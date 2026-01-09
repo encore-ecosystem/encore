@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable
 
 import ehir
+from ehir.backend import OptProfile
 from ehir_llvm_backend import EHIR_LLVM_Backend
 
 from encore.translator.translator import Translator
@@ -39,12 +40,13 @@ def handle_build(args: Namespace):
 
     translator = Translator()
     program_ehir = translator.run(program)
+    # print(program_ehir.get_raw_program())
 
     project_name = manifest.get_project_name()
     ehir_compiler = ehir.Compiler()
-    ehir_module = ehir_compiler.compile(program_ehir, name=project_name)
+    ehir_module = ehir_compiler.compile(program_ehir.get_raw_program(), name=project_name)
 
-    profile = ehir.OptProfile.debug
+    profile = OptProfile.debug
     profile_path = cwd / "target" / profile.value
     profile_path.mkdir(parents=True, exist_ok=True)
 
@@ -61,5 +63,10 @@ def handle_build(args: Namespace):
     with (ehir_dir / "main.ehir").open("w") as f:
         f.write(str(ehir_module))
 
-    backend = EHIR_LLVM_Backend()
-    backend.compile(ehir_module, output_object_path=obj_dir / "main.o", output_file_path=profile_path / project_name)
+    backend = EHIR_LLVM_Backend(output_llvm_ir_path=llvm_dir)
+    backend.compile(
+        ehir_module,
+        output_object_path=obj_dir / "main.o",
+        output_file_path=profile_path / project_name,
+        opt_level=profile,
+    )
