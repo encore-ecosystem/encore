@@ -96,11 +96,9 @@ class Translator:
     def _translate_expression(self, expr: s.Statement_Expression, name: Optional[str] = None) -> Assignable:
         if isinstance(expr, s.Expression_IntegerLiteral):
             return self._builder.build_lcpos(prim=Usize(int(expr.value)))
-        # elif isinstance(expr, s.Expression_VariableAccess):
-        #     if (var := self._variables[self._current_function].get(expr.name)) is None:
-        #         raise RuntimeError(f"Variable {expr.name} is not defined.")
-        #     ret_var = Variable(name=self._advance_variable(), type=var.type)
-        #     return [Instruction_load(ret_var, var)]
+
+        elif isinstance(expr, s.Expression_VariableAccess):
+            return self._builder.get_var(expr.name)
 
         elif isinstance(expr, s.Expression_BinaryOperation):
             lhs = self._translate_expression(expr.lhs)
@@ -134,6 +132,10 @@ class Translator:
 
         elif isinstance(expr, s.Expression_StructField):
             return self._builder.build_getfield(src=Variable(expr.name), indexes=[Variable(expr.field)])
+
+        elif isinstance(expr, s.Expression_Call):
+            args = [self._translate_expression(arg_exp).var_out for arg_exp in expr.args]
+            return self._builder.build_call(fn_name=expr.name, args=args, name=name)
 
         raise NotImplementedError(f"Translation for expression type {type(expr)} is not implemented.")
 

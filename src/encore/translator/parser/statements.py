@@ -114,6 +114,12 @@ class Expression_StructField(Statement_Expression):
     field: str
 
 
+@dataclass
+class Expression_Call(Statement_Expression):
+    name: str
+    args: list[Statement_Expression]
+
+
 # =============
 @dataclass
 class Expression_BinaryOperation(Statement_Expression):

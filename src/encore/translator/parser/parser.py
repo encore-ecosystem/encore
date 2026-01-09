@@ -151,6 +151,19 @@ class Parser:
                 self._safe_consume(TokenType.DOT)
                 field = self._safe_consume(TokenType.IDENTIFIER).value
                 return s.Expression_StructField(name, field)
+            elif self._get_current_token().type == TokenType.LEFT_PAREN:
+                self._safe_consume(TokenType.LEFT_PAREN)
+
+                args = []
+                if self._get_current_token().type != TokenType.RIGHT_PAREN:
+                    args.append(self._parse_expression())
+
+                while self._get_current_token().type != TokenType.RIGHT_PAREN:
+                    self._safe_consume(TokenType.COMMA)
+                    args.append(self._parse_expression())
+                self._safe_consume(TokenType.RIGHT_PAREN)
+                return s.Expression_Call(name, args)
+
             else:
                 return s.Expression_VariableAccess(name)
 

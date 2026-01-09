@@ -4,7 +4,7 @@ from typing import Optional
 from ehir.core.block import Block
 from ehir.core.derectives import Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
-from ehir.core.instructions.base import Instruction
+from ehir.core.instructions.base import Assignable, Instruction
 from ehir.core.instructions.capture import Instruction_lcpos, Instruction_lcsos
 from ehir.core.instructions.control_flow import Instruction_ret
 from ehir.core.instructions.memory import Instruction_getfield
@@ -14,6 +14,7 @@ from ehir.core.instructions.operators.arithmetic import (
     Instruction_mul,
     Instruction_sub,
 )
+from ehir.core.instructions.special import Instruction_call
 from ehir.core.primitives.base import Primitive
 from ehir.core.struct import Struct
 from ehir.core.type import Type
@@ -34,6 +35,7 @@ class EHIR_Builder:
     current_function: Derective_fn
     current_block: Block
     shift: int
+    variables: dict[str, Variable]
 
     def __init__(self, module: EHIR_Module):
         self.module = module
@@ -51,6 +53,7 @@ class EHIR_Builder:
         fn = Derective_fn(name, params, [], ret_type)
         self.module.ast.append(fn)
         self.current_function = fn
+        self.variables = {}
 
     def build_add(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_add:
         instr = Instruction_add(self._reserve_variable(name), lhs, rhs)
@@ -80,10 +83,7 @@ class EHIR_Builder:
         return instr
 
     def build_lcpos(self, prim: Primitive, name: Optional[str] = None) -> Instruction_lcpos:
-        lcpos = Instruction_lcpos(
-            var_out=self._reserve_variable(name),
-            primitive=prim,
-        )
+        lcpos = Instruction_lcpos(self._reserve_variable(name), prim)
         self._add(lcpos)
         return lcpos
 
@@ -92,8 +92,20 @@ class EHIR_Builder:
         self._add(lcsos)
         return lcsos
 
+    def build_call(self, fn_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_call:
+        call = Instruction_call(self._reserve_variable(name), fn_name, args)
+        self._add(call)
+        return call
+
     def build_ret(self, var: Variable):
         self._add(Instruction_ret(var))
+
+    def get_var(self, name: Optional[str] = None) -> Assignable:
+        if name is None:
+            raise ValueError
+        if var := self.variables.get(name, None):
+            return Assignable(var)
+        raise ValueError
 
     def append_block(self, name: str) -> Block:
         block = Block(name, [])
@@ -114,4 +126,6 @@ class EHIR_Builder:
 
     def _reserve_variable(self, name: Optional[str] = None) -> Variable:
         name = self._process_name(name)
-        return Variable(name)
+        var = Variable(name)
+        self.variables[name] = var
+        return var
