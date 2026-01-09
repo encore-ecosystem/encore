@@ -1,0 +1,19 @@
+import argparse
+from typing import Callable
+
+from encore import modes
+
+
+def main():
+    main_parser = argparse.ArgumentParser(prog="encore", description="Encore compiler")
+    subparsers = main_parser.add_subparsers(dest="command", required=True, help="Available commands")
+
+    dispatcher: dict[str, Callable] = {}
+    name, handler = modes.add_build_parser(subparsers)
+    dispatcher[name] = handler
+
+    args = main_parser.parse_args()
+    if handler := dispatcher.get(args.command, None):
+        handler(args)
+    else:
+        print(f"Unknown mode: {args.command}")
