@@ -5,9 +5,9 @@ from ehir.core.block import Block
 from ehir.core.derectives import Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions.base import Assignable, Instruction
-from ehir.core.instructions.capture import Instruction_lcpos, Instruction_lcsos
+from ehir.core.instructions.capture import Instruction_lcpos, Instruction_lcsos, Instruction_scsoh, Instruction_scsos
 from ehir.core.instructions.control_flow import Instruction_ret
-from ehir.core.instructions.memory import Instruction_getfield
+from ehir.core.instructions.memory import Instruction_sgetfield
 from ehir.core.instructions.operators.arithmetic import (
     Instruction_add,
     Instruction_div,
@@ -17,8 +17,8 @@ from ehir.core.instructions.operators.arithmetic import (
 from ehir.core.instructions.special import Instruction_call
 from ehir.core.primitives.base import Primitive
 from ehir.core.struct import Struct
-from ehir.core.type import Type
-from ehir.core.variable import Parameter, Variable
+from ehir.core.type import HeapSmartPointer, StackSmartPointer, Type
+from ehir.core.variable import Parameter, TypedVariable, Variable
 
 
 @dataclass
@@ -75,22 +75,36 @@ class EHIR_Builder:
         self._add(instr)
         return instr
 
-    def build_getfield(
-        self, src: Variable, indexes: list[Variable], name: Optional[str] = None
-    ) -> Instruction_getfield:
-        instr = Instruction_getfield(self._reserve_variable(name), src, indexes)
+    def build_sgetfield(self, src: Variable, field: Variable, name: Optional[str] = None) -> Instruction_sgetfield:
+        instr = Instruction_sgetfield(self._reserve_variable(name), src, field)
         self._add(instr)
         return instr
 
     def build_lcpos(self, prim: Primitive, name: Optional[str] = None) -> Instruction_lcpos:
-        lcpos = Instruction_lcpos(self._reserve_variable(name), prim)
+        lcpos = Instruction_lcpos(self._reserve_variable(name, prim.type), prim)
         self._add(lcpos)
         return lcpos
 
     def build_lcsos(self, struct_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_lcsos:
-        lcsos = Instruction_lcsos(var_out=self._reserve_variable(name), struct=Struct(struct_name, args))
+        struct = Struct(struct_name, args)
+        lcsos = Instruction_lcsos(var_out=self._reserve_variable(name, struct.as_type()), struct=struct)
         self._add(lcsos)
         return lcsos
+
+    def build_scsos(self, struct_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_scsos:
+        struct = Struct(struct_name, args)
+        scsos = Instruction_scsos(
+            var_out=self._reserve_variable(name, StackSmartPointer(struct.as_type())), struct=struct
+        )
+        self._add(scsos)
+        return scsos
+
+    def build_scsoh(self, struct_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_scsoh:
+        scsoh = Instruction_scsoh(
+            var_out=self._reserve_variable(name, HeapSmartPointer(Type(struct_name))), struct=Struct(struct_name, args)
+        )
+        self._add(scsoh)
+        return scsoh
 
     def build_call(self, fn_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_call:
         call = Instruction_call(self._reserve_variable(name), fn_name, args)
@@ -124,8 +138,8 @@ class EHIR_Builder:
             self.shift += 1
         return name
 
-    def _reserve_variable(self, name: Optional[str] = None) -> Variable:
+    def _reserve_variable(self, name: Optional[str] = None, type: Optional[Type] = None) -> Variable:
         name = self._process_name(name)
-        var = Variable(name)
+        var = TypedVariable(name, type) if type else Variable(name)
         self.variables[name] = var
         return var

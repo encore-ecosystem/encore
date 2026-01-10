@@ -124,6 +124,19 @@ class Translator:
 
         elif isinstance(expr, s.Expression_StructInitialization):
             args = [self._translate_expression(arg_exp).var_out for arg_exp in expr.args]
+            if expr.name.endswith("<S>"):
+                return self._builder.build_scsos(
+                    struct_name=expr.name[:-3],
+                    args=args,
+                    name=name,
+                )
+            elif expr.name.endswith("<H>"):
+                return self._builder.build_scsoh(
+                    struct_name=expr.name[:-3],
+                    args=args,
+                    name=name,
+                )
+
             return self._builder.build_lcsos(
                 struct_name=expr.name,
                 args=args,
@@ -131,7 +144,7 @@ class Translator:
             )
 
         elif isinstance(expr, s.Expression_StructField):
-            return self._builder.build_getfield(src=Variable(expr.name), indexes=[Variable(expr.field)])
+            return self._builder.build_sgetfield(src=Variable(expr.name), field=Variable(expr.field))
 
         elif isinstance(expr, s.Expression_Call):
             args = [self._translate_expression(arg_exp).var_out for arg_exp in expr.args]

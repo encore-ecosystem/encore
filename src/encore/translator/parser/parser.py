@@ -129,55 +129,76 @@ class Parser:
     def _parse_postfix(self) -> s.Statement_Expression:
         return self._parse_primary()
 
+    def _parse_integer_literal(self) -> s.Expression_IntegerLiteral:
+        value = self._safe_consume(TokenType.INTEGER).value
+        return s.Expression_IntegerLiteral(value)
+
+    def _parse_parenthesized(self) -> s.Expression_Parenthesized:
+        self._safe_consume(TokenType.LEFT_PAREN)
+        expr = self._parse_expression()
+        self._safe_consume(TokenType.RIGHT_PAREN)
+        return s.Expression_Parenthesized(expr=expr)
+
+    def _parse_struct_initialization(self) -> s.Expression_StructInitialization:
+        struct = self._parse_type()
+
+        self._safe_consume(TokenType.LEFT_BRACE)
+        args = []
+        if self._get_current_token().type != TokenType.RIGHT_BRACE:
+            args.append(self._parse_expression())
+
+        while self._get_current_token().type != TokenType.RIGHT_BRACE:
+            self._safe_consume(TokenType.COMMA)
+            args.append(self._parse_expression())
+        self._safe_consume(TokenType.RIGHT_BRACE)
+
+        return s.Expression_StructInitialization(struct, args)
+
+    def _parse_struct_field(self) -> s.Expression_StructField:
+        variable = self._safe_consume(TokenType.IDENTIFIER).value
+        self._safe_consume(TokenType.DOT)
+        field = self._safe_consume(TokenType.IDENTIFIER).value
+        return s.Expression_StructField(variable, field)
+
+    def _parse_call(self) -> s.Expression_Call:
+        name = self._safe_consume(TokenType.IDENTIFIER).value
+        self._safe_consume(TokenType.LEFT_PAREN)
+
+        args = []
+        if self._get_current_token().type != TokenType.RIGHT_PAREN:
+            args.append(self._parse_expression())
+
+        while self._get_current_token().type != TokenType.RIGHT_PAREN:
+            self._safe_consume(TokenType.COMMA)
+            args.append(self._parse_expression())
+        self._safe_consume(TokenType.RIGHT_PAREN)
+        return s.Expression_Call(name, args)
+
+    def _parse_variable_access(self) -> s.Expression_VariableAccess:
+        name = self._safe_consume(TokenType.IDENTIFIER).value
+        return s.Expression_VariableAccess(name)
+
     def _parse_primary(self) -> s.Statement_Expression:
         curr_token = self._get_current_token()
 
-        if curr_token.type == TokenType.IDENTIFIER:
-            name = self._safe_consume(TokenType.IDENTIFIER).value
-            if self._get_current_token().type == TokenType.LEFT_BRACE:
-                self._safe_consume(TokenType.LEFT_BRACE)
+        if curr_token.type == TokenType.INTEGER:
+            return self._parse_integer_literal()
 
-                args = []
-                if self._get_current_token().type != TokenType.RIGHT_BRACE:
-                    args.append(self._parse_expression())
+        elif curr_token.type == TokenType.LEFT_PAREN:
+            return self._parse_parenthesized()
 
-                while self._get_current_token().type != TokenType.RIGHT_BRACE:
-                    self._safe_consume(TokenType.COMMA)
-                    args.append(self._parse_expression())
-                self._safe_consume(TokenType.RIGHT_BRACE)
+        elif curr_token.type == TokenType.IDENTIFIER:
+            if self._get_next_token().type in (TokenType.LEFT_BRACE, TokenType.OP_LESS):
+                return self._parse_struct_initialization()
 
-                return s.Expression_StructInitialization(name, args)
-            elif self._get_current_token().type == TokenType.DOT:
-                self._safe_consume(TokenType.DOT)
-                field = self._safe_consume(TokenType.IDENTIFIER).value
-                return s.Expression_StructField(name, field)
-            elif self._get_current_token().type == TokenType.LEFT_PAREN:
-                self._safe_consume(TokenType.LEFT_PAREN)
+            elif self._get_next_token().type == TokenType.DOT:
+                return self._parse_struct_field()
 
-                args = []
-                if self._get_current_token().type != TokenType.RIGHT_PAREN:
-                    args.append(self._parse_expression())
-
-                while self._get_current_token().type != TokenType.RIGHT_PAREN:
-                    self._safe_consume(TokenType.COMMA)
-                    args.append(self._parse_expression())
-                self._safe_consume(TokenType.RIGHT_PAREN)
-                return s.Expression_Call(name, args)
+            elif self._get_next_token().type == TokenType.LEFT_PAREN:
+                return self._parse_call()
 
             else:
-                return s.Expression_VariableAccess(name)
-
-        if curr_token.type == TokenType.INTEGER:
-            return s.Expression_IntegerLiteral(value=self._safe_consume(TokenType.INTEGER).value)
-
-        if curr_token.type == TokenType.FLOAT:
-            return s.Expression_FloatLiteral(value=self._safe_consume(TokenType.FLOAT).value)
-
-        if curr_token.type == TokenType.LEFT_PAREN:
-            self._safe_consume(TokenType.LEFT_PAREN)
-            expr = self._parse_expression()
-            self._safe_consume(TokenType.RIGHT_PAREN)
-            return s.Expression_Parenthesized(expr=expr)
+                return self._parse_variable_access()
 
         raise TypeError(f"Unable to parse primary expression, got: {curr_token}")
 
@@ -193,7 +214,15 @@ class Parser:
         )
 
     def _parse_type(self) -> str:
-        return self._safe_consume(TokenType.IDENTIFIER).value
+        name = self._safe_consume(TokenType.IDENTIFIER).value
+        if self._get_current_token().type == TokenType.OP_LESS:
+            self._safe_consume(TokenType.OP_LESS)
+            pointer = self._safe_consume(TokenType.IDENTIFIER).value
+            if pointer not in ("H", "S"):
+                raise TypeError(f"Unexpected pointer annotation: {pointer}")
+            name += "<" + pointer + ">"
+            self._safe_consume(TokenType.OP_GREATER)
+        return name
 
     def _parse_param(self) -> tuple[str, str]:
         name = self._safe_consume(TokenType.IDENTIFIER).value

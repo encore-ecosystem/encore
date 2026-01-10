@@ -40,11 +40,12 @@ def handle_build(args: Namespace):
 
     translator = Translator()
     program_ehir = translator.run(program)
-    # print(program_ehir.get_raw_program())
+    print(program_ehir.get_raw_program())
 
     project_name = manifest.get_project_name()
     ehir_compiler = ehir.Compiler()
     ehir_module = ehir_compiler.compile(program_ehir.get_raw_program(), name=project_name)
+    # print(ehir_module)
 
     profile = OptProfile.debug
     profile_path = cwd / "target" / profile.value
