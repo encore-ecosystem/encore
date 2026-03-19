@@ -6,7 +6,8 @@ from ehir.core.derectives import Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions.base import Assignable, Instruction
 from ehir.core.instructions.capture import Instruction_lcpos, Instruction_lcsos, Instruction_scsoh, Instruction_scsos
-from ehir.core.instructions.control_flow import Instruction_ret
+from ehir.core.instructions.control_flow import Instruction_br, Instruction_cbr, Instruction_ret
+from ehir.core.instructions.control_flow.phi import Instruction_phi, PhiPair
 from ehir.core.instructions.memory import Instruction_sgetfield
 from ehir.core.instructions.operators.arithmetic import (
     Instruction_add,
@@ -14,7 +15,15 @@ from ehir.core.instructions.operators.arithmetic import (
     Instruction_mul,
     Instruction_sub,
 )
+from ehir.core.instructions.operators.comparison import (
+    Instruction_geq,
+    Instruction_grt,
+    Instruction_leq,
+    Instruction_les,
+)
+from ehir.core.instructions.operators.logic import Instruction_ieq, Instruction_neq
 from ehir.core.instructions.special import Instruction_call
+from ehir.core.primitives import Usize_t
 from ehir.core.primitives.base import Primitive
 from ehir.core.struct import Struct
 from ehir.core.type import HeapSmartPointer, StackSmartPointer, Type
@@ -113,6 +122,48 @@ class EHIR_Builder:
 
     def build_ret(self, var: Variable):
         self._add(Instruction_ret(var))
+
+    def build_br(self, label: str):
+        self._add(Instruction_br(label=label))
+
+    def build_cbr(self, cond_var: Variable, true_label: str, else_label: str):
+        self._add(Instruction_cbr(cond_var=cond_var, true_br_label=true_label, else_br_label=else_label))
+
+    def build_ieq(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_ieq:
+        instr = Instruction_ieq(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
+        self._add(instr)
+        return instr
+
+    def build_neq(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_neq:
+        instr = Instruction_neq(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
+        self._add(instr)
+        return instr
+
+    def build_les(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_les:
+        instr = Instruction_les(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
+        self._add(instr)
+        return instr
+
+    def build_leq(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_leq:
+        instr = Instruction_leq(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
+        self._add(instr)
+        return instr
+
+    def build_grt(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_grt:
+        instr = Instruction_grt(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
+        self._add(instr)
+        return instr
+
+    def build_geq(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_geq:
+        instr = Instruction_geq(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
+        self._add(instr)
+        return instr
+
+    def build_phi(self, name: str, var_type: Optional[Type], pairs: list[PhiPair]) -> Instruction_phi:
+        var = self._reserve_variable(name, var_type)
+        instr = Instruction_phi(var_out=var, args=pairs)
+        self._add(instr)
+        return instr
 
     def get_var(self, name: Optional[str] = None) -> Assignable:
         if name is None:

@@ -75,6 +75,10 @@ class Parser:
             return self._parse_ret()
         if curr_token.type == TokenType.KW_LET:
             return self._parse_let()
+        if curr_token.type == TokenType.KW_WHILE:
+            return self._parse_while()
+        if curr_token.type == TokenType.IDENTIFIER and self._get_next_token().type == TokenType.OP_ASSIGN:
+            return self._parse_assignment()
 
         raise NotImplementedError(curr_token)
 
@@ -83,8 +87,102 @@ class Parser:
         expr = self._parse_expression()
         return s.Statement_Ret(expr=expr)
 
+    def _parse_while(self) -> s.Statement_While:
+        self._safe_consume(TokenType.KW_WHILE)
+        expr = self._parse_expression()
+        body = self._parse_block()
+        return s.Statement_While(expr, body)
+
     def _parse_expression(self) -> s.Statement_Expression:
-        return self._parse_additive()
+        return self._parse_logical_or()
+
+    def _parse_logical_or(self) -> s.Statement_Expression:
+        left = self._parse_logical_and()
+        while True:
+            operator = self._get_current_token()
+            if operator.type not in {TokenType.OP_OR}:
+                break
+            self._unsafe_consume()
+            right = self._parse_logical_and()
+            left = s.BinaryOperation_LogicalOr(lhs=left, operator=operator.value, rhs=right)
+        return left
+
+    def _parse_logical_and(self) -> s.Statement_Expression:
+        left = self._parse_bitwise_or()
+        while True:
+            operator = self._get_current_token()
+            if operator.type not in {TokenType.OP_AND}:
+                break
+            self._unsafe_consume()
+            right = self._parse_bitwise_or()
+            left = s.BinaryOperation_LogicalAnd(lhs=left, operator=operator.value, rhs=right)
+        return left
+
+    def _parse_bitwise_or(self) -> s.Statement_Expression:
+        left = self._parse_bitwise_xor()
+        while True:
+            operator = self._get_current_token()
+            if operator.type not in {TokenType.OP_BIT_OR}:
+                break
+            self._unsafe_consume()
+            right = self._parse_bitwise_xor()
+            left = s.BinaryOperation_BitwiseOr(lhs=left, operator=operator.value, rhs=right)
+        return left
+
+    def _parse_bitwise_xor(self) -> s.Statement_Expression:
+        left = self._parse_bitwise_and()
+        while True:
+            operator = self._get_current_token()
+            if operator.type not in {TokenType.OP_BIT_XOR}:
+                break
+            self._unsafe_consume()
+            right = self._parse_bitwise_and()
+            left = s.BinaryOperation_BitwiseXor(lhs=left, operator=operator.value, rhs=right)
+        return left
+
+    def _parse_bitwise_and(self) -> s.Statement_Expression:
+        left = self._parse_equality()
+        while True:
+            operator = self._get_current_token()
+            if operator.type not in {TokenType.OP_BIT_AND}:
+                break
+            self._unsafe_consume()
+            right = self._parse_equality()
+            left = s.BinaryOperation_BitwiseAnd(lhs=left, operator=operator.value, rhs=right)
+        return left
+
+    def _parse_equality(self) -> s.Statement_Expression:
+        left = self._parse_relational()
+        while True:
+            operator = self._get_current_token()
+            if operator.type not in {TokenType.OP_EQUAL, TokenType.OP_NOT_EQUAL}:
+                break
+            self._unsafe_consume()
+            right = self._parse_relational()
+            left = s.BinaryOperation_Equality(lhs=left, operator=operator.value, rhs=right)
+        return left
+
+    def _parse_relational(self) -> s.Statement_Expression:
+        left = self._parse_shift()
+        while True:
+            operator = self._get_current_token()
+            if operator.type not in {TokenType.OP_LESS, TokenType.OP_GREATER, TokenType.OP_LESS_EQUAL, TokenType.OP_GREATER_EQUAL}:
+                break
+            self._unsafe_consume()
+            right = self._parse_shift()
+            left = s.BinaryOperation_Relational(lhs=left, operator=operator.value, rhs=right)
+        return left
+
+    def _parse_shift(self) -> s.Statement_Expression:
+        left = self._parse_additive()
+        while True:
+            operator = self._get_current_token()
+            if operator.type not in {TokenType.OP_LEFT_SHIFT, TokenType.OP_RIGHT_SHIFT}:
+                break
+            self._unsafe_consume()
+            right = self._parse_additive()
+            left = s.BinaryOperation_Shift(lhs=left, operator=operator.value, rhs=right)
+        return left
 
     def _parse_additive(self) -> s.Statement_Expression:
         left = self._parse_multiplicative()
@@ -94,7 +192,7 @@ class Parser:
                 break
             self._unsafe_consume()
             right = self._parse_multiplicative()
-            left = s.Expression_BinaryOperation(lhs=left, operator=operator.value, rhs=right)
+            left = s.BinaryOperation_Additive(lhs=left, operator=operator.value, rhs=right)
         return left
 
     def _parse_multiplicative(self) -> s.Statement_Expression:
@@ -105,7 +203,7 @@ class Parser:
                 break
             self._unsafe_consume()
             right = self._parse_unary()
-            left = s.Expression_BinaryOperation(lhs=left, operator=operator.value, rhs=right)
+            left = s.BinaryOperation_Multiplicative(lhs=left, operator=operator.value, rhs=right)
         return left
 
     def _parse_unary(self) -> s.Statement_Expression:
@@ -188,19 +286,25 @@ class Parser:
             return self._parse_parenthesized()
 
         elif curr_token.type == TokenType.IDENTIFIER:
-            if self._get_next_token().type in (TokenType.LEFT_BRACE, TokenType.OP_LESS):
+            next_tok = self._get_next_token()
+            if next_tok.type == TokenType.LEFT_BRACE:
                 return self._parse_struct_initialization()
-
-            elif self._get_next_token().type == TokenType.DOT:
+            elif next_tok.type == TokenType.OP_LESS and self._peek_token(2).value in ("H", "S"):
+                return self._parse_struct_initialization()
+            elif next_tok.type == TokenType.DOT:
                 return self._parse_struct_field()
-
-            elif self._get_next_token().type == TokenType.LEFT_PAREN:
+            elif next_tok.type == TokenType.LEFT_PAREN:
                 return self._parse_call()
-
             else:
                 return self._parse_variable_access()
 
         raise TypeError(f"Unable to parse primary expression, got: {curr_token}")
+
+    def _parse_assignment(self) -> s.Statement_Assignment:
+        name = self._safe_consume(TokenType.IDENTIFIER).value
+        self._safe_consume(TokenType.OP_ASSIGN)
+        expr = self._parse_expression()
+        return s.Statement_Assignment(name=name, expr=expr)
 
     def _parse_let(self) -> s.Statement_Let:
         self._safe_consume(TokenType.KW_LET)
@@ -263,3 +367,10 @@ class Parser:
             raise ValueError
 
         return self.tokens[self.current_index + 1]
+
+    def _peek_token(self, offset: int) -> Token:
+        index = self.current_index + offset
+        if index >= len(self.tokens):
+            raise ValueError
+
+        return self.tokens[index]

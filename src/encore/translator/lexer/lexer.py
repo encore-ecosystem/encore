@@ -11,6 +11,7 @@ class Lexer:
             "struct": TokenType.KW_STRUCT,
             "let": TokenType.KW_LET,
             "ret": TokenType.KW_RET,
+            "while": TokenType.KW_WHILE,
         }
 
         # Tokenization patterns (order matters!)

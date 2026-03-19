@@ -50,6 +50,19 @@ class Statement_Let(Statement_InnerLevel):
 
 
 @dataclass
+class Statement_While(Statement_InnerLevel):
+    expr: "Statement_Expression"
+    body: list["Statement_InnerLevel"]
+
+    def __repr__(self) -> str:
+        r = f"while {self.expr} + {{"
+        for stmt in self.body:
+            r += f"\n  {stmt}"
+        r += "\n}"
+        return r
+
+
+@dataclass
 class Statement_Assignment(Statement_InnerLevel):
     name: str
     expr: "Statement_Expression"

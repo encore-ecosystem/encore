@@ -11,6 +11,7 @@ class TokenType(Enum):
     KW_STRUCT = auto()
     KW_LET = auto()
     KW_RET = auto()
+    KW_WHILE = auto()
 
     OP_PLUS = auto()
     OP_MINUS = auto()
