@@ -12,6 +12,10 @@ class Lexer:
             "let": TokenType.KW_LET,
             "ret": TokenType.KW_RET,
             "while": TokenType.KW_WHILE,
+            "do": TokenType.KW_DO,
+            "break": TokenType.KW_BREAK,
+            "continue": TokenType.KW_CONTINUE,
+            "loop": TokenType.KW_LOOP,
         }
 
         # Tokenization patterns (order matters!)

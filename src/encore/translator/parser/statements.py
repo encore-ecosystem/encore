@@ -55,10 +55,23 @@ class Statement_While(Statement_InnerLevel):
     body: list["Statement_InnerLevel"]
 
     def __repr__(self) -> str:
-        r = f"while {self.expr} + {{"
+        r = f"while {self.expr} {{"
         for stmt in self.body:
             r += f"\n  {stmt}"
         r += "\n}"
+        return r
+
+
+@dataclass
+class Statement_DoWhile(Statement_InnerLevel):
+    body: list["Statement_InnerLevel"]
+    expr: "Statement_Expression"
+
+    def __repr__(self) -> str:
+        r = "do {{"
+        for stmt in self.body:
+            r += f"\n  {stmt}"
+        r += f"\n}} while {self.expr}"
         return r
 
 

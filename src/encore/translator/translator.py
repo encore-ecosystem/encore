@@ -94,6 +94,9 @@ class Translator:
         elif isinstance(statement, s.Statement_While):
             return self._translate_while(statement)
 
+        elif isinstance(statement, s.Statement_DoWhile):
+            return self._translate_do_while(statement)
+
         elif isinstance(statement, s.Statement_Assignment):
             return self._translate_assignment(statement)
 
@@ -159,12 +162,62 @@ class Translator:
         for var, phi_var in phi_vars.items():
             self._var_vals[var] = phi_var
 
+    def _translate_do_while(self, statement: s.Statement_DoWhile):
+        while_id = self._while_counter
+        self._while_counter += 1
+
+        body_block = self._builder.append_block(f"do_while_body_{while_id}")
+        cond_block = self._builder.append_block(f"do_while_cond_{while_id}")
+        end_block = self._builder.append_block(f"do_while_end_{while_id}")
+
+        modified = self._collect_assignments(statement.body) & self._var_vals.keys()
+
+        phi_names: dict[str, tuple[str, str]] = {}
+        entry_vals: dict[str, Variable] = {}
+        for var in modified:
+            phi_names[var] = (f"{var}_phi_{while_id}", f"{var}_next_{while_id}")
+            entry_vals[var] = self._var_vals[var]
+
+        entry_block_name = self._builder.current_block.name
+        self._builder.build_br(body_block.name)
+
+        self._builder.position_at_end(body_block)
+        phi_vars: dict[str, Variable] = {}
+        for var, (phi_name, next_name) in phi_names.items():
+            phi = self._builder.build_phi(
+                phi_name,
+                entry_vals[var].type,
+                [
+                    PhiPair(entry_vals[var], entry_block_name),
+                    PhiPair(Variable(next_name), cond_block.name),
+                ],
+            )
+            self._var_vals[var] = phi.var_out
+            phi_vars[var] = phi.var_out
+
+        saved_targets = self._assignment_targets
+        self._assignment_targets = {**saved_targets, **{var: next_name for var, (_, next_name) in phi_names.items()}}
+        self._translate_block(statement.body)
+        self._assignment_targets = saved_targets
+        self._builder.build_br(cond_block.name)
+
+        self._builder.position_at_end(cond_block)
+        for var, (_, next_name) in phi_names.items():
+            self._var_vals[var] = Variable(next_name)
+
+        cond = self._translate_expression(statement.expr)
+        self._builder.build_cbr(cond.var_out, body_block.name, end_block.name)
+
+        self._builder.position_at_end(end_block)
+        for var in phi_vars:
+            self._var_vals[var] = Variable(phi_names[var][1])
+
     def _collect_assignments(self, body: list[s.Statement_InnerLevel]) -> set[str]:
         assigned: set[str] = set()
         for stmt in body:
             if isinstance(stmt, s.Statement_Assignment):
                 assigned.add(stmt.name)
-            elif isinstance(stmt, s.Statement_While):
+            elif isinstance(stmt, (s.Statement_While, s.Statement_DoWhile)):
                 assigned |= self._collect_assignments(stmt.body)
         return assigned
 
