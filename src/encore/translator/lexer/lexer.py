@@ -16,6 +16,9 @@ class Lexer:
             "break": TokenType.KW_BREAK,
             "continue": TokenType.KW_CONTINUE,
             "loop": TokenType.KW_LOOP,
+            "if": TokenType.KW_IF,
+            "elif": TokenType.KW_ELIF,
+            "else": TokenType.KW_ELSE,
         }
 
         # Tokenization patterns (order matters!)

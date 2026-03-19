@@ -1,6 +1,7 @@
 from encore.translator.lexer import Token
 from encore.translator.lexer.tokens import TokenType
 from encore.translator.parser import statements as s
+from encore.translator.parser.statements import Expression_BooleanLiteral
 
 
 class Parser:
@@ -81,6 +82,8 @@ class Parser:
             return self._parse_while()
         if curr_token.type == TokenType.KW_LOOP:
             return self._parse_loop()
+        if curr_token.type == TokenType.KW_IF:
+            return self._parse_if_block()
         if curr_token.type == TokenType.KW_BREAK:
             return self._parse_break()
         if curr_token.type == TokenType.KW_CONTINUE:
@@ -101,11 +104,18 @@ class Parser:
         body = self._parse_block()
         return s.Statement_While(expr, body)
 
+    def _parse_loop(self) -> s.Statement_Loop:
+        self._safe_consume(TokenType.KW_LOOP)
+        body = self._parse_block()
+        return s.Statement_Loop(body)
+
     def _parse_break(self):
-        raise NotImplementedError
+        self._safe_consume(TokenType.KW_BREAK)
+        return s.Statement_Break()
 
     def _parse_continue(self):
-        raise NotImplementedError
+        self._safe_consume(TokenType.KW_CONTINUE)
+        return s.Statement_Continue()
 
     def _parse_do_while(self) -> s.Statement_DoWhile:
         self._safe_consume(TokenType.KW_DO)
@@ -114,8 +124,20 @@ class Parser:
         expr = self._parse_expression()
         return s.Statement_DoWhile(body, expr)
 
-    def _parse_loop(self):
-        raise NotImplementedError
+    def _parse_if_block(self):
+        self._safe_consume(TokenType.KW_IF)
+        branches = [s.Statement_IfBranch(expr=self._parse_expression(), body=self._parse_block())]
+
+        while not self._is_at_end() and self._get_current_token().type == TokenType.KW_ELIF:
+            self._safe_consume(TokenType.KW_ELIF)
+            branches.append(s.Statement_IfBranch(expr=self._parse_expression(), body=self._parse_block()))
+
+        else_body = None
+        if not self._is_at_end() and self._get_current_token().type == TokenType.KW_ELSE:
+            self._safe_consume(TokenType.KW_ELSE)
+            else_body = self._parse_block()
+
+        return s.Statement_If(branches=branches, else_body=else_body)
 
     def _parse_expression(self) -> s.Statement_Expression:
         return self._parse_logical_or()
