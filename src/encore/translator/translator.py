@@ -138,12 +138,12 @@ class Translator:
         break_inputs = loop_ctx["break_inputs"]
         loop_vars = loop_ctx["loop_vars"]
         current_block = self._builder.current_block.name
-        loop_ctx["break_blocks"].append(current_block)
+        loop_ctx["break_blocks"].append(current_block)  # ty:ignore[unresolved-attribute]
 
-        for var, pairs in break_inputs.items():
-            pairs.append(PhiPair(self._var_vals.get(var, loop_vars[var]), current_block))
+        for var, pairs in break_inputs.items():  # ty:ignore[unresolved-attribute]
+            pairs.append(PhiPair(self._var_vals.get(var, loop_vars[var]), current_block))  # ty:ignore[not-subscriptable]
 
-        self._builder.build_br(loop_ctx["break_target"])
+        self._builder.build_br(loop_ctx["break_target"])  # ty:ignore[invalid-argument-type]
         self._mark_current_block_terminated()
 
     def _translate_continue(self, statement: s.Statement_Continue):
@@ -151,7 +151,7 @@ class Translator:
             raise ValueError("continue used outside of a loop")
 
         loop_ctx = self._loop_stack[-1]
-        self._builder.build_br(loop_ctx["continue_target"])
+        self._builder.build_br(loop_ctx["continue_target"])  # ty:ignore[invalid-argument-type]
         self._mark_current_block_terminated()
 
     def _translate_assignment(self, statement: s.Statement_Assignment):
@@ -205,7 +205,7 @@ class Translator:
             "break_blocks": [],
             "loop_vars": {var: phi_var for var, phi_var in phi_vars.items()},
         }
-        self._loop_stack.append(loop_ctx)
+        self._loop_stack.append(loop_ctx)  # ty:ignore[invalid-argument-type]
         self._translate_block(statement.body)
         self._loop_stack.pop()
         self._assignment_targets = saved_targets
@@ -268,7 +268,7 @@ class Translator:
             "break_blocks": [],
             "loop_vars": {var: phi_var for var, phi_var in phi_vars.items()},
         }
-        self._loop_stack.append(loop_ctx)
+        self._loop_stack.append(loop_ctx)  # ty:ignore[invalid-argument-type]
         self._translate_block(statement.body)
         self._loop_stack.pop()
         self._assignment_targets = saved_targets
@@ -339,7 +339,7 @@ class Translator:
             "break_blocks": [],
             "loop_vars": {var: phi_var for var, phi_var in phi_vars.items()},
         }
-        self._loop_stack.append(loop_ctx)
+        self._loop_stack.append(loop_ctx)  # ty:ignore[invalid-argument-type]
         self._translate_block(statement.body)
         self._loop_stack.pop()
         self._assignment_targets = saved_targets
@@ -407,6 +407,7 @@ class Translator:
                     phi_inputs[var].append(PhiPair(self._var_vals.get(var, base_var_vals[var]), branch_exit))
 
         if else_block is not None:
+            assert statement.else_body
             self._builder.position_at_end(else_block)
             self._var_vals = dict(base_var_vals)
             self._translate_block(statement.else_body)
