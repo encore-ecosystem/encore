@@ -1,7 +1,6 @@
 from encore.translator.lexer import Token
 from encore.translator.lexer.tokens import TokenType
 from encore.translator.parser import statements as s
-from encore.translator.parser.statements import Expression_BooleanLiteral
 
 
 class Parser:
