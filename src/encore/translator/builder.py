@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ehir.core.block import Block
-from ehir.core.derectives import Derective_fn, Derective_struct
+from ehir.core.derectives import Derective_cimp, Derective_fn, Derective_imp, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions.base import Assignable, Instruction
 from ehir.core.instructions.capture import Instruction_lcpos, Instruction_lcsos, Instruction_scsoh, Instruction_scsos
@@ -48,6 +48,12 @@ class EHIR_Builder:
     def __init__(self, module: EHIR_Module):
         self.module = module
         self.shift = 0
+
+    def build_imp(self, prefix: list[str], symbol: str):
+        self.module.ast.append(Derective_imp(prefix=prefix, symbol=symbol))
+
+    def build_cimp(self, prefix: list[str], symbol: str):
+        self.module.ast.append(Derective_cimp(prefix=prefix, symbol=symbol))
 
     def build_struct(self, name: str, params: list[Parameter]):
         self.module.ast.append(

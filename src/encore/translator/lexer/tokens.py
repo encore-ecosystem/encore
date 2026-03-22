@@ -19,6 +19,10 @@ class TokenType(Enum):
     KW_IF = auto()
     KW_ELIF = auto()
     KW_ELSE = auto()
+    KW_PUB = auto()
+    KW_IMPORT = auto()
+
+    OP_SCOPE = auto()
 
     OP_PLUS = auto()
     OP_MINUS = auto()

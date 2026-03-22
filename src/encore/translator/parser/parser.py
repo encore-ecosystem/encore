@@ -1,6 +1,7 @@
 from encore.translator.lexer import Token
 from encore.translator.lexer.tokens import TokenType
 from encore.translator.parser import statements as s
+from encore.translator.parser.statements import Statement_Import
 
 
 class Parser:
@@ -16,14 +17,50 @@ class Parser:
     def _parse_top_level(self) -> s.Statement_TopLevel:
         curr_token = self._get_current_token()
 
+        is_public = False
+        if curr_token.type == TokenType.KW_PUB:
+            self._consume()
+            is_public = True
+            curr_token = self._get_current_token()
+
         if curr_token.type == TokenType.KW_FN:
-            return self._parse_function_definition()
+            return self._parse_function_definition(is_public)
         elif curr_token.type == TokenType.KW_STRUCT:
-            return self._parse_struct_definition()
+            return self._parse_struct_definition(is_public)
+        elif curr_token.type == TokenType.KW_IMPORT:
+            return self._parse_import(is_public)
 
         raise ValueError("Unable to parse top level statement")
 
-    def _parse_struct_definition(self) -> s.Statement_StructureDefinition:
+    def _parse_import(self, is_public: bool) -> s.Statement_Import:
+        self._safe_consume(TokenType.KW_IMPORT)
+        imp = self._parse_module_import()
+        return s.Statement_Import(is_public=is_public, pair=imp)
+
+    def _parse_module_import(self) -> Statement_Import.ImportPair:
+        module = self._safe_consume(TokenType.IDENTIFIER).value
+        if self._get_current_token().type != TokenType.OP_SCOPE:
+            return Statement_Import.ImportPair(module, [])
+
+        self._safe_consume(TokenType.OP_SCOPE)
+        curr_token = self._get_current_token()
+        match curr_token.type:
+            case TokenType.OP_MULTIPLY | TokenType.IDENTIFIER:
+                self._consume()
+                return Statement_Import.ImportPair(module, [Statement_Import.ImportPair(curr_token.value, [])])
+            case TokenType.LEFT_BRACE:
+                self._safe_consume(TokenType.LEFT_BRACE)
+                mods = []
+                mods.append(self._parse_module_import())
+                while self._get_current_token().type != TokenType.RIGHT_BRACE:
+                    self._safe_consume(TokenType.COMMA)
+                    mods.append(self._parse_module_import())
+                self._safe_consume(TokenType.RIGHT_BRACE)
+                return Statement_Import.ImportPair(module, mods)
+            case _:
+                raise ValueError(f"Unexpected Token: {curr_token}")
+
+    def _parse_struct_definition(self, is_public: bool) -> s.Statement_StructureDefinition:
         self._safe_consume(TokenType.KW_STRUCT)
         struct_name = self._safe_consume(TokenType.IDENTIFIER).value
 
@@ -35,7 +72,7 @@ class Parser:
 
         return s.Statement_StructureDefinition(name=struct_name, fields=fields)
 
-    def _parse_function_definition(self) -> s.Statement_FunctionDefinition:
+    def _parse_function_definition(self, is_public: bool) -> s.Statement_FunctionDefinition:
         self._safe_consume(TokenType.KW_FN)
         func_name = self._safe_consume(TokenType.IDENTIFIER).value
         params: list[tuple[str, str]] = []

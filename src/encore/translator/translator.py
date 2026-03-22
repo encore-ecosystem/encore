@@ -55,6 +55,7 @@ class Translator:
 
         tokens = self._lexer.tokenize(program)
         ast = self._parser.parse(tokens)
+        # print(*ast)
 
         for statement in ast:
             self._translate_statement(statement)
@@ -66,7 +67,20 @@ class Translator:
             return self._translate_function_definition(statement)
         elif isinstance(statement, s.Statement_StructureDefinition):
             return self._translate_structure_definition(statement)
+        elif isinstance(statement, s.Statement_Import):
+            return self._translate_import(statement)
         raise NotImplementedError(f"Translation for statement type {type(statement)} is not implemented.")
+
+    def _translate_import(self, statement: s.Statement_Import):
+        self._translate_import_pair(prefix=[], pair=statement.pair, is_public=statement.is_public)
+
+    def _translate_import_pair(self, prefix: list[str], pair: s.Statement_Import.ImportPair, is_public: bool):
+        match len(pair.dst):
+            case 0:
+                (self._builder.build_cimp if is_public else self._builder.build_imp)(prefix=prefix, symbol=pair.src)
+            case _:
+                for dst in pair.dst:
+                    self._translate_import_pair(prefix=prefix + [pair.src], pair=dst, is_public=is_public)
 
     def _translate_structure_definition(self, statement: s.Statement_StructureDefinition):
         self._builder.build_struct(statement.name, [Parameter(name, Type(type)) for (name, type) in statement.fields])
