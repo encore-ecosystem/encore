@@ -14,8 +14,13 @@ class ProjectSection(StrictModel):
     licence: str = Field(default="MIT")
 
 
+class SpecialSection(StrictModel):
+    no_std: bool = Field(default=False)
+
+
 class ProjectManifest(StrictModel):
     project: ProjectSection
+    special: SpecialSection
 
     @staticmethod
     def default_filename() -> str:
@@ -23,3 +28,10 @@ class ProjectManifest(StrictModel):
 
     def get_project_name(self) -> str:
         return self.project.name
+
+    @classmethod
+    def default(cls, project_name: str) -> "ProjectManifest":
+        return cls(
+            project=ProjectSection(name=project_name),
+            special=SpecialSection(),
+        )
