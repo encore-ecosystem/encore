@@ -6,7 +6,7 @@ from ehir.core.derectives import Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions.base import Assignable, Instruction
 from ehir.core.instructions.capture import Instruction_lcpos, Instruction_lcsos, Instruction_scsoh, Instruction_scsos
-from ehir.core.instructions.control_flow import Instruction_br, Instruction_cbr, Instruction_ret
+from ehir.core.instructions.control_flow import Instruction_br, Instruction_call, Instruction_cbr, Instruction_ret
 from ehir.core.instructions.control_flow.phi import Instruction_phi, PhiPair
 from ehir.core.instructions.memory import Instruction_sgetfield
 from ehir.core.instructions.operators.arithmetic import (
@@ -22,7 +22,6 @@ from ehir.core.instructions.operators.comparison import (
     Instruction_les,
 )
 from ehir.core.instructions.operators.logic import Instruction_ieq, Instruction_neq
-from ehir.core.instructions.special import Instruction_call
 from ehir.core.primitives import Usize_t
 from ehir.core.primitives.base import Primitive
 from ehir.core.struct import Struct
@@ -50,16 +49,17 @@ class EHIR_Builder:
         self.module = module
         self.shift = 0
 
-    def build_struct(self, name: str, args: list[Parameter]):
+    def build_struct(self, name: str, params: list[Parameter]):
         self.module.ast.append(
             Derective_struct(
-                name,
-                args,
+                name=name,
+                generics=[],
+                params=params,
             )
         )
 
     def build_fn(self, name: str, params: list[Parameter], ret_type: Type):
-        fn = Derective_fn(name, params, [], ret_type)
+        fn = Derective_fn(name=name, generics=[], params=params, body=[], ret_type=ret_type)
         self.module.ast.append(fn)
         self.current_function = fn
         self.variables = {}

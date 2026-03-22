@@ -11,11 +11,16 @@ from ehir_llvm_backend import EHIR_LLVM_Backend
 from encore.translator.translator import Translator
 from encore.utils.manifest import ProjectManifest
 
+AVAILABLE_BACKENDS = {"llvm": EHIR_LLVM_Backend}
+
 
 def add_build_parser(subparsers) -> tuple[str, Callable]:
     section = "build"
     build_parser = subparsers.add_parser(section, help="Build a project")
     build_parser.add_argument("--release", action="store_true", help="Enable release optimizations")
+    build_parser.add_argument(
+        "--backend", default="llvm", choices=set(AVAILABLE_BACKENDS.keys()), help="EHIR Compiler Backend"
+    )
     return (section, handle_build)
 
 
@@ -40,7 +45,7 @@ def handle_build(args: Namespace):
 
     translator = Translator()
     program_ehir = translator.run(program)
-    print(program_ehir.get_raw_program())
+    # print(program_ehir.get_raw_program())
 
     project_name = manifest.get_project_name()
     ehir_compiler = ehir.Compiler()
@@ -64,7 +69,7 @@ def handle_build(args: Namespace):
     with (ehir_dir / "main.ehir").open("w") as f:
         f.write(str(ehir_module))
 
-    backend = EHIR_LLVM_Backend(output_llvm_ir_path=llvm_dir)
+    backend = AVAILABLE_BACKENDS[args.backend](output_llvm_ir_path=llvm_dir)
     backend.compile(
         ehir_module,
         output_object_path=obj_dir / "main.o",
