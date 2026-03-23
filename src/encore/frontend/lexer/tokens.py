@@ -9,6 +9,9 @@ class TokenType(Enum):
 
     KW_FN = auto()
     KW_STRUCT = auto()
+    KW_TRAIT = auto()
+    KW_IMPL = auto()
+    KW_FOR = auto()
     KW_LET = auto()
     KW_RET = auto()
     KW_WHILE = auto()
@@ -19,6 +22,10 @@ class TokenType(Enum):
     KW_IF = auto()
     KW_ELIF = auto()
     KW_ELSE = auto()
+    KW_PUB = auto()
+    KW_IMPORT = auto()
+
+    OP_SCOPE = auto()
 
     OP_PLUS = auto()
     OP_MINUS = auto()

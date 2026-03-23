@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Literal
 
 
 @dataclass
@@ -10,7 +9,34 @@ class Statement:
 # =============
 @dataclass
 class Statement_TopLevel(Statement):
-    pass
+    is_public: bool
+
+    def __repr__(self) -> str:
+        return "pub" if self.is_public else ""
+
+
+@dataclass
+class Statement_Import(Statement_TopLevel):
+    @dataclass
+    class ImportPair:
+        src: str
+        dst: list["Statement_Import.ImportPair"]
+
+        def __repr__(self) -> str:
+            match len(self.dst):
+                case 0:
+                    return self.src
+                case 1:
+                    return f"{self.src}::{self.dst[0]}"
+                case _:
+                    dst_repr = f"{{ {', '.join(x.__repr__() for x in self.dst)} }}"
+                    return f"{self.src}::{dst_repr}"
+
+    pair: ImportPair
+
+    def __repr__(self) -> str:
+        pair_repr = self.pair.__repr__()
+        return f"{super().__repr__()}import {pair_repr}"
 
 
 @dataclass
@@ -31,7 +57,27 @@ class Statement_FunctionDefinition(Statement_TopLevel):
 @dataclass
 class Statement_StructureDefinition(Statement_TopLevel):
     name: str
+    generics: list[str]
     fields: list[tuple[str, str]]
+
+
+@dataclass
+class Statement_Impl(Statement_TopLevel):
+    # @dataclass
+    # class FunctionDeclaration(Statement_TopLevel):
+    #     name: str
+    #     generics: list[str]
+    #     params: list[tuple[str, str]]
+    #     type: str
+
+    generics: list[str]
+    trait_name: str | None
+    struct: str
+    body: list[Statement_FunctionDefinition]
+    is_public: bool
+
+    def __post_init__(self):
+        self.is_public = False
 
 
 # =============
@@ -206,7 +252,13 @@ class Expression_StructField(Statement_Expression):
 @dataclass
 class Expression_Call(Statement_Expression):
     name: str
+    generics: list[str]
     args: list[Statement_Expression]
+
+
+@dataclass
+class Expression_StructMethodCall(Expression_Call):
+    struct: str
 
 
 # =============

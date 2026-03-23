@@ -9,6 +9,9 @@ class Lexer:
         self.keywords = {
             "fn": TokenType.KW_FN,
             "struct": TokenType.KW_STRUCT,
+            "trait": TokenType.KW_TRAIT,
+            "impl": TokenType.KW_IMPL,
+            "for": TokenType.KW_FOR,
             "let": TokenType.KW_LET,
             "ret": TokenType.KW_RET,
             "while": TokenType.KW_WHILE,
@@ -19,6 +22,8 @@ class Lexer:
             "if": TokenType.KW_IF,
             "elif": TokenType.KW_ELIF,
             "else": TokenType.KW_ELSE,
+            "pub": TokenType.KW_PUB,
+            "import": TokenType.KW_IMPORT,
         }
 
         # Tokenization patterns (order matters!)
@@ -26,7 +31,8 @@ class Lexer:
             # Three-character operators
             (r"<<=", TokenType.OP_LSHIFT_ASSIGN),
             (r">>=", TokenType.OP_RSHIFT_ASSIGN),
-            # Two-character operators (must come first!)
+            # Two-character operators
+            (r"::", TokenType.OP_SCOPE),
             (r"==", TokenType.OP_EQUAL),
             (r"!=", TokenType.OP_NOT_EQUAL),
             (r"<=", TokenType.OP_LESS_EQUAL),
