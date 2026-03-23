@@ -29,5 +29,4 @@ class ProjectManifest(StrictModel):
     def default(cls, project_name: str) -> "ProjectManifest":
         return cls(
             project=ProjectSection(name=project_name),
-            special=SpecialSection(),
         )

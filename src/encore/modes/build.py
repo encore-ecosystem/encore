@@ -3,12 +3,10 @@ from argparse import Namespace
 from pathlib import Path
 from typing import Callable
 
-import git
 from ehir.backend import EHIR_Backend
 from ehir.compiler import EHIR_ProjectCompiler, Target
 from ehir_llvm_backend import EHIR_LLVM_Backend
 
-from encore import PROJECT_ROOT
 from encore.frontend import EHIR_EncoreFrontend
 from encore.utils.manifest import ProjectManifest
 
