@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Union
 
 
 @dataclass
@@ -58,7 +57,27 @@ class Statement_FunctionDefinition(Statement_TopLevel):
 @dataclass
 class Statement_StructureDefinition(Statement_TopLevel):
     name: str
+    generics: list[str]
     fields: list[tuple[str, str]]
+
+
+@dataclass
+class Statement_Impl(Statement_TopLevel):
+    # @dataclass
+    # class FunctionDeclaration(Statement_TopLevel):
+    #     name: str
+    #     generics: list[str]
+    #     params: list[tuple[str, str]]
+    #     type: str
+
+    generics: list[str]
+    trait_name: str | None
+    struct: str
+    body: list[Statement_FunctionDefinition]
+    is_public: bool
+
+    def __post_init__(self):
+        self.is_public = False
 
 
 # =============
@@ -233,7 +252,13 @@ class Expression_StructField(Statement_Expression):
 @dataclass
 class Expression_Call(Statement_Expression):
     name: str
+    generics: list[str]
     args: list[Statement_Expression]
+
+
+@dataclass
+class Expression_StructMethodCall(Expression_Call):
+    struct: str
 
 
 # =============

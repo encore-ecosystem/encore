@@ -9,6 +9,9 @@ class Lexer:
         self.keywords = {
             "fn": TokenType.KW_FN,
             "struct": TokenType.KW_STRUCT,
+            "trait": TokenType.KW_TRAIT,
+            "impl": TokenType.KW_IMPL,
+            "for": TokenType.KW_FOR,
             "let": TokenType.KW_LET,
             "ret": TokenType.KW_RET,
             "while": TokenType.KW_WHILE,

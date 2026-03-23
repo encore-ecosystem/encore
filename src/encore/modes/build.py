@@ -1,22 +1,21 @@
-import shutil
 import tomllib
 from argparse import Namespace
 from pathlib import Path
 from typing import Callable
 
-import ehir
-from ehir.backend import OptProfile
+from ehir.backend import EHIR_Backend
+from ehir.compiler import EHIR_ProjectCompiler, Target
 from ehir_llvm_backend import EHIR_LLVM_Backend
 
-from encore.translator.project_tree import ProjectTree
-from encore.translator.translator import Translator
+from encore import PROJECT_ROOT
+from encore.frontend import EHIR_EncoreFrontend
 from encore.utils.manifest import ProjectManifest
 
 AVAILABLE_BACKENDS = {"llvm": EHIR_LLVM_Backend}
 AVAILABLE_OPTPROFILES = {
-    "debug": OptProfile.debug,
-    "release": OptProfile.release,
-    "extreme": OptProfile.extreme,
+    "debug": EHIR_Backend.OptProfile.debug,
+    "release": EHIR_Backend.OptProfile.release,
+    "extreme": EHIR_Backend.OptProfile.extreme,
 }
 
 
@@ -44,7 +43,14 @@ def handle_build(args: Namespace):
     with manifest_path.open("r") as f:
         manifest = ProjectManifest(**tomllib.loads(f.read()))
 
-    project_tree = ProjectTree(
-        manifest=manifest, profile=AVAILABLE_OPTPROFILES[args.profile], backend=AVAILABLE_BACKENDS[args.backend]()
+    compiler = EHIR_ProjectCompiler(
+        frontend=EHIR_EncoreFrontend(src_dir=cwd / "src"),
+        backend=AVAILABLE_BACKENDS[args.backend](
+            target_dir=cwd / "target", opt_profile=AVAILABLE_OPTPROFILES[args.profile]
+        ),
     )
-    project_tree.compile(entrypoint=cwd / "src" / "main.enq")
+    compiler.add_target_to_build(Target(module_id=(cwd / "src" / "main.enq").__str__()))
+    if not manifest.special.no_std:
+        compiler.add_target_to_build(Target(module_id=(PROJECT_ROOT / "std" / "src" / "lib.enq").__str__()))
+
+    compiler.compile_all_targets()

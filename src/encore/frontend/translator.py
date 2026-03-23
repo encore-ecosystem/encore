@@ -1,5 +1,6 @@
 from typing import Optional
 
+from ehir.builder import EHIR_Builder, EHIR_Module
 from ehir.core.derectives import Derective_fn
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions.base import Assignable
@@ -15,11 +16,9 @@ from ehir.core.primitives import Usize
 from ehir.core.type import Type
 from ehir.core.variable import Parameter, Variable
 
-from encore.translator.lexer import Lexer
-from encore.translator.parser import Parser
-from encore.translator.parser import statements as s
-
-from .builder import EHIR_Builder, EHIR_Module
+from encore.frontend.lexer import Lexer
+from encore.frontend.parser import Parser
+from encore.frontend.parser import statements as s
 
 BINOP_MAPPING: dict[str, type[BinOp]] = {
     "+": Instruction_add,
@@ -37,7 +36,7 @@ class Translator:
     def __init__(self):
         self._lexer = Lexer()
         self._parser = Parser()
-        self._module = EHIR_Module(name="default")
+        self._module = EHIR_Module(id="default", ast=[])
         self._builder = EHIR_Builder(self._module)
         self._current_function = None
         self._current_variable_name = "null"
@@ -532,9 +531,21 @@ class Translator:
         elif isinstance(expr, s.Expression_StructField):
             return self._builder.build_sgetfield(src=Variable(expr.name), field=Variable(expr.field))
 
-        elif isinstance(expr, s.Expression_Call):
+        elif isinstance(expr, s.Expression_StructMethodCall):
+            generics = [Type(g) for g in expr.generics]
             args = [self._translate_expression(arg_exp).var_out for arg_exp in expr.args]
-            return self._builder.build_call(fn_name=expr.name, args=args, name=name)
+            return self._builder.build_struct_method_call(
+                struct=expr.struct,
+                fn_name=expr.name,
+                generics=generics,
+                args=args,
+                name=name,
+            )
+
+        elif isinstance(expr, s.Expression_Call):
+            generics = [Type(g) for g in expr.generics]
+            args = [self._translate_expression(arg_exp).var_out for arg_exp in expr.args]
+            return self._builder.build_call(fn_name=expr.name, generics=generics, args=args, name=name)
 
         raise NotImplementedError(f"Translation for expression type {type(expr)} is not implemented.")
 
