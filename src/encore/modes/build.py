@@ -3,6 +3,7 @@ from argparse import Namespace
 from pathlib import Path
 from typing import Callable
 
+import git
 from ehir.backend import EHIR_Backend
 from ehir.compiler import EHIR_ProjectCompiler, Target
 from ehir_llvm_backend import EHIR_LLVM_Backend
@@ -49,8 +50,33 @@ def handle_build(args: Namespace):
             target_dir=cwd / "target", opt_profile=AVAILABLE_OPTPROFILES[args.profile]
         ),
     )
-    compiler.add_target_to_build(Target(module_id=(cwd / "src" / "main.enq").__str__()))
-    if not manifest.special.no_std:
-        compiler.add_target_to_build(Target(module_id=(PROJECT_ROOT / "std" / "src" / "lib.enq").__str__()))
 
+    for dependency in manifest.project.dependencies:
+        target = get_target_dependency(dependency)
+        compiler.add_target_to_build(target)
+
+    compiler.add_target_to_build(Target(module_id=(cwd / "src" / "main.enq").__str__()))
     compiler.compile_all_targets()
+
+
+def get_target_dependency(dep: str) -> Target:
+    from git import Repo
+
+    from encore import ENCORE_CACHE_DIR
+
+    ENCORE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if dep.startswith("git@"):
+        repo_url = dep.removeprefix("git@")
+        org, repo_name = repo_url.split("/")[-2:]
+        path = ENCORE_CACHE_DIR / "git" / org / repo_name
+        path.mkdir(parents=True, exist_ok=True)
+        Repo.clone_from(url=repo_url, to_path=path)
+
+    elif dep.startswith("path@"):
+        path = dep.removeprefix("path@")
+
+    else:
+        raise RuntimeError(f"Unable to load dependency: {dep}")
+
+    return Target(module_id=path.__str__(), type=Target.TargetType.RAW)

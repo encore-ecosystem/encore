@@ -9,18 +9,14 @@ class StrictModel(BaseModel):
 class ProjectSection(StrictModel):
     name: str
     version: str = Field(default="0.0.0")
-    description: str = Field(default="Add description here")
+    description: str = Field(default="")
     readme: str = Field(default="README.md")
     licence: str = Field(default="MIT")
-
-
-class SpecialSection(StrictModel):
-    no_std: bool = Field(default=False)
+    dependencies: list[str] = Field(default=["git@https://github.com/encore-language/stdlib"])
 
 
 class ProjectManifest(StrictModel):
     project: ProjectSection
-    special: SpecialSection
 
     @staticmethod
     def default_filename() -> str:
