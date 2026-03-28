@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Optional
 
 from ehir.builder import EHIR_Builder, EHIR_Module
@@ -36,7 +37,7 @@ class Translator:
     def __init__(self):
         self._lexer = Lexer()
         self._parser = Parser()
-        self._module = EHIR_Module(id="default", ast=[])
+        self._module = EHIR_Module(id=Path(), ast=[])
         self._builder = EHIR_Builder(self._module)
         self._current_function = None
         self._current_variable_name = "null"

@@ -32,8 +32,8 @@ class Parser:
             return self._parse_struct_definition(is_public)
         elif curr_token.type == TokenType.KW_IMPORT:
             return self._parse_import(is_public)
-        elif curr_token.type == TokenType.KW_TRAIT:
-            return self._parse_trait(is_public)
+        # elif curr_token.type == TokenType.KW_TRAIT:
+        #     return self._parse_trait(is_public)
 
         raise ValueError("Unable to parse top level statement")
 
