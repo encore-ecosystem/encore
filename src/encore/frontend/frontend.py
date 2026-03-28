@@ -11,24 +11,20 @@ from encore.frontend.translator import Translator
 
 @dataclass
 class EHIR_EncoreFrontend(EHIR_Frontend):
-    """
-    ID - Absolute path to file with .enq suffix
-    """
-
     src_dir: Path
-    _cache: dict[str, EHIR_Module] = field(default_factory=dict)
+    _cache: dict[Path, EHIR_Module] = field(default_factory=dict)
 
-    def get_module_by_id(self, id: str) -> EHIR_Module:
+    def get_module_by_id(self, id: Path) -> EHIR_Module:
         if m := self._cache.get(id, None):
             return m
 
-        with Path(id).open("r") as f:
+        with id.open("r") as f:
             module = Translator().run(f.read())
 
         self._cache[module.id] = module
         return module
 
-    def get_parent_id_of(self, id: str, derective: Derective_import) -> str:
+    def get_parent_id_of(self, id: Path, derective: Derective_import) -> Path:
         match derective.prefix[0]:
             case "repo":
                 dep_filepath = self.src_dir / Path(*derective.prefix[1:])
@@ -43,4 +39,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         if not dep_filepath.exists():
             raise RuntimeError(f"Unable to import: {derective} in {id}")
-        return dep_filepath.__str__()
+        return dep_filepath
+
+    def get_file_extension(self) -> str:
+        return ".enq"

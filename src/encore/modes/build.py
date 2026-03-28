@@ -3,8 +3,9 @@ from argparse import Namespace
 from pathlib import Path
 from typing import Callable
 
+from ehir import Refrain
 from ehir.backend import EHIR_Backend
-from ehir.compiler import EHIR_ProjectCompiler, Target
+from ehir.compiler import EHIR_ProjectCompiler
 from ehir_llvm_backend import EHIR_LLVM_Backend
 
 from encore.frontend import EHIR_EncoreFrontend
@@ -34,30 +35,17 @@ def add_build_parser(subparsers) -> tuple[str, Callable]:
 def handle_build(args: Namespace):
     cwd = Path().resolve()
 
-    manifest_path = cwd / ProjectManifest.default_filename()
-    if not manifest_path.exists():
-        print("Project is not initialized")
-        exit(-1)
-
-    with manifest_path.open("r") as f:
-        manifest = ProjectManifest(**tomllib.loads(f.read()))
-
     compiler = EHIR_ProjectCompiler(
         frontend=EHIR_EncoreFrontend(src_dir=cwd / "src"),
         backend=AVAILABLE_BACKENDS[args.backend](
             target_dir=cwd / "target", opt_profile=AVAILABLE_OPTPROFILES[args.profile]
         ),
     )
-
-    for dependency in manifest.project.dependencies:
-        target = get_target_dependency(dependency)
-        compiler.add_target_to_build(target)
-
-    compiler.add_target_to_build(Target(module_id=(cwd / "src" / "main.enq").__str__()))
-    compiler.compile_all_targets()
+    _load_refrain(compiler, cwd, type=Refrain.TargetType.EXECUTABLE)
+    compiler.compile_all()
 
 
-def get_target_dependency(dep: str) -> Target:
+def _resolve_dependency(dep: str) -> Path:
     from git import Repo
 
     from encore import ENCORE_CACHE_DIR
@@ -69,12 +57,36 @@ def get_target_dependency(dep: str) -> Target:
         org, repo_name = repo_url.split("/")[-2:]
         path = ENCORE_CACHE_DIR / "git" / org / repo_name
         path.mkdir(parents=True, exist_ok=True)
-        Repo.clone_from(url=repo_url, to_path=path)
+        if not path.exists:
+            Repo.clone_from(url=repo_url, to_path=path)
 
     elif dep.startswith("path@"):
-        path = dep.removeprefix("path@")
+        path = Path(dep.removeprefix("path@")).resolve()
 
     else:
         raise RuntimeError(f"Unable to load dependency: {dep}")
 
-    return Target(module_id=path.__str__(), type=Target.TargetType.RAW)
+    return path
+
+
+def _load_refrain(
+    compiler: EHIR_ProjectCompiler, path: Path, type: Refrain.TargetType = Refrain.TargetType.OBJECT
+) -> Refrain:
+    manifest_path = path / ProjectManifest.default_filename()
+    if not manifest_path.exists():
+        print(f"Project {path} is not initialized")
+        exit(-1)
+    with manifest_path.open("r") as f:
+        manifest = ProjectManifest(**tomllib.loads(f.read()))
+
+    for dependency in manifest.project.dependencies:
+        _dep_path = _resolve_dependency(dependency)
+        _load_refrain(compiler, _dep_path, Refrain.TargetType.OBJECT)
+
+    ref = Refrain(
+        name=manifest.project.name,
+        path=path,
+        type=type,
+    )
+    compiler.add_refrain_to_build(ref)
+    return ref
