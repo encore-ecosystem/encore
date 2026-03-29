@@ -9,6 +9,7 @@ class Lexer:
         self.keywords = {
             "fn": TokenType.KW_FN,
             "struct": TokenType.KW_STRUCT,
+            "enum": TokenType.KW_ENUM,
             "trait": TokenType.KW_TRAIT,
             "impl": TokenType.KW_IMPL,
             "for": TokenType.KW_FOR,

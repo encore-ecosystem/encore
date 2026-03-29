@@ -1,8 +1,10 @@
 import argparse
+import sys
 from typing import Callable
 
 from encore import modes
 
+sys.setrecursionlimit(150)
 MODES = [
     modes.add_init_parser,
     modes.add_build_parser,
