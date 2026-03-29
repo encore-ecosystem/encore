@@ -5,6 +5,7 @@ from enum import Enum, auto
 class TokenType(Enum):
     INTEGER = auto()
     FLOAT = auto()
+    STRING = auto()
     IDENTIFIER = auto()
 
     KW_FN = auto()
@@ -23,6 +24,7 @@ class TokenType(Enum):
     KW_IF = auto()
     KW_ELIF = auto()
     KW_ELSE = auto()
+    KW_MATCH = auto()
     KW_PUB = auto()
     KW_IMPORT = auto()
 
@@ -68,6 +70,7 @@ class TokenType(Enum):
     OP_DECREMENT = auto()
 
     OP_ARROW = auto()
+    OP_FAT_ARROW = auto()
 
     LEFT_PAREN = auto()
     RIGHT_PAREN = auto()

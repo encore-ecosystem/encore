@@ -7,6 +7,7 @@ from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum, EnumVariant
 from ehir.core.instructions.base import Assignable
 from ehir.core.instructions.capture import Instruction_lceos, Instruction_lcsos, Instruction_scsoh, Instruction_scsos
+from ehir.core.instructions.control_flow import MatchCase
 from ehir.core.instructions.control_flow.phi import PhiPair
 from ehir.core.instructions.memory import Instruction_sgetfieldptr, Instruction_store
 from ehir.core.instructions.operators.arithmetic import (
@@ -16,14 +17,18 @@ from ehir.core.instructions.operators.arithmetic import (
     Instruction_sub,
 )
 from ehir.core.instructions.operators.base import BinOp
-from ehir.core.primitives import Usize, Usize_t
+from ehir.core.primitives import Float, Float_t, Isize, Isize_t, Str, Str_t, Usize, Usize_t
 from ehir.core.struct import Struct
 from ehir.core.type import HeapSmartPointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter, Variable
 
+from encore.frontend.inference import TypeInferer
 from encore.frontend.lexer import Lexer
 from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
+
+MatchArmLike = s.Statement_MatchArm | s.Expression_MatchArm
+MatchBodyArmLike = s.Statement_MatchArm | s.Expression_MatchArm
 
 BINOP_MAPPING: dict[str, type[BinOp]] = {
     "+": Instruction_add,
@@ -39,6 +44,26 @@ class Translator:
     _structs: dict[str, s.StructureDefinition]
     _builder: EHIR_Builder
     _module: EHIR_Module
+
+    class _PreparedMatch:
+        def __init__(
+            self,
+            *,
+            scrutinee: Assignable,
+            base_var_vals: dict[str, Variable],
+            end_block,
+            default_block,
+            wildcard_arm: MatchBodyArmLike | None,
+            arm_blocks: dict[int, object],
+            arm_payload_types: dict[int, Type | None],
+        ):
+            self.scrutinee = scrutinee
+            self.base_var_vals = base_var_vals
+            self.end_block = end_block
+            self.default_block = default_block
+            self.wildcard_arm = wildcard_arm
+            self.arm_blocks = arm_blocks
+            self.arm_payload_types = arm_payload_types
 
     def __init__(self):
         self._lexer = Lexer()
@@ -66,6 +91,7 @@ class Translator:
         self._reset_state()
         tokens = self._lexer.tokenize(program)
         ast = self._parser.parse(tokens)
+        TypeInferer().infer(ast)
         return self.translate_ast(ast)
 
     def translate_ast(self, ast: list[s.Statement]) -> EHIR_Module:
@@ -155,6 +181,7 @@ class Translator:
         return derective
 
     def _translate_function_definition(self, statement: s.Statement_FunctionDefinition):
+        assert statement.type is not None
         self._builder.build_fn(
             name=statement.name,
             generics=[self._translate_type(g) for g in statement.generics],
@@ -200,21 +227,29 @@ class Translator:
         elif isinstance(statement, s.Statement_If):
             return self._translate_if(statement)
 
+        elif isinstance(statement, s.Statement_Match):
+            return self._translate_match(statement)
+
         elif isinstance(statement, s.Statement_Assignment):
             return self._translate_assignment(statement)
 
         raise NotImplementedError(f"Translation for inner statement type {type(statement)} is not implemented.")
 
     def _translate_let(self, statement: s.Statement_Let):
+        assert statement.type is not None
         self._set_new_variable(statement.name)
-        val = self._translate_expression(
-            statement.expr, name=statement.name, expected_type=self._translate_type(statement.type)
-        )
+        expected_type = self._translate_type(statement.type)
+        val = self._translate_expression(statement.expr, name=statement.name, expected_type=expected_type)
+        if val.var_out.type is None:
+            val.var_out.type = expected_type
         self._var_vals[statement.name] = val.var_out
 
     def _translate_ret(self, statement: s.Statement_Ret):
         self._set_new_variable("ret")
-        expr = self._translate_expression(expr=statement.expr)
+        expected_type = None
+        if hasattr(self._builder, "current_function"):
+            expected_type = self._builder.current_function.ret_type
+        expr = self._translate_expression(expr=statement.expr, expected_type=expected_type)
         self._builder.build_ret(expr.var_out)
         self._mark_current_block_terminated()
 
@@ -246,11 +281,14 @@ class Translator:
         if isinstance(statement.target, s.Expression_Path) and len(statement.target.segments) == 1:
             target_name = self._assignment_targets.get(statement.name, statement.name)
             self._set_new_variable(target_name)
+            expected_type = self._resolve_variable(statement.name).type
             val = self._translate_expression(
                 statement.expr,
                 name=target_name,
-                expected_type=self._resolve_variable(statement.name).type,
+                expected_type=expected_type,
             )
+            if val.var_out.type is None:
+                val.var_out.type = expected_type
             self._var_vals[statement.name] = val.var_out
             return
 
@@ -541,6 +579,63 @@ class Translator:
             phi = self._builder.build_phi(f"{var}_if_{if_id}", base_var_vals[var].type, pairs)
             self._var_vals[var] = phi.var_out
 
+    def _translate_match(self, statement: s.Statement_Match):
+        match_id = self._if_counter
+        self._if_counter += 1
+
+        prepared = self._prepare_match(
+            match_id=match_id,
+            scrutinee_expr=statement.expr,
+            arms=statement.arms,
+            end_prefix="match_end",
+            default_prefix="match_default",
+            arm_prefix="match_arm",
+        )
+        modified = self._collect_match_assignments(statement) & prepared.base_var_vals.keys()
+        phi_inputs: dict[str, list[PhiPair]] = {var: [] for var in modified}
+        dispatch_block = self._builder.current_block.name
+
+        for idx, arm in enumerate(statement.arms):
+            if arm.is_wildcard:
+                continue
+
+            self._builder.position_at_end(prepared.arm_blocks[idx])
+            self._var_vals = dict(prepared.base_var_vals)
+            payload_type = prepared.arm_payload_types[idx]
+
+            if arm.binding is not None and payload_type is not None:
+                self._var_vals[arm.binding] = Variable(arm.binding, payload_type)
+
+            self._translate_block(arm.body)
+            if not self._is_current_block_terminated():
+                arm_exit = self._builder.current_block.name
+                self._builder.build_br(prepared.end_block.name)
+                self._mark_current_block_terminated()
+
+                for var in modified:
+                    phi_inputs[var].append(PhiPair(self._var_vals.get(var, prepared.base_var_vals[var]), arm_exit))
+
+        if prepared.wildcard_arm is not None:
+            self._builder.position_at_end(prepared.default_block)
+            self._var_vals = dict(prepared.base_var_vals)
+            self._translate_block(prepared.wildcard_arm.body)
+            if not self._is_current_block_terminated():
+                default_exit = self._builder.current_block.name
+                self._builder.build_br(prepared.end_block.name)
+                self._mark_current_block_terminated()
+
+                for var in modified:
+                    phi_inputs[var].append(PhiPair(self._var_vals.get(var, prepared.base_var_vals[var]), default_exit))
+
+        self._builder.position_at_end(prepared.end_block)
+        self._var_vals = dict(prepared.base_var_vals)
+        if prepared.wildcard_arm is None:
+            for var in modified:
+                phi_inputs[var].append(PhiPair(prepared.base_var_vals[var], dispatch_block))
+        for var, pairs in phi_inputs.items():
+            phi = self._builder.build_phi(f"{var}_match_{match_id}", prepared.base_var_vals[var].type, pairs)
+            self._var_vals[var] = phi.var_out
+
     def _collect_assignments(self, body: list[s.Statement_InnerLevel]) -> set[str]:
         assigned: set[str] = set()
         for stmt in body:
@@ -551,6 +646,8 @@ class Translator:
                 assigned |= self._collect_assignments(stmt.body)
             elif isinstance(stmt, s.Statement_If):
                 assigned |= self._collect_if_assignments(stmt)
+            elif isinstance(stmt, s.Statement_Match):
+                assigned |= self._collect_match_assignments(stmt)
         return assigned
 
     def _collect_if_assignments(self, statement: s.Statement_If) -> set[str]:
@@ -561,6 +658,48 @@ class Translator:
             assigned |= self._collect_assignments(statement.else_body)
         return assigned
 
+    def _collect_match_assignments(self, statement: s.Statement_Match) -> set[str]:
+        assigned: set[str] = set()
+        for arm in statement.arms:
+            assigned |= self._collect_assignments(arm.body)
+        return assigned
+
+    def _resolve_match_arm(self, scrutinee_type: Type, arm: s.Statement_MatchArm) -> tuple[str, int, Optional[Type]]:
+        if arm.is_wildcard:
+            raise TypeError("Wildcard arm has no explicit variant")
+        return self._resolve_match_arm_common(scrutinee_type, arm)
+
+    def _resolve_match_arm_common(self, scrutinee_type: Type, arm: MatchArmLike) -> tuple[str, int, Optional[Type]]:
+        base_type = (
+            scrutinee_type.pointee
+            if isinstance(scrutinee_type, (HeapSmartPointer, StackSmartPointer))
+            else scrutinee_type
+        )
+        enum = self._enums.get(base_type.name)
+        if enum is None:
+            raise TypeError(f"Match expression must be an enum, got {scrutinee_type}")
+        generic_mapping = {generic.name: concrete for generic, concrete in zip(enum.generics, base_type.generics)}
+
+        assert arm.pattern is not None
+        if len(arm.pattern.segments) == 1:
+            variant_name = arm.pattern.segments[0].name
+        elif len(arm.pattern.segments) == 2:
+            explicit_enum = arm.pattern.segments[0]
+            if explicit_enum.name != base_type.name:
+                raise TypeError(f"Pattern enum '{explicit_enum.name}' does not match scrutinee type '{base_type.name}'")
+            if explicit_enum.generics and explicit_enum != base_type:
+                raise TypeError(f"Pattern enum '{explicit_enum}' does not match scrutinee type '{base_type}'")
+            variant_name = arm.pattern.segments[1].name
+        else:
+            raise TypeError(f"Unsupported match pattern: {arm.pattern}")
+
+        for idx, variant in enumerate(enum.variants):
+            if variant.name == variant_name:
+                payload_type = None if variant.type is None else self._specialize_type(variant.type, generic_mapping)
+                return variant_name, idx, payload_type
+
+        raise TypeError(f"Unknown variant '{variant_name}' for enum '{enum.name}'")
+
     def _translate_expression(
         self,
         expr: s.Statement_Expression,
@@ -568,11 +707,22 @@ class Translator:
         expected_type: Optional[Type] = None,
     ) -> Assignable:
         if isinstance(expr, s.Expression_BooleanLiteral):
-            return self._builder.build_lcpos(prim=Usize(int(expr.value)), name=name)
+            return self._builder.build_lcpos(prim=Usize(int(expr.value), size=1), name=name)
+
+        elif isinstance(expr, s.Expression_StringLiteral):
+            return self._builder.build_lcpos(prim=Str(expr.value), name=name)
 
         elif isinstance(expr, s.Expression_IntegerLiteral):
+            prim = self._build_integer_primitive(int(expr.value), expr.literal_type or expected_type)
+            return self._builder.build_lcpos(prim=prim, name=name)
+
+        elif isinstance(expr, s.Expression_FloatLiteral):
             return self._builder.build_lcpos(
-                prim=Usize(int(expr.value), size=self._infer_int_size(expected_type)), name=name
+                prim=Float(
+                    float(expr.value),
+                    size=self._infer_float_size(expr.literal_type or expected_type),
+                ),
+                name=name,
             )
 
         elif isinstance(expr, s.Expression_Path):
@@ -588,6 +738,15 @@ class Translator:
                 return Assignable(out)
 
             raise NotImplementedError(f"Translation for path expression {expr.name} is not implemented.")
+
+        elif isinstance(expr, s.Expression_Block):
+            return self._translate_expression_block(expr, name=name, expected_type=expected_type)
+
+        elif isinstance(expr, s.Expression_If):
+            return self._translate_if_expression(expr, name=name, expected_type=expected_type)
+
+        elif isinstance(expr, s.Expression_Match):
+            return self._translate_match_expression(expr, name=name, expected_type=expected_type)
 
         elif isinstance(expr, s.Expression_BinaryOperation):
             lhs = self._translate_expression(expr.lhs)
@@ -651,6 +810,191 @@ class Translator:
             return self._builder.build_call(fn_name=expr.name, generics=generics, args=args, name=name)
 
         raise NotImplementedError(f"Translation for expression type {type(expr)} is not implemented.")
+
+    def _translate_expression_block(
+        self,
+        expr: s.Expression_Block,
+        name: Optional[str] = None,
+        expected_type: Optional[Type] = None,
+    ) -> Assignable:
+        outer_var_vals = self._var_vals
+        outer_assignment_targets = self._assignment_targets
+        self._var_vals = dict(self._var_vals)
+        self._assignment_targets = dict(self._assignment_targets)
+
+        try:
+            for statement in expr.body:
+                self._translate_expression_block_statement(statement)
+            return self._translate_expression(expr.expr, name=name, expected_type=expected_type)
+        finally:
+            self._var_vals = outer_var_vals
+            self._assignment_targets = outer_assignment_targets
+
+    def _translate_expression_block_statement(self, statement: s.Statement_InnerLevel):
+        if isinstance(statement, (s.Statement_Ret, s.Statement_Break, s.Statement_Continue)):
+            raise TypeError(f"{type(statement).__name__} is not allowed inside expression block")
+        self._translate_inner_statement(statement)
+
+    def _translate_if_expression(
+        self,
+        expr: s.Expression_If,
+        name: Optional[str] = None,
+        expected_type: Optional[Type] = None,
+    ) -> Assignable:
+        if_id = self._if_counter
+        self._if_counter += 1
+
+        branch_count = len(expr.branches)
+        branch_bodies = [self._builder.append_block(f"if_expr_body_{if_id}_{idx}") for idx in range(branch_count)]
+        cond_blocks = [self._builder.current_block] + [
+            self._builder.append_block(f"if_expr_cond_{if_id}_{idx}") for idx in range(1, branch_count)
+        ]
+        else_block = self._builder.append_block(f"if_expr_else_{if_id}")
+        end_block = self._builder.append_block(f"if_expr_end_{if_id}")
+
+        base_var_vals = dict(self._var_vals)
+        phi_pairs: list[PhiPair] = []
+        result_name = name or self._advance_variable()
+        result_type = expected_type
+
+        for idx, branch in enumerate(expr.branches):
+            self._builder.position_at_end(cond_blocks[idx])
+            self._var_vals = dict(base_var_vals)
+
+            false_target = cond_blocks[idx + 1].name if idx + 1 < branch_count else else_block.name
+            cond = self._translate_expression(branch.expr)
+            self._builder.build_cbr(cond.var_out, branch_bodies[idx].name, false_target)
+            self._mark_current_block_terminated()
+
+            self._builder.position_at_end(branch_bodies[idx])
+            branch_result = self._translate_expression(branch.body, expected_type=expected_type)
+            result_type = result_type or branch_result.var_out.type
+            branch_exit = self._builder.current_block.name
+            self._builder.build_br(end_block.name)
+            self._mark_current_block_terminated()
+            phi_pairs.append(PhiPair(branch_result.var_out, branch_exit))
+
+        self._builder.position_at_end(else_block)
+        self._var_vals = dict(base_var_vals)
+        else_result = self._translate_expression(expr.else_body, expected_type=expected_type)
+        result_type = result_type or else_result.var_out.type
+        else_exit = self._builder.current_block.name
+        self._builder.build_br(end_block.name)
+        self._mark_current_block_terminated()
+        phi_pairs.append(PhiPair(else_result.var_out, else_exit))
+
+        assert result_type is not None
+        self._builder.position_at_end(end_block)
+        self._var_vals = dict(base_var_vals)
+        phi = self._builder.build_phi(result_name, result_type, phi_pairs)
+        return Assignable(phi.var_out)
+
+    def _translate_match_expression(
+        self,
+        expr: s.Expression_Match,
+        name: Optional[str] = None,
+        expected_type: Optional[Type] = None,
+    ) -> Assignable:
+        match_id = self._if_counter
+        self._if_counter += 1
+
+        prepared = self._prepare_match(
+            match_id=match_id,
+            scrutinee_expr=expr.expr,
+            arms=expr.arms,
+            end_prefix="match_expr_end",
+            default_prefix="match_expr_default",
+            arm_prefix="match_expr_arm",
+        )
+        phi_pairs: list[PhiPair] = []
+        result_name = name or self._advance_variable()
+        result_type = expected_type
+
+        for idx, arm in enumerate(expr.arms):
+            if arm.is_wildcard:
+                continue
+
+            self._builder.position_at_end(prepared.arm_blocks[idx])
+            self._var_vals = dict(prepared.base_var_vals)
+
+            payload_type = prepared.arm_payload_types[idx]
+            if arm.binding is not None and payload_type is not None:
+                self._var_vals[arm.binding] = Variable(arm.binding, payload_type)
+
+            arm_result = self._translate_expression(arm.expr, expected_type=expected_type)
+            result_type = result_type or arm_result.var_out.type
+            arm_exit = self._builder.current_block.name
+            self._builder.build_br(prepared.end_block.name)
+            self._mark_current_block_terminated()
+            phi_pairs.append(PhiPair(arm_result.var_out, arm_exit))
+
+        if prepared.wildcard_arm is not None:
+            self._builder.position_at_end(prepared.default_block)
+            self._var_vals = dict(prepared.base_var_vals)
+            default_result = self._translate_expression(prepared.wildcard_arm.expr, expected_type=expected_type)
+            result_type = result_type or default_result.var_out.type
+            default_exit = self._builder.current_block.name
+            self._builder.build_br(prepared.end_block.name)
+            self._mark_current_block_terminated()
+            phi_pairs.append(PhiPair(default_result.var_out, default_exit))
+
+        assert result_type is not None
+        self._builder.position_at_end(prepared.end_block)
+        self._var_vals = dict(prepared.base_var_vals)
+        phi = self._builder.build_phi(result_name, result_type, phi_pairs)
+        return Assignable(phi.var_out)
+
+    def _prepare_match(
+        self,
+        *,
+        match_id: int,
+        scrutinee_expr: s.Statement_Expression,
+        arms: list[MatchBodyArmLike],
+        end_prefix: str,
+        default_prefix: str,
+        arm_prefix: str,
+    ) -> _PreparedMatch:
+        scrutinee = self._translate_expression(scrutinee_expr)
+        assert scrutinee.var_out.type is not None
+        base_var_vals = dict(self._var_vals)
+        end_block = self._builder.append_block(f"{end_prefix}_{match_id}")
+        wildcard_arm = next((arm for arm in arms if arm.is_wildcard), None)
+        default_block = (
+            self._builder.append_block(f"{default_prefix}_{match_id}") if wildcard_arm is not None else end_block
+        )
+
+        arm_blocks: dict[int, object] = {}
+        arm_payload_types: dict[int, Type | None] = {}
+        cases: list[MatchCase] = []
+        for idx, arm in enumerate(arms):
+            if arm.is_wildcard:
+                continue
+            arm_blocks[idx] = self._builder.append_block(f"{arm_prefix}_{match_id}_{idx}")
+            variant_name, _, payload_type = self._resolve_match_arm_common(scrutinee.var_out.type, arm)
+            arm_payload_types[idx] = payload_type
+            payload_var = (
+                Variable(arm.binding, payload_type) if arm.binding is not None and payload_type is not None else None
+            )
+            cases.append(MatchCase(variant=variant_name, label=arm_blocks[idx].name, payload_var=payload_var))
+
+        self._builder.build_match(cond_var=scrutinee.var_out, default_label=default_block.name, cases=cases)
+        self._mark_current_block_terminated()
+        return self._PreparedMatch(
+            scrutinee=scrutinee,
+            base_var_vals=base_var_vals,
+            end_block=end_block,
+            default_block=default_block,
+            wildcard_arm=wildcard_arm,
+            arm_blocks=arm_blocks,
+            arm_payload_types=arm_payload_types,
+        )
+
+    def _resolve_expression_match_arm_translation(
+        self, scrutinee_type: Type, arm: s.Expression_MatchArm
+    ) -> tuple[str, int, Optional[Type]]:
+        if arm.is_wildcard:
+            raise TypeError("Wildcard arm has no explicit variant")
+        return self._resolve_match_arm_common(scrutinee_type, arm)
 
     def _mark_current_block_terminated(self):
         self._terminated_blocks.add(self._builder.current_block.name)
@@ -777,8 +1121,20 @@ class Translator:
             return HeapSmartPointer(self._translate_type(typ.pointee))
         if isinstance(typ, StackSmartPointer):
             return StackSmartPointer(self._translate_type(typ.pointee))
+        if typ.name == "bool":
+            return Usize_t(1)
+        if typ.name == "usize":
+            return Usize_t()
+        if typ.name == "isize":
+            return Isize_t()
+        if typ.name == "str":
+            return Str_t()
         if typ.name.startswith("u") and typ.name[1:].isdigit():
             return Usize_t(int(typ.name[1:]))
+        if typ.name.startswith("i") and typ.name[1:].isdigit():
+            return Isize_t(int(typ.name[1:]))
+        if typ.name.startswith("f") and typ.name[1:].isdigit():
+            return Float_t(int(typ.name[1:]))
         return Type(typ.name, [self._translate_type(generic) for generic in typ.generics])
 
     @staticmethod
@@ -789,6 +1145,39 @@ class Translator:
         base_type = (
             expected_type.pointee if isinstance(expected_type, (HeapSmartPointer, StackSmartPointer)) else expected_type
         )
-        if base_type.name.startswith("u") and base_type.name[1:].isdigit():
+        if base_type.name == "usize":
+            return 32
+        if base_type.name == "isize":
+            return 32
+        if base_type.name[1:].isdigit() and base_type.name[0] in ("u", "i"):
             return int(base_type.name[1:])
         return 32
+
+    @staticmethod
+    def _infer_float_size(expected_type: Optional[Type]) -> int:
+        if expected_type is None:
+            return 64
+        base_type = (
+            expected_type.pointee if isinstance(expected_type, (HeapSmartPointer, StackSmartPointer)) else expected_type
+        )
+        if base_type.name.startswith("f") and base_type.name[1:].isdigit():
+            return int(base_type.name[1:])
+        return 64
+
+    @classmethod
+    def _build_integer_primitive(cls, value: int, expected_type: Optional[Type]):
+        if expected_type is None:
+            return Isize(value, size=32)
+
+        base_type = (
+            expected_type.pointee if isinstance(expected_type, (HeapSmartPointer, StackSmartPointer)) else expected_type
+        )
+        if base_type.name == "usize":
+            return Usize(value)
+        if base_type.name == "isize":
+            return Isize(value)
+        if base_type.name.startswith("u") and base_type.name[1:].isdigit():
+            return Usize(value, size=int(base_type.name[1:]))
+        if base_type.name.startswith("i") and base_type.name[1:].isdigit():
+            return Isize(value, size=int(base_type.name[1:]))
+        return Isize(value, size=32)

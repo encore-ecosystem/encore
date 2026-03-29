@@ -8,6 +8,7 @@ from ehir.builder import EHIR_Module
 from ehir.core.derectives import Derective_imp, Derective_import
 
 from encore import ENCORE_CACHE_DIR, PROJECT_ROOT
+from encore.frontend.inference import TypeInferer
 from encore.frontend.lexer import Lexer
 from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
@@ -51,6 +52,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         ast = self._get_ast_by_id(id)
         imported_declarations = self._collect_imported_declarations(id, ast)
+        TypeInferer().infer(ast, imported_declarations)
 
         translator = Translator()
         translator.preload_declarations(imported_declarations)
