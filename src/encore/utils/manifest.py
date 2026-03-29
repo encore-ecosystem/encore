@@ -22,7 +22,7 @@ class ProjectSection(StrictModel):
     description: str = Field(default="")
     readme: str = Field(default="README.md")
     licence: str = Field(default="MIT")
-    dependencies: list[str] = Field(default=["git@https://github.com/encore-language/stdlib"])
+    dependencies: list[str] = Field(default=["git@https://github.com/encore-language/std"])
 
 
 class ProjectManifest(StrictModel):
