@@ -59,11 +59,15 @@ class Statement_FunctionDefinition(Statement_TopLevel):
     name: str
     generics: list[Type]
     params: list[Parameter]
-    type: Type
+    type: Type | None
     body: list["Statement_InnerLevel"]
 
     def __repr__(self) -> str:
-        r = f"fn {self.name}({', '.join(f'{p.name} : {p.type}' for p in self.params)}) -> {self.type}" + " {"
+        type_repr = ""
+        if self.type:
+            type_repr = f"-> {self.type}"
+
+        r = f"fn {self.name}({', '.join(f'{p.name} : {p.type}' for p in self.params)}){type_repr}" + " {"
         for stmt in self.body:
             r += f"\n  {stmt}"
         r += "\n}"
@@ -159,11 +163,12 @@ class Statement_InnerLevel(Statement):
 @dataclass
 class Statement_Let(Statement_InnerLevel):
     name: str
-    type: Type
+    type: Type | None
     expr: "Statement_Expression"
 
     def __repr__(self) -> str:
-        return f"let {self.name} : {self.type} = {self.expr}"
+        type_repr = f" : {self.type}" if self.type else ""
+        return f"let {self.name}{type_repr} = {self.expr}"
 
 
 @dataclass
@@ -251,6 +256,37 @@ class Statement_If(Statement_InnerLevel):
         return r
 
 
+@dataclass
+class Statement_MatchArm:
+    pattern: "Expression_Path | None"
+    binding: str | None
+    body: list["Statement_InnerLevel"]
+
+    @property
+    def is_wildcard(self) -> bool:
+        return self.pattern is None
+
+    def __repr__(self) -> str:
+        pattern_repr = "_" if self.pattern is None else self.pattern.name
+        if self.binding is not None:
+            pattern_repr = f"{pattern_repr}({self.binding})"
+        r = f"{pattern_repr} => {{"
+        for stmt in self.body:
+            r += f"\n  {stmt}"
+        r += "\n}"
+        return r
+
+
+@dataclass
+class Statement_Match(Statement_InnerLevel):
+    expr: "Statement_Expression"
+    arms: list[Statement_MatchArm]
+
+    def __repr__(self) -> str:
+        arms_repr = "\n".join(f"  {arm}" for arm in self.arms)
+        return f"match {self.expr} {{\n{arms_repr}\n}}"
+
+
 # =============
 @dataclass
 class Statement_ControlFlow(Statement_InnerLevel):
@@ -306,17 +342,28 @@ class Expression_BooleanLiteral(Statement_Expression):
 @dataclass
 class Expression_IntegerLiteral(Statement_Expression):
     value: str
+    literal_type: Type | None = None
 
     def __repr__(self) -> str:
-        return self.value
+        return self.value if self.literal_type is None else f"{self.value}_{self.literal_type}"
 
 
 @dataclass
 class Expression_FloatLiteral(Statement_Expression):
     value: str
+    literal_type: Type | None = None
 
     def __repr__(self) -> str:
-        return self.value
+        return self.value if self.literal_type is None else f"{self.value}_{self.literal_type}"
+
+
+@dataclass
+class Expression_StringLiteral(Statement_Expression):
+    value: str
+
+    def __repr__(self) -> str:
+        escaped = self.value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t")
+        return f'"{escaped}"'
 
 
 @dataclass
@@ -351,6 +398,69 @@ class Expression_Call(Statement_Expression):
     def __repr__(self) -> str:
         generics = f"[{', '.join(str(g) for g in self.generics)}]" if self.generics else ""
         return f"{self.callee}{generics}({', '.join(str(arg) for arg in self.args)})"
+
+
+@dataclass
+class Expression_MatchArm:
+    pattern: "Expression_Path | None"
+    binding: str | None
+    expr: Statement_Expression
+
+    @property
+    def is_wildcard(self) -> bool:
+        return self.pattern is None
+
+    def __repr__(self) -> str:
+        pattern_repr = "_" if self.pattern is None else self.pattern.name
+        if self.binding is not None:
+            pattern_repr = f"{pattern_repr}({self.binding})"
+        return f"{pattern_repr} => {self.expr}"
+
+
+@dataclass
+class Expression_Match(Statement_Expression):
+    expr: Statement_Expression
+    arms: list[Expression_MatchArm]
+
+    def __repr__(self) -> str:
+        arms_repr = "\n".join(f"  {arm}" for arm in self.arms)
+        return f"match {self.expr} {{\n{arms_repr}\n}}"
+
+
+# =============
+@dataclass
+class Expression_IfBranch:
+    expr: Statement_Expression
+    body: Statement_Expression
+
+    def __repr__(self) -> str:
+        return f"{self.expr} {{ {self.body} }}"
+
+
+@dataclass
+class Expression_If(Statement_Expression):
+    branches: list[Expression_IfBranch]
+    else_body: Statement_Expression
+
+    def __repr__(self) -> str:
+        r = f"if {self.branches[0]}"
+        for branch in self.branches[1:]:
+            r += f"\nelif {branch}"
+        return f"{r}\nelse {{ {self.else_body} }}"
+
+
+# =============
+@dataclass
+class Expression_Block(Statement_Expression):
+    body: list[Statement_InnerLevel]
+    expr: Statement_Expression
+
+    def __repr__(self) -> str:
+        r = "{"
+        for stmt in self.body:
+            r += f"\n  {stmt}"
+        r += f"\n  {self.expr}\n}}"
+        return r
 
 
 # =============

@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from ehir.core.type import HeapSmartPointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter
 
@@ -11,6 +13,7 @@ class Parser:
     def parse(self, tokens: list[Token]) -> list[s.Statement]:
         self.tokens = tokens
         self.current_index = 0
+        self._parsing_match_header = False
 
         statements: list[s.Statement] = []
         while not self._is_at_end():
@@ -100,8 +103,10 @@ class Parser:
             params.append(self._parse_param())
         self._safe_consume(TokenType.RIGHT_PAREN)
 
-        self._safe_consume(TokenType.OP_ARROW)
-        fn_type = self._parse_type()
+        fn_type = None
+        if self._get_current_token().type == TokenType.OP_ARROW:
+            self._safe_consume(TokenType.OP_ARROW)
+            fn_type = self._parse_type()
         body = self._parse_block()
 
         return s.Statement_FunctionDefinition(
@@ -229,6 +234,8 @@ class Parser:
             return self._parse_loop()
         if curr_token.type == TokenType.KW_IF:
             return self._parse_if_block()
+        if curr_token.type == TokenType.KW_MATCH:
+            return self._parse_match()
         if curr_token.type == TokenType.KW_BREAK:
             return self._parse_break()
         if curr_token.type == TokenType.KW_CONTINUE:
@@ -286,6 +293,75 @@ class Parser:
             else_body = self._parse_block()
 
         return s.Statement_If(branches=branches, else_body=else_body)
+
+    def _parse_if_expression(self) -> s.Expression_If:
+        self._safe_consume(TokenType.KW_IF)
+        branches = [s.Expression_IfBranch(expr=self._parse_expression(), body=self._parse_expression_block())]
+
+        while not self._is_at_end() and self._get_current_token().type == TokenType.KW_ELIF:
+            self._safe_consume(TokenType.KW_ELIF)
+            branches.append(s.Expression_IfBranch(expr=self._parse_expression(), body=self._parse_expression_block()))
+
+        if self._is_at_end() or self._get_current_token().type != TokenType.KW_ELSE:
+            raise TypeError("If expression must have an else branch")
+
+        self._safe_consume(TokenType.KW_ELSE)
+        else_body = self._parse_expression_block()
+        return s.Expression_If(branches=branches, else_body=else_body)
+
+    def _parse_match(self) -> s.Statement_Match:
+        self._safe_consume(TokenType.KW_MATCH)
+        self._parsing_match_header = True
+        expr = self._parse_expression()
+        self._parsing_match_header = False
+        self._safe_consume(TokenType.LEFT_BRACE)
+        arms: list[s.Statement_MatchArm] = []
+        while self._get_current_token().type != TokenType.RIGHT_BRACE:
+            arms.append(self._parse_match_arm())
+        self._safe_consume(TokenType.RIGHT_BRACE)
+        return s.Statement_Match(expr=expr, arms=arms)
+
+    def _parse_match_arm(self) -> s.Statement_MatchArm:
+        pattern = None
+        if self._get_current_token().type == TokenType.IDENTIFIER and self._get_current_token().value == "_":
+            self._unsafe_consume()
+        else:
+            pattern = self._parse_path()
+        binding = None
+        if self._get_current_token().type == TokenType.LEFT_PAREN:
+            self._safe_consume(TokenType.LEFT_PAREN)
+            binding = self._safe_consume(TokenType.IDENTIFIER).value
+            self._safe_consume(TokenType.RIGHT_PAREN)
+        self._safe_consume(TokenType.OP_FAT_ARROW)
+        body = self._parse_block()
+        return s.Statement_MatchArm(pattern=pattern, binding=binding, body=body)
+
+    def _parse_match_expression(self) -> s.Expression_Match:
+        self._safe_consume(TokenType.KW_MATCH)
+        self._parsing_match_header = True
+        expr = self._parse_expression()
+        self._parsing_match_header = False
+        self._safe_consume(TokenType.LEFT_BRACE)
+        arms: list[s.Expression_MatchArm] = []
+        while self._get_current_token().type != TokenType.RIGHT_BRACE:
+            arms.append(self._parse_match_expression_arm())
+        self._safe_consume(TokenType.RIGHT_BRACE)
+        return s.Expression_Match(expr=expr, arms=arms)
+
+    def _parse_match_expression_arm(self) -> s.Expression_MatchArm:
+        pattern = None
+        if self._get_current_token().type == TokenType.IDENTIFIER and self._get_current_token().value == "_":
+            self._unsafe_consume()
+        else:
+            pattern = self._parse_path()
+        binding = None
+        if self._get_current_token().type == TokenType.LEFT_PAREN:
+            self._safe_consume(TokenType.LEFT_PAREN)
+            binding = self._safe_consume(TokenType.IDENTIFIER).value
+            self._safe_consume(TokenType.RIGHT_PAREN)
+        self._safe_consume(TokenType.OP_FAT_ARROW)
+        expr = self._parse_expression()
+        return s.Expression_MatchArm(pattern=pattern, binding=binding, expr=expr)
 
     def _parse_expression(self) -> s.Statement_Expression:
         return self._parse_logical_or()
@@ -428,13 +504,39 @@ class Parser:
 
     def _parse_integer_literal(self) -> s.Expression_IntegerLiteral:
         value = self._safe_consume(TokenType.INTEGER).value
-        return s.Expression_IntegerLiteral(value)
+        literal_type = self._parse_numeric_literal_suffix()
+        if literal_type is not None and self._is_float_type_name(literal_type.name):
+            return s.Expression_FloatLiteral(value, literal_type=literal_type)
+        return s.Expression_IntegerLiteral(value, literal_type=literal_type)
+
+    def _parse_float_literal(self) -> s.Expression_FloatLiteral:
+        value = self._safe_consume(TokenType.FLOAT).value
+        literal_type = self._parse_numeric_literal_suffix()
+        if literal_type is not None and not self._is_float_type_name(literal_type.name):
+            raise TypeError(f"Float literal suffix must be a float type, got {literal_type}")
+        return s.Expression_FloatLiteral(value, literal_type=literal_type)
+
+    def _parse_string_literal(self) -> s.Expression_StringLiteral:
+        raw = self._safe_consume(TokenType.STRING).value
+        return s.Expression_StringLiteral(self._unescape_string_literal(raw[1:-1]))
 
     def _parse_parenthesized(self) -> s.Expression_Parenthesized:
         self._safe_consume(TokenType.LEFT_PAREN)
         expr = self._parse_expression()
         self._safe_consume(TokenType.RIGHT_PAREN)
         return s.Expression_Parenthesized(expr=expr)
+
+    def _parse_expression_block(self) -> s.Statement_Expression:
+        self._safe_consume(TokenType.LEFT_BRACE)
+        body: list[s.Statement_InnerLevel] = []
+        while self._starts_expression_block_statement():
+            body.append(self._parse_inner_level())
+
+        expr = self._parse_expression()
+        self._safe_consume(TokenType.RIGHT_BRACE)
+        if not body:
+            return expr
+        return s.Expression_Block(body=body, expr=expr)
 
     def _parse_struct_initialization(self, struct: Type) -> s.Expression_StructInitialization:
         self._safe_consume(TokenType.LEFT_BRACE)
@@ -456,6 +558,15 @@ class Parser:
 
     def _parse_call(self, callee: s.Expression_Path) -> s.Expression_Call:
         generics = self._parse_generics_args() if self._get_current_token().type == TokenType.LEFT_BRACKET else []
+
+        # `foo[T](...)` is parsed by `_parse_path()` as the last path segment carrying generics.
+        # Normalize that into call generics so function lookup still uses plain `foo`.
+        last_segment = callee.segments[-1]
+        if last_segment.generics:
+            if generics:
+                raise TypeError("Function call generics must be specified only once")
+            generics = list(last_segment.generics)
+            callee = s.Expression_Path([*callee.segments[:-1], replace(last_segment, generics=[])])
 
         self._safe_consume(TokenType.LEFT_PAREN)
         args = []
@@ -479,11 +590,24 @@ class Parser:
 
         if curr_token.type == TokenType.INTEGER:
             return self._parse_integer_literal()
+        elif curr_token.type == TokenType.FLOAT:
+            return self._parse_float_literal()
+        elif curr_token.type == TokenType.STRING:
+            return self._parse_string_literal()
 
         elif curr_token.type == TokenType.LEFT_PAREN:
             return self._parse_parenthesized()
 
+        elif curr_token.type == TokenType.KW_MATCH:
+            return self._parse_match_expression()
+
+        elif curr_token.type == TokenType.KW_IF:
+            return self._parse_if_expression()
+
         elif curr_token.type == TokenType.IDENTIFIER:
+            if curr_token.value in ("true", "false"):
+                self._consume()
+                return s.Expression_BooleanLiteral(curr_token.value == "true")
             first = self._parse_type()
             symbol = str(first)
             segments = [first]
@@ -495,6 +619,8 @@ class Parser:
 
             match self._get_current_token().type:
                 case TokenType.LEFT_BRACE:
+                    if self._parsing_match_header:
+                        return path
                     return self._parse_struct_initialization(first)
                 case TokenType.DOT:
                     return self._parse_struct_field(symbol)
@@ -512,12 +638,16 @@ class Parser:
 
     def _parse_let(self) -> s.Statement_Let:
         self._safe_consume(TokenType.KW_LET)
-        param = self._parse_param()
+        name = self._safe_consume(TokenType.IDENTIFIER).value
+        typ = None
+        if self._get_current_token().type == TokenType.COLON:
+            self._safe_consume(TokenType.COLON)
+            typ = self._parse_type()
         self._safe_consume(TokenType.OP_ASSIGN)
         expr = self._parse_expression()
         return s.Statement_Let(
-            name=param.name,
-            type=param.type,
+            name=name,
+            type=typ,
             expr=expr,
         )
 
@@ -566,8 +696,63 @@ class Parser:
         type = self._parse_type()
         return Parameter(name, type)
 
+    def _parse_numeric_literal_suffix(self) -> Type | None:
+        if self._is_at_end():
+            return None
+        token = self._get_current_token()
+        if token.type != TokenType.IDENTIFIER or not token.value.startswith("_"):
+            return None
+
+        suffix_name = token.value.removeprefix("_")
+        if not self._is_numeric_type_name(suffix_name):
+            return None
+
+        self._unsafe_consume()
+        return Type(suffix_name)
+
+    @staticmethod
+    def _is_numeric_type_name(name: str) -> bool:
+        return Parser._is_integer_type_name(name) or Parser._is_float_type_name(name)
+
+    @staticmethod
+    def _is_integer_type_name(name: str) -> bool:
+        return name in ("usize", "isize") or (len(name) > 1 and name[0] in ("u", "i") and name[1:].isdigit())
+
+    @staticmethod
+    def _is_float_type_name(name: str) -> bool:
+        return len(name) > 1 and name[0] == "f" and name[1:].isdigit()
+
+    def _starts_expression_block_statement(self) -> bool:
+        if self._get_current_token().type in {
+            TokenType.KW_LET,
+            TokenType.KW_DO,
+            TokenType.KW_WHILE,
+            TokenType.KW_LOOP,
+            TokenType.KW_IF,
+            TokenType.KW_MATCH,
+            TokenType.KW_RET,
+            TokenType.KW_BREAK,
+            TokenType.KW_CONTINUE,
+        }:
+            return True
+        if self._get_current_token().type != TokenType.IDENTIFIER:
+            return False
+
+        saved_index = self.current_index
+        try:
+            self._parse_expression()
+            return not self._is_at_end() and self._get_current_token().type == TokenType.OP_ASSIGN
+        except Exception:
+            return False
+        finally:
+            self.current_index = saved_index
+
     def _is_at_end(self) -> bool:
         return self.current_index >= len(self.tokens)
+
+    @staticmethod
+    def _unescape_string_literal(string: str) -> str:
+        return bytes(string, "utf-8").decode("unicode_escape")
 
     def _safe_consume(self, expected_token_type: TokenType) -> Token:
         token = self._consume()

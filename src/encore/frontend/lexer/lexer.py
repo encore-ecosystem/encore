@@ -23,6 +23,7 @@ class Lexer:
             "if": TokenType.KW_IF,
             "elif": TokenType.KW_ELIF,
             "else": TokenType.KW_ELSE,
+            "match": TokenType.KW_MATCH,
             "pub": TokenType.KW_PUB,
             "import": TokenType.KW_IMPORT,
         }
@@ -34,6 +35,7 @@ class Lexer:
             (r">>=", TokenType.OP_RSHIFT_ASSIGN),
             # Two-character operators
             (r"::", TokenType.OP_SCOPE),
+            (r"=>", TokenType.OP_FAT_ARROW),
             (r"==", TokenType.OP_EQUAL),
             (r"!=", TokenType.OP_NOT_EQUAL),
             (r"<=", TokenType.OP_LESS_EQUAL),
@@ -78,6 +80,7 @@ class Lexer:
             (r",", TokenType.COMMA),
             (r"\.", TokenType.DOT),
             # Literals
+            (r'"(?:\\.|[^"\\])*"', TokenType.STRING),  # string
             (r"\d+\.\d+", TokenType.FLOAT),  # float (must come before integer!)
             (r"\d+", TokenType.INTEGER),  # integer
             (r"[a-zA-Z_][a-zA-Z0-9_]*", TokenType.IDENTIFIER),  # identifier
