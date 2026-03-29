@@ -1,4 +1,8 @@
+from abc import ABC
 from dataclasses import dataclass
+
+from ehir.core.type import Type
+from ehir.core.variable import Parameter
 
 
 @dataclass
@@ -12,7 +16,7 @@ class Statement_TopLevel(Statement):
     is_public: bool
 
     def __repr__(self) -> str:
-        return "pub" if self.is_public else ""
+        return "pub " if self.is_public else ""
 
 
 @dataclass
@@ -42,12 +46,13 @@ class Statement_Import(Statement_TopLevel):
 @dataclass
 class Statement_FunctionDefinition(Statement_TopLevel):
     name: str
-    params: list[tuple[str, str]]
-    type: str
+    generics: list[Type]
+    params: list[Parameter]
+    type: Type
     body: list["Statement_InnerLevel"]
 
     def __repr__(self) -> str:
-        r = f"fn {self.name}({', '.join(f'{p[0]} : {p[1]}' for p in self.params)}) -> {self.type}" + " {"
+        r = f"fn {self.name}({', '.join(f'{p.name} : {p.type}' for p in self.params)}) -> {self.type}" + " {"
         for stmt in self.body:
             r += f"\n  {stmt}"
         r += "\n}"
@@ -55,10 +60,64 @@ class Statement_FunctionDefinition(Statement_TopLevel):
 
 
 @dataclass
-class Statement_StructureDefinition(Statement_TopLevel):
+class StructureDefinition(ABC):
     name: str
-    generics: list[str]
-    fields: list[tuple[str, str]]
+    generics: list[Type]
+
+    def __repr__(self) -> str:
+        generic_repr = ("[" + ", ".join(str(g) for g in self.generics) + "]") if self.generics else ""
+        return f"{self.name}{generic_repr}"
+
+
+@dataclass
+class CLikeStructureDefinition(StructureDefinition):
+    fields: list[Parameter]
+
+    def __repr__(self) -> str:
+        body_repr = " {\n" + "\n".join(f"  {b}" for b in self.fields) + "\n}"
+        return f"{super().__repr__()}{body_repr}"
+
+
+@dataclass
+class TupleStructureDefinition(StructureDefinition):
+    fields: list[Type]
+
+    def _to_clike(self) -> CLikeStructureDefinition:
+        return CLikeStructureDefinition(
+            name=self.name, generics=self.generics, fields=[Parameter(str(i), t) for i, t in enumerate(self.fields)]
+        )
+
+    def __repr__(self) -> str:
+        return f"{super().__repr__()}(" + ", ".join(str(f) for f in self.fields) + ")"
+
+
+@dataclass
+class UnitStructureDefinition(StructureDefinition):
+    def _to_tuple(self) -> TupleStructureDefinition:
+        return TupleStructureDefinition(name=self.name, generics=self.generics, fields=[])
+
+    def __repr__(self) -> str:
+        return super().__repr__()
+
+
+@dataclass
+class Statement_StructureDefinition(Statement_TopLevel):
+    defi: StructureDefinition
+
+    def __repr__(self) -> str:
+        return f"{super().__repr__()}struct {self.defi}"
+
+
+@dataclass
+class Statement_EnumDefinition(Statement_TopLevel):
+    name: str
+    generics: list[Type]
+    body: list[StructureDefinition]
+
+    def __repr__(self) -> str:
+        generic_repr = "[" + ", ".join(str(g) for g in self.generics) + "]"
+        body = " {\n" + "\n".join(f"  {b}" for b in self.body) + "\n}"
+        return f"{super().__repr__()}enum {self.name}{generic_repr}{body}"
 
 
 @dataclass
@@ -70,9 +129,9 @@ class Statement_Impl(Statement_TopLevel):
     #     params: list[tuple[str, str]]
     #     type: str
 
-    generics: list[str]
+    generics: list[Type]
     trait_name: str | None
-    struct: str
+    struct: Type
     body: list[Statement_FunctionDefinition]
     is_public: bool
 
@@ -89,7 +148,7 @@ class Statement_InnerLevel(Statement):
 @dataclass
 class Statement_Let(Statement_InnerLevel):
     name: str
-    type: str
+    type: Type
     expr: "Statement_Expression"
 
     def __repr__(self) -> str:
@@ -136,11 +195,19 @@ class Statement_DoWhile(Statement_InnerLevel):
 
 @dataclass
 class Statement_Assignment(Statement_InnerLevel):
-    name: str
+    target: "Statement_Expression"
     expr: "Statement_Expression"
 
+    @property
+    def name(self) -> str:
+        if isinstance(self.target, Expression_Path):
+            return self.target.name
+        if isinstance(self.target, Expression_StructField):
+            return self.target.name
+        return repr(self.target)
+
     def __repr__(self) -> str:
-        return f"{self.name} = {self.expr}"
+        return f"{self.target} = {self.expr}"
 
 
 @dataclass
@@ -206,8 +273,12 @@ class Statement_Expression(Statement_InnerLevel):
 
 
 @dataclass
-class Expression_VariableAccess(Statement_Expression):
-    name: str
+class Expression_Path(Statement_Expression):
+    segments: list[Type]
+
+    @property
+    def name(self) -> str:
+        return "::".join(str(segment) for segment in self.segments)
 
     def __repr__(self) -> str:
         return self.name
@@ -239,8 +310,12 @@ class Expression_FloatLiteral(Statement_Expression):
 
 @dataclass
 class Expression_StructInitialization(Statement_Expression):
-    name: str
+    name: Type
     args: list[Statement_Expression]
+
+    def __repr__(self) -> str:
+        args = "{" + ", ".join(str(a) for a in self.args) + "}"
+        return f"{self.name}{args}"
 
 
 @dataclass
@@ -248,17 +323,23 @@ class Expression_StructField(Statement_Expression):
     name: str
     field: str
 
+    def __repr__(self) -> str:
+        return f"{self.name}.{self.field}"
+
 
 @dataclass
 class Expression_Call(Statement_Expression):
-    name: str
-    generics: list[str]
+    callee: Expression_Path
+    generics: list[Type]
     args: list[Statement_Expression]
 
+    @property
+    def name(self) -> str:
+        return self.callee.name
 
-@dataclass
-class Expression_StructMethodCall(Expression_Call):
-    struct: str
+    def __repr__(self) -> str:
+        generics = f"[{', '.join(str(g) for g in self.generics)}]" if self.generics else ""
+        return f"{self.callee}{generics}({', '.join(str(arg) for arg in self.args)})"
 
 
 # =============
