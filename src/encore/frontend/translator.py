@@ -43,6 +43,9 @@ class Translator:
     def __init__(self):
         self._lexer = Lexer()
         self._parser = Parser()
+        self._reset_state()
+
+    def _reset_state(self):
         self._module = EHIR_Module(id=Path(), ast=[])
         self._builder = EHIR_Builder(self._module)
         self._current_function = None
@@ -55,20 +58,30 @@ class Translator:
         self._terminated_blocks: set[str] = set()
         self._var_vals: dict[str, Variable] = {}
         self._assignment_targets: dict[str, str] = {}
-
-    def run(self, program: str) -> EHIR_Module:
         self._funcs = {}
         self._enums = {}
         self._structs = {}
 
+    def run(self, program: str) -> EHIR_Module:
+        self._reset_state()
         tokens = self._lexer.tokenize(program)
         ast = self._parser.parse(tokens)
-        # print(*ast)
+        return self.translate_ast(ast)
 
+    def translate_ast(self, ast: list[s.Statement]) -> EHIR_Module:
         for statement in ast:
             self._translate_statement(statement)
 
         return self._module
+
+    def preload_declarations(self, statements: list[s.Statement_TopLevel]):
+        for statement in statements:
+            if isinstance(statement, s.Statement_StructureDefinition):
+                if not isinstance(statement.defi, s.CLikeStructureDefinition):
+                    raise NotImplementedError(f"Unsupported structure definition: {type(statement.defi)}")
+                self._structs[statement.defi.name] = statement.defi
+            elif isinstance(statement, s.Statement_EnumDefinition):
+                self._enums[statement.name] = self._build_enum_directive(statement)
 
     def _translate_statement(self, statement: s.Statement) -> Derective:
         if isinstance(statement, s.Statement_FunctionDefinition):
@@ -112,7 +125,7 @@ class Translator:
             params=[Parameter(param.name, self._translate_type(param.type)) for param in statement.defi.fields],
         )
 
-    def _translate_enum_definition(self, statement: s.Statement_EnumDefinition):
+    def _build_enum_directive(self, statement: s.Statement_EnumDefinition) -> Derective_enum:
         variants: list[EnumVariant] = []
         for variant in statement.body:
             if isinstance(variant, s.UnitStructureDefinition):
@@ -129,11 +142,14 @@ class Translator:
             if isinstance(variant, s.CLikeStructureDefinition):
                 raise NotImplementedError(f"CLike enum variant is not supported: {variant.name}")
 
-        derective = Derective_enum(
+        return Derective_enum(
             name=statement.name,
             generics=[self._translate_type(generic) for generic in statement.generics],
             variants=variants,
         )
+
+    def _translate_enum_definition(self, statement: s.Statement_EnumDefinition):
+        derective = self._build_enum_directive(statement)
         self._module.ast.append(derective)
         self._enums[statement.name] = derective
         return derective
@@ -705,8 +721,8 @@ class Translator:
             payload_type = self._lookup_enum_variant_type(enum_type, variant_name)
             if payload_type is None:
                 raise NotImplementedError(f"Unable to resolve payload type for enum variant '{expr.name}'.")
-
             payload_var = self._translate_expression(expr.args[0], expected_type=payload_type).var_out
+
             payload = Struct(name=payload_type.name, value=payload_var, type=payload_type)
         return Enum(name=enum_type.name, generics=enum_type.generics, variant=variant_name, payload=payload)
 
