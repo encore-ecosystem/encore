@@ -26,20 +26,31 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
     def get_parent_id_of(self, id: Path, derective: Derective_import) -> Path:
         match derective.prefix[0]:
+            case "refrain":
+                dep_filepath = self._get_project_root_of(id) / "src" / Path(*derective.prefix[1:])
             case "repo":
                 dep_filepath = self.src_dir / Path(*derective.prefix[1:])
             case "std":
                 dep_filepath = PROJECT_ROOT / "std" / "src" / Path(*derective.prefix[1:])
             case _:
-                raise ImportError("Only repo and std imports available")
+                dep_filepath = id.parent / Path(*derective.prefix)
 
-        if not dep_filepath.with_suffix(".enq").exists():
-            dep_filepath /= "mod"
-        dep_filepath = dep_filepath.with_suffix(".enq")
+        dep_filepath = self._resolve_module_path(dep_filepath)
 
         if not dep_filepath.exists():
             raise RuntimeError(f"Unable to import: {derective} in {id}")
         return dep_filepath
+
+    def _get_project_root_of(self, id: Path) -> Path:
+        for parent in [id.parent, *id.parents]:
+            if (parent / "encore.toml").exists():
+                return parent
+        raise RuntimeError(f"Unable to find encore.toml for module: {id}")
+
+    def _resolve_module_path(self, path: Path) -> Path:
+        if path.with_suffix(".enq").exists():
+            return path.with_suffix(".enq")
+        return (path / "mod").with_suffix(".enq")
 
     def get_file_extension(self) -> str:
         return ".enq"

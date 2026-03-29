@@ -45,37 +45,38 @@ class Parser:
 
     def _parse_import(self, is_public: bool) -> s.Statement_Import:
         self._safe_consume(TokenType.KW_IMPORT)
-        imp = self._parse_module_import()
+        imp = self._parse_import_path(default_leaf_kind=s.Statement_Import.ImportKind.PACKAGE)
         return s.Statement_Import(is_public=is_public, pair=imp)
 
-    def _parse_module_import(self) -> Statement_Import.ImportPair:
+    def _parse_import_path(self, default_leaf_kind: s.Statement_Import.ImportKind) -> Statement_Import.ImportPair:
         module = self._safe_consume(TokenType.IDENTIFIER).value
 
-        if self._get_current_token().type != TokenType.OP_SCOPE:
-            return Statement_Import.ImportPair(module, [])
+        if self._is_at_end() or self._get_current_token().type != TokenType.OP_SCOPE:
+            return Statement_Import.ImportPair(module, [], default_leaf_kind)
 
         self._safe_consume(TokenType.OP_SCOPE)
+        if self._is_at_end():
+            raise ValueError("Import path cannot end with ::")
+
         curr_token = self._get_current_token()
         match curr_token.type:
             case TokenType.OP_MULTIPLY:
                 self._consume()
-                return Statement_Import.ImportPair(module, [Statement_Import.ImportPair(curr_token.value, [])])
-            case TokenType.IDENTIFIER:
-                submodule = self._safe_consume(TokenType.IDENTIFIER).value
-                mods = []
-                if self._get_current_token().type == TokenType.OP_SCOPE:
-                    self._consume()
-                    mods.append(self._parse_module_import())
-                return Statement_Import.ImportPair(module, [Statement_Import.ImportPair(submodule, mods)])
+                return Statement_Import.ImportPair(
+                    module,
+                    [Statement_Import.ImportPair("*", [], s.Statement_Import.ImportKind.GLOB)],
+                )
             case TokenType.LEFT_BRACE:
                 self._safe_consume(TokenType.LEFT_BRACE)
-                mods = []
-                mods.append(self._parse_module_import())
+                mods = [self._parse_import_path(default_leaf_kind=s.Statement_Import.ImportKind.PACKAGE)]
                 while self._get_current_token().type != TokenType.RIGHT_BRACE:
                     self._safe_consume(TokenType.COMMA)
-                    mods.append(self._parse_module_import())
+                    mods.append(self._parse_import_path(default_leaf_kind=s.Statement_Import.ImportKind.PACKAGE))
                 self._safe_consume(TokenType.RIGHT_BRACE)
                 return Statement_Import.ImportPair(module, mods)
+            case TokenType.IDENTIFIER:
+                nested = self._parse_import_path(default_leaf_kind=s.Statement_Import.ImportKind.SYMBOL)
+                return Statement_Import.ImportPair(module, [nested])
             case _:
                 raise ValueError(f"Unexpected Token: {curr_token}")
 

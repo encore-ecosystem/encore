@@ -1,3 +1,5 @@
+from enum import StrEnum
+
 from pydantic import BaseModel, ConfigDict
 from pydantic.fields import Field
 
@@ -6,8 +8,16 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ProjectTarget(StrEnum):
+    AUTO = "auto"
+    EXECUTABLE = "executable"
+    STATIC_LIB = "static_lib"
+    SHARED_LIB = "shared_lib"
+
+
 class ProjectSection(StrictModel):
     name: str
+    target: ProjectTarget = Field(default=ProjectTarget.AUTO)
     version: str = Field(default="0.0.0")
     description: str = Field(default="")
     readme: str = Field(default="README.md")

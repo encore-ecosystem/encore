@@ -1,5 +1,6 @@
 from abc import ABC
 from dataclasses import dataclass
+from enum import StrEnum, auto
 
 from ehir.core.type import Type
 from ehir.core.variable import Parameter
@@ -21,15 +22,25 @@ class Statement_TopLevel(Statement):
 
 @dataclass
 class Statement_Import(Statement_TopLevel):
+    class ImportKind(StrEnum):
+        PACKAGE = auto()
+        SYMBOL = auto()
+        GLOB = auto()
+
     @dataclass
     class ImportPair:
         src: str
         dst: list["Statement_Import.ImportPair"]
+        kind: "Statement_Import.ImportKind | None" = None
+
+        def __post_init__(self):
+            if self.kind is None:
+                self.kind = Statement_Import.ImportKind.SYMBOL
 
         def __repr__(self) -> str:
             match len(self.dst):
                 case 0:
-                    return self.src
+                    return "*" if self.kind == Statement_Import.ImportKind.GLOB else self.src
                 case 1:
                     return f"{self.src}::{self.dst[0]}"
                 case _:

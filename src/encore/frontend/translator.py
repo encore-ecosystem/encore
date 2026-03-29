@@ -87,7 +87,17 @@ class Translator:
     def _translate_import_pair(self, prefix: list[str], pair: s.Statement_Import.ImportPair, is_public: bool):
         match len(pair.dst):
             case 0:
-                (self._builder.build_cimp if is_public else self._builder.build_imp)(prefix=prefix, symbol=pair.src)
+                match pair.kind:
+                    case s.Statement_Import.ImportKind.PACKAGE:
+                        (self._builder.build_cimp if is_public else self._builder.build_imp)(
+                            prefix=prefix + [pair.src], symbol="*"
+                        )
+                    case s.Statement_Import.ImportKind.SYMBOL:
+                        (self._builder.build_cimp if is_public else self._builder.build_imp)(
+                            prefix=prefix, symbol=pair.src
+                        )
+                    case s.Statement_Import.ImportKind.GLOB:
+                        (self._builder.build_cimp if is_public else self._builder.build_imp)(prefix=prefix, symbol="*")
             case _:
                 for dst in pair.dst:
                     self._translate_import_pair(prefix=prefix + [pair.src], pair=dst, is_public=is_public)

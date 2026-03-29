@@ -10,7 +10,7 @@ from ehir.compiler import EHIR_ProjectCompiler
 from ehir_llvm_backend import EHIR_LLVM_Backend
 
 from encore.frontend import EHIR_EncoreFrontend
-from encore.utils.manifest import ProjectManifest
+from encore.utils.manifest import ProjectManifest, ProjectTarget
 
 AVAILABLE_BACKENDS = {"llvm": EHIR_LLVM_Backend}
 AVAILABLE_OPTPROFILES = {
@@ -37,7 +37,7 @@ def handle_build(args: Namespace):
     cwd = Path().resolve()
 
     compiler = create_compiler(cwd, args.backend, args.profile)
-    _load_refrain(compiler, cwd, type=Refrain.TargetType.EXECUTABLE)
+    _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
     compiler.compile_all()
 
 
@@ -110,9 +110,35 @@ def _load_refrain(
     return ref
 
 
+def infer_project_target_type(cwd: Path) -> Refrain.TargetType:
+    src_dir = cwd / "src"
+    has_main = (src_dir / "main.enq").exists()
+    has_lib = (src_dir / "lib.enq").exists()
+
+    if has_main:
+        return Refrain.TargetType.EXECUTABLE
+    if has_lib:
+        return Refrain.TargetType.STATIC_LIB
+    raise RuntimeError(f"Unable to determine project target type in {cwd}: expected src/main.enq or src/lib.enq")
+
+
+def resolve_project_target_type(cwd: Path) -> Refrain.TargetType:
+    manifest = load_manifest(cwd)
+    match manifest.project.target:
+        case ProjectTarget.AUTO:
+            return infer_project_target_type(cwd)
+        case ProjectTarget.EXECUTABLE:
+            return Refrain.TargetType.EXECUTABLE
+        case ProjectTarget.STATIC_LIB:
+            return Refrain.TargetType.STATIC_LIB
+        case ProjectTarget.SHARED_LIB:
+            raise NotImplementedError("shared_lib target is declared in encore.toml, but is not supported yet")
+    raise RuntimeError(f"Unknown project target type: {manifest.project.target}")
+
+
 def build_project(cwd: Path, backend: str, profile: str) -> list[tuple[str, Path]]:
     compiler = create_compiler(cwd, backend, profile)
-    entry_ref = _load_refrain(compiler, cwd, type=Refrain.TargetType.EXECUTABLE)
+    entry_ref = _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
     outputs = compiler.compile_all()
     outputs_by_name = dict(outputs)
     return [(entry_ref.name, outputs_by_name[entry_ref.name]), *[(n, p) for n, p in outputs if n != entry_ref.name]]
