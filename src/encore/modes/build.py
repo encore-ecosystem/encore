@@ -1,3 +1,4 @@
+import subprocess
 import tomllib
 from argparse import Namespace
 from pathlib import Path
@@ -35,17 +36,37 @@ def add_build_parser(subparsers) -> tuple[str, Callable]:
 def handle_build(args: Namespace):
     cwd = Path().resolve()
 
-    compiler = EHIR_ProjectCompiler(
-        frontend=EHIR_EncoreFrontend(src_dir=cwd / "src"),
-        backend=AVAILABLE_BACKENDS[args.backend](
-            target_dir=cwd / "target", opt_profile=AVAILABLE_OPTPROFILES[args.profile]
-        ),
-    )
+    compiler = create_compiler(cwd, args.backend, args.profile)
     _load_refrain(compiler, cwd, type=Refrain.TargetType.EXECUTABLE)
     compiler.compile_all()
 
 
-def _resolve_dependency(dep: str) -> Path:
+def create_compiler(cwd: Path, backend: str, profile: str) -> EHIR_ProjectCompiler:
+    compiler = EHIR_ProjectCompiler(
+        frontend=EHIR_EncoreFrontend(src_dir=cwd / "src"),
+        backend=AVAILABLE_BACKENDS[backend](target_dir=cwd / "target", opt_profile=AVAILABLE_OPTPROFILES[profile]),
+    )
+    return compiler
+
+
+def load_manifest(path: Path) -> ProjectManifest:
+    manifest_path = path / ProjectManifest.default_filename()
+    if not manifest_path.exists():
+        raise RuntimeError(f"Project {path} is not initialized")
+
+    with manifest_path.open("rb") as f:
+        return ProjectManifest(**tomllib.load(f))
+
+
+def save_manifest(path: Path, manifest: ProjectManifest):
+    import toml
+
+    manifest_path = path / ProjectManifest.default_filename()
+    with manifest_path.open("w") as f:
+        f.write(toml.dumps(manifest.model_dump()))
+
+
+def _resolve_dependency(dep: str, update: bool = False) -> Path:
     from git import Repo
 
     from encore import ENCORE_CACHE_DIR
@@ -56,9 +77,11 @@ def _resolve_dependency(dep: str) -> Path:
         repo_url = dep.removeprefix("git@")
         org, repo_name = repo_url.split("/")[-2:]
         path = ENCORE_CACHE_DIR / "git" / org / repo_name
-        path.mkdir(parents=True, exist_ok=True)
-        if not path.exists:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not (path / ".git").exists():
             Repo.clone_from(url=repo_url, to_path=path)
+        elif update:
+            Repo(path).remotes.origin.pull()
 
     elif dep.startswith("path@"):
         path = Path(dep.removeprefix("path@")).resolve()
@@ -72,12 +95,7 @@ def _resolve_dependency(dep: str) -> Path:
 def _load_refrain(
     compiler: EHIR_ProjectCompiler, path: Path, type: Refrain.TargetType = Refrain.TargetType.OBJECT
 ) -> Refrain:
-    manifest_path = path / ProjectManifest.default_filename()
-    if not manifest_path.exists():
-        print(f"Project {path} is not initialized")
-        exit(-1)
-    with manifest_path.open("r") as f:
-        manifest = ProjectManifest(**tomllib.loads(f.read()))
+    manifest = load_manifest(path)
 
     for dependency in manifest.project.dependencies:
         _dep_path = _resolve_dependency(dependency)
@@ -90,3 +108,25 @@ def _load_refrain(
     )
     compiler.add_refrain_to_build(ref)
     return ref
+
+
+def build_project(cwd: Path, backend: str, profile: str) -> list[tuple[str, Path]]:
+    compiler = create_compiler(cwd, backend, profile)
+    entry_ref = _load_refrain(compiler, cwd, type=Refrain.TargetType.EXECUTABLE)
+    outputs = compiler.compile_all()
+    outputs_by_name = dict(outputs)
+    return [(entry_ref.name, outputs_by_name[entry_ref.name]), *[(n, p) for n, p in outputs if n != entry_ref.name]]
+
+
+def run_binary(binary_path: Path, args: list[str]) -> int:
+    result = subprocess.run([str(binary_path), *args], check=False)
+    return result.returncode
+
+
+def update_dependencies(path: Path):
+    manifest = load_manifest(path)
+    for dependency in manifest.project.dependencies:
+        dep_path = _resolve_dependency(dependency, update=True)
+        dep_manifest = dep_path / ProjectManifest.default_filename()
+        if dep_manifest.exists():
+            update_dependencies(dep_path)

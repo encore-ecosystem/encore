@@ -25,7 +25,13 @@ def _create_manifest(root: Path, project_name: str):
 
 def _create_src(root: Path):
     (root / "src").mkdir(exist_ok=True)
-    (root / "src" / "main.enq").touch(exist_ok=True)
+
+    main_path = root / "src" / "main.enq"
+    if not main_path.exists():
+        with main_path.open("w") as f:
+            f.write("fn main() -> u32 {")
+            f.write("  ret 0")
+            f.write("}")
 
 
 def _initialize_git_repo(root: Path):
@@ -37,6 +43,7 @@ def _initialize_git_repo(root: Path):
     gitignore = root / ".gitignore"
     if not gitignore.exists():
         with (root / ".gitignore").open("w") as f:
+            f.write(".ehir\n")
             f.write("target\n")
 
 

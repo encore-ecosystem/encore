@@ -536,7 +536,7 @@ class Parser:
         generics = self._parse_generics_args() if self._get_current_token().type == TokenType.LEFT_BRACKET else []
         typ = Type(name, generics)
 
-        if self._get_current_token().type == TokenType.OP_LESS:
+        if self._is_smart_pointer_suffix():
             self._safe_consume(TokenType.OP_LESS)
             pointer = self._safe_consume(TokenType.IDENTIFIER).value
             if pointer not in ("H", "S"):
@@ -546,6 +546,18 @@ class Parser:
                 return HeapSmartPointer(typ)
             return StackSmartPointer(typ)
         return typ
+
+    def _is_smart_pointer_suffix(self) -> bool:
+        if self._get_current_token().type != TokenType.OP_LESS:
+            return False
+        try:
+            pointer = self._peek_token(1)
+            closer = self._peek_token(2)
+        except ValueError:
+            return False
+        return (
+            pointer.type == TokenType.IDENTIFIER and pointer.value in ("H", "S") and closer.type == TokenType.OP_GREATER
+        )
 
     def _parse_param(self) -> Parameter:
         name = self._safe_consume(TokenType.IDENTIFIER).value
