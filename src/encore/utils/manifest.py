@@ -17,7 +17,7 @@ class ProjectTarget(StrEnum):
 
 class ProjectSection(StrictModel):
     name: str
-    target: ProjectTarget = Field(default=ProjectTarget.AUTO)
+    target: str = Field(default=ProjectTarget.AUTO)
     version: str = Field(default="0.0.0")
     description: str = Field(default="")
     readme: str = Field(default="README.md")

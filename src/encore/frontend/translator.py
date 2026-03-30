@@ -44,6 +44,7 @@ class Translator:
     _structs: dict[str, s.StructureDefinition]
     _builder: EHIR_Builder
     _module: EHIR_Module
+    _extern_fns: dict[str, s.Statement_ExternFunctionDefinition]
 
     class _PreparedMatch:
         def __init__(
@@ -86,6 +87,8 @@ class Translator:
         self._funcs = {}
         self._enums = {}
         self._structs = {}
+        self._extern_fns = {}
+        self._unsafe_depth = 0
 
     def run(self, program: str) -> EHIR_Module:
         self._reset_state()
@@ -108,10 +111,14 @@ class Translator:
                 self._structs[statement.defi.name] = statement.defi
             elif isinstance(statement, s.Statement_EnumDefinition):
                 self._enums[statement.name] = self._build_enum_directive(statement)
+            elif isinstance(statement, s.Statement_ExternFunctionDefinition):
+                self._extern_fns[statement.name] = statement
 
-    def _translate_statement(self, statement: s.Statement) -> Derective:
+    def _translate_statement(self, statement: s.Statement) -> Derective | None:
         if isinstance(statement, s.Statement_FunctionDefinition):
             return self._translate_function_definition(statement)
+        elif isinstance(statement, s.Statement_ExternFunctionDefinition):
+            return self._translate_extern_function_definition(statement)
         elif isinstance(statement, s.Statement_StructureDefinition):
             return self._translate_structure_definition(statement)
         elif isinstance(statement, s.Statement_EnumDefinition):
@@ -119,6 +126,16 @@ class Translator:
         elif isinstance(statement, s.Statement_Import):
             return self._translate_import(statement)
         raise NotImplementedError(f"Translation for statement type {type(statement)} is not implemented.")
+
+    def _translate_extern_function_definition(self, statement: s.Statement_ExternFunctionDefinition):
+        self._extern_fns[statement.name] = statement
+        self._builder.build_extern_fn(
+            name=statement.name,
+            generics=[self._translate_type(g) for g in statement.generics],
+            params=[Parameter(name=param.name, type=self._translate_type(param.type)) for param in statement.params],
+            ret_type=self._translate_type(statement.type),
+        )
+        return self._module.ast[-1]
 
     def _translate_import(self, statement: s.Statement_Import):
         self._translate_import_pair(prefix=[], pair=statement.pair, is_public=statement.is_public)
@@ -230,8 +247,14 @@ class Translator:
         elif isinstance(statement, s.Statement_Match):
             return self._translate_match(statement)
 
+        elif isinstance(statement, s.Statement_Unsafe):
+            return self._translate_unsafe(statement)
+
         elif isinstance(statement, s.Statement_Assignment):
             return self._translate_assignment(statement)
+
+        elif isinstance(statement, s.Statement_Expr):
+            return self._translate_expression_statement(statement)
 
         raise NotImplementedError(f"Translation for inner statement type {type(statement)} is not implemented.")
 
@@ -308,6 +331,16 @@ class Translator:
             return
 
         raise NotImplementedError(f"Complex assignment target is not implemented: {statement.target}")
+
+    def _translate_expression_statement(self, statement: s.Statement_Expr):
+        self._translate_expression(statement.expr)
+
+    def _translate_unsafe(self, statement: s.Statement_Unsafe):
+        self._unsafe_depth += 1
+        try:
+            self._translate_block(statement.body)
+        finally:
+            self._unsafe_depth -= 1
 
     def _translate_while(self, statement: s.Statement_While):
         while_id = self._while_counter
@@ -742,6 +775,13 @@ class Translator:
         elif isinstance(expr, s.Expression_Block):
             return self._translate_expression_block(expr, name=name, expected_type=expected_type)
 
+        elif isinstance(expr, s.Expression_Unsafe):
+            self._unsafe_depth += 1
+            try:
+                return self._translate_expression_block(expr, name=name, expected_type=expected_type)
+            finally:
+                self._unsafe_depth -= 1
+
         elif isinstance(expr, s.Expression_If):
             return self._translate_if_expression(expr, name=name, expected_type=expected_type)
 
@@ -805,9 +845,18 @@ class Translator:
                 self._builder._add(Instruction_lceos(var_out=out, enum=enum_expr))
                 return Assignable(out)
 
+            if expr.name in self._extern_fns and self._unsafe_depth <= 0:
+                raise TypeError(f"Extern function '{expr.name}' can only be called inside unsafe block")
+
             generics = [self._translate_type(g) for g in expr.generics]
             args = [self._translate_expression(arg_exp).var_out for arg_exp in expr.args]
-            return self._builder.build_call(fn_name=expr.name, generics=generics, args=args, name=name)
+            return self._builder.build_call(
+                fn_name=expr.name,
+                generics=generics,
+                args=args,
+                name=name,
+                is_unsafe=expr.name in self._extern_fns and self._unsafe_depth > 0,
+            )
 
         raise NotImplementedError(f"Translation for expression type {type(expr)} is not implemented.")
 

@@ -29,9 +29,9 @@ def _create_src(root: Path):
     main_path = root / "src" / "main.enq"
     if not main_path.exists():
         with main_path.open("w") as f:
-            f.write("fn main() -> u32 {")
-            f.write("  ret 0")
-            f.write("}")
+            f.write("fn main() -> u32 {\n")
+            f.write("  ret 0\n")
+            f.write("}\n")
 
 
 def _initialize_git_repo(root: Path):

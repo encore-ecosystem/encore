@@ -13,6 +13,7 @@ class TypeInferer:
         self._funcs: dict[str, s.Statement_FunctionDefinition] = {}
         self._structs: dict[str, s.StructureDefinition] = {}
         self._enums: dict[str, s.Statement_EnumDefinition] = {}
+        self._unsafe_depth = 0
 
     def infer(
         self,
@@ -32,6 +33,8 @@ class TypeInferer:
     def _collect_declarations(self, statements: list[s.Statement]):
         for statement in statements:
             if isinstance(statement, s.Statement_FunctionDefinition):
+                self._funcs[statement.name] = statement
+            elif isinstance(statement, s.Statement_ExternFunctionDefinition):
                 self._funcs[statement.name] = statement
             elif isinstance(statement, s.Statement_StructureDefinition):
                 self._structs[statement.defi.name] = statement.defi
@@ -62,6 +65,8 @@ class TypeInferer:
                 value_type = self._infer_expression(statement.expr, env, expected)
                 if expected is not None and value_type is not None and expected != value_type:
                     raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
+            elif isinstance(statement, s.Statement_Expr):
+                self._infer_expression(statement.expr, env)
             elif isinstance(statement, s.Statement_Ret):
                 ret_type = self._infer_expression(statement.expr, env, fn_ret_type)
                 if ret_type is not None and ret_type != fn_ret_type:
@@ -88,6 +93,12 @@ class TypeInferer:
                     self._infer_block(statement.else_body, dict(env), fn_ret_type)
             elif isinstance(statement, s.Statement_Match):
                 self._infer_match(statement, env, fn_ret_type)
+            elif isinstance(statement, s.Statement_Unsafe):
+                self._unsafe_depth += 1
+                try:
+                    self._infer_block(statement.body, dict(env), fn_ret_type)
+                finally:
+                    self._unsafe_depth -= 1
 
     def _infer_return_type(self, body: list[s.Statement_InnerLevel], env: dict[str, Type]) -> Optional[Type]:
         types: list[Type] = []
@@ -102,6 +113,8 @@ class TypeInferer:
                 ret_type = self._infer_expression(statement.expr, env)
                 if ret_type is not None:
                     types.append(ret_type)
+            elif isinstance(statement, s.Statement_Expr):
+                self._infer_expression(statement.expr, env)
             elif isinstance(statement, s.Statement_While):
                 nested = self._infer_return_type(statement.body, dict(env))
                 if nested is not None:
@@ -133,6 +146,14 @@ class TypeInferer:
                     nested = self._infer_return_type(arm.body, arm_env)
                     if nested is not None:
                         types.append(nested)
+            elif isinstance(statement, s.Statement_Unsafe):
+                self._unsafe_depth += 1
+                try:
+                    nested = self._infer_return_type(statement.body, dict(env))
+                finally:
+                    self._unsafe_depth -= 1
+                if nested is not None:
+                    types.append(nested)
 
         if not types:
             return None
@@ -211,6 +232,13 @@ class TypeInferer:
         if isinstance(expr, s.Expression_Block):
             return self._infer_expression_block(expr, env, expected_type)
 
+        if isinstance(expr, s.Expression_Unsafe):
+            self._unsafe_depth += 1
+            try:
+                return self._infer_expression_block(expr, env, expected_type)
+            finally:
+                self._unsafe_depth -= 1
+
         if isinstance(expr, s.Expression_If):
             return self._infer_if_expression(expr, env, expected_type)
 
@@ -242,6 +270,8 @@ class TypeInferer:
             fn = self._funcs.get(expr.name)
             if fn is None:
                 return None
+            if isinstance(fn, s.Statement_ExternFunctionDefinition) and self._unsafe_depth <= 0:
+                raise TypeError(f"Extern function '{fn.name}' can only be called inside unsafe block")
 
             generic_mapping: dict[str, Type] = {}
             if expr.generics:
@@ -399,6 +429,10 @@ class TypeInferer:
                 raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
             return
 
+        if isinstance(statement, s.Statement_Expr):
+            self._infer_expression(statement.expr, env)
+            return
+
         if isinstance(statement, s.Statement_If):
             for branch in statement.branches:
                 cond = self._infer_expression(branch.expr, env, Type("bool"))
@@ -441,6 +475,14 @@ class TypeInferer:
 
         if isinstance(statement, s.Statement_Loop):
             self._infer_expression_block_nested(statement.body, dict(env))
+            return
+
+        if isinstance(statement, s.Statement_Unsafe):
+            self._unsafe_depth += 1
+            try:
+                self._infer_expression_block_nested(statement.body, dict(env))
+            finally:
+                self._unsafe_depth -= 1
             return
 
         if isinstance(statement, (s.Statement_Ret, s.Statement_Break, s.Statement_Continue)):

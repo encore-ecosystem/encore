@@ -35,6 +35,8 @@ class Parser:
 
         if curr_token.type == TokenType.KW_FN:
             return self._parse_function_definition(is_public)
+        elif curr_token.type == TokenType.KW_EXTERN:
+            return self._parse_extern_function_definition(is_public)
         elif curr_token.type == TokenType.KW_STRUCT:
             return self._parse_struct_definition(is_public)
         elif curr_token.type == TokenType.KW_IMPORT:
@@ -116,6 +118,31 @@ class Parser:
             params=params,
             type=fn_type,
             body=body,
+        )
+
+    def _parse_extern_function_definition(self, is_public: bool) -> s.Statement_ExternFunctionDefinition:
+        self._safe_consume(TokenType.KW_EXTERN)
+        self._safe_consume(TokenType.KW_FN)
+        func_name = self._safe_consume(TokenType.IDENTIFIER).value
+        generics = self._parse_generics_args() if self._get_current_token().type == TokenType.LEFT_BRACKET else []
+        params: list[Parameter] = []
+
+        self._safe_consume(TokenType.LEFT_PAREN)
+        if self._get_current_token().type != TokenType.RIGHT_PAREN:
+            params.append(self._parse_param())
+        while self._get_current_token().type != TokenType.RIGHT_PAREN:
+            self._safe_consume(TokenType.COMMA)
+            params.append(self._parse_param())
+        self._safe_consume(TokenType.RIGHT_PAREN)
+
+        self._safe_consume(TokenType.OP_ARROW)
+        fn_type = self._parse_type()
+        return s.Statement_ExternFunctionDefinition(
+            is_public=is_public,
+            name=func_name,
+            generics=generics,
+            params=params,
+            type=fn_type,
         )
 
     def _parse_enum(self, is_public: bool) -> s.Statement_EnumDefinition:
@@ -236,6 +263,8 @@ class Parser:
             return self._parse_if_block()
         if curr_token.type == TokenType.KW_MATCH:
             return self._parse_match()
+        if curr_token.type == TokenType.KW_UNSAFE:
+            return self._parse_unsafe_block()
         if curr_token.type == TokenType.KW_BREAK:
             return self._parse_break()
         if curr_token.type == TokenType.KW_CONTINUE:
@@ -244,7 +273,7 @@ class Parser:
             target = self._parse_expression()
             if self._get_current_token().type == TokenType.OP_ASSIGN:
                 return self._parse_assignment(target)
-            raise NotImplementedError(curr_token)
+            return s.Statement_Expr(target)
 
         raise NotImplementedError(curr_token)
 
@@ -347,6 +376,21 @@ class Parser:
             arms.append(self._parse_match_expression_arm())
         self._safe_consume(TokenType.RIGHT_BRACE)
         return s.Expression_Match(expr=expr, arms=arms)
+
+    def _parse_unsafe_block(self) -> s.Statement_Unsafe:
+        self._safe_consume(TokenType.KW_UNSAFE)
+        body = self._parse_block()
+        return s.Statement_Unsafe(body=body)
+
+    def _parse_unsafe_expression(self) -> s.Expression_Unsafe:
+        self._safe_consume(TokenType.KW_UNSAFE)
+        self._safe_consume(TokenType.LEFT_BRACE)
+        body: list[s.Statement_InnerLevel] = []
+        while self._starts_expression_block_statement():
+            body.append(self._parse_inner_level())
+        expr = self._parse_expression()
+        self._safe_consume(TokenType.RIGHT_BRACE)
+        return s.Expression_Unsafe(body=body, expr=expr)
 
     def _parse_match_expression_arm(self) -> s.Expression_MatchArm:
         pattern = None
@@ -603,6 +647,8 @@ class Parser:
 
         elif curr_token.type == TokenType.KW_IF:
             return self._parse_if_expression()
+        elif curr_token.type == TokenType.KW_UNSAFE:
+            return self._parse_unsafe_expression()
 
         elif curr_token.type == TokenType.IDENTIFIER:
             if curr_token.value in ("true", "false"):
@@ -730,6 +776,7 @@ class Parser:
             TokenType.KW_LOOP,
             TokenType.KW_IF,
             TokenType.KW_MATCH,
+            TokenType.KW_UNSAFE,
             TokenType.KW_RET,
             TokenType.KW_BREAK,
             TokenType.KW_CONTINUE,

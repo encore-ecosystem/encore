@@ -26,6 +26,8 @@ class Lexer:
             "match": TokenType.KW_MATCH,
             "pub": TokenType.KW_PUB,
             "import": TokenType.KW_IMPORT,
+            "extern": TokenType.KW_EXTERN,
+            "unsafe": TokenType.KW_UNSAFE,
         }
 
         # Tokenization patterns (order matters!)

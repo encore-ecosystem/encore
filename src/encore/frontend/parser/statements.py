@@ -75,6 +75,17 @@ class Statement_FunctionDefinition(Statement_TopLevel):
 
 
 @dataclass
+class Statement_ExternFunctionDefinition(Statement_TopLevel):
+    name: str
+    generics: list[Type]
+    params: list[Parameter]
+    type: Type
+
+    def __repr__(self) -> str:
+        return f"extern fn {self.name}(" + ", ".join(f"{p.name} : {p.type}" for p in self.params) + f") -> {self.type}"
+
+
+@dataclass
 class StructureDefinition(ABC):
     name: str
     generics: list[Type]
@@ -227,6 +238,14 @@ class Statement_Assignment(Statement_InnerLevel):
 
 
 @dataclass
+class Statement_Expr(Statement_InnerLevel):
+    expr: "Statement_Expression"
+
+    def __repr__(self) -> str:
+        return str(self.expr)
+
+
+@dataclass
 class Statement_IfBranch:
     expr: "Statement_Expression"
     body: list["Statement_InnerLevel"]
@@ -285,6 +304,18 @@ class Statement_Match(Statement_InnerLevel):
     def __repr__(self) -> str:
         arms_repr = "\n".join(f"  {arm}" for arm in self.arms)
         return f"match {self.expr} {{\n{arms_repr}\n}}"
+
+
+@dataclass
+class Statement_Unsafe(Statement_InnerLevel):
+    body: list["Statement_InnerLevel"]
+
+    def __repr__(self) -> str:
+        r = "unsafe {"
+        for stmt in self.body:
+            r += f"\n  {stmt}"
+        r += "\n}"
+        return r
 
 
 # =============
@@ -457,6 +488,19 @@ class Expression_Block(Statement_Expression):
 
     def __repr__(self) -> str:
         r = "{"
+        for stmt in self.body:
+            r += f"\n  {stmt}"
+        r += f"\n  {self.expr}\n}}"
+        return r
+
+
+@dataclass
+class Expression_Unsafe(Statement_Expression):
+    body: list[Statement_InnerLevel]
+    expr: Statement_Expression
+
+    def __repr__(self) -> str:
+        r = "unsafe {"
         for stmt in self.body:
             r += f"\n  {stmt}"
         r += f"\n  {self.expr}\n}}"

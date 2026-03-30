@@ -4,11 +4,11 @@ from argparse import Namespace
 from pathlib import Path
 from typing import Callable
 
-from ehir import Refrain
 from ehir.backend import EHIR_Backend
 from ehir.compiler import EHIR_ProjectCompiler
 from ehir_llvm_backend import EHIR_LLVM_Backend
 
+from ehir import Refrain
 from encore.frontend import EHIR_EncoreFrontend
 from encore.utils.manifest import ProjectManifest, ProjectTarget
 
@@ -66,7 +66,7 @@ def save_manifest(path: Path, manifest: ProjectManifest):
         f.write(toml.dumps(manifest.model_dump()))
 
 
-def _resolve_dependency(dep: str, update: bool = False) -> Path:
+def _resolve_dependency(dep: str, base_path: Path, update: bool = False) -> Path:
     from git import Repo
 
     from encore import ENCORE_CACHE_DIR
@@ -84,7 +84,7 @@ def _resolve_dependency(dep: str, update: bool = False) -> Path:
             Repo(path).remotes.origin.pull()
 
     elif dep.startswith("path@"):
-        path = Path(dep.removeprefix("path@")).resolve()
+        path = (base_path / dep.removeprefix("path@")).resolve()
 
     else:
         raise RuntimeError(f"Unable to load dependency: {dep}")
@@ -98,7 +98,7 @@ def _load_refrain(
     manifest = load_manifest(path)
 
     for dependency in manifest.project.dependencies:
-        _dep_path = _resolve_dependency(dependency)
+        _dep_path = _resolve_dependency(dependency, path)
         _load_refrain(compiler, _dep_path, Refrain.TargetType.OBJECT)
 
     ref = Refrain(
@@ -152,7 +152,7 @@ def run_binary(binary_path: Path, args: list[str]) -> int:
 def update_dependencies(path: Path):
     manifest = load_manifest(path)
     for dependency in manifest.project.dependencies:
-        dep_path = _resolve_dependency(dependency, update=True)
+        dep_path = _resolve_dependency(dependency, path, update=True)
         dep_manifest = dep_path / ProjectManifest.default_filename()
         if dep_manifest.exists():
             update_dependencies(dep_path)

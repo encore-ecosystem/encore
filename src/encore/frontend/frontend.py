@@ -3,10 +3,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from pathlib import Path
 
-from ehir import EHIR_Frontend
 from ehir.builder import EHIR_Module
 from ehir.core.derectives import Derective_imp, Derective_import
 
+from ehir import EHIR_Frontend
 from encore import ENCORE_CACHE_DIR, PROJECT_ROOT
 from encore.frontend.inference import TypeInferer
 from encore.frontend.lexer import Lexer
@@ -65,12 +65,18 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
     def get_parent_id_of(self, id: Path, derective: Derective_import) -> Path:
         project_root = self._get_project_root_of(id)
         dep_roots = self._get_dependency_roots(project_root)
+        manifest = self._load_manifest(project_root)
 
         match derective.prefix[0]:
             case "refrain":
                 dep_filepath = project_root / "src" / Path(*derective.prefix[1:])
             case "repo":
                 dep_filepath = self.src_dir / Path(*derective.prefix[1:])
+            case self_name if self_name == manifest.project.name:
+                if len(derective.prefix) == 1:
+                    dep_filepath = project_root / "src" / "lib"
+                else:
+                    dep_filepath = project_root / "src" / Path(*derective.prefix[1:])
             case dep_name if dep_name in dep_roots:
                 dep_root = dep_roots[dep_name]
                 if len(derective.prefix) == 1:
@@ -141,6 +147,8 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return None
 
         if isinstance(statement, s.Statement_FunctionDefinition):
+            return ExportBinding(statement.name, ExportKind.FUNCTION, id, statement)
+        if isinstance(statement, s.Statement_ExternFunctionDefinition):
             return ExportBinding(statement.name, ExportKind.FUNCTION, id, statement)
         if isinstance(statement, s.Statement_StructureDefinition):
             return ExportBinding(statement.defi.name, ExportKind.STRUCT, id, statement)

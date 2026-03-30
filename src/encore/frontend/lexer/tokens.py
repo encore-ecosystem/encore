@@ -27,6 +27,8 @@ class TokenType(Enum):
     KW_MATCH = auto()
     KW_PUB = auto()
     KW_IMPORT = auto()
+    KW_EXTERN = auto()
+    KW_UNSAFE = auto()
 
     OP_SCOPE = auto()
 
