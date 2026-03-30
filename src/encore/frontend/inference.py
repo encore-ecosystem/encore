@@ -215,7 +215,10 @@ class TypeInferer:
                 if expected_type is not None and expected_type != expr.literal_type:
                     raise TypeError(f"Type mismatch: {expected_type} != {expr.literal_type}")
                 return expr.literal_type
-            return expected_type if expected_type is not None and self._is_integer_type(expected_type) else Type("i32")
+            if expected_type is not None and self._is_integer_type(expected_type):
+                expr.literal_type = expected_type
+                return expected_type
+            return Type("i32")
 
         if isinstance(expr, s.Expression_FloatLiteral):
             if expr.literal_type is not None:
@@ -224,7 +227,10 @@ class TypeInferer:
                 if expected_type is not None and expected_type != expr.literal_type:
                     raise TypeError(f"Type mismatch: {expected_type} != {expr.literal_type}")
                 return expr.literal_type
-            return expected_type if expected_type is not None and self._is_float_type(expected_type) else Type("f64")
+            if expected_type is not None and self._is_float_type(expected_type):
+                expr.literal_type = expected_type
+                return expected_type
+            return Type("f64")
 
         if isinstance(expr, s.Expression_Parenthesized):
             return self._infer_expression(expr.expr, env, expected_type)
@@ -299,6 +305,8 @@ class TypeInferer:
         if isinstance(expr, s.Expression_BinaryOperation):
             lhs_type = self._infer_expression(expr.lhs, env, expected_type)
             rhs_type = self._infer_expression(expr.rhs, env, lhs_type or expected_type)
+            if lhs_type is None and rhs_type is not None:
+                lhs_type = self._infer_expression(expr.lhs, env, rhs_type)
             if expr.operator in ("==", "!=", "<", "<=", ">", ">="):
                 return Type("bool")
             return lhs_type or rhs_type or expected_type

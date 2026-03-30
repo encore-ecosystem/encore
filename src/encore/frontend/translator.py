@@ -9,7 +9,12 @@ from ehir.core.instructions.base import Assignable
 from ehir.core.instructions.capture import Instruction_lceos, Instruction_lcsos, Instruction_scsoh, Instruction_scsos
 from ehir.core.instructions.control_flow import MatchCase
 from ehir.core.instructions.control_flow.phi import PhiPair
-from ehir.core.instructions.memory import Instruction_sgetfieldptr, Instruction_store
+from ehir.core.instructions.memory import (
+    Instruction_getfield,
+    Instruction_getfieldptr,
+    Instruction_sgetfieldptr,
+    Instruction_store,
+)
 from ehir.core.instructions.operators.arithmetic import (
     Instruction_add,
     Instruction_div,
@@ -77,6 +82,7 @@ class Translator:
         self._current_function = None
         self._current_variable_name = "tmp"
         self._current_variable_idx = 0
+        self._unique_variable_idx = 0
         self._variables: dict[str, dict[str, Variable]] = {}
         self._while_counter = 0
         self._if_counter = 0
@@ -319,9 +325,11 @@ class Translator:
             self._set_new_variable(statement.target.field)
             src = self._resolve_variable(statement.target.name)
             dst_ptr = Variable(self._advance_variable())
-            self._builder._add(
-                Instruction_sgetfieldptr(var_out=dst_ptr, src=src, field=Variable(statement.target.field))
-            )
+            field = Variable(statement.target.field)
+            if isinstance(src.type, (HeapSmartPointer, StackSmartPointer)):
+                self._builder._add(Instruction_sgetfieldptr(var_out=dst_ptr, src=src, field=field))
+            else:
+                self._builder._add(Instruction_getfieldptr(var_out=dst_ptr, src=src, field=field))
 
             val = self._translate_expression(
                 statement.expr,
@@ -836,7 +844,21 @@ class Translator:
             return self._translate_struct_initialization(expr.name, args, name)
 
         elif isinstance(expr, s.Expression_StructField):
-            return self._builder.build_sgetfield(src=self._resolve_variable(expr.name), field=Variable(expr.field))
+            src = self._resolve_variable(expr.name)
+            field = Variable(expr.field)
+            field_type_raw = self._lookup_field_type(src.type, expr.field)
+            field_type = self._translate_type(field_type_raw) if field_type_raw is not None else None
+            if isinstance(src.type, (HeapSmartPointer, StackSmartPointer)):
+                instr = self._builder.build_sgetfield(src=src, field=field)
+                if field_type is not None:
+                    instr.var_out.type = field_type
+                return instr
+
+            instr = Instruction_getfield(var_out=Variable(name or self._advance_variable()), src=src, field=field)
+            if field_type is not None:
+                instr.var_out.type = field_type
+            self._builder._add(instr)
+            return instr
 
         elif isinstance(expr, s.Expression_Call):
             enum_expr = self._build_enum_from_call(expr)
@@ -1061,7 +1083,8 @@ class Translator:
 
     def _advance_variable(self) -> str:
         self._current_variable_idx += 1
-        return f"{self._current_variable_name}_{self._current_variable_idx}"
+        self._unique_variable_idx += 1
+        return f"{self._current_variable_name}_{self._unique_variable_idx}"
 
     def _resolve_variable(self, name: str) -> Variable:
         return self._var_vals.get(name, Variable(name))
