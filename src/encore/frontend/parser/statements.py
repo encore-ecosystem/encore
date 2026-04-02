@@ -86,6 +86,31 @@ class Statement_ExternFunctionDefinition(Statement_TopLevel):
 
 
 @dataclass
+class TraitMethodDeclaration:
+    name: str
+    generics: list[Type]
+    params: list[Parameter]
+    type: Type
+
+    def __repr__(self) -> str:
+        generics_repr = ("[" + ", ".join(str(g) for g in self.generics) + "]") if self.generics else ""
+        params_repr = ", ".join(f"{p.name} : {p.type}" for p in self.params)
+        return f"fn {self.name}{generics_repr}({params_repr}) -> {self.type}"
+
+
+@dataclass
+class Statement_Trait(Statement_TopLevel):
+    name: str
+    generics: list[Type]
+    body: list[TraitMethodDeclaration]
+
+    def __repr__(self) -> str:
+        generics_repr = ("[" + ", ".join(str(g) for g in self.generics) + "]") if self.generics else ""
+        body_repr = " {\n" + "\n".join(f"  {method}" for method in self.body) + "\n}"
+        return f"{super().__repr__()}trait {self.name}{generics_repr}{body_repr}"
+
+
+@dataclass
 class StructureDefinition(ABC):
     name: str
     generics: list[Type]
@@ -157,12 +182,22 @@ class Statement_Impl(Statement_TopLevel):
 
     generics: list[Type]
     trait_name: str | None
+    trait_args: list[Type]
     struct: Type
     body: list[Statement_FunctionDefinition]
     is_public: bool
 
     def __post_init__(self):
         self.is_public = False
+
+    def __repr__(self) -> str:
+        generics_repr = ("[" + ", ".join(str(g) for g in self.generics) + "]") if self.generics else ""
+        trait_repr = ""
+        if self.trait_name is not None:
+            trait_args_repr = ("[" + ", ".join(str(g) for g in self.trait_args) + "]") if self.trait_args else ""
+            trait_repr = f" {self.trait_name}{trait_args_repr}"
+        body_repr = "\n".join(f"  {method}" for method in self.body)
+        return f"impl{generics_repr}{trait_repr} for {self.struct} {{\n{body_repr}\n}}"
 
 
 # =============
@@ -576,6 +611,14 @@ class Expression_UnaryOperation(Statement_Expression):
 
     def __repr__(self) -> str:
         return f"{self.operator}{self.expr}"
+
+
+@dataclass
+class Expression_Try(Statement_Expression):
+    expr: Statement_Expression
+
+    def __repr__(self) -> str:
+        return f"{self.expr}?"
 
 
 # =============

@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Optional
 
 from ehir.builder import EHIR_Builder, EHIR_Module
-from ehir.core.derectives import Derective_enum, Derective_fn
+from ehir.core.derectives import Derective_enum, Derective_fn, Derective_impl, Derective_trait, TraitMethod
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum, EnumVariant
 from ehir.core.instructions.base import Assignable
@@ -47,9 +47,12 @@ class Translator:
     _funcs: dict[str, Derective_fn]
     _enums: dict[str, Derective_enum]
     _structs: dict[str, s.StructureDefinition]
+    _traits: dict[str, s.Statement_Trait]
     _builder: EHIR_Builder
     _module: EHIR_Module
     _extern_fns: dict[str, s.Statement_ExternFunctionDefinition]
+    _enum_payload_structs: dict[str, list[s.CLikeStructureDefinition]]
+    _emitted_structs: set[str]
 
     class _PreparedMatch:
         def __init__(
@@ -94,7 +97,10 @@ class Translator:
         self._enums = {}
         self._structs = {}
         self._extern_fns = {}
+        self._traits = {}
         self._unsafe_depth = 0
+        self._enum_payload_structs = {}
+        self._emitted_structs = set()
 
     def run(self, program: str) -> EHIR_Module:
         self._reset_state()
@@ -104,6 +110,7 @@ class Translator:
         return self.translate_ast(ast)
 
     def translate_ast(self, ast: list[s.Statement]) -> EHIR_Module:
+        self.preload_declarations([statement for statement in ast if isinstance(statement, s.Statement_TopLevel)])
         for statement in ast:
             self._translate_statement(statement)
 
@@ -115,10 +122,34 @@ class Translator:
                 if not isinstance(statement.defi, s.CLikeStructureDefinition):
                     raise NotImplementedError(f"Unsupported structure definition: {type(statement.defi)}")
                 self._structs[statement.defi.name] = statement.defi
+            elif isinstance(statement, s.Statement_FunctionDefinition):
+                if statement.type is None:
+                    continue
+                self._funcs[statement.name] = Derective_fn(
+                    name=statement.name,
+                    generics=[self._translate_type(g) for g in statement.generics],
+                    params=[
+                        Parameter(name=param.name, type=self._translate_type(param.type)) for param in statement.params
+                    ],
+                    body=[],
+                    ret_type=self._translate_type(statement.type),
+                )
             elif isinstance(statement, s.Statement_EnumDefinition):
                 self._enums[statement.name] = self._build_enum_directive(statement)
             elif isinstance(statement, s.Statement_ExternFunctionDefinition):
                 self._extern_fns[statement.name] = statement
+                self._funcs[statement.name] = Derective_fn(
+                    name=statement.name,
+                    generics=[self._translate_type(g) for g in statement.generics],
+                    params=[
+                        Parameter(name=param.name, type=self._translate_type(param.type)) for param in statement.params
+                    ],
+                    body=[],
+                    ret_type=self._translate_type(statement.type),
+                    is_extern=True,
+                )
+            elif isinstance(statement, s.Statement_Trait):
+                self._traits[statement.name] = statement
 
     def _translate_statement(self, statement: s.Statement) -> Derective | None:
         if isinstance(statement, s.Statement_FunctionDefinition):
@@ -129,6 +160,10 @@ class Translator:
             return self._translate_structure_definition(statement)
         elif isinstance(statement, s.Statement_EnumDefinition):
             return self._translate_enum_definition(statement)
+        elif isinstance(statement, s.Statement_Trait):
+            return self._translate_trait_definition(statement)
+        elif isinstance(statement, s.Statement_Impl):
+            return self._translate_impl_definition(statement)
         elif isinstance(statement, s.Statement_Import):
             return self._translate_import(statement)
         raise NotImplementedError(f"Translation for statement type {type(statement)} is not implemented.")
@@ -168,11 +203,17 @@ class Translator:
         if not isinstance(statement.defi, s.CLikeStructureDefinition):
             raise NotImplementedError(f"Unsupported structure definition: {type(statement.defi)}")
         self._structs[statement.defi.name] = statement.defi
+        self._emit_struct_definition(statement.defi)
+
+    def _emit_struct_definition(self, definition: s.CLikeStructureDefinition):
+        if definition.name in self._emitted_structs:
+            return
         self._builder.build_struct(
-            name=statement.defi.name,
-            generics=[self._translate_type(g) for g in statement.defi.generics],
-            params=[Parameter(param.name, self._translate_type(param.type)) for param in statement.defi.fields],
+            name=definition.name,
+            generics=[self._translate_type(g) for g in definition.generics],
+            params=[Parameter(param.name, self._translate_type(param.type)) for param in definition.fields],
         )
+        self._emitted_structs.add(definition.name)
 
     def _build_enum_directive(self, statement: s.Statement_EnumDefinition) -> Derective_enum:
         variants: list[EnumVariant] = []
@@ -182,14 +223,21 @@ class Translator:
                 continue
 
             if isinstance(variant, s.TupleStructureDefinition):
-                if len(variant.fields) > 1:
-                    raise NotImplementedError(f"Tuple enum variant with arity > 1 is not supported: {variant.name}")
-                payload_type = self._translate_type(variant.fields[0]) if variant.fields else None
+                if len(variant.fields) <= 1:
+                    payload_type = self._translate_type(variant.fields[0]) if variant.fields else None
+                    variants.append(EnumVariant(name=variant.name, type=payload_type))
+                    continue
+
+                payload_struct = self._ensure_enum_payload_struct(statement, variant)
+                payload_type = self._translate_type(Type(payload_struct.name, list(statement.generics)))
                 variants.append(EnumVariant(name=variant.name, type=payload_type))
                 continue
 
             if isinstance(variant, s.CLikeStructureDefinition):
-                raise NotImplementedError(f"CLike enum variant is not supported: {variant.name}")
+                payload_struct = self._ensure_enum_payload_struct(statement, variant)
+                payload_type = self._translate_type(Type(payload_struct.name, list(statement.generics)))
+                variants.append(EnumVariant(name=variant.name, type=payload_type))
+                continue
 
         return Derective_enum(
             name=statement.name,
@@ -197,27 +245,136 @@ class Translator:
             variants=variants,
         )
 
+    def _ensure_enum_payload_struct(
+        self, enum_statement: s.Statement_EnumDefinition, variant: s.StructureDefinition
+    ) -> s.CLikeStructureDefinition:
+        struct_name = f"{enum_statement.name}_{variant.name}_Payload"
+        existing = self._structs.get(struct_name)
+        if isinstance(existing, s.CLikeStructureDefinition):
+            payload = existing
+        else:
+            if isinstance(variant, s.TupleStructureDefinition):
+                fields = [Parameter(f"_{idx}", field) for idx, field in enumerate(variant.fields)]
+            elif isinstance(variant, s.CLikeStructureDefinition):
+                fields = list(variant.fields)
+            else:
+                raise NotImplementedError(f"Unsupported enum payload variant shape: {type(variant)}")
+
+            payload = s.CLikeStructureDefinition(
+                name=struct_name, generics=list(enum_statement.generics), fields=fields
+            )
+            self._structs[struct_name] = payload
+
+        payloads = self._enum_payload_structs.setdefault(enum_statement.name, [])
+        if all(definition.name != payload.name for definition in payloads):
+            payloads.append(payload)
+        return payload
+
     def _translate_enum_definition(self, statement: s.Statement_EnumDefinition):
+        for payload_struct in self._enum_payload_structs.get(statement.name, []):
+            self._emit_struct_definition(payload_struct)
         derective = self._build_enum_directive(statement)
         self._module.ast.append(derective)
         self._enums[statement.name] = derective
         return derective
 
+    def _translate_trait_definition(self, statement: s.Statement_Trait):
+        derective = self._builder.build_trait(
+            name=statement.name,
+            generics=[self._translate_type(g) for g in statement.generics],
+            methods=[
+                TraitMethod(
+                    name=method.name,
+                    generics=[self._translate_type(g) for g in method.generics],
+                    params=[
+                        Parameter(name=param.name, type=self._translate_type(param.type)) for param in method.params
+                    ],
+                    ret_type=self._translate_type(method.type),
+                )
+                for method in statement.body
+            ],
+        )
+        self._traits[statement.name] = statement
+        return derective
+
+    def _translate_impl_definition(self, statement: s.Statement_Impl):
+        if statement.trait_name is None:
+            struct_type = self._translate_type(statement.struct)
+            for method in statement.body:
+                impl_generic_names = {generic.name for generic in statement.generics}
+                merged_method_generics = [*statement.generics]
+                for generic in method.generics:
+                    if generic.name in impl_generic_names:
+                        continue
+                    merged_method_generics.append(generic)
+                    impl_generic_names.add(generic.name)
+
+                namespaced_method = s.Statement_FunctionDefinition(
+                    is_public=method.is_public,
+                    name=f"{struct_type.name}::{method.name}",
+                    generics=merged_method_generics,
+                    params=method.params,
+                    type=method.type,
+                    body=method.body,
+                )
+                self._module.ast.append(self._translate_nested_function_definition(namespaced_method))
+            return None
+
+        methods = [self._translate_nested_function_definition(method) for method in statement.body]
+        return self._builder.build_impl(
+            trait_name=statement.trait_name,
+            trait_args=[self._translate_type(arg) for arg in statement.trait_args],
+            for_type=self._translate_type(statement.struct),
+            generics=[self._translate_type(generic) for generic in statement.generics],
+            methods=methods,
+        )
+
     def _translate_function_definition(self, statement: s.Statement_FunctionDefinition):
+        fn = self._translate_nested_function_definition(statement)
+        self._module.ast.append(fn)
+        self._funcs[statement.name] = fn
+        return fn
+
+    def _translate_nested_function_definition(self, statement: s.Statement_FunctionDefinition) -> Derective_fn:
         assert statement.type is not None
-        self._builder.build_fn(
+        fn = Derective_fn(
             name=statement.name,
             generics=[self._translate_type(g) for g in statement.generics],
             params=[Parameter(name=param.name, type=self._translate_type(param.type)) for param in statement.params],
+            body=[],
             ret_type=self._translate_type(statement.type),
         )
+        self._translate_function_body(fn, statement.body)
+        return fn
+
+    def _translate_function_body(self, fn: Derective_fn, body: list[s.Statement_InnerLevel]):
+        prev_current_function = getattr(self._builder, "current_function", None)
+        prev_current_block = getattr(self._builder, "current_block", None)
+        prev_builder_variables = getattr(self._builder, "variables", {})
+        prev_var_vals = self._var_vals
+        prev_assignment_targets = self._assignment_targets
+        prev_terminated_blocks = self._terminated_blocks
+        prev_loop_stack = self._loop_stack
+
+        self._builder.current_function = fn
+        self._builder.variables = {param.name: param for param in fn.params}
         self._var_vals = {}
         self._assignment_targets = {}
         self._terminated_blocks = set()
         self._loop_stack = []
         entry_block = self._builder.append_block("entry")
         self._builder.position_at_end(entry_block)
-        self._translate_block(statement.body)
+        self._translate_block(body)
+
+        if prev_current_function is not None:
+            self._builder.current_function = prev_current_function
+        if prev_current_block is not None:
+            self._builder.current_block = prev_current_block
+        self._builder.variables = prev_builder_variables
+        self._var_vals = prev_var_vals
+        self._assignment_targets = prev_assignment_targets
+        self._terminated_blocks = prev_terminated_blocks
+        self._loop_stack = prev_loop_stack
 
     def _translate_block(self, statement: list[s.Statement_InnerLevel]):
         for inner_statement in statement:
@@ -323,7 +480,7 @@ class Translator:
 
         if isinstance(statement.target, s.Expression_StructField):
             self._set_new_variable(statement.target.field)
-            src = self._resolve_variable(statement.target.name)
+            src = self._resolve_struct_field_chain(statement.target.name)
             dst_ptr = Variable(self._advance_variable())
             field = Variable(statement.target.field)
             if isinstance(src.type, (HeapSmartPointer, StackSmartPointer)):
@@ -825,7 +982,14 @@ class Translator:
                     raise NotImplementedError(f"Translation for binary operator {expr.operator} is not implemented.")
 
         elif isinstance(expr, s.Expression_UnaryOperation):
-            raise NotImplementedError("Translation for unary operations is not implemented.")
+            if expr.operator in ("!", "not"):
+                operand = self._translate_expression(expr.expr)
+                zero = self._builder.build_lcpos(prim=Usize(0, size=1))
+                return self._builder.build_ieq(operand.var_out, zero.var_out, name)
+            raise NotImplementedError(f"Translation for unary operator '{expr.operator}' is not implemented.")
+
+        elif isinstance(expr, s.Expression_Try):
+            return self._translate_try_expression(expr, name=name)
 
         elif isinstance(expr, s.Expression_Parenthesized):
             return self._translate_expression(expr.expr, name=name, expected_type=expected_type)
@@ -844,7 +1008,7 @@ class Translator:
             return self._translate_struct_initialization(expr.name, args, name)
 
         elif isinstance(expr, s.Expression_StructField):
-            src = self._resolve_variable(expr.name)
+            src = self._resolve_struct_field_chain(expr.name)
             field = Variable(expr.field)
             field_type_raw = self._lookup_field_type(src.type, expr.field)
             field_type = self._translate_type(field_type_raw) if field_type_raw is not None else None
@@ -872,15 +1036,82 @@ class Translator:
 
             generics = [self._translate_type(g) for g in expr.generics]
             args = [self._translate_expression(arg_exp).var_out for arg_exp in expr.args]
-            return self._builder.build_call(
+            call = self._builder.build_call(
                 fn_name=expr.name,
                 generics=generics,
                 args=args,
                 name=name,
                 is_unsafe=expr.name in self._extern_fns and self._unsafe_depth > 0,
             )
+            callee = self._funcs.get(expr.name)
+            if callee is not None:
+                generic_mapping = {generic.name: concrete for generic, concrete in zip(callee.generics, generics)}
+                call.var_out.type = self._specialize_type(callee.ret_type, generic_mapping)
+            return call
 
         raise NotImplementedError(f"Translation for expression type {type(expr)} is not implemented.")
+
+    def _translate_try_expression(
+        self,
+        expr: s.Expression_Try,
+        name: Optional[str] = None,
+    ) -> Assignable:
+        tried = self._translate_expression(expr.expr)
+        if tried.var_out.type is None:
+            raise TypeError("Unable to infer type of expression used with '?'")
+
+        result_type = tried.var_out.type
+        base_result_type = (
+            result_type.pointee if isinstance(result_type, (HeapSmartPointer, StackSmartPointer)) else result_type
+        )
+        if base_result_type.name != "Result" or len(base_result_type.generics) != 2:
+            raise TypeError(f"'?' operator expects Result[T, E], got {result_type}")
+        ok_type, err_type = base_result_type.generics
+        ok_type = self._translate_type(ok_type)
+        err_type = self._translate_type(err_type)
+
+        current_fn = getattr(self._builder, "current_function", None)
+        if current_fn is None:
+            raise TypeError("'?' operator can only be used inside a function")
+        fn_ret_type = current_fn.ret_type
+        base_fn_ret_type = (
+            fn_ret_type.pointee if isinstance(fn_ret_type, (HeapSmartPointer, StackSmartPointer)) else fn_ret_type
+        )
+        if base_fn_ret_type.name != "Result" or len(base_fn_ret_type.generics) != 2:
+            raise TypeError("'?' operator can only be used in functions returning Result")
+        fn_err_type = base_fn_ret_type.generics[1]
+        if not self._types_compatible(fn_err_type, err_type):
+            raise TypeError(f"'?' error type mismatch: function expects {fn_err_type}, got {err_type}")
+
+        try_id = self._if_counter
+        self._if_counter += 1
+
+        ok_block = self._builder.append_block(f"try_ok_{try_id}")
+        err_block = self._builder.append_block(f"try_err_{try_id}")
+
+        ok_payload = Variable(name or self._advance_variable(), ok_type)
+        err_payload = Variable(self._advance_variable(), err_type)
+        cases = [
+            MatchCase(variant="Ok", label=ok_block.name, payload_var=ok_payload),
+            MatchCase(variant="Err", label=err_block.name, payload_var=err_payload),
+        ]
+        self._builder.build_match(cond_var=tried.var_out, default_label=err_block.name, cases=cases)
+        self._mark_current_block_terminated()
+
+        self._builder.position_at_end(err_block)
+        err_value = Variable(self._advance_variable(), fn_ret_type)
+        err_enum = Enum(
+            name=base_fn_ret_type.name,
+            generics=base_fn_ret_type.generics,
+            variant="Err",
+            payload=Struct(name=err_type.name, value=err_payload, type=err_type),
+        )
+        self._builder._add(Instruction_lceos(var_out=err_value, enum=err_enum))
+        self._builder.build_ret(err_value)
+        self._mark_current_block_terminated()
+
+        self._builder.position_at_end(ok_block)
+        return Assignable(ok_payload)
 
     def _translate_expression_block(
         self,
@@ -1026,7 +1257,11 @@ class Translator:
         arm_prefix: str,
     ) -> _PreparedMatch:
         scrutinee = self._translate_expression(scrutinee_expr)
-        assert scrutinee.var_out.type is not None
+        if scrutinee.var_out.type is None:
+            current_fn = getattr(self._builder.current_function, "name", "<unknown>")
+            raise TypeError(
+                f"Unable to infer match scrutinee type in '{current_fn}' for expression: {scrutinee_expr!r}"
+            )
         base_var_vals = dict(self._var_vals)
         end_block = self._builder.append_block(f"{end_prefix}_{match_id}")
         wildcard_arm = next((arm for arm in arms if arm.is_wildcard), None)
@@ -1087,7 +1322,31 @@ class Translator:
         return f"{self._current_variable_name}_{self._unique_variable_idx}"
 
     def _resolve_variable(self, name: str) -> Variable:
-        return self._var_vals.get(name, Variable(name))
+        if name in self._var_vals:
+            return self._var_vals[name]
+        try:
+            return self._builder.get_var(name).var_out
+        except ValueError:
+            return Variable(name)
+
+    def _resolve_struct_field_chain(self, name: str) -> Variable:
+        parts = name.split(".")
+        if not parts:
+            return Variable(name)
+
+        src = self._resolve_variable(parts[0])
+        for segment in parts[1:]:
+            field = Variable(segment)
+            field_type = self._lookup_field_type(src.type, segment)
+            if isinstance(src.type, (HeapSmartPointer, StackSmartPointer)):
+                instr = self._builder.build_sgetfield(src=src, field=field)
+            else:
+                instr = Instruction_getfield(var_out=Variable(self._advance_variable()), src=src, field=field)
+                self._builder._add(instr)
+            if field_type is not None:
+                instr.var_out.type = field_type
+            src = instr.var_out
+        return src
 
     def _translate_struct_initialization(
         self, typ: Type, args: list[Variable], name: Optional[str] = None
@@ -1131,13 +1390,26 @@ class Translator:
 
         payload = None
         if expr.args:
-            if len(expr.args) != 1:
-                raise NotImplementedError(f"Enum payload variant '{expr.name}' with arity > 1 is not supported yet.")
-
             payload_type = self._lookup_enum_variant_type(enum_type, variant_name)
             if payload_type is None:
                 raise NotImplementedError(f"Unable to resolve payload type for enum variant '{expr.name}'.")
-            payload_var = self._translate_expression(expr.args[0], expected_type=payload_type).var_out
+
+            payload_field_types = self._lookup_struct_field_types(payload_type)
+            if payload_field_types:
+                if len(payload_field_types) != len(expr.args):
+                    raise TypeError(
+                        f"Enum variant '{expr.name}' expects {len(payload_field_types)} payload arguments, "
+                        f"got {len(expr.args)}"
+                    )
+                payload_args = [
+                    self._translate_expression(arg_expr, expected_type=payload_field_types[idx]).var_out
+                    for idx, arg_expr in enumerate(expr.args)
+                ]
+                payload_var = self._translate_struct_initialization(payload_type, payload_args).var_out
+            else:
+                if len(expr.args) != 1:
+                    raise TypeError(f"Enum variant '{expr.name}' expects a single payload argument")
+                payload_var = self._translate_expression(expr.args[0], expected_type=payload_type).var_out
 
             payload = Struct(name=payload_type.name, value=payload_var, type=payload_type)
         return Enum(name=enum_type.name, generics=enum_type.generics, variant=variant_name, payload=payload)
@@ -1208,6 +1480,24 @@ class Translator:
         if typ.name.startswith("f") and typ.name[1:].isdigit():
             return Float_t(int(typ.name[1:]))
         return Type(typ.name, [self._translate_type(generic) for generic in typ.generics])
+
+    def _types_compatible(self, lhs: Type, rhs: Type) -> bool:
+        if isinstance(lhs, HeapSmartPointer) and isinstance(rhs, HeapSmartPointer):
+            return self._types_compatible(lhs.pointee, rhs.pointee)
+        if isinstance(lhs, StackSmartPointer) and isinstance(rhs, StackSmartPointer):
+            return self._types_compatible(lhs.pointee, rhs.pointee)
+        if isinstance(lhs, (HeapSmartPointer, StackSmartPointer)) or isinstance(
+            rhs, (HeapSmartPointer, StackSmartPointer)
+        ):
+            return False
+        if lhs.name != rhs.name:
+            return False
+        if len(lhs.generics) != len(rhs.generics):
+            return False
+        for lg, rg in zip(lhs.generics, rhs.generics):
+            if not self._types_compatible(lg, rg):
+                return False
+        return True
 
     @staticmethod
     def _infer_int_size(expected_type: Optional[Type]) -> int:

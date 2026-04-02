@@ -1,0 +1,1330 @@
+import std::string::concat
+import std::string::len
+import repo::frontend::lexer::Lexer
+import repo::frontend::token::Token
+import repo::frontend::token::TokenType
+
+pub struct ParseError {
+    message: str
+    line: usize
+    column: usize
+}
+
+pub struct ParsedModule {
+    directives: usize
+    imports: usize
+    structs: usize
+    enums: usize
+    traits: usize
+    impls: usize
+    functions: usize
+    extern_functions: usize
+    unsafe_functions: usize
+    outline: str
+}
+
+pub enum ParseOutcome {
+    Success(ParsedModule)
+    Failure(ParseError)
+}
+
+struct Cursor {
+    lexer: Lexer
+    current: Token
+}
+
+enum ParseStep {
+    Continue(Cursor)
+    Fail(ParseError)
+}
+
+pub fn parse(source: str) -> ParseOutcome {
+    let start = init_cursor(source)
+    ret parse_module(start, empty_parsed_module())
+}
+
+fn parse_module(cursor: Cursor, module: ParsedModule) -> ParseOutcome {
+    if (is_cursor_eof(cursor)) {
+        ret ParseOutcome::Success(module)
+    }
+
+    let counted = count_directive(module, cursor)
+    let step = parse_directive(cursor)
+    match step {
+        Continue(next) => {
+            if (is_cursor_eof(next)) {
+                ret ParseOutcome::Success(counted)
+            }
+            ret parse_module(next, counted)
+        }
+        Fail(error) => {
+            ret ParseOutcome::Failure(error)
+        }
+    }
+}
+
+fn init_cursor(source: str) -> Cursor {
+    let lexer = Lexer::from_source(source)
+    let lexed = Lexer::next_token(lexer)
+    ret Cursor{lexed.next, lexed.token}
+}
+
+fn advance(cursor: Cursor) -> Cursor {
+    let lexed = Lexer::next_token(cursor.lexer)
+    ret Cursor{lexed.next, lexed.token}
+}
+
+fn parse_directive(cursor: Cursor) -> ParseStep {
+    let no_pub = consume_optional_pub(cursor)
+    match no_pub.current.type {
+        KW_IMPORT => {
+            ret parse_import(no_pub)
+        }
+        KW_STRUCT => {
+            ret parse_struct(no_pub)
+        }
+        KW_ENUM => {
+            ret parse_enum(no_pub)
+        }
+        KW_TRAIT => {
+            ret parse_trait(no_pub)
+        }
+        KW_IMPL => {
+            ret parse_impl(no_pub)
+        }
+        KW_EXTERN => {
+            ret parse_extern_fn(no_pub)
+        }
+        KW_UNSAFE => {
+            ret parse_unsafe_fn(no_pub)
+        }
+        KW_FN => {
+            ret parse_fn(no_pub)
+        }
+        EOF => {
+            ret ParseStep::Continue(no_pub)
+        }
+        _ => {
+            ret fail(no_pub, "Unexpected top-level directive")
+        }
+    }
+}
+
+fn consume_optional_pub(cursor: Cursor) -> Cursor {
+    match cursor.current.type {
+        KW_PUB => {
+            ret advance(cursor)
+        }
+        _ => {
+            ret cursor
+        }
+    }
+}
+
+fn parse_import(cursor: Cursor) -> ParseStep {
+    let after_kw = advance(cursor)
+    ret parse_import_path(after_kw)
+}
+
+fn parse_import_path(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        IDENTIFIER => {
+            let after_segment = advance(cursor)
+            ret parse_import_tail(after_segment)
+        }
+        OP_MULTIPLY => {
+            let after_glob = advance(cursor)
+            ret parse_import_tail(after_glob)
+        }
+        _ => {
+            ret fail(cursor, "Expected import segment")
+        }
+    }
+}
+
+fn parse_import_tail(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        OP_SCOPE => {
+            let after_scope = advance(cursor)
+            ret parse_import_after_scope(after_scope)
+        }
+        COMMA => {
+            ret ParseStep::Continue(cursor)
+        }
+        RIGHT_BRACE => {
+            ret ParseStep::Continue(cursor)
+        }
+        _ => {
+            if (is_top_level_start(cursor.current.type)) {
+                ret ParseStep::Continue(cursor)
+            }
+            ret fail(cursor, "Unexpected token in import path")
+        }
+    }
+}
+
+fn parse_import_after_scope(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        LEFT_BRACE => {
+            let after_lbrace = advance(cursor)
+            ret parse_import_group(after_lbrace)
+        }
+        IDENTIFIER => {
+            let after_segment = advance(cursor)
+            ret parse_import_tail(after_segment)
+        }
+        OP_MULTIPLY => {
+            let after_glob = advance(cursor)
+            ret parse_import_tail(after_glob)
+        }
+        _ => {
+            ret fail(cursor, "Expected import segment after '::'")
+        }
+    }
+}
+
+fn parse_import_group(cursor: Cursor) -> ParseStep {
+    let first = parse_import_path(cursor)
+    match first {
+        Continue(next) => {
+            ret parse_import_group_tail(next)
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn parse_import_group_tail(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        COMMA => {
+            let after_comma = advance(cursor)
+            match after_comma.current.type {
+                RIGHT_BRACE => {
+                    let after_rbrace = advance(after_comma)
+                    ret parse_import_tail(after_rbrace)
+                }
+                _ => {
+                    ret parse_import_group(after_comma)
+                }
+            }
+        }
+        RIGHT_BRACE => {
+            let after_rbrace = advance(cursor)
+            ret parse_import_tail(after_rbrace)
+        }
+        _ => {
+            ret fail(cursor, "Expected ',' or '}' in import group")
+        }
+    }
+}
+
+fn parse_named_block_directive(cursor: Cursor) -> ParseStep {
+    let after_kw = advance(cursor)
+    match after_kw.current.type {
+        IDENTIFIER => {
+            let after_name = advance(after_kw)
+            let with_generics = parse_optional_generics(after_name)
+            match with_generics {
+                Continue(next) => {
+                    match next.current.type {
+                        LEFT_BRACE => {
+                            let after_lbrace = advance(next)
+                            ret consume_block_body(after_lbrace, 1_usize)
+                        }
+                        _ => {
+                            ret fail(next, "Expected '{' in declaration body")
+                        }
+                    }
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+        _ => {
+            ret fail(after_kw, "Expected declaration name")
+        }
+    }
+}
+
+fn parse_struct(cursor: Cursor) -> ParseStep {
+    let after_kw = advance(cursor)
+    match after_kw.current.type {
+        IDENTIFIER => {
+            let after_name = advance(after_kw)
+            let with_generics = parse_optional_generics(after_name)
+            match with_generics {
+                Continue(next) => {
+                    match next.current.type {
+                        LEFT_BRACE => {
+                            let after_lbrace = advance(next)
+                            ret parse_struct_fields(after_lbrace)
+                        }
+                        _ => {
+                            ret fail(next, "Expected '{' in struct body")
+                        }
+                    }
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+        _ => {
+            ret fail(after_kw, "Expected struct name")
+        }
+    }
+}
+
+fn parse_struct_fields(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        RIGHT_BRACE => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        IDENTIFIER => {
+            let after_name = advance(cursor)
+            match after_name.current.type {
+                COLON => {}
+                _ => {
+                    ret fail(after_name, "Expected ':' after struct field name")
+                }
+            }
+
+            let after_colon = advance(after_name)
+            let with_type = consume_type_until_struct_field_boundary(after_colon, 0_usize, 0_usize, 0_usize, false)
+            match with_type {
+                Continue(next) => {
+                    ret parse_struct_fields_tail(next)
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+        _ => {
+            ret fail(cursor, "Expected struct field name or '}'")
+        }
+    }
+}
+
+fn parse_struct_fields_tail(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        COMMA => {
+            let after_comma = advance(cursor)
+            ret parse_struct_fields(after_comma)
+        }
+        RIGHT_BRACE => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        IDENTIFIER => {
+            ret parse_struct_fields(cursor)
+        }
+        _ => {
+            ret fail(cursor, "Expected next struct field or '}'")
+        }
+    }
+}
+
+fn consume_type_until_struct_field_boundary(
+    cursor: Cursor, square_depth: usize, angle_depth: usize, paren_depth: usize, consumed: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        ret fail(cursor, "Expected struct field type")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                match tt {
+                    RIGHT_BRACE => {
+                        if (consumed) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        ret fail(cursor, "Expected struct field type")
+                    }
+                    COMMA => {
+                        if (consumed) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        ret fail(cursor, "Expected struct field type")
+                    }
+                    IDENTIFIER => {
+                        if (consumed) {
+                            let maybe_colon = advance(cursor)
+                            match maybe_colon.current.type {
+                                COLON => {
+                                    ret ParseStep::Continue(cursor)
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in struct field type")
+    }
+    let next_angle = next_angle_depth(tt, angle_depth)
+    if (next_angle >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '<' / '>' in struct field type")
+    }
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in struct field type")
+    }
+
+    ret consume_type_until_struct_field_boundary(advance(cursor), next_square, next_angle, next_paren, true)
+}
+
+fn parse_enum(cursor: Cursor) -> ParseStep {
+    let after_kw = advance(cursor)
+    match after_kw.current.type {
+        IDENTIFIER => {
+            let after_name = advance(after_kw)
+            let with_generics = parse_optional_generics(after_name)
+            match with_generics {
+                Continue(next) => {
+                    match next.current.type {
+                        LEFT_BRACE => {
+                            let after_lbrace = advance(next)
+                            ret parse_enum_variants(after_lbrace)
+                        }
+                        _ => {
+                            ret fail(next, "Expected '{' in enum body")
+                        }
+                    }
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+        _ => {
+            ret fail(after_kw, "Expected enum name")
+        }
+    }
+}
+
+fn parse_enum_variants(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        RIGHT_BRACE => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        IDENTIFIER => {
+            ret parse_enum_variant(cursor)
+        }
+        _ => {
+            ret fail(cursor, "Expected enum variant name or '}'")
+        }
+    }
+}
+
+fn parse_enum_variant(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        IDENTIFIER => {}
+        _ => {
+            ret fail(cursor, "Expected enum variant name")
+        }
+    }
+
+    let after_name = advance(cursor)
+    let with_payload = parse_optional_enum_variant_payload(after_name)
+    match with_payload {
+        Continue(next) => {
+            ret parse_enum_variants_tail(next)
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn parse_optional_enum_variant_payload(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        LEFT_PAREN => {
+            let after_lparen = advance(cursor)
+            ret consume_paren_group(after_lparen, 1_usize)
+        }
+        _ => {
+            ret ParseStep::Continue(cursor)
+        }
+    }
+}
+
+fn parse_enum_variants_tail(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        COMMA => {
+            let after_comma = advance(cursor)
+            ret parse_enum_variants(after_comma)
+        }
+        RIGHT_BRACE => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        IDENTIFIER => {
+            ret parse_enum_variants(cursor)
+        }
+        _ => {
+            ret fail(cursor, "Expected next enum variant or '}'")
+        }
+    }
+}
+
+fn parse_trait(cursor: Cursor) -> ParseStep {
+    let after_kw = advance(cursor)
+    match after_kw.current.type {
+        IDENTIFIER => {
+            let after_name = advance(after_kw)
+            let with_generics = parse_optional_generics(after_name)
+            match with_generics {
+                Continue(next) => {
+                    match next.current.type {
+                        LEFT_BRACE => {
+                            let after_lbrace = advance(next)
+                            ret parse_trait_methods(after_lbrace)
+                        }
+                        _ => {
+                            ret fail(next, "Expected '{' in trait body")
+                        }
+                    }
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+        _ => {
+            ret fail(after_kw, "Expected trait name")
+        }
+    }
+}
+
+fn parse_trait_methods(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        RIGHT_BRACE => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        _ => {
+            let with_pub = consume_optional_pub(cursor)
+            match with_pub.current.type {
+                KW_FN => {
+                    let after_fn = advance(with_pub)
+                    let method = parse_fn_signature(after_fn, false, true, true)
+                    match method {
+                        Continue(next) => {
+                            ret parse_trait_methods(next)
+                        }
+                        Fail(error) => {
+                            ret ParseStep::Fail(error)
+                        }
+                    }
+                }
+                _ => {
+                    ret fail(with_pub, "Expected trait method declaration")
+                }
+            }
+        }
+    }
+}
+
+fn parse_impl(cursor: Cursor) -> ParseStep {
+    let after_kw = advance(cursor)
+    let with_header = parse_impl_header(after_kw)
+    match with_header {
+        Continue(next) => {
+            ret parse_impl_body(next)
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn parse_impl_header(cursor: Cursor) -> ParseStep {
+    let with_generics = parse_optional_generics(cursor)
+    match with_generics {
+        Continue(next0) => {
+            let before_for = match next0.current.type {
+                KW_FOR => ParseStep::Continue(next0)
+                _ => consume_impl_trait_until_for(next0, 0_usize, 0_usize, 0_usize, false)
+            }
+
+            match before_for {
+                Continue(next1) => {
+                    if (not is_kw_for(next1.current.type)) {
+                        ret fail(next1, "Expected 'for' in impl header")
+                    }
+                    let after_for = advance(next1)
+                    ret consume_type_until_impl_body(after_for, 0_usize, 0_usize, 0_usize, false)
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn consume_impl_trait_until_for(
+    cursor: Cursor, square_depth: usize, angle_depth: usize, paren_depth: usize, consumed: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        ret fail(cursor, "Expected 'for' in impl header")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                if (is_kw_for(tt)) {
+                    if (consumed) {
+                        ret ParseStep::Continue(cursor)
+                    }
+                    ret fail(cursor, "Expected trait name or 'for'")
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in impl trait")
+    }
+    let next_angle = next_angle_depth(tt, angle_depth)
+    if (next_angle >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '<' / '>' in impl trait")
+    }
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in impl trait")
+    }
+
+    ret consume_impl_trait_until_for(advance(cursor), next_square, next_angle, next_paren, true)
+}
+
+fn consume_type_until_impl_body(
+    cursor: Cursor, square_depth: usize, angle_depth: usize, paren_depth: usize, consumed: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        if (consumed) {
+            ret ParseStep::Continue(cursor)
+        }
+        ret fail(cursor, "Expected type after 'for' in impl header")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                match tt {
+                    LEFT_BRACE => {
+                        if (consumed) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        ret fail(cursor, "Expected type after 'for' in impl header")
+                    }
+                    _ => {
+                        if (is_top_level_start(tt)) {
+                            if (consumed) {
+                                ret ParseStep::Continue(cursor)
+                            }
+                            ret fail(cursor, "Expected type after 'for' in impl header")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in impl type")
+    }
+    let next_angle = next_angle_depth(tt, angle_depth)
+    if (next_angle >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '<' / '>' in impl type")
+    }
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in impl type")
+    }
+
+    ret consume_type_until_impl_body(advance(cursor), next_square, next_angle, next_paren, true)
+}
+
+fn parse_impl_body(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        LEFT_BRACE => {
+            let after_lbrace = advance(cursor)
+            ret parse_impl_methods(after_lbrace)
+        }
+        _ => {
+            ret fail(cursor, "Expected '{' in impl body")
+        }
+    }
+}
+
+fn parse_impl_methods(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        RIGHT_BRACE => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        _ => {
+            let with_pub = consume_optional_pub(cursor)
+            match with_pub.current.type {
+                KW_FN => {
+                    let method = parse_fn(with_pub)
+                    match method {
+                        Continue(next) => {
+                            ret parse_impl_methods(next)
+                        }
+                        Fail(error) => {
+                            ret ParseStep::Fail(error)
+                        }
+                    }
+                }
+                _ => {
+                    ret fail(with_pub, "Expected impl method definition")
+                }
+            }
+        }
+    }
+}
+
+fn parse_extern_fn(cursor: Cursor) -> ParseStep {
+    let after_extern = advance(cursor)
+    let after_unsafe = match after_extern.current.type {
+        KW_UNSAFE => advance(after_extern)
+        _ => after_extern
+    }
+
+    match after_unsafe.current.type {
+        KW_FN => {
+            let after_fn = advance(after_unsafe)
+            ret parse_fn_signature(after_fn, false, true, false)
+        }
+        _ => {
+            ret fail(after_unsafe, "Expected 'fn' after 'extern'")
+        }
+    }
+}
+
+fn parse_unsafe_fn(cursor: Cursor) -> ParseStep {
+    let after_unsafe = advance(cursor)
+    match after_unsafe.current.type {
+        KW_FN => {
+            ret parse_fn(after_unsafe)
+        }
+        _ => {
+            ret fail(after_unsafe, "Expected 'fn' after 'unsafe'")
+        }
+    }
+}
+
+fn parse_fn(cursor: Cursor) -> ParseStep {
+    let after_fn = advance(cursor)
+    ret parse_fn_signature(after_fn, true, false, false)
+}
+
+fn parse_fn_signature(cursor: Cursor, has_body: bool, require_return: bool, allow_member_boundary: bool) -> ParseStep {
+    match cursor.current.type {
+        IDENTIFIER => {}
+        _ => {
+            ret fail(cursor, "Expected function name")
+        }
+    }
+
+    let after_name = advance(cursor)
+    let with_generics = parse_optional_generics(after_name)
+    match with_generics {
+        Continue(next0) => {
+            match next0.current.type {
+                LEFT_PAREN => {}
+                _ => {
+                    ret fail(next0, "Expected '(' after function name")
+                }
+            }
+
+            let after_lparen = advance(next0)
+            let with_params = consume_paren_group(after_lparen, 1_usize)
+            match with_params {
+                Continue(next1) => {
+                    ret parse_fn_tail(next1, has_body, require_return, allow_member_boundary)
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn parse_fn_tail(cursor: Cursor, has_body: bool, require_return: bool, allow_member_boundary: bool) -> ParseStep {
+    match cursor.current.type {
+        OP_ARROW => {
+            let after_arrow = advance(cursor)
+            let with_type = if (has_body) {
+                consume_type_until_body(after_arrow, 0_usize, 0_usize, 0_usize, false)
+            } else {
+                consume_type_until_signature_boundary(after_arrow, 0_usize, 0_usize, 0_usize, false, allow_member_boundary)
+            }
+            match with_type {
+                Continue(next) => {
+                    ret finish_fn_tail(next, has_body, allow_member_boundary)
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+        _ => {
+            if (require_return) {
+                ret fail(cursor, "Expected return type after '->'")
+            }
+            ret finish_fn_tail(cursor, has_body, allow_member_boundary)
+        }
+    }
+}
+
+fn finish_fn_tail(cursor: Cursor, has_body: bool, allow_member_boundary: bool) -> ParseStep {
+    if (has_body) {
+        match cursor.current.type {
+            LEFT_BRACE => {
+                let after_lbrace = advance(cursor)
+                ret consume_block_body(after_lbrace, 1_usize)
+            }
+            _ => {
+                ret fail(cursor, "Expected function body '{'")
+            }
+        }
+    }
+
+    match cursor.current.type {
+        LEFT_BRACE => {
+            ret fail(cursor, "Extern function must not have body")
+        }
+        _ => {
+            if (is_top_level_start(cursor.current.type)) {
+                ret ParseStep::Continue(cursor)
+            }
+            if (allow_member_boundary) {
+                if (is_trait_member_start(cursor.current.type)) {
+                    ret ParseStep::Continue(cursor)
+                }
+            }
+            ret fail(cursor, "Unexpected token after extern signature")
+        }
+    }
+}
+
+fn parse_optional_generics(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        LEFT_BRACKET => {
+            let after_lbracket = advance(cursor)
+            ret consume_square_group(after_lbracket, 1_usize)
+        }
+        _ => {
+            ret ParseStep::Continue(cursor)
+        }
+    }
+}
+
+fn consume_square_group(cursor: Cursor, depth: usize) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        ret fail(cursor, "Unclosed generic parameter list")
+    }
+
+    match cursor.current.type {
+        LEFT_BRACKET => {
+            ret consume_square_group(advance(cursor), depth + 1_usize)
+        }
+        RIGHT_BRACKET => {
+            let after = advance(cursor)
+            if (depth <= 1_usize) {
+                ret ParseStep::Continue(after)
+            }
+            ret consume_square_group(after, depth - 1_usize)
+        }
+        _ => {
+            ret consume_square_group(advance(cursor), depth)
+        }
+    }
+}
+
+fn consume_paren_group(cursor: Cursor, depth: usize) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        ret fail(cursor, "Unclosed parameter list")
+    }
+
+    match cursor.current.type {
+        LEFT_PAREN => {
+            ret consume_paren_group(advance(cursor), depth + 1_usize)
+        }
+        RIGHT_PAREN => {
+            let after = advance(cursor)
+            if (depth <= 1_usize) {
+                ret ParseStep::Continue(after)
+            }
+            ret consume_paren_group(after, depth - 1_usize)
+        }
+        _ => {
+            ret consume_paren_group(advance(cursor), depth)
+        }
+    }
+}
+
+fn consume_type_until_body(
+    cursor: Cursor, square_depth: usize, angle_depth: usize, paren_depth: usize, consumed: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        ret fail(cursor, "Expected function body '{'")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                match tt {
+                    LEFT_BRACE => {
+                        if (consumed) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        ret fail(cursor, "Expected return type after '->'")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in return type")
+    }
+    let next_angle = next_angle_depth(tt, angle_depth)
+    if (next_angle >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '<' / '>' in return type")
+    }
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in return type")
+    }
+
+    ret consume_type_until_body(advance(cursor), next_square, next_angle, next_paren, true)
+}
+
+fn consume_type_until_signature_boundary(
+    cursor: Cursor, square_depth: usize, angle_depth: usize, paren_depth: usize, consumed: bool, allow_member_boundary: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        if (consumed) {
+            ret ParseStep::Continue(cursor)
+        }
+        ret fail(cursor, "Expected return type after '->'")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                if (is_top_level_start(tt)) {
+                    if (consumed) {
+                        ret ParseStep::Continue(cursor)
+                    }
+                    ret fail(cursor, "Expected return type after '->'")
+                }
+                if (allow_member_boundary) {
+                    if (is_trait_member_start(tt)) {
+                        if (consumed) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        ret fail(cursor, "Expected return type after '->'")
+                    }
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in return type")
+    }
+    let next_angle = next_angle_depth(tt, angle_depth)
+    if (next_angle >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '<' / '>' in return type")
+    }
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in return type")
+    }
+
+    ret consume_type_until_signature_boundary(
+        advance(cursor), next_square, next_angle, next_paren, true, allow_member_boundary
+    )
+}
+
+fn consume_block_body(cursor: Cursor, depth: usize) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        ret fail(cursor, "Unclosed block")
+    }
+
+    match cursor.current.type {
+        LEFT_BRACE => {
+            ret consume_block_body(advance(cursor), depth + 1_usize)
+        }
+        RIGHT_BRACE => {
+            let after = advance(cursor)
+            if (depth <= 1_usize) {
+                ret ParseStep::Continue(after)
+            }
+            ret consume_block_body(after, depth - 1_usize)
+        }
+        _ => {
+            ret consume_block_body(advance(cursor), depth)
+        }
+    }
+}
+
+fn next_square_depth(tt: TokenType, depth: usize) -> usize {
+    match tt {
+        LEFT_BRACKET => {
+            ret depth + 1_usize
+        }
+        RIGHT_BRACKET => {
+            if (depth == 0_usize) {
+                ret 1000000_usize
+            }
+            ret depth - 1_usize
+        }
+        _ => {
+            ret depth
+        }
+    }
+}
+
+fn next_angle_depth(tt: TokenType, depth: usize) -> usize {
+    match tt {
+        OP_LESS => {
+            ret depth + 1_usize
+        }
+        OP_GREATER => {
+            if (depth == 0_usize) {
+                ret 1000000_usize
+            }
+            ret depth - 1_usize
+        }
+        OP_RIGHT_SHIFT => {
+            if (depth == 0_usize) {
+                ret 1000000_usize
+            }
+            if (depth == 1_usize) {
+                ret 0_usize
+            }
+            ret depth - 2_usize
+        }
+        _ => {
+            ret depth
+        }
+    }
+}
+
+fn next_paren_depth(tt: TokenType, depth: usize) -> usize {
+    match tt {
+        LEFT_PAREN => {
+            ret depth + 1_usize
+        }
+        RIGHT_PAREN => {
+            if (depth == 0_usize) {
+                ret 1000000_usize
+            }
+            ret depth - 1_usize
+        }
+        _ => {
+            ret depth
+        }
+    }
+}
+
+fn is_top_level_start(tt: TokenType) -> bool {
+    match tt {
+        KW_IMPORT => { ret true }
+        KW_STRUCT => { ret true }
+        KW_ENUM => { ret true }
+        KW_TRAIT => { ret true }
+        KW_IMPL => { ret true }
+        KW_EXTERN => { ret true }
+        KW_UNSAFE => { ret true }
+        KW_FN => { ret true }
+        KW_PUB => { ret true }
+        EOF => { ret true }
+        _ => { ret false }
+    }
+}
+
+fn is_trait_member_start(tt: TokenType) -> bool {
+    match tt {
+        RIGHT_BRACE => { ret true }
+        KW_FN => { ret true }
+        KW_PUB => { ret true }
+        _ => { ret false }
+    }
+}
+
+fn is_kw_for(tt: TokenType) -> bool {
+    match tt {
+        KW_FOR => { ret true }
+        _ => { ret false }
+    }
+}
+
+fn is_cursor_eof(cursor: Cursor) -> bool {
+    match cursor.current.type {
+        EOF => { ret true }
+        _ => { ret false }
+    }
+}
+
+fn make_error(cursor: Cursor, message: str) -> ParseError {
+    ret ParseError{message, cursor.current.line, cursor.current.column}
+}
+
+fn fail(cursor: Cursor, message: str) -> ParseStep {
+    ret ParseStep::Fail(make_error(cursor, concat(concat(message, ": "), cursor.current.value)))
+}
+
+fn empty_parsed_module() -> ParsedModule {
+    ret ParsedModule{
+        0_usize,
+        0_usize,
+        0_usize,
+        0_usize,
+        0_usize,
+        0_usize,
+        0_usize,
+        0_usize,
+        0_usize,
+        ""
+    }
+}
+
+fn count_directive(module: ParsedModule, cursor: Cursor) -> ParsedModule {
+    let no_pub = consume_optional_pub(cursor)
+    match no_pub.current.type {
+        KW_IMPORT => {
+            ret ParsedModule{
+                module.directives + 1_usize,
+                module.imports + 1_usize,
+                module.structs,
+                module.enums,
+                module.traits,
+                module.impls,
+                module.functions,
+                module.extern_functions,
+                module.unsafe_functions,
+                append_outline(module.outline, directive_header(cursor))
+            }
+        }
+        KW_STRUCT => {
+            ret ParsedModule{
+                module.directives + 1_usize,
+                module.imports,
+                module.structs + 1_usize,
+                module.enums,
+                module.traits,
+                module.impls,
+                module.functions,
+                module.extern_functions,
+                module.unsafe_functions,
+                append_outline(module.outline, directive_header(cursor))
+            }
+        }
+        KW_ENUM => {
+            ret ParsedModule{
+                module.directives + 1_usize,
+                module.imports,
+                module.structs,
+                module.enums + 1_usize,
+                module.traits,
+                module.impls,
+                module.functions,
+                module.extern_functions,
+                module.unsafe_functions,
+                append_outline(module.outline, directive_header(cursor))
+            }
+        }
+        KW_TRAIT => {
+            ret ParsedModule{
+                module.directives + 1_usize,
+                module.imports,
+                module.structs,
+                module.enums,
+                module.traits + 1_usize,
+                module.impls,
+                module.functions,
+                module.extern_functions,
+                module.unsafe_functions,
+                append_outline(module.outline, directive_header(cursor))
+            }
+        }
+        KW_IMPL => {
+            ret ParsedModule{
+                module.directives + 1_usize,
+                module.imports,
+                module.structs,
+                module.enums,
+                module.traits,
+                module.impls + 1_usize,
+                module.functions,
+                module.extern_functions,
+                module.unsafe_functions,
+                append_outline(module.outline, directive_header(cursor))
+            }
+        }
+        KW_EXTERN => {
+            ret ParsedModule{
+                module.directives + 1_usize,
+                module.imports,
+                module.structs,
+                module.enums,
+                module.traits,
+                module.impls,
+                module.functions,
+                module.extern_functions + 1_usize,
+                module.unsafe_functions,
+                append_outline(module.outline, directive_header(cursor))
+            }
+        }
+        KW_UNSAFE => {
+            ret ParsedModule{
+                module.directives + 1_usize,
+                module.imports,
+                module.structs,
+                module.enums,
+                module.traits,
+                module.impls,
+                module.functions,
+                module.extern_functions,
+                module.unsafe_functions + 1_usize,
+                append_outline(module.outline, directive_header(cursor))
+            }
+        }
+        KW_FN => {
+            ret ParsedModule{
+                module.directives + 1_usize,
+                module.imports,
+                module.structs,
+                module.enums,
+                module.traits,
+                module.impls,
+                module.functions + 1_usize,
+                module.extern_functions,
+                module.unsafe_functions,
+                append_outline(module.outline, directive_header(cursor))
+            }
+        }
+        _ => {
+            ret module
+        }
+    }
+}
+
+fn append_outline(outline: str, line: str) -> str {
+    if (len(outline) == 0_usize) {
+        ret line
+    }
+    ret concat(concat(outline, "\n"), line)
+}
+
+fn directive_header(cursor: Cursor) -> str {
+    let is_public = match cursor.current.type {
+        KW_PUB => true
+        _ => false
+    }
+    let pub_prefix = if (is_public) { "pub " } else { "" }
+    let no_pub = consume_optional_pub(cursor)
+
+    match no_pub.current.type {
+        KW_IMPORT => {
+            let after_kw = advance(no_pub)
+            let head = first_import_segment(after_kw)
+            ret concat(concat(pub_prefix, "import "), head)
+        }
+        KW_STRUCT => {
+            ret concat(concat(pub_prefix, "struct "), identifier_after_keyword(no_pub))
+        }
+        KW_ENUM => {
+            ret concat(concat(pub_prefix, "enum "), identifier_after_keyword(no_pub))
+        }
+        KW_TRAIT => {
+            ret concat(concat(pub_prefix, "trait "), identifier_after_keyword(no_pub))
+        }
+        KW_IMPL => {
+            ret concat(pub_prefix, "impl")
+        }
+        KW_EXTERN => {
+            let after_extern = advance(no_pub)
+            let after_fn = skip_optional_unsafe(after_extern)
+            let name = identifier_after_keyword(after_fn)
+            ret concat(concat(pub_prefix, "extern fn "), name)
+        }
+        KW_UNSAFE => {
+            let name = identifier_after_keyword(advance(no_pub))
+            ret concat(concat(pub_prefix, "unsafe fn "), name)
+        }
+        KW_FN => {
+            ret concat(concat(pub_prefix, "fn "), identifier_after_keyword(no_pub))
+        }
+        _ => {
+            ret "<unknown>"
+        }
+    }
+}
+
+fn identifier_after_keyword(cursor: Cursor) -> str {
+    let next = advance(cursor)
+    match next.current.type {
+        IDENTIFIER => {
+            ret next.current.value
+        }
+        _ => {
+            ret "<unknown>"
+        }
+    }
+}
+
+fn first_import_segment(cursor: Cursor) -> str {
+    match cursor.current.type {
+        IDENTIFIER => {
+            ret cursor.current.value
+        }
+        OP_MULTIPLY => {
+            ret "*"
+        }
+        _ => {
+            ret "<unknown>"
+        }
+    }
+}
+
+fn skip_optional_unsafe(cursor: Cursor) -> Cursor {
+    match cursor.current.type {
+        KW_UNSAFE => {
+            ret advance(cursor)
+        }
+        _ => {
+            ret cursor
+        }
+    }
+}

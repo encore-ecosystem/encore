@@ -1,6 +1,193 @@
-import repo::frontend::lexer::print_tokens
+import std::os::argc
+import std::os::argv
+import std::os::read_file
+import std::os::file_exists
+import std::os::write_file
+import std::os::ensure_parent_dirs
+import std::os::run_command
+import std::io::println
+import std::string::concat
+import std::string::len
+import std::string::str_eq
+import repo::frontend::lexer::Lexer
+import repo::frontend::parser::parse
+import repo::frontend::parser::ParseOutcome
+import repo::modes::manifest::BuildSettings
+import repo::modes::manifest::load_build_settings
 
 pub fn run_build() -> u32 {
-    print_tokens("fn main() { ret 0 }")
+    let settings = load_build_settings("encore.toml")
+    let project_name = settings.project_name
+    let target = settings.target
+    let backend = settings.backend
+    let profile = settings.profile
+    let artifact_path = resolve_artifact_path(settings)
+    let source_path = resolve_input_path(settings)
+    let payload_path = concat(artifact_path, ".ehir")
+
+    println(concat("project: ", project_name))
+    println(concat("target: ", target))
+    println(concat("backend: ", backend))
+    println(concat("profile: ", profile))
+    println(concat("artifact: ", artifact_path))
+
+    if (not file_exists(source_path)) {
+        println(concat("build: source file not found: ", source_path))
+        ret 1_u32
+    }
+
+    let source = read_file(source_path)
+    let lexer = Lexer::new()
+    let lex_status = Lexer::print_tokens(lexer, source)
+    if (lex_status != 0_u32) {
+        println("build: lexer failed")
+        ret 2_u32
+    }
+    let parse_status = parse(source)
+    match parse_status {
+        Success(parsed) => {
+            println("build: parser completed")
+            if (len(parsed.outline) > 0_usize) {
+                println("build: parser outline")
+                println(parsed.outline)
+            }
+        }
+        Failure(error) => {
+            let where = concat(concat(usize_to_str(error.line), ":"), usize_to_str(error.column))
+            println(concat("build: parser failed at ", where))
+            println(concat("build: parser failed: ", error.message))
+            ret 2_u32
+        }
+    }
+
+    let mkdir_status = ensure_parent_dirs(payload_path)
+    if (mkdir_status != 0_i32) {
+        println(concat("build: unable to create target dirs for payload: ", payload_path))
+        ret 1_u32
+    }
+
+    let write_status = write_file(payload_path, source)
+    if (write_status != 0_i32) {
+        println(concat("build: unable to write payload: ", payload_path))
+        ret 1_u32
+    }
+
+    println(concat("source: ", source_path))
+    println(concat("payload: ", payload_path))
+    println("build: frontend pipeline completed")
+
+    let host_build_cmd = resolve_host_backend_command()
+    println(concat("build: host backend command: ", host_build_cmd))
+    let host_status = run_command(host_build_cmd)
+    if (host_status != 0_i32) {
+        println("build: host backend failed")
+        ret 3_u32
+    }
+
+    println("build: llvm/backend pipeline completed")
     ret 0_u32
+}
+
+fn resolve_input_path(settings: BuildSettings) -> str {
+    let target = settings.target
+
+    if (argc() > 2_usize) {
+        ret argv(2_usize)
+    }
+
+    if (str_eq(target, "object")) {
+        if (file_exists("src/lib.enq")) {
+            ret "src/lib.enq"
+        }
+    }
+    if (str_eq(target, "static_lib")) {
+        if (file_exists("src/lib.enq")) {
+            ret "src/lib.enq"
+        }
+    }
+    if (str_eq(target, "dynamic_lib")) {
+        if (file_exists("src/lib.enq")) {
+            ret "src/lib.enq"
+        }
+    }
+
+    if (file_exists("src/main.enq")) {
+        ret "src/main.enq"
+    }
+    if (file_exists("src/lib.enq")) {
+        ret "src/lib.enq"
+    }
+
+    ret "src/main.enq"
+}
+
+pub fn run_build_demo() -> u32 {
+    let parse_status = parse("fn main() { ret 0 }")
+    match parse_status {
+        Success(parsed) => {
+            ret 0_u32
+        }
+        Failure(error) => {
+            println(concat("build-demo: parser failed: ", error.message))
+            ret 1_u32
+        }
+    }
+}
+
+fn resolve_host_backend_command() -> str {
+    if (file_exists("../../../.venv/bin/encore")) {
+        ret "../../../.venv/bin/encore build"
+    }
+    if (file_exists("../../.venv/bin/encore")) {
+        ret "../../.venv/bin/encore build"
+    }
+    if (file_exists("../.venv/bin/encore")) {
+        ret "../.venv/bin/encore build"
+    }
+    ret "encore build"
+}
+
+fn resolve_artifact_path(settings: BuildSettings) -> str {
+    let profile = settings.profile
+    let target = settings.target
+    let project_name = settings.project_name
+    let base_dir = concat("target/", profile)
+
+    if (str_eq(target, "object")) {
+        let filename = concat(project_name, ".o")
+        ret concat(concat(base_dir, "/object/"), filename)
+    }
+    if (str_eq(target, "static_lib")) {
+        let filename = concat(concat("lib", project_name), ".a")
+        ret concat(concat(base_dir, "/"), filename)
+    }
+    if (str_eq(target, "dynamic_lib")) {
+        let filename = concat(concat("lib", project_name), ".so")
+        ret concat(concat(base_dir, "/"), filename)
+    }
+    ret concat(concat(base_dir, "/"), project_name)
+}
+
+fn usize_to_str(value: usize) -> str {
+    if (value < 10_usize) {
+        ret digit_to_str(value)
+    }
+
+    let q = value / 10_usize
+    let r = value - q * 10_usize
+    ret concat(usize_to_str(q), digit_to_str(r))
+}
+
+fn digit_to_str(value: usize) -> str {
+    if (value == 0_usize) { ret "0" }
+    if (value == 1_usize) { ret "1" }
+    if (value == 2_usize) { ret "2" }
+    if (value == 3_usize) { ret "3" }
+    if (value == 4_usize) { ret "4" }
+    if (value == 5_usize) { ret "5" }
+    if (value == 6_usize) { ret "6" }
+    if (value == 7_usize) { ret "7" }
+    if (value == 8_usize) { ret "8" }
+    if (value == 9_usize) { ret "9" }
+    ret "?"
 }

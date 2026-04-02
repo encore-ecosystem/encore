@@ -20,6 +20,7 @@ class ExportKind(StrEnum):
     FUNCTION = auto()
     STRUCT = auto()
     ENUM = auto()
+    TRAIT = auto()
 
 
 @dataclass(frozen=True)
@@ -117,8 +118,30 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                         continue
                     seen.add(key)
                     declarations.append(binding.statement)
+                    if isinstance(binding.statement, s.Statement_StructureDefinition):
+                        for idx, assoc_impl in enumerate(
+                            self._collect_associated_impls(binding.module_id, binding.name)
+                        ):
+                            impl_key = (binding.module_id, f"impl::{binding.name}::{idx}")
+                            if impl_key in seen:
+                                continue
+                            seen.add(impl_key)
+                            declarations.append(assoc_impl)
 
         return declarations
+
+    def _collect_associated_impls(self, module_id: Path, struct_name: str) -> list[s.Statement_Impl]:
+        ast = self._get_ast_by_id(module_id)
+        result: list[s.Statement_Impl] = []
+        for statement in ast:
+            if not isinstance(statement, s.Statement_Impl):
+                continue
+            if statement.trait_name is not None:
+                continue
+            if statement.struct.name != struct_name:
+                continue
+            result.append(statement)
+        return result
 
     def _get_module_index(self, id: Path) -> ModuleIndex:
         if id in self._index_cache:
@@ -154,6 +177,8 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return ExportBinding(statement.defi.name, ExportKind.STRUCT, id, statement)
         if isinstance(statement, s.Statement_EnumDefinition):
             return ExportBinding(statement.name, ExportKind.ENUM, id, statement)
+        if isinstance(statement, s.Statement_Trait):
+            return ExportBinding(statement.name, ExportKind.TRAIT, id, statement)
         return None
 
     def _expand_import_statement(self, statement: s.Statement_Import) -> list[Derective_import]:

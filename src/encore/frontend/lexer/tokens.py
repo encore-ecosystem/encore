@@ -70,6 +70,7 @@ class TokenType(Enum):
 
     OP_INCREMENT = auto()
     OP_DECREMENT = auto()
+    OP_TRY = auto()
 
     OP_ARROW = auto()
     OP_FAT_ARROW = auto()

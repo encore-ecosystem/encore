@@ -28,6 +28,8 @@ class Lexer:
             "import": TokenType.KW_IMPORT,
             "extern": TokenType.KW_EXTERN,
             "unsafe": TokenType.KW_UNSAFE,
+            # Accept textual unary-not as an alias for `!`.
+            "not": TokenType.OP_NOT,
         }
 
         # Tokenization patterns (order matters!)
@@ -57,6 +59,7 @@ class Lexer:
             (r"\^=", TokenType.OP_XOR_ASSIGN),
             (r"\+\+", TokenType.OP_INCREMENT),
             (r"--", TokenType.OP_DECREMENT),
+            (r"\?", TokenType.OP_TRY),
             # Single-character operators
             (r"\+", TokenType.OP_PLUS),
             (r"-", TokenType.OP_MINUS),

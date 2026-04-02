@@ -13,7 +13,9 @@ class TypeInferer:
         self._funcs: dict[str, s.Statement_FunctionDefinition] = {}
         self._structs: dict[str, s.StructureDefinition] = {}
         self._enums: dict[str, s.Statement_EnumDefinition] = {}
+        self._traits: dict[str, s.Statement_Trait] = {}
         self._unsafe_depth = 0
+        self._current_fn_return_type: Type | None = None
 
     def infer(
         self,
@@ -27,6 +29,9 @@ class TypeInferer:
         for statement in ast:
             if isinstance(statement, s.Statement_FunctionDefinition):
                 self._infer_function(statement)
+            elif isinstance(statement, s.Statement_Impl):
+                for method in statement.body:
+                    self._infer_function(method)
 
         return ast
 
@@ -40,25 +45,45 @@ class TypeInferer:
                 self._structs[statement.defi.name] = statement.defi
             elif isinstance(statement, s.Statement_EnumDefinition):
                 self._enums[statement.name] = statement
+            elif isinstance(statement, s.Statement_Trait):
+                self._traits[statement.name] = statement
+            elif isinstance(statement, s.Statement_Impl) and statement.trait_name is None:
+                struct_name = statement.struct.name
+                for method in statement.body:
+                    method_generic_names = {generic.name for generic in statement.generics}
+                    merged_generics = [*statement.generics]
+                    for generic in method.generics:
+                        if generic.name in method_generic_names:
+                            continue
+                        merged_generics.append(generic)
+                        method_generic_names.add(generic.name)
+                    self._funcs[f"{struct_name}::{method.name}"] = replace(method, generics=merged_generics)
 
     def _infer_function(self, statement: s.Statement_FunctionDefinition):
         env = {param.name: param.type for param in statement.params}
 
+        prev_fn_return = self._current_fn_return_type
         if statement.type is None:
             statement.type = self._infer_return_type(statement.body, env)
             if statement.type is None:
                 raise TypeError(f"Unable to infer return type for function '{statement.name}'")
 
-        self._infer_block(statement.body, env, statement.type)
+        self._current_fn_return_type = statement.type
+        try:
+            self._infer_block(statement.body, env, statement.type)
+        finally:
+            self._current_fn_return_type = prev_fn_return
 
     def _infer_block(self, body: list[s.Statement_InnerLevel], env: dict[str, Type], fn_ret_type: Type):
         for statement in body:
             if isinstance(statement, s.Statement_Let):
                 inferred = self._infer_expression(statement.expr, env, statement.type)
-                if inferred is None:
-                    raise TypeError(f"Unable to infer type of variable '{statement.name}'")
                 if statement.type is None:
+                    if inferred is None:
+                        raise TypeError(f"Unable to infer type of variable '{statement.name}'")
                     statement.type = inferred
+                elif inferred is not None and statement.type != inferred:
+                    raise TypeError(f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}")
                 env[statement.name] = statement.type
             elif isinstance(statement, s.Statement_Assignment):
                 expected = self._infer_lvalue_type(statement.target, env)
@@ -167,8 +192,7 @@ class TypeInferer:
         if isinstance(expr, s.Expression_Path) and len(expr.segments) == 1:
             return env.get(expr.name)
         if isinstance(expr, s.Expression_StructField):
-            base_type = env.get(expr.name)
-            return self._lookup_field_type(base_type, expr.field)
+            return self._lookup_chained_field_type(expr.name, expr.field, env)
         return None
 
     def _infer_match(self, statement: s.Statement_Match, env: dict[str, Type], fn_ret_type: Type):
@@ -232,6 +256,34 @@ class TypeInferer:
                 return expected_type
             return Type("f64")
 
+        if isinstance(expr, s.Expression_Try):
+            inner_type = self._infer_expression(expr.expr, env)
+            if inner_type is None:
+                raise TypeError("Unable to infer type of expression used with '?'")
+
+            base_inner = (
+                inner_type.pointee if isinstance(inner_type, (HeapSmartPointer, StackSmartPointer)) else inner_type
+            )
+            if base_inner.name != "Result" or len(base_inner.generics) != 2:
+                raise TypeError(f"'?' operator expects Result[T, E], got {inner_type}")
+
+            ok_type, err_type = base_inner.generics
+            if self._current_fn_return_type is not None:
+                fn_ret_base = (
+                    self._current_fn_return_type.pointee
+                    if isinstance(self._current_fn_return_type, (HeapSmartPointer, StackSmartPointer))
+                    else self._current_fn_return_type
+                )
+                if fn_ret_base.name != "Result" or len(fn_ret_base.generics) != 2:
+                    raise TypeError("'?' operator can only be used in functions returning Result")
+                fn_err_type = fn_ret_base.generics[1]
+                if fn_err_type != err_type:
+                    raise TypeError(f"'?' error type mismatch: function expects {fn_err_type}, got {err_type}")
+
+            if expected_type is not None and ok_type != expected_type:
+                raise TypeError(f"Type mismatch: {expected_type} != {ok_type}")
+            return ok_type
+
         if isinstance(expr, s.Expression_Parenthesized):
             return self._infer_expression(expr.expr, env, expected_type)
 
@@ -266,7 +318,7 @@ class TypeInferer:
             return expr.name
 
         if isinstance(expr, s.Expression_StructField):
-            return self._lookup_field_type(env.get(expr.name), expr.field)
+            return self._lookup_chained_field_type(expr.name, expr.field, env)
 
         if isinstance(expr, s.Expression_Call):
             enum_type = self._infer_enum_call(expr, env)
@@ -423,10 +475,12 @@ class TypeInferer:
     def _infer_expression_block_statement(self, statement: s.Statement_InnerLevel, env: dict[str, Type]):
         if isinstance(statement, s.Statement_Let):
             inferred = self._infer_expression(statement.expr, env, statement.type)
-            if inferred is None:
-                raise TypeError(f"Unable to infer type of variable '{statement.name}'")
             if statement.type is None:
+                if inferred is None:
+                    raise TypeError(f"Unable to infer type of variable '{statement.name}'")
                 statement.type = inferred
+            elif inferred is not None and statement.type != inferred:
+                raise TypeError(f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}")
             env[statement.name] = statement.type
             return
 
@@ -600,6 +654,19 @@ class TypeInferer:
             if field_param.name == field:
                 return self._specialize_type(field_param.type, generic_mapping)
         return None
+
+    def _lookup_chained_field_type(self, base_name: str, field: str, env: dict[str, Type]) -> Optional[Type]:
+        parts = base_name.split(".")
+        if not parts:
+            return None
+
+        base_type = env.get(parts[0])
+        for segment in parts[1:]:
+            base_type = self._lookup_field_type(base_type, segment)
+            if base_type is None:
+                return None
+
+        return self._lookup_field_type(base_type, field)
 
     def _specialize_type(self, typ: Type, generic_mapping: dict[str, Type]) -> Type:
         if isinstance(typ, HeapSmartPointer):

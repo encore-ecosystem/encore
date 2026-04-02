@@ -43,8 +43,8 @@ class Parser:
             return self._parse_import(is_public)
         elif curr_token.type == TokenType.KW_ENUM:
             return self._parse_enum(is_public)
-        # elif curr_token.type == TokenType.KW_TRAIT:
-        #     return self._parse_trait(is_public)
+        elif curr_token.type == TokenType.KW_TRAIT:
+            return self._parse_trait(is_public)
 
         raise ValueError(f"Unable to parse top level statement: {curr_token}")
 
@@ -73,10 +73,14 @@ class Parser:
                 )
             case TokenType.LEFT_BRACE:
                 self._safe_consume(TokenType.LEFT_BRACE)
-                mods = [self._parse_import_path(default_leaf_kind=s.Statement_Import.ImportKind.PACKAGE)]
-                while self._get_current_token().type != TokenType.RIGHT_BRACE:
-                    self._safe_consume(TokenType.COMMA)
+                mods: list[Statement_Import.ImportPair] = []
+                if self._get_current_token().type != TokenType.RIGHT_BRACE:
                     mods.append(self._parse_import_path(default_leaf_kind=s.Statement_Import.ImportKind.PACKAGE))
+                    while self._get_current_token().type == TokenType.COMMA:
+                        self._safe_consume(TokenType.COMMA)
+                        if self._get_current_token().type == TokenType.RIGHT_BRACE:
+                            break
+                        mods.append(self._parse_import_path(default_leaf_kind=s.Statement_Import.ImportKind.PACKAGE))
                 self._safe_consume(TokenType.RIGHT_BRACE)
                 return Statement_Import.ImportPair(module, mods)
             case TokenType.IDENTIFIER:
@@ -90,7 +94,9 @@ class Parser:
         definition = self._parse_raw_struct_definition()
         return s.Statement_StructureDefinition(is_public=is_public, defi=definition)
 
-    def _parse_function_definition(self, is_public: bool) -> s.Statement_FunctionDefinition:
+    def _parse_function_signature(
+        self, require_return_type: bool
+    ) -> tuple[str, list[Type], list[Parameter], Type | None]:
         self._safe_consume(TokenType.KW_FN)
         func_name = self._safe_consume(TokenType.IDENTIFIER).value
         generics = self._parse_generics_args() if self._get_current_token().type == TokenType.LEFT_BRACKET else []
@@ -109,6 +115,13 @@ class Parser:
         if self._get_current_token().type == TokenType.OP_ARROW:
             self._safe_consume(TokenType.OP_ARROW)
             fn_type = self._parse_type()
+        elif require_return_type:
+            raise TypeError(f"Function '{func_name}' must declare a return type")
+
+        return func_name, generics, params, fn_type
+
+    def _parse_function_definition(self, is_public: bool) -> s.Statement_FunctionDefinition:
+        func_name, generics, params, fn_type = self._parse_function_signature(require_return_type=False)
         body = self._parse_block()
 
         return s.Statement_FunctionDefinition(
@@ -122,21 +135,8 @@ class Parser:
 
     def _parse_extern_function_definition(self, is_public: bool) -> s.Statement_ExternFunctionDefinition:
         self._safe_consume(TokenType.KW_EXTERN)
-        self._safe_consume(TokenType.KW_FN)
-        func_name = self._safe_consume(TokenType.IDENTIFIER).value
-        generics = self._parse_generics_args() if self._get_current_token().type == TokenType.LEFT_BRACKET else []
-        params: list[Parameter] = []
-
-        self._safe_consume(TokenType.LEFT_PAREN)
-        if self._get_current_token().type != TokenType.RIGHT_PAREN:
-            params.append(self._parse_param())
-        while self._get_current_token().type != TokenType.RIGHT_PAREN:
-            self._safe_consume(TokenType.COMMA)
-            params.append(self._parse_param())
-        self._safe_consume(TokenType.RIGHT_PAREN)
-
-        self._safe_consume(TokenType.OP_ARROW)
-        fn_type = self._parse_type()
+        func_name, generics, params, fn_type = self._parse_function_signature(require_return_type=True)
+        assert fn_type is not None
         return s.Statement_ExternFunctionDefinition(
             is_public=is_public,
             name=func_name,
@@ -144,6 +144,27 @@ class Parser:
             params=params,
             type=fn_type,
         )
+
+    def _parse_trait(self, is_public: bool) -> s.Statement_Trait:
+        self._safe_consume(TokenType.KW_TRAIT)
+        name = self._safe_consume(TokenType.IDENTIFIER).value
+        generics = self._parse_generics_args() if self._get_current_token().type == TokenType.LEFT_BRACKET else []
+
+        body: list[s.TraitMethodDeclaration] = []
+        self._safe_consume(TokenType.LEFT_BRACE)
+        while self._get_current_token().type != TokenType.RIGHT_BRACE:
+            method_name, method_generics, params, method_type = self._parse_function_signature(require_return_type=True)
+            assert method_type is not None
+            body.append(
+                s.TraitMethodDeclaration(
+                    name=method_name,
+                    generics=method_generics,
+                    params=params,
+                    type=method_type,
+                )
+            )
+        self._safe_consume(TokenType.RIGHT_BRACE)
+        return s.Statement_Trait(is_public=is_public, name=name, generics=generics, body=body)
 
     def _parse_enum(self, is_public: bool) -> s.Statement_EnumDefinition:
         self._safe_consume(TokenType.KW_ENUM)
@@ -155,6 +176,10 @@ class Parser:
         self._safe_consume(TokenType.LEFT_BRACE)
         while self._get_current_token().type != TokenType.RIGHT_BRACE:
             body.append(self._parse_raw_struct_definition())
+            if self._get_current_token().type == TokenType.COMMA:
+                self._safe_consume(TokenType.COMMA)
+                if self._get_current_token().type == TokenType.RIGHT_BRACE:
+                    break
         self._safe_consume(TokenType.RIGHT_BRACE)
         return s.Statement_EnumDefinition(
             is_public=is_public,
@@ -172,6 +197,10 @@ class Parser:
                 fields: list[Parameter] = []
                 while self._get_current_token().type != TokenType.RIGHT_BRACE:
                     fields.append(self._parse_param())
+                    if self._get_current_token().type == TokenType.COMMA:
+                        self._safe_consume(TokenType.COMMA)
+                        if self._get_current_token().type == TokenType.RIGHT_BRACE:
+                            break
                 self._safe_consume(TokenType.RIGHT_BRACE)
                 return s.CLikeStructureDefinition(name=name, generics=generics, fields=fields)
             case TokenType.LEFT_PAREN:
@@ -179,6 +208,10 @@ class Parser:
                 fields: list[Type] = []
                 while self._get_current_token().type != TokenType.RIGHT_PAREN:
                     fields.append(self._parse_type())
+                    if self._get_current_token().type == TokenType.COMMA:
+                        self._safe_consume(TokenType.COMMA)
+                        if self._get_current_token().type == TokenType.RIGHT_PAREN:
+                            break
                 self._safe_consume(TokenType.RIGHT_PAREN)
                 return s.TupleStructureDefinition(name=name, generics=generics, fields=fields)
             case _:
@@ -189,8 +222,10 @@ class Parser:
         generics = self._parse_generics_args() if self._get_current_token().type == TokenType.LEFT_BRACKET else []
 
         trait_name = None
+        trait_args: list[Type] = []
         if self._get_current_token().type != TokenType.KW_FOR:
             trait_name = self._safe_consume(TokenType.IDENTIFIER).value
+            trait_args = self._parse_generics_args() if self._get_current_token().type == TokenType.LEFT_BRACKET else []
         self._safe_consume(TokenType.KW_FOR)
         struct = self._parse_type()
 
@@ -205,7 +240,14 @@ class Parser:
                 body.append(self._parse_function_definition(is_public))
             self._safe_consume(TokenType.RIGHT_BRACE)
 
-        return s.Statement_Impl(is_public=False, generics=generics, trait_name=trait_name, struct=struct, body=body)
+        return s.Statement_Impl(
+            is_public=False,
+            generics=generics,
+            trait_name=trait_name,
+            trait_args=trait_args,
+            struct=struct,
+            body=body,
+        )
 
     # def _parse_function_declaration(self) -> s.Statement_Impl.FunctionDeclaration:
     #     is_public = False
@@ -544,7 +586,15 @@ class Parser:
         return self._parse_postfix()
 
     def _parse_postfix(self) -> s.Statement_Expression:
-        return self._parse_primary()
+        expr = self._parse_primary()
+        while not self._is_at_end():
+            token = self._get_current_token()
+            if token.type == TokenType.OP_TRY:
+                self._unsafe_consume()
+                expr = s.Expression_Try(expr=expr)
+                continue
+            break
+        return expr
 
     def _parse_integer_literal(self) -> s.Expression_IntegerLiteral:
         value = self._safe_consume(TokenType.INTEGER).value
@@ -669,7 +719,10 @@ class Parser:
                         return path
                     return self._parse_struct_initialization(first)
                 case TokenType.DOT:
-                    return self._parse_struct_field(symbol)
+                    field = self._parse_struct_field(symbol)
+                    while not self._is_at_end() and self._get_current_token().type == TokenType.DOT:
+                        field = self._parse_struct_field(f"{field.name}.{field.field}")
+                    return field
                 case TokenType.LEFT_PAREN:
                     return self._parse_call(path)
                 case _:
@@ -774,14 +827,24 @@ class Parser:
             TokenType.KW_DO,
             TokenType.KW_WHILE,
             TokenType.KW_LOOP,
-            TokenType.KW_IF,
-            TokenType.KW_MATCH,
-            TokenType.KW_UNSAFE,
             TokenType.KW_RET,
             TokenType.KW_BREAK,
             TokenType.KW_CONTINUE,
         }:
             return True
+        if self._get_current_token().type in {TokenType.KW_IF, TokenType.KW_MATCH, TokenType.KW_UNSAFE}:
+            # These tokens can start either a statement or an expression.
+            # Keep them as statements only if more tokens follow the parsed expression
+            # before closing the current expression block.
+            saved_index = self.current_index
+            try:
+                self._parse_expression()
+                return not self._is_at_end() and self._get_current_token().type != TokenType.RIGHT_BRACE
+            except Exception:
+                return True
+            finally:
+                self.current_index = saved_index
+
         if self._get_current_token().type != TokenType.IDENTIFIER:
             return False
 
