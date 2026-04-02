@@ -259,6 +259,7 @@ class Statement_DoWhile(Statement_InnerLevel):
 class Statement_Assignment(Statement_InnerLevel):
     target: "Statement_Expression"
     expr: "Statement_Expression"
+    operator: str = "="
 
     @property
     def name(self) -> str:
@@ -269,7 +270,7 @@ class Statement_Assignment(Statement_InnerLevel):
         return repr(self.target)
 
     def __repr__(self) -> str:
-        return f"{self.target} = {self.expr}"
+        return f"{self.target} {self.operator} {self.expr}"
 
 
 @dataclass
@@ -464,6 +465,19 @@ class Expression_Call(Statement_Expression):
     def __repr__(self) -> str:
         generics = f"[{', '.join(str(g) for g in self.generics)}]" if self.generics else ""
         return f"{self.callee}{generics}({', '.join(str(arg) for arg in self.args)})"
+
+
+@dataclass
+class Expression_MethodCall(Statement_Expression):
+    receiver: Statement_Expression
+    method: str
+    generics: list[Type]
+    args: list[Statement_Expression]
+
+    def __repr__(self) -> str:
+        generics = f"[{', '.join(str(g) for g in self.generics)}]" if self.generics else ""
+        args = ", ".join(str(arg) for arg in self.args)
+        return f"{self.receiver}.{self.method}{generics}({args})"
 
 
 @dataclass

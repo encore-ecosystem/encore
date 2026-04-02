@@ -32,12 +32,18 @@ expected_exit_code() {
   case "$example" in
     hello) echo 0 ;;
     arithmetic) echo 42 ;;
+    compound_assign) echo 7 ;;
     do_while) echo 62 ;;
+    cimp_reexport) echo 42 ;;
     heap) echo 32 ;;
+    transitive_refrain_import) echo 42 ;;
+    refrain_absolute_import) echo 7 ;;
     latest) echo 15 ;;
     loop) echo 6 ;;
     refrains) echo 25 ;;
+    short_circuit) echo 0 ;;
     structs) echo 14 ;;
+    unsafe_fn) echo 42 ;;
     while) echo 5 ;;
     *) echo 0 ;;
   esac

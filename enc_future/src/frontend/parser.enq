@@ -1,11 +1,37 @@
 import std::string::concat
 import std::string::len
+import std::string::str_eq
+import std::vec::Vec
+import std::vec::push_front
+import std::vec::reverse
 import repo::frontend::lexer::Lexer
 import repo::frontend::token::Token
 import repo::frontend::token::TokenType
+import repo::frontend::token::token_type_name
 
 pub struct ParseError {
     message: str
+    line: usize
+    column: usize
+}
+
+pub enum ParsedDirectiveKind {
+    Import
+    CImport
+    Struct
+    Enum
+    Trait
+    Impl
+    Function
+    ExternFunction
+    UnsafeFunction
+    Unknown
+}
+
+pub struct ParsedDirective {
+    kind: ParsedDirectiveKind
+    is_public: bool
+    name: str
     line: usize
     column: usize
 }
@@ -20,6 +46,11 @@ pub struct ParsedModule {
     functions: usize
     extern_functions: usize
     unsafe_functions: usize
+    import_bindings_outline: str
+    public_import_bindings_outline: str
+    cimport_bindings_outline: str
+    directives_meta_outline: str
+    directives_meta: Vec[ParsedDirective]
     outline: str
 }
 
@@ -43,9 +74,46 @@ pub fn parse(source: str) -> ParseOutcome {
     ret parse_module(start, empty_parsed_module())
 }
 
+pub fn parsed_meta_count(module: ParsedModule) -> usize {
+    ret parsed_meta_count_vec(module.directives_meta)
+}
+
+pub fn parsed_meta_outline(module: ParsedModule) -> str {
+    ret parsed_meta_outline_vec(module.directives_meta)
+}
+
+fn parsed_meta_count_vec(meta: Vec[ParsedDirective]) -> usize {
+    match meta {
+        Cons(node) => {
+            ret 1_usize + parsed_meta_count_vec(node.tail)
+        }
+        Empty => {
+            ret 0_usize
+        }
+    }
+}
+
+fn parsed_meta_outline_vec(meta: Vec[ParsedDirective]) -> str {
+    match meta {
+        Cons(node) => {
+            ret append_lines(parsed_meta_line(node.head), parsed_meta_outline_vec(node.tail))
+        }
+        Empty => {
+            ret ""
+        }
+    }
+}
+
+fn parsed_meta_line(directive: ParsedDirective) -> str {
+    let visibility = if (directive.is_public) { "pub" } else { "priv" }
+    let kind = directive_kind_line_label(directive.kind)
+    let position = concat(concat(usize_to_str(directive.line), ":"), usize_to_str(directive.column))
+    ret concat(concat(concat(concat(concat(concat(kind, " "), visibility), " "), directive.name), " @"), position)
+}
+
 fn parse_module(cursor: Cursor, module: ParsedModule) -> ParseOutcome {
     if (is_cursor_eof(cursor)) {
-        ret ParseOutcome::Success(module)
+        ret ParseOutcome::Success(finalize_parsed_module(module))
     }
 
     let counted = count_directive(module, cursor)
@@ -53,7 +121,7 @@ fn parse_module(cursor: Cursor, module: ParsedModule) -> ParseOutcome {
     match step {
         Continue(next) => {
             if (is_cursor_eof(next)) {
-                ret ParseOutcome::Success(counted)
+                ret ParseOutcome::Success(finalize_parsed_module(counted))
             }
             ret parse_module(next, counted)
         }
@@ -76,6 +144,9 @@ fn advance(cursor: Cursor) -> Cursor {
 
 fn parse_directive(cursor: Cursor) -> ParseStep {
     let no_pub = consume_optional_pub(cursor)
+    if (is_cimp_keyword(no_pub)) {
+        ret parse_import(no_pub)
+    }
     match no_pub.current.type {
         KW_IMPORT => {
             ret parse_import(no_pub)
@@ -121,6 +192,17 @@ fn consume_optional_pub(cursor: Cursor) -> Cursor {
     }
 }
 
+fn directive_is_public(cursor: Cursor) -> bool {
+    match cursor.current.type {
+        KW_PUB => {
+            ret true
+        }
+        _ => {
+            ret false
+        }
+    }
+}
+
 fn parse_import(cursor: Cursor) -> ParseStep {
     let after_kw = advance(cursor)
     ret parse_import_path(after_kw)
@@ -130,11 +212,11 @@ fn parse_import_path(cursor: Cursor) -> ParseStep {
     match cursor.current.type {
         IDENTIFIER => {
             let after_segment = advance(cursor)
-            ret parse_import_tail(after_segment)
+            ret parse_import_tail(after_segment, true)
         }
         OP_MULTIPLY => {
             let after_glob = advance(cursor)
-            ret parse_import_tail(after_glob)
+            ret parse_import_tail(after_glob, false)
         }
         _ => {
             ret fail(cursor, "Expected import segment")
@@ -142,9 +224,12 @@ fn parse_import_path(cursor: Cursor) -> ParseStep {
     }
 }
 
-fn parse_import_tail(cursor: Cursor) -> ParseStep {
+fn parse_import_tail(cursor: Cursor, allow_scope: bool) -> ParseStep {
     match cursor.current.type {
         OP_SCOPE => {
+            if (not allow_scope) {
+                ret fail(cursor, "Wildcard '*' must be terminal in import path")
+            }
             let after_scope = advance(cursor)
             ret parse_import_after_scope(after_scope)
         }
@@ -156,6 +241,9 @@ fn parse_import_tail(cursor: Cursor) -> ParseStep {
         }
         _ => {
             if (is_top_level_start(cursor.current.type)) {
+                ret ParseStep::Continue(cursor)
+            }
+            if (is_cimp_keyword(cursor)) {
                 ret ParseStep::Continue(cursor)
             }
             ret fail(cursor, "Unexpected token in import path")
@@ -171,11 +259,11 @@ fn parse_import_after_scope(cursor: Cursor) -> ParseStep {
         }
         IDENTIFIER => {
             let after_segment = advance(cursor)
-            ret parse_import_tail(after_segment)
+            ret parse_import_tail(after_segment, true)
         }
         OP_MULTIPLY => {
             let after_glob = advance(cursor)
-            ret parse_import_tail(after_glob)
+            ret parse_import_tail(after_glob, false)
         }
         _ => {
             ret fail(cursor, "Expected import segment after '::'")
@@ -202,7 +290,7 @@ fn parse_import_group_tail(cursor: Cursor) -> ParseStep {
             match after_comma.current.type {
                 RIGHT_BRACE => {
                     let after_rbrace = advance(after_comma)
-                    ret parse_import_tail(after_rbrace)
+                    ret parse_import_tail(after_rbrace, true)
                 }
                 _ => {
                     ret parse_import_group(after_comma)
@@ -211,7 +299,7 @@ fn parse_import_group_tail(cursor: Cursor) -> ParseStep {
         }
         RIGHT_BRACE => {
             let after_rbrace = advance(cursor)
-            ret parse_import_tail(after_rbrace)
+            ret parse_import_tail(after_rbrace, true)
         }
         _ => {
             ret fail(cursor, "Expected ',' or '}' in import group")
@@ -261,8 +349,28 @@ fn parse_struct(cursor: Cursor) -> ParseStep {
                             let after_lbrace = advance(next)
                             ret parse_struct_fields(after_lbrace)
                         }
+                        LEFT_PAREN => {
+                            let after_lparen = advance(next)
+                            ret parse_struct_tuple_fields(after_lparen)
+                        }
                         _ => {
-                            ret fail(next, "Expected '{' in struct body")
+                            if (is_cimp_keyword(next)) {
+                                ret ParseStep::Continue(next)
+                            }
+                            match next.current.type {
+                                KW_IMPORT => { ret ParseStep::Continue(next) }
+                                KW_STRUCT => { ret ParseStep::Continue(next) }
+                                KW_ENUM => { ret ParseStep::Continue(next) }
+                                KW_TRAIT => { ret ParseStep::Continue(next) }
+                                KW_IMPL => { ret ParseStep::Continue(next) }
+                                KW_EXTERN => { ret ParseStep::Continue(next) }
+                                KW_UNSAFE => { ret ParseStep::Continue(next) }
+                                KW_FN => { ret ParseStep::Continue(next) }
+                                KW_PUB => { ret ParseStep::Continue(next) }
+                                EOF => { ret ParseStep::Continue(next) }
+                                _ => {}
+                            }
+                            ret fail(next, "Expected '{' or '(' in struct body")
                         }
                     }
                 }
@@ -275,6 +383,93 @@ fn parse_struct(cursor: Cursor) -> ParseStep {
             ret fail(after_kw, "Expected struct name")
         }
     }
+}
+
+fn parse_struct_tuple_fields(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        RIGHT_PAREN => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        _ => {
+            let with_type = consume_type_until_struct_tuple_boundary(cursor, 0_usize, 0_usize, 0_usize, false)
+            match with_type {
+                Continue(next) => {
+                    ret parse_struct_tuple_fields_tail(next)
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+    }
+}
+
+fn parse_struct_tuple_fields_tail(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        COMMA => {
+            let after_comma = advance(cursor)
+            match after_comma.current.type {
+                RIGHT_PAREN => {
+                    ret ParseStep::Continue(advance(after_comma))
+                }
+                _ => {
+                    ret parse_struct_tuple_fields(after_comma)
+                }
+            }
+        }
+        RIGHT_PAREN => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        _ => {
+            ret fail(cursor, "Expected ',' or ')' in tuple struct fields")
+        }
+    }
+}
+
+fn consume_type_until_struct_tuple_boundary(
+    cursor: Cursor, square_depth: usize, angle_depth: usize, paren_depth: usize, consumed: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        ret fail(cursor, "Expected tuple struct field type")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                match tt {
+                    COMMA => {
+                        if (consumed) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        ret fail(cursor, "Expected tuple struct field type")
+                    }
+                    RIGHT_PAREN => {
+                        if (consumed) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        ret fail(cursor, "Expected tuple struct field type")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in tuple struct field type")
+    }
+    let next_angle = next_angle_depth(tt, angle_depth)
+    if (next_angle >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '<' / '>' in tuple struct field type")
+    }
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in tuple struct field type")
+    }
+
+    ret consume_type_until_struct_tuple_boundary(advance(cursor), next_square, next_angle, next_paren, true)
 }
 
 fn parse_struct_fields(cursor: Cursor) -> ParseStep {
@@ -450,12 +645,103 @@ fn parse_optional_enum_variant_payload(cursor: Cursor) -> ParseStep {
     match cursor.current.type {
         LEFT_PAREN => {
             let after_lparen = advance(cursor)
-            ret consume_paren_group(after_lparen, 1_usize)
+            ret parse_enum_variant_payload_types(after_lparen)
+        }
+        LEFT_BRACE => {
+            let after_lbrace = advance(cursor)
+            ret parse_struct_fields(after_lbrace)
         }
         _ => {
             ret ParseStep::Continue(cursor)
         }
     }
+}
+
+fn parse_enum_variant_payload_types(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        RIGHT_PAREN => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        _ => {
+            let with_type = consume_type_until_enum_variant_payload_boundary(cursor, 0_usize, 0_usize, 0_usize, false)
+            match with_type {
+                Continue(next) => {
+                    ret parse_enum_variant_payload_tail(next)
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+    }
+}
+
+fn parse_enum_variant_payload_tail(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        COMMA => {
+            let after_comma = advance(cursor)
+            match after_comma.current.type {
+                RIGHT_PAREN => {
+                    ret ParseStep::Continue(advance(after_comma))
+                }
+                _ => {
+                    ret parse_enum_variant_payload_types(after_comma)
+                }
+            }
+        }
+        RIGHT_PAREN => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        _ => {
+            ret fail(cursor, "Expected ',' or ')' in enum payload")
+        }
+    }
+}
+
+fn consume_type_until_enum_variant_payload_boundary(
+    cursor: Cursor, square_depth: usize, angle_depth: usize, paren_depth: usize, consumed: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        ret fail(cursor, "Expected enum payload type")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                match tt {
+                    COMMA => {
+                        if (consumed) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        ret fail(cursor, "Expected enum payload type")
+                    }
+                    RIGHT_PAREN => {
+                        if (consumed) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        ret fail(cursor, "Expected enum payload type")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in enum payload type")
+    }
+    let next_angle = next_angle_depth(tt, angle_depth)
+    if (next_angle >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '<' / '>' in enum payload type")
+    }
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in enum payload type")
+    }
+
+    ret consume_type_until_enum_variant_payload_boundary(advance(cursor), next_square, next_angle, next_paren, true)
 }
 
 fn parse_enum_variants_tail(cursor: Cursor) -> ParseStep {
@@ -515,7 +801,7 @@ fn parse_trait_methods(cursor: Cursor) -> ParseStep {
             match with_pub.current.type {
                 KW_FN => {
                     let after_fn = advance(with_pub)
-                    let method = parse_fn_signature(after_fn, false, true, true)
+                    let method = parse_fn_signature(after_fn, false, true, true, true)
                     match method {
                         Continue(next) => {
                             ret parse_trait_methods(next)
@@ -639,6 +925,12 @@ fn consume_type_until_impl_body(
                             }
                             ret fail(cursor, "Expected type after 'for' in impl header")
                         }
+                        if (is_cimp_keyword(cursor)) {
+                            if (consumed) {
+                                ret ParseStep::Continue(cursor)
+                            }
+                            ret fail(cursor, "Expected type after 'for' in impl header")
+                        }
                     }
                 }
             }
@@ -682,7 +974,8 @@ fn parse_impl_methods(cursor: Cursor) -> ParseStep {
             let with_pub = consume_optional_pub(cursor)
             match with_pub.current.type {
                 KW_FN => {
-                    let method = parse_fn(with_pub)
+                    let after_fn = advance(with_pub)
+                    let method = parse_fn_signature(after_fn, true, false, false, true)
                     match method {
                         Continue(next) => {
                             ret parse_impl_methods(next)
@@ -710,7 +1003,7 @@ fn parse_extern_fn(cursor: Cursor) -> ParseStep {
     match after_unsafe.current.type {
         KW_FN => {
             let after_fn = advance(after_unsafe)
-            ret parse_fn_signature(after_fn, false, true, false)
+            ret parse_fn_signature(after_fn, false, true, false, false)
         }
         _ => {
             ret fail(after_unsafe, "Expected 'fn' after 'extern'")
@@ -732,10 +1025,12 @@ fn parse_unsafe_fn(cursor: Cursor) -> ParseStep {
 
 fn parse_fn(cursor: Cursor) -> ParseStep {
     let after_fn = advance(cursor)
-    ret parse_fn_signature(after_fn, true, false, false)
+    ret parse_fn_signature(after_fn, true, false, false, false)
 }
 
-fn parse_fn_signature(cursor: Cursor, has_body: bool, require_return: bool, allow_member_boundary: bool) -> ParseStep {
+fn parse_fn_signature(
+    cursor: Cursor, has_body: bool, require_return: bool, allow_member_boundary: bool, allow_self_param: bool
+) -> ParseStep {
     match cursor.current.type {
         IDENTIFIER => {}
         _ => {
@@ -755,7 +1050,7 @@ fn parse_fn_signature(cursor: Cursor, has_body: bool, require_return: bool, allo
             }
 
             let after_lparen = advance(next0)
-            let with_params = consume_paren_group(after_lparen, 1_usize)
+            let with_params = parse_fn_params(after_lparen, allow_self_param)
             match with_params {
                 Continue(next1) => {
                     ret parse_fn_tail(next1, has_body, require_return, allow_member_boundary)
@@ -769,6 +1064,126 @@ fn parse_fn_signature(cursor: Cursor, has_body: bool, require_return: bool, allo
             ret ParseStep::Fail(error)
         }
     }
+}
+
+fn parse_fn_params(cursor: Cursor, allow_self_param: bool) -> ParseStep {
+    match cursor.current.type {
+        RIGHT_PAREN => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        _ => {
+            ret parse_fn_param(cursor, allow_self_param)
+        }
+    }
+}
+
+fn parse_fn_param(cursor: Cursor, allow_self_param: bool) -> ParseStep {
+    match cursor.current.type {
+        IDENTIFIER => {}
+        _ => {
+            ret fail(cursor, "Expected function parameter name")
+        }
+    }
+
+    let after_name = advance(cursor)
+    if (allow_self_param) {
+        if (is_self_identifier(cursor)) {
+            match after_name.current.type {
+                COMMA => {
+                    ret parse_fn_params_tail(after_name, allow_self_param)
+                }
+                RIGHT_PAREN => {
+                    ret parse_fn_params_tail(after_name, allow_self_param)
+                }
+                _ => {}
+            }
+        }
+    }
+    match after_name.current.type {
+        COLON => {}
+        _ => {
+            ret fail(after_name, "Expected ':' after function parameter name")
+        }
+    }
+
+    let after_colon = advance(after_name)
+    let with_type = consume_type_until_fn_param_boundary(after_colon, 0_usize, 0_usize, 0_usize, false)
+    match with_type {
+        Continue(next) => {
+            ret parse_fn_params_tail(next, allow_self_param)
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn parse_fn_params_tail(cursor: Cursor, allow_self_param: bool) -> ParseStep {
+    match cursor.current.type {
+        COMMA => {
+            let after_comma = advance(cursor)
+            match after_comma.current.type {
+                RIGHT_PAREN => {
+                    ret ParseStep::Continue(advance(after_comma))
+                }
+                _ => {
+                    ret parse_fn_param(after_comma, allow_self_param)
+                }
+            }
+        }
+        RIGHT_PAREN => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        _ => {
+            ret fail(cursor, "Expected ',' or ')' in parameter list")
+        }
+    }
+}
+
+fn consume_type_until_fn_param_boundary(
+    cursor: Cursor, square_depth: usize, angle_depth: usize, paren_depth: usize, consumed: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        ret fail(cursor, "Expected function parameter type")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                match tt {
+                    COMMA => {
+                        if (consumed) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        ret fail(cursor, "Expected function parameter type")
+                    }
+                    RIGHT_PAREN => {
+                        if (consumed) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        ret fail(cursor, "Expected function parameter type")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in function parameter type")
+    }
+    let next_angle = next_angle_depth(tt, angle_depth)
+    if (next_angle >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '<' / '>' in function parameter type")
+    }
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in function parameter type")
+    }
+
+    ret consume_type_until_fn_param_boundary(advance(cursor), next_square, next_angle, next_paren, true)
 }
 
 fn parse_fn_tail(cursor: Cursor, has_body: bool, require_return: bool, allow_member_boundary: bool) -> ParseStep {
@@ -803,7 +1218,7 @@ fn finish_fn_tail(cursor: Cursor, has_body: bool, allow_member_boundary: bool) -
         match cursor.current.type {
             LEFT_BRACE => {
                 let after_lbrace = advance(cursor)
-                ret consume_block_body(after_lbrace, 1_usize)
+                ret parse_statement_block(after_lbrace, 0_usize)
             }
             _ => {
                 ret fail(cursor, "Expected function body '{'")
@@ -819,6 +1234,9 @@ fn finish_fn_tail(cursor: Cursor, has_body: bool, allow_member_boundary: bool) -
             if (is_top_level_start(cursor.current.type)) {
                 ret ParseStep::Continue(cursor)
             }
+            if (is_cimp_keyword(cursor)) {
+                ret ParseStep::Continue(cursor)
+            }
             if (allow_member_boundary) {
                 if (is_trait_member_start(cursor.current.type)) {
                     ret ParseStep::Continue(cursor)
@@ -827,6 +1245,746 @@ fn finish_fn_tail(cursor: Cursor, has_body: bool, allow_member_boundary: bool) -
             ret fail(cursor, "Unexpected token after extern signature")
         }
     }
+}
+
+fn parse_statement_block(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    match cursor.current.type {
+        RIGHT_BRACE => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        _ => {
+            let parsed = parse_inner_statement(cursor, loop_depth)
+            match parsed {
+                Continue(next) => {
+                    ret parse_statement_block(next, loop_depth)
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+    }
+}
+
+fn parse_inner_statement(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    match cursor.current.type {
+        KW_LET => {
+            ret parse_let_statement(cursor)
+        }
+        KW_RET => {
+            ret parse_ret_statement(cursor)
+        }
+        KW_IF => {
+            ret parse_if_statement(cursor, loop_depth)
+        }
+        KW_WHILE => {
+            ret parse_while_statement(cursor, loop_depth)
+        }
+        KW_FOR => {
+            ret parse_for_statement(cursor, loop_depth)
+        }
+        KW_LOOP => {
+            ret parse_loop_statement(cursor, loop_depth)
+        }
+        KW_DO => {
+            ret parse_do_while_statement(cursor, loop_depth)
+        }
+        KW_MATCH => {
+            ret parse_match_statement(cursor, loop_depth)
+        }
+        KW_UNSAFE => {
+            ret parse_unsafe_statement(cursor, loop_depth)
+        }
+        KW_BREAK => {
+            if (loop_depth == 0_usize) {
+                ret fail(cursor, "'break' is only allowed inside loop bodies")
+            }
+            ret ParseStep::Continue(advance(cursor))
+        }
+        KW_CONTINUE => {
+            if (loop_depth == 0_usize) {
+                ret fail(cursor, "'continue' is only allowed inside loop bodies")
+            }
+            ret ParseStep::Continue(advance(cursor))
+        }
+        _ => {
+            ret parse_expression_or_assignment_statement(cursor)
+        }
+    }
+}
+
+fn parse_let_statement(cursor: Cursor) -> ParseStep {
+    let after_let = advance(cursor)
+    match after_let.current.type {
+        IDENTIFIER => {}
+        _ => {
+            ret fail(after_let, "Expected variable name after 'let'")
+        }
+    }
+
+    let after_name = advance(after_let)
+    match after_name.current.type {
+        COLON => {
+            let after_colon = advance(after_name)
+            let with_type = consume_type_until_assignment(after_colon, 0_usize, 0_usize, 0_usize, false)
+            match with_type {
+                Continue(next0) => {
+                    ret parse_let_assignment_value(next0)
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+        _ => {
+            ret parse_let_assignment_value(after_name)
+        }
+    }
+}
+
+fn parse_let_assignment_value(cursor: Cursor) -> ParseStep {
+    match cursor.current.type {
+        OP_ASSIGN => {
+            let after_assign = advance(cursor)
+            ret consume_expression_until_statement_boundary(
+                after_assign, 0_usize, 0_usize, 0_usize, 0_usize, false, false
+            )
+        }
+        _ => {
+            ret fail(cursor, "Expected '=' in let statement")
+        }
+    }
+}
+
+fn parse_ret_statement(cursor: Cursor) -> ParseStep {
+    let after_ret = advance(cursor)
+    ret consume_expression_until_statement_boundary(after_ret, 0_usize, 0_usize, 0_usize, 0_usize, false, false)
+}
+
+fn parse_if_statement(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    let after_if = advance(cursor)
+    let condition = consume_expression_until_left_brace(after_if, 0_usize, 0_usize, 0_usize, false)
+    match condition {
+        Continue(next0) => {
+            match next0.current.type {
+                LEFT_BRACE => {
+                    let after_lbrace = advance(next0)
+                    let branch = parse_statement_block(after_lbrace, loop_depth)
+                    match branch {
+                        Continue(next1) => {
+                            ret parse_if_suffix(next1, loop_depth)
+                        }
+                        Fail(error) => {
+                            ret ParseStep::Fail(error)
+                        }
+                    }
+                }
+                _ => {
+                    ret fail(next0, "Expected '{' after if condition")
+                }
+            }
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn parse_if_suffix(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    match cursor.current.type {
+        KW_ELIF => {
+            let after_elif = advance(cursor)
+            let condition = consume_expression_until_left_brace(after_elif, 0_usize, 0_usize, 0_usize, false)
+            match condition {
+                Continue(next0) => {
+                    match next0.current.type {
+                        LEFT_BRACE => {
+                            let after_lbrace = advance(next0)
+                            let branch = parse_statement_block(after_lbrace, loop_depth)
+                            match branch {
+                                Continue(next1) => {
+                                    ret parse_if_suffix(next1, loop_depth)
+                                }
+                                Fail(error) => {
+                                    ret ParseStep::Fail(error)
+                                }
+                            }
+                        }
+                        _ => {
+                            ret fail(next0, "Expected '{' after elif condition")
+                        }
+                    }
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+        KW_ELSE => {
+            let after_else = advance(cursor)
+            match after_else.current.type {
+                LEFT_BRACE => {
+                    ret parse_statement_block(advance(after_else), loop_depth)
+                }
+                _ => {
+                    ret fail(after_else, "Expected '{' after else")
+                }
+            }
+        }
+        _ => {
+            ret ParseStep::Continue(cursor)
+        }
+    }
+}
+
+fn parse_while_statement(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    let after_while = advance(cursor)
+    let condition = consume_expression_until_left_brace(after_while, 0_usize, 0_usize, 0_usize, false)
+    match condition {
+        Continue(next0) => {
+            match next0.current.type {
+                LEFT_BRACE => {
+                    ret parse_statement_block(advance(next0), loop_depth + 1_usize)
+                }
+                _ => {
+                    ret fail(next0, "Expected '{' after while condition")
+                }
+            }
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn parse_for_statement(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    let after_for = advance(cursor)
+    match after_for.current.type {
+        IDENTIFIER => {}
+        _ => {
+            ret fail(after_for, "Expected loop binding after 'for'")
+        }
+    }
+
+    let after_binding = advance(after_for)
+    match after_binding.current.type {
+        IDENTIFIER => {
+            if (not str_eq(after_binding.current.value, "in")) {
+                ret fail(after_binding, "Expected 'in' in for statement")
+            }
+        }
+        _ => {
+            ret fail(after_binding, "Expected 'in' in for statement")
+        }
+    }
+
+    let after_in = advance(after_binding)
+    let iterable = consume_expression_until_left_brace(after_in, 0_usize, 0_usize, 0_usize, false)
+    match iterable {
+        Continue(next0) => {
+            match next0.current.type {
+                LEFT_BRACE => {
+                    ret parse_statement_block(advance(next0), loop_depth + 1_usize)
+                }
+                _ => {
+                    ret fail(next0, "Expected '{' after for iterable expression")
+                }
+            }
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn parse_loop_statement(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    let after_loop = advance(cursor)
+    match after_loop.current.type {
+        LEFT_BRACE => {
+            ret parse_statement_block(advance(after_loop), loop_depth + 1_usize)
+        }
+        _ => {
+            ret fail(after_loop, "Expected '{' after loop")
+        }
+    }
+}
+
+fn parse_do_while_statement(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    let after_do = advance(cursor)
+    match after_do.current.type {
+        LEFT_BRACE => {}
+        _ => {
+            ret fail(after_do, "Expected '{' after do")
+        }
+    }
+
+    let body = parse_statement_block(advance(after_do), loop_depth + 1_usize)
+    match body {
+        Continue(next0) => {
+            match next0.current.type {
+                KW_WHILE => {
+                    let after_while = advance(next0)
+                    ret consume_expression_until_statement_boundary_relaxed(
+                        after_while, 0_usize, 0_usize, 0_usize, 0_usize, false, false
+                    )
+                }
+                _ => {
+                    ret fail(next0, "Expected 'while' after do-block")
+                }
+            }
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn consume_expression_until_statement_boundary_relaxed(
+    cursor: Cursor,
+    square_depth: usize,
+    angle_depth: usize,
+    paren_depth: usize,
+    brace_depth: usize,
+    consumed: bool,
+    prev_can_end: bool
+) -> ParseStep {
+    if (not consumed) {
+        if (is_statement_boundary_token(cursor.current.type)) {
+            if (should_stop_at_statement_boundary(cursor.current.type, prev_can_end)) {
+                ret ParseStep::Continue(cursor)
+            }
+        }
+    }
+    ret consume_expression_until_statement_boundary(
+        cursor, square_depth, angle_depth, paren_depth, brace_depth, consumed, prev_can_end
+    )
+}
+
+fn consume_expression_until_match_arm_boundary(
+    cursor: Cursor,
+    square_depth: usize,
+    angle_depth: usize,
+    paren_depth: usize,
+    brace_depth: usize,
+    consumed: bool,
+    prev_can_end: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        if (consumed) {
+            ret ParseStep::Continue(cursor)
+        }
+        ret fail(cursor, "Expected expression in match arm")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                if (brace_depth == 0_usize) {
+                    if (consumed) {
+                        match tt {
+                            COMMA => {
+                                ret ParseStep::Continue(cursor)
+                            }
+                            RIGHT_BRACE => {
+                                ret ParseStep::Continue(cursor)
+                            }
+                            _ => {}
+                        }
+                        if (prev_can_end) {
+                            if (is_identifier_token(tt)) {
+                                ret ParseStep::Continue(cursor)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in match arm expression")
+    }
+    let next_angle = angle_depth
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in match arm expression")
+    }
+    let next_brace = next_brace_depth(tt, brace_depth)
+    if (next_brace >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '{' / '}' in match arm expression")
+    }
+
+    ret consume_expression_until_match_arm_boundary(
+        advance(cursor), next_square, next_angle, next_paren, next_brace, true, can_end_expression(tt)
+    )
+}
+
+fn parse_match_statement(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    let after_match = advance(cursor)
+    let scrutinee = consume_expression_until_left_brace(after_match, 0_usize, 0_usize, 0_usize, false)
+    match scrutinee {
+        Continue(next0) => {
+            match next0.current.type {
+                LEFT_BRACE => {
+                    ret parse_match_arms(advance(next0), loop_depth)
+                }
+                _ => {
+                    ret fail(next0, "Expected '{' after match scrutinee")
+                }
+            }
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn parse_match_arms(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    match cursor.current.type {
+        RIGHT_BRACE => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        _ => {
+            let arm = parse_match_arm(cursor, loop_depth)
+            match arm {
+                Continue(next) => {
+                    ret parse_match_arms_tail(next, loop_depth)
+                }
+                Fail(error) => {
+                    ret ParseStep::Fail(error)
+                }
+            }
+        }
+    }
+}
+
+fn parse_match_arms_tail(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    match cursor.current.type {
+        COMMA => {
+            let after_comma = advance(cursor)
+            match after_comma.current.type {
+                RIGHT_BRACE => {
+                    ret ParseStep::Continue(advance(after_comma))
+                }
+                _ => {
+                    ret parse_match_arms(after_comma, loop_depth)
+                }
+            }
+        }
+        RIGHT_BRACE => {
+            ret ParseStep::Continue(advance(cursor))
+        }
+        _ => {
+            ret fail(cursor, "Expected ',' or '}' after match arm")
+        }
+    }
+}
+
+fn parse_match_arm(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    let pattern = consume_match_pattern_until_fat_arrow(cursor, 0_usize, 0_usize, 0_usize, 0_usize, false)
+    match pattern {
+        Continue(next0) => {
+            match next0.current.type {
+                OP_FAT_ARROW => {
+                    let after_arrow = advance(next0)
+                    match after_arrow.current.type {
+                        LEFT_BRACE => {
+                            ret parse_statement_block(advance(after_arrow), loop_depth)
+                        }
+                        _ => {
+                            ret consume_expression_until_match_arm_boundary(
+                                after_arrow, 0_usize, 0_usize, 0_usize, 0_usize, false, false
+                            )
+                        }
+                    }
+                }
+                _ => {
+                    ret fail(next0, "Expected '=>' in match arm")
+                }
+            }
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn parse_unsafe_statement(cursor: Cursor, loop_depth: usize) -> ParseStep {
+    let after_unsafe = advance(cursor)
+    match after_unsafe.current.type {
+        LEFT_BRACE => {
+            ret parse_statement_block(advance(after_unsafe), loop_depth)
+        }
+        _ => {
+            ret consume_expression_until_statement_boundary(
+                after_unsafe, 0_usize, 0_usize, 0_usize, 0_usize, false, false
+            )
+        }
+    }
+}
+
+fn parse_expression_or_assignment_statement(cursor: Cursor) -> ParseStep {
+    let lhs = consume_expression_until_assignment_or_statement_boundary(
+        cursor, 0_usize, 0_usize, 0_usize, 0_usize, false, false
+    )
+    match lhs {
+        Continue(next0) => {
+            match next0.current.type {
+                OP_ASSIGN => {
+                    let after_assign = advance(next0)
+                    ret consume_expression_until_statement_boundary(
+                        after_assign, 0_usize, 0_usize, 0_usize, 0_usize, false, false
+                    )
+                }
+                _ => {
+                    ret ParseStep::Continue(next0)
+                }
+            }
+        }
+        Fail(error) => {
+            ret ParseStep::Fail(error)
+        }
+    }
+}
+
+fn consume_type_until_assignment(
+    cursor: Cursor, square_depth: usize, angle_depth: usize, paren_depth: usize, consumed: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        ret fail(cursor, "Expected type in let statement")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                if (is_op_assign(tt)) {
+                    if (consumed) {
+                        ret ParseStep::Continue(cursor)
+                    }
+                    ret fail(cursor, "Expected type after ':'")
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in type")
+    }
+    let next_angle = next_angle_depth(tt, angle_depth)
+    if (next_angle >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '<' / '>' in type")
+    }
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in type")
+    }
+
+    ret consume_type_until_assignment(advance(cursor), next_square, next_angle, next_paren, true)
+}
+
+fn consume_expression_until_left_brace(
+    cursor: Cursor, square_depth: usize, angle_depth: usize, paren_depth: usize, consumed: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        ret fail(cursor, "Expected condition expression")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                if (is_left_brace_token(tt)) {
+                    if (consumed) {
+                        ret ParseStep::Continue(cursor)
+                    }
+                    ret fail(cursor, "Expected expression before '{'")
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in expression")
+    }
+    let next_angle = angle_depth
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in expression")
+    }
+
+    ret consume_expression_until_left_brace(advance(cursor), next_square, next_angle, next_paren, true)
+}
+
+fn consume_match_pattern_until_fat_arrow(
+    cursor: Cursor,
+    square_depth: usize,
+    angle_depth: usize,
+    paren_depth: usize,
+    brace_depth: usize,
+    consumed: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        ret fail(cursor, "Expected match arm pattern")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                if (brace_depth == 0_usize) {
+                    if (is_op_fat_arrow(tt)) {
+                        if (consumed) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        ret fail(cursor, "Expected pattern before '=>'")
+                    }
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in match pattern")
+    }
+    let next_angle = next_angle_depth(tt, angle_depth)
+    if (next_angle >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '<' / '>' in match pattern")
+    }
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in match pattern")
+    }
+    let next_brace = next_brace_depth(tt, brace_depth)
+    if (next_brace >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '{' / '}' in match pattern")
+    }
+
+    ret consume_match_pattern_until_fat_arrow(
+        advance(cursor), next_square, next_angle, next_paren, next_brace, true
+    )
+}
+
+fn consume_expression_until_assignment_or_statement_boundary(
+    cursor: Cursor,
+    square_depth: usize,
+    angle_depth: usize,
+    paren_depth: usize,
+    brace_depth: usize,
+    consumed: bool,
+    prev_can_end: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        if (consumed) {
+            ret ParseStep::Continue(cursor)
+        }
+        ret fail(cursor, "Expected expression")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                if (brace_depth == 0_usize) {
+                    if (consumed) {
+                        if (is_op_assign(tt)) {
+                            ret ParseStep::Continue(cursor)
+                        }
+                        if (is_statement_boundary_token(tt)) {
+                            if (should_stop_at_statement_boundary(tt, prev_can_end)) {
+                                ret ParseStep::Continue(cursor)
+                            }
+                        }
+                        if (prev_can_end) {
+                            if (is_identifier_token(tt)) {
+                                ret ParseStep::Continue(cursor)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in expression")
+    }
+    let next_angle = angle_depth
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in expression")
+    }
+    let next_brace = next_brace_depth(tt, brace_depth)
+    if (next_brace >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '{' / '}' in expression")
+    }
+
+    ret consume_expression_until_assignment_or_statement_boundary(
+        advance(cursor), next_square, next_angle, next_paren, next_brace, true, can_end_expression(tt)
+    )
+}
+
+fn consume_expression_until_statement_boundary(
+    cursor: Cursor,
+    square_depth: usize,
+    angle_depth: usize,
+    paren_depth: usize,
+    brace_depth: usize,
+    consumed: bool,
+    prev_can_end: bool
+) -> ParseStep {
+    if (is_cursor_eof(cursor)) {
+        if (consumed) {
+            ret ParseStep::Continue(cursor)
+        }
+        ret fail(cursor, "Expected expression")
+    }
+
+    let tt = cursor.current.type
+    if (square_depth == 0_usize) {
+        if (angle_depth == 0_usize) {
+            if (paren_depth == 0_usize) {
+                if (brace_depth == 0_usize) {
+                    if (consumed) {
+                        if (is_statement_boundary_token(tt)) {
+                            if (should_stop_at_statement_boundary(tt, prev_can_end)) {
+                                ret ParseStep::Continue(cursor)
+                            }
+                        }
+                        if (prev_can_end) {
+                            if (is_identifier_token(tt)) {
+                                ret ParseStep::Continue(cursor)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let next_square = next_square_depth(tt, square_depth)
+    if (next_square >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '[' / ']' in expression")
+    }
+    let next_angle = angle_depth
+    let next_paren = next_paren_depth(tt, paren_depth)
+    if (next_paren >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '(' / ')' in expression")
+    }
+    let next_brace = next_brace_depth(tt, brace_depth)
+    if (next_brace >= 1000000_usize) {
+        ret fail(cursor, "Unbalanced '{' / '}' in expression")
+    }
+
+    ret consume_expression_until_statement_boundary(
+        advance(cursor), next_square, next_angle, next_paren, next_brace, true, can_end_expression(tt)
+    )
 }
 
 fn parse_optional_generics(cursor: Cursor) -> ParseStep {
@@ -945,6 +2103,12 @@ fn consume_type_until_signature_boundary(
                     }
                     ret fail(cursor, "Expected return type after '->'")
                 }
+                if (is_cimp_keyword(cursor)) {
+                    if (consumed) {
+                        ret ParseStep::Continue(cursor)
+                    }
+                    ret fail(cursor, "Expected return type after '->'")
+                }
                 if (allow_member_boundary) {
                     if (is_trait_member_start(tt)) {
                         if (consumed) {
@@ -1057,6 +2221,23 @@ fn next_paren_depth(tt: TokenType, depth: usize) -> usize {
     }
 }
 
+fn next_brace_depth(tt: TokenType, depth: usize) -> usize {
+    match tt {
+        LEFT_BRACE => {
+            ret depth + 1_usize
+        }
+        RIGHT_BRACE => {
+            if (depth == 0_usize) {
+                ret 1000000_usize
+            }
+            ret depth - 1_usize
+        }
+        _ => {
+            ret depth
+        }
+    }
+}
+
 fn is_top_level_start(tt: TokenType) -> bool {
     match tt {
         KW_IMPORT => { ret true }
@@ -1082,10 +2263,103 @@ fn is_trait_member_start(tt: TokenType) -> bool {
     }
 }
 
+fn is_statement_boundary_token(tt: TokenType) -> bool {
+    match tt {
+        KW_LET => { ret true }
+        KW_RET => { ret true }
+        KW_IF => { ret true }
+        KW_ELIF => { ret true }
+        KW_ELSE => { ret true }
+        KW_WHILE => { ret true }
+        KW_FOR => { ret true }
+        KW_LOOP => { ret true }
+        KW_DO => { ret true }
+        KW_MATCH => { ret true }
+        KW_BREAK => { ret true }
+        KW_CONTINUE => { ret true }
+        KW_UNSAFE => { ret true }
+        RIGHT_BRACE => { ret true }
+        EOF => { ret true }
+        _ => { ret false }
+    }
+}
+
+fn should_stop_at_statement_boundary(tt: TokenType, prev_can_end: bool) -> bool {
+    match tt {
+        KW_IF => { ret prev_can_end }
+        KW_MATCH => { ret prev_can_end }
+        KW_UNSAFE => { ret prev_can_end }
+        _ => { ret true }
+    }
+}
+
+fn can_end_expression(tt: TokenType) -> bool {
+    match tt {
+        IDENTIFIER => { ret true }
+        INTEGER => { ret true }
+        FLOAT => { ret true }
+        STRING => { ret true }
+        RIGHT_PAREN => { ret true }
+        RIGHT_BRACKET => { ret true }
+        RIGHT_BRACE => { ret true }
+        OP_TRY => { ret true }
+        _ => { ret false }
+    }
+}
+
 fn is_kw_for(tt: TokenType) -> bool {
     match tt {
         KW_FOR => { ret true }
         _ => { ret false }
+    }
+}
+
+fn is_op_assign(tt: TokenType) -> bool {
+    match tt {
+        OP_ASSIGN => { ret true }
+        OP_PLUS_ASSIGN => { ret true }
+        OP_MINUS_ASSIGN => { ret true }
+        OP_MULT_ASSIGN => { ret true }
+        OP_DIV_ASSIGN => { ret true }
+        OP_MOD_ASSIGN => { ret true }
+        OP_AND_ASSIGN => { ret true }
+        OP_OR_ASSIGN => { ret true }
+        OP_XOR_ASSIGN => { ret true }
+        OP_LSHIFT_ASSIGN => { ret true }
+        OP_RSHIFT_ASSIGN => { ret true }
+        _ => { ret false }
+    }
+}
+
+fn is_left_brace_token(tt: TokenType) -> bool {
+    match tt {
+        LEFT_BRACE => { ret true }
+        _ => { ret false }
+    }
+}
+
+fn is_op_fat_arrow(tt: TokenType) -> bool {
+    match tt {
+        OP_FAT_ARROW => { ret true }
+        _ => { ret false }
+    }
+}
+
+fn is_identifier_token(tt: TokenType) -> bool {
+    match tt {
+        IDENTIFIER => { ret true }
+        _ => { ret false }
+    }
+}
+
+fn is_self_identifier(cursor: Cursor) -> bool {
+    match cursor.current.type {
+        IDENTIFIER => {
+            ret str_eq(cursor.current.value, "self")
+        }
+        _ => {
+            ret false
+        }
     }
 }
 
@@ -1101,7 +2375,12 @@ fn make_error(cursor: Cursor, message: str) -> ParseError {
 }
 
 fn fail(cursor: Cursor, message: str) -> ParseStep {
-    ret ParseStep::Fail(make_error(cursor, concat(concat(message, ": "), cursor.current.value)))
+    let current_name = token_type_name(cursor.current.type)
+    let with_type = concat(concat(concat(message, " ["), current_name), "]")
+    if (len(cursor.current.value) > 0_usize) {
+        ret ParseStep::Fail(make_error(cursor, concat(concat(with_type, ": "), cursor.current.value)))
+    }
+    ret ParseStep::Fail(make_error(cursor, with_type))
 }
 
 fn empty_parsed_module() -> ParsedModule {
@@ -1115,14 +2394,70 @@ fn empty_parsed_module() -> ParsedModule {
         0_usize,
         0_usize,
         0_usize,
+        "",
+        "",
+        "",
+        "",
+        Vec[ParsedDirective]::Empty,
         ""
     }
 }
 
+fn finalize_parsed_module(module: ParsedModule) -> ParsedModule {
+    ret ParsedModule{
+        module.directives,
+        module.imports,
+        module.structs,
+        module.enums,
+        module.traits,
+        module.impls,
+        module.functions,
+        module.extern_functions,
+        module.unsafe_functions,
+        module.import_bindings_outline,
+        module.public_import_bindings_outline,
+        module.cimport_bindings_outline,
+        module.directives_meta_outline,
+        reverse(module.directives_meta),
+        module.outline
+    }
+}
+
+fn prepend_directive_meta(meta: Vec[ParsedDirective], cursor: Cursor) -> Vec[ParsedDirective] {
+    ret push_front(meta, directive_meta(cursor))
+}
+
 fn count_directive(module: ParsedModule, cursor: Cursor) -> ParsedModule {
+    let is_public = directive_is_public(cursor)
     let no_pub = consume_optional_pub(cursor)
+    if (is_cimp_keyword(no_pub)) {
+        let collected = collect_import_bindings_outline(no_pub)
+        ret ParsedModule{
+            module.directives + 1_usize,
+            module.imports + 1_usize,
+            module.structs,
+            module.enums,
+            module.traits,
+            module.impls,
+            module.functions,
+            module.extern_functions,
+            module.unsafe_functions,
+            append_lines(module.import_bindings_outline, collected),
+            append_lines(module.public_import_bindings_outline, collected),
+            append_lines(module.cimport_bindings_outline, collected),
+            append_lines(module.directives_meta_outline, directive_meta_line(cursor)),
+            prepend_directive_meta(module.directives_meta, cursor),
+            append_outline(module.outline, directive_header(cursor))
+        }
+    }
     match no_pub.current.type {
         KW_IMPORT => {
+            let collected = collect_import_bindings_outline(no_pub)
+            let next_public_imports = if (is_public) {
+                append_lines(module.public_import_bindings_outline, collected)
+            } else {
+                module.public_import_bindings_outline
+            }
             ret ParsedModule{
                 module.directives + 1_usize,
                 module.imports + 1_usize,
@@ -1133,6 +2468,11 @@ fn count_directive(module: ParsedModule, cursor: Cursor) -> ParsedModule {
                 module.functions,
                 module.extern_functions,
                 module.unsafe_functions,
+                append_lines(module.import_bindings_outline, collected),
+                next_public_imports,
+                module.cimport_bindings_outline,
+                append_lines(module.directives_meta_outline, directive_meta_line(cursor)),
+                prepend_directive_meta(module.directives_meta, cursor),
                 append_outline(module.outline, directive_header(cursor))
             }
         }
@@ -1147,6 +2487,11 @@ fn count_directive(module: ParsedModule, cursor: Cursor) -> ParsedModule {
                 module.functions,
                 module.extern_functions,
                 module.unsafe_functions,
+                module.import_bindings_outline,
+                module.public_import_bindings_outline,
+                module.cimport_bindings_outline,
+                append_lines(module.directives_meta_outline, directive_meta_line(cursor)),
+                prepend_directive_meta(module.directives_meta, cursor),
                 append_outline(module.outline, directive_header(cursor))
             }
         }
@@ -1161,6 +2506,11 @@ fn count_directive(module: ParsedModule, cursor: Cursor) -> ParsedModule {
                 module.functions,
                 module.extern_functions,
                 module.unsafe_functions,
+                module.import_bindings_outline,
+                module.public_import_bindings_outline,
+                module.cimport_bindings_outline,
+                append_lines(module.directives_meta_outline, directive_meta_line(cursor)),
+                prepend_directive_meta(module.directives_meta, cursor),
                 append_outline(module.outline, directive_header(cursor))
             }
         }
@@ -1175,6 +2525,11 @@ fn count_directive(module: ParsedModule, cursor: Cursor) -> ParsedModule {
                 module.functions,
                 module.extern_functions,
                 module.unsafe_functions,
+                module.import_bindings_outline,
+                module.public_import_bindings_outline,
+                module.cimport_bindings_outline,
+                append_lines(module.directives_meta_outline, directive_meta_line(cursor)),
+                prepend_directive_meta(module.directives_meta, cursor),
                 append_outline(module.outline, directive_header(cursor))
             }
         }
@@ -1189,6 +2544,11 @@ fn count_directive(module: ParsedModule, cursor: Cursor) -> ParsedModule {
                 module.functions,
                 module.extern_functions,
                 module.unsafe_functions,
+                module.import_bindings_outline,
+                module.public_import_bindings_outline,
+                module.cimport_bindings_outline,
+                append_lines(module.directives_meta_outline, directive_meta_line(cursor)),
+                prepend_directive_meta(module.directives_meta, cursor),
                 append_outline(module.outline, directive_header(cursor))
             }
         }
@@ -1203,6 +2563,11 @@ fn count_directive(module: ParsedModule, cursor: Cursor) -> ParsedModule {
                 module.functions,
                 module.extern_functions + 1_usize,
                 module.unsafe_functions,
+                module.import_bindings_outline,
+                module.public_import_bindings_outline,
+                module.cimport_bindings_outline,
+                append_lines(module.directives_meta_outline, directive_meta_line(cursor)),
+                prepend_directive_meta(module.directives_meta, cursor),
                 append_outline(module.outline, directive_header(cursor))
             }
         }
@@ -1217,6 +2582,11 @@ fn count_directive(module: ParsedModule, cursor: Cursor) -> ParsedModule {
                 module.functions,
                 module.extern_functions,
                 module.unsafe_functions + 1_usize,
+                module.import_bindings_outline,
+                module.public_import_bindings_outline,
+                module.cimport_bindings_outline,
+                append_lines(module.directives_meta_outline, directive_meta_line(cursor)),
+                prepend_directive_meta(module.directives_meta, cursor),
                 append_outline(module.outline, directive_header(cursor))
             }
         }
@@ -1231,6 +2601,11 @@ fn count_directive(module: ParsedModule, cursor: Cursor) -> ParsedModule {
                 module.functions + 1_usize,
                 module.extern_functions,
                 module.unsafe_functions,
+                module.import_bindings_outline,
+                module.public_import_bindings_outline,
+                module.cimport_bindings_outline,
+                append_lines(module.directives_meta_outline, directive_meta_line(cursor)),
+                prepend_directive_meta(module.directives_meta, cursor),
                 append_outline(module.outline, directive_header(cursor))
             }
         }
@@ -1238,6 +2613,139 @@ fn count_directive(module: ParsedModule, cursor: Cursor) -> ParsedModule {
             ret module
         }
     }
+}
+
+struct ImportLineCollect {
+    cursor: Cursor
+    lines: str
+}
+
+struct ImportRoot {
+    cursor: Cursor
+    is_refrain: bool
+}
+
+fn collect_import_bindings_outline(import_cursor: Cursor) -> str {
+    let after_kw = advance(import_cursor)
+    let rooted = consume_refrain_import_root(after_kw)
+    let parsed = parse_import_line_expr(rooted.cursor, "", rooted.is_refrain)
+    ret parsed.lines
+}
+
+fn consume_refrain_import_root(cursor: Cursor) -> ImportRoot {
+    match cursor.current.type {
+        IDENTIFIER => {
+            if (str_eq(cursor.current.value, "refrain")) {
+                let after_name = advance(cursor)
+                match after_name.current.type {
+                    OP_SCOPE => {
+                        ret ImportRoot{advance(after_name), true}
+                    }
+                    _ => {}
+                }
+            }
+            ret ImportRoot{cursor, false}
+        }
+        _ => {
+            ret ImportRoot{cursor, false}
+        }
+    }
+}
+
+fn parse_import_line_expr(cursor: Cursor, prefix: str, is_refrain: bool) -> ImportLineCollect {
+    match cursor.current.type {
+        IDENTIFIER => {
+            ret parse_import_line_segment(cursor, cursor.current.value, prefix, is_refrain)
+        }
+        OP_MULTIPLY => {
+            ret parse_import_line_segment(cursor, "*", prefix, is_refrain)
+        }
+        _ => {
+            ret ImportLineCollect{cursor, ""}
+        }
+    }
+}
+
+fn parse_import_line_segment(cursor: Cursor, segment: str, prefix: str, is_refrain: bool) -> ImportLineCollect {
+    let path = join_import_path(prefix, segment)
+    let after_segment = advance(cursor)
+    match after_segment.current.type {
+        OP_SCOPE => {
+            let after_scope = advance(after_segment)
+            match after_scope.current.type {
+                LEFT_BRACE => {
+                    ret parse_import_line_group(advance(after_scope), path, is_refrain)
+                }
+                _ => {
+                    ret parse_import_line_expr(after_scope, path, is_refrain)
+                }
+            }
+        }
+        _ => {
+            ret ImportLineCollect{after_segment, with_refrain_prefix(path, is_refrain)}
+        }
+    }
+}
+
+fn parse_import_line_group(cursor: Cursor, prefix: str, is_refrain: bool) -> ImportLineCollect {
+    match cursor.current.type {
+        RIGHT_BRACE => {
+            ret ImportLineCollect{advance(cursor), ""}
+        }
+        _ => {
+            let first = parse_import_line_expr(cursor, prefix, is_refrain)
+            ret parse_import_line_group_tail(first.cursor, prefix, is_refrain, first.lines)
+        }
+    }
+}
+
+fn parse_import_line_group_tail(cursor: Cursor, prefix: str, is_refrain: bool, acc: str) -> ImportLineCollect {
+    match cursor.current.type {
+        COMMA => {
+            let after_comma = advance(cursor)
+            match after_comma.current.type {
+                RIGHT_BRACE => {
+                    ret ImportLineCollect{advance(after_comma), acc}
+                }
+                _ => {
+                    let next = parse_import_line_expr(after_comma, prefix, is_refrain)
+                    ret parse_import_line_group_tail(
+                        next.cursor, prefix, is_refrain, append_lines(acc, next.lines)
+                    )
+                }
+            }
+        }
+        RIGHT_BRACE => {
+            ret ImportLineCollect{advance(cursor), acc}
+        }
+        _ => {
+            ret ImportLineCollect{cursor, acc}
+        }
+    }
+}
+
+fn join_import_path(prefix: str, segment: str) -> str {
+    if (len(prefix) == 0_usize) {
+        ret segment
+    }
+    ret concat(concat(prefix, "::"), segment)
+}
+
+fn with_refrain_prefix(path: str, is_refrain: bool) -> str {
+    if (is_refrain) {
+        ret concat("refrain::", path)
+    }
+    ret path
+}
+
+fn append_lines(lhs: str, rhs: str) -> str {
+    if (len(lhs) == 0_usize) {
+        ret rhs
+    }
+    if (len(rhs) == 0_usize) {
+        ret lhs
+    }
+    ret concat(concat(lhs, "\n"), rhs)
 }
 
 fn append_outline(outline: str, line: str) -> str {
@@ -1254,6 +2762,11 @@ fn directive_header(cursor: Cursor) -> str {
     }
     let pub_prefix = if (is_public) { "pub " } else { "" }
     let no_pub = consume_optional_pub(cursor)
+    if (is_cimp_keyword(no_pub)) {
+        let after_kw = advance(no_pub)
+        let head = first_import_segment(after_kw)
+        ret concat(concat(pub_prefix, "cimp "), head)
+    }
 
     match no_pub.current.type {
         KW_IMPORT => {
@@ -1292,6 +2805,112 @@ fn directive_header(cursor: Cursor) -> str {
     }
 }
 
+fn directive_meta(cursor: Cursor) -> ParsedDirective {
+    let is_public = match cursor.current.type {
+        KW_PUB => true
+        _ => false
+    }
+    let no_pub = consume_optional_pub(cursor)
+    let name = directive_name(no_pub)
+
+    ret ParsedDirective{
+        directive_kind(no_pub),
+        is_public,
+        name,
+        no_pub.current.line,
+        no_pub.current.column
+    }
+}
+
+fn directive_meta_line(cursor: Cursor) -> str {
+    let is_public = match cursor.current.type {
+        KW_PUB => true
+        _ => false
+    }
+    let no_pub = consume_optional_pub(cursor)
+    let visibility = if (is_public) { "pub" } else { "priv" }
+    let kind = directive_kind_line_label(directive_kind(no_pub))
+    let name = directive_name(no_pub)
+    ret concat(
+        concat(
+            concat(kind, " "),
+            concat(visibility, " ")
+        ),
+        name
+    )
+}
+
+fn directive_name(no_pub: Cursor) -> str {
+    if (is_cimp_keyword(no_pub)) {
+        let after_kw = advance(no_pub)
+        ret first_import_segment(after_kw)
+    }
+    match no_pub.current.type {
+        KW_IMPORT => {
+            let after_kw = advance(no_pub)
+            ret first_import_segment(after_kw)
+        }
+        KW_STRUCT => {
+            ret identifier_after_keyword(no_pub)
+        }
+        KW_ENUM => {
+            ret identifier_after_keyword(no_pub)
+        }
+        KW_TRAIT => {
+            ret identifier_after_keyword(no_pub)
+        }
+        KW_IMPL => {
+            ret "<impl>"
+        }
+        KW_EXTERN => {
+            let after_extern = advance(no_pub)
+            let after_fn = skip_optional_unsafe(after_extern)
+            ret identifier_after_keyword(after_fn)
+        }
+        KW_UNSAFE => {
+            ret identifier_after_keyword(advance(no_pub))
+        }
+        KW_FN => {
+            ret identifier_after_keyword(no_pub)
+        }
+        _ => {
+            ret "<unknown>"
+        }
+    }
+}
+
+fn directive_kind(cursor: Cursor) -> ParsedDirectiveKind {
+    if (is_cimp_keyword(cursor)) {
+        ret ParsedDirectiveKind::CImport
+    }
+    match cursor.current.type {
+        KW_IMPORT => { ret ParsedDirectiveKind::Import }
+        KW_STRUCT => { ret ParsedDirectiveKind::Struct }
+        KW_ENUM => { ret ParsedDirectiveKind::Enum }
+        KW_TRAIT => { ret ParsedDirectiveKind::Trait }
+        KW_IMPL => { ret ParsedDirectiveKind::Impl }
+        KW_FN => { ret ParsedDirectiveKind::Function }
+        KW_EXTERN => { ret ParsedDirectiveKind::ExternFunction }
+        KW_UNSAFE => { ret ParsedDirectiveKind::UnsafeFunction }
+        _ => { ret ParsedDirectiveKind::Unknown }
+    }
+}
+
+fn directive_kind_line_label(kind: ParsedDirectiveKind) -> str {
+    match kind {
+        Import => { ret "import" }
+        CImport => { ret "cimp" }
+        Struct => { ret "struct" }
+        Enum => { ret "enum" }
+        Trait => { ret "trait" }
+        Impl => { ret "impl" }
+        Function => { ret "fn" }
+        ExternFunction => { ret "extern_fn" }
+        UnsafeFunction => { ret "unsafe_fn" }
+        Unknown => { ret "unknown" }
+    }
+}
+
 fn identifier_after_keyword(cursor: Cursor) -> str {
     let next = advance(cursor)
     match next.current.type {
@@ -1327,4 +2946,39 @@ fn skip_optional_unsafe(cursor: Cursor) -> Cursor {
             ret cursor
         }
     }
+}
+
+fn is_cimp_keyword(cursor: Cursor) -> bool {
+    match cursor.current.type {
+        IDENTIFIER => {
+            ret str_eq(cursor.current.value, "cimp")
+        }
+        _ => {
+            ret false
+        }
+    }
+}
+
+fn usize_to_str(value: usize) -> str {
+    if (value < 10_usize) {
+        ret digit_to_str(value)
+    }
+
+    let q = value / 10_usize
+    let r = value - q * 10_usize
+    ret concat(usize_to_str(q), digit_to_str(r))
+}
+
+fn digit_to_str(value: usize) -> str {
+    if (value == 0_usize) { ret "0" }
+    if (value == 1_usize) { ret "1" }
+    if (value == 2_usize) { ret "2" }
+    if (value == 3_usize) { ret "3" }
+    if (value == 4_usize) { ret "4" }
+    if (value == 5_usize) { ret "5" }
+    if (value == 6_usize) { ret "6" }
+    if (value == 7_usize) { ret "7" }
+    if (value == 8_usize) { ret "8" }
+    if (value == 9_usize) { ret "9" }
+    ret "?"
 }

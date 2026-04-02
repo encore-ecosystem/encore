@@ -8,12 +8,27 @@ from encore.frontend.lexer.tokens import TokenType
 from encore.frontend.parser import statements as s
 from encore.frontend.parser.statements import Statement_Import
 
+ASSIGNMENT_OPERATORS: dict[TokenType, str] = {
+    TokenType.OP_ASSIGN: "=",
+    TokenType.OP_PLUS_ASSIGN: "+=",
+    TokenType.OP_MINUS_ASSIGN: "-=",
+    TokenType.OP_MULT_ASSIGN: "*=",
+    TokenType.OP_DIV_ASSIGN: "/=",
+    TokenType.OP_MOD_ASSIGN: "%=",
+    TokenType.OP_AND_ASSIGN: "&=",
+    TokenType.OP_OR_ASSIGN: "|=",
+    TokenType.OP_XOR_ASSIGN: "^=",
+    TokenType.OP_LSHIFT_ASSIGN: "<<=",
+    TokenType.OP_RSHIFT_ASSIGN: ">>=",
+}
+
 
 class Parser:
     def parse(self, tokens: list[Token]) -> list[s.Statement]:
         self.tokens = tokens
         self.current_index = 0
         self._parsing_match_header = False
+        self._current_loop_depth = 0
 
         statements: list[s.Statement] = []
         while not self._is_at_end():
@@ -41,6 +56,10 @@ class Parser:
             return self._parse_struct_definition(is_public)
         elif curr_token.type == TokenType.KW_IMPORT:
             return self._parse_import(is_public)
+        elif curr_token.type == TokenType.IDENTIFIER and curr_token.value == "cimp":
+            return self._parse_cimport()
+        elif curr_token.type == TokenType.KW_UNSAFE:
+            return self._parse_unsafe_function_definition(is_public)
         elif curr_token.type == TokenType.KW_ENUM:
             return self._parse_enum(is_public)
         elif curr_token.type == TokenType.KW_TRAIT:
@@ -52,6 +71,13 @@ class Parser:
         self._safe_consume(TokenType.KW_IMPORT)
         imp = self._parse_import_path(default_leaf_kind=s.Statement_Import.ImportKind.PACKAGE)
         return s.Statement_Import(is_public=is_public, pair=imp)
+
+    def _parse_cimport(self) -> s.Statement_Import:
+        cimp_token = self._safe_consume(TokenType.IDENTIFIER)
+        if cimp_token.value != "cimp":
+            raise ValueError(f"Unexpected token: {cimp_token}, expected 'cimp'")
+        imp = self._parse_import_path(default_leaf_kind=s.Statement_Import.ImportKind.PACKAGE)
+        return s.Statement_Import(is_public=True, pair=imp)
 
     def _parse_import_path(self, default_leaf_kind: s.Statement_Import.ImportKind) -> Statement_Import.ImportPair:
         module = self._safe_consume(TokenType.IDENTIFIER).value
@@ -67,6 +93,8 @@ class Parser:
         match curr_token.type:
             case TokenType.OP_MULTIPLY:
                 self._consume()
+                if not self._is_at_end() and self._get_current_token().type == TokenType.OP_SCOPE:
+                    raise TypeError("Wildcard '*' must be terminal in import path")
                 return Statement_Import.ImportPair(
                     module,
                     [Statement_Import.ImportPair("*", [], s.Statement_Import.ImportKind.GLOB)],
@@ -95,7 +123,10 @@ class Parser:
         return s.Statement_StructureDefinition(is_public=is_public, defi=definition)
 
     def _parse_function_signature(
-        self, require_return_type: bool
+        self,
+        require_return_type: bool,
+        allow_self_param: bool = False,
+        self_param_type: Type | None = None,
     ) -> tuple[str, list[Type], list[Parameter], Type | None]:
         self._safe_consume(TokenType.KW_FN)
         func_name = self._safe_consume(TokenType.IDENTIFIER).value
@@ -104,11 +135,11 @@ class Parser:
 
         self._safe_consume(TokenType.LEFT_PAREN)
         if self._get_current_token().type != TokenType.RIGHT_PAREN:
-            params.append(self._parse_param())
+            params.append(self._parse_param(allow_self_param=allow_self_param, self_param_type=self_param_type))
 
         while self._get_current_token().type != TokenType.RIGHT_PAREN:
             self._safe_consume(TokenType.COMMA)
-            params.append(self._parse_param())
+            params.append(self._parse_param(allow_self_param=allow_self_param, self_param_type=self_param_type))
         self._safe_consume(TokenType.RIGHT_PAREN)
 
         fn_type = None
@@ -120,9 +151,15 @@ class Parser:
 
         return func_name, generics, params, fn_type
 
-    def _parse_function_definition(self, is_public: bool) -> s.Statement_FunctionDefinition:
-        func_name, generics, params, fn_type = self._parse_function_signature(require_return_type=False)
-        body = self._parse_block()
+    def _parse_function_definition(
+        self, is_public: bool, allow_self_param: bool = False, self_param_type: Type | None = None
+    ) -> s.Statement_FunctionDefinition:
+        func_name, generics, params, fn_type = self._parse_function_signature(
+            require_return_type=False,
+            allow_self_param=allow_self_param,
+            self_param_type=self_param_type,
+        )
+        body = self._parse_block(loop_depth=0)
 
         return s.Statement_FunctionDefinition(
             is_public=is_public,
@@ -135,6 +172,8 @@ class Parser:
 
     def _parse_extern_function_definition(self, is_public: bool) -> s.Statement_ExternFunctionDefinition:
         self._safe_consume(TokenType.KW_EXTERN)
+        if self._get_current_token().type == TokenType.KW_UNSAFE:
+            self._safe_consume(TokenType.KW_UNSAFE)
         func_name, generics, params, fn_type = self._parse_function_signature(require_return_type=True)
         assert fn_type is not None
         return s.Statement_ExternFunctionDefinition(
@@ -145,6 +184,10 @@ class Parser:
             type=fn_type,
         )
 
+    def _parse_unsafe_function_definition(self, is_public: bool) -> s.Statement_FunctionDefinition:
+        self._safe_consume(TokenType.KW_UNSAFE)
+        return self._parse_function_definition(is_public=is_public)
+
     def _parse_trait(self, is_public: bool) -> s.Statement_Trait:
         self._safe_consume(TokenType.KW_TRAIT)
         name = self._safe_consume(TokenType.IDENTIFIER).value
@@ -153,7 +196,9 @@ class Parser:
         body: list[s.TraitMethodDeclaration] = []
         self._safe_consume(TokenType.LEFT_BRACE)
         while self._get_current_token().type != TokenType.RIGHT_BRACE:
-            method_name, method_generics, params, method_type = self._parse_function_signature(require_return_type=True)
+            method_name, method_generics, params, method_type = self._parse_function_signature(
+                require_return_type=True, allow_self_param=True, self_param_type=Type("Self")
+            )
             assert method_type is not None
             body.append(
                 s.TraitMethodDeclaration(
@@ -237,7 +282,7 @@ class Parser:
                 if self._get_current_token().type == TokenType.KW_PUB:
                     self._safe_consume(TokenType.KW_PUB)
                     is_public = True
-                body.append(self._parse_function_definition(is_public))
+                body.append(self._parse_function_definition(is_public, allow_self_param=True, self_param_type=struct))
             self._safe_consume(TokenType.RIGHT_BRACE)
 
         return s.Statement_Impl(
@@ -280,15 +325,22 @@ class Parser:
     #         type=fn_type,
     #     )
 
-    def _parse_block(self) -> list[s.Statement_InnerLevel]:
+    def _parse_block(self, loop_depth: int = 0) -> list[s.Statement_InnerLevel]:
+        prev_loop_depth = self._current_loop_depth
+        self._current_loop_depth = loop_depth
         self._safe_consume(TokenType.LEFT_BRACE)
         statements: list[s.Statement_InnerLevel] = []
-        while self._get_current_token().type != TokenType.RIGHT_BRACE:
-            statements.append(self._parse_inner_level())
-        self._safe_consume(TokenType.RIGHT_BRACE)
-        return statements
+        try:
+            while self._get_current_token().type != TokenType.RIGHT_BRACE:
+                statements.append(self._parse_inner_level(loop_depth=loop_depth))
+            self._safe_consume(TokenType.RIGHT_BRACE)
+            return statements
+        finally:
+            self._current_loop_depth = prev_loop_depth
 
-    def _parse_inner_level(self) -> s.Statement_InnerLevel:
+    def _parse_inner_level(self, loop_depth: int | None = None) -> s.Statement_InnerLevel:
+        if loop_depth is None:
+            loop_depth = self._current_loop_depth
         curr_token = self._get_current_token()
 
         if curr_token.type == TokenType.KW_RET:
@@ -296,24 +348,28 @@ class Parser:
         if curr_token.type == TokenType.KW_LET:
             return self._parse_let()
         if curr_token.type == TokenType.KW_DO:
-            return self._parse_do_while()
+            return self._parse_do_while(loop_depth=loop_depth)
         if curr_token.type == TokenType.KW_WHILE:
-            return self._parse_while()
+            return self._parse_while(loop_depth=loop_depth)
         if curr_token.type == TokenType.KW_LOOP:
-            return self._parse_loop()
+            return self._parse_loop(loop_depth=loop_depth)
         if curr_token.type == TokenType.KW_IF:
-            return self._parse_if_block()
+            return self._parse_if_block(loop_depth=loop_depth)
         if curr_token.type == TokenType.KW_MATCH:
-            return self._parse_match()
+            return self._parse_match(loop_depth=loop_depth)
         if curr_token.type == TokenType.KW_UNSAFE:
-            return self._parse_unsafe_block()
+            return self._parse_unsafe_block(loop_depth=loop_depth)
         if curr_token.type == TokenType.KW_BREAK:
+            if loop_depth <= 0:
+                raise TypeError("'break' is only allowed inside loop bodies")
             return self._parse_break()
         if curr_token.type == TokenType.KW_CONTINUE:
+            if loop_depth <= 0:
+                raise TypeError("'continue' is only allowed inside loop bodies")
             return self._parse_continue()
         if curr_token.type == TokenType.IDENTIFIER:
             target = self._parse_expression()
-            if self._get_current_token().type == TokenType.OP_ASSIGN:
+            if self._is_assignment_operator(self._get_current_token().type):
                 return self._parse_assignment(target)
             return s.Statement_Expr(target)
 
@@ -324,15 +380,15 @@ class Parser:
         expr = self._parse_expression()
         return s.Statement_Ret(expr=expr)
 
-    def _parse_while(self) -> s.Statement_While:
+    def _parse_while(self, loop_depth: int = 0) -> s.Statement_While:
         self._safe_consume(TokenType.KW_WHILE)
         expr = self._parse_expression()
-        body = self._parse_block()
+        body = self._parse_block(loop_depth=loop_depth + 1)
         return s.Statement_While(expr, body)
 
-    def _parse_loop(self) -> s.Statement_Loop:
+    def _parse_loop(self, loop_depth: int = 0) -> s.Statement_Loop:
         self._safe_consume(TokenType.KW_LOOP)
-        body = self._parse_block()
+        body = self._parse_block(loop_depth=loop_depth + 1)
         return s.Statement_Loop(body)
 
     def _parse_break(self):
@@ -343,25 +399,27 @@ class Parser:
         self._safe_consume(TokenType.KW_CONTINUE)
         return s.Statement_Continue()
 
-    def _parse_do_while(self) -> s.Statement_DoWhile:
+    def _parse_do_while(self, loop_depth: int = 0) -> s.Statement_DoWhile:
         self._safe_consume(TokenType.KW_DO)
-        body = self._parse_block()
+        body = self._parse_block(loop_depth=loop_depth + 1)
         self._safe_consume(TokenType.KW_WHILE)
         expr = self._parse_expression()
         return s.Statement_DoWhile(body, expr)
 
-    def _parse_if_block(self):
+    def _parse_if_block(self, loop_depth: int = 0):
         self._safe_consume(TokenType.KW_IF)
-        branches = [s.Statement_IfBranch(expr=self._parse_expression(), body=self._parse_block())]
+        branches = [s.Statement_IfBranch(expr=self._parse_expression(), body=self._parse_block(loop_depth=loop_depth))]
 
         while not self._is_at_end() and self._get_current_token().type == TokenType.KW_ELIF:
             self._safe_consume(TokenType.KW_ELIF)
-            branches.append(s.Statement_IfBranch(expr=self._parse_expression(), body=self._parse_block()))
+            branches.append(
+                s.Statement_IfBranch(expr=self._parse_expression(), body=self._parse_block(loop_depth=loop_depth))
+            )
 
         else_body = None
         if not self._is_at_end() and self._get_current_token().type == TokenType.KW_ELSE:
             self._safe_consume(TokenType.KW_ELSE)
-            else_body = self._parse_block()
+            else_body = self._parse_block(loop_depth=loop_depth)
 
         return s.Statement_If(branches=branches, else_body=else_body)
 
@@ -380,7 +438,7 @@ class Parser:
         else_body = self._parse_expression_block()
         return s.Expression_If(branches=branches, else_body=else_body)
 
-    def _parse_match(self) -> s.Statement_Match:
+    def _parse_match(self, loop_depth: int = 0) -> s.Statement_Match:
         self._safe_consume(TokenType.KW_MATCH)
         self._parsing_match_header = True
         expr = self._parse_expression()
@@ -388,11 +446,11 @@ class Parser:
         self._safe_consume(TokenType.LEFT_BRACE)
         arms: list[s.Statement_MatchArm] = []
         while self._get_current_token().type != TokenType.RIGHT_BRACE:
-            arms.append(self._parse_match_arm())
+            arms.append(self._parse_match_arm(loop_depth=loop_depth))
         self._safe_consume(TokenType.RIGHT_BRACE)
         return s.Statement_Match(expr=expr, arms=arms)
 
-    def _parse_match_arm(self) -> s.Statement_MatchArm:
+    def _parse_match_arm(self, loop_depth: int = 0) -> s.Statement_MatchArm:
         pattern = None
         if self._get_current_token().type == TokenType.IDENTIFIER and self._get_current_token().value == "_":
             self._unsafe_consume()
@@ -404,7 +462,7 @@ class Parser:
             binding = self._safe_consume(TokenType.IDENTIFIER).value
             self._safe_consume(TokenType.RIGHT_PAREN)
         self._safe_consume(TokenType.OP_FAT_ARROW)
-        body = self._parse_block()
+        body = self._parse_block(loop_depth=loop_depth)
         return s.Statement_MatchArm(pattern=pattern, binding=binding, body=body)
 
     def _parse_match_expression(self) -> s.Expression_Match:
@@ -419,9 +477,9 @@ class Parser:
         self._safe_consume(TokenType.RIGHT_BRACE)
         return s.Expression_Match(expr=expr, arms=arms)
 
-    def _parse_unsafe_block(self) -> s.Statement_Unsafe:
+    def _parse_unsafe_block(self, loop_depth: int = 0) -> s.Statement_Unsafe:
         self._safe_consume(TokenType.KW_UNSAFE)
-        body = self._parse_block()
+        body = self._parse_block(loop_depth=loop_depth)
         return s.Statement_Unsafe(body=body)
 
     def _parse_unsafe_expression(self) -> s.Expression_Unsafe:
@@ -589,6 +647,14 @@ class Parser:
         expr = self._parse_primary()
         while not self._is_at_end():
             token = self._get_current_token()
+            if token.type == TokenType.LEFT_PAREN:
+                if not isinstance(expr, s.Expression_Path):
+                    raise TypeError(f"Call target must be a path expression, got: {expr}")
+                expr = self._parse_call(expr)
+                continue
+            if token.type == TokenType.DOT:
+                expr = self._parse_dotted_postfix(expr)
+                continue
             if token.type == TokenType.OP_TRY:
                 self._unsafe_consume()
                 expr = s.Expression_Try(expr=expr)
@@ -662,15 +728,49 @@ class Parser:
             generics = list(last_segment.generics)
             callee = s.Expression_Path([*callee.segments[:-1], replace(last_segment, generics=[])])
 
+        args = self._parse_call_args()
+        return s.Expression_Call(callee, generics, args)
+
+    def _parse_call_args(self) -> list[s.Statement_Expression]:
         self._safe_consume(TokenType.LEFT_PAREN)
-        args = []
+        args: list[s.Statement_Expression] = []
         if self._get_current_token().type != TokenType.RIGHT_PAREN:
             args.append(self._parse_expression())
         while self._get_current_token().type != TokenType.RIGHT_PAREN:
             self._safe_consume(TokenType.COMMA)
             args.append(self._parse_expression())
         self._safe_consume(TokenType.RIGHT_PAREN)
-        return s.Expression_Call(callee, generics, args)
+        return args
+
+    def _build_struct_field(self, receiver: s.Statement_Expression, field: str) -> s.Expression_StructField:
+        if isinstance(receiver, s.Expression_Path):
+            return s.Expression_StructField(receiver.name, field)
+        if isinstance(receiver, s.Expression_StructField):
+            return s.Expression_StructField(f"{receiver.name}.{receiver.field}", field)
+        raise TypeError(f"Field access is supported only for paths/fields, got: {receiver}")
+
+    def _parse_dotted_postfix(self, base: s.Statement_Expression) -> s.Statement_Expression:
+        expr = base
+        while not self._is_at_end() and self._get_current_token().type == TokenType.DOT:
+            self._safe_consume(TokenType.DOT)
+            member = self._safe_consume(TokenType.IDENTIFIER).value
+            member_generics = (
+                self._parse_generics_args() if self._get_current_token().type == TokenType.LEFT_BRACKET else []
+            )
+
+            if not self._is_at_end() and self._get_current_token().type == TokenType.LEFT_PAREN:
+                expr = s.Expression_MethodCall(
+                    receiver=expr,
+                    method=member,
+                    generics=member_generics,
+                    args=self._parse_call_args(),
+                )
+                continue
+
+            if member_generics:
+                raise TypeError(f"Field '{member}' cannot have generic arguments")
+            expr = self._build_struct_field(expr, member)
+        return expr
 
     def _parse_path(self) -> s.Expression_Path:
         segments = [self._parse_type()]
@@ -705,7 +805,6 @@ class Parser:
                 self._consume()
                 return s.Expression_BooleanLiteral(curr_token.value == "true")
             first = self._parse_type()
-            symbol = str(first)
             segments = [first]
             while self._get_current_token().type == TokenType.OP_SCOPE:
                 self._safe_consume(TokenType.OP_SCOPE)
@@ -713,27 +812,21 @@ class Parser:
                 segments.append(segment)
             path = s.Expression_Path(segments)
 
-            match self._get_current_token().type:
-                case TokenType.LEFT_BRACE:
-                    if self._parsing_match_header:
-                        return path
-                    return self._parse_struct_initialization(first)
-                case TokenType.DOT:
-                    field = self._parse_struct_field(symbol)
-                    while not self._is_at_end() and self._get_current_token().type == TokenType.DOT:
-                        field = self._parse_struct_field(f"{field.name}.{field.field}")
-                    return field
-                case TokenType.LEFT_PAREN:
-                    return self._parse_call(path)
-                case _:
+            if self._get_current_token().type == TokenType.LEFT_BRACE:
+                if self._parsing_match_header:
                     return path
+                return self._parse_struct_initialization(first)
+            return path
 
         raise TypeError(f"Unable to parse primary expression, got: {curr_token}")
 
     def _parse_assignment(self, target: s.Statement_Expression) -> s.Statement_Assignment:
-        self._safe_consume(TokenType.OP_ASSIGN)
+        curr_token = self._get_current_token()
+        if not self._is_assignment_operator(curr_token.type):
+            raise TypeError(f"Unexpected token: {curr_token}, expected assignment operator")
+        self._consume()
         expr = self._parse_expression()
-        return s.Statement_Assignment(target=target, expr=expr)
+        return s.Statement_Assignment(target=target, expr=expr, operator=ASSIGNMENT_OPERATORS[curr_token.type])
 
     def _parse_let(self) -> s.Statement_Let:
         self._safe_consume(TokenType.KW_LET)
@@ -789,8 +882,35 @@ class Parser:
             pointer.type == TokenType.IDENTIFIER and pointer.value in ("H", "S") and closer.type == TokenType.OP_GREATER
         )
 
-    def _parse_param(self) -> Parameter:
+    def _parse_param(self, allow_self_param: bool = False, self_param_type: Type | None = None) -> Parameter:
+        curr = self._get_current_token()
+        if allow_self_param and curr.type == TokenType.IDENTIFIER and curr.value == "mut" and not self._is_at_end():
+            try:
+                maybe_self = self._peek_token(1)
+                maybe_delim = self._peek_token(2)
+            except ValueError:
+                maybe_self = None
+                maybe_delim = None
+
+            if (
+                maybe_self is not None
+                and maybe_delim is not None
+                and maybe_self.type == TokenType.IDENTIFIER
+                and maybe_self.value == "self"
+                and maybe_delim.type in {TokenType.COMMA, TokenType.RIGHT_PAREN}
+            ):
+                self._safe_consume(TokenType.IDENTIFIER)  # mut
+                self._safe_consume(TokenType.IDENTIFIER)  # self
+                return Parameter("self", self_param_type or Type("Self"))
+
         name = self._safe_consume(TokenType.IDENTIFIER).value
+        if (
+            allow_self_param
+            and curr.type == TokenType.IDENTIFIER
+            and name == "self"
+            and self._get_current_token().type in {TokenType.COMMA, TokenType.RIGHT_PAREN}
+        ):
+            return Parameter("self", self_param_type or Type("Self"))
         self._safe_consume(TokenType.COLON)
         type = self._parse_type()
         return Parameter(name, type)
@@ -851,11 +971,15 @@ class Parser:
         saved_index = self.current_index
         try:
             self._parse_expression()
-            return not self._is_at_end() and self._get_current_token().type == TokenType.OP_ASSIGN
+            return not self._is_at_end() and self._is_assignment_operator(self._get_current_token().type)
         except Exception:
             return False
         finally:
             self.current_index = saved_index
+
+    @staticmethod
+    def _is_assignment_operator(token_type: TokenType) -> bool:
+        return token_type in ASSIGNMENT_OPERATORS
 
     def _is_at_end(self) -> bool:
         return self.current_index >= len(self.tokens)

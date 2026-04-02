@@ -1,0 +1,829 @@
+import std::os::file_exists
+import std::os::read_file
+import std::string::len
+import std::string::slice
+import std::string::concat
+import std::string::byte_at
+import std::string::str_eq
+import repo::frontend::parser::parse
+import repo::frontend::parser::ParseOutcome
+
+pub struct ImportGraphResult {
+    outline: str
+    unresolved: usize
+    unresolved_outline: str
+}
+
+struct ImportGraphProgress {
+    outline: str
+    unresolved: usize
+    unresolved_outline: str
+    visited_modules: str
+}
+
+struct ImportResolution {
+    target: str
+    unresolved: bool
+}
+
+struct MaybePath {
+    found: bool
+    path: str
+    scope: str
+}
+
+struct ModuleExports {
+    symbols_outline: str
+    has_wildcard_reexport: bool
+}
+
+pub fn build_import_graph(
+    source_path: str, bindings_outline: str, dependency_roots_outline: str, dependency_paths_outline: str
+) -> ImportGraphResult {
+    let source_dir = dirname(source_path)
+    let progress = build_import_graph_from(
+        bindings_outline, source_dir, dependency_roots_outline, dependency_paths_outline, 0_usize, "", 0_usize, "", source_path
+    )
+    ret ImportGraphResult{progress.outline, progress.unresolved, progress.unresolved_outline}
+}
+
+fn build_import_graph_from(
+    lines: str,
+    source_dir: str,
+    dependency_roots_outline: str,
+    dependency_paths_outline: str,
+    index: usize,
+    outline: str,
+    unresolved: usize,
+    unresolved_outline: str,
+    visited_modules: str
+) -> ImportGraphProgress {
+    if (index >= len(lines)) {
+        ret ImportGraphProgress{outline, unresolved, unresolved_outline, visited_modules}
+    }
+
+    let line_end = find_line_end(lines, index)
+    let line = slice(lines, index, line_end - index)
+    let next_index = next_line_index(lines, line_end)
+
+    if (len(line) == 0_usize) {
+        ret build_import_graph_from(
+            lines,
+            source_dir,
+            dependency_roots_outline,
+            dependency_paths_outline,
+            next_index,
+            outline,
+            unresolved,
+            unresolved_outline,
+            visited_modules
+        )
+    }
+
+    let resolved = resolve_import_binding(
+        source_dir, dependency_roots_outline, dependency_paths_outline, line, visited_modules
+    )
+    let mapped = concat(concat(concat(line, " -> "), resolved.target), "")
+    let next_outline = append_lines(outline, mapped)
+    let next_unresolved = if (resolved.unresolved) { unresolved + 1_usize } else { unresolved }
+    let next_unresolved_outline = if (resolved.unresolved) {
+        append_lines(unresolved_outline, mapped)
+    } else {
+        unresolved_outline
+    }
+
+    let next_progress = ImportGraphProgress{next_outline, next_unresolved, next_unresolved_outline, visited_modules}
+    if (is_local_target(resolved.target)) {
+        let local_path = local_target_path(resolved.target)
+        if (len(local_path) > 0_usize) {
+            if (not contains_line(next_progress.visited_modules, local_path)) {
+                let nested_bindings = collect_module_bindings_outline(local_path)
+                let nested_progress = build_import_graph_from(
+                    nested_bindings,
+                    dirname(local_path),
+                    dependency_roots_outline,
+                    dependency_paths_outline,
+                    0_usize,
+                    next_progress.outline,
+                    next_progress.unresolved,
+                    next_progress.unresolved_outline,
+                    append_lines(next_progress.visited_modules, local_path)
+                )
+                ret build_import_graph_from(
+                    lines,
+                    source_dir,
+                    dependency_roots_outline,
+                    dependency_paths_outline,
+                    next_index,
+                    nested_progress.outline,
+                    nested_progress.unresolved,
+                    nested_progress.unresolved_outline,
+                    nested_progress.visited_modules
+                )
+            }
+        }
+    }
+
+    ret build_import_graph_from(
+        lines,
+        source_dir,
+        dependency_roots_outline,
+        dependency_paths_outline,
+        next_index,
+        next_progress.outline,
+        next_progress.unresolved,
+        next_progress.unresolved_outline,
+        next_progress.visited_modules
+    )
+}
+
+fn resolve_import_binding(
+    source_dir: str,
+    dependency_roots_outline: str,
+    dependency_paths_outline: str,
+    binding: str,
+    visited_modules: str
+) -> ImportResolution {
+    if (starts_with(binding, "refrain::")) {
+        ret resolve_refrain_binding(
+            source_dir, dependency_roots_outline, dependency_paths_outline, binding, visited_modules
+        )
+    }
+
+    let local = resolve_local_binding(source_dir, binding)
+    if (local.found) {
+        if (local_binding_symbol_resolved(
+            local.path, binding, local.scope, dependency_roots_outline, dependency_paths_outline, visited_modules
+        )) {
+            ret ImportResolution{concat("local:", local.path), false}
+        }
+        ret ImportResolution{concat("unresolved_symbol:", binding), true}
+    }
+
+    let root = first_scope_segment(binding)
+    if (len(root) == 0_usize) {
+        ret ImportResolution{"unresolved:<empty>", true}
+    }
+    if (contains_line(dependency_roots_outline, root)) {
+        ret ImportResolution{concat("refrain:", root), false}
+    }
+    ret ImportResolution{concat("unresolved:", root), true}
+}
+
+fn resolve_refrain_binding(
+    source_dir: str,
+    dependency_roots_outline: str,
+    dependency_paths_outline: str,
+    binding: str,
+    visited_modules: str
+) -> ImportResolution {
+    let suffix = slice(binding, 9_usize, len(binding) - 9_usize)
+    if (len(suffix) == 0_usize) {
+        ret ImportResolution{"unresolved:refrain::<empty>", true}
+    }
+
+    let project_root = find_project_root(source_dir)
+    if (len(project_root) > 0_usize) {
+        let project_src = concat(project_root, "/src")
+        let local_absolute = resolve_local_binding(project_src, suffix)
+        if (local_absolute.found) {
+            if (local_binding_symbol_resolved(
+                local_absolute.path,
+                suffix,
+                local_absolute.scope,
+                dependency_roots_outline,
+                dependency_paths_outline,
+                visited_modules
+            )) {
+                ret ImportResolution{concat("local:", local_absolute.path), false}
+            }
+            ret ImportResolution{concat("unresolved_symbol:refrain::", suffix), true}
+        }
+    }
+
+    let root = first_scope_segment(suffix)
+    if (len(root) == 0_usize) {
+        ret ImportResolution{"unresolved:refrain::<empty>", true}
+    }
+    if (not contains_line(dependency_roots_outline, root)) {
+        ret ImportResolution{concat("unresolved:refrain::", root), true}
+    }
+
+    let root_path = dependency_root_path(dependency_paths_outline, root)
+    if (len(root_path) == 0_usize) {
+        ret ImportResolution{concat("refrain:", root), false}
+    }
+
+    let tail = scope_tail(suffix)
+    if (len(tail) == 0_usize) {
+        ret ImportResolution{concat("refrain:", root), false}
+    }
+
+    let root_src = concat(root_path, "/src")
+    let local = resolve_local_binding(root_src, tail)
+    if (not local.found) {
+        let root_lib = concat(root_src, "/lib.enq")
+        if (file_exists(root_lib)) {
+            if (local_binding_symbol_resolved(
+                root_lib, tail, "", dependency_roots_outline, dependency_paths_outline, visited_modules
+            )) {
+                ret ImportResolution{concat("refrain:", root), false}
+            }
+            ret ImportResolution{concat("unresolved_symbol:refrain::", suffix), true}
+        }
+        ret ImportResolution{concat("unresolved:refrain::", suffix), true}
+    }
+    if (local_binding_symbol_resolved(
+        local.path, tail, local.scope, dependency_roots_outline, dependency_paths_outline, visited_modules
+    )) {
+        ret ImportResolution{concat("refrain:", root), false}
+    }
+    ret ImportResolution{concat("unresolved_symbol:refrain::", suffix), true}
+}
+
+fn find_project_root(start_dir: str) -> str {
+    if (len(start_dir) == 0_usize) {
+        ret ""
+    }
+
+    let manifest = concat(start_dir, "/encore.toml")
+    if (file_exists(manifest)) {
+        ret start_dir
+    }
+
+    let parent = dirname(start_dir)
+    if (str_eq(parent, start_dir)) {
+        ret ""
+    }
+    ret find_project_root(parent)
+}
+
+fn resolve_local_binding(source_dir: str, binding: str) -> MaybePath {
+    ret resolve_local_binding_chain(source_dir, binding)
+}
+
+fn resolve_local_binding_chain(source_dir: str, scope: str) -> MaybePath {
+    if (len(scope) == 0_usize) {
+        ret none_path()
+    }
+
+    let local = resolve_local_scope_once(source_dir, scope)
+    if (local.found) {
+        ret local
+    }
+
+    ret resolve_local_binding_chain(source_dir, scope_parent(scope))
+}
+
+fn resolve_local_scope_once(source_dir: str, scope: str) -> MaybePath {
+    let as_path = scope_to_path(scope)
+
+    let direct_file = concat(concat(source_dir, "/"), concat(as_path, ".enq"))
+    if (file_exists(direct_file)) {
+        ret some_path(direct_file, scope)
+    }
+
+    let direct_mod = concat(concat(concat(source_dir, "/"), as_path), "/mod.enq")
+    if (file_exists(direct_mod)) {
+        ret some_path(direct_mod, scope)
+    }
+
+    ret none_path()
+}
+
+fn dirname(path: str) -> str {
+    if (len(path) == 0_usize) {
+        ret "."
+    }
+
+    let slash = find_last_slash(path, len(path))
+    if (slash >= 1000000_usize) {
+        ret "."
+    }
+    if (slash == 0_usize) {
+        ret "/"
+    }
+    ret slice(path, 0_usize, slash)
+}
+
+fn find_last_slash(path: str, index: usize) -> usize {
+    if (index == 0_usize) {
+        ret 1000000_usize
+    }
+
+    let i = index - 1_usize
+    if (byte_at(path, i) == 47) {
+        ret i
+    }
+    ret find_last_slash(path, i)
+}
+
+fn starts_with(value: str, prefix: str) -> bool {
+    let prefix_len = len(prefix)
+    if (prefix_len > len(value)) {
+        ret false
+    }
+    ret str_eq(slice(value, 0_usize, prefix_len), prefix)
+}
+
+fn is_local_target(target: str) -> bool {
+    ret starts_with(target, "local:")
+}
+
+fn local_target_path(target: str) -> str {
+    if (not is_local_target(target)) {
+        ret ""
+    }
+    let prefix_len = 6_usize
+    if (len(target) < prefix_len) {
+        ret ""
+    }
+    ret slice(target, prefix_len, len(target) - prefix_len)
+}
+
+fn collect_module_bindings_outline(module_path: str) -> str {
+    if (not file_exists(module_path)) {
+        ret ""
+    }
+
+    let source = read_file(module_path)
+    let parsed = parse(source)
+    match parsed {
+        Success(module) => {
+            ret module.import_bindings_outline
+        }
+        Failure(error) => {
+            ret ""
+        }
+    }
+}
+
+fn collect_module_exports(
+    module_path: str, dependency_roots_outline: str, dependency_paths_outline: str, visited_modules: str
+) -> ModuleExports {
+    if (not file_exists(module_path)) {
+        ret ModuleExports{"", false}
+    }
+    if (contains_line(visited_modules, module_path)) {
+        ret ModuleExports{"", false}
+    }
+
+    let source = read_file(module_path)
+    let parsed = parse(source)
+    match parsed {
+        Success(module) => {
+            let module_dir = dirname(module_path)
+            let next_visited = append_lines(visited_modules, module_path)
+            let pub_direct = collect_public_direct_exports(module.directives_meta_outline)
+            let cimp_exports = collect_resolved_exports_from_bindings(
+                module.cimport_bindings_outline,
+                module_dir,
+                dependency_roots_outline,
+                dependency_paths_outline,
+                next_visited
+            )
+            let pub_import_exports = collect_resolved_exports_from_bindings(
+                module.public_import_bindings_outline,
+                module_dir,
+                dependency_roots_outline,
+                dependency_paths_outline,
+                next_visited
+            )
+            let merged_symbols = append_lines(pub_direct, append_lines(cimp_exports.symbols_outline, pub_import_exports.symbols_outline))
+            let merged_wildcard = if (cimp_exports.has_wildcard_reexport) {
+                true
+            } else {
+                pub_import_exports.has_wildcard_reexport
+            }
+            ret ModuleExports{merged_symbols, merged_wildcard}
+        }
+        Failure(error) => {
+            ret ModuleExports{"", false}
+        }
+    }
+}
+
+fn local_binding_symbol_resolved(
+    module_path: str,
+    binding: str,
+    matched_scope: str,
+    dependency_roots_outline: str,
+    dependency_paths_outline: str,
+    visited_modules: str
+) -> bool {
+    if (is_glob_binding(binding)) {
+        ret true
+    }
+    if (str_eq(binding, matched_scope)) {
+        ret true
+    }
+
+    let expected = last_scope_segment(binding)
+    if (len(expected) == 0_usize) {
+        ret true
+    }
+
+    let exports = collect_module_exports(module_path, dependency_roots_outline, dependency_paths_outline, visited_modules)
+    if (contains_line(exports.symbols_outline, expected)) {
+        ret true
+    }
+    ret exports.has_wildcard_reexport
+}
+
+fn collect_public_direct_exports(meta_outline: str) -> str {
+    ret collect_public_direct_exports_from(meta_outline, 0_usize, "")
+}
+
+fn collect_public_direct_exports_from(meta_outline: str, index: usize, acc: str) -> str {
+    if (index >= len(meta_outline)) {
+        ret acc
+    }
+
+    let line_end = find_line_end(meta_outline, index)
+    let line = slice(meta_outline, index, line_end - index)
+    let next_index = next_line_index(meta_outline, line_end)
+    if (len(line) == 0_usize) {
+        ret collect_public_direct_exports_from(meta_outline, next_index, acc)
+    }
+
+    let kind = line_token(line, 0_usize)
+    let visibility = line_token(line, 1_usize)
+    let name = line_token(line, 2_usize)
+
+    let is_pub: bool = str_eq(visibility, "pub")
+    let is_export_kind: bool = is_direct_export_kind(kind)
+    let is_valid_name: bool = is_valid_export_name(name)
+    let next_acc = if (is_pub) {
+        if (is_export_kind) {
+            if (is_valid_name) {
+                append_lines(acc, name)
+            } else {
+                acc
+            }
+        } else {
+            acc
+        }
+    } else {
+        acc
+    }
+    ret collect_public_direct_exports_from(meta_outline, next_index, next_acc)
+}
+
+fn is_direct_export_kind(kind: str) -> bool {
+    if (str_eq(kind, "import")) {
+        ret false
+    }
+    if (str_eq(kind, "cimp")) {
+        ret false
+    }
+    if (str_eq(kind, "impl")) {
+        ret false
+    }
+    if (str_eq(kind, "unknown")) {
+        ret false
+    }
+    ret true
+}
+
+fn is_valid_export_name(name: str) -> bool {
+    if (len(name) == 0_usize) {
+        ret false
+    }
+    if (str_eq(name, "<unknown>")) {
+        ret false
+    }
+    if (str_eq(name, "<impl>")) {
+        ret false
+    }
+    ret true
+}
+
+fn collect_resolved_exports_from_bindings(
+    bindings_outline: str,
+    source_dir: str,
+    dependency_roots_outline: str,
+    dependency_paths_outline: str,
+    visited_modules: str
+) -> ModuleExports {
+    ret collect_resolved_exports_from_bindings_from(
+        bindings_outline, source_dir, dependency_roots_outline, dependency_paths_outline, visited_modules, 0_usize, "", false
+    )
+}
+
+fn collect_resolved_exports_from_bindings_from(
+    bindings_outline: str,
+    source_dir: str,
+    dependency_roots_outline: str,
+    dependency_paths_outline: str,
+    visited_modules: str,
+    index: usize,
+    acc: str,
+    has_wildcard: bool
+) -> ModuleExports {
+    if (index >= len(bindings_outline)) {
+        ret ModuleExports{acc, has_wildcard}
+    }
+
+    let line_end = find_line_end(bindings_outline, index)
+    let line = slice(bindings_outline, index, line_end - index)
+    let next_index = next_line_index(bindings_outline, line_end)
+    if (len(line) == 0_usize) {
+        ret collect_resolved_exports_from_bindings_from(
+            bindings_outline,
+            source_dir,
+            dependency_roots_outline,
+            dependency_paths_outline,
+            visited_modules,
+            next_index,
+            acc,
+            has_wildcard
+        )
+    }
+
+    let resolved = resolve_import_binding(
+        source_dir, dependency_roots_outline, dependency_paths_outline, line, visited_modules
+    )
+    if (resolved.unresolved) {
+        ret collect_resolved_exports_from_bindings_from(
+            bindings_outline,
+            source_dir,
+            dependency_roots_outline,
+            dependency_paths_outline,
+            visited_modules,
+            next_index,
+            acc,
+            has_wildcard
+        )
+    }
+
+    if (is_glob_binding(line)) {
+        ret collect_resolved_exports_from_bindings_from(
+            bindings_outline,
+            source_dir,
+            dependency_roots_outline,
+            dependency_paths_outline,
+            visited_modules,
+            next_index,
+            acc,
+            true
+        )
+    }
+
+    let leaf = last_scope_segment(line)
+    let next_acc = if (len(leaf) > 0_usize) { append_lines(acc, leaf) } else { acc }
+    ret collect_resolved_exports_from_bindings_from(
+        bindings_outline,
+        source_dir,
+        dependency_roots_outline,
+        dependency_paths_outline,
+        visited_modules,
+        next_index,
+        next_acc,
+        has_wildcard
+    )
+}
+
+fn first_scope_segment(path: str) -> str {
+    let sep = find_first_scope_sep(path, 0_usize)
+    if (sep >= len(path)) {
+        ret path
+    }
+    ret slice(path, 0_usize, sep)
+}
+
+fn scope_tail(path: str) -> str {
+    let sep = find_first_scope_sep(path, 0_usize)
+    if (sep >= len(path)) {
+        ret ""
+    }
+    let start = sep + 2_usize
+    if (start >= len(path)) {
+        ret ""
+    }
+    ret slice(path, start, len(path) - start)
+}
+
+fn scope_parent(path: str) -> str {
+    let sep = find_last_scope_sep(path, 0_usize, 1000000_usize)
+    if (sep >= 1000000_usize) {
+        ret ""
+    }
+    ret slice(path, 0_usize, sep)
+}
+
+fn dependency_root_path(paths_outline: str, root: str) -> str {
+    ret dependency_root_path_from(paths_outline, root, 0_usize)
+}
+
+fn dependency_root_path_from(paths_outline: str, root: str, index: usize) -> str {
+    if (index >= len(paths_outline)) {
+        ret ""
+    }
+
+    let line_end = find_line_end(paths_outline, index)
+    let line = slice(paths_outline, index, line_end - index)
+    let next_index = next_line_index(paths_outline, line_end)
+    if (len(line) == 0_usize) {
+        ret dependency_root_path_from(paths_outline, root, next_index)
+    }
+
+    let eq: usize = find_char(line, 61, 0_usize)
+    if (eq < len(line)) {
+        let name = slice(line, 0_usize, eq)
+        if (str_eq(name, root)) {
+            let value_start = eq + 1_usize
+            if (value_start >= len(line)) {
+                ret ""
+            }
+            ret slice(line, value_start, len(line) - value_start)
+        }
+    }
+
+    ret dependency_root_path_from(paths_outline, root, next_index)
+}
+
+fn last_scope_segment(path: str) -> str {
+    let sep = find_last_scope_sep(path, 0_usize, 1000000_usize)
+    if (sep >= 1000000_usize) {
+        ret path
+    }
+    let start = sep + 2_usize
+    if (start >= len(path)) {
+        ret ""
+    }
+    ret slice(path, start, len(path) - start)
+}
+
+fn is_glob_binding(binding: str) -> bool {
+    if (str_eq(binding, "*")) {
+        ret true
+    }
+    ret ends_with(binding, "::*")
+}
+
+fn ends_with(value: str, suffix: str) -> bool {
+    let value_len = len(value)
+    let suffix_len = len(suffix)
+    if (suffix_len > value_len) {
+        ret false
+    }
+    let start = value_len - suffix_len
+    ret str_eq(slice(value, start, suffix_len), suffix)
+}
+
+fn line_token(line: str, token_index: usize) -> str {
+    ret line_token_from(line, 0_usize, token_index)
+}
+
+fn line_token_from(line: str, index: usize, token_index: usize) -> str {
+    let start = skip_spaces(line, index)
+    if (start >= len(line)) {
+        ret ""
+    }
+    let end = find_token_end(line, start)
+    if (token_index == 0_usize) {
+        ret slice(line, start, end - start)
+    }
+    ret line_token_from(line, end, token_index - 1_usize)
+}
+
+fn skip_spaces(line: str, index: usize) -> usize {
+    if (index >= len(line)) {
+        ret len(line)
+    }
+
+    let ch = byte_at(line, index)
+    if (ch == 32) {
+        ret skip_spaces(line, index + 1_usize)
+    }
+    ret index
+}
+
+fn find_token_end(line: str, index: usize) -> usize {
+    if (index >= len(line)) {
+        ret index
+    }
+    if (byte_at(line, index) == 32) {
+        ret index
+    }
+    ret find_token_end(line, index + 1_usize)
+}
+
+fn scope_to_path(scope: str) -> str {
+    ret scope_to_path_from(scope, 0_usize, "")
+}
+
+fn scope_to_path_from(scope: str, index: usize, acc: str) -> str {
+    if (index >= len(scope)) {
+        ret acc
+    }
+
+    let next_index = index + 1_usize
+    if (next_index < len(scope)) {
+        if (byte_at(scope, index) == 58) {
+            if (byte_at(scope, next_index) == 58) {
+                ret scope_to_path_from(scope, index + 2_usize, concat(acc, "/"))
+            }
+        }
+    }
+
+    ret scope_to_path_from(scope, index + 1_usize, concat(acc, slice(scope, index, 1_usize)))
+}
+
+fn find_first_scope_sep(path: str, index: usize) -> usize {
+    let next_index = index + 1_usize
+    if (next_index >= len(path)) {
+        ret len(path)
+    }
+    if (byte_at(path, index) == 58) {
+        if (byte_at(path, next_index) == 58) {
+            ret index
+        }
+    }
+    ret find_first_scope_sep(path, index + 1_usize)
+}
+
+fn find_last_scope_sep(path: str, index: usize, last: usize) -> usize {
+    let next_index = index + 1_usize
+    if (next_index >= len(path)) {
+        ret last
+    }
+
+    if (byte_at(path, index) == 58) {
+        if (byte_at(path, next_index) == 58) {
+            ret find_last_scope_sep(path, index + 2_usize, index)
+        }
+    }
+    ret find_last_scope_sep(path, index + 1_usize, last)
+}
+
+fn append_lines(lhs: str, rhs: str) -> str {
+    if (len(lhs) == 0_usize) {
+        ret rhs
+    }
+    if (len(rhs) == 0_usize) {
+        ret lhs
+    }
+    ret concat(concat(lhs, "\n"), rhs)
+}
+
+fn find_line_end(text: str, index: usize) -> usize {
+    if (index >= len(text)) {
+        ret index
+    }
+
+    let ch = byte_at(text, index)
+    if (ch == 10) {
+        ret index
+    }
+    if (ch == 13) {
+        ret index
+    }
+    ret find_line_end(text, index + 1_usize)
+}
+
+fn next_line_index(text: str, line_end: usize) -> usize {
+    if (line_end >= len(text)) {
+        ret line_end
+    }
+
+    let ch = byte_at(text, line_end)
+    if (ch == 13) {
+        let next_line_end = line_end + 1_usize
+        if (next_line_end < len(text)) {
+            if (byte_at(text, next_line_end) == 10) {
+                ret line_end + 2_usize
+            }
+        }
+        ret line_end + 1_usize
+    }
+    if (ch == 10) {
+        ret line_end + 1_usize
+    }
+    ret line_end + 1_usize
+}
+
+fn contains_line(lines: str, target: str) -> bool {
+    ret contains_line_from(lines, target, 0_usize)
+}
+
+fn contains_line_from(lines: str, target: str, index: usize) -> bool {
+    if (index >= len(lines)) {
+        ret false
+    }
+
+    let line_end = find_line_end(lines, index)
+    let line = slice(lines, index, line_end - index)
+    if (str_eq(line, target)) {
+        ret true
+    }
+    ret contains_line_from(lines, target, next_line_index(lines, line_end))
+}
+
+fn none_path() -> MaybePath {
+    ret MaybePath{false, "", ""}
+}
+
+fn some_path(path: str, scope: str) -> MaybePath {
+    ret MaybePath{true, path, scope}
+}

@@ -70,7 +70,30 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         match derective.prefix[0]:
             case "refrain":
-                dep_filepath = project_root / "src" / Path(*derective.prefix[1:])
+                # 1) Absolute path inside current project (legacy refrain semantics).
+                local_absolute = project_root / "src" / Path(*derective.prefix[1:])
+                local_module = self._resolve_module_path(local_absolute)
+                if local_module.exists():
+                    dep_filepath = local_absolute
+                else:
+                    # 2) Root-prefixed dependency form: refrain::<dep_root>::...
+                    if len(derective.prefix) < 2:
+                        raise RuntimeError(f"Unable to import: {derective} in {id}")
+
+                    refrain_root = derective.prefix[1]
+                    if refrain_root == manifest.project.name:
+                        base_root = project_root
+                    elif refrain_root in dep_roots:
+                        base_root = dep_roots[refrain_root]
+                    elif refrain_root == "std":
+                        base_root = self._fallback_std_root()
+                    else:
+                        raise RuntimeError(f"Unable to import: {derective} in {id}")
+
+                    if len(derective.prefix) == 2:
+                        dep_filepath = base_root / "src" / "lib"
+                    else:
+                        dep_filepath = base_root / "src" / Path(*derective.prefix[2:])
             case "repo":
                 dep_filepath = self.src_dir / Path(*derective.prefix[1:])
             case self_name if self_name == manifest.project.name:
@@ -222,15 +245,23 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         if project_root in self._dependency_cache:
             return self._dependency_cache[project_root]
 
-        manifest = self._load_manifest(project_root)
         roots: dict[str, Path] = {}
-        for dependency in manifest.project.dependencies:
-            dep_path = self._resolve_dependency_ref(project_root, dependency)
-            dep_manifest = self._load_manifest(dep_path)
-            roots[dep_manifest.project.name] = dep_path
+        self._collect_dependency_roots(project_root, roots, set())
 
         self._dependency_cache[project_root] = roots
         return roots
+
+    def _collect_dependency_roots(self, project_root: Path, roots: dict[str, Path], visited: set[Path]) -> None:
+        if project_root in visited:
+            return
+        visited.add(project_root)
+
+        manifest = self._load_manifest(project_root)
+        for dependency in manifest.project.dependencies:
+            dep_path = self._resolve_dependency_ref(project_root, dependency)
+            dep_manifest = self._load_manifest(dep_path)
+            roots.setdefault(dep_manifest.project.name, dep_path)
+            self._collect_dependency_roots(dep_path, roots, visited)
 
     def _load_manifest(self, path: Path) -> ProjectManifest:
         manifest_path = path / ProjectManifest.default_filename()

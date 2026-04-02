@@ -320,6 +320,29 @@ class TypeInferer:
         if isinstance(expr, s.Expression_StructField):
             return self._lookup_chained_field_type(expr.name, expr.field, env)
 
+        if isinstance(expr, s.Expression_MethodCall):
+            receiver_type = self._infer_expression(expr.receiver, env)
+            if receiver_type is None:
+                raise TypeError(f"Unable to infer receiver type for method call '{expr.method}'")
+
+            base_receiver_type = (
+                receiver_type.pointee
+                if isinstance(receiver_type, (HeapSmartPointer, StackSmartPointer))
+                else receiver_type
+            )
+            fn_name = f"{base_receiver_type.name}::{expr.method}"
+            if fn_name not in self._funcs:
+                raise TypeError(f"Method '{expr.method}' is not defined for type '{base_receiver_type.name}'")
+
+            desugared = s.Expression_Call(
+                callee=s.Expression_Path([Type(fn_name)]),
+                generics=list(expr.generics),
+                args=[expr.receiver, *expr.args],
+            )
+            inferred = self._infer_expression(desugared, env, expected_type)
+            expr.generics = desugared.generics
+            return inferred
+
         if isinstance(expr, s.Expression_Call):
             enum_type = self._infer_enum_call(expr, env)
             if enum_type is not None:
@@ -355,6 +378,17 @@ class TypeInferer:
             return self._specialize_type(fn.type, generic_mapping)
 
         if isinstance(expr, s.Expression_BinaryOperation):
+            if expr.operator in ("&&", "||"):
+                lhs_type = self._infer_expression(expr.lhs, env)
+                rhs_type = self._infer_expression(expr.rhs, env)
+                if lhs_type is not None and lhs_type != Type("bool"):
+                    raise TypeError(f"Logical operator '{expr.operator}' expects bool lhs, got {lhs_type}")
+                if rhs_type is not None and rhs_type != Type("bool"):
+                    raise TypeError(f"Logical operator '{expr.operator}' expects bool rhs, got {rhs_type}")
+                if expected_type is not None and expected_type != Type("bool"):
+                    raise TypeError(f"Type mismatch: {expected_type} != bool")
+                return Type("bool")
+
             lhs_type = self._infer_expression(expr.lhs, env, expected_type)
             rhs_type = self._infer_expression(expr.rhs, env, lhs_type or expected_type)
             if lhs_type is None and rhs_type is not None:

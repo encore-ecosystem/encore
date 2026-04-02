@@ -18,6 +18,7 @@ from ehir.core.instructions.memory import (
 from ehir.core.instructions.operators.arithmetic import (
     Instruction_add,
     Instruction_div,
+    Instruction_mod,
     Instruction_mul,
     Instruction_sub,
 )
@@ -40,6 +41,20 @@ BINOP_MAPPING: dict[str, type[BinOp]] = {
     "-": Instruction_sub,
     "*": Instruction_mul,
     "/": Instruction_div,
+    "%": Instruction_mod,
+}
+
+COMPOUND_ASSIGNMENT_TO_BINOP: dict[str, str] = {
+    "+=": "+",
+    "-=": "-",
+    "*=": "*",
+    "/=": "/",
+    "%=": "%",
+    "&=": "&",
+    "|=": "|",
+    "^=": "^",
+    "<<=": "<<",
+    ">>=": ">>",
 }
 
 
@@ -119,9 +134,7 @@ class Translator:
     def preload_declarations(self, statements: list[s.Statement_TopLevel]):
         for statement in statements:
             if isinstance(statement, s.Statement_StructureDefinition):
-                if not isinstance(statement.defi, s.CLikeStructureDefinition):
-                    raise NotImplementedError(f"Unsupported structure definition: {type(statement.defi)}")
-                self._structs[statement.defi.name] = statement.defi
+                self._structs[statement.defi.name] = self._normalize_struct_definition(statement.defi)
             elif isinstance(statement, s.Statement_FunctionDefinition):
                 if statement.type is None:
                     continue
@@ -150,6 +163,30 @@ class Translator:
                 )
             elif isinstance(statement, s.Statement_Trait):
                 self._traits[statement.name] = statement
+            elif isinstance(statement, s.Statement_Impl) and statement.trait_name is None:
+                struct_type = self._translate_type(statement.struct)
+                for method in statement.body:
+                    if method.type is None:
+                        continue
+
+                    impl_generic_names = {generic.name for generic in statement.generics}
+                    merged_method_generics = [*statement.generics]
+                    for generic in method.generics:
+                        if generic.name in impl_generic_names:
+                            continue
+                        merged_method_generics.append(generic)
+                        impl_generic_names.add(generic.name)
+
+                    namespaced_name = f"{struct_type.name}::{method.name}"
+                    self._funcs[namespaced_name] = Derective_fn(
+                        name=namespaced_name,
+                        generics=[self._translate_type(g) for g in merged_method_generics],
+                        params=[
+                            Parameter(name=param.name, type=self._translate_type(param.type)) for param in method.params
+                        ],
+                        body=[],
+                        ret_type=self._translate_type(method.type),
+                    )
 
     def _translate_statement(self, statement: s.Statement) -> Derective | None:
         if isinstance(statement, s.Statement_FunctionDefinition):
@@ -167,6 +204,15 @@ class Translator:
         elif isinstance(statement, s.Statement_Import):
             return self._translate_import(statement)
         raise NotImplementedError(f"Translation for statement type {type(statement)} is not implemented.")
+
+    def _normalize_struct_definition(self, definition: s.StructureDefinition) -> s.CLikeStructureDefinition:
+        if isinstance(definition, s.CLikeStructureDefinition):
+            return definition
+        if isinstance(definition, s.TupleStructureDefinition):
+            return definition._to_clike()
+        if isinstance(definition, s.UnitStructureDefinition):
+            return definition._to_tuple()._to_clike()
+        raise NotImplementedError(f"Unsupported structure definition: {type(definition)}")
 
     def _translate_extern_function_definition(self, statement: s.Statement_ExternFunctionDefinition):
         self._extern_fns[statement.name] = statement
@@ -200,10 +246,9 @@ class Translator:
                     self._translate_import_pair(prefix=prefix + [pair.src], pair=dst, is_public=is_public)
 
     def _translate_structure_definition(self, statement: s.Statement_StructureDefinition):
-        if not isinstance(statement.defi, s.CLikeStructureDefinition):
-            raise NotImplementedError(f"Unsupported structure definition: {type(statement.defi)}")
-        self._structs[statement.defi.name] = statement.defi
-        self._emit_struct_definition(statement.defi)
+        definition = self._normalize_struct_definition(statement.defi)
+        self._structs[definition.name] = definition
+        self._emit_struct_definition(definition)
 
     def _emit_struct_definition(self, definition: s.CLikeStructureDefinition):
         if definition.name in self._emitted_structs:
@@ -464,12 +509,14 @@ class Translator:
         self._mark_current_block_terminated()
 
     def _translate_assignment(self, statement: s.Statement_Assignment):
+        assign_expr = self._assignment_expr(statement)
+
         if isinstance(statement.target, s.Expression_Path) and len(statement.target.segments) == 1:
             target_name = self._assignment_targets.get(statement.name, statement.name)
             self._set_new_variable(target_name)
             expected_type = self._resolve_variable(statement.name).type
             val = self._translate_expression(
-                statement.expr,
+                assign_expr,
                 name=target_name,
                 expected_type=expected_type,
             )
@@ -489,13 +536,26 @@ class Translator:
                 self._builder._add(Instruction_getfieldptr(var_out=dst_ptr, src=src, field=field))
 
             val = self._translate_expression(
-                statement.expr,
+                assign_expr,
                 expected_type=self._lookup_field_type(src.type, statement.target.field),
             )
             self._builder._add(Instruction_store(var_src=val.var_out, var_dst=dst_ptr))
             return
 
         raise NotImplementedError(f"Complex assignment target is not implemented: {statement.target}")
+
+    def _assignment_expr(self, statement: s.Statement_Assignment) -> s.Statement_Expression:
+        if statement.operator == "=":
+            return statement.expr
+
+        if statement.operator not in COMPOUND_ASSIGNMENT_TO_BINOP:
+            raise NotImplementedError(f"Assignment operator '{statement.operator}' is not implemented.")
+
+        return s.Expression_BinaryOperation(
+            lhs=statement.target,
+            operator=COMPOUND_ASSIGNMENT_TO_BINOP[statement.operator],
+            rhs=statement.expr,
+        )
 
     def _translate_expression_statement(self, statement: s.Statement_Expr):
         self._translate_expression(statement.expr)
@@ -954,6 +1014,9 @@ class Translator:
             return self._translate_match_expression(expr, name=name, expected_type=expected_type)
 
         elif isinstance(expr, s.Expression_BinaryOperation):
+            if expr.operator in ("&&", "||"):
+                return self._translate_short_circuit_logical(expr, name=name)
+
             lhs = self._translate_expression(expr.lhs)
             rhs = self._translate_expression(expr.rhs)
 
@@ -966,6 +1029,18 @@ class Translator:
                     return self._builder.build_mul(lhs.var_out, rhs.var_out, name)
                 case "/":
                     return self._builder.build_div(lhs.var_out, rhs.var_out, name)
+                case "%":
+                    return self._builder.build_mod(lhs.var_out, rhs.var_out, name)
+                case "&":
+                    return self._builder.build_and(lhs.var_out, rhs.var_out, name)
+                case "|":
+                    return self._builder.build_or(lhs.var_out, rhs.var_out, name)
+                case "^":
+                    return self._builder.build_xor(lhs.var_out, rhs.var_out, name)
+                case "<<":
+                    return self._builder.build_shl(lhs.var_out, rhs.var_out, name)
+                case ">>":
+                    return self._builder.build_shr(lhs.var_out, rhs.var_out, name)
                 case "==":
                     return self._builder.build_ieq(lhs.var_out, rhs.var_out, name)
                 case "!=":
@@ -1024,6 +1099,37 @@ class Translator:
             self._builder._add(instr)
             return instr
 
+        elif isinstance(expr, s.Expression_MethodCall):
+            receiver = self._translate_expression(expr.receiver).var_out
+            if receiver.type is None:
+                raise TypeError(f"Unable to infer receiver type for method call '{expr.method}'")
+
+            receiver_base_type = (
+                receiver.type.pointee
+                if isinstance(receiver.type, (HeapSmartPointer, StackSmartPointer))
+                else receiver.type
+            )
+            fn_name = f"{receiver_base_type.name}::{expr.method}"
+            callee = self._funcs.get(fn_name)
+            if callee is None:
+                raise TypeError(f"Method '{expr.method}' is not defined for type '{receiver_base_type.name}'")
+
+            if fn_name in self._extern_fns and self._unsafe_depth <= 0:
+                raise TypeError(f"Extern function '{fn_name}' can only be called inside unsafe block")
+
+            generics = [self._translate_type(g) for g in expr.generics]
+            args = [receiver, *[self._translate_expression(arg_exp).var_out for arg_exp in expr.args]]
+            call = self._builder.build_call(
+                fn_name=fn_name,
+                generics=generics,
+                args=args,
+                name=name,
+                is_unsafe=fn_name in self._extern_fns and self._unsafe_depth > 0,
+            )
+            generic_mapping = {generic.name: concrete for generic, concrete in zip(callee.generics, generics)}
+            call.var_out.type = self._specialize_type(callee.ret_type, generic_mapping)
+            return call
+
         elif isinstance(expr, s.Expression_Call):
             enum_expr = self._build_enum_from_call(expr)
             if enum_expr is not None:
@@ -1050,6 +1156,62 @@ class Translator:
             return call
 
         raise NotImplementedError(f"Translation for expression type {type(expr)} is not implemented.")
+
+    def _translate_short_circuit_logical(
+        self,
+        expr: s.Expression_BinaryOperation,
+        name: Optional[str] = None,
+    ) -> Assignable:
+        if expr.operator not in ("&&", "||"):
+            raise ValueError(f"Unsupported logical operator for short-circuit: {expr.operator}")
+
+        logical_id = self._if_counter
+        self._if_counter += 1
+
+        rhs_block = self._builder.append_block(f"logical_rhs_{logical_id}")
+        short_block = self._builder.append_block(f"logical_short_{logical_id}")
+        end_block = self._builder.append_block(f"logical_end_{logical_id}")
+
+        lhs = self._translate_expression(expr.lhs, expected_type=Type("bool"))
+        lhs_cond = self._ensure_boolean(lhs.var_out, context=f"lhs of '{expr.operator}'")
+
+        if expr.operator == "&&":
+            self._builder.build_cbr(lhs_cond, rhs_block.name, short_block.name)
+        else:
+            self._builder.build_cbr(lhs_cond, short_block.name, rhs_block.name)
+        self._mark_current_block_terminated()
+
+        self._builder.position_at_end(rhs_block)
+        rhs = self._translate_expression(expr.rhs, expected_type=Type("bool"))
+        rhs_cond = self._ensure_boolean(rhs.var_out, context=f"rhs of '{expr.operator}'")
+        rhs_exit = self._builder.current_block.name
+        self._builder.build_br(end_block.name)
+        self._mark_current_block_terminated()
+
+        self._builder.position_at_end(short_block)
+        short_value = self._builder.build_lcpos(prim=Usize(0 if expr.operator == "&&" else 1, size=1)).var_out
+        short_exit = self._builder.current_block.name
+        self._builder.build_br(end_block.name)
+        self._mark_current_block_terminated()
+
+        self._builder.position_at_end(end_block)
+        result = self._builder.build_phi(
+            name or self._advance_variable(),
+            Usize_t(1),
+            [PhiPair(rhs_cond, rhs_exit), PhiPair(short_value, short_exit)],
+        )
+        return Assignable(result.var_out)
+
+    def _ensure_boolean(self, var: Variable, *, context: str) -> Variable:
+        if var.type is None:
+            raise TypeError(f"Unable to infer boolean type for {context}")
+
+        if isinstance(var.type, (Usize_t, Isize_t)) and var.type.size == 1:
+            return var
+        if var.type.name in {"bool", "u1", "i1"}:
+            return var
+
+        raise TypeError(f"Expected bool for {context}, got {var.type}")
 
     def _translate_try_expression(
         self,
@@ -1396,16 +1558,29 @@ class Translator:
 
             payload_field_types = self._lookup_struct_field_types(payload_type)
             if payload_field_types:
-                if len(payload_field_types) != len(expr.args):
-                    raise TypeError(
-                        f"Enum variant '{expr.name}' expects {len(payload_field_types)} payload arguments, "
-                        f"got {len(expr.args)}"
-                    )
-                payload_args = [
-                    self._translate_expression(arg_expr, expected_type=payload_field_types[idx]).var_out
-                    for idx, arg_expr in enumerate(expr.args)
-                ]
-                payload_var = self._translate_struct_initialization(payload_type, payload_args).var_out
+                if len(expr.args) == 1:
+                    first_expected = payload_field_types[0] if len(payload_field_types) == 1 else None
+                    first_arg = self._translate_expression(expr.args[0], expected_type=first_expected).var_out
+                    if first_arg.type is not None and self._types_compatible(first_arg.type, payload_type):
+                        payload_var = first_arg
+                    elif len(payload_field_types) == 1:
+                        payload_var = self._translate_struct_initialization(payload_type, [first_arg]).var_out
+                    else:
+                        raise TypeError(
+                            f"Enum variant '{expr.name}' expects {len(payload_field_types)} payload arguments "
+                            f"or one composite payload value, got 1"
+                        )
+                else:
+                    if len(payload_field_types) != len(expr.args):
+                        raise TypeError(
+                            f"Enum variant '{expr.name}' expects {len(payload_field_types)} payload arguments, "
+                            f"got {len(expr.args)}"
+                        )
+                    payload_args = [
+                        self._translate_expression(arg_expr, expected_type=payload_field_types[idx]).var_out
+                        for idx, arg_expr in enumerate(expr.args)
+                    ]
+                    payload_var = self._translate_struct_initialization(payload_type, payload_args).var_out
             else:
                 if len(expr.args) != 1:
                     raise TypeError(f"Enum variant '{expr.name}' expects a single payload argument")
