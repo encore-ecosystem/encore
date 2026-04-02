@@ -9,7 +9,7 @@ from ehir.core.derectives import Derective_imp, Derective_import
 from ehir import EHIR_Frontend
 from encore import ENCORE_CACHE_DIR, PROJECT_ROOT
 from encore.frontend.inference import TypeInferer
-from encore.frontend.lexer import Lexer
+from encore.frontend.lexer import Lexer, LexerToken
 from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
 from encore.frontend.translator import Translator
@@ -44,8 +44,8 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
     _ast_cache: dict[Path, list[s.Statement]] = field(default_factory=dict)
     _index_cache: dict[Path, ModuleIndex] = field(default_factory=dict)
     _dependency_cache: dict[Path, dict[str, Path]] = field(default_factory=dict)
-    _lexer: Lexer = field(default_factory=Lexer)
-    _parser: Parser = field(default_factory=Parser)
+    _lexer: Lexer = field(default_factory=lambda: Lexer())
+    _parser: Parser = field(default_factory=lambda: Parser())
 
     def get_module_by_id(self, id: Path) -> EHIR_Module:
         if id in self._cache:
@@ -122,7 +122,9 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         if id in self._ast_cache:
             return self._ast_cache[id]
 
-        ast = self._parser.parse(self._lexer.tokenize(id.read_text()))
+        tokens = self._lexer.parse(list(id.read_text()))
+        ast = self._parser.parse(tokens)
+        print(*ast, sep="\n")
         self._ast_cache[id] = ast
         return ast
 

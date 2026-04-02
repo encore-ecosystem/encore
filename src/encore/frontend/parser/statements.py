@@ -207,6 +207,22 @@ class Statement_InnerLevel(Statement):
 
 
 @dataclass
+class Statement_OneLineComment(Statement_TopLevel, Statement_InnerLevel):
+    value: str
+
+    def __repr__(self) -> str:
+        return self.value
+
+
+@dataclass
+class Statement_MultiLineComment(Statement_TopLevel, Statement_InnerLevel):
+    value: str
+
+    def __repr__(self) -> str:
+        return self.value
+
+
+@dataclass
 class Statement_Let(Statement_InnerLevel):
     name: str
     type: Type | None
@@ -569,52 +585,62 @@ class Expression_BinaryOperation(Statement_Expression):
 
 @dataclass
 class BinaryOperation_LogicalOr(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_LogicalAnd(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_BitwiseOr(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_BitwiseXor(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_BitwiseAnd(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_Equality(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_Relational(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_Shift(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_Additive(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_Multiplicative(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 # =============

@@ -8,6 +8,9 @@ class TokenType(Enum):
     STRING = auto()
     IDENTIFIER = auto()
 
+    ONE_LINE_COMMENT = auto()
+    MULTI_LINE_COMMENT = auto()
+
     KW_FN = auto()
     KW_STRUCT = auto()
     KW_TRAIT = auto()
@@ -84,7 +87,6 @@ class TokenType(Enum):
     COLON = auto()
     COMMA = auto()
     DOT = auto()
-    ARROW = auto()
 
     WHITESPACE = auto()
     NEWLINE = auto()
@@ -93,11 +95,11 @@ class TokenType(Enum):
 
 
 @dataclass
-class Token:
+class LexerToken:
     type: TokenType
     value: str
     line: int
     column: int
 
     def __repr__(self) -> str:
-        return f"{self.type.name}({self.value!r})"
+        return f"{self.line}:{self.column}({self.type.name}: {self.value})"
