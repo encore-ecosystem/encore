@@ -9,7 +9,7 @@ from ehir.core.derectives import Derective_imp, Derective_import
 from ehir import EHIR_Frontend
 from encore import ENCORE_CACHE_DIR, PROJECT_ROOT
 from encore.frontend.inference import TypeInferer
-from encore.frontend.lexer import Lexer, LexerToken
+from encore.frontend.lexer import Lexer
 from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
 from encore.frontend.translator import Translator
@@ -113,7 +113,6 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                 dep_filepath = id.parent / Path(*derective.prefix)
 
         dep_filepath = self._resolve_module_path(dep_filepath)
-
         if not dep_filepath.exists():
             raise RuntimeError(f"Unable to import: {derective} in {id}")
         return dep_filepath
@@ -124,7 +123,6 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         tokens = self._lexer.parse(list(id.read_text()))
         ast = self._parser.parse(tokens)
-        print(*ast, sep="\n")
         self._ast_cache[id] = ast
         return ast
 
@@ -195,11 +193,11 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return None
 
         if isinstance(statement, s.Statement_FunctionDefinition):
-            return ExportBinding(statement.name, ExportKind.FUNCTION, id, statement)
-        if isinstance(statement, s.Statement_ExternFunctionDefinition):
+            return ExportBinding(statement.signature.name, ExportKind.FUNCTION, id, statement)
+        if isinstance(statement, s.FunctionSignature):
             return ExportBinding(statement.name, ExportKind.FUNCTION, id, statement)
         if isinstance(statement, s.Statement_StructureDefinition):
-            return ExportBinding(statement.defi.name, ExportKind.STRUCT, id, statement)
+            return ExportBinding(statement.signature.name, ExportKind.STRUCT, id, statement)
         if isinstance(statement, s.Statement_EnumDefinition):
             return ExportBinding(statement.name, ExportKind.ENUM, id, statement)
         if isinstance(statement, s.Statement_Trait):

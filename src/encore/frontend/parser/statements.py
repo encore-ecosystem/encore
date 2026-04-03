@@ -1,6 +1,7 @@
 from abc import ABC
 from dataclasses import dataclass
 from enum import StrEnum, auto
+from typing import Optional
 
 from ehir.core.type import Type
 from ehir.core.variable import Parameter
@@ -55,54 +56,33 @@ class Statement_Import(Statement_TopLevel):
 
 
 @dataclass
-class Statement_FunctionDefinition(Statement_TopLevel):
+class FunctionSignature(Statement_TopLevel):
+    is_extern: bool
     name: str
     generics: list[Type]
     params: list[Parameter]
     type: Type | None
-    body: list["Statement_InnerLevel"]
 
     def __repr__(self) -> str:
-        type_repr = ""
-        if self.type:
-            type_repr = f"-> {self.type}"
-
-        r = f"fn {self.name}({', '.join(f'{p.name} : {p.type}' for p in self.params)}){type_repr}" + " {"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += "\n}"
-        return r
+        extern_repr = "extern " if self.is_extern else ""
+        type_repr = f"-> {self.type}" if self.type else ""
+        return f"{extern_repr}fn {self.name}({', '.join(str(p) for p in self.params)}){type_repr}"
 
 
 @dataclass
-class Statement_ExternFunctionDefinition(Statement_TopLevel):
-    name: str
-    generics: list[Type]
-    params: list[Parameter]
-    type: Type
+class Statement_FunctionDefinition(Statement_TopLevel):
+    signature: FunctionSignature
+    body: "Block"
 
     def __repr__(self) -> str:
-        return f"extern fn {self.name}(" + ", ".join(f"{p.name} : {p.type}" for p in self.params) + f") -> {self.type}"
-
-
-@dataclass
-class TraitMethodDeclaration:
-    name: str
-    generics: list[Type]
-    params: list[Parameter]
-    type: Type
-
-    def __repr__(self) -> str:
-        generics_repr = ("[" + ", ".join(str(g) for g in self.generics) + "]") if self.generics else ""
-        params_repr = ", ".join(f"{p.name} : {p.type}" for p in self.params)
-        return f"fn {self.name}{generics_repr}({params_repr}) -> {self.type}"
+        return f"{self.signature} {self.body}"
 
 
 @dataclass
 class Statement_Trait(Statement_TopLevel):
     name: str
     generics: list[Type]
-    body: list[TraitMethodDeclaration]
+    body: list[FunctionSignature]
 
     def __repr__(self) -> str:
         generics_repr = ("[" + ", ".join(str(g) for g in self.generics) + "]") if self.generics else ""
@@ -111,7 +91,7 @@ class Statement_Trait(Statement_TopLevel):
 
 
 @dataclass
-class StructureDefinition(ABC):
+class StructureSignature(ABC):
     name: str
     generics: list[Type]
 
@@ -121,7 +101,7 @@ class StructureDefinition(ABC):
 
 
 @dataclass
-class CLikeStructureDefinition(StructureDefinition):
+class CLikeStructureDefinition(StructureSignature):
     fields: list[Parameter]
 
     def __repr__(self) -> str:
@@ -130,7 +110,7 @@ class CLikeStructureDefinition(StructureDefinition):
 
 
 @dataclass
-class TupleStructureDefinition(StructureDefinition):
+class TupleStructureDefinition(StructureSignature):
     fields: list[Type]
 
     def _to_clike(self) -> CLikeStructureDefinition:
@@ -143,7 +123,7 @@ class TupleStructureDefinition(StructureDefinition):
 
 
 @dataclass
-class UnitStructureDefinition(StructureDefinition):
+class UnitStructureDefinition(StructureSignature):
     def _to_tuple(self) -> TupleStructureDefinition:
         return TupleStructureDefinition(name=self.name, generics=self.generics, fields=[])
 
@@ -153,17 +133,17 @@ class UnitStructureDefinition(StructureDefinition):
 
 @dataclass
 class Statement_StructureDefinition(Statement_TopLevel):
-    defi: StructureDefinition
+    signature: StructureSignature
 
     def __repr__(self) -> str:
-        return f"{super().__repr__()}struct {self.defi}"
+        return f"{super().__repr__()}struct {self.signature}"
 
 
 @dataclass
 class Statement_EnumDefinition(Statement_TopLevel):
     name: str
     generics: list[Type]
-    body: list[StructureDefinition]
+    body: list[StructureSignature]
 
     def __repr__(self) -> str:
         generic_repr = "[" + ", ".join(str(g) for g in self.generics) + "]"
@@ -173,13 +153,6 @@ class Statement_EnumDefinition(Statement_TopLevel):
 
 @dataclass
 class Statement_Impl(Statement_TopLevel):
-    # @dataclass
-    # class FunctionDeclaration(Statement_TopLevel):
-    #     name: str
-    #     generics: list[str]
-    #     params: list[tuple[str, str]]
-    #     type: str
-
     generics: list[Type]
     trait_name: str | None
     trait_args: list[Type]
@@ -236,39 +209,27 @@ class Statement_Let(Statement_InnerLevel):
 @dataclass
 class Statement_While(Statement_InnerLevel):
     expr: "Statement_Expression"
-    body: list["Statement_InnerLevel"]
+    body: "Block"
 
     def __repr__(self) -> str:
-        r = f"while {self.expr} {{"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += "\n}"
-        return r
+        return f"while {self.body}"
 
 
 @dataclass
 class Statement_Loop(Statement_InnerLevel):
-    body: list["Statement_InnerLevel"]
+    body: "Block"
 
     def __repr__(self) -> str:
-        r = "loop {"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += "\n}"
-        return r
+        return f"loop {self.body}"
 
 
 @dataclass
 class Statement_DoWhile(Statement_InnerLevel):
-    body: list["Statement_InnerLevel"]
+    body: "Block"
     expr: "Statement_Expression"
 
     def __repr__(self) -> str:
-        r = "do {"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += f"\n}} while {self.expr}"
-        return r
+        return f"do {self.body} while {self.expr}"
 
 
 @dataclass
@@ -300,20 +261,16 @@ class Statement_Expr(Statement_InnerLevel):
 @dataclass
 class Statement_IfBranch:
     expr: "Statement_Expression"
-    body: list["Statement_InnerLevel"]
+    body: "Block"
 
     def __repr__(self) -> str:
-        r = f"{self.expr} {{"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += "\n}"
-        return r
+        return f"{self.expr} {self.body}"
 
 
 @dataclass
 class Statement_If(Statement_InnerLevel):
     branches: list[Statement_IfBranch]
-    else_body: list["Statement_InnerLevel"] | None = None
+    else_body: Optional["Block"] = None
 
     def __repr__(self) -> str:
         r = f"if {self.branches[0]}"
@@ -321,7 +278,7 @@ class Statement_If(Statement_InnerLevel):
             r += f"\nelif {branch}"
         if self.else_body is not None:
             r += "\nelse {"
-            for stmt in self.else_body:
+            for stmt in self.else_body.body:
                 r += f"\n  {stmt}"
             r += "\n}"
         return r
@@ -331,7 +288,7 @@ class Statement_If(Statement_InnerLevel):
 class Statement_MatchArm:
     pattern: "Expression_Path | None"
     binding: str | None
-    body: list["Statement_InnerLevel"]
+    body: "Block"
 
     @property
     def is_wildcard(self) -> bool:
@@ -341,11 +298,7 @@ class Statement_MatchArm:
         pattern_repr = "_" if self.pattern is None else self.pattern.name
         if self.binding is not None:
             pattern_repr = f"{pattern_repr}({self.binding})"
-        r = f"{pattern_repr} => {{"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += "\n}"
-        return r
+        return f"{pattern_repr} => {self.body}"
 
 
 @dataclass
@@ -360,14 +313,10 @@ class Statement_Match(Statement_InnerLevel):
 
 @dataclass
 class Statement_Unsafe(Statement_InnerLevel):
-    body: list["Statement_InnerLevel"]
+    body: "Block"
 
     def __repr__(self) -> str:
-        r = "unsafe {"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += "\n}"
-        return r
+        return f"unsafe {self.body}"
 
 
 # =============
@@ -560,16 +509,23 @@ class Expression_Block(Statement_Expression):
 
 
 @dataclass
-class Expression_Unsafe(Statement_Expression):
+class Block:
     body: list[Statement_InnerLevel]
-    expr: Statement_Expression
 
     def __repr__(self) -> str:
-        r = "unsafe {"
+        r = "{"
         for stmt in self.body:
             r += f"\n  {stmt}"
-        r += f"\n  {self.expr}\n}}"
+        r += "\n}"
         return r
+
+
+@dataclass
+class Expression_Unsafe(Statement_Expression):
+    body: "Block"
+
+    def __repr__(self) -> str:
+        return f"unsafe {self.body}"
 
 
 # =============

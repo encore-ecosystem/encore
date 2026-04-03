@@ -2,7 +2,13 @@ from pathlib import Path
 from typing import Optional
 
 from ehir.builder import EHIR_Builder, EHIR_Module
-from ehir.core.derectives import Derective_enum, Derective_fn, Derective_impl, Derective_trait, TraitMethod
+from ehir.core.derectives import (
+    Derective_enum,
+    Derective_extern_fn,
+    Derective_fn,
+    Derective_struct,
+    TraitMethod,
+)
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum, EnumVariant
 from ehir.core.instructions.base import Assignable
@@ -32,6 +38,7 @@ from encore.frontend.inference import TypeInferer
 from encore.frontend.lexer import Lexer
 from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
+from encore.frontend.parser.statements import Block
 
 MatchArmLike = s.Statement_MatchArm | s.Expression_MatchArm
 MatchBodyArmLike = s.Statement_MatchArm | s.Expression_MatchArm
@@ -59,13 +66,12 @@ COMPOUND_ASSIGNMENT_TO_BINOP: dict[str, str] = {
 
 
 class Translator:
-    _funcs: dict[str, Derective_fn]
+    _funcs: dict[str, Derective_fn | Derective_extern_fn]
     _enums: dict[str, Derective_enum]
-    _structs: dict[str, s.StructureDefinition]
+    _structs: dict[str, Derective_struct]
     _traits: dict[str, s.Statement_Trait]
     _builder: EHIR_Builder
     _module: EHIR_Module
-    _extern_fns: dict[str, s.Statement_ExternFunctionDefinition]
     _enum_payload_structs: dict[str, list[s.CLikeStructureDefinition]]
     _emitted_structs: set[str]
 
@@ -136,30 +142,28 @@ class Translator:
             if isinstance(statement, s.Statement_StructureDefinition):
                 self._structs[statement.defi.name] = self._normalize_struct_definition(statement.defi)
             elif isinstance(statement, s.Statement_FunctionDefinition):
-                if statement.type is None:
+                if statement.signature.type is None:
                     continue
-                self._funcs[statement.name] = Derective_fn(
-                    name=statement.name,
-                    generics=[self._translate_type(g) for g in statement.generics],
+                self._funcs[statement.signature.name] = Derective_fn(
+                    name=statement.signature.name,
+                    generics=[self._translate_type(g) for g in statement.signature.generics],
                     params=[
-                        Parameter(name=param.name, type=self._translate_type(param.type)) for param in statement.params
+                        Parameter(name=param.name, type=self._translate_type(param.type))
+                        for param in statement.signature.params
                     ],
                     body=[],
-                    ret_type=self._translate_type(statement.type),
+                    ret_type=self._translate_type(statement.signature.type),
                 )
             elif isinstance(statement, s.Statement_EnumDefinition):
                 self._enums[statement.name] = self._build_enum_directive(statement)
-            elif isinstance(statement, s.Statement_ExternFunctionDefinition):
+            elif isinstance(statement, s.FunctionSignature):
                 self._extern_fns[statement.name] = statement
-                self._funcs[statement.name] = Derective_fn(
+                self._funcs[statement.name] = Derective_extern_fn(
                     name=statement.name,
-                    generics=[self._translate_type(g) for g in statement.generics],
                     params=[
                         Parameter(name=param.name, type=self._translate_type(param.type)) for param in statement.params
                     ],
-                    body=[],
                     ret_type=self._translate_type(statement.type),
-                    is_extern=True,
                 )
             elif isinstance(statement, s.Statement_Trait):
                 self._traits[statement.name] = statement
@@ -191,7 +195,7 @@ class Translator:
     def _translate_statement(self, statement: s.Statement) -> Derective | None:
         if isinstance(statement, s.Statement_FunctionDefinition):
             return self._translate_function_definition(statement)
-        elif isinstance(statement, s.Statement_ExternFunctionDefinition):
+        elif isinstance(statement, s.FunctionSignature):
             return self._translate_extern_function_definition(statement)
         elif isinstance(statement, s.Statement_StructureDefinition):
             return self._translate_structure_definition(statement)
@@ -205,7 +209,7 @@ class Translator:
             return self._translate_import(statement)
         raise NotImplementedError(f"Translation for statement type {type(statement)} is not implemented.")
 
-    def _normalize_struct_definition(self, definition: s.StructureDefinition) -> s.CLikeStructureDefinition:
+    def _normalize_struct_definition(self, definition: s.Statement_StructureDefinition) -> s.CLikeStructureDefinition:
         if isinstance(definition, s.CLikeStructureDefinition):
             return definition
         if isinstance(definition, s.TupleStructureDefinition):
@@ -214,11 +218,10 @@ class Translator:
             return definition._to_tuple()._to_clike()
         raise NotImplementedError(f"Unsupported structure definition: {type(definition)}")
 
-    def _translate_extern_function_definition(self, statement: s.Statement_ExternFunctionDefinition):
+    def _translate_extern_function_definition(self, statement):
         self._extern_fns[statement.name] = statement
         self._builder.build_extern_fn(
             name=statement.name,
-            generics=[self._translate_type(g) for g in statement.generics],
             params=[Parameter(name=param.name, type=self._translate_type(param.type)) for param in statement.params],
             ret_type=self._translate_type(statement.type),
         )
@@ -291,7 +294,7 @@ class Translator:
         )
 
     def _ensure_enum_payload_struct(
-        self, enum_statement: s.Statement_EnumDefinition, variant: s.StructureDefinition
+        self, enum_statement: s.Statement_EnumDefinition, variant: s.Statement_StructureDefinition
     ) -> s.CLikeStructureDefinition:
         struct_name = f"{enum_statement.name}_{variant.name}_Payload"
         existing = self._structs.get(struct_name)
@@ -377,22 +380,25 @@ class Translator:
     def _translate_function_definition(self, statement: s.Statement_FunctionDefinition):
         fn = self._translate_nested_function_definition(statement)
         self._module.ast.append(fn)
-        self._funcs[statement.name] = fn
+        self._funcs[statement.signature.name] = fn
         return fn
 
     def _translate_nested_function_definition(self, statement: s.Statement_FunctionDefinition) -> Derective_fn:
-        assert statement.type is not None
+        assert statement.signature.type is not None
         fn = Derective_fn(
-            name=statement.name,
-            generics=[self._translate_type(g) for g in statement.generics],
-            params=[Parameter(name=param.name, type=self._translate_type(param.type)) for param in statement.params],
+            name=statement.signature.name,
+            generics=[self._translate_type(g) for g in statement.signature.generics],
+            params=[
+                Parameter(name=param.name, type=self._translate_type(param.type))
+                for param in statement.signature.params
+            ],
             body=[],
-            ret_type=self._translate_type(statement.type),
+            ret_type=self._translate_type(statement.signature.type),
         )
         self._translate_function_body(fn, statement.body)
         return fn
 
-    def _translate_function_body(self, fn: Derective_fn, body: list[s.Statement_InnerLevel]):
+    def _translate_function_body(self, fn: Derective_fn, body: Block):
         prev_current_function = getattr(self._builder, "current_function", None)
         prev_current_block = getattr(self._builder, "current_block", None)
         prev_builder_variables = getattr(self._builder, "variables", {})
@@ -421,8 +427,8 @@ class Translator:
         self._terminated_blocks = prev_terminated_blocks
         self._loop_stack = prev_loop_stack
 
-    def _translate_block(self, statement: list[s.Statement_InnerLevel]):
-        for inner_statement in statement:
+    def _translate_block(self, block: Block):
+        for inner_statement in block.body:
             if self._is_current_block_terminated():
                 break
             self._translate_inner_statement(inner_statement)
@@ -894,9 +900,9 @@ class Translator:
             phi = self._builder.build_phi(f"{var}_match_{match_id}", prepared.base_var_vals[var].type, pairs)
             self._var_vals[var] = phi.var_out
 
-    def _collect_assignments(self, body: list[s.Statement_InnerLevel]) -> set[str]:
+    def _collect_assignments(self, block: Block) -> set[str]:
         assigned: set[str] = set()
-        for stmt in body:
+        for stmt in block.body:
             if isinstance(stmt, s.Statement_Assignment):
                 if isinstance(stmt.target, s.Expression_Path) and len(stmt.target.segments) == 1:
                     assigned.add(stmt.name)
@@ -997,13 +1003,13 @@ class Translator:
 
             raise NotImplementedError(f"Translation for path expression {expr.name} is not implemented.")
 
-        elif isinstance(expr, s.Expression_Block):
-            return self._translate_expression_block(expr, name=name, expected_type=expected_type)
+        # elif isinstance(expr, s.Expression_Block):
+        #     return self._translate_expression_block(expr, name=name, expected_type=expected_type)
 
         elif isinstance(expr, s.Expression_Unsafe):
             self._unsafe_depth += 1
             try:
-                return self._translate_expression_block(expr, name=name, expected_type=expected_type)
+                return self._translate_expression_block(expr.body, name=name, expected_type=expected_type)
             finally:
                 self._unsafe_depth -= 1
 
@@ -1151,8 +1157,7 @@ class Translator:
             )
             callee = self._funcs.get(expr.name)
             if callee is not None:
-                generic_mapping = {generic.name: concrete for generic, concrete in zip(callee.generics, generics)}
-                call.var_out.type = self._specialize_type(callee.ret_type, generic_mapping)
+                call.var_out.type = self._specialize_type(callee.ret_type, {})
             return call
 
         raise NotImplementedError(f"Translation for expression type {type(expr)} is not implemented.")
@@ -1277,7 +1282,7 @@ class Translator:
 
     def _translate_expression_block(
         self,
-        expr: s.Expression_Block,
+        block: Block,
         name: Optional[str] = None,
         expected_type: Optional[Type] = None,
     ) -> Assignable:
@@ -1287,9 +1292,9 @@ class Translator:
         self._assignment_targets = dict(self._assignment_targets)
 
         try:
-            for statement in expr.body:
+            for statement in block.body[:-1]:
                 self._translate_expression_block_statement(statement)
-            return self._translate_expression(expr.expr, name=name, expected_type=expected_type)
+            return self._translate_expression(block.body[-1], name=name, expected_type=expected_type)
         finally:
             self._var_vals = outer_var_vals
             self._assignment_targets = outer_assignment_targets

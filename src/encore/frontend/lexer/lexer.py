@@ -18,6 +18,7 @@ class Lexer(ParserBase[str, LexerToken]):
                     self._consume_and_push(TokenType.WHITESPACE)
                 case "\n":
                     self._line += 1
+                    self._column = 0
                     self._consume_and_push(TokenType.NEWLINE)
 
                 case "+":
@@ -90,11 +91,25 @@ class Lexer(ParserBase[str, LexerToken]):
                     self._consume_and_push(TokenType.OP_SCOPE) if self._peek_curr() == ":" else self._push_token(
                         TokenType.COLON
                     )
-
+                case ".":
+                    self._consume_and_push(TokenType.DOT)
                 case ",":
                     self._consume_and_push(TokenType.COMMA)
                 case "=":
-                    self._consume_and_push(TokenType.OP_ASSIGN)
+                    self._consume()
+                    match self._peek_curr():
+                        case "=":
+                            self._consume_and_push(TokenType.OP_EQUAL)
+                        case ">":
+                            self._consume_and_push(TokenType.OP_FAT_ARROW)
+                        case _:
+                            self._push_token(TokenType.OP_ASSIGN)
+
+                case "!":
+                    self._consume()
+                    self._consume_and_push(TokenType.OP_NOT_EQUAL) if self._peek_curr() == "=" else self._push_token(
+                        TokenType.OP_NOT
+                    )
 
                 case '"':
                     self._consume()
@@ -111,6 +126,7 @@ class Lexer(ParserBase[str, LexerToken]):
                         self._consume()
                         self._push_token(TokenType.UNKNOWN)
                         unknowns.append(self._result.pop())
+        assert len(unknowns) == 0, unknowns
         return self._result
 
     def _parse_number(self):
@@ -161,14 +177,14 @@ class Lexer(ParserBase[str, LexerToken]):
 
     def _consume_and_push(self, token_type: TokenType):
         self._consume()
-        self._column += 1
         self._push_token(token_type)
 
-    def _push_token(self, token_type: TokenType):
+    def _push_token(self, token_type: TokenType) -> int:
         match token_type:
             case TokenType.NEWLINE | TokenType.WHITESPACE:
                 self._drop()
+                return 0
             case _:
-                self._push(
-                    LexerToken(type=token_type, value="".join(self._value), line=self._line, column=self._column)
-                )
+                lt = LexerToken(type=token_type, value="".join(self._value), line=self._line, column=self._column)
+                self._push(lt)
+                return len(lt.value)

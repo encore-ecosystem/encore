@@ -4,6 +4,7 @@ from typing import Optional
 from ehir.core.type import HeapSmartPointer, StackSmartPointer, Type
 
 from encore.frontend.parser import statements as s
+from encore.frontend.parser.statements import Block
 
 MatchArmLike = s.Statement_MatchArm | s.Expression_MatchArm
 
@@ -11,7 +12,7 @@ MatchArmLike = s.Statement_MatchArm | s.Expression_MatchArm
 class TypeInferer:
     def __init__(self):
         self._funcs: dict[str, s.Statement_FunctionDefinition] = {}
-        self._structs: dict[str, s.StructureDefinition] = {}
+        self._structs: dict[str, s.Statement_StructureDefinition] = {}
         self._enums: dict[str, s.Statement_EnumDefinition] = {}
         self._traits: dict[str, s.Statement_Trait] = {}
         self._unsafe_depth = 0
@@ -38,11 +39,9 @@ class TypeInferer:
     def _collect_declarations(self, statements: list[s.Statement]):
         for statement in statements:
             if isinstance(statement, s.Statement_FunctionDefinition):
-                self._funcs[statement.name] = statement
-            elif isinstance(statement, s.Statement_ExternFunctionDefinition):
-                self._funcs[statement.name] = statement
+                self._funcs[statement.signature.name] = statement
             elif isinstance(statement, s.Statement_StructureDefinition):
-                self._structs[statement.defi.name] = statement.defi
+                self._structs[statement.signature.name] = statement
             elif isinstance(statement, s.Statement_EnumDefinition):
                 self._enums[statement.name] = statement
             elif isinstance(statement, s.Statement_Trait):
@@ -60,22 +59,22 @@ class TypeInferer:
                     self._funcs[f"{struct_name}::{method.name}"] = replace(method, generics=merged_generics)
 
     def _infer_function(self, statement: s.Statement_FunctionDefinition):
-        env = {param.name: param.type for param in statement.params}
+        env = {param.name: param.type for param in statement.signature.params}
 
         prev_fn_return = self._current_fn_return_type
-        if statement.type is None:
-            statement.type = self._infer_return_type(statement.body, env)
+        if statement.signature.type is None:
+            statement.signature.type = self._infer_return_type(statement.body, env)
             if statement.type is None:
                 raise TypeError(f"Unable to infer return type for function '{statement.name}'")
 
-        self._current_fn_return_type = statement.type
+        self._current_fn_return_type = statement.signature.type
         try:
-            self._infer_block(statement.body, env, statement.type)
+            self._infer_block(statement.body, env, statement.signature.type)
         finally:
             self._current_fn_return_type = prev_fn_return
 
-    def _infer_block(self, body: list[s.Statement_InnerLevel], env: dict[str, Type], fn_ret_type: Type):
-        for statement in body:
+    def _infer_block(self, body: Block, env: dict[str, Type], fn_ret_type: Type):
+        for statement in body.body:
             if isinstance(statement, s.Statement_Let):
                 inferred = self._infer_expression(statement.expr, env, statement.type)
                 if statement.type is None:
@@ -293,7 +292,7 @@ class TypeInferer:
         if isinstance(expr, s.Expression_Unsafe):
             self._unsafe_depth += 1
             try:
-                return self._infer_expression_block(expr, env, expected_type)
+                return self._infer_expression_block(expr.body, env, expected_type)
             finally:
                 self._unsafe_depth -= 1
 
@@ -351,31 +350,37 @@ class TypeInferer:
             fn = self._funcs.get(expr.name)
             if fn is None:
                 return None
-            if isinstance(fn, s.Statement_ExternFunctionDefinition) and self._unsafe_depth <= 0:
+            if isinstance(fn, s.FunctionSignature) and self._unsafe_depth <= 0:
                 raise TypeError(f"Extern function '{fn.name}' can only be called inside unsafe block")
 
             generic_mapping: dict[str, Type] = {}
             if expr.generics:
-                if len(expr.generics) != len(fn.generics):
+                if len(expr.generics) != len(fn.signature.generics):
                     raise TypeError(
-                        f"Generic count mismatch for function '{fn.name}': {len(expr.generics)} != {len(fn.generics)}"
+                        f"Generic count mismatch for function '{fn.signature.name}': {len(expr.generics)} != {len(fn.signature.generics)}"
                     )
-                generic_mapping = {generic.name: concrete for generic, concrete in zip(fn.generics, expr.generics)}
+                generic_mapping = {
+                    generic.name: concrete for generic, concrete in zip(fn.signature.generics, expr.generics)
+                }
 
-            for param, arg in zip(fn.params, expr.args):
+            for param, arg in zip(fn.signature.params, expr.args):
                 expected_param_type = self._specialize_type(param.type, generic_mapping)
                 arg_type = self._infer_expression(arg, env, expected_param_type)
                 if arg_type is not None:
                     self._match_generic(param.type, arg_type, generic_mapping)
 
-            if fn.generics:
-                missing_generics = [generic.name for generic in fn.generics if generic.name not in generic_mapping]
+            if fn.signature.generics:
+                missing_generics = [
+                    generic.name for generic in fn.signature.generics if generic.name not in generic_mapping
+                ]
                 if missing_generics:
-                    raise TypeError(f"Unable to infer generics for function '{fn.name}': {', '.join(missing_generics)}")
-                expr.generics = [generic_mapping[generic.name] for generic in fn.generics]
-            if fn.type is None:
+                    raise TypeError(
+                        f"Unable to infer generics for function '{fn.signature.name}': {', '.join(missing_generics)}"
+                    )
+                expr.generics = [generic_mapping[generic.name] for generic in fn.signature.generics]
+            if fn.signature.type is None:
                 return None
-            return self._specialize_type(fn.type, generic_mapping)
+            return self._specialize_type(fn.signature.type, generic_mapping)
 
         if isinstance(expr, s.Expression_BinaryOperation):
             if expr.operator in ("&&", "||"):
@@ -496,15 +501,15 @@ class TypeInferer:
 
     def _infer_expression_block(
         self,
-        expr: s.Expression_Block,
+        block: Block,
         env: dict[str, Type],
         expected_type: Optional[Type] = None,
     ) -> Optional[Type]:
         block_env = dict(env)
-        for statement in expr.body:
+        for statement in block.body[:-1]:
             self._infer_expression_block_statement(statement, block_env)
 
-        return self._infer_expression(expr.expr, block_env, expected_type)
+        return self._infer_expression(block.body[-1], block_env, expected_type)
 
     def _infer_expression_block_statement(self, statement: s.Statement_InnerLevel, env: dict[str, Type]):
         if isinstance(statement, s.Statement_Let):
