@@ -16,6 +16,7 @@ class Lexer(ParserBase[str, LexerToken]):
             match curr_char:
                 case " ":
                     self._consume_and_push(TokenType.WHITESPACE)
+
                 case "\n":
                     self._line += 1
                     self._column = 0
@@ -36,6 +37,7 @@ class Lexer(ParserBase[str, LexerToken]):
                             self._consume_and_push(TokenType.OP_ARROW)
                         case _:
                             self._push_token(TokenType.OP_MINUS)
+
                 case "*":
                     self._consume()
                     self._consume_and_push(TokenType.OP_MULT_ASSIGN) if self._peek_curr() == "=" else self._push_token(
@@ -116,6 +118,9 @@ class Lexer(ParserBase[str, LexerToken]):
                     while self._peek_curr() != '"':
                         self._consume()
                     self._consume_and_push(TokenType.STRING)
+
+                case "'":
+                    self._consume_and_push(TokenType.QUOTE)
 
                 case _:
                     if curr_char.isdigit():

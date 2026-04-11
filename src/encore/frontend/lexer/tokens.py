@@ -87,6 +87,7 @@ class TokenType(Enum):
     COLON = auto()
     COMMA = auto()
     DOT = auto()
+    QUOTE = auto()
 
     WHITESPACE = auto()
     NEWLINE = auto()

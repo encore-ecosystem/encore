@@ -1,4 +1,4 @@
-from abc import ABC
+from abc import ABC, ABCMeta
 from dataclasses import dataclass
 from enum import StrEnum, auto
 from typing import Optional
@@ -208,19 +208,23 @@ class Statement_Let(Statement_InnerLevel):
 
 @dataclass
 class Statement_While(Statement_InnerLevel):
+    label: Optional[str]
     expr: "Statement_Expression"
     body: "Block"
 
     def __repr__(self) -> str:
-        return f"while {self.body}"
+        label_repr = f"<'{self.label}>" if self.label else ""
+        return f"while{label_repr} {self.body}"
 
 
 @dataclass
 class Statement_Loop(Statement_InnerLevel):
+    label: Optional[str]
     body: "Block"
 
     def __repr__(self) -> str:
-        return f"loop {self.body}"
+        label_repr = f"<'{self.label}>" if self.label else ""
+        return f"loop{label_repr} {self.body}"
 
 
 @dataclass
@@ -335,19 +339,25 @@ class Statement_Ret(Statement_ControlFlow):
 
 @dataclass
 class Statement_Break(Statement_ControlFlow):
+    label: Optional[str]
+
     def __repr__(self) -> str:
-        return "break"
+        label_repr = f"<'{self.label}>" if self.label else ""
+        return f"break{label_repr}"
 
 
 @dataclass
 class Statement_Continue(Statement_ControlFlow):
+    label: Optional[str]
+
     def __repr__(self) -> str:
-        return "continue"
+        label_repr = f"<'{self.label}>" if self.label else ""
+        return f"continue{label_repr}"
 
 
 # =============
 @dataclass
-class Statement_Expression(Statement_InnerLevel):
+class Statement_Expression(Statement_InnerLevel, ABC):
     pass
 
 

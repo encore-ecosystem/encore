@@ -54,9 +54,11 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_add,
     ProcessedInstruction_call,
     ProcessedInstruction_grt,
+    ProcessedInstruction_ieq,
     ProcessedInstruction_les,
     ProcessedInstruction_load,
     ProcessedInstruction_mul,
+    ProcessedInstruction_neq,
     ProcessedInstruction_phi,
     ProcessedInstruction_put,
     ProcessedInstruction_ret,
@@ -204,9 +206,9 @@ class Codegen:
             self._build_and(instr)
         elif isinstance(instr, Instruction_xor):
             self._build_xor(instr)
-        elif isinstance(instr, Instruction_ieq):
+        elif isinstance(instr, ProcessedInstruction_ieq):
             self._build_ieq(instr)
-        elif isinstance(instr, Instruction_neq):
+        elif isinstance(instr, ProcessedInstruction_neq):
             self._build_neq(instr)
         elif isinstance(instr, ProcessedInstruction_les):
             self._build_les(instr)
@@ -540,7 +542,7 @@ class Codegen:
         self._variables[instr.var_out.name] = result
         return result
 
-    def _build_ieq(self, instr: Instruction_ieq):
+    def _build_ieq(self, instr: ProcessedInstruction_ieq):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
@@ -549,7 +551,7 @@ class Codegen:
         self._variables[instr.var_out.name] = result
         return result
 
-    def _build_neq(self, instr: Instruction_neq):
+    def _build_neq(self, instr: ProcessedInstruction_neq):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]

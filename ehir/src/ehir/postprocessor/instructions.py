@@ -117,6 +117,20 @@ class ProcessedInstruction_grt(ProcessedInstruction):
 
 
 @dataclass
+class ProcessedInstruction_ieq(ProcessedInstruction):
+    var_out: TypedVariable
+    lhs: TypedVariable
+    rhs: TypedVariable
+
+
+@dataclass
+class ProcessedInstruction_neq(ProcessedInstruction):
+    var_out: TypedVariable
+    lhs: TypedVariable
+    rhs: TypedVariable
+
+
+@dataclass
 class ProcessedInstruction_store(ProcessedInstruction):
     var_src: TypedVariable
     var_dst: TypedVariable

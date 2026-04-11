@@ -56,9 +56,11 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_cbr,
     ProcessedInstruction_div,
     ProcessedInstruction_grt,
+    ProcessedInstruction_ieq,
     ProcessedInstruction_les,
     ProcessedInstruction_load,
     ProcessedInstruction_mul,
+    ProcessedInstruction_neq,
     ProcessedInstruction_phi,
     ProcessedInstruction_put,
     ProcessedInstruction_ret,
@@ -200,9 +202,27 @@ class Postprocessor:
         if isinstance(instr, Instruction_xor):
             self._build_xor(instr)
         if isinstance(instr, Instruction_ieq):
-            self._build_ieq(instr)
+            assert instr.var_out.type
+            assert instr.lhs.type
+            assert instr.rhs.type
+
+            return ProcessedInstruction_ieq(
+                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
+                lhs=TypedVariable(instr.lhs.name, instr.lhs.type),
+                rhs=TypedVariable(instr.rhs.name, instr.rhs.type),
+            )
+
         if isinstance(instr, Instruction_neq):
-            self._build_neq(instr)
+            assert instr.var_out.type
+            assert instr.lhs.type
+            assert instr.rhs.type
+
+            return ProcessedInstruction_neq(
+                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
+                lhs=TypedVariable(instr.lhs.name, instr.lhs.type),
+                rhs=TypedVariable(instr.rhs.name, instr.rhs.type),
+            )
+
         if isinstance(instr, Instruction_les):
             assert instr.var_out.type
             assert instr.lhs.type

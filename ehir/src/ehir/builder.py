@@ -15,7 +15,13 @@ from ehir.core.derectives import (
 )
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions.base import Assignable, Instruction
-from ehir.core.instructions.capture import Instruction_lcpos, Instruction_lcsos, Instruction_scsoh, Instruction_scsos
+from ehir.core.instructions.capture import (
+    Instruction_cpos,
+    Instruction_lcpos,
+    Instruction_lcsos,
+    Instruction_scsoh,
+    Instruction_scsos,
+)
 from ehir.core.instructions.control_flow import (
     Instruction_br,
     Instruction_call,
@@ -51,7 +57,7 @@ from ehir.core.instructions.operators.logic import (
 from ehir.core.primitives import Usize_t
 from ehir.core.primitives.base import Primitive
 from ehir.core.struct import Struct
-from ehir.core.type import HeapSmartPointer, StackSmartPointer, Type
+from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter, TypedVariable, Variable
 
 
@@ -167,6 +173,11 @@ class EHIR_Builder:
         lcpos = Instruction_lcpos(self._reserve_variable(name, prim.type), prim)
         self._add(lcpos)
         return lcpos
+
+    def build_cpos(self, prim: Primitive, name: Optional[str] = None) -> Instruction_cpos:
+        cpos = Instruction_cpos(self._reserve_variable(name, Pointer(prim.type)), prim)
+        self._add(cpos)
+        return cpos
 
     def build_lcsos(self, struct_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_lcsos:
         struct = Struct(name=struct_name, args=args)

@@ -12,12 +12,19 @@ from ehir.core.derectives import (
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum, EnumVariant
 from ehir.core.instructions.base import Assignable
-from ehir.core.instructions.capture import Instruction_lceos, Instruction_lcsos, Instruction_scsoh, Instruction_scsos
+from ehir.core.instructions.capture import (
+    Instruction_cpos,
+    Instruction_lceos,
+    Instruction_lcsos,
+    Instruction_scsoh,
+    Instruction_scsos,
+)
 from ehir.core.instructions.control_flow import MatchCase
-from ehir.core.instructions.control_flow.phi import PhiPair
 from ehir.core.instructions.memory import (
     Instruction_getfield,
     Instruction_getfieldptr,
+    Instruction_load,
+    Instruction_salloc,
     Instruction_sgetfieldptr,
     Instruction_store,
 )
@@ -31,7 +38,7 @@ from ehir.core.instructions.operators.arithmetic import (
 from ehir.core.instructions.operators.base import BinOp
 from ehir.core.primitives import Float, Float_t, Isize, Isize_t, Str, Str_t, Usize, Usize_t
 from ehir.core.struct import Struct
-from ehir.core.type import HeapSmartPointer, StackSmartPointer, Type
+from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter, Variable
 
 from encore.frontend.inference import TypeInferer
@@ -81,6 +88,7 @@ class Translator:
             *,
             scrutinee: Assignable,
             base_var_vals: dict[str, Variable],
+            base_var_ptrs: dict[str, Variable],
             end_block,
             default_block,
             wildcard_arm: MatchBodyArmLike | None,
@@ -89,11 +97,18 @@ class Translator:
         ):
             self.scrutinee = scrutinee
             self.base_var_vals = base_var_vals
+            self.base_var_ptrs = base_var_ptrs
             self.end_block = end_block
             self.default_block = default_block
             self.wildcard_arm = wildcard_arm
             self.arm_blocks = arm_blocks
             self.arm_payload_types = arm_payload_types
+
+    class _LoopContext:
+        def __init__(self, *, label: str | None, break_target: str, continue_target: str):
+            self.label = label
+            self.break_target = break_target
+            self.continue_target = continue_target
 
     def __init__(self):
         self._lexer = Lexer()
@@ -110,9 +125,10 @@ class Translator:
         self._variables: dict[str, dict[str, Variable]] = {}
         self._while_counter = 0
         self._if_counter = 0
-        self._loop_stack: list[dict[str, object]] = []
+        self._loop_stack: list[Translator._LoopContext] = []
         self._terminated_blocks: set[str] = set()
         self._var_vals: dict[str, Variable] = {}
+        self._var_ptrs: dict[str, Variable] = {}
         self._assignment_targets: dict[str, str] = {}
         self._funcs = {}
         self._enums = {}
@@ -134,7 +150,7 @@ class Translator:
         self.preload_declarations([statement for statement in ast if isinstance(statement, s.Statement_TopLevel)])
         for statement in ast:
             self._translate_statement(statement)
-
+        print(self._module)
         return self._module
 
     def preload_declarations(self, statements: list[s.Statement_TopLevel]):
@@ -403,6 +419,7 @@ class Translator:
         prev_current_block = getattr(self._builder, "current_block", None)
         prev_builder_variables = getattr(self._builder, "variables", {})
         prev_var_vals = self._var_vals
+        prev_var_ptrs = self._var_ptrs
         prev_assignment_targets = self._assignment_targets
         prev_terminated_blocks = self._terminated_blocks
         prev_loop_stack = self._loop_stack
@@ -410,6 +427,7 @@ class Translator:
         self._builder.current_function = fn
         self._builder.variables = {param.name: param for param in fn.params}
         self._var_vals = {}
+        self._var_ptrs = {}
         self._assignment_targets = {}
         self._terminated_blocks = set()
         self._loop_stack = []
@@ -423,6 +441,7 @@ class Translator:
             self._builder.current_block = prev_current_block
         self._builder.variables = prev_builder_variables
         self._var_vals = prev_var_vals
+        self._var_ptrs = prev_var_ptrs
         self._assignment_targets = prev_assignment_targets
         self._terminated_blocks = prev_terminated_blocks
         self._loop_stack = prev_loop_stack
@@ -476,10 +495,30 @@ class Translator:
         assert statement.type is not None
         self._set_new_variable(statement.name)
         expected_type = self._translate_type(statement.type)
-        val = self._translate_expression(statement.expr, name=statement.name, expected_type=expected_type)
-        if val.var_out.type is None:
-            val.var_out.type = expected_type
-        self._var_vals[statement.name] = val.var_out
+
+        slot_ptr: Variable
+        if isinstance(statement.expr, s.Expression_BooleanLiteral):
+            prim = Usize(1 if statement.expr.value else 0, size=1)
+            slot_ptr = self._builder.build_cpos(prim=prim, name=statement.name).var_out
+        elif isinstance(statement.expr, s.Expression_IntegerLiteral):
+            prim = self._build_integer_primitive(
+                int(statement.expr.value), statement.expr.literal_type or expected_type
+            )
+            slot_ptr = self._builder.build_cpos(prim=prim, name=statement.name).var_out
+        elif isinstance(statement.expr, s.Expression_FloatLiteral):
+            prim = Float(
+                float(statement.expr.value), size=self._infer_float_size(statement.expr.literal_type or expected_type)
+            )
+            slot_ptr = self._builder.build_cpos(prim=prim, name=statement.name).var_out
+        elif isinstance(statement.expr, s.Expression_StringLiteral):
+            slot_ptr = self._builder.build_cpos(prim=Str(statement.expr.value), name=statement.name).var_out
+        else:
+            val = self._translate_expression(statement.expr, expected_type=expected_type)
+            if val.var_out.type is None:
+                val.var_out.type = expected_type
+            slot_ptr = self._create_stack_slot(statement.name, val.var_out, expected_type)
+
+        self._var_ptrs[statement.name] = slot_ptr
 
     def _translate_ret(self, statement: s.Statement_Ret):
         self._set_new_variable("ret")
@@ -491,27 +530,13 @@ class Translator:
         self._mark_current_block_terminated()
 
     def _translate_break(self, statement: s.Statement_Break):
-        if not self._loop_stack:
-            raise ValueError("break used outside of a loop")
-
-        loop_ctx = self._loop_stack[-1]
-        break_inputs = loop_ctx["break_inputs"]
-        loop_vars = loop_ctx["loop_vars"]
-        current_block = self._builder.current_block.name
-        loop_ctx["break_blocks"].append(current_block)  # ty:ignore[unresolved-attribute]
-
-        for var, pairs in break_inputs.items():  # ty:ignore[unresolved-attribute]
-            pairs.append(PhiPair(self._var_vals.get(var, loop_vars[var]), current_block))  # ty:ignore[not-subscriptable]
-
-        self._builder.build_br(loop_ctx["break_target"])  # ty:ignore[invalid-argument-type]
+        loop_ctx = self._resolve_loop_ctx(statement.label, keyword="break")
+        self._builder.build_br(loop_ctx.break_target)
         self._mark_current_block_terminated()
 
     def _translate_continue(self, statement: s.Statement_Continue):
-        if not self._loop_stack:
-            raise ValueError("continue used outside of a loop")
-
-        loop_ctx = self._loop_stack[-1]
-        self._builder.build_br(loop_ctx["continue_target"])  # ty:ignore[invalid-argument-type]
+        loop_ctx = self._resolve_loop_ctx(statement.label, keyword="continue")
+        self._builder.build_br(loop_ctx.continue_target)
         self._mark_current_block_terminated()
 
     def _translate_assignment(self, statement: s.Statement_Assignment):
@@ -520,15 +545,20 @@ class Translator:
         if isinstance(statement.target, s.Expression_Path) and len(statement.target.segments) == 1:
             target_name = self._assignment_targets.get(statement.name, statement.name)
             self._set_new_variable(target_name)
-            expected_type = self._resolve_variable(statement.name).type
+            expected_type = self._resolve_variable_type(statement.name)
+            slot_ptr = self._var_ptrs.get(statement.name)
+            expr_name = self._advance_variable() if slot_ptr is not None else target_name
             val = self._translate_expression(
                 assign_expr,
-                name=target_name,
+                name=expr_name,
                 expected_type=expected_type,
             )
             if val.var_out.type is None:
                 val.var_out.type = expected_type
-            self._var_vals[statement.name] = val.var_out
+            if slot_ptr is not None:
+                self._builder._add(Instruction_store(var_src=val.var_out, var_dst=slot_ptr))
+            else:
+                self._var_vals[statement.name] = val.var_out
             return
 
         if isinstance(statement.target, s.Expression_StructField):
@@ -581,64 +611,29 @@ class Translator:
         body_block = self._builder.append_block(f"while_body_{while_id}")
         end_block = self._builder.append_block(f"while_end_{while_id}")
 
-        modified = self._collect_assignments(statement.body) & self._var_vals.keys()
-
-        phi_names: dict[str, tuple[str, str]] = {}
-        entry_vals: dict[str, Variable] = {}
-        for var in modified:
-            phi_names[var] = (f"{var}_phi_{while_id}", f"{var}_next_{while_id}")
-            entry_vals[var] = self._var_vals[var]
-
-        entry_block_name = self._builder.current_block.name
         self._builder.build_br(cond_block.name)
+        self._mark_current_block_terminated()
 
         self._builder.position_at_end(cond_block)
-        phi_vars: dict[str, Variable] = {}
-        for var, (phi_name, next_name) in phi_names.items():
-            phi = self._builder.build_phi(
-                phi_name,
-                entry_vals[var].type,
-                [
-                    PhiPair(entry_vals[var], entry_block_name),
-                    PhiPair(Variable(next_name), body_block.name),
-                ],
-            )
-            self._var_vals[var] = phi.var_out
-            phi_vars[var] = phi.var_out
-
         cond = self._translate_expression(statement.expr)
         self._builder.build_cbr(cond.var_out, body_block.name, end_block.name)
+        self._mark_current_block_terminated()
 
         self._builder.position_at_end(body_block)
-        saved_targets = self._assignment_targets
-        self._assignment_targets = {**saved_targets, **{var: next_name for var, (_, next_name) in phi_names.items()}}
-        loop_ctx = {
-            "break_target": end_block.name,
-            "continue_target": cond_block.name,
-            "break_inputs": {var: [] for var in modified},
-            "break_blocks": [],
-            "loop_vars": {var: phi_var for var, phi_var in phi_vars.items()},
-        }
-        self._loop_stack.append(loop_ctx)  # ty:ignore[invalid-argument-type]
+        self._loop_stack.append(
+            Translator._LoopContext(
+                label=statement.label,
+                break_target=end_block.name,
+                continue_target=cond_block.name,
+            )
+        )
         self._translate_block(statement.body)
         self._loop_stack.pop()
-        self._assignment_targets = saved_targets
         if not self._is_current_block_terminated():
             self._builder.build_br(cond_block.name)
             self._mark_current_block_terminated()
 
         self._builder.position_at_end(end_block)
-        for var, phi_var in phi_vars.items():
-            break_inputs = loop_ctx["break_inputs"][var]
-            if break_inputs:
-                exit_phi = self._builder.build_phi(
-                    f"{var}_exit_{while_id}",
-                    entry_vals[var].type,
-                    [PhiPair(phi_var, cond_block.name), *break_inputs],
-                )
-                self._var_vals[var] = exit_phi.var_out
-            else:
-                self._var_vals[var] = phi_var
 
     def _translate_do_while(self, statement: s.Statement_DoWhile):
         while_id = self._while_counter
@@ -648,68 +643,29 @@ class Translator:
         cond_block = self._builder.append_block(f"do_while_cond_{while_id}")
         end_block = self._builder.append_block(f"do_while_end_{while_id}")
 
-        modified = self._collect_assignments(statement.body) & self._var_vals.keys()
-
-        phi_names: dict[str, tuple[str, str]] = {}
-        entry_vals: dict[str, Variable] = {}
-        for var in modified:
-            phi_names[var] = (f"{var}_phi_{while_id}", f"{var}_next_{while_id}")
-            entry_vals[var] = self._var_vals[var]
-
-        entry_block_name = self._builder.current_block.name
         self._builder.build_br(body_block.name)
+        self._mark_current_block_terminated()
 
         self._builder.position_at_end(body_block)
-        phi_vars: dict[str, Variable] = {}
-        for var, (phi_name, next_name) in phi_names.items():
-            phi = self._builder.build_phi(
-                phi_name,
-                entry_vals[var].type,
-                [
-                    PhiPair(entry_vals[var], entry_block_name),
-                    PhiPair(Variable(next_name), cond_block.name),
-                ],
+        self._loop_stack.append(
+            Translator._LoopContext(
+                label=None,
+                break_target=end_block.name,
+                continue_target=cond_block.name,
             )
-            self._var_vals[var] = phi.var_out
-            phi_vars[var] = phi.var_out
-
-        saved_targets = self._assignment_targets
-        self._assignment_targets = {**saved_targets, **{var: next_name for var, (_, next_name) in phi_names.items()}}
-        loop_ctx = {
-            "break_target": end_block.name,
-            "continue_target": cond_block.name,
-            "break_inputs": {var: [] for var in modified},
-            "break_blocks": [],
-            "loop_vars": {var: phi_var for var, phi_var in phi_vars.items()},
-        }
-        self._loop_stack.append(loop_ctx)  # ty:ignore[invalid-argument-type]
+        )
         self._translate_block(statement.body)
         self._loop_stack.pop()
-        self._assignment_targets = saved_targets
         if not self._is_current_block_terminated():
             self._builder.build_br(cond_block.name)
             self._mark_current_block_terminated()
 
         self._builder.position_at_end(cond_block)
-        for var, (_, next_name) in phi_names.items():
-            self._var_vals[var] = Variable(next_name)
-
         cond = self._translate_expression(statement.expr)
         self._builder.build_cbr(cond.var_out, body_block.name, end_block.name)
         self._mark_current_block_terminated()
 
         self._builder.position_at_end(end_block)
-        for var in phi_vars:
-            break_inputs = loop_ctx["break_inputs"][var]
-            if break_inputs:
-                exit_phi = self._builder.build_phi(
-                    f"{var}_exit_{while_id}",
-                    entry_vals[var].type,
-                    [PhiPair(Variable(phi_names[var][1]), cond_block.name), *break_inputs],
-                )
-                self._var_vals[var] = exit_phi.var_out
-            else:
-                self._var_vals[var] = Variable(phi_names[var][1])
 
     def _translate_loop(self, statement: s.Statement_Loop):
         loop_id = self._while_counter
@@ -719,67 +675,28 @@ class Translator:
         latch_block = self._builder.append_block(f"loop_latch_{loop_id}")
         end_block = self._builder.append_block(f"loop_end_{loop_id}")
 
-        modified = self._collect_assignments(statement.body) & self._var_vals.keys()
-
-        phi_names: dict[str, tuple[str, str]] = {}
-        entry_vals: dict[str, Variable] = {}
-        for var in modified:
-            phi_names[var] = (f"{var}_phi_{loop_id}", f"{var}_next_{loop_id}")
-            entry_vals[var] = self._var_vals[var]
-
-        entry_block_name = self._builder.current_block.name
         self._builder.build_br(body_block.name)
+        self._mark_current_block_terminated()
 
         self._builder.position_at_end(body_block)
-        phi_vars: dict[str, Variable] = {}
-        for var, (phi_name, next_name) in phi_names.items():
-            phi = self._builder.build_phi(
-                phi_name,
-                entry_vals[var].type,
-                [
-                    PhiPair(entry_vals[var], entry_block_name),
-                    PhiPair(Variable(next_name), latch_block.name),
-                ],
+        self._loop_stack.append(
+            Translator._LoopContext(
+                label=statement.label,
+                break_target=end_block.name,
+                continue_target=latch_block.name,
             )
-            self._var_vals[var] = phi.var_out
-            phi_vars[var] = phi.var_out
-
-        saved_targets = self._assignment_targets
-        self._assignment_targets = {**saved_targets, **{var: next_name for var, (_, next_name) in phi_names.items()}}
-        loop_ctx = {
-            "break_target": end_block.name,
-            "continue_target": latch_block.name,
-            "break_inputs": {var: [] for var in modified},
-            "break_blocks": [],
-            "loop_vars": {var: phi_var for var, phi_var in phi_vars.items()},
-        }
-        self._loop_stack.append(loop_ctx)  # ty:ignore[invalid-argument-type]
+        )
         self._translate_block(statement.body)
         self._loop_stack.pop()
-        self._assignment_targets = saved_targets
         if not self._is_current_block_terminated():
             self._builder.build_br(latch_block.name)
             self._mark_current_block_terminated()
 
         self._builder.position_at_end(latch_block)
-        for var, (_, next_name) in phi_names.items():
-            self._var_vals[var] = Variable(next_name)
         self._builder.build_br(body_block.name)
         self._mark_current_block_terminated()
 
         self._builder.position_at_end(end_block)
-        if not loop_ctx["break_blocks"]:
-            self._mark_current_block_terminated()
-
-        for var in phi_vars:
-            break_inputs = loop_ctx["break_inputs"][var]
-            if break_inputs:
-                exit_phi = self._builder.build_phi(
-                    f"{var}_exit_{loop_id}",
-                    entry_vals[var].type,
-                    break_inputs,
-                )
-                self._var_vals[var] = exit_phi.var_out
 
     def _translate_if(self, statement: s.Statement_If):
         if_id = self._if_counter
@@ -794,12 +711,12 @@ class Translator:
         end_block = self._builder.append_block(f"if_end_{if_id}")
 
         base_var_vals = dict(self._var_vals)
-        modified = self._collect_if_assignments(statement) & base_var_vals.keys()
-        phi_inputs: dict[str, list[PhiPair]] = {var: [] for var in modified}
+        base_var_ptrs = dict(self._var_ptrs)
 
         for idx, branch in enumerate(statement.branches):
             self._builder.position_at_end(cond_blocks[idx])
             self._var_vals = dict(base_var_vals)
+            self._var_ptrs = dict(base_var_ptrs)
 
             false_target = (
                 cond_blocks[idx + 1].name
@@ -813,35 +730,22 @@ class Translator:
             self._builder.position_at_end(branch_bodies[idx])
             self._translate_block(branch.body)
             if not self._is_current_block_terminated():
-                branch_exit = self._builder.current_block.name
                 self._builder.build_br(end_block.name)
                 self._mark_current_block_terminated()
-
-                for var in modified:
-                    phi_inputs[var].append(PhiPair(self._var_vals.get(var, base_var_vals[var]), branch_exit))
 
         if else_block is not None:
             assert statement.else_body
             self._builder.position_at_end(else_block)
             self._var_vals = dict(base_var_vals)
+            self._var_ptrs = dict(base_var_ptrs)
             self._translate_block(statement.else_body)
             if not self._is_current_block_terminated():
-                else_exit = self._builder.current_block.name
                 self._builder.build_br(end_block.name)
                 self._mark_current_block_terminated()
 
-                for var in modified:
-                    phi_inputs[var].append(PhiPair(self._var_vals.get(var, base_var_vals[var]), else_exit))
-        else:
-            fallthrough_block = cond_blocks[-1].name
-            for var in modified:
-                phi_inputs[var].append(PhiPair(base_var_vals[var], fallthrough_block))
-
         self._builder.position_at_end(end_block)
         self._var_vals = dict(base_var_vals)
-        for var, pairs in phi_inputs.items():
-            phi = self._builder.build_phi(f"{var}_if_{if_id}", base_var_vals[var].type, pairs)
-            self._var_vals[var] = phi.var_out
+        self._var_ptrs = dict(base_var_ptrs)
 
     def _translate_match(self, statement: s.Statement_Match):
         match_id = self._if_counter
@@ -855,9 +759,6 @@ class Translator:
             default_prefix="match_default",
             arm_prefix="match_arm",
         )
-        modified = self._collect_match_assignments(statement) & prepared.base_var_vals.keys()
-        phi_inputs: dict[str, list[PhiPair]] = {var: [] for var in modified}
-        dispatch_block = self._builder.current_block.name
 
         for idx, arm in enumerate(statement.arms):
             if arm.is_wildcard:
@@ -865,6 +766,7 @@ class Translator:
 
             self._builder.position_at_end(prepared.arm_blocks[idx])
             self._var_vals = dict(prepared.base_var_vals)
+            self._var_ptrs = dict(prepared.base_var_ptrs)
             payload_type = prepared.arm_payload_types[idx]
 
             if arm.binding is not None and payload_type is not None:
@@ -872,33 +774,21 @@ class Translator:
 
             self._translate_block(arm.body)
             if not self._is_current_block_terminated():
-                arm_exit = self._builder.current_block.name
                 self._builder.build_br(prepared.end_block.name)
                 self._mark_current_block_terminated()
-
-                for var in modified:
-                    phi_inputs[var].append(PhiPair(self._var_vals.get(var, prepared.base_var_vals[var]), arm_exit))
 
         if prepared.wildcard_arm is not None:
             self._builder.position_at_end(prepared.default_block)
             self._var_vals = dict(prepared.base_var_vals)
+            self._var_ptrs = dict(prepared.base_var_ptrs)
             self._translate_block(prepared.wildcard_arm.body)
             if not self._is_current_block_terminated():
-                default_exit = self._builder.current_block.name
                 self._builder.build_br(prepared.end_block.name)
                 self._mark_current_block_terminated()
 
-                for var in modified:
-                    phi_inputs[var].append(PhiPair(self._var_vals.get(var, prepared.base_var_vals[var]), default_exit))
-
         self._builder.position_at_end(prepared.end_block)
         self._var_vals = dict(prepared.base_var_vals)
-        if prepared.wildcard_arm is None:
-            for var in modified:
-                phi_inputs[var].append(PhiPair(prepared.base_var_vals[var], dispatch_block))
-        for var, pairs in phi_inputs.items():
-            phi = self._builder.build_phi(f"{var}_match_{match_id}", prepared.base_var_vals[var].type, pairs)
-            self._var_vals[var] = phi.var_out
+        self._var_ptrs = dict(prepared.base_var_ptrs)
 
     def _collect_assignments(self, block: Block) -> set[str]:
         assigned: set[str] = set()
@@ -991,6 +881,9 @@ class Translator:
 
         elif isinstance(expr, s.Expression_Path):
             if len(expr.segments) == 1:
+                ptr = self._var_ptrs.get(expr.name)
+                if ptr is not None:
+                    return self._build_load_from_ptr(ptr, name=name)
                 if expr.name in self._var_vals:
                     return Assignable(self._var_vals[expr.name])
                 return self._builder.get_var(expr.name)
@@ -1176,6 +1069,12 @@ class Translator:
         rhs_block = self._builder.append_block(f"logical_rhs_{logical_id}")
         short_block = self._builder.append_block(f"logical_short_{logical_id}")
         end_block = self._builder.append_block(f"logical_end_{logical_id}")
+        result_name = name or self._advance_variable()
+        result_slot = self._create_stack_slot(
+            f"{result_name}_slot",
+            self._builder.build_lcpos(prim=Usize(0, size=1)).var_out,
+            Usize_t(1),
+        )
 
         lhs = self._translate_expression(expr.lhs, expected_type=Type("bool"))
         lhs_cond = self._ensure_boolean(lhs.var_out, context=f"lhs of '{expr.operator}'")
@@ -1189,23 +1088,18 @@ class Translator:
         self._builder.position_at_end(rhs_block)
         rhs = self._translate_expression(expr.rhs, expected_type=Type("bool"))
         rhs_cond = self._ensure_boolean(rhs.var_out, context=f"rhs of '{expr.operator}'")
-        rhs_exit = self._builder.current_block.name
+        self._builder._add(Instruction_store(var_src=rhs_cond, var_dst=result_slot))
         self._builder.build_br(end_block.name)
         self._mark_current_block_terminated()
 
         self._builder.position_at_end(short_block)
         short_value = self._builder.build_lcpos(prim=Usize(0 if expr.operator == "&&" else 1, size=1)).var_out
-        short_exit = self._builder.current_block.name
+        self._builder._add(Instruction_store(var_src=short_value, var_dst=result_slot))
         self._builder.build_br(end_block.name)
         self._mark_current_block_terminated()
 
         self._builder.position_at_end(end_block)
-        result = self._builder.build_phi(
-            name or self._advance_variable(),
-            Usize_t(1),
-            [PhiPair(rhs_cond, rhs_exit), PhiPair(short_value, short_exit)],
-        )
-        return Assignable(result.var_out)
+        return self._build_load_from_ptr(result_slot, name=result_name)
 
     def _ensure_boolean(self, var: Variable, *, context: str) -> Variable:
         if var.type is None:
@@ -1287,8 +1181,10 @@ class Translator:
         expected_type: Optional[Type] = None,
     ) -> Assignable:
         outer_var_vals = self._var_vals
+        outer_var_ptrs = self._var_ptrs
         outer_assignment_targets = self._assignment_targets
         self._var_vals = dict(self._var_vals)
+        self._var_ptrs = dict(self._var_ptrs)
         self._assignment_targets = dict(self._assignment_targets)
 
         try:
@@ -1297,6 +1193,7 @@ class Translator:
             return self._translate_expression(block.body[-1], name=name, expected_type=expected_type)
         finally:
             self._var_vals = outer_var_vals
+            self._var_ptrs = outer_var_ptrs
             self._assignment_targets = outer_assignment_targets
 
     def _translate_expression_block_statement(self, statement: s.Statement_InnerLevel):
@@ -1322,13 +1219,15 @@ class Translator:
         end_block = self._builder.append_block(f"if_expr_end_{if_id}")
 
         base_var_vals = dict(self._var_vals)
-        phi_pairs: list[PhiPair] = []
+        base_var_ptrs = dict(self._var_ptrs)
         result_name = name or self._advance_variable()
         result_type = expected_type
+        result_slot: Variable | None = None
 
         for idx, branch in enumerate(expr.branches):
             self._builder.position_at_end(cond_blocks[idx])
             self._var_vals = dict(base_var_vals)
+            self._var_ptrs = dict(base_var_ptrs)
 
             false_target = cond_blocks[idx + 1].name if idx + 1 < branch_count else else_block.name
             cond = self._translate_expression(branch.expr)
@@ -1338,25 +1237,32 @@ class Translator:
             self._builder.position_at_end(branch_bodies[idx])
             branch_result = self._translate_expression(branch.body, expected_type=expected_type)
             result_type = result_type or branch_result.var_out.type
-            branch_exit = self._builder.current_block.name
+            if result_slot is None:
+                assert result_type is not None
+                result_slot = self._create_stack_slot(f"{result_name}_slot", branch_result.var_out, result_type)
+            else:
+                self._builder._add(Instruction_store(var_src=branch_result.var_out, var_dst=result_slot))
             self._builder.build_br(end_block.name)
             self._mark_current_block_terminated()
-            phi_pairs.append(PhiPair(branch_result.var_out, branch_exit))
 
         self._builder.position_at_end(else_block)
         self._var_vals = dict(base_var_vals)
+        self._var_ptrs = dict(base_var_ptrs)
         else_result = self._translate_expression(expr.else_body, expected_type=expected_type)
         result_type = result_type or else_result.var_out.type
-        else_exit = self._builder.current_block.name
+        if result_slot is None:
+            assert result_type is not None
+            result_slot = self._create_stack_slot(f"{result_name}_slot", else_result.var_out, result_type)
+        else:
+            self._builder._add(Instruction_store(var_src=else_result.var_out, var_dst=result_slot))
         self._builder.build_br(end_block.name)
         self._mark_current_block_terminated()
-        phi_pairs.append(PhiPair(else_result.var_out, else_exit))
 
-        assert result_type is not None
+        assert result_type is not None and result_slot is not None
         self._builder.position_at_end(end_block)
         self._var_vals = dict(base_var_vals)
-        phi = self._builder.build_phi(result_name, result_type, phi_pairs)
-        return Assignable(phi.var_out)
+        self._var_ptrs = dict(base_var_ptrs)
+        return self._build_load_from_ptr(result_slot, name=result_name)
 
     def _translate_match_expression(
         self,
@@ -1375,9 +1281,9 @@ class Translator:
             default_prefix="match_expr_default",
             arm_prefix="match_expr_arm",
         )
-        phi_pairs: list[PhiPair] = []
         result_name = name or self._advance_variable()
         result_type = expected_type
+        result_slot: Variable | None = None
 
         for idx, arm in enumerate(expr.arms):
             if arm.is_wildcard:
@@ -1385,6 +1291,7 @@ class Translator:
 
             self._builder.position_at_end(prepared.arm_blocks[idx])
             self._var_vals = dict(prepared.base_var_vals)
+            self._var_ptrs = dict(prepared.base_var_ptrs)
 
             payload_type = prepared.arm_payload_types[idx]
             if arm.binding is not None and payload_type is not None:
@@ -1392,26 +1299,33 @@ class Translator:
 
             arm_result = self._translate_expression(arm.expr, expected_type=expected_type)
             result_type = result_type or arm_result.var_out.type
-            arm_exit = self._builder.current_block.name
+            if result_slot is None:
+                assert result_type is not None
+                result_slot = self._create_stack_slot(f"{result_name}_slot", arm_result.var_out, result_type)
+            else:
+                self._builder._add(Instruction_store(var_src=arm_result.var_out, var_dst=result_slot))
             self._builder.build_br(prepared.end_block.name)
             self._mark_current_block_terminated()
-            phi_pairs.append(PhiPair(arm_result.var_out, arm_exit))
 
         if prepared.wildcard_arm is not None:
             self._builder.position_at_end(prepared.default_block)
             self._var_vals = dict(prepared.base_var_vals)
+            self._var_ptrs = dict(prepared.base_var_ptrs)
             default_result = self._translate_expression(prepared.wildcard_arm.expr, expected_type=expected_type)
             result_type = result_type or default_result.var_out.type
-            default_exit = self._builder.current_block.name
+            if result_slot is None:
+                assert result_type is not None
+                result_slot = self._create_stack_slot(f"{result_name}_slot", default_result.var_out, result_type)
+            else:
+                self._builder._add(Instruction_store(var_src=default_result.var_out, var_dst=result_slot))
             self._builder.build_br(prepared.end_block.name)
             self._mark_current_block_terminated()
-            phi_pairs.append(PhiPair(default_result.var_out, default_exit))
 
-        assert result_type is not None
+        assert result_type is not None and result_slot is not None
         self._builder.position_at_end(prepared.end_block)
         self._var_vals = dict(prepared.base_var_vals)
-        phi = self._builder.build_phi(result_name, result_type, phi_pairs)
-        return Assignable(phi.var_out)
+        self._var_ptrs = dict(prepared.base_var_ptrs)
+        return self._build_load_from_ptr(result_slot, name=result_name)
 
     def _prepare_match(
         self,
@@ -1430,6 +1344,7 @@ class Translator:
                 f"Unable to infer match scrutinee type in '{current_fn}' for expression: {scrutinee_expr!r}"
             )
         base_var_vals = dict(self._var_vals)
+        base_var_ptrs = dict(self._var_ptrs)
         end_block = self._builder.append_block(f"{end_prefix}_{match_id}")
         wildcard_arm = next((arm for arm in arms if arm.is_wildcard), None)
         default_block = (
@@ -1455,6 +1370,7 @@ class Translator:
         return self._PreparedMatch(
             scrutinee=scrutinee,
             base_var_vals=base_var_vals,
+            base_var_ptrs=base_var_ptrs,
             end_block=end_block,
             default_block=default_block,
             wildcard_arm=wildcard_arm,
@@ -1475,6 +1391,55 @@ class Translator:
     def _is_current_block_terminated(self) -> bool:
         return self._builder.current_block.name in self._terminated_blocks
 
+    def _resolve_loop_ctx(self, label: str | None, *, keyword: str) -> _LoopContext:
+        if not self._loop_stack:
+            raise ValueError(f"{keyword} used outside of a loop")
+        if label is None:
+            return self._loop_stack[-1]
+        for loop_ctx in reversed(self._loop_stack):
+            if loop_ctx.label == label:
+                return loop_ctx
+        raise ValueError(f"{keyword}<'{label}'> targets unknown loop label")
+
+    def _resolve_variable_type(self, name: str) -> Type | None:
+        ptr = self._var_ptrs.get(name)
+        if ptr is not None and isinstance(ptr.type, Pointer):
+            return ptr.type.pointee
+        return self._resolve_variable(name).type
+
+    def _build_load_from_ptr(self, ptr: Variable, *, name: str | None = None) -> Assignable:
+        pointee_type = ptr.type.pointee if isinstance(ptr.type, Pointer) else None
+        if name is None:
+            self._unique_variable_idx += 1
+            name = f"{ptr.name}_{self._unique_variable_idx}"
+        out = Variable(name or self._advance_variable(), pointee_type)
+        self._builder._add(Instruction_load(var_out=out, var=ptr))
+        return Assignable(out)
+
+    def _create_stack_slot(self, slot_name: str, value: Variable, value_type: Type) -> Variable:
+        if isinstance(value_type, (Usize_t, Isize_t, Float_t, Str_t)):
+            init_prim = self._zero_primitive(value_type)
+            capture = Instruction_cpos(var_out=Variable(slot_name, Pointer(value_type)), primitive=init_prim)
+            self._builder._add(capture)
+            slot_ptr = capture.var_out
+        else:
+            slot_ptr = Variable(slot_name, Pointer(value_type))
+            self._builder._add(Instruction_salloc(var_out=slot_ptr, type=value_type))
+
+        self._builder._add(Instruction_store(var_src=value, var_dst=slot_ptr))
+        return slot_ptr
+
+    def _zero_primitive(self, typ: Type):
+        if isinstance(typ, Usize_t):
+            return Usize(0, size=typ.size)
+        if isinstance(typ, Isize_t):
+            return Isize(0, size=typ.size)
+        if isinstance(typ, Float_t):
+            return Float(0.0, size=typ.size)
+        if isinstance(typ, Str_t):
+            return Str("")
+        raise TypeError(f"Can not build zero primitive for type '{typ}'")
+
     #
     # Helpers
     #
@@ -1489,6 +1454,8 @@ class Translator:
         return f"{self._current_variable_name}_{self._unique_variable_idx}"
 
     def _resolve_variable(self, name: str) -> Variable:
+        if name in self._var_ptrs:
+            return self._build_load_from_ptr(self._var_ptrs[name]).var_out
         if name in self._var_vals:
             return self._var_vals[name]
         try:

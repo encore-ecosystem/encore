@@ -1,3 +1,5 @@
+from typing import Optional
+
 from ehir.core.type import HeapSmartPointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter
 from ehir.format import ThemePalette, printfmt
@@ -303,22 +305,26 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     def _parse_while(self) -> s.Statement_While:
         self._safe_consume(TokenType.KW_WHILE)
+        label = self._parse_maybe_label()
         expr = self._parse_expression()
         body = self._parse_block()
-        return s.Statement_While(expr, body)
+        return s.Statement_While(label, expr, body)
 
     def _parse_loop(self) -> s.Statement_Loop:
         self._safe_consume(TokenType.KW_LOOP)
+        label = self._parse_maybe_label()
         body = self._parse_block()
-        return s.Statement_Loop(body)
+        return s.Statement_Loop(label, body)
 
     def _parse_break(self):
         self._safe_consume(TokenType.KW_BREAK)
-        return s.Statement_Break()
+        label = self._parse_maybe_label()
+        return s.Statement_Break(label)
 
     def _parse_continue(self):
         self._safe_consume(TokenType.KW_CONTINUE)
-        return s.Statement_Continue()
+        label = self._parse_maybe_label()
+        return s.Statement_Continue(label)
 
     def _parse_do_while(self) -> s.Statement_DoWhile:
         self._safe_consume(TokenType.KW_DO)
@@ -580,6 +586,15 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         expr = self._parse_expression()
         self._safe_consume(TokenType.RIGHT_PAREN)
         return s.Expression_Parenthesized(expr=expr)
+
+    def _parse_maybe_label(self) -> Optional[str]:
+        label = None
+        if self._peek_curr().type == TokenType.OP_LESS:
+            self._safe_consume(TokenType.OP_LESS)
+            self._safe_consume(TokenType.QUOTE)
+            label = self._safe_consume(TokenType.IDENTIFIER).value
+            self._safe_consume(TokenType.OP_GREATER)
+        return label
 
     def _parse_expression_block(self) -> s.Statement_Expression:
         self._safe_consume(TokenType.LEFT_BRACE)
