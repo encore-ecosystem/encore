@@ -170,6 +170,8 @@ class Lexer(ParserBase[str, LexerToken]):
             "extern": TokenType.KW_EXTERN,
             "unsafe": TokenType.KW_UNSAFE,
             "not": TokenType.OP_NOT,
+            "true": TokenType.BOOLEAN,
+            "false": TokenType.BOOLEAN,
         }
 
         token_type = TokenType.IDENTIFIER

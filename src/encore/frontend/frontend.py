@@ -2,12 +2,13 @@ import tomllib
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from pathlib import Path
+from typing import Optional
 
 from ehir.builder import EHIR_Module
 from ehir.core.derectives import Derective_imp, Derective_import
 
 from ehir import EHIR_Frontend
-from encore import ENCORE_CACHE_DIR, PROJECT_ROOT
+from encore import ENCORE_CACHE_DIR
 from encore.frontend.inference import TypeInferer
 from encore.frontend.lexer import Lexer
 from encore.frontend.parser import Parser
@@ -65,52 +66,24 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
     def get_parent_id_of(self, id: Path, derective: Derective_import) -> Path:
         project_root = self._get_project_root_of(id)
-        dep_roots = self._get_dependency_roots(project_root)
-        manifest = self._load_manifest(project_root)
+        prefix_root = derective.prefix[0]
+        suffix = derective.prefix[1:]
 
-        match derective.prefix[0]:
+        match prefix_root:
             case "refrain":
-                # 1) Absolute path inside current project (legacy refrain semantics).
-                local_absolute = project_root / "src" / Path(*derective.prefix[1:])
-                local_module = self._resolve_module_path(local_absolute)
-                if local_module.exists():
-                    dep_filepath = local_absolute
-                else:
-                    # 2) Root-prefixed dependency form: refrain::<dep_root>::...
-                    if len(derective.prefix) < 2:
-                        raise RuntimeError(f"Unable to import: {derective} in {id}")
+                dep_filepath = project_root / "src" / ("lib" if not suffix else Path(*suffix))
 
-                    refrain_root = derective.prefix[1]
-                    if refrain_root == manifest.project.name:
-                        base_root = project_root
-                    elif refrain_root in dep_roots:
-                        base_root = dep_roots[refrain_root]
-                    elif refrain_root == "std":
-                        base_root = self._fallback_std_root()
-                    else:
-                        raise RuntimeError(f"Unable to import: {derective} in {id}")
+            case "mod":
+                dep_filepath = id.parent if not suffix else id.parent / Path(*suffix)
 
-                    if len(derective.prefix) == 2:
-                        dep_filepath = base_root / "src" / "lib"
-                    else:
-                        dep_filepath = base_root / "src" / Path(*derective.prefix[2:])
-            case "repo":
-                dep_filepath = self.src_dir / Path(*derective.prefix[1:])
-            case self_name if self_name == manifest.project.name:
-                if len(derective.prefix) == 1:
-                    dep_filepath = project_root / "src" / "lib"
-                else:
-                    dep_filepath = project_root / "src" / Path(*derective.prefix[1:])
-            case dep_name if dep_name in dep_roots:
-                dep_root = dep_roots[dep_name]
-                if len(derective.prefix) == 1:
-                    dep_filepath = dep_root / "src" / "lib"
-                else:
-                    dep_filepath = dep_root / "src" / Path(*derective.prefix[1:])
-            case "std":
-                dep_filepath = self._fallback_std_root() / "src" / Path(*derective.prefix[1:])
             case _:
-                dep_filepath = id.parent / Path(*derective.prefix)
+                dep_roots = self._get_dependency_roots(project_root)
+                dep_root = dep_roots.get(prefix_root)
+                if dep_root is None:
+                    raise ImportError(
+                        f"Unknown dependency root '{prefix_root}' for import '{derective}' in module '{id}'."
+                    )
+                dep_filepath = dep_root / "src" / ("lib" if not suffix else Path(*suffix))
 
         dep_filepath = self._resolve_module_path(dep_filepath)
         if not dep_filepath.exists():
@@ -284,16 +257,18 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         raise RuntimeError(f"Unable to load dependency: {dependency}")
 
-    def _fallback_std_root(self) -> Path:
-        local_std = PROJECT_ROOT.parent / "stdlib"
-        if local_std.exists():
-            return local_std
-        return PROJECT_ROOT / "std"
-
     def _resolve_module_path(self, path: Path) -> Path:
         if path.with_suffix(".enq").exists():
             return path.with_suffix(".enq")
         return (path / "mod").with_suffix(".enq")
+
+    @staticmethod
+    def _fallback_to_manifest(path: Path) -> Optional[Path]:
+        assert path.is_absolute()
+        for parent in path.parents:
+            manifest_path = parent / ProjectManifest.default_filename()
+            if manifest_path.exists():
+                return manifest_path
 
     def get_file_extension(self) -> str:
         return ".enq"

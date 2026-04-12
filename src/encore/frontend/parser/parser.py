@@ -699,6 +699,8 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             return self._parse_integer_literal()
         elif curr_token.type == TokenType.FLOAT:
             return self._parse_float_literal()
+        elif curr_token.type == TokenType.BOOLEAN:
+            return s.Expression_BooleanLiteral(curr_token.value == "true")
         elif curr_token.type == TokenType.STRING:
             return self._parse_string_literal()
 
@@ -715,9 +717,6 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             return self._parse_unsafe_expression()
 
         elif curr_token.type == TokenType.IDENTIFIER:
-            if curr_token.value in ("true", "false"):
-                self._consume()
-                return s.Expression_BooleanLiteral(curr_token.value == "true")
             first = self._parse_type()
             segments = [first]
             while self._peek_curr().type == TokenType.OP_SCOPE:
@@ -727,8 +726,8 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             path = s.Expression_Path(segments)
 
             if self._peek_curr().type == TokenType.LEFT_BRACE:
-                if self._parsing_match_header:
-                    return path
+                # if self._parsing_match_header:
+                #     return path
                 return self._parse_struct_initialization(first)
             return path
 

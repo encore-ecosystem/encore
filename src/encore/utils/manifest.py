@@ -1,4 +1,6 @@
+import tomllib
 from enum import StrEnum
+from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 from pydantic.fields import Field
@@ -40,3 +42,9 @@ class ProjectManifest(StrictModel):
         return cls(
             project=ProjectSection(name=project_name),
         )
+
+    @classmethod
+    def read(cls, path: Path) -> "ProjectManifest":
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+        return cls(**data)

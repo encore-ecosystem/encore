@@ -242,7 +242,7 @@ class EHIR_ProjectCompiler:
 
             else:
                 for d in parent_ast:
-                    if isinstance(d, Derective_fn) and d.is_extern:
+                    if isinstance(d, Derective_fn):
                         append_directive(d)
                 for d in parent_ast:
                     if isinstance(d, Derective_import):
