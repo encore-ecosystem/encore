@@ -1,6 +1,6 @@
 from ehir.builder import EHIR_Module
 from ehir.core.block import TerminatedBlock
-from ehir.core.derectives import Derective_struct
+from ehir.core.derectives import Derective_extern_fn, Derective_struct
 from ehir.core.instructions.base import Instruction
 from ehir.core.instructions.capture import Instruction_lcpos
 from ehir.core.instructions.control_flow import (
@@ -55,6 +55,7 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_call,
     ProcessedInstruction_cbr,
     ProcessedInstruction_div,
+    ProcessedInstruction_getfieldptr,
     ProcessedInstruction_grt,
     ProcessedInstruction_ieq,
     ProcessedInstruction_les,
@@ -95,6 +96,14 @@ class Postprocessor:
                         entry_block=self._validate_block(derective.entry_block),
                         body=[self._validate_block(b) for b in derective.body],
                         exit_block=self._validate_block(derective.exit_block),
+                    )
+                )
+            elif isinstance(derective, Derective_extern_fn):
+                mod.funcs.append(
+                    ProcessedDerective_extern_fn(
+                        name=derective.name,
+                        params=derective.params,
+                        ret_type=derective.ret_type,
                     )
                 )
 
@@ -266,7 +275,15 @@ class Postprocessor:
         if isinstance(instr, Instruction_pcast):
             self._build_pcast(instr)
         if isinstance(instr, Instruction_getfieldptr):
-            self._build_getfieldptr(instr)
+            assert instr.var_out.type
+            assert instr.src.type
+            assert instr.field.type
+
+            return ProcessedInstruction_getfieldptr(
+                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
+                src=TypedVariable(instr.src.name, instr.src.type),
+                field=TypedVariable(instr.field.name, instr.field.type),
+            )
         if isinstance(instr, Instruction_getfield):
             self._build_getfield(instr)
         if isinstance(instr, Instruction_getptr):

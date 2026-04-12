@@ -1,5 +1,5 @@
-from abc import ABC, ABCMeta
-from dataclasses import dataclass
+from abc import ABC
+from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from typing import Optional
 
@@ -74,6 +74,22 @@ class Statement_FunctionDefinition(Statement_TopLevel):
     signature: FunctionSignature
     body: "Block"
 
+    @property
+    def name(self) -> str:
+        return self.signature.name
+
+    @property
+    def generics(self) -> list[Type]:
+        return self.signature.generics
+
+    @property
+    def params(self) -> list[Parameter]:
+        return self.signature.params
+
+    @property
+    def type(self) -> Type | None:
+        return self.signature.type
+
     def __repr__(self) -> str:
         return f"{self.signature} {self.body}"
 
@@ -83,11 +99,13 @@ class Statement_Trait(Statement_TopLevel):
     name: str
     generics: list[Type]
     body: list[FunctionSignature]
+    bases: list[Type] = field(default_factory=list)
 
     def __repr__(self) -> str:
         generics_repr = ("[" + ", ".join(str(g) for g in self.generics) + "]") if self.generics else ""
+        bases_repr = f" < {', '.join(str(base) for base in self.bases)}" if self.bases else ""
         body_repr = " {\n" + "\n".join(f"  {method}" for method in self.body) + "\n}"
-        return f"{super().__repr__()}trait {self.name}{generics_repr}{body_repr}"
+        return f"{super().__repr__()}trait {self.name}{generics_repr}{bases_repr}{body_repr}"
 
 
 @dataclass
@@ -200,10 +218,12 @@ class Statement_Let(Statement_InnerLevel):
     name: str
     type: Type | None
     expr: "Statement_Expression"
+    is_mut: bool = False
 
     def __repr__(self) -> str:
+        mut_repr = "mut " if self.is_mut else ""
         type_repr = f" : {self.type}" if self.type else ""
-        return f"let {self.name}{type_repr} = {self.expr}"
+        return f"let {mut_repr}{self.name}{type_repr} = {self.expr}"
 
 
 @dataclass

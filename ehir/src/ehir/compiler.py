@@ -1,4 +1,5 @@
 import hashlib
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,6 +9,7 @@ from ehir.builder import EHIR_Module
 from ehir.cache import CompiledRefrainCache
 from ehir.core.derectives import (
     Derective_enum,
+    Derective_extern_fn,
     Derective_fn,
     Derective_impl,
     Derective_import,
@@ -36,6 +38,7 @@ class EHIR_ProjectCompiler:
     frontend: EHIR_Frontend
     backend: EHIR_Backend
     cache_dir: Path | None = None
+    on_refrain: Callable[[Refrain], None] | None = None
     refrains: dict[str, Refrain] = field(default_factory=dict)
     tree: dict[Path, TreeNode] = field(default_factory=dict)
     compiled_refrains: dict[str, CompiledRefrain] = field(default_factory=dict)
@@ -77,17 +80,22 @@ class EHIR_ProjectCompiler:
         if compiled_refrain := self.compiled_refrains.get(refrain.name):
             return compiled_refrain
 
+        if self.on_refrain is not None:
+            self.on_refrain(refrain)
+
         entrypoint_id = self._get_entrypoint_id(refrain)
         node = self._compile_node_by_id(entrypoint_id)
         source_files = self._collect_source_files(entrypoint_id)
         semantic_hash = self._build_semantic_hash(refrain, source_files)
 
         if compiled_refrain := self._cache.load(refrain.name, semantic_hash):
-            printfmt(f"[{refrain.name}] Cache hit.\n", style=ThemePalette.ACCENT_TEXT)
+            if self.on_refrain is None:
+                printfmt(f"[{refrain.name}] Cache hit.\n", style=ThemePalette.ACCENT_TEXT)
             self.compiled_refrains[refrain.name] = compiled_refrain
             return compiled_refrain
 
-        printfmt(f"[{refrain.name}] Compiling...\n", style=ThemePalette.ACCENT_TEXT)
+        if self.on_refrain is None:
+            printfmt(f"[{refrain.name}] Compiling...\n", style=ThemePalette.ACCENT_TEXT)
 
         module = EHIR_Module(
             id=node.module.id,
@@ -199,7 +207,7 @@ class EHIR_ProjectCompiler:
         resolved_impls: set[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = set()
 
         def append_directive(directive):
-            if isinstance(directive, (Derective_fn, Derective_struct, Derective_enum, Derective_trait)):
+            if isinstance(directive, (Derective_fn, Derective_extern_fn, Derective_struct, Derective_enum, Derective_trait)):
                 key = (type(directive), directive.name)
                 if key in resolved_symbols:
                     return
@@ -242,17 +250,17 @@ class EHIR_ProjectCompiler:
 
             else:
                 for d in parent_ast:
-                    if isinstance(d, Derective_fn):
+                    if isinstance(d, (Derective_fn, Derective_extern_fn)):
                         append_directive(d)
                 for d in parent_ast:
                     if isinstance(d, Derective_import):
                         continue
 
                     if (
-                        isinstance(d, (Derective_fn, Derective_struct, Derective_enum, Derective_trait))
+                        isinstance(d, (Derective_fn, Derective_extern_fn, Derective_struct, Derective_enum, Derective_trait))
                         and d.name == directive.symbol
                     ):
-                        if isinstance(d, (Derective_fn, Derective_trait, Derective_struct)):
+                        if isinstance(d, (Derective_fn, Derective_extern_fn, Derective_trait, Derective_struct)):
                             append_module_contents(parent_ast)
                         else:
                             append_directive(d)

@@ -118,7 +118,7 @@ class Resolver:
         base_function_names: set[str] = set()
 
         for derective in ast:
-            if isinstance(derective, Derective_fn):
+            if isinstance(derective, (Derective_fn, Derective_extern_fn)):
                 self.fn[derective.name] = derective
                 base_function_names.add(derective.name)
             elif isinstance(derective, Derective_enum):
@@ -151,7 +151,11 @@ class Resolver:
         base_struct_ast_names = {x.name for x in ast if isinstance(x, Derective_struct)}
         new_enums = [e for e in self.enums if e not in base_enum_ast_names]
         new_structs = [s for s in self.structs if s not in base_struct_ast_names]
-        new_functions = [f for f in self.fn if f not in base_function_names and not self.fn[f].generics]
+        new_functions = [
+            f
+            for f in self.fn
+            if f not in base_function_names and not getattr(self.fn[f], "generics", [])
+        ]
         new_ast = []
 
         for derective in new_enums:
@@ -237,8 +241,6 @@ class Resolver:
             if isinstance(target_fn, Derective_extern_fn):
                 if not instr.is_unsafe:
                     raise TypeError(f"Extern function '{instr.fn_name}' requires unsafe call")
-                if target_fn.generics:
-                    raise TypeError(f"Extern function '{instr.fn_name}' cannot be generic")
                 if len(instr.args) != len(target_fn.params):
                     raise TypeError(
                         f"Argument count mismatch for extern function '{instr.fn_name}': "

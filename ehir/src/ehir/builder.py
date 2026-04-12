@@ -41,6 +41,7 @@ from ehir.core.instructions.operators.arithmetic import (
     Instruction_shr,
     Instruction_sub,
 )
+from ehir.core.instructions.operators.base import BinOp
 from ehir.core.instructions.operators.comparison import (
     Instruction_geq,
     Instruction_grt,
@@ -96,8 +97,14 @@ class EHIR_Builder:
             )
         )
 
-    def build_trait(self, name: str, generics: list[Type], methods: list[TraitMethod]):
-        trait = Derective_trait(name=name, generics=generics, methods=methods)
+    def build_trait(
+        self,
+        name: str,
+        generics: list[Type],
+        methods: list[TraitMethod],
+        bounds: dict[str, list[str]] | None = None,
+    ):
+        trait = Derective_trait(name=name, generics=generics, bounds=bounds or {}, methods=methods)
         self.module.ast.append(trait)
         return trait
 
@@ -129,38 +136,45 @@ class EHIR_Builder:
         extern_fn = Derective_extern_fn(name=name, params=params, ret_type=ret_type)
         self.module.ast.append(extern_fn)
 
-    def build_add(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_add:
-        instr = Instruction_add(self._reserve_variable(name), lhs, rhs)
-        self._add(instr)
-        return instr
+    def build_binop(self, op: str, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> BinOp:
+        instr = None
+        match op:
+            case "add":
+                instr = Instruction_add(self._reserve_variable(name), lhs, rhs)
+            case "sub":
+                instr = Instruction_sub(self._reserve_variable(name), lhs, rhs)
+            case "mul":
+                instr = Instruction_mul(self._reserve_variable(name), lhs, rhs)
+            case "div":
+                instr = Instruction_div(self._reserve_variable(name), lhs, rhs)
+            case "mod":
+                instr = Instruction_mod(self._reserve_variable(name), lhs, rhs)
+            case "shl":
+                instr = Instruction_shl(self._reserve_variable(name, lhs.type), lhs, rhs)
+            case "shr":
+                instr = Instruction_shr(self._reserve_variable(name, lhs.type), lhs, rhs)
+            case "ieq":
+                instr = Instruction_ieq(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
+            case "neq":
+                instr = Instruction_neq(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
+            case "and":
+                instr = Instruction_and(self._reserve_variable(name, lhs.type), lhs, rhs)
+            case "or":
+                instr = Instruction_or(self._reserve_variable(name, lhs.type), lhs, rhs)
+            case "xor":
+                instr = Instruction_xor(self._reserve_variable(name, lhs.type), lhs, rhs)
+            case "les":
+                instr = Instruction_les(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
+            case "leq":
+                instr = Instruction_leq(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
+            case "grt":
+                instr = Instruction_grt(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
+            case "geq":
+                instr = Instruction_geq(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
+            case _:
+                raise ValueError(f"Unknown operator: {op}")
 
-    def build_sub(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_sub:
-        instr = Instruction_sub(self._reserve_variable(name), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_mul(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_mul:
-        instr = Instruction_mul(self._reserve_variable(name), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_div(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_div:
-        instr = Instruction_div(self._reserve_variable(name), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_mod(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_mod:
-        instr = Instruction_mod(self._reserve_variable(name), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_shl(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_shl:
-        instr = Instruction_shl(self._reserve_variable(name, lhs.type), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_shr(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_shr:
-        instr = Instruction_shr(self._reserve_variable(name, lhs.type), lhs, rhs)
+        assert instr
         self._add(instr)
         return instr
 
@@ -250,51 +264,7 @@ class EHIR_Builder:
     def build_match(self, cond_var: Variable, default_label: str, cases: list[MatchCase]):
         self._add(Instruction_match(cond_var=cond_var, default_case=default_label, cases=cases))
 
-    def build_ieq(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_ieq:
-        instr = Instruction_ieq(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_neq(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_neq:
-        instr = Instruction_neq(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_and(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_and:
-        instr = Instruction_and(self._reserve_variable(name, lhs.type), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_or(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_or:
-        instr = Instruction_or(self._reserve_variable(name, lhs.type), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_xor(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_xor:
-        instr = Instruction_xor(self._reserve_variable(name, lhs.type), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_les(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_les:
-        instr = Instruction_les(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_leq(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_leq:
-        instr = Instruction_leq(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_grt(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_grt:
-        instr = Instruction_grt(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
-        self._add(instr)
-        return instr
-
-    def build_geq(self, lhs: Variable, rhs: Variable, name: Optional[str] = None) -> Instruction_geq:
-        instr = Instruction_geq(self._reserve_variable(name, Usize_t(1)), lhs, rhs)
-        self._add(instr)
-        return instr
-
+    # deprecated shit
     def build_phi(self, name: str, var_type: Optional[Type], pairs: list[PhiPair]) -> Instruction_phi:
         var = self._reserve_variable(name, var_type)
         instr = Instruction_phi(var_out=var, args=pairs)

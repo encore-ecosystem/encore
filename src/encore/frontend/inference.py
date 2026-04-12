@@ -5,6 +5,14 @@ from ehir.core.type import HeapSmartPointer, StackSmartPointer, Type
 
 from encore.frontend.parser import statements as s
 from encore.frontend.parser.statements import Block
+from encore.frontend.types import (
+    AnySmartPointer,
+    is_mutable_type,
+    is_reference_like_type,
+    make_mutable_type,
+    strip_mutability,
+    unwrap_for_storage,
+)
 
 MatchArmLike = s.Statement_MatchArm | s.Expression_MatchArm
 
@@ -12,11 +20,13 @@ MatchArmLike = s.Statement_MatchArm | s.Expression_MatchArm
 class TypeInferer:
     def __init__(self):
         self._funcs: dict[str, s.Statement_FunctionDefinition] = {}
-        self._structs: dict[str, s.Statement_StructureDefinition] = {}
+        self._structs: dict[str, s.StructureSignature] = {}
         self._enums: dict[str, s.Statement_EnumDefinition] = {}
         self._traits: dict[str, s.Statement_Trait] = {}
+        self._impl_traits: dict[str, list[str]] = {}
         self._unsafe_depth = 0
         self._current_fn_return_type: Type | None = None
+        self._current_self_type: Type | None = None
 
     def infer(
         self,
@@ -32,7 +42,7 @@ class TypeInferer:
                 self._infer_function(statement)
             elif isinstance(statement, s.Statement_Impl):
                 for method in statement.body:
-                    self._infer_function(method)
+                    self._infer_function(method, self_type=statement.struct)
 
         return ast
 
@@ -41,13 +51,17 @@ class TypeInferer:
             if isinstance(statement, s.Statement_FunctionDefinition):
                 self._funcs[statement.signature.name] = statement
             elif isinstance(statement, s.Statement_StructureDefinition):
-                self._structs[statement.signature.name] = statement
+                self._structs[statement.signature.name] = self._normalize_struct_definition(statement.signature)
             elif isinstance(statement, s.Statement_EnumDefinition):
                 self._enums[statement.name] = statement
             elif isinstance(statement, s.Statement_Trait):
                 self._traits[statement.name] = statement
-            elif isinstance(statement, s.Statement_Impl) and statement.trait_name is None:
+            elif isinstance(statement, s.Statement_Impl):
                 struct_name = statement.struct.name
+                if statement.trait_name is not None:
+                    self._impl_traits.setdefault(struct_name, []).append(statement.trait_name)
+                    continue
+
                 for method in statement.body:
                     method_generic_names = {generic.name for generic in statement.generics}
                     merged_generics = [*statement.generics]
@@ -56,124 +70,165 @@ class TypeInferer:
                             continue
                         merged_generics.append(generic)
                         method_generic_names.add(generic.name)
-                    self._funcs[f"{struct_name}::{method.name}"] = replace(method, generics=merged_generics)
 
-    def _infer_function(self, statement: s.Statement_FunctionDefinition):
+                    normalized_signature = self._normalize_signature(
+                        replace(method.signature, generics=merged_generics),
+                        self_type=statement.struct,
+                    )
+                    self._funcs[f"{struct_name}::{method.name}"] = replace(method, signature=normalized_signature)
+
+    def _infer_function(self, statement: s.Statement_FunctionDefinition, self_type: Type | None = None):
+        statement.signature = self._normalize_signature(statement.signature, self_type=self_type)
         env = {param.name: param.type for param in statement.signature.params}
+        mutability_env = {param.name: False for param in statement.signature.params}
 
         prev_fn_return = self._current_fn_return_type
+        prev_self_type = self._current_self_type
         if statement.signature.type is None:
-            statement.signature.type = self._infer_return_type(statement.body, env)
-            if statement.type is None:
+            statement.signature.type = self._infer_return_type(statement.body, env, mutability_env)
+            if statement.signature.type is None:
                 raise TypeError(f"Unable to infer return type for function '{statement.name}'")
 
         self._current_fn_return_type = statement.signature.type
+        self._current_self_type = self._resolve_self_type(self_type or env.get("self"))
         try:
-            self._infer_block(statement.body, env, statement.signature.type)
+            self._infer_block(statement.body, env, mutability_env, statement.signature.type)
         finally:
             self._current_fn_return_type = prev_fn_return
+            self._current_self_type = prev_self_type
 
-    def _infer_block(self, body: Block, env: dict[str, Type], fn_ret_type: Type):
+    def _infer_block(self, body: Block, env: dict[str, Type], mutability_env: dict[str, bool], fn_ret_type: Type):
         for statement in body.body:
             if isinstance(statement, s.Statement_Let):
-                inferred = self._infer_expression(statement.expr, env, statement.type)
+                inferred = self._infer_expression(statement.expr, env, statement.type, mutability_env)
                 if statement.type is None:
                     if inferred is None:
                         raise TypeError(f"Unable to infer type of variable '{statement.name}'")
                     statement.type = inferred
-                elif inferred is not None and statement.type != inferred:
-                    raise TypeError(f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}")
+                elif inferred is not None:
+                    if not self._types_compatible(statement.type, inferred) and not self._types_match_ignoring_mut(
+                        statement.type, inferred
+                    ):
+                        raise TypeError(
+                            f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}"
+                        )
+                    statement.type = self._concretize_type(statement.type, inferred)
                 env[statement.name] = statement.type
+                mutability_env[statement.name] = statement.is_mut
             elif isinstance(statement, s.Statement_Assignment):
+                self._assert_assignment_target_mutable(statement.target, env, mutability_env)
                 expected = self._infer_lvalue_type(statement.target, env)
-                value_type = self._infer_expression(statement.expr, env, expected)
-                if expected is not None and value_type is not None and expected != value_type:
+                value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
+                if expected is not None and value_type is not None and not self._types_compatible(expected, value_type):
                     raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
             elif isinstance(statement, s.Statement_Expr):
-                self._infer_expression(statement.expr, env)
+                self._infer_expression(statement.expr, env, mutable_env=mutability_env)
             elif isinstance(statement, s.Statement_Ret):
-                ret_type = self._infer_expression(statement.expr, env, fn_ret_type)
-                if ret_type is not None and ret_type != fn_ret_type:
+                ret_type = self._infer_expression(statement.expr, env, fn_ret_type, mutability_env)
+                if ret_type is not None and not self._types_compatible(fn_ret_type, ret_type):
                     raise TypeError(f"Return type mismatch: {ret_type} != {fn_ret_type}")
             elif isinstance(statement, s.Statement_While):
-                cond = self._infer_expression(statement.expr, env, Type("bool"))
+                cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
                 if cond is not None and cond != Type("bool"):
                     raise TypeError(f"While condition must be bool, got {cond}")
-                self._infer_block(statement.body, dict(env), fn_ret_type)
+                self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
             elif isinstance(statement, s.Statement_DoWhile):
-                self._infer_block(statement.body, dict(env), fn_ret_type)
-                cond = self._infer_expression(statement.expr, env, Type("bool"))
+                self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
+                cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
                 if cond is not None and cond != Type("bool"):
                     raise TypeError(f"Do-while condition must be bool, got {cond}")
             elif isinstance(statement, s.Statement_Loop):
-                self._infer_block(statement.body, dict(env), fn_ret_type)
+                self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
             elif isinstance(statement, s.Statement_If):
                 for branch in statement.branches:
-                    cond = self._infer_expression(branch.expr, env, Type("bool"))
+                    cond = self._infer_expression(branch.expr, env, Type("bool"), mutability_env)
                     if cond is not None and cond != Type("bool"):
                         raise TypeError(f"If condition must be bool, got {cond}")
-                    self._infer_block(branch.body, dict(env), fn_ret_type)
+                    self._infer_block(branch.body, dict(env), dict(mutability_env), fn_ret_type)
                 if statement.else_body is not None:
-                    self._infer_block(statement.else_body, dict(env), fn_ret_type)
+                    self._infer_block(statement.else_body, dict(env), dict(mutability_env), fn_ret_type)
             elif isinstance(statement, s.Statement_Match):
-                self._infer_match(statement, env, fn_ret_type)
+                self._infer_match(statement, env, mutability_env, fn_ret_type)
             elif isinstance(statement, s.Statement_Unsafe):
                 self._unsafe_depth += 1
                 try:
-                    self._infer_block(statement.body, dict(env), fn_ret_type)
+                    self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
                 finally:
                     self._unsafe_depth -= 1
 
-    def _infer_return_type(self, body: list[s.Statement_InnerLevel], env: dict[str, Type]) -> Optional[Type]:
+    def _infer_return_type(
+        self,
+        body: Block | list[s.Statement_InnerLevel],
+        env: dict[str, Type],
+        mutability_env: dict[str, bool],
+    ) -> Optional[Type]:
+        statements = body.body if isinstance(body, Block) else body
         types: list[Type] = []
-        for statement in body:
+        for statement in statements:
             if isinstance(statement, s.Statement_Let):
-                inferred = self._infer_expression(statement.expr, env, statement.type)
+                inferred = self._infer_expression(statement.expr, env, statement.type, mutability_env)
                 if inferred is not None:
                     if statement.type is None:
                         statement.type = inferred
+                    else:
+                        if not self._types_compatible(
+                            statement.type, inferred
+                        ) and not self._types_match_ignoring_mut(statement.type, inferred):
+                            raise TypeError(
+                                f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}"
+                            )
+                        statement.type = self._concretize_type(statement.type, inferred)
                     env[statement.name] = statement.type
+                    mutability_env[statement.name] = statement.is_mut
+            if isinstance(statement, s.Statement_Assignment):
+                self._assert_assignment_target_mutable(statement.target, env, mutability_env)
+                expected = self._infer_lvalue_type(statement.target, env)
+                value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
+                if expected is not None and value_type is not None and not self._types_compatible(expected, value_type):
+                    raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
             if isinstance(statement, s.Statement_Ret):
-                ret_type = self._infer_expression(statement.expr, env)
+                ret_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
                 if ret_type is not None:
                     types.append(ret_type)
             elif isinstance(statement, s.Statement_Expr):
-                self._infer_expression(statement.expr, env)
+                self._infer_expression(statement.expr, env, mutable_env=mutability_env)
             elif isinstance(statement, s.Statement_While):
-                nested = self._infer_return_type(statement.body, dict(env))
+                nested = self._infer_return_type(statement.body, dict(env), dict(mutability_env))
                 if nested is not None:
                     types.append(nested)
             elif isinstance(statement, s.Statement_DoWhile):
-                nested = self._infer_return_type(statement.body, dict(env))
+                nested = self._infer_return_type(statement.body, dict(env), dict(mutability_env))
                 if nested is not None:
                     types.append(nested)
             elif isinstance(statement, s.Statement_Loop):
-                nested = self._infer_return_type(statement.body, dict(env))
+                nested = self._infer_return_type(statement.body, dict(env), dict(mutability_env))
                 if nested is not None:
                     types.append(nested)
             elif isinstance(statement, s.Statement_If):
                 for branch in statement.branches:
-                    nested = self._infer_return_type(branch.body, dict(env))
+                    nested = self._infer_return_type(branch.body, dict(env), dict(mutability_env))
                     if nested is not None:
                         types.append(nested)
                 if statement.else_body is not None:
-                    nested = self._infer_return_type(statement.else_body, dict(env))
+                    nested = self._infer_return_type(statement.else_body, dict(env), dict(mutability_env))
                     if nested is not None:
                         types.append(nested)
             elif isinstance(statement, s.Statement_Match):
-                scrutinee_type = self._infer_expression(statement.expr, env)
+                scrutinee_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
                 for arm in statement.arms:
                     arm_env = dict(env)
+                    arm_mutability_env = dict(mutability_env)
                     payload_type = self._resolve_match_arm_payload_type(scrutinee_type, arm)
                     if arm.binding is not None and payload_type is not None:
                         arm_env[arm.binding] = payload_type
-                    nested = self._infer_return_type(arm.body, arm_env)
+                        arm_mutability_env[arm.binding] = False
+                    nested = self._infer_return_type(arm.body, arm_env, arm_mutability_env)
                     if nested is not None:
                         types.append(nested)
             elif isinstance(statement, s.Statement_Unsafe):
                 self._unsafe_depth += 1
                 try:
-                    nested = self._infer_return_type(statement.body, dict(env))
+                    nested = self._infer_return_type(statement.body, dict(env), dict(mutability_env))
                 finally:
                     self._unsafe_depth -= 1
                 if nested is not None:
@@ -187,42 +242,190 @@ class TypeInferer:
                 raise TypeError(f"Unable to infer a single return type: {first} != {typ}")
         return first
 
+    def _normalize_signature(self, signature: s.FunctionSignature, self_type: Type | None) -> s.FunctionSignature:
+        resolved_self_type = self._resolve_self_type(self_type)
+        params = [replace(param, type=self._resolve_self_in_type(param.type, resolved_self_type)) for param in signature.params]
+        ret_type = None if signature.type is None else self._resolve_self_in_type(signature.type, resolved_self_type)
+        return replace(signature, params=params, type=ret_type)
+
+    def _normalize_struct_definition(self, definition: s.StructureSignature) -> s.StructureSignature:
+        if isinstance(definition, s.CLikeStructureDefinition):
+            return definition
+        if isinstance(definition, s.TupleStructureDefinition):
+            return definition._to_clike()
+        if isinstance(definition, s.UnitStructureDefinition):
+            return definition._to_tuple()._to_clike()
+        raise NotImplementedError(f"Unsupported structure definition: {type(definition)}")
+
+    def _resolve_self_type(self, self_type: Type | None) -> Type | None:
+        if self_type is None:
+            return None
+        self_type = unwrap_for_storage(self_type)
+        if self_type.name == "Self" and not self_type.generics:
+            return self._current_self_type or self_type
+        return self_type
+
+    def _resolve_self_in_type(self, typ: Type, self_type: Type | None) -> Type:
+        if is_mutable_type(typ):
+            resolved = self._resolve_self_in_type(unwrap_for_storage(typ), self_type)
+            return make_mutable_type(resolved)
+        if isinstance(typ, AnySmartPointer):
+            return AnySmartPointer(self._resolve_self_in_type(typ.pointee, self_type))
+        if isinstance(typ, HeapSmartPointer):
+            return HeapSmartPointer(self._resolve_self_in_type(typ.pointee, self_type))
+        if isinstance(typ, StackSmartPointer):
+            return StackSmartPointer(self._resolve_self_in_type(typ.pointee, self_type))
+        if typ.name == "Self" and not typ.generics and self_type is not None:
+            return self_type
+        return replace(typ, generics=[self._resolve_self_in_type(g, self_type) for g in typ.generics])
+
+    def _lookup_function_signature(self, fn_name: str) -> s.FunctionSignature | None:
+        fn = self._funcs.get(fn_name)
+        return None if fn is None else fn.signature
+
+    def _lookup_trait_method_signature(
+        self,
+        trait_name: str,
+        method_name: str,
+        *,
+        receiver_type: Type | None = None,
+        seen: set[str] | None = None,
+    ) -> s.FunctionSignature | None:
+        trait = self._traits.get(trait_name)
+        if trait is None:
+            return None
+
+        seen = seen or set()
+        if trait_name in seen:
+            return None
+        seen.add(trait_name)
+
+        for method in trait.body:
+            if method.name == method_name:
+                return self._normalize_signature(method, self_type=receiver_type)
+
+        for base in trait.bases:
+            signature = self._lookup_trait_method_signature(base.name, method_name, receiver_type=receiver_type, seen=seen)
+            if signature is not None:
+                return signature
+        return None
+
+    def _resolve_method_signature(self, receiver_type: Type, method_name: str) -> tuple[str, s.FunctionSignature]:
+        receiver_type = unwrap_for_storage(receiver_type)
+        base_receiver_type = receiver_type.pointee if is_reference_like_type(receiver_type) else receiver_type
+        inherent_name = f"{base_receiver_type.name}::{method_name}"
+        inherent_signature = self._lookup_function_signature(inherent_name)
+        if inherent_signature is not None:
+            return inherent_name, inherent_signature
+
+        for trait_name in self._impl_traits.get(base_receiver_type.name, []):
+            trait_signature = self._lookup_trait_method_signature(
+                trait_name,
+                method_name,
+                receiver_type=base_receiver_type,
+            )
+            if trait_signature is not None:
+                return f"{trait_name}::{method_name}", trait_signature
+
+        raise TypeError(f"Method '{method_name}' is not defined for type '{base_receiver_type.name}'")
+
+    def _infer_call_signature(
+        self,
+        *,
+        signature: s.FunctionSignature,
+        args: list[s.Statement_Expression],
+        env: dict[str, Type],
+        expected_type: Optional[Type],
+        mutable_env: dict[str, bool],
+        explicit_generics: list[Type],
+        callable_name: str,
+    ) -> Optional[Type]:
+        if len(args) != len(signature.params):
+            raise TypeError(f"Argument count mismatch for function '{callable_name}': {len(args)} != {len(signature.params)}")
+
+        generic_mapping: dict[str, Type] = {}
+        if explicit_generics:
+            if len(explicit_generics) != len(signature.generics):
+                raise TypeError(
+                    f"Generic count mismatch for function '{callable_name}': {len(explicit_generics)} != {len(signature.generics)}"
+                )
+            generic_mapping = {
+                generic.name: concrete for generic, concrete in zip(signature.generics, explicit_generics)
+            }
+
+        for param, arg in zip(signature.params, args):
+            expected_param_type = self._specialize_type(param.type, generic_mapping)
+            arg_type = self._infer_expression(arg, env, expected_param_type, mutable_env)
+            if (
+                arg_type is not None
+                and expected_param_type is not None
+                and not self._types_compatible(expected_param_type, arg_type)
+            ):
+                raise TypeError(f"Type mismatch in call argument: {expected_param_type} != {arg_type}")
+            if arg_type is not None:
+                self._match_generic(param.type, arg_type, generic_mapping)
+
+        if signature.generics:
+            missing_generics = [generic.name for generic in signature.generics if generic.name not in generic_mapping]
+            if missing_generics:
+                raise TypeError(f"Unable to infer generics for function '{callable_name}': {', '.join(missing_generics)}")
+            explicit_generics[:] = [generic_mapping[generic.name] for generic in signature.generics]
+
+        if signature.type is None:
+            return None
+        return self._specialize_type(signature.type, generic_mapping)
+
     def _infer_lvalue_type(self, expr: s.Statement_Expression, env: dict[str, Type]) -> Optional[Type]:
         if isinstance(expr, s.Expression_Path) and len(expr.segments) == 1:
-            return env.get(expr.name)
+            if expr.name in env:
+                return env.get(expr.name)
+            if self._current_self_type is not None:
+                return self._lookup_field_type(self._current_self_type, expr.name)
+            return None
         if isinstance(expr, s.Expression_StructField):
             return self._lookup_chained_field_type(expr.name, expr.field, env)
         return None
 
-    def _infer_match(self, statement: s.Statement_Match, env: dict[str, Type], fn_ret_type: Type):
-        scrutinee_type = self._infer_expression(statement.expr, env)
+    def _infer_match(
+        self,
+        statement: s.Statement_Match,
+        env: dict[str, Type],
+        mutability_env: dict[str, bool],
+        fn_ret_type: Type,
+    ):
+        scrutinee_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
         if scrutinee_type is None:
             raise TypeError("Unable to infer type of match expression")
         self._validate_match_coverage(scrutinee_type, statement.arms)
 
         for arm in statement.arms:
             if arm.is_wildcard:
-                self._infer_block(arm.body, dict(env), fn_ret_type)
+                self._infer_block(arm.body, dict(env), dict(mutability_env), fn_ret_type)
                 continue
 
             variant_name, payload_type = self._resolve_match_arm(scrutinee_type, arm)
 
             arm_env = dict(env)
+            arm_mutability_env = dict(mutability_env)
             if arm.binding is not None:
                 if payload_type is None:
                     raise TypeError(f"Variant '{variant_name}' does not carry payload")
                 arm_env[arm.binding] = payload_type
+                arm_mutability_env[arm.binding] = False
             elif payload_type is not None:
                 # Payload-less matching is allowed; no binding is introduced.
                 pass
-            self._infer_block(arm.body, arm_env, fn_ret_type)
+            self._infer_block(arm.body, arm_env, arm_mutability_env, fn_ret_type)
 
     def _infer_expression(
         self,
         expr: s.Statement_Expression,
         env: dict[str, Type],
         expected_type: Optional[Type] = None,
+        mutable_env: dict[str, bool] | None = None,
     ) -> Optional[Type]:
+        mutable_env = mutable_env or {}
+
         if isinstance(expr, s.Expression_BooleanLiteral):
             return Type("bool")
 
@@ -241,6 +444,8 @@ class TypeInferer:
             if expected_type is not None and self._is_integer_type(expected_type):
                 expr.literal_type = expected_type
                 return expected_type
+            if expected_type is not None and self._is_float_type(expected_type):
+                return expected_type
             return Type("i32")
 
         if isinstance(expr, s.Expression_FloatLiteral):
@@ -256,23 +461,19 @@ class TypeInferer:
             return Type("f64")
 
         if isinstance(expr, s.Expression_Try):
-            inner_type = self._infer_expression(expr.expr, env)
+            inner_type = self._infer_expression(expr.expr, env, mutable_env=mutable_env)
             if inner_type is None:
                 raise TypeError("Unable to infer type of expression used with '?'")
 
-            base_inner = (
-                inner_type.pointee if isinstance(inner_type, (HeapSmartPointer, StackSmartPointer)) else inner_type
-            )
+            inner_type = unwrap_for_storage(inner_type)
+            base_inner = inner_type.pointee if is_reference_like_type(inner_type) else inner_type
             if base_inner.name != "Result" or len(base_inner.generics) != 2:
                 raise TypeError(f"'?' operator expects Result[T, E], got {inner_type}")
 
             ok_type, err_type = base_inner.generics
             if self._current_fn_return_type is not None:
-                fn_ret_base = (
-                    self._current_fn_return_type.pointee
-                    if isinstance(self._current_fn_return_type, (HeapSmartPointer, StackSmartPointer))
-                    else self._current_fn_return_type
-                )
+                current_fn_ret_type = unwrap_for_storage(self._current_fn_return_type)
+                fn_ret_base = current_fn_ret_type.pointee if is_reference_like_type(current_fn_ret_type) else current_fn_ret_type
                 if fn_ret_base.name != "Result" or len(fn_ret_base.generics) != 2:
                     raise TypeError("'?' operator can only be used in functions returning Result")
                 fn_err_type = fn_ret_base.generics[1]
@@ -284,27 +485,33 @@ class TypeInferer:
             return ok_type
 
         if isinstance(expr, s.Expression_Parenthesized):
-            return self._infer_expression(expr.expr, env, expected_type)
+            return self._infer_expression(expr.expr, env, expected_type, mutable_env)
 
         if isinstance(expr, s.Expression_Block):
-            return self._infer_expression_block(expr, env, expected_type)
+            return self._infer_expression_block(expr, env, mutable_env, expected_type)
 
         if isinstance(expr, s.Expression_Unsafe):
             self._unsafe_depth += 1
             try:
-                return self._infer_expression_block(expr.body, env, expected_type)
+                return self._infer_expression_block(expr.body, env, mutable_env, expected_type)
             finally:
                 self._unsafe_depth -= 1
 
         if isinstance(expr, s.Expression_If):
-            return self._infer_if_expression(expr, env, expected_type)
+            return self._infer_if_expression(expr, env, mutable_env, expected_type)
 
         if isinstance(expr, s.Expression_Match):
-            return self._infer_match_expression(expr, env, expected_type)
+            return self._infer_match_expression(expr, env, mutable_env, expected_type)
 
         if isinstance(expr, s.Expression_Path):
             if len(expr.segments) == 1:
-                return env.get(expr.name, expr.segments[0])
+                if expr.name in env:
+                    return env[expr.name]
+                if self._current_self_type is not None:
+                    implicit_self_field = self._lookup_field_type(self._current_self_type, expr.name)
+                    if implicit_self_field is not None:
+                        return implicit_self_field
+                return expr.segments[0]
             if len(expr.segments) == 2 and expr.segments[0].name in self._enums:
                 return expr.segments[0]
             return None
@@ -320,72 +527,44 @@ class TypeInferer:
             return self._lookup_chained_field_type(expr.name, expr.field, env)
 
         if isinstance(expr, s.Expression_MethodCall):
-            receiver_type = self._infer_expression(expr.receiver, env)
+            receiver_type = self._infer_expression(expr.receiver, env, mutable_env=mutable_env)
             if receiver_type is None:
                 raise TypeError(f"Unable to infer receiver type for method call '{expr.method}'")
 
-            base_receiver_type = (
-                receiver_type.pointee
-                if isinstance(receiver_type, (HeapSmartPointer, StackSmartPointer))
-                else receiver_type
-            )
-            fn_name = f"{base_receiver_type.name}::{expr.method}"
-            if fn_name not in self._funcs:
-                raise TypeError(f"Method '{expr.method}' is not defined for type '{base_receiver_type.name}'")
-
-            desugared = s.Expression_Call(
-                callee=s.Expression_Path([Type(fn_name)]),
-                generics=list(expr.generics),
+            call_name, signature = self._resolve_method_signature(receiver_type, expr.method)
+            inferred = self._infer_call_signature(
+                signature=signature,
                 args=[expr.receiver, *expr.args],
+                env=env,
+                expected_type=expected_type,
+                mutable_env=mutable_env,
+                explicit_generics=expr.generics,
+                callable_name=call_name,
             )
-            inferred = self._infer_expression(desugared, env, expected_type)
-            expr.generics = desugared.generics
             return inferred
 
         if isinstance(expr, s.Expression_Call):
-            enum_type = self._infer_enum_call(expr, env)
+            enum_type = self._infer_enum_call(expr, env, mutable_env)
             if enum_type is not None:
                 return enum_type
 
-            fn = self._funcs.get(expr.name)
-            if fn is None:
+            signature = self._lookup_function_signature(expr.name)
+            if signature is None:
                 return None
-            if isinstance(fn, s.FunctionSignature) and self._unsafe_depth <= 0:
-                raise TypeError(f"Extern function '{fn.name}' can only be called inside unsafe block")
-
-            generic_mapping: dict[str, Type] = {}
-            if expr.generics:
-                if len(expr.generics) != len(fn.signature.generics):
-                    raise TypeError(
-                        f"Generic count mismatch for function '{fn.signature.name}': {len(expr.generics)} != {len(fn.signature.generics)}"
-                    )
-                generic_mapping = {
-                    generic.name: concrete for generic, concrete in zip(fn.signature.generics, expr.generics)
-                }
-
-            for param, arg in zip(fn.signature.params, expr.args):
-                expected_param_type = self._specialize_type(param.type, generic_mapping)
-                arg_type = self._infer_expression(arg, env, expected_param_type)
-                if arg_type is not None:
-                    self._match_generic(param.type, arg_type, generic_mapping)
-
-            if fn.signature.generics:
-                missing_generics = [
-                    generic.name for generic in fn.signature.generics if generic.name not in generic_mapping
-                ]
-                if missing_generics:
-                    raise TypeError(
-                        f"Unable to infer generics for function '{fn.signature.name}': {', '.join(missing_generics)}"
-                    )
-                expr.generics = [generic_mapping[generic.name] for generic in fn.signature.generics]
-            if fn.signature.type is None:
-                return None
-            return self._specialize_type(fn.signature.type, generic_mapping)
+            return self._infer_call_signature(
+                signature=signature,
+                args=expr.args,
+                env=env,
+                expected_type=expected_type,
+                mutable_env=mutable_env,
+                explicit_generics=expr.generics,
+                callable_name=expr.name,
+            )
 
         if isinstance(expr, s.Expression_BinaryOperation):
             if expr.operator in ("&&", "||"):
-                lhs_type = self._infer_expression(expr.lhs, env)
-                rhs_type = self._infer_expression(expr.rhs, env)
+                lhs_type = self._infer_expression(expr.lhs, env, mutable_env=mutable_env)
+                rhs_type = self._infer_expression(expr.rhs, env, mutable_env=mutable_env)
                 if lhs_type is not None and lhs_type != Type("bool"):
                     raise TypeError(f"Logical operator '{expr.operator}' expects bool lhs, got {lhs_type}")
                 if rhs_type is not None and rhs_type != Type("bool"):
@@ -394,17 +573,23 @@ class TypeInferer:
                     raise TypeError(f"Type mismatch: {expected_type} != bool")
                 return Type("bool")
 
-            lhs_type = self._infer_expression(expr.lhs, env, expected_type)
-            rhs_type = self._infer_expression(expr.rhs, env, lhs_type or expected_type)
+            lhs_type = self._infer_expression(expr.lhs, env, expected_type, mutable_env)
+            rhs_type = self._infer_expression(expr.rhs, env, lhs_type or expected_type, mutable_env)
             if lhs_type is None and rhs_type is not None:
-                lhs_type = self._infer_expression(expr.lhs, env, rhs_type)
+                lhs_type = self._infer_expression(expr.lhs, env, rhs_type, mutable_env)
             if expr.operator in ("==", "!=", "<", "<=", ">", ">="):
                 return Type("bool")
             return lhs_type or rhs_type or expected_type
 
         return None
 
-    def _infer_enum_call(self, expr: s.Expression_Call, env: dict[str, Type]) -> Optional[Type]:
+    def _infer_enum_call(
+        self,
+        expr: s.Expression_Call,
+        env: dict[str, Type],
+        mutable_env: dict[str, bool] | None = None,
+    ) -> Optional[Type]:
+        mutable_env = mutable_env or {}
         if len(expr.callee.segments) != 2:
             return None
 
@@ -420,7 +605,7 @@ class TypeInferer:
             if isinstance(variant, s.TupleStructureDefinition) and variant.fields:
                 payload_type = self._specialize_type(variant.fields[0], generic_mapping)
                 if expr.args:
-                    self._infer_expression(expr.args[0], env, payload_type)
+                    self._infer_expression(expr.args[0], env, payload_type, mutable_env)
             return enum_type
         return None
 
@@ -436,16 +621,17 @@ class TypeInferer:
         self,
         expr: s.Expression_Match,
         env: dict[str, Type],
+        mutable_env: dict[str, bool],
         expected_type: Optional[Type] = None,
     ) -> Optional[Type]:
-        scrutinee_type = self._infer_expression(expr.expr, env)
+        scrutinee_type = self._infer_expression(expr.expr, env, mutable_env=mutable_env)
         if scrutinee_type is None:
             raise TypeError("Unable to infer type of match expression")
         self._validate_match_coverage(scrutinee_type, expr.arms)
         arm_types: list[Type] = []
         for arm in expr.arms:
             if arm.is_wildcard:
-                arm_type = self._infer_expression(arm.expr, dict(env), expected_type)
+                arm_type = self._infer_expression(arm.expr, dict(env), expected_type, dict(mutable_env))
                 if arm_type is None:
                     raise TypeError("Unable to infer wildcard match arm type")
                 arm_types.append(arm_type)
@@ -454,12 +640,14 @@ class TypeInferer:
             variant_name, payload_type = self._resolve_match_arm(scrutinee_type, arm)
 
             arm_env = dict(env)
+            arm_mutability_env = dict(mutable_env)
             if arm.binding is not None:
                 if payload_type is None:
                     raise TypeError(f"Variant '{variant_name}' does not carry payload")
                 arm_env[arm.binding] = payload_type
+                arm_mutability_env[arm.binding] = False
 
-            arm_type = self._infer_expression(arm.expr, arm_env, expected_type)
+            arm_type = self._infer_expression(arm.expr, arm_env, expected_type, arm_mutability_env)
             if arm_type is None:
                 raise TypeError(f"Unable to infer type of match arm '{variant_name}'")
             arm_types.append(arm_type)
@@ -474,21 +662,22 @@ class TypeInferer:
         self,
         expr: s.Expression_If,
         env: dict[str, Type],
+        mutable_env: dict[str, bool],
         expected_type: Optional[Type] = None,
     ) -> Optional[Type]:
         branch_types: list[Type] = []
 
         for branch in expr.branches:
-            cond = self._infer_expression(branch.expr, env, Type("bool"))
+            cond = self._infer_expression(branch.expr, env, Type("bool"), mutable_env)
             if cond is not None and cond != Type("bool"):
                 raise TypeError(f"If condition must be bool, got {cond}")
 
-            branch_type = self._infer_expression(branch.body, dict(env), expected_type)
+            branch_type = self._infer_expression(branch.body, dict(env), expected_type, dict(mutable_env))
             if branch_type is None:
                 raise TypeError("Unable to infer if-expression branch type")
             branch_types.append(branch_type)
 
-        else_type = self._infer_expression(expr.else_body, dict(env), expected_type)
+        else_type = self._infer_expression(expr.else_body, dict(env), expected_type, dict(mutable_env))
         if else_type is None:
             raise TypeError("Unable to infer else branch type")
         branch_types.append(else_type)
@@ -501,87 +690,118 @@ class TypeInferer:
 
     def _infer_expression_block(
         self,
-        block: Block,
+        block: Block | s.Expression_Block,
         env: dict[str, Type],
+        mutable_env: dict[str, bool],
         expected_type: Optional[Type] = None,
     ) -> Optional[Type]:
         block_env = dict(env)
-        for statement in block.body[:-1]:
-            self._infer_expression_block_statement(statement, block_env)
+        block_mutability_env = dict(mutable_env)
+        statements, tail_expr = self._split_expression_block(block)
+        for statement in statements:
+            self._infer_expression_block_statement(statement, block_env, block_mutability_env)
 
-        return self._infer_expression(block.body[-1], block_env, expected_type)
+        return self._infer_expression(tail_expr, block_env, expected_type, block_mutability_env)
 
-    def _infer_expression_block_statement(self, statement: s.Statement_InnerLevel, env: dict[str, Type]):
+    def _split_expression_block(
+        self,
+        block: Block | s.Expression_Block,
+    ) -> tuple[list[s.Statement_InnerLevel], s.Statement_Expression]:
+        if isinstance(block, s.Expression_Block):
+            return list(block.body), block.expr
+
+        if not block.body:
+            raise TypeError("Expression block can not be empty")
+
+        *statements, tail = block.body
+        if not isinstance(tail, s.Statement_Expr):
+            raise TypeError("Expression block must end with an expression statement")
+        return statements, tail.expr
+
+    def _infer_expression_block_statement(
+        self,
+        statement: s.Statement_InnerLevel,
+        env: dict[str, Type],
+        mutability_env: dict[str, bool],
+    ):
         if isinstance(statement, s.Statement_Let):
-            inferred = self._infer_expression(statement.expr, env, statement.type)
+            inferred = self._infer_expression(statement.expr, env, statement.type, mutability_env)
             if statement.type is None:
                 if inferred is None:
                     raise TypeError(f"Unable to infer type of variable '{statement.name}'")
                 statement.type = inferred
-            elif inferred is not None and statement.type != inferred:
-                raise TypeError(f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}")
+            elif inferred is not None:
+                if not self._types_compatible(statement.type, inferred) and not self._types_match_ignoring_mut(
+                    statement.type, inferred
+                ):
+                    raise TypeError(f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}")
+                statement.type = self._concretize_type(statement.type, inferred)
             env[statement.name] = statement.type
+            mutability_env[statement.name] = statement.is_mut
             return
 
         if isinstance(statement, s.Statement_Assignment):
+            self._assert_assignment_target_mutable(statement.target, env, mutability_env)
             expected = self._infer_lvalue_type(statement.target, env)
-            value_type = self._infer_expression(statement.expr, env, expected)
-            if expected is not None and value_type is not None and expected != value_type:
+            value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
+            if expected is not None and value_type is not None and not self._types_compatible(expected, value_type):
                 raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
             return
 
         if isinstance(statement, s.Statement_Expr):
-            self._infer_expression(statement.expr, env)
+            self._infer_expression(statement.expr, env, mutable_env=mutability_env)
             return
 
         if isinstance(statement, s.Statement_If):
             for branch in statement.branches:
-                cond = self._infer_expression(branch.expr, env, Type("bool"))
+                cond = self._infer_expression(branch.expr, env, Type("bool"), mutability_env)
                 if cond is not None and cond != Type("bool"):
                     raise TypeError(f"If condition must be bool, got {cond}")
-                self._infer_expression_block_nested(branch.body, dict(env))
+                self._infer_expression_block_nested(branch.body, dict(env), dict(mutability_env))
             if statement.else_body is not None:
-                self._infer_expression_block_nested(statement.else_body, dict(env))
+                self._infer_expression_block_nested(statement.else_body, dict(env), dict(mutability_env))
             return
 
         if isinstance(statement, s.Statement_Match):
-            scrutinee_type = self._infer_expression(statement.expr, env)
+            scrutinee_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
             if scrutinee_type is None:
                 raise TypeError("Unable to infer type of match expression")
             self._validate_match_coverage(scrutinee_type, statement.arms)
             for arm in statement.arms:
                 arm_env = dict(env)
+                arm_mutability_env = dict(mutability_env)
                 if not arm.is_wildcard:
                     variant_name, payload_type = self._resolve_match_arm(scrutinee_type, arm)
                     if arm.binding is not None:
                         if payload_type is None:
                             raise TypeError(f"Variant '{variant_name}' does not carry payload")
                         arm_env[arm.binding] = payload_type
-                self._infer_expression_block_nested(arm.body, arm_env)
+                        arm_mutability_env[arm.binding] = False
+                self._infer_expression_block_nested(arm.body, arm_env, arm_mutability_env)
             return
 
         if isinstance(statement, s.Statement_While):
-            cond = self._infer_expression(statement.expr, env, Type("bool"))
+            cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
             if cond is not None and cond != Type("bool"):
                 raise TypeError(f"While condition must be bool, got {cond}")
-            self._infer_expression_block_nested(statement.body, dict(env))
+            self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
             return
 
         if isinstance(statement, s.Statement_DoWhile):
-            self._infer_expression_block_nested(statement.body, dict(env))
-            cond = self._infer_expression(statement.expr, env, Type("bool"))
+            self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
+            cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
             if cond is not None and cond != Type("bool"):
                 raise TypeError(f"Do-while condition must be bool, got {cond}")
             return
 
         if isinstance(statement, s.Statement_Loop):
-            self._infer_expression_block_nested(statement.body, dict(env))
+            self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
             return
 
         if isinstance(statement, s.Statement_Unsafe):
             self._unsafe_depth += 1
             try:
-                self._infer_expression_block_nested(statement.body, dict(env))
+                self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
             finally:
                 self._unsafe_depth -= 1
             return
@@ -591,9 +811,14 @@ class TypeInferer:
 
         raise TypeError(f"Unsupported statement in expression block: {type(statement).__name__}")
 
-    def _infer_expression_block_nested(self, body: list[s.Statement_InnerLevel], env: dict[str, Type]):
+    def _infer_expression_block_nested(
+        self,
+        body: list[s.Statement_InnerLevel],
+        env: dict[str, Type],
+        mutability_env: dict[str, bool],
+    ):
         for statement in body:
-            self._infer_expression_block_statement(statement, env)
+            self._infer_expression_block_statement(statement, env, mutability_env)
 
     def _resolve_match_arm(self, scrutinee_type: Type, arm: s.Statement_MatchArm) -> tuple[str, Optional[Type]]:
         if arm.is_wildcard:
@@ -646,7 +871,8 @@ class TypeInferer:
                 raise TypeError(f"Non-exhaustive match for enum '{enum_def.name}', missing: {', '.join(missing)}")
 
     def _resolve_enum_definition(self, typ: Type) -> tuple[s.Statement_EnumDefinition, dict[str, Type]]:
-        base_type = typ.pointee if isinstance(typ, (HeapSmartPointer, StackSmartPointer)) else typ
+        typ = unwrap_for_storage(typ)
+        base_type = typ.pointee if is_reference_like_type(typ) else typ
         enum_def = self._enums.get(base_type.name)
         if enum_def is None:
             raise TypeError(f"Match expression must be an enum, got {typ}")
@@ -661,11 +887,8 @@ class TypeInferer:
         if len(pattern.segments) != 2:
             raise TypeError(f"Unsupported match pattern: {pattern}")
 
-        base_type = (
-            scrutinee_type.pointee
-            if isinstance(scrutinee_type, (HeapSmartPointer, StackSmartPointer))
-            else scrutinee_type
-        )
+        scrutinee_type = unwrap_for_storage(scrutinee_type)
+        base_type = scrutinee_type.pointee if is_reference_like_type(scrutinee_type) else scrutinee_type
         explicit_enum = pattern.segments[0]
         if explicit_enum.name != base_type.name:
             raise TypeError(f"Pattern enum '{explicit_enum.name}' does not match scrutinee type '{base_type.name}'")
@@ -674,7 +897,8 @@ class TypeInferer:
         return pattern.segments[1].name
 
     def _lookup_struct_field_types(self, typ: Type) -> list[Type]:
-        base_type = typ.pointee if isinstance(typ, (HeapSmartPointer, StackSmartPointer)) else typ
+        typ = unwrap_for_storage(typ)
+        base_type = typ.pointee if is_reference_like_type(typ) else typ
         struct_def = self._structs.get(base_type.name)
         if not isinstance(struct_def, s.CLikeStructureDefinition):
             return []
@@ -684,7 +908,8 @@ class TypeInferer:
     def _lookup_field_type(self, typ: Optional[Type], field: str) -> Optional[Type]:
         if typ is None:
             return None
-        base_type = typ.pointee if isinstance(typ, (HeapSmartPointer, StackSmartPointer)) else typ
+        typ = unwrap_for_storage(typ)
+        base_type = typ.pointee if is_reference_like_type(typ) else typ
         struct_def = self._structs.get(base_type.name)
         if not isinstance(struct_def, s.CLikeStructureDefinition):
             return None
@@ -708,6 +933,10 @@ class TypeInferer:
         return self._lookup_field_type(base_type, field)
 
     def _specialize_type(self, typ: Type, generic_mapping: dict[str, Type]) -> Type:
+        if is_mutable_type(typ):
+            return make_mutable_type(self._specialize_type(unwrap_for_storage(typ), generic_mapping))
+        if isinstance(typ, AnySmartPointer):
+            return AnySmartPointer(self._specialize_type(typ.pointee, generic_mapping))
         if isinstance(typ, HeapSmartPointer):
             return HeapSmartPointer(self._specialize_type(typ.pointee, generic_mapping))
         if isinstance(typ, StackSmartPointer):
@@ -717,6 +946,14 @@ class TypeInferer:
         return replace(typ, generics=[self._specialize_type(g, generic_mapping) for g in typ.generics])
 
     def _match_generic(self, pattern: Type, concrete: Type, mapping: dict[str, Type]):
+        if is_mutable_type(pattern) and not is_mutable_type(concrete):
+            return
+        pattern = unwrap_for_storage(pattern)
+        concrete = unwrap_for_storage(concrete)
+
+        if isinstance(pattern, AnySmartPointer) and is_reference_like_type(concrete):
+            self._match_generic(pattern.pointee, concrete.pointee, mapping)
+            return
         if isinstance(pattern, HeapSmartPointer) and isinstance(concrete, HeapSmartPointer):
             self._match_generic(pattern.pointee, concrete.pointee, mapping)
             return
@@ -729,12 +966,104 @@ class TypeInferer:
         for lhs, rhs in zip(pattern.generics, concrete.generics):
             self._match_generic(lhs, rhs, mapping)
 
+    def _types_match_ignoring_mut(self, lhs: Type, rhs: Type) -> bool:
+        return self._types_compatible(strip_mutability(lhs), strip_mutability(rhs))
+
+    def _types_compatible(self, expected: Type, actual: Type) -> bool:
+        if is_mutable_type(expected) and not is_mutable_type(actual):
+            return False
+        expected = unwrap_for_storage(expected)
+        actual = unwrap_for_storage(actual)
+
+        if isinstance(expected, AnySmartPointer):
+            if not is_reference_like_type(actual):
+                return False
+            return self._types_compatible(expected.pointee, actual.pointee)
+
+        if isinstance(expected, HeapSmartPointer):
+            return isinstance(actual, HeapSmartPointer) and self._types_compatible(expected.pointee, actual.pointee)
+
+        if isinstance(expected, StackSmartPointer):
+            return isinstance(actual, StackSmartPointer) and self._types_compatible(expected.pointee, actual.pointee)
+
+        if is_reference_like_type(actual):
+            return False
+
+        if expected.name != actual.name:
+            return False
+        if len(expected.generics) != len(actual.generics):
+            return False
+        return all(self._types_compatible(lhs, rhs) for lhs, rhs in zip(expected.generics, actual.generics))
+
+    def _concretize_type(self, pattern: Type, concrete: Type) -> Type:
+        pattern_is_mut = is_mutable_type(pattern)
+        concrete_is_mut = is_mutable_type(concrete)
+        pattern = unwrap_for_storage(pattern)
+        concrete = unwrap_for_storage(concrete)
+
+        if isinstance(pattern, AnySmartPointer):
+            if isinstance(concrete, (HeapSmartPointer, StackSmartPointer)):
+                return make_mutable_type(concrete) if pattern_is_mut or concrete_is_mut else concrete
+            if isinstance(concrete, AnySmartPointer):
+                result = AnySmartPointer(self._concretize_type(pattern.pointee, concrete.pointee))
+                return make_mutable_type(result) if pattern_is_mut or concrete_is_mut else result
+            return make_mutable_type(pattern) if pattern_is_mut else pattern
+
+        if isinstance(pattern, HeapSmartPointer) and isinstance(concrete, HeapSmartPointer):
+            result = HeapSmartPointer(self._concretize_type(pattern.pointee, concrete.pointee))
+            return make_mutable_type(result) if pattern_is_mut or concrete_is_mut else result
+
+        if isinstance(pattern, StackSmartPointer) and isinstance(concrete, StackSmartPointer):
+            result = StackSmartPointer(self._concretize_type(pattern.pointee, concrete.pointee))
+            return make_mutable_type(result) if pattern_is_mut or concrete_is_mut else result
+
+        if len(pattern.generics) != len(concrete.generics) or not pattern.generics:
+            return make_mutable_type(pattern) if pattern_is_mut or concrete_is_mut else pattern
+
+        result = replace(
+            pattern,
+            generics=[self._concretize_type(lhs, rhs) for lhs, rhs in zip(pattern.generics, concrete.generics)],
+        )
+        return make_mutable_type(result) if pattern_is_mut or concrete_is_mut else result
+
+    def _assert_assignment_target_mutable(
+        self,
+        target: s.Statement_Expression,
+        env: dict[str, Type],
+        mutability_env: dict[str, bool],
+    ):
+        if isinstance(target, s.Expression_Path) and len(target.segments) == 1:
+            if mutability_env.get(target.name, False):
+                return
+            if self._current_self_type is not None and self._lookup_field_type(self._current_self_type, target.name) is not None:
+                if is_mutable_type(self._current_self_type):
+                    return
+                raise TypeError(f"Cannot assign to immutable field '{target.name}'. Use a mutable receiver type.")
+            raise TypeError(f"Cannot assign to immutable binding '{target.name}'. Use `let mut {target.name}`.")
+
+        if not isinstance(target, s.Expression_StructField):
+            return
+
+        binding_name = target.name.split(".")[0]
+        binding_type = env.get(binding_name)
+        if binding_type is None and binding_name == "self":
+            binding_type = self._current_self_type
+        if binding_type is not None and is_mutable_type(binding_type):
+            return
+
+        raise TypeError(
+            f"Cannot assign through immutable access '{binding_name}'. "
+            f"Use a `mut` type."
+        )
+
     @staticmethod
     def _is_integer_type(typ: Type) -> bool:
+        typ = unwrap_for_storage(typ)
         return typ.name in ("usize", "isize") or (
             len(typ.name) > 1 and typ.name[0] in ("u", "i") and typ.name[1:].isdigit()
         )
 
     @staticmethod
     def _is_float_type(typ: Type) -> bool:
+        typ = unwrap_for_storage(typ)
         return len(typ.name) > 1 and typ.name[0] == "f" and typ.name[1:].isdigit()

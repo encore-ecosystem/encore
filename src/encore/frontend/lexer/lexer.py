@@ -24,24 +24,30 @@ class Lexer(ParserBase[str, LexerToken]):
 
                 case "+":
                     self._consume()
-                    self._consume_and_push(TokenType.OP_PLUS_ASSIGN) if self._peek_curr() == "=" else self._push_token(
-                        TokenType.OP_PLUS
-                    )
+                    match self._peek_curr():
+                        case "=":
+                            self._consume_and_push(TokenType.PLUS_EQUAL)
+                        case "+":
+                            self._consume_and_push(TokenType.INCREMENT)
+                        case _:
+                            self._push_token(TokenType.PLUS)
 
                 case "-":
                     self._consume()
                     match self._peek_curr():
                         case "=":
-                            self._consume_and_push(TokenType.OP_MINUS_ASSIGN)
+                            self._consume_and_push(TokenType.MINUS_EQUAL)
                         case ">":
-                            self._consume_and_push(TokenType.OP_ARROW)
+                            self._consume_and_push(TokenType.ARROW)
+                        case "-":
+                            self._consume_and_push(TokenType.DECREMENT)
                         case _:
-                            self._push_token(TokenType.OP_MINUS)
+                            self._push_token(TokenType.MINUS)
 
                 case "*":
                     self._consume()
-                    self._consume_and_push(TokenType.OP_MULT_ASSIGN) if self._peek_curr() == "=" else self._push_token(
-                        TokenType.OP_MULTIPLY
+                    self._consume_and_push(TokenType.ASTERISK_EQUAL) if self._peek_curr() == "=" else self._push_token(
+                        TokenType.ASTERISK
                     )
 
                 case "/":
@@ -60,21 +66,43 @@ class Lexer(ParserBase[str, LexerToken]):
                             self._consume_and_push(TokenType.MULTI_LINE_COMMENT)
                         case "=":  # div equal
                             self._consume()
-                            self._consume_and_push(TokenType.OP_DIV_ASSIGN)
+                            self._consume_and_push(TokenType.SLASH_EQUAL)
                         case _:
-                            self._consume_and_push(TokenType.OP_DIVIDE)
+                            self._consume_and_push(TokenType.SLASH)
+
+                case "%":
+                    self._consume()
+                    self._consume_and_push(TokenType.PERCENT_EQUAL) if self._peek_curr() == "=" else self._push_token(
+                        TokenType.PERCENT
+                    )
 
                 case "<":
                     self._consume()
-                    self._consume_and_push(TokenType.OP_LESS_EQUAL) if self._peek_curr() == "=" else self._push_token(
-                        TokenType.OP_LESS
-                    )
+                    match self._peek_curr():
+                        case "<":
+                            self._consume()
+                            if self._peek_curr() == "=":
+                                self._consume_and_push(TokenType.LEFT_SHIFT_EQUAL)
+                            else:
+                                self._push_token(TokenType.LEFT_SHIFT)
+                        case "=":
+                            self._consume_and_push(TokenType.LESS_EQUAL)
+                        case _:
+                            self._push_token(TokenType.LESS)
 
                 case ">":
                     self._consume()
-                    self._consume_and_push(
-                        TokenType.OP_GREATER_EQUAL
-                    ) if self._peek_curr() == "=" else self._push_token(TokenType.OP_GREATER)
+                    match self._peek_curr():
+                        case ">":
+                            self._consume()
+                            if self._peek_curr() == "=":
+                                self._consume_and_push(TokenType.RIGHT_SHIFT_EQUAL)
+                            else:
+                                self._push_token(TokenType.RIGHT_SHIFT)
+                        case "=":
+                            self._consume_and_push(TokenType.GREATER_EQUAL)
+                        case _:
+                            self._push_token(TokenType.GREATER)
 
                 case "(":
                     self._consume_and_push(TokenType.LEFT_PAREN)
@@ -90,7 +118,7 @@ class Lexer(ParserBase[str, LexerToken]):
                     self._consume_and_push(TokenType.RIGHT_BRACE)
                 case ":":
                     self._consume()
-                    self._consume_and_push(TokenType.OP_SCOPE) if self._peek_curr() == ":" else self._push_token(
+                    self._consume_and_push(TokenType.SCOPE) if self._peek_curr() == ":" else self._push_token(
                         TokenType.COLON
                     )
                 case ".":
@@ -101,17 +129,49 @@ class Lexer(ParserBase[str, LexerToken]):
                     self._consume()
                     match self._peek_curr():
                         case "=":
-                            self._consume_and_push(TokenType.OP_EQUAL)
+                            self._consume_and_push(TokenType.EQUAL_EQUAL)
                         case ">":
-                            self._consume_and_push(TokenType.OP_FAT_ARROW)
+                            self._consume_and_push(TokenType.FAT_ARROW)
                         case _:
-                            self._push_token(TokenType.OP_ASSIGN)
+                            self._push_token(TokenType.ASSIGN)
 
                 case "!":
                     self._consume()
-                    self._consume_and_push(TokenType.OP_NOT_EQUAL) if self._peek_curr() == "=" else self._push_token(
-                        TokenType.OP_NOT
+                    self._consume_and_push(TokenType.BANG_EQUAL) if self._peek_curr() == "=" else self._push_token(
+                        TokenType.BANG
                     )
+
+                case "&":
+                    self._consume()
+                    match self._peek_curr():
+                        case "&":
+                            self._consume_and_push(TokenType.AND_AND)
+                        case "=":
+                            self._consume_and_push(TokenType.AMPERSAND_EQUAL)
+                        case _:
+                            self._push_token(TokenType.AMPERSAND)
+
+                case "|":
+                    self._consume()
+                    match self._peek_curr():
+                        case "|":
+                            self._consume_and_push(TokenType.PIPE_PIPE)
+                        case "=":
+                            self._consume_and_push(TokenType.PIPE_EQUAL)
+                        case _:
+                            self._push_token(TokenType.PIPE)
+
+                case "^":
+                    self._consume()
+                    self._consume_and_push(TokenType.CARET_EQUAL) if self._peek_curr() == "=" else self._push_token(
+                        TokenType.CARET
+                    )
+
+                case "~":
+                    self._consume_and_push(TokenType.TILDE)
+
+                case "?":
+                    self._consume_and_push(TokenType.QUESTION)
 
                 case '"':
                     self._consume()
@@ -135,13 +195,15 @@ class Lexer(ParserBase[str, LexerToken]):
         return self._result
 
     def _parse_number(self):
+        is_float = False
         while self._peek_curr().isdigit():
             self._consume()
         if self._peek_curr() == "." and self._peek_next().isdigit():
+            is_float = True
             self._consume()
             while self._peek_curr().isdigit():
                 self._consume()
-        self._push_token(TokenType.INTEGER)
+        self._push_token(TokenType.FLOAT if is_float else TokenType.INTEGER)
 
     def _parse_identifier(self):
         while self._peek_curr().isalnum() or self._peek_curr() == "_":
@@ -155,6 +217,7 @@ class Lexer(ParserBase[str, LexerToken]):
             "impl": TokenType.KW_IMPL,
             "for": TokenType.KW_FOR,
             "let": TokenType.KW_LET,
+            "mut": TokenType.KW_MUT,
             "ret": TokenType.KW_RET,
             "while": TokenType.KW_WHILE,
             "do": TokenType.KW_DO,
@@ -169,7 +232,7 @@ class Lexer(ParserBase[str, LexerToken]):
             "import": TokenType.KW_IMPORT,
             "extern": TokenType.KW_EXTERN,
             "unsafe": TokenType.KW_UNSAFE,
-            "not": TokenType.OP_NOT,
+            "not": TokenType.BANG,
             "true": TokenType.BOOLEAN,
             "false": TokenType.BOOLEAN,
         }

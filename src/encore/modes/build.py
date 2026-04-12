@@ -1,12 +1,17 @@
 import subprocess
 import tomllib
 from argparse import Namespace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from ehir.backend import EHIR_Backend
 from ehir.compiler import EHIR_ProjectCompiler
 from ehir_llvm_backend import EHIR_LLVM_Backend
+from rich.console import Console, Group
+from rich.live import Live
+from rich.spinner import Spinner
+from rich.text import Text
 
 from ehir import Refrain
 from encore.frontend import EHIR_EncoreFrontend
@@ -18,6 +23,62 @@ AVAILABLE_OPTPROFILES = {
     "release": EHIR_Backend.OptProfile.release,
     "extreme": EHIR_Backend.OptProfile.extreme,
 }
+
+
+@dataclass
+class _BuildLiveStatus:
+    compiler: EHIR_ProjectCompiler
+    _current_refrain: str = ""
+    _current_file: str = ""
+    _live: Live | None = None
+    _console: Console = field(init=False, repr=False, default_factory=lambda: Console(highlight=False))
+
+    def __enter__(self):
+        self._live = Live(self._render(), console=self._console, refresh_per_second=12, transient=True)
+        self._live.__enter__()
+        self.compiler.on_refrain = self.set_refrain
+        frontend = self.compiler.frontend
+        if isinstance(frontend, EHIR_EncoreFrontend):
+            frontend.on_module_load = self.set_file
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.compiler.on_refrain = None
+        frontend = self.compiler.frontend
+        if isinstance(frontend, EHIR_EncoreFrontend):
+            frontend.on_module_load = None
+        assert self._live is not None
+        return self._live.__exit__(exc_type, exc, tb)
+
+    def set_refrain(self, refrain: Refrain) -> None:
+        self._current_refrain = refrain.name
+        self._current_file = ""
+        self._refresh()
+
+    def set_file(self, module_id: Path) -> None:
+        self._current_file = self._format_module_path(module_id)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        if self._live is None:
+            return
+        self._live.update(self._render())
+
+    def _render(self):
+        return Group(
+            Spinner("dots", text=self._current_refrain),
+            Text(self._current_file or " ", style="dim"),
+        )
+
+    def _format_module_path(self, module_id: Path) -> str:
+        module_id = module_id.resolve()
+        for refrain in sorted(self.compiler.refrains.values(), key=lambda ref: len(ref.path.parts), reverse=True):
+            src_root = (refrain.path / "src").resolve()
+            try:
+                return module_id.relative_to(src_root).as_posix()
+            except ValueError:
+                continue
+        return module_id.name
 
 
 def add_build_parser(subparsers) -> tuple[str, Callable]:
@@ -38,7 +99,8 @@ def handle_build(args: Namespace):
 
     compiler = create_compiler(cwd, args.backend, args.profile)
     _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
-    compiler.compile_all()
+    with _BuildLiveStatus(compiler):
+        compiler.compile_all()
 
 
 def create_compiler(cwd: Path, backend: str, profile: str) -> EHIR_ProjectCompiler:

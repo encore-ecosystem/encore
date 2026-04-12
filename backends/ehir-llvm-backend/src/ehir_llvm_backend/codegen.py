@@ -7,9 +7,7 @@ from ehir.core.instructions.capture import Instruction_lcpos
 from ehir.core.instructions.control_flow import (
     Instruction_br,
     Instruction_cbr,
-    Instruction_phi,
 )
-from ehir.core.instructions.control_flow.phi import PhiPair
 from ehir.core.instructions.memory import (
     Instruction_getfield,
     Instruction_getfieldptr,
@@ -19,21 +17,16 @@ from ehir.core.instructions.memory import (
 )
 from ehir.core.instructions.memory.halloc import Instruction_halloc
 from ehir.core.instructions.operators.arithmetic import (
-    Instruction_div,
     Instruction_mod,
     Instruction_shl,
     Instruction_shr,
 )
 from ehir.core.instructions.operators.comparison import (
     Instruction_geq,
-    Instruction_grt,
     Instruction_leq,
-    Instruction_les,
 )
 from ehir.core.instructions.operators.logic import (
     Instruction_and,
-    Instruction_ieq,
-    Instruction_neq,
     Instruction_or,
     Instruction_xor,
 )
@@ -53,6 +46,8 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction,
     ProcessedInstruction_add,
     ProcessedInstruction_call,
+    ProcessedInstruction_div,
+    ProcessedInstruction_getfieldptr,
     ProcessedInstruction_grt,
     ProcessedInstruction_ieq,
     ProcessedInstruction_les,
@@ -198,7 +193,7 @@ class Codegen:
             self._build_sub(instr)
         elif isinstance(instr, ProcessedInstruction_mul):
             self._build_mul(instr)
-        elif isinstance(instr, Instruction_div):
+        elif isinstance(instr, ProcessedInstruction_div):
             self._build_div(instr)
         elif isinstance(instr, Instruction_or):
             self._build_or(instr)
@@ -240,7 +235,7 @@ class Codegen:
             self._build_store(instr)
         elif isinstance(instr, Instruction_pcast):
             self._build_pcast(instr)
-        elif isinstance(instr, Instruction_getfieldptr):
+        elif isinstance(instr, ProcessedInstruction_getfieldptr):
             self._build_getfieldptr(instr)
         elif isinstance(instr, Instruction_getfield):
             self._build_getfield(instr)
@@ -339,7 +334,7 @@ class Codegen:
 
         self.builder.store(value, ptr)
 
-    def _build_getfieldptr(self, instr: Instruction_getfieldptr):
+    def _build_getfieldptr(self, instr: ProcessedInstruction_getfieldptr):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         base = self._variables[instr.src.name]
@@ -446,7 +441,10 @@ class Codegen:
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
         right = self._variables[instr.rhs.name]
-        result = self.builder.add(left, right, name=instr.var_out.name)
+        if self._is_float_value(left):
+            result = self.builder.fadd(left, right, name=instr.var_out.name)
+        else:
+            result = self.builder.add(left, right, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
 
@@ -455,7 +453,10 @@ class Codegen:
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
         right = self._variables[instr.rhs.name]
-        result = self.builder.sub(left, right, name=instr.var_out.name)
+        if self._is_float_value(left):
+            result = self.builder.fsub(left, right, name=instr.var_out.name)
+        else:
+            result = self.builder.sub(left, right, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
 
@@ -464,16 +465,24 @@ class Codegen:
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
         right = self._variables[instr.rhs.name]
-        result = self.builder.mul(left, right, name=instr.var_out.name)
+        if self._is_float_value(left):
+            result = self.builder.fmul(left, right, name=instr.var_out.name)
+        else:
+            result = self.builder.mul(left, right, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
 
-    def _build_div(self, instr: Instruction_div):
+    def _build_div(self, instr: ProcessedInstruction_div):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
         right = self._variables[instr.rhs.name]
-        result = self.builder.sdiv(left, right, name=instr.var_out.name)
+        if self._is_float_value(left):
+            result = self.builder.fdiv(left, right, name=instr.var_out.name)
+        elif self._is_unsigned_type(instr.lhs.type):
+            result = self.builder.udiv(left, right, name=instr.var_out.name)
+        else:
+            result = self.builder.sdiv(left, right, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
 
@@ -482,7 +491,12 @@ class Codegen:
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
         right = self._variables[instr.rhs.name]
-        result = self.builder.srem(left, right, name=instr.var_out.name)
+        if self._is_float_value(left):
+            result = self.builder.frem(left, right, name=instr.var_out.name)
+        elif self._is_unsigned_type(instr.lhs.type):
+            result = self.builder.urem(left, right, name=instr.var_out.name)
+        else:
+            result = self.builder.srem(left, right, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
 
@@ -547,7 +561,12 @@ class Codegen:
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
         right = self._variables[instr.rhs.name]
-        result = self.builder.icmp_signed("==", left, right, name=instr.var_out.name)
+        if self._is_float_value(left):
+            result = self.builder.fcmp_ordered("==", left, right, name=instr.var_out.name)
+        elif self._is_unsigned_type(instr.lhs.type):
+            result = self.builder.icmp_unsigned("==", left, right, name=instr.var_out.name)
+        else:
+            result = self.builder.icmp_signed("==", left, right, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
 
@@ -556,7 +575,12 @@ class Codegen:
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
         right = self._variables[instr.rhs.name]
-        result = self.builder.icmp_signed("!=", left, right, name=instr.var_out.name)
+        if self._is_float_value(left):
+            result = self.builder.fcmp_unordered("!=", left, right, name=instr.var_out.name)
+        elif self._is_unsigned_type(instr.lhs.type):
+            result = self.builder.icmp_unsigned("!=", left, right, name=instr.var_out.name)
+        else:
+            result = self.builder.icmp_signed("!=", left, right, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
 
@@ -565,7 +589,12 @@ class Codegen:
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
         right = self._variables[instr.rhs.name]
-        result = self.builder.icmp_signed("<", left, right, name=instr.var_out.name)
+        if self._is_float_value(left):
+            result = self.builder.fcmp_ordered("<", left, right, name=instr.var_out.name)
+        elif self._is_unsigned_type(instr.lhs.type):
+            result = self.builder.icmp_unsigned("<", left, right, name=instr.var_out.name)
+        else:
+            result = self.builder.icmp_signed("<", left, right, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
 
@@ -574,7 +603,12 @@ class Codegen:
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
         right = self._variables[instr.rhs.name]
-        result = self.builder.icmp_signed("<=", left, right, name=instr.var_out.name)
+        if self._is_float_value(left):
+            result = self.builder.fcmp_ordered("<=", left, right, name=instr.var_out.name)
+        elif self._is_unsigned_type(instr.lhs.type):
+            result = self.builder.icmp_unsigned("<=", left, right, name=instr.var_out.name)
+        else:
+            result = self.builder.icmp_signed("<=", left, right, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
 
@@ -583,7 +617,12 @@ class Codegen:
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
         right = self._variables[instr.rhs.name]
-        result = self.builder.icmp_signed(">", left, right, name=instr.var_out.name)
+        if self._is_float_value(left):
+            result = self.builder.fcmp_ordered(">", left, right, name=instr.var_out.name)
+        elif self._is_unsigned_type(instr.lhs.type):
+            result = self.builder.icmp_unsigned(">", left, right, name=instr.var_out.name)
+        else:
+            result = self.builder.icmp_signed(">", left, right, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
 
@@ -592,7 +631,12 @@ class Codegen:
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
         right = self._variables[instr.rhs.name]
-        result = self.builder.icmp_signed(">=", left, right, name=instr.var_out.name)
+        if self._is_float_value(left):
+            result = self.builder.fcmp_ordered(">=", left, right, name=instr.var_out.name)
+        elif self._is_unsigned_type(instr.lhs.type):
+            result = self.builder.icmp_unsigned(">=", left, right, name=instr.var_out.name)
+        else:
+            result = self.builder.icmp_signed(">=", left, right, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
 
@@ -748,9 +792,27 @@ class Codegen:
             return ir.Constant(typ, 0)
         if isinstance(typ, ir.PointerType):
             return ir.Constant(typ, None)
-        if isinstance(typ, (ir.HalfType, ir.FloatType, ir.DoubleType, ir.FP128Type)):
+        if isinstance(typ, self._float_ir_types()):
             return ir.Constant(typ, 0.0)
         return ir.Constant(typ, None)
+
+    @classmethod
+    def _is_float_value(cls, value: ir.Value) -> bool:
+        return isinstance(value.type, cls._float_ir_types())
+
+    @staticmethod
+    def _is_unsigned_type(typ: Type | None) -> bool:
+        if typ is None:
+            return False
+        return isinstance(typ, Usize_t) or typ.name == "usize" or typ.name.startswith("u")
+
+    @staticmethod
+    def _float_ir_types() -> tuple[type, ...]:
+        types: list[type] = [ir.HalfType, ir.FloatType, ir.DoubleType]
+        fp128_type = getattr(ir, "FP128Type", None)
+        if fp128_type is not None:
+            types.append(fp128_type)
+        return tuple(types)
 
     def _build_br(self, instr: Instruction_br):
         self.builder.comment("")
@@ -827,7 +889,10 @@ class Codegen:
                 case 64:
                     return ir.DoubleType()
                 case 128:
-                    return ir.FP128Type()
+                    fp128_type = getattr(ir, "FP128Type", None)
+                    if fp128_type is None:
+                        raise ValueError("Current llvmlite build does not support f128")
+                    return fp128_type()
                 case _:
                     raise ValueError(f"Unsupported float size: f{type.size}")
 

@@ -134,3 +134,10 @@ class ProcessedInstruction_neq(ProcessedInstruction):
 class ProcessedInstruction_store(ProcessedInstruction):
     var_src: TypedVariable
     var_dst: TypedVariable
+
+
+@dataclass
+class ProcessedInstruction_getfieldptr(ProcessedInstruction):
+    var_out: TypedVariable
+    src: TypedVariable
+    field: TypedVariable

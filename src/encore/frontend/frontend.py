@@ -1,4 +1,5 @@
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from pathlib import Path
@@ -41,6 +42,7 @@ class ModuleIndex:
 @dataclass
 class EHIR_EncoreFrontend(EHIR_Frontend):
     src_dir: Path
+    on_module_load: Callable[[Path], None] | None = None
     _cache: dict[Path, EHIR_Module] = field(default_factory=dict)
     _ast_cache: dict[Path, list[s.Statement]] = field(default_factory=dict)
     _index_cache: dict[Path, ModuleIndex] = field(default_factory=dict)
@@ -49,6 +51,9 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
     _parser: Parser = field(default_factory=lambda: Parser())
 
     def get_module_by_id(self, id: Path) -> EHIR_Module:
+        if self.on_module_load is not None:
+            self.on_module_load(id)
+
         if id in self._cache:
             return self._cache[id]
 
