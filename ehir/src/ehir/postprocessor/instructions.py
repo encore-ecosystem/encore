@@ -110,7 +110,21 @@ class ProcessedInstruction_les(ProcessedInstruction):
 
 
 @dataclass
+class ProcessedInstruction_leq(ProcessedInstruction):
+    var_out: TypedVariable
+    lhs: TypedVariable
+    rhs: TypedVariable
+
+
+@dataclass
 class ProcessedInstruction_grt(ProcessedInstruction):
+    var_out: TypedVariable
+    lhs: TypedVariable
+    rhs: TypedVariable
+
+
+@dataclass
+class ProcessedInstruction_geq(ProcessedInstruction):
     var_out: TypedVariable
     lhs: TypedVariable
     rhs: TypedVariable

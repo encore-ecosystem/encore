@@ -29,10 +29,6 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         if curr_token.type == TokenType.KW_IMPL:
             self._push(self._parse_impl())
             return
-        elif curr_token.type == TokenType.ONE_LINE_COMMENT:
-            return self._parse_one_line_comment()
-        elif curr_token.type == TokenType.MULTI_LINE_COMMENT:
-            return self._parse_multi_line_comment()
 
         is_public = False
         if curr_token.type == TokenType.KW_PUB:
@@ -55,12 +51,6 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 self._parse_extern(is_public)
             case _:
                 raise NotImplementedError(f"{curr_token}")
-
-    def _parse_one_line_comment(self):
-        self._safe_consume(TokenType.ONE_LINE_COMMENT)
-
-    def _parse_multi_line_comment(self):
-        self._safe_consume(TokenType.MULTI_LINE_COMMENT)
 
     def _parse_import(self, is_pub: bool):
         self._safe_consume(TokenType.KW_IMPORT)

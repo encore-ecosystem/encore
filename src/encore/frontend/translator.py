@@ -181,6 +181,9 @@ class Translator:
         for statement in ast:
             self._translate_statement(statement)
         # print(self._module)
+        # import time
+
+        # time.sleep(0.5)
         return self._module
 
     def preload_declarations(self, statements: list[s.Statement_TopLevel]):

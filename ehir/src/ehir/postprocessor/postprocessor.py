@@ -33,6 +33,7 @@ from ehir.core.instructions.operators.arithmetic import (
     Instruction_shr,
     Instruction_sub,
 )
+from ehir.core.instructions.operators.base import BinOp
 from ehir.core.instructions.operators.comparison import (
     Instruction_geq,
     Instruction_grt,
@@ -55,9 +56,11 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_call,
     ProcessedInstruction_cbr,
     ProcessedInstruction_div,
+    ProcessedInstruction_geq,
     ProcessedInstruction_getfieldptr,
     ProcessedInstruction_grt,
     ProcessedInstruction_ieq,
+    ProcessedInstruction_leq,
     ProcessedInstruction_les,
     ProcessedInstruction_load,
     ProcessedInstruction_mul,
@@ -163,106 +166,7 @@ class Postprocessor:
             self._build_lcpos(instr)
         if isinstance(instr, Instruction_halloc):
             self._build_halloc(instr)
-        if isinstance(instr, Instruction_add):
-            assert instr.var_out.type
-            assert instr.lhs.type
-            assert instr.rhs.type
 
-            return ProcessedInstruction_add(
-                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
-                lhs=TypedVariable(instr.lhs.name, instr.lhs.type),
-                rhs=TypedVariable(instr.rhs.name, instr.rhs.type),
-            )
-        if isinstance(instr, Instruction_sub):
-            assert instr.var_out.type
-            assert instr.lhs.type
-            assert instr.rhs.type
-
-            return ProcessedInstruction_sub(
-                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
-                lhs=TypedVariable(instr.lhs.name, instr.lhs.type),
-                rhs=TypedVariable(instr.rhs.name, instr.rhs.type),
-            )
-        if isinstance(instr, Instruction_mul):
-            assert instr.var_out.type
-            assert instr.lhs.type
-            assert instr.rhs.type
-
-            return ProcessedInstruction_mul(
-                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
-                lhs=TypedVariable(instr.lhs.name, instr.lhs.type),
-                rhs=TypedVariable(instr.rhs.name, instr.rhs.type),
-            )
-        if isinstance(instr, Instruction_div):
-            assert instr.var_out.type
-            assert instr.lhs.type
-            assert instr.rhs.type
-
-            return ProcessedInstruction_div(
-                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
-                lhs=TypedVariable(instr.lhs.name, instr.lhs.type),
-                rhs=TypedVariable(instr.rhs.name, instr.rhs.type),
-            )
-
-        if isinstance(instr, Instruction_or):
-            self._build_or(instr)
-        if isinstance(instr, Instruction_and):
-            self._build_and(instr)
-        if isinstance(instr, Instruction_xor):
-            self._build_xor(instr)
-        if isinstance(instr, Instruction_ieq):
-            assert instr.var_out.type
-            assert instr.lhs.type
-            assert instr.rhs.type
-
-            return ProcessedInstruction_ieq(
-                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
-                lhs=TypedVariable(instr.lhs.name, instr.lhs.type),
-                rhs=TypedVariable(instr.rhs.name, instr.rhs.type),
-            )
-
-        if isinstance(instr, Instruction_neq):
-            assert instr.var_out.type
-            assert instr.lhs.type
-            assert instr.rhs.type
-
-            return ProcessedInstruction_neq(
-                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
-                lhs=TypedVariable(instr.lhs.name, instr.lhs.type),
-                rhs=TypedVariable(instr.rhs.name, instr.rhs.type),
-            )
-
-        if isinstance(instr, Instruction_les):
-            assert instr.var_out.type
-            assert instr.lhs.type
-            assert instr.rhs.type
-
-            return ProcessedInstruction_les(
-                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
-                lhs=TypedVariable(instr.lhs.name, instr.lhs.type),
-                rhs=TypedVariable(instr.rhs.name, instr.rhs.type),
-            )
-        if isinstance(instr, Instruction_leq):
-            self._build_leq(instr)
-        if isinstance(instr, Instruction_grt):
-            assert instr.var_out.type
-            assert instr.lhs.type
-            assert instr.rhs.type
-
-            return ProcessedInstruction_grt(
-                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
-                lhs=TypedVariable(instr.lhs.name, instr.lhs.type),
-                rhs=TypedVariable(instr.rhs.name, instr.rhs.type),
-            )
-        if isinstance(instr, Instruction_geq):
-            self._build_geq(instr)
-
-        if isinstance(instr, Instruction_mod):
-            self._build_mod(instr)
-        if isinstance(instr, Instruction_shl):
-            self._build_shl(instr)
-        if isinstance(instr, Instruction_shr):
-            self._build_shr(instr)
         if isinstance(instr, Instruction_hfree):
             self._build_hfree(instr)
         if isinstance(instr, Instruction_store):
@@ -295,7 +199,8 @@ class Postprocessor:
                 assert pair.var.type
                 pairs.append((TypedVariable(pair.var.name, pair.var.type), pair.block_label))
             return ProcessedInstruction_phi(var_out=TypedVariable(instr.var_out.name, instr.var_out.type), args=pairs)
-
+        if isinstance(instr, BinOp):
+            return self._build_processed_binop(instr)
         raise NotImplementedError(instr)
 
     def _validate_term(self, term: ControlFlow) -> ProcessedControlFlow:
@@ -322,3 +227,63 @@ class Postprocessor:
             )
 
         raise NotImplementedError(term)
+
+    def _build_processed_binop(self, instr: BinOp):
+        assert instr.var_out.type
+        assert instr.lhs.type
+        assert instr.rhs.type
+        result = None
+        if isinstance(instr, Instruction_add):
+            result = ProcessedInstruction_add
+
+        if isinstance(instr, Instruction_sub):
+            result = ProcessedInstruction_sub
+
+        if isinstance(instr, Instruction_mul):
+            result = ProcessedInstruction_mul
+
+        if isinstance(instr, Instruction_div):
+            result = ProcessedInstruction_div
+
+        if isinstance(instr, Instruction_or):
+            self._build_or(instr)
+
+        if isinstance(instr, Instruction_and):
+            self._build_and(instr)
+
+        if isinstance(instr, Instruction_xor):
+            self._build_xor(instr)
+
+        if isinstance(instr, Instruction_ieq):
+            result = ProcessedInstruction_ieq
+
+        if isinstance(instr, Instruction_neq):
+            result = ProcessedInstruction_neq
+
+        if isinstance(instr, Instruction_les):
+            result = ProcessedInstruction_les
+
+        if isinstance(instr, Instruction_leq):
+            result = ProcessedInstruction_leq
+
+        if isinstance(instr, Instruction_grt):
+            result = ProcessedInstruction_grt
+
+        if isinstance(instr, Instruction_geq):
+            result = ProcessedInstruction_geq
+
+        if isinstance(instr, Instruction_mod):
+            self._build_mod(instr)
+
+        if isinstance(instr, Instruction_shl):
+            self._build_shl(instr)
+
+        if isinstance(instr, Instruction_shr):
+            self._build_shr(instr)
+
+        assert result
+        return result(
+            var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
+            lhs=TypedVariable(instr.lhs.name, instr.lhs.type),
+            rhs=TypedVariable(instr.rhs.name, instr.rhs.type),
+        )

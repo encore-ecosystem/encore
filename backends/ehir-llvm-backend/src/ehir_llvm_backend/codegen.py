@@ -50,6 +50,7 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_getfieldptr,
     ProcessedInstruction_grt,
     ProcessedInstruction_ieq,
+    ProcessedInstruction_leq,
     ProcessedInstruction_les,
     ProcessedInstruction_load,
     ProcessedInstruction_mul,
@@ -195,20 +196,21 @@ class Codegen:
             self._build_mul(instr)
         elif isinstance(instr, ProcessedInstruction_div):
             self._build_div(instr)
-        elif isinstance(instr, Instruction_or):
-            self._build_or(instr)
-        elif isinstance(instr, Instruction_and):
-            self._build_and(instr)
-        elif isinstance(instr, Instruction_xor):
-            self._build_xor(instr)
         elif isinstance(instr, ProcessedInstruction_ieq):
             self._build_ieq(instr)
         elif isinstance(instr, ProcessedInstruction_neq):
             self._build_neq(instr)
         elif isinstance(instr, ProcessedInstruction_les):
             self._build_les(instr)
-        elif isinstance(instr, Instruction_leq):
+        elif isinstance(instr, ProcessedInstruction_leq):
             self._build_leq(instr)
+        elif isinstance(instr, Instruction_or):
+            self._build_or(instr)
+        elif isinstance(instr, Instruction_and):
+            self._build_and(instr)
+        elif isinstance(instr, Instruction_xor):
+            self._build_xor(instr)
+
         elif isinstance(instr, ProcessedInstruction_grt):
             self._build_grt(instr)
         elif isinstance(instr, Instruction_geq):
@@ -598,7 +600,7 @@ class Codegen:
         self._variables[instr.var_out.name] = result
         return result
 
-    def _build_leq(self, instr: Instruction_leq):
+    def _build_leq(self, instr: ProcessedInstruction_leq):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]

@@ -573,11 +573,16 @@ class TypeInferer:
                     raise TypeError(f"Type mismatch: {expected_type} != bool")
                 return Type("bool")
 
-            lhs_type = self._infer_expression(expr.lhs, env, expected_type, mutable_env)
-            rhs_type = self._infer_expression(expr.rhs, env, lhs_type or expected_type, mutable_env)
+            comparison_ops = {"==", "!=", "<", "<=", ">", ">="}
+            operand_expected_type = None if expr.operator in comparison_ops else expected_type
+
+            lhs_type = self._infer_expression(expr.lhs, env, operand_expected_type, mutable_env)
+            rhs_type = self._infer_expression(expr.rhs, env, lhs_type or operand_expected_type, mutable_env)
             if lhs_type is None and rhs_type is not None:
                 lhs_type = self._infer_expression(expr.lhs, env, rhs_type, mutable_env)
-            if expr.operator in ("==", "!=", "<", "<=", ">", ">="):
+            if expr.operator in comparison_ops:
+                if expected_type is not None and expected_type != Type("bool"):
+                    raise TypeError(f"Type mismatch: {expected_type} != bool")
                 return Type("bool")
             return lhs_type or rhs_type or expected_type
 

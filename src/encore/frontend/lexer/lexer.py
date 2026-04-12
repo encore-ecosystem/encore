@@ -251,7 +251,7 @@ class Lexer(ParserBase[str, LexerToken]):
 
     def _push_token(self, token_type: TokenType) -> int:
         match token_type:
-            case TokenType.NEWLINE | TokenType.WHITESPACE:
+            case TokenType.NEWLINE | TokenType.WHITESPACE | TokenType.ONE_LINE_COMMENT | TokenType.MULTI_LINE_COMMENT:
                 self._drop()
                 return 0
             case _:
