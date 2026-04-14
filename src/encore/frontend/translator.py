@@ -39,7 +39,7 @@ from ehir.core.instructions.operators.arithmetic import (
 from ehir.core.instructions.operators.base import BinOp
 from ehir.core.primitives import Float, Float_t, Isize, Isize_t, Str, Str_t, Usize, Usize_t
 from ehir.core.struct import Struct
-from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
+from ehir.core.type import HeapSmartPointer, Pointer, SmartPointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter, Variable
 
 from encore.frontend.inference import TypeInferer
@@ -109,6 +109,7 @@ class Translator:
     _module: EHIR_Module
     _enum_payload_structs: dict[str, list[s.CLikeStructureDefinition]]
     _emitted_structs: set[str]
+    _any_pointer_variants: dict[str, dict[type[Type], str]]
 
     class _PreparedMatch:
         def __init__(
@@ -168,6 +169,7 @@ class Translator:
         self._enum_payload_structs = {}
         self._emitted_structs = set()
         self._current_self_type: Type | None = None
+        self._any_pointer_variants = {}
 
     def run(self, program: str) -> EHIR_Module:
         self._reset_state()
@@ -194,16 +196,32 @@ class Translator:
                 statement.signature = self._normalize_signature(statement.signature)
                 if statement.signature.type is None:
                     continue
-                self._funcs[statement.signature.name] = Derective_fn(
-                    name=statement.signature.name,
-                    generics=[self._translate_type(g) for g in statement.signature.generics],
-                    params=[
-                        Parameter(name=param.name, type=self._translate_type(param.type))
-                        for param in statement.signature.params
-                    ],
-                    body=[],
-                    ret_type=self._translate_type(statement.signature.type),
-                )
+                if self._signature_has_any_pointer(statement.signature):
+                    for pointer_cls, suffix in ((HeapSmartPointer, "__H"), (StackSmartPointer, "__S")):
+                        concrete_sig = self._specialize_signature_any_pointer(statement.signature, pointer_cls)
+                        concrete_name = f"{statement.signature.name}{suffix}"
+                        self._any_pointer_variants.setdefault(statement.signature.name, {})[pointer_cls] = concrete_name
+                        self._funcs[concrete_name] = Derective_fn(
+                            name=concrete_name,
+                            generics=[self._translate_type(g) for g in concrete_sig.generics],
+                            params=[
+                                Parameter(name=param.name, type=self._translate_type(param.type))
+                                for param in concrete_sig.params
+                            ],
+                            body=[],
+                            ret_type=self._translate_type(concrete_sig.type),
+                        )
+                else:
+                    self._funcs[statement.signature.name] = Derective_fn(
+                        name=statement.signature.name,
+                        generics=[self._translate_type(g) for g in statement.signature.generics],
+                        params=[
+                            Parameter(name=param.name, type=self._translate_type(param.type))
+                            for param in statement.signature.params
+                        ],
+                        body=[],
+                        ret_type=self._translate_type(statement.signature.type),
+                    )
             elif isinstance(statement, s.Statement_EnumDefinition):
                 self._enums[statement.name] = self._build_enum_directive(statement)
             elif isinstance(statement, s.FunctionSignature):
@@ -549,6 +567,19 @@ class Translator:
         )
 
     def _translate_function_definition(self, statement: s.Statement_FunctionDefinition):
+        normalized_sig = self._normalize_signature(statement.signature)
+        statement = replace(statement, signature=normalized_sig)
+        if self._signature_has_any_pointer(statement.signature):
+            emitted = None
+            for pointer_cls, suffix in ((HeapSmartPointer, "__H"), (StackSmartPointer, "__S")):
+                concrete_sig = self._specialize_signature_any_pointer(statement.signature, pointer_cls)
+                concrete_stmt = replace(statement, signature=replace(concrete_sig, name=f"{statement.signature.name}{suffix}"))
+                fn = self._translate_nested_function_definition(concrete_stmt)
+                self._module.ast.append(fn)
+                self._funcs[fn.name] = fn
+                emitted = fn
+            return emitted
+
         fn = self._translate_nested_function_definition(statement)
         self._module.ast.append(fn)
         self._funcs[statement.signature.name] = fn
@@ -1155,19 +1186,22 @@ class Translator:
                 self._builder._add(Instruction_lceos(var_out=out, enum=enum_expr))
                 return Assignable(out)
 
-            if expr.name in self._extern_fns and self._unsafe_depth <= 0:
+            call_name = expr.name
+            args = [self._translate_expression(arg_exp).var_out for arg_exp in expr.args]
+            call_name = self._resolve_any_pointer_call_name(call_name, args)
+
+            if call_name in self._extern_fns and self._unsafe_depth <= 0:
                 raise TypeError(f"Extern function '{expr.name}' can only be called inside unsafe block")
 
             generics = [self._translate_type(g) for g in expr.generics]
-            args = [self._translate_expression(arg_exp).var_out for arg_exp in expr.args]
             call = self._builder.build_call(
-                fn_name=expr.name,
+                fn_name=call_name,
                 generics=generics,
                 args=args,
                 name=name,
-                is_unsafe=expr.name in self._extern_fns and self._unsafe_depth > 0,
+                is_unsafe=call_name in self._extern_fns and self._unsafe_depth > 0,
             )
-            callee = self._funcs.get(expr.name)
+            callee = self._funcs.get(call_name)
             if callee is not None:
                 call.var_out.type = self._specialize_type(callee.ret_type, {})
             return call
@@ -1772,6 +1806,58 @@ class Translator:
         if typ.name.startswith("f") and typ.name[1:].isdigit():
             return Float_t(int(typ.name[1:]))
         return Type(typ.name, [self._translate_type(generic) for generic in typ.generics])
+
+    def _contains_any_pointer(self, typ: Type) -> bool:
+        if is_mutable_type(typ):
+            return self._contains_any_pointer(unwrap_for_storage(typ))
+        if isinstance(typ, AnySmartPointer):
+            return True
+        if isinstance(typ, (HeapSmartPointer, StackSmartPointer)):
+            return self._contains_any_pointer(typ.pointee)
+        return any(self._contains_any_pointer(generic) for generic in typ.generics)
+
+    def _replace_any_pointer(self, typ: Type, pointer_cls: type[SmartPointer]) -> Type:
+        if is_mutable_type(typ):
+            return make_mutable_type(self._replace_any_pointer(unwrap_for_storage(typ), pointer_cls))
+        if isinstance(typ, AnySmartPointer):
+            return pointer_cls(self._replace_any_pointer(typ.pointee, pointer_cls))
+        if isinstance(typ, HeapSmartPointer):
+            return HeapSmartPointer(self._replace_any_pointer(typ.pointee, pointer_cls))
+        if isinstance(typ, StackSmartPointer):
+            return StackSmartPointer(self._replace_any_pointer(typ.pointee, pointer_cls))
+        return Type(typ.name, [self._replace_any_pointer(generic, pointer_cls) for generic in typ.generics])
+
+    def _signature_has_any_pointer(self, signature: s.FunctionSignature) -> bool:
+        if signature.type is not None and self._contains_any_pointer(signature.type):
+            return True
+        return any(self._contains_any_pointer(param.type) for param in signature.params)
+
+    def _specialize_signature_any_pointer(
+        self, signature: s.FunctionSignature, pointer_cls: type[SmartPointer]
+    ) -> s.FunctionSignature:
+        params = [replace(param, type=self._replace_any_pointer(param.type, pointer_cls)) for param in signature.params]
+        ret_type = None if signature.type is None else self._replace_any_pointer(signature.type, pointer_cls)
+        return replace(signature, params=params, type=ret_type)
+
+    def _resolve_any_pointer_call_name(self, fn_name: str, args: list[Variable]) -> str:
+        variants = self._any_pointer_variants.get(fn_name)
+        if not variants:
+            return fn_name
+
+        concrete_kind: type[Type] | None = None
+        for arg in args:
+            if isinstance(arg.type, HeapSmartPointer):
+                if concrete_kind is not None and concrete_kind is not HeapSmartPointer:
+                    raise TypeError(f"Mixed smart-pointer kinds in call '{fn_name}' are not supported yet")
+                concrete_kind = HeapSmartPointer
+            elif isinstance(arg.type, StackSmartPointer):
+                if concrete_kind is not None and concrete_kind is not StackSmartPointer:
+                    raise TypeError(f"Mixed smart-pointer kinds in call '{fn_name}' are not supported yet")
+                concrete_kind = StackSmartPointer
+
+        if concrete_kind is None:
+            raise TypeError(f"Unable to infer smart-pointer kind for call '{fn_name}'")
+        return variants.get(concrete_kind, fn_name)
 
     def _types_compatible(self, lhs: Type, rhs: Type) -> bool:
         if is_mutable_type(lhs) and not is_mutable_type(rhs):

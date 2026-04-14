@@ -16,6 +16,7 @@ TRACE_MAX_LINES_FOR_UNIT = 5
 
 class Parser(ParserBase[LexerToken, s.Statement]):
     def _parse(self) -> list[s.Statement]:
+        self._parsing_match_header = False
         while not self._is_at_end():
             self._parse_top_level()
         return self._result
@@ -347,6 +348,21 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             else_body = self._parse_block()
 
         return s.Statement_If(branches=branches, else_body=else_body)
+
+    def _parse_if_expression(self) -> s.Expression_If:
+        self._safe_consume(TokenType.KW_IF)
+        branches = [s.Expression_IfBranch(expr=self._parse_expression(), body=self._parse_expression_block())]
+
+        while not self._is_at_end() and self._peek_curr().type == TokenType.KW_ELIF:
+            self._safe_consume(TokenType.KW_ELIF)
+            branches.append(s.Expression_IfBranch(expr=self._parse_expression(), body=self._parse_expression_block()))
+
+        if self._is_at_end() or self._peek_curr().type != TokenType.KW_ELSE:
+            raise TypeError("If expression must have an else branch")
+        self._safe_consume(TokenType.KW_ELSE)
+        else_body = self._parse_expression_block()
+
+        return s.Expression_If(branches=branches, else_body=else_body)
 
     def _parse_unsafe_block(self) -> s.Statement_Unsafe:
         self._safe_consume(TokenType.KW_UNSAFE)
@@ -726,8 +742,8 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             path = s.Expression_Path(segments)
 
             if self._peek_curr().type == TokenType.LEFT_BRACE:
-                # if self._parsing_match_header:
-                #     return path
+                if self._parsing_match_header:
+                    return path
                 return self._parse_struct_initialization(first)
             return path
 

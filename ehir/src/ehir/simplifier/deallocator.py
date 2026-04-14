@@ -14,6 +14,7 @@ from ehir.core.instructions.capture import (
     Instruction_lcpos,
     Instruction_lcsos,
     Instruction_scsoh,
+    Instruction_scsos,
 )
 from ehir.core.instructions.control_flow import (
     Instruction_br,
@@ -241,6 +242,7 @@ class Deallocator:
                 instr,
                 (
                     Instruction_scsoh,
+                    Instruction_scsos,
                     Instruction_csos,
                     Instruction_csoh,
                     Instruction_lcsos,

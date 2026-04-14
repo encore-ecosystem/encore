@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from ehir.core.instructions.base import Instruction
 from ehir.core.primitives import Usize
-from ehir.core.primitives.base import Primitive
+from ehir.core.primitives.base import Primitive, PrimitiveType
 from ehir.core.type import Type
 from ehir.core.variable import TypedVariable
 
@@ -60,6 +60,17 @@ class ProcessedInstruction_call(ProcessedInstruction):
 class ProcessedInstruction_salloc(ProcessedInstruction):
     var_out: TypedVariable
     type: Type
+
+
+@dataclass
+class ProcessedInstruction_halloc(ProcessedInstruction):
+    var_out: TypedVariable
+    type: Type
+
+
+@dataclass
+class ProcessedInstruction_hfree(ProcessedInstruction):
+    var: TypedVariable
 
 
 @dataclass
@@ -142,6 +153,34 @@ class ProcessedInstruction_neq(ProcessedInstruction):
     var_out: TypedVariable
     lhs: TypedVariable
     rhs: TypedVariable
+
+
+@dataclass
+class ProcessedInstruction_or(ProcessedInstruction):
+    var_out: TypedVariable
+    lhs: TypedVariable
+    rhs: TypedVariable
+
+
+@dataclass
+class ProcessedInstruction_and(ProcessedInstruction):
+    var_out: TypedVariable
+    lhs: TypedVariable
+    rhs: TypedVariable
+
+
+@dataclass
+class ProcessedInstruction_xor(ProcessedInstruction):
+    var_out: TypedVariable
+    lhs: TypedVariable
+    rhs: TypedVariable
+
+
+@dataclass
+class ProcessedInstruction_pcast(ProcessedInstruction):
+    var_out: TypedVariable
+    var: TypedVariable
+    type: PrimitiveType
 
 
 @dataclass

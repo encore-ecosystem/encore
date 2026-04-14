@@ -45,16 +45,21 @@ from ehir.postprocessor.derectives import (
 from ehir.postprocessor.instructions import (
     ProcessedInstruction,
     ProcessedInstruction_add,
+    ProcessedInstruction_and,
     ProcessedInstruction_call,
     ProcessedInstruction_div,
     ProcessedInstruction_getfieldptr,
     ProcessedInstruction_grt,
+    ProcessedInstruction_halloc,
+    ProcessedInstruction_hfree,
     ProcessedInstruction_ieq,
     ProcessedInstruction_leq,
     ProcessedInstruction_les,
     ProcessedInstruction_load,
     ProcessedInstruction_mul,
     ProcessedInstruction_neq,
+    ProcessedInstruction_or,
+    ProcessedInstruction_pcast,
     ProcessedInstruction_phi,
     ProcessedInstruction_put,
     ProcessedInstruction_ret,
@@ -180,10 +185,10 @@ class Codegen:
     def _build_instruction(self, instr: ProcessedInstruction):
         if isinstance(instr, ProcessedInstruction_salloc):
             self._build_salloc(instr)
+        elif isinstance(instr, ProcessedInstruction_halloc):
+            self._build_halloc(instr)
         elif isinstance(instr, Instruction_lcpos):
             self._build_lcpos(instr)
-        elif isinstance(instr, Instruction_halloc):
-            self._build_halloc(instr)
         elif isinstance(instr, ProcessedInstruction_put):
             self._build_put(instr)
         elif isinstance(instr, ProcessedInstruction_load):
@@ -204,9 +209,9 @@ class Codegen:
             self._build_les(instr)
         elif isinstance(instr, ProcessedInstruction_leq):
             self._build_leq(instr)
-        elif isinstance(instr, Instruction_or):
+        elif isinstance(instr, ProcessedInstruction_or):
             self._build_or(instr)
-        elif isinstance(instr, Instruction_and):
+        elif isinstance(instr, ProcessedInstruction_and):
             self._build_and(instr)
         elif isinstance(instr, Instruction_xor):
             self._build_xor(instr)
@@ -231,11 +236,11 @@ class Codegen:
             self._build_cbr(instr)
         elif isinstance(instr, ProcessedInstruction_switch):
             self._build_switch(instr)
-        elif isinstance(instr, Instruction_hfree):
+        elif isinstance(instr, ProcessedInstruction_hfree):
             self._build_hfree(instr)
         elif isinstance(instr, ProcessedInstruction_store):
             self._build_store(instr)
-        elif isinstance(instr, Instruction_pcast):
+        elif isinstance(instr, ProcessedInstruction_pcast):
             self._build_pcast(instr)
         elif isinstance(instr, ProcessedInstruction_getfieldptr):
             self._build_getfieldptr(instr)
@@ -270,7 +275,7 @@ class Codegen:
         self.builder.store(self._variables[instr.var.name], alloca)
         self._variables[instr.var_out.name] = alloca
 
-    def _build_pcast(self, instr: Instruction_pcast):
+    def _build_pcast(self, instr: ProcessedInstruction_pcast):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
 
@@ -389,7 +394,7 @@ class Codegen:
         self._variables[instr.var_out.name] = casted_ptr
         return casted_ptr
 
-    def _build_halloc(self, instr: Instruction_halloc):
+    def _build_halloc(self, instr: ProcessedInstruction_halloc):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
 
@@ -401,7 +406,7 @@ class Codegen:
         self._variables[instr.var_out.name] = casted_ptr
         return casted_ptr
 
-    def _build_hfree(self, instr: Instruction_hfree):
+    def _build_hfree(self, instr: ProcessedInstruction_hfree):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
 
@@ -531,7 +536,7 @@ class Codegen:
         self._variables[instr.var_out.name] = result
         return result
 
-    def _build_or(self, instr: Instruction_or):
+    def _build_or(self, instr: ProcessedInstruction_or):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
@@ -540,7 +545,7 @@ class Codegen:
         self._variables[instr.var_out.name] = result
         return result
 
-    def _build_and(self, instr: Instruction_and):
+    def _build_and(self, instr: ProcessedInstruction_and):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]

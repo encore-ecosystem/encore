@@ -68,7 +68,7 @@ class Lexer(ParserBase[str, LexerToken]):
                             self._consume()
                             self._consume_and_push(TokenType.SLASH_EQUAL)
                         case _:
-                            self._consume_and_push(TokenType.SLASH)
+                            self._push_token(TokenType.SLASH)
 
                 case "%":
                     self._consume()

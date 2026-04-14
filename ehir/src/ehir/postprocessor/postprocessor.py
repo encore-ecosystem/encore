@@ -52,6 +52,7 @@ from ehir.postprocessor.instructions import (
     ProcessedControlFlow,
     ProcessedInstruction,
     ProcessedInstruction_add,
+    ProcessedInstruction_and,
     ProcessedInstruction_br,
     ProcessedInstruction_call,
     ProcessedInstruction_cbr,
@@ -59,12 +60,16 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_geq,
     ProcessedInstruction_getfieldptr,
     ProcessedInstruction_grt,
+    ProcessedInstruction_halloc,
+    ProcessedInstruction_hfree,
     ProcessedInstruction_ieq,
     ProcessedInstruction_leq,
     ProcessedInstruction_les,
     ProcessedInstruction_load,
     ProcessedInstruction_mul,
     ProcessedInstruction_neq,
+    ProcessedInstruction_or,
+    ProcessedInstruction_pcast,
     ProcessedInstruction_phi,
     ProcessedInstruction_put,
     ProcessedInstruction_ret,
@@ -72,6 +77,7 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_store,
     ProcessedInstruction_sub,
     ProcessedInstruction_switch,
+    ProcessedInstruction_xor,
 )
 from ehir.postprocessor.module import ProcessedModule
 from ehir.postprocessor.special import ProcessedBlock
@@ -165,10 +171,15 @@ class Postprocessor:
         if isinstance(instr, Instruction_lcpos):
             self._build_lcpos(instr)
         if isinstance(instr, Instruction_halloc):
-            self._build_halloc(instr)
+            assert instr.var_out.type
+            return ProcessedInstruction_halloc(
+                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
+                type=instr.type,
+            )
 
         if isinstance(instr, Instruction_hfree):
-            self._build_hfree(instr)
+            assert instr.var.type
+            return ProcessedInstruction_hfree(var=TypedVariable(instr.var.name, instr.var.type))
         if isinstance(instr, Instruction_store):
             assert instr.var_src.type
             assert instr.var_dst.type
@@ -177,7 +188,13 @@ class Postprocessor:
                 var_dst=TypedVariable(instr.var_dst.name, instr.var_dst.type),
             )
         if isinstance(instr, Instruction_pcast):
-            self._build_pcast(instr)
+            assert instr.var_out.type
+            assert instr.var.type
+            return ProcessedInstruction_pcast(
+                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
+                var=TypedVariable(instr.var.name, instr.var.type),
+                type=instr.type,
+            )
         if isinstance(instr, Instruction_getfieldptr):
             assert instr.var_out.type
             assert instr.src.type
@@ -188,8 +205,6 @@ class Postprocessor:
                 src=TypedVariable(instr.src.name, instr.src.type),
                 field=TypedVariable(instr.field.name, instr.field.type),
             )
-        if isinstance(instr, Instruction_getfield):
-            self._build_getfield(instr)
         if isinstance(instr, Instruction_getptr):
             self._build_getptr(instr)
         if isinstance(instr, Instruction_phi):
@@ -246,13 +261,13 @@ class Postprocessor:
             result = ProcessedInstruction_div
 
         if isinstance(instr, Instruction_or):
-            self._build_or(instr)
+            result = ProcessedInstruction_or
 
         if isinstance(instr, Instruction_and):
-            self._build_and(instr)
+            result = ProcessedInstruction_and
 
         if isinstance(instr, Instruction_xor):
-            self._build_xor(instr)
+            result = ProcessedInstruction_xor
 
         if isinstance(instr, Instruction_ieq):
             result = ProcessedInstruction_ieq

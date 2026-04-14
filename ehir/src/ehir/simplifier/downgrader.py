@@ -47,7 +47,7 @@ from ehir.core.instructions.operators.logic import Instruction_and, Instruction_
 from ehir.core.instructions.special import Instruction_comment
 from ehir.core.primitives import Usize, Usize_t
 from ehir.core.struct import Struct
-from ehir.core.type import HeapSmartPointer, Pointer
+from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer
 from ehir.core.variable import Parameter, TypedVariable
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
@@ -282,7 +282,27 @@ class Downgrader:
         raise NotImplementedError
 
     def _downgrade_scsos(self, instr: Instruction_scsos) -> list[Instruction]:
-        raise NotImplementedError
+        ptr = TypedVariable(name=f".{instr.var_out.name}_wrapped_ptr", type=Pointer(instr.struct.as_type()))
+        ptr_init = Instruction_csos(ptr, instr.struct)
+
+        wrapper_name = StackSmartPointer(instr.struct.as_type()).get_name()
+        if wrapper_name not in self._structs:
+            wrapper_struct = Derective_struct(
+                name=wrapper_name,
+                generics=[],
+                params=[Parameter(name="ptr", type=ptr.type)],
+            )
+            self._structs[wrapper_name] = wrapper_struct
+            self._structs_to_add.append(wrapper_struct)
+
+        wrapped = Struct(name=wrapper_name, args=[ptr])
+        instr.var_out.type = wrapped.as_type()
+        res = Instruction_lcsos(instr.var_out, wrapped)
+
+        return [
+            *self._downgrade_csos(ptr_init),
+            *self._downgrade_lcsos(res),
+        ]
 
     def _downgrade_scsoh(self, instr: Instruction_scsoh) -> list[Instruction]:
         ptr = TypedVariable(name=f".{instr.var_out.name}_wrapped_ptr", type=Pointer(instr.struct.as_type()))
@@ -511,4 +531,4 @@ class Downgrader:
             cases.append((Usize(variant_names.index(case.variant), size=8), case.label))
 
         switch = Instruction_switch(cond_var=tag, default_case=instr.default_case, cases=cases)
-        return [*prelude, get_tag, switch]
+        return [*prelude, *self._downgrade_getfield(get_tag), switch]
