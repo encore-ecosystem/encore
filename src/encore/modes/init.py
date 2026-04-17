@@ -43,7 +43,6 @@ def _initialize_git_repo(root: Path):
     gitignore = root / ".gitignore"
     if not gitignore.exists():
         with (root / ".gitignore").open("w") as f:
-            f.write(".ehir\n")
             f.write("target\n")
 
 

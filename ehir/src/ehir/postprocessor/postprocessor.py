@@ -13,11 +13,12 @@ from ehir.core.instructions.control_flow import (
 )
 from ehir.core.instructions.control_flow.base import ControlFlow
 from ehir.core.instructions.memory import (
-    Instruction_getfield,
+    Instruction_gep,
     Instruction_getfieldptr,
     Instruction_getptr,
     Instruction_halloc,
     Instruction_hfree,
+    Instruction_hrealloc,
     Instruction_load,
     Instruction_pcast,
     Instruction_put,
@@ -58,10 +59,12 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_cbr,
     ProcessedInstruction_div,
     ProcessedInstruction_geq,
+    ProcessedInstruction_gep,
     ProcessedInstruction_getfieldptr,
     ProcessedInstruction_grt,
     ProcessedInstruction_halloc,
     ProcessedInstruction_hfree,
+    ProcessedInstruction_hrealloc,
     ProcessedInstruction_ieq,
     ProcessedInstruction_leq,
     ProcessedInstruction_les,
@@ -176,6 +179,15 @@ class Postprocessor:
                 var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
                 type=instr.type,
             )
+        if isinstance(instr, Instruction_hrealloc):
+            assert instr.var_out.type
+            assert instr.var.type
+            assert instr.count.type
+            return ProcessedInstruction_hrealloc(
+                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
+                var=TypedVariable(instr.var.name, instr.var.type),
+                count=TypedVariable(instr.count.name, instr.count.type),
+            )
 
         if isinstance(instr, Instruction_hfree):
             assert instr.var.type
@@ -200,10 +212,19 @@ class Postprocessor:
             assert instr.src.type
             assert instr.field.type
 
-            return ProcessedInstruction_getfieldptr(
+            return ProcessedInstruction_gep(
                 var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
-                src=TypedVariable(instr.src.name, instr.src.type),
-                field=TypedVariable(instr.field.name, instr.field.type),
+                var=TypedVariable(instr.src.name, instr.src.type),
+                offset=int(instr.field.name),
+            )
+        if isinstance(instr, Instruction_gep):
+            assert instr.var_out.type
+            assert instr.var.type
+            assert instr.offset.type
+            return ProcessedInstruction_gep(
+                var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
+                var=TypedVariable(instr.var.name, instr.var.type),
+                offset=TypedVariable(instr.offset.name, instr.offset.type),
             )
         if isinstance(instr, Instruction_getptr):
             self._build_getptr(instr)

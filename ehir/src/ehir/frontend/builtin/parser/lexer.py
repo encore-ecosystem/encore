@@ -198,6 +198,8 @@ class Lexer:
                 self._append_token(t.GETFIELD)
             case "getfieldptr":
                 self._append_token(t.GETFIELDPTR)
+            case "gep":
+                self._append_token(t.GEP)
             case "sgetfield":
                 self._append_token(t.SGETFIELD)
             case "sgetfieldptr":
@@ -258,6 +260,8 @@ class Lexer:
                 self._append_token(t.STORE)
             case "halloc":
                 self._append_token(t.HALLOC)
+            case "hrealloc":
+                self._append_token(t.HREALLOC)
             case "hfree":
                 self._append_token(t.HFREE)
             case _:

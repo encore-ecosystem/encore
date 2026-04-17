@@ -26,11 +26,13 @@ from ehir.core.instructions.control_flow import (
     Instruction_switch,
 )
 from ehir.core.instructions.memory import (
+    Instruction_gep,
     Instruction_getfield,
     Instruction_getfieldptr,
     Instruction_getptr,
     Instruction_halloc,
     Instruction_hfree,
+    Instruction_hrealloc,
     Instruction_load,
     Instruction_pcast,
     Instruction_salloc,
@@ -47,6 +49,7 @@ from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 SKIPABLE = (
     Instruction_br,
     Instruction_halloc,
+    Instruction_hrealloc,
     Instruction_lcpos,
     Instruction_cpoh,
     Instruction_cpos,
@@ -233,6 +236,12 @@ class Deallocator:
                 self._add_variable_usage(instr.cond_var)
             elif isinstance(instr, Instruction_getptr):
                 self._add_variable_usage(instr.var)
+            elif isinstance(instr, Instruction_gep):
+                self._add_variable_usage(instr.var)
+                self._add_variable_usage(instr.offset)
+            elif isinstance(instr, Instruction_hrealloc):
+                self._add_variable_usage(instr.var)
+                self._add_variable_usage(instr.count)
             elif isinstance(instr, Instruction_store):
                 self._add_variable_usage(instr.var_src)
                 self._add_variable_usage(instr.var_dst)

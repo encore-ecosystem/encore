@@ -69,6 +69,13 @@ class ProcessedInstruction_halloc(ProcessedInstruction):
 
 
 @dataclass
+class ProcessedInstruction_hrealloc(ProcessedInstruction):
+    var_out: TypedVariable
+    var: TypedVariable
+    count: TypedVariable
+
+
+@dataclass
 class ProcessedInstruction_hfree(ProcessedInstruction):
     var: TypedVariable
 
@@ -180,7 +187,7 @@ class ProcessedInstruction_xor(ProcessedInstruction):
 class ProcessedInstruction_pcast(ProcessedInstruction):
     var_out: TypedVariable
     var: TypedVariable
-    type: PrimitiveType
+    type: Type
 
 
 @dataclass
@@ -194,3 +201,10 @@ class ProcessedInstruction_getfieldptr(ProcessedInstruction):
     var_out: TypedVariable
     src: TypedVariable
     field: TypedVariable
+
+
+@dataclass
+class ProcessedInstruction_gep(ProcessedInstruction):
+    var_out: TypedVariable
+    var: TypedVariable
+    offset: TypedVariable | int

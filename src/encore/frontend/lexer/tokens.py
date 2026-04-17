@@ -34,6 +34,7 @@ class TokenType(Enum):
     KW_IMPORT = auto()
     KW_EXTERN = auto()
     KW_UNSAFE = auto()
+    KW_EHIR = auto()
 
     SCOPE = auto()
 
@@ -86,6 +87,7 @@ class TokenType(Enum):
     RIGHT_BRACE = auto()
     LEFT_BRACKET = auto()
     RIGHT_BRACKET = auto()
+    SEMICOLON = auto()
     COLON = auto()
     COMMA = auto()
     DOT = auto()

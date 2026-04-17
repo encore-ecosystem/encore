@@ -47,7 +47,9 @@ class EHIR_ProjectCompiler:
 
     def __post_init__(self):
         if self.cache_dir is None:
-            self.cache_dir = self.backend.target_dir.parent / ".ehir" / "cache"
+            # Keep EHIR cache alongside backend artifacts:
+            # target/<profile>/{llvm,object,ehir}
+            self.cache_dir = self.backend.profile_path / "ehir" / "cache"
 
         self._cache = CompiledRefrainCache(self.cache_dir)
 

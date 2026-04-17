@@ -125,6 +125,8 @@ class Lexer(ParserBase[str, LexerToken]):
                     self._consume_and_push(TokenType.DOT)
                 case ",":
                     self._consume_and_push(TokenType.COMMA)
+                case ";":
+                    self._consume_and_push(TokenType.SEMICOLON)
                 case "=":
                     self._consume()
                     match self._peek_curr():
@@ -232,6 +234,7 @@ class Lexer(ParserBase[str, LexerToken]):
             "import": TokenType.KW_IMPORT,
             "extern": TokenType.KW_EXTERN,
             "unsafe": TokenType.KW_UNSAFE,
+            "ehir": TokenType.KW_EHIR,
             "not": TokenType.BANG,
             "true": TokenType.BOOLEAN,
             "false": TokenType.BOOLEAN,

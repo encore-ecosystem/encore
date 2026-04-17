@@ -28,24 +28,21 @@ class Normalizer:
 
     def _terminate_blocks(self, derective: Derective_fn):
         new_blocks = []
-        for idx, block in enumerate(derective.body):
-            observed: list[Instruction] = []
+        for block in derective.body:
+            #
+            block_body: list[Instruction] = []
             for instr in block.body:
                 if isinstance(instr, ControlFlow):
                     break
-                observed.append(instr)
-            else:
-                if idx + 1 < len(derective.body):
-                    new_blocks.append(
-                        TerminatedBlock(
-                            name=block.name, body=observed, term=Instruction_br(derective.body[idx + 1].name)
-                        )
-                    )
-                    continue
-                if not observed:
-                    continue
+                block_body.append(instr)
+
+            if len(block_body) != len(block.body) - 1:
+                raise ValueError("Found dead code!")
+
+            if not isinstance(block.body[-1], ControlFlow):
                 raise ValueError("Block must end with a control flow instruction")
-            new_blocks.append(TerminatedBlock(name=block.name, body=observed, term=instr))
+            #
+            new_blocks.append(TerminatedBlock(name=block.name, body=block_body, term=block.body[-1]))
         derective.body = new_blocks
 
     def _normalize_fn(self, derective: Derective_fn) -> Normalized_fn:

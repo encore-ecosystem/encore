@@ -29,10 +29,12 @@ from ehir.core.instructions.control_flow import (
 )
 from ehir.core.instructions.control_flow.base import ControlFlow
 from ehir.core.instructions.memory import (
+    Instruction_gep,
     Instruction_getfield,
     Instruction_getfieldptr,
     Instruction_getptr,
     Instruction_hfree,
+    Instruction_hrealloc,
     Instruction_pcast,
     Instruction_put,
     Instruction_sgetfield,
@@ -66,10 +68,12 @@ SKIPABLE = (
     Instruction_put,
     Instruction_hfree,
     Instruction_getfieldptr,
+    Instruction_gep,
     Instruction_pcast,
     Instruction_getptr,
     Instruction_comment,
     Instruction_halloc,
+    Instruction_hrealloc,
     Instruction_phi,
 )
 

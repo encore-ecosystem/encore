@@ -12,10 +12,7 @@ from ehir.core.instructions.memory import (
     Instruction_getfield,
     Instruction_getfieldptr,
     Instruction_getptr,
-    Instruction_hfree,
-    Instruction_pcast,
 )
-from ehir.core.instructions.memory.halloc import Instruction_halloc
 from ehir.core.instructions.operators.arithmetic import (
     Instruction_mod,
     Instruction_shl,
@@ -23,11 +20,8 @@ from ehir.core.instructions.operators.arithmetic import (
 )
 from ehir.core.instructions.operators.comparison import (
     Instruction_geq,
-    Instruction_leq,
 )
 from ehir.core.instructions.operators.logic import (
-    Instruction_and,
-    Instruction_or,
     Instruction_xor,
 )
 from ehir.core.instructions.special import Instruction_comment
@@ -48,10 +42,13 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_and,
     ProcessedInstruction_call,
     ProcessedInstruction_div,
+    ProcessedInstruction_geq,
+    ProcessedInstruction_gep,
     ProcessedInstruction_getfieldptr,
     ProcessedInstruction_grt,
     ProcessedInstruction_halloc,
     ProcessedInstruction_hfree,
+    ProcessedInstruction_hrealloc,
     ProcessedInstruction_ieq,
     ProcessedInstruction_leq,
     ProcessedInstruction_les,
@@ -187,6 +184,8 @@ class Codegen:
             self._build_salloc(instr)
         elif isinstance(instr, ProcessedInstruction_halloc):
             self._build_halloc(instr)
+        elif isinstance(instr, ProcessedInstruction_hrealloc):
+            self._build_hrealloc(instr)
         elif isinstance(instr, Instruction_lcpos):
             self._build_lcpos(instr)
         elif isinstance(instr, ProcessedInstruction_put):
@@ -218,7 +217,7 @@ class Codegen:
 
         elif isinstance(instr, ProcessedInstruction_grt):
             self._build_grt(instr)
-        elif isinstance(instr, Instruction_geq):
+        elif isinstance(instr, ProcessedInstruction_geq):
             self._build_geq(instr)
         elif isinstance(instr, Instruction_mod):
             self._build_mod(instr)
@@ -242,6 +241,8 @@ class Codegen:
             self._build_store(instr)
         elif isinstance(instr, ProcessedInstruction_pcast):
             self._build_pcast(instr)
+        elif isinstance(instr, ProcessedInstruction_gep):
+            self._build_gep(instr)
         elif isinstance(instr, ProcessedInstruction_getfieldptr):
             self._build_getfieldptr(instr)
         elif isinstance(instr, Instruction_getfield):
@@ -289,11 +290,9 @@ class Codegen:
         # Cast
         ## Same
         if src_type == dst_type:
-            return
+            result = value
 
-        result = None
-        ## Int to Int
-        if isinstance(src_type, ir.IntType) and isinstance(dst_type, ir.IntType):
+        elif isinstance(src_type, ir.IntType) and isinstance(dst_type, ir.IntType):
             src_width = src_type.width
             dst_width = dst_type.width
 
@@ -302,7 +301,13 @@ class Codegen:
             elif src_width > dst_width:
                 result = self.builder.trunc(value, dst_type, name=instr.var_out.name)
             else:
-                raise RuntimeError("Unreachable")
+                result = value
+        elif isinstance(src_type, ir.IntType) and isinstance(dst_type, ir.PointerType):
+            result = self.builder.inttoptr(value, dst_type, name=instr.var_out.name)
+        elif isinstance(src_type, ir.PointerType) and isinstance(dst_type, ir.IntType):
+            result = self.builder.ptrtoint(value, dst_type, name=instr.var_out.name)
+        elif isinstance(src_type, ir.PointerType) and isinstance(dst_type, ir.PointerType):
+            result = self.builder.bitcast(value, dst_type, name=instr.var_out.name)
 
         else:
             raise NotImplementedError(f"Unsupported cast: {src_type} -> {dst_type}")
@@ -373,6 +378,37 @@ class Codegen:
         self._variables[instr.var_out.name] = result
         return result
 
+    def _build_gep(self, instr: ProcessedInstruction_gep):
+        self.builder.comment("")
+        self.builder.comment(f"{instr}")
+
+        base = self._variables[instr.var.name]
+        if not isinstance(base.type, ir.PointerType):
+            temp = self.builder.alloca(base.type)
+            self.builder.store(base, temp)
+            base = temp
+
+        if not isinstance(base.type, ir.PointerType):
+            raise ValueError(f"GEP expects pointer base, got {base.type}")
+
+        if isinstance(instr.offset, int):
+            offset_value = ir.Constant(ir.IntType(32), instr.offset)
+        else:
+            offset_value = self._variables[instr.offset.name]
+
+        if isinstance(base.type.pointee, ir.BaseStructType):
+            if hasattr(offset_value, "constant"):
+                field_index = int(offset_value.constant)
+            else:
+                raise ValueError(f"Struct GEP requires constant offset: {instr}")
+            indices = [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_index)]
+        else:
+            indices = [offset_value]
+
+        result = self.builder.gep(base, indices, name=instr.var_out.name)
+        self._variables[instr.var_out.name] = result
+        return result
+
     def _build_getfield(self, instr: Instruction_getfield):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
@@ -386,13 +422,22 @@ class Codegen:
     def _build_salloc(self, instr: ProcessedInstruction_salloc):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
-
-        byte_size = self._sizeof(instr.type)
-        ptr = self.builder.alloca(ir.IntType(8), size=byte_size, name=f".salloc_{instr.var_out.name}")
         target_type = self._build_type(instr.type)
-        casted_ptr = self.builder.bitcast(ptr, ir.PointerType(target_type), name=instr.var_out.name)
-        self._variables[instr.var_out.name] = casted_ptr
-        return casted_ptr
+        ptr = self.builder.alloca(target_type, name=instr.var_out.name)
+        self._variables[instr.var_out.name] = ptr
+        return ptr
+
+    def _entry_alloca_builder(self) -> ir.IRBuilder:
+        current_block = self.builder.block
+        if current_block is None:
+            return self.builder
+        entry_block = current_block.function.entry_basic_block
+        builder = ir.IRBuilder(entry_block)
+        if entry_block.instructions:
+            builder.position_before(entry_block.instructions[0])
+        else:
+            builder.position_at_end(entry_block)
+        return builder
 
     def _build_halloc(self, instr: ProcessedInstruction_halloc):
         self.builder.comment("")
@@ -403,6 +448,34 @@ class Codegen:
         raw_ptr = self.builder.call(malloc_func, [byte_size], name=f".halloc_{instr.var_out.name}")
         target_type = self._build_type(instr.type)
         casted_ptr = self.builder.bitcast(raw_ptr, ir.PointerType(target_type), name=instr.var_out.name)
+        self._variables[instr.var_out.name] = casted_ptr
+        return casted_ptr
+
+    def _build_hrealloc(self, instr: ProcessedInstruction_hrealloc):
+        self.builder.comment("")
+        self.builder.comment(f"{instr}")
+
+        ptr = self._variables[instr.var.name]
+        count = self._variables[instr.count.name]
+        assert instr.var.type is not None
+
+        size_type = ir.IntType(self._get_pointer_width_bits())
+        if count.type != size_type:
+            if isinstance(count.type, ir.IntType):
+                if count.type.width < size_type.width:
+                    count = self.builder.zext(count, size_type, name=f".countext_{instr.count.name}")
+                elif count.type.width > size_type.width:
+                    count = self.builder.trunc(count, size_type, name=f".counttrunc_{instr.count.name}")
+            else:
+                raise TypeError(f"HREALLOC count must lower to integer, got {count.type}")
+
+        elem_size = self._sizeof(instr.var.type.pointee)
+        byte_size = self.builder.mul(count, elem_size, name=f".hrealloc_bytes_{instr.var_out.name}")
+        realloc_func = self._get_realloc_function()
+        raw_ptr = self.builder.bitcast(ptr, realloc_func.args[0].type, name=f".hrealloc_raw_{instr.var.name}")
+        resized = self.builder.call(realloc_func, [raw_ptr, byte_size], name=f".hrealloc_{instr.var_out.name}")
+        target_type = self._build_type(instr.var.type.pointee)
+        casted_ptr = self.builder.bitcast(resized, ir.PointerType(target_type), name=instr.var_out.name)
         self._variables[instr.var_out.name] = casted_ptr
         return casted_ptr
 
@@ -633,7 +706,7 @@ class Codegen:
         self._variables[instr.var_out.name] = result
         return result
 
-    def _build_geq(self, instr: Instruction_geq):
+    def _build_geq(self, instr: ProcessedInstruction_geq):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
@@ -1022,13 +1095,15 @@ class Codegen:
         self._pointer_width_bits = ctypes.sizeof(ctypes.c_void_p) * 8
         return self._pointer_width_bits
 
-    def _sizeof(self, type: Type):
+    def _sizeof(self, type: Type, builder: ir.IRBuilder | None = None):
+        if builder is None:
+            builder = self.builder
         t = self._build_type(type)
         null_ptr_type = ir.PointerType(t)
         null_ptr = ir.Constant(null_ptr_type, None)
         one = ir.Constant(ir.IntType(32), 1)
-        size_ptr = self.builder.gep(null_ptr, [one], name=f".sizeof_{type.name}_ptr")
-        return self.builder.ptrtoint(size_ptr, ir.IntType(64), name=f".sizeof_{type.name}_")
+        size_ptr = builder.gep(null_ptr, [one], name=f".sizeof_{type.name}_ptr")
+        return builder.ptrtoint(size_ptr, ir.IntType(64), name=f".sizeof_{type.name}_")
 
     def _get_malloc_function(self) -> ir.Function:
         if "malloc" in self.module.globals:
@@ -1041,6 +1116,17 @@ class Codegen:
         malloc_func = ir.Function(self.module, malloc_type, name="malloc")
         malloc_func.attributes.add("noinline")
         return malloc_func
+
+    def _get_realloc_function(self) -> ir.Function:
+        if "realloc" in self.module.globals:
+            return self.module.globals["realloc"]
+        realloc_type = ir.FunctionType(
+            ir.IntType(8).as_pointer(),
+            [ir.IntType(8).as_pointer(), ir.IntType(self._get_pointer_width_bits())],
+        )
+        realloc_func = ir.Function(self.module, realloc_type, name="realloc")
+        realloc_func.attributes.add("noinline")
+        return realloc_func
 
     def _get_free_function(self):
         if "free" in self.module.globals:

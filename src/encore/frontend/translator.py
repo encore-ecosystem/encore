@@ -49,9 +49,15 @@ from encore.frontend.parser import statements as s
 from encore.frontend.parser.statements import Block
 from encore.frontend.types import (
     AnySmartPointer,
+    array_size,
+    is_array_type,
     is_mutable_type,
+    is_raw_pointer_type,
     is_reference_like_type,
+    is_tuple_type,
     make_mutable_type,
+    make_tuple_type,
+    tuple_arity,
     unwrap_for_storage,
 )
 
@@ -261,16 +267,34 @@ class Translator:
                         ),
                         self_type=statement.struct,
                     )
-                    self._funcs[normalized_signature.name] = Derective_fn(
-                        name=normalized_signature.name,
-                        generics=[self._translate_type(g) for g in normalized_signature.generics],
-                        params=[
-                            Parameter(name=param.name, type=self._translate_type(param.type))
-                            for param in normalized_signature.params
-                        ],
-                        body=[],
-                        ret_type=self._translate_type(normalized_signature.type),
-                    )
+                    if self._signature_has_any_pointer(normalized_signature):
+                        for pointer_cls, suffix in ((HeapSmartPointer, "__H"), (StackSmartPointer, "__S")):
+                            concrete_sig = self._specialize_signature_any_pointer(normalized_signature, pointer_cls)
+                            concrete_name = f"{normalized_signature.name}{suffix}"
+                            self._any_pointer_variants.setdefault(normalized_signature.name, {})[
+                                pointer_cls
+                            ] = concrete_name
+                            self._funcs[concrete_name] = Derective_fn(
+                                name=concrete_name,
+                                generics=[self._translate_type(g) for g in concrete_sig.generics],
+                                params=[
+                                    Parameter(name=param.name, type=self._translate_type(param.type))
+                                    for param in concrete_sig.params
+                                ],
+                                body=[],
+                                ret_type=self._translate_type(concrete_sig.type),
+                            )
+                    else:
+                        self._funcs[normalized_signature.name] = Derective_fn(
+                            name=normalized_signature.name,
+                            generics=[self._translate_type(g) for g in normalized_signature.generics],
+                            params=[
+                                Parameter(name=param.name, type=self._translate_type(param.type))
+                                for param in normalized_signature.params
+                            ],
+                            body=[],
+                            ret_type=self._translate_type(normalized_signature.type),
+                        )
 
     def _translate_statement(self, statement: s.Statement) -> Derective | None:
         if isinstance(statement, s.Statement_FunctionDefinition):
@@ -317,6 +341,8 @@ class Translator:
             return HeapSmartPointer(self._resolve_self_in_type(typ.pointee, self_type))
         if isinstance(typ, StackSmartPointer):
             return StackSmartPointer(self._resolve_self_in_type(typ.pointee, self_type))
+        if is_raw_pointer_type(typ):
+            return Pointer(self._resolve_self_in_type(typ.pointee, self_type))
         if typ.name == "Self" and not typ.generics and self_type is not None:
             return self_type
         return replace(typ, generics=[self._resolve_self_in_type(generic, self_type) for generic in typ.generics])
@@ -354,13 +380,15 @@ class Translator:
         self,
         receiver_type: Type,
         method_name: str,
-    ) -> tuple[str, Derective_fn | Derective_extern_fn]:
+    ) -> tuple[str, Derective_fn | Derective_extern_fn | None]:
         receiver_type = unwrap_for_storage(receiver_type)
         base_receiver_type = receiver_type.pointee if is_reference_like_type(receiver_type) else receiver_type
         inherent_name = f"{base_receiver_type.name}::{method_name}"
         inherent_callee = self._funcs.get(inherent_name)
         if inherent_callee is not None:
             return inherent_name, inherent_callee
+        if inherent_name in self._any_pointer_variants:
+            return inherent_name, None
 
         for trait_name in self._impl_traits.get(base_receiver_type.name, []):
             signature = self._lookup_trait_method_signature(
@@ -439,6 +467,26 @@ class Translator:
             params=[Parameter(param.name, self._translate_type(param.type)) for param in definition.fields],
         )
         self._emitted_structs.add(definition.name)
+
+    def _ensure_runtime_tuple_struct(self, arity: int):
+        name = f"__tuple_{arity}"
+        if name in self._structs:
+            return
+        generics = [Type(f"T{idx}") for idx in range(arity)]
+        fields = [Parameter(str(idx), Type(f"T{idx}")) for idx in range(arity)]
+        definition = s.CLikeStructureDefinition(name=name, generics=generics, fields=fields)
+        self._structs[name] = definition
+        self._emit_struct_definition(definition)
+
+    def _ensure_runtime_array_struct(self, size: int):
+        name = f"__array_{size}"
+        if name in self._structs:
+            return
+        generics = [Type("T")]
+        fields = [Parameter(str(idx), Type("T")) for idx in range(size)]
+        definition = s.CLikeStructureDefinition(name=name, generics=generics, fields=fields)
+        self._structs[name] = definition
+        self._emit_struct_definition(definition)
 
     def _build_enum_directive(self, statement: s.Statement_EnumDefinition) -> Derective_enum:
         variants: list[EnumVariant] = []
@@ -546,7 +594,24 @@ class Translator:
                         self_type=statement.struct,
                     ),
                 )
-                self._module.ast.append(self._translate_nested_function_definition(namespaced_method))
+                if self._signature_has_any_pointer(namespaced_method.signature):
+                    for pointer_cls, suffix in ((HeapSmartPointer, "__H"), (StackSmartPointer, "__S")):
+                        concrete_sig = self._specialize_signature_any_pointer(namespaced_method.signature, pointer_cls)
+                        concrete_name = f"{namespaced_method.signature.name}{suffix}"
+                        concrete_stmt = replace(
+                            namespaced_method,
+                            signature=replace(concrete_sig, name=concrete_name),
+                        )
+                        fn = self._translate_nested_function_definition(concrete_stmt)
+                        self._module.ast.append(fn)
+                        self._funcs[fn.name] = fn
+                        self._any_pointer_variants.setdefault(namespaced_method.signature.name, {})[
+                            pointer_cls
+                        ] = fn.name
+                else:
+                    fn = self._translate_nested_function_definition(namespaced_method)
+                    self._module.ast.append(fn)
+                    self._funcs[fn.name] = fn
             return None
 
         methods = [
@@ -676,6 +741,9 @@ class Translator:
 
         elif isinstance(statement, s.Statement_Unsafe):
             return self._translate_unsafe(statement)
+
+        elif isinstance(statement, s.Statement_EHIR):
+            return self._translate_ehir(statement)
 
         elif isinstance(statement, s.Statement_Assignment):
             return self._translate_assignment(statement)
@@ -809,6 +877,17 @@ class Translator:
             self._translate_block(statement.body)
         finally:
             self._unsafe_depth -= 1
+
+    def _translate_ehir(self, statement: s.Statement_EHIR):
+        for instruction in statement.instructions:
+            if isinstance(instruction, Assignable):
+                if instruction.var_out.name in self._var_ptrs or instruction.var_out.name in self._var_vals:
+                    raise TypeError(
+                        f"EHIR output '{instruction.var_out.name}' conflicts with existing Encore local. "
+                        "Use a distinct raw variable name."
+                    )
+                self._builder.variables[instruction.var_out.name] = instruction.var_out
+            self._builder._add(instruction)
 
     def _translate_while(self, statement: s.Statement_While):
         while_id = self._while_counter
@@ -1126,6 +1205,62 @@ class Translator:
         elif isinstance(expr, s.Expression_Parenthesized):
             return self._translate_expression(expr.expr, name=name, expected_type=expected_type)
 
+        elif isinstance(expr, s.Expression_TupleLiteral):
+            expected_items: list[Type | None] = [None] * len(expr.items)
+            tuple_type = None
+            if expected_type is not None:
+                expected_base = unwrap_for_storage(expected_type)
+                expected_base = expected_base.pointee if is_reference_like_type(expected_base) else expected_base
+                if is_tuple_type(expected_base):
+                    expected_items = list(expected_base.generics)
+                    tuple_type = expected_base
+
+            args = [
+                self._translate_expression(item, expected_type=expected_items[idx] if idx < len(expected_items) else None).var_out
+                for idx, item in enumerate(expr.items)
+            ]
+            if tuple_type is None:
+                if any(arg.type is None for arg in args):
+                    raise TypeError("Unable to infer tuple literal type")
+                tuple_type = make_tuple_type([arg.type for arg in args if arg.type is not None])
+            return self._translate_struct_initialization(self._translate_type(tuple_type), args, name)
+
+        elif isinstance(expr, s.Expression_ArrayRepeat):
+            expected_item_type = None
+            array_type = None
+            if expected_type is not None:
+                expected_base = unwrap_for_storage(expected_type)
+                expected_base = expected_base.pointee if is_reference_like_type(expected_base) else expected_base
+                if is_array_type(expected_base):
+                    expected_item_type = expected_base.generics[0]
+                    array_type = expected_base
+            item = self._translate_expression(expr.value, expected_type=expected_item_type).var_out
+            if array_type is None:
+                if item.type is None:
+                    raise TypeError("Unable to infer array repeat item type")
+                array_type = Type(f"__array_{expr.size}", [item.type])
+            args = [item for _ in range(expr.size)]
+            return self._translate_struct_initialization(self._translate_type(array_type), args, name)
+
+        elif isinstance(expr, s.Expression_ArrayLiteral):
+            expected_item_type = None
+            array_type = None
+            if expected_type is not None:
+                expected_base = unwrap_for_storage(expected_type)
+                expected_base = expected_base.pointee if is_reference_like_type(expected_base) else expected_base
+                if is_array_type(expected_base):
+                    expected_item_type = expected_base.generics[0]
+                    array_type = expected_base
+
+            args = [self._translate_expression(item, expected_type=expected_item_type).var_out for item in expr.items]
+            if array_type is None:
+                if not args:
+                    raise TypeError("Unable to infer type of empty array literal")
+                if args[0].type is None:
+                    raise TypeError("Unable to infer array item type")
+                array_type = Type(f"__array_{len(args)}", [args[0].type])
+            return self._translate_struct_initialization(self._translate_type(array_type), args, name)
+
         elif isinstance(expr, s.Expression_StructInitialization):
             target_struct_type = self._translate_type(expr.name)
             field_types = self._lookup_struct_field_types(target_struct_type)
@@ -1156,6 +1291,27 @@ class Translator:
             self._builder._add(instr)
             return instr
 
+        elif isinstance(expr, s.Expression_Index):
+            if not isinstance(expr.index, s.Expression_IntegerLiteral):
+                raise TypeError("Only constant integer indexing is currently supported")
+            idx = int(expr.index.value)
+
+            src = self._translate_expression(expr.base).var_out
+            field = Variable(str(idx))
+            field_type = self._lookup_field_type(src.type, field.name)
+            if field_type is None:
+                raise TypeError(f"Unable to resolve index '{idx}' for type '{src.type}'")
+
+            if is_reference_like_type(src.type):
+                instr = self._builder.build_sgetfield(src=src, field=field)
+                instr.var_out.type = field_type
+                return instr
+
+            instr = Instruction_getfield(var_out=Variable(name or self._advance_variable()), src=src, field=field)
+            instr.var_out.type = field_type
+            self._builder._add(instr)
+            return instr
+
         elif isinstance(expr, s.Expression_MethodCall):
             receiver = self._translate_expression(expr.receiver).var_out
             if receiver.type is None:
@@ -1168,6 +1324,8 @@ class Translator:
 
             generics = [self._translate_type(g) for g in expr.generics]
             args = [receiver, *[self._translate_expression(arg_exp).var_out for arg_exp in expr.args]]
+            fn_name = self._resolve_any_pointer_call_name(fn_name, args)
+            callee = self._funcs.get(fn_name, callee)
             call = self._builder.build_call(
                 fn_name=fn_name,
                 generics=generics,
@@ -1175,8 +1333,9 @@ class Translator:
                 name=name,
                 is_unsafe=fn_name in self._extern_fns and self._unsafe_depth > 0,
             )
-            generic_mapping = {generic.name: concrete for generic, concrete in zip(callee.generics, generics)}
-            call.var_out.type = self._specialize_type(callee.ret_type, generic_mapping)
+            if callee is not None:
+                generic_mapping = {generic.name: concrete for generic, concrete in zip(callee.generics, generics)}
+                call.var_out.type = self._specialize_type(callee.ret_type, generic_mapping)
             return call
 
         elif isinstance(expr, s.Expression_Call):
@@ -1186,14 +1345,14 @@ class Translator:
                 self._builder._add(Instruction_lceos(var_out=out, enum=enum_expr))
                 return Assignable(out)
 
-            call_name = expr.name
+            call_name, call_generics = self._resolve_function_call_target(expr)
             args = [self._translate_expression(arg_exp).var_out for arg_exp in expr.args]
             call_name = self._resolve_any_pointer_call_name(call_name, args)
 
             if call_name in self._extern_fns and self._unsafe_depth <= 0:
                 raise TypeError(f"Extern function '{expr.name}' can only be called inside unsafe block")
 
-            generics = [self._translate_type(g) for g in expr.generics]
+            generics = [self._translate_type(g) for g in call_generics]
             call = self._builder.build_call(
                 fn_name=call_name,
                 generics=generics,
@@ -1203,7 +1362,9 @@ class Translator:
             )
             callee = self._funcs.get(call_name)
             if callee is not None:
-                call.var_out.type = self._specialize_type(callee.ret_type, {})
+                callee_generics = getattr(callee, "generics", [])
+                generic_mapping = {generic.name: concrete for generic, concrete in zip(callee_generics, generics)}
+                call.var_out.type = self._specialize_type(callee.ret_type, generic_mapping)
             return call
 
         raise NotImplementedError(f"Translation for expression type {type(expr)}:{expr} is not implemented.")
@@ -1389,7 +1550,9 @@ class Translator:
         base_var_ptrs = dict(self._var_ptrs)
         result_name = name or self._advance_variable()
         result_type = expected_type
-        result_slot: Variable | None = None
+        result_slot: Variable | None = (
+            self._allocate_stack_slot(f"{result_name}_slot", result_type) if result_type is not None else None
+        )
 
         for idx, branch in enumerate(expr.branches):
             self._builder.position_at_end(cond_blocks[idx])
@@ -1439,6 +1602,11 @@ class Translator:
     ) -> Assignable:
         match_id = self._if_counter
         self._if_counter += 1
+        result_name = name or self._advance_variable()
+        result_type = expected_type
+        result_slot: Variable | None = (
+            self._allocate_stack_slot(f"{result_name}_slot", result_type) if result_type is not None else None
+        )
 
         prepared = self._prepare_match(
             match_id=match_id,
@@ -1448,9 +1616,6 @@ class Translator:
             default_prefix="match_expr_default",
             arm_prefix="match_expr_arm",
         )
-        result_name = name or self._advance_variable()
-        result_type = expected_type
-        result_slot: Variable | None = None
 
         for idx, arm in enumerate(expr.arms):
             if arm.is_wildcard:
@@ -1583,16 +1748,19 @@ class Translator:
         self._builder._add(Instruction_load(var_out=out, var=ptr))
         return Assignable(out)
 
-    def _create_stack_slot(self, slot_name: str, value: Variable, value_type: Type) -> Variable:
+    def _allocate_stack_slot(self, slot_name: str, value_type: Type) -> Variable:
         if isinstance(value_type, (Usize_t, Isize_t, Float_t, Str_t)):
             init_prim = self._zero_primitive(value_type)
             capture = Instruction_cpos(var_out=Variable(slot_name, Pointer(value_type)), primitive=init_prim)
             self._builder._add(capture)
-            slot_ptr = capture.var_out
-        else:
-            slot_ptr = Variable(slot_name, Pointer(value_type))
-            self._builder._add(Instruction_salloc(var_out=slot_ptr, type=value_type))
+            return capture.var_out
 
+        slot_ptr = Variable(slot_name, Pointer(value_type))
+        self._builder._add(Instruction_salloc(var_out=slot_ptr, type=value_type))
+        return slot_ptr
+
+    def _create_stack_slot(self, slot_name: str, value: Variable, value_type: Type) -> Variable:
+        slot_ptr = self._allocate_stack_slot(slot_name, value_type)
         self._builder._add(Instruction_store(var_src=value, var_dst=slot_ptr))
         return slot_ptr
 
@@ -1753,6 +1921,8 @@ class Translator:
             return HeapSmartPointer(self._specialize_type(typ.pointee, generic_mapping))
         if isinstance(typ, StackSmartPointer):
             return StackSmartPointer(self._specialize_type(typ.pointee, generic_mapping))
+        if is_raw_pointer_type(typ):
+            return Pointer(self._specialize_type(typ.pointee, generic_mapping))
         if not typ.generics and typ.name in generic_mapping:
             return generic_mapping[typ.name]
         return Type(typ.name, [self._specialize_type(generic, generic_mapping) for generic in typ.generics])
@@ -1763,7 +1933,8 @@ class Translator:
         struct_def = self._structs.get(base_type.name)
         if not isinstance(struct_def, s.CLikeStructureDefinition):
             return []
-        return [self._translate_type(field.type) for field in struct_def.fields]
+        generic_mapping = {generic.name: concrete for generic, concrete in zip(struct_def.generics, base_type.generics)}
+        return [self._translate_type(self._specialize_type(field.type, generic_mapping)) for field in struct_def.fields]
 
     def _lookup_field_type(self, typ: Optional[Type], field: str) -> Optional[Type]:
         if typ is None:
@@ -1775,9 +1946,10 @@ class Translator:
         if not isinstance(struct_def, s.CLikeStructureDefinition):
             return None
 
+        generic_mapping = {generic.name: concrete for generic, concrete in zip(struct_def.generics, base_type.generics)}
         for field_param in struct_def.fields:
             if field_param.name == field:
-                return self._translate_type(field_param.type)
+                return self._translate_type(self._specialize_type(field_param.type, generic_mapping))
         return None
 
     def _translate_type(self, typ: Type) -> Type:
@@ -1787,10 +1959,18 @@ class Translator:
                 f"Ambiguous smart pointer type '{typ}'. "
                 "Use a concrete smart pointer ('T<H>' or 'T<S>') or let the type be inferred from initializer."
             )
+        if is_tuple_type(typ):
+            self._ensure_runtime_tuple_struct(tuple_arity(typ))
+            return Type(typ.name, [self._translate_type(generic) for generic in typ.generics])
+        if is_array_type(typ):
+            self._ensure_runtime_array_struct(array_size(typ))
+            return Type(typ.name, [self._translate_type(generic) for generic in typ.generics])
         if isinstance(typ, HeapSmartPointer):
             return HeapSmartPointer(self._translate_type(typ.pointee))
         if isinstance(typ, StackSmartPointer):
             return StackSmartPointer(self._translate_type(typ.pointee))
+        if is_raw_pointer_type(typ):
+            return Pointer(self._translate_type(typ.pointee))
         if typ.name == "bool":
             return Usize_t(1)
         if typ.name == "usize":
@@ -1814,6 +1994,8 @@ class Translator:
             return True
         if isinstance(typ, (HeapSmartPointer, StackSmartPointer)):
             return self._contains_any_pointer(typ.pointee)
+        if is_raw_pointer_type(typ):
+            return self._contains_any_pointer(typ.pointee)
         return any(self._contains_any_pointer(generic) for generic in typ.generics)
 
     def _replace_any_pointer(self, typ: Type, pointer_cls: type[SmartPointer]) -> Type:
@@ -1825,6 +2007,8 @@ class Translator:
             return HeapSmartPointer(self._replace_any_pointer(typ.pointee, pointer_cls))
         if isinstance(typ, StackSmartPointer):
             return StackSmartPointer(self._replace_any_pointer(typ.pointee, pointer_cls))
+        if is_raw_pointer_type(typ):
+            return Pointer(self._replace_any_pointer(typ.pointee, pointer_cls))
         return Type(typ.name, [self._replace_any_pointer(generic, pointer_cls) for generic in typ.generics])
 
     def _signature_has_any_pointer(self, signature: s.FunctionSignature) -> bool:
@@ -1859,6 +2043,26 @@ class Translator:
             raise TypeError(f"Unable to infer smart-pointer kind for call '{fn_name}'")
         return variants.get(concrete_kind, fn_name)
 
+    def _resolve_function_call_target(self, expr: s.Expression_Call) -> tuple[str, list[Type]]:
+        call_name = expr.name
+        explicit_generics = list(expr.generics)
+        if call_name in self._funcs or call_name in self._extern_fns:
+            return call_name, explicit_generics
+
+        if len(expr.callee.segments) == 2:
+            owner = expr.callee.segments[0]
+            normalized_name = f"{owner.name}::{expr.callee.segments[1].name}"
+            if normalized_name in self._funcs or normalized_name in self._extern_fns:
+                if owner.generics:
+                    if explicit_generics:
+                        raise TypeError(
+                            "Associated function generics must be specified either on the owner type or on the call"
+                        )
+                    explicit_generics = list(owner.generics)
+                return normalized_name, explicit_generics
+
+        return call_name, explicit_generics
+
     def _types_compatible(self, lhs: Type, rhs: Type) -> bool:
         if is_mutable_type(lhs) and not is_mutable_type(rhs):
             return False
@@ -1876,7 +2080,11 @@ class Translator:
             return self._types_compatible(lhs.pointee, rhs.pointee)
         if isinstance(lhs, StackSmartPointer) and isinstance(rhs, StackSmartPointer):
             return self._types_compatible(lhs.pointee, rhs.pointee)
+        if is_raw_pointer_type(lhs) and is_raw_pointer_type(rhs):
+            return self._types_compatible(lhs.pointee, rhs.pointee)
         if is_reference_like_type(lhs) or is_reference_like_type(rhs):
+            return False
+        if is_raw_pointer_type(lhs) or is_raw_pointer_type(rhs):
             return False
         if lhs.name != rhs.name:
             return False

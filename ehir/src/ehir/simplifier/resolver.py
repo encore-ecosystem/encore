@@ -37,11 +37,13 @@ from ehir.core.instructions.control_flow import (
     Instruction_switch,
 )
 from ehir.core.instructions.memory import (
+    Instruction_gep,
     Instruction_getfield,
     Instruction_getfieldptr,
     Instruction_getptr,
     Instruction_halloc,
     Instruction_hfree,
+    Instruction_hrealloc,
     Instruction_pcast,
     Instruction_put,
     Instruction_sgetfield,
@@ -714,6 +716,38 @@ class Resolver:
                         )
                     instr.var_out.type = expected_type
                     instr.var_out = add_variable(instr.var_out)
+                elif isinstance(instr, Instruction_hrealloc):
+                    instr.var = add_variable(instr.var)
+                    instr.count = add_variable(instr.count)
+                    if instr.var.type is not None:
+                        instr.var.type = self._resolve_type(instr.var.type)
+                        if not isinstance(instr.var.type, Pointer):
+                            raise TypeError(f"HREALLOC expects pointer source, got {instr.var.type}")
+                    if instr.count.type is not None:
+                        instr.count.type = self._resolve_type(instr.count.type)
+                        if not (
+                            isinstance(instr.count.type, PrimitiveType)
+                            and (
+                                instr.count.type.name in {"usize", "isize"}
+                                or instr.count.type.name.startswith("u")
+                                or instr.count.type.name.startswith("i")
+                            )
+                        ):
+                            raise TypeError(f"HREALLOC count must be integer, got {instr.count.type}")
+                    expected_type = instr.var.type if instr.var.type is not None else None
+                    if instr.var_out.type is not None:
+                        instr.var_out.type = self._resolve_type(instr.var_out.type)
+                    elif expected_type is not None:
+                        instr.var_out.type = expected_type
+                    if instr.var_out.type is None:
+                        raise TypeError(f"Unable to infer type for HREALLOC result '{instr.var_out.name}'")
+                    if not isinstance(instr.var_out.type, Pointer):
+                        raise TypeError(f"HREALLOC result must be pointer, got {instr.var_out.type}")
+                    if expected_type is not None and instr.var_out.type != expected_type:
+                        raise TypeError(
+                            f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
+                        )
+                    instr.var_out = add_variable(instr.var_out)
                 elif isinstance(instr, Instruction_put):
                     expected_type = Pointer(instr.primitive.type)
                     if instr.var.type and instr.var.type != expected_type:
@@ -732,6 +766,34 @@ class Resolver:
                                 f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
                             )
                         instr.var_out.type = expected_type
+                    instr.var_out = add_variable(instr.var_out)
+                elif isinstance(instr, Instruction_gep):
+                    instr.var = add_variable(instr.var)
+                    instr.offset = add_variable(instr.offset)
+                    if instr.var.type is not None:
+                        instr.var.type = self._resolve_type(instr.var.type)
+                        if not isinstance(instr.var.type, Pointer):
+                            raise TypeError(f"GEP expects pointer source, got {instr.var.type}")
+                    if instr.offset.type is not None:
+                        instr.offset.type = self._resolve_type(instr.offset.type)
+                        if not (
+                            isinstance(instr.offset.type, PrimitiveType)
+                            and (
+                                instr.offset.type.name in {"usize", "isize"}
+                                or instr.offset.type.name.startswith("u")
+                                or instr.offset.type.name.startswith("i")
+                            )
+                        ):
+                            raise TypeError(f"GEP offset must be integer, got {instr.offset.type}")
+                    expected_type = instr.var.type if instr.var.type is not None else None
+                    if instr.var_out.type is not None:
+                        instr.var_out.type = self._resolve_type(instr.var_out.type)
+                    elif expected_type is not None:
+                        instr.var_out.type = expected_type
+                    if instr.var_out.type is None:
+                        raise TypeError(f"Unable to infer type for GEP result '{instr.var_out.name}'")
+                    if not isinstance(instr.var_out.type, Pointer):
+                        raise TypeError(f"GEP result must be pointer, got {instr.var_out.type}")
                     instr.var_out = add_variable(instr.var_out)
                 elif isinstance(instr, Instruction_store):
                     instr.var_src = add_variable(instr.var_src)

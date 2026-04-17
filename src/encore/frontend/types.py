@@ -1,4 +1,7 @@
-from ehir.core.type import HeapSmartPointer, StackSmartPointer, Type
+from ehir.core.type import HeapSmartPointer, Pointer, SmartPointer, StackSmartPointer, Type
+
+TUPLE_TYPE_PREFIX = "__tuple_"
+ARRAY_TYPE_PREFIX = "__array_"
 
 
 class AnySmartPointer(Type):
@@ -27,6 +30,10 @@ def is_reference_like_type(typ: Type | None) -> bool:
     return isinstance(typ, (AnySmartPointer, HeapSmartPointer, StackSmartPointer))
 
 
+def is_raw_pointer_type(typ: Type | None) -> bool:
+    return isinstance(typ, Pointer) and not isinstance(typ, SmartPointer)
+
+
 def is_mutable_type(typ: Type | None) -> bool:
     return isinstance(typ, MutableType)
 
@@ -44,6 +51,8 @@ def strip_mutability(typ: Type) -> Type:
         return HeapSmartPointer(strip_mutability(typ.pointee))
     if isinstance(typ, StackSmartPointer):
         return StackSmartPointer(strip_mutability(typ.pointee))
+    if is_raw_pointer_type(typ):
+        return Pointer(strip_mutability(typ.pointee))
     return Type(typ.name, [strip_mutability(generic) for generic in typ.generics])
 
 
@@ -53,3 +62,31 @@ def reapply_mutability(template: Type, typ: Type) -> Type:
 
 def unwrap_for_storage(typ: Type) -> Type:
     return typ.inner if isinstance(typ, MutableType) else typ
+
+
+def make_tuple_type(items: list[Type]) -> Type:
+    return Type(f"{TUPLE_TYPE_PREFIX}{len(items)}", list(items))
+
+
+def is_tuple_type(typ: Type | None) -> bool:
+    return isinstance(typ, Type) and typ.name.startswith(TUPLE_TYPE_PREFIX)
+
+
+def tuple_arity(typ: Type) -> int:
+    if not is_tuple_type(typ):
+        raise TypeError(f"Type '{typ}' is not a tuple type")
+    return int(typ.name.removeprefix(TUPLE_TYPE_PREFIX))
+
+
+def make_array_type(item_type: Type, size: int) -> Type:
+    return Type(f"{ARRAY_TYPE_PREFIX}{size}", [item_type])
+
+
+def is_array_type(typ: Type | None) -> bool:
+    return isinstance(typ, Type) and typ.name.startswith(ARRAY_TYPE_PREFIX)
+
+
+def array_size(typ: Type) -> int:
+    if not is_array_type(typ):
+        raise TypeError(f"Type '{typ}' is not an array type")
+    return int(typ.name.removeprefix(ARRAY_TYPE_PREFIX))

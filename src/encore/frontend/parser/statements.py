@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from typing import Optional
 
+from ehir.core.instructions.base import Instruction
 from ehir.core.type import Type
 from ehir.core.variable import Parameter
 
@@ -343,6 +344,19 @@ class Statement_Unsafe(Statement_InnerLevel):
         return f"unsafe {self.body}"
 
 
+@dataclass
+class Statement_EHIR(Statement_InnerLevel):
+    instructions: list[Instruction]
+    is_unsafe: bool = False
+
+    def __repr__(self) -> str:
+        prefix = "unsafe ehir" if self.is_unsafe else "ehir"
+        if not self.instructions:
+            return f"{prefix} {{}}"
+        body = "\n".join(f"  {instruction}" for instruction in self.instructions)
+        return f"{prefix} {{\n{body}\n}}"
+
+
 # =============
 @dataclass
 class Statement_ControlFlow(Statement_InnerLevel):
@@ -659,3 +673,37 @@ class Expression_Parenthesized(Expression_Primary):
 
     def __repr__(self) -> str:
         return f"({self.expr})"
+
+
+@dataclass
+class Expression_TupleLiteral(Expression_Primary):
+    items: list[Statement_Expression]
+
+    def __repr__(self) -> str:
+        return "(" + ", ".join(str(item) for item in self.items) + ")"
+
+
+@dataclass
+class Expression_ArrayLiteral(Expression_Primary):
+    items: list[Statement_Expression]
+
+    def __repr__(self) -> str:
+        return "[" + ", ".join(str(item) for item in self.items) + "]"
+
+
+@dataclass
+class Expression_ArrayRepeat(Expression_Primary):
+    value: Statement_Expression
+    size: int
+
+    def __repr__(self) -> str:
+        return f"[{self.value}; {self.size}]"
+
+
+@dataclass
+class Expression_Index(Statement_Expression):
+    base: Statement_Expression
+    index: Statement_Expression
+
+    def __repr__(self) -> str:
+        return f"{self.base}[{self.index}]"

@@ -38,10 +38,12 @@ from ehir.core.instructions.control_flow import (
 )
 from ehir.core.instructions.control_flow.phi import Instruction_phi, PhiPair
 from ehir.core.instructions.memory import (
+    Instruction_gep,
     Instruction_getfield,
     Instruction_getfieldptr,
     Instruction_getptr,
     Instruction_hfree,
+    Instruction_hrealloc,
     Instruction_pcast,
     Instruction_put,
     Instruction_sgetfield,
@@ -128,6 +130,18 @@ class Parser:
             self._ast.append(derective)
 
         return self._ast
+
+    def parse_instruction_stream(self, source_code: str) -> list[Instruction]:
+        self._tokens = self._lexer.tokenize(source_code)
+        self._consumed = 0
+        instructions: list[Instruction] = []
+        while not self._is_at_end():
+            instr = self._parse_instruction()
+            if instr is None:
+                current = self._lookup_curr()
+                raise ValueError(f"Unexpected token {current}")
+            instructions.append(instr)
+        return instructions
 
     def _mark_visibility(self, derective: Derective, is_public: bool):
         if isinstance(derective, Derective_impl):
@@ -580,6 +594,12 @@ class Parser:
             type = self._parse_type()
             return Instruction_halloc(var_out=var, type=type)
 
+        elif isinstance(curr_token, t.HREALLOC):
+            var_src = self._parse_variable()
+            self._safe_consume(t.COMMA)
+            count = self._parse_variable()
+            return Instruction_hrealloc(var_out=var, var=var_src, count=count)
+
         elif isinstance(curr_token, t.LOAD):
             var_src = self._parse_variable()
             return Instruction_load(var_out=var, var=var_src)
@@ -588,7 +608,6 @@ class Parser:
             var_src = self._parse_variable()
             self._safe_consume(t.COMMA)
             type = self._parse_type()
-            assert isinstance(type, PrimitiveType)
             return Instruction_pcast(var_out=var, var=var_src, type=type)
 
         elif isinstance(curr_token, t.GETPTR):
@@ -606,6 +625,12 @@ class Parser:
             self._safe_consume(t.COMMA)
             field = self._parse_variable()
             return Instruction_getfieldptr(var_out=var, src=var_src, field=field)
+
+        elif isinstance(curr_token, t.GEP):
+            var_src = self._parse_variable()
+            self._safe_consume(t.COMMA)
+            offset = self._parse_variable()
+            return Instruction_gep(var_out=var, var=var_src, offset=offset)
 
         elif isinstance(curr_token, t.SGETFIELD):
             var_src = self._parse_variable()

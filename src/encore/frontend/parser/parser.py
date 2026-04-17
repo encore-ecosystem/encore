@@ -1,22 +1,126 @@
 from dataclasses import replace
 from typing import Optional
 
-from ehir.core.type import HeapSmartPointer, StackSmartPointer, Type
+from ehir.core.instructions.base import Assignable, Instruction
+from ehir.core.instructions.capture import (
+    Instruction_ceoh,
+    Instruction_ceos,
+    Instruction_cpoh,
+    Instruction_cpos,
+    Instruction_csoh,
+    Instruction_csos,
+    Instruction_lceos,
+    Instruction_lcpos,
+    Instruction_lcsos,
+    Instruction_scpoh,
+    Instruction_scpos,
+    Instruction_scsoh,
+    Instruction_scsos,
+)
+from ehir.core.instructions.control_flow import (
+    Instruction_br,
+    Instruction_call,
+    Instruction_cbr,
+    Instruction_match,
+    Instruction_ret,
+    Instruction_switch,
+)
+from ehir.core.instructions.control_flow.phi import Instruction_phi
+from ehir.core.instructions.memory import (
+    Instruction_getfield,
+    Instruction_getfieldptr,
+    Instruction_getptr,
+    Instruction_hfree,
+    Instruction_load,
+    Instruction_pcast,
+    Instruction_put,
+    Instruction_salloc,
+    Instruction_sgetfield,
+    Instruction_sgetfieldptr,
+    Instruction_store,
+)
+from ehir.core.instructions.memory.halloc import Instruction_halloc
+from ehir.core.instructions.operators.arithmetic import (
+    Instruction_add,
+    Instruction_div,
+    Instruction_mod,
+    Instruction_mul,
+    Instruction_shl,
+    Instruction_shr,
+    Instruction_sub,
+)
+from ehir.core.instructions.operators.comparison import (
+    Instruction_geq,
+    Instruction_grt,
+    Instruction_leq,
+    Instruction_les,
+)
+from ehir.core.instructions.operators.logic import (
+    Instruction_and,
+    Instruction_ieq,
+    Instruction_neq,
+    Instruction_or,
+    Instruction_xor,
+)
+from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter
+from ehir.frontend.builtin.parser import Parser as EHIR_Parser
 from ehir.format import ThemePalette, printfmt
 
 from encore.frontend.base import ParserBase
 from encore.frontend.lexer import LexerToken
 from encore.frontend.lexer.tokens import TokenType
 from encore.frontend.parser import statements as s
-from encore.frontend.types import AnySmartPointer, make_mutable_type
+from encore.frontend.types import AnySmartPointer, make_array_type, make_mutable_type, make_tuple_type
 
 TRACE_MAX_LINES_FOR_UNIT = 5
+SAFE_EHIR_INSTRUCTION_TYPES = (
+    Instruction_lcpos,
+    Instruction_lceos,
+    Instruction_lcsos,
+    Instruction_cpos,
+    Instruction_ceoh,
+    Instruction_ceos,
+    Instruction_cpoh,
+    Instruction_csoh,
+    Instruction_csos,
+    Instruction_scpos,
+    Instruction_scpoh,
+    Instruction_scsos,
+    Instruction_scsoh,
+    Instruction_add,
+    Instruction_sub,
+    Instruction_mul,
+    Instruction_div,
+    Instruction_mod,
+    Instruction_shl,
+    Instruction_shr,
+    Instruction_les,
+    Instruction_leq,
+    Instruction_grt,
+    Instruction_geq,
+    Instruction_ieq,
+    Instruction_neq,
+    Instruction_and,
+    Instruction_or,
+    Instruction_xor,
+)
+ALLOWED_SAFE_EHIR_INSTRUCTION_TYPES = SAFE_EHIR_INSTRUCTION_TYPES + (Instruction_call,)
+FORBIDDEN_EHIR_INSTRUCTION_TYPES = (
+    Instruction_ret,
+    Instruction_br,
+    Instruction_cbr,
+    Instruction_match,
+    Instruction_switch,
+    Instruction_phi,
+)
 
 
 class Parser(ParserBase[LexerToken, s.Statement]):
     def _parse(self) -> list[s.Statement]:
         self._parsing_match_header = False
+        self._parsing_control_flow_header = False
+        self._ehir_parser = EHIR_Parser()
         while not self._is_at_end():
             self._parse_top_level()
         return self._result
@@ -278,7 +382,11 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             case TokenType.KW_MATCH:
                 return self._parse_match()
             case TokenType.KW_UNSAFE:
+                if self._peek_next().type == TokenType.KW_EHIR:
+                    return self._parse_ehir_block(is_unsafe=True)
                 return self._parse_unsafe_block()
+            case TokenType.KW_EHIR:
+                return self._parse_ehir_block(is_unsafe=False)
             case TokenType.KW_BREAK:
                 return self._parse_break()
             case TokenType.KW_CONTINUE:
@@ -307,7 +415,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
     def _parse_while(self) -> s.Statement_While:
         self._safe_consume(TokenType.KW_WHILE)
         label = self._parse_maybe_label()
+        self._parsing_control_flow_header = True
         expr = self._parse_expression()
+        self._parsing_control_flow_header = False
         body = self._parse_block()
         return s.Statement_While(label, expr, body)
 
@@ -331,16 +441,24 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         self._safe_consume(TokenType.KW_DO)
         body = self._parse_block()
         self._safe_consume(TokenType.KW_WHILE)
+        self._parsing_control_flow_header = True
         expr = self._parse_expression()
+        self._parsing_control_flow_header = False
         return s.Statement_DoWhile(body, expr)
 
     def _parse_if_block(self):
         self._safe_consume(TokenType.KW_IF)
-        branches = [s.Statement_IfBranch(expr=self._parse_expression(), body=self._parse_block())]
+        self._parsing_control_flow_header = True
+        first_expr = self._parse_expression()
+        self._parsing_control_flow_header = False
+        branches = [s.Statement_IfBranch(expr=first_expr, body=self._parse_block())]
 
         while not self._is_at_end() and self._peek_curr().type == TokenType.KW_ELIF:
             self._safe_consume(TokenType.KW_ELIF)
-            branches.append(s.Statement_IfBranch(expr=self._parse_expression(), body=self._parse_block()))
+            self._parsing_control_flow_header = True
+            branch_expr = self._parse_expression()
+            self._parsing_control_flow_header = False
+            branches.append(s.Statement_IfBranch(expr=branch_expr, body=self._parse_block()))
 
         else_body = None
         if not self._is_at_end() and self._peek_curr().type == TokenType.KW_ELSE:
@@ -351,11 +469,17 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     def _parse_if_expression(self) -> s.Expression_If:
         self._safe_consume(TokenType.KW_IF)
-        branches = [s.Expression_IfBranch(expr=self._parse_expression(), body=self._parse_expression_block())]
+        self._parsing_control_flow_header = True
+        first_expr = self._parse_expression()
+        self._parsing_control_flow_header = False
+        branches = [s.Expression_IfBranch(expr=first_expr, body=self._parse_expression_block())]
 
         while not self._is_at_end() and self._peek_curr().type == TokenType.KW_ELIF:
             self._safe_consume(TokenType.KW_ELIF)
-            branches.append(s.Expression_IfBranch(expr=self._parse_expression(), body=self._parse_expression_block()))
+            self._parsing_control_flow_header = True
+            branch_expr = self._parse_expression()
+            self._parsing_control_flow_header = False
+            branches.append(s.Expression_IfBranch(expr=branch_expr, body=self._parse_expression_block()))
 
         if self._is_at_end() or self._peek_curr().type != TokenType.KW_ELSE:
             raise TypeError("If expression must have an else branch")
@@ -368,6 +492,34 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         self._safe_consume(TokenType.KW_UNSAFE)
         body = self._parse_block()
         return s.Statement_Unsafe(body=body)
+
+    def _parse_ehir_block(self, is_unsafe: bool) -> s.Statement_EHIR:
+        if is_unsafe:
+            self._safe_consume(TokenType.KW_UNSAFE)
+        self._safe_consume(TokenType.KW_EHIR)
+        self._safe_consume(TokenType.LEFT_BRACE)
+
+        body_tokens: list[LexerToken] = []
+        while self._peek_curr().type != TokenType.RIGHT_BRACE:
+            body_tokens.append(self._consume())
+        self._safe_consume(TokenType.RIGHT_BRACE)
+
+        body_source = " ".join(token.value for token in body_tokens)
+        instructions = self._ehir_parser.parse_instruction_stream(body_source) if body_source.strip() else []
+        self._validate_ehir_instructions(instructions, is_unsafe=is_unsafe)
+        return s.Statement_EHIR(instructions=instructions, is_unsafe=is_unsafe)
+
+    def _validate_ehir_instructions(self, instructions: list[Instruction], *, is_unsafe: bool):
+        for instruction in instructions:
+            if isinstance(instruction, FORBIDDEN_EHIR_INSTRUCTION_TYPES):
+                raise TypeError(f"EHIR block does not support control-flow instruction '{instruction}'")
+            if not is_unsafe:
+                if isinstance(instruction, Instruction_call) and instruction.is_unsafe:
+                    raise TypeError("Unsafe EHIR call requires `unsafe ehir { ... }`")
+                if not isinstance(instruction, ALLOWED_SAFE_EHIR_INSTRUCTION_TYPES):
+                    raise TypeError(
+                        f"Unsafe EHIR instruction '{type(instruction).__name__}' requires `unsafe ehir {{ ... }}`"
+                    )
 
     def _parse_match(self) -> s.Statement_Match:
         self._safe_consume(TokenType.KW_MATCH)
@@ -571,6 +723,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             if token.type == TokenType.DOT:
                 expr = self._parse_dotted_postfix(expr)
                 continue
+            if token.type == TokenType.LEFT_BRACKET:
+                expr = self._parse_index_postfix(expr)
+                continue
             if token.type == TokenType.QUESTION:
                 self._consume()
                 expr = s.Expression_Try(expr=expr)
@@ -597,11 +752,48 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         unescape = bytes(raw[1:-1], "utf-8").decode("unicode_escape")
         return s.Expression_StringLiteral(unescape)
 
-    def _parse_parenthesized(self) -> s.Expression_Parenthesized:
+    def _parse_parenthesized_or_tuple(self) -> s.Statement_Expression:
         self._safe_consume(TokenType.LEFT_PAREN)
-        expr = self._parse_expression()
+
+        if self._peek_curr().type == TokenType.RIGHT_PAREN:
+            self._safe_consume(TokenType.RIGHT_PAREN)
+            return s.Expression_TupleLiteral(items=[])
+
+        first = self._parse_expression()
+        if self._peek_curr().type != TokenType.COMMA:
+            self._safe_consume(TokenType.RIGHT_PAREN)
+            return s.Expression_Parenthesized(expr=first)
+
+        items = [first]
+        while self._peek_curr().type == TokenType.COMMA:
+            self._safe_consume(TokenType.COMMA)
+            if self._peek_curr().type == TokenType.RIGHT_PAREN:
+                break
+            items.append(self._parse_expression())
         self._safe_consume(TokenType.RIGHT_PAREN)
-        return s.Expression_Parenthesized(expr=expr)
+        return s.Expression_TupleLiteral(items=items)
+
+    def _parse_array_literal(self) -> s.Statement_Expression:
+        self._safe_consume(TokenType.LEFT_BRACKET)
+        if self._peek_curr().type == TokenType.RIGHT_BRACKET:
+            self._safe_consume(TokenType.RIGHT_BRACKET)
+            return s.Expression_ArrayLiteral(items=[])
+
+        first = self._parse_expression()
+        if self._peek_curr().type == TokenType.SEMICOLON:
+            self._safe_consume(TokenType.SEMICOLON)
+            size = int(self._safe_consume(TokenType.INTEGER).value)
+            self._safe_consume(TokenType.RIGHT_BRACKET)
+            return s.Expression_ArrayRepeat(value=first, size=size)
+
+        items = [first]
+        while self._peek_curr().type == TokenType.COMMA:
+            self._safe_consume(TokenType.COMMA)
+            if self._peek_curr().type == TokenType.RIGHT_BRACKET:
+                break
+            items.append(self._parse_expression())
+        self._safe_consume(TokenType.RIGHT_BRACKET)
+        return s.Expression_ArrayLiteral(items=items)
 
     def _parse_maybe_label(self) -> Optional[str]:
         label = None
@@ -623,6 +815,91 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         if not body:
             return expr
         return s.Expression_Block(body=body, expr=expr)
+
+    def _starts_expression_block_statement(self) -> bool:
+        token_type = self._peek_curr().type
+
+        if token_type in {
+            TokenType.KW_LET,
+            TokenType.KW_RET,
+            TokenType.KW_WHILE,
+            TokenType.KW_LOOP,
+            TokenType.KW_DO,
+            TokenType.KW_EHIR,
+            TokenType.KW_BREAK,
+            TokenType.KW_CONTINUE,
+        }:
+            return True
+
+        if token_type == TokenType.KW_UNSAFE and self._peek_next().type == TokenType.KW_EHIR:
+            return True
+
+        # `if` / `match` / `unsafe` are valid expressions in tail position.
+        # Prefer treating them as the final expression of the block unless the
+        # language later gains explicit statement delimiters for this context.
+        if token_type in {
+            TokenType.KW_IF,
+            TokenType.KW_MATCH,
+            TokenType.KW_UNSAFE,
+            TokenType.RIGHT_BRACE,
+            TokenType.EOF,
+        }:
+            return False
+
+        if token_type != TokenType.IDENTIFIER:
+            return False
+
+        return self._starts_assignment_statement()
+
+    def _starts_assignment_statement(self) -> bool:
+        index = 0
+        if self._peek_n(index).type != TokenType.IDENTIFIER:
+            return False
+
+        while True:
+            index += 1
+
+            if self._peek_n(index).type == TokenType.LEFT_BRACKET:
+                depth = 1
+                index += 1
+                while depth > 0:
+                    token_type = self._peek_n(index).type
+                    if token_type == TokenType.LEFT_BRACKET:
+                        depth += 1
+                    elif token_type == TokenType.RIGHT_BRACKET:
+                        depth -= 1
+                    elif token_type == TokenType.EOF:
+                        return False
+                    index += 1
+
+            next_type = self._peek_n(index).type
+            if next_type == TokenType.SCOPE:
+                index += 1
+                if self._peek_n(index).type != TokenType.IDENTIFIER:
+                    return False
+                continue
+
+            if next_type == TokenType.DOT:
+                index += 1
+                if self._peek_n(index).type != TokenType.IDENTIFIER:
+                    return False
+                continue
+
+            break
+
+        return self._peek_n(index).type in {
+            TokenType.ASSIGN,
+            TokenType.PLUS_EQUAL,
+            TokenType.MINUS_EQUAL,
+            TokenType.ASTERISK_EQUAL,
+            TokenType.SLASH_EQUAL,
+            TokenType.PERCENT_EQUAL,
+            TokenType.AMPERSAND_EQUAL,
+            TokenType.PIPE_EQUAL,
+            TokenType.CARET_EQUAL,
+            TokenType.LEFT_SHIFT_EQUAL,
+            TokenType.RIGHT_SHIFT_EQUAL,
+        }
 
     def _parse_struct_initialization(self, struct: Type) -> s.Expression_StructInitialization:
         self._safe_consume(TokenType.LEFT_BRACE)
@@ -684,7 +961,11 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         expr = base
         while not self._is_at_end() and self._peek_curr().type == TokenType.DOT:
             self._safe_consume(TokenType.DOT)
-            member = self._safe_consume(TokenType.IDENTIFIER).value
+            member_token = self._peek_curr()
+            if member_token.type not in (TokenType.IDENTIFIER, TokenType.INTEGER):
+                raise TypeError(f"Expected field/method after '.', got: {member_token}")
+            self._consume()
+            member = member_token.value
             member_generics = self._parse_generics_args() if self._peek_curr().type == TokenType.LEFT_BRACKET else []
 
             if not self._is_at_end() and self._peek_curr().type == TokenType.LEFT_PAREN:
@@ -701,12 +982,51 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             expr = self._build_struct_field(expr, member)
         return expr
 
+    def _parse_index_postfix(self, base: s.Statement_Expression) -> s.Statement_Expression:
+        expr = base
+        while not self._is_at_end() and self._peek_curr().type == TokenType.LEFT_BRACKET:
+            self._safe_consume(TokenType.LEFT_BRACKET)
+            index = self._parse_expression()
+            self._safe_consume(TokenType.RIGHT_BRACKET)
+            expr = s.Expression_Index(base=expr, index=index)
+        return expr
+
     def _parse_path(self) -> s.Expression_Path:
         segments = [self._parse_path_segment()]
         while self._peek_curr().type == TokenType.SCOPE:
             self._safe_consume(TokenType.SCOPE)
             segments.append(self._parse_path_segment())
         return s.Expression_Path(segments)
+
+    def _parse_expression_path_segment(self) -> Type:
+        name = self._safe_consume(TokenType.IDENTIFIER).value
+        generics = self._parse_generics_args() if self._should_parse_expression_path_generics() else []
+        typ = Type(name, generics)
+        if self._is_smart_pointer_suffix():
+            self._safe_consume(TokenType.LESS)
+            pointer = self._safe_consume(TokenType.IDENTIFIER).value
+            self._safe_consume(TokenType.GREATER)
+            return HeapSmartPointer(typ) if pointer == "H" else StackSmartPointer(typ)
+        return typ
+
+    def _should_parse_expression_path_generics(self) -> bool:
+        if self._peek_curr().type != TokenType.LEFT_BRACKET:
+            return False
+
+        depth = 0
+        index = 0
+        while True:
+            token_type = self._peek_n(index).type
+            if token_type == TokenType.EOF:
+                return False
+            if token_type == TokenType.LEFT_BRACKET:
+                depth += 1
+            elif token_type == TokenType.RIGHT_BRACKET:
+                depth -= 1
+                if depth == 0:
+                    after = self._peek_n(index + 1).type
+                    return after in {TokenType.SCOPE, TokenType.LEFT_PAREN, TokenType.LEFT_BRACE, TokenType.LESS}
+            index += 1
 
     def _parse_primary(self) -> s.Statement_Expression:
         curr_token = self._peek_curr()
@@ -716,12 +1036,19 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         elif curr_token.type == TokenType.FLOAT:
             return self._parse_float_literal()
         elif curr_token.type == TokenType.BOOLEAN:
+            self._consume()
             return s.Expression_BooleanLiteral(curr_token.value == "true")
         elif curr_token.type == TokenType.STRING:
             return self._parse_string_literal()
 
         elif curr_token.type == TokenType.LEFT_PAREN:
-            return self._parse_parenthesized()
+            return self._parse_parenthesized_or_tuple()
+
+        elif curr_token.type == TokenType.LEFT_BRACKET:
+            return self._parse_array_literal()
+
+        elif curr_token.type == TokenType.LEFT_BRACE:
+            return self._parse_expression_block()
 
         elif curr_token.type == TokenType.KW_MATCH:
             return self._parse_match_expression()
@@ -733,16 +1060,16 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             return self._parse_unsafe_expression()
 
         elif curr_token.type == TokenType.IDENTIFIER:
-            first = self._parse_path_segment()
+            first = self._parse_expression_path_segment()
             segments = [first]
             while self._peek_curr().type == TokenType.SCOPE:
                 self._safe_consume(TokenType.SCOPE)
-                segment = self._parse_path_segment()
+                segment = self._parse_expression_path_segment()
                 segments.append(segment)
             path = s.Expression_Path(segments)
 
             if self._peek_curr().type == TokenType.LEFT_BRACE:
-                if self._parsing_match_header:
+                if self._parsing_match_header or self._parsing_control_flow_header:
                     return path
                 return self._parse_struct_initialization(first)
             return path
@@ -821,9 +1148,11 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             self._safe_consume(TokenType.KW_MUT)
             is_mut = True
 
-        name = self._safe_consume(TokenType.IDENTIFIER).value
-        generics = self._parse_generics_args() if self._peek_curr().type == TokenType.LEFT_BRACKET else []
-        typ = Type(name, generics)
+        typ = self._parse_type_base()
+
+        while self._peek_curr().type == TokenType.ASTERISK:
+            self._safe_consume(TokenType.ASTERISK)
+            typ = Pointer(typ)
 
         if self._is_smart_pointer_suffix():
             self._safe_consume(TokenType.LESS)
@@ -840,6 +1169,39 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             typ = AnySmartPointer(typ)
 
         return make_mutable_type(typ) if is_mut else typ
+
+    def _parse_type_base(self) -> Type:
+        if self._peek_curr().type == TokenType.LEFT_PAREN:
+            self._safe_consume(TokenType.LEFT_PAREN)
+            if self._peek_curr().type == TokenType.RIGHT_PAREN:
+                self._safe_consume(TokenType.RIGHT_PAREN)
+                return make_tuple_type([])
+
+            first = self._parse_type()
+            if self._peek_curr().type != TokenType.COMMA:
+                self._safe_consume(TokenType.RIGHT_PAREN)
+                return first
+
+            items = [first]
+            while self._peek_curr().type == TokenType.COMMA:
+                self._safe_consume(TokenType.COMMA)
+                if self._peek_curr().type == TokenType.RIGHT_PAREN:
+                    break
+                items.append(self._parse_type())
+            self._safe_consume(TokenType.RIGHT_PAREN)
+            return make_tuple_type(items)
+
+        if self._peek_curr().type == TokenType.LEFT_BRACKET:
+            self._safe_consume(TokenType.LEFT_BRACKET)
+            item_type = self._parse_type()
+            self._safe_consume(TokenType.SEMICOLON)
+            size = int(self._safe_consume(TokenType.INTEGER).value)
+            self._safe_consume(TokenType.RIGHT_BRACKET)
+            return make_array_type(item_type, size)
+
+        name = self._safe_consume(TokenType.IDENTIFIER).value
+        generics = self._parse_generics_args() if self._peek_curr().type == TokenType.LEFT_BRACKET else []
+        return Type(name, generics)
 
     def _parse_path_segment(self) -> Type:
         name = self._safe_consume(TokenType.IDENTIFIER).value

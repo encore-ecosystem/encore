@@ -67,10 +67,12 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         module.id = id
 
         self._cache[id] = module
+        print(module)
         return module
 
     def get_parent_id_of(self, id: Path, derective: Derective_import) -> Path:
         project_root = self._get_project_root_of(id)
+        project_name = self._load_manifest(project_root).project.name
         prefix_root = derective.prefix[0]
         suffix = derective.prefix[1:]
 
@@ -82,13 +84,16 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                 dep_filepath = id.parent if not suffix else id.parent / Path(*suffix)
 
             case _:
-                dep_roots = self._get_dependency_roots(project_root)
-                dep_root = dep_roots.get(prefix_root)
-                if dep_root is None:
-                    raise ImportError(
-                        f"Unknown dependency root '{prefix_root}' for import '{derective}' in module '{id}'."
-                    )
-                dep_filepath = dep_root / "src" / ("lib" if not suffix else Path(*suffix))
+                if prefix_root in {project_name, "repo"}:
+                    dep_filepath = project_root / "src" / ("lib" if not suffix else Path(*suffix))
+                else:
+                    dep_roots = self._get_dependency_roots(project_root)
+                    dep_root = dep_roots.get(prefix_root)
+                    if dep_root is None:
+                        raise ImportError(
+                            f"Unknown dependency root '{prefix_root}' for import '{derective}' in module '{id}'."
+                        )
+                    dep_filepath = dep_root / "src" / ("lib" if not suffix else Path(*suffix))
 
         dep_filepath = self._resolve_module_path(dep_filepath)
         if not dep_filepath.exists():
