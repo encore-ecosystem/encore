@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 typedef struct {
     char *ptr;
@@ -270,6 +271,32 @@ encore_str __ehir_rt_os_argv(size_t index) {
         return encore_empty_str();
     }
     return encore_from_cstr_copy(g_argv[index]);
+}
+
+encore_str __ehir_rt_os_cwd(void) {
+    size_t size = 256;
+
+    for (;;) {
+        char *buffer = malloc(size);
+        if (buffer == NULL) {
+            return encore_empty_str();
+        }
+
+        if (getcwd(buffer, size) != NULL) {
+            size_t len = strlen(buffer);
+            return encore_from_owned_buffer(buffer, len);
+        }
+
+        free(buffer);
+        if (errno != ERANGE) {
+            return encore_empty_str();
+        }
+
+        if (size > (SIZE_MAX / 2)) {
+            return encore_empty_str();
+        }
+        size *= 2;
+    }
 }
 
 encore_str __ehir_rt_os_read_file(encore_str path) {

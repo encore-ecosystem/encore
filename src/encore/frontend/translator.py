@@ -95,6 +95,12 @@ OPERATOR_MAPPING: dict[str, str] = {
 }
 
 OPERATOR_TRAIT_MAPPING: dict[str, str] = {
+    "==": "Eq",
+    "!=": "Ne",
+    "<": "Lt",
+    "<=": "Le",
+    ">": "Gt",
+    ">=": "Ge",
     "+": "Add",
     "-": "Sub",
     "*": "Mul",
@@ -106,6 +112,8 @@ OPERATOR_TRAIT_MAPPING: dict[str, str] = {
     "<<": "Shl",
     ">>": "Shr",
 }
+
+COMPARISON_OPERATOR_SET = {"==", "!=", "<", "<=", ">", ">="}
 
 
 class Translator:
@@ -1201,7 +1209,10 @@ class Translator:
                     args=[lhs.var_out, rhs.var_out],
                     name=name,
                 )
-                call.var_out.type = lhs.var_out.type or rhs.var_out.type
+                if expr.operator in COMPARISON_OPERATOR_SET:
+                    call.var_out.type = Usize_t(size=1)
+                else:
+                    call.var_out.type = lhs.var_out.type or rhs.var_out.type
                 return call
 
             lhs = self._translate_expression(expr.lhs, expected_type=expected_type)

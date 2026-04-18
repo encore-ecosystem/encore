@@ -611,10 +611,10 @@ class Resolver:
                 elif isinstance(instr, Instruction_ret):
                     fn.ret_type = self._resolve_type(fn.ret_type)
                     expected_type = fn.ret_type
+                    instr.var = add_variable(instr.var)
                     if instr.var.type and instr.var.type != expected_type:
                         raise TypeError(f"Type mismatch for return value: {instr.var.type} != {expected_type}")
                     instr.var.type = expected_type
-                    instr.var = add_variable(instr.var)
 
                 elif isinstance(instr, BinOp):
                     instr.lhs = add_variable(instr.lhs)
@@ -1137,6 +1137,8 @@ class Resolver:
             return Usize_t()
         if typ.name == "isize":
             return Isize_t()
+        if typ.name == "bool":
+            return Usize_t(1)
         if typ.name == "str":
             return Str_t()
         if typ.name.startswith("u") and typ.name[1:].isdigit():

@@ -90,7 +90,7 @@ class TypeInferer:
     def _infer_function(self, statement: s.Statement_FunctionDefinition, self_type: Type | None = None):
         statement.signature = self._normalize_signature(statement.signature, self_type=self_type)
         env = {param.name: param.type for param in statement.signature.params}
-        mutability_env = {param.name: False for param in statement.signature.params}
+        mutability_env = {param.name: is_mutable_type(param.type) for param in statement.signature.params}
 
         prev_fn_return = self._current_fn_return_type
         prev_self_type = self._current_self_type
@@ -637,6 +637,13 @@ class TypeInferer:
             if len(expr.segments) == 1:
                 if expr.name in env:
                     result = env[expr.name]
+                    if (
+                        expected_type is not None
+                        and is_mutable_type(expected_type)
+                        and mutable_env.get(expr.name, False)
+                        and not is_mutable_type(result)
+                    ):
+                        result = make_mutable_type(result)
                     self._assert_raw_pointer_usage_allowed(result, context=f"binding '{expr.name}'")
                     return result
                 if self._current_self_type is not None:
