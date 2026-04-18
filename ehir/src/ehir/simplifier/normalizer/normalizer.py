@@ -28,21 +28,30 @@ class Normalizer:
 
     def _terminate_blocks(self, derective: Derective_fn):
         new_blocks = []
-        for block in derective.body:
-            #
-            block_body: list[Instruction] = []
-            for instr in block.body:
+        for block_index, block in enumerate(derective.body):
+            term_index = None
+            for instr_index, instr in enumerate(block.body):
                 if isinstance(instr, ControlFlow):
+                    term_index = instr_index
                     break
-                block_body.append(instr)
 
-            if len(block_body) != len(block.body) - 1:
-                raise ValueError("Found dead code!")
+            if term_index is None:
+                if len(block.body) == 0:
+                    if block_index + 1 >= len(derective.body):
+                        raise ValueError(
+                            f"Empty block has no successor: function '{derective.name}', block '{block.name}'"
+                        )
+                    next_block = derective.body[block_index + 1]
+                    new_blocks.append(TerminatedBlock(name=block.name, body=[], term=Instruction_br(label=next_block.name)))
+                    continue
+                raise ValueError(
+                    f"Block must end with a control flow instruction: function '{derective.name}', block '{block.name}'"
+                )
 
-            if not isinstance(block.body[-1], ControlFlow):
-                raise ValueError("Block must end with a control flow instruction")
-            #
-            new_blocks.append(TerminatedBlock(name=block.name, body=block_body, term=block.body[-1]))
+            block_body = block.body[:term_index]
+            term = block.body[term_index]
+            assert isinstance(term, ControlFlow)
+            new_blocks.append(TerminatedBlock(name=block.name, body=block_body, term=term))
         derective.body = new_blocks
 
     def _normalize_fn(self, derective: Derective_fn) -> Normalized_fn:

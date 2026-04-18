@@ -65,7 +65,10 @@ from ehir.core.instructions.operators.comparison import (
     Instruction_leq,
     Instruction_les,
 )
-from ehir.core.instructions.operators.logic import Instruction_ieq, Instruction_neq
+from ehir.core.instructions.operators.logic import (
+    Instruction_ieq,
+    Instruction_neq,
+)
 from ehir.core.primitives import Float_t, Isize_t, Str_t, Usize_t
 from ehir.core.primitives.base import PrimitiveType
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
@@ -81,18 +84,11 @@ _BOOLEAN_INSTRUCTS = (
     Instruction_neq,  # why it is logic?
 )
 
-_ARITHM_TRAITS = {
-    Instruction_add: ("Add", "add"),
-    Instruction_sub: ("Sub", "sub"),
-    Instruction_mul: ("Mul", "mul"),
-    Instruction_div: ("Div", "div"),
-}
-
-
 @dataclass
 class _ImplMethodRef:
     trait_name: str
     method_name: str
+    trait_args: list[Type]
     for_type: Type
     impl_generics: list[Type]
     fn_name: str
@@ -193,18 +189,36 @@ class Resolver:
             method_fn.generics = deepcopy(merged_generics)
 
             if method_fn.name in self.fn:
-                method_fn.name = f"impl_{impl.trait_name}_{impl.for_type.name}_{method_fn.name}"
+                for_type_suffix = self._mangle_type_name(impl.for_type)
+                if impl.trait_args:
+                    trait_args_suffix = "_".join(self._mangle_type_name(arg) for arg in impl.trait_args)
+                else:
+                    trait_args_suffix = "noargs"
+                base_name = f"impl_{impl.trait_name}_{for_type_suffix}_{trait_args_suffix}_{method_fn.name}"
+                unique_name = base_name
+                suffix = 0
+                while unique_name in self.fn:
+                    suffix += 1
+                    unique_name = f"{base_name}_{suffix}"
+                method_fn.name = unique_name
 
             self.fn[method_fn.name] = method_fn
             self.impl_method_refs.append(
                 _ImplMethodRef(
                     trait_name=impl.trait_name,
                     method_name=method.name,
+                    trait_args=deepcopy(impl.trait_args),
                     for_type=impl.for_type,
                     impl_generics=deepcopy(merged_generics),
                     fn_name=method_fn.name,
                 )
             )
+
+    @staticmethod
+    def _mangle_type_name(typ: Type) -> str:
+        value = str(typ)
+        mangled = "".join(ch if ch.isalnum() else "_" for ch in value).strip("_")
+        return mangled or "type"
 
     def _resolve(self, fn: Derective_fn):
         variables: dict[str, Variable] = {}
@@ -238,6 +252,18 @@ class Resolver:
                     instr.generics = inferred_generics
 
             if instr.fn_name not in self.fn:
+                if "::" in instr.fn_name:
+                    trait_name, method_name = instr.fn_name.split("::", 1)
+                    candidates = [
+                        f"{ref.trait_name}[{', '.join(str(arg) for arg in ref.trait_args)}] for {ref.for_type}::{ref.method_name}"
+                        for ref in self.impl_method_refs
+                        if ref.trait_name == trait_name and ref.method_name == method_name
+                    ]
+                    arg_types = [str(arg.type) if arg.type is not None else "?" for arg in instr.args]
+                    raise TypeError(
+                        f"Unknown function '{instr.fn_name}' for args {arg_types}. "
+                        f"Impl candidates: {candidates}"
+                    )
                 raise TypeError(f"Unknown function '{instr.fn_name}'")
             target_fn = self.fn[instr.fn_name]
             if isinstance(target_fn, Derective_extern_fn):
@@ -618,22 +644,7 @@ class Resolver:
                         if instr.var_out.type and instr.var_out.type != expected_t:
                             raise TypeError(f"Type mismatch for binop: {instr.var_out.type} != {expected_t}")
                         instr.var_out.type = expected_t
-                    if (
-                        isinstance(instr, tuple(_ARITHM_TRAITS))
-                        and expected_t
-                        and not isinstance(expected_t, PrimitiveType)
-                        and self._is_concrete_type(expected_t)
-                    ):
-                        overloaded = self._resolve_overloaded_binop(instr, expected_t)
-                        if overloaded is None:
-                            raise TypeError(
-                                f"No operator overload found for '{type(instr).__name__}' and '{expected_t}'"
-                            )
-                        overloaded.var_out.type = instr.var_out.type
-                        block.body[instr_id] = overloaded
-                        resolve_call(overloaded)
-                    else:
-                        instr.var_out = add_variable(instr.var_out)
+                    instr.var_out = add_variable(instr.var_out)
 
                 elif isinstance(instr, Instruction_call):
                     resolve_call(instr)
@@ -1000,48 +1011,54 @@ class Resolver:
 
         raise TypeError(f"Unknown enum variant '{enum.variant}' in '{enum.name}'")
 
-    def _resolve_overloaded_binop(self, instr: BinOp, operand_type: Type) -> Instruction_call | None:
-        trait_name, method_name = _ARITHM_TRAITS[type(instr)]
-        for ref in self.impl_method_refs:
-            if ref.trait_name != trait_name or ref.method_name != method_name:
-                continue
-            generic_names = {generic.name for generic in ref.impl_generics}
-            mapping: dict[str, Type] = {}
-            if not self._match_type_template(ref.for_type, operand_type, generic_names, mapping):
-                continue
-
-            target_fn = self.fn[ref.fn_name]
-            concrete_generics: list[Type] = []
-            for generic in target_fn.generics:
-                if generic.name not in mapping:
-                    break
-                concrete_generics.append(mapping[generic.name])
-            else:
-                return Instruction_call(
-                    var_out=deepcopy(instr.var_out),
-                    fn_name=ref.fn_name,
-                    generics=concrete_generics,
-                    args=[deepcopy(instr.lhs), deepcopy(instr.rhs)],
-                )
-        return None
-
     def _resolve_impl_method_call(self, fn_name: str, args: list[Variable]) -> tuple[str, list[Type]] | None:
         if "::" not in fn_name or not args:
             return None
+
+        def unwrap_receiver_type(typ: Type) -> Type:
+            if isinstance(typ, (HeapSmartPointer, StackSmartPointer)):
+                return typ.pointee
+            return typ
 
         trait_name, method_name = fn_name.split("::", 1)
         recv = args[0]
         if recv.type is None:
             return None
+        recv_type = unwrap_receiver_type(recv.type)
 
         for ref in self.impl_method_refs:
             if ref.trait_name != trait_name or ref.method_name != method_name:
                 continue
             generic_names = {generic.name for generic in ref.impl_generics}
             mapping: dict[str, Type] = {}
-            if not self._match_type_template(ref.for_type, recv.type, generic_names, mapping):
+            if not self._match_type_template(ref.for_type, recv_type, generic_names, mapping):
                 continue
+
+            if ref.trait_args:
+                if len(args) - 1 < len(ref.trait_args):
+                    continue
+                trait_arg_match = True
+                for template_arg, arg in zip(ref.trait_args, args[1 : 1 + len(ref.trait_args)], strict=True):
+                    if arg.type is None or not self._match_type_template(
+                        template_arg, unwrap_receiver_type(arg.type), generic_names, mapping
+                    ):
+                        trait_arg_match = False
+                        break
+                if not trait_arg_match:
+                    continue
+
             target_fn = self.fn[ref.fn_name]
+            if len(target_fn.params) != len(args):
+                continue
+            params_match = True
+            for param, arg in zip(target_fn.params, args, strict=True):
+                if arg.type is None or not self._match_type_template(
+                    param.type, unwrap_receiver_type(arg.type), generic_names, mapping
+                ):
+                    params_match = False
+                    break
+            if not params_match:
+                continue
             concrete_generics: list[Type] = []
             for generic in target_fn.generics:
                 if generic.name not in mapping:

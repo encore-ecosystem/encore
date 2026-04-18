@@ -121,6 +121,27 @@ class ProcessedInstruction_div(ProcessedInstruction):
 
 
 @dataclass
+class ProcessedInstruction_mod(ProcessedInstruction):
+    var_out: TypedVariable
+    lhs: TypedVariable
+    rhs: TypedVariable
+
+
+@dataclass
+class ProcessedInstruction_shl(ProcessedInstruction):
+    var_out: TypedVariable
+    lhs: TypedVariable
+    rhs: TypedVariable
+
+
+@dataclass
+class ProcessedInstruction_shr(ProcessedInstruction):
+    var_out: TypedVariable
+    lhs: TypedVariable
+    rhs: TypedVariable
+
+
+@dataclass
 class ProcessedInstruction_les(ProcessedInstruction):
     var_out: TypedVariable
     lhs: TypedVariable

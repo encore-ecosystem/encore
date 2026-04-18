@@ -13,16 +13,8 @@ from ehir.core.instructions.memory import (
     Instruction_getfieldptr,
     Instruction_getptr,
 )
-from ehir.core.instructions.operators.arithmetic import (
-    Instruction_mod,
-    Instruction_shl,
-    Instruction_shr,
-)
 from ehir.core.instructions.operators.comparison import (
     Instruction_geq,
-)
-from ehir.core.instructions.operators.logic import (
-    Instruction_xor,
 )
 from ehir.core.instructions.special import Instruction_comment
 from ehir.core.primitives import Float, Float_t, Isize, Isize_t, Str, Str_t, Usize, Usize_t
@@ -53,6 +45,7 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_leq,
     ProcessedInstruction_les,
     ProcessedInstruction_load,
+    ProcessedInstruction_mod,
     ProcessedInstruction_mul,
     ProcessedInstruction_neq,
     ProcessedInstruction_or,
@@ -61,9 +54,12 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_put,
     ProcessedInstruction_ret,
     ProcessedInstruction_salloc,
+    ProcessedInstruction_shl,
+    ProcessedInstruction_shr,
     ProcessedInstruction_store,
     ProcessedInstruction_sub,
     ProcessedInstruction_switch,
+    ProcessedInstruction_xor,
 )
 from ehir.postprocessor.special import ProcessedBlock
 
@@ -168,7 +164,6 @@ class Codegen:
             self._blocks[block.name] = ir_block
 
         for block, ir_block in zip(fn.get_body(), ir_blocks, strict=True):
-            assert block.name == ir_block.name
             self.builder.position_at_end(ir_block)
             self._build_block(block)
 
@@ -212,18 +207,18 @@ class Codegen:
             self._build_or(instr)
         elif isinstance(instr, ProcessedInstruction_and):
             self._build_and(instr)
-        elif isinstance(instr, Instruction_xor):
+        elif isinstance(instr, ProcessedInstruction_xor):
             self._build_xor(instr)
 
         elif isinstance(instr, ProcessedInstruction_grt):
             self._build_grt(instr)
         elif isinstance(instr, ProcessedInstruction_geq):
             self._build_geq(instr)
-        elif isinstance(instr, Instruction_mod):
+        elif isinstance(instr, ProcessedInstruction_mod):
             self._build_mod(instr)
-        elif isinstance(instr, Instruction_shl):
+        elif isinstance(instr, ProcessedInstruction_shl):
             self._build_shl(instr)
-        elif isinstance(instr, Instruction_shr):
+        elif isinstance(instr, ProcessedInstruction_shr):
             self._build_shr(instr)
         elif isinstance(instr, ProcessedInstruction_call):
             self._build_call(instr)
@@ -397,11 +392,17 @@ class Codegen:
             offset_value = self._variables[instr.offset.name]
 
         if isinstance(base.type.pointee, ir.BaseStructType):
-            if hasattr(offset_value, "constant"):
-                field_index = int(offset_value.constant)
+            expected_result_type = self._build_type(instr.var_out.type.pointee)
+            is_field_access = isinstance(instr.offset, int) and expected_result_type != base.type.pointee
+
+            if is_field_access:
+                if hasattr(offset_value, "constant"):
+                    field_index = int(offset_value.constant)
+                else:
+                    raise ValueError(f"Struct field GEP requires constant offset: {instr}")
+                indices = [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_index)]
             else:
-                raise ValueError(f"Struct GEP requires constant offset: {instr}")
-            indices = [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_index)]
+                indices = [offset_value]
         else:
             indices = [offset_value]
 
@@ -566,7 +567,7 @@ class Codegen:
         self._variables[instr.var_out.name] = result
         return result
 
-    def _build_mod(self, instr: Instruction_mod):
+    def _build_mod(self, instr: ProcessedInstruction_mod):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
@@ -580,7 +581,7 @@ class Codegen:
         self._variables[instr.var_out.name] = result
         return result
 
-    def _build_shl(self, instr: Instruction_shl):
+    def _build_shl(self, instr: ProcessedInstruction_shl):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
@@ -589,7 +590,7 @@ class Codegen:
         self._variables[instr.var_out.name] = result
         return result
 
-    def _build_shr(self, instr: Instruction_shr):
+    def _build_shr(self, instr: ProcessedInstruction_shr):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]
@@ -627,7 +628,7 @@ class Codegen:
         self._variables[instr.var_out.name] = result
         return result
 
-    def _build_xor(self, instr: Instruction_xor):
+    def _build_xor(self, instr: ProcessedInstruction_xor):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         left = self._variables[instr.lhs.name]

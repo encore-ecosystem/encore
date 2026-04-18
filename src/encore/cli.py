@@ -8,6 +8,7 @@ MODES = [
     modes.add_init_parser,
     modes.add_build_parser,
     modes.add_run_parser,
+    modes.add_test_parser,
     modes.add_update_parser,
 ]
 

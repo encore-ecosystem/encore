@@ -15,9 +15,12 @@ class Refrain:
     name: str
     path: Path
     type: TargetType = TargetType.EXECUTABLE
+    entrypoint: str | None = None
 
     @property
     def entrypoint_stem(self) -> str:
+        if self.entrypoint is not None:
+            return self.entrypoint
         if self.type == self.TargetType.EXECUTABLE:
             return "main"
         return "lib"

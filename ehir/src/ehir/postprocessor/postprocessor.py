@@ -69,6 +69,7 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_leq,
     ProcessedInstruction_les,
     ProcessedInstruction_load,
+    ProcessedInstruction_mod,
     ProcessedInstruction_mul,
     ProcessedInstruction_neq,
     ProcessedInstruction_or,
@@ -77,6 +78,8 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_put,
     ProcessedInstruction_ret,
     ProcessedInstruction_salloc,
+    ProcessedInstruction_shl,
+    ProcessedInstruction_shr,
     ProcessedInstruction_store,
     ProcessedInstruction_sub,
     ProcessedInstruction_switch,
@@ -281,6 +284,15 @@ class Postprocessor:
         if isinstance(instr, Instruction_div):
             result = ProcessedInstruction_div
 
+        if isinstance(instr, Instruction_mod):
+            result = ProcessedInstruction_mod
+
+        if isinstance(instr, Instruction_shl):
+            result = ProcessedInstruction_shl
+
+        if isinstance(instr, Instruction_shr):
+            result = ProcessedInstruction_shr
+
         if isinstance(instr, Instruction_or):
             result = ProcessedInstruction_or
 
@@ -307,15 +319,6 @@ class Postprocessor:
 
         if isinstance(instr, Instruction_geq):
             result = ProcessedInstruction_geq
-
-        if isinstance(instr, Instruction_mod):
-            self._build_mod(instr)
-
-        if isinstance(instr, Instruction_shl):
-            self._build_shl(instr)
-
-        if isinstance(instr, Instruction_shr):
-            self._build_shr(instr)
 
         assert result
         return result(

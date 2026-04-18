@@ -67,7 +67,6 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         module.id = id
 
         self._cache[id] = module
-        print(module)
         return module
 
     def get_parent_id_of(self, id: Path, derective: Derective_import) -> Path:
@@ -106,8 +105,55 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         tokens = self._lexer.parse(list(id.read_text()))
         ast = self._parser.parse(tokens)
+        ast = self._inject_prelude_imports(id, ast)
         self._ast_cache[id] = ast
         return ast
+
+    def _inject_prelude_imports(self, id: Path, ast: list[s.Statement]) -> list[s.Statement]:
+        project_root = self._get_project_root_of(id)
+        manifest = self._load_manifest(project_root)
+        dependency_roots = self._get_dependency_roots(project_root)
+        prelude_prefix: list[str] | None = None
+
+        if manifest.project.name == "core":
+            # Do not inject prelude into core::ops itself.
+            core_ops_mod = (project_root / "src" / "ops" / "mod.enq").resolve()
+            if id.resolve() == core_ops_mod:
+                return ast
+            prelude_prefix = ["refrain", "ops"]
+        elif manifest.project.name == "std":
+            # Do not inject prelude into std::ops shim itself.
+            std_ops_mod = (project_root / "src" / "ops" / "mod.enq").resolve()
+            if id.resolve() == std_ops_mod:
+                return ast
+            prelude_prefix = ["core", "ops"] if "core" in dependency_roots else ["refrain", "ops"]
+        elif "std" in dependency_roots:
+            prelude_prefix = ["std", "ops"]
+        elif "core" in dependency_roots:
+            prelude_prefix = ["core", "ops"]
+        else:
+            return ast
+
+        for statement in ast:
+            if not isinstance(statement, s.Statement_Import):
+                continue
+            for request in self._expand_import_statement(statement):
+                if request.prefix in (["std", "ops"], ["core", "ops"], ["refrain", "ops"]):
+                    return ast
+
+        prelude_import = s.Statement_Import(
+            is_public=False,
+            pair=s.Statement_Import.ImportPair(
+                src=prelude_prefix[0],
+                dst=[
+                    s.Statement_Import.ImportPair(
+                        src=prelude_prefix[1],
+                        dst=[s.Statement_Import.ImportPair(src="*", dst=[], kind=s.Statement_Import.ImportKind.GLOB)],
+                    )
+                ],
+            ),
+        )
+        return [prelude_import, *ast]
 
     def _collect_imported_declarations(self, id: Path, ast: list[s.Statement]) -> list[s.Statement_TopLevel]:
         declarations: list[s.Statement_TopLevel] = []
@@ -133,6 +179,13 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                                 continue
                             seen.add(impl_key)
                             declarations.append(assoc_impl)
+                    elif isinstance(binding.statement, s.Statement_Trait):
+                        for idx, trait_impl in enumerate(self._collect_trait_impls(binding.module_id, binding.name)):
+                            impl_key = (binding.module_id, f"impl-trait::{binding.name}::{idx}")
+                            if impl_key in seen:
+                                continue
+                            seen.add(impl_key)
+                            declarations.append(trait_impl)
 
         return declarations
 
@@ -145,6 +198,17 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             if statement.trait_name is not None:
                 continue
             if statement.struct.name != struct_name:
+                continue
+            result.append(statement)
+        return result
+
+    def _collect_trait_impls(self, module_id: Path, trait_name: str) -> list[s.Statement_Impl]:
+        ast = self._get_ast_by_id(module_id)
+        result: list[s.Statement_Impl] = []
+        for statement in ast:
+            if not isinstance(statement, s.Statement_Impl):
+                continue
+            if statement.trait_name != trait_name:
                 continue
             result.append(statement)
         return result
@@ -229,10 +293,53 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return self._dependency_cache[project_root]
 
         roots: dict[str, Path] = {}
-        self._collect_dependency_roots(project_root, roots, set())
+        visited: set[Path] = set()
+        self._collect_dependency_roots(project_root, roots, visited)
+        self._inject_mandatory_core_dependency(project_root, roots, visited)
 
         self._dependency_cache[project_root] = roots
         return roots
+
+    def _inject_mandatory_core_dependency(self, project_root: Path, roots: dict[str, Path], visited: set[Path]) -> None:
+        manifest = self._load_manifest(project_root)
+        if manifest.project.name == "core":
+            return
+        if "core" in roots:
+            return
+
+        core_root = self._resolve_local_core_root(project_root)
+        if core_root is None:
+            raise RuntimeError(
+                "Unable to resolve mandatory dependency 'core'. "
+                "Expected to find it in dependencies or as local 'refrains/core'."
+            )
+
+        roots.setdefault("core", core_root)
+        self._collect_dependency_roots(core_root, roots, visited)
+
+    def _resolve_local_core_root(self, project_root: Path) -> Optional[Path]:
+        candidates: list[Path] = []
+        for base in [project_root, *project_root.parents]:
+            candidates.append(base / "refrains" / "core")
+            candidates.append(base / "core")
+        candidates.append(Path(__file__).resolve().parents[3] / "enc_future" / "refrains" / "core")
+        candidates.append(ENCORE_CACHE_DIR / "git" / "encore-language" / "core")
+        candidates.append(ENCORE_CACHE_DIR / "git" / "encore-language" / "encore-core")
+
+        seen: set[Path] = set()
+        for candidate in candidates:
+            candidate = candidate.resolve()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            manifest_path = candidate / ProjectManifest.default_filename()
+            if not manifest_path.exists():
+                continue
+            manifest = self._load_manifest(candidate)
+            if manifest.project.name == "core":
+                return candidate
+
+        return None
 
     def _collect_dependency_roots(self, project_root: Path, roots: dict[str, Path], visited: set[Path]) -> None:
         if project_root in visited:

@@ -86,22 +86,25 @@ COMPOUND_ASSIGNMENT_TO_BINOP: dict[str, str] = {
 }
 
 OPERATOR_MAPPING: dict[str, str] = {
-    "+": "add",
-    "-": "sub",
-    "*": "mul",
-    "/": "div",
-    "%": "mod",
-    "&": "and",
-    "|": "or",
-    "^": "xor",
-    "<<": "shl",
-    ">>": "shr",
     "==": "ieq",
     "!=": "neq",
     "<": "les",
     "<=": "leq",
     ">": "grt",
     ">=": "geq",
+}
+
+OPERATOR_TRAIT_MAPPING: dict[str, str] = {
+    "+": "Add",
+    "-": "Sub",
+    "*": "Mul",
+    "/": "Div",
+    "%": "Rem",
+    "&": "BitAnd",
+    "|": "BitOr",
+    "^": "BitXor",
+    "<<": "Shl",
+    ">>": "Shr",
 }
 
 
@@ -1187,6 +1190,19 @@ class Translator:
         elif isinstance(expr, s.Expression_BinaryOperation):
             if expr.operator in ("&&", "||"):
                 return self._translate_short_circuit_logical(expr, name=name)
+
+            trait_name = OPERATOR_TRAIT_MAPPING.get(expr.operator)
+            if trait_name is not None:
+                lhs = self._translate_expression(expr.lhs, expected_type=expected_type)
+                rhs = self._translate_expression(expr.rhs, expected_type=lhs.var_out.type or expected_type)
+                call = self._builder.build_call(
+                    fn_name=f"{trait_name}::op",
+                    generics=[],
+                    args=[lhs.var_out, rhs.var_out],
+                    name=name,
+                )
+                call.var_out.type = lhs.var_out.type or rhs.var_out.type
+                return call
 
             lhs = self._translate_expression(expr.lhs, expected_type=expected_type)
             rhs = self._translate_expression(expr.rhs, expected_type=lhs.var_out.type or expected_type)
