@@ -38,6 +38,7 @@ class EHIR_ProjectCompiler:
     frontend: EHIR_Frontend
     backend: EHIR_Backend
     cache_dir: Path | None = None
+    use_cache: bool = True
     on_refrain: Callable[[Refrain], None] | None = None
     refrains: dict[str, Refrain] = field(default_factory=dict)
     tree: dict[Path, TreeNode] = field(default_factory=dict)
@@ -90,7 +91,7 @@ class EHIR_ProjectCompiler:
         source_files = self._collect_source_files(entrypoint_id)
         semantic_hash = self._build_semantic_hash(refrain, source_files)
 
-        if compiled_refrain := self._cache.load(refrain.name, semantic_hash):
+        if self.use_cache and (compiled_refrain := self._cache.load(refrain.name, semantic_hash)):
             if self.on_refrain is None:
                 printfmt(f"[{refrain.name}] Cache hit.\n", style=ThemePalette.ACCENT_TEXT)
             self.compiled_refrains[refrain.name] = compiled_refrain

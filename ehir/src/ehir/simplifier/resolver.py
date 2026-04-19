@@ -253,6 +253,15 @@ class Resolver:
 
             if instr.fn_name not in self.fn:
                 if "::" in instr.fn_name:
+                    # Generic trait calls (e.g. Debug::fmt(T) inside generic fn)
+                    # are resolved after monomorphization when arg types become concrete.
+                    has_unresolved_generic_arg = any(
+                        arg.type is None or not self._is_concrete_type(arg.type) for arg in instr.args
+                    )
+                    if has_unresolved_generic_arg:
+                        instr.var_out = add_variable(instr.var_out)
+                        return
+
                     trait_name, method_name = instr.fn_name.split("::", 1)
                     candidates = [
                         f"{ref.trait_name}[{', '.join(str(arg) for arg in ref.trait_args)}] for {ref.for_type}::{ref.method_name}"

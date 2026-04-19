@@ -118,6 +118,7 @@ COMPARISON_OPERATOR_SET = {"==", "!=", "<", "<=", ">", ">="}
 
 class Translator:
     _funcs: dict[str, Derective_fn | Derective_extern_fn]
+    _source_signatures: dict[str, s.FunctionSignature]
     _enums: dict[str, Derective_enum]
     _structs: dict[str, Derective_struct]
     _traits: dict[str, s.Statement_Trait]
@@ -177,6 +178,7 @@ class Translator:
         self._var_ptrs: dict[str, Variable] = {}
         self._assignment_targets: dict[str, str] = {}
         self._funcs = {}
+        self._source_signatures = {}
         self._enums = {}
         self._structs = {}
         self._extern_fns = {}
@@ -213,18 +215,17 @@ class Translator:
                 statement.signature = self._normalize_signature(statement.signature)
                 if statement.signature.type is None:
                     continue
+                self._register_source_signature(statement.signature)
                 if self._signature_has_any_pointer(statement.signature):
                     for pointer_cls, suffix in ((HeapSmartPointer, "__H"), (StackSmartPointer, "__S")):
                         concrete_sig = self._specialize_signature_any_pointer(statement.signature, pointer_cls)
                         concrete_name = f"{statement.signature.name}{suffix}"
+                        self._register_source_signature(replace(concrete_sig, name=concrete_name))
                         self._any_pointer_variants.setdefault(statement.signature.name, {})[pointer_cls] = concrete_name
                         self._funcs[concrete_name] = Derective_fn(
                             name=concrete_name,
                             generics=[self._translate_type(g) for g in concrete_sig.generics],
-                            params=[
-                                Parameter(name=param.name, type=self._translate_type(param.type))
-                                for param in concrete_sig.params
-                            ],
+                            params=self._lower_params(concrete_sig.params),
                             body=[],
                             ret_type=self._translate_type(concrete_sig.type),
                         )
@@ -232,10 +233,7 @@ class Translator:
                     self._funcs[statement.signature.name] = Derective_fn(
                         name=statement.signature.name,
                         generics=[self._translate_type(g) for g in statement.signature.generics],
-                        params=[
-                            Parameter(name=param.name, type=self._translate_type(param.type))
-                            for param in statement.signature.params
-                        ],
+                        params=self._lower_params(statement.signature.params),
                         body=[],
                         ret_type=self._translate_type(statement.signature.type),
                     )
@@ -243,11 +241,10 @@ class Translator:
                 self._enums[statement.name] = self._build_enum_directive(statement)
             elif isinstance(statement, s.FunctionSignature):
                 self._extern_fns[statement.name] = statement
+                self._register_source_signature(statement)
                 self._funcs[statement.name] = Derective_extern_fn(
                     name=statement.name,
-                    params=[
-                        Parameter(name=param.name, type=self._translate_type(param.type)) for param in statement.params
-                    ],
+                    params=self._lower_params(statement.params),
                     ret_type=self._translate_type(statement.type),
                 )
             elif isinstance(statement, s.Statement_Trait):
@@ -278,20 +275,19 @@ class Translator:
                         ),
                         self_type=statement.struct,
                     )
+                    self._register_source_signature(normalized_signature)
                     if self._signature_has_any_pointer(normalized_signature):
                         for pointer_cls, suffix in ((HeapSmartPointer, "__H"), (StackSmartPointer, "__S")):
                             concrete_sig = self._specialize_signature_any_pointer(normalized_signature, pointer_cls)
                             concrete_name = f"{normalized_signature.name}{suffix}"
+                            self._register_source_signature(replace(concrete_sig, name=concrete_name))
                             self._any_pointer_variants.setdefault(normalized_signature.name, {})[
                                 pointer_cls
                             ] = concrete_name
                             self._funcs[concrete_name] = Derective_fn(
                                 name=concrete_name,
                                 generics=[self._translate_type(g) for g in concrete_sig.generics],
-                                params=[
-                                    Parameter(name=param.name, type=self._translate_type(param.type))
-                                    for param in concrete_sig.params
-                                ],
+                                params=self._lower_params(concrete_sig.params),
                                 body=[],
                                 ret_type=self._translate_type(concrete_sig.type),
                             )
@@ -299,10 +295,7 @@ class Translator:
                         self._funcs[normalized_signature.name] = Derective_fn(
                             name=normalized_signature.name,
                             generics=[self._translate_type(g) for g in normalized_signature.generics],
-                            params=[
-                                Parameter(name=param.name, type=self._translate_type(param.type))
-                                for param in normalized_signature.params
-                            ],
+                            params=self._lower_params(normalized_signature.params),
                             body=[],
                             ret_type=self._translate_type(normalized_signature.type),
                         )
@@ -438,7 +431,7 @@ class Translator:
         self._extern_fns[statement.name] = statement
         self._builder.build_extern_fn(
             name=statement.name,
-            params=[Parameter(name=param.name, type=self._translate_type(param.type)) for param in statement.params],
+            params=self._lower_params(statement.params),
             ret_type=self._translate_type(statement.type),
         )
         return self._module.ast[-1]
@@ -667,17 +660,20 @@ class Translator:
         fn = Derective_fn(
             name=statement.signature.name,
             generics=[self._translate_type(g) for g in statement.signature.generics],
-            params=[
-                Parameter(name=param.name, type=self._translate_type(param.type))
-                for param in statement.signature.params
-            ],
+            params=self._lower_params(statement.signature.params),
             body=[],
             ret_type=self._translate_type(statement.signature.type),
         )
-        self._translate_function_body(fn, statement.body)
+        self._translate_function_body(fn, statement.body, source_params=statement.signature.params)
         return fn
 
-    def _translate_function_body(self, fn: Derective_fn, body: Block):
+    def _translate_function_body(
+        self,
+        fn: Derective_fn,
+        body: Block,
+        *,
+        source_params: list[s.Parameter] | None = None,
+    ):
         prev_current_function = getattr(self._builder, "current_function", None)
         prev_current_block = getattr(self._builder, "current_block", None)
         prev_builder_variables = getattr(self._builder, "variables", {})
@@ -695,13 +691,21 @@ class Translator:
         self._assignment_targets = {}
         self._terminated_blocks = set()
         self._loop_stack = []
-        if fn.params and fn.params[0].name == "self":
-            self_type = unwrap_for_storage(fn.params[0].type)
+        source_params = source_params or []
+        mutable_params = {param.name for param in source_params if is_mutable_type(param.type)}
+        if source_params and source_params[0].name == "self":
+            self_type = unwrap_for_storage(source_params[0].type)
             self._current_self_type = self_type.pointee if is_reference_like_type(self_type) else self_type
         else:
             self._current_self_type = None
         entry_block = self._builder.append_block("entry")
         self._builder.position_at_end(entry_block)
+
+        for param in fn.params:
+            if param.name not in mutable_params:
+                continue
+            self._var_ptrs[param.name] = Variable(param.name, param.type)
+
         self._translate_block(body)
 
         if prev_current_function is not None:
@@ -715,6 +719,83 @@ class Translator:
         self._terminated_blocks = prev_terminated_blocks
         self._loop_stack = prev_loop_stack
         self._current_self_type = prev_self_type
+
+    def _register_source_signature(self, signature: s.FunctionSignature):
+        self._source_signatures[signature.name] = signature
+
+    def _lower_param_type(self, typ: Type) -> Type:
+        if is_mutable_type(typ):
+            return Pointer(self._translate_type(unwrap_for_storage(typ)))
+        return self._translate_type(typ)
+
+    def _lower_params(self, params: list[s.Parameter]) -> list[Parameter]:
+        return [Parameter(name=param.name, type=self._lower_param_type(param.type)) for param in params]
+
+    def _call_expected_type(self, param_type: Type | None) -> Type | None:
+        if param_type is None:
+            return None
+        concrete_type = unwrap_for_storage(param_type)
+        if self._contains_any_pointer(concrete_type):
+            return None
+        return self._translate_type(concrete_type)
+
+    def _fresh_temp_name(self, prefix: str) -> str:
+        self._unique_variable_idx += 1
+        return f"{prefix}_{self._unique_variable_idx}"
+
+    def _translate_mutable_argument(
+        self,
+        expr: s.Statement_Expression,
+        value: Variable,
+        expected_type: Type,
+    ) -> Variable:
+        if isinstance(expr, s.Expression_Path) and len(expr.segments) == 1:
+            ptr = self._var_ptrs.get(expr.name)
+            if ptr is not None:
+                return ptr
+            return self._create_stack_slot(self._fresh_temp_name(f"{expr.name}_mut_arg"), value, expected_type)
+
+        if isinstance(expr, s.Expression_StructField):
+            dst_ptr = Variable(self._fresh_temp_name(expr.field), Pointer(expected_type))
+            field = Variable(expr.field)
+            lvalue_ptr = self._resolve_struct_lvalue_base_ptr(expr.name)
+            if lvalue_ptr is not None:
+                self._builder._add(Instruction_getfieldptr(var_out=dst_ptr, src=lvalue_ptr, field=field))
+                return dst_ptr
+
+            src = self._resolve_struct_field_chain(expr.name)
+            if is_reference_like_type(src.type):
+                self._builder._add(Instruction_sgetfieldptr(var_out=dst_ptr, src=src, field=field))
+            else:
+                self._builder._add(Instruction_getfieldptr(var_out=dst_ptr, src=src, field=field))
+            return dst_ptr
+
+        return self._create_stack_slot(self._fresh_temp_name("mut_arg"), value, expected_type)
+
+    def _materialize_call_args(
+        self,
+        arg_exprs: list[s.Statement_Expression],
+        arg_values: list[Assignable],
+        source_params: list[s.Parameter] | None,
+    ) -> list[Variable]:
+        if source_params is None:
+            return [arg.var_out for arg in arg_values]
+
+        if len(arg_exprs) != len(source_params) or len(arg_values) != len(source_params):
+            raise TypeError("Call argument lowering mismatch")
+
+        args: list[Variable] = []
+        for expr, value, param in zip(arg_exprs, arg_values, source_params):
+            if not is_mutable_type(param.type):
+                args.append(value.var_out)
+                continue
+
+            inner_type = unwrap_for_storage(param.type)
+            expected_type = value.var_out.type if self._contains_any_pointer(inner_type) else self._translate_type(inner_type)
+            if expected_type is None:
+                raise TypeError(f"Unable to lower mutable argument for parameter '{param.name}'")
+            args.append(self._translate_mutable_argument(expr, value.var_out, expected_type))
+        return args
 
     def _translate_block(self, block: Block):
         for inner_statement in block.body:
@@ -849,17 +930,23 @@ class Translator:
 
         if isinstance(statement.target, s.Expression_StructField):
             self._set_new_variable(statement.target.field)
-            src = self._resolve_struct_field_chain(statement.target.name)
+            lvalue_ptr = self._resolve_struct_lvalue_base_ptr(statement.target.name)
             dst_ptr = Variable(self._advance_variable())
             field = Variable(statement.target.field)
-            if is_reference_like_type(src.type):
-                self._builder._add(Instruction_sgetfieldptr(var_out=dst_ptr, src=src, field=field))
+            if lvalue_ptr is not None:
+                self._builder._add(Instruction_getfieldptr(var_out=dst_ptr, src=lvalue_ptr, field=field))
+                expected_type = self._lookup_field_type(lvalue_ptr.type.pointee, statement.target.field)
             else:
-                self._builder._add(Instruction_getfieldptr(var_out=dst_ptr, src=src, field=field))
+                src = self._resolve_struct_field_chain(statement.target.name)
+                if is_reference_like_type(src.type):
+                    self._builder._add(Instruction_sgetfieldptr(var_out=dst_ptr, src=src, field=field))
+                else:
+                    self._builder._add(Instruction_getfieldptr(var_out=dst_ptr, src=src, field=field))
+                expected_type = self._lookup_field_type(src.type, statement.target.field)
 
             val = self._translate_expression(
                 assign_expr,
-                expected_type=self._lookup_field_type(src.type, statement.target.field),
+                expected_type=expected_type,
             )
             self._builder._add(Instruction_store(var_src=val.var_out, var_dst=dst_ptr))
             return
@@ -1349,9 +1436,29 @@ class Translator:
             if fn_name in self._extern_fns and self._unsafe_depth <= 0:
                 raise TypeError(f"Extern function '{fn_name}' can only be called inside unsafe block")
 
+            base_source_signature = self._source_signatures.get(fn_name)
+            arg_exprs = [expr.receiver, *expr.args]
+            arg_values = [Assignable(receiver)]
+            if base_source_signature is not None:
+                extra_params = base_source_signature.params[1:]
+                arg_values.extend(
+                    self._translate_expression(
+                        arg_exp,
+                        expected_type=self._call_expected_type(param.type),
+                    )
+                    for arg_exp, param in zip(expr.args, extra_params)
+                )
+            else:
+                arg_values.extend(self._translate_expression(arg_exp) for arg_exp in expr.args)
+
+            fn_name = self._resolve_any_pointer_call_name(fn_name, [arg.var_out for arg in arg_values])
+            source_signature = self._source_signatures.get(fn_name, base_source_signature)
             generics = [self._translate_type(g) for g in expr.generics]
-            args = [receiver, *[self._translate_expression(arg_exp).var_out for arg_exp in expr.args]]
-            fn_name = self._resolve_any_pointer_call_name(fn_name, args)
+            args = self._materialize_call_args(
+                arg_exprs,
+                arg_values,
+                source_signature.params if source_signature is not None else None,
+            )
             callee = self._funcs.get(fn_name, callee)
             call = self._builder.build_call(
                 fn_name=fn_name,
@@ -1373,8 +1480,21 @@ class Translator:
                 return Assignable(out)
 
             call_name, call_generics = self._resolve_function_call_target(expr)
-            args = [self._translate_expression(arg_exp).var_out for arg_exp in expr.args]
-            call_name = self._resolve_any_pointer_call_name(call_name, args)
+            base_source_signature = self._source_signatures.get(call_name)
+            if base_source_signature is not None:
+                arg_values = [
+                    self._translate_expression(arg_exp, expected_type=self._call_expected_type(param.type))
+                    for arg_exp, param in zip(expr.args, base_source_signature.params)
+                ]
+            else:
+                arg_values = [self._translate_expression(arg_exp) for arg_exp in expr.args]
+            call_name = self._resolve_any_pointer_call_name(call_name, [arg.var_out for arg in arg_values])
+            source_signature = self._source_signatures.get(call_name, base_source_signature)
+            args = self._materialize_call_args(
+                expr.args,
+                arg_values,
+                source_signature.params if source_signature is not None else None,
+            )
 
             if call_name in self._extern_fns and self._unsafe_depth <= 0:
                 raise TypeError(f"Extern function '{expr.name}' can only be called inside unsafe block")
@@ -1843,6 +1963,27 @@ class Translator:
                 instr.var_out.type = field_type
             src = instr.var_out
         return src
+
+    def _resolve_struct_lvalue_base_ptr(self, name: str) -> Variable | None:
+        parts = name.split(".")
+        if not parts:
+            return None
+
+        root_ptr = self._var_ptrs.get(parts[0])
+        if root_ptr is None:
+            return None
+        if not isinstance(root_ptr.type, Pointer):
+            return None
+        if isinstance(root_ptr.type.pointee, SmartPointer):
+            return None
+
+        src_ptr = root_ptr
+        for segment in parts[1:]:
+            field_ptr = Variable(self._advance_variable())
+            self._builder._add(Instruction_getfieldptr(var_out=field_ptr, src=src_ptr, field=Variable(segment)))
+            src_ptr = field_ptr
+
+        return src_ptr
 
     def _translate_struct_initialization(
         self, typ: Type, args: list[Variable], name: Optional[str] = None

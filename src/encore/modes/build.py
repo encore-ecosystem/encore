@@ -91,22 +91,24 @@ def add_build_parser(subparsers) -> tuple[str, Callable]:
     build_parser.add_argument(
         "--profile", default="debug", choices=set(AVAILABLE_OPTPROFILES.keys()), help="Optimization profile"
     )
+    build_parser.add_argument("--no-cache", action="store_true", help="Ignore existing EHIR cache for this build")
     return (section, handle_build)
 
 
 def handle_build(args: Namespace):
     cwd = Path().resolve()
 
-    compiler = create_compiler(cwd, args.backend, args.profile)
+    compiler = create_compiler(cwd, args.backend, args.profile, no_cache=args.no_cache)
     _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
     with _BuildLiveStatus(compiler):
         compiler.compile_all()
 
 
-def create_compiler(cwd: Path, backend: str, profile: str) -> EHIR_ProjectCompiler:
+def create_compiler(cwd: Path, backend: str, profile: str, *, no_cache: bool = False) -> EHIR_ProjectCompiler:
     compiler = EHIR_ProjectCompiler(
         frontend=EHIR_EncoreFrontend(src_dir=cwd / "src"),
         backend=AVAILABLE_BACKENDS[backend](target_dir=cwd / "target", opt_profile=AVAILABLE_OPTPROFILES[profile]),
+        use_cache=not no_cache,
     )
     return compiler
 
@@ -198,8 +200,8 @@ def resolve_project_target_type(cwd: Path) -> Refrain.TargetType:
     raise RuntimeError(f"Unknown project target type: {manifest.project.target}")
 
 
-def build_project(cwd: Path, backend: str, profile: str) -> list[tuple[str, Path]]:
-    compiler = create_compiler(cwd, backend, profile)
+def build_project(cwd: Path, backend: str, profile: str, *, no_cache: bool = False) -> list[tuple[str, Path]]:
+    compiler = create_compiler(cwd, backend, profile, no_cache=no_cache)
     entry_ref = _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
     outputs = compiler.compile_all()
     outputs_by_name = dict(outputs)

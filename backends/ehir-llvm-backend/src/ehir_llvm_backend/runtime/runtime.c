@@ -1,6 +1,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <inttypes.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +53,31 @@ static encore_str encore_from_cstr_copy(const char *value) {
     }
     memcpy(buffer, value, len + 1);
     return (encore_str){.ptr = buffer, .len = len};
+}
+
+static encore_str encore_format(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int needed = vsnprintf(NULL, 0, fmt, args);
+    va_end(args);
+    if (needed < 0) {
+        return encore_empty_str();
+    }
+
+    char *buffer = malloc((size_t)needed + 1);
+    if (buffer == NULL) {
+        return encore_empty_str();
+    }
+
+    va_start(args, fmt);
+    int written = vsnprintf(buffer, (size_t)needed + 1, fmt, args);
+    va_end(args);
+    if (written < 0) {
+        free(buffer);
+        return encore_empty_str();
+    }
+
+    return encore_from_owned_buffer(buffer, (size_t)written);
 }
 
 static int32_t encore_mkdir_p(const char *path) {
@@ -146,6 +173,58 @@ encore_str __ehir_rt_str_concat(encore_str lhs, encore_str rhs) {
     }
 
     return encore_from_owned_buffer(buffer, total_len);
+}
+
+encore_str __ehir_rt_fmt_bool(bool value) {
+    return value ? encore_from_cstr_copy("true") : encore_from_cstr_copy("false");
+}
+
+encore_str __ehir_rt_fmt_u8(uint8_t value) {
+    return encore_format("%" PRIu8, value);
+}
+
+encore_str __ehir_rt_fmt_u16(uint16_t value) {
+    return encore_format("%" PRIu16, value);
+}
+
+encore_str __ehir_rt_fmt_u32(uint32_t value) {
+    return encore_format("%" PRIu32, value);
+}
+
+encore_str __ehir_rt_fmt_u64(uint64_t value) {
+    return encore_format("%" PRIu64, value);
+}
+
+encore_str __ehir_rt_fmt_usize(size_t value) {
+    return encore_format("%zu", value);
+}
+
+encore_str __ehir_rt_fmt_i8(int8_t value) {
+    return encore_format("%" PRId8, value);
+}
+
+encore_str __ehir_rt_fmt_i16(int16_t value) {
+    return encore_format("%" PRId16, value);
+}
+
+encore_str __ehir_rt_fmt_i32(int32_t value) {
+    return encore_format("%" PRId32, value);
+}
+
+encore_str __ehir_rt_fmt_i64(int64_t value) {
+    return encore_format("%" PRId64, value);
+}
+
+encore_str __ehir_rt_fmt_isize(intptr_t value) {
+    return encore_format("%" PRIdPTR, value);
+}
+
+encore_str __ehir_rt_fmt_f32(float value) {
+    return encore_format("%.9g", value);
+}
+
+encore_str __ehir_rt_fmt_f64(double value) {
+    return encore_format("%.17g", value);
 }
 
 int32_t __ehir_rt_io_print(encore_str value) {

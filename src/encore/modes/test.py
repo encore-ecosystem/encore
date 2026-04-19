@@ -3,9 +3,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from ehir import Refrain
 from rich.console import Console
 
+from ehir import Refrain
 from encore import ENCORE_CACHE_DIR
 from encore.modes.build import (
     AVAILABLE_BACKENDS,
@@ -27,7 +27,7 @@ class _TestCase:
 
     @property
     def display_name(self) -> str:
-        rel = self.source_file.relative_to(self.refrain_path / "src")
+        rel = self.source_file.relative_to(self.refrain_path)
         return f"{self.refrain_name}:{rel.as_posix()}"
 
 
@@ -40,6 +40,7 @@ def add_test_parser(subparsers) -> tuple[str, Callable]:
     test_parser.add_argument(
         "--profile", default="debug", choices=set(AVAILABLE_OPTPROFILES.keys()), help="Optimization profile"
     )
+    test_parser.add_argument("--no-cache", action="store_true", help="Ignore existing EHIR cache for this build")
     test_parser.add_argument("--filter", type=str, default=None, help="Only run tests whose path contains this text")
     return (section, handle_test)
 
@@ -57,7 +58,7 @@ def handle_test(args: Namespace):
     failed = 0
     for idx, test in enumerate(tests, start=1):
         test_name = _build_test_refrain_name(test)
-        compiler = create_compiler(cwd, args.backend, args.profile)
+        compiler = create_compiler(cwd, args.backend, args.profile, no_cache=args.no_cache)
         compiler.on_refrain = lambda _refrain: None
         compiler.add_refrain_to_build(
             Refrain(
@@ -78,10 +79,7 @@ def handle_test(args: Namespace):
                 console.print(f"[{idx}/{len(tests)}] [green]ok[/green] {test.display_name}")
             else:
                 failed += 1
-                console.print(
-                    f"[{idx}/{len(tests)}] [red]FAILED[/red] {test.display_name} "
-                    f"(exit code {ret_code})"
-                )
+                console.print(f"[{idx}/{len(tests)}] [red]FAILED[/red] {test.display_name} (exit code {ret_code})")
         except Exception as exc:
             failed += 1
             console.print(f"[{idx}/{len(tests)}] [red]FAILED[/red] {test.display_name} ({exc})")
@@ -100,7 +98,7 @@ def _collect_test_cases(root: Path, filter_text: str | None) -> list[_TestCase]:
 
     for refrain_name in sorted(refrains):
         refrain_path = refrains[refrain_name]
-        tests_dir = refrain_path / "src" / "tests"
+        tests_dir = refrain_path / "tests"
         if not tests_dir.exists():
             continue
         for source_file in sorted(tests_dir.rglob("*.enq")):
