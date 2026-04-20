@@ -63,6 +63,16 @@ from encore.frontend.types import (
 
 MatchArmLike = s.Statement_MatchArm | s.Expression_MatchArm
 MatchBodyArmLike = s.Statement_MatchArm | s.Expression_MatchArm
+MatchLike = s.Statement_Match | s.Expression_Match
+MatchBodyLike = Block | s.Statement_Expression
+MatchPatternLike = (
+    s.Expression_Path
+    | s.Expression_BooleanLiteral
+    | s.Expression_IntegerLiteral
+    | s.Expression_FloatLiteral
+    | s.Expression_StringLiteral
+    | None
+)
 
 BINOP_MAPPING: dict[str, type[BinOp]] = {
     "+": Instruction_add,
@@ -128,6 +138,11 @@ class Translator:
     _enum_payload_structs: dict[str, list[s.CLikeStructureDefinition]]
     _emitted_structs: set[str]
     _any_pointer_variants: dict[str, dict[type[Type], str]]
+    _current_module_id: Path
+    _module_namespace_cache: dict[Path, str]
+    _function_aliases: dict[str, str]
+    _type_aliases: dict[str, str]
+    _trait_aliases: dict[str, str]
 
     class _PreparedMatch:
         def __init__(
@@ -187,18 +202,33 @@ class Translator:
         self._unsafe_depth = 0
         self._enum_payload_structs = {}
         self._emitted_structs = set()
-        self._current_self_type: Type | None = None
         self._any_pointer_variants = {}
+        self._current_module_id = Path()
+        self._module_namespace_cache = {}
+        self._function_aliases = {}
+        self._type_aliases = {}
+        self._trait_aliases = {}
 
     def run(self, program: str) -> EHIR_Module:
         self._reset_state()
-        tokens = self._lexer.parse(program)
+        tokens = self._lexer.parse(list(program))
         ast = self._parser.parse(tokens)
         TypeInferer().infer(ast)
         return self.translate_ast(ast)
 
-    def translate_ast(self, ast: list[s.Statement]) -> EHIR_Module:
-        self.preload_declarations([statement for statement in ast if isinstance(statement, s.Statement_TopLevel)])
+    def translate_ast(
+        self,
+        ast: list[s.Statement],
+        *,
+        module_id: Path | None = None,
+        imported_declarations: list[object] | None = None,
+    ) -> EHIR_Module:
+        self._current_module_id = module_id or Path()
+        imported_declarations = imported_declarations or []
+        declaration_entries = [*self._normalize_declaration_entries(imported_declarations)] + [
+            (self._current_module_id, statement) for statement in ast if isinstance(statement, s.Statement_TopLevel)
+        ]
+        self.preload_declarations(declaration_entries)
         for statement in ast:
             self._translate_statement(statement)
         # print(self._module)
@@ -207,21 +237,28 @@ class Translator:
         # time.sleep(0.5)
         return self._module
 
-    def preload_declarations(self, statements: list[s.Statement_TopLevel]):
-        for statement in statements:
+    def preload_declarations(self, declarations: list[tuple[Path, s.Statement_TopLevel]]):
+        for module_id, statement in declarations:
+            self._register_declaration_alias(module_id, statement)
+
+        for module_id, statement in declarations:
             if isinstance(statement, s.Statement_StructureDefinition):
-                self._structs[statement.signature.name] = self._normalize_struct_definition(statement.signature)
+                definition = self._normalize_struct_definition(statement.signature)
+                definition = replace(definition, name=self._qualify_type_name(module_id, definition.name))
+                self._structs[definition.name] = definition
             elif isinstance(statement, s.Statement_FunctionDefinition):
                 statement.signature = self._normalize_signature(statement.signature)
                 if statement.signature.type is None:
                     continue
-                self._register_source_signature(statement.signature)
+                internal_name = self._qualify_function_name(module_id, statement.signature.name)
+                internal_signature = replace(statement.signature, name=internal_name)
+                self._register_source_signature(internal_signature)
                 if self._signature_has_any_pointer(statement.signature):
                     for pointer_cls, suffix in ((HeapSmartPointer, "__H"), (StackSmartPointer, "__S")):
-                        concrete_sig = self._specialize_signature_any_pointer(statement.signature, pointer_cls)
-                        concrete_name = f"{statement.signature.name}{suffix}"
+                        concrete_sig = self._specialize_signature_any_pointer(internal_signature, pointer_cls)
+                        concrete_name = f"{internal_name}{suffix}"
                         self._register_source_signature(replace(concrete_sig, name=concrete_name))
-                        self._any_pointer_variants.setdefault(statement.signature.name, {})[pointer_cls] = concrete_name
+                        self._any_pointer_variants.setdefault(internal_name, {})[pointer_cls] = concrete_name
                         self._funcs[concrete_name] = Derective_fn(
                             name=concrete_name,
                             generics=[self._translate_type(g) for g in concrete_sig.generics],
@@ -230,15 +267,16 @@ class Translator:
                             ret_type=self._translate_type(concrete_sig.type),
                         )
                 else:
-                    self._funcs[statement.signature.name] = Derective_fn(
-                        name=statement.signature.name,
-                        generics=[self._translate_type(g) for g in statement.signature.generics],
-                        params=self._lower_params(statement.signature.params),
+                    self._funcs[internal_name] = Derective_fn(
+                        name=internal_name,
+                        generics=[self._translate_type(g) for g in internal_signature.generics],
+                        params=self._lower_params(internal_signature.params),
                         body=[],
-                        ret_type=self._translate_type(statement.signature.type),
+                        ret_type=self._translate_type(internal_signature.type),
                     )
             elif isinstance(statement, s.Statement_EnumDefinition):
-                self._enums[statement.name] = self._build_enum_directive(statement)
+                directive = self._build_enum_directive(statement, module_id=module_id)
+                self._enums[directive.name] = directive
             elif isinstance(statement, s.FunctionSignature):
                 self._extern_fns[statement.name] = statement
                 self._register_source_signature(statement)
@@ -248,11 +286,23 @@ class Translator:
                     ret_type=self._translate_type(statement.type),
                 )
             elif isinstance(statement, s.Statement_Trait):
-                self._traits[statement.name] = statement
+                internal_trait_name = self._qualify_trait_name(module_id, statement.name)
+                internal_trait = replace(
+                    statement,
+                    name=internal_trait_name,
+                    bases=[self._translate_trait_type(base) for base in statement.bases],
+                )
+                self._traits[internal_trait_name] = internal_trait
+                for method in internal_trait.body:
+                    method_signature = self._normalize_signature(
+                        replace(method, name=f"{internal_trait_name}::{method.name}")
+                    )
+                    self._register_source_signature(method_signature)
             elif isinstance(statement, s.Statement_Impl):
                 struct_type = self._translate_type(statement.struct)
                 if statement.trait_name is not None:
-                    self._impl_traits.setdefault(struct_type.name, []).append(statement.trait_name)
+                    resolved_trait_name = self._trait_aliases.get(statement.trait_name, statement.trait_name)
+                    self._impl_traits.setdefault(struct_type.name, []).append(resolved_trait_name)
                     continue
 
                 for method in statement.body:
@@ -281,9 +331,9 @@ class Translator:
                             concrete_sig = self._specialize_signature_any_pointer(normalized_signature, pointer_cls)
                             concrete_name = f"{normalized_signature.name}{suffix}"
                             self._register_source_signature(replace(concrete_sig, name=concrete_name))
-                            self._any_pointer_variants.setdefault(normalized_signature.name, {})[
-                                pointer_cls
-                            ] = concrete_name
+                            self._any_pointer_variants.setdefault(normalized_signature.name, {})[pointer_cls] = (
+                                concrete_name
+                            )
                             self._funcs[concrete_name] = Derective_fn(
                                 name=concrete_name,
                                 generics=[self._translate_type(g) for g in concrete_sig.generics],
@@ -331,10 +381,7 @@ class Translator:
     def _resolve_self_type(self, self_type: Type | None) -> Type | None:
         if self_type is None:
             return None
-        self_type = unwrap_for_storage(self_type)
-        if self_type.name == "Self" and not self_type.generics:
-            return self._current_self_type or self_type
-        return self_type
+        return unwrap_for_storage(self_type)
 
     def _resolve_self_in_type(self, typ: Type, self_type: Type | None) -> Type:
         if is_mutable_type(typ):
@@ -459,6 +506,7 @@ class Translator:
 
     def _translate_structure_definition(self, statement: s.Statement_StructureDefinition):
         definition = self._normalize_struct_definition(statement.signature)
+        definition = replace(definition, name=self._qualify_type_name(self._current_module_id, definition.name))
         self._structs[definition.name] = definition
         self._emit_struct_definition(definition)
 
@@ -492,7 +540,11 @@ class Translator:
         self._structs[name] = definition
         self._emit_struct_definition(definition)
 
-    def _build_enum_directive(self, statement: s.Statement_EnumDefinition) -> Derective_enum:
+    def _build_enum_directive(
+        self, statement: s.Statement_EnumDefinition, *, module_id: Path | None = None
+    ) -> Derective_enum:
+        module_id = module_id or self._current_module_id
+        enum_name = self._qualify_type_name(module_id, statement.name)
         variants: list[EnumVariant] = []
         for variant in statement.body:
             if isinstance(variant, s.UnitStructureDefinition):
@@ -505,27 +557,32 @@ class Translator:
                     variants.append(EnumVariant(name=variant.name, type=payload_type))
                     continue
 
-                payload_struct = self._ensure_enum_payload_struct(statement, variant)
+                payload_struct = self._ensure_enum_payload_struct(statement, variant, module_id=module_id)
                 payload_type = self._translate_type(Type(payload_struct.name, list(statement.generics)))
                 variants.append(EnumVariant(name=variant.name, type=payload_type))
                 continue
 
             if isinstance(variant, s.CLikeStructureDefinition):
-                payload_struct = self._ensure_enum_payload_struct(statement, variant)
+                payload_struct = self._ensure_enum_payload_struct(statement, variant, module_id=module_id)
                 payload_type = self._translate_type(Type(payload_struct.name, list(statement.generics)))
                 variants.append(EnumVariant(name=variant.name, type=payload_type))
                 continue
 
         return Derective_enum(
-            name=statement.name,
+            name=enum_name,
             generics=[self._translate_type(generic) for generic in statement.generics],
             variants=variants,
         )
 
     def _ensure_enum_payload_struct(
-        self, enum_statement: s.Statement_EnumDefinition, variant: s.Statement_StructureDefinition
+        self,
+        enum_statement: s.Statement_EnumDefinition,
+        variant: s.Statement_StructureDefinition,
+        *,
+        module_id: Path | None = None,
     ) -> s.CLikeStructureDefinition:
-        struct_name = f"{enum_statement.name}_{variant.name}_Payload"
+        module_id = module_id or self._current_module_id
+        struct_name = f"{self._qualify_type_name(module_id, enum_statement.name)}_{variant.name}_Payload"
         existing = self._structs.get(struct_name)
         if isinstance(existing, s.CLikeStructureDefinition):
             payload = existing
@@ -542,24 +599,26 @@ class Translator:
             )
             self._structs[struct_name] = payload
 
-        payloads = self._enum_payload_structs.setdefault(enum_statement.name, [])
+        enum_key = self._qualify_type_name(module_id, enum_statement.name)
+        payloads = self._enum_payload_structs.setdefault(enum_key, [])
         if all(definition.name != payload.name for definition in payloads):
             payloads.append(payload)
         return payload
 
     def _translate_enum_definition(self, statement: s.Statement_EnumDefinition):
-        for payload_struct in self._enum_payload_structs.get(statement.name, []):
+        enum_key = self._qualify_type_name(self._current_module_id, statement.name)
+        for payload_struct in self._enum_payload_structs.get(enum_key, []):
             self._emit_struct_definition(payload_struct)
         derective = self._build_enum_directive(statement)
         self._module.ast.append(derective)
-        self._enums[statement.name] = derective
+        self._enums[derective.name] = derective
         return derective
 
     def _translate_trait_definition(self, statement: s.Statement_Trait):
         derective = self._builder.build_trait(
-            name=statement.name,
+            name=self._qualify_trait_name(self._current_module_id, statement.name),
             generics=[self._translate_type(g) for g in statement.generics],
-            bounds={"Self": [base.name for base in statement.bases]} if statement.bases else {},
+            bounds={"Self": [self._translate_trait_type(base).name for base in statement.bases]} if statement.bases else {},
             methods=[
                 TraitMethod(
                     name=method.name,
@@ -572,7 +631,11 @@ class Translator:
                 for method in statement.body
             ],
         )
-        self._traits[statement.name] = statement
+        self._traits[derective.name] = replace(
+            statement,
+            name=derective.name,
+            bases=[self._translate_trait_type(base) for base in statement.bases],
+        )
         return derective
 
     def _translate_impl_definition(self, statement: s.Statement_Impl):
@@ -609,9 +672,9 @@ class Translator:
                         fn = self._translate_nested_function_definition(concrete_stmt)
                         self._module.ast.append(fn)
                         self._funcs[fn.name] = fn
-                        self._any_pointer_variants.setdefault(namespaced_method.signature.name, {})[
-                            pointer_cls
-                        ] = fn.name
+                        self._any_pointer_variants.setdefault(namespaced_method.signature.name, {})[pointer_cls] = (
+                            fn.name
+                        )
                 else:
                     fn = self._translate_nested_function_definition(namespaced_method)
                     self._module.ast.append(fn)
@@ -628,7 +691,7 @@ class Translator:
             for method in statement.body
         ]
         return self._builder.build_impl(
-            trait_name=statement.trait_name,
+            trait_name=self._trait_aliases.get(statement.trait_name, statement.trait_name),
             trait_args=[self._translate_type(arg) for arg in statement.trait_args],
             for_type=self._translate_type(statement.struct),
             generics=[self._translate_type(generic) for generic in statement.generics],
@@ -637,12 +700,18 @@ class Translator:
 
     def _translate_function_definition(self, statement: s.Statement_FunctionDefinition):
         normalized_sig = self._normalize_signature(statement.signature)
+        normalized_sig = replace(
+            normalized_sig,
+            name=self._qualify_function_name(self._current_module_id, normalized_sig.name),
+        )
         statement = replace(statement, signature=normalized_sig)
         if self._signature_has_any_pointer(statement.signature):
             emitted = None
             for pointer_cls, suffix in ((HeapSmartPointer, "__H"), (StackSmartPointer, "__S")):
                 concrete_sig = self._specialize_signature_any_pointer(statement.signature, pointer_cls)
-                concrete_stmt = replace(statement, signature=replace(concrete_sig, name=f"{statement.signature.name}{suffix}"))
+                concrete_stmt = replace(
+                    statement, signature=replace(concrete_sig, name=f"{statement.signature.name}{suffix}")
+                )
                 fn = self._translate_nested_function_definition(concrete_stmt)
                 self._module.ast.append(fn)
                 self._funcs[fn.name] = fn
@@ -651,7 +720,7 @@ class Translator:
 
         fn = self._translate_nested_function_definition(statement)
         self._module.ast.append(fn)
-        self._funcs[statement.signature.name] = fn
+        self._funcs[fn.name] = fn
         return fn
 
     def _translate_nested_function_definition(self, statement: s.Statement_FunctionDefinition) -> Derective_fn:
@@ -682,7 +751,6 @@ class Translator:
         prev_assignment_targets = self._assignment_targets
         prev_terminated_blocks = self._terminated_blocks
         prev_loop_stack = self._loop_stack
-        prev_self_type = self._current_self_type
 
         self._builder.current_function = fn
         self._builder.variables = {param.name: param for param in fn.params}
@@ -693,18 +761,14 @@ class Translator:
         self._loop_stack = []
         source_params = source_params or []
         mutable_params = {param.name for param in source_params if is_mutable_type(param.type)}
-        if source_params and source_params[0].name == "self":
-            self_type = unwrap_for_storage(source_params[0].type)
-            self._current_self_type = self_type.pointee if is_reference_like_type(self_type) else self_type
-        else:
-            self._current_self_type = None
         entry_block = self._builder.append_block("entry")
         self._builder.position_at_end(entry_block)
 
         for param in fn.params:
-            if param.name not in mutable_params:
+            if param.name in mutable_params:
+                self._var_ptrs[param.name] = Variable(param.name, param.type)
                 continue
-            self._var_ptrs[param.name] = Variable(param.name, param.type)
+            self._var_vals[param.name] = Variable(param.name, param.type)
 
         self._translate_block(body)
 
@@ -718,10 +782,85 @@ class Translator:
         self._assignment_targets = prev_assignment_targets
         self._terminated_blocks = prev_terminated_blocks
         self._loop_stack = prev_loop_stack
-        self._current_self_type = prev_self_type
 
     def _register_source_signature(self, signature: s.FunctionSignature):
         self._source_signatures[signature.name] = signature
+
+    def _normalize_declaration_entries(
+        self, declarations: list[object]
+    ) -> list[tuple[Path, s.Statement_TopLevel]]:
+        normalized: list[tuple[Path, s.Statement_TopLevel]] = []
+        for declaration in declarations:
+            module_id = getattr(declaration, "module_id", None)
+            statement = getattr(declaration, "statement", None)
+            if module_id is None or statement is None:
+                raise TypeError(f"Unsupported imported declaration payload: {declaration!r}")
+            normalized.append((module_id, statement))
+        return normalized
+
+    def _register_declaration_alias(self, module_id: Path, statement: s.Statement_TopLevel):
+        if isinstance(statement, s.Statement_StructureDefinition):
+            self._type_aliases[statement.signature.name] = self._qualify_type_name(module_id, statement.signature.name)
+            return
+        if isinstance(statement, s.Statement_EnumDefinition):
+            self._type_aliases[statement.name] = self._qualify_type_name(module_id, statement.name)
+            return
+        if isinstance(statement, s.Statement_Trait):
+            qualified_trait_name = self._qualify_trait_name(module_id, statement.name)
+            self._trait_aliases[statement.name] = qualified_trait_name
+            for method in statement.body:
+                self._function_aliases[f"{statement.name}::{method.name}"] = f"{qualified_trait_name}::{method.name}"
+            return
+        if isinstance(statement, s.FunctionSignature):
+            self._function_aliases[statement.name] = statement.name
+            return
+        if isinstance(statement, s.Statement_FunctionDefinition):
+            self._function_aliases[statement.signature.name] = self._qualify_function_name(
+                module_id, statement.signature.name
+            )
+            return
+        if isinstance(statement, s.Statement_Impl) and statement.trait_name is None:
+            owner_name = self._type_aliases.get(statement.struct.name, statement.struct.name)
+            for method in statement.body:
+                self._function_aliases[f"{statement.struct.name}::{method.name}"] = f"{owner_name}::{method.name}"
+
+    def _module_namespace(self, module_id: Path) -> str:
+        if not module_id:
+            return ""
+        module_id = module_id.resolve()
+        cached = self._module_namespace_cache.get(module_id)
+        if cached is not None:
+            return cached
+
+        project_root = module_id.parent
+        for parent in [module_id.parent, *module_id.parents]:
+            if (parent / "encore.toml").exists():
+                project_root = parent
+                break
+
+        rel_module = module_id.relative_to(project_root).with_suffix("")
+        namespace = "::".join([project_root.name, *rel_module.parts])
+        self._module_namespace_cache[module_id] = namespace
+        return namespace
+
+    def _qualify_type_name(self, module_id: Path, name: str) -> str:
+        namespace = self._module_namespace(module_id)
+        return f"{namespace}::{name}" if namespace else name
+
+    def _qualify_trait_name(self, module_id: Path, name: str) -> str:
+        namespace = self._module_namespace(module_id)
+        return f"{namespace}::{name}" if namespace else name
+
+    def _qualify_function_name(self, module_id: Path, name: str) -> str:
+        if name == "main":
+            return name
+        namespace = self._module_namespace(module_id)
+        return f"{namespace}::{name}" if namespace else name
+
+    def _translate_trait_type(self, typ: Type) -> Type:
+        if typ.name in self._trait_aliases:
+            return replace(typ, name=self._trait_aliases[typ.name], generics=[self._translate_type(g) for g in typ.generics])
+        return replace(typ, generics=[self._translate_type(g) for g in typ.generics])
 
     def _lower_param_type(self, typ: Type) -> Type:
         if is_mutable_type(typ):
@@ -791,7 +930,9 @@ class Translator:
                 continue
 
             inner_type = unwrap_for_storage(param.type)
-            expected_type = value.var_out.type if self._contains_any_pointer(inner_type) else self._translate_type(inner_type)
+            expected_type = (
+                value.var_out.type if self._contains_any_pointer(inner_type) else self._translate_type(inner_type)
+            )
             if expected_type is None:
                 raise TypeError(f"Unable to lower mutable argument for parameter '{param.name}'")
             args.append(self._translate_mutable_argument(expr, value.var_out, expected_type))
@@ -1132,52 +1273,253 @@ class Translator:
         self._var_ptrs = dict(base_var_ptrs)
 
     def _translate_match(self, statement: s.Statement_Match):
+        self._translate_match_common(statement, is_expression=False)
+
+    def _translate_match_common(
+        self,
+        match_expr: MatchLike,
+        *,
+        is_expression: bool,
+        name: Optional[str] = None,
+        expected_type: Optional[Type] = None,
+    ) -> Assignable | None:
         match_id = self._if_counter
         self._if_counter += 1
 
-        prepared = self._prepare_match(
-            match_id=match_id,
-            scrutinee_expr=statement.expr,
-            arms=statement.arms,
-            end_prefix="match_end",
-            default_prefix="match_default",
-            arm_prefix="match_arm",
+        scrutinee = self._translate_expression(match_expr.expr)
+        if scrutinee.var_out.type is None:
+            current_fn = getattr(self._builder.current_function, "name", "<unknown>")
+            raise TypeError(
+                f"Unable to infer match scrutinee type in '{current_fn}' for expression: {match_expr.expr!r}"
+            )
+
+        if self._is_builtin_match_type(scrutinee.var_out.type):
+            return self._translate_builtin_match(
+                match_id=match_id,
+                scrutinee=scrutinee,
+                arms=match_expr.arms,
+                is_expression=is_expression,
+                name=name,
+                expected_type=expected_type,
+            )
+
+        result_name = (name or self._advance_variable()) if is_expression else None
+        result_type = expected_type if is_expression else None
+        result_slot: Variable | None = (
+            self._allocate_stack_slot(f"{result_name}_slot", result_type)
+            if is_expression and result_type is not None
+            else None
         )
 
-        for idx, arm in enumerate(statement.arms):
+        prepared = self._prepare_match(
+            match_id=match_id,
+            scrutinee=scrutinee,
+            arms=match_expr.arms,
+            end_prefix="match_expr_end" if is_expression else "match_end",
+            default_prefix="match_expr_default" if is_expression else "match_default",
+            arm_prefix="match_expr_arm" if is_expression else "match_arm",
+        )
+
+        for idx, arm in enumerate(match_expr.arms):
             if arm.is_wildcard:
                 continue
 
-            self._builder.position_at_end(prepared.arm_blocks[idx])
-            self._var_vals = dict(prepared.base_var_vals)
-            self._var_ptrs = dict(prepared.base_var_ptrs)
-            payload_type = prepared.arm_payload_types[idx]
-
-            if arm.binding is not None and payload_type is not None:
-                self._var_vals[arm.binding] = Variable(arm.binding, payload_type)
-
-            self._translate_block(arm.body)
-            if not self._is_current_block_terminated():
+            self._enter_match_arm_scope(prepared, idx, arm)
+            body = self._get_match_arm_body(arm)
+            if is_expression:
+                arm_result = self._translate_match_expression_body(body, expected_type=expected_type)
+                result_type = result_type or arm_result.var_out.type
+                if result_slot is None:
+                    assert result_name is not None and result_type is not None
+                    result_slot = self._create_stack_slot(f"{result_name}_slot", arm_result.var_out, result_type)
+                else:
+                    self._builder._add(Instruction_store(var_src=arm_result.var_out, var_dst=result_slot))
                 self._builder.build_br(prepared.end_block.name)
                 self._mark_current_block_terminated()
+            else:
+                self._translate_match_statement_body(body)
+                if not self._is_current_block_terminated():
+                    self._builder.build_br(prepared.end_block.name)
+                    self._mark_current_block_terminated()
 
         if prepared.wildcard_arm is not None:
-            self._builder.position_at_end(prepared.default_block)
-            self._var_vals = dict(prepared.base_var_vals)
-            self._var_ptrs = dict(prepared.base_var_ptrs)
-            self._translate_block(prepared.wildcard_arm.body)
-            if not self._is_current_block_terminated():
+            self._enter_match_default_scope(prepared)
+            body = self._get_match_arm_body(prepared.wildcard_arm)
+            if is_expression:
+                default_result = self._translate_match_expression_body(body, expected_type=expected_type)
+                result_type = result_type or default_result.var_out.type
+                if result_slot is None:
+                    assert result_name is not None and result_type is not None
+                    result_slot = self._create_stack_slot(f"{result_name}_slot", default_result.var_out, result_type)
+                else:
+                    self._builder._add(Instruction_store(var_src=default_result.var_out, var_dst=result_slot))
                 self._builder.build_br(prepared.end_block.name)
                 self._mark_current_block_terminated()
+            else:
+                self._translate_match_statement_body(body)
+                if not self._is_current_block_terminated():
+                    self._builder.build_br(prepared.end_block.name)
+                    self._mark_current_block_terminated()
 
         self._builder.position_at_end(prepared.end_block)
         self._var_vals = dict(prepared.base_var_vals)
         self._var_ptrs = dict(prepared.base_var_ptrs)
 
-    def _resolve_match_arm(self, scrutinee_type: Type, arm: s.Statement_MatchArm) -> tuple[str, int, Optional[Type]]:
-        if arm.is_wildcard:
-            raise TypeError("Wildcard arm has no explicit variant")
-        return self._resolve_match_arm_common(scrutinee_type, arm)
+        if not is_expression:
+            return None
+
+        assert result_name is not None and result_type is not None and result_slot is not None
+        return self._build_load_from_ptr(result_slot, name=result_name)
+
+    def _enter_match_arm_scope(self, prepared: "_PreparedMatch", idx: int, arm: MatchBodyArmLike):
+        self._builder.position_at_end(prepared.arm_blocks[idx])
+        self._var_vals = dict(prepared.base_var_vals)
+        self._var_ptrs = dict(prepared.base_var_ptrs)
+        payload_type = prepared.arm_payload_types[idx]
+        if arm.binding is not None and payload_type is not None:
+            self._var_vals[arm.binding] = Variable(arm.binding, payload_type)
+
+    def _enter_match_default_scope(self, prepared: "_PreparedMatch"):
+        self._builder.position_at_end(prepared.default_block)
+        self._var_vals = dict(prepared.base_var_vals)
+        self._var_ptrs = dict(prepared.base_var_ptrs)
+
+    def _get_match_arm_body(self, arm: MatchBodyArmLike) -> MatchBodyLike:
+        if isinstance(arm, s.Statement_MatchArm):
+            return arm.body
+        return arm.expr
+
+    def _translate_match_statement_body(self, body: MatchBodyLike):
+        if isinstance(body, Block):
+            self._translate_block(body)
+            return
+        self._translate_expression(body)
+
+    def _translate_match_expression_body(
+        self,
+        body: MatchBodyLike,
+        *,
+        expected_type: Optional[Type] = None,
+    ) -> Assignable:
+        if isinstance(body, Block):
+            return self._translate_expression_block(body, expected_type=expected_type)
+        return self._translate_expression(body, expected_type=expected_type)
+
+    def _translate_builtin_match(
+        self,
+        *,
+        match_id: int,
+        scrutinee: Assignable,
+        arms: list[MatchBodyArmLike],
+        is_expression: bool,
+        name: Optional[str] = None,
+        expected_type: Optional[Type] = None,
+    ) -> Assignable | None:
+        explicit_arms = [arm for arm in arms if not arm.is_wildcard]
+        wildcard_arm = next((arm for arm in arms if arm.is_wildcard), None)
+        default_arm = wildcard_arm
+        if default_arm is None:
+            if not explicit_arms:
+                raise TypeError("Builtin match must have at least one arm")
+            default_arm = explicit_arms[-1]
+            explicit_arms = explicit_arms[:-1]
+
+        result_name = (name or self._advance_variable()) if is_expression else None
+        result_type = expected_type if is_expression else None
+        result_slot: Variable | None = (
+            self._allocate_stack_slot(f"{result_name}_slot", result_type)
+            if is_expression and result_type is not None
+            else None
+        )
+
+        base_var_vals = dict(self._var_vals)
+        base_var_ptrs = dict(self._var_ptrs)
+        end_block = self._builder.append_block(f"match_builtin_end_{match_id}")
+
+        if explicit_arms:
+            cond_blocks = [self._builder.current_block] + [
+                self._builder.append_block(f"match_builtin_cond_{match_id}_{idx}") for idx in range(1, len(explicit_arms))
+            ]
+            arm_blocks = [self._builder.append_block(f"match_builtin_arm_{match_id}_{idx}") for idx in range(len(explicit_arms))]
+            default_block = self._builder.append_block(f"match_builtin_default_{match_id}")
+
+            for idx, arm in enumerate(explicit_arms):
+                self._builder.position_at_end(cond_blocks[idx])
+                self._var_vals = dict(base_var_vals)
+                self._var_ptrs = dict(base_var_ptrs)
+
+                cond_var = self._translate_builtin_match_condition(scrutinee.var_out, arm.pattern)
+                false_target = cond_blocks[idx + 1].name if idx + 1 < len(explicit_arms) else default_block.name
+                self._builder.build_cbr(cond_var, arm_blocks[idx].name, false_target)
+                self._mark_current_block_terminated()
+
+                self._builder.position_at_end(arm_blocks[idx])
+                self._var_vals = dict(base_var_vals)
+                self._var_ptrs = dict(base_var_ptrs)
+                body = self._get_match_arm_body(arm)
+                if is_expression:
+                    arm_result = self._translate_match_expression_body(body, expected_type=expected_type)
+                    result_type = result_type or arm_result.var_out.type
+                    if result_slot is None:
+                        assert result_name is not None and result_type is not None
+                        result_slot = self._create_stack_slot(f"{result_name}_slot", arm_result.var_out, result_type)
+                    else:
+                        self._builder._add(Instruction_store(var_src=arm_result.var_out, var_dst=result_slot))
+                    self._builder.build_br(end_block.name)
+                    self._mark_current_block_terminated()
+                else:
+                    self._translate_match_statement_body(body)
+                    if not self._is_current_block_terminated():
+                        self._builder.build_br(end_block.name)
+                        self._mark_current_block_terminated()
+
+            self._builder.position_at_end(default_block)
+            self._var_vals = dict(base_var_vals)
+            self._var_ptrs = dict(base_var_ptrs)
+        else:
+            self._var_vals = dict(base_var_vals)
+            self._var_ptrs = dict(base_var_ptrs)
+
+        body = self._get_match_arm_body(default_arm)
+        if is_expression:
+            default_result = self._translate_match_expression_body(body, expected_type=expected_type)
+            result_type = result_type or default_result.var_out.type
+            if result_slot is None:
+                assert result_name is not None and result_type is not None
+                result_slot = self._create_stack_slot(f"{result_name}_slot", default_result.var_out, result_type)
+            else:
+                self._builder._add(Instruction_store(var_src=default_result.var_out, var_dst=result_slot))
+            self._builder.build_br(end_block.name)
+            self._mark_current_block_terminated()
+        else:
+            self._translate_match_statement_body(body)
+            if not self._is_current_block_terminated():
+                self._builder.build_br(end_block.name)
+                self._mark_current_block_terminated()
+
+        self._builder.position_at_end(end_block)
+        self._var_vals = dict(base_var_vals)
+        self._var_ptrs = dict(base_var_ptrs)
+
+        if not is_expression:
+            return None
+
+        assert result_name is not None and result_type is not None and result_slot is not None
+        return self._build_load_from_ptr(result_slot, name=result_name)
+
+    def _translate_builtin_match_condition(self, scrutinee: Variable, pattern: MatchPatternLike) -> Variable:
+        if pattern is None:
+            raise TypeError("Wildcard arm has no explicit pattern")
+
+        rhs = self._translate_expression(pattern, expected_type=scrutinee.type)
+        eq_fn_name = self._function_aliases.get("Eq::op", "Eq::op")
+        cond = self._builder.build_call(
+            fn_name=eq_fn_name,
+            generics=[],
+            args=[scrutinee, rhs.var_out],
+        )
+        cond.var_out.type = Usize_t(1)
+        return cond.var_out
 
     def _resolve_match_arm_common(self, scrutinee_type: Type, arm: MatchArmLike) -> tuple[str, int, Optional[Type]]:
         scrutinee_type = unwrap_for_storage(scrutinee_type)
@@ -1187,14 +1529,15 @@ class Translator:
             raise TypeError(f"Match expression must be an enum, got {scrutinee_type}")
         generic_mapping = {generic.name: concrete for generic, concrete in zip(enum.generics, base_type.generics)}
 
-        assert arm.pattern is not None
+        assert isinstance(arm.pattern, s.Expression_Path)
         if len(arm.pattern.segments) == 1:
             variant_name = arm.pattern.segments[0].name
         elif len(arm.pattern.segments) == 2:
             explicit_enum = arm.pattern.segments[0]
-            if explicit_enum.name != base_type.name:
+            translated_explicit_enum = self._translate_type(explicit_enum)
+            if translated_explicit_enum.name != base_type.name:
                 raise TypeError(f"Pattern enum '{explicit_enum.name}' does not match scrutinee type '{base_type.name}'")
-            if explicit_enum.generics and explicit_enum != base_type:
+            if translated_explicit_enum.generics and not self._types_compatible(translated_explicit_enum, base_type):
                 raise TypeError(f"Pattern enum '{explicit_enum}' does not match scrutinee type '{base_type}'")
             variant_name = arm.pattern.segments[1].name
         else:
@@ -1245,17 +1588,9 @@ class Translator:
 
         elif isinstance(expr, s.Expression_Path):
             if len(expr.segments) == 1:
-                ptr = self._var_ptrs.get(expr.name)
-                if ptr is not None:
-                    return self._build_load_from_ptr(ptr, name=name)
-                if expr.name in self._var_vals:
-                    return Assignable(self._var_vals[expr.name])
-                if self._current_self_type is not None and self._lookup_field_type(self._current_self_type, expr.name):
-                    return self._translate_expression(
-                        s.Expression_StructField("self", expr.name),
-                        name=name,
-                        expected_type=expected_type,
-                    )
+                explicit_binding = self._lookup_explicit_path_value(expr.name, result_name=name)
+                if explicit_binding is not None:
+                    return explicit_binding
                 return self._builder.get_var(expr.name)
 
             enum_expr = self._build_enum_from_path(expr)
@@ -1279,7 +1614,7 @@ class Translator:
         elif isinstance(expr, s.Expression_If):
             return self._translate_if_expression(expr, name=name, expected_type=expected_type)
 
-        elif isinstance(expr, s.Expression_Match):
+        elif isinstance(expr, (s.Statement_Match, s.Expression_Match)):
             return self._translate_match_expression(expr, name=name, expected_type=expected_type)
 
         elif isinstance(expr, s.Expression_BinaryOperation):
@@ -1290,8 +1625,9 @@ class Translator:
             if trait_name is not None:
                 lhs = self._translate_expression(expr.lhs, expected_type=expected_type)
                 rhs = self._translate_expression(expr.rhs, expected_type=lhs.var_out.type or expected_type)
+                fn_name = self._function_aliases.get(f"{trait_name}::op", f"{trait_name}::op")
                 call = self._builder.build_call(
-                    fn_name=f"{trait_name}::op",
+                    fn_name=fn_name,
                     generics=[],
                     args=[lhs.var_out, rhs.var_out],
                     name=name,
@@ -1330,7 +1666,9 @@ class Translator:
                     tuple_type = expected_base
 
             args = [
-                self._translate_expression(item, expected_type=expected_items[idx] if idx < len(expected_items) else None).var_out
+                self._translate_expression(
+                    item, expected_type=expected_items[idx] if idx < len(expected_items) else None
+                ).var_out
                 for idx, item in enumerate(expr.items)
             ]
             if tuple_type is None:
@@ -1386,7 +1724,7 @@ class Translator:
                 ).var_out
                 for idx, arg_exp in enumerate(expr.args)
             ]
-            return self._translate_struct_initialization(expr.name, args, name)
+            return self._translate_struct_initialization(self._translate_type(expr.name), args, name)
 
         elif isinstance(expr, s.Expression_StructField):
             src = self._resolve_struct_field_chain(expr.name)
@@ -1743,85 +2081,24 @@ class Translator:
 
     def _translate_match_expression(
         self,
-        expr: s.Expression_Match,
+        expr: MatchLike,
         name: Optional[str] = None,
         expected_type: Optional[Type] = None,
     ) -> Assignable:
-        match_id = self._if_counter
-        self._if_counter += 1
-        result_name = name or self._advance_variable()
-        result_type = expected_type
-        result_slot: Variable | None = (
-            self._allocate_stack_slot(f"{result_name}_slot", result_type) if result_type is not None else None
-        )
-
-        prepared = self._prepare_match(
-            match_id=match_id,
-            scrutinee_expr=expr.expr,
-            arms=expr.arms,
-            end_prefix="match_expr_end",
-            default_prefix="match_expr_default",
-            arm_prefix="match_expr_arm",
-        )
-
-        for idx, arm in enumerate(expr.arms):
-            if arm.is_wildcard:
-                continue
-
-            self._builder.position_at_end(prepared.arm_blocks[idx])
-            self._var_vals = dict(prepared.base_var_vals)
-            self._var_ptrs = dict(prepared.base_var_ptrs)
-
-            payload_type = prepared.arm_payload_types[idx]
-            if arm.binding is not None and payload_type is not None:
-                self._var_vals[arm.binding] = Variable(arm.binding, payload_type)
-
-            arm_result = self._translate_expression(arm.expr, expected_type=expected_type)
-            result_type = result_type or arm_result.var_out.type
-            if result_slot is None:
-                assert result_type is not None
-                result_slot = self._create_stack_slot(f"{result_name}_slot", arm_result.var_out, result_type)
-            else:
-                self._builder._add(Instruction_store(var_src=arm_result.var_out, var_dst=result_slot))
-            self._builder.build_br(prepared.end_block.name)
-            self._mark_current_block_terminated()
-
-        if prepared.wildcard_arm is not None:
-            self._builder.position_at_end(prepared.default_block)
-            self._var_vals = dict(prepared.base_var_vals)
-            self._var_ptrs = dict(prepared.base_var_ptrs)
-            default_result = self._translate_expression(prepared.wildcard_arm.expr, expected_type=expected_type)
-            result_type = result_type or default_result.var_out.type
-            if result_slot is None:
-                assert result_type is not None
-                result_slot = self._create_stack_slot(f"{result_name}_slot", default_result.var_out, result_type)
-            else:
-                self._builder._add(Instruction_store(var_src=default_result.var_out, var_dst=result_slot))
-            self._builder.build_br(prepared.end_block.name)
-            self._mark_current_block_terminated()
-
-        assert result_type is not None and result_slot is not None
-        self._builder.position_at_end(prepared.end_block)
-        self._var_vals = dict(prepared.base_var_vals)
-        self._var_ptrs = dict(prepared.base_var_ptrs)
-        return self._build_load_from_ptr(result_slot, name=result_name)
+        result = self._translate_match_common(expr, is_expression=True, name=name, expected_type=expected_type)
+        assert result is not None
+        return result
 
     def _prepare_match(
         self,
         *,
         match_id: int,
-        scrutinee_expr: s.Statement_Expression,
+        scrutinee: Assignable,
         arms: list[MatchBodyArmLike],
         end_prefix: str,
         default_prefix: str,
         arm_prefix: str,
-    ) -> _PreparedMatch:
-        scrutinee = self._translate_expression(scrutinee_expr)
-        if scrutinee.var_out.type is None:
-            current_fn = getattr(self._builder.current_function, "name", "<unknown>")
-            raise TypeError(
-                f"Unable to infer match scrutinee type in '{current_fn}' for expression: {scrutinee_expr!r}"
-            )
+    ) -> "_PreparedMatch":
         base_var_vals = dict(self._var_vals)
         base_var_ptrs = dict(self._var_ptrs)
         end_block = self._builder.append_block(f"{end_prefix}_{match_id}")
@@ -1857,12 +2134,26 @@ class Translator:
             arm_payload_types=arm_payload_types,
         )
 
-    def _resolve_expression_match_arm_translation(
-        self, scrutinee_type: Type, arm: s.Expression_MatchArm
-    ) -> tuple[str, int, Optional[Type]]:
-        if arm.is_wildcard:
-            raise TypeError("Wildcard arm has no explicit variant")
-        return self._resolve_match_arm_common(scrutinee_type, arm)
+    def _normalize_match_scrutinee_type(self, typ: Type) -> Type:
+        typ = unwrap_for_storage(typ)
+        return typ.pointee if is_reference_like_type(typ) else typ
+
+    def _is_builtin_match_type(self, typ: Type) -> bool:
+        base_type = self._normalize_match_scrutinee_type(typ)
+        return (
+            base_type.name == "str"
+            or base_type.name == "bool"
+            or self._is_integer_type_name(base_type.name)
+            or self._is_float_type_name(base_type.name)
+        )
+
+    @staticmethod
+    def _is_integer_type_name(name: str) -> bool:
+        return name in ("usize", "isize") or (len(name) > 1 and name[0] in ("u", "i") and name[1:].isdigit())
+
+    @staticmethod
+    def _is_float_type_name(name: str) -> bool:
+        return len(name) > 1 and name[0] == "f" and name[1:].isdigit()
 
     def _mark_current_block_terminated(self):
         self._terminated_blocks.add(self._builder.current_block.name)
@@ -1945,6 +2236,21 @@ class Translator:
         except ValueError:
             return Variable(name)
 
+    def _lookup_explicit_path_value(self, binding_name: str, *, result_name: str | None = None) -> Assignable | None:
+        ptr = self._var_ptrs.get(binding_name)
+        if ptr is not None:
+            return self._build_load_from_ptr(ptr, name=result_name)
+
+        var = self._var_vals.get(binding_name)
+        if var is not None:
+            return Assignable(var)
+
+        var = self._builder.variables.get(binding_name)
+        if var is not None:
+            return Assignable(var)
+
+        return None
+
     def _resolve_struct_field_chain(self, name: str) -> Variable:
         parts = name.split(".")
         if not parts:
@@ -2014,7 +2320,8 @@ class Translator:
         if len(expr.segments) != 2 or self._lookup_enum(enum_type) is None:
             return None
 
-        return Enum(name=enum_type.name, generics=enum_type.generics, variant=variant_name)
+        translated_enum_type = self._translate_type(enum_type)
+        return Enum(name=translated_enum_type.name, generics=translated_enum_type.generics, variant=variant_name)
 
     def _build_enum_from_call(self, expr: s.Expression_Call) -> Enum | None:
         if len(expr.callee.segments) != 2:
@@ -2024,6 +2331,7 @@ class Translator:
         variant_name = expr.callee.segments[1].name
         if self._lookup_enum(enum_type) is None:
             return None
+        translated_enum_type = self._translate_type(enum_type)
 
         payload = None
         if expr.args:
@@ -2062,17 +2370,20 @@ class Translator:
                 payload_var = self._translate_expression(expr.args[0], expected_type=payload_type).var_out
 
             payload = Struct(name=payload_type.name, value=payload_var, type=payload_type)
-        return Enum(name=enum_type.name, generics=enum_type.generics, variant=variant_name, payload=payload)
+        return Enum(name=translated_enum_type.name, generics=translated_enum_type.generics, variant=variant_name, payload=payload)
 
     def _lookup_enum(self, typ: Type) -> Derective_enum | None:
-        return self._enums.get(typ.name)
+        return self._enums.get(self._translate_type(typ).name)
 
     def _lookup_enum_variant_type(self, enum_type: Type, variant_name: str) -> Optional[Type]:
-        enum_def = self._lookup_enum(enum_type)
+        translated_enum_type = self._translate_type(enum_type)
+        enum_def = self._lookup_enum(translated_enum_type)
         if enum_def is None:
             return None
 
-        generic_mapping = {generic.name: concrete for generic, concrete in zip(enum_def.generics, enum_type.generics)}
+        generic_mapping = {
+            generic.name: concrete for generic, concrete in zip(enum_def.generics, translated_enum_type.generics)
+        }
         for variant in enum_def.variants:
             if variant.name == variant_name:
                 if variant.type is None:
@@ -2153,7 +2464,8 @@ class Translator:
             return Isize_t(int(typ.name[1:]))
         if typ.name.startswith("f") and typ.name[1:].isdigit():
             return Float_t(int(typ.name[1:]))
-        return Type(typ.name, [self._translate_type(generic) for generic in typ.generics])
+        translated_name = self._type_aliases.get(typ.name, typ.name)
+        return Type(translated_name, [self._translate_type(generic) for generic in typ.generics])
 
     def _contains_any_pointer(self, typ: Type) -> bool:
         if is_mutable_type(typ):
@@ -2212,14 +2524,14 @@ class Translator:
         return variants.get(concrete_kind, fn_name)
 
     def _resolve_function_call_target(self, expr: s.Expression_Call) -> tuple[str, list[Type]]:
-        call_name = expr.name
+        call_name = self._function_aliases.get(expr.name, expr.name)
         explicit_generics = list(expr.generics)
         if call_name in self._funcs or call_name in self._extern_fns:
             return call_name, explicit_generics
 
         if len(expr.callee.segments) == 2:
             owner = expr.callee.segments[0]
-            normalized_name = f"{owner.name}::{expr.callee.segments[1].name}"
+            normalized_name = f"{self._translate_type(owner).name}::{expr.callee.segments[1].name}"
             if normalized_name in self._funcs or normalized_name in self._extern_fns:
                 if owner.generics:
                     if explicit_generics:

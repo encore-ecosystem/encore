@@ -311,16 +311,16 @@ class Statement_If(Statement_InnerLevel):
 
 @dataclass
 class Statement_MatchArm:
-    pattern: "Expression_Path | None"
+    pattern: "Statement_Expression | None"
     binding: str | None
-    body: "Block"
+    body: "Block | Statement_Expression"
 
     @property
     def is_wildcard(self) -> bool:
         return self.pattern is None
 
     def __repr__(self) -> str:
-        pattern_repr = "_" if self.pattern is None else self.pattern.name
+        pattern_repr = "_" if self.pattern is None else str(self.pattern)
         if self.binding is not None:
             pattern_repr = f"{pattern_repr}({self.binding})"
         return f"{pattern_repr} => {self.body}"
@@ -491,7 +491,7 @@ class Expression_MethodCall(Statement_Expression):
 
 @dataclass
 class Expression_MatchArm:
-    pattern: "Expression_Path | None"
+    pattern: "Statement_Expression | None"
     binding: str | None
     expr: Statement_Expression
 
@@ -500,7 +500,7 @@ class Expression_MatchArm:
         return self.pattern is None
 
     def __repr__(self) -> str:
-        pattern_repr = "_" if self.pattern is None else self.pattern.name
+        pattern_repr = "_" if self.pattern is None else str(self.pattern)
         if self.binding is not None:
             pattern_repr = f"{pattern_repr}({self.binding})"
         return f"{pattern_repr} => {self.expr}"

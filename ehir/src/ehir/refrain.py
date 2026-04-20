@@ -16,6 +16,7 @@ class Refrain:
     path: Path
     type: TargetType = TargetType.EXECUTABLE
     entrypoint: str | None = None
+    entry_root: str = "src"
 
     @property
     def entrypoint_stem(self) -> str:

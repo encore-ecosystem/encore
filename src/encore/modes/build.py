@@ -77,6 +77,13 @@ class _BuildLiveStatus:
             try:
                 return module_id.relative_to(src_root).as_posix()
             except ValueError:
+                pass
+
+            tests_root = (refrain.path / "tests").resolve()
+            try:
+                rel = module_id.relative_to(tests_root).as_posix()
+                return f"tests/{rel}"
+            except ValueError:
                 continue
         return module_id.name
 

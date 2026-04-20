@@ -1,158 +1,262 @@
-import mod::statements::AssignmentStmt
-import mod::statements::Ast
-import mod::statements::BinaryExpr
-import mod::statements::Block
-import mod::statements::CallExpr
-import mod::statements::DoWhileStmt
-import mod::statements::EnumItem
-import mod::statements::Expr
-import mod::statements::FieldExpr
-import mod::statements::FunctionItem
-import mod::statements::FunctionParam
-import mod::statements::IfBranch
-import mod::statements::IfStmt
-import mod::statements::ImplItem
-import mod::statements::ImportItem
-import mod::statements::Item
-import mod::statements::LetStmt
-import mod::statements::LoopStmt
-import mod::statements::MatchArm
-import mod::statements::MatchExpr
-import mod::statements::MatchExprArm
-import mod::statements::MatchPattern
-import mod::statements::MatchStmt
-import mod::statements::MethodCallExpr
-import mod::statements::NamedField
-import mod::statements::Statement
-import mod::statements::StructInitExpr
-import mod::statements::StructItem
-import mod::statements::StructSignature
-import mod::statements::TraitItem
-import mod::statements::TupleLiteralExpr
-import mod::statements::UnaryExpr
-import mod::statements::WhileStmt
-
 import refrain::frontend::lexer::Token
 import refrain::frontend::lexer::TokenType
 
+import mod::statements::*
+
+import core::panic::panic
 import std::fmt::Debug
-import std::io::println
 import std::option::Option
 import std::string::String
-import std::string::as_str
+import std::string::byte_at
+import std::string::len
 import std::string::str_eq
 import std::vec::Vec
 
+
 pub struct Parser {
+    tokens: Vec[Token]
     consumed: usize
-    failed: bool
+    ast: Vec[Statement]
     parsing_match_header: bool
     parsing_control_flow_header: bool
-    tokens: Vec[Token]
-    items: Vec[Item]
-    blocks: Vec[Block]
-    exprs: Vec[Expr]
 }
+
 
 impl for Parser {
     pub fn new() -> Parser {
         ret Parser{
-            0_usize,
-            false,
-            false,
-            false,
             Vec[Token]::new(),
-            Vec[Item]::new(),
-            Vec[Block]::new(),
-            Vec[Expr]::new()
+            0_usize,
+            Vec[Statement]::new(),
+            false,
+            false
         }
     }
 
-    pub fn parse(mut self, tokens: Vec[Token]) -> Ast {
+    pub fn parse(mut self, tokens: Vec[Token]) -> Vec[Statement] {
+        self.tokens = tokens
         self.consumed = 0_usize
-        self.failed = false
+        self.ast = Vec[Statement]::new()
         self.parsing_match_header = false
         self.parsing_control_flow_header = false
-        self.tokens = tokens
-        self.items = Vec[Item]::new()
-        self.blocks = Vec[Block]::new()
-        self.exprs = Vec[Expr]::new()
 
         loop {
-            if self.is_at_end() || self.failed {
+            if self.is_at_end() {
                 break
             }
-            self.items = self.items.push(self.parse_top_level())
+            let statement = self.parse_top_level()
+            self.ast = self.ast.push(statement)
         }
 
-        ret Ast{self.items, self.blocks, self.exprs}
+        ret self.ast
     }
 
-    fn parse_top_level(mut self) -> Item {
-        if self.curr_type() == TokenType::KW_IMPL {
-            ret self.parse_impl()
-        }
+    fn mk_expr(self, value: Expr) -> ExprNode {
+        ret ExprNode{value}
+    }
 
+    fn box_expr(self, node: ExprNode) -> ExprNode<H> {
+        ret ExprNode<H>{node.value}
+    }
+
+    fn parse_top_level(mut self) -> Statement {
         let mut is_public = false
-        if self.curr_type() == TokenType::KW_PUB {
+        if self.peek_curr_type() == TokenType::KW_PUB {
             self.consume()
             is_public = true
         }
 
-        if self.curr_type() == TokenType::KW_IMPORT {
-            ret self.parse_import(is_public)
+        let curr_token = self.peek_curr()
+        match curr_token.type {
+            TokenType::KW_IMPORT => {
+                ret self.parse_import(is_public)
+            }
+            TokenType::KW_ENUM => {
+                ret self.parse_enum(is_public)
+            }
+            TokenType::KW_STRUCT => {
+                ret self.parse_struct(is_public)
+            }
+            TokenType::KW_TRAIT => {
+                ret self.parse_trait(is_public)
+            }
+            TokenType::KW_IMPL => {
+                ret self.parse_impl()
+            }
+            TokenType::KW_FN => {
+                ret self.parse_fn(is_public)
+            }
+            TokenType::KW_EXTERN => {
+                ret self.parse_extern(is_public)
+            }
+            _ => {
+                self.unexpected_token("top-level statement", curr_token)
+                ret Statement::Import(ImportStmt{false, String::new()})
+            }
         }
-        if self.curr_type() == TokenType::KW_STRUCT {
-            ret self.parse_struct(is_public)
+    }
+
+    fn parse_import(mut self, is_public: bool) -> Statement {
+        self.safe_consume(TokenType::KW_IMPORT)
+        let path = self.parse_import_path()
+        ret Statement::Import(ImportStmt{is_public, path})
+    }
+
+    fn parse_enum(mut self, is_public: bool) -> Statement {
+        self.safe_consume(TokenType::KW_ENUM)
+        let name = self.safe_consume_value(TokenType::IDENTIFIER)
+        let generics = self.parse_possible_generics()
+
+        let mut variants = Vec[EnumVariant]::new()
+        self.safe_consume(TokenType::LEFT_BRACE)
+        loop {
+            if self.peek_curr_type() == TokenType::RIGHT_BRACE {
+                break
+            }
+            variants = variants.push(self.parse_structure_shape())
+            let curr_type = self.peek_curr_type()
+            if curr_type == TokenType::COMMA {
+                self.consume()
+            }
+            elif curr_type == TokenType::RIGHT_BRACE {
+                break
+            }
         }
-        if self.curr_type() == TokenType::KW_ENUM {
-            ret self.parse_enum(is_public)
+        self.safe_consume(TokenType::RIGHT_BRACE)
+
+        ret Statement::EnumItem(EnumStmt{is_public, name, generics, variants})
+    }
+
+    fn parse_struct(mut self, is_public: bool) -> Statement {
+        self.safe_consume(TokenType::KW_STRUCT)
+        let shape = self.parse_structure_shape()
+        ret Statement::Struct(
+            StructStmt{
+                is_public,
+                shape.name,
+                shape.generics,
+                shape.named_fields,
+                shape.tuple_fields,
+                shape.is_tuple,
+                shape.is_unit
+            }
+        )
+    }
+
+    fn parse_trait(mut self, is_public: bool) -> Statement {
+        self.safe_consume(TokenType::KW_TRAIT)
+        let name = self.safe_consume_value(TokenType::IDENTIFIER)
+        let generics = self.parse_possible_generics()
+        let bases = self.parse_trait_bases()
+
+        let mut methods = Vec[FunctionItem]::new()
+        self.safe_consume(TokenType::LEFT_BRACE)
+        loop {
+            if self.peek_curr_type() == TokenType::RIGHT_BRACE {
+                break
+            }
+            methods = methods.push(self.parse_function_signature(false))
         }
-        if self.curr_type() == TokenType::KW_TRAIT {
-            ret self.parse_trait(is_public)
+        self.safe_consume(TokenType::RIGHT_BRACE)
+
+        ret Statement::Trait(TraitStmt{is_public, name, generics, bases, methods})
+    }
+
+    fn parse_impl(mut self) -> Statement {
+        self.safe_consume(TokenType::KW_IMPL)
+        let generics = self.parse_possible_generics()
+
+        let mut trait_name = Option[String]::None
+        let mut trait_args = Vec[String]::new()
+        if self.peek_curr_type() != TokenType::KW_FOR {
+            trait_name = Option[String]::Some(self.safe_consume_value(TokenType::IDENTIFIER))
+            trait_args = self.parse_possible_generics()
         }
-        if self.curr_type() == TokenType::KW_FN {
-            ret self.parse_function(is_public, false)
-        }
-        if self.curr_type() == TokenType::KW_EXTERN {
-            self.consume()
-            if self.curr_type() == TokenType::KW_FN {
-                ret self.parse_function(is_public, true)
+
+        self.safe_consume(TokenType::KW_FOR)
+        let target = self.parse_type()
+
+        let mut methods = Vec[FunctionItem]::new()
+        self.safe_consume(TokenType::LEFT_BRACE)
+        loop {
+            if self.peek_curr_type() == TokenType::RIGHT_BRACE {
+                break
             }
 
-            self.fail_current("Expected `fn` after `extern`")
-            ret Item::Import(ImportItem{false, String::from_str("<error>")})
+            let mut is_public = false
+            if self.peek_curr_type() == TokenType::KW_PUB {
+                self.consume()
+                is_public = true
+            }
+
+            let header = self.parse_function_signature(is_public)
+            let body = self.parse_block()
+            methods = methods.push(
+                FunctionItem{
+                    header.is_public,
+                    header.is_extern,
+                    header.name,
+                    header.generics,
+                    header.params,
+                    header.ret_type,
+                    Option[Block]::Some(body)
+                }
+            )
         }
+        self.safe_consume(TokenType::RIGHT_BRACE)
 
-        self.fail_current("Unsupported top-level item")
-        ret Item::Import(ImportItem{false, String::from_str("<error>")})
+        ret Statement::Impl(ImplStmt{generics, trait_name, trait_args, target, methods})
     }
 
-    fn parse_import(mut self, is_public: bool) -> Item {
-        self.expect(TokenType::KW_IMPORT)
-        let path = self.parse_import_path_text()
-        ret Item::Import(ImportItem{is_public, path})
+    fn parse_fn(mut self, is_public: bool) -> Statement {
+        let header = self.parse_function_signature(is_public)
+        let body = self.parse_block()
+        ret Statement::Function(
+            FunctionItem{
+                header.is_public,
+                header.is_extern,
+                header.name,
+                header.generics,
+                header.params,
+                header.ret_type,
+                Option[Block]::Some(body)
+            }
+        )
     }
 
-    fn parse_function(mut self, is_public: bool, is_extern: bool) -> Item {
-        ret Item::Function(self.parse_function_item(is_public, is_extern, true))
+    fn parse_extern(mut self, is_public: bool) -> Statement {
+        ret Statement::Function(self.parse_function_signature(is_public))
     }
 
-    fn parse_function_item(mut self, is_public: bool, is_extern: bool, allow_body: bool) -> FunctionItem {
-        self.expect(TokenType::KW_FN)
-        let name = self.expect_value(TokenType::IDENTIFIER)
-        let generics = self.parse_possible_generics_text()
-        let params = self.parse_function_params()
-
-        let mut ret_type: Option[String] = Option[String]::None
-        if self.curr_type() == TokenType::ARROW {
+    fn parse_function_signature(mut self, is_public: bool) -> FunctionItem {
+        let mut is_extern = false
+        if self.peek_curr_type() == TokenType::KW_EXTERN {
             self.consume()
-            ret_type = Option[String]::Some(self.parse_type_text())
+            is_extern = true
         }
 
-        let mut body: Option[usize] = Option[usize]::None
-        if allow_body && !is_extern && self.curr_type() == TokenType::LEFT_BRACE {
-            body = Option[usize]::Some(self.parse_block())
+        self.safe_consume(TokenType::KW_FN)
+        let name = self.safe_consume_value(TokenType::IDENTIFIER)
+        let generics = self.parse_possible_generics()
+
+        let mut params = Vec[FunctionParam]::new()
+        self.safe_consume(TokenType::LEFT_PAREN)
+        if self.peek_curr_type() != TokenType::RIGHT_PAREN {
+            params = params.push(self.parse_param())
+            loop {
+                if self.peek_curr_type() == TokenType::RIGHT_PAREN {
+                    break
+                }
+                self.safe_consume(TokenType::COMMA)
+                params = params.push(self.parse_param())
+            }
+        }
+        self.safe_consume(TokenType::RIGHT_PAREN)
+
+        let mut ret_type = Option[String]::None
+        if self.peek_curr_type() == TokenType::ARROW {
+            self.consume()
+            ret_type = Option[String]::Some(self.parse_type())
         }
 
         ret FunctionItem{
@@ -162,338 +266,194 @@ impl for Parser {
             generics,
             params,
             ret_type,
-            body
+            Option[Block]::None
         }
     }
 
-    fn parse_struct(mut self, is_public: bool) -> Item {
-        self.expect(TokenType::KW_STRUCT)
-        ret Item::Struct(StructItem{is_public, self.parse_struct_signature()})
-    }
+    fn parse_structure_shape(mut self) -> EnumVariant {
+        let name = self.safe_consume_value(TokenType::IDENTIFIER)
+        let generics = self.parse_possible_generics()
 
-    fn parse_enum(mut self, is_public: bool) -> Item {
-        self.expect(TokenType::KW_ENUM)
-        let name = self.expect_value(TokenType::IDENTIFIER)
-        let generics = self.parse_possible_generics_text()
-        let mut variants = Vec[StructSignature]::new()
-
-        self.expect(TokenType::LEFT_BRACE)
-        loop {
-            if self.curr_type() == TokenType::RIGHT_BRACE || self.failed {
-                break
-            }
-            variants = variants.push(self.parse_struct_signature())
-            if self.curr_type() != TokenType::COMMA {
-                break
-            }
-            self.consume()
-            if self.curr_type() == TokenType::RIGHT_BRACE {
-                break
-            }
-        }
-        self.expect(TokenType::RIGHT_BRACE)
-
-        ret Item::Enum(EnumItem{is_public, name, generics, variants})
-    }
-
-    fn parse_trait(mut self, is_public: bool) -> Item {
-        self.expect(TokenType::KW_TRAIT)
-        let name = self.expect_value(TokenType::IDENTIFIER)
-        let generics = self.parse_possible_generics_text()
-        let bases = self.parse_trait_bases()
-        let mut methods = Vec[FunctionItem]::new()
-
-        self.expect(TokenType::LEFT_BRACE)
-        loop {
-            if self.curr_type() == TokenType::RIGHT_BRACE || self.failed {
-                break
-            }
-
-            let mut method_is_public = false
-            if self.curr_type() == TokenType::KW_PUB {
-                self.consume()
-                method_is_public = true
-            }
-
-            methods = methods.push(self.parse_function_item(method_is_public, false, false))
-        }
-        self.expect(TokenType::RIGHT_BRACE)
-
-        ret Item::Trait(TraitItem{is_public, name, generics, bases, methods})
-    }
-
-    fn parse_impl(mut self) -> Item {
-        self.expect(TokenType::KW_IMPL)
-        let generics = self.parse_possible_generics_text()
-
-        let mut trait_name: Option[String] = Option[String]::None
-        if self.curr_type() != TokenType::KW_FOR {
-            trait_name = Option[String]::Some(self.parse_path_text())
-        }
-
-        self.expect(TokenType::KW_FOR)
-        let target = self.parse_type_text()
-        let mut methods = Vec[FunctionItem]::new()
-
-        self.expect(TokenType::LEFT_BRACE)
-        loop {
-            if self.curr_type() == TokenType::RIGHT_BRACE || self.failed {
-                break
-            }
-
-            let mut method_is_public = false
-            if self.curr_type() == TokenType::KW_PUB {
-                self.consume()
-                method_is_public = true
-            }
-
-            methods = methods.push(self.parse_function_item(method_is_public, false, true))
-        }
-        self.expect(TokenType::RIGHT_BRACE)
-
-        ret Item::Impl(ImplItem{generics, trait_name, target, methods})
-    }
-
-    fn parse_struct_signature(mut self) -> StructSignature {
-        let name = self.expect_value(TokenType::IDENTIFIER)
-        let generics = self.parse_possible_generics_text()
-
-        if self.curr_type() == TokenType::LEFT_BRACE {
+        if self.peek_curr_type() == TokenType::LEFT_BRACE {
             self.consume()
             let mut named_fields = Vec[NamedField]::new()
             loop {
-                if self.curr_type() == TokenType::RIGHT_BRACE || self.failed {
+                if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                     break
                 }
-
-                let field_name = self.expect_value(TokenType::IDENTIFIER)
-                self.expect(TokenType::COLON)
-                let field_type = self.parse_type_text()
+                let field_name = self.safe_consume_value(TokenType::IDENTIFIER)
+                self.safe_consume(TokenType::COLON)
+                let field_type = self.parse_type()
                 named_fields = named_fields.push(NamedField{field_name, field_type})
-
-                if self.curr_type() != TokenType::COMMA {
-                    break
+                let curr_type = self.peek_curr_type()
+                if curr_type == TokenType::COMMA {
+                    self.consume()
                 }
-                self.consume()
-                if self.curr_type() == TokenType::RIGHT_BRACE {
+                elif curr_type == TokenType::RIGHT_BRACE {
                     break
                 }
             }
-            self.expect(TokenType::RIGHT_BRACE)
-            ret StructSignature{name, generics, named_fields, Vec[String]::new(), false, false}
+            self.safe_consume(TokenType::RIGHT_BRACE)
+            ret EnumVariant{name, generics, named_fields, Vec[String]::new(), false, false}
         }
 
-        if self.curr_type() == TokenType::LEFT_PAREN {
+        if self.peek_curr_type() == TokenType::LEFT_PAREN {
             self.consume()
             let mut tuple_fields = Vec[String]::new()
-            loop {
-                if self.curr_type() == TokenType::RIGHT_PAREN || self.failed {
-                    break
-                }
-
-                tuple_fields = tuple_fields.push(self.parse_type_text())
-                if self.curr_type() != TokenType::COMMA {
-                    break
-                }
-                self.consume()
-                if self.curr_type() == TokenType::RIGHT_PAREN {
-                    break
+            if self.peek_curr_type() != TokenType::RIGHT_PAREN {
+                tuple_fields = tuple_fields.push(self.parse_type())
+                loop {
+                    if self.peek_curr_type() == TokenType::RIGHT_PAREN {
+                        break
+                    }
+                    self.safe_consume(TokenType::COMMA)
+                    if self.peek_curr_type() == TokenType::RIGHT_PAREN {
+                        break
+                    }
+                    tuple_fields = tuple_fields.push(self.parse_type())
                 }
             }
-            self.expect(TokenType::RIGHT_PAREN)
-            ret StructSignature{name, generics, Vec[NamedField]::new(), tuple_fields, true, false}
+            self.safe_consume(TokenType::RIGHT_PAREN)
+            ret EnumVariant{name, generics, Vec[NamedField]::new(), tuple_fields, true, false}
         }
 
-        ret StructSignature{name, generics, Vec[NamedField]::new(), Vec[String]::new(), false, true}
+        ret EnumVariant{name, generics, Vec[NamedField]::new(), Vec[String]::new(), false, true}
     }
 
-    fn parse_trait_bases(mut self) -> Vec[String] {
-        let mut bases = Vec[String]::new()
-        if self.curr_type() != TokenType::LESS {
-            ret bases
-        }
-
-        self.consume()
-        loop {
-            if self.curr_type() == TokenType::LEFT_BRACE || self.failed {
-                break
-            }
-
-            bases = bases.push(self.parse_type_text())
-            if self.curr_type() != TokenType::COMMA {
-                break
-            }
-            self.consume()
-        }
-
-        ret bases
-    }
-
-    fn parse_function_params(mut self) -> Vec[FunctionParam] {
-        let mut params = Vec[FunctionParam]::new()
-        self.expect(TokenType::LEFT_PAREN)
-        if self.curr_type() == TokenType::RIGHT_PAREN {
-            self.expect(TokenType::RIGHT_PAREN)
-            ret params
-        }
-
-        loop {
-            params = params.push(self.parse_param())
-            if self.curr_type() != TokenType::COMMA {
-                break
-            }
-            self.consume()
-            if self.curr_type() == TokenType::RIGHT_PAREN {
-                break
-            }
-        }
-        self.expect(TokenType::RIGHT_PAREN)
-        ret params
-    }
-
-    fn parse_param(mut self) -> FunctionParam {
-        if self.curr_ident_is("self") {
-            let name = self.consume_value()
-            let mut typ: Option[String] = Option[String]::None
-            if self.curr_type() == TokenType::COLON {
-                self.consume()
-                typ = Option[String]::Some(self.parse_type_text())
-            }
-            ret FunctionParam{name, typ}
-        }
-
-        if self.curr_type() == TokenType::KW_MUT {
-            self.consume()
-            if self.curr_ident_is("self") {
-                let name = self.consume_value()
-                let mut typ: Option[String] = Option[String]::Some(String::from_str("mut Self"))
-                if self.curr_type() == TokenType::COLON {
-                    self.consume()
-                    let mut out = String::from_str("mut ")
-                    let parsed = self.parse_type_text()
-                    out = out.concat(as_str(parsed))
-                    typ = Option[String]::Some(out)
-                }
-                ret FunctionParam{name, typ}
-            }
-            self.fail_current("Only `self` may use prefix `mut` in parameter position")
-            ret FunctionParam{String::from_str("<error>"), Option[String]::None}
-        }
-
-        let name = self.expect_value(TokenType::IDENTIFIER)
-        self.expect(TokenType::COLON)
-        ret FunctionParam{name, Option[String]::Some(self.parse_type_text())}
-    }
-
-    fn parse_block(mut self) -> usize {
-        self.expect(TokenType::LEFT_BRACE)
+    fn parse_block(mut self) -> Block {
+        self.safe_consume(TokenType::LEFT_BRACE)
         let mut statements = Vec[Statement]::new()
         loop {
-            if self.curr_type() == TokenType::RIGHT_BRACE || self.failed {
+            if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                 break
             }
             statements = statements.push(self.parse_inner_level())
         }
-        self.expect(TokenType::RIGHT_BRACE)
-        let block_id = self.blocks.len()
-        self.blocks = self.blocks.push(Block{statements})
-        ret block_id
+        self.safe_consume(TokenType::RIGHT_BRACE)
+        ret Block{statements}
     }
 
     fn parse_inner_level(mut self) -> Statement {
-        if self.curr_type() == TokenType::KW_LET {
-            ret self.parse_let()
+        let curr_token = self.peek_curr()
+        match curr_token.type {
+            TokenType::KW_RET => {
+                ret self.parse_ret()
+            }
+            TokenType::KW_LET => {
+                ret self.parse_let()
+            }
+            TokenType::KW_DO => {
+                ret self.parse_do_while()
+            }
+            TokenType::KW_WHILE => {
+                ret self.parse_while()
+            }
+            TokenType::KW_LOOP => {
+                ret self.parse_loop()
+            }
+            TokenType::KW_IF => {
+                ret self.parse_if_statement()
+            }
+            TokenType::KW_MATCH => {
+                ret self.parse_match_statement()
+            }
+            TokenType::KW_UNSAFE => {
+                if self.peek_next_type() == TokenType::KW_EHIR {
+                    ret self.parse_ehir_statement(true)
+                }
+                ret self.parse_unsafe_statement()
+            }
+            TokenType::KW_EHIR => {
+                ret self.parse_ehir_statement(false)
+            }
+            TokenType::KW_BREAK => {
+                ret self.parse_break()
+            }
+            TokenType::KW_CONTINUE => {
+                ret self.parse_continue()
+            }
+            _ => {
+                let expr = self.parse_expression()
+                let next_type = self.peek_curr_type()
+                if self.is_assignment_operator(next_type) {
+                    ret self.parse_assignment(expr)
+                }
+                ret Statement::Expr(expr)
+            }
         }
-        if self.curr_type() == TokenType::KW_RET {
-            ret self.parse_ret()
-        }
-        if self.curr_type() == TokenType::KW_WHILE {
-            ret self.parse_while()
-        }
-        if self.curr_type() == TokenType::KW_LOOP {
-            ret self.parse_loop()
-        }
-        if self.curr_type() == TokenType::KW_DO {
-            ret self.parse_do_while()
-        }
-        if self.curr_type() == TokenType::KW_IF {
-            ret self.parse_if()
-        }
-        if self.curr_type() == TokenType::KW_MATCH {
-            ret self.parse_match()
-        }
-        if self.curr_type() == TokenType::KW_BREAK {
-            self.consume()
-            ret Statement::Break
-        }
-        if self.curr_type() == TokenType::KW_CONTINUE {
-            self.consume()
-            ret Statement::Continue
-        }
+    }
 
-        let target = self.parse_expression()
-        if self.is_assignment_operator(self.curr_type()) {
-            ret self.parse_assignment_from_target(target)
-        }
-        ret Statement::Expr(target)
+    fn parse_ret(mut self) -> Statement {
+        self.safe_consume(TokenType::KW_RET)
+        ret Statement::Ret(self.parse_expression())
     }
 
     fn parse_let(mut self) -> Statement {
-        self.expect(TokenType::KW_LET)
+        self.safe_consume(TokenType::KW_LET)
         let mut is_mut = false
-        if self.curr_type() == TokenType::KW_MUT {
+        if self.peek_curr_type() == TokenType::KW_MUT {
             self.consume()
             is_mut = true
         }
-
-        let name = self.expect_value(TokenType::IDENTIFIER)
-        let mut typ: Option[String] = Option[String]::None
-        if self.curr_type() == TokenType::COLON {
+        let name = self.safe_consume_value(TokenType::IDENTIFIER)
+        let mut typ = Option[String]::None
+        if self.peek_curr_type() == TokenType::COLON {
             self.consume()
-            typ = Option[String]::Some(self.parse_type_text())
+            typ = Option[String]::Some(self.parse_type())
         }
-        self.expect(TokenType::ASSIGN)
+        self.safe_consume(TokenType::ASSIGN)
         let expr = self.parse_expression()
         ret Statement::Let(LetStmt{name, typ, expr, is_mut})
     }
 
-    fn parse_ret(mut self) -> Statement {
-        self.expect(TokenType::KW_RET)
-        ret Statement::Ret(self.parse_expression())
-    }
-
     fn parse_while(mut self) -> Statement {
-        self.expect(TokenType::KW_WHILE)
+        self.safe_consume(TokenType::KW_WHILE)
+        let label = self.parse_maybe_label()
         self.parsing_control_flow_header = true
         let condition = self.parse_expression()
         self.parsing_control_flow_header = false
-        ret Statement::While(WhileStmt{condition, self.parse_block()})
+        let body = self.parse_block()
+        ret Statement::While(WhileStmt{label, condition, body})
     }
 
     fn parse_loop(mut self) -> Statement {
-        self.expect(TokenType::KW_LOOP)
-        ret Statement::Loop(LoopStmt{self.parse_block()})
+        self.safe_consume(TokenType::KW_LOOP)
+        let label = self.parse_maybe_label()
+        let body = self.parse_block()
+        ret Statement::Loop(LoopStmt{label, body})
+    }
+
+    fn parse_break(mut self) -> Statement {
+        self.safe_consume(TokenType::KW_BREAK)
+        ret Statement::Break(self.parse_maybe_label())
+    }
+
+    fn parse_continue(mut self) -> Statement {
+        self.safe_consume(TokenType::KW_CONTINUE)
+        ret Statement::Continue(self.parse_maybe_label())
     }
 
     fn parse_do_while(mut self) -> Statement {
-        self.expect(TokenType::KW_DO)
+        self.safe_consume(TokenType::KW_DO)
         let body = self.parse_block()
-        self.expect(TokenType::KW_WHILE)
+        self.safe_consume(TokenType::KW_WHILE)
         self.parsing_control_flow_header = true
         let condition = self.parse_expression()
         self.parsing_control_flow_header = false
         ret Statement::DoWhile(DoWhileStmt{body, condition})
     }
 
-    fn parse_if(mut self) -> Statement {
-        self.expect(TokenType::KW_IF)
+    fn parse_if_statement(mut self) -> Statement {
+        self.safe_consume(TokenType::KW_IF)
         self.parsing_control_flow_header = true
         let first_condition = self.parse_expression()
         self.parsing_control_flow_header = false
-        let mut branches = Vec[IfBranch]::new().push(IfBranch{first_condition, self.parse_block()})
+
+        let mut branches = Vec[IfBranch]::new()
+        branches = branches.push(IfBranch{first_condition, self.parse_block()})
 
         loop {
-            if self.curr_type() != TokenType::KW_ELIF {
+            if self.peek_curr_type() != TokenType::KW_ELIF {
                 break
             }
             self.consume()
@@ -503,617 +463,1101 @@ impl for Parser {
             branches = branches.push(IfBranch{condition, self.parse_block()})
         }
 
-        let mut else_body: Option[usize] = Option[usize]::None
-        if self.curr_type() == TokenType::KW_ELSE {
+        let mut else_body = Option[Block]::None
+        if self.peek_curr_type() == TokenType::KW_ELSE {
             self.consume()
-            else_body = Option[usize]::Some(self.parse_block())
+            else_body = Option[Block]::Some(self.parse_block())
         }
 
         ret Statement::If(IfStmt{branches, else_body})
     }
 
-    fn parse_match(mut self) -> Statement {
-        self.expect(TokenType::KW_MATCH)
+    fn parse_if_expression(mut self) -> ExprNode {
+        self.safe_consume(TokenType::KW_IF)
+        self.parsing_control_flow_header = true
+        let first_condition = self.parse_expression()
+        self.parsing_control_flow_header = false
+
+        let mut branches = Vec[IfExprBranch]::new()
+        branches = branches.push(IfExprBranch{first_condition, self.parse_expression_block()})
+
+        loop {
+            if self.peek_curr_type() != TokenType::KW_ELIF {
+                break
+            }
+            self.consume()
+            self.parsing_control_flow_header = true
+            let condition = self.parse_expression()
+            self.parsing_control_flow_header = false
+            branches = branches.push(IfExprBranch{condition, self.parse_expression_block()})
+        }
+
+        if self.peek_curr_type() != TokenType::KW_ELSE {
+            panic("If expression must have else branch")
+            ret self.mk_expr(Expr::Path(String::new()))
+        }
+        self.consume()
+        let else_body = self.parse_expression_block()
+        ret self.mk_expr(Expr::If(IfExpr{branches, self.box_expr(else_body)}))
+    }
+
+    fn parse_unsafe_statement(mut self) -> Statement {
+        self.safe_consume(TokenType::KW_UNSAFE)
+        ret Statement::Unsafe(self.parse_block())
+    }
+
+    fn parse_unsafe_expression(mut self) -> ExprNode {
+        self.safe_consume(TokenType::KW_UNSAFE)
+        ret self.mk_expr(Expr::Unsafe(self.parse_block()))
+    }
+
+    fn parse_ehir_statement(mut self, is_unsafe: bool) -> Statement {
+        if is_unsafe {
+            self.safe_consume(TokenType::KW_UNSAFE)
+        }
+        self.safe_consume(TokenType::KW_EHIR)
+        self.safe_consume(TokenType::LEFT_BRACE)
+
+        let mut body = String::new()
+        loop {
+            if self.peek_curr_type() == TokenType::RIGHT_BRACE {
+                break
+            }
+            let token = self.consume()
+            body = body.concat(token.value.as_str())
+            body = body.concat(" ")
+        }
+        self.safe_consume(TokenType::RIGHT_BRACE)
+
+        ret Statement::Ehir(EhirStmt{is_unsafe, body})
+    }
+
+    fn parse_match_statement(mut self) -> Statement {
+        self.safe_consume(TokenType::KW_MATCH)
         self.parsing_match_header = true
         let expr = self.parse_expression()
         self.parsing_match_header = false
-        self.expect(TokenType::LEFT_BRACE)
+
         let mut arms = Vec[MatchArm]::new()
+        self.safe_consume(TokenType::LEFT_BRACE)
         loop {
-            if self.curr_type() == TokenType::RIGHT_BRACE || self.failed {
+            if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                 break
             }
-            arms = arms.push(self.parse_match_arm())
+            let pattern = self.parse_match_pattern()
+            self.safe_consume(TokenType::FAT_ARROW)
+            let body = self.parse_statement_match_body()
+            arms = arms.push(MatchArm{pattern, body})
         }
-        self.expect(TokenType::RIGHT_BRACE)
+        self.safe_consume(TokenType::RIGHT_BRACE)
+
         ret Statement::Match(MatchStmt{expr, arms})
     }
 
-    fn parse_match_arm(mut self) -> MatchArm {
-        let mut path: Option[String] = Option[String]::None
-        if self.curr_ident_is("_") {
-            self.consume()
-        }
-        else {
-            path = Option[String]::Some(self.parse_path_text())
-        }
-
-        let mut binding: Option[String] = Option[String]::None
-        if self.curr_type() == TokenType::LEFT_PAREN {
-            self.consume()
-            binding = Option[String]::Some(self.expect_value(TokenType::IDENTIFIER))
-            self.expect(TokenType::RIGHT_PAREN)
-        }
-
-        self.expect(TokenType::FAT_ARROW)
-        ret MatchArm{MatchPattern{path, binding}, self.parse_block()}
-    }
-
-    fn parse_assignment_from_target(mut self, target: usize) -> Statement {
-        let operator = self.consume_value()
+    fn parse_match_expression(mut self) -> ExprNode {
+        self.safe_consume(TokenType::KW_MATCH)
+        self.parsing_match_header = true
         let expr = self.parse_expression()
-        ret Statement::Assignment(AssignmentStmt{target, operator, expr})
+        self.parsing_match_header = false
+
+        let mut arms = Vec[MatchExprArm]::new()
+        self.safe_consume(TokenType::LEFT_BRACE)
+        loop {
+            if self.peek_curr_type() == TokenType::RIGHT_BRACE {
+                break
+            }
+            let pattern = self.parse_match_pattern()
+            self.safe_consume(TokenType::FAT_ARROW)
+            let arm_expr = self.parse_expression()
+            arms = arms.push(MatchExprArm{pattern, arm_expr})
+        }
+        self.safe_consume(TokenType::RIGHT_BRACE)
+
+        ret self.mk_expr(Expr::Match(MatchExpr{self.box_expr(expr), arms}))
     }
 
-    fn parse_expression(mut self) -> usize {
+    fn parse_match_pattern(mut self) -> MatchPattern {
+        let curr_token = self.peek_curr()
+
+        if curr_token.type == TokenType::IDENTIFIER && str_eq(curr_token.value.as_str(), "_") {
+            self.consume()
+            ret MatchPattern{String::from_str("wildcard"), Option[String]::None, Option[String]::None}
+        }
+
+        if curr_token.type == TokenType::MINUS {
+            self.consume()
+            let next_type = self.peek_curr_type()
+            if next_type == TokenType::INTEGER {
+                let value = self.literal_value(self.parse_integer_literal())
+                ret MatchPattern{String::from_str("integer"), Option[String]::Some(value), Option[String]::None}
+            }
+            if next_type == TokenType::FLOAT {
+                let value = self.literal_value(self.parse_float_literal())
+                ret MatchPattern{String::from_str("float"), Option[String]::Some(value), Option[String]::None}
+            }
+            panic("Match pattern '-' must be followed by numeric literal")
+            ret MatchPattern{String::from_str("invalid"), Option[String]::None, Option[String]::None}
+        }
+
+        if curr_token.type == TokenType::STRING {
+            let value = self.safe_consume_value(TokenType::STRING)
+            ret MatchPattern{String::from_str("string"), Option[String]::Some(value), Option[String]::None}
+        }
+
+        if curr_token.type == TokenType::INTEGER {
+            let value = self.literal_value(self.parse_integer_literal())
+            ret MatchPattern{String::from_str("integer"), Option[String]::Some(value), Option[String]::None}
+        }
+
+        if curr_token.type == TokenType::FLOAT {
+            let value = self.literal_value(self.parse_float_literal())
+            ret MatchPattern{String::from_str("float"), Option[String]::Some(value), Option[String]::None}
+        }
+
+        if curr_token.type == TokenType::BOOLEAN {
+            let token = self.consume()
+            ret MatchPattern{String::from_str("bool"), Option[String]::Some(token.value), Option[String]::None}
+        }
+
+        let path = self.parse_path()
+        let mut binding = Option[String]::None
+        if self.peek_curr_type() == TokenType::LEFT_PAREN {
+            self.consume()
+            binding = Option[String]::Some(self.safe_consume_value(TokenType::IDENTIFIER))
+            self.safe_consume(TokenType::RIGHT_PAREN)
+        }
+        ret MatchPattern{String::from_str("path"), Option[String]::Some(path), binding}
+    }
+
+    fn parse_statement_match_body(mut self) -> MatchArmBody {
+        if self.peek_curr_type() == TokenType::LEFT_BRACE {
+            ret MatchArmBody::Block(self.parse_block())
+        }
+        ret MatchArmBody::Expr(self.parse_expression())
+    }
+
+    fn parse_expression(mut self) -> ExprNode {
         ret self.parse_logical_or()
     }
 
-    fn parse_logical_or(mut self) -> usize {
+    fn parse_logical_or(mut self) -> ExprNode {
         let mut left = self.parse_logical_and()
         loop {
-            if self.curr_type() != TokenType::PIPE_PIPE {
+            let operator = self.peek_curr()
+            if operator.type != TokenType::PIPE_PIPE {
                 break
             }
-            let operator = self.consume_value()
+            self.consume()
             let right = self.parse_logical_and()
-            left = self.push_expr(Expr::Binary(BinaryExpr{left, operator, right}))
+            left = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(left), operator.value, self.box_expr(right)}))
         }
         ret left
     }
 
-    fn parse_logical_and(mut self) -> usize {
+    fn parse_logical_and(mut self) -> ExprNode {
+        let mut left = self.parse_bitwise_or()
+        loop {
+            let operator = self.peek_curr()
+            if operator.type != TokenType::AND_AND {
+                break
+            }
+            self.consume()
+            let right = self.parse_bitwise_or()
+            left = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(left), operator.value, self.box_expr(right)}))
+        }
+        ret left
+    }
+
+    fn parse_bitwise_or(mut self) -> ExprNode {
+        let mut left = self.parse_bitwise_xor()
+        loop {
+            let operator = self.peek_curr()
+            if operator.type != TokenType::PIPE {
+                break
+            }
+            self.consume()
+            let right = self.parse_bitwise_xor()
+            left = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(left), operator.value, self.box_expr(right)}))
+        }
+        ret left
+    }
+
+    fn parse_bitwise_xor(mut self) -> ExprNode {
+        let mut left = self.parse_bitwise_and()
+        loop {
+            let operator = self.peek_curr()
+            if operator.type != TokenType::CARET {
+                break
+            }
+            self.consume()
+            let right = self.parse_bitwise_and()
+            left = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(left), operator.value, self.box_expr(right)}))
+        }
+        ret left
+    }
+
+    fn parse_bitwise_and(mut self) -> ExprNode {
         let mut left = self.parse_equality()
         loop {
-            if self.curr_type() != TokenType::AND_AND {
+            let operator = self.peek_curr()
+            if operator.type != TokenType::AMPERSAND {
                 break
             }
-            let operator = self.consume_value()
+            self.consume()
             let right = self.parse_equality()
-            left = self.push_expr(Expr::Binary(BinaryExpr{left, operator, right}))
+            left = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(left), operator.value, self.box_expr(right)}))
         }
         ret left
     }
 
-    fn parse_equality(mut self) -> usize {
+    fn parse_equality(mut self) -> ExprNode {
         let mut left = self.parse_relational()
         loop {
-            let curr_type = self.curr_type()
-            if curr_type != TokenType::EQUAL_EQUAL && curr_type != TokenType::BANG_EQUAL {
+            let operator = self.peek_curr()
+            if operator.type != TokenType::EQUAL_EQUAL && operator.type != TokenType::BANG_EQUAL {
                 break
             }
-            let operator = self.consume_value()
+            self.consume()
             let right = self.parse_relational()
-            left = self.push_expr(Expr::Binary(BinaryExpr{left, operator, right}))
+            left = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(left), operator.value, self.box_expr(right)}))
         }
         ret left
     }
 
-    fn parse_relational(mut self) -> usize {
+    fn parse_relational(mut self) -> ExprNode {
+        let mut left = self.parse_shift()
+        loop {
+            let operator = self.peek_curr()
+            if !self.is_relational_operator(operator.type) {
+                break
+            }
+            self.consume()
+            let right = self.parse_shift()
+            left = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(left), operator.value, self.box_expr(right)}))
+        }
+        ret left
+    }
+
+    fn parse_shift(mut self) -> ExprNode {
         let mut left = self.parse_additive()
         loop {
-            let curr_type = self.curr_type()
-            if curr_type != TokenType::LESS && curr_type != TokenType::LESS_EQUAL &&
-               curr_type != TokenType::GREATER && curr_type != TokenType::GREATER_EQUAL {
+            let operator = self.peek_curr()
+            if operator.type != TokenType::LEFT_SHIFT && operator.type != TokenType::RIGHT_SHIFT {
                 break
             }
-            let operator = self.consume_value()
+            self.consume()
             let right = self.parse_additive()
-            left = self.push_expr(Expr::Binary(BinaryExpr{left, operator, right}))
+            left = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(left), operator.value, self.box_expr(right)}))
         }
         ret left
     }
 
-    fn parse_additive(mut self) -> usize {
+    fn parse_additive(mut self) -> ExprNode {
         let mut left = self.parse_multiplicative()
         loop {
-            let curr_type = self.curr_type()
-            if curr_type != TokenType::PLUS && curr_type != TokenType::MINUS {
+            let operator = self.peek_curr()
+            if operator.type != TokenType::PLUS && operator.type != TokenType::MINUS {
                 break
             }
-            let operator = self.consume_value()
+            self.consume()
             let right = self.parse_multiplicative()
-            left = self.push_expr(Expr::Binary(BinaryExpr{left, operator, right}))
+            left = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(left), operator.value, self.box_expr(right)}))
         }
         ret left
     }
 
-    fn parse_multiplicative(mut self) -> usize {
+    fn parse_multiplicative(mut self) -> ExprNode {
         let mut left = self.parse_unary()
         loop {
-            let curr_type = self.curr_type()
-            if curr_type != TokenType::ASTERISK && curr_type != TokenType::SLASH && curr_type != TokenType::PERCENT {
+            let operator = self.peek_curr()
+            if operator.type != TokenType::ASTERISK && operator.type != TokenType::SLASH && operator.type != TokenType::PERCENT {
                 break
             }
-            let operator = self.consume_value()
+            self.consume()
             let right = self.parse_unary()
-            left = self.push_expr(Expr::Binary(BinaryExpr{left, operator, right}))
+            left = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(left), operator.value, self.box_expr(right)}))
         }
         ret left
     }
 
-    fn parse_unary(mut self) -> usize {
-        let curr_type = self.curr_type()
-        if curr_type == TokenType::PLUS || curr_type == TokenType::MINUS || curr_type == TokenType::BANG {
-            let operator = self.consume_value()
+    fn parse_unary(mut self) -> ExprNode {
+        let token = self.peek_curr()
+        if self.is_unary_operator(token.type) {
+            self.consume()
             let expr = self.parse_unary()
-            ret self.push_expr(Expr::Unary(UnaryExpr{operator, expr}))
+            ret self.mk_expr(Expr::Unary(UnaryExpr{token.value, self.box_expr(expr)}))
         }
         ret self.parse_postfix()
     }
 
-    fn parse_postfix(mut self) -> usize {
+    fn parse_postfix(mut self) -> ExprNode {
         let mut expr = self.parse_primary()
         loop {
-            let curr_type = self.curr_type()
+            let curr_type = self.peek_curr_type()
             if curr_type == TokenType::LEFT_PAREN {
-                let args = self.parse_call_args()
-                expr = self.push_expr(Expr::Call(CallExpr{expr, args}))
+                expr = self.parse_call(expr)
+                continue
             }
-            elif curr_type == TokenType::DOT {
+            if curr_type == TokenType::DOT {
+                expr = self.parse_dotted_postfix(expr)
+                continue
+            }
+            if curr_type == TokenType::LEFT_BRACKET {
+                expr = self.parse_index_postfix(expr)
+                continue
+            }
+            if curr_type == TokenType::QUESTION {
                 self.consume()
-                let member = self.expect_value(TokenType::IDENTIFIER)
-                if self.curr_type() == TokenType::LEFT_PAREN {
-                    let args = self.parse_call_args()
-                    expr = self.push_expr(Expr::MethodCall(MethodCallExpr{expr, member, args}))
-                }
-                else {
-                    expr = self.push_expr(Expr::Field(FieldExpr{expr, member}))
-                }
+                expr = self.mk_expr(Expr::Try(self.box_expr(expr)))
+                continue
             }
-            else {
-                break
-            }
+            break
         }
         ret expr
     }
 
-    fn parse_primary(mut self) -> usize {
-        let token = self.peek_curr()
-        if token.type == TokenType::KW_MATCH {
-            ret self.parse_match_expression()
-        }
-        if token.type == TokenType::INTEGER {
-            ret self.parse_integer_literal()
-        }
-        if token.type == TokenType::FLOAT {
-            ret self.parse_float_literal()
-        }
-        if token.type == TokenType::BOOLEAN {
-            let bool_value = str_eq(as_str(self.consume_value()), "true")
-            ret self.push_expr(Expr::Boolean(bool_value))
-        }
-        if token.type == TokenType::STRING {
-            let string_value = self.consume_value()
-            ret self.push_expr(Expr::StringLiteral(string_value))
-        }
-        if token.type == TokenType::LEFT_PAREN {
-            ret self.parse_parenthesized_or_tuple()
-        }
-        if token.type == TokenType::IDENTIFIER {
-            let path = self.parse_path_text()
-            if self.curr_type() == TokenType::LEFT_BRACE {
-                ret self.parse_struct_init(path)
+    fn parse_integer_literal(mut self) -> ExprNode {
+        let mut value = self.safe_consume_value(TokenType::INTEGER)
+        match self.parse_numeric_literal_suffix() {
+            Option[String]::Some(text) => {
+                value = value.concat(text.as_str())
             }
-            ret self.push_expr(Expr::Path(path))
+            Option[String]::None => {}
         }
-
-        self.fail_current("Unable to parse primary expression")
-        ret self.push_expr(Expr::Path(String::from_str("<error>")))
+        ret self.mk_expr(Expr::Integer(value))
     }
 
-    fn parse_match_expression(mut self) -> usize {
-        self.expect(TokenType::KW_MATCH)
-        self.parsing_match_header = true
-        let expr = self.parse_expression()
-        self.parsing_match_header = false
-        self.expect(TokenType::LEFT_BRACE)
-
-        let mut arms = Vec[MatchExprArm]::new()
-        loop {
-            if self.curr_type() == TokenType::RIGHT_BRACE || self.failed {
-                break
+    fn parse_float_literal(mut self) -> ExprNode {
+        let mut value = self.safe_consume_value(TokenType::FLOAT)
+        match self.parse_numeric_literal_suffix() {
+            Option[String]::Some(text) => {
+                value = value.concat(text.as_str())
             }
-            arms = arms.push(self.parse_match_expression_arm())
+            Option[String]::None => {}
         }
-        self.expect(TokenType::RIGHT_BRACE)
-
-        ret self.push_expr(Expr::Match(MatchExpr{expr, arms}))
+        ret self.mk_expr(Expr::Float(value))
     }
 
-    fn parse_match_expression_arm(mut self) -> MatchExprArm {
-        let mut path: Option[String] = Option[String]::None
-        if self.curr_ident_is("_") {
+    fn parse_parenthesized_or_tuple(mut self) -> ExprNode {
+        self.safe_consume(TokenType::LEFT_PAREN)
+        if self.peek_curr_type() == TokenType::RIGHT_PAREN {
             self.consume()
-        }
-        else {
-            path = Option[String]::Some(self.parse_path_text())
-        }
-
-        let mut binding: Option[String] = Option[String]::None
-        if self.curr_type() == TokenType::LEFT_PAREN {
-            self.consume()
-            binding = Option[String]::Some(self.expect_value(TokenType::IDENTIFIER))
-            self.expect(TokenType::RIGHT_PAREN)
-        }
-
-        self.expect(TokenType::FAT_ARROW)
-
-        let mut expr = 0_usize
-        if self.curr_type() == TokenType::LEFT_BRACE {
-            expr = self.push_expr(Expr::Block(self.parse_block()))
-        }
-        else {
-            expr = self.parse_expression()
-        }
-
-        ret MatchExprArm{MatchPattern{path, binding}, expr}
-    }
-
-    fn parse_parenthesized_or_tuple(mut self) -> usize {
-        self.expect(TokenType::LEFT_PAREN)
-        if self.curr_type() == TokenType::RIGHT_PAREN {
-            self.expect(TokenType::RIGHT_PAREN)
-            ret self.push_expr(Expr::TupleLiteral(TupleLiteralExpr{Vec[usize]::new()}))
+            ret self.mk_expr(Expr::TupleLiteral(TupleLiteralExpr{Vec[ExprNode]::new()}))
         }
 
         let first = self.parse_expression()
-        if self.curr_type() != TokenType::COMMA {
-            self.expect(TokenType::RIGHT_PAREN)
-            ret self.push_expr(Expr::Parenthesized(first))
+        if self.peek_curr_type() != TokenType::COMMA {
+            self.safe_consume(TokenType::RIGHT_PAREN)
+            ret self.mk_expr(Expr::Parenthesized(self.box_expr(first)))
         }
 
-        let mut items = Vec[usize]::new().push(first)
+        let mut items = Vec[ExprNode]::new()
+        items = items.push(first)
         loop {
-            if self.curr_type() != TokenType::COMMA {
+            if self.peek_curr_type() != TokenType::COMMA {
                 break
             }
             self.consume()
-            if self.curr_type() == TokenType::RIGHT_PAREN {
+            if self.peek_curr_type() == TokenType::RIGHT_PAREN {
                 break
             }
             items = items.push(self.parse_expression())
         }
-        self.expect(TokenType::RIGHT_PAREN)
-        ret self.push_expr(Expr::TupleLiteral(TupleLiteralExpr{items}))
+        self.safe_consume(TokenType::RIGHT_PAREN)
+        ret self.mk_expr(Expr::TupleLiteral(TupleLiteralExpr{items}))
     }
 
-    fn parse_struct_init(mut self, path: String) -> usize {
-        self.expect(TokenType::LEFT_BRACE)
-        let mut values = Vec[usize]::new()
+    fn parse_array_literal(mut self) -> ExprNode {
+        self.safe_consume(TokenType::LEFT_BRACKET)
+        if self.peek_curr_type() == TokenType::RIGHT_BRACKET {
+            self.consume()
+            ret self.mk_expr(Expr::ArrayLiteral(ArrayLiteralExpr{Vec[ExprNode]::new()}))
+        }
+
+        let first = self.parse_expression()
+        if self.peek_curr_type() == TokenType::SEMICOLON {
+            self.consume()
+            let size = self.safe_consume_value(TokenType::INTEGER)
+            self.safe_consume(TokenType::RIGHT_BRACKET)
+            ret self.mk_expr(Expr::ArrayRepeat(ArrayRepeatExpr{self.box_expr(first), size}))
+        }
+
+        let mut items = Vec[ExprNode]::new()
+        items = items.push(first)
         loop {
-            if self.curr_type() == TokenType::RIGHT_BRACE || self.failed {
-                break
-            }
-            values = values.push(self.parse_expression())
-            if self.curr_type() != TokenType::COMMA {
+            if self.peek_curr_type() != TokenType::COMMA {
                 break
             }
             self.consume()
-            if self.curr_type() == TokenType::RIGHT_BRACE {
+            if self.peek_curr_type() == TokenType::RIGHT_BRACKET {
                 break
             }
+            items = items.push(self.parse_expression())
         }
-        self.expect(TokenType::RIGHT_BRACE)
-        ret self.push_expr(Expr::StructInit(StructInitExpr{path, values}))
+        self.safe_consume(TokenType::RIGHT_BRACKET)
+        ret self.mk_expr(Expr::ArrayLiteral(ArrayLiteralExpr{items}))
     }
 
-    fn parse_integer_literal(mut self) -> usize {
-        let mut value = self.expect_value(TokenType::INTEGER)
-        let suffix = self.parse_numeric_literal_suffix()
-        match suffix {
-            Some(suffix_value) => {
-                value = value.concat(as_str(suffix_value))
+    fn parse_expression_block(mut self) -> ExprNode {
+        self.safe_consume(TokenType::LEFT_BRACE)
+        let mut statements = Vec[Statement]::new()
+        loop {
+            if !self.starts_expression_block_statement() {
+                break
             }
-            None => {}
+            statements = statements.push(self.parse_inner_level())
         }
-        ret self.push_expr(Expr::Integer(value))
+        let tail = self.parse_expression()
+        self.safe_consume(TokenType::RIGHT_BRACE)
+        ret self.mk_expr(Expr::Block(BlockExpr{statements, self.box_expr(tail)}))
     }
 
-    fn parse_float_literal(mut self) -> usize {
-        let mut value = self.expect_value(TokenType::FLOAT)
-        let suffix = self.parse_numeric_literal_suffix()
-        match suffix {
-            Some(suffix_value) => {
-                value = value.concat(as_str(suffix_value))
-            }
-            None => {}
+    fn starts_expression_block_statement(self) -> bool {
+        let token_type = self.peek_curr_type()
+        if token_type == TokenType::KW_LET
+            || token_type == TokenType::KW_RET
+            || token_type == TokenType::KW_WHILE
+            || token_type == TokenType::KW_LOOP
+            || token_type == TokenType::KW_DO
+            || token_type == TokenType::KW_EHIR
+            || token_type == TokenType::KW_BREAK
+            || token_type == TokenType::KW_CONTINUE {
+            ret true
         }
-        ret self.push_expr(Expr::Float(value))
+
+        if token_type == TokenType::KW_UNSAFE && self.peek_next_type() == TokenType::KW_EHIR {
+            ret true
+        }
+
+        if token_type == TokenType::KW_IF
+            || token_type == TokenType::KW_MATCH
+            || token_type == TokenType::KW_UNSAFE
+            || token_type == TokenType::RIGHT_BRACE
+            || token_type == TokenType::EOF {
+            ret false
+        }
+
+        if token_type != TokenType::IDENTIFIER {
+            ret false
+        }
+        ret self.starts_assignment_statement()
+    }
+
+    fn starts_assignment_statement(self) -> bool {
+        let mut index = 0_usize
+        if self.peek_nth_type(index) != TokenType::IDENTIFIER {
+            ret false
+        }
+
+        loop {
+            index = index + 1_usize
+
+            if self.peek_nth_type(index) == TokenType::LEFT_BRACKET {
+                let mut depth = 1_usize
+                index = index + 1_usize
+                loop {
+                    let token_type = self.peek_nth_type(index)
+                    if token_type == TokenType::LEFT_BRACKET {
+                        depth = depth + 1_usize
+                    }
+                    elif token_type == TokenType::RIGHT_BRACKET {
+                        depth = depth - 1_usize
+                        if depth == 0_usize {
+                            index = index + 1_usize
+                            break
+                        }
+                    }
+                    elif token_type == TokenType::EOF {
+                        ret false
+                    }
+                    index = index + 1_usize
+                }
+            }
+
+            let next_type = self.peek_nth_type(index)
+            if next_type == TokenType::SCOPE {
+                index = index + 1_usize
+                if self.peek_nth_type(index) != TokenType::IDENTIFIER {
+                    ret false
+                }
+                continue
+            }
+
+            if next_type == TokenType::DOT {
+                index = index + 1_usize
+                let member_type = self.peek_nth_type(index)
+                if member_type != TokenType::IDENTIFIER && member_type != TokenType::INTEGER {
+                    ret false
+                }
+                continue
+            }
+
+            ret self.is_assignment_operator(next_type)
+        }
+    }
+
+    fn parse_struct_initialization(mut self, path: String) -> ExprNode {
+        self.safe_consume(TokenType::LEFT_BRACE)
+        let mut values = Vec[ExprNode]::new()
+        if self.peek_curr_type() != TokenType::RIGHT_BRACE {
+            values = values.push(self.parse_expression())
+            loop {
+                if self.peek_curr_type() != TokenType::COMMA {
+                    break
+                }
+                self.consume()
+                if self.peek_curr_type() == TokenType::RIGHT_BRACE {
+                    break
+                }
+                values = values.push(self.parse_expression())
+            }
+        }
+        self.safe_consume(TokenType::RIGHT_BRACE)
+        ret self.mk_expr(Expr::StructInit(StructInitExpr{path, values}))
+    }
+
+    fn parse_call(mut self, callee: ExprNode) -> ExprNode {
+        let args = self.parse_call_args()
+        ret self.mk_expr(Expr::Call(CallExpr{self.box_expr(callee), Vec[String]::new(), args}))
+    }
+
+    fn parse_call_args(mut self) -> Vec[ExprNode] {
+        let mut args = Vec[ExprNode]::new()
+        self.safe_consume(TokenType::LEFT_PAREN)
+        if self.peek_curr_type() != TokenType::RIGHT_PAREN {
+            args = args.push(self.parse_expression())
+            loop {
+                if self.peek_curr_type() != TokenType::COMMA {
+                    break
+                }
+                self.consume()
+                if self.peek_curr_type() == TokenType::RIGHT_PAREN {
+                    break
+                }
+                args = args.push(self.parse_expression())
+            }
+        }
+        self.safe_consume(TokenType::RIGHT_PAREN)
+        ret args
+    }
+
+    fn parse_dotted_postfix(mut self, base: ExprNode) -> ExprNode {
+        let mut expr = base
+        loop {
+            if self.peek_curr_type() != TokenType::DOT {
+                break
+            }
+            self.consume()
+            let member_token = self.peek_curr()
+            if member_token.type != TokenType::IDENTIFIER && member_token.type != TokenType::INTEGER {
+                self.unexpected_token("field or method name", member_token)
+                ret expr
+            }
+            let member = self.consume_value()
+            let member_generics = self.parse_possible_generics()
+
+            if self.peek_curr_type() == TokenType::LEFT_PAREN {
+                let args = self.parse_call_args()
+                expr = self.mk_expr(
+                    Expr::MethodCall(MethodCallExpr{self.box_expr(expr), member, member_generics, args})
+                )
+                continue
+            }
+
+            if member_generics.len() > 0_usize {
+                panic("Field can not have generic arguments")
+                ret expr
+            }
+
+            expr = self.mk_expr(Expr::Field(FieldExpr{self.box_expr(expr), member}))
+        }
+        ret expr
+    }
+
+    fn parse_index_postfix(mut self, base: ExprNode) -> ExprNode {
+        let mut expr = base
+        loop {
+            if self.peek_curr_type() != TokenType::LEFT_BRACKET {
+                break
+            }
+            self.consume()
+            let index = self.parse_expression()
+            self.safe_consume(TokenType::RIGHT_BRACKET)
+            expr = self.mk_expr(Expr::Index(IndexExpr{self.box_expr(expr), self.box_expr(index)}))
+        }
+        ret expr
+    }
+
+    fn parse_path(mut self) -> String {
+        let mut path = self.parse_expression_path_segment()
+        loop {
+            if self.peek_curr_type() != TokenType::SCOPE {
+                break
+            }
+            self.consume()
+            path = path.concat("::")
+            let segment = self.parse_expression_path_segment()
+            path = path.concat(segment.as_str())
+        }
+        ret path
+    }
+
+    fn parse_expression_path_segment(mut self) -> String {
+        let name = self.safe_consume_value(TokenType::IDENTIFIER)
+        let generics = self.parse_possible_expression_generics()
+        let mut out = name
+        if generics.len() > 0_usize {
+            let joined = self.join_strings(generics, ", ")
+            out = out.concat("[")
+            out = out.concat(joined.as_str())
+            out = out.concat("]")
+        }
+        if self.is_smart_pointer_suffix() {
+            self.safe_consume(TokenType::LESS)
+            let pointer = self.safe_consume_value(TokenType::IDENTIFIER)
+            self.safe_consume(TokenType::GREATER)
+            out = out.concat("<")
+            out = out.concat(pointer.as_str())
+            out = out.concat(">")
+        }
+        ret out
+    }
+
+    fn parse_primary(mut self) -> ExprNode {
+        let curr_token = self.peek_curr()
+        match curr_token.type {
+            TokenType::INTEGER => {
+                ret self.parse_integer_literal()
+            }
+            TokenType::FLOAT => {
+                ret self.parse_float_literal()
+            }
+            TokenType::BOOLEAN => {
+                let token = self.consume()
+                ret self.mk_expr(Expr::Boolean(str_eq(token.value.as_str(), "true")))
+            }
+            TokenType::STRING => {
+                let value = self.consume_value()
+                ret self.mk_expr(Expr::StringLiteral(value))
+            }
+            TokenType::LEFT_PAREN => {
+                ret self.parse_parenthesized_or_tuple()
+            }
+            TokenType::LEFT_BRACKET => {
+                ret self.parse_array_literal()
+            }
+            TokenType::LEFT_BRACE => {
+                ret self.parse_expression_block()
+            }
+            TokenType::KW_MATCH => {
+                ret self.parse_match_expression()
+            }
+            TokenType::KW_IF => {
+                ret self.parse_if_expression()
+            }
+            TokenType::KW_UNSAFE => {
+                ret self.parse_unsafe_expression()
+            }
+            TokenType::IDENTIFIER => {
+                let path = self.parse_path()
+                if self.peek_curr_type() == TokenType::LEFT_BRACE && !self.parsing_match_header && !self.parsing_control_flow_header {
+                    ret self.parse_struct_initialization(path)
+                }
+                ret self.mk_expr(Expr::Path(path))
+            }
+            _ => {
+                self.unexpected_token("expression", curr_token)
+                ret self.mk_expr(Expr::Path(String::new()))
+            }
+        }
+    }
+
+    fn parse_assignment(mut self, target: ExprNode) -> Statement {
+        let operator = self.consume_value()
+        let expr = self.parse_expression()
+        ret Statement::Assignment(AssignmentStmt{target, operator, expr})
     }
 
     fn parse_numeric_literal_suffix(mut self) -> Option[String] {
         if self.is_at_end() {
             ret Option[String]::None
         }
-
         let token = self.peek_curr()
         if token.type != TokenType::IDENTIFIER {
             ret Option[String]::None
         }
-
-        match token.value.char_at(0_usize) {
-            Some(ch) => {
-                if str_eq(ch, "_") {
-                    ret Option[String]::Some(self.consume_value())
-                }
-            }
-            None => {}
+        if !self.is_numeric_suffix_token(token.value.as_str()) {
+            ret Option[String]::None
         }
-
-        ret Option[String]::None
+        ret Option[String]::Some(self.consume_value())
     }
 
-    fn parse_call_args(mut self) -> Vec[usize] {
-        let mut args = Vec[usize]::new()
-        self.expect(TokenType::LEFT_PAREN)
-        if self.curr_type() == TokenType::RIGHT_PAREN {
-            self.expect(TokenType::RIGHT_PAREN)
-            ret args
-        }
-
-        loop {
-            args = args.push(self.parse_expression())
-            if self.curr_type() != TokenType::COMMA {
-                break
-            }
-            self.consume()
-            if self.curr_type() == TokenType::RIGHT_PAREN {
-                break
-            }
-        }
-        self.expect(TokenType::RIGHT_PAREN)
-        ret args
-    }
-
-    fn parse_possible_generics_text(mut self) -> Vec[String] {
-        if self.curr_type() == TokenType::LEFT_BRACKET {
-            ret self.parse_generics_text()
+    fn parse_possible_generics(mut self) -> Vec[String] {
+        if self.peek_curr_type() == TokenType::LEFT_BRACKET {
+            ret self.parse_generics_args()
         }
         ret Vec[String]::new()
     }
 
-    fn parse_generics_text(mut self) -> Vec[String] {
-        let mut generics = Vec[String]::new()
-        self.expect(TokenType::LEFT_BRACKET)
-        if self.curr_type() == TokenType::RIGHT_BRACKET {
-            self.expect(TokenType::RIGHT_BRACKET)
-            ret generics
+    fn parse_possible_expression_generics(mut self) -> Vec[String] {
+        if self.should_parse_expression_path_generics() {
+            ret self.parse_generics_args()
         }
+        ret Vec[String]::new()
+    }
 
+    fn parse_generics_args(mut self) -> Vec[String] {
+        let mut generics = Vec[String]::new()
+        self.safe_consume(TokenType::LEFT_BRACKET)
+        generics = generics.push(self.parse_type())
         loop {
-            generics = generics.push(self.parse_type_text())
-            if self.curr_type() != TokenType::COMMA {
+            if self.peek_curr_type() == TokenType::RIGHT_BRACKET {
                 break
             }
-            self.consume()
-            if self.curr_type() == TokenType::RIGHT_BRACKET {
-                break
-            }
+            self.safe_consume(TokenType::COMMA)
+            generics = generics.push(self.parse_type())
         }
-        self.expect(TokenType::RIGHT_BRACKET)
+        self.safe_consume(TokenType::RIGHT_BRACKET)
         ret generics
     }
 
-    fn parse_import_path_text(mut self) -> String {
-        let mut out = self.parse_path_segment_text()
-        loop {
-            if self.curr_type() != TokenType::SCOPE {
-                break
-            }
-            self.consume()
-            out = out.concat("::")
-            if self.curr_type() == TokenType::ASTERISK {
-                out = out.concat(as_str(self.consume_value()))
-                break
-            }
-            out = out.concat(as_str(self.parse_path_segment_text()))
-        }
-        ret out
-    }
-
-    fn parse_path_text(mut self) -> String {
-        let mut out = self.parse_path_segment_text()
-        loop {
-            if self.curr_type() != TokenType::SCOPE {
-                break
-            }
-            self.consume()
-            out = out.concat("::")
-            out = out.concat(as_str(self.parse_path_segment_text()))
-        }
-        ret out
-    }
-
-    fn parse_path_segment_text(mut self) -> String {
-        let mut out = self.expect_value(TokenType::IDENTIFIER)
-        if self.curr_type() == TokenType::LEFT_BRACKET {
-            out = out.concat(as_str(self.parse_generic_suffix_text()))
-        }
-
-        if self.is_smart_pointer_suffix() {
-            self.expect(TokenType::LESS)
-            let pointer = self.expect_value(TokenType::IDENTIFIER)
-            self.expect(TokenType::GREATER)
-            out = out.concat("<")
-            out = out.concat(as_str(pointer))
-            out = out.concat(">")
-        }
-
-        ret out
-    }
-
-    fn parse_generic_suffix_text(mut self) -> String {
-        let items = self.parse_generics_text()
-        let mut out = String::from_str("[")
-        let mut idx = 0_usize
-        loop {
-            match items.get(idx) {
-                Some(item) => {
-                    if idx > 0_usize {
-                        out = out.concat(", ")
-                    }
-                    out = out.concat(as_str(item))
-                    idx = idx + 1_usize
-                }
-                None => {
-                    break
-                }
-            }
-        }
-        out = out.concat("]")
-        ret out
-    }
-
-    fn parse_type_text(mut self) -> String {
+    fn parse_type(mut self) -> String {
         let mut out = String::new()
-        if self.curr_type() == TokenType::KW_MUT {
+        if self.peek_curr_type() == TokenType::KW_MUT {
             self.consume()
             out = out.concat("mut ")
         }
 
-        out = out.concat(as_str(self.parse_type_base_text()))
-
+        let base = self.parse_type_base()
+        out = out.concat(base.as_str())
         loop {
-            if self.curr_type() != TokenType::ASTERISK {
+            if self.peek_curr_type() != TokenType::ASTERISK {
                 break
             }
-            out = out.concat(as_str(self.consume_value()))
+            self.consume()
+            out = out.concat("*")
         }
 
         if self.is_smart_pointer_suffix() {
-            self.expect(TokenType::LESS)
-            let pointer = self.expect_value(TokenType::IDENTIFIER)
-            self.expect(TokenType::GREATER)
+            self.safe_consume(TokenType::LESS)
+            let pointer = self.safe_consume_value(TokenType::IDENTIFIER)
+            self.safe_consume(TokenType::GREATER)
             out = out.concat("<")
-            out = out.concat(as_str(pointer))
+            out = out.concat(pointer.as_str())
             out = out.concat(">")
         }
-        elif self.curr_type() == TokenType::AMPERSAND {
-            out = out.concat(as_str(self.consume_value()))
+        elif self.peek_curr_type() == TokenType::AMPERSAND {
+            self.consume()
+            out = out.concat("&")
         }
 
         ret out
     }
 
-    fn parse_type_base_text(mut self) -> String {
-        if self.curr_type() == TokenType::LEFT_PAREN {
-            let mut out = String::from_str("(")
+    fn parse_type_base(mut self) -> String {
+        if self.peek_curr_type() == TokenType::LEFT_PAREN {
             self.consume()
-            if self.curr_type() != TokenType::RIGHT_PAREN {
+            let mut out = String::from_str("(")
+            if self.peek_curr_type() != TokenType::RIGHT_PAREN {
+                let first = self.parse_type()
+                out = out.concat(first.as_str())
                 loop {
-                    out = out.concat(as_str(self.parse_type_text()))
-                    if self.curr_type() != TokenType::COMMA {
+                    if self.peek_curr_type() != TokenType::COMMA {
                         break
                     }
-                    out = out.concat(as_str(self.consume_value()))
-                    if self.curr_type() == TokenType::RIGHT_PAREN {
+                    self.consume()
+                    out = out.concat(",")
+                    if self.peek_curr_type() == TokenType::RIGHT_PAREN {
                         break
                     }
+                    let item = self.parse_type()
                     out = out.concat(" ")
+                    out = out.concat(item.as_str())
                 }
             }
-            self.expect(TokenType::RIGHT_PAREN)
+            self.safe_consume(TokenType::RIGHT_PAREN)
             out = out.concat(")")
             ret out
         }
 
-        if self.curr_type() == TokenType::LEFT_BRACKET {
-            let mut out = String::from_str("[")
+        if self.peek_curr_type() == TokenType::LEFT_BRACKET {
             self.consume()
-            out = out.concat(as_str(self.parse_type_text()))
-            self.expect(TokenType::SEMICOLON)
+            let item_type = self.parse_type()
+            self.safe_consume(TokenType::SEMICOLON)
+            let size = self.safe_consume_value(TokenType::INTEGER)
+            self.safe_consume(TokenType::RIGHT_BRACKET)
+            let mut out = String::from_str("[")
+            out = out.concat(item_type.as_str())
             out = out.concat("; ")
-            out = out.concat(as_str(self.expect_value(TokenType::INTEGER)))
-            self.expect(TokenType::RIGHT_BRACKET)
+            out = out.concat(size.as_str())
             out = out.concat("]")
             ret out
         }
 
-        let mut out = self.expect_value(TokenType::IDENTIFIER)
-        if self.curr_type() == TokenType::LEFT_BRACKET {
-            out = out.concat(as_str(self.parse_generic_suffix_text()))
+        let name = self.safe_consume_value(TokenType::IDENTIFIER)
+        let generics = self.parse_possible_generics()
+        let mut out = name
+        if generics.len() > 0_usize {
+            let joined = self.join_strings(generics, ", ")
+            out = out.concat("[")
+            out = out.concat(joined.as_str())
+            out = out.concat("]")
         }
         ret out
     }
 
-    fn push_expr(mut self, expr: Expr) -> usize {
-        let expr_id = self.exprs.len()
-        self.exprs = self.exprs.push(expr)
-        ret expr_id
+    fn parse_param(mut self) -> FunctionParam {
+        if self.peek_curr_type() == TokenType::KW_MUT {
+            self.consume()
+            let token = self.safe_consume(TokenType::IDENTIFIER)
+            if !str_eq(token.value.as_str(), "self") {
+                panic("Only `self` may use prefix `mut` before the parameter name")
+                ret FunctionParam{String::new(), Option[String]::None}
+            }
+            if self.peek_curr_type() == TokenType::COLON {
+                self.consume()
+                let parsed_type = self.parse_type()
+                let mut typ = String::from_str("mut ")
+                typ = typ.concat(parsed_type.as_str())
+                ret FunctionParam{String::from_str("self"), Option[String]::Some(typ)}
+            }
+            ret FunctionParam{String::from_str("self"), Option[String]::Some(String::from_str("mut Self"))}
+        }
+
+        if self.peek_curr_is_identifier("self") {
+            self.consume()
+            if self.peek_curr_type() == TokenType::COLON {
+                self.consume()
+                ret FunctionParam{String::from_str("self"), Option[String]::Some(self.parse_type())}
+            }
+            ret FunctionParam{String::from_str("self"), Option[String]::Some(String::from_str("Self"))}
+        }
+
+        let name = self.safe_consume_value(TokenType::IDENTIFIER)
+        self.safe_consume(TokenType::COLON)
+        let typ = self.parse_type()
+        ret FunctionParam{name, Option[String]::Some(typ)}
     }
 
-    fn is_assignment_operator(self, typ: TokenType) -> bool {
-        ret typ == TokenType::ASSIGN ||
-            typ == TokenType::PLUS_EQUAL ||
-            typ == TokenType::MINUS_EQUAL ||
-            typ == TokenType::ASTERISK_EQUAL ||
-            typ == TokenType::SLASH_EQUAL ||
-            typ == TokenType::PERCENT_EQUAL
+    fn parse_trait_bases(mut self) -> Vec[String] {
+        let mut bases = Vec[String]::new()
+        if self.peek_curr_type() != TokenType::LESS {
+            ret bases
+        }
+
+        self.consume()
+        loop {
+            if self.peek_curr_type() == TokenType::LEFT_BRACE {
+                break
+            }
+            bases = bases.push(self.parse_type())
+            if self.peek_curr_type() != TokenType::COMMA {
+                break
+            }
+            self.consume()
+        }
+        ret bases
+    }
+
+    fn parse_import_path(mut self) -> String {
+        let mut out = self.safe_consume_value(TokenType::IDENTIFIER)
+
+        loop {
+            if self.peek_curr_type() != TokenType::SCOPE {
+                break
+            }
+            self.consume()
+            out = out.concat("::")
+
+            if self.peek_curr_type() == TokenType::ASTERISK {
+                self.consume()
+                out = out.concat("*")
+                break
+            }
+
+            if self.peek_curr_type() == TokenType::LEFT_BRACE {
+                self.consume()
+                out = out.concat("{")
+                if self.peek_curr_type() != TokenType::RIGHT_BRACE {
+                    let first = self.parse_import_path()
+                    out = out.concat(first.as_str())
+                    loop {
+                        if self.peek_curr_type() != TokenType::COMMA {
+                            break
+                        }
+                        self.consume()
+                        out = out.concat(", ")
+                        if self.peek_curr_type() == TokenType::RIGHT_BRACE {
+                            break
+                        }
+                        let nested = self.parse_import_path()
+                        out = out.concat(nested.as_str())
+                    }
+                }
+                self.safe_consume(TokenType::RIGHT_BRACE)
+                out = out.concat("}")
+                break
+            }
+
+            let segment = self.safe_consume_value(TokenType::IDENTIFIER)
+            out = out.concat(segment.as_str())
+        }
+
+        ret out
+    }
+
+    fn parse_maybe_label(mut self) -> Option[String] {
+        if self.peek_curr_type() != TokenType::LESS {
+            ret Option[String]::None
+        }
+        self.consume()
+        self.safe_consume(TokenType::QUOTE)
+        let label = self.safe_consume_value(TokenType::IDENTIFIER)
+        self.safe_consume(TokenType::GREATER)
+        ret Option[String]::Some(label)
+    }
+
+    fn should_parse_expression_path_generics(self) -> bool {
+        if self.peek_curr_type() != TokenType::LEFT_BRACKET {
+            ret false
+        }
+
+        let mut depth = 0_usize
+        let mut index = 0_usize
+        loop {
+            let token_type = self.peek_nth_type(index)
+            if token_type == TokenType::EOF {
+                ret false
+            }
+            if token_type == TokenType::LEFT_BRACKET {
+                depth = depth + 1_usize
+            }
+            elif token_type == TokenType::RIGHT_BRACKET {
+                depth = depth - 1_usize
+                if depth == 0_usize {
+                    let after = self.peek_nth_type(index + 1_usize)
+                    ret after == TokenType::SCOPE
+                        || after == TokenType::LEFT_PAREN
+                        || after == TokenType::LEFT_BRACE
+                        || after == TokenType::LESS
+                }
+            }
+            index = index + 1_usize
+        }
     }
 
     fn is_smart_pointer_suffix(self) -> bool {
-        if self.curr_type() != TokenType::LESS {
+        if self.peek_curr_type() != TokenType::LESS {
             ret false
         }
         let pointer = self.peek_nth(1_usize)
         let closer = self.peek_nth(2_usize)
-        if pointer.type != TokenType::IDENTIFIER || closer.type != TokenType::GREATER {
-            ret false
-        }
-        ret str_eq(as_str(pointer.value), "H") || str_eq(as_str(pointer.value), "S")
+        ret pointer.type == TokenType::IDENTIFIER
+            && (str_eq(pointer.value.as_str(), "H") || str_eq(pointer.value.as_str(), "S"))
+            && closer.type == TokenType::GREATER
     }
 
-    fn fail_current(mut self, message: str) -> () {
-        let token = self.peek_curr()
-        let mut out = String::from_str("Parser error: ")
-        out = out.concat(message)
-        out = out.concat(" at `")
-        out = out.concat(as_str(token.value))
-        out = out.concat("` (")
-        out = out.concat(Debug::fmt(token.line))
-        out = out.concat(":")
-        out = out.concat(Debug::fmt(token.column))
-        out = out.concat(")")
-        println(as_str(out))
-        self.failed = true
+    fn is_assignment_operator(self, token_type: TokenType) -> bool {
+        ret token_type == TokenType::ASSIGN
+            || token_type == TokenType::PLUS_EQUAL
+            || token_type == TokenType::MINUS_EQUAL
+            || token_type == TokenType::ASTERISK_EQUAL
+            || token_type == TokenType::SLASH_EQUAL
+            || token_type == TokenType::PERCENT_EQUAL
+            || token_type == TokenType::AMPERSAND_EQUAL
+            || token_type == TokenType::PIPE_EQUAL
+            || token_type == TokenType::CARET_EQUAL
+            || token_type == TokenType::LEFT_SHIFT_EQUAL
+            || token_type == TokenType::RIGHT_SHIFT_EQUAL
+    }
+
+    fn is_relational_operator(self, token_type: TokenType) -> bool {
+        ret token_type == TokenType::LESS
+            || token_type == TokenType::GREATER
+            || token_type == TokenType::LESS_EQUAL
+            || token_type == TokenType::GREATER_EQUAL
+    }
+
+    fn is_unary_operator(self, token_type: TokenType) -> bool {
+        ret token_type == TokenType::PLUS
+            || token_type == TokenType::MINUS
+            || token_type == TokenType::BANG
+            || token_type == TokenType::TILDE
+            || token_type == TokenType::INCREMENT
+            || token_type == TokenType::DECREMENT
+    }
+
+    fn is_numeric_suffix_token(self, raw: str) -> bool {
+        if len(raw) == 0_usize {
+            ret false
+        }
+        ret byte_at(raw, 0_usize) == 95_u8
+    }
+
+    fn literal_value(self, expr: ExprNode) -> String {
+        match expr.value {
+            Expr::Integer(value) => {
+                ret value
+            }
+            Expr::Float(value) => {
+                ret value
+            }
+            _ => {
+                ret String::new()
+            }
+        }
+    }
+
+    fn join_strings(self, items: Vec[String], separator: str) -> String {
+        let mut out = String::new()
+        let mut index = 0_usize
+        loop {
+            match items.get(index) {
+                Option[String]::Some(item) => {
+                    if index > 0_usize {
+                        out = out.concat(separator)
+                    }
+                    out = out.concat(item.as_str())
+                    index = index + 1_usize
+                }
+                Option[String]::None => {
+                    break
+                }
+            }
+        }
+        ret out
+    }
+
+    fn unexpected_token(self, expected: str, found: Token) -> () {
+        let mut message = String::from_str("Unexpected token '")
+        message = message.concat(found.value.as_str())
+        message = message.concat("' of type ")
+        message = message.concat(Debug::fmt(found.type))
+        message = message.concat(", expected ")
+        message = message.concat(expected)
+        panic(message.as_str())
         ret ()
     }
 
-    fn expect(mut self, expected: TokenType) -> Token {
+    fn safe_consume(mut self, expected_token_type: TokenType) -> Token {
         let token = self.consume()
-        if token.type != expected {
-            let mut out = String::from_str("Expected ")
-            out = out.concat(Debug::fmt(expected))
-            out = out.concat(", got ")
-            out = out.concat(Debug::fmt(token.type))
-            self.fail_current(as_str(out))
+        if token.type != expected_token_type {
+            self.unexpected_token(Debug::fmt(expected_token_type), token)
         }
         ret token
     }
 
-    fn is_at_end(self) -> bool {
-        ret self.consumed >= self.tokens.len()
+    fn safe_consume_value(mut self, expected_token_type: TokenType) -> String {
+        let token = self.safe_consume(expected_token_type)
+        ret token.value
     }
 
-    fn curr_type(self) -> TokenType {
+    fn consume(mut self) -> Token {
         let token = self.peek_curr()
-        ret token.type
-    }
-
-    fn curr_ident_is(self, value: str) -> bool {
-        let token = self.peek_curr()
-        ret token.type == TokenType::IDENTIFIER && str_eq(as_str(token.value), value)
+        if self.consumed < self.tokens.len() {
+            self.consumed = self.consumed + 1_usize
+        }
+        ret token
     }
 
     fn consume_value(mut self) -> String {
@@ -1121,31 +1565,50 @@ impl for Parser {
         ret token.value
     }
 
-    fn expect_value(mut self, expected: TokenType) -> String {
-        let token = self.expect(expected)
-        ret token.value
-    }
-
     fn peek_curr(self) -> Token {
         ret self.peek_nth(0_usize)
     }
 
-    fn peek_nth(self, nth: usize) -> Token {
-        match self.tokens.get(self.consumed + nth) {
-            Some(token) => {
-                ret token
+    fn peek_next(self) -> Token {
+        ret self.peek_nth(1_usize)
+    }
+
+    fn peek_nth(self, n: usize) -> Token {
+        let index = self.consumed + n
+        match self.tokens.get(index) {
+            Option[Token]::Some(tk) => {
+                ret tk
             }
-            None => {
+            Option[Token]::None => {
                 ret Token::new(TokenType::EOF, String::new(), 0_usize, 0_usize)
             }
         }
     }
 
-    fn consume(mut self) -> Token {
+    fn peek_curr_type(self) -> TokenType {
         let token = self.peek_curr()
-        if !self.is_at_end() {
-            self.consumed = self.consumed + 1_usize
+        ret token.type
+    }
+
+    fn peek_next_type(self) -> TokenType {
+        let token = self.peek_next()
+        ret token.type
+    }
+
+    fn peek_nth_type(self, n: usize) -> TokenType {
+        let token = self.peek_nth(n)
+        ret token.type
+    }
+
+    fn peek_curr_is_identifier(self, expected: str) -> bool {
+        if self.peek_curr_type() != TokenType::IDENTIFIER {
+            ret false
         }
-        ret token
+        let token = self.peek_curr()
+        ret str_eq(token.value.as_str(), expected)
+    }
+
+    fn is_at_end(self) -> bool {
+        ret self.peek_curr_type() == TokenType::EOF
     }
 }

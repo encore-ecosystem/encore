@@ -161,7 +161,7 @@ class EHIR_ProjectCompiler:
         return typ.name in concrete_type_names or not typ.name.isidentifier() or typ.name.startswith(("u", "i", "f"))
 
     def _get_entrypoint_id(self, refrain: Refrain) -> Path:
-        return refrain.path / "src" / f"{refrain.entrypoint_stem}{self.frontend.get_file_extension()}"
+        return refrain.path / refrain.entry_root / f"{refrain.entrypoint_stem}{self.frontend.get_file_extension()}"
 
     def _collect_source_files(self, entrypoint_id: Path) -> list[Path]:
         observed: set[Path] = set()
@@ -233,6 +233,9 @@ class EHIR_ProjectCompiler:
                     continue
                 append_directive(d)
 
+        def matches_import_symbol(directive_name: str, import_symbol: str) -> bool:
+            return directive_name == import_symbol or directive_name.endswith(f"::{import_symbol}")
+
         for directive in module.ast:
             if not isinstance(directive, Derective_import):
                 append_directive(directive)
@@ -261,7 +264,7 @@ class EHIR_ProjectCompiler:
 
                     if (
                         isinstance(d, (Derective_fn, Derective_extern_fn, Derective_struct, Derective_enum, Derective_trait))
-                        and d.name == directive.symbol
+                        and matches_import_symbol(d.name, directive.symbol)
                     ):
                         if isinstance(d, (Derective_fn, Derective_extern_fn, Derective_trait, Derective_struct)):
                             append_module_contents(parent_ast)

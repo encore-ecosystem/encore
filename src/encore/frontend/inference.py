@@ -23,6 +23,16 @@ from encore.frontend.types import (
 )
 
 MatchArmLike = s.Statement_MatchArm | s.Expression_MatchArm
+MatchLike = s.Statement_Match | s.Expression_Match
+MatchBodyLike = Block | s.Statement_Expression
+MatchPatternLike = (
+    s.Expression_Path
+    | s.Expression_BooleanLiteral
+    | s.Expression_IntegerLiteral
+    | s.Expression_FloatLiteral
+    | s.Expression_StringLiteral
+    | None
+)
 
 
 class TypeInferer:
@@ -34,7 +44,7 @@ class TypeInferer:
         self._impl_traits: dict[str, list[str]] = {}
         self._unsafe_depth = 0
         self._current_fn_return_type: Type | None = None
-        self._current_self_type: Type | None = None
+        self._current_self_binding_type: Type | None = None
 
     def infer(
         self,
@@ -93,19 +103,19 @@ class TypeInferer:
         mutability_env = {param.name: is_mutable_type(param.type) for param in statement.signature.params}
 
         prev_fn_return = self._current_fn_return_type
-        prev_self_type = self._current_self_type
+        prev_self_binding_type = self._current_self_binding_type
         if statement.signature.type is None:
             statement.signature.type = self._infer_return_type(statement.body, env, mutability_env)
             if statement.signature.type is None:
                 raise TypeError(f"Unable to infer return type for function '{statement.name}'")
 
         self._current_fn_return_type = statement.signature.type
-        self._current_self_type = self._resolve_self_type(self_type or env.get("self"))
+        self._current_self_binding_type = env.get("self")
         try:
             self._infer_block(statement.body, env, mutability_env, statement.signature.type)
         finally:
             self._current_fn_return_type = prev_fn_return
-            self._current_self_type = prev_self_type
+            self._current_self_binding_type = prev_self_binding_type
 
     def _infer_block(self, body: Block, env: dict[str, Type], mutability_env: dict[str, bool], fn_ret_type: Type):
         for statement in body.body:
@@ -285,10 +295,7 @@ class TypeInferer:
     def _resolve_self_type(self, self_type: Type | None) -> Type | None:
         if self_type is None:
             return None
-        self_type = unwrap_for_storage(self_type)
-        if self_type.name == "Self" and not self_type.generics:
-            return self._current_self_type or self_type
-        return self_type
+        return unwrap_for_storage(self_type)
 
     def _resolve_self_in_type(self, typ: Type, self_type: Type | None) -> Type:
         if is_mutable_type(typ):
@@ -437,11 +444,7 @@ class TypeInferer:
 
     def _infer_lvalue_type(self, expr: s.Statement_Expression, env: dict[str, Type]) -> Optional[Type]:
         if isinstance(expr, s.Expression_Path) and len(expr.segments) == 1:
-            if expr.name in env:
-                return env.get(expr.name)
-            if self._current_self_type is not None:
-                return self._lookup_field_type(self._current_self_type, expr.name)
-            return None
+            return env.get(expr.name)
         if isinstance(expr, s.Expression_StructField):
             return self._lookup_chained_field_type(expr.name, expr.field, env)
         return None
@@ -453,29 +456,88 @@ class TypeInferer:
         mutability_env: dict[str, bool],
         fn_ret_type: Type,
     ):
+        scrutinee_type = self._infer_match_scrutinee(statement, env, mutability_env)
+        for arm in statement.arms:
+            arm_env, arm_mutability_env = self._prepare_match_arm_scope(scrutinee_type, arm, env, mutability_env)
+            self._infer_match_statement_body(self._get_match_arm_body(arm), arm_env, arm_mutability_env, fn_ret_type)
+
+    def _infer_match_scrutinee(
+        self,
+        statement: MatchLike,
+        env: dict[str, Type],
+        mutability_env: dict[str, bool],
+    ) -> Type:
         scrutinee_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
         if scrutinee_type is None:
             raise TypeError("Unable to infer type of match expression")
         self._validate_match_coverage(scrutinee_type, statement.arms)
+        return scrutinee_type
 
-        for arm in statement.arms:
-            if arm.is_wildcard:
-                self._infer_block(arm.body, dict(env), dict(mutability_env), fn_ret_type)
-                continue
+    def _prepare_match_arm_scope(
+        self,
+        scrutinee_type: Type,
+        arm: MatchArmLike,
+        env: dict[str, Type],
+        mutability_env: dict[str, bool],
+    ) -> tuple[dict[str, Type], dict[str, bool]]:
+        arm_env = dict(env)
+        arm_mutability_env = dict(mutability_env)
+        if arm.is_wildcard:
+            return arm_env, arm_mutability_env
 
-            variant_name, payload_type = self._resolve_match_arm(scrutinee_type, arm)
-
-            arm_env = dict(env)
-            arm_mutability_env = dict(mutability_env)
+        if not self._is_match_enum_type(scrutinee_type):
             if arm.binding is not None:
-                if payload_type is None:
-                    raise TypeError(f"Variant '{variant_name}' does not carry payload")
-                arm_env[arm.binding] = payload_type
-                arm_mutability_env[arm.binding] = False
-            elif payload_type is not None:
-                # Payload-less matching is allowed; no binding is introduced.
-                pass
-            self._infer_block(arm.body, arm_env, arm_mutability_env, fn_ret_type)
+                raise TypeError("Only enum match arms can bind payload")
+            return arm_env, arm_mutability_env
+
+        variant_name, payload_type = self._resolve_match_arm_common(scrutinee_type, arm)
+        if arm.binding is not None:
+            if payload_type is None:
+                raise TypeError(f"Variant '{variant_name}' does not carry payload")
+            arm_env[arm.binding] = payload_type
+            arm_mutability_env[arm.binding] = False
+        return arm_env, arm_mutability_env
+
+    def _get_match_arm_body(self, arm: MatchArmLike) -> MatchBodyLike:
+        if isinstance(arm, s.Statement_MatchArm):
+            return arm.body
+        return arm.expr
+
+    def _infer_match_statement_body(
+        self,
+        body: MatchBodyLike,
+        env: dict[str, Type],
+        mutability_env: dict[str, bool],
+        fn_ret_type: Type,
+    ):
+        if isinstance(body, Block):
+            self._infer_block(body, env, mutability_env, fn_ret_type)
+            return
+        expr_type = self._infer_expression(body, env, mutable_env=mutability_env)
+        self._assert_raw_pointer_usage_allowed(expr_type, context="match arm expression")
+
+    def _infer_match_expression_body(
+        self,
+        body: MatchBodyLike,
+        env: dict[str, Type],
+        mutable_env: dict[str, bool],
+        expected_type: Optional[Type] = None,
+    ) -> Optional[Type]:
+        if isinstance(body, Block):
+            return self._infer_expression_block(body, env, mutable_env, expected_type)
+        return self._infer_expression(body, env, expected_type, mutable_env)
+
+    def _infer_match_nested_body(
+        self,
+        body: MatchBodyLike,
+        env: dict[str, Type],
+        mutability_env: dict[str, bool],
+    ):
+        if isinstance(body, Block):
+            self._infer_expression_block_nested(body, env, mutability_env)
+            return
+        expr_type = self._infer_expression(body, env, mutable_env=mutability_env)
+        self._assert_raw_pointer_usage_allowed(expr_type, context="match arm expression")
 
     def _infer_expression(
         self,
@@ -646,11 +708,6 @@ class TypeInferer:
                         result = make_mutable_type(result)
                     self._assert_raw_pointer_usage_allowed(result, context=f"binding '{expr.name}'")
                     return result
-                if self._current_self_type is not None:
-                    implicit_self_field = self._lookup_field_type(self._current_self_type, expr.name)
-                    if implicit_self_field is not None:
-                        self._assert_raw_pointer_usage_allowed(implicit_self_field, context=f"field '{expr.name}'")
-                        return implicit_self_field
                 return expr.segments[0]
             if len(expr.segments) == 2 and expr.segments[0].name in self._enums:
                 return expr.segments[0]
@@ -783,46 +840,34 @@ class TypeInferer:
         return None
 
     def _resolve_match_arm_payload_type(
-        self, scrutinee_type: Optional[Type], arm: s.Statement_MatchArm
+        self, scrutinee_type: Optional[Type], arm: MatchArmLike
     ) -> Optional[Type]:
         if scrutinee_type is None:
             return None
-        _, payload_type = self._resolve_match_arm(scrutinee_type, arm)
+        if not self._is_match_enum_type(scrutinee_type):
+            return None
+        _, payload_type = self._resolve_match_arm_common(scrutinee_type, arm)
         return payload_type
 
     def _infer_match_expression(
         self,
-        expr: s.Expression_Match,
+        expr: MatchLike,
         env: dict[str, Type],
         mutable_env: dict[str, bool],
         expected_type: Optional[Type] = None,
     ) -> Optional[Type]:
-        scrutinee_type = self._infer_expression(expr.expr, env, mutable_env=mutable_env)
-        if scrutinee_type is None:
-            raise TypeError("Unable to infer type of match expression")
-        self._validate_match_coverage(scrutinee_type, expr.arms)
+        scrutinee_type = self._infer_match_scrutinee(expr, env, mutable_env)
         arm_types: list[Type] = []
         for arm in expr.arms:
-            if arm.is_wildcard:
-                arm_type = self._infer_expression(arm.expr, dict(env), expected_type, dict(mutable_env))
-                if arm_type is None:
-                    raise TypeError("Unable to infer wildcard match arm type")
-                arm_types.append(arm_type)
-                continue
-
-            variant_name, payload_type = self._resolve_match_arm(scrutinee_type, arm)
-
-            arm_env = dict(env)
-            arm_mutability_env = dict(mutable_env)
-            if arm.binding is not None:
-                if payload_type is None:
-                    raise TypeError(f"Variant '{variant_name}' does not carry payload")
-                arm_env[arm.binding] = payload_type
-                arm_mutability_env[arm.binding] = False
-
-            arm_type = self._infer_expression(arm.expr, arm_env, expected_type, arm_mutability_env)
+            arm_env, arm_mutability_env = self._prepare_match_arm_scope(scrutinee_type, arm, env, mutable_env)
+            arm_type = self._infer_match_expression_body(
+                self._get_match_arm_body(arm),
+                arm_env,
+                arm_mutability_env,
+                expected_type,
+            )
             if arm_type is None:
-                raise TypeError(f"Unable to infer type of match arm '{variant_name}'")
+                raise TypeError("Unable to infer type of match arm")
             arm_types.append(arm_type)
 
         result_type = expected_type or arm_types[0]
@@ -939,21 +984,10 @@ class TypeInferer:
             return
 
         if isinstance(statement, s.Statement_Match):
-            scrutinee_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
-            if scrutinee_type is None:
-                raise TypeError("Unable to infer type of match expression")
-            self._validate_match_coverage(scrutinee_type, statement.arms)
+            scrutinee_type = self._infer_match_scrutinee(statement, env, mutability_env)
             for arm in statement.arms:
-                arm_env = dict(env)
-                arm_mutability_env = dict(mutability_env)
-                if not arm.is_wildcard:
-                    variant_name, payload_type = self._resolve_match_arm(scrutinee_type, arm)
-                    if arm.binding is not None:
-                        if payload_type is None:
-                            raise TypeError(f"Variant '{variant_name}' does not carry payload")
-                        arm_env[arm.binding] = payload_type
-                        arm_mutability_env[arm.binding] = False
-                self._infer_expression_block_nested(arm.body, arm_env, arm_mutability_env)
+                arm_env, arm_mutability_env = self._prepare_match_arm_scope(scrutinee_type, arm, env, mutability_env)
+                self._infer_match_nested_body(self._get_match_arm_body(arm), arm_env, arm_mutability_env)
             return
 
         if isinstance(statement, s.Statement_While):
@@ -1021,11 +1055,6 @@ class TypeInferer:
         for statement in body:
             self._infer_expression_block_statement(statement, env, mutability_env)
 
-    def _resolve_match_arm(self, scrutinee_type: Type, arm: s.Statement_MatchArm) -> tuple[str, Optional[Type]]:
-        if arm.is_wildcard:
-            raise TypeError("Wildcard arm has no variant")
-        return self._resolve_match_arm_common(scrutinee_type, arm)
-
     def _resolve_match_arm_common(self, scrutinee_type: Type, arm: MatchArmLike) -> tuple[str, Optional[Type]]:
         enum_def, generic_mapping = self._resolve_enum_definition(scrutinee_type)
         variant_name = self._resolve_match_variant_name(scrutinee_type, arm.pattern)
@@ -1044,6 +1073,10 @@ class TypeInferer:
         raise TypeError(f"Unknown variant '{variant_name}' for enum '{enum_def.name}'")
 
     def _validate_match_coverage(self, scrutinee_type: Type, arms: list[MatchArmLike]):
+        if self._is_builtin_match_type(scrutinee_type):
+            self._validate_builtin_match_coverage(scrutinee_type, arms)
+            return
+
         enum_def, _ = self._resolve_enum_definition(scrutinee_type)
         if not arms:
             raise TypeError(f"Match on enum '{enum_def.name}' must have at least one arm")
@@ -1071,31 +1104,123 @@ class TypeInferer:
             if missing:
                 raise TypeError(f"Non-exhaustive match for enum '{enum_def.name}', missing: {', '.join(missing)}")
 
+    def _validate_builtin_match_coverage(self, scrutinee_type: Type, arms: list[MatchArmLike]):
+        base_type = self._normalize_match_scrutinee_type(scrutinee_type)
+        if not arms:
+            raise TypeError(f"Match on '{base_type}' must have at least one arm")
+
+        seen_patterns: set[tuple[str, object]] = set()
+        wildcard_seen = False
+        for idx, arm in enumerate(arms):
+            if arm.is_wildcard:
+                if arm.binding is not None:
+                    raise TypeError("Wildcard match arm cannot bind payload")
+                if wildcard_seen:
+                    raise TypeError("Duplicate wildcard match arm")
+                if idx != len(arms) - 1:
+                    raise TypeError("Wildcard match arm must be the last arm")
+                wildcard_seen = True
+                continue
+
+            if arm.binding is not None:
+                raise TypeError("Only enum match arms can bind payload")
+
+            pattern_key = self._resolve_builtin_match_pattern_key(base_type, arm.pattern)
+            if pattern_key in seen_patterns:
+                raise TypeError(f"Duplicate match arm for pattern '{arm.pattern}'")
+            seen_patterns.add(pattern_key)
+
+        if wildcard_seen:
+            return
+
+        if base_type.name == "bool":
+            missing: list[str] = []
+            if ("bool", True) not in seen_patterns:
+                missing.append("true")
+            if ("bool", False) not in seen_patterns:
+                missing.append("false")
+            if missing:
+                raise TypeError(f"Non-exhaustive match for bool, missing: {', '.join(missing)}")
+            return
+
+        raise TypeError(f"Non-exhaustive match for '{base_type}', add wildcard arm")
+
     def _resolve_enum_definition(self, typ: Type) -> tuple[s.Statement_EnumDefinition, dict[str, Type]]:
-        typ = unwrap_for_storage(typ)
-        base_type = typ.pointee if is_reference_like_type(typ) else typ
+        base_type = self._normalize_match_scrutinee_type(typ)
         enum_def = self._enums.get(base_type.name)
         if enum_def is None:
             raise TypeError(f"Match expression must be an enum, got {typ}")
         generic_mapping = {generic.name: concrete for generic, concrete in zip(enum_def.generics, base_type.generics)}
         return enum_def, generic_mapping
 
-    def _resolve_match_variant_name(self, scrutinee_type: Type, pattern: s.Expression_Path | None) -> str:
+    def _resolve_match_variant_name(self, scrutinee_type: Type, pattern: MatchPatternLike) -> str:
         if pattern is None:
             raise TypeError("Wildcard arm has no explicit variant name")
+        if not isinstance(pattern, s.Expression_Path):
+            raise TypeError(f"Enum match expects variant path, got {pattern}")
         if len(pattern.segments) == 1:
             return pattern.segments[0].name
         if len(pattern.segments) != 2:
             raise TypeError(f"Unsupported match pattern: {pattern}")
 
-        scrutinee_type = unwrap_for_storage(scrutinee_type)
-        base_type = scrutinee_type.pointee if is_reference_like_type(scrutinee_type) else scrutinee_type
+        base_type = self._normalize_match_scrutinee_type(scrutinee_type)
         explicit_enum = pattern.segments[0]
         if explicit_enum.name != base_type.name:
             raise TypeError(f"Pattern enum '{explicit_enum.name}' does not match scrutinee type '{base_type.name}'")
         if explicit_enum.generics and explicit_enum != base_type:
             raise TypeError(f"Pattern enum '{explicit_enum}' does not match scrutinee type '{base_type}'")
         return pattern.segments[1].name
+
+    def _normalize_match_scrutinee_type(self, typ: Type) -> Type:
+        typ = unwrap_for_storage(typ)
+        return typ.pointee if is_reference_like_type(typ) else typ
+
+    def _is_match_enum_type(self, typ: Type) -> bool:
+        return self._normalize_match_scrutinee_type(typ).name in self._enums
+
+    def _is_builtin_match_type(self, typ: Type) -> bool:
+        base_type = self._normalize_match_scrutinee_type(typ)
+        return (
+            base_type.name == "str"
+            or base_type.name == "bool"
+            or self._is_integer_type(base_type)
+            or self._is_float_type(base_type)
+        )
+
+    def _resolve_builtin_match_pattern_key(
+        self,
+        scrutinee_type: Type,
+        pattern: MatchPatternLike,
+    ) -> tuple[str, object]:
+        if pattern is None:
+            raise TypeError("Wildcard arm has no explicit pattern")
+
+        base_type = self._normalize_match_scrutinee_type(scrutinee_type)
+        if base_type.name == "str":
+            if not isinstance(pattern, s.Expression_StringLiteral):
+                raise TypeError(f"Match on '{base_type}' expects string literal patterns, got {pattern}")
+            return ("str", pattern.value)
+
+        if base_type.name == "bool":
+            if not isinstance(pattern, s.Expression_BooleanLiteral):
+                raise TypeError(f"Match on '{base_type}' expects bool literal patterns, got {pattern}")
+            return ("bool", pattern.value)
+
+        if self._is_integer_type(base_type):
+            if not isinstance(pattern, s.Expression_IntegerLiteral):
+                raise TypeError(f"Match on '{base_type}' expects integer literal patterns, got {pattern}")
+            if pattern.literal_type is not None and not self._types_compatible(base_type, pattern.literal_type):
+                raise TypeError(f"Match pattern type mismatch: {pattern.literal_type} != {base_type}")
+            return (base_type.name, pattern.value)
+
+        if self._is_float_type(base_type):
+            if not isinstance(pattern, s.Expression_FloatLiteral):
+                raise TypeError(f"Match on '{base_type}' expects float literal patterns, got {pattern}")
+            if pattern.literal_type is not None and not self._types_compatible(base_type, pattern.literal_type):
+                raise TypeError(f"Match pattern type mismatch: {pattern.literal_type} != {base_type}")
+            return (base_type.name, pattern.value)
+
+        raise TypeError(f"Match expression must be an enum or builtin scalar, got {scrutinee_type}")
 
     def _lookup_struct_field_types(self, typ: Type) -> list[Type]:
         typ = unwrap_for_storage(typ)
@@ -1264,13 +1389,6 @@ class TypeInferer:
         if isinstance(target, s.Expression_Path) and len(target.segments) == 1:
             if mutability_env.get(target.name, False):
                 return
-            if (
-                self._current_self_type is not None
-                and self._lookup_field_type(self._current_self_type, target.name) is not None
-            ):
-                if is_mutable_type(self._current_self_type):
-                    return
-                raise TypeError(f"Cannot assign to immutable field '{target.name}'. Use a mutable receiver type.")
             raise TypeError(f"Cannot assign to immutable binding '{target.name}'. Use `let mut {target.name}`.")
 
         if not isinstance(target, s.Expression_StructField):
@@ -1279,7 +1397,7 @@ class TypeInferer:
         binding_name = target.name.split(".")[0]
         binding_type = env.get(binding_name)
         if binding_type is None and binding_name == "self":
-            binding_type = self._current_self_type
+            binding_type = self._current_self_binding_type
         if binding_type is not None and is_mutable_type(binding_type):
             return
 

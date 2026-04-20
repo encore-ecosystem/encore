@@ -39,6 +39,12 @@ class ModuleIndex:
     exports: dict[str, ExportBinding] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ImportedTopLevelDeclaration:
+    module_id: Path
+    statement: s.Statement_TopLevel
+
+
 @dataclass
 class EHIR_EncoreFrontend(EHIR_Frontend):
     src_dir: Path
@@ -59,11 +65,10 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         ast = self._get_ast_by_id(id)
         imported_declarations = self._collect_imported_declarations(id, ast)
-        TypeInferer().infer(ast, imported_declarations)
+        TypeInferer().infer(ast, [declaration.statement for declaration in imported_declarations])
 
         translator = Translator()
-        translator.preload_declarations(imported_declarations)
-        module = translator.translate_ast(ast)
+        module = translator.translate_ast(ast, module_id=id, imported_declarations=imported_declarations)
         module.id = id
 
         self._cache[id] = module
@@ -138,7 +143,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             if not isinstance(statement, s.Statement_Import):
                 continue
             for request in self._expand_import_statement(statement):
-                if request.prefix in (["std", "ops"], ["core", "ops"], ["refrain", "ops"]):
+                if request.prefix in (["std", "ops"], ["core", "ops"], ["refrain", "ops"]) and request.symbol == "*":
                     return ast
 
         prelude_import = s.Statement_Import(
@@ -155,37 +160,47 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         )
         return [prelude_import, *ast]
 
-    def _collect_imported_declarations(self, id: Path, ast: list[s.Statement]) -> list[s.Statement_TopLevel]:
-        declarations: list[s.Statement_TopLevel] = []
+    def _collect_imported_declarations(self, id: Path, ast: list[s.Statement]) -> list[ImportedTopLevelDeclaration]:
+        declarations: list[ImportedTopLevelDeclaration] = []
         seen: set[tuple[Path, str]] = set()
+        visited_modules: set[Path] = set()
 
-        for statement in ast:
-            if not isinstance(statement, s.Statement_Import):
-                continue
+        def append_binding(binding: ExportBinding):
+            key = (binding.module_id, binding.name)
+            if key not in seen:
+                seen.add(key)
+                declarations.append(ImportedTopLevelDeclaration(module_id=binding.module_id, statement=binding.statement))
 
-            for request in self._expand_import_statement(statement):
-                for binding in self._resolve_import_bindings(id, request):
-                    key = (binding.module_id, binding.name)
-                    if key in seen:
+            if isinstance(binding.statement, s.Statement_StructureDefinition):
+                for idx, assoc_impl in enumerate(self._collect_associated_impls(binding.module_id, binding.name)):
+                    impl_key = (binding.module_id, f"impl::{binding.name}::{idx}")
+                    if impl_key in seen:
                         continue
-                    seen.add(key)
-                    declarations.append(binding.statement)
-                    if isinstance(binding.statement, s.Statement_StructureDefinition):
-                        for idx, assoc_impl in enumerate(
-                            self._collect_associated_impls(binding.module_id, binding.name)
-                        ):
-                            impl_key = (binding.module_id, f"impl::{binding.name}::{idx}")
-                            if impl_key in seen:
-                                continue
-                            seen.add(impl_key)
-                            declarations.append(assoc_impl)
-                    elif isinstance(binding.statement, s.Statement_Trait):
-                        for idx, trait_impl in enumerate(self._collect_trait_impls(binding.module_id, binding.name)):
-                            impl_key = (binding.module_id, f"impl-trait::{binding.name}::{idx}")
-                            if impl_key in seen:
-                                continue
-                            seen.add(impl_key)
-                            declarations.append(trait_impl)
+                    seen.add(impl_key)
+                    declarations.append(ImportedTopLevelDeclaration(module_id=binding.module_id, statement=assoc_impl))
+            elif isinstance(binding.statement, s.Statement_Trait):
+                for idx, trait_impl in enumerate(self._collect_trait_impls(binding.module_id, binding.name)):
+                    impl_key = (binding.module_id, f"impl-trait::{binding.name}::{idx}")
+                    if impl_key in seen:
+                        continue
+                    seen.add(impl_key)
+                    declarations.append(ImportedTopLevelDeclaration(module_id=binding.module_id, statement=trait_impl))
+
+        def visit(module_id: Path, module_ast: list[s.Statement]):
+            if module_id in visited_modules:
+                return
+            visited_modules.add(module_id)
+
+            for statement in module_ast:
+                if not isinstance(statement, s.Statement_Import):
+                    continue
+
+                for request in self._expand_import_statement(statement):
+                    for binding in self._resolve_import_bindings(module_id, request):
+                        append_binding(binding)
+                        visit(binding.module_id, self._get_ast_by_id(binding.module_id))
+
+        visit(id, ast)
 
         return declarations
 

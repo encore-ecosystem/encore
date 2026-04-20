@@ -253,6 +253,17 @@ int32_t __ehir_rt_io_eprintln(encore_str value) {
     return fputc('\n', stderr) == EOF ? -1 : 0;
 }
 
+int32_t __ehir_rt_panic(encore_str message) {
+    fputs("panic: ", stderr);
+    if (__ehir_rt_io_eprint(message) != 0) {
+        fputc('\n', stderr);
+    } else {
+        __ehir_rt_io_eprintln(encore_empty_str());
+    }
+    exit(1);
+    return 1;
+}
+
 static bool g_args_initialized = false;
 static size_t g_argc = 0;
 static char **g_argv = NULL;

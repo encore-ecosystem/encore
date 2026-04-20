@@ -262,7 +262,7 @@ class Resolver:
                         instr.var_out = add_variable(instr.var_out)
                         return
 
-                    trait_name, method_name = instr.fn_name.split("::", 1)
+                    trait_name, method_name = instr.fn_name.rsplit("::", 1)
                     candidates = [
                         f"{ref.trait_name}[{', '.join(str(arg) for arg in ref.trait_args)}] for {ref.for_type}::{ref.method_name}"
                         for ref in self.impl_method_refs
@@ -1029,7 +1029,7 @@ class Resolver:
                 return typ.pointee
             return typ
 
-        trait_name, method_name = fn_name.split("::", 1)
+        trait_name, method_name = fn_name.rsplit("::", 1)
         recv = args[0]
         if recv.type is None:
             return None

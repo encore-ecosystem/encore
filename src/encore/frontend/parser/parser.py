@@ -64,8 +64,8 @@ from ehir.core.instructions.operators.logic import (
 )
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter
-from ehir.frontend.builtin.parser import Parser as EHIR_Parser
 from ehir.format import ThemePalette, printfmt
+from ehir.frontend.builtin.parser import Parser as EHIR_Parser
 
 from encore.frontend.base import ParserBase
 from encore.frontend.lexer import LexerToken
@@ -447,46 +447,44 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         return s.Statement_DoWhile(body, expr)
 
     def _parse_if_block(self):
+        branches, else_body = self._parse_if_common(
+            branch_factory=s.Statement_IfBranch,
+            body_parser=self._parse_block,
+            require_else=False,
+        )
+        return s.Statement_If(branches=branches, else_body=else_body)
+
+    def _parse_if_expression(self) -> s.Expression_If:
+        branches, else_body = self._parse_if_common(
+            branch_factory=s.Expression_IfBranch,
+            body_parser=self._parse_expression_block,
+            require_else=True,
+        )
+        assert else_body is not None
+        return s.Expression_If(branches=branches, else_body=else_body)
+
+    def _parse_if_common(self, *, branch_factory, body_parser, require_else: bool):
         self._safe_consume(TokenType.KW_IF)
         self._parsing_control_flow_header = True
         first_expr = self._parse_expression()
         self._parsing_control_flow_header = False
-        branches = [s.Statement_IfBranch(expr=first_expr, body=self._parse_block())]
+        branches = [branch_factory(expr=first_expr, body=body_parser())]
 
         while not self._is_at_end() and self._peek_curr().type == TokenType.KW_ELIF:
             self._safe_consume(TokenType.KW_ELIF)
             self._parsing_control_flow_header = True
             branch_expr = self._parse_expression()
             self._parsing_control_flow_header = False
-            branches.append(s.Statement_IfBranch(expr=branch_expr, body=self._parse_block()))
+            branches.append(branch_factory(expr=branch_expr, body=body_parser()))
 
         else_body = None
         if not self._is_at_end() and self._peek_curr().type == TokenType.KW_ELSE:
             self._safe_consume(TokenType.KW_ELSE)
-            else_body = self._parse_block()
-
-        return s.Statement_If(branches=branches, else_body=else_body)
-
-    def _parse_if_expression(self) -> s.Expression_If:
-        self._safe_consume(TokenType.KW_IF)
-        self._parsing_control_flow_header = True
-        first_expr = self._parse_expression()
-        self._parsing_control_flow_header = False
-        branches = [s.Expression_IfBranch(expr=first_expr, body=self._parse_expression_block())]
-
-        while not self._is_at_end() and self._peek_curr().type == TokenType.KW_ELIF:
-            self._safe_consume(TokenType.KW_ELIF)
-            self._parsing_control_flow_header = True
-            branch_expr = self._parse_expression()
-            self._parsing_control_flow_header = False
-            branches.append(s.Expression_IfBranch(expr=branch_expr, body=self._parse_expression_block()))
-
-        if self._is_at_end() or self._peek_curr().type != TokenType.KW_ELSE:
+            else_body = body_parser()
+        elif require_else:
             raise TypeError("If expression must have an else branch")
-        self._safe_consume(TokenType.KW_ELSE)
-        else_body = self._parse_expression_block()
 
-        return s.Expression_If(branches=branches, else_body=else_body)
+        return branches, else_body
 
     def _parse_unsafe_block(self) -> s.Statement_Unsafe:
         self._safe_consume(TokenType.KW_UNSAFE)
@@ -522,58 +520,75 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                     )
 
     def _parse_match(self) -> s.Statement_Match:
-        self._safe_consume(TokenType.KW_MATCH)
-        self._parsing_match_header = True
-        expr = self._parse_expression()
-        self._parsing_match_header = False
-        self._safe_consume(TokenType.LEFT_BRACE)
-        arms: list[s.Statement_MatchArm] = []
-        while self._peek_curr().type != TokenType.RIGHT_BRACE:
-            arms.append(self._parse_match_arm())
-        self._safe_consume(TokenType.RIGHT_BRACE)
+        expr, arms = self._parse_match_common(self._parse_statement_match_arm)
         return s.Statement_Match(expr=expr, arms=arms)
 
-    def _parse_match_arm(self) -> s.Statement_MatchArm:
-        pattern = None
-        if self._peek_curr().type == TokenType.IDENTIFIER and self._peek_curr().value == "_":
-            self._consume()
-        else:
-            pattern = self._parse_path()
-        binding = None
-        if self._peek_curr().type == TokenType.LEFT_PAREN:
-            self._safe_consume(TokenType.LEFT_PAREN)
-            binding = self._safe_consume(TokenType.IDENTIFIER).value
-            self._safe_consume(TokenType.RIGHT_PAREN)
-        self._safe_consume(TokenType.FAT_ARROW)
-        body = self._parse_block()
-        return s.Statement_MatchArm(pattern=pattern, binding=binding, body=body)
-
     def _parse_match_expression(self) -> s.Expression_Match:
+        expr, arms = self._parse_match_common(self._parse_expression_match_arm)
+        return s.Expression_Match(expr=expr, arms=arms)
+
+    def _parse_match_common(self, arm_parser):
         self._safe_consume(TokenType.KW_MATCH)
         self._parsing_match_header = True
         expr = self._parse_expression()
         self._parsing_match_header = False
         self._safe_consume(TokenType.LEFT_BRACE)
-        arms: list[s.Expression_MatchArm] = []
+        arms = []
         while self._peek_curr().type != TokenType.RIGHT_BRACE:
-            arms.append(self._parse_match_expression_arm())
+            arms.append(arm_parser())
         self._safe_consume(TokenType.RIGHT_BRACE)
-        return s.Expression_Match(expr=expr, arms=arms)
+        return expr, arms
 
-    def _parse_match_expression_arm(self) -> s.Expression_MatchArm:
-        pattern = None
-        if self._peek_curr().type == TokenType.IDENTIFIER and self._peek_curr().value == "_":
-            self._consume()
-        else:
-            pattern = self._parse_path()
+    def _parse_statement_match_arm(self) -> s.Statement_MatchArm:
+        pattern, binding, body = self._parse_match_arm_common(self._parse_statement_match_body)
+        return s.Statement_MatchArm(pattern=pattern, binding=binding, body=body)
+
+    def _parse_expression_match_arm(self) -> s.Expression_MatchArm:
+        pattern, binding, expr = self._parse_match_arm_common(self._parse_expression)
+        return s.Expression_MatchArm(pattern=pattern, binding=binding, expr=expr)
+
+    def _parse_match_arm_common(self, body_parser):
+        pattern = self._parse_match_pattern()
         binding = None
         if self._peek_curr().type == TokenType.LEFT_PAREN:
             self._safe_consume(TokenType.LEFT_PAREN)
             binding = self._safe_consume(TokenType.IDENTIFIER).value
             self._safe_consume(TokenType.RIGHT_PAREN)
         self._safe_consume(TokenType.FAT_ARROW)
-        expr = self._parse_expression()
-        return s.Expression_MatchArm(pattern=pattern, binding=binding, expr=expr)
+        return pattern, binding, body_parser()
+
+    def _parse_match_pattern(self):
+        pattern = None
+        curr_token = self._peek_curr()
+        if curr_token.type == TokenType.IDENTIFIER and curr_token.value == "_":
+            self._consume()
+        elif curr_token.type == TokenType.MINUS:
+            self._consume()
+            if self._peek_curr().type == TokenType.INTEGER:
+                pattern = self._parse_integer_literal()
+                pattern.value = f"-{pattern.value}"
+            elif self._peek_curr().type == TokenType.FLOAT:
+                pattern = self._parse_float_literal()
+                pattern.value = f"-{pattern.value}"
+            else:
+                raise TypeError("Match pattern '-' must be followed by numeric literal")
+        elif curr_token.type == TokenType.STRING:
+            pattern = self._parse_string_literal()
+        elif curr_token.type == TokenType.INTEGER:
+            pattern = self._parse_integer_literal()
+        elif curr_token.type == TokenType.FLOAT:
+            pattern = self._parse_float_literal()
+        elif curr_token.type == TokenType.BOOLEAN:
+            self._consume()
+            pattern = s.Expression_BooleanLiteral(curr_token.value == "true")
+        else:
+            pattern = self._parse_path()
+        return pattern
+
+    def _parse_statement_match_body(self):
+        if self._peek_curr().type == TokenType.LEFT_BRACE:
+            return self._parse_block()
+        return self._parse_expression()
 
     def _parse_expression(self) -> s.Statement_Expression:
         return self._parse_logical_or()
@@ -1279,3 +1294,4 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 f"  Expected: {','.join(str(x) for x in expected_types)}\n",
                 ThemePalette.ACCENT_TEXT,
             )
+        raise RuntimeError

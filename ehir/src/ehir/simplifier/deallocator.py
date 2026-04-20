@@ -127,6 +127,9 @@ class Deallocator:
                 else:
                     outer_paths.append(path)
 
+            if not inner_paths:
+                continue
+
             shared_path = self._find_shared_path(inner_paths)
             least_shared_node = shared_path[0]
             if least_shared_node == fn.entry_block.name:

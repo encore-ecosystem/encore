@@ -23,6 +23,7 @@ class _TestCase:
     refrain_name: str
     refrain_path: Path
     source_file: Path
+    entry_root: str
     entrypoint: str
 
     @property
@@ -33,7 +34,7 @@ class _TestCase:
 
 def add_test_parser(subparsers) -> tuple[str, Callable]:
     section = "test"
-    test_parser = subparsers.add_parser(section, help="Run unit tests in src/tests of all loaded refrains")
+    test_parser = subparsers.add_parser(section, help="Run unit tests in tests/ of all loaded refrains")
     test_parser.add_argument(
         "--backend", default="llvm", choices=set(AVAILABLE_BACKENDS.keys()), help="EHIR Compiler Backend"
     )
@@ -65,6 +66,7 @@ def handle_test(args: Namespace):
                 name=test_name,
                 path=test.refrain_path,
                 type=Refrain.TargetType.EXECUTABLE,
+                entry_root=test.entry_root,
                 entrypoint=test.entrypoint,
             )
         )
@@ -102,12 +104,13 @@ def _collect_test_cases(root: Path, filter_text: str | None) -> list[_TestCase]:
         if not tests_dir.exists():
             continue
         for source_file in sorted(tests_dir.rglob("*.enq")):
-            rel_to_src = source_file.relative_to(refrain_path / "src")
-            entrypoint = rel_to_src.with_suffix("").as_posix()
+            rel_to_tests = source_file.relative_to(tests_dir)
+            entrypoint = rel_to_tests.with_suffix("").as_posix()
             test = _TestCase(
                 refrain_name=refrain_name,
                 refrain_path=refrain_path,
                 source_file=source_file,
+                entry_root="tests",
                 entrypoint=entrypoint,
             )
             if filter_text and filter_text not in test.display_name:
@@ -164,7 +167,7 @@ def _resolve_local_core_root(project_root: Path) -> Optional[Path]:
 
 
 def _build_test_refrain_name(test: _TestCase) -> str:
-    stem = test.source_file.relative_to(test.refrain_path / "src").with_suffix("").as_posix()
+    stem = test.source_file.relative_to(test.refrain_path).with_suffix("").as_posix()
     normalized = []
     for ch in stem:
         if ch.isalnum():
