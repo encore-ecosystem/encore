@@ -177,9 +177,20 @@ class Lexer(ParserBase[str, LexerToken]):
 
                 case '"':
                     self._consume()
-                    while self._peek_curr() != '"':
+                    while not self._is_at_end():
+                        if self._peek_curr() == "\\":
+                            self._consume()
+                            if self._is_at_end():
+                                break
+                            self._consume()
+                            continue
+                        if self._peek_curr() == '"':
+                            break
                         self._consume()
-                    self._consume_and_push(TokenType.STRING)
+                    if self._peek_curr() == '"':
+                        self._consume_and_push(TokenType.STRING)
+                    else:
+                        self._push_token(TokenType.UNKNOWN)
 
                 case "'":
                     self._consume_and_push(TokenType.QUOTE)

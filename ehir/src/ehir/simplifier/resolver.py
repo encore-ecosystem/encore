@@ -634,7 +634,9 @@ class Resolver:
                     expected_t = None
                     if lhs_t and rhs_t:
                         if lhs_t != rhs_t:
-                            raise TypeError(f"Type mismatch for binop operands: {lhs_t} != {rhs_t}")
+                            raise TypeError(
+                                f"Type mismatch for binop operands in '{fn.name}': {lhs_t} != {rhs_t}. Instr: {instr}"
+                            )
                         expected_t = Usize_t(size=1) if isinstance(instr, _BOOLEAN_INSTRUCTS) else lhs_t
                         if instr.var_out.type and instr.var_out.type != expected_t:
                             raise TypeError(f"Type mismatch for binop: {instr.var_out.type} != {expected_t}")

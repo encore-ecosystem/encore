@@ -233,6 +233,31 @@ class EHIR_ProjectCompiler:
                     continue
                 append_directive(d)
 
+        def iter_child_module_ids(module_id: Path) -> list[Path]:
+            list_children = getattr(self.frontend, "_list_child_modules", None)
+            if not callable(list_children):
+                return []
+            children = list_children(module_id)
+            if not isinstance(children, dict):
+                return []
+            return [Path(child_id) for child_id in children.values()]
+
+        def append_module_tree(root_module_id: Path):
+            pending = [root_module_id]
+            observed: set[Path] = set()
+            while pending:
+                current_module_id = pending.pop()
+                if current_module_id in observed:
+                    continue
+                observed.add(current_module_id)
+
+                node.dependencies.add(current_module_id)
+                current_node = self._compile_node_by_id(current_module_id)
+                append_module_contents(current_node.module.ast)
+
+                for child_id in iter_child_module_ids(current_module_id):
+                    pending.append(child_id)
+
         def matches_import_symbol(directive_name: str, import_symbol: str) -> bool:
             return directive_name == import_symbol or directive_name.endswith(f"::{import_symbol}")
 
@@ -252,7 +277,7 @@ class EHIR_ProjectCompiler:
             parent_ast = parent_node.module.ast
 
             if directive.symbol == "*":
-                append_module_contents(parent_ast)
+                append_module_tree(parent_id)
 
             else:
                 for d in parent_ast:

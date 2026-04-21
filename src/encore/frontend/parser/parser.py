@@ -1309,4 +1309,3 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 f"  Expected: {','.join(str(x) for x in expected_types)}\n",
                 ThemePalette.ACCENT_TEXT,
             )
-        raise RuntimeError
