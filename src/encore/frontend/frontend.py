@@ -256,6 +256,21 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                 return
             visited_modules.add(module_id)
 
+            if module_id != id:
+                for idx, builtin_impl in enumerate(self._collect_builtin_associated_impls(module_id)):
+                    impl_key = (module_id, f"impl-builtin::{builtin_impl.struct.name}::{idx}")
+                    if impl_key in seen:
+                        continue
+                    seen.add(impl_key)
+                    declarations.append(
+                        ImportedTopLevelDeclaration(
+                            module_id=module_id,
+                            statement=builtin_impl,
+                            local_name=builtin_impl.struct.name,
+                            source_name=builtin_impl.struct.name,
+                        )
+                    )
+
             for statement in module_ast:
                 if not isinstance(statement, s.Statement_Import):
                     continue
@@ -278,6 +293,35 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             if statement.trait_name is not None:
                 continue
             if statement.struct.name != struct_name:
+                continue
+            result.append(statement)
+        return result
+
+    def _collect_builtin_associated_impls(self, module_id: Path) -> list[s.Statement_Impl]:
+        builtin_types = {
+            "bool",
+            "str",
+            "u8",
+            "u16",
+            "u32",
+            "u64",
+            "usize",
+            "i8",
+            "i16",
+            "i32",
+            "i64",
+            "isize",
+            "f32",
+            "f64",
+        }
+        ast = self._get_ast_by_id(module_id)
+        result: list[s.Statement_Impl] = []
+        for statement in ast:
+            if not isinstance(statement, s.Statement_Impl):
+                continue
+            if statement.trait_name is not None:
+                continue
+            if statement.struct.name not in builtin_types:
                 continue
             result.append(statement)
         return result
