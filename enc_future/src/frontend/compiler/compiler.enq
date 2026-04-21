@@ -1,0 +1,469 @@
+import core::option::Option
+import std::os::ensure_parent_dirs
+import std::os::write_file
+import std::path::Path
+import std::string::String
+import std::vec::Vec
+
+import ehir_core::Module
+import ehir_core::module_to_string
+import mod::progress::BuildProgress
+import mod::refrain::Refrain
+import mod::refrain::determine_entry_module
+import mod::refrain::find_refrain_by_name
+import mod::refrain::load_refrain_graph
+import mod::refrain::resolve_project_target
+import refrain::frontend::lexer::Lexer
+import refrain::frontend::parser::Parser
+import refrain::frontend::parser::statements::ImportStmt
+import refrain::frontend::parser::statements::Statement
+import refrain::frontend::translator::translate_module
+import refrain::frontend::type_infer::infer_program
+
+
+pub struct CompiledModule {
+    refrain_name: str
+    source_path: Path
+    module: Module
+}
+
+pub struct ResolvedImport {
+    refrain: Refrain
+    module_path: Path
+}
+
+pub struct ProjectCompiler {
+    root: Path
+    target_dir: Path
+    refrains: Vec[Refrain]
+    modules: Vec[CompiledModule]
+    progress: BuildProgress
+}
+
+pub fn make_project_compiler(root: Path, refrains: Vec[Refrain]) -> ProjectCompiler {
+    ret ProjectCompiler{
+        root,
+        root / "target" / "debug",
+        refrains,
+        Vec[CompiledModule]::new(),
+        BuildProgress::new()
+    }
+}
+
+pub fn compile_project(root: Path) -> () {
+    let refrains = load_refrain_graph(root, resolve_project_target(root))
+    let mut compiler = make_project_compiler(root, refrains)
+    ProjectCompiler::compile_all(compiler)
+    ret ()
+}
+
+impl for ProjectCompiler {
+    pub fn compile_all(mut self) -> () {
+        let mut index = 0_usize
+        loop {
+            match Vec[Refrain]::get(self.refrains, index) {
+                Some(refrain) => {
+                    self.compile_refrain(refrain)
+                    index = index + 1_usize
+                }
+                None => {
+                    break
+                }
+            }
+        }
+        self.progress = BuildProgress::finish(self.progress)
+        ret ()
+    }
+
+    fn compile_refrain(mut self, refrain: Refrain) -> () {
+        match determine_entry_module(refrain) {
+            Some(entry) => {
+                self.compile_module(refrain, entry)
+            }
+            None => {}
+        }
+        self.progress = BuildProgress::refrain_done(self.progress, refrain.name)
+        ret ()
+    }
+
+    fn compile_module(mut self, refrain: Refrain, module_path: Path) -> () {
+        if self.has_compiled_module(module_path) {
+            ret ()
+        }
+
+        let relative_path = self.relative_source_path(refrain, module_path)
+        self.progress = BuildProgress::show(self.progress, refrain.name, relative_path)
+
+        let source = String::as_str(Path::read_text(module_path))
+        let mut lexer = Lexer::new()
+        let tokens = Lexer::tokenize(lexer, source)
+        let mut parser = Parser::new()
+        let ast = Parser::parse(parser, tokens)
+
+        let imports = self.collect_imports(refrain, module_path, ast)
+        let mut index = 0_usize
+        loop {
+            match Vec[ResolvedImport]::get(imports, index) {
+                Some(resolved) => {
+                    self.compile_module(resolved.refrain, resolved.module_path)
+                    index = index + 1_usize
+                }
+                None => {
+                    break
+                }
+            }
+        }
+
+        let typed_dump = infer_program(ast)
+        let module_name = self.logical_module_name(refrain, module_path)
+        let module = translate_module(module_name, ast)
+        self.write_module_outputs(refrain, module_path, module, typed_dump)
+        self.modules = Vec[CompiledModule]::push(self.modules, CompiledModule{refrain.name, module_path, module})
+        ret ()
+    }
+
+    fn collect_imports(mut self, current_refrain: Refrain, current_module: Path, ast: Vec[Statement]) -> Vec[ResolvedImport] {
+        let mut out = Vec[ResolvedImport]::new()
+        let mut index = 0_usize
+        loop {
+            match Vec[Statement]::get(ast, index) {
+                Some(stmt) => {
+                    match stmt {
+                        Statement::Import(import_stmt) => {
+                            match self.resolve_import(current_refrain, current_module, import_stmt) {
+                                Some(resolved) => {
+                                    if !contains_import(out, resolved.module_path) {
+                                        out = Vec[ResolvedImport]::push(out, resolved)
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                    index = index + 1_usize
+                }
+                None => {
+                    break
+                }
+            }
+        }
+        ret out
+    }
+
+    fn resolve_import(mut self, current_refrain: Refrain, current_module: Path, import_stmt: ImportStmt) -> Option[ResolvedImport] {
+        let normalized = remove_import_alias(import_stmt.path)
+        if contains(normalized, "{") {
+            ret Option[ResolvedImport]::None
+        }
+
+        let segments = split_scope(normalized)
+        match Vec[str]::get(segments, 0_usize) {
+            Some(root_name) => {
+                let suffix = drop_segments(segments, 1_usize)
+                if root_name == "mod" {
+                    match Path::parent(current_module) {
+                        Some(parent) => {
+                            match resolve_module_path_from_base(parent, suffix) {
+                                Some(path) => {
+                                    ret Option[ResolvedImport]::Some(ResolvedImport{current_refrain, path})
+                                }
+                                None => {
+                                    ret Option[ResolvedImport]::None
+                                }
+                            }
+                        }
+                        None => {
+                            ret Option[ResolvedImport]::None
+                        }
+                    }
+                }
+
+                if root_name == "refrain" || root_name == "repo" || root_name == current_refrain.name {
+                    match resolve_module_path_from_base(current_refrain.path / "src", suffix) {
+                        Some(path) => {
+                            ret Option[ResolvedImport]::Some(ResolvedImport{current_refrain, path})
+                        }
+                        None => {
+                            ret Option[ResolvedImport]::None
+                        }
+                    }
+                }
+
+                match find_refrain_by_name(self.refrains, root_name) {
+                    Some(dep_refrain) => {
+                        match resolve_module_path_from_base(dep_refrain.path / "src", suffix) {
+                            Some(path) => {
+                                ret Option[ResolvedImport]::Some(ResolvedImport{dep_refrain, path})
+                            }
+                            None => {
+                                ret Option[ResolvedImport]::None
+                            }
+                        }
+                    }
+                    None => {
+                        ret Option[ResolvedImport]::None
+                    }
+                }
+            }
+            None => {
+                ret Option[ResolvedImport]::None
+            }
+        }
+    }
+
+    fn logical_module_name(self, refrain: Refrain, module_path: Path) -> str {
+        let relative = self.relative_source_path(refrain, module_path)
+        let stem = strip_module_suffix(relative)
+        if stem.len() == 0_usize {
+            ret refrain.name
+        }
+        ret refrain.name + "::" + replace_slashes_with_scope(stem)
+    }
+
+    fn relative_source_path(self, refrain: Refrain, module_path: Path) -> str {
+        let src_root = Path::as_str(refrain.path / "src")
+        let full = Path::as_str(module_path)
+        if !starts_with(full, src_root) {
+            ret full
+        }
+
+        let mut start = src_root.len()
+        if start < full.len() && full.byte_at(start) == 47_u8 {
+            start = start + 1_usize
+        }
+        ret full.slice(start, full.len() - start)
+    }
+
+    fn write_module_outputs(mut self, refrain: Refrain, module_path: Path, module: Module, typed_dump: str) -> () {
+        let relative = self.relative_source_path(refrain, module_path)
+
+        let ehir_path = Path::with_suffix(self.target_dir / "ehir" / refrain.name / relative, ".ehir")
+        let typed_path = Path::with_suffix(self.target_dir / "typed" / refrain.name / relative, ".typed.enq")
+
+        ensure_parent_dirs(Path::as_str(ehir_path))
+        ensure_parent_dirs(Path::as_str(typed_path))
+        write_file(Path::as_str(ehir_path), module_to_string(module))
+        write_file(Path::as_str(typed_path), typed_dump)
+        ret ()
+    }
+
+    fn has_compiled_module(self, module_path: Path) -> bool {
+        let raw = Path::as_str(module_path)
+        let mut index = 0_usize
+        loop {
+            match Vec[CompiledModule]::get(self.modules, index) {
+                Some(item) => {
+                    if Path::as_str(item.source_path) == raw {
+                        ret true
+                    }
+                    index = index + 1_usize
+                }
+                None => {
+                    break
+                }
+            }
+        }
+        ret false
+    }
+}
+
+fn resolve_module_path_from_base(base: Path, suffix: Vec[str]) -> Option[Path] {
+    let mut count = suffix.len()
+    loop {
+        let candidate = append_segments(base, suffix, count)
+        match try_resolve_module_path(candidate) {
+            Some(path) => {
+                ret Option[Path]::Some(path)
+            }
+            None => {}
+        }
+
+        if count == 0_usize {
+            break
+        }
+        count = count - 1_usize
+    }
+    ret Option[Path]::None
+}
+
+fn try_resolve_module_path(candidate: Path) -> Option[Path] {
+    let file_candidate = Path::with_suffix(candidate, ".enq")
+    if Path::exists(file_candidate) {
+        ret Option[Path]::Some(file_candidate)
+    }
+
+    let mod_candidate = candidate / "mod.enq"
+    if Path::exists(mod_candidate) {
+        ret Option[Path]::Some(mod_candidate)
+    }
+
+    ret Option[Path]::None
+}
+
+fn append_segments(base: Path, suffix: Vec[str], count: usize) -> Path {
+    if count == 0_usize {
+        ret base / "lib"
+    }
+
+    let mut out = base
+    let mut index = 0_usize
+    loop {
+        if index >= count {
+            break
+        }
+        match Vec[str]::get(suffix, index) {
+            Some(part) => {
+                out = out / part
+                index = index + 1_usize
+            }
+            None => {
+                break
+            }
+        }
+    }
+    ret out
+}
+
+fn contains_import(items: Vec[ResolvedImport], module_path: Path) -> bool {
+    let raw = Path::as_str(module_path)
+    let mut index = 0_usize
+    loop {
+        match Vec[ResolvedImport]::get(items, index) {
+            Some(item) => {
+                if Path::as_str(item.module_path) == raw {
+                    ret true
+                }
+                index = index + 1_usize
+            }
+            None => {
+                break
+            }
+        }
+    }
+    ret false
+}
+
+fn split_scope(path: str) -> Vec[str] {
+    ret split_scope_from(path, 0_usize, Vec[str]::new())
+}
+
+fn split_scope_from(path: str, start: usize, parts: Vec[str]) -> Vec[str] {
+    let next = find_scope_from(path, start)
+    if next >= path.len() {
+        if start >= path.len() {
+            ret parts
+        }
+        ret Vec[str]::push(parts, path.slice(start, path.len() - start))
+    }
+
+    let next_parts = Vec[str]::push(parts, path.slice(start, next - start))
+    ret split_scope_from(path, next + 2_usize, next_parts)
+}
+
+fn find_scope_from(path: str, index: usize) -> usize {
+    if index + 1_usize >= path.len() {
+        ret path.len()
+    }
+    if path.byte_at(index) == 58_u8 && path.byte_at(index + 1_usize) == 58_u8 {
+        ret index
+    }
+    ret find_scope_from(path, index + 1_usize)
+}
+
+fn drop_segments(segments: Vec[str], start: usize) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut index = start
+    loop {
+        match Vec[str]::get(segments, index) {
+            Some(part) => {
+                out = Vec[str]::push(out, part)
+                index = index + 1_usize
+            }
+            None => {
+                break
+            }
+        }
+    }
+    ret out
+}
+
+fn remove_import_alias(path: str) -> str {
+    let alias_index = find_alias_marker(path, 0_usize)
+    if alias_index >= path.len() {
+        ret path
+    }
+    ret path.slice(0_usize, alias_index)
+}
+
+fn find_alias_marker(path: str, index: usize) -> usize {
+    if index + 3_usize >= path.len() {
+        ret path.len()
+    }
+    if path.byte_at(index) == 32_u8
+        && path.byte_at(index + 1_usize) == 97_u8
+        && path.byte_at(index + 2_usize) == 115_u8
+        && path.byte_at(index + 3_usize) == 32_u8 {
+        ret index
+    }
+    ret find_alias_marker(path, index + 1_usize)
+}
+
+fn strip_module_suffix(relative: str) -> str {
+    if ends_with(relative, "/mod.enq") {
+        ret relative.slice(0_usize, relative.len() - 8_usize)
+    }
+    if ends_with(relative, ".enq") {
+        ret relative.slice(0_usize, relative.len() - 4_usize)
+    }
+    ret relative
+}
+
+fn replace_slashes_with_scope(path: str) -> str {
+    let mut out = ""
+    let mut index = 0_usize
+    loop {
+        if index >= path.len() {
+            break
+        }
+        let ch = path.slice(index, 1_usize)
+        if ch == "/" {
+            out = out + "::"
+        } else {
+            out = out + ch
+        }
+        index = index + 1_usize
+    }
+    ret out
+}
+
+fn contains(text: str, needle: str) -> bool {
+    ret find_substring(text, needle, 0_usize) < text.len()
+}
+
+fn find_substring(text: str, needle: str, index: usize) -> usize {
+    if needle.len() == 0_usize {
+        ret index
+    }
+    if index + needle.len() > text.len() {
+        ret text.len()
+    }
+    if text.slice(index, needle.len()) == needle {
+        ret index
+    }
+    ret find_substring(text, needle, index + 1_usize)
+}
+
+fn starts_with(text: str, prefix: str) -> bool {
+    if text.len() < prefix.len() {
+        ret false
+    }
+    ret text.slice(0_usize, prefix.len()) == prefix
+}
+
+fn ends_with(text: str, suffix: str) -> bool {
+    if text.len() < suffix.len() {
+        ret false
+    }
+    ret text.slice(text.len() - suffix.len(), suffix.len()) == suffix
+}
