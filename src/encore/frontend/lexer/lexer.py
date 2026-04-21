@@ -18,8 +18,6 @@ class Lexer(ParserBase[str, LexerToken]):
                     self._consume_and_push(TokenType.WHITESPACE)
 
                 case "\n":
-                    self._line += 1
-                    self._column = 0
                     self._consume_and_push(TokenType.NEWLINE)
 
                 case "+":
@@ -264,12 +262,26 @@ class Lexer(ParserBase[str, LexerToken]):
         self._consume()
         self._push_token(token_type)
 
+    def _consume(self) -> str:
+        token = super()._consume()
+        if token == self._get_eof_token():
+            return token
+        if token == "\n":
+            self._line += 1
+            self._column = 0
+        else:
+            self._column += 1
+        return token
+
     def _push_token(self, token_type: TokenType) -> int:
         match token_type:
             case TokenType.NEWLINE | TokenType.WHITESPACE | TokenType.ONE_LINE_COMMENT | TokenType.MULTI_LINE_COMMENT:
                 self._drop()
                 return 0
             case _:
-                lt = LexerToken(type=token_type, value="".join(self._value), line=self._line, column=self._column)
+                value = "".join(self._value)
+                line = self._line
+                column = self._column - len(value)
+                lt = LexerToken(type=token_type, value=value, line=line, column=max(column, 0))
                 self._push(lt)
                 return len(lt.value)

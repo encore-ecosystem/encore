@@ -1,7 +1,9 @@
 import argparse
+import sys
 from typing import Callable
 
 from encore import modes
+from encore.utils.diagnostics import render_diagnostic
 
 MODES = [
     modes.add_add_parser,
@@ -23,7 +25,13 @@ def main():
         dispatcher[name] = handler
 
     args = main_parser.parse_args()
-    if handler := dispatcher.get(args.command, None):
-        handler(args)
-    else:
-        print(f"Unknown mode: {args.command}")
+    try:
+        if handler := dispatcher.get(args.command, None):
+            handler(args)
+        else:
+            print(f"Unknown mode: {args.command}")
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        print(render_diagnostic(exc), file=sys.stderr)
+        raise SystemExit(1) from None

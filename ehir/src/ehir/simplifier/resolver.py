@@ -400,6 +400,10 @@ class Resolver:
                     raise TypeError(f"Enum variant '{case.variant}' does not carry payload")
 
                 payload_var = case.payload_var
+                if payload_var.name == "_":
+                    # Wildcard payload binding must not materialize a real SSA variable.
+                    case.payload_var = None
+                    continue
                 payload_var.type = payload_type
                 payload_var = add_variable(payload_var)
                 case.payload_var = payload_var

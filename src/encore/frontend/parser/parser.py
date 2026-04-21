@@ -1,4 +1,5 @@
 from dataclasses import replace
+from pathlib import Path
 from typing import Optional
 
 from ehir.core.instructions.base import Assignable, Instruction
@@ -64,7 +65,6 @@ from ehir.core.instructions.operators.logic import (
 )
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter
-from ehir.format import ThemePalette, printfmt
 from ehir.frontend.builtin.parser import Parser as EHIR_Parser
 
 from encore.frontend.base import ParserBase
@@ -72,6 +72,7 @@ from encore.frontend.lexer import LexerToken
 from encore.frontend.lexer.tokens import TokenType
 from encore.frontend.parser import statements as s
 from encore.frontend.types import AnySmartPointer, make_array_type, make_mutable_type, make_tuple_type
+from encore.utils.diagnostics import CompileDiagnostic
 
 TRACE_MAX_LINES_FOR_UNIT = 5
 SAFE_EHIR_INSTRUCTION_TYPES = (
@@ -117,6 +118,20 @@ FORBIDDEN_EHIR_INSTRUCTION_TYPES = (
 
 
 class Parser(ParserBase[LexerToken, s.Statement]):
+    _module_id: Path | None = None
+    _source_text: str = ""
+
+    def parse(
+        self,
+        source: list[LexerToken],
+        *,
+        module_id: Path | None = None,
+        source_text: str | None = None,
+    ) -> list[s.Statement]:
+        self._module_id = module_id
+        self._source_text = source_text or ""
+        return super().parse(source)
+
     def _parse(self) -> list[s.Statement]:
         self._parsing_match_header = False
         self._parsing_control_flow_header = False
@@ -1294,18 +1309,21 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         token = self._consume()
 
         if token.type != expected_token_type:
-            self._trace_unexpected_token_error(token, expected_types=[expected_token_type])
-            exit(1)
+            source_line = None
+            if self._source_text:
+                rows = self._source_text.splitlines()
+                if 0 <= token.line < len(rows):
+                    source_line = rows[token.line]
+            raise CompileDiagnostic(
+                message=(
+                    f"Unexpected token '{token.value}' ({token.type}). "
+                    f"Expected: {expected_token_type}"
+                ),
+                stage="parse",
+                module_id=self._module_id,
+                line=token.line,
+                column=token.column,
+                source_line=source_line,
+            )
 
         return token
-
-    def _trace_unexpected_token_error(self, token: LexerToken, expected_types: list[TokenType]):
-        printfmt(
-            f"  Error: Unexpected token '{token.value}' at line {token.line + 1}, column {token.column + 1}\n",
-            ThemePalette.ERROR_TEXT,
-        )
-        if expected_types:
-            printfmt(
-                f"  Expected: {','.join(str(x) for x in expected_types)}\n",
-                ThemePalette.ACCENT_TEXT,
-            )

@@ -24,6 +24,7 @@ from encore.frontend.types import (
     make_mutable_type,
     unwrap_for_storage,
 )
+from encore.utils.diagnostics import with_diagnostic_context
 from encore.utils.manifest import ProjectManifest
 
 
@@ -84,13 +85,19 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         ast = self._get_ast_by_id(id)
         imported_declarations = self._collect_imported_declarations(id, ast)
-        TypeInferer().infer(ast, imported_declarations)
+        try:
+            TypeInferer().infer(ast, imported_declarations)
+        except Exception as exc:
+            raise with_diagnostic_context(exc, stage="type-inference", module_id=id) from exc
 
         translator = Translator()
         ast_for_translation = self._prepare_imports_for_translation(id, ast)
-        module = translator.translate_ast(
-            ast_for_translation, module_id=id, imported_declarations=imported_declarations
-        )
+        try:
+            module = translator.translate_ast(
+                ast_for_translation, module_id=id, imported_declarations=imported_declarations
+            )
+        except Exception as exc:
+            raise with_diagnostic_context(exc, stage="translation", module_id=id) from exc
         module.id = id
 
         self._cache[id] = module
@@ -136,8 +143,12 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         if id in self._ast_cache:
             return self._ast_cache[id]
 
-        tokens = self._lexer.parse(list(id.read_text()))
-        ast = self._parser.parse(tokens)
+        source_text = id.read_text()
+        try:
+            tokens = self._lexer.parse(list(source_text))
+            ast = self._parser.parse(tokens, module_id=id, source_text=source_text)
+        except Exception as exc:
+            raise with_diagnostic_context(exc, stage="parse", module_id=id, source_text=source_text) from exc
         ast = self._inject_prelude_imports(id, ast)
         self._ast_cache[id] = ast
         return ast
