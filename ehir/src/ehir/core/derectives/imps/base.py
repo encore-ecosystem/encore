@@ -7,6 +7,7 @@ from ehir.core.derectives.base import Derective
 class Derective_import(Derective):
     prefix: list[str]
     symbol: str
+    alias: str | None = None
 
     def __post_init__(self):
         assert len(self.prefix) > 0

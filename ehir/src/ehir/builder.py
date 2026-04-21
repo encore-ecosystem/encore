@@ -82,11 +82,11 @@ class EHIR_Builder:
         self.module = module
         self.shift = 0
 
-    def build_imp(self, prefix: list[str], symbol: str):
-        self.module.ast.append(Derective_imp(prefix=prefix, symbol=symbol))
+    def build_imp(self, prefix: list[str], symbol: str, alias: str | None = None):
+        self.module.ast.append(Derective_imp(prefix=prefix, symbol=symbol, alias=alias))
 
-    def build_cimp(self, prefix: list[str], symbol: str):
-        self.module.ast.append(Derective_cimp(prefix=prefix, symbol=symbol))
+    def build_cimp(self, prefix: list[str], symbol: str, alias: str | None = None):
+        self.module.ast.append(Derective_cimp(prefix=prefix, symbol=symbol, alias=alias))
 
     def build_struct(self, name: str, generics: list[Type], params: list[Parameter]):
         self.module.ast.append(

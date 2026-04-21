@@ -263,7 +263,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         module = self._safe_consume(TokenType.IDENTIFIER).value
 
         if self._is_at_end() or self._peek_curr().type != TokenType.SCOPE:
-            return s.Statement_Import.ImportPair(module, [], default_leaf_kind)
+            return s.Statement_Import.ImportPair(
+                module, [], default_leaf_kind, alias=self._parse_possible_import_alias()
+            )
 
         self._safe_consume(TokenType.SCOPE)
         if self._is_at_end():
@@ -275,10 +277,14 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 self._consume()
                 if not self._is_at_end() and self._peek_curr().type == TokenType.SCOPE:
                     raise TypeError("Wildcard '*' must be terminal in import path")
-                return s.Statement_Import.ImportPair(
+                pair = s.Statement_Import.ImportPair(
                     module,
                     [s.Statement_Import.ImportPair("*", [], s.Statement_Import.ImportKind.GLOB)],
                 )
+                pair.alias = self._parse_possible_import_alias()
+                if pair.alias is not None:
+                    raise TypeError("Wildcard import cannot have alias")
+                return pair
             case TokenType.LEFT_BRACE:
                 self._safe_consume(TokenType.LEFT_BRACE)
                 mods: list[s.Statement_Import.ImportPair] = []
@@ -290,12 +296,18 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                             break
                         mods.append(self._parse_import_path(default_leaf_kind=s.Statement_Import.ImportKind.PACKAGE))
                 self._safe_consume(TokenType.RIGHT_BRACE)
-                return s.Statement_Import.ImportPair(module, mods)
+                return s.Statement_Import.ImportPair(module, mods, alias=self._parse_possible_import_alias())
             case TokenType.IDENTIFIER:
                 nested = self._parse_import_path(default_leaf_kind=s.Statement_Import.ImportKind.SYMBOL)
-                return s.Statement_Import.ImportPair(module, [nested])
+                return s.Statement_Import.ImportPair(module, [nested], alias=self._parse_possible_import_alias())
             case _:
                 raise ValueError(f"Unexpected Token: {curr_token}")
+
+    def _parse_possible_import_alias(self) -> str | None:
+        if self._peek_curr().type != TokenType.KW_AS:
+            return None
+        self._safe_consume(TokenType.KW_AS)
+        return self._safe_consume(TokenType.IDENTIFIER).value
 
     def _parse_struct_signature(self) -> s.StructureSignature:
         name = self._safe_consume(TokenType.IDENTIFIER).value
@@ -1215,6 +1227,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             return make_array_type(item_type, size)
 
         name = self._safe_consume(TokenType.IDENTIFIER).value
+        while self._peek_curr().type == TokenType.SCOPE:
+            self._safe_consume(TokenType.SCOPE)
+            name += f"::{self._safe_consume(TokenType.IDENTIFIER).value}"
         generics = self._parse_generics_args() if self._peek_curr().type == TokenType.LEFT_BRACKET else []
         return Type(name, generics)
 

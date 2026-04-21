@@ -34,6 +34,7 @@ class Statement_Import(Statement_TopLevel):
         src: str
         dst: list["Statement_Import.ImportPair"]
         kind: "Statement_Import.ImportKind | None" = None
+        alias: str | None = None
 
         def __post_init__(self):
             if self.kind is None:
@@ -42,12 +43,16 @@ class Statement_Import(Statement_TopLevel):
         def __repr__(self) -> str:
             match len(self.dst):
                 case 0:
-                    return "*" if self.kind == Statement_Import.ImportKind.GLOB else self.src
+                    base = "*" if self.kind == Statement_Import.ImportKind.GLOB else self.src
                 case 1:
-                    return f"{self.src}::{self.dst[0]}"
+                    base = f"{self.src}::{self.dst[0]}"
                 case _:
                     dst_repr = f"{{ {', '.join(x.__repr__() for x in self.dst)} }}"
-                    return f"{self.src}::{dst_repr}"
+                    base = f"{self.src}::{dst_repr}"
+
+            if self.alias is not None:
+                return f"{base} as {self.alias}"
+            return base
 
     pair: ImportPair
 

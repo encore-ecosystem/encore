@@ -1,11 +1,13 @@
 import tomllib
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from enum import StrEnum, auto
 from pathlib import Path
 from typing import Optional
 
 from ehir.builder import EHIR_Module
+from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 from ehir.core.derectives import Derective_imp, Derective_import
 
 from ehir import EHIR_Frontend
@@ -15,6 +17,7 @@ from encore.frontend.lexer import Lexer
 from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
 from encore.frontend.translator import Translator
+from encore.frontend.types import AnySmartPointer, is_mutable_type, is_raw_pointer_type, make_mutable_type, unwrap_for_storage
 from encore.utils.manifest import ProjectManifest
 
 
@@ -31,6 +34,7 @@ class ExportBinding:
     kind: ExportKind
     module_id: Path
     statement: s.Statement_TopLevel
+    source_name: str | None = None
 
 
 @dataclass
@@ -40,9 +44,18 @@ class ModuleIndex:
 
 
 @dataclass(frozen=True)
+class ImportRequest:
+    path: tuple[str, ...]
+    kind: str  # "item" | "glob"
+    alias: str | None = None
+
+
+@dataclass(frozen=True)
 class ImportedTopLevelDeclaration:
     module_id: Path
     statement: s.Statement_TopLevel
+    local_name: str | None = None
+    source_name: str | None = None
 
 
 @dataclass
@@ -65,10 +78,11 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         ast = self._get_ast_by_id(id)
         imported_declarations = self._collect_imported_declarations(id, ast)
-        TypeInferer().infer(ast, [declaration.statement for declaration in imported_declarations])
+        TypeInferer().infer(ast, imported_declarations)
 
         translator = Translator()
-        module = translator.translate_ast(ast, module_id=id, imported_declarations=imported_declarations)
+        ast_for_translation = self._prepare_imports_for_translation(id, ast)
+        module = translator.translate_ast(ast_for_translation, module_id=id, imported_declarations=imported_declarations)
         module.id = id
 
         self._cache[id] = module
@@ -103,6 +117,12 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         if not dep_filepath.exists():
             raise RuntimeError(f"Unable to import: {derective} in {id}")
         return dep_filepath
+
+    def _try_get_parent_id_of(self, id: Path, derective: Derective_import) -> Path | None:
+        try:
+            return self.get_parent_id_of(id, derective)
+        except (RuntimeError, ImportError):
+            return None
 
     def _get_ast_by_id(self, id: Path) -> list[s.Statement]:
         if id in self._ast_cache:
@@ -143,7 +163,9 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             if not isinstance(statement, s.Statement_Import):
                 continue
             for request in self._expand_import_statement(statement):
-                if request.prefix in (["std", "ops"], ["core", "ops"], ["refrain", "ops"]) and request.symbol == "*":
+                if request.kind != "glob":
+                    continue
+                if list(request.path) in (["std", "ops"], ["core", "ops"], ["refrain", "ops"]):
                     return ast
 
         prelude_import = s.Statement_Import(
@@ -164,27 +186,70 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         declarations: list[ImportedTopLevelDeclaration] = []
         seen: set[tuple[Path, str]] = set()
         visited_modules: set[Path] = set()
+        local_sources: dict[str, tuple[Path, str]] = {}
 
         def append_binding(binding: ExportBinding):
+            existing_source = local_sources.get(binding.name)
+            current_source = (binding.module_id, binding.source_name or binding.name)
+            if existing_source is not None and existing_source != current_source:
+                raise TypeError(
+                    f"Ambiguous import for symbol '{binding.name}': "
+                    f"{existing_source[0]}::{existing_source[1]} vs {current_source[0]}::{current_source[1]}. "
+                    f"Use `as` to disambiguate."
+                )
+            local_sources.setdefault(binding.name, current_source)
+
             key = (binding.module_id, binding.name)
             if key not in seen:
                 seen.add(key)
-                declarations.append(ImportedTopLevelDeclaration(module_id=binding.module_id, statement=binding.statement))
+                declarations.append(
+                    ImportedTopLevelDeclaration(
+                        module_id=binding.module_id,
+                        statement=binding.statement,
+                        local_name=binding.name,
+                        source_name=binding.source_name or binding.name,
+                    )
+                )
 
             if isinstance(binding.statement, s.Statement_StructureDefinition):
-                for idx, assoc_impl in enumerate(self._collect_associated_impls(binding.module_id, binding.name)):
+                lookup_name = binding.source_name or binding.name
+                for idx, assoc_impl in enumerate(self._collect_associated_impls(binding.module_id, lookup_name)):
+                    if binding.source_name is not None:
+                        assoc_impl = replace(assoc_impl, struct=replace(assoc_impl.struct, name=binding.name))
+                        assoc_impl = self._rewrite_impl_type_aliases(
+                            assoc_impl,
+                            source_name=lookup_name,
+                            target_name=binding.name,
+                        )
                     impl_key = (binding.module_id, f"impl::{binding.name}::{idx}")
                     if impl_key in seen:
                         continue
                     seen.add(impl_key)
-                    declarations.append(ImportedTopLevelDeclaration(module_id=binding.module_id, statement=assoc_impl))
+                    declarations.append(
+                        ImportedTopLevelDeclaration(
+                            module_id=binding.module_id,
+                            statement=assoc_impl,
+                            local_name=binding.name,
+                            source_name=binding.source_name or binding.name,
+                        )
+                    )
             elif isinstance(binding.statement, s.Statement_Trait):
-                for idx, trait_impl in enumerate(self._collect_trait_impls(binding.module_id, binding.name)):
+                lookup_name = binding.source_name or binding.name
+                for idx, trait_impl in enumerate(self._collect_trait_impls(binding.module_id, lookup_name)):
+                    if binding.source_name is not None:
+                        trait_impl = replace(trait_impl, trait_name=binding.name)
                     impl_key = (binding.module_id, f"impl-trait::{binding.name}::{idx}")
                     if impl_key in seen:
                         continue
                     seen.add(impl_key)
-                    declarations.append(ImportedTopLevelDeclaration(module_id=binding.module_id, statement=trait_impl))
+                    declarations.append(
+                        ImportedTopLevelDeclaration(
+                            module_id=binding.module_id,
+                            statement=trait_impl,
+                            local_name=binding.name,
+                            source_name=binding.source_name or binding.name,
+                        )
+                    )
 
         def visit(module_id: Path, module_ast: list[s.Statement]):
             if module_id in visited_modules:
@@ -266,36 +331,175 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return ExportBinding(statement.name, ExportKind.TRAIT, id, statement)
         return None
 
-    def _expand_import_statement(self, statement: s.Statement_Import) -> list[Derective_import]:
-        requests: list[Derective_import] = []
+    def _expand_import_statement(self, statement: s.Statement_Import) -> list[ImportRequest]:
+        requests: list[ImportRequest] = []
 
-        def visit(prefix: list[str], pair: s.Statement_Import.ImportPair):
+        def visit(prefix: tuple[str, ...], pair: s.Statement_Import.ImportPair, inherited_alias: str | None = None):
+            alias = inherited_alias or pair.alias
             if pair.dst:
+                if alias is not None and len(pair.dst) != 1:
+                    raise TypeError("Alias cannot be applied to import groups")
                 for child in pair.dst:
-                    visit(prefix + [pair.src], child)
+                    visit(prefix + (pair.src,), child, alias)
                 return
 
-            if pair.kind == s.Statement_Import.ImportKind.PACKAGE:
-                requests.append(Derective_imp(prefix=prefix + [pair.src], symbol="*"))
-            elif pair.kind == s.Statement_Import.ImportKind.SYMBOL:
-                requests.append(Derective_imp(prefix=prefix, symbol=pair.src))
-            elif pair.kind == s.Statement_Import.ImportKind.GLOB:
-                requests.append(Derective_imp(prefix=prefix, symbol="*"))
+            if pair.kind == s.Statement_Import.ImportKind.GLOB:
+                if alias is not None:
+                    raise TypeError("Wildcard import cannot have alias")
+                requests.append(ImportRequest(path=prefix, kind="glob", alias=None))
+                return
 
-        visit([], statement.pair)
+            requests.append(ImportRequest(path=prefix + (pair.src,), kind="item", alias=alias))
+
+        visit(tuple(), statement.pair)
         return requests
 
-    def _resolve_import_bindings(self, id: Path, request: Derective_import) -> list[ExportBinding]:
-        parent_id = self.get_parent_id_of(id, request)
-        target_index = self._get_module_index(parent_id)
-
-        if request.symbol == "*":
+    def _resolve_import_bindings(self, id: Path, request: ImportRequest) -> list[ExportBinding]:
+        if request.kind == "glob":
+            parent_id = self.get_parent_id_of(id, Derective_imp(prefix=list(request.path), symbol="*"))
+            target_index = self._get_module_index(parent_id)
             return list(target_index.exports.values())
 
-        binding = target_index.exports.get(request.symbol)
-        if binding is None:
-            raise RuntimeError(f"Unable to import: {request}")
-        return [binding]
+        module_candidate_id = self._try_get_parent_id_of(id, Derective_imp(prefix=list(request.path), symbol="*"))
+        symbol_candidate_binding: ExportBinding | None = None
+        if len(request.path) >= 2:
+            parent_id = self._try_get_parent_id_of(id, Derective_imp(prefix=list(request.path[:-1]), symbol="*"))
+            if parent_id is not None:
+                target_index = self._get_module_index(parent_id)
+                symbol_candidate_binding = target_index.exports.get(request.path[-1])
+
+        if module_candidate_id is not None and symbol_candidate_binding is not None:
+            # Backward compatibility with legacy imports: prefer symbol when both exist.
+            if request.alias is None:
+                return [symbol_candidate_binding]
+            return [self._alias_binding(symbol_candidate_binding, request.alias)]
+
+        if symbol_candidate_binding is not None:
+            if request.alias is None:
+                return [symbol_candidate_binding]
+            return [self._alias_binding(symbol_candidate_binding, request.alias)]
+
+        if module_candidate_id is not None:
+            local_module_name = request.alias or request.path[-1]
+            return self._resolve_module_import_bindings(module_candidate_id, local_module_name)
+
+        raise RuntimeError(f"Unable to import: {'::'.join(request.path)}")
+
+    def _prepare_imports_for_translation(self, id: Path, ast: list[s.Statement]) -> list[s.Statement]:
+        translated_ast = deepcopy(ast)
+
+        def classify_import_pair(prefix: tuple[str, ...], pair: s.Statement_Import.ImportPair):
+            if pair.dst:
+                for child in pair.dst:
+                    classify_import_pair(prefix + (pair.src,), child)
+                return
+
+            if pair.kind == s.Statement_Import.ImportKind.GLOB:
+                return
+
+            path = prefix + (pair.src,)
+            if self._is_module_import_path(id, path, pair.alias):
+                pair.kind = s.Statement_Import.ImportKind.PACKAGE
+            else:
+                pair.kind = s.Statement_Import.ImportKind.SYMBOL
+
+        for statement in translated_ast:
+            if not isinstance(statement, s.Statement_Import):
+                continue
+            classify_import_pair(tuple(), statement.pair)
+
+        return translated_ast
+
+    def _is_module_import_path(self, id: Path, path: tuple[str, ...], alias: str | None) -> bool:
+        module_candidate_id = self._try_get_parent_id_of(id, Derective_imp(prefix=list(path), symbol="*"))
+        symbol_candidate_exists = False
+        if len(path) >= 2:
+            parent_id = self._try_get_parent_id_of(id, Derective_imp(prefix=list(path[:-1]), symbol="*"))
+            if parent_id is not None:
+                symbol_candidate_exists = self._get_module_index(parent_id).exports.get(path[-1]) is not None
+
+        if module_candidate_id is not None and symbol_candidate_exists:
+            # Keep legacy behavior for ambiguous paths.
+            return False
+        return module_candidate_id is not None and not symbol_candidate_exists
+
+    def _resolve_module_import_bindings(self, module_id: Path, local_module_name: str) -> list[ExportBinding]:
+        result: list[ExportBinding] = []
+        visited: set[Path] = set()
+
+        def visit(curr_module_id: Path, relative_prefix: tuple[str, ...]):
+            if curr_module_id in visited:
+                return
+            visited.add(curr_module_id)
+
+            index = self._get_module_index(curr_module_id)
+            prefix = "::".join((local_module_name, *relative_prefix))
+            for binding in index.exports.values():
+                local_name = f"{prefix}::{binding.name}"
+                result.append(self._alias_binding(binding, local_name))
+
+            for child_name, child_module_id in self._list_child_modules(curr_module_id).items():
+                visit(child_module_id, (*relative_prefix, child_name))
+
+        visit(module_id, tuple())
+        return result
+
+    def _list_child_modules(self, module_id: Path) -> dict[str, Path]:
+        children: dict[str, Path] = {}
+
+        if module_id.stem == "mod":
+            base_dir = module_id.parent
+            candidates = list(base_dir.glob("*.enq")) + list(base_dir.glob("*/mod.enq"))
+        else:
+            base_dir = module_id.parent / module_id.stem
+            if not base_dir.exists():
+                return children
+            candidates = list(base_dir.glob("*.enq")) + list(base_dir.glob("*/mod.enq"))
+
+        for candidate in candidates:
+            if candidate.resolve() == module_id.resolve():
+                continue
+            if candidate.name == "mod.enq":
+                child_name = candidate.parent.name
+            else:
+                child_name = candidate.stem
+            children.setdefault(child_name, candidate.resolve())
+
+        return children
+
+    def _alias_binding(self, binding: ExportBinding, alias: str) -> ExportBinding:
+        return replace(binding, name=alias, source_name=binding.name)
+
+    def _rewrite_impl_type_aliases(self, impl: s.Statement_Impl, *, source_name: str, target_name: str) -> s.Statement_Impl:
+        rewritten_methods: list[s.Statement_FunctionDefinition] = []
+        for method in impl.body:
+            params = [
+                replace(param, type=self._replace_type_name(param.type, source_name, target_name))
+                for param in method.signature.params
+            ]
+            ret_type = (
+                None
+                if method.signature.type is None
+                else self._replace_type_name(method.signature.type, source_name, target_name)
+            )
+            signature = replace(method.signature, params=params, type=ret_type)
+            rewritten_methods.append(replace(method, signature=signature))
+        return replace(impl, body=rewritten_methods)
+
+    def _replace_type_name(self, typ: Type, source_name: str, target_name: str) -> Type:
+        if is_mutable_type(typ):
+            return make_mutable_type(self._replace_type_name(unwrap_for_storage(typ), source_name, target_name))
+        if isinstance(typ, AnySmartPointer):
+            return AnySmartPointer(self._replace_type_name(typ.pointee, source_name, target_name))
+        if isinstance(typ, HeapSmartPointer):
+            return HeapSmartPointer(self._replace_type_name(typ.pointee, source_name, target_name))
+        if isinstance(typ, StackSmartPointer):
+            return StackSmartPointer(self._replace_type_name(typ.pointee, source_name, target_name))
+        if is_raw_pointer_type(typ):
+            return Pointer(self._replace_type_name(typ.pointee, source_name, target_name))
+
+        name = target_name if typ.name == source_name else typ.name
+        return Type(name, [self._replace_type_name(generic, source_name, target_name) for generic in typ.generics])
 
     def _get_project_root_of(self, id: Path) -> Path:
         for parent in [id.parent, *id.parents]:

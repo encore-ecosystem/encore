@@ -226,7 +226,7 @@ class Translator:
         self._current_module_id = module_id or Path()
         imported_declarations = imported_declarations or []
         declaration_entries = [*self._normalize_declaration_entries(imported_declarations)] + [
-            (self._current_module_id, statement) for statement in ast if isinstance(statement, s.Statement_TopLevel)
+            (self._current_module_id, statement, None, None) for statement in ast if isinstance(statement, s.Statement_TopLevel)
         ]
         self.preload_declarations(declaration_entries)
         for statement in ast:
@@ -237,23 +237,29 @@ class Translator:
         # time.sleep(0.5)
         return self._module
 
-    def preload_declarations(self, declarations: list[tuple[Path, s.Statement_TopLevel]]):
-        for module_id, statement in declarations:
-            self._register_declaration_alias(module_id, statement)
+    def preload_declarations(self, declarations: list[tuple[Path, s.Statement_TopLevel, str | None, str | None]]):
+        for module_id, statement, local_name, source_name in declarations:
+            self._register_declaration_alias(module_id, statement, local_name=local_name, source_name=source_name)
 
-        for module_id, statement in declarations:
+        for module_id, statement, _, source_name in declarations:
             if isinstance(statement, s.Statement_StructureDefinition):
-                definition = self._normalize_struct_definition(statement.signature)
+                signature = statement.signature
+                if source_name is not None:
+                    signature = replace(signature, name=source_name)
+                definition = self._normalize_struct_definition(signature)
                 definition = replace(definition, name=self._qualify_type_name(module_id, definition.name))
                 self._structs[definition.name] = definition
             elif isinstance(statement, s.Statement_FunctionDefinition):
-                statement.signature = self._normalize_signature(statement.signature)
-                if statement.signature.type is None:
+                signature = statement.signature
+                if source_name is not None:
+                    signature = replace(signature, name=source_name)
+                signature = self._normalize_signature(signature)
+                if signature.type is None:
                     continue
-                internal_name = self._qualify_function_name(module_id, statement.signature.name)
-                internal_signature = replace(statement.signature, name=internal_name)
+                internal_name = self._qualify_function_name(module_id, signature.name)
+                internal_signature = replace(signature, name=internal_name)
                 self._register_source_signature(internal_signature)
-                if self._signature_has_any_pointer(statement.signature):
+                if self._signature_has_any_pointer(signature):
                     for pointer_cls, suffix in ((HeapSmartPointer, "__H"), (StackSmartPointer, "__S")):
                         concrete_sig = self._specialize_signature_any_pointer(internal_signature, pointer_cls)
                         concrete_name = f"{internal_name}{suffix}"
@@ -275,22 +281,29 @@ class Translator:
                         ret_type=self._translate_type(internal_signature.type),
                     )
             elif isinstance(statement, s.Statement_EnumDefinition):
-                directive = self._build_enum_directive(statement, module_id=module_id)
+                enum_statement = statement
+                if source_name is not None:
+                    enum_statement = replace(enum_statement, name=source_name)
+                directive = self._build_enum_directive(enum_statement, module_id=module_id)
                 self._enums[directive.name] = directive
             elif isinstance(statement, s.FunctionSignature):
-                self._extern_fns[statement.name] = statement
-                self._register_source_signature(statement)
-                self._funcs[statement.name] = Derective_extern_fn(
-                    name=statement.name,
-                    params=self._lower_params(statement.params),
-                    ret_type=self._translate_type(statement.type),
+                signature = statement if source_name is None else replace(statement, name=source_name)
+                self._extern_fns[signature.name] = signature
+                self._register_source_signature(signature)
+                self._funcs[signature.name] = Derective_extern_fn(
+                    name=signature.name,
+                    params=self._lower_params(signature.params),
+                    ret_type=self._translate_type(signature.type),
                 )
             elif isinstance(statement, s.Statement_Trait):
-                internal_trait_name = self._qualify_trait_name(module_id, statement.name)
+                trait_statement = statement
+                if source_name is not None:
+                    trait_statement = replace(trait_statement, name=source_name)
+                internal_trait_name = self._qualify_trait_name(module_id, trait_statement.name)
                 internal_trait = replace(
-                    statement,
+                    trait_statement,
                     name=internal_trait_name,
-                    bases=[self._translate_trait_type(base) for base in statement.bases],
+                    bases=[self._translate_trait_type(base) for base in trait_statement.bases],
                 )
                 self._traits[internal_trait_name] = internal_trait
                 for method in internal_trait.body:
@@ -441,6 +454,16 @@ class Translator:
         if inherent_name in self._any_pointer_variants:
             return inherent_name, None
 
+        suffix = f"::{base_receiver_type.name}::{method_name}"
+        inherent_candidates = [name for name in self._funcs if name.endswith(suffix)]
+        if len(inherent_candidates) == 1:
+            matched_name = inherent_candidates[0]
+            matched_callee = self._funcs.get(matched_name)
+            if matched_callee is not None:
+                return matched_name, matched_callee
+            if matched_name in self._any_pointer_variants:
+                return matched_name, None
+
         for trait_name in self._impl_traits.get(base_receiver_type.name, []):
             signature = self._lookup_trait_method_signature(
                 trait_name,
@@ -492,14 +515,16 @@ class Translator:
                 match pair.kind:
                     case s.Statement_Import.ImportKind.PACKAGE:
                         (self._builder.build_cimp if is_public else self._builder.build_imp)(
-                            prefix=prefix + [pair.src], symbol="*"
+                            prefix=prefix + [pair.src], symbol="*", alias=pair.alias
                         )
                     case s.Statement_Import.ImportKind.SYMBOL:
                         (self._builder.build_cimp if is_public else self._builder.build_imp)(
-                            prefix=prefix, symbol=pair.src
+                            prefix=prefix, symbol=pair.src, alias=pair.alias
                         )
                     case s.Statement_Import.ImportKind.GLOB:
-                        (self._builder.build_cimp if is_public else self._builder.build_imp)(prefix=prefix, symbol="*")
+                        (self._builder.build_cimp if is_public else self._builder.build_imp)(
+                            prefix=prefix, symbol="*", alias=pair.alias
+                        )
             case _:
                 for dst in pair.dst:
                     self._translate_import_pair(prefix=prefix + [pair.src], pair=dst, is_public=is_public)
@@ -788,36 +813,54 @@ class Translator:
 
     def _normalize_declaration_entries(
         self, declarations: list[object]
-    ) -> list[tuple[Path, s.Statement_TopLevel]]:
-        normalized: list[tuple[Path, s.Statement_TopLevel]] = []
+    ) -> list[tuple[Path, s.Statement_TopLevel, str | None, str | None]]:
+        normalized: list[tuple[Path, s.Statement_TopLevel, str | None, str | None]] = []
         for declaration in declarations:
             module_id = getattr(declaration, "module_id", None)
             statement = getattr(declaration, "statement", None)
             if module_id is None or statement is None:
                 raise TypeError(f"Unsupported imported declaration payload: {declaration!r}")
-            normalized.append((module_id, statement))
+            local_name = getattr(declaration, "local_name", None)
+            source_name = getattr(declaration, "source_name", None)
+            normalized.append((module_id, statement, local_name, source_name))
         return normalized
 
-    def _register_declaration_alias(self, module_id: Path, statement: s.Statement_TopLevel):
+    def _register_declaration_alias(
+        self,
+        module_id: Path,
+        statement: s.Statement_TopLevel,
+        *,
+        local_name: str | None = None,
+        source_name: str | None = None,
+    ):
+        source_name = source_name or local_name
         if isinstance(statement, s.Statement_StructureDefinition):
-            self._type_aliases[statement.signature.name] = self._qualify_type_name(module_id, statement.signature.name)
+            local = local_name or statement.signature.name
+            source = source_name or statement.signature.name
+            self._type_aliases[local] = self._qualify_type_name(module_id, source)
             return
         if isinstance(statement, s.Statement_EnumDefinition):
-            self._type_aliases[statement.name] = self._qualify_type_name(module_id, statement.name)
+            local = local_name or statement.name
+            source = source_name or statement.name
+            self._type_aliases[local] = self._qualify_type_name(module_id, source)
             return
         if isinstance(statement, s.Statement_Trait):
-            qualified_trait_name = self._qualify_trait_name(module_id, statement.name)
-            self._trait_aliases[statement.name] = qualified_trait_name
+            local = local_name or statement.name
+            source = source_name or statement.name
+            qualified_trait_name = self._qualify_trait_name(module_id, source)
+            self._trait_aliases[local] = qualified_trait_name
             for method in statement.body:
-                self._function_aliases[f"{statement.name}::{method.name}"] = f"{qualified_trait_name}::{method.name}"
+                self._function_aliases[f"{local}::{method.name}"] = f"{qualified_trait_name}::{method.name}"
             return
         if isinstance(statement, s.FunctionSignature):
-            self._function_aliases[statement.name] = statement.name
+            local = local_name or statement.name
+            source = source_name or statement.name
+            self._function_aliases[local] = source
             return
         if isinstance(statement, s.Statement_FunctionDefinition):
-            self._function_aliases[statement.signature.name] = self._qualify_function_name(
-                module_id, statement.signature.name
-            )
+            local = local_name or statement.signature.name
+            source = source_name or statement.signature.name
+            self._function_aliases[local] = self._qualify_function_name(module_id, source)
             return
         if isinstance(statement, s.Statement_Impl) and statement.trait_name is None:
             owner_name = self._type_aliases.get(statement.struct.name, statement.struct.name)
@@ -2529,17 +2572,20 @@ class Translator:
         if call_name in self._funcs or call_name in self._extern_fns:
             return call_name, explicit_generics
 
-        if len(expr.callee.segments) == 2:
-            owner = expr.callee.segments[0]
-            normalized_name = f"{self._translate_type(owner).name}::{expr.callee.segments[1].name}"
-            if normalized_name in self._funcs or normalized_name in self._extern_fns:
+        if len(expr.callee.segments) >= 2:
+            owner_segments = expr.callee.segments[:-1]
+            owner = owner_segments[-1]
+            normalized_owner = "::".join(segment.name for segment in owner_segments)
+            normalized_name = f"{normalized_owner}::{expr.callee.segments[-1].name}"
+            mapped_name = self._function_aliases.get(normalized_name, normalized_name)
+            if mapped_name in self._funcs or mapped_name in self._extern_fns:
                 if owner.generics:
                     if explicit_generics:
                         raise TypeError(
                             "Associated function generics must be specified either on the owner type or on the call"
                         )
                     explicit_generics = list(owner.generics)
-                return normalized_name, explicit_generics
+                return mapped_name, explicit_generics
 
         return call_name, explicit_generics
 

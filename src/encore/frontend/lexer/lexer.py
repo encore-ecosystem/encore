@@ -232,6 +232,7 @@ class Lexer(ParserBase[str, LexerToken]):
             "match": TokenType.KW_MATCH,
             "pub": TokenType.KW_PUB,
             "import": TokenType.KW_IMPORT,
+            "as": TokenType.KW_AS,
             "extern": TokenType.KW_EXTERN,
             "unsafe": TokenType.KW_UNSAFE,
             "ehir": TokenType.KW_EHIR,

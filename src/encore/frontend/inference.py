@@ -49,11 +49,13 @@ class TypeInferer:
     def infer(
         self,
         ast: list[s.Statement],
-        imported_declarations: list[s.Statement_TopLevel] | None = None,
+        imported_declarations: list[object] | None = None,
     ) -> list[s.Statement]:
         imported_declarations = imported_declarations or []
-        self._collect_declarations(imported_declarations)
-        self._collect_declarations(ast)
+        declaration_entries = [*self._normalize_declaration_entries(imported_declarations)] + [
+            (statement, None, None) for statement in ast if isinstance(statement, s.Statement_TopLevel)
+        ]
+        self._collect_declarations(declaration_entries)
 
         for statement in ast:
             if isinstance(statement, s.Statement_FunctionDefinition):
@@ -64,18 +66,23 @@ class TypeInferer:
 
         return ast
 
-    def _collect_declarations(self, statements: list[s.Statement]):
-        for statement in statements:
+    def _collect_declarations(self, declarations: list[tuple[s.Statement_TopLevel, str | None, str | None]]):
+        for statement, local_name, source_name in declarations:
             if isinstance(statement, s.Statement_FunctionDefinition):
-                self._funcs[statement.signature.name] = statement
+                name = local_name or statement.signature.name
+                self._funcs[name] = statement
             elif isinstance(statement, s.FunctionSignature):
-                self._funcs[statement.name] = statement
+                name = local_name or statement.name
+                self._funcs[name] = statement
             elif isinstance(statement, s.Statement_StructureDefinition):
-                self._structs[statement.signature.name] = self._normalize_struct_definition(statement.signature)
+                name = local_name or statement.signature.name
+                self._structs[name] = self._normalize_struct_definition(statement.signature)
             elif isinstance(statement, s.Statement_EnumDefinition):
-                self._enums[statement.name] = statement
+                name = local_name or statement.name
+                self._enums[name] = statement
             elif isinstance(statement, s.Statement_Trait):
-                self._traits[statement.name] = statement
+                name = local_name or statement.name
+                self._traits[name] = statement
             elif isinstance(statement, s.Statement_Impl):
                 struct_name = statement.struct.name
                 if statement.trait_name is not None:
@@ -96,6 +103,19 @@ class TypeInferer:
                         self_type=statement.struct,
                     )
                     self._funcs[f"{struct_name}::{method.name}"] = replace(method, signature=normalized_signature)
+
+    def _normalize_declaration_entries(
+        self, declarations: list[object]
+    ) -> list[tuple[s.Statement_TopLevel, str | None, str | None]]:
+        normalized: list[tuple[s.Statement_TopLevel, str | None, str | None]] = []
+        for declaration in declarations:
+            statement = getattr(declaration, "statement", declaration)
+            if not isinstance(statement, s.Statement_TopLevel):
+                raise TypeError(f"Unsupported imported declaration payload: {declaration!r}")
+            local_name = getattr(declaration, "local_name", None)
+            source_name = getattr(declaration, "source_name", None)
+            normalized.append((statement, local_name, source_name))
+        return normalized
 
     def _infer_function(self, statement: s.Statement_FunctionDefinition, self_type: Type | None = None):
         statement.signature = self._normalize_signature(statement.signature, self_type=self_type)
@@ -331,9 +351,11 @@ class TypeInferer:
         if signature is not None:
             return call_name, explicit_generics, signature
 
-        if len(expr.callee.segments) == 2:
-            owner = expr.callee.segments[0]
-            normalized_name = f"{owner.name}::{expr.callee.segments[1].name}"
+        if len(expr.callee.segments) >= 2:
+            owner_segments = expr.callee.segments[:-1]
+            owner = owner_segments[-1]
+            normalized_owner = "::".join(segment.name for segment in owner_segments)
+            normalized_name = f"{normalized_owner}::{expr.callee.segments[-1].name}"
             signature = self._lookup_function_signature(normalized_name)
             if signature is not None:
                 if owner.generics:
@@ -382,6 +404,14 @@ class TypeInferer:
         inherent_signature = self._lookup_function_signature(inherent_name)
         if inherent_signature is not None:
             return inherent_name, inherent_signature
+
+        suffix = f"::{base_receiver_type.name}::{method_name}"
+        inherent_candidates = [name for name in self._funcs if name.endswith(suffix)]
+        if len(inherent_candidates) == 1:
+            matched_name = inherent_candidates[0]
+            matched_signature = self._lookup_function_signature(matched_name)
+            if matched_signature is not None:
+                return matched_name, matched_signature
 
         for trait_name in self._impl_traits.get(base_receiver_type.name, []):
             trait_signature = self._lookup_trait_method_signature(
