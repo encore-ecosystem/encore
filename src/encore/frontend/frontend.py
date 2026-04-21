@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Optional
 
 from ehir.builder import EHIR_Module
-from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 from ehir.core.derectives import Derective_imp, Derective_import
+from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 
 from ehir import EHIR_Frontend
 from encore import ENCORE_CACHE_DIR
@@ -17,7 +17,13 @@ from encore.frontend.lexer import Lexer
 from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
 from encore.frontend.translator import Translator
-from encore.frontend.types import AnySmartPointer, is_mutable_type, is_raw_pointer_type, make_mutable_type, unwrap_for_storage
+from encore.frontend.types import (
+    AnySmartPointer,
+    is_mutable_type,
+    is_raw_pointer_type,
+    make_mutable_type,
+    unwrap_for_storage,
+)
 from encore.utils.manifest import ProjectManifest
 
 
@@ -82,7 +88,9 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         translator = Translator()
         ast_for_translation = self._prepare_imports_for_translation(id, ast)
-        module = translator.translate_ast(ast_for_translation, module_id=id, imported_declarations=imported_declarations)
+        module = translator.translate_ast(
+            ast_for_translation, module_id=id, imported_declarations=imported_declarations
+        )
         module.id = id
 
         self._cache[id] = module
@@ -427,7 +435,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             local_module_name = request.alias or request.path[-1]
             return self._resolve_module_import_bindings(module_candidate_id, local_module_name)
 
-        raise RuntimeError(f"Unable to import: {'::'.join(request.path)}")
+        raise RuntimeError(f"Unable to import: {'::'.join(request.path)} in {id}")
 
     def _prepare_imports_for_translation(self, id: Path, ast: list[s.Statement]) -> list[s.Statement]:
         translated_ast = deepcopy(ast)
@@ -514,7 +522,9 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
     def _alias_binding(self, binding: ExportBinding, alias: str) -> ExportBinding:
         return replace(binding, name=alias, source_name=binding.name)
 
-    def _rewrite_impl_type_aliases(self, impl: s.Statement_Impl, *, source_name: str, target_name: str) -> s.Statement_Impl:
+    def _rewrite_impl_type_aliases(
+        self, impl: s.Statement_Impl, *, source_name: str, target_name: str
+    ) -> s.Statement_Impl:
         rewritten_methods: list[s.Statement_FunctionDefinition] = []
         for method in impl.body:
             params = [
