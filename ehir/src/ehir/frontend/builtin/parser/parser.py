@@ -2,6 +2,7 @@ from ehir.core.block import Block
 from ehir.core.derectives import (
     Derective_cimp,
     Derective_enum,
+    Derective_extern_fn,
     Derective_fn,
     Derective_imp,
     Derective_impl,
@@ -260,9 +261,9 @@ class Parser:
         self._safe_consume(t.EXTERN)
         return self._parse_fn_decl(with_body=False, is_extern=True)
 
-    def _parse_fn_decl(self, with_body: bool, is_extern: bool = False) -> Derective_fn:
+    def _parse_fn_decl(self, with_body: bool, is_extern: bool = False) -> Derective_fn | Derective_extern_fn:
         self._safe_consume(t.FN)
-        name = self._parse_name()
+        name = self._parse_callable_name()
         generics = self._parse_generics() if isinstance(self._lookup_curr(), t.LEFT_BRACKET) else []
 
         params = []
@@ -283,13 +284,21 @@ class Parser:
             while not isinstance(self._lookup_curr(), t.RIGHT_BRACE):
                 body.append(self._parse_block())
             self._safe_consume(t.RIGHT_BRACE)
+        if is_extern:
+            if len(generics) > 0:
+                raise ValueError(f"Extern function '{name}' cannot declare generics")
+            return Derective_extern_fn(
+                name=name,
+                params=params,
+                ret_type=ret_type,
+            )
+
         return Derective_fn(
             name=name,
             generics=generics,
             params=params,
             ret_type=ret_type,
             body=body,
-            is_extern=is_extern,
         )
 
     def _parse_block(self) -> Block:
@@ -470,11 +479,7 @@ class Parser:
             if isinstance(curr_token, t.UNSAFE):
                 curr_token = self._consume()
                 is_unsafe = True
-            fn_name = self._parse_name()
-            if isinstance(self._lookup_curr(), t.DOUBLE_COLON):
-                self._safe_consume(t.DOUBLE_COLON)
-                method = self._parse_name()
-                fn_name = f"{fn_name}::{method}"
+            fn_name = self._parse_callable_name()
             generics = self._parse_generics() if isinstance(self._lookup_curr(), t.LEFT_BRACKET) else []
 
             args = []
@@ -777,10 +782,38 @@ class Parser:
 
     def _parse_name(self) -> str:
         token = self._consume()
-        if isinstance(token, (t.IDENTIFIER, t.ADD, t.SUB, t.MUL, t.DIV, t.LES, t.LEQ, t.GRT, t.GEQ, t.IEQ, t.NEQ)):
+        if isinstance(
+            token,
+            (t.IDENTIFIER, t.ADD, t.SUB, t.MUL, t.DIV, t.MOD, t.SHL, t.SHR, t.AND, t.OR, t.XOR, t.LES, t.LEQ, t.GRT, t.GEQ, t.IEQ, t.NEQ),
+        ):
             return token.string
         self._trace_unexpected_token(token, t.IDENTIFIER)
         raise AssertionError("Unreachable")
+
+    def _parse_callable_name(self) -> str:
+        name = self._parse_name()
+        name += self._parse_scoped_segment_generics()
+
+        while isinstance(self._lookup_curr(), t.DOUBLE_COLON):
+            self._safe_consume(t.DOUBLE_COLON)
+            segment = self._parse_name()
+            segment += self._parse_scoped_segment_generics()
+            name = f"{name}::{segment}"
+
+        return name
+
+    def _parse_scoped_segment_generics(self) -> str:
+        if not isinstance(self._lookup_curr(), t.LEFT_BRACKET):
+            return ""
+
+        saved = self._consumed
+        generics = self._parse_generics()
+        if isinstance(self._lookup_curr(), t.DOUBLE_COLON):
+            joined = ", ".join(str(generic) for generic in generics)
+            return f"[{joined}]"
+
+        self._consumed = saved
+        return ""
 
     def _parse_primitive(self) -> Primitive:
         sign = 1

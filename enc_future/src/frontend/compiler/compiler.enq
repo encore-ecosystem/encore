@@ -1,5 +1,8 @@
 import core::option::Option
+import core::panic::panic
 import std::os::ensure_parent_dirs
+import std::os::read_file
+import std::os::run_command
 import std::os::write_file
 import std::path::Path
 import std::string::String
@@ -72,6 +75,7 @@ impl for ProjectCompiler {
             }
         }
         self.progress = BuildProgress::finish(self.progress)
+        self.emit_backend_artifact()
         ret ()
     }
 
@@ -95,24 +99,29 @@ impl for ProjectCompiler {
         self.progress = BuildProgress::show(self.progress, refrain.name, relative_path)
 
         let source = String::as_str(Path::read_text(module_path))
-        let mut lexer = Lexer::new()
-        let tokens = Lexer::tokenize(lexer, source)
-        let mut parser = Parser::new()
-        let ast = Parser::parse(parser, tokens)
 
-        let imports = self.collect_imports(refrain, module_path, ast)
-        let mut index = 0_usize
+        let mut dep_lexer = Lexer::new()
+        let dep_tokens = Lexer::tokenize(dep_lexer, source)
+        let mut dep_parser = Parser::new()
+        let dep_ast = Parser::parse(dep_parser, dep_tokens)
+        let imports = self.collect_imports(refrain, module_path, dep_ast)
+        let mut dep_index = 0_usize
         loop {
-            match Vec[ResolvedImport]::get(imports, index) {
+            match Vec[ResolvedImport]::get(imports, dep_index) {
                 Some(resolved) => {
                     self.compile_module(resolved.refrain, resolved.module_path)
-                    index = index + 1_usize
+                    dep_index = dep_index + 1_usize
                 }
                 None => {
                     break
                 }
             }
         }
+
+        let mut lexer = Lexer::new()
+        let tokens = Lexer::tokenize(lexer, source)
+        let mut parser = Parser::new()
+        let ast = Parser::parse(parser, tokens)
 
         let typed_dump = infer_program(ast)
         let module_name = self.logical_module_name(refrain, module_path)
@@ -265,6 +274,88 @@ impl for ProjectCompiler {
             }
         }
         ret false
+    }
+
+    fn emit_backend_artifact(mut self) -> () {
+        match self.find_root_refrain() {
+            Some(root_refrain) => {
+                let stage_root = self.target_dir / "llvm_stage" / root_refrain.name
+                self.materialize_ehir_stage(stage_root)
+
+                let root_type = normalize_root_type(root_refrain.target)
+                let stage_root_raw = Path::as_str(stage_root)
+                let final_target_raw = Path::as_str(self.root / "target")
+                let tool_backend_raw = Path::as_str(self.root / ".." / ".venv" / "bin" / "ehir-llvm-backend-cli")
+                let tool_python_raw = Path::as_str(self.root / ".." / ".venv" / "bin" / "python")
+
+                let command =
+                    "cd " + stage_root_raw +
+                    " && (" + tool_backend_raw + " --profile debug --root-type " + root_type +
+                    " --target-dir " + final_target_raw +
+                    " || " + tool_python_raw + " -m ehir_llvm_backend.cli --profile debug --root-type " + root_type +
+                    " --target-dir " + final_target_raw + ")"
+
+                if run_command(command) != 0_i32 {
+                    panic("LLVM backend failed in self-hosted build")
+                }
+            }
+            None => {}
+        }
+        ret ()
+    }
+
+    fn materialize_ehir_stage(mut self, stage_root: Path) -> () {
+        let mut index = 0_usize
+        loop {
+            match Vec[CompiledModule]::get(self.modules, index) {
+                Some(module_item) => {
+                    match find_refrain_by_name(self.refrains, module_item.refrain_name) {
+                        Some(module_refrain) => {
+                            let relative = self.relative_source_path(module_refrain, module_item.source_path)
+                            let source_ehir = Path::with_suffix(
+                                self.target_dir / "ehir" / module_item.refrain_name / relative,
+                                ".ehir"
+                            )
+                            let source_text = read_file(Path::as_str(source_ehir))
+
+                            let destination = if Path::as_str(module_refrain.path) == Path::as_str(self.root) {
+                                Path::with_suffix(stage_root / "src" / relative, ".ehir")
+                            } else {
+                                Path::with_suffix(stage_root / "refrains" / module_refrain.name / "src" / relative, ".ehir")
+                            }
+
+                            ensure_parent_dirs(Path::as_str(destination))
+                            write_file(Path::as_str(destination), source_text)
+                        }
+                        None => {}
+                    }
+                    index = index + 1_usize
+                }
+                None => {
+                    break
+                }
+            }
+        }
+        ret ()
+    }
+
+    fn find_root_refrain(self) -> Option[Refrain] {
+        let root_raw = Path::as_str(self.root)
+        let mut index = 0_usize
+        loop {
+            match Vec[Refrain]::get(self.refrains, index) {
+                Some(refrain) => {
+                    if Path::as_str(refrain.path) == root_raw {
+                        ret Option[Refrain]::Some(refrain)
+                    }
+                    index = index + 1_usize
+                }
+                None => {
+                    break
+                }
+            }
+        }
+        ret Option[Refrain]::None
     }
 }
 
@@ -466,4 +557,14 @@ fn ends_with(text: str, suffix: str) -> bool {
         ret false
     }
     ret text.slice(text.len() - suffix.len(), suffix.len()) == suffix
+}
+
+fn normalize_root_type(target: str) -> str {
+    if target == "static_lib" {
+        ret "static_lib"
+    }
+    if target == "object" {
+        ret "object"
+    }
+    ret "executable"
 }

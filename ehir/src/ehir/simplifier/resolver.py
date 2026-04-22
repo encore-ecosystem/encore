@@ -244,6 +244,12 @@ class Resolver:
 
         def resolve_call(instr: Instruction_call):
             instr.args = [add_variable(arg) for arg in instr.args]
+            resolved_inherent = self._resolve_inherent_method_call(instr.fn_name, instr.args)
+            if resolved_inherent is not None:
+                fn_name, inferred_generics = resolved_inherent
+                instr.fn_name = fn_name
+                if not instr.generics:
+                    instr.generics = inferred_generics
             resolved_impl = self._resolve_impl_method_call(instr.fn_name, instr.args)
             if resolved_impl is not None:
                 fn_name, inferred_generics = resolved_impl
@@ -252,28 +258,34 @@ class Resolver:
                     instr.generics = inferred_generics
 
             if instr.fn_name not in self.fn:
-                if "::" in instr.fn_name:
-                    # Generic trait calls (e.g. Debug::fmt(T) inside generic fn)
-                    # are resolved after monomorphization when arg types become concrete.
-                    has_unresolved_generic_arg = any(
-                        arg.type is None or not self._is_concrete_type(arg.type) for arg in instr.args
-                    )
-                    if has_unresolved_generic_arg:
-                        instr.var_out = add_variable(instr.var_out)
-                        return
+                if "::" not in instr.fn_name:
+                    same_basename = [name for name in self.fn if name.rsplit("::", 1)[-1] == instr.fn_name]
+                    if len(same_basename) == 1:
+                        instr.fn_name = same_basename[0]
 
-                    trait_name, method_name = instr.fn_name.rsplit("::", 1)
-                    candidates = [
-                        f"{ref.trait_name}[{', '.join(str(arg) for arg in ref.trait_args)}] for {ref.for_type}::{ref.method_name}"
-                        for ref in self.impl_method_refs
-                        if ref.trait_name == trait_name and ref.method_name == method_name
-                    ]
-                    arg_types = [str(arg.type) if arg.type is not None else "?" for arg in instr.args]
-                    raise TypeError(
-                        f"Unknown function '{instr.fn_name}' for args {arg_types}. "
-                        f"Impl candidates: {candidates}"
-                    )
-                raise TypeError(f"Unknown function '{instr.fn_name}'")
+                if instr.fn_name not in self.fn:
+                    if "::" in instr.fn_name:
+                        # Generic trait calls (e.g. Debug::fmt(T) inside generic fn)
+                        # are resolved after monomorphization when arg types become concrete.
+                        has_unresolved_generic_arg = any(
+                            arg.type is None or not self._is_concrete_type(arg.type) for arg in instr.args
+                        )
+                        if has_unresolved_generic_arg:
+                            instr.var_out = add_variable(instr.var_out)
+                            return
+
+                        trait_name, method_name = instr.fn_name.rsplit("::", 1)
+                        candidates = [
+                            f"{ref.trait_name}[{', '.join(str(arg) for arg in ref.trait_args)}] for {ref.for_type}::{ref.method_name}"
+                            for ref in self.impl_method_refs
+                            if ref.trait_name == trait_name and ref.method_name == method_name
+                        ]
+                        arg_types = [str(arg.type) if arg.type is not None else "?" for arg in instr.args]
+                        raise TypeError(
+                            f"Unknown function '{instr.fn_name}' for args {arg_types}. "
+                            f"Impl candidates: {candidates}"
+                        )
+                    raise TypeError(f"Unknown function '{instr.fn_name}'")
             target_fn = self.fn[instr.fn_name]
             if isinstance(target_fn, Derective_extern_fn):
                 if not instr.is_unsafe:
@@ -654,7 +666,7 @@ class Resolver:
                         instr.rhs = add_variable(TypedVariable(instr.rhs.name, expected_t))
 
                         if isinstance(instr, _BOOLEAN_INSTRUCTS):
-                            expected_t = Usize_t(size=1)  # aka bool
+                            expected_t = Usize_t(size=1)
 
                         if instr.var_out.type and instr.var_out.type != expected_t:
                             raise TypeError(f"Type mismatch for binop: {instr.var_out.type} != {expected_t}")
@@ -1084,6 +1096,54 @@ class Resolver:
 
         return None
 
+    def _resolve_inherent_method_call(self, fn_name: str, args: list[Variable]) -> tuple[str, list[Type]] | None:
+        if "::" not in fn_name:
+            return None
+
+        owner_text, method_name = fn_name.rsplit("::", 1)
+        actual_owner = self._parse_type_text(owner_text)
+        if actual_owner is None or not actual_owner.generics:
+            return None
+
+        for candidate_name, target_fn in self.fn.items():
+            if "::" not in candidate_name or candidate_name.rsplit("::", 1)[-1] != method_name:
+                continue
+            if not getattr(target_fn, "generics", []):
+                continue
+
+            template_owner = self._parse_type_text(candidate_name.rsplit("::", 1)[0])
+            if template_owner is None:
+                continue
+
+            generic_names = {generic.name for generic in target_fn.generics}
+            mapping: dict[str, Type] = {}
+            if not self._match_type_template(template_owner, actual_owner, generic_names, mapping):
+                continue
+
+            if len(target_fn.params) != len(args):
+                continue
+
+            params_match = True
+            for param, arg in zip(target_fn.params, args, strict=True):
+                if arg.type is None:
+                    continue
+                if not self._match_type_template(param.type, arg.type, generic_names, mapping):
+                    params_match = False
+                    break
+            if not params_match:
+                continue
+
+            concrete_generics: list[Type] = []
+            for generic in target_fn.generics:
+                bound = mapping.get(generic.name)
+                if bound is None:
+                    break
+                concrete_generics.append(bound)
+            else:
+                return target_fn.name, concrete_generics
+
+        return None
+
     def _match_type_template(
         self,
         template: Type,
@@ -1131,6 +1191,79 @@ class Resolver:
         base = deepcopy(typ)
         base.generics = [self._canonicalize_type(generic) for generic in typ.generics]
         return base
+
+    def _parse_type_text(self, text: str) -> Type | None:
+        raw = text.strip()
+        if not raw:
+            return None
+
+        if raw.endswith("<H>"):
+            pointee = self._parse_type_text(raw.removesuffix("<H>"))
+            return HeapSmartPointer(pointee) if pointee is not None else None
+        if raw.endswith("<S>"):
+            pointee = self._parse_type_text(raw.removesuffix("<S>"))
+            return StackSmartPointer(pointee) if pointee is not None else None
+        if raw.endswith("*"):
+            pointee = self._parse_type_text(raw[:-1])
+            return Pointer(pointee) if pointee is not None else None
+
+        bracket_index = self._find_top_level_char(raw, "[")
+        if bracket_index == -1:
+            return Type(raw)
+        if not raw.endswith("]"):
+            return None
+
+        name = raw[:bracket_index].strip()
+        inner = raw[bracket_index + 1 : -1]
+        generics: list[Type] = []
+        for part in self._split_top_level(inner, ","):
+            generic = self._parse_type_text(part)
+            if generic is None:
+                return None
+            generics.append(generic)
+        return Type(name, generics)
+
+    @staticmethod
+    def _find_top_level_char(text: str, needle: str) -> int:
+        depth_square = 0
+        depth_angle = 0
+        for index, char in enumerate(text):
+            if char == needle and depth_square == 0 and depth_angle == 0:
+                return index
+            if char == "[":
+                depth_square += 1
+            elif char == "]":
+                depth_square -= 1
+            elif char == "<":
+                depth_angle += 1
+            elif char == ">":
+                depth_angle -= 1
+        return -1
+
+    @staticmethod
+    def _split_top_level(text: str, separator: str) -> list[str]:
+        parts: list[str] = []
+        start = 0
+        depth_square = 0
+        depth_angle = 0
+
+        for index, char in enumerate(text):
+            if char == "[":
+                depth_square += 1
+            elif char == "]":
+                depth_square -= 1
+            elif char == "<":
+                depth_angle += 1
+            elif char == ">":
+                depth_angle -= 1
+            elif char == separator and depth_square == 0 and depth_angle == 0:
+                parts.append(text[start:index].strip())
+                start = index + 1
+
+        tail = text[start:].strip()
+        if tail:
+            parts.append(tail)
+        return parts
 
     def _resolve_type(self, typ: Type) -> Type:
         return self._replace_type(typ, {})

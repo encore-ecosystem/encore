@@ -57,6 +57,7 @@ pub struct FunctionTranslator {
     terminated: bool
     loop_break_label: Option[str]
     loop_continue_label: Option[str]
+    unsafe_depth: usize
 }
 
 pub fn translate_module(module_name: str, ast: Vec[Statement]) -> Module {
@@ -65,6 +66,31 @@ pub fn translate_module(module_name: str, ast: Vec[Statement]) -> Module {
     let signatures = collect_function_signatures(ast)
 
     let mut builder = ModuleBuilder::new(module_name)
+
+    // Temporary bootstrap prelude: self-hosted parser/import lowering is still incomplete,
+    // so keep basic I/O symbols available in generated EHIR.
+    let mut prelude_core_io = Vec[str]::new()
+    prelude_core_io = prelude_core_io.push("core")
+    prelude_core_io = prelude_core_io.push("io")
+    builder.push(cimp(prelude_core_io, "print"))
+
+    let mut prelude_core_io = Vec[str]::new()
+    prelude_core_io = prelude_core_io.push("core")
+    prelude_core_io = prelude_core_io.push("io")
+    builder.push(cimp(prelude_core_io, "println"))
+
+    let mut prelude_core_io = Vec[str]::new()
+    prelude_core_io = prelude_core_io.push("core")
+    prelude_core_io = prelude_core_io.push("io")
+    builder.push(cimp(prelude_core_io, "eprint"))
+
+    let mut prelude_core_io = Vec[str]::new()
+    prelude_core_io = prelude_core_io.push("core")
+    prelude_core_io = prelude_core_io.push("io")
+    builder.push(cimp(prelude_core_io, "eprintln"))
+
+    translate_import_statements(builder, ast)
+
     let mut index = 0_usize
 
     loop {
@@ -82,6 +108,44 @@ pub fn translate_module(module_name: str, ast: Vec[Statement]) -> Module {
     ret ModuleBuilder::finish(builder)
 }
 
+fn translate_import_statements(builder: mut ModuleBuilder, ast: Vec[Statement]) -> () {
+    let mut index = 0_usize
+
+    loop {
+        match ast.get(index) {
+            Some(stmt) => {
+                match stmt {
+                    Statement::Import(import_stmt) => {
+                        let items = expand_import_stmt(import_stmt)
+                        let mut item_index = 0_usize
+                        loop {
+                            match items.get(item_index) {
+                                Some(item) => {
+                                    let import_directive = Directive::Import(
+                                        ImportDirective{item.prefix, item.symbol, item.alias, true}
+                                    )
+                                    builder.push(import_directive)
+                                    item_index = item_index + 1_usize
+                                }
+                                None => {
+                                    break
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                index = index + 1_usize
+            }
+            None => {
+                break
+            }
+        }
+    }
+
+    ret ()
+}
+
 fn translate_top_level_statement(
     builder: mut ModuleBuilder,
     stmt: Statement,
@@ -90,22 +154,7 @@ fn translate_top_level_statement(
     signatures: Vec[FunctionSignature]
 ) -> () {
     match stmt {
-        Statement::Import(import_stmt) => {
-            let items = expand_import_stmt(import_stmt)
-            let mut index = 0_usize
-            loop {
-                match items.get(index) {
-                    Some(item) => {
-                        let import_directive = Directive::Import(ImportDirective{item.prefix, item.symbol, item.alias, item.is_public})
-                        builder.push(import_directive)
-                        index = index + 1_usize
-                    }
-                    None => {
-                        break
-                    }
-                }
-            }
-        }
+        Statement::Import(_) => {}
         Statement::Struct(struct_stmt) => {
             builder.push(translate_struct_stmt(struct_stmt))
         }
@@ -369,7 +418,8 @@ impl for FunctionTranslator {
             0_usize,
             false,
             Option[str]::None,
-            Option[str]::None
+            Option[str]::None,
+            0_usize
         }
         out.builder.start_block("entry")
         ret out
@@ -437,7 +487,9 @@ impl for FunctionTranslator {
                 self.translate_do_while_statement(do_stmt)
             }
             Statement::Unsafe(block) => {
+                self.enter_unsafe()
                 self.translate_scoped_block(block)
+                self.exit_unsafe()
             }
             Statement::Ehir(ehir_stmt) => {
                 self.translate_ehir_stmt(ehir_stmt)
@@ -915,24 +967,24 @@ impl for FunctionTranslator {
                 }
             }
             Expr::Boolean(flag) => {
-                let raw = if flag { "true" } else { "false" }
-                let out = self.fresh_value(preferred_name, fallback_type(hint, Option[Type]::Some(plain_type("bool", Vec[Type]::new()))))
+                let raw = if flag { "1_u1" } else { "0_u1" }
+                let out = self.fresh_value(preferred_name, fallback_type(hint, Option[Type]::Some(ehir_bool_type())))
                 self.builder.emit(lcpos(out, raw))
                 ret out
             }
             Expr::Integer(integer_text) => {
                 let out = self.fresh_value(preferred_name, fallback_type(hint, infer_integer_type(integer_text)))
-                self.builder.emit(lcpos(out, integer_text))
+                self.builder.emit(lcpos(out, normalize_integer_literal(integer_text, out.typ)))
                 ret out
             }
             Expr::Float(float_text) => {
                 let out = self.fresh_value(preferred_name, fallback_type(hint, infer_float_type(float_text)))
-                self.builder.emit(lcpos(out, float_text))
+                self.builder.emit(lcpos(out, normalize_float_literal(float_text, out.typ)))
                 ret out
             }
             Expr::StringLiteral(string_text) => {
                 let out = self.fresh_value(preferred_name, fallback_type(hint, Option[Type]::Some(plain_type("str", Vec[Type]::new()))))
-                self.builder.emit(lcpos(out, string_text))
+                self.builder.emit(lcpos(out, normalize_string_literal(string_text)))
                 ret out
             }
             Expr::Parenthesized(inner) => {
@@ -968,7 +1020,9 @@ impl for FunctionTranslator {
                 ret self.translate_if_expr(if_expr, preferred_name, hint)
             }
             Expr::Unsafe(block) => {
+                self.enter_unsafe()
                 let block_value = self.translate_block_expr(BlockExpr{block.statements, box_expr(expr)}, preferred_name, hint)
+                self.exit_unsafe()
                 ret block_value
             }
             Expr::TupleLiteral(tuple_expr) => {
@@ -987,7 +1041,7 @@ impl for FunctionTranslator {
                 let index = self.translate_boxed_expression(index_expr.index, preferred_name + "_index")
                 let out = self.fresh_value(preferred_name, hint)
                 self.builder.emit(comment("index expression"))
-                self.builder.emit(call(out, "__encore_index", Vec[Type]::new(), Vec[Variable]::new().push(base).push(index), false))
+                self.builder.emit(call(out, "__encore_index", Vec[Type]::new(), Vec[Variable]::new().push(base).push(index), self.is_in_unsafe_context()))
                 ret out
             }
             Expr::Try(inner) => {
@@ -1006,6 +1060,10 @@ impl for FunctionTranslator {
             let zero = self.default_zero_like(value.typ, preferred_name + "_zero")
             ret self.translate_binary_from_values(zero, "-", value, preferred_name, hint)
         }
+        if unary_expr.operator == "!" {
+            let false_value = self.default_value_for_type(ehir_bool_type(), preferred_name + "_false")
+            ret self.translate_binary_from_values(value, "==", false_value, preferred_name, Option[Type]::Some(ehir_bool_type()))
+        }
         self.builder.emit(comment("unsupported unary operator " + unary_expr.operator))
         ret with_fallback_type(value, hint)
     }
@@ -1023,7 +1081,7 @@ impl for FunctionTranslator {
                 let args = self.translate_expr_args(call_expr.args, preferred_name)
                 let ret_hint = fallback_type(hint, self.lookup_signature_return_type(path))
                 let out = self.fresh_value(preferred_name, ret_hint)
-                self.builder.emit(call(out, path, lower_type_generics(call_expr.generics, self.current_self_type), args, false))
+                self.builder.emit(call(out, path, lower_type_generics(call_expr.generics, self.current_self_type), args, self.is_in_unsafe_context()))
                 ret out
             }
             _ => {
@@ -1032,7 +1090,7 @@ impl for FunctionTranslator {
                 args = args.push(callee)
                 args = append_variables(args, self.translate_expr_args(call_expr.args, preferred_name))
                 let out = self.fresh_value(preferred_name, hint)
-                self.builder.emit(call(out, "__encore_call", lower_type_generics(call_expr.generics, self.current_self_type), args, false))
+                self.builder.emit(call(out, "__encore_call", lower_type_generics(call_expr.generics, self.current_self_type), args, self.is_in_unsafe_context()))
                 ret out
             }
         }
@@ -1047,8 +1105,24 @@ impl for FunctionTranslator {
         let call_name = self.resolve_method_name(receiver, method_expr.method)
         let ret_hint = fallback_type(hint, self.lookup_signature_return_type(call_name))
         let out = self.fresh_value(preferred_name, ret_hint)
-        self.builder.emit(call(out, call_name, lower_type_generics(method_expr.generics, self.current_self_type), args, false))
+        self.builder.emit(call(out, call_name, lower_type_generics(method_expr.generics, self.current_self_type), args, self.is_in_unsafe_context()))
         ret out
+    }
+
+    fn enter_unsafe(mut self) -> () {
+        self.unsafe_depth = self.unsafe_depth + 1_usize
+        ret ()
+    }
+
+    fn exit_unsafe(mut self) -> () {
+        if self.unsafe_depth > 0_usize {
+            self.unsafe_depth = self.unsafe_depth - 1_usize
+        }
+        ret ()
+    }
+
+    fn is_in_unsafe_context(self) -> bool {
+        ret self.unsafe_depth > 0_usize
     }
 
     fn translate_field_expr(mut self, field_expr: FieldExpr, preferred_name: str, hint: Option[Type]) -> Variable {
@@ -1695,9 +1769,9 @@ impl for FunctionTranslator {
     }
 
     fn default_value_for_type(mut self, typ: Type, preferred_name: str) -> Variable {
-        if typ.name == "bool" {
+        if is_ehir_bool_type_name(typ.name) {
             let out = self.fresh_value(preferred_name, Option[Type]::Some(typ))
-            self.builder.emit(lcpos(out, "false"))
+            self.builder.emit(lcpos(out, "0_u1"))
             ret out
         }
         if typ.name == "str" {
@@ -2036,6 +2110,10 @@ fn lower_type_text(raw: str, current_self_type: Option[str]) -> Type {
         text = strip_raw_pointer_suffix(text)
     }
 
+    if text == "bool" {
+        text = "u1"
+    }
+
     if starts_with(text, "(") || starts_with(text, "[") {
         ret make_type(text, Vec[Type]::new(), pointer)
     }
@@ -2307,7 +2385,7 @@ fn lower_binary_operator(operator: str) -> Option[BinaryOpKind] {
 
 fn infer_binary_result_type(operator: str, lhs: Option[Type], rhs: Option[Type]) -> Option[Type] {
     if operator == "==" || operator == "!=" || operator == "<" || operator == "<=" || operator == ">" || operator == ">=" || operator == "&&" || operator == "||" {
-        ret Option[Type]::Some(plain_type("bool", Vec[Type]::new()))
+        ret Option[Type]::Some(ehir_bool_type())
     }
     match lhs {
         Some(typ) => {
@@ -2324,6 +2402,14 @@ fn infer_binary_result_type(operator: str, lhs: Option[Type], rhs: Option[Type])
             }
         }
     }
+}
+
+fn ehir_bool_type() -> Type {
+    ret plain_type("u1", Vec[Type]::new())
+}
+
+fn is_ehir_bool_type_name(name: str) -> bool {
+    ret name == "bool" || name == "u1"
 }
 
 fn infer_integer_type(value: str) -> Option[Type] {
@@ -2717,6 +2803,55 @@ fn ends_with(text: str, suffix: str) -> bool {
         ret false
     }
     ret text.slice(text.len() - suffix.len(), suffix.len()) == suffix
+}
+
+fn normalize_string_literal(raw: str) -> str {
+    if ends_with(raw, "_str") {
+        ret raw
+    }
+    ret raw + "_str"
+}
+
+fn normalize_integer_literal(raw: str, typ: Option[Type]) -> str {
+    if has_ehir_literal_suffix(raw) {
+        ret raw
+    }
+    match typ {
+        Some(t) => {
+            ret raw + "_" + t.name
+        }
+        None => {
+            ret raw + "_u32"
+        }
+    }
+}
+
+fn normalize_float_literal(raw: str, typ: Option[Type]) -> str {
+    if has_ehir_literal_suffix(raw) {
+        ret raw
+    }
+    match typ {
+        Some(t) => {
+            ret raw + "_" + t.name
+        }
+        None => {
+            ret raw + "_f32"
+        }
+    }
+}
+
+fn has_ehir_literal_suffix(raw: str) -> bool {
+    let mut index = 0_usize
+    loop {
+        if index >= raw.len() {
+            break
+        }
+        if raw.byte_at(index) == 95_u8 {
+            ret true
+        }
+        index = index + 1_usize
+    }
+    ret false
 }
 
 fn starts_with_uppercase(text: str) -> bool {

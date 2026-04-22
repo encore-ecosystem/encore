@@ -261,12 +261,20 @@ class EHIR_ProjectCompiler:
         def matches_import_symbol(directive_name: str, import_symbol: str) -> bool:
             return directive_name == import_symbol or directive_name.endswith(f"::{import_symbol}")
 
+        def module_name_from_id(module_id: Path) -> str:
+            if module_id.stem == "mod":
+                return module_id.parent.name
+            return module_id.stem
+
         for directive in module.ast:
             if not isinstance(directive, Derective_import):
                 append_directive(directive)
                 continue
 
             parent_id = self._resolve_parent_id(id, directive)
+            if Path(parent_id).resolve() == Path(id).resolve():
+                # Ignore self-imports (can appear in transitional bootstrap/prelude lowering).
+                continue
 
             if not parent_id.exists():
                 raise RuntimeError(f"Unable to find import path: {parent_id}")
@@ -297,6 +305,9 @@ class EHIR_ProjectCompiler:
                             append_directive(d)
                         break
                 else:
+                    if module_name_from_id(parent_id) == directive.symbol:
+                        append_module_tree(parent_id)
+                        continue
                     raise RuntimeError(f"Unable to import: {directive}")
 
         node.module.ast = resolved_ast
