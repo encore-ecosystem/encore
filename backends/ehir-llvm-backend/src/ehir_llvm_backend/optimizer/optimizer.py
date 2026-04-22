@@ -14,11 +14,15 @@ class Optimizer:
 
         module_llvm = llvm.parse_assembly(str(module))
 
+        # Keep debug builds as transparent as possible: no LLVM optimization
+        # pipeline, only structural verification.
+        if opt_profile == EHIR_Backend.OptProfile.debug:
+            module_llvm.verify()
+            return module_llvm
+
         speed_level = 0
         size_level = 0
-        if opt_profile == EHIR_Backend.OptProfile.debug:
-            pass
-        elif opt_profile == EHIR_Backend.OptProfile.release:
+        if opt_profile == EHIR_Backend.OptProfile.release:
             speed_level = 1
         elif opt_profile == EHIR_Backend.OptProfile.extreme:
             speed_level = 2

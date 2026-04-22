@@ -54,14 +54,8 @@ class Cfree_Simplifier_Pass:
         for struct in list(self._structs.values()):
             self._unwrap_smart_pointer_in_struct(struct)
 
-        for fn in list(self._fns.values()):
-            for block in fn.get_body():
-                for instr in block.get_body():
-                    if isinstance(instr, Instruction_cfree):
-                        assert isinstance(instr.var.type, SmartPointer)
-                        if not self._is_concrete_type(instr.var.type):
-                            continue
-                        self._generate_cfree(instr.var.type)
+        # Bootstrap mode: keep cfree lowering disabled for now.
+        # We intentionally skip generating recursive cfree helper functions.
 
         for fn in self._fns.values():
             self._unwrap_smart_pointer_in_fn(fn)
@@ -95,28 +89,8 @@ class Cfree_Simplifier_Pass:
                 self._unwrap_smart_pointer(instr.var_out)
 
         if isinstance(instr, Instruction_cfree):
-            assert instr.var.type
-            cfree_name = instr.var.type.name
-            if isinstance(instr.var.type, SmartPointer):
-                if not self._is_concrete_type(instr.var.type):
-                    return []
-                cfree_name = instr.var.type.get_name()
-                self._unwrap_smart_pointer(instr.var)
-            elif f"cfree_{cfree_name}" not in self._fns:
-                return []
-
-            mode_var = TypedVariable(".cfree_mode", Usize_t())
-            zero = Instruction_lcpos(
-                var_out=mode_var,
-                primitive=Usize(0),
-            )
-            instr = Instruction_call(
-                var_out=TypedVariable(".cfree_out", Usize_t()),
-                fn_name=f"cfree_{cfree_name}",
-                generics=[],
-                args=[instr.var, mode_var],
-            )
-            return [zero, instr]
+            # Temporary bootstrap behavior: ignore cfree instructions.
+            return []
         return [instr]
 
     def _is_concrete_type(self, typ: Type) -> bool:

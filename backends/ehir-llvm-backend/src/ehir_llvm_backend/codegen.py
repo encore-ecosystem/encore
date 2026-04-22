@@ -267,7 +267,8 @@ class Codegen:
         assert instr.var.type is not None
         dst_type = self._build_type(instr.var.type)
 
-        alloca = self.builder.alloca(dst_type, name=instr.var_out.name)
+        entry_builder = self._entry_alloca_builder()
+        alloca = entry_builder.alloca(dst_type, name=instr.var_out.name)
         self.builder.store(self._variables[instr.var.name], alloca)
         self._variables[instr.var_out.name] = alloca
 
@@ -348,7 +349,8 @@ class Codegen:
         assert hasattr(base, "type")
         expected_result_type = self._build_type(instr.var_out.type) if instr.var_out.type is not None else None
         if not isinstance(base.type, ir.PointerType):
-            temp = self.builder.alloca(base.type)
+            entry_builder = self._entry_alloca_builder()
+            temp = entry_builder.alloca(base.type)
             self.builder.store(base, temp)
             base = temp
         elif not isinstance(base.type.pointee, ir.BaseStructType):
@@ -379,7 +381,8 @@ class Codegen:
 
         base = self._variables[instr.var.name]
         if not isinstance(base.type, ir.PointerType):
-            temp = self.builder.alloca(base.type)
+            entry_builder = self._entry_alloca_builder()
+            temp = entry_builder.alloca(base.type)
             self.builder.store(base, temp)
             base = temp
 
@@ -424,7 +427,8 @@ class Codegen:
         self.builder.comment("")
         self.builder.comment(f"{instr}")
         target_type = self._build_type(instr.type)
-        ptr = self.builder.alloca(target_type, name=instr.var_out.name)
+        entry_builder = self._entry_alloca_builder()
+        ptr = entry_builder.alloca(target_type, name=instr.var_out.name)
         self._variables[instr.var_out.name] = ptr
         return ptr
 
