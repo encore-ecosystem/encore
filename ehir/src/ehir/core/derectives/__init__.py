@@ -1,11 +1,13 @@
 from .enum import Derective_enum
-from .fns import Derective_extern_fn, Derective_fn
+from .extern_fn import Derective_extern_fn
+from .fn import Derective_fn
 from .impl import Derective_impl
-from .imps.base import Derective_import
-from .imps.cimp import Derective_cimp
-from .imps.imp import Derective_imp
-from .structs import Derective_struct
+from .import_base import Derective_import
+from .cimp import Derective_cimp
+from .imp import Derective_imp
+from .struct import Derective_struct
 from .trait import Derective_trait, TraitMethod
+from .typealias import Derective_typealias
 
 __all__ = [
     "Derective_import",
@@ -17,5 +19,6 @@ __all__ = [
     "Derective_cimp",
     "Derective_struct",
     "Derective_trait",
+    "Derective_typealias",
     "TraitMethod",
 ]

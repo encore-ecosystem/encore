@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from ehir.core.type import HeapSmartPointer, Pointer, SmartPointer, StackSmartPointer, Type
 
 TUPLE_TYPE_PREFIX = "__tuple_"
@@ -53,7 +55,7 @@ def strip_mutability(typ: Type) -> Type:
         return StackSmartPointer(strip_mutability(typ.pointee))
     if is_raw_pointer_type(typ):
         return Pointer(strip_mutability(typ.pointee))
-    return Type(typ.name, [strip_mutability(generic) for generic in typ.generics])
+    return replace(typ, generics=[strip_mutability(generic) for generic in typ.generics])
 
 
 def reapply_mutability(template: Type, typ: Type) -> Type:

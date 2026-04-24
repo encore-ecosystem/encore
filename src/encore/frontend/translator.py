@@ -143,6 +143,7 @@ class Translator:
     _function_aliases: dict[str, str]
     _type_aliases: dict[str, str]
     _trait_aliases: dict[str, str]
+    _active_generic_bounds: dict[str, list[Type]]
 
     class _PreparedMatch:
         def __init__(
@@ -208,6 +209,7 @@ class Translator:
         self._function_aliases = {}
         self._type_aliases = {}
         self._trait_aliases = {}
+        self._active_generic_bounds = {}
 
     def run(self, program: str) -> EHIR_Module:
         self._reset_state()
@@ -440,6 +442,59 @@ class Translator:
                 return signature
         return None
 
+    def _collect_generic_bounds(self, generics: list[Type]) -> dict[str, list[Type]]:
+        bounds: dict[str, list[Type]] = {}
+        for generic in generics:
+            if isinstance(generic, s.GenericParam) and generic.bounds:
+                bounds[generic.name] = list(generic.bounds)
+        return bounds
+
+    def _lookup_active_generic_bounds(self, typ: Type | None) -> list[Type]:
+        if typ is None:
+            return []
+        typ = unwrap_for_storage(typ)
+        if is_reference_like_type(typ):
+            return self._lookup_active_generic_bounds(typ.pointee)
+        if is_raw_pointer_type(typ):
+            return self._lookup_active_generic_bounds(typ.pointee)
+        return list(self._active_generic_bounds.get(typ.name, []))
+
+    def _resolve_trait_method_call_name(
+        self,
+        trait_name: str,
+        method_name: str,
+        *,
+        receiver_type: Type | None = None,
+    ) -> str:
+        if receiver_type is not None:
+            receiver_type = unwrap_for_storage(receiver_type)
+            receiver_type = receiver_type.pointee if is_reference_like_type(receiver_type) else receiver_type
+            for bound in self._lookup_active_generic_bounds(receiver_type):
+                resolved_trait_name = self._trait_aliases.get(
+                    bound.name,
+                    self._qualify_trait_name(self._current_module_id, bound.name),
+                )
+                if bound.name != trait_name and resolved_trait_name != trait_name:
+                    continue
+                signature = self._lookup_trait_method_signature(
+                    resolved_trait_name,
+                    method_name,
+                    receiver_type=receiver_type,
+                )
+                if signature is not None:
+                    return f"{resolved_trait_name}::{method_name}"
+
+        mapped = self._function_aliases.get(f"{trait_name}::{method_name}")
+        if mapped is not None:
+            return mapped
+
+        qualified_trait_name = self._qualify_trait_name(self._current_module_id, trait_name)
+        qualified_method_name = f"{qualified_trait_name}::{method_name}"
+        if qualified_method_name in self._source_signatures:
+            return qualified_method_name
+
+        return f"{trait_name}::{method_name}"
+
     def _resolve_method_callable(
         self,
         receiver_type: Type,
@@ -473,10 +528,36 @@ class Translator:
             if signature is None or signature.type is None:
                 continue
 
+                return (
+                    f"{trait_name}::{method_name}",
+                    Derective_fn(
+                        name=f"{trait_name}::{method_name}",
+                        generics=[self._translate_type(generic) for generic in signature.generics],
+                    params=[
+                        Parameter(name=param.name, type=self._translate_type(param.type)) for param in signature.params
+                    ],
+                    body=[],
+                    ret_type=self._translate_type(signature.type),
+                    ),
+                )
+
+        for bound in self._lookup_active_generic_bounds(base_receiver_type):
+            resolved_trait_name = self._trait_aliases.get(
+                bound.name,
+                self._qualify_trait_name(self._current_module_id, bound.name),
+            )
+            signature = self._lookup_trait_method_signature(
+                resolved_trait_name,
+                method_name,
+                receiver_type=base_receiver_type,
+            )
+            if signature is None or signature.type is None:
+                continue
+
             return (
-                f"{trait_name}::{method_name}",
+                f"{resolved_trait_name}::{method_name}",
                 Derective_fn(
-                    name=f"{trait_name}::{method_name}",
+                    name=f"{resolved_trait_name}::{method_name}",
                     generics=[self._translate_type(generic) for generic in signature.generics],
                     params=[
                         Parameter(name=param.name, type=self._translate_type(param.type)) for param in signature.params
@@ -758,7 +839,12 @@ class Translator:
             body=[],
             ret_type=self._translate_type(statement.signature.type),
         )
-        self._translate_function_body(fn, statement.body, source_params=statement.signature.params)
+        self._translate_function_body(
+            fn,
+            statement.body,
+            source_params=statement.signature.params,
+            source_generics=statement.signature.generics,
+        )
         return fn
 
     def _translate_function_body(
@@ -767,6 +853,7 @@ class Translator:
         body: Block,
         *,
         source_params: list[s.Parameter] | None = None,
+        source_generics: list[Type] | None = None,
     ):
         prev_current_function = getattr(self._builder, "current_function", None)
         prev_current_block = getattr(self._builder, "current_block", None)
@@ -776,6 +863,7 @@ class Translator:
         prev_assignment_targets = self._assignment_targets
         prev_terminated_blocks = self._terminated_blocks
         prev_loop_stack = self._loop_stack
+        prev_generic_bounds = self._active_generic_bounds
 
         self._builder.current_function = fn
         self._builder.variables = {param.name: param for param in fn.params}
@@ -784,6 +872,7 @@ class Translator:
         self._assignment_targets = {}
         self._terminated_blocks = set()
         self._loop_stack = []
+        self._active_generic_bounds = self._collect_generic_bounds(source_generics or [])
         source_params = source_params or []
         mutable_params = {param.name for param in source_params if is_mutable_type(param.type)}
         entry_block = self._builder.append_block("entry")
@@ -807,6 +896,7 @@ class Translator:
         self._assignment_targets = prev_assignment_targets
         self._terminated_blocks = prev_terminated_blocks
         self._loop_stack = prev_loop_stack
+        self._active_generic_bounds = prev_generic_bounds
 
     def _register_source_signature(self, signature: s.FunctionSignature):
         self._source_signatures[signature.name] = signature
@@ -1668,7 +1758,7 @@ class Translator:
             if trait_name is not None:
                 lhs = self._translate_expression(expr.lhs, expected_type=expected_type)
                 rhs = self._translate_expression(expr.rhs, expected_type=lhs.var_out.type or expected_type)
-                fn_name = self._function_aliases.get(f"{trait_name}::op", f"{trait_name}::op")
+                fn_name = self._resolve_trait_method_call_name(trait_name, "op", receiver_type=lhs.var_out.type)
                 call = self._builder.build_call(
                     fn_name=fn_name,
                     generics=[],

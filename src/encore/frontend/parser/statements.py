@@ -13,6 +13,29 @@ class Statement:
     pass
 
 
+@dataclass
+class GenericParam(Type):
+    bounds: list[Type] = field(default_factory=list)
+
+    def format_declaration(self) -> str:
+        if not self.bounds:
+            return self.name
+        return f"{self.name}:{'+'.join(str(bound) for bound in self.bounds)}"
+
+
+def format_generic_params(generics: list[Type]) -> str:
+    if not generics:
+        return ""
+
+    items: list[str] = []
+    for generic in generics:
+        if isinstance(generic, GenericParam):
+            items.append(generic.format_declaration())
+        else:
+            items.append(str(generic))
+    return "[" + ", ".join(items) + "]"
+
+
 # =============
 @dataclass
 class Statement_TopLevel(Statement):
@@ -71,8 +94,9 @@ class FunctionSignature(Statement_TopLevel):
 
     def __repr__(self) -> str:
         extern_repr = "extern " if self.is_extern else ""
+        generics_repr = format_generic_params(self.generics)
         type_repr = f"-> {self.type}" if self.type else ""
-        return f"{extern_repr}fn {self.name}({', '.join(str(p) for p in self.params)}){type_repr}"
+        return f"{extern_repr}fn {self.name}{generics_repr}({', '.join(str(p) for p in self.params)}){type_repr}"
 
 
 @dataclass
@@ -108,7 +132,7 @@ class Statement_Trait(Statement_TopLevel):
     bases: list[Type] = field(default_factory=list)
 
     def __repr__(self) -> str:
-        generics_repr = ("[" + ", ".join(str(g) for g in self.generics) + "]") if self.generics else ""
+        generics_repr = format_generic_params(self.generics)
         bases_repr = f" < {', '.join(str(base) for base in self.bases)}" if self.bases else ""
         body_repr = " {\n" + "\n".join(f"  {method}" for method in self.body) + "\n}"
         return f"{super().__repr__()}trait {self.name}{generics_repr}{bases_repr}{body_repr}"
@@ -120,7 +144,7 @@ class StructureSignature(ABC):
     generics: list[Type]
 
     def __repr__(self) -> str:
-        generic_repr = ("[" + ", ".join(str(g) for g in self.generics) + "]") if self.generics else ""
+        generic_repr = format_generic_params(self.generics)
         return f"{self.name}{generic_repr}"
 
 
@@ -170,7 +194,7 @@ class Statement_EnumDefinition(Statement_TopLevel):
     body: list[StructureSignature]
 
     def __repr__(self) -> str:
-        generic_repr = "[" + ", ".join(str(g) for g in self.generics) + "]"
+        generic_repr = format_generic_params(self.generics)
         body = " {\n" + "\n".join(f"  {b}" for b in self.body) + "\n}"
         return f"{super().__repr__()}enum {self.name}{generic_repr}{body}"
 
@@ -188,7 +212,7 @@ class Statement_Impl(Statement_TopLevel):
         self.is_public = False
 
     def __repr__(self) -> str:
-        generics_repr = ("[" + ", ".join(str(g) for g in self.generics) + "]") if self.generics else ""
+        generics_repr = format_generic_params(self.generics)
         trait_repr = ""
         if self.trait_name is not None:
             trait_args_repr = ("[" + ", ".join(str(g) for g in self.trait_args) + "]") if self.trait_args else ""

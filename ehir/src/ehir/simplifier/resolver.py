@@ -8,70 +8,57 @@ from ehir.core.derectives import (
     Derective_impl,
     Derective_struct,
     Derective_trait,
+    Derective_typealias,
 )
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum
-from ehir.core.instructions.base import Assignable
-from ehir.core.instructions.capture import (
-    Instruction_ceoh,
-    Instruction_ceos,
-    Instruction_cpoh,
-    Instruction_csoh,
-    Instruction_csos,
-    Instruction_lceos,
-    Instruction_lcpos,
-    Instruction_lcsos,
-    Instruction_scpoh,
-    Instruction_scpos,
-    Instruction_scsoh,
-    Instruction_scsos,
-)
-from ehir.core.instructions.capture.cpos import Instruction_cpos
-from ehir.core.instructions.control_flow import (
+from ehir.core.instructions import (
+    BinOp,
+    Instruction_add,
     Instruction_br,
     Instruction_call,
+    Instruction_capenum,
+    Instruction_capprim,
+    Instruction_capstruct,
     Instruction_cbr,
-    Instruction_match,
-    Instruction_phi,
-    Instruction_ret,
-    Instruction_switch,
-)
-from ehir.core.instructions.memory import (
+    Instruction_cenum,
+    Instruction_cpos,
+    Instruction_cstruct,
     Instruction_gep,
+    Instruction_geq,
     Instruction_getfield,
     Instruction_getfieldptr,
     Instruction_getptr,
+    Instruction_grt,
     Instruction_halloc,
     Instruction_hfree,
     Instruction_hrealloc,
+    Instruction_ieq,
+    Instruction_leq,
+    Instruction_les,
+    Instruction_load,
+    Instruction_match,
+    Instruction_mul,
+    Instruction_neq,
     Instruction_pcast,
+    Instruction_phi,
     Instruction_put,
+    Instruction_ret,
+    Instruction_salloc,
+    Instruction_scpos,
+    Instruction_scstruct,
+    Instruction_setfield,
     Instruction_sgetfield,
     Instruction_sgetfieldptr,
     Instruction_store,
-)
-from ehir.core.instructions.memory.load import Instruction_load
-from ehir.core.instructions.memory.salloc import Instruction_salloc
-from ehir.core.instructions.operators.arithmetic import (
-    Instruction_add,
-    Instruction_div,
-    Instruction_mul,
     Instruction_sub,
+    Instruction_switch,
 )
-from ehir.core.instructions.operators.base import BinOp
-from ehir.core.instructions.operators.comparison import (
-    Instruction_geq,
-    Instruction_grt,
-    Instruction_leq,
-    Instruction_les,
-)
-from ehir.core.instructions.operators.logic import (
-    Instruction_ieq,
-    Instruction_neq,
-)
-from ehir.core.primitives import Float_t, Isize_t, Str_t, Usize_t
+from ehir.core.instructions.base import Assignable
+from ehir.core.instructions.arithmetic import Instruction_div
+from ehir.core.primitives import Char_t, Float_t, Isize_t, Str_t, Usize_t
 from ehir.core.primitives.base import PrimitiveType
-from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
+from ehir.core.type import Pointer, Type, box_pointee, is_box_type
 from ehir.core.variable import Parameter, TypedVariable, Variable
 
 _BOOLEAN_INSTRUCTS = (
@@ -86,7 +73,7 @@ _BOOLEAN_INSTRUCTS = (
 
 @dataclass
 class _ImplMethodRef:
-    trait_name: str
+    trait_name: str | None
     method_name: str
     trait_args: list[Type]
     for_type: Type
@@ -103,6 +90,8 @@ class Resolver:
     impl_method_refs: list[_ImplMethodRef]
     concrete_struct_origins: dict[str, tuple[str, list[Type]]]
     concrete_enum_origins: dict[str, tuple[str, list[Type]]]
+    fn_owner_types: dict[str, Type]
+    type_aliases: dict[str, Type]
 
     def run(self, ast: list[Derective]) -> list[Derective]:
         self.fn = {}
@@ -113,6 +102,8 @@ class Resolver:
         self.impl_method_refs = []
         self.concrete_struct_origins = {}
         self.concrete_enum_origins = {}
+        self.fn_owner_types = {}
+        self.type_aliases = {}
         base_function_names: set[str] = set()
 
         for derective in ast:
@@ -125,8 +116,12 @@ class Resolver:
                 self.structs[derective.name] = derective
             elif isinstance(derective, Derective_trait):
                 self.traits[derective.name] = derective
+            elif isinstance(derective, Derective_typealias):
+                self.type_aliases[derective.name] = deepcopy(derective.target)
             elif isinstance(derective, Derective_impl):
                 self.impls.append(derective)
+
+        self._rebuild_concrete_origins()
 
         for impl in self.impls:
             self._register_impl(impl)
@@ -142,9 +137,6 @@ class Resolver:
                 continue
             self._resolve(fn)
 
-        # drop generics
-        base_enum_names = {x.name for x in self.enums.values() if x.generics}
-        base_struct_names = {x.name for x in self.structs.values() if x.generics}
         base_enum_ast_names = {x.name for x in ast if isinstance(x, Derective_enum)}
         base_struct_ast_names = {x.name for x in ast if isinstance(x, Derective_struct)}
         new_enums = [e for e in self.enums if e not in base_enum_ast_names]
@@ -164,17 +156,60 @@ class Resolver:
             new_ast.append(self.fn[derective])
 
         for derective in ast[::-1]:
-            if isinstance(derective, (Derective_trait, Derective_impl)):
-                continue
-            if isinstance(derective, Derective_enum) and derective.name in base_enum_names:
-                continue
-            if isinstance(derective, Derective_struct) and derective.name in base_struct_names:
-                continue
-            if isinstance(derective, Derective_fn) and derective.generics:
+            if isinstance(derective, Derective_typealias):
                 continue
             new_ast.append(derective)
 
         return new_ast
+
+    def _rebuild_concrete_origins(self):
+        known_types: list[Type] = []
+        for name, struct in self.structs.items():
+            if struct.generics:
+                continue
+            known_types.append(Type(name))
+        for name, enum in self.enums.items():
+            if enum.generics:
+                continue
+            known_types.append(Type(name))
+
+        primitive_names = [
+            "u1",
+            "u8",
+            "u16",
+            "u32",
+            "u64",
+            "usize",
+            "i8",
+            "i16",
+            "i32",
+            "i64",
+            "isize",
+            "f32",
+            "f64",
+            "char",
+            "str",
+            "void",
+        ]
+        known_types.extend(Type(name) for name in primitive_names)
+
+        mangled_to_type = {self._mangle_type_name(typ): typ for typ in known_types}
+
+        for name, struct in list(self.structs.items()):
+            if struct.generics:
+                continue
+            for base_name, base_struct in self.structs.items():
+                if not base_struct.generics or len(base_struct.generics) != 1:
+                    continue
+                prefix = f"{base_name}_"
+                if not name.startswith(prefix):
+                    continue
+                suffix = name[len(prefix) :]
+                generic = mangled_to_type.get(suffix)
+                if generic is None:
+                    continue
+                self.concrete_struct_origins[name] = (base_name, [deepcopy(generic)])
+                break
 
     def _register_impl(self, impl: Derective_impl):
         merged_generics = deepcopy(impl.generics)
@@ -188,7 +223,9 @@ class Resolver:
                 impl_generic_names.add(generic.name)
             method_fn.generics = deepcopy(merged_generics)
 
-            if method_fn.name in self.fn:
+            if impl.trait_name is None:
+                method_fn.name = f"{impl.for_type}::{method_fn.name}"
+            else:
                 for_type_suffix = self._mangle_type_name(impl.for_type)
                 if impl.trait_args:
                     trait_args_suffix = "_".join(self._mangle_type_name(arg) for arg in impl.trait_args)
@@ -203,16 +240,18 @@ class Resolver:
                 method_fn.name = unique_name
 
             self.fn[method_fn.name] = method_fn
-            self.impl_method_refs.append(
-                _ImplMethodRef(
-                    trait_name=impl.trait_name,
-                    method_name=method.name,
-                    trait_args=deepcopy(impl.trait_args),
-                    for_type=impl.for_type,
-                    impl_generics=deepcopy(merged_generics),
-                    fn_name=method_fn.name,
+            self.fn_owner_types[method_fn.name] = deepcopy(impl.for_type)
+            if impl.trait_name is not None:
+                self.impl_method_refs.append(
+                    _ImplMethodRef(
+                        trait_name=impl.trait_name,
+                        method_name=method.name,
+                        trait_args=deepcopy(impl.trait_args),
+                        for_type=impl.for_type,
+                        impl_generics=deepcopy(merged_generics),
+                        fn_name=method_fn.name,
+                    )
                 )
-            )
 
     @staticmethod
     def _mangle_type_name(typ: Type) -> str:
@@ -222,6 +261,18 @@ class Resolver:
 
     def _resolve(self, fn: Derective_fn):
         variables: dict[str, Variable] = {}
+        temp_rename_counters: dict[str, int] = {}
+
+        def is_ephemeral_name(name: str) -> bool:
+            return (
+                name.startswith("ret_arg_")
+                or name.startswith("expr_arg_")
+                or name.startswith("expr_")
+                or name.startswith("match_scrutinee_")
+                or name.startswith("if_cond_")
+                or name.startswith("if_cond_lhs_")
+                or name.startswith("if_cond_rhs_")
+            )
 
         def add_variable(var: Variable) -> Variable:
             if var.type is not None:
@@ -234,6 +285,20 @@ class Resolver:
             old_var = variables[var.name]
             if old_var.type and var.type:
                 if old_var.type != var.type:
+                    if self._types_compatible(old_var.type, var.type):
+                        if self._type_specificity(var.type) > self._type_specificity(old_var.type):
+                            old_var.type = var.type
+                        return old_var
+                    if is_ephemeral_name(var.name):
+                        counter = temp_rename_counters.get(var.name, 0)
+                        new_name = var.name
+                        while new_name in variables:
+                            counter += 1
+                            new_name = f"{var.name}__{counter}"
+                        temp_rename_counters[var.name] = counter
+                        var.name = new_name
+                        variables[new_name] = var
+                        return var
                     raise TypeError(f"Type mismatch for variable '{var.name}': {old_var.type} != {var.type}")
                 return old_var
             elif old_var.type:
@@ -244,6 +309,11 @@ class Resolver:
 
         def resolve_call(instr: Instruction_call):
             instr.args = [add_variable(arg) for arg in instr.args]
+            if instr.fn_name == "op" and any(
+                arg.type is None or not self._is_concrete_type(arg.type) for arg in instr.args
+            ):
+                instr.var_out = add_variable(instr.var_out)
+                return
             resolved_inherent = self._resolve_inherent_method_call(instr.fn_name, instr.args)
             if resolved_inherent is not None:
                 fn_name, inferred_generics = resolved_inherent
@@ -257,11 +327,92 @@ class Resolver:
                 if not instr.generics:
                     instr.generics = inferred_generics
 
+            if instr.fn_name == "op" and any(
+                arg.type is None or not self._is_concrete_type(arg.type) for arg in instr.args
+            ):
+                instr.var_out = add_variable(instr.var_out)
+                return
+
             if instr.fn_name not in self.fn:
                 if "::" not in instr.fn_name:
                     same_basename = [name for name in self.fn if name.rsplit("::", 1)[-1] == instr.fn_name]
                     if len(same_basename) == 1:
                         instr.fn_name = same_basename[0]
+                    elif len(same_basename) > 1:
+                        by_arity = [
+                            name for name in same_basename if len(getattr(self.fn[name], "params", [])) == len(instr.args)
+                        ]
+                        if len(by_arity) == 1:
+                            instr.fn_name = by_arity[0]
+
+                    if instr.fn_name not in self.fn and instr.args and instr.args[0].type is not None:
+                        inferred_call = self._resolve_inherent_method_call(
+                            f"{instr.args[0].type}::{instr.fn_name}", instr.args
+                        )
+                        if inferred_call is not None:
+                            inferred_name, inferred_generics = inferred_call
+                            instr.fn_name = inferred_name
+                            if not instr.generics:
+                                instr.generics = inferred_generics
+
+                if instr.fn_name not in self.fn:
+                    debug_trait_name = instr.fn_name.rsplit("::", 1)[0] if "::" in instr.fn_name else ""
+                    if (
+                        len(instr.args) == 1
+                        and instr.args[0].type is not None
+                        and instr.fn_name.endswith("::fmt")
+                        and debug_trait_name.rsplit("::", 1)[-1] == "Debug"
+                    ):
+                        runtime_fmt_map = {
+                            "u1": "__ehir_rt_fmt_bool",
+                            "u8": "__ehir_rt_fmt_u8",
+                            "u16": "__ehir_rt_fmt_u16",
+                            "u32": "__ehir_rt_fmt_u32",
+                            "u64": "__ehir_rt_fmt_u64",
+                            "usize": "__ehir_rt_fmt_usize",
+                            "i8": "__ehir_rt_fmt_i8",
+                            "i16": "__ehir_rt_fmt_i16",
+                            "i32": "__ehir_rt_fmt_i32",
+                            "i64": "__ehir_rt_fmt_i64",
+                            "isize": "__ehir_rt_fmt_isize",
+                            "f32": "__ehir_rt_fmt_f32",
+                            "f64": "__ehir_rt_fmt_f64",
+                        }
+                        fmt_rt_fn = runtime_fmt_map.get(instr.args[0].type.name)
+                        if fmt_rt_fn is not None and fmt_rt_fn in self.fn:
+                            instr.fn_name = fmt_rt_fn
+                            instr.is_unsafe = True
+
+                if instr.fn_name not in self.fn:
+                    if "::" in instr.fn_name:
+                        owner_text, method_name = instr.fn_name.rsplit("::", 1)
+                        owner_type = self._parse_type_text(owner_text)
+                        if owner_type is not None:
+                            resolved_owner = self._resolve_type(owner_type)
+                            resolved_name = f"{resolved_owner}::{method_name}"
+                            if resolved_name in self.fn:
+                                instr.fn_name = resolved_name
+                            elif instr.args and instr.args[0].type is not None:
+                                inferred_call = self._resolve_inherent_method_call(
+                                    f"{instr.args[0].type}::{method_name}", instr.args
+                                )
+                                if inferred_call is not None:
+                                    inferred_name, inferred_generics = inferred_call
+                                    instr.fn_name = inferred_name
+                                    if not instr.generics:
+                                        instr.generics = inferred_generics
+                        if instr.fn_name not in self.fn:
+                            same_basename = [name for name in self.fn if name.rsplit("::", 1)[-1] == method_name]
+                            if len(same_basename) == 1:
+                                instr.fn_name = same_basename[0]
+                        if instr.fn_name not in self.fn:
+                            path_parts = instr.fn_name.split("::")
+                            for idx in range(1, len(path_parts) - 1):
+                                suffix = "::".join(path_parts[idx:])
+                                suffix_matches = [name for name in self.fn if name.endswith(suffix)]
+                                if len(suffix_matches) == 1:
+                                    instr.fn_name = suffix_matches[0]
+                                    break
 
                 if instr.fn_name not in self.fn:
                     if "::" in instr.fn_name:
@@ -278,17 +429,29 @@ class Resolver:
                         candidates = [
                             f"{ref.trait_name}[{', '.join(str(arg) for arg in ref.trait_args)}] for {ref.for_type}::{ref.method_name}"
                             for ref in self.impl_method_refs
-                            if ref.trait_name == trait_name and ref.method_name == method_name
+                            if (
+                                ref.method_name == method_name
+                                and (
+                                    ref.trait_name == trait_name
+                                    or ref.trait_name.rsplit("::", 1)[-1] == trait_name.rsplit("::", 1)[-1]
+                                )
+                            )
                         ]
                         arg_types = [str(arg.type) if arg.type is not None else "?" for arg in instr.args]
                         raise TypeError(
-                            f"Unknown function '{instr.fn_name}' for args {arg_types}. "
+                            f"Unknown function '{instr.fn_name}' for args {arg_types} in '{fn.name}'. "
                             f"Impl candidates: {candidates}"
                         )
-                    raise TypeError(f"Unknown function '{instr.fn_name}'")
+                    arg_types = [str(arg.type) if arg.type is not None else "?" for arg in instr.args]
+                    basename = instr.fn_name.rsplit("::", 1)[-1]
+                    candidates = [name for name in self.fn if name.rsplit("::", 1)[-1] == basename]
+                    raise TypeError(
+                        f"Unknown function '{instr.fn_name}' in '{fn.name}' for args {arg_types}. "
+                        f"Candidates: {candidates}"
+                    )
             target_fn = self.fn[instr.fn_name]
             if isinstance(target_fn, Derective_extern_fn):
-                if not instr.is_unsafe:
+                if not instr.is_unsafe and "safe" not in getattr(target_fn, "attrs", ()):
                     raise TypeError(f"Extern function '{instr.fn_name}' requires unsafe call")
                 if len(instr.args) != len(target_fn.params):
                     raise TypeError(
@@ -340,7 +503,8 @@ class Resolver:
                     expected_type = self._resolve_type(expected_type)
                     if instr.var_out.type and instr.var_out.type != expected_type:
                         raise TypeError(
-                            f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
+                            f"Type mismatch for variable '{instr.var_out.name}' in fn '{fn.name}': "
+                            f"{instr.var_out.type} != {expected_type}. Instr: {instr}"
                         )
                     instr.var_out.type = expected_type
                     instr.var_out = add_variable(instr.var_out)
@@ -351,11 +515,21 @@ class Resolver:
                 instr.generics.clear()
                 instr.fn_name = concrete_name
                 target_fn = self.fn[concrete_name]
-            expected_type = self._resolve_type(deepcopy(target_fn.ret_type))
+            inferred_mapping = self._infer_call_type_mapping(target_fn, instr.args, instr.var_out.type)
+            expected_template = deepcopy(target_fn.ret_type)
+            if inferred_mapping:
+                expected_template = self._replace_type(expected_template, inferred_mapping)
+            expected_type = self._resolve_type(expected_template)
             if instr.var_out.type and instr.var_out.type != expected_type:
-                raise TypeError(
-                    f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
-                )
+                if instr.fn_name == "op":
+                    expected_type = instr.var_out.type
+                else:
+                    arg_types = [str(arg.type) if arg.type is not None else "?" for arg in instr.args]
+                    raise TypeError(
+                        f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type} "
+                        f"(in={fn.name}, call={instr.fn_name}, decl={target_fn.name}, ret_template={target_fn.ret_type}, "
+                        f"ret_after_replace={expected_template}, mapping={inferred_mapping}, args={arg_types})"
+                    )
             instr.var_out.type = expected_type
             instr.var_out = add_variable(instr.var_out)
 
@@ -385,15 +559,6 @@ class Resolver:
                 enum_variant_payloads = {
                     variant.name: variant.type
                     for variant in self._get_enum_variants(cond_type.name, cond_type.generics)
-                }
-            elif cond_type.name.endswith("_HSP") or cond_type.name.endswith("_SSP"):
-                inner_name = cond_type.name.removesuffix("_HSP").removesuffix("_SSP")
-                inner_type = Type(name=inner_name)
-                wrapper_ptr_type = Pointer(inner_type)
-                if inner_name not in self.enums:
-                    return
-                enum_variant_payloads = {
-                    variant.name: variant.type for variant in self._get_enum_variants(inner_name, inner_type.generics)
                 }
             else:
                 return
@@ -472,40 +637,37 @@ class Resolver:
             for instr in block.body:
                 if isinstance(instr, Instruction_match):
                     instr.cond_var = add_variable(instr.cond_var)
-                    assert instr.cond_var.type is not None
-                    instr.cond_var.type = self._resolve_type(instr.cond_var.type)
-                    inject_match_payload_binding(instr)
+                    if instr.cond_var.type is not None:
+                        instr.cond_var.type = self._resolve_type(instr.cond_var.type)
+                        inject_match_payload_binding(instr)
 
         for block in fn.body:
             for instr_id, instr in enumerate(block.body):
                 if isinstance(instr, Assignable) and instr.var_out.type is not None:
                     instr.var_out.type = self._resolve_type(instr.var_out.type)
 
-                if isinstance(instr, (Instruction_cpos, Instruction_cpoh, Instruction_scpos, Instruction_scpoh)):
-                    if isinstance(instr, (Instruction_cpos, Instruction_cpoh)):
+                if isinstance(instr, (Instruction_cpos, Instruction_scpos)):
+                    if isinstance(instr, Instruction_cpos):
                         pointer_t = Pointer
-                    elif isinstance(instr, Instruction_scpos):
-                        pointer_t = StackSmartPointer
                     else:
-                        pointer_t = HeapSmartPointer
+                        pointer_t = lambda inner: Type("Box", [inner])
                     expected_type = pointer_t(instr.primitive.type)
                     if instr.var_out.type and instr.var_out.type != expected_type:
                         raise TypeError(
-                            f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
+                            f"Type mismatch for variable '{instr.var_out.name}' in fn '{fn.name}': "
+                            f"{instr.var_out.type} != {expected_type}. Instr: {instr}"
                         )
                     instr.var_out.type = expected_type
                     instr.var_out = add_variable(instr.var_out)
 
-                elif isinstance(instr, (Instruction_ceoh, Instruction_ceos)):
+                elif isinstance(instr, Instruction_cenum):
                     instr.enum = self._resolve_enum(instr.enum)
-                    if isinstance(instr, Instruction_ceoh):
-                        expected_type = Pointer(instr.enum.as_type())
-                    else:
-                        expected_type = Pointer(instr.enum.as_type())
+                    expected_type = Pointer(instr.enum.as_type())
 
                     if instr.var_out.type and instr.var_out.type != expected_type:
                         raise TypeError(
-                            f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
+                            f"Type mismatch for variable '{instr.var_out.name}' in fn '{fn.name}': "
+                            f"{instr.var_out.type} != {expected_type}. Instr: {instr}"
                         )
                     instr.var_out.type = expected_type
                     instr.var_out = add_variable(instr.var_out)
@@ -517,16 +679,14 @@ class Resolver:
                         else:
                             instr.enum.payload.value = add_variable(instr.enum.payload.value)
 
-                elif isinstance(instr, (Instruction_csos, Instruction_csoh, Instruction_scsos, Instruction_scsoh)):
+                elif isinstance(instr, (Instruction_cstruct, Instruction_scstruct)):
                     instr.struct = self._resolve_struct(instr.struct)
-                    if isinstance(instr, (Instruction_csos, Instruction_csoh)):
+                    if isinstance(instr, Instruction_cstruct):
                         pointer_t = Pointer
-                    elif isinstance(instr, Instruction_scsos):
-                        pointer_t = StackSmartPointer
                     else:
-                        pointer_t = HeapSmartPointer
+                        pointer_t = lambda inner: Type("Box", [inner])
                     expected_type = pointer_t(instr.struct.as_type())
-                    if instr.var_out.type and instr.var_out.type != expected_type:
+                    if instr.var_out.type and not self._types_compatible(instr.var_out.type, expected_type):
                         raise TypeError(
                             f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
                         )
@@ -546,21 +706,21 @@ class Resolver:
                         arg.type = expected_type
                         add_variable(arg)
 
-                elif isinstance(instr, Instruction_lcpos):
+                elif isinstance(instr, Instruction_capprim):
                     expected_type = instr.primitive.type
 
-                    if instr.var_out.type and instr.var_out.type != expected_type:
+                    if instr.var_out.type and not self._types_compatible(instr.var_out.type, expected_type):
                         raise TypeError(
                             f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
                         )
                     instr.var_out.type = expected_type
                     instr.var_out = add_variable(instr.var_out)
 
-                elif isinstance(instr, Instruction_lceos):
+                elif isinstance(instr, Instruction_capenum):
                     instr.enum = self._resolve_enum(instr.enum)
                     expected_type = instr.enum.as_type()
 
-                    if instr.var_out.type and instr.var_out.type != expected_type:
+                    if instr.var_out.type and not self._types_compatible(instr.var_out.type, expected_type):
                         raise TypeError(
                             f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
                         )
@@ -574,11 +734,11 @@ class Resolver:
                         else:
                             instr.enum.payload.value = add_variable(instr.enum.payload.value)
 
-                elif isinstance(instr, Instruction_lcsos):
+                elif isinstance(instr, Instruction_capstruct):
                     instr.struct = self._resolve_struct(instr.struct)
                     expected_type = instr.struct.as_type()
 
-                    if instr.var_out.type and instr.var_out.type != expected_type:
+                    if instr.var_out.type and not self._types_compatible(instr.var_out.type, expected_type):
                         raise TypeError(
                             f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
                         )
@@ -599,45 +759,66 @@ class Resolver:
 
                 elif isinstance(
                     instr,
-                    (Instruction_getfield, Instruction_getfieldptr, Instruction_sgetfield, Instruction_sgetfieldptr),
+                    (
+                        Instruction_getfield,
+                        Instruction_getfieldptr,
+                        Instruction_sgetfield,
+                        Instruction_sgetfieldptr,
+                        Instruction_setfield,
+                    ),
                 ):
-                    instr.src = add_variable(instr.src)
-                    assert instr.src.type
-                    instr.src.type = self._resolve_type(instr.src.type)
+                    src = instr.src if hasattr(instr, "src") else instr.var
+                    src = add_variable(src)
+                    assert src.type
+                    src.type = self._resolve_type(src.type)
+                    if hasattr(instr, "src"):
+                        instr.src = src
+                    else:
+                        instr.var = src
 
-                    if isinstance(instr.src.type, PrimitiveType):
-                        raise TypeError(f"Cannot access field of primitive type '{instr.src.type}'")
+                    if isinstance(src.type, PrimitiveType):
+                        raise TypeError(f"Cannot access field of primitive type '{src.type}'")
 
-                    resolved_params = self._get_composite_params(instr.src.type.name, instr.src.type.generics)
+                    resolved_params = self._get_composite_params(src.type.name, src.type.generics)
                     for i, param in enumerate(resolved_params):
                         if param.name == instr.field.name or str(i) == instr.field.name:
                             if instr.field.type and instr.field.type != param.type:
                                 raise TypeError(
-                                    f"Type mismatch for field '{instr.field.name}' in struct '{instr.src.type.name}': {instr.field.type} != {param.type}"
+                                    f"Type mismatch for field '{instr.field.name}' in struct '{src.type.name}': {instr.field.type} != {param.type}"
                                 )
                             instr.field.type = param.type
                             instr.field.name = str(i)
                             break
                     else:
-                        raise TypeError(f"Unknown field '{instr.field.name}' in struct '{instr.src.type.name}'")
+                        raise TypeError(f"Unknown field '{instr.field.name}' in struct '{src.type.name}'")
 
-                    expected_type = (
-                        instr.field.type
-                        if isinstance(instr, (Instruction_getfield, Instruction_sgetfield))
-                        else Pointer(instr.field.type)
-                    )
-                    if instr.var_out.type and instr.var_out.type != expected_type:
-                        raise TypeError(
-                            f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
+                    if isinstance(instr, Instruction_setfield):
+                        instr.value = add_variable(instr.value)
+                        expected_type = instr.field.type
+                        if instr.value.type and not self._types_compatible(instr.value.type, expected_type):
+                            raise TypeError(
+                                f"Type mismatch for variable '{instr.value.name}': {instr.value.type} != {expected_type}"
+                            )
+                        instr.value.type = expected_type
+                        instr.value = add_variable(instr.value)
+                    else:
+                        expected_type = (
+                            instr.field.type
+                            if isinstance(instr, (Instruction_getfield, Instruction_sgetfield))
+                            else Pointer(instr.field.type)
                         )
-                    instr.var_out.type = expected_type
-                    instr.var_out = add_variable(instr.var_out)
+                        if instr.var_out.type and not self._types_compatible(instr.var_out.type, expected_type):
+                            raise TypeError(
+                                f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
+                            )
+                        instr.var_out.type = expected_type
+                        instr.var_out = add_variable(instr.var_out)
 
                 elif isinstance(instr, Instruction_ret):
                     fn.ret_type = self._resolve_type(fn.ret_type)
                     expected_type = fn.ret_type
                     instr.var = add_variable(instr.var)
-                    if instr.var.type and instr.var.type != expected_type:
+                    if instr.var.type and not self._types_compatible(instr.var.type, expected_type):
                         raise TypeError(f"Type mismatch for return value: {instr.var.type} != {expected_type}")
                     instr.var.type = expected_type
 
@@ -688,17 +869,22 @@ class Resolver:
                             raise TypeError(f"Unable to determine expected type for phi instruction: {instr}")
 
                     if instr.var_out.type and instr.var_out.type != expected_type:
-                        raise TypeError(
-                            f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
-                        )
-                    instr.var_out.type = expected_type
+                        if self._types_compatible(instr.var_out.type, expected_type):
+                            instr.var_out.type = expected_type
+                        else:
+                            raise TypeError(
+                                f"Type mismatch for variable '{instr.var_out.name}': {instr.var_out.type} != {expected_type}"
+                            )
+                    else:
+                        instr.var_out.type = expected_type
                     instr.var_out = add_variable(instr.var_out)
 
                     for arg in instr.args:
                         if arg.var.type and arg.var.type != expected_type:
-                            raise TypeError(
-                                f"Type mismatch for arg '{arg.var.name}': {arg.var.type} != {expected_type}"
-                            )
+                            if not self._types_compatible(arg.var.type, expected_type):
+                                raise TypeError(
+                                    f"Type mismatch for arg '{arg.var.name}': {arg.var.type} != {expected_type}"
+                                )
                         arg.var.type = expected_type
                         arg.var = add_variable(arg.var)
 
@@ -728,14 +914,17 @@ class Resolver:
                         if case.variant in seen_variants:
                             raise TypeError(f"Duplicate match variant '{case.variant}'")
                         seen_variants.add(case.variant)
-                        if case.payload_var is not None and case.payload_var.type != next(
+                        expected_payload_type = next(
                             variant.type
-                            for variant in self._get_enum_variants(
-                                instr.cond_var.type.name, instr.cond_var.type.generics
-                            )
+                            for variant in self._get_enum_variants(instr.cond_var.type.name, instr.cond_var.type.generics)
                             if variant.name == case.variant
-                        ):
-                            raise TypeError(f"Type mismatch for match payload variable '{case.payload_var.name}'")
+                        )
+                        if case.payload_var is not None:
+                            if case.payload_var.type is None:
+                                case.payload_var.type = expected_payload_type
+                                case.payload_var = add_variable(case.payload_var)
+                            elif case.payload_var.type != expected_payload_type:
+                                raise TypeError(f"Type mismatch for match payload variable '{case.payload_var.name}'")
                 elif isinstance(instr, Instruction_salloc):
                     instr.type = self._resolve_type(instr.type)
                     expected_type = Pointer(instr.type)
@@ -878,7 +1067,7 @@ class Resolver:
         # step 1: Check variables
         for name, val in variables.items():
             if val.type is None:
-                raise TypeError(f"Type not specified for variable '{name}'")
+                raise TypeError(f"Type not specified for variable '{name}' in fn '{fn.name}'")
 
     def _concrete_fn(self, fn: Derective_fn, types: list[Type]) -> "Derective_fn":
         assert len(fn.generics) == len(types)
@@ -889,6 +1078,8 @@ class Resolver:
         base.generics.clear()
         base.name = base.get_conrete_name(types)
         self.fn[base.name] = base
+        if fn.name in self.fn_owner_types:
+            self.fn_owner_types[base.name] = self._replace_type(deepcopy(self.fn_owner_types[fn.name]), generic_mapping)
         self._resolve(base)
 
         return base
@@ -1042,23 +1233,30 @@ class Resolver:
         if "::" not in fn_name or not args:
             return None
 
-        def unwrap_receiver_type(typ: Type) -> Type:
-            if isinstance(typ, (HeapSmartPointer, StackSmartPointer)):
-                return typ.pointee
-            return typ
-
         trait_name, method_name = fn_name.rsplit("::", 1)
         recv = args[0]
         if recv.type is None:
             return None
-        recv_type = unwrap_receiver_type(recv.type)
+        recv_type = self._canonicalize_type(recv.type)
+        recv_type_variants = [recv_type]
+        if is_box_type(recv_type):
+            recv_type_variants.append(box_pointee(recv_type))
 
         for ref in self.impl_method_refs:
-            if ref.trait_name != trait_name or ref.method_name != method_name:
+            if ref.method_name != method_name:
+                continue
+            if not (
+                ref.trait_name == trait_name or ref.trait_name.rsplit("::", 1)[-1] == trait_name.rsplit("::", 1)[-1]
+            ):
                 continue
             generic_names = {generic.name for generic in ref.impl_generics}
-            mapping: dict[str, Type] = {}
-            if not self._match_type_template(ref.for_type, recv_type, generic_names, mapping):
+            mapping: dict[str, Type] | None = None
+            for recv_candidate in recv_type_variants:
+                candidate_mapping: dict[str, Type] = {}
+                if self._match_type_template(ref.for_type, recv_candidate, generic_names, candidate_mapping):
+                    mapping = candidate_mapping
+                    break
+            if mapping is None:
                 continue
 
             if ref.trait_args:
@@ -1067,7 +1265,7 @@ class Resolver:
                 trait_arg_match = True
                 for template_arg, arg in zip(ref.trait_args, args[1 : 1 + len(ref.trait_args)], strict=True):
                     if arg.type is None or not self._match_type_template(
-                        template_arg, unwrap_receiver_type(arg.type), generic_names, mapping
+                        template_arg, self._canonicalize_type(arg.type), generic_names, mapping
                     ):
                         trait_arg_match = False
                         break
@@ -1080,7 +1278,7 @@ class Resolver:
             params_match = True
             for param, arg in zip(target_fn.params, args, strict=True):
                 if arg.type is None or not self._match_type_template(
-                    param.type, unwrap_receiver_type(arg.type), generic_names, mapping
+                    param.type, self._canonicalize_type(arg.type), generic_names, mapping
                 ):
                     params_match = False
                     break
@@ -1096,38 +1294,71 @@ class Resolver:
 
         return None
 
+    def _infer_call_type_mapping(
+        self, target_fn: Derective_fn, args: list[Variable], out_type: Type | None
+    ) -> dict[str, Type]:
+        mapping: dict[str, Type] = {}
+        generic_names = {generic.name for generic in getattr(target_fn, "generics", [])}
+
+        if "::" in target_fn.name:
+            owner_text = target_fn.name.rsplit("::", 1)[0]
+            owner_type = self._parse_type_text(owner_text)
+            if owner_type is not None:
+                generic_names |= {generic.name for generic in owner_type.generics if not generic.generics}
+            if owner_type is not None and args and args[0].type is not None:
+                self._match_type_template(owner_type, args[0].type, generic_names, mapping)
+
+        for param, arg in zip(target_fn.params, args, strict=False):
+            if arg.type is None:
+                continue
+            self._match_type_template(param.type, arg.type, generic_names, mapping)
+
+        if out_type is not None:
+            self._match_type_template(target_fn.ret_type, out_type, generic_names, mapping)
+
+        return mapping
+
     def _resolve_inherent_method_call(self, fn_name: str, args: list[Variable]) -> tuple[str, list[Type]] | None:
         if "::" not in fn_name:
             return None
 
         owner_text, method_name = fn_name.rsplit("::", 1)
         actual_owner = self._parse_type_text(owner_text)
-        if actual_owner is None or not actual_owner.generics:
+        if actual_owner is None:
             return None
+        actual_owner = self._canonicalize_type(actual_owner)
 
         for candidate_name, target_fn in self.fn.items():
             if "::" not in candidate_name or candidate_name.rsplit("::", 1)[-1] != method_name:
-                continue
-            if not getattr(target_fn, "generics", []):
                 continue
 
             template_owner = self._parse_type_text(candidate_name.rsplit("::", 1)[0])
             if template_owner is None:
                 continue
+            template_owner = self._canonicalize_type(template_owner)
 
-            generic_names = {generic.name for generic in target_fn.generics}
+            generic_names = {generic.name for generic in getattr(target_fn, "generics", [])}
+            generic_names |= {generic.name for generic in template_owner.generics if not generic.generics}
             mapping: dict[str, Type] = {}
             if not self._match_type_template(template_owner, actual_owner, generic_names, mapping):
                 continue
+            for generic_name in list(mapping.keys()):
+                bound = mapping[generic_name]
+                if not bound.generics and bound.name in generic_names:
+                    del mapping[generic_name]
 
             if len(target_fn.params) != len(args):
                 continue
 
             params_match = True
-            for param, arg in zip(target_fn.params, args, strict=True):
+            for index, (param, arg) in enumerate(zip(target_fn.params, args, strict=True)):
+                if index == 0:
+                    # Receiver compatibility is already checked via owner matching.
+                    continue
                 if arg.type is None:
                     continue
-                if not self._match_type_template(param.type, arg.type, generic_names, mapping):
+                expected_param_type = template_owner if param.type.name == "Self" and not param.type.generics else param.type
+                if not self._match_type_template(expected_param_type, arg.type, generic_names, mapping):
                     params_match = False
                     break
             if not params_match:
@@ -1174,10 +1405,6 @@ class Resolver:
         return True
 
     def _canonicalize_type(self, typ: Type) -> Type:
-        if isinstance(typ, HeapSmartPointer):
-            return HeapSmartPointer(self._canonicalize_type(typ.pointee))
-        if isinstance(typ, StackSmartPointer):
-            return StackSmartPointer(self._canonicalize_type(typ.pointee))
         if isinstance(typ, Pointer):
             return Pointer(self._canonicalize_type(typ.pointee))
 
@@ -1192,17 +1419,47 @@ class Resolver:
         base.generics = [self._canonicalize_type(generic) for generic in typ.generics]
         return base
 
+    def _types_compatible(self, lhs: Type, rhs: Type) -> bool:
+        lhs_c = self._canonicalize_type(lhs)
+        rhs_c = self._canonicalize_type(rhs)
+        if lhs_c == rhs_c:
+            return True
+        generic_names = self._collect_placeholder_type_names(lhs_c) | self._collect_placeholder_type_names(rhs_c)
+        if not generic_names:
+            return False
+        return self._match_type_template(lhs_c, rhs_c, generic_names, {}) or self._match_type_template(
+            rhs_c, lhs_c, generic_names, {}
+        )
+
+    def _type_specificity(self, typ: Type) -> int:
+        return -len(self._collect_placeholder_type_names(self._canonicalize_type(typ)))
+
+    def _collect_placeholder_type_names(self, typ: Type) -> set[str]:
+        names: set[str] = set()
+        stack: list[Type] = [typ]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, Pointer):
+                stack.append(current.pointee)
+                continue
+            stack.extend(current.generics)
+            if (
+                not current.generics
+                and current.name not in self.structs
+                and current.name not in self.enums
+                and current.name not in self.concrete_struct_origins
+                and current.name not in self.concrete_enum_origins
+                and not isinstance(current, PrimitiveType)
+                and current.name != "void"
+            ):
+                names.add(current.name)
+        return names
+
     def _parse_type_text(self, text: str) -> Type | None:
         raw = text.strip()
         if not raw:
             return None
 
-        if raw.endswith("<H>"):
-            pointee = self._parse_type_text(raw.removesuffix("<H>"))
-            return HeapSmartPointer(pointee) if pointee is not None else None
-        if raw.endswith("<S>"):
-            pointee = self._parse_type_text(raw.removesuffix("<S>"))
-            return StackSmartPointer(pointee) if pointee is not None else None
         if raw.endswith("*"):
             pointee = self._parse_type_text(raw[:-1])
             return Pointer(pointee) if pointee is not None else None
@@ -1269,10 +1526,6 @@ class Resolver:
         return self._replace_type(typ, {})
 
     def _replace_type(self, typ: Type, generic_mapping: dict[str, Type]) -> Type:
-        if isinstance(typ, HeapSmartPointer):
-            return HeapSmartPointer(self._replace_type(typ.pointee, generic_mapping))
-        if isinstance(typ, StackSmartPointer):
-            return StackSmartPointer(self._replace_type(typ.pointee, generic_mapping))
         if isinstance(typ, Pointer):
             return Pointer(self._replace_type(typ.pointee, generic_mapping))
         if isinstance(typ, PrimitiveType):
@@ -1281,12 +1534,17 @@ class Resolver:
         if not typ.generics and typ.name in generic_mapping:
             return deepcopy(generic_mapping[typ.name])
 
+        if not typ.generics and typ.name in self.type_aliases:
+            return self._replace_type(deepcopy(self.type_aliases[typ.name]), generic_mapping)
+
         if typ.name == "usize":
             return Usize_t()
         if typ.name == "isize":
             return Isize_t()
         if typ.name == "bool":
             return Usize_t(1)
+        if typ.name == "char":
+            return Char_t()
         if typ.name == "str":
             return Str_t()
         if typ.name.startswith("u") and typ.name[1:].isdigit():
@@ -1326,7 +1584,7 @@ class Resolver:
         return resolved
 
     def _is_concrete_type(self, typ: Type) -> bool:
-        if isinstance(typ, (HeapSmartPointer, StackSmartPointer, Pointer)):
+        if isinstance(typ, Pointer):
             return self._is_concrete_type(typ.pointee)
 
         if isinstance(typ, PrimitiveType):

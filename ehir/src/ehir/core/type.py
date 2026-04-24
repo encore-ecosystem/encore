@@ -1,4 +1,3 @@
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 
@@ -25,34 +24,17 @@ class Pointer(Type):
     def __str__(self) -> str:
         return f"{self.pointee}*"
 
-
-class SmartPointer(Pointer, ABC):
-    @abstractmethod
-    def get_name(self) -> str:
-        raise NotImplementedError
+def is_box_type(typ: Type) -> bool:
+    return not isinstance(typ, Pointer) and typ.name == "Box" and len(typ.generics) == 1
 
 
-class HeapSmartPointer(SmartPointer):
-    def get_name(self) -> str:
-        return f"{self.pointee}_HSP"
-
-    def __str__(self) -> str:
-        return f"{self.pointee}<H>"
-
-
-class StackSmartPointer(SmartPointer):
-    def get_name(self) -> str:
-        return f"{self.pointee}_SSP"
-
-    def __str__(self) -> str:
-        return f"{self.pointee}<S>"
+def box_pointee(typ: Type) -> Type:
+    if not is_box_type(typ):
+        raise TypeError(f"{typ} is not Box[T]")
+    return typ.generics[0]
 
 
 def mangle_type_name(typ: Type) -> str:
-    if isinstance(typ, HeapSmartPointer):
-        return f"{mangle_type_name(typ.pointee)}_H"
-    if isinstance(typ, StackSmartPointer):
-        return f"{mangle_type_name(typ.pointee)}_S"
     if isinstance(typ, Pointer):
         return f"{mangle_type_name(typ.pointee)}_ptr"
     if not typ.generics:

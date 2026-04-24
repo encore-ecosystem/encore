@@ -16,6 +16,13 @@ from encore.frontend.inference import TypeInferer
 from encore.frontend.lexer import Lexer
 from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
+from encore.frontend.reflection import (
+    ModuleReflection,
+    ReflectionSymbol,
+    build_module_reflection,
+    build_runtime_reflection_ast,
+    find_symbol_reflection,
+)
 from encore.frontend.translator import Translator
 from encore.frontend.types import (
     AnySmartPointer,
@@ -71,8 +78,10 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
     on_module_load: Callable[[Path], None] | None = None
     _cache: dict[Path, EHIR_Module] = field(default_factory=dict)
     _ast_cache: dict[Path, list[s.Statement]] = field(default_factory=dict)
+    _source_ast_cache: dict[Path, list[s.Statement]] = field(default_factory=dict)
     _index_cache: dict[Path, ModuleIndex] = field(default_factory=dict)
     _dependency_cache: dict[Path, dict[str, Path]] = field(default_factory=dict)
+    _reflection_cache: dict[Path, ModuleReflection] = field(default_factory=dict)
     _lexer: Lexer = field(default_factory=lambda: Lexer())
     _parser: Parser = field(default_factory=lambda: Parser())
 
@@ -84,11 +93,13 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return self._cache[id]
 
         ast = self._get_ast_by_id(id)
+        source_ast = self._get_source_ast_by_id(id)
         imported_declarations = self._collect_imported_declarations(id, ast)
         try:
             TypeInferer().infer(ast, imported_declarations)
         except Exception as exc:
             raise with_diagnostic_context(exc, stage="type-inference", module_id=id) from exc
+        self._reflection_cache[id] = build_module_reflection(id, source_ast)
 
         translator = Translator()
         ast_for_translation = self._prepare_imports_for_translation(id, ast)
@@ -102,6 +113,25 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         self._cache[id] = module
         return module
+
+    def get_reflection_by_id(self, id: Path) -> ModuleReflection:
+        if id in self._reflection_cache:
+            return self._reflection_cache[id]
+
+        ast = self._get_ast_by_id(id)
+        source_ast = self._get_source_ast_by_id(id)
+        imported_declarations = self._collect_imported_declarations(id, ast)
+        try:
+            TypeInferer().infer(ast, imported_declarations)
+        except Exception as exc:
+            raise with_diagnostic_context(exc, stage="type-inference", module_id=id) from exc
+
+        reflection = build_module_reflection(id, source_ast)
+        self._reflection_cache[id] = reflection
+        return reflection
+
+    def get_symbol_reflection_by_id(self, id: Path, query: str) -> ReflectionSymbol | None:
+        return find_symbol_reflection(self.get_reflection_by_id(id), query)
 
     def get_parent_id_of(self, id: Path, derective: Derective_import) -> Path:
         project_root = self._get_project_root_of(id)
@@ -143,6 +173,20 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         if id in self._ast_cache:
             return self._ast_cache[id]
 
+        source_ast = self._get_source_ast_by_id(id)
+        reflection = self._reflection_cache.get(id)
+        if reflection is None:
+            reflection = build_module_reflection(id, source_ast)
+            self._reflection_cache[id] = reflection
+
+        ast = build_runtime_reflection_ast(id, source_ast, reflection)
+        self._ast_cache[id] = ast
+        return ast
+
+    def _get_source_ast_by_id(self, id: Path) -> list[s.Statement]:
+        if id in self._source_ast_cache:
+            return self._source_ast_cache[id]
+
         source_text = id.read_text()
         try:
             tokens = self._lexer.parse(list(source_text))
@@ -150,7 +194,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         except Exception as exc:
             raise with_diagnostic_context(exc, stage="parse", module_id=id, source_text=source_text) from exc
         ast = self._inject_prelude_imports(id, ast)
-        self._ast_cache[id] = ast
+        self._source_ast_cache[id] = ast
         return ast
 
     def _inject_prelude_imports(self, id: Path, ast: list[s.Statement]) -> list[s.Statement]:
@@ -530,12 +574,18 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         return children
 
+    def list_child_module_ids(self, id: Path) -> list[Path]:
+        return sorted(Path(child_id) for child_id in self._list_child_modules(id).values())
+
     def _alias_binding(self, binding: ExportBinding, alias: str) -> ExportBinding:
         return replace(binding, name=alias, source_name=binding.name)
 
     def _rewrite_impl_type_aliases(
         self, impl: s.Statement_Impl, *, source_name: str, target_name: str
     ) -> s.Statement_Impl:
+        rewritten_impl_generics = [self._replace_type_name(generic, source_name, target_name) for generic in impl.generics]
+        rewritten_trait_args = [self._replace_type_name(arg, source_name, target_name) for arg in impl.trait_args]
+        rewritten_struct = self._replace_type_name(impl.struct, source_name, target_name)
         rewritten_methods: list[s.Statement_FunctionDefinition] = []
         for method in impl.body:
             params = [
@@ -547,9 +597,16 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                 if method.signature.type is None
                 else self._replace_type_name(method.signature.type, source_name, target_name)
             )
-            signature = replace(method.signature, params=params, type=ret_type)
+            generics = [self._replace_type_name(generic, source_name, target_name) for generic in method.signature.generics]
+            signature = replace(method.signature, generics=generics, params=params, type=ret_type)
             rewritten_methods.append(replace(method, signature=signature))
-        return replace(impl, body=rewritten_methods)
+        return replace(
+            impl,
+            generics=rewritten_impl_generics,
+            trait_args=rewritten_trait_args,
+            struct=rewritten_struct,
+            body=rewritten_methods,
+        )
 
     def _replace_type_name(self, typ: Type, source_name: str, target_name: str) -> Type:
         if is_mutable_type(typ):
@@ -564,7 +621,11 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return Pointer(self._replace_type_name(typ.pointee, source_name, target_name))
 
         name = target_name if typ.name == source_name else typ.name
-        return Type(name, [self._replace_type_name(generic, source_name, target_name) for generic in typ.generics])
+        generics = [self._replace_type_name(generic, source_name, target_name) for generic in typ.generics]
+        if isinstance(typ, s.GenericParam):
+            bounds = [self._replace_type_name(bound, source_name, target_name) for bound in typ.bounds]
+            return s.GenericParam(name=name, generics=generics, bounds=bounds)
+        return Type(name, generics)
 
     def _get_project_root_of(self, id: Path) -> Path:
         for parent in [id.parent, *id.parents]:

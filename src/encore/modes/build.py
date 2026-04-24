@@ -14,7 +14,7 @@ from rich.spinner import Spinner
 from rich.text import Text
 
 from ehir import Refrain
-from encore.frontend import EHIR_EncoreFrontend
+from encore.frontend import EHIR_EncoreFrontend, format_module_reflection
 from encore.utils.manifest import ProjectManifest, ProjectTarget
 
 AVAILABLE_BACKENDS = {"llvm": EHIR_LLVM_Backend}
@@ -109,6 +109,7 @@ def handle_build(args: Namespace):
     _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
     with _BuildLiveStatus(compiler):
         compiler.compile_all()
+    _emit_reflection_artifacts(compiler)
 
 
 def create_compiler(cwd: Path, backend: str, profile: str, *, no_cache: bool = False) -> EHIR_ProjectCompiler:
@@ -176,6 +177,7 @@ def _load_refrain(
         name=manifest.project.name,
         path=path,
         type=type,
+        merge_module_dirs=("modes",) if (path / "src" / "modes").exists() else (),
     )
     compiler.add_refrain_to_build(ref)
     return ref
@@ -211,8 +213,43 @@ def build_project(cwd: Path, backend: str, profile: str, *, no_cache: bool = Fal
     compiler = create_compiler(cwd, backend, profile, no_cache=no_cache)
     entry_ref = _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
     outputs = compiler.compile_all()
+    _emit_reflection_artifacts(compiler)
     outputs_by_name = dict(outputs)
     return [(entry_ref.name, outputs_by_name[entry_ref.name]), *[(n, p) for n, p in outputs if n != entry_ref.name]]
+
+
+def _emit_reflection_artifacts(compiler: EHIR_ProjectCompiler) -> None:
+    frontend = compiler.frontend
+    if not isinstance(frontend, EHIR_EncoreFrontend):
+        return
+
+    reflection_root = compiler.backend.profile_path / "reflection"
+    for module_id, reflection in frontend._reflection_cache.items():
+        artifact_path = _reflection_artifact_path(compiler, Path(module_id))
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text(format_module_reflection(reflection))
+
+
+def _reflection_artifact_path(compiler: EHIR_ProjectCompiler, module_id: Path) -> Path:
+    reflection_root = compiler.backend.profile_path / "reflection"
+    module_id = module_id.resolve()
+
+    for refrain in sorted(compiler.refrains.values(), key=lambda ref: len(ref.path.parts), reverse=True):
+        src_root = (refrain.path / "src").resolve()
+        try:
+            relative = module_id.relative_to(src_root)
+            return (reflection_root / refrain.name / relative).with_suffix(".reflection.txt")
+        except ValueError:
+            pass
+
+        tests_root = (refrain.path / "tests").resolve()
+        try:
+            relative = Path("tests") / module_id.relative_to(tests_root)
+            return (reflection_root / refrain.name / relative).with_suffix(".reflection.txt")
+        except ValueError:
+            continue
+
+    return (reflection_root / module_id.name).with_suffix(".reflection.txt")
 
 
 def run_binary(binary_path: Path, args: list[str]) -> int:

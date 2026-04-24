@@ -219,7 +219,7 @@ fn translate_struct_stmt(stmt: StructStmt) -> Directive {
         }
     }
 
-    ret struct_directive(stmt.name, lower_type_generics(stmt.generics, Option[str]::None), fields)
+    ret struct_directive(stmt.name, lower_type_generics(generic_param_names(stmt.generics), Option[str]::None), fields)
 }
 
 fn translate_enum_stmt(stmt: EnumStmt) -> Vec[Directive] {
@@ -230,7 +230,7 @@ fn translate_enum_stmt(stmt: EnumStmt) -> Vec[Directive] {
     loop {
         match stmt.variants.get(index) {
             Some(variant) => {
-                let payload_info = lower_enum_variant_payload(stmt.name, stmt.generics, variant)
+                let payload_info = lower_enum_variant_payload(stmt.name, generic_param_names(stmt.generics), variant)
                 let payload_type = payload_info.payload_type
 
                 let mut payload_index = 0_usize
@@ -264,7 +264,7 @@ fn translate_enum_stmt(stmt: EnumStmt) -> Vec[Directive] {
         }
     }
 
-    directives = directives.push(enum_directive(stmt.name, lower_type_generics(stmt.generics, Option[str]::None), variants))
+    directives = directives.push(enum_directive(stmt.name, lower_type_generics(generic_param_names(stmt.generics), Option[str]::None), variants))
     ret directives
 }
 
@@ -278,7 +278,7 @@ fn translate_trait_stmt(stmt: TraitStmt) -> Directive {
                 methods = methods.push(
                     trait_method(
                         method.name,
-                        lower_type_generics(method.generics, Option[str]::None),
+                        lower_type_generics(generic_param_names(method.generics), Option[str]::None),
                         lower_params(method.params, Option[str]::None),
                         lower_return_type(method.ret_type, Option[str]::None)
                     )
@@ -291,7 +291,7 @@ fn translate_trait_stmt(stmt: TraitStmt) -> Directive {
         }
     }
 
-    ret trait_directive(stmt.name, lower_type_generics(stmt.generics, Option[str]::None), methods)
+    ret trait_directive(stmt.name, lower_type_generics(generic_param_names(stmt.generics), Option[str]::None), methods)
 }
 
 fn translate_impl_stmt(
@@ -321,7 +321,7 @@ fn translate_impl_stmt(
 
             builder.push(
                 impl_directive(
-                    lower_type_generics(stmt.generics, Option[str]::Some(stmt.target)),
+                    lower_type_generics(generic_param_names(stmt.generics), Option[str]::Some(stmt.target)),
                     trait_name,
                     lower_type_generics(stmt.trait_args, Option[str]::Some(stmt.target)),
                     lower_type_text(stmt.target, Option[str]::Some(stmt.target)),
@@ -362,7 +362,7 @@ fn translate_function_item(
     enums: Vec[EnumInfo],
     signatures: Vec[FunctionSignature]
 ) -> FnDirective {
-    let generics = lower_type_generics(stmt.generics, current_self_type)
+    let generics = lower_type_generics(generic_param_names(stmt.generics), current_self_type)
     let params = lower_params(stmt.params, current_self_type)
     let ret_type = lower_return_type(stmt.ret_type, current_self_type)
 
@@ -1648,6 +1648,13 @@ impl for FunctionTranslator {
                     if sig.name == name {
                         match sig.ret_type {
                             Some(ret_type) => {
+                                if ret_type == "Self" {
+                                    let scope = find_last_scope(name)
+                                    if scope < name.len() {
+                                        let owner = name.slice(0_usize, scope)
+                                        ret Option[Type]::Some(lower_type_text(owner, self.current_self_type))
+                                    }
+                                }
                                 ret Option[Type]::Some(lower_type_text(ret_type, self.current_self_type))
                             }
                             None => {
@@ -1739,7 +1746,9 @@ impl for FunctionTranslator {
     }
 
     fn fresh_untyped(mut self, prefix: str) -> Variable {
-        let name = prefix + "_" + Debug::fmt(self.next_name_index)
+        // Keep untyped temporaries in a separate namespace to avoid collisions
+        // with builder-generated typed temporaries (`prefix_<n>`).
+        let name = prefix + "_u_" + Debug::fmt(self.next_name_index)
         self.next_name_index = self.next_name_index + 1_usize
         ret untyped_var(name)
     }
@@ -1951,7 +1960,7 @@ fn struct_info_from_stmt(stmt: StructStmt) -> StructInfo {
         }
     }
 
-    ret StructInfo{stmt.name, stmt.generics, fields}
+    ret StructInfo{stmt.name, generic_param_names(stmt.generics), fields}
 }
 
 fn enum_info_from_stmt(stmt: EnumStmt) -> EnumInfo {
@@ -1961,7 +1970,7 @@ fn enum_info_from_stmt(stmt: EnumStmt) -> EnumInfo {
     loop {
         match stmt.variants.get(index) {
             Some(variant) => {
-                let payload_info = lower_enum_variant_payload(stmt.name, stmt.generics, variant)
+                let payload_info = lower_enum_variant_payload(stmt.name, generic_param_names(stmt.generics), variant)
                 variants = variants.push(EnumVariantInfo{variant.name, payload_info.payload_type})
                 index = index + 1_usize
             }
@@ -1971,7 +1980,7 @@ fn enum_info_from_stmt(stmt: EnumStmt) -> EnumInfo {
         }
     }
 
-    ret EnumInfo{stmt.name, stmt.generics, variants}
+    ret EnumInfo{stmt.name, generic_param_names(stmt.generics), variants}
 }
 
 fn lower_enum_variant_payload(enum_name: str, enum_generics: Vec[str], variant: ParsedEnumVariant) -> EnumVariantPayloadInfo {
@@ -2034,6 +2043,23 @@ fn lower_enum_variant_payload(enum_name: str, enum_generics: Vec[str], variant: 
 
     let directive = struct_directive(struct_name, lower_type_generics(enum_generics, Option[str]::None), fields)
     ret EnumVariantPayloadInfo{Option[str]::Some(apply_type_generics_text(struct_name, enum_generics)), Vec[Directive]::new().push(directive)}
+}
+
+fn generic_param_names(items: Vec[GenericParam]) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut index = 0_usize
+    loop {
+        match items.get(index) {
+            Some(item) => {
+                out = out.push(item.name)
+                index = index + 1_usize
+            }
+            None => {
+                break
+            }
+        }
+    }
+    ret out
 }
 
 fn lower_params(params: Vec[FunctionParam], current_self_type: Option[str]) -> Vec[Parameter] {
@@ -2184,9 +2210,11 @@ fn expand_import_path(raw: str, is_public: bool) -> Vec[ImportItem] {
 
     let segments = split_scope_segments(path)
     if path_ends_with_glob(path) {
-        ret Vec[ImportItem]::new().push(ImportItem{drop_last_segment(segments), "*", alias, is_public})
+        let out: Vec[ImportItem] = Vec[ImportItem]::new()
+        ret out.push(ImportItem{drop_last_segment(segments), "*", alias, is_public})
     }
-    ret Vec[ImportItem]::new().push(ImportItem{drop_last_segment(segments), last_segment(segments), alias, is_public})
+    let out: Vec[ImportItem] = Vec[ImportItem]::new()
+    ret out.push(ImportItem{drop_last_segment(segments), last_segment(segments), alias, is_public})
 }
 
 fn append_imports(lhs: Vec[ImportItem], rhs: Vec[ImportItem]) -> Vec[ImportItem] {

@@ -71,7 +71,7 @@ from encore.frontend.base import ParserBase
 from encore.frontend.lexer import LexerToken
 from encore.frontend.lexer.tokens import TokenType
 from encore.frontend.parser import statements as s
-from encore.frontend.types import AnySmartPointer, make_array_type, make_mutable_type, make_tuple_type
+from encore.frontend.types import AnySmartPointer, is_mutable_type, make_array_type, make_mutable_type, make_tuple_type
 from encore.utils.diagnostics import CompileDiagnostic
 
 TRACE_MAX_LINES_FOR_UNIT = 5
@@ -180,7 +180,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
     def _parse_enum(self, is_public: bool):
         self._safe_consume(TokenType.KW_ENUM)
         name = self._safe_consume(TokenType.IDENTIFIER).value
-        generics = self._parse_possible_generics()
+        generics = self._parse_generic_params()
 
         body = []
         self._safe_consume(TokenType.LEFT_BRACE)
@@ -204,7 +204,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
     def _parse_trait(self, is_public: bool):
         self._safe_consume(TokenType.KW_TRAIT)
         name = self._safe_consume(TokenType.IDENTIFIER).value
-        generics = self._parse_generics_args() if self._peek_curr().type == TokenType.LEFT_BRACKET else []
+        generics = self._parse_generic_params()
         bases = self._parse_trait_bases()
 
         body: list[s.FunctionSignature] = []
@@ -216,7 +216,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     def _parse_impl(self):
         self._safe_consume(TokenType.KW_IMPL)
-        generics = self._parse_generics_args() if self._peek_curr().type == TokenType.LEFT_BRACKET else []
+        generics = self._parse_generic_params()
 
         trait_name = None
         trait_args: list[Type] = []
@@ -326,7 +326,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     def _parse_struct_signature(self) -> s.StructureSignature:
         name = self._safe_consume(TokenType.IDENTIFIER).value
-        generics = self._parse_generics_args() if self._peek_curr().type == TokenType.LEFT_BRACKET else []
+        generics = self._parse_generic_params()
         match self._peek_curr().type:
             case TokenType.LEFT_BRACE:
                 self._safe_consume(TokenType.LEFT_BRACE)
@@ -361,7 +361,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
         self._safe_consume(TokenType.KW_FN)
         func_name = self._safe_consume(TokenType.IDENTIFIER).value
-        generics = self._parse_possible_generics()
+        generics = self._parse_generic_params()
 
         params: list[Parameter] = []
         self._safe_consume(TokenType.LEFT_PAREN)
@@ -1172,6 +1172,38 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     def _parse_possible_generics(self) -> list[Type]:
         return self._parse_generics_args() if self._peek_curr().type == TokenType.LEFT_BRACKET else []
+
+    def _parse_generic_params(self) -> list[Type]:
+        return self._parse_generic_param_list() if self._peek_curr().type == TokenType.LEFT_BRACKET else []
+
+    def _parse_generic_param_list(self) -> list[Type]:
+        generics: list[Type] = []
+        self._safe_consume(TokenType.LEFT_BRACKET)
+        generics.append(self._parse_generic_param())
+        while self._peek_curr().type != TokenType.RIGHT_BRACKET:
+            self._safe_consume(TokenType.COMMA)
+            generics.append(self._parse_generic_param())
+        self._safe_consume(TokenType.RIGHT_BRACKET)
+        return generics
+
+    def _parse_generic_param(self) -> s.GenericParam:
+        name = self._safe_consume(TokenType.IDENTIFIER).value
+        bounds: list[Type] = []
+        if self._peek_curr().type == TokenType.COLON:
+            self._safe_consume(TokenType.COLON)
+            bounds.append(self._parse_trait_bound())
+            while self._peek_curr().type == TokenType.PLUS:
+                self._safe_consume(TokenType.PLUS)
+                bounds.append(self._parse_trait_bound())
+        return s.GenericParam(name=name, generics=[], bounds=bounds)
+
+    def _parse_trait_bound(self) -> Type:
+        bound = self._parse_type()
+        if isinstance(bound, (Pointer, HeapSmartPointer, StackSmartPointer)) or isinstance(bound, AnySmartPointer):
+            raise TypeError(f"Trait bounds must be trait types, got {bound}")
+        if is_mutable_type(bound):
+            raise TypeError(f"Trait bounds can not be mutable, got {bound}")
+        return bound
 
     def _parse_generics_args(self) -> list[Type]:
         generics: list[Type] = []

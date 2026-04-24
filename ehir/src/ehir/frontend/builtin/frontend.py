@@ -31,6 +31,20 @@ class EHIR_DirectFrontend(EHIR_Frontend):
 
     def get_parent_id_of(self, id: Path, derective: Derective_import) -> Path:
         child_path = Path(id).resolve()
+        core_root = Path(__file__).resolve().parents[4] / "core"
+
+        if derective.prefix and derective.prefix[0] == "core":
+            rest = derective.prefix[1:]
+            candidates: list[Path] = []
+            if derective.symbol != "*":
+                candidates.append((core_root / Path(*rest, derective.symbol)).with_suffix(self.get_file_extension()))
+            candidates.append((core_root / Path(*rest)).with_suffix(self.get_file_extension()))
+            if rest:
+                candidates.append(core_root / Path(*rest) / f"mod{self.get_file_extension()}")
+            candidates.append(core_root / f"mod{self.get_file_extension()}")
+            for candidate in candidates:
+                if candidate.exists():
+                    return candidate.resolve()
 
         def suffix_variants(prefix_parts: list[str]) -> list[Path]:
             variants: list[Path] = []
@@ -38,6 +52,8 @@ class EHIR_DirectFrontend(EHIR_Frontend):
             if derective.symbol != "*":
                 with_symbol = Path(*prefix_parts, derective.symbol)
                 variants.append(with_symbol)
+            if not prefix_parts:
+                variants.append(Path("lib"))
             variants.append(prefix_only)
             return variants
 
@@ -107,3 +123,25 @@ class EHIR_DirectFrontend(EHIR_Frontend):
 
     def get_file_extension(self) -> str:
         return ".ehir"
+
+    def list_child_module_ids(self, id: Path) -> list[Path]:
+        module_id = Path(id).resolve()
+
+        if module_id.stem == "mod":
+            base_dir = module_id.parent
+            candidates = list(base_dir.glob("*.ehir")) + list(base_dir.glob("*/mod.ehir"))
+        else:
+            base_dir = module_id.parent / module_id.stem
+            if not base_dir.exists():
+                return []
+            candidates = list(base_dir.glob("*.ehir")) + list(base_dir.glob("*/mod.ehir"))
+
+        result: list[Path] = []
+        seen: set[Path] = set()
+        for candidate in sorted(candidates):
+            candidate = candidate.resolve()
+            if candidate == module_id or candidate in seen:
+                continue
+            seen.add(candidate)
+            result.append(candidate)
+        return result

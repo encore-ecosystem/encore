@@ -2,54 +2,49 @@ from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_enum, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum
-from ehir.core.instructions.base import Instruction
-from ehir.core.instructions.capture import (
-    Instruction_ceoh,
-    Instruction_ceos,
-    Instruction_cpoh,
-    Instruction_cpos,
-    Instruction_csoh,
-    Instruction_csos,
-    Instruction_lceos,
-    Instruction_lcpos,
-    Instruction_lcsos,
-    Instruction_scpoh,
-    Instruction_scpos,
-    Instruction_scsoh,
-    Instruction_scsos,
-)
-from ehir.core.instructions.control_flow import (
+from ehir.core.instructions import (
+    BinOp,
+    ControlFlow,
+    Instruction_and,
     Instruction_br,
     Instruction_call,
+    Instruction_capenum,
+    Instruction_capprim,
+    Instruction_capstruct,
     Instruction_cbr,
-    Instruction_match,
-    Instruction_phi,
-    Instruction_ret,
-    Instruction_switch,
-)
-from ehir.core.instructions.control_flow.base import ControlFlow
-from ehir.core.instructions.memory import (
+    Instruction_cenum,
+    Instruction_comment,
+    Instruction_cpos,
+    Instruction_cstruct,
     Instruction_gep,
     Instruction_getfield,
     Instruction_getfieldptr,
     Instruction_getptr,
+    Instruction_halloc,
     Instruction_hfree,
     Instruction_hrealloc,
+    Instruction_ieq,
+    Instruction_load,
+    Instruction_match,
+    Instruction_neq,
+    Instruction_or,
     Instruction_pcast,
+    Instruction_phi,
     Instruction_put,
+    Instruction_ret,
+    Instruction_salloc,
+    Instruction_scpos,
+    Instruction_scstruct,
+    Instruction_setfield,
     Instruction_sgetfield,
     Instruction_sgetfieldptr,
     Instruction_store,
+    Instruction_switch,
 )
-from ehir.core.instructions.memory.halloc import Instruction_halloc
-from ehir.core.instructions.memory.load import Instruction_load
-from ehir.core.instructions.memory.salloc import Instruction_salloc
-from ehir.core.instructions.operators.base import BinOp
-from ehir.core.instructions.operators.logic import Instruction_and, Instruction_ieq, Instruction_neq, Instruction_or
-from ehir.core.instructions.special import Instruction_comment
+from ehir.core.instructions.base import Instruction
 from ehir.core.primitives import Usize, Usize_t
 from ehir.core.struct import Struct
-from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer
+from ehir.core.type import Pointer, Type, mangle_type_name
 from ehir.core.variable import Parameter, TypedVariable
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
@@ -136,36 +131,28 @@ class Downgrader:
     def _downgrade(self, instr: Instruction) -> list[Instruction]:
         if isinstance(instr, Instruction_cpos):
             return self._downgrade_cpos(instr)
-        elif isinstance(instr, Instruction_cpoh):
-            return self._downgrade_cpoh(instr)
-        elif isinstance(instr, Instruction_ceos):
-            return self._downgrade_ceos(instr)
-        elif isinstance(instr, Instruction_ceoh):
-            return self._downgrade_ceoh(instr)
-        elif isinstance(instr, Instruction_csos):
-            return self._downgrade_csos(instr)
-        elif isinstance(instr, Instruction_csoh):
-            return self._downgrade_csoh(instr)
+        elif isinstance(instr, Instruction_cenum):
+            return self._downgrade_cenum(instr)
+        elif isinstance(instr, Instruction_cstruct):
+            return self._downgrade_cstruct(instr)
         elif isinstance(instr, Instruction_scpos):
             return self._downgrade_scpos(instr)
-        elif isinstance(instr, Instruction_scpoh):
-            return self._downgrade_scpoh(instr)
-        elif isinstance(instr, Instruction_scsos):
-            return self._downgrade_scsos(instr)
-        elif isinstance(instr, Instruction_scsoh):
-            return self._downgrade_scsoh(instr)
-        elif isinstance(instr, Instruction_lcpos):
-            return self._downgrade_lcpos(instr)
-        elif isinstance(instr, Instruction_lceos):
-            return self._downgrade_lceos(instr)
-        elif isinstance(instr, Instruction_lcsos):
-            return self._downgrade_lcsos(instr)
+        elif isinstance(instr, Instruction_scstruct):
+            return self._downgrade_scstruct(instr)
+        elif isinstance(instr, Instruction_capprim):
+            return self._downgrade_capprim(instr)
+        elif isinstance(instr, Instruction_capenum):
+            return self._downgrade_capenum(instr)
+        elif isinstance(instr, Instruction_capstruct):
+            return self._downgrade_capstruct(instr)
         elif isinstance(instr, Instruction_getfield):
             return self._downgrade_getfield(instr)
         elif isinstance(instr, Instruction_sgetfield):
             return self._downgrade_sgetfield(instr)
         elif isinstance(instr, Instruction_sgetfieldptr):
             return self._downgrade_sgetfieldptr(instr)
+        elif isinstance(instr, Instruction_setfield):
+            return self._downgrade_setfield(instr)
         elif isinstance(instr, Instruction_cbr):
             return self._downgrade_cbr(instr)
         elif isinstance(instr, Instruction_match):
@@ -202,34 +189,12 @@ class Downgrader:
             put,
         ]
 
-    def _downgrade_cpoh(self, instr: Instruction_cpoh) -> list[Instruction]:
-        assert instr.var_out.type is not None
-        assert isinstance(instr.var_out.type, Pointer)
-
-        halloc = Instruction_halloc(
-            var_out=instr.var_out,
-            type=instr.var_out.type.pointee,
-        )
-        put = Instruction_put(
-            primitive=instr.primitive,
-            var=instr.var_out,
-        )
-        return [
-            halloc,
-            put,
-        ]
-
-    def _downgrade_ceoh(self, instr: Instruction_ceoh) -> list[Instruction]:
-        assert instr.var_out.type is not None
-        assert isinstance(instr.var_out.type, Pointer)
-        return self._downgrade_enum_capture(instr.var_out, instr.enum, on_heap=True)
-
-    def _downgrade_ceos(self, instr: Instruction_ceos) -> list[Instruction]:
+    def _downgrade_cenum(self, instr: Instruction_cenum) -> list[Instruction]:
         assert instr.var_out.type is not None
         assert isinstance(instr.var_out.type, Pointer)
         return self._downgrade_enum_capture(instr.var_out, instr.enum, on_heap=False)
 
-    def _downgrade_csos(self, instr: Instruction_csos) -> list[Instruction]:
+    def _downgrade_cstruct(self, instr: Instruction_cstruct) -> list[Instruction]:
         assert instr.var_out.type is not None
         assert isinstance(instr.var_out.type, Pointer)
 
@@ -254,42 +219,14 @@ class Downgrader:
 
         return downgrades
 
-    def _downgrade_csoh(self, instr: Instruction_csoh) -> list[Instruction]:
-        assert instr.var_out.type is not None
-        assert isinstance(instr.var_out.type, Pointer)
-
-        halloc = Instruction_halloc(
-            var_out=instr.var_out,
-            type=instr.struct.as_type(),
-        )
-        downgrades = [halloc]
-        for i, arg in enumerate(instr.struct.args):
-            assert arg.type
-            field_arg = TypedVariable(name=f".{instr.var_out.name}.{arg.name}", type=Pointer(arg.type))
-            field_ptr = Instruction_getfieldptr(
-                var_out=field_arg, src=instr.var_out, field=TypedVariable(name=str(i), type=arg.type)
-            )
-
-            store = Instruction_store(
-                var_src=arg,
-                var_dst=field_arg,
-            )
-            downgrades.append(field_ptr)
-            downgrades.append(store)
-
-        return downgrades
-
     def _downgrade_scpos(self, instr: Instruction_scpos) -> list[Instruction]:
         raise NotImplementedError
 
-    def _downgrade_scpoh(self, instr: Instruction_scpoh) -> list[Instruction]:
-        raise NotImplementedError
-
-    def _downgrade_scsos(self, instr: Instruction_scsos) -> list[Instruction]:
+    def _downgrade_scstruct(self, instr: Instruction_scstruct) -> list[Instruction]:
         ptr = TypedVariable(name=f".{instr.var_out.name}_wrapped_ptr", type=Pointer(instr.struct.as_type()))
-        ptr_init = Instruction_csos(ptr, instr.struct)
+        ptr_init = Instruction_cstruct(ptr, instr.struct)
 
-        wrapper_name = StackSmartPointer(instr.struct.as_type()).get_name()
+        wrapper_name = mangle_type_name(Type("Box", [instr.struct.as_type()]))
         if wrapper_name not in self._structs:
             wrapper_struct = Derective_struct(
                 name=wrapper_name,
@@ -301,53 +238,14 @@ class Downgrader:
 
         wrapped = Struct(name=wrapper_name, args=[ptr])
         instr.var_out.type = wrapped.as_type()
-        res = Instruction_lcsos(instr.var_out, wrapped)
+        res = Instruction_capstruct(instr.var_out, wrapped)
 
         return [
-            *self._downgrade_csos(ptr_init),
-            *self._downgrade_lcsos(res),
+            *self._downgrade_cstruct(ptr_init),
+            *self._downgrade_capstruct(res),
         ]
 
-    def _downgrade_scsoh(self, instr: Instruction_scsoh) -> list[Instruction]:
-        ptr = TypedVariable(name=f".{instr.var_out.name}_wrapped_ptr", type=Pointer(instr.struct.as_type()))
-        ref_cnt = TypedVariable(name=f".{instr.var_out.name}_ref_cnt", type=Usize_t())
-        in_reachable = TypedVariable(name=f".{instr.var_out.name}_in_reachable", type=Usize_t(1))
-        out_reachable = TypedVariable(name=f".{instr.var_out.name}_out_reachable", type=Usize_t(1))
-        out_visited = TypedVariable(name=f".{instr.var_out.name}_out_visited", type=Usize_t(1))
-        deallocate = TypedVariable(name=f".{instr.var_out.name}_deallocate", type=Usize_t(1))
-
-        ptr_init = Instruction_csoh(ptr, instr.struct)
-        ref_cnt_init = Instruction_lcpos(ref_cnt, Usize(val=1))
-        in_reachable_init = Instruction_lcpos(in_reachable, Usize(val=1, size=1))
-        out_reachable_init = Instruction_lcpos(out_reachable, Usize(val=0, size=1))
-        out_visited_init = Instruction_lcpos(out_visited, Usize(val=0, size=1))
-        deallocate_init = Instruction_lcpos(deallocate, Usize(val=0, size=1))
-
-        wrapper_name = HeapSmartPointer(instr.struct.as_type()).get_name()
-        if wrapper_name not in self._structs:
-            wrapper_struct = Derective_struct(
-                name=wrapper_name,
-                generics=[],
-                params=[Parameter(name="ptr", type=ptr.type)],
-            )
-            self._structs[wrapper_name] = wrapper_struct
-            self._structs_to_add.append(wrapper_struct)
-
-        s = Struct(name=wrapper_name, args=[ptr])
-        instr.var_out.type = s.as_type()
-        res = Instruction_lcsos(instr.var_out, s)
-
-        return [
-            *self._downgrade_csoh(ptr_init),
-            *self._downgrade_lcpos(ref_cnt_init),
-            *self._downgrade_lcpos(in_reachable_init),
-            *self._downgrade_lcpos(out_reachable_init),
-            *self._downgrade_lcpos(out_visited_init),
-            *self._downgrade_lcpos(deallocate_init),
-            *self._downgrade_lcsos(res),
-        ]
-
-    def _downgrade_lcpos(self, instr: Instruction_lcpos) -> list[Instruction]:
+    def _downgrade_capprim(self, instr: Instruction_capprim) -> list[Instruction]:
         assert instr.var_out.type is not None
         out_ptr = TypedVariable(name=f".{instr.var_out.name}_ptr", type=Pointer(instr.var_out.type))
         cpos = Instruction_cpos(
@@ -360,23 +258,23 @@ class Downgrader:
             load,
         ]
 
-    def _downgrade_lceos(self, instr: Instruction_lceos) -> list[Instruction]:
+    def _downgrade_capenum(self, instr: Instruction_capenum) -> list[Instruction]:
         assert instr.var_out.type is not None
         out_ptr = TypedVariable(name=f".{instr.var_out.name}_ptr", type=Pointer(instr.var_out.type))
-        ceos = Instruction_ceos(var_out=out_ptr, enum=instr.enum)
+        ceos = Instruction_cenum(var_out=out_ptr, enum=instr.enum)
         load = Instruction_load(var_out=instr.var_out, var=out_ptr)
         return [
-            *self._downgrade_ceos(ceos),
+            *self._downgrade_cenum(ceos),
             load,
         ]
 
-    def _downgrade_lcsos(self, instr: Instruction_lcsos) -> list[Instruction]:
+    def _downgrade_capstruct(self, instr: Instruction_capstruct) -> list[Instruction]:
         assert instr.var_out.type is not None
         out_ptr = TypedVariable(name=f".{instr.var_out.name}_ptr", type=Pointer(instr.var_out.type))
-        csos = Instruction_csos(var_out=out_ptr, struct=instr.struct)
+        csos = Instruction_cstruct(var_out=out_ptr, struct=instr.struct)
         load = Instruction_load(var_out=instr.var_out, var=out_ptr)
         return [
-            *self._downgrade_csos(csos),
+            *self._downgrade_cstruct(csos),
             load,
         ]
 
@@ -390,6 +288,13 @@ class Downgrader:
             load,
         ]
 
+    def _downgrade_setfield(self, instr: Instruction_setfield) -> list[Instruction]:
+        assert instr.field.type is not None
+        field_ptr = TypedVariable(name=f".{instr.var.name}_{instr.field.name}_ptr", type=Pointer(instr.field.type))
+        getfieldptr = Instruction_getfieldptr(var_out=field_ptr, src=instr.var, field=instr.field)
+        store = Instruction_store(var_src=instr.value, var_dst=field_ptr)
+        return [getfieldptr, store]
+
     def _downgrade_enum_capture(self, out: TypedVariable, enum: Enum, on_heap: bool) -> list[Instruction]:
         assert out.type is not None
         assert isinstance(out.type, Pointer)
@@ -397,7 +302,7 @@ class Downgrader:
         lowered_struct = self._structs[enum.name]
         tag_value = self._enum_variants[enum.name].index(enum.variant)
         tag_var = TypedVariable(name=f".{out.name}_tag", type=Usize_t(8))
-        tag_init = Instruction_lcpos(var_out=tag_var, primitive=Usize(tag_value, size=8))
+        tag_init = Instruction_capprim(var_out=tag_var, primitive=Usize(tag_value, size=8))
 
         alloc: Instruction
         if on_heap:
@@ -411,7 +316,7 @@ class Downgrader:
         )
         tag_store = Instruction_store(var_src=tag_var, var_dst=tag_ptr)
 
-        result: list[Instruction] = [alloc, *self._downgrade_lcpos(tag_init), tag_field_ptr, tag_store]
+        result: list[Instruction] = [alloc, *self._downgrade_capprim(tag_init), tag_field_ptr, tag_store]
 
         if enum.payload is None:
             return result
@@ -421,8 +326,8 @@ class Downgrader:
         if enum.payload.value is None:
             # Enum layout stores payload as a pointer field. Payload must outlive the
             # current stack frame (e.g. returned enum values), so it cannot be stack-allocated.
-            payload_init = Instruction_csoh(var_out=payload_ptr, struct=enum.payload)
-            result.extend(self._downgrade_csoh(payload_init))
+            payload_init = Instruction_cstruct(var_out=payload_ptr, struct=enum.payload)
+            result.extend(self._downgrade_cstruct(payload_init))
         else:
             # Same lifetime rule as above: never put enum payload behind a stack pointer.
             result.append(Instruction_halloc(var_out=payload_ptr, type=payload_type))
@@ -517,6 +422,10 @@ class Downgrader:
                     )
                     prelude.append(Instruction_load(var_out=enum_value, var=enum_ptr))
                     cond_src = enum_value
+
+        if variant_names is None:
+            if instr.cond_var.type.name == "Option" or instr.cond_var.type.name.startswith("Option_"):
+                variant_names = ["Some", "None"]
 
         if variant_names is None:
             raise TypeError(f"Match condition must be a lowered enum, got '{instr.cond_var.type}'")

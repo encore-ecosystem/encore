@@ -13,7 +13,10 @@ class ProcessedDerective(ABC, Derective): ...
 
 
 @dataclass
-class ProcessedDerective_extern_fn(ProcessedDerective, Derective_extern_fn): ...
+class ProcessedDerective_extern_fn(ProcessedDerective, Derective_extern_fn):
+    def __repr__(self) -> str:
+        params_repr = ", ".join(str(p) for p in self.params)
+        return f"extern fn {self.name}({params_repr}) -> {self.ret_type}"
 
 
 @dataclass
@@ -33,8 +36,15 @@ class ProcessedDerective_fn(ProcessedDerective):
         body_repr = "\n".join("\n".join(f"  {line}" for line in str(b).splitlines()) for b in self.get_body())
         return f"fn {self.name}({params_repr}) -> {self.ret_type}" + " {\n" + body_repr + "\n}"
 
+    def __repr__(self) -> str:
+        return self.__str__()
+
 
 @dataclass
 class ProcessedDerective_struct(ProcessedDerective):
     name: str
     fields: list[Parameter]
+
+    def __repr__(self) -> str:
+        fields_repr = "\n  ".join(str(field) for field in self.fields)
+        return f"struct {self.name} {{\n  {fields_repr}\n}}"

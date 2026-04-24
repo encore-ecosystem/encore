@@ -34,6 +34,25 @@ MatchPatternLike = (
     | None
 )
 
+OPERATOR_TRAIT_BOUNDS: dict[str, str] = {
+    "+": "Add",
+    "-": "Sub",
+    "*": "Mul",
+    "/": "Div",
+    "%": "Rem",
+    "<<": "Shl",
+    ">>": "Shr",
+    "&": "BitAnd",
+    "|": "BitOr",
+    "^": "BitXor",
+    "==": "Eq",
+    "!=": "Ne",
+    "<": "Lt",
+    "<=": "Le",
+    ">": "Gt",
+    ">=": "Ge",
+}
+
 
 class TypeInferer:
     def __init__(self):
@@ -45,6 +64,8 @@ class TypeInferer:
         self._unsafe_depth = 0
         self._current_fn_return_type: Type | None = None
         self._current_self_binding_type: Type | None = None
+        self._active_generic_bounds: dict[str, list[Type]] = {}
+        self._active_generic_names: set[str] = set()
 
     def infer(
         self,
@@ -124,6 +145,8 @@ class TypeInferer:
 
         prev_fn_return = self._current_fn_return_type
         prev_self_binding_type = self._current_self_binding_type
+        prev_generic_bounds = self._active_generic_bounds
+        prev_generic_names = self._active_generic_names
         if statement.signature.type is None:
             statement.signature.type = self._infer_return_type(statement.body, env, mutability_env)
             if statement.signature.type is None:
@@ -131,11 +154,15 @@ class TypeInferer:
 
         self._current_fn_return_type = statement.signature.type
         self._current_self_binding_type = env.get("self")
+        self._active_generic_bounds = self._collect_generic_bounds(statement.signature.generics)
+        self._active_generic_names = {generic.name for generic in statement.signature.generics}
         try:
             self._infer_block(statement.body, env, mutability_env, statement.signature.type)
         finally:
             self._current_fn_return_type = prev_fn_return
             self._current_self_binding_type = prev_self_binding_type
+            self._active_generic_bounds = prev_generic_bounds
+            self._active_generic_names = prev_generic_names
 
     def _infer_block(self, body: Block, env: dict[str, Type], mutability_env: dict[str, bool], fn_ret_type: Type):
         for statement in body.body:
@@ -422,6 +449,15 @@ class TypeInferer:
             if trait_signature is not None:
                 return f"{trait_name}::{method_name}", trait_signature
 
+        for bound in self._lookup_active_generic_bounds(base_receiver_type):
+            trait_signature = self._lookup_trait_method_signature(
+                bound.name,
+                method_name,
+                receiver_type=base_receiver_type,
+            )
+            if trait_signature is not None:
+                return f"{bound.name}::{method_name}", trait_signature
+
         raise TypeError(f"Method '{method_name}' is not defined for type '{base_receiver_type.name}'")
 
     def _infer_call_signature(
@@ -441,6 +477,7 @@ class TypeInferer:
             )
 
         generic_mapping: dict[str, Type] = {}
+        generic_names = {generic.name for generic in signature.generics}
         if explicit_generics:
             if len(explicit_generics) != len(signature.generics):
                 raise TypeError(
@@ -452,7 +489,10 @@ class TypeInferer:
 
         for param, arg in zip(signature.params, args):
             expected_param_type = self._specialize_type(param.type, generic_mapping)
-            arg_type = self._infer_expression(arg, env, expected_param_type, mutable_env)
+            arg_expected_type = (
+                None if self._contains_unresolved_generic(param.type, generic_mapping, generic_names) else expected_param_type
+            )
+            arg_type = self._infer_expression(arg, env, arg_expected_type, mutable_env)
             # print(param, arg, expected_param_type, arg_type)
             if arg_type is not None:
                 self._match_generic(param.type, arg_type, generic_mapping)
@@ -467,6 +507,7 @@ class TypeInferer:
                     f"Unable to infer generics for function '{callable_name}': {', '.join(missing_generics)}"
                 )
             explicit_generics[:] = [generic_mapping[generic.name] for generic in signature.generics]
+            self._validate_generic_bounds(signature.generics, generic_mapping, callable_name)
 
         if signature.type is None:
             return None
@@ -835,6 +876,7 @@ class TypeInferer:
             rhs_type = self._infer_expression(expr.rhs, env, None, mutable_env)
             if lhs_type is None and rhs_type is not None:
                 lhs_type = self._infer_expression(expr.lhs, env, lhs_expected_type or rhs_type, mutable_env)
+            self._assert_operator_trait_bound(lhs_type, expr.operator)
             if expr.operator in comparison_ops:
                 if expected_type is not None and expected_type != Type("bool"):
                     raise TypeError(f"Type mismatch: {expected_type} != bool")
@@ -866,8 +908,116 @@ class TypeInferer:
                 payload_type = self._specialize_type(variant.fields[0], generic_mapping)
                 if expr.args:
                     self._infer_expression(expr.args[0], env, payload_type, mutable_env)
-            return enum_type
+        return enum_type
+
+    def _collect_generic_bounds(self, generics: list[Type]) -> dict[str, list[Type]]:
+        bounds: dict[str, list[Type]] = {}
+        for generic in generics:
+            if isinstance(generic, s.GenericParam) and generic.bounds:
+                bounds[generic.name] = list(generic.bounds)
+        return bounds
+
+    def _lookup_active_generic_bounds(self, typ: Type | None) -> list[Type]:
+        if typ is None:
+            return []
+        typ = unwrap_for_storage(typ)
+        if is_reference_like_type(typ):
+            return self._lookup_active_generic_bounds(typ.pointee)
+        if is_raw_pointer_type(typ):
+            return self._lookup_active_generic_bounds(typ.pointee)
+        return list(self._active_generic_bounds.get(typ.name, []))
+
+    def _is_active_generic_type(self, typ: Type | None) -> bool:
+        if typ is None:
+            return False
+        typ = unwrap_for_storage(typ)
+        if is_reference_like_type(typ):
+            return self._is_active_generic_type(typ.pointee)
+        if is_raw_pointer_type(typ):
+            return self._is_active_generic_type(typ.pointee)
+        return not typ.generics and typ.name in self._active_generic_names
+
+    def _validate_generic_bounds(
+        self,
+        generics: list[Type],
+        generic_mapping: dict[str, Type],
+        callable_name: str,
+    ) -> None:
+        for generic in generics:
+            if not isinstance(generic, s.GenericParam):
+                continue
+            concrete = generic_mapping.get(generic.name)
+            if concrete is None:
+                continue
+            for bound in generic.bounds:
+                if not self._type_satisfies_bound(concrete, bound):
+                    raise TypeError(
+                        f"Type '{concrete}' does not satisfy bound '{bound}' for generic '{generic.name}' "
+                        f"in call '{callable_name}'"
+                    )
+
+    def _type_satisfies_bound(self, concrete: Type, bound: Type) -> bool:
+        concrete = unwrap_for_storage(concrete)
+        if is_reference_like_type(concrete):
+            return self._type_satisfies_bound(concrete.pointee, bound)
+        if is_raw_pointer_type(concrete):
+            return self._type_satisfies_bound(concrete.pointee, bound)
+
+        active_bounds = self._lookup_active_generic_bounds(concrete)
+        for active_bound in active_bounds:
+            if self._trait_satisfies_bound(active_bound.name, bound):
+                return True
+
+        for trait_name in self._impl_traits.get(concrete.name, []):
+            if self._trait_satisfies_bound(trait_name, bound):
+                return True
+
+        return False
+
+    def _trait_satisfies_bound(self, trait_name: str, required_bound: Type, seen: set[str] | None = None) -> bool:
+        if trait_name == required_bound.name:
+            return True
+
+        seen = seen or set()
+        if trait_name in seen:
+            return False
+        seen.add(trait_name)
+
+        trait = self._traits.get(trait_name)
+        if trait is None:
+            return False
+
+        for base in trait.bases:
+            if base.name == required_bound.name:
+                return True
+            if self._trait_satisfies_bound(base.name, required_bound, seen):
+                return True
+        return False
+
+    def _assert_operator_trait_bound(self, lhs_type: Type | None, operator: str) -> None:
+        required_trait = OPERATOR_TRAIT_BOUNDS.get(operator)
+        if required_trait is None or lhs_type is None:
+            return
+        if not self._is_active_generic_type(lhs_type):
+            return
+        if not self._type_satisfies_bound(lhs_type, Type(required_trait)):
+            raise TypeError(f"Operator '{operator}' requires bound '{required_trait}' for generic type '{lhs_type}'")
         return None
+
+    def _contains_unresolved_generic(
+        self,
+        pattern: Type,
+        generic_mapping: dict[str, Type],
+        generic_names: set[str],
+    ) -> bool:
+        pattern = unwrap_for_storage(pattern)
+        if is_reference_like_type(pattern):
+            return self._contains_unresolved_generic(pattern.pointee, generic_mapping, generic_names)
+        if is_raw_pointer_type(pattern):
+            return self._contains_unresolved_generic(pattern.pointee, generic_mapping, generic_names)
+        if not pattern.generics and pattern.name in generic_names and pattern.name not in generic_mapping:
+            return True
+        return any(self._contains_unresolved_generic(generic, generic_mapping, generic_names) for generic in pattern.generics)
 
     def _resolve_match_arm_payload_type(
         self, scrutinee_type: Optional[Type], arm: MatchArmLike

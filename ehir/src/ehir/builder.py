@@ -14,51 +14,44 @@ from ehir.core.derectives import (
     TraitMethod,
 )
 from ehir.core.derectives.base import Derective
-from ehir.core.instructions.base import Assignable, Instruction
-from ehir.core.instructions.capture import (
-    Instruction_cpos,
-    Instruction_lcpos,
-    Instruction_lcsos,
-    Instruction_scsoh,
-    Instruction_scsos,
-)
-from ehir.core.instructions.control_flow import (
+from ehir.core.instructions import (
+    BinOp,
+    Instruction_add,
+    Instruction_and,
     Instruction_br,
     Instruction_call,
+    Instruction_capprim,
+    Instruction_capstruct,
     Instruction_cbr,
-    Instruction_match,
-    Instruction_ret,
-    MatchCase,
-)
-from ehir.core.instructions.control_flow.phi import Instruction_phi, PhiPair
-from ehir.core.instructions.memory import Instruction_sgetfield
-from ehir.core.instructions.operators.arithmetic import (
-    Instruction_add,
+    Instruction_cpos,
     Instruction_div,
+    Instruction_geq,
+    Instruction_grt,
+    Instruction_ieq,
+    Instruction_leq,
+    Instruction_les,
+    Instruction_match,
     Instruction_mod,
     Instruction_mul,
+    Instruction_neq,
+    Instruction_or,
+    Instruction_phi,
+    Instruction_ret,
+    Instruction_scpos,
+    Instruction_scstruct,
+    Instruction_sgetfield,
     Instruction_shl,
     Instruction_shr,
     Instruction_sub,
-)
-from ehir.core.instructions.operators.base import BinOp
-from ehir.core.instructions.operators.comparison import (
-    Instruction_geq,
-    Instruction_grt,
-    Instruction_leq,
-    Instruction_les,
-)
-from ehir.core.instructions.operators.logic import (
-    Instruction_and,
-    Instruction_ieq,
-    Instruction_neq,
-    Instruction_or,
     Instruction_xor,
+    MatchCase,
+    PhiPair,
 )
+from ehir.core.instructions.base import Assignable, Instruction
 from ehir.core.primitives import Usize_t
 from ehir.core.primitives.base import Primitive
 from ehir.core.struct import Struct
-from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
+from ehir.core.type import Pointer, Type
 from ehir.core.variable import Parameter, TypedVariable, Variable
 
 
@@ -183,37 +176,27 @@ class EHIR_Builder:
         self._add(instr)
         return instr
 
-    def build_lcpos(self, prim: Primitive, name: Optional[str] = None) -> Instruction_lcpos:
-        lcpos = Instruction_lcpos(self._reserve_variable(name, prim.type), prim)
-        self._add(lcpos)
-        return lcpos
+    def build_capprim(self, prim: Primitive, name: Optional[str] = None) -> Instruction_capprim:
+        capprim = Instruction_capprim(self._reserve_variable(name, prim.type), prim)
+        self._add(capprim)
+        return capprim
 
     def build_cpos(self, prim: Primitive, name: Optional[str] = None) -> Instruction_cpos:
         cpos = Instruction_cpos(self._reserve_variable(name, Pointer(prim.type)), prim)
         self._add(cpos)
         return cpos
 
-    def build_lcsos(self, struct_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_lcsos:
+    def build_capstruct(self, struct_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_capstruct:
         struct = Struct(name=struct_name, args=args)
-        lcsos = Instruction_lcsos(var_out=self._reserve_variable(name, struct.as_type()), struct=struct)
-        self._add(lcsos)
-        return lcsos
+        capstruct = Instruction_capstruct(var_out=self._reserve_variable(name, struct.as_type()), struct=struct)
+        self._add(capstruct)
+        return capstruct
 
-    def build_scsos(self, struct_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_scsos:
+    def build_scstruct(self, struct_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_scstruct:
         struct = Struct(name=struct_name, args=args)
-        scsos = Instruction_scsos(
-            var_out=self._reserve_variable(name, StackSmartPointer(struct.as_type())), struct=struct
-        )
-        self._add(scsos)
-        return scsos
-
-    def build_scsoh(self, struct_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_scsoh:
-        scsoh = Instruction_scsoh(
-            var_out=self._reserve_variable(name, HeapSmartPointer(Type(struct_name))),
-            struct=Struct(name=struct_name, args=args),
-        )
-        self._add(scsoh)
-        return scsoh
+        scstruct = Instruction_scstruct(var_out=self._reserve_variable(name, Type("Box", [struct.as_type()])), struct=struct)
+        self._add(scstruct)
+        return scstruct
 
     def build_struct_method_call(
         self,

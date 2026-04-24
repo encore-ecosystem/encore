@@ -1,31 +1,20 @@
 from collections import deque
+from copy import deepcopy
 
 from ehir.core.block import TerminatedBlock
+from ehir.core.derectives import Derective_enum, Derective_struct
 from ehir.core.derectives.base import Derective
-from ehir.core.instructions.base import Assignable
-from ehir.core.instructions.capture import (
-    Instruction_ceoh,
-    Instruction_ceos,
-    Instruction_cpoh,
-    Instruction_cpos,
-    Instruction_csoh,
-    Instruction_csos,
-    Instruction_lceos,
-    Instruction_lcpos,
-    Instruction_lcsos,
-    Instruction_scsoh,
-    Instruction_scsos,
-)
-from ehir.core.instructions.control_flow import (
+from ehir.core.instructions import (
+    BinOp,
     Instruction_br,
     Instruction_call,
+    Instruction_capenum,
+    Instruction_capprim,
+    Instruction_capstruct,
     Instruction_cbr,
-    Instruction_match,
-    Instruction_phi,
-    Instruction_ret,
-    Instruction_switch,
-)
-from ehir.core.instructions.memory import (
+    Instruction_cenum,
+    Instruction_cpos,
+    Instruction_cstruct,
     Instruction_gep,
     Instruction_getfield,
     Instruction_getfieldptr,
@@ -34,24 +23,29 @@ from ehir.core.instructions.memory import (
     Instruction_hfree,
     Instruction_hrealloc,
     Instruction_load,
+    Instruction_match,
+    Instruction_phi,
     Instruction_pcast,
+    Instruction_ret,
     Instruction_salloc,
+    Instruction_scstruct,
+    Instruction_setfield,
     Instruction_sgetfield,
     Instruction_sgetfieldptr,
     Instruction_store,
+    Instruction_switch,
 )
-from ehir.core.instructions.operators.base import BinOp
-from ehir.core.instructions.special import Instruction_cfree
-from ehir.core.type import SmartPointer
-from ehir.core.variable import Variable
+from ehir.core.instructions.base import Assignable
+from ehir.core.type import Type
+from ehir.core.variable import TypedVariable, Variable
+from ehir.simplifier.drop_helper import needs_drop
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 SKIPABLE = (
     Instruction_br,
     Instruction_halloc,
     Instruction_hrealloc,
-    Instruction_lcpos,
-    Instruction_cpoh,
+    Instruction_capprim,
     Instruction_cpos,
     Instruction_salloc,
     Instruction_getfield,
@@ -66,8 +60,13 @@ class Deallocator:
     _captures: dict[str, str]
     _curr_block: str
     _variables: dict[str, Variable]
+    _arg_names: set[str]
+    _aggregate_names: set[str]
 
     def run(self, ast: list[Derective]) -> list[Derective]:
+        self._aggregate_names = {
+            directive.name for directive in ast if isinstance(directive, (Derective_struct, Derective_enum))
+        }
         for derective in ast:
             if isinstance(derective, Normalized_fn):
                 self._place_cfree(derective)
@@ -77,6 +76,7 @@ class Deallocator:
         self._usages = {}
         self._captures = {}
         self._variables = {}
+        self._arg_names = {param.name for param in fn.params}
         cfg: dict[str, list[str]] = {}
         observed: set[str] = set()
 
@@ -114,7 +114,7 @@ class Deallocator:
                     queue.append(name2block[child])
 
         all_paths = self._find_all_paths(fn.entry_block.name, fn.exit_block.name, cfg)
-        for block, var in self._captures.items():
+        for var, block in self._captures.items():
             assert isinstance(fn.exit_block.term, Instruction_ret)
             if fn.exit_block.term.var.name == var:
                 continue
@@ -176,7 +176,14 @@ class Deallocator:
             else:
                 dealloc_block = name2block[least_shared_node]
 
-            dealloc_block.body.append(Instruction_cfree(self._variables[var]))
+            dealloc_block.body.append(
+                Instruction_call(
+                    var_out=TypedVariable(name=f".drop_{var}", type=Type("void")),
+                    fn_name="Drop::drop",
+                    generics=[deepcopy(generic) for generic in self._variables[var].type.generics],
+                    args=[TypedVariable(self._variables[var].name, self._variables[var].type)],
+                )
+            )
 
     @staticmethod
     def _find_shared_path(paths: list[list[str]]) -> list[str]:
@@ -213,14 +220,14 @@ class Deallocator:
     def _add_variable_usage(self, var: Variable):
         self._variables[var.name] = var
 
-        if isinstance(var.type, SmartPointer):
+        if var.type is not None and needs_drop(var.type, self._aggregate_names):
             self._usages[var.name] = self._usages.get(var.name, set()) | {self._curr_block}
 
     def _add_variable_capture(self, var: Variable):
         self._variables[var.name] = var
 
-        if isinstance(var.type, SmartPointer):
-            self._captures[self._curr_block] = var.name
+        if var.name not in self._arg_names and var.type is not None and needs_drop(var.type, self._aggregate_names):
+            self._captures[var.name] = self._curr_block
             self._add_variable_usage(var)
 
     def _collect_variable_usages(self, block: TerminatedBlock):
@@ -237,6 +244,8 @@ class Deallocator:
                 self._add_variable_usage(instr.cond_var)
             elif isinstance(instr, Instruction_match):
                 self._add_variable_usage(instr.cond_var)
+            elif isinstance(instr, Instruction_switch):
+                self._add_variable_usage(instr.cond_var)
             elif isinstance(instr, Instruction_getptr):
                 self._add_variable_usage(instr.var)
             elif isinstance(instr, Instruction_gep):
@@ -248,19 +257,19 @@ class Deallocator:
             elif isinstance(instr, Instruction_store):
                 self._add_variable_usage(instr.var_src)
                 self._add_variable_usage(instr.var_dst)
+            elif isinstance(instr, Instruction_setfield):
+                self._add_variable_usage(instr.var)
+                self._add_variable_usage(instr.value)
             elif isinstance(instr, Instruction_load):
                 self._add_variable_usage(instr.var)
             elif isinstance(
                 instr,
                 (
-                    Instruction_scsoh,
-                    Instruction_scsos,
-                    Instruction_csos,
-                    Instruction_csoh,
-                    Instruction_lcsos,
-                    Instruction_ceoh,
-                    Instruction_ceos,
-                    Instruction_lceos,
+                    Instruction_scstruct,
+                    Instruction_cstruct,
+                    Instruction_capstruct,
+                    Instruction_cenum,
+                    Instruction_capenum,
                 ),
             ):
                 if hasattr(instr, "struct"):

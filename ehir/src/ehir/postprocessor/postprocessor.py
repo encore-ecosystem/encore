@@ -1,53 +1,45 @@
 from ehir.builder import EHIR_Module
 from ehir.core.block import TerminatedBlock
-from ehir.core.derectives import Derective_extern_fn, Derective_struct
-from ehir.core.instructions.base import Instruction
-from ehir.core.instructions.capture import Instruction_lcpos
-from ehir.core.instructions.control_flow import (
+from ehir.core.derectives import Derective_enum, Derective_extern_fn, Derective_struct
+from ehir.core.instructions import (
+    BinOp,
+    ControlFlow,
+    Instruction_add,
+    Instruction_and,
     Instruction_br,
     Instruction_call,
+    Instruction_capprim,
     Instruction_cbr,
-    Instruction_phi,
-    Instruction_ret,
-    Instruction_switch,
-)
-from ehir.core.instructions.control_flow.base import ControlFlow
-from ehir.core.instructions.memory import (
     Instruction_gep,
+    Instruction_geq,
     Instruction_getfieldptr,
     Instruction_getptr,
+    Instruction_grt,
     Instruction_halloc,
     Instruction_hfree,
     Instruction_hrealloc,
-    Instruction_load,
-    Instruction_pcast,
-    Instruction_put,
-    Instruction_salloc,
-    Instruction_store,
-)
-from ehir.core.instructions.operators.arithmetic import (
-    Instruction_add,
-    Instruction_div,
-    Instruction_mod,
-    Instruction_mul,
-    Instruction_shl,
-    Instruction_shr,
-    Instruction_sub,
-)
-from ehir.core.instructions.operators.base import BinOp
-from ehir.core.instructions.operators.comparison import (
-    Instruction_geq,
-    Instruction_grt,
+    Instruction_ieq,
     Instruction_leq,
     Instruction_les,
-)
-from ehir.core.instructions.operators.logic import (
-    Instruction_and,
-    Instruction_ieq,
+    Instruction_load,
+    Instruction_mod,
+    Instruction_mul,
     Instruction_neq,
     Instruction_or,
+    Instruction_pcast,
+    Instruction_phi,
+    Instruction_put,
+    Instruction_ret,
+    Instruction_salloc,
+    Instruction_shl,
+    Instruction_shr,
+    Instruction_store,
+    Instruction_sub,
+    Instruction_switch,
     Instruction_xor,
 )
+from ehir.core.instructions.base import Instruction
+from ehir.core.instructions.arithmetic import Instruction_div
 from ehir.core.variable import TypedVariable
 from ehir.postprocessor.instructions import (
     ProcessedControlFlow,
@@ -98,6 +90,28 @@ from .derectives import (
 
 class Postprocessor:
     def run(self, raw_mod: EHIR_Module) -> ProcessedModule:
+        self._known_type_suffixes = {
+            directive.name
+            for directive in raw_mod.ast
+            if isinstance(directive, (Derective_struct, Derective_enum))
+        } | {
+            "u1",
+            "u8",
+            "u16",
+            "u32",
+            "u64",
+            "usize",
+            "i8",
+            "i16",
+            "i32",
+            "i64",
+            "isize",
+            "f32",
+            "f64",
+            "char",
+            "str",
+            "void",
+        }
         mod = ProcessedModule(id=raw_mod.id, structs=[], funcs=[])
         for derective in raw_mod.ast:
             if isinstance(derective, Normalized_fn):
@@ -105,7 +119,7 @@ class Postprocessor:
 
                 mod.funcs.append(
                     ProcessedDerective_fn(
-                        name=derective.name,
+                        name=self._emit_symbol_name(derective.name),
                         params=derective.params,
                         ret_type=derective.ret_type,
                         entry_block=self._validate_block(derective.entry_block),
@@ -116,7 +130,7 @@ class Postprocessor:
             elif isinstance(derective, Derective_extern_fn):
                 mod.funcs.append(
                     ProcessedDerective_extern_fn(
-                        name=derective.name,
+                        name=self._emit_symbol_name(derective.name),
                         params=derective.params,
                         ret_type=derective.ret_type,
                     )
@@ -170,12 +184,12 @@ class Postprocessor:
                 args.append(TypedVariable(arg.name, arg.type))
             return ProcessedInstruction_call(
                 var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
-                fn_name=instr.fn_name,
+                fn_name=self._emit_symbol_name(instr.fn_name),
                 args=args,
             )
 
-        if isinstance(instr, Instruction_lcpos):
-            self._build_lcpos(instr)
+        if isinstance(instr, Instruction_capprim):
+            raise AssertionError("Instruction_capprim must be downgraded before postprocessing")
         if isinstance(instr, Instruction_halloc):
             assert instr.var_out.type
             return ProcessedInstruction_halloc(
@@ -266,6 +280,32 @@ class Postprocessor:
             )
 
         raise NotImplementedError(term)
+
+    def _emit_symbol_name(self, name: str) -> str:
+        if "::" not in name:
+            return name
+
+        owner_text, method_name = name.rsplit("::", 1)
+        owner_name = owner_text.split("[", 1)[0]
+        return f"{owner_name}__{self._emit_method_name(method_name)}"
+
+    def _emit_method_name(self, method_name: str) -> str:
+        if "__" in method_name:
+            return method_name
+
+        parts = method_name.split("_")
+        if len(parts) < 2:
+            return method_name
+
+        for index in range(1, len(parts)):
+            suffix = "_".join(parts[index:])
+            if suffix in self._known_type_suffixes:
+                prefix = "_".join(parts[:index])
+                if prefix:
+                    return f"{prefix}__{suffix}"
+                return suffix
+
+        return method_name
 
     def _build_processed_binop(self, instr: BinOp):
         assert instr.var_out.type

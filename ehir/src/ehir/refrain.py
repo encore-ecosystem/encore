@@ -17,6 +17,7 @@ class Refrain:
     type: TargetType = TargetType.EXECUTABLE
     entrypoint: str | None = None
     entry_root: str = "src"
+    merge_module_dirs: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def entrypoint_stem(self) -> str:

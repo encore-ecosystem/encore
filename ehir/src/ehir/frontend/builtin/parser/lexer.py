@@ -38,6 +38,8 @@ class Lexer:
                     self._column = 0
                 case '"':
                     self._parse_string()
+                case "'":
+                    self._parse_char()
 
                 # Parenthesses
                 case "(":
@@ -84,6 +86,9 @@ class Lexer:
                 case "$":
                     self._append_token(t.DOLLAR)
 
+                case "#":
+                    self._append_token(t.HASH)
+
                 case ".":
                     self._append_token(t.DOT)
 
@@ -98,7 +103,11 @@ class Lexer:
                         self._append_token(t.COLON)
 
                 case ";":
-                    self._append_token(t.SEMICOLON)
+                    # Treat ';' as a one-line comment marker in EHIR text dumps.
+                    # Newline is intentionally not consumed here.
+                    while not self._is_at_end() and self._lookup_curr() != "\n":
+                        self._consume()
+                    self._append_token(t.WHITESPACE)
 
                 case _:
                     if curr_char.isdigit():
@@ -135,6 +144,16 @@ class Lexer:
                 break
         self._append_token(t.STRING)
 
+    def _parse_char(self):
+        while not self._is_at_end():
+            curr_char = self._consume()
+            if curr_char == "\\" and not self._is_at_end():
+                self._consume()
+                continue
+            if curr_char == "'":
+                break
+        self._append_token(t.CHAR)
+
     def _parse_identifier(self):
         while self._lookup_curr().isalnum() or self._lookup_curr() == "_":
             self._consume()
@@ -164,32 +183,24 @@ class Lexer:
                 self._append_token(t.FOR)
             case "where":
                 self._append_token(t.WHERE)
-            case "ceoh":
-                self._append_token(t.CEOH)
-            case "ceos":
-                self._append_token(t.CEOS)
-            case "lceos":
-                self._append_token(t.LCEOS)
+            case "type":
+                self._append_token(t.TYPE)
+            case "cenum":
+                self._append_token(t.CENUM)
             case "cpos":
                 self._append_token(t.CPOS)
-            case "cpoh":
-                self._append_token(t.CPOH)
-            case "csos":
-                self._append_token(t.CSOS)
-            case "csoh":
-                self._append_token(t.CSOH)
+            case "cstruct":
+                self._append_token(t.CSTRUCT)
             case "scpos":
                 self._append_token(t.SCPOS)
-            case "scpoh":
-                self._append_token(t.SCPOH)
-            case "scsos":
+            case "scstruct":
                 self._append_token(t.SCSOS)
-            case "scsoh":
-                self._append_token(t.SCSOH)
-            case "lcpos":
-                self._append_token(t.LCPOS)
-            case "lcsos":
-                self._append_token(t.LCSOS)
+            case "capprim":
+                self._append_token(t.CAPPRIM)
+            case "capenum":
+                self._append_token(t.CAPENUM)
+            case "capstruct":
+                self._append_token(t.CAPSTRUCT)
             case "pcast":
                 self._append_token(t.PCAST)
             case "getptr":
@@ -198,6 +209,8 @@ class Lexer:
                 self._append_token(t.GETFIELD)
             case "getfieldptr":
                 self._append_token(t.GETFIELDPTR)
+            case "setfield":
+                self._append_token(t.SETFIELD)
             case "gep":
                 self._append_token(t.GEP)
             case "sgetfield":

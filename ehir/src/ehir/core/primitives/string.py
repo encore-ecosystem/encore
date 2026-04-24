@@ -16,4 +16,4 @@ class Str(Primitive):
 
     def __str__(self) -> str:
         escaped = self.val.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"_{self.type}'
+        return f'"{escaped}"'

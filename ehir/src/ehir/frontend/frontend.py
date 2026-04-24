@@ -19,3 +19,6 @@ class EHIR_Frontend(ABC):
     @abstractmethod
     def get_file_extension(self) -> str:
         raise NotImplementedError
+
+    def list_child_module_ids(self, id: Path) -> list[Path]:
+        return []

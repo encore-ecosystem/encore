@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
+from ehir.core.instructions import ControlFlow
 from ehir.core.instructions.base import Instruction
-from ehir.core.instructions.control_flow.base import ControlFlow
 
 
 @dataclass

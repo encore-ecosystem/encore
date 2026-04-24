@@ -18,4 +18,13 @@ class TypedVariable(Variable):
     type: Type
 
 
+@dataclass
+class StructField(TypedVariable):
+    attrs: tuple[str, ...] = ()
+
+    def __str__(self) -> str:
+        attrs_repr = "".join(f"#attr({attr})\n  " for attr in self.attrs)
+        return f"{attrs_repr}{self.name}: {self.type}"
+
+
 Parameter = TypedVariable
