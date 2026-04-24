@@ -101,6 +101,8 @@ class Lexer:
                         self._append_token(t.DOUBLE_COLON)
                     else:
                         self._append_token(t.COLON)
+                case "&":
+                    self._append_token(t.AMPERSAND)
 
                 case ";":
                     # Treat ';' as a one-line comment marker in EHIR text dumps.

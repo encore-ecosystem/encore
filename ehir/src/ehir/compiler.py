@@ -25,7 +25,16 @@ from ehir.format import ThemePalette, printfmt
 from ehir.frontend import EHIR_Frontend
 from ehir.postprocessor import Postprocessor
 from ehir.refrain import CompiledRefrain, Refrain
-from ehir.simplifier import AutoDropPass, Deallocator, Downgrader, DropLoweringPass, Normalizer, Resolver
+from ehir.simplifier import (
+    AutoDropPass,
+    AutoRetainPass,
+    Deallocator,
+    Downgrader,
+    DropLoweringPass,
+    Normalizer,
+    Resolver,
+    RetainInsertionPass,
+)
 from ehir.simplifier.safety import SafetyValidator
 from ehir.simplifier.stripper import UnneededSymbolsStripper
 from ehir.version import COMPILER_VERSION
@@ -112,7 +121,9 @@ class EHIR_ProjectCompiler:
         )
 
         module.ast = Resolver().run(module.ast)
+        module.ast = AutoRetainPass().run(module.ast)
         module.ast = AutoDropPass().run(module.ast)
+        module.ast = RetainInsertionPass().run(module.ast)
         module.ast = SafetyValidator().run(module.ast)
         module.ast = Normalizer().run(module.ast)
         module.ast = Deallocator().run(module.ast)

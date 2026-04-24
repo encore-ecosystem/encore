@@ -430,10 +430,10 @@ class Parser:
         self._safe_consume(t.SETFIELD)
         var = self._parse_variable()
         self._safe_consume(t.COMMA)
-        field = self._parse_variable()
+        field, field_path = self._parse_field_path()
         self._safe_consume(t.COMMA)
         value = self._parse_variable()
-        return Instruction_setfield(var=var, field=field, value=value)
+        return Instruction_setfield(var=var, field=field, field_path=field_path, value=value)
 
     def _parse_br(self) -> Instruction_br:
         self._safe_consume(t.BR)
@@ -681,14 +681,14 @@ class Parser:
         elif isinstance(curr_token, t.GETFIELD):
             var_src = self._parse_variable()
             self._safe_consume(t.COMMA)
-            field = self._parse_variable()
-            return Instruction_getfield(var_out=var, src=var_src, field=field)
+            field, field_path = self._parse_field_path()
+            return Instruction_getfield(var_out=var, src=var_src, field=field, field_path=field_path)
 
         elif isinstance(curr_token, t.GETFIELDPTR):
             var_src = self._parse_variable()
             self._safe_consume(t.COMMA)
-            field = self._parse_variable()
-            return Instruction_getfieldptr(var_out=var, src=var_src, field=field)
+            field, field_path = self._parse_field_path()
+            return Instruction_getfieldptr(var_out=var, src=var_src, field=field, field_path=field_path)
 
         elif isinstance(curr_token, t.GEP):
             var_src = self._parse_variable()
@@ -770,9 +770,17 @@ class Parser:
                 self._safe_consume(t.COLON)
             curr = self._lookup_curr()
             same_line = curr.line == colon.line
-            if same_line and isinstance(curr, (t.IDENTIFIER, t.LEFT_PAREN)):
+            if same_line and isinstance(curr, (t.AMPERSAND, t.IDENTIFIER, t.LEFT_PAREN)):
                 type = self._parse_type()
         return Variable(name, type)
+
+    def _parse_field_path(self) -> tuple[Variable, list[Variable]]:
+        head = Variable(self._parse_name())
+        tail: list[Variable] = []
+        while isinstance(self._lookup_curr(), t.DOUBLE_COLON):
+            self._safe_consume(t.DOUBLE_COLON)
+            tail.append(Variable(self._parse_name()))
+        return head, tail
 
     def _parse_param(self) -> Parameter:
         var = self._parse_variable()
@@ -796,6 +804,11 @@ class Parser:
             self._safe_consume(t.LEFT_PAREN)
             self._safe_consume(t.RIGHT_PAREN)
             return Type("void")
+
+        if isinstance(self._lookup_curr(), t.AMPERSAND):
+            self._safe_consume(t.AMPERSAND)
+            inner = self._parse_type()
+            return Type("Box", [inner])
 
         name = self._safe_consume(t.IDENTIFIER).string
 

@@ -62,7 +62,6 @@ SKIPABLE = (
     Instruction_load,
     Instruction_put,
     Instruction_hfree,
-    Instruction_getfieldptr,
     Instruction_gep,
     Instruction_pcast,
     Instruction_getptr,
@@ -147,6 +146,8 @@ class Downgrader:
             return self._downgrade_capstruct(instr)
         elif isinstance(instr, Instruction_getfield):
             return self._downgrade_getfield(instr)
+        elif isinstance(instr, Instruction_getfieldptr):
+            return self._downgrade_getfieldptr(instr)
         elif isinstance(instr, Instruction_sgetfield):
             return self._downgrade_sgetfield(instr)
         elif isinstance(instr, Instruction_sgetfieldptr):
@@ -281,19 +282,51 @@ class Downgrader:
     def _downgrade_getfield(self, instr: Instruction_getfield) -> list[Instruction]:
         assert instr.var_out.type is not None
         out_ptr = TypedVariable(name=f".{instr.var_out.name}_ptr", type=Pointer(instr.var_out.type))
-        getfieldptr = Instruction_getfieldptr(var_out=out_ptr, src=instr.src, field=instr.field)
+        getfieldptr = Instruction_getfieldptr(
+            var_out=out_ptr,
+            src=instr.src,
+            field=instr.field,
+            field_path=list(instr.field_path),
+        )
         load = Instruction_load(var_out=instr.var_out, var=out_ptr)
         return [
-            getfieldptr,
+            *self._downgrade_getfieldptr(getfieldptr),
             load,
         ]
 
+    def _downgrade_getfieldptr(self, instr: Instruction_getfieldptr) -> list[Instruction]:
+        field_segments = [instr.field, *instr.field_path]
+        if len(field_segments) == 1:
+            return [instr]
+
+        result: list[Instruction] = []
+        current_src = instr.src
+        for index, field in enumerate(field_segments):
+            assert field.type is not None
+            is_last = index == len(field_segments) - 1
+            var_out = (
+                instr.var_out
+                if is_last
+                else TypedVariable(name=f".{instr.var_out.name}_{index}_ptr", type=Pointer(field.type))
+            )
+            lowered = Instruction_getfieldptr(var_out=var_out, src=current_src, field=field)
+            result.append(lowered)
+            current_src = var_out
+        return result
+
     def _downgrade_setfield(self, instr: Instruction_setfield) -> list[Instruction]:
         assert instr.field.type is not None
-        field_ptr = TypedVariable(name=f".{instr.var.name}_{instr.field.name}_ptr", type=Pointer(instr.field.type))
-        getfieldptr = Instruction_getfieldptr(var_out=field_ptr, src=instr.var, field=instr.field)
+        final_field = ([instr.field, *instr.field_path])[-1]
+        assert final_field.type is not None
+        field_ptr = TypedVariable(name=f".{instr.var.name}_{final_field.name}_ptr", type=Pointer(final_field.type))
+        getfieldptr = Instruction_getfieldptr(
+            var_out=field_ptr,
+            src=instr.var,
+            field=instr.field,
+            field_path=list(instr.field_path),
+        )
         store = Instruction_store(var_src=instr.value, var_dst=field_ptr)
-        return [getfieldptr, store]
+        return [*self._downgrade_getfieldptr(getfieldptr), store]
 
     def _downgrade_enum_capture(self, out: TypedVariable, enum: Enum, on_heap: bool) -> list[Instruction]:
         assert out.type is not None

@@ -58,6 +58,7 @@ SKIPABLE = (
 class Deallocator:
     _usages: dict[str, set[str]]
     _captures: dict[str, str]
+    _returned_aliases: set[str]
     _curr_block: str
     _variables: dict[str, Variable]
     _arg_names: set[str]
@@ -68,13 +69,14 @@ class Deallocator:
             directive.name for directive in ast if isinstance(directive, (Derective_struct, Derective_enum))
         }
         for derective in ast:
-            if isinstance(derective, Normalized_fn):
+            if isinstance(derective, Normalized_fn) and not derective.name.startswith("__retain_"):
                 self._place_cfree(derective)
         return ast
 
     def _place_cfree(self, fn: Normalized_fn):
         self._usages = {}
         self._captures = {}
+        self._returned_aliases = set()
         self._variables = {}
         self._arg_names = {param.name for param in fn.params}
         cfg: dict[str, list[str]] = {}
@@ -117,6 +119,8 @@ class Deallocator:
         for var, block in self._captures.items():
             assert isinstance(fn.exit_block.term, Instruction_ret)
             if fn.exit_block.term.var.name == var:
+                continue
+            if var in self._returned_aliases:
                 continue
 
             outer_paths = []
@@ -255,6 +259,8 @@ class Deallocator:
                 self._add_variable_usage(instr.var)
                 self._add_variable_usage(instr.count)
             elif isinstance(instr, Instruction_store):
+                if instr.var_dst.name == ".exit_var_ptr":
+                    self._returned_aliases.add(instr.var_src.name)
                 self._add_variable_usage(instr.var_src)
                 self._add_variable_usage(instr.var_dst)
             elif isinstance(instr, Instruction_setfield):

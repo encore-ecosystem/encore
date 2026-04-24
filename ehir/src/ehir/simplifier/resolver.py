@@ -779,22 +779,36 @@ class Resolver:
                     if isinstance(src.type, PrimitiveType):
                         raise TypeError(f"Cannot access field of primitive type '{src.type}'")
 
-                    resolved_params = self._get_composite_params(src.type.name, src.type.generics)
-                    for i, param in enumerate(resolved_params):
-                        if param.name == instr.field.name or str(i) == instr.field.name:
-                            if instr.field.type and instr.field.type != param.type:
-                                raise TypeError(
-                                    f"Type mismatch for field '{instr.field.name}' in struct '{src.type.name}': {instr.field.type} != {param.type}"
-                                )
-                            instr.field.type = param.type
-                            instr.field.name = str(i)
-                            break
-                    else:
-                        raise TypeError(f"Unknown field '{instr.field.name}' in struct '{src.type.name}'")
+                    field_segments = [instr.field, *getattr(instr, "field_path", [])]
+                    current_type = src.type
+                    resolved_segments: list[Variable] = []
+                    for field_segment in field_segments:
+                        composite_type = current_type.pointee if isinstance(current_type, Pointer) else current_type
+                        if isinstance(composite_type, PrimitiveType):
+                            raise TypeError(f"Cannot access field of primitive type '{composite_type}'")
+
+                        resolved_params = self._get_composite_params(composite_type.name, composite_type.generics)
+                        for i, param in enumerate(resolved_params):
+                            if param.name == field_segment.name or str(i) == field_segment.name:
+                                if field_segment.type and field_segment.type != param.type:
+                                    raise TypeError(
+                                        f"Type mismatch for field '{field_segment.name}' in struct '{composite_type.name}': {field_segment.type} != {param.type}"
+                                    )
+                                field_segment.type = param.type
+                                field_segment.name = str(i)
+                                resolved_segments.append(field_segment)
+                                current_type = param.type
+                                break
+                        else:
+                            raise TypeError(f"Unknown field '{field_segment.name}' in struct '{composite_type.name}'")
+
+                    instr.field = resolved_segments[0]
+                    if hasattr(instr, "field_path"):
+                        instr.field_path = resolved_segments[1:]
 
                     if isinstance(instr, Instruction_setfield):
                         instr.value = add_variable(instr.value)
-                        expected_type = instr.field.type
+                        expected_type = current_type
                         if instr.value.type and not self._types_compatible(instr.value.type, expected_type):
                             raise TypeError(
                                 f"Type mismatch for variable '{instr.value.name}': {instr.value.type} != {expected_type}"
@@ -803,9 +817,9 @@ class Resolver:
                         instr.value = add_variable(instr.value)
                     else:
                         expected_type = (
-                            instr.field.type
+                            current_type
                             if isinstance(instr, (Instruction_getfield, Instruction_sgetfield))
-                            else Pointer(instr.field.type)
+                            else Pointer(current_type)
                         )
                         if instr.var_out.type and not self._types_compatible(instr.var_out.type, expected_type):
                             raise TypeError(

@@ -5,13 +5,21 @@ from ehir.core.derectives import Derective_enum, Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import EnumVariant
 from ehir.core.instructions import (
+    Instruction_br,
+    Instruction_capprim,
+    Instruction_cbr,
     Instruction_getfield,
+    Instruction_getfieldptr,
     Instruction_hfree,
+    Instruction_ieq,
     Instruction_load,
     Instruction_match,
     Instruction_ret,
+    Instruction_store,
+    Instruction_sub,
     MatchCase,
 )
+from ehir.core.primitives import Usize, Usize_t
 from ehir.core.type import Pointer, Type
 from ehir.core.variable import Parameter, TypedVariable
 from ehir.simplifier.drop_helper import drop_function_name, is_box_struct, needs_drop
@@ -54,12 +62,16 @@ class AutoDropPass:
     def _generate_struct_drop_fn(self, directive: Derective_struct) -> Derective_fn:
         self_type = Type(directive.name)
         self_var = TypedVariable("self", self_type)
-        body = self._generate_struct_drop_body(directive, self_var)
+        if is_box_struct(directive):
+            blocks = self._generate_box_drop_blocks(directive, self_var)
+        else:
+            body = self._generate_struct_drop_body(directive, self_var)
+            blocks = [Block(name="entry", body=body)]
         return Derective_fn(
             name=drop_function_name(self_type),
             generics=[],
             params=[Parameter("self", self_type)],
-            body=[Block(name="entry", body=body)],
+            body=blocks,
             ret_type=Type("void"),
             attrs=("safe",),
         )
@@ -110,6 +122,79 @@ class AutoDropPass:
 
         body.append(Instruction_ret(TypedVariable(".drop_ret", Type("void"))))
         return body
+
+    def _generate_box_drop_blocks(self, directive: Derective_struct, self_var: TypedVariable) -> list[Block]:
+        ptr_type = directive.params[0].type
+        owner_ptr_type = directive.params[1].type
+        assert isinstance(ptr_type, Pointer)
+        assert isinstance(owner_ptr_type, Pointer)
+
+        owner_ptr = TypedVariable(".drop_owner_ptr", owner_ptr_type)
+        ref_count_ptr = TypedVariable(".drop_ref_count_ptr", Pointer(Usize_t()))
+        ref_count = TypedVariable(".drop_ref_count", Usize_t())
+        one = TypedVariable(".drop_one", Usize_t())
+        next_ref_count = TypedVariable(".drop_next_ref_count", Usize_t())
+        is_last = TypedVariable(".drop_is_last", Usize_t(1))
+
+        entry = Block(
+            name="entry",
+            body=[
+                Instruction_getfield(var_out=owner_ptr, src=self_var, field=TypedVariable("1", owner_ptr_type)),
+                Instruction_getfieldptr(
+                    var_out=ref_count_ptr,
+                    src=owner_ptr,
+                    field=TypedVariable("1", Usize_t()),
+                ),
+                Instruction_load(var_out=ref_count, var=ref_count_ptr),
+                Instruction_capprim(var_out=one, primitive=Usize(1)),
+                Instruction_sub(var_out=next_ref_count, lhs=ref_count, rhs=one),
+                Instruction_store(var_src=next_ref_count, var_dst=ref_count_ptr),
+                Instruction_ieq(var_out=is_last, lhs=ref_count, rhs=one),
+                Instruction_cbr(cond_var=is_last, true_br_label="cleanup", else_br_label="done"),
+            ],
+        )
+
+        kind_ptr = TypedVariable(".drop_kind_ptr", Pointer(Usize_t(8)))
+        kind = TypedVariable(".drop_kind", Usize_t(8))
+        heap_kind = TypedVariable(".drop_heap_kind", Usize_t(8))
+        is_heap = TypedVariable(".drop_is_heap", Usize_t(1))
+        cleanup = Block(
+            name="cleanup",
+            body=[
+                Instruction_getfieldptr(
+                    var_out=kind_ptr,
+                    src=owner_ptr,
+                    field=TypedVariable("0", Usize_t(8)),
+                ),
+                Instruction_load(var_out=kind, var=kind_ptr),
+                Instruction_capprim(var_out=heap_kind, primitive=Usize(0, size=8)),
+                Instruction_ieq(var_out=is_heap, lhs=kind, rhs=heap_kind),
+                Instruction_cbr(cond_var=is_heap, true_br_label="cleanup_heap", else_br_label="cleanup_non_heap"),
+            ],
+        )
+
+        cleanup_heap_body = []
+        ptr_var = TypedVariable(".drop_ptr", ptr_type)
+        cleanup_heap_body.append(
+            Instruction_getfield(var_out=ptr_var, src=self_var, field=TypedVariable("0", ptr_type))
+        )
+        pointee_type = ptr_type.pointee
+        if needs_drop(pointee_type, self._aggregate_names):
+            value_var = TypedVariable(".drop_value", pointee_type)
+            cleanup_heap_body.append(Instruction_load(var_out=value_var, var=ptr_var))
+        cleanup_heap_body.extend([Instruction_hfree(var=ptr_var), Instruction_hfree(var=owner_ptr), Instruction_ret(TypedVariable(".drop_ret", Type("void")))])
+        cleanup_heap = Block(name="cleanup_heap", body=cleanup_heap_body)
+
+        cleanup_non_heap = Block(
+            name="cleanup_non_heap",
+            body=[
+                Instruction_hfree(var=owner_ptr),
+                Instruction_ret(TypedVariable(".drop_ret", Type("void"))),
+            ],
+        )
+
+        done = Block(name="done", body=[Instruction_ret(TypedVariable(".drop_ret", Type("void")))])
+        return [entry, cleanup, cleanup_heap, cleanup_non_heap, done]
 
     def _generate_enum_drop_blocks(self, directive: Derective_enum, self_var: TypedVariable) -> list[Block]:
         drop_variants = [

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 
 from ehir.core.instructions.base import Assignable
 from ehir.core.variable import Variable
@@ -8,6 +8,8 @@ from ehir.core.variable import Variable
 class Instruction_getfieldptr(Assignable):
     src: Variable
     field: Variable
+    field_path: list[Variable] = dataclass_field(default_factory=list)
 
     def __str__(self) -> str:
-        return f"{super().__str__()}getfieldptr {self.src}, {self.field}"
+        field_repr = "::".join(str(field) for field in [self.field, *self.field_path])
+        return f"{super().__str__()}getfieldptr {self.src}, {field_repr}"
