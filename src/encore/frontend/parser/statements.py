@@ -1,7 +1,9 @@
 from abc import ABC
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum, auto
+from typing import Optional
 
+from ehir.core.instructions.base import Instruction
 from ehir.core.type import Type
 from ehir.core.variable import Parameter
 
@@ -9,6 +11,29 @@ from ehir.core.variable import Parameter
 @dataclass
 class Statement:
     pass
+
+
+@dataclass
+class GenericParam(Type):
+    bounds: list[Type] = field(default_factory=list)
+
+    def format_declaration(self) -> str:
+        if not self.bounds:
+            return self.name
+        return f"{self.name}:{'+'.join(str(bound) for bound in self.bounds)}"
+
+
+def format_generic_params(generics: list[Type]) -> str:
+    if not generics:
+        return ""
+
+    items: list[str] = []
+    for generic in generics:
+        if isinstance(generic, GenericParam):
+            items.append(generic.format_declaration())
+        else:
+            items.append(str(generic))
+    return "[" + ", ".join(items) + "]"
 
 
 # =============
@@ -32,6 +57,7 @@ class Statement_Import(Statement_TopLevel):
         src: str
         dst: list["Statement_Import.ImportPair"]
         kind: "Statement_Import.ImportKind | None" = None
+        alias: str | None = None
 
         def __post_init__(self):
             if self.kind is None:
@@ -40,12 +66,16 @@ class Statement_Import(Statement_TopLevel):
         def __repr__(self) -> str:
             match len(self.dst):
                 case 0:
-                    return "*" if self.kind == Statement_Import.ImportKind.GLOB else self.src
+                    base = "*" if self.kind == Statement_Import.ImportKind.GLOB else self.src
                 case 1:
-                    return f"{self.src}::{self.dst[0]}"
+                    base = f"{self.src}::{self.dst[0]}"
                 case _:
                     dst_repr = f"{{ {', '.join(x.__repr__() for x in self.dst)} }}"
-                    return f"{self.src}::{dst_repr}"
+                    base = f"{self.src}::{dst_repr}"
+
+            if self.alias is not None:
+                return f"{base} as {self.alias}"
+            return base
 
     pair: ImportPair
 
@@ -55,37 +85,71 @@ class Statement_Import(Statement_TopLevel):
 
 
 @dataclass
-class Statement_FunctionDefinition(Statement_TopLevel):
+class FunctionSignature(Statement_TopLevel):
+    is_extern: bool
     name: str
     generics: list[Type]
     params: list[Parameter]
     type: Type | None
-    body: list["Statement_InnerLevel"]
 
     def __repr__(self) -> str:
-        type_repr = ""
-        if self.type:
-            type_repr = f"-> {self.type}"
-
-        r = f"fn {self.name}({', '.join(f'{p.name} : {p.type}' for p in self.params)}){type_repr}" + " {"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += "\n}"
-        return r
+        extern_repr = "extern " if self.is_extern else ""
+        generics_repr = format_generic_params(self.generics)
+        type_repr = f"-> {self.type}" if self.type else ""
+        return f"{extern_repr}fn {self.name}{generics_repr}({', '.join(str(p) for p in self.params)}){type_repr}"
 
 
 @dataclass
-class StructureDefinition(ABC):
+class Statement_FunctionDefinition(Statement_TopLevel):
+    signature: FunctionSignature
+    body: "Block"
+
+    @property
+    def name(self) -> str:
+        return self.signature.name
+
+    @property
+    def generics(self) -> list[Type]:
+        return self.signature.generics
+
+    @property
+    def params(self) -> list[Parameter]:
+        return self.signature.params
+
+    @property
+    def type(self) -> Type | None:
+        return self.signature.type
+
+    def __repr__(self) -> str:
+        return f"{self.signature} {self.body}"
+
+
+@dataclass
+class Statement_Trait(Statement_TopLevel):
+    name: str
+    generics: list[Type]
+    body: list[FunctionSignature]
+    bases: list[Type] = field(default_factory=list)
+
+    def __repr__(self) -> str:
+        generics_repr = format_generic_params(self.generics)
+        bases_repr = f" < {', '.join(str(base) for base in self.bases)}" if self.bases else ""
+        body_repr = " {\n" + "\n".join(f"  {method}" for method in self.body) + "\n}"
+        return f"{super().__repr__()}trait {self.name}{generics_repr}{bases_repr}{body_repr}"
+
+
+@dataclass
+class StructureSignature(ABC):
     name: str
     generics: list[Type]
 
     def __repr__(self) -> str:
-        generic_repr = ("[" + ", ".join(str(g) for g in self.generics) + "]") if self.generics else ""
+        generic_repr = format_generic_params(self.generics)
         return f"{self.name}{generic_repr}"
 
 
 @dataclass
-class CLikeStructureDefinition(StructureDefinition):
+class CLikeStructureDefinition(StructureSignature):
     fields: list[Parameter]
 
     def __repr__(self) -> str:
@@ -94,7 +158,7 @@ class CLikeStructureDefinition(StructureDefinition):
 
 
 @dataclass
-class TupleStructureDefinition(StructureDefinition):
+class TupleStructureDefinition(StructureSignature):
     fields: list[Type]
 
     def _to_clike(self) -> CLikeStructureDefinition:
@@ -107,7 +171,7 @@ class TupleStructureDefinition(StructureDefinition):
 
 
 @dataclass
-class UnitStructureDefinition(StructureDefinition):
+class UnitStructureDefinition(StructureSignature):
     def _to_tuple(self) -> TupleStructureDefinition:
         return TupleStructureDefinition(name=self.name, generics=self.generics, fields=[])
 
@@ -117,41 +181,44 @@ class UnitStructureDefinition(StructureDefinition):
 
 @dataclass
 class Statement_StructureDefinition(Statement_TopLevel):
-    defi: StructureDefinition
+    signature: StructureSignature
 
     def __repr__(self) -> str:
-        return f"{super().__repr__()}struct {self.defi}"
+        return f"{super().__repr__()}struct {self.signature}"
 
 
 @dataclass
 class Statement_EnumDefinition(Statement_TopLevel):
     name: str
     generics: list[Type]
-    body: list[StructureDefinition]
+    body: list[StructureSignature]
 
     def __repr__(self) -> str:
-        generic_repr = "[" + ", ".join(str(g) for g in self.generics) + "]"
+        generic_repr = format_generic_params(self.generics)
         body = " {\n" + "\n".join(f"  {b}" for b in self.body) + "\n}"
         return f"{super().__repr__()}enum {self.name}{generic_repr}{body}"
 
 
 @dataclass
 class Statement_Impl(Statement_TopLevel):
-    # @dataclass
-    # class FunctionDeclaration(Statement_TopLevel):
-    #     name: str
-    #     generics: list[str]
-    #     params: list[tuple[str, str]]
-    #     type: str
-
     generics: list[Type]
     trait_name: str | None
+    trait_args: list[Type]
     struct: Type
     body: list[Statement_FunctionDefinition]
     is_public: bool
 
     def __post_init__(self):
         self.is_public = False
+
+    def __repr__(self) -> str:
+        generics_repr = format_generic_params(self.generics)
+        trait_repr = ""
+        if self.trait_name is not None:
+            trait_args_repr = ("[" + ", ".join(str(g) for g in self.trait_args) + "]") if self.trait_args else ""
+            trait_repr = f" {self.trait_name}{trait_args_repr}"
+        body_repr = "\n".join(f"  {method}" for method in self.body)
+        return f"impl{generics_repr}{trait_repr} for {self.struct} {{\n{body_repr}\n}}"
 
 
 # =============
@@ -161,58 +228,69 @@ class Statement_InnerLevel(Statement):
 
 
 @dataclass
+class Statement_OneLineComment(Statement_TopLevel, Statement_InnerLevel):
+    value: str
+
+    def __repr__(self) -> str:
+        return self.value
+
+
+@dataclass
+class Statement_MultiLineComment(Statement_TopLevel, Statement_InnerLevel):
+    value: str
+
+    def __repr__(self) -> str:
+        return self.value
+
+
+@dataclass
 class Statement_Let(Statement_InnerLevel):
     name: str
     type: Type | None
     expr: "Statement_Expression"
+    is_mut: bool = False
 
     def __repr__(self) -> str:
+        mut_repr = "mut " if self.is_mut else ""
         type_repr = f" : {self.type}" if self.type else ""
-        return f"let {self.name}{type_repr} = {self.expr}"
+        return f"let {mut_repr}{self.name}{type_repr} = {self.expr}"
 
 
 @dataclass
 class Statement_While(Statement_InnerLevel):
+    label: Optional[str]
     expr: "Statement_Expression"
-    body: list["Statement_InnerLevel"]
+    body: "Block"
 
     def __repr__(self) -> str:
-        r = f"while {self.expr} {{"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += "\n}"
-        return r
+        label_repr = f"<'{self.label}>" if self.label else ""
+        return f"while{label_repr} {self.body}"
 
 
 @dataclass
 class Statement_Loop(Statement_InnerLevel):
-    body: list["Statement_InnerLevel"]
+    label: Optional[str]
+    body: "Block"
 
     def __repr__(self) -> str:
-        r = "loop {"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += "\n}"
-        return r
+        label_repr = f"<'{self.label}>" if self.label else ""
+        return f"loop{label_repr} {self.body}"
 
 
 @dataclass
 class Statement_DoWhile(Statement_InnerLevel):
-    body: list["Statement_InnerLevel"]
+    body: "Block"
     expr: "Statement_Expression"
 
     def __repr__(self) -> str:
-        r = "do {"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += f"\n}} while {self.expr}"
-        return r
+        return f"do {self.body} while {self.expr}"
 
 
 @dataclass
 class Statement_Assignment(Statement_InnerLevel):
     target: "Statement_Expression"
     expr: "Statement_Expression"
+    operator: str = "="
 
     @property
     def name(self) -> str:
@@ -223,26 +301,30 @@ class Statement_Assignment(Statement_InnerLevel):
         return repr(self.target)
 
     def __repr__(self) -> str:
-        return f"{self.target} = {self.expr}"
+        return f"{self.target} {self.operator} {self.expr}"
+
+
+@dataclass
+class Statement_Expr(Statement_InnerLevel):
+    expr: "Statement_Expression"
+
+    def __repr__(self) -> str:
+        return str(self.expr)
 
 
 @dataclass
 class Statement_IfBranch:
     expr: "Statement_Expression"
-    body: list["Statement_InnerLevel"]
+    body: "Block"
 
     def __repr__(self) -> str:
-        r = f"{self.expr} {{"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += "\n}"
-        return r
+        return f"{self.expr} {self.body}"
 
 
 @dataclass
 class Statement_If(Statement_InnerLevel):
     branches: list[Statement_IfBranch]
-    else_body: list["Statement_InnerLevel"] | None = None
+    else_body: Optional["Block"] = None
 
     def __repr__(self) -> str:
         r = f"if {self.branches[0]}"
@@ -250,7 +332,7 @@ class Statement_If(Statement_InnerLevel):
             r += f"\nelif {branch}"
         if self.else_body is not None:
             r += "\nelse {"
-            for stmt in self.else_body:
+            for stmt in self.else_body.body:
                 r += f"\n  {stmt}"
             r += "\n}"
         return r
@@ -258,23 +340,19 @@ class Statement_If(Statement_InnerLevel):
 
 @dataclass
 class Statement_MatchArm:
-    pattern: "Expression_Path | None"
+    pattern: "Statement_Expression | None"
     binding: str | None
-    body: list["Statement_InnerLevel"]
+    body: "Block | Statement_Expression"
 
     @property
     def is_wildcard(self) -> bool:
         return self.pattern is None
 
     def __repr__(self) -> str:
-        pattern_repr = "_" if self.pattern is None else self.pattern.name
+        pattern_repr = "_" if self.pattern is None else str(self.pattern)
         if self.binding is not None:
             pattern_repr = f"{pattern_repr}({self.binding})"
-        r = f"{pattern_repr} => {{"
-        for stmt in self.body:
-            r += f"\n  {stmt}"
-        r += "\n}"
-        return r
+        return f"{pattern_repr} => {self.body}"
 
 
 @dataclass
@@ -285,6 +363,27 @@ class Statement_Match(Statement_InnerLevel):
     def __repr__(self) -> str:
         arms_repr = "\n".join(f"  {arm}" for arm in self.arms)
         return f"match {self.expr} {{\n{arms_repr}\n}}"
+
+
+@dataclass
+class Statement_Unsafe(Statement_InnerLevel):
+    body: "Block"
+
+    def __repr__(self) -> str:
+        return f"unsafe {self.body}"
+
+
+@dataclass
+class Statement_EHIR(Statement_InnerLevel):
+    instructions: list[Instruction]
+    is_unsafe: bool = False
+
+    def __repr__(self) -> str:
+        prefix = "unsafe ehir" if self.is_unsafe else "ehir"
+        if not self.instructions:
+            return f"{prefix} {{}}"
+        body = "\n".join(f"  {instruction}" for instruction in self.instructions)
+        return f"{prefix} {{\n{body}\n}}"
 
 
 # =============
@@ -303,19 +402,25 @@ class Statement_Ret(Statement_ControlFlow):
 
 @dataclass
 class Statement_Break(Statement_ControlFlow):
+    label: Optional[str]
+
     def __repr__(self) -> str:
-        return "break"
+        label_repr = f"<'{self.label}>" if self.label else ""
+        return f"break{label_repr}"
 
 
 @dataclass
 class Statement_Continue(Statement_ControlFlow):
+    label: Optional[str]
+
     def __repr__(self) -> str:
-        return "continue"
+        label_repr = f"<'{self.label}>" if self.label else ""
+        return f"continue{label_repr}"
 
 
 # =============
 @dataclass
-class Statement_Expression(Statement_InnerLevel):
+class Statement_Expression(Statement_InnerLevel, ABC):
     pass
 
 
@@ -401,8 +506,21 @@ class Expression_Call(Statement_Expression):
 
 
 @dataclass
+class Expression_MethodCall(Statement_Expression):
+    receiver: Statement_Expression
+    method: str
+    generics: list[Type]
+    args: list[Statement_Expression]
+
+    def __repr__(self) -> str:
+        generics = f"[{', '.join(str(g) for g in self.generics)}]" if self.generics else ""
+        args = ", ".join(str(arg) for arg in self.args)
+        return f"{self.receiver}.{self.method}{generics}({args})"
+
+
+@dataclass
 class Expression_MatchArm:
-    pattern: "Expression_Path | None"
+    pattern: "Statement_Expression | None"
     binding: str | None
     expr: Statement_Expression
 
@@ -411,7 +529,7 @@ class Expression_MatchArm:
         return self.pattern is None
 
     def __repr__(self) -> str:
-        pattern_repr = "_" if self.pattern is None else self.pattern.name
+        pattern_repr = "_" if self.pattern is None else str(self.pattern)
         if self.binding is not None:
             pattern_repr = f"{pattern_repr}({self.binding})"
         return f"{pattern_repr} => {self.expr}"
@@ -463,6 +581,26 @@ class Expression_Block(Statement_Expression):
         return r
 
 
+@dataclass
+class Block:
+    body: list[Statement_InnerLevel]
+
+    def __repr__(self) -> str:
+        r = "{"
+        for stmt in self.body:
+            r += f"\n  {stmt}"
+        r += "\n}"
+        return r
+
+
+@dataclass
+class Expression_Unsafe(Statement_Expression):
+    body: "Block"
+
+    def __repr__(self) -> str:
+        return f"unsafe {self.body}"
+
+
 # =============
 @dataclass
 class Expression_BinaryOperation(Statement_Expression):
@@ -476,52 +614,62 @@ class Expression_BinaryOperation(Statement_Expression):
 
 @dataclass
 class BinaryOperation_LogicalOr(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_LogicalAnd(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_BitwiseOr(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_BitwiseXor(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_BitwiseAnd(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_Equality(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_Relational(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_Shift(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_Additive(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 @dataclass
 class BinaryOperation_Multiplicative(Expression_BinaryOperation):
-    pass
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
 
 
 # =============
@@ -532,6 +680,14 @@ class Expression_UnaryOperation(Statement_Expression):
 
     def __repr__(self) -> str:
         return f"{self.operator}{self.expr}"
+
+
+@dataclass
+class Expression_Try(Statement_Expression):
+    expr: Statement_Expression
+
+    def __repr__(self) -> str:
+        return f"{self.expr}?"
 
 
 # =============
@@ -546,3 +702,37 @@ class Expression_Parenthesized(Expression_Primary):
 
     def __repr__(self) -> str:
         return f"({self.expr})"
+
+
+@dataclass
+class Expression_TupleLiteral(Expression_Primary):
+    items: list[Statement_Expression]
+
+    def __repr__(self) -> str:
+        return "(" + ", ".join(str(item) for item in self.items) + ")"
+
+
+@dataclass
+class Expression_ArrayLiteral(Expression_Primary):
+    items: list[Statement_Expression]
+
+    def __repr__(self) -> str:
+        return "[" + ", ".join(str(item) for item in self.items) + "]"
+
+
+@dataclass
+class Expression_ArrayRepeat(Expression_Primary):
+    value: Statement_Expression
+    size: int
+
+    def __repr__(self) -> str:
+        return f"[{self.value}; {self.size}]"
+
+
+@dataclass
+class Expression_Index(Statement_Expression):
+    base: Statement_Expression
+    index: Statement_Expression
+
+    def __repr__(self) -> str:
+        return f"{self.base}[{self.index}]"

@@ -1,0 +1,3 @@
+COMPILER_VERSION = "0.0.12"
+
+__all__ = ["COMPILER_VERSION"]

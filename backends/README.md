@@ -1,0 +1,35 @@
+# Backend API
+- salloc
+- lcpos
+- halloc
+- put
+- load
+- ret
+
+- add
+- sub
+- or
+- and
+- xor
+- ieq
+- neq
+- les
+- leq
+- grt
+- geq
+- mul
+- div
+- mod
+- shl
+- shr
+- call
+- br
+- cbr
+- switch
+- hfree
+- store
+- pcast
+- getfieldptr
+- getfield
+- getptr
+- phi

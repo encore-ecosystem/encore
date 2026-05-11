@@ -5,8 +5,12 @@ from enum import Enum, auto
 class TokenType(Enum):
     INTEGER = auto()
     FLOAT = auto()
+    BOOLEAN = auto()
     STRING = auto()
     IDENTIFIER = auto()
+
+    ONE_LINE_COMMENT = auto()
+    MULTI_LINE_COMMENT = auto()
 
     KW_FN = auto()
     KW_STRUCT = auto()
@@ -15,6 +19,7 @@ class TokenType(Enum):
     KW_IMPL = auto()
     KW_FOR = auto()
     KW_LET = auto()
+    KW_MUT = auto()
     KW_RET = auto()
     KW_WHILE = auto()
     KW_LOOP = auto()
@@ -27,50 +32,55 @@ class TokenType(Enum):
     KW_MATCH = auto()
     KW_PUB = auto()
     KW_IMPORT = auto()
+    KW_AS = auto()
+    KW_EXTERN = auto()
+    KW_UNSAFE = auto()
+    KW_EHIR = auto()
 
-    OP_SCOPE = auto()
+    SCOPE = auto()
 
-    OP_PLUS = auto()
-    OP_MINUS = auto()
-    OP_MULTIPLY = auto()
-    OP_DIVIDE = auto()
-    OP_MODULO = auto()
+    PLUS = auto()
+    MINUS = auto()
+    ASTERISK = auto()
+    SLASH = auto()
+    PERCENT = auto()
 
-    OP_EQUAL = auto()
-    OP_NOT_EQUAL = auto()
-    OP_LESS = auto()
-    OP_GREATER = auto()
-    OP_LESS_EQUAL = auto()
-    OP_GREATER_EQUAL = auto()
+    EQUAL_EQUAL = auto()
+    BANG_EQUAL = auto()
+    LESS = auto()
+    GREATER = auto()
+    LESS_EQUAL = auto()
+    GREATER_EQUAL = auto()
 
-    OP_AND = auto()
-    OP_OR = auto()
-    OP_NOT = auto()
+    AND_AND = auto()
+    PIPE_PIPE = auto()
+    BANG = auto()
 
-    OP_BIT_AND = auto()
-    OP_BIT_OR = auto()
-    OP_BIT_XOR = auto()
-    OP_BIT_NOT = auto()
-    OP_LEFT_SHIFT = auto()
-    OP_RIGHT_SHIFT = auto()
+    AMPERSAND = auto()
+    PIPE = auto()
+    CARET = auto()
+    TILDE = auto()
+    LEFT_SHIFT = auto()
+    RIGHT_SHIFT = auto()
 
-    OP_ASSIGN = auto()
-    OP_PLUS_ASSIGN = auto()
-    OP_MINUS_ASSIGN = auto()
-    OP_MULT_ASSIGN = auto()
-    OP_DIV_ASSIGN = auto()
-    OP_MOD_ASSIGN = auto()
-    OP_AND_ASSIGN = auto()
-    OP_OR_ASSIGN = auto()
-    OP_XOR_ASSIGN = auto()
-    OP_LSHIFT_ASSIGN = auto()
-    OP_RSHIFT_ASSIGN = auto()
+    ASSIGN = auto()
+    PLUS_EQUAL = auto()
+    MINUS_EQUAL = auto()
+    ASTERISK_EQUAL = auto()
+    SLASH_EQUAL = auto()
+    PERCENT_EQUAL = auto()
+    AMPERSAND_EQUAL = auto()
+    PIPE_EQUAL = auto()
+    CARET_EQUAL = auto()
+    LEFT_SHIFT_EQUAL = auto()
+    RIGHT_SHIFT_EQUAL = auto()
 
-    OP_INCREMENT = auto()
-    OP_DECREMENT = auto()
+    INCREMENT = auto()
+    DECREMENT = auto()
+    QUESTION = auto()
 
-    OP_ARROW = auto()
-    OP_FAT_ARROW = auto()
+    ARROW = auto()
+    FAT_ARROW = auto()
 
     LEFT_PAREN = auto()
     RIGHT_PAREN = auto()
@@ -78,10 +88,11 @@ class TokenType(Enum):
     RIGHT_BRACE = auto()
     LEFT_BRACKET = auto()
     RIGHT_BRACKET = auto()
+    SEMICOLON = auto()
     COLON = auto()
     COMMA = auto()
     DOT = auto()
-    ARROW = auto()
+    QUOTE = auto()
 
     WHITESPACE = auto()
     NEWLINE = auto()
@@ -90,11 +101,11 @@ class TokenType(Enum):
 
 
 @dataclass
-class Token:
+class LexerToken:
     type: TokenType
     value: str
     line: int
     column: int
 
     def __repr__(self) -> str:
-        return f"{self.type.name}({self.value!r})"
+        return f"{self.line}:{self.column}({self.type.name}: {self.value})"
