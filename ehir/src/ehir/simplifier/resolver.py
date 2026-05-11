@@ -12,7 +12,7 @@ from ehir.core.derectives import (
     Derective_typealias,
 )
 from ehir.core.derectives.base import Derective
-from ehir.core.enum import Enum
+from ehir.core.enum import Enum, EnumVariant, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import (
     BinOp,
     Instruction_add,
@@ -77,8 +77,14 @@ _BOOLEAN_INSTRUCTS = (
 class VariableDatabase:
     _data: dict[str, Variable] = field(default_factory=dict)
 
-    def store_raw_as_source_of_truth(self, variable: Variable, expected_type: Type) -> TypedVariable:
-        var = TypedVariable(variable.name, expected_type)
+    def store_raw_as_source_of_truth(self, variable: Variable, expected_type: Type) -> Variable:
+        if cached := self._data.get(variable.name):
+            if cached.type != expected_type:
+                raise RuntimeError(
+                    f"Different type for variable {cached.name}. Cached {cached.type} but last store expect {expected_type}"
+                )
+            return cached
+        var = Variable(variable.name, expected_type)
         self._data[var.name] = var
         return var
 
@@ -86,6 +92,19 @@ class VariableDatabase:
         if variable.type != expected_type:
             raise RuntimeError(f"Different typed for variable {variable.name}: {variable.type} != {expected_type}")
         return self.store_raw_as_source_of_truth(variable, expected_type)
+
+    def store(self, variable: Variable, expected_type: Type):
+        if isinstance(variable, TypedVariable):
+            return self.store_typ_as_source_of_truth(variable, expected_type)
+        return self.store_raw_as_source_of_truth(variable, expected_type)
+
+    def get(self, variable: Variable) -> Variable:
+        if cached := self._data.get(variable.name):
+            return cached
+
+        var = deepcopy(variable)
+        self._data[var.name] = var
+        return var
 
 
 class Resolver:
@@ -112,9 +131,9 @@ class Resolver:
             elif isinstance(derective, Derective_struct):
                 self.structs[derective.name] = derective
             elif isinstance(derective, Derective_trait):
-                self.traits[derective.name] = derective
+                self.traits[derective.name] = self._resolve_trait(derective)
             elif isinstance(derective, Derective_impl):
-                self.impls.append(derective)
+                self.impls.append(self._resolve_impl(derective))
 
         # 2. Resolve types in functions
         for fn in list(self.fn.values()):
@@ -221,6 +240,22 @@ class Resolver:
         mangled = "".join(ch if ch.isalnum() else "_" for ch in value).strip("_")
         return mangled or "type"
 
+    def _resolve_trait(self, trait: Derective_trait) -> Derective_trait:
+        return trait
+
+    def _resolve_impl(self, impl: Derective_impl) -> Derective_impl:
+        def rename_self(type: Type) -> Type:
+            if type.name == "Self":
+                type.name = impl.for_type.name
+            for i, g in enumerate(type.generics):
+                type.generics[i] = rename_self(g)
+            return type
+
+        for method in impl.methods:
+            method.ret_type = rename_self(method.ret_type)
+
+        return impl
+
     def _resolve_function_body(self, fn: Derective_fn):
         self.variables = VariableDatabase()
 
@@ -232,6 +267,8 @@ class Resolver:
             for instr in block.get_body():
                 if isinstance(instr, Instruction_capprim):
                     self._resolve_capprim(instr)
+                elif isinstance(instr, Instruction_capenum):
+                    self._resolve_capenum(instr)
                 elif isinstance(instr, Instruction_call):
                     self._resolve_call(instr)
                 else:
@@ -253,7 +290,69 @@ class Resolver:
         instr.var_out = new_var_out
 
     def _resolve_call(self, instr: Instruction_call):
-        print(instr.fn_name)
+        expected_type = None
+        target_fn = None
+        for res in self.impls:
+            for method in res.methods:
+                name = f"{res.for_type}::{method.name}"
+                if name == instr.fn_name:
+                    expected_type = method.ret_type
+                    target_fn = method
+
+        if expected_type is not None:
+            instr.var_out = self.variables.store(instr.var_out, expected_type)
+        assert target_fn
+
+        for i, arg in enumerate(instr.args):
+            expected_type = target_fn.params[i].type
+            instr.args[i] = self.variables.store(arg, expected_type)
+
+    def _resolve_capenum(self, instr: Instruction_capenum):
+        if instr.enum.name not in self.enums:
+            raise RuntimeError(f"Unknown enum: {instr.enum.name}")
+
+        target_enum = self.enums[instr.enum.name]
+        target_variant = None
+        for variant in target_enum.variants:
+            if variant.name == instr.enum.variant:
+                target_variant = variant
+                break
+        else:
+            raise RuntimeError(f"Unknown variant {instr.enum.variant} for enum {instr.enum.name}")
+
+        target_variant: EnumVariant
+        if isinstance(target_variant, UnitLikeVariant):
+            raise NotImplementedError()
+        elif isinstance(target_variant, TupleLikeVariant):
+            for i, arg in enumerate(instr.enum.args):
+                instr.enum.args[i] = self.variables.get(arg)
+        else:
+            raise NotImplementedError()
+
+        curr_gens = len(instr.enum.generics)
+        targ_gens = len(target_enum.generics)
+        if curr_gens > targ_gens:
+            raise RuntimeError(f"Too much typed generics: {instr}. Current: {curr_gens} but expected {targ_gens}")
+        else:
+            generic_to_arg_index_mapping: dict[str, list[int]] = {}
+            for gen in target_enum.generics:
+                for i, arg in enumerate(target_variant.types):
+                    if arg.name != gen.name:
+                        continue
+                    generic_to_arg_index_mapping[gen.name] = generic_to_arg_index_mapping.get(gen.name, []) + [i]
+
+            # Check existing generics
+            for _i in range(curr_gens):
+                # print(1, instr.enum.generics[i], target_enum.generics)
+                raise NotImplementedError
+
+            for i in range(curr_gens, targ_gens):
+                possible_indexes_to_acquire_type = generic_to_arg_index_mapping[target_enum.generics[i].name]
+                types = [instr.enum.args[index].type for index in possible_indexes_to_acquire_type]
+                assert types[0]
+                instr.enum.generics.append(types[0])
+
+        instr.var_out = self.variables.store(instr.var_out, instr.enum.as_type())
 
     def _concrete_fn(self, fn: Derective_fn, types: list[Type]) -> "Derective_fn":
         assert len(fn.generics) == len(types)

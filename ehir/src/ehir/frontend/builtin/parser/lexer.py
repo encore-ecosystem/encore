@@ -213,8 +213,6 @@ class Lexer:
                 self._append_token(TokenType.KW_SGETFIELDPTR)
             case "call":
                 self._append_token(TokenType.KW_CALL)
-            case "methodcall":
-                self._append_token(TokenType.KW_METHODCALL)
             case "br":
                 self._append_token(TokenType.KW_BR)
             case "cbr":

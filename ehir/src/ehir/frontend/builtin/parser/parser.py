@@ -12,7 +12,7 @@ from ehir.core.derectives import (
     TraitMethod,
 )
 from ehir.core.derectives.base import Derective
-from ehir.core.enum import Enum, EnumVariant
+from ehir.core.enum import Enum, EnumVariant, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import (
     Instruction_add,
     Instruction_and,
@@ -271,13 +271,23 @@ class Parser:
         self._safe_consume(TokenType.LEFT_BRACE)
         while self._lookup_curr() != TokenType.RIGHT_BRACE:
             variant_name = self._safe_consume(TokenType.IDENTIFIER).value
-            variant_type = None
-            if self._lookup_curr() == TokenType.LEFT_PAREN:
-                self._safe_consume(TokenType.LEFT_PAREN)
-                if self._lookup_curr() != TokenType.RIGHT_PAREN:
-                    variant_type = self._parse_type()
-                self._safe_consume(TokenType.RIGHT_PAREN)
-            variants.append(EnumVariant(name=variant_name, type=variant_type))
+
+            match self._lookup_curr():
+                case TokenType.LEFT_BRACKET:
+                    raise NotImplementedError
+                case TokenType.LEFT_PAREN:
+                    self._safe_consume(TokenType.LEFT_PAREN)
+                    variant_fields_types = []
+                    if self._lookup_curr() != TokenType.RIGHT_PAREN:
+                        variant_fields_types.append(self._parse_type())
+                    while self._lookup_curr() != TokenType.RIGHT_PAREN:
+                        self._safe_consume(TokenType.COMMA)
+                        variant_fields_types.append(self._parse_type())
+                    self._safe_consume(TokenType.RIGHT_PAREN)
+                    variants.append(TupleLikeVariant(name=variant_name, types=variant_fields_types))
+                case _:
+                    variants.append(UnitLikeVariant(name=variant_name))
+
         self._safe_consume(TokenType.RIGHT_BRACE)
 
         return Derective_enum(name=name, generics=generics, variants=variants)
@@ -499,11 +509,12 @@ class Parser:
                 variable = self._parse_variable()
                 return Instruction_wrap(var_out=var, variable=variable)
 
-            case TokenType.KW_CALL | TokenType.KW_METHODCALL | TokenType.KW_UNSAFE:
+            case TokenType.KW_CALL | TokenType.KW_UNSAFE:
                 is_unsafe = False
                 if curr_token == TokenType.KW_UNSAFE:
                     self._consume()
                     is_unsafe = True
+
                 fn_name = self._parse_callable_name()
                 generics = self._parse_generics() if self._lookup_curr() == TokenType.LEFT_BRACKET else []
 
@@ -692,8 +703,18 @@ class Parser:
     def _parse_enum_init(self) -> Enum:
         enum_as_type = self._parse_type()
         self._safe_consume(TokenType.OP_SCOPE)
-        variant = self._parse_struct_init()
-        return Enum(name=enum_as_type.name, generics=enum_as_type.generics, variant=variant.name, payload=variant)
+        variant = self._parse_name()
+
+        args = []
+        if self._lookup_curr() == TokenType.LEFT_PAREN:
+            self._safe_consume(TokenType.LEFT_PAREN)
+            if self._lookup_curr() != TokenType.RIGHT_PAREN:
+                args.append(self._parse_variable())
+            while self._lookup_curr() != TokenType.RIGHT_PAREN:
+                self._safe_consume(TokenType.COMMA)
+                args.append(self._parse_variable())
+            self._safe_consume(TokenType.RIGHT_PAREN)
+        return Enum(name=enum_as_type.name, generics=enum_as_type.generics, variant=variant, args=args)
 
     def _parse_variable(self) -> Variable:
         name = self._parse_name()

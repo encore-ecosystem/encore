@@ -56,7 +56,6 @@ class TokenType(Enum):
     KW_SWITCH = auto()
     KW_RET = auto()
     KW_CALL = auto()
-    KW_METHODCALL = auto()
 
     KW_ADD = auto()
     KW_SUB = auto()
