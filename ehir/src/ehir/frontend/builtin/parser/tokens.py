@@ -1,320 +1,135 @@
 from dataclasses import dataclass
+from enum import Enum, auto
 
 
-@dataclass
+class TokenType(Enum):
+    # Generic
+    IDENTIFIER = auto()
+    NUMBER = auto()
+    STRING = auto()
+    CHAR = auto()
+
+    UNKNOWN = auto()
+    EOF = auto()
+
+    # Multi-char operators
+    ARROW = auto()  # ->
+    BOLD_ARROW = auto()  # =>
+    OP_SCOPE = auto()  # ::
+
+    # Symbols
+    AMPERSAND = auto()
+
+    # Keywords
+    KW_FN = auto()
+    KW_STRUCT = auto()
+    KW_ENUM = auto()
+    KW_TRAIT = auto()
+    KW_IMPL = auto()
+    KW_PUB = auto()
+    KW_IMP = auto()
+    KW_EXTERN = auto()
+    KW_UNSAFE = auto()
+    KW_FOR = auto()
+    KW_WHERE = auto()
+    KW_TYPE = auto()
+
+    # IR / Instructions
+    KW_CAPPRIM = auto()
+    KW_CAPENUM = auto()
+    KW_CAPSTRUCT = auto()
+    KW_WRAP = auto()
+    KW_GETPTR = auto()
+    KW_GETFIELD = auto()
+    KW_GETFIELDPTR = auto()
+    KW_SETFIELD = auto()
+    KW_GEP = auto()
+
+    KW_SGETFIELD = auto()
+    KW_SGETFIELDPTR = auto()
+
+    KW_PCAST = auto()
+
+    KW_BR = auto()
+    KW_CBR = auto()
+    KW_MATCH = auto()
+    KW_SWITCH = auto()
+    KW_RET = auto()
+    KW_CALL = auto()
+    KW_METHODCALL = auto()
+
+    KW_ADD = auto()
+    KW_SUB = auto()
+    KW_MUL = auto()
+    KW_DIV = auto()
+    KW_MOD = auto()
+
+    KW_SHL = auto()
+    KW_SHR = auto()
+
+    KW_LES = auto()
+    KW_LEQ = auto()
+    KW_GRT = auto()
+    KW_GEQ = auto()
+    KW_IEQ = auto()
+    KW_NEQ = auto()
+
+    KW_AND = auto()
+    KW_OR = auto()
+    KW_XOR = auto()
+
+    KW_SALLOC = auto()
+    KW_HALLOC = auto()
+    KW_HREALLOC = auto()
+
+    KW_PUT = auto()
+    KW_LOAD = auto()
+    KW_STORE = auto()
+    KW_HFREE = auto()
+
+    # Operators
+    PLUS = auto()
+    MINUS = auto()
+    EQUAL = auto()
+    STAR = auto()
+    LESS = auto()
+    GREATER = auto()
+
+    # Punctuation
+    COMMA = auto()
+    SEMICOLON = auto()
+    COLON = auto()
+    DOT = auto()
+    DOLLAR = auto()
+    HASH = auto()
+
+    # Delimiters
+    LEFT_PAREN = auto()
+    RIGHT_PAREN = auto()
+
+    LEFT_BRACE = auto()
+    RIGHT_BRACE = auto()
+
+    LEFT_BRACKET = auto()
+    RIGHT_BRACKET = auto()
+
+    # Whitespace
+    WHITESPACE = auto()
+    NEWLINE = auto()
+    TAB = auto()
+
+
+@dataclass(slots=True)
 class Token:
-    string: str
+    type: TokenType
+    value: str
     line: int
     column: int
 
-
-class IDENTIFIER(Token): ...
-
-
-class NUMBER(Token): ...
-
-
-class STRING(Token): ...
-
-
-class CHAR(Token): ...
-
-
-class ARROW(Token): ...
-
-
-class BOLD_ARROW(Token): ...
-
-
-class DOUBLE_COLON(Token): ...
-
-
-class AMPERSAND(Token): ...
-
-
-class UNKNOWN(Token): ...
-
-
-class EOF(Token): ...
-
-
-# Keywords
-class FN(Token): ...
-
-
-class STRUCT(Token): ...
-
-
-class ENUM(Token): ...
-
-
-class TRAIT(Token): ...
-
-
-class IMPL(Token): ...
-
-
-class PUB(Token): ...
-
-
-class IMP(Token): ...
-
-
-class CIMP(Token): ...
-
-
-class EXTERN(Token): ...
-
-
-class UNSAFE(Token): ...
-
-
-class FOR(Token): ...
-
-
-class WHERE(Token): ...
-
-
-class TYPE(Token): ...
-
-
-class CEOH(Token): ...
-
-
-class CEOS(Token): ...
-
-
-class CENUM(Token): ...
-
-
-class LCEOS(Token): ...
-
-
-class CPOS(Token): ...
-
-
-class CPOH(Token): ...
-
-
-class CSOS(Token): ...
-
-
-class CSTRUCT(Token): ...
-
-
-class CSOH(Token): ...
-
-
-class SCPOS(Token): ...
-
-
-class SCPOH(Token): ...
-
-
-class SCSOS(Token): ...
-
-
-class SCSOH(Token): ...
-
-
-class LCPOS(Token): ...
-
-
-class LCSOS(Token): ...
-
-
-class CAPPRIM(Token): ...
-
-
-class CAPENUM(Token): ...
-
-
-class CAPSTRUCT(Token): ...
-
-
-class WRAP(Token): ...
-
-
-class GETPTR(Token): ...
-
-
-class GETFIELD(Token): ...
-
-
-class GETFIELDPTR(Token): ...
-
-
-class SETFIELD(Token): ...
-
-
-class GEP(Token): ...
-
-
-class SGETFIELD(Token): ...
-
-
-class SGETFIELDPTR(Token): ...
-
-
-class PCAST(Token): ...
-
-
-class BR(Token): ...
-
-
-class CBR(Token): ...
-
-
-class MATCH(Token): ...
-
-
-class SWITCH(Token): ...
-
-
-class RET(Token): ...
-
-
-class CALL(Token): ...
-
-
-class ADD(Token): ...
-
-
-class SUB(Token): ...
-
-
-class MUL(Token): ...
-
-
-class DIV(Token): ...
-
-
-class MOD(Token): ...
-
-
-class SHL(Token): ...
-
-
-class SHR(Token): ...
-
-
-class LES(Token): ...
-
-
-class LEQ(Token): ...
-
-
-class GRT(Token): ...
-
-
-class GEQ(Token): ...
-
-
-class IEQ(Token): ...
-
-
-class NEQ(Token): ...
-
-
-class AND(Token): ...
-
-
-class OR(Token): ...
-
-
-class XOR(Token): ...
-
-
-class PHI(Token): ...
-
-
-class SALLOC(Token): ...
-
-
-class HALLOC(Token): ...
-
-
-class HREALLOC(Token): ...
-
-
-class PUT(Token): ...
-
-
-class LOAD(Token): ...
-
-
-class STORE(Token): ...
-
-
-class HFREE(Token): ...
-
-
-# Operators
-class PLUS(Token): ...
-
-
-class MINUS(Token): ...
-
-
-class EQUAL(Token): ...
-
-
-class STAR(Token): ...
-
-
-class LESS(Token): ...
-
-
-class GREATER(Token): ...
-
-
-# Punctuation
-class COMMA(Token): ...
-
-
-class SEMICOLON(Token): ...
-
-
-class COLON(Token): ...
-
-
-class DOT(Token): ...
-
-
-class DOLLAR(Token): ...
-
-
-class HASH(Token): ...
-
-
-# Parentheses
-
-
-class LEFT_PAREN(Token): ...
-
-
-class RIGHT_PAREN(Token): ...
-
-
-class LEFT_BRACE(Token): ...
-
-
-class RIGHT_BRACE(Token): ...
-
-
-class LEFT_BRACKET(Token): ...
-
-
-class RIGHT_BRACKET(Token): ...
-
-
-# Whitespace
-
-
-class WHITESPACE(Token): ...
-
-
-class NEWLINE(Token): ...
-
-
-class TAB(Token): ...
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, TokenType):
+            return self.type == other
+        raise NotImplementedError
+
+    def __repr__(self) -> str:
+        return f"{self.line}:{self.column}({self.type.name}: {self.value})"

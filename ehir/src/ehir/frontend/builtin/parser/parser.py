@@ -44,7 +44,6 @@ from ehir.core.instructions import (
     Instruction_neq,
     Instruction_or,
     Instruction_pcast,
-    Instruction_phi,
     Instruction_put,
     Instruction_ret,
     Instruction_salloc,
@@ -61,7 +60,6 @@ from ehir.core.instructions import (
     Instruction_wrap,
     Instruction_xor,
     MatchCase,
-    PhiPair,
 )
 from ehir.core.instructions.base import Instruction
 from ehir.core.primitives import Char, Char_t, Float, Float_t, Isize, Isize_t, Str, Str_t, Usize, Usize_t
@@ -69,8 +67,8 @@ from ehir.core.primitives.base import Primitive, PrimitiveType
 from ehir.core.struct import Struct
 from ehir.core.type import Pointer, Type
 from ehir.core.variable import Parameter, StructField, Variable
-from ehir.frontend.builtin.parser import tokens as t
 from ehir.frontend.builtin.parser.lexer import Lexer
+from ehir.frontend.builtin.parser.tokens import Token, TokenType
 
 
 class Parser:
@@ -94,28 +92,26 @@ class Parser:
             current_token = self._lookup_curr()
             is_public = False
 
-            if isinstance(current_token, t.PUB):
-                self._safe_consume(t.PUB)
+            if current_token.type == TokenType.KW_PUB:
+                self._safe_consume(TokenType.KW_PUB)
                 is_public = True
                 current_token = self._lookup_curr()
 
-            if isinstance(current_token, t.FN):
+            if current_token.type == TokenType.KW_FN:
                 derective = self._parse_fn()
-            elif isinstance(current_token, t.EXTERN):
+            elif current_token.type == TokenType.KW_EXTERN:
                 derective = self._parse_extern_fn()
-            elif isinstance(current_token, t.TRAIT):
+            elif current_token.type == TokenType.KW_TRAIT:
                 derective = self._parse_trait()
-            elif isinstance(current_token, t.IMPL):
+            elif current_token.type == TokenType.KW_IMPL:
                 derective = self._parse_impl()
-            elif isinstance(current_token, t.IMP):
+            elif current_token.type == TokenType.KW_IMP:
                 derective = self._parse_imp()
-            elif isinstance(current_token, t.CIMP):
-                derective = self._parse_cimp()
-            elif isinstance(current_token, t.ENUM):
+            elif current_token.type == TokenType.KW_ENUM:
                 derective = self._parse_enum()
-            elif isinstance(current_token, t.STRUCT):
+            elif current_token.type == TokenType.KW_STRUCT:
                 derective = self._parse_struct()
-            elif isinstance(current_token, t.TYPE):
+            elif current_token.type == TokenType.KW_TYPE:
                 derective = self._parse_typealias()
             else:
                 raise ValueError(f"Unexpected token {current_token}")
@@ -173,102 +169,88 @@ class Parser:
                 raise ValueError(f"Attribute 'inline' is not valid for {target}")
 
     def _parse_typealias(self) -> Derective_typealias:
-        self._safe_consume(t.TYPE)
-        name = self._safe_consume(t.IDENTIFIER).string
-        self._safe_consume(t.EQUAL)
+        self._safe_consume(TokenType.KW_TYPE)
+        name = self._safe_consume(TokenType.IDENTIFIER).value
+        self._safe_consume(TokenType.EQUAL)
         target = self._parse_type()
-        if isinstance(self._lookup_curr(), t.SEMICOLON):
-            self._safe_consume(t.SEMICOLON)
+        if self._lookup_curr() == TokenType.OP_SCOPE:
+            self._safe_consume(TokenType.SEMICOLON)
         return Derective_typealias(name=name, target=target)
 
     def _parse_attrs(self) -> tuple[str, ...]:
         attrs: list[str] = []
-        while isinstance(self._lookup_curr(), t.HASH):
-            self._safe_consume(t.HASH)
-            attr_kw = self._safe_consume(t.IDENTIFIER).string
+        while self._lookup_curr().type == TokenType.HASH:
+            self._safe_consume(TokenType.HASH)
+            attr_kw = self._safe_consume(TokenType.IDENTIFIER).value
             if attr_kw != "attr":
                 raise ValueError(f"Unknown attribute directive '#{attr_kw}'")
 
-            self._safe_consume(t.LEFT_PAREN)
-            if not isinstance(self._lookup_curr(), t.RIGHT_PAREN):
-                attrs.append(self._safe_consume(t.IDENTIFIER).string)
-                while isinstance(self._lookup_curr(), t.COMMA):
-                    self._safe_consume(t.COMMA)
-                    attrs.append(self._safe_consume(t.IDENTIFIER).string)
-            self._safe_consume(t.RIGHT_PAREN)
+            self._safe_consume(TokenType.LEFT_PAREN)
+            if self._lookup_curr() != TokenType.RIGHT_PAREN:
+                attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
+                while self._lookup_curr() == TokenType.COMMA:
+                    self._safe_consume(TokenType.COMMA)
+                    attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
+            self._safe_consume(TokenType.RIGHT_PAREN)
 
         return tuple(dict.fromkeys(attrs))
 
-    def _parse_cimp(self) -> Derective_cimp:
-        self._safe_consume(t.CIMP)
-        parts = [self._parse_import_path_segment()]
-        while isinstance(self._lookup_curr(), t.DOUBLE_COLON):
-            self._safe_consume(t.DOUBLE_COLON)
-            parts.append(self._parse_import_path_segment())
-
-        if isinstance(self._lookup_curr(), t.SEMICOLON):
-            self._safe_consume(t.SEMICOLON)
-
-        if len(parts) < 2:
-            raise ValueError("Import must have module path and symbol: imp path::to::symbol")
-        return Derective_cimp(prefix=parts[:-1], symbol=parts[-1])
-
     def _parse_imp(self) -> Derective_imp:
-        self._safe_consume(t.IMP)
+        self._safe_consume(TokenType.KW_IMP)
         parts = [self._parse_import_path_segment()]
-        while isinstance(self._lookup_curr(), t.DOUBLE_COLON):
-            self._safe_consume(t.DOUBLE_COLON)
+        while self._lookup_curr() == TokenType.OP_SCOPE:
+            self._safe_consume(TokenType.OP_SCOPE)
             parts.append(self._parse_import_path_segment())
 
-        if isinstance(self._lookup_curr(), t.SEMICOLON):
-            self._safe_consume(t.SEMICOLON)
+        if self._lookup_curr() == TokenType.SEMICOLON:
+            self._safe_consume(TokenType.SEMICOLON)
 
         if len(parts) < 2:
             raise ValueError("Import must have module path and symbol: imp path::to::symbol")
         return Derective_imp(prefix=parts[:-1], symbol=parts[-1])
 
     def _parse_trait(self) -> Derective_trait:
-        self._safe_consume(t.TRAIT)
+        self._safe_consume(TokenType.KW_TRAIT)
         name = self._parse_name()
-        generics = self._parse_generics() if isinstance(self._lookup_curr(), t.LEFT_BRACKET) else []
-        bounds = self._parse_bounds() if isinstance(self._lookup_curr(), t.WHERE) else {}
+        generics = self._parse_generics() if self._lookup_curr() == TokenType.LEFT_BRACKET else []
+        bounds = self._parse_bounds() if self._lookup_curr() == TokenType.KW_WHERE else {}
 
         methods: list[TraitMethod] = []
-        self._safe_consume(t.LEFT_BRACE)
-        while not isinstance(self._lookup_curr(), t.RIGHT_BRACE):
+        self._safe_consume(TokenType.LEFT_BRACE)
+        while self._lookup_curr() != TokenType.RIGHT_BRACE:
             method = self._parse_fn_decl(with_body=False)
             methods.append(
                 TraitMethod(name=method.name, generics=method.generics, params=method.params, ret_type=method.ret_type)
             )
-        self._safe_consume(t.RIGHT_BRACE)
+        self._safe_consume(TokenType.RIGHT_BRACE)
 
         return Derective_trait(name=name, generics=generics, bounds=bounds, methods=methods)
 
     def _parse_impl(self) -> Derective_impl:
-        self._safe_consume(t.IMPL)
-        generics = self._parse_generics() if isinstance(self._lookup_curr(), t.LEFT_BRACKET) else []
+        self._safe_consume(TokenType.KW_IMPL)
+        generics = self._parse_generics() if self._lookup_curr() == TokenType.LEFT_BRACKET else []
         first_type = self._parse_type()
-        if isinstance(self._lookup_curr(), t.FOR):
+        if self._lookup_curr() == TokenType.KW_FOR:
             trait_name = first_type.name
             trait_args = first_type.generics
-            self._safe_consume(t.FOR)
+            self._safe_consume(TokenType.KW_FOR)
             for_type = self._parse_type()
         else:
             trait_name = None
             trait_args = []
             for_type = first_type
-        bounds = self._parse_bounds() if isinstance(self._lookup_curr(), t.WHERE) else {}
+        bounds = self._parse_bounds() if self._lookup_curr() == TokenType.KW_WHERE else {}
 
         methods: list[Derective_fn] = []
-        self._safe_consume(t.LEFT_BRACE)
-        while not isinstance(self._lookup_curr(), t.RIGHT_BRACE):
+        self._safe_consume(TokenType.LEFT_BRACE)
+        while self._lookup_curr() != TokenType.RIGHT_BRACE:
             method_attrs = self._parse_attrs()
             is_public = False
-            if isinstance(self._lookup_curr(), t.PUB):
-                self._safe_consume(t.PUB)
+            if self._lookup_curr() == TokenType.KW_PUB:
+                self._safe_consume(TokenType.KW_PUB)
                 is_public = True
             methods.append(self._parse_fn_decl(with_body=True, attrs=method_attrs, is_public=is_public))
-        self._safe_consume(t.RIGHT_BRACE)
+        self._safe_consume(TokenType.RIGHT_BRACE)
 
         return Derective_impl(
             trait_name=trait_name,
@@ -280,37 +262,37 @@ class Parser:
         )
 
     def _parse_enum(self) -> Derective_enum:
-        self._safe_consume(t.ENUM)
-        name = self._safe_consume(t.IDENTIFIER).string
+        self._safe_consume(TokenType.KW_ENUM)
+        name = self._safe_consume(TokenType.IDENTIFIER).value
 
-        generics = self._parse_generics() if isinstance(self._lookup_curr(), t.LEFT_BRACKET) else []
+        generics = self._parse_generics() if self._lookup_curr() == TokenType.LEFT_BRACKET else []
 
         variants = []
-        self._safe_consume(t.LEFT_BRACE)
-        while not isinstance(self._lookup_curr(), t.RIGHT_BRACE):
-            variant_name = self._safe_consume(t.IDENTIFIER).string
+        self._safe_consume(TokenType.LEFT_BRACE)
+        while self._lookup_curr() != TokenType.RIGHT_BRACE:
+            variant_name = self._safe_consume(TokenType.IDENTIFIER).value
             variant_type = None
-            if isinstance(self._lookup_curr(), t.LEFT_PAREN):
-                self._safe_consume(t.LEFT_PAREN)
-                if not isinstance(self._lookup_curr(), t.RIGHT_PAREN):
+            if self._lookup_curr() == TokenType.LEFT_PAREN:
+                self._safe_consume(TokenType.LEFT_PAREN)
+                if self._lookup_curr() != TokenType.RIGHT_PAREN:
                     variant_type = self._parse_type()
-                self._safe_consume(t.RIGHT_PAREN)
+                self._safe_consume(TokenType.RIGHT_PAREN)
             variants.append(EnumVariant(name=variant_name, type=variant_type))
-        self._safe_consume(t.RIGHT_BRACE)
+        self._safe_consume(TokenType.RIGHT_BRACE)
 
         return Derective_enum(name=name, generics=generics, variants=variants)
 
     def _parse_struct(self) -> Derective_struct:
-        self._safe_consume(t.STRUCT)
-        name = self._safe_consume(t.IDENTIFIER).string
+        self._safe_consume(TokenType.KW_STRUCT)
+        name = self._safe_consume(TokenType.IDENTIFIER).value
 
-        generics = self._parse_generics() if isinstance(self._lookup_curr(), t.LEFT_BRACKET) else []
+        generics = self._parse_generics() if self._lookup_curr() == TokenType.LEFT_BRACKET else []
 
         params = []
-        self._safe_consume(t.LEFT_BRACE)
-        while not isinstance(self._lookup_curr(), t.RIGHT_BRACE):
+        self._safe_consume(TokenType.LEFT_BRACE)
+        while self._lookup_curr() != TokenType.RIGHT_BRACE:
             params.append(self._parse_struct_field())
-        self._safe_consume(t.RIGHT_BRACE)
+        self._safe_consume(TokenType.RIGHT_BRACE)
 
         return Derective_struct(name=name, generics=generics, params=params)
 
@@ -318,7 +300,7 @@ class Parser:
         return self._parse_fn_decl(with_body=True)
 
     def _parse_extern_fn(self) -> Derective_fn:
-        self._safe_consume(t.EXTERN)
+        self._safe_consume(TokenType.EXTERN)
         return self._parse_fn_decl(with_body=False, is_extern=True)
 
     def _parse_fn_decl(
@@ -328,29 +310,28 @@ class Parser:
         attrs: tuple[str, ...] = (),
         is_public: bool = False,
     ) -> Derective_fn | Derective_extern_fn:
-        self._validate_attrs(attrs, "extern_fn" if is_extern else "fn")
-        self._safe_consume(t.FN)
+        self._safe_consume(TokenType.KW_FN)
         name = self._parse_callable_name()
-        generics = self._parse_generics() if isinstance(self._lookup_curr(), t.LEFT_BRACKET) else []
+        generics = self._parse_generics() if self._lookup_curr() == TokenType.LEFT_BRACKET else []
 
         params = []
-        self._safe_consume(t.LEFT_PAREN)
-        if not isinstance(self._lookup_curr(), t.RIGHT_PAREN):
+        self._safe_consume(TokenType.LEFT_PAREN)
+        if self._lookup_curr() != TokenType.RIGHT_PAREN:
             params.append(self._parse_param())
-            while not isinstance(self._lookup_curr(), t.RIGHT_PAREN):
-                self._safe_consume(t.COMMA)
+            while self._lookup_curr() != TokenType.RIGHT_PAREN:
+                self._safe_consume(TokenType.COMMA)
                 params.append(self._parse_param())
-        self._safe_consume(t.RIGHT_PAREN)
+        self._safe_consume(TokenType.RIGHT_PAREN)
 
-        self._safe_consume(t.ARROW)
+        self._safe_consume(TokenType.ARROW)
         ret_type = self._parse_type()
 
         body = []
         if with_body:
-            self._safe_consume(t.LEFT_BRACE)
-            while not isinstance(self._lookup_curr(), t.RIGHT_BRACE):
+            self._safe_consume(TokenType.LEFT_BRACE)
+            while self._lookup_curr() != TokenType.RIGHT_BRACE:
                 body.append(self._parse_block())
-            self._safe_consume(t.RIGHT_BRACE)
+            self._safe_consume(TokenType.RIGHT_BRACE)
         if is_extern:
             if len(generics) > 0:
                 raise ValueError(f"Extern function '{name}' cannot declare generics")
@@ -374,7 +355,7 @@ class Parser:
 
     def _parse_block(self) -> Block:
         name = self._parse_block_label()
-        self._safe_consume(t.COLON)
+        self._safe_consume(TokenType.COLON)
 
         body: list[Instruction] = []
 
@@ -385,377 +366,348 @@ class Parser:
 
     def _parse_instruction(self) -> Instruction | None:
         curr_token = self._lookup_curr()
-        if isinstance(curr_token, t.RET):
-            return self._parse_ret()
-        elif isinstance(curr_token, t.BR):
-            return self._parse_br()
-        elif isinstance(curr_token, t.CBR):
-            return self._parse_cbr()
-        elif isinstance(curr_token, t.MATCH):
-            return self._parse_match()
-        elif isinstance(curr_token, t.SWITCH):
-            return self._parse_switch()
-        elif isinstance(curr_token, t.PUT):
-            return self._parse_put()
-        elif isinstance(curr_token, t.STORE):
-            return self._parse_store()
-        elif isinstance(curr_token, t.SETFIELD):
-            return self._parse_setfield()
-        elif isinstance(curr_token, t.HFREE):
-            return self._parse_hfree()
+        match curr_token:
+            case TokenType.KW_RET:
+                return self._parse_ret()
+            case TokenType.KW_BR:
+                return self._parse_br()
+            case TokenType.KW_CBR:
+                return self._parse_cbr()
+            case TokenType.KW_MATCH:
+                return self._parse_match()
+            case TokenType.KW_SWITCH:
+                return self._parse_switch()
+            case TokenType.KW_PUT:
+                return self._parse_put()
+            case TokenType.KW_STORE:
+                return self._parse_store()
+            case TokenType.KW_SETFIELD:
+                return self._parse_setfield()
+            case TokenType.KW_HFREE:
+                return self._parse_hfree()
 
         next_token = self._lookup_next()
-        # Assign with typed / untyped variable
-        if isinstance(next_token, (t.COLON, t.EQUAL)):
+        if next_token == TokenType.COLON or next_token == TokenType.EQUAL:
             return self._parse_assignable()
 
     def _parse_hfree(self) -> Instruction_hfree:
-        self._safe_consume(t.HFREE)
+        self._safe_consume(TokenType.KW_HFREE)
         var = self._parse_variable()
         return Instruction_hfree(var=var)
 
     def _parse_put(self) -> Instruction_put:
-        self._safe_consume(t.PUT)
+        self._safe_consume(TokenType.KW_PUT)
         prim = self._parse_primitive()
-        self._safe_consume(t.COMMA)
+        self._safe_consume(TokenType.COMMA)
         var = self._parse_variable()
         return Instruction_put(var=var, primitive=prim)
 
     def _parse_store(self) -> Instruction_store:
-        self._safe_consume(t.STORE)
+        self._safe_consume(TokenType.KW_STORE)
         var_src = self._parse_variable()
-        self._safe_consume(t.COMMA)
+        self._safe_consume(TokenType.COMMA)
         var_dst = self._parse_variable()
         return Instruction_store(var_src=var_src, var_dst=var_dst)
 
     def _parse_setfield(self) -> Instruction_setfield:
-        self._safe_consume(t.SETFIELD)
+        self._safe_consume(TokenType.KW_SETFIELD)
         field, field_path = self._parse_field_path()
-        self._safe_consume(t.COMMA)
+        self._safe_consume(TokenType.COMMA)
         value = self._parse_variable()
         return Instruction_setfield(field=field, field_path=field_path, value=value)
 
     def _parse_br(self) -> Instruction_br:
-        self._safe_consume(t.BR)
+        self._safe_consume(TokenType.KW_BR)
         label = self._parse_block_label()
         return Instruction_br(label)
 
     def _parse_cbr(self) -> Instruction_cbr:
-        self._safe_consume(t.CBR)
+        self._safe_consume(TokenType.KW_CBR)
         cond = self._parse_variable()
-        self._safe_consume(t.COMMA)
+        self._safe_consume(TokenType.COMMA)
         true_br = self._parse_block_label()
-        self._safe_consume(t.COMMA)
+        self._safe_consume(TokenType.COMMA)
         else_br = self._parse_block_label()
 
         return Instruction_cbr(cond_var=cond, true_br_label=true_br, else_br_label=else_br)
 
     def _parse_switch(self) -> Instruction_switch:
-        self._safe_consume(t.SWITCH)
+        self._safe_consume(TokenType.KW_SWITCH)
         cond_var = self._parse_variable()
-        self._safe_consume(t.COMMA)
+        self._safe_consume(TokenType.COMMA)
         default_label = self._parse_block_label()
 
         cases = []
-        self._safe_consume(t.LEFT_BRACE)
-        while not isinstance(self._lookup_curr(), t.RIGHT_BRACE):
+        self._safe_consume(TokenType.LEFT_BRACE)
+        while self._lookup_curr() != TokenType.RIGHT_BRACE:
             val = self._parse_primitive()
-            self._safe_consume(t.BOLD_ARROW)
+            self._safe_consume(TokenType.BOLD_ARROW)
             label = self._parse_block_label()
             cases.append((val, label))
-        self._safe_consume(t.RIGHT_BRACE)
+        self._safe_consume(TokenType.RIGHT_BRACE)
         return Instruction_switch(cond_var=cond_var, default_case=default_label, cases=cases)
 
     def _parse_match(self) -> Instruction_match:
-        self._safe_consume(t.MATCH)
+        self._safe_consume(TokenType.MATCH)
         cond_var = self._parse_variable()
-        self._safe_consume(t.COMMA)
+        self._safe_consume(TokenType.COMMA)
         default_label = self._parse_block_label()
 
         cases: list[MatchCase] = []
-        self._safe_consume(t.LEFT_BRACE)
-        while not isinstance(self._lookup_curr(), t.RIGHT_BRACE):
-            variant = self._safe_consume(t.IDENTIFIER).string
+        self._safe_consume(TokenType.LEFT_BRACE)
+        while not isinstance(self._lookup_curr(), TokenType.RIGHT_BRACE):
+            variant = self._safe_consume(TokenType.IDENTIFIER).string
             payload_var = None
-            if isinstance(self._lookup_curr(), t.LEFT_PAREN):
-                self._safe_consume(t.LEFT_PAREN)
+            if isinstance(self._lookup_curr(), TokenType.LEFT_PAREN):
+                self._safe_consume(TokenType.LEFT_PAREN)
                 payload_var = self._parse_variable()
-                self._safe_consume(t.RIGHT_PAREN)
-            self._safe_consume(t.BOLD_ARROW)
+                self._safe_consume(TokenType.RIGHT_PAREN)
+            self._safe_consume(TokenType.BOLD_ARROW)
             label = self._parse_block_label()
             cases.append(MatchCase(variant=variant, label=label, payload_var=payload_var))
-        self._safe_consume(t.RIGHT_BRACE)
+        self._safe_consume(TokenType.RIGHT_BRACE)
         return Instruction_match(cond_var=cond_var, default_case=default_label, cases=cases)
 
     def _parse_ret(self) -> Instruction_ret:
-        self._safe_consume(t.RET)
+        self._safe_consume(TokenType.KW_RET)
         var = self._parse_variable()
         return Instruction_ret(var)
 
     def _parse_block_label(self) -> str:
-        self._safe_consume(t.DOLLAR)
-        return self._safe_consume(t.IDENTIFIER).string
+        self._safe_consume(TokenType.DOLLAR)
+        return self._safe_consume(TokenType.IDENTIFIER).value
 
     def _parse_assignable(self) -> Instruction:
         var = self._parse_variable()
-        self._safe_consume(t.EQUAL)
+        self._safe_consume(TokenType.EQUAL)
 
         curr_token = self._consume()
-        if isinstance(curr_token, t.CPOS):
-            primitive = self._parse_primitive()
-            return Instruction_cpos(var_out=var, primitive=primitive)
+        match curr_token:
+            case TokenType.KW_CAPPRIM:
+                primitive = self._parse_primitive()
+                return Instruction_capprim(var_out=var, primitive=primitive)
 
-        elif isinstance(curr_token, t.CENUM):
-            enum = self._parse_enum_init()
-            return Instruction_cenum(var_out=var, enum=enum)
+            case TokenType.KW_CAPENUM:
+                enum = self._parse_enum_init()
+                return Instruction_capenum(var_out=var, enum=enum)
 
-        elif isinstance(curr_token, t.CSTRUCT):
-            struct = self._parse_struct_init()
-            return Instruction_cstruct(var_out=var, struct=struct)
+            case TokenType.KW_CAPSTRUCT:
+                struct = self._parse_struct_init()
+                return Instruction_capstruct(var_out=var, struct=struct)
 
-        elif isinstance(curr_token, t.SCPOS):
-            primitive = self._parse_primitive()
-            return Instruction_scpos(var_out=var, primitive=primitive)
+            case TokenType.KW_WRAP:
+                variable = self._parse_variable()
+                return Instruction_wrap(var_out=var, variable=variable)
 
-        elif isinstance(curr_token, t.SCSOS):
-            struct = self._parse_struct_init()
-            return Instruction_scstruct(var_out=var, struct=struct)
+            case TokenType.KW_CALL | TokenType.KW_METHODCALL | TokenType.KW_UNSAFE:
+                is_unsafe = False
+                if curr_token == TokenType.KW_UNSAFE:
+                    self._consume()
+                    is_unsafe = True
+                fn_name = self._parse_callable_name()
+                generics = self._parse_generics() if self._lookup_curr() == TokenType.LEFT_BRACKET else []
 
-        elif isinstance(curr_token, t.CAPPRIM):
-            primitive = self._parse_primitive()
-            return Instruction_capprim(var_out=var, primitive=primitive)
-
-        elif isinstance(curr_token, t.CAPENUM):
-            enum = self._parse_enum_init()
-            return Instruction_capenum(var_out=var, enum=enum)
-
-        elif isinstance(curr_token, t.CAPSTRUCT):
-            struct = self._parse_struct_init()
-            return Instruction_capstruct(var_out=var, struct=struct)
-
-        elif isinstance(curr_token, t.WRAP):
-            variable = self._parse_variable()
-            return Instruction_wrap(var_out=var, variable=variable)
-
-        elif isinstance(curr_token, t.CALL) or isinstance(curr_token, t.UNSAFE):
-            is_unsafe = False
-            if isinstance(curr_token, t.UNSAFE):
-                curr_token = self._consume()
-                is_unsafe = True
-            fn_name = self._parse_callable_name()
-            generics = self._parse_generics() if isinstance(self._lookup_curr(), t.LEFT_BRACKET) else []
-
-            args = []
-            self._safe_consume(t.LEFT_PAREN)
-            if not isinstance(self._lookup_curr(), t.RIGHT_PAREN):
-                args.append(self._parse_variable())
-                while not isinstance(self._lookup_curr(), t.RIGHT_PAREN):
-                    self._safe_consume(t.COMMA)
+                args = []
+                self._safe_consume(TokenType.LEFT_PAREN)
+                if self._lookup_curr() != TokenType.RIGHT_PAREN:
                     args.append(self._parse_variable())
-            self._safe_consume(t.RIGHT_PAREN)
-            return Instruction_call(var_out=var, fn_name=fn_name, generics=generics, args=args, is_unsafe=is_unsafe)
+                    while self._lookup_curr() != TokenType.RIGHT_PAREN:
+                        self._safe_consume(TokenType.COMMA)
+                        args.append(self._parse_variable())
+                self._safe_consume(TokenType.RIGHT_PAREN)
+                return Instruction_call(var_out=var, fn_name=fn_name, generics=generics, args=args, is_unsafe=is_unsafe)
 
-        elif isinstance(curr_token, t.ADD):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_add(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_ADD:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_add(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.SUB):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_sub(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_SUB:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_sub(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.MUL):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_mul(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_MUL:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_mul(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.DIV):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_div(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_DIV:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_div(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.MOD):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_mod(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_MOD:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_mod(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.SHL):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_shl(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_SHL:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_shl(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.SHR):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_shr(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_SHR:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_shr(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.LES):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_les(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_LES:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_les(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.LEQ):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_leq(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_LEQ:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_leq(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.GRT):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_grt(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_GRT:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_grt(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.GEQ):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_geq(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_GEQ:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_geq(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.IEQ):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_ieq(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_IEQ:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_ieq(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.NEQ):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_neq(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_NEQ:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_neq(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.AND):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_and(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_AND:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_and(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.OR):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_or(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_OR:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_or(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.XOR):
-            lhs = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            rhs = self._parse_variable()
-            return Instruction_xor(var_out=var, lhs=lhs, rhs=rhs)
+            case TokenType.KW_XOR:
+                lhs = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                rhs = self._parse_variable()
+                return Instruction_xor(var_out=var, lhs=lhs, rhs=rhs)
 
-        elif isinstance(curr_token, t.PHI):
-            return self._parse_phi(var)
+            case TokenType.KW_SALLOC:
+                type = self._parse_type()
+                return Instruction_salloc(var_out=var, type=type)
 
-        elif isinstance(curr_token, t.SALLOC):
-            type = self._parse_type()
-            return Instruction_salloc(var_out=var, type=type)
+            case TokenType.KW_HALLOC:
+                type = self._parse_type()
+                return Instruction_halloc(var_out=var, type=type)
 
-        elif isinstance(curr_token, t.HALLOC):
-            type = self._parse_type()
-            return Instruction_halloc(var_out=var, type=type)
+            case TokenType.KW_HREALLOC:
+                var_src = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                count = self._parse_variable()
+                return Instruction_hrealloc(var_out=var, var=var_src, count=count)
 
-        elif isinstance(curr_token, t.HREALLOC):
-            var_src = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            count = self._parse_variable()
-            return Instruction_hrealloc(var_out=var, var=var_src, count=count)
+            case TokenType.KW_LOAD:
+                var_src = self._parse_variable()
+                return Instruction_load(var_out=var, var=var_src)
 
-        elif isinstance(curr_token, t.LOAD):
-            var_src = self._parse_variable()
-            return Instruction_load(var_out=var, var=var_src)
+            case TokenType.KW_PCAST:
+                var_src = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                type = self._parse_type()
+                return Instruction_pcast(var_out=var, var=var_src, type=type)
 
-        elif isinstance(curr_token, t.PCAST):
-            var_src = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            type = self._parse_type()
-            return Instruction_pcast(var_out=var, var=var_src, type=type)
+            case TokenType.KW_GETPTR:
+                var_src = self._parse_variable()
+                return Instruction_getptr(var_out=var, var=var_src)
 
-        elif isinstance(curr_token, t.GETPTR):
-            var_src = self._parse_variable()
-            return Instruction_getptr(var_out=var, var=var_src)
+            case TokenType.KW_GETFIELD:
+                field, field_path = self._parse_field_path()
+                return Instruction_getfield(var_out=var, field=field, field_path=field_path)
 
-        elif isinstance(curr_token, t.GETFIELD):
-            field, field_path = self._parse_field_path()
-            return Instruction_getfield(var_out=var, field=field, field_path=field_path)
+            case TokenType.KW_GETFIELDPTR:
+                field, field_path = self._parse_field_path()
+                return Instruction_getfieldptr(var_out=var, field=field, field_path=field_path)
 
-        elif isinstance(curr_token, t.GETFIELDPTR):
-            field, field_path = self._parse_field_path()
-            return Instruction_getfieldptr(var_out=var, field=field, field_path=field_path)
+            case TokenType.KW_GEP:
+                var_src = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                offset = self._parse_variable()
+                return Instruction_gep(var_out=var, var=var_src, offset=offset)
 
-        elif isinstance(curr_token, t.GEP):
-            var_src = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            offset = self._parse_variable()
-            return Instruction_gep(var_out=var, var=var_src, offset=offset)
+            case TokenType.KW_SGETFIELD:
+                var_src = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                field = self._parse_variable()
+                return Instruction_sgetfield(var_out=var, src=var_src, field=field)
 
-        elif isinstance(curr_token, t.SGETFIELD):
-            var_src = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            field = self._parse_variable()
-            return Instruction_sgetfield(var_out=var, src=var_src, field=field)
+            case TokenType.KW_SGETFIELDPTR:
+                var_src = self._parse_variable()
+                self._safe_consume(TokenType.COMMA)
+                field = self._parse_variable()
+                return Instruction_sgetfieldptr(var_out=var, src=var_src, field=field)
 
-        elif isinstance(curr_token, t.SGETFIELDPTR):
-            var_src = self._parse_variable()
-            self._safe_consume(t.COMMA)
-            field = self._parse_variable()
-            return Instruction_sgetfieldptr(var_out=var, src=var_src, field=field)
-
-        else:
-            raise ValueError(f"Unexpected token {curr_token}")
+            case _:
+                raise ValueError(f"Unexpected token {curr_token}")
 
     def _parse_struct_init(self) -> Struct:
         struct_as_type = self._parse_type()
         result = Struct(name=struct_as_type.name, generics=struct_as_type.generics, fields=[])
 
-        if not isinstance(self._lookup_curr(), t.LEFT_PAREN):
+        if self._lookup_curr() != TokenType.LEFT_PAREN:
             return result
 
-        self._safe_consume(t.LEFT_PAREN)
+        self._safe_consume(TokenType.LEFT_PAREN)
         fields = []
-        if not isinstance(self._lookup_curr(), t.RIGHT_PAREN):
+        if self._lookup_curr() != TokenType.RIGHT_PAREN:
             fields.append(self._parse_variable())
-        while not isinstance(self._lookup_curr(), t.RIGHT_PAREN):
-            self._safe_consume(t.COMMA)
+        while self._lookup_curr() != TokenType.RIGHT_PAREN:
+            self._safe_consume(TokenType.COMMA)
             fields.append(self._parse_variable())
-        self._safe_consume(t.RIGHT_PAREN)
+        self._safe_consume(TokenType.RIGHT_PAREN)
 
         result.fields = fields
         return result
 
     def _parse_enum_init(self) -> Enum:
         enum_as_type = self._parse_type()
-        self._safe_consume(t.DOUBLE_COLON)
+        self._safe_consume(TokenType.OP_SCOPE)
         variant = self._parse_struct_init()
         return Enum(name=enum_as_type.name, generics=enum_as_type.generics, variant=variant.name, payload=variant)
 
     def _parse_variable(self) -> Variable:
         name = self._parse_name()
         type = None
-        if isinstance(self._lookup_curr(), t.COLON):
-            colon = self._safe_consume(t.COLON)
-            # Be permissive for staged bootstrap dumps that can emit malformed
-            # placeholders like `name: :` for unsupported generic EHIR snippets.
-            while isinstance(self._lookup_curr(), t.COLON):
-                self._safe_consume(t.COLON)
-            curr = self._lookup_curr()
-            same_line = curr.line == colon.line
-            if same_line and isinstance(curr, (t.AMPERSAND, t.IDENTIFIER, t.LEFT_PAREN)):
-                type = self._parse_type()
+        if self._lookup_curr() == TokenType.COLON:
+            self._safe_consume(TokenType.COLON)
+            type = self._parse_type()
         return Variable(name, type)
 
     def _parse_field_path(self) -> tuple[Variable, list[Variable]]:
         head = self._parse_variable()
         tail: list[Variable] = []
-        while isinstance(self._lookup_curr(), t.GREATER):
-            self._safe_consume(t.GREATER)
+        while self._lookup_curr() == TokenType.GREATER:
+            self._safe_consume(TokenType.GREATER)
             tail.append(self._parse_variable())
         return head, tail
 
@@ -777,17 +729,17 @@ class Parser:
 
     def _parse_type(self) -> Type | PrimitiveType | Pointer:
         # Unit type syntax in staged EHIR: `()`
-        if isinstance(self._lookup_curr(), t.LEFT_PAREN):
-            self._safe_consume(t.LEFT_PAREN)
-            self._safe_consume(t.RIGHT_PAREN)
+        if self._lookup_curr() == TokenType.LEFT_PAREN:
+            self._safe_consume(TokenType.LEFT_PAREN)
+            self._safe_consume(TokenType.RIGHT_PAREN)
             return Type("void")
 
-        if isinstance(self._lookup_curr(), t.AMPERSAND):
-            self._safe_consume(t.AMPERSAND)
+        if self._lookup_curr() == TokenType.AMPERSAND:
+            self._safe_consume(TokenType.AMPERSAND)
             inner = self._parse_type()
             return Type("Box", [inner])
 
-        name = self._safe_consume(t.IDENTIFIER).string
+        name = self._safe_consume(TokenType.IDENTIFIER).value
 
         type = Type(name)
         if name == "usize":
@@ -808,9 +760,9 @@ class Parser:
             size = int(name[1:])
             type = Float_t(size=size)
 
-        type.generics = self._parse_generics() if isinstance(self._lookup_curr(), t.LEFT_BRACKET) else []
-        if isinstance(self._lookup_curr(), t.STAR):
-            self._safe_consume(t.STAR)
+        type.generics = self._parse_generics() if self._lookup_curr() == TokenType.LEFT_BRACKET else []
+        if self._lookup_curr() == TokenType.STAR:
+            self._safe_consume(TokenType.STAR)
             type = Pointer(type)
 
         return type
@@ -818,72 +770,44 @@ class Parser:
     def _parse_generics(self) -> list[Type]:
         generics = []
 
-        self._safe_consume(t.LEFT_BRACKET)
+        self._safe_consume(TokenType.LEFT_BRACKET)
         generics.append(self._parse_type())
-        while not isinstance(self._lookup_curr(), t.RIGHT_BRACKET):
-            self._safe_consume(t.COMMA)
+        while self._lookup_curr() != TokenType.RIGHT_BRACKET:
+            self._safe_consume(TokenType.COMMA)
             generics.append(self._parse_type())
-        self._safe_consume(t.RIGHT_BRACKET)
+        self._safe_consume(TokenType.RIGHT_BRACKET)
         return generics
 
     def _parse_bounds(self) -> dict[str, list[str]]:
         bounds: dict[str, list[str]] = {}
-        self._safe_consume(t.WHERE)
+        self._safe_consume(TokenType.KW_WHERE)
         while True:
             generic_name = self._parse_name()
-            self._safe_consume(t.COLON)
+            self._safe_consume(TokenType.COLON)
             traits = [self._parse_name()]
-            while isinstance(self._lookup_curr(), t.PLUS):
-                self._safe_consume(t.PLUS)
+            while isinstance(self._lookup_curr(), TokenType.PLUS):
+                self._safe_consume(TokenType.PLUS)
                 traits.append(self._parse_name())
             bounds[generic_name] = traits
-            if not isinstance(self._lookup_curr(), t.COMMA):
+            if not isinstance(self._lookup_curr(), TokenType.COMMA):
                 break
-            self._safe_consume(t.COMMA)
+            self._safe_consume(TokenType.COMMA)
         return bounds
 
     def _parse_name(self) -> str:
-        token = self._consume()
-        if not isinstance(
-            token,
-            (
-                t.UNKNOWN,
-                t.EOF,
-                t.LEFT_PAREN,
-                t.RIGHT_PAREN,
-                t.LEFT_BRACE,
-                t.RIGHT_BRACE,
-                t.LEFT_BRACKET,
-                t.RIGHT_BRACKET,
-                t.COMMA,
-                t.COLON,
-                t.SEMICOLON,
-                t.DOT,
-                t.DOLLAR,
-                t.DOUBLE_COLON,
-                t.ARROW,
-                t.BOLD_ARROW,
-                t.EQUAL,
-                t.LESS,
-                t.GREATER,
-                t.STAR,
-            ),
-        ):
-            return token.string
-        self._trace_unexpected_token(token, t.IDENTIFIER)
-        raise AssertionError("Unreachable")
+        return self._consume().value
 
     def _parse_import_path_segment(self) -> str:
-        if isinstance(self._lookup_curr(), t.STAR):
-            return self._consume().string
+        if self._lookup_curr() == TokenType.STAR:
+            return self._consume().value
         return self._parse_name()
 
     def _parse_callable_name(self) -> str:
         name = self._parse_name()
         name += self._parse_scoped_segment_generics()
 
-        while isinstance(self._lookup_curr(), t.DOUBLE_COLON):
-            self._safe_consume(t.DOUBLE_COLON)
+        while self._lookup_curr() == TokenType.OP_SCOPE:
+            self._safe_consume(TokenType.OP_SCOPE)
             segment = self._parse_name()
             segment += self._parse_scoped_segment_generics()
             name = f"{name}::{segment}"
@@ -891,12 +815,12 @@ class Parser:
         return name
 
     def _parse_scoped_segment_generics(self) -> str:
-        if not isinstance(self._lookup_curr(), t.LEFT_BRACKET):
+        if self._lookup_curr() != TokenType.LEFT_BRACKET:
             return ""
 
         saved = self._consumed
         generics = self._parse_generics()
-        if isinstance(self._lookup_curr(), t.DOUBLE_COLON):
+        if self._lookup_curr() == TokenType.OP_SCOPE:
             joined = ", ".join(str(generic) for generic in generics)
             return f"[{joined}]"
 
@@ -905,54 +829,54 @@ class Parser:
 
     def _parse_primitive(self) -> Primitive:
         sign = 1
-        if isinstance(self._lookup_curr(), t.MINUS):
-            self._safe_consume(t.MINUS)
+        if self._lookup_curr() == TokenType.MINUS:
+            self._safe_consume(TokenType.MINUS)
             sign = -1
 
         curr_token = self._consume()
-        if isinstance(curr_token, t.STRING):
-            if isinstance(self._lookup_curr(), t.IDENTIFIER) and self._lookup_curr().string == "_str":
+        if curr_token == TokenType.STRING:
+            if self._lookup_curr() == TokenType.IDENTIFIER and self._lookup_curr().value == "_str":
                 self._consume()
-            return Str(val=self._unescape_string_literal(curr_token.string[1:-1]))
+            return Str(val=self._unescape_string_literal(curr_token.value[1:-1]))
 
-        if isinstance(curr_token, t.CHAR):
-            raw = self._unescape_string_literal(curr_token.string[1:-1])
+        if curr_token == TokenType.CHAR:
+            raw = self._unescape_string_literal(curr_token.value[1:-1])
             return Char(val=raw)
 
-        if isinstance(curr_token, t.NUMBER):
-            suffix = self._safe_consume(t.IDENTIFIER).string
+        if curr_token == TokenType.NUMBER:
+            suffix = self._safe_consume(TokenType.IDENTIFIER).value
             if suffix == "_usize":
-                return Usize(val=int(curr_token.string) * sign)
+                return Usize(val=int(curr_token.value) * sign)
             if suffix.startswith("_u"):
                 size = int(suffix[2:])
-                return Usize(val=int(curr_token.string) * sign, size=size)
+                return Usize(val=int(curr_token.value) * sign, size=size)
             if suffix == "_isize":
-                return Isize(val=int(curr_token.string) * sign)
+                return Isize(val=int(curr_token.value) * sign)
             if suffix.startswith("_i"):
                 size = int(suffix[2:])
-                return Isize(val=int(curr_token.string) * sign, size=size)
+                return Isize(val=int(curr_token.value) * sign, size=size)
             if suffix.startswith("_f"):
                 size = int(suffix[2:])
-                return Float(val=float(f"{'-' if sign < 0 else ''}{curr_token.string}"), size=size)
+                return Float(val=float(f"{'-' if sign < 0 else ''}{curr_token.value}"), size=size)
             raise ValueError(f"Invalid primitive suffix: {suffix}")
         raise ValueError(f"Expected primitive literal, got {curr_token}")
 
     def _unescape_string_literal(self, string: str) -> str:
         return bytes(string, "utf-8").decode("unicode_escape")
 
-    def _lookup_curr(self) -> t.Token:
-        return t.EOF("", 0, 0) if self._is_at_end(0) else self._tokens[self._consumed + 0]
+    def _lookup_curr(self) -> Token:
+        return self._eof() if self._is_at_end(0) else self._tokens[self._consumed + 0]
 
-    def _lookup_next(self) -> t.Token:
-        return t.EOF("", 0, 0) if self._is_at_end(1) else self._tokens[self._consumed + 1]
+    def _lookup_next(self) -> Token:
+        return self._eof() if self._is_at_end(1) else self._tokens[self._consumed + 1]
 
-    def _safe_consume(self, expected: type[t.Token]) -> t.Token:
+    def _safe_consume(self, expected: TokenType) -> Token:
         current_token = self._consume()
-        if not isinstance(current_token, expected):
+        if current_token.type != expected:
             self._trace_unexpected_token(current_token, expected)
         return current_token
 
-    def _consume(self) -> t.Token:
+    def _consume(self) -> Token:
         current_token = self._lookup_curr()
         self._consumed += 1
         return current_token
@@ -960,5 +884,8 @@ class Parser:
     def _is_at_end(self, n: int = 0) -> bool:
         return self._consumed + n >= len(self._tokens)
 
-    def _trace_unexpected_token(self, token: t.Token, expected_t: type[t.Token]):
+    def _eof(self) -> Token:
+        return Token(TokenType.EOF, "", 0, 0)
+
+    def _trace_unexpected_token(self, token: Token, expected_t: TokenType):
         raise ValueError(f"Unexpected token: {token}. Expected: {expected_t}")
