@@ -9,12 +9,12 @@ from ehir.core.variable import Variable
 class Struct:
     name: str
     generics: list[Type] = field(default_factory=list)
-    args: list[Variable] = field(default_factory=list)
+    fields: list[Variable] = field(default_factory=list)
     value: Variable | None = None
     type: Type | None = None
 
     def __post_init__(self):
-        if self.value is not None and self.args:
+        if self.value is not None and self.fields:
             raise ValueError("Struct cannot have both args and captured value")
 
     def as_type(self) -> Type:
@@ -30,5 +30,5 @@ class Struct:
         type_repr = str(self.as_type())
         if self.value is not None:
             return f"{type_repr}(<- {self.value})"
-        params_repr = ", ".join(str(p) for p in self.args)
+        params_repr = ", ".join(str(p) for p in self.fields)
         return f"{type_repr}({params_repr})"

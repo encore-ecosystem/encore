@@ -1,4 +1,12 @@
-from .arithmetic import Instruction_add, Instruction_div, Instruction_mod, Instruction_mul, Instruction_shl, Instruction_shr, Instruction_sub
+from .arithmetic import (
+    Instruction_add,
+    Instruction_div,
+    Instruction_mod,
+    Instruction_mul,
+    Instruction_shl,
+    Instruction_shr,
+    Instruction_sub,
+)
 from .br import Instruction_br
 from .call import Instruction_call
 from .capenum import Instruction_capenum
@@ -36,6 +44,7 @@ from .sgetfield import Instruction_sgetfield
 from .sgetfieldptr import Instruction_sgetfieldptr
 from .store import Instruction_store
 from .switch import Instruction_switch
+from .wrap import Instruction_wrap
 
 __all__ = [
     "BinOp",
@@ -91,4 +100,5 @@ __all__ = [
     "Instruction_xor",
     "MatchCase",
     "PhiPair",
+    "Instruction_wrap",
 ]

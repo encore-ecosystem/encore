@@ -13,7 +13,6 @@ from ehir.core.derectives import (
 )
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum, EnumVariant
-from ehir.core.instructions.base import Instruction
 from ehir.core.instructions import (
     Instruction_add,
     Instruction_and,
@@ -59,10 +58,12 @@ from ehir.core.instructions import (
     Instruction_store,
     Instruction_sub,
     Instruction_switch,
+    Instruction_wrap,
     Instruction_xor,
     MatchCase,
     PhiPair,
 )
+from ehir.core.instructions.base import Instruction
 from ehir.core.primitives import Char, Char_t, Float, Float_t, Isize, Isize_t, Str, Str_t, Usize, Usize_t
 from ehir.core.primitives.base import Primitive, PrimitiveType
 from ehir.core.struct import Struct
@@ -83,10 +84,11 @@ class Parser:
         self._consumed = 0
 
     def parse(self, source_code: str) -> list[Derective]:
+        self._sc = source_code
         self._ast.clear()
         self._tokens = self._lexer.tokenize(source_code)
         self._consumed = 0
-        # print(*self._tokens, sep="\n")
+
         while not self._is_at_end():
             attrs = self._parse_attrs()
             current_token = self._lookup_curr()
@@ -428,12 +430,10 @@ class Parser:
 
     def _parse_setfield(self) -> Instruction_setfield:
         self._safe_consume(t.SETFIELD)
-        var = self._parse_variable()
-        self._safe_consume(t.COMMA)
         field, field_path = self._parse_field_path()
         self._safe_consume(t.COMMA)
         value = self._parse_variable()
-        return Instruction_setfield(var=var, field=field, field_path=field_path, value=value)
+        return Instruction_setfield(field=field, field_path=field_path, value=value)
 
     def _parse_br(self) -> Instruction_br:
         self._safe_consume(t.BR)
@@ -532,6 +532,10 @@ class Parser:
         elif isinstance(curr_token, t.CAPSTRUCT):
             struct = self._parse_struct_init()
             return Instruction_capstruct(var_out=var, struct=struct)
+
+        elif isinstance(curr_token, t.WRAP):
+            variable = self._parse_variable()
+            return Instruction_wrap(var_out=var, variable=variable)
 
         elif isinstance(curr_token, t.CALL) or isinstance(curr_token, t.UNSAFE):
             is_unsafe = False
@@ -679,16 +683,12 @@ class Parser:
             return Instruction_getptr(var_out=var, var=var_src)
 
         elif isinstance(curr_token, t.GETFIELD):
-            var_src = self._parse_variable()
-            self._safe_consume(t.COMMA)
             field, field_path = self._parse_field_path()
-            return Instruction_getfield(var_out=var, src=var_src, field=field, field_path=field_path)
+            return Instruction_getfield(var_out=var, field=field, field_path=field_path)
 
         elif isinstance(curr_token, t.GETFIELDPTR):
-            var_src = self._parse_variable()
-            self._safe_consume(t.COMMA)
             field, field_path = self._parse_field_path()
-            return Instruction_getfieldptr(var_out=var, src=var_src, field=field, field_path=field_path)
+            return Instruction_getfieldptr(var_out=var, field=field, field_path=field_path)
 
         elif isinstance(curr_token, t.GEP):
             var_src = self._parse_variable()
@@ -711,53 +711,30 @@ class Parser:
         else:
             raise ValueError(f"Unexpected token {curr_token}")
 
-    def _parse_phi(self, var: Variable) -> Instruction_phi:
-        args: list[PhiPair] = []
-
-        def parse_phi_arg() -> PhiPair:
-            var_src = self._parse_variable()
-            label = self._parse_block_label()
-            return PhiPair(var_src, label)
-
-        args.append(parse_phi_arg())
-
-        while isinstance(self._lookup_curr(), t.COMMA):
-            self._safe_consume(t.COMMA)
-            args.append(parse_phi_arg())
-
-        return Instruction_phi(var_out=var, args=args)
-
     def _parse_struct_init(self) -> Struct:
         struct_as_type = self._parse_type()
-        params = []
+        result = Struct(name=struct_as_type.name, generics=struct_as_type.generics, fields=[])
+
+        if not isinstance(self._lookup_curr(), t.LEFT_PAREN):
+            return result
+
         self._safe_consume(t.LEFT_PAREN)
+        fields = []
         if not isinstance(self._lookup_curr(), t.RIGHT_PAREN):
-            params.append(self._parse_variable())
-            while not isinstance(self._lookup_curr(), t.RIGHT_PAREN):
-                self._safe_consume(t.COMMA)
-                params.append(self._parse_variable())
+            fields.append(self._parse_variable())
+        while not isinstance(self._lookup_curr(), t.RIGHT_PAREN):
+            self._safe_consume(t.COMMA)
+            fields.append(self._parse_variable())
         self._safe_consume(t.RIGHT_PAREN)
-        return Struct(name=struct_as_type.name, generics=struct_as_type.generics, args=params)
+
+        result.fields = fields
+        return result
 
     def _parse_enum_init(self) -> Enum:
         enum_as_type = self._parse_type()
         self._safe_consume(t.DOUBLE_COLON)
-        variant = self._safe_consume(t.IDENTIFIER).string
-        self._safe_consume(t.LEFT_PAREN)
-        payload = None
-        if not isinstance(self._lookup_curr(), t.RIGHT_PAREN):
-            if isinstance(self._lookup_next(), (t.LEFT_PAREN, t.LEFT_BRACKET, t.LESS)):
-                payload = self._parse_struct_init()
-            else:
-                payload_var = self._parse_variable()
-                payload_type = payload_var.type
-                payload = Struct(
-                    name=payload_type.name if payload_type is not None else "_",
-                    value=payload_var,
-                    type=payload_type,
-                )
-        self._safe_consume(t.RIGHT_PAREN)
-        return Enum(name=enum_as_type.name, generics=enum_as_type.generics, variant=variant, payload=payload)
+        variant = self._parse_struct_init()
+        return Enum(name=enum_as_type.name, generics=enum_as_type.generics, variant=variant.name, payload=variant)
 
     def _parse_variable(self) -> Variable:
         name = self._parse_name()
@@ -775,11 +752,11 @@ class Parser:
         return Variable(name, type)
 
     def _parse_field_path(self) -> tuple[Variable, list[Variable]]:
-        head = Variable(self._parse_name())
+        head = self._parse_variable()
         tail: list[Variable] = []
-        while isinstance(self._lookup_curr(), t.DOUBLE_COLON):
-            self._safe_consume(t.DOUBLE_COLON)
-            tail.append(Variable(self._parse_name()))
+        while isinstance(self._lookup_curr(), t.GREATER):
+            self._safe_consume(t.GREATER)
+            tail.append(self._parse_variable())
         return head, tail
 
     def _parse_param(self) -> Parameter:

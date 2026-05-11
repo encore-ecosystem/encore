@@ -1,5 +1,6 @@
 from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass
+from typing import Optional
 
 from ehir.core.derectives import (
     Derective_enum,
@@ -54,8 +55,8 @@ from ehir.core.instructions import (
     Instruction_sub,
     Instruction_switch,
 )
-from ehir.core.instructions.base import Assignable
 from ehir.core.instructions.arithmetic import Instruction_div
+from ehir.core.instructions.base import Assignable
 from ehir.core.primitives import Char_t, Float_t, Isize_t, Str_t, Usize_t
 from ehir.core.primitives.base import PrimitiveType
 from ehir.core.type import Pointer, Type, box_pointee, is_box_type
@@ -71,6 +72,7 @@ _BOOLEAN_INSTRUCTS = (
     Instruction_neq,  # why it is logic?
 )
 
+
 @dataclass
 class _ImplMethodRef:
     trait_name: str | None
@@ -81,71 +83,79 @@ class _ImplMethodRef:
     fn_name: str
 
 
+@dataclass
+class VariableDatabase:
+    """
+    Stores all variables in the memory
+    """
+
+    def store(self, variable: Variable) -> Variable: ...
+
+    def store_check(self, variable: Variable): ...
+
+
 class Resolver:
     fn: dict[str, Derective_fn | Derective_extern_fn]
     enums: dict[str, Derective_enum]
     structs: dict[str, Derective_struct]
     traits: dict[str, Derective_trait]
     impls: list[Derective_impl]
-    impl_method_refs: list[_ImplMethodRef]
-    concrete_struct_origins: dict[str, tuple[str, list[Type]]]
-    concrete_enum_origins: dict[str, tuple[str, list[Type]]]
-    fn_owner_types: dict[str, Type]
-    type_aliases: dict[str, Type]
 
     def run(self, ast: list[Derective]) -> list[Derective]:
+        """
+        Steps:
+            1. Collect all sources of truth (all declarations)
+            2. Resolve types in functions
+        """
+
+        # 1.
         self.fn = {}
         self.enums = {}
         self.structs = {}
         self.traits = {}
         self.impls = []
-        self.impl_method_refs = []
-        self.concrete_struct_origins = {}
-        self.concrete_enum_origins = {}
-        self.fn_owner_types = {}
-        self.type_aliases = {}
-        base_function_names: set[str] = set()
 
         for derective in ast:
             if isinstance(derective, (Derective_fn, Derective_extern_fn)):
                 self.fn[derective.name] = derective
-                base_function_names.add(derective.name)
             elif isinstance(derective, Derective_enum):
                 self.enums[derective.name] = derective
             elif isinstance(derective, Derective_struct):
                 self.structs[derective.name] = derective
             elif isinstance(derective, Derective_trait):
                 self.traits[derective.name] = derective
-            elif isinstance(derective, Derective_typealias):
-                self.type_aliases[derective.name] = deepcopy(derective.target)
+            # elif isinstance(derective, Derective_typealias):
+            #     self.type_aliases[derective.name] = deepcopy(derective.target)
             elif isinstance(derective, Derective_impl):
                 self.impls.append(derective)
 
-        self._rebuild_concrete_origins()
-
-        for impl in self.impls:
-            self._register_impl(impl)
-
-        for struct in list(self.structs.values()):
-            self._rewrite_types(struct.params, {})
-
-        for enum in list(self.enums.values()):
-            self._rewrite_types(enum.variants, {})
-
+        # 2.
         for fn in list(self.fn.values()):
             if isinstance(fn, Derective_extern_fn):
                 continue
             self._resolve(fn)
 
+        # self._rebuild_concrete_origins()
+
+        # for impl in self.impls:
+        #     self._register_impl(impl)
+
+        # for struct in list(self.structs.values()):
+        #     self._rewrite_types(struct.params, {})
+
+        # for enum in list(self.enums.values()):
+        #     self._rewrite_types(enum.variants, {})
+
+        # for fn in list(self.fn.values()):
+        #     if isinstance(fn, Derective_extern_fn):
+        #         continue
+        #     self._resolve(fn)
+
         base_enum_ast_names = {x.name for x in ast if isinstance(x, Derective_enum)}
         base_struct_ast_names = {x.name for x in ast if isinstance(x, Derective_struct)}
         new_enums = [e for e in self.enums if e not in base_enum_ast_names]
         new_structs = [s for s in self.structs if s not in base_struct_ast_names]
-        new_functions = [
-            f
-            for f in self.fn
-            if f not in base_function_names and not getattr(self.fn[f], "generics", [])
-        ]
+        new_functions = [f for f in self.fn if f not in base_function_names and not getattr(self.fn[f], "generics", [])]
         new_ast = []
 
         for derective in new_enums:
@@ -340,7 +350,9 @@ class Resolver:
                         instr.fn_name = same_basename[0]
                     elif len(same_basename) > 1:
                         by_arity = [
-                            name for name in same_basename if len(getattr(self.fn[name], "params", [])) == len(instr.args)
+                            name
+                            for name in same_basename
+                            if len(getattr(self.fn[name], "params", [])) == len(instr.args)
                         ]
                         if len(by_arity) == 1:
                             instr.fn_name = by_arity[0]
@@ -930,7 +942,9 @@ class Resolver:
                         seen_variants.add(case.variant)
                         expected_payload_type = next(
                             variant.type
-                            for variant in self._get_enum_variants(instr.cond_var.type.name, instr.cond_var.type.generics)
+                            for variant in self._get_enum_variants(
+                                instr.cond_var.type.name, instr.cond_var.type.generics
+                            )
                             if variant.name == case.variant
                         )
                         if case.payload_var is not None:
@@ -1198,6 +1212,41 @@ class Resolver:
         raise TypeError(f"Unknown composite type '{type_name}'")
 
     def _resolve_enum_payload(self, enum: Enum):
+        """
+        Steps:
+            1. Get corresponding enum declaration as a truth source
+            2. Resolve generics if they may occure here
+        """
+
+        # 1
+        enum_declaration = self.enums.get(enum.name, None)
+        if enum_declaration is None:
+            raise RuntimeError(f"Unable to find corresponding enum declaration: {enum.name}")
+
+        # 2
+        if enum.payload is None:
+            raise NotImplementedError
+
+        declared_payload = None
+        for variant in enum_declaration.variants:
+            if variant.name == enum.payload.name:
+                declared_payload = variant
+
+        if declared_payload is None:
+            raise RuntimeError(f"Unable to find payload {enum.payload.name} in enum {enum.name}")
+
+        generics_mapping: dict[str, Type] = {}
+        for arg in enum.payload.fields:
+            if not isinstance(arg, TypedVariable):
+                raise RuntimeError(f"Found untyped argument: {arg}")
+
+            print(52, arg.type)
+
+        # if len(enum.payload.fields) != len(enum_declaration.)
+
+        current_generics = enum.generics
+        target_generics = enum_declaration.generics
+
         variants = self._get_enum_variants(enum.name, enum.generics)
         for variant_index, variant in enumerate(variants):
             if variant.name != enum.variant:
@@ -1211,6 +1260,7 @@ class Resolver:
             if variant.type is None:
                 raise TypeError(f"Enum variant '{enum.variant}' must not have payload")
 
+            print(variant.type, enum)
             if enum.payload.value is None:
                 enum.payload = self._resolve_struct(enum.payload)
             else:
@@ -1256,6 +1306,17 @@ class Resolver:
         if is_box_type(recv_type):
             recv_type_variants.append(box_pointee(recv_type))
 
+        print([x.for_type.name for x in self.impls])
+
+        for impl in self.impls:
+            if impl.for_type.name != trait_name:
+                continue
+            for method in impl.methods:
+                if method.name != method_name:
+                    continue
+                print(1, method)
+
+        print(trait_name, method_name, self.impls[1].for_type)
         for ref in self.impl_method_refs:
             if ref.method_name != method_name:
                 continue
@@ -1371,7 +1432,9 @@ class Resolver:
                     continue
                 if arg.type is None:
                     continue
-                expected_param_type = template_owner if param.type.name == "Self" and not param.type.generics else param.type
+                expected_param_type = (
+                    template_owner if param.type.name == "Self" and not param.type.generics else param.type
+                )
                 if not self._match_type_template(expected_param_type, arg.type, generic_names, mapping):
                     params_match = False
                     break
@@ -1422,10 +1485,12 @@ class Resolver:
         if isinstance(typ, Pointer):
             return Pointer(self._canonicalize_type(typ.pointee))
 
-        if typ.name in self.concrete_struct_origins:
-            base_name, generics = self.concrete_struct_origins[typ.name]
-            return Type(base_name, [self._canonicalize_type(generic) for generic in generics])
-        if typ.name in self.concrete_enum_origins:
+        if typ.name in self.structs:
+            target_struct = self.structs[typ.name]
+            return Type(target_struct.name, [self._canonicalize_type(generic) for generic in target_struct.generics])
+        if typ.name in self.enums:
+            target_enum = self.enums[typ.name]
+            raise NotImplementedError
             base_name, generics = self.concrete_enum_origins[typ.name]
             return Type(base_name, [self._canonicalize_type(generic) for generic in generics])
 

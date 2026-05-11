@@ -203,6 +203,8 @@ class Lexer:
                 self._append_token(t.CAPENUM)
             case "capstruct":
                 self._append_token(t.CAPSTRUCT)
+            case "wrap":
+                self._append_token(t.WRAP)
             case "pcast":
                 self._append_token(t.PCAST)
             case "getptr":
