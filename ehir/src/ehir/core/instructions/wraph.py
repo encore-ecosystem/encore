@@ -5,8 +5,8 @@ from ehir.core.variable import Variable
 
 
 @dataclass
-class Instruction_wrap(Assignable):
+class Instruction_wraph(Assignable):
     variable: Variable
 
     def __str__(self) -> str:
-        return f"{super().__str__()}wrap {self.variable}"
+        return f"{super().__str__()}wraph {self.variable}"

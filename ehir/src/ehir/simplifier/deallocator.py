@@ -24,7 +24,6 @@ from ehir.core.instructions import (
     Instruction_hrealloc,
     Instruction_load,
     Instruction_match,
-    Instruction_phi,
     Instruction_pcast,
     Instruction_ret,
     Instruction_salloc,
@@ -34,11 +33,13 @@ from ehir.core.instructions import (
     Instruction_sgetfieldptr,
     Instruction_store,
     Instruction_switch,
+    Instruction_wraph,
+    Instruction_wraps,
 )
 from ehir.core.instructions.base import Assignable
 from ehir.core.type import Type
 from ehir.core.variable import TypedVariable, Variable
-from ehir.simplifier.drop_helper import needs_drop
+from ehir.simplifier.drop_helper import collect_aggregate_names, needs_drop
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 SKIPABLE = (
@@ -65,13 +66,29 @@ class Deallocator:
     _aggregate_names: set[str]
 
     def run(self, ast: list[Derective]) -> list[Derective]:
-        self._aggregate_names = {
-            directive.name for directive in ast if isinstance(directive, (Derective_struct, Derective_enum))
+        structs = {
+            directive.name: directive
+            for directive in ast
+            if isinstance(directive, Derective_struct) and not directive.generics
         }
+        enums = {
+            directive.name: directive
+            for directive in ast
+            if isinstance(directive, Derective_enum) and not directive.generics
+        }
+        self._aggregate_names = collect_aggregate_names(structs, enums)
         for derective in ast:
-            if isinstance(derective, Normalized_fn) and not derective.name.startswith("__retain_"):
+            if isinstance(derective, Normalized_fn) and not self._is_runtime_memory_fn(derective.name):
                 self._place_cfree(derective)
         return ast
+
+    def _is_runtime_memory_fn(self, name: str) -> bool:
+        return (
+            name.startswith("__Box_")
+            or name.startswith("__drop_")
+            or name.startswith("__retain_")
+            or name.startswith("__cfree")
+        )
 
     def _place_cfree(self, fn: Normalized_fn):
         self._usages = {}
@@ -180,12 +197,15 @@ class Deallocator:
             else:
                 dealloc_block = name2block[least_shared_node]
 
+            var_def = self._variables[var]
+            if var_def.type is None:
+                continue
             dealloc_block.body.append(
                 Instruction_call(
                     var_out=TypedVariable(name=f".drop_{var}", type=Type("void")),
                     fn_name="Drop::drop",
-                    generics=[deepcopy(generic) for generic in self._variables[var].type.generics],
-                    args=[TypedVariable(self._variables[var].name, self._variables[var].type)],
+                    generics=[deepcopy(generic) for generic in var_def.type.generics],
+                    args=[TypedVariable(var_def.name, var_def.type)],
                 )
             )
 
@@ -222,13 +242,25 @@ class Deallocator:
         return all_paths
 
     def _add_variable_usage(self, var: Variable):
-        self._variables[var.name] = var
+        if cached := self._variables.get(var.name):
+            if cached.type is None and var.type is not None:
+                self._variables[var.name] = var
+            else:
+                var = cached
+        else:
+            self._variables[var.name] = var
 
         if var.type is not None and needs_drop(var.type, self._aggregate_names):
             self._usages[var.name] = self._usages.get(var.name, set()) | {self._curr_block}
 
     def _add_variable_capture(self, var: Variable):
-        self._variables[var.name] = var
+        if cached := self._variables.get(var.name):
+            if cached.type is None and var.type is not None:
+                self._variables[var.name] = var
+            else:
+                var = cached
+        else:
+            self._variables[var.name] = var
 
         if var.name not in self._arg_names and var.type is not None and needs_drop(var.type, self._aggregate_names):
             self._captures[var.name] = self._curr_block
@@ -274,19 +306,13 @@ class Deallocator:
                     Instruction_scstruct,
                     Instruction_cstruct,
                     Instruction_capstruct,
-                    Instruction_cenum,
-                    Instruction_capenum,
                 ),
             ):
-                if hasattr(instr, "struct"):
-                    args = [instr.struct.value] if instr.struct.value is not None else instr.struct.args
-                elif instr.enum.payload is not None:
-                    args = (
-                        [instr.enum.payload.value] if instr.enum.payload.value is not None else instr.enum.payload.args
-                    )
-                else:
-                    args = []
+                args = [instr.struct.value] if instr.struct.value is not None else instr.struct.fields
                 for arg in args:
+                    self._add_variable_usage(arg)
+            elif isinstance(instr, (Instruction_cenum, Instruction_capenum)):
+                for arg in instr.enum.args:
                     self._add_variable_usage(arg)
             elif isinstance(instr, Instruction_hfree):
                 self._add_variable_usage(instr.var)
@@ -295,11 +321,10 @@ class Deallocator:
             elif isinstance(instr, Instruction_call):
                 for arg in instr.args:
                     self._add_variable_usage(arg)
+            elif isinstance(instr, (Instruction_wraps, Instruction_wraph)):
+                self._add_variable_usage(instr.variable)
             elif isinstance(instr, BinOp):
                 self._add_variable_usage(instr.lhs)
                 self._add_variable_usage(instr.rhs)
-            elif isinstance(instr, Instruction_phi):
-                for arg in instr.args:
-                    self._add_variable_usage(arg.var)
             else:
                 raise NotImplementedError(f"Variable usage not define for {instr}")

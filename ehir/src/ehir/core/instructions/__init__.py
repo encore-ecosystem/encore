@@ -32,7 +32,6 @@ from .logic import Instruction_and, Instruction_ieq, Instruction_neq, Instructio
 from .match import Instruction_match, MatchCase
 from .operator_base import BinOp
 from .pcast import Instruction_pcast
-from .phi import Instruction_phi, PhiPair
 from .pload import Instruction_pload
 from .put import Instruction_put
 from .ret import Instruction_ret
@@ -44,7 +43,8 @@ from .sgetfield import Instruction_sgetfield
 from .sgetfieldptr import Instruction_sgetfieldptr
 from .store import Instruction_store
 from .switch import Instruction_switch
-from .wrap import Instruction_wrap
+from .wraph import Instruction_wraph
+from .wraps import Instruction_wraps
 
 __all__ = [
     "BinOp",
@@ -82,7 +82,6 @@ __all__ = [
     "Instruction_neq",
     "Instruction_or",
     "Instruction_pcast",
-    "Instruction_phi",
     "Instruction_pload",
     "Instruction_put",
     "Instruction_ret",
@@ -99,6 +98,6 @@ __all__ = [
     "Instruction_switch",
     "Instruction_xor",
     "MatchCase",
-    "PhiPair",
-    "Instruction_wrap",
+    "Instruction_wraps",
+    "Instruction_wraph",
 ]

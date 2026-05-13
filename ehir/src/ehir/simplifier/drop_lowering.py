@@ -5,19 +5,25 @@ from ehir.core.derectives import Derective_enum, Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import Instruction_call, Instruction_cfree
 from ehir.core.instructions.base import Instruction
-from ehir.core.type import Type
+from ehir.core.type import Type, is_box_type
 from ehir.core.variable import TypedVariable
-from ehir.simplifier.drop_helper import drop_function_name, needs_drop
+from ehir.simplifier.drop_helper import collect_aggregate_names, drop_function_name, needs_drop
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 
 class DropLoweringPass:
     def run(self, ast: list[Derective]) -> list[Derective]:
-        self._aggregate_names = {
-            directive.name
+        structs = {
+            directive.name: directive
             for directive in ast
-            if isinstance(directive, (Derective_struct, Derective_enum))
+            if isinstance(directive, Derective_struct) and not directive.generics
         }
+        enums = {
+            directive.name: directive
+            for directive in ast
+            if isinstance(directive, Derective_enum) and not directive.generics
+        }
+        self._aggregate_names = collect_aggregate_names(structs, enums)
         self._drop_functions = {
             directive.name
             for directive in ast
@@ -54,6 +60,12 @@ class DropLoweringPass:
 
         fn_name = drop_function_name(var.type)
         if fn_name not in self._drop_functions:
+            if is_box_type(var.type):
+                return []
+            # Generic aggregate specializations may not have a synthesized concrete drop yet.
+            # Keep compilation progressing; dedicated drop synthesis for these types is handled separately.
+            if var.type.generics:
+                return []
             raise TypeError(f"Unknown concrete drop function '{fn_name}' for type '{var.type}'")
         return [
             Instruction_call(

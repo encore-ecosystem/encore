@@ -27,7 +27,6 @@ from ehir.core.instructions import (
     Instruction_neq,
     Instruction_or,
     Instruction_pcast,
-    Instruction_phi,
     Instruction_put,
     Instruction_ret,
     Instruction_salloc,
@@ -38,8 +37,8 @@ from ehir.core.instructions import (
     Instruction_switch,
     Instruction_xor,
 )
-from ehir.core.instructions.base import Instruction
 from ehir.core.instructions.arithmetic import Instruction_div
+from ehir.core.instructions.base import Instruction
 from ehir.core.variable import TypedVariable
 from ehir.postprocessor.instructions import (
     ProcessedControlFlow,
@@ -50,8 +49,8 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_call,
     ProcessedInstruction_cbr,
     ProcessedInstruction_div,
-    ProcessedInstruction_geq,
     ProcessedInstruction_gep,
+    ProcessedInstruction_geq,
     ProcessedInstruction_getfieldptr,
     ProcessedInstruction_grt,
     ProcessedInstruction_halloc,
@@ -91,9 +90,7 @@ from .derectives import (
 class Postprocessor:
     def run(self, raw_mod: EHIR_Module) -> ProcessedModule:
         self._known_type_suffixes = {
-            directive.name
-            for directive in raw_mod.ast
-            if isinstance(directive, (Derective_struct, Derective_enum))
+            directive.name for directive in raw_mod.ast if isinstance(directive, (Derective_struct, Derective_enum))
         } | {
             "u1",
             "u8",
@@ -115,8 +112,6 @@ class Postprocessor:
         mod = ProcessedModule(id=raw_mod.id, structs=[], funcs=[])
         for derective in raw_mod.ast:
             if isinstance(derective, Normalized_fn):
-                assert len(derective.generics) == 0
-
                 mod.funcs.append(
                     ProcessedDerective_fn(
                         name=self._emit_symbol_name(derective.name),
@@ -137,8 +132,6 @@ class Postprocessor:
                 )
 
             elif isinstance(derective, Derective_struct):
-                assert len(derective.generics) == 0
-
                 mod.structs.append(
                     ProcessedDerective_struct(
                         name=derective.name,
@@ -245,13 +238,6 @@ class Postprocessor:
             )
         if isinstance(instr, Instruction_getptr):
             self._build_getptr(instr)
-        if isinstance(instr, Instruction_phi):
-            assert instr.var_out.type
-            pairs: list[tuple[TypedVariable, str]] = []
-            for pair in instr.args:
-                assert pair.var.type
-                pairs.append((TypedVariable(pair.var.name, pair.var.type), pair.block_label))
-            return ProcessedInstruction_phi(var_out=TypedVariable(instr.var_out.name, instr.var_out.type), args=pairs)
         if isinstance(instr, BinOp):
             return self._build_processed_binop(instr)
         raise NotImplementedError(instr)

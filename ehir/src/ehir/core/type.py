@@ -24,8 +24,19 @@ class Pointer(Type):
     def __str__(self) -> str:
         return f"{self.pointee}*"
 
+
+class Reference(Type):
+    pointee: Type
+
+    def __init__(self, pointee: Type):
+        super().__init__(name=pointee.name, generics=list(pointee.generics))
+        self.pointee = pointee
+
+    def __str__(self) -> str:
+        return f"&{self.pointee}"
+
 def is_box_type(typ: Type) -> bool:
-    return not isinstance(typ, Pointer) and typ.name == "Box" and len(typ.generics) == 1
+    return not isinstance(typ, (Pointer, Reference)) and typ.name == "Box" and len(typ.generics) == 1
 
 
 def box_pointee(typ: Type) -> Type:
@@ -37,6 +48,8 @@ def box_pointee(typ: Type) -> Type:
 def mangle_type_name(typ: Type) -> str:
     if isinstance(typ, Pointer):
         return f"{mangle_type_name(typ.pointee)}_ptr"
+    if isinstance(typ, Reference):
+        return f"{mangle_type_name(typ.pointee)}_ref"
     if not typ.generics:
         return typ.name
     return f"{typ.name}_{'_'.join(mangle_type_name(generic) for generic in typ.generics)}"

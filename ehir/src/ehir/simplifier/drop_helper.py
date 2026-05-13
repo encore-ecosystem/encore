@@ -1,10 +1,10 @@
-from ehir.core.derectives import Derective_struct
+from ehir.core.derectives import Derective_enum, Derective_struct
 from ehir.core.primitives.base import PrimitiveType
-from ehir.core.type import Pointer, Type, is_box_type, mangle_type_name
+from ehir.core.type import Pointer, Reference, Type, is_box_type, mangle_type_name
 
 
 def needs_drop(typ: Type, aggregate_names: set[str]) -> bool:
-    if isinstance(typ, Pointer):
+    if isinstance(typ, (Pointer, Reference)):
         return False
     if isinstance(typ, PrimitiveType):
         return False
@@ -17,6 +17,13 @@ def needs_drop(typ: Type, aggregate_names: set[str]) -> bool:
 
 def needs_retain(typ: Type, aggregate_names: set[str]) -> bool:
     return needs_drop(typ, aggregate_names)
+
+
+def collect_aggregate_names(
+    structs: dict[str, Derective_struct],
+    enums: dict[str, Derective_enum],
+) -> set[str]:
+    return set(structs) | set(enums)
 
 
 def drop_function_name(typ: Type) -> str:

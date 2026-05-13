@@ -3,20 +3,15 @@ from collections.abc import Sequence
 
 import llvmlite.binding as llvm
 import llvmlite.ir as ir
-from ehir.core.instructions.capture import Instruction_lcpos
-from ehir.core.instructions.control_flow import (
+from ehir.core.instructions import (
     Instruction_br,
     Instruction_cbr,
-)
-from ehir.core.instructions.memory import (
+    Instruction_comment,
+    Instruction_geq,
     Instruction_getfield,
     Instruction_getfieldptr,
     Instruction_getptr,
 )
-from ehir.core.instructions.operators.comparison import (
-    Instruction_geq,
-)
-from ehir.core.instructions.special import Instruction_comment
 from ehir.core.primitives import Float, Float_t, Isize, Isize_t, Str, Str_t, Usize, Usize_t
 from ehir.core.primitives.base import Primitive
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
@@ -34,8 +29,8 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_and,
     ProcessedInstruction_call,
     ProcessedInstruction_div,
-    ProcessedInstruction_geq,
     ProcessedInstruction_gep,
+    ProcessedInstruction_geq,
     ProcessedInstruction_getfieldptr,
     ProcessedInstruction_grt,
     ProcessedInstruction_halloc,
@@ -709,9 +704,7 @@ class Codegen:
                 raise TypeError(f"Invalid neq operands for str compare: {left.type} != {right.type}")
             eq_fn = self._get_str_eq_function()
             eq_result = self.builder.call(eq_fn, [left, right], name=f"{instr.var_out.name}.eq")
-            result = self.builder.icmp_unsigned(
-                "==", eq_result, ir.Constant(ir.IntType(1), 0), name=instr.var_out.name
-            )
+            result = self.builder.icmp_unsigned("==", eq_result, ir.Constant(ir.IntType(1), 0), name=instr.var_out.name)
         elif self._is_float_value(left):
             result = self.builder.fcmp_unordered("!=", left, right, name=instr.var_out.name)
         elif self._is_unsigned_type(instr.lhs.type):

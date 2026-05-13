@@ -3,7 +3,7 @@ from copy import deepcopy
 from ehir.core.block import Block
 from ehir.core.derectives import Derective_enum, Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
-from ehir.core.enum import EnumVariant
+from ehir.core.enum import EnumVariant, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import (
     Instruction_add,
     Instruction_call,
@@ -17,7 +17,7 @@ from ehir.core.instructions import (
 from ehir.core.primitives import Usize, Usize_t
 from ehir.core.type import Pointer, Type
 from ehir.core.variable import Parameter, TypedVariable
-from ehir.simplifier.drop_helper import is_box_struct, needs_retain, retain_function_name
+from ehir.simplifier.drop_helper import collect_aggregate_names, is_box_struct, needs_retain, retain_function_name
 
 
 class AutoRetainPass:
@@ -32,7 +32,7 @@ class AutoRetainPass:
             for directive in ast
             if isinstance(directive, Derective_enum) and not directive.generics
         }
-        self._aggregate_names = set(self._structs) | set(self._enums)
+        self._aggregate_names = collect_aggregate_names(self._structs, self._enums)
         existing_names = {
             directive.name
             for directive in ast
@@ -41,12 +41,20 @@ class AutoRetainPass:
 
         generated: list[Derective] = []
         for directive in ast:
-            if isinstance(directive, Derective_struct) and not directive.generics:
+            if (
+                isinstance(directive, Derective_struct)
+                and not directive.generics
+                and needs_retain(Type(directive.name), self._aggregate_names)
+            ):
                 fn_name = retain_function_name(Type(directive.name))
                 if fn_name not in existing_names:
                     generated.append(self._generate_struct_retain_fn(directive))
                     existing_names.add(fn_name)
-            elif isinstance(directive, Derective_enum) and not directive.generics:
+            elif (
+                isinstance(directive, Derective_enum)
+                and not directive.generics
+                and needs_retain(Type(directive.name), self._aggregate_names)
+            ):
                 fn_name = retain_function_name(Type(directive.name))
                 if fn_name not in existing_names:
                     generated.append(self._generate_enum_retain_fn(directive))
@@ -156,10 +164,11 @@ class AutoRetainPass:
         )
         blocks = [entry]
         for variant_index, variant in retain_variants:
-            assert variant.type is not None
-            payload_ptr_type = Pointer(deepcopy(variant.type))
+            payload_type = self._variant_payload_type(variant)
+            assert payload_type is not None
+            payload_ptr_type = Pointer(deepcopy(payload_type))
             payload_ptr = TypedVariable(f".retain_{variant.name}_ptr", payload_ptr_type)
-            payload = TypedVariable(f".retain_{variant.name}", deepcopy(variant.type))
+            payload = TypedVariable(f".retain_{variant.name}", deepcopy(payload_type))
             blocks.append(
                 Block(
                     name=f"retain_{variant.name}",
@@ -172,7 +181,7 @@ class AutoRetainPass:
                         Instruction_load(var_out=payload, var=payload_ptr),
                         Instruction_call(
                             var_out=TypedVariable(f".retain_call_{variant.name}", Type("void")),
-                            fn_name=retain_function_name(variant.type),
+                            fn_name=retain_function_name(payload_type),
                             generics=[],
                             args=[deepcopy(payload)],
                         ),
@@ -184,4 +193,14 @@ class AutoRetainPass:
         return blocks
 
     def _variant_needs_retain(self, variant: EnumVariant) -> bool:
-        return variant.type is not None and needs_retain(variant.type, self._aggregate_names)
+        payload_type = self._variant_payload_type(variant)
+        return payload_type is not None and needs_retain(payload_type, self._aggregate_names)
+
+    def _variant_payload_type(self, variant: EnumVariant) -> Type | None:
+        if isinstance(variant, UnitLikeVariant):
+            return None
+        if isinstance(variant, TupleLikeVariant):
+            if len(variant.types) == 0:
+                return None
+            return variant.types[0]
+        raise TypeError(f"Unknown enum variant kind: {type(variant)}")
