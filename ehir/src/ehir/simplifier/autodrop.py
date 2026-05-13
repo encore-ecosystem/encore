@@ -3,7 +3,7 @@ from copy import deepcopy
 from ehir.core.block import Block
 from ehir.core.derectives import Derective_enum, Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
-from ehir.core.enum import EnumVariant
+from ehir.core.enum import EnumVariant, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import (
     Instruction_br,
     Instruction_capprim,
@@ -217,10 +217,11 @@ class AutoDropPass:
         )
         blocks = [entry]
         for variant_index, variant in drop_variants:
-            assert variant.type is not None
-            payload_ptr_type = Pointer(deepcopy(variant.type))
+            payload_type = self._variant_payload_type(variant)
+            assert payload_type is not None
+            payload_ptr_type = Pointer(deepcopy(payload_type))
             payload_ptr = TypedVariable(f".drop_{variant.name}_ptr", payload_ptr_type)
-            payload = TypedVariable(f".drop_{variant.name}", deepcopy(variant.type))
+            payload = TypedVariable(f".drop_{variant.name}", deepcopy(payload_type))
             blocks.append(
                 Block(
                     name=f"drop_{variant.name}",
@@ -239,4 +240,14 @@ class AutoDropPass:
         return blocks
 
     def _variant_needs_drop(self, variant: EnumVariant) -> bool:
-        return variant.type is not None and needs_drop(variant.type, self._aggregate_names)
+        payload_type = self._variant_payload_type(variant)
+        return payload_type is not None and needs_drop(payload_type, self._aggregate_names)
+
+    def _variant_payload_type(self, variant: EnumVariant) -> Type | None:
+        if isinstance(variant, UnitLikeVariant):
+            return None
+        if isinstance(variant, TupleLikeVariant):
+            if len(variant.types) == 0:
+                return None
+            return variant.types[0]
+        raise TypeError(f"Unknown enum variant kind: {type(variant)}")

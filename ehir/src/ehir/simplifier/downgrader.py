@@ -1,7 +1,7 @@
 from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_enum, Derective_struct
 from ehir.core.derectives.base import Derective
-from ehir.core.enum import Enum
+from ehir.core.enum import Enum, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import (
     BinOp,
     ControlFlow,
@@ -29,7 +29,6 @@ from ehir.core.instructions import (
     Instruction_neq,
     Instruction_or,
     Instruction_pcast,
-    Instruction_phi,
     Instruction_put,
     Instruction_ret,
     Instruction_salloc,
@@ -40,12 +39,14 @@ from ehir.core.instructions import (
     Instruction_sgetfieldptr,
     Instruction_store,
     Instruction_switch,
+    Instruction_wraph,
+    Instruction_wraps,
 )
 from ehir.core.instructions.base import Instruction
 from ehir.core.primitives import Usize, Usize_t
 from ehir.core.struct import Struct
-from ehir.core.type import Pointer, Type, mangle_type_name
-from ehir.core.variable import Parameter, TypedVariable
+from ehir.core.type import Pointer, Reference, Type, mangle_type_name
+from ehir.core.variable import Parameter, TypedVariable, Variable
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 SKIPABLE = (
@@ -68,7 +69,6 @@ SKIPABLE = (
     Instruction_comment,
     Instruction_halloc,
     Instruction_hrealloc,
-    Instruction_phi,
 )
 
 ENABLE_COMMENTS: bool = True
@@ -154,6 +154,8 @@ class Downgrader:
             return self._downgrade_sgetfieldptr(instr)
         elif isinstance(instr, Instruction_setfield):
             return self._downgrade_setfield(instr)
+        elif isinstance(instr, (Instruction_wraps, Instruction_wraph)):
+            return self._downgrade_wrap(instr)
         elif isinstance(instr, Instruction_cbr):
             return self._downgrade_cbr(instr)
         elif isinstance(instr, Instruction_match):
@@ -165,13 +167,49 @@ class Downgrader:
         else:
             raise NotImplementedError(f"Downgrading instruction for {type(instr)}:{instr} not implemented")
 
+    def _downgrade_wrap(self, instr: Instruction_wraps | Instruction_wraph) -> list[Instruction]:
+        assert instr.variable.type is not None
+        assert instr.var_out.type is not None
+        if isinstance(instr, Instruction_wraph):
+            assert instr.var_out.type is not None
+            return [
+                Instruction_call(
+                    var_out=instr.var_out,
+                    fn_name=f"{instr.var_out.type}::wrap",
+                    generics=[],
+                    args=[instr.variable],
+                )
+            ]
+
+        temp_ptr = TypedVariable(name=f".{instr.var_out.name}_wrap_ptr", type=Pointer(instr.variable.type))
+        return [
+            Instruction_salloc(var_out=temp_ptr, type=instr.variable.type),
+            Instruction_store(var_src=instr.variable, var_dst=temp_ptr),
+            Instruction_call(
+                var_out=instr.var_out,
+                fn_name=f"{instr.var_out.type}::from_stack_raw",
+                generics=[],
+                args=[temp_ptr],
+            ),
+        ]
+
     def _lower_enum_derective(self, enum: Derective_enum) -> Derective_struct:
         params = [Parameter(name="tag", type=Usize_t(8))]
         for variant in enum.variants:
-            if variant.type is None:
+            payload_type = self._variant_payload_type(variant)
+            if payload_type is None:
                 continue
-            params.append(Parameter(name=variant.name, type=Pointer(variant.type)))
+            params.append(Parameter(name=variant.name, type=Pointer(payload_type)))
         return Derective_struct(name=enum.name, generics=enum.generics, params=params)
+
+    def _variant_payload_type(self, variant: UnitLikeVariant | TupleLikeVariant):
+        if isinstance(variant, UnitLikeVariant):
+            return None
+        if isinstance(variant, TupleLikeVariant):
+            if len(variant.types) == 0:
+                return None
+            return variant.types[0]
+        raise TypeError(f"Unknown enum variant kind: {type(variant)}")
 
     def _downgrade_cpos(self, instr: Instruction_cpos) -> list[Instruction]:
         assert instr.var_out.type is not None
@@ -204,7 +242,7 @@ class Downgrader:
             type=instr.struct.as_type(),
         )
         downgrades = [salloc]
-        for i, arg in enumerate(instr.struct.args):
+        for i, arg in enumerate(instr.struct.fields):
             assert arg.type
             field_arg = TypedVariable(name=f".{instr.var_out.name}.{arg.name}", type=Pointer(arg.type))
             field_ptr = Instruction_getfieldptr(
@@ -296,20 +334,36 @@ class Downgrader:
 
     def _downgrade_getfieldptr(self, instr: Instruction_getfieldptr) -> list[Instruction]:
         field_segments = [instr.field, *instr.field_path]
-        if len(field_segments) == 1:
-            return [instr]
-
         result: list[Instruction] = []
         current_src = instr.src
         for index, field in enumerate(field_segments):
-            assert field.type is not None
             is_last = index == len(field_segments) - 1
+            owner_t = current_src.type
+            assert owner_t is not None
+            if isinstance(owner_t, (Pointer, Reference)):
+                owner_t = owner_t.pointee
+            struct_decl = self._structs.get(owner_t.name)
+            assert struct_decl is not None, f"Unknown struct for getfieldptr: {owner_t}"
+            field_index = int(field.name) if field.name.isdigit() else None
+            if field_index is None:
+                for idx, p in enumerate(struct_decl.params):
+                    if p.name == field.name:
+                        field_index = idx
+                        break
+            assert field_index is not None, f"Unknown field {field.name} for {owner_t.name}"
+            resolved_field_type = struct_decl.params[field_index].type
+            if field.type is None:
+                field.type = resolved_field_type
             var_out = (
                 instr.var_out
                 if is_last
-                else TypedVariable(name=f".{instr.var_out.name}_{index}_ptr", type=Pointer(field.type))
+                else TypedVariable(name=f".{instr.var_out.name}_{index}_ptr", type=Pointer(resolved_field_type))
             )
-            lowered = Instruction_getfieldptr(var_out=var_out, src=current_src, field=field)
+            lowered = Instruction_getfieldptr(
+                var_out=var_out,
+                src=current_src,
+                field=Variable(name=str(field_index), type=field.type),
+            )
             result.append(lowered)
             current_src = var_out
         return result
@@ -332,8 +386,9 @@ class Downgrader:
         assert out.type is not None
         assert isinstance(out.type, Pointer)
 
-        lowered_struct = self._structs[enum.name]
-        tag_value = self._enum_variants[enum.name].index(enum.variant)
+        lowered_enum_name = out.type.pointee.name
+        lowered_struct = self._structs[lowered_enum_name]
+        tag_value = self._enum_variants[lowered_enum_name].index(enum.variant)
         tag_var = TypedVariable(name=f".{out.name}_tag", type=Usize_t(8))
         tag_init = Instruction_capprim(var_out=tag_var, primitive=Usize(tag_value, size=8))
 
@@ -351,20 +406,16 @@ class Downgrader:
 
         result: list[Instruction] = [alloc, *self._downgrade_capprim(tag_init), tag_field_ptr, tag_store]
 
-        if enum.payload is None:
+        if len(enum.args) == 0:
             return result
 
-        payload_type = enum.payload.as_type()
+        payload_value = enum.args[0]
+        assert payload_value.type is not None
+        payload_type = payload_value.type
         payload_ptr = TypedVariable(name=f".{out.name}_{enum.variant}_payload", type=Pointer(payload_type))
-        if enum.payload.value is None:
-            # Enum layout stores payload as a pointer field. Payload must outlive the
-            # current stack frame (e.g. returned enum values), so it cannot be stack-allocated.
-            payload_init = Instruction_cstruct(var_out=payload_ptr, struct=enum.payload)
-            result.extend(self._downgrade_cstruct(payload_init))
-        else:
-            # Same lifetime rule as above: never put enum payload behind a stack pointer.
-            result.append(Instruction_halloc(var_out=payload_ptr, type=payload_type))
-            result.append(Instruction_store(var_src=enum.payload.value, var_dst=payload_ptr))
+        # Enum layout stores payload as a pointer field; payload must outlive this frame.
+        result.append(Instruction_halloc(var_out=payload_ptr, type=payload_type))
+        result.append(Instruction_store(var_src=payload_value, var_dst=payload_ptr))
 
         payload_field_index = next(i for i, param in enumerate(lowered_struct.params) if param.name == enum.variant)
         payload_field_ptr = TypedVariable(name=f".{out.name}_{enum.variant}_field_ptr", type=Pointer(payload_ptr.type))

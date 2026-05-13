@@ -12,12 +12,17 @@ class EnumVariant:
 
 
 @dataclass
-class UnitLikeVariant(EnumVariant): ...
+class UnitLikeVariant(EnumVariant):
+    def __str__(self) -> str:
+        return self.name
 
 
 @dataclass
 class TupleLikeVariant(EnumVariant):
     types: list[Type]
+
+    def __str__(self) -> str:
+        return f"{self.name}({', '.join(str(t) for t in self.types)})"
 
 
 @dataclass

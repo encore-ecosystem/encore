@@ -24,7 +24,6 @@ from ehir.core.instructions import (
     Instruction_hrealloc,
     Instruction_load,
     Instruction_match,
-    Instruction_phi,
     Instruction_pcast,
     Instruction_ret,
     Instruction_salloc,
@@ -34,6 +33,8 @@ from ehir.core.instructions import (
     Instruction_sgetfieldptr,
     Instruction_store,
     Instruction_switch,
+    Instruction_wraph,
+    Instruction_wraps,
 )
 from ehir.core.instructions.base import Assignable
 from ehir.core.type import Type
@@ -180,12 +181,15 @@ class Deallocator:
             else:
                 dealloc_block = name2block[least_shared_node]
 
+            var_def = self._variables[var]
+            if var_def.type is None:
+                continue
             dealloc_block.body.append(
                 Instruction_call(
                     var_out=TypedVariable(name=f".drop_{var}", type=Type("void")),
                     fn_name="Drop::drop",
-                    generics=[deepcopy(generic) for generic in self._variables[var].type.generics],
-                    args=[TypedVariable(self._variables[var].name, self._variables[var].type)],
+                    generics=[deepcopy(generic) for generic in var_def.type.generics],
+                    args=[TypedVariable(var_def.name, var_def.type)],
                 )
             )
 
@@ -222,13 +226,25 @@ class Deallocator:
         return all_paths
 
     def _add_variable_usage(self, var: Variable):
-        self._variables[var.name] = var
+        if cached := self._variables.get(var.name):
+            if cached.type is None and var.type is not None:
+                self._variables[var.name] = var
+            else:
+                var = cached
+        else:
+            self._variables[var.name] = var
 
         if var.type is not None and needs_drop(var.type, self._aggregate_names):
             self._usages[var.name] = self._usages.get(var.name, set()) | {self._curr_block}
 
     def _add_variable_capture(self, var: Variable):
-        self._variables[var.name] = var
+        if cached := self._variables.get(var.name):
+            if cached.type is None and var.type is not None:
+                self._variables[var.name] = var
+            else:
+                var = cached
+        else:
+            self._variables[var.name] = var
 
         if var.name not in self._arg_names and var.type is not None and needs_drop(var.type, self._aggregate_names):
             self._captures[var.name] = self._curr_block
@@ -279,13 +295,9 @@ class Deallocator:
                 ),
             ):
                 if hasattr(instr, "struct"):
-                    args = [instr.struct.value] if instr.struct.value is not None else instr.struct.args
-                elif instr.enum.payload is not None:
-                    args = (
-                        [instr.enum.payload.value] if instr.enum.payload.value is not None else instr.enum.payload.args
-                    )
+                    args = [instr.struct.value] if instr.struct.value is not None else instr.struct.fields
                 else:
-                    args = []
+                    args = instr.enum.args
                 for arg in args:
                     self._add_variable_usage(arg)
             elif isinstance(instr, Instruction_hfree):
@@ -295,11 +307,10 @@ class Deallocator:
             elif isinstance(instr, Instruction_call):
                 for arg in instr.args:
                     self._add_variable_usage(arg)
+            elif isinstance(instr, (Instruction_wraps, Instruction_wraph)):
+                self._add_variable_usage(instr.variable)
             elif isinstance(instr, BinOp):
                 self._add_variable_usage(instr.lhs)
                 self._add_variable_usage(instr.rhs)
-            elif isinstance(instr, Instruction_phi):
-                for arg in instr.args:
-                    self._add_variable_usage(arg.var)
             else:
                 raise NotImplementedError(f"Variable usage not define for {instr}")

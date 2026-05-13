@@ -10,7 +10,6 @@ from ehir.core.instructions import (
     Instruction_cstruct,
     Instruction_getfield,
     Instruction_load,
-    Instruction_phi,
     Instruction_ret,
     Instruction_scstruct,
     Instruction_sgetfield,
@@ -53,7 +52,7 @@ class RetainInsertionPass:
         if isinstance(instr, Instruction_store):
             return [*self._retain_calls([instr.var_src]), instr]
 
-        if isinstance(instr, (Instruction_load, Instruction_getfield, Instruction_sgetfield, Instruction_phi)):
+        if isinstance(instr, (Instruction_load, Instruction_getfield, Instruction_sgetfield)):
             assert isinstance(instr.var_out, Variable)
             return [instr, *self._retain_calls([instr.var_out])]
 
@@ -84,7 +83,7 @@ class RetainInsertionPass:
     def _struct_args(struct: Struct) -> list[Variable]:
         if struct.value is not None:
             return [struct.value]
-        return list(struct.args)
+        return list(struct.fields)
 
     @staticmethod
     def _enum_args(enum) -> list[Variable]:

@@ -17,23 +17,24 @@ from ehir.core.derectives import (
     Derective_trait,
     Derective_typealias,
 )
+from ehir.core.derectives.base import Derective
 from ehir.core.variable import Parameter
 from ehir.core.primitives import Str_t
 from ehir.core.primitives.base import PrimitiveType
-from ehir.core.type import Pointer, Type
+from ehir.core.type import Pointer, Reference, Type
 from ehir.format import ThemePalette, printfmt
 from ehir.frontend import EHIR_Frontend
 from ehir.postprocessor import Postprocessor
 from ehir.refrain import CompiledRefrain, Refrain
 from ehir.simplifier import (
     AutoDropPass,
-    AutoRetainPass,
     Deallocator,
     Downgrader,
     DropLoweringPass,
+    MonomorphizationPass,
     Normalizer,
+    ReferenceLoweringPass,
     Resolver,
-    RetainInsertionPass,
 )
 from ehir.simplifier.safety import SafetyValidator
 from ehir.simplifier.stripper import UnneededSymbolsStripper
@@ -121,13 +122,22 @@ class EHIR_ProjectCompiler:
         )
 
         module.ast = Resolver().run(module.ast)
-        module.ast = AutoRetainPass().run(module.ast)
+        module.ast = ReferenceLoweringPass().run(module.ast)
+        module.ast = MonomorphizationPass().run(module.ast)
+        self._emit_ehir_stage(refrain.name, "post_monomorphize", module.ast)
         module.ast = AutoDropPass().run(module.ast)
-        module.ast = RetainInsertionPass().run(module.ast)
         module.ast = SafetyValidator().run(module.ast)
         module.ast = Normalizer().run(module.ast)
         module.ast = Deallocator().run(module.ast)
         module.ast = DropLoweringPass().run(module.ast)
+        module.ast = UnneededSymbolsStripper().run(module.ast)
+        module.ast = [
+            directive
+            for directive in module.ast
+            if not isinstance(directive, (Derective_trait, Derective_impl, Derective_import))
+        ]
+        self._emit_ehir_stage(refrain.name, "pre_downgrade", module.ast)
+        module.ast = Downgrader().run(module.ast)
         concrete_type_names = {
             directive.name for directive in module.ast if isinstance(directive, (Derective_struct, Derective_enum))
         }
@@ -135,13 +145,6 @@ class EHIR_ProjectCompiler:
             directive for directive in module.ast if self._is_backend_emittable(directive, concrete_type_names)
         ]
         module.ast = [directive for directive in module.ast if not isinstance(directive, Derective_typealias)]
-        module.ast = UnneededSymbolsStripper().run(module.ast)
-        module.ast = [
-            directive
-            for directive in module.ast
-            if not isinstance(directive, (Derective_trait, Derective_impl, Derective_import))
-        ]
-        module.ast = Downgrader().run(module.ast)
         processed_mod = Postprocessor().run(module)
 
         compiled_refrain = CompiledRefrain(
@@ -157,6 +160,13 @@ class EHIR_ProjectCompiler:
         self._cache.store(compiled_refrain)
         self.compiled_refrains[refrain.name] = compiled_refrain
         return compiled_refrain
+
+    def _emit_ehir_stage(self, refrain_name: str, stage: str, ast: list[Derective]) -> None:
+        ehir_dir = self.backend.profile_path / "ehir"
+        ehir_dir.mkdir(parents=True, exist_ok=True)
+        out_path = ehir_dir / f"{refrain_name}.{stage}.ehir"
+        text = "\n\n".join(str(directive) for directive in ast) + "\n"
+        out_path.write_text(text)
 
     def _merge_refrain_modules(
         self,
@@ -240,7 +250,7 @@ class EHIR_ProjectCompiler:
         return True
 
     def _is_concrete_type(self, typ: Type, concrete_type_names: set[str]) -> bool:
-        if isinstance(typ, Pointer):
+        if isinstance(typ, (Pointer, Reference)):
             return self._is_concrete_type(typ.pointee, concrete_type_names)
         if isinstance(typ, PrimitiveType):
             return True
@@ -345,10 +355,6 @@ class EHIR_ProjectCompiler:
 
                 for child_id in self.frontend.list_child_module_ids(current_module_id):
                     pending.append(child_id)
-
-        if not self._is_core_module_id(id):
-            for core_module_id in self._core_module_ids():
-                append_module_tree(core_module_id)
 
         def matches_import_symbol(directive_name: str, import_symbol: str) -> bool:
             return directive_name == import_symbol or directive_name.endswith(f"::{import_symbol}")
@@ -464,11 +470,38 @@ class EHIR_ProjectCompiler:
             parent_id = parent_id.parent / parent_id.stem / f"mod{self.frontend.get_file_extension()}"
         return parent_id
 
-    def _builtin_directives(self) -> list[Derective_extern_fn]:
+    def _builtin_directives(self) -> list[Derective]:
+        builtins: list[Derective] = []
+        builtins.extend(self._builtin_box_directives())
+
         unit_t = Type("void")
         str_t = Str_t()
         params = [Parameter("text", str_t)]
-        return [
+        builtins.extend([
             Derective_extern_fn(name="print", params=deepcopy(params), ret_type=unit_t, attrs=("safe",)),
             Derective_extern_fn(name="eprint", params=deepcopy(params), ret_type=unit_t, attrs=("safe",)),
-        ]
+        ])
+        return builtins
+
+    def _builtin_box_directives(self) -> list[Derective]:
+        core_root = self._core_dir()
+        extension = self.frontend.get_file_extension()
+        owner_id = core_root / f"owner{extension}"
+        box_id = core_root / f"smart_box{extension}"
+
+        directives: list[Derective] = []
+        seen_symbols: set[tuple[type, str]] = set()
+        for module_id in (owner_id, box_id):
+            if not module_id.exists():
+                continue
+            module = self.frontend.get_module_by_id(module_id)
+            for directive in module.ast:
+                if isinstance(directive, Derective_import):
+                    continue
+                symbol_name = getattr(directive, "name", "")
+                key = (type(directive), symbol_name)
+                if key in seen_symbols:
+                    continue
+                seen_symbols.add(key)
+                directives.append(deepcopy(directive))
+        return directives

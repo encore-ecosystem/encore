@@ -4,7 +4,7 @@ from ehir.core.derectives import Derective_enum, Derective_extern_fn, Derective_
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import Instruction_call
 from ehir.core.primitives.base import PrimitiveType
-from ehir.core.type import Pointer, Type
+from ehir.core.type import Pointer, Reference, Type
 
 
 class UnneededSymbolsStripper:
@@ -14,7 +14,13 @@ class UnneededSymbolsStripper:
             directive.name
             for directive in ast
             if isinstance(directive, (Derective_extern_fn, Derective_fn))
-            and (directive.name == "main" or getattr(directive, "is_public", False) or isinstance(directive, Derective_extern_fn))
+            and (
+                directive.name == "main"
+                or directive.name.startswith("__Box_")
+                or directive.name.startswith("__drop___Box_")
+                or getattr(directive, "is_public", False)
+                or isinstance(directive, Derective_extern_fn)
+            )
         }
 
         pending = list(reachable_fns)
@@ -80,7 +86,7 @@ class UnneededSymbolsStripper:
     def _collect_type(self, typ: Type, out: set[str]) -> None:
         if isinstance(typ, PrimitiveType):
             return
-        if isinstance(typ, Pointer):
+        if isinstance(typ, (Pointer, Reference)):
             self._collect_type(typ.pointee, out)
         if typ.name and typ.name.isidentifier():
             out.add(typ.name)

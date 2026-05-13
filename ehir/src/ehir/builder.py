@@ -35,9 +35,7 @@ from ehir.core.instructions import (
     Instruction_mul,
     Instruction_neq,
     Instruction_or,
-    Instruction_phi,
     Instruction_ret,
-    Instruction_scpos,
     Instruction_scstruct,
     Instruction_sgetfield,
     Instruction_shl,
@@ -45,7 +43,6 @@ from ehir.core.instructions import (
     Instruction_sub,
     Instruction_xor,
     MatchCase,
-    PhiPair,
 )
 from ehir.core.instructions.base import Assignable, Instruction
 from ehir.core.primitives import Usize_t
@@ -186,15 +183,21 @@ class EHIR_Builder:
         self._add(cpos)
         return cpos
 
-    def build_capstruct(self, struct_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_capstruct:
+    def build_capstruct(
+        self, struct_name: str, args: list[Variable], name: Optional[str] = None
+    ) -> Instruction_capstruct:
         struct = Struct(name=struct_name, args=args)
         capstruct = Instruction_capstruct(var_out=self._reserve_variable(name, struct.as_type()), struct=struct)
         self._add(capstruct)
         return capstruct
 
-    def build_scstruct(self, struct_name: str, args: list[Variable], name: Optional[str] = None) -> Instruction_scstruct:
+    def build_scstruct(
+        self, struct_name: str, args: list[Variable], name: Optional[str] = None
+    ) -> Instruction_scstruct:
         struct = Struct(name=struct_name, args=args)
-        scstruct = Instruction_scstruct(var_out=self._reserve_variable(name, Type("Box", [struct.as_type()])), struct=struct)
+        scstruct = Instruction_scstruct(
+            var_out=self._reserve_variable(name, Type("Box", [struct.as_type()])), struct=struct
+        )
         self._add(scstruct)
         return scstruct
 
@@ -246,13 +249,6 @@ class EHIR_Builder:
 
     def build_match(self, cond_var: Variable, default_label: str, cases: list[MatchCase]):
         self._add(Instruction_match(cond_var=cond_var, default_case=default_label, cases=cases))
-
-    # deprecated shit
-    def build_phi(self, name: str, var_type: Optional[Type], pairs: list[PhiPair]) -> Instruction_phi:
-        var = self._reserve_variable(name, var_type)
-        instr = Instruction_phi(var_out=var, args=pairs)
-        self._add(instr)
-        return instr
 
     def get_var(self, name: Optional[str] = None) -> Assignable:
         if name is None:

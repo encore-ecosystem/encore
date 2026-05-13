@@ -57,7 +57,8 @@ from ehir.core.instructions import (
     Instruction_store,
     Instruction_sub,
     Instruction_switch,
-    Instruction_wrap,
+    Instruction_wraph,
+    Instruction_wraps,
     Instruction_xor,
     MatchCase,
 )
@@ -65,7 +66,7 @@ from ehir.core.instructions.base import Instruction
 from ehir.core.primitives import Char, Char_t, Float, Float_t, Isize, Isize_t, Str, Str_t, Usize, Usize_t
 from ehir.core.primitives.base import Primitive, PrimitiveType
 from ehir.core.struct import Struct
-from ehir.core.type import Pointer, Type
+from ehir.core.type import Pointer, Reference, Type
 from ehir.core.variable import Parameter, StructField, Variable
 from ehir.frontend.builtin.parser.lexer import Lexer
 from ehir.frontend.builtin.parser.tokens import Token, TokenType
@@ -421,10 +422,12 @@ class Parser:
 
     def _parse_setfield(self) -> Instruction_setfield:
         self._safe_consume(TokenType.KW_SETFIELD)
+        var = self._parse_variable()
+        self._safe_consume(TokenType.GREATER)
         field, field_path = self._parse_field_path()
         self._safe_consume(TokenType.COMMA)
         value = self._parse_variable()
-        return Instruction_setfield(field=field, field_path=field_path, value=value)
+        return Instruction_setfield(var=var, field=field, field_path=field_path, value=value)
 
     def _parse_br(self) -> Instruction_br:
         self._safe_consume(TokenType.KW_BR)
@@ -505,9 +508,13 @@ class Parser:
                 struct = self._parse_struct_init()
                 return Instruction_capstruct(var_out=var, struct=struct)
 
-            case TokenType.KW_WRAP:
+            case TokenType.KW_WRAPS:
                 variable = self._parse_variable()
-                return Instruction_wrap(var_out=var, variable=variable)
+                return Instruction_wraps(var_out=var, variable=variable)
+
+            case TokenType.KW_WRAPH:
+                variable = self._parse_variable()
+                return Instruction_wraph(var_out=var, variable=variable)
 
             case TokenType.KW_CALL | TokenType.KW_UNSAFE:
                 is_unsafe = False
@@ -653,12 +660,16 @@ class Parser:
                 return Instruction_getptr(var_out=var, var=var_src)
 
             case TokenType.KW_GETFIELD:
+                src = self._parse_variable()
+                self._safe_consume(TokenType.GREATER)
                 field, field_path = self._parse_field_path()
-                return Instruction_getfield(var_out=var, field=field, field_path=field_path)
+                return Instruction_getfield(var_out=var, src=src, field=field, field_path=field_path)
 
             case TokenType.KW_GETFIELDPTR:
+                src = self._parse_variable()
+                self._safe_consume(TokenType.GREATER)
                 field, field_path = self._parse_field_path()
-                return Instruction_getfieldptr(var_out=var, field=field, field_path=field_path)
+                return Instruction_getfieldptr(var_out=var, src=src, field=field, field_path=field_path)
 
             case TokenType.KW_GEP:
                 var_src = self._parse_variable()
@@ -748,7 +759,7 @@ class Parser:
             raise ValueError(f"Struct field {var.name} must have a type")
         return StructField(var.name, var.type, attrs=attrs)
 
-    def _parse_type(self) -> Type | PrimitiveType | Pointer:
+    def _parse_type(self) -> Type | PrimitiveType | Pointer | Reference:
         # Unit type syntax in staged EHIR: `()`
         if self._lookup_curr() == TokenType.LEFT_PAREN:
             self._safe_consume(TokenType.LEFT_PAREN)
@@ -758,7 +769,7 @@ class Parser:
         if self._lookup_curr() == TokenType.AMPERSAND:
             self._safe_consume(TokenType.AMPERSAND)
             inner = self._parse_type()
-            return Type("Box", [inner])
+            return Reference(inner)
 
         name = self._safe_consume(TokenType.IDENTIFIER).value
 

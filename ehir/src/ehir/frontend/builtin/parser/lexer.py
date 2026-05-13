@@ -175,8 +175,6 @@ class Lexer:
                 self._append_token(TokenType.KW_PUB)
             case "imp":
                 self._append_token(TokenType.KW_IMP)
-            case "cimp":
-                self._append_token(TokenType.KW_CIMP)
             case "extern":
                 self._append_token(TokenType.KW_EXTERN)
             case "unsafe":
@@ -193,8 +191,10 @@ class Lexer:
                 self._append_token(TokenType.KW_CAPENUM)
             case "capstruct":
                 self._append_token(TokenType.KW_CAPSTRUCT)
-            case "wrap":
-                self._append_token(TokenType.KW_WRAP)
+            case "wraps":
+                self._append_token(TokenType.KW_WRAPS)
+            case "wraph":
+                self._append_token(TokenType.KW_WRAPH)
             case "pcast":
                 self._append_token(TokenType.KW_PCAST)
             case "getptr":

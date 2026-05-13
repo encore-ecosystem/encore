@@ -1,10 +1,10 @@
 from ehir.core.derectives import Derective_struct
 from ehir.core.primitives.base import PrimitiveType
-from ehir.core.type import Pointer, Type, is_box_type, mangle_type_name
+from ehir.core.type import Pointer, Reference, Type, is_box_type, mangle_type_name
 
 
 def needs_drop(typ: Type, aggregate_names: set[str]) -> bool:
-    if isinstance(typ, Pointer):
+    if isinstance(typ, (Pointer, Reference)):
         return False
     if isinstance(typ, PrimitiveType):
         return False
