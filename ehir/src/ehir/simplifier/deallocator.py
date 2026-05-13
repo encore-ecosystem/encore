@@ -39,7 +39,7 @@ from ehir.core.instructions import (
 from ehir.core.instructions.base import Assignable
 from ehir.core.type import Type
 from ehir.core.variable import TypedVariable, Variable
-from ehir.simplifier.drop_helper import needs_drop
+from ehir.simplifier.drop_helper import collect_aggregate_names, needs_drop
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 SKIPABLE = (
@@ -66,13 +66,29 @@ class Deallocator:
     _aggregate_names: set[str]
 
     def run(self, ast: list[Derective]) -> list[Derective]:
-        self._aggregate_names = {
-            directive.name for directive in ast if isinstance(directive, (Derective_struct, Derective_enum))
+        structs = {
+            directive.name: directive
+            for directive in ast
+            if isinstance(directive, Derective_struct) and not directive.generics
         }
+        enums = {
+            directive.name: directive
+            for directive in ast
+            if isinstance(directive, Derective_enum) and not directive.generics
+        }
+        self._aggregate_names = collect_aggregate_names(structs, enums)
         for derective in ast:
-            if isinstance(derective, Normalized_fn) and not derective.name.startswith("__retain_"):
+            if isinstance(derective, Normalized_fn) and not self._is_runtime_memory_fn(derective.name):
                 self._place_cfree(derective)
         return ast
+
+    def _is_runtime_memory_fn(self, name: str) -> bool:
+        return (
+            name.startswith("__Box_")
+            or name.startswith("__drop_")
+            or name.startswith("__retain_")
+            or name.startswith("__cfree")
+        )
 
     def _place_cfree(self, fn: Normalized_fn):
         self._usages = {}
@@ -290,15 +306,13 @@ class Deallocator:
                     Instruction_scstruct,
                     Instruction_cstruct,
                     Instruction_capstruct,
-                    Instruction_cenum,
-                    Instruction_capenum,
                 ),
             ):
-                if hasattr(instr, "struct"):
-                    args = [instr.struct.value] if instr.struct.value is not None else instr.struct.fields
-                else:
-                    args = instr.enum.args
+                args = [instr.struct.value] if instr.struct.value is not None else instr.struct.fields
                 for arg in args:
+                    self._add_variable_usage(arg)
+            elif isinstance(instr, (Instruction_cenum, Instruction_capenum)):
+                for arg in instr.enum.args:
                     self._add_variable_usage(arg)
             elif isinstance(instr, Instruction_hfree):
                 self._add_variable_usage(instr.var)

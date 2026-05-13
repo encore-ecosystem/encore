@@ -22,7 +22,9 @@ class Derective_impl(Derective):
         if self.bounds:
             parts = [f"{name}: {' + '.join(traits)}" for name, traits in self.bounds.items()]
             bounds_repr = " where " + ", ".join(parts)
-        methods_repr = "\n  ".join("\n".join(f"  {line}" for line in str(m).splitlines()) for m in self.methods)
+        methods_repr = "\n\n".join(
+            "\n".join(f"  {line}" for line in str(method).splitlines()) for method in self.methods
+        )
         attrs_repr = "".join(f"#attr({attr})\n" for attr in self.attrs)
         if self.trait_name is None:
             return f"{attrs_repr}impl{generics_repr} {self.for_type}{bounds_repr} {{\n{methods_repr}\n}}"

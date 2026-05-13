@@ -7,17 +7,23 @@ from ehir.core.instructions import Instruction_call, Instruction_cfree
 from ehir.core.instructions.base import Instruction
 from ehir.core.type import Type, is_box_type
 from ehir.core.variable import TypedVariable
-from ehir.simplifier.drop_helper import drop_function_name, needs_drop
+from ehir.simplifier.drop_helper import collect_aggregate_names, drop_function_name, needs_drop
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 
 class DropLoweringPass:
     def run(self, ast: list[Derective]) -> list[Derective]:
-        self._aggregate_names = {
-            directive.name
+        structs = {
+            directive.name: directive
             for directive in ast
-            if isinstance(directive, (Derective_struct, Derective_enum))
+            if isinstance(directive, Derective_struct) and not directive.generics
         }
+        enums = {
+            directive.name: directive
+            for directive in ast
+            if isinstance(directive, Derective_enum) and not directive.generics
+        }
+        self._aggregate_names = collect_aggregate_names(structs, enums)
         self._drop_functions = {
             directive.name
             for directive in ast

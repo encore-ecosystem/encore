@@ -2,6 +2,7 @@ import hashlib
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
+from importlib.metadata import version
 from pathlib import Path
 
 from ehir.backend import EHIR_Backend
@@ -18,27 +19,30 @@ from ehir.core.derectives import (
     Derective_typealias,
 )
 from ehir.core.derectives.base import Derective
-from ehir.core.variable import Parameter
 from ehir.core.primitives import Str_t
 from ehir.core.primitives.base import PrimitiveType
 from ehir.core.type import Pointer, Reference, Type
+from ehir.core.variable import Parameter
 from ehir.format import ThemePalette, printfmt
 from ehir.frontend import EHIR_Frontend
 from ehir.postprocessor import Postprocessor
 from ehir.refrain import CompiledRefrain, Refrain
 from ehir.simplifier import (
     AutoDropPass,
+    AutoRetainPass,
     Deallocator,
     Downgrader,
     DropLoweringPass,
     MonomorphizationPass,
     Normalizer,
     ReferenceLoweringPass,
+    RetainInsertionPass,
     Resolver,
 )
 from ehir.simplifier.safety import SafetyValidator
 from ehir.simplifier.stripper import UnneededSymbolsStripper
-from ehir.version import COMPILER_VERSION
+
+COMPILER_VERSION = version(__package__ or "ehir")
 
 
 @dataclass
@@ -122,22 +126,28 @@ class EHIR_ProjectCompiler:
         )
 
         module.ast = Resolver().run(module.ast)
+        self._emit_ehir_stage(refrain.name, "post_resolve", module.ast)
         module.ast = ReferenceLoweringPass().run(module.ast)
         module.ast = MonomorphizationPass().run(module.ast)
         self._emit_ehir_stage(refrain.name, "post_monomorphize", module.ast)
         module.ast = AutoDropPass().run(module.ast)
+        module.ast = AutoRetainPass().run(module.ast)
+        module.ast = RetainInsertionPass().run(module.ast)
         module.ast = SafetyValidator().run(module.ast)
         module.ast = Normalizer().run(module.ast)
         module.ast = Deallocator().run(module.ast)
         module.ast = DropLoweringPass().run(module.ast)
-        module.ast = UnneededSymbolsStripper().run(module.ast)
+        self._emit_ehir_stage(refrain.name, "pre_downgrade", module.ast)
+        module.ast = Downgrader().run(module.ast)
+        module.ast = UnneededSymbolsStripper().run(
+            module.ast,
+            keep_public_api=refrain.type != Refrain.TargetType.EXECUTABLE,
+        )
         module.ast = [
             directive
             for directive in module.ast
             if not isinstance(directive, (Derective_trait, Derective_impl, Derective_import))
         ]
-        self._emit_ehir_stage(refrain.name, "pre_downgrade", module.ast)
-        module.ast = Downgrader().run(module.ast)
         concrete_type_names = {
             directive.name for directive in module.ast if isinstance(directive, (Derective_struct, Derective_enum))
         }
@@ -189,7 +199,14 @@ class EHIR_ProjectCompiler:
         for directive in target_node.module.ast:
             if isinstance(
                 directive,
-                (Derective_fn, Derective_extern_fn, Derective_struct, Derective_enum, Derective_trait, Derective_typealias),
+                (
+                    Derective_fn,
+                    Derective_extern_fn,
+                    Derective_struct,
+                    Derective_enum,
+                    Derective_trait,
+                    Derective_typealias,
+                ),
             ):
                 symbol_keys.add((type(directive), directive.name))
             elif isinstance(directive, Derective_impl):
@@ -212,7 +229,14 @@ class EHIR_ProjectCompiler:
                     continue
                 if isinstance(
                     directive,
-                    (Derective_fn, Derective_extern_fn, Derective_struct, Derective_enum, Derective_trait, Derective_typealias),
+                    (
+                        Derective_fn,
+                        Derective_extern_fn,
+                        Derective_struct,
+                        Derective_enum,
+                        Derective_trait,
+                        Derective_typealias,
+                    ),
                 ):
                     key = (type(directive), directive.name)
                     if key in symbol_keys:
@@ -316,7 +340,14 @@ class EHIR_ProjectCompiler:
         def append_directive(directive):
             if isinstance(
                 directive,
-                (Derective_fn, Derective_extern_fn, Derective_struct, Derective_enum, Derective_trait, Derective_typealias),
+                (
+                    Derective_fn,
+                    Derective_extern_fn,
+                    Derective_struct,
+                    Derective_enum,
+                    Derective_trait,
+                    Derective_typealias,
+                ),
             ):
                 key = (type(directive), directive.name)
                 if key in resolved_symbols:
@@ -393,14 +424,21 @@ class EHIR_ProjectCompiler:
                     if isinstance(d, Derective_import):
                         continue
 
-                    if (
-                        isinstance(
+                    if isinstance(
+                        d,
+                        (
+                            Derective_fn,
+                            Derective_extern_fn,
+                            Derective_struct,
+                            Derective_enum,
+                            Derective_trait,
+                            Derective_typealias,
+                        ),
+                    ) and matches_import_symbol(d.name, directive.symbol):
+                        if isinstance(
                             d,
-                            (Derective_fn, Derective_extern_fn, Derective_struct, Derective_enum, Derective_trait, Derective_typealias),
-                        )
-                        and matches_import_symbol(d.name, directive.symbol)
-                    ):
-                        if isinstance(d, (Derective_fn, Derective_extern_fn, Derective_trait, Derective_struct, Derective_typealias)):
+                            (Derective_fn, Derective_extern_fn, Derective_trait, Derective_struct, Derective_typealias),
+                        ):
                             append_module_contents(parent_ast)
                         else:
                             append_directive(d)
@@ -446,7 +484,9 @@ class EHIR_ProjectCompiler:
             rest = directive.prefix[1:]
             candidates = []
             if directive.symbol != "*":
-                candidates.append((core_root / Path(*rest, directive.symbol)).with_suffix(self.frontend.get_file_extension()))
+                candidates.append(
+                    (core_root / Path(*rest, directive.symbol)).with_suffix(self.frontend.get_file_extension())
+                )
             candidates.append((core_root / Path(*rest)).with_suffix(self.frontend.get_file_extension()))
             if rest:
                 candidates.append(core_root / Path(*rest) / f"mod{self.frontend.get_file_extension()}")
@@ -477,10 +517,12 @@ class EHIR_ProjectCompiler:
         unit_t = Type("void")
         str_t = Str_t()
         params = [Parameter("text", str_t)]
-        builtins.extend([
-            Derective_extern_fn(name="print", params=deepcopy(params), ret_type=unit_t, attrs=("safe",)),
-            Derective_extern_fn(name="eprint", params=deepcopy(params), ret_type=unit_t, attrs=("safe",)),
-        ])
+        builtins.extend(
+            [
+                Derective_extern_fn(name="print", params=deepcopy(params), ret_type=unit_t, attrs=("safe",)),
+                Derective_extern_fn(name="eprint", params=deepcopy(params), ret_type=unit_t, attrs=("safe",)),
+            ]
+        )
         return builtins
 
     def _builtin_box_directives(self) -> list[Derective]:

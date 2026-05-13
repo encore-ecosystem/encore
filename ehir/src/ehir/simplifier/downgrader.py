@@ -454,30 +454,10 @@ class Downgrader:
         return [*self._downgrade_getfield(getfield), getfieldptr]
 
     def _downgrade_cbr(self, instr: Instruction_cbr) -> list[Instruction]:
-        assert instr.cond_var.type is not None
-        assert isinstance(instr.cond_var.type, Usize_t)
-
-        switch = Instruction_switch(
-            cond_var=instr.cond_var,
-            default_case=instr.else_br_label,
-            cases=[(Usize(1, size=instr.cond_var.type.size), instr.true_br_label)],
-        )
-        return [switch]
+        return [instr]
 
     def _downgrade_br(self, instr: Instruction_br) -> list[Instruction]:
-        zero_ptr = TypedVariable(name=".br_zero_ptr", type=Pointer(Usize_t(1)))
-        zero = TypedVariable(name=".br_zero", type=Usize_t(1))
-        cpos = Instruction_cpos(var_out=zero_ptr, primitive=Usize(0, size=1))
-        load = Instruction_load(
-            var_out=zero,
-            var=zero_ptr,
-        )
-        switch = Instruction_switch(
-            cond_var=zero,
-            default_case=instr.label,
-            cases=[],
-        )
-        return [*self._downgrade_cpos(cpos), load, switch]
+        return [instr]
 
     def _downgrade_match(self, instr: Instruction_match) -> list[Instruction]:
         assert instr.cond_var.type is not None
