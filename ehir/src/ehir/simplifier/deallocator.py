@@ -255,6 +255,10 @@ class Deallocator:
             self._usages[var.name] = self._usages.get(var.name, set()) | {self._curr_block}
 
     def _add_variable_capture(self, var: Variable):
+        if var.name.startswith("."):
+            # Compiler-generated temporaries frequently alias user-owned aggregates.
+            # Dropping them as independent owners causes duplicate cascades.
+            return
         if cached := self._variables.get(var.name):
             if cached.type is None and var.type is not None:
                 self._variables[var.name] = var
