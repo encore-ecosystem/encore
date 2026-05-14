@@ -430,7 +430,25 @@ class Codegen:
                 and isinstance(ptr.type.pointee, ir.IntType)
                 and ptr.type.pointee.width == 8
             ):
+                if isinstance(value.type, ir.BaseStructType):
+                    cast_ptr = self.builder.bitcast(
+                        ptr, ir.PointerType(value.type), name=f"{instr.var_dst.name}.store_struct_ptr"
+                    )
+                    self.builder.store(value, cast_ptr)
+                    return
                 cast_ptr = self.builder.bitcast(ptr, ir.PointerType(value.type), name=f"{instr.var_dst.name}.store_cast_ptr")
+                self.builder.store(value, cast_ptr)
+                return
+            if (
+                isinstance(ptr.type, ir.PointerType)
+                and isinstance(ptr.type.pointee, ir.PointerType)
+                and isinstance(ptr.type.pointee.pointee, ir.IntType)
+                and ptr.type.pointee.pointee.width == 8
+                and isinstance(value.type, ir.BaseStructType)
+            ):
+                cast_ptr = self.builder.bitcast(
+                    ptr, ir.PointerType(value.type), name=f"{instr.var_dst.name}.store_struct_ptrptr"
+                )
                 self.builder.store(value, cast_ptr)
                 return
             if (
@@ -443,6 +461,15 @@ class Codegen:
                 return
             if (
                 isinstance(ptr.type, ir.PointerType)
+                and isinstance(ptr.type.pointee, ir.BaseStructType)
+                and isinstance(value.type, ir.PointerType)
+                and isinstance(value.type.pointee, ir.BaseStructType)
+            ):
+                loaded = self.builder.load(value, name=f"{instr.var_src.name}.store_ptrload")
+                self.builder.store(loaded, ptr)
+                return
+            if (
+                isinstance(ptr.type, ir.PointerType)
                 and isinstance(ptr.type.pointee, ir.IntType)
                 and isinstance(value.type, ir.IntType)
             ):
@@ -452,6 +479,15 @@ class Codegen:
                     value = self.builder.zext(value, ir.IntType(dst_bits), name=f"{instr.var_src.name}.store_zext")
                 elif src_bits > dst_bits:
                     value = self.builder.trunc(value, ir.IntType(dst_bits), name=f"{instr.var_src.name}.store_trunc")
+                self.builder.store(value, ptr)
+                return
+            if (
+                isinstance(ptr.type, ir.PointerType)
+                and isinstance(ptr.type.pointee, ir.IntType)
+                and isinstance(value.type, ir.PointerType)
+            ):
+                int_type = ptr.type.pointee
+                value = self.builder.ptrtoint(value, int_type, name=f"{instr.var_src.name}.store_ptrtoint")
                 self.builder.store(value, ptr)
                 return
             if (
@@ -530,8 +566,13 @@ class Codegen:
         if not isinstance(base.type, ir.PointerType):
             raise ValueError(f"GEP expects pointer base, got {base.type}")
 
+        const_offset: int | None = None
         if isinstance(instr.offset, int):
+            const_offset = instr.offset
             offset_value = ir.Constant(ir.IntType(32), instr.offset)
+        elif isinstance(instr.offset, TypedVariable) and instr.offset.name.isdigit():
+            const_offset = int(instr.offset.name)
+            offset_value = ir.Constant(ir.IntType(32), const_offset)
         else:
             offset_value = self._variables[instr.offset.name]
 
@@ -545,14 +586,13 @@ class Codegen:
                     result = result_i8
                 self._variables[instr.var_out.name] = result
                 return result
-            expected_result_type = self._build_type(instr.var_out.type.pointee)
-            is_field_access = isinstance(instr.offset, int) and expected_result_type != base.type.pointee
+            field_index: int | None = None
+            if const_offset is not None:
+                field_index = const_offset
+            elif hasattr(offset_value, "constant"):
+                field_index = int(offset_value.constant)
 
-            if is_field_access:
-                if hasattr(offset_value, "constant"):
-                    field_index = int(offset_value.constant)
-                else:
-                    raise ValueError(f"Struct field GEP requires constant offset: {instr}")
+            if field_index is not None:
                 indices = [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_index)]
             else:
                 indices = [offset_value]
@@ -952,6 +992,8 @@ class Codegen:
         if trait_name == "Add":
             if self._is_str_value(lhs):
                 return self._build_str_concat(lhs, rhs, instr.var_out.name)
+            if isinstance(lhs.type, ir.PointerType) and isinstance(rhs.type, ir.IntType):
+                return self.builder.gep(lhs, [rhs], name=instr.var_out.name)
             return self.builder.fadd(lhs, rhs, name=instr.var_out.name) if self._is_float_value(lhs) else self.builder.add(lhs, rhs, name=instr.var_out.name)
         if trait_name == "Sub":
             return self.builder.fsub(lhs, rhs, name=instr.var_out.name) if self._is_float_value(lhs) else self.builder.sub(lhs, rhs, name=instr.var_out.name)

@@ -144,6 +144,23 @@ class EHIR_ProjectCompiler:
             module.ast,
             keep_public_api=refrain.type != Refrain.TargetType.EXECUTABLE,
         )
+        lifted_method_names = {
+            directive.name for directive in module.ast if isinstance(directive, (Derective_fn, Derective_extern_fn))
+        }
+        lifted_methods: list[Derective_fn] = []
+        for directive in module.ast:
+            if isinstance(directive, Derective_impl):
+                if directive.trait_name is not None and directive.trait_name != "":
+                    continue
+                for method in directive.methods:
+                    if not isinstance(method, Derective_fn):
+                        continue
+                    if method.name in lifted_method_names:
+                        continue
+                    lifted_method_names.add(method.name)
+                    lifted_methods.append(method)
+        if lifted_methods:
+            module.ast.extend(lifted_methods)
         module.ast = [
             directive
             for directive in module.ast
@@ -256,17 +273,16 @@ class EHIR_ProjectCompiler:
                 target_node.module.ast.append(directive)
 
     def _is_backend_emittable(self, directive, concrete_type_names: set[str]) -> bool:
-        if getattr(directive, "generics", []):
-            if isinstance(directive, Derective_struct) and (
-                directive.name.startswith("__tuple_") or directive.name.startswith("__array_")
-            ):
-                return True
-            return False
-
         if isinstance(directive, Derective_fn):
+            if directive.name.startswith("std::src::vec::mod::"):
+                return True
             return all(
                 self._is_concrete_type(param.type, concrete_type_names) for param in directive.params
             ) and self._is_concrete_type(directive.ret_type, concrete_type_names)
+        if getattr(directive, "generics", []):
+            if isinstance(directive, Derective_struct):
+                return True
+            return False
         if isinstance(directive, Derective_struct):
             return all(self._is_concrete_type(param.type, concrete_type_names) for param in directive.params)
         if isinstance(directive, Derective_enum):

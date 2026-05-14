@@ -17,10 +17,15 @@ def _box_concrete_name(inner: Type) -> str:
 
 
 class MonomorphizationPass:
+    _GENERIC_MONO_PASSES = 4
+
     def run(self, ast: list[Derective]) -> list[Derective]:
         box_struct = next((d for d in ast if isinstance(d, Derective_struct) and d.name == "Box" and d.generics), None)
         if box_struct is None:
-            return ast
+            out = ast
+            for _ in range(self._GENERIC_MONO_PASSES):
+                out = self._monomorphize_generic_functions(out)
+            return out
 
         box_methods = [
             d
@@ -31,7 +36,10 @@ class MonomorphizationPass:
 
         concrete_box_types = self._collect_concrete_box_types(ast)
         if not concrete_box_types:
-            return ast
+            out = ast
+            for _ in range(self._GENERIC_MONO_PASSES):
+                out = self._monomorphize_generic_functions(out)
+            return out
 
         new_nodes: list[Derective] = []
         for concrete in concrete_box_types:
@@ -91,7 +99,79 @@ class MonomorphizationPass:
             filtered.append(d)
         new_nodes = [d for d in new_nodes if not (isinstance(d, Derective_fn) and d.name.endswith("::from_stack"))]
         filtered.extend(new_nodes)
-        return filtered
+        out = filtered
+        for _ in range(self._GENERIC_MONO_PASSES):
+            out = self._monomorphize_generic_functions(out)
+        return out
+
+    def _monomorphize_generic_functions(self, ast: list[Derective]) -> list[Derective]:
+        fn_by_name = {d.name: d for d in ast if isinstance(d, Derective_fn)}
+        call_specs: dict[str, dict[str, list[Type]]] = {}
+        for item in self._walk(ast):
+            if not isinstance(item, Instruction_call):
+                continue
+            target = fn_by_name.get(item.fn_name)
+            if target is None or not target.generics or not item.generics:
+                continue
+            if len(target.generics) != len(item.generics):
+                continue
+            signature = ",".join(mangle_type_name(generic) for generic in item.generics)
+            call_specs.setdefault(item.fn_name, {})[signature] = [deepcopy(generic) for generic in item.generics]
+
+        if not call_specs:
+            return ast
+
+        renames: dict[tuple[str, str], str] = {}
+        clones: list[Derective_fn] = []
+        for fn_name, specs in call_specs.items():
+            template = fn_by_name.get(fn_name)
+            if template is None or not template.generics:
+                continue
+            for signature, concrete_generics in specs.items():
+                mapping = {
+                    generic_param.name: concrete
+                    for generic_param, concrete in zip(template.generics, concrete_generics, strict=False)
+                }
+                clone = deepcopy(template)
+                clone.generics = []
+                clone.name = f"{template.name}__{signature}"
+                clone = self._rewrite_types(clone, mapping)
+                clones.append(clone)
+                renames[(fn_name, signature)] = clone.name
+
+        if not clones:
+            return ast
+
+        rewritten: list[Derective] = []
+        for directive in ast:
+            rewritten.append(self._rewrite_generic_calls(directive, renames))
+        rewritten.extend(self._rewrite_generic_calls(clone, renames) for clone in clones)
+        return rewritten
+
+    def _rewrite_generic_calls(self, value, renames: dict[tuple[str, str], str]):
+        if isinstance(value, Type):
+            if isinstance(value, Pointer):
+                return Pointer(self._rewrite_generic_calls(value.pointee, renames))
+            if isinstance(value, Reference):
+                return Reference(self._rewrite_generic_calls(value.pointee, renames))
+            return Type(value.name, [self._rewrite_generic_calls(generic, renames) for generic in value.generics])
+        if isinstance(value, list):
+            return [self._rewrite_generic_calls(item, renames) for item in value]
+        if isinstance(value, Primitive):
+            return value
+        if isinstance(value, Instruction_call):
+            if value.generics:
+                signature = ",".join(mangle_type_name(generic) for generic in value.generics)
+                renamed = renames.get((value.fn_name, signature))
+                if renamed is not None:
+                    return replace(value, fn_name=renamed, generics=[])
+            return value
+        if not is_dataclass(value):
+            return value
+        return replace(
+            value,
+            **{field.name: self._rewrite_generic_calls(getattr(value, field.name), renames) for field in fields(value)},
+        )
 
     def _build_concrete_enums(
         self,
