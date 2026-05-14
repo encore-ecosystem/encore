@@ -25,6 +25,8 @@ from ehir.postprocessor.derectives import (
 )
 from ehir.postprocessor.instructions import (
     ProcessedInstruction,
+    ProcessedInstruction_br,
+    ProcessedInstruction_cbr,
     ProcessedInstruction_add,
     ProcessedInstruction_and,
     ProcessedInstruction_call,
@@ -81,9 +83,11 @@ class Codegen:
         self._pointer_width_bits: int | None = None
         self._string_literal_counter = 0
         self._str_type: ir.IdentifiedStructType | None = None
+        self._enabled_functions: set[str] = set()
 
     def run(self, mod: ProcessedModule) -> ir.Module:
         self._reset_state()
+        self._enabled_functions = self._collect_enabled_functions(mod.funcs)
 
         for derective in mod.structs:
             self._codegen_struct_decl(derective)
@@ -92,13 +96,62 @@ class Codegen:
             self._codegen_struct_body(derective)
 
         for derective in mod.funcs:
+            if derective.name not in self._enabled_functions:
+                continue
             self._codegen_fn_decl(derective)
 
         for derective in mod.funcs:
+            if derective.name not in self._enabled_functions:
+                continue
             if isinstance(derective, ProcessedDerective_fn):
                 self._codegen_fn_body(derective)
 
         return self.module
+
+    def _collect_enabled_functions(
+        self, funcs: Sequence[ProcessedDerective_fn | ProcessedDerective_extern_fn]
+    ) -> set[str]:
+        by_name: dict[str, ProcessedDerective_fn | ProcessedDerective_extern_fn] = {fn.name: fn for fn in funcs}
+        by_emitted: dict[str, ProcessedDerective_fn | ProcessedDerective_extern_fn] = {}
+        for fn in funcs:
+            emitted = self._emit_like_symbol_name(fn.name)
+            by_emitted.setdefault(emitted, fn)
+        roots = [fn.name for fn in funcs if isinstance(fn, ProcessedDerective_fn) and fn.name == "main"]
+        if not roots:
+            return set(by_name.keys())
+
+        enabled: set[str] = set()
+        queue = list(roots)
+        while queue:
+            name = queue.pop()
+            if name in enabled:
+                continue
+            fn = by_name.get(name) or by_emitted.get(name)
+            if fn is None:
+                continue
+            enabled.add(name)
+            if not isinstance(fn, ProcessedDerective_fn):
+                continue
+            for block in fn.get_body():
+                for instr in block.body:
+                    if isinstance(instr, ProcessedInstruction_call):
+                        queue.append(instr.fn_name)
+                if isinstance(block.term, ProcessedInstruction_call):
+                    queue.append(block.term.fn_name)
+        out: set[str] = set()
+        for name in enabled:
+            fn = by_name.get(name) or by_emitted.get(name)
+            if fn is not None:
+                out.add(fn.name)
+        return out
+
+    def _emit_like_symbol_name(self, name: str) -> str:
+        if "::" not in name:
+            return name
+        owner_text, method_name = name.rsplit("::", 1)
+        owner_name = owner_text.split("[", 1)[0]
+        method = method_name.split("[", 1)[0]
+        return f"{owner_name}__{method}"
 
     def _codegen_struct_decl(self, struct: ProcessedDerective_struct):
         if struct.name in self._structs:
@@ -166,6 +219,7 @@ class Codegen:
 
         self._resolve_pending_phi_incomings()
 
+
     def _collect_block_predecessors(self, blocks: Sequence[ProcessedBlock]) -> dict[str, set[str]]:
         predecessors: dict[str, set[str]] = {}
         for block in blocks:
@@ -197,8 +251,6 @@ class Codegen:
             self._build_halloc(instr)
         elif isinstance(instr, ProcessedInstruction_hrealloc):
             self._build_hrealloc(instr)
-        elif isinstance(instr, Instruction_lcpos):
-            self._build_lcpos(instr)
         elif isinstance(instr, ProcessedInstruction_put):
             self._build_put(instr)
         elif isinstance(instr, ProcessedInstruction_load):
@@ -240,9 +292,9 @@ class Codegen:
             self._build_call(instr)
         elif isinstance(instr, ProcessedInstruction_ret):
             self._build_ret(instr)
-        elif isinstance(instr, Instruction_br):
+        elif isinstance(instr, (Instruction_br, ProcessedInstruction_br)):
             self._build_br(instr)
-        elif isinstance(instr, Instruction_cbr):
+        elif isinstance(instr, (Instruction_cbr, ProcessedInstruction_cbr)):
             self._build_cbr(instr)
         elif isinstance(instr, ProcessedInstruction_switch):
             self._build_switch(instr)
@@ -330,7 +382,14 @@ class Codegen:
     def _build_store(self, instr: ProcessedInstruction_store):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
-        value = self._variables[instr.var_src.name]
+        value = self._variables.get(instr.var_src.name)
+        if value is None:
+            src_t = instr.var_src.type
+            if src_t is not None and src_t.name == "void":
+                return
+            if instr.var_src.name.startswith(".drop_") or instr.var_src.name == ".drop_ret":
+                return
+            raise KeyError(instr.var_src.name)
         ptr = self._variables[instr.var_dst.name]
 
         if isinstance(ptr.type, ir.PointerType) and ptr.type.pointee == self._get_str_type():
@@ -354,6 +413,35 @@ class Codegen:
                 return
 
         if ptr.type != value.type.as_pointer():
+            if (
+                isinstance(ptr.type, ir.PointerType)
+                and isinstance(ptr.type.pointee, ir.IntType)
+                and ptr.type.pointee.width == 8
+            ):
+                cast_ptr = self.builder.bitcast(ptr, ir.PointerType(value.type), name=f"{instr.var_dst.name}.store_cast_ptr")
+                self.builder.store(value, cast_ptr)
+                return
+            if (
+                isinstance(ptr.type, ir.PointerType)
+                and isinstance(ptr.type.pointee, ir.PointerType)
+                and isinstance(value.type, ir.PointerType)
+            ):
+                value = self.builder.bitcast(value, ptr.type.pointee, name=f"{instr.var_src.name}.store_ptrcast")
+                self.builder.store(value, ptr)
+                return
+            if (
+                isinstance(ptr.type, ir.PointerType)
+                and isinstance(ptr.type.pointee, ir.IntType)
+                and isinstance(value.type, ir.IntType)
+            ):
+                dst_bits = ptr.type.pointee.width
+                src_bits = value.type.width
+                if src_bits < dst_bits:
+                    value = self.builder.zext(value, ir.IntType(dst_bits), name=f"{instr.var_src.name}.store_zext")
+                elif src_bits > dst_bits:
+                    value = self.builder.trunc(value, ir.IntType(dst_bits), name=f"{instr.var_src.name}.store_trunc")
+                self.builder.store(value, ptr)
+                return
             if (
                 isinstance(value.type, ir.BaseStructType)
                 and isinstance(ptr.type, ir.PointerType)
@@ -424,6 +512,15 @@ class Codegen:
             offset_value = self._variables[instr.offset.name]
 
         if isinstance(base.type.pointee, ir.BaseStructType):
+            if base.type.pointee.elements is None:
+                i8_ptr = self.builder.bitcast(base, ir.IntType(8).as_pointer(), name=f"{instr.var.name}.opaque_i8_ptr")
+                result_i8 = self.builder.gep(i8_ptr, [offset_value], name=f"{instr.var_out.name}.opaque_gep")
+                if instr.var_out.type is not None:
+                    result = self.builder.bitcast(result_i8, self._build_type(instr.var_out.type), name=instr.var_out.name)
+                else:
+                    result = result_i8
+                self._variables[instr.var_out.name] = result
+                return result
             expected_result_type = self._build_type(instr.var_out.type.pointee)
             is_field_access = isinstance(instr.offset, int) and expected_result_type != base.type.pointee
 
@@ -528,14 +625,20 @@ class Codegen:
         self.builder.comment("")
         self.builder.comment(str(instr).replace("\n", "\\n"))
         constant = self._build_primitive(instr.primitive)
-        self.builder.store(constant, self._variables[instr.var.name])
-
-    def _build_lcpos(self, instr: Instruction_lcpos):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
-        constant = self._build_primitive(instr.primitive)
-        self._variables[instr.var_out.name] = constant
-        return constant
+        dst = self._variables[instr.var.name]
+        if (
+            isinstance(dst.type, ir.PointerType)
+            and isinstance(dst.type.pointee, ir.IntType)
+            and isinstance(constant.type, ir.IntType)
+            and constant.type != dst.type.pointee
+        ):
+            dst_bits = dst.type.pointee.width
+            src_bits = constant.type.width
+            if src_bits < dst_bits:
+                constant = self.builder.zext(constant, ir.IntType(dst_bits), name=f"{instr.var.name}.put_zext")
+            elif src_bits > dst_bits:
+                constant = self.builder.trunc(constant, ir.IntType(dst_bits), name=f"{instr.var.name}.put_trunc")
+        self.builder.store(constant, dst)
 
     def _build_load(self, instr: ProcessedInstruction_load):
         self.builder.comment("")
@@ -546,6 +649,13 @@ class Codegen:
             # Treat repeated `load` on that value as a move.
             self._variables[instr.var_out.name] = ptr
             return ptr
+        if (
+            instr.var_out.type is not None
+            and isinstance(ptr.type.pointee, ir.IntType)
+            and ptr.type.pointee.width == 8
+        ):
+            expected_ptr = ir.PointerType(self._build_type(instr.var_out.type))
+            ptr = self.builder.bitcast(ptr, expected_ptr, name=f"{instr.var.name}.load_cast_ptr")
         value = self.builder.load(ptr, name=instr.var_out.name)
         self._variables[instr.var_out.name] = value
         return value
@@ -773,6 +883,10 @@ class Codegen:
     def _build_call(self, instr: ProcessedInstruction_call):
         self.builder.comment("")
         self.builder.comment(f"{instr}")
+        trait_result = self._try_build_trait_op_call(instr)
+        if trait_result is not None:
+            self._variables[instr.var_out.name] = trait_result
+            return trait_result
         func = self._get_or_declare_called_function(instr)
 
         expected_types = list(func.function_type.args)
@@ -794,6 +908,81 @@ class Codegen:
         result = self.builder.call(func, args, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
+
+    def _try_build_trait_op_call(self, instr: ProcessedInstruction_call):
+        if len(instr.args) != 2:
+            return None
+        if "::" not in instr.fn_name:
+            return None
+        tail = instr.fn_name.rsplit("::", 1)[-1]
+        trait_name: str | None = None
+        if tail == "op":
+            trait_name = instr.fn_name.rsplit("::", 2)[-2]
+        elif tail.endswith("__op"):
+            trait_name = tail[: -len("__op")]
+        if trait_name is None:
+            return None
+        lhs = self._get_typed_value(instr.args[0])
+        rhs = self._get_typed_value(instr.args[1])
+
+        if trait_name == "Add":
+            if self._is_str_value(lhs):
+                return self._build_str_concat(lhs, rhs, instr.var_out.name)
+            return self.builder.fadd(lhs, rhs, name=instr.var_out.name) if self._is_float_value(lhs) else self.builder.add(lhs, rhs, name=instr.var_out.name)
+        if trait_name == "Sub":
+            return self.builder.fsub(lhs, rhs, name=instr.var_out.name) if self._is_float_value(lhs) else self.builder.sub(lhs, rhs, name=instr.var_out.name)
+        if trait_name == "Mul":
+            return self.builder.fmul(lhs, rhs, name=instr.var_out.name) if self._is_float_value(lhs) else self.builder.mul(lhs, rhs, name=instr.var_out.name)
+        if trait_name == "Div":
+            if self._is_float_value(lhs):
+                return self.builder.fdiv(lhs, rhs, name=instr.var_out.name)
+            return self.builder.udiv(lhs, rhs, name=instr.var_out.name) if self._is_unsigned_type(instr.args[0].type) else self.builder.sdiv(lhs, rhs, name=instr.var_out.name)
+        if trait_name == "Rem":
+            if self._is_float_value(lhs):
+                return self.builder.frem(lhs, rhs, name=instr.var_out.name)
+            return self.builder.urem(lhs, rhs, name=instr.var_out.name) if self._is_unsigned_type(instr.args[0].type) else self.builder.srem(lhs, rhs, name=instr.var_out.name)
+        if trait_name == "Eq":
+            if self._is_str_value(lhs):
+                return self._build_str_eq(lhs, rhs, instr.var_out.name)
+            if self._is_float_value(lhs):
+                return self.builder.fcmp_ordered("==", lhs, rhs, name=instr.var_out.name)
+            return self.builder.icmp_unsigned("==", lhs, rhs, name=instr.var_out.name) if self._is_unsigned_type(instr.args[0].type) else self.builder.icmp_signed("==", lhs, rhs, name=instr.var_out.name)
+        if trait_name == "Ne":
+            if self._is_str_value(lhs):
+                eq = self._build_str_eq(lhs, rhs, f"{instr.var_out.name}.eq")
+                return self.builder.icmp_unsigned("==", eq, ir.Constant(ir.IntType(1), 0), name=instr.var_out.name)
+            if self._is_float_value(lhs):
+                return self.builder.fcmp_unordered("!=", lhs, rhs, name=instr.var_out.name)
+            return self.builder.icmp_unsigned("!=", lhs, rhs, name=instr.var_out.name) if self._is_unsigned_type(instr.args[0].type) else self.builder.icmp_signed("!=", lhs, rhs, name=instr.var_out.name)
+        if trait_name == "Lt":
+            if self._is_float_value(lhs):
+                return self.builder.fcmp_ordered("<", lhs, rhs, name=instr.var_out.name)
+            return self.builder.icmp_unsigned("<", lhs, rhs, name=instr.var_out.name) if self._is_unsigned_type(instr.args[0].type) else self.builder.icmp_signed("<", lhs, rhs, name=instr.var_out.name)
+        if trait_name == "Le":
+            if self._is_float_value(lhs):
+                return self.builder.fcmp_ordered("<=", lhs, rhs, name=instr.var_out.name)
+            return self.builder.icmp_unsigned("<=", lhs, rhs, name=instr.var_out.name) if self._is_unsigned_type(instr.args[0].type) else self.builder.icmp_signed("<=", lhs, rhs, name=instr.var_out.name)
+        if trait_name == "Gt":
+            if self._is_float_value(lhs):
+                return self.builder.fcmp_ordered(">", lhs, rhs, name=instr.var_out.name)
+            return self.builder.icmp_unsigned(">", lhs, rhs, name=instr.var_out.name) if self._is_unsigned_type(instr.args[0].type) else self.builder.icmp_signed(">", lhs, rhs, name=instr.var_out.name)
+        if trait_name == "Ge":
+            if self._is_float_value(lhs):
+                return self.builder.fcmp_ordered(">=", lhs, rhs, name=instr.var_out.name)
+            return self.builder.icmp_unsigned(">=", lhs, rhs, name=instr.var_out.name) if self._is_unsigned_type(instr.args[0].type) else self.builder.icmp_signed(">=", lhs, rhs, name=instr.var_out.name)
+        return None
+
+    def _build_str_eq(self, lhs, rhs, name: str):
+        if not self._is_str_value(lhs) or not self._is_str_value(rhs):
+            raise TypeError(f"Invalid str compare operands: {lhs.type} and {rhs.type}")
+        eq_fn = self._get_str_eq_function()
+        return self.builder.call(eq_fn, [lhs, rhs], name=name)
+
+    def _build_str_concat(self, lhs, rhs, name: str):
+        if not self._is_str_value(lhs) or not self._is_str_value(rhs):
+            raise TypeError(f"Invalid str concat operands: {lhs.type} and {rhs.type}")
+        concat_fn = self._get_str_concat_function()
+        return self.builder.call(concat_fn, [lhs, rhs], name=name)
 
     def _get_or_declare_called_function(self, instr: ProcessedInstruction_call) -> ir.Function:
         for fn in self.module.functions:
@@ -1083,9 +1272,17 @@ class Codegen:
 
         if isinstance(type, Usize_t):
             return ir.IntType(bits=self._get_pointer_width_bits() if type.size is None else type.size)
+        if type.name == "usize":
+            return ir.IntType(bits=self._get_pointer_width_bits())
+        if type.name.startswith("u") and type.name[1:].isdigit():
+            return ir.IntType(bits=int(type.name[1:]))
 
         if isinstance(type, Isize_t):
             return ir.IntType(bits=self._get_pointer_width_bits() if type.size is None else type.size)
+        if type.name == "isize":
+            return ir.IntType(bits=self._get_pointer_width_bits())
+        if type.name.startswith("i") and type.name[1:].isdigit():
+            return ir.IntType(bits=int(type.name[1:]))
 
         if isinstance(type, Float_t):
             match type.size:
@@ -1108,7 +1305,12 @@ class Codegen:
 
         if type.name not in self._structs:
             # Allow referencing external/opaque structs across refrain boundaries.
-            self._structs[type.name] = self.module.context.get_identified_type(type.name)
+            fallback = self.module.context.get_identified_type(type.name)
+            if fallback.is_opaque:
+                # Fallback sized layout for unresolved aggregate types (e.g. enums not
+                # materialized as structs in the current pipeline stage).
+                fallback.set_body(ir.IntType(8), ir.IntType(8).as_pointer())
+            self._structs[type.name] = fallback
         struct = self._structs[type.name]
 
         return struct
@@ -1178,10 +1380,12 @@ class Codegen:
 
     def _build_primitive(self, prim: Primitive) -> ir.Constant:
         if isinstance(prim, Usize):
-            bits = self._get_pointer_width_bits() if prim.type.size is None else prim.type.size
+            size = getattr(prim.type, "size", None)
+            bits = self._get_pointer_width_bits() if size is None else size
             return ir.Constant(ir.IntType(bits=bits), prim.val)
         if isinstance(prim, Isize):
-            bits = self._get_pointer_width_bits() if prim.type.size is None else prim.type.size
+            size = getattr(prim.type, "size", None)
+            bits = self._get_pointer_width_bits() if size is None else size
             return ir.Constant(ir.IntType(bits=bits), prim.val)
         if isinstance(prim, Float):
             return ir.Constant(self._build_type(prim.type), prim.val)

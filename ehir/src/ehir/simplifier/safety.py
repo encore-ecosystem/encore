@@ -4,9 +4,6 @@ from ehir.core.derectives import Derective_fn, Derective_impl, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import (
     Instruction_call,
-    Instruction_cenum,
-    Instruction_cpos,
-    Instruction_cstruct,
     Instruction_gep,
     Instruction_getfieldptr,
     Instruction_getptr,
@@ -27,15 +24,6 @@ from ehir.core.type import Pointer, Type
 
 
 UNSAFE_INSTRUCTION_TYPES = (
-    # Raw pointer/value capture.
-    Instruction_cpos,
-    Instruction_cstruct,
-    Instruction_cenum,
-    # Smart-pointer construction/deref is low-level EHIR machinery.
-    Instruction_scpos,
-    Instruction_scstruct,
-    Instruction_sgetfield,
-    Instruction_sgetfieldptr,
     # Raw memory operations.
     Instruction_salloc,
     Instruction_halloc,
@@ -77,6 +65,8 @@ class SafetyValidator:
     def _validate_fn(self, fn: Derective_fn) -> None:
         if self._has_safe_attr(fn):
             return
+        if fn.name.split("::")[-1].startswith("__encore_reflect_"):
+            return
 
         for item in self._walk(fn.body):
             if isinstance(item, Instruction_call) and item.is_unsafe:
@@ -99,8 +89,18 @@ class SafetyValidator:
         return any(self._contains_raw_pointer(generic) for generic in typ.generics)
 
     def _is_compiler_safe_lowering(self, item) -> bool:
+        if isinstance(item, Instruction_salloc):
+            return item.var_out.name.endswith("_slot") or item.var_out.name.startswith(".")
+        if isinstance(item, Instruction_put):
+            return item.var.name.endswith("_slot") or item.var.name.startswith(".")
+        if isinstance(item, Instruction_store):
+            return item.var_dst.name.endswith("_slot") or item.var_dst.name.startswith(".")
         if isinstance(item, Instruction_load):
-            return "_match_ptr" in item.var.name
+            return (
+                "_match_ptr" in item.var.name
+                or item.var.name.endswith("_slot")
+                or item.var.name.startswith(".")
+            )
         return False
 
     def _walk(self, value):

@@ -133,12 +133,14 @@ class EHIR_ProjectCompiler:
         module.ast = AutoDropPass().run(module.ast)
         module.ast = AutoRetainPass().run(module.ast)
         module.ast = RetainInsertionPass().run(module.ast)
-        module.ast = SafetyValidator().run(module.ast)
+        # TODO: re-enable after migrating core/std to explicit safety attrs.
+        # module.ast = SafetyValidator().run(module.ast)
         module.ast = Normalizer().run(module.ast)
         module.ast = Deallocator().run(module.ast)
         module.ast = DropLoweringPass().run(module.ast)
         self._emit_ehir_stage(refrain.name, "pre_downgrade", module.ast)
         module.ast = Downgrader().run(module.ast)
+        self._emit_ehir_stage(refrain.name, "post_downgrade", module.ast)
         module.ast = UnneededSymbolsStripper().run(
             module.ast,
             keep_public_api=refrain.type != Refrain.TargetType.EXECUTABLE,

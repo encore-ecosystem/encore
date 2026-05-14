@@ -372,6 +372,33 @@ class Downgrader:
         assert instr.field.type is not None
         final_field = ([instr.field, *instr.field_path])[-1]
         assert final_field.type is not None
+        owner_type = instr.var.type
+        assert owner_type is not None
+
+        # Mutating a value-typed variable must flow updated value back into the same SSA symbol.
+        # Otherwise getfieldptr works over a temporary copy and changes are lost.
+        if not isinstance(owner_type, (Pointer, Reference)):
+            owner_ptr = TypedVariable(name=f".{instr.var.name}_setfield_owner_ptr", type=Pointer(owner_type))
+            owner_writeback = TypedVariable(name=instr.var.name, type=owner_type)
+            field_ptr = TypedVariable(
+                name=f".{instr.var.name}_{final_field.name}_ptr",
+                type=Pointer(final_field.type),
+            )
+            getfieldptr = Instruction_getfieldptr(
+                var_out=field_ptr,
+                src=owner_ptr,
+                field=instr.field,
+                field_path=list(instr.field_path),
+            )
+            store_value = Instruction_store(var_src=instr.value, var_dst=field_ptr)
+            return [
+                Instruction_salloc(var_out=owner_ptr, type=owner_type),
+                Instruction_store(var_src=instr.var, var_dst=owner_ptr),
+                *self._downgrade_getfieldptr(getfieldptr),
+                store_value,
+                Instruction_load(var_out=owner_writeback, var=owner_ptr),
+            ]
+
         field_ptr = TypedVariable(name=f".{instr.var.name}_{final_field.name}_ptr", type=Pointer(final_field.type))
         getfieldptr = Instruction_getfieldptr(
             var_out=field_ptr,

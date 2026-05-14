@@ -25,6 +25,7 @@ from ehir.core.instructions import (
     Instruction_cenum,
     Instruction_cpos,
     Instruction_cstruct,
+    Instruction_div,
     Instruction_gep,
     Instruction_geq,
     Instruction_getfield,
@@ -461,17 +462,17 @@ class Parser:
         return Instruction_switch(cond_var=cond_var, default_case=default_label, cases=cases)
 
     def _parse_match(self) -> Instruction_match:
-        self._safe_consume(TokenType.MATCH)
+        self._safe_consume(TokenType.KW_MATCH)
         cond_var = self._parse_variable()
         self._safe_consume(TokenType.COMMA)
         default_label = self._parse_block_label()
 
         cases: list[MatchCase] = []
         self._safe_consume(TokenType.LEFT_BRACE)
-        while not isinstance(self._lookup_curr(), TokenType.RIGHT_BRACE):
-            variant = self._safe_consume(TokenType.IDENTIFIER).string
+        while self._lookup_curr() != TokenType.RIGHT_BRACE:
+            variant = self._safe_consume(TokenType.IDENTIFIER).value
             payload_var = None
-            if isinstance(self._lookup_curr(), TokenType.LEFT_PAREN):
+            if self._lookup_curr() == TokenType.LEFT_PAREN:
                 self._safe_consume(TokenType.LEFT_PAREN)
                 payload_var = self._parse_variable()
                 self._safe_consume(TokenType.RIGHT_PAREN)

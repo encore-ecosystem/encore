@@ -11,32 +11,28 @@ from ehir.core.derectives import (
     TraitMethod,
 )
 from ehir.core.derectives.base import Derective
-from ehir.core.enum import Enum, EnumVariant
+from ehir.core.enum import Enum, EnumVariant, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions.base import Assignable
-from ehir.core.instructions.capture import (
-    Instruction_cpos,
-    Instruction_lceos,
-    Instruction_lcsos,
-    Instruction_scsoh,
-    Instruction_scsos,
-)
-from ehir.core.instructions.control_flow import MatchCase
-from ehir.core.instructions.memory import (
+from ehir.core.instructions import (
+    BinOp,
+    Instruction_add,
+    Instruction_capenum,
+    Instruction_capstruct,
+    Instruction_div,
     Instruction_getfield,
     Instruction_getfieldptr,
     Instruction_load,
+    Instruction_mod,
+    Instruction_mul,
+    Instruction_put,
     Instruction_salloc,
     Instruction_sgetfieldptr,
     Instruction_store,
-)
-from ehir.core.instructions.operators.arithmetic import (
-    Instruction_add,
-    Instruction_div,
-    Instruction_mod,
-    Instruction_mul,
     Instruction_sub,
+    Instruction_wraph,
+    Instruction_wraps,
+    MatchCase,
 )
-from ehir.core.instructions.operators.base import BinOp
 from ehir.core.primitives import Float, Float_t, Isize, Isize_t, Str, Str_t, Usize, Usize_t
 from ehir.core.struct import Struct
 from ehir.core.type import HeapSmartPointer, Pointer, SmartPointer, StackSmartPointer, Type
@@ -484,6 +480,9 @@ class Translator:
                 if signature is not None:
                     return f"{resolved_trait_name}::{method_name}"
 
+        if trait_name in OPERATOR_TRAIT_MAPPING.values():
+            return f"{trait_name}::{method_name}"
+
         mapped = self._function_aliases.get(f"{trait_name}::{method_name}")
         if mapped is not None:
             return mapped
@@ -654,24 +653,18 @@ class Translator:
         variants: list[EnumVariant] = []
         for variant in statement.body:
             if isinstance(variant, s.UnitStructureDefinition):
-                variants.append(EnumVariant(name=variant.name))
+                variants.append(UnitLikeVariant(name=variant.name))
                 continue
 
             if isinstance(variant, s.TupleStructureDefinition):
-                if len(variant.fields) <= 1:
-                    payload_type = self._translate_type(variant.fields[0]) if variant.fields else None
-                    variants.append(EnumVariant(name=variant.name, type=payload_type))
-                    continue
-
-                payload_struct = self._ensure_enum_payload_struct(statement, variant, module_id=module_id)
-                payload_type = self._translate_type(Type(payload_struct.name, list(statement.generics)))
-                variants.append(EnumVariant(name=variant.name, type=payload_type))
+                payload_types = [self._translate_type(field) for field in variant.fields]
+                variants.append(TupleLikeVariant(name=variant.name, types=payload_types))
                 continue
 
             if isinstance(variant, s.CLikeStructureDefinition):
                 payload_struct = self._ensure_enum_payload_struct(statement, variant, module_id=module_id)
                 payload_type = self._translate_type(Type(payload_struct.name, list(statement.generics)))
-                variants.append(EnumVariant(name=variant.name, type=payload_type))
+                variants.append(TupleLikeVariant(name=variant.name, types=[payload_type]))
                 continue
 
         return Derective_enum(
@@ -1678,7 +1671,9 @@ class Translator:
 
         for idx, variant in enumerate(enum.variants):
             if variant.name == variant_name:
-                payload_type = None if variant.type is None else self._specialize_type(variant.type, generic_mapping)
+                payload_type: Type | None = None
+                if isinstance(variant, TupleLikeVariant) and variant.types:
+                    payload_type = self._specialize_type(variant.types[0], generic_mapping)
                 return variant_name, idx, payload_type
 
         raise TypeError(f"Unknown variant '{variant_name}' for enum '{enum.name}'")
@@ -1690,10 +1685,10 @@ class Translator:
         expected_type: Optional[Type] = None,
     ) -> Assignable:
         if isinstance(expr, s.Expression_BooleanLiteral):
-            return self._builder.build_lcpos(prim=Usize(int(expr.value), size=1), name=name)
+            return self._builder.build_capprim(prim=Usize(int(expr.value), size=1), name=name)
 
         elif isinstance(expr, s.Expression_StringLiteral):
-            return self._builder.build_lcpos(prim=Str(expr.value), name=name)
+            return self._builder.build_capprim(prim=Str(expr.value), name=name)
 
         elif isinstance(expr, s.Expression_IntegerLiteral):
             int_expected = expr.literal_type or expected_type
@@ -1706,12 +1701,12 @@ class Translator:
                     and base_expected.name[1:].isdigit()
                 ):
                     prim = Float(float(expr.value), size=self._infer_float_size(int_expected))
-                    return self._builder.build_lcpos(prim=prim, name=name)
+                    return self._builder.build_capprim(prim=prim, name=name)
             prim = self._build_integer_primitive(int(expr.value), int_expected)
-            return self._builder.build_lcpos(prim=prim, name=name)
+            return self._builder.build_capprim(prim=prim, name=name)
 
         elif isinstance(expr, s.Expression_FloatLiteral):
-            return self._builder.build_lcpos(
+            return self._builder.build_capprim(
                 prim=Float(
                     float(expr.value),
                     size=self._infer_float_size(expr.literal_type or expected_type),
@@ -1729,7 +1724,7 @@ class Translator:
             enum_expr = self._build_enum_from_path(expr)
             if enum_expr is not None:
                 out = Variable(name or self._advance_variable())
-                self._builder._add(Instruction_lceos(var_out=out, enum=enum_expr))
+                self._builder._add(Instruction_capenum(var_out=out, enum=enum_expr))
                 return Assignable(out)
 
             raise NotImplementedError(f"Translation for path expression {expr.name} is not implemented.")
@@ -1778,7 +1773,7 @@ class Translator:
         elif isinstance(expr, s.Expression_UnaryOperation):
             if expr.operator in ("!", "not"):
                 operand = self._translate_expression(expr.expr)
-                zero = self._builder.build_lcpos(prim=Usize(0, size=1))
+                zero = self._builder.build_capprim(prim=Usize(0, size=1))
                 return self._builder.build_binop("ieq", operand.var_out, zero.var_out, name)
             raise NotImplementedError(f"Translation for unary operator '{expr.operator}' is not implemented.")
 
@@ -1947,7 +1942,7 @@ class Translator:
             enum_expr = self._build_enum_from_call(expr)
             if enum_expr is not None:
                 out = Variable(name or self._advance_variable())
-                self._builder._add(Instruction_lceos(var_out=out, enum=enum_expr))
+                self._builder._add(Instruction_capenum(var_out=out, enum=enum_expr))
                 return Assignable(out)
 
             call_name, call_generics = self._resolve_function_call_target(expr)
@@ -2004,7 +1999,7 @@ class Translator:
         result_name = name or self._advance_variable()
         result_slot = self._create_stack_slot(
             f"{result_name}_slot",
-            self._builder.build_lcpos(prim=Usize(0, size=1)).var_out,
+            self._builder.build_capprim(prim=Usize(0, size=1)).var_out,
             Usize_t(1),
         )
 
@@ -2025,7 +2020,7 @@ class Translator:
         self._mark_current_block_terminated()
 
         self._builder.position_at_end(short_block)
-        short_value = self._builder.build_lcpos(prim=Usize(0 if expr.operator == "&&" else 1, size=1)).var_out
+        short_value = self._builder.build_capprim(prim=Usize(0 if expr.operator == "&&" else 1, size=1)).var_out
         self._builder._add(Instruction_store(var_src=short_value, var_dst=result_slot))
         self._builder.build_br(end_block.name)
         self._mark_current_block_terminated()
@@ -2097,7 +2092,7 @@ class Translator:
             variant="Err",
             payload=Struct(name=err_type.name, value=err_payload, type=err_type),
         )
-        self._builder._add(Instruction_lceos(var_out=err_value, enum=err_enum))
+        self._builder._add(Instruction_capenum(var_out=err_value, enum=err_enum))
         self._builder.build_ret(err_value)
         self._mark_current_block_terminated()
 
@@ -2322,9 +2317,10 @@ class Translator:
     def _allocate_stack_slot(self, slot_name: str, value_type: Type) -> Variable:
         if isinstance(value_type, (Usize_t, Isize_t, Float_t, Str_t)):
             init_prim = self._zero_primitive(value_type)
-            capture = Instruction_cpos(var_out=Variable(slot_name, Pointer(value_type)), primitive=init_prim)
-            self._builder._add(capture)
-            return capture.var_out
+            slot_ptr = Variable(slot_name, Pointer(value_type))
+            self._builder._add(Instruction_salloc(var_out=slot_ptr, type=value_type))
+            self._builder._add(Instruction_put(primitive=init_prim, var=slot_ptr))
+            return slot_ptr
 
         slot_ptr = Variable(slot_name, Pointer(value_type))
         self._builder._add(Instruction_salloc(var_out=slot_ptr, type=value_type))
@@ -2431,17 +2427,21 @@ class Translator:
         out = Variable(name or self._advance_variable())
 
         if isinstance(typ, HeapSmartPointer):
+            plain = Variable(self._advance_variable(), struct.as_type())
+            self._builder._add(Instruction_capstruct(var_out=plain, struct=struct))
             out.type = HeapSmartPointer(struct.as_type())
-            self._builder._add(Instruction_scsoh(var_out=out, struct=struct))
+            self._builder._add(Instruction_wraph(var_out=out, variable=plain))
             return Assignable(out)
 
         if isinstance(typ, StackSmartPointer):
+            plain = Variable(self._advance_variable(), struct.as_type())
+            self._builder._add(Instruction_capstruct(var_out=plain, struct=struct))
             out.type = StackSmartPointer(struct.as_type())
-            self._builder._add(Instruction_scsos(var_out=out, struct=struct))
+            self._builder._add(Instruction_wraps(var_out=out, variable=plain))
             return Assignable(out)
 
         out.type = struct.as_type()
-        self._builder._add(Instruction_lcsos(var_out=out, struct=struct))
+        self._builder._add(Instruction_capstruct(var_out=out, struct=struct))
         return Assignable(out)
 
     def _build_enum_from_path(self, expr: s.Expression_Path) -> Enum | None:
@@ -2454,7 +2454,7 @@ class Translator:
             return None
 
         translated_enum_type = self._translate_type(enum_type)
-        return Enum(name=translated_enum_type.name, generics=translated_enum_type.generics, variant=variant_name)
+        return Enum(name=translated_enum_type.name, generics=translated_enum_type.generics, variant=variant_name, args=[])
 
     def _build_enum_from_call(self, expr: s.Expression_Call) -> Enum | None:
         if len(expr.callee.segments) != 2:
@@ -2466,7 +2466,7 @@ class Translator:
             return None
         translated_enum_type = self._translate_type(enum_type)
 
-        payload = None
+        payload_var = None
         if expr.args:
             payload_type = self._lookup_enum_variant_type(enum_type, variant_name)
             if payload_type is None:
@@ -2502,8 +2502,12 @@ class Translator:
                     raise TypeError(f"Enum variant '{expr.name}' expects a single payload argument")
                 payload_var = self._translate_expression(expr.args[0], expected_type=payload_type).var_out
 
-            payload = Struct(name=payload_type.name, value=payload_var, type=payload_type)
-        return Enum(name=translated_enum_type.name, generics=translated_enum_type.generics, variant=variant_name, payload=payload)
+        return Enum(
+            name=translated_enum_type.name,
+            generics=translated_enum_type.generics,
+            variant=variant_name,
+            args=[] if payload_var is None else [payload_var],
+        )
 
     def _lookup_enum(self, typ: Type) -> Derective_enum | None:
         return self._enums.get(self._translate_type(typ).name)
@@ -2519,9 +2523,9 @@ class Translator:
         }
         for variant in enum_def.variants:
             if variant.name == variant_name:
-                if variant.type is None:
+                if not isinstance(variant, TupleLikeVariant) or not variant.types:
                     return None
-                return self._specialize_type(variant.type, generic_mapping)
+                return self._specialize_type(variant.types[0], generic_mapping)
         return None
 
     def _specialize_type(self, typ: Type, generic_mapping: dict[str, Type]) -> Type:

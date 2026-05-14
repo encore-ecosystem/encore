@@ -23,7 +23,6 @@ from ehir.core.instructions import (
     Instruction_capprim,
     Instruction_capstruct,
     Instruction_cbr,
-    Instruction_cpos,
     Instruction_div,
     Instruction_geq,
     Instruction_grt,
@@ -36,6 +35,8 @@ from ehir.core.instructions import (
     Instruction_neq,
     Instruction_or,
     Instruction_ret,
+    Instruction_salloc,
+    Instruction_put,
     Instruction_scstruct,
     Instruction_sgetfield,
     Instruction_shl,
@@ -178,10 +179,13 @@ class EHIR_Builder:
         self._add(capprim)
         return capprim
 
-    def build_cpos(self, prim: Primitive, name: Optional[str] = None) -> Instruction_cpos:
-        cpos = Instruction_cpos(self._reserve_variable(name, Pointer(prim.type)), prim)
-        self._add(cpos)
-        return cpos
+    def build_cpos(self, prim: Primitive, name: Optional[str] = None) -> Instruction_salloc:
+        # Legacy API compatibility: lower old cpos into salloc + put.
+        ptr = self._reserve_variable(name, Pointer(prim.type))
+        salloc = Instruction_salloc(var_out=ptr, type=prim.type)
+        self._add(salloc)
+        self._add(Instruction_put(primitive=prim, var=ptr))
+        return salloc
 
     def build_capstruct(
         self, struct_name: str, args: list[Variable], name: Optional[str] = None

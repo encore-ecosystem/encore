@@ -545,15 +545,8 @@ class AutoDropPass:
         owner_ptr_type = self._box_owner_ptr_type(child.type)
         owner_ptr = self._emit_owner_ptr(body, child, owner_ptr_type, f"{prefix}_owner")
         outer_ptr = self._emit_owner_field_ptr(body, owner_ptr, 3, Usize_t(1), f"{prefix}_outer")
-        visited_ptr = self._emit_owner_field_ptr(body, owner_ptr, 4, Usize_t(1), f"{prefix}_visited")
         true_var = self._emit_bool_const(body, True, f"{prefix}_true")
-        false_var = self._emit_bool_const(body, False, f"{prefix}_false")
-        body.extend(
-            [
-                Instruction_store(var_src=true_var, var_dst=outer_ptr),
-                Instruction_store(var_src=false_var, var_dst=visited_ptr),
-            ]
-        )
+        body.append(Instruction_store(var_src=true_var, var_dst=outer_ptr))
         self._emit_pass_call(body, child, 1, prefix)
 
     def _emit_pass_call(self, body: list, child: TypedVariable, pass_index: int, prefix: str) -> None:
@@ -760,7 +753,6 @@ class AutoDropPass:
                             generics=[],
                             args=[deepcopy(payload)],
                         ),
-                        Instruction_hfree(var=payload_ptr),
                         Instruction_ret(TypedVariable(".drop_ret", Type("void"))),
                     ],
                 )

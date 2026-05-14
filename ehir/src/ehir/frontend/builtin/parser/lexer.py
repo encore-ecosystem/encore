@@ -187,9 +187,15 @@ class Lexer:
                 self._append_token(TokenType.KW_TYPE)
             case "capprim":
                 self._append_token(TokenType.KW_CAPPRIM)
+            case "lcpos":
+                self._append_token(TokenType.KW_CAPPRIM)
             case "capenum":
                 self._append_token(TokenType.KW_CAPENUM)
+            case "lceos":
+                self._append_token(TokenType.KW_CAPENUM)
             case "capstruct":
+                self._append_token(TokenType.KW_CAPSTRUCT)
+            case "lcsos":
                 self._append_token(TokenType.KW_CAPSTRUCT)
             case "wraps":
                 self._append_token(TokenType.KW_WRAPS)
