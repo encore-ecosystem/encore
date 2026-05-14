@@ -25,6 +25,7 @@ from ehir.core.instructions import (
     Instruction_cenum,
     Instruction_cpos,
     Instruction_cstruct,
+    Instruction_div,
     Instruction_gep,
     Instruction_geq,
     Instruction_getfield,

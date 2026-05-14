@@ -25,6 +25,7 @@ from ehir.core.instructions import (
     Instruction_load,
     Instruction_match,
     Instruction_pcast,
+    Instruction_put,
     Instruction_ret,
     Instruction_salloc,
     Instruction_scstruct,
@@ -299,6 +300,8 @@ class Deallocator:
                 self._add_variable_usage(instr.var)
                 self._add_variable_usage(instr.value)
             elif isinstance(instr, Instruction_load):
+                self._add_variable_usage(instr.var)
+            elif isinstance(instr, Instruction_put):
                 self._add_variable_usage(instr.var)
             elif isinstance(
                 instr,

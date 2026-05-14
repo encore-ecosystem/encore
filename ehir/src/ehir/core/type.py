@@ -35,6 +35,29 @@ class Reference(Type):
     def __str__(self) -> str:
         return f"&{self.pointee}"
 
+
+class SmartPointer(Type):
+    pointee: Type
+    tag: str
+
+    def __init__(self, pointee: Type, tag: str):
+        super().__init__(name=pointee.name, generics=list(pointee.generics))
+        self.pointee = pointee
+        self.tag = tag
+
+    def __str__(self) -> str:
+        return f"{self.pointee}<{self.tag}>"
+
+
+class HeapSmartPointer(SmartPointer):
+    def __init__(self, pointee: Type):
+        super().__init__(pointee=pointee, tag="H")
+
+
+class StackSmartPointer(SmartPointer):
+    def __init__(self, pointee: Type):
+        super().__init__(pointee=pointee, tag="S")
+
 def is_box_type(typ: Type) -> bool:
     return not isinstance(typ, (Pointer, Reference)) and typ.name == "Box" and len(typ.generics) == 1
 

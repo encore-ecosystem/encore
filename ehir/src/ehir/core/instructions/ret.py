@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from ehir.core.variable import Variable
 
-from .control_flow_base import ControlFlow
+from .control_flow import ControlFlow
 
 
 @dataclass

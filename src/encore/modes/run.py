@@ -16,9 +16,7 @@ from encore.modes.build import (
 def add_run_parser(subparsers) -> tuple[str, Callable]:
     section = "run"
     run_parser = subparsers.add_parser(section, help="Build and run a project")
-    run_parser.add_argument(
-        "--backend", default="llvm", choices=set(AVAILABLE_BACKENDS.keys()), help="EHIR Compiler Backend"
-    )
+    run_parser.add_argument("--backend", default="llvm", choices=set(AVAILABLE_BACKENDS), help="EHIR Compiler Backend")
     run_parser.add_argument(
         "--profile", default="debug", choices=set(AVAILABLE_OPTPROFILES.keys()), help="Optimization profile"
     )

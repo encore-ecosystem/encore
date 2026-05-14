@@ -7,7 +7,6 @@ from typing import Callable
 
 from ehir.backend import EHIR_Backend
 from ehir.compiler import EHIR_ProjectCompiler
-from ehir_llvm_backend import EHIR_LLVM_Backend
 from rich.console import Console, Group
 from rich.live import Live
 from rich.spinner import Spinner
@@ -17,12 +16,12 @@ from ehir import Refrain
 from encore.frontend import EHIR_EncoreFrontend, format_module_reflection
 from encore.utils.manifest import ProjectManifest, ProjectTarget
 
-AVAILABLE_BACKENDS = {"llvm": EHIR_LLVM_Backend}
 AVAILABLE_OPTPROFILES = {
     "debug": EHIR_Backend.OptProfile.debug,
     "release": EHIR_Backend.OptProfile.release,
     "extreme": EHIR_Backend.OptProfile.extreme,
 }
+AVAILABLE_BACKENDS = ("llvm",)
 
 
 @dataclass
@@ -93,7 +92,7 @@ def add_build_parser(subparsers) -> tuple[str, Callable]:
     build_parser = subparsers.add_parser(section, help="Build a project")
     build_parser.add_argument("--release", action="store_true", help="Enable release optimizations")
     build_parser.add_argument(
-        "--backend", default="llvm", choices=set(AVAILABLE_BACKENDS.keys()), help="EHIR Compiler Backend"
+        "--backend", default="llvm", choices=set(AVAILABLE_BACKENDS), help="EHIR Compiler Backend"
     )
     build_parser.add_argument(
         "--profile", default="debug", choices=set(AVAILABLE_OPTPROFILES.keys()), help="Optimization profile"
@@ -113,12 +112,21 @@ def handle_build(args: Namespace):
 
 
 def create_compiler(cwd: Path, backend: str, profile: str, *, no_cache: bool = False) -> EHIR_ProjectCompiler:
+    backend_cls = _resolve_backend(backend)
     compiler = EHIR_ProjectCompiler(
         frontend=EHIR_EncoreFrontend(src_dir=cwd / "src"),
-        backend=AVAILABLE_BACKENDS[backend](target_dir=cwd / "target", opt_profile=AVAILABLE_OPTPROFILES[profile]),
+        backend=backend_cls(target_dir=cwd / "target", opt_profile=AVAILABLE_OPTPROFILES[profile]),
         use_cache=not no_cache,
     )
     return compiler
+
+
+def _resolve_backend(name: str):
+    if name == "llvm":
+        from ehir_llvm_backend import EHIR_LLVM_Backend
+
+        return EHIR_LLVM_Backend
+    raise RuntimeError(f"Unknown backend: {name}")
 
 
 def load_manifest(path: Path) -> ProjectManifest:

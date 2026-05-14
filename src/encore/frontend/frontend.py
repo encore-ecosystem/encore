@@ -18,6 +18,7 @@ from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
 from encore.frontend.reflection import (
     ModuleReflection,
+    RUNTIME_REFLECTION_RESERVED_NAMES,
     ReflectionSymbol,
     build_module_reflection,
     build_runtime_reflection_ast,
@@ -179,7 +180,9 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             reflection = build_module_reflection(id, source_ast)
             self._reflection_cache[id] = reflection
 
-        ast = build_runtime_reflection_ast(id, source_ast, reflection)
+        # TODO: re-enable runtime reflection injection after CFG normalization
+        # for generated reflect functions is stabilized.
+        ast = source_ast
         self._ast_cache[id] = ast
         return ast
 
@@ -427,8 +430,12 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return None
 
         if isinstance(statement, s.Statement_FunctionDefinition):
+            if statement.signature.name in RUNTIME_REFLECTION_RESERVED_NAMES:
+                return None
             return ExportBinding(statement.signature.name, ExportKind.FUNCTION, id, statement)
         if isinstance(statement, s.FunctionSignature):
+            if statement.name in RUNTIME_REFLECTION_RESERVED_NAMES:
+                return None
             return ExportBinding(statement.name, ExportKind.FUNCTION, id, statement)
         if isinstance(statement, s.Statement_StructureDefinition):
             return ExportBinding(statement.signature.name, ExportKind.STRUCT, id, statement)

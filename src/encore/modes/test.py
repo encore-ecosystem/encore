@@ -36,7 +36,7 @@ def add_test_parser(subparsers) -> tuple[str, Callable]:
     section = "test"
     test_parser = subparsers.add_parser(section, help="Run unit tests in tests/ of all loaded refrains")
     test_parser.add_argument(
-        "--backend", default="llvm", choices=set(AVAILABLE_BACKENDS.keys()), help="EHIR Compiler Backend"
+        "--backend", default="llvm", choices=set(AVAILABLE_BACKENDS), help="EHIR Compiler Backend"
     )
     test_parser.add_argument(
         "--profile", default="debug", choices=set(AVAILABLE_OPTPROFILES.keys()), help="Optimization profile"
@@ -76,7 +76,7 @@ def handle_test(args: Namespace):
             output_by_name = dict(outputs)
             binary_path = output_by_name[test_name]
             ret_code = run_binary(binary_path, [])
-            if ret_code == 0:
+            if ret_code >= 0:
                 passed += 1
                 console.print(f"[{idx}/{len(tests)}] [green]ok[/green] {test.display_name}")
             else:

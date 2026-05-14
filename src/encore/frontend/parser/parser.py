@@ -3,64 +3,49 @@ from pathlib import Path
 from typing import Optional
 
 from ehir.core.instructions.base import Assignable, Instruction
-from ehir.core.instructions.capture import (
-    Instruction_ceoh,
-    Instruction_ceos,
-    Instruction_cpoh,
-    Instruction_cpos,
-    Instruction_csoh,
-    Instruction_csos,
-    Instruction_lceos,
-    Instruction_lcpos,
-    Instruction_lcsos,
-    Instruction_scpoh,
-    Instruction_scpos,
-    Instruction_scsoh,
-    Instruction_scsos,
-)
-from ehir.core.instructions.control_flow import (
+from ehir.core.instructions import (
+    Instruction_add,
+    Instruction_and,
     Instruction_br,
     Instruction_call,
+    Instruction_capenum,
+    Instruction_capprim,
+    Instruction_capstruct,
     Instruction_cbr,
-    Instruction_match,
-    Instruction_ret,
-    Instruction_switch,
-)
-from ehir.core.instructions.control_flow.phi import Instruction_phi
-from ehir.core.instructions.memory import (
+    Instruction_cenum,
+    Instruction_cpos,
+    Instruction_cstruct,
+    Instruction_div,
+    Instruction_geq,
     Instruction_getfield,
     Instruction_getfieldptr,
     Instruction_getptr,
-    Instruction_hfree,
-    Instruction_load,
-    Instruction_pcast,
-    Instruction_put,
-    Instruction_salloc,
-    Instruction_sgetfield,
-    Instruction_sgetfieldptr,
-    Instruction_store,
-)
-from ehir.core.instructions.memory.halloc import Instruction_halloc
-from ehir.core.instructions.operators.arithmetic import (
-    Instruction_add,
-    Instruction_div,
-    Instruction_mod,
-    Instruction_mul,
-    Instruction_shl,
-    Instruction_shr,
-    Instruction_sub,
-)
-from ehir.core.instructions.operators.comparison import (
-    Instruction_geq,
     Instruction_grt,
+    Instruction_halloc,
+    Instruction_hfree,
+    Instruction_ieq,
     Instruction_leq,
     Instruction_les,
-)
-from ehir.core.instructions.operators.logic import (
-    Instruction_and,
-    Instruction_ieq,
+    Instruction_load,
+    Instruction_match,
+    Instruction_mod,
+    Instruction_mul,
     Instruction_neq,
     Instruction_or,
+    Instruction_pcast,
+    Instruction_put,
+    Instruction_ret,
+    Instruction_salloc,
+    Instruction_scpos,
+    Instruction_scstruct,
+    Instruction_setfield,
+    Instruction_sgetfield,
+    Instruction_sgetfieldptr,
+    Instruction_shl,
+    Instruction_shr,
+    Instruction_store,
+    Instruction_sub,
+    Instruction_switch,
     Instruction_xor,
 )
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
@@ -76,19 +61,14 @@ from encore.utils.diagnostics import CompileDiagnostic
 
 TRACE_MAX_LINES_FOR_UNIT = 5
 SAFE_EHIR_INSTRUCTION_TYPES = (
-    Instruction_lcpos,
-    Instruction_lceos,
-    Instruction_lcsos,
+    Instruction_capprim,
+    Instruction_capenum,
+    Instruction_capstruct,
     Instruction_cpos,
-    Instruction_ceoh,
-    Instruction_ceos,
-    Instruction_cpoh,
-    Instruction_csoh,
-    Instruction_csos,
+    Instruction_cenum,
+    Instruction_cstruct,
     Instruction_scpos,
-    Instruction_scpoh,
-    Instruction_scsos,
-    Instruction_scsoh,
+    Instruction_scstruct,
     Instruction_add,
     Instruction_sub,
     Instruction_mul,
@@ -105,6 +85,7 @@ SAFE_EHIR_INSTRUCTION_TYPES = (
     Instruction_and,
     Instruction_or,
     Instruction_xor,
+    Instruction_setfield,
 )
 ALLOWED_SAFE_EHIR_INSTRUCTION_TYPES = SAFE_EHIR_INSTRUCTION_TYPES + (Instruction_call,)
 FORBIDDEN_EHIR_INSTRUCTION_TYPES = (
@@ -113,7 +94,6 @@ FORBIDDEN_EHIR_INSTRUCTION_TYPES = (
     Instruction_cbr,
     Instruction_match,
     Instruction_switch,
-    Instruction_phi,
 )
 
 

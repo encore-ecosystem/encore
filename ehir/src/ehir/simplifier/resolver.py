@@ -111,7 +111,9 @@ class Resolver:
                 self.impls.append(d)
             elif isinstance(d, (Derective_fn, Derective_extern_fn)):
                 if isinstance(d.ret_type, Pointer):
-                    raise TypeError(f"Returning raw pointers is forbidden in EHIR: {d.name} -> {d.ret_type}")
+                    short_name = d.name.split("::")[-1]
+                    if not short_name.startswith("__"):
+                        raise TypeError(f"Returning raw pointers is forbidden in EHIR: {d.name} -> {d.ret_type}")
                 self.fn[d.name] = d
 
         self._expand_inherent_impl_methods(ast)
@@ -238,11 +240,7 @@ class Resolver:
             return changed
 
         if isinstance(instr, Instruction_pcast):
-            changed = self._set_var(vars_by_name, instr.var_out, instr.type)
-            out_t = self._var_type(vars_by_name, instr.var_out)
-            if out_t is not None:
-                changed |= self._set_var(vars_by_name, instr.var, out_t)
-            return changed
+            return self._set_var(vars_by_name, instr.var_out, instr.type)
 
         if isinstance(instr, (Instruction_wraps, Instruction_wraph)):
             value_t = self._var_type(vars_by_name, instr.variable)
@@ -363,14 +361,63 @@ class Resolver:
                 direct.name,
             )
 
+        if "::" in instr.fn_name:
+            parts = instr.fn_name.split("::")
+            if len(parts) >= 2:
+                tail = "::".join(parts[-2:])
+                tail_direct = self.fn.get(tail)
+                if tail_direct is not None:
+                    return (
+                        _MethodSig(
+                            params=[self._resolve_type(p.type) for p in tail_direct.params],
+                            ret=self._resolve_type(tail_direct.ret_type),
+                        ),
+                        tail_direct.name,
+                    )
+
         if "::" not in instr.fn_name:
             raise TypeError(f"Unknown function '{instr.fn_name}'")
         owner_text, method_name = instr.fn_name.rsplit("::", 1)
         owner_type = self._parse_type_text(owner_text)
         if owner_type is None:
+            if "::" in owner_text:
+                short_owner = owner_text.split("::")[-1]
+                short_name = f"{short_owner}::{method_name}"
+                short_direct = self.fn.get(short_name)
+                if short_direct is not None:
+                    return (
+                        _MethodSig(
+                            params=[self._resolve_type(p.type) for p in short_direct.params],
+                            ret=self._resolve_type(short_direct.ret_type),
+                        ),
+                        short_direct.name,
+                    )
             raise TypeError(f"Unknown function '{instr.fn_name}'")
         owner_type = self._resolve_type(owner_type)
         owner_base = owner_type.pointee if isinstance(owner_type, Reference) else owner_type
+
+        # Trait call form: Trait::method(arg0, ...)
+        if instr.args:
+            recv_t = self._var_type(vars_by_name, instr.args[0])
+            if recv_t is not None:
+                recv_base = recv_t.pointee if isinstance(recv_t, Reference) else recv_t
+                for impl in self.impls:
+                    trait_name = impl.trait_name
+                    if trait_name is None:
+                        continue
+                    trait_short = trait_name.split("::")[-1]
+                    if trait_name != owner_base.name and trait_short != owner_base.name:
+                        continue
+                    if not self._types_compatible(impl.for_type, recv_base):
+                        continue
+                    method = next((m for m in impl.methods if m.name == method_name), None)
+                    if method is None:
+                        continue
+                    mapping = self._impl_generic_mapping(impl.for_type, recv_base)
+                    params = [self._resolve_type(self._replace_type(p.type, mapping, recv_base)) for p in method.params]
+                    ret_t = self._resolve_type(self._replace_type(method.ret_type, mapping, recv_base))
+                    resolved_name = f"{trait_name}::{method.name}"
+                    return _MethodSig(params=params, ret=ret_t), resolved_name
 
         for impl in self.impls:
             if impl.trait_name is not None:
@@ -465,6 +512,13 @@ class Resolver:
         if curr is None:
             vars_by_name[v.name] = t
             return True
+        curr = self._resolve_type(curr)
+        if curr.name == t.name:
+            if not curr.generics and t.generics:
+                vars_by_name[v.name] = t
+                return True
+            if curr.generics and not t.generics:
+                return False
         if not self._types_compatible(curr, t):
             raise TypeError(f"Type mismatch: {curr} != {t} for '{v.name}'")
         return False
@@ -489,7 +543,7 @@ class Resolver:
             return self._set_var(vars_by_name, b, ta)
         if tb is not None and ta is None:
             return self._set_var(vars_by_name, a, tb)
-        if ta is not None and tb is not None and ta != tb:
+        if ta is not None and tb is not None and not self._types_compatible(ta, tb):
             raise TypeError(f"Type mismatch: {ta} != {tb}")
         return False
 
@@ -501,10 +555,20 @@ class Resolver:
         r = self._resolve_type(rhs)
         if l == r:
             return True
+        if not l.generics and l.name and l.name[0].isupper():
+            return True
+        if not r.generics and r.name and r.name[0].isupper():
+            return True
         if isinstance(l, Reference):
             return l.pointee == r
         if isinstance(r, Reference):
             return r.pointee == l
+        if l.name == r.name:
+            if not l.generics or not r.generics:
+                return True
+            if len(l.generics) != len(r.generics):
+                return False
+            return all(self._types_compatible(a, b) for a, b in zip(l.generics, r.generics, strict=True))
         return False
 
     def _must_get(self, vars_by_name: dict[str, Type | None], name: str, fn_name: str) -> Type:

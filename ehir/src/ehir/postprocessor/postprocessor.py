@@ -10,6 +10,7 @@ from ehir.core.instructions import (
     Instruction_call,
     Instruction_capprim,
     Instruction_cbr,
+    Instruction_div,
     Instruction_gep,
     Instruction_geq,
     Instruction_getfieldptr,
@@ -37,8 +38,8 @@ from ehir.core.instructions import (
     Instruction_switch,
     Instruction_xor,
 )
-from ehir.core.instructions.arithmetic import Instruction_div
 from ehir.core.instructions.base import Instruction
+from ehir.core.primitives import Usize_t
 from ehir.core.variable import TypedVariable
 from ehir.postprocessor.instructions import (
     ProcessedControlFlow,
@@ -170,7 +171,6 @@ class Postprocessor:
             )
         if isinstance(instr, Instruction_call):
             assert instr.var_out.type
-            assert len(instr.generics) == 0
             args = []
             for arg in instr.args:
                 assert arg.type
@@ -247,9 +247,9 @@ class Postprocessor:
             return ProcessedInstruction_br(label=term.label)
 
         if isinstance(term, Instruction_cbr):
-            assert isinstance(term.cond_var, TypedVariable)
+            cond_t = term.cond_var.type or Usize_t(1)
             return ProcessedInstruction_cbr(
-                cond_var=term.cond_var,
+                cond_var=TypedVariable(term.cond_var.name, cond_t),
                 true_br_label=term.true_br_label,
                 else_br_label=term.else_br_label,
             )
@@ -273,6 +273,7 @@ class Postprocessor:
 
         owner_text, method_name = name.rsplit("::", 1)
         owner_name = owner_text.split("[", 1)[0]
+        method_name = method_name.split("[", 1)[0]
         return f"{owner_name}__{self._emit_method_name(method_name)}"
 
     def _emit_method_name(self, method_name: str) -> str:
