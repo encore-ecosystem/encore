@@ -231,7 +231,6 @@ def _emit_reflection_artifacts(compiler: EHIR_ProjectCompiler) -> None:
     if not isinstance(frontend, EHIR_EncoreFrontend):
         return
 
-    reflection_root = compiler.backend.profile_path / "reflection"
     for module_id, reflection in frontend._reflection_cache.items():
         artifact_path = _reflection_artifact_path(compiler, Path(module_id))
         artifact_path.parent.mkdir(parents=True, exist_ok=True)

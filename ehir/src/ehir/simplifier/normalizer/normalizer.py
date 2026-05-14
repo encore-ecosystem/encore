@@ -2,7 +2,6 @@ from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_fn
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import ControlFlow, Instruction_br, Instruction_load, Instruction_ret, Instruction_salloc, Instruction_store
-from ehir.core.instructions.base import Instruction
 from ehir.core.type import Pointer
 from ehir.core.variable import TypedVariable
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn

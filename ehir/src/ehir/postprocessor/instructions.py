@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from ehir.core.instructions.base import Instruction
 from ehir.core.primitives import Usize
-from ehir.core.primitives.base import Primitive, PrimitiveType
+from ehir.core.primitives.base import Primitive
 from ehir.core.type import Type
 from ehir.core.variable import TypedVariable
 

@@ -2,7 +2,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
-from ehir.core.instructions.base import Assignable, Instruction
+from ehir.core.instructions.base import Instruction
 from ehir.core.instructions import (
     Instruction_add,
     Instruction_and,
@@ -17,33 +17,21 @@ from ehir.core.instructions import (
     Instruction_cstruct,
     Instruction_div,
     Instruction_geq,
-    Instruction_getfield,
-    Instruction_getfieldptr,
-    Instruction_getptr,
     Instruction_grt,
-    Instruction_halloc,
-    Instruction_hfree,
     Instruction_ieq,
     Instruction_leq,
     Instruction_les,
-    Instruction_load,
     Instruction_match,
     Instruction_mod,
     Instruction_mul,
     Instruction_neq,
     Instruction_or,
-    Instruction_pcast,
-    Instruction_put,
     Instruction_ret,
-    Instruction_salloc,
     Instruction_scpos,
     Instruction_scstruct,
     Instruction_setfield,
-    Instruction_sgetfield,
-    Instruction_sgetfieldptr,
     Instruction_shl,
     Instruction_shr,
-    Instruction_store,
     Instruction_sub,
     Instruction_switch,
     Instruction_xor,
@@ -1198,9 +1186,14 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     def _parse_type(self) -> Type:
         is_mut = False
+        is_prefix_ref = False
         if self._peek_curr().type == TokenType.KW_MUT:
             self._safe_consume(TokenType.KW_MUT)
             is_mut = True
+
+        if self._peek_curr().type == TokenType.AMPERSAND:
+            self._safe_consume(TokenType.AMPERSAND)
+            is_prefix_ref = True
 
         typ = self._parse_type_base()
 
@@ -1220,6 +1213,11 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 typ = StackSmartPointer(typ)
         elif self._peek_curr().type == TokenType.AMPERSAND:
             self._safe_consume(TokenType.AMPERSAND)
+            typ = AnySmartPointer(typ)
+
+        if is_prefix_ref:
+            if isinstance(typ, AnySmartPointer):
+                raise TypeError(f"Unexpected duplicate reference annotation in type '{typ}'")
             typ = AnySmartPointer(typ)
 
         return make_mutable_type(typ) if is_mut else typ

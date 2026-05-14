@@ -88,8 +88,6 @@ class MonomorphizationPass:
                 continue
             if isinstance(d, Derective_fn) and d.name.startswith("Box[T]::"):
                 continue
-            if isinstance(d, Derective_enum) and d.generics:
-                continue
             filtered.append(d)
         new_nodes = [d for d in new_nodes if not (isinstance(d, Derective_fn) and d.name.endswith("::from_stack"))]
         filtered.extend(new_nodes)
@@ -192,7 +190,7 @@ class MonomorphizationPass:
             inner = typ.generics[0]
             if isinstance(inner, PrimitiveType):
                 out[str(inner)] = deepcopy(inner)
-            elif not inner.generics and inner.name.isidentifier() and inner.name not in {"T", "Self"}:
+            elif not inner.generics and inner.name not in {"T", "Self"}:
                 out[str(inner)] = deepcopy(inner)
 
     def _rewrite_box_uses_in_value(self, value):
@@ -226,7 +224,11 @@ class MonomorphizationPass:
             return value
         if isinstance(value, Enum):
             rewritten_generics = [self._rewrite_enum_type(generic, enum_names) for generic in value.generics]
-            if value.name in enum_names and rewritten_generics:
+            if (
+                value.name in enum_names
+                and rewritten_generics
+                and not any(self._is_placeholder_type(generic) for generic in rewritten_generics)
+            ):
                 concrete_type = Type(value.name, rewritten_generics)
                 return replace(
                     value,
@@ -272,7 +274,11 @@ class MonomorphizationPass:
         if isinstance(typ, Reference):
             return Reference(self._rewrite_enum_type(typ.pointee, enum_names))
         rewritten_generics = [self._rewrite_enum_type(generic, enum_names) for generic in typ.generics]
-        if typ.name in enum_names and rewritten_generics:
+        if (
+            typ.name in enum_names
+            and rewritten_generics
+            and not any(self._is_placeholder_type(generic) for generic in rewritten_generics)
+        ):
             return Type(mangle_type_name(Type(typ.name, rewritten_generics)))
         return Type(typ.name, rewritten_generics)
 

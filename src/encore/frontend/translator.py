@@ -26,6 +26,7 @@ from ehir.core.instructions import (
     Instruction_mul,
     Instruction_put,
     Instruction_salloc,
+    Instruction_setfield,
     Instruction_sgetfieldptr,
     Instruction_store,
     Instruction_sub,
@@ -153,6 +154,7 @@ class Translator:
             wildcard_arm: MatchBodyArmLike | None,
             arm_blocks: dict[int, object],
             arm_payload_types: dict[int, Type | None],
+            arm_variant_indices: dict[int, int],
         ):
             self.scrutinee = scrutinee
             self.base_var_vals = base_var_vals
@@ -162,6 +164,7 @@ class Translator:
             self.wildcard_arm = wildcard_arm
             self.arm_blocks = arm_blocks
             self.arm_payload_types = arm_payload_types
+            self.arm_variant_indices = arm_variant_indices
 
     class _LoopContext:
         def __init__(self, *, label: str | None, break_target: str, continue_target: str):
@@ -188,6 +191,7 @@ class Translator:
         self._terminated_blocks: set[str] = set()
         self._var_vals: dict[str, Variable] = {}
         self._var_ptrs: dict[str, Variable] = {}
+        self._source_var_types: dict[str, Type] = {}
         self._assignment_targets: dict[str, str] = {}
         self._funcs = {}
         self._source_signatures = {}
@@ -853,6 +857,7 @@ class Translator:
         prev_builder_variables = getattr(self._builder, "variables", {})
         prev_var_vals = self._var_vals
         prev_var_ptrs = self._var_ptrs
+        prev_source_var_types = self._source_var_types
         prev_assignment_targets = self._assignment_targets
         prev_terminated_blocks = self._terminated_blocks
         prev_loop_stack = self._loop_stack
@@ -862,6 +867,7 @@ class Translator:
         self._builder.variables = {param.name: param for param in fn.params}
         self._var_vals = {}
         self._var_ptrs = {}
+        self._source_var_types = {}
         self._assignment_targets = {}
         self._terminated_blocks = set()
         self._loop_stack = []
@@ -871,7 +877,9 @@ class Translator:
         entry_block = self._builder.append_block("entry")
         self._builder.position_at_end(entry_block)
 
+        source_param_types = {param.name: param.type for param in source_params}
         for param in fn.params:
+            self._remember_source_type(param, source_param_types.get(param.name, param.type))
             if param.name in mutable_params:
                 self._var_ptrs[param.name] = Variable(param.name, param.type)
                 continue
@@ -886,6 +894,7 @@ class Translator:
         self._builder.variables = prev_builder_variables
         self._var_vals = prev_var_vals
         self._var_ptrs = prev_var_ptrs
+        self._source_var_types = prev_source_var_types
         self._assignment_targets = prev_assignment_targets
         self._terminated_blocks = prev_terminated_blocks
         self._loop_stack = prev_loop_stack
@@ -1004,6 +1013,21 @@ class Translator:
             return None
         return self._translate_type(concrete_type)
 
+    def _remember_source_type(self, var: Variable, source_type: Type | None) -> None:
+        if source_type is None:
+            return
+        self._source_var_types[var.name] = source_type
+
+    def _source_type_for_var(self, var: Variable) -> Type | None:
+        return self._source_var_types.get(var.name)
+
+    def _field_owner_type(self, var: Variable) -> Type | None:
+        return self._source_type_for_var(var) or var.type
+
+    def _is_source_reference_like(self, var: Variable) -> bool:
+        source_type = self._source_type_for_var(var)
+        return is_reference_like_type(source_type) or is_reference_like_type(var.type)
+
     def _fresh_temp_name(self, prefix: str) -> str:
         self._unique_variable_idx += 1
         return f"{prefix}_{self._unique_variable_idx}"
@@ -1029,7 +1053,7 @@ class Translator:
                 return dst_ptr
 
             src = self._resolve_struct_field_chain(expr.name)
-            if is_reference_like_type(src.type):
+            if self._is_source_reference_like(src):
                 self._builder._add(Instruction_sgetfieldptr(var_out=dst_ptr, src=src, field=field))
             else:
                 self._builder._add(Instruction_getfieldptr(var_out=dst_ptr, src=src, field=field))
@@ -1152,6 +1176,7 @@ class Translator:
                 val.var_out.type = expected_type
             slot_ptr = self._create_stack_slot(statement.name, val.var_out, expected_type)
 
+        self._remember_source_type(slot_ptr, statement.type)
         self._var_ptrs[statement.name] = slot_ptr
 
     def _translate_ret(self, statement: s.Statement_Ret):
@@ -1193,6 +1218,10 @@ class Translator:
                 self._builder._add(Instruction_store(var_src=val.var_out, var_dst=slot_ptr))
             else:
                 self._var_vals[statement.name] = val.var_out
+                self._remember_source_type(
+                    val.var_out,
+                    self._source_type_for_var(val.var_out) or expected_type or val.var_out.type,
+                )
             return
 
         if isinstance(statement.target, s.Expression_StructField):
@@ -1205,11 +1234,17 @@ class Translator:
                 expected_type = self._lookup_field_type(lvalue_ptr.type.pointee, statement.target.field)
             else:
                 src = self._resolve_struct_field_chain(statement.target.name)
-                if is_reference_like_type(src.type):
-                    self._builder._add(Instruction_sgetfieldptr(var_out=dst_ptr, src=src, field=field))
+                expected_type = self._lookup_field_type(self._field_owner_type(src), statement.target.field)
+                val = self._translate_expression(
+                    assign_expr,
+                    expected_type=expected_type,
+                )
+                if self._is_source_reference_like(src):
+                    self._builder._add(Instruction_setfield(var=src, field=field, value=val.var_out))
                 else:
                     self._builder._add(Instruction_getfieldptr(var_out=dst_ptr, src=src, field=field))
-                expected_type = self._lookup_field_type(src.type, statement.target.field)
+                    self._builder._add(Instruction_store(var_src=val.var_out, var_dst=dst_ptr))
+                return
 
             val = self._translate_expression(
                 assign_expr,
@@ -1359,10 +1394,16 @@ class Translator:
             self._builder.append_block(f"if_cond_{if_id}_{idx}") for idx in range(1, branch_count)
         ]
         else_block = self._builder.append_block(f"if_else_{if_id}") if statement.else_body is not None else None
-        end_block = self._builder.append_block(f"if_end_{if_id}")
+        end_block = self._builder.append_block(f"if_end_{if_id}") if else_block is None else None
 
         base_var_vals = dict(self._var_vals)
         base_var_ptrs = dict(self._var_ptrs)
+
+        def ensure_end_block():
+            nonlocal end_block
+            if end_block is None:
+                end_block = self._builder.append_block(f"if_end_{if_id}")
+            return end_block
 
         for idx, branch in enumerate(statement.branches):
             self._builder.position_at_end(cond_blocks[idx])
@@ -1372,7 +1413,7 @@ class Translator:
             false_target = (
                 cond_blocks[idx + 1].name
                 if idx + 1 < branch_count
-                else (else_block.name if else_block else end_block.name)
+                else (else_block.name if else_block else ensure_end_block().name)
             )
             cond = self._translate_expression(branch.expr)
             self._builder.build_cbr(cond.var_out, branch_bodies[idx].name, false_target)
@@ -1381,7 +1422,7 @@ class Translator:
             self._builder.position_at_end(branch_bodies[idx])
             self._translate_block(branch.body)
             if not self._is_current_block_terminated():
-                self._builder.build_br(end_block.name)
+                self._builder.build_br(ensure_end_block().name)
                 self._mark_current_block_terminated()
 
         if else_block is not None:
@@ -1391,12 +1432,13 @@ class Translator:
             self._var_ptrs = dict(base_var_ptrs)
             self._translate_block(statement.else_body)
             if not self._is_current_block_terminated():
-                self._builder.build_br(end_block.name)
+                self._builder.build_br(ensure_end_block().name)
                 self._mark_current_block_terminated()
 
-        self._builder.position_at_end(end_block)
-        self._var_vals = dict(base_var_vals)
-        self._var_ptrs = dict(base_var_ptrs)
+        if end_block is not None:
+            self._builder.position_at_end(end_block)
+            self._var_vals = dict(base_var_vals)
+            self._var_ptrs = dict(base_var_ptrs)
 
     def _translate_match(self, statement: s.Statement_Match):
         self._translate_match_common(statement, is_expression=False)
@@ -1503,7 +1545,19 @@ class Translator:
         self._var_ptrs = dict(prepared.base_var_ptrs)
         payload_type = prepared.arm_payload_types[idx]
         if arm.binding is not None and payload_type is not None:
-            self._var_vals[arm.binding] = Variable(arm.binding, payload_type)
+            binding_var = Variable(arm.binding, payload_type)
+            variant_field_index = prepared.arm_variant_indices[idx] + 1
+            payload_ptr = Variable(self._advance_variable(), Pointer(payload_type))
+            self._builder._add(
+                Instruction_getfield(
+                    var_out=payload_ptr,
+                    src=prepared.scrutinee.var_out,
+                    field=Variable(str(variant_field_index), Pointer(payload_type)),
+                )
+            )
+            self._builder._add(Instruction_load(var_out=binding_var, var=payload_ptr))
+            self._var_vals[arm.binding] = binding_var
+            self._remember_source_type(binding_var, payload_type)
 
     def _enter_match_default_scope(self, prepared: "_PreparedMatch"):
         self._builder.position_at_end(prepared.default_block)
@@ -1842,8 +1896,7 @@ class Translator:
             return self._translate_struct_initialization(self._translate_type(array_type), args, name)
 
         elif isinstance(expr, s.Expression_StructInitialization):
-            target_struct_type = self._translate_type(expr.name)
-            field_types = self._lookup_struct_field_types(target_struct_type)
+            field_types = self._lookup_struct_field_types(expr.name)
             args = [
                 self._translate_expression(
                     arg_exp,
@@ -1852,18 +1905,12 @@ class Translator:
                 ).var_out
                 for idx, arg_exp in enumerate(expr.args)
             ]
-            return self._translate_struct_initialization(self._translate_type(expr.name), args, name)
+            return self._translate_struct_initialization(expr.name, args, name)
 
         elif isinstance(expr, s.Expression_StructField):
             src = self._resolve_struct_field_chain(expr.name)
             field = Variable(expr.field)
-            field_type_raw = self._lookup_field_type(src.type, expr.field)
-            field_type = self._translate_type(field_type_raw) if field_type_raw is not None else None
-            if is_reference_like_type(src.type):
-                instr = self._builder.build_sgetfield(src=src, field=field)
-                if field_type is not None:
-                    instr.var_out.type = field_type
-                return instr
+            field_type = self._lookup_field_type(self._field_owner_type(src), expr.field)
 
             instr = Instruction_getfield(var_out=Variable(name or self._advance_variable()), src=src, field=field)
             if field_type is not None:
@@ -1878,14 +1925,9 @@ class Translator:
 
             src = self._translate_expression(expr.base).var_out
             field = Variable(str(idx))
-            field_type = self._lookup_field_type(src.type, field.name)
+            field_type = self._lookup_field_type(self._field_owner_type(src), field.name)
             if field_type is None:
                 raise TypeError(f"Unable to resolve index '{idx}' for type '{src.type}'")
-
-            if is_reference_like_type(src.type):
-                instr = self._builder.build_sgetfield(src=src, field=field)
-                instr.var_out.type = field_type
-                return instr
 
             instr = Instruction_getfield(var_out=Variable(name or self._advance_variable()), src=src, field=field)
             instr.var_out.type = field_type
@@ -1895,7 +1937,13 @@ class Translator:
         elif isinstance(expr, s.Expression_MethodCall):
             receiver = self._translate_expression(expr.receiver).var_out
             if receiver.type is None:
-                raise TypeError(f"Unable to infer receiver type for method call '{expr.method}'")
+                source_type = self._source_type_for_var(receiver)
+                if source_type is not None:
+                    receiver.type = self._translate_type(source_type)
+                elif isinstance(expr.receiver, s.Expression_Path) and len(expr.receiver.segments) == 1:
+                    receiver.type = self._resolve_variable_type(expr.receiver.name)
+                if receiver.type is None:
+                    raise TypeError(f"Unable to infer receiver type for method call '{expr.method}'")
 
             fn_name, callee = self._resolve_method_callable(receiver.type, expr.method)
 
@@ -1933,6 +1981,8 @@ class Translator:
                 name=name,
                 is_unsafe=fn_name in self._extern_fns and self._unsafe_depth > 0,
             )
+            if source_signature is not None and source_signature.type is not None:
+                self._remember_source_type(call.var_out, source_signature.type)
             if callee is not None:
                 generic_mapping = {generic.name: concrete for generic, concrete in zip(callee.generics, generics)}
                 call.var_out.type = self._specialize_type(callee.ret_type, generic_mapping)
@@ -1973,6 +2023,8 @@ class Translator:
                 name=name,
                 is_unsafe=call_name in self._extern_fns and self._unsafe_depth > 0,
             )
+            if source_signature is not None and source_signature.type is not None:
+                self._remember_source_type(call.var_out, source_signature.type)
             callee = self._funcs.get(call_name)
             if callee is not None:
                 callee_generics = getattr(callee, "generics", [])
@@ -2237,12 +2289,14 @@ class Translator:
 
         arm_blocks: dict[int, object] = {}
         arm_payload_types: dict[int, Type | None] = {}
+        arm_variant_indices: dict[int, int] = {}
         cases: list[MatchCase] = []
         for idx, arm in enumerate(arms):
             if arm.is_wildcard:
                 continue
             arm_blocks[idx] = self._builder.append_block(f"{arm_prefix}_{match_id}_{idx}")
-            variant_name, _, payload_type = self._resolve_match_arm_common(scrutinee.var_out.type, arm)
+            variant_name, variant_index, payload_type = self._resolve_match_arm_common(scrutinee.var_out.type, arm)
+            arm_variant_indices[idx] = variant_index
             arm_payload_types[idx] = payload_type
             payload_var = (
                 Variable(arm.binding, payload_type) if arm.binding is not None and payload_type is not None else None
@@ -2260,6 +2314,7 @@ class Translator:
             wildcard_arm=wildcard_arm,
             arm_blocks=arm_blocks,
             arm_payload_types=arm_payload_types,
+            arm_variant_indices=arm_variant_indices,
         )
 
     def _normalize_match_scrutinee_type(self, typ: Type) -> Type:
@@ -2311,6 +2366,7 @@ class Translator:
             self._unique_variable_idx += 1
             name = f"{ptr.name}_{self._unique_variable_idx}"
         out = Variable(name or self._advance_variable(), pointee_type)
+        self._remember_source_type(out, self._source_type_for_var(ptr))
         self._builder._add(Instruction_load(var_out=out, var=ptr))
         return Assignable(out)
 
@@ -2388,12 +2444,9 @@ class Translator:
         src = self._resolve_variable(parts[0])
         for segment in parts[1:]:
             field = Variable(segment)
-            field_type = self._lookup_field_type(src.type, segment)
-            if is_reference_like_type(src.type):
-                instr = self._builder.build_sgetfield(src=src, field=field)
-            else:
-                instr = Instruction_getfield(var_out=Variable(self._advance_variable()), src=src, field=field)
-                self._builder._add(instr)
+            field_type = self._lookup_field_type(self._field_owner_type(src), segment)
+            instr = Instruction_getfield(var_out=Variable(self._advance_variable()), src=src, field=field)
+            self._builder._add(instr)
             if field_type is not None:
                 instr.var_out.type = field_type
             src = instr.var_out
@@ -2409,6 +2462,8 @@ class Translator:
             return None
         if not isinstance(root_ptr.type, Pointer):
             return None
+        if is_reference_like_type(self._source_type_for_var(root_ptr)):
+            return None
         if isinstance(root_ptr.type.pointee, SmartPointer):
             return None
 
@@ -2423,24 +2478,32 @@ class Translator:
     def _translate_struct_initialization(
         self, typ: Type, args: list[Variable], name: Optional[str] = None
     ) -> Assignable:
-        struct = Struct(typ.name, typ.generics, args)
+        source_type = unwrap_for_storage(typ)
+        struct_type = source_type.pointee if is_reference_like_type(source_type) else source_type
+        struct_type = self._translate_type(struct_type)
+        struct = Struct(struct_type.name, struct_type.generics, args)
         out = Variable(name or self._advance_variable())
 
-        if isinstance(typ, HeapSmartPointer):
+        if isinstance(source_type, HeapSmartPointer):
             plain = Variable(self._advance_variable(), struct.as_type())
+            self._remember_source_type(plain, source_type.pointee)
             self._builder._add(Instruction_capstruct(var_out=plain, struct=struct))
-            out.type = HeapSmartPointer(struct.as_type())
+            out.type = self._translate_type(source_type)
+            self._remember_source_type(out, source_type)
             self._builder._add(Instruction_wraph(var_out=out, variable=plain))
             return Assignable(out)
 
-        if isinstance(typ, StackSmartPointer):
+        if isinstance(source_type, StackSmartPointer):
             plain = Variable(self._advance_variable(), struct.as_type())
+            self._remember_source_type(plain, source_type.pointee)
             self._builder._add(Instruction_capstruct(var_out=plain, struct=struct))
-            out.type = StackSmartPointer(struct.as_type())
+            out.type = self._translate_type(source_type)
+            self._remember_source_type(out, source_type)
             self._builder._add(Instruction_wraps(var_out=out, variable=plain))
             return Assignable(out)
 
         out.type = struct.as_type()
+        self._remember_source_type(out, typ)
         self._builder._add(Instruction_capstruct(var_out=out, struct=struct))
         return Assignable(out)
 
@@ -2546,7 +2609,7 @@ class Translator:
     def _lookup_struct_field_types(self, typ: Type) -> list[Type]:
         typ = unwrap_for_storage(typ)
         base_type = typ.pointee if is_reference_like_type(typ) else typ
-        struct_def = self._structs.get(base_type.name)
+        struct_def = self._resolve_struct_definition(base_type.name)
         if not isinstance(struct_def, s.CLikeStructureDefinition):
             return []
         generic_mapping = {generic.name: concrete for generic, concrete in zip(struct_def.generics, base_type.generics)}
@@ -2558,7 +2621,7 @@ class Translator:
 
         typ = unwrap_for_storage(typ)
         base_type = typ.pointee if is_reference_like_type(typ) else typ
-        struct_def = self._structs.get(base_type.name)
+        struct_def = self._resolve_struct_definition(base_type.name)
         if not isinstance(struct_def, s.CLikeStructureDefinition):
             return None
 
@@ -2566,6 +2629,23 @@ class Translator:
         for field_param in struct_def.fields:
             if field_param.name == field:
                 return self._translate_type(self._specialize_type(field_param.type, generic_mapping))
+        return None
+
+    def _resolve_struct_definition(self, type_name: str) -> s.CLikeStructureDefinition | None:
+        struct_def = self._structs.get(type_name)
+        if isinstance(struct_def, s.CLikeStructureDefinition):
+            return struct_def
+
+        if "::" in type_name:
+            return None
+
+        matches = [
+            definition
+            for name, definition in self._structs.items()
+            if isinstance(definition, s.CLikeStructureDefinition) and name.endswith(f"::{type_name}")
+        ]
+        if len(matches) == 1:
+            return matches[0]
         return None
 
     def _translate_type(self, typ: Type) -> Type:
@@ -2582,9 +2662,9 @@ class Translator:
             self._ensure_runtime_array_struct(array_size(typ))
             return Type(typ.name, [self._translate_type(generic) for generic in typ.generics])
         if isinstance(typ, HeapSmartPointer):
-            return HeapSmartPointer(self._translate_type(typ.pointee))
+            return Type("Box", [self._translate_type(typ.pointee)])
         if isinstance(typ, StackSmartPointer):
-            return StackSmartPointer(self._translate_type(typ.pointee))
+            return Type("Box", [self._translate_type(typ.pointee)])
         if is_raw_pointer_type(typ):
             return Pointer(self._translate_type(typ.pointee))
         if typ.name == "bool":
@@ -2647,11 +2727,12 @@ class Translator:
 
         concrete_kind: type[Type] | None = None
         for arg in args:
-            if isinstance(arg.type, HeapSmartPointer):
+            source_type = unwrap_for_storage(self._source_type_for_var(arg) or arg.type) if (self._source_type_for_var(arg) or arg.type) is not None else None
+            if isinstance(source_type, HeapSmartPointer):
                 if concrete_kind is not None and concrete_kind is not HeapSmartPointer:
                     raise TypeError(f"Mixed smart-pointer kinds in call '{fn_name}' are not supported yet")
                 concrete_kind = HeapSmartPointer
-            elif isinstance(arg.type, StackSmartPointer):
+            elif isinstance(source_type, StackSmartPointer):
                 if concrete_kind is not None and concrete_kind is not StackSmartPointer:
                     raise TypeError(f"Mixed smart-pointer kinds in call '{fn_name}' are not supported yet")
                 concrete_kind = StackSmartPointer

@@ -1,7 +1,6 @@
 from copy import deepcopy
 from dataclasses import dataclass
 
-from ehir.core.struct import Struct
 from ehir.core.type import Type
 from ehir.core.variable import Variable
 

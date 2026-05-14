@@ -39,7 +39,6 @@ from ehir.simplifier import (
     RetainInsertionPass,
     Resolver,
 )
-from ehir.simplifier.safety import SafetyValidator
 from ehir.simplifier.stripper import UnneededSymbolsStripper
 
 COMPILER_VERSION = version(__package__ or "ehir")
@@ -258,6 +257,10 @@ class EHIR_ProjectCompiler:
 
     def _is_backend_emittable(self, directive, concrete_type_names: set[str]) -> bool:
         if getattr(directive, "generics", []):
+            if isinstance(directive, Derective_struct) and (
+                directive.name.startswith("__tuple_") or directive.name.startswith("__array_")
+            ):
+                return True
             return False
 
         if isinstance(directive, Derective_fn):
@@ -529,16 +532,19 @@ class EHIR_ProjectCompiler:
 
     def _builtin_box_directives(self) -> list[Derective]:
         core_root = self._core_dir()
-        extension = self.frontend.get_file_extension()
-        owner_id = core_root / f"owner{extension}"
-        box_id = core_root / f"smart_box{extension}"
+        owner_id = core_root / "owner.ehir"
+        box_id = core_root / "smart_box.ehir"
+
+        from ehir.frontend.builtin import EHIR_DirectFrontend
+
+        core_frontend = self.frontend if self.frontend.get_file_extension() == ".ehir" else EHIR_DirectFrontend()
 
         directives: list[Derective] = []
         seen_symbols: set[tuple[type, str]] = set()
         for module_id in (owner_id, box_id):
             if not module_id.exists():
                 continue
-            module = self.frontend.get_module_by_id(module_id)
+            module = core_frontend.get_module_by_id(module_id)
             for directive in module.ast:
                 if isinstance(directive, Derective_import):
                     continue

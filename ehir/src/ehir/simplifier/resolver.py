@@ -13,7 +13,7 @@ from ehir.core.derectives import (
     Derective_typealias,
 )
 from ehir.core.derectives.base import Derective
-from ehir.core.enum import Enum, TupleLikeVariant, UnitLikeVariant
+from ehir.core.enum import TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import (
     Instruction_add,
     Instruction_and,
@@ -51,7 +51,7 @@ from ehir.core.instructions import (
 from ehir.core.primitives import Char_t, Float_t, Isize_t, Str_t, Usize_t
 from ehir.core.primitives.base import PrimitiveType
 from ehir.core.type import Pointer, Reference, Type, box_pointee, is_box_type
-from ehir.core.variable import Parameter, TypedVariable, Variable
+from ehir.core.variable import Parameter, Variable
 
 _BOOL = Usize_t(1)
 _BIN_SAME = (
@@ -333,7 +333,9 @@ class Resolver:
             for exp_t, arg in zip(spec_types, instr.enum.args, strict=False):
                 changed |= self._unify_var(vars_by_name, arg, exp_t)
 
-        changed |= self._set_var(vars_by_name, instr.var_out, self._resolve_type(Type(instr.enum.name, concrete_generics)))
+        changed |= self._set_var(
+            vars_by_name, instr.var_out, self._resolve_type(Type(instr.enum.name, concrete_generics))
+        )
         return changed
 
     def _resolve_call(self, instr: Instruction_call, vars_by_name: dict[str, Type | None]) -> bool:
@@ -441,7 +443,9 @@ class Resolver:
                 mapping = {f"T{i}": g for i, g in enumerate(owner_type.generics)}
                 if owner_type.generics:
                     mapping["T"] = owner_type.generics[0]
-                params = [self._resolve_type(self._replace_generics_by_name(p.type, mapping)) for p in generic_fn.params]
+                params = [
+                    self._resolve_type(self._replace_generics_by_name(p.type, mapping)) for p in generic_fn.params
+                ]
                 ret = self._resolve_type(self._replace_generics_by_name(generic_fn.ret_type, mapping))
                 return (
                     _MethodSig(params=params, ret=ret),
@@ -458,7 +462,9 @@ class Resolver:
             return deepcopy(mapping[typ.name])
         return Type(typ.name, [self._replace_generics_by_name(g, mapping) for g in typ.generics])
 
-    def _resolve_getfield(self, instr: Instruction_getfield | Instruction_getfieldptr, vars_by_name: dict[str, Type | None], as_ptr: bool) -> bool:
+    def _resolve_getfield(
+        self, instr: Instruction_getfield | Instruction_getfieldptr, vars_by_name: dict[str, Type | None], as_ptr: bool
+    ) -> bool:
         field_t = self._field_path_type(vars_by_name, instr.src, [instr.field, *instr.field_path])
         if field_t is None:
             return False
@@ -466,7 +472,9 @@ class Resolver:
             field_t = Pointer(field_t)
         return self._set_var(vars_by_name, instr.var_out, field_t)
 
-    def _field_path_type(self, vars_by_name: dict[str, Type | None], src: Variable, path: list[Variable]) -> Type | None:
+    def _field_path_type(
+        self, vars_by_name: dict[str, Type | None], src: Variable, path: list[Variable]
+    ) -> Type | None:
         src_t = self._var_type(vars_by_name, src)
         if src_t is None:
             return None
@@ -551,24 +559,24 @@ class Resolver:
         return vars_by_name.get(v.name) or v.type
 
     def _types_compatible(self, lhs: Type, rhs: Type) -> bool:
-        l = self._resolve_type(lhs)
-        r = self._resolve_type(rhs)
-        if l == r:
+        lhs = self._resolve_type(lhs)
+        rhs = self._resolve_type(rhs)
+        if lhs == rhs:
             return True
-        if not l.generics and l.name and l.name[0].isupper():
+        if not lhs.generics and lhs.name and lhs.name[0].isupper():
             return True
-        if not r.generics and r.name and r.name[0].isupper():
+        if not rhs.generics and rhs.name and rhs.name[0].isupper():
             return True
-        if isinstance(l, Reference):
-            return l.pointee == r
-        if isinstance(r, Reference):
-            return r.pointee == l
-        if l.name == r.name:
-            if not l.generics or not r.generics:
+        if isinstance(lhs, Reference):
+            return lhs.pointee == rhs
+        if isinstance(rhs, Reference):
+            return rhs.pointee == lhs
+        if lhs.name == rhs.name:
+            if not lhs.generics or not rhs.generics:
                 return True
-            if len(l.generics) != len(r.generics):
+            if len(lhs.generics) != len(rhs.generics):
                 return False
-            return all(self._types_compatible(a, b) for a, b in zip(l.generics, r.generics, strict=True))
+            return all(self._types_compatible(a, b) for a, b in zip(lhs.generics, rhs.generics, strict=True))
         return False
 
     def _must_get(self, vars_by_name: dict[str, Type | None], name: str, fn_name: str) -> Type:
