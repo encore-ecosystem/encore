@@ -10,6 +10,12 @@ from ehir.core.type import Pointer, Reference, Type
 class UnneededSymbolsStripper:
     def run(self, ast: list[Derective], *, keep_public_api: bool = True) -> list[Derective]:
         fns = {directive.name: directive for directive in ast if isinstance(directive, Derective_fn)}
+        for directive in ast:
+            if isinstance(directive, Derective_impl):
+                for method in directive.methods:
+                    fns.setdefault(method.name, method)
+        emitted_to_fn = {self._emit_like_symbol_name(name): name for name in fns}
+        normalized_to_fn = {self._normalize_fn_lookup_name(name): name for name in fns}
         reachable_fns = {
             directive.name
             for directive in ast
@@ -30,12 +36,16 @@ class UnneededSymbolsStripper:
             if fn is None:
                 continue
             for call_name in self._collect_called_function_names(fn):
-                if call_name in extern_fns and call_name not in reachable_fns:
-                    reachable_fns.add(call_name)
+                canonical_call_name = emitted_to_fn.get(call_name, call_name)
+                canonical_call_name = normalized_to_fn.get(
+                    self._normalize_fn_lookup_name(canonical_call_name), canonical_call_name
+                )
+                if canonical_call_name in extern_fns and canonical_call_name not in reachable_fns:
+                    reachable_fns.add(canonical_call_name)
                     continue
-                if call_name in fns and call_name not in reachable_fns:
-                    reachable_fns.add(call_name)
-                    pending.append(call_name)
+                if canonical_call_name in fns and canonical_call_name not in reachable_fns:
+                    reachable_fns.add(canonical_call_name)
+                    pending.append(canonical_call_name)
 
         reachable_types = set()
         if keep_public_api:
@@ -97,10 +107,15 @@ class UnneededSymbolsStripper:
             return
         if isinstance(typ, (Pointer, Reference)):
             self._collect_type(typ.pointee, out)
-        if typ.name and typ.name.isidentifier():
+        if typ.name and not self._is_placeholder_type_name(typ.name):
             out.add(typ.name)
         for generic in typ.generics:
             self._collect_type(generic, out)
+
+    def _is_placeholder_type_name(self, name: str) -> bool:
+        if name in {"Self", "T"}:
+            return True
+        return len(name) == 2 and name.startswith("T") and name[1].isdigit()
 
     def _walk(self, value):
         if value is None or isinstance(value, (str, int, float, bool)):
@@ -118,3 +133,22 @@ class UnneededSymbolsStripper:
         if is_dataclass(value):
             for field in fields(value):
                 yield from self._walk(getattr(value, field.name))
+
+    def _emit_like_symbol_name(self, name: str) -> str:
+        if "::" not in name:
+            return name
+        owner_text, method_name = name.rsplit("::", 1)
+        owner_name = owner_text.split("[", 1)[0]
+        method = method_name.split("[", 1)[0]
+        return f"{owner_name}__{method}"
+
+    def _normalize_fn_lookup_name(self, name: str) -> str:
+        text = name
+        if text.startswith("[") and "]" in text:
+            text = text.split("]", 1)[1]
+        if "::" not in text:
+            return text.split("[", 1)[0]
+        owner_text, method_name = text.rsplit("::", 1)
+        owner_name = owner_text.split("[", 1)[0]
+        method = method_name.split("[", 1)[0]
+        return f"{owner_name}::{method}"

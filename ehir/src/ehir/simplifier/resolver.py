@@ -353,15 +353,30 @@ class Resolver:
     def _resolve_callable_signature(
         self, instr: Instruction_call, vars_by_name: dict[str, Type | None]
     ) -> tuple[_MethodSig, str] | None:
+        def build_sig(fn_directive) -> _MethodSig:
+            fn_generics = getattr(fn_directive, "generics", [])
+            if fn_generics:
+                explicit_generics = [self._resolve_type(generic) for generic in instr.generics]
+                if len(explicit_generics) == len(fn_generics):
+                    mapping = {
+                        generic_param.name: concrete
+                        for generic_param, concrete in zip(fn_generics, explicit_generics, strict=False)
+                    }
+                    return _MethodSig(
+                        params=[
+                            self._resolve_type(self._replace_generics_by_name(param.type, mapping))
+                            for param in fn_directive.params
+                        ],
+                        ret=self._resolve_type(self._replace_generics_by_name(fn_directive.ret_type, mapping)),
+                    )
+            return _MethodSig(
+                params=[self._resolve_type(param.type) for param in fn_directive.params],
+                ret=self._resolve_type(fn_directive.ret_type),
+            )
+
         direct = self.fn.get(instr.fn_name)
         if direct is not None:
-            return (
-                _MethodSig(
-                    params=[self._resolve_type(p.type) for p in direct.params],
-                    ret=self._resolve_type(direct.ret_type),
-                ),
-                direct.name,
-            )
+            return (build_sig(direct), direct.name)
 
         if "::" in instr.fn_name:
             parts = instr.fn_name.split("::")
@@ -369,13 +384,7 @@ class Resolver:
                 tail = "::".join(parts[-2:])
                 tail_direct = self.fn.get(tail)
                 if tail_direct is not None:
-                    return (
-                        _MethodSig(
-                            params=[self._resolve_type(p.type) for p in tail_direct.params],
-                            ret=self._resolve_type(tail_direct.ret_type),
-                        ),
-                        tail_direct.name,
-                    )
+                    return (build_sig(tail_direct), tail_direct.name)
 
         if "::" not in instr.fn_name:
             raise TypeError(f"Unknown function '{instr.fn_name}'")
@@ -387,13 +396,7 @@ class Resolver:
                 short_name = f"{short_owner}::{method_name}"
                 short_direct = self.fn.get(short_name)
                 if short_direct is not None:
-                    return (
-                        _MethodSig(
-                            params=[self._resolve_type(p.type) for p in short_direct.params],
-                            ret=self._resolve_type(short_direct.ret_type),
-                        ),
-                        short_direct.name,
-                    )
+                    return (build_sig(short_direct), short_direct.name)
             raise TypeError(f"Unknown function '{instr.fn_name}'")
         owner_type = self._resolve_type(owner_type)
         owner_base = owner_type.pointee if isinstance(owner_type, Reference) else owner_type
