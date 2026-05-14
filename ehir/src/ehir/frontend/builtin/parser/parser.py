@@ -1,6 +1,5 @@
 from ehir.core.block import Block
 from ehir.core.derectives import (
-    Derective_cimp,
     Derective_enum,
     Derective_extern_fn,
     Derective_fn,
@@ -12,7 +11,7 @@ from ehir.core.derectives import (
     TraitMethod,
 )
 from ehir.core.derectives.base import Derective
-from ehir.core.enum import Enum, EnumVariant, TupleLikeVariant, UnitLikeVariant
+from ehir.core.enum import Enum, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import (
     Instruction_add,
     Instruction_and,
@@ -22,9 +21,6 @@ from ehir.core.instructions import (
     Instruction_capprim,
     Instruction_capstruct,
     Instruction_cbr,
-    Instruction_cenum,
-    Instruction_cpos,
-    Instruction_cstruct,
     Instruction_div,
     Instruction_gep,
     Instruction_geq,
@@ -48,8 +44,6 @@ from ehir.core.instructions import (
     Instruction_put,
     Instruction_ret,
     Instruction_salloc,
-    Instruction_scpos,
-    Instruction_scstruct,
     Instruction_setfield,
     Instruction_sgetfield,
     Instruction_sgetfieldptr,

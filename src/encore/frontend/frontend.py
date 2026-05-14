@@ -21,7 +21,6 @@ from encore.frontend.reflection import (
     RUNTIME_REFLECTION_RESERVED_NAMES,
     ReflectionSymbol,
     build_module_reflection,
-    build_runtime_reflection_ast,
     find_symbol_reflection,
 )
 from encore.frontend.translator import Translator

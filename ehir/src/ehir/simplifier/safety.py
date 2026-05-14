@@ -14,10 +14,6 @@ from ehir.core.instructions import (
     Instruction_pcast,
     Instruction_put,
     Instruction_salloc,
-    Instruction_scpos,
-    Instruction_scstruct,
-    Instruction_sgetfield,
-    Instruction_sgetfieldptr,
     Instruction_store,
 )
 from ehir.core.type import Pointer, Type

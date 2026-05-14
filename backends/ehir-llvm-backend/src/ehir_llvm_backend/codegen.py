@@ -7,7 +7,6 @@ from ehir.core.instructions import (
     Instruction_br,
     Instruction_cbr,
     Instruction_comment,
-    Instruction_geq,
     Instruction_getfield,
     Instruction_getfieldptr,
     Instruction_getptr,
@@ -80,6 +79,7 @@ class Codegen:
         self._blocks: dict[str, ir.Block] = {}
         self._pending_phi_incomings: list[tuple[ir.PhiInstr, Sequence[tuple[TypedVariable, str]]]] = []
         self._block_predecessors: dict[str, set[str]] = {}
+        self._generic_struct_templates: dict[str, tuple[list[str], list[Type]]] = {}
         self._pointer_width_bits: int | None = None
         self._string_literal_counter = 0
         self._str_type: ir.IdentifiedStructType | None = None
@@ -158,6 +158,10 @@ class Codegen:
             raise ValueError(f"Struct '{struct.name}' already declared")
         st = self.module.context.get_identified_type(struct.name)
         self._structs[struct.name] = st
+        template_field_types = [param.type for param in struct.fields]
+        generic_names = self._collect_generic_placeholders(template_field_types)
+        if generic_names:
+            self._generic_struct_templates[struct.name] = (generic_names, template_field_types)
 
     def _codegen_fn_decl(self, fn: ProcessedDerective_fn | ProcessedDerective_extern_fn):
         ret_type = self._build_type(fn.ret_type)
@@ -181,7 +185,15 @@ class Codegen:
 
     def _codegen_struct_body(self, struct: ProcessedDerective_struct):
         struct_type = self._structs[struct.name]
-        field_types = [self._build_type(param.type) for param in struct.fields]
+        template_field_types = [param.type for param in struct.fields]
+        generic_names = self._collect_generic_placeholders(template_field_types)
+        if generic_names:
+            # Generic runtime templates (__tuple_N/__array_N) are materialized
+            # into concrete identified structs on demand in _build_type().
+            self._generic_struct_templates[struct.name] = (generic_names, template_field_types)
+            return
+
+        field_types = [self._build_type(field_type) for field_type in template_field_types]
         if isinstance(struct_type, ir.IdentifiedStructType):
             if struct_type.is_opaque:
                 struct_type.set_body(*field_types)
@@ -477,6 +489,18 @@ class Codegen:
 
         field_index = int(instr.field.name)
         base = self._unwrap_smart_pointer_wrapper_for_gep(base, field_index, instr.var_out.name, expected_result_type)
+        if isinstance(base.type, ir.PointerType) and isinstance(base.type.pointee, ir.IdentifiedStructType):
+            pointee_name = getattr(base.type.pointee, "name", "")
+            template_name = pointee_name.split("[", 1)[0]
+            if template_name in self._generic_struct_templates and instr.var_out.type is not None:
+                i8_ptr = self.builder.bitcast(base, ir.IntType(8).as_pointer(), name=f"{instr.var_out.name}.tmpl_i8_base")
+                field_type = instr.var_out.type.pointee if isinstance(instr.var_out.type, Pointer) else instr.var_out.type
+                elem_size = self._sizeof(field_type)
+                byte_offset = ir.Constant(ir.IntType(32), field_index * elem_size)
+                field_i8_ptr = self.builder.gep(i8_ptr, [byte_offset], name=f"{instr.var_out.name}.tmpl_i8_ptr")
+                result = self.builder.bitcast(field_i8_ptr, self._build_type(instr.var_out.type), name=instr.var_out.name)
+                self._variables[instr.var_out.name] = result
+                return result
         if isinstance(base.type, ir.PointerType) and not isinstance(base.type.pointee, ir.BaseStructType):
             self._variables[instr.var_out.name] = base
             return base
@@ -1261,6 +1285,24 @@ class Codegen:
                 phi.add_incoming(value=value, block=self._blocks[pred_name])
 
     def _build_type(self, type: Type) -> ir.Type:
+        template_key = type.name.split("[", 1)[0]
+        template_args = list(type.generics)
+        if not template_args and "[" in type.name and type.name.endswith("]"):
+            template_args = self._parse_inline_generic_args(type.name)
+
+        if template_key in self._generic_struct_templates and template_args:
+            generic_names, template_fields = self._generic_struct_templates[template_key]
+            concrete_name = type.name if "[" in type.name else str(Type(template_key, template_args))
+            concrete_struct = self.module.context.get_identified_type(concrete_name)
+            self._structs[concrete_name] = concrete_struct
+            if concrete_struct.is_opaque:
+                mapping = {name: arg for name, arg in zip(generic_names, template_args, strict=False)}
+                concrete_fields = [
+                    self._build_type(self._substitute_generic_type(field_type, mapping)) for field_type in template_fields
+                ]
+                concrete_struct.set_body(*concrete_fields)
+            return concrete_struct
+
         if isinstance(type, (HeapSmartPointer, StackSmartPointer)):
             wrapper_name = type.get_name()
             if wrapper_name not in self._structs:
@@ -1303,17 +1345,74 @@ class Codegen:
         if isinstance(type, Str_t) or type.name == "str":
             return self._get_str_type()
 
-        if type.name not in self._structs:
+        struct_key = type.name
+        if struct_key not in self._structs and "[" in struct_key and struct_key.endswith("]"):
+            base_name = struct_key.split("[", 1)[0]
+            if base_name in self._structs:
+                struct_key = base_name
+
+        if struct_key not in self._structs:
             # Allow referencing external/opaque structs across refrain boundaries.
             fallback = self.module.context.get_identified_type(type.name)
             if fallback.is_opaque:
                 # Fallback sized layout for unresolved aggregate types (e.g. enums not
                 # materialized as structs in the current pipeline stage).
                 fallback.set_body(ir.IntType(8), ir.IntType(8).as_pointer())
-            self._structs[type.name] = fallback
-        struct = self._structs[type.name]
+            self._structs[struct_key] = fallback
+        struct = self._structs[struct_key]
 
         return struct
+
+    @staticmethod
+    def _is_generic_placeholder_name(name: str) -> bool:
+        return name == "T" or (name.startswith("T") and name[1:].isdigit())
+
+    def _collect_generic_placeholders(self, types: list[Type]) -> list[str]:
+        names: list[str] = []
+
+        def visit(typ: Type):
+            if self._is_generic_placeholder_name(typ.name) and not typ.generics and typ.name not in names:
+                names.append(typ.name)
+            for generic in typ.generics:
+                visit(generic)
+            if isinstance(typ, Pointer):
+                visit(typ.pointee)
+
+        for typ in types:
+            visit(typ)
+        return names
+
+    def _substitute_generic_type(self, typ: Type, mapping: dict[str, Type]) -> Type:
+        if isinstance(typ, Pointer):
+            return Pointer(self._substitute_generic_type(typ.pointee, mapping))
+        if not typ.generics and typ.name in mapping:
+            return mapping[typ.name]
+        return Type(typ.name, [self._substitute_generic_type(generic, mapping) for generic in typ.generics])
+
+    def _parse_inline_generic_args(self, type_name: str) -> list[Type]:
+        start = type_name.find("[")
+        if start < 0 or not type_name.endswith("]"):
+            return []
+        payload = type_name[start + 1 : -1]
+        items: list[str] = []
+        level = 0
+        token = []
+        for ch in payload:
+            if ch == "," and level == 0:
+                part = "".join(token).strip()
+                if part:
+                    items.append(part)
+                token = []
+                continue
+            if ch == "[":
+                level += 1
+            elif ch == "]":
+                level -= 1
+            token.append(ch)
+        tail = "".join(token).strip()
+        if tail:
+            items.append(tail)
+        return [Type(item) for item in items]
 
     def _ensure_smart_pointer_wrapper(self, smart_pointer: HeapSmartPointer | StackSmartPointer):
         wrapper_name = smart_pointer.get_name()

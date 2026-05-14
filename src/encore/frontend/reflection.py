@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from ehir.core.type import Type
 from ehir.core.variable import Parameter
