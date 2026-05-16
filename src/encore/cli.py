@@ -2,6 +2,7 @@ import argparse
 import sys
 from typing import Callable
 
+from encore import __version__
 from encore import modes
 from encore.utils.diagnostics import render_diagnostic
 
@@ -18,6 +19,7 @@ MODES = [
 
 def main():
     main_parser = argparse.ArgumentParser(prog="encore", description="Encore compiler")
+    main_parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = main_parser.add_subparsers(dest="command", required=True, help="Available commands")
 
     dispatcher: dict[str, Callable] = {}
