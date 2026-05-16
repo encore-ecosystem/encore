@@ -1055,6 +1055,28 @@ class Codegen:
             if fn.name == instr.fn_name:
                 return fn
 
+        # Fallback for emitted-like call names (owner__method) that may be produced
+        # by lowering while declarations are still stored under canonical names.
+        alias_candidates: list[ir.Function] = []
+        for fn in self.module.functions:
+            if self._emit_like_symbol_name(fn.name) != instr.fn_name:
+                continue
+            if len(fn.function_type.args) != len(instr.args):
+                continue
+            matches = True
+            for expected, arg in zip(fn.function_type.args, instr.args, strict=True):
+                if arg.type is None:
+                    matches = False
+                    break
+                if self._build_type(arg.type) != expected:
+                    matches = False
+                    break
+            if matches:
+                alias_candidates.append(fn)
+
+        if len(alias_candidates) == 1:
+            return alias_candidates[0]
+
         if instr.var_out.type is None:
             raise TypeError(f"Cannot declare function '{instr.fn_name}' without known return type")
 

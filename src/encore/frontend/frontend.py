@@ -669,8 +669,33 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         self._collect_dependency_roots(core_root, roots, visited)
 
     def _resolve_local_core_root(self, project_root: Path) -> Optional[Path]:
+        from os import getenv
+
+        from encore import PROJECT_ROOT
+
+        canonical_candidates = [
+            (PROJECT_ROOT / "core").resolve(),
+            (PROJECT_ROOT / "refrains" / "core").resolve(),
+        ]
+        for candidate in canonical_candidates:
+            manifest_path = candidate / ProjectManifest.default_filename()
+            if not manifest_path.exists():
+                continue
+            manifest = self._load_manifest(candidate)
+            if manifest.project.name == "core":
+                return candidate
+
         candidates: list[Path] = []
         for base in [project_root, *project_root.parents]:
+            candidates.append(base / "refrains" / "core")
+            candidates.append(base / "core")
+        cwd = Path.cwd().resolve()
+        for base in [cwd, *cwd.parents]:
+            candidates.append(base / "refrains" / "core")
+            candidates.append(base / "core")
+        encore_home = getenv("ENCORE_HOME")
+        if encore_home:
+            base = Path(encore_home).expanduser().resolve()
             candidates.append(base / "refrains" / "core")
             candidates.append(base / "core")
         candidates.append(Path(__file__).resolve().parents[3] / "enc_future" / "refrains" / "core")

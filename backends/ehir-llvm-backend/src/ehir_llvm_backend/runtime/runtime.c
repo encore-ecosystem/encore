@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <unistd.h>
 
 typedef struct {
@@ -490,4 +491,65 @@ int32_t __ehir_rt_os_run(encore_str command) {
     int rc = system(command_c);
     free(command_c);
     return rc;
+}
+
+encore_str __ehir_rt_os_read_dir(encore_str path) {
+    char *path_c = encore_to_cstr(path);
+    if (path_c == NULL) {
+        return encore_empty_str();
+    }
+
+    DIR *dir = opendir(path_c);
+    free(path_c);
+    if (dir == NULL) {
+        return encore_empty_str();
+    }
+
+    size_t cap = 256;
+    size_t len = 0;
+    char *buffer = malloc(cap + 1);
+    if (buffer == NULL) {
+        closedir(dir);
+        return encore_empty_str();
+    }
+
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+
+        size_t name_len = strlen(name);
+        size_t need = len + name_len + 1; // + '\n'
+        if (need > cap) {
+            size_t next_cap = cap;
+            while (need > next_cap) {
+                if (next_cap > (SIZE_MAX / 2)) {
+                    free(buffer);
+                    closedir(dir);
+                    return encore_empty_str();
+                }
+                next_cap *= 2;
+            }
+            char *next = realloc(buffer, next_cap + 1);
+            if (next == NULL) {
+                free(buffer);
+                closedir(dir);
+                return encore_empty_str();
+            }
+            buffer = next;
+            cap = next_cap;
+        }
+
+        memcpy(buffer + len, name, name_len);
+        len += name_len;
+        buffer[len++] = '\n';
+    }
+    closedir(dir);
+
+    if (len > 0 && buffer[len - 1] == '\n') {
+        len -= 1;
+    }
+    return encore_from_owned_buffer(buffer, len);
 }

@@ -2,7 +2,9 @@ from argparse import Namespace
 from pathlib import Path
 from typing import Callable
 
-from encore.modes.build import update_dependencies
+from rich.console import Console
+
+from encore.modes.build import sync_dependencies, write_lockfile
 
 
 def add_update_parser(subparsers) -> tuple[str, Callable]:
@@ -13,4 +15,7 @@ def add_update_parser(subparsers) -> tuple[str, Callable]:
 
 def handle_update(args: Namespace):
     cwd = Path().resolve()
-    update_dependencies(cwd)
+    console = Console(highlight=False)
+    resolved = sync_dependencies(cwd, update=True, ignore_errors=False)
+    write_lockfile(cwd, resolved)
+    console.print(f"Updated {len(resolved)} packages -> encore.lock")
