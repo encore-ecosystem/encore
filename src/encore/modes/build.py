@@ -1,3 +1,4 @@
+import os
 import subprocess
 import tomllib
 from argparse import Namespace
@@ -7,6 +8,7 @@ from typing import Callable
 
 from ehir.backend import EHIR_Backend
 from ehir.compiler import EHIR_ProjectCompiler
+from git import Repo
 from rich.console import Console, Group
 from rich.live import Live
 from rich.spinner import Spinner
@@ -22,6 +24,7 @@ AVAILABLE_OPTPROFILES = {
     "extreme": EHIR_Backend.OptProfile.extreme,
 }
 AVAILABLE_BACKENDS = ("llvm",)
+SYSTEM_CORE_REF = "sys@core"
 
 
 @dataclass
@@ -105,6 +108,7 @@ def handle_build(args: Namespace):
     cwd = Path().resolve()
 
     compiler = create_compiler(cwd, args.backend, args.profile, no_cache=args.no_cache)
+    _inject_mandatory_core_dependency(compiler, cwd)
     _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
     with _BuildLiveStatus(compiler):
         compiler.compile_all()
@@ -147,11 +151,15 @@ def save_manifest(path: Path, manifest: ProjectManifest):
 
 
 def _resolve_dependency(dep: str, base_path: Path, update: bool = False) -> Path:
-    from git import Repo
-
     from encore import ENCORE_CACHE_DIR
 
     ENCORE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if dep == SYSTEM_CORE_REF:
+        core_root = _resolve_local_core_root(base_path)
+        if core_root is None:
+            raise RuntimeError("Unable to resolve system dependency 'core'")
+        return core_root
 
     if dep.startswith("git@"):
         repo_url = dep.removeprefix("git@")
@@ -162,14 +170,89 @@ def _resolve_dependency(dep: str, base_path: Path, update: bool = False) -> Path
             Repo.clone_from(url=repo_url, to_path=path)
         elif update:
             Repo(path).remotes.origin.pull()
-
     elif dep.startswith("path@"):
         path = (base_path / dep.removeprefix("path@")).resolve()
+        manifest_path = path / ProjectManifest.default_filename()
+        if not manifest_path.exists():
+            parts = path.parts
+            if "index" in parts:
+                pkg_name = path.name
+                mapped_dep = f"git@https://github.com/encore-language-index/{pkg_name}"
+                return _resolve_dependency(mapped_dep, base_path, update=update)
 
     else:
         raise RuntimeError(f"Unable to load dependency: {dep}")
 
     return path
+
+
+def _resolve_local_core_root(project_root: Path) -> Path | None:
+    from os import getenv
+
+    from encore import ENCORE_CACHE_DIR, PROJECT_ROOT
+
+    canonical_candidates = [
+        (PROJECT_ROOT / "core").resolve(),
+        (PROJECT_ROOT / "refrains" / "core").resolve(),
+    ]
+    for candidate in canonical_candidates:
+        manifest_path = candidate / ProjectManifest.default_filename()
+        if not manifest_path.exists():
+            continue
+        manifest = load_manifest(candidate)
+        if manifest.project.name == "core":
+            return candidate
+
+    candidates: list[Path] = []
+    for base in [project_root, *project_root.parents]:
+        candidates.append(base / "refrains" / "core")
+        candidates.append(base / "core")
+        candidates.append(base / "encore" / "refrains" / "core")
+        candidates.append(base / "encore" / "core")
+    cwd = Path.cwd().resolve()
+    for base in [cwd, *cwd.parents]:
+        candidates.append(base / "refrains" / "core")
+        candidates.append(base / "core")
+        candidates.append(base / "encore" / "refrains" / "core")
+        candidates.append(base / "encore" / "core")
+    encore_home = getenv("ENCORE_HOME")
+    if encore_home:
+        base = Path(encore_home).expanduser().resolve()
+        candidates.append(base / "refrains" / "core")
+        candidates.append(base / "core")
+    candidates.append(Path(__file__).resolve().parents[3] / "enc_future" / "refrains" / "core")
+    candidates.append(ENCORE_CACHE_DIR / "git" / "encore-language" / "core")
+    candidates.append(ENCORE_CACHE_DIR / "git" / "encore-language" / "encore-core")
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        manifest_path = candidate / ProjectManifest.default_filename()
+        if not manifest_path.exists():
+            continue
+        manifest = load_manifest(candidate)
+        if manifest.project.name == "core":
+            return candidate
+
+    return None
+
+
+def _inject_mandatory_core_dependency(compiler: EHIR_ProjectCompiler, project_root: Path) -> None:
+    manifest = load_manifest(project_root)
+    if manifest.project.name == "core":
+        return
+
+    core_root = _resolve_local_core_root(project_root)
+    if core_root is None:
+        raise RuntimeError(
+            "Unable to resolve mandatory dependency 'core'. "
+            "Expected to find it in dependencies or as local 'refrains/core'."
+        )
+
+    _load_refrain(compiler, core_root, Refrain.TargetType.OBJECT)
 
 
 def _load_refrain(
@@ -219,6 +302,7 @@ def resolve_project_target_type(cwd: Path) -> Refrain.TargetType:
 
 def build_project(cwd: Path, backend: str, profile: str, *, no_cache: bool = False) -> list[tuple[str, Path]]:
     compiler = create_compiler(cwd, backend, profile, no_cache=no_cache)
+    _inject_mandatory_core_dependency(compiler, cwd)
     entry_ref = _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
     outputs = compiler.compile_all()
     _emit_reflection_artifacts(compiler)
@@ -271,3 +355,93 @@ def update_dependencies(path: Path):
         dep_manifest = dep_path / ProjectManifest.default_filename()
         if dep_manifest.exists():
             update_dependencies(dep_path)
+
+
+def sync_dependencies(path: Path, *, update: bool = False, ignore_errors: bool = False) -> dict[str, dict[str, str]]:
+    manifest = load_manifest(path)
+    resolved: dict[str, dict[str, str]] = {}
+    visited: set[Path] = set()
+
+    def visit(project_path: Path) -> None:
+        project_path = project_path.resolve()
+        if project_path in visited:
+            return
+        visited.add(project_path)
+
+        project_manifest = load_manifest(project_path)
+        for dep_ref in project_manifest.project.dependencies:
+            try:
+                dep_path = _resolve_dependency(dep_ref, project_path, update=update)
+                dep_manifest = load_manifest(dep_path)
+            except Exception:
+                if ignore_errors:
+                    continue
+                raise
+            info: dict[str, str] = {
+                "name": dep_manifest.project.name,
+                "ref": _resolved_ref_for_lock(dep_ref, project_path, dep_path),
+                "version": dep_manifest.project.version,
+            }
+            git_dir = dep_path / ".git"
+            if git_dir.exists():
+                try:
+                    repo = Repo(dep_path)
+                    info["commit"] = repo.head.commit.hexsha
+                except Exception:
+                    pass
+            resolved[dep_manifest.project.name] = info
+            try:
+                visit(dep_path)
+            except Exception:
+                if not ignore_errors:
+                    raise
+
+    visit(path)
+    if load_manifest(path).project.name != "core":
+        core_root = _resolve_dependency(SYSTEM_CORE_REF, path, update=update)
+        core_manifest = load_manifest(core_root)
+        resolved.setdefault(
+            core_manifest.project.name,
+            {
+                "name": core_manifest.project.name,
+                "ref": SYSTEM_CORE_REF,
+                "version": core_manifest.project.version,
+            },
+        )
+    return resolved
+
+
+def _resolved_ref_for_lock(dep_ref: str, project_path: Path, dep_path: Path) -> str:
+    if dep_ref.startswith("git@"):
+        return dep_ref
+
+    if dep_ref.startswith("path@"):
+        requested_path = (project_path / dep_ref.removeprefix("path@")).resolve()
+        if requested_path == dep_path.resolve():
+            return _path_ref_for_lock(project_path, dep_path)
+
+        # Legacy path@index/* fallback: persist effective git ref in lock.
+        if "index" in requested_path.parts:
+            pkg_name = requested_path.name
+            return f"git@https://github.com/encore-language-index/{pkg_name}"
+
+    return dep_ref
+
+
+def _path_ref_for_lock(base_path: Path, target_path: Path) -> str:
+    try:
+        rel = target_path.resolve().relative_to(base_path.resolve())
+        return f"path@{rel.as_posix()}"
+    except ValueError:
+        pass
+    relative = Path(os.path.relpath(target_path.resolve(), base_path.resolve()))
+    return f"path@{relative.as_posix()}"
+
+
+def write_lockfile(path: Path, resolved: dict[str, dict[str, str]]) -> None:
+    import toml
+
+    lock_path = path / "encore.lock"
+    packages = [resolved[name] for name in sorted(resolved)]
+    lock_data = {"version": 1, "packages": packages}
+    lock_path.write_text(toml.dumps(lock_data))

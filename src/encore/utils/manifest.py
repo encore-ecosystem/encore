@@ -19,12 +19,12 @@ class ProjectTarget(StrEnum):
 
 class ProjectSection(StrictModel):
     name: str
-    target: str = Field(default=ProjectTarget.AUTO)
+    target: str = Field(default=ProjectTarget.AUTO.value)
     version: str = Field(default="0.0.0")
     description: str = Field(default="")
     readme: str = Field(default="README.md")
     licence: str = Field(default="MIT")
-    dependencies: list[str] = Field(default=["git@https://github.com/encore-language/std"])
+    dependencies: list[str] = Field(default=[])
 
 
 class ProjectManifest(StrictModel):
