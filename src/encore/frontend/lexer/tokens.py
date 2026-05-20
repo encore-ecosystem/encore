@@ -78,6 +78,7 @@ class TokenType(Enum):
     INCREMENT = auto()
     DECREMENT = auto()
     QUESTION = auto()
+    HASH = auto()
 
     ARROW = auto()
     FAT_ARROW = auto()

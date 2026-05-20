@@ -65,6 +65,7 @@ class Deallocator:
     _variables: dict[str, Variable]
     _arg_names: set[str]
     _aggregate_names: set[str]
+    _dealloc_name_seq: int
 
     def run(self, ast: list[Derective]) -> list[Derective]:
         structs = {
@@ -97,7 +98,9 @@ class Deallocator:
         self._returned_aliases = set()
         self._variables = {}
         self._arg_names = {param.name for param in fn.params}
+        self._dealloc_name_seq = 0
         cfg: dict[str, list[str]] = {}
+        predecessors: dict[str, set[str]] = {}
         observed: set[str] = set()
 
         name2block: dict[str, TerminatedBlock] = {}
@@ -105,6 +108,7 @@ class Deallocator:
             assert isinstance(block, TerminatedBlock)
             name2block[block.name] = block
             cfg[block.name] = []
+            predecessors[block.name] = set()
 
         queue: deque[TerminatedBlock] = deque([fn.entry_block])
         while queue:
@@ -130,10 +134,11 @@ class Deallocator:
             for child in children:
                 if child not in cfg[block.name]:
                     cfg[block.name].append(child)
+                    predecessors[child].add(block.name)
                 if child not in observed:
                     queue.append(name2block[child])
 
-        all_paths = self._find_all_paths(fn.entry_block.name, fn.exit_block.name, cfg)
+        dominators = self._compute_dominators(fn.entry_block.name, observed, predecessors)
         for var, block in self._captures.items():
             assert isinstance(fn.exit_block.term, Instruction_ret)
             if fn.exit_block.term.var.name == var:
@@ -141,106 +146,126 @@ class Deallocator:
             if var in self._returned_aliases:
                 continue
 
-            outer_paths = []
-            inner_paths = []
-            for path in all_paths:
-                if any(usg in path for usg in self._usages[var]):
-                    inner_paths.append(path)
-                else:
-                    outer_paths.append(path)
-
-            if not inner_paths:
-                continue
-
-            shared_path = self._find_shared_path(inner_paths)
-            least_shared_node = shared_path[0]
-            if least_shared_node == fn.entry_block.name:
-                # LLVM entry block cannot have predecessors.
-                # If CFG merge-point resolution falls back to entry,
-                # place cfree at function exit instead.
-                least_shared_node = fn.exit_block.name
-
-            if any(least_shared_node in pth for pth in outer_paths):
-                dealloc_block = TerminatedBlock(
-                    name=f".dealloc_{var}",
-                    body=[],
-                    term=Instruction_br(label=least_shared_node),
-                )
-                fn.body.append(dealloc_block)
-
-                for path in inner_paths:
-                    index = path.index(least_shared_node)
-                    prev_block = path[index - 1]
-                    block = name2block[prev_block]
-
-                    if isinstance(block.term, Instruction_br):
-                        block.term.label = dealloc_block.name
-                    elif isinstance(block.term, Instruction_cbr):
-                        if block.term.true_br_label == least_shared_node:
-                            block.term.true_br_label = dealloc_block.name
-                        elif block.term.else_br_label == least_shared_node:
-                            block.term.else_br_label = dealloc_block.name
-                    elif isinstance(block.term, Instruction_switch):
-                        if block.term.default_case == least_shared_node:
-                            block.term.default_case = dealloc_block.name
-                        else:
-                            for i in range(len(block.term.cases)):
-                                if block.term.cases[i][1] == least_shared_node:
-                                    block.term.cases[i] = (block.term.cases[i][0], dealloc_block.name)
-                    elif isinstance(block.term, Instruction_match):
-                        if block.term.default_case == least_shared_node:
-                            block.term.default_case = dealloc_block.name
-                        else:
-                            for i, case in enumerate(block.term.cases):
-                                if case.label == least_shared_node:
-                                    block.term.cases[i] = type(case)(variant=case.variant, label=dealloc_block.name)
-
-            else:
-                dealloc_block = name2block[least_shared_node]
-
             var_def = self._variables[var]
             if var_def.type is None:
                 continue
-            dealloc_block.body.append(
-                Instruction_call(
-                    var_out=TypedVariable(name=f".drop_{var}", type=Type("void")),
-                    fn_name="Drop::drop",
-                    generics=[deepcopy(generic) for generic in var_def.type.generics],
-                    args=[TypedVariable(var_def.name, var_def.type)],
-                )
+            drop_edges = self._collect_drop_edges(
+                def_block=block,
+                cfg=cfg,
+                dominators=dominators,
+                observed=observed,
             )
+            placed = False
+            for src, dst in sorted(drop_edges):
+                dealloc_block_name = self._next_dealloc_block_name(var)
+                dealloc_block = TerminatedBlock(
+                    name=dealloc_block_name,
+                    body=[
+                        Instruction_call(
+                            var_out=TypedVariable(name=f".drop_{var}", type=Type("void")),
+                            fn_name="Drop::drop",
+                            generics=[deepcopy(generic) for generic in var_def.type.generics],
+                            args=[TypedVariable(var_def.name, var_def.type)],
+                        )
+                    ],
+                    term=Instruction_br(label=dst),
+                )
+                fn.body.append(dealloc_block)
+                name2block[dealloc_block_name] = dealloc_block
+                self._redirect_block_edge(name2block[src], dst, dealloc_block_name)
+                placed = True
+
+            if not placed and self._is_dominated(fn.exit_block.name, block, dominators):
+                fn.exit_block.body.append(
+                    Instruction_call(
+                        var_out=TypedVariable(name=f".drop_{var}", type=Type("void")),
+                        fn_name="Drop::drop",
+                        generics=[deepcopy(generic) for generic in var_def.type.generics],
+                        args=[TypedVariable(var_def.name, var_def.type)],
+                    )
+                )
+
+    def _next_dealloc_block_name(self, var_name: str) -> str:
+        self._dealloc_name_seq += 1
+        return f".dealloc_{var_name}_{self._dealloc_name_seq}"
+
+    def _redirect_block_edge(self, block: TerminatedBlock, src_label: str, dst_label: str) -> None:
+        if isinstance(block.term, Instruction_br):
+            if block.term.label == src_label:
+                block.term.label = dst_label
+            return
+
+        if isinstance(block.term, Instruction_cbr):
+            if block.term.true_br_label == src_label:
+                block.term.true_br_label = dst_label
+            elif block.term.else_br_label == src_label:
+                block.term.else_br_label = dst_label
+            return
+
+        if isinstance(block.term, Instruction_switch):
+            if block.term.default_case == src_label:
+                block.term.default_case = dst_label
+            for i in range(len(block.term.cases)):
+                if block.term.cases[i][1] == src_label:
+                    block.term.cases[i] = (block.term.cases[i][0], dst_label)
+            return
+
+        if isinstance(block.term, Instruction_match):
+            if block.term.default_case == src_label:
+                block.term.default_case = dst_label
+            for i, case in enumerate(block.term.cases):
+                if case.label == src_label:
+                    block.term.cases[i] = type(case)(variant=case.variant, label=dst_label)
 
     @staticmethod
-    def _find_shared_path(paths: list[list[str]]) -> list[str]:
-        available_stepbacks = min(map(len, paths))
-        n = 1
-        for _ in range(available_stepbacks):
-            if all(path[-n] == paths[0][-n] for path in paths):
-                n += 1
+    def _compute_dominators(
+        entry: str,
+        observed: set[str],
+        predecessors: dict[str, set[str]],
+    ) -> dict[str, set[str]]:
+        all_nodes = set(observed)
+        dominators: dict[str, set[str]] = {node: set(all_nodes) for node in all_nodes}
+        dominators[entry] = {entry}
 
-        return paths[0][-n + 1 :]
+        changed = True
+        while changed:
+            changed = False
+            for node in all_nodes:
+                if node == entry:
+                    continue
+
+                preds = predecessors.get(node, set()) & all_nodes
+                if not preds:
+                    new_dom = {node}
+                else:
+                    pred_doms = [dominators[pred] for pred in preds]
+                    new_dom = {node} | set.intersection(*pred_doms)
+
+                if new_dom != dominators[node]:
+                    dominators[node] = new_dom
+                    changed = True
+
+        return dominators
 
     @staticmethod
-    def _find_all_paths(start: str, finish: str, cfg: dict[str, list[str]]):
-        def dfs(current: str, path: list[str], visited: set[str], all_paths: list[list[str]]):
-            path.append(current)
-            visited.add(current)
+    def _is_dominated(node: str, dominator: str, dominators: dict[str, set[str]]) -> bool:
+        return dominator in dominators.get(node, set())
 
-            if current == finish:
-                all_paths.append(path.copy())
-            else:
-                for neighbor in cfg.get(current, []):
-                    if neighbor not in visited:
-                        dfs(neighbor, path, visited, all_paths)
-
-            # (backtracking)
-            path.pop()
-            visited.remove(current)
-
-        all_paths = []
-        visited = set()
-        dfs(start, [], visited, all_paths)
-        return all_paths
+    def _collect_drop_edges(
+        self,
+        def_block: str,
+        cfg: dict[str, list[str]],
+        dominators: dict[str, set[str]],
+        observed: set[str],
+    ) -> set[tuple[str, str]]:
+        drop_edges: set[tuple[str, str]] = set()
+        for src in observed:
+            if not self._is_dominated(src, def_block, dominators):
+                continue
+            for dst in cfg.get(src, []):
+                if not self._is_dominated(dst, def_block, dominators):
+                    drop_edges.add((src, dst))
+        return drop_edges
 
     def _add_variable_usage(self, var: Variable):
         if cached := self._variables.get(var.name):

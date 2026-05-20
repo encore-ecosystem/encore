@@ -40,6 +40,7 @@ from ehir.core.instructions import (
 )
 from ehir.core.instructions.base import Instruction
 from ehir.core.primitives import Usize_t
+from ehir.core.type import Type
 from ehir.core.variable import TypedVariable
 from ehir.postprocessor.instructions import (
     ProcessedControlFlow,
@@ -108,12 +109,17 @@ class Postprocessor:
             "str",
             "void",
         }
+        self._fn_ret_by_emitted_name: dict[str, Type] = {}
+        for derective in raw_mod.ast:
+            if isinstance(derective, (Normalized_fn, Derective_extern_fn)):
+                emitted_name = self._emit_symbol_name(derective.name, [param.type for param in derective.params])
+                self._fn_ret_by_emitted_name[emitted_name] = derective.ret_type
         mod = ProcessedModule(id=raw_mod.id, structs=[], funcs=[])
         for derective in raw_mod.ast:
             if isinstance(derective, Normalized_fn):
                 mod.funcs.append(
                     ProcessedDerective_fn(
-                        name=self._emit_symbol_name(derective.name),
+                        name=self._emit_symbol_name(derective.name, [param.type for param in derective.params]),
                         params=derective.params,
                         ret_type=derective.ret_type,
                         entry_block=self._validate_block(derective.entry_block),
@@ -124,7 +130,7 @@ class Postprocessor:
             elif isinstance(derective, Derective_extern_fn):
                 mod.funcs.append(
                     ProcessedDerective_extern_fn(
-                        name=self._emit_symbol_name(derective.name),
+                        name=self._emit_symbol_name(derective.name, [param.type for param in derective.params]),
                         params=derective.params,
                         ret_type=derective.ret_type,
                     )
@@ -168,14 +174,28 @@ class Postprocessor:
                 var=TypedVariable(instr.var.name, instr.var.type),
             )
         if isinstance(instr, Instruction_call):
-            assert instr.var_out.type
+            emitted_name = self._emit_symbol_name(instr.fn_name, [arg.type for arg in instr.args])
+            if instr.var_out.type is None:
+                inferred_ret = self._fn_ret_by_emitted_name.get(emitted_name)
+                if inferred_ret is not None:
+                    instr.var_out.type = inferred_ret
+            if instr.var_out.type is None:
+                hint = [
+                    key
+                    for key in self._fn_ret_by_emitted_name
+                    if key.startswith(instr.fn_name) or key.startswith(instr.fn_name + "__")
+                ][:5]
+                raise AssertionError(
+                    f"Instruction_call has unresolved output type: {instr}; emitted='{emitted_name}'; candidates={hint}"
+                )
             args = []
             for arg in instr.args:
-                assert arg.type
+                if arg.type is None:
+                    raise AssertionError(f"Instruction_call has unresolved argument type: {instr}")
                 args.append(TypedVariable(arg.name, arg.type))
             return ProcessedInstruction_call(
                 var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
-                fn_name=self._emit_symbol_name(instr.fn_name),
+                fn_name=emitted_name,
                 args=args,
             )
 
@@ -265,14 +285,25 @@ class Postprocessor:
 
         raise NotImplementedError(term)
 
-    def _emit_symbol_name(self, name: str) -> str:
+    def _emit_symbol_name(self, name: str, arg_types: list[Type | None] | None = None) -> str:
         if "::" not in name:
-            return name
-
+            return name.split("[", 1)[0]
         owner_text, method_name = name.rsplit("::", 1)
         owner_name = owner_text.split("[", 1)[0]
         method_name = method_name.split("[", 1)[0]
-        return f"{owner_name}__{self._emit_method_name(method_name)}"
+        # Keep operator trait calls canonical for dedicated codegen fast-path.
+        if method_name != "op" and arg_types and arg_types[0] is not None:
+            recv = self._mangle_type(arg_types[0])
+            if recv:
+                method_name = f"{method_name}__{recv}"
+        return f"{owner_name}::{method_name}"
+
+    def _mangle_type(self, typ: Type) -> str:
+        base = typ.name.split("[", 1)[0]
+        if typ.generics:
+            inner = "_".join(self._mangle_type(generic) for generic in typ.generics)
+            return f"{base}_{inner}"
+        return base.replace("::", "_")
 
     def _emit_method_name(self, method_name: str) -> str:
         if "__" in method_name:

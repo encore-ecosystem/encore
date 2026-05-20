@@ -1,5 +1,5 @@
 from ehir.core.block import TerminatedBlock
-from ehir.core.derectives import Derective_fn
+from ehir.core.derectives import Derective_fn, Derective_impl
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import ControlFlow, Instruction_br, Instruction_load, Instruction_ret, Instruction_salloc, Instruction_store
 from ehir.core.type import Pointer
@@ -14,6 +14,16 @@ class Normalizer:
             if isinstance(derective, Derective_fn):
                 self._terminate_blocks(derective)
                 new.append(self._normalize_fn(derective))
+            elif isinstance(derective, Derective_impl):
+                normalized_methods = []
+                for method in derective.methods:
+                    if isinstance(method, Derective_fn):
+                        self._terminate_blocks(method)
+                        normalized_methods.append(self._normalize_fn(method))
+                    else:
+                        normalized_methods.append(method)
+                derective.methods = normalized_methods
+                new.append(derective)
             else:
                 new.append(derective)
         return new

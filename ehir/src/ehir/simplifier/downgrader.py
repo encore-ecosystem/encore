@@ -345,6 +345,25 @@ class Downgrader:
             struct_decl = self._structs.get(owner_t.name)
             assert struct_decl is not None, f"Unknown struct for getfieldptr: {owner_t}"
             field_index = int(field.name) if field.name.isdigit() else None
+            if field_index is not None:
+                enum_variants = self._enum_variants.get(owner_t.name)
+                if enum_variants is not None and field_index > 0:
+                    # High-level enum field numbering is tag(0) + variant ordinal(1..N).
+                    # Lowered enum layout stores only payload-carrying variants as named fields.
+                    variant_ordinal = field_index - 1
+                    assert variant_ordinal < len(enum_variants), (
+                        f"Invalid enum variant field index {field_index} for {owner_t.name}"
+                    )
+                    variant_name = enum_variants[variant_ordinal]
+                    payload_field_index = None
+                    for idx, p in enumerate(struct_decl.params):
+                        if p.name == variant_name:
+                            payload_field_index = idx
+                            break
+                    assert payload_field_index is not None, (
+                        f"Enum variant '{variant_name}' in {owner_t.name} has no payload field in lowered layout"
+                    )
+                    field_index = payload_field_index
             if field_index is None:
                 for idx, p in enumerate(struct_decl.params):
                     if p.name == field.name:

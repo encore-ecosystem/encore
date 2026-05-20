@@ -19,6 +19,12 @@ def _box_concrete_name(inner: Type) -> str:
 class MonomorphizationPass:
     _GENERIC_MONO_PASSES = 4
 
+    @staticmethod
+    def _generic_clone_name(fn_name: str, signature: str) -> str:
+        # Use a dedicated marker to avoid collisions with user-authored names
+        # like `foo__T` and to prevent accidental self-recursion after rewrite.
+        return f"{fn_name}__mono__{signature}"
+
     def run(self, ast: list[Derective]) -> list[Derective]:
         box_struct = next((d for d in ast if isinstance(d, Derective_struct) and d.name == "Box" and d.generics), None)
         if box_struct is None:
@@ -115,6 +121,8 @@ class MonomorphizationPass:
                 continue
             if len(target.generics) != len(item.generics):
                 continue
+            if any(self._is_placeholder_type(generic) for generic in item.generics):
+                continue
             signature = ",".join(mangle_type_name(generic) for generic in item.generics)
             call_specs.setdefault(item.fn_name, {})[signature] = [deepcopy(generic) for generic in item.generics]
 
@@ -134,7 +142,7 @@ class MonomorphizationPass:
                 }
                 clone = deepcopy(template)
                 clone.generics = []
-                clone.name = f"{template.name}__{signature}"
+                clone.name = self._generic_clone_name(template.name, signature)
                 clone = self._rewrite_types(clone, mapping)
                 clones.append(clone)
                 renames[(fn_name, signature)] = clone.name

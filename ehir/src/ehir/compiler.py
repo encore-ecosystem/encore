@@ -21,7 +21,7 @@ from ehir.core.derectives import (
 from ehir.core.derectives.base import Derective
 from ehir.core.primitives import Str_t
 from ehir.core.primitives.base import PrimitiveType
-from ehir.core.type import Pointer, Reference, Type
+from ehir.core.type import Pointer, Reference, Type, is_box_type
 from ehir.core.variable import Parameter
 from ehir.format import ThemePalette, printfmt
 from ehir.frontend import EHIR_Frontend
@@ -124,6 +124,7 @@ class EHIR_ProjectCompiler:
             ast=self._builtin_directives() + deepcopy(node.module.ast),
         )
 
+        module.ast = self._lift_impl_methods(module.ast)
         module.ast = Resolver().run(module.ast)
         self._emit_ehir_stage(refrain.name, "post_resolve", module.ast)
         module.ast = ReferenceLoweringPass().run(module.ast)
@@ -140,27 +141,8 @@ class EHIR_ProjectCompiler:
         self._emit_ehir_stage(refrain.name, "pre_downgrade", module.ast)
         module.ast = Downgrader().run(module.ast)
         self._emit_ehir_stage(refrain.name, "post_downgrade", module.ast)
-        module.ast = UnneededSymbolsStripper().run(
-            module.ast,
-            keep_public_api=refrain.type != Refrain.TargetType.EXECUTABLE,
-        )
-        lifted_method_names = {
-            directive.name for directive in module.ast if isinstance(directive, (Derective_fn, Derective_extern_fn))
-        }
-        lifted_methods: list[Derective_fn] = []
-        for directive in module.ast:
-            if isinstance(directive, Derective_impl):
-                if directive.trait_name is not None and directive.trait_name != "":
-                    continue
-                for method in directive.methods:
-                    if not isinstance(method, Derective_fn):
-                        continue
-                    if method.name in lifted_method_names:
-                        continue
-                    lifted_method_names.add(method.name)
-                    lifted_methods.append(method)
-        if lifted_methods:
-            module.ast.extend(lifted_methods)
+        if refrain.type == Refrain.TargetType.EXECUTABLE:
+            module.ast = UnneededSymbolsStripper().run(module.ast, keep_public_api=False)
         module.ast = [
             directive
             for directive in module.ast
@@ -169,10 +151,18 @@ class EHIR_ProjectCompiler:
         concrete_type_names = {
             directive.name for directive in module.ast if isinstance(directive, (Derective_struct, Derective_enum))
         }
+        known_type_names = set(concrete_type_names)
+        known_type_names |= {
+            directive.name for directive in module.ast if isinstance(directive, Derective_typealias)
+        }
+        known_type_names |= {
+            type_name.rsplit("::", 1)[-1] for type_name in concrete_type_names if "::" in type_name
+        }
         module.ast = [
-            directive for directive in module.ast if self._is_backend_emittable(directive, concrete_type_names)
+            directive for directive in module.ast if self._is_backend_emittable(directive, known_type_names)
         ]
         module.ast = [directive for directive in module.ast if not isinstance(directive, Derective_typealias)]
+        self._emit_ehir_stage(refrain.name, "pre_postprocess", module.ast)
         processed_mod = Postprocessor().run(module)
 
         compiled_refrain = CompiledRefrain(
@@ -188,6 +178,51 @@ class EHIR_ProjectCompiler:
         self._cache.store(compiled_refrain)
         self.compiled_refrains[refrain.name] = compiled_refrain
         return compiled_refrain
+
+    def _lift_impl_methods(self, ast: list[Derective]) -> list[Derective]:
+        lifted_method_names = {
+            directive.name for directive in ast if isinstance(directive, (Derective_fn, Derective_extern_fn))
+        }
+        lifted_methods: list[Derective_fn] = []
+        for directive in ast:
+            if not isinstance(directive, Derective_impl):
+                continue
+            for method in directive.methods:
+                if not isinstance(method, Derective_fn):
+                    continue
+                lifted = deepcopy(method)
+                if "::" not in lifted.name:
+                    owner = directive.trait_name if directive.trait_name else directive.for_type.name
+                    if owner:
+                        method_name = lifted.name
+                        if method_name != "op":
+                            suffix = self._mangle_type_name(directive.for_type)
+                            if suffix:
+                                method_name = f"{method_name}__{suffix}"
+                        lifted.name = f"{owner}::{method_name}"
+                if lifted.name in lifted_method_names:
+                    continue
+                lifted_method_names.add(lifted.name)
+                lifted_methods.append(lifted)
+        if lifted_methods:
+            return [*ast, *lifted_methods]
+        return ast
+
+    def _mangle_type_name(self, typ: Type) -> str:
+        if self._is_placeholder_type_name(typ.name):
+            return ""
+        if typ.generics:
+            mangled_generics = [self._mangle_type_name(generic) for generic in typ.generics]
+            if any(not part for part in mangled_generics):
+                return ""
+            inner = "_".join(mangled_generics)
+            return f"{typ.name}_{inner}"
+        return typ.name.replace("::", "_")
+
+    def _is_placeholder_type_name(self, name: str) -> bool:
+        if name == "T":
+            return True
+        return len(name) > 1 and name.startswith("T") and name[1:].isdigit()
 
     def _emit_ehir_stage(self, refrain_name: str, stage: str, ast: list[Derective]) -> None:
         ehir_dir = self.backend.profile_path / "ehir"
@@ -272,38 +307,35 @@ class EHIR_ProjectCompiler:
                     impl_keys.add(key)
                 target_node.module.ast.append(directive)
 
-    def _is_backend_emittable(self, directive, concrete_type_names: set[str]) -> bool:
+    def _is_backend_emittable(self, directive, known_type_names: set[str]) -> bool:
         if isinstance(directive, Derective_fn):
-            if directive.name.startswith("std::src::vec::mod::"):
-                return True
             return all(
-                self._is_concrete_type(param.type, concrete_type_names) for param in directive.params
-            ) and self._is_concrete_type(directive.ret_type, concrete_type_names)
+                self._is_concrete_type(param.type, known_type_names) for param in directive.params
+            ) and self._is_concrete_type(directive.ret_type, known_type_names)
         if getattr(directive, "generics", []):
-            if isinstance(directive, Derective_struct):
+            if isinstance(directive, (Derective_struct, Derective_enum)):
                 return True
             return False
         if isinstance(directive, Derective_struct):
-            return all(self._is_concrete_type(param.type, concrete_type_names) for param in directive.params)
+            return True
         if isinstance(directive, Derective_enum):
-            return all(
-                variant.type is None or self._is_concrete_type(variant.type, concrete_type_names)
-                for variant in directive.variants
-            )
+            return True
         if isinstance(directive, Derective_typealias):
             return False
         return True
 
-    def _is_concrete_type(self, typ: Type, concrete_type_names: set[str]) -> bool:
+    def _is_concrete_type(self, typ: Type, known_type_names: set[str]) -> bool:
         if isinstance(typ, (Pointer, Reference)):
-            return self._is_concrete_type(typ.pointee, concrete_type_names)
+            return self._is_concrete_type(typ.pointee, known_type_names)
         if isinstance(typ, PrimitiveType):
             return True
-        if typ.generics and not all(self._is_concrete_type(generic, concrete_type_names) for generic in typ.generics):
+        if typ.generics and not all(self._is_concrete_type(generic, known_type_names) for generic in typ.generics):
             return False
         builtin_scalar_names = {"void", "str", "char"}
         return (
-            typ.name in concrete_type_names
+            is_box_type(typ)
+            or
+            typ.name in known_type_names
             or typ.name in builtin_scalar_names
             or not typ.name.isidentifier()
             or typ.name.startswith(("u", "i", "f"))
@@ -478,6 +510,9 @@ class EHIR_ProjectCompiler:
         return node
 
     def _core_dir(self) -> Path:
+        package_core = Path(__file__).resolve().parent / "core"
+        if package_core.exists():
+            return package_core
         return Path(__file__).resolve().parents[2] / "core"
 
     def _core_module_ids(self) -> list[Path]:
