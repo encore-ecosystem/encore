@@ -112,9 +112,12 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         return LexerToken(type=TokenType.EOF, value="", line=0, column=0)
 
     def _parse_top_level(self):
+        attrs = self._parse_function_attrs()
         curr_token = self._peek_curr()
 
         if curr_token.type == TokenType.KW_IMPL:
+            if attrs:
+                raise TypeError("Function attributes are only allowed on fn/extern fn")
             self._push(self._parse_impl())
             return
 
@@ -123,6 +126,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             self._safe_consume(TokenType.KW_PUB)
             is_public = True
             curr_token = self._peek_curr()
+
+        if attrs and curr_token.type not in (TokenType.KW_FN, TokenType.KW_EXTERN):
+            raise TypeError("Function attributes are only allowed on fn/extern fn")
 
         match curr_token.type:
             case TokenType.KW_IMPORT:
@@ -134,9 +140,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             case TokenType.KW_STRUCT:
                 self._push(self._parse_struct(is_public))
             case TokenType.KW_FN:
-                self._parse_fn(is_public)
+                self._parse_fn(is_public, attrs)
             case TokenType.KW_EXTERN:
-                self._parse_extern(is_public)
+                self._parse_extern(is_public, attrs)
             case _:
                 raise NotImplementedError(f"{curr_token}")
 
@@ -178,7 +184,8 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         body: list[s.FunctionSignature] = []
         self._safe_consume(TokenType.LEFT_BRACE)
         while self._peek_curr().type != TokenType.RIGHT_BRACE:
-            body.append(self._parse_function_signature())
+            attrs = self._parse_function_attrs()
+            body.append(self._parse_function_signature(attrs=attrs))
         self._safe_consume(TokenType.RIGHT_BRACE)
         self._push(s.Statement_Trait(is_public=is_public, name=name, generics=generics, body=body, bases=bases))
 
@@ -198,12 +205,13 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         if self._peek_curr().type == TokenType.LEFT_BRACE:
             self._safe_consume(TokenType.LEFT_BRACE)
             while self._peek_curr().type != TokenType.RIGHT_BRACE:
+                attrs = self._parse_function_attrs()
                 is_public = False
                 if self._peek_curr().type == TokenType.KW_PUB:
                     self._safe_consume(TokenType.KW_PUB)
                     is_public = True
 
-                sign = self._parse_function_signature(is_public)
+                sign = self._parse_function_signature(is_public, attrs=attrs)
                 fn_body = self._parse_block()
                 body.append(
                     s.Statement_FunctionDefinition(
@@ -228,8 +236,8 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         signature = self._parse_struct_signature()
         return s.Statement_StructureDefinition(is_public=is_public, signature=signature)
 
-    def _parse_fn(self, is_public: bool):
-        sign = self._parse_function_signature()
+    def _parse_fn(self, is_public: bool, attrs: list[str]):
+        sign = self._parse_function_signature(is_public, attrs=attrs)
         body = self._parse_block()
         self._push(
             s.Statement_FunctionDefinition(
@@ -239,8 +247,8 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             )
         )
 
-    def _parse_extern(self, is_public: bool):
-        self._push(self._parse_function_signature(is_public))
+    def _parse_extern(self, is_public: bool, attrs: list[str]):
+        self._push(self._parse_function_signature(is_public, attrs=attrs))
 
     def _parse_import_path(self, default_leaf_kind: s.Statement_Import.ImportKind) -> s.Statement_Import.ImportPair:
         module = self._safe_consume(TokenType.IDENTIFIER).value
@@ -321,7 +329,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             case _:
                 return s.UnitStructureDefinition(name=name, generics=generics)
 
-    def _parse_function_signature(self, is_public: bool = False) -> s.FunctionSignature:
+    def _parse_function_signature(self, is_public: bool = False, *, attrs: list[str] | None = None) -> s.FunctionSignature:
         is_extern = False
         if self._peek_curr().type == TokenType.KW_EXTERN:
             self._safe_consume(TokenType.KW_EXTERN)
@@ -347,8 +355,30 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             fn_type = self._parse_type()
 
         return s.FunctionSignature(
-            is_public=is_public, is_extern=is_extern, name=func_name, generics=generics, params=params, type=fn_type
+            is_public=is_public,
+            attrs=list(attrs) if attrs is not None else [],
+            is_extern=is_extern,
+            name=func_name,
+            generics=generics,
+            params=params,
+            type=fn_type,
         )
+
+    def _parse_function_attrs(self) -> list[str]:
+        attrs: list[str] = []
+        while self._peek_curr().type == TokenType.HASH:
+            self._safe_consume(TokenType.HASH)
+            directive = self._safe_consume(TokenType.IDENTIFIER).value
+            if directive != "attr":
+                raise TypeError(f"Unsupported attribute directive '#{directive}', expected '#attr(...)'")
+
+            self._safe_consume(TokenType.LEFT_PAREN)
+            attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
+            while self._peek_curr().type == TokenType.COMMA:
+                self._safe_consume(TokenType.COMMA)
+                attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
+            self._safe_consume(TokenType.RIGHT_PAREN)
+        return attrs
 
     def _parse_block(self) -> s.Block:
         self._safe_consume(TokenType.LEFT_BRACE)
