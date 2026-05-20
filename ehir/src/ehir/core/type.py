@@ -68,11 +68,16 @@ def box_pointee(typ: Type) -> Type:
     return typ.generics[0]
 
 
+def concrete_box_type_name(inner: Type) -> str:
+    return f"__Box_{mangle_type_name(inner)}"
+
+
 def mangle_type_name(typ: Type) -> str:
     if isinstance(typ, Pointer):
         return f"{mangle_type_name(typ.pointee)}_ptr"
     if isinstance(typ, Reference):
         return f"{mangle_type_name(typ.pointee)}_ref"
+    name = typ.name.replace("::", "_")
     if not typ.generics:
-        return typ.name
-    return f"{typ.name}_{'_'.join(mangle_type_name(generic) for generic in typ.generics)}"
+        return name
+    return f"{name}_{'_'.join(mangle_type_name(generic) for generic in typ.generics)}"

@@ -9,11 +9,7 @@ from ehir.core.enum import Enum, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import Instruction_call, Instruction_wraps
 from ehir.core.primitives.base import Primitive, PrimitiveType
 from ehir.core.struct import Struct
-from ehir.core.type import Pointer, Reference, Type, mangle_type_name
-
-
-def _box_concrete_name(inner: Type) -> str:
-    return f"__Box_{mangle_type_name(inner)}"
+from ehir.core.type import Pointer, Reference, Type, concrete_box_type_name, mangle_type_name
 
 
 class MonomorphizationPass:
@@ -53,7 +49,7 @@ class MonomorphizationPass:
 
         new_nodes: list[Derective] = []
         for concrete in concrete_box_types:
-            concrete_name = _box_concrete_name(concrete)
+            concrete_name = concrete_box_type_name(concrete)
             mapping = {"T": concrete}
 
             # Struct __Box_<T>
@@ -228,7 +224,7 @@ class MonomorphizationPass:
     def _is_placeholder_type(self, typ: Type) -> bool:
         if isinstance(typ, (Pointer, Reference)):
             return self._is_placeholder_type(typ.pointee)
-        if not typ.generics and typ.name in {"T", "Self"}:
+        if not typ.generics and (typ.name in {"T", "Self"} or (len(typ.name) == 1 and typ.name.isupper())):
             return True
         return any(self._is_placeholder_type(generic) for generic in typ.generics)
 
@@ -302,7 +298,7 @@ class MonomorphizationPass:
                 )
             return replace(
                 value,
-                name=_box_concrete_name(inner),
+                name=concrete_box_type_name(inner),
                 generics=[],
             )
         return replace(
@@ -364,7 +360,7 @@ class MonomorphizationPass:
         if rewritten_generics and any(self._is_placeholder_type(generic) for generic in rewritten_generics):
             return Type(typ.name, rewritten_generics)
         if typ.name == "Box" and len(rewritten_generics) == 1:
-            return Type(_box_concrete_name(rewritten_generics[0]))
+            return Type(concrete_box_type_name(rewritten_generics[0]))
         return Type(typ.name, rewritten_generics)
 
     def _rewrite_enum_type(self, typ: Type, enum_names: set[str]) -> Type:

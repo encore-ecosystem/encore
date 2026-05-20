@@ -97,6 +97,10 @@ class Codegen:
         except PackageNotFoundError:
             return "0.0.0-dev"
 
+    def _comment_instruction(self, instr: object) -> None:
+        self.builder.comment("")
+        self.builder.comment(str(instr).encode("unicode_escape").decode("ascii"))
+
     def run(self, mod: ProcessedModule) -> ir.Module:
         self._reset_state()
         self._enabled_functions = self._collect_enabled_functions(mod.funcs)
@@ -362,8 +366,7 @@ class Codegen:
             raise NotImplementedError(f"Unsupported instruction type: {type(instr)}")
 
     def _build_getptr(self, instr: Instruction_getptr):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
 
         assert instr.var.type is not None
         type = self._build_type(instr.var.type)
@@ -371,8 +374,7 @@ class Codegen:
         self._variables[instr.var.name] = ptr
 
     def _build_getptr(self, instr: Instruction_getptr):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
 
         assert instr.var.type is not None
         dst_type = self._build_type(instr.var.type)
@@ -383,8 +385,7 @@ class Codegen:
         self._variables[instr.var_out.name] = alloca
 
     def _build_pcast(self, instr: ProcessedInstruction_pcast):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
 
         value = self._variables[instr.var.name]
         assert hasattr(value, "type")
@@ -422,8 +423,7 @@ class Codegen:
         return result
 
     def _build_store(self, instr: ProcessedInstruction_store):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         value = self._variables.get(instr.var_src.name)
         if value is None:
             src_t = instr.var_src.type
@@ -538,8 +538,7 @@ class Codegen:
         self.builder.store(value, ptr)
 
     def _build_getfieldptr(self, instr: ProcessedInstruction_getfieldptr):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         base = self._variables[instr.src.name]
         assert hasattr(base, "type")
         expected_result_type = self._build_type(instr.var_out.type) if instr.var_out.type is not None else None
@@ -583,8 +582,7 @@ class Codegen:
         return result
 
     def _build_gep(self, instr: ProcessedInstruction_gep):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
 
         base = self._variables[instr.var.name]
         if not isinstance(base.type, ir.PointerType):
@@ -640,8 +638,7 @@ class Codegen:
         return result
 
     def _build_getfield(self, instr: Instruction_getfield):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
 
         field_ptr_instr = Instruction_getfieldptr(var_out=instr.var_out, src=instr.src, field=instr.field)
         field_ptr = self._build_getfieldptr(field_ptr_instr)
@@ -650,8 +647,7 @@ class Codegen:
         return result
 
     def _build_salloc(self, instr: ProcessedInstruction_salloc):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         target_type = self._build_type(instr.type)
         entry_builder = self._entry_alloca_builder()
         ptr = entry_builder.alloca(target_type, name=instr.var_out.name)
@@ -671,8 +667,7 @@ class Codegen:
         return builder
 
     def _build_halloc(self, instr: ProcessedInstruction_halloc):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
 
         byte_size = self._sizeof(instr.type)
         malloc_func = self._get_malloc_function()
@@ -683,8 +678,7 @@ class Codegen:
         return casted_ptr
 
     def _build_hrealloc(self, instr: ProcessedInstruction_hrealloc):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
 
         ptr = self._variables[instr.var.name]
         count = self._variables[instr.count.name]
@@ -711,8 +705,7 @@ class Codegen:
         return casted_ptr
 
     def _build_hfree(self, instr: ProcessedInstruction_hfree):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
 
         ptr = self._variables[instr.var.name]
         free_func = self._get_free_function()
@@ -722,8 +715,7 @@ class Codegen:
         self.builder.call(free_func, [ptr_conv])
 
     def _build_put(self, instr: ProcessedInstruction_put):
-        self.builder.comment("")
-        self.builder.comment(str(instr).replace("\n", "\\n"))
+        self._comment_instruction(instr)
         constant = self._build_primitive(instr.primitive)
         dst = self._variables[instr.var.name]
         if (
@@ -741,8 +733,7 @@ class Codegen:
         self.builder.store(constant, dst)
 
     def _build_load(self, instr: ProcessedInstruction_load):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         ptr = self._variables[instr.var.name]
         if not isinstance(ptr.type, ir.PointerType):
             # Some lowered match payload paths may already yield a concrete value.
@@ -761,8 +752,7 @@ class Codegen:
         return value
 
     def _build_add(self, instr: ProcessedInstruction_add):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         if self._is_str_value(left):
@@ -778,8 +768,7 @@ class Codegen:
         return result
 
     def _build_sub(self, instr: ProcessedInstruction_sub):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         if self._is_float_value(left):
@@ -790,8 +779,7 @@ class Codegen:
         return result
 
     def _build_mul(self, instr: ProcessedInstruction_mul):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         if self._is_float_value(left):
@@ -802,8 +790,7 @@ class Codegen:
         return result
 
     def _build_div(self, instr: ProcessedInstruction_div):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         if self._is_float_value(left):
@@ -816,8 +803,7 @@ class Codegen:
         return result
 
     def _build_mod(self, instr: ProcessedInstruction_mod):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         if self._is_float_value(left):
@@ -830,8 +816,7 @@ class Codegen:
         return result
 
     def _build_shl(self, instr: ProcessedInstruction_shl):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         result = self.builder.shl(left, right, name=instr.var_out.name)
@@ -839,8 +824,7 @@ class Codegen:
         return result
 
     def _build_shr(self, instr: ProcessedInstruction_shr):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
 
@@ -859,8 +843,7 @@ class Codegen:
         return result
 
     def _build_or(self, instr: ProcessedInstruction_or):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         result = self.builder.or_(left, right, name=instr.var_out.name)
@@ -868,8 +851,7 @@ class Codegen:
         return result
 
     def _build_and(self, instr: ProcessedInstruction_and):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         result = self.builder.and_(left, right, name=instr.var_out.name)
@@ -877,8 +859,7 @@ class Codegen:
         return result
 
     def _build_xor(self, instr: ProcessedInstruction_xor):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         result = self.builder.xor(left, right, name=instr.var_out.name)
@@ -886,8 +867,7 @@ class Codegen:
         return result
 
     def _build_ieq(self, instr: ProcessedInstruction_ieq):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         if self._is_str_value(left):
@@ -905,8 +885,7 @@ class Codegen:
         return result
 
     def _build_neq(self, instr: ProcessedInstruction_neq):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         if self._is_str_value(left):
@@ -925,8 +904,7 @@ class Codegen:
         return result
 
     def _build_les(self, instr: ProcessedInstruction_les):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         if self._is_float_value(left):
@@ -939,8 +917,7 @@ class Codegen:
         return result
 
     def _build_leq(self, instr: ProcessedInstruction_leq):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         if self._is_float_value(left):
@@ -953,8 +930,7 @@ class Codegen:
         return result
 
     def _build_grt(self, instr: ProcessedInstruction_grt):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         if self._is_float_value(left):
@@ -967,8 +943,7 @@ class Codegen:
         return result
 
     def _build_geq(self, instr: ProcessedInstruction_geq):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         left = self._get_typed_value(instr.lhs)
         right = self._get_typed_value(instr.rhs)
         if self._is_float_value(left):
@@ -981,8 +956,7 @@ class Codegen:
         return result
 
     def _build_call(self, instr: ProcessedInstruction_call):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         trait_result = self._try_build_trait_op_call(instr)
         if trait_result is not None:
             self._variables[instr.var_out.name] = trait_result
@@ -1366,13 +1340,11 @@ class Codegen:
         return tuple(types)
 
     def _build_br(self, instr: Instruction_br):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         self.builder.branch(self._blocks[instr.label])
 
     def _build_cbr(self, instr: Instruction_cbr):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         cond_value = self._variables[instr.cond_var.name]
         self.builder.cbranch(cond_value, self._blocks[instr.true_br_label], self._blocks[instr.else_br_label])
 
@@ -1393,8 +1365,7 @@ class Codegen:
             switch.add_case(const_val, target_block)
 
     def _build_ret(self, instr: ProcessedInstruction_ret):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
         value = self._get_typed_value(instr.var)
         expected_ret_type = self.builder.function.function_type.return_type
         if value.type != expected_ret_type:
@@ -1418,8 +1389,7 @@ class Codegen:
         self.builder.ret(value)
 
     def _build_phi(self, instr: ProcessedInstruction_phi):
-        self.builder.comment("")
-        self.builder.comment(f"{instr}")
+        self._comment_instruction(instr)
 
         assert instr.var_out.type
         phi = self.builder.phi(typ=self._build_type(instr.var_out.type), name=instr.var_out.name)
@@ -1522,7 +1492,11 @@ class Codegen:
 
     @staticmethod
     def _is_generic_placeholder_name(name: str) -> bool:
-        return name == "T" or (name.startswith("T") and name[1:].isdigit())
+        return (
+            name in {"Self", "T"}
+            or (len(name) == 1 and name.isupper())
+            or (name.startswith("T") and name[1:].isdigit())
+        )
 
     def _collect_generic_placeholders(self, types: list[Type]) -> list[str]:
         names: list[str] = []
