@@ -1,5 +1,8 @@
 import ctypes
+import hashlib
+import re
 from collections.abc import Sequence
+from importlib.metadata import PackageNotFoundError, version
 
 import llvmlite.binding as llvm
 import llvmlite.ir as ir
@@ -84,6 +87,15 @@ class Codegen:
         self._string_literal_counter = 0
         self._str_type: ir.IdentifiedStructType | None = None
         self._enabled_functions: set[str] = set()
+        self._symbol_by_canonical: dict[str, str] = {}
+        self._canonical_by_symbol: dict[str, str] = {}
+        self._symbol_version_salt = self._detect_symbol_version_salt()
+
+    def _detect_symbol_version_salt(self) -> str:
+        try:
+            return version("ehir-llvm-backend")
+        except PackageNotFoundError:
+            return "0.0.0-dev"
 
     def run(self, mod: ProcessedModule) -> ir.Module:
         self._reset_state()
@@ -146,12 +158,26 @@ class Codegen:
         return out
 
     def _emit_like_symbol_name(self, name: str) -> str:
-        if "::" not in name:
+        if name == "main":
+            return "main"
+        if name in self._symbol_by_canonical:
+            return self._symbol_by_canonical[name]
+        if name in self._canonical_by_symbol:
             return name
-        owner_text, method_name = name.rsplit("::", 1)
-        owner_name = owner_text.split("[", 1)[0]
-        method = method_name.split("[", 1)[0]
-        return f"{owner_name}__{method}"
+
+        base = name.rsplit("::", 1)[-1].split("[", 1)[0]
+        base = re.sub(r"[^0-9A-Za-z_]", "_", base)
+        if not base or not (base[0].isalpha() or base[0] == "_"):
+            base = f"fn_{base}" if base else "fn"
+
+        digest = hashlib.blake2b(
+            f"{self._symbol_version_salt}:{name}".encode("utf-8"),
+            digest_size=8,
+        ).hexdigest()
+        symbol = f"__ehir_{base}_{digest}"
+        self._symbol_by_canonical[name] = symbol
+        self._canonical_by_symbol[symbol] = name
+        return symbol
 
     def _codegen_struct_decl(self, struct: ProcessedDerective_struct):
         if struct.name in self._structs:
@@ -168,7 +194,10 @@ class Codegen:
         param_types = [self._build_type(t.type) for t in fn.params]
 
         func_type = ir.FunctionType(ret_type, param_types)
-        func = ir.Function(self.module, func_type, name=fn.name)
+        emitted_name = fn.name if isinstance(fn, ProcessedDerective_extern_fn) or fn.name == "main" else self._emit_like_symbol_name(fn.name)
+        self._symbol_by_canonical[fn.name] = emitted_name
+        self._canonical_by_symbol[emitted_name] = fn.name
+        func = ir.Function(self.module, func_type, name=emitted_name)
 
         for i, param in enumerate(func.args):
             param.name = fn.params[i].name
@@ -207,7 +236,8 @@ class Codegen:
         struct_type.elements = field_types  # ty:ignore[invalid-assignment]
 
     def _codegen_fn_body(self, fn: ProcessedDerective_fn):
-        func = [f for f in self.module.functions if f.name == fn.name][0]
+        emitted_name = self._symbol_by_canonical.get(fn.name, fn.name)
+        func = [f for f in self.module.functions if f.name == emitted_name][0]
 
         self._variables.clear()
         self._blocks.clear()
@@ -1079,15 +1109,16 @@ class Codegen:
         return self.builder.call(concat_fn, [lhs, rhs], name=name)
 
     def _get_or_declare_called_function(self, instr: ProcessedInstruction_call) -> ir.Function:
+        emitted_call_name = self._symbol_by_canonical.get(instr.fn_name, instr.fn_name)
         for fn in self.module.functions:
-            if fn.name == instr.fn_name:
+            if fn.name == emitted_call_name:
                 return fn
 
         # Fallback for emitted-like call names (owner__method) that may be produced
         # by lowering while declarations are still stored under canonical names.
         alias_candidates: list[ir.Function] = []
         for fn in self.module.functions:
-            if self._emit_like_symbol_name(fn.name) != instr.fn_name:
+            if self._emit_like_symbol_name(fn.name) != emitted_call_name:
                 continue
             if len(fn.function_type.args) != len(instr.args):
                 continue
@@ -1106,17 +1137,17 @@ class Codegen:
             return alias_candidates[0]
 
         if instr.var_out.type is None:
-            raise TypeError(f"Cannot declare function '{instr.fn_name}' without known return type")
+            raise TypeError(f"Cannot declare function '{emitted_call_name}' without known return type")
 
         ret_type = self._build_type(instr.var_out.type)
         arg_types: list[ir.Type] = []
         for arg in instr.args:
             if arg.type is None:
-                raise TypeError(f"Cannot declare function '{instr.fn_name}' without known arg type for '{arg.name}'")
+                raise TypeError(f"Cannot declare function '{emitted_call_name}' without known arg type for '{arg.name}'")
             arg_types.append(self._build_type(arg.type))
 
         fn_type = ir.FunctionType(ret_type, arg_types)
-        return ir.Function(self.module, fn_type, name=instr.fn_name)
+        return ir.Function(self.module, fn_type, name=emitted_call_name)
 
     def _get_typed_value(self, var: TypedVariable):
         value = self._variables.get(var.name)

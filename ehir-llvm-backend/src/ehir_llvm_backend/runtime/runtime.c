@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -8,7 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <dirent.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -117,6 +121,56 @@ static int32_t encore_mkdir_p(const char *path) {
 
     free(buffer);
     return 0;
+}
+
+static double encore_timespec_to_seconds(const struct timespec *ts) {
+    return (double)ts->tv_sec + ((double)ts->tv_nsec / 1000000000.0);
+}
+
+double __ehir_rt_time_time(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+        return encore_timespec_to_seconds(&ts);
+    }
+
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) == 0) {
+        return (double)tv.tv_sec + ((double)tv.tv_usec / 1000000.0);
+    }
+    return 0.0;
+}
+
+double __ehir_rt_time_perf_counter(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return encore_timespec_to_seconds(&ts);
+    }
+    return __ehir_rt_time_time();
+}
+
+uint64_t __ehir_rt_time_perf_counter_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
+    }
+    double fallback = __ehir_rt_time_time();
+    if (fallback <= 0.0) {
+        return 0ULL;
+    }
+    return (uint64_t)(fallback * 1000.0);
+}
+
+bool __ehir_rt_time_sleep_ms(uint64_t ms) {
+    struct timespec req;
+    req.tv_sec = (time_t)(ms / 1000ULL);
+    req.tv_nsec = (long)((ms % 1000ULL) * 1000000ULL);
+
+    while (nanosleep(&req, &req) != 0) {
+        if (errno != EINTR) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool __ehir_rt_str_eq(encore_str lhs, encore_str rhs) {

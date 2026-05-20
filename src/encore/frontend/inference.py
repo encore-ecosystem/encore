@@ -857,6 +857,20 @@ class TypeInferer:
             self._assert_raw_pointer_usage_allowed(result, context=f"call '{call_name}'")
             return result
 
+        if isinstance(expr, s.Expression_UnaryOperation):
+            operand_type = self._infer_expression(expr.expr, env, expected_type, mutable_env)
+            if expr.operator in ("!", "not"):
+                if operand_type is not None and operand_type != Type("bool"):
+                    raise TypeError(f"Logical unary operator '{expr.operator}' expects bool, got {operand_type}")
+                if expected_type is not None and expected_type != Type("bool"):
+                    raise TypeError(f"Type mismatch: {expected_type} != bool")
+                return Type("bool")
+            if expr.operator == "await":
+                return operand_type or expected_type
+            if expr.operator in ("+", "-", "~", "++", "--"):
+                return operand_type or expected_type
+            return operand_type or expected_type
+
         if isinstance(expr, s.Expression_BinaryOperation):
             if expr.operator in ("&&", "||"):
                 lhs_type = self._infer_expression(expr.lhs, env, mutable_env=mutable_env)

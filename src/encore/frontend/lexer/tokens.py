@@ -36,6 +36,8 @@ class TokenType(Enum):
     KW_EXTERN = auto()
     KW_UNSAFE = auto()
     KW_EHIR = auto()
+    KW_ASYNC = auto()
+    KW_AWAIT = auto()
 
     SCOPE = auto()
 

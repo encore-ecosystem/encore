@@ -127,7 +127,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             is_public = True
             curr_token = self._peek_curr()
 
-        if attrs and curr_token.type not in (TokenType.KW_FN, TokenType.KW_EXTERN):
+        if attrs and curr_token.type not in (TokenType.KW_FN, TokenType.KW_EXTERN, TokenType.KW_ASYNC):
             raise TypeError("Function attributes are only allowed on fn/extern fn")
 
         match curr_token.type:
@@ -143,6 +143,8 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 self._parse_fn(is_public, attrs)
             case TokenType.KW_EXTERN:
                 self._parse_extern(is_public, attrs)
+            case TokenType.KW_ASYNC:
+                self._parse_fn(is_public, attrs)
             case _:
                 raise NotImplementedError(f"{curr_token}")
 
@@ -330,10 +332,19 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 return s.UnitStructureDefinition(name=name, generics=generics)
 
     def _parse_function_signature(self, is_public: bool = False, *, attrs: list[str] | None = None) -> s.FunctionSignature:
+        attrs_list = list(attrs) if attrs is not None else []
+        is_async = False
+        if self._peek_curr().type == TokenType.KW_ASYNC:
+            self._safe_consume(TokenType.KW_ASYNC)
+            is_async = True
+
         is_extern = False
         if self._peek_curr().type == TokenType.KW_EXTERN:
             self._safe_consume(TokenType.KW_EXTERN)
             is_extern = True
+            if self._peek_curr().type == TokenType.KW_ASYNC:
+                self._safe_consume(TokenType.KW_ASYNC)
+                is_async = True
 
         self._safe_consume(TokenType.KW_FN)
         func_name = self._safe_consume(TokenType.IDENTIFIER).value
@@ -356,7 +367,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
         return s.FunctionSignature(
             is_public=is_public,
-            attrs=list(attrs) if attrs is not None else [],
+            attrs=attrs_list + (["async"] if is_async else []),
             is_extern=is_extern,
             name=func_name,
             generics=generics,
@@ -416,7 +427,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 return self._parse_break()
             case TokenType.KW_CONTINUE:
                 return self._parse_continue()
-            case TokenType.IDENTIFIER:
+            case _:
+                if not self._starts_statement_expression(curr_token.type):
+                    raise NotImplementedError(curr_token)
                 target = self._parse_expression()
                 match self._peek_curr().type:
                     case (
@@ -429,8 +442,28 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                         return self._parse_assignment(target)
                     case _:
                         return s.Statement_Expr(target)
-            case _:
-                raise NotImplementedError(curr_token)
+
+    def _starts_statement_expression(self, token_type: TokenType) -> bool:
+        return token_type in {
+            TokenType.IDENTIFIER,
+            TokenType.INTEGER,
+            TokenType.FLOAT,
+            TokenType.BOOLEAN,
+            TokenType.STRING,
+            TokenType.LEFT_PAREN,
+            TokenType.LEFT_BRACKET,
+            TokenType.LEFT_BRACE,
+            TokenType.KW_MATCH,
+            TokenType.KW_IF,
+            TokenType.KW_UNSAFE,
+            TokenType.KW_AWAIT,
+            TokenType.PLUS,
+            TokenType.MINUS,
+            TokenType.BANG,
+            TokenType.TILDE,
+            TokenType.INCREMENT,
+            TokenType.DECREMENT,
+        }
 
     def _parse_ret(self) -> s.Statement_Ret:
         self._safe_consume(TokenType.KW_RET)
@@ -742,6 +775,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             TokenType.TILDE,
             TokenType.INCREMENT,
             TokenType.DECREMENT,
+            TokenType.KW_AWAIT,
         }:
             operator = tok
             self._consume()

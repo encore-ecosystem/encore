@@ -247,6 +247,8 @@ class Lexer(ParserBase[str, LexerToken]):
             "extern": TokenType.KW_EXTERN,
             "unsafe": TokenType.KW_UNSAFE,
             "ehir": TokenType.KW_EHIR,
+            "async": TokenType.KW_ASYNC,
+            "await": TokenType.KW_AWAIT,
             "not": TokenType.BANG,
             "true": TokenType.BOOLEAN,
             "false": TokenType.BOOLEAN,

@@ -98,8 +98,6 @@ class MonomorphizationPass:
         for d in ast:
             if isinstance(d, Derective_fn) and d.name.endswith("::from_stack"):
                 continue
-            if isinstance(d, Derective_struct) and d.name == "Box" and d.generics:
-                continue
             if isinstance(d, Derective_fn) and d.name.startswith("Box[T]::"):
                 continue
             filtered.append(d)
@@ -291,9 +289,16 @@ class MonomorphizationPass:
         if not is_dataclass(value):
             return value
         if isinstance(value, Struct) and value.name == "Box" and len(value.generics) == 1:
+            inner = self._rewrite_box_type(value.generics[0])
+            if self._is_placeholder_type(inner):
+                return replace(
+                    value,
+                    name="Box",
+                    generics=[inner],
+                )
             return replace(
                 value,
-                name=_box_concrete_name(self._rewrite_box_type(value.generics[0])),
+                name=_box_concrete_name(inner),
                 generics=[],
             )
         return replace(
@@ -352,6 +357,8 @@ class MonomorphizationPass:
         if isinstance(typ, Reference):
             return Reference(self._rewrite_box_type(typ.pointee))
         rewritten_generics = [self._rewrite_box_type(g) for g in typ.generics]
+        if rewritten_generics and any(self._is_placeholder_type(generic) for generic in rewritten_generics):
+            return Type(typ.name, rewritten_generics)
         if typ.name == "Box" and len(rewritten_generics) == 1:
             return Type(_box_concrete_name(rewritten_generics[0]))
         return Type(typ.name, rewritten_generics)

@@ -40,6 +40,8 @@ from ehir.core.instructions import (
     Instruction_ret,
     Instruction_salloc,
     Instruction_setfield,
+    Instruction_sgetfield,
+    Instruction_sgetfieldptr,
     Instruction_shl,
     Instruction_shr,
     Instruction_store,
@@ -265,6 +267,12 @@ class Resolver:
 
         if isinstance(instr, Instruction_getfieldptr):
             return self._resolve_getfield(instr, vars_by_name, as_ptr=True)
+
+        if isinstance(instr, Instruction_sgetfield):
+            return self._resolve_static_getfield(instr, vars_by_name, as_ptr=False)
+
+        if isinstance(instr, Instruction_sgetfieldptr):
+            return self._resolve_static_getfield(instr, vars_by_name, as_ptr=True)
 
         if isinstance(instr, Instruction_setfield):
             field_t = self._field_path_type(vars_by_name, instr.var, [instr.field, *instr.field_path])
@@ -618,6 +626,35 @@ class Resolver:
         field_t = self._field_path_type(vars_by_name, instr.src, [instr.field, *instr.field_path])
         if field_t is None:
             return False
+        if as_ptr:
+            field_t = Pointer(field_t)
+        return self._set_var(vars_by_name, instr.var_out, field_t)
+
+    def _resolve_static_getfield(
+        self,
+        instr: Instruction_sgetfield | Instruction_sgetfieldptr,
+        vars_by_name: dict[str, Type | None],
+        as_ptr: bool,
+    ) -> bool:
+        src_t = self._var_type(vars_by_name, instr.src)
+        if src_t is None:
+            return False
+
+        owner_t = src_t.pointee if isinstance(src_t, (Reference, Pointer)) else src_t
+        decl = self.structs.get(owner_t.name)
+        if decl is None:
+            return False
+
+        field_decl = next((p for p in decl.params if p.name == instr.field.name), None)
+        if field_decl is None and instr.field.name.isdigit():
+            index = int(instr.field.name)
+            if 0 <= index < len(decl.params):
+                field_decl = decl.params[index]
+        if field_decl is None:
+            raise TypeError(f"Unknown field '{instr.field.name}' for struct '{decl.name}'")
+
+        field_t = self._resolve_type(self._specialize_type(field_decl.type, decl.generics, owner_t.generics))
+        instr.field.type = field_t
         if as_ptr:
             field_t = Pointer(field_t)
         return self._set_var(vars_by_name, instr.var_out, field_t)

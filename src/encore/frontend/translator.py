@@ -1829,6 +1829,8 @@ class Translator:
                 operand = self._translate_expression(expr.expr)
                 zero = self._builder.build_capprim(prim=Usize(0, size=1))
                 return self._builder.build_binop("ieq", operand.var_out, zero.var_out, name)
+            if expr.operator == "await":
+                return self._translate_expression(expr.expr, name=name, expected_type=expected_type)
             raise NotImplementedError(f"Translation for unary operator '{expr.operator}' is not implemented.")
 
         elif isinstance(expr, s.Expression_Try):
