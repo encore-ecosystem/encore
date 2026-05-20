@@ -85,82 +85,21 @@ static encore_str encore_format(const char *fmt, ...) {
     return encore_from_owned_buffer(buffer, (size_t)written);
 }
 
-static int32_t encore_mkdir_p(const char *path) {
-    if (path == NULL) {
-        return -1;
-    }
-
-    size_t len = strlen(path);
-    if (len == 0) {
-        return 0;
-    }
-
-    char *buffer = malloc(len + 1);
-    if (buffer == NULL) {
-        return -1;
-    }
-    memcpy(buffer, path, len + 1);
-
-    for (size_t i = 1; i <= len; ++i) {
-        if (buffer[i] != '/' && buffer[i] != '\0') {
-            continue;
-        }
-
-        char saved = buffer[i];
-        buffer[i] = '\0';
-
-        if (buffer[0] != '\0') {
-            if (mkdir(buffer, 0755) != 0 && errno != EEXIST) {
-                free(buffer);
-                return -1;
-            }
-        }
-
-        buffer[i] = saved;
-    }
-
-    free(buffer);
-    return 0;
-}
-
-static double encore_timespec_to_seconds(const struct timespec *ts) {
-    return (double)ts->tv_sec + ((double)ts->tv_nsec / 1000000000.0);
-}
-
-double __ehir_rt_time_time(void) {
+uint64_t __ehir_rt_clock_ms(uint8_t kind) {
     struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
-        return encore_timespec_to_seconds(&ts);
+    clockid_t clock_kind = kind == 0 ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+    if (clock_gettime(clock_kind, &ts) == 0) {
+        return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
     }
 
     struct timeval tv;
     if (gettimeofday(&tv, NULL) == 0) {
-        return (double)tv.tv_sec + ((double)tv.tv_usec / 1000000.0);
+        return ((uint64_t)tv.tv_sec * 1000ULL) + ((uint64_t)tv.tv_usec / 1000ULL);
     }
-    return 0.0;
+    return 0ULL;
 }
 
-double __ehir_rt_time_perf_counter(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
-        return encore_timespec_to_seconds(&ts);
-    }
-    return __ehir_rt_time_time();
-}
-
-uint64_t __ehir_rt_time_perf_counter_ms(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
-        return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
-    }
-    double fallback = __ehir_rt_time_time();
-    if (fallback <= 0.0) {
-        return 0ULL;
-    }
-    return (uint64_t)(fallback * 1000.0);
-}
-
-bool __ehir_rt_time_sleep_ms(uint64_t ms) {
+bool __ehir_rt_sleep_ms(uint64_t ms) {
     struct timespec req;
     req.tv_sec = (time_t)(ms / 1000ULL);
     req.tv_nsec = (long)((ms % 1000ULL) * 1000000ULL);
@@ -230,93 +169,35 @@ encore_str __ehir_rt_str_concat(encore_str lhs, encore_str rhs) {
     return encore_from_owned_buffer(buffer, total_len);
 }
 
-encore_str __ehir_rt_fmt_bool(bool value) {
-    return value ? encore_from_cstr_copy("true") : encore_from_cstr_copy("false");
-}
-
-encore_str __ehir_rt_fmt_u8(uint8_t value) {
-    return encore_format("%" PRIu8, value);
-}
-
-encore_str __ehir_rt_fmt_u16(uint16_t value) {
-    return encore_format("%" PRIu16, value);
-}
-
-encore_str __ehir_rt_fmt_u32(uint32_t value) {
-    return encore_format("%" PRIu32, value);
-}
-
 encore_str __ehir_rt_fmt_u64(uint64_t value) {
     return encore_format("%" PRIu64, value);
-}
-
-encore_str __ehir_rt_fmt_usize(size_t value) {
-    return encore_format("%zu", value);
-}
-
-encore_str __ehir_rt_fmt_i8(int8_t value) {
-    return encore_format("%" PRId8, value);
-}
-
-encore_str __ehir_rt_fmt_i16(int16_t value) {
-    return encore_format("%" PRId16, value);
-}
-
-encore_str __ehir_rt_fmt_i32(int32_t value) {
-    return encore_format("%" PRId32, value);
 }
 
 encore_str __ehir_rt_fmt_i64(int64_t value) {
     return encore_format("%" PRId64, value);
 }
 
-encore_str __ehir_rt_fmt_isize(intptr_t value) {
-    return encore_format("%" PRIdPTR, value);
-}
-
-encore_str __ehir_rt_fmt_f32(float value) {
-    return encore_format("%.9g", value);
-}
-
 encore_str __ehir_rt_fmt_f64(double value) {
     return encore_format("%.17g", value);
 }
 
-int32_t __ehir_rt_io_print(encore_str value) {
-    size_t written = fwrite(value.ptr, 1, value.len, stdout);
-    fflush(stdout);
-    return written == value.len ? 0 : -1;
-}
-
-int32_t __ehir_rt_io_println(encore_str value) {
-    if (__ehir_rt_io_print(value) != 0) {
-        return -1;
-    }
-    return fputc('\n', stdout) == EOF ? -1 : 0;
-}
-
-int32_t __ehir_rt_io_eprint(encore_str value) {
-    size_t written = fwrite(value.ptr, 1, value.len, stderr);
-    fflush(stderr);
-    return written == value.len ? 0 : -1;
-}
-
-int32_t __ehir_rt_io_eprintln(encore_str value) {
-    if (__ehir_rt_io_eprint(value) != 0) {
-        return -1;
-    }
-    return fputc('\n', stderr) == EOF ? -1 : 0;
-}
-
-int32_t __ehir_rt_panic(encore_str message) {
-    fputs("panic: ", stderr);
-    if (__ehir_rt_io_eprint(message) != 0) {
-        fputc('\n', stderr);
+int32_t __ehir_rt_io_write(int32_t fd, encore_str value) {
+    FILE *stream = NULL;
+    if (fd == 1) {
+        stream = stdout;
+    } else if (fd == 2) {
+        stream = stderr;
     } else {
-        __ehir_rt_io_eprintln(encore_empty_str());
+        return -1;
     }
-    exit(1);
-    return 1;
+    size_t written = fwrite(value.ptr, 1, value.len, stream);
+    fflush(stream);
+    return written == value.len ? 0 : -1;
+}
+
+int32_t __ehir_rt_proc_exit(int32_t code) {
+    exit(code);
+    return code;
 }
 
 static bool g_args_initialized = false;
@@ -444,7 +325,7 @@ encore_str __ehir_rt_os_cwd(void) {
     }
 }
 
-encore_str __ehir_rt_os_read_file(encore_str path) {
+encore_str __ehir_rt_fs_read_file(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return encore_empty_str();
@@ -478,7 +359,7 @@ encore_str __ehir_rt_os_read_file(encore_str path) {
     return encore_from_owned_buffer(buffer, read_count);
 }
 
-int32_t __ehir_rt_os_write_file(encore_str path, encore_str contents) {
+int32_t __ehir_rt_fs_write_file(encore_str path, encore_str contents) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return -1;
@@ -495,19 +376,19 @@ int32_t __ehir_rt_os_write_file(encore_str path, encore_str contents) {
     return written == contents.len ? 0 : -1;
 }
 
-bool __ehir_rt_os_file_exists(encore_str path) {
+int32_t __ehir_rt_fs_status(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
-        return false;
+        return -1;
     }
 
     struct stat st;
-    bool exists = stat(path_c, &st) == 0;
+    int32_t result = stat(path_c, &st) == 0 ? 0 : -1;
     free(path_c);
-    return exists;
+    return result;
 }
 
-int32_t __ehir_rt_os_remove_file(encore_str path) {
+int32_t __ehir_rt_fs_remove_file(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return -1;
@@ -518,36 +399,19 @@ int32_t __ehir_rt_os_remove_file(encore_str path) {
     return result == 0 ? 0 : -1;
 }
 
-int32_t __ehir_rt_os_ensure_parent_dirs(encore_str path) {
+int32_t __ehir_rt_fs_mkdir(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return -1;
     }
 
-    char *last_sep = strrchr(path_c, '/');
-    if (last_sep == NULL || last_sep == path_c) {
-        free(path_c);
-        return 0;
-    }
-
-    *last_sep = '\0';
-    int32_t status = encore_mkdir_p(path_c);
+    int rc = mkdir(path_c, 0755);
+    int32_t status = (rc == 0 || errno == EEXIST) ? 0 : -1;
     free(path_c);
     return status;
 }
 
-int32_t __ehir_rt_os_run(encore_str command) {
-    char *command_c = encore_to_cstr(command);
-    if (command_c == NULL) {
-        return -1;
-    }
-
-    int rc = system(command_c);
-    free(command_c);
-    return rc;
-}
-
-encore_str __ehir_rt_os_read_dir(encore_str path) {
+encore_str __ehir_rt_fs_read_dir(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return encore_empty_str();

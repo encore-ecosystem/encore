@@ -121,7 +121,7 @@ class EHIR_ProjectCompiler:
 
         module = EHIR_Module(
             id=node.module.id,
-            ast=self._builtin_directives() + deepcopy(node.module.ast),
+            ast=self._merge_builtin_directives(self._builtin_directives(), deepcopy(node.module.ast)),
         )
 
         module.ast = self._lift_impl_methods(module.ast)
@@ -178,6 +178,30 @@ class EHIR_ProjectCompiler:
         self._cache.store(compiled_refrain)
         self.compiled_refrains[refrain.name] = compiled_refrain
         return compiled_refrain
+
+    def _merge_builtin_directives(
+        self,
+        builtins: list[Derective],
+        user_directives: list[Derective],
+    ) -> list[Derective]:
+        existing: set[tuple[type, str]] = set()
+        for directive in user_directives:
+            existing.add(self._directive_identity(directive))
+
+        merged: list[Derective] = []
+        for directive in builtins:
+            key = self._directive_identity(directive)
+            if key in existing:
+                continue
+            merged.append(directive)
+        merged.extend(user_directives)
+        return merged
+
+    def _directive_identity(self, directive: Derective) -> tuple[type, str]:
+        if isinstance(directive, Derective_impl):
+            trait_name = directive.trait_name or ""
+            return (type(directive), f"{trait_name}::{directive.for_type}")
+        return (type(directive), getattr(directive, "name", ""))
 
     def _lift_impl_methods(self, ast: list[Derective]) -> list[Derective]:
         lifted_method_names = {
@@ -510,10 +534,10 @@ class EHIR_ProjectCompiler:
         return node
 
     def _core_dir(self) -> Path:
-        package_core = Path(__file__).resolve().parent / "core"
-        if package_core.exists():
-            return package_core
-        return Path(__file__).resolve().parents[2] / "core"
+        repo_core = Path(__file__).resolve().parents[2] / "core"
+        if repo_core.exists():
+            return repo_core
+        return Path(__file__).resolve().parent / "core"
 
     def _core_module_ids(self) -> list[Path]:
         core_dir = self._core_dir()
@@ -585,6 +609,7 @@ class EHIR_ProjectCompiler:
         core_root = self._core_dir()
         owner_id = core_root / "owner.ehir"
         box_id = core_root / "smart_box.ehir"
+        runtime_id = core_root / "runtime.ehir"
 
         from ehir.frontend.builtin import EHIR_DirectFrontend
 
@@ -592,7 +617,7 @@ class EHIR_ProjectCompiler:
 
         directives: list[Derective] = []
         seen_symbols: set[tuple[type, str]] = set()
-        for module_id in (owner_id, box_id):
+        for module_id in (owner_id, box_id, runtime_id):
             if not module_id.exists():
                 continue
             module = core_frontend.get_module_by_id(module_id)

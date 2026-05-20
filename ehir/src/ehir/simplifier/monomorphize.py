@@ -25,6 +25,10 @@ class MonomorphizationPass:
         # like `foo__T` and to prevent accidental self-recursion after rewrite.
         return f"{fn_name}__mono__{signature}"
 
+    @staticmethod
+    def _is_box_template_method_name(name: str) -> bool:
+        return name.startswith("Box[T]::") or name.startswith("Box::")
+
     def run(self, ast: list[Derective]) -> list[Derective]:
         box_struct = next((d for d in ast if isinstance(d, Derective_struct) and d.name == "Box" and d.generics), None)
         if box_struct is None:
@@ -37,7 +41,7 @@ class MonomorphizationPass:
             d
             for d in ast
             if isinstance(d, Derective_fn)
-            and d.name.startswith("Box[T]::")
+            and self._is_box_template_method_name(d.name)
         ]
 
         concrete_box_types = self._collect_concrete_box_types(ast)
@@ -98,7 +102,7 @@ class MonomorphizationPass:
         for d in ast:
             if isinstance(d, Derective_fn) and d.name.endswith("::from_stack"):
                 continue
-            if isinstance(d, Derective_fn) and d.name.startswith("Box[T]::"):
+            if isinstance(d, Derective_fn) and self._is_box_template_method_name(d.name):
                 continue
             filtered.append(d)
         new_nodes = [d for d in new_nodes if not (isinstance(d, Derective_fn) and d.name.endswith("::from_stack"))]
@@ -336,7 +340,7 @@ class MonomorphizationPass:
 
     def _rewrite_box_call_names(self, ast: list[Derective]) -> None:
         for item in self._walk(ast):
-            if isinstance(item, Instruction_call) and item.fn_name.startswith("Box[T]::"):
+            if isinstance(item, Instruction_call) and self._is_box_template_method_name(item.fn_name):
                 method = item.fn_name.rsplit("::", 1)[-1]
                 owner = self._infer_call_owner(item)
                 if owner is not None:

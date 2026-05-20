@@ -1000,7 +1000,12 @@ class Codegen:
             value = self._get_typed_value(arg)
             try:
                 args.append(
-                    self._coerce_call_arg(value=value, expected_type=expected_type, arg_name=f"{arg.name}_{index}")
+                    self._coerce_call_arg(
+                        value=value,
+                        expected_type=expected_type,
+                        arg_name=f"{arg.name}_{index}",
+                        source_type=arg.type,
+                    )
                 )
             except TypeError as exc:
                 raise TypeError(f"Call '{instr.fn_name}' arg#{index} '{arg.name}' type mismatch: {exc}") from exc
@@ -1110,6 +1115,8 @@ class Codegen:
 
     def _get_or_declare_called_function(self, instr: ProcessedInstruction_call) -> ir.Function:
         emitted_call_name = self._symbol_by_canonical.get(instr.fn_name, instr.fn_name)
+        if emitted_call_name == instr.fn_name and "::" in instr.fn_name and instr.fn_name != "main":
+            emitted_call_name = self._emit_like_symbol_name(instr.fn_name)
         for fn in self.module.functions:
             if fn.name == emitted_call_name:
                 return fn
@@ -1161,7 +1168,7 @@ class Codegen:
         self._variables[var.name] = placeholder
         return placeholder
 
-    def _coerce_call_arg(self, value, expected_type: ir.Type, arg_name: str):
+    def _coerce_call_arg(self, value, expected_type: ir.Type, arg_name: str, source_type: Type | None = None):
         assert hasattr(value, "type")
         if value.type == expected_type:
             return value
@@ -1179,9 +1186,22 @@ class Codegen:
 
         if isinstance(value.type, ir.IntType) and isinstance(expected_type, ir.IntType):
             if value.type.width < expected_type.width:
+                if self._is_signed_integer_type(source_type):
+                    return self.builder.sext(value, expected_type, name=f"{arg_name}.sext")
                 return self.builder.zext(value, expected_type, name=f"{arg_name}.zext")
             if value.type.width > expected_type.width:
                 return self.builder.trunc(value, expected_type, name=f"{arg_name}.trunc")
+            return value
+
+        if isinstance(value.type, (ir.FloatType, ir.DoubleType)) and isinstance(
+            expected_type, (ir.FloatType, ir.DoubleType)
+        ):
+            source_width = self._float_width(value.type)
+            expected_width = self._float_width(expected_type)
+            if source_width < expected_width:
+                return self.builder.fpext(value, expected_type, name=f"{arg_name}.fpext")
+            if source_width > expected_width:
+                return self.builder.fptrunc(value, expected_type, name=f"{arg_name}.fptrunc")
             return value
 
         if (
@@ -1212,6 +1232,20 @@ class Codegen:
             f"value_fields={len(value.type.elements) if isinstance(value.type, ir.BaseStructType) else 'na'}, "
             f"expected_fields={len(expected_type.elements) if isinstance(expected_type, ir.BaseStructType) else 'na'}"
         )
+
+    def _is_signed_integer_type(self, typ: Type | None) -> bool:
+        if typ is None:
+            return False
+        return isinstance(typ, Isize_t) or typ.name == "isize" or (
+            len(typ.name) > 1 and typ.name.startswith("i") and typ.name[1:].isdigit()
+        )
+
+    def _float_width(self, typ: ir.Type) -> int:
+        if isinstance(typ, ir.FloatType):
+            return 32
+        if isinstance(typ, ir.DoubleType):
+            return 64
+        raise TypeError(f"Unsupported float type: {typ}")
 
     def _unwrap_wrapper_argument(self, value, expected_type: ir.Type, arg_name: str):
         wrapper_value = value

@@ -730,6 +730,8 @@ class Resolver:
             if vt is not None and self._types_compatible(vt, expected.pointee):
                 return False
             return self._set_var(vars_by_name, v, Type("Box", [expected.pointee]))
+        if vt is not None and self._can_pass_as(vt, expected):
+            return False
         return self._set_var(vars_by_name, v, expected)
 
     def _unify_pair(self, vars_by_name: dict[str, Type | None], a: Variable, b: Variable) -> bool:
@@ -766,6 +768,22 @@ class Resolver:
                 return False
             return all(self._types_compatible(a, b) for a, b in zip(lhs.generics, rhs.generics, strict=True))
         return False
+
+    def _can_pass_as(self, actual: Type, expected: Type) -> bool:
+        actual = self._resolve_type(actual)
+        expected = self._resolve_type(expected)
+        if self._types_compatible(actual, expected):
+            return True
+        if isinstance(actual, Usize_t) and isinstance(expected, Usize_t):
+            return self._primitive_bits(actual) <= self._primitive_bits(expected)
+        if isinstance(actual, Isize_t) and isinstance(expected, Isize_t):
+            return self._primitive_bits(actual) <= self._primitive_bits(expected)
+        if isinstance(actual, Float_t) and isinstance(expected, Float_t):
+            return actual.size <= expected.size
+        return False
+
+    def _primitive_bits(self, typ: Usize_t | Isize_t) -> int:
+        return 64 if typ.size is None else typ.size
 
     def _must_get(self, vars_by_name: dict[str, Type | None], name: str, fn_name: str) -> Type:
         t = vars_by_name.get(name)
