@@ -86,6 +86,7 @@ class Statement_Import(Statement_TopLevel):
 
 @dataclass
 class FunctionSignature(Statement_TopLevel):
+    attrs: list[str]
     is_extern: bool
     name: str
     generics: list[Type]
@@ -93,10 +94,11 @@ class FunctionSignature(Statement_TopLevel):
     type: Type | None
 
     def __repr__(self) -> str:
+        attrs_repr = "".join(f"#attr({attr})\n" for attr in self.attrs)
         extern_repr = "extern " if self.is_extern else ""
         generics_repr = format_generic_params(self.generics)
         type_repr = f"-> {self.type}" if self.type else ""
-        return f"{extern_repr}fn {self.name}{generics_repr}({', '.join(str(p) for p in self.params)}){type_repr}"
+        return f"{attrs_repr}{extern_repr}fn {self.name}{generics_repr}({', '.join(str(p) for p in self.params)}){type_repr}"
 
 
 @dataclass

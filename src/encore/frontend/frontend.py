@@ -16,13 +16,6 @@ from encore.frontend.inference import TypeInferer
 from encore.frontend.lexer import Lexer
 from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
-from encore.frontend.reflection import (
-    ModuleReflection,
-    RUNTIME_REFLECTION_RESERVED_NAMES,
-    ReflectionSymbol,
-    build_module_reflection,
-    find_symbol_reflection,
-)
 from encore.frontend.translator import Translator
 from encore.frontend.types import (
     AnySmartPointer,
@@ -81,7 +74,6 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
     _source_ast_cache: dict[Path, list[s.Statement]] = field(default_factory=dict)
     _index_cache: dict[Path, ModuleIndex] = field(default_factory=dict)
     _dependency_cache: dict[Path, dict[str, Path]] = field(default_factory=dict)
-    _reflection_cache: dict[Path, ModuleReflection] = field(default_factory=dict)
     _lexer: Lexer = field(default_factory=lambda: Lexer())
     _parser: Parser = field(default_factory=lambda: Parser())
 
@@ -93,13 +85,11 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return self._cache[id]
 
         ast = self._get_ast_by_id(id)
-        source_ast = self._get_source_ast_by_id(id)
         imported_declarations = self._collect_imported_declarations(id, ast)
         try:
             TypeInferer().infer(ast, imported_declarations)
         except Exception as exc:
             raise with_diagnostic_context(exc, stage="type-inference", module_id=id) from exc
-        self._reflection_cache[id] = build_module_reflection(id, source_ast)
 
         translator = Translator()
         ast_for_translation = self._prepare_imports_for_translation(id, ast)
@@ -113,25 +103,6 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         self._cache[id] = module
         return module
-
-    def get_reflection_by_id(self, id: Path) -> ModuleReflection:
-        if id in self._reflection_cache:
-            return self._reflection_cache[id]
-
-        ast = self._get_ast_by_id(id)
-        source_ast = self._get_source_ast_by_id(id)
-        imported_declarations = self._collect_imported_declarations(id, ast)
-        try:
-            TypeInferer().infer(ast, imported_declarations)
-        except Exception as exc:
-            raise with_diagnostic_context(exc, stage="type-inference", module_id=id) from exc
-
-        reflection = build_module_reflection(id, source_ast)
-        self._reflection_cache[id] = reflection
-        return reflection
-
-    def get_symbol_reflection_by_id(self, id: Path, query: str) -> ReflectionSymbol | None:
-        return find_symbol_reflection(self.get_reflection_by_id(id), query)
 
     def get_parent_id_of(self, id: Path, derective: Derective_import) -> Path:
         project_root = self._get_project_root_of(id)
@@ -174,13 +145,6 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return self._ast_cache[id]
 
         source_ast = self._get_source_ast_by_id(id)
-        reflection = self._reflection_cache.get(id)
-        if reflection is None:
-            reflection = build_module_reflection(id, source_ast)
-            self._reflection_cache[id] = reflection
-
-        # TODO: re-enable runtime reflection injection after CFG normalization
-        # for generated reflect functions is stabilized.
         ast = source_ast
         self._ast_cache[id] = ast
         return ast
@@ -429,12 +393,8 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return None
 
         if isinstance(statement, s.Statement_FunctionDefinition):
-            if statement.signature.name in RUNTIME_REFLECTION_RESERVED_NAMES:
-                return None
             return ExportBinding(statement.signature.name, ExportKind.FUNCTION, id, statement)
         if isinstance(statement, s.FunctionSignature):
-            if statement.name in RUNTIME_REFLECTION_RESERVED_NAMES:
-                return None
             return ExportBinding(statement.name, ExportKind.FUNCTION, id, statement)
         if isinstance(statement, s.Statement_StructureDefinition):
             return ExportBinding(statement.signature.name, ExportKind.STRUCT, id, statement)
