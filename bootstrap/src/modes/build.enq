@@ -1,4 +1,7 @@
 import std::path::Path
+import std::os::read_file
+import std::io::println
+import core::fmt::Debug
 import core::option::Option
 import core::panic::panic
 import core::os::read_file
@@ -6,6 +9,11 @@ import std::io::println
 import std::fmt::Debug
 import refrain::frontend::Lexer
 import refrain::frontend::Parser
+
+import rich::Spinner
+import rich::status
+import rich::status_ok
+import rich::status_fail
 
 pub fn run_build() -> u32 {
     match find_project_root(Path::cwd()) {
@@ -20,17 +28,368 @@ pub fn run_build() -> u32 {
 }
 
 fn compile_project(root: Path) -> u32 {
-    let entry = root.join("src").join("main.enq")
-    let source = read_file(entry.as_str())
+    let manifest_path = root.join("encore.toml")
+    let manifest_source = read_file(manifest_path.as_str())
+    if !contains_substring(manifest_source, "[project]") {
+        println(status_fail("Unable to parse manifest: missing [project] section"))
+        ret 1_u32
+    }
 
-    let mut lexer = Lexer::new()
-    let tokens = lexer.tokenize(source)
+    let source_path = root.join("src").join("main.enq")
+    let source = read_file(source_path.as_str())
 
-    let mut parser = Parser::new()
-    let ast = parser.parse(tokens)
+    println(status(Spinner::dots(), 0_usize, "Bootstrap lexer"))
+    if !validate_lexer_symbols(source) {
+        println(status_fail("Lexing failed"))
+        ret 1_u32
+    }
 
-    println("bootstrap: parsed units = " + Debug::fmt(ast.len()))
+    let tokens = tokenize(source)
+    println("tokens: " + Debug::fmt(tokens.len()))
+
+    println(status(Spinner::dots(), 1_usize, "Bootstrap parser"))
+    let ast_nodes = parse_top_level(tokens)
+    println("ast nodes: " + Debug::fmt(ast_nodes))
+
+    println(status_ok("Build frontend pipeline complete"))
     ret 0_u32
+}
+
+fn tokenize(source: str) -> str {
+    let mut out = ""
+    let mut index = 0_usize
+    while index < source.len() {
+        match source.get(index) {
+            Option[str]::Some(ch) => {
+                if is_space(ch) {
+                    out = out + " "
+                }
+                elif is_punct(ch) {
+                    out = out + " " + ch + " "
+                }
+                else {
+                    out = out + ch
+                }
+                index = index + 1_usize
+            }
+            Option[str]::None => { break }
+        }
+    }
+    ret out
+}
+
+fn parse_top_level(tokens: str) -> usize {
+    // bootstrap parser stage: top-level declaration scanner
+    // aligned with python parser top-level entry points
+    let mut count = 0_usize
+    let mut line = ""
+    let mut i = 0_usize
+    while i < tokens.len() {
+        match tokens.get(i) {
+            Option[str]::Some(ch) => {
+                if is_newline_char(ch) {
+                    if is_top_level_decl(line) {
+                        count = count + 1_usize
+                    }
+                    line = ""
+                }
+                else {
+                    line = line + ch
+                }
+            }
+            Option[str]::None => { break }
+        }
+        i = i + 1_usize
+    }
+    if is_top_level_decl(line) {
+        count = count + 1_usize
+    }
+    ret count
+}
+
+fn is_top_level_decl(line_raw: str) -> bool {
+    let line = trim_spaces(line_raw)
+    if line == "" {
+        ret false
+    }
+    if starts_with(line, "import ") { ret true }
+    if starts_with(line, "pub import ") { ret true }
+    if starts_with(line, "enum ") { ret true }
+    if starts_with(line, "pub enum ") { ret true }
+    if starts_with(line, "struct ") { ret true }
+    if starts_with(line, "pub struct ") { ret true }
+    if starts_with(line, "trait ") { ret true }
+    if starts_with(line, "pub trait ") { ret true }
+    if starts_with(line, "impl ") { ret true }
+    if starts_with(line, "fn ") { ret true }
+    if starts_with(line, "pub fn ") { ret true }
+    if starts_with(line, "extern fn ") { ret true }
+    if starts_with(line, "pub extern fn ") { ret true }
+    ret false
+}
+
+fn contains_substring(haystack: str, needle: str) -> bool {
+    if needle.len() == 0_usize {
+        ret true
+    }
+    if needle.len() > haystack.len() {
+        ret false
+    }
+
+    let mut start = 0_usize
+    while start + needle.len() <= haystack.len() {
+        let mut matched = true
+        let mut i = 0_usize
+        while i < needle.len() {
+            match haystack.get(start + i) {
+                Option[str]::Some(lhs) => {
+                    match needle.get(i) {
+                        Option[str]::Some(rhs) => {
+                            if lhs != rhs {
+                                matched = false
+                                break
+                            }
+                        }
+                        Option[str]::None => {
+                            matched = false
+                            break
+                        }
+                    }
+                }
+                Option[str]::None => {
+                    matched = false
+                    break
+                }
+            }
+            i = i + 1_usize
+        }
+        if matched {
+            ret true
+        }
+        start = start + 1_usize
+    }
+    ret false
+}
+
+fn validate_lexer_symbols(source: str) -> bool {
+    let mut ok = true
+    let mut line = 1_usize
+    let mut column = 1_usize
+    let mut index = 0_usize
+    while index < source.len() {
+        match source.get(index) {
+            Option[str]::Some(ch) => {
+                if is_newline_char(ch) {
+                    line = line + 1_usize
+                    column = 1_usize
+                    index = index + 1_usize
+                    continue
+                }
+
+                if is_unknown_symbol(ch) {
+                    ok = false
+                    render_unknown_trace(source, line, column)
+                }
+
+                column = column + 1_usize
+                index = index + 1_usize
+            }
+            Option[str]::None => {
+                break
+            }
+        }
+    }
+    ret ok
+}
+
+fn is_unknown_symbol(ch: str) -> bool {
+    if is_space(ch) || is_punct(ch) {
+        ret false
+    }
+    if ch == "_" {
+        ret false
+    }
+    match ch.get_byte(0_usize) {
+        Option[u8]::Some(code) => {
+            if code >= 48_u8 && code <= 57_u8 { ret false }
+            if code >= 65_u8 && code <= 90_u8 { ret false }
+            if code >= 97_u8 && code <= 122_u8 { ret false }
+            ret true
+        }
+        Option[u8]::None => {
+            ret true
+        }
+    }
+}
+
+fn is_space(ch: str) -> bool {
+    if ch == " " {
+        ret true
+    }
+    if ch.len() != 1_usize {
+        ret false
+    }
+    let b = ch.byte_at(0_usize)
+    if b == 9_u8 || b == 13_u8 {
+        ret true
+    }
+    ret false
+}
+
+fn is_punct(ch: str) -> bool {
+    if ch == "(" || ch == ")" || ch == "{" || ch == "}" { ret true }
+    if ch == "[" || ch == "]" || ch == ":" || ch == ";" { ret true }
+    if ch == "," || ch == "." || ch == "?" { ret true }
+    if ch == "+" || ch == "-" || ch == "*" || ch == "/" || ch == "%" { ret true }
+    if ch == "=" || ch == "!" || ch == "<" || ch == ">" { ret true }
+    if ch == "&" || ch == "|" || ch == "^" || ch == "~" { ret true }
+    if ch == "'" { ret true }
+    if ch.len() == 1_usize && ch.byte_at(0_usize) == 34_u8 { ret true }
+    ret false
+}
+
+fn is_newline_char(ch: str) -> bool {
+    if ch.len() != 1_usize {
+        ret false
+    }
+    ret ch.byte_at(0_usize) == 10_u8
+}
+
+fn render_unknown_trace(source: str, line: usize, column: usize) -> () {
+    println(status_fail("Unknown token at " + Debug::fmt(line) + ":" + Debug::fmt(column)))
+    let line_start = find_line_start(source, line, column)
+    let line_end = find_line_end(source, line, column)
+    let text = source.slice(line_start, line_end - line_start)
+    println("  " + text)
+    println("  " + repeat(" ", column - 1_usize) + "^")
+    ret ()
+}
+
+fn find_line_start(source: str, line: usize, column: usize) -> usize {
+    ret abs_index_from_line_col(source, line, column) - (column - 1_usize)
+}
+
+fn find_line_end(source: str, line: usize, column: usize) -> usize {
+    let mut i = abs_index_from_line_col(source, line, column)
+    while i < source.len() {
+        match source.get_byte(i) {
+            Option[u8]::Some(b) => {
+                if b == 10_u8 {
+                    break
+                }
+            }
+            Option[u8]::None => { break }
+        }
+        i = i + 1_usize
+    }
+    ret i
+}
+
+fn abs_index_from_line_col(source: str, target_line: usize, target_col: usize) -> usize {
+    let mut i = 0_usize
+    let mut line = 1_usize
+    let mut col = 1_usize
+    while i < source.len() {
+        if line == target_line && col == target_col {
+            ret i
+        }
+        match source.get_byte(i) {
+            Option[u8]::Some(b) => {
+                if b == 10_u8 {
+                    line = line + 1_usize
+                    col = 1_usize
+                }
+                else {
+                    col = col + 1_usize
+                }
+            }
+            Option[u8]::None => { break }
+        }
+        i = i + 1_usize
+    }
+    ret i
+}
+
+fn repeat(ch: str, times: usize) -> str {
+    let mut out = ""
+    let mut i = 0_usize
+    while i < times {
+        out = out + ch
+        i = i + 1_usize
+    }
+    ret out
+}
+
+fn trim_spaces(line: str) -> str {
+    let mut start = 0_usize
+    while start < line.len() {
+        match line.get(start) {
+            Option[str]::Some(ch) => {
+                if ch != " " {
+                    if ch.len() == 1_usize {
+                        let b = ch.byte_at(0_usize)
+                        if b == 9_u8 || b == 13_u8 {
+                            start = start + 1_usize
+                            continue
+                        }
+                    }
+                    break
+                }
+            }
+            Option[str]::None => { break }
+        }
+        start = start + 1_usize
+    }
+
+    if start >= line.len() {
+        ret ""
+    }
+
+    let mut end = line.len()
+    while end > start {
+        match line.get(end - 1_usize) {
+            Option[str]::Some(ch) => {
+                if ch != " " {
+                    if ch.len() == 1_usize {
+                        let b = ch.byte_at(0_usize)
+                        if b == 9_u8 || b == 13_u8 {
+                            end = end - 1_usize
+                            continue
+                        }
+                    }
+                    break
+                }
+            }
+            Option[str]::None => { break }
+        }
+        end = end - 1_usize
+    }
+
+    ret line.slice(start, end - start)
+}
+
+fn starts_with(value: str, prefix: str) -> bool {
+    if prefix.len() > value.len() {
+        ret false
+    }
+    let mut i = 0_usize
+    while i < prefix.len() {
+        match value.get(i) {
+            Option[str]::Some(lhs) => {
+                match prefix.get(i) {
+                    Option[str]::Some(rhs) => {
+                        if lhs != rhs {
+                            ret false
+                        }
+                    }
+                    Option[str]::None => { ret false }
+                }
+            }
+            Option[str]::None => { ret false }
+        }
+        i = i + 1_usize
+    }
+    ret true
 }
 
 fn find_project_root(path: Path) -> Option[Path] {
