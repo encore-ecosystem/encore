@@ -172,6 +172,8 @@ class Lexer(ParserBase[str, LexerToken]):
 
                 case "?":
                     self._consume_and_push(TokenType.QUESTION)
+                case "#":
+                    self._consume_and_push(TokenType.HASH)
 
                 case '"':
                     self._consume()
