@@ -865,8 +865,6 @@ class TypeInferer:
                 if expected_type is not None and expected_type != Type("bool"):
                     raise TypeError(f"Type mismatch: {expected_type} != bool")
                 return Type("bool")
-            if expr.operator == "await":
-                return operand_type or expected_type
             if expr.operator in ("+", "-", "~", "++", "--"):
                 return operand_type or expected_type
             return operand_type or expected_type

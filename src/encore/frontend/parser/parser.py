@@ -127,7 +127,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             is_public = True
             curr_token = self._peek_curr()
 
-        if attrs and curr_token.type not in (TokenType.KW_FN, TokenType.KW_EXTERN, TokenType.KW_ASYNC):
+        if attrs and curr_token.type not in (TokenType.KW_FN, TokenType.KW_EXTERN):
             raise TypeError("Function attributes are only allowed on fn/extern fn")
 
         match curr_token.type:
@@ -143,8 +143,6 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 self._parse_fn(is_public, attrs)
             case TokenType.KW_EXTERN:
                 self._parse_extern(is_public, attrs)
-            case TokenType.KW_ASYNC:
-                self._parse_fn(is_public, attrs)
             case _:
                 raise NotImplementedError(f"{curr_token}")
 
@@ -333,18 +331,11 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     def _parse_function_signature(self, is_public: bool = False, *, attrs: list[str] | None = None) -> s.FunctionSignature:
         attrs_list = list(attrs) if attrs is not None else []
-        is_async = False
-        if self._peek_curr().type == TokenType.KW_ASYNC:
-            self._safe_consume(TokenType.KW_ASYNC)
-            is_async = True
 
         is_extern = False
         if self._peek_curr().type == TokenType.KW_EXTERN:
             self._safe_consume(TokenType.KW_EXTERN)
             is_extern = True
-            if self._peek_curr().type == TokenType.KW_ASYNC:
-                self._safe_consume(TokenType.KW_ASYNC)
-                is_async = True
 
         self._safe_consume(TokenType.KW_FN)
         func_name = self._safe_consume(TokenType.IDENTIFIER).value
@@ -367,7 +358,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
         return s.FunctionSignature(
             is_public=is_public,
-            attrs=attrs_list + (["async"] if is_async else []),
+            attrs=attrs_list,
             is_extern=is_extern,
             name=func_name,
             generics=generics,
@@ -456,7 +447,6 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             TokenType.KW_MATCH,
             TokenType.KW_IF,
             TokenType.KW_UNSAFE,
-            TokenType.KW_AWAIT,
             TokenType.PLUS,
             TokenType.MINUS,
             TokenType.BANG,
@@ -775,7 +765,6 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             TokenType.TILDE,
             TokenType.INCREMENT,
             TokenType.DECREMENT,
-            TokenType.KW_AWAIT,
         }:
             operator = tok
             self._consume()
