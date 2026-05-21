@@ -306,7 +306,7 @@ class Parser:
         return self._parse_fn_decl(with_body=True)
 
     def _parse_extern_fn(self) -> Derective_fn:
-        self._safe_consume(TokenType.EXTERN)
+        self._safe_consume(TokenType.KW_EXTERN)
         return self._parse_fn_decl(with_body=False, is_extern=True)
 
     def _parse_fn_decl(

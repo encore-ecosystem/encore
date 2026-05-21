@@ -323,7 +323,6 @@ def update_dependencies(path: Path):
 
 
 def sync_dependencies(path: Path, *, update: bool = False, ignore_errors: bool = False) -> dict[str, dict[str, str]]:
-    manifest = load_manifest(path)
     resolved: dict[str, dict[str, str]] = {}
     visited: set[Path] = set()
 

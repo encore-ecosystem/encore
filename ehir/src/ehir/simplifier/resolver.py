@@ -40,6 +40,8 @@ from ehir.core.instructions import (
     Instruction_ret,
     Instruction_salloc,
     Instruction_setfield,
+    Instruction_sgetfield,
+    Instruction_sgetfieldptr,
     Instruction_shl,
     Instruction_shr,
     Instruction_store,
@@ -50,7 +52,7 @@ from ehir.core.instructions import (
 )
 from ehir.core.primitives import Char_t, Float_t, Isize_t, Str_t, Usize_t
 from ehir.core.primitives.base import PrimitiveType
-from ehir.core.type import Pointer, Reference, Type, box_pointee, is_box_type
+from ehir.core.type import Pointer, Reference, Type, box_pointee, concrete_box_type_name, is_box_type
 from ehir.core.variable import Parameter, Variable
 
 _BOOL = Usize_t(1)
@@ -249,6 +251,9 @@ class Resolver:
             value_t = self._var_type(vars_by_name, instr.variable)
             if value_t is None:
                 return False
+            current_t = self._var_type(vars_by_name, instr.var_out)
+            if current_t is not None and current_t.name == concrete_box_type_name(value_t):
+                return False
             return self._set_var(vars_by_name, instr.var_out, Type("Box", [value_t]))
 
         if isinstance(instr, Instruction_capstruct):
@@ -265,6 +270,12 @@ class Resolver:
 
         if isinstance(instr, Instruction_getfieldptr):
             return self._resolve_getfield(instr, vars_by_name, as_ptr=True)
+
+        if isinstance(instr, Instruction_sgetfield):
+            return self._resolve_static_getfield(instr, vars_by_name, as_ptr=False)
+
+        if isinstance(instr, Instruction_sgetfieldptr):
+            return self._resolve_static_getfield(instr, vars_by_name, as_ptr=True)
 
         if isinstance(instr, Instruction_setfield):
             field_t = self._field_path_type(vars_by_name, instr.var, [instr.field, *instr.field_path])
@@ -444,19 +455,18 @@ class Resolver:
                     trait_short = trait_name.split("::")[-1]
                     if trait_name != owner_base.name and trait_short != owner_base.name:
                         continue
-                    if not self._types_compatible(impl.for_type, recv_base):
+                    mapping: dict[str, Type] = {}
+                    if not self._bind_generic_from_types(impl.for_type, recv_base, mapping):
                         continue
                     method = next((m for m in impl.methods if m.name == method_name), None)
                     if method is None:
                         continue
-                    mapping = self._impl_generic_mapping(impl.for_type, recv_base)
                     params = [self._resolve_type(self._replace_type(p.type, mapping, recv_base)) for p in method.params]
                     ret_t = self._resolve_type(self._replace_type(method.ret_type, mapping, recv_base))
-                    resolved_method = method.name
-                    if resolved_method != "op":
-                        suffix = self._mangle_type_name(recv_base)
-                        if suffix:
-                            resolved_method = f"{resolved_method}__{suffix}"
+                    resolved_method = self._trait_impl_method_name(impl, method, recv_base)
+                    resolved_generics = self._resolve_trait_impl_generics(impl, method, mapping)
+                    if resolved_generics is not None:
+                        instr.generics = resolved_generics
                     resolved_name = f"{trait_name}::{resolved_method}"
                     return _MethodSig(params=params, ret=ret_t), resolved_name
 
@@ -541,6 +551,56 @@ class Resolver:
                 return f"{owner_text}::{trait_name}::op"
         return fn_name
 
+    def _trait_impl_method_name(self, impl, method: Derective_fn, recv_type: Type) -> str:
+        suffix = (
+            self._mangle_type_template_name(impl.for_type)
+            if impl.generics or method.generics
+            else self._mangle_type_name(recv_type)
+        )
+        if not suffix:
+            return method.name
+        return f"{method.name}__{suffix}"
+
+    def _resolve_trait_impl_generics(
+        self,
+        impl,
+        method: Derective_fn,
+        mapping: dict[str, Type],
+    ) -> list[Type] | None:
+        merged = self._merge_generics(impl.generics, method.generics)
+        if not merged:
+            return []
+
+        resolved: list[Type] = []
+        for generic in merged:
+            concrete = mapping.get(generic.name)
+            if concrete is None:
+                return None
+            resolved.append(deepcopy(concrete))
+        return resolved
+
+    def _merge_generics(self, *generic_groups: list[Type]) -> list[Type]:
+        merged: list[Type] = []
+        seen: set[str] = set()
+        for group in generic_groups:
+            for generic in group:
+                if generic.name in seen:
+                    continue
+                seen.add(generic.name)
+                merged.append(generic)
+        return merged
+
+    def _mangle_type_template_name(self, typ: Type) -> str:
+        if isinstance(typ, Pointer):
+            return f"{self._mangle_type_template_name(typ.pointee)}_ptr"
+        if isinstance(typ, Reference):
+            return f"{self._mangle_type_template_name(typ.pointee)}_ref"
+        name = typ.name.replace("::", "_")
+        if not typ.generics:
+            return name
+        inner = "_".join(self._mangle_type_template_name(generic) for generic in typ.generics)
+        return f"{name}_{inner}"
+
     def _mangle_type_name(self, typ: Type) -> str:
         if self._is_placeholder_type_name(typ.name):
             return ""
@@ -553,7 +613,9 @@ class Resolver:
         return typ.name.replace("::", "_")
 
     def _is_placeholder_type_name(self, name: str) -> bool:
-        if name == "T":
+        if name in {"Self", "T"}:
+            return True
+        if len(name) == 1 and name.isupper():
             return True
         return len(name) > 1 and name.startswith("T") and name[1:].isdigit()
 
@@ -618,6 +680,35 @@ class Resolver:
         field_t = self._field_path_type(vars_by_name, instr.src, [instr.field, *instr.field_path])
         if field_t is None:
             return False
+        if as_ptr:
+            field_t = Pointer(field_t)
+        return self._set_var(vars_by_name, instr.var_out, field_t)
+
+    def _resolve_static_getfield(
+        self,
+        instr: Instruction_sgetfield | Instruction_sgetfieldptr,
+        vars_by_name: dict[str, Type | None],
+        as_ptr: bool,
+    ) -> bool:
+        src_t = self._var_type(vars_by_name, instr.src)
+        if src_t is None:
+            return False
+
+        owner_t = src_t.pointee if isinstance(src_t, (Reference, Pointer)) else src_t
+        decl = self.structs.get(owner_t.name)
+        if decl is None:
+            return False
+
+        field_decl = next((p for p in decl.params if p.name == instr.field.name), None)
+        if field_decl is None and instr.field.name.isdigit():
+            index = int(instr.field.name)
+            if 0 <= index < len(decl.params):
+                field_decl = decl.params[index]
+        if field_decl is None:
+            raise TypeError(f"Unknown field '{instr.field.name}' for struct '{decl.name}'")
+
+        field_t = self._resolve_type(self._specialize_type(field_decl.type, decl.generics, owner_t.generics))
+        instr.field.type = field_t
         if as_ptr:
             field_t = Pointer(field_t)
         return self._set_var(vars_by_name, instr.var_out, field_t)
@@ -693,6 +784,8 @@ class Resolver:
             if vt is not None and self._types_compatible(vt, expected.pointee):
                 return False
             return self._set_var(vars_by_name, v, Type("Box", [expected.pointee]))
+        if vt is not None and self._can_pass_as(vt, expected):
+            return False
         return self._set_var(vars_by_name, v, expected)
 
     def _unify_pair(self, vars_by_name: dict[str, Type | None], a: Variable, b: Variable) -> bool:
@@ -729,6 +822,22 @@ class Resolver:
                 return False
             return all(self._types_compatible(a, b) for a, b in zip(lhs.generics, rhs.generics, strict=True))
         return False
+
+    def _can_pass_as(self, actual: Type, expected: Type) -> bool:
+        actual = self._resolve_type(actual)
+        expected = self._resolve_type(expected)
+        if self._types_compatible(actual, expected):
+            return True
+        if isinstance(actual, Usize_t) and isinstance(expected, Usize_t):
+            return self._primitive_bits(actual) <= self._primitive_bits(expected)
+        if isinstance(actual, Isize_t) and isinstance(expected, Isize_t):
+            return self._primitive_bits(actual) <= self._primitive_bits(expected)
+        if isinstance(actual, Float_t) and isinstance(expected, Float_t):
+            return actual.size <= expected.size
+        return False
+
+    def _primitive_bits(self, typ: Usize_t | Isize_t) -> int:
+        return 64 if typ.size is None else typ.size
 
     def _must_get(self, vars_by_name: dict[str, Type | None], name: str, fn_name: str) -> Type:
         t = vars_by_name.get(name)

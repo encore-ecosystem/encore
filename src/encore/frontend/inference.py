@@ -857,6 +857,18 @@ class TypeInferer:
             self._assert_raw_pointer_usage_allowed(result, context=f"call '{call_name}'")
             return result
 
+        if isinstance(expr, s.Expression_UnaryOperation):
+            operand_type = self._infer_expression(expr.expr, env, expected_type, mutable_env)
+            if expr.operator in ("!", "not"):
+                if operand_type is not None and operand_type != Type("bool"):
+                    raise TypeError(f"Logical unary operator '{expr.operator}' expects bool, got {operand_type}")
+                if expected_type is not None and expected_type != Type("bool"):
+                    raise TypeError(f"Type mismatch: {expected_type} != bool")
+                return Type("bool")
+            if expr.operator in ("+", "-", "~", "++", "--"):
+                return operand_type or expected_type
+            return operand_type or expected_type
+
         if isinstance(expr, s.Expression_BinaryOperation):
             if expr.operator in ("&&", "||"):
                 lhs_type = self._infer_expression(expr.lhs, env, mutable_env=mutable_env)
@@ -1519,11 +1531,23 @@ class TypeInferer:
         if is_raw_pointer_type(actual):
             return False
 
+        if self._can_widen_primitive(actual, expected):
+            return True
+
         if expected.name != actual.name:
             return False
         if len(expected.generics) != len(actual.generics):
             return False
         return all(self._types_compatible(lhs, rhs) for lhs, rhs in zip(expected.generics, actual.generics))
+
+    def _can_widen_primitive(self, actual: Type, expected: Type) -> bool:
+        if self._is_unsigned_integer_type(actual) and self._is_unsigned_integer_type(expected):
+            return self._integer_bits(actual) <= self._integer_bits(expected)
+        if self._is_signed_integer_type(actual) and self._is_signed_integer_type(expected):
+            return self._integer_bits(actual) <= self._integer_bits(expected)
+        if self._is_float_type(actual) and self._is_float_type(expected):
+            return self._float_bits(actual) <= self._float_bits(expected)
+        return False
 
     def _concretize_type(self, pattern: Type, concrete: Type) -> Type:
         pattern_is_mut = is_mutable_type(pattern)
@@ -1591,6 +1615,28 @@ class TypeInferer:
         )
 
     @staticmethod
+    def _is_unsigned_integer_type(typ: Type) -> bool:
+        typ = unwrap_for_storage(typ)
+        return typ.name == "usize" or (len(typ.name) > 1 and typ.name[0] == "u" and typ.name[1:].isdigit())
+
+    @staticmethod
+    def _is_signed_integer_type(typ: Type) -> bool:
+        typ = unwrap_for_storage(typ)
+        return typ.name == "isize" or (len(typ.name) > 1 and typ.name[0] == "i" and typ.name[1:].isdigit())
+
+    @staticmethod
+    def _integer_bits(typ: Type) -> int:
+        typ = unwrap_for_storage(typ)
+        if typ.name in ("usize", "isize"):
+            return 64
+        return int(typ.name[1:])
+
+    @staticmethod
     def _is_float_type(typ: Type) -> bool:
         typ = unwrap_for_storage(typ)
         return len(typ.name) > 1 and typ.name[0] == "f" and typ.name[1:].isdigit()
+
+    @staticmethod
+    def _float_bits(typ: Type) -> int:
+        typ = unwrap_for_storage(typ)
+        return int(typ.name[1:])
