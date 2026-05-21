@@ -121,7 +121,7 @@ class EHIR_ProjectCompiler:
 
         module = EHIR_Module(
             id=node.module.id,
-            ast=self._builtin_directives() + deepcopy(node.module.ast),
+            ast=self._merge_builtin_directives(self._builtin_directives(), deepcopy(node.module.ast)),
         )
 
         module.ast = self._lift_impl_methods(module.ast)
@@ -129,6 +129,7 @@ class EHIR_ProjectCompiler:
         self._emit_ehir_stage(refrain.name, "post_resolve", module.ast)
         module.ast = ReferenceLoweringPass().run(module.ast)
         module.ast = MonomorphizationPass().run(module.ast)
+        module.ast = Resolver().run(module.ast)
         self._emit_ehir_stage(refrain.name, "post_monomorphize", module.ast)
         module.ast = AutoDropPass().run(module.ast)
         module.ast = AutoRetainPass().run(module.ast)
@@ -162,6 +163,7 @@ class EHIR_ProjectCompiler:
             directive for directive in module.ast if self._is_backend_emittable(directive, known_type_names)
         ]
         module.ast = [directive for directive in module.ast if not isinstance(directive, Derective_typealias)]
+        module.ast = self._deduplicate_directives(module.ast)
         self._emit_ehir_stage(refrain.name, "pre_postprocess", module.ast)
         processed_mod = Postprocessor().run(module)
 
@@ -179,6 +181,45 @@ class EHIR_ProjectCompiler:
         self.compiled_refrains[refrain.name] = compiled_refrain
         return compiled_refrain
 
+    def _merge_builtin_directives(
+        self,
+        builtins: list[Derective],
+        user_directives: list[Derective],
+    ) -> list[Derective]:
+        existing: set[tuple[type, str]] = set()
+        for directive in user_directives:
+            existing.add(self._directive_identity(directive))
+
+        merged: list[Derective] = []
+        for directive in builtins:
+            key = self._directive_identity(directive)
+            if key in existing:
+                continue
+            merged.append(directive)
+        merged.extend(user_directives)
+        return merged
+
+    def _directive_identity(self, directive: Derective) -> tuple[type, str]:
+        if isinstance(directive, Derective_impl):
+            trait_name = directive.trait_name or ""
+            return (type(directive), f"{trait_name}::{directive.for_type}")
+        return (type(directive), getattr(directive, "name", ""))
+
+    def _deduplicate_directives(self, directives: list[Derective]) -> list[Derective]:
+        result: list[Derective] = []
+        seen: dict[tuple[type, str], str] = {}
+        for directive in directives:
+            key = self._directive_identity(directive)
+            text = str(directive)
+            existing = seen.get(key)
+            if existing is not None:
+                if existing != text:
+                    raise RuntimeError(f"Conflicting generated directive for '{key[1]}'")
+                continue
+            seen[key] = text
+            result.append(directive)
+        return result
+
     def _lift_impl_methods(self, ast: list[Derective]) -> list[Derective]:
         lifted_method_names = {
             directive.name for directive in ast if isinstance(directive, (Derective_fn, Derective_extern_fn))
@@ -191,12 +232,13 @@ class EHIR_ProjectCompiler:
                 if not isinstance(method, Derective_fn):
                     continue
                 lifted = deepcopy(method)
+                lifted.generics = self._merge_generics(directive.generics, lifted.generics)
                 if "::" not in lifted.name:
                     owner = directive.trait_name if directive.trait_name else directive.for_type.name
                     if owner:
                         method_name = lifted.name
-                        if method_name != "op":
-                            suffix = self._mangle_type_name(directive.for_type)
+                        if directive.trait_name is not None:
+                            suffix = self._mangle_type_template_name(directive.for_type)
                             if suffix:
                                 method_name = f"{method_name}__{suffix}"
                         lifted.name = f"{owner}::{method_name}"
@@ -207,6 +249,24 @@ class EHIR_ProjectCompiler:
         if lifted_methods:
             return [*ast, *lifted_methods]
         return ast
+
+    def _merge_generics(self, *generic_groups: list[Type]) -> list[Type]:
+        merged: list[Type] = []
+        seen: set[str] = set()
+        for group in generic_groups:
+            for generic in group:
+                if generic.name in seen:
+                    continue
+                seen.add(generic.name)
+                merged.append(deepcopy(generic))
+        return merged
+
+    def _mangle_type_template_name(self, typ: Type) -> str:
+        name = typ.name.replace("::", "_")
+        if not typ.generics:
+            return name
+        inner = "_".join(self._mangle_type_template_name(generic) for generic in typ.generics)
+        return f"{name}_{inner}"
 
     def _mangle_type_name(self, typ: Type) -> str:
         if self._is_placeholder_type_name(typ.name):
@@ -220,7 +280,9 @@ class EHIR_ProjectCompiler:
         return typ.name.replace("::", "_")
 
     def _is_placeholder_type_name(self, name: str) -> bool:
-        if name == "T":
+        if name in {"Self", "T"}:
+            return True
+        if len(name) == 1 and name.isupper():
             return True
         return len(name) > 1 and name.startswith("T") and name[1:].isdigit()
 
@@ -490,7 +552,14 @@ class EHIR_ProjectCompiler:
                     ) and matches_import_symbol(d.name, directive.symbol):
                         if isinstance(
                             d,
-                            (Derective_fn, Derective_extern_fn, Derective_trait, Derective_struct, Derective_typealias),
+                            (
+                                Derective_fn,
+                                Derective_extern_fn,
+                                Derective_trait,
+                                Derective_struct,
+                                Derective_enum,
+                                Derective_typealias,
+                            ),
                         ):
                             append_module_contents(parent_ast)
                         else:
@@ -510,10 +579,10 @@ class EHIR_ProjectCompiler:
         return node
 
     def _core_dir(self) -> Path:
-        package_core = Path(__file__).resolve().parent / "core"
-        if package_core.exists():
-            return package_core
-        return Path(__file__).resolve().parents[2] / "core"
+        repo_core = Path(__file__).resolve().parents[2] / "core"
+        if repo_core.exists():
+            return repo_core
+        return Path(__file__).resolve().parent / "core"
 
     def _core_module_ids(self) -> list[Path]:
         core_dir = self._core_dir()
@@ -585,6 +654,7 @@ class EHIR_ProjectCompiler:
         core_root = self._core_dir()
         owner_id = core_root / "owner.ehir"
         box_id = core_root / "smart_box.ehir"
+        runtime_id = core_root / "runtime.ehir"
 
         from ehir.frontend.builtin import EHIR_DirectFrontend
 
@@ -592,7 +662,7 @@ class EHIR_ProjectCompiler:
 
         directives: list[Derective] = []
         seen_symbols: set[tuple[type, str]] = set()
-        for module_id in (owner_id, box_id):
+        for module_id in (owner_id, box_id, runtime_id):
             if not module_id.exists():
                 continue
             module = core_frontend.get_module_by_id(module_id)

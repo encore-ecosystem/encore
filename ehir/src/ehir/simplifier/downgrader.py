@@ -81,6 +81,15 @@ class Downgrader:
     _fns: dict[str, Normalized_fn]
     _fns_to_add: list[Normalized_fn]
 
+    def _lookup_struct(self, type_name: str) -> Derective_struct | None:
+        struct_decl = self._structs.get(type_name)
+        if struct_decl is not None:
+            return struct_decl
+        if "[" in type_name:
+            base_name = type_name.split("[", 1)[0]
+            return self._structs.get(base_name)
+        return None
+
     def run(self, ast: list[Derective]) -> list[Derective]:
         self._structs = {}
         self._enum_variants = {}
@@ -342,7 +351,7 @@ class Downgrader:
             assert owner_t is not None
             if isinstance(owner_t, (Pointer, Reference)):
                 owner_t = owner_t.pointee
-            struct_decl = self._structs.get(owner_t.name)
+            struct_decl = self._lookup_struct(owner_t.name)
             assert struct_decl is not None, f"Unknown struct for getfieldptr: {owner_t}"
             field_index = int(field.name) if field.name.isdigit() else None
             if field_index is not None:
@@ -477,7 +486,8 @@ class Downgrader:
     def _downgrade_sgetfield(self, instr: Instruction_sgetfield) -> list[Instruction]:
         assert instr.var_out.type is not None
         assert instr.src.type
-        wrapped_struct = self._structs[instr.src.type.name]
+        wrapped_struct = self._lookup_struct(instr.src.type.name)
+        assert wrapped_struct is not None, f"Unknown wrapped struct for sgetfield: {instr.src.type.name}"
         wrapped_struct_ptr = TypedVariable(name=f".{instr.var_out.name}_sgf_ptr", type=wrapped_struct.params[0].type)
         getfield1 = Instruction_getfield(
             var_out=wrapped_struct_ptr, src=instr.src, field=TypedVariable("0", wrapped_struct.params[0].type)
@@ -491,7 +501,8 @@ class Downgrader:
     def _downgrade_sgetfieldptr(self, instr: Instruction_sgetfieldptr) -> list[Instruction]:
         assert instr.var_out.type is not None
         assert instr.src.type
-        wrapped_struct = self._structs[instr.src.type.name]
+        wrapped_struct = self._lookup_struct(instr.src.type.name)
+        assert wrapped_struct is not None, f"Unknown wrapped struct for sgetfieldptr: {instr.src.type.name}"
         wrapped_struct_ptr = TypedVariable(name=f".{instr.var_out.name}_sgfptr_ptr", type=wrapped_struct.params[0].type)
         getfield = Instruction_getfield(
             var_out=wrapped_struct_ptr, src=instr.src, field=TypedVariable("0", wrapped_struct.params[0].type)
@@ -512,7 +523,7 @@ class Downgrader:
         variant_names = self._enum_variants.get(instr.cond_var.type.name)
 
         if variant_names is None:
-            wrapped_struct = self._structs.get(instr.cond_var.type.name)
+            wrapped_struct = self._lookup_struct(instr.cond_var.type.name)
             if (
                 wrapped_struct is not None
                 and wrapped_struct.params

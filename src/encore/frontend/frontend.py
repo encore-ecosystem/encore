@@ -240,7 +240,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                     )
                 )
 
-            if isinstance(binding.statement, s.Statement_StructureDefinition):
+            if isinstance(binding.statement, (s.Statement_StructureDefinition, s.Statement_EnumDefinition)):
                 lookup_name = binding.source_name or binding.name
                 for idx, assoc_impl in enumerate(self._collect_associated_impls(binding.module_id, lookup_name)):
                     if binding.source_name is not None:
@@ -318,8 +318,6 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         result: list[s.Statement_Impl] = []
         for statement in ast:
             if not isinstance(statement, s.Statement_Impl):
-                continue
-            if statement.trait_name is not None:
                 continue
             if statement.struct.name != struct_name:
                 continue

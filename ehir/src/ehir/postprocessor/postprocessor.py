@@ -291,11 +291,6 @@ class Postprocessor:
         owner_text, method_name = name.rsplit("::", 1)
         owner_name = owner_text.split("[", 1)[0]
         method_name = method_name.split("[", 1)[0]
-        # Keep operator trait calls canonical for dedicated codegen fast-path.
-        if method_name != "op" and arg_types and arg_types[0] is not None:
-            recv = self._mangle_type(arg_types[0])
-            if recv:
-                method_name = f"{method_name}__{recv}"
         return f"{owner_name}::{method_name}"
 
     def _mangle_type(self, typ: Type) -> str:

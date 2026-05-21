@@ -330,6 +330,8 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 return s.UnitStructureDefinition(name=name, generics=generics)
 
     def _parse_function_signature(self, is_public: bool = False, *, attrs: list[str] | None = None) -> s.FunctionSignature:
+        attrs_list = list(attrs) if attrs is not None else []
+
         is_extern = False
         if self._peek_curr().type == TokenType.KW_EXTERN:
             self._safe_consume(TokenType.KW_EXTERN)
@@ -356,7 +358,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
         return s.FunctionSignature(
             is_public=is_public,
-            attrs=list(attrs) if attrs is not None else [],
+            attrs=attrs_list,
             is_extern=is_extern,
             name=func_name,
             generics=generics,
@@ -416,7 +418,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 return self._parse_break()
             case TokenType.KW_CONTINUE:
                 return self._parse_continue()
-            case TokenType.IDENTIFIER:
+            case _:
+                if not self._starts_statement_expression(curr_token.type):
+                    raise NotImplementedError(curr_token)
                 target = self._parse_expression()
                 match self._peek_curr().type:
                     case (
@@ -429,8 +433,27 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                         return self._parse_assignment(target)
                     case _:
                         return s.Statement_Expr(target)
-            case _:
-                raise NotImplementedError(curr_token)
+
+    def _starts_statement_expression(self, token_type: TokenType) -> bool:
+        return token_type in {
+            TokenType.IDENTIFIER,
+            TokenType.INTEGER,
+            TokenType.FLOAT,
+            TokenType.BOOLEAN,
+            TokenType.STRING,
+            TokenType.LEFT_PAREN,
+            TokenType.LEFT_BRACKET,
+            TokenType.LEFT_BRACE,
+            TokenType.KW_MATCH,
+            TokenType.KW_IF,
+            TokenType.KW_UNSAFE,
+            TokenType.PLUS,
+            TokenType.MINUS,
+            TokenType.BANG,
+            TokenType.TILDE,
+            TokenType.INCREMENT,
+            TokenType.DECREMENT,
+        }
 
     def _parse_ret(self) -> s.Statement_Ret:
         self._safe_consume(TokenType.KW_RET)

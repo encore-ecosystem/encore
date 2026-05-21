@@ -9,11 +9,7 @@ from ehir.core.enum import Enum, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import Instruction_call, Instruction_wraps
 from ehir.core.primitives.base import Primitive, PrimitiveType
 from ehir.core.struct import Struct
-from ehir.core.type import Pointer, Reference, Type, mangle_type_name
-
-
-def _box_concrete_name(inner: Type) -> str:
-    return f"__Box_{mangle_type_name(inner)}"
+from ehir.core.type import Pointer, Reference, Type, concrete_box_type_name, mangle_type_name
 
 
 class MonomorphizationPass:
@@ -24,6 +20,10 @@ class MonomorphizationPass:
         # Use a dedicated marker to avoid collisions with user-authored names
         # like `foo__T` and to prevent accidental self-recursion after rewrite.
         return f"{fn_name}__mono__{signature}"
+
+    @staticmethod
+    def _is_box_template_method_name(name: str) -> bool:
+        return name.startswith("Box[T]::") or name.startswith("Box::")
 
     def run(self, ast: list[Derective]) -> list[Derective]:
         box_struct = next((d for d in ast if isinstance(d, Derective_struct) and d.name == "Box" and d.generics), None)
@@ -37,7 +37,7 @@ class MonomorphizationPass:
             d
             for d in ast
             if isinstance(d, Derective_fn)
-            and d.name.startswith("Box[T]::")
+            and self._is_box_template_method_name(d.name)
         ]
 
         concrete_box_types = self._collect_concrete_box_types(ast)
@@ -49,7 +49,7 @@ class MonomorphizationPass:
 
         new_nodes: list[Derective] = []
         for concrete in concrete_box_types:
-            concrete_name = _box_concrete_name(concrete)
+            concrete_name = concrete_box_type_name(concrete)
             mapping = {"T": concrete}
 
             # Struct __Box_<T>
@@ -98,9 +98,7 @@ class MonomorphizationPass:
         for d in ast:
             if isinstance(d, Derective_fn) and d.name.endswith("::from_stack"):
                 continue
-            if isinstance(d, Derective_struct) and d.name == "Box" and d.generics:
-                continue
-            if isinstance(d, Derective_fn) and d.name.startswith("Box[T]::"):
+            if isinstance(d, Derective_fn) and self._is_box_template_method_name(d.name):
                 continue
             filtered.append(d)
         new_nodes = [d for d in new_nodes if not (isinstance(d, Derective_fn) and d.name.endswith("::from_stack"))]
@@ -226,7 +224,7 @@ class MonomorphizationPass:
     def _is_placeholder_type(self, typ: Type) -> bool:
         if isinstance(typ, (Pointer, Reference)):
             return self._is_placeholder_type(typ.pointee)
-        if not typ.generics and typ.name in {"T", "Self"}:
+        if not typ.generics and (typ.name in {"T", "Self"} or (len(typ.name) == 1 and typ.name.isupper())):
             return True
         return any(self._is_placeholder_type(generic) for generic in typ.generics)
 
@@ -291,9 +289,16 @@ class MonomorphizationPass:
         if not is_dataclass(value):
             return value
         if isinstance(value, Struct) and value.name == "Box" and len(value.generics) == 1:
+            inner = self._rewrite_box_type(value.generics[0])
+            if self._is_placeholder_type(inner):
+                return replace(
+                    value,
+                    name="Box",
+                    generics=[inner],
+                )
             return replace(
                 value,
-                name=_box_concrete_name(self._rewrite_box_type(value.generics[0])),
+                name=concrete_box_type_name(inner),
                 generics=[],
             )
         return replace(
@@ -331,7 +336,7 @@ class MonomorphizationPass:
 
     def _rewrite_box_call_names(self, ast: list[Derective]) -> None:
         for item in self._walk(ast):
-            if isinstance(item, Instruction_call) and item.fn_name.startswith("Box[T]::"):
+            if isinstance(item, Instruction_call) and self._is_box_template_method_name(item.fn_name):
                 method = item.fn_name.rsplit("::", 1)[-1]
                 owner = self._infer_call_owner(item)
                 if owner is not None:
@@ -352,8 +357,10 @@ class MonomorphizationPass:
         if isinstance(typ, Reference):
             return Reference(self._rewrite_box_type(typ.pointee))
         rewritten_generics = [self._rewrite_box_type(g) for g in typ.generics]
+        if rewritten_generics and any(self._is_placeholder_type(generic) for generic in rewritten_generics):
+            return Type(typ.name, rewritten_generics)
         if typ.name == "Box" and len(rewritten_generics) == 1:
-            return Type(_box_concrete_name(rewritten_generics[0]))
+            return Type(concrete_box_type_name(rewritten_generics[0]))
         return Type(typ.name, rewritten_generics)
 
     def _rewrite_enum_type(self, typ: Type, enum_names: set[str]) -> Type:
