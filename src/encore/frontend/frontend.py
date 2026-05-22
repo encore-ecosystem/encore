@@ -216,6 +216,54 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         seen: set[tuple[Path, str]] = set()
         visited_modules: set[Path] = set()
         local_sources: dict[str, tuple[Path, str]] = {}
+        expanded_type_impls: set[tuple[Path, str]] = set()
+
+        def collect_named_types(typ: Type | None) -> set[str]:
+            if typ is None:
+                return set()
+            typ = unwrap_for_storage(typ)
+            if isinstance(typ, AnySmartPointer):
+                return collect_named_types(typ.pointee)
+            if isinstance(typ, HeapSmartPointer):
+                return collect_named_types(typ.pointee)
+            if isinstance(typ, StackSmartPointer):
+                return collect_named_types(typ.pointee)
+            if is_raw_pointer_type(typ):
+                return collect_named_types(typ.pointee)
+
+            names = {typ.name}
+            for generic in typ.generics:
+                names |= collect_named_types(generic)
+            return names
+
+        def append_associated_type_impls(module_id: Path, type_name: str):
+            marker = (module_id, type_name)
+            if marker in expanded_type_impls:
+                return
+            expanded_type_impls.add(marker)
+
+            assoc_impls = self._collect_associated_impls(module_id, type_name)
+            for idx, assoc_impl in enumerate(assoc_impls):
+                impl_key = (module_id, f"impl-dep::{type_name}::{idx}")
+                if impl_key in seen:
+                    continue
+                seen.add(impl_key)
+                declarations.append(
+                    ImportedTopLevelDeclaration(
+                        module_id=module_id,
+                        statement=assoc_impl,
+                        local_name=type_name,
+                        source_name=type_name,
+                    )
+                )
+
+                for method in assoc_impl.body:
+                    if method.signature.type is not None:
+                        for dep_type_name in collect_named_types(method.signature.type):
+                            append_associated_type_impls(module_id, dep_type_name)
+                    for param in method.signature.params:
+                        for dep_type_name in collect_named_types(param.type):
+                            append_associated_type_impls(module_id, dep_type_name)
 
         def append_binding(binding: ExportBinding):
             existing_source = local_sources.get(binding.name)
@@ -260,6 +308,26 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                             statement=assoc_impl,
                             local_name=binding.name,
                             source_name=binding.source_name or binding.name,
+                        )
+                    )
+                    for method in assoc_impl.body:
+                        if method.signature.type is not None:
+                            for dep_type_name in collect_named_types(method.signature.type):
+                                append_associated_type_impls(binding.module_id, dep_type_name)
+                        for param in method.signature.params:
+                            for dep_type_name in collect_named_types(param.type):
+                                append_associated_type_impls(binding.module_id, dep_type_name)
+                for idx, assoc_impl in enumerate(self._collect_module_inherent_impls(binding.module_id)):
+                    impl_key = (binding.module_id, f"impl-module::{idx}")
+                    if impl_key in seen:
+                        continue
+                    seen.add(impl_key)
+                    declarations.append(
+                        ImportedTopLevelDeclaration(
+                            module_id=binding.module_id,
+                            statement=assoc_impl,
+                            local_name=assoc_impl.struct.name,
+                            source_name=assoc_impl.struct.name,
                         )
                     )
             elif isinstance(binding.statement, s.Statement_Trait):
@@ -314,12 +382,15 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         return declarations
 
     def _collect_associated_impls(self, module_id: Path, struct_name: str) -> list[s.Statement_Impl]:
+        def leaf(name: str) -> str:
+            return name.rsplit("::", 1)[-1]
+
         ast = self._get_ast_by_id(module_id)
         result: list[s.Statement_Impl] = []
         for statement in ast:
             if not isinstance(statement, s.Statement_Impl):
                 continue
-            if statement.struct.name != struct_name:
+            if statement.struct.name != struct_name and leaf(statement.struct.name) != leaf(struct_name):
                 continue
             result.append(statement)
         return result
@@ -349,6 +420,17 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             if statement.trait_name is not None:
                 continue
             if statement.struct.name not in builtin_types:
+                continue
+            result.append(statement)
+        return result
+
+    def _collect_module_inherent_impls(self, module_id: Path) -> list[s.Statement_Impl]:
+        ast = self._get_ast_by_id(module_id)
+        result: list[s.Statement_Impl] = []
+        for statement in ast:
+            if not isinstance(statement, s.Statement_Impl):
+                continue
+            if statement.trait_name is not None:
                 continue
             result.append(statement)
         return result
