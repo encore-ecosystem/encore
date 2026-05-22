@@ -52,7 +52,7 @@ from ehir.core.instructions import (
 )
 from ehir.core.primitives import Char_t, Float_t, Isize_t, Str_t, Usize_t
 from ehir.core.primitives.base import PrimitiveType
-from ehir.core.type import Pointer, Reference, Type, box_pointee, concrete_box_type_name, is_box_type
+from ehir.core.type import Pointer, Reference, Type, box_pointee, concrete_box_type_name, is_box_type, mangle_type_name
 from ehir.core.variable import Parameter, Variable
 
 _BOOL = Usize_t(1)
@@ -378,6 +378,26 @@ class Resolver:
                         generic_param.name: concrete
                         for generic_param, concrete in zip(fn_generics, explicit_generics, strict=False)
                     }
+                    inferred = self._infer_fn_generic_mapping(fn_directive, instr, vars_by_name)
+                    if inferred is None and instr.args:
+                        recv_t = self._var_type(vars_by_name, instr.args[0])
+                        recv_base = recv_t.pointee if isinstance(recv_t, Reference) else recv_t
+                        if recv_base is not None and len(recv_base.generics) == len(fn_generics):
+                            inferred = {
+                                generic_param.name: deepcopy(concrete)
+                                for generic_param, concrete in zip(fn_generics, recv_base.generics, strict=False)
+                            }
+                    if inferred is not None:
+                        for generic_param in fn_generics:
+                            explicit = mapping.get(generic_param.name)
+                            if explicit is None:
+                                continue
+                            explicit_is_placeholder = (
+                                not explicit.generics
+                                and explicit.name == generic_param.name
+                            )
+                            if explicit_is_placeholder and generic_param.name in inferred:
+                                mapping[generic_param.name] = deepcopy(inferred[generic_param.name])
                     return _MethodSig(
                         params=[
                             self._resolve_type(self._replace_generics_by_name(param.type, mapping))
@@ -442,6 +462,22 @@ class Resolver:
             raise TypeError(f"Unknown function '{instr.fn_name}'")
         owner_type = self._resolve_type(owner_type)
         owner_base = owner_type.pointee if isinstance(owner_type, Reference) else owner_type
+        if not owner_base.generics and instr.args:
+            recv_t = self._var_type(vars_by_name, instr.args[0])
+            if recv_t is not None:
+                recv_base = recv_t.pointee if isinstance(recv_t, Reference) else recv_t
+                owner_short = owner_base.name.split("::")[-1]
+                recv_short = recv_base.name.split("::")[-1]
+                if owner_short == recv_short and recv_base.generics:
+                    owner_base = recv_base
+
+        owner_suffix = self._mangle_type_name(owner_base)
+        if owner_suffix:
+            mangled_suffix = f"::{method_name}__{owner_suffix}"
+            mangled_candidates = [name for name in self.fn if name.endswith(mangled_suffix)]
+            if len(mangled_candidates) == 1:
+                mangled_direct = self.fn[mangled_candidates[0]]
+                return (build_sig(mangled_direct), mangled_direct.name)
 
         # Trait call form: Trait::method(arg0, ...)
         if instr.args:
@@ -505,9 +541,18 @@ class Resolver:
         for impl in self.impls:
             if impl.trait_name is not None:
                 continue
-            if impl.for_type.name != owner_base.name:
+            owner_short = owner_base.name.split("::")[-1]
+            impl_short = impl.for_type.name.split("::")[-1]
+            if impl.for_type.name != owner_base.name and impl_short != owner_short:
                 continue
-            method = next((m for m in impl.methods if m.name == method_name), None)
+            method = next(
+                (
+                    m
+                    for m in impl.methods
+                    if m.name == method_name or m.name.startswith(f"{method_name}__")
+                ),
+                None,
+            )
             if method is None:
                 continue
             mapping = self._impl_generic_mapping(impl.for_type, owner_base)
@@ -609,7 +654,7 @@ class Resolver:
             if any(not part for part in mangled_generics):
                 return ""
             inner = "_".join(mangled_generics)
-            return f"{typ.name}_{inner}"
+            return f"{typ.name.replace('::', '_')}_{inner}"
         return typ.name.replace("::", "_")
 
     def _is_placeholder_type_name(self, name: str) -> bool:
@@ -762,12 +807,27 @@ class Resolver:
             vars_by_name[v.name] = t
             return True
         curr = self._resolve_type(curr)
+        curr_base = curr.name.rsplit("::", 1)[-1]
+        t_base = t.name.rsplit("::", 1)[-1]
         if curr.name == t.name:
             if not curr.generics and t.generics:
                 vars_by_name[v.name] = t
                 return True
             if curr.generics and not t.generics:
                 return False
+        if curr_base == t_base and len(curr.generics) == len(t.generics) and curr.generics:
+            can_specialize = True
+            for lhs_g, rhs_g in zip(curr.generics, t.generics):
+                lhs_g = self._resolve_type(lhs_g)
+                rhs_g = self._resolve_type(rhs_g)
+                if lhs_g == rhs_g:
+                    continue
+                if not self._contains_unbound_generic(lhs_g):
+                    can_specialize = False
+                    break
+            if can_specialize:
+                vars_by_name[v.name] = t
+                return True
         if not self._types_compatible(curr, t):
             where = f" in fn '{self._current_fn_name}'" if self._current_fn_name else ""
             raise TypeError(f"Type mismatch: {curr} != {t} for '{v.name}'{where}")
@@ -807,6 +867,8 @@ class Resolver:
         rhs = self._resolve_type(rhs)
         if lhs == rhs:
             return True
+        if mangle_type_name(lhs) == mangle_type_name(rhs):
+            return True
         if not lhs.generics and lhs.name and lhs.name[0].isupper():
             return True
         if not rhs.generics and rhs.name and rhs.name[0].isupper():
@@ -815,7 +877,9 @@ class Resolver:
             return lhs.pointee == rhs
         if isinstance(rhs, Reference):
             return rhs.pointee == lhs
-        if lhs.name == rhs.name:
+        lhs_base = lhs.name.split("::")[-1]
+        rhs_base = rhs.name.split("::")[-1]
+        if lhs.name == rhs.name or lhs_base == rhs_base:
             if not lhs.generics or not rhs.generics:
                 return True
             if len(lhs.generics) != len(rhs.generics):
@@ -838,6 +902,21 @@ class Resolver:
 
     def _primitive_bits(self, typ: Usize_t | Isize_t) -> int:
         return 64 if typ.size is None else typ.size
+
+    def _contains_unbound_generic(self, typ: Type) -> bool:
+        typ = self._resolve_type(typ)
+        if isinstance(typ, Pointer):
+            return self._contains_unbound_generic(typ.pointee)
+        if isinstance(typ, Reference):
+            return self._contains_unbound_generic(typ.pointee)
+        is_symbolic = (
+            typ.name not in self.structs
+            and typ.name not in self.enums
+            and typ.name[:1].isupper()
+        )
+        if is_symbolic:
+            return True
+        return any(self._contains_unbound_generic(generic) for generic in typ.generics)
 
     def _must_get(self, vars_by_name: dict[str, Type | None], name: str, fn_name: str) -> Type:
         t = vars_by_name.get(name)

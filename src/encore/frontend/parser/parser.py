@@ -400,6 +400,10 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 return self._parse_let()
             case TokenType.KW_DO:
                 return self._parse_do_while()
+            case TokenType.KW_WITH:
+                return self._parse_with()
+            case TokenType.KW_FOR:
+                return self._parse_for()
             case TokenType.KW_WHILE:
                 return self._parse_while()
             case TokenType.KW_LOOP:
@@ -493,6 +497,24 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         expr = self._parse_expression()
         self._parsing_control_flow_header = False
         return s.Statement_DoWhile(body, expr)
+
+    def _parse_for(self) -> s.Statement_For:
+        self._safe_consume(TokenType.KW_FOR)
+        item_name = self._safe_consume(TokenType.IDENTIFIER).value
+        self._safe_consume(TokenType.KW_IN)
+        self._parsing_control_flow_header = True
+        iterable_expr = self._parse_expression()
+        self._parsing_control_flow_header = False
+        body = self._parse_block()
+        return s.Statement_For(name=item_name, iterable=iterable_expr, body=body)
+
+    def _parse_with(self) -> s.Statement_With:
+        self._safe_consume(TokenType.KW_WITH)
+        expr = self._parse_expression()
+        self._safe_consume(TokenType.KW_AS)
+        name = self._safe_consume(TokenType.IDENTIFIER).value
+        body = self._parse_block()
+        return s.Statement_With(expr=expr, name=name, body=body)
 
     def _parse_if_block(self):
         branches, else_body = self._parse_if_common(
@@ -639,7 +661,16 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         return self._parse_expression()
 
     def _parse_expression(self) -> s.Statement_Expression:
-        return self._parse_logical_or()
+        return self._parse_range()
+
+    def _parse_range(self) -> s.Statement_Expression:
+        left = self._parse_logical_or()
+        token = self._peek_curr()
+        if token.type not in {TokenType.DOT_DOT, TokenType.DOT_DOT_EQUAL}:
+            return left
+        self._consume()
+        right = self._parse_logical_or()
+        return s.Expression_Range(start=left, end=right, inclusive=(token.type == TokenType.DOT_DOT_EQUAL))
 
     def _parse_logical_or(self) -> s.Statement_Expression:
         left = self._parse_logical_and()
@@ -886,6 +917,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             TokenType.KW_LET,
             TokenType.KW_RET,
             TokenType.KW_WHILE,
+            TokenType.KW_WITH,
             TokenType.KW_LOOP,
             TokenType.KW_DO,
             TokenType.KW_EHIR,
