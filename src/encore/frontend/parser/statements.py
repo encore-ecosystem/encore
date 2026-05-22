@@ -289,6 +289,26 @@ class Statement_DoWhile(Statement_InnerLevel):
 
 
 @dataclass
+class Statement_For(Statement_InnerLevel):
+    name: str
+    iterable: "Statement_Expression"
+    body: "Block"
+
+    def __repr__(self) -> str:
+        return f"for {self.name} in {self.iterable} {self.body}"
+
+
+@dataclass
+class Statement_With(Statement_InnerLevel):
+    expr: "Statement_Expression"
+    name: str
+    body: "Block"
+
+    def __repr__(self) -> str:
+        return f"with {self.expr} as {self.name} {self.body}"
+
+
+@dataclass
 class Statement_Assignment(Statement_InnerLevel):
     target: "Statement_Expression"
     expr: "Statement_Expression"
@@ -604,6 +624,17 @@ class Expression_Unsafe(Statement_Expression):
 
 
 # =============
+@dataclass
+class Expression_Range(Statement_Expression):
+    start: Statement_Expression
+    end: Statement_Expression
+    inclusive: bool
+
+    def __repr__(self) -> str:
+        op = "..=" if self.inclusive else ".."
+        return f"{self.start}{op}{self.end}"
+
+
 @dataclass
 class Expression_BinaryOperation(Statement_Expression):
     lhs: Statement_Expression

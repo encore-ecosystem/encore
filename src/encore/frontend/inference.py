@@ -210,6 +210,108 @@ class TypeInferer:
                     raise TypeError(f"Do-while condition must be bool, got {cond}")
             elif isinstance(statement, s.Statement_Loop):
                 self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
+            elif isinstance(statement, s.Statement_For):
+                iter_expr = s.Expression_MethodCall(receiver=statement.iterable, method="iter", generics=[], args=[])
+                iter_type = self._infer_expression(iter_expr, env, mutable_env=mutability_env)
+                if iter_type is None:
+                    raise TypeError("Unable to infer iterator type in for-loop")
+
+                loop_env = dict(env)
+                loop_mutability_env = dict(mutability_env)
+                loop_env["__for_iter"] = iter_type
+                loop_mutability_env["__for_iter"] = True
+
+                step_expr = s.Expression_MethodCall(
+                    receiver=s.Expression_Path([Type("__for_iter")]),
+                    method="next",
+                    generics=[],
+                    args=[],
+                )
+                step_type = self._infer_expression(step_expr, loop_env, mutable_env=loop_mutability_env)
+                if step_type is None:
+                    raise TypeError("Unable to infer iterator step type in for-loop")
+
+                loop_env["__for_step"] = step_type
+                loop_mutability_env["__for_step"] = False
+
+                next_iter_type = self._lookup_chained_field_type("__for_step", "0", loop_env)
+                if next_iter_type is not None and not self._types_compatible(iter_type, next_iter_type):
+                    raise TypeError(f"For-loop iterator state mismatch: {iter_type} != {next_iter_type}")
+
+                item_opt_type = self._lookup_chained_field_type("__for_step", "1", loop_env)
+                if item_opt_type is None:
+                    raise TypeError("Unable to infer yielded item type in for-loop")
+                item_opt_type = unwrap_for_storage(item_opt_type)
+                if is_reference_like_type(item_opt_type):
+                    item_opt_type = item_opt_type.pointee
+                if item_opt_type.name != "Option" or len(item_opt_type.generics) != 1:
+                    raise TypeError(f"For-loop `next` must return Option[T], got {item_opt_type}")
+
+                body_env = dict(loop_env)
+                body_mutability_env = dict(loop_mutability_env)
+                body_env[statement.name] = item_opt_type.generics[0]
+                body_mutability_env[statement.name] = False
+                self._infer_block(statement.body, body_env, body_mutability_env, fn_ret_type)
+            elif isinstance(statement, s.Statement_With):
+                resource_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
+                if resource_type is None:
+                    raise TypeError("Unable to infer resource type in with-statement")
+
+                base_resource_type = unwrap_for_storage(resource_type)
+                base_resource_type = (
+                    base_resource_type.pointee
+                    if is_reference_like_type(base_resource_type)
+                    else base_resource_type
+                )
+                trait_names = list(self._impl_traits.get(base_resource_type.name, []))
+                resource_leaf = base_resource_type.name.rsplit("::", 1)[-1]
+                for owner_name, owner_traits in self._impl_traits.items():
+                    if owner_name == base_resource_type.name:
+                        continue
+                    if owner_name.rsplit("::", 1)[-1] == resource_leaf:
+                        for owner_trait in owner_traits:
+                            if owner_trait not in trait_names:
+                                trait_names.append(owner_trait)
+                has_context_manager = False
+                for trait_name in trait_names:
+                    if trait_name.rsplit("::", 1)[-1] == "ContextManager":
+                        has_context_manager = True
+                        break
+                if not has_context_manager:
+                    raise TypeError(
+                        f"with-statement requires `{base_resource_type.name}` to implement ContextManager"
+                    )
+
+                enter_type = self._infer_expression(
+                    s.Expression_MethodCall(
+                        receiver=statement.expr,
+                        method="with_enter",
+                        generics=[],
+                        args=[],
+                    ),
+                    env,
+                    mutable_env=mutability_env,
+                )
+                if enter_type is None:
+                    raise TypeError("with-statement requires ContextManager::with_enter(self) -> Self")
+
+                self._infer_expression(
+                    s.Expression_MethodCall(
+                        receiver=s.Expression_Path([Type(statement.name)]),
+                        method="with_exit",
+                        generics=[],
+                        args=[],
+                    ),
+                    {**env, statement.name: enter_type},
+                    Type("bool"),
+                    {**mutability_env, statement.name: False},
+                )
+
+                body_env = dict(env)
+                body_mutability_env = dict(mutability_env)
+                body_env[statement.name] = enter_type
+                body_mutability_env[statement.name] = False
+                self._infer_block(statement.body, body_env, body_mutability_env, fn_ret_type)
             elif isinstance(statement, s.Statement_If):
                 for branch in statement.branches:
                     cond = self._infer_expression(branch.expr, env, Type("bool"), mutability_env)
@@ -425,6 +527,25 @@ class TypeInferer:
         return None
 
     def _resolve_method_signature(self, receiver_type: Type, method_name: str) -> tuple[str, s.FunctionSignature]:
+        def base_type_name(name: str) -> str:
+            bracket = name.find("[")
+            return name if bracket < 0 else name[:bracket]
+
+        def leaf_type_name(name: str) -> str:
+            return base_type_name(name).rsplit("::", 1)[-1]
+
+        def impl_trait_names(type_name: str) -> list[str]:
+            out = list(self._impl_traits.get(type_name, []))
+            leaf = leaf_type_name(type_name)
+            for owner_name, trait_names in self._impl_traits.items():
+                if owner_name == type_name:
+                    continue
+                if leaf_type_name(owner_name) == leaf:
+                    for trait_name in trait_names:
+                        if trait_name not in out:
+                            out.append(trait_name)
+            return out
+
         receiver_type = unwrap_for_storage(receiver_type)
         base_receiver_type = receiver_type.pointee if is_reference_like_type(receiver_type) else receiver_type
         inherent_name = f"{base_receiver_type.name}::{method_name}"
@@ -432,15 +553,26 @@ class TypeInferer:
         if inherent_signature is not None:
             return inherent_name, inherent_signature
 
-        suffix = f"::{base_receiver_type.name}::{method_name}"
-        inherent_candidates = [name for name in self._funcs if name.endswith(suffix)]
+        receiver_base = base_type_name(base_receiver_type.name)
+        receiver_leaf = leaf_type_name(base_receiver_type.name)
+        inherent_candidates: list[str] = []
+        for candidate_name in self._funcs:
+            if not candidate_name.endswith(f"::{method_name}"):
+                continue
+            parts = candidate_name.rsplit("::", 2)
+            if len(parts) < 2:
+                continue
+            owner_name = base_type_name(parts[-2])
+            if owner_name != receiver_base and leaf_type_name(owner_name) != receiver_leaf:
+                continue
+            inherent_candidates.append(candidate_name)
         if len(inherent_candidates) == 1:
             matched_name = inherent_candidates[0]
             matched_signature = self._lookup_function_signature(matched_name)
             if matched_signature is not None:
                 return matched_name, matched_signature
 
-        for trait_name in self._impl_traits.get(base_receiver_type.name, []):
+        for trait_name in impl_trait_names(base_receiver_type.name):
             trait_signature = self._lookup_trait_method_signature(
                 trait_name,
                 method_name,
@@ -458,7 +590,24 @@ class TypeInferer:
             if trait_signature is not None:
                 return f"{bound.name}::{method_name}", trait_signature
 
-        raise TypeError(f"Method '{method_name}' is not defined for type '{base_receiver_type.name}'")
+        similar = [name for name in self._funcs if name.endswith(f"::{method_name}")]
+        owner_filtered: list[str] = []
+        for candidate_name in similar:
+            parts = candidate_name.rsplit("::", 2)
+            if len(parts) < 2:
+                continue
+            if leaf_type_name(parts[-2]) == receiver_leaf:
+                owner_filtered.append(candidate_name)
+        if owner_filtered:
+            preferred = [name for name in owner_filtered if "::Iterator::" not in name]
+            matched_name = preferred[0] if preferred else owner_filtered[0]
+            matched_signature = self._lookup_function_signature(matched_name)
+            if matched_signature is not None:
+                return matched_name, matched_signature
+        raise TypeError(
+            f"Method '{method_name}' is not defined for type '{base_receiver_type.name}'. "
+            f"inherent_name='{inherent_name}', suffix_matches={len(inherent_candidates)}, method_suffix_matches={len(similar)}"
+        )
 
     def _infer_call_signature(
         self,
@@ -621,6 +770,14 @@ class TypeInferer:
 
         if isinstance(expr, s.Expression_BooleanLiteral):
             return Type("bool")
+
+        if isinstance(expr, s.Expression_Range):
+            range_ctor = s.Expression_Call(
+                callee=s.Expression_Path([Type("range_inclusive" if expr.inclusive else "range")]),
+                generics=[],
+                args=[expr.start, expr.end],
+            )
+            return self._infer_expression(range_ctor, env, expected_type, mutable_env)
 
         if isinstance(expr, s.Expression_StringLiteral):
             if expected_type is not None and expected_type != Type("str"):
@@ -1240,11 +1397,12 @@ class TypeInferer:
 
     def _infer_expression_block_nested(
         self,
-        body: list[s.Statement_InnerLevel],
+        body: Block | list[s.Statement_InnerLevel],
         env: dict[str, Type],
         mutability_env: dict[str, bool],
     ):
-        for statement in body:
+        items = body.body if isinstance(body, Block) else body
+        for statement in items:
             self._infer_expression_block_statement(statement, env, mutability_env)
 
     def _resolve_match_arm_common(self, scrutinee_type: Type, arm: MatchArmLike) -> tuple[str, Optional[Type]]:

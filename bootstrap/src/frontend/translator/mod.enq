@@ -1,0 +1,453 @@
+import core::option::Option
+import core::fmt::Debug
+import std::vec::Vec
+
+import refrain::frontend::parser::statements::EnumStmt
+import refrain::frontend::parser::statements::Expr
+import refrain::frontend::parser::statements::ExprNode
+import refrain::frontend::parser::statements::FunctionItem
+import refrain::frontend::parser::statements::FunctionParam
+import refrain::frontend::parser::statements::IfBranch
+import refrain::frontend::parser::statements::IfStmt
+import refrain::frontend::parser::statements::ImportStmt
+import refrain::frontend::parser::statements::LoopStmt
+import refrain::frontend::parser::statements::NamedField
+import refrain::frontend::parser::statements::DoWhileStmt
+import refrain::frontend::parser::statements::ParsedBlock
+import refrain::frontend::parser::statements::ParsedEnumVariant
+import refrain::frontend::parser::statements::Statement
+import refrain::frontend::parser::statements::StructStmt
+import refrain::frontend::parser::statements::WhileStmt
+
+pub fn translate_to_ehir(ast: Vec[Statement]) -> str {
+    let mut out = ""
+    for stmt in ast {
+        match stmt {
+            Statement::Import(imp_item) => {
+                out = out + translate_import(imp_item)
+            }
+            Statement::Struct(struct_item) => {
+                out = out + translate_struct(struct_item)
+            }
+            Statement::EnumItem(enum_item) => {
+                out = out + translate_enum(enum_item)
+            }
+            Statement::Function(fn_item) => {
+                out = out + translate_function(fn_item)
+            }
+            _ => {}
+        }
+        if !ends_with_newline(out) {
+            out = out + "\n"
+        }
+    }
+    ret out
+}
+
+fn translate_import(imp: ImportStmt) -> str {
+    ret "imp " + imp.path + "\n"
+}
+
+fn translate_struct(item: StructStmt) -> str {
+    let mut out = "struct " + item.name + " {\n"
+    if item.is_tuple {
+        let mut i = 0_usize
+        for field_t in item.tuple_fields {
+            out = out + "  _" + Debug::fmt(i) + ": " + field_t + "\n"
+            i = i + 1_usize
+        }
+    }
+    else {
+        for field in item.named_fields {
+            out = out + "  " + field.name + ": " + field.typ + "\n"
+        }
+    }
+    out = out + "}\n"
+    ret out
+}
+
+fn translate_enum(item: EnumStmt) -> str {
+    let mut out = "enum " + item.name + " {\n"
+    for variant in item.variants {
+        if variant.is_unit {
+            out = out + "  " + variant.name + "\n"
+        }
+        elif variant.is_tuple {
+            out = out + "  " + variant.name + "(" + join_strs(variant.tuple_fields, ", ") + ")\n"
+        }
+        else {
+            let mut fields = Vec[str]::new()
+            for field in variant.named_fields {
+                fields = fields.push(field.typ)
+            }
+            out = out + "  " + variant.name + "(" + join_strs(fields, ", ") + ")\n"
+        }
+    }
+    out = out + "}\n"
+    ret out
+}
+
+fn translate_function(fn_item: FunctionItem) -> str {
+    let mut out = "fn " + fn_item.name + "(" + translate_params(fn_item) + ") -> " + function_ret_type(fn_item) + " {\n"
+    out = out + "  $entry:\n"
+
+    match fn_item.body {
+        Option[ParsedBlock]::Some(body) => {
+            out = out + translate_statements(
+                body.statements,
+                function_ret_type(fn_item),
+                "entry",
+                Option[str]::None,
+                Option[str]::None,
+            )
+        }
+        Option[ParsedBlock]::None => {
+            out = out + translate_default_ret(function_ret_type(fn_item))
+        }
+    }
+
+    out = out + "}\n"
+    ret out
+}
+
+fn translate_statements(
+    statements: Vec[Statement],
+    ret_type: str,
+    prefix: str,
+    break_label: Option[str],
+    continue_label: Option[str],
+) -> str {
+    let mut out = ""
+    let mut saw_ret = false
+    let mut i = 0_usize
+    for stmt in statements {
+        match stmt {
+            Statement::Ret(expr) => {
+                out = out + translate_ret_expr(expr, ret_type)
+                saw_ret = true
+            }
+            Statement::If(if_stmt) => {
+                out = out + translate_if_stmt(if_stmt, ret_type, prefix, i, break_label, continue_label)
+            }
+            Statement::While(while_stmt) => {
+                out = out + translate_while_stmt(while_stmt, ret_type, prefix, i)
+            }
+            Statement::Loop(loop_stmt) => {
+                out = out + translate_loop_stmt(loop_stmt, ret_type, prefix, i)
+            }
+            Statement::DoWhile(do_stmt) => {
+                out = out + translate_do_while_stmt(do_stmt, ret_type, prefix, i)
+            }
+            Statement::Break(_) => {
+                match break_label {
+                    Option[str]::Some(target) => {
+                        out = out + "    br $" + target + "\n"
+                    }
+                    Option[str]::None => {}
+                }
+            }
+            Statement::Continue(_) => {
+                match continue_label {
+                    Option[str]::Some(target) => {
+                        out = out + "    br $" + target + "\n"
+                    }
+                    Option[str]::None => {}
+                }
+            }
+            _ => {}
+        }
+        i = i + 1_usize
+    }
+    if !saw_ret {
+        out = out + translate_default_ret(ret_type)
+    }
+    ret out
+}
+
+fn lower_cond(expr: ExprNode, temp_name: str) -> str {
+    match expr.value {
+        Expr::Boolean(v) => {
+            if v {
+                ret "    " + temp_name + ": bool = capprim 1_u1\n"
+            }
+            ret "    " + temp_name + ": bool = capprim 0_u1\n"
+        }
+        Expr::Path(name) => {
+            ret "    " + temp_name + ": bool = capprim 1_u1\n" + "    " + temp_name + " = capprim 1_u1\n" + "    # cond path: " + name + "\n"
+        }
+        _ => {
+            ret "    " + temp_name + ": bool = capprim 1_u1\n"
+        }
+    }
+}
+
+fn translate_if_stmt(
+    if_stmt: IfStmt,
+    ret_type: str,
+    prefix: str,
+    idx: usize,
+    break_label: Option[str],
+    continue_label: Option[str],
+) -> str {
+    let then_label = prefix + "_if_then_" + Debug::fmt(idx)
+    let else_label = prefix + "_if_else_" + Debug::fmt(idx)
+    let end_label = prefix + "_if_end_" + Debug::fmt(idx)
+    let cond_name = prefix + "_if_cond_" + Debug::fmt(idx)
+
+    let mut out = ""
+    let branches = if_stmt.branches
+    match branches.get(0_usize) {
+        Option[IfBranch]::Some(branch0) => {
+            out = out + lower_cond(branch0.condition, cond_name)
+            out = out + "    cbr " + cond_name + ", $" + then_label + ", $" + else_label + "\n"
+            out = out + "  $" + then_label + ":\n"
+            out = out + translate_statements(
+                branch0.body.statements,
+                ret_type,
+                then_label,
+                break_label,
+                continue_label,
+            )
+            out = out + "    br $" + end_label + "\n"
+        }
+        Option[IfBranch]::None => {
+            ret ""
+        }
+    }
+
+    out = out + "  $" + else_label + ":\n"
+    match if_stmt.else_body {
+        Option[ParsedBlock]::Some(else_block) => {
+            out = out + translate_statements(
+                else_block.statements,
+                ret_type,
+                else_label,
+                break_label,
+                continue_label,
+            )
+        }
+        Option[ParsedBlock]::None => {
+            out = out + "    br $" + end_label + "\n"
+        }
+    }
+    out = out + "    br $" + end_label + "\n"
+    out = out + "  $" + end_label + ":\n"
+    ret out
+}
+
+fn translate_while_stmt(while_stmt: WhileStmt, ret_type: str, prefix: str, idx: usize) -> str {
+    let cond_label = prefix + "_while_cond_" + Debug::fmt(idx)
+    let body_label = prefix + "_while_body_" + Debug::fmt(idx)
+    let end_label = prefix + "_while_end_" + Debug::fmt(idx)
+    let cond_name = prefix + "_while_condv_" + Debug::fmt(idx)
+
+    let mut out = "    br $" + cond_label + "\n"
+    out = out + "  $" + cond_label + ":\n"
+    out = out + lower_cond(while_stmt.condition, cond_name)
+    out = out + "    cbr " + cond_name + ", $" + body_label + ", $" + end_label + "\n"
+    out = out + "  $" + body_label + ":\n"
+    out = out + translate_statements(
+        while_stmt.body.statements,
+        ret_type,
+        body_label,
+        Option[str]::Some(end_label),
+        Option[str]::Some(cond_label),
+    )
+    out = out + "    br $" + cond_label + "\n"
+    out = out + "  $" + end_label + ":\n"
+    ret out
+}
+
+fn translate_loop_stmt(loop_stmt: LoopStmt, ret_type: str, prefix: str, idx: usize) -> str {
+    let body_label = prefix + "_loop_body_" + Debug::fmt(idx)
+    let end_label = prefix + "_loop_end_" + Debug::fmt(idx)
+    let mut out = "    br $" + body_label + "\n"
+    out = out + "  $" + body_label + ":\n"
+    out = out + translate_statements(
+        loop_stmt.body.statements,
+        ret_type,
+        body_label,
+        Option[str]::Some(end_label),
+        Option[str]::Some(body_label),
+    )
+    out = out + "    br $" + body_label + "\n"
+    out = out + "  $" + end_label + ":\n"
+    ret out
+}
+
+fn translate_do_while_stmt(do_stmt: DoWhileStmt, ret_type: str, prefix: str, idx: usize) -> str {
+    let body_label = prefix + "_do_body_" + Debug::fmt(idx)
+    let cond_label = prefix + "_do_cond_" + Debug::fmt(idx)
+    let end_label = prefix + "_do_end_" + Debug::fmt(idx)
+    let cond_name = prefix + "_do_condv_" + Debug::fmt(idx)
+    let mut out = "    br $" + body_label + "\n"
+    out = out + "  $" + body_label + ":\n"
+    out = out + translate_statements(
+        do_stmt.body.statements,
+        ret_type,
+        body_label,
+        Option[str]::Some(end_label),
+        Option[str]::Some(cond_label),
+    )
+    out = out + "    br $" + cond_label + "\n"
+    out = out + "  $" + cond_label + ":\n"
+    out = out + lower_cond(do_stmt.condition, cond_name)
+    out = out + "    cbr " + cond_name + ", $" + body_label + ", $" + end_label + "\n"
+    out = out + "  $" + end_label + ":\n"
+    ret out
+}
+
+fn translate_params(fn_item: FunctionItem) -> str {
+    let mut out = ""
+    let mut i = 0_usize
+    for param in fn_item.params {
+        if i > 0_usize {
+            out = out + ", "
+        }
+        let t = unwrap_type_or_usize(param.typ)
+        out = out + param.name + ": " + t
+        i = i + 1_usize
+    }
+    ret out
+}
+
+fn function_ret_type(fn_item: FunctionItem) -> str {
+    match fn_item.ret_type {
+        Option[str]::Some(rt) => { ret rt }
+        Option[str]::None => { ret "void" }
+    }
+    ret "void"
+}
+
+fn unwrap_type_or_usize(typ: Option[str]) -> str {
+    match typ {
+        Option[str]::Some(value) => { ret value }
+        Option[str]::None => { ret "usize" }
+    }
+    ret "usize"
+}
+
+fn translate_ret_expr(expr: ExprNode, ret_type: str) -> str {
+    match expr.value {
+        Expr::Integer(v) => {
+            ret "    _ret: " + ret_type + " = capprim " + with_numeric_suffix(v, ret_type) + "\n"
+                + "    ret _ret: " + ret_type + "\n"
+        }
+        Expr::Float(v) => {
+            ret "    _ret: " + ret_type + " = capprim " + with_numeric_suffix(v, ret_type) + "\n"
+                + "    ret _ret: " + ret_type + "\n"
+        }
+        Expr::StringLiteral(v) => {
+            ret "    _ret: str = capprim \"" + escape_str(v) + "\"_str\n"
+                + "    ret _ret: str\n"
+        }
+        Expr::Boolean(v) => {
+            let mut lit = "0_u1"
+            if v {
+                lit = "1_u1"
+            }
+            ret "    _ret: bool = capprim " + lit + "\n"
+                + "    ret _ret: bool\n"
+        }
+        Expr::Path(name) => {
+            ret "    ret " + name + ": " + ret_type + "\n"
+        }
+        _ => {
+            ret translate_default_ret(ret_type)
+        }
+    }
+}
+
+fn translate_default_ret(ret_type: str) -> str {
+    if ret_type == "void" {
+        ret ""
+    }
+    if ret_type == "str" {
+        ret "    _ret: str = capprim \"\"_str\n"
+            + "    ret _ret: str\n"
+    }
+    if ret_type == "bool" {
+        ret "    _ret: bool = capprim 0_u1\n"
+            + "    ret _ret: bool\n"
+    }
+    ret "    _ret: " + ret_type + " = capprim " + with_numeric_suffix("0", ret_type) + "\n"
+        + "    ret _ret\n"
+}
+
+fn with_numeric_suffix(value: str, typ: str) -> str {
+    if ends_with(typ, "usize") {
+        ret value + "_usize"
+    }
+    if ends_with(typ, "isize") {
+        ret value + "_isize"
+    }
+    if starts_with(typ, "u") || starts_with(typ, "i") || starts_with(typ, "f") {
+        ret value + "_" + typ
+    }
+    ret value + "_usize"
+}
+
+fn join_strs(items: Vec[str], sep: str) -> str {
+    let mut out = ""
+    let mut i = 0_usize
+    for item in items {
+        if i > 0_usize {
+            out = out + sep
+        }
+        out = out + item
+        i = i + 1_usize
+    }
+    ret out
+}
+
+fn ends_with_newline(value: str) -> bool {
+    if value.len() == 0_usize {
+        ret false
+    }
+    match value.get(value.len() - 1_usize) {
+        Option[str]::Some(ch) => { ret ch == "\n" }
+        Option[str]::None => { ret false }
+    }
+    ret false
+}
+
+fn starts_with(value: str, prefix: str) -> bool {
+    if prefix.len() > value.len() {
+        ret false
+    }
+    ret value.slice(0_usize, prefix.len()) == prefix
+}
+
+fn ends_with(value: str, suffix: str) -> bool {
+    if suffix.len() > value.len() {
+        ret false
+    }
+    let start = value.len() - suffix.len()
+    ret value.slice(start, suffix.len()) == suffix
+}
+
+fn escape_str(value: str) -> str {
+    let mut out = ""
+    let mut i = 0_usize
+    loop {
+        match value.get(i) {
+            Option[str]::Some(ch) => {
+                if ch == "\\" {
+                    out = out + "\\\\"
+                }
+                elif ch == "\"" {
+                    out = out + "\\\""
+                }
+                elif ch == "\n" {
+                    out = out + "\\n"
+                }
+                else {
+                    out = out + ch
+                }
+                i = i + 1_usize
+            }
+            Option[str]::None => { break }
+        }
+    }
+    ret out
+}
