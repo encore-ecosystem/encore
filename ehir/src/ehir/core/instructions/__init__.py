@@ -18,6 +18,7 @@ from .binop import (
     Instruction_xor,
 )
 from .call import Instruction_call
+from .callvoid import Instruction_callvoid
 from .capenum import Instruction_capenum
 from .capprim import Instruction_capprim
 from .capstruct import Instruction_capstruct
@@ -57,6 +58,7 @@ __all__ = [
     "Instruction_and",
     "Instruction_br",
     "Instruction_call",
+    "Instruction_callvoid",
     "Instruction_capenum",
     "Instruction_capprim",
     "Instruction_capstruct",

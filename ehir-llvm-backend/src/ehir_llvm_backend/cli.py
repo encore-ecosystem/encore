@@ -1,5 +1,7 @@
 import argparse
+import re
 import subprocess
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,13 +24,90 @@ AVAILABLE_ROOT_TYPES = {
 
 
 @dataclass(frozen=True)
+class _CfreeExpectations:
+    free_ids: tuple[str, ...] | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.free_ids is not None
+
+
+@dataclass(frozen=True)
 class _TestCase:
     source_file: Path
     entrypoint: str
+    cfree_expectations: _CfreeExpectations
+    expected_compile_error: str | None = None
 
     @property
     def display_name(self) -> str:
         return self.source_file.as_posix()
+
+
+_CFREE_FREE_IDS_RE = re.compile(r"^\[cfree\] free heap payload of .+ id=(?P<id>.+)$")
+
+
+def _parse_cfree_expectations(source_file: Path) -> _CfreeExpectations:
+    free_ids: tuple[str, ...] | None = None
+    for raw_line in source_file.read_text().splitlines():
+        line = raw_line.strip()
+        if not line.startswith(";@"):
+            continue
+        if line.startswith(";@cfree.free_ids="):
+            value = line.split("=", 1)[1].strip()
+            if value:
+                free_ids = tuple(part.strip() for part in value.split(",") if part.strip())
+            else:
+                free_ids = tuple()
+    return _CfreeExpectations(free_ids=free_ids)
+
+
+def _parse_expected_compile_error(source_file: Path) -> str | None:
+    expected: str | None = None
+    for raw_line in source_file.read_text().splitlines():
+        line = raw_line.strip()
+        if not line.startswith(";@"):
+            continue
+        if line.startswith(";@expect.compile_error="):
+            expected = line.split("=", 1)[1].strip() or ""
+    return expected
+
+
+def _extract_cfree_free_ids(output: str) -> list[str]:
+    ids: list[str] = []
+    for line in output.splitlines():
+        match = _CFREE_FREE_IDS_RE.match(line.strip())
+        if match is not None:
+            ids.append(match.group("id"))
+    return ids
+
+
+def _validate_cfree_expectations(test: _TestCase, output: str) -> str | None:
+    exp = test.cfree_expectations
+    if exp.free_ids is None:
+        return None
+    actual_ids = _extract_cfree_free_ids(output)
+    expected_counter = Counter(exp.free_ids)
+    actual_counter = Counter(actual_ids)
+    if expected_counter != actual_counter:
+        expected = ", ".join(sorted(exp.free_ids))
+        actual = ", ".join(sorted(actual_ids))
+        return (
+            "cfree free-id set mismatch: "
+            f"expected {{{expected}}}, got {{{actual}}}"
+        )
+    return None
+
+
+def _exception_text(exc: Exception) -> str:
+    parts: list[str] = []
+    current: BaseException | None = exc
+    while current is not None:
+        text = str(current).strip()
+        if text:
+            parts.append(text)
+        current = current.__cause__ or current.__context__
+    return " | caused by: ".join(parts)
 
 
 def _add_dependency_refrains(compiler: EHIR_ProjectCompiler, cwd: Path):
@@ -72,7 +151,14 @@ def _collect_tests(cwd: Path) -> list[_TestCase]:
     for source_file in sorted(tests_dir.rglob("*.ehir")):
         rel = source_file.relative_to(tests_dir)
         entrypoint = rel.with_suffix("").as_posix()
-        cases.append(_TestCase(source_file=source_file, entrypoint=entrypoint))
+        cases.append(
+            _TestCase(
+                source_file=source_file,
+                entrypoint=entrypoint,
+                cfree_expectations=_parse_cfree_expectations(source_file),
+                expected_compile_error=_parse_expected_compile_error(source_file),
+            )
+        )
     return cases
 
 
@@ -85,7 +171,8 @@ def _run_tests(cwd: Path, *, target: str, target_dir: Path | None, trace_cfree: 
     passed = 0
     failed = 0
     for idx, test in enumerate(tests, start=1):
-        compiler = _create_compiler(cwd, target=target, target_dir=target_dir, trace_cfree=trace_cfree)
+        needs_trace = trace_cfree or test.cfree_expectations.enabled
+        compiler = _create_compiler(cwd, target=target, target_dir=target_dir, trace_cfree=needs_trace)
         test_name = f"{cwd.name}__test__{test.entrypoint.replace('/', '__')}"
         compiler.add_refrain_to_build(
             Refrain(
@@ -99,17 +186,39 @@ def _run_tests(cwd: Path, *, target: str, target_dir: Path | None, trace_cfree: 
 
         try:
             outputs = dict(compiler.compile_all())
+            if test.expected_compile_error is not None:
+                failed += 1
+                print(
+                    f"[{idx}/{len(tests)}] FAILED {test.display_name} "
+                    f"(expected compile error containing '{test.expected_compile_error}')"
+                )
+                continue
             binary_path = outputs[test_name]
-            result = subprocess.run([str(binary_path)], check=False)
+            result = subprocess.run([str(binary_path)], check=False, text=True, capture_output=True)
+            output = result.stdout + result.stderr
+            if result.stdout:
+                print(result.stdout, end="")
+            if result.stderr:
+                print(result.stderr, end="")
             if result.returncode == 0:
-                passed += 1
-                print(f"[{idx}/{len(tests)}] ok {test.display_name}")
+                expectation_error = _validate_cfree_expectations(test, output)
+                if expectation_error is None:
+                    passed += 1
+                    print(f"[{idx}/{len(tests)}] ok {test.display_name}")
+                else:
+                    failed += 1
+                    print(f"[{idx}/{len(tests)}] FAILED {test.display_name} ({expectation_error})")
             else:
                 failed += 1
                 print(f"[{idx}/{len(tests)}] FAILED {test.display_name} (exit code {result.returncode})")
         except Exception as exc:
-            failed += 1
-            print(f"[{idx}/{len(tests)}] FAILED {test.display_name} ({exc})")
+            error_text = _exception_text(exc)
+            if test.expected_compile_error is not None and test.expected_compile_error in error_text:
+                passed += 1
+                print(f"[{idx}/{len(tests)}] ok {test.display_name} (expected compile error)")
+            else:
+                failed += 1
+                print(f"[{idx}/{len(tests)}] FAILED {test.display_name} ({error_text})")
 
     if failed == 0:
         print(f"PASS {passed} tests")

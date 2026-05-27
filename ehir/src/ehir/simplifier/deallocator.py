@@ -8,6 +8,7 @@ from ehir.core.instructions import (
     BinOp,
     Instruction_br,
     Instruction_call,
+    Instruction_callvoid,
     Instruction_capenum,
     Instruction_capprim,
     Instruction_capstruct,
@@ -41,6 +42,7 @@ from ehir.core.instructions import (
 from ehir.core.instructions.base import Assignable
 from ehir.core.type import Type
 from ehir.core.variable import TypedVariable, Variable
+from ehir.errors import EhirCompileError
 from ehir.simplifier.drop_helper import collect_aggregate_names, needs_drop
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
@@ -444,7 +446,7 @@ class Deallocator:
                 self._add_variable_usage(instr.var)
             elif isinstance(instr, Instruction_pcast):
                 self._add_variable_usage(instr.var)
-            elif isinstance(instr, Instruction_call):
+            elif isinstance(instr, (Instruction_call, Instruction_callvoid)):
                 for arg in instr.args:
                     self._add_variable_usage(arg)
             elif isinstance(instr, (Instruction_wraps, Instruction_wraph)):
@@ -502,21 +504,26 @@ class Deallocator:
 
             dropped = set(merged)
             for instr in block.body:
-                for used in self._used_vars(instr):
-                    if used.name in dropped:
-                        raise TypeError(f"Use-after-drop of '{used.name}' in fn '{fn.name}'")
                 if isinstance(instr, Instruction_drop):
                     if instr.var.name in arg_names:
-                        raise TypeError(f"Manual drop for function parameter '{instr.var.name}' is forbidden")
+                        raise EhirCompileError(
+                            f"Manual drop for function parameter '{instr.var.name}' is forbidden", code="EHIR3001"
+                        )
                     if instr.var.name in dropped:
-                        raise TypeError(f"Double drop of '{instr.var.name}' in fn '{fn.name}'")
+                        raise EhirCompileError(f"Double drop of '{instr.var.name}' in fn '{fn.name}'", code="EHIR3002")
                     dropped.add(instr.var.name)
+                    continue
+                for used in self._used_vars(instr):
+                    if used.name in dropped:
+                        raise EhirCompileError(
+                            f"Use-after-drop of '{used.name}' in fn '{fn.name}'", code="EHIR3003"
+                        )
                 if isinstance(instr, Assignable):
                     dropped.discard(instr.var_out.name)
 
             for used in self._used_vars(block.term):
                 if used.name in dropped:
-                    raise TypeError(f"Use-after-drop of '{used.name}' in fn '{fn.name}'")
+                    raise EhirCompileError(f"Use-after-drop of '{used.name}' in fn '{fn.name}'", code="EHIR3003")
 
             if dropped != out_dropped[block_name]:
                 out_dropped[block_name] = dropped
@@ -544,6 +551,10 @@ class Deallocator:
             return [instr.var, instr.value]
         if isinstance(instr, Instruction_load):
             return [instr.var]
+        if isinstance(instr, (Instruction_getfield, Instruction_getfieldptr)):
+            return [instr.src]
+        if isinstance(instr, (Instruction_sgetfield, Instruction_sgetfieldptr)):
+            return [instr.src]
         if isinstance(instr, Instruction_put):
             return [instr.var]
         if isinstance(instr, (Instruction_scstruct, Instruction_cstruct, Instruction_capstruct)):
@@ -556,7 +567,7 @@ class Deallocator:
             return [instr.var]
         if isinstance(instr, Instruction_pcast):
             return [instr.var]
-        if isinstance(instr, Instruction_call):
+        if isinstance(instr, (Instruction_call, Instruction_callvoid)):
             return list(instr.args)
         if isinstance(instr, (Instruction_wraps, Instruction_wraph)):
             return [instr.variable]
