@@ -22,6 +22,7 @@ from ehir.core.instructions import (
     Instruction_capstruct,
     Instruction_cbr,
     Instruction_div,
+    Instruction_drop,
     Instruction_gep,
     Instruction_geq,
     Instruction_getfield,
@@ -391,6 +392,8 @@ class Parser:
                 return self._parse_setfield()
             case TokenType.KW_HFREE:
                 return self._parse_hfree()
+            case TokenType.KW_DROP:
+                return self._parse_drop()
 
         next_token = self._lookup_next()
         if next_token == TokenType.COLON or next_token == TokenType.EQUAL:
@@ -400,6 +403,11 @@ class Parser:
         self._safe_consume(TokenType.KW_HFREE)
         var = self._parse_variable()
         return Instruction_hfree(var=var)
+
+    def _parse_drop(self) -> Instruction_drop:
+        self._safe_consume(TokenType.KW_DROP)
+        var = self._parse_variable()
+        return Instruction_drop(var=var)
 
     def _parse_put(self) -> Instruction_put:
         self._safe_consume(TokenType.KW_PUT)

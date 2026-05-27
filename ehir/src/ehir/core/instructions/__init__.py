@@ -21,6 +21,7 @@ from .call import Instruction_call
 from .capenum import Instruction_capenum
 from .capprim import Instruction_capprim
 from .capstruct import Instruction_capstruct
+from .drop import Instruction_drop
 from .cenum import Instruction_cenum
 from .cfree import Instruction_cfree
 from .comment import Instruction_comment
@@ -66,6 +67,7 @@ __all__ = [
     "Instruction_cpos",
     "Instruction_cstruct",
     "Instruction_div",
+    "Instruction_drop",
     "Instruction_gep",
     "Instruction_geq",
     "Instruction_getfield",

@@ -22,6 +22,7 @@ from ehir.core.instructions import (
     Instruction_capprim,
     Instruction_capstruct,
     Instruction_div,
+    Instruction_drop,
     Instruction_geq,
     Instruction_getfield,
     Instruction_getfieldptr,
@@ -126,6 +127,9 @@ class Resolver:
             if isinstance(fn, Derective_extern_fn):
                 continue
             self._resolve_fn(fn)
+        for impl in self.impls:
+            for method in impl.methods:
+                self._resolve_fn(method)
 
         return ast
 
@@ -287,6 +291,9 @@ class Resolver:
             # keep pointer-kind
             return self._unify_pair(vars_by_name, instr.var_out, instr.var)
 
+        if isinstance(instr, Instruction_drop):
+            return False
+
         return False
 
     def _resolve_capstruct(self, instr: Instruction_capstruct, vars_by_name: dict[str, Type | None]) -> bool:
@@ -369,7 +376,22 @@ class Resolver:
     ) -> tuple[_MethodSig, str] | None:
         instr.fn_name = self._normalize_call_name(instr.fn_name)
 
-        def build_sig(fn_directive) -> _MethodSig:
+        def _owner_self_type_from_name(name: str) -> Type | None:
+            if "::" not in name:
+                return None
+            owner_text, _ = name.rsplit("::", 1)
+            owner = self._parse_type_text(owner_text)
+            if owner is None:
+                return None
+            owner = self._resolve_type(owner)
+            return owner.pointee if isinstance(owner, Reference) else owner
+
+        def _apply_self_type(typ: Type, self_type: Type | None) -> Type:
+            if self_type is None:
+                return typ
+            return self._replace_type(typ, {}, self_type)
+
+        def build_sig(fn_directive, self_type: Type | None = None) -> _MethodSig:
             fn_generics = getattr(fn_directive, "generics", [])
             if fn_generics:
                 explicit_generics = [self._resolve_type(generic) for generic in instr.generics]
@@ -400,10 +422,14 @@ class Resolver:
                                 mapping[generic_param.name] = deepcopy(inferred[generic_param.name])
                     return _MethodSig(
                         params=[
-                            self._resolve_type(self._replace_generics_by_name(param.type, mapping))
+                            self._resolve_type(
+                                _apply_self_type(self._replace_generics_by_name(param.type, mapping), self_type)
+                            )
                             for param in fn_directive.params
                         ],
-                        ret=self._resolve_type(self._replace_generics_by_name(fn_directive.ret_type, mapping)),
+                        ret=self._resolve_type(
+                            _apply_self_type(self._replace_generics_by_name(fn_directive.ret_type, mapping), self_type)
+                        ),
                     )
                 inferred = self._infer_fn_generic_mapping(fn_directive, instr, vars_by_name)
                 if inferred is not None and len(inferred) == len(fn_generics):
@@ -411,14 +437,18 @@ class Resolver:
                     mapping = {g.name: deepcopy(inferred[g.name]) for g in fn_generics}
                     return _MethodSig(
                         params=[
-                            self._resolve_type(self._replace_generics_by_name(param.type, mapping))
+                            self._resolve_type(
+                                _apply_self_type(self._replace_generics_by_name(param.type, mapping), self_type)
+                            )
                             for param in fn_directive.params
                         ],
-                        ret=self._resolve_type(self._replace_generics_by_name(fn_directive.ret_type, mapping)),
+                        ret=self._resolve_type(
+                            _apply_self_type(self._replace_generics_by_name(fn_directive.ret_type, mapping), self_type)
+                        ),
                     )
             return _MethodSig(
-                params=[self._resolve_type(param.type) for param in fn_directive.params],
-                ret=self._resolve_type(fn_directive.ret_type),
+                params=[self._resolve_type(_apply_self_type(param.type, self_type)) for param in fn_directive.params],
+                ret=self._resolve_type(_apply_self_type(fn_directive.ret_type, self_type)),
             )
 
         trait_owner_call = False
@@ -438,7 +468,7 @@ class Resolver:
         if not trait_owner_call:
             direct = self.fn.get(instr.fn_name)
             if direct is not None:
-                return (build_sig(direct), direct.name)
+                return (build_sig(direct, _owner_self_type_from_name(instr.fn_name)), direct.name)
 
         if "::" in instr.fn_name:
             parts = instr.fn_name.split("::")
@@ -446,7 +476,7 @@ class Resolver:
                 tail = "::".join(parts[-2:])
                 tail_direct = self.fn.get(tail)
                 if tail_direct is not None and not trait_owner_call:
-                    return (build_sig(tail_direct), tail_direct.name)
+                    return (build_sig(tail_direct, _owner_self_type_from_name(instr.fn_name)), tail_direct.name)
 
         if "::" not in instr.fn_name:
             raise TypeError(f"Unknown function '{instr.fn_name}'")
@@ -867,6 +897,14 @@ class Resolver:
         rhs = self._resolve_type(rhs)
         if lhs == rhs:
             return True
+        if is_box_type(lhs):
+            expected_concrete = concrete_box_type_name(lhs.generics[0])
+            if rhs.name == expected_concrete and not rhs.generics:
+                return True
+        if is_box_type(rhs):
+            expected_concrete = concrete_box_type_name(rhs.generics[0])
+            if lhs.name == expected_concrete and not lhs.generics:
+                return True
         if mangle_type_name(lhs) == mangle_type_name(rhs):
             return True
         if not lhs.generics and lhs.name and lhs.name[0].isupper():

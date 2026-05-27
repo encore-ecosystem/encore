@@ -1,7 +1,7 @@
 import hashlib
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, fields, field, is_dataclass
 from importlib.metadata import version
 from pathlib import Path
 
@@ -56,6 +56,7 @@ class EHIR_ProjectCompiler:
     backend: EHIR_Backend
     cache_dir: Path | None = None
     use_cache: bool = True
+    trace_cfree: bool = False
     on_refrain: Callable[[Refrain], None] | None = None
     refrains: dict[str, Refrain] = field(default_factory=dict)
     tree: dict[Path, TreeNode] = field(default_factory=dict)
@@ -131,7 +132,7 @@ class EHIR_ProjectCompiler:
         module.ast = MonomorphizationPass().run(module.ast)
         module.ast = Resolver().run(module.ast)
         self._emit_ehir_stage(refrain.name, "post_monomorphize", module.ast)
-        module.ast = AutoDropPass().run(module.ast)
+        module.ast = AutoDropPass(trace_cfree=self.trace_cfree).run(module.ast)
         module.ast = AutoRetainPass().run(module.ast)
         module.ast = RetainInsertionPass().run(module.ast)
         # TODO: re-enable after migrating core/std to explicit safety attrs.
@@ -228,11 +229,13 @@ class EHIR_ProjectCompiler:
         for directive in ast:
             if not isinstance(directive, Derective_impl):
                 continue
+            self._replace_self(directive.methods, directive.for_type)
             for method in directive.methods:
                 if not isinstance(method, Derective_fn):
                     continue
                 lifted = deepcopy(method)
                 lifted.generics = self._merge_generics(directive.generics, lifted.generics)
+                lifted = self._replace_self(lifted, directive.for_type)
                 if "::" not in lifted.name:
                     owner = directive.trait_name if directive.trait_name else directive.for_type.name
                     if owner:
@@ -249,6 +252,25 @@ class EHIR_ProjectCompiler:
         if lifted_methods:
             return [*ast, *lifted_methods]
         return ast
+
+    def _replace_self(self, value, self_type: Type):
+        if isinstance(value, Type):
+            if isinstance(value, Pointer):
+                return Pointer(self._replace_self(value.pointee, self_type))
+            if isinstance(value, Reference):
+                return Reference(self._replace_self(value.pointee, self_type))
+            if value.name == "Self" and not value.generics:
+                return deepcopy(self_type)
+            return Type(value.name, [self._replace_self(generic, self_type) for generic in value.generics])
+        if isinstance(value, list):
+            for i, item in enumerate(value):
+                value[i] = self._replace_self(item, self_type)
+            return value
+        if not is_dataclass(value):
+            return value
+        for f in fields(value):
+            setattr(value, f.name, self._replace_self(getattr(value, f.name), self_type))
+        return value
 
     def _merge_generics(self, *generic_groups: list[Type]) -> list[Type]:
         merged: list[Type] = []
@@ -426,6 +448,8 @@ class EHIR_ProjectCompiler:
         digest.update(self._compiler_version.encode())
         digest.update(refrain.name.encode())
         digest.update(refrain.type.value.encode())
+        digest.update(b"trace_cfree=")
+        digest.update(b"1" if self.trace_cfree else b"0")
 
         for source_file in source_files:
             resolved_file = source_file.resolve()

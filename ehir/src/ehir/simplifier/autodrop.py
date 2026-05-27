@@ -24,7 +24,7 @@ from ehir.core.instructions import (
     Instruction_sub,
     MatchCase,
 )
-from ehir.core.primitives import Usize, Usize_t
+from ehir.core.primitives import Str, Usize, Usize_t
 from ehir.core.type import Pointer, Type
 from ehir.core.variable import Parameter, TypedVariable
 from ehir.simplifier.drop_helper import collect_aggregate_names, drop_function_name, is_box_struct, needs_drop
@@ -41,6 +41,9 @@ class _ChildEdge:
 
 
 class AutoDropPass:
+    def __init__(self, trace_cfree: bool = False):
+        self._trace_cfree = trace_cfree
+
     def run(self, ast: list[Derective]) -> list[Derective]:
         self._structs = {
             directive.name: directive
@@ -437,12 +440,49 @@ class AutoDropPass:
 
         free_heap_body: list = []
         ptr = self._emit_box_ptr(free_heap_body, self_var, ptr_type, ".cfree2_free")
+        if self._trace_cfree:
+            msg = self._emit_cfree_trace_message_with_id(
+                free_heap_body,
+                box_type_name=self_var.type.name,
+                ptr_type=ptr_type,
+                ptr_var=ptr,
+                prefix=".cfree2_trace_heap",
+            )
+            fd = TypedVariable(".cfree2_trace_heap_fd", Type("i32"))
+            free_heap_body.append(Instruction_capprim(var_out=fd, primitive=Usize(2, size=32)))
+            free_heap_body.append(
+                Instruction_call(
+                    var_out=TypedVariable(".cfree2_trace_heap_out", Type("i32")),
+                    fn_name="__ehir_rt_io_write",
+                    generics=[],
+                    args=[fd, msg],
+                )
+            )
         free_heap_body.extend([Instruction_hfree(var=ptr), Instruction_br(label="free_owner")])
 
-        free_owner_body = [
-            Instruction_hfree(var=owner_ptr),
-            Instruction_ret(TypedVariable(".cfree2_ret", Type("void"))),
-        ]
+        free_owner_body: list = []
+        if self._trace_cfree:
+            msg = self._emit_debug_message(
+                free_owner_body,
+                f"[cfree] free owner header of {self_var.type.name}\n",
+                ".cfree2_trace_owner",
+            )
+            fd = TypedVariable(".cfree2_trace_owner_fd", Type("i32"))
+            free_owner_body.append(Instruction_capprim(var_out=fd, primitive=Usize(2, size=32)))
+            free_owner_body.append(
+                Instruction_call(
+                    var_out=TypedVariable(".cfree2_trace_owner_out", Type("i32")),
+                    fn_name="__ehir_rt_io_write",
+                    generics=[],
+                    args=[fd, msg],
+                )
+            )
+        free_owner_body.extend(
+            [
+                Instruction_hfree(var=owner_ptr),
+                Instruction_ret(TypedVariable(".cfree2_ret", Type("void"))),
+            ]
+        )
 
         survive_body: list = []
         value = self._emit_box_value(survive_body, self_var, ptr_type, ".cfree2_restore_value")
@@ -536,6 +576,75 @@ class AutoDropPass:
         current_body.append(final)
         blocks.append(Block(name=current_name, body=current_body))
         return blocks
+
+    def _emit_debug_message(self, body: list, text: str, name: str) -> TypedVariable:
+        msg = TypedVariable(name, Type("str"))
+        body.append(Instruction_capprim(var_out=msg, primitive=Str(text)))
+        return msg
+
+    def _emit_cfree_trace_message_with_id(
+        self,
+        body: list,
+        *,
+        box_type_name: str,
+        ptr_type: Pointer,
+        ptr_var: TypedVariable,
+        prefix: str,
+    ) -> TypedVariable:
+        base = self._emit_debug_message(body, f"[cfree] free heap payload of {box_type_name}", f"{prefix}_base")
+        pointee = ptr_type.pointee
+        struct_decl = self._structs.get(pointee.name)
+        if struct_decl is None:
+            return self._emit_debug_message(body, f"[cfree] free heap payload of {box_type_name}\n", prefix)
+
+        id_index = None
+        for idx, field in enumerate(struct_decl.params):
+            if field.name == "id" and field.type.name == "str":
+                id_index = idx
+                break
+        if id_index is None:
+            return self._emit_debug_message(body, f"[cfree] free heap payload of {box_type_name}\n", prefix)
+
+        payload = TypedVariable(f"{prefix}_payload", deepcopy(pointee))
+        id_value = TypedVariable(f"{prefix}_id", Type("str"))
+        sep = self._emit_debug_message(body, " id=", f"{prefix}_sep")
+        with_sep = TypedVariable(f"{prefix}_with_sep", Type("str"))
+        with_id = TypedVariable(f"{prefix}_with_id", Type("str"))
+        final = TypedVariable(prefix, Type("str"))
+        body.append(Instruction_load(var_out=payload, var=ptr_var))
+        body.append(
+            Instruction_getfield(
+                var_out=id_value,
+                src=payload,
+                field=TypedVariable(str(id_index), Type("str")),
+            )
+        )
+        body.append(
+            Instruction_call(
+                var_out=with_sep,
+                fn_name="__ehir_rt_str_concat",
+                generics=[],
+                args=[base, sep],
+            )
+        )
+        body.append(
+            Instruction_call(
+                var_out=with_id,
+                fn_name="__ehir_rt_str_concat",
+                generics=[],
+                args=[with_sep, id_value],
+            )
+        )
+        nl = self._emit_debug_message(body, "\n", f"{prefix}_nl")
+        body.append(
+            Instruction_call(
+                var_out=final,
+                fn_name="__ehir_rt_str_concat",
+                generics=[],
+                args=[with_id, nl],
+            )
+        )
+        return final
 
     def _emit_pass0_child(self, body: list, child: TypedVariable, prefix: str) -> None:
         self._emit_ref_count_add_for_box(body, child, -1, prefix)

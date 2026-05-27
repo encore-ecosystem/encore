@@ -275,6 +275,8 @@ class Lexer:
                 self._append_token(TokenType.KW_HREALLOC)
             case "hfree":
                 self._append_token(TokenType.KW_HFREE)
+            case "drop":
+                self._append_token(TokenType.KW_DROP)
             case _:
                 self._append_token(TokenType.IDENTIFIER)
 
