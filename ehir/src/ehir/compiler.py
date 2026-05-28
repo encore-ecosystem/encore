@@ -435,6 +435,8 @@ class EHIR_ProjectCompiler:
             return self._is_concrete_type(typ.pointee, known_type_names)
         if isinstance(typ, PrimitiveType):
             return True
+        if typ.name == "dyn":
+            return len(typ.generics) == 1
         if typ.generics and not all(self._is_concrete_type(generic, known_type_names) for generic in typ.generics):
             return False
         builtin_scalar_names = {"void", "str", "char"}

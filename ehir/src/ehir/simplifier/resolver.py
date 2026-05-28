@@ -145,7 +145,7 @@ class Resolver:
 
     def _validate_impl_coherence(self) -> None:
         seen_impl_keys: set[tuple[str, str]] = set()
-        seen_impl_templates: list[tuple[str, Type]] = []
+        seen_impl_templates: list[tuple[str, Type, set[str]]] = []
         for impl in self.impls:
             method_names = [method.name for method in impl.methods]
             duplicates = {name for name in method_names if method_names.count(name) > 1}
@@ -188,10 +188,16 @@ class Resolver:
                 )
             seen_impl_keys.add(key)
             resolved_for = self._resolve_type(impl.for_type)
-            for seen_trait, seen_for in seen_impl_templates:
+            current_generic_vars = {generic.name for generic in impl.generics}
+            for seen_trait, seen_for, seen_generic_vars in seen_impl_templates:
                 if seen_trait != trait_decl.name:
                     continue
-                if self._types_overlap(seen_for, resolved_for):
+                if self._types_overlap(
+                    seen_for,
+                    resolved_for,
+                    left_vars=seen_generic_vars,
+                    right_vars=current_generic_vars,
+                ):
                     raise EhirCompileError(
                         (
                             f"Conflicting trait impl: '{trait_decl.name}' has overlapping targets "
@@ -199,11 +205,9 @@ class Resolver:
                         ),
                         code="EHIR1106",
                     )
-            seen_impl_templates.append((trait_decl.name, resolved_for))
+            seen_impl_templates.append((trait_decl.name, resolved_for, current_generic_vars))
 
-    def _types_overlap(self, left: Type, right: Type) -> bool:
-        left_vars = self._collect_generic_names(left)
-        right_vars = self._collect_generic_names(right)
+    def _types_overlap(self, left: Type, right: Type, *, left_vars: set[str], right_vars: set[str]) -> bool:
         return self._unify_type_templates(
             left,
             right,
@@ -212,14 +216,6 @@ class Resolver:
             left_subst={},
             right_subst={},
         )
-
-    def _collect_generic_names(self, typ: Type) -> set[str]:
-        names: set[str] = set()
-        if not typ.generics and self._is_placeholder_type_name(typ.name):
-            names.add(typ.name)
-        for generic in typ.generics:
-            names |= self._collect_generic_names(generic)
-        return names
 
     def _unify_type_templates(
         self,
@@ -346,7 +342,7 @@ class Resolver:
                 raise EhirCompileError(
                     f"dyn for generic trait '{trait_decl.name}' is not supported ({context})", code="EHIR1302"
                 )
-            for method in trait_decl.methods:
+            for method in self._trait_methods_with_parents(trait_decl.name):
                 if method.generics:
                     raise EhirCompileError(
                         f"Trait '{trait_decl.name}' is not object-safe: method '{method.name}' is generic",
@@ -383,10 +379,12 @@ class Resolver:
 
     def _trait_method_names_with_parents(self, trait_name: str) -> set[str]:
         result: set[str] = set()
-        stack = [trait_name]
+        canonical = self._canonical_trait_name(trait_name) or trait_name
+        stack = [canonical]
         seen: set[str] = set()
         while stack:
             current = stack.pop()
+            current = self._canonical_trait_name(current) or current
             if current in seen:
                 continue
             seen.add(current)
@@ -397,13 +395,41 @@ class Resolver:
             stack.extend(self._trait_parents.get(current, []))
         return result
 
+    def _trait_methods_with_parents(self, trait_name: str) -> list:
+        methods_by_name: dict[str, object] = {}
+        canonical = self._canonical_trait_name(trait_name) or trait_name
+        stack = [canonical]
+        seen: set[str] = set()
+        while stack:
+            current = stack.pop()
+            current = self._canonical_trait_name(current) or current
+            if current in seen:
+                continue
+            seen.add(current)
+            trait = self.traits.get(current)
+            if trait is None:
+                continue
+            for method in trait.methods:
+                methods_by_name.setdefault(method.name, method)
+            stack.extend(self._trait_parents.get(current, []))
+        return list(methods_by_name.values())
+
+    def _find_trait_method_with_parents(self, trait_name: str, method_name: str):
+        for method in self._trait_methods_with_parents(trait_name):
+            if method.name == method_name:
+                return method
+        return None
+
     def _trait_is_descendant_of(self, child: str, parent: str) -> bool:
+        child = self._canonical_trait_name(child) or child
+        parent = self._canonical_trait_name(parent) or parent
         if child == parent:
             return True
         stack = list(self._trait_parents.get(child, []))
         seen: set[str] = set()
         while stack:
             current = stack.pop()
+            current = self._canonical_trait_name(current) or current
             if current in seen:
                 continue
             if current == parent:
@@ -411,6 +437,15 @@ class Resolver:
             seen.add(current)
             stack.extend(self._trait_parents.get(current, []))
         return False
+
+    def _canonical_trait_name(self, name: str) -> str | None:
+        if name in self.traits:
+            return name
+        short = name.split("::")[-1]
+        matches = [trait_name for trait_name in self.traits if trait_name.split("::")[-1] == short]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     def _expand_inherent_impl_methods(self, ast: list[Derective]) -> None:
         fn_names = {d.name for d in ast if isinstance(d, (Derective_fn, Derective_extern_fn))}
@@ -745,7 +780,7 @@ class Resolver:
                 )
             if trait_decl is None:
                 raise EhirCompileError(f"Unknown trait '{trait_name}' in dyn dispatch", code="EHIR1301")
-            trait_method = next((m for m in trait_decl.methods if m.name == method_name), None)
+            trait_method = self._find_trait_method_with_parents(trait_decl.name, method_name)
             if trait_method is None:
                 raise EhirCompileError(
                     f"Unknown method '{method_name}' for trait '{trait_decl.name}'",
@@ -918,14 +953,18 @@ class Resolver:
                             f"Unknown trait '{dyn_trait_name}' in dyn dispatch receiver",
                             code="EHIR1301",
                         )
-                    owner_short = owner_base.name.split("::")[-1]
-                    trait_short = trait_decl.name.split("::")[-1]
-                    if owner_short != trait_short and owner_base.name != trait_decl.name:
+                    owner_name = owner_base.name
+                    owner_full = owner_name if owner_name in self.traits else next(
+                        (name for name in self.traits if name.split("::")[-1] == owner_name),
+                        owner_name,
+                    )
+                    owner_canonical = self._canonical_trait_name(owner_full)
+                    if owner_canonical is None or not self._trait_is_descendant_of(trait_decl.name, owner_canonical):
                         raise EhirCompileError(
                             f"Trait call '{instr.fn_name}' does not match receiver dyn {trait_decl.name}",
                             code="EHIR1308",
                         )
-                    trait_method = next((m for m in trait_decl.methods if m.name == method_name), None)
+                    trait_method = self._find_trait_method_with_parents(trait_decl.name, method_name)
                     if trait_method is None:
                         raise EhirCompileError(
                             f"Unknown method '{method_name}' for trait '{trait_decl.name}'",

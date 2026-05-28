@@ -78,6 +78,32 @@ A backend that claims EHIR compatibility must provide these symbols with compati
 `drop/cfree` graph semantics are language-level.  
 Runtime ABI does not perform semantic ownership analysis; it only executes the primitive operations requested by lowered code.
 
+## dyn Trait ABI (fat pointer + vtable)
+
+Current EHIR lowering for `dyn Trait` uses a uniform trait-object ABI:
+
+1. Runtime representation of `dyn Trait`:
+   - `data_ptr: i8*`
+   - `vtable_ptr: i8*`
+
+2. `data_ptr` points to heap storage containing a concrete value payload.
+
+3. `vtable_ptr` points to a trait-specific vtable object:
+   - one slot per trait method,
+   - each slot stores an erased function pointer (`i8*`).
+
+4. Slot order is deterministic and backend-defined by trait method order contract used during lowering.
+
+5. Dynamic dispatch:
+   - lower `Trait::method(dyn_obj, ...)` to dyn-dispatch path,
+   - read function pointer from method slot,
+   - cast slot pointer to concrete call signature,
+   - indirect-call with `self` reconstructed from `data_ptr`.
+
+6. Null/uninitialized vtable slot is a hard runtime failure (`trap`), not silent fallback.
+
+7. Object-safety remains a language-level check in EHIR (before backend codegen).
+
 ## Compatibility policy
 
 Backend updates must preserve this ABI for the same major EHIR version.  
