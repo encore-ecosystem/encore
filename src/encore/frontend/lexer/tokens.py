@@ -38,6 +38,7 @@ class TokenType(Enum):
     KW_EXTERN = auto()
     KW_UNSAFE = auto()
     KW_EHIR = auto()
+    KW_MACRO_RULES = auto()
 
     SCOPE = auto()
 
@@ -81,6 +82,7 @@ class TokenType(Enum):
     DECREMENT = auto()
     QUESTION = auto()
     HASH = auto()
+    DOLLAR = auto()
 
     ARROW = auto()
     FAT_ARROW = auto()

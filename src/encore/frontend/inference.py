@@ -516,6 +516,11 @@ class TypeInferer:
         seen: set[str] | None = None,
     ) -> s.FunctionSignature | None:
         trait = self._traits.get(trait_name)
+        if trait is None and "::" not in trait_name:
+            matches = [name for name in self._traits if name.endswith(f"::{trait_name}")]
+            if len(matches) == 1:
+                trait_name = matches[0]
+                trait = self._traits.get(trait_name)
         if trait is None:
             return None
 
@@ -860,6 +865,16 @@ class TypeInferer:
                 raise TypeError(f"Type mismatch: {expected_type} != {ok_type}")
             return ok_type
 
+        if isinstance(expr, s.Expression_Cast):
+            cast_call = s.Expression_MethodCall(
+                receiver=expr.expr,
+                method="cast",
+                generics=[],
+                args=[],
+            )
+            self._infer_expression(cast_call, env, expr.target, mutable_env)
+            return expr.target
+
         if isinstance(expr, s.Expression_Parenthesized):
             return self._infer_expression(expr.expr, env, expected_type, mutable_env)
 
@@ -1077,6 +1092,7 @@ class TypeInferer:
             return lhs_type or expected_type or rhs_type
 
         return None
+
 
     def _infer_enum_call(
         self,
