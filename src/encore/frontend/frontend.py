@@ -14,6 +14,7 @@ from ehir import EHIR_Frontend
 from encore import ENCORE_CACHE_DIR
 from encore.frontend.inference import TypeInferer
 from encore.frontend.lexer import Lexer
+from encore.frontend.macro_expander import MacroExpander
 from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
 from encore.frontend.translator import Translator
@@ -76,6 +77,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
     _dependency_cache: dict[Path, dict[str, Path]] = field(default_factory=dict)
     _lexer: Lexer = field(default_factory=lambda: Lexer())
     _parser: Parser = field(default_factory=lambda: Parser())
+    _macro_expander: MacroExpander = field(default_factory=lambda: MacroExpander())
 
     def get_module_by_id(self, id: Path) -> EHIR_Module:
         if self.on_module_load is not None:
@@ -156,6 +158,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         source_text = id.read_text()
         try:
             tokens = self._lexer.parse(list(source_text))
+            tokens = self._macro_expander.expand(tokens)
             ast = self._parser.parse(tokens, module_id=id, source_text=source_text)
         except Exception as exc:
             raise with_diagnostic_context(exc, stage="parse", module_id=id, source_text=source_text) from exc
@@ -168,26 +171,35 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         manifest = self._load_manifest(project_root)
         dependency_roots = self._get_dependency_roots(project_root)
         prelude_prefix: list[str] | None = None
+        cast_prefix: list[str] | None = None
 
         if manifest.project.name == "core":
             # Do not inject prelude into core::ops itself.
             core_ops_mod = (project_root / "src" / "ops" / "mod.enq").resolve()
-            if id.resolve() == core_ops_mod:
-                return ast
-            prelude_prefix = ["refrain", "ops"]
+            core_cast_mod = (project_root / "src" / "cast" / "mod.enq").resolve()
+            if id.resolve() != core_ops_mod:
+                prelude_prefix = ["refrain", "ops"]
+            if id.resolve() != core_cast_mod:
+                cast_prefix = ["refrain", "cast"]
         elif manifest.project.name == "std":
             # Do not inject prelude into std::ops shim itself.
             std_ops_mod = (project_root / "src" / "ops" / "mod.enq").resolve()
-            if id.resolve() == std_ops_mod:
-                return ast
-            prelude_prefix = ["core", "ops"] if "core" in dependency_roots else ["refrain", "ops"]
+            std_cast_mod = (project_root / "src" / "cast" / "mod.enq").resolve()
+            if id.resolve() != std_ops_mod:
+                prelude_prefix = ["core", "ops"] if "core" in dependency_roots else ["refrain", "ops"]
+            if id.resolve() != std_cast_mod:
+                cast_prefix = ["core", "cast"] if "core" in dependency_roots else ["refrain", "cast"]
         elif "std" in dependency_roots:
             prelude_prefix = ["std", "ops"]
+            cast_prefix = ["std", "cast"]
         elif "core" in dependency_roots:
             prelude_prefix = ["core", "ops"]
+            cast_prefix = ["core", "cast"]
         else:
             return ast
 
+        has_ops_glob = False
+        has_cast_glob = False
         for statement in ast:
             if not isinstance(statement, s.Statement_Import):
                 continue
@@ -195,21 +207,42 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                 if request.kind != "glob":
                     continue
                 if list(request.path) in (["std", "ops"], ["core", "ops"], ["refrain", "ops"]):
-                    return ast
+                    has_ops_glob = True
+                if list(request.path) in (["std", "cast"], ["core", "cast"], ["refrain", "cast"]):
+                    has_cast_glob = True
 
-        prelude_import = s.Statement_Import(
-            is_public=False,
-            pair=s.Statement_Import.ImportPair(
-                src=prelude_prefix[0],
-                dst=[
-                    s.Statement_Import.ImportPair(
-                        src=prelude_prefix[1],
-                        dst=[s.Statement_Import.ImportPair(src="*", dst=[], kind=s.Statement_Import.ImportKind.GLOB)],
-                    )
-                ],
-            ),
-        )
-        return [prelude_import, *ast]
+        injected: list[s.Statement] = []
+        if prelude_prefix is not None and not has_ops_glob:
+            injected.append(
+                s.Statement_Import(
+                    is_public=False,
+                    pair=s.Statement_Import.ImportPair(
+                        src=prelude_prefix[0],
+                        dst=[
+                            s.Statement_Import.ImportPair(
+                                src=prelude_prefix[1],
+                                dst=[s.Statement_Import.ImportPair(src="*", dst=[], kind=s.Statement_Import.ImportKind.GLOB)],
+                            )
+                        ],
+                    ),
+                )
+            )
+        if cast_prefix is not None and not has_cast_glob:
+            injected.append(
+                s.Statement_Import(
+                    is_public=False,
+                    pair=s.Statement_Import.ImportPair(
+                        src=cast_prefix[0],
+                        dst=[
+                            s.Statement_Import.ImportPair(
+                                src=cast_prefix[1],
+                                dst=[s.Statement_Import.ImportPair(src="*", dst=[], kind=s.Statement_Import.ImportKind.GLOB)],
+                            )
+                        ],
+                    ),
+                )
+            )
+        return [*injected, *ast] if injected else ast
 
     def _collect_imported_declarations(self, id: Path, ast: list[s.Statement]) -> list[ImportedTopLevelDeclaration]:
         declarations: list[ImportedTopLevelDeclaration] = []

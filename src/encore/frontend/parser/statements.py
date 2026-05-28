@@ -723,6 +723,15 @@ class Expression_Try(Statement_Expression):
         return f"{self.expr}?"
 
 
+@dataclass
+class Expression_Cast(Statement_Expression):
+    expr: Statement_Expression
+    target: Type
+
+    def __repr__(self) -> str:
+        return f"{self.expr} as {self.target}"
+
+
 # =============
 @dataclass
 class Expression_Primary(Statement_Expression):

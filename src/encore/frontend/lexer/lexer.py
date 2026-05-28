@@ -182,6 +182,8 @@ class Lexer(ParserBase[str, LexerToken]):
                     self._consume_and_push(TokenType.QUESTION)
                 case "#":
                     self._consume_and_push(TokenType.HASH)
+                case "$":
+                    self._consume_and_push(TokenType.DOLLAR)
 
                 case '"':
                     self._consume()
@@ -257,6 +259,7 @@ class Lexer(ParserBase[str, LexerToken]):
             "extern": TokenType.KW_EXTERN,
             "unsafe": TokenType.KW_UNSAFE,
             "ehir": TokenType.KW_EHIR,
+            "macro_rules": TokenType.KW_MACRO_RULES,
             "not": TokenType.BANG,
             "true": TokenType.BOOLEAN,
             "false": TokenType.BOOLEAN,

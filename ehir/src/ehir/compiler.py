@@ -237,7 +237,10 @@ class EHIR_ProjectCompiler:
     def _directive_identity(self, directive: Derective) -> tuple[type, str]:
         if isinstance(directive, Derective_impl):
             trait_name = directive.trait_name or ""
-            return (type(directive), f"{trait_name}::{directive.for_type}")
+            trait_args_suffix = ""
+            if directive.trait_args:
+                trait_args_suffix = "[" + ",".join(self._mangle_type_name(arg) for arg in directive.trait_args) + "]"
+            return (type(directive), f"{trait_name}{trait_args_suffix}::{directive.for_type}")
         return (type(directive), getattr(directive, "name", ""))
 
     def _deduplicate_directives(self, directives: list[Derective]) -> list[Derective]:
@@ -276,6 +279,10 @@ class EHIR_ProjectCompiler:
                         method_name = lifted.name
                         if directive.trait_name is not None:
                             suffix = self._mangle_type_template_name(directive.for_type)
+                            if directive.trait_args:
+                                trait_suffix = "_".join(self._mangle_type_template_name(arg) for arg in directive.trait_args)
+                                if trait_suffix:
+                                    suffix = f"{suffix}__{trait_suffix}" if suffix else trait_suffix
                             if suffix:
                                 method_name = f"{method_name}__{suffix}"
                         lifted.name = f"{owner}::{method_name}"

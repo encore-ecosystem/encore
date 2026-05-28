@@ -103,6 +103,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
     def _parse(self) -> list[s.Statement]:
         self._parsing_match_header = False
         self._parsing_control_flow_header = False
+        self._parsing_with_binding_expr = False
         self._ehir_parser = EHIR_Parser()
         while not self._is_at_end():
             self._parse_top_level()
@@ -510,7 +511,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     def _parse_with(self) -> s.Statement_With:
         self._safe_consume(TokenType.KW_WITH)
+        self._parsing_with_binding_expr = True
         expr = self._parse_expression()
+        self._parsing_with_binding_expr = False
         self._safe_consume(TokenType.KW_AS)
         name = self._safe_consume(TokenType.IDENTIFIER).value
         body = self._parse_block()
@@ -777,15 +780,23 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         return left
 
     def _parse_multiplicative(self) -> s.Statement_Expression:
-        left = self._parse_unary()
+        left = self._parse_cast()
         while True:
             operator = self._peek_curr()
             if operator.type not in {TokenType.ASTERISK, TokenType.SLASH, TokenType.PERCENT}:
                 break
             self._consume()
-            right = self._parse_unary()
+            right = self._parse_cast()
             left = s.BinaryOperation_Multiplicative(lhs=left, operator=operator.value, rhs=right)
         return left
+
+    def _parse_cast(self) -> s.Statement_Expression:
+        expr = self._parse_unary()
+        while self._peek_curr().type == TokenType.KW_AS and not self._parsing_with_binding_expr:
+            self._safe_consume(TokenType.KW_AS)
+            target = self._parse_type()
+            expr = s.Expression_Cast(expr=expr, target=target)
+        return expr
 
     def _parse_unary(self) -> s.Statement_Expression:
         tok = self._peek_curr()
