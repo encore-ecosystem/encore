@@ -60,10 +60,6 @@ class MatchValidatorPass:
                             )
                         seen.add(case.variant)
 
-                    if seen == variant_names:
-                        raise EhirCompileError(
-                            f"Unreachable match default branch for enum '{enum_decl.name}' "
-                            f"in fn '{directive.name}' block '{block.name}'",
-                            code="EHIR2006",
-                        )
+                    # Default branch remains valid even when all variants are listed.
+                    # It is intentionally allowed as a conservative fallback path.
         return ast
