@@ -60,6 +60,7 @@ class MatchValidatorPass:
                             )
                         seen.add(case.variant)
 
-                    # Default branch remains valid even when all variants are listed.
-                    # It is intentionally allowed as a conservative fallback path.
+                    # EHIR match always has a default label, even for exhaustive matches.
+                    # Whether that label came from a source-level wildcard or from IR lowering
+                    # is not represented here, so unreachable-default diagnostics belong above EHIR.
         return ast

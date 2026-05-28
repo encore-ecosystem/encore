@@ -144,8 +144,8 @@ class Resolver:
         return ast
 
     def _validate_impl_coherence(self) -> None:
-        seen_impl_keys: set[tuple[str, str]] = set()
-        seen_impl_templates: list[tuple[str, Type, set[str]]] = []
+        seen_impl_keys: set[tuple[str, str, str]] = set()
+        seen_impl_templates: list[tuple[str, tuple[str, ...], Type, set[str]]] = []
         for impl in self.impls:
             method_names = [method.name for method in impl.methods]
             duplicates = {name for name in method_names if method_names.count(name) > 1}
@@ -181,16 +181,17 @@ class Resolver:
                     code="EHIR1104",
                 )
 
-            key = (trait_decl.name, str(self._resolve_type(impl.for_type)))
+            resolved_trait_args = tuple(str(self._resolve_type(arg)) for arg in impl.trait_args)
+            key = (trait_decl.name, ",".join(resolved_trait_args), str(self._resolve_type(impl.for_type)))
             if key in seen_impl_keys:
                 raise EhirCompileError(
-                    f"Conflicting trait impl: '{trait_decl.name}' already implemented for '{key[1]}'", code="EHIR1105"
+                    f"Conflicting trait impl: '{trait_decl.name}' already implemented for '{key[2]}'", code="EHIR1105"
                 )
             seen_impl_keys.add(key)
             resolved_for = self._resolve_type(impl.for_type)
             current_generic_vars = {generic.name for generic in impl.generics}
-            for seen_trait, seen_for, seen_generic_vars in seen_impl_templates:
-                if seen_trait != trait_decl.name:
+            for seen_trait, seen_trait_args, seen_for, seen_generic_vars in seen_impl_templates:
+                if seen_trait != trait_decl.name or seen_trait_args != resolved_trait_args:
                     continue
                 if self._types_overlap(
                     seen_for,
@@ -205,7 +206,7 @@ class Resolver:
                         ),
                         code="EHIR1106",
                     )
-            seen_impl_templates.append((trait_decl.name, resolved_for, current_generic_vars))
+            seen_impl_templates.append((trait_decl.name, resolved_trait_args, resolved_for, current_generic_vars))
 
     def _types_overlap(self, left: Type, right: Type, *, left_vars: set[str], right_vars: set[str]) -> bool:
         return self._unify_type_templates(
@@ -993,6 +994,13 @@ class Resolver:
                     mapping: dict[str, Type] = {}
                     if not self._bind_generic_from_types(impl.for_type, recv_base, mapping):
                         continue
+                    if instr.generics:
+                        expected_trait_args = [self._resolve_type(g) for g in instr.generics]
+                        resolved_trait_args = [self._resolve_type(self._replace_type(arg, mapping, recv_base)) for arg in impl.trait_args]
+                        if len(expected_trait_args) != len(resolved_trait_args):
+                            continue
+                        if any(str(l) != str(r) for l, r in zip(expected_trait_args, resolved_trait_args, strict=False)):
+                            continue
                     method = next((m for m in impl.methods if m.name == method_name), None)
                     if method is None:
                         continue
@@ -1101,6 +1109,10 @@ class Resolver:
             if impl.generics or method.generics
             else self._mangle_type_name(recv_type)
         )
+        if impl.trait_args:
+            trait_suffix = "_".join(self._mangle_type_template_name(arg) for arg in impl.trait_args)
+            if trait_suffix:
+                suffix = f"{suffix}__{trait_suffix}" if suffix else trait_suffix
         if not suffix:
             return method.name
         return f"{method.name}__{suffix}"

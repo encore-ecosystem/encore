@@ -41,6 +41,7 @@ from ehir.core.variable import Parameter, Variable
 
 from encore.frontend.inference import TypeInferer
 from encore.frontend.lexer import Lexer
+from encore.frontend.macro_expander import MacroExpander
 from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
 from encore.frontend.parser.statements import Block
@@ -193,6 +194,7 @@ class Translator:
 
     def __init__(self):
         self._lexer = Lexer()
+        self._macro_expander = MacroExpander()
         self._parser = Parser()
         self._reset_state()
 
@@ -234,6 +236,7 @@ class Translator:
     def run(self, program: str) -> EHIR_Module:
         self._reset_state()
         tokens = self._lexer.parse(list(program))
+        tokens = self._macro_expander.expand(tokens)
         ast = self._parser.parse(tokens)
         TypeInferer().infer(ast)
         return self.translate_ast(ast)
@@ -442,6 +445,11 @@ class Translator:
         seen: set[str] | None = None,
     ) -> s.FunctionSignature | None:
         trait = self._traits.get(trait_name)
+        if trait is None and "::" not in trait_name:
+            matches = [name for name in self._traits if name.endswith(f"::{trait_name}")]
+            if len(matches) == 1:
+                trait_name = matches[0]
+                trait = self._traits.get(trait_name)
         if trait is None:
             return None
 
@@ -2153,6 +2161,17 @@ class Translator:
         elif isinstance(expr, s.Expression_Try):
             return self._translate_try_expression(expr, name=name)
 
+        elif isinstance(expr, s.Expression_Cast):
+            cast_call = s.Expression_MethodCall(
+                receiver=expr.expr,
+                method="cast",
+                generics=[expr.target],
+                args=[],
+            )
+            out = self._translate_expression(cast_call, name=name, expected_type=expr.target)
+            out.var_out.type = self._translate_type(expr.target)
+            return out
+
         elif isinstance(expr, s.Expression_Parenthesized):
             return self._translate_expression(expr.expr, name=name, expected_type=expected_type)
 
@@ -2381,6 +2400,7 @@ class Translator:
             return call
 
         raise NotImplementedError(f"Translation for expression type {type(expr)}:{expr} is not implemented.")
+
 
     def _translate_short_circuit_logical(
         self,
