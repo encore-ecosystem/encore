@@ -1,7 +1,7 @@
 import hashlib
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, fields, field, is_dataclass
 from importlib.metadata import version
 from pathlib import Path
 
@@ -33,6 +33,8 @@ from ehir.simplifier import (
     Deallocator,
     Downgrader,
     DropLoweringPass,
+    InstanceCallLoweringPass,
+    MatchValidatorPass,
     MonomorphizationPass,
     Normalizer,
     ReferenceLoweringPass,
@@ -50,12 +52,17 @@ class TreeNode:
     dependencies: set[Path] = field(default_factory=set)
 
 
+class CompileStageError(RuntimeError):
+    pass
+
+
 @dataclass
 class EHIR_ProjectCompiler:
     frontend: EHIR_Frontend
     backend: EHIR_Backend
     cache_dir: Path | None = None
     use_cache: bool = True
+    trace_cfree: bool = False
     on_refrain: Callable[[Refrain], None] | None = None
     refrains: dict[str, Refrain] = field(default_factory=dict)
     tree: dict[Path, TreeNode] = field(default_factory=dict)
@@ -124,26 +131,46 @@ class EHIR_ProjectCompiler:
             ast=self._merge_builtin_directives(self._builtin_directives(), deepcopy(node.module.ast)),
         )
 
-        module.ast = self._lift_impl_methods(module.ast)
-        module.ast = Resolver().run(module.ast)
+        module.ast = self._run_stage("lift_impl_methods", refrain, lambda: self._lift_impl_methods(module.ast))
+        module.ast = self._run_stage("deduplicate_after_lift", refrain, lambda: self._deduplicate_directives(module.ast))
+        module.ast = self._run_stage(
+            "instance_call_lowering_pre_resolve", refrain, lambda: InstanceCallLoweringPass().run(module.ast)
+        )
+        module.ast = self._run_stage(
+            "deduplicate_after_instance_call_lowering_pre_resolve",
+            refrain,
+            lambda: self._deduplicate_directives(module.ast),
+        )
+        module.ast = self._run_stage("resolve_1", refrain, lambda: Resolver().run(module.ast))
+        module.ast = self._run_stage("deduplicate_after_resolve_1", refrain, lambda: self._deduplicate_directives(module.ast))
         self._emit_ehir_stage(refrain.name, "post_resolve", module.ast)
-        module.ast = ReferenceLoweringPass().run(module.ast)
-        module.ast = MonomorphizationPass().run(module.ast)
-        module.ast = Resolver().run(module.ast)
+        module.ast = self._run_stage("reference_lowering", refrain, lambda: ReferenceLoweringPass().run(module.ast))
+        module.ast = self._run_stage(
+            "deduplicate_after_reference_lowering", refrain, lambda: self._deduplicate_directives(module.ast)
+        )
+        module.ast = self._run_stage("monomorphization", refrain, lambda: MonomorphizationPass().run(module.ast))
+        module.ast = self._run_stage(
+            "deduplicate_after_monomorphization", refrain, lambda: self._deduplicate_directives(module.ast)
+        )
+        module.ast = self._run_stage("resolve_2", refrain, lambda: Resolver().run(module.ast))
+        module.ast = self._run_stage("deduplicate_after_resolve_2", refrain, lambda: self._deduplicate_directives(module.ast))
+        module.ast = self._run_stage("match_validator", refrain, lambda: MatchValidatorPass().run(module.ast))
         self._emit_ehir_stage(refrain.name, "post_monomorphize", module.ast)
-        module.ast = AutoDropPass().run(module.ast)
-        module.ast = AutoRetainPass().run(module.ast)
-        module.ast = RetainInsertionPass().run(module.ast)
+        module.ast = self._run_stage("autodrop", refrain, lambda: AutoDropPass(trace_cfree=self.trace_cfree).run(module.ast))
+        module.ast = self._run_stage("autoretain", refrain, lambda: AutoRetainPass().run(module.ast))
+        module.ast = self._run_stage("retain_insertion", refrain, lambda: RetainInsertionPass().run(module.ast))
         # TODO: re-enable after migrating core/std to explicit safety attrs.
         # module.ast = SafetyValidator().run(module.ast)
-        module.ast = Normalizer().run(module.ast)
-        module.ast = Deallocator().run(module.ast)
-        module.ast = DropLoweringPass().run(module.ast)
+        module.ast = self._run_stage("normalizer", refrain, lambda: Normalizer().run(module.ast))
+        module.ast = self._run_stage("deallocator", refrain, lambda: Deallocator().run(module.ast))
+        module.ast = self._run_stage("drop_lowering", refrain, lambda: DropLoweringPass().run(module.ast))
         self._emit_ehir_stage(refrain.name, "pre_downgrade", module.ast)
-        module.ast = Downgrader().run(module.ast)
+        module.ast = self._run_stage("downgrader", refrain, lambda: Downgrader().run(module.ast))
         self._emit_ehir_stage(refrain.name, "post_downgrade", module.ast)
         if refrain.type == Refrain.TargetType.EXECUTABLE:
-            module.ast = UnneededSymbolsStripper().run(module.ast, keep_public_api=False)
+            module.ast = self._run_stage(
+                "stripper", refrain, lambda: UnneededSymbolsStripper().run(module.ast, keep_public_api=False)
+            )
         module.ast = [
             directive
             for directive in module.ast
@@ -165,7 +192,7 @@ class EHIR_ProjectCompiler:
         module.ast = [directive for directive in module.ast if not isinstance(directive, Derective_typealias)]
         module.ast = self._deduplicate_directives(module.ast)
         self._emit_ehir_stage(refrain.name, "pre_postprocess", module.ast)
-        processed_mod = Postprocessor().run(module)
+        processed_mod = self._run_stage("postprocessor", refrain, lambda: Postprocessor().run(module))
 
         compiled_refrain = CompiledRefrain(
             name=refrain.name,
@@ -180,6 +207,14 @@ class EHIR_ProjectCompiler:
         self._cache.store(compiled_refrain)
         self.compiled_refrains[refrain.name] = compiled_refrain
         return compiled_refrain
+
+    def _run_stage(self, stage: str, refrain: Refrain, action):
+        try:
+            return action()
+        except Exception as exc:
+            raise CompileStageError(
+                f"Compile stage '{stage}' failed for refrain '{refrain.name}' ({refrain.path}): {exc}"
+            ) from exc
 
     def _merge_builtin_directives(
         self,
@@ -228,13 +263,15 @@ class EHIR_ProjectCompiler:
         for directive in ast:
             if not isinstance(directive, Derective_impl):
                 continue
+            self._replace_self(directive.methods, directive.for_type)
             for method in directive.methods:
                 if not isinstance(method, Derective_fn):
                     continue
                 lifted = deepcopy(method)
                 lifted.generics = self._merge_generics(directive.generics, lifted.generics)
+                lifted = self._replace_self(lifted, directive.for_type)
                 if "::" not in lifted.name:
-                    owner = directive.trait_name if directive.trait_name else directive.for_type.name
+                    owner = directive.trait_name if directive.trait_name else str(directive.for_type)
                     if owner:
                         method_name = lifted.name
                         if directive.trait_name is not None:
@@ -249,6 +286,25 @@ class EHIR_ProjectCompiler:
         if lifted_methods:
             return [*ast, *lifted_methods]
         return ast
+
+    def _replace_self(self, value, self_type: Type):
+        if isinstance(value, Type):
+            if isinstance(value, Pointer):
+                return Pointer(self._replace_self(value.pointee, self_type))
+            if isinstance(value, Reference):
+                return Reference(self._replace_self(value.pointee, self_type))
+            if value.name == "Self" and not value.generics:
+                return deepcopy(self_type)
+            return Type(value.name, [self._replace_self(generic, self_type) for generic in value.generics])
+        if isinstance(value, list):
+            for i, item in enumerate(value):
+                value[i] = self._replace_self(item, self_type)
+            return value
+        if not is_dataclass(value):
+            return value
+        for f in fields(value):
+            setattr(value, f.name, self._replace_self(getattr(value, f.name), self_type))
+        return value
 
     def _merge_generics(self, *generic_groups: list[Type]) -> list[Type]:
         merged: list[Type] = []
@@ -310,7 +366,7 @@ class EHIR_ProjectCompiler:
             return
 
         symbol_keys: set[tuple[type, str]] = set()
-        impl_keys: set[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = set()
+        impl_keys: set[str] = set()
         for directive in target_node.module.ast:
             if isinstance(
                 directive,
@@ -325,14 +381,7 @@ class EHIR_ProjectCompiler:
             ):
                 symbol_keys.add((type(directive), directive.name))
             elif isinstance(directive, Derective_impl):
-                impl_keys.add(
-                    (
-                        directive.trait_name or "",
-                        str(directive.for_type),
-                        tuple(str(arg) for arg in directive.trait_args),
-                        tuple(method.name for method in directive.methods),
-                    )
-                )
+                impl_keys.add(str(directive))
 
         for module_path in module_paths:
             if module_path.resolve() == entrypoint_id.resolve():
@@ -358,12 +407,7 @@ class EHIR_ProjectCompiler:
                         continue
                     symbol_keys.add(key)
                 elif isinstance(directive, Derective_impl):
-                    key = (
-                        directive.trait_name or "",
-                        str(directive.for_type),
-                        tuple(str(arg) for arg in directive.trait_args),
-                        tuple(method.name for method in directive.methods),
-                    )
+                    key = str(directive)
                     if key in impl_keys:
                         continue
                     impl_keys.add(key)
@@ -391,6 +435,8 @@ class EHIR_ProjectCompiler:
             return self._is_concrete_type(typ.pointee, known_type_names)
         if isinstance(typ, PrimitiveType):
             return True
+        if typ.name == "dyn":
+            return len(typ.generics) == 1
         if typ.generics and not all(self._is_concrete_type(generic, known_type_names) for generic in typ.generics):
             return False
         builtin_scalar_names = {"void", "str", "char"}
@@ -426,6 +472,8 @@ class EHIR_ProjectCompiler:
         digest.update(self._compiler_version.encode())
         digest.update(refrain.name.encode())
         digest.update(refrain.type.value.encode())
+        digest.update(b"trace_cfree=")
+        digest.update(b"1" if self.trace_cfree else b"0")
 
         for source_file in source_files:
             resolved_file = source_file.resolve()
@@ -450,7 +498,7 @@ class EHIR_ProjectCompiler:
 
         resolved_ast = []
         resolved_symbols: set[tuple[type, str]] = set()
-        resolved_impls: set[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = set()
+        resolved_impls: set[str] = set()
 
         def append_directive(directive):
             if isinstance(
@@ -469,12 +517,7 @@ class EHIR_ProjectCompiler:
                     return
                 resolved_symbols.add(key)
             elif isinstance(directive, Derective_impl):
-                key = (
-                    directive.trait_name or "",
-                    str(directive.for_type),
-                    tuple(str(arg) for arg in directive.trait_args),
-                    tuple(method.name for method in directive.methods),
-                )
+                key = str(directive)
                 if key in resolved_impls:
                     return
                 resolved_impls.add(key)

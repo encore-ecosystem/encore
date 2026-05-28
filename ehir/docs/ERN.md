@@ -11,3 +11,7 @@ Let $P(v)$ be the set of nodes reachable from $v$, and assume $v \in P(v)$ for a
 Then:
 
 $$ ERN(v) = P(v) - \bigcup_{k \in \overline{P(v)}} P(k) $$
+
+or
+
+$$ ERN(v) = P(v) - \bigcup_{k \in \overline{P(v)}} (P(k) \bigcap P(v)) $$

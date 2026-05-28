@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 
 from ehir.backend.builtin import EHIR_DirectBackend
@@ -6,6 +7,14 @@ from ehir.frontend.builtin import EHIR_DirectFrontend
 
 
 def main():
+    parser = argparse.ArgumentParser(prog="ehir")
+    parser.add_argument(
+        "--trace-cfree",
+        action="store_true",
+        help="Print debug messages right before cfree deallocations.",
+    )
+    args = parser.parse_args()
+
     cwd = Path().resolve()
     target_path = cwd / "target"
     refrains_path = cwd / "refrains"
@@ -13,6 +22,7 @@ def main():
     compiler = EHIR_ProjectCompiler(
         frontend=EHIR_DirectFrontend(),
         backend=EHIR_DirectBackend(target_dir=target_path),
+        trace_cfree=args.trace_cfree,
     )
 
     if refrains_path.exists():

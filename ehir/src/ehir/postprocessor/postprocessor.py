@@ -8,6 +8,7 @@ from ehir.core.instructions import (
     Instruction_and,
     Instruction_br,
     Instruction_call,
+    Instruction_callvoid,
     Instruction_capprim,
     Instruction_cbr,
     Instruction_div,
@@ -49,6 +50,7 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_and,
     ProcessedInstruction_br,
     ProcessedInstruction_call,
+    ProcessedInstruction_callvoid,
     ProcessedInstruction_cbr,
     ProcessedInstruction_div,
     ProcessedInstruction_gep,
@@ -197,6 +199,28 @@ class Postprocessor:
                 var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
                 fn_name=emitted_name,
                 args=args,
+            )
+        if isinstance(instr, Instruction_callvoid):
+            emitted_name = self._emit_symbol_name(instr.fn_name, [arg.type for arg in instr.args])
+            if emitted_name not in self._fn_ret_by_emitted_name:
+                hint = [key for key in self._fn_ret_by_emitted_name if key.startswith(instr.fn_name)][:5]
+                raise AssertionError(
+                    f"Instruction_callvoid has unresolved callee: {instr}; emitted='{emitted_name}'; candidates={hint}"
+                )
+            args = []
+            for arg in instr.args:
+                if arg.type is None:
+                    raise AssertionError(f"Instruction_callvoid has unresolved argument type: {instr}")
+                args.append(TypedVariable(arg.name, arg.type))
+            assign_to = None
+            if instr.assign_to is not None:
+                if instr.assign_to.type is None:
+                    raise AssertionError(f"Instruction_callvoid has unresolved assign target type: {instr}")
+                assign_to = TypedVariable(instr.assign_to.name, instr.assign_to.type)
+            return ProcessedInstruction_callvoid(
+                fn_name=emitted_name,
+                args=args,
+                assign_to=assign_to,
             )
 
         if isinstance(instr, Instruction_capprim):

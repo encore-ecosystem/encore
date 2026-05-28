@@ -21,9 +21,12 @@ class EHIR_DirectFrontend(EHIR_Frontend):
             return self._cache[id]
 
         parser = Parser()
-
-        with Path(id).resolve().open("r") as f:
-            ast = parser.parse(f.read())
+        module_path = Path(id).resolve()
+        try:
+            with module_path.open("r") as f:
+                ast = parser.parse(f.read())
+        except Exception as exc:
+            raise RuntimeError(f"Parse error in {module_path}: {exc}") from exc
 
         mod = EHIR_Module(id, ast)
         self._cache[id] = mod
