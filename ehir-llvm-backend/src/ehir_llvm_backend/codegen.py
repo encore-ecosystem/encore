@@ -16,7 +16,7 @@ from ehir.core.instructions import (
 )
 from ehir.core.primitives import Float, Float_t, Isize, Isize_t, Str, Str_t, Usize, Usize_t
 from ehir.core.primitives.base import Primitive
-from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
+from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type, mangle_type_name
 from ehir.core.variable import TypedVariable
 from ehir.postprocessor import ProcessedModule
 from ehir.postprocessor.derectives import (
@@ -32,6 +32,7 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_add,
     ProcessedInstruction_and,
     ProcessedInstruction_call,
+    ProcessedInstruction_callvoid,
     ProcessedInstruction_div,
     ProcessedInstruction_gep,
     ProcessedInstruction_geq,
@@ -150,9 +151,33 @@ class Codegen:
                 continue
             for block in fn.get_body():
                 for instr in block.body:
-                    if isinstance(instr, ProcessedInstruction_call):
+                    if isinstance(instr, (ProcessedInstruction_call, ProcessedInstruction_callvoid)):
+                        if instr.fn_name.startswith("__dyn_dispatch__"):
+                            payload = instr.fn_name[len("__dyn_dispatch__") :]
+                            if "::" in payload:
+                                trait_name, method_name = payload.rsplit("::", 1)
+                                prefix = f"{trait_name}::{method_name}"
+                                for candidate_name in by_name:
+                                    if not candidate_name.startswith(prefix):
+                                        continue
+                                    tail = candidate_name[len(prefix) :]
+                                    if tail and not tail.startswith("__"):
+                                        continue
+                                    queue.append(candidate_name)
                         queue.append(instr.fn_name)
                 if isinstance(block.term, ProcessedInstruction_call):
+                    if block.term.fn_name.startswith("__dyn_dispatch__"):
+                        payload = block.term.fn_name[len("__dyn_dispatch__") :]
+                        if "::" in payload:
+                            trait_name, method_name = payload.rsplit("::", 1)
+                            prefix = f"{trait_name}::{method_name}"
+                            for candidate_name in by_name:
+                                if not candidate_name.startswith(prefix):
+                                    continue
+                                tail = candidate_name[len(prefix) :]
+                                if tail and not tail.startswith("__"):
+                                    continue
+                                queue.append(candidate_name)
                     queue.append(block.term.fn_name)
         out: set[str] = set()
         for name in enabled:
@@ -336,6 +361,8 @@ class Codegen:
             self._build_shr(instr)
         elif isinstance(instr, ProcessedInstruction_call):
             self._build_call(instr)
+        elif isinstance(instr, ProcessedInstruction_callvoid):
+            self._build_callvoid(instr)
         elif isinstance(instr, ProcessedInstruction_ret):
             self._build_ret(instr)
         elif isinstance(instr, (Instruction_br, ProcessedInstruction_br)):
@@ -393,6 +420,15 @@ class Codegen:
 
         assert instr.var.type is not None
         dst_type = self._build_type(instr.type)
+        if instr.type.name == "dyn" and len(instr.type.generics) == 1:
+            trait_name = instr.type.generics[0].name
+            raw_ptr = self._pack_dyn_payload(value, instr.var.type)
+            vtable_ptr = self._get_dyn_vtable_ptr(trait_name, instr.var.type)
+            dyn_value = ir.Constant(dst_type, ir.Undefined)
+            dyn_value = self.builder.insert_value(dyn_value, raw_ptr, 0, name=f"{instr.var_out.name}.dyn_data")
+            dyn_value = self.builder.insert_value(dyn_value, vtable_ptr, 1, name=f"{instr.var_out.name}.dyn_vtable")
+            self._variables[instr.var_out.name] = dyn_value
+            return dyn_value
 
         # Cast
         ## Same
@@ -957,6 +993,10 @@ class Codegen:
 
     def _build_call(self, instr: ProcessedInstruction_call):
         self._comment_instruction(instr)
+        if instr.fn_name.startswith("__dyn_dispatch__"):
+            result = self._build_dyn_dispatch_call(instr)
+            self._variables[instr.var_out.name] = result
+            return result
         trait_result = self._try_build_trait_op_call(instr)
         if trait_result is not None:
             self._variables[instr.var_out.name] = trait_result
@@ -987,6 +1027,209 @@ class Codegen:
         result = self.builder.call(func, args, name=instr.var_out.name)
         self._variables[instr.var_out.name] = result
         return result
+
+    def _build_dyn_dispatch_call(self, instr: ProcessedInstruction_call):
+        payload = instr.fn_name[len("__dyn_dispatch__") :]
+        if "::" not in payload:
+            raise ValueError(f"Invalid dyn dispatch call name: {instr.fn_name}")
+        trait_name, method_name = payload.rsplit("::", 1)
+        if not instr.args:
+            raise ValueError("dyn dispatch call requires receiver argument")
+
+        recv = self._get_typed_value(instr.args[0])
+        recv_ty = recv.type
+        if isinstance(recv_ty, ir.PointerType) and isinstance(recv_ty.pointee, ir.BaseStructType):
+            recv = self.builder.load(recv, name=f"{instr.args[0].name}.dyn_load")
+            recv_ty = recv.type
+        if not isinstance(recv_ty, ir.BaseStructType) or len(recv_ty.elements) != 2:
+            raise TypeError(f"dyn dispatch receiver has invalid IR type: {recv_ty}")
+
+        data_ptr = self.builder.extract_value(recv, 0, name=f"{instr.args[0].name}.dyn_data_ptr")
+        vtable_ptr = self.builder.extract_value(recv, 1, name=f"{instr.args[0].name}.dyn_vtable_ptr")
+        method_names = self._dyn_trait_methods(trait_name)
+        if method_name not in method_names:
+            raise ValueError(f"No dyn dispatch slot for {trait_name}::{method_name}")
+        slot_index = method_names.index(method_name)
+
+        callee = self._resolve_dyn_callee_from_vtable(
+            trait_name=trait_name,
+            method_name=method_name,
+            slot_index=slot_index,
+            vtable_raw_ptr=vtable_ptr,
+            result_name=instr.var_out.name,
+            receiver_data_ptr=data_ptr,
+            args=instr.args,
+        )
+        return callee
+
+    def _dyn_trait_methods(self, trait_name: str) -> list[str]:
+        methods: set[str] = set()
+        prefix = f"{trait_name}::"
+        for fn in self.module.functions:
+            canonical = self._canonical_by_symbol.get(fn.name, fn.name)
+            if not canonical.startswith(prefix):
+                continue
+            tail = canonical[len(prefix) :]
+            if not tail:
+                continue
+            method = tail.split("__", 1)[0]
+            methods.add(method)
+        return sorted(methods)
+
+    def _collect_dyn_method_candidates(self, trait_name: str, method_name: str) -> list[ir.Function]:
+        out: list[ir.Function] = []
+        prefix = f"{trait_name}::{method_name}"
+        for fn in self.module.functions:
+            canonical = self._canonical_by_symbol.get(fn.name, fn.name)
+            if not canonical.startswith(prefix):
+                continue
+            tail = canonical[len(prefix) :]
+            if tail and not tail.startswith("__"):
+                continue
+            out.append(fn)
+        return out
+
+    def _find_dyn_impl_function(self, trait_name: str, method_name: str, concrete_type: Type) -> ir.Function | None:
+        suffix = mangle_type_name(concrete_type)
+        expected = f"{trait_name}::{method_name}__{suffix}"
+        fallback = f"{trait_name}::{method_name}"
+        for fn in self.module.functions:
+            canonical = self._canonical_by_symbol.get(fn.name, fn.name)
+            if canonical == expected:
+                return fn
+        for fn in self.module.functions:
+            canonical = self._canonical_by_symbol.get(fn.name, fn.name)
+            if canonical == fallback:
+                return fn
+        return None
+
+    def _get_dyn_vtable_type(self, trait_name: str):
+        vtable_name = f"__dyn_vtable_{trait_name.replace('::', '_')}"
+        methods = self._dyn_trait_methods(trait_name)
+        vtable_struct = self.module.context.get_identified_type(vtable_name)
+        if vtable_struct.is_opaque:
+            vtable_struct.set_body(*([ir.IntType(8).as_pointer()] * len(methods)))
+        return vtable_struct, methods
+
+    def _get_dyn_vtable_ptr(self, trait_name: str, concrete_type: Type):
+        vtable_struct, methods = self._get_dyn_vtable_type(trait_name)
+        global_name = f"{vtable_struct.name}__{mangle_type_name(concrete_type)}"
+        existing = self.module.globals.get(global_name)
+        if isinstance(existing, ir.GlobalVariable):
+            return self.builder.bitcast(existing, ir.IntType(8).as_pointer(), name=f"{global_name}.ptr")
+
+        values: list[ir.Constant] = []
+        for method_name in methods:
+            fn = self._find_dyn_impl_function(trait_name, method_name, concrete_type)
+            if fn is None:
+                values.append(ir.Constant(ir.IntType(8).as_pointer(), None))
+            else:
+                values.append(ir.Constant.bitcast(fn, ir.IntType(8).as_pointer()))
+        gv = ir.GlobalVariable(self.module, vtable_struct, name=global_name)
+        gv.global_constant = True
+        gv.linkage = "internal"
+        gv.initializer = ir.Constant(vtable_struct, values)
+        return self.builder.bitcast(gv, ir.IntType(8).as_pointer(), name=f"{global_name}.ptr")
+
+    def _resolve_dyn_callee_from_vtable(
+        self,
+        *,
+        trait_name: str,
+        method_name: str,
+        slot_index: int,
+        vtable_raw_ptr,
+        result_name: str,
+        receiver_data_ptr,
+        args: list[TypedVariable],
+    ):
+        vtable_struct, _ = self._get_dyn_vtable_type(trait_name)
+        vtable_ptr_t = ir.PointerType(vtable_struct)
+        typed_vtable_ptr = self.builder.bitcast(vtable_raw_ptr, vtable_ptr_t, name=f"{result_name}.vt_cast")
+        slot_ptr = self.builder.gep(
+            typed_vtable_ptr,
+            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), slot_index)],
+            name=f"{result_name}.vt_slot_ptr",
+        )
+        fn_raw = self.builder.load(slot_ptr, name=f"{result_name}.vt_fn_raw")
+        null_fn = ir.Constant(fn_raw.type, None)
+        is_null = self.builder.icmp_unsigned("==", fn_raw, null_fn, name=f"{result_name}.vt_null")
+        ok_block = self.builder.function.append_basic_block(f"dyn_vt_ok_{len(self.builder.function.blocks)}")
+        bad_block = self.builder.function.append_basic_block(f"dyn_vt_bad_{len(self.builder.function.blocks)}")
+        self.builder.cbranch(is_null, bad_block, ok_block)
+
+        self.builder.position_at_end(bad_block)
+        trap = self._get_trap_intrinsic()
+        self.builder.call(trap, [])
+        self.builder.unreachable()
+
+        self.builder.position_at_end(ok_block)
+        method_candidates = self._collect_dyn_method_candidates(trait_name, method_name)
+        if not method_candidates:
+            raise ValueError(f"No dyn dispatch candidates found for {trait_name}::{method_name}")
+        proto = method_candidates[0].function_type
+        fn_ptr_t = ir.PointerType(proto)
+        fn_ptr = self.builder.bitcast(fn_raw, fn_ptr_t, name=f"{result_name}.vt_fn")
+
+        call_args = []
+        for arg_index, expected_type in enumerate(proto.args):
+            if arg_index == 0:
+                typed_data_ptr = self.builder.bitcast(
+                    receiver_data_ptr,
+                    ir.PointerType(expected_type),
+                    name=f"{result_name}.dyn_self_ptr",
+                )
+                self_arg = self.builder.load(typed_data_ptr, name=f"{result_name}.dyn_self")
+                call_args.append(self_arg)
+                continue
+            arg = args[arg_index]
+            value = self._get_typed_value(arg)
+            call_args.append(
+                self._coerce_call_arg(
+                    value=value,
+                    expected_type=expected_type,
+                    arg_name=f"{arg.name}_{arg_index}",
+                    source_type=arg.type,
+                )
+            )
+        return self.builder.call(fn_ptr, call_args, name=f"{result_name}.dyn_call")
+
+    def _pack_dyn_payload(self, value, source_type: Type):
+        malloc_func = self._get_malloc_function()
+        byte_size = self._sizeof(source_type)
+        raw_ptr = self.builder.call(malloc_func, [byte_size], name=".dyn_payload_raw")
+        typed_ptr = self.builder.bitcast(raw_ptr, ir.PointerType(value.type), name=".dyn_payload_typed")
+        self.builder.store(value, typed_ptr)
+        return raw_ptr
+
+    def _dyn_struct_name(self, trait_name: str) -> str:
+        return f"__dyn_{trait_name.replace('::', '_')}"
+
+    def _build_callvoid(self, instr: ProcessedInstruction_callvoid):
+        self._comment_instruction(instr)
+        func = self._get_or_declare_called_function_void(instr)
+
+        expected_types = list(func.function_type.args)
+        if len(expected_types) != len(instr.args):
+            raise ValueError(
+                f"Call arg count mismatch for '{instr.fn_name}': {len(instr.args)} != {len(expected_types)}"
+            )
+
+        args = []
+        for index, (expected_type, arg) in enumerate(zip(expected_types, instr.args, strict=True)):
+            value = self._get_typed_value(arg)
+            args.append(
+                self._coerce_call_arg(
+                    value=value,
+                    expected_type=expected_type,
+                    arg_name=f"{arg.name}_{index}",
+                    source_type=arg.type,
+                )
+            )
+        if instr.assign_to is None:
+            self.builder.call(func, args)
+            return
+        result = self.builder.call(func, args, name=instr.assign_to.name)
+        self._variables[instr.assign_to.name] = result
 
     def _try_build_trait_op_call(self, instr: ProcessedInstruction_call):
         if len(instr.args) != 2:
@@ -1127,6 +1370,21 @@ class Codegen:
                 raise TypeError(f"Cannot declare function '{emitted_call_name}' without known arg type for '{arg.name}'")
             arg_types.append(self._build_type(arg.type))
 
+        fn_type = ir.FunctionType(ret_type, arg_types)
+        return ir.Function(self.module, fn_type, name=emitted_call_name)
+
+    def _get_or_declare_called_function_void(self, instr: ProcessedInstruction_callvoid) -> ir.Function:
+        emitted_call_name = self._symbol_by_canonical.get(instr.fn_name, instr.fn_name)
+        if emitted_call_name == instr.fn_name and "::" in instr.fn_name and instr.fn_name != "main":
+            emitted_call_name = self._emit_like_symbol_name(instr.fn_name)
+        for fn in self.module.functions:
+            if fn.name == emitted_call_name:
+                return fn
+
+        arg_types = [self._build_type(arg.type) for arg in instr.args]
+        ret_type: ir.Type = ir.VoidType()
+        if instr.assign_to is not None:
+            ret_type = self._build_type(instr.assign_to.type)
         fn_type = ir.FunctionType(ret_type, arg_types)
         return ir.Function(self.module, fn_type, name=emitted_call_name)
 
@@ -1412,6 +1670,16 @@ class Codegen:
                 phi.add_incoming(value=value, block=self._blocks[pred_name])
 
     def _build_type(self, type: Type) -> ir.Type:
+        if type.name == "dyn" and len(type.generics) == 1:
+            trait_name = type.generics[0].name
+            dyn_name = self._dyn_struct_name(trait_name)
+            if dyn_name not in self._structs:
+                dyn_struct = self.module.context.get_identified_type(dyn_name)
+                if dyn_struct.is_opaque:
+                    dyn_struct.set_body(ir.IntType(8).as_pointer(), ir.IntType(8).as_pointer())
+                self._structs[dyn_name] = dyn_struct
+            return self._structs[dyn_name]
+
         template_key = type.name.split("[", 1)[0]
         template_args = list(type.generics)
         if not template_args and "[" in type.name and type.name.endswith("]"):
@@ -1722,6 +1990,16 @@ class Codegen:
         fn_type = ir.FunctionType(ir.IntType(1), [str_type, str_type])
         fn = ir.Function(self.module, fn_type, name="__ehir_rt_str_eq")
         fn.attributes.add("noinline")
+        return fn
+
+    def _get_trap_intrinsic(self) -> ir.Function:
+        name = "llvm.trap"
+        if name in self.module.globals:
+            fn = self.module.globals[name]
+            if not isinstance(fn, ir.Function):
+                raise TypeError("llvm.trap global is not a function")
+            return fn
+        fn = ir.Function(self.module, ir.FunctionType(ir.VoidType(), []), name=name)
         return fn
 
     def _initialize_memory(self, ptr, elem_type, size):

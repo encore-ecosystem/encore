@@ -2,7 +2,7 @@ from dataclasses import fields, is_dataclass
 
 from ehir.core.derectives import Derective_enum, Derective_extern_fn, Derective_fn, Derective_impl, Derective_struct, Derective_trait
 from ehir.core.derectives.base import Derective
-from ehir.core.instructions import Instruction_call
+from ehir.core.instructions import Instruction_call, Instruction_callvoid
 from ehir.core.primitives.base import PrimitiveType
 from ehir.core.type import Pointer, Reference, Type
 
@@ -51,6 +51,21 @@ class UnneededSymbolsStripper:
             if fn is None:
                 continue
             for call_name in self._collect_called_function_names(fn):
+                if call_name.startswith("__dyn_dispatch__"):
+                    payload = call_name[len("__dyn_dispatch__") :]
+                    if "::" in payload:
+                        trait_name, method_name = payload.rsplit("::", 1)
+                        method_prefix = f"{trait_name}::{method_name}"
+                        for candidate_name in fns:
+                            if not candidate_name.startswith(method_prefix):
+                                continue
+                            tail = candidate_name[len(method_prefix) :]
+                            if tail and not tail.startswith("__"):
+                                continue
+                            if candidate_name not in reachable_fns:
+                                reachable_fns.add(candidate_name)
+                                pending.append(candidate_name)
+                    continue
                 canonical_call_name = emitted_to_fn.get(call_name, call_name)
                 normalized_call_name = self._normalize_fn_lookup_name(canonical_call_name)
                 canonical_call_name = normalized_to_fn.get(normalized_call_name, canonical_call_name)
@@ -100,7 +115,7 @@ class UnneededSymbolsStripper:
     def _collect_called_function_names(self, value) -> set[str]:
         calls: set[str] = set()
         for item in self._walk(value):
-            if isinstance(item, Instruction_call):
+            if isinstance(item, (Instruction_call, Instruction_callvoid)):
                 calls.add(item.fn_name)
         return calls
 

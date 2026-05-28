@@ -3,7 +3,7 @@ from copy import deepcopy
 from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_enum, Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
-from ehir.core.instructions import Instruction_call, Instruction_cfree
+from ehir.core.instructions import Instruction_call, Instruction_cfree, Instruction_drop
 from ehir.core.instructions.base import Instruction
 from ehir.core.type import Type, is_box_type
 from ehir.core.variable import TypedVariable
@@ -44,6 +44,9 @@ class DropLoweringPass:
 
     def _lower_instruction(self, instr: Instruction) -> list[Instruction]:
         if isinstance(instr, Instruction_cfree):
+            return self._lower_drop_call(instr.var, TypedVariable(name=f".drop_{instr.var.name}", type=Type("void")))
+
+        if isinstance(instr, Instruction_drop):
             return self._lower_drop_call(instr.var, TypedVariable(name=f".drop_{instr.var.name}", type=Type("void")))
 
         if isinstance(instr, Instruction_call) and instr.fn_name == "Drop::drop":

@@ -8,6 +8,7 @@ from ehir.core.instructions import (
     BinOp,
     Instruction_br,
     Instruction_call,
+    Instruction_callvoid,
     Instruction_capenum,
     Instruction_capprim,
     Instruction_capstruct,
@@ -15,6 +16,7 @@ from ehir.core.instructions import (
     Instruction_cenum,
     Instruction_cpos,
     Instruction_cstruct,
+    Instruction_drop,
     Instruction_gep,
     Instruction_getfield,
     Instruction_getfieldptr,
@@ -40,6 +42,7 @@ from ehir.core.instructions import (
 from ehir.core.instructions.base import Assignable
 from ehir.core.type import Type
 from ehir.core.variable import TypedVariable, Variable
+from ehir.errors import EhirCompileError
 from ehir.simplifier.drop_helper import collect_aggregate_names, needs_drop
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
@@ -93,6 +96,7 @@ class Deallocator:
         )
 
     def _place_cfree(self, fn: Normalized_fn):
+        self._validate_manual_drop(fn)
         self._usages = {}
         self._captures = {}
         self._returned_aliases = set()
@@ -102,6 +106,7 @@ class Deallocator:
         cfg: dict[str, list[str]] = {}
         predecessors: dict[str, set[str]] = {}
         observed: set[str] = set()
+        block_order: list[str] = []
 
         name2block: dict[str, TerminatedBlock] = {}
         for block in fn.get_body():
@@ -113,8 +118,8 @@ class Deallocator:
         queue: deque[TerminatedBlock] = deque([fn.entry_block])
         while queue:
             block = queue.popleft()
-            self._collect_variable_usages(block)
             observed.add(block.name)
+            block_order.append(block.name)
 
             children: list[str] = []
             if isinstance(block.term, Instruction_br):
@@ -138,8 +143,31 @@ class Deallocator:
                 if child not in observed:
                     queue.append(name2block[child])
 
+        entry_initialized = {
+            param.name
+            for param in fn.params
+            if param.type is not None and needs_drop(param.type, self._aggregate_names)
+        }
+        initialized_in = self._compute_definitely_initialized(
+            fn=fn,
+            name2block=name2block,
+            block_order=block_order,
+            predecessors=predecessors,
+            observed=observed,
+            entry_initialized=entry_initialized,
+        )
+        self._insert_drop_before_reassign(
+            fn=fn,
+            name2block=name2block,
+            block_order=block_order,
+            initialized_in=initialized_in,
+        )
+
+        for block_name in block_order:
+            self._collect_variable_usages(name2block[block_name], set(initialized_in[block_name]))
+
         dominators = self._compute_dominators(fn.entry_block.name, observed, predecessors)
-        for var, block in self._captures.items():
+        for var, block in reversed(list(self._captures.items())):
             assert isinstance(fn.exit_block.term, Instruction_ret)
             if fn.exit_block.term.var.name == var:
                 continue
@@ -160,14 +188,7 @@ class Deallocator:
                 dealloc_block_name = self._next_dealloc_block_name(var)
                 dealloc_block = TerminatedBlock(
                     name=dealloc_block_name,
-                    body=[
-                        Instruction_call(
-                            var_out=TypedVariable(name=f".drop_{var}", type=Type("void")),
-                            fn_name="Drop::drop",
-                            generics=[deepcopy(generic) for generic in var_def.type.generics],
-                            args=[TypedVariable(var_def.name, var_def.type)],
-                        )
-                    ],
+                    body=[Instruction_drop(var=TypedVariable(var_def.name, var_def.type))],
                     term=Instruction_br(label=dst),
                 )
                 fn.body.append(dealloc_block)
@@ -176,14 +197,89 @@ class Deallocator:
                 placed = True
 
             if not placed and self._is_dominated(fn.exit_block.name, block, dominators):
-                fn.exit_block.body.append(
-                    Instruction_call(
-                        var_out=TypedVariable(name=f".drop_{var}", type=Type("void")),
-                        fn_name="Drop::drop",
-                        generics=[deepcopy(generic) for generic in var_def.type.generics],
-                        args=[TypedVariable(var_def.name, var_def.type)],
-                    )
-                )
+                fn.exit_block.body.append(Instruction_drop(var=TypedVariable(var_def.name, var_def.type)))
+
+    def _compute_definitely_initialized(
+        self,
+        fn: Normalized_fn,
+        name2block: dict[str, TerminatedBlock],
+        block_order: list[str],
+        predecessors: dict[str, set[str]],
+        observed: set[str],
+        entry_initialized: set[str],
+    ) -> dict[str, set[str]]:
+        candidate_vars = set(entry_initialized)
+        gen: dict[str, set[str]] = {}
+
+        for block_name in block_order:
+            block = name2block[block_name]
+            gen_block: set[str] = set()
+            for instr in block.body:
+                if not isinstance(instr, Assignable):
+                    continue
+                if instr.var_out.type is not None and needs_drop(instr.var_out.type, self._aggregate_names):
+                    gen_block.add(instr.var_out.name)
+            gen[block_name] = gen_block
+            candidate_vars |= gen_block
+
+        initialized_in: dict[str, set[str]] = {}
+        initialized_out: dict[str, set[str]] = {}
+        entry = fn.entry_block.name
+        for block_name in observed:
+            if block_name == entry:
+                initialized_in[block_name] = set(entry_initialized)
+            else:
+                initialized_in[block_name] = set(candidate_vars)
+            initialized_out[block_name] = initialized_in[block_name] | gen.get(block_name, set())
+
+        changed = True
+        while changed:
+            changed = False
+            for block_name in block_order:
+                if block_name == entry:
+                    in_set = set(entry_initialized)
+                else:
+                    preds = predecessors.get(block_name, set()) & observed
+                    if not preds:
+                        in_set = set()
+                    else:
+                        pred_sets = [initialized_out[pred] for pred in preds]
+                        in_set = set.intersection(*pred_sets) if pred_sets else set()
+                out_set = in_set | gen.get(block_name, set())
+                if in_set != initialized_in[block_name] or out_set != initialized_out[block_name]:
+                    initialized_in[block_name] = in_set
+                    initialized_out[block_name] = out_set
+                    changed = True
+
+        return initialized_in
+
+    def _insert_drop_before_reassign(
+        self,
+        fn: Normalized_fn,
+        name2block: dict[str, TerminatedBlock],
+        block_order: list[str],
+        initialized_in: dict[str, set[str]],
+    ) -> None:
+        var_types: dict[str, Type] = {param.name: deepcopy(param.type) for param in fn.params if param.type is not None}
+        for block_name in block_order:
+            block = name2block[block_name]
+            initialized = set(initialized_in[block_name])
+            new_body = []
+            for instr in block.body:
+                if isinstance(instr, Assignable):
+                    current_type = instr.var_out.type if instr.var_out.type is not None else var_types.get(instr.var_out.name)
+                    if (
+                        instr.var_out.name in initialized
+                        and instr.var_out.name not in self._arg_names
+                        and current_type is not None
+                        and needs_drop(current_type, self._aggregate_names)
+                    ):
+                        new_body.append(Instruction_drop(var=TypedVariable(instr.var_out.name, deepcopy(current_type))))
+                    if current_type is not None and needs_drop(current_type, self._aggregate_names):
+                        initialized.add(instr.var_out.name)
+                        var_types[instr.var_out.name] = deepcopy(current_type)
+                new_body.append(instr)
+            block.body = new_body
 
     def _next_dealloc_block_name(self, var_name: str) -> str:
         self._dealloc_name_seq += 1
@@ -280,10 +376,6 @@ class Deallocator:
             self._usages[var.name] = self._usages.get(var.name, set()) | {self._curr_block}
 
     def _add_variable_capture(self, var: Variable):
-        if var.name.startswith("."):
-            # Compiler-generated temporaries frequently alias user-owned aggregates.
-            # Dropping them as independent owners causes duplicate cascades.
-            return
         if cached := self._variables.get(var.name):
             if cached.type is None and var.type is not None:
                 self._variables[var.name] = var
@@ -296,11 +388,13 @@ class Deallocator:
             self._captures[var.name] = self._curr_block
             self._add_variable_usage(var)
 
-    def _collect_variable_usages(self, block: TerminatedBlock):
+    def _collect_variable_usages(self, block: TerminatedBlock, initialized: set[str]):
         self._curr_block = block.name
         for instr in [*block.body, block.term]:
             if isinstance(instr, Assignable):
                 self._add_variable_capture(instr.var_out)
+                if instr.var_out.type is not None and needs_drop(instr.var_out.type, self._aggregate_names):
+                    initialized.add(instr.var_out.name)
 
             if isinstance(instr, SKIPABLE):
                 pass
@@ -348,9 +442,11 @@ class Deallocator:
                     self._add_variable_usage(arg)
             elif isinstance(instr, Instruction_hfree):
                 self._add_variable_usage(instr.var)
+            elif isinstance(instr, Instruction_drop):
+                self._add_variable_usage(instr.var)
             elif isinstance(instr, Instruction_pcast):
                 self._add_variable_usage(instr.var)
-            elif isinstance(instr, Instruction_call):
+            elif isinstance(instr, (Instruction_call, Instruction_callvoid)):
                 for arg in instr.args:
                     self._add_variable_usage(arg)
             elif isinstance(instr, (Instruction_wraps, Instruction_wraph)):
@@ -360,3 +456,121 @@ class Deallocator:
                 self._add_variable_usage(instr.rhs)
             else:
                 raise NotImplementedError(f"Variable usage not define for {instr}")
+
+    def _validate_manual_drop(self, fn: Normalized_fn) -> None:
+        arg_names = {param.name for param in fn.params}
+        name2block = {block.name: block for block in fn.get_body()}
+        cfg: dict[str, list[str]] = {name: [] for name in name2block}
+        predecessors: dict[str, set[str]] = {name: set() for name in name2block}
+        observed: set[str] = set()
+
+        queue: deque[TerminatedBlock] = deque([fn.entry_block])
+        while queue:
+            block = queue.popleft()
+            observed.add(block.name)
+            children: list[str] = []
+            if isinstance(block.term, Instruction_br):
+                children.append(block.term.label)
+            elif isinstance(block.term, Instruction_cbr):
+                children.extend([block.term.true_br_label, block.term.else_br_label])
+            elif isinstance(block.term, Instruction_switch):
+                children.append(block.term.default_case)
+                children.extend(label for _, label in block.term.cases)
+            elif isinstance(block.term, Instruction_match):
+                children.append(block.term.default_case)
+                children.extend(case.label for case in block.term.cases)
+            for child in children:
+                if child not in cfg[block.name]:
+                    cfg[block.name].append(child)
+                    predecessors[child].add(block.name)
+                if child not in observed:
+                    queue.append(name2block[child])
+
+        in_dropped: dict[str, set[str]] = {name: set() for name in observed}
+        out_dropped: dict[str, set[str]] = {name: set() for name in observed}
+        worklist: deque[str] = deque([fn.entry_block.name])
+
+        while worklist:
+            block_name = worklist.popleft()
+            block = name2block[block_name]
+            if block_name == fn.entry_block.name:
+                merged = set()
+            else:
+                preds = predecessors.get(block_name, set()) & observed
+                merged = set()
+                for pred in preds:
+                    merged |= out_dropped[pred]
+            in_dropped[block_name] = merged
+
+            dropped = set(merged)
+            for instr in block.body:
+                if isinstance(instr, Instruction_drop):
+                    if instr.var.name in arg_names:
+                        raise EhirCompileError(
+                            f"Manual drop for function parameter '{instr.var.name}' is forbidden", code="EHIR3001"
+                        )
+                    if instr.var.name in dropped:
+                        raise EhirCompileError(f"Double drop of '{instr.var.name}' in fn '{fn.name}'", code="EHIR3002")
+                    dropped.add(instr.var.name)
+                    continue
+                for used in self._used_vars(instr):
+                    if used.name in dropped:
+                        raise EhirCompileError(
+                            f"Use-after-drop of '{used.name}' in fn '{fn.name}'", code="EHIR3003"
+                        )
+                if isinstance(instr, Assignable):
+                    dropped.discard(instr.var_out.name)
+
+            for used in self._used_vars(block.term):
+                if used.name in dropped:
+                    raise EhirCompileError(f"Use-after-drop of '{used.name}' in fn '{fn.name}'", code="EHIR3003")
+
+            if dropped != out_dropped[block_name]:
+                out_dropped[block_name] = dropped
+                for succ in cfg.get(block_name, []):
+                    worklist.append(succ)
+
+    def _used_vars(self, instr) -> list[Variable]:
+        if isinstance(instr, Instruction_ret):
+            return [instr.var]
+        if isinstance(instr, Instruction_cbr):
+            return [instr.cond_var]
+        if isinstance(instr, Instruction_match):
+            return [instr.cond_var]
+        if isinstance(instr, Instruction_switch):
+            return [instr.cond_var]
+        if isinstance(instr, Instruction_getptr):
+            return [instr.var]
+        if isinstance(instr, Instruction_gep):
+            return [instr.var, instr.offset]
+        if isinstance(instr, Instruction_hrealloc):
+            return [instr.var, instr.count]
+        if isinstance(instr, Instruction_store):
+            return [instr.var_src, instr.var_dst]
+        if isinstance(instr, Instruction_setfield):
+            return [instr.var, instr.value]
+        if isinstance(instr, Instruction_load):
+            return [instr.var]
+        if isinstance(instr, (Instruction_getfield, Instruction_getfieldptr)):
+            return [instr.src]
+        if isinstance(instr, (Instruction_sgetfield, Instruction_sgetfieldptr)):
+            return [instr.src]
+        if isinstance(instr, Instruction_put):
+            return [instr.var]
+        if isinstance(instr, (Instruction_scstruct, Instruction_cstruct, Instruction_capstruct)):
+            return [instr.struct.value] if instr.struct.value is not None else list(instr.struct.fields)
+        if isinstance(instr, (Instruction_cenum, Instruction_capenum)):
+            return list(instr.enum.args)
+        if isinstance(instr, Instruction_hfree):
+            return [instr.var]
+        if isinstance(instr, Instruction_drop):
+            return [instr.var]
+        if isinstance(instr, Instruction_pcast):
+            return [instr.var]
+        if isinstance(instr, (Instruction_call, Instruction_callvoid)):
+            return list(instr.args)
+        if isinstance(instr, (Instruction_wraps, Instruction_wraph)):
+            return [instr.variable]
+        if isinstance(instr, BinOp):
+            return [instr.lhs, instr.rhs]
+        return []

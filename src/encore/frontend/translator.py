@@ -1003,7 +1003,13 @@ class Translator:
         for param in fn.params:
             self._remember_source_type(param, source_param_types.get(param.name, param.type))
             if param.name in mutable_params:
-                self._var_ptrs[param.name] = Variable(param.name, param.type)
+                if isinstance(param.type, Pointer):
+                    self._var_ptrs[param.name] = Variable(param.name, param.type)
+                else:
+                    mut_slot = Variable(self._fresh_temp_name(f"{param.name}_mut"), Pointer(param.type))
+                    self._builder._add(Instruction_salloc(var_out=mut_slot, type=param.type))
+                    self._builder._add(Instruction_store(var_src=Variable(param.name, param.type), var_dst=mut_slot))
+                    self._var_ptrs[param.name] = mut_slot
                 continue
             self._var_vals[param.name] = Variable(param.name, param.type)
 
@@ -1150,7 +1156,11 @@ class Translator:
 
     def _is_source_reference_like(self, var: Variable) -> bool:
         source_type = self._source_type_for_var(var)
-        return is_reference_like_type(source_type) or is_reference_like_type(var.type)
+        return (
+            is_reference_like_type(source_type)
+            or is_reference_like_type(var.type)
+            or is_raw_pointer_type(var.type)
+        )
 
     def _fresh_temp_name(self, prefix: str) -> str:
         self._unique_variable_idx += 1
@@ -1463,7 +1473,22 @@ class Translator:
         )
 
     def _translate_expression_statement(self, statement: s.Statement_Expr):
-        self._translate_expression(statement.expr)
+        value = self._translate_expression(statement.expr)
+        expr = statement.expr
+        if not isinstance(expr, s.Expression_MethodCall):
+            return
+        if not isinstance(expr.receiver, s.Expression_Path) or len(expr.receiver.segments) != 1:
+            return
+        receiver_name = expr.receiver.name
+        receiver_ptr = self._var_ptrs.get(receiver_name)
+        if receiver_ptr is None or not isinstance(receiver_ptr.type, Pointer):
+            return
+        receiver_type = receiver_ptr.type.pointee
+        result_type = value.var_out.type
+        if result_type is None:
+            return
+        if self._types_compatible(result_type, receiver_type):
+            self._builder._add(Instruction_store(var_src=value.var_out, var_dst=receiver_ptr))
 
     def _translate_unsafe(self, statement: s.Statement_Unsafe):
         self._unsafe_depth += 1
@@ -2699,6 +2724,13 @@ class Translator:
             slot_ptr = Variable(slot_name, Pointer(value_type))
             self._builder._add(Instruction_salloc(var_out=slot_ptr, type=value_type))
             self._builder._add(Instruction_put(primitive=init_prim, var=slot_ptr))
+            return slot_ptr
+        if is_tuple_type(value_type) and tuple_arity(value_type) == 0:
+            slot_ptr = Variable(slot_name, Pointer(value_type))
+            self._builder._add(Instruction_salloc(var_out=slot_ptr, type=value_type))
+            unit_tmp = Variable(self._advance_variable(), value_type)
+            self._builder._add(Instruction_capstruct(var_out=unit_tmp, struct=Struct(value_type.name, [])))
+            self._builder._add(Instruction_store(var_src=unit_tmp, var_dst=slot_ptr))
             return slot_ptr
 
         slot_ptr = Variable(slot_name, Pointer(value_type))

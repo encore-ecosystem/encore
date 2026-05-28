@@ -188,7 +188,12 @@ class TypeInferer:
                 expected = self._infer_lvalue_type(statement.target, env)
                 value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
                 self._assert_raw_pointer_usage_allowed(expected, context="assignment target")
-                if expected is not None and value_type is not None and not self._types_compatible(expected, value_type):
+                if (
+                    expected is not None
+                    and value_type is not None
+                    and not self._types_compatible(expected, value_type)
+                    and not self._types_match_ignoring_mut(expected, value_type)
+                ):
                     raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
             elif isinstance(statement, s.Statement_Expr):
                 expr_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
@@ -361,7 +366,12 @@ class TypeInferer:
                 expected = self._infer_lvalue_type(statement.target, env)
                 value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
                 self._assert_raw_pointer_usage_allowed(expected, context="assignment target")
-                if expected is not None and value_type is not None and not self._types_compatible(expected, value_type):
+                if (
+                    expected is not None
+                    and value_type is not None
+                    and not self._types_compatible(expected, value_type)
+                    and not self._types_match_ignoring_mut(expected, value_type)
+                ):
                     raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
             if isinstance(statement, s.Statement_Ret):
                 ret_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
@@ -644,10 +654,24 @@ class TypeInferer:
             arg_type = self._infer_expression(arg, env, arg_expected_type, mutable_env)
             # print(param, arg, expected_param_type, arg_type)
             if arg_type is not None:
+                if (
+                    expected_param_type is not None
+                    and is_mutable_type(expected_param_type)
+                    and not is_mutable_type(arg_type)
+                ):
+                    if isinstance(arg, s.Expression_Path) and len(arg.segments) == 1 and not mutable_env.get(arg.name, False):
+                        raise TypeError(
+                            f"Cannot pass immutable binding '{arg.name}' as mutable argument "
+                            f"for '{callable_name}' param '{param.name}'"
+                        )
+                    arg_type = make_mutable_type(arg_type)
                 self._match_generic(param.type, arg_type, generic_mapping)
                 expected_param_type = self._specialize_type(param.type, generic_mapping)
                 if expected_param_type is not None and not self._types_compatible(expected_param_type, arg_type):
-                    raise TypeError(f"Type mismatch in call argument: {expected_param_type} != {arg_type}")
+                    raise TypeError(
+                        f"Type mismatch in call argument for '{callable_name}' param '{param.name}': "
+                        f"{expected_param_type} != {arg_type}"
+                    )
 
         if signature.generics:
             missing_generics = [generic.name for generic in signature.generics if generic.name not in generic_mapping]
@@ -1313,7 +1337,12 @@ class TypeInferer:
             expected = self._infer_lvalue_type(statement.target, env)
             value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
             self._assert_raw_pointer_usage_allowed(expected, context="assignment target")
-            if expected is not None and value_type is not None and not self._types_compatible(expected, value_type):
+            if (
+                expected is not None
+                and value_type is not None
+                and not self._types_compatible(expected, value_type)
+                and not self._types_match_ignoring_mut(expected, value_type)
+            ):
                 raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
             return
 

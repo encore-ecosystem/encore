@@ -23,6 +23,7 @@ class TraitMethod:
 class Derective_trait(Derective):
     name: str
     generics: list[Type]
+    parent: str | None = None
     bounds: dict[str, list[str]] = field(default_factory=dict)
     methods: list[TraitMethod] = field(default_factory=list)
     is_public: bool = field(default=False, kw_only=True)
@@ -30,6 +31,7 @@ class Derective_trait(Derective):
 
     def __str__(self) -> str:
         generics_repr = ("[" + ", ".join(str(x) for x in self.generics) + "]") if self.generics else ""
+        parent_repr = f" < {self.parent}" if self.parent else ""
         bounds_repr = ""
         if self.bounds:
             parts = [f"{name}: {' + '.join(traits)}" for name, traits in self.bounds.items()]
@@ -37,4 +39,7 @@ class Derective_trait(Derective):
         methods_repr = "\n  ".join(str(method) for method in self.methods)
         attrs_repr = "".join(f"#attr({attr})\n" for attr in self.attrs)
         visibility_repr = "pub " if self.is_public else ""
-        return f"{attrs_repr}{visibility_repr}trait {self.name}{generics_repr}{bounds_repr} {{\n  {methods_repr}\n}}"
+        return (
+            f"{attrs_repr}{visibility_repr}trait {self.name}{generics_repr}"
+            f"{parent_repr}{bounds_repr} {{\n  {methods_repr}\n}}"
+        )
