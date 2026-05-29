@@ -183,6 +183,7 @@ class TypeInferer:
             self._active_generic_names = prev_generic_names
 
     def _infer_block(self, body: Block, env: dict[str, Type], mutability_env: dict[str, bool], fn_ret_type: Type):
+        inferable_numeric_lets: dict[str, s.Statement_Let] = {}
         for statement in body.body:
             if isinstance(statement, s.Statement_Let):
                 inferred = self._infer_expression(statement.expr, env, statement.type, mutability_env)
@@ -190,6 +191,8 @@ class TypeInferer:
                     if inferred is None:
                         raise TypeError(f"Unable to infer type of variable '{statement.name}'")
                     statement.type = inferred
+                    if self._is_unsuffixed_numeric_literal(statement.expr):
+                        inferable_numeric_lets[statement.name] = statement
                 elif inferred is not None:
                     if not self._types_compatible(statement.type, inferred) and not self._types_match_ignoring_mut(
                         statement.type, inferred
@@ -219,6 +222,19 @@ class TypeInferer:
             elif isinstance(statement, s.Statement_Ret):
                 ret_type = self._infer_expression(statement.expr, env, fn_ret_type, mutability_env)
                 self._assert_raw_pointer_usage_allowed(ret_type, context="return value")
+                if ret_type is not None and not self._types_compatible(fn_ret_type, ret_type):
+                    if isinstance(statement.expr, s.Expression_Path) and len(statement.expr.segments) == 1:
+                        local_name = statement.expr.segments[0].name
+                        let_stmt = inferable_numeric_lets.get(local_name)
+                        if (
+                            let_stmt is not None
+                            and self._is_numeric_type(fn_ret_type)
+                            and self._is_numeric_type(ret_type)
+                        ):
+                            let_stmt.type = fn_ret_type
+                            self._annotate_numeric_literal(let_stmt.expr, fn_ret_type)
+                            env[local_name] = fn_ret_type
+                            ret_type = fn_ret_type
                 if ret_type is not None and not self._types_compatible(fn_ret_type, ret_type):
                     raise TypeError(f"Return type mismatch: {ret_type} != {fn_ret_type}")
             elif isinstance(statement, s.Statement_While):
@@ -353,6 +369,22 @@ class TypeInferer:
                     self._unsafe_depth -= 1
             elif isinstance(statement, s.Statement_EHIR):
                 self._bind_ehir_outputs(statement, env, mutability_env)
+
+    def _is_numeric_type(self, typ: Type) -> bool:
+        return self._is_integer_type(typ) or self._is_float_type(typ)
+
+    def _is_unsuffixed_numeric_literal(self, expr: s.Statement_Expression) -> bool:
+        if isinstance(expr, s.Expression_IntegerLiteral):
+            return expr.literal_type is None
+        if isinstance(expr, s.Expression_FloatLiteral):
+            return expr.literal_type is None
+        return False
+
+    def _annotate_numeric_literal(self, expr: s.Statement_Expression, inferred_type: Type):
+        if isinstance(expr, s.Expression_IntegerLiteral):
+            expr.literal_type = inferred_type
+        elif isinstance(expr, s.Expression_FloatLiteral):
+            expr.literal_type = inferred_type
 
     def _infer_return_type(
         self,

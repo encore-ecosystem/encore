@@ -45,7 +45,11 @@ class EHIR_LLVM_Backend(EHIR_Backend):
             return self._archiver.run(object_path, self._profile_path / f"{output_stem}.a")
 
         if refrain.type == Refrain.TargetType.EXECUTABLE:
-            return self._linker.run(object_path, self._profile_path / output_stem)
+            return self._linker.run(
+                object_path,
+                self._profile_path / output_stem,
+                native_libraries=refrain.native_libraries,
+            )
 
         raise ValueError(f"Unsupported refrain target type: {refrain.type}")
 

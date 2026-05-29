@@ -10,10 +10,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <direct.h>
+#include <io.h>
+#else
 #include <sys/time.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <time.h>
 #include <unistd.h>
+#endif
 
 typedef struct {
     char *ptr;
@@ -86,6 +94,23 @@ static encore_str encore_format(const char *fmt, ...) {
 }
 
 uint64_t __ehir_rt_clock_ms(uint8_t kind) {
+#ifdef _WIN32
+    if (kind == 0) {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        ULARGE_INTEGER value;
+        value.LowPart = ft.dwLowDateTime;
+        value.HighPart = ft.dwHighDateTime;
+        return (uint64_t)(value.QuadPart / 10000ULL);
+    }
+
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER counter;
+    if (QueryPerformanceFrequency(&frequency) && QueryPerformanceCounter(&counter) && frequency.QuadPart > 0) {
+        return (uint64_t)((counter.QuadPart * 1000ULL) / frequency.QuadPart);
+    }
+    return (uint64_t)GetTickCount64();
+#else
     struct timespec ts;
     clockid_t clock_kind = kind == 0 ? CLOCK_REALTIME : CLOCK_MONOTONIC;
     if (clock_gettime(clock_kind, &ts) == 0) {
@@ -97,9 +122,14 @@ uint64_t __ehir_rt_clock_ms(uint8_t kind) {
         return ((uint64_t)tv.tv_sec * 1000ULL) + ((uint64_t)tv.tv_usec / 1000ULL);
     }
     return 0ULL;
+#endif
 }
 
 bool __ehir_rt_sleep_ms(uint64_t ms) {
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+    return true;
+#else
     struct timespec req;
     req.tv_sec = (time_t)(ms / 1000ULL);
     req.tv_nsec = (long)((ms % 1000ULL) * 1000000ULL);
@@ -110,6 +140,7 @@ bool __ehir_rt_sleep_ms(uint64_t ms) {
         }
     }
     return true;
+#endif
 }
 
 bool __ehir_rt_str_eq(encore_str lhs, encore_str rhs) {
@@ -408,7 +439,13 @@ encore_str __ehir_rt_os_cwd(void) {
             return encore_empty_str();
         }
 
-        if (getcwd(buffer, size) != NULL) {
+        char *cwd_result =
+#ifdef _WIN32
+            _getcwd(buffer, (int)size);
+#else
+            getcwd(buffer, size);
+#endif
+        if (cwd_result != NULL) {
             size_t len = strlen(buffer);
             return encore_from_owned_buffer(buffer, len);
         }
@@ -423,6 +460,33 @@ encore_str __ehir_rt_os_cwd(void) {
         }
         size *= 2;
     }
+}
+
+encore_str __ehir_rt_os_home_dir(void) {
+#ifdef _WIN32
+    const char *home = getenv("USERPROFILE");
+    if (home == NULL || home[0] == '\0') {
+        const char *drive = getenv("HOMEDRIVE");
+        const char *path = getenv("HOMEPATH");
+        if (drive != NULL && path != NULL) {
+            size_t drive_len = strlen(drive);
+            size_t path_len = strlen(path);
+            char *buffer = malloc(drive_len + path_len + 1);
+            if (buffer == NULL) {
+                return encore_empty_str();
+            }
+            memcpy(buffer, drive, drive_len);
+            memcpy(buffer + drive_len, path, path_len + 1);
+            return (encore_str){.ptr = buffer, .len = drive_len + path_len};
+        }
+    }
+#else
+    const char *home = getenv("HOME");
+#endif
+    if (home == NULL || home[0] == '\0') {
+        return encore_empty_str();
+    }
+    return encore_from_cstr_copy(home);
 }
 
 encore_str __ehir_rt_fs_read_file(encore_str path) {
@@ -505,10 +569,44 @@ int32_t __ehir_rt_fs_mkdir(encore_str path) {
         return -1;
     }
 
-    int rc = mkdir(path_c, 0755);
+    int rc =
+#ifdef _WIN32
+        _mkdir(path_c);
+#else
+        mkdir(path_c, 0755);
+#endif
     int32_t status = (rc == 0 || errno == EEXIST) ? 0 : -1;
     free(path_c);
     return status;
+}
+
+static bool encore_append_dir_entry(char **buffer, size_t *cap, size_t *len, const char *name) {
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return true;
+    }
+
+    size_t name_len = strlen(name);
+    size_t need = *len + name_len + 1;
+    if (need > *cap) {
+        size_t next_cap = *cap;
+        while (need > next_cap) {
+            if (next_cap > (SIZE_MAX / 2)) {
+                return false;
+            }
+            next_cap *= 2;
+        }
+        char *next = realloc(*buffer, next_cap + 1);
+        if (next == NULL) {
+            return false;
+        }
+        *buffer = next;
+        *cap = next_cap;
+    }
+
+    memcpy(*buffer + *len, name, name_len);
+    *len += name_len;
+    (*buffer)[(*len)++] = '\n';
+    return true;
 }
 
 encore_str __ehir_rt_fs_read_dir(encore_str path) {
@@ -517,57 +615,384 @@ encore_str __ehir_rt_fs_read_dir(encore_str path) {
         return encore_empty_str();
     }
 
+#ifdef _WIN32
+    size_t path_len = strlen(path_c);
+    const char *suffix = (path_len > 0 && (path_c[path_len - 1] == '\\' || path_c[path_len - 1] == '/')) ? "*" : "\\*";
+    char *pattern = malloc(path_len + strlen(suffix) + 1);
+    if (pattern == NULL) {
+        free(path_c);
+        return encore_empty_str();
+    }
+    strcpy(pattern, path_c);
+    strcat(pattern, suffix);
+    free(path_c);
+
+    WIN32_FIND_DATAA data;
+    HANDLE handle = FindFirstFileA(pattern, &data);
+    free(pattern);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return encore_empty_str();
+    }
+#else
     DIR *dir = opendir(path_c);
     free(path_c);
     if (dir == NULL) {
         return encore_empty_str();
     }
+#endif
 
     size_t cap = 256;
     size_t len = 0;
     char *buffer = malloc(cap + 1);
     if (buffer == NULL) {
+#ifdef _WIN32
+        FindClose(handle);
+#else
         closedir(dir);
+#endif
         return encore_empty_str();
     }
 
+#ifdef _WIN32
+    do {
+        if (!encore_append_dir_entry(&buffer, &cap, &len, data.cFileName)) {
+            free(buffer);
+            FindClose(handle);
+            return encore_empty_str();
+        }
+    } while (FindNextFileA(handle, &data));
+    FindClose(handle);
+#else
     struct dirent *entry = NULL;
     while ((entry = readdir(dir)) != NULL) {
-        const char *name = entry->d_name;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
-            continue;
+        if (!encore_append_dir_entry(&buffer, &cap, &len, entry->d_name)) {
+            free(buffer);
+            closedir(dir);
+            return encore_empty_str();
         }
-
-        size_t name_len = strlen(name);
-        size_t need = len + name_len + 1; // + '\n'
-        if (need > cap) {
-            size_t next_cap = cap;
-            while (need > next_cap) {
-                if (next_cap > (SIZE_MAX / 2)) {
-                    free(buffer);
-                    closedir(dir);
-                    return encore_empty_str();
-                }
-                next_cap *= 2;
-            }
-            char *next = realloc(buffer, next_cap + 1);
-            if (next == NULL) {
-                free(buffer);
-                closedir(dir);
-                return encore_empty_str();
-            }
-            buffer = next;
-            cap = next_cap;
-        }
-
-        memcpy(buffer + len, name, name_len);
-        len += name_len;
-        buffer[len++] = '\n';
     }
     closedir(dir);
+#endif
 
     if (len > 0 && buffer[len - 1] == '\n') {
         len -= 1;
     }
     return encore_from_owned_buffer(buffer, len);
 }
+
+#ifndef _WIN32
+typedef void EncoreGuiDisplay;
+typedef void *EncoreGuiGc;
+typedef unsigned long EncoreGuiWindowId;
+typedef unsigned long EncoreGuiAtom;
+
+typedef struct {
+    bool initialized;
+    bool available;
+    void *lib;
+
+    EncoreGuiDisplay *(*XOpenDisplay)(const char *);
+    int (*XDefaultScreen)(EncoreGuiDisplay *);
+    EncoreGuiWindowId (*XRootWindow)(EncoreGuiDisplay *, int);
+    unsigned long (*XBlackPixel)(EncoreGuiDisplay *, int);
+    unsigned long (*XWhitePixel)(EncoreGuiDisplay *, int);
+    EncoreGuiWindowId (*XCreateSimpleWindow)(
+        EncoreGuiDisplay *,
+        EncoreGuiWindowId,
+        int,
+        int,
+        unsigned int,
+        unsigned int,
+        unsigned int,
+        unsigned long,
+        unsigned long);
+    int (*XStoreName)(EncoreGuiDisplay *, EncoreGuiWindowId, const char *);
+    int (*XSelectInput)(EncoreGuiDisplay *, EncoreGuiWindowId, long);
+    int (*XMapWindow)(EncoreGuiDisplay *, EncoreGuiWindowId);
+    EncoreGuiGc (*XCreateGC)(EncoreGuiDisplay *, EncoreGuiWindowId, unsigned long, void *);
+    int (*XFreeGC)(EncoreGuiDisplay *, EncoreGuiGc);
+    int (*XSetForeground)(EncoreGuiDisplay *, EncoreGuiGc, unsigned long);
+    int (*XFillRectangle)(EncoreGuiDisplay *, EncoreGuiWindowId, EncoreGuiGc, int, int, unsigned int, unsigned int);
+    int (*XFlush)(EncoreGuiDisplay *);
+    int (*XPending)(EncoreGuiDisplay *);
+    int (*XNextEvent)(EncoreGuiDisplay *, void *);
+    int (*XDestroyWindow)(EncoreGuiDisplay *, EncoreGuiWindowId);
+    int (*XCloseDisplay)(EncoreGuiDisplay *);
+    EncoreGuiAtom (*XInternAtom)(EncoreGuiDisplay *, const char *, int);
+    int (*XSetWMProtocols)(EncoreGuiDisplay *, EncoreGuiWindowId, EncoreGuiAtom *, int);
+} EncoreGuiX11Api;
+
+typedef struct {
+    EncoreGuiDisplay *display;
+    EncoreGuiWindowId window;
+    EncoreGuiGc gc;
+    EncoreGuiAtom wm_delete;
+    bool open;
+    uint32_t width;
+    uint32_t height;
+} EncoreGuiWindow;
+
+typedef struct {
+    int type;
+    unsigned long serial;
+    int send_event;
+    EncoreGuiDisplay *display;
+    EncoreGuiWindowId window;
+    EncoreGuiAtom message_type;
+    int format;
+    union {
+        char b[20];
+        short s[10];
+        long l[5];
+    } data;
+} EncoreGuiXClientMessageEvent;
+
+static EncoreGuiX11Api g_gui_x11 = {0};
+
+#define ENCORE_X11_LOAD(field)                                                            \
+    do {                                                                                  \
+        *(void **)(&g_gui_x11.field) = dlsym(g_gui_x11.lib, #field);                      \
+        if (g_gui_x11.field == NULL) {                                                     \
+            dlclose(g_gui_x11.lib);                                                        \
+            memset(&g_gui_x11, 0, sizeof(g_gui_x11));                                      \
+            g_gui_x11.initialized = true;                                                  \
+            return false;                                                                  \
+        }                                                                                  \
+    } while (0)
+
+static bool encore_gui_x11_load(void) {
+    if (g_gui_x11.initialized) {
+        return g_gui_x11.available;
+    }
+
+    g_gui_x11.initialized = true;
+    g_gui_x11.lib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
+    if (g_gui_x11.lib == NULL) {
+        g_gui_x11.lib = dlopen("libX11.so", RTLD_LAZY | RTLD_LOCAL);
+    }
+    if (g_gui_x11.lib == NULL) {
+        return false;
+    }
+
+    ENCORE_X11_LOAD(XOpenDisplay);
+    ENCORE_X11_LOAD(XDefaultScreen);
+    ENCORE_X11_LOAD(XRootWindow);
+    ENCORE_X11_LOAD(XBlackPixel);
+    ENCORE_X11_LOAD(XWhitePixel);
+    ENCORE_X11_LOAD(XCreateSimpleWindow);
+    ENCORE_X11_LOAD(XStoreName);
+    ENCORE_X11_LOAD(XSelectInput);
+    ENCORE_X11_LOAD(XMapWindow);
+    ENCORE_X11_LOAD(XCreateGC);
+    ENCORE_X11_LOAD(XFreeGC);
+    ENCORE_X11_LOAD(XSetForeground);
+    ENCORE_X11_LOAD(XFillRectangle);
+    ENCORE_X11_LOAD(XFlush);
+    ENCORE_X11_LOAD(XPending);
+    ENCORE_X11_LOAD(XNextEvent);
+    ENCORE_X11_LOAD(XDestroyWindow);
+    ENCORE_X11_LOAD(XCloseDisplay);
+    ENCORE_X11_LOAD(XInternAtom);
+    ENCORE_X11_LOAD(XSetWMProtocols);
+
+    g_gui_x11.available = true;
+    return true;
+}
+
+#undef ENCORE_X11_LOAD
+
+static EncoreGuiWindow *encore_gui_window_from_handle(size_t handle) {
+    if (handle == 0) {
+        return NULL;
+    }
+    return (EncoreGuiWindow *)(uintptr_t)handle;
+}
+
+size_t __ehir_rt_gui_window_create(encore_str title, uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0 || !encore_gui_x11_load()) {
+        return 0;
+    }
+
+    EncoreGuiDisplay *display = g_gui_x11.XOpenDisplay(NULL);
+    if (display == NULL) {
+        return 0;
+    }
+
+    EncoreGuiWindow *state = calloc(1, sizeof(EncoreGuiWindow));
+    if (state == NULL) {
+        g_gui_x11.XCloseDisplay(display);
+        return 0;
+    }
+
+    int screen = g_gui_x11.XDefaultScreen(display);
+    EncoreGuiWindowId root = g_gui_x11.XRootWindow(display, screen);
+    unsigned long black = g_gui_x11.XBlackPixel(display, screen);
+    unsigned long white = g_gui_x11.XWhitePixel(display, screen);
+
+    EncoreGuiWindowId window = g_gui_x11.XCreateSimpleWindow(display, root, 0, 0, width, height, 0, black, white);
+    if (window == 0) {
+        free(state);
+        g_gui_x11.XCloseDisplay(display);
+        return 0;
+    }
+
+    EncoreGuiGc gc = g_gui_x11.XCreateGC(display, window, 0, NULL);
+    if (gc == NULL) {
+        g_gui_x11.XDestroyWindow(display, window);
+        free(state);
+        g_gui_x11.XCloseDisplay(display);
+        return 0;
+    }
+
+    char *title_c = encore_to_cstr(title);
+    if (title_c != NULL) {
+        g_gui_x11.XStoreName(display, window, title_c);
+        free(title_c);
+    }
+
+    const long event_mask = (1L << 15) | (1L << 17) | (1L << 0);
+    g_gui_x11.XSelectInput(display, window, event_mask);
+
+    EncoreGuiAtom wm_delete = g_gui_x11.XInternAtom(display, "WM_DELETE_WINDOW", 0);
+    if (wm_delete != 0) {
+        g_gui_x11.XSetWMProtocols(display, window, &wm_delete, 1);
+    }
+
+    g_gui_x11.XMapWindow(display, window);
+    g_gui_x11.XFlush(display);
+
+    state->display = display;
+    state->window = window;
+    state->gc = gc;
+    state->wm_delete = wm_delete;
+    state->open = true;
+    state->width = width;
+    state->height = height;
+
+    return (size_t)(uintptr_t)state;
+}
+
+bool __ehir_rt_gui_window_is_open(size_t handle) {
+    EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
+    return state != NULL && state->open;
+}
+
+bool __ehir_rt_gui_window_poll(size_t handle) {
+    EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
+    if (state == NULL || !state->open) {
+        return false;
+    }
+
+    while (g_gui_x11.XPending(state->display) > 0) {
+        long event_storage[24];
+        memset(event_storage, 0, sizeof(event_storage));
+        g_gui_x11.XNextEvent(state->display, event_storage);
+
+        int type = *((int *)event_storage);
+        if (type == 17) {
+            state->open = false;
+        } else if (type == 33 && state->wm_delete != 0) {
+            EncoreGuiXClientMessageEvent *client = (EncoreGuiXClientMessageEvent *)event_storage;
+            if (client->format == 32 && (EncoreGuiAtom)client->data.l[0] == state->wm_delete) {
+                state->open = false;
+            }
+        }
+    }
+
+    return state->open;
+}
+
+bool __ehir_rt_gui_window_clear(size_t handle, uint32_t color_rgb) {
+    EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
+    if (state == NULL || !state->open) {
+        return false;
+    }
+
+    g_gui_x11.XSetForeground(state->display, state->gc, (unsigned long)color_rgb);
+    g_gui_x11.XFillRectangle(state->display, state->window, state->gc, 0, 0, state->width, state->height);
+    return true;
+}
+
+bool __ehir_rt_gui_window_fill_rect(size_t handle, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t color_rgb) {
+    EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
+    if (state == NULL || !state->open || width == 0 || height == 0) {
+        return false;
+    }
+
+    g_gui_x11.XSetForeground(state->display, state->gc, (unsigned long)color_rgb);
+    g_gui_x11.XFillRectangle(state->display, state->window, state->gc, x, y, width, height);
+    return true;
+}
+
+bool __ehir_rt_gui_window_present(size_t handle) {
+    EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
+    if (state == NULL || !state->open) {
+        return false;
+    }
+    g_gui_x11.XFlush(state->display);
+    return true;
+}
+
+bool __ehir_rt_gui_window_destroy(size_t handle) {
+    EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
+    if (state == NULL) {
+        return false;
+    }
+
+    if (state->display != NULL) {
+        if (state->gc != NULL) {
+            g_gui_x11.XFreeGC(state->display, state->gc);
+        }
+        if (state->window != 0) {
+            g_gui_x11.XDestroyWindow(state->display, state->window);
+        }
+        g_gui_x11.XCloseDisplay(state->display);
+    }
+
+    free(state);
+    return true;
+}
+#else
+size_t __ehir_rt_gui_window_create(encore_str title, uint32_t width, uint32_t height) {
+    (void)title;
+    (void)width;
+    (void)height;
+    return 0;
+}
+
+bool __ehir_rt_gui_window_is_open(size_t handle) {
+    (void)handle;
+    return false;
+}
+
+bool __ehir_rt_gui_window_poll(size_t handle) {
+    (void)handle;
+    return false;
+}
+
+bool __ehir_rt_gui_window_clear(size_t handle, uint32_t color_rgb) {
+    (void)handle;
+    (void)color_rgb;
+    return false;
+}
+
+bool __ehir_rt_gui_window_fill_rect(size_t handle, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t color_rgb) {
+    (void)handle;
+    (void)x;
+    (void)y;
+    (void)width;
+    (void)height;
+    (void)color_rgb;
+    return false;
+}
+
+bool __ehir_rt_gui_window_present(size_t handle) {
+    (void)handle;
+    return false;
+}
+
+bool __ehir_rt_gui_window_destroy(size_t handle) {
+    (void)handle;
+    return false;
+}
+#endif

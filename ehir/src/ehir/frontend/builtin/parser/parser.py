@@ -1,3 +1,5 @@
+from typing import NoReturn, cast
+
 from ehir.core.block import Block
 from ehir.core.derectives import (
     Derective_enum,
@@ -65,6 +67,7 @@ from ehir.core.primitives.base import Primitive, PrimitiveType
 from ehir.core.struct import Struct
 from ehir.core.type import Pointer, Reference, Type
 from ehir.core.variable import Parameter, StructField, Variable
+from ehir.cfg import set_item_cfgs
 from ehir.frontend.builtin.parser.lexer import Lexer
 from ehir.frontend.builtin.parser.tokens import Token, TokenType
 
@@ -90,7 +93,7 @@ class Parser:
         self._consumed = 0
 
         while not self._is_at_end():
-            attrs = self._parse_attrs()
+            attrs, cfgs = self._parse_metadata_directives()
             current_token = self._lookup_curr()
             is_public = False
 
@@ -119,6 +122,7 @@ class Parser:
                 self._error_at(current_token, "Unexpected token at top-level declaration")
 
             self._mark_metadata(derective, is_public, attrs)
+            set_item_cfgs(derective, cfgs)
             self._ast.append(derective)
 
         return self._ast
@@ -179,23 +183,55 @@ class Parser:
             self._safe_consume(TokenType.SEMICOLON)
         return Derective_typealias(name=name, target=target)
 
-    def _parse_attrs(self) -> tuple[str, ...]:
+    def _parse_metadata_directives(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         attrs: list[str] = []
+        cfgs: list[str] = []
         while self._lookup_curr().type == TokenType.HASH:
             self._safe_consume(TokenType.HASH)
             attr_kw = self._safe_consume(TokenType.IDENTIFIER).value
-            if attr_kw != "attr":
-                self._error_at(self._lookup_curr(), f"Unknown attribute directive '#{attr_kw}'")
+            if attr_kw == "attr":
+                attrs.extend(self._parse_attr_args())
+                continue
+            if attr_kw == "cfg":
+                cfgs.append(self._parse_cfg_args())
+                continue
+            self._error_at(self._lookup_curr(), f"Unknown attribute directive '#{attr_kw}'")
 
-            self._safe_consume(TokenType.LEFT_PAREN)
-            if self._lookup_curr() != TokenType.RIGHT_PAREN:
+        return tuple(dict.fromkeys(attrs)), tuple(dict.fromkeys(cfgs))
+
+    def _parse_attrs(self) -> tuple[str, ...]:
+        attrs, cfgs = self._parse_metadata_directives()
+        if cfgs:
+            self._error_at(self._lookup_curr(), "#cfg(...) is only valid for declarations")
+        return attrs
+
+    def _parse_attr_args(self) -> list[str]:
+        attrs: list[str] = []
+        self._safe_consume(TokenType.LEFT_PAREN)
+        if self._lookup_curr() != TokenType.RIGHT_PAREN:
+            attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
+            while self._lookup_curr() == TokenType.COMMA:
+                self._safe_consume(TokenType.COMMA)
                 attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
-                while self._lookup_curr() == TokenType.COMMA:
-                    self._safe_consume(TokenType.COMMA)
-                    attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
-            self._safe_consume(TokenType.RIGHT_PAREN)
+        self._safe_consume(TokenType.RIGHT_PAREN)
+        return attrs
 
-        return tuple(dict.fromkeys(attrs))
+    def _parse_cfg_args(self) -> str:
+        self._safe_consume(TokenType.LEFT_PAREN)
+        depth = 1
+        parts: list[str] = []
+        while depth > 0:
+            token = self._consume()
+            if token.type == TokenType.EOF:
+                self._error_at(token, "Unclosed #cfg(...)")
+            if token.type == TokenType.LEFT_PAREN:
+                depth += 1
+            elif token.type == TokenType.RIGHT_PAREN:
+                depth -= 1
+                if depth == 0:
+                    break
+            parts.append(token.value)
+        return "".join(parts)
 
     def _parse_imp(self) -> Derective_imp:
         self._safe_consume(TokenType.KW_IMP)
@@ -229,9 +265,14 @@ class Parser:
         methods: list[TraitMethod] = []
         self._safe_consume(TokenType.LEFT_BRACE)
         while self._lookup_curr() != TokenType.RIGHT_BRACE:
-            method = self._parse_fn_decl(with_body=False)
+            method_attrs, method_cfgs = self._parse_metadata_directives()
+            method = cast(Derective_fn, self._parse_fn_decl(with_body=False, attrs=method_attrs))
+            trait_method = TraitMethod(
+                name=method.name, generics=method.generics, params=method.params, ret_type=method.ret_type
+            )
+            set_item_cfgs(trait_method, method_cfgs)
             methods.append(
-                TraitMethod(name=method.name, generics=method.generics, params=method.params, ret_type=method.ret_type)
+                trait_method
             )
         self._safe_consume(TokenType.RIGHT_BRACE)
 
@@ -255,12 +296,14 @@ class Parser:
         methods: list[Derective_fn] = []
         self._safe_consume(TokenType.LEFT_BRACE)
         while self._lookup_curr() != TokenType.RIGHT_BRACE:
-            method_attrs = self._parse_attrs()
+            method_attrs, method_cfgs = self._parse_metadata_directives()
             is_public = False
             if self._lookup_curr() == TokenType.KW_PUB:
                 self._safe_consume(TokenType.KW_PUB)
                 is_public = True
-            methods.append(self._parse_fn_decl(with_body=True, attrs=method_attrs, is_public=is_public))
+            method = cast(Derective_fn, self._parse_fn_decl(with_body=True, attrs=method_attrs, is_public=is_public))
+            set_item_cfgs(method, method_cfgs)
+            methods.append(method)
         self._safe_consume(TokenType.RIGHT_BRACE)
 
         return Derective_impl(
@@ -318,11 +361,11 @@ class Parser:
         return Derective_struct(name=name, generics=generics, params=params)
 
     def _parse_fn(self) -> Derective_fn:
-        return self._parse_fn_decl(with_body=True)
+        return cast(Derective_fn, self._parse_fn_decl(with_body=True))
 
-    def _parse_extern_fn(self) -> Derective_fn:
+    def _parse_extern_fn(self) -> Derective_extern_fn:
         self._safe_consume(TokenType.KW_EXTERN)
-        return self._parse_fn_decl(with_body=False, is_extern=True)
+        return cast(Derective_extern_fn, self._parse_fn_decl(with_body=False, is_extern=True))
 
     def _parse_fn_decl(
         self,
@@ -862,11 +905,11 @@ class Parser:
             generic_name = self._parse_name()
             self._safe_consume(TokenType.COLON)
             traits = [self._parse_name()]
-            while isinstance(self._lookup_curr(), TokenType.PLUS):
+            while self._lookup_curr() == TokenType.PLUS:
                 self._safe_consume(TokenType.PLUS)
                 traits.append(self._parse_name())
             bounds[generic_name] = traits
-            if not isinstance(self._lookup_curr(), TokenType.COMMA):
+            if self._lookup_curr() != TokenType.COMMA:
                 break
             self._safe_consume(TokenType.COMMA)
         return bounds
@@ -967,7 +1010,7 @@ class Parser:
     def _trace_unexpected_token(self, token: Token, expected_t: TokenType):
         self._error_at(token, f"Unexpected token '{token.value}', expected {expected_t.name}")
 
-    def _error_at(self, token: Token, message: str) -> None:
+    def _error_at(self, token: Token, message: str) -> NoReturn:
         line = token.line
         col = token.column
         source_line = ""
