@@ -7,7 +7,7 @@ from typing import Any
 
 from ehir.refrain import CompiledRefrain
 
-CACHE_FORMAT_VERSION = 2
+CACHE_FORMAT_VERSION = 3
 
 
 def _load_symbol(module_name: str, qualname: str) -> type[Any]:

@@ -5,6 +5,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from ehir.cfg import default_cfg_environment
 from ehir.compiler import EHIR_ProjectCompiler, Refrain
 from ehir.frontend.builtin import EHIR_DirectFrontend
 
@@ -125,19 +126,36 @@ def _create_compiler(
     target: str,
     target_dir: Path | None = None,
     trace_cfree: bool = False,
+    cfg_overrides: list[str] | None = None,
 ) -> EHIR_ProjectCompiler:
     out_dir = target_dir if target_dir is not None else cwd / "target"
+    cfg_environment = default_cfg_environment(backend="llvm", extra=cfg_overrides or [])
     compiler = EHIR_ProjectCompiler(
-        frontend=EHIR_DirectFrontend(),
+        frontend=EHIR_DirectFrontend(cfg_environment=cfg_environment),
         backend=EHIR_LLVM_Backend(target_dir=out_dir, opt_profile=AVAILABLE_TARGETS[target]),
         trace_cfree=trace_cfree,
+        cfg_environment=cfg_environment,
     )
     _add_dependency_refrains(compiler, cwd)
     return compiler
 
 
-def _build_project(cwd: Path, *, target: str, target_dir: Path | None, root_type: str, trace_cfree: bool):
-    compiler = _create_compiler(cwd, target=target, target_dir=target_dir, trace_cfree=trace_cfree)
+def _build_project(
+    cwd: Path,
+    *,
+    target: str,
+    target_dir: Path | None,
+    root_type: str,
+    trace_cfree: bool,
+    cfg_overrides: list[str] | None,
+):
+    compiler = _create_compiler(
+        cwd,
+        target=target,
+        target_dir=target_dir,
+        trace_cfree=trace_cfree,
+        cfg_overrides=cfg_overrides,
+    )
     compiler.add_refrain_to_build(Refrain(name=cwd.name, path=cwd, type=AVAILABLE_ROOT_TYPES[root_type]))
     compiler.compile_all()
 
@@ -162,7 +180,14 @@ def _collect_tests(cwd: Path) -> list[_TestCase]:
     return cases
 
 
-def _run_tests(cwd: Path, *, target: str, target_dir: Path | None, trace_cfree: bool) -> int:
+def _run_tests(
+    cwd: Path,
+    *,
+    target: str,
+    target_dir: Path | None,
+    trace_cfree: bool,
+    cfg_overrides: list[str] | None,
+) -> int:
     tests = _collect_tests(cwd)
     if not tests:
         print("No tests found.")
@@ -172,7 +197,13 @@ def _run_tests(cwd: Path, *, target: str, target_dir: Path | None, trace_cfree: 
     failed = 0
     for idx, test in enumerate(tests, start=1):
         needs_trace = trace_cfree or test.cfree_expectations.enabled
-        compiler = _create_compiler(cwd, target=target, target_dir=target_dir, trace_cfree=needs_trace)
+        compiler = _create_compiler(
+            cwd,
+            target=target,
+            target_dir=target_dir,
+            trace_cfree=needs_trace,
+            cfg_overrides=cfg_overrides,
+        )
         test_name = f"{cwd.name}__test__{test.entrypoint.replace('/', '__')}"
         compiler.add_refrain_to_build(
             Refrain(
@@ -250,6 +281,13 @@ def main():
         action="store_true",
         help="Print debug messages right before cfree deallocations.",
     )
+    build_parser.add_argument(
+        "--cfg",
+        action="append",
+        default=[],
+        metavar="PREDICATE",
+        help="Add compile-time cfg flag or key=value override.",
+    )
 
     test_parser = subparsers.add_parser("test", help="Run tests from ./tests (*.ehir with fn main)")
     test_parser.add_argument(
@@ -264,6 +302,13 @@ def main():
         action="store_true",
         help="Print debug messages right before cfree deallocations.",
     )
+    test_parser.add_argument(
+        "--cfg",
+        action="append",
+        default=[],
+        metavar="PREDICATE",
+        help="Add compile-time cfg flag or key=value override.",
+    )
 
     args = parser.parse_args()
 
@@ -277,10 +322,19 @@ def main():
             target_dir=target_dir,
             root_type=args.root_type,
             trace_cfree=args.trace_cfree,
+            cfg_overrides=args.cfg,
         )
         return
     if args.command == "test":
-        raise SystemExit(_run_tests(cwd, target=args.target, target_dir=target_dir, trace_cfree=args.trace_cfree))
+        raise SystemExit(
+            _run_tests(
+                cwd,
+                target=args.target,
+                target_dir=target_dir,
+                trace_cfree=args.trace_cfree,
+                cfg_overrides=args.cfg,
+            )
+        )
 
 
 if __name__ == "__main__":

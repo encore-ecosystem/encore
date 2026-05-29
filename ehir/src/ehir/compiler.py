@@ -8,6 +8,7 @@ from pathlib import Path
 from ehir.backend import EHIR_Backend
 from ehir.builder import EHIR_Module
 from ehir.cache import CompiledRefrainCache
+from ehir.cfg import CfgEnvironment, default_cfg_environment
 from ehir.core.derectives import (
     Derective_enum,
     Derective_extern_fn,
@@ -26,7 +27,7 @@ from ehir.core.variable import Parameter
 from ehir.format import ThemePalette, printfmt
 from ehir.frontend import EHIR_Frontend
 from ehir.postprocessor import Postprocessor
-from ehir.refrain import CompiledRefrain, Refrain
+from ehir.refrain import CompiledRefrain, NativeLibrary, Refrain
 from ehir.simplifier import (
     AutoDropPass,
     AutoRetainPass,
@@ -63,6 +64,7 @@ class EHIR_ProjectCompiler:
     cache_dir: Path | None = None
     use_cache: bool = True
     trace_cfree: bool = False
+    cfg_environment: CfgEnvironment = field(default_factory=default_cfg_environment)
     on_refrain: Callable[[Refrain], None] | None = None
     refrains: dict[str, Refrain] = field(default_factory=dict)
     tree: dict[Path, TreeNode] = field(default_factory=dict)
@@ -77,6 +79,8 @@ class EHIR_ProjectCompiler:
             self.cache_dir = self.backend.profile_path / "ehir" / "cache"
 
         self._cache = CompiledRefrainCache(self.cache_dir)
+        if hasattr(self.frontend, "cfg_environment"):
+            setattr(self.frontend, "cfg_environment", self.cfg_environment)
 
     def add_refrain_to_build(self, refrain: Refrain):
         if refrain.name in self.refrains:
@@ -203,6 +207,7 @@ class EHIR_ProjectCompiler:
             compiler_version=self._compiler_version,
             dependencies=sorted(node.dependencies),
             source_files=source_files,
+            native_libraries=self._collect_native_libraries_for(refrain),
         )
         self._cache.store(compiled_refrain)
         self.compiled_refrains[refrain.name] = compiled_refrain
@@ -481,6 +486,13 @@ class EHIR_ProjectCompiler:
         digest.update(refrain.type.value.encode())
         digest.update(b"trace_cfree=")
         digest.update(b"1" if self.trace_cfree else b"0")
+        digest.update(b"cfg.flags=")
+        digest.update(",".join(sorted(self.cfg_environment.flags)).encode())
+        digest.update(b"cfg.values=")
+        digest.update(",".join(f"{k}={v}" for k, v in sorted(self.cfg_environment.values.items())).encode())
+        digest.update(b"native=")
+        for native in self._collect_native_libraries_for(refrain):
+            digest.update(repr(native).encode())
 
         for source_file in source_files:
             resolved_file = source_file.resolve()
@@ -488,6 +500,18 @@ class EHIR_ProjectCompiler:
             digest.update(resolved_file.read_bytes())
 
         return digest.hexdigest()
+
+    def _collect_native_libraries_for(self, refrain: Refrain) -> list[NativeLibrary]:
+        candidates = self.refrains.values() if refrain.type == Refrain.TargetType.EXECUTABLE else [refrain]
+        result: list[NativeLibrary] = []
+        seen: set[NativeLibrary] = set()
+        for candidate in candidates:
+            for native in candidate.native_libraries:
+                if native in seen:
+                    continue
+                seen.add(native)
+                result.append(native)
+        return result
 
     def _compile_node_by_id(self, id: Path) -> TreeNode:
         if node := self.tree.get(id):
@@ -708,7 +732,11 @@ class EHIR_ProjectCompiler:
 
         from ehir.frontend.builtin import EHIR_DirectFrontend
 
-        core_frontend = self.frontend if self.frontend.get_file_extension() == ".ehir" else EHIR_DirectFrontend()
+        core_frontend = (
+            self.frontend
+            if self.frontend.get_file_extension() == ".ehir"
+            else EHIR_DirectFrontend(cfg_environment=self.cfg_environment)
+        )
 
         directives: list[Derective] = []
         seen_symbols: set[tuple[type, str]] = set()

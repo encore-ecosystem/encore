@@ -232,6 +232,7 @@ class Translator:
         self._type_aliases = {}
         self._trait_aliases = {}
         self._active_generic_bounds = {}
+        self._global_exprs: dict[str, s.Statement_Expression] = {}
 
     def run(self, program: str) -> EHIR_Module:
         self._reset_state()
@@ -265,6 +266,9 @@ class Translator:
     def preload_declarations(self, declarations: list[tuple[Path, s.Statement_TopLevel, str | None, str | None]]):
         for module_id, statement, local_name, source_name in declarations:
             self._register_declaration_alias(module_id, statement, local_name=local_name, source_name=source_name)
+            if isinstance(statement, s.Statement_Global):
+                binding_name = local_name or statement.name
+                self._global_exprs[binding_name] = statement.expr
 
         for module_id, statement, _, source_name in declarations:
             if isinstance(statement, s.Statement_StructureDefinition):
@@ -387,6 +391,8 @@ class Translator:
                             body=[],
                             ret_type=self._translate_type(normalized_signature.type),
                         )
+            elif isinstance(statement, s.Statement_Global):
+                continue
 
     def _translate_statement(self, statement: s.Statement) -> Derective | None:
         if isinstance(statement, s.Statement_FunctionDefinition):
@@ -403,6 +409,8 @@ class Translator:
             return self._translate_impl_definition(statement)
         elif isinstance(statement, s.Statement_Import):
             return self._translate_import(statement)
+        elif isinstance(statement, s.Statement_Global):
+            return None
         raise NotImplementedError(f"Translation for statement type {type(statement)} is not implemented.")
 
     def _normalize_signature(
@@ -1485,18 +1493,37 @@ class Translator:
         expr = statement.expr
         if not isinstance(expr, s.Expression_MethodCall):
             return
-        if not isinstance(expr.receiver, s.Expression_Path) or len(expr.receiver.segments) != 1:
-            return
-        receiver_name = expr.receiver.name
-        receiver_ptr = self._var_ptrs.get(receiver_name)
-        if receiver_ptr is None or not isinstance(receiver_ptr.type, Pointer):
-            return
-        receiver_type = receiver_ptr.type.pointee
         result_type = value.var_out.type
         if result_type is None:
             return
-        if self._types_compatible(result_type, receiver_type):
-            self._builder._add(Instruction_store(var_src=value.var_out, var_dst=receiver_ptr))
+        if isinstance(expr.receiver, s.Expression_Path) and len(expr.receiver.segments) == 1:
+            receiver_name = expr.receiver.name
+            receiver_ptr = self._var_ptrs.get(receiver_name)
+            if receiver_ptr is None or not isinstance(receiver_ptr.type, Pointer):
+                return
+            receiver_type = receiver_ptr.type.pointee
+            if self._types_compatible(result_type, receiver_type):
+                self._builder._add(Instruction_store(var_src=value.var_out, var_dst=receiver_ptr))
+            return
+
+        if isinstance(expr.receiver, s.Expression_StructField):
+            lvalue_ptr = self._resolve_struct_lvalue_base_ptr(expr.receiver.name)
+            field = Variable(expr.receiver.field)
+            dst_ptr = Variable(self._advance_variable())
+            expected_type: Type | None = None
+            if lvalue_ptr is not None:
+                self._builder._add(Instruction_getfieldptr(var_out=dst_ptr, src=lvalue_ptr, field=field))
+                expected_type = self._lookup_field_type(lvalue_ptr.type.pointee, expr.receiver.field)
+            else:
+                src = self._resolve_struct_field_chain(expr.receiver.name)
+                expected_type = self._lookup_field_type(self._field_owner_type(src), expr.receiver.field)
+                if expected_type is not None and self._is_source_reference_like(src):
+                    if self._types_compatible(result_type, expected_type):
+                        self._builder._add(Instruction_setfield(var=src, field=field, value=value.var_out))
+                    return
+                self._builder._add(Instruction_getfieldptr(var_out=dst_ptr, src=src, field=field))
+            if expected_type is not None and self._types_compatible(result_type, expected_type):
+                self._builder._add(Instruction_store(var_src=value.var_out, var_dst=dst_ptr))
 
     def _translate_unsafe(self, statement: s.Statement_Unsafe):
         self._unsafe_depth += 1
@@ -2100,6 +2127,9 @@ class Translator:
                 explicit_binding = self._lookup_explicit_path_value(expr.name, result_name=name)
                 if explicit_binding is not None:
                     return explicit_binding
+                global_expr = self._global_exprs.get(expr.name)
+                if global_expr is not None:
+                    return self._translate_expression(global_expr, name=name, expected_type=expected_type)
                 return self._builder.get_var(expr.name)
 
             enum_expr = self._build_enum_from_path(expr)
@@ -2832,7 +2862,18 @@ class Translator:
         if not parts:
             return None
 
-        root_ptr = self._var_ptrs.get(parts[0])
+        root_name = parts[0]
+        root_ptr = self._var_ptrs.get(root_name)
+        if root_ptr is None:
+            root_val = self._var_vals.get(root_name)
+            if root_val is not None and root_val.type is not None:
+                promoted_ptr = self._create_stack_slot(
+                    self._fresh_temp_name(f"{root_name}_slot"),
+                    root_val,
+                    root_val.type,
+                )
+                self._var_ptrs[root_name] = promoted_ptr
+                root_ptr = promoted_ptr
         if root_ptr is None:
             return None
         if not isinstance(root_ptr.type, Pointer):

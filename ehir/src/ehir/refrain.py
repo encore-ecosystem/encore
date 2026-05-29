@@ -5,6 +5,18 @@ from pathlib import Path
 from ehir.postprocessor import ProcessedModule
 
 
+@dataclass(frozen=True)
+class NativeLibrary:
+    name: str
+    kind: str = "system"
+    link_name: str | None = None
+    path: str | None = None
+    search_paths: tuple[str, ...] = field(default_factory=tuple)
+    frameworks: tuple[str, ...] = field(default_factory=tuple)
+    link_args: tuple[str, ...] = field(default_factory=tuple)
+    cfg: str | None = None
+
+
 @dataclass
 class Refrain:
     class TargetType(StrEnum):
@@ -18,6 +30,7 @@ class Refrain:
     entrypoint: str | None = None
     entry_root: str = "src"
     merge_module_dirs: tuple[str, ...] = field(default_factory=tuple)
+    native_libraries: list[NativeLibrary] = field(default_factory=list)
 
     @property
     def entrypoint_stem(self) -> str:
@@ -38,3 +51,4 @@ class CompiledRefrain:
     compiler_version: str
     dependencies: list[Path] = field(default_factory=list)
     source_files: list[Path] = field(default_factory=list)
+    native_libraries: list[NativeLibrary] = field(default_factory=list)

@@ -4,9 +4,10 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import StrEnum, auto
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
 from ehir.builder import EHIR_Module
+from ehir.cfg import CfgEnvironment, default_cfg_environment, filter_cfg_items
 from ehir.core.derectives import Derective_imp, Derective_import
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 
@@ -21,7 +22,6 @@ from encore.frontend.translator import Translator
 from encore.frontend.types import (
     AnySmartPointer,
     is_mutable_type,
-    is_raw_pointer_type,
     make_mutable_type,
     unwrap_for_storage,
 )
@@ -69,6 +69,7 @@ class ImportedTopLevelDeclaration:
 @dataclass
 class EHIR_EncoreFrontend(EHIR_Frontend):
     src_dir: Path
+    cfg_environment: CfgEnvironment = field(default_factory=default_cfg_environment)
     on_module_load: Callable[[Path], None] | None = None
     _cache: dict[Path, EHIR_Module] = field(default_factory=dict)
     _ast_cache: dict[Path, list[s.Statement]] = field(default_factory=dict)
@@ -89,7 +90,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         ast = self._get_ast_by_id(id)
         imported_declarations = self._collect_imported_declarations(id, ast)
         try:
-            TypeInferer().infer(ast, imported_declarations)
+            TypeInferer().infer(ast, cast(list[object], imported_declarations))
         except Exception as exc:
             raise with_diagnostic_context(exc, stage="type-inference", module_id=id) from exc
 
@@ -97,7 +98,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         ast_for_translation = self._prepare_imports_for_translation(id, ast)
         try:
             module = translator.translate_ast(
-                ast_for_translation, module_id=id, imported_declarations=imported_declarations
+                ast_for_translation, module_id=id, imported_declarations=cast(list[object], imported_declarations)
             )
         except Exception as exc:
             raise with_diagnostic_context(exc, stage="translation", module_id=id) from exc
@@ -160,6 +161,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             tokens = self._lexer.parse(list(source_text))
             tokens = self._macro_expander.expand(tokens)
             ast = self._parser.parse(tokens, module_id=id, source_text=source_text)
+            ast = filter_cfg_items(ast, self.cfg_environment)
         except Exception as exc:
             raise with_diagnostic_context(exc, stage="parse", module_id=id, source_text=source_text) from exc
         ast = self._inject_prelude_imports(id, ast)
@@ -261,7 +263,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                 return collect_named_types(typ.pointee)
             if isinstance(typ, StackSmartPointer):
                 return collect_named_types(typ.pointee)
-            if is_raw_pointer_type(typ):
+            if isinstance(typ, Pointer):
                 return collect_named_types(typ.pointee)
 
             names = {typ.name}
@@ -696,7 +698,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return HeapSmartPointer(self._replace_type_name(typ.pointee, source_name, target_name))
         if isinstance(typ, StackSmartPointer):
             return StackSmartPointer(self._replace_type_name(typ.pointee, source_name, target_name))
-        if is_raw_pointer_type(typ):
+        if isinstance(typ, Pointer):
             return Pointer(self._replace_type_name(typ.pointee, source_name, target_name))
 
         name = target_name if typ.name == source_name else typ.name
