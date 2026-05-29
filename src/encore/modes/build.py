@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Callable
 
 from ehir.backend import EHIR_Backend
+from ehir.cfg import CfgEnvironment, cfg_matches, default_cfg_environment
 from ehir.compiler import EHIR_ProjectCompiler
+from ehir.refrain import NativeLibrary
 from git import Repo
 from rich.console import Console, Group
 from rich.live import Live
@@ -101,25 +103,41 @@ def add_build_parser(subparsers) -> tuple[str, Callable]:
         "--profile", default="debug", choices=set(AVAILABLE_OPTPROFILES.keys()), help="Optimization profile"
     )
     build_parser.add_argument("--no-cache", action="store_true", help="Ignore existing EHIR cache for this build")
+    build_parser.add_argument(
+        "--cfg",
+        action="append",
+        default=[],
+        metavar="PREDICATE",
+        help="Add compile-time cfg flag or key=value override.",
+    )
     return (section, handle_build)
 
 
 def handle_build(args: Namespace):
     cwd = Path().resolve()
 
-    compiler = create_compiler(cwd, args.backend, args.profile, no_cache=args.no_cache)
+    compiler = create_compiler(cwd, args.backend, args.profile, no_cache=args.no_cache, cfg_overrides=args.cfg)
     _inject_mandatory_core_dependency(compiler, cwd)
     _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
     with _BuildLiveStatus(compiler):
         compiler.compile_all()
 
 
-def create_compiler(cwd: Path, backend: str, profile: str, *, no_cache: bool = False) -> EHIR_ProjectCompiler:
+def create_compiler(
+    cwd: Path,
+    backend: str,
+    profile: str,
+    *,
+    no_cache: bool = False,
+    cfg_overrides: list[str] | None = None,
+) -> EHIR_ProjectCompiler:
     backend_cls = _resolve_backend(backend)
+    cfg_environment = default_cfg_environment(backend=backend, extra=cfg_overrides or [])
     compiler = EHIR_ProjectCompiler(
-        frontend=EHIR_EncoreFrontend(src_dir=cwd / "src"),
+        frontend=EHIR_EncoreFrontend(src_dir=cwd / "src", cfg_environment=cfg_environment),
         backend=backend_cls(target_dir=cwd / "target", opt_profile=AVAILABLE_OPTPROFILES[profile]),
         use_cache=not no_cache,
+        cfg_environment=cfg_environment,
     )
     return compiler
 
@@ -268,9 +286,69 @@ def _load_refrain(
         path=path,
         type=type,
         merge_module_dirs=("modes",) if (path / "src" / "modes").exists() else (),
+        native_libraries=_native_libraries_from_manifest(manifest, path, compiler.cfg_environment),
     )
     compiler.add_refrain_to_build(ref)
     return ref
+
+
+def _native_libraries_from_manifest(
+    manifest: ProjectManifest,
+    project_path: Path,
+    cfg_environment: CfgEnvironment,
+) -> list[NativeLibrary]:
+    native = manifest.native
+    result: list[NativeLibrary] = []
+
+    if native.search_paths or native.frameworks or native.link_args:
+        result.append(
+            NativeLibrary(
+                name=f"{manifest.project.name}::native",
+                kind="link_args",
+                search_paths=tuple(_resolve_native_path(project_path, path) for path in native.search_paths),
+                frameworks=tuple(native.frameworks),
+                link_args=tuple(native.link_args),
+            )
+        )
+
+    for entry in native.libraries:
+        if isinstance(entry, str):
+            result.append(
+                NativeLibrary(
+                    name=entry,
+                    search_paths=tuple(_resolve_native_path(project_path, path) for path in native.search_paths),
+                    frameworks=tuple(native.frameworks),
+                    link_args=tuple(native.link_args),
+                )
+            )
+            continue
+
+        if entry.cfg is not None and not cfg_matches(entry.cfg, cfg_environment):
+            continue
+
+        result.append(
+            NativeLibrary(
+                name=entry.name,
+                kind=entry.kind,
+                link_name=entry.link_name,
+                path=_resolve_native_path(project_path, entry.path) if entry.path is not None else None,
+                search_paths=tuple(
+                    _resolve_native_path(project_path, path)
+                    for path in [*native.search_paths, *entry.search_paths]
+                ),
+                frameworks=tuple([*native.frameworks, *entry.frameworks]),
+                link_args=tuple([*native.link_args, *entry.link_args]),
+                cfg=entry.cfg,
+            )
+        )
+    return result
+
+
+def _resolve_native_path(project_path: Path, value: str) -> str:
+    path = Path(value)
+    if path.is_absolute():
+        return path.as_posix()
+    return (project_path / path).resolve().as_posix()
 
 
 def infer_project_target_type(cwd: Path) -> Refrain.TargetType:
@@ -299,8 +377,15 @@ def resolve_project_target_type(cwd: Path) -> Refrain.TargetType:
     raise RuntimeError(f"Unknown project target type: {manifest.project.target}")
 
 
-def build_project(cwd: Path, backend: str, profile: str, *, no_cache: bool = False) -> list[tuple[str, Path]]:
-    compiler = create_compiler(cwd, backend, profile, no_cache=no_cache)
+def build_project(
+    cwd: Path,
+    backend: str,
+    profile: str,
+    *,
+    no_cache: bool = False,
+    cfg_overrides: list[str] | None = None,
+) -> list[tuple[str, Path]]:
+    compiler = create_compiler(cwd, backend, profile, no_cache=no_cache, cfg_overrides=cfg_overrides)
     _inject_mandatory_core_dependency(compiler, cwd)
     entry_ref = _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
     outputs = compiler.compile_all()
@@ -325,6 +410,7 @@ def update_dependencies(path: Path):
 def sync_dependencies(path: Path, *, update: bool = False, ignore_errors: bool = False) -> dict[str, dict[str, str]]:
     resolved: dict[str, dict[str, str]] = {}
     visited: set[Path] = set()
+    lock_root = path.resolve()
 
     def visit(project_path: Path) -> None:
         project_path = project_path.resolve()
@@ -343,7 +429,7 @@ def sync_dependencies(path: Path, *, update: bool = False, ignore_errors: bool =
                 raise
             info: dict[str, str] = {
                 "name": dep_manifest.project.name,
-                "ref": _resolved_ref_for_lock(dep_ref, project_path, dep_path),
+                "ref": _resolved_ref_for_lock(dep_ref, project_path, dep_path, lock_root),
                 "version": dep_manifest.project.version,
             }
             git_dir = dep_path / ".git"
@@ -375,14 +461,14 @@ def sync_dependencies(path: Path, *, update: bool = False, ignore_errors: bool =
     return resolved
 
 
-def _resolved_ref_for_lock(dep_ref: str, project_path: Path, dep_path: Path) -> str:
+def _resolved_ref_for_lock(dep_ref: str, project_path: Path, dep_path: Path, lock_root: Path) -> str:
     if dep_ref.startswith("git@"):
         return dep_ref
 
     if dep_ref.startswith("path@"):
         requested_path = (project_path / dep_ref.removeprefix("path@")).resolve()
         if requested_path == dep_path.resolve():
-            return _path_ref_for_lock(project_path, dep_path)
+            return _path_ref_for_lock(lock_root, dep_path)
 
         # Legacy path@index/* fallback: persist effective git ref in lock.
         if "index" in requested_path.parts:

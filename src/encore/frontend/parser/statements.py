@@ -230,6 +230,17 @@ class Statement_InnerLevel(Statement):
 
 
 @dataclass
+class Statement_Global(Statement_TopLevel):
+    name: str
+    type: Type | None
+    expr: "Statement_Expression"
+
+    def __repr__(self) -> str:
+        type_repr = f" : {self.type}" if self.type else ""
+        return f"{super().__repr__()}let {self.name}{type_repr} = {self.expr}"
+
+
+@dataclass
 class Statement_OneLineComment(Statement_TopLevel, Statement_InnerLevel):
     value: str
 

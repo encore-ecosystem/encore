@@ -27,8 +27,27 @@ class ProjectSection(StrictModel):
     dependencies: list[str] = Field(default=[])
 
 
+class NativeLibrarySection(StrictModel):
+    name: str
+    kind: str = Field(default="system")
+    link_name: str | None = None
+    path: str | None = None
+    search_paths: list[str] = Field(default=[])
+    frameworks: list[str] = Field(default=[])
+    link_args: list[str] = Field(default=[])
+    cfg: str | None = None
+
+
+class NativeSection(StrictModel):
+    libraries: list[str | NativeLibrarySection] = Field(default=[])
+    search_paths: list[str] = Field(default=[])
+    frameworks: list[str] = Field(default=[])
+    link_args: list[str] = Field(default=[])
+
+
 class ProjectManifest(StrictModel):
     project: ProjectSection
+    native: NativeSection = Field(default_factory=NativeSection)
 
     @staticmethod
     def default_filename() -> str:

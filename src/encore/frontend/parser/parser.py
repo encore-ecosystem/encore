@@ -36,6 +36,7 @@ from ehir.core.instructions import (
     Instruction_switch,
     Instruction_xor,
 )
+from ehir.cfg import set_item_cfgs
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter
 from ehir.frontend.builtin.parser import Parser as EHIR_Parser
@@ -113,13 +114,16 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         return LexerToken(type=TokenType.EOF, value="", line=0, column=0)
 
     def _parse_top_level(self):
-        attrs = self._parse_function_attrs()
+        attrs, cfgs = self._parse_metadata_directives()
         curr_token = self._peek_curr()
+        result_start = len(self._result)
 
         if curr_token.type == TokenType.KW_IMPL:
             if attrs:
                 raise TypeError("Function attributes are only allowed on fn/extern fn")
-            self._push(self._parse_impl())
+            impl = self._parse_impl()
+            set_item_cfgs(impl, cfgs)
+            self._push(impl)
             return
 
         is_public = False
@@ -140,12 +144,28 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 self._parse_trait(is_public)
             case TokenType.KW_STRUCT:
                 self._push(self._parse_struct(is_public))
+            case TokenType.KW_LET:
+                self._push(self._parse_global_let(is_public))
             case TokenType.KW_FN:
                 self._parse_fn(is_public, attrs)
             case TokenType.KW_EXTERN:
                 self._parse_extern(is_public, attrs)
             case _:
                 raise NotImplementedError(f"{curr_token}")
+
+        for statement in self._result[result_start:]:
+            set_item_cfgs(statement, cfgs)
+
+    def _parse_global_let(self, is_public: bool) -> s.Statement_Global:
+        let_stmt = self._parse_let()
+        if let_stmt.is_mut:
+            raise TypeError("Global 'let' can not be mutable")
+        return s.Statement_Global(
+            is_public=is_public,
+            name=let_stmt.name,
+            type=let_stmt.type,
+            expr=let_stmt.expr,
+        )
 
     def _parse_import(self, is_pub: bool):
         self._safe_consume(TokenType.KW_IMPORT)
@@ -185,8 +205,10 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         body: list[s.FunctionSignature] = []
         self._safe_consume(TokenType.LEFT_BRACE)
         while self._peek_curr().type != TokenType.RIGHT_BRACE:
-            attrs = self._parse_function_attrs()
-            body.append(self._parse_function_signature(attrs=attrs))
+            attrs, cfgs = self._parse_metadata_directives()
+            method = self._parse_function_signature(attrs=attrs)
+            set_item_cfgs(method, cfgs)
+            body.append(method)
         self._safe_consume(TokenType.RIGHT_BRACE)
         self._push(s.Statement_Trait(is_public=is_public, name=name, generics=generics, body=body, bases=bases))
 
@@ -206,7 +228,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         if self._peek_curr().type == TokenType.LEFT_BRACE:
             self._safe_consume(TokenType.LEFT_BRACE)
             while self._peek_curr().type != TokenType.RIGHT_BRACE:
-                attrs = self._parse_function_attrs()
+                attrs, cfgs = self._parse_metadata_directives()
                 is_public = False
                 if self._peek_curr().type == TokenType.KW_PUB:
                     self._safe_consume(TokenType.KW_PUB)
@@ -215,12 +237,13 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 sign = self._parse_function_signature(is_public, attrs=attrs)
                 fn_body = self._parse_block()
                 body.append(
-                    s.Statement_FunctionDefinition(
+                    fn_def := s.Statement_FunctionDefinition(
                         is_public=is_public,
                         signature=sign,
                         body=fn_body,
                     )
                 )
+                set_item_cfgs(fn_def, cfgs)
             self._safe_consume(TokenType.RIGHT_BRACE)
 
         return s.Statement_Impl(
@@ -368,20 +391,53 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         )
 
     def _parse_function_attrs(self) -> list[str]:
+        attrs, cfgs = self._parse_metadata_directives()
+        if cfgs:
+            raise TypeError("#cfg(...) is only valid for declarations")
+        return attrs
+
+    def _parse_metadata_directives(self) -> tuple[list[str], list[str]]:
         attrs: list[str] = []
+        cfgs: list[str] = []
         while self._peek_curr().type == TokenType.HASH:
             self._safe_consume(TokenType.HASH)
             directive = self._safe_consume(TokenType.IDENTIFIER).value
-            if directive != "attr":
-                raise TypeError(f"Unsupported attribute directive '#{directive}', expected '#attr(...)'")
+            if directive == "attr":
+                attrs.extend(self._parse_attr_args())
+                continue
+            if directive == "cfg":
+                cfgs.append(self._parse_cfg_args())
+                continue
+            raise TypeError(f"Unsupported attribute directive '#{directive}', expected '#attr(...)' or '#cfg(...)'")
 
-            self._safe_consume(TokenType.LEFT_PAREN)
+        return attrs, cfgs
+
+    def _parse_attr_args(self) -> list[str]:
+        attrs: list[str] = []
+        self._safe_consume(TokenType.LEFT_PAREN)
+        attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
+        while self._peek_curr().type == TokenType.COMMA:
+            self._safe_consume(TokenType.COMMA)
             attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
-            while self._peek_curr().type == TokenType.COMMA:
-                self._safe_consume(TokenType.COMMA)
-                attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
-            self._safe_consume(TokenType.RIGHT_PAREN)
+        self._safe_consume(TokenType.RIGHT_PAREN)
         return attrs
+
+    def _parse_cfg_args(self) -> str:
+        self._safe_consume(TokenType.LEFT_PAREN)
+        depth = 1
+        parts: list[str] = []
+        while depth > 0:
+            if self._is_at_end():
+                raise TypeError("Unclosed #cfg(...)")
+            token = self._consume()
+            if token.type == TokenType.LEFT_PAREN:
+                depth += 1
+            elif token.type == TokenType.RIGHT_PAREN:
+                depth -= 1
+                if depth == 0:
+                    break
+            parts.append(token.value)
+        return "".join(parts)
 
     def _parse_block(self) -> s.Block:
         self._safe_consume(TokenType.LEFT_BRACE)
@@ -838,7 +894,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             break
         return expr
 
-    def _parse_integer_literal(self) -> s.Expression_IntegerLiteral:
+    def _parse_integer_literal(self) -> s.Expression_IntegerLiteral | s.Expression_FloatLiteral:
         value = self._safe_consume(TokenType.INTEGER).value
         literal_type = self._parse_numeric_literal_suffix()
         if literal_type is not None and self._is_float_type_name(literal_type.name):
@@ -854,8 +910,37 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     def _parse_string_literal(self) -> s.Expression_StringLiteral:
         raw = self._safe_consume(TokenType.STRING).value
-        unescape = bytes(raw[1:-1], "utf-8").decode("unicode_escape")
-        return s.Expression_StringLiteral(unescape)
+        return s.Expression_StringLiteral(self._unescape_string_literal(raw[1:-1]))
+
+    def _unescape_string_literal(self, raw: str) -> str:
+        out: list[str] = []
+        i = 0
+        while i < len(raw):
+            ch = raw[i]
+            if ch != "\\":
+                out.append(ch)
+                i += 1
+                continue
+            if i + 1 >= len(raw):
+                out.append("\\")
+                break
+            nxt = raw[i + 1]
+            if nxt == "n":
+                out.append("\n")
+            elif nxt == "t":
+                out.append("\t")
+            elif nxt == "r":
+                out.append("\r")
+            elif nxt == "\\":
+                out.append("\\")
+            elif nxt == '"':
+                out.append('"')
+            else:
+                # Keep unknown escapes verbatim.
+                out.append("\\")
+                out.append(nxt)
+            i += 2
+        return "".join(out)
 
     def _parse_parenthesized_or_tuple(self) -> s.Statement_Expression:
         self._safe_consume(TokenType.LEFT_PAREN)

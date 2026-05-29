@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from ehir.builder import EHIR_Module
+from ehir.cfg import CfgEnvironment, default_cfg_environment, filter_cfg_items
 from ehir.core.derectives import Derective_import
 from ehir.frontend import EHIR_Frontend
 from ehir.frontend.builtin.parser import Parser
@@ -13,8 +14,9 @@ class EHIR_DirectFrontend(EHIR_Frontend):
 
     _cache: dict[Path, EHIR_Module]
 
-    def __init__(self):
+    def __init__(self, cfg_environment: CfgEnvironment | None = None):
         self._cache = {}
+        self.cfg_environment = cfg_environment or default_cfg_environment()
 
     def get_module_by_id(self, id: Path) -> EHIR_Module:
         if id in self._cache:
@@ -24,7 +26,7 @@ class EHIR_DirectFrontend(EHIR_Frontend):
         module_path = Path(id).resolve()
         try:
             with module_path.open("r") as f:
-                ast = parser.parse(f.read())
+                ast = filter_cfg_items(parser.parse(f.read()), self.cfg_environment)
         except Exception as exc:
             raise RuntimeError(f"Parse error in {module_path}: {exc}") from exc
 
