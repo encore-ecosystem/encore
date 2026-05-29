@@ -232,6 +232,7 @@ class Translator:
         self._type_aliases = {}
         self._trait_aliases = {}
         self._active_generic_bounds = {}
+        self._global_exprs: dict[str, s.Statement_Expression] = {}
 
     def run(self, program: str) -> EHIR_Module:
         self._reset_state()
@@ -265,6 +266,9 @@ class Translator:
     def preload_declarations(self, declarations: list[tuple[Path, s.Statement_TopLevel, str | None, str | None]]):
         for module_id, statement, local_name, source_name in declarations:
             self._register_declaration_alias(module_id, statement, local_name=local_name, source_name=source_name)
+            if isinstance(statement, s.Statement_Global):
+                binding_name = local_name or statement.name
+                self._global_exprs[binding_name] = statement.expr
 
         for module_id, statement, _, source_name in declarations:
             if isinstance(statement, s.Statement_StructureDefinition):
@@ -387,6 +391,8 @@ class Translator:
                             body=[],
                             ret_type=self._translate_type(normalized_signature.type),
                         )
+            elif isinstance(statement, s.Statement_Global):
+                continue
 
     def _translate_statement(self, statement: s.Statement) -> Derective | None:
         if isinstance(statement, s.Statement_FunctionDefinition):
@@ -403,6 +409,8 @@ class Translator:
             return self._translate_impl_definition(statement)
         elif isinstance(statement, s.Statement_Import):
             return self._translate_import(statement)
+        elif isinstance(statement, s.Statement_Global):
+            return None
         raise NotImplementedError(f"Translation for statement type {type(statement)} is not implemented.")
 
     def _normalize_signature(
@@ -2100,6 +2108,9 @@ class Translator:
                 explicit_binding = self._lookup_explicit_path_value(expr.name, result_name=name)
                 if explicit_binding is not None:
                     return explicit_binding
+                global_expr = self._global_exprs.get(expr.name)
+                if global_expr is not None:
+                    return self._translate_expression(global_expr, name=name, expected_type=expected_type)
                 return self._builder.get_var(expr.name)
 
             enum_expr = self._build_enum_from_path(expr)

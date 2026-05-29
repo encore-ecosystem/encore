@@ -140,12 +140,25 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 self._parse_trait(is_public)
             case TokenType.KW_STRUCT:
                 self._push(self._parse_struct(is_public))
+            case TokenType.KW_LET:
+                self._push(self._parse_global_let(is_public))
             case TokenType.KW_FN:
                 self._parse_fn(is_public, attrs)
             case TokenType.KW_EXTERN:
                 self._parse_extern(is_public, attrs)
             case _:
                 raise NotImplementedError(f"{curr_token}")
+
+    def _parse_global_let(self, is_public: bool) -> s.Statement_Global:
+        let_stmt = self._parse_let()
+        if let_stmt.is_mut:
+            raise TypeError("Global 'let' can not be mutable")
+        return s.Statement_Global(
+            is_public=is_public,
+            name=let_stmt.name,
+            type=let_stmt.type,
+            expr=let_stmt.expr,
+        )
 
     def _parse_import(self, is_pub: bool):
         self._safe_consume(TokenType.KW_IMPORT)
@@ -854,8 +867,37 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     def _parse_string_literal(self) -> s.Expression_StringLiteral:
         raw = self._safe_consume(TokenType.STRING).value
-        unescape = bytes(raw[1:-1], "utf-8").decode("unicode_escape")
-        return s.Expression_StringLiteral(unescape)
+        return s.Expression_StringLiteral(self._unescape_string_literal(raw[1:-1]))
+
+    def _unescape_string_literal(self, raw: str) -> str:
+        out: list[str] = []
+        i = 0
+        while i < len(raw):
+            ch = raw[i]
+            if ch != "\\":
+                out.append(ch)
+                i += 1
+                continue
+            if i + 1 >= len(raw):
+                out.append("\\")
+                break
+            nxt = raw[i + 1]
+            if nxt == "n":
+                out.append("\n")
+            elif nxt == "t":
+                out.append("\t")
+            elif nxt == "r":
+                out.append("\r")
+            elif nxt == "\\":
+                out.append("\\")
+            elif nxt == '"':
+                out.append('"')
+            else:
+                # Keep unknown escapes verbatim.
+                out.append("\\")
+                out.append(nxt)
+            i += 2
+        return "".join(out)
 
     def _parse_parenthesized_or_tuple(self) -> s.Statement_Expression:
         self._safe_consume(TokenType.LEFT_PAREN)

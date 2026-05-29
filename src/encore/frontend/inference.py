@@ -61,6 +61,7 @@ class TypeInferer:
         self._enums: dict[str, s.Statement_EnumDefinition] = {}
         self._traits: dict[str, s.Statement_Trait] = {}
         self._impl_traits: dict[str, list[str]] = {}
+        self._globals: dict[str, Type] = {}
         self._unsafe_depth = 0
         self._current_fn_return_type: Type | None = None
         self._current_self_binding_type: Type | None = None
@@ -79,6 +80,18 @@ class TypeInferer:
         self._collect_declarations(declaration_entries)
 
         for statement in ast:
+            if isinstance(statement, s.Statement_Global):
+                global_env = dict(self._globals)
+                inferred = self._infer_expression(statement.expr, global_env, statement.type, mutable_env={})
+                if statement.type is None:
+                    if inferred is None:
+                        raise TypeError(f"Unable to infer type of global '{statement.name}'")
+                    statement.type = inferred
+                elif inferred is not None and not self._types_compatible(statement.type, inferred):
+                    raise TypeError(f"Type mismatch in global '{statement.name}': {statement.type} != {inferred}")
+                assert statement.type is not None
+                self._globals[statement.name] = statement.type
+                continue
             if isinstance(statement, s.Statement_FunctionDefinition):
                 self._infer_function(statement)
             elif isinstance(statement, s.Statement_Impl):
@@ -124,6 +137,10 @@ class TypeInferer:
                         self_type=statement.struct,
                     )
                     self._funcs[f"{struct_name}::{method.name}"] = replace(method, signature=normalized_signature)
+            elif isinstance(statement, s.Statement_Global):
+                name = local_name or statement.name
+                if statement.type is not None:
+                    self._globals[name] = statement.type
 
     def _normalize_declaration_entries(
         self, declarations: list[object]
@@ -140,8 +157,9 @@ class TypeInferer:
 
     def _infer_function(self, statement: s.Statement_FunctionDefinition, self_type: Type | None = None):
         statement.signature = self._normalize_signature(statement.signature, self_type=self_type)
-        env = {param.name: param.type for param in statement.signature.params}
-        mutability_env = {param.name: is_mutable_type(param.type) for param in statement.signature.params}
+        env = {**self._globals, **{param.name: param.type for param in statement.signature.params}}
+        mutability_env = {name: False for name in self._globals}
+        mutability_env.update({param.name: is_mutable_type(param.type) for param in statement.signature.params})
 
         prev_fn_return = self._current_fn_return_type
         prev_self_binding_type = self._current_self_binding_type

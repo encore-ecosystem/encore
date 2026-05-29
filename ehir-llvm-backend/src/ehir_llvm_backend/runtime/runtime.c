@@ -136,7 +136,23 @@ uint8_t __ehir_rt_str_byte_at(encore_str value, size_t index) {
     return (uint8_t)value.ptr[index];
 }
 
-encore_str __ehir_rt_str_slice(encore_str value, size_t start, size_t slice_len) {
+static size_t encore_utf8_char_width(uint8_t lead) {
+    if ((lead & 0x80u) == 0u) {
+        return 1;
+    }
+    if ((lead & 0xE0u) == 0xC0u) {
+        return 2;
+    }
+    if ((lead & 0xF0u) == 0xE0u) {
+        return 3;
+    }
+    if ((lead & 0xF8u) == 0xF0u) {
+        return 4;
+    }
+    return 1;
+}
+
+static encore_str encore_str_copy_range(encore_str value, size_t start, size_t slice_len) {
     if (value.ptr == NULL || start >= value.len) {
         return encore_empty_str();
     }
@@ -150,6 +166,90 @@ encore_str __ehir_rt_str_slice(encore_str value, size_t start, size_t slice_len)
 
     memcpy(buffer, value.ptr + start, actual_len);
     return encore_from_owned_buffer(buffer, actual_len);
+}
+
+size_t __ehir_rt_str_char_len(encore_str value) {
+    if (value.ptr == NULL || value.len == 0) {
+        return 0;
+    }
+
+    size_t chars = 0;
+    size_t i = 0;
+    while (i < value.len) {
+        size_t width = encore_utf8_char_width((uint8_t)value.ptr[i]);
+        if (i + width > value.len) {
+            width = 1;
+        }
+        i += width;
+        chars += 1;
+    }
+    return chars;
+}
+
+encore_str __ehir_rt_str_char_at(encore_str value, size_t index) {
+    if (value.ptr == NULL || value.len == 0) {
+        return encore_empty_str();
+    }
+
+    size_t i = 0;
+    size_t char_index = 0;
+    while (i < value.len) {
+        size_t width = encore_utf8_char_width((uint8_t)value.ptr[i]);
+        if (i + width > value.len) {
+            width = 1;
+        }
+        if (char_index == index) {
+            return encore_str_copy_range(value, i, width);
+        }
+        i += width;
+        char_index += 1;
+    }
+    return encore_empty_str();
+}
+
+encore_str __ehir_rt_str_slice_chars(encore_str value, size_t start, size_t char_len) {
+    if (value.ptr == NULL || value.len == 0 || char_len == 0) {
+        return encore_empty_str();
+    }
+
+    size_t i = 0;
+    size_t char_index = 0;
+    size_t start_byte = value.len;
+    size_t end_byte = value.len;
+
+    while (i < value.len) {
+        if (char_index == start) {
+            start_byte = i;
+            break;
+        }
+        size_t width = encore_utf8_char_width((uint8_t)value.ptr[i]);
+        if (i + width > value.len) {
+            width = 1;
+        }
+        i += width;
+        char_index += 1;
+    }
+
+    if (start_byte == value.len) {
+        return encore_empty_str();
+    }
+
+    i = start_byte;
+    size_t taken = 0;
+    while (i < value.len && taken < char_len) {
+        size_t width = encore_utf8_char_width((uint8_t)value.ptr[i]);
+        if (i + width > value.len) {
+            width = 1;
+        }
+        i += width;
+        taken += 1;
+    }
+    end_byte = i;
+    return encore_str_copy_range(value, start_byte, end_byte - start_byte);
+}
+
+encore_str __ehir_rt_str_slice(encore_str value, size_t start, size_t slice_len) {
+    return encore_str_copy_range(value, start, slice_len);
 }
 
 encore_str __ehir_rt_str_concat(encore_str lhs, encore_str rhs) {
