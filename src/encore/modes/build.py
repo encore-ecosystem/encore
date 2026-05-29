@@ -410,6 +410,7 @@ def update_dependencies(path: Path):
 def sync_dependencies(path: Path, *, update: bool = False, ignore_errors: bool = False) -> dict[str, dict[str, str]]:
     resolved: dict[str, dict[str, str]] = {}
     visited: set[Path] = set()
+    lock_root = path.resolve()
 
     def visit(project_path: Path) -> None:
         project_path = project_path.resolve()
@@ -428,7 +429,7 @@ def sync_dependencies(path: Path, *, update: bool = False, ignore_errors: bool =
                 raise
             info: dict[str, str] = {
                 "name": dep_manifest.project.name,
-                "ref": _resolved_ref_for_lock(dep_ref, project_path, dep_path),
+                "ref": _resolved_ref_for_lock(dep_ref, project_path, dep_path, lock_root),
                 "version": dep_manifest.project.version,
             }
             git_dir = dep_path / ".git"
@@ -460,14 +461,14 @@ def sync_dependencies(path: Path, *, update: bool = False, ignore_errors: bool =
     return resolved
 
 
-def _resolved_ref_for_lock(dep_ref: str, project_path: Path, dep_path: Path) -> str:
+def _resolved_ref_for_lock(dep_ref: str, project_path: Path, dep_path: Path, lock_root: Path) -> str:
     if dep_ref.startswith("git@"):
         return dep_ref
 
     if dep_ref.startswith("path@"):
         requested_path = (project_path / dep_ref.removeprefix("path@")).resolve()
         if requested_path == dep_path.resolve():
-            return _path_ref_for_lock(project_path, dep_path)
+            return _path_ref_for_lock(lock_root, dep_path)
 
         # Legacy path@index/* fallback: persist effective git ref in lock.
         if "index" in requested_path.parts:

@@ -1612,7 +1612,8 @@ class TypeInferer:
         explicit_enum = pattern.segments[0]
         if explicit_enum.name != base_type.name:
             raise TypeError(f"Pattern enum '{explicit_enum.name}' does not match scrutinee type '{base_type.name}'")
-        if explicit_enum.generics and explicit_enum != base_type:
+
+        if explicit_enum.generics and not self._types_compatible(base_type, explicit_enum):
             raise TypeError(f"Pattern enum '{explicit_enum}' does not match scrutinee type '{base_type}'")
         return pattern.segments[1].name
 
