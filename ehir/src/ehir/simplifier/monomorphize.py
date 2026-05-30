@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import fields, is_dataclass, replace
 
-from ehir.core.derectives import Derective_enum, Derective_fn, Derective_struct
+from ehir.core.derectives import Derective_enum, Derective_fn, Derective_impl, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import Instruction_call, Instruction_wraps
@@ -31,7 +31,7 @@ class MonomorphizationPass:
             out = ast
             for _ in range(self._GENERIC_MONO_PASSES):
                 out = self._monomorphize_generic_functions(out)
-            return out
+            return self._prune_unreferenced_generic_functions(out)
 
         box_methods = [
             d
@@ -45,7 +45,7 @@ class MonomorphizationPass:
             out = ast
             for _ in range(self._GENERIC_MONO_PASSES):
                 out = self._monomorphize_generic_functions(out)
-            return out
+            return self._prune_unreferenced_generic_functions(out)
 
         new_nodes: list[Derective] = []
         for concrete in concrete_box_types:
@@ -106,7 +106,45 @@ class MonomorphizationPass:
         out = filtered
         for _ in range(self._GENERIC_MONO_PASSES):
             out = self._monomorphize_generic_functions(out)
-        return out
+        return self._prune_unreferenced_generic_functions(out)
+
+    def _prune_unreferenced_generic_functions(self, ast: list[Derective]) -> list[Derective]:
+        referenced_fn_names: set[str] = set()
+        for item in self._walk(ast):
+            if isinstance(item, Instruction_call):
+                referenced_fn_names.add(item.fn_name)
+        pruned: list[Derective] = []
+        for directive in ast:
+            if isinstance(directive, Derective_fn):
+                if self._is_unresolved_template_fn(directive) and directive.name not in referenced_fn_names:
+                    continue
+                pruned.append(directive)
+                continue
+
+            if isinstance(directive, Derective_impl):
+                kept_methods: list[Derective_fn] = []
+                for method in directive.methods:
+                    if self._is_unresolved_template_fn(method):
+                        continue
+                    kept_methods.append(method)
+                if not kept_methods and directive.generics:
+                    continue
+                pruned.append(replace(directive, methods=kept_methods))
+                continue
+
+            pruned.append(directive)
+
+        return pruned
+
+    def _is_unresolved_template_fn(self, fn: Derective_fn) -> bool:
+        if fn.generics:
+            return True
+        if self._is_placeholder_type(fn.ret_type):
+            return True
+        for param in fn.params:
+            if self._is_placeholder_type(param.type):
+                return True
+        return False
 
     def _monomorphize_generic_functions(self, ast: list[Derective]) -> list[Derective]:
         fn_by_name = {d.name: d for d in ast if isinstance(d, Derective_fn)}
@@ -152,6 +190,7 @@ class MonomorphizationPass:
         for directive in ast:
             rewritten.append(self._rewrite_generic_calls(directive, renames))
         rewritten.extend(self._rewrite_generic_calls(clone, renames) for clone in clones)
+
         return rewritten
 
     def _rewrite_generic_calls(self, value, renames: dict[tuple[str, str], str]):

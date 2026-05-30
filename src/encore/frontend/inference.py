@@ -61,10 +61,12 @@ class TypeInferer:
         self._enums: dict[str, s.Statement_EnumDefinition] = {}
         self._traits: dict[str, s.Statement_Trait] = {}
         self._impl_traits: dict[str, list[str]] = {}
+        self._generic_impl_traits: list[tuple[list[Type], str]] = []
         self._globals: dict[str, Type] = {}
         self._unsafe_depth = 0
         self._current_fn_return_type: Type | None = None
         self._current_self_binding_type: Type | None = None
+        self._current_impl_self_type: Type | None = None
         self._active_generic_bounds: dict[str, list[Type]] = {}
         self._active_generic_names: set[str] = set()
 
@@ -96,6 +98,14 @@ class TypeInferer:
                 self._infer_function(statement)
             elif isinstance(statement, s.Statement_Impl):
                 for method in statement.body:
+                    impl_generic_names = {generic.name for generic in statement.generics}
+                    merged_generics = [*statement.generics]
+                    for generic in method.signature.generics:
+                        if generic.name in impl_generic_names:
+                            continue
+                        merged_generics.append(generic)
+                        impl_generic_names.add(generic.name)
+                    method.signature = replace(method.signature, generics=merged_generics)
                     self._infer_function(method, self_type=statement.struct)
 
         return ast
@@ -120,7 +130,12 @@ class TypeInferer:
             elif isinstance(statement, s.Statement_Impl):
                 struct_name = statement.struct.name
                 if statement.trait_name is not None:
-                    self._impl_traits.setdefault(struct_name, []).append(statement.trait_name)
+                    owner_generic = next((generic for generic in statement.generics if generic.name == struct_name), None)
+                    if owner_generic is not None:
+                        bounds = list(owner_generic.bounds) if isinstance(owner_generic, s.GenericParam) else []
+                        self._generic_impl_traits.append((bounds, statement.trait_name))
+                    else:
+                        self._impl_traits.setdefault(struct_name, []).append(statement.trait_name)
                     continue
 
                 for method in statement.body:
@@ -163,6 +178,7 @@ class TypeInferer:
 
         prev_fn_return = self._current_fn_return_type
         prev_self_binding_type = self._current_self_binding_type
+        prev_impl_self_type = self._current_impl_self_type
         prev_generic_bounds = self._active_generic_bounds
         prev_generic_names = self._active_generic_names
         if statement.signature.type is None:
@@ -172,6 +188,7 @@ class TypeInferer:
 
         self._current_fn_return_type = statement.signature.type
         self._current_self_binding_type = env.get("self")
+        self._current_impl_self_type = self_type
         self._active_generic_bounds = self._collect_generic_bounds(statement.signature.generics)
         self._active_generic_names = {generic.name for generic in statement.signature.generics}
         try:
@@ -179,6 +196,7 @@ class TypeInferer:
         finally:
             self._current_fn_return_type = prev_fn_return
             self._current_self_binding_type = prev_self_binding_type
+            self._current_impl_self_type = prev_impl_self_type
             self._active_generic_bounds = prev_generic_bounds
             self._active_generic_names = prev_generic_names
 
@@ -541,7 +559,11 @@ class TypeInferer:
             return call_name, explicit_generics, signature
 
         if len(expr.callee.segments) >= 2:
-            owner_segments = expr.callee.segments[:-1]
+            owner_segments = list(expr.callee.segments[:-1])
+            if owner_segments and owner_segments[-1].name == "Self":
+                self_hint = self._current_self_binding_type or self._current_impl_self_type
+                resolved_self = self._resolve_self_type(self_hint)
+                owner_segments[-1] = self._resolve_self_in_type(owner_segments[-1], resolved_self)
             owner = owner_segments[-1]
             normalized_owner = "::".join(segment.name for segment in owner_segments)
             normalized_name = f"{normalized_owner}::{expr.callee.segments[-1].name}"
@@ -599,7 +621,8 @@ class TypeInferer:
         def leaf_type_name(name: str) -> str:
             return base_type_name(name).rsplit("::", 1)[-1]
 
-        def impl_trait_names(type_name: str) -> list[str]:
+        def impl_trait_names(receiver: Type) -> list[str]:
+            type_name = receiver.name
             out = list(self._impl_traits.get(type_name, []))
             leaf = leaf_type_name(type_name)
             for owner_name, trait_names in self._impl_traits.items():
@@ -609,6 +632,11 @@ class TypeInferer:
                     for trait_name in trait_names:
                         if trait_name not in out:
                             out.append(trait_name)
+            for bounds, trait_name in self._generic_impl_traits:
+                if not self._receiver_satisfies_bounds(receiver, bounds):
+                    continue
+                if trait_name not in out:
+                    out.append(trait_name)
             return out
 
         receiver_type = unwrap_for_storage(receiver_type)
@@ -637,7 +665,7 @@ class TypeInferer:
             if matched_signature is not None:
                 return matched_name, matched_signature
 
-        for trait_name in impl_trait_names(base_receiver_type.name):
+        for trait_name in impl_trait_names(base_receiver_type):
             trait_signature = self._lookup_trait_method_signature(
                 trait_name,
                 method_name,
@@ -673,6 +701,12 @@ class TypeInferer:
             f"Method '{method_name}' is not defined for type '{base_receiver_type.name}'. "
             f"inherent_name='{inherent_name}', suffix_matches={len(inherent_candidates)}, method_suffix_matches={len(similar)}"
         )
+
+    def _receiver_satisfies_bounds(self, receiver_type: Type, bounds: list[Type]) -> bool:
+        for bound in bounds:
+            if not self._type_satisfies_bound(receiver_type, bound):
+                return False
+        return True
 
     def _infer_call_signature(
         self,
@@ -1031,11 +1065,14 @@ class TypeInferer:
             return None
 
         if isinstance(expr, s.Expression_StructInitialization):
-            field_types = self._lookup_struct_field_types(expr.name)
+            self_hint = self._current_self_binding_type or self._current_impl_self_type
+            current_self_type = self._resolve_self_type(self_hint)
+            struct_type = self._resolve_self_in_type(expr.name, current_self_type)
+            field_types = self._lookup_struct_field_types(struct_type)
             for idx, arg in enumerate(expr.args):
                 arg_expected = field_types[idx] if idx < len(field_types) else None
                 self._infer_expression(arg, env, arg_expected)
-            return expr.name
+            return struct_type
 
         if isinstance(expr, s.Expression_StructField):
             result = self._lookup_chained_field_type(expr.name, expr.field, env)
@@ -1234,7 +1271,8 @@ class TypeInferer:
         return False
 
     def _trait_satisfies_bound(self, trait_name: str, required_bound: Type, seen: set[str] | None = None) -> bool:
-        if trait_name == required_bound.name:
+        required_name = required_bound.name
+        if trait_name == required_name or trait_name.split("::")[-1] == required_name.split("::")[-1]:
             return True
 
         seen = seen or set()
@@ -1247,7 +1285,7 @@ class TypeInferer:
             return False
 
         for base in trait.bases:
-            if base.name == required_bound.name:
+            if base.name == required_name or base.name.split("::")[-1] == required_name.split("::")[-1]:
                 return True
             if self._trait_satisfies_bound(base.name, required_bound, seen):
                 return True

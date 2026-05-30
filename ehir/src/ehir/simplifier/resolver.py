@@ -996,10 +996,22 @@ class Resolver:
                         continue
                     if instr.generics:
                         expected_trait_args = [self._resolve_type(g) for g in instr.generics]
-                        resolved_trait_args = [self._resolve_type(self._replace_type(arg, mapping, recv_base)) for arg in impl.trait_args]
-                        if len(expected_trait_args) != len(resolved_trait_args):
+                        if len(expected_trait_args) != len(impl.trait_args):
                             continue
-                        if any(str(l) != str(r) for l, r in zip(expected_trait_args, resolved_trait_args, strict=False)):
+                        trait_arg_mismatch = False
+                        for template_arg, expected_arg in zip(impl.trait_args, expected_trait_args, strict=False):
+                            if not self._bind_generic_from_types(template_arg, expected_arg, mapping):
+                                trait_arg_mismatch = True
+                                break
+                        if trait_arg_mismatch:
+                            continue
+                        resolved_trait_args = [self._resolve_type(self._replace_type(arg, mapping, recv_base)) for arg in impl.trait_args]
+                        if any(
+                            str(expected_arg) != str(resolved_arg)
+                            for expected_arg, resolved_arg in zip(
+                                expected_trait_args, resolved_trait_args, strict=False
+                            )
+                        ):
                             continue
                     method = next((m for m in impl.methods if m.name == method_name), None)
                     if method is None:
