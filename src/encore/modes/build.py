@@ -1,8 +1,10 @@
 import os
+import shutil
 import subprocess
 import tomllib
 from argparse import Namespace
 from dataclasses import dataclass, field
+from hashlib import sha1
 from pathlib import Path
 from typing import Callable
 
@@ -18,7 +20,7 @@ from rich.text import Text
 
 from ehir import Refrain
 from encore.frontend import EHIR_EncoreFrontend
-from encore.utils.manifest import ProjectManifest, ProjectTarget
+from encore.utils.manifest import NativeSection, ProjectManifest, ProjectTarget
 
 AVAILABLE_OPTPROFILES = {
     "debug": EHIR_Backend.OptProfile.debug,
@@ -27,6 +29,7 @@ AVAILABLE_OPTPROFILES = {
 }
 AVAILABLE_BACKENDS = ("llvm",)
 SYSTEM_CORE_REF = "sys@core"
+_ACTIVE_BUILD_SCRIPTS: set[Path] = set()
 
 
 @dataclass
@@ -92,6 +95,14 @@ class _BuildLiveStatus:
         return module_id.name
 
 
+@dataclass(frozen=True)
+class _BuildScriptContext:
+    backend: str
+    profile: str
+    no_cache: bool
+    cfg_overrides: tuple[str, ...]
+
+
 def add_build_parser(subparsers) -> tuple[str, Callable]:
     section = "build"
     build_parser = subparsers.add_parser(section, help="Build a project")
@@ -115,10 +126,16 @@ def add_build_parser(subparsers) -> tuple[str, Callable]:
 
 def handle_build(args: Namespace):
     cwd = Path().resolve()
+    build_ctx = _BuildScriptContext(
+        backend=args.backend,
+        profile=args.profile,
+        no_cache=args.no_cache,
+        cfg_overrides=tuple(args.cfg),
+    )
 
     compiler = create_compiler(cwd, args.backend, args.profile, no_cache=args.no_cache, cfg_overrides=args.cfg)
-    _inject_mandatory_core_dependency(compiler, cwd)
-    _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
+    _inject_mandatory_core_dependency(compiler, cwd, build_ctx)
+    _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd), build_ctx=build_ctx)
     with _BuildLiveStatus(compiler):
         compiler.compile_all()
 
@@ -257,7 +274,11 @@ def _resolve_local_core_root(project_root: Path) -> Path | None:
     return None
 
 
-def _inject_mandatory_core_dependency(compiler: EHIR_ProjectCompiler, project_root: Path) -> None:
+def _inject_mandatory_core_dependency(
+    compiler: EHIR_ProjectCompiler,
+    project_root: Path,
+    build_ctx: _BuildScriptContext,
+) -> None:
     manifest = load_manifest(project_root)
     if manifest.project.name == "core":
         return
@@ -269,24 +290,32 @@ def _inject_mandatory_core_dependency(compiler: EHIR_ProjectCompiler, project_ro
             "Expected to find it in dependencies or as local 'refrains/core'."
         )
 
-    _load_refrain(compiler, core_root, Refrain.TargetType.OBJECT)
+    _load_refrain(compiler, core_root, Refrain.TargetType.OBJECT, build_ctx=build_ctx)
 
 
 def _load_refrain(
-    compiler: EHIR_ProjectCompiler, path: Path, type: Refrain.TargetType = Refrain.TargetType.OBJECT
+    compiler: EHIR_ProjectCompiler,
+    path: Path,
+    type: Refrain.TargetType = Refrain.TargetType.OBJECT,
+    *,
+    build_ctx: _BuildScriptContext,
 ) -> Refrain:
     manifest = load_manifest(path)
 
     for dependency in manifest.project.dependencies:
         _dep_path = _resolve_dependency(dependency, path)
-        _load_refrain(compiler, _dep_path, Refrain.TargetType.OBJECT)
+        _load_refrain(compiler, _dep_path, Refrain.TargetType.OBJECT, build_ctx=build_ctx)
+
+    native_libraries = _native_libraries_from_manifest(manifest, path, compiler.cfg_environment)
+    native_libraries.extend(_native_libraries_from_build_script(manifest, path, compiler.cfg_environment, build_ctx))
+    native_libraries = _materialize_native_sources(native_libraries, path, build_ctx.profile)
 
     ref = Refrain(
         name=manifest.project.name,
         path=path,
         type=type,
         merge_module_dirs=("modes",) if (path / "src" / "modes").exists() else (),
-        native_libraries=_native_libraries_from_manifest(manifest, path, compiler.cfg_environment),
+        native_libraries=native_libraries,
     )
     compiler.add_refrain_to_build(ref)
     return ref
@@ -297,13 +326,21 @@ def _native_libraries_from_manifest(
     project_path: Path,
     cfg_environment: CfgEnvironment,
 ) -> list[NativeLibrary]:
-    native = manifest.native
+    return _native_libraries_from_native_section(manifest.project.name, manifest.native, project_path, cfg_environment)
+
+
+def _native_libraries_from_native_section(
+    project_name: str,
+    native: NativeSection,
+    project_path: Path,
+    cfg_environment: CfgEnvironment,
+) -> list[NativeLibrary]:
     result: list[NativeLibrary] = []
 
     if native.search_paths or native.frameworks or native.link_args:
         result.append(
             NativeLibrary(
-                name=f"{manifest.project.name}::native",
+                name=f"{project_name}::native",
                 kind="link_args",
                 search_paths=tuple(_resolve_native_path(project_path, path) for path in native.search_paths),
                 frameworks=tuple(native.frameworks),
@@ -344,11 +381,191 @@ def _native_libraries_from_manifest(
     return result
 
 
+def _native_libraries_from_build_script(
+    manifest: ProjectManifest,
+    project_path: Path,
+    cfg_environment: CfgEnvironment,
+    build_ctx: _BuildScriptContext,
+) -> list[NativeLibrary]:
+    project_path = project_path.resolve()
+    if project_path in _ACTIVE_BUILD_SCRIPTS:
+        return []
+
+    script_path = _resolve_build_script_path(manifest, project_path)
+    if script_path is None:
+        return []
+
+    native = _run_build_script(
+        manifest=manifest,
+        project_path=project_path,
+        script_path=script_path,
+        cfg_environment=cfg_environment,
+        build_ctx=build_ctx,
+    )
+    return _native_libraries_from_native_section(manifest.project.name, native, project_path, cfg_environment)
+
+
+def _resolve_build_script_path(manifest: ProjectManifest, project_path: Path) -> Path | None:
+    declared = manifest.project.build
+    if declared is not None:
+        candidate = (project_path / declared).resolve()
+        if not candidate.exists():
+            raise RuntimeError(f"Declared build script does not exist: {candidate}")
+        return candidate
+
+    default_candidate = project_path / "build.enq"
+    if default_candidate.exists():
+        return default_candidate.resolve()
+    return None
+
+
+def _run_build_script(
+    *,
+    manifest: ProjectManifest,
+    project_path: Path,
+    script_path: Path,
+    cfg_environment: CfgEnvironment,
+    build_ctx: _BuildScriptContext,
+) -> NativeSection:
+    import json
+    import toml
+
+    target_dir = project_path / "target" / build_ctx.profile / "build"
+    script_dir = target_dir / "scripts" / f"{manifest.project.name}_{script_path.stem}"
+    src_dir = script_dir / "src"
+    out_dir = target_dir / "out" / script_path.stem
+    meta_path = out_dir / "build-meta.json"
+
+    if script_dir.exists():
+        shutil.rmtree(script_dir)
+    src_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    src_main = src_dir / "main.enq"
+    src_main.write_text(script_path.read_text(), encoding="utf-8")
+
+    script_manifest = {
+        "project": {
+            "name": f"{manifest.project.name}__build_script",
+            "target": "executable",
+            "version": "0.0.0",
+            "description": "",
+            "readme": "README.md",
+            "licence": "MIT",
+            "dependencies": [_rewrite_build_dependency(dep, project_path) for dep in manifest.project.dependencies],
+        }
+    }
+    core_root = _resolve_local_core_root(project_path)
+    if manifest.project.name == "core" and core_root is not None:
+        runtime_c = (core_root / "runtime.c").resolve()
+        if runtime_c.exists():
+            script_manifest["native"] = {
+                "libraries": [
+                    {
+                        "name": "core_runtime_for_build_script",
+                        "path": runtime_c.as_posix(),
+                    }
+                ]
+            }
+    (script_dir / "encore.toml").write_text(toml.dumps(script_manifest), encoding="utf-8")
+    (script_dir / "README.md").write_text("# build script\n", encoding="utf-8")
+
+    _ACTIVE_BUILD_SCRIPTS.add(project_path.resolve())
+    try:
+        script_compiler = create_compiler(
+            script_dir,
+            build_ctx.backend,
+            build_ctx.profile,
+            no_cache=build_ctx.no_cache,
+            cfg_overrides=list(build_ctx.cfg_overrides),
+        )
+        _inject_mandatory_core_dependency(script_compiler, script_dir, build_ctx)
+        script_ref = _load_refrain(
+            script_compiler,
+            script_dir,
+            type=Refrain.TargetType.EXECUTABLE,
+            build_ctx=build_ctx,
+        )
+        script_outputs = script_compiler.compile_all()
+        script_binary = dict(script_outputs)[script_ref.name]
+
+        script_args = [
+            meta_path.resolve().as_posix(),
+            project_path.resolve().as_posix(),
+            script_path.resolve().as_posix(),
+            build_ctx.profile,
+            build_ctx.backend,
+            json.dumps(
+                {
+                    "flags": sorted(cfg_environment.flags),
+                    "values": dict(sorted(cfg_environment.values.items())),
+                }
+            ),
+        ]
+        exit_code = run_binary(script_binary, script_args)
+        if exit_code != 0:
+            raise RuntimeError(f"build.enq failed for '{manifest.project.name}' with exit code {exit_code}")
+        if not meta_path.exists():
+            raise RuntimeError(
+                f"build.enq for '{manifest.project.name}' did not produce build metadata at {meta_path.as_posix()}"
+            )
+
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        native_payload = data.get("native")
+        if native_payload is None:
+            raise RuntimeError(f"build.enq metadata for '{manifest.project.name}' must include 'native' section")
+        if not isinstance(native_payload, dict):
+            raise RuntimeError(
+                f"build.enq metadata 'native' section must be a table, got: {type(native_payload).__name__}"
+            )
+
+        return NativeSection(**native_payload)
+    finally:
+        _ACTIVE_BUILD_SCRIPTS.discard(project_path.resolve())
+
+
+def _rewrite_build_dependency(dep: str, project_path: Path) -> str:
+    if dep.startswith("path@"):
+        target = (project_path / dep.removeprefix("path@")).resolve()
+        return f"path@{target.as_posix()}"
+    return dep
+
+
 def _resolve_native_path(project_path: Path, value: str) -> str:
     path = Path(value)
     if path.is_absolute():
         return path.as_posix()
     return (project_path / path).resolve().as_posix()
+
+
+def _materialize_native_sources(
+    native_libraries: list[NativeLibrary],
+    project_path: Path,
+    profile: str,
+) -> list[NativeLibrary]:
+    out: list[NativeLibrary] = []
+    native_build_dir = project_path / "target" / profile / "build" / "native"
+    native_build_dir.mkdir(parents=True, exist_ok=True)
+
+    for native in native_libraries:
+        if native.path is None:
+            out.append(native)
+            continue
+
+        source_path = Path(native.path)
+        if source_path.suffix != ".c":
+            out.append(native)
+            continue
+
+        digest = sha1(str(source_path.resolve()).encode(), usedforsecurity=False).hexdigest()[:16]
+        obj_path = native_build_dir / f"{source_path.stem}_{digest}.o"
+        cmd = ["clang", "-std=c11", "-c", str(source_path), "-o", str(obj_path)]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Native source compile error ({source_path}): {result.stderr}")
+
+        out.append(NativeLibrary(**{**native.__dict__, "path": obj_path.as_posix()}))
+    return out
 
 
 def infer_project_target_type(cwd: Path) -> Refrain.TargetType:
@@ -385,16 +602,22 @@ def build_project(
     no_cache: bool = False,
     cfg_overrides: list[str] | None = None,
 ) -> list[tuple[str, Path]]:
+    build_ctx = _BuildScriptContext(
+        backend=backend,
+        profile=profile,
+        no_cache=no_cache,
+        cfg_overrides=tuple(cfg_overrides or []),
+    )
     compiler = create_compiler(cwd, backend, profile, no_cache=no_cache, cfg_overrides=cfg_overrides)
-    _inject_mandatory_core_dependency(compiler, cwd)
-    entry_ref = _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd))
+    _inject_mandatory_core_dependency(compiler, cwd, build_ctx)
+    entry_ref = _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd), build_ctx=build_ctx)
     outputs = compiler.compile_all()
     outputs_by_name = dict(outputs)
     return [(entry_ref.name, outputs_by_name[entry_ref.name]), *[(n, p) for n, p in outputs if n != entry_ref.name]]
 
 
-def run_binary(binary_path: Path, args: list[str]) -> int:
-    result = subprocess.run([str(binary_path), *args], check=False)
+def run_binary(binary_path: Path, args: list[str], *, env: dict[str, str] | None = None) -> int:
+    result = subprocess.run([str(binary_path), *args], check=False, env=env)
     return result.returncode
 
 
