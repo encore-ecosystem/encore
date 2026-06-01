@@ -25,6 +25,7 @@ class ProjectSection(StrictModel):
     readme: str = Field(default="README.md")
     licence: str = Field(default="MIT")
     dependencies: list[str] = Field(default=[])
+    build: str | None = Field(default=None)
 
 
 class NativeLibrarySection(StrictModel):
