@@ -736,6 +736,13 @@ class Translator:
         if module_prefix is None:
             return typ
 
+        def is_generic_placeholder(name: str) -> bool:
+            if name in {"Self", "T"}:
+                return True
+            if len(name) == 1 and name.isupper():
+                return True
+            return len(name) > 1 and name.startswith("T") and name[1:].isdigit()
+
         def qualify(inner: Type) -> Type:
             if is_mutable_type(inner):
                 return make_mutable_type(qualify(unwrap_for_storage(inner)))
@@ -755,6 +762,7 @@ class Translator:
             if (
                 "::" not in name
                 and name not in generic_names
+                and not is_generic_placeholder(name)
                 and name not in BUILTIN_TYPE_NAMES
                 and not name.startswith("__tuple_")
             ):

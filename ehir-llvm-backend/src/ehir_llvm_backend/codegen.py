@@ -88,6 +88,7 @@ class Codegen:
         self._string_literal_counter = 0
         self._str_type: ir.IdentifiedStructType | None = None
         self._enabled_functions: set[str] = set()
+        self._current_fn_name: str | None = None
         self._symbol_by_canonical: dict[str, str] = {}
         self._canonical_by_symbol: dict[str, str] = {}
         self._symbol_version_salt = self._detect_symbol_version_salt()
@@ -267,6 +268,7 @@ class Codegen:
     def _codegen_fn_body(self, fn: ProcessedDerective_fn):
         emitted_name = self._symbol_by_canonical.get(fn.name, fn.name)
         func = [f for f in self.module.functions if f.name == emitted_name][0]
+        self._current_fn_name = fn.name
 
         self._variables.clear()
         self._blocks.clear()
@@ -289,6 +291,7 @@ class Codegen:
             self._build_block(block)
 
         self._resolve_pending_phi_incomings()
+        self._current_fn_name = None
 
 
     def _collect_block_predecessors(self, blocks: Sequence[ProcessedBlock]) -> dict[str, set[str]]:
@@ -418,10 +421,11 @@ class Codegen:
         assert hasattr(value, "type")
         src_type = value.type
 
-        assert instr.var.type is not None
-        dst_type = self._build_type(instr.type)
-        if instr.type.name == "dyn" and len(instr.type.generics) == 1:
-            trait_name = instr.type.generics[0].name
+        assert instr.var_out.type is not None
+        dst_type = self._build_type(instr.var_out.type)
+        if instr.var_out.type.name == "dyn" and len(instr.var_out.type.generics) == 1:
+            trait_name = instr.var_out.type.generics[0].name
+            assert instr.var.type is not None
             raw_ptr = self._pack_dyn_payload(value, instr.var.type)
             vtable_ptr = self._get_dyn_vtable_ptr(trait_name, instr.var.type)
             dyn_value = ir.Constant(dst_type, ir.Undefined)
@@ -453,7 +457,10 @@ class Codegen:
             result = self.builder.bitcast(value, dst_type, name=instr.var_out.name)
 
         else:
-            raise NotImplementedError(f"Unsupported cast: {src_type} -> {dst_type}")
+            raise NotImplementedError(
+                f"Unsupported cast: {src_type} -> {dst_type}; instr={instr}; out_type={instr.var_out.type!r}; "
+                f"out_type_cls={type(instr.var_out.type).__name__}; fn={self._current_fn_name or '<none>'}"
+            )
 
         self._variables[instr.var_out.name] = result
         return result
@@ -1670,6 +1677,15 @@ class Codegen:
                 phi.add_incoming(value=value, block=self._blocks[pred_name])
 
     def _build_type(self, type: Type) -> ir.Type:
+        if isinstance(type, (HeapSmartPointer, StackSmartPointer)):
+            wrapper_name = type.get_name()
+            if wrapper_name not in self._structs:
+                self._ensure_smart_pointer_wrapper(type)
+            return self._structs[wrapper_name]
+
+        if isinstance(type, Pointer):
+            return ir.PointerType(self._build_type(type.pointee))
+
         if type.name == "dyn" and len(type.generics) == 1:
             trait_name = type.generics[0].name
             dyn_name = self._dyn_struct_name(trait_name)
@@ -1697,15 +1713,6 @@ class Codegen:
                 ]
                 concrete_struct.set_body(*concrete_fields)
             return concrete_struct
-
-        if isinstance(type, (HeapSmartPointer, StackSmartPointer)):
-            wrapper_name = type.get_name()
-            if wrapper_name not in self._structs:
-                self._ensure_smart_pointer_wrapper(type)
-            return self._structs[wrapper_name]
-
-        if isinstance(type, Pointer):
-            return ir.PointerType(self._build_type(type.pointee))
 
         if isinstance(type, Usize_t):
             return ir.IntType(bits=self._get_pointer_width_bits() if type.size is None else type.size)
