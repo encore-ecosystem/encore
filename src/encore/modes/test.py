@@ -43,6 +43,13 @@ def add_test_parser(subparsers) -> tuple[str, Callable]:
     )
     test_parser.add_argument("--no-cache", action="store_true", help="Ignore existing EHIR cache for this build")
     test_parser.add_argument("--filter", type=str, default=None, help="Only run tests whose path contains this text")
+    test_parser.add_argument(
+        "--cfg",
+        action="append",
+        default=[],
+        metavar="PREDICATE",
+        help="Add compile-time cfg flag or key=value override.",
+    )
     return (section, handle_test)
 
 
@@ -59,7 +66,7 @@ def handle_test(args: Namespace):
     failed = 0
     for idx, test in enumerate(tests, start=1):
         test_name = _build_test_refrain_name(test)
-        compiler = create_compiler(cwd, args.backend, args.profile, no_cache=args.no_cache)
+        compiler = create_compiler(cwd, args.backend, args.profile, no_cache=args.no_cache, cfg_overrides=args.cfg)
         compiler.on_refrain = lambda _refrain: None
         compiler.add_refrain_to_build(
             Refrain(

@@ -1,9 +1,10 @@
 from ehir.core.block import TerminatedBlock
-from ehir.core.derectives import Derective_fn
+from ehir.core.derectives import Derective_fn, Derective_impl
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import ControlFlow, Instruction_br, Instruction_load, Instruction_ret, Instruction_salloc, Instruction_store
 from ehir.core.type import Pointer
 from ehir.core.variable import TypedVariable
+from ehir.errors import EhirCompileError
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 
@@ -14,6 +15,16 @@ class Normalizer:
             if isinstance(derective, Derective_fn):
                 self._terminate_blocks(derective)
                 new.append(self._normalize_fn(derective))
+            elif isinstance(derective, Derective_impl):
+                normalized_methods = []
+                for method in derective.methods:
+                    if isinstance(method, Derective_fn):
+                        self._terminate_blocks(method)
+                        normalized_methods.append(self._normalize_fn(method))
+                    else:
+                        normalized_methods.append(method)
+                derective.methods = normalized_methods
+                new.append(derective)
             else:
                 new.append(derective)
         return new
@@ -30,13 +41,13 @@ class Normalizer:
             if term_index is None:
                 if len(block.body) == 0:
                     if block_index + 1 >= len(derective.body):
-                        raise ValueError(
+                        raise EhirCompileError(
                             f"Empty block has no successor: function '{derective.name}', block '{block.name}'"
                         )
                     next_block = derective.body[block_index + 1]
                     new_blocks.append(TerminatedBlock(name=block.name, body=[], term=Instruction_br(label=next_block.name)))
                     continue
-                raise ValueError(
+                raise EhirCompileError(
                     f"Block must end with a control flow instruction: function '{derective.name}', block '{block.name}'"
                 )
 
@@ -53,7 +64,7 @@ class Normalizer:
         ret_block_name = None
         for block in derective.body:
             if block.name in block_mapping:
-                raise ValueError(f"Double definition of block {block.name}")
+                raise EhirCompileError(f"Double definition of block {block.name}")
             assert isinstance(block, TerminatedBlock)
             block_mapping[block.name] = block
             if isinstance(block.term, Instruction_ret):
@@ -61,7 +72,7 @@ class Normalizer:
                 ret_block_name = block.name
 
         if "entry" not in block_mapping:
-            raise ValueError(f"Function '{derective.name}' must have an entry block")
+            raise EhirCompileError(f"Function '{derective.name}' must have an entry block")
 
         if num_ret == 1 and ret_block_name != "entry":
             assert ret_block_name
@@ -75,7 +86,7 @@ class Normalizer:
             )
 
         if "exit" in block_mapping:
-            raise ValueError(f"Function '{derective.name}' has reserved block `exit`")
+            raise EhirCompileError(f"Function '{derective.name}' has reserved block `exit`")
 
         # Step 1: Create resulting variable in entry block
         exit_var_ptr = TypedVariable(name=".exit_var_ptr", type=Pointer(derective.ret_type))

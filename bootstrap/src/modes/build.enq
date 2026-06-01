@@ -1,12 +1,28 @@
-import std::path::Path
+import core::fmt::Debug
 import core::option::Option
 import core::panic::panic
+import std::io::println
+import std::os::read_file
+import std::os::write_file
+import std::path::Path
+import std::vec::Vec
+
+import refrain::frontend::Lexer
+import refrain::frontend::Parser
+import refrain::frontend::run_semantic_checks
+import refrain::frontend::translate_to_ehir
+import refrain::frontend::lexer::Token
+import refrain::frontend::lexer::TokenType
+
+import rich::Spinner
+import rich::status
+import rich::status_fail
+import rich::status_ok
 
 pub fn run_build() -> u32 {
     match find_project_root(Path::cwd()) {
         Option[Path]::Some(root) => {
-            // compile_project(root)
-            ret 0_u32
+            ret compile_project(root)
         }
         Option[Path]::None => {
             panic("Unable to find encore.toml in current directory or parents")
@@ -15,12 +31,114 @@ pub fn run_build() -> u32 {
     }
 }
 
+fn compile_project(root: Path) -> u32 {
+    let manifest_path = root.join("encore.toml")
+    let manifest_source = read_file(manifest_path.as_str())
+    if !contains_substring(manifest_source, "[project]") {
+        println(status_fail("Unable to parse manifest: missing [project] section"))
+        ret 1_u32
+    }
+
+    let source_path = root.join("src").join("main.enq")
+    let source = read_file(source_path.as_str())
+
+    println(status(Spinner::dots(), 0_usize, "Bootstrap lexer"))
+    let mut lexer = Lexer::new()
+    let tokens = lexer.tokenize(source)
+    if has_unknown_tokens(tokens) {
+        ret 1_u32
+    }
+    println("tokens: " + Debug::fmt(tokens.len()))
+
+    println(status(Spinner::dots(), 1_usize, "Bootstrap parser"))
+    let mut parser = Parser::new()
+    let ast = parser.parse(tokens)
+    println("ast nodes: " + Debug::fmt(ast.len()))
+
+    println(status(Spinner::dots(), 2_usize, "Bootstrap semantic checks"))
+    if !run_semantic_checks(ast) {
+        println(status_fail("Semantic checks failed"))
+        ret 1_u32
+    }
+
+    println(status(Spinner::dots(), 3_usize, "Bootstrap EHIR translation"))
+    let ehir_text = translate_to_ehir(ast)
+    let out_path = root.join("target.bootstrap.ehir")
+    let write_code = write_file(out_path.as_str(), ehir_text)
+    if write_code != 0_i32 {
+        println(status_fail("Failed to write translated EHIR"))
+        ret 1_u32
+    }
+    println("ehir out: " + out_path.as_str())
+
+    println(status_ok("Build frontend pipeline complete"))
+    ret 0_u32
+}
+
+fn has_unknown_tokens(tokens: Vec[Token]) -> bool {
+    let mut failed = false
+    for token in tokens {
+        if token.type == TokenType::UNKNOWN {
+            failed = true
+            println(status_fail("Unknown token at " + Debug::fmt(token.line + 1_usize) + ":" + Debug::fmt(token.column + 1_usize)))
+            println("  " + token.value)
+        }
+    }
+    if failed {
+        println(status_fail("Lexing failed"))
+    }
+    ret failed
+}
+
+fn contains_substring(haystack: str, needle: str) -> bool {
+    if needle.len() == 0_usize {
+        ret true
+    }
+    if needle.len() > haystack.len() {
+        ret false
+    }
+
+    let mut start = 0_usize
+    while start + needle.len() <= haystack.len() {
+        let mut matched = true
+        let mut i = 0_usize
+        while i < needle.len() {
+            match haystack.get(start + i) {
+                Option[str]::Some(lhs) => {
+                    match needle.get(i) {
+                        Option[str]::Some(rhs) => {
+                            if lhs != rhs {
+                                matched = false
+                                break
+                            }
+                        }
+                        Option[str]::None => {
+                            matched = false
+                            break
+                        }
+                    }
+                }
+                Option[str]::None => {
+                    matched = false
+                    break
+                }
+            }
+            i = i + 1_usize
+        }
+        if matched {
+            ret true
+        }
+        start = start + 1_usize
+    }
+    ret false
+}
+
 fn find_project_root(path: Path) -> Option[Path] {
-    if Path::exists(path.join("encore.toml")) {
+    if path.join("encore.toml").exists() {
         ret Option[Path]::Some(path)
     }
 
-    match Path::parent(path) {
+    match path.parent() {
         Option[Path]::Some(parent) => {
             ret find_project_root(parent)
         }

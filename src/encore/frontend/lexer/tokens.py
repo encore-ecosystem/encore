@@ -18,11 +18,13 @@ class TokenType(Enum):
     KW_ENUM = auto()
     KW_IMPL = auto()
     KW_FOR = auto()
+    KW_IN = auto()
     KW_LET = auto()
     KW_MUT = auto()
     KW_RET = auto()
     KW_WHILE = auto()
     KW_LOOP = auto()
+    KW_WITH = auto()
     KW_DO = auto()
     KW_CONTINUE = auto()
     KW_BREAK = auto()
@@ -36,6 +38,7 @@ class TokenType(Enum):
     KW_EXTERN = auto()
     KW_UNSAFE = auto()
     KW_EHIR = auto()
+    KW_MACRO_RULES = auto()
 
     SCOPE = auto()
 
@@ -78,6 +81,8 @@ class TokenType(Enum):
     INCREMENT = auto()
     DECREMENT = auto()
     QUESTION = auto()
+    HASH = auto()
+    DOLLAR = auto()
 
     ARROW = auto()
     FAT_ARROW = auto()
@@ -92,6 +97,8 @@ class TokenType(Enum):
     COLON = auto()
     COMMA = auto()
     DOT = auto()
+    DOT_DOT = auto()
+    DOT_DOT_EQUAL = auto()
     QUOTE = auto()
 
     WHITESPACE = auto()

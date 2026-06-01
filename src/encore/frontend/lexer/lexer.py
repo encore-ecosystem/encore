@@ -120,7 +120,15 @@ class Lexer(ParserBase[str, LexerToken]):
                         TokenType.COLON
                     )
                 case ".":
-                    self._consume_and_push(TokenType.DOT)
+                    self._consume()
+                    if self._peek_curr() == ".":
+                        self._consume()
+                        if self._peek_curr() == "=":
+                            self._consume_and_push(TokenType.DOT_DOT_EQUAL)
+                        else:
+                            self._push_token(TokenType.DOT_DOT)
+                    else:
+                        self._push_token(TokenType.DOT)
                 case ",":
                     self._consume_and_push(TokenType.COMMA)
                 case ";":
@@ -172,6 +180,10 @@ class Lexer(ParserBase[str, LexerToken]):
 
                 case "?":
                     self._consume_and_push(TokenType.QUESTION)
+                case "#":
+                    self._consume_and_push(TokenType.HASH)
+                case "$":
+                    self._consume_and_push(TokenType.DOLLAR)
 
                 case '"':
                     self._consume()
@@ -227,6 +239,7 @@ class Lexer(ParserBase[str, LexerToken]):
             "trait": TokenType.KW_TRAIT,
             "impl": TokenType.KW_IMPL,
             "for": TokenType.KW_FOR,
+            "in": TokenType.KW_IN,
             "let": TokenType.KW_LET,
             "mut": TokenType.KW_MUT,
             "ret": TokenType.KW_RET,
@@ -235,6 +248,7 @@ class Lexer(ParserBase[str, LexerToken]):
             "break": TokenType.KW_BREAK,
             "continue": TokenType.KW_CONTINUE,
             "loop": TokenType.KW_LOOP,
+            "with": TokenType.KW_WITH,
             "if": TokenType.KW_IF,
             "elif": TokenType.KW_ELIF,
             "else": TokenType.KW_ELSE,
@@ -245,6 +259,7 @@ class Lexer(ParserBase[str, LexerToken]):
             "extern": TokenType.KW_EXTERN,
             "unsafe": TokenType.KW_UNSAFE,
             "ehir": TokenType.KW_EHIR,
+            "macro_rules": TokenType.KW_MACRO_RULES,
             "not": TokenType.BANG,
             "true": TokenType.BOOLEAN,
             "false": TokenType.BOOLEAN,

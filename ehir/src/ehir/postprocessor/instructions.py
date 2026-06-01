@@ -74,6 +74,17 @@ class ProcessedInstruction_call(ProcessedInstruction):
 
 
 @dataclass
+class ProcessedInstruction_callvoid(ProcessedInstruction):
+    fn_name: str
+    args: list[TypedVariable]
+    assign_to: TypedVariable | None = None
+
+    def __repr__(self) -> str:
+        prefix = f"{self.assign_to} = " if self.assign_to is not None else ""
+        return f"{prefix}callvoid {self.fn_name}({', '.join(str(arg) for arg in self.args)})"
+
+
+@dataclass
 class ProcessedInstruction_salloc(ProcessedInstruction):
     var_out: TypedVariable
     type: Type

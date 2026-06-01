@@ -8,6 +8,7 @@ from ehir.core.instructions import (
     Instruction_and,
     Instruction_br,
     Instruction_call,
+    Instruction_callvoid,
     Instruction_capenum,
     Instruction_capprim,
     Instruction_capstruct,
@@ -47,6 +48,7 @@ from ehir.core.primitives import Usize, Usize_t
 from ehir.core.struct import Struct
 from ehir.core.type import Pointer, Reference, Type, mangle_type_name
 from ehir.core.variable import Parameter, TypedVariable, Variable
+from ehir.errors import EhirCompileError
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 SKIPABLE = (
@@ -58,6 +60,7 @@ SKIPABLE = (
     Instruction_neq,
     Instruction_store,
     Instruction_call,
+    Instruction_callvoid,
     Instruction_switch,
     Instruction_salloc,
     Instruction_load,
@@ -80,6 +83,15 @@ class Downgrader:
     _structs_to_add: list[Derective_struct]
     _fns: dict[str, Normalized_fn]
     _fns_to_add: list[Normalized_fn]
+
+    def _lookup_struct(self, type_name: str) -> Derective_struct | None:
+        struct_decl = self._structs.get(type_name)
+        if struct_decl is not None:
+            return struct_decl
+        if "[" in type_name:
+            base_name = type_name.split("[", 1)[0]
+            return self._structs.get(base_name)
+        return None
 
     def run(self, ast: list[Derective]) -> list[Derective]:
         self._structs = {}
@@ -112,10 +124,13 @@ class Downgrader:
         return ast
 
     def _downgrade_function(self, fn: Normalized_fn):
+        blocks_by_name = {block.name: block for block in fn.get_body()}
         for block in fn.get_body():
             assert isinstance(block, TerminatedBlock)
             new_body = []
             for instr in block.get_body():
+                if isinstance(instr, Instruction_match):
+                    self._inject_match_payload_bindings(fn, blocks_by_name, instr)
                 new = self._downgrade(instr)
                 if not isinstance(instr, ControlFlow):
                     new_body.extend(new)
@@ -126,6 +141,70 @@ class Downgrader:
                     block.term = term
 
             block.body = new_body
+
+    def _inject_match_payload_bindings(
+        self,
+        fn: Normalized_fn,
+        blocks_by_name: dict[str, TerminatedBlock],
+        match_instr: Instruction_match,
+    ) -> None:
+        assert match_instr.cond_var.type is not None
+        enum_struct = self._lookup_struct(match_instr.cond_var.type.name)
+        if enum_struct is None:
+            return
+
+        payload_field_index_by_variant: dict[str, int] = {}
+        for index, param in enumerate(enum_struct.params):
+            if param.name == "tag":
+                continue
+            payload_field_index_by_variant[param.name] = index
+
+        for case in match_instr.cases:
+            if case.payload_var is None:
+                continue
+            field_index = payload_field_index_by_variant.get(case.variant)
+            if field_index is None:
+                continue
+
+            case_block = blocks_by_name.get(case.label)
+            if case_block is None:
+                raise EhirCompileError(
+                    f"Unknown match case label '{case.label}' in function '{fn.name}'",
+                    code="EHIR2101",
+                )
+
+            field_type = enum_struct.params[field_index].type
+            if not isinstance(field_type, Pointer):
+                raise EhirCompileError(
+                    f"Invalid enum payload field type for '{match_instr.cond_var.type.name}::{case.variant}': {field_type}",
+                    code="EHIR2102",
+                )
+
+            payload_ptr = TypedVariable(
+                name=f".{match_instr.cond_var.name}_{case.variant}_payload_ptr",
+                type=field_type,
+            )
+            payload_out = TypedVariable(
+                name=case.payload_var.name,
+                type=case.payload_var.type or field_type.pointee,
+            )
+            field_var = TypedVariable(name=str(field_index), type=field_type)
+
+            # Avoid duplicate prepends when pass re-runs on the same AST object.
+            if case_block.body and isinstance(case_block.body[0], Instruction_getfield):
+                existing = case_block.body[0]
+                if existing.var_out.name == payload_ptr.name and existing.src.name == match_instr.cond_var.name:
+                    continue
+
+            case_block.body.insert(
+                0,
+                Instruction_getfield(
+                    var_out=payload_ptr,
+                    src=match_instr.cond_var,
+                    field=field_var,
+                ),
+            )
+            case_block.body.insert(1, Instruction_load(var_out=payload_out, var=payload_ptr))
 
     def _downgrade(self, instr: Instruction) -> list[Instruction]:
         if isinstance(instr, Instruction_cpos):
@@ -209,7 +288,7 @@ class Downgrader:
             if len(variant.types) == 0:
                 return None
             return variant.types[0]
-        raise TypeError(f"Unknown enum variant kind: {type(variant)}")
+        raise EhirCompileError(f"Unknown enum variant kind: {type(variant)}", code="EHIR2103")
 
     def _downgrade_cpos(self, instr: Instruction_cpos) -> list[Instruction]:
         assert instr.var_out.type is not None
@@ -342,9 +421,28 @@ class Downgrader:
             assert owner_t is not None
             if isinstance(owner_t, (Pointer, Reference)):
                 owner_t = owner_t.pointee
-            struct_decl = self._structs.get(owner_t.name)
+            struct_decl = self._lookup_struct(owner_t.name)
             assert struct_decl is not None, f"Unknown struct for getfieldptr: {owner_t}"
             field_index = int(field.name) if field.name.isdigit() else None
+            if field_index is not None:
+                enum_variants = self._enum_variants.get(owner_t.name)
+                if enum_variants is not None and field_index > 0:
+                    # High-level enum field numbering is tag(0) + variant ordinal(1..N).
+                    # Lowered enum layout stores only payload-carrying variants as named fields.
+                    variant_ordinal = field_index - 1
+                    assert variant_ordinal < len(enum_variants), (
+                        f"Invalid enum variant field index {field_index} for {owner_t.name}"
+                    )
+                    variant_name = enum_variants[variant_ordinal]
+                    payload_field_index = None
+                    for idx, p in enumerate(struct_decl.params):
+                        if p.name == variant_name:
+                            payload_field_index = idx
+                            break
+                    assert payload_field_index is not None, (
+                        f"Enum variant '{variant_name}' in {owner_t.name} has no payload field in lowered layout"
+                    )
+                    field_index = payload_field_index
             if field_index is None:
                 for idx, p in enumerate(struct_decl.params):
                     if p.name == field.name:
@@ -458,7 +556,13 @@ class Downgrader:
     def _downgrade_sgetfield(self, instr: Instruction_sgetfield) -> list[Instruction]:
         assert instr.var_out.type is not None
         assert instr.src.type
-        wrapped_struct = self._structs[instr.src.type.name]
+        wrapped_struct = self._lookup_struct(instr.src.type.name)
+        assert wrapped_struct is not None, f"Unknown wrapped struct for sgetfield: {instr.src.type.name}"
+        if not wrapped_struct.params or not isinstance(wrapped_struct.params[0].type, Pointer):
+            # Plain struct: static field access is equivalent to direct field access.
+            return self._downgrade_getfield(
+                Instruction_getfield(var_out=instr.var_out, src=instr.src, field=instr.field)
+            )
         wrapped_struct_ptr = TypedVariable(name=f".{instr.var_out.name}_sgf_ptr", type=wrapped_struct.params[0].type)
         getfield1 = Instruction_getfield(
             var_out=wrapped_struct_ptr, src=instr.src, field=TypedVariable("0", wrapped_struct.params[0].type)
@@ -472,7 +576,11 @@ class Downgrader:
     def _downgrade_sgetfieldptr(self, instr: Instruction_sgetfieldptr) -> list[Instruction]:
         assert instr.var_out.type is not None
         assert instr.src.type
-        wrapped_struct = self._structs[instr.src.type.name]
+        wrapped_struct = self._lookup_struct(instr.src.type.name)
+        assert wrapped_struct is not None, f"Unknown wrapped struct for sgetfieldptr: {instr.src.type.name}"
+        if not wrapped_struct.params or not isinstance(wrapped_struct.params[0].type, Pointer):
+            # Plain struct: static field pointer access is equivalent to direct getfieldptr.
+            return [Instruction_getfieldptr(var_out=instr.var_out, src=instr.src, field=instr.field)]
         wrapped_struct_ptr = TypedVariable(name=f".{instr.var_out.name}_sgfptr_ptr", type=wrapped_struct.params[0].type)
         getfield = Instruction_getfield(
             var_out=wrapped_struct_ptr, src=instr.src, field=TypedVariable("0", wrapped_struct.params[0].type)
@@ -493,7 +601,7 @@ class Downgrader:
         variant_names = self._enum_variants.get(instr.cond_var.type.name)
 
         if variant_names is None:
-            wrapped_struct = self._structs.get(instr.cond_var.type.name)
+            wrapped_struct = self._lookup_struct(instr.cond_var.type.name)
             if (
                 wrapped_struct is not None
                 and wrapped_struct.params
@@ -519,7 +627,10 @@ class Downgrader:
                 variant_names = ["Some", "None"]
 
         if variant_names is None:
-            raise TypeError(f"Match condition must be a lowered enum, got '{instr.cond_var.type}'")
+            raise EhirCompileError(
+                f"Match condition must be a lowered enum, got '{instr.cond_var.type}'",
+                code="EHIR2104",
+            )
 
         tag = TypedVariable(name=f".{cond_src.name}_match_tag", type=Usize_t(8))
         get_tag = Instruction_getfield(
@@ -531,7 +642,10 @@ class Downgrader:
         cases: list[tuple[Usize, str]] = []
         for case in instr.cases:
             if case.variant not in variant_names:
-                raise TypeError(f"Unknown enum variant '{case.variant}' for '{cond_src.type.name}'")
+                raise EhirCompileError(
+                    f"Unknown enum variant '{case.variant}' for '{cond_src.type.name}'",
+                    code="EHIR2105",
+                )
             cases.append((Usize(variant_names.index(case.variant), size=8), case.label))
 
         switch = Instruction_switch(cond_var=tag, default_case=instr.default_case, cases=cases)

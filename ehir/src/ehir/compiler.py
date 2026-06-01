@@ -1,13 +1,14 @@
 import hashlib
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, fields, field, is_dataclass
 from importlib.metadata import version
 from pathlib import Path
 
 from ehir.backend import EHIR_Backend
 from ehir.builder import EHIR_Module
 from ehir.cache import CompiledRefrainCache
+from ehir.cfg import CfgEnvironment, default_cfg_environment
 from ehir.core.derectives import (
     Derective_enum,
     Derective_extern_fn,
@@ -21,18 +22,20 @@ from ehir.core.derectives import (
 from ehir.core.derectives.base import Derective
 from ehir.core.primitives import Str_t
 from ehir.core.primitives.base import PrimitiveType
-from ehir.core.type import Pointer, Reference, Type
+from ehir.core.type import Pointer, Reference, Type, is_box_type
 from ehir.core.variable import Parameter
 from ehir.format import ThemePalette, printfmt
 from ehir.frontend import EHIR_Frontend
 from ehir.postprocessor import Postprocessor
-from ehir.refrain import CompiledRefrain, Refrain
+from ehir.refrain import CompiledRefrain, NativeLibrary, Refrain
 from ehir.simplifier import (
     AutoDropPass,
     AutoRetainPass,
     Deallocator,
     Downgrader,
     DropLoweringPass,
+    InstanceCallLoweringPass,
+    MatchValidatorPass,
     MonomorphizationPass,
     Normalizer,
     ReferenceLoweringPass,
@@ -50,12 +53,18 @@ class TreeNode:
     dependencies: set[Path] = field(default_factory=set)
 
 
+class CompileStageError(RuntimeError):
+    pass
+
+
 @dataclass
 class EHIR_ProjectCompiler:
     frontend: EHIR_Frontend
     backend: EHIR_Backend
     cache_dir: Path | None = None
     use_cache: bool = True
+    trace_cfree: bool = False
+    cfg_environment: CfgEnvironment = field(default_factory=default_cfg_environment)
     on_refrain: Callable[[Refrain], None] | None = None
     refrains: dict[str, Refrain] = field(default_factory=dict)
     tree: dict[Path, TreeNode] = field(default_factory=dict)
@@ -70,6 +79,8 @@ class EHIR_ProjectCompiler:
             self.cache_dir = self.backend.profile_path / "ehir" / "cache"
 
         self._cache = CompiledRefrainCache(self.cache_dir)
+        if hasattr(self.frontend, "cfg_environment"):
+            setattr(self.frontend, "cfg_environment", self.cfg_environment)
 
     def add_refrain_to_build(self, refrain: Refrain):
         if refrain.name in self.refrains:
@@ -121,46 +132,49 @@ class EHIR_ProjectCompiler:
 
         module = EHIR_Module(
             id=node.module.id,
-            ast=self._builtin_directives() + deepcopy(node.module.ast),
+            ast=self._merge_builtin_directives(self._builtin_directives(), deepcopy(node.module.ast)),
         )
 
-        module.ast = Resolver().run(module.ast)
+        module.ast = self._run_stage("lift_impl_methods", refrain, lambda: self._lift_impl_methods(module.ast))
+        module.ast = self._run_stage("deduplicate_after_lift", refrain, lambda: self._deduplicate_directives(module.ast))
+        module.ast = self._run_stage(
+            "instance_call_lowering_pre_resolve", refrain, lambda: InstanceCallLoweringPass().run(module.ast)
+        )
+        module.ast = self._run_stage(
+            "deduplicate_after_instance_call_lowering_pre_resolve",
+            refrain,
+            lambda: self._deduplicate_directives(module.ast),
+        )
+        module.ast = self._run_stage("resolve_1", refrain, lambda: Resolver().run(module.ast))
+        module.ast = self._run_stage("deduplicate_after_resolve_1", refrain, lambda: self._deduplicate_directives(module.ast))
         self._emit_ehir_stage(refrain.name, "post_resolve", module.ast)
-        module.ast = ReferenceLoweringPass().run(module.ast)
-        module.ast = MonomorphizationPass().run(module.ast)
+        module.ast = self._run_stage("reference_lowering", refrain, lambda: ReferenceLoweringPass().run(module.ast))
+        module.ast = self._run_stage(
+            "deduplicate_after_reference_lowering", refrain, lambda: self._deduplicate_directives(module.ast)
+        )
+        module.ast = self._run_stage("monomorphization", refrain, lambda: MonomorphizationPass().run(module.ast))
+        module.ast = self._run_stage(
+            "deduplicate_after_monomorphization", refrain, lambda: self._deduplicate_directives(module.ast)
+        )
+        module.ast = self._run_stage("resolve_2", refrain, lambda: Resolver().run(module.ast))
+        module.ast = self._run_stage("deduplicate_after_resolve_2", refrain, lambda: self._deduplicate_directives(module.ast))
+        module.ast = self._run_stage("match_validator", refrain, lambda: MatchValidatorPass().run(module.ast))
         self._emit_ehir_stage(refrain.name, "post_monomorphize", module.ast)
-        module.ast = AutoDropPass().run(module.ast)
-        module.ast = AutoRetainPass().run(module.ast)
-        module.ast = RetainInsertionPass().run(module.ast)
+        module.ast = self._run_stage("autodrop", refrain, lambda: AutoDropPass(trace_cfree=self.trace_cfree).run(module.ast))
+        module.ast = self._run_stage("autoretain", refrain, lambda: AutoRetainPass().run(module.ast))
+        module.ast = self._run_stage("retain_insertion", refrain, lambda: RetainInsertionPass().run(module.ast))
         # TODO: re-enable after migrating core/std to explicit safety attrs.
         # module.ast = SafetyValidator().run(module.ast)
-        module.ast = Normalizer().run(module.ast)
-        module.ast = Deallocator().run(module.ast)
-        module.ast = DropLoweringPass().run(module.ast)
+        module.ast = self._run_stage("normalizer", refrain, lambda: Normalizer().run(module.ast))
+        module.ast = self._run_stage("deallocator", refrain, lambda: Deallocator().run(module.ast))
+        module.ast = self._run_stage("drop_lowering", refrain, lambda: DropLoweringPass().run(module.ast))
         self._emit_ehir_stage(refrain.name, "pre_downgrade", module.ast)
-        module.ast = Downgrader().run(module.ast)
+        module.ast = self._run_stage("downgrader", refrain, lambda: Downgrader().run(module.ast))
         self._emit_ehir_stage(refrain.name, "post_downgrade", module.ast)
-        module.ast = UnneededSymbolsStripper().run(
-            module.ast,
-            keep_public_api=refrain.type != Refrain.TargetType.EXECUTABLE,
-        )
-        lifted_method_names = {
-            directive.name for directive in module.ast if isinstance(directive, (Derective_fn, Derective_extern_fn))
-        }
-        lifted_methods: list[Derective_fn] = []
-        for directive in module.ast:
-            if isinstance(directive, Derective_impl):
-                if directive.trait_name is not None and directive.trait_name != "":
-                    continue
-                for method in directive.methods:
-                    if not isinstance(method, Derective_fn):
-                        continue
-                    if method.name in lifted_method_names:
-                        continue
-                    lifted_method_names.add(method.name)
-                    lifted_methods.append(method)
-        if lifted_methods:
-            module.ast.extend(lifted_methods)
+        if refrain.type == Refrain.TargetType.EXECUTABLE:
+            module.ast = self._run_stage(
+                "stripper", refrain, lambda: UnneededSymbolsStripper().run(module.ast, keep_public_api=False)
+            )
         module.ast = [
             directive
             for directive in module.ast
@@ -169,11 +183,20 @@ class EHIR_ProjectCompiler:
         concrete_type_names = {
             directive.name for directive in module.ast if isinstance(directive, (Derective_struct, Derective_enum))
         }
+        known_type_names = set(concrete_type_names)
+        known_type_names |= {
+            directive.name for directive in module.ast if isinstance(directive, Derective_typealias)
+        }
+        known_type_names |= {
+            type_name.rsplit("::", 1)[-1] for type_name in concrete_type_names if "::" in type_name
+        }
         module.ast = [
-            directive for directive in module.ast if self._is_backend_emittable(directive, concrete_type_names)
+            directive for directive in module.ast if self._is_backend_emittable(directive, known_type_names)
         ]
         module.ast = [directive for directive in module.ast if not isinstance(directive, Derective_typealias)]
-        processed_mod = Postprocessor().run(module)
+        module.ast = self._deduplicate_directives(module.ast)
+        self._emit_ehir_stage(refrain.name, "pre_postprocess", module.ast)
+        processed_mod = self._run_stage("postprocessor", refrain, lambda: Postprocessor().run(module))
 
         compiled_refrain = CompiledRefrain(
             name=refrain.name,
@@ -184,10 +207,152 @@ class EHIR_ProjectCompiler:
             compiler_version=self._compiler_version,
             dependencies=sorted(node.dependencies),
             source_files=source_files,
+            native_libraries=self._collect_native_libraries_for(refrain),
         )
         self._cache.store(compiled_refrain)
         self.compiled_refrains[refrain.name] = compiled_refrain
         return compiled_refrain
+
+    def _run_stage(self, stage: str, refrain: Refrain, action):
+        try:
+            return action()
+        except Exception as exc:
+            raise CompileStageError(
+                f"Compile stage '{stage}' failed for refrain '{refrain.name}' ({refrain.path}): {exc}"
+            ) from exc
+
+    def _merge_builtin_directives(
+        self,
+        builtins: list[Derective],
+        user_directives: list[Derective],
+    ) -> list[Derective]:
+        existing: set[tuple[type, str]] = set()
+        for directive in user_directives:
+            existing.add(self._directive_identity(directive))
+
+        merged: list[Derective] = []
+        for directive in builtins:
+            key = self._directive_identity(directive)
+            if key in existing:
+                continue
+            merged.append(directive)
+        merged.extend(user_directives)
+        return merged
+
+    def _directive_identity(self, directive: Derective) -> tuple[type, str]:
+        if isinstance(directive, Derective_impl):
+            trait_name = directive.trait_name or ""
+            trait_args_suffix = ""
+            if directive.trait_args:
+                trait_args_suffix = "[" + ",".join(self._mangle_type_name(arg) for arg in directive.trait_args) + "]"
+            return (type(directive), f"{trait_name}{trait_args_suffix}::{directive.for_type}")
+        return (type(directive), getattr(directive, "name", ""))
+
+    def _deduplicate_directives(self, directives: list[Derective]) -> list[Derective]:
+        result: list[Derective] = []
+        seen: dict[tuple[type, str], str] = {}
+        for directive in directives:
+            key = self._directive_identity(directive)
+            text = str(directive)
+            existing = seen.get(key)
+            if existing is not None:
+                if existing != text:
+                    raise RuntimeError(f"Conflicting generated directive for '{key[1]}'")
+                continue
+            seen[key] = text
+            result.append(directive)
+        return result
+
+    def _lift_impl_methods(self, ast: list[Derective]) -> list[Derective]:
+        lifted_method_names = {
+            directive.name for directive in ast if isinstance(directive, (Derective_fn, Derective_extern_fn))
+        }
+        lifted_methods: list[Derective_fn] = []
+        for directive in ast:
+            if not isinstance(directive, Derective_impl):
+                continue
+            self._replace_self(directive.methods, directive.for_type)
+            for method in directive.methods:
+                if not isinstance(method, Derective_fn):
+                    continue
+                lifted = deepcopy(method)
+                lifted.generics = self._merge_generics(directive.generics, lifted.generics)
+                lifted = self._replace_self(lifted, directive.for_type)
+                if "::" not in lifted.name:
+                    owner = directive.trait_name if directive.trait_name else str(directive.for_type)
+                    if owner:
+                        method_name = lifted.name
+                        if directive.trait_name is not None:
+                            suffix = self._mangle_type_template_name(directive.for_type)
+                            if directive.trait_args:
+                                trait_suffix = "_".join(self._mangle_type_template_name(arg) for arg in directive.trait_args)
+                                if trait_suffix:
+                                    suffix = f"{suffix}__{trait_suffix}" if suffix else trait_suffix
+                            if suffix:
+                                method_name = f"{method_name}__{suffix}"
+                        lifted.name = f"{owner}::{method_name}"
+                if lifted.name in lifted_method_names:
+                    continue
+                lifted_method_names.add(lifted.name)
+                lifted_methods.append(lifted)
+        if lifted_methods:
+            return [*ast, *lifted_methods]
+        return ast
+
+    def _replace_self(self, value, self_type: Type):
+        if isinstance(value, Type):
+            if isinstance(value, Pointer):
+                return Pointer(self._replace_self(value.pointee, self_type))
+            if isinstance(value, Reference):
+                return Reference(self._replace_self(value.pointee, self_type))
+            if value.name == "Self" and not value.generics:
+                return deepcopy(self_type)
+            return Type(value.name, [self._replace_self(generic, self_type) for generic in value.generics])
+        if isinstance(value, list):
+            for i, item in enumerate(value):
+                value[i] = self._replace_self(item, self_type)
+            return value
+        if not is_dataclass(value):
+            return value
+        for f in fields(value):
+            setattr(value, f.name, self._replace_self(getattr(value, f.name), self_type))
+        return value
+
+    def _merge_generics(self, *generic_groups: list[Type]) -> list[Type]:
+        merged: list[Type] = []
+        seen: set[str] = set()
+        for group in generic_groups:
+            for generic in group:
+                if generic.name in seen:
+                    continue
+                seen.add(generic.name)
+                merged.append(deepcopy(generic))
+        return merged
+
+    def _mangle_type_template_name(self, typ: Type) -> str:
+        name = typ.name.replace("::", "_")
+        if not typ.generics:
+            return name
+        inner = "_".join(self._mangle_type_template_name(generic) for generic in typ.generics)
+        return f"{name}_{inner}"
+
+    def _mangle_type_name(self, typ: Type) -> str:
+        if self._is_placeholder_type_name(typ.name):
+            return ""
+        if typ.generics:
+            mangled_generics = [self._mangle_type_name(generic) for generic in typ.generics]
+            if any(not part for part in mangled_generics):
+                return ""
+            inner = "_".join(mangled_generics)
+            return f"{typ.name}_{inner}"
+        return typ.name.replace("::", "_")
+
+    def _is_placeholder_type_name(self, name: str) -> bool:
+        if name in {"Self", "T"}:
+            return True
+        if len(name) == 1 and name.isupper():
+            return True
+        return len(name) > 1 and name.startswith("T") and name[1:].isdigit()
 
     def _emit_ehir_stage(self, refrain_name: str, stage: str, ast: list[Derective]) -> None:
         ehir_dir = self.backend.profile_path / "ehir"
@@ -213,7 +378,7 @@ class EHIR_ProjectCompiler:
             return
 
         symbol_keys: set[tuple[type, str]] = set()
-        impl_keys: set[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = set()
+        impl_keys: set[str] = set()
         for directive in target_node.module.ast:
             if isinstance(
                 directive,
@@ -228,14 +393,7 @@ class EHIR_ProjectCompiler:
             ):
                 symbol_keys.add((type(directive), directive.name))
             elif isinstance(directive, Derective_impl):
-                impl_keys.add(
-                    (
-                        directive.trait_name or "",
-                        str(directive.for_type),
-                        tuple(str(arg) for arg in directive.trait_args),
-                        tuple(method.name for method in directive.methods),
-                    )
-                )
+                impl_keys.add(str(directive))
 
         for module_path in module_paths:
             if module_path.resolve() == entrypoint_id.resolve():
@@ -261,49 +419,43 @@ class EHIR_ProjectCompiler:
                         continue
                     symbol_keys.add(key)
                 elif isinstance(directive, Derective_impl):
-                    key = (
-                        directive.trait_name or "",
-                        str(directive.for_type),
-                        tuple(str(arg) for arg in directive.trait_args),
-                        tuple(method.name for method in directive.methods),
-                    )
+                    key = str(directive)
                     if key in impl_keys:
                         continue
                     impl_keys.add(key)
                 target_node.module.ast.append(directive)
 
-    def _is_backend_emittable(self, directive, concrete_type_names: set[str]) -> bool:
+    def _is_backend_emittable(self, directive, known_type_names: set[str]) -> bool:
         if isinstance(directive, Derective_fn):
-            if directive.name.startswith("std::src::vec::mod::"):
-                return True
             return all(
-                self._is_concrete_type(param.type, concrete_type_names) for param in directive.params
-            ) and self._is_concrete_type(directive.ret_type, concrete_type_names)
+                self._is_concrete_type(param.type, known_type_names) for param in directive.params
+            ) and self._is_concrete_type(directive.ret_type, known_type_names)
         if getattr(directive, "generics", []):
-            if isinstance(directive, Derective_struct):
+            if isinstance(directive, (Derective_struct, Derective_enum)):
                 return True
             return False
         if isinstance(directive, Derective_struct):
-            return all(self._is_concrete_type(param.type, concrete_type_names) for param in directive.params)
+            return True
         if isinstance(directive, Derective_enum):
-            return all(
-                variant.type is None or self._is_concrete_type(variant.type, concrete_type_names)
-                for variant in directive.variants
-            )
+            return True
         if isinstance(directive, Derective_typealias):
             return False
         return True
 
-    def _is_concrete_type(self, typ: Type, concrete_type_names: set[str]) -> bool:
+    def _is_concrete_type(self, typ: Type, known_type_names: set[str]) -> bool:
         if isinstance(typ, (Pointer, Reference)):
-            return self._is_concrete_type(typ.pointee, concrete_type_names)
+            return self._is_concrete_type(typ.pointee, known_type_names)
         if isinstance(typ, PrimitiveType):
             return True
-        if typ.generics and not all(self._is_concrete_type(generic, concrete_type_names) for generic in typ.generics):
+        if typ.name == "dyn":
+            return len(typ.generics) == 1
+        if typ.generics and not all(self._is_concrete_type(generic, known_type_names) for generic in typ.generics):
             return False
         builtin_scalar_names = {"void", "str", "char"}
         return (
-            typ.name in concrete_type_names
+            is_box_type(typ)
+            or
+            typ.name in known_type_names
             or typ.name in builtin_scalar_names
             or not typ.name.isidentifier()
             or typ.name.startswith(("u", "i", "f"))
@@ -332,6 +484,15 @@ class EHIR_ProjectCompiler:
         digest.update(self._compiler_version.encode())
         digest.update(refrain.name.encode())
         digest.update(refrain.type.value.encode())
+        digest.update(b"trace_cfree=")
+        digest.update(b"1" if self.trace_cfree else b"0")
+        digest.update(b"cfg.flags=")
+        digest.update(",".join(sorted(self.cfg_environment.flags)).encode())
+        digest.update(b"cfg.values=")
+        digest.update(",".join(f"{k}={v}" for k, v in sorted(self.cfg_environment.values.items())).encode())
+        digest.update(b"native=")
+        for native in self._collect_native_libraries_for(refrain):
+            digest.update(repr(native).encode())
 
         for source_file in source_files:
             resolved_file = source_file.resolve()
@@ -339,6 +500,18 @@ class EHIR_ProjectCompiler:
             digest.update(resolved_file.read_bytes())
 
         return digest.hexdigest()
+
+    def _collect_native_libraries_for(self, refrain: Refrain) -> list[NativeLibrary]:
+        candidates = self.refrains.values() if refrain.type == Refrain.TargetType.EXECUTABLE else [refrain]
+        result: list[NativeLibrary] = []
+        seen: set[NativeLibrary] = set()
+        for candidate in candidates:
+            for native in candidate.native_libraries:
+                if native in seen:
+                    continue
+                seen.add(native)
+                result.append(native)
+        return result
 
     def _compile_node_by_id(self, id: Path) -> TreeNode:
         if node := self.tree.get(id):
@@ -356,7 +529,7 @@ class EHIR_ProjectCompiler:
 
         resolved_ast = []
         resolved_symbols: set[tuple[type, str]] = set()
-        resolved_impls: set[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = set()
+        resolved_impls: set[str] = set()
 
         def append_directive(directive):
             if isinstance(
@@ -375,12 +548,7 @@ class EHIR_ProjectCompiler:
                     return
                 resolved_symbols.add(key)
             elif isinstance(directive, Derective_impl):
-                key = (
-                    directive.trait_name or "",
-                    str(directive.for_type),
-                    tuple(str(arg) for arg in directive.trait_args),
-                    tuple(method.name for method in directive.methods),
-                )
+                key = str(directive)
                 if key in resolved_impls:
                     return
                 resolved_impls.add(key)
@@ -458,7 +626,14 @@ class EHIR_ProjectCompiler:
                     ) and matches_import_symbol(d.name, directive.symbol):
                         if isinstance(
                             d,
-                            (Derective_fn, Derective_extern_fn, Derective_trait, Derective_struct, Derective_typealias),
+                            (
+                                Derective_fn,
+                                Derective_extern_fn,
+                                Derective_trait,
+                                Derective_struct,
+                                Derective_enum,
+                                Derective_typealias,
+                            ),
                         ):
                             append_module_contents(parent_ast)
                         else:
@@ -478,7 +653,10 @@ class EHIR_ProjectCompiler:
         return node
 
     def _core_dir(self) -> Path:
-        return Path(__file__).resolve().parents[2] / "core"
+        repo_core = Path(__file__).resolve().parents[2] / "core"
+        if repo_core.exists():
+            return repo_core
+        return Path(__file__).resolve().parent / "core"
 
     def _core_module_ids(self) -> list[Path]:
         core_dir = self._core_dir()
@@ -550,14 +728,19 @@ class EHIR_ProjectCompiler:
         core_root = self._core_dir()
         owner_id = core_root / "owner.ehir"
         box_id = core_root / "smart_box.ehir"
+        runtime_id = core_root / "runtime.ehir"
 
         from ehir.frontend.builtin import EHIR_DirectFrontend
 
-        core_frontend = self.frontend if self.frontend.get_file_extension() == ".ehir" else EHIR_DirectFrontend()
+        core_frontend = (
+            self.frontend
+            if self.frontend.get_file_extension() == ".ehir"
+            else EHIR_DirectFrontend(cfg_environment=self.cfg_environment)
+        )
 
         directives: list[Derective] = []
         seen_symbols: set[tuple[type, str]] = set()
-        for module_id in (owner_id, box_id):
+        for module_id in (owner_id, box_id, runtime_id):
             if not module_id.exists():
                 continue
             module = core_frontend.get_module_by_id(module_id)

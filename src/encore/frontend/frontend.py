@@ -4,9 +4,10 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import StrEnum, auto
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
 from ehir.builder import EHIR_Module
+from ehir.cfg import CfgEnvironment, default_cfg_environment, filter_cfg_items
 from ehir.core.derectives import Derective_imp, Derective_import
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 
@@ -14,20 +15,13 @@ from ehir import EHIR_Frontend
 from encore import ENCORE_CACHE_DIR
 from encore.frontend.inference import TypeInferer
 from encore.frontend.lexer import Lexer
+from encore.frontend.macro_expander import MacroExpander
 from encore.frontend.parser import Parser
 from encore.frontend.parser import statements as s
-from encore.frontend.reflection import (
-    ModuleReflection,
-    RUNTIME_REFLECTION_RESERVED_NAMES,
-    ReflectionSymbol,
-    build_module_reflection,
-    find_symbol_reflection,
-)
 from encore.frontend.translator import Translator
 from encore.frontend.types import (
     AnySmartPointer,
     is_mutable_type,
-    is_raw_pointer_type,
     make_mutable_type,
     unwrap_for_storage,
 )
@@ -75,15 +69,16 @@ class ImportedTopLevelDeclaration:
 @dataclass
 class EHIR_EncoreFrontend(EHIR_Frontend):
     src_dir: Path
+    cfg_environment: CfgEnvironment = field(default_factory=default_cfg_environment)
     on_module_load: Callable[[Path], None] | None = None
     _cache: dict[Path, EHIR_Module] = field(default_factory=dict)
     _ast_cache: dict[Path, list[s.Statement]] = field(default_factory=dict)
     _source_ast_cache: dict[Path, list[s.Statement]] = field(default_factory=dict)
     _index_cache: dict[Path, ModuleIndex] = field(default_factory=dict)
     _dependency_cache: dict[Path, dict[str, Path]] = field(default_factory=dict)
-    _reflection_cache: dict[Path, ModuleReflection] = field(default_factory=dict)
     _lexer: Lexer = field(default_factory=lambda: Lexer())
     _parser: Parser = field(default_factory=lambda: Parser())
+    _macro_expander: MacroExpander = field(default_factory=lambda: MacroExpander())
 
     def get_module_by_id(self, id: Path) -> EHIR_Module:
         if self.on_module_load is not None:
@@ -93,19 +88,17 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return self._cache[id]
 
         ast = self._get_ast_by_id(id)
-        source_ast = self._get_source_ast_by_id(id)
         imported_declarations = self._collect_imported_declarations(id, ast)
         try:
-            TypeInferer().infer(ast, imported_declarations)
+            TypeInferer().infer(ast, cast(list[object], imported_declarations))
         except Exception as exc:
             raise with_diagnostic_context(exc, stage="type-inference", module_id=id) from exc
-        self._reflection_cache[id] = build_module_reflection(id, source_ast)
 
         translator = Translator()
         ast_for_translation = self._prepare_imports_for_translation(id, ast)
         try:
             module = translator.translate_ast(
-                ast_for_translation, module_id=id, imported_declarations=imported_declarations
+                ast_for_translation, module_id=id, imported_declarations=cast(list[object], imported_declarations)
             )
         except Exception as exc:
             raise with_diagnostic_context(exc, stage="translation", module_id=id) from exc
@@ -113,25 +106,6 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         self._cache[id] = module
         return module
-
-    def get_reflection_by_id(self, id: Path) -> ModuleReflection:
-        if id in self._reflection_cache:
-            return self._reflection_cache[id]
-
-        ast = self._get_ast_by_id(id)
-        source_ast = self._get_source_ast_by_id(id)
-        imported_declarations = self._collect_imported_declarations(id, ast)
-        try:
-            TypeInferer().infer(ast, imported_declarations)
-        except Exception as exc:
-            raise with_diagnostic_context(exc, stage="type-inference", module_id=id) from exc
-
-        reflection = build_module_reflection(id, source_ast)
-        self._reflection_cache[id] = reflection
-        return reflection
-
-    def get_symbol_reflection_by_id(self, id: Path, query: str) -> ReflectionSymbol | None:
-        return find_symbol_reflection(self.get_reflection_by_id(id), query)
 
     def get_parent_id_of(self, id: Path, derective: Derective_import) -> Path:
         project_root = self._get_project_root_of(id)
@@ -174,13 +148,6 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return self._ast_cache[id]
 
         source_ast = self._get_source_ast_by_id(id)
-        reflection = self._reflection_cache.get(id)
-        if reflection is None:
-            reflection = build_module_reflection(id, source_ast)
-            self._reflection_cache[id] = reflection
-
-        # TODO: re-enable runtime reflection injection after CFG normalization
-        # for generated reflect functions is stabilized.
         ast = source_ast
         self._ast_cache[id] = ast
         return ast
@@ -192,7 +159,9 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         source_text = id.read_text()
         try:
             tokens = self._lexer.parse(list(source_text))
+            tokens = self._macro_expander.expand(tokens)
             ast = self._parser.parse(tokens, module_id=id, source_text=source_text)
+            ast = filter_cfg_items(ast, self.cfg_environment)
         except Exception as exc:
             raise with_diagnostic_context(exc, stage="parse", module_id=id, source_text=source_text) from exc
         ast = self._inject_prelude_imports(id, ast)
@@ -204,26 +173,35 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         manifest = self._load_manifest(project_root)
         dependency_roots = self._get_dependency_roots(project_root)
         prelude_prefix: list[str] | None = None
+        cast_prefix: list[str] | None = None
 
         if manifest.project.name == "core":
             # Do not inject prelude into core::ops itself.
             core_ops_mod = (project_root / "src" / "ops" / "mod.enq").resolve()
-            if id.resolve() == core_ops_mod:
-                return ast
-            prelude_prefix = ["refrain", "ops"]
+            core_cast_mod = (project_root / "src" / "cast" / "mod.enq").resolve()
+            if id.resolve() != core_ops_mod:
+                prelude_prefix = ["refrain", "ops"]
+            if id.resolve() != core_cast_mod:
+                cast_prefix = ["refrain", "cast"]
         elif manifest.project.name == "std":
             # Do not inject prelude into std::ops shim itself.
             std_ops_mod = (project_root / "src" / "ops" / "mod.enq").resolve()
-            if id.resolve() == std_ops_mod:
-                return ast
-            prelude_prefix = ["core", "ops"] if "core" in dependency_roots else ["refrain", "ops"]
+            std_cast_mod = (project_root / "src" / "cast" / "mod.enq").resolve()
+            if id.resolve() != std_ops_mod:
+                prelude_prefix = ["core", "ops"] if "core" in dependency_roots else ["refrain", "ops"]
+            if id.resolve() != std_cast_mod:
+                cast_prefix = ["core", "cast"] if "core" in dependency_roots else ["refrain", "cast"]
         elif "std" in dependency_roots:
             prelude_prefix = ["std", "ops"]
+            cast_prefix = ["std", "cast"]
         elif "core" in dependency_roots:
             prelude_prefix = ["core", "ops"]
+            cast_prefix = ["core", "cast"]
         else:
             return ast
 
+        has_ops_glob = False
+        has_cast_glob = False
         for statement in ast:
             if not isinstance(statement, s.Statement_Import):
                 continue
@@ -231,27 +209,96 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                 if request.kind != "glob":
                     continue
                 if list(request.path) in (["std", "ops"], ["core", "ops"], ["refrain", "ops"]):
-                    return ast
+                    has_ops_glob = True
+                if list(request.path) in (["std", "cast"], ["core", "cast"], ["refrain", "cast"]):
+                    has_cast_glob = True
 
-        prelude_import = s.Statement_Import(
-            is_public=False,
-            pair=s.Statement_Import.ImportPair(
-                src=prelude_prefix[0],
-                dst=[
-                    s.Statement_Import.ImportPair(
-                        src=prelude_prefix[1],
-                        dst=[s.Statement_Import.ImportPair(src="*", dst=[], kind=s.Statement_Import.ImportKind.GLOB)],
-                    )
-                ],
-            ),
-        )
-        return [prelude_import, *ast]
+        injected: list[s.Statement] = []
+        if prelude_prefix is not None and not has_ops_glob:
+            injected.append(
+                s.Statement_Import(
+                    is_public=False,
+                    pair=s.Statement_Import.ImportPair(
+                        src=prelude_prefix[0],
+                        dst=[
+                            s.Statement_Import.ImportPair(
+                                src=prelude_prefix[1],
+                                dst=[s.Statement_Import.ImportPair(src="*", dst=[], kind=s.Statement_Import.ImportKind.GLOB)],
+                            )
+                        ],
+                    ),
+                )
+            )
+        if cast_prefix is not None and not has_cast_glob:
+            injected.append(
+                s.Statement_Import(
+                    is_public=False,
+                    pair=s.Statement_Import.ImportPair(
+                        src=cast_prefix[0],
+                        dst=[
+                            s.Statement_Import.ImportPair(
+                                src=cast_prefix[1],
+                                dst=[s.Statement_Import.ImportPair(src="*", dst=[], kind=s.Statement_Import.ImportKind.GLOB)],
+                            )
+                        ],
+                    ),
+                )
+            )
+        return [*injected, *ast] if injected else ast
 
     def _collect_imported_declarations(self, id: Path, ast: list[s.Statement]) -> list[ImportedTopLevelDeclaration]:
         declarations: list[ImportedTopLevelDeclaration] = []
         seen: set[tuple[Path, str]] = set()
         visited_modules: set[Path] = set()
         local_sources: dict[str, tuple[Path, str]] = {}
+        expanded_type_impls: set[tuple[Path, str]] = set()
+
+        def collect_named_types(typ: Type | None) -> set[str]:
+            if typ is None:
+                return set()
+            typ = unwrap_for_storage(typ)
+            if isinstance(typ, AnySmartPointer):
+                return collect_named_types(typ.pointee)
+            if isinstance(typ, HeapSmartPointer):
+                return collect_named_types(typ.pointee)
+            if isinstance(typ, StackSmartPointer):
+                return collect_named_types(typ.pointee)
+            if isinstance(typ, Pointer):
+                return collect_named_types(typ.pointee)
+
+            names = {typ.name}
+            for generic in typ.generics:
+                names |= collect_named_types(generic)
+            return names
+
+        def append_associated_type_impls(module_id: Path, type_name: str):
+            marker = (module_id, type_name)
+            if marker in expanded_type_impls:
+                return
+            expanded_type_impls.add(marker)
+
+            assoc_impls = self._collect_associated_impls(module_id, type_name)
+            for idx, assoc_impl in enumerate(assoc_impls):
+                impl_key = (module_id, f"impl-dep::{type_name}::{idx}")
+                if impl_key in seen:
+                    continue
+                seen.add(impl_key)
+                declarations.append(
+                    ImportedTopLevelDeclaration(
+                        module_id=module_id,
+                        statement=assoc_impl,
+                        local_name=type_name,
+                        source_name=type_name,
+                    )
+                )
+
+                for method in assoc_impl.body:
+                    if method.signature.type is not None:
+                        for dep_type_name in collect_named_types(method.signature.type):
+                            append_associated_type_impls(module_id, dep_type_name)
+                    for param in method.signature.params:
+                        for dep_type_name in collect_named_types(param.type):
+                            append_associated_type_impls(module_id, dep_type_name)
 
         def append_binding(binding: ExportBinding):
             existing_source = local_sources.get(binding.name)
@@ -276,7 +323,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                     )
                 )
 
-            if isinstance(binding.statement, s.Statement_StructureDefinition):
+            if isinstance(binding.statement, (s.Statement_StructureDefinition, s.Statement_EnumDefinition)):
                 lookup_name = binding.source_name or binding.name
                 for idx, assoc_impl in enumerate(self._collect_associated_impls(binding.module_id, lookup_name)):
                     if binding.source_name is not None:
@@ -296,6 +343,26 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                             statement=assoc_impl,
                             local_name=binding.name,
                             source_name=binding.source_name or binding.name,
+                        )
+                    )
+                    for method in assoc_impl.body:
+                        if method.signature.type is not None:
+                            for dep_type_name in collect_named_types(method.signature.type):
+                                append_associated_type_impls(binding.module_id, dep_type_name)
+                        for param in method.signature.params:
+                            for dep_type_name in collect_named_types(param.type):
+                                append_associated_type_impls(binding.module_id, dep_type_name)
+                for idx, assoc_impl in enumerate(self._collect_module_inherent_impls(binding.module_id)):
+                    impl_key = (binding.module_id, f"impl-module::{idx}")
+                    if impl_key in seen:
+                        continue
+                    seen.add(impl_key)
+                    declarations.append(
+                        ImportedTopLevelDeclaration(
+                            module_id=binding.module_id,
+                            statement=assoc_impl,
+                            local_name=assoc_impl.struct.name,
+                            source_name=assoc_impl.struct.name,
                         )
                     )
             elif isinstance(binding.statement, s.Statement_Trait):
@@ -350,14 +417,15 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         return declarations
 
     def _collect_associated_impls(self, module_id: Path, struct_name: str) -> list[s.Statement_Impl]:
+        def leaf(name: str) -> str:
+            return name.rsplit("::", 1)[-1]
+
         ast = self._get_ast_by_id(module_id)
         result: list[s.Statement_Impl] = []
         for statement in ast:
             if not isinstance(statement, s.Statement_Impl):
                 continue
-            if statement.trait_name is not None:
-                continue
-            if statement.struct.name != struct_name:
+            if statement.struct.name != struct_name and leaf(statement.struct.name) != leaf(struct_name):
                 continue
             result.append(statement)
         return result
@@ -387,6 +455,17 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             if statement.trait_name is not None:
                 continue
             if statement.struct.name not in builtin_types:
+                continue
+            result.append(statement)
+        return result
+
+    def _collect_module_inherent_impls(self, module_id: Path) -> list[s.Statement_Impl]:
+        ast = self._get_ast_by_id(module_id)
+        result: list[s.Statement_Impl] = []
+        for statement in ast:
+            if not isinstance(statement, s.Statement_Impl):
+                continue
+            if statement.trait_name is not None:
                 continue
             result.append(statement)
         return result
@@ -429,12 +508,8 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return None
 
         if isinstance(statement, s.Statement_FunctionDefinition):
-            if statement.signature.name in RUNTIME_REFLECTION_RESERVED_NAMES:
-                return None
             return ExportBinding(statement.signature.name, ExportKind.FUNCTION, id, statement)
         if isinstance(statement, s.FunctionSignature):
-            if statement.name in RUNTIME_REFLECTION_RESERVED_NAMES:
-                return None
             return ExportBinding(statement.name, ExportKind.FUNCTION, id, statement)
         if isinstance(statement, s.Statement_StructureDefinition):
             return ExportBinding(statement.signature.name, ExportKind.STRUCT, id, statement)
@@ -623,7 +698,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return HeapSmartPointer(self._replace_type_name(typ.pointee, source_name, target_name))
         if isinstance(typ, StackSmartPointer):
             return StackSmartPointer(self._replace_type_name(typ.pointee, source_name, target_name))
-        if is_raw_pointer_type(typ):
+        if isinstance(typ, Pointer):
             return Pointer(self._replace_type_name(typ.pointee, source_name, target_name))
 
         name = target_name if typ.name == source_name else typ.name

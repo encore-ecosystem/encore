@@ -6,8 +6,7 @@ import mod::statements::*
 import core::panic::panic
 import core::fmt::Debug
 import core::option::Option
-import colorterm::eprintln_error
-import colorterm::eprintln_note
+import std::io::println
 import std::vec::Vec
 
 
@@ -43,7 +42,7 @@ impl for Parser {
                 break
             }
             let statement = self.parse_top_level()
-            self.ast = self.ast.push(statement)
+            self.ast.push(statement)
         }
 
         ret self.ast
@@ -58,6 +57,7 @@ impl for Parser {
     }
 
     fn parse_top_level(mut self) -> Statement {
+        let attrs = self.parse_function_attrs()
         let mut is_public = false
         if self.peek_curr_type() == TokenType::KW_PUB {
             self.consume()
@@ -65,6 +65,9 @@ impl for Parser {
         }
 
         let curr_token = self.peek_curr()
+        if attrs.len() > 0_usize && curr_token.type != TokenType::KW_FN && curr_token.type != TokenType::KW_EXTERN {
+            self.unexpected_token("function after attributes", curr_token)
+        }
         match curr_token.type {
             TokenType::KW_IMPORT => {
                 ret self.parse_import(is_public)
@@ -82,10 +85,10 @@ impl for Parser {
                 ret self.parse_impl()
             }
             TokenType::KW_FN => {
-                ret self.parse_fn(is_public)
+                ret self.parse_fn(is_public, attrs)
             }
             TokenType::KW_EXTERN => {
-                ret self.parse_extern(is_public)
+                ret self.parse_extern(is_public, attrs)
             }
             _ => {
                 self.unexpected_token("top-level statement", curr_token)
@@ -111,7 +114,7 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                 break
             }
-            variants = variants.push(self.parse_structure_shape())
+            variants.push(self.parse_structure_shape())
             let curr_type = self.peek_curr_type()
             if curr_type == TokenType::COMMA {
                 self.consume()
@@ -153,7 +156,8 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                 break
             }
-            methods = methods.push(self.parse_function_signature(false))
+            let attrs = self.parse_function_attrs()
+            methods.push(self.parse_function_signature(false, attrs))
         }
         self.safe_consume(TokenType::RIGHT_BRACE)
 
@@ -181,16 +185,18 @@ impl for Parser {
                 break
             }
 
+            let attrs = self.parse_function_attrs()
             let mut is_public = false
             if self.peek_curr_type() == TokenType::KW_PUB {
                 self.consume()
                 is_public = true
             }
 
-            let header = self.parse_function_signature(is_public)
+            let header = self.parse_function_signature(is_public, attrs)
             let body = self.parse_block()
-            methods = methods.push(
+            methods.push(
                 FunctionItem{
+                    header.attrs,
                     header.is_public,
                     header.is_extern,
                     header.name,
@@ -206,11 +212,12 @@ impl for Parser {
         ret Statement::Impl(ImplStmt{generics, trait_name, trait_args, target, methods})
     }
 
-    fn parse_fn(mut self, is_public: bool) -> Statement {
-        let header = self.parse_function_signature(is_public)
+    fn parse_fn(mut self, is_public: bool, attrs: Vec[str]) -> Statement {
+        let header = self.parse_function_signature(is_public, attrs)
         let body = self.parse_block()
         ret Statement::Function(
             FunctionItem{
+                header.attrs,
                 header.is_public,
                 header.is_extern,
                 header.name,
@@ -222,11 +229,11 @@ impl for Parser {
         )
     }
 
-    fn parse_extern(mut self, is_public: bool) -> Statement {
-        ret Statement::Function(self.parse_function_signature(is_public))
+    fn parse_extern(mut self, is_public: bool, attrs: Vec[str]) -> Statement {
+        ret Statement::Function(self.parse_function_signature(is_public, attrs))
     }
 
-    fn parse_function_signature(mut self, is_public: bool) -> FunctionItem {
+    fn parse_function_signature(mut self, is_public: bool, attrs: Vec[str]) -> FunctionItem {
         let mut is_extern = false
         if self.peek_curr_type() == TokenType::KW_EXTERN {
             self.consume()
@@ -240,13 +247,13 @@ impl for Parser {
         let mut params = Vec[FunctionParam]::new()
         self.safe_consume(TokenType::LEFT_PAREN)
         if self.peek_curr_type() != TokenType::RIGHT_PAREN {
-            params = params.push(self.parse_param())
+            params.push(self.parse_param())
             loop {
                 if self.peek_curr_type() == TokenType::RIGHT_PAREN {
                     break
                 }
                 self.safe_consume(TokenType::COMMA)
-                params = params.push(self.parse_param())
+                params.push(self.parse_param())
             }
         }
         self.safe_consume(TokenType::RIGHT_PAREN)
@@ -258,6 +265,7 @@ impl for Parser {
         }
 
         ret FunctionItem{
+            attrs,
             is_public,
             is_extern,
             name,
@@ -266,6 +274,34 @@ impl for Parser {
             ret_type,
             Option[ParsedBlock]::None
         }
+    }
+
+    fn parse_function_attrs(mut self) -> Vec[str] {
+        let mut attrs = Vec[str]::new()
+        loop {
+            if self.peek_curr_type() != TokenType::HASH {
+                break
+            }
+            self.consume()
+
+            let attr_directive = self.safe_consume_value(TokenType::IDENTIFIER)
+            if attr_directive != "attr" {
+                let found = self.peek_curr()
+                self.unexpected_token("`#attr(...)`", found)
+            }
+
+            self.safe_consume(TokenType::LEFT_PAREN)
+            attrs.push(self.safe_consume_value(TokenType::IDENTIFIER))
+            loop {
+                if self.peek_curr_type() != TokenType::COMMA {
+                    break
+                }
+                self.consume()
+                attrs.push(self.safe_consume_value(TokenType::IDENTIFIER))
+            }
+            self.safe_consume(TokenType::RIGHT_PAREN)
+        }
+        ret attrs
     }
 
     fn parse_structure_shape(mut self) -> ParsedEnumVariant {
@@ -282,7 +318,7 @@ impl for Parser {
                 let field_name = self.safe_consume_value(TokenType::IDENTIFIER)
                 self.safe_consume(TokenType::COLON)
                 let field_type = self.parse_type()
-                named_fields = named_fields.push(NamedField{field_name, field_type})
+                named_fields.push(NamedField{field_name, field_type})
                 let curr_type = self.peek_curr_type()
                 if curr_type == TokenType::COMMA {
                     self.consume()
@@ -299,7 +335,7 @@ impl for Parser {
             self.consume()
             let mut tuple_fields = Vec[str]::new()
             if self.peek_curr_type() != TokenType::RIGHT_PAREN {
-                tuple_fields = tuple_fields.push(self.parse_type())
+                tuple_fields.push(self.parse_type())
                 loop {
                     if self.peek_curr_type() == TokenType::RIGHT_PAREN {
                         break
@@ -308,7 +344,7 @@ impl for Parser {
                     if self.peek_curr_type() == TokenType::RIGHT_PAREN {
                         break
                     }
-                    tuple_fields = tuple_fields.push(self.parse_type())
+                    tuple_fields.push(self.parse_type())
                 }
             }
             self.safe_consume(TokenType::RIGHT_PAREN)
@@ -325,7 +361,7 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                 break
             }
-            statements = statements.push(self.parse_inner_level())
+            statements.push(self.parse_inner_level())
         }
         self.safe_consume(TokenType::RIGHT_BRACE)
         ret ParsedBlock{statements}
@@ -448,7 +484,7 @@ impl for Parser {
         self.parsing_control_flow_header = false
 
         let mut branches = Vec[IfBranch]::new()
-        branches = branches.push(IfBranch{first_condition, self.parse_block()})
+        branches.push(IfBranch{first_condition, self.parse_block()})
 
         loop {
             if self.peek_curr_type() != TokenType::KW_ELIF {
@@ -458,7 +494,7 @@ impl for Parser {
             self.parsing_control_flow_header = true
             let condition = self.parse_expression()
             self.parsing_control_flow_header = false
-            branches = branches.push(IfBranch{condition, self.parse_block()})
+            branches.push(IfBranch{condition, self.parse_block()})
         }
 
         let mut else_body = Option[ParsedBlock]::None
@@ -477,7 +513,7 @@ impl for Parser {
         self.parsing_control_flow_header = false
 
         let mut branches = Vec[IfExprBranch]::new()
-        branches = branches.push(IfExprBranch{first_condition, self.parse_expression_block()})
+        branches.push(IfExprBranch{first_condition, self.parse_expression_block()})
 
         loop {
             if self.peek_curr_type() != TokenType::KW_ELIF {
@@ -487,7 +523,7 @@ impl for Parser {
             self.parsing_control_flow_header = true
             let condition = self.parse_expression()
             self.parsing_control_flow_header = false
-            branches = branches.push(IfExprBranch{condition, self.parse_expression_block()})
+            branches.push(IfExprBranch{condition, self.parse_expression_block()})
         }
 
         if self.peek_curr_type() != TokenType::KW_ELSE {
@@ -545,7 +581,7 @@ impl for Parser {
             let pattern = self.parse_match_pattern()
             self.safe_consume(TokenType::FAT_ARROW)
             let body = self.parse_statement_match_body()
-            arms = arms.push(ParsedMatchArm{pattern, body})
+            arms.push(ParsedMatchArm{pattern, body})
         }
         self.safe_consume(TokenType::RIGHT_BRACE)
 
@@ -567,7 +603,7 @@ impl for Parser {
             let pattern = self.parse_match_pattern()
             self.safe_consume(TokenType::FAT_ARROW)
             let arm_expr = self.parse_expression()
-            arms = arms.push(MatchExprArm{pattern, arm_expr})
+            arms.push(MatchExprArm{pattern, arm_expr})
         }
         self.safe_consume(TokenType::RIGHT_BRACE)
 
@@ -865,7 +901,7 @@ impl for Parser {
         }
 
         let mut items = Vec[ExprNode]::new()
-        items = items.push(first)
+        items.push(first)
         loop {
             if self.peek_curr_type() != TokenType::COMMA {
                 break
@@ -874,7 +910,7 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::RIGHT_PAREN {
                 break
             }
-            items = items.push(self.parse_expression())
+            items.push(self.parse_expression())
         }
         self.safe_consume(TokenType::RIGHT_PAREN)
         ret self.mk_expr(Expr::TupleLiteral(TupleLiteralExpr{items}))
@@ -896,7 +932,7 @@ impl for Parser {
         }
 
         let mut items = Vec[ExprNode]::new()
-        items = items.push(first)
+        items.push(first)
         loop {
             if self.peek_curr_type() != TokenType::COMMA {
                 break
@@ -905,7 +941,7 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::RIGHT_BRACKET {
                 break
             }
-            items = items.push(self.parse_expression())
+            items.push(self.parse_expression())
         }
         self.safe_consume(TokenType::RIGHT_BRACKET)
         ret self.mk_expr(Expr::ArrayLiteral(ArrayLiteralExpr{items}))
@@ -918,7 +954,7 @@ impl for Parser {
             if !self.starts_expression_block_statement() {
                 break
             }
-            statements = statements.push(self.parse_inner_level())
+            statements.push(self.parse_inner_level())
         }
         let tail = self.parse_expression()
         self.safe_consume(TokenType::RIGHT_BRACE)
@@ -1017,7 +1053,7 @@ impl for Parser {
         self.safe_consume(TokenType::LEFT_BRACE)
         let mut values = Vec[ExprNode]::new()
         if self.peek_curr_type() != TokenType::RIGHT_BRACE {
-            values = values.push(self.parse_expression())
+            values.push(self.parse_expression())
             loop {
                 if self.peek_curr_type() != TokenType::COMMA {
                     break
@@ -1026,7 +1062,7 @@ impl for Parser {
                 if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                     break
                 }
-                values = values.push(self.parse_expression())
+                values.push(self.parse_expression())
             }
         }
         self.safe_consume(TokenType::RIGHT_BRACE)
@@ -1042,7 +1078,7 @@ impl for Parser {
         let mut args = Vec[ExprNode]::new()
         self.safe_consume(TokenType::LEFT_PAREN)
         if self.peek_curr_type() != TokenType::RIGHT_PAREN {
-            args = args.push(self.parse_expression())
+            args.push(self.parse_expression())
             loop {
                 if self.peek_curr_type() != TokenType::COMMA {
                     break
@@ -1051,7 +1087,7 @@ impl for Parser {
                 if self.peek_curr_type() == TokenType::RIGHT_PAREN {
                     break
                 }
-                args = args.push(self.parse_expression())
+                args.push(self.parse_expression())
             }
         }
         self.safe_consume(TokenType::RIGHT_PAREN)
@@ -1239,13 +1275,13 @@ impl for Parser {
     fn parse_generics_args(mut self) -> Vec[str] {
         let mut generics = Vec[str]::new()
         self.safe_consume(TokenType::LEFT_BRACKET)
-        generics = generics.push(self.parse_type())
+        generics.push(self.parse_type())
         loop {
             if self.peek_curr_type() == TokenType::RIGHT_BRACKET {
                 break
             }
             self.safe_consume(TokenType::COMMA)
-            generics = generics.push(self.parse_type())
+            generics.push(self.parse_type())
         }
         self.safe_consume(TokenType::RIGHT_BRACKET)
         ret generics
@@ -1254,13 +1290,13 @@ impl for Parser {
     fn parse_generic_params(mut self) -> Vec[GenericParam] {
         let mut params = Vec[GenericParam]::new()
         self.safe_consume(TokenType::LEFT_BRACKET)
-        params = params.push(self.parse_generic_param())
+        params.push(self.parse_generic_param())
         loop {
             if self.peek_curr_type() == TokenType::RIGHT_BRACKET {
                 break
             }
             self.safe_consume(TokenType::COMMA)
-            params = params.push(self.parse_generic_param())
+            params.push(self.parse_generic_param())
         }
         self.safe_consume(TokenType::RIGHT_BRACKET)
         ret params
@@ -1271,13 +1307,13 @@ impl for Parser {
         let mut bounds = Vec[TraitBound]::new()
         if self.peek_curr_type() == TokenType::COLON {
             self.consume()
-            bounds = bounds.push(self.parse_trait_bound())
+            bounds.push(self.parse_trait_bound())
             loop {
                 if self.peek_curr_type() != TokenType::PLUS {
                     break
                 }
                 self.consume()
-                bounds = bounds.push(self.parse_trait_bound())
+                bounds.push(self.parse_trait_bound())
             }
         }
         ret GenericParam{name, bounds}
@@ -1430,7 +1466,7 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::LEFT_BRACE {
                 break
             }
-            bases = bases.push(self.parse_type())
+            bases.push(self.parse_type())
             if self.peek_curr_type() != TokenType::COMMA {
                 break
             }
@@ -1620,10 +1656,10 @@ impl for Parser {
     }
 
     fn unexpected_token(self, expected: str, found: Token) -> () {
-        eprintln_error("Parse error")
-        eprintln_note("found: `" + found.value + "`")
-        eprintln_note("expected: " + expected)
-        eprintln_note("at line " + Debug::fmt(found.line) + ", column " + Debug::fmt(found.column))
+        println("Parse error")
+        println("found: `" + found.value + "`")
+        println("expected: " + expected)
+        println("at line " + Debug::fmt(found.line) + ", column " + Debug::fmt(found.column))
         panic("Unexpected token: " + found.value)
         ret ()
     }

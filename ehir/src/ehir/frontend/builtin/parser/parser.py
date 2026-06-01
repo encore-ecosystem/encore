@@ -1,3 +1,5 @@
+from typing import NoReturn, cast
+
 from ehir.core.block import Block
 from ehir.core.derectives import (
     Derective_enum,
@@ -17,11 +19,13 @@ from ehir.core.instructions import (
     Instruction_and,
     Instruction_br,
     Instruction_call,
+    Instruction_callvoid,
     Instruction_capenum,
     Instruction_capprim,
     Instruction_capstruct,
     Instruction_cbr,
     Instruction_div,
+    Instruction_drop,
     Instruction_gep,
     Instruction_geq,
     Instruction_getfield,
@@ -63,8 +67,13 @@ from ehir.core.primitives.base import Primitive, PrimitiveType
 from ehir.core.struct import Struct
 from ehir.core.type import Pointer, Reference, Type
 from ehir.core.variable import Parameter, StructField, Variable
+from ehir.cfg import set_item_cfgs
 from ehir.frontend.builtin.parser.lexer import Lexer
 from ehir.frontend.builtin.parser.tokens import Token, TokenType
+
+
+class ParseError(ValueError):
+    pass
 
 
 class Parser:
@@ -84,7 +93,7 @@ class Parser:
         self._consumed = 0
 
         while not self._is_at_end():
-            attrs = self._parse_attrs()
+            attrs, cfgs = self._parse_metadata_directives()
             current_token = self._lookup_curr()
             is_public = False
 
@@ -110,9 +119,10 @@ class Parser:
             elif current_token.type == TokenType.KW_TYPE:
                 derective = self._parse_typealias()
             else:
-                raise ValueError(f"Unexpected token {current_token}")
+                self._error_at(current_token, "Unexpected token at top-level declaration")
 
             self._mark_metadata(derective, is_public, attrs)
+            set_item_cfgs(derective, cfgs)
             self._ast.append(derective)
 
         return self._ast
@@ -125,7 +135,7 @@ class Parser:
             instr = self._parse_instruction()
             if instr is None:
                 current = self._lookup_curr()
-                raise ValueError(f"Unexpected token {current}")
+                self._error_at(current, "Unexpected token in instruction stream")
             instructions.append(instr)
         return instructions
 
@@ -158,11 +168,11 @@ class Parser:
     def _validate_attrs(self, attrs: tuple[str, ...], target: str):
         for attr in attrs:
             if attr not in self._valid_attrs:
-                raise ValueError(f"Unknown attribute '{attr}'")
+                self._error_at(self._lookup_curr(), f"Unknown attribute '{attr}'")
             if attr == "safe" and target not in {"fn", "extern_fn", "struct"}:
-                raise ValueError(f"Attribute 'safe' is not valid for {target}")
+                self._error_at(self._lookup_curr(), f"Attribute 'safe' is not valid for {target}")
             if attr == "inline" and target not in {"fn", "extern_fn"}:
-                raise ValueError(f"Attribute 'inline' is not valid for {target}")
+                self._error_at(self._lookup_curr(), f"Attribute 'inline' is not valid for {target}")
 
     def _parse_typealias(self) -> Derective_typealias:
         self._safe_consume(TokenType.KW_TYPE)
@@ -173,23 +183,55 @@ class Parser:
             self._safe_consume(TokenType.SEMICOLON)
         return Derective_typealias(name=name, target=target)
 
-    def _parse_attrs(self) -> tuple[str, ...]:
+    def _parse_metadata_directives(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         attrs: list[str] = []
+        cfgs: list[str] = []
         while self._lookup_curr().type == TokenType.HASH:
             self._safe_consume(TokenType.HASH)
             attr_kw = self._safe_consume(TokenType.IDENTIFIER).value
-            if attr_kw != "attr":
-                raise ValueError(f"Unknown attribute directive '#{attr_kw}'")
+            if attr_kw == "attr":
+                attrs.extend(self._parse_attr_args())
+                continue
+            if attr_kw == "cfg":
+                cfgs.append(self._parse_cfg_args())
+                continue
+            self._error_at(self._lookup_curr(), f"Unknown attribute directive '#{attr_kw}'")
 
-            self._safe_consume(TokenType.LEFT_PAREN)
-            if self._lookup_curr() != TokenType.RIGHT_PAREN:
+        return tuple(dict.fromkeys(attrs)), tuple(dict.fromkeys(cfgs))
+
+    def _parse_attrs(self) -> tuple[str, ...]:
+        attrs, cfgs = self._parse_metadata_directives()
+        if cfgs:
+            self._error_at(self._lookup_curr(), "#cfg(...) is only valid for declarations")
+        return attrs
+
+    def _parse_attr_args(self) -> list[str]:
+        attrs: list[str] = []
+        self._safe_consume(TokenType.LEFT_PAREN)
+        if self._lookup_curr() != TokenType.RIGHT_PAREN:
+            attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
+            while self._lookup_curr() == TokenType.COMMA:
+                self._safe_consume(TokenType.COMMA)
                 attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
-                while self._lookup_curr() == TokenType.COMMA:
-                    self._safe_consume(TokenType.COMMA)
-                    attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
-            self._safe_consume(TokenType.RIGHT_PAREN)
+        self._safe_consume(TokenType.RIGHT_PAREN)
+        return attrs
 
-        return tuple(dict.fromkeys(attrs))
+    def _parse_cfg_args(self) -> str:
+        self._safe_consume(TokenType.LEFT_PAREN)
+        depth = 1
+        parts: list[str] = []
+        while depth > 0:
+            token = self._consume()
+            if token.type == TokenType.EOF:
+                self._error_at(token, "Unclosed #cfg(...)")
+            if token.type == TokenType.LEFT_PAREN:
+                depth += 1
+            elif token.type == TokenType.RIGHT_PAREN:
+                depth -= 1
+                if depth == 0:
+                    break
+            parts.append(token.value)
+        return "".join(parts)
 
     def _parse_imp(self) -> Derective_imp:
         self._safe_consume(TokenType.KW_IMP)
@@ -202,25 +244,39 @@ class Parser:
             self._safe_consume(TokenType.SEMICOLON)
 
         if len(parts) < 2:
-            raise ValueError("Import must have module path and symbol: imp path::to::symbol")
+            self._error_at(self._lookup_curr(), "Import must have module path and symbol: imp path::to::symbol")
         return Derective_imp(prefix=parts[:-1], symbol=parts[-1])
 
     def _parse_trait(self) -> Derective_trait:
         self._safe_consume(TokenType.KW_TRAIT)
         name = self._parse_name()
         generics = self._parse_generics() if self._lookup_curr() == TokenType.LEFT_BRACKET else []
+        parent: str | None = None
+        if self._lookup_curr() == TokenType.LESS:
+            self._safe_consume(TokenType.LESS)
+            parent = self._parse_name()
+            if self._lookup_curr() == TokenType.COMMA:
+                self._error_at(
+                    self._lookup_curr(),
+                    "Trait inheritance supports exactly one parent: use 'trait Child < Parent'",
+                )
         bounds = self._parse_bounds() if self._lookup_curr() == TokenType.KW_WHERE else {}
 
         methods: list[TraitMethod] = []
         self._safe_consume(TokenType.LEFT_BRACE)
         while self._lookup_curr() != TokenType.RIGHT_BRACE:
-            method = self._parse_fn_decl(with_body=False)
+            method_attrs, method_cfgs = self._parse_metadata_directives()
+            method = cast(Derective_fn, self._parse_fn_decl(with_body=False, attrs=method_attrs))
+            trait_method = TraitMethod(
+                name=method.name, generics=method.generics, params=method.params, ret_type=method.ret_type
+            )
+            set_item_cfgs(trait_method, method_cfgs)
             methods.append(
-                TraitMethod(name=method.name, generics=method.generics, params=method.params, ret_type=method.ret_type)
+                trait_method
             )
         self._safe_consume(TokenType.RIGHT_BRACE)
 
-        return Derective_trait(name=name, generics=generics, bounds=bounds, methods=methods)
+        return Derective_trait(name=name, generics=generics, parent=parent, bounds=bounds, methods=methods)
 
     def _parse_impl(self) -> Derective_impl:
         self._safe_consume(TokenType.KW_IMPL)
@@ -240,12 +296,14 @@ class Parser:
         methods: list[Derective_fn] = []
         self._safe_consume(TokenType.LEFT_BRACE)
         while self._lookup_curr() != TokenType.RIGHT_BRACE:
-            method_attrs = self._parse_attrs()
+            method_attrs, method_cfgs = self._parse_metadata_directives()
             is_public = False
             if self._lookup_curr() == TokenType.KW_PUB:
                 self._safe_consume(TokenType.KW_PUB)
                 is_public = True
-            methods.append(self._parse_fn_decl(with_body=True, attrs=method_attrs, is_public=is_public))
+            method = cast(Derective_fn, self._parse_fn_decl(with_body=True, attrs=method_attrs, is_public=is_public))
+            set_item_cfgs(method, method_cfgs)
+            methods.append(method)
         self._safe_consume(TokenType.RIGHT_BRACE)
 
         return Derective_impl(
@@ -303,11 +361,11 @@ class Parser:
         return Derective_struct(name=name, generics=generics, params=params)
 
     def _parse_fn(self) -> Derective_fn:
-        return self._parse_fn_decl(with_body=True)
+        return cast(Derective_fn, self._parse_fn_decl(with_body=True))
 
-    def _parse_extern_fn(self) -> Derective_fn:
-        self._safe_consume(TokenType.EXTERN)
-        return self._parse_fn_decl(with_body=False, is_extern=True)
+    def _parse_extern_fn(self) -> Derective_extern_fn:
+        self._safe_consume(TokenType.KW_EXTERN)
+        return cast(Derective_extern_fn, self._parse_fn_decl(with_body=False, is_extern=True))
 
     def _parse_fn_decl(
         self,
@@ -340,7 +398,7 @@ class Parser:
             self._safe_consume(TokenType.RIGHT_BRACE)
         if is_extern:
             if len(generics) > 0:
-                raise ValueError(f"Extern function '{name}' cannot declare generics")
+                self._error_at(self._lookup_curr(), f"Extern function '{name}' cannot declare generics")
             return Derective_extern_fn(
                 name=name,
                 params=params,
@@ -391,6 +449,10 @@ class Parser:
                 return self._parse_setfield()
             case TokenType.KW_HFREE:
                 return self._parse_hfree()
+            case TokenType.KW_DROP:
+                return self._parse_drop()
+            case TokenType.KW_CALL | TokenType.KW_UNSAFE:
+                return self._parse_callvoid()
 
         next_token = self._lookup_next()
         if next_token == TokenType.COLON or next_token == TokenType.EQUAL:
@@ -400,6 +462,29 @@ class Parser:
         self._safe_consume(TokenType.KW_HFREE)
         var = self._parse_variable()
         return Instruction_hfree(var=var)
+
+    def _parse_drop(self) -> Instruction_drop:
+        self._safe_consume(TokenType.KW_DROP)
+        var = self._parse_variable()
+        return Instruction_drop(var=var)
+
+    def _parse_callvoid(self) -> Instruction_callvoid:
+        curr_token = self._consume()
+        is_unsafe = False
+        if curr_token == TokenType.KW_UNSAFE:
+            self._safe_consume(TokenType.KW_CALL)
+            is_unsafe = True
+        fn_name = self._parse_callable_name()
+        generics = self._parse_generics() if self._lookup_curr() == TokenType.LEFT_BRACKET else []
+        args = []
+        self._safe_consume(TokenType.LEFT_PAREN)
+        if self._lookup_curr() != TokenType.RIGHT_PAREN:
+            args.append(self._parse_variable())
+            while self._lookup_curr() != TokenType.RIGHT_PAREN:
+                self._safe_consume(TokenType.COMMA)
+                args.append(self._parse_variable())
+        self._safe_consume(TokenType.RIGHT_PAREN)
+        return Instruction_callvoid(fn_name=fn_name, generics=generics, args=args, is_unsafe=is_unsafe)
 
     def _parse_put(self) -> Instruction_put:
         self._safe_consume(TokenType.KW_PUT)
@@ -685,7 +770,7 @@ class Parser:
                 return Instruction_sgetfieldptr(var_out=var, src=var_src, field=field)
 
             case _:
-                raise ValueError(f"Unexpected token {curr_token}")
+                self._error_at(curr_token, "Unexpected token in assignable expression")
 
     def _parse_struct_init(self) -> Struct:
         struct_as_type = self._parse_type()
@@ -743,7 +828,7 @@ class Parser:
         if var.type is not None:
             return Parameter(var.name, var.type)
         else:
-            raise ValueError(f"Parameter {var.name} must have a type")
+            self._error_at(self._lookup_curr(), f"Parameter {var.name} must have a type")
 
     def _parse_struct_field(self) -> StructField:
         attrs = self._parse_attrs()
@@ -751,7 +836,7 @@ class Parser:
 
         var = self._parse_variable()
         if var.type is None:
-            raise ValueError(f"Struct field {var.name} must have a type")
+            self._error_at(self._lookup_curr(), f"Struct field {var.name} must have a type")
         return StructField(var.name, var.type, attrs=attrs)
 
     def _parse_type(self) -> Type | PrimitiveType | Pointer | Reference:
@@ -767,6 +852,14 @@ class Parser:
             return Reference(inner)
 
         name = self._safe_consume(TokenType.IDENTIFIER).value
+
+        if name == "dyn":
+            trait_name = self._parse_name()
+            dyn_type = Type("dyn", [Type(trait_name)])
+            if self._lookup_curr() == TokenType.STAR:
+                self._safe_consume(TokenType.STAR)
+                return Pointer(dyn_type)
+            return dyn_type
 
         type = Type(name)
         if name == "usize":
@@ -812,11 +905,11 @@ class Parser:
             generic_name = self._parse_name()
             self._safe_consume(TokenType.COLON)
             traits = [self._parse_name()]
-            while isinstance(self._lookup_curr(), TokenType.PLUS):
+            while self._lookup_curr() == TokenType.PLUS:
                 self._safe_consume(TokenType.PLUS)
                 traits.append(self._parse_name())
             bounds[generic_name] = traits
-            if not isinstance(self._lookup_curr(), TokenType.COMMA):
+            if self._lookup_curr() != TokenType.COMMA:
                 break
             self._safe_consume(TokenType.COMMA)
         return bounds
@@ -885,8 +978,8 @@ class Parser:
             if suffix.startswith("_f"):
                 size = int(suffix[2:])
                 return Float(val=float(f"{'-' if sign < 0 else ''}{curr_token.value}"), size=size)
-            raise ValueError(f"Invalid primitive suffix: {suffix}")
-        raise ValueError(f"Expected primitive literal, got {curr_token}")
+            self._error_at(self._lookup_curr(), f"Invalid primitive suffix: {suffix}")
+        self._error_at(curr_token, f"Expected primitive literal, got {curr_token}")
 
     def _unescape_string_literal(self, string: str) -> str:
         return bytes(string, "utf-8").decode("unicode_escape")
@@ -915,4 +1008,19 @@ class Parser:
         return Token(TokenType.EOF, "", 0, 0)
 
     def _trace_unexpected_token(self, token: Token, expected_t: TokenType):
-        raise ValueError(f"Unexpected token: {token}. Expected: {expected_t}")
+        self._error_at(token, f"Unexpected token '{token.value}', expected {expected_t.name}")
+
+    def _error_at(self, token: Token, message: str) -> NoReturn:
+        line = token.line
+        col = token.column
+        source_line = ""
+        if hasattr(self, "_sc"):
+            lines = self._sc.splitlines()
+            if 1 <= line <= len(lines):
+                source_line = lines[line - 1]
+        caret_line = (" " * max(col - 1, 0)) + "^" if source_line else ""
+        location = f"{line}:{col}"
+        detail = f"{message} at {location}"
+        if source_line:
+            raise ParseError(f"{detail}\n{source_line}\n{caret_line}")
+        raise ParseError(detail)

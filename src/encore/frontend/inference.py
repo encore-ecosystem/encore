@@ -61,9 +61,12 @@ class TypeInferer:
         self._enums: dict[str, s.Statement_EnumDefinition] = {}
         self._traits: dict[str, s.Statement_Trait] = {}
         self._impl_traits: dict[str, list[str]] = {}
+        self._generic_impl_traits: list[tuple[list[Type], str]] = []
+        self._globals: dict[str, Type] = {}
         self._unsafe_depth = 0
         self._current_fn_return_type: Type | None = None
         self._current_self_binding_type: Type | None = None
+        self._current_impl_self_type: Type | None = None
         self._active_generic_bounds: dict[str, list[Type]] = {}
         self._active_generic_names: set[str] = set()
 
@@ -79,10 +82,30 @@ class TypeInferer:
         self._collect_declarations(declaration_entries)
 
         for statement in ast:
+            if isinstance(statement, s.Statement_Global):
+                global_env = dict(self._globals)
+                inferred = self._infer_expression(statement.expr, global_env, statement.type, mutable_env={})
+                if statement.type is None:
+                    if inferred is None:
+                        raise TypeError(f"Unable to infer type of global '{statement.name}'")
+                    statement.type = inferred
+                elif inferred is not None and not self._types_compatible(statement.type, inferred):
+                    raise TypeError(f"Type mismatch in global '{statement.name}': {statement.type} != {inferred}")
+                assert statement.type is not None
+                self._globals[statement.name] = statement.type
+                continue
             if isinstance(statement, s.Statement_FunctionDefinition):
                 self._infer_function(statement)
             elif isinstance(statement, s.Statement_Impl):
                 for method in statement.body:
+                    impl_generic_names = {generic.name for generic in statement.generics}
+                    merged_generics = [*statement.generics]
+                    for generic in method.signature.generics:
+                        if generic.name in impl_generic_names:
+                            continue
+                        merged_generics.append(generic)
+                        impl_generic_names.add(generic.name)
+                    method.signature = replace(method.signature, generics=merged_generics)
                     self._infer_function(method, self_type=statement.struct)
 
         return ast
@@ -107,7 +130,12 @@ class TypeInferer:
             elif isinstance(statement, s.Statement_Impl):
                 struct_name = statement.struct.name
                 if statement.trait_name is not None:
-                    self._impl_traits.setdefault(struct_name, []).append(statement.trait_name)
+                    owner_generic = next((generic for generic in statement.generics if generic.name == struct_name), None)
+                    if owner_generic is not None:
+                        bounds = list(owner_generic.bounds) if isinstance(owner_generic, s.GenericParam) else []
+                        self._generic_impl_traits.append((bounds, statement.trait_name))
+                    else:
+                        self._impl_traits.setdefault(struct_name, []).append(statement.trait_name)
                     continue
 
                 for method in statement.body:
@@ -124,6 +152,10 @@ class TypeInferer:
                         self_type=statement.struct,
                     )
                     self._funcs[f"{struct_name}::{method.name}"] = replace(method, signature=normalized_signature)
+            elif isinstance(statement, s.Statement_Global):
+                name = local_name or statement.name
+                if statement.type is not None:
+                    self._globals[name] = statement.type
 
     def _normalize_declaration_entries(
         self, declarations: list[object]
@@ -140,11 +172,13 @@ class TypeInferer:
 
     def _infer_function(self, statement: s.Statement_FunctionDefinition, self_type: Type | None = None):
         statement.signature = self._normalize_signature(statement.signature, self_type=self_type)
-        env = {param.name: param.type for param in statement.signature.params}
-        mutability_env = {param.name: is_mutable_type(param.type) for param in statement.signature.params}
+        env = {**self._globals, **{param.name: param.type for param in statement.signature.params}}
+        mutability_env = {name: False for name in self._globals}
+        mutability_env.update({param.name: is_mutable_type(param.type) for param in statement.signature.params})
 
         prev_fn_return = self._current_fn_return_type
         prev_self_binding_type = self._current_self_binding_type
+        prev_impl_self_type = self._current_impl_self_type
         prev_generic_bounds = self._active_generic_bounds
         prev_generic_names = self._active_generic_names
         if statement.signature.type is None:
@@ -154,6 +188,7 @@ class TypeInferer:
 
         self._current_fn_return_type = statement.signature.type
         self._current_self_binding_type = env.get("self")
+        self._current_impl_self_type = self_type
         self._active_generic_bounds = self._collect_generic_bounds(statement.signature.generics)
         self._active_generic_names = {generic.name for generic in statement.signature.generics}
         try:
@@ -161,10 +196,12 @@ class TypeInferer:
         finally:
             self._current_fn_return_type = prev_fn_return
             self._current_self_binding_type = prev_self_binding_type
+            self._current_impl_self_type = prev_impl_self_type
             self._active_generic_bounds = prev_generic_bounds
             self._active_generic_names = prev_generic_names
 
     def _infer_block(self, body: Block, env: dict[str, Type], mutability_env: dict[str, bool], fn_ret_type: Type):
+        inferable_numeric_lets: dict[str, s.Statement_Let] = {}
         for statement in body.body:
             if isinstance(statement, s.Statement_Let):
                 inferred = self._infer_expression(statement.expr, env, statement.type, mutability_env)
@@ -172,6 +209,8 @@ class TypeInferer:
                     if inferred is None:
                         raise TypeError(f"Unable to infer type of variable '{statement.name}'")
                     statement.type = inferred
+                    if self._is_unsuffixed_numeric_literal(statement.expr):
+                        inferable_numeric_lets[statement.name] = statement
                 elif inferred is not None:
                     if not self._types_compatible(statement.type, inferred) and not self._types_match_ignoring_mut(
                         statement.type, inferred
@@ -188,7 +227,12 @@ class TypeInferer:
                 expected = self._infer_lvalue_type(statement.target, env)
                 value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
                 self._assert_raw_pointer_usage_allowed(expected, context="assignment target")
-                if expected is not None and value_type is not None and not self._types_compatible(expected, value_type):
+                if (
+                    expected is not None
+                    and value_type is not None
+                    and not self._types_compatible(expected, value_type)
+                    and not self._types_match_ignoring_mut(expected, value_type)
+                ):
                     raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
             elif isinstance(statement, s.Statement_Expr):
                 expr_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
@@ -196,6 +240,19 @@ class TypeInferer:
             elif isinstance(statement, s.Statement_Ret):
                 ret_type = self._infer_expression(statement.expr, env, fn_ret_type, mutability_env)
                 self._assert_raw_pointer_usage_allowed(ret_type, context="return value")
+                if ret_type is not None and not self._types_compatible(fn_ret_type, ret_type):
+                    if isinstance(statement.expr, s.Expression_Path) and len(statement.expr.segments) == 1:
+                        local_name = statement.expr.segments[0].name
+                        let_stmt = inferable_numeric_lets.get(local_name)
+                        if (
+                            let_stmt is not None
+                            and self._is_numeric_type(fn_ret_type)
+                            and self._is_numeric_type(ret_type)
+                        ):
+                            let_stmt.type = fn_ret_type
+                            self._annotate_numeric_literal(let_stmt.expr, fn_ret_type)
+                            env[local_name] = fn_ret_type
+                            ret_type = fn_ret_type
                 if ret_type is not None and not self._types_compatible(fn_ret_type, ret_type):
                     raise TypeError(f"Return type mismatch: {ret_type} != {fn_ret_type}")
             elif isinstance(statement, s.Statement_While):
@@ -210,6 +267,108 @@ class TypeInferer:
                     raise TypeError(f"Do-while condition must be bool, got {cond}")
             elif isinstance(statement, s.Statement_Loop):
                 self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
+            elif isinstance(statement, s.Statement_For):
+                iter_expr = s.Expression_MethodCall(receiver=statement.iterable, method="iter", generics=[], args=[])
+                iter_type = self._infer_expression(iter_expr, env, mutable_env=mutability_env)
+                if iter_type is None:
+                    raise TypeError("Unable to infer iterator type in for-loop")
+
+                loop_env = dict(env)
+                loop_mutability_env = dict(mutability_env)
+                loop_env["__for_iter"] = iter_type
+                loop_mutability_env["__for_iter"] = True
+
+                step_expr = s.Expression_MethodCall(
+                    receiver=s.Expression_Path([Type("__for_iter")]),
+                    method="next",
+                    generics=[],
+                    args=[],
+                )
+                step_type = self._infer_expression(step_expr, loop_env, mutable_env=loop_mutability_env)
+                if step_type is None:
+                    raise TypeError("Unable to infer iterator step type in for-loop")
+
+                loop_env["__for_step"] = step_type
+                loop_mutability_env["__for_step"] = False
+
+                next_iter_type = self._lookup_chained_field_type("__for_step", "0", loop_env)
+                if next_iter_type is not None and not self._types_compatible(iter_type, next_iter_type):
+                    raise TypeError(f"For-loop iterator state mismatch: {iter_type} != {next_iter_type}")
+
+                item_opt_type = self._lookup_chained_field_type("__for_step", "1", loop_env)
+                if item_opt_type is None:
+                    raise TypeError("Unable to infer yielded item type in for-loop")
+                item_opt_type = unwrap_for_storage(item_opt_type)
+                if is_reference_like_type(item_opt_type):
+                    item_opt_type = item_opt_type.pointee
+                if item_opt_type.name != "Option" or len(item_opt_type.generics) != 1:
+                    raise TypeError(f"For-loop `next` must return Option[T], got {item_opt_type}")
+
+                body_env = dict(loop_env)
+                body_mutability_env = dict(loop_mutability_env)
+                body_env[statement.name] = item_opt_type.generics[0]
+                body_mutability_env[statement.name] = False
+                self._infer_block(statement.body, body_env, body_mutability_env, fn_ret_type)
+            elif isinstance(statement, s.Statement_With):
+                resource_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
+                if resource_type is None:
+                    raise TypeError("Unable to infer resource type in with-statement")
+
+                base_resource_type = unwrap_for_storage(resource_type)
+                base_resource_type = (
+                    base_resource_type.pointee
+                    if is_reference_like_type(base_resource_type)
+                    else base_resource_type
+                )
+                trait_names = list(self._impl_traits.get(base_resource_type.name, []))
+                resource_leaf = base_resource_type.name.rsplit("::", 1)[-1]
+                for owner_name, owner_traits in self._impl_traits.items():
+                    if owner_name == base_resource_type.name:
+                        continue
+                    if owner_name.rsplit("::", 1)[-1] == resource_leaf:
+                        for owner_trait in owner_traits:
+                            if owner_trait not in trait_names:
+                                trait_names.append(owner_trait)
+                has_context_manager = False
+                for trait_name in trait_names:
+                    if trait_name.rsplit("::", 1)[-1] == "ContextManager":
+                        has_context_manager = True
+                        break
+                if not has_context_manager:
+                    raise TypeError(
+                        f"with-statement requires `{base_resource_type.name}` to implement ContextManager"
+                    )
+
+                enter_type = self._infer_expression(
+                    s.Expression_MethodCall(
+                        receiver=statement.expr,
+                        method="with_enter",
+                        generics=[],
+                        args=[],
+                    ),
+                    env,
+                    mutable_env=mutability_env,
+                )
+                if enter_type is None:
+                    raise TypeError("with-statement requires ContextManager::with_enter(self) -> Self")
+
+                self._infer_expression(
+                    s.Expression_MethodCall(
+                        receiver=s.Expression_Path([Type(statement.name)]),
+                        method="with_exit",
+                        generics=[],
+                        args=[],
+                    ),
+                    {**env, statement.name: enter_type},
+                    Type("bool"),
+                    {**mutability_env, statement.name: False},
+                )
+
+                body_env = dict(env)
+                body_mutability_env = dict(mutability_env)
+                body_env[statement.name] = enter_type
+                body_mutability_env[statement.name] = False
+                self._infer_block(statement.body, body_env, body_mutability_env, fn_ret_type)
             elif isinstance(statement, s.Statement_If):
                 for branch in statement.branches:
                     cond = self._infer_expression(branch.expr, env, Type("bool"), mutability_env)
@@ -228,6 +387,22 @@ class TypeInferer:
                     self._unsafe_depth -= 1
             elif isinstance(statement, s.Statement_EHIR):
                 self._bind_ehir_outputs(statement, env, mutability_env)
+
+    def _is_numeric_type(self, typ: Type) -> bool:
+        return self._is_integer_type(typ) or self._is_float_type(typ)
+
+    def _is_unsuffixed_numeric_literal(self, expr: s.Statement_Expression) -> bool:
+        if isinstance(expr, s.Expression_IntegerLiteral):
+            return expr.literal_type is None
+        if isinstance(expr, s.Expression_FloatLiteral):
+            return expr.literal_type is None
+        return False
+
+    def _annotate_numeric_literal(self, expr: s.Statement_Expression, inferred_type: Type):
+        if isinstance(expr, s.Expression_IntegerLiteral):
+            expr.literal_type = inferred_type
+        elif isinstance(expr, s.Expression_FloatLiteral):
+            expr.literal_type = inferred_type
 
     def _infer_return_type(
         self,
@@ -259,7 +434,12 @@ class TypeInferer:
                 expected = self._infer_lvalue_type(statement.target, env)
                 value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
                 self._assert_raw_pointer_usage_allowed(expected, context="assignment target")
-                if expected is not None and value_type is not None and not self._types_compatible(expected, value_type):
+                if (
+                    expected is not None
+                    and value_type is not None
+                    and not self._types_compatible(expected, value_type)
+                    and not self._types_match_ignoring_mut(expected, value_type)
+                ):
                     raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
             if isinstance(statement, s.Statement_Ret):
                 ret_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
@@ -379,7 +559,11 @@ class TypeInferer:
             return call_name, explicit_generics, signature
 
         if len(expr.callee.segments) >= 2:
-            owner_segments = expr.callee.segments[:-1]
+            owner_segments = list(expr.callee.segments[:-1])
+            if owner_segments and owner_segments[-1].name == "Self":
+                self_hint = self._current_self_binding_type or self._current_impl_self_type
+                resolved_self = self._resolve_self_type(self_hint)
+                owner_segments[-1] = self._resolve_self_in_type(owner_segments[-1], resolved_self)
             owner = owner_segments[-1]
             normalized_owner = "::".join(segment.name for segment in owner_segments)
             normalized_name = f"{normalized_owner}::{expr.callee.segments[-1].name}"
@@ -404,6 +588,11 @@ class TypeInferer:
         seen: set[str] | None = None,
     ) -> s.FunctionSignature | None:
         trait = self._traits.get(trait_name)
+        if trait is None and "::" not in trait_name:
+            matches = [name for name in self._traits if name.endswith(f"::{trait_name}")]
+            if len(matches) == 1:
+                trait_name = matches[0]
+                trait = self._traits.get(trait_name)
         if trait is None:
             return None
 
@@ -425,6 +614,31 @@ class TypeInferer:
         return None
 
     def _resolve_method_signature(self, receiver_type: Type, method_name: str) -> tuple[str, s.FunctionSignature]:
+        def base_type_name(name: str) -> str:
+            bracket = name.find("[")
+            return name if bracket < 0 else name[:bracket]
+
+        def leaf_type_name(name: str) -> str:
+            return base_type_name(name).rsplit("::", 1)[-1]
+
+        def impl_trait_names(receiver: Type) -> list[str]:
+            type_name = receiver.name
+            out = list(self._impl_traits.get(type_name, []))
+            leaf = leaf_type_name(type_name)
+            for owner_name, trait_names in self._impl_traits.items():
+                if owner_name == type_name:
+                    continue
+                if leaf_type_name(owner_name) == leaf:
+                    for trait_name in trait_names:
+                        if trait_name not in out:
+                            out.append(trait_name)
+            for bounds, trait_name in self._generic_impl_traits:
+                if not self._receiver_satisfies_bounds(receiver, bounds):
+                    continue
+                if trait_name not in out:
+                    out.append(trait_name)
+            return out
+
         receiver_type = unwrap_for_storage(receiver_type)
         base_receiver_type = receiver_type.pointee if is_reference_like_type(receiver_type) else receiver_type
         inherent_name = f"{base_receiver_type.name}::{method_name}"
@@ -432,15 +646,26 @@ class TypeInferer:
         if inherent_signature is not None:
             return inherent_name, inherent_signature
 
-        suffix = f"::{base_receiver_type.name}::{method_name}"
-        inherent_candidates = [name for name in self._funcs if name.endswith(suffix)]
+        receiver_base = base_type_name(base_receiver_type.name)
+        receiver_leaf = leaf_type_name(base_receiver_type.name)
+        inherent_candidates: list[str] = []
+        for candidate_name in self._funcs:
+            if not candidate_name.endswith(f"::{method_name}"):
+                continue
+            parts = candidate_name.rsplit("::", 2)
+            if len(parts) < 2:
+                continue
+            owner_name = base_type_name(parts[-2])
+            if owner_name != receiver_base and leaf_type_name(owner_name) != receiver_leaf:
+                continue
+            inherent_candidates.append(candidate_name)
         if len(inherent_candidates) == 1:
             matched_name = inherent_candidates[0]
             matched_signature = self._lookup_function_signature(matched_name)
             if matched_signature is not None:
                 return matched_name, matched_signature
 
-        for trait_name in self._impl_traits.get(base_receiver_type.name, []):
+        for trait_name in impl_trait_names(base_receiver_type):
             trait_signature = self._lookup_trait_method_signature(
                 trait_name,
                 method_name,
@@ -458,7 +683,30 @@ class TypeInferer:
             if trait_signature is not None:
                 return f"{bound.name}::{method_name}", trait_signature
 
-        raise TypeError(f"Method '{method_name}' is not defined for type '{base_receiver_type.name}'")
+        similar = [name for name in self._funcs if name.endswith(f"::{method_name}")]
+        owner_filtered: list[str] = []
+        for candidate_name in similar:
+            parts = candidate_name.rsplit("::", 2)
+            if len(parts) < 2:
+                continue
+            if leaf_type_name(parts[-2]) == receiver_leaf:
+                owner_filtered.append(candidate_name)
+        if owner_filtered:
+            preferred = [name for name in owner_filtered if "::Iterator::" not in name]
+            matched_name = preferred[0] if preferred else owner_filtered[0]
+            matched_signature = self._lookup_function_signature(matched_name)
+            if matched_signature is not None:
+                return matched_name, matched_signature
+        raise TypeError(
+            f"Method '{method_name}' is not defined for type '{base_receiver_type.name}'. "
+            f"inherent_name='{inherent_name}', suffix_matches={len(inherent_candidates)}, method_suffix_matches={len(similar)}"
+        )
+
+    def _receiver_satisfies_bounds(self, receiver_type: Type, bounds: list[Type]) -> bool:
+        for bound in bounds:
+            if not self._type_satisfies_bound(receiver_type, bound):
+                return False
+        return True
 
     def _infer_call_signature(
         self,
@@ -495,10 +743,24 @@ class TypeInferer:
             arg_type = self._infer_expression(arg, env, arg_expected_type, mutable_env)
             # print(param, arg, expected_param_type, arg_type)
             if arg_type is not None:
+                if (
+                    expected_param_type is not None
+                    and is_mutable_type(expected_param_type)
+                    and not is_mutable_type(arg_type)
+                ):
+                    if isinstance(arg, s.Expression_Path) and len(arg.segments) == 1 and not mutable_env.get(arg.name, False):
+                        raise TypeError(
+                            f"Cannot pass immutable binding '{arg.name}' as mutable argument "
+                            f"for '{callable_name}' param '{param.name}'"
+                        )
+                    arg_type = make_mutable_type(arg_type)
                 self._match_generic(param.type, arg_type, generic_mapping)
                 expected_param_type = self._specialize_type(param.type, generic_mapping)
                 if expected_param_type is not None and not self._types_compatible(expected_param_type, arg_type):
-                    raise TypeError(f"Type mismatch in call argument: {expected_param_type} != {arg_type}")
+                    raise TypeError(
+                        f"Type mismatch in call argument for '{callable_name}' param '{param.name}': "
+                        f"{expected_param_type} != {arg_type}"
+                    )
 
         if signature.generics:
             missing_generics = [generic.name for generic in signature.generics if generic.name not in generic_mapping]
@@ -622,6 +884,14 @@ class TypeInferer:
         if isinstance(expr, s.Expression_BooleanLiteral):
             return Type("bool")
 
+        if isinstance(expr, s.Expression_Range):
+            range_ctor = s.Expression_Call(
+                callee=s.Expression_Path([Type("range_inclusive" if expr.inclusive else "range")]),
+                generics=[],
+                args=[expr.start, expr.end],
+            )
+            return self._infer_expression(range_ctor, env, expected_type, mutable_env)
+
         if isinstance(expr, s.Expression_StringLiteral):
             if expected_type is not None and expected_type != Type("str"):
                 raise TypeError(f"Type mismatch: {expected_type} != str")
@@ -678,6 +948,16 @@ class TypeInferer:
             if expected_type is not None and ok_type != expected_type:
                 raise TypeError(f"Type mismatch: {expected_type} != {ok_type}")
             return ok_type
+
+        if isinstance(expr, s.Expression_Cast):
+            cast_call = s.Expression_MethodCall(
+                receiver=expr.expr,
+                method="cast",
+                generics=[],
+                args=[],
+            )
+            self._infer_expression(cast_call, env, expr.target, mutable_env)
+            return expr.target
 
         if isinstance(expr, s.Expression_Parenthesized):
             return self._infer_expression(expr.expr, env, expected_type, mutable_env)
@@ -785,11 +1065,14 @@ class TypeInferer:
             return None
 
         if isinstance(expr, s.Expression_StructInitialization):
-            field_types = self._lookup_struct_field_types(expr.name)
+            self_hint = self._current_self_binding_type or self._current_impl_self_type
+            current_self_type = self._resolve_self_type(self_hint)
+            struct_type = self._resolve_self_in_type(expr.name, current_self_type)
+            field_types = self._lookup_struct_field_types(struct_type)
             for idx, arg in enumerate(expr.args):
                 arg_expected = field_types[idx] if idx < len(field_types) else None
                 self._infer_expression(arg, env, arg_expected)
-            return expr.name
+            return struct_type
 
         if isinstance(expr, s.Expression_StructField):
             result = self._lookup_chained_field_type(expr.name, expr.field, env)
@@ -857,6 +1140,18 @@ class TypeInferer:
             self._assert_raw_pointer_usage_allowed(result, context=f"call '{call_name}'")
             return result
 
+        if isinstance(expr, s.Expression_UnaryOperation):
+            operand_type = self._infer_expression(expr.expr, env, expected_type, mutable_env)
+            if expr.operator in ("!", "not"):
+                if operand_type is not None and operand_type != Type("bool"):
+                    raise TypeError(f"Logical unary operator '{expr.operator}' expects bool, got {operand_type}")
+                if expected_type is not None and expected_type != Type("bool"):
+                    raise TypeError(f"Type mismatch: {expected_type} != bool")
+                return Type("bool")
+            if expr.operator in ("+", "-", "~", "++", "--"):
+                return operand_type or expected_type
+            return operand_type or expected_type
+
         if isinstance(expr, s.Expression_BinaryOperation):
             if expr.operator in ("&&", "||"):
                 lhs_type = self._infer_expression(expr.lhs, env, mutable_env=mutable_env)
@@ -884,6 +1179,7 @@ class TypeInferer:
             return lhs_type or expected_type or rhs_type
 
         return None
+
 
     def _infer_enum_call(
         self,
@@ -975,7 +1271,8 @@ class TypeInferer:
         return False
 
     def _trait_satisfies_bound(self, trait_name: str, required_bound: Type, seen: set[str] | None = None) -> bool:
-        if trait_name == required_bound.name:
+        required_name = required_bound.name
+        if trait_name == required_name or trait_name.split("::")[-1] == required_name.split("::")[-1]:
             return True
 
         seen = seen or set()
@@ -988,7 +1285,7 @@ class TypeInferer:
             return False
 
         for base in trait.bases:
-            if base.name == required_bound.name:
+            if base.name == required_name or base.name.split("::")[-1] == required_name.split("::")[-1]:
                 return True
             if self._trait_satisfies_bound(base.name, required_bound, seen):
                 return True
@@ -1144,7 +1441,12 @@ class TypeInferer:
             expected = self._infer_lvalue_type(statement.target, env)
             value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
             self._assert_raw_pointer_usage_allowed(expected, context="assignment target")
-            if expected is not None and value_type is not None and not self._types_compatible(expected, value_type):
+            if (
+                expected is not None
+                and value_type is not None
+                and not self._types_compatible(expected, value_type)
+                and not self._types_match_ignoring_mut(expected, value_type)
+            ):
                 raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
             return
 
@@ -1228,11 +1530,12 @@ class TypeInferer:
 
     def _infer_expression_block_nested(
         self,
-        body: list[s.Statement_InnerLevel],
+        body: Block | list[s.Statement_InnerLevel],
         env: dict[str, Type],
         mutability_env: dict[str, bool],
     ):
-        for statement in body:
+        items = body.body if isinstance(body, Block) else body
+        for statement in items:
             self._infer_expression_block_statement(statement, env, mutability_env)
 
     def _resolve_match_arm_common(self, scrutinee_type: Type, arm: MatchArmLike) -> tuple[str, Optional[Type]]:
@@ -1347,7 +1650,8 @@ class TypeInferer:
         explicit_enum = pattern.segments[0]
         if explicit_enum.name != base_type.name:
             raise TypeError(f"Pattern enum '{explicit_enum.name}' does not match scrutinee type '{base_type.name}'")
-        if explicit_enum.generics and explicit_enum != base_type:
+
+        if explicit_enum.generics and not self._types_compatible(base_type, explicit_enum):
             raise TypeError(f"Pattern enum '{explicit_enum}' does not match scrutinee type '{base_type}'")
         return pattern.segments[1].name
 
@@ -1519,11 +1823,23 @@ class TypeInferer:
         if is_raw_pointer_type(actual):
             return False
 
+        if self._can_widen_primitive(actual, expected):
+            return True
+
         if expected.name != actual.name:
             return False
         if len(expected.generics) != len(actual.generics):
             return False
         return all(self._types_compatible(lhs, rhs) for lhs, rhs in zip(expected.generics, actual.generics))
+
+    def _can_widen_primitive(self, actual: Type, expected: Type) -> bool:
+        if self._is_unsigned_integer_type(actual) and self._is_unsigned_integer_type(expected):
+            return self._integer_bits(actual) <= self._integer_bits(expected)
+        if self._is_signed_integer_type(actual) and self._is_signed_integer_type(expected):
+            return self._integer_bits(actual) <= self._integer_bits(expected)
+        if self._is_float_type(actual) and self._is_float_type(expected):
+            return self._float_bits(actual) <= self._float_bits(expected)
+        return False
 
     def _concretize_type(self, pattern: Type, concrete: Type) -> Type:
         pattern_is_mut = is_mutable_type(pattern)
@@ -1591,6 +1907,28 @@ class TypeInferer:
         )
 
     @staticmethod
+    def _is_unsigned_integer_type(typ: Type) -> bool:
+        typ = unwrap_for_storage(typ)
+        return typ.name == "usize" or (len(typ.name) > 1 and typ.name[0] == "u" and typ.name[1:].isdigit())
+
+    @staticmethod
+    def _is_signed_integer_type(typ: Type) -> bool:
+        typ = unwrap_for_storage(typ)
+        return typ.name == "isize" or (len(typ.name) > 1 and typ.name[0] == "i" and typ.name[1:].isdigit())
+
+    @staticmethod
+    def _integer_bits(typ: Type) -> int:
+        typ = unwrap_for_storage(typ)
+        if typ.name in ("usize", "isize"):
+            return 64
+        return int(typ.name[1:])
+
+    @staticmethod
     def _is_float_type(typ: Type) -> bool:
         typ = unwrap_for_storage(typ)
         return len(typ.name) > 1 and typ.name[0] == "f" and typ.name[1:].isdigit()
+
+    @staticmethod
+    def _float_bits(typ: Type) -> int:
+        typ = unwrap_for_storage(typ)
+        return int(typ.name[1:])

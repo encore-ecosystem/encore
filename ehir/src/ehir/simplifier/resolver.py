@@ -18,10 +18,12 @@ from ehir.core.instructions import (
     Instruction_add,
     Instruction_and,
     Instruction_call,
+    Instruction_callvoid,
     Instruction_capenum,
     Instruction_capprim,
     Instruction_capstruct,
     Instruction_div,
+    Instruction_drop,
     Instruction_geq,
     Instruction_getfield,
     Instruction_getfieldptr,
@@ -32,6 +34,7 @@ from ehir.core.instructions import (
     Instruction_leq,
     Instruction_les,
     Instruction_load,
+    Instruction_match,
     Instruction_mod,
     Instruction_mul,
     Instruction_neq,
@@ -40,6 +43,8 @@ from ehir.core.instructions import (
     Instruction_ret,
     Instruction_salloc,
     Instruction_setfield,
+    Instruction_sgetfield,
+    Instruction_sgetfieldptr,
     Instruction_shl,
     Instruction_shr,
     Instruction_store,
@@ -50,8 +55,9 @@ from ehir.core.instructions import (
 )
 from ehir.core.primitives import Char_t, Float_t, Isize_t, Str_t, Usize_t
 from ehir.core.primitives.base import PrimitiveType
-from ehir.core.type import Pointer, Reference, Type, box_pointee, is_box_type
+from ehir.core.type import Pointer, Reference, Type, box_pointee, concrete_box_type_name, is_box_type, mangle_type_name
 from ehir.core.variable import Parameter, Variable
+from ehir.errors import EhirCompileError
 
 _BOOL = Usize_t(1)
 _BIN_SAME = (
@@ -89,6 +95,7 @@ class Resolver:
     traits: dict[str, Derective_trait]
     impls: list[Derective_impl]
     type_aliases: dict[str, Type]
+    _trait_parents: dict[str, list[str]]
 
     def run(self, ast: list[Derective]) -> list[Derective]:
         self.fn = {}
@@ -97,6 +104,8 @@ class Resolver:
         self.traits = {}
         self.impls = []
         self.type_aliases = {}
+        self._current_fn_name: str | None = None
+        self._trait_parents = {}
 
         for d in ast:
             if isinstance(d, Derective_typealias):
@@ -113,9 +122,14 @@ class Resolver:
                 if isinstance(d.ret_type, Pointer):
                     short_name = d.name.split("::")[-1]
                     if not short_name.startswith("__"):
-                        raise TypeError(f"Returning raw pointers is forbidden in EHIR: {d.name} -> {d.ret_type}")
+                        raise EhirCompileError(
+                            f"Returning raw pointers is forbidden in EHIR: {d.name} -> {d.ret_type}", code="EHIR1001"
+                        )
                 self.fn[d.name] = d
 
+        self._validate_trait_hierarchy()
+        self._validate_dyn_trait_usage()
+        self._validate_impl_coherence()
         self._expand_inherent_impl_methods(ast)
         self._rewrite_declaration_types(ast)
 
@@ -123,8 +137,316 @@ class Resolver:
             if isinstance(fn, Derective_extern_fn):
                 continue
             self._resolve_fn(fn)
+        for impl in self.impls:
+            for method in impl.methods:
+                self._resolve_fn(method)
 
         return ast
+
+    def _validate_impl_coherence(self) -> None:
+        seen_impl_keys: set[tuple[str, str, str]] = set()
+        seen_impl_templates: list[tuple[str, tuple[str, ...], Type, set[str]]] = []
+        for impl in self.impls:
+            method_names = [method.name for method in impl.methods]
+            duplicates = {name for name in method_names if method_names.count(name) > 1}
+            if duplicates:
+                dup = sorted(duplicates)[0]
+                raise EhirCompileError(f"Duplicate method '{dup}' in impl for '{impl.for_type}'", code="EHIR1101")
+
+            if impl.trait_name is None:
+                continue
+
+            trait_decl = self.traits.get(impl.trait_name)
+            if trait_decl is None:
+                short = impl.trait_name.split("::")[-1]
+                trait_decl = next((trait for trait in self.traits.values() if trait.name.split("::")[-1] == short), None)
+            if trait_decl is None:
+                raise EhirCompileError(
+                    f"Unknown trait '{impl.trait_name}' in impl for '{impl.for_type}'", code="EHIR1102"
+                )
+
+            trait_methods = self._trait_method_names_with_parents(trait_decl.name)
+            impl_methods = {method.name for method in impl.methods}
+            missing = trait_methods - impl_methods
+            extra = impl_methods - trait_methods
+            if missing:
+                first = sorted(missing)[0]
+                raise EhirCompileError(
+                    f"Trait impl '{trait_decl.name}' for '{impl.for_type}' misses method '{first}'", code="EHIR1103"
+                )
+            if extra:
+                first = sorted(extra)[0]
+                raise EhirCompileError(
+                    f"Trait impl '{trait_decl.name}' for '{impl.for_type}' defines unknown method '{first}'",
+                    code="EHIR1104",
+                )
+
+            resolved_trait_args = tuple(str(self._resolve_type(arg)) for arg in impl.trait_args)
+            key = (trait_decl.name, ",".join(resolved_trait_args), str(self._resolve_type(impl.for_type)))
+            if key in seen_impl_keys:
+                raise EhirCompileError(
+                    f"Conflicting trait impl: '{trait_decl.name}' already implemented for '{key[2]}'", code="EHIR1105"
+                )
+            seen_impl_keys.add(key)
+            resolved_for = self._resolve_type(impl.for_type)
+            current_generic_vars = {generic.name for generic in impl.generics}
+            for seen_trait, seen_trait_args, seen_for, seen_generic_vars in seen_impl_templates:
+                if seen_trait != trait_decl.name or seen_trait_args != resolved_trait_args:
+                    continue
+                if self._types_overlap(
+                    seen_for,
+                    resolved_for,
+                    left_vars=seen_generic_vars,
+                    right_vars=current_generic_vars,
+                ):
+                    raise EhirCompileError(
+                        (
+                            f"Conflicting trait impl: '{trait_decl.name}' has overlapping targets "
+                            f"'{seen_for}' and '{resolved_for}'"
+                        ),
+                        code="EHIR1106",
+                    )
+            seen_impl_templates.append((trait_decl.name, resolved_trait_args, resolved_for, current_generic_vars))
+
+    def _types_overlap(self, left: Type, right: Type, *, left_vars: set[str], right_vars: set[str]) -> bool:
+        return self._unify_type_templates(
+            left,
+            right,
+            left_vars=left_vars,
+            right_vars=right_vars,
+            left_subst={},
+            right_subst={},
+        )
+
+    def _unify_type_templates(
+        self,
+        left: Type,
+        right: Type,
+        *,
+        left_vars: set[str],
+        right_vars: set[str],
+        left_subst: dict[str, Type],
+        right_subst: dict[str, Type],
+    ) -> bool:
+        if not left.generics and self._is_placeholder_type_name(left.name) and left.name in left_vars:
+            bound = left_subst.get(left.name)
+            if bound is not None:
+                return self._unify_type_templates(
+                    bound,
+                    right,
+                    left_vars=left_vars,
+                    right_vars=right_vars,
+                    left_subst=left_subst,
+                    right_subst=right_subst,
+                )
+            left_subst[left.name] = right
+            return True
+
+        if not right.generics and self._is_placeholder_type_name(right.name) and right.name in right_vars:
+            bound = right_subst.get(right.name)
+            if bound is not None:
+                return self._unify_type_templates(
+                    left,
+                    bound,
+                    left_vars=left_vars,
+                    right_vars=right_vars,
+                    left_subst=left_subst,
+                    right_subst=right_subst,
+                )
+            right_subst[right.name] = left
+            return True
+
+        if left.name != right.name:
+            return False
+        if len(left.generics) != len(right.generics):
+            return False
+        for left_generic, right_generic in zip(left.generics, right.generics, strict=False):
+            if not self._unify_type_templates(
+                left_generic,
+                right_generic,
+                left_vars=left_vars,
+                right_vars=right_vars,
+                left_subst=left_subst,
+                right_subst=right_subst,
+            ):
+                return False
+        return True
+
+    def _validate_trait_hierarchy(self) -> None:
+        by_short = {trait.name.split("::")[-1]: trait.name for trait in self.traits.values()}
+        self._trait_parents = {}
+        for trait in self.traits.values():
+            parents: list[str] = []
+            if trait.parent is not None:
+                full = trait.parent
+                if full not in self.traits:
+                    full = by_short.get(trait.parent, trait.parent)
+                if full not in self.traits:
+                    raise EhirCompileError(
+                        f"Unknown parent trait '{trait.parent}' for trait '{trait.name}'", code="EHIR1110"
+                    )
+                parents.append(full)
+            self._trait_parents[trait.name] = parents
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def dfs(name: str):
+            if name in visited:
+                return
+            if name in visiting:
+                raise EhirCompileError(f"Cyclic trait inheritance detected at '{name}'", code="EHIR1111")
+            visiting.add(name)
+            for parent in self._trait_parents.get(name, []):
+                dfs(parent)
+            visiting.remove(name)
+            visited.add(name)
+
+        for name in self.traits:
+            dfs(name)
+
+    def _validate_dyn_trait_usage(self) -> None:
+        for struct_decl in self.structs.values():
+            for field in struct_decl.params:
+                self._validate_dyn_type(field.type, context=f"struct '{struct_decl.name}' field '{field.name}'")
+        for fn_decl in self.fn.values():
+            for param in fn_decl.params:
+                self._validate_dyn_type(param.type, context=f"fn '{fn_decl.name}' param '{param.name}'")
+            self._validate_dyn_type(fn_decl.ret_type, context=f"fn '{fn_decl.name}' return")
+        for impl in self.impls:
+            self._validate_dyn_type(impl.for_type, context=f"impl target '{impl.for_type}'")
+            for method in impl.methods:
+                for param in method.params:
+                    self._validate_dyn_type(param.type, context=f"method '{method.name}' param '{param.name}'")
+                self._validate_dyn_type(method.ret_type, context=f"method '{method.name}' return")
+
+    def _validate_dyn_type(self, typ: Type, *, context: str) -> None:
+        if isinstance(typ, Pointer):
+            self._validate_dyn_type(typ.pointee, context=context)
+            return
+        if isinstance(typ, Reference):
+            self._validate_dyn_type(typ.pointee, context=context)
+            return
+        if typ.name == "dyn":
+            if len(typ.generics) != 1:
+                raise EhirCompileError(f"Invalid dyn type in {context}: expected 'dyn Trait'", code="EHIR1300")
+            trait_name = typ.generics[0].name
+            trait_decl = self.traits.get(trait_name)
+            if trait_decl is None:
+                trait_decl = next(
+                    (trait for trait in self.traits.values() if trait.name.split("::")[-1] == trait_name),
+                    None,
+                )
+            if trait_decl is None:
+                raise EhirCompileError(f"Unknown trait '{trait_name}' in dyn type ({context})", code="EHIR1301")
+            if trait_decl.generics:
+                raise EhirCompileError(
+                    f"dyn for generic trait '{trait_decl.name}' is not supported ({context})", code="EHIR1302"
+                )
+            for method in self._trait_methods_with_parents(trait_decl.name):
+                if method.generics:
+                    raise EhirCompileError(
+                        f"Trait '{trait_decl.name}' is not object-safe: method '{method.name}' is generic",
+                        code="EHIR1303",
+                    )
+                if self._type_contains_self(method.ret_type):
+                    raise EhirCompileError(
+                        f"Trait '{trait_decl.name}' is not object-safe: method '{method.name}' returns Self",
+                        code="EHIR1304",
+                    )
+                for index, param in enumerate(method.params):
+                    if index == 0:
+                        continue
+                    if self._type_contains_self(param.type):
+                        raise EhirCompileError(
+                            (
+                                f"Trait '{trait_decl.name}' is not object-safe: method '{method.name}' "
+                                "uses Self outside receiver"
+                            ),
+                            code="EHIR1305",
+                        )
+            return
+        for generic in typ.generics:
+            self._validate_dyn_type(generic, context=context)
+
+    def _type_contains_self(self, typ: Type) -> bool:
+        if isinstance(typ, Pointer):
+            return self._type_contains_self(typ.pointee)
+        if isinstance(typ, Reference):
+            return self._type_contains_self(typ.pointee)
+        if typ.name == "Self" and not typ.generics:
+            return True
+        return any(self._type_contains_self(generic) for generic in typ.generics)
+
+    def _trait_method_names_with_parents(self, trait_name: str) -> set[str]:
+        result: set[str] = set()
+        canonical = self._canonical_trait_name(trait_name) or trait_name
+        stack = [canonical]
+        seen: set[str] = set()
+        while stack:
+            current = stack.pop()
+            current = self._canonical_trait_name(current) or current
+            if current in seen:
+                continue
+            seen.add(current)
+            trait = self.traits.get(current)
+            if trait is None:
+                continue
+            result |= {method.name for method in trait.methods}
+            stack.extend(self._trait_parents.get(current, []))
+        return result
+
+    def _trait_methods_with_parents(self, trait_name: str) -> list:
+        methods_by_name: dict[str, object] = {}
+        canonical = self._canonical_trait_name(trait_name) or trait_name
+        stack = [canonical]
+        seen: set[str] = set()
+        while stack:
+            current = stack.pop()
+            current = self._canonical_trait_name(current) or current
+            if current in seen:
+                continue
+            seen.add(current)
+            trait = self.traits.get(current)
+            if trait is None:
+                continue
+            for method in trait.methods:
+                methods_by_name.setdefault(method.name, method)
+            stack.extend(self._trait_parents.get(current, []))
+        return list(methods_by_name.values())
+
+    def _find_trait_method_with_parents(self, trait_name: str, method_name: str):
+        for method in self._trait_methods_with_parents(trait_name):
+            if method.name == method_name:
+                return method
+        return None
+
+    def _trait_is_descendant_of(self, child: str, parent: str) -> bool:
+        child = self._canonical_trait_name(child) or child
+        parent = self._canonical_trait_name(parent) or parent
+        if child == parent:
+            return True
+        stack = list(self._trait_parents.get(child, []))
+        seen: set[str] = set()
+        while stack:
+            current = stack.pop()
+            current = self._canonical_trait_name(current) or current
+            if current in seen:
+                continue
+            if current == parent:
+                return True
+            seen.add(current)
+            stack.extend(self._trait_parents.get(current, []))
+        return False
+
+    def _canonical_trait_name(self, name: str) -> str | None:
+        if name in self.traits:
+            return name
+        short = name.split("::")[-1]
+        matches = [trait_name for trait_name in self.traits if trait_name.split("::")[-1] == short]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     def _expand_inherent_impl_methods(self, ast: list[Derective]) -> None:
         fn_names = {d.name for d in ast if isinstance(d, (Derective_fn, Derective_extern_fn))}
@@ -175,6 +497,7 @@ class Resolver:
             self._rewrite_types(d)
 
     def _resolve_fn(self, fn: Derective_fn) -> None:
+        self._current_fn_name = fn.name
         vars_by_name: dict[str, Type | None] = {}
         for p in fn.params:
             vars_by_name[p.name] = p.type
@@ -193,6 +516,7 @@ class Resolver:
                 self._commit_instr_vars(instr, vars_by_name)
         for i, p in enumerate(fn.params):
             fn.params[i] = Parameter(p.name, self._must_get(vars_by_name, p.name, fn.name))
+        self._current_fn_name = None
 
     def _resolve_instr(self, instr, fn_ret_type: Type, vars_by_name: dict[str, Type | None]) -> bool:
         if isinstance(instr, Instruction_capprim):
@@ -246,6 +570,9 @@ class Resolver:
             value_t = self._var_type(vars_by_name, instr.variable)
             if value_t is None:
                 return False
+            current_t = self._var_type(vars_by_name, instr.var_out)
+            if current_t is not None and current_t.name == concrete_box_type_name(value_t):
+                return False
             return self._set_var(vars_by_name, instr.var_out, Type("Box", [value_t]))
 
         if isinstance(instr, Instruction_capstruct):
@@ -256,6 +583,8 @@ class Resolver:
 
         if isinstance(instr, Instruction_call):
             return self._resolve_call(instr, vars_by_name)
+        if isinstance(instr, Instruction_callvoid):
+            return self._resolve_callvoid(instr, vars_by_name)
 
         if isinstance(instr, Instruction_getfield):
             return self._resolve_getfield(instr, vars_by_name, as_ptr=False)
@@ -263,15 +592,27 @@ class Resolver:
         if isinstance(instr, Instruction_getfieldptr):
             return self._resolve_getfield(instr, vars_by_name, as_ptr=True)
 
+        if isinstance(instr, Instruction_sgetfield):
+            return self._resolve_static_getfield(instr, vars_by_name, as_ptr=False)
+
+        if isinstance(instr, Instruction_sgetfieldptr):
+            return self._resolve_static_getfield(instr, vars_by_name, as_ptr=True)
+
         if isinstance(instr, Instruction_setfield):
             field_t = self._field_path_type(vars_by_name, instr.var, [instr.field, *instr.field_path])
             if field_t is None:
                 return False
             return self._unify_var(vars_by_name, instr.value, field_t)
 
+        if isinstance(instr, Instruction_match):
+            return self._resolve_match(instr, vars_by_name)
+
         if isinstance(instr, Instruction_hrealloc):
             # keep pointer-kind
             return self._unify_pair(vars_by_name, instr.var_out, instr.var)
+
+        if isinstance(instr, Instruction_drop):
+            return False
 
         return False
 
@@ -302,13 +643,40 @@ class Resolver:
         changed |= self._set_var(vars_by_name, instr.var_out, self._resolve_type(out_t))
         return changed
 
+    def _resolve_match(self, instr: Instruction_match, vars_by_name: dict[str, Type | None]) -> bool:
+        cond_t = self._var_type(vars_by_name, instr.cond_var)
+        if cond_t is None:
+            return False
+        enum_t = cond_t.pointee if isinstance(cond_t, Reference) else cond_t
+        enum_t = self._resolve_type(enum_t)
+        enum_decl = self.enums.get(enum_t.name)
+        if enum_decl is None:
+            return False
+
+        changed = False
+        for case in instr.cases:
+            variant_decl = next((variant for variant in enum_decl.variants if variant.name == case.variant), None)
+            if variant_decl is None:
+                continue
+            if not isinstance(variant_decl, TupleLikeVariant):
+                continue
+            if case.payload_var is None:
+                continue
+            if len(variant_decl.types) != 1:
+                continue
+            payload_t = self._resolve_type(
+                self._specialize_type(variant_decl.types[0], enum_decl.generics, enum_t.generics)
+            )
+            changed |= self._set_var(vars_by_name, case.payload_var, payload_t)
+        return changed
+
     def _resolve_capenum(self, instr: Instruction_capenum, vars_by_name: dict[str, Type | None]) -> bool:
         enum_decl = self.enums.get(instr.enum.name)
         if enum_decl is None:
             return False
         variant = next((v for v in enum_decl.variants if v.name == instr.enum.variant), None)
         if variant is None:
-            raise TypeError(f"Unknown variant '{instr.enum.variant}' for enum '{instr.enum.name}'")
+            raise EhirCompileError(f"Unknown variant '{instr.enum.variant}' for enum '{instr.enum.name}'")
 
         changed = False
         concrete_generics = list(instr.enum.generics)
@@ -327,7 +695,7 @@ class Resolver:
 
         if isinstance(variant, UnitLikeVariant):
             if instr.enum.args:
-                raise TypeError(f"Unit variant '{variant.name}' does not accept payload")
+                raise EhirCompileError(f"Unit variant '{variant.name}' does not accept payload")
         elif isinstance(variant, TupleLikeVariant):
             spec_types = self._specialize_types(variant.types, enum_decl.generics, concrete_generics)
             for exp_t, arg in zip(spec_types, instr.enum.args, strict=False):
@@ -339,6 +707,7 @@ class Resolver:
         return changed
 
     def _resolve_call(self, instr: Instruction_call, vars_by_name: dict[str, Type | None]) -> bool:
+        self._rewrite_instance_method_call(instr, vars_by_name)
         resolved = self._resolve_callable_signature(instr, vars_by_name)
         if resolved is None:
             return False
@@ -350,10 +719,104 @@ class Resolver:
         changed |= self._set_var(vars_by_name, instr.var_out, sig.ret)
         return changed
 
+    def _resolve_callvoid(self, instr: Instruction_callvoid, vars_by_name: dict[str, Type | None]) -> bool:
+        self._rewrite_instance_method_call(instr, vars_by_name)
+        tmp_out = Variable(name=".callvoid_out", type=None)
+        proxy = Instruction_call(
+            var_out=tmp_out,
+            fn_name=instr.fn_name,
+            generics=deepcopy(instr.generics),
+            args=deepcopy(instr.args),
+            is_unsafe=instr.is_unsafe,
+        )
+        resolved = self._resolve_callable_signature(proxy, vars_by_name)
+        if resolved is None:
+            return False
+        sig, resolved_name = resolved
+        instr.fn_name = resolved_name
+        instr.generics = proxy.generics
+        changed = False
+        for arg, exp_t in zip(instr.args, sig.params, strict=False):
+            changed |= self._unify_expected(vars_by_name, arg, exp_t)
+        if instr.assign_to is not None:
+            changed |= self._set_var(vars_by_name, instr.assign_to, sig.ret)
+        return changed
+
+    def _rewrite_instance_method_call(
+        self,
+        instr: Instruction_call | Instruction_callvoid,
+        vars_by_name: dict[str, Type | None],
+    ) -> None:
+        if "::" not in instr.fn_name:
+            return
+        owner_text, method_name = instr.fn_name.rsplit("::", 1)
+        owner_type = vars_by_name.get(owner_text)
+        if owner_type is None:
+            return
+        receiver = Variable(name=owner_text, type=owner_type)
+        if isinstance(instr, Instruction_callvoid):
+            instr.assign_to = Variable(name=owner_text, type=owner_type)
+        owner_base = owner_type.pointee if isinstance(owner_type, Reference) else owner_type
+        if owner_base.generics:
+            generic_owner = Type(owner_base.name, [Type("T") for _ in owner_base.generics])
+            instr.fn_name = f"{generic_owner}::{method_name}"
+        else:
+            instr.fn_name = f"{owner_base}::{method_name}"
+        instr.args = [receiver, *instr.args]
+
     def _resolve_callable_signature(
         self, instr: Instruction_call, vars_by_name: dict[str, Type | None]
     ) -> tuple[_MethodSig, str] | None:
-        def build_sig(fn_directive) -> _MethodSig:
+        instr.fn_name = self._normalize_call_name(instr.fn_name)
+        if instr.fn_name.startswith("__dyn_dispatch__"):
+            payload = instr.fn_name[len("__dyn_dispatch__") :]
+            if "::" not in payload:
+                raise EhirCompileError(f"Invalid dyn dispatch call name '{instr.fn_name}'", code="EHIR1310")
+            trait_name, method_name = payload.rsplit("::", 1)
+            trait_decl = self.traits.get(trait_name)
+            if trait_decl is None:
+                trait_decl = next(
+                    (trait for trait in self.traits.values() if trait.name.split("::")[-1] == trait_name),
+                    None,
+                )
+            if trait_decl is None:
+                raise EhirCompileError(f"Unknown trait '{trait_name}' in dyn dispatch", code="EHIR1301")
+            trait_method = self._find_trait_method_with_parents(trait_decl.name, method_name)
+            if trait_method is None:
+                raise EhirCompileError(
+                    f"Unknown method '{method_name}' for trait '{trait_decl.name}'",
+                    code="EHIR1309",
+                )
+            if not instr.args:
+                raise EhirCompileError("dyn dispatch call requires receiver argument", code="EHIR1311")
+            recv_t = self._var_type(vars_by_name, instr.args[0])
+            if recv_t is None:
+                return None
+            recv_base = recv_t.pointee if isinstance(recv_t, Reference) else recv_t
+            params: list[Type] = [recv_base]
+            for index, param in enumerate(trait_method.params):
+                if index == 0:
+                    continue
+                params.append(self._resolve_type(param.type))
+            ret_t = self._resolve_type(trait_method.ret_type)
+            return _MethodSig(params=params, ret=ret_t), instr.fn_name
+
+        def _owner_self_type_from_name(name: str) -> Type | None:
+            if "::" not in name:
+                return None
+            owner_text, _ = name.rsplit("::", 1)
+            owner = self._parse_type_text(owner_text)
+            if owner is None:
+                return None
+            owner = self._resolve_type(owner)
+            return owner.pointee if isinstance(owner, Reference) else owner
+
+        def _apply_self_type(typ: Type, self_type: Type | None) -> Type:
+            if self_type is None:
+                return typ
+            return self._replace_type(typ, {}, self_type)
+
+        def build_sig(fn_directive, self_type: Type | None = None) -> _MethodSig:
             fn_generics = getattr(fn_directive, "generics", [])
             if fn_generics:
                 explicit_generics = [self._resolve_type(generic) for generic in instr.generics]
@@ -362,32 +825,86 @@ class Resolver:
                         generic_param.name: concrete
                         for generic_param, concrete in zip(fn_generics, explicit_generics, strict=False)
                     }
+                    inferred = self._infer_fn_generic_mapping(fn_directive, instr, vars_by_name)
+                    if inferred is None and instr.args:
+                        recv_t = self._var_type(vars_by_name, instr.args[0])
+                        recv_base = recv_t.pointee if isinstance(recv_t, Reference) else recv_t
+                        if recv_base is not None and len(recv_base.generics) == len(fn_generics):
+                            inferred = {
+                                generic_param.name: deepcopy(concrete)
+                                for generic_param, concrete in zip(fn_generics, recv_base.generics, strict=False)
+                            }
+                    if inferred is not None:
+                        for generic_param in fn_generics:
+                            explicit = mapping.get(generic_param.name)
+                            if explicit is None:
+                                continue
+                            explicit_is_placeholder = (
+                                not explicit.generics
+                                and explicit.name == generic_param.name
+                            )
+                            if explicit_is_placeholder and generic_param.name in inferred:
+                                mapping[generic_param.name] = deepcopy(inferred[generic_param.name])
                     return _MethodSig(
                         params=[
-                            self._resolve_type(self._replace_generics_by_name(param.type, mapping))
+                            self._resolve_type(
+                                _apply_self_type(self._replace_generics_by_name(param.type, mapping), self_type)
+                            )
                             for param in fn_directive.params
                         ],
-                        ret=self._resolve_type(self._replace_generics_by_name(fn_directive.ret_type, mapping)),
+                        ret=self._resolve_type(
+                            _apply_self_type(self._replace_generics_by_name(fn_directive.ret_type, mapping), self_type)
+                        ),
+                    )
+                inferred = self._infer_fn_generic_mapping(fn_directive, instr, vars_by_name)
+                if inferred is not None and len(inferred) == len(fn_generics):
+                    instr.generics = [deepcopy(inferred[g.name]) for g in fn_generics]
+                    mapping = {g.name: deepcopy(inferred[g.name]) for g in fn_generics}
+                    return _MethodSig(
+                        params=[
+                            self._resolve_type(
+                                _apply_self_type(self._replace_generics_by_name(param.type, mapping), self_type)
+                            )
+                            for param in fn_directive.params
+                        ],
+                        ret=self._resolve_type(
+                            _apply_self_type(self._replace_generics_by_name(fn_directive.ret_type, mapping), self_type)
+                        ),
                     )
             return _MethodSig(
-                params=[self._resolve_type(param.type) for param in fn_directive.params],
-                ret=self._resolve_type(fn_directive.ret_type),
+                params=[self._resolve_type(_apply_self_type(param.type, self_type)) for param in fn_directive.params],
+                ret=self._resolve_type(_apply_self_type(fn_directive.ret_type, self_type)),
             )
 
-        direct = self.fn.get(instr.fn_name)
-        if direct is not None:
-            return (build_sig(direct), direct.name)
+        trait_owner_call = False
+        owner_text_for_trait: str | None = None
+        if "::" in instr.fn_name:
+            owner_text_for_trait, trait_method_for_trait = instr.fn_name.rsplit("::", 1)
+            is_specialized_method_name = "__" in trait_method_for_trait and trait_method_for_trait != "op"
+            owner_type_for_trait = self._parse_type_text(owner_text_for_trait)
+            if owner_type_for_trait is not None and not is_specialized_method_name:
+                owner_base_name = owner_type_for_trait.name
+                owner_short_name = owner_base_name.split("::")[-1]
+                if owner_base_name in self.traits or any(
+                    trait.name.split("::")[-1] == owner_short_name for trait in self.traits.values()
+                ):
+                    trait_owner_call = True
+
+        if not trait_owner_call:
+            direct = self.fn.get(instr.fn_name)
+            if direct is not None:
+                return (build_sig(direct, _owner_self_type_from_name(instr.fn_name)), direct.name)
 
         if "::" in instr.fn_name:
             parts = instr.fn_name.split("::")
             if len(parts) >= 2:
                 tail = "::".join(parts[-2:])
                 tail_direct = self.fn.get(tail)
-                if tail_direct is not None:
-                    return (build_sig(tail_direct), tail_direct.name)
+                if tail_direct is not None and not trait_owner_call:
+                    return (build_sig(tail_direct, _owner_self_type_from_name(instr.fn_name)), tail_direct.name)
 
         if "::" not in instr.fn_name:
-            raise TypeError(f"Unknown function '{instr.fn_name}'")
+            raise EhirCompileError(f"Unknown function '{instr.fn_name}'")
         owner_text, method_name = instr.fn_name.rsplit("::", 1)
         owner_type = self._parse_type_text(owner_text)
         if owner_type is None:
@@ -397,45 +914,175 @@ class Resolver:
                 short_direct = self.fn.get(short_name)
                 if short_direct is not None:
                     return (build_sig(short_direct), short_direct.name)
-            raise TypeError(f"Unknown function '{instr.fn_name}'")
+            raise EhirCompileError(f"Unknown function '{instr.fn_name}'")
         owner_type = self._resolve_type(owner_type)
         owner_base = owner_type.pointee if isinstance(owner_type, Reference) else owner_type
+        if not owner_base.generics and instr.args:
+            recv_t = self._var_type(vars_by_name, instr.args[0])
+            if recv_t is not None:
+                recv_base = recv_t.pointee if isinstance(recv_t, Reference) else recv_t
+                owner_short = owner_base.name.split("::")[-1]
+                recv_short = recv_base.name.split("::")[-1]
+                if owner_short == recv_short and recv_base.generics:
+                    owner_base = recv_base
+
+        owner_suffix = self._mangle_type_name(owner_base)
+        if owner_suffix:
+            mangled_suffix = f"::{method_name}__{owner_suffix}"
+            mangled_candidates = [name for name in self.fn if name.endswith(mangled_suffix)]
+            if len(mangled_candidates) == 1:
+                mangled_direct = self.fn[mangled_candidates[0]]
+                return (build_sig(mangled_direct), mangled_direct.name)
 
         # Trait call form: Trait::method(arg0, ...)
         if instr.args:
             recv_t = self._var_type(vars_by_name, instr.args[0])
             if recv_t is not None:
                 recv_base = recv_t.pointee if isinstance(recv_t, Reference) else recv_t
+                if recv_base.name == "dyn":
+                    if len(recv_base.generics) != 1:
+                        raise EhirCompileError("Invalid dyn receiver type", code="EHIR1307")
+                    dyn_trait_name = recv_base.generics[0].name
+                    trait_decl = self.traits.get(dyn_trait_name)
+                    if trait_decl is None:
+                        trait_decl = next(
+                            (trait for trait in self.traits.values() if trait.name.split("::")[-1] == dyn_trait_name),
+                            None,
+                        )
+                    if trait_decl is None:
+                        raise EhirCompileError(
+                            f"Unknown trait '{dyn_trait_name}' in dyn dispatch receiver",
+                            code="EHIR1301",
+                        )
+                    owner_name = owner_base.name
+                    owner_full = owner_name if owner_name in self.traits else next(
+                        (name for name in self.traits if name.split("::")[-1] == owner_name),
+                        owner_name,
+                    )
+                    owner_canonical = self._canonical_trait_name(owner_full)
+                    if owner_canonical is None or not self._trait_is_descendant_of(trait_decl.name, owner_canonical):
+                        raise EhirCompileError(
+                            f"Trait call '{instr.fn_name}' does not match receiver dyn {trait_decl.name}",
+                            code="EHIR1308",
+                        )
+                    trait_method = self._find_trait_method_with_parents(trait_decl.name, method_name)
+                    if trait_method is None:
+                        raise EhirCompileError(
+                            f"Unknown method '{method_name}' for trait '{trait_decl.name}'",
+                            code="EHIR1309",
+                        )
+                    params: list[Type] = [recv_base]
+                    for index, param in enumerate(trait_method.params):
+                        if index == 0:
+                            continue
+                        params.append(self._resolve_type(param.type))
+                    ret_t = self._resolve_type(trait_method.ret_type)
+                    resolved_name = f"__dyn_dispatch__{trait_decl.name}::{method_name}"
+                    return _MethodSig(params=params, ret=ret_t), resolved_name
                 for impl in self.impls:
                     trait_name = impl.trait_name
                     if trait_name is None:
                         continue
                     trait_short = trait_name.split("::")[-1]
-                    if trait_name != owner_base.name and trait_short != owner_base.name:
+                    owner_name = owner_base.name
+                    owner_full = owner_name if owner_name in self.traits else next(
+                        (name for name in self.traits if name.split("::")[-1] == owner_name),
+                        owner_name,
+                    )
+                    if not self._trait_is_descendant_of(trait_name, owner_full) and trait_short != owner_name:
                         continue
-                    if not self._types_compatible(impl.for_type, recv_base):
+                    mapping: dict[str, Type] = {}
+                    if not self._bind_generic_from_types(impl.for_type, recv_base, mapping):
                         continue
+                    if instr.generics:
+                        expected_trait_args = [self._resolve_type(g) for g in instr.generics]
+                        if len(expected_trait_args) != len(impl.trait_args):
+                            continue
+                        trait_arg_mismatch = False
+                        for template_arg, expected_arg in zip(impl.trait_args, expected_trait_args, strict=False):
+                            if not self._bind_generic_from_types(template_arg, expected_arg, mapping):
+                                trait_arg_mismatch = True
+                                break
+                        if trait_arg_mismatch:
+                            continue
+                        resolved_trait_args = [self._resolve_type(self._replace_type(arg, mapping, recv_base)) for arg in impl.trait_args]
+                        if any(
+                            str(expected_arg) != str(resolved_arg)
+                            for expected_arg, resolved_arg in zip(
+                                expected_trait_args, resolved_trait_args, strict=False
+                            )
+                        ):
+                            continue
                     method = next((m for m in impl.methods if m.name == method_name), None)
                     if method is None:
                         continue
-                    mapping = self._impl_generic_mapping(impl.for_type, recv_base)
                     params = [self._resolve_type(self._replace_type(p.type, mapping, recv_base)) for p in method.params]
                     ret_t = self._resolve_type(self._replace_type(method.ret_type, mapping, recv_base))
-                    resolved_name = f"{trait_name}::{method.name}"
+                    resolved_method = self._trait_impl_method_name(impl, method, recv_base)
+                    resolved_generics = self._resolve_trait_impl_generics(impl, method, mapping)
+                    if resolved_generics is not None:
+                        instr.generics = resolved_generics
+                    resolved_name = f"{trait_name}::{resolved_method}"
                     return _MethodSig(params=params, ret=ret_t), resolved_name
+
+        # Fallback: resolve through trait declaration signature even if concrete impl
+        # is not selected at this point. This preserves result typing for downstream passes.
+        trait_decl = self.traits.get(owner_base.name)
+        if trait_decl is None:
+            owner_short = owner_base.name.split("::")[-1]
+            for trait in self.traits.values():
+                if trait.name.split("::")[-1] == owner_short:
+                    trait_decl = trait
+                    break
+        if trait_decl is not None:
+            trait_method = next((m for m in trait_decl.methods if m.name == method_name), None)
+            if trait_method is not None:
+                recv_t = self._var_type(vars_by_name, instr.args[0]) if instr.args else None
+                recv_base = recv_t.pointee if isinstance(recv_t, Reference) else recv_t
+                params = []
+                for param in trait_method.params:
+                    param_t = self._resolve_type(param.type)
+                    if recv_base is not None and param_t.name == "Self":
+                        params.append(recv_base)
+                    else:
+                        params.append(param_t)
+                ret_t = self._resolve_type(trait_method.ret_type)
+                if recv_base is not None and ret_t.name == "Self":
+                    ret_t = recv_base
+                resolved_method = trait_method.name
+                if resolved_method != "op" and recv_base is not None:
+                    suffix = self._mangle_type_name(recv_base)
+                    if suffix:
+                        resolved_method = f"{resolved_method}__{suffix}"
+                resolved_name = f"{trait_decl.name}::{resolved_method}"
+                return _MethodSig(params=params, ret=ret_t), resolved_name
 
         for impl in self.impls:
             if impl.trait_name is not None:
                 continue
-            if impl.for_type.name != owner_base.name:
+            owner_short = owner_base.name.split("::")[-1]
+            impl_short = impl.for_type.name.split("::")[-1]
+            if impl.for_type.name != owner_base.name and impl_short != owner_short:
                 continue
-            method = next((m for m in impl.methods if m.name == method_name), None)
+            method = next(
+                (
+                    m
+                    for m in impl.methods
+                    if m.name == method_name or m.name.startswith(f"{method_name}__")
+                ),
+                None,
+            )
             if method is None:
                 continue
             mapping = self._impl_generic_mapping(impl.for_type, owner_base)
             params = [self._resolve_type(self._replace_type(p.type, mapping, owner_base)) for p in method.params]
             ret_t = self._resolve_type(self._replace_type(method.ret_type, mapping, owner_base))
-            resolved_name = f"{impl.for_type}::{method.name}"
+            resolved_method = method.name
+            if resolved_method != "op":
+                suffix = self._mangle_type_name(owner_base)
+                if suffix:
+                    resolved_method = f"{resolved_method}__{suffix}"
+            resolved_name = f"{impl.for_type}::{resolved_method}"
             return _MethodSig(params=params, ret=ret_t), resolved_name
 
         if owner_type.generics:
@@ -454,7 +1101,142 @@ class Resolver:
                     _MethodSig(params=params, ret=ret),
                     generic_name,
                 )
-        raise TypeError(f"Unknown function '{instr.fn_name}'")
+        raise EhirCompileError(f"Unknown function '{instr.fn_name}'")
+
+    def _normalize_call_name(self, fn_name: str) -> str:
+        # Canonicalize legacy trait-op aliases from `<module>::Trait__op`
+        # into `<module>::Trait::op` so resolver/codegen operate on one naming scheme.
+        if "::" not in fn_name:
+            return fn_name
+        owner_text, method_name = fn_name.rsplit("::", 1)
+        if method_name.endswith("__op"):
+            trait_name = method_name[: -len("__op")]
+            if trait_name:
+                return f"{owner_text}::{trait_name}::op"
+        return fn_name
+
+    def _trait_impl_method_name(self, impl, method: Derective_fn, recv_type: Type) -> str:
+        suffix = (
+            self._mangle_type_template_name(impl.for_type)
+            if impl.generics or method.generics
+            else self._mangle_type_name(recv_type)
+        )
+        if impl.trait_args:
+            trait_suffix = "_".join(self._mangle_type_template_name(arg) for arg in impl.trait_args)
+            if trait_suffix:
+                suffix = f"{suffix}__{trait_suffix}" if suffix else trait_suffix
+        if not suffix:
+            return method.name
+        return f"{method.name}__{suffix}"
+
+    def _resolve_trait_impl_generics(
+        self,
+        impl,
+        method: Derective_fn,
+        mapping: dict[str, Type],
+    ) -> list[Type] | None:
+        merged = self._merge_generics(impl.generics, method.generics)
+        if not merged:
+            return []
+
+        resolved: list[Type] = []
+        for generic in merged:
+            concrete = mapping.get(generic.name)
+            if concrete is None:
+                return None
+            resolved.append(deepcopy(concrete))
+        return resolved
+
+    def _merge_generics(self, *generic_groups: list[Type]) -> list[Type]:
+        merged: list[Type] = []
+        seen: set[str] = set()
+        for group in generic_groups:
+            for generic in group:
+                if generic.name in seen:
+                    continue
+                seen.add(generic.name)
+                merged.append(generic)
+        return merged
+
+    def _mangle_type_template_name(self, typ: Type) -> str:
+        if isinstance(typ, Pointer):
+            return f"{self._mangle_type_template_name(typ.pointee)}_ptr"
+        if isinstance(typ, Reference):
+            return f"{self._mangle_type_template_name(typ.pointee)}_ref"
+        name = typ.name.replace("::", "_")
+        if not typ.generics:
+            return name
+        inner = "_".join(self._mangle_type_template_name(generic) for generic in typ.generics)
+        return f"{name}_{inner}"
+
+    def _mangle_type_name(self, typ: Type) -> str:
+        if self._is_placeholder_type_name(typ.name):
+            return ""
+        if typ.generics:
+            mangled_generics = [self._mangle_type_name(generic) for generic in typ.generics]
+            if any(not part for part in mangled_generics):
+                return ""
+            inner = "_".join(mangled_generics)
+            return f"{typ.name.replace('::', '_')}_{inner}"
+        return typ.name.replace("::", "_")
+
+    def _is_placeholder_type_name(self, name: str) -> bool:
+        if name in {"Self", "T"}:
+            return True
+        if len(name) == 1 and name.isupper():
+            return True
+        return len(name) > 1 and name.startswith("T") and name[1:].isdigit()
+
+    def _infer_fn_generic_mapping(
+        self,
+        fn_directive,
+        instr: Instruction_call,
+        vars_by_name: dict[str, Type | None],
+    ) -> dict[str, Type] | None:
+        fn_generics = getattr(fn_directive, "generics", [])
+        if not fn_generics:
+            return {}
+        if len(instr.args) != len(fn_directive.params):
+            return None
+
+        mapping: dict[str, Type] = {}
+        for arg, param in zip(instr.args, fn_directive.params, strict=True):
+            arg_t = self._var_type(vars_by_name, arg)
+            if arg_t is None:
+                return None
+            if not self._bind_generic_from_types(param.type, arg_t, mapping):
+                return None
+
+        out_t = self._var_type(vars_by_name, instr.var_out)
+        if out_t is not None:
+            if not self._bind_generic_from_types(fn_directive.ret_type, out_t, mapping):
+                return None
+
+        if any(g.name not in mapping for g in fn_generics):
+            return None
+        return mapping
+
+    def _bind_generic_from_types(self, template: Type, concrete: Type, mapping: dict[str, Type]) -> bool:
+        if isinstance(template, Pointer) and isinstance(concrete, Pointer):
+            return self._bind_generic_from_types(template.pointee, concrete.pointee, mapping)
+        if isinstance(template, Reference) and isinstance(concrete, Reference):
+            return self._bind_generic_from_types(template.pointee, concrete.pointee, mapping)
+
+        if not template.generics and template.name and template.name[0].isupper():
+            existed = mapping.get(template.name)
+            if existed is None:
+                mapping[template.name] = deepcopy(concrete)
+                return True
+            return self._types_compatible(existed, concrete)
+
+        if template.name != concrete.name:
+            return False
+        if len(template.generics) != len(concrete.generics):
+            return False
+        for t_g, c_g in zip(template.generics, concrete.generics, strict=True):
+            if not self._bind_generic_from_types(t_g, c_g, mapping):
+                return False
+        return True
 
     def _replace_generics_by_name(self, typ: Type, mapping: dict[str, Type]) -> Type:
         if isinstance(typ, Pointer):
@@ -471,6 +1253,35 @@ class Resolver:
         field_t = self._field_path_type(vars_by_name, instr.src, [instr.field, *instr.field_path])
         if field_t is None:
             return False
+        if as_ptr:
+            field_t = Pointer(field_t)
+        return self._set_var(vars_by_name, instr.var_out, field_t)
+
+    def _resolve_static_getfield(
+        self,
+        instr: Instruction_sgetfield | Instruction_sgetfieldptr,
+        vars_by_name: dict[str, Type | None],
+        as_ptr: bool,
+    ) -> bool:
+        src_t = self._var_type(vars_by_name, instr.src)
+        if src_t is None:
+            return False
+
+        owner_t = src_t.pointee if isinstance(src_t, (Reference, Pointer)) else src_t
+        decl = self.structs.get(owner_t.name)
+        if decl is None:
+            return False
+
+        field_decl = next((p for p in decl.params if p.name == instr.field.name), None)
+        if field_decl is None and instr.field.name.isdigit():
+            index = int(instr.field.name)
+            if 0 <= index < len(decl.params):
+                field_decl = decl.params[index]
+        if field_decl is None:
+            raise EhirCompileError(f"Unknown field '{instr.field.name}' for struct '{decl.name}'")
+
+        field_t = self._resolve_type(self._specialize_type(field_decl.type, decl.generics, owner_t.generics))
+        instr.field.type = field_t
         if as_ptr:
             field_t = Pointer(field_t)
         return self._set_var(vars_by_name, instr.var_out, field_t)
@@ -495,7 +1306,7 @@ class Resolver:
                 return None
             field = next((p for p in decl.params if p.name == seg.name), None)
             if field is None:
-                raise TypeError(f"Unknown field '{seg.name}' for struct '{decl.name}'")
+                raise EhirCompileError(f"Unknown field '{seg.name}' for struct '{decl.name}'")
             spec = self._specialize_type(field.type, decl.generics, current.generics)
             current = self._resolve_type(spec)
             seg.type = current
@@ -524,14 +1335,30 @@ class Resolver:
             vars_by_name[v.name] = t
             return True
         curr = self._resolve_type(curr)
+        curr_base = curr.name.rsplit("::", 1)[-1]
+        t_base = t.name.rsplit("::", 1)[-1]
         if curr.name == t.name:
             if not curr.generics and t.generics:
                 vars_by_name[v.name] = t
                 return True
             if curr.generics and not t.generics:
                 return False
+        if curr_base == t_base and len(curr.generics) == len(t.generics) and curr.generics:
+            can_specialize = True
+            for lhs_g, rhs_g in zip(curr.generics, t.generics):
+                lhs_g = self._resolve_type(lhs_g)
+                rhs_g = self._resolve_type(rhs_g)
+                if lhs_g == rhs_g:
+                    continue
+                if not self._contains_unbound_generic(lhs_g):
+                    can_specialize = False
+                    break
+            if can_specialize:
+                vars_by_name[v.name] = t
+                return True
         if not self._types_compatible(curr, t):
-            raise TypeError(f"Type mismatch: {curr} != {t} for '{v.name}'")
+            where = f" in fn '{self._current_fn_name}'" if self._current_fn_name else ""
+            raise EhirCompileError(f"Type mismatch: {curr} != {t} for '{v.name}'{where}", code="EHIR1201")
         return False
 
     def _unify_var(self, vars_by_name: dict[str, Type | None], v: Variable, t: Type) -> bool:
@@ -545,6 +1372,8 @@ class Resolver:
             if vt is not None and self._types_compatible(vt, expected.pointee):
                 return False
             return self._set_var(vars_by_name, v, Type("Box", [expected.pointee]))
+        if vt is not None and self._can_pass_as(vt, expected):
+            return False
         return self._set_var(vars_by_name, v, expected)
 
     def _unify_pair(self, vars_by_name: dict[str, Type | None], a: Variable, b: Variable) -> bool:
@@ -555,7 +1384,7 @@ class Resolver:
         if tb is not None and ta is None:
             return self._set_var(vars_by_name, a, tb)
         if ta is not None and tb is not None and not self._types_compatible(ta, tb):
-            raise TypeError(f"Type mismatch: {ta} != {tb}")
+            raise EhirCompileError(f"Type mismatch: {ta} != {tb}", code="EHIR1201")
         return False
 
     def _var_type(self, vars_by_name: dict[str, Type | None], v: Variable) -> Type | None:
@@ -566,6 +1395,16 @@ class Resolver:
         rhs = self._resolve_type(rhs)
         if lhs == rhs:
             return True
+        if is_box_type(lhs):
+            expected_concrete = concrete_box_type_name(lhs.generics[0])
+            if rhs.name == expected_concrete and not rhs.generics:
+                return True
+        if is_box_type(rhs):
+            expected_concrete = concrete_box_type_name(rhs.generics[0])
+            if lhs.name == expected_concrete and not lhs.generics:
+                return True
+        if mangle_type_name(lhs) == mangle_type_name(rhs):
+            return True
         if not lhs.generics and lhs.name and lhs.name[0].isupper():
             return True
         if not rhs.generics and rhs.name and rhs.name[0].isupper():
@@ -574,7 +1413,9 @@ class Resolver:
             return lhs.pointee == rhs
         if isinstance(rhs, Reference):
             return rhs.pointee == lhs
-        if lhs.name == rhs.name:
+        lhs_base = lhs.name.split("::")[-1]
+        rhs_base = rhs.name.split("::")[-1]
+        if lhs.name == rhs.name or lhs_base == rhs_base:
             if not lhs.generics or not rhs.generics:
                 return True
             if len(lhs.generics) != len(rhs.generics):
@@ -582,10 +1423,41 @@ class Resolver:
             return all(self._types_compatible(a, b) for a, b in zip(lhs.generics, rhs.generics, strict=True))
         return False
 
+    def _can_pass_as(self, actual: Type, expected: Type) -> bool:
+        actual = self._resolve_type(actual)
+        expected = self._resolve_type(expected)
+        if self._types_compatible(actual, expected):
+            return True
+        if isinstance(actual, Usize_t) and isinstance(expected, Usize_t):
+            return self._primitive_bits(actual) <= self._primitive_bits(expected)
+        if isinstance(actual, Isize_t) and isinstance(expected, Isize_t):
+            return self._primitive_bits(actual) <= self._primitive_bits(expected)
+        if isinstance(actual, Float_t) and isinstance(expected, Float_t):
+            return actual.size <= expected.size
+        return False
+
+    def _primitive_bits(self, typ: Usize_t | Isize_t) -> int:
+        return 64 if typ.size is None else typ.size
+
+    def _contains_unbound_generic(self, typ: Type) -> bool:
+        typ = self._resolve_type(typ)
+        if isinstance(typ, Pointer):
+            return self._contains_unbound_generic(typ.pointee)
+        if isinstance(typ, Reference):
+            return self._contains_unbound_generic(typ.pointee)
+        is_symbolic = (
+            typ.name not in self.structs
+            and typ.name not in self.enums
+            and typ.name[:1].isupper()
+        )
+        if is_symbolic:
+            return True
+        return any(self._contains_unbound_generic(generic) for generic in typ.generics)
+
     def _must_get(self, vars_by_name: dict[str, Type | None], name: str, fn_name: str) -> Type:
         t = vars_by_name.get(name)
         if t is None:
-            raise TypeError(f"Unable to infer type of variable '{name}' in fn '{fn_name}'")
+            raise EhirCompileError(f"Unable to infer type of variable '{name}' in fn '{fn_name}'", code="EHIR1202")
         return t
 
     def _resolve_type(self, typ: Type) -> Type:
@@ -650,6 +1522,11 @@ class Resolver:
         s = text.strip()
         if not s:
             return None
+        if s.startswith("dyn "):
+            tail = s[4:].strip()
+            if not tail:
+                return None
+            return Type("dyn", [Type(tail)])
         if s.startswith("&"):
             inner = self._parse_type_text(s[1:])
             return Reference(inner) if inner is not None else None

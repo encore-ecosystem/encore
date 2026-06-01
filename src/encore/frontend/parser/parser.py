@@ -36,6 +36,7 @@ from ehir.core.instructions import (
     Instruction_switch,
     Instruction_xor,
 )
+from ehir.cfg import set_item_cfgs
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter
 from ehir.frontend.builtin.parser import Parser as EHIR_Parser
@@ -103,6 +104,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
     def _parse(self) -> list[s.Statement]:
         self._parsing_match_header = False
         self._parsing_control_flow_header = False
+        self._parsing_with_binding_expr = False
         self._ehir_parser = EHIR_Parser()
         while not self._is_at_end():
             self._parse_top_level()
@@ -112,10 +114,16 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         return LexerToken(type=TokenType.EOF, value="", line=0, column=0)
 
     def _parse_top_level(self):
+        attrs, cfgs = self._parse_metadata_directives()
         curr_token = self._peek_curr()
+        result_start = len(self._result)
 
         if curr_token.type == TokenType.KW_IMPL:
-            self._push(self._parse_impl())
+            if attrs:
+                raise TypeError("Function attributes are only allowed on fn/extern fn")
+            impl = self._parse_impl()
+            set_item_cfgs(impl, cfgs)
+            self._push(impl)
             return
 
         is_public = False
@@ -123,6 +131,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             self._safe_consume(TokenType.KW_PUB)
             is_public = True
             curr_token = self._peek_curr()
+
+        if attrs and curr_token.type not in (TokenType.KW_FN, TokenType.KW_EXTERN):
+            raise TypeError("Function attributes are only allowed on fn/extern fn")
 
         match curr_token.type:
             case TokenType.KW_IMPORT:
@@ -133,12 +144,28 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 self._parse_trait(is_public)
             case TokenType.KW_STRUCT:
                 self._push(self._parse_struct(is_public))
+            case TokenType.KW_LET:
+                self._push(self._parse_global_let(is_public))
             case TokenType.KW_FN:
-                self._parse_fn(is_public)
+                self._parse_fn(is_public, attrs)
             case TokenType.KW_EXTERN:
-                self._parse_extern(is_public)
+                self._parse_extern(is_public, attrs)
             case _:
                 raise NotImplementedError(f"{curr_token}")
+
+        for statement in self._result[result_start:]:
+            set_item_cfgs(statement, cfgs)
+
+    def _parse_global_let(self, is_public: bool) -> s.Statement_Global:
+        let_stmt = self._parse_let()
+        if let_stmt.is_mut:
+            raise TypeError("Global 'let' can not be mutable")
+        return s.Statement_Global(
+            is_public=is_public,
+            name=let_stmt.name,
+            type=let_stmt.type,
+            expr=let_stmt.expr,
+        )
 
     def _parse_import(self, is_pub: bool):
         self._safe_consume(TokenType.KW_IMPORT)
@@ -178,7 +205,10 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         body: list[s.FunctionSignature] = []
         self._safe_consume(TokenType.LEFT_BRACE)
         while self._peek_curr().type != TokenType.RIGHT_BRACE:
-            body.append(self._parse_function_signature())
+            attrs, cfgs = self._parse_metadata_directives()
+            method = self._parse_function_signature(attrs=attrs)
+            set_item_cfgs(method, cfgs)
+            body.append(method)
         self._safe_consume(TokenType.RIGHT_BRACE)
         self._push(s.Statement_Trait(is_public=is_public, name=name, generics=generics, body=body, bases=bases))
 
@@ -198,20 +228,22 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         if self._peek_curr().type == TokenType.LEFT_BRACE:
             self._safe_consume(TokenType.LEFT_BRACE)
             while self._peek_curr().type != TokenType.RIGHT_BRACE:
+                attrs, cfgs = self._parse_metadata_directives()
                 is_public = False
                 if self._peek_curr().type == TokenType.KW_PUB:
                     self._safe_consume(TokenType.KW_PUB)
                     is_public = True
 
-                sign = self._parse_function_signature(is_public)
+                sign = self._parse_function_signature(is_public, attrs=attrs)
                 fn_body = self._parse_block()
                 body.append(
-                    s.Statement_FunctionDefinition(
+                    fn_def := s.Statement_FunctionDefinition(
                         is_public=is_public,
                         signature=sign,
                         body=fn_body,
                     )
                 )
+                set_item_cfgs(fn_def, cfgs)
             self._safe_consume(TokenType.RIGHT_BRACE)
 
         return s.Statement_Impl(
@@ -228,8 +260,8 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         signature = self._parse_struct_signature()
         return s.Statement_StructureDefinition(is_public=is_public, signature=signature)
 
-    def _parse_fn(self, is_public: bool):
-        sign = self._parse_function_signature()
+    def _parse_fn(self, is_public: bool, attrs: list[str]):
+        sign = self._parse_function_signature(is_public, attrs=attrs)
         body = self._parse_block()
         self._push(
             s.Statement_FunctionDefinition(
@@ -239,8 +271,8 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             )
         )
 
-    def _parse_extern(self, is_public: bool):
-        self._push(self._parse_function_signature(is_public))
+    def _parse_extern(self, is_public: bool, attrs: list[str]):
+        self._push(self._parse_function_signature(is_public, attrs=attrs))
 
     def _parse_import_path(self, default_leaf_kind: s.Statement_Import.ImportKind) -> s.Statement_Import.ImportPair:
         module = self._safe_consume(TokenType.IDENTIFIER).value
@@ -321,7 +353,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             case _:
                 return s.UnitStructureDefinition(name=name, generics=generics)
 
-    def _parse_function_signature(self, is_public: bool = False) -> s.FunctionSignature:
+    def _parse_function_signature(self, is_public: bool = False, *, attrs: list[str] | None = None) -> s.FunctionSignature:
+        attrs_list = list(attrs) if attrs is not None else []
+
         is_extern = False
         if self._peek_curr().type == TokenType.KW_EXTERN:
             self._safe_consume(TokenType.KW_EXTERN)
@@ -347,8 +381,63 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             fn_type = self._parse_type()
 
         return s.FunctionSignature(
-            is_public=is_public, is_extern=is_extern, name=func_name, generics=generics, params=params, type=fn_type
+            is_public=is_public,
+            attrs=attrs_list,
+            is_extern=is_extern,
+            name=func_name,
+            generics=generics,
+            params=params,
+            type=fn_type,
         )
+
+    def _parse_function_attrs(self) -> list[str]:
+        attrs, cfgs = self._parse_metadata_directives()
+        if cfgs:
+            raise TypeError("#cfg(...) is only valid for declarations")
+        return attrs
+
+    def _parse_metadata_directives(self) -> tuple[list[str], list[str]]:
+        attrs: list[str] = []
+        cfgs: list[str] = []
+        while self._peek_curr().type == TokenType.HASH:
+            self._safe_consume(TokenType.HASH)
+            directive = self._safe_consume(TokenType.IDENTIFIER).value
+            if directive == "attr":
+                attrs.extend(self._parse_attr_args())
+                continue
+            if directive == "cfg":
+                cfgs.append(self._parse_cfg_args())
+                continue
+            raise TypeError(f"Unsupported attribute directive '#{directive}', expected '#attr(...)' or '#cfg(...)'")
+
+        return attrs, cfgs
+
+    def _parse_attr_args(self) -> list[str]:
+        attrs: list[str] = []
+        self._safe_consume(TokenType.LEFT_PAREN)
+        attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
+        while self._peek_curr().type == TokenType.COMMA:
+            self._safe_consume(TokenType.COMMA)
+            attrs.append(self._safe_consume(TokenType.IDENTIFIER).value)
+        self._safe_consume(TokenType.RIGHT_PAREN)
+        return attrs
+
+    def _parse_cfg_args(self) -> str:
+        self._safe_consume(TokenType.LEFT_PAREN)
+        depth = 1
+        parts: list[str] = []
+        while depth > 0:
+            if self._is_at_end():
+                raise TypeError("Unclosed #cfg(...)")
+            token = self._consume()
+            if token.type == TokenType.LEFT_PAREN:
+                depth += 1
+            elif token.type == TokenType.RIGHT_PAREN:
+                depth -= 1
+                if depth == 0:
+                    break
+            parts.append(token.value)
+        return "".join(parts)
 
     def _parse_block(self) -> s.Block:
         self._safe_consume(TokenType.LEFT_BRACE)
@@ -368,6 +457,10 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 return self._parse_let()
             case TokenType.KW_DO:
                 return self._parse_do_while()
+            case TokenType.KW_WITH:
+                return self._parse_with()
+            case TokenType.KW_FOR:
+                return self._parse_for()
             case TokenType.KW_WHILE:
                 return self._parse_while()
             case TokenType.KW_LOOP:
@@ -386,7 +479,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 return self._parse_break()
             case TokenType.KW_CONTINUE:
                 return self._parse_continue()
-            case TokenType.IDENTIFIER:
+            case _:
+                if not self._starts_statement_expression(curr_token.type):
+                    raise NotImplementedError(curr_token)
                 target = self._parse_expression()
                 match self._peek_curr().type:
                     case (
@@ -399,8 +494,27 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                         return self._parse_assignment(target)
                     case _:
                         return s.Statement_Expr(target)
-            case _:
-                raise NotImplementedError(curr_token)
+
+    def _starts_statement_expression(self, token_type: TokenType) -> bool:
+        return token_type in {
+            TokenType.IDENTIFIER,
+            TokenType.INTEGER,
+            TokenType.FLOAT,
+            TokenType.BOOLEAN,
+            TokenType.STRING,
+            TokenType.LEFT_PAREN,
+            TokenType.LEFT_BRACKET,
+            TokenType.LEFT_BRACE,
+            TokenType.KW_MATCH,
+            TokenType.KW_IF,
+            TokenType.KW_UNSAFE,
+            TokenType.PLUS,
+            TokenType.MINUS,
+            TokenType.BANG,
+            TokenType.TILDE,
+            TokenType.INCREMENT,
+            TokenType.DECREMENT,
+        }
 
     def _parse_ret(self) -> s.Statement_Ret:
         self._safe_consume(TokenType.KW_RET)
@@ -440,6 +554,26 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         expr = self._parse_expression()
         self._parsing_control_flow_header = False
         return s.Statement_DoWhile(body, expr)
+
+    def _parse_for(self) -> s.Statement_For:
+        self._safe_consume(TokenType.KW_FOR)
+        item_name = self._safe_consume(TokenType.IDENTIFIER).value
+        self._safe_consume(TokenType.KW_IN)
+        self._parsing_control_flow_header = True
+        iterable_expr = self._parse_expression()
+        self._parsing_control_flow_header = False
+        body = self._parse_block()
+        return s.Statement_For(name=item_name, iterable=iterable_expr, body=body)
+
+    def _parse_with(self) -> s.Statement_With:
+        self._safe_consume(TokenType.KW_WITH)
+        self._parsing_with_binding_expr = True
+        expr = self._parse_expression()
+        self._parsing_with_binding_expr = False
+        self._safe_consume(TokenType.KW_AS)
+        name = self._safe_consume(TokenType.IDENTIFIER).value
+        body = self._parse_block()
+        return s.Statement_With(expr=expr, name=name, body=body)
 
     def _parse_if_block(self):
         branches, else_body = self._parse_if_common(
@@ -586,7 +720,16 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         return self._parse_expression()
 
     def _parse_expression(self) -> s.Statement_Expression:
-        return self._parse_logical_or()
+        return self._parse_range()
+
+    def _parse_range(self) -> s.Statement_Expression:
+        left = self._parse_logical_or()
+        token = self._peek_curr()
+        if token.type not in {TokenType.DOT_DOT, TokenType.DOT_DOT_EQUAL}:
+            return left
+        self._consume()
+        right = self._parse_logical_or()
+        return s.Expression_Range(start=left, end=right, inclusive=(token.type == TokenType.DOT_DOT_EQUAL))
 
     def _parse_logical_or(self) -> s.Statement_Expression:
         left = self._parse_logical_and()
@@ -693,15 +836,23 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         return left
 
     def _parse_multiplicative(self) -> s.Statement_Expression:
-        left = self._parse_unary()
+        left = self._parse_cast()
         while True:
             operator = self._peek_curr()
             if operator.type not in {TokenType.ASTERISK, TokenType.SLASH, TokenType.PERCENT}:
                 break
             self._consume()
-            right = self._parse_unary()
+            right = self._parse_cast()
             left = s.BinaryOperation_Multiplicative(lhs=left, operator=operator.value, rhs=right)
         return left
+
+    def _parse_cast(self) -> s.Statement_Expression:
+        expr = self._parse_unary()
+        while self._peek_curr().type == TokenType.KW_AS and not self._parsing_with_binding_expr:
+            self._safe_consume(TokenType.KW_AS)
+            target = self._parse_type()
+            expr = s.Expression_Cast(expr=expr, target=target)
+        return expr
 
     def _parse_unary(self) -> s.Statement_Expression:
         tok = self._peek_curr()
@@ -743,7 +894,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             break
         return expr
 
-    def _parse_integer_literal(self) -> s.Expression_IntegerLiteral:
+    def _parse_integer_literal(self) -> s.Expression_IntegerLiteral | s.Expression_FloatLiteral:
         value = self._safe_consume(TokenType.INTEGER).value
         literal_type = self._parse_numeric_literal_suffix()
         if literal_type is not None and self._is_float_type_name(literal_type.name):
@@ -759,8 +910,37 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     def _parse_string_literal(self) -> s.Expression_StringLiteral:
         raw = self._safe_consume(TokenType.STRING).value
-        unescape = bytes(raw[1:-1], "utf-8").decode("unicode_escape")
-        return s.Expression_StringLiteral(unescape)
+        return s.Expression_StringLiteral(self._unescape_string_literal(raw[1:-1]))
+
+    def _unescape_string_literal(self, raw: str) -> str:
+        out: list[str] = []
+        i = 0
+        while i < len(raw):
+            ch = raw[i]
+            if ch != "\\":
+                out.append(ch)
+                i += 1
+                continue
+            if i + 1 >= len(raw):
+                out.append("\\")
+                break
+            nxt = raw[i + 1]
+            if nxt == "n":
+                out.append("\n")
+            elif nxt == "t":
+                out.append("\t")
+            elif nxt == "r":
+                out.append("\r")
+            elif nxt == "\\":
+                out.append("\\")
+            elif nxt == '"':
+                out.append('"')
+            else:
+                # Keep unknown escapes verbatim.
+                out.append("\\")
+                out.append(nxt)
+            i += 2
+        return "".join(out)
 
     def _parse_parenthesized_or_tuple(self) -> s.Statement_Expression:
         self._safe_consume(TokenType.LEFT_PAREN)
@@ -833,6 +1013,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             TokenType.KW_LET,
             TokenType.KW_RET,
             TokenType.KW_WHILE,
+            TokenType.KW_WITH,
             TokenType.KW_LOOP,
             TokenType.KW_DO,
             TokenType.KW_EHIR,

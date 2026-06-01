@@ -3,21 +3,27 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import fields, is_dataclass, replace
 
-from ehir.core.derectives import Derective_enum, Derective_fn, Derective_struct
+from ehir.core.derectives import Derective_enum, Derective_fn, Derective_impl, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import Instruction_call, Instruction_wraps
 from ehir.core.primitives.base import Primitive, PrimitiveType
 from ehir.core.struct import Struct
-from ehir.core.type import Pointer, Reference, Type, mangle_type_name
-
-
-def _box_concrete_name(inner: Type) -> str:
-    return f"__Box_{mangle_type_name(inner)}"
+from ehir.core.type import Pointer, Reference, Type, concrete_box_type_name, mangle_type_name
 
 
 class MonomorphizationPass:
     _GENERIC_MONO_PASSES = 4
+
+    @staticmethod
+    def _generic_clone_name(fn_name: str, signature: str) -> str:
+        # Use a dedicated marker to avoid collisions with user-authored names
+        # like `foo__T` and to prevent accidental self-recursion after rewrite.
+        return f"{fn_name}__mono__{signature}"
+
+    @staticmethod
+    def _is_box_template_method_name(name: str) -> bool:
+        return name.startswith("Box[T]::") or name.startswith("Box::")
 
     def run(self, ast: list[Derective]) -> list[Derective]:
         box_struct = next((d for d in ast if isinstance(d, Derective_struct) and d.name == "Box" and d.generics), None)
@@ -25,13 +31,13 @@ class MonomorphizationPass:
             out = ast
             for _ in range(self._GENERIC_MONO_PASSES):
                 out = self._monomorphize_generic_functions(out)
-            return out
+            return self._prune_unreferenced_generic_functions(out)
 
         box_methods = [
             d
             for d in ast
             if isinstance(d, Derective_fn)
-            and d.name.startswith("Box[T]::")
+            and self._is_box_template_method_name(d.name)
         ]
 
         concrete_box_types = self._collect_concrete_box_types(ast)
@@ -39,11 +45,11 @@ class MonomorphizationPass:
             out = ast
             for _ in range(self._GENERIC_MONO_PASSES):
                 out = self._monomorphize_generic_functions(out)
-            return out
+            return self._prune_unreferenced_generic_functions(out)
 
         new_nodes: list[Derective] = []
         for concrete in concrete_box_types:
-            concrete_name = _box_concrete_name(concrete)
+            concrete_name = concrete_box_type_name(concrete)
             mapping = {"T": concrete}
 
             # Struct __Box_<T>
@@ -92,9 +98,7 @@ class MonomorphizationPass:
         for d in ast:
             if isinstance(d, Derective_fn) and d.name.endswith("::from_stack"):
                 continue
-            if isinstance(d, Derective_struct) and d.name == "Box" and d.generics:
-                continue
-            if isinstance(d, Derective_fn) and d.name.startswith("Box[T]::"):
+            if isinstance(d, Derective_fn) and self._is_box_template_method_name(d.name):
                 continue
             filtered.append(d)
         new_nodes = [d for d in new_nodes if not (isinstance(d, Derective_fn) and d.name.endswith("::from_stack"))]
@@ -102,7 +106,45 @@ class MonomorphizationPass:
         out = filtered
         for _ in range(self._GENERIC_MONO_PASSES):
             out = self._monomorphize_generic_functions(out)
-        return out
+        return self._prune_unreferenced_generic_functions(out)
+
+    def _prune_unreferenced_generic_functions(self, ast: list[Derective]) -> list[Derective]:
+        referenced_fn_names: set[str] = set()
+        for item in self._walk(ast):
+            if isinstance(item, Instruction_call):
+                referenced_fn_names.add(item.fn_name)
+        pruned: list[Derective] = []
+        for directive in ast:
+            if isinstance(directive, Derective_fn):
+                if self._is_unresolved_template_fn(directive) and directive.name not in referenced_fn_names:
+                    continue
+                pruned.append(directive)
+                continue
+
+            if isinstance(directive, Derective_impl):
+                kept_methods: list[Derective_fn] = []
+                for method in directive.methods:
+                    if self._is_unresolved_template_fn(method):
+                        continue
+                    kept_methods.append(method)
+                if not kept_methods and directive.generics:
+                    continue
+                pruned.append(replace(directive, methods=kept_methods))
+                continue
+
+            pruned.append(directive)
+
+        return pruned
+
+    def _is_unresolved_template_fn(self, fn: Derective_fn) -> bool:
+        if fn.generics:
+            return True
+        if self._is_placeholder_type(fn.ret_type):
+            return True
+        for param in fn.params:
+            if self._is_placeholder_type(param.type):
+                return True
+        return False
 
     def _monomorphize_generic_functions(self, ast: list[Derective]) -> list[Derective]:
         fn_by_name = {d.name: d for d in ast if isinstance(d, Derective_fn)}
@@ -114,6 +156,8 @@ class MonomorphizationPass:
             if target is None or not target.generics or not item.generics:
                 continue
             if len(target.generics) != len(item.generics):
+                continue
+            if any(self._is_placeholder_type(generic) for generic in item.generics):
                 continue
             signature = ",".join(mangle_type_name(generic) for generic in item.generics)
             call_specs.setdefault(item.fn_name, {})[signature] = [deepcopy(generic) for generic in item.generics]
@@ -134,7 +178,7 @@ class MonomorphizationPass:
                 }
                 clone = deepcopy(template)
                 clone.generics = []
-                clone.name = f"{template.name}__{signature}"
+                clone.name = self._generic_clone_name(template.name, signature)
                 clone = self._rewrite_types(clone, mapping)
                 clones.append(clone)
                 renames[(fn_name, signature)] = clone.name
@@ -146,6 +190,7 @@ class MonomorphizationPass:
         for directive in ast:
             rewritten.append(self._rewrite_generic_calls(directive, renames))
         rewritten.extend(self._rewrite_generic_calls(clone, renames) for clone in clones)
+
         return rewritten
 
     def _rewrite_generic_calls(self, value, renames: dict[tuple[str, str], str]):
@@ -218,7 +263,7 @@ class MonomorphizationPass:
     def _is_placeholder_type(self, typ: Type) -> bool:
         if isinstance(typ, (Pointer, Reference)):
             return self._is_placeholder_type(typ.pointee)
-        if not typ.generics and typ.name in {"T", "Self"}:
+        if not typ.generics and (typ.name in {"T", "Self"} or (len(typ.name) == 1 and typ.name.isupper())):
             return True
         return any(self._is_placeholder_type(generic) for generic in typ.generics)
 
@@ -283,9 +328,16 @@ class MonomorphizationPass:
         if not is_dataclass(value):
             return value
         if isinstance(value, Struct) and value.name == "Box" and len(value.generics) == 1:
+            inner = self._rewrite_box_type(value.generics[0])
+            if self._is_placeholder_type(inner):
+                return replace(
+                    value,
+                    name="Box",
+                    generics=[inner],
+                )
             return replace(
                 value,
-                name=_box_concrete_name(self._rewrite_box_type(value.generics[0])),
+                name=concrete_box_type_name(inner),
                 generics=[],
             )
         return replace(
@@ -323,7 +375,7 @@ class MonomorphizationPass:
 
     def _rewrite_box_call_names(self, ast: list[Derective]) -> None:
         for item in self._walk(ast):
-            if isinstance(item, Instruction_call) and item.fn_name.startswith("Box[T]::"):
+            if isinstance(item, Instruction_call) and self._is_box_template_method_name(item.fn_name):
                 method = item.fn_name.rsplit("::", 1)[-1]
                 owner = self._infer_call_owner(item)
                 if owner is not None:
@@ -344,8 +396,10 @@ class MonomorphizationPass:
         if isinstance(typ, Reference):
             return Reference(self._rewrite_box_type(typ.pointee))
         rewritten_generics = [self._rewrite_box_type(g) for g in typ.generics]
+        if rewritten_generics and any(self._is_placeholder_type(generic) for generic in rewritten_generics):
+            return Type(typ.name, rewritten_generics)
         if typ.name == "Box" and len(rewritten_generics) == 1:
-            return Type(_box_concrete_name(rewritten_generics[0]))
+            return Type(concrete_box_type_name(rewritten_generics[0]))
         return Type(typ.name, rewritten_generics)
 
     def _rewrite_enum_type(self, typ: Type, enum_names: set[str]) -> Type:

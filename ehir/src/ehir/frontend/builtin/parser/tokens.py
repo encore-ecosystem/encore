@@ -86,6 +86,7 @@ class TokenType(Enum):
     KW_LOAD = auto()
     KW_STORE = auto()
     KW_HFREE = auto()
+    KW_DROP = auto()
 
     # Operators
     PLUS = auto()

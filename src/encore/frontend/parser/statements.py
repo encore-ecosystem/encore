@@ -86,6 +86,7 @@ class Statement_Import(Statement_TopLevel):
 
 @dataclass
 class FunctionSignature(Statement_TopLevel):
+    attrs: list[str]
     is_extern: bool
     name: str
     generics: list[Type]
@@ -93,10 +94,11 @@ class FunctionSignature(Statement_TopLevel):
     type: Type | None
 
     def __repr__(self) -> str:
+        attrs_repr = "".join(f"#attr({attr})\n" for attr in self.attrs)
         extern_repr = "extern " if self.is_extern else ""
         generics_repr = format_generic_params(self.generics)
         type_repr = f"-> {self.type}" if self.type else ""
-        return f"{extern_repr}fn {self.name}{generics_repr}({', '.join(str(p) for p in self.params)}){type_repr}"
+        return f"{attrs_repr}{extern_repr}fn {self.name}{generics_repr}({', '.join(str(p) for p in self.params)}){type_repr}"
 
 
 @dataclass
@@ -228,6 +230,17 @@ class Statement_InnerLevel(Statement):
 
 
 @dataclass
+class Statement_Global(Statement_TopLevel):
+    name: str
+    type: Type | None
+    expr: "Statement_Expression"
+
+    def __repr__(self) -> str:
+        type_repr = f" : {self.type}" if self.type else ""
+        return f"{super().__repr__()}let {self.name}{type_repr} = {self.expr}"
+
+
+@dataclass
 class Statement_OneLineComment(Statement_TopLevel, Statement_InnerLevel):
     value: str
 
@@ -284,6 +297,26 @@ class Statement_DoWhile(Statement_InnerLevel):
 
     def __repr__(self) -> str:
         return f"do {self.body} while {self.expr}"
+
+
+@dataclass
+class Statement_For(Statement_InnerLevel):
+    name: str
+    iterable: "Statement_Expression"
+    body: "Block"
+
+    def __repr__(self) -> str:
+        return f"for {self.name} in {self.iterable} {self.body}"
+
+
+@dataclass
+class Statement_With(Statement_InnerLevel):
+    expr: "Statement_Expression"
+    name: str
+    body: "Block"
+
+    def __repr__(self) -> str:
+        return f"with {self.expr} as {self.name} {self.body}"
 
 
 @dataclass
@@ -603,6 +636,17 @@ class Expression_Unsafe(Statement_Expression):
 
 # =============
 @dataclass
+class Expression_Range(Statement_Expression):
+    start: Statement_Expression
+    end: Statement_Expression
+    inclusive: bool
+
+    def __repr__(self) -> str:
+        op = "..=" if self.inclusive else ".."
+        return f"{self.start}{op}{self.end}"
+
+
+@dataclass
 class Expression_BinaryOperation(Statement_Expression):
     lhs: Statement_Expression
     operator: str
@@ -688,6 +732,15 @@ class Expression_Try(Statement_Expression):
 
     def __repr__(self) -> str:
         return f"{self.expr}?"
+
+
+@dataclass
+class Expression_Cast(Statement_Expression):
+    expr: Statement_Expression
+    target: Type
+
+    def __repr__(self) -> str:
+        return f"{self.expr} as {self.target}"
 
 
 # =============

@@ -2,13 +2,21 @@ from dataclasses import fields, is_dataclass
 
 from ehir.core.derectives import Derective_enum, Derective_extern_fn, Derective_fn, Derective_impl, Derective_struct, Derective_trait
 from ehir.core.derectives.base import Derective
-from ehir.core.instructions import Instruction_call
+from ehir.core.instructions import Instruction_call, Instruction_callvoid
 from ehir.core.primitives.base import PrimitiveType
 from ehir.core.type import Pointer, Reference, Type
 
 
 class UnneededSymbolsStripper:
     def run(self, ast: list[Derective], *, keep_public_api: bool = True) -> list[Derective]:
+        public_type_names: set[str] = set()
+        if keep_public_api:
+            for directive in ast:
+                if isinstance(directive, (Derective_struct, Derective_enum, Derective_trait)) and getattr(
+                    directive, "is_public", False
+                ):
+                    public_type_names.add(directive.name)
+
         fns = {directive.name: directive for directive in ast if isinstance(directive, Derective_fn)}
         for directive in ast:
             if isinstance(directive, Derective_impl):
@@ -27,6 +35,13 @@ class UnneededSymbolsStripper:
                 or (keep_public_api and getattr(directive, "is_public", False))
             )
         }
+        if keep_public_api:
+            for directive in ast:
+                if not isinstance(directive, Derective_impl):
+                    continue
+                for method in directive.methods:
+                    reachable_fns.add(method.name)
+
         extern_fns = {directive.name for directive in ast if isinstance(directive, Derective_extern_fn)}
 
         pending = list(reachable_fns)
@@ -36,10 +51,30 @@ class UnneededSymbolsStripper:
             if fn is None:
                 continue
             for call_name in self._collect_called_function_names(fn):
+                if call_name.startswith("__dyn_dispatch__"):
+                    payload = call_name[len("__dyn_dispatch__") :]
+                    if "::" in payload:
+                        trait_name, method_name = payload.rsplit("::", 1)
+                        method_prefix = f"{trait_name}::{method_name}"
+                        for candidate_name in fns:
+                            if not candidate_name.startswith(method_prefix):
+                                continue
+                            tail = candidate_name[len(method_prefix) :]
+                            if tail and not tail.startswith("__"):
+                                continue
+                            if candidate_name not in reachable_fns:
+                                reachable_fns.add(candidate_name)
+                                pending.append(candidate_name)
+                    continue
                 canonical_call_name = emitted_to_fn.get(call_name, call_name)
-                canonical_call_name = normalized_to_fn.get(
-                    self._normalize_fn_lookup_name(canonical_call_name), canonical_call_name
-                )
+                normalized_call_name = self._normalize_fn_lookup_name(canonical_call_name)
+                canonical_call_name = normalized_to_fn.get(normalized_call_name, canonical_call_name)
+                if canonical_call_name not in fns and canonical_call_name not in extern_fns:
+                    unsuffixed_name = self._strip_method_receiver_suffix(canonical_call_name)
+                    canonical_call_name = normalized_to_fn.get(
+                        self._normalize_fn_lookup_name(unsuffixed_name),
+                        canonical_call_name,
+                    )
                 if canonical_call_name in extern_fns and canonical_call_name not in reachable_fns:
                     reachable_fns.add(canonical_call_name)
                     continue
@@ -49,13 +84,7 @@ class UnneededSymbolsStripper:
 
         reachable_types = set()
         if keep_public_api:
-            for directive in ast:
-                if isinstance(directive, Derective_struct) and getattr(directive, "is_public", False):
-                    reachable_types.add(directive.name)
-                elif isinstance(directive, Derective_enum) and getattr(directive, "is_public", False):
-                    reachable_types.add(directive.name)
-                elif isinstance(directive, Derective_trait) and getattr(directive, "is_public", False):
-                    reachable_types.add(directive.name)
+            reachable_types.update(public_type_names)
 
         for directive in ast:
             if isinstance(directive, (Derective_extern_fn, Derective_fn)) and directive.name in reachable_fns:
@@ -67,18 +96,11 @@ class UnneededSymbolsStripper:
                 continue
             if isinstance(directive, Derective_fn) and directive.name not in reachable_fns:
                 continue
-            if isinstance(directive, Derective_struct):
-                is_public = getattr(directive, "is_public", False)
-                if directive.name not in reachable_types and not (keep_public_api and is_public):
-                    continue
-            if isinstance(directive, Derective_enum):
-                is_public = getattr(directive, "is_public", False)
-                if directive.name not in reachable_types and not (keep_public_api and is_public):
-                    continue
-            if isinstance(directive, Derective_trait):
-                is_public = getattr(directive, "is_public", False)
-                if directive.name not in reachable_types and not (keep_public_api and is_public):
-                    continue
+            # Keep all type declarations. Aggressive type stripping can break lowered
+            # layout contracts when instructions still reference a type by name.
+            if isinstance(directive, (Derective_struct, Derective_enum, Derective_trait)):
+                result.append(directive)
+                continue
             if isinstance(directive, Derective_impl):
                 if not self._impl_is_reachable(directive, reachable_fns, reachable_types):
                     continue
@@ -93,7 +115,7 @@ class UnneededSymbolsStripper:
     def _collect_called_function_names(self, value) -> set[str]:
         calls: set[str] = set()
         for item in self._walk(value):
-            if isinstance(item, Instruction_call):
+            if isinstance(item, (Instruction_call, Instruction_callvoid)):
                 calls.add(item.fn_name)
         return calls
 
@@ -152,3 +174,15 @@ class UnneededSymbolsStripper:
         owner_name = owner_text.split("[", 1)[0]
         method = method_name.split("[", 1)[0]
         return f"{owner_name}::{method}"
+
+    def _strip_method_receiver_suffix(self, name: str) -> str:
+        text = name
+        if text.startswith("[") and "]" in text:
+            text = text.split("]", 1)[1]
+        if "::" not in text:
+            return text
+        owner_text, method_name = text.rsplit("::", 1)
+        method = method_name.split("[", 1)[0]
+        if "__" not in method:
+            return f"{owner_text}::{method}"
+        return f"{owner_text}::{method.split('__', 1)[0]}"

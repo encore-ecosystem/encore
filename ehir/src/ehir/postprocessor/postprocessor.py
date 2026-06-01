@@ -8,6 +8,7 @@ from ehir.core.instructions import (
     Instruction_and,
     Instruction_br,
     Instruction_call,
+    Instruction_callvoid,
     Instruction_capprim,
     Instruction_cbr,
     Instruction_div,
@@ -40,6 +41,7 @@ from ehir.core.instructions import (
 )
 from ehir.core.instructions.base import Instruction
 from ehir.core.primitives import Usize_t
+from ehir.core.type import Type
 from ehir.core.variable import TypedVariable
 from ehir.postprocessor.instructions import (
     ProcessedControlFlow,
@@ -48,6 +50,7 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_and,
     ProcessedInstruction_br,
     ProcessedInstruction_call,
+    ProcessedInstruction_callvoid,
     ProcessedInstruction_cbr,
     ProcessedInstruction_div,
     ProcessedInstruction_gep,
@@ -108,12 +111,17 @@ class Postprocessor:
             "str",
             "void",
         }
+        self._fn_ret_by_emitted_name: dict[str, Type] = {}
+        for derective in raw_mod.ast:
+            if isinstance(derective, (Normalized_fn, Derective_extern_fn)):
+                emitted_name = self._emit_symbol_name(derective.name, [param.type for param in derective.params])
+                self._fn_ret_by_emitted_name[emitted_name] = derective.ret_type
         mod = ProcessedModule(id=raw_mod.id, structs=[], funcs=[])
         for derective in raw_mod.ast:
             if isinstance(derective, Normalized_fn):
                 mod.funcs.append(
                     ProcessedDerective_fn(
-                        name=self._emit_symbol_name(derective.name),
+                        name=self._emit_symbol_name(derective.name, [param.type for param in derective.params]),
                         params=derective.params,
                         ret_type=derective.ret_type,
                         entry_block=self._validate_block(derective.entry_block),
@@ -124,7 +132,7 @@ class Postprocessor:
             elif isinstance(derective, Derective_extern_fn):
                 mod.funcs.append(
                     ProcessedDerective_extern_fn(
-                        name=self._emit_symbol_name(derective.name),
+                        name=self._emit_symbol_name(derective.name, [param.type for param in derective.params]),
                         params=derective.params,
                         ret_type=derective.ret_type,
                     )
@@ -168,15 +176,51 @@ class Postprocessor:
                 var=TypedVariable(instr.var.name, instr.var.type),
             )
         if isinstance(instr, Instruction_call):
-            assert instr.var_out.type
+            emitted_name = self._emit_symbol_name(instr.fn_name, [arg.type for arg in instr.args])
+            if instr.var_out.type is None:
+                inferred_ret = self._fn_ret_by_emitted_name.get(emitted_name)
+                if inferred_ret is not None:
+                    instr.var_out.type = inferred_ret
+            if instr.var_out.type is None:
+                hint = [
+                    key
+                    for key in self._fn_ret_by_emitted_name
+                    if key.startswith(instr.fn_name) or key.startswith(instr.fn_name + "__")
+                ][:5]
+                raise AssertionError(
+                    f"Instruction_call has unresolved output type: {instr}; emitted='{emitted_name}'; candidates={hint}"
+                )
             args = []
             for arg in instr.args:
-                assert arg.type
+                if arg.type is None:
+                    raise AssertionError(f"Instruction_call has unresolved argument type: {instr}")
                 args.append(TypedVariable(arg.name, arg.type))
             return ProcessedInstruction_call(
                 var_out=TypedVariable(instr.var_out.name, instr.var_out.type),
-                fn_name=self._emit_symbol_name(instr.fn_name),
+                fn_name=emitted_name,
                 args=args,
+            )
+        if isinstance(instr, Instruction_callvoid):
+            emitted_name = self._emit_symbol_name(instr.fn_name, [arg.type for arg in instr.args])
+            if emitted_name not in self._fn_ret_by_emitted_name:
+                hint = [key for key in self._fn_ret_by_emitted_name if key.startswith(instr.fn_name)][:5]
+                raise AssertionError(
+                    f"Instruction_callvoid has unresolved callee: {instr}; emitted='{emitted_name}'; candidates={hint}"
+                )
+            args = []
+            for arg in instr.args:
+                if arg.type is None:
+                    raise AssertionError(f"Instruction_callvoid has unresolved argument type: {instr}")
+                args.append(TypedVariable(arg.name, arg.type))
+            assign_to = None
+            if instr.assign_to is not None:
+                if instr.assign_to.type is None:
+                    raise AssertionError(f"Instruction_callvoid has unresolved assign target type: {instr}")
+                assign_to = TypedVariable(instr.assign_to.name, instr.assign_to.type)
+            return ProcessedInstruction_callvoid(
+                fn_name=emitted_name,
+                args=args,
+                assign_to=assign_to,
             )
 
         if isinstance(instr, Instruction_capprim):
@@ -265,14 +309,20 @@ class Postprocessor:
 
         raise NotImplementedError(term)
 
-    def _emit_symbol_name(self, name: str) -> str:
+    def _emit_symbol_name(self, name: str, arg_types: list[Type | None] | None = None) -> str:
         if "::" not in name:
-            return name
-
+            return name.split("[", 1)[0]
         owner_text, method_name = name.rsplit("::", 1)
         owner_name = owner_text.split("[", 1)[0]
         method_name = method_name.split("[", 1)[0]
-        return f"{owner_name}__{self._emit_method_name(method_name)}"
+        return f"{owner_name}::{method_name}"
+
+    def _mangle_type(self, typ: Type) -> str:
+        base = typ.name.split("[", 1)[0]
+        if typ.generics:
+            inner = "_".join(self._mangle_type(generic) for generic in typ.generics)
+            return f"{base}_{inner}"
+        return base.replace("::", "_")
 
     def _emit_method_name(self, method_name: str) -> str:
         if "__" in method_name:

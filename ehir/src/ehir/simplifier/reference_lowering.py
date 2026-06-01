@@ -66,7 +66,7 @@ class ReferenceLoweringPass:
                         )
                         new_body.append(
                             Instruction_call(
-                                var_out=TypedVariable(name=f".store_{instr.var.name}", type=Type("void")),
+                                var_out=TypedVariable(name=f".store_{instr.var.name}", type=deepcopy(pointee)),
                                 fn_name="Box[T]::store",
                                 generics=[],
                                 args=[deepcopy(instr.var), loaded],
