@@ -13,14 +13,20 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <direct.h>
 #include <io.h>
+#pragma comment(lib, "Ws2_32.lib")
 #else
 #include <sys/time.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <time.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
 #endif
 
 typedef struct {
@@ -324,6 +330,327 @@ int32_t __ehir_rt_io_write(int32_t fd, encore_str value) {
     size_t written = fwrite(value.ptr, 1, value.len, stream);
     fflush(stream);
     return written == value.len ? 0 : -1;
+}
+
+static char g_net_last_error[256] = {0};
+
+static void encore_set_net_error_cstr(const char *msg) {
+    if (msg == NULL) {
+        g_net_last_error[0] = '\0';
+        return;
+    }
+    snprintf(g_net_last_error, sizeof(g_net_last_error), "%s", msg);
+}
+
+static void encore_set_net_error_code(const char *prefix, int code) {
+    if (prefix == NULL) {
+        prefix = "net";
+    }
+#ifdef _WIN32
+    snprintf(g_net_last_error, sizeof(g_net_last_error), "%s: %d", prefix, code);
+#else
+    snprintf(g_net_last_error, sizeof(g_net_last_error), "%s: %s", prefix, strerror(code));
+#endif
+}
+
+encore_str __ehir_rt_net_last_error(void) {
+    if (g_net_last_error[0] == '\0') {
+        return encore_empty_str();
+    }
+    return encore_from_cstr_copy(g_net_last_error);
+}
+
+#ifdef _WIN32
+static bool g_winsock_initialized = false;
+
+static bool encore_net_init(void) {
+    if (g_winsock_initialized) {
+        return true;
+    }
+    WSADATA wsa_data;
+    int rc = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+    if (rc != 0) {
+        encore_set_net_error_code("WSAStartup failed", rc);
+        return false;
+    }
+    g_winsock_initialized = true;
+    return true;
+}
+
+static int encore_last_socket_error(void) {
+    return WSAGetLastError();
+}
+
+static int encore_close_socket(SOCKET fd) {
+    return closesocket(fd);
+}
+#else
+static bool encore_net_init(void) {
+    return true;
+}
+
+static int encore_last_socket_error(void) {
+    return errno;
+}
+
+static int encore_close_socket(int fd) {
+    return close(fd);
+}
+#endif
+
+static int32_t encore_parse_port(encore_str port_s) {
+    char *port_c = encore_to_cstr(port_s);
+    if (port_c == NULL) {
+        return -1;
+    }
+    char *end = NULL;
+    long parsed = strtol(port_c, &end, 10);
+    bool ok = end != NULL && *end == '\0' && parsed >= 0 && parsed <= 65535;
+    free(port_c);
+    if (!ok) {
+        return -1;
+    }
+    return (int32_t)parsed;
+}
+
+int32_t __ehir_rt_net_tcp_connect(encore_str addr) {
+    if (!encore_net_init()) {
+        return -1;
+    }
+
+    char *addr_c = encore_to_cstr(addr);
+    if (addr_c == NULL) {
+        encore_set_net_error_cstr("alloc failed");
+        return -1;
+    }
+
+    char *colon = strrchr(addr_c, ':');
+    if (colon == NULL) {
+        free(addr_c);
+        encore_set_net_error_cstr("invalid addr, expected host:port");
+        return -1;
+    }
+    *colon = '\0';
+    const char *host = addr_c;
+    encore_str port_s = {.ptr = colon + 1, .len = strlen(colon + 1)};
+    int32_t port = encore_parse_port(port_s);
+    if (port < 0) {
+        free(addr_c);
+        encore_set_net_error_cstr("invalid port");
+        return -1;
+    }
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_buf[16];
+    snprintf(port_buf, sizeof(port_buf), "%d", (int)port);
+    struct addrinfo *results = NULL;
+    int gai_rc = getaddrinfo(host, port_buf, &hints, &results);
+    if (gai_rc != 0 || results == NULL) {
+        free(addr_c);
+        encore_set_net_error_cstr("getaddrinfo failed");
+        return -1;
+    }
+
+    int32_t out_fd = -1;
+    for (struct addrinfo *it = results; it != NULL; it = it->ai_next) {
+#ifdef _WIN32
+        SOCKET fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (fd == INVALID_SOCKET) {
+            continue;
+        }
+        if (connect(fd, it->ai_addr, (int)it->ai_addrlen) == 0) {
+            out_fd = (int32_t)fd;
+            break;
+        }
+        encore_close_socket(fd);
+#else
+        int fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) {
+            out_fd = (int32_t)fd;
+            break;
+        }
+        encore_close_socket(fd);
+#endif
+    }
+    if (out_fd < 0) {
+        encore_set_net_error_code("connect failed", encore_last_socket_error());
+    }
+
+    freeaddrinfo(results);
+    free(addr_c);
+    return out_fd;
+}
+
+int32_t __ehir_rt_net_tcp_bind(encore_str addr) {
+    if (!encore_net_init()) {
+        return -1;
+    }
+
+    char *addr_c = encore_to_cstr(addr);
+    if (addr_c == NULL) {
+        encore_set_net_error_cstr("alloc failed");
+        return -1;
+    }
+    char *colon = strrchr(addr_c, ':');
+    if (colon == NULL) {
+        free(addr_c);
+        encore_set_net_error_cstr("invalid addr, expected host:port");
+        return -1;
+    }
+    *colon = '\0';
+    const char *host = addr_c;
+    encore_str port_s = {.ptr = colon + 1, .len = strlen(colon + 1)};
+    int32_t port = encore_parse_port(port_s);
+    if (port < 0) {
+        free(addr_c);
+        encore_set_net_error_cstr("invalid port");
+        return -1;
+    }
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    char port_buf[16];
+    snprintf(port_buf, sizeof(port_buf), "%d", (int)port);
+    struct addrinfo *results = NULL;
+    int gai_rc = getaddrinfo(host, port_buf, &hints, &results);
+    if (gai_rc != 0 || results == NULL) {
+        free(addr_c);
+        encore_set_net_error_cstr("getaddrinfo failed");
+        return -1;
+    }
+
+    int32_t out_fd = -1;
+    for (struct addrinfo *it = results; it != NULL; it = it->ai_next) {
+#ifdef _WIN32
+        SOCKET fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (fd == INVALID_SOCKET) {
+            continue;
+        }
+        BOOL reuse = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+        if (bind(fd, it->ai_addr, (int)it->ai_addrlen) == 0 && listen(fd, 64) == 0) {
+            out_fd = (int32_t)fd;
+            break;
+        }
+        encore_close_socket(fd);
+#else
+        int fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        int reuse = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        if (bind(fd, it->ai_addr, it->ai_addrlen) == 0 && listen(fd, 64) == 0) {
+            out_fd = (int32_t)fd;
+            break;
+        }
+        encore_close_socket(fd);
+#endif
+    }
+    if (out_fd < 0) {
+        encore_set_net_error_code("bind/listen failed", encore_last_socket_error());
+    }
+
+    freeaddrinfo(results);
+    free(addr_c);
+    return out_fd;
+}
+
+int32_t __ehir_rt_net_tcp_accept(int32_t listener_fd) {
+    if (!encore_net_init()) {
+        return -1;
+    }
+#ifdef _WIN32
+    SOCKET fd = accept((SOCKET)listener_fd, NULL, NULL);
+    if (fd == INVALID_SOCKET) {
+        encore_set_net_error_code("accept failed", encore_last_socket_error());
+        return -1;
+    }
+    return (int32_t)fd;
+#else
+    int fd = accept(listener_fd, NULL, NULL);
+    if (fd < 0) {
+        encore_set_net_error_code("accept failed", errno);
+        return -1;
+    }
+    return fd;
+#endif
+}
+
+encore_str __ehir_rt_net_tcp_read(int32_t fd, size_t max) {
+    if (max == 0) {
+        return encore_empty_str();
+    }
+    char *buffer = malloc(max + 1);
+    if (buffer == NULL) {
+        encore_set_net_error_cstr("alloc failed");
+        return encore_empty_str();
+    }
+#ifdef _WIN32
+    int n = recv((SOCKET)fd, buffer, (int)max, 0);
+    if (n < 0) {
+        free(buffer);
+        encore_set_net_error_code("recv failed", encore_last_socket_error());
+        return encore_empty_str();
+    }
+    return encore_from_owned_buffer(buffer, (size_t)n);
+#else
+    ssize_t n = recv(fd, buffer, max, 0);
+    if (n < 0) {
+        free(buffer);
+        encore_set_net_error_code("recv failed", errno);
+        return encore_empty_str();
+    }
+    return encore_from_owned_buffer(buffer, (size_t)n);
+#endif
+}
+
+int32_t __ehir_rt_net_tcp_write(int32_t fd, encore_str data) {
+    if (data.ptr == NULL && data.len > 0) {
+        encore_set_net_error_cstr("invalid data");
+        return -1;
+    }
+#ifdef _WIN32
+    int n = send((SOCKET)fd, data.ptr, (int)data.len, 0);
+    if (n < 0) {
+        encore_set_net_error_code("send failed", encore_last_socket_error());
+        return -1;
+    }
+    return n;
+#else
+    ssize_t n = send(fd, data.ptr, data.len, 0);
+    if (n < 0) {
+        encore_set_net_error_code("send failed", errno);
+        return -1;
+    }
+    return (int32_t)n;
+#endif
+}
+
+int32_t __ehir_rt_net_tcp_close(int32_t fd) {
+    int rc = encore_close_socket(
+#ifdef _WIN32
+        (SOCKET)fd
+#else
+        fd
+#endif
+    );
+    if (rc != 0) {
+        encore_set_net_error_code("close failed", encore_last_socket_error());
+        return -1;
+    }
+    return 0;
 }
 
 int32_t __ehir_rt_proc_exit(int32_t code) {
