@@ -149,6 +149,7 @@ class Translator:
     _structs: dict[str, Derective_struct]
     _traits: dict[str, s.Statement_Trait]
     _impl_traits: dict[str, list[str]]
+    _generic_impl_traits: list[tuple[list[Type], str]]
     _builder: EHIR_Builder
     _module: EHIR_Module
     _enum_payload_structs: dict[str, list[s.CLikeStructureDefinition]]
@@ -161,6 +162,8 @@ class Translator:
     _trait_aliases: dict[str, str]
     _active_generic_bounds: dict[str, list[Type]]
     _with_cleanup_stack: list[str]
+    _current_self_binding_type: Type | None
+    _current_impl_self_type: Type | None
 
     class _PreparedMatch:
         def __init__(
@@ -222,6 +225,7 @@ class Translator:
         self._extern_fns = {}
         self._traits = {}
         self._impl_traits = {}
+        self._generic_impl_traits = []
         self._unsafe_depth = 0
         self._enum_payload_structs = {}
         self._emitted_structs = set()
@@ -232,6 +236,8 @@ class Translator:
         self._type_aliases = {}
         self._trait_aliases = {}
         self._active_generic_bounds = {}
+        self._current_self_binding_type = None
+        self._current_impl_self_type = None
         self._global_exprs: dict[str, s.Statement_Expression] = {}
 
     def run(self, program: str) -> EHIR_Module:
@@ -344,7 +350,15 @@ class Translator:
                 struct_type = self._translate_type(statement.struct)
                 if statement.trait_name is not None:
                     resolved_trait_name = self._trait_aliases.get(statement.trait_name, statement.trait_name)
-                    self._impl_traits.setdefault(struct_type.name, []).append(resolved_trait_name)
+                    owner_generic = next(
+                        (generic for generic in statement.generics if generic.name == struct_type.name),
+                        None,
+                    )
+                    if owner_generic is not None:
+                        bounds = list(owner_generic.bounds) if isinstance(owner_generic, s.GenericParam) else []
+                        self._generic_impl_traits.append((bounds, resolved_trait_name))
+                    else:
+                        self._impl_traits.setdefault(struct_type.name, []).append(resolved_trait_name)
                     continue
 
                 for method in statement.body:
@@ -546,7 +560,8 @@ class Translator:
         def leaf_type_name(name: str) -> str:
             return base_type_name(name).rsplit("::", 1)[-1]
 
-        def impl_trait_names(type_name: str) -> list[str]:
+        def impl_trait_names(receiver: Type) -> list[str]:
+            type_name = receiver.name
             out = list(self._impl_traits.get(type_name, []))
             leaf = leaf_type_name(type_name)
             for owner_name, trait_names in self._impl_traits.items():
@@ -556,6 +571,11 @@ class Translator:
                     for trait_name in trait_names:
                         if trait_name not in out:
                             out.append(trait_name)
+            for bounds, trait_name in self._generic_impl_traits:
+                if not self._receiver_satisfies_bounds(receiver, bounds):
+                    continue
+                if trait_name not in out:
+                    out.append(trait_name)
             return out
 
         receiver_type = unwrap_for_storage(receiver_type)
@@ -588,7 +608,7 @@ class Translator:
             if matched_name in self._any_pointer_variants:
                 return matched_name, None
 
-        for trait_name in impl_trait_names(base_receiver_type.name):
+        for trait_name in impl_trait_names(base_receiver_type):
             signature = self._lookup_trait_method_signature(
                 trait_name,
                 method_name,
@@ -663,6 +683,41 @@ class Translator:
             f"inherent_name='{inherent_name}', suffix_matches={len(inherent_candidates)}, method_suffix_matches={len(similar)}"
         )
 
+    def _receiver_satisfies_bounds(self, receiver_type: Type, bounds: list[Type]) -> bool:
+        for bound in bounds:
+            if not self._type_satisfies_bound(receiver_type, bound):
+                return False
+        return True
+
+    def _type_satisfies_bound(self, concrete: Type, bound: Type) -> bool:
+        concrete = unwrap_for_storage(concrete)
+        if is_reference_like_type(concrete):
+            return self._type_satisfies_bound(concrete.pointee, bound)
+        if is_raw_pointer_type(concrete):
+            return self._type_satisfies_bound(concrete.pointee, bound)
+        for trait_name in self._impl_traits.get(concrete.name, []):
+            if self._trait_satisfies_bound(trait_name, bound):
+                return True
+        return False
+
+    def _trait_satisfies_bound(self, trait_name: str, required_bound: Type, seen: set[str] | None = None) -> bool:
+        if trait_name == required_bound.name or trait_name.endswith(f"::{required_bound.name}"):
+            return True
+
+        seen = seen or set()
+        if trait_name in seen:
+            return False
+        seen.add(trait_name)
+
+        trait = self._traits.get(trait_name)
+        if trait is None:
+            return False
+
+        for base in trait.bases:
+            if self._trait_satisfies_bound(base.name, required_bound, seen):
+                return True
+        return False
+
     def _callable_module_prefix(self, fn_name: str) -> str | None:
         parts = fn_name.split("::")
         if len(parts) < 3:
@@ -680,6 +735,13 @@ class Translator:
         module_prefix = self._callable_module_prefix(fn_name)
         if module_prefix is None:
             return typ
+
+        def is_generic_placeholder(name: str) -> bool:
+            if name in {"Self", "T"}:
+                return True
+            if len(name) == 1 and name.isupper():
+                return True
+            return len(name) > 1 and name.startswith("T") and name[1:].isdigit()
 
         def qualify(inner: Type) -> Type:
             if is_mutable_type(inner):
@@ -700,6 +762,7 @@ class Translator:
             if (
                 "::" not in name
                 and name not in generic_names
+                and not is_generic_placeholder(name)
                 and name not in BUILTIN_TYPE_NAMES
                 and not name.startswith("__tuple_")
             ):
@@ -878,6 +941,8 @@ class Translator:
         return derective
 
     def _translate_impl_definition(self, statement: s.Statement_Impl):
+        prev_impl_self_type = self._current_impl_self_type
+        self._current_impl_self_type = statement.struct
         if statement.trait_name is None:
             struct_type = self._translate_type(statement.struct)
             for method in statement.body:
@@ -918,6 +983,7 @@ class Translator:
                     fn = self._translate_nested_function_definition(namespaced_method)
                     self._module.ast.append(fn)
                     self._funcs[fn.name] = fn
+            self._current_impl_self_type = prev_impl_self_type
             return None
 
         methods = [
@@ -929,13 +995,15 @@ class Translator:
             )
             for method in statement.body
         ]
-        return self._builder.build_impl(
+        impl_directive = self._builder.build_impl(
             trait_name=self._trait_aliases.get(statement.trait_name, statement.trait_name),
             trait_args=[self._translate_type(arg) for arg in statement.trait_args],
             for_type=self._translate_type(statement.struct),
             generics=[self._translate_type(generic) for generic in statement.generics],
             methods=methods,
         )
+        self._current_impl_self_type = prev_impl_self_type
+        return impl_directive
 
     def _translate_function_definition(self, statement: s.Statement_FunctionDefinition):
         normalized_sig = self._normalize_signature(statement.signature)
@@ -999,6 +1067,7 @@ class Translator:
         prev_loop_stack = self._loop_stack
         prev_with_cleanup_stack = self._with_cleanup_stack
         prev_generic_bounds = self._active_generic_bounds
+        prev_self_binding_type = self._current_self_binding_type
 
         self._builder.current_function = fn
         self._builder.variables = {param.name: param for param in fn.params}
@@ -1016,6 +1085,7 @@ class Translator:
         self._builder.position_at_end(entry_block)
 
         source_param_types = {param.name: param.type for param in source_params}
+        self._current_self_binding_type = source_param_types.get("self")
         for param in fn.params:
             self._remember_source_type(param, source_param_types.get(param.name, param.type))
             if param.name in mutable_params:
@@ -1044,6 +1114,7 @@ class Translator:
         self._loop_stack = prev_loop_stack
         self._with_cleanup_stack = prev_with_cleanup_stack
         self._active_generic_bounds = prev_generic_bounds
+        self._current_self_binding_type = prev_self_binding_type
 
     def _register_source_signature(self, signature: s.FunctionSignature):
         self._source_signatures[signature.name] = signature
@@ -2264,7 +2335,10 @@ class Translator:
             return self._translate_struct_initialization(self._translate_type(array_type), args, name)
 
         elif isinstance(expr, s.Expression_StructInitialization):
-            field_types = self._lookup_struct_field_types(expr.name)
+            self_hint = self._current_self_binding_type or self._current_impl_self_type
+            current_self_type = self._resolve_self_type(self_hint)
+            struct_type = self._resolve_self_in_type(expr.name, current_self_type)
+            field_types = self._lookup_struct_field_types(struct_type)
             args = [
                 self._translate_expression(
                     arg_exp,
@@ -2273,7 +2347,7 @@ class Translator:
                 ).var_out
                 for idx, arg_exp in enumerate(expr.args)
             ]
-            return self._translate_struct_initialization(expr.name, args, name)
+            return self._translate_struct_initialization(struct_type, args, name)
 
         elif isinstance(expr, s.Expression_StructField):
             src = self._resolve_struct_field_chain(expr.name)
@@ -3179,7 +3253,11 @@ class Translator:
             return call_name, explicit_generics
 
         if len(expr.callee.segments) >= 2:
-            owner_segments = expr.callee.segments[:-1]
+            owner_segments = list(expr.callee.segments[:-1])
+            if owner_segments and owner_segments[-1].name == "Self":
+                self_hint = self._current_self_binding_type or self._current_impl_self_type
+                resolved_self = self._resolve_self_type(self_hint)
+                owner_segments[-1] = self._resolve_self_in_type(owner_segments[-1], resolved_self)
             owner = owner_segments[-1]
             normalized_owner = "::".join(segment.name for segment in owner_segments)
             normalized_name = f"{normalized_owner}::{expr.callee.segments[-1].name}"
