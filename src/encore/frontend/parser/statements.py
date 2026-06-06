@@ -301,12 +301,14 @@ class Statement_DoWhile(Statement_InnerLevel):
 
 @dataclass
 class Statement_For(Statement_InnerLevel):
+    label: Optional[str]
     name: str
     iterable: "Statement_Expression"
     body: "Block"
 
     def __repr__(self) -> str:
-        return f"for {self.name} in {self.iterable} {self.body}"
+        label_repr = f"<'{self.label}>" if self.label else ""
+        return f"for{label_repr} {self.name} in {self.iterable} {self.body}"
 
 
 @dataclass

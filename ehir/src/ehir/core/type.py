@@ -7,6 +7,8 @@ class Type:
     generics: list["Type"] = field(default_factory=list)
 
     def __str__(self) -> str:
+        if self.name == "dyn" and len(self.generics) == 1:
+            return f"dyn {self.generics[0]}"
         generics_repr = ("[" + ", ".join(str(x) for x in self.generics) + "]") if self.generics else ""
         return f"{self.name}{generics_repr}"
 

@@ -158,6 +158,12 @@ class EHIR_ProjectCompiler:
         )
         module.ast = self._run_stage("resolve_2", refrain, lambda: Resolver().run(module.ast))
         module.ast = self._run_stage("deduplicate_after_resolve_2", refrain, lambda: self._deduplicate_directives(module.ast))
+        module.ast = self._run_stage("late_monomorphization", refrain, lambda: MonomorphizationPass().run(module.ast))
+        module.ast = self._run_stage(
+            "deduplicate_after_late_monomorphization", refrain, lambda: self._deduplicate_directives(module.ast)
+        )
+        module.ast = self._run_stage("resolve_3", refrain, lambda: Resolver().run(module.ast))
+        module.ast = self._run_stage("deduplicate_after_resolve_3", refrain, lambda: self._deduplicate_directives(module.ast))
         module.ast = self._run_stage("match_validator", refrain, lambda: MatchValidatorPass().run(module.ast))
         self._emit_ehir_stage(refrain.name, "post_monomorphize", module.ast)
         module.ast = self._run_stage("autodrop", refrain, lambda: AutoDropPass(trace_cfree=self.trace_cfree).run(module.ast))
@@ -728,7 +734,6 @@ class EHIR_ProjectCompiler:
         core_root = self._core_dir()
         owner_id = core_root / "owner.ehir"
         box_id = core_root / "smart_box.ehir"
-        runtime_id = core_root / "runtime.ehir"
 
         from ehir.frontend.builtin import EHIR_DirectFrontend
 
@@ -740,7 +745,7 @@ class EHIR_ProjectCompiler:
 
         directives: list[Derective] = []
         seen_symbols: set[tuple[type, str]] = set()
-        for module_id in (owner_id, box_id, runtime_id):
+        for module_id in (owner_id, box_id):
             if not module_id.exists():
                 continue
             module = core_frontend.get_module_by_id(module_id)

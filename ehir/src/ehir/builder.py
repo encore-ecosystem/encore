@@ -93,9 +93,10 @@ class EHIR_Builder:
         name: str,
         generics: list[Type],
         methods: list[TraitMethod],
+        parent: str | None = None,
         bounds: dict[str, list[str]] | None = None,
     ):
-        trait = Derective_trait(name=name, generics=generics, bounds=bounds or {}, methods=methods)
+        trait = Derective_trait(name=name, generics=generics, parent=parent, bounds=bounds or {}, methods=methods)
         self.module.ast.append(trait)
         return trait
 

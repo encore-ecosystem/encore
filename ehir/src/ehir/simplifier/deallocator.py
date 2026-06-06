@@ -230,7 +230,7 @@ class Deallocator:
                 initialized_in[block_name] = set(entry_initialized)
             else:
                 initialized_in[block_name] = set(candidate_vars)
-            initialized_out[block_name] = initialized_in[block_name] | gen.get(block_name, set())
+            initialized_out[block_name] = self._transfer_initialized(name2block[block_name], initialized_in[block_name])
 
         changed = True
         while changed:
@@ -245,13 +245,25 @@ class Deallocator:
                     else:
                         pred_sets = [initialized_out[pred] for pred in preds]
                         in_set = set.intersection(*pred_sets) if pred_sets else set()
-                out_set = in_set | gen.get(block_name, set())
+                out_set = self._transfer_initialized(name2block[block_name], in_set)
                 if in_set != initialized_in[block_name] or out_set != initialized_out[block_name]:
                     initialized_in[block_name] = in_set
                     initialized_out[block_name] = out_set
                     changed = True
 
         return initialized_in
+
+    def _transfer_initialized(self, block: TerminatedBlock, in_set: set[str]) -> set[str]:
+        initialized = set(in_set)
+        for instr in block.body:
+            if isinstance(instr, Instruction_drop):
+                initialized.discard(instr.var.name)
+                continue
+            if not isinstance(instr, Assignable):
+                continue
+            if instr.var_out.type is not None and needs_drop(instr.var_out.type, self._aggregate_names):
+                initialized.add(instr.var_out.name)
+        return initialized
 
     def _insert_drop_before_reassign(
         self,
@@ -266,6 +278,10 @@ class Deallocator:
             initialized = set(initialized_in[block_name])
             new_body = []
             for instr in block.body:
+                if isinstance(instr, Instruction_drop):
+                    initialized.discard(instr.var.name)
+                    new_body.append(instr)
+                    continue
                 if isinstance(instr, Assignable):
                     current_type = instr.var_out.type if instr.var_out.type is not None else var_types.get(instr.var_out.name)
                     if (
@@ -444,6 +460,8 @@ class Deallocator:
                 self._add_variable_usage(instr.var)
             elif isinstance(instr, Instruction_drop):
                 self._add_variable_usage(instr.var)
+                self._captures.pop(instr.var.name, None)
+                initialized.discard(instr.var.name)
             elif isinstance(instr, Instruction_pcast):
                 self._add_variable_usage(instr.var)
             elif isinstance(instr, (Instruction_call, Instruction_callvoid)):

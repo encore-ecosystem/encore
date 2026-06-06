@@ -46,7 +46,7 @@ from ehir.core.instructions import (
 from ehir.core.instructions.base import Instruction
 from ehir.core.primitives import Usize, Usize_t
 from ehir.core.struct import Struct
-from ehir.core.type import Pointer, Reference, Type, mangle_type_name
+from ehir.core.type import Pointer, Reference, Type, box_pointee, is_box_type, mangle_type_name
 from ehir.core.variable import Parameter, TypedVariable, Variable
 from ehir.errors import EhirCompileError
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
@@ -83,6 +83,7 @@ class Downgrader:
     _structs_to_add: list[Derective_struct]
     _fns: dict[str, Normalized_fn]
     _fns_to_add: list[Normalized_fn]
+    _BOX_STORAGE_FIELDS = {"ptr", "owner", "0", "1"}
 
     def _lookup_struct(self, type_name: str) -> Derective_struct | None:
         struct_decl = self._structs.get(type_name)
@@ -92,6 +93,37 @@ class Downgrader:
             base_name = type_name.split("[", 1)[0]
             return self._structs.get(base_name)
         return None
+
+    def _box_field_target(self, owner_t: Type, field: Variable) -> tuple[Type, Derective_struct] | None:
+        if field.name in self._BOX_STORAGE_FIELDS:
+            return None
+        pointee = self._box_pointee(owner_t)
+        if pointee is None:
+            return None
+        decl = self._lookup_struct(pointee.name)
+        if decl is None:
+            return None
+        if field.name.isdigit():
+            index = int(field.name)
+            if 0 <= index < len(decl.params):
+                return pointee, decl
+            return None
+        if any(param.name == field.name for param in decl.params):
+            return pointee, decl
+        return None
+
+    def _box_pointee(self, typ: Type) -> Type | None:
+        if is_box_type(typ):
+            return box_pointee(typ)
+        if not typ.name.startswith("__Box_"):
+            return None
+        decl = self._lookup_struct(typ.name)
+        if decl is None or not decl.params:
+            return None
+        ptr_field = decl.params[0].type
+        if not isinstance(ptr_field, Pointer):
+            return None
+        return ptr_field.pointee
 
     def run(self, ast: list[Derective]) -> list[Derective]:
         self._structs = {}
@@ -188,23 +220,61 @@ class Downgrader:
                 name=case.payload_var.name,
                 type=case.payload_var.type or field_type.pointee,
             )
-            field_var = TypedVariable(name=str(field_index), type=field_type)
-
-            # Avoid duplicate prepends when pass re-runs on the same AST object.
-            if case_block.body and isinstance(case_block.body[0], Instruction_getfield):
-                existing = case_block.body[0]
-                if existing.var_out.name == payload_ptr.name and existing.src.name == match_instr.cond_var.name:
-                    continue
+            high_level_field_index = self._high_level_enum_payload_field_index(
+                match_instr.cond_var.type.name,
+                case.variant,
+            )
+            if self._case_block_already_extracts_payload(
+                case_block,
+                match_instr.cond_var,
+                field_index,
+                high_level_field_index,
+            ):
+                continue
 
             case_block.body.insert(
                 0,
                 Instruction_getfield(
                     var_out=payload_ptr,
                     src=match_instr.cond_var,
-                    field=field_var,
+                    field=TypedVariable(case.variant, field_type),
                 ),
             )
             case_block.body.insert(1, Instruction_load(var_out=payload_out, var=payload_ptr))
+
+    def _high_level_enum_payload_field_index(self, enum_name: str, variant_name: str) -> int | None:
+        variant_names = self._enum_variants.get(enum_name)
+        if variant_names is None:
+            return None
+        try:
+            return variant_names.index(variant_name) + 1
+        except ValueError:
+            return None
+
+    def _case_block_already_extracts_payload(
+        self,
+        case_block: TerminatedBlock,
+        cond_var: Variable,
+        lowered_field_index: int,
+        high_level_field_index: int | None,
+    ) -> bool:
+        if len(case_block.body) < 2:
+            return False
+
+        field_read = case_block.body[0]
+        payload_load = case_block.body[1]
+        if not isinstance(field_read, Instruction_getfield):
+            return False
+        if not isinstance(payload_load, Instruction_load):
+            return False
+        if field_read.src.name != cond_var.name:
+            return False
+        accepted_field_names = {str(lowered_field_index)}
+        if high_level_field_index is not None:
+            accepted_field_names.add(str(high_level_field_index))
+        if field_read.field.name not in accepted_field_names:
+            return False
+        return payload_load.var.name == field_read.var_out.name
 
     def _downgrade(self, instr: Instruction) -> list[Instruction]:
         if isinstance(instr, Instruction_cpos):
@@ -421,7 +491,31 @@ class Downgrader:
             assert owner_t is not None
             if isinstance(owner_t, (Pointer, Reference)):
                 owner_t = owner_t.pointee
-            struct_decl = self._lookup_struct(owner_t.name)
+
+            box_target = self._box_field_target(owner_t, field)
+            if box_target is not None:
+                pointee, struct_decl = box_target
+                payload_ptr_type = Pointer(pointee)
+                payload_field_ptr = TypedVariable(
+                    name=f".{instr.var_out.name}_{index}_box_payload_field_ptr",
+                    type=Pointer(payload_ptr_type),
+                )
+                payload_ptr = TypedVariable(
+                    name=f".{instr.var_out.name}_{index}_box_payload_ptr",
+                    type=payload_ptr_type,
+                )
+                result.append(
+                    Instruction_getfieldptr(
+                        var_out=payload_field_ptr,
+                        src=current_src,
+                        field=Variable(name="0", type=payload_ptr_type),
+                    )
+                )
+                result.append(Instruction_load(var_out=payload_ptr, var=payload_field_ptr))
+                current_src = payload_ptr
+                owner_t = pointee
+            else:
+                struct_decl = self._lookup_struct(owner_t.name)
             assert struct_decl is not None, f"Unknown struct for getfieldptr: {owner_t}"
             field_index = int(field.name) if field.name.isdigit() else None
             if field_index is not None:
@@ -449,7 +543,7 @@ class Downgrader:
                         field_index = idx
                         break
             assert field_index is not None, f"Unknown field {field.name} for {owner_t.name}"
-            resolved_field_type = struct_decl.params[field_index].type
+            resolved_field_type = field.type or struct_decl.params[field_index].type
             if field.type is None:
                 field.type = resolved_field_type
             var_out = (

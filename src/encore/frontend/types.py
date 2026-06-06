@@ -40,6 +40,10 @@ def is_mutable_type(typ: Type | None) -> bool:
     return isinstance(typ, MutableType)
 
 
+def is_dyn_trait_type(typ: Type | None) -> bool:
+    return isinstance(typ, Type) and typ.name == "dyn" and len(typ.generics) == 1
+
+
 def make_mutable_type(typ: Type) -> Type:
     return typ if isinstance(typ, MutableType) else MutableType(typ)
 

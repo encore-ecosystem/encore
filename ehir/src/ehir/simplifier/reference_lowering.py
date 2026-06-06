@@ -3,12 +3,14 @@ from dataclasses import fields, is_dataclass
 
 from ehir.core.derectives import Derective_extern_fn, Derective_fn
 from ehir.core.derectives.base import Derective
-from ehir.core.instructions import Instruction_call, Instruction_getfield, Instruction_setfield
+from ehir.core.instructions import Instruction_getfield, Instruction_getfieldptr, Instruction_load, Instruction_setfield
 from ehir.core.type import Pointer, Reference, Type, box_pointee, is_box_type
 from ehir.core.variable import Parameter, TypedVariable, Variable
 
 
 class ReferenceLoweringPass:
+    _BOX_STORAGE_FIELDS = {"ptr", "owner", "0", "1"}
+
     def run(self, ast: list[Derective]) -> list[Derective]:
         self._rewrite_reference_types(ast)
         for directive in ast:
@@ -24,57 +26,65 @@ class ReferenceLoweringPass:
             new_body = []
             for instr in block.body:
                 if isinstance(instr, Instruction_getfield) and instr.src.type is not None and is_box_type(instr.src.type):
-                    if instr.field.name not in {"ptr", "owner", "0", "1"}:
+                    if instr.field.name not in self._BOX_STORAGE_FIELDS:
                         pointee = box_pointee(instr.src.type)
-                        loaded = TypedVariable(name=f".{instr.var_out.name}_ref_loaded", type=deepcopy(pointee))
-                        new_body.append(
-                            Instruction_call(
-                                var_out=loaded,
-                                fn_name="Box[T]::load",
-                                generics=[],
-                                args=[deepcopy(instr.src)],
-                            )
+                        prelude, payload_ptr = self._lower_box_payload_pointer(
+                            instr.src,
+                            seed=instr.var_out.name,
+                            pointee=pointee,
                         )
+                        new_body.extend(prelude)
                         new_body.append(
                             Instruction_getfield(
                                 var_out=instr.var_out,
-                                src=loaded,
+                                src=payload_ptr,
                                 field=instr.field,
                                 field_path=list(instr.field_path),
                             )
                         )
                         continue
                 if isinstance(instr, Instruction_setfield) and instr.var.type is not None and is_box_type(instr.var.type):
-                    if instr.field.name not in {"ptr", "owner", "0", "1"}:
+                    if instr.field.name not in self._BOX_STORAGE_FIELDS:
                         pointee = box_pointee(instr.var.type)
-                        loaded = TypedVariable(name=f".{instr.var.name}_ref_loaded", type=deepcopy(pointee))
-                        new_body.append(
-                            Instruction_call(
-                                var_out=loaded,
-                                fn_name="Box[T]::load",
-                                generics=[],
-                                args=[deepcopy(instr.var)],
-                            )
+                        prelude, payload_ptr = self._lower_box_payload_pointer(
+                            instr.var,
+                            seed=instr.var.name,
+                            pointee=pointee,
                         )
+                        new_body.extend(prelude)
                         new_body.append(
                             Instruction_setfield(
-                                var=loaded,
+                                var=payload_ptr,
                                 field=instr.field,
                                 value=instr.value,
                                 field_path=list(instr.field_path),
                             )
                         )
-                        new_body.append(
-                            Instruction_call(
-                                var_out=TypedVariable(name=f".store_{instr.var.name}", type=deepcopy(pointee)),
-                                fn_name="Box[T]::store",
-                                generics=[],
-                                args=[deepcopy(instr.var), loaded],
-                            )
-                        )
                         continue
                 new_body.append(instr)
             block.body = new_body
+
+    def _lower_box_payload_pointer(
+        self,
+        box_var: TypedVariable | Variable,
+        *,
+        seed: str,
+        pointee: Type,
+    ) -> tuple[list[Instruction_getfieldptr | Instruction_load], TypedVariable]:
+        ptr_type = Pointer(deepcopy(pointee))
+        ptr_field = TypedVariable(name=f".{seed}_box_ptr_field", type=Pointer(ptr_type))
+        payload_ptr = TypedVariable(name=f".{seed}_box_ptr", type=ptr_type)
+        return (
+            [
+                Instruction_getfieldptr(
+                    var_out=ptr_field,
+                    src=deepcopy(box_var),
+                    field=TypedVariable(name="0", type=ptr_type),
+                ),
+                Instruction_load(var_out=payload_ptr, var=ptr_field),
+            ],
+            payload_ptr,
+        )
 
     def _lower_type(self, typ: Type) -> Type:
         if isinstance(typ, Reference):

@@ -557,13 +557,14 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     def _parse_for(self) -> s.Statement_For:
         self._safe_consume(TokenType.KW_FOR)
+        label = self._parse_maybe_label()
         item_name = self._safe_consume(TokenType.IDENTIFIER).value
         self._safe_consume(TokenType.KW_IN)
         self._parsing_control_flow_header = True
         iterable_expr = self._parse_expression()
         self._parsing_control_flow_header = False
         body = self._parse_block()
-        return s.Statement_For(name=item_name, iterable=iterable_expr, body=body)
+        return s.Statement_For(label=label, name=item_name, iterable=iterable_expr, body=body)
 
     def _parse_with(self) -> s.Statement_With:
         self._safe_consume(TokenType.KW_WITH)
@@ -1404,6 +1405,15 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         return make_mutable_type(typ) if is_mut else typ
 
     def _parse_type_base(self) -> Type:
+        if self._peek_curr().type == TokenType.KW_DYN:
+            self._safe_consume(TokenType.KW_DYN)
+            trait_name = self._safe_consume(TokenType.IDENTIFIER).value
+            while self._peek_curr().type == TokenType.SCOPE:
+                self._safe_consume(TokenType.SCOPE)
+                trait_name += f"::{self._safe_consume(TokenType.IDENTIFIER).value}"
+            generics = self._parse_generics_args() if self._peek_curr().type == TokenType.LEFT_BRACKET else []
+            return Type("dyn", [Type(trait_name, generics)])
+
         if self._peek_curr().type == TokenType.LEFT_PAREN:
             self._safe_consume(TokenType.LEFT_PAREN)
             if self._peek_curr().type == TokenType.RIGHT_PAREN:

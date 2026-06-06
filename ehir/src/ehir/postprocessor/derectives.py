@@ -1,5 +1,5 @@
 from abc import ABC
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ehir.core.derectives import Derective_extern_fn
 from ehir.core.derectives.base import Derective
@@ -44,6 +44,7 @@ class ProcessedDerective_fn(ProcessedDerective):
 class ProcessedDerective_struct(ProcessedDerective):
     name: str
     fields: list[Parameter]
+    generics: list[Type] = field(default_factory=list)
 
     def __repr__(self) -> str:
         fields_repr = "\n  ".join(str(field) for field in self.fields)

@@ -24,6 +24,7 @@ from ehir.core.instructions import (
     Instruction_load,
     Instruction_mod,
     Instruction_mul,
+    Instruction_pcast,
     Instruction_put,
     Instruction_salloc,
     Instruction_setfield,
@@ -49,6 +50,7 @@ from encore.frontend.types import (
     AnySmartPointer,
     array_size,
     is_array_type,
+    is_dyn_trait_type,
     is_mutable_type,
     is_raw_pointer_type,
     is_reference_like_type,
@@ -170,8 +172,7 @@ class Translator:
             self,
             *,
             scrutinee: Assignable,
-            base_var_vals: dict[str, Variable],
-            base_var_ptrs: dict[str, Variable],
+            base_scope: "Translator._ScopeSnapshot",
             end_block,
             default_block,
             wildcard_arm: MatchBodyArmLike | None,
@@ -180,14 +181,27 @@ class Translator:
             arm_variant_indices: dict[int, int],
         ):
             self.scrutinee = scrutinee
-            self.base_var_vals = base_var_vals
-            self.base_var_ptrs = base_var_ptrs
+            self.base_scope = base_scope
             self.end_block = end_block
             self.default_block = default_block
             self.wildcard_arm = wildcard_arm
             self.arm_blocks = arm_blocks
             self.arm_payload_types = arm_payload_types
             self.arm_variant_indices = arm_variant_indices
+
+    class _ScopeSnapshot:
+        def __init__(
+            self,
+            *,
+            var_vals: dict[str, Variable],
+            var_ptrs: dict[str, Variable],
+            source_var_types: dict[str, Type],
+            assignment_targets: dict[str, str],
+        ):
+            self.var_vals = var_vals
+            self.var_ptrs = var_ptrs
+            self.source_var_types = source_var_types
+            self.assignment_targets = assignment_targets
 
     class _LoopContext:
         def __init__(self, *, label: str | None, break_target: str, continue_target: str):
@@ -218,6 +232,7 @@ class Translator:
         self._var_ptrs: dict[str, Variable] = {}
         self._source_var_types: dict[str, Type] = {}
         self._assignment_targets: dict[str, str] = {}
+        self._used_ehir_names: set[str] = set()
         self._funcs = {}
         self._source_signatures = {}
         self._enums = {}
@@ -236,6 +251,7 @@ class Translator:
         self._type_aliases = {}
         self._trait_aliases = {}
         self._active_generic_bounds = {}
+        self._active_generic_names = set()
         self._current_self_binding_type = None
         self._current_impl_self_type = None
         self._global_exprs: dict[str, s.Statement_Expression] = {}
@@ -580,6 +596,33 @@ class Translator:
 
         receiver_type = unwrap_for_storage(receiver_type)
         base_receiver_type = receiver_type.pointee if is_reference_like_type(receiver_type) else receiver_type
+        if is_dyn_trait_type(base_receiver_type):
+            trait_type = base_receiver_type.generics[0]
+            signature = self._lookup_trait_method_signature(
+                trait_type.name,
+                method_name,
+                receiver_type=base_receiver_type,
+            )
+            if signature is not None and signature.type is not None:
+                fn_name = self._resolve_trait_method_call_name(
+                    trait_type.name,
+                    method_name,
+                    receiver_type=base_receiver_type,
+                )
+                return (
+                    fn_name,
+                    Derective_fn(
+                        name=fn_name,
+                        generics=[self._translate_type(generic) for generic in signature.generics],
+                        params=[
+                            Parameter(name=param.name, type=self._translate_type(param.type))
+                            for param in signature.params
+                        ],
+                        body=[],
+                        ret_type=self._translate_type(signature.type),
+                    ),
+                )
+
         inherent_name = f"{base_receiver_type.name}::{method_name}"
         inherent_callee = self._funcs.get(inherent_name)
         if inherent_callee is not None:
@@ -737,6 +780,8 @@ class Translator:
             return typ
 
         def is_generic_placeholder(name: str) -> bool:
+            if name in self._active_generic_names:
+                return True
             if name in {"Self", "T"}:
                 return True
             if len(name) == 1 and name.isupper():
@@ -754,6 +799,8 @@ class Translator:
                 return StackSmartPointer(qualify(inner.pointee))
             if is_raw_pointer_type(inner):
                 return Pointer(qualify(inner.pointee))
+            if is_dyn_trait_type(inner):
+                return Type("dyn", [self._translate_trait_type(inner.generics[0])])
             if isinstance(inner, (Usize_t, Isize_t, Float_t, Str_t)):
                 return inner
 
@@ -920,7 +967,7 @@ class Translator:
         derective = self._builder.build_trait(
             name=self._qualify_trait_name(self._current_module_id, statement.name),
             generics=[self._translate_type(g) for g in statement.generics],
-            bounds={"Self": [self._translate_trait_type(base).name for base in statement.bases]} if statement.bases else {},
+            parent=self._translate_trait_type(statement.bases[0]).name if statement.bases else None,
             methods=[
                 TraitMethod(
                     name=method.name,
@@ -1063,10 +1110,12 @@ class Translator:
         prev_var_ptrs = self._var_ptrs
         prev_source_var_types = self._source_var_types
         prev_assignment_targets = self._assignment_targets
+        prev_used_ehir_names = self._used_ehir_names
         prev_terminated_blocks = self._terminated_blocks
         prev_loop_stack = self._loop_stack
         prev_with_cleanup_stack = self._with_cleanup_stack
         prev_generic_bounds = self._active_generic_bounds
+        prev_generic_names = self._active_generic_names
         prev_self_binding_type = self._current_self_binding_type
 
         self._builder.current_function = fn
@@ -1075,10 +1124,12 @@ class Translator:
         self._var_ptrs = {}
         self._source_var_types = {}
         self._assignment_targets = {}
+        self._used_ehir_names = {param.name for param in fn.params}
         self._terminated_blocks = set()
         self._loop_stack = []
         self._with_cleanup_stack = []
         self._active_generic_bounds = self._collect_generic_bounds(source_generics or [])
+        self._active_generic_names = {generic.name for generic in source_generics or []}
         source_params = source_params or []
         mutable_params = {param.name for param in source_params if is_mutable_type(param.type)}
         entry_block = self._builder.append_block("entry")
@@ -1110,10 +1161,12 @@ class Translator:
         self._var_ptrs = prev_var_ptrs
         self._source_var_types = prev_source_var_types
         self._assignment_targets = prev_assignment_targets
+        self._used_ehir_names = prev_used_ehir_names
         self._terminated_blocks = prev_terminated_blocks
         self._loop_stack = prev_loop_stack
         self._with_cleanup_stack = prev_with_cleanup_stack
         self._active_generic_bounds = prev_generic_bounds
+        self._active_generic_names = prev_generic_names
         self._current_self_binding_type = prev_self_binding_type
 
     def _register_source_signature(self, signature: s.FunctionSignature):
@@ -1235,6 +1288,23 @@ class Translator:
             return
         self._source_var_types[var.name] = source_type
 
+    def _capture_scope(self) -> "_ScopeSnapshot":
+        return self._ScopeSnapshot(
+            var_vals=dict(self._var_vals),
+            var_ptrs=dict(self._var_ptrs),
+            source_var_types=dict(self._source_var_types),
+            assignment_targets=dict(self._assignment_targets),
+        )
+
+    def _restore_scope(self, scope: "_ScopeSnapshot") -> None:
+        self._var_vals = dict(scope.var_vals)
+        self._var_ptrs = dict(scope.var_ptrs)
+        self._source_var_types = dict(scope.source_var_types)
+        self._assignment_targets = dict(scope.assignment_targets)
+
+    def _fork_scope(self, scope: "_ScopeSnapshot") -> None:
+        self._restore_scope(scope)
+
     def _source_type_for_var(self, var: Variable) -> Type | None:
         return self._source_var_types.get(var.name)
 
@@ -1250,8 +1320,18 @@ class Translator:
         )
 
     def _fresh_temp_name(self, prefix: str) -> str:
-        self._unique_variable_idx += 1
-        return f"{prefix}_{self._unique_variable_idx}"
+        while True:
+            self._unique_variable_idx += 1
+            candidate = f"{prefix}_{self._unique_variable_idx}"
+            if candidate not in self._used_ehir_names:
+                self._used_ehir_names.add(candidate)
+                return candidate
+
+    def _claim_ehir_name(self, preferred: str) -> str:
+        if preferred not in self._used_ehir_names:
+            self._used_ehir_names.add(preferred)
+            return preferred
+        return self._fresh_temp_name(preferred)
 
     def _translate_mutable_argument(
         self,
@@ -1365,13 +1445,15 @@ class Translator:
 
     def _translate_let(self, statement: s.Statement_Let):
         assert statement.type is not None
-        self._set_new_variable(statement.name)
+        target_name = self._claim_ehir_name(statement.name)
+        self._assignment_targets[statement.name] = target_name
+        self._set_new_variable(target_name)
         expected_type = self._translate_type(statement.type)
 
         slot_ptr: Variable
         if isinstance(statement.expr, s.Expression_BooleanLiteral):
             prim = Usize(1 if statement.expr.value else 0, size=1)
-            slot_ptr = self._builder.build_cpos(prim=prim, name=statement.name).var_out
+            slot_ptr = self._builder.build_cpos(prim=prim, name=target_name).var_out
         elif isinstance(statement.expr, s.Expression_IntegerLiteral):
             literal_expected = statement.expr.literal_type or expected_type
             if literal_expected is not None:
@@ -1389,19 +1471,19 @@ class Translator:
                     prim = self._build_integer_primitive(int(statement.expr.value), literal_expected)
             else:
                 prim = self._build_integer_primitive(int(statement.expr.value), literal_expected)
-            slot_ptr = self._builder.build_cpos(prim=prim, name=statement.name).var_out
+            slot_ptr = self._builder.build_cpos(prim=prim, name=target_name).var_out
         elif isinstance(statement.expr, s.Expression_FloatLiteral):
             prim = Float(
                 float(statement.expr.value), size=self._infer_float_size(statement.expr.literal_type or expected_type)
             )
-            slot_ptr = self._builder.build_cpos(prim=prim, name=statement.name).var_out
+            slot_ptr = self._builder.build_cpos(prim=prim, name=target_name).var_out
         elif isinstance(statement.expr, s.Expression_StringLiteral):
-            slot_ptr = self._builder.build_cpos(prim=Str(statement.expr.value), name=statement.name).var_out
+            slot_ptr = self._builder.build_cpos(prim=Str(statement.expr.value), name=target_name).var_out
         else:
             val = self._translate_expression(statement.expr, expected_type=expected_type)
             if val.var_out.type is None:
                 val.var_out.type = expected_type
-            slot_ptr = self._create_stack_slot(statement.name, val.var_out, expected_type)
+            slot_ptr = self._create_stack_slot(target_name, val.var_out, expected_type)
 
         self._remember_source_type(slot_ptr, statement.type)
         self._var_ptrs[statement.name] = slot_ptr
@@ -1441,7 +1523,8 @@ class Translator:
             self._translate_expression(cleanup_expr)
 
     def _translate_with(self, statement: s.Statement_With):
-        self._set_new_variable(statement.name)
+        target_name = self._claim_ehir_name(statement.name)
+        self._set_new_variable(target_name)
         enter_expr = s.Expression_MethodCall(
             receiver=statement.expr,
             method="with_enter",
@@ -1451,13 +1534,15 @@ class Translator:
         resource = self._translate_expression(enter_expr)
         if resource.var_out.type is None:
             raise TypeError("Unable to infer resource type in with-statement")
-        slot_ptr = self._create_stack_slot(statement.name, resource.var_out, resource.var_out.type)
+        slot_ptr = self._create_stack_slot(target_name, resource.var_out, resource.var_out.type)
 
         prev_ptr = self._var_ptrs.get(statement.name)
         prev_val = self._var_vals.get(statement.name)
         prev_source_type = self._source_var_types.get(statement.name)
+        prev_assignment_target = self._assignment_targets.get(statement.name)
 
         self._var_ptrs[statement.name] = slot_ptr
+        self._assignment_targets[statement.name] = target_name
         source_type = self._source_type_for_var(resource.var_out) or resource.var_out.type
         self._remember_source_type(slot_ptr, source_type)
 
@@ -1488,6 +1573,11 @@ class Translator:
             self._source_var_types[statement.name] = prev_source_type
         elif statement.name in self._source_var_types:
             del self._source_var_types[statement.name]
+
+        if prev_assignment_target is not None:
+            self._assignment_targets[statement.name] = prev_assignment_target
+        elif statement.name in self._assignment_targets:
+            del self._assignment_targets[statement.name]
 
     def _translate_assignment(self, statement: s.Statement_Assignment):
         assign_expr = self._assignment_expr(statement)
@@ -1732,7 +1822,7 @@ class Translator:
         self._builder.position_at_end(body_block)
         self._loop_stack.append(
             Translator._LoopContext(
-                label=None,
+                label=statement.label,
                 break_target=end_block.name,
                 continue_target=latch_block.name,
             )
@@ -1821,8 +1911,7 @@ class Translator:
         else_block = self._builder.append_block(f"if_else_{if_id}") if statement.else_body is not None else None
         end_block = self._builder.append_block(f"if_end_{if_id}") if else_block is None else None
 
-        base_var_vals = dict(self._var_vals)
-        base_var_ptrs = dict(self._var_ptrs)
+        base_scope = self._capture_scope()
 
         def ensure_end_block():
             nonlocal end_block
@@ -1832,8 +1921,7 @@ class Translator:
 
         for idx, branch in enumerate(statement.branches):
             self._builder.position_at_end(cond_blocks[idx])
-            self._var_vals = dict(base_var_vals)
-            self._var_ptrs = dict(base_var_ptrs)
+            self._fork_scope(base_scope)
 
             false_target = (
                 cond_blocks[idx + 1].name
@@ -1845,6 +1933,7 @@ class Translator:
             self._mark_current_block_terminated()
 
             self._builder.position_at_end(branch_bodies[idx])
+            self._fork_scope(base_scope)
             self._translate_block(branch.body)
             if not self._is_current_block_terminated():
                 self._builder.build_br(ensure_end_block().name)
@@ -1853,8 +1942,7 @@ class Translator:
         if else_block is not None:
             assert statement.else_body
             self._builder.position_at_end(else_block)
-            self._var_vals = dict(base_var_vals)
-            self._var_ptrs = dict(base_var_ptrs)
+            self._fork_scope(base_scope)
             self._translate_block(statement.else_body)
             if not self._is_current_block_terminated():
                 self._builder.build_br(ensure_end_block().name)
@@ -1862,8 +1950,7 @@ class Translator:
 
         if end_block is not None:
             self._builder.position_at_end(end_block)
-            self._var_vals = dict(base_var_vals)
-            self._var_ptrs = dict(base_var_ptrs)
+            self._restore_scope(base_scope)
 
     def _translate_match(self, statement: s.Statement_Match):
         self._translate_match_common(statement, is_expression=False)
@@ -1955,8 +2042,7 @@ class Translator:
                     self._mark_current_block_terminated()
 
         self._builder.position_at_end(prepared.end_block)
-        self._var_vals = dict(prepared.base_var_vals)
-        self._var_ptrs = dict(prepared.base_var_ptrs)
+        self._restore_scope(prepared.base_scope)
 
         if not is_expression:
             return None
@@ -1966,11 +2052,11 @@ class Translator:
 
     def _enter_match_arm_scope(self, prepared: "_PreparedMatch", idx: int, arm: MatchBodyArmLike):
         self._builder.position_at_end(prepared.arm_blocks[idx])
-        self._var_vals = dict(prepared.base_var_vals)
-        self._var_ptrs = dict(prepared.base_var_ptrs)
+        self._fork_scope(prepared.base_scope)
         payload_type = prepared.arm_payload_types[idx]
         if arm.binding is not None and payload_type is not None:
-            binding_var = Variable(arm.binding, payload_type)
+            binding_name = self._claim_ehir_name(arm.binding)
+            binding_var = Variable(binding_name, payload_type)
             variant_field_index = prepared.arm_variant_indices[idx] + 1
             payload_ptr = Variable(self._advance_variable(), Pointer(payload_type))
             self._builder._add(
@@ -1982,12 +2068,12 @@ class Translator:
             )
             self._builder._add(Instruction_load(var_out=binding_var, var=payload_ptr))
             self._var_vals[arm.binding] = binding_var
+            self._assignment_targets[arm.binding] = binding_name
             self._remember_source_type(binding_var, payload_type)
 
     def _enter_match_default_scope(self, prepared: "_PreparedMatch"):
         self._builder.position_at_end(prepared.default_block)
-        self._var_vals = dict(prepared.base_var_vals)
-        self._var_ptrs = dict(prepared.base_var_ptrs)
+        self._fork_scope(prepared.base_scope)
 
     def _get_match_arm_body(self, arm: MatchBodyArmLike) -> MatchBodyLike:
         if isinstance(arm, s.Statement_MatchArm):
@@ -2037,8 +2123,7 @@ class Translator:
             else None
         )
 
-        base_var_vals = dict(self._var_vals)
-        base_var_ptrs = dict(self._var_ptrs)
+        base_scope = self._capture_scope()
         end_block = self._builder.append_block(f"match_builtin_end_{match_id}")
 
         if explicit_arms:
@@ -2050,8 +2135,7 @@ class Translator:
 
             for idx, arm in enumerate(explicit_arms):
                 self._builder.position_at_end(cond_blocks[idx])
-                self._var_vals = dict(base_var_vals)
-                self._var_ptrs = dict(base_var_ptrs)
+                self._fork_scope(base_scope)
 
                 cond_var = self._translate_builtin_match_condition(scrutinee.var_out, arm.pattern)
                 false_target = cond_blocks[idx + 1].name if idx + 1 < len(explicit_arms) else default_block.name
@@ -2059,8 +2143,7 @@ class Translator:
                 self._mark_current_block_terminated()
 
                 self._builder.position_at_end(arm_blocks[idx])
-                self._var_vals = dict(base_var_vals)
-                self._var_ptrs = dict(base_var_ptrs)
+                self._fork_scope(base_scope)
                 body = self._get_match_arm_body(arm)
                 if is_expression:
                     arm_result = self._translate_match_expression_body(body, expected_type=expected_type)
@@ -2079,11 +2162,9 @@ class Translator:
                         self._mark_current_block_terminated()
 
             self._builder.position_at_end(default_block)
-            self._var_vals = dict(base_var_vals)
-            self._var_ptrs = dict(base_var_ptrs)
+            self._fork_scope(base_scope)
         else:
-            self._var_vals = dict(base_var_vals)
-            self._var_ptrs = dict(base_var_ptrs)
+            self._fork_scope(base_scope)
 
         body = self._get_match_arm_body(default_arm)
         if is_expression:
@@ -2103,8 +2184,7 @@ class Translator:
                 self._mark_current_block_terminated()
 
         self._builder.position_at_end(end_block)
-        self._var_vals = dict(base_var_vals)
-        self._var_ptrs = dict(base_var_ptrs)
+        self._restore_scope(base_scope)
 
         if not is_expression:
             return None
@@ -2257,12 +2337,43 @@ class Translator:
                 operand = self._translate_expression(expr.expr)
                 zero = self._builder.build_capprim(prim=Usize(0, size=1))
                 return self._builder.build_binop("ieq", operand.var_out, zero.var_out, name)
+            if expr.operator == "+":
+                return self._translate_expression(expr.expr, name=name, expected_type=expected_type)
+            if expr.operator == "-":
+                operand = self._translate_expression(expr.expr, expected_type=expected_type)
+                operand_type = operand.var_out.type or (self._translate_type(expected_type) if expected_type is not None else None)
+                if operand_type is None:
+                    raise TypeError("Unable to infer type for unary '-'")
+
+                base_type = unwrap_for_storage(operand_type)
+                base_type = base_type.pointee if is_reference_like_type(base_type) else base_type
+                if self._is_float_type_name(base_type.name):
+                    zero = self._builder.build_capprim(
+                        prim=Float(0.0, size=self._infer_float_size(base_type)),
+                    )
+                elif self._is_integer_type_name(base_type.name):
+                    zero = self._builder.build_capprim(prim=self._build_integer_primitive(0, base_type))
+                else:
+                    raise TypeError(f"Unary '-' expects numeric type, got {base_type}")
+                result = self._builder.build_binop("sub", zero.var_out, operand.var_out, name)
+                result.var_out.type = operand.var_out.type
+                self._remember_source_type(result.var_out, self._source_type_for_var(operand.var_out) or operand.var_out.type)
+                return result
             raise NotImplementedError(f"Translation for unary operator '{expr.operator}' is not implemented.")
 
         elif isinstance(expr, s.Expression_Try):
             return self._translate_try_expression(expr, name=name)
 
         elif isinstance(expr, s.Expression_Cast):
+            if is_dyn_trait_type(expr.target):
+                source = self._translate_expression(expr.expr).var_out
+                target_type = self._translate_type(expr.target)
+                out = Variable(name or self._advance_variable(), target_type)
+                instr = Instruction_pcast(var_out=out, var=source, type=target_type)
+                self._builder._add(instr)
+                self._remember_source_type(instr.var_out, expr.target)
+                return instr
+
             cast_call = s.Expression_MethodCall(
                 receiver=expr.expr,
                 method="cast",
@@ -2482,6 +2593,37 @@ class Translator:
                 raise TypeError(f"Extern function '{expr.name}' can only be called inside unsafe block")
 
             generics = [self._translate_type(g) for g in call_generics]
+            callee = self._funcs.get(call_name)
+            callee_generics = getattr(callee, "generics", []) if callee is not None else []
+            if callee is not None and callee_generics:
+                inferred_mapping: dict[str, Type] = {}
+                source_params = source_signature.params if source_signature is not None else callee.params
+                for param, arg in zip(source_params, args, strict=False):
+                    if arg.type is None:
+                        continue
+                    self._collect_generic_mapping_from_types(
+                        self._qualify_type_for_callable(
+                            param.type,
+                            fn_name=call_name,
+                            generic_names={generic.name for generic in callee_generics},
+                        ),
+                        arg.type,
+                        inferred_mapping,
+                    )
+                if not generics:
+                    for generic in callee_generics:
+                        concrete = inferred_mapping.get(generic.name)
+                        if concrete is not None:
+                            generics.append(concrete)
+                else:
+                    normalized_generics: list[Type] = []
+                    for generic, explicit in zip(callee_generics, generics, strict=False):
+                        concrete = inferred_mapping.get(generic.name)
+                        if concrete is not None and self._same_type_shape(explicit, concrete):
+                            normalized_generics.append(concrete)
+                        else:
+                            normalized_generics.append(explicit)
+                    generics = normalized_generics
             call = self._builder.build_call(
                 fn_name=call_name,
                 generics=generics,
@@ -2491,9 +2633,7 @@ class Translator:
             )
             if source_signature is not None and source_signature.type is not None:
                 self._remember_source_type(call.var_out, source_signature.type)
-            callee = self._funcs.get(call_name)
             if callee is not None:
-                callee_generics = getattr(callee, "generics", [])
                 generic_mapping = {generic.name: concrete for generic, concrete in zip(callee_generics, generics)}
                 ret_type = self._specialize_type(callee.ret_type, generic_mapping)
                 call.var_out.type = self._qualify_type_for_callable(
@@ -2629,12 +2769,8 @@ class Translator:
         name: Optional[str] = None,
         expected_type: Optional[Type] = None,
     ) -> Assignable:
-        outer_var_vals = self._var_vals
-        outer_var_ptrs = self._var_ptrs
-        outer_assignment_targets = self._assignment_targets
-        self._var_vals = dict(self._var_vals)
-        self._var_ptrs = dict(self._var_ptrs)
-        self._assignment_targets = dict(self._assignment_targets)
+        outer_scope = self._capture_scope()
+        self._fork_scope(outer_scope)
 
         try:
             statements, tail_expr = self._split_expression_block(block)
@@ -2642,9 +2778,7 @@ class Translator:
                 self._translate_expression_block_statement(statement)
             return self._translate_expression(tail_expr, name=name, expected_type=expected_type)
         finally:
-            self._var_vals = outer_var_vals
-            self._var_ptrs = outer_var_ptrs
-            self._assignment_targets = outer_assignment_targets
+            self._restore_scope(outer_scope)
 
     def _split_expression_block(
         self,
@@ -2683,8 +2817,7 @@ class Translator:
         else_block = self._builder.append_block(f"if_expr_else_{if_id}")
         end_block = self._builder.append_block(f"if_expr_end_{if_id}")
 
-        base_var_vals = dict(self._var_vals)
-        base_var_ptrs = dict(self._var_ptrs)
+        base_scope = self._capture_scope()
         result_name = name or self._advance_variable()
         result_type = expected_type
         result_slot: Variable | None = (
@@ -2693,8 +2826,7 @@ class Translator:
 
         for idx, branch in enumerate(expr.branches):
             self._builder.position_at_end(cond_blocks[idx])
-            self._var_vals = dict(base_var_vals)
-            self._var_ptrs = dict(base_var_ptrs)
+            self._fork_scope(base_scope)
 
             false_target = cond_blocks[idx + 1].name if idx + 1 < branch_count else else_block.name
             cond = self._translate_expression(branch.expr)
@@ -2702,6 +2834,7 @@ class Translator:
             self._mark_current_block_terminated()
 
             self._builder.position_at_end(branch_bodies[idx])
+            self._fork_scope(base_scope)
             branch_result = self._translate_expression(branch.body, expected_type=expected_type)
             result_type = result_type or branch_result.var_out.type
             if result_slot is None:
@@ -2713,8 +2846,7 @@ class Translator:
             self._mark_current_block_terminated()
 
         self._builder.position_at_end(else_block)
-        self._var_vals = dict(base_var_vals)
-        self._var_ptrs = dict(base_var_ptrs)
+        self._fork_scope(base_scope)
         else_result = self._translate_expression(expr.else_body, expected_type=expected_type)
         result_type = result_type or else_result.var_out.type
         if result_slot is None:
@@ -2727,8 +2859,7 @@ class Translator:
 
         assert result_type is not None and result_slot is not None
         self._builder.position_at_end(end_block)
-        self._var_vals = dict(base_var_vals)
-        self._var_ptrs = dict(base_var_ptrs)
+        self._restore_scope(base_scope)
         return self._build_load_from_ptr(result_slot, name=result_name)
 
     def _translate_match_expression(
@@ -2751,8 +2882,7 @@ class Translator:
         default_prefix: str,
         arm_prefix: str,
     ) -> "_PreparedMatch":
-        base_var_vals = dict(self._var_vals)
-        base_var_ptrs = dict(self._var_ptrs)
+        base_scope = self._capture_scope()
         end_block = self._builder.append_block(f"{end_prefix}_{match_id}")
         wildcard_arm = next((arm for arm in arms if arm.is_wildcard), None)
         default_block = (
@@ -2779,8 +2909,7 @@ class Translator:
         self._mark_current_block_terminated()
         return self._PreparedMatch(
             scrutinee=scrutinee,
-            base_var_vals=base_var_vals,
-            base_var_ptrs=base_var_ptrs,
+            base_scope=base_scope,
             end_block=end_block,
             default_block=default_block,
             wildcard_arm=wildcard_arm,
@@ -2886,9 +3015,13 @@ class Translator:
         return name
 
     def _advance_variable(self) -> str:
-        self._current_variable_idx += 1
-        self._unique_variable_idx += 1
-        return f"{self._current_variable_name}_{self._unique_variable_idx}"
+        while True:
+            self._current_variable_idx += 1
+            self._unique_variable_idx += 1
+            candidate = f"{self._current_variable_name}_{self._unique_variable_idx}"
+            if candidate not in self._used_ehir_names:
+                self._used_ehir_names.add(candidate)
+                return candidate
 
     def _resolve_variable(self, name: str) -> Variable:
         if name in self._var_ptrs:
@@ -3172,6 +3305,8 @@ class Translator:
             return Type("Box", [self._translate_type(typ.pointee)])
         if is_raw_pointer_type(typ):
             return Pointer(self._translate_type(typ.pointee))
+        if is_dyn_trait_type(typ):
+            return Type("dyn", [self._translate_trait_type(typ.generics[0])])
         if typ.name == "bool":
             return Usize_t(1)
         if typ.name == "usize":
@@ -3186,6 +3321,8 @@ class Translator:
             return Isize_t(int(typ.name[1:]))
         if typ.name.startswith("f") and typ.name[1:].isdigit():
             return Float_t(int(typ.name[1:]))
+        if not typ.generics and typ.name in self._active_generic_names:
+            return Type(typ.name)
         translated_name = self._type_aliases.get(typ.name, typ.name)
         return Type(translated_name, [self._translate_type(generic) for generic in typ.generics])
 
@@ -3296,6 +3433,8 @@ class Translator:
             return False
         if is_raw_pointer_type(lhs) or is_raw_pointer_type(rhs):
             return False
+        if is_dyn_trait_type(lhs) or is_dyn_trait_type(rhs):
+            return is_dyn_trait_type(lhs) and is_dyn_trait_type(rhs)
         if lhs.name != rhs.name:
             return False
         if len(lhs.generics) != len(rhs.generics):
@@ -3304,6 +3443,22 @@ class Translator:
             if not self._types_compatible(lg, rg):
                 return False
         return True
+
+    def _same_type_shape(self, lhs: Type, rhs: Type) -> bool:
+        lhs = unwrap_for_storage(lhs)
+        rhs = unwrap_for_storage(rhs)
+        if isinstance(lhs, Pointer) and isinstance(rhs, Pointer):
+            return self._same_type_shape(lhs.pointee, rhs.pointee)
+        if is_reference_like_type(lhs) and is_reference_like_type(rhs):
+            return self._same_type_shape(lhs.pointee, rhs.pointee)
+        if lhs.name != rhs.name and lhs.name.split("::")[-1] != rhs.name.split("::")[-1]:
+            return False
+        if len(lhs.generics) != len(rhs.generics):
+            return False
+        return all(
+            self._same_type_shape(left, right)
+            for left, right in zip(lhs.generics, rhs.generics, strict=True)
+        )
 
     @staticmethod
     def _infer_int_size(expected_type: Optional[Type]) -> int:

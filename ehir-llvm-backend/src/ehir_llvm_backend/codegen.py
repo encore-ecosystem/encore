@@ -76,7 +76,7 @@ class Codegen:
         self._reset_state()
 
     def _reset_state(self):
-        self.module = ir.Module()
+        self.module = ir.Module(context=ir.Context())
         self.builder = ir.IRBuilder()
         self._variables: dict[str, object] = {}
         self._structs: dict[str, ir.BaseStructType] = {}
@@ -124,6 +124,7 @@ class Codegen:
             if isinstance(derective, ProcessedDerective_fn):
                 self._codegen_fn_body(derective)
 
+        self._emit_builtin_native_helpers()
         return self.module
 
     def _collect_enabled_functions(
@@ -215,7 +216,7 @@ class Codegen:
         st = self.module.context.get_identified_type(struct.name)
         self._structs[struct.name] = st
         template_field_types = [param.type for param in struct.fields]
-        generic_names = self._collect_generic_placeholders(template_field_types)
+        generic_names = [generic.name for generic in struct.generics]
         if generic_names:
             self._generic_struct_templates[struct.name] = (generic_names, template_field_types)
 
@@ -245,9 +246,9 @@ class Codegen:
     def _codegen_struct_body(self, struct: ProcessedDerective_struct):
         struct_type = self._structs[struct.name]
         template_field_types = [param.type for param in struct.fields]
-        generic_names = self._collect_generic_placeholders(template_field_types)
+        generic_names = [generic.name for generic in struct.generics]
         if generic_names:
-            # Generic runtime templates (__tuple_N/__array_N) are materialized
+            # Generic backend templates (__tuple_N/__array_N) are materialized
             # into concrete identified structs on demand in _build_type().
             self._generic_struct_templates[struct.name] = (generic_names, template_field_types)
             return
@@ -423,7 +424,11 @@ class Codegen:
 
         assert instr.var_out.type is not None
         dst_type = self._build_type(instr.var_out.type)
-        if instr.var_out.type.name == "dyn" and len(instr.var_out.type.generics) == 1:
+        if (
+            not isinstance(instr.var_out.type, Pointer)
+            and instr.var_out.type.name == "dyn"
+            and len(instr.var_out.type.generics) == 1
+        ):
             trait_name = instr.var_out.type.generics[0].name
             assert instr.var.type is not None
             raw_ptr = self._pack_dyn_payload(value, instr.var.type)
@@ -444,9 +449,31 @@ class Codegen:
             dst_width = dst_type.width
 
             if src_width < dst_width:
-                result = self.builder.zext(value, dst_type, name=instr.var_out.name)
+                if self._is_signed_integer_type(instr.var.type):
+                    result = self.builder.sext(value, dst_type, name=instr.var_out.name)
+                else:
+                    result = self.builder.zext(value, dst_type, name=instr.var_out.name)
             elif src_width > dst_width:
                 result = self.builder.trunc(value, dst_type, name=instr.var_out.name)
+            else:
+                result = value
+        elif isinstance(src_type, ir.IntType) and isinstance(dst_type, self._float_ir_types()):
+            if self._is_signed_integer_type(instr.var.type):
+                result = self.builder.sitofp(value, dst_type, name=instr.var_out.name)
+            else:
+                result = self.builder.uitofp(value, dst_type, name=instr.var_out.name)
+        elif isinstance(src_type, self._float_ir_types()) and isinstance(dst_type, ir.IntType):
+            if self._is_signed_integer_type(instr.var_out.type):
+                result = self.builder.fptosi(value, dst_type, name=instr.var_out.name)
+            else:
+                result = self.builder.fptoui(value, dst_type, name=instr.var_out.name)
+        elif isinstance(src_type, self._float_ir_types()) and isinstance(dst_type, self._float_ir_types()):
+            src_width = self._float_width(src_type)
+            dst_width = self._float_width(dst_type)
+            if src_width < dst_width:
+                result = self.builder.fpext(value, dst_type, name=instr.var_out.name)
+            elif src_width > dst_width:
+                result = self.builder.fptrunc(value, dst_type, name=instr.var_out.name)
             else:
                 result = value
         elif isinstance(src_type, ir.IntType) and isinstance(dst_type, ir.PointerType):
@@ -1131,12 +1158,37 @@ class Codegen:
             if fn is None:
                 values.append(ir.Constant(ir.IntType(8).as_pointer(), None))
             else:
-                values.append(ir.Constant.bitcast(fn, ir.IntType(8).as_pointer()))
+                thunk = self._get_dyn_thunk(trait_name, method_name, concrete_type, fn)
+                values.append(ir.Constant.bitcast(thunk, ir.IntType(8).as_pointer()))
         gv = ir.GlobalVariable(self.module, vtable_struct, name=global_name)
         gv.global_constant = True
         gv.linkage = "internal"
         gv.initializer = ir.Constant(vtable_struct, values)
         return self.builder.bitcast(gv, ir.IntType(8).as_pointer(), name=f"{global_name}.ptr")
+
+    def _get_dyn_thunk(self, trait_name: str, method_name: str, concrete_type: Type, impl_fn: ir.Function) -> ir.Function:
+        thunk_name = (
+            f"__dyn_thunk_{trait_name.replace('::', '_')}__{method_name}__{mangle_type_name(concrete_type)}"
+        )
+        existing = self.module.globals.get(thunk_name)
+        if isinstance(existing, ir.Function):
+            return existing
+
+        impl_type = impl_fn.function_type
+        thunk_type = ir.FunctionType(impl_type.return_type, [ir.IntType(8).as_pointer(), *impl_type.args[1:]])
+        thunk = ir.Function(self.module, thunk_type, name=thunk_name)
+        thunk.linkage = "internal"
+
+        block = thunk.append_basic_block("entry")
+        builder = ir.IRBuilder(block)
+        typed_self_ptr = builder.bitcast(thunk.args[0], ir.PointerType(impl_type.args[0]), name="self.ptr")
+        typed_self = builder.load(typed_self_ptr, name="self")
+        result = builder.call(impl_fn, [typed_self, *list(thunk.args[1:])], name="call")
+        if isinstance(impl_type.return_type, ir.VoidType):
+            builder.ret_void()
+        else:
+            builder.ret(result)
+        return thunk
 
     def _resolve_dyn_callee_from_vtable(
         self,
@@ -1173,21 +1225,13 @@ class Codegen:
         method_candidates = self._collect_dyn_method_candidates(trait_name, method_name)
         if not method_candidates:
             raise ValueError(f"No dyn dispatch candidates found for {trait_name}::{method_name}")
-        proto = method_candidates[0].function_type
+        sample_proto = method_candidates[0].function_type
+        proto = ir.FunctionType(sample_proto.return_type, [ir.IntType(8).as_pointer(), *sample_proto.args[1:]])
         fn_ptr_t = ir.PointerType(proto)
         fn_ptr = self.builder.bitcast(fn_raw, fn_ptr_t, name=f"{result_name}.vt_fn")
 
-        call_args = []
-        for arg_index, expected_type in enumerate(proto.args):
-            if arg_index == 0:
-                typed_data_ptr = self.builder.bitcast(
-                    receiver_data_ptr,
-                    ir.PointerType(expected_type),
-                    name=f"{result_name}.dyn_self_ptr",
-                )
-                self_arg = self.builder.load(typed_data_ptr, name=f"{result_name}.dyn_self")
-                call_args.append(self_arg)
-                continue
+        call_args = [receiver_data_ptr]
+        for arg_index, expected_type in enumerate(proto.args[1:], start=1):
             arg = args[arg_index]
             value = self._get_typed_value(arg)
             call_args.append(
@@ -1765,12 +1809,14 @@ class Codegen:
 
         return struct
 
-    @staticmethod
-    def _is_generic_placeholder_name(name: str) -> bool:
+    def _is_generic_placeholder_name(self, name: str) -> bool:
+        if name in self._structs:
+            return False
         return (
             name in {"Self", "T"}
             or (len(name) == 1 and name.isupper())
             or (name.startswith("T") and name[1:].isdigit())
+            or ("::" not in name and name[:1].isupper())
         )
 
     def _collect_generic_placeholders(self, types: list[Type]) -> list[str]:
@@ -1973,29 +2019,134 @@ class Codegen:
         free_func.attributes.add("noinline")
         return free_func
 
-    def _get_str_concat_function(self) -> ir.Function:
-        if "__ehir_rt_str_concat" in self.module.globals:
-            fn = self.module.globals["__ehir_rt_str_concat"]
+    def _get_write_function(self):
+        if "write" in self.module.globals:
+            fn = self.module.globals["write"]
             if not isinstance(fn, ir.Function):
-                raise TypeError("__ehir_rt_str_concat global is not a function")
+                raise TypeError("write global is not a function")
+            return fn
+
+        size_type = ir.IntType(self._get_pointer_width_bits())
+        write_type = ir.FunctionType(
+            size_type,
+            [ir.IntType(32), ir.IntType(8).as_pointer(), size_type],
+        )
+        write_func = ir.Function(self.module, write_type, name="write")
+        write_func.attributes.add("noinline")
+        return write_func
+
+    def _get_str_concat_function(self) -> ir.Function:
+        if "encore_str_concat" in self.module.globals:
+            fn = self.module.globals["encore_str_concat"]
+            if not isinstance(fn, ir.Function):
+                raise TypeError("encore_str_concat global is not a function")
             return fn
 
         str_type = self._get_str_type()
         fn_type = ir.FunctionType(str_type, [str_type, str_type])
-        fn = ir.Function(self.module, fn_type, name="__ehir_rt_str_concat")
+        fn = ir.Function(self.module, fn_type, name="encore_str_concat")
         fn.attributes.add("noinline")
         return fn
 
+    def _emit_builtin_native_helpers(self) -> None:
+        self._emit_builtin_str_concat()
+        self._emit_builtin_io_write()
+
+    def _native_declaration(self, name: str) -> ir.Function | None:
+        value = self.module.globals.get(name)
+        if value is None:
+            return None
+        if not isinstance(value, ir.Function):
+            raise TypeError(f"{name} global is not a function")
+        if len(value.blocks) > 0:
+            return None
+        return value
+
+    def _emit_builtin_str_concat(self) -> None:
+        fn = self._native_declaration("encore_str_concat")
+        if fn is None:
+            return
+        str_type = self._get_str_type()
+        expected_type = ir.FunctionType(str_type, [str_type, str_type])
+        if str(fn.function_type) != str(expected_type):
+            raise TypeError(f"encore_str_concat has incompatible type: {fn.function_type}")
+
+        fn.linkage = "internal"
+        lhs, rhs = fn.args
+        lhs.name = "lhs"
+        rhs.name = "rhs"
+        block = fn.append_basic_block("entry")
+        builder = ir.IRBuilder(block)
+
+        lhs_ptr = builder.extract_value(lhs, 0, name="lhs_ptr")
+        lhs_len = builder.extract_value(lhs, 1, name="lhs_len")
+        rhs_ptr = builder.extract_value(rhs, 0, name="rhs_ptr")
+        rhs_len = builder.extract_value(rhs, 1, name="rhs_len")
+        total_len = builder.add(lhs_len, rhs_len, name="total_len")
+
+        malloc_size = self._coerce_int_width(builder, total_len, 64, "malloc_size")
+        out_ptr = builder.call(self._get_malloc_function(), [malloc_size], name="out_ptr")
+        memcpy = self._get_memcpy_function()
+        copy_len_type = memcpy.function_type.args[2]
+        lhs_copy_len = self._coerce_int_width(builder, lhs_len, copy_len_type.width, "lhs_copy_len")
+        rhs_copy_len = self._coerce_int_width(builder, rhs_len, copy_len_type.width, "rhs_copy_len")
+        offset = self._coerce_int_width(builder, lhs_len, self._get_pointer_width_bits(), "rhs_offset")
+        rhs_dst = builder.gep(out_ptr, [offset], name="rhs_dst")
+
+        builder.call(memcpy, [out_ptr, lhs_ptr, lhs_copy_len])
+        builder.call(memcpy, [rhs_dst, rhs_ptr, rhs_copy_len])
+
+        out = ir.Constant(str_type, ir.Undefined)
+        out = builder.insert_value(out, out_ptr, 0, name="out_with_ptr")
+        out = builder.insert_value(out, total_len, 1, name="out")
+        builder.ret(out)
+
+    def _emit_builtin_io_write(self) -> None:
+        fn = self._native_declaration("encore_io_write")
+        if fn is None:
+            return
+        str_type = self._get_str_type()
+        expected_type = ir.FunctionType(ir.IntType(32), [ir.IntType(32), str_type])
+        if str(fn.function_type) != str(expected_type):
+            raise TypeError(f"encore_io_write has incompatible type: {fn.function_type}")
+
+        fn.linkage = "internal"
+        fd, value = fn.args
+        fd.name = "fd"
+        value.name = "value"
+        block = fn.append_basic_block("entry")
+        builder = ir.IRBuilder(block)
+
+        ptr = builder.extract_value(value, 0, name="ptr")
+        length = builder.extract_value(value, 1, name="len")
+        write = self._get_write_function()
+        write_len_type = write.function_type.args[2]
+        write_len = self._coerce_int_width(builder, length, write_len_type.width, "write_len")
+        written = builder.call(write, [fd, ptr, write_len], name="written")
+        ret = self._coerce_int_width(builder, written, 32, "ret")
+        builder.ret(ret)
+
+    @staticmethod
+    def _coerce_int_width(builder: ir.IRBuilder, value, width: int, name: str):
+        if not isinstance(value.type, ir.IntType):
+            raise TypeError(f"Expected integer value for {name}, got {value.type}")
+        if value.type.width == width:
+            return value
+        target = ir.IntType(width)
+        if value.type.width < width:
+            return builder.zext(value, target, name=name)
+        return builder.trunc(value, target, name=name)
+
     def _get_str_eq_function(self) -> ir.Function:
-        if "__ehir_rt_str_eq" in self.module.globals:
-            fn = self.module.globals["__ehir_rt_str_eq"]
+        if "encore_str_eq" in self.module.globals:
+            fn = self.module.globals["encore_str_eq"]
             if not isinstance(fn, ir.Function):
-                raise TypeError("__ehir_rt_str_eq global is not a function")
+                raise TypeError("encore_str_eq global is not a function")
             return fn
 
         str_type = self._get_str_type()
         fn_type = ir.FunctionType(ir.IntType(1), [str_type, str_type])
-        fn = ir.Function(self.module, fn_type, name="__ehir_rt_str_eq")
+        fn = ir.Function(self.module, fn_type, name="encore_str_eq")
         fn.attributes.add("noinline")
         return fn
 
@@ -2031,3 +2182,24 @@ class Codegen:
         memset_func = ir.Function(self.module, memset_type, name="memset")
         memset_func.attributes.add("noinline")
         return memset_func
+
+    def _get_memcpy_function(self):
+        if "memcpy" in self.module.globals:
+            fn = self.module.globals["memcpy"]
+            if not isinstance(fn, ir.Function):
+                raise TypeError("memcpy global is not a function")
+            return fn
+
+        size_type = ir.IntType(self._get_pointer_width_bits())
+        memcpy_type = ir.FunctionType(
+            ir.IntType(8).as_pointer(),
+            [
+                ir.IntType(8).as_pointer(),
+                ir.IntType(8).as_pointer(),
+                size_type,
+            ],
+        )
+
+        memcpy_func = ir.Function(self.module, memcpy_type, name="memcpy")
+        memcpy_func.attributes.add("noinline")
+        return memcpy_func

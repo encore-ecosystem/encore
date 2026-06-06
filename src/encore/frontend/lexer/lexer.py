@@ -237,6 +237,7 @@ class Lexer(ParserBase[str, LexerToken]):
             "struct": TokenType.KW_STRUCT,
             "enum": TokenType.KW_ENUM,
             "trait": TokenType.KW_TRAIT,
+            "dyn": TokenType.KW_DYN,
             "impl": TokenType.KW_IMPL,
             "for": TokenType.KW_FOR,
             "in": TokenType.KW_IN,

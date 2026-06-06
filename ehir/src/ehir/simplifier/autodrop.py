@@ -7,6 +7,7 @@ from ehir.core.derectives.base import Derective
 from ehir.core.enum import EnumVariant, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import (
     Instruction_add,
+    Instruction_and,
     Instruction_br,
     Instruction_capprim,
     Instruction_cbr,
@@ -18,7 +19,7 @@ from ehir.core.instructions import (
     Instruction_load,
     Instruction_match,
     Instruction_neq,
-    Instruction_or,
+    Instruction_pcast,
     Instruction_ret,
     Instruction_store,
     Instruction_sub,
@@ -189,7 +190,9 @@ class AutoDropPass:
             self._generate_cfree_initiator_fn(directive, box_type),
             self._generate_cfree_pass0_fn(directive, box_type, edges),
             self._generate_cfree_pass1_fn(directive, box_type, edges),
+            self._generate_cfree_mark_outer_fn(directive, box_type, edges),
             self._generate_cfree_pass2_fn(directive, box_type, edges),
+            self._generate_cfree_pass3_fn(directive, box_type, edges),
         ]
 
     def _generate_cfree_initiator_fn(self, directive: Derective_struct, box_type: Type) -> Derective_fn:
@@ -197,10 +200,10 @@ class AutoDropPass:
         owner_ptr_type = directive.params[1].type
         assert isinstance(owner_ptr_type, Pointer)
 
-        body: list = []
-        owner_ptr = self._emit_owner_ptr(body, self_var, owner_ptr_type, ".cfree")
-        self._emit_ref_count_add(body, owner_ptr, -1, ".cfree_root")
-        body.extend(
+        entry_body: list = []
+        owner_ptr = self._emit_owner_ptr(entry_body, self_var, owner_ptr_type, ".cfree")
+        self._emit_ref_count_add(entry_body, owner_ptr, -1, ".cfree_root")
+        entry_body.extend(
             [
                 Instruction_call(
                     var_out=TypedVariable(".cfree_pass0_ret", Type("void")),
@@ -220,10 +223,88 @@ class AutoDropPass:
                     generics=[],
                     args=[deepcopy(self_var)],
                 ),
-                Instruction_ret(TypedVariable(".cfree_ret", Type("void"))),
             ]
         )
-        return self._cfree_fn(self._cfree_name(box_type), box_type, [Block(name="entry", body=body)])
+        root_candidate = self._emit_free_candidate(entry_body, owner_ptr, ".cfree_root_candidate")
+        entry_body.append(
+            Instruction_cbr(
+                cond_var=root_candidate,
+                true_br_label="break_root",
+                else_br_label="sweep",
+            )
+        )
+
+        break_root_body: list = []
+        zero = self._emit_usize_const(break_root_body, 0, ".cfree_root_pending_zero")
+        root_ref_ptr = self._emit_owner_field_ptr(break_root_body, owner_ptr, 1, Usize_t(), ".cfree_root_pending")
+        break_root_body.extend(
+            [
+                Instruction_store(var_src=zero, var_dst=root_ref_ptr),
+                Instruction_br(label="sweep"),
+            ]
+        )
+
+        sweep_body: list = [
+            Instruction_call(
+                var_out=TypedVariable(".cfree_pass3_ret", Type("void")),
+                fn_name=self._cfree_pass_name(box_type, 3),
+                generics=[],
+                args=[deepcopy(self_var)],
+            ),
+            Instruction_ret(TypedVariable(".cfree_ret", Type("void"))),
+        ]
+        return self._cfree_fn(
+            self._cfree_name(box_type),
+            box_type,
+            [
+                Block(name="entry", body=entry_body),
+                Block(name="break_root", body=break_root_body),
+                Block(name="sweep", body=sweep_body),
+            ],
+        )
+
+    def _generate_cfree_mark_outer_fn(
+        self,
+        directive: Derective_struct,
+        box_type: Type,
+        edges: list[_ChildEdge],
+    ) -> Derective_fn:
+        self_var = TypedVariable("self", box_type)
+        ptr_type = directive.params[0].type
+        owner_ptr_type = directive.params[1].type
+        assert isinstance(ptr_type, Pointer)
+        assert isinstance(owner_ptr_type, Pointer)
+
+        entry_body: list = []
+        owner_ptr = self._emit_owner_ptr(entry_body, self_var, owner_ptr_type, ".cfree_outer")
+        outer_ptr = self._emit_owner_field_ptr(entry_body, owner_ptr, 3, Usize_t(1), ".cfree_outer")
+        outer = TypedVariable(".cfree_outer", Usize_t(1))
+        entry_body.extend(
+            [
+                Instruction_load(var_out=outer, var=outer_ptr),
+                Instruction_cbr(cond_var=outer, true_br_label="done", else_br_label="visit"),
+            ]
+        )
+
+        visit_body: list = []
+        true_var = self._emit_bool_const(visit_body, True, ".cfree_outer_true")
+        visit_body.append(Instruction_store(var_src=true_var, var_dst=outer_ptr))
+        value = self._emit_box_value(visit_body, self_var, ptr_type, ".cfree_outer_value")
+
+        blocks = [Block(name="entry", body=entry_body)]
+        blocks.extend(
+            self._edge_chain_blocks(
+                start_name="visit",
+                start_body=visit_body,
+                value_var=value,
+                edges=edges,
+                op=lambda body, child, prefix: self._emit_mark_outer_child(body, child, prefix),
+                final=Instruction_br(label="done"),
+                prefix=".cfree_outer",
+            )
+        )
+        blocks.append(Block(name="done", body=[Instruction_ret(TypedVariable(".cfree_outer_ret", Type("void")))]))
+        return self._cfree_fn(self._cfree_mark_outer_name(box_type), box_type, blocks)
 
     def _generate_cfree_pass0_fn(
         self,
@@ -295,20 +376,24 @@ class AutoDropPass:
         ref_count = self._emit_ref_count_load(visit_body, owner_ptr, ".cfree1")
         zero = self._emit_usize_const(visit_body, 0, ".cfree1_zero")
         has_outer_count = TypedVariable(".cfree1_has_outer_count", Usize_t(1))
-        outer_ptr = self._emit_owner_field_ptr(visit_body, owner_ptr, 3, Usize_t(1), ".cfree1_outer")
-        outer = TypedVariable(".cfree1_outer", Usize_t(1))
-        outer_next = TypedVariable(".cfree1_outer_next", Usize_t(1))
         true_var = self._emit_bool_const(visit_body, True, ".cfree1_true")
         visit_body.extend(
             [
                 Instruction_neq(var_out=has_outer_count, lhs=ref_count, rhs=zero),
-                Instruction_load(var_out=outer, var=outer_ptr),
-                Instruction_or(var_out=outer_next, lhs=outer, rhs=has_outer_count),
-                Instruction_store(var_src=outer_next, var_dst=outer_ptr),
                 Instruction_store(var_src=true_var, var_dst=visited_ptr),
-                Instruction_cbr(cond_var=outer_next, true_br_label="propagate", else_br_label="scan"),
+                Instruction_cbr(cond_var=has_outer_count, true_br_label="mark_outer", else_br_label="scan"),
             ]
         )
+
+        mark_outer_body: list = [
+            Instruction_call(
+                var_out=TypedVariable(".cfree1_mark_outer_ret", Type("void")),
+                fn_name=self._cfree_mark_outer_name(box_type),
+                generics=[],
+                args=[deepcopy(self_var)],
+            ),
+            Instruction_br(label="scan"),
+        ]
 
         value_scan_body: list = []
         value_scan = self._emit_box_value(value_scan_body, self_var, ptr_type, ".cfree1_scan_value")
@@ -322,20 +407,11 @@ class AutoDropPass:
             prefix=".cfree1_scan",
         )
 
-        value_prop_body: list = []
-        value_prop = self._emit_box_value(value_prop_body, self_var, ptr_type, ".cfree1_prop_value")
-        prop_blocks = self._edge_chain_blocks(
-            start_name="propagate",
-            start_body=value_prop_body,
-            value_var=value_prop,
-            edges=edges,
-            op=lambda body, child, prefix: self._emit_pass1_propagate_child(body, child, prefix),
-            final=Instruction_br(label="done"),
-            prefix=".cfree1_prop",
-        )
-
-        blocks = [Block(name="entry", body=entry_body), Block(name="visit", body=visit_body)]
-        blocks.extend(prop_blocks)
+        blocks = [
+            Block(name="entry", body=entry_body),
+            Block(name="visit", body=visit_body),
+            Block(name="mark_outer", body=mark_outer_body),
+        ]
         blocks.extend(scan_blocks)
         blocks.append(Block(name="done", body=[Instruction_ret(TypedVariable(".cfree1_ret", Type("void")))]))
         return self._cfree_fn(self._cfree_pass_name(box_type, 1), box_type, blocks)
@@ -354,82 +430,141 @@ class AutoDropPass:
 
         entry_body: list = []
         owner_ptr = self._emit_owner_ptr(entry_body, self_var, owner_ptr_type, ".cfree2")
+        inner_ptr = self._emit_owner_field_ptr(entry_body, owner_ptr, 2, Usize_t(1), ".cfree2_inner")
+        inner = TypedVariable(".cfree2_inner", Usize_t(1))
         deal_ptr = self._emit_owner_field_ptr(entry_body, owner_ptr, 5, Usize_t(1), ".cfree2_deal")
         deal = TypedVariable(".cfree2_deal", Usize_t(1))
         entry_body.extend(
             [
-                Instruction_load(var_out=deal, var=deal_ptr),
-                Instruction_cbr(cond_var=deal, true_br_label="done", else_br_label="visit"),
+                Instruction_load(var_out=inner, var=inner_ptr),
+                Instruction_cbr(cond_var=inner, true_br_label="check_deal", else_br_label="done"),
             ]
         )
+        check_deal_body: list = [
+            Instruction_load(var_out=deal, var=deal_ptr),
+            Instruction_cbr(cond_var=deal, true_br_label="done", else_br_label="visit"),
+        ]
 
         visit_body: list = []
         true_var = self._emit_bool_const(visit_body, True, ".cfree2_true")
         visit_body.append(Instruction_store(var_src=true_var, var_dst=deal_ptr))
+        self_candidate = self._emit_free_candidate(visit_body, owner_ptr, ".cfree2_self_candidate")
         value = self._emit_box_value(visit_body, self_var, ptr_type, ".cfree2_value")
 
-        blocks = [Block(name="entry", body=entry_body)]
+        blocks = [Block(name="entry", body=entry_body), Block(name="check_deal", body=check_deal_body)]
         blocks.extend(
             self._edge_chain_blocks(
                 start_name="visit",
                 start_body=visit_body,
                 value_var=value,
                 edges=edges,
-                op=lambda body, child, prefix: self._emit_pass_call(body, child, 2, prefix),
-                final=Instruction_br(label="decide"),
-                prefix=".cfree2_recurse",
+                op=lambda body, child, prefix: self._emit_count_free_edge(body, child, self_candidate, prefix),
+                final=Instruction_br(label="done"),
+                prefix=".cfree2_count",
             )
         )
-        blocks.extend(self._generate_pass2_decision_blocks(self_var, ptr_type, owner_ptr, edges))
         blocks.append(Block(name="done", body=[Instruction_ret(TypedVariable(".cfree2_ret", Type("void")))]))
         return self._cfree_fn(self._cfree_pass_name(box_type, 2), box_type, blocks)
 
-    def _generate_pass2_decision_blocks(
+    def _generate_cfree_pass3_fn(
         self,
-        self_var: TypedVariable,
-        ptr_type: Pointer,
-        owner_ptr: TypedVariable,
+        directive: Derective_struct,
+        box_type: Type,
         edges: list[_ChildEdge],
-    ) -> list[Block]:
-        decide_body: list = []
-        ref_count = self._emit_ref_count_load(decide_body, owner_ptr, ".cfree2_decide")
-        zero = self._emit_usize_const(decide_body, 0, ".cfree2_zero")
-        is_zero = TypedVariable(".cfree2_is_zero", Usize_t(1))
-        decide_body.extend(
-            [
-                Instruction_ieq(var_out=is_zero, lhs=ref_count, rhs=zero),
-                Instruction_cbr(cond_var=is_zero, true_br_label="check_inner", else_br_label="survive"),
-            ]
-        )
+    ) -> Derective_fn:
+        self_var = TypedVariable("self", box_type)
+        ptr_type = directive.params[0].type
+        owner_ptr_type = directive.params[1].type
+        assert isinstance(ptr_type, Pointer)
+        assert isinstance(owner_ptr_type, Pointer)
 
-        check_inner_body: list = []
-        inner_ptr = self._emit_owner_field_ptr(check_inner_body, owner_ptr, 2, Usize_t(1), ".cfree2_inner")
-        inner = TypedVariable(".cfree2_inner", Usize_t(1))
-        check_inner_body.extend(
+        entry_body: list = []
+        owner_ptr = self._emit_owner_ptr(entry_body, self_var, owner_ptr_type, ".cfree3")
+        inner_ptr = self._emit_owner_field_ptr(entry_body, owner_ptr, 2, Usize_t(1), ".cfree3_inner")
+        inner = TypedVariable(".cfree3_inner", Usize_t(1))
+        entry_body.extend(
             [
                 Instruction_load(var_out=inner, var=inner_ptr),
-                Instruction_cbr(cond_var=inner, true_br_label="check_outer", else_br_label="survive"),
+                Instruction_cbr(cond_var=inner, true_br_label="decide", else_br_label="maybe_finalize"),
             ]
         )
 
-        check_outer_body: list = []
-        outer_ptr = self._emit_owner_field_ptr(check_outer_body, owner_ptr, 3, Usize_t(1), ".cfree2_outer")
-        outer = TypedVariable(".cfree2_outer", Usize_t(1))
-        false_var = self._emit_bool_const(check_outer_body, False, ".cfree2_false")
-        not_outer = TypedVariable(".cfree2_not_outer", Usize_t(1))
-        check_outer_body.extend(
+        maybe_finalize_body: list = []
+        alive = self._emit_candidate_alive(maybe_finalize_body, owner_ptr, ".cfree3_finalize_alive")
+        active_ptr = self._emit_owner_field_ptr(maybe_finalize_body, owner_ptr, 4, Usize_t(1), ".cfree3_finalize_active")
+        active = TypedVariable(".cfree3_finalize_active", Usize_t(1))
+        finalize_false = self._emit_bool_const(maybe_finalize_body, False, ".cfree3_finalize_false")
+        inactive = TypedVariable(".cfree3_finalize_inactive", Usize_t(1))
+        can_check_pending = TypedVariable(".cfree3_finalize_can_check_pending", Usize_t(1))
+        maybe_finalize_body.extend(
             [
-                Instruction_load(var_out=outer, var=outer_ptr),
-                Instruction_ieq(var_out=not_outer, lhs=outer, rhs=false_var),
-                Instruction_cbr(cond_var=not_outer, true_br_label="free", else_br_label="survive"),
+                Instruction_load(var_out=active, var=active_ptr),
+                Instruction_ieq(var_out=inactive, lhs=active, rhs=finalize_false),
+                Instruction_and(var_out=can_check_pending, lhs=alive, rhs=inactive),
+                Instruction_cbr(cond_var=can_check_pending, true_br_label="finalize_pending", else_br_label="done"),
+            ]
+        )
+
+        finalize_pending_body: list = []
+        finalize_pending = self._emit_ref_count_load(finalize_pending_body, owner_ptr, ".cfree3_finalize_pending")
+        finalize_zero = self._emit_usize_const(finalize_pending_body, 0, ".cfree3_finalize_zero")
+        finalize_pending_zero = TypedVariable(".cfree3_finalize_pending_zero", Usize_t(1))
+        finalize_pending_body.extend(
+            [
+                Instruction_ieq(var_out=finalize_pending_zero, lhs=finalize_pending, rhs=finalize_zero),
+                Instruction_cbr(cond_var=finalize_pending_zero, true_br_label="free", else_br_label="done"),
+            ]
+        )
+
+        decide_body: list = []
+        candidate = self._emit_free_candidate(decide_body, owner_ptr, ".cfree3_candidate")
+        decide_body.append(Instruction_cbr(cond_var=candidate, true_br_label="free_visit", else_br_label="survive"))
+
+        free_visit_body: list = []
+        false_var = self._emit_bool_const(free_visit_body, False, ".cfree3_free_false")
+        true_var = self._emit_bool_const(free_visit_body, True, ".cfree3_free_true")
+        active_ptr = self._emit_owner_field_ptr(free_visit_body, owner_ptr, 4, Usize_t(1), ".cfree3_free_active")
+        free_visit_body.append(Instruction_store(var_src=false_var, var_dst=inner_ptr))
+        free_visit_body.append(Instruction_store(var_src=true_var, var_dst=active_ptr))
+        value = self._emit_box_value(free_visit_body, self_var, ptr_type, ".cfree3_free_value")
+
+        blocks = [
+            Block(name="entry", body=entry_body),
+            Block(name="maybe_finalize", body=maybe_finalize_body),
+            Block(name="finalize_pending", body=finalize_pending_body),
+            Block(name="decide", body=decide_body),
+        ]
+        blocks.extend(
+            self._edge_chain_blocks(
+                start_name="free_visit",
+                start_body=free_visit_body,
+                value_var=value,
+                edges=edges,
+                op=lambda body, child, prefix: self._emit_sweep_child_from_free(body, child, prefix),
+                final=Instruction_br(label="finish_free_candidate"),
+                prefix=".cfree3_free",
+            )
+        )
+
+        finish_free_body: list = []
+        finish_false = self._emit_bool_const(finish_free_body, False, ".cfree3_finish_false")
+        finish_active_ptr = self._emit_owner_field_ptr(finish_free_body, owner_ptr, 4, Usize_t(1), ".cfree3_finish_active")
+        finish_free_body.append(Instruction_store(var_src=finish_false, var_dst=finish_active_ptr))
+        pending = self._emit_ref_count_load(finish_free_body, owner_ptr, ".cfree3_finish_pending")
+        zero = self._emit_usize_const(finish_free_body, 0, ".cfree3_finish_zero")
+        pending_zero = TypedVariable(".cfree3_finish_pending_zero", Usize_t(1))
+        finish_free_body.extend(
+            [
+                Instruction_ieq(var_out=pending_zero, lhs=pending, rhs=zero),
+                Instruction_cbr(cond_var=pending_zero, true_br_label="free", else_br_label="done"),
             ]
         )
 
         free_body: list = []
-        kind_ptr = self._emit_owner_field_ptr(free_body, owner_ptr, 0, Usize_t(8), ".cfree2_kind")
-        kind = TypedVariable(".cfree2_kind", Usize_t(8))
-        heap_kind = self._emit_u8_const(free_body, 0, ".cfree2_heap_kind")
-        is_heap = TypedVariable(".cfree2_is_heap", Usize_t(1))
+        kind_ptr = self._emit_owner_field_ptr(free_body, owner_ptr, 0, Usize_t(8), ".cfree3_kind")
+        kind = TypedVariable(".cfree3_kind", Usize_t(8))
+        heap_kind = self._emit_u8_const(free_body, 0, ".cfree3_heap_kind")
+        is_heap = TypedVariable(".cfree3_is_heap", Usize_t(1))
         free_body.extend(
             [
                 Instruction_load(var_out=kind, var=kind_ptr),
@@ -439,21 +574,21 @@ class AutoDropPass:
         )
 
         free_heap_body: list = []
-        ptr = self._emit_box_ptr(free_heap_body, self_var, ptr_type, ".cfree2_free")
+        ptr = self._emit_box_ptr(free_heap_body, self_var, ptr_type, ".cfree3_free")
         if self._trace_cfree:
             msg = self._emit_cfree_trace_message_with_id(
                 free_heap_body,
                 box_type_name=self_var.type.name,
                 ptr_type=ptr_type,
                 ptr_var=ptr,
-                prefix=".cfree2_trace_heap",
+                prefix=".cfree3_trace_heap",
             )
-            fd = TypedVariable(".cfree2_trace_heap_fd", Type("i32"))
+            fd = TypedVariable(".cfree3_trace_heap_fd", Type("i32"))
             free_heap_body.append(Instruction_capprim(var_out=fd, primitive=Usize(2, size=32)))
             free_heap_body.append(
                 Instruction_call(
-                    var_out=TypedVariable(".cfree2_trace_heap_out", Type("i32")),
-                    fn_name="__ehir_rt_io_write",
+                    var_out=TypedVariable(".cfree3_trace_heap_out", Type("i32")),
+                    fn_name="encore_io_write",
                     generics=[],
                     args=[fd, msg],
                 )
@@ -465,14 +600,14 @@ class AutoDropPass:
             msg = self._emit_debug_message(
                 free_owner_body,
                 f"[cfree] free owner header of {self_var.type.name}\n",
-                ".cfree2_trace_owner",
+                ".cfree3_trace_owner",
             )
-            fd = TypedVariable(".cfree2_trace_owner_fd", Type("i32"))
+            fd = TypedVariable(".cfree3_trace_owner_fd", Type("i32"))
             free_owner_body.append(Instruction_capprim(var_out=fd, primitive=Usize(2, size=32)))
             free_owner_body.append(
                 Instruction_call(
-                    var_out=TypedVariable(".cfree2_trace_owner_out", Type("i32")),
-                    fn_name="__ehir_rt_io_write",
+                    var_out=TypedVariable(".cfree3_trace_owner_out", Type("i32")),
+                    fn_name="encore_io_write",
                     generics=[],
                     args=[fd, msg],
                 )
@@ -480,40 +615,39 @@ class AutoDropPass:
         free_owner_body.extend(
             [
                 Instruction_hfree(var=owner_ptr),
-                Instruction_ret(TypedVariable(".cfree2_ret", Type("void"))),
+                Instruction_br(label="done"),
             ]
         )
 
         survive_body: list = []
-        value = self._emit_box_value(survive_body, self_var, ptr_type, ".cfree2_restore_value")
-        blocks = [
-            Block(name="decide", body=decide_body),
-            Block(name="check_inner", body=check_inner_body),
-            Block(name="check_outer", body=check_outer_body),
-            Block(name="free", body=free_body),
-            Block(name="free_heap", body=free_heap_body),
-            Block(name="free_owner", body=free_owner_body),
-        ]
+        survive_false = self._emit_bool_const(survive_body, False, ".cfree3_survive_false")
+        for index, name in ((2, "inner"), (3, "outer"), (4, "visited"), (5, "deal")):
+            field_ptr = self._emit_owner_field_ptr(survive_body, owner_ptr, index, Usize_t(1), f".cfree3_survive_{name}")
+            survive_body.append(Instruction_store(var_src=survive_false, var_dst=field_ptr))
+        survive_value = self._emit_box_value(survive_body, self_var, ptr_type, ".cfree3_survive_value")
+
+        blocks.extend(
+            [
+                Block(name="finish_free_candidate", body=finish_free_body),
+                Block(name="free", body=free_body),
+                Block(name="free_heap", body=free_heap_body),
+                Block(name="free_owner", body=free_owner_body),
+            ]
+        )
         blocks.extend(
             self._edge_chain_blocks(
                 start_name="survive",
                 start_body=survive_body,
-                value_var=value,
+                value_var=survive_value,
                 edges=edges,
-                op=lambda body, child, prefix: self._emit_ref_count_add_for_box(body, child, 1, prefix),
-                final=Instruction_br(label="reset"),
-                prefix=".cfree2_restore",
+                op=lambda body, child, prefix: self._emit_sweep_child_from_survivor(body, child, prefix),
+                final=Instruction_br(label="done"),
+                prefix=".cfree3_survive",
             )
         )
 
-        reset_body: list = []
-        false_reset = self._emit_bool_const(reset_body, False, ".cfree2_reset_false")
-        for index, name in ((2, "inner"), (3, "outer"), (4, "visited"), (5, "deal")):
-            field_ptr = self._emit_owner_field_ptr(reset_body, owner_ptr, index, Usize_t(1), f".cfree2_reset_{name}")
-            reset_body.append(Instruction_store(var_src=false_reset, var_dst=field_ptr))
-        reset_body.append(Instruction_ret(TypedVariable(".cfree2_ret", Type("void"))))
-        blocks.append(Block(name="reset", body=reset_body))
-        return blocks
+        blocks.append(Block(name="done", body=[Instruction_ret(TypedVariable(".cfree3_ret", Type("void")))]))
+        return self._cfree_fn(self._cfree_pass_name(box_type, 3), box_type, blocks)
 
     def _edge_chain_blocks(
         self,
@@ -558,7 +692,7 @@ class AutoDropPass:
                 Pointer(deepcopy(edge.child_type)),
             )
             child = TypedVariable(f"{prefix}_{index}_{edge.field_name}_child", deepcopy(edge.child_type))
-            some_body = [
+            some_body: list = [
                 Instruction_getfield(
                     var_out=payload_ptr,
                     src=field_var,
@@ -622,7 +756,7 @@ class AutoDropPass:
         body.append(
             Instruction_call(
                 var_out=with_sep,
-                fn_name="__ehir_rt_str_concat",
+                fn_name="encore_str_concat",
                 generics=[],
                 args=[base, sep],
             )
@@ -630,7 +764,7 @@ class AutoDropPass:
         body.append(
             Instruction_call(
                 var_out=with_id,
-                fn_name="__ehir_rt_str_concat",
+                fn_name="encore_str_concat",
                 generics=[],
                 args=[with_sep, id_value],
             )
@@ -639,7 +773,7 @@ class AutoDropPass:
         body.append(
             Instruction_call(
                 var_out=final,
-                fn_name="__ehir_rt_str_concat",
+                fn_name="encore_str_concat",
                 generics=[],
                 args=[with_id, nl],
             )
@@ -650,6 +784,44 @@ class AutoDropPass:
         self._emit_ref_count_add_for_box(body, child, -1, prefix)
         self._emit_pass_call(body, child, 0, prefix)
 
+    def _emit_mark_outer_child(self, body: list, child: TypedVariable, prefix: str) -> None:
+        assert child.type is not None
+        body.append(
+            Instruction_call(
+                var_out=TypedVariable(f"{prefix}_mark_outer_ret", Type("void")),
+                fn_name=self._cfree_mark_outer_name(child.type),
+                generics=[],
+                args=[deepcopy(child)],
+            )
+        )
+
+    def _emit_count_free_edge(
+        self,
+        body: list,
+        child: TypedVariable,
+        self_candidate: TypedVariable,
+        prefix: str,
+    ) -> None:
+        owner_ptr_type = self._box_owner_ptr_type(child.type)
+        child_owner = self._emit_owner_ptr(body, child, owner_ptr_type, f"{prefix}_owner")
+        child_candidate = self._emit_free_candidate(body, child_owner, f"{prefix}_candidate")
+        edge_counts = TypedVariable(f"{prefix}_edge_counts", Usize_t(1))
+        body.append(Instruction_and(var_out=edge_counts, lhs=self_candidate, rhs=child_candidate))
+        delta = self._emit_bool_to_usize(body, edge_counts, f"{prefix}_delta")
+        self._emit_ref_count_add_delta(body, child_owner, delta, prefix, subtract=False)
+        self._emit_pass_call(body, child, 2, prefix)
+
+    def _emit_sweep_child_from_free(self, body: list, child: TypedVariable, prefix: str) -> None:
+        owner_ptr_type = self._box_owner_ptr_type(child.type)
+        child_owner = self._emit_owner_ptr(body, child, owner_ptr_type, f"{prefix}_owner")
+        child_candidate = self._emit_candidate_alive(body, child_owner, f"{prefix}_candidate")
+        self._emit_ref_count_sub_if_pending(body, child_owner, child_candidate, prefix)
+        self._emit_pass_call(body, child, 3, prefix)
+
+    def _emit_sweep_child_from_survivor(self, body: list, child: TypedVariable, prefix: str) -> None:
+        self._emit_ref_count_add_for_box(body, child, 1, prefix)
+        self._emit_pass_call(body, child, 3, prefix)
+
     def _emit_pass1_propagate_child(self, body: list, child: TypedVariable, prefix: str) -> None:
         owner_ptr_type = self._box_owner_ptr_type(child.type)
         owner_ptr = self._emit_owner_ptr(body, child, owner_ptr_type, f"{prefix}_owner")
@@ -657,6 +829,17 @@ class AutoDropPass:
         true_var = self._emit_bool_const(body, True, f"{prefix}_true")
         body.append(Instruction_store(var_src=true_var, var_dst=outer_ptr))
         self._emit_pass_call(body, child, 1, prefix)
+
+    def _emit_cleanup_child(self, body: list, child: TypedVariable, prefix: str) -> None:
+        assert child.type is not None
+        body.append(
+            Instruction_call(
+                var_out=TypedVariable(f"{prefix}_cleanup_ret", Type("void")),
+                fn_name=self._cfree_cleanup_name(child.type),
+                generics=[],
+                args=[deepcopy(child)],
+            )
+        )
 
     def _emit_pass_call(self, body: list, child: TypedVariable, pass_index: int, prefix: str) -> None:
         assert child.type is not None
@@ -686,11 +869,96 @@ class AutoDropPass:
             body.append(Instruction_add(var_out=next_count, lhs=ref_count, rhs=one))
         body.append(Instruction_store(var_src=next_count, var_dst=ref_ptr))
 
+    def _emit_ref_count_add_delta(
+        self,
+        body: list,
+        owner_ptr: TypedVariable,
+        delta: TypedVariable,
+        prefix: str,
+        *,
+        subtract: bool,
+    ) -> None:
+        ref_ptr = self._emit_owner_field_ptr(body, owner_ptr, 1, Usize_t(), f"{prefix}_ref")
+        ref_count = TypedVariable(f"{prefix}_ref_count", Usize_t())
+        next_count = TypedVariable(f"{prefix}_next_ref_count", Usize_t())
+        body.append(Instruction_load(var_out=ref_count, var=ref_ptr))
+        if subtract:
+            body.append(Instruction_sub(var_out=next_count, lhs=ref_count, rhs=delta))
+        else:
+            body.append(Instruction_add(var_out=next_count, lhs=ref_count, rhs=delta))
+        body.append(Instruction_store(var_src=next_count, var_dst=ref_ptr))
+
+    def _emit_ref_count_sub_if_pending(
+        self,
+        body: list,
+        owner_ptr: TypedVariable,
+        should_subtract: TypedVariable,
+        prefix: str,
+    ) -> None:
+        ref_ptr = self._emit_owner_field_ptr(body, owner_ptr, 1, Usize_t(), f"{prefix}_ref")
+        ref_count = TypedVariable(f"{prefix}_ref_count", Usize_t())
+        zero = self._emit_usize_const(body, 0, f"{prefix}_zero")
+        has_pending = TypedVariable(f"{prefix}_has_pending", Usize_t(1))
+        do_subtract = TypedVariable(f"{prefix}_do_subtract", Usize_t(1))
+        delta = TypedVariable(f"{prefix}_delta", Usize_t())
+        next_count = TypedVariable(f"{prefix}_next_ref_count", Usize_t())
+        body.extend(
+            [
+                Instruction_load(var_out=ref_count, var=ref_ptr),
+                Instruction_neq(var_out=has_pending, lhs=ref_count, rhs=zero),
+                Instruction_and(var_out=do_subtract, lhs=should_subtract, rhs=has_pending),
+                Instruction_pcast(var_out=delta, var=do_subtract, type=Usize_t()),
+                Instruction_sub(var_out=next_count, lhs=ref_count, rhs=delta),
+                Instruction_store(var_src=next_count, var_dst=ref_ptr),
+            ]
+        )
+
     def _emit_ref_count_load(self, body: list, owner_ptr: TypedVariable, prefix: str) -> TypedVariable:
         ref_ptr = self._emit_owner_field_ptr(body, owner_ptr, 1, Usize_t(), f"{prefix}_ref")
         ref_count = TypedVariable(f"{prefix}_ref_count", Usize_t())
         body.append(Instruction_load(var_out=ref_count, var=ref_ptr))
         return ref_count
+
+    def _emit_free_candidate(self, body: list, owner_ptr: TypedVariable, prefix: str) -> TypedVariable:
+        inner_ptr = self._emit_owner_field_ptr(body, owner_ptr, 2, Usize_t(1), f"{prefix}_inner")
+        outer_ptr = self._emit_owner_field_ptr(body, owner_ptr, 3, Usize_t(1), f"{prefix}_outer")
+        inner = TypedVariable(f"{prefix}_inner", Usize_t(1))
+        outer = TypedVariable(f"{prefix}_outer", Usize_t(1))
+        false_var = self._emit_bool_const(body, False, f"{prefix}_false")
+        not_outer = TypedVariable(f"{prefix}_not_outer", Usize_t(1))
+        candidate = TypedVariable(prefix, Usize_t(1))
+        body.extend(
+            [
+                Instruction_load(var_out=inner, var=inner_ptr),
+                Instruction_load(var_out=outer, var=outer_ptr),
+                Instruction_ieq(var_out=not_outer, lhs=outer, rhs=false_var),
+                Instruction_and(var_out=candidate, lhs=inner, rhs=not_outer),
+            ]
+        )
+        return candidate
+
+    def _emit_candidate_alive(self, body: list, owner_ptr: TypedVariable, prefix: str) -> TypedVariable:
+        outer_ptr = self._emit_owner_field_ptr(body, owner_ptr, 3, Usize_t(1), f"{prefix}_outer")
+        deal_ptr = self._emit_owner_field_ptr(body, owner_ptr, 5, Usize_t(1), f"{prefix}_deal")
+        outer = TypedVariable(f"{prefix}_outer", Usize_t(1))
+        deal = TypedVariable(f"{prefix}_deal", Usize_t(1))
+        false_var = self._emit_bool_const(body, False, f"{prefix}_false")
+        not_outer = TypedVariable(f"{prefix}_not_outer", Usize_t(1))
+        alive = TypedVariable(prefix, Usize_t(1))
+        body.extend(
+            [
+                Instruction_load(var_out=outer, var=outer_ptr),
+                Instruction_load(var_out=deal, var=deal_ptr),
+                Instruction_ieq(var_out=not_outer, lhs=outer, rhs=false_var),
+                Instruction_and(var_out=alive, lhs=deal, rhs=not_outer),
+            ]
+        )
+        return alive
+
+    def _emit_bool_to_usize(self, body: list, value: TypedVariable, prefix: str) -> TypedVariable:
+        out = TypedVariable(prefix, Usize_t())
+        body.append(Instruction_pcast(var_out=out, var=value, type=Usize_t()))
+        return out
 
     def _emit_box_value(
         self,
@@ -804,13 +1072,19 @@ class AutoDropPass:
         assert isinstance(owner_type, Pointer)
         return deepcopy(owner_type)
 
-    def _cfree_fn(self, name: str, box_type: Type, blocks: list[Block]) -> Derective_fn:
+    def _cfree_fn(
+        self,
+        name: str,
+        box_type: Type,
+        blocks: list[Block],
+        ret_type: Type | None = None,
+    ) -> Derective_fn:
         return Derective_fn(
             name=name,
             generics=[],
             params=[Parameter("self", deepcopy(box_type))],
             body=blocks,
-            ret_type=Type("void"),
+            ret_type=ret_type or Type("void"),
             attrs=("safe",),
         )
 
@@ -819,6 +1093,12 @@ class AutoDropPass:
 
     def _cfree_pass_name(self, box_type: Type, pass_index: int) -> str:
         return f"__cfree_pass{pass_index}_{box_type.name}"
+
+    def _cfree_mark_outer_name(self, box_type: Type) -> str:
+        return f"__cfree_mark_outer_{box_type.name}"
+
+    def _cfree_cleanup_name(self, box_type: Type) -> str:
+        return f"__cfree_cleanup_{box_type.name}"
 
     def _generate_enum_drop_blocks(self, directive: Derective_enum, self_var: TypedVariable) -> list[Block]:
         drop_variants = [

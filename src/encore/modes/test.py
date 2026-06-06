@@ -5,11 +5,14 @@ from typing import Callable, Optional
 
 from rich.console import Console
 
-from ehir import Refrain
+from ehir import CompiledRefrain, Refrain
 from encore import ENCORE_CACHE_DIR
 from encore.modes.build import (
     AVAILABLE_BACKENDS,
     AVAILABLE_OPTPROFILES,
+    _BuildScriptContext,
+    _inject_mandatory_core_dependency,
+    _load_refrain,
     _resolve_dependency,
     create_compiler,
     load_manifest,
@@ -25,6 +28,7 @@ class _TestCase:
     source_file: Path
     entry_root: str
     entrypoint: str
+    expected_compile_error: str | None = None
 
     @property
     def display_name(self) -> str:
@@ -64,34 +68,56 @@ def handle_test(args: Namespace):
 
     passed = 0
     failed = 0
+    shared_compiled_refrains: dict[str, CompiledRefrain] = {}
     for idx, test in enumerate(tests, start=1):
         test_name = _build_test_refrain_name(test)
         compiler = create_compiler(cwd, args.backend, args.profile, no_cache=args.no_cache, cfg_overrides=args.cfg)
+        compiler.compiled_refrains.update(shared_compiled_refrains)
         compiler.on_refrain = lambda _refrain: None
-        compiler.add_refrain_to_build(
-            Refrain(
-                name=test_name,
-                path=test.refrain_path,
-                type=Refrain.TargetType.EXECUTABLE,
-                entry_root=test.entry_root,
-                entrypoint=test.entrypoint,
-            )
+        build_ctx = _BuildScriptContext(
+            backend=args.backend,
+            profile=args.profile,
+            no_cache=args.no_cache,
+            cfg_overrides=tuple(args.cfg),
+        )
+        _inject_mandatory_core_dependency(compiler, test.refrain_path, build_ctx)
+        _load_refrain(
+            compiler,
+            test.refrain_path,
+            type=Refrain.TargetType.EXECUTABLE,
+            build_ctx=build_ctx,
+            name=test_name,
+            entry_root=test.entry_root,
+            entrypoint=test.entrypoint,
         )
 
         try:
             outputs = compiler.compile_all()
+            _share_compiled_dependencies(shared_compiled_refrains, compiler.compiled_refrains, test_name)
+            if test.expected_compile_error is not None:
+                failed += 1
+                console.print(
+                    f"[{idx}/{len(tests)}] [red]FAILED[/red] {test.display_name} "
+                    f"(expected compile error containing '{test.expected_compile_error}')"
+                )
+                continue
             output_by_name = dict(outputs)
             binary_path = output_by_name[test_name]
             ret_code = run_binary(binary_path, [])
-            if ret_code >= 0:
+            if ret_code == 0:
                 passed += 1
                 console.print(f"[{idx}/{len(tests)}] [green]ok[/green] {test.display_name}")
             else:
                 failed += 1
                 console.print(f"[{idx}/{len(tests)}] [red]FAILED[/red] {test.display_name} (exit code {ret_code})")
         except Exception as exc:
-            failed += 1
-            console.print(f"[{idx}/{len(tests)}] [red]FAILED[/red] {test.display_name} ({exc})")
+            error_text = _exception_text(exc)
+            if test.expected_compile_error is not None and test.expected_compile_error in error_text:
+                passed += 1
+                console.print(f"[{idx}/{len(tests)}] [green]ok[/green] {test.display_name} (expected compile error)")
+            else:
+                failed += 1
+                console.print(f"[{idx}/{len(tests)}] [red]FAILED[/red] {test.display_name} ({error_text})")
 
     if failed == 0:
         console.print(f"[green]PASS[/green] {passed} tests")
@@ -119,6 +145,7 @@ def _collect_test_cases(root: Path, filter_text: str | None) -> list[_TestCase]:
                 source_file=source_file,
                 entry_root="tests",
                 entrypoint=entrypoint,
+                expected_compile_error=_parse_expected_compile_error(source_file),
             )
             if filter_text and filter_text not in test.display_name:
                 continue
@@ -171,6 +198,40 @@ def _resolve_local_core_root(project_root: Path) -> Optional[Path]:
         if manifest.project.name == "core":
             return candidate
     return None
+
+
+def _parse_expected_compile_error(source_file: Path) -> str | None:
+    expected: str | None = None
+    for raw_line in source_file.read_text().splitlines():
+        line = raw_line.strip()
+        if line.startswith("//@expect.compile_error="):
+            expected = line.split("=", 1)[1].strip() or ""
+        if line.startswith("// @expect.compile_error="):
+            expected = line.split("=", 1)[1].strip() or ""
+    return expected
+
+
+def _exception_text(exc: Exception) -> str:
+    parts: list[str] = []
+    current: BaseException | None = exc
+    while current is not None:
+        text = str(current).strip()
+        parts.append(text if text else current.__class__.__name__)
+        current = current.__cause__ or current.__context__
+    return " | caused by: ".join(parts)
+
+
+def _share_compiled_dependencies(
+    shared: dict[str, CompiledRefrain],
+    compiled: dict[str, CompiledRefrain],
+    test_name: str,
+) -> None:
+    for name, compiled_refrain in compiled.items():
+        if name == test_name:
+            continue
+        if compiled_refrain.type != Refrain.TargetType.OBJECT:
+            continue
+        shared[name] = compiled_refrain
 
 
 def _build_test_refrain_name(test: _TestCase) -> str:

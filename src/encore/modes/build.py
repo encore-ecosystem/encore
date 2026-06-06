@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -6,7 +7,7 @@ from argparse import Namespace
 from dataclasses import dataclass, field
 from hashlib import sha1
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from ehir.backend import EHIR_Backend
 from ehir.cfg import CfgEnvironment, cfg_matches, default_cfg_environment
@@ -30,6 +31,7 @@ AVAILABLE_OPTPROFILES = {
 AVAILABLE_BACKENDS = ("llvm",)
 SYSTEM_CORE_REF = "sys@core"
 _ACTIVE_BUILD_SCRIPTS: set[Path] = set()
+_BUILD_SCRIPT_METADATA_CACHE: dict[tuple[object, ...], NativeSection] = {}
 
 
 @dataclass
@@ -299,6 +301,9 @@ def _load_refrain(
     type: Refrain.TargetType = Refrain.TargetType.OBJECT,
     *,
     build_ctx: _BuildScriptContext,
+    name: str | None = None,
+    entry_root: str | None = None,
+    entrypoint: str | None = None,
 ) -> Refrain:
     manifest = load_manifest(path)
 
@@ -311,9 +316,11 @@ def _load_refrain(
     native_libraries = _materialize_native_sources(native_libraries, path, build_ctx.profile)
 
     ref = Refrain(
-        name=manifest.project.name,
+        name=name or manifest.project.name,
         path=path,
         type=type,
+        entry_root=entry_root or "src",
+        entrypoint=entrypoint,
         merge_module_dirs=("modes",) if (path / "src" / "modes").exists() else (),
         native_libraries=native_libraries,
     )
@@ -395,6 +402,15 @@ def _native_libraries_from_build_script(
     if script_path is None:
         return []
 
+    cache_key = _build_script_cache_key(manifest, project_path, script_path, cfg_environment, build_ctx)
+    if cached := _BUILD_SCRIPT_METADATA_CACHE.get(cache_key):
+        return _native_libraries_from_native_section(
+            manifest.project.name,
+            _clone_native_section(cached),
+            project_path,
+            cfg_environment,
+        )
+
     native = _run_build_script(
         manifest=manifest,
         project_path=project_path,
@@ -402,7 +418,33 @@ def _native_libraries_from_build_script(
         cfg_environment=cfg_environment,
         build_ctx=build_ctx,
     )
+    _BUILD_SCRIPT_METADATA_CACHE[cache_key] = _clone_native_section(native)
     return _native_libraries_from_native_section(manifest.project.name, native, project_path, cfg_environment)
+
+
+def _clone_native_section(native: NativeSection) -> NativeSection:
+    return NativeSection(**native.model_dump())
+
+
+def _build_script_cache_key(
+    manifest: ProjectManifest,
+    project_path: Path,
+    script_path: Path,
+    cfg_environment: CfgEnvironment,
+    build_ctx: _BuildScriptContext,
+) -> tuple[object, ...]:
+    digest = sha1(usedforsecurity=False)
+    digest.update(script_path.read_bytes())
+    digest.update(json.dumps(manifest.model_dump(mode="json"), sort_keys=True).encode())
+    return (
+        project_path.resolve().as_posix(),
+        script_path.resolve().as_posix(),
+        build_ctx.backend,
+        build_ctx.profile,
+        tuple(sorted(cfg_environment.flags)),
+        tuple((key, cfg_environment.values[key]) for key in sorted(cfg_environment.values)),
+        digest.hexdigest(),
+    )
 
 
 def _resolve_build_script_path(manifest: ProjectManifest, project_path: Path) -> Path | None:
@@ -427,13 +469,13 @@ def _run_build_script(
     cfg_environment: CfgEnvironment,
     build_ctx: _BuildScriptContext,
 ) -> NativeSection:
-    import json
     import toml
 
     target_dir = project_path / "target" / build_ctx.profile / "build"
-    script_dir = target_dir / "scripts" / f"{manifest.project.name}_{script_path.stem}"
+    script_workspace = f"{manifest.project.name}_{script_path.stem}_{os.getpid()}"
+    script_dir = target_dir / "scripts" / script_workspace
     src_dir = script_dir / "src"
-    out_dir = target_dir / "out" / script_path.stem
+    out_dir = target_dir / "out" / script_workspace
     meta_path = out_dir / "build-meta.json"
 
     if script_dir.exists():
@@ -444,7 +486,7 @@ def _run_build_script(
     src_main = src_dir / "main.enq"
     src_main.write_text(script_path.read_text(), encoding="utf-8")
 
-    script_manifest = {
+    script_manifest: dict[str, Any] = {
         "project": {
             "name": f"{manifest.project.name}__build_script",
             "target": "executable",
@@ -462,7 +504,7 @@ def _run_build_script(
             script_manifest["native"] = {
                 "libraries": [
                     {
-                        "name": "core_runtime_for_build_script",
+                        "name": "encore_core_native_for_build_script",
                         "path": runtime_c.as_posix(),
                     }
                 ]
@@ -559,12 +601,29 @@ def _materialize_native_sources(
 
         digest = sha1(str(source_path.resolve()).encode(), usedforsecurity=False).hexdigest()[:16]
         obj_path = native_build_dir / f"{source_path.stem}_{digest}.o"
-        cmd = ["clang", "-std=c11", "-c", str(source_path), "-o", str(obj_path)]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Native source compile error ({source_path}): {result.stderr}")
+        try:
+            object_is_current = obj_path.exists() and obj_path.stat().st_mtime_ns >= source_path.stat().st_mtime_ns
+        except OSError:
+            object_is_current = False
 
-        out.append(NativeLibrary(**{**native.__dict__, "path": obj_path.as_posix()}))
+        if not object_is_current:
+            cmd = ["clang", "-std=c11", "-c", str(source_path), "-o", str(obj_path)]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(f"Native source compile error ({source_path}): {result.stderr}")
+
+        out.append(
+            NativeLibrary(
+                name=native.name,
+                kind=native.kind,
+                link_name=native.link_name,
+                path=obj_path.as_posix(),
+                search_paths=native.search_paths,
+                frameworks=native.frameworks,
+                link_args=native.link_args,
+                cfg=native.cfg,
+            )
+        )
     return out
 
 

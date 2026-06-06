@@ -1610,28 +1610,28 @@ class Codegen:
         return free_func
 
     def _get_str_concat_function(self) -> ir.Function:
-        if "__ehir_rt_str_concat" in self.module.globals:
-            fn = self.module.globals["__ehir_rt_str_concat"]
+        if "encore_str_concat" in self.module.globals:
+            fn = self.module.globals["encore_str_concat"]
             if not isinstance(fn, ir.Function):
-                raise TypeError("__ehir_rt_str_concat global is not a function")
+                raise TypeError("encore_str_concat global is not a function")
             return fn
 
         str_type = self._get_str_type()
         fn_type = ir.FunctionType(str_type, [str_type, str_type])
-        fn = ir.Function(self.module, fn_type, name="__ehir_rt_str_concat")
+        fn = ir.Function(self.module, fn_type, name="encore_str_concat")
         fn.attributes.add("noinline")
         return fn
 
     def _get_str_eq_function(self) -> ir.Function:
-        if "__ehir_rt_str_eq" in self.module.globals:
-            fn = self.module.globals["__ehir_rt_str_eq"]
+        if "encore_str_eq" in self.module.globals:
+            fn = self.module.globals["encore_str_eq"]
             if not isinstance(fn, ir.Function):
-                raise TypeError("__ehir_rt_str_eq global is not a function")
+                raise TypeError("encore_str_eq global is not a function")
             return fn
 
         str_type = self._get_str_type()
         fn_type = ir.FunctionType(ir.IntType(1), [str_type, str_type])
-        fn = ir.Function(self.module, fn_type, name="__ehir_rt_str_eq")
+        fn = ir.Function(self.module, fn_type, name="encore_str_eq")
         fn.attributes.add("noinline")
         return fn
 

@@ -143,6 +143,7 @@ class Postprocessor:
                     ProcessedDerective_struct(
                         name=derective.name,
                         fields=derective.params,
+                        generics=derective.generics,
                     )
                 )
 

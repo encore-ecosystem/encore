@@ -118,7 +118,7 @@ static int32_t encore_mkdir_p(const char *path) {
     return 0;
 }
 
-bool __ehir_rt_str_eq(encore_str lhs, encore_str rhs) {
+bool encore_str_eq(encore_str lhs, encore_str rhs) {
     if (lhs.len != rhs.len) {
         return false;
     }
@@ -131,18 +131,18 @@ bool __ehir_rt_str_eq(encore_str lhs, encore_str rhs) {
     return memcmp(lhs.ptr, rhs.ptr, lhs.len) == 0;
 }
 
-size_t __ehir_rt_str_len(encore_str value) {
+size_t encore_str_len(encore_str value) {
     return value.len;
 }
 
-uint8_t __ehir_rt_str_byte_at(encore_str value, size_t index) {
+uint8_t encore_str_byte_at(encore_str value, size_t index) {
     if (value.ptr == NULL || index >= value.len) {
         return 0;
     }
     return (uint8_t)value.ptr[index];
 }
 
-encore_str __ehir_rt_str_slice(encore_str value, size_t start, size_t slice_len) {
+encore_str encore_str_slice(encore_str value, size_t start, size_t slice_len) {
     if (value.ptr == NULL || start >= value.len) {
         return encore_empty_str();
     }
@@ -158,7 +158,7 @@ encore_str __ehir_rt_str_slice(encore_str value, size_t start, size_t slice_len)
     return encore_from_owned_buffer(buffer, actual_len);
 }
 
-encore_str __ehir_rt_str_concat(encore_str lhs, encore_str rhs) {
+encore_str encore_str_concat(encore_str lhs, encore_str rhs) {
     size_t total_len = lhs.len + rhs.len;
     char *buffer = malloc(total_len + 1);
     if (buffer == NULL) {
@@ -175,90 +175,90 @@ encore_str __ehir_rt_str_concat(encore_str lhs, encore_str rhs) {
     return encore_from_owned_buffer(buffer, total_len);
 }
 
-encore_str __ehir_rt_fmt_bool(bool value) {
+encore_str encore_fmt_bool(bool value) {
     return value ? encore_from_cstr_copy("true") : encore_from_cstr_copy("false");
 }
 
-encore_str __ehir_rt_fmt_u8(uint8_t value) {
+encore_str encore_fmt_u8(uint8_t value) {
     return encore_format("%" PRIu8, value);
 }
 
-encore_str __ehir_rt_fmt_u16(uint16_t value) {
+encore_str encore_fmt_u16(uint16_t value) {
     return encore_format("%" PRIu16, value);
 }
 
-encore_str __ehir_rt_fmt_u32(uint32_t value) {
+encore_str encore_fmt_u32(uint32_t value) {
     return encore_format("%" PRIu32, value);
 }
 
-encore_str __ehir_rt_fmt_u64(uint64_t value) {
+encore_str encore_fmt_u64(uint64_t value) {
     return encore_format("%" PRIu64, value);
 }
 
-encore_str __ehir_rt_fmt_usize(size_t value) {
+encore_str encore_fmt_usize(size_t value) {
     return encore_format("%zu", value);
 }
 
-encore_str __ehir_rt_fmt_i8(int8_t value) {
+encore_str encore_fmt_i8(int8_t value) {
     return encore_format("%" PRId8, value);
 }
 
-encore_str __ehir_rt_fmt_i16(int16_t value) {
+encore_str encore_fmt_i16(int16_t value) {
     return encore_format("%" PRId16, value);
 }
 
-encore_str __ehir_rt_fmt_i32(int32_t value) {
+encore_str encore_fmt_i32(int32_t value) {
     return encore_format("%" PRId32, value);
 }
 
-encore_str __ehir_rt_fmt_i64(int64_t value) {
+encore_str encore_fmt_i64(int64_t value) {
     return encore_format("%" PRId64, value);
 }
 
-encore_str __ehir_rt_fmt_isize(intptr_t value) {
+encore_str encore_fmt_isize(intptr_t value) {
     return encore_format("%" PRIdPTR, value);
 }
 
-encore_str __ehir_rt_fmt_f32(float value) {
+encore_str encore_fmt_f32(float value) {
     return encore_format("%.9g", value);
 }
 
-encore_str __ehir_rt_fmt_f64(double value) {
+encore_str encore_fmt_f64(double value) {
     return encore_format("%.17g", value);
 }
 
-int32_t __ehir_rt_io_print(encore_str value) {
+int32_t encore_io_print(encore_str value) {
     size_t written = fwrite(value.ptr, 1, value.len, stdout);
     fflush(stdout);
     return written == value.len ? 0 : -1;
 }
 
-int32_t __ehir_rt_io_println(encore_str value) {
-    if (__ehir_rt_io_print(value) != 0) {
+int32_t encore_io_println(encore_str value) {
+    if (encore_io_print(value) != 0) {
         return -1;
     }
     return fputc('\n', stdout) == EOF ? -1 : 0;
 }
 
-int32_t __ehir_rt_io_eprint(encore_str value) {
+int32_t encore_io_eprint(encore_str value) {
     size_t written = fwrite(value.ptr, 1, value.len, stderr);
     fflush(stderr);
     return written == value.len ? 0 : -1;
 }
 
-int32_t __ehir_rt_io_eprintln(encore_str value) {
-    if (__ehir_rt_io_eprint(value) != 0) {
+int32_t encore_io_eprintln(encore_str value) {
+    if (encore_io_eprint(value) != 0) {
         return -1;
     }
     return fputc('\n', stderr) == EOF ? -1 : 0;
 }
 
-int32_t __ehir_rt_panic(encore_str message) {
+int32_t encore_panic(encore_str message) {
     fputs("panic: ", stderr);
-    if (__ehir_rt_io_eprint(message) != 0) {
+    if (encore_io_eprint(message) != 0) {
         fputc('\n', stderr);
     } else {
-        __ehir_rt_io_eprintln(encore_empty_str());
+        encore_io_eprintln(encore_empty_str());
     }
     exit(1);
     return 1;
@@ -350,12 +350,12 @@ static void encore_init_args(void) {
     free(buffer);
 }
 
-size_t __ehir_rt_os_argc(void) {
+size_t encore_os_argc(void) {
     encore_init_args();
     return g_argc;
 }
 
-encore_str __ehir_rt_os_argv(size_t index) {
+encore_str encore_os_argv(size_t index) {
     encore_init_args();
     if (index >= g_argc || g_argv == NULL || g_argv[index] == NULL) {
         return encore_empty_str();
@@ -363,7 +363,7 @@ encore_str __ehir_rt_os_argv(size_t index) {
     return encore_from_cstr_copy(g_argv[index]);
 }
 
-encore_str __ehir_rt_os_cwd(void) {
+encore_str encore_os_cwd(void) {
     size_t size = 256;
 
     for (;;) {
@@ -389,7 +389,7 @@ encore_str __ehir_rt_os_cwd(void) {
     }
 }
 
-encore_str __ehir_rt_os_read_file(encore_str path) {
+encore_str encore_os_read_file(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return encore_empty_str();
@@ -423,7 +423,7 @@ encore_str __ehir_rt_os_read_file(encore_str path) {
     return encore_from_owned_buffer(buffer, read_count);
 }
 
-int32_t __ehir_rt_os_write_file(encore_str path, encore_str contents) {
+int32_t encore_os_write_file(encore_str path, encore_str contents) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return -1;
@@ -440,7 +440,7 @@ int32_t __ehir_rt_os_write_file(encore_str path, encore_str contents) {
     return written == contents.len ? 0 : -1;
 }
 
-bool __ehir_rt_os_file_exists(encore_str path) {
+bool encore_os_file_exists(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return false;
@@ -452,7 +452,7 @@ bool __ehir_rt_os_file_exists(encore_str path) {
     return exists;
 }
 
-int32_t __ehir_rt_os_remove_file(encore_str path) {
+int32_t encore_os_remove_file(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return -1;
@@ -463,7 +463,7 @@ int32_t __ehir_rt_os_remove_file(encore_str path) {
     return result == 0 ? 0 : -1;
 }
 
-int32_t __ehir_rt_os_ensure_parent_dirs(encore_str path) {
+int32_t encore_os_ensure_parent_dirs(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return -1;
@@ -481,7 +481,7 @@ int32_t __ehir_rt_os_ensure_parent_dirs(encore_str path) {
     return status;
 }
 
-int32_t __ehir_rt_os_run(encore_str command) {
+int32_t encore_os_run(encore_str command) {
     char *command_c = encore_to_cstr(command);
     if (command_c == NULL) {
         return -1;

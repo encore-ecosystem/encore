@@ -99,7 +99,7 @@ static encore_str encore_format(const char *fmt, ...) {
     return encore_from_owned_buffer(buffer, (size_t)written);
 }
 
-uint64_t __ehir_rt_clock_ms(uint8_t kind) {
+uint64_t encore_clock_ms(uint8_t kind) {
 #ifdef _WIN32
     if (kind == 0) {
         FILETIME ft;
@@ -131,7 +131,7 @@ uint64_t __ehir_rt_clock_ms(uint8_t kind) {
 #endif
 }
 
-bool __ehir_rt_sleep_ms(uint64_t ms) {
+bool encore_sleep_ms(uint64_t ms) {
 #ifdef _WIN32
     Sleep((DWORD)ms);
     return true;
@@ -149,7 +149,7 @@ bool __ehir_rt_sleep_ms(uint64_t ms) {
 #endif
 }
 
-bool __ehir_rt_str_eq(encore_str lhs, encore_str rhs) {
+bool encore_str_eq(encore_str lhs, encore_str rhs) {
     if (lhs.len != rhs.len) {
         return false;
     }
@@ -162,11 +162,11 @@ bool __ehir_rt_str_eq(encore_str lhs, encore_str rhs) {
     return memcmp(lhs.ptr, rhs.ptr, lhs.len) == 0;
 }
 
-size_t __ehir_rt_str_len(encore_str value) {
+size_t encore_str_len(encore_str value) {
     return value.len;
 }
 
-uint8_t __ehir_rt_str_byte_at(encore_str value, size_t index) {
+uint8_t encore_str_byte_at(encore_str value, size_t index) {
     if (value.ptr == NULL || index >= value.len) {
         return 0;
     }
@@ -205,7 +205,7 @@ static encore_str encore_str_copy_range(encore_str value, size_t start, size_t s
     return encore_from_owned_buffer(buffer, actual_len);
 }
 
-size_t __ehir_rt_str_char_len(encore_str value) {
+size_t encore_str_char_len(encore_str value) {
     if (value.ptr == NULL || value.len == 0) {
         return 0;
     }
@@ -223,7 +223,7 @@ size_t __ehir_rt_str_char_len(encore_str value) {
     return chars;
 }
 
-encore_str __ehir_rt_str_char_at(encore_str value, size_t index) {
+encore_str encore_str_char_at(encore_str value, size_t index) {
     if (value.ptr == NULL || value.len == 0) {
         return encore_empty_str();
     }
@@ -244,7 +244,7 @@ encore_str __ehir_rt_str_char_at(encore_str value, size_t index) {
     return encore_empty_str();
 }
 
-encore_str __ehir_rt_str_slice_chars(encore_str value, size_t start, size_t char_len) {
+encore_str encore_str_slice_chars(encore_str value, size_t start, size_t char_len) {
     if (value.ptr == NULL || value.len == 0 || char_len == 0) {
         return encore_empty_str();
     }
@@ -285,11 +285,11 @@ encore_str __ehir_rt_str_slice_chars(encore_str value, size_t start, size_t char
     return encore_str_copy_range(value, start_byte, end_byte - start_byte);
 }
 
-encore_str __ehir_rt_str_slice(encore_str value, size_t start, size_t slice_len) {
+encore_str encore_str_slice(encore_str value, size_t start, size_t slice_len) {
     return encore_str_copy_range(value, start, slice_len);
 }
 
-encore_str __ehir_rt_str_concat(encore_str lhs, encore_str rhs) {
+encore_str encore_str_concat(encore_str lhs, encore_str rhs) {
     size_t total_len = lhs.len + rhs.len;
     char *buffer = malloc(total_len + 1);
     if (buffer == NULL) {
@@ -306,19 +306,19 @@ encore_str __ehir_rt_str_concat(encore_str lhs, encore_str rhs) {
     return encore_from_owned_buffer(buffer, total_len);
 }
 
-encore_str __ehir_rt_fmt_u64(uint64_t value) {
+encore_str encore_fmt_u64(uint64_t value) {
     return encore_format("%" PRIu64, value);
 }
 
-encore_str __ehir_rt_fmt_i64(int64_t value) {
+encore_str encore_fmt_i64(int64_t value) {
     return encore_format("%" PRId64, value);
 }
 
-encore_str __ehir_rt_fmt_f64(double value) {
+encore_str encore_fmt_f64(double value) {
     return encore_format("%.17g", value);
 }
 
-int32_t __ehir_rt_io_write(int32_t fd, encore_str value) {
+int32_t encore_io_write(int32_t fd, encore_str value) {
     FILE *stream = NULL;
     if (fd == 1) {
         stream = stdout;
@@ -353,7 +353,7 @@ static void encore_set_net_error_code(const char *prefix, int code) {
 #endif
 }
 
-encore_str __ehir_rt_net_last_error(void) {
+encore_str encore_net_last_error(void) {
     if (g_net_last_error[0] == '\0') {
         return encore_empty_str();
     }
@@ -413,7 +413,7 @@ static int32_t encore_parse_port(encore_str port_s) {
     return (int32_t)parsed;
 }
 
-int32_t __ehir_rt_net_tcp_connect(encore_str addr) {
+int32_t encore_net_tcp_connect(encore_str addr) {
     if (!encore_net_init()) {
         return -1;
     }
@@ -488,7 +488,7 @@ int32_t __ehir_rt_net_tcp_connect(encore_str addr) {
     return out_fd;
 }
 
-int32_t __ehir_rt_net_tcp_bind(encore_str addr) {
+int32_t encore_net_tcp_bind(encore_str addr) {
     if (!encore_net_init()) {
         return -1;
     }
@@ -567,7 +567,7 @@ int32_t __ehir_rt_net_tcp_bind(encore_str addr) {
     return out_fd;
 }
 
-int32_t __ehir_rt_net_tcp_accept(int32_t listener_fd) {
+int32_t encore_net_tcp_accept(int32_t listener_fd) {
     if (!encore_net_init()) {
         return -1;
     }
@@ -588,7 +588,7 @@ int32_t __ehir_rt_net_tcp_accept(int32_t listener_fd) {
 #endif
 }
 
-encore_str __ehir_rt_net_tcp_read(int32_t fd, size_t max) {
+encore_str encore_net_tcp_read(int32_t fd, size_t max) {
     if (max == 0) {
         return encore_empty_str();
     }
@@ -616,7 +616,7 @@ encore_str __ehir_rt_net_tcp_read(int32_t fd, size_t max) {
 #endif
 }
 
-int32_t __ehir_rt_net_tcp_write(int32_t fd, encore_str data) {
+int32_t encore_net_tcp_write(int32_t fd, encore_str data) {
     if (data.ptr == NULL && data.len > 0) {
         encore_set_net_error_cstr("invalid data");
         return -1;
@@ -638,7 +638,7 @@ int32_t __ehir_rt_net_tcp_write(int32_t fd, encore_str data) {
 #endif
 }
 
-int32_t __ehir_rt_net_tcp_close(int32_t fd) {
+int32_t encore_net_tcp_close(int32_t fd) {
     int rc = encore_close_socket(
 #ifdef _WIN32
         (SOCKET)fd
@@ -653,7 +653,7 @@ int32_t __ehir_rt_net_tcp_close(int32_t fd) {
     return 0;
 }
 
-int32_t __ehir_rt_proc_exit(int32_t code) {
+int32_t encore_proc_exit(int32_t code) {
     exit(code);
     return code;
 }
@@ -744,12 +744,12 @@ static void encore_init_args(void) {
     free(buffer);
 }
 
-size_t __ehir_rt_os_argc(void) {
+size_t encore_os_argc(void) {
     encore_init_args();
     return g_argc;
 }
 
-encore_str __ehir_rt_os_argv(size_t index) {
+encore_str encore_os_argv(size_t index) {
     encore_init_args();
     if (index >= g_argc || g_argv == NULL || g_argv[index] == NULL) {
         return encore_empty_str();
@@ -757,7 +757,7 @@ encore_str __ehir_rt_os_argv(size_t index) {
     return encore_from_cstr_copy(g_argv[index]);
 }
 
-encore_str __ehir_rt_os_cwd(void) {
+encore_str encore_os_cwd(void) {
     size_t size = 256;
 
     for (;;) {
@@ -789,7 +789,7 @@ encore_str __ehir_rt_os_cwd(void) {
     }
 }
 
-encore_str __ehir_rt_os_home_dir(void) {
+encore_str encore_os_home_dir(void) {
 #ifdef _WIN32
     const char *home = getenv("USERPROFILE");
     if (home == NULL || home[0] == '\0') {
@@ -816,7 +816,7 @@ encore_str __ehir_rt_os_home_dir(void) {
     return encore_from_cstr_copy(home);
 }
 
-encore_str __ehir_rt_fs_read_file(encore_str path) {
+encore_str encore_fs_read_file(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return encore_empty_str();
@@ -850,7 +850,7 @@ encore_str __ehir_rt_fs_read_file(encore_str path) {
     return encore_from_owned_buffer(buffer, read_count);
 }
 
-int32_t __ehir_rt_fs_write_file(encore_str path, encore_str contents) {
+int32_t encore_fs_write_file(encore_str path, encore_str contents) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return -1;
@@ -867,7 +867,7 @@ int32_t __ehir_rt_fs_write_file(encore_str path, encore_str contents) {
     return written == contents.len ? 0 : -1;
 }
 
-int32_t __ehir_rt_fs_status(encore_str path) {
+int32_t encore_fs_status(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return -1;
@@ -879,7 +879,7 @@ int32_t __ehir_rt_fs_status(encore_str path) {
     return result;
 }
 
-int32_t __ehir_rt_fs_remove_file(encore_str path) {
+int32_t encore_fs_remove_file(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return -1;
@@ -890,7 +890,7 @@ int32_t __ehir_rt_fs_remove_file(encore_str path) {
     return result == 0 ? 0 : -1;
 }
 
-int32_t __ehir_rt_fs_mkdir(encore_str path) {
+int32_t encore_fs_mkdir(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return -1;
@@ -936,7 +936,7 @@ static bool encore_append_dir_entry(char **buffer, size_t *cap, size_t *len, con
     return true;
 }
 
-encore_str __ehir_rt_fs_read_dir(encore_str path) {
+encore_str encore_fs_read_dir(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
         return encore_empty_str();
@@ -1135,7 +1135,7 @@ static EncoreGuiWindow *encore_gui_window_from_handle(size_t handle) {
     return (EncoreGuiWindow *)(uintptr_t)handle;
 }
 
-size_t __ehir_rt_gui_window_create(encore_str title, uint32_t width, uint32_t height) {
+size_t encore_gui_window_create(encore_str title, uint32_t width, uint32_t height) {
     if (width == 0 || height == 0 || !encore_gui_x11_load()) {
         return 0;
     }
@@ -1199,12 +1199,12 @@ size_t __ehir_rt_gui_window_create(encore_str title, uint32_t width, uint32_t he
     return (size_t)(uintptr_t)state;
 }
 
-bool __ehir_rt_gui_window_is_open(size_t handle) {
+bool encore_gui_window_is_open(size_t handle) {
     EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
     return state != NULL && state->open;
 }
 
-bool __ehir_rt_gui_window_poll(size_t handle) {
+bool encore_gui_window_poll(size_t handle) {
     EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
     if (state == NULL || !state->open) {
         return false;
@@ -1229,7 +1229,7 @@ bool __ehir_rt_gui_window_poll(size_t handle) {
     return state->open;
 }
 
-bool __ehir_rt_gui_window_clear(size_t handle, uint32_t color_rgb) {
+bool encore_gui_window_clear(size_t handle, uint32_t color_rgb) {
     EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
     if (state == NULL || !state->open) {
         return false;
@@ -1240,7 +1240,7 @@ bool __ehir_rt_gui_window_clear(size_t handle, uint32_t color_rgb) {
     return true;
 }
 
-bool __ehir_rt_gui_window_fill_rect(size_t handle, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t color_rgb) {
+bool encore_gui_window_fill_rect(size_t handle, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t color_rgb) {
     EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
     if (state == NULL || !state->open || width == 0 || height == 0) {
         return false;
@@ -1251,7 +1251,7 @@ bool __ehir_rt_gui_window_fill_rect(size_t handle, int32_t x, int32_t y, uint32_
     return true;
 }
 
-bool __ehir_rt_gui_window_present(size_t handle) {
+bool encore_gui_window_present(size_t handle) {
     EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
     if (state == NULL || !state->open) {
         return false;
@@ -1260,7 +1260,7 @@ bool __ehir_rt_gui_window_present(size_t handle) {
     return true;
 }
 
-bool __ehir_rt_gui_window_destroy(size_t handle) {
+bool encore_gui_window_destroy(size_t handle) {
     EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
     if (state == NULL) {
         return false;
@@ -1280,30 +1280,30 @@ bool __ehir_rt_gui_window_destroy(size_t handle) {
     return true;
 }
 #else
-size_t __ehir_rt_gui_window_create(encore_str title, uint32_t width, uint32_t height) {
+size_t encore_gui_window_create(encore_str title, uint32_t width, uint32_t height) {
     (void)title;
     (void)width;
     (void)height;
     return 0;
 }
 
-bool __ehir_rt_gui_window_is_open(size_t handle) {
+bool encore_gui_window_is_open(size_t handle) {
     (void)handle;
     return false;
 }
 
-bool __ehir_rt_gui_window_poll(size_t handle) {
+bool encore_gui_window_poll(size_t handle) {
     (void)handle;
     return false;
 }
 
-bool __ehir_rt_gui_window_clear(size_t handle, uint32_t color_rgb) {
+bool encore_gui_window_clear(size_t handle, uint32_t color_rgb) {
     (void)handle;
     (void)color_rgb;
     return false;
 }
 
-bool __ehir_rt_gui_window_fill_rect(size_t handle, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t color_rgb) {
+bool encore_gui_window_fill_rect(size_t handle, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t color_rgb) {
     (void)handle;
     (void)x;
     (void)y;
@@ -1313,12 +1313,12 @@ bool __ehir_rt_gui_window_fill_rect(size_t handle, int32_t x, int32_t y, uint32_
     return false;
 }
 
-bool __ehir_rt_gui_window_present(size_t handle) {
+bool encore_gui_window_present(size_t handle) {
     (void)handle;
     return false;
 }
 
-bool __ehir_rt_gui_window_destroy(size_t handle) {
+bool encore_gui_window_destroy(size_t handle) {
     (void)handle;
     return false;
 }

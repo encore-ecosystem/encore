@@ -10,6 +10,7 @@ from encore.frontend.types import (
     AnySmartPointer,
     array_size,
     is_array_type,
+    is_dyn_trait_type,
     is_mutable_type,
     is_raw_pointer_type,
     is_reference_like_type,
@@ -62,6 +63,7 @@ class TypeInferer:
         self._traits: dict[str, s.Statement_Trait] = {}
         self._impl_traits: dict[str, list[str]] = {}
         self._generic_impl_traits: list[tuple[list[Type], str]] = []
+        self._trait_impl_records: list[s.Statement_Impl] = []
         self._globals: dict[str, Type] = {}
         self._unsafe_depth = 0
         self._current_fn_return_type: Type | None = None
@@ -130,6 +132,7 @@ class TypeInferer:
             elif isinstance(statement, s.Statement_Impl):
                 struct_name = statement.struct.name
                 if statement.trait_name is not None:
+                    self._trait_impl_records.append(statement)
                     owner_generic = next((generic for generic in statement.generics if generic.name == struct_name), None)
                     if owner_generic is not None:
                         bounds = list(owner_generic.bounds) if isinstance(owner_generic, s.GenericParam) else []
@@ -641,6 +644,16 @@ class TypeInferer:
 
         receiver_type = unwrap_for_storage(receiver_type)
         base_receiver_type = receiver_type.pointee if is_reference_like_type(receiver_type) else receiver_type
+        if is_dyn_trait_type(base_receiver_type):
+            trait_type = base_receiver_type.generics[0]
+            trait_signature = self._lookup_trait_method_signature(
+                trait_type.name,
+                method_name,
+                receiver_type=base_receiver_type,
+            )
+            if trait_signature is not None:
+                return f"{trait_type.name}::{method_name}", trait_signature
+
         inherent_name = f"{base_receiver_type.name}::{method_name}"
         inherent_signature = self._lookup_function_signature(inherent_name)
         if inherent_signature is not None:
@@ -763,6 +776,9 @@ class TypeInferer:
                     )
 
         if signature.generics:
+            if expected_type is not None and signature.type is not None:
+                self._match_generic(signature.type, expected_type, generic_mapping)
+            self._infer_missing_generics_from_bounds(signature.generics, generic_mapping)
             missing_generics = [generic.name for generic in signature.generics if generic.name not in generic_mapping]
             if missing_generics:
                 raise TypeError(
@@ -774,6 +790,61 @@ class TypeInferer:
         if signature.type is None:
             return None
         return self._specialize_type(signature.type, generic_mapping)
+
+    def _infer_missing_generics_from_bounds(
+        self,
+        generics: list[Type],
+        generic_mapping: dict[str, Type],
+    ) -> None:
+        changed = True
+        while changed:
+            changed = False
+            for generic in generics:
+                if not isinstance(generic, s.GenericParam):
+                    continue
+                concrete = generic_mapping.get(generic.name)
+                if concrete is None:
+                    continue
+                for bound in generic.bounds:
+                    changed |= self._infer_generics_from_bound_impl(bound, concrete, generic_mapping)
+
+    def _infer_generics_from_bound_impl(
+        self,
+        bound: Type,
+        concrete: Type,
+        generic_mapping: dict[str, Type],
+    ) -> bool:
+        concrete = unwrap_for_storage(concrete)
+        if is_reference_like_type(concrete):
+            return self._infer_generics_from_bound_impl(bound, concrete.pointee, generic_mapping)
+        if is_raw_pointer_type(concrete):
+            return self._infer_generics_from_bound_impl(bound, concrete.pointee, generic_mapping)
+
+        changed = False
+        for impl in self._trait_impl_records:
+            if impl.trait_name is None:
+                continue
+            if not self._trait_names_match(impl.trait_name, bound.name):
+                continue
+
+            impl_mapping: dict[str, Type] = {}
+            self._match_generic(impl.struct, concrete, impl_mapping)
+            concrete_impl_struct = self._specialize_type(impl.struct, impl_mapping)
+            if not self._types_compatible(concrete_impl_struct, concrete):
+                continue
+
+            trait_args = [self._specialize_type(arg, impl_mapping) for arg in impl.trait_args]
+            actual_bound = Type(bound.name, trait_args)
+            before = dict(generic_mapping)
+            self._match_generic(bound, actual_bound, generic_mapping)
+            changed |= before != generic_mapping
+        return changed
+
+    def _trait_names_match(self, lhs: str, rhs: str) -> bool:
+        return lhs == rhs or lhs.rsplit("::", 1)[-1] == rhs.rsplit("::", 1)[-1]
+
+    def _call_uses_owner_generics(self, expr: s.Expression_Call) -> bool:
+        return len(expr.callee.segments) >= 2 and bool(expr.callee.segments[-2].generics)
 
     def _infer_lvalue_type(self, expr: s.Statement_Expression, env: dict[str, Type]) -> Optional[Type]:
         if isinstance(expr, s.Expression_Path) and len(expr.segments) == 1:
@@ -950,6 +1021,21 @@ class TypeInferer:
             return ok_type
 
         if isinstance(expr, s.Expression_Cast):
+            if is_dyn_trait_type(expr.target):
+                source_type = self._infer_expression(expr.expr, env, mutable_env=mutable_env)
+                if source_type is None:
+                    raise TypeError(f"Unable to infer source type for cast to '{expr.target}'")
+
+                source_type = unwrap_for_storage(source_type)
+                source_base = source_type.pointee if is_reference_like_type(source_type) else source_type
+                target_trait = expr.target.generics[0]
+                if is_dyn_trait_type(source_base):
+                    if not self._trait_satisfies_bound(source_base.generics[0].name, target_trait):
+                        raise TypeError(f"Cannot cast '{source_base}' to '{expr.target}'")
+                elif not self._type_satisfies_bound(source_base, target_trait):
+                    raise TypeError(f"Type '{source_base}' does not implement trait '{target_trait}'")
+                return expr.target
+
             cast_call = s.Expression_MethodCall(
                 receiver=expr.expr,
                 method="cast",
@@ -1061,7 +1147,7 @@ class TypeInferer:
                     return result
                 return expr.segments[0]
             if len(expr.segments) == 2 and expr.segments[0].name in self._enums:
-                return expr.segments[0]
+                return self._infer_enum_path(expr, expected_type)
             return None
 
         if isinstance(expr, s.Expression_StructInitialization):
@@ -1117,11 +1203,12 @@ class TypeInferer:
                 explicit_generics=expr.generics,
                 callable_name=call_name,
             )
+            expr.generics = list(expr.generics)
             self._assert_raw_pointer_usage_allowed(inferred, context=f"method call '{call_name}'")
             return inferred
 
         if isinstance(expr, s.Expression_Call):
-            enum_type = self._infer_enum_call(expr, env, mutable_env)
+            enum_type = self._infer_enum_call(expr, env, expected_type, mutable_env)
             if enum_type is not None:
                 return enum_type
 
@@ -1137,6 +1224,8 @@ class TypeInferer:
                 explicit_generics=explicit_generics,
                 callable_name=call_name,
             )
+            if not self._call_uses_owner_generics(expr):
+                expr.generics = list(explicit_generics)
             self._assert_raw_pointer_usage_allowed(result, context=f"call '{call_name}'")
             return result
 
@@ -1185,6 +1274,7 @@ class TypeInferer:
         self,
         expr: s.Expression_Call,
         env: dict[str, Type],
+        expected_type: Optional[Type] = None,
         mutable_env: dict[str, bool] | None = None,
     ) -> Optional[Type]:
         mutable_env = mutable_env or {}
@@ -1197,13 +1287,58 @@ class TypeInferer:
             return None
 
         generic_mapping = {generic.name: concrete for generic, concrete in zip(enum_def.generics, enum_type.generics)}
+        expected_base = unwrap_for_storage(expected_type) if expected_type is not None else None
+        if expected_base is not None and is_reference_like_type(expected_base):
+            expected_base = expected_base.pointee
+        if expected_base is not None and expected_base.name == enum_def.name:
+            for generic, concrete in zip(enum_def.generics, expected_base.generics):
+                generic_mapping.setdefault(generic.name, concrete)
+
         for variant in enum_def.body:
             if variant.name != expr.callee.segments[1].name:
                 continue
             if isinstance(variant, s.TupleStructureDefinition) and variant.fields:
                 payload_type = self._specialize_type(variant.fields[0], generic_mapping)
                 if expr.args:
-                    self._infer_expression(expr.args[0], env, payload_type, mutable_env)
+                    arg_type = self._infer_expression(expr.args[0], env, payload_type, mutable_env)
+                    if arg_type is not None:
+                        self._match_generic(variant.fields[0], arg_type, generic_mapping)
+        if enum_def.generics:
+            missing_generics = [generic.name for generic in enum_def.generics if generic.name not in generic_mapping]
+            if missing_generics:
+                raise TypeError(
+                    f"Unable to infer generics for enum constructor '{enum_def.name}::{expr.callee.segments[1].name}': "
+                    f"{', '.join(missing_generics)}"
+                )
+            enum_type.generics = [generic_mapping[generic.name] for generic in enum_def.generics]
+        return enum_type
+
+    def _infer_enum_path(self, expr: s.Expression_Path, expected_type: Optional[Type] = None) -> Type:
+        enum_type = expr.segments[0]
+        enum_def = self._enums[enum_type.name]
+        variant_name = expr.segments[1].name
+        variant = next((candidate for candidate in enum_def.body if candidate.name == variant_name), None)
+        if variant is None:
+            raise TypeError(f"Unknown enum variant '{variant_name}' for enum '{enum_def.name}'")
+        if isinstance(variant, s.TupleStructureDefinition) and variant.fields:
+            raise TypeError(f"Enum variant '{enum_def.name}::{variant_name}' requires payload")
+
+        generic_mapping = {generic.name: concrete for generic, concrete in zip(enum_def.generics, enum_type.generics)}
+        expected_base = unwrap_for_storage(expected_type) if expected_type is not None else None
+        if expected_base is not None and is_reference_like_type(expected_base):
+            expected_base = expected_base.pointee
+        if expected_base is not None and expected_base.name == enum_def.name:
+            for generic, concrete in zip(enum_def.generics, expected_base.generics):
+                generic_mapping.setdefault(generic.name, concrete)
+
+        if enum_def.generics:
+            missing_generics = [generic.name for generic in enum_def.generics if generic.name not in generic_mapping]
+            if missing_generics:
+                raise TypeError(
+                    f"Unable to infer generics for enum variant '{enum_def.name}::{variant_name}': "
+                    f"{', '.join(missing_generics)}"
+                )
+            enum_type.generics = [generic_mapping[generic.name] for generic in enum_def.generics]
         return enum_type
 
     def _collect_generic_bounds(self, generics: list[Type]) -> dict[str, list[Type]]:
@@ -1258,6 +1393,8 @@ class TypeInferer:
             return self._type_satisfies_bound(concrete.pointee, bound)
         if is_raw_pointer_type(concrete):
             return self._type_satisfies_bound(concrete.pointee, bound)
+        if is_dyn_trait_type(concrete):
+            return self._trait_satisfies_bound(concrete.generics[0].name, bound)
 
         active_bounds = self._lookup_active_generic_bounds(concrete)
         for active_bound in active_bounds:
@@ -1822,6 +1959,11 @@ class TypeInferer:
             return False
         if is_raw_pointer_type(actual):
             return False
+
+        if is_dyn_trait_type(expected) or is_dyn_trait_type(actual):
+            if not (is_dyn_trait_type(expected) and is_dyn_trait_type(actual)):
+                return False
+            return self._trait_satisfies_bound(actual.generics[0].name, expected.generics[0])
 
         if self._can_widen_primitive(actual, expected):
             return True

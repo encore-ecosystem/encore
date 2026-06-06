@@ -105,6 +105,7 @@ class Resolver:
         self.impls = []
         self.type_aliases = {}
         self._current_fn_name: str | None = None
+        self._current_generic_names: set[str] = set()
         self._trait_parents = {}
 
         for d in ast:
@@ -498,6 +499,8 @@ class Resolver:
 
     def _resolve_fn(self, fn: Derective_fn) -> None:
         self._current_fn_name = fn.name
+        previous_generic_names = self._current_generic_names
+        self._current_generic_names = {generic.name for generic in fn.generics}
         vars_by_name: dict[str, Type | None] = {}
         for p in fn.params:
             vars_by_name[p.name] = p.type
@@ -517,6 +520,7 @@ class Resolver:
         for i, p in enumerate(fn.params):
             fn.params[i] = Parameter(p.name, self._must_get(vars_by_name, p.name, fn.name))
         self._current_fn_name = None
+        self._current_generic_names = previous_generic_names
 
     def _resolve_instr(self, instr, fn_ret_type: Type, vars_by_name: dict[str, Type | None]) -> bool:
         if isinstance(instr, Instruction_capprim):
@@ -538,10 +542,24 @@ class Resolver:
             return changed
 
         if isinstance(instr, Instruction_salloc):
-            return self._set_var(vars_by_name, instr.var_out, Pointer(instr.type))
+            existing = vars_by_name.get(instr.var_out.name) or instr.var_out.type
+            if isinstance(existing, Pointer) and self._contains_unbound_generic(instr.type):
+                instr.type = existing.pointee
+            changed = self._set_var(vars_by_name, instr.var_out, Pointer(instr.type))
+            resolved = self._var_type(vars_by_name, instr.var_out)
+            if isinstance(resolved, Pointer) and self._types_compatible(instr.type, resolved.pointee):
+                instr.type = resolved.pointee
+            return changed
 
         if isinstance(instr, Instruction_halloc):
-            return self._set_var(vars_by_name, instr.var_out, Pointer(instr.type))
+            existing = vars_by_name.get(instr.var_out.name) or instr.var_out.type
+            if isinstance(existing, Pointer) and self._contains_unbound_generic(instr.type):
+                instr.type = existing.pointee
+            changed = self._set_var(vars_by_name, instr.var_out, Pointer(instr.type))
+            resolved = self._var_type(vars_by_name, instr.var_out)
+            if isinstance(resolved, Pointer) and self._types_compatible(instr.type, resolved.pointee):
+                instr.type = resolved.pointee
+            return changed
 
         if isinstance(instr, Instruction_load):
             ptr_t = self._var_type(vars_by_name, instr.var)
@@ -1041,20 +1059,30 @@ class Resolver:
                 recv_base = recv_t.pointee if isinstance(recv_t, Reference) else recv_t
                 params = []
                 for param in trait_method.params:
-                    param_t = self._resolve_type(param.type)
-                    if recv_base is not None and param_t.name == "Self":
-                        params.append(recv_base)
-                    else:
-                        params.append(param_t)
-                ret_t = self._resolve_type(trait_method.ret_type)
-                if recv_base is not None and ret_t.name == "Self":
-                    ret_t = recv_base
+                    param_type = self._replace_type(param.type, {}, recv_base) if recv_base is not None else param.type
+                    params.append(self._resolve_type(param_type))
+                ret_type = self._replace_type(trait_method.ret_type, {}, recv_base) if recv_base is not None else trait_method.ret_type
+                ret_t = self._resolve_type(ret_type)
                 resolved_method = trait_method.name
                 if resolved_method != "op" and recv_base is not None:
                     suffix = self._mangle_type_name(recv_base)
                     if suffix:
                         resolved_method = f"{resolved_method}__{suffix}"
                 resolved_name = f"{trait_decl.name}::{resolved_method}"
+                if resolved_name not in self.fn and recv_base is not None:
+                    lifted_prefix = f"{trait_decl.name}::{trait_method.name}__"
+                    for candidate_name, candidate in self.fn.items():
+                        if not candidate_name.startswith(lifted_prefix):
+                            continue
+                        if not candidate.params:
+                            continue
+                        mapping: dict[str, Type] = {}
+                        if not self._bind_generic_from_types(candidate.params[0].type, recv_base, mapping):
+                            continue
+                        if candidate.generics and any(generic.name not in mapping for generic in candidate.generics):
+                            continue
+                        instr.generics = [deepcopy(mapping[generic.name]) for generic in candidate.generics]
+                        return build_sig(candidate), candidate_name
                 return _MethodSig(params=params, ret=ret_t), resolved_name
 
         for impl in self.impls:
@@ -1181,6 +1209,8 @@ class Resolver:
         return typ.name.replace("::", "_")
 
     def _is_placeholder_type_name(self, name: str) -> bool:
+        if name in self._current_generic_names:
+            return True
         if name in {"Self", "T"}:
             return True
         if len(name) == 1 and name.isupper():
@@ -1229,7 +1259,7 @@ class Resolver:
                 return True
             return self._types_compatible(existed, concrete)
 
-        if template.name != concrete.name:
+        if template.name != concrete.name and template.name.split("::")[-1] != concrete.name.split("::")[-1]:
             return False
         if len(template.generics) != len(concrete.generics):
             return False
@@ -1295,9 +1325,9 @@ class Resolver:
         current = src_t.pointee if isinstance(src_t, (Reference, Pointer)) else src_t
         for seg in path:
             decl = self.structs.get(current.name)
-            if is_box_type(current):
+            pointee = self._box_pointee_for_field(current, seg)
+            if pointee is not None:
                 # Safe field access through Box[T] behaves like access through &T.
-                pointee = box_pointee(current)
                 pointee_decl = self.structs.get(pointee.name)
                 if pointee_decl is not None and any(p.name == seg.name for p in pointee_decl.params):
                     current = pointee
@@ -1305,12 +1335,31 @@ class Resolver:
             if decl is None:
                 return None
             field = next((p for p in decl.params if p.name == seg.name), None)
+            if field is None and seg.name.isdigit():
+                field_index = int(seg.name)
+                if 0 <= field_index < len(decl.params):
+                    field = decl.params[field_index]
             if field is None:
                 raise EhirCompileError(f"Unknown field '{seg.name}' for struct '{decl.name}'")
             spec = self._specialize_type(field.type, decl.generics, current.generics)
             current = self._resolve_type(spec)
             seg.type = current
         return current
+
+    def _box_pointee_for_field(self, current: Type, field: Variable) -> Type | None:
+        if field.name in {"ptr", "owner", "0", "1"}:
+            return None
+        if is_box_type(current):
+            return box_pointee(current)
+        if not current.name.startswith("__Box_"):
+            return None
+        decl = self.structs.get(current.name)
+        if decl is None or not decl.params:
+            return None
+        ptr_field = decl.params[0].type
+        if not isinstance(ptr_field, Pointer):
+            return None
+        return ptr_field.pointee
 
     def _commit_instr_vars(self, instr, vars_by_name: dict[str, Type | None]) -> None:
         self._commit_value(instr, vars_by_name)
@@ -1467,6 +1516,8 @@ class Resolver:
             return Reference(self._resolve_type(typ.pointee))
         if isinstance(typ, PrimitiveType):
             return deepcopy(typ)
+        if not typ.generics and typ.name in self._current_generic_names:
+            return Type(typ.name)
         if not typ.generics and typ.name in self.type_aliases:
             return self._resolve_type(deepcopy(self.type_aliases[typ.name]))
         if typ.name == "usize":

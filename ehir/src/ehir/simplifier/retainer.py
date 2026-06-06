@@ -8,6 +8,7 @@ from ehir.core.instructions import (
     Instruction_capstruct,
     Instruction_cenum,
     Instruction_cstruct,
+    Instruction_drop,
     Instruction_getfield,
     Instruction_load,
     Instruction_ret,
@@ -22,7 +23,6 @@ from ehir.core.type import Type
 from ehir.core.variable import TypedVariable, Variable
 from ehir.simplifier.drop_helper import (
     collect_aggregate_names,
-    drop_function_name,
     needs_retain,
     retain_function_name,
 )
@@ -50,6 +50,7 @@ class RetainInsertionPass:
         if fn.name.startswith("__drop_") or fn.name.startswith("__retain_") or fn.name.startswith("__cfree"):
             return
 
+        self._tmp_seq = 0
         arg_names = {param.name for param in fn.params}
         for block in fn.body:
             new_body: list[Instruction] = []
@@ -68,19 +69,28 @@ class RetainInsertionPass:
                 old = TypedVariable(f".old_{instr.var_dst.name}", deepcopy(instr.var_src.type))
                 return [
                     Instruction_load(var_out=old, var=instr.var_dst),
-                    Instruction_call(
-                        var_out=TypedVariable(f".drop_old_{instr.var_dst.name}", Type("void")),
-                        fn_name=drop_function_name(instr.var_src.type),
-                        generics=[],
-                        args=[deepcopy(old)],
-                    ),
                     *self._retain_calls([instr.var_src]),
                     instr,
+                    Instruction_drop(var=deepcopy(old)),
                 ]
             return [*self._retain_calls([instr.var_src]), instr]
 
         if isinstance(instr, Instruction_setfield):
-            return [*self._retain_calls([instr.value]), instr]
+            final_field = ([instr.field, *instr.field_path])[-1]
+            if final_field.type is None or not needs_retain(final_field.type, self._aggregate_names):
+                return [*self._retain_calls([instr.value]), instr]
+            old = TypedVariable(f".old_{self._next_tmp()}_{instr.var.name}_{final_field.name}", deepcopy(final_field.type))
+            return [
+                *self._retain_calls([instr.value]),
+                Instruction_getfield(
+                    var_out=old,
+                    src=deepcopy(instr.var),
+                    field=deepcopy(instr.field),
+                    field_path=deepcopy(instr.field_path or []),
+                ),
+                instr,
+                Instruction_drop(var=old),
+            ]
 
         if isinstance(instr, (Instruction_load, Instruction_getfield, Instruction_sgetfield)):
             assert isinstance(instr.var_out, Variable)
@@ -93,6 +103,10 @@ class RetainInsertionPass:
             return [*self._retain_calls(self._enum_args(instr.enum)), instr]
 
         return [instr]
+
+    def _next_tmp(self) -> int:
+        self._tmp_seq += 1
+        return self._tmp_seq
 
     @staticmethod
     def _is_concrete_box_store(fn_name: str) -> bool:

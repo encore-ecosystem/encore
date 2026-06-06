@@ -1,110 +1,84 @@
-# EHIR Runtime ABI (v0 draft)
+# Native ABI Boundary
 
-This document defines the language/backend contract for runtime calls used by EHIR after lowering.
+EHIR does not define or implement a language runtime.
 
-## Scope
+Runtime-like functionality is supplied by frontends/packages through native
+libraries. Encore's `core` package provides its native implementation via
+`build.enq`, which asks the build system to compile and link `core/runtime.c`.
 
-EHIR core lowering may emit `extern fn __ehir_rt_*` calls.  
-A backend that claims EHIR compatibility must provide these symbols with compatible signatures and semantics.
+## Contract
 
-## Conventions
+1. EHIR may contain ordinary `extern fn` declarations.
+2. Backends link the native libraries attached to the compiled refrain.
+3. A backend is not required to implement any EHIR-owned runtime symbol family.
+4. Package authors own the ABI names they expose through `extern fn`.
 
-1. Function names are stable ABI symbols (no backend-specific renaming).
-2. Primitive widths must match EHIR types exactly (`u8/u64/i32/usize/u1/...`).
-3. `str` is an opaque runtime string handle owned by runtime conventions.
-4. Return codes:
-   - `0` means success for integer status APIs unless explicitly documented otherwise.
-   - non-zero indicates failure.
-5. Calls must be deterministic relative to runtime/environment inputs.
+Encore reserves the `encore_*` C symbol prefix for its standard native ABI.
+Those symbols are provided by Encore `core`, not by EHIR.
 
-## Required symbol groups
+## Encore Core Native Symbols
 
-### Time
+The current Encore core native implementation exports symbols such as:
 
-- `__ehir_rt_clock_ms(kind: u8) -> u64`
-- `__ehir_rt_sleep_ms(ms: u64) -> u1`
+- `encore_clock_ms`
+- `encore_sleep_ms`
+- `encore_io_write`
+- `encore_proc_exit`
+- `encore_str_len`
+- `encore_str_byte_at`
+- `encore_str_concat`
+- `encore_str_slice`
+- `encore_str_char_len`
+- `encore_str_char_at`
+- `encore_str_slice_chars`
+- `encore_fmt_u64`
+- `encore_fmt_i64`
+- `encore_fmt_f64`
+- `encore_os_argc`
+- `encore_os_argv`
+- `encore_os_cwd`
+- `encore_os_home_dir`
+- `encore_fs_read_file`
+- `encore_fs_write_file`
+- `encore_fs_status`
+- `encore_fs_remove_file`
+- `encore_fs_mkdir`
+- `encore_fs_read_dir`
+- `encore_net_tcp_connect`
+- `encore_net_tcp_bind`
+- `encore_net_tcp_accept`
+- `encore_net_tcp_read`
+- `encore_net_tcp_write`
+- `encore_net_tcp_close`
+- `encore_net_last_error`
+- `encore_gui_window_create`
+- `encore_gui_window_is_open`
+- `encore_gui_window_poll`
+- `encore_gui_window_clear`
+- `encore_gui_window_fill_rect`
+- `encore_gui_window_present`
+- `encore_gui_window_destroy`
 
-`kind` values:
-- `0`: wall clock milliseconds
-- `1`: monotonic/perf clock milliseconds
+This list documents Encore's current native package surface. It is not an EHIR
+backend requirement.
 
-### IO
+## Memory Model Boundary
 
-- `__ehir_rt_io_write(fd: i32, value: str) -> i32`
+`drop/cfree/ERN` graph semantics are EHIR language semantics. Native libraries
+do not perform ownership analysis; they only execute explicitly emitted calls.
 
-`fd` is backend/runtime-defined, but `1` and `2` should map to stdout/stderr where available.
-
-### Process
-
-- `__ehir_rt_proc_exit(code: i32) -> i32`
-
-### String
-
-- `__ehir_rt_str_len(value: str) -> usize`
-- `__ehir_rt_str_byte_at(value: str, index: usize) -> u8`
-- `__ehir_rt_str_concat(lhs: str, rhs: str) -> str`
-- `__ehir_rt_str_slice(value: str, start: usize, slice_len: usize) -> str`
-
-### Formatting
-
-- `__ehir_rt_fmt_u64(value: u64) -> str`
-- `__ehir_rt_fmt_i64(value: i64) -> str`
-- `__ehir_rt_fmt_f64(value: f64) -> str`
-
-### OS / FS
-
-- `__ehir_rt_os_argc() -> usize`
-- `__ehir_rt_os_argv(index: usize) -> str`
-- `__ehir_rt_os_cwd() -> str`
-- `__ehir_rt_fs_read_file(path: str) -> str`
-- `__ehir_rt_fs_write_file(path: str, contents: str) -> i32`
-- `__ehir_rt_fs_status(path: str) -> i32`
-- `__ehir_rt_fs_remove_file(path: str) -> i32`
-- `__ehir_rt_fs_mkdir(path: str) -> i32`
-- `__ehir_rt_fs_read_dir(path: str) -> str`
-
-### Network
-
-- `__ehir_rt_net_tcp_connect(addr: str) -> i32`
-- `__ehir_rt_net_tcp_bind(addr: str) -> i32`
-- `__ehir_rt_net_tcp_accept(listener_fd: i32) -> i32`
-- `__ehir_rt_net_tcp_read(fd: i32, max: usize) -> str`
-- `__ehir_rt_net_tcp_write(fd: i32, data: str) -> i32`
-- `__ehir_rt_net_tcp_close(fd: i32) -> i32`
-- `__ehir_rt_net_last_error() -> str`
-
-## Memory model boundary
-
-`drop/cfree` graph semantics are language-level.  
-Runtime ABI does not perform semantic ownership analysis; it only executes the primitive operations requested by lowered code.
-
-## dyn Trait ABI (fat pointer + vtable)
+## dyn Trait ABI
 
 Current EHIR lowering for `dyn Trait` uses a uniform trait-object ABI:
 
 1. Runtime representation of `dyn Trait`:
    - `data_ptr: i8*`
    - `vtable_ptr: i8*`
-
 2. `data_ptr` points to heap storage containing a concrete value payload.
-
-3. `vtable_ptr` points to a trait-specific vtable object:
-   - one slot per trait method,
-   - each slot stores an erased function pointer (`i8*`).
-
-4. Slot order is deterministic and backend-defined by trait method order contract used during lowering.
-
-5. Dynamic dispatch:
-   - lower `Trait::method(dyn_obj, ...)` to dyn-dispatch path,
-   - read function pointer from method slot,
-   - cast slot pointer to concrete call signature,
-   - indirect-call with `self` reconstructed from `data_ptr`.
-
-6. Null/uninitialized vtable slot is a hard runtime failure (`trap`), not silent fallback.
-
-7. Object-safety remains a language-level check in EHIR (before backend codegen).
-
-## Compatibility policy
-
-Backend updates must preserve this ABI for the same major EHIR version.  
-If a symbol or signature changes, it requires a coordinated ABI version bump and migration.
+3. `vtable_ptr` points to a trait-specific vtable object.
+4. Slot order is deterministic and follows trait method order after inherited
+   methods are included.
+5. Dynamic dispatch reads the function pointer from the vtable slot and performs
+   an indirect call with `self` reconstructed from `data_ptr`.
+6. Null/uninitialized vtable slots are hard failures (`trap`).
+7. Object-safety is checked before backend codegen.

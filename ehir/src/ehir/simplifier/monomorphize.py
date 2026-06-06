@@ -14,6 +14,7 @@ from ehir.core.type import Pointer, Reference, Type, concrete_box_type_name, man
 
 class MonomorphizationPass:
     _GENERIC_MONO_PASSES = 4
+    _known_concrete_type_names: set[str]
 
     @staticmethod
     def _generic_clone_name(fn_name: str, signature: str) -> str:
@@ -26,6 +27,9 @@ class MonomorphizationPass:
         return name.startswith("Box[T]::") or name.startswith("Box::")
 
     def run(self, ast: list[Derective]) -> list[Derective]:
+        self._known_concrete_type_names = {
+            d.name for d in ast if isinstance(d, (Derective_struct, Derective_enum))
+        }
         box_struct = next((d for d in ast if isinstance(d, Derective_struct) and d.name == "Box" and d.generics), None)
         if box_struct is None:
             out = ast
@@ -113,28 +117,50 @@ class MonomorphizationPass:
         for item in self._walk(ast):
             if isinstance(item, Instruction_call):
                 referenced_fn_names.add(item.fn_name)
+        impl_template_names = self._lifted_impl_template_names(ast)
         pruned: list[Derective] = []
         for directive in ast:
             if isinstance(directive, Derective_fn):
-                if self._is_unresolved_template_fn(directive) and directive.name not in referenced_fn_names:
+                if (
+                    self._is_unresolved_template_fn(directive)
+                    and directive.name not in referenced_fn_names
+                    and directive.name not in impl_template_names
+                ):
                     continue
                 pruned.append(directive)
                 continue
 
             if isinstance(directive, Derective_impl):
-                kept_methods: list[Derective_fn] = []
-                for method in directive.methods:
-                    if self._is_unresolved_template_fn(method):
-                        continue
-                    kept_methods.append(method)
-                if not kept_methods and directive.generics:
-                    continue
-                pruned.append(replace(directive, methods=kept_methods))
+                pruned.append(directive)
                 continue
 
             pruned.append(directive)
 
         return pruned
+
+    def _lifted_impl_template_names(self, ast: list[Derective]) -> set[str]:
+        names: set[str] = set()
+        for directive in ast:
+            if not isinstance(directive, Derective_impl):
+                continue
+            owner = directive.trait_name if directive.trait_name else str(directive.for_type)
+            if not owner:
+                continue
+            for method in directive.methods:
+                method_name = method.name
+                if "::" in method_name:
+                    names.add(method_name)
+                    continue
+                if directive.trait_name is not None:
+                    suffix = mangle_type_name(directive.for_type)
+                    if directive.trait_args:
+                        trait_suffix = "_".join(mangle_type_name(arg) for arg in directive.trait_args)
+                        if trait_suffix:
+                            suffix = f"{suffix}__{trait_suffix}" if suffix else trait_suffix
+                    if suffix:
+                        method_name = f"{method_name}__{suffix}"
+                names.add(f"{owner}::{method_name}")
+        return names
 
     def _is_unresolved_template_fn(self, fn: Derective_fn) -> bool:
         if fn.generics:
@@ -263,6 +289,8 @@ class MonomorphizationPass:
     def _is_placeholder_type(self, typ: Type) -> bool:
         if isinstance(typ, (Pointer, Reference)):
             return self._is_placeholder_type(typ.pointee)
+        if typ.name in self._known_concrete_type_names:
+            return any(self._is_placeholder_type(generic) for generic in typ.generics)
         if not typ.generics and (typ.name in {"T", "Self"} or (len(typ.name) == 1 and typ.name.isupper())):
             return True
         return any(self._is_placeholder_type(generic) for generic in typ.generics)

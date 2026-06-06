@@ -15,6 +15,7 @@ class TokenType(Enum):
     KW_FN = auto()
     KW_STRUCT = auto()
     KW_TRAIT = auto()
+    KW_DYN = auto()
     KW_ENUM = auto()
     KW_IMPL = auto()
     KW_FOR = auto()
