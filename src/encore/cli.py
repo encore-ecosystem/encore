@@ -9,6 +9,8 @@ from encore.utils.diagnostics import render_diagnostic
 MODES = [
     modes.add_add_parser,
     modes.add_init_parser,
+    modes.add_install_parser,
+    modes.add_lsp_parser,
     modes.add_build_parser,
     modes.add_run_parser,
     modes.add_sync_parser,
