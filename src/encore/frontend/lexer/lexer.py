@@ -44,9 +44,17 @@ class Lexer(ParserBase[str, LexerToken]):
 
                 case "*":
                     self._consume()
-                    self._consume_and_push(TokenType.ASTERISK_EQUAL) if self._peek_curr() == "=" else self._push_token(
-                        TokenType.ASTERISK
-                    )
+                    match self._peek_curr():
+                        case "*":
+                            self._consume()
+                            if self._peek_curr() == "=":
+                                self._consume_and_push(TokenType.POWER_EQUAL)
+                            else:
+                                self._push_token(TokenType.POWER)
+                        case "=":
+                            self._consume_and_push(TokenType.ASTERISK_EQUAL)
+                        case _:
+                            self._push_token(TokenType.ASTERISK)
 
                 case "/":
                     self._consume()
@@ -63,7 +71,6 @@ class Lexer(ParserBase[str, LexerToken]):
                             self._consume()
                             self._consume_and_push(TokenType.MULTI_LINE_COMMENT)
                         case "=":  # div equal
-                            self._consume()
                             self._consume_and_push(TokenType.SLASH_EQUAL)
                         case _:
                             self._push_token(TokenType.SLASH)

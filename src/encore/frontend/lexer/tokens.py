@@ -46,6 +46,7 @@ class TokenType(Enum):
     PLUS = auto()
     MINUS = auto()
     ASTERISK = auto()
+    POWER = auto()
     SLASH = auto()
     PERCENT = auto()
 
@@ -71,6 +72,7 @@ class TokenType(Enum):
     PLUS_EQUAL = auto()
     MINUS_EQUAL = auto()
     ASTERISK_EQUAL = auto()
+    POWER_EQUAL = auto()
     SLASH_EQUAL = auto()
     PERCENT_EQUAL = auto()
     AMPERSAND_EQUAL = auto()

@@ -74,6 +74,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
     _cache: dict[Path, EHIR_Module] = field(default_factory=dict)
     _ast_cache: dict[Path, list[s.Statement]] = field(default_factory=dict)
     _source_ast_cache: dict[Path, list[s.Statement]] = field(default_factory=dict)
+    _source_text_cache: dict[Path, str] = field(default_factory=dict)
     _index_cache: dict[Path, ModuleIndex] = field(default_factory=dict)
     _dependency_cache: dict[Path, dict[str, Path]] = field(default_factory=dict)
     _lexer: Lexer = field(default_factory=lambda: Lexer())
@@ -88,11 +89,12 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             return self._cache[id]
 
         ast = self._get_ast_by_id(id)
+        source_text = self._get_source_text_by_id(id)
         imported_declarations = self._collect_imported_declarations(id, ast)
         try:
             TypeInferer().infer(ast, cast(list[object], imported_declarations))
         except Exception as exc:
-            raise with_diagnostic_context(exc, stage="type-inference", module_id=id) from exc
+            raise with_diagnostic_context(exc, stage="type-inference", module_id=id, source_text=source_text) from exc
 
         translator = Translator()
         ast_for_translation = self._prepare_imports_for_translation(id, ast)
@@ -101,7 +103,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                 ast_for_translation, module_id=id, imported_declarations=cast(list[object], imported_declarations)
             )
         except Exception as exc:
-            raise with_diagnostic_context(exc, stage="translation", module_id=id) from exc
+            raise with_diagnostic_context(exc, stage="translation", module_id=id, source_text=source_text) from exc
         module.id = id
 
         self._cache[id] = module
@@ -156,7 +158,7 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         if id in self._source_ast_cache:
             return self._source_ast_cache[id]
 
-        source_text = id.read_text()
+        source_text = self._get_source_text_by_id(id)
         try:
             tokens = self._lexer.parse(list(source_text))
             tokens = self._macro_expander.expand(tokens)
@@ -167,6 +169,11 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         ast = self._inject_prelude_imports(id, ast)
         self._source_ast_cache[id] = ast
         return ast
+
+    def _get_source_text_by_id(self, id: Path) -> str:
+        if id not in self._source_text_cache:
+            self._source_text_cache[id] = id.read_text()
+        return self._source_text_cache[id]
 
     def _inject_prelude_imports(self, id: Path, ast: list[s.Statement]) -> list[s.Statement]:
         project_root = self._get_project_root_of(id)

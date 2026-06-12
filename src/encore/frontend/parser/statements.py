@@ -1,6 +1,7 @@
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
+from pathlib import Path
 from typing import Optional
 
 from ehir.core.instructions.base import Instruction
@@ -10,7 +11,11 @@ from ehir.core.variable import Parameter
 
 @dataclass
 class Statement:
-    pass
+    line: int | None = field(default=None, init=False, repr=False)
+    column: int | None = field(default=None, init=False, repr=False)
+    span_length: int | None = field(default=None, init=False, repr=False)
+    source_line: str | None = field(default=None, init=False, repr=False)
+    module_id: Path | None = field(default=None, init=False, repr=False)
 
 
 @dataclass
@@ -526,6 +531,15 @@ class Expression_StructField(Statement_Expression):
 
 
 @dataclass
+class Expression_FieldAccess(Statement_Expression):
+    receiver: Statement_Expression
+    field: str
+
+    def __repr__(self) -> str:
+        return f"{self.receiver}.{self.field}"
+
+
+@dataclass
 class Expression_Call(Statement_Expression):
     callee: Expression_Path
     generics: list[Type]
@@ -714,6 +728,12 @@ class BinaryOperation_Additive(Expression_BinaryOperation):
 
 @dataclass
 class BinaryOperation_Multiplicative(Expression_BinaryOperation):
+    def __repr__(self) -> str:
+        return f"{self.lhs} {self.operator} {self.rhs}"
+
+
+@dataclass
+class BinaryOperation_Power(Expression_BinaryOperation):
     def __repr__(self) -> str:
         return f"{self.lhs} {self.operator} {self.rhs}"
 

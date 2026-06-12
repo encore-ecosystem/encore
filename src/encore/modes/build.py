@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import subprocess
 import tomllib
 from argparse import Namespace
@@ -8,6 +7,7 @@ from dataclasses import dataclass, field
 from hashlib import sha1
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from ehir.backend import EHIR_Backend
 from ehir.cfg import CfgEnvironment, cfg_matches, default_cfg_environment
@@ -103,43 +103,48 @@ class _BuildScriptContext:
     profile: str
     no_cache: bool
     cfg_overrides: tuple[str, ...]
+    workspace_suffix: str | None = None
 
 
 def add_build_parser(subparsers) -> tuple[str, Callable]:
     section = "build"
     build_parser = subparsers.add_parser(section, help="Build a project")
-    build_parser.add_argument("--release", action="store_true", help="Enable release optimizations")
-    build_parser.add_argument(
+    add_build_options(build_parser)
+    return (section, handle_build)
+
+
+def add_build_options(parser) -> None:
+    parser.add_argument("--release", action="store_true", help="Enable release optimizations")
+    parser.add_argument(
         "--backend", default="llvm", choices=set(AVAILABLE_BACKENDS), help="EHIR Compiler Backend"
     )
-    build_parser.add_argument(
+    parser.add_argument(
         "--profile", default="debug", choices=set(AVAILABLE_OPTPROFILES.keys()), help="Optimization profile"
     )
-    build_parser.add_argument("--no-cache", action="store_true", help="Ignore existing EHIR cache for this build")
-    build_parser.add_argument(
+    parser.add_argument("--no-cache", action="store_true", help="Ignore existing EHIR cache for this build")
+    parser.add_argument(
         "--cfg",
         action="append",
         default=[],
         metavar="PREDICATE",
         help="Add compile-time cfg flag or key=value override.",
     )
-    return (section, handle_build)
 
 
 def handle_build(args: Namespace):
     cwd = Path().resolve()
-    build_ctx = _BuildScriptContext(
-        backend=args.backend,
-        profile=args.profile,
+    build_project(
+        cwd,
+        args.backend,
+        resolve_build_profile(args),
         no_cache=args.no_cache,
-        cfg_overrides=tuple(args.cfg),
+        cfg_overrides=args.cfg,
+        show_status=True,
     )
 
-    compiler = create_compiler(cwd, args.backend, args.profile, no_cache=args.no_cache, cfg_overrides=args.cfg)
-    _inject_mandatory_core_dependency(compiler, cwd, build_ctx)
-    _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd), build_ctx=build_ctx)
-    with _BuildLiveStatus(compiler):
-        compiler.compile_all()
+
+def resolve_build_profile(args: Namespace) -> str:
+    return "release" if getattr(args, "release", False) else args.profile
 
 
 def create_compiler(
@@ -149,12 +154,15 @@ def create_compiler(
     *,
     no_cache: bool = False,
     cfg_overrides: list[str] | None = None,
+    target_dir: Path | None = None,
+    cache_dir: Path | None = None,
 ) -> EHIR_ProjectCompiler:
     backend_cls = _resolve_backend(backend)
     cfg_environment = default_cfg_environment(backend=backend, extra=cfg_overrides or [])
     compiler = EHIR_ProjectCompiler(
         frontend=EHIR_EncoreFrontend(src_dir=cwd / "src", cfg_environment=cfg_environment),
-        backend=backend_cls(target_dir=cwd / "target", opt_profile=AVAILABLE_OPTPROFILES[profile]),
+        backend=backend_cls(target_dir=target_dir or cwd / "target", opt_profile=AVAILABLE_OPTPROFILES[profile]),
+        cache_dir=cache_dir,
         use_cache=not no_cache,
         cfg_environment=cfg_environment,
     )
@@ -321,7 +329,6 @@ def _load_refrain(
         type=type,
         entry_root=entry_root or "src",
         entrypoint=entrypoint,
-        merge_module_dirs=("modes",) if (path / "src" / "modes").exists() else (),
         native_libraries=native_libraries,
     )
     compiler.add_refrain_to_build(ref)
@@ -410,6 +417,14 @@ def _native_libraries_from_build_script(
             project_path,
             cfg_environment,
         )
+    if cached := _load_build_script_metadata_cache(project_path, build_ctx.profile, cache_key):
+        _BUILD_SCRIPT_METADATA_CACHE[cache_key] = _clone_native_section(cached)
+        return _native_libraries_from_native_section(
+            manifest.project.name,
+            cached,
+            project_path,
+            cfg_environment,
+        )
 
     native = _run_build_script(
         manifest=manifest,
@@ -419,6 +434,7 @@ def _native_libraries_from_build_script(
         build_ctx=build_ctx,
     )
     _BUILD_SCRIPT_METADATA_CACHE[cache_key] = _clone_native_section(native)
+    _store_build_script_metadata_cache(project_path, build_ctx.profile, cache_key, native)
     return _native_libraries_from_native_section(manifest.project.name, native, project_path, cfg_environment)
 
 
@@ -447,6 +463,46 @@ def _build_script_cache_key(
     )
 
 
+def _build_script_metadata_cache_path(
+    project_path: Path,
+    profile: str,
+    cache_key: tuple[object, ...],
+) -> Path:
+    digest = sha1(repr(cache_key).encode(), usedforsecurity=False).hexdigest()
+    return project_path / "target" / profile / "build" / "metadata" / f"{digest}.json"
+
+
+def _load_build_script_metadata_cache(
+    project_path: Path,
+    profile: str,
+    cache_key: tuple[object, ...],
+) -> NativeSection | None:
+    cache_path = _build_script_metadata_cache_path(project_path, profile, cache_key)
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        return NativeSection(**payload)
+    except Exception:
+        return None
+
+
+def _store_build_script_metadata_cache(
+    project_path: Path,
+    profile: str,
+    cache_key: tuple[object, ...],
+    native: NativeSection,
+) -> None:
+    cache_path = _build_script_metadata_cache_path(project_path, profile, cache_key)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_name(f"{cache_path.name}.{uuid4().hex}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(native.model_dump(mode="json"), sort_keys=True, indent=2), encoding="utf-8")
+        tmp_path.replace(cache_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def _resolve_build_script_path(manifest: ProjectManifest, project_path: Path) -> Path | None:
     declared = manifest.project.build
     if declared is not None:
@@ -472,16 +528,22 @@ def _run_build_script(
     import toml
 
     target_dir = project_path / "target" / build_ctx.profile / "build"
-    script_workspace = f"{manifest.project.name}_{script_path.stem}_{os.getpid()}"
+    script_workspace = _build_script_workspace_name(
+        manifest=manifest,
+        project_path=project_path,
+        script_path=script_path,
+        cfg_environment=cfg_environment,
+        build_ctx=build_ctx,
+    )
     script_dir = target_dir / "scripts" / script_workspace
     src_dir = script_dir / "src"
     out_dir = target_dir / "out" / script_workspace
     meta_path = out_dir / "build-meta.json"
 
-    if script_dir.exists():
-        shutil.rmtree(script_dir)
     src_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if meta_path.exists():
+        meta_path.unlink()
 
     src_main = src_dir / "main.enq"
     src_main.write_text(script_path.read_text(), encoding="utf-8")
@@ -573,6 +635,27 @@ def _rewrite_build_dependency(dep: str, project_path: Path) -> str:
     return dep
 
 
+def _build_script_workspace_name(
+    *,
+    manifest: ProjectManifest,
+    project_path: Path,
+    script_path: Path,
+    cfg_environment: CfgEnvironment,
+    build_ctx: _BuildScriptContext,
+) -> str:
+    digest = sha1(usedforsecurity=False)
+    digest.update(project_path.resolve().as_posix().encode())
+    digest.update(script_path.resolve().as_posix().encode())
+    digest.update(script_path.read_bytes())
+    digest.update(json.dumps(manifest.model_dump(mode="json"), sort_keys=True).encode())
+    digest.update(build_ctx.backend.encode())
+    digest.update(build_ctx.profile.encode())
+    digest.update(",".join(sorted(cfg_environment.flags)).encode())
+    digest.update(",".join(f"{k}={v}" for k, v in sorted(cfg_environment.values.items())).encode())
+    suffix = f"_{build_ctx.workspace_suffix}" if build_ctx.workspace_suffix else ""
+    return f"{manifest.project.name}_{script_path.stem}_{digest.hexdigest()[:12]}{suffix}"
+
+
 def _resolve_native_path(project_path: Path, value: str) -> str:
     path = Path(value)
     if path.is_absolute():
@@ -607,10 +690,13 @@ def _materialize_native_sources(
             object_is_current = False
 
         if not object_is_current:
-            cmd = ["clang", "-std=c11", "-c", str(source_path), "-o", str(obj_path)]
+            tmp_obj_path = obj_path.with_name(f"{obj_path.name}.{uuid4().hex}.tmp")
+            cmd = ["clang", "-std=c11", "-c", str(source_path), "-o", str(tmp_obj_path)]
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
+                tmp_obj_path.unlink(missing_ok=True)
                 raise RuntimeError(f"Native source compile error ({source_path}): {result.stderr}")
+            tmp_obj_path.replace(obj_path)
 
         out.append(
             NativeLibrary(
@@ -660,6 +746,7 @@ def build_project(
     *,
     no_cache: bool = False,
     cfg_overrides: list[str] | None = None,
+    show_status: bool = False,
 ) -> list[tuple[str, Path]]:
     build_ctx = _BuildScriptContext(
         backend=backend,
@@ -670,7 +757,11 @@ def build_project(
     compiler = create_compiler(cwd, backend, profile, no_cache=no_cache, cfg_overrides=cfg_overrides)
     _inject_mandatory_core_dependency(compiler, cwd, build_ctx)
     entry_ref = _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd), build_ctx=build_ctx)
-    outputs = compiler.compile_all()
+    if show_status:
+        with _BuildLiveStatus(compiler):
+            outputs = compiler.compile_all()
+    else:
+        outputs = compiler.compile_all()
     outputs_by_name = dict(outputs)
     return [(entry_ref.name, outputs_by_name[entry_ref.name]), *[(n, p) for n, p in outputs if n != entry_ref.name]]
 

@@ -20,6 +20,7 @@
 #pragma comment(lib, "Ws2_32.lib")
 #else
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <time.h>
@@ -656,6 +657,30 @@ int32_t encore_net_tcp_close(int32_t fd) {
 int32_t encore_proc_exit(int32_t code) {
     exit(code);
     return code;
+}
+
+int32_t encore_proc_run(encore_str command) {
+    char *command_c = encore_to_cstr(command);
+    if (command_c == NULL) {
+        return -1;
+    }
+
+    int rc = system(command_c);
+    free(command_c);
+    if (rc == -1) {
+        return -1;
+    }
+#ifdef _WIN32
+    return rc;
+#else
+    if (WIFEXITED(rc)) {
+        return WEXITSTATUS(rc);
+    }
+    if (WIFSIGNALED(rc)) {
+        return 128 + WTERMSIG(rc);
+    }
+    return rc;
+#endif
 }
 
 static bool g_args_initialized = false;

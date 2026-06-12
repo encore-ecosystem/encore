@@ -60,6 +60,7 @@ from encore.frontend.types import (
     tuple_arity,
     unwrap_for_storage,
 )
+from encore.utils.diagnostics import CompileDiagnostic
 
 MatchArmLike = s.Statement_MatchArm | s.Expression_MatchArm
 MatchBodyArmLike = s.Statement_MatchArm | s.Expression_MatchArm
@@ -86,6 +87,7 @@ COMPOUND_ASSIGNMENT_TO_BINOP: dict[str, str] = {
     "+=": "+",
     "-=": "-",
     "*=": "*",
+    "**=": "**",
     "/=": "/",
     "%=": "%",
     "&=": "&",
@@ -114,6 +116,7 @@ OPERATOR_TRAIT_MAPPING: dict[str, str] = {
     "+": "Add",
     "-": "Sub",
     "*": "Mul",
+    "**": "Pow",
     "/": "Div",
     "%": "Rem",
     "&": "BitAnd",
@@ -255,6 +258,19 @@ class Translator:
         self._current_self_binding_type = None
         self._current_impl_self_type = None
         self._global_exprs: dict[str, s.Statement_Expression] = {}
+
+    def _diagnostic_for_statement(self, statement: s.Statement, exc: Exception) -> CompileDiagnostic:
+        if isinstance(exc, CompileDiagnostic) and exc.line is not None:
+            return exc
+        return CompileDiagnostic(
+            message=str(exc),
+            line=getattr(statement, "line", None),
+            column=getattr(statement, "column", None),
+            span_length=getattr(statement, "span_length", None),
+            source_line=getattr(statement, "source_line", None),
+            module_id=getattr(statement, "module_id", None),
+            cause=exc,
+        )
 
     def run(self, program: str) -> EHIR_Module:
         self._reset_state()
@@ -425,23 +441,26 @@ class Translator:
                 continue
 
     def _translate_statement(self, statement: s.Statement) -> Derective | None:
-        if isinstance(statement, s.Statement_FunctionDefinition):
-            return self._translate_function_definition(statement)
-        elif isinstance(statement, s.FunctionSignature):
-            return self._translate_extern_function_definition(statement)
-        elif isinstance(statement, s.Statement_StructureDefinition):
-            return self._translate_structure_definition(statement)
-        elif isinstance(statement, s.Statement_EnumDefinition):
-            return self._translate_enum_definition(statement)
-        elif isinstance(statement, s.Statement_Trait):
-            return self._translate_trait_definition(statement)
-        elif isinstance(statement, s.Statement_Impl):
-            return self._translate_impl_definition(statement)
-        elif isinstance(statement, s.Statement_Import):
-            return self._translate_import(statement)
-        elif isinstance(statement, s.Statement_Global):
-            return None
-        raise NotImplementedError(f"Translation for statement type {type(statement)} is not implemented.")
+        try:
+            if isinstance(statement, s.Statement_FunctionDefinition):
+                return self._translate_function_definition(statement)
+            elif isinstance(statement, s.FunctionSignature):
+                return self._translate_extern_function_definition(statement)
+            elif isinstance(statement, s.Statement_StructureDefinition):
+                return self._translate_structure_definition(statement)
+            elif isinstance(statement, s.Statement_EnumDefinition):
+                return self._translate_enum_definition(statement)
+            elif isinstance(statement, s.Statement_Trait):
+                return self._translate_trait_definition(statement)
+            elif isinstance(statement, s.Statement_Impl):
+                return self._translate_impl_definition(statement)
+            elif isinstance(statement, s.Statement_Import):
+                return self._translate_import(statement)
+            elif isinstance(statement, s.Statement_Global):
+                return None
+            raise NotImplementedError(f"Translation for statement type {type(statement)} is not implemented.")
+        except Exception as exc:
+            raise self._diagnostic_for_statement(statement, exc) from exc
 
     def _normalize_signature(
         self, signature: s.FunctionSignature, self_type: Type | None = None
@@ -1396,52 +1415,55 @@ class Translator:
             self._translate_inner_statement(inner_statement)
 
     def _translate_inner_statement(self, statement: s.Statement_InnerLevel):
-        if isinstance(statement, s.Statement_Let):
-            return self._translate_let(statement)
+        try:
+            if isinstance(statement, s.Statement_Let):
+                return self._translate_let(statement)
 
-        elif isinstance(statement, s.Statement_Ret):
-            return self._translate_ret(statement)
+            elif isinstance(statement, s.Statement_Ret):
+                return self._translate_ret(statement)
 
-        elif isinstance(statement, s.Statement_Break):
-            return self._translate_break(statement)
+            elif isinstance(statement, s.Statement_Break):
+                return self._translate_break(statement)
 
-        elif isinstance(statement, s.Statement_Continue):
-            return self._translate_continue(statement)
+            elif isinstance(statement, s.Statement_Continue):
+                return self._translate_continue(statement)
 
-        elif isinstance(statement, s.Statement_While):
-            return self._translate_while(statement)
+            elif isinstance(statement, s.Statement_While):
+                return self._translate_while(statement)
 
-        elif isinstance(statement, s.Statement_Loop):
-            return self._translate_loop(statement)
+            elif isinstance(statement, s.Statement_Loop):
+                return self._translate_loop(statement)
 
-        elif isinstance(statement, s.Statement_DoWhile):
-            return self._translate_do_while(statement)
+            elif isinstance(statement, s.Statement_DoWhile):
+                return self._translate_do_while(statement)
 
-        elif isinstance(statement, s.Statement_For):
-            return self._translate_for(statement)
+            elif isinstance(statement, s.Statement_For):
+                return self._translate_for(statement)
 
-        elif isinstance(statement, s.Statement_With):
-            return self._translate_with(statement)
+            elif isinstance(statement, s.Statement_With):
+                return self._translate_with(statement)
 
-        elif isinstance(statement, s.Statement_If):
-            return self._translate_if(statement)
+            elif isinstance(statement, s.Statement_If):
+                return self._translate_if(statement)
 
-        elif isinstance(statement, s.Statement_Match):
-            return self._translate_match(statement)
+            elif isinstance(statement, s.Statement_Match):
+                return self._translate_match(statement)
 
-        elif isinstance(statement, s.Statement_Unsafe):
-            return self._translate_unsafe(statement)
+            elif isinstance(statement, s.Statement_Unsafe):
+                return self._translate_unsafe(statement)
 
-        elif isinstance(statement, s.Statement_EHIR):
-            return self._translate_ehir(statement)
+            elif isinstance(statement, s.Statement_EHIR):
+                return self._translate_ehir(statement)
 
-        elif isinstance(statement, s.Statement_Assignment):
-            return self._translate_assignment(statement)
+            elif isinstance(statement, s.Statement_Assignment):
+                return self._translate_assignment(statement)
 
-        elif isinstance(statement, s.Statement_Expr):
-            return self._translate_expression_statement(statement)
+            elif isinstance(statement, s.Statement_Expr):
+                return self._translate_expression_statement(statement)
 
-        raise NotImplementedError(f"Translation for inner statement type {type(statement)} is not implemented.")
+            raise NotImplementedError(f"Translation for inner statement type {type(statement)} is not implemented.")
+        except Exception as exc:
+            raise self._diagnostic_for_statement(statement, exc) from exc
 
     def _translate_let(self, statement: s.Statement_Let):
         assert statement.type is not None
@@ -2281,7 +2303,17 @@ class Translator:
                 global_expr = self._global_exprs.get(expr.name)
                 if global_expr is not None:
                     return self._translate_expression(global_expr, name=name, expected_type=expected_type)
-                return self._builder.get_var(expr.name)
+                try:
+                    return self._builder.get_var(expr.name)
+                except ValueError as exc:
+                    raise CompileDiagnostic(
+                        message=f"Unknown variable '{expr.name}'",
+                        line=getattr(expr, "line", None),
+                        column=getattr(expr, "column", None),
+                        source_line=getattr(expr, "source_line", None),
+                        module_id=getattr(expr, "module_id", None),
+                        cause=exc,
+                    ) from exc
 
             enum_expr = self._build_enum_from_path(expr)
             if enum_expr is not None:
@@ -2314,7 +2346,8 @@ class Translator:
             trait_name = OPERATOR_TRAIT_MAPPING.get(expr.operator)
             if trait_name is not None:
                 lhs = self._translate_expression(expr.lhs, expected_type=expected_type)
-                rhs = self._translate_expression(expr.rhs, expected_type=lhs.var_out.type or expected_type)
+                rhs_expected = self._operator_rhs_expected_type(expr.operator, lhs.var_out.type, expected_type)
+                rhs = self._translate_expression(expr.rhs, expected_type=rhs_expected)
                 fn_name = self._resolve_trait_method_call_name(trait_name, "op", receiver_type=lhs.var_out.type)
                 call = self._builder.build_call(
                     fn_name=fn_name,
@@ -2468,6 +2501,18 @@ class Translator:
             instr = Instruction_getfield(var_out=Variable(name or self._advance_variable()), src=src, field=field)
             if field_type is not None:
                 instr.var_out.type = field_type
+            self._builder._add(instr)
+            return instr
+
+        elif isinstance(expr, s.Expression_FieldAccess):
+            src = self._translate_expression(expr.receiver).var_out
+            field = Variable(expr.field)
+            field_type = self._lookup_field_type(self._field_owner_type(src), expr.field)
+
+            instr = Instruction_getfield(var_out=Variable(name or self._advance_variable()), src=src, field=field)
+            if field_type is not None:
+                instr.var_out.type = field_type
+                self._remember_source_type(instr.var_out, field_type)
             self._builder._add(instr)
             return instr
 
@@ -3459,6 +3504,19 @@ class Translator:
             self._same_type_shape(left, right)
             for left, right in zip(lhs.generics, rhs.generics, strict=True)
         )
+
+    @staticmethod
+    def _operator_rhs_expected_type(
+        operator: str,
+        lhs_type: Optional[Type],
+        expression_expected_type: Optional[Type],
+    ) -> Optional[Type]:
+        if operator == "**" and lhs_type is not None:
+            lhs_base = unwrap_for_storage(lhs_type)
+            lhs_base = lhs_base.pointee if is_reference_like_type(lhs_base) else lhs_base
+            if lhs_base.name.startswith("f") and lhs_base.name[1:].isdigit():
+                return None
+        return lhs_type or expression_expected_type
 
     @staticmethod
     def _infer_int_size(expected_type: Optional[Type]) -> int:

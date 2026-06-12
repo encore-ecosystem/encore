@@ -12,6 +12,7 @@ class CompileDiagnostic(Exception):
     module_id: Path | None = None
     line: int | None = None
     column: int | None = None
+    span_length: int | None = None
     source_line: str | None = None
     cause: Exception | None = None
 
@@ -38,35 +39,56 @@ def with_diagnostic_context(
     return CompileDiagnostic(
         message=str(exc),
         stage=stage,
-        module_id=module_id,
-        source_line=None,
+        module_id=module_id if module_id is not None else getattr(exc, "module_id", None),
+        line=getattr(exc, "line", None),
+        column=getattr(exc, "column", None),
+        span_length=getattr(exc, "span_length", None),
+        source_line=getattr(exc, "source_line", None),
         cause=exc,
     )
 
 
 def render_diagnostic(exc: Exception) -> str:
     diag = exc if isinstance(exc, CompileDiagnostic) else CompileDiagnostic(message=str(exc), cause=exc)
+    red = "\x1b[1;31m"
+    yellow = "\x1b[1;33m"
+    cyan = "\x1b[1;36m"
+    dim = "\x1b[2m"
+    reset = "\x1b[0m"
     lines: list[str] = []
-    lines.append(f"Error: {diag.message}")
+    lines.append(f"{red}Error:{reset} {diag.message}")
 
     if diag.stage is not None:
-        lines.append(f"Stage: {diag.stage}")
+        lines.append(f"{yellow}Stage:{reset} {diag.stage}")
 
     if diag.module_id is not None:
         if diag.line is not None and diag.column is not None:
-            lines.append(f" --> {diag.module_id}:{diag.line + 1}:{diag.column + 1}")
+            lines.append(f"{cyan} --> {diag.module_id}:{diag.line + 1}:{diag.column + 1}{reset}")
         elif diag.line is not None:
-            lines.append(f" --> {diag.module_id}:{diag.line + 1}")
+            lines.append(f"{cyan} --> {diag.module_id}:{diag.line + 1}{reset}")
         else:
-            lines.append(f" --> {diag.module_id}")
+            lines.append(f"{cyan} --> {diag.module_id}{reset}")
 
     if diag.source_line is not None:
         if diag.line is not None:
             line_no = str(diag.line + 1)
-            lines.append(f"{line_no:>4} | {diag.source_line}")
+            rendered_source = diag.source_line
+            if diag.column is not None:
+                span_length = max(diag.span_length or 1, 1)
+                start = max(diag.column, 0)
+                end = min(start + span_length, len(rendered_source))
+                rendered_source = (
+                    rendered_source[:start]
+                    + red
+                    + rendered_source[start:end]
+                    + reset
+                    + rendered_source[end:]
+                )
+            lines.append(f"{dim}{line_no:>4} |{reset} {rendered_source}")
             if diag.column is not None:
                 caret_pad = " " * max(diag.column, 0)
-                lines.append(f"     | {caret_pad}^")
+                carets = "^" * max(diag.span_length or 1, 1)
+                lines.append(f"{dim}     |{reset} {caret_pad}{red}{carets}{reset}")
         else:
             lines.append(f"      {diag.source_line}")
 

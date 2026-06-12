@@ -4,6 +4,7 @@ from enum import Enum
 from importlib import import_module
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ehir.refrain import CompiledRefrain
 
@@ -142,10 +143,13 @@ class CompiledRefrainCache:
             "format_version": CACHE_FORMAT_VERSION,
             "compiled_refrain": _encode(compiled_refrain),
         }
-        tmp_path = cache_path.with_suffix(f"{cache_path.suffix}.tmp")
-        with tmp_path.open("w") as f:
-            json.dump(payload, f, indent=2, sort_keys=True)
-        tmp_path.replace(cache_path)
+        tmp_path = cache_path.with_name(f"{cache_path.name}.{uuid4().hex}.tmp")
+        try:
+            with tmp_path.open("w") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+            tmp_path.replace(cache_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     def _get_cache_path(self, refrain_name: str, semantic_hash: str) -> Path:
         return self.cache_dir / refrain_name / f"{semantic_hash}.json"

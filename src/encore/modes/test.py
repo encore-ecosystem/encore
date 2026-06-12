@@ -1,11 +1,14 @@
-from argparse import Namespace
+import subprocess
+import sys
+from argparse import Namespace, SUPPRESS
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 from rich.console import Console
 
-from ehir import CompiledRefrain, Refrain
+from ehir import Refrain
 from encore import ENCORE_CACHE_DIR
 from encore.modes.build import (
     AVAILABLE_BACKENDS,
@@ -47,6 +50,8 @@ def add_test_parser(subparsers) -> tuple[str, Callable]:
     )
     test_parser.add_argument("--no-cache", action="store_true", help="Ignore existing EHIR cache for this build")
     test_parser.add_argument("--filter", type=str, default=None, help="Only run tests whose path contains this text")
+    test_parser.add_argument("-j", "--jobs", type=int, default=1, help="Number of test worker processes to run")
+    test_parser.add_argument("--_worker-source", dest="_worker_source", type=str, default=None, help=SUPPRESS)
     test_parser.add_argument(
         "--cfg",
         action="append",
@@ -60,64 +65,40 @@ def add_test_parser(subparsers) -> tuple[str, Callable]:
 def handle_test(args: Namespace):
     cwd = Path().resolve()
     console = Console(highlight=False)
+    if args._worker_source is not None:
+        _handle_test_worker(args, cwd)
+        return
 
     tests = _collect_test_cases(cwd, args.filter)
     if not tests:
         console.print("No tests found.")
         return
 
+    jobs = _normalize_jobs(args.jobs)
     passed = 0
     failed = 0
-    shared_compiled_refrains: dict[str, CompiledRefrain] = {}
-    for idx, test in enumerate(tests, start=1):
-        test_name = _build_test_refrain_name(test)
-        compiler = create_compiler(cwd, args.backend, args.profile, no_cache=args.no_cache, cfg_overrides=args.cfg)
-        compiler.compiled_refrains.update(shared_compiled_refrains)
-        compiler.on_refrain = lambda _refrain: None
-        build_ctx = _BuildScriptContext(
-            backend=args.backend,
-            profile=args.profile,
-            no_cache=args.no_cache,
-            cfg_overrides=tuple(args.cfg),
-        )
-        _inject_mandatory_core_dependency(compiler, test.refrain_path, build_ctx)
-        _load_refrain(
-            compiler,
-            test.refrain_path,
-            type=Refrain.TargetType.EXECUTABLE,
-            build_ctx=build_ctx,
-            name=test_name,
-            entry_root=test.entry_root,
-            entrypoint=test.entrypoint,
-        )
+    completed = 0
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        futures = {executor.submit(_run_test_worker, args, cwd, test): test for test in tests}
+        for future in as_completed(futures):
+            test = futures[future]
+            completed += 1
+            try:
+                result = future.result()
+            except Exception as exc:
+                failed += 1
+                console.print(f"[{completed}/{len(tests)}] [red]FAILED[/red] {test.display_name} ({_exception_text(exc)})")
+                continue
 
-        try:
-            outputs = compiler.compile_all()
-            _share_compiled_dependencies(shared_compiled_refrains, compiler.compiled_refrains, test_name)
-            if test.expected_compile_error is not None:
+            if result.returncode == 0:
+                passed += 1
+                suffix = " (expected compile error)" if test.expected_compile_error is not None else ""
+                console.print(f"[{completed}/{len(tests)}] [green]ok[/green] {test.display_name}{suffix}")
+            else:
                 failed += 1
                 console.print(
-                    f"[{idx}/{len(tests)}] [red]FAILED[/red] {test.display_name} "
-                    f"(expected compile error containing '{test.expected_compile_error}')"
+                    f"[{completed}/{len(tests)}] [red]FAILED[/red] {test.display_name} ({_format_worker_error(result)})"
                 )
-                continue
-            output_by_name = dict(outputs)
-            binary_path = output_by_name[test_name]
-            ret_code = run_binary(binary_path, [])
-            if ret_code == 0:
-                passed += 1
-                console.print(f"[{idx}/{len(tests)}] [green]ok[/green] {test.display_name}")
-            else:
-                failed += 1
-                console.print(f"[{idx}/{len(tests)}] [red]FAILED[/red] {test.display_name} (exit code {ret_code})")
-        except Exception as exc:
-            error_text = _exception_text(exc)
-            if test.expected_compile_error is not None and test.expected_compile_error in error_text:
-                passed += 1
-                console.print(f"[{idx}/{len(tests)}] [green]ok[/green] {test.display_name} (expected compile error)")
-            else:
-                failed += 1
-                console.print(f"[{idx}/{len(tests)}] [red]FAILED[/red] {test.display_name} ({error_text})")
 
     if failed == 0:
         console.print(f"[green]PASS[/green] {passed} tests")
@@ -125,6 +106,113 @@ def handle_test(args: Namespace):
 
     console.print(f"[red]FAIL[/red] {failed} failed, {passed} passed")
     raise SystemExit(1)
+
+
+def _normalize_jobs(jobs: int) -> int:
+    if jobs < 1:
+        raise RuntimeError("--jobs must be greater than zero")
+    return jobs
+
+
+def _handle_test_worker(args: Namespace, cwd: Path) -> None:
+    source_file = Path(args._worker_source).resolve()
+    tests = _collect_test_cases(cwd, None)
+    for test in tests:
+        if test.source_file.resolve() == source_file:
+            _run_test_case(args, cwd, test)
+            return
+    raise RuntimeError(f"Unknown test source: {source_file}")
+
+
+def _run_test_worker(args: Namespace, cwd: Path, test: _TestCase) -> subprocess.CompletedProcess[str]:
+    cmd = [
+        sys.executable,
+        "-c",
+        "from encore.cli import main; main()",
+        "test",
+        "--backend",
+        args.backend,
+        "--profile",
+        args.profile,
+        "--_worker-source",
+        str(test.source_file),
+    ]
+    if args.no_cache:
+        cmd.append("--no-cache")
+    for cfg in args.cfg:
+        cmd.extend(["--cfg", cfg])
+
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
+
+
+def _run_test_case(args: Namespace, cwd: Path, test: _TestCase) -> None:
+    test_name = _build_test_refrain_name(test)
+    compiler = create_compiler(
+        cwd,
+        args.backend,
+        args.profile,
+        no_cache=args.no_cache,
+        cfg_overrides=args.cfg,
+        target_dir=_test_worker_target_dir(cwd, test_name),
+        cache_dir=_test_shared_cache_dir(cwd, args.profile),
+    )
+    compiler.on_refrain = lambda _refrain: None
+    build_ctx = _BuildScriptContext(
+        backend=args.backend,
+        profile=args.profile,
+        no_cache=args.no_cache,
+        cfg_overrides=tuple(args.cfg),
+        workspace_suffix=test_name,
+    )
+    _inject_mandatory_core_dependency(compiler, test.refrain_path, build_ctx)
+    ref = _load_refrain(
+        compiler,
+        test.refrain_path,
+        type=Refrain.TargetType.EXECUTABLE,
+        build_ctx=build_ctx,
+        name=test_name,
+        entry_root=test.entry_root,
+        entrypoint=test.entrypoint,
+    )
+
+    if test.expected_compile_error is not None:
+        _assert_expected_compile_error(compiler, ref, test.expected_compile_error)
+        return
+
+    outputs = compiler.compile_all()
+    output_by_name = dict(outputs)
+    binary_path = output_by_name[test_name]
+    ret_code = run_binary(binary_path, [])
+    if ret_code != 0:
+        raise RuntimeError(f"exit code {ret_code}")
+
+
+def _assert_expected_compile_error(compiler, ref: Refrain, expected: str) -> None:
+    try:
+        compiler.prepare_refrain(ref)
+    except Exception as exc:
+        error_text = _exception_text(exc)
+        if expected in error_text:
+            return
+        raise
+    raise RuntimeError(f"expected compile error containing '{expected}'")
+
+
+def _test_worker_target_dir(cwd: Path, test_name: str) -> Path:
+    return cwd / "target" / "tests" / test_name
+
+
+def _test_shared_cache_dir(cwd: Path, profile: str) -> Path:
+    return cwd / "target" / profile / "ehir" / "cache"
+
+
+def _format_worker_error(result: subprocess.CompletedProcess[str]) -> str:
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    if output:
+        return output
+    if result.returncode < 0:
+        return f"worker terminated by signal {-result.returncode}"
+    return f"worker exited with code {result.returncode}"
 
 
 def _collect_test_cases(root: Path, filter_text: str | None) -> list[_TestCase]:
@@ -214,24 +302,13 @@ def _parse_expected_compile_error(source_file: Path) -> str | None:
 def _exception_text(exc: Exception) -> str:
     parts: list[str] = []
     current: BaseException | None = exc
-    while current is not None:
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
         text = str(current).strip()
         parts.append(text if text else current.__class__.__name__)
         current = current.__cause__ or current.__context__
     return " | caused by: ".join(parts)
-
-
-def _share_compiled_dependencies(
-    shared: dict[str, CompiledRefrain],
-    compiled: dict[str, CompiledRefrain],
-    test_name: str,
-) -> None:
-    for name, compiled_refrain in compiled.items():
-        if name == test_name:
-            continue
-        if compiled_refrain.type != Refrain.TargetType.OBJECT:
-            continue
-        shared[name] = compiled_refrain
 
 
 def _build_test_refrain_name(test: _TestCase) -> str:

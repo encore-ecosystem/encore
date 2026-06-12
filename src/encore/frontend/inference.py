@@ -22,6 +22,7 @@ from encore.frontend.types import (
     tuple_arity,
     unwrap_for_storage,
 )
+from encore.utils.diagnostics import CompileDiagnostic
 
 MatchArmLike = s.Statement_MatchArm | s.Expression_MatchArm
 MatchLike = s.Statement_Match | s.Expression_Match
@@ -39,6 +40,7 @@ OPERATOR_TRAIT_BOUNDS: dict[str, str] = {
     "+": "Add",
     "-": "Sub",
     "*": "Mul",
+    "**": "Pow",
     "/": "Div",
     "%": "Rem",
     "<<": "Shl",
@@ -111,6 +113,19 @@ class TypeInferer:
                     self._infer_function(method, self_type=statement.struct)
 
         return ast
+
+    def _diagnostic_for_statement(self, statement: s.Statement, exc: Exception) -> CompileDiagnostic:
+        if isinstance(exc, CompileDiagnostic) and exc.line is not None:
+            return exc
+        return CompileDiagnostic(
+            message=str(exc),
+            line=getattr(statement, "line", None),
+            column=getattr(statement, "column", None),
+            span_length=getattr(statement, "span_length", None),
+            source_line=getattr(statement, "source_line", None),
+            module_id=getattr(statement, "module_id", None),
+            cause=exc,
+        )
 
     def _collect_declarations(self, declarations: list[tuple[s.Statement_TopLevel, str | None, str | None]]):
         for statement, local_name, source_name in declarations:
@@ -206,190 +221,170 @@ class TypeInferer:
     def _infer_block(self, body: Block, env: dict[str, Type], mutability_env: dict[str, bool], fn_ret_type: Type):
         inferable_numeric_lets: dict[str, s.Statement_Let] = {}
         for statement in body.body:
-            if isinstance(statement, s.Statement_Let):
-                inferred = self._infer_expression(statement.expr, env, statement.type, mutability_env)
-                if statement.type is None:
-                    if inferred is None:
-                        raise TypeError(f"Unable to infer type of variable '{statement.name}'")
-                    statement.type = inferred
-                    if self._is_unsuffixed_numeric_literal(statement.expr):
-                        inferable_numeric_lets[statement.name] = statement
-                elif inferred is not None:
-                    if not self._types_compatible(statement.type, inferred) and not self._types_match_ignoring_mut(
-                        statement.type, inferred
-                    ):
-                        raise TypeError(
-                            f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}"
-                        )
-                    statement.type = self._concretize_type(statement.type, inferred)
-                self._assert_raw_pointer_usage_allowed(statement.type, context=f"binding '{statement.name}'")
-                env[statement.name] = statement.type
-                mutability_env[statement.name] = statement.is_mut
-            elif isinstance(statement, s.Statement_Assignment):
-                self._assert_assignment_target_mutable(statement.target, env, mutability_env)
-                expected = self._infer_lvalue_type(statement.target, env)
-                value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
-                self._assert_raw_pointer_usage_allowed(expected, context="assignment target")
-                if (
-                    expected is not None
-                    and value_type is not None
-                    and not self._types_compatible(expected, value_type)
-                    and not self._types_match_ignoring_mut(expected, value_type)
-                ):
-                    raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
-            elif isinstance(statement, s.Statement_Expr):
-                expr_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
-                self._assert_raw_pointer_usage_allowed(expr_type, context="expression statement")
-            elif isinstance(statement, s.Statement_Ret):
-                ret_type = self._infer_expression(statement.expr, env, fn_ret_type, mutability_env)
-                self._assert_raw_pointer_usage_allowed(ret_type, context="return value")
-                if ret_type is not None and not self._types_compatible(fn_ret_type, ret_type):
-                    if isinstance(statement.expr, s.Expression_Path) and len(statement.expr.segments) == 1:
-                        local_name = statement.expr.segments[0].name
-                        let_stmt = inferable_numeric_lets.get(local_name)
-                        if (
-                            let_stmt is not None
-                            and self._is_numeric_type(fn_ret_type)
-                            and self._is_numeric_type(ret_type)
+            try:
+                if isinstance(statement, s.Statement_Let):
+                    inferred = self._infer_expression(statement.expr, env, statement.type, mutability_env)
+                    if statement.type is None:
+                        if inferred is None:
+                            raise TypeError(f"Unable to infer type of variable '{statement.name}'")
+                        statement.type = inferred
+                        if self._is_unsuffixed_numeric_literal(statement.expr):
+                            inferable_numeric_lets[statement.name] = statement
+                    elif inferred is not None:
+                        if not self._types_compatible(statement.type, inferred) and not self._types_match_ignoring_mut(
+                            statement.type, inferred
                         ):
-                            let_stmt.type = fn_ret_type
-                            self._annotate_numeric_literal(let_stmt.expr, fn_ret_type)
-                            env[local_name] = fn_ret_type
-                            ret_type = fn_ret_type
-                if ret_type is not None and not self._types_compatible(fn_ret_type, ret_type):
-                    raise TypeError(f"Return type mismatch: {ret_type} != {fn_ret_type}")
-            elif isinstance(statement, s.Statement_While):
-                cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
-                if cond is not None and cond != Type("bool"):
-                    raise TypeError(f"While condition must be bool, got {cond}")
-                self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
-            elif isinstance(statement, s.Statement_DoWhile):
-                self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
-                cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
-                if cond is not None and cond != Type("bool"):
-                    raise TypeError(f"Do-while condition must be bool, got {cond}")
-            elif isinstance(statement, s.Statement_Loop):
-                self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
-            elif isinstance(statement, s.Statement_For):
-                iter_expr = s.Expression_MethodCall(receiver=statement.iterable, method="iter", generics=[], args=[])
-                iter_type = self._infer_expression(iter_expr, env, mutable_env=mutability_env)
-                if iter_type is None:
-                    raise TypeError("Unable to infer iterator type in for-loop")
-
-                loop_env = dict(env)
-                loop_mutability_env = dict(mutability_env)
-                loop_env["__for_iter"] = iter_type
-                loop_mutability_env["__for_iter"] = True
-
-                step_expr = s.Expression_MethodCall(
-                    receiver=s.Expression_Path([Type("__for_iter")]),
-                    method="next",
-                    generics=[],
-                    args=[],
-                )
-                step_type = self._infer_expression(step_expr, loop_env, mutable_env=loop_mutability_env)
-                if step_type is None:
-                    raise TypeError("Unable to infer iterator step type in for-loop")
-
-                loop_env["__for_step"] = step_type
-                loop_mutability_env["__for_step"] = False
-
-                next_iter_type = self._lookup_chained_field_type("__for_step", "0", loop_env)
-                if next_iter_type is not None and not self._types_compatible(iter_type, next_iter_type):
-                    raise TypeError(f"For-loop iterator state mismatch: {iter_type} != {next_iter_type}")
-
-                item_opt_type = self._lookup_chained_field_type("__for_step", "1", loop_env)
-                if item_opt_type is None:
-                    raise TypeError("Unable to infer yielded item type in for-loop")
-                item_opt_type = unwrap_for_storage(item_opt_type)
-                if is_reference_like_type(item_opt_type):
-                    item_opt_type = item_opt_type.pointee
-                if item_opt_type.name != "Option" or len(item_opt_type.generics) != 1:
-                    raise TypeError(f"For-loop `next` must return Option[T], got {item_opt_type}")
-
-                body_env = dict(loop_env)
-                body_mutability_env = dict(loop_mutability_env)
-                body_env[statement.name] = item_opt_type.generics[0]
-                body_mutability_env[statement.name] = False
-                self._infer_block(statement.body, body_env, body_mutability_env, fn_ret_type)
-            elif isinstance(statement, s.Statement_With):
-                resource_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
-                if resource_type is None:
-                    raise TypeError("Unable to infer resource type in with-statement")
-
-                base_resource_type = unwrap_for_storage(resource_type)
-                base_resource_type = (
-                    base_resource_type.pointee
-                    if is_reference_like_type(base_resource_type)
-                    else base_resource_type
-                )
-                trait_names = list(self._impl_traits.get(base_resource_type.name, []))
-                resource_leaf = base_resource_type.name.rsplit("::", 1)[-1]
-                for owner_name, owner_traits in self._impl_traits.items():
-                    if owner_name == base_resource_type.name:
-                        continue
-                    if owner_name.rsplit("::", 1)[-1] == resource_leaf:
-                        for owner_trait in owner_traits:
-                            if owner_trait not in trait_names:
-                                trait_names.append(owner_trait)
-                has_context_manager = False
-                for trait_name in trait_names:
-                    if trait_name.rsplit("::", 1)[-1] == "ContextManager":
-                        has_context_manager = True
-                        break
-                if not has_context_manager:
-                    raise TypeError(
-                        f"with-statement requires `{base_resource_type.name}` to implement ContextManager"
-                    )
-
-                enter_type = self._infer_expression(
-                    s.Expression_MethodCall(
-                        receiver=statement.expr,
-                        method="with_enter",
-                        generics=[],
-                        args=[],
-                    ),
-                    env,
-                    mutable_env=mutability_env,
-                )
-                if enter_type is None:
-                    raise TypeError("with-statement requires ContextManager::with_enter(self) -> Self")
-
-                self._infer_expression(
-                    s.Expression_MethodCall(
-                        receiver=s.Expression_Path([Type(statement.name)]),
-                        method="with_exit",
-                        generics=[],
-                        args=[],
-                    ),
-                    {**env, statement.name: enter_type},
-                    Type("bool"),
-                    {**mutability_env, statement.name: False},
-                )
-
-                body_env = dict(env)
-                body_mutability_env = dict(mutability_env)
-                body_env[statement.name] = enter_type
-                body_mutability_env[statement.name] = False
-                self._infer_block(statement.body, body_env, body_mutability_env, fn_ret_type)
-            elif isinstance(statement, s.Statement_If):
-                for branch in statement.branches:
-                    cond = self._infer_expression(branch.expr, env, Type("bool"), mutability_env)
+                            raise TypeError(
+                                f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}"
+                            )
+                        statement.type = self._concretize_type(statement.type, inferred)
+                    self._assert_raw_pointer_usage_allowed(statement.type, context=f"binding '{statement.name}'")
+                    env[statement.name] = statement.type
+                    mutability_env[statement.name] = statement.is_mut
+                elif isinstance(statement, s.Statement_Assignment):
+                    self._assert_assignment_target_mutable(statement.target, env, mutability_env)
+                    expected = self._infer_lvalue_type(statement.target, env)
+                    value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
+                    self._assert_raw_pointer_usage_allowed(expected, context="assignment target")
+                    if (
+                        expected is not None
+                        and value_type is not None
+                        and not self._types_compatible(expected, value_type)
+                        and not self._types_match_ignoring_mut(expected, value_type)
+                    ):
+                        raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
+                elif isinstance(statement, s.Statement_Expr):
+                    expr_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
+                    self._assert_raw_pointer_usage_allowed(expr_type, context="expression statement")
+                elif isinstance(statement, s.Statement_Ret):
+                    ret_type = self._infer_expression(statement.expr, env, fn_ret_type, mutability_env)
+                    self._assert_raw_pointer_usage_allowed(ret_type, context="return value")
+                    if ret_type is not None and not self._types_compatible(fn_ret_type, ret_type):
+                        if isinstance(statement.expr, s.Expression_Path) and len(statement.expr.segments) == 1:
+                            local_name = statement.expr.segments[0].name
+                            let_stmt = inferable_numeric_lets.get(local_name)
+                            if (
+                                let_stmt is not None
+                                and self._is_numeric_type(fn_ret_type)
+                                and self._is_numeric_type(ret_type)
+                            ):
+                                let_stmt.type = fn_ret_type
+                                self._annotate_numeric_literal(let_stmt.expr, fn_ret_type)
+                                env[local_name] = fn_ret_type
+                                ret_type = fn_ret_type
+                    if ret_type is not None and not self._types_compatible(fn_ret_type, ret_type):
+                        raise TypeError(f"Return type mismatch: {ret_type} != {fn_ret_type}")
+                elif isinstance(statement, s.Statement_While):
+                    cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
                     if cond is not None and cond != Type("bool"):
-                        raise TypeError(f"If condition must be bool, got {cond}")
-                    self._infer_block(branch.body, dict(env), dict(mutability_env), fn_ret_type)
-                if statement.else_body is not None:
-                    self._infer_block(statement.else_body, dict(env), dict(mutability_env), fn_ret_type)
-            elif isinstance(statement, s.Statement_Match):
-                self._infer_match(statement, env, mutability_env, fn_ret_type)
-            elif isinstance(statement, s.Statement_Unsafe):
-                self._unsafe_depth += 1
-                try:
+                        raise TypeError(f"While condition must be bool, got {cond}")
                     self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
-                finally:
-                    self._unsafe_depth -= 1
-            elif isinstance(statement, s.Statement_EHIR):
-                self._bind_ehir_outputs(statement, env, mutability_env)
+                elif isinstance(statement, s.Statement_DoWhile):
+                    self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
+                    cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
+                    if cond is not None and cond != Type("bool"):
+                        raise TypeError(f"Do-while condition must be bool, got {cond}")
+                elif isinstance(statement, s.Statement_Loop):
+                    self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
+                elif isinstance(statement, s.Statement_For):
+                    iter_expr = s.Expression_MethodCall(receiver=statement.iterable, method="iter", generics=[], args=[])
+                    iter_type = self._infer_expression(iter_expr, env, mutable_env=mutability_env)
+                    if iter_type is None:
+                        raise TypeError("Unable to infer iterator type in for-loop")
+                    loop_env = dict(env)
+                    loop_mutability_env = dict(mutability_env)
+                    loop_env["__for_iter"] = iter_type
+                    loop_mutability_env["__for_iter"] = True
+                    step_expr = s.Expression_MethodCall(
+                        receiver=s.Expression_Path([Type("__for_iter")]),
+                        method="next",
+                        generics=[],
+                        args=[],
+                    )
+                    step_type = self._infer_expression(step_expr, loop_env, mutable_env=loop_mutability_env)
+                    if step_type is None:
+                        raise TypeError("Unable to infer iterator step type in for-loop")
+                    loop_env["__for_step"] = step_type
+                    loop_mutability_env["__for_step"] = False
+                    next_iter_type = self._lookup_chained_field_type("__for_step", "0", loop_env)
+                    if next_iter_type is not None and not self._types_compatible(iter_type, next_iter_type):
+                        raise TypeError(f"For-loop iterator state mismatch: {iter_type} != {next_iter_type}")
+                    item_opt_type = self._lookup_chained_field_type("__for_step", "1", loop_env)
+                    if item_opt_type is None:
+                        raise TypeError("Unable to infer yielded item type in for-loop")
+                    item_opt_type = unwrap_for_storage(item_opt_type)
+                    if is_reference_like_type(item_opt_type):
+                        item_opt_type = item_opt_type.pointee
+                    if item_opt_type.name != "Option" or len(item_opt_type.generics) != 1:
+                        raise TypeError(f"For-loop `next` must return Option[T], got {item_opt_type}")
+                    body_env = dict(loop_env)
+                    body_mutability_env = dict(loop_mutability_env)
+                    body_env[statement.name] = item_opt_type.generics[0]
+                    body_mutability_env[statement.name] = False
+                    self._infer_block(statement.body, body_env, body_mutability_env, fn_ret_type)
+                elif isinstance(statement, s.Statement_With):
+                    resource_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
+                    if resource_type is None:
+                        raise TypeError("Unable to infer resource type in with-statement")
+                    base_resource_type = unwrap_for_storage(resource_type)
+                    base_resource_type = base_resource_type.pointee if is_reference_like_type(base_resource_type) else base_resource_type
+                    trait_names = list(self._impl_traits.get(base_resource_type.name, []))
+                    resource_leaf = base_resource_type.name.rsplit("::", 1)[-1]
+                    for owner_name, owner_traits in self._impl_traits.items():
+                        if owner_name == base_resource_type.name:
+                            continue
+                        if owner_name.rsplit("::", 1)[-1] == resource_leaf:
+                            for owner_trait in owner_traits:
+                                if owner_trait not in trait_names:
+                                    trait_names.append(owner_trait)
+                    has_context_manager = any(trait_name.rsplit("::", 1)[-1] == "ContextManager" for trait_name in trait_names)
+                    if not has_context_manager:
+                        raise TypeError(
+                            f"with-statement requires `{base_resource_type.name}` to implement ContextManager"
+                        )
+                    enter_type = self._infer_expression(
+                        s.Expression_MethodCall(receiver=statement.expr, method="with_enter", generics=[], args=[]),
+                        env,
+                        mutable_env=mutability_env,
+                    )
+                    if enter_type is None:
+                        raise TypeError("with-statement requires ContextManager::with_enter(self) -> Self")
+                    self._infer_expression(
+                        s.Expression_MethodCall(
+                            receiver=s.Expression_Path([Type(statement.name)]),
+                            method="with_exit",
+                            generics=[],
+                            args=[],
+                        ),
+                        {**env, statement.name: enter_type},
+                        Type("bool"),
+                        {**mutability_env, statement.name: False},
+                    )
+                    body_env = dict(env)
+                    body_mutability_env = dict(mutability_env)
+                    body_env[statement.name] = enter_type
+                    body_mutability_env[statement.name] = False
+                    self._infer_block(statement.body, body_env, body_mutability_env, fn_ret_type)
+                elif isinstance(statement, s.Statement_If):
+                    for branch in statement.branches:
+                        cond = self._infer_expression(branch.expr, env, Type("bool"), mutability_env)
+                        if cond is not None and cond != Type("bool"):
+                            raise TypeError(f"If condition must be bool, got {cond}")
+                        self._infer_block(branch.body, dict(env), dict(mutability_env), fn_ret_type)
+                    if statement.else_body is not None:
+                        self._infer_block(statement.else_body, dict(env), dict(mutability_env), fn_ret_type)
+                elif isinstance(statement, s.Statement_Match):
+                    self._infer_match(statement, env, mutability_env, fn_ret_type)
+                elif isinstance(statement, s.Statement_Unsafe):
+                    self._unsafe_depth += 1
+                    try:
+                        self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
+                    finally:
+                        self._unsafe_depth -= 1
+                elif isinstance(statement, s.Statement_EHIR):
+                    self._bind_ehir_outputs(statement, env, mutability_env)
+            except Exception as exc:
+                raise self._diagnostic_for_statement(statement, exc) from exc
 
     def _is_numeric_type(self, typ: Type) -> bool:
         return self._is_integer_type(typ) or self._is_float_type(typ)
@@ -581,6 +576,34 @@ class TypeInferer:
                 return normalized_name, explicit_generics, signature
 
         return call_name, explicit_generics, None
+
+    def _resolve_trait_qualified_call_signature(
+        self,
+        expr: s.Expression_Call,
+        env: dict[str, Type],
+        mutable_env: dict[str, bool],
+    ) -> tuple[str, list[Type], s.FunctionSignature | None]:
+        if len(expr.callee.segments) < 2 or not expr.args:
+            return expr.name, list(expr.generics), None
+
+        trait_name = "::".join(segment.name for segment in expr.callee.segments[:-1])
+        method_name = expr.callee.segments[-1].name
+        receiver_type = self._infer_expression(expr.args[0], env, mutable_env=mutable_env)
+        if receiver_type is None:
+            return expr.name, list(expr.generics), None
+
+        signature = self._lookup_trait_method_signature(
+            trait_name,
+            method_name,
+            receiver_type=receiver_type,
+        )
+        if signature is None:
+            return expr.name, list(expr.generics), None
+
+        if not self._type_satisfies_bound(receiver_type, Type(trait_name)):
+            raise TypeError(f"Type '{receiver_type}' does not implement trait '{trait_name}'")
+
+        return f"{trait_name}::{method_name}", list(expr.generics), signature
 
     def _lookup_trait_method_signature(
         self,
@@ -970,8 +993,8 @@ class TypeInferer:
 
         if isinstance(expr, s.Expression_IntegerLiteral):
             if expr.literal_type is not None:
-                if not self._is_integer_type(expr.literal_type):
-                    raise TypeError(f"Integer literal suffix must be an integer type, got {expr.literal_type}")
+                if not self._is_integer_type(expr.literal_type) and not self._is_float_type(expr.literal_type):
+                    raise TypeError(f"Integer literal suffix must be a numeric type, got {expr.literal_type}")
                 if expected_type is not None and not self._types_compatible(expected_type, expr.literal_type):
                     raise TypeError(f"Type mismatch: {expected_type} != {expr.literal_type}")
                 return expr.literal_type
@@ -979,6 +1002,7 @@ class TypeInferer:
                 expr.literal_type = expected_type
                 return expected_type
             if expected_type is not None and self._is_float_type(expected_type):
+                expr.literal_type = expected_type
                 return expected_type
             return Type("i32")
 
@@ -1145,7 +1169,13 @@ class TypeInferer:
                         result = make_mutable_type(result)
                     self._assert_raw_pointer_usage_allowed(result, context=f"binding '{expr.name}'")
                     return result
-                return expr.segments[0]
+                raise CompileDiagnostic(
+                    message=f"Unknown variable '{expr.name}'",
+                    line=getattr(expr, "line", None),
+                    column=getattr(expr, "column", None),
+                    source_line=getattr(expr, "source_line", None),
+                    module_id=getattr(expr, "module_id", None),
+                )
             if len(expr.segments) == 2 and expr.segments[0].name in self._enums:
                 return self._infer_enum_path(expr, expected_type)
             return None
@@ -1162,6 +1192,12 @@ class TypeInferer:
 
         if isinstance(expr, s.Expression_StructField):
             result = self._lookup_chained_field_type(expr.name, expr.field, env)
+            self._assert_raw_pointer_usage_allowed(result, context=f"field '{expr.field}'")
+            return result
+
+        if isinstance(expr, s.Expression_FieldAccess):
+            receiver_type = self._infer_expression(expr.receiver, env, mutable_env=mutable_env)
+            result = self._lookup_field_type(receiver_type, expr.field)
             self._assert_raw_pointer_usage_allowed(result, context=f"field '{expr.field}'")
             return result
 
@@ -1214,7 +1250,20 @@ class TypeInferer:
 
             call_name, explicit_generics, signature = self._resolve_function_call_signature(expr)
             if signature is None:
-                return None
+                call_name, explicit_generics, signature = self._resolve_trait_qualified_call_signature(
+                    expr,
+                    env,
+                    mutable_env,
+                )
+            if signature is None:
+                raise CompileDiagnostic(
+                    message=f"Unknown symbol '{call_name}'",
+                    line=getattr(expr, "line", None),
+                    column=getattr(expr, "column", None),
+                    span_length=getattr(expr, "span_length", None),
+                    source_line=getattr(expr, "source_line", None),
+                    module_id=getattr(expr, "module_id", None),
+                )
             result = self._infer_call_signature(
                 signature=signature,
                 args=expr.args,
@@ -1257,7 +1306,22 @@ class TypeInferer:
             lhs_expected_type = None if expr.operator in comparison_ops else expected_type
 
             lhs_type = self._infer_expression(expr.lhs, env, lhs_expected_type, mutable_env)
-            rhs_type = self._infer_expression(expr.rhs, env, None, mutable_env)
+            rhs_expected_type = None
+            if (
+                expr.operator != "**"
+                and lhs_type is not None
+                and self._is_numeric_type(lhs_type)
+                and self._is_unsuffixed_numeric_literal(expr.rhs)
+            ):
+                rhs_expected_type = lhs_type
+            rhs_type = self._infer_expression(expr.rhs, env, rhs_expected_type, mutable_env)
+            if (
+                expr.operator != "**"
+                and rhs_type is not None
+                and self._is_numeric_type(rhs_type)
+                and self._is_unsuffixed_numeric_literal(expr.lhs)
+            ):
+                lhs_type = self._infer_expression(expr.lhs, env, rhs_type, mutable_env)
             if lhs_type is None and rhs_type is not None:
                 lhs_type = self._infer_expression(expr.lhs, env, lhs_expected_type or rhs_type, mutable_env)
             self._assert_operator_trait_bound(lhs_type, expr.operator)
@@ -1556,93 +1620,96 @@ class TypeInferer:
         env: dict[str, Type],
         mutability_env: dict[str, bool],
     ):
-        if isinstance(statement, s.Statement_Let):
-            inferred = self._infer_expression(statement.expr, env, statement.type, mutability_env)
-            if statement.type is None:
-                if inferred is None:
-                    raise TypeError(f"Unable to infer type of variable '{statement.name}'")
-                statement.type = inferred
-            elif inferred is not None:
-                if not self._types_compatible(statement.type, inferred) and not self._types_match_ignoring_mut(
-                    statement.type, inferred
+        try:
+            if isinstance(statement, s.Statement_Let):
+                inferred = self._infer_expression(statement.expr, env, statement.type, mutability_env)
+                if statement.type is None:
+                    if inferred is None:
+                        raise TypeError(f"Unable to infer type of variable '{statement.name}'")
+                    statement.type = inferred
+                elif inferred is not None:
+                    if not self._types_compatible(statement.type, inferred) and not self._types_match_ignoring_mut(
+                        statement.type, inferred
+                    ):
+                        raise TypeError(f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}")
+                    statement.type = self._concretize_type(statement.type, inferred)
+                self._assert_raw_pointer_usage_allowed(statement.type, context=f"binding '{statement.name}'")
+                env[statement.name] = statement.type
+                mutability_env[statement.name] = statement.is_mut
+                return
+
+            if isinstance(statement, s.Statement_Assignment):
+                self._assert_assignment_target_mutable(statement.target, env, mutability_env)
+                expected = self._infer_lvalue_type(statement.target, env)
+                value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
+                self._assert_raw_pointer_usage_allowed(expected, context="assignment target")
+                if (
+                    expected is not None
+                    and value_type is not None
+                    and not self._types_compatible(expected, value_type)
+                    and not self._types_match_ignoring_mut(expected, value_type)
                 ):
-                    raise TypeError(f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}")
-                statement.type = self._concretize_type(statement.type, inferred)
-            self._assert_raw_pointer_usage_allowed(statement.type, context=f"binding '{statement.name}'")
-            env[statement.name] = statement.type
-            mutability_env[statement.name] = statement.is_mut
-            return
+                    raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
+                return
 
-        if isinstance(statement, s.Statement_Assignment):
-            self._assert_assignment_target_mutable(statement.target, env, mutability_env)
-            expected = self._infer_lvalue_type(statement.target, env)
-            value_type = self._infer_expression(statement.expr, env, expected, mutability_env)
-            self._assert_raw_pointer_usage_allowed(expected, context="assignment target")
-            if (
-                expected is not None
-                and value_type is not None
-                and not self._types_compatible(expected, value_type)
-                and not self._types_match_ignoring_mut(expected, value_type)
-            ):
-                raise TypeError(f"Type mismatch in assignment: {expected} != {value_type}")
-            return
+            if isinstance(statement, s.Statement_Expr):
+                expr_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
+                self._assert_raw_pointer_usage_allowed(expr_type, context="expression statement")
+                return
 
-        if isinstance(statement, s.Statement_Expr):
-            expr_type = self._infer_expression(statement.expr, env, mutable_env=mutability_env)
-            self._assert_raw_pointer_usage_allowed(expr_type, context="expression statement")
-            return
+            if isinstance(statement, s.Statement_If):
+                for branch in statement.branches:
+                    cond = self._infer_expression(branch.expr, env, Type("bool"), mutability_env)
+                    if cond is not None and cond != Type("bool"):
+                        raise TypeError(f"If condition must be bool, got {cond}")
+                    self._infer_expression_block_nested(branch.body, dict(env), dict(mutability_env))
+                if statement.else_body is not None:
+                    self._infer_expression_block_nested(statement.else_body, dict(env), dict(mutability_env))
+                return
 
-        if isinstance(statement, s.Statement_If):
-            for branch in statement.branches:
-                cond = self._infer_expression(branch.expr, env, Type("bool"), mutability_env)
+            if isinstance(statement, s.Statement_Match):
+                scrutinee_type = self._infer_match_scrutinee(statement, env, mutability_env)
+                for arm in statement.arms:
+                    arm_env, arm_mutability_env = self._prepare_match_arm_scope(scrutinee_type, arm, env, mutability_env)
+                    self._infer_match_nested_body(self._get_match_arm_body(arm), arm_env, arm_mutability_env)
+                return
+
+            if isinstance(statement, s.Statement_While):
+                cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
                 if cond is not None and cond != Type("bool"):
-                    raise TypeError(f"If condition must be bool, got {cond}")
-                self._infer_expression_block_nested(branch.body, dict(env), dict(mutability_env))
-            if statement.else_body is not None:
-                self._infer_expression_block_nested(statement.else_body, dict(env), dict(mutability_env))
-            return
-
-        if isinstance(statement, s.Statement_Match):
-            scrutinee_type = self._infer_match_scrutinee(statement, env, mutability_env)
-            for arm in statement.arms:
-                arm_env, arm_mutability_env = self._prepare_match_arm_scope(scrutinee_type, arm, env, mutability_env)
-                self._infer_match_nested_body(self._get_match_arm_body(arm), arm_env, arm_mutability_env)
-            return
-
-        if isinstance(statement, s.Statement_While):
-            cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
-            if cond is not None and cond != Type("bool"):
-                raise TypeError(f"While condition must be bool, got {cond}")
-            self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
-            return
-
-        if isinstance(statement, s.Statement_DoWhile):
-            self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
-            cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
-            if cond is not None and cond != Type("bool"):
-                raise TypeError(f"Do-while condition must be bool, got {cond}")
-            return
-
-        if isinstance(statement, s.Statement_Loop):
-            self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
-            return
-
-        if isinstance(statement, s.Statement_Unsafe):
-            self._unsafe_depth += 1
-            try:
+                    raise TypeError(f"While condition must be bool, got {cond}")
                 self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
-            finally:
-                self._unsafe_depth -= 1
-            return
+                return
 
-        if isinstance(statement, s.Statement_EHIR):
-            self._bind_ehir_outputs(statement, env, mutability_env)
-            return
+            if isinstance(statement, s.Statement_DoWhile):
+                self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
+                cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
+                if cond is not None and cond != Type("bool"):
+                    raise TypeError(f"Do-while condition must be bool, got {cond}")
+                return
 
-        if isinstance(statement, (s.Statement_Ret, s.Statement_Break, s.Statement_Continue)):
-            raise TypeError(f"{type(statement).__name__} is not allowed inside expression block")
+            if isinstance(statement, s.Statement_Loop):
+                self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
+                return
 
-        raise TypeError(f"Unsupported statement in expression block: {type(statement).__name__}")
+            if isinstance(statement, s.Statement_Unsafe):
+                self._unsafe_depth += 1
+                try:
+                    self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
+                finally:
+                    self._unsafe_depth -= 1
+                return
+
+            if isinstance(statement, s.Statement_EHIR):
+                self._bind_ehir_outputs(statement, env, mutability_env)
+                return
+
+            if isinstance(statement, (s.Statement_Ret, s.Statement_Break, s.Statement_Continue)):
+                raise TypeError(f"{type(statement).__name__} is not allowed inside expression block")
+
+            raise TypeError(f"Unsupported statement in expression block: {type(statement).__name__}")
+        except Exception as exc:
+            raise self._diagnostic_for_statement(statement, exc) from exc
 
     def _bind_ehir_outputs(
         self,

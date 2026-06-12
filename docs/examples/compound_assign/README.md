@@ -1,3 +1,3 @@
 # compound_assign
 
-Smoke for assignment operators (`+=`, `-=`, `*=`, `/=`, `%=`, `<<=`, `>>=`, `|=`, `&=`, `^=`).
+Smoke for assignment operators (`+=`, `-=`, `*=`, `**=`, `/=`, `%=`, `<<=`, `>>=`, `|=`, `&=`, `^=`).

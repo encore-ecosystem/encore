@@ -113,6 +113,27 @@ class Parser(ParserBase[LexerToken, s.Statement]):
     def _get_eof_token(self) -> LexerToken:
         return LexerToken(type=TokenType.EOF, value="", line=0, column=0)
 
+    def _source_line_at(self, line: int) -> str | None:
+        if not self._source_text:
+            return None
+        rows = self._source_text.splitlines()
+        if 0 <= line < len(rows):
+            return rows[line]
+        return None
+
+    def _attach_span(self, node: object, token: LexerToken):
+        if getattr(node, "line", None) is None:
+            node.line = token.line
+        if getattr(node, "column", None) is None:
+            node.column = token.column
+        if getattr(node, "span_length", None) is None:
+            node.span_length = max(len(token.value), 1)
+        if getattr(node, "source_line", None) is None:
+            node.source_line = self._source_line_at(token.line)
+        if getattr(node, "module_id", None) is None:
+            node.module_id = self._module_id
+        return node
+
     def _parse_top_level(self):
         attrs, cfgs = self._parse_metadata_directives()
         curr_token = self._peek_curr()
@@ -154,6 +175,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 raise NotImplementedError(f"{curr_token}")
 
         for statement in self._result[result_start:]:
+            self._attach_span(statement, curr_token)
             set_item_cfgs(statement, cfgs)
 
     def _parse_global_let(self, is_public: bool) -> s.Statement_Global:
@@ -452,33 +474,34 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
         match curr_token.type:
             case TokenType.KW_RET:
-                return self._parse_ret()
+                statement = self._parse_ret()
             case TokenType.KW_LET:
-                return self._parse_let()
+                statement = self._parse_let()
             case TokenType.KW_DO:
-                return self._parse_do_while()
+                statement = self._parse_do_while()
             case TokenType.KW_WITH:
-                return self._parse_with()
+                statement = self._parse_with()
             case TokenType.KW_FOR:
-                return self._parse_for()
+                statement = self._parse_for()
             case TokenType.KW_WHILE:
-                return self._parse_while()
+                statement = self._parse_while()
             case TokenType.KW_LOOP:
-                return self._parse_loop()
+                statement = self._parse_loop()
             case TokenType.KW_IF:
-                return self._parse_if_block()
+                statement = self._parse_if_block()
             case TokenType.KW_MATCH:
-                return self._parse_match()
+                statement = self._parse_match()
             case TokenType.KW_UNSAFE:
                 if self._peek_next().type == TokenType.KW_EHIR:
-                    return self._parse_ehir_block(is_unsafe=True)
-                return self._parse_unsafe_block()
+                    statement = self._parse_ehir_block(is_unsafe=True)
+                else:
+                    statement = self._parse_unsafe_block()
             case TokenType.KW_EHIR:
-                return self._parse_ehir_block(is_unsafe=False)
+                statement = self._parse_ehir_block(is_unsafe=False)
             case TokenType.KW_BREAK:
-                return self._parse_break()
+                statement = self._parse_break()
             case TokenType.KW_CONTINUE:
-                return self._parse_continue()
+                statement = self._parse_continue()
             case _:
                 if not self._starts_statement_expression(curr_token.type):
                     raise NotImplementedError(curr_token)
@@ -489,11 +512,19 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                         | TokenType.PLUS_EQUAL
                         | TokenType.MINUS_EQUAL
                         | TokenType.ASTERISK_EQUAL
+                        | TokenType.POWER_EQUAL
                         | TokenType.SLASH_EQUAL
+                        | TokenType.PERCENT_EQUAL
+                        | TokenType.AMPERSAND_EQUAL
+                        | TokenType.PIPE_EQUAL
+                        | TokenType.CARET_EQUAL
+                        | TokenType.LEFT_SHIFT_EQUAL
+                        | TokenType.RIGHT_SHIFT_EQUAL
                     ):
-                        return self._parse_assignment(target)
+                        statement = self._parse_assignment(target)
                     case _:
-                        return s.Statement_Expr(target)
+                        statement = s.Statement_Expr(target)
+        return self._attach_span(statement, curr_token)
 
     def _starts_statement_expression(self, token_type: TokenType) -> bool:
         return token_type in {
@@ -710,7 +741,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             pattern = self._parse_float_literal()
         elif curr_token.type == TokenType.BOOLEAN:
             self._consume()
-            pattern = s.Expression_BooleanLiteral(curr_token.value == "true")
+            pattern = self._attach_span(s.Expression_BooleanLiteral(curr_token.value == "true"), curr_token)
         else:
             pattern = self._parse_path()
         return pattern
@@ -837,15 +868,24 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         return left
 
     def _parse_multiplicative(self) -> s.Statement_Expression:
-        left = self._parse_cast()
+        left = self._parse_power()
         while True:
             operator = self._peek_curr()
             if operator.type not in {TokenType.ASTERISK, TokenType.SLASH, TokenType.PERCENT}:
                 break
             self._consume()
-            right = self._parse_cast()
+            right = self._parse_power()
             left = s.BinaryOperation_Multiplicative(lhs=left, operator=operator.value, rhs=right)
         return left
+
+    def _parse_power(self) -> s.Statement_Expression:
+        left = self._parse_cast()
+        operator = self._peek_curr()
+        if operator.type != TokenType.POWER:
+            return left
+        self._consume()
+        right = self._parse_power()
+        return s.BinaryOperation_Power(lhs=left, operator=operator.value, rhs=right)
 
     def _parse_cast(self) -> s.Statement_Expression:
         expr = self._parse_unary()
@@ -896,22 +936,25 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         return expr
 
     def _parse_integer_literal(self) -> s.Expression_IntegerLiteral | s.Expression_FloatLiteral:
-        value = self._safe_consume(TokenType.INTEGER).value
+        token = self._safe_consume(TokenType.INTEGER)
+        value = token.value
         literal_type = self._parse_numeric_literal_suffix()
         if literal_type is not None and self._is_float_type_name(literal_type.name):
-            return s.Expression_FloatLiteral(value, literal_type=literal_type)
-        return s.Expression_IntegerLiteral(value, literal_type=literal_type)
+            return self._attach_span(s.Expression_FloatLiteral(value, literal_type=literal_type), token)
+        return self._attach_span(s.Expression_IntegerLiteral(value, literal_type=literal_type), token)
 
     def _parse_float_literal(self) -> s.Expression_FloatLiteral:
-        value = self._safe_consume(TokenType.FLOAT).value
+        token = self._safe_consume(TokenType.FLOAT)
+        value = token.value
         literal_type = self._parse_numeric_literal_suffix()
         if literal_type is not None and not self._is_float_type_name(literal_type.name):
             raise TypeError(f"Float literal suffix must be a float type, got {literal_type}")
-        return s.Expression_FloatLiteral(value, literal_type=literal_type)
+        return self._attach_span(s.Expression_FloatLiteral(value, literal_type=literal_type), token)
 
     def _parse_string_literal(self) -> s.Expression_StringLiteral:
-        raw = self._safe_consume(TokenType.STRING).value
-        return s.Expression_StringLiteral(self._unescape_string_literal(raw[1:-1]))
+        token = self._safe_consume(TokenType.STRING)
+        raw = token.value
+        return self._attach_span(s.Expression_StringLiteral(self._unescape_string_literal(raw[1:-1])), token)
 
     def _unescape_string_literal(self, raw: str) -> str:
         out: list[str] = []
@@ -932,6 +975,26 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 out.append("\t")
             elif nxt == "r":
                 out.append("\r")
+            elif nxt == "x":
+                hex_digits = raw[i + 2 : i + 4]
+                if len(hex_digits) == 2 and all(c in "0123456789abcdefABCDEF" for c in hex_digits):
+                    out.append(chr(int(hex_digits, 16)))
+                    i += 4
+                    continue
+                out.append("\\")
+                out.append("x")
+            elif nxt == "u":
+                if i + 2 < len(raw) and raw[i + 2] == "{":
+                    end = raw.find("}", i + 3)
+                    if end != -1:
+                        codepoint_digits = raw[i + 3 : end]
+                        if codepoint_digits and all(c in "0123456789abcdefABCDEF" for c in codepoint_digits):
+                            codepoint = int(codepoint_digits, 16)
+                            out.append(chr(codepoint))
+                            i = end + 1
+                            continue
+                out.append("\\")
+                out.append("u")
             elif nxt == "\\":
                 out.append("\\")
             elif nxt == '"':
@@ -1084,6 +1147,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             TokenType.PLUS_EQUAL,
             TokenType.MINUS_EQUAL,
             TokenType.ASTERISK_EQUAL,
+            TokenType.POWER_EQUAL,
             TokenType.SLASH_EQUAL,
             TokenType.PERCENT_EQUAL,
             TokenType.AMPERSAND_EQUAL,
@@ -1121,10 +1185,23 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             if generics:
                 raise TypeError("Function call generics must be specified only once")
             generics = list(last_segment.generics)
-            callee = s.Expression_Path([*callee.segments[:-1], replace(last_segment, generics=[])])
+            normalized_callee = s.Expression_Path([*callee.segments[:-1], replace(last_segment, generics=[])])
+            normalized_callee.line = callee.line
+            normalized_callee.column = callee.column
+            normalized_callee.span_length = callee.span_length
+            normalized_callee.source_line = callee.source_line
+            normalized_callee.module_id = callee.module_id
+            callee = normalized_callee
 
         args = self._parse_call_args()
-        return s.Expression_Call(callee, generics, args)
+        call = s.Expression_Call(callee, generics, args)
+        if callee.line is not None:
+            call.line = callee.line
+            call.column = callee.column
+            call.span_length = callee.span_length
+            call.source_line = callee.source_line
+            call.module_id = callee.module_id
+        return call
 
     def _parse_unsafe_expression(self) -> s.Expression_Unsafe:
         self._safe_consume(TokenType.KW_UNSAFE)
@@ -1142,12 +1219,12 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         self._safe_consume(TokenType.RIGHT_PAREN)
         return args
 
-    def _build_struct_field(self, receiver: s.Statement_Expression, field: str) -> s.Expression_StructField:
+    def _build_struct_field(self, receiver: s.Statement_Expression, field: str) -> s.Statement_Expression:
         if isinstance(receiver, s.Expression_Path):
             return s.Expression_StructField(receiver.name, field)
         if isinstance(receiver, s.Expression_StructField):
             return s.Expression_StructField(f"{receiver.name}.{receiver.field}", field)
-        raise TypeError(f"Field access is supported only for paths/fields, got: {receiver}")
+        return s.Expression_FieldAccess(receiver=receiver, field=field)
 
     def _parse_dotted_postfix(self, base: s.Statement_Expression) -> s.Statement_Expression:
         expr = base
@@ -1184,11 +1261,12 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         return expr
 
     def _parse_path(self) -> s.Expression_Path:
+        token = self._peek_curr()
         segments = [self._parse_path_segment()]
         while self._peek_curr().type == TokenType.SCOPE:
             self._safe_consume(TokenType.SCOPE)
             segments.append(self._parse_path_segment())
-        return s.Expression_Path(segments)
+        return self._attach_span(s.Expression_Path(segments), token)
 
     def _parse_expression_path_segment(self) -> Type:
         name = self._safe_consume(TokenType.IDENTIFIER).value
@@ -1229,7 +1307,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             return self._parse_float_literal()
         elif curr_token.type == TokenType.BOOLEAN:
             self._consume()
-            return s.Expression_BooleanLiteral(curr_token.value == "true")
+            return self._attach_span(s.Expression_BooleanLiteral(curr_token.value == "true"), curr_token)
         elif curr_token.type == TokenType.STRING:
             return self._parse_string_literal()
 
@@ -1258,7 +1336,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 self._safe_consume(TokenType.SCOPE)
                 segment = self._parse_expression_path_segment()
                 segments.append(segment)
-            path = s.Expression_Path(segments)
+            path = self._attach_span(s.Expression_Path(segments), curr_token)
 
             if self._peek_curr().type == TokenType.LEFT_BRACE:
                 if self._parsing_match_header or self._parsing_control_flow_header:
@@ -1280,18 +1358,22 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         if self._peek_curr().type == TokenType.KW_MUT:
             self._safe_consume(TokenType.KW_MUT)
             is_mut = True
-        name = self._safe_consume(TokenType.IDENTIFIER).value
+        name_token = self._safe_consume(TokenType.IDENTIFIER)
+        name = name_token.value
         typ = None
         if self._peek_curr().type == TokenType.COLON:
             self._safe_consume(TokenType.COLON)
             typ = self._parse_type()
         self._safe_consume(TokenType.ASSIGN)
         expr = self._parse_expression()
-        return s.Statement_Let(
+        return self._attach_span(
+            s.Statement_Let(
             name=name,
             type=typ,
             expr=expr,
             is_mut=is_mut,
+            ),
+            name_token,
         )
 
     def _parse_numeric_literal_suffix(self) -> Type | None:

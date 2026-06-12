@@ -116,8 +116,6 @@ class EHIR_ProjectCompiler:
 
         entrypoint_id = self._get_entrypoint_id(refrain)
         node = self._compile_node_by_id(entrypoint_id)
-        for relative_dir in refrain.merge_module_dirs:
-            self._merge_refrain_modules(refrain, entrypoint_id, node, Path(relative_dir))
         source_files = self._collect_source_files(entrypoint_id)
         semantic_hash = self._build_semantic_hash(refrain, source_files)
 
@@ -650,10 +648,6 @@ class EHIR_ProjectCompiler:
                         append_module_tree(parent_id)
                         continue
                     raise RuntimeError(f"Unable to import: {directive}")
-
-        # Optionally include direct child modules exposed by the active frontend.
-        for child_id in self.frontend.list_child_module_ids(id):
-            append_module_tree(child_id)
 
         node.module.ast = resolved_ast
         return node
