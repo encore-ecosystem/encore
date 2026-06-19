@@ -49,6 +49,7 @@ from ehir.core.struct import Struct
 from ehir.core.type import Pointer, Reference, Type, box_pointee, is_box_type, mangle_type_name
 from ehir.core.variable import Parameter, TypedVariable, Variable
 from ehir.errors import EhirCompileError
+from ehir.simplifier.drop_helper import collect_aggregate_names, needs_retain, retain_function_name
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 SKIPABLE = (
@@ -80,6 +81,7 @@ ENABLE_COMMENTS: bool = True
 class Downgrader:
     _structs: dict[str, Derective_struct]
     _enum_variants: dict[str, list[str]]
+    _aggregate_names: set[str]
     _structs_to_add: list[Derective_struct]
     _fns: dict[str, Normalized_fn]
     _fns_to_add: list[Normalized_fn]
@@ -131,6 +133,17 @@ class Downgrader:
         self._structs_to_add = []
         self._fns = {}
         self._fns_to_add = []
+        source_structs = {
+            directive.name: directive
+            for directive in ast
+            if isinstance(directive, Derective_struct) and not directive.generics
+        }
+        source_enums = {
+            directive.name: directive
+            for directive in ast
+            if isinstance(directive, Derective_enum) and not directive.generics
+        }
+        self._aggregate_names = collect_aggregate_names(source_structs, source_enums)
 
         rewritten_ast: list[Derective] = []
         for derective in ast:
@@ -206,19 +219,9 @@ class Downgrader:
                 )
 
             field_type = enum_struct.params[field_index].type
-            if not isinstance(field_type, Pointer):
-                raise EhirCompileError(
-                    f"Invalid enum payload field type for '{match_instr.cond_var.type.name}::{case.variant}': {field_type}",
-                    code="EHIR2102",
-                )
-
-            payload_ptr = TypedVariable(
-                name=f".{match_instr.cond_var.name}_{case.variant}_payload_ptr",
-                type=field_type,
-            )
             payload_out = TypedVariable(
                 name=case.payload_var.name,
-                type=case.payload_var.type or field_type.pointee,
+                type=case.payload_var.type or field_type,
             )
             high_level_field_index = self._high_level_enum_payload_field_index(
                 match_instr.cond_var.type.name,
@@ -235,12 +238,21 @@ class Downgrader:
             case_block.body.insert(
                 0,
                 Instruction_getfield(
-                    var_out=payload_ptr,
+                    var_out=payload_out,
                     src=match_instr.cond_var,
                     field=TypedVariable(case.variant, field_type),
                 ),
             )
-            case_block.body.insert(1, Instruction_load(var_out=payload_out, var=payload_ptr))
+            if needs_retain(payload_out.type, self._aggregate_names):
+                case_block.body.insert(
+                    1,
+                    Instruction_call(
+                        var_out=TypedVariable(f".retain_{payload_out.name}", Type("void")),
+                        fn_name=retain_function_name(payload_out.type),
+                        generics=[],
+                        args=[payload_out],
+                    ),
+                )
 
     def _high_level_enum_payload_field_index(self, enum_name: str, variant_name: str) -> int | None:
         variant_names = self._enum_variants.get(enum_name)
@@ -258,23 +270,18 @@ class Downgrader:
         lowered_field_index: int,
         high_level_field_index: int | None,
     ) -> bool:
-        if len(case_block.body) < 2:
+        if len(case_block.body) < 1:
             return False
 
         field_read = case_block.body[0]
-        payload_load = case_block.body[1]
         if not isinstance(field_read, Instruction_getfield):
-            return False
-        if not isinstance(payload_load, Instruction_load):
             return False
         if field_read.src.name != cond_var.name:
             return False
         accepted_field_names = {str(lowered_field_index)}
         if high_level_field_index is not None:
             accepted_field_names.add(str(high_level_field_index))
-        if field_read.field.name not in accepted_field_names:
-            return False
-        return payload_load.var.name == field_read.var_out.name
+        return field_read.field.name in accepted_field_names
 
     def _downgrade(self, instr: Instruction) -> list[Instruction]:
         if isinstance(instr, Instruction_cpos):
@@ -348,7 +355,7 @@ class Downgrader:
             payload_type = self._variant_payload_type(variant)
             if payload_type is None:
                 continue
-            params.append(Parameter(name=variant.name, type=Pointer(payload_type)))
+            params.append(Parameter(name=variant.name, type=payload_type))
         return Derective_struct(name=enum.name, generics=enum.generics, params=params)
 
     def _variant_payload_type(self, variant: UnitLikeVariant | TupleLikeVariant):
@@ -631,19 +638,15 @@ class Downgrader:
         payload_value = enum.args[0]
         assert payload_value.type is not None
         payload_type = payload_value.type
-        payload_ptr = TypedVariable(name=f".{out.name}_{enum.variant}_payload", type=Pointer(payload_type))
-        # Enum layout stores payload as a pointer field; payload must outlive this frame.
-        result.append(Instruction_halloc(var_out=payload_ptr, type=payload_type))
-        result.append(Instruction_store(var_src=payload_value, var_dst=payload_ptr))
 
         payload_field_index = next(i for i, param in enumerate(lowered_struct.params) if param.name == enum.variant)
-        payload_field_ptr = TypedVariable(name=f".{out.name}_{enum.variant}_field_ptr", type=Pointer(payload_ptr.type))
+        payload_field_ptr = TypedVariable(name=f".{out.name}_{enum.variant}_field_ptr", type=Pointer(payload_type))
         payload_getfieldptr = Instruction_getfieldptr(
             var_out=payload_field_ptr,
             src=out,
-            field=TypedVariable(name=str(payload_field_index), type=payload_ptr.type),
+            field=TypedVariable(name=str(payload_field_index), type=payload_type),
         )
-        payload_store = Instruction_store(var_src=payload_ptr, var_dst=payload_field_ptr)
+        payload_store = Instruction_store(var_src=payload_value, var_dst=payload_field_ptr)
         result.extend([payload_getfieldptr, payload_store])
         return result
 

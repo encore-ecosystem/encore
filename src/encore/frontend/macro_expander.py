@@ -279,17 +279,17 @@ class MacroExpander:
         if inferred_type is not None:
             out.extend([tok(TokenType.LEFT_BRACKET, "["), *inferred_type, tok(TokenType.RIGHT_BRACKET, "]")])
         out.extend([tok(TokenType.SCOPE, "::"), tok(TokenType.IDENTIFIER, "new"), tok(TokenType.LEFT_PAREN, "("), tok(TokenType.RIGHT_PAREN, ")")])
-        for item in items:
+        for index, item in enumerate(items):
+            unit_var = f"{var}_unit_{index}"
             out.extend(
                 [
-                    tok(TokenType.IDENTIFIER, var),
+                    tok(TokenType.KW_LET, "let"),
+                    tok(TokenType.IDENTIFIER, unit_var),
                     tok(TokenType.ASSIGN, "="),
-                    tok(TokenType.IDENTIFIER, "Vec"),
-                    tok(TokenType.SCOPE, "::"),
+                    tok(TokenType.IDENTIFIER, var),
+                    tok(TokenType.DOT, "."),
                     tok(TokenType.IDENTIFIER, "push"),
                     tok(TokenType.LEFT_PAREN, "("),
-                    tok(TokenType.IDENTIFIER, var),
-                    tok(TokenType.COMMA, ","),
                     *[LexerToken(type=x.type, value=x.value, line=callsite.line, column=callsite.column) for x in item],
                     tok(TokenType.RIGHT_PAREN, ")"),
                 ]

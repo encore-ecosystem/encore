@@ -19,6 +19,9 @@ from encore.modes.build import (
     _resolve_dependency,
     create_compiler,
     load_manifest,
+    print_profile_report,
+    profile_timings_enabled,
+    resolve_build_profile,
     run_binary,
 )
 from encore.utils.manifest import ProjectManifest
@@ -46,7 +49,21 @@ def add_test_parser(subparsers) -> tuple[str, Callable]:
         "--backend", default="llvm", choices=set(AVAILABLE_BACKENDS), help="EHIR Compiler Backend"
     )
     test_parser.add_argument(
-        "--profile", default="debug", choices=set(AVAILABLE_OPTPROFILES.keys()), help="Optimization profile"
+        "--opt-profile",
+        default=None,
+        choices=set(AVAILABLE_OPTPROFILES.keys()),
+        help="Optimization profile. Defaults to debug.",
+    )
+    test_parser.add_argument(
+        "--profile",
+        nargs="?",
+        const="timings",
+        default=None,
+        choices={*AVAILABLE_OPTPROFILES.keys(), "timings"},
+        help=(
+            "Enable compiler timing profile when passed without a value. "
+            "For compatibility, --profile debug|release|extreme still selects the optimization profile."
+        ),
     )
     test_parser.add_argument("--no-cache", action="store_true", help="Ignore existing EHIR cache for this build")
     test_parser.add_argument("--filter", type=str, default=None, help="Only run tests whose path contains this text")
@@ -65,6 +82,8 @@ def add_test_parser(subparsers) -> tuple[str, Callable]:
 def handle_test(args: Namespace):
     cwd = Path().resolve()
     console = Console(highlight=False)
+    args.resolved_profile = resolve_build_profile(args)
+    args.profile_timings = profile_timings_enabled(args)
     if args._worker_source is not None:
         _handle_test_worker(args, cwd)
         return
@@ -72,6 +91,10 @@ def handle_test(args: Namespace):
     tests = _collect_test_cases(cwd, args.filter)
     if not tests:
         console.print("No tests found.")
+        return
+
+    if args.profile_timings:
+        _run_tests_in_process(args, cwd, console, tests)
         return
 
     jobs = _normalize_jobs(args.jobs)
@@ -108,6 +131,28 @@ def handle_test(args: Namespace):
     raise SystemExit(1)
 
 
+def _run_tests_in_process(args: Namespace, cwd: Path, console: Console, tests: list[_TestCase]) -> None:
+    passed = 0
+    failed = 0
+    for completed, test in enumerate(tests, start=1):
+        try:
+            _run_test_case(args, cwd, test)
+        except Exception as exc:
+            failed += 1
+            console.print(f"[{completed}/{len(tests)}] [red]FAILED[/red] {test.display_name} ({_exception_text(exc)})")
+            continue
+        passed += 1
+        suffix = " (expected compile error)" if test.expected_compile_error is not None else ""
+        console.print(f"[{completed}/{len(tests)}] [green]ok[/green] {test.display_name}{suffix}")
+
+    if failed == 0:
+        console.print(f"[green]PASS[/green] {passed} tests")
+        return
+
+    console.print(f"[red]FAIL[/red] {failed} failed, {passed} passed")
+    raise SystemExit(1)
+
+
 def _normalize_jobs(jobs: int) -> int:
     if jobs < 1:
         raise RuntimeError("--jobs must be greater than zero")
@@ -133,7 +178,7 @@ def _run_test_worker(args: Namespace, cwd: Path, test: _TestCase) -> subprocess.
         "--backend",
         args.backend,
         "--profile",
-        args.profile,
+        args.resolved_profile,
         "--_worker-source",
         str(test.source_file),
     ]
@@ -150,16 +195,17 @@ def _run_test_case(args: Namespace, cwd: Path, test: _TestCase) -> None:
     compiler = create_compiler(
         cwd,
         args.backend,
-        args.profile,
+        args.resolved_profile,
         no_cache=args.no_cache,
         cfg_overrides=args.cfg,
         target_dir=_test_worker_target_dir(cwd, test_name),
-        cache_dir=_test_shared_cache_dir(cwd, args.profile),
+        cache_dir=_test_shared_cache_dir(cwd, args.resolved_profile),
+        profile_timings=args.profile_timings,
     )
     compiler.on_refrain = lambda _refrain: None
     build_ctx = _BuildScriptContext(
         backend=args.backend,
-        profile=args.profile,
+        profile=args.resolved_profile,
         no_cache=args.no_cache,
         cfg_overrides=tuple(args.cfg),
         workspace_suffix=test_name,
@@ -177,9 +223,13 @@ def _run_test_case(args: Namespace, cwd: Path, test: _TestCase) -> None:
 
     if test.expected_compile_error is not None:
         _assert_expected_compile_error(compiler, ref, test.expected_compile_error)
+        if args.profile_timings:
+            print_profile_report(compiler)
         return
 
     outputs = compiler.compile_all()
+    if args.profile_timings:
+        print_profile_report(compiler)
     output_by_name = dict(outputs)
     binary_path = output_by_name[test_name]
     ret_code = run_binary(binary_path, [])

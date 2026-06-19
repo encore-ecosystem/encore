@@ -2,7 +2,7 @@ from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_fn, Derective_impl
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import ControlFlow, Instruction_br, Instruction_load, Instruction_ret, Instruction_salloc, Instruction_store
-from ehir.core.type import Pointer
+from ehir.core.type import Pointer, Type
 from ehir.core.variable import TypedVariable
 from ehir.errors import EhirCompileError
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
@@ -87,6 +87,25 @@ class Normalizer:
 
         if "exit" in block_mapping:
             raise EhirCompileError(f"Function '{derective.name}' has reserved block `exit`")
+
+        if derective.ret_type.name == "void":
+            for block in block_mapping.values():
+                if isinstance(block.term, Instruction_ret):
+                    block.term = Instruction_br(label="exit")
+
+            exit_block = TerminatedBlock(
+                name="exit",
+                body=[],
+                term=Instruction_ret(TypedVariable(name=".void", type=Type("void"))),
+            )
+            return Normalized_fn.new(
+                name=derective.name,
+                params=derective.params,
+                ret_type=derective.ret_type,
+                entry_block=block_mapping["entry"],
+                body=[block for name, block in block_mapping.items() if name != "entry"],
+                exit_block=exit_block,
+            )
 
         # Step 1: Create resulting variable in entry block
         exit_var_ptr = TypedVariable(name=".exit_var_ptr", type=Pointer(derective.ret_type))

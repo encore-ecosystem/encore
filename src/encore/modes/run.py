@@ -7,6 +7,7 @@ from ehir import Refrain
 from encore.modes.build import (
     add_build_options,
     build_project,
+    profile_timings_enabled,
     resolve_build_profile,
     resolve_project_target_type,
     run_binary,
@@ -32,6 +33,7 @@ def handle_run(args: Namespace):
         no_cache=args.no_cache,
         cfg_overrides=args.cfg,
         show_status=True,
+        profile_timings=profile_timings_enabled(args),
     )
     _, executable_path = outputs[0]
     program_args = args.program_args[1:] if args.program_args[:1] == ["--"] else args.program_args

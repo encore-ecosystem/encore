@@ -4,10 +4,8 @@ from typing import Optional
 
 from ehir.core.block import Block
 from ehir.core.derectives import (
-    Derective_cimp,
     Derective_extern_fn,
     Derective_fn,
-    Derective_imp,
     Derective_impl,
     Derective_struct,
     Derective_trait,
@@ -34,9 +32,9 @@ from ehir.core.instructions import (
     Instruction_mul,
     Instruction_neq,
     Instruction_or,
+    Instruction_put,
     Instruction_ret,
     Instruction_salloc,
-    Instruction_put,
     Instruction_scstruct,
     Instruction_sgetfield,
     Instruction_shl,
@@ -55,7 +53,6 @@ from ehir.core.variable import Parameter, TypedVariable, Variable
 
 @dataclass
 class EHIR_Module:
-    id: Path
     ast: list[Derective]
 
     def __str__(self) -> str:
@@ -72,12 +69,6 @@ class EHIR_Builder:
     def __init__(self, module: EHIR_Module):
         self.module = module
         self.shift = 0
-
-    def build_imp(self, prefix: list[str], symbol: str, alias: str | None = None):
-        self.module.ast.append(Derective_imp(prefix=prefix, symbol=symbol, alias=alias))
-
-    def build_cimp(self, prefix: list[str], symbol: str, alias: str | None = None):
-        self.module.ast.append(Derective_cimp(prefix=prefix, symbol=symbol, alias=alias))
 
     def build_struct(self, name: str, generics: list[Type], params: list[Parameter]):
         self.module.ast.append(

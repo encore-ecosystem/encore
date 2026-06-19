@@ -2,7 +2,6 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
-from ehir.core.instructions.base import Instruction
 from ehir.core.instructions import (
     Instruction_add,
     Instruction_and,
@@ -36,10 +35,9 @@ from ehir.core.instructions import (
     Instruction_switch,
     Instruction_xor,
 )
-from ehir.cfg import set_item_cfgs
+from ehir.core.instructions.base import Instruction
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter
-from ehir.frontend.builtin.parser import Parser as EHIR_Parser
 
 from encore.frontend.base import ParserBase
 from encore.frontend.lexer import LexerToken
@@ -375,7 +373,9 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             case _:
                 return s.UnitStructureDefinition(name=name, generics=generics)
 
-    def _parse_function_signature(self, is_public: bool = False, *, attrs: list[str] | None = None) -> s.FunctionSignature:
+    def _parse_function_signature(
+        self, is_public: bool = False, *, attrs: list[str] | None = None
+    ) -> s.FunctionSignature:
         attrs_list = list(attrs) if attrs is not None else []
 
         is_extern = False
@@ -1368,10 +1368,10 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         expr = self._parse_expression()
         return self._attach_span(
             s.Statement_Let(
-            name=name,
-            type=typ,
-            expr=expr,
-            is_mut=is_mut,
+                name=name,
+                type=typ,
+                expr=expr,
+                is_mut=is_mut,
             ),
             name_token,
         )
@@ -1598,10 +1598,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 if 0 <= token.line < len(rows):
                     source_line = rows[token.line]
             raise CompileDiagnostic(
-                message=(
-                    f"Unexpected token '{token.value}' ({token.type}). "
-                    f"Expected: {expected_token_type}"
-                ),
+                message=(f"Unexpected token '{token.value}' ({token.type}). Expected: {expected_token_type}"),
                 stage="parse",
                 module_id=self._module_id,
                 line=token.line,

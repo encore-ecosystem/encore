@@ -32,9 +32,7 @@ class MonomorphizationPass:
         }
         box_struct = next((d for d in ast if isinstance(d, Derective_struct) and d.name == "Box" and d.generics), None)
         if box_struct is None:
-            out = ast
-            for _ in range(self._GENERIC_MONO_PASSES):
-                out = self._monomorphize_generic_functions(out)
+            out = self._run_generic_monomorphization_fixpoint(ast)
             return self._prune_unreferenced_generic_functions(out)
 
         box_methods = [
@@ -46,9 +44,7 @@ class MonomorphizationPass:
 
         concrete_box_types = self._collect_concrete_box_types(ast)
         if not concrete_box_types:
-            out = ast
-            for _ in range(self._GENERIC_MONO_PASSES):
-                out = self._monomorphize_generic_functions(out)
+            out = self._run_generic_monomorphization_fixpoint(ast)
             return self._prune_unreferenced_generic_functions(out)
 
         new_nodes: list[Derective] = []
@@ -107,10 +103,17 @@ class MonomorphizationPass:
             filtered.append(d)
         new_nodes = [d for d in new_nodes if not (isinstance(d, Derective_fn) and d.name.endswith("::from_stack"))]
         filtered.extend(new_nodes)
-        out = filtered
-        for _ in range(self._GENERIC_MONO_PASSES):
-            out = self._monomorphize_generic_functions(out)
+        out = self._run_generic_monomorphization_fixpoint(filtered)
         return self._prune_unreferenced_generic_functions(out)
+
+    def _run_generic_monomorphization_fixpoint(self, ast: list[Derective]) -> list[Derective]:
+        out = ast
+        for _ in range(self._GENERIC_MONO_PASSES):
+            next_out = self._monomorphize_generic_functions(out)
+            if next_out is out:
+                break
+            out = next_out
+        return out
 
     def _prune_unreferenced_generic_functions(self, ast: list[Derective]) -> list[Derective]:
         referenced_fn_names: set[str] = set()

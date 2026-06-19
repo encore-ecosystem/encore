@@ -1,8 +1,8 @@
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 
 from ehir.core.block import Block
-from ehir.core.derectives import Derective_enum, Derective_fn, Derective_struct
+from ehir.core.derectives import Derective_enum, Derective_extern_fn, Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import EnumVariant, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import (
@@ -12,23 +12,36 @@ from ehir.core.instructions import (
     Instruction_capprim,
     Instruction_cbr,
     Instruction_call,
+    Instruction_callvoid,
+    Instruction_drop,
+    Instruction_gep,
     Instruction_getfield,
     Instruction_getfieldptr,
     Instruction_hfree,
     Instruction_ieq,
+    Instruction_les,
     Instruction_load,
     Instruction_match,
     Instruction_neq,
     Instruction_pcast,
     Instruction_ret,
+    Instruction_salloc,
     Instruction_store,
     Instruction_sub,
     MatchCase,
 )
 from ehir.core.primitives import Str, Usize, Usize_t
-from ehir.core.type import Pointer, Type
-from ehir.core.variable import Parameter, TypedVariable
-from ehir.simplifier.drop_helper import collect_aggregate_names, drop_function_name, is_box_struct, needs_drop
+from ehir.core.primitives.base import Primitive, PrimitiveType
+from ehir.core.type import Pointer, Reference, Type, mangle_type_name
+from ehir.core.variable import Parameter, StructField, TypedVariable
+from ehir.simplifier.drop_helper import (
+    collect_aggregate_names,
+    drop_function_name,
+    is_box_struct,
+    is_dyn_type,
+    needs_drop,
+    reference_storage_struct,
+)
 
 
 @dataclass(frozen=True)
@@ -49,12 +62,12 @@ class AutoDropPass:
         self._structs = {
             directive.name: directive
             for directive in ast
-            if isinstance(directive, Derective_struct) and not directive.generics
+            if isinstance(directive, Derective_struct)
         }
         self._enums = {
             directive.name: directive
             for directive in ast
-            if isinstance(directive, Derective_enum) and not directive.generics
+            if isinstance(directive, Derective_enum)
         }
         self._aggregate_names = collect_aggregate_names(self._structs, self._enums)
         existing_drop_names = {
@@ -64,6 +77,34 @@ class AutoDropPass:
         }
 
         generated: list[Derective] = []
+        uses_str = self._uses_type(ast, Type("str"))
+        str_drop_name = drop_function_name(Type("str"))
+        if uses_str and "encore_str_drop" not in existing_drop_names:
+            generated.append(
+                Derective_extern_fn(
+                    name="encore_str_drop",
+                    params=[Parameter("value", Type("str"))],
+                    ret_type=Type("void"),
+                )
+            )
+            existing_drop_names.add("encore_str_drop")
+        if uses_str and str_drop_name not in existing_drop_names:
+            generated.append(self._generate_str_drop_fn())
+            existing_drop_names.add(str_drop_name)
+
+        for dyn_type in self._collect_dyn_types(ast):
+            fn_name = drop_function_name(dyn_type)
+            if fn_name in existing_drop_names:
+                continue
+            generated.append(
+                Derective_extern_fn(
+                    name=fn_name,
+                    params=[Parameter("self", dyn_type)],
+                    ret_type=Type("void"),
+                )
+            )
+            existing_drop_names.add(fn_name)
+
         for directive in ast:
             if (
                 isinstance(directive, Derective_struct)
@@ -84,6 +125,31 @@ class AutoDropPass:
                     generated.append(self._generate_enum_drop_fn(directive))
                     existing_drop_names.add(fn_name)
 
+        for concrete_type in self._collect_concrete_reference_storage_types(ast):
+            fn_name = drop_function_name(concrete_type)
+            if fn_name in existing_drop_names:
+                continue
+            concrete_struct, concrete_storage = self._concrete_reference_storage_structs(concrete_type)
+            if concrete_struct is None or concrete_storage is None:
+                continue
+            generated.append(self._generate_reference_storage_drop_fn(concrete_type, concrete_struct, concrete_storage))
+            existing_drop_names.add(fn_name)
+
+        for concrete_type in self._collect_concrete_generic_aggregate_types(ast):
+            fn_name = drop_function_name(concrete_type)
+            if fn_name in existing_drop_names:
+                continue
+            if concrete_type.name in self._structs:
+                concrete_struct = self._concrete_generic_struct(concrete_type)
+                if concrete_struct is not None:
+                    generated.append(self._generate_struct_drop_fn(concrete_struct, self_type=concrete_type))
+                    existing_drop_names.add(fn_name)
+            elif concrete_type.name in self._enums:
+                concrete_enum = self._concrete_generic_enum(concrete_type)
+                if concrete_enum is not None:
+                    generated.append(self._generate_enum_drop_fn(concrete_enum, self_type=concrete_type))
+                    existing_drop_names.add(fn_name)
+
         for directive in ast:
             if isinstance(directive, Derective_struct) and not directive.generics and is_box_struct(directive):
                 for fn in self._generate_box_cfree_fns(directive):
@@ -93,10 +159,37 @@ class AutoDropPass:
 
         return ast + generated
 
-    def _generate_struct_drop_fn(self, directive: Derective_struct) -> Derective_fn:
-        self_type = Type(directive.name)
+    def _generate_str_drop_fn(self) -> Derective_fn:
+        self_type = Type("str")
         self_var = TypedVariable("self", self_type)
-        if is_box_struct(directive):
+        return Derective_fn(
+            name=drop_function_name(self_type),
+            generics=[],
+            params=[Parameter("self", self_type)],
+            body=[
+                Block(
+                    name="entry",
+                    body=[
+                        Instruction_callvoid(
+                            fn_name="encore_str_drop",
+                            generics=[],
+                            args=[deepcopy(self_var)],
+                        ),
+                        Instruction_ret(TypedVariable(".drop_ret", Type("void"))),
+                    ],
+                )
+            ],
+            ret_type=Type("void"),
+            attrs=("safe",),
+        )
+
+    def _generate_struct_drop_fn(self, directive: Derective_struct, self_type: Type | None = None) -> Derective_fn:
+        self_type = deepcopy(self_type) if self_type is not None else Type(directive.name)
+        self_var = TypedVariable("self", self_type)
+        reference_storage = reference_storage_struct(directive, self._structs)
+        if reference_storage is not None:
+            blocks = self._generate_reference_storage_drop_blocks(directive, reference_storage, self_var)
+        elif is_box_struct(directive):
             blocks = self._generate_box_drop_blocks(directive, self_var)
         else:
             body = self._generate_struct_drop_body(directive, self_var)
@@ -110,8 +203,135 @@ class AutoDropPass:
             attrs=("safe",),
         )
 
-    def _generate_enum_drop_fn(self, directive: Derective_enum) -> Derective_fn:
-        self_type = Type(directive.name)
+    def _generate_reference_storage_drop_fn(
+        self,
+        self_type: Type,
+        directive: Derective_struct,
+        storage: Derective_struct,
+    ) -> Derective_fn:
+        self_var = TypedVariable("self", self_type)
+        return Derective_fn(
+            name=drop_function_name(self_type),
+            generics=[],
+            params=[Parameter("self", self_type)],
+            body=self._generate_reference_storage_drop_blocks(directive, storage, self_var),
+            ret_type=Type("void"),
+            attrs=("safe",),
+        )
+
+    def _generate_reference_storage_drop_blocks(
+        self,
+        directive: Derective_struct,
+        storage: Derective_struct,
+        self_var: TypedVariable,
+    ) -> list[Block]:
+        storage_ptr_type = directive.params[0].type
+        assert isinstance(storage_ptr_type, Pointer)
+        ptr_type = storage.params[1].type
+        assert isinstance(ptr_type, Pointer)
+        elem_type = ptr_type.pointee
+
+        storage_ptr = TypedVariable(".drop_storage_ptr", storage_ptr_type)
+        ref_count_ptr = TypedVariable(".drop_ref_count_ptr", Pointer(Usize_t()))
+        ref_count = TypedVariable(".drop_ref_count", Usize_t())
+        one = TypedVariable(".drop_one", Usize_t())
+        next_ref_count = TypedVariable(".drop_next_ref_count", Usize_t())
+        zero = TypedVariable(".drop_zero", Usize_t())
+        is_zero = TypedVariable(".drop_is_zero", Type("u1"))
+
+        entry = Block(
+            name="entry",
+            body=[
+                Instruction_getfield(var_out=storage_ptr, src=self_var, field=TypedVariable("0", storage_ptr_type)),
+                Instruction_getfieldptr(
+                    var_out=ref_count_ptr,
+                    src=storage_ptr,
+                    field=TypedVariable("0", storage.params[0].type),
+                ),
+                Instruction_load(var_out=ref_count, var=ref_count_ptr),
+                Instruction_capprim(var_out=one, primitive=Usize(1)),
+                Instruction_sub(var_out=next_ref_count, lhs=ref_count, rhs=one),
+                Instruction_store(var_src=next_ref_count, var_dst=ref_count_ptr),
+                Instruction_capprim(var_out=zero, primitive=Usize(0)),
+                Instruction_ieq(var_out=is_zero, lhs=next_ref_count, rhs=zero),
+                Instruction_cbr(cond_var=is_zero, true_br_label="release", else_br_label="done"),
+            ],
+        )
+
+        data_ptr = TypedVariable(".drop_data_ptr", ptr_type)
+        release_body = [
+            Instruction_getfield(var_out=data_ptr, src=storage_ptr, field=TypedVariable("1", ptr_type)),
+        ]
+        if needs_drop(elem_type, self._aggregate_names):
+            len_var = TypedVariable(".drop_len", Usize_t())
+            idx_ptr = TypedVariable(".drop_idx_ptr", Pointer(Usize_t()))
+            idx_zero = TypedVariable(".drop_idx_zero", Usize_t())
+            release_body.extend(
+                [
+                    Instruction_getfield(var_out=len_var, src=storage_ptr, field=TypedVariable("2", Usize_t())),
+                    Instruction_salloc(var_out=idx_ptr, type=Usize_t()),
+                    Instruction_capprim(var_out=idx_zero, primitive=Usize(0)),
+                    Instruction_store(var_src=idx_zero, var_dst=idx_ptr),
+                    Instruction_br("drop_elements"),
+                ]
+            )
+            idx = TypedVariable(".drop_idx", Usize_t())
+            keep_going = TypedVariable(".drop_keep_going", Type("u1"))
+            elem_ptr = TypedVariable(".drop_elem_ptr", Pointer(elem_type))
+            elem = TypedVariable(".drop_elem", elem_type)
+            elem_one = TypedVariable(".drop_elem_one", Usize_t())
+            next_idx = TypedVariable(".drop_next_idx", Usize_t())
+            loop = Block(
+                name="drop_elements",
+                body=[
+                    Instruction_load(var_out=idx, var=idx_ptr),
+                    Instruction_les(var_out=keep_going, lhs=idx, rhs=len_var),
+                    Instruction_cbr(cond_var=keep_going, true_br_label="drop_element", else_br_label="free_storage"),
+                ],
+            )
+            drop_element = Block(
+                name="drop_element",
+                body=[
+                    Instruction_gep(var_out=elem_ptr, var=data_ptr, offset=idx),
+                    Instruction_load(var_out=elem, var=elem_ptr),
+                    Instruction_drop(var=elem),
+                    Instruction_capprim(var_out=elem_one, primitive=Usize(1)),
+                    Instruction_add(var_out=next_idx, lhs=idx, rhs=elem_one),
+                    Instruction_store(var_src=next_idx, var_dst=idx_ptr),
+                    Instruction_br("drop_elements"),
+                ],
+            )
+            return [
+                entry,
+                Block(name="release", body=release_body),
+                loop,
+                drop_element,
+                Block(
+                    name="free_storage",
+                    body=[
+                        Instruction_hfree(var=data_ptr),
+                        Instruction_hfree(var=storage_ptr),
+                        Instruction_ret(TypedVariable(".drop_ret", Type("void"))),
+                    ],
+                ),
+                Block(name="done", body=[Instruction_ret(TypedVariable(".drop_ret", Type("void")))]),
+            ]
+
+        release_body.extend(
+            [
+                Instruction_hfree(var=data_ptr),
+                Instruction_hfree(var=storage_ptr),
+                Instruction_ret(TypedVariable(".drop_ret", Type("void"))),
+            ]
+        )
+        return [
+            entry,
+            Block(name="release", body=release_body),
+            Block(name="done", body=[Instruction_ret(TypedVariable(".drop_ret", Type("void")))]),
+        ]
+
+    def _generate_enum_drop_fn(self, directive: Derective_enum, self_type: Type | None = None) -> Derective_fn:
+        self_type = deepcopy(self_type) if self_type is not None else Type(directive.name)
         self_var = TypedVariable("self", self_type)
         blocks = self._generate_enum_drop_blocks(directive, self_var)
         return Derective_fn(
@@ -576,22 +796,15 @@ class AutoDropPass:
         free_heap_body: list = []
         ptr = self._emit_box_ptr(free_heap_body, self_var, ptr_type, ".cfree3_free")
         if self._trace_cfree:
-            msg = self._emit_cfree_trace_message_with_id(
+            fd = TypedVariable(".cfree3_trace_heap_fd", Type("i32"))
+            free_heap_body.append(Instruction_capprim(var_out=fd, primitive=Usize(2, size=32)))
+            self._emit_cfree_trace_payload_writes(
                 free_heap_body,
                 box_type_name=self_var.type.name,
                 ptr_type=ptr_type,
                 ptr_var=ptr,
+                fd=fd,
                 prefix=".cfree3_trace_heap",
-            )
-            fd = TypedVariable(".cfree3_trace_heap_fd", Type("i32"))
-            free_heap_body.append(Instruction_capprim(var_out=fd, primitive=Usize(2, size=32)))
-            free_heap_body.append(
-                Instruction_call(
-                    var_out=TypedVariable(".cfree3_trace_heap_out", Type("i32")),
-                    fn_name="encore_io_write",
-                    generics=[],
-                    args=[fd, msg],
-                )
             )
         free_heap_body.extend([Instruction_hfree(var=ptr), Instruction_br(label="free_owner")])
 
@@ -687,18 +900,13 @@ class AutoDropPass:
             )
             blocks.append(Block(name=current_name, body=current_body))
 
-            payload_ptr = TypedVariable(
-                f"{prefix}_{index}_{edge.field_name}_payload_ptr",
-                Pointer(deepcopy(edge.child_type)),
-            )
             child = TypedVariable(f"{prefix}_{index}_{edge.field_name}_child", deepcopy(edge.child_type))
             some_body: list = [
                 Instruction_getfield(
-                    var_out=payload_ptr,
+                    var_out=child,
                     src=field_var,
-                    field=TypedVariable(str(edge.variant_index), Pointer(deepcopy(edge.child_type))),
-                ),
-                Instruction_load(var_out=child, var=payload_ptr),
+                    field=TypedVariable(str(edge.variant_index), deepcopy(edge.child_type)),
+                )
             ]
             op(some_body, child, f"{prefix}_{index}_some")
             some_body.append(Instruction_br(label=next_label))
@@ -716,20 +924,33 @@ class AutoDropPass:
         body.append(Instruction_capprim(var_out=msg, primitive=Str(text)))
         return msg
 
-    def _emit_cfree_trace_message_with_id(
+    def _emit_trace_write(self, body: list, fd: TypedVariable, text: TypedVariable, name: str) -> None:
+        body.append(
+            Instruction_call(
+                var_out=TypedVariable(name, Type("i32")),
+                fn_name="encore_io_write",
+                generics=[],
+                args=[fd, text],
+            )
+        )
+
+    def _emit_cfree_trace_payload_writes(
         self,
         body: list,
         *,
         box_type_name: str,
         ptr_type: Pointer,
         ptr_var: TypedVariable,
+        fd: TypedVariable,
         prefix: str,
-    ) -> TypedVariable:
+    ) -> None:
         base = self._emit_debug_message(body, f"[cfree] free heap payload of {box_type_name}", f"{prefix}_base")
         pointee = ptr_type.pointee
         struct_decl = self._structs.get(pointee.name)
         if struct_decl is None:
-            return self._emit_debug_message(body, f"[cfree] free heap payload of {box_type_name}\n", prefix)
+            msg = self._emit_debug_message(body, f"[cfree] free heap payload of {box_type_name}\n", prefix)
+            self._emit_trace_write(body, fd, msg, f"{prefix}_out")
+            return
 
         id_index = None
         for idx, field in enumerate(struct_decl.params):
@@ -737,14 +958,13 @@ class AutoDropPass:
                 id_index = idx
                 break
         if id_index is None:
-            return self._emit_debug_message(body, f"[cfree] free heap payload of {box_type_name}\n", prefix)
+            msg = self._emit_debug_message(body, f"[cfree] free heap payload of {box_type_name}\n", prefix)
+            self._emit_trace_write(body, fd, msg, f"{prefix}_out")
+            return
 
         payload = TypedVariable(f"{prefix}_payload", deepcopy(pointee))
         id_value = TypedVariable(f"{prefix}_id", Type("str"))
         sep = self._emit_debug_message(body, " id=", f"{prefix}_sep")
-        with_sep = TypedVariable(f"{prefix}_with_sep", Type("str"))
-        with_id = TypedVariable(f"{prefix}_with_id", Type("str"))
-        final = TypedVariable(prefix, Type("str"))
         body.append(Instruction_load(var_out=payload, var=ptr_var))
         body.append(
             Instruction_getfield(
@@ -753,32 +973,11 @@ class AutoDropPass:
                 field=TypedVariable(str(id_index), Type("str")),
             )
         )
-        body.append(
-            Instruction_call(
-                var_out=with_sep,
-                fn_name="encore_str_concat",
-                generics=[],
-                args=[base, sep],
-            )
-        )
-        body.append(
-            Instruction_call(
-                var_out=with_id,
-                fn_name="encore_str_concat",
-                generics=[],
-                args=[with_sep, id_value],
-            )
-        )
         nl = self._emit_debug_message(body, "\n", f"{prefix}_nl")
-        body.append(
-            Instruction_call(
-                var_out=final,
-                fn_name="encore_str_concat",
-                generics=[],
-                args=[with_id, nl],
-            )
-        )
-        return final
+        self._emit_trace_write(body, fd, base, f"{prefix}_base_out")
+        self._emit_trace_write(body, fd, sep, f"{prefix}_sep_out")
+        self._emit_trace_write(body, fd, id_value, f"{prefix}_id_out")
+        self._emit_trace_write(body, fd, nl, f"{prefix}_nl_out")
 
     def _emit_pass0_child(self, body: list, child: TypedVariable, prefix: str) -> None:
         self._emit_ref_count_add_for_box(body, child, -1, prefix)
@@ -1104,7 +1303,7 @@ class AutoDropPass:
         drop_variants = [
             (variant_index, variant)
             for variant_index, variant in enumerate(directive.variants, start=1)
-            if self._variant_needs_drop(variant)
+            if self._variant_payload_type(variant) is not None
         ]
         if not drop_variants:
             return [Block(name="entry", body=[Instruction_ret(TypedVariable(".drop_ret", Type("void")))])]
@@ -1123,27 +1322,32 @@ class AutoDropPass:
         for variant_index, variant in drop_variants:
             payload_type = self._variant_payload_type(variant)
             assert payload_type is not None
-            payload_ptr_type = Pointer(deepcopy(payload_type))
-            payload_ptr = TypedVariable(f".drop_{variant.name}_ptr", payload_ptr_type)
             payload = TypedVariable(f".drop_{variant.name}", deepcopy(payload_type))
+            body = [
+                Instruction_getfield(
+                    var_out=payload,
+                    src=self_var,
+                    field=TypedVariable(str(variant_index), deepcopy(payload_type)),
+                )
+            ]
+            if needs_drop(payload_type, self._aggregate_names):
+                body.append(
+                    Instruction_call(
+                        var_out=TypedVariable(f".drop_call_{variant.name}", Type("void")),
+                        fn_name=drop_function_name(payload_type),
+                        generics=[],
+                        args=[deepcopy(payload)],
+                    )
+                )
+            body.extend(
+                [
+                    Instruction_ret(TypedVariable(".drop_ret", Type("void"))),
+                ]
+            )
             blocks.append(
                 Block(
                     name=f"drop_{variant.name}",
-                    body=[
-                        Instruction_getfield(
-                            var_out=payload_ptr,
-                            src=self_var,
-                            field=TypedVariable(str(variant_index), payload_ptr_type),
-                        ),
-                        Instruction_load(var_out=payload, var=payload_ptr),
-                        Instruction_call(
-                            var_out=TypedVariable(f".drop_call_{variant.name}", Type("void")),
-                            fn_name=drop_function_name(payload_type),
-                            generics=[],
-                            args=[deepcopy(payload)],
-                        ),
-                        Instruction_ret(TypedVariable(".drop_ret", Type("void"))),
-                    ],
+                    body=body,
                 )
             )
         blocks.append(Block(name="done", body=[Instruction_ret(TypedVariable(".drop_ret", Type("void")))]))
@@ -1152,6 +1356,194 @@ class AutoDropPass:
     def _variant_needs_drop(self, variant: EnumVariant) -> bool:
         payload_type = self._variant_payload_type(variant)
         return payload_type is not None and needs_drop(payload_type, self._aggregate_names)
+
+    def _collect_concrete_reference_storage_types(self, ast: list[Derective]) -> list[Type]:
+        reference_storage_names = {
+            name
+            for name, directive in self._structs.items()
+            if directive.generics and reference_storage_struct(directive, self._structs) is not None
+        }
+        observed: dict[str, Type] = {}
+        for item in self._walk(ast):
+            if isinstance(item, Type):
+                self._collect_concrete_reference_storage_type(item, reference_storage_names, observed)
+        return list(observed.values())
+
+    def _collect_concrete_reference_storage_type(
+        self,
+        typ: Type,
+        reference_storage_names: set[str],
+        out: dict[str, Type],
+    ) -> None:
+        if isinstance(typ, (Pointer, Reference)):
+            self._collect_concrete_reference_storage_type(typ.pointee, reference_storage_names, out)
+            return
+        for generic in typ.generics:
+            self._collect_concrete_reference_storage_type(generic, reference_storage_names, out)
+        if typ.name not in reference_storage_names or not typ.generics:
+            return
+        if self._is_placeholder_type(typ):
+            return
+        out[mangle_type_name(typ)] = deepcopy(typ)
+
+    def _collect_concrete_generic_aggregate_types(self, ast: list[Derective]) -> list[Type]:
+        generic_names = {
+            name
+            for name, directive in {**self._structs, **self._enums}.items()
+            if getattr(directive, "generics", None)
+        }
+        observed: dict[str, Type] = {}
+        for item in self._walk(ast):
+            if isinstance(item, Type):
+                self._collect_concrete_generic_aggregate_type(item, generic_names, observed)
+        return list(observed.values())
+
+    def _collect_dyn_types(self, ast: list[Derective]) -> list[Type]:
+        observed: dict[str, Type] = {}
+        for item in self._walk(ast):
+            if not isinstance(item, Type):
+                continue
+            self._collect_dyn_type(item, observed)
+        return list(observed.values())
+
+    def _collect_dyn_type(self, typ: Type, out: dict[str, Type]) -> None:
+        if isinstance(typ, (Pointer, Reference)):
+            self._collect_dyn_type(typ.pointee, out)
+            return
+        for generic in typ.generics:
+            self._collect_dyn_type(generic, out)
+        if is_dyn_type(typ) and not self._is_placeholder_type(typ):
+            out[mangle_type_name(typ)] = deepcopy(typ)
+
+    def _collect_concrete_generic_aggregate_type(
+        self,
+        typ: Type,
+        generic_names: set[str],
+        out: dict[str, Type],
+    ) -> None:
+        if isinstance(typ, (Pointer, Reference)):
+            self._collect_concrete_generic_aggregate_type(typ.pointee, generic_names, out)
+            return
+        for generic in typ.generics:
+            self._collect_concrete_generic_aggregate_type(generic, generic_names, out)
+        if typ.name not in generic_names or not typ.generics:
+            return
+        if self._is_placeholder_type(typ):
+            return
+        out[mangle_type_name(typ)] = deepcopy(typ)
+
+    def _concrete_generic_struct(self, concrete_type: Type) -> Derective_struct | None:
+        template = self._structs.get(concrete_type.name)
+        if template is None or not template.generics:
+            return None
+        mapping = {
+            generic.name: concrete
+            for generic, concrete in zip(template.generics, concrete_type.generics, strict=False)
+        }
+        return self._materialize_struct(template, mapping)
+
+    def _concrete_generic_enum(self, concrete_type: Type) -> Derective_enum | None:
+        template = self._enums.get(concrete_type.name)
+        if template is None or not template.generics:
+            return None
+        mapping = {
+            generic.name: concrete
+            for generic, concrete in zip(template.generics, concrete_type.generics, strict=False)
+        }
+        return Derective_enum(
+            name=template.name,
+            generics=[],
+            variants=[self._replace_enum_variant_types(variant, mapping) for variant in template.variants],
+            is_public=template.is_public,
+            attrs=template.attrs,
+        )
+
+    def _replace_enum_variant_types(
+        self,
+        variant: UnitLikeVariant | TupleLikeVariant,
+        mapping: dict[str, Type],
+    ) -> UnitLikeVariant | TupleLikeVariant:
+        if isinstance(variant, UnitLikeVariant):
+            return UnitLikeVariant(name=variant.name)
+        if isinstance(variant, TupleLikeVariant):
+            return TupleLikeVariant(
+                name=variant.name,
+                types=[self._replace_type(typ, mapping) for typ in variant.types],
+            )
+        raise TypeError(f"Unknown enum variant kind: {type(variant)}")
+
+    def _concrete_reference_storage_structs(
+        self,
+        concrete_type: Type,
+    ) -> tuple[Derective_struct | None, Derective_struct | None]:
+        template = self._structs.get(concrete_type.name)
+        if template is None or not template.generics:
+            return None, None
+        storage_template = reference_storage_struct(template, self._structs)
+        if storage_template is None:
+            return None, None
+        mapping = {
+            generic.name: concrete
+            for generic, concrete in zip(template.generics, concrete_type.generics, strict=False)
+        }
+        return self._materialize_struct(template, mapping), self._materialize_struct(storage_template, mapping)
+
+    def _materialize_struct(self, template: Derective_struct, mapping: dict[str, Type]) -> Derective_struct:
+        return Derective_struct(
+            name=template.name,
+            generics=[],
+            params=[
+                StructField(field.name, self._replace_type(field.type, mapping), attrs=getattr(field, "attrs", ()))
+                for field in template.params
+            ],
+            is_public=template.is_public,
+            attrs=template.attrs,
+        )
+
+    def _replace_type(self, typ: Type, mapping: dict[str, Type]) -> Type:
+        if isinstance(typ, Pointer):
+            return Pointer(self._replace_type(typ.pointee, mapping))
+        if isinstance(typ, Reference):
+            return Reference(self._replace_type(typ.pointee, mapping))
+        if not typ.generics and typ.name in mapping:
+            return deepcopy(mapping[typ.name])
+        if isinstance(typ, PrimitiveType):
+            return deepcopy(typ)
+        return Type(typ.name, [self._replace_type(generic, mapping) for generic in typ.generics])
+
+    def _uses_type(self, ast: list[Derective], needle: Type) -> bool:
+        return any(
+            isinstance(item, Type) and item.name == needle.name and item.generics == needle.generics
+            for item in self._walk(ast)
+        )
+
+    def _is_placeholder_type(self, typ: Type) -> bool:
+        if isinstance(typ, (Pointer, Reference)):
+            return self._is_placeholder_type(typ.pointee)
+        if not typ.generics and (
+            typ.name in {"Self", "T"}
+            or (len(typ.name) == 1 and typ.name.isupper())
+            or (typ.name.startswith("T") and typ.name[1:].isdigit())
+        ):
+            return True
+        return any(self._is_placeholder_type(generic) for generic in typ.generics)
+
+    def _walk(self, value):
+        if value is None or isinstance(value, (str, int, float, bool, Primitive)):
+            return
+        yield value
+        if isinstance(value, dict):
+            for key, item in value.items():
+                yield from self._walk(key)
+                yield from self._walk(item)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                yield from self._walk(item)
+            return
+        if is_dataclass(value):
+            for field in fields(value):
+                yield from self._walk(getattr(value, field.name))
 
     def _variant_payload_type(self, variant: EnumVariant) -> Type | None:
         if isinstance(variant, UnitLikeVariant):

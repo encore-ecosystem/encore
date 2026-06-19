@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <errno.h>
 #include <stdio.h>
@@ -31,25 +32,51 @@
 #endif
 
 typedef struct {
-    char *ptr;
+    size_t ref_count;
     size_t len;
+    char data[];
+} encore_str_object;
+
+typedef struct {
+    encore_str_object *object;
 } encore_str;
 
+static struct {
+    size_t ref_count;
+    size_t len;
+    char data[1];
+} g_empty_str_object = {.ref_count = 0, .len = 0, .data = {0}};
+
+static char *encore_str_data(encore_str value) {
+    if (value.object == NULL) {
+        return g_empty_str_object.data;
+    }
+    return value.object->data;
+}
+
+static size_t encore_str_size(encore_str value) {
+    if (value.object == NULL) {
+        return 0;
+    }
+    return value.object->len;
+}
+
 static encore_str encore_empty_str(void) {
-    static char empty[] = "";
-    return (encore_str){.ptr = empty, .len = 0};
+    return (encore_str){.object = (encore_str_object *)&g_empty_str_object};
 }
 
 static char *encore_to_cstr(encore_str value) {
-    char *buffer = malloc(value.len + 1);
+    size_t len = encore_str_size(value);
+    char *buffer = malloc(len + 1);
     if (buffer == NULL) {
         return NULL;
     }
 
-    if (value.len > 0 && value.ptr != NULL) {
-        memcpy(buffer, value.ptr, value.len);
+    char *data = encore_str_data(value);
+    if (len > 0 && data != NULL) {
+        memcpy(buffer, data, len);
     }
-    buffer[value.len] = '\0';
+    buffer[len] = '\0';
     return buffer;
 }
 
@@ -57,8 +84,19 @@ static encore_str encore_from_owned_buffer(char *buffer, size_t len) {
     if (buffer == NULL) {
         return encore_empty_str();
     }
-    buffer[len] = '\0';
-    return (encore_str){.ptr = buffer, .len = len};
+    encore_str_object *object = malloc(sizeof(encore_str_object) + len + 1);
+    if (object == NULL) {
+        free(buffer);
+        return encore_empty_str();
+    }
+    object->ref_count = 1;
+    object->len = len;
+    if (len > 0) {
+        memcpy(object->data, buffer, len);
+    }
+    object->data[len] = '\0';
+    free(buffer);
+    return (encore_str){.object = object};
 }
 
 static encore_str encore_from_cstr_copy(const char *value) {
@@ -72,7 +110,28 @@ static encore_str encore_from_cstr_copy(const char *value) {
         return encore_empty_str();
     }
     memcpy(buffer, value, len + 1);
-    return (encore_str){.ptr = buffer, .len = len};
+    return encore_from_owned_buffer(buffer, len);
+}
+
+void encore_str_retain(encore_str value) {
+    if (value.object == NULL || value.object->ref_count == 0) {
+        return;
+    }
+    value.object->ref_count += 1;
+}
+
+void encore_str_drop(encore_str value) {
+    if (value.object == NULL || value.object->ref_count == 0) {
+        return;
+    }
+    if (value.object->ref_count == 0) {
+        return;
+    }
+    value.object->ref_count -= 1;
+    if (value.object->ref_count != 0) {
+        return;
+    }
+    free(value.object);
 }
 
 static encore_str encore_format(const char *fmt, ...) {
@@ -151,27 +210,33 @@ bool encore_sleep_ms(uint64_t ms) {
 }
 
 bool encore_str_eq(encore_str lhs, encore_str rhs) {
-    if (lhs.len != rhs.len) {
+    size_t lhs_len = encore_str_size(lhs);
+    size_t rhs_len = encore_str_size(rhs);
+    if (lhs_len != rhs_len) {
         return false;
     }
-    if (lhs.len == 0) {
+    if (lhs_len == 0) {
         return true;
     }
-    if (lhs.ptr == NULL || rhs.ptr == NULL) {
+    char *lhs_data = encore_str_data(lhs);
+    char *rhs_data = encore_str_data(rhs);
+    if (lhs_data == NULL || rhs_data == NULL) {
         return false;
     }
-    return memcmp(lhs.ptr, rhs.ptr, lhs.len) == 0;
+    return memcmp(lhs_data, rhs_data, lhs_len) == 0;
 }
 
 size_t encore_str_len(encore_str value) {
-    return value.len;
+    return encore_str_size(value);
 }
 
 uint8_t encore_str_byte_at(encore_str value, size_t index) {
-    if (value.ptr == NULL || index >= value.len) {
+    size_t len = encore_str_size(value);
+    char *data = encore_str_data(value);
+    if (data == NULL || index >= len) {
         return 0;
     }
-    return (uint8_t)value.ptr[index];
+    return (uint8_t)data[index];
 }
 
 static size_t encore_utf8_char_width(uint8_t lead) {
@@ -191,31 +256,35 @@ static size_t encore_utf8_char_width(uint8_t lead) {
 }
 
 static encore_str encore_str_copy_range(encore_str value, size_t start, size_t slice_len) {
-    if (value.ptr == NULL || start >= value.len) {
+    size_t len = encore_str_size(value);
+    char *data = encore_str_data(value);
+    if (data == NULL || start >= len) {
         return encore_empty_str();
     }
 
-    size_t remaining = value.len - start;
+    size_t remaining = len - start;
     size_t actual_len = slice_len < remaining ? slice_len : remaining;
     char *buffer = malloc(actual_len + 1);
     if (buffer == NULL) {
         return encore_empty_str();
     }
 
-    memcpy(buffer, value.ptr + start, actual_len);
+    memcpy(buffer, data + start, actual_len);
     return encore_from_owned_buffer(buffer, actual_len);
 }
 
 size_t encore_str_char_len(encore_str value) {
-    if (value.ptr == NULL || value.len == 0) {
+    size_t len = encore_str_size(value);
+    char *data = encore_str_data(value);
+    if (data == NULL || len == 0) {
         return 0;
     }
 
     size_t chars = 0;
     size_t i = 0;
-    while (i < value.len) {
-        size_t width = encore_utf8_char_width((uint8_t)value.ptr[i]);
-        if (i + width > value.len) {
+    while (i < len) {
+        size_t width = encore_utf8_char_width((uint8_t)data[i]);
+        if (i + width > len) {
             width = 1;
         }
         i += width;
@@ -225,15 +294,17 @@ size_t encore_str_char_len(encore_str value) {
 }
 
 encore_str encore_str_char_at(encore_str value, size_t index) {
-    if (value.ptr == NULL || value.len == 0) {
+    size_t len = encore_str_size(value);
+    char *data = encore_str_data(value);
+    if (data == NULL || len == 0) {
         return encore_empty_str();
     }
 
     size_t i = 0;
     size_t char_index = 0;
-    while (i < value.len) {
-        size_t width = encore_utf8_char_width((uint8_t)value.ptr[i]);
-        if (i + width > value.len) {
+    while (i < len) {
+        size_t width = encore_utf8_char_width((uint8_t)data[i]);
+        if (i + width > len) {
             width = 1;
         }
         if (char_index == index) {
@@ -246,37 +317,39 @@ encore_str encore_str_char_at(encore_str value, size_t index) {
 }
 
 encore_str encore_str_slice_chars(encore_str value, size_t start, size_t char_len) {
-    if (value.ptr == NULL || value.len == 0 || char_len == 0) {
+    size_t len = encore_str_size(value);
+    char *data = encore_str_data(value);
+    if (data == NULL || len == 0 || char_len == 0) {
         return encore_empty_str();
     }
 
     size_t i = 0;
     size_t char_index = 0;
-    size_t start_byte = value.len;
-    size_t end_byte = value.len;
+    size_t start_byte = len;
+    size_t end_byte = len;
 
-    while (i < value.len) {
+    while (i < len) {
         if (char_index == start) {
             start_byte = i;
             break;
         }
-        size_t width = encore_utf8_char_width((uint8_t)value.ptr[i]);
-        if (i + width > value.len) {
+        size_t width = encore_utf8_char_width((uint8_t)data[i]);
+        if (i + width > len) {
             width = 1;
         }
         i += width;
         char_index += 1;
     }
 
-    if (start_byte == value.len) {
+    if (start_byte == len) {
         return encore_empty_str();
     }
 
     i = start_byte;
     size_t taken = 0;
-    while (i < value.len && taken < char_len) {
-        size_t width = encore_utf8_char_width((uint8_t)value.ptr[i]);
-        if (i + width > value.len) {
+    while (i < len && taken < char_len) {
+        size_t width = encore_utf8_char_width((uint8_t)data[i]);
+        if (i + width > len) {
             width = 1;
         }
         i += width;
@@ -291,17 +364,21 @@ encore_str encore_str_slice(encore_str value, size_t start, size_t slice_len) {
 }
 
 encore_str encore_str_concat(encore_str lhs, encore_str rhs) {
-    size_t total_len = lhs.len + rhs.len;
+    size_t lhs_len = encore_str_size(lhs);
+    size_t rhs_len = encore_str_size(rhs);
+    char *lhs_data = encore_str_data(lhs);
+    char *rhs_data = encore_str_data(rhs);
+    size_t total_len = lhs_len + rhs_len;
     char *buffer = malloc(total_len + 1);
     if (buffer == NULL) {
         return encore_empty_str();
     }
 
-    if (lhs.ptr != NULL && lhs.len > 0) {
-        memcpy(buffer, lhs.ptr, lhs.len);
+    if (lhs_data != NULL && lhs_len > 0) {
+        memcpy(buffer, lhs_data, lhs_len);
     }
-    if (rhs.ptr != NULL && rhs.len > 0) {
-        memcpy(buffer + lhs.len, rhs.ptr, rhs.len);
+    if (rhs_data != NULL && rhs_len > 0) {
+        memcpy(buffer + lhs_len, rhs_data, rhs_len);
     }
 
     return encore_from_owned_buffer(buffer, total_len);
@@ -319,18 +396,78 @@ encore_str encore_fmt_f64(double value) {
     return encore_format("%.17g", value);
 }
 
+encore_str encore_io_read(int32_t fd, size_t max_bytes) {
+    if (fd < 0 || max_bytes == 0 || max_bytes > SIZE_MAX - 1) {
+        return encore_empty_str();
+    }
+
+    char *buffer = malloc(max_bytes + 1);
+    if (buffer == NULL) {
+        return encore_empty_str();
+    }
+
+#ifdef _WIN32
+    size_t request = max_bytes > UINT_MAX ? UINT_MAX : max_bytes;
+    int bytes_read = _read(fd, buffer, (unsigned int)request);
+    if (bytes_read <= 0) {
+        free(buffer);
+        return encore_empty_str();
+    }
+    return encore_from_owned_buffer(buffer, (size_t)bytes_read);
+#else
+    ssize_t bytes_read = read(fd, buffer, max_bytes);
+    if (bytes_read <= 0) {
+        free(buffer);
+        return encore_empty_str();
+    }
+    return encore_from_owned_buffer(buffer, (size_t)bytes_read);
+#endif
+}
+
 int32_t encore_io_write(int32_t fd, encore_str value) {
-    FILE *stream = NULL;
-    if (fd == 1) {
-        stream = stdout;
-    } else if (fd == 2) {
-        stream = stderr;
-    } else {
+    if (fd < 0) {
         return -1;
     }
-    size_t written = fwrite(value.ptr, 1, value.len, stream);
-    fflush(stream);
-    return written == value.len ? 0 : -1;
+    size_t len = encore_str_size(value);
+    char *data = encore_str_data(value);
+    if (len == 0) {
+        return 0;
+    }
+    if (data == NULL) {
+        return -1;
+    }
+
+    size_t offset = 0;
+    while (offset < len) {
+#ifdef _WIN32
+        size_t remaining = len - offset;
+        size_t request = remaining > UINT_MAX ? UINT_MAX : remaining;
+        int written = _write(fd, data + offset, (unsigned int)request);
+        if (written <= 0) {
+            return -1;
+        }
+        offset += (size_t)written;
+#else
+        ssize_t written = write(fd, data + offset, len - offset);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (written == 0) {
+            return -1;
+        }
+        offset += (size_t)written;
+#endif
+    }
+
+    if (fd == 1) {
+        fflush(stdout);
+    } else if (fd == 2) {
+        fflush(stderr);
+    }
+    return 0;
 }
 
 static char g_net_last_error[256] = {0};
@@ -399,15 +536,13 @@ static int encore_close_socket(int fd) {
 }
 #endif
 
-static int32_t encore_parse_port(encore_str port_s) {
-    char *port_c = encore_to_cstr(port_s);
+static int32_t encore_parse_port(const char *port_c) {
     if (port_c == NULL) {
         return -1;
     }
     char *end = NULL;
     long parsed = strtol(port_c, &end, 10);
     bool ok = end != NULL && *end == '\0' && parsed >= 0 && parsed <= 65535;
-    free(port_c);
     if (!ok) {
         return -1;
     }
@@ -433,8 +568,7 @@ int32_t encore_net_tcp_connect(encore_str addr) {
     }
     *colon = '\0';
     const char *host = addr_c;
-    encore_str port_s = {.ptr = colon + 1, .len = strlen(colon + 1)};
-    int32_t port = encore_parse_port(port_s);
+    int32_t port = encore_parse_port(colon + 1);
     if (port < 0) {
         free(addr_c);
         encore_set_net_error_cstr("invalid port");
@@ -507,8 +641,7 @@ int32_t encore_net_tcp_bind(encore_str addr) {
     }
     *colon = '\0';
     const char *host = addr_c;
-    encore_str port_s = {.ptr = colon + 1, .len = strlen(colon + 1)};
-    int32_t port = encore_parse_port(port_s);
+    int32_t port = encore_parse_port(colon + 1);
     if (port < 0) {
         free(addr_c);
         encore_set_net_error_cstr("invalid port");
@@ -618,19 +751,21 @@ encore_str encore_net_tcp_read(int32_t fd, size_t max) {
 }
 
 int32_t encore_net_tcp_write(int32_t fd, encore_str data) {
-    if (data.ptr == NULL && data.len > 0) {
+    size_t len = encore_str_size(data);
+    char *bytes = encore_str_data(data);
+    if (bytes == NULL && len > 0) {
         encore_set_net_error_cstr("invalid data");
         return -1;
     }
 #ifdef _WIN32
-    int n = send((SOCKET)fd, data.ptr, (int)data.len, 0);
+    int n = send((SOCKET)fd, bytes, (int)len, 0);
     if (n < 0) {
         encore_set_net_error_code("send failed", encore_last_socket_error());
         return -1;
     }
     return n;
 #else
-    ssize_t n = send(fd, data.ptr, data.len, 0);
+    ssize_t n = send(fd, bytes, len, 0);
     if (n < 0) {
         encore_set_net_error_code("send failed", errno);
         return -1;
@@ -829,7 +964,7 @@ encore_str encore_os_home_dir(void) {
             }
             memcpy(buffer, drive, drive_len);
             memcpy(buffer + drive_len, path, path_len + 1);
-            return (encore_str){.ptr = buffer, .len = drive_len + path_len};
+            return encore_from_owned_buffer(buffer, drive_len + path_len);
         }
     }
 #else
@@ -887,9 +1022,11 @@ int32_t encore_fs_write_file(encore_str path, encore_str contents) {
         return -1;
     }
 
-    size_t written = fwrite(contents.ptr, 1, contents.len, file);
+    size_t contents_len = encore_str_size(contents);
+    char *contents_data = encore_str_data(contents);
+    size_t written = fwrite(contents_data, 1, contents_len, file);
     fclose(file);
-    return written == contents.len ? 0 : -1;
+    return written == contents_len ? 0 : -1;
 }
 
 int32_t encore_fs_status(encore_str path) {

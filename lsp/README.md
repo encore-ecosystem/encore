@@ -15,6 +15,5 @@ Run from this directory:
 
 ```sh
 encore build
-./target/debug/encore_lsp
+./target/debug/encore-lsp
 ```
-

@@ -40,7 +40,7 @@ from ehir.core.instructions import (
     Instruction_wraps,
 )
 from ehir.core.instructions.base import Assignable
-from ehir.core.type import Type
+from ehir.core.type import Pointer, Type
 from ehir.core.variable import TypedVariable, Variable
 from ehir.errors import EhirCompileError
 from ehir.simplifier.drop_helper import collect_aggregate_names, needs_drop
@@ -53,33 +53,36 @@ SKIPABLE = (
     Instruction_capprim,
     Instruction_cpos,
     Instruction_salloc,
-    Instruction_getfield,
-    Instruction_getfieldptr,
-    Instruction_sgetfield,
-    Instruction_sgetfieldptr,
 )
 
 
 class Deallocator:
     _usages: dict[str, set[str]]
     _captures: dict[str, str]
-    _returned_aliases: set[str]
+    _returned_alias_blocks: dict[str, set[str]]
     _curr_block: str
     _variables: dict[str, Variable]
     _arg_names: set[str]
     _aggregate_names: set[str]
     _dealloc_name_seq: int
+    _fresh_owning_vars: set[str]
+    _owning_stack_slots: dict[str, Type]
+    _stack_slot_defs: dict[str, str]
+    _stack_slot_usages: dict[str, set[str]]
+    _returned_stack_slot_blocks: dict[str, set[str]]
+    _loaded_from_stack_slot: dict[str, str]
+    _explicitly_dropped_stack_slots: dict[str, set[str]]
 
     def run(self, ast: list[Derective]) -> list[Derective]:
         structs = {
             directive.name: directive
             for directive in ast
-            if isinstance(directive, Derective_struct) and not directive.generics
+            if isinstance(directive, Derective_struct)
         }
         enums = {
             directive.name: directive
             for directive in ast
-            if isinstance(directive, Derective_enum) and not directive.generics
+            if isinstance(directive, Derective_enum)
         }
         self._aggregate_names = collect_aggregate_names(structs, enums)
         for derective in ast:
@@ -99,10 +102,17 @@ class Deallocator:
         self._validate_manual_drop(fn)
         self._usages = {}
         self._captures = {}
-        self._returned_aliases = set()
+        self._returned_alias_blocks = {}
         self._variables = {}
         self._arg_names = {param.name for param in fn.params}
         self._dealloc_name_seq = 0
+        self._fresh_owning_vars = set()
+        self._owning_stack_slots = {}
+        self._stack_slot_defs = {}
+        self._stack_slot_usages = {}
+        self._returned_stack_slot_blocks = {}
+        self._loaded_from_stack_slot = {}
+        self._explicitly_dropped_stack_slots = {}
         cfg: dict[str, list[str]] = {}
         predecessors: dict[str, set[str]] = {}
         observed: set[str] = set()
@@ -163,17 +173,22 @@ class Deallocator:
             initialized_in=initialized_in,
         )
 
+        for param in fn.params:
+            if param.type is None or not needs_drop(param.type, self._aggregate_names):
+                continue
+            self._variables[param.name] = TypedVariable(param.name, deepcopy(param.type))
+            self._captures[param.name] = fn.entry_block.name
+            self._usages[param.name] = {fn.entry_block.name}
+
         for block_name in block_order:
             self._collect_variable_usages(name2block[block_name], set(initialized_in[block_name]))
 
         dominators = self._compute_dominators(fn.entry_block.name, observed, predecessors)
+        edge_heads: dict[tuple[str, str], str] = {}
         for var, block in reversed(list(self._captures.items())):
             assert isinstance(fn.exit_block.term, Instruction_ret)
             if fn.exit_block.term.var.name == var:
                 continue
-            if var in self._returned_aliases:
-                continue
-
             var_def = self._variables[var]
             if var_def.type is None:
                 continue
@@ -182,22 +197,40 @@ class Deallocator:
                 cfg=cfg,
                 dominators=dominators,
                 observed=observed,
+                usage_blocks=self._usages.get(var, set()),
+                returned_blocks=self._returned_alias_blocks.get(var, set()),
             )
             placed = False
             for src, dst in sorted(drop_edges):
                 dealloc_block_name = self._next_dealloc_block_name(var)
+                edge_key = (src, dst)
+                current_head = edge_heads.get(edge_key, dst)
                 dealloc_block = TerminatedBlock(
                     name=dealloc_block_name,
                     body=[Instruction_drop(var=TypedVariable(var_def.name, var_def.type))],
-                    term=Instruction_br(label=dst),
+                    term=Instruction_br(label=current_head),
                 )
                 fn.body.append(dealloc_block)
                 name2block[dealloc_block_name] = dealloc_block
-                self._redirect_block_edge(name2block[src], dst, dealloc_block_name)
+                self._redirect_block_edge(name2block[src], current_head, dealloc_block_name)
+                edge_heads[edge_key] = dealloc_block_name
                 placed = True
 
-            if not placed and self._is_dominated(fn.exit_block.name, block, dominators):
+            if (
+                not placed
+                and not self._returned_alias_blocks.get(var)
+                and self._is_dominated(fn.exit_block.name, block, dominators)
+            ):
                 fn.exit_block.body.append(Instruction_drop(var=TypedVariable(var_def.name, var_def.type)))
+
+        self._place_stack_slot_drops(
+            fn=fn,
+            name2block=name2block,
+            cfg=cfg,
+            dominators=dominators,
+            observed=observed,
+            edge_heads=edge_heads,
+        )
 
     def _compute_definitely_initialized(
         self,
@@ -255,14 +288,21 @@ class Deallocator:
 
     def _transfer_initialized(self, block: TerminatedBlock, in_set: set[str]) -> set[str]:
         initialized = set(in_set)
+        fresh_owning_vars: set[str] = set()
         for instr in block.body:
             if isinstance(instr, Instruction_drop):
                 initialized.discard(instr.var.name)
+                fresh_owning_vars.discard(instr.var.name)
                 continue
+            if isinstance(instr, Instruction_store) and instr.var_src.name in fresh_owning_vars:
+                initialized.discard(instr.var_src.name)
+                fresh_owning_vars.discard(instr.var_src.name)
             if not isinstance(instr, Assignable):
                 continue
             if instr.var_out.type is not None and needs_drop(instr.var_out.type, self._aggregate_names):
                 initialized.add(instr.var_out.name)
+                if self._is_fresh_owning_result(instr):
+                    fresh_owning_vars.add(instr.var_out.name)
         return initialized
 
     def _insert_drop_before_reassign(
@@ -282,6 +322,9 @@ class Deallocator:
                     initialized.discard(instr.var.name)
                     new_body.append(instr)
                     continue
+                if isinstance(instr, Instruction_store) and instr.var_src.name in self._fresh_owning_vars:
+                    initialized.discard(instr.var_src.name)
+                    self._fresh_owning_vars.discard(instr.var_src.name)
                 if isinstance(instr, Assignable):
                     current_type = instr.var_out.type if instr.var_out.type is not None else var_types.get(instr.var_out.name)
                     if (
@@ -294,6 +337,8 @@ class Deallocator:
                     if current_type is not None and needs_drop(current_type, self._aggregate_names):
                         initialized.add(instr.var_out.name)
                         var_types[instr.var_out.name] = deepcopy(current_type)
+                        if self._is_fresh_owning_result(instr):
+                            self._fresh_owning_vars.add(instr.var_out.name)
                 new_body.append(instr)
             block.body = new_body
 
@@ -369,15 +414,101 @@ class Deallocator:
         cfg: dict[str, list[str]],
         dominators: dict[str, set[str]],
         observed: set[str],
+        usage_blocks: set[str],
+        returned_blocks: set[str] | None = None,
     ) -> set[tuple[str, str]]:
+        returned_blocks = returned_blocks or set()
+        dominated_region = {
+            block
+            for block in observed
+            if self._is_dominated(block, def_block, dominators)
+        }
+        live_region = self._compute_live_region(
+            cfg=cfg,
+            dominated_region=dominated_region,
+            usage_blocks=usage_blocks,
+        )
         drop_edges: set[tuple[str, str]] = set()
-        for src in observed:
-            if not self._is_dominated(src, def_block, dominators):
+        for src in dominated_region:
+            if src not in live_region:
+                continue
+            if src in returned_blocks:
                 continue
             for dst in cfg.get(src, []):
-                if not self._is_dominated(dst, def_block, dominators):
+                if dst == def_block and src != def_block:
+                    drop_edges.add((src, dst))
+                elif dst not in live_region:
                     drop_edges.add((src, dst))
         return drop_edges
+
+    @staticmethod
+    def _compute_live_region(
+        cfg: dict[str, list[str]],
+        dominated_region: set[str],
+        usage_blocks: set[str],
+    ) -> set[str]:
+        predecessors: dict[str, set[str]] = {block: set() for block in dominated_region}
+        for src, dsts in cfg.items():
+            if src not in dominated_region:
+                continue
+            for dst in dsts:
+                if dst in dominated_region:
+                    predecessors.setdefault(dst, set()).add(src)
+
+        live_region: set[str] = set()
+        worklist: deque[str] = deque(block for block in usage_blocks if block in dominated_region)
+        while worklist:
+            block = worklist.popleft()
+            if block in live_region:
+                continue
+            live_region.add(block)
+            worklist.extend(predecessors.get(block, set()) - live_region)
+        return live_region
+
+    def _place_stack_slot_drops(
+        self,
+        *,
+        fn: Normalized_fn,
+        name2block: dict[str, TerminatedBlock],
+        cfg: dict[str, list[str]],
+        dominators: dict[str, set[str]],
+        observed: set[str],
+        edge_heads: dict[tuple[str, str], str],
+    ) -> None:
+        for slot, def_block in sorted(self._stack_slot_defs.items()):
+            slot_type = self._owning_stack_slots.get(slot)
+            if slot_type is None:
+                continue
+            usage_blocks = self._stack_slot_usages.get(slot, set())
+            if not usage_blocks:
+                continue
+            drop_edges = self._collect_drop_edges(
+                def_block=def_block,
+                cfg=cfg,
+                dominators=dominators,
+                observed=observed,
+                usage_blocks=usage_blocks,
+                returned_blocks=self._returned_stack_slot_blocks.get(slot, set()),
+            )
+            for src, dst in sorted(drop_edges):
+                if src in self._explicitly_dropped_stack_slots.get(slot, set()):
+                    continue
+                edge_key = (src, dst)
+                current_head = edge_heads.get(edge_key, dst)
+                drop_block_name = self._next_dealloc_block_name(f"slot_{slot}")
+                value = TypedVariable(f".drop_slot_{slot}_{self._dealloc_name_seq}", deepcopy(slot_type))
+                drop_block = TerminatedBlock(
+                    name=drop_block_name,
+                    body=[
+                        Instruction_load(var_out=value, var=TypedVariable(slot, Pointer(deepcopy(slot_type)))),
+                        Instruction_drop(var=value),
+                    ],
+                    term=Instruction_br(label=current_head),
+                )
+                fn.body.append(drop_block)
+                name2block[drop_block_name] = drop_block
+                self._redirect_block_edge(name2block[src], current_head, drop_block_name)
+                edge_heads[edge_key] = drop_block_name
 
     def _add_variable_usage(self, var: Variable):
         if cached := self._variables.get(var.name):
@@ -391,6 +522,10 @@ class Deallocator:
         if var.type is not None and needs_drop(var.type, self._aggregate_names):
             self._usages[var.name] = self._usages.get(var.name, set()) | {self._curr_block}
 
+    def _add_stack_slot_usage(self, slot: str) -> None:
+        if slot in self._owning_stack_slots:
+            self._stack_slot_usages.setdefault(slot, set()).add(self._curr_block)
+
     def _add_variable_capture(self, var: Variable):
         if cached := self._variables.get(var.name):
             if cached.type is None and var.type is not None:
@@ -400,17 +535,27 @@ class Deallocator:
         else:
             self._variables[var.name] = var
 
-        if var.name not in self._arg_names and var.type is not None and needs_drop(var.type, self._aggregate_names):
+        if var.type is not None and needs_drop(var.type, self._aggregate_names):
             self._captures[var.name] = self._curr_block
             self._add_variable_usage(var)
 
     def _collect_variable_usages(self, block: TerminatedBlock, initialized: set[str]):
         self._curr_block = block.name
+        fresh_owning_vars: set[str] = set()
         for instr in [*block.body, block.term]:
+            if (
+                isinstance(instr, Instruction_salloc)
+                and isinstance(instr.var_out.type, Pointer)
+                and needs_drop(instr.var_out.type.pointee, self._aggregate_names)
+            ):
+                self._owning_stack_slots[instr.var_out.name] = deepcopy(instr.var_out.type.pointee)
+                self._stack_slot_defs[instr.var_out.name] = self._curr_block
             if isinstance(instr, Assignable):
                 self._add_variable_capture(instr.var_out)
                 if instr.var_out.type is not None and needs_drop(instr.var_out.type, self._aggregate_names):
                     initialized.add(instr.var_out.name)
+                    if self._is_fresh_owning_result(instr):
+                        fresh_owning_vars.add(instr.var_out.name)
 
             if isinstance(instr, SKIPABLE):
                 pass
@@ -432,15 +577,33 @@ class Deallocator:
                 self._add_variable_usage(instr.count)
             elif isinstance(instr, Instruction_store):
                 if instr.var_dst.name == ".exit_var_ptr":
-                    self._returned_aliases.add(instr.var_src.name)
-                self._add_variable_usage(instr.var_src)
+                    self._returned_alias_blocks.setdefault(instr.var_src.name, set()).add(self._curr_block)
+                    if slot := self._loaded_from_stack_slot.get(instr.var_src.name):
+                        self._returned_stack_slot_blocks.setdefault(slot, set()).add(self._curr_block)
+                self._add_stack_slot_usage(instr.var_dst.name)
+                if instr.var_src.name in fresh_owning_vars:
+                    self._captures.pop(instr.var_src.name, None)
+                    initialized.discard(instr.var_src.name)
+                    fresh_owning_vars.discard(instr.var_src.name)
+                else:
+                    self._add_variable_usage(instr.var_src)
                 self._add_variable_usage(instr.var_dst)
             elif isinstance(instr, Instruction_setfield):
                 self._add_variable_usage(instr.var)
                 self._add_variable_usage(instr.value)
             elif isinstance(instr, Instruction_load):
+                self._add_stack_slot_usage(instr.var.name)
+                if instr.var.name in self._owning_stack_slots:
+                    self._loaded_from_stack_slot[instr.var_out.name] = instr.var.name
+                    if instr.var_out.name.startswith(".drop_slot_"):
+                        self._explicitly_dropped_stack_slots.setdefault(instr.var.name, set()).add(self._curr_block)
                 self._add_variable_usage(instr.var)
+            elif isinstance(instr, (Instruction_getfield, Instruction_getfieldptr)):
+                self._add_variable_usage(instr.src)
+            elif isinstance(instr, (Instruction_sgetfield, Instruction_sgetfieldptr)):
+                self._add_variable_usage(instr.src)
             elif isinstance(instr, Instruction_put):
+                self._add_stack_slot_usage(instr.var.name)
                 self._add_variable_usage(instr.var)
             elif isinstance(
                 instr,
@@ -462,6 +625,7 @@ class Deallocator:
                 self._add_variable_usage(instr.var)
                 self._captures.pop(instr.var.name, None)
                 initialized.discard(instr.var.name)
+                fresh_owning_vars.discard(instr.var.name)
             elif isinstance(instr, Instruction_pcast):
                 self._add_variable_usage(instr.var)
             elif isinstance(instr, (Instruction_call, Instruction_callvoid)):
@@ -474,6 +638,23 @@ class Deallocator:
                 self._add_variable_usage(instr.rhs)
             else:
                 raise NotImplementedError(f"Variable usage not define for {instr}")
+
+    def _is_fresh_owning_result(self, instr: Assignable) -> bool:
+        if instr.var_out.type is None or not needs_drop(instr.var_out.type, self._aggregate_names):
+            return False
+        return isinstance(
+            instr,
+            (
+                Instruction_call,
+                Instruction_capstruct,
+                Instruction_cstruct,
+                Instruction_scstruct,
+                Instruction_capenum,
+                Instruction_cenum,
+                Instruction_wraps,
+                Instruction_wraph,
+            ),
+        )
 
     def _validate_manual_drop(self, fn: Normalized_fn) -> None:
         arg_names = {param.name for param in fn.params}

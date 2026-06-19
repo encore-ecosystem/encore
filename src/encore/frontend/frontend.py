@@ -1,17 +1,14 @@
 import tomllib
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from enum import StrEnum, auto
 from pathlib import Path
 from typing import Optional, cast
 
 from ehir.builder import EHIR_Module
-from ehir.cfg import CfgEnvironment, default_cfg_environment, filter_cfg_items
-from ehir.core.derectives import Derective_imp, Derective_import
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 
-from ehir import EHIR_Frontend
 from encore import ENCORE_CACHE_DIR
 from encore.frontend.inference import TypeInferer
 from encore.frontend.lexer import Lexer
@@ -77,6 +74,8 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
     _source_text_cache: dict[Path, str] = field(default_factory=dict)
     _index_cache: dict[Path, ModuleIndex] = field(default_factory=dict)
     _dependency_cache: dict[Path, dict[str, Path]] = field(default_factory=dict)
+    _inferred_modules: set[Path] = field(default_factory=set)
+    _inferring_modules: set[Path] = field(default_factory=set)
     _lexer: Lexer = field(default_factory=lambda: Lexer())
     _parser: Parser = field(default_factory=lambda: Parser())
     _macro_expander: MacroExpander = field(default_factory=lambda: MacroExpander())
@@ -90,9 +89,8 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
         ast = self._get_ast_by_id(id)
         source_text = self._get_source_text_by_id(id)
-        imported_declarations = self._collect_imported_declarations(id, ast)
         try:
-            TypeInferer().infer(ast, cast(list[object], imported_declarations))
+            imported_declarations = self._ensure_type_inferred(id, ast)
         except Exception as exc:
             raise with_diagnostic_context(exc, stage="type-inference", module_id=id, source_text=source_text) from exc
 
@@ -109,11 +107,46 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         self._cache[id] = module
         return module
 
-    def get_parent_id_of(self, id: Path, derective: Derective_import) -> Path:
+    def _ensure_type_inferred(
+        self, id: Path, ast: list[s.Statement] | None = None
+    ) -> list[ImportedTopLevelDeclaration]:
+        module_id = id.resolve()
+        module_ast = self._get_ast_by_id(module_id) if ast is None else ast
+        imported_declarations = self._collect_imported_declarations(module_id, module_ast)
+
+        if module_id in self._inferred_modules:
+            return imported_declarations
+        if module_id in self._inferring_modules:
+            return imported_declarations
+
+        self._inferring_modules.add(module_id)
+        try:
+            dependency_ids = sorted(
+                {
+                    declaration.module_id.resolve()
+                    for declaration in imported_declarations
+                    if declaration.module_id.resolve() != module_id
+                }
+            )
+            for dependency_id in dependency_ids:
+                self._ensure_type_inferred(dependency_id)
+
+            TypeInferer().infer(module_ast, cast(list[object], imported_declarations))
+            self._inferred_modules.add(module_id)
+        finally:
+            self._inferring_modules.discard(module_id)
+
+        return imported_declarations
+
+    def _resolve_import_module_id(self, id: Path, path: tuple[str, ...]) -> Path:
+        if not path:
+            raise RuntimeError(f"Unable to import empty path in {id}")
+
         project_root = self._get_project_root_of(id)
         project_name = self._load_manifest(project_root).project.name
-        prefix_root = derective.prefix[0]
-        suffix = derective.prefix[1:]
+        prefix_root = path[0]
+        suffix = path[1:]
+        import_path = "::".join(path)
 
         match prefix_root:
             case "refrain":
@@ -130,18 +163,18 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                     dep_root = dep_roots.get(prefix_root)
                     if dep_root is None:
                         raise ImportError(
-                            f"Unknown dependency root '{prefix_root}' for import '{derective}' in module '{id}'."
+                            f"Unknown dependency root '{prefix_root}' for import '{import_path}' in module '{id}'."
                         )
                     dep_filepath = dep_root / "src" / ("lib" if not suffix else Path(*suffix))
 
         dep_filepath = self._resolve_module_path(dep_filepath)
         if not dep_filepath.exists():
-            raise RuntimeError(f"Unable to import: {derective} in {id}")
+            raise RuntimeError(f"Unable to import: {import_path} in {id}")
         return dep_filepath
 
-    def _try_get_parent_id_of(self, id: Path, derective: Derective_import) -> Path | None:
+    def _try_resolve_import_module_id(self, id: Path, path: tuple[str, ...]) -> Path | None:
         try:
-            return self.get_parent_id_of(id, derective)
+            return self._resolve_import_module_id(id, path)
         except (RuntimeError, ImportError):
             return None
 
@@ -230,7 +263,11 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                         dst=[
                             s.Statement_Import.ImportPair(
                                 src=prelude_prefix[1],
-                                dst=[s.Statement_Import.ImportPair(src="*", dst=[], kind=s.Statement_Import.ImportKind.GLOB)],
+                                dst=[
+                                    s.Statement_Import.ImportPair(
+                                        src="*", dst=[], kind=s.Statement_Import.ImportKind.GLOB
+                                    )
+                                ],
                             )
                         ],
                     ),
@@ -245,7 +282,11 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                         dst=[
                             s.Statement_Import.ImportPair(
                                 src=cast_prefix[1],
-                                dst=[s.Statement_Import.ImportPair(src="*", dst=[], kind=s.Statement_Import.ImportKind.GLOB)],
+                                dst=[
+                                    s.Statement_Import.ImportPair(
+                                        src="*", dst=[], kind=s.Statement_Import.ImportKind.GLOB
+                                    )
+                                ],
                             )
                         ],
                     ),
@@ -278,15 +319,174 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                 names |= collect_named_types(generic)
             return names
 
+        def find_type_binding(module_id: Path, type_name: str) -> ExportBinding | None:
+            leaf = type_name.rsplit("::", 1)[-1]
+            index = self._get_module_index(module_id)
+            binding = index.exports.get(type_name) or index.exports.get(leaf)
+            if binding is None:
+                return None
+            if binding.kind not in {ExportKind.STRUCT, ExportKind.ENUM, ExportKind.TRAIT}:
+                return None
+            return binding
+
+        def find_type_statement(
+            module_id: Path, type_name: str
+        ) -> s.Statement_StructureDefinition | s.Statement_EnumDefinition | s.Statement_Trait | None:
+            leaf = type_name.rsplit("::", 1)[-1]
+            module_ast = self._get_ast_by_id(module_id)
+            for statement in module_ast:
+                if isinstance(statement, s.Statement_StructureDefinition) and statement.signature.name == leaf:
+                    return statement
+                if isinstance(statement, s.Statement_EnumDefinition) and statement.name == leaf:
+                    return statement
+                if isinstance(statement, s.Statement_Trait) and statement.name == leaf:
+                    return statement
+            return None
+
+        def append_type_definition(module_id: Path, type_name: str) -> None:
+            binding = find_type_binding(module_id, type_name)
+            if binding is not None:
+                binding_module_id = binding.module_id
+                binding_name = binding.name
+                source_name = binding.source_name or binding.name
+                statement = binding.statement
+            else:
+                statement = find_type_statement(module_id, type_name)
+                if statement is None:
+                    return
+                binding_module_id = module_id
+                binding_name = type_name.rsplit("::", 1)[-1]
+                source_name = binding_name
+
+            if not isinstance(
+                statement, (s.Statement_StructureDefinition, s.Statement_EnumDefinition, s.Statement_Trait)
+            ):
+                return
+
+            existing_source = local_sources.get(binding_name)
+            current_source = (binding_module_id, source_name)
+            if existing_source is not None and existing_source != current_source:
+                raise TypeError(
+                    f"Ambiguous import for symbol '{binding_name}': "
+                    f"{existing_source[0]}::{existing_source[1]} vs {current_source[0]}::{current_source[1]}. "
+                    f"Use `as` to disambiguate."
+                )
+            local_sources.setdefault(binding_name, current_source)
+
+            key = (binding_module_id, binding_name)
+            if key in seen:
+                return
+            seen.add(key)
+            declarations.append(
+                ImportedTopLevelDeclaration(
+                    module_id=binding_module_id,
+                    statement=statement,
+                    local_name=binding_name,
+                    source_name=source_name,
+                )
+            )
+            if isinstance(statement, s.Statement_StructureDefinition):
+                for field_param in statement.signature.fields:
+                    for dep_type_name in collect_named_types(field_param.type):
+                        append_type_definition(binding_module_id, dep_type_name)
+            elif isinstance(statement, s.Statement_EnumDefinition):
+                for variant in statement.variants:
+                    if isinstance(variant, s.TupleStructureDefinition):
+                        variant_types = list(variant.fields)
+                    elif isinstance(variant, s.CLikeStructureDefinition):
+                        variant_types = [field_param.type for field_param in variant.fields]
+                    else:
+                        variant_types = []
+                    for variant_type in variant_types:
+                        for dep_type_name in collect_named_types(variant_type):
+                            append_type_definition(binding_module_id, dep_type_name)
+
+        def find_function_statement(
+            module_id: Path, function_name: str
+        ) -> s.Statement_FunctionDefinition | s.FunctionSignature | None:
+            if "::" in function_name:
+                return None
+            module_ast = self._get_ast_by_id(module_id)
+            for statement in module_ast:
+                if isinstance(statement, s.Statement_FunctionDefinition) and statement.signature.name == function_name:
+                    return statement
+                if isinstance(statement, s.FunctionSignature) and statement.name == function_name:
+                    return statement
+            return None
+
+        def append_function_definition(module_id: Path, function_name: str) -> None:
+            statement = find_function_statement(module_id, function_name)
+            if statement is None:
+                return
+
+            key = (module_id, function_name)
+            if key in seen:
+                return
+            seen.add(key)
+            declarations.append(
+                ImportedTopLevelDeclaration(
+                    module_id=module_id,
+                    statement=statement,
+                    local_name=function_name,
+                    source_name=function_name,
+                )
+            )
+            signature = statement.signature if isinstance(statement, s.Statement_FunctionDefinition) else statement
+            if signature.type is not None:
+                for dep_type_name in collect_named_types(signature.type):
+                    append_type_definition(module_id, dep_type_name)
+            for param in signature.params:
+                for dep_type_name in collect_named_types(param.type):
+                    append_type_definition(module_id, dep_type_name)
+
+        def collect_body_call_names(statement: s.Statement_TopLevel) -> set[str]:
+            names: set[str] = set()
+
+            def visit_node(node: object) -> None:
+                if isinstance(node, s.Expression_Call):
+                    names.add(node.name)
+
+                if isinstance(node, (str, int, float, bool, Path, Type)) or node is None:
+                    return
+                if isinstance(node, list | tuple | set):
+                    for item in node:
+                        visit_node(item)
+                    return
+                if isinstance(node, dict):
+                    for item in node.values():
+                        visit_node(item)
+                    return
+                if not is_dataclass(node):
+                    return
+
+                for item in fields(node):
+                    if item.name in {"line", "column", "span_length", "source_line", "module_id"}:
+                        continue
+                    visit_node(getattr(node, item.name))
+
+            visit_node(statement)
+            return names
+
+        def impl_source_key(module_id: Path, impl: s.Statement_Impl) -> tuple[Path, str, str, str, tuple[str, ...]]:
+            return (
+                module_id,
+                "impl",
+                impl.trait_name or "",
+                str(impl.struct),
+                tuple(method.signature.name for method in impl.body),
+            )
+
         def append_associated_type_impls(module_id: Path, type_name: str):
-            marker = (module_id, type_name)
+            source_type_name = type_name.rsplit("::", 1)[-1]
+            marker = (module_id, source_type_name)
             if marker in expanded_type_impls:
                 return
             expanded_type_impls.add(marker)
 
-            assoc_impls = self._collect_associated_impls(module_id, type_name)
-            for idx, assoc_impl in enumerate(assoc_impls):
-                impl_key = (module_id, f"impl-dep::{type_name}::{idx}")
+            append_type_definition(module_id, type_name)
+            assoc_impls = self._collect_associated_impls(module_id, source_type_name)
+            for assoc_impl in assoc_impls:
+                impl_key = impl_source_key(module_id, assoc_impl)
                 if impl_key in seen:
                     continue
                 seen.add(impl_key)
@@ -294,8 +494,8 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                     ImportedTopLevelDeclaration(
                         module_id=module_id,
                         statement=assoc_impl,
-                        local_name=type_name,
-                        source_name=type_name,
+                        local_name=source_type_name,
+                        source_name=source_type_name,
                     )
                 )
 
@@ -332,7 +532,11 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
             if isinstance(binding.statement, (s.Statement_StructureDefinition, s.Statement_EnumDefinition)):
                 lookup_name = binding.source_name or binding.name
-                for idx, assoc_impl in enumerate(self._collect_associated_impls(binding.module_id, lookup_name)):
+                for assoc_impl in self._collect_associated_impls(binding.module_id, lookup_name):
+                    impl_key = impl_source_key(binding.module_id, assoc_impl)
+                    if impl_key in seen:
+                        continue
+                    seen.add(impl_key)
                     if binding.source_name is not None:
                         assoc_impl = replace(assoc_impl, struct=replace(assoc_impl.struct, name=binding.name))
                         assoc_impl = self._rewrite_impl_type_aliases(
@@ -340,10 +544,6 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                             source_name=lookup_name,
                             target_name=binding.name,
                         )
-                    impl_key = (binding.module_id, f"impl::{binding.name}::{idx}")
-                    if impl_key in seen:
-                        continue
-                    seen.add(impl_key)
                     declarations.append(
                         ImportedTopLevelDeclaration(
                             module_id=binding.module_id,
@@ -359,28 +559,15 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                         for param in method.signature.params:
                             for dep_type_name in collect_named_types(param.type):
                                 append_associated_type_impls(binding.module_id, dep_type_name)
-                for idx, assoc_impl in enumerate(self._collect_module_inherent_impls(binding.module_id)):
-                    impl_key = (binding.module_id, f"impl-module::{idx}")
-                    if impl_key in seen:
-                        continue
-                    seen.add(impl_key)
-                    declarations.append(
-                        ImportedTopLevelDeclaration(
-                            module_id=binding.module_id,
-                            statement=assoc_impl,
-                            local_name=assoc_impl.struct.name,
-                            source_name=assoc_impl.struct.name,
-                        )
-                    )
             elif isinstance(binding.statement, s.Statement_Trait):
                 lookup_name = binding.source_name or binding.name
-                for idx, trait_impl in enumerate(self._collect_trait_impls(binding.module_id, lookup_name)):
-                    if binding.source_name is not None:
-                        trait_impl = replace(trait_impl, trait_name=binding.name)
-                    impl_key = (binding.module_id, f"impl-trait::{binding.name}::{idx}")
+                for trait_impl in self._collect_trait_impls(binding.module_id, lookup_name):
+                    impl_key = impl_source_key(binding.module_id, trait_impl)
                     if impl_key in seen:
                         continue
                     seen.add(impl_key)
+                    if binding.source_name is not None:
+                        trait_impl = replace(trait_impl, trait_name=binding.name)
                     declarations.append(
                         ImportedTopLevelDeclaration(
                             module_id=binding.module_id,
@@ -396,8 +583,8 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
             visited_modules.add(module_id)
 
             if module_id != id:
-                for idx, builtin_impl in enumerate(self._collect_builtin_associated_impls(module_id)):
-                    impl_key = (module_id, f"impl-builtin::{builtin_impl.struct.name}::{idx}")
+                for builtin_impl in self._collect_builtin_associated_impls(module_id):
+                    impl_key = impl_source_key(module_id, builtin_impl)
                     if impl_key in seen:
                         continue
                     seen.add(impl_key)
@@ -420,6 +607,12 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                         visit(binding.module_id, self._get_ast_by_id(binding.module_id))
 
         visit(id, ast)
+        processed_dependencies = 0
+        while processed_dependencies < len(declarations):
+            declaration = declarations[processed_dependencies]
+            processed_dependencies += 1
+            for function_name in collect_body_call_names(declaration.statement):
+                append_function_definition(declaration.module_id, function_name)
 
         return declarations
 
@@ -551,14 +744,14 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
 
     def _resolve_import_bindings(self, id: Path, request: ImportRequest) -> list[ExportBinding]:
         if request.kind == "glob":
-            parent_id = self.get_parent_id_of(id, Derective_imp(prefix=list(request.path), symbol="*"))
+            parent_id = self._resolve_import_module_id(id, request.path)
             target_index = self._get_module_index(parent_id)
             return list(target_index.exports.values())
 
-        module_candidate_id = self._try_get_parent_id_of(id, Derective_imp(prefix=list(request.path), symbol="*"))
+        module_candidate_id = self._try_resolve_import_module_id(id, request.path)
         symbol_candidate_binding: ExportBinding | None = None
         if len(request.path) >= 2:
-            parent_id = self._try_get_parent_id_of(id, Derective_imp(prefix=list(request.path[:-1]), symbol="*"))
+            parent_id = self._try_resolve_import_module_id(id, request.path[:-1])
             if parent_id is not None:
                 target_index = self._get_module_index(parent_id)
                 symbol_candidate_binding = target_index.exports.get(request.path[-1])
@@ -606,10 +799,10 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
         return translated_ast
 
     def _is_module_import_path(self, id: Path, path: tuple[str, ...], alias: str | None) -> bool:
-        module_candidate_id = self._try_get_parent_id_of(id, Derective_imp(prefix=list(path), symbol="*"))
+        module_candidate_id = self._try_resolve_import_module_id(id, path)
         symbol_candidate_exists = False
         if len(path) >= 2:
-            parent_id = self._try_get_parent_id_of(id, Derective_imp(prefix=list(path[:-1]), symbol="*"))
+            parent_id = self._try_resolve_import_module_id(id, path[:-1])
             if parent_id is not None:
                 symbol_candidate_exists = self._get_module_index(parent_id).exports.get(path[-1]) is not None
 
@@ -671,7 +864,9 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
     def _rewrite_impl_type_aliases(
         self, impl: s.Statement_Impl, *, source_name: str, target_name: str
     ) -> s.Statement_Impl:
-        rewritten_impl_generics = [self._replace_type_name(generic, source_name, target_name) for generic in impl.generics]
+        rewritten_impl_generics = [
+            self._replace_type_name(generic, source_name, target_name) for generic in impl.generics
+        ]
         rewritten_trait_args = [self._replace_type_name(arg, source_name, target_name) for arg in impl.trait_args]
         rewritten_struct = self._replace_type_name(impl.struct, source_name, target_name)
         rewritten_methods: list[s.Statement_FunctionDefinition] = []
@@ -685,7 +880,9 @@ class EHIR_EncoreFrontend(EHIR_Frontend):
                 if method.signature.type is None
                 else self._replace_type_name(method.signature.type, source_name, target_name)
             )
-            generics = [self._replace_type_name(generic, source_name, target_name) for generic in method.signature.generics]
+            generics = [
+                self._replace_type_name(generic, source_name, target_name) for generic in method.signature.generics
+            ]
             signature = replace(method.signature, generics=generics, params=params, type=ret_type)
             rewritten_methods.append(replace(method, signature=signature))
         return replace(

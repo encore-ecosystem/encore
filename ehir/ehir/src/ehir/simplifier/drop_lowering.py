@@ -1,7 +1,7 @@
 from copy import deepcopy
 
 from ehir.core.block import TerminatedBlock
-from ehir.core.derectives import Derective_enum, Derective_fn, Derective_struct
+from ehir.core.derectives import Derective_enum, Derective_extern_fn, Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import Instruction_call, Instruction_cfree, Instruction_drop
 from ehir.core.instructions.base import Instruction
@@ -16,18 +16,18 @@ class DropLoweringPass:
         structs = {
             directive.name: directive
             for directive in ast
-            if isinstance(directive, Derective_struct) and not directive.generics
+            if isinstance(directive, Derective_struct)
         }
         enums = {
             directive.name: directive
             for directive in ast
-            if isinstance(directive, Derective_enum) and not directive.generics
+            if isinstance(directive, Derective_enum)
         }
         self._aggregate_names = collect_aggregate_names(structs, enums)
         self._drop_functions = {
             directive.name
             for directive in ast
-            if isinstance(directive, (Normalized_fn, Derective_fn))
+            if isinstance(directive, (Normalized_fn, Derective_fn, Derective_extern_fn))
         }
         for directive in ast:
             if isinstance(directive, Normalized_fn):

@@ -9,26 +9,20 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
-from ehir.backend import EHIR_Backend
-from ehir.cfg import CfgEnvironment, cfg_matches, default_cfg_environment
 from ehir.compiler import EHIR_ProjectCompiler
-from ehir.refrain import NativeLibrary
+from ehir_llvm_backend.optimizer import OptimizationProfile
 from git import Repo
 from rich.console import Console, Group
 from rich.live import Live
 from rich.spinner import Spinner
+from rich.table import Table
 from rich.text import Text
 
-from ehir import Refrain
 from encore.frontend import EHIR_EncoreFrontend
 from encore.utils.manifest import NativeSection, ProjectManifest, ProjectTarget
 
-AVAILABLE_OPTPROFILES = {
-    "debug": EHIR_Backend.OptProfile.debug,
-    "release": EHIR_Backend.OptProfile.release,
-    "extreme": EHIR_Backend.OptProfile.extreme,
-}
-AVAILABLE_BACKENDS = ("llvm",)
+AVAILABLE_BACKENDS = {"llvm": [OptimizationProfile.debug, OptimizationProfile.release, OptimizationProfile.extreme]}
+PROFILE_TIMINGS_SENTINEL = "timings"
 SYSTEM_CORE_REF = "sys@core"
 _ACTIVE_BUILD_SCRIPTS: set[Path] = set()
 _BUILD_SCRIPT_METADATA_CACHE: dict[tuple[object, ...], NativeSection] = {}
@@ -103,6 +97,7 @@ class _BuildScriptContext:
     profile: str
     no_cache: bool
     cfg_overrides: tuple[str, ...]
+    profile_timings: bool = False
     workspace_suffix: str | None = None
 
 
@@ -115,11 +110,23 @@ def add_build_parser(subparsers) -> tuple[str, Callable]:
 
 def add_build_options(parser) -> None:
     parser.add_argument("--release", action="store_true", help="Enable release optimizations")
+    parser.add_argument("--backend", default="llvm", choices=set(AVAILABLE_BACKENDS), help="EHIR Compiler Backend")
     parser.add_argument(
-        "--backend", default="llvm", choices=set(AVAILABLE_BACKENDS), help="EHIR Compiler Backend"
+        "--opt-profile",
+        default=None,
+        choices=set(AVAILABLE_OPTPROFILES.keys()),
+        help="Optimization profile. Defaults to debug.",
     )
     parser.add_argument(
-        "--profile", default="debug", choices=set(AVAILABLE_OPTPROFILES.keys()), help="Optimization profile"
+        "--profile",
+        nargs="?",
+        const=PROFILE_TIMINGS_SENTINEL,
+        default=None,
+        choices={*AVAILABLE_OPTPROFILES.keys(), PROFILE_TIMINGS_SENTINEL},
+        help=(
+            "Enable compiler timing profile when passed without a value. "
+            "For compatibility, --profile debug|release|extreme still selects the optimization profile."
+        ),
     )
     parser.add_argument("--no-cache", action="store_true", help="Ignore existing EHIR cache for this build")
     parser.add_argument(
@@ -140,11 +147,23 @@ def handle_build(args: Namespace):
         no_cache=args.no_cache,
         cfg_overrides=args.cfg,
         show_status=True,
+        profile_timings=profile_timings_enabled(args),
     )
 
 
 def resolve_build_profile(args: Namespace) -> str:
-    return "release" if getattr(args, "release", False) else args.profile
+    if getattr(args, "release", False):
+        return "release"
+    if getattr(args, "opt_profile", None) is not None:
+        return args.opt_profile
+    legacy_profile = getattr(args, "profile", None)
+    if legacy_profile in AVAILABLE_OPTPROFILES:
+        return legacy_profile
+    return "debug"
+
+
+def profile_timings_enabled(args: Namespace) -> bool:
+    return getattr(args, "profile", None) == PROFILE_TIMINGS_SENTINEL
 
 
 def create_compiler(
@@ -156,6 +175,7 @@ def create_compiler(
     cfg_overrides: list[str] | None = None,
     target_dir: Path | None = None,
     cache_dir: Path | None = None,
+    profile_timings: bool = False,
 ) -> EHIR_ProjectCompiler:
     backend_cls = _resolve_backend(backend)
     cfg_environment = default_cfg_environment(backend=backend, extra=cfg_overrides or [])
@@ -165,8 +185,41 @@ def create_compiler(
         cache_dir=cache_dir,
         use_cache=not no_cache,
         cfg_environment=cfg_environment,
+        profile_timings=profile_timings,
     )
     return compiler
+
+
+def print_profile_report(compiler: EHIR_ProjectCompiler) -> None:
+    records = compiler.profile_records
+    if not records:
+        return
+
+    console = Console(highlight=False)
+    stage_totals: dict[str, float] = {}
+    for record in records:
+        stage_totals[record.stage] = stage_totals.get(record.stage, 0.0) + record.seconds
+
+    total = sum(record.seconds for record in records)
+    console.print(f"\n[bold]Compiler profile[/bold] total measured: {total:.3f}s")
+
+    stage_table = Table(title="Stage totals")
+    stage_table.add_column("stage")
+    stage_table.add_column("time", justify="right")
+    stage_table.add_column("%", justify="right")
+    for stage, seconds in sorted(stage_totals.items(), key=lambda item: item[1], reverse=True):
+        percent = (seconds / total * 100.0) if total > 0 else 0.0
+        stage_table.add_row(stage, f"{seconds:.3f}s", f"{percent:.1f}%")
+    console.print(stage_table)
+
+    slowest_table = Table(title="Slowest stage invocations")
+    slowest_table.add_column("refrain")
+    slowest_table.add_column("stage")
+    slowest_table.add_column("time", justify="right")
+    slowest_table.add_column("detail", overflow="fold")
+    for record in sorted(records, key=lambda item: item.seconds, reverse=True)[:20]:
+        slowest_table.add_row(record.refrain, record.stage, f"{record.seconds:.3f}s", record.detail)
+    console.print(slowest_table)
 
 
 def _resolve_backend(name: str):
@@ -384,8 +437,7 @@ def _native_libraries_from_native_section(
                 link_name=entry.link_name,
                 path=_resolve_native_path(project_path, entry.path) if entry.path is not None else None,
                 search_paths=tuple(
-                    _resolve_native_path(project_path, path)
-                    for path in [*native.search_paths, *entry.search_paths]
+                    _resolve_native_path(project_path, path) for path in [*native.search_paths, *entry.search_paths]
                 ),
                 frameworks=tuple([*native.frameworks, *entry.frameworks]),
                 link_args=tuple([*native.link_args, *entry.link_args]),
@@ -582,6 +634,7 @@ def _run_build_script(
             build_ctx.profile,
             no_cache=build_ctx.no_cache,
             cfg_overrides=list(build_ctx.cfg_overrides),
+            profile_timings=build_ctx.profile_timings,
         )
         _inject_mandatory_core_dependency(script_compiler, script_dir, build_ctx)
         script_ref = _load_refrain(
@@ -747,14 +800,23 @@ def build_project(
     no_cache: bool = False,
     cfg_overrides: list[str] | None = None,
     show_status: bool = False,
+    profile_timings: bool = False,
 ) -> list[tuple[str, Path]]:
     build_ctx = _BuildScriptContext(
         backend=backend,
         profile=profile,
         no_cache=no_cache,
         cfg_overrides=tuple(cfg_overrides or []),
+        profile_timings=profile_timings,
     )
-    compiler = create_compiler(cwd, backend, profile, no_cache=no_cache, cfg_overrides=cfg_overrides)
+    compiler = create_compiler(
+        cwd,
+        backend,
+        profile,
+        no_cache=no_cache,
+        cfg_overrides=cfg_overrides,
+        profile_timings=profile_timings,
+    )
     _inject_mandatory_core_dependency(compiler, cwd, build_ctx)
     entry_ref = _load_refrain(compiler, cwd, type=resolve_project_target_type(cwd), build_ctx=build_ctx)
     if show_status:
@@ -763,6 +825,8 @@ def build_project(
     else:
         outputs = compiler.compile_all()
     outputs_by_name = dict(outputs)
+    if profile_timings:
+        print_profile_report(compiler)
     return [(entry_ref.name, outputs_by_name[entry_ref.name]), *[(n, p) for n, p in outputs if n != entry_ref.name]]
 
 

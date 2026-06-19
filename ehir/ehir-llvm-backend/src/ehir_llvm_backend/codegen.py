@@ -141,6 +141,9 @@ class Codegen:
 
         enabled: set[str] = set()
         queue = list(roots)
+        for fn in funcs:
+            if self._is_memory_management_function(fn.name):
+                queue.append(fn.name)
         while queue:
             name = queue.pop()
             if name in enabled:
@@ -187,6 +190,14 @@ class Codegen:
             if fn is not None:
                 out.add(fn.name)
         return out
+
+    def _is_memory_management_function(self, name: str) -> bool:
+        return (
+            name.startswith("__retain_")
+            or name.startswith("__drop_")
+            or name.startswith("__cfree")
+            or name in {"encore_str_retain", "encore_str_drop"}
+        )
 
     def _emit_like_symbol_name(self, name: str) -> str:
         if name == "main":
@@ -287,6 +298,10 @@ class Codegen:
             ir_blocks.append(ir_block)
             self._blocks[block.name] = ir_block
 
+        if ir_blocks:
+            self.builder.position_at_end(ir_blocks[0])
+            self._predeclare_stack_allocas(fn.get_body())
+
         for block, ir_block in zip(fn.get_body(), ir_blocks, strict=True):
             self.builder.position_at_end(ir_block)
             self._build_block(block)
@@ -313,6 +328,18 @@ class Codegen:
                     predecessors.setdefault(case_label, set()).add(block.name)
 
         return predecessors
+
+    def _predeclare_stack_allocas(self, blocks: Sequence[ProcessedBlock]) -> None:
+        for block in blocks:
+            for instr in block.body:
+                if not isinstance(instr, ProcessedInstruction_salloc):
+                    continue
+                if instr.var_out.name in self._variables:
+                    continue
+                target_type = self._build_type(instr.type)
+                if isinstance(target_type, ir.VoidType):
+                    continue
+                self._variables[instr.var_out.name] = self.builder.alloca(target_type, name=instr.var_out.name)
 
     def _build_block(self, block: ProcessedBlock):
         for instr in block.body:
@@ -718,7 +745,11 @@ class Codegen:
 
     def _build_salloc(self, instr: ProcessedInstruction_salloc):
         self._comment_instruction(instr)
+        if instr.var_out.name in self._variables:
+            return self._variables[instr.var_out.name]
         target_type = self._build_type(instr.type)
+        if isinstance(target_type, ir.VoidType):
+            return None
         entry_builder = self._entry_alloca_builder()
         ptr = entry_builder.alloca(target_type, name=instr.var_out.name)
         self._variables[instr.var_out.name] = ptr
@@ -1083,7 +1114,7 @@ class Codegen:
         method_names = self._dyn_trait_methods(trait_name)
         if method_name not in method_names:
             raise ValueError(f"No dyn dispatch slot for {trait_name}::{method_name}")
-        slot_index = method_names.index(method_name)
+        slot_index = 2 + method_names.index(method_name)
 
         callee = self._resolve_dyn_callee_from_vtable(
             trait_name=trait_name,
@@ -1142,7 +1173,7 @@ class Codegen:
         methods = self._dyn_trait_methods(trait_name)
         vtable_struct = self.module.context.get_identified_type(vtable_name)
         if vtable_struct.is_opaque:
-            vtable_struct.set_body(*([ir.IntType(8).as_pointer()] * len(methods)))
+            vtable_struct.set_body(*([ir.IntType(8).as_pointer()] * (2 + len(methods))))
         return vtable_struct, methods
 
     def _get_dyn_vtable_ptr(self, trait_name: str, concrete_type: Type):
@@ -1152,7 +1183,12 @@ class Codegen:
         if isinstance(existing, ir.GlobalVariable):
             return self.builder.bitcast(existing, ir.IntType(8).as_pointer(), name=f"{global_name}.ptr")
 
-        values: list[ir.Constant] = []
+        retain_thunk = self._get_dyn_retain_thunk(trait_name, concrete_type)
+        drop_thunk = self._get_dyn_drop_thunk(trait_name, concrete_type)
+        values: list[ir.Constant] = [
+            ir.Constant.bitcast(retain_thunk, ir.IntType(8).as_pointer()),
+            ir.Constant.bitcast(drop_thunk, ir.IntType(8).as_pointer()),
+        ]
         for method_name in methods:
             fn = self._find_dyn_impl_function(trait_name, method_name, concrete_type)
             if fn is None:
@@ -1189,6 +1225,75 @@ class Codegen:
         else:
             builder.ret(result)
         return thunk
+
+    def _get_dyn_retain_thunk(self, trait_name: str, concrete_type: Type) -> ir.Function:
+        thunk_name = f"__dyn_retain_{trait_name.replace('::', '_')}__{mangle_type_name(concrete_type)}"
+        existing = self.module.globals.get(thunk_name)
+        if isinstance(existing, ir.Function):
+            return existing
+
+        i8ptr = ir.IntType(8).as_pointer()
+        thunk_type = ir.FunctionType(ir.VoidType(), [i8ptr])
+        thunk = ir.Function(self.module, thunk_type, name=thunk_name)
+        thunk.linkage = "internal"
+
+        block = thunk.append_basic_block("entry")
+        builder = ir.IRBuilder(block)
+        ref_count_ptr = self._dyn_ref_count_ptr(builder, thunk.args[0], "self")
+        ref_count = builder.load(ref_count_ptr, name="ref_count")
+        one = ir.Constant(ref_count.type, 1)
+        next_ref_count = builder.add(ref_count, one, name="next_ref_count")
+        builder.store(next_ref_count, ref_count_ptr)
+        builder.ret_void()
+        return thunk
+
+    def _get_dyn_drop_thunk(self, trait_name: str, concrete_type: Type) -> ir.Function:
+        thunk_name = f"__dyn_drop_{trait_name.replace('::', '_')}__{mangle_type_name(concrete_type)}"
+        existing = self.module.globals.get(thunk_name)
+        if isinstance(existing, ir.Function):
+            return existing
+
+        i8ptr = ir.IntType(8).as_pointer()
+        thunk_type = ir.FunctionType(ir.VoidType(), [i8ptr])
+        thunk = ir.Function(self.module, thunk_type, name=thunk_name)
+        thunk.linkage = "internal"
+
+        block = thunk.append_basic_block("entry")
+        builder = ir.IRBuilder(block)
+        ref_count_ptr = self._dyn_ref_count_ptr(builder, thunk.args[0], "self")
+        ref_count = builder.load(ref_count_ptr, name="ref_count")
+        one = ir.Constant(ref_count.type, 1)
+        should_free = builder.icmp_unsigned("<=", ref_count, one, name="should_free")
+
+        free_block = thunk.append_basic_block("free")
+        retain_block = thunk.append_basic_block("retain")
+        builder.cbranch(should_free, free_block, retain_block)
+
+        builder.position_at_end(retain_block)
+        next_ref_count = builder.sub(ref_count, one, name="next_ref_count")
+        builder.store(next_ref_count, ref_count_ptr)
+        builder.ret_void()
+
+        builder.position_at_end(free_block)
+        typed_ptr = builder.bitcast(thunk.args[0], ir.PointerType(self._build_type(concrete_type)), name="self.ptr")
+        value = builder.load(typed_ptr, name="self")
+        drop_fn = self._find_function_by_canonical(f"__drop_{mangle_type_name(concrete_type)}")
+        if drop_fn is not None:
+            builder.call(drop_fn, [value])
+        owner_ptr = self._dyn_owner_ptr(builder, thunk.args[0], "self")
+        builder.call(self._get_free_function(), [owner_ptr])
+        builder.ret_void()
+        return thunk
+
+    def _find_function_by_canonical(self, canonical_name: str) -> ir.Function | None:
+        emitted_name = self._symbol_by_canonical.get(canonical_name, canonical_name)
+        value = self.module.globals.get(emitted_name)
+        if isinstance(value, ir.Function):
+            return value
+        value = self.module.globals.get(canonical_name)
+        if isinstance(value, ir.Function):
+            return value
+        return None
 
     def _resolve_dyn_callee_from_vtable(
         self,
@@ -1246,11 +1351,39 @@ class Codegen:
 
     def _pack_dyn_payload(self, value, source_type: Type):
         malloc_func = self._get_malloc_function()
-        byte_size = self._sizeof(source_type)
-        raw_ptr = self.builder.call(malloc_func, [byte_size], name=".dyn_payload_raw")
+        payload_size = self._sizeof(source_type)
+        ref_size = ir.Constant(payload_size.type, self._get_pointer_width_bits() // 8)
+        byte_size = self.builder.add(payload_size, ref_size, name=".dyn_alloc_size")
+        owner_ptr = self.builder.call(malloc_func, [byte_size], name=".dyn_payload_owner")
+        ref_count_ptr = self.builder.bitcast(
+            owner_ptr,
+            ir.PointerType(ir.IntType(self._get_pointer_width_bits())),
+            name=".dyn_ref_count_ptr",
+        )
+        self.builder.store(ir.Constant(ir.IntType(self._get_pointer_width_bits()), 1), ref_count_ptr)
+        raw_ptr = self.builder.gep(
+            owner_ptr,
+            [ir.Constant(ir.IntType(self._get_pointer_width_bits()), self._get_pointer_width_bits() // 8)],
+            name=".dyn_payload_raw",
+        )
         typed_ptr = self.builder.bitcast(raw_ptr, ir.PointerType(value.type), name=".dyn_payload_typed")
         self.builder.store(value, typed_ptr)
+        retain_fn = self._find_function_by_canonical(f"__retain_{mangle_type_name(source_type)}")
+        if retain_fn is not None:
+            self.builder.call(retain_fn, [value])
         return raw_ptr
+
+    def _dyn_owner_ptr(self, builder: ir.IRBuilder, data_ptr, name: str):
+        offset = ir.Constant(ir.IntType(self._get_pointer_width_bits()), -(self._get_pointer_width_bits() // 8))
+        return builder.gep(data_ptr, [offset], name=f"{name}.owner")
+
+    def _dyn_ref_count_ptr(self, builder: ir.IRBuilder, data_ptr, name: str):
+        owner_ptr = self._dyn_owner_ptr(builder, data_ptr, name)
+        return builder.bitcast(
+            owner_ptr,
+            ir.PointerType(ir.IntType(self._get_pointer_width_bits())),
+            name=f"{name}.ref_count_ptr",
+        )
 
     def _dyn_struct_name(self, trait_name: str) -> str:
         return f"__dyn_{trait_name.replace('::', '_')}"
@@ -1675,8 +1808,12 @@ class Codegen:
 
     def _build_ret(self, instr: ProcessedInstruction_ret):
         self._comment_instruction(instr)
-        value = self._get_typed_value(instr.var)
         expected_ret_type = self.builder.function.function_type.return_type
+        if isinstance(expected_ret_type, ir.VoidType):
+            self.builder.ret_void()
+            return
+
+        value = self._get_typed_value(instr.var)
         if value.type != expected_ret_type:
             if (
                 isinstance(value.type, ir.BaseStructType)
@@ -1721,6 +1858,9 @@ class Codegen:
                 phi.add_incoming(value=value, block=self._blocks[pred_name])
 
     def _build_type(self, type: Type) -> ir.Type:
+        if type.name == "void":
+            return ir.VoidType()
+
         if isinstance(type, (HeapSmartPointer, StackSmartPointer)):
             wrapper_name = type.get_name()
             if wrapper_name not in self._structs:
@@ -1944,18 +2084,30 @@ class Codegen:
             encoded = bytearray(prim.val.encode("utf-8"))
             encoded.append(0)
             array_type = ir.ArrayType(ir.IntType(8), len(encoded))
+            literal_type = ir.LiteralStructType(
+                [
+                    ir.IntType(self._get_pointer_width_bits()),
+                    ir.IntType(self._get_pointer_width_bits()),
+                    array_type,
+                ]
+            )
             literal_name = f".str.{self._string_literal_counter}"
             self._string_literal_counter += 1
 
-            global_var = ir.GlobalVariable(self.module, array_type, name=literal_name)
+            global_var = ir.GlobalVariable(self.module, literal_type, name=literal_name)
             global_var.global_constant = True
             global_var.linkage = "internal"
-            global_var.initializer = ir.Constant(array_type, encoded)
+            global_var.initializer = ir.Constant(
+                literal_type,
+                [
+                    ir.Constant(ir.IntType(self._get_pointer_width_bits()), 0),
+                    ir.Constant(ir.IntType(self._get_pointer_width_bits()), len(encoded) - 1),
+                    ir.Constant(array_type, encoded),
+                ],
+            )
 
-            zero = ir.Constant(ir.IntType(32), 0)
-            ptr = global_var.gep((zero, zero))
-            strlen = ir.Constant(ir.IntType(self._get_pointer_width_bits()), len(encoded) - 1)
-            return ir.Constant(self._get_str_type(), [ptr, strlen])
+            ptr = ir.Constant.bitcast(global_var, ir.IntType(8).as_pointer())
+            return ir.Constant(self._get_str_type(), [ptr])
         raise NotImplementedError(f"Unsupported primitive: {prim}")
 
     def _get_str_type(self) -> ir.IdentifiedStructType:
@@ -1964,7 +2116,7 @@ class Codegen:
 
         str_type = self.module.context.get_identified_type("str")
         if str_type.is_opaque:
-            str_type.set_body(ir.IntType(8).as_pointer(), ir.IntType(self._get_pointer_width_bits()))
+            str_type.set_body(ir.IntType(8).as_pointer())
         self._str_type = str_type
         return str_type
 
@@ -2049,8 +2201,41 @@ class Codegen:
         return fn
 
     def _emit_builtin_native_helpers(self) -> None:
-        self._emit_builtin_str_concat()
-        self._emit_builtin_io_write()
+        self._emit_dyn_memory_helpers()
+
+    def _emit_dyn_memory_helpers(self) -> None:
+        for fn in list(self.module.functions):
+            canonical = self._canonical_by_symbol.get(fn.name, fn.name)
+            if canonical.startswith("__retain_dyn_"):
+                self._emit_dyn_memory_helper(fn, slot_index=0)
+            elif canonical.startswith("__drop_dyn_"):
+                self._emit_dyn_memory_helper(fn, slot_index=1)
+
+    def _emit_dyn_memory_helper(self, fn: ir.Function, *, slot_index: int) -> None:
+        if len(fn.blocks) > 0:
+            return
+        if len(fn.function_type.args) != 1:
+            raise TypeError(f"{fn.name} has incompatible dyn memory helper signature")
+
+        block = fn.append_basic_block("entry")
+        builder = ir.IRBuilder(block)
+        dyn_value = fn.args[0]
+        data_ptr = builder.extract_value(dyn_value, 0, name="data")
+        vtable_ptr = builder.extract_value(dyn_value, 1, name="vtable")
+
+        i8ptr = ir.IntType(8).as_pointer()
+        slot_ptr_type = ir.PointerType(i8ptr)
+        slots = builder.bitcast(vtable_ptr, slot_ptr_type, name="slots")
+        slot_ptr = builder.gep(
+            slots,
+            [ir.Constant(ir.IntType(self._get_pointer_width_bits()), slot_index)],
+            name="slot.ptr",
+        )
+        fn_raw = builder.load(slot_ptr, name="slot")
+        helper_type = ir.FunctionType(ir.VoidType(), [i8ptr])
+        helper_ptr = builder.bitcast(fn_raw, ir.PointerType(helper_type), name="helper")
+        builder.call(helper_ptr, [data_ptr])
+        builder.ret_void()
 
     def _native_declaration(self, name: str) -> ir.Function | None:
         value = self.module.globals.get(name)
@@ -2084,7 +2269,9 @@ class Codegen:
         rhs_len = builder.extract_value(rhs, 1, name="rhs_len")
         total_len = builder.add(lhs_len, rhs_len, name="total_len")
 
-        malloc_size = self._coerce_int_width(builder, total_len, 64, "malloc_size")
+        one_len = ir.Constant(total_len.type, 1)
+        malloc_len = builder.add(total_len, one_len, name="malloc_len")
+        malloc_size = self._coerce_int_width(builder, malloc_len, 64, "malloc_size")
         out_ptr = builder.call(self._get_malloc_function(), [malloc_size], name="out_ptr")
         memcpy = self._get_memcpy_function()
         copy_len_type = memcpy.function_type.args[2]
@@ -2095,10 +2282,18 @@ class Codegen:
 
         builder.call(memcpy, [out_ptr, lhs_ptr, lhs_copy_len])
         builder.call(memcpy, [rhs_dst, rhs_ptr, rhs_copy_len])
+        nul_ptr = builder.gep(out_ptr, [self._coerce_int_width(builder, total_len, self._get_pointer_width_bits(), "nul_offset")], name="nul_ptr")
+        builder.store(ir.Constant(ir.IntType(8), 0), nul_ptr)
+
+        owner_size = ir.Constant(ir.IntType(64), max(8, self._get_pointer_width_bits() // 8))
+        owner_raw = builder.call(self._get_malloc_function(), [owner_size], name="owner_raw")
+        owner_usize_ptr = builder.bitcast(owner_raw, ir.PointerType(ir.IntType(self._get_pointer_width_bits())), name="owner_ref_ptr")
+        builder.store(ir.Constant(ir.IntType(self._get_pointer_width_bits()), 1), owner_usize_ptr)
 
         out = ir.Constant(str_type, ir.Undefined)
         out = builder.insert_value(out, out_ptr, 0, name="out_with_ptr")
-        out = builder.insert_value(out, total_len, 1, name="out")
+        out = builder.insert_value(out, total_len, 1, name="out_with_len")
+        out = builder.insert_value(out, owner_raw, 2, name="out")
         builder.ret(out)
 
     def _emit_builtin_io_write(self) -> None:
