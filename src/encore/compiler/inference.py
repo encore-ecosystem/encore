@@ -4,9 +4,9 @@ from typing import Optional
 from ehir.core.instructions.base import Assignable
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 
-from encore.frontend.parser import statements as s
-from encore.frontend.parser.statements import Block, FunctionSignature
-from encore.frontend.types import (
+from encore.compiler.parser import statements as s
+from encore.compiler.parser.statements import Block, FunctionSignature
+from encore.compiler.types import (
     AnySmartPointer,
     array_size,
     is_array_type,
@@ -148,7 +148,9 @@ class TypeInferer:
                 struct_name = statement.struct.name
                 if statement.trait_name is not None:
                     self._trait_impl_records.append(statement)
-                    owner_generic = next((generic for generic in statement.generics if generic.name == struct_name), None)
+                    owner_generic = next(
+                        (generic for generic in statement.generics if generic.name == struct_name), None
+                    )
                     if owner_generic is not None:
                         bounds = list(owner_generic.bounds) if isinstance(owner_generic, s.GenericParam) else []
                         self._generic_impl_traits.append((bounds, statement.trait_name))
@@ -287,7 +289,9 @@ class TypeInferer:
                 elif isinstance(statement, s.Statement_Loop):
                     self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
                 elif isinstance(statement, s.Statement_For):
-                    iter_expr = s.Expression_MethodCall(receiver=statement.iterable, method="iter", generics=[], args=[])
+                    iter_expr = s.Expression_MethodCall(
+                        receiver=statement.iterable, method="iter", generics=[], args=[]
+                    )
                     iter_type = self._infer_expression(iter_expr, env, mutable_env=mutability_env)
                     if iter_type is None:
                         raise TypeError("Unable to infer iterator type in for-loop")
@@ -327,7 +331,9 @@ class TypeInferer:
                     if resource_type is None:
                         raise TypeError("Unable to infer resource type in with-statement")
                     base_resource_type = unwrap_for_storage(resource_type)
-                    base_resource_type = base_resource_type.pointee if is_reference_like_type(base_resource_type) else base_resource_type
+                    base_resource_type = (
+                        base_resource_type.pointee if is_reference_like_type(base_resource_type) else base_resource_type
+                    )
                     trait_names = list(self._impl_traits.get(base_resource_type.name, []))
                     resource_leaf = base_resource_type.name.rsplit("::", 1)[-1]
                     for owner_name, owner_traits in self._impl_traits.items():
@@ -337,7 +343,9 @@ class TypeInferer:
                             for owner_trait in owner_traits:
                                 if owner_trait not in trait_names:
                                     trait_names.append(owner_trait)
-                    has_context_manager = any(trait_name.rsplit("::", 1)[-1] == "ContextManager" for trait_name in trait_names)
+                    has_context_manager = any(
+                        trait_name.rsplit("::", 1)[-1] == "ContextManager" for trait_name in trait_names
+                    )
                     if not has_context_manager:
                         raise TypeError(
                             f"with-statement requires `{base_resource_type.name}` to implement ContextManager"
@@ -774,7 +782,9 @@ class TypeInferer:
         for param, arg in zip(signature.params, args):
             expected_param_type = self._specialize_type(param.type, generic_mapping)
             arg_expected_type = (
-                None if self._contains_unresolved_generic(param.type, generic_mapping, generic_names) else expected_param_type
+                None
+                if self._contains_unresolved_generic(param.type, generic_mapping, generic_names)
+                else expected_param_type
             )
             arg_type = self._infer_expression(arg, env, arg_expected_type, mutable_env)
             # print(param, arg, expected_param_type, arg_type)
@@ -784,7 +794,11 @@ class TypeInferer:
                     and is_mutable_type(expected_param_type)
                     and not is_mutable_type(arg_type)
                 ):
-                    if isinstance(arg, s.Expression_Path) and len(arg.segments) == 1 and not mutable_env.get(arg.name, False):
+                    if (
+                        isinstance(arg, s.Expression_Path)
+                        and len(arg.segments) == 1
+                        and not mutable_env.get(arg.name, False)
+                    ):
                         raise TypeError(
                             f"Cannot pass immutable binding '{arg.name}' as mutable argument "
                             f"for '{callable_name}' param '{param.name}'"
@@ -1333,7 +1347,6 @@ class TypeInferer:
 
         return None
 
-
     def _infer_enum_call(
         self,
         expr: s.Expression_Call,
@@ -1515,11 +1528,11 @@ class TypeInferer:
             return self._contains_unresolved_generic(pattern.pointee, generic_mapping, generic_names)
         if not pattern.generics and pattern.name in generic_names and pattern.name not in generic_mapping:
             return True
-        return any(self._contains_unresolved_generic(generic, generic_mapping, generic_names) for generic in pattern.generics)
+        return any(
+            self._contains_unresolved_generic(generic, generic_mapping, generic_names) for generic in pattern.generics
+        )
 
-    def _resolve_match_arm_payload_type(
-        self, scrutinee_type: Optional[Type], arm: MatchArmLike
-    ) -> Optional[Type]:
+    def _resolve_match_arm_payload_type(self, scrutinee_type: Optional[Type], arm: MatchArmLike) -> Optional[Type]:
         if scrutinee_type is None:
             return None
         if not self._is_match_enum_type(scrutinee_type):
@@ -1631,7 +1644,9 @@ class TypeInferer:
                     if not self._types_compatible(statement.type, inferred) and not self._types_match_ignoring_mut(
                         statement.type, inferred
                     ):
-                        raise TypeError(f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}")
+                        raise TypeError(
+                            f"Type mismatch in let binding '{statement.name}': {statement.type} != {inferred}"
+                        )
                     statement.type = self._concretize_type(statement.type, inferred)
                 self._assert_raw_pointer_usage_allowed(statement.type, context=f"binding '{statement.name}'")
                 env[statement.name] = statement.type
@@ -1670,7 +1685,9 @@ class TypeInferer:
             if isinstance(statement, s.Statement_Match):
                 scrutinee_type = self._infer_match_scrutinee(statement, env, mutability_env)
                 for arm in statement.arms:
-                    arm_env, arm_mutability_env = self._prepare_match_arm_scope(scrutinee_type, arm, env, mutability_env)
+                    arm_env, arm_mutability_env = self._prepare_match_arm_scope(
+                        scrutinee_type, arm, env, mutability_env
+                    )
                     self._infer_match_nested_body(self._get_match_arm_body(arm), arm_env, arm_mutability_env)
                 return
 

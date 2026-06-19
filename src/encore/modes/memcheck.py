@@ -4,14 +4,9 @@ from argparse import REMAINDER, Namespace
 from pathlib import Path
 from typing import Callable
 
-from ehir import Refrain
-
 from encore.modes.build import (
     add_build_options,
     build_project,
-    profile_timings_enabled,
-    resolve_build_profile,
-    resolve_project_target_type,
 )
 
 
@@ -52,8 +47,7 @@ def handle_memcheck(args: Namespace):
     valgrind = shutil.which(args.valgrind)
     if valgrind is None:
         raise RuntimeError(
-            "Valgrind is not installed or not found in PATH. "
-            "Install valgrind or pass --valgrind /path/to/valgrind."
+            "Valgrind is not installed or not found in PATH. Install valgrind or pass --valgrind /path/to/valgrind."
         )
 
     outputs = build_project(

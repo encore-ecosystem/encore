@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
-from encore.frontend.lexer.lexer import Lexer
-from encore.frontend.lexer.tokens import LexerToken, TokenType
+from encore.compiler.lexer.lexer import Lexer
+from encore.compiler.lexer.tokens import LexerToken, TokenType
 from encore.utils.diagnostics import CompileDiagnostic
 
 OPEN_TO_CLOSE = {
@@ -93,14 +93,23 @@ class MacroExpander:
                     LexerToken(type=TokenType.IDENTIFIER, value="format", line=tokens[i].line, column=tokens[i].column)
                 )
                 out.append(LexerToken(type=TokenType.BANG, value="!", line=tokens[i].line, column=tokens[i].column))
-                out.append(LexerToken(type=TokenType.LEFT_PAREN, value="(", line=tokens[i].line, column=tokens[i].column))
-                out.append(LexerToken(type=TokenType.STRING, value=fmt_literal, line=tokens[i].line, column=tokens[i].column))
+                out.append(
+                    LexerToken(type=TokenType.LEFT_PAREN, value="(", line=tokens[i].line, column=tokens[i].column)
+                )
+                out.append(
+                    LexerToken(type=TokenType.STRING, value=fmt_literal, line=tokens[i].line, column=tokens[i].column)
+                )
                 for arg in args:
-                    out.append(LexerToken(type=TokenType.COMMA, value=",", line=tokens[i].line, column=tokens[i].column))
-                    out.extend(
-                        LexerToken(type=t.type, value=t.value, line=tokens[i].line, column=tokens[i].column) for t in arg
+                    out.append(
+                        LexerToken(type=TokenType.COMMA, value=",", line=tokens[i].line, column=tokens[i].column)
                     )
-                out.append(LexerToken(type=TokenType.RIGHT_PAREN, value=")", line=tokens[i].line, column=tokens[i].column))
+                    out.extend(
+                        LexerToken(type=t.type, value=t.value, line=tokens[i].line, column=tokens[i].column)
+                        for t in arg
+                    )
+                out.append(
+                    LexerToken(type=TokenType.RIGHT_PAREN, value=")", line=tokens[i].line, column=tokens[i].column)
+                )
                 i += 2
                 continue
             out.append(tokens[i])
@@ -156,7 +165,9 @@ class MacroExpander:
             current = next_tokens
         raise CompileDiagnostic(message="Macro expansion exceeded recursion limit")
 
-    def _expand_calls_one_round(self, tokens: list[LexerToken], macros: dict[str, MacroDef]) -> tuple[list[LexerToken], bool]:
+    def _expand_calls_one_round(
+        self, tokens: list[LexerToken], macros: dict[str, MacroDef]
+    ) -> tuple[list[LexerToken], bool]:
         out: list[LexerToken] = []
         changed = False
         i = 0
@@ -193,7 +204,9 @@ class MacroExpander:
             if captures is None:
                 continue
             rendered = self._render_template(rule.template, captures, {})
-            return [LexerToken(type=x.type, value=x.value, line=callsite.line, column=callsite.column) for x in rendered]
+            return [
+                LexerToken(type=x.type, value=x.value, line=callsite.line, column=callsite.column) for x in rendered
+            ]
         raise CompileDiagnostic(
             message=f"No macro_rules arm matched for {macro.name}!(...)",
             line=callsite.line,
@@ -203,10 +216,14 @@ class MacroExpander:
     def _expand_builtin_format(self, args: list[LexerToken], callsite: LexerToken) -> list[LexerToken]:
         parts = self._split_top_level_args(args)
         if not parts:
-            raise CompileDiagnostic(message="format! expects at least a format string", line=callsite.line, column=callsite.column)
+            raise CompileDiagnostic(
+                message="format! expects at least a format string", line=callsite.line, column=callsite.column
+            )
         fmt = parts[0]
         if len(fmt) != 1 or fmt[0].type != TokenType.STRING:
-            raise CompileDiagnostic(message="format! first argument must be a string literal", line=callsite.line, column=callsite.column)
+            raise CompileDiagnostic(
+                message="format! first argument must be a string literal", line=callsite.line, column=callsite.column
+            )
         raw = fmt[0].value
         chunks, placeholders = self._parse_format_template(raw, callsite)
         positional = parts[1:]
@@ -214,7 +231,16 @@ class MacroExpander:
         expr_parts: list[list[LexerToken]] = []
         for idx, chunk in enumerate(chunks):
             if chunk:
-                expr_parts.append([LexerToken(type=TokenType.STRING, value=self._quote_string(chunk), line=callsite.line, column=callsite.column)])
+                expr_parts.append(
+                    [
+                        LexerToken(
+                            type=TokenType.STRING,
+                            value=self._quote_string(chunk),
+                            line=callsite.line,
+                            column=callsite.column,
+                        )
+                    ]
+                )
             if idx >= len(placeholders):
                 continue
             hole = placeholders[idx]
@@ -269,16 +295,37 @@ class MacroExpander:
         self._gensym += 1
         var = f"__macro_vec_tmp_{self._gensym}"
         inferred_type = self._infer_type_tokens_from_expr(items[0], callsite)
+
         def tok(tt: TokenType, v: str) -> LexerToken:
             return LexerToken(type=tt, value=v, line=callsite.line, column=callsite.column)
 
-        out: list[LexerToken] = [tok(TokenType.LEFT_BRACE, "{"), tok(TokenType.KW_LET, "let"), tok(TokenType.KW_MUT, "mut"), tok(TokenType.IDENTIFIER, var)]
+        out: list[LexerToken] = [
+            tok(TokenType.LEFT_BRACE, "{"),
+            tok(TokenType.KW_LET, "let"),
+            tok(TokenType.KW_MUT, "mut"),
+            tok(TokenType.IDENTIFIER, var),
+        ]
         if inferred_type is not None:
-            out.extend([tok(TokenType.COLON, ":"), tok(TokenType.IDENTIFIER, "Vec"), tok(TokenType.LEFT_BRACKET, "["), *inferred_type, tok(TokenType.RIGHT_BRACKET, "]")])
+            out.extend(
+                [
+                    tok(TokenType.COLON, ":"),
+                    tok(TokenType.IDENTIFIER, "Vec"),
+                    tok(TokenType.LEFT_BRACKET, "["),
+                    *inferred_type,
+                    tok(TokenType.RIGHT_BRACKET, "]"),
+                ]
+            )
         out.extend([tok(TokenType.ASSIGN, "="), tok(TokenType.IDENTIFIER, "Vec")])
         if inferred_type is not None:
             out.extend([tok(TokenType.LEFT_BRACKET, "["), *inferred_type, tok(TokenType.RIGHT_BRACKET, "]")])
-        out.extend([tok(TokenType.SCOPE, "::"), tok(TokenType.IDENTIFIER, "new"), tok(TokenType.LEFT_PAREN, "("), tok(TokenType.RIGHT_PAREN, ")")])
+        out.extend(
+            [
+                tok(TokenType.SCOPE, "::"),
+                tok(TokenType.IDENTIFIER, "new"),
+                tok(TokenType.LEFT_PAREN, "("),
+                tok(TokenType.RIGHT_PAREN, ")"),
+            ]
+        )
         for index, item in enumerate(items):
             unit_var = f"{var}_unit_{index}"
             out.extend(
@@ -319,7 +366,9 @@ class MacroExpander:
 
     def _parse_format_template(self, raw_string_token_value: str, callsite: LexerToken) -> tuple[list[str], list[str]]:
         if len(raw_string_token_value) < 2 or raw_string_token_value[0] != '"' or raw_string_token_value[-1] != '"':
-            raise CompileDiagnostic(message="Invalid string literal in format template", line=callsite.line, column=callsite.column)
+            raise CompileDiagnostic(
+                message="Invalid string literal in format template", line=callsite.line, column=callsite.column
+            )
         s = raw_string_token_value[1:-1]
         chunks: list[str] = []
         placeholders: list[str] = []
@@ -334,7 +383,9 @@ class MacroExpander:
                     continue
                 end = s.find("}", i + 1)
                 if end == -1:
-                    raise CompileDiagnostic(message="Unclosed '{' in format string", line=callsite.line, column=callsite.column)
+                    raise CompileDiagnostic(
+                        message="Unclosed '{' in format string", line=callsite.line, column=callsite.column
+                    )
                 hole = s[i + 1 : end].strip()
                 chunks.append(curr)
                 curr = ""
@@ -346,7 +397,9 @@ class MacroExpander:
                 i += 2
                 continue
             if ch == "}":
-                raise CompileDiagnostic(message="Unmatched '}' in format string", line=callsite.line, column=callsite.column)
+                raise CompileDiagnostic(
+                    message="Unmatched '}' in format string", line=callsite.line, column=callsite.column
+                )
             curr += ch
             i += 1
         chunks.append(curr)
@@ -460,7 +513,9 @@ class MacroExpander:
             return args[start:i], i
         return None, start
 
-    def _render_template(self, nodes: list[TemplateNode], captures: dict[str, object], rep_index: dict[str, int]) -> list[LexerToken]:
+    def _render_template(
+        self, nodes: list[TemplateNode], captures: dict[str, object], rep_index: dict[str, int]
+    ) -> list[LexerToken]:
         out: list[LexerToken] = []
         for node in nodes:
             if isinstance(node, TemplateLiteral):
@@ -543,7 +598,11 @@ class MacroExpander:
                 name = tokens[i + 1]
                 colon = tokens[i + 2]
                 kind = tokens[i + 3]
-                if name.type != TokenType.IDENTIFIER or colon.type != TokenType.COLON or kind.type != TokenType.IDENTIFIER:
+                if (
+                    name.type != TokenType.IDENTIFIER
+                    or colon.type != TokenType.COLON
+                    or kind.type != TokenType.IDENTIFIER
+                ):
                     raise CompileDiagnostic(message="Invalid capture syntax in macro pattern")
                 out.append(PatternCapture(name=name.value, kind=kind.value))
                 i += 4
@@ -552,7 +611,9 @@ class MacroExpander:
             i += 1
         return out, i
 
-    def _parse_template_sequence(self, tokens: list[LexerToken], start: int, end: int) -> tuple[list[TemplateNode], int]:
+    def _parse_template_sequence(
+        self, tokens: list[LexerToken], start: int, end: int
+    ) -> tuple[list[TemplateNode], int]:
         out: list[TemplateNode] = []
         i = start
         while i < end:
@@ -641,8 +702,14 @@ class MacroExpander:
             return [LexerToken(type=TokenType.IDENTIFIER, value="str", line=callsite.line, column=callsite.column)]
         if first.type == TokenType.BOOLEAN:
             return [LexerToken(type=TokenType.IDENTIFIER, value="bool", line=callsite.line, column=callsite.column)]
-        if len(item) >= 2 and first.type in {TokenType.INTEGER, TokenType.FLOAT} and item[1].type == TokenType.IDENTIFIER:
+        if (
+            len(item) >= 2
+            and first.type in {TokenType.INTEGER, TokenType.FLOAT}
+            and item[1].type == TokenType.IDENTIFIER
+        ):
             suffix = item[1].value
             if suffix.startswith("_") and len(suffix) > 1:
-                return [LexerToken(type=TokenType.IDENTIFIER, value=suffix[1:], line=callsite.line, column=callsite.column)]
+                return [
+                    LexerToken(type=TokenType.IDENTIFIER, value=suffix[1:], line=callsite.line, column=callsite.column)
+                ]
         return None

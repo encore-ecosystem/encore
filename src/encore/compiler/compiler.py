@@ -10,13 +10,13 @@ from ehir.builder import EHIR_Module
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 
 from encore import ENCORE_CACHE_DIR
-from encore.frontend.inference import TypeInferer
-from encore.frontend.lexer import Lexer
-from encore.frontend.macro_expander import MacroExpander
-from encore.frontend.parser import Parser
-from encore.frontend.parser import statements as s
-from encore.frontend.translator import Translator
-from encore.frontend.types import (
+from encore.compiler.inference import TypeInferer
+from encore.compiler.lexer import Lexer
+from encore.compiler.macro_expander import MacroExpander
+from encore.compiler.parser import Parser
+from encore.compiler.parser import statements as s
+from encore.compiler.translator import Translator
+from encore.compiler.types import (
     AnySmartPointer,
     is_mutable_type,
     make_mutable_type,
@@ -64,18 +64,8 @@ class ImportedTopLevelDeclaration:
 
 
 @dataclass
-class EHIR_EncoreFrontend(EHIR_Frontend):
+class EncoreCompiler:
     src_dir: Path
-    cfg_environment: CfgEnvironment = field(default_factory=default_cfg_environment)
-    on_module_load: Callable[[Path], None] | None = None
-    _cache: dict[Path, EHIR_Module] = field(default_factory=dict)
-    _ast_cache: dict[Path, list[s.Statement]] = field(default_factory=dict)
-    _source_ast_cache: dict[Path, list[s.Statement]] = field(default_factory=dict)
-    _source_text_cache: dict[Path, str] = field(default_factory=dict)
-    _index_cache: dict[Path, ModuleIndex] = field(default_factory=dict)
-    _dependency_cache: dict[Path, dict[str, Path]] = field(default_factory=dict)
-    _inferred_modules: set[Path] = field(default_factory=set)
-    _inferring_modules: set[Path] = field(default_factory=set)
     _lexer: Lexer = field(default_factory=lambda: Lexer())
     _parser: Parser = field(default_factory=lambda: Parser())
     _macro_expander: MacroExpander = field(default_factory=lambda: MacroExpander())

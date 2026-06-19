@@ -2,15 +2,9 @@ from argparse import REMAINDER, Namespace
 from pathlib import Path
 from typing import Callable
 
-from ehir import Refrain
-
 from encore.modes.build import (
     add_build_options,
     build_project,
-    profile_timings_enabled,
-    resolve_build_profile,
-    resolve_project_target_type,
-    run_binary,
 )
 
 
@@ -24,8 +18,6 @@ def add_run_parser(subparsers) -> tuple[str, Callable]:
 
 def handle_run(args: Namespace):
     cwd = Path().resolve()
-    if resolve_project_target_type(cwd) != Refrain.TargetType.EXECUTABLE:
-        raise RuntimeError("run is only available for executable projects")
     outputs = build_project(
         cwd,
         args.backend,

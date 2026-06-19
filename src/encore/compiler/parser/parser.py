@@ -39,11 +39,11 @@ from ehir.core.instructions.base import Instruction
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter
 
-from encore.frontend.base import ParserBase
-from encore.frontend.lexer import LexerToken
-from encore.frontend.lexer.tokens import TokenType
-from encore.frontend.parser import statements as s
-from encore.frontend.types import AnySmartPointer, is_mutable_type, make_array_type, make_mutable_type, make_tuple_type
+from encore.compiler.base import ParserBase
+from encore.compiler.lexer import LexerToken
+from encore.compiler.lexer.tokens import TokenType
+from encore.compiler.parser import statements as s
+from encore.compiler.types import AnySmartPointer, is_mutable_type, make_array_type, make_mutable_type, make_tuple_type
 from encore.utils.diagnostics import CompileDiagnostic
 
 TRACE_MAX_LINES_FOR_UNIT = 5

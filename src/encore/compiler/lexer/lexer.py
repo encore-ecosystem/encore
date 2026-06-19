@@ -1,4 +1,4 @@
-from encore.frontend.base import ParserBase
+from encore.compiler.base import ParserBase
 
 from .tokens import LexerToken, TokenType
 

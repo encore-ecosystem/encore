@@ -12,7 +12,6 @@ from ehir.core.derectives import (
 )
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum, EnumVariant, TupleLikeVariant, UnitLikeVariant
-from ehir.core.instructions.base import Assignable
 from ehir.core.instructions import (
     BinOp,
     Instruction_add,
@@ -35,18 +34,19 @@ from ehir.core.instructions import (
     Instruction_wraps,
     MatchCase,
 )
+from ehir.core.instructions.base import Assignable
 from ehir.core.primitives import Float, Float_t, Isize, Isize_t, Str, Str_t, Usize, Usize_t
 from ehir.core.struct import Struct
 from ehir.core.type import HeapSmartPointer, Pointer, SmartPointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter, Variable
 
-from encore.frontend.inference import TypeInferer
-from encore.frontend.lexer import Lexer
-from encore.frontend.macro_expander import MacroExpander
-from encore.frontend.parser import Parser
-from encore.frontend.parser import statements as s
-from encore.frontend.parser.statements import Block
-from encore.frontend.types import (
+from encore.compiler.inference import TypeInferer
+from encore.compiler.lexer import Lexer
+from encore.compiler.macro_expander import MacroExpander
+from encore.compiler.parser import Parser
+from encore.compiler.parser import statements as s
+from encore.compiler.parser.statements import Block
+from encore.compiler.types import (
     AnySmartPointer,
     array_size,
     is_array_type,
@@ -290,7 +290,9 @@ class Translator:
         self._current_module_id = module_id or Path()
         imported_declarations = imported_declarations or []
         declaration_entries = [*self._normalize_declaration_entries(imported_declarations)] + [
-            (self._current_module_id, statement, None, None) for statement in ast if isinstance(statement, s.Statement_TopLevel)
+            (self._current_module_id, statement, None, None)
+            for statement in ast
+            if isinstance(statement, s.Statement_TopLevel)
         ]
         self.preload_declarations(declaration_entries)
         emitted_declarations: set[tuple[object, ...]] = set()
@@ -758,7 +760,9 @@ class Translator:
                 Derective_fn(
                     name=f"{trait_name}::{method_name}",
                     generics=[self._translate_type(generic) for generic in signature.generics],
-                    params=[Parameter(name=param.name, type=self._translate_type(param.type)) for param in signature.params],
+                    params=[
+                        Parameter(name=param.name, type=self._translate_type(param.type)) for param in signature.params
+                    ],
                     body=[],
                     ret_type=self._translate_type(signature.type),
                 ),
@@ -1350,7 +1354,9 @@ class Translator:
 
     def _translate_trait_type(self, typ: Type) -> Type:
         if typ.name in self._trait_aliases:
-            return replace(typ, name=self._trait_aliases[typ.name], generics=[self._translate_type(g) for g in typ.generics])
+            return replace(
+                typ, name=self._trait_aliases[typ.name], generics=[self._translate_type(g) for g in typ.generics]
+            )
         return replace(typ, generics=[self._translate_type(g) for g in typ.generics])
 
     def _lower_param_type(self, typ: Type) -> Type:
@@ -1399,11 +1405,7 @@ class Translator:
 
     def _is_source_reference_like(self, var: Variable) -> bool:
         source_type = self._source_type_for_var(var)
-        return (
-            is_reference_like_type(source_type)
-            or is_reference_like_type(var.type)
-            or is_raw_pointer_type(var.type)
-        )
+        return is_reference_like_type(source_type) or is_reference_like_type(var.type) or is_raw_pointer_type(var.type)
 
     def _fresh_temp_name(self, prefix: str) -> str:
         while True:
@@ -2214,9 +2216,12 @@ class Translator:
 
         if explicit_arms:
             cond_blocks = [self._builder.current_block] + [
-                self._builder.append_block(f"match_builtin_cond_{match_id}_{idx}") for idx in range(1, len(explicit_arms))
+                self._builder.append_block(f"match_builtin_cond_{match_id}_{idx}")
+                for idx in range(1, len(explicit_arms))
             ]
-            arm_blocks = [self._builder.append_block(f"match_builtin_arm_{match_id}_{idx}") for idx in range(len(explicit_arms))]
+            arm_blocks = [
+                self._builder.append_block(f"match_builtin_arm_{match_id}_{idx}") for idx in range(len(explicit_arms))
+            ]
             default_block = self._builder.append_block(f"match_builtin_default_{match_id}")
 
             for idx, arm in enumerate(explicit_arms):
@@ -2438,7 +2443,9 @@ class Translator:
                 return self._translate_expression(expr.expr, name=name, expected_type=expected_type)
             if expr.operator == "-":
                 operand = self._translate_expression(expr.expr, expected_type=expected_type)
-                operand_type = operand.var_out.type or (self._translate_type(expected_type) if expected_type is not None else None)
+                operand_type = operand.var_out.type or (
+                    self._translate_type(expected_type) if expected_type is not None else None
+                )
                 if operand_type is None:
                     raise TypeError("Unable to infer type for unary '-'")
 
@@ -2454,7 +2461,9 @@ class Translator:
                     raise TypeError(f"Unary '-' expects numeric type, got {base_type}")
                 result = self._builder.build_binop("sub", zero.var_out, operand.var_out, name)
                 result.var_out.type = operand.var_out.type
-                self._remember_source_type(result.var_out, self._source_type_for_var(operand.var_out) or operand.var_out.type)
+                self._remember_source_type(
+                    result.var_out, self._source_type_for_var(operand.var_out) or operand.var_out.type
+                )
                 return result
             raise NotImplementedError(f"Translation for unary operator '{expr.operator}' is not implemented.")
 
@@ -2756,7 +2765,6 @@ class Translator:
             return call
 
         raise NotImplementedError(f"Translation for expression type {type(expr)}:{expr} is not implemented.")
-
 
     def _translate_short_circuit_logical(
         self,
@@ -3254,7 +3262,9 @@ class Translator:
             return None
 
         translated_enum_type = self._translate_type(enum_type)
-        return Enum(name=translated_enum_type.name, generics=translated_enum_type.generics, variant=variant_name, args=[])
+        return Enum(
+            name=translated_enum_type.name, generics=translated_enum_type.generics, variant=variant_name, args=[]
+        )
 
     def _build_enum_from_call(self, expr: s.Expression_Call) -> Enum | None:
         if len(expr.callee.segments) != 2:
@@ -3491,7 +3501,11 @@ class Translator:
 
         concrete_kind: type[Type] | None = None
         for arg in args:
-            source_type = unwrap_for_storage(self._source_type_for_var(arg) or arg.type) if (self._source_type_for_var(arg) or arg.type) is not None else None
+            source_type = (
+                unwrap_for_storage(self._source_type_for_var(arg) or arg.type)
+                if (self._source_type_for_var(arg) or arg.type) is not None
+                else None
+            )
             if isinstance(source_type, HeapSmartPointer):
                 if concrete_kind is not None and concrete_kind is not HeapSmartPointer:
                     raise TypeError(f"Mixed smart-pointer kinds in call '{fn_name}' are not supported yet")
@@ -3594,10 +3608,7 @@ class Translator:
             return False
         if len(lhs.generics) != len(rhs.generics):
             return False
-        return all(
-            self._same_type_shape(left, right)
-            for left, right in zip(lhs.generics, rhs.generics, strict=True)
-        )
+        return all(self._same_type_shape(left, right) for left, right in zip(lhs.generics, rhs.generics, strict=True))
 
     @staticmethod
     def _operator_rhs_expected_type(

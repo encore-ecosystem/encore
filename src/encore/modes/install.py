@@ -6,15 +6,11 @@ from typing import Callable
 
 from rich.console import Console
 
-from ehir import Refrain
-
 from encore.modes.build import (
     AVAILABLE_BACKENDS,
-    AVAILABLE_OPTPROFILES,
     _resolve_dependency,
     build_project,
     load_manifest,
-    resolve_project_target_type,
 )
 
 INDEX_GITHUB_PREFIX = "git@https://github.com/encore-language-index/"
