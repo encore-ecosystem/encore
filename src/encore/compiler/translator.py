@@ -531,26 +531,23 @@ class EncoreToEHIRTranslator:
                 self._current_module_id = prev_module_id
 
     def _translate_statement(self, statement: s.Statement) -> Derective | None:
-        try:
-            if isinstance(statement, s.Statement_FunctionDefinition):
-                return self._translate_function_definition(statement)
-            elif isinstance(statement, s.FunctionSignature):
-                return self._translate_extern_function_definition(statement)
-            elif isinstance(statement, s.Statement_StructureDefinition):
-                return self._translate_structure_definition(statement)
-            elif isinstance(statement, s.Statement_EnumDefinition):
-                return self._translate_enum_definition(statement)
-            elif isinstance(statement, s.Statement_Trait):
-                return self._translate_trait_definition(statement)
-            elif isinstance(statement, s.Statement_Impl):
-                return self._translate_impl_definition(statement)
-            elif isinstance(statement, s.Statement_Import):
-                return self._translate_import(statement)
-            elif isinstance(statement, s.Statement_Global):
-                return None
-            raise NotImplementedError(f"Translation for statement type {type(statement)} is not implemented.")
-        except Exception as exc:
-            raise self._diagnostic_for_statement(statement, exc) from exc
+        if isinstance(statement, s.Statement_FunctionDefinition):
+            return self._translate_function_definition(statement)
+        elif isinstance(statement, s.FunctionSignature):
+            return self._translate_extern_function_definition(statement)
+        elif isinstance(statement, s.Statement_StructureDefinition):
+            return self._translate_structure_definition(statement)
+        elif isinstance(statement, s.Statement_EnumDefinition):
+            return self._translate_enum_definition(statement)
+        elif isinstance(statement, s.Statement_Trait):
+            return self._translate_trait_definition(statement)
+        elif isinstance(statement, s.Statement_Impl):
+            return self._translate_impl_definition(statement)
+        elif isinstance(statement, s.Statement_Import):
+            return self._translate_import(statement)
+        elif isinstance(statement, s.Statement_Global):
+            return None
+        raise NotImplementedError(f"Translation for statement type {type(statement)} is not implemented.")
 
     def _normalize_signature(
         self, signature: s.FunctionSignature, self_type: Type | None = None
@@ -1522,55 +1519,52 @@ class EncoreToEHIRTranslator:
             self._translate_inner_statement(inner_statement)
 
     def _translate_inner_statement(self, statement: s.Statement_InnerLevel):
-        try:
-            if isinstance(statement, s.Statement_Let):
-                return self._translate_let(statement)
+        if isinstance(statement, s.Statement_Let):
+            return self._translate_let(statement)
 
-            elif isinstance(statement, s.Statement_Ret):
-                return self._translate_ret(statement)
+        elif isinstance(statement, s.Statement_Ret):
+            return self._translate_ret(statement)
 
-            elif isinstance(statement, s.Statement_Break):
-                return self._translate_break(statement)
+        elif isinstance(statement, s.Statement_Break):
+            return self._translate_break(statement)
 
-            elif isinstance(statement, s.Statement_Continue):
-                return self._translate_continue(statement)
+        elif isinstance(statement, s.Statement_Continue):
+            return self._translate_continue(statement)
 
-            elif isinstance(statement, s.Statement_While):
-                return self._translate_while(statement)
+        elif isinstance(statement, s.Statement_While):
+            return self._translate_while(statement)
 
-            elif isinstance(statement, s.Statement_Loop):
-                return self._translate_loop(statement)
+        elif isinstance(statement, s.Statement_Loop):
+            return self._translate_loop(statement)
 
-            elif isinstance(statement, s.Statement_DoWhile):
-                return self._translate_do_while(statement)
+        elif isinstance(statement, s.Statement_DoWhile):
+            return self._translate_do_while(statement)
 
-            elif isinstance(statement, s.Statement_For):
-                return self._translate_for(statement)
+        elif isinstance(statement, s.Statement_For):
+            return self._translate_for(statement)
 
-            elif isinstance(statement, s.Statement_With):
-                return self._translate_with(statement)
+        elif isinstance(statement, s.Statement_With):
+            return self._translate_with(statement)
 
-            elif isinstance(statement, s.Statement_If):
-                return self._translate_if(statement)
+        elif isinstance(statement, s.Statement_If):
+            return self._translate_if(statement)
 
-            elif isinstance(statement, s.Statement_Match):
-                return self._translate_match(statement)
+        elif isinstance(statement, s.Statement_Match):
+            return self._translate_match(statement)
 
-            elif isinstance(statement, s.Statement_Unsafe):
-                return self._translate_unsafe(statement)
+        elif isinstance(statement, s.Statement_Unsafe):
+            return self._translate_unsafe(statement)
 
-            elif isinstance(statement, s.Statement_EHIR):
-                return self._translate_ehir(statement)
+        elif isinstance(statement, s.Statement_EHIR):
+            return self._translate_ehir(statement)
 
-            elif isinstance(statement, s.Statement_Assignment):
-                return self._translate_assignment(statement)
+        elif isinstance(statement, s.Statement_Assignment):
+            return self._translate_assignment(statement)
 
-            elif isinstance(statement, s.Statement_Expr):
-                return self._translate_expression_statement(statement)
+        elif isinstance(statement, s.Statement_Expr):
+            return self._translate_expression_statement(statement)
 
-            raise NotImplementedError(f"Translation for inner statement type {type(statement)} is not implemented.")
-        except Exception as exc:
-            raise self._diagnostic_for_statement(statement, exc) from exc
+        raise NotImplementedError(f"Translation for inner statement type {type(statement)} is not implemented.")
 
     def _translate_let(self, statement: s.Statement_Let):
         assert statement.type is not None

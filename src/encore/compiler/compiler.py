@@ -3,15 +3,16 @@ import hashlib
 import json
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from pathlib import Path
 
 from ehir.builder import EHIR_Module
+from ehir.compiler import CompileProfileRecord
 from ehir_llvm_backend import EHIR_LLVM_Backend
 
 from ehir import EHIR_ProjectCompiler
-from ehir.compiler import CompileProfileRecord
 from encore.compiler.inference import TypeInferer
 from encore.compiler.parser import statements as s
 from encore.compiler.translator import EncoreToEHIRTranslator
@@ -84,6 +85,9 @@ class EncoreCompiler:
         native_inputs_by_refrain: dict[str, NativeLinkInputs] = {}
 
         for refrain in building_queue:
+            print(f"Compiling {refrain.name}... ", end="")
+            start_time = time.perf_counter()
+
             entrypoint = refrain.import_graph.entrypoint if refrain.import_graph is not None else None
             source_text = entrypoint.read_text() if entrypoint is not None and entrypoint.exists() else None
             try:
@@ -127,6 +131,9 @@ class EncoreCompiler:
                     module_id=entrypoint,
                     source_text=source_text,
                 ) from exc
+
+            time_elapsed = time.perf_counter() - start_time
+            print(f"{time_elapsed:.3f} sec.")
             result.append(
                 CompiledRefrain(
                     refrain=refrain,

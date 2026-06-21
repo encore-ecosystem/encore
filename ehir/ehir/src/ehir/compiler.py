@@ -23,12 +23,10 @@ from ehir.simplifier.passes import (
     DeallocatorPass,
     DowngraderPass,
     DropLoweringPass,
-    InstanceCallLoweringPass,
     MatchValidatorPass,
     MonomorphizationPass,
     NormalizerPass,
     ReferenceLoweringPass,
-    ResolverPass,
     RetainInsertionPass,
     StripperPass,
     TypedVerifierPass,
@@ -65,7 +63,6 @@ class EHIR_ProjectCompiler:
 
     def compile_module(self, module: EHIR_Module) -> EHIR_ProcessedModule:
         module = self._time_it(InstanceCallLoweringPass(), module)
-        module = self._time_it(ResolverPass(), module)
         module = self._time_it(ReferenceLoweringPass(), module)
         module = self._time_it(MonomorphizationPass(), module)
         module = self._time_it(TypedVerifierPass(), module)
