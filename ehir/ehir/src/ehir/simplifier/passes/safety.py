@@ -1,5 +1,6 @@
 from dataclasses import fields, is_dataclass
 
+from ehir.builder import EHIR_Module
 from ehir.core.derectives import Derective_fn, Derective_impl, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import (
@@ -17,6 +18,7 @@ from ehir.core.instructions import (
     Instruction_store,
 )
 from ehir.core.type import Pointer, Type
+from ehir.simplifier.base import SimplifierPass
 
 
 UNSAFE_INSTRUCTION_TYPES = (
@@ -35,8 +37,12 @@ UNSAFE_INSTRUCTION_TYPES = (
 )
 
 
-class SafetyValidator:
-    def run(self, ast: list[Derective]) -> list[Derective]:
+class SafetyValidator(SimplifierPass):
+    def run(self, module: EHIR_Module) -> EHIR_Module:
+        module.ast = self._run_ast(module.ast)
+        return module
+
+    def _run_ast(self, ast: list[Derective]) -> list[Derective]:
         for directive in ast:
             if isinstance(directive, Derective_struct):
                 self._validate_struct(directive)

@@ -1,3 +1,4 @@
+from ehir.builder import EHIR_Module
 from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_enum, Derective_struct
 from ehir.core.derectives.base import Derective
@@ -49,6 +50,7 @@ from ehir.core.struct import Struct
 from ehir.core.type import Pointer, Reference, Type, box_pointee, is_box_type, mangle_type_name
 from ehir.core.variable import Parameter, TypedVariable, Variable
 from ehir.errors import EhirCompileError
+from ehir.simplifier.base import SimplifierPass
 from ehir.simplifier.drop_helper import collect_aggregate_names, needs_retain, retain_function_name
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
@@ -78,7 +80,7 @@ SKIPABLE = (
 ENABLE_COMMENTS: bool = True
 
 
-class Downgrader:
+class DowngraderPass(SimplifierPass):
     _structs: dict[str, Derective_struct]
     _enum_variants: dict[str, list[str]]
     _aggregate_names: set[str]
@@ -127,7 +129,11 @@ class Downgrader:
             return None
         return ptr_field.pointee
 
-    def run(self, ast: list[Derective]) -> list[Derective]:
+    def run(self, module: EHIR_Module) -> EHIR_Module:
+        module.ast = self._run_ast(module.ast)
+        return module
+
+    def _run_ast(self, ast: list[Derective]) -> list[Derective]:
         self._structs = {}
         self._enum_variants = {}
         self._structs_to_add = []
@@ -747,3 +753,6 @@ class Downgrader:
 
         switch = Instruction_switch(cond_var=tag, default_case=instr.default_case, cases=cases)
         return [*prelude, *self._downgrade_getfield(get_tag), switch]
+
+
+Downgrader = DowngraderPass

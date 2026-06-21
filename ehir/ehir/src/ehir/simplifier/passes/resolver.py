@@ -137,6 +137,7 @@ class ResolverPass(SimplifierPass):
         self._validate_dyn_trait_usage()
         self._validate_impl_coherence()
         self._expand_inherent_impl_methods(module.ast)
+        self._expand_trait_impl_methods(module.ast)
         self._rewrite_declaration_types(module.ast)
 
         for fn in self.fn.values():
@@ -494,6 +495,33 @@ class ResolverPass(SimplifierPass):
                     merged_generics.append(deepcopy(g))
                 lowered.generics = merged_generics
                 lowered.name = f"{impl.for_type}::{method.name}"
+                self._replace_self(lowered, impl.for_type)
+                if lowered.name in fn_names:
+                    continue
+                fn_names.add(lowered.name)
+                generated.append(lowered)
+                self.fn[lowered.name] = lowered
+        ast.extend(generated)
+
+    def _expand_trait_impl_methods(self, ast: list[Derective]) -> None:
+        fn_names = {d.name for d in ast if isinstance(d, (Derective_fn, Derective_extern_fn))}
+        generated: list[Derective_fn] = []
+        for impl in self.impls:
+            if impl.trait_name is None:
+                continue
+            trait_name = self._canonical_trait_name(impl.trait_name) or impl.trait_name
+            recv_type = self._resolve_type(impl.for_type)
+            for method in impl.methods:
+                lowered = deepcopy(method)
+                merged_generics: list[Type] = []
+                known = set()
+                for g in [*impl.generics, *method.generics]:
+                    if g.name in known:
+                        continue
+                    known.add(g.name)
+                    merged_generics.append(deepcopy(g))
+                lowered.generics = merged_generics
+                lowered.name = f"{trait_name}::{self._trait_impl_method_name(impl, lowered, recv_type)}"
                 self._replace_self(lowered, impl.for_type)
                 if lowered.name in fn_names:
                     continue

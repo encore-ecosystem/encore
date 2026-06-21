@@ -3,7 +3,7 @@ from enum import StrEnum, auto
 from pathlib import Path
 
 from ehir.builder import EHIR_Module
-from ehir.postprocessor import EHIR_ProcessedModule
+from ehir_llvm_backend import EHIR_LLVM_Backend
 
 from ehir import EHIR_ProjectCompiler
 from encore.compiler.inference import TypeInferer
@@ -50,6 +50,12 @@ class ImportedTopLevelDeclaration:
     source_name: str | None = None
 
 
+@dataclass(frozen=True)
+class CompiledRefrain:
+    refrain: RefrainData
+    ehir_module: EHIR_Module
+
+
 @dataclass
 class EncoreCompiler:
     refrain_manager: RefrainManager = field(default_factory=RefrainManager)
@@ -58,9 +64,9 @@ class EncoreCompiler:
     def add_compile_target(self, path: Path):
         self.targets.append(self.refrain_manager.add_binary_target(path))
 
-    def compile_all_targets(self) -> list[EHIR_ProcessedModule]:
+    def compile_all_targets(self) -> list[CompiledRefrain]:
         building_queue = self.refrain_manager.get_building_queue()
-        result: list[EHIR_ProcessedModule] = []
+        result: list[CompiledRefrain] = []
 
         for refrain in building_queue:
             entrypoint = refrain.import_graph.entrypoint if refrain.import_graph is not None else None
@@ -78,6 +84,8 @@ class EncoreCompiler:
             try:
                 ehir_raw_module = EncoreToEHIRTranslator().translate_ast(refrain.ast, module_id=entrypoint)
                 ehir_resolved_module = EHIR_ProjectCompiler().compile_module(ehir_raw_module)
+                output_path = EHIR_LLVM_Backend().compile(ehir_resolved_module)
+                print(output_path)
             except Exception as exc:
                 raise with_diagnostic_context(
                     exc,
@@ -85,7 +93,7 @@ class EncoreCompiler:
                     module_id=entrypoint,
                     source_text=source_text,
                 ) from exc
-            result.append(ehir_resolved_module)
+            result.append(CompiledRefrain(refrain=refrain, ehir_module=ehir_resolved_module))
 
         return result
 

@@ -1,3 +1,4 @@
+from ehir.builder import EHIR_Module
 from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_fn, Derective_impl
 from ehir.core.derectives.base import Derective
@@ -5,11 +6,16 @@ from ehir.core.instructions import ControlFlow, Instruction_br, Instruction_load
 from ehir.core.type import Pointer, Type
 from ehir.core.variable import TypedVariable
 from ehir.errors import EhirCompileError
+from ehir.simplifier.base import SimplifierPass
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 
-class Normalizer:
-    def run(self, ast: list[Derective]) -> list[Derective]:
+class NormalizerPass(SimplifierPass):
+    def run(self, module: EHIR_Module) -> EHIR_Module:
+        module.ast = self._run_ast(module.ast)
+        return module
+
+    def _run_ast(self, ast: list[Derective]) -> list[Derective]:
         new = []
         for derective in ast:
             if isinstance(derective, Derective_fn):
@@ -143,3 +149,6 @@ class Normalizer:
             body=[block for name, block in block_mapping.items() if name != "entry"],
             exit_block=exit_block,
         )
+
+
+Normalizer = NormalizerPass

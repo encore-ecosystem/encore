@@ -1,5 +1,6 @@
 from copy import deepcopy
 
+from ehir.builder import EHIR_Module
 from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_fn
 from ehir.core.derectives.base import Derective
@@ -7,11 +8,16 @@ from ehir.core.instructions import ControlFlow, Instruction_call, Instruction_cf
 from ehir.core.instructions.base import Instruction
 from ehir.core.type import Type
 from ehir.core.variable import TypedVariable
+from ehir.simplifier.base import SimplifierPass
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 
-class Cfree_Simplifier_Pass:
-    def run(self, ast: list[Derective]):
+class CfreeSimplifierPass(SimplifierPass):
+    def run(self, module: EHIR_Module) -> EHIR_Module:
+        module.ast = self._run_ast(module.ast)
+        return module
+
+    def _run_ast(self, ast: list[Derective]) -> list[Derective]:
         for derective in ast:
             if isinstance(derective, Normalized_fn):
                 self._lower_cfree_in_fn(derective)
@@ -40,3 +46,6 @@ class Cfree_Simplifier_Pass:
                 )
             ]
         return [instr]
+
+
+Cfree_Simplifier_Pass = CfreeSimplifierPass

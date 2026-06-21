@@ -1,14 +1,20 @@
 from dataclasses import fields, is_dataclass
 
+from ehir.builder import EHIR_Module
 from ehir.core.derectives import Derective_enum, Derective_extern_fn, Derective_fn, Derective_impl, Derective_struct, Derective_trait
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import Instruction_call, Instruction_callvoid
 from ehir.core.primitives.base import PrimitiveType
 from ehir.core.type import Pointer, Reference, Type
+from ehir.simplifier.base import SimplifierPass
 
 
-class UnneededSymbolsStripper:
-    def run(self, ast: list[Derective], *, keep_public_api: bool = True) -> list[Derective]:
+class StripperPass(SimplifierPass):
+    def run(self, module: EHIR_Module, *, keep_public_api: bool = True) -> EHIR_Module:
+        module.ast = self._run_ast(module.ast, keep_public_api=keep_public_api)
+        return module
+
+    def _run_ast(self, ast: list[Derective], *, keep_public_api: bool = True) -> list[Derective]:
         public_type_names: set[str] = set()
         if keep_public_api:
             for directive in ast:
@@ -186,3 +192,6 @@ class UnneededSymbolsStripper:
         if "__" not in method:
             return f"{owner_text}::{method}"
         return f"{owner_text}::{method.split('__', 1)[0]}"
+
+
+UnneededSymbolsStripper = StripperPass

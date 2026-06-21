@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import fields, is_dataclass, replace
 
+from ehir.builder import EHIR_Module
 from ehir.core.derectives import Derective_enum, Derective_fn, Derective_impl, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum, TupleLikeVariant, UnitLikeVariant
@@ -10,9 +11,10 @@ from ehir.core.instructions import Instruction_call, Instruction_wraps
 from ehir.core.primitives.base import Primitive, PrimitiveType
 from ehir.core.struct import Struct
 from ehir.core.type import Pointer, Reference, Type, concrete_box_type_name, mangle_type_name
+from ehir.simplifier.base import SimplifierPass
 
 
-class MonomorphizationPass:
+class MonomorphizationPass(SimplifierPass):
     _GENERIC_MONO_PASSES = 4
     _known_concrete_type_names: set[str]
 
@@ -26,7 +28,11 @@ class MonomorphizationPass:
     def _is_box_template_method_name(name: str) -> bool:
         return name.startswith("Box[T]::") or name.startswith("Box::")
 
-    def run(self, ast: list[Derective]) -> list[Derective]:
+    def run(self, module: EHIR_Module) -> EHIR_Module:
+        module.ast = self._run_ast(module.ast)
+        return module
+
+    def _run_ast(self, ast: list[Derective]) -> list[Derective]:
         self._known_concrete_type_names = {
             d.name for d in ast if isinstance(d, (Derective_struct, Derective_enum))
         }

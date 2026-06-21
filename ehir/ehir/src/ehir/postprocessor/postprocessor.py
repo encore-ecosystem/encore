@@ -116,7 +116,7 @@ class Postprocessor:
             if isinstance(derective, (Normalized_fn, Derective_extern_fn)):
                 emitted_name = self._emit_symbol_name(derective.name, [param.type for param in derective.params])
                 self._fn_ret_by_emitted_name[emitted_name] = derective.ret_type
-        mod = ProcessedModule(id=raw_mod.id, structs=[], funcs=[])
+        mod = EHIR_ProcessedModule(id=raw_mod.id, structs=[], funcs=[])
         for derective in raw_mod.ast:
             if isinstance(derective, Normalized_fn):
                 mod.funcs.append(

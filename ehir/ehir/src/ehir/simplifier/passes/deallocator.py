@@ -1,6 +1,7 @@
 from collections import deque
 from copy import deepcopy
 
+from ehir.builder import EHIR_Module
 from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_enum, Derective_struct
 from ehir.core.derectives.base import Derective
@@ -43,6 +44,7 @@ from ehir.core.instructions.base import Assignable
 from ehir.core.type import Pointer, Type
 from ehir.core.variable import TypedVariable, Variable
 from ehir.errors import EhirCompileError
+from ehir.simplifier.base import SimplifierPass
 from ehir.simplifier.drop_helper import collect_aggregate_names, needs_drop
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
@@ -56,7 +58,7 @@ SKIPABLE = (
 )
 
 
-class Deallocator:
+class DeallocatorPass(SimplifierPass):
     _usages: dict[str, set[str]]
     _captures: dict[str, str]
     _returned_alias_blocks: dict[str, set[str]]
@@ -73,7 +75,11 @@ class Deallocator:
     _loaded_from_stack_slot: dict[str, str]
     _explicitly_dropped_stack_slots: dict[str, set[str]]
 
-    def run(self, ast: list[Derective]) -> list[Derective]:
+    def run(self, module: EHIR_Module) -> EHIR_Module:
+        module.ast = self._run_ast(module.ast)
+        return module
+
+    def _run_ast(self, ast: list[Derective]) -> list[Derective]:
         structs = {
             directive.name: directive
             for directive in ast
@@ -773,3 +779,6 @@ class Deallocator:
         if isinstance(instr, BinOp):
             return [instr.lhs, instr.rhs]
         return []
+
+
+Deallocator = DeallocatorPass

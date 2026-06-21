@@ -54,6 +54,7 @@ from ehir.core.variable import Parameter, TypedVariable, Variable
 @dataclass
 class EHIR_Module:
     ast: list[Derective]
+    id: Path = Path()
 
     def __str__(self) -> str:
         return "\n\n".join(map(str, self.ast))

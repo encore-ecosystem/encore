@@ -1,6 +1,7 @@
 from copy import deepcopy
 from dataclasses import fields, is_dataclass
 
+from ehir.builder import EHIR_Module
 from ehir.core.block import Block
 from ehir.core.derectives import Derective_enum, Derective_extern_fn, Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
@@ -20,6 +21,7 @@ from ehir.core.primitives import Usize, Usize_t
 from ehir.core.primitives.base import Primitive, PrimitiveType
 from ehir.core.type import Pointer, Reference, Type, mangle_type_name
 from ehir.core.variable import Parameter, StructField, TypedVariable
+from ehir.simplifier.base import SimplifierPass
 from ehir.simplifier.drop_helper import (
     collect_aggregate_names,
     is_box_struct,
@@ -30,8 +32,12 @@ from ehir.simplifier.drop_helper import (
 )
 
 
-class AutoRetainPass:
-    def run(self, ast: list[Derective]) -> list[Derective]:
+class AutoRetainPass(SimplifierPass):
+    def run(self, module: EHIR_Module) -> EHIR_Module:
+        module.ast = self._run_ast(module.ast)
+        return module
+
+    def _run_ast(self, ast: list[Derective]) -> list[Derective]:
         self._structs = {
             directive.name: directive
             for directive in ast

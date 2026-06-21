@@ -1,12 +1,18 @@
+from ehir.builder import EHIR_Module
 from ehir.core.derectives import Derective_enum, Derective_fn
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import Instruction_match
 from ehir.errors import EhirCompileError
+from ehir.simplifier.base import SimplifierPass
 
 
-class MatchValidatorPass:
-    def run(self, ast: list[Derective]) -> list[Derective]:
+class MatchValidatorPass(SimplifierPass):
+    def run(self, module: EHIR_Module) -> EHIR_Module:
+        module.ast = self._run_ast(module.ast)
+        return module
+
+    def _run_ast(self, ast: list[Derective]) -> list[Derective]:
         enums = {directive.name: directive for directive in ast if isinstance(directive, Derective_enum)}
         for directive in ast:
             if not isinstance(directive, Derective_fn):

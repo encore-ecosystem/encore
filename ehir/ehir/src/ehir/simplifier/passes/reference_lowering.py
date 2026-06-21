@@ -1,17 +1,23 @@
 from copy import deepcopy
 from dataclasses import fields, is_dataclass
 
+from ehir.builder import EHIR_Module
 from ehir.core.derectives import Derective_extern_fn, Derective_fn
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import Instruction_getfield, Instruction_getfieldptr, Instruction_load, Instruction_setfield
 from ehir.core.type import Pointer, Reference, Type, box_pointee, is_box_type
 from ehir.core.variable import Parameter, TypedVariable, Variable
+from ehir.simplifier.base import SimplifierPass
 
 
-class ReferenceLoweringPass:
+class ReferenceLoweringPass(SimplifierPass):
     _BOX_STORAGE_FIELDS = {"ptr", "owner", "0", "1"}
 
-    def run(self, ast: list[Derective]) -> list[Derective]:
+    def run(self, module: EHIR_Module) -> EHIR_Module:
+        module.ast = self._run_ast(module.ast)
+        return module
+
+    def _run_ast(self, ast: list[Derective]) -> list[Derective]:
         self._rewrite_reference_types(ast)
         for directive in ast:
             if isinstance(directive, (Derective_fn, Derective_extern_fn)):

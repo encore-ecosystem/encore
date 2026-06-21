@@ -1,16 +1,11 @@
 from argparse import Namespace
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from ehir.builder import EHIR_Module
 from ehir_llvm_backend.optimizer import OptimizationProfile
-from git import Repo
 
-from encore import PROJECT_ROOT
 from encore.compiler import EncoreCompiler
-from encore.utils.manifest import ProjectManifest
+from encore.compiler.compiler import CompiledRefrain
 
 AVAILABLE_BACKENDS = ["llvm"]
 AVAILABLE_OPTPROFILES = [OptimizationProfile.debug, OptimizationProfile.release, OptimizationProfile.extreme]
@@ -64,7 +59,7 @@ def build_project(
     path: Path,
     profile: OptimizationProfile,
     show_status: bool = False,
-) -> list[EHIR_Module]:
+) -> list[CompiledRefrain]:
     compiler = EncoreCompiler()
     compiler.add_compile_target(path)
     return compiler.compile_all_targets()

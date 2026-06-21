@@ -1,14 +1,20 @@
 from copy import deepcopy
 
+from ehir.builder import EHIR_Module
 from ehir.core.derectives import Derective_fn
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import Instruction_call, Instruction_callvoid
 from ehir.core.type import Reference, Type
 from ehir.core.variable import Variable
+from ehir.simplifier.base import SimplifierPass
 
 
-class InstanceCallLoweringPass:
-    def run(self, ast: list[Derective]) -> list[Derective]:
+class InstanceCallLoweringPass(SimplifierPass):
+    def run(self, module: EHIR_Module) -> EHIR_Module:
+        module.ast = self._run_ast(module.ast)
+        return module
+
+    def _run_ast(self, ast: list[Derective]) -> list[Derective]:
         for directive in ast:
             if not isinstance(directive, Derective_fn):
                 continue

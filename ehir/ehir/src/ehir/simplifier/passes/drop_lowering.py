@@ -1,5 +1,6 @@
 from copy import deepcopy
 
+from ehir.builder import EHIR_Module
 from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_enum, Derective_extern_fn, Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
@@ -7,12 +8,17 @@ from ehir.core.instructions import Instruction_call, Instruction_cfree, Instruct
 from ehir.core.instructions.base import Instruction
 from ehir.core.type import Type, is_box_type
 from ehir.core.variable import TypedVariable
+from ehir.simplifier.base import SimplifierPass
 from ehir.simplifier.drop_helper import collect_aggregate_names, drop_function_name, needs_drop
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 
-class DropLoweringPass:
-    def run(self, ast: list[Derective]) -> list[Derective]:
+class DropLoweringPass(SimplifierPass):
+    def run(self, module: EHIR_Module) -> EHIR_Module:
+        module.ast = self._run_ast(module.ast)
+        return module
+
+    def _run_ast(self, ast: list[Derective]) -> list[Derective]:
         structs = {
             directive.name: directive
             for directive in ast
