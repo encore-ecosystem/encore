@@ -1,7 +1,7 @@
 from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass
 
-from ehir.builder import EHIR_Module
+from ehir.resolver import EHIR_TypedModule
 from ehir.core.block import Block
 from ehir.core.derectives import Derective_enum, Derective_extern_fn, Derective_fn, Derective_struct
 from ehir.core.derectives.base import Derective
@@ -60,7 +60,7 @@ class AutoDropPass(SimplifierPass):
     def __init__(self, trace_cfree: bool = False):
         self._trace_cfree = trace_cfree
 
-    def run(self, module: EHIR_Module) -> EHIR_Module:
+    def run(self, module: EHIR_TypedModule) -> EHIR_TypedModule:
         module.ast = self._run_ast(module.ast)
         return module
 

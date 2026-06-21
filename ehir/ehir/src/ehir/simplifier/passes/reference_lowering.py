@@ -1,7 +1,7 @@
 from copy import deepcopy
 from dataclasses import fields, is_dataclass
 
-from ehir.builder import EHIR_Module
+from ehir.resolver import EHIR_TypedModule
 from ehir.core.derectives import Derective_extern_fn, Derective_fn
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import Instruction_getfield, Instruction_getfieldptr, Instruction_load, Instruction_setfield
@@ -13,7 +13,7 @@ from ehir.simplifier.base import SimplifierPass
 class ReferenceLoweringPass(SimplifierPass):
     _BOX_STORAGE_FIELDS = {"ptr", "owner", "0", "1"}
 
-    def run(self, module: EHIR_Module) -> EHIR_Module:
+    def run(self, module: EHIR_TypedModule) -> EHIR_TypedModule:
         module.ast = self._run_ast(module.ast)
         return module
 

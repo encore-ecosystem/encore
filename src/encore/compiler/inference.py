@@ -66,6 +66,8 @@ class TypeInferer:
         self._impl_traits: dict[str, list[str]] = {}
         self._generic_impl_traits: list[tuple[list[Type], str]] = []
         self._trait_impl_records: list[s.Statement_Impl] = []
+        self._type_aliases: dict[str, str] = {}
+        self._ambiguous_type_aliases: set[str] = set()
         self._globals: dict[str, Type] = {}
         self._unsafe_depth = 0
         self._current_fn_return_type: Type | None = None
@@ -137,19 +139,26 @@ class TypeInferer:
                 self._funcs[name] = statement
             elif isinstance(statement, s.Statement_StructureDefinition):
                 name = local_name or statement.signature.name
-                self._structs[name] = self._normalize_struct_definition(statement.signature)
+                canonical_name = self._canonical_declaration_name(statement.signature.name, local_name, source_name)
+                self._register_type_aliases(canonical_name, statement.signature.name, local_name, source_name)
+                definition = self._normalize_struct_definition(statement.signature)
+                self._structs[name] = definition
+                self._structs[canonical_name] = definition
             elif isinstance(statement, s.Statement_EnumDefinition):
                 name = local_name or statement.name
+                canonical_name = self._canonical_declaration_name(statement.name, local_name, source_name)
+                self._register_type_aliases(canonical_name, statement.name, local_name, source_name)
                 self._enums[name] = statement
+                self._enums[canonical_name] = statement
             elif isinstance(statement, s.Statement_Trait):
                 name = local_name or statement.name
                 self._traits[name] = statement
             elif isinstance(statement, s.Statement_Impl):
-                struct_name = statement.struct.name
+                struct_name = self._canonical_type_name(statement.struct.name)
                 if statement.trait_name is not None:
                     self._trait_impl_records.append(statement)
                     owner_generic = next(
-                        (generic for generic in statement.generics if generic.name == struct_name), None
+                        (generic for generic in statement.generics if generic.name == statement.struct.name), None
                     )
                     if owner_generic is not None:
                         bounds = list(owner_generic.bounds) if isinstance(owner_generic, s.GenericParam) else []
@@ -189,6 +198,48 @@ class TypeInferer:
             source_name = getattr(declaration, "source_name", None)
             normalized.append((statement, local_name, source_name))
         return normalized
+
+    def _canonical_declaration_name(
+        self,
+        declared_name: str,
+        local_name: str | None,
+        source_name: str | None,
+    ) -> str:
+        return source_name or local_name or declared_name
+
+    def _register_type_aliases(
+        self,
+        canonical_name: str,
+        declared_name: str,
+        local_name: str | None,
+        source_name: str | None,
+    ) -> None:
+        for alias in (canonical_name, declared_name, local_name, source_name, canonical_name.rsplit("::", 1)[-1]):
+            if alias:
+                self._register_type_alias(alias, canonical_name)
+
+    def _register_type_alias(self, alias: str, canonical_name: str) -> None:
+        if alias in self._ambiguous_type_aliases:
+            return
+        existing = self._type_aliases.get(alias)
+        if existing is None:
+            self._type_aliases[alias] = canonical_name
+            return
+        if existing == canonical_name:
+            return
+        self._type_aliases.pop(alias, None)
+        self._ambiguous_type_aliases.add(alias)
+
+    def _canonical_type_name(self, name: str) -> str:
+        exact = self._type_aliases.get(name)
+        if exact is not None:
+            return exact
+        if "::" not in name:
+            return name
+        leaf = name.rsplit("::", 1)[-1]
+        if leaf in self._ambiguous_type_aliases:
+            return name
+        return self._type_aliases.get(leaf, name)
 
     def _infer_function(self, statement: s.Statement_FunctionDefinition, self_type: Type | None = None):
         statement.signature = self._normalize_signature(statement.signature, self_type=self_type)
@@ -278,13 +329,13 @@ class TypeInferer:
                         raise TypeError(f"Return type mismatch: {ret_type} != {fn_ret_type}")
                 elif isinstance(statement, s.Statement_While):
                     cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
-                    if cond is not None and cond != Type("bool"):
+                    if cond is not None and not self._is_bool_type(cond):
                         raise TypeError(f"While condition must be bool, got {cond}")
                     self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
                 elif isinstance(statement, s.Statement_DoWhile):
                     self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
                     cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
-                    if cond is not None and cond != Type("bool"):
+                    if cond is not None and not self._is_bool_type(cond):
                         raise TypeError(f"Do-while condition must be bool, got {cond}")
                 elif isinstance(statement, s.Statement_Loop):
                     self._infer_block(statement.body, dict(env), dict(mutability_env), fn_ret_type)
@@ -334,10 +385,11 @@ class TypeInferer:
                     base_resource_type = (
                         base_resource_type.pointee if is_reference_like_type(base_resource_type) else base_resource_type
                     )
-                    trait_names = list(self._impl_traits.get(base_resource_type.name, []))
-                    resource_leaf = base_resource_type.name.rsplit("::", 1)[-1]
+                    resource_type_name = self._canonical_type_name(base_resource_type.name)
+                    trait_names = list(self._impl_traits.get(resource_type_name, []))
+                    resource_leaf = resource_type_name.rsplit("::", 1)[-1]
                     for owner_name, owner_traits in self._impl_traits.items():
-                        if owner_name == base_resource_type.name:
+                        if owner_name == resource_type_name:
                             continue
                         if owner_name.rsplit("::", 1)[-1] == resource_leaf:
                             for owner_trait in owner_traits:
@@ -376,7 +428,7 @@ class TypeInferer:
                 elif isinstance(statement, s.Statement_If):
                     for branch in statement.branches:
                         cond = self._infer_expression(branch.expr, env, Type("bool"), mutability_env)
-                        if cond is not None and cond != Type("bool"):
+                        if cond is not None and not self._is_bool_type(cond):
                             raise TypeError(f"If condition must be bool, got {cond}")
                         self._infer_block(branch.body, dict(env), dict(mutability_env), fn_ret_type)
                     if statement.else_body is not None:
@@ -656,7 +708,7 @@ class TypeInferer:
             return base_type_name(name).rsplit("::", 1)[-1]
 
         def impl_trait_names(receiver: Type) -> list[str]:
-            type_name = receiver.name
+            type_name = self._canonical_type_name(receiver.name)
             out = list(self._impl_traits.get(type_name, []))
             leaf = leaf_type_name(type_name)
             for owner_name, trait_names in self._impl_traits.items():
@@ -685,13 +737,14 @@ class TypeInferer:
             if trait_signature is not None:
                 return f"{trait_type.name}::{method_name}", trait_signature
 
-        inherent_name = f"{base_receiver_type.name}::{method_name}"
+        receiver_type_name = self._canonical_type_name(base_receiver_type.name)
+        inherent_name = f"{receiver_type_name}::{method_name}"
         inherent_signature = self._lookup_function_signature(inherent_name)
         if inherent_signature is not None:
             return inherent_name, inherent_signature
 
-        receiver_base = base_type_name(base_receiver_type.name)
-        receiver_leaf = leaf_type_name(base_receiver_type.name)
+        receiver_base = base_type_name(receiver_type_name)
+        receiver_leaf = leaf_type_name(receiver_type_name)
         inherent_candidates: list[str] = []
         for candidate_name in self._funcs:
             if not candidate_name.endswith(f"::{method_name}"):
@@ -1190,7 +1243,7 @@ class TypeInferer:
                     source_line=getattr(expr, "source_line", None),
                     module_id=getattr(expr, "module_id", None),
                 )
-            if len(expr.segments) == 2 and expr.segments[0].name in self._enums:
+            if len(expr.segments) == 2 and self._canonical_type_name(expr.segments[0].name) in self._enums:
                 return self._infer_enum_path(expr, expected_type)
             return None
 
@@ -1295,9 +1348,9 @@ class TypeInferer:
         if isinstance(expr, s.Expression_UnaryOperation):
             operand_type = self._infer_expression(expr.expr, env, expected_type, mutable_env)
             if expr.operator in ("!", "not"):
-                if operand_type is not None and operand_type != Type("bool"):
+                if operand_type is not None and not self._is_bool_type(operand_type):
                     raise TypeError(f"Logical unary operator '{expr.operator}' expects bool, got {operand_type}")
-                if expected_type is not None and expected_type != Type("bool"):
+                if expected_type is not None and not self._is_bool_type(expected_type):
                     raise TypeError(f"Type mismatch: {expected_type} != bool")
                 return Type("bool")
             if expr.operator in ("+", "-", "~", "++", "--"):
@@ -1308,11 +1361,11 @@ class TypeInferer:
             if expr.operator in ("&&", "||"):
                 lhs_type = self._infer_expression(expr.lhs, env, mutable_env=mutable_env)
                 rhs_type = self._infer_expression(expr.rhs, env, mutable_env=mutable_env)
-                if lhs_type is not None and lhs_type != Type("bool"):
+                if lhs_type is not None and not self._is_bool_type(lhs_type):
                     raise TypeError(f"Logical operator '{expr.operator}' expects bool lhs, got {lhs_type}")
-                if rhs_type is not None and rhs_type != Type("bool"):
+                if rhs_type is not None and not self._is_bool_type(rhs_type):
                     raise TypeError(f"Logical operator '{expr.operator}' expects bool rhs, got {rhs_type}")
-                if expected_type is not None and expected_type != Type("bool"):
+                if expected_type is not None and not self._is_bool_type(expected_type):
                     raise TypeError(f"Type mismatch: {expected_type} != bool")
                 return Type("bool")
 
@@ -1340,7 +1393,7 @@ class TypeInferer:
                 lhs_type = self._infer_expression(expr.lhs, env, lhs_expected_type or rhs_type, mutable_env)
             self._assert_operator_trait_bound(lhs_type, expr.operator)
             if expr.operator in comparison_ops:
-                if expected_type is not None and expected_type != Type("bool"):
+                if expected_type is not None and not self._is_bool_type(expected_type):
                     raise TypeError(f"Type mismatch: {expected_type} != bool")
                 return Type("bool")
             return lhs_type or expected_type or rhs_type
@@ -1359,7 +1412,7 @@ class TypeInferer:
             return None
 
         enum_type = expr.callee.segments[0]
-        enum_def = self._enums.get(enum_type.name)
+        enum_def = self._enums.get(self._canonical_type_name(enum_type.name))
         if enum_def is None:
             return None
 
@@ -1367,7 +1420,7 @@ class TypeInferer:
         expected_base = unwrap_for_storage(expected_type) if expected_type is not None else None
         if expected_base is not None and is_reference_like_type(expected_base):
             expected_base = expected_base.pointee
-        if expected_base is not None and expected_base.name == enum_def.name:
+        if expected_base is not None and self._canonical_type_name(expected_base.name) == self._canonical_type_name(enum_def.name):
             for generic, concrete in zip(enum_def.generics, expected_base.generics):
                 generic_mapping.setdefault(generic.name, concrete)
 
@@ -1392,7 +1445,7 @@ class TypeInferer:
 
     def _infer_enum_path(self, expr: s.Expression_Path, expected_type: Optional[Type] = None) -> Type:
         enum_type = expr.segments[0]
-        enum_def = self._enums[enum_type.name]
+        enum_def = self._enums[self._canonical_type_name(enum_type.name)]
         variant_name = expr.segments[1].name
         variant = next((candidate for candidate in enum_def.body if candidate.name == variant_name), None)
         if variant is None:
@@ -1404,7 +1457,7 @@ class TypeInferer:
         expected_base = unwrap_for_storage(expected_type) if expected_type is not None else None
         if expected_base is not None and is_reference_like_type(expected_base):
             expected_base = expected_base.pointee
-        if expected_base is not None and expected_base.name == enum_def.name:
+        if expected_base is not None and self._canonical_type_name(expected_base.name) == self._canonical_type_name(enum_def.name):
             for generic, concrete in zip(enum_def.generics, expected_base.generics):
                 generic_mapping.setdefault(generic.name, concrete)
 
@@ -1478,7 +1531,7 @@ class TypeInferer:
             if self._trait_satisfies_bound(active_bound.name, bound):
                 return True
 
-        for trait_name in self._impl_traits.get(concrete.name, []):
+        for trait_name in self._impl_traits.get(self._canonical_type_name(concrete.name), []):
             if self._trait_satisfies_bound(trait_name, bound):
                 return True
 
@@ -1578,7 +1631,7 @@ class TypeInferer:
 
         for branch in expr.branches:
             cond = self._infer_expression(branch.expr, env, Type("bool"), mutable_env)
-            if cond is not None and cond != Type("bool"):
+            if cond is not None and not self._is_bool_type(cond):
                 raise TypeError(f"If condition must be bool, got {cond}")
 
             branch_type = self._infer_expression(branch.body, dict(env), expected_type, dict(mutable_env))
@@ -1675,7 +1728,7 @@ class TypeInferer:
             if isinstance(statement, s.Statement_If):
                 for branch in statement.branches:
                     cond = self._infer_expression(branch.expr, env, Type("bool"), mutability_env)
-                    if cond is not None and cond != Type("bool"):
+                    if cond is not None and not self._is_bool_type(cond):
                         raise TypeError(f"If condition must be bool, got {cond}")
                     self._infer_expression_block_nested(branch.body, dict(env), dict(mutability_env))
                 if statement.else_body is not None:
@@ -1693,7 +1746,7 @@ class TypeInferer:
 
             if isinstance(statement, s.Statement_While):
                 cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
-                if cond is not None and cond != Type("bool"):
+                if cond is not None and not self._is_bool_type(cond):
                     raise TypeError(f"While condition must be bool, got {cond}")
                 self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
                 return
@@ -1701,7 +1754,7 @@ class TypeInferer:
             if isinstance(statement, s.Statement_DoWhile):
                 self._infer_expression_block_nested(statement.body, dict(env), dict(mutability_env))
                 cond = self._infer_expression(statement.expr, env, Type("bool"), mutability_env)
-                if cond is not None and cond != Type("bool"):
+                if cond is not None and not self._is_bool_type(cond):
                     raise TypeError(f"Do-while condition must be bool, got {cond}")
                 return
 
@@ -1851,7 +1904,7 @@ class TypeInferer:
 
     def _resolve_enum_definition(self, typ: Type) -> tuple[s.Statement_EnumDefinition, dict[str, Type]]:
         base_type = self._normalize_match_scrutinee_type(typ)
-        enum_def = self._enums.get(base_type.name)
+        enum_def = self._enums.get(self._canonical_type_name(base_type.name))
         if enum_def is None:
             raise TypeError(f"Match expression must be an enum, got {typ}")
         generic_mapping = {generic.name: concrete for generic, concrete in zip(enum_def.generics, base_type.generics)}
@@ -1869,7 +1922,7 @@ class TypeInferer:
 
         base_type = self._normalize_match_scrutinee_type(scrutinee_type)
         explicit_enum = pattern.segments[0]
-        if explicit_enum.name != base_type.name:
+        if self._canonical_type_name(explicit_enum.name) != self._canonical_type_name(base_type.name):
             raise TypeError(f"Pattern enum '{explicit_enum.name}' does not match scrutinee type '{base_type.name}'")
 
         if explicit_enum.generics and not self._types_compatible(base_type, explicit_enum):
@@ -1881,7 +1934,7 @@ class TypeInferer:
         return typ.pointee if is_reference_like_type(typ) else typ
 
     def _is_match_enum_type(self, typ: Type) -> bool:
-        return self._normalize_match_scrutinee_type(typ).name in self._enums
+        return self._canonical_type_name(self._normalize_match_scrutinee_type(typ).name) in self._enums
 
     def _is_builtin_match_type(self, typ: Type) -> bool:
         base_type = self._normalize_match_scrutinee_type(typ)
@@ -1934,7 +1987,7 @@ class TypeInferer:
             return list(base_type.generics)
         if is_array_type(base_type):
             return [base_type.generics[0] for _ in range(array_size(base_type))]
-        struct_def = self._structs.get(base_type.name)
+        struct_def = self._structs.get(self._canonical_type_name(base_type.name))
         if not isinstance(struct_def, s.CLikeStructureDefinition):
             return []
         generic_mapping = {generic.name: concrete for generic, concrete in zip(struct_def.generics, base_type.generics)}
@@ -1955,7 +2008,7 @@ class TypeInferer:
                 idx = int(field)
                 return base_type.generics[0] if 0 <= idx < array_size(base_type) else None
             return None
-        struct_def = self._structs.get(base_type.name)
+        struct_def = self._structs.get(self._canonical_type_name(base_type.name))
         if not isinstance(struct_def, s.CLikeStructureDefinition):
             return None
         generic_mapping = {generic.name: concrete for generic, concrete in zip(struct_def.generics, base_type.generics)}
@@ -2010,7 +2063,8 @@ class TypeInferer:
         if is_raw_pointer_type(pattern) and is_raw_pointer_type(concrete):
             self._match_generic(pattern.pointee, concrete.pointee, mapping)
             return
-        if not pattern.generics and pattern.name not in self._structs and pattern.name not in self._enums:
+        canonical_pattern_name = self._canonical_type_name(pattern.name)
+        if not pattern.generics and canonical_pattern_name not in self._structs and canonical_pattern_name not in self._enums:
             mapping.setdefault(pattern.name, concrete)
             return
         for lhs, rhs in zip(pattern.generics, concrete.generics):
@@ -2024,6 +2078,9 @@ class TypeInferer:
             return False
         expected = unwrap_for_storage(expected)
         actual = unwrap_for_storage(actual)
+
+        if self._is_bool_type(expected) or self._is_bool_type(actual):
+            return self._is_bool_type(expected) and self._is_bool_type(actual)
 
         if isinstance(expected, AnySmartPointer):
             if not is_reference_like_type(actual):
@@ -2052,7 +2109,7 @@ class TypeInferer:
         if self._can_widen_primitive(actual, expected):
             return True
 
-        if expected.name != actual.name:
+        if self._canonical_type_name(expected.name) != self._canonical_type_name(actual.name):
             return False
         if len(expected.generics) != len(actual.generics):
             return False
@@ -2131,6 +2188,11 @@ class TypeInferer:
         return typ.name in ("usize", "isize") or (
             len(typ.name) > 1 and typ.name[0] in ("u", "i") and typ.name[1:].isdigit()
         )
+
+    @staticmethod
+    def _is_bool_type(typ: Type) -> bool:
+        typ = unwrap_for_storage(typ)
+        return typ.name in {"bool", "u1"}
 
     @staticmethod
     def _is_unsigned_integer_type(typ: Type) -> bool:

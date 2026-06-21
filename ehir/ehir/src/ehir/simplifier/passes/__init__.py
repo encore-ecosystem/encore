@@ -11,7 +11,6 @@ from .reference_lowering import ReferenceLoweringPass
 from .retainer import RetainInsertionPass
 from .safety import SafetyValidator
 from .stripper import StripperPass, UnneededSymbolsStripper
-from .typed_verifier import TypedVerifierPass
 
 __all__ = [
     "AutoDropPass",
@@ -30,6 +29,5 @@ __all__ = [
     "RetainInsertionPass",
     "SafetyValidator",
     "StripperPass",
-    "TypedVerifierPass",
     "UnneededSymbolsStripper",
 ]

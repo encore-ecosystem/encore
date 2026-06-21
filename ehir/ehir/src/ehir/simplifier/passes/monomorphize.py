@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import fields, is_dataclass, replace
 
-from ehir.builder import EHIR_Module
+from ehir.resolver import EHIR_TypedModule
 from ehir.core.derectives import Derective_enum, Derective_fn, Derective_impl, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum, TupleLikeVariant, UnitLikeVariant
@@ -30,7 +30,7 @@ class MonomorphizationPass(SimplifierPass):
     def _is_box_template_method_name(name: str) -> bool:
         return name.startswith("Box[T]::") or name.startswith("Box::")
 
-    def run(self, module: EHIR_Module) -> EHIR_Module:
+    def run(self, module: EHIR_TypedModule) -> EHIR_TypedModule:
         module.ast = self._run_ast(module.ast)
         return module
 

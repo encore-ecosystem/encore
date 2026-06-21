@@ -1,16 +1,12 @@
 import hashlib
-import json
 import pickle
-import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from ehir.resolver import Resolver
 from git import Repo
 
 from encore import ENCORE_CACHE_DIR, ENCORE_INDEX_URL, PROJECT_ROOT, __version__
-from encore.compiler.inference import TypeInferer
 from encore.compiler.lexer import Lexer
 from encore.compiler.macro_expander import MacroExpander
 from encore.compiler.parser import EncoreParser
@@ -26,7 +22,6 @@ from encore.compiler.parser.statements import (
     Statement_TopLevel,
     Statement_Trait,
 )
-from encore.compiler.translator import EncoreToEHIRTranslator
 from encore.utils.manifest import ProjectManifest
 
 
@@ -210,21 +205,13 @@ class RefrainManager:
         self._resolve_imports(data, data.import_graph)
         data.ast = self._flatten_import_graph_ast(data.import_graph)
         data.symbols.all = self._collect_flat_symbols(data.ast)
-
-        # Type Infer in Encore side
-        TypeInferer().infer(data.ast)
         data.symbols.resolved = True
-
-        # Translate to typed EHIR Module
-        raw_module = EncoreToEHIRTranslator().translate_ast(data.ast)
-        typ_module = Resolver().run(raw_module)
 
         # Dump cache
         if load_cache:
             cache_dump_path.parent.mkdir(exist_ok=True)
-            cache_content = asdict(typ_module)
             with cache_dump_path.open("wb") as f:
-                pickle.dump(cache_content, f)
+                pickle.dump(data, f)
 
         return data
 

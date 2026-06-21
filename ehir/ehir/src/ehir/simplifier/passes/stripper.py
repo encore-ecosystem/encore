@@ -1,6 +1,6 @@
 from dataclasses import fields, is_dataclass
 
-from ehir.builder import EHIR_Module
+from ehir.resolver import EHIR_TypedModule
 from ehir.core.derectives import Derective_enum, Derective_extern_fn, Derective_fn, Derective_impl, Derective_struct, Derective_trait
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import Instruction_call, Instruction_callvoid
@@ -10,7 +10,7 @@ from ehir.simplifier.base import SimplifierPass
 
 
 class StripperPass(SimplifierPass):
-    def run(self, module: EHIR_Module, *, keep_public_api: bool = True) -> EHIR_Module:
+    def run(self, module: EHIR_TypedModule, *, keep_public_api: bool = True) -> EHIR_TypedModule:
         module.ast = self._run_ast(module.ast, keep_public_api=keep_public_api)
         return module
 

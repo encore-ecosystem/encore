@@ -15,6 +15,7 @@ from ehir.core.derectives import (
 from ehir.core.derectives.base import Derective
 from ehir.parser import Parser
 from ehir.postprocessor import EHIR_ProcessedModule, Postprocessor
+from ehir.resolver import EHIR_TypedModule, Resolver
 from ehir.simplifier.base import SimplifierPass
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 from ehir.simplifier.passes import (
@@ -29,7 +30,6 @@ from ehir.simplifier.passes import (
     ReferenceLoweringPass,
     RetainInsertionPass,
     StripperPass,
-    TypedVerifierPass,
 )
 
 COMPILER_VERSION = version(__package__ or "ehir")
@@ -59,13 +59,14 @@ class EHIR_ProjectCompiler:
 
     def compile(self, program: str) -> EHIR_ProcessedModule:
         ast = self._parser.parse(program)
-        return self.compile_module(EHIR_Module(ast))
+        return self.compile_module(self.resolve_module(EHIR_Module(ast)))
 
-    def compile_module(self, module: EHIR_Module) -> EHIR_ProcessedModule:
-        module = self._time_it(InstanceCallLoweringPass(), module)
+    def resolve_module(self, module: EHIR_Module) -> EHIR_TypedModule:
+        return self._time_stage("Resolver", module, lambda: Resolver().run(module))
+
+    def compile_module(self, module: EHIR_TypedModule) -> EHIR_ProcessedModule:
         module = self._time_it(ReferenceLoweringPass(), module)
         module = self._time_it(MonomorphizationPass(), module)
-        module = self._time_it(TypedVerifierPass(), module)
         module = self._time_it(MatchValidatorPass(), module)
         module = self._time_it(AutoDropPass(), module)
         module = self._time_it(AutoRetainPass(), module)
@@ -102,7 +103,7 @@ class EHIR_ProjectCompiler:
             result.append(directive)
         return result
 
-    def _time_it(self, simp_pass: SimplifierPass, module: EHIR_Module) -> EHIR_Module:
+    def _time_it(self, simp_pass: SimplifierPass, module: EHIR_TypedModule) -> EHIR_TypedModule:
         return self._time_stage(simp_pass.__class__.__name__, module, lambda: simp_pass.run(module))
 
     def _time_stage(self, stage: str, module: EHIR_Module, runner):

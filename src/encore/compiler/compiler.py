@@ -109,7 +109,8 @@ class EncoreCompiler:
                     imported_declarations=alias_declarations,
                 )
                 ehir_compiler = EHIR_ProjectCompiler()
-                ehir_resolved_module = ehir_compiler.compile_module(ehir_raw_module)
+                ehir_typed_module = ehir_compiler.resolve_module(ehir_raw_module)
+                ehir_resolved_module = ehir_compiler.compile_module(ehir_typed_module)
                 self.profile_records.extend(
                     CompileProfileRecord(
                         module=refrain.name,

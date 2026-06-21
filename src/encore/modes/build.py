@@ -102,24 +102,29 @@ def print_profile_report(compiler: EncoreCompiler) -> None:
         records_by_module.setdefault(record.module, []).append(record)
 
     for module, records in records_by_module.items():
+        module_total = totals_by_module[module]
         table = PrettyTable()
         table.title = module
-        table.field_names = ["Pass", "Time, ms"]
+        table.field_names = ["Pass", "Time, ms", "%"]
         table.align["Pass"] = "l"
         table.align["Time, ms"] = "r"
+        table.align["%"] = "r"
         for record in records:
-            table.add_row([record.stage, f"{record.seconds * 1000:.3f}"])
-        table.add_row(["TOTAL", f"{totals_by_module[module] * 1000:.3f}"])
+            percent = (record.seconds / module_total * 100.0) if module_total > 0 else 0.0
+            table.add_row([record.stage, f"{record.seconds * 1000:.3f}", f"{percent:.2f}"])
+        table.add_row(["TOTAL", f"{module_total * 1000:.3f}", "100.00"])
         print(table)
 
     totals_table = PrettyTable()
     totals_table.title = "Totals"
-    totals_table.field_names = ["Refrain", "Time, ms"]
+    totals_table.field_names = ["Refrain", "Time, ms", "%"]
     totals_table.align["Refrain"] = "l"
     totals_table.align["Time, ms"] = "r"
+    totals_table.align["%"] = "r"
     for module, seconds in totals_by_module.items():
-        totals_table.add_row([module, f"{seconds * 1000:.3f}"])
-    totals_table.add_row(["TOTAL", f"{total * 1000:.3f}"])
+        percent = (seconds / total * 100.0) if total > 0 else 0.0
+        totals_table.add_row([module, f"{seconds * 1000:.3f}", f"{percent:.2f}"])
+    totals_table.add_row(["TOTAL", f"{total * 1000:.3f}", "100.00"])
     print(totals_table)
 
 

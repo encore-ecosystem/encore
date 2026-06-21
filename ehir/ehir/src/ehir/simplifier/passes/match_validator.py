@@ -1,4 +1,4 @@
-from ehir.builder import EHIR_Module
+from ehir.resolver import EHIR_TypedModule
 from ehir.core.derectives import Derective_enum, Derective_fn
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import TupleLikeVariant, UnitLikeVariant
@@ -8,7 +8,7 @@ from ehir.simplifier.base import SimplifierPass
 
 
 class MatchValidatorPass(SimplifierPass):
-    def run(self, module: EHIR_Module) -> EHIR_Module:
+    def run(self, module: EHIR_TypedModule) -> EHIR_TypedModule:
         module.ast = self._run_ast(module.ast)
         return module
 

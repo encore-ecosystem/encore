@@ -1,6 +1,6 @@
 from copy import deepcopy
 
-from ehir.builder import EHIR_Module
+from ehir.resolver import EHIR_TypedModule
 from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_fn
 from ehir.core.derectives.base import Derective
@@ -13,7 +13,7 @@ from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
 
 class CfreeSimplifierPass(SimplifierPass):
-    def run(self, module: EHIR_Module) -> EHIR_Module:
+    def run(self, module: EHIR_TypedModule) -> EHIR_TypedModule:
         module.ast = self._run_ast(module.ast)
         return module
 

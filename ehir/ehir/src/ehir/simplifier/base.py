@@ -1,9 +1,9 @@
 from abc import ABC, abstractmethod
 
-from ehir.builder import EHIR_Module
+from ehir.resolver import EHIR_TypedModule
 
 
 class SimplifierPass(ABC):
     @abstractmethod
-    def run(self, module: EHIR_Module) -> EHIR_Module:
+    def run(self, module: EHIR_TypedModule) -> EHIR_TypedModule:
         raise NotImplementedError
