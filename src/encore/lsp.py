@@ -458,20 +458,24 @@ class RefrainManager:
         return None
 
     def _statements_for_binding(self, graph: ImportGraph, binding: SymbolBinding) -> list[Statement_TopLevel]:
-        result = [binding.statement]
-
+        result: list[Statement_TopLevel] = []
+        seen: set[int] = set()
         for statement in graph.modules[binding.module_id]:
-            if not isinstance(statement, Statement_Impl):
+            if isinstance(statement, Statement_Import):
                 continue
-            if self._impl_belongs_to_symbol(statement, binding):
-                result.append(statement)
+            if not isinstance(statement, Statement_TopLevel):
+                continue
+            if id(statement) in seen:
+                continue
+            seen.add(id(statement))
+            result.append(statement)
         return result
 
     def _impl_belongs_to_symbol(self, statement: Statement_Impl, binding: SymbolBinding) -> bool:
         if isinstance(binding.statement, Statement_Trait):
             return statement.trait_name == binding.source_name
         if isinstance(binding.statement, Statement_StructureDefinition | Statement_EnumDefinition):
-            return statement.trait_name is None and statement.struct.name == binding.source_name
+            return statement.struct.name == binding.source_name
         return False
 
     def _build_import_graph(self, data: RefrainData) -> ImportGraph:
@@ -599,17 +603,18 @@ class RefrainManager:
         if not import_path:
             raise RuntimeError(f"Unable to resolve empty import in {source}")
 
+        owner = self._source_owner(data, source)
         root_name = import_path[0]
         suffix = import_path[1:]
 
-        if root_name in {"refrain", "repo", data.name}:
-            base_dir = data.path / "src"
+        if root_name in {"refrain", "repo", owner.name}:
+            base_dir = owner.path / "src"
             parts = suffix
         elif root_name == "mod":
             base_dir = source.parent
             parts = suffix
         else:
-            dependency = self._dependency_by_name(data, root_name)
+            dependency = self._dependency_by_name(owner, root_name) or self._dependency_by_name(data, root_name)
             if dependency is None:
                 raise RuntimeError(f"Unknown import root '{root_name}' in {source}: {'::'.join(import_path)}")
             base_dir = dependency.path / "src"
@@ -628,6 +633,35 @@ class RefrainManager:
             if dependency.name == name:
                 return dependency
         return None
+
+    def _source_owner(self, root: RefrainData, source: Path) -> RefrainData:
+        source = source.resolve()
+        candidates = self._collect_refrain_tree(root)
+        candidates.sort(key=lambda item: len(item.path.resolve().parts), reverse=True)
+        for candidate in candidates:
+            src_root = (candidate.path / "src").resolve()
+            try:
+                source.relative_to(src_root)
+            except ValueError:
+                continue
+            return candidate
+        return root
+
+    def _collect_refrain_tree(self, root: RefrainData) -> list[RefrainData]:
+        result: list[RefrainData] = []
+        seen: set[Path] = set()
+
+        def visit(data: RefrainData) -> None:
+            key = data.path.resolve()
+            if key in seen:
+                return
+            seen.add(key)
+            result.append(data)
+            for dependency in data.dependencies:
+                visit(dependency)
+
+        visit(root)
+        return result
 
     def _resolve_module_file(self, base_dir: Path, module_parts: tuple[str, ...]) -> Path | None:
         module_base = base_dir.joinpath(*module_parts) if module_parts else base_dir / "lib"

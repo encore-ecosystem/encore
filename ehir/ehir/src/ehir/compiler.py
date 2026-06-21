@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass, field
 from importlib.metadata import version
 from pathlib import Path
@@ -14,6 +15,7 @@ from ehir.core.derectives import (
 from ehir.core.derectives.base import Derective
 from ehir.parser import Parser
 from ehir.postprocessor import EHIR_ProcessedModule, Postprocessor
+from ehir.simplifier.base import SimplifierPass
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 from ehir.simplifier.passes import (
     AutoDropPass,
@@ -29,6 +31,7 @@ from ehir.simplifier.passes import (
     ResolverPass,
     RetainInsertionPass,
     StripperPass,
+    TypedVerifierPass,
 )
 
 COMPILER_VERSION = version(__package__ or "ehir")
@@ -46,40 +49,38 @@ class CompileStageError(RuntimeError):
 
 @dataclass(frozen=True)
 class CompileProfileRecord:
-    refrain: str
+    module: str
     stage: str
     seconds: float
-    detail: str = ""
 
 
 @dataclass
 class EHIR_ProjectCompiler:
     _parser: Parser = field(default_factory=Parser)
+    pass_timings: list[CompileProfileRecord] = field(default_factory=list)
 
     def compile(self, program: str) -> EHIR_ProcessedModule:
         ast = self._parser.parse(program)
         return self.compile_module(EHIR_Module(ast))
 
     def compile_module(self, module: EHIR_Module) -> EHIR_ProcessedModule:
-        module = InstanceCallLoweringPass().run(module)
-        module = ResolverPass().run(module)
-        module = ReferenceLoweringPass().run(module)
-        module = MonomorphizationPass().run(module)
-        module = ResolverPass().run(module)
-        module = MonomorphizationPass().run(module)
-        module = ResolverPass().run(module)
-        module = MatchValidatorPass().run(module)
-        module = AutoDropPass().run(module)
-        module = AutoRetainPass().run(module)
-        module = RetainInsertionPass().run(module)
-        module = NormalizerPass().run(module)
-        module = DeallocatorPass().run(module)
-        module = DropLoweringPass().run(module)
-        module = DowngraderPass().run(module)
-        module = StripperPass().run(module)
-        module.ast = self._postprocessable_directives(module.ast)
-        module.ast = self._deduplicate_directives(module.ast)
-        return Postprocessor().run(module)
+        module = self._time_it(InstanceCallLoweringPass(), module)
+        module = self._time_it(ResolverPass(), module)
+        module = self._time_it(ReferenceLoweringPass(), module)
+        module = self._time_it(MonomorphizationPass(), module)
+        module = self._time_it(TypedVerifierPass(), module)
+        module = self._time_it(MatchValidatorPass(), module)
+        module = self._time_it(AutoDropPass(), module)
+        module = self._time_it(AutoRetainPass(), module)
+        module = self._time_it(RetainInsertionPass(), module)
+        module = self._time_it(NormalizerPass(), module)
+        module = self._time_it(DeallocatorPass(), module)
+        module = self._time_it(DropLoweringPass(), module)
+        module = self._time_it(DowngraderPass(), module)
+        module = self._time_it(StripperPass(), module)
+        module.ast = self._time_stage("PostprocessFilter", module, lambda: self._postprocessable_directives(module.ast))
+        module.ast = self._time_stage("DeduplicateDirectives", module, lambda: self._deduplicate_directives(module.ast))
+        return self._time_stage("Postprocessor", module, lambda: Postprocessor().run(module))
 
     def _postprocessable_directives(self, ast: list[Derective]) -> list[Derective]:
         return [
@@ -102,4 +103,20 @@ class EHIR_ProjectCompiler:
                 continue
             seen.add(key)
             result.append(directive)
+        return result
+
+    def _time_it(self, simp_pass: SimplifierPass, module: EHIR_Module) -> EHIR_Module:
+        return self._time_stage(simp_pass.__class__.__name__, module, lambda: simp_pass.run(module))
+
+    def _time_stage(self, stage: str, module: EHIR_Module, runner):
+        start_timestamp = time.perf_counter()
+        result = runner()
+        time_elapsed = time.perf_counter() - start_timestamp
+        self.pass_timings.append(
+            CompileProfileRecord(
+                module=str(module.id) if module.id != Path() else "<memory>",
+                stage=stage,
+                seconds=time_elapsed,
+            )
+        )
         return result

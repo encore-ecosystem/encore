@@ -8,9 +8,11 @@ from ehir.core.derectives import Derective_enum, Derective_fn, Derective_impl, D
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import Instruction_call, Instruction_wraps
-from ehir.core.primitives.base import Primitive, PrimitiveType
+from ehir.core.primitives import Usize_t
+from ehir.core.primitives.base import Primitive
 from ehir.core.struct import Struct
 from ehir.core.type import Pointer, Reference, Type, concrete_box_type_name, mangle_type_name
+from ehir.core.variable import Parameter
 from ehir.simplifier.base import SimplifierPass
 
 
@@ -37,7 +39,14 @@ class MonomorphizationPass(SimplifierPass):
             d.name for d in ast if isinstance(d, (Derective_struct, Derective_enum))
         }
         box_struct = next((d for d in ast if isinstance(d, Derective_struct) and d.name == "Box" and d.generics), None)
+        concrete_box_types = self._collect_concrete_box_types(ast)
         if box_struct is None:
+            if concrete_box_types:
+                ast = [*ast, *self._builtin_box_structs(ast, concrete_box_types)]
+                for i, directive in enumerate(ast):
+                    ast[i] = self._rewrite_box_uses_in_value(directive)
+                self._rewrite_box_call_names(ast)
+                self._canonicalize_stack_wrap_calls(ast)
             out = self._run_generic_monomorphization_fixpoint(ast)
             return self._prune_unreferenced_generic_functions(out)
 
@@ -48,7 +57,6 @@ class MonomorphizationPass(SimplifierPass):
             and self._is_box_template_method_name(d.name)
         ]
 
-        concrete_box_types = self._collect_concrete_box_types(ast)
         if not concrete_box_types:
             out = self._run_generic_monomorphization_fixpoint(ast)
             return self._prune_unreferenced_generic_functions(out)
@@ -350,10 +358,44 @@ class MonomorphizationPass(SimplifierPass):
             self._collect_from_type(g, out)
         if typ.name == "Box" and len(typ.generics) == 1:
             inner = typ.generics[0]
-            if isinstance(inner, PrimitiveType):
+            if not self._is_placeholder_type(inner):
                 out[str(inner)] = deepcopy(inner)
-            elif not inner.generics and inner.name not in {"T", "Self"}:
-                out[str(inner)] = deepcopy(inner)
+
+    def _builtin_box_structs(self, ast: list[Derective], concrete_box_types: list[Type]) -> list[Derective_struct]:
+        existing = {directive.name for directive in ast if isinstance(directive, Derective_struct)}
+        result: list[Derective_struct] = []
+        if "OwnerHeader" not in existing:
+            result.append(
+                Derective_struct(
+                    name="OwnerHeader",
+                    generics=[],
+                    params=[
+                        Parameter("kind", Usize_t(8)),
+                        Parameter("ref_count", Usize_t()),
+                        Parameter("inner", Usize_t(1)),
+                        Parameter("outer", Usize_t(1)),
+                        Parameter("active", Usize_t(1)),
+                        Parameter("deal", Usize_t(1)),
+                    ],
+                )
+            )
+            existing.add("OwnerHeader")
+        for inner in concrete_box_types:
+            name = concrete_box_type_name(inner)
+            if name in existing:
+                continue
+            result.append(
+                Derective_struct(
+                    name=name,
+                    generics=[],
+                    params=[
+                        Parameter("ptr", Pointer(deepcopy(inner))),
+                        Parameter("owner", Pointer(Type("OwnerHeader"))),
+                    ],
+                )
+            )
+            existing.add(name)
+        return result
 
     def _rewrite_box_uses_in_value(self, value):
         if isinstance(value, Type):

@@ -252,6 +252,7 @@ class EncoreToEHIRTranslator:
         self._module_namespace_cache = {}
         self._function_aliases = {}
         self._type_aliases = {}
+        self._module_type_aliases = {}
         self._trait_aliases = {}
         self._active_generic_bounds = {}
         self._active_generic_names = set()
@@ -384,125 +385,43 @@ class EncoreToEHIRTranslator:
 
     def preload_declarations(self, declarations: list[tuple[Path, s.Statement_TopLevel, str | None, str | None]]):
         for module_id, statement, local_name, source_name in declarations:
-            self._register_declaration_alias(module_id, statement, local_name=local_name, source_name=source_name)
-            if isinstance(statement, s.Statement_Global):
-                binding_name = local_name or statement.name
-                self._global_exprs[binding_name] = statement.expr
+            prev_module_id = self._current_module_id
+            self._current_module_id = module_id
+            try:
+                self._register_declaration_alias(module_id, statement, local_name=local_name, source_name=source_name)
+                if isinstance(statement, s.Statement_Global):
+                    binding_name = local_name or statement.name
+                    self._global_exprs[binding_name] = statement.expr
+            finally:
+                self._current_module_id = prev_module_id
 
         for module_id, statement, _, source_name in declarations:
-            if isinstance(statement, s.Statement_StructureDefinition):
-                signature = statement.signature
-                if source_name is not None:
-                    signature = replace(signature, name=source_name)
-                definition = self._normalize_struct_definition(signature)
-                definition = replace(definition, name=self._qualify_type_name(module_id, definition.name))
-                self._structs[definition.name] = definition
-            elif isinstance(statement, s.Statement_FunctionDefinition):
-                signature = statement.signature
-                if source_name is not None:
-                    signature = replace(signature, name=source_name)
-                signature = self._normalize_signature(signature)
-                if signature.type is None:
-                    continue
-                internal_name = self._qualify_function_name(module_id, signature.name)
-                internal_signature = replace(signature, name=internal_name)
-                self._register_source_signature(internal_signature)
-                if self._signature_has_any_pointer(signature):
-                    for pointer_cls, suffix in ((HeapSmartPointer, "__H"), (StackSmartPointer, "__S")):
-                        concrete_sig = self._specialize_signature_any_pointer(internal_signature, pointer_cls)
-                        concrete_name = f"{internal_name}{suffix}"
-                        self._register_source_signature(replace(concrete_sig, name=concrete_name))
-                        self._any_pointer_variants.setdefault(internal_name, {})[pointer_cls] = concrete_name
-                        self._funcs[concrete_name] = Derective_fn(
-                            name=concrete_name,
-                            generics=[self._translate_type(g) for g in concrete_sig.generics],
-                            params=self._lower_params(concrete_sig.params),
-                            body=[],
-                            ret_type=self._translate_type(concrete_sig.type),
-                        )
-                else:
-                    self._funcs[internal_name] = Derective_fn(
-                        name=internal_name,
-                        generics=[self._translate_type(g) for g in internal_signature.generics],
-                        params=self._lower_params(internal_signature.params),
-                        body=[],
-                        ret_type=self._translate_type(internal_signature.type),
-                    )
-            elif isinstance(statement, s.Statement_EnumDefinition):
-                enum_statement = statement
-                if source_name is not None:
-                    enum_statement = replace(enum_statement, name=source_name)
-                directive = self._build_enum_directive(enum_statement, module_id=module_id)
-                self._enums[directive.name] = directive
-            elif isinstance(statement, s.FunctionSignature):
-                signature = statement if source_name is None else replace(statement, name=source_name)
-                self._extern_fns[signature.name] = signature
-                self._register_source_signature(signature)
-                self._funcs[signature.name] = Derective_extern_fn(
-                    name=signature.name,
-                    params=self._lower_params(signature.params),
-                    ret_type=self._translate_type(signature.type),
-                )
-            elif isinstance(statement, s.Statement_Trait):
-                trait_statement = statement
-                if source_name is not None:
-                    trait_statement = replace(trait_statement, name=source_name)
-                internal_trait_name = self._qualify_trait_name(module_id, trait_statement.name)
-                internal_trait = replace(
-                    trait_statement,
-                    name=internal_trait_name,
-                    bases=[self._translate_trait_type(base) for base in trait_statement.bases],
-                )
-                self._traits[internal_trait_name] = internal_trait
-                for method in internal_trait.body:
-                    method_signature = self._normalize_signature(
-                        replace(method, name=f"{internal_trait_name}::{method.name}")
-                    )
-                    self._register_source_signature(method_signature)
-            elif isinstance(statement, s.Statement_Impl):
-                struct_type = self._translate_type(statement.struct)
-                if statement.trait_name is not None:
-                    resolved_trait_name = self._trait_aliases.get(statement.trait_name, statement.trait_name)
-                    owner_generic = next(
-                        (generic for generic in statement.generics if generic.name == struct_type.name),
-                        None,
-                    )
-                    if owner_generic is not None:
-                        bounds = list(owner_generic.bounds) if isinstance(owner_generic, s.GenericParam) else []
-                        self._generic_impl_traits.append((bounds, resolved_trait_name))
-                    else:
-                        self._impl_traits.setdefault(struct_type.name, []).append(resolved_trait_name)
-                    continue
-
-                for method in statement.body:
-                    if method.type is None:
+            prev_module_id = self._current_module_id
+            self._current_module_id = module_id
+            try:
+                if isinstance(statement, s.Statement_StructureDefinition):
+                    signature = statement.signature
+                    if source_name is not None:
+                        signature = replace(signature, name=source_name)
+                    definition = self._normalize_struct_definition(signature)
+                    definition = replace(definition, name=self._qualify_type_name(module_id, definition.name))
+                    self._structs[definition.name] = definition
+                elif isinstance(statement, s.Statement_FunctionDefinition):
+                    signature = statement.signature
+                    if source_name is not None:
+                        signature = replace(signature, name=source_name)
+                    signature = self._normalize_signature(signature)
+                    if signature.type is None:
                         continue
-
-                    impl_generic_names = {generic.name for generic in statement.generics}
-                    merged_method_generics = [*statement.generics]
-                    for generic in method.generics:
-                        if generic.name in impl_generic_names:
-                            continue
-                        merged_method_generics.append(generic)
-                        impl_generic_names.add(generic.name)
-
-                    normalized_signature = self._normalize_signature(
-                        replace(
-                            method.signature,
-                            name=f"{struct_type.name}::{method.name}",
-                            generics=merged_method_generics,
-                        ),
-                        self_type=statement.struct,
-                    )
-                    self._register_source_signature(normalized_signature)
-                    if self._signature_has_any_pointer(normalized_signature):
+                    internal_name = self._qualify_function_name(module_id, signature.name)
+                    internal_signature = replace(signature, name=internal_name)
+                    self._register_source_signature(internal_signature)
+                    if self._signature_has_any_pointer(signature):
                         for pointer_cls, suffix in ((HeapSmartPointer, "__H"), (StackSmartPointer, "__S")):
-                            concrete_sig = self._specialize_signature_any_pointer(normalized_signature, pointer_cls)
-                            concrete_name = f"{normalized_signature.name}{suffix}"
+                            concrete_sig = self._specialize_signature_any_pointer(internal_signature, pointer_cls)
+                            concrete_name = f"{internal_name}{suffix}"
                             self._register_source_signature(replace(concrete_sig, name=concrete_name))
-                            self._any_pointer_variants.setdefault(normalized_signature.name, {})[pointer_cls] = (
-                                concrete_name
-                            )
+                            self._any_pointer_variants.setdefault(internal_name, {})[pointer_cls] = concrete_name
                             self._funcs[concrete_name] = Derective_fn(
                                 name=concrete_name,
                                 generics=[self._translate_type(g) for g in concrete_sig.generics],
@@ -511,15 +430,105 @@ class EncoreToEHIRTranslator:
                                 ret_type=self._translate_type(concrete_sig.type),
                             )
                     else:
-                        self._funcs[normalized_signature.name] = Derective_fn(
-                            name=normalized_signature.name,
-                            generics=[self._translate_type(g) for g in normalized_signature.generics],
-                            params=self._lower_params(normalized_signature.params),
+                        self._funcs[internal_name] = Derective_fn(
+                            name=internal_name,
+                            generics=[self._translate_type(g) for g in internal_signature.generics],
+                            params=self._lower_params(internal_signature.params),
                             body=[],
-                            ret_type=self._translate_type(normalized_signature.type),
+                            ret_type=self._translate_type(internal_signature.type),
                         )
-            elif isinstance(statement, s.Statement_Global):
-                continue
+                elif isinstance(statement, s.Statement_EnumDefinition):
+                    enum_statement = statement
+                    if source_name is not None:
+                        enum_statement = replace(enum_statement, name=source_name)
+                    directive = self._build_enum_directive(enum_statement, module_id=module_id)
+                    self._enums[directive.name] = directive
+                elif isinstance(statement, s.FunctionSignature):
+                    signature = statement if source_name is None else replace(statement, name=source_name)
+                    self._extern_fns[signature.name] = signature
+                    self._register_source_signature(signature)
+                    self._funcs[signature.name] = Derective_extern_fn(
+                        name=signature.name,
+                        params=self._lower_params(signature.params),
+                        ret_type=self._translate_type(signature.type),
+                    )
+                elif isinstance(statement, s.Statement_Trait):
+                    trait_statement = statement
+                    if source_name is not None:
+                        trait_statement = replace(trait_statement, name=source_name)
+                    internal_trait_name = self._qualify_trait_name(module_id, trait_statement.name)
+                    internal_trait = replace(
+                        trait_statement,
+                        name=internal_trait_name,
+                        bases=[self._translate_trait_type(base) for base in trait_statement.bases],
+                    )
+                    self._traits[internal_trait_name] = internal_trait
+                    for method in internal_trait.body:
+                        method_signature = self._normalize_signature(
+                            replace(method, name=f"{internal_trait_name}::{method.name}")
+                        )
+                        self._register_source_signature(method_signature)
+                elif isinstance(statement, s.Statement_Impl):
+                    struct_type = self._translate_type(statement.struct)
+                    if statement.trait_name is not None:
+                        resolved_trait_name = self._trait_aliases.get(statement.trait_name, statement.trait_name)
+                        owner_generic = next(
+                            (generic for generic in statement.generics if generic.name == struct_type.name),
+                            None,
+                        )
+                        if owner_generic is not None:
+                            bounds = list(owner_generic.bounds) if isinstance(owner_generic, s.GenericParam) else []
+                            self._generic_impl_traits.append((bounds, resolved_trait_name))
+                        else:
+                            self._impl_traits.setdefault(struct_type.name, []).append(resolved_trait_name)
+                        continue
+
+                    for method in statement.body:
+                        if method.type is None:
+                            continue
+
+                        impl_generic_names = {generic.name for generic in statement.generics}
+                        merged_method_generics = [*statement.generics]
+                        for generic in method.generics:
+                            if generic.name in impl_generic_names:
+                                continue
+                            merged_method_generics.append(generic)
+                            impl_generic_names.add(generic.name)
+
+                        normalized_signature = self._normalize_signature(
+                            replace(
+                                method.signature,
+                                name=f"{struct_type.name}::{method.name}",
+                                generics=merged_method_generics,
+                            ),
+                            self_type=statement.struct,
+                        )
+                        self._register_source_signature(normalized_signature)
+                        if self._signature_has_any_pointer(normalized_signature):
+                            for pointer_cls, suffix in ((HeapSmartPointer, "__H"), (StackSmartPointer, "__S")):
+                                concrete_sig = self._specialize_signature_any_pointer(normalized_signature, pointer_cls)
+                                concrete_name = f"{normalized_signature.name}{suffix}"
+                                self._register_source_signature(replace(concrete_sig, name=concrete_name))
+                                self._any_pointer_variants.setdefault(normalized_signature.name, {})[pointer_cls] = (
+                                    concrete_name
+                                )
+                                self._funcs[concrete_name] = Derective_fn(
+                                    name=concrete_name,
+                                    generics=[self._translate_type(g) for g in concrete_sig.generics],
+                                    params=self._lower_params(concrete_sig.params),
+                                    body=[],
+                                    ret_type=self._translate_type(concrete_sig.type),
+                                )
+                        else:
+                            self._funcs[normalized_signature.name] = Derective_fn(
+                                name=normalized_signature.name,
+                                generics=[self._translate_type(g) for g in normalized_signature.generics],
+                                params=self._lower_params(normalized_signature.params),
+                                body=[],
+                                ret_type=self._translate_type(normalized_signature.type),
+                            )
+            finally:
+                self._current_module_id = prev_module_id
 
     def _translate_statement(self, statement: s.Statement) -> Derective | None:
         try:
@@ -1235,6 +1244,7 @@ class EncoreToEHIRTranslator:
                     self._var_ptrs[param.name] = Variable(param.name, param.type)
                 else:
                     mut_slot = Variable(self._fresh_temp_name(f"{param.name}_mut"), Pointer(param.type))
+                    self._remember_source_type(mut_slot, source_param_types.get(param.name, param.type))
                     self._builder._add(Instruction_salloc(var_out=mut_slot, type=param.type))
                     self._builder._add(Instruction_store(var_src=Variable(param.name, param.type), var_dst=mut_slot))
                     self._var_ptrs[param.name] = mut_slot
@@ -1289,12 +1299,16 @@ class EncoreToEHIRTranslator:
         if isinstance(statement, s.Statement_StructureDefinition):
             local = local_name or statement.signature.name
             source = source_name or statement.signature.name
-            self._type_aliases[local] = self._qualify_type_name(module_id, source)
+            qualified = self._qualify_type_name(module_id, source)
+            self._type_aliases[local] = qualified
+            self._module_type_aliases.setdefault(module_id.resolve(), {})[local] = qualified
             return
         if isinstance(statement, s.Statement_EnumDefinition):
             local = local_name or statement.name
             source = source_name or statement.name
-            self._type_aliases[local] = self._qualify_type_name(module_id, source)
+            qualified = self._qualify_type_name(module_id, source)
+            self._type_aliases[local] = qualified
+            self._module_type_aliases.setdefault(module_id.resolve(), {})[local] = qualified
             return
         if isinstance(statement, s.Statement_Trait):
             local = local_name or statement.name
@@ -1400,6 +1414,29 @@ class EncoreToEHIRTranslator:
 
     def _source_type_for_var(self, var: Variable) -> Type | None:
         return self._source_var_types.get(var.name)
+
+    def _source_type_for_binding(self, name: str) -> Type | None:
+        ptr = self._var_ptrs.get(name)
+        if ptr is not None:
+            if source_type := self._source_type_for_var(ptr):
+                return source_type
+            if isinstance(ptr.type, Pointer):
+                return ptr.type.pointee
+        var = self._var_vals.get(name)
+        if var is not None:
+            return self._source_type_for_var(var) or var.type
+        var = self._builder.variables.get(name)
+        if var is not None:
+            return self._source_type_for_var(var) or var.type
+        return None
+
+    def _infer_struct_field_source_type(self, expr: s.Expression_StructField) -> Type | None:
+        owner_type = self._source_type_for_binding(expr.name.split(".", 1)[0])
+        for segment in expr.name.split(".")[1:]:
+            owner_type = self._lookup_field_source_type(owner_type, segment)
+            if owner_type is None:
+                return None
+        return self._lookup_field_source_type(owner_type, expr.field)
 
     def _field_owner_type(self, var: Variable) -> Type | None:
         return self._source_type_for_var(var) or var.type
@@ -2612,7 +2649,10 @@ class EncoreToEHIRTranslator:
         elif isinstance(expr, s.Expression_MethodCall):
             receiver = self._translate_expression(expr.receiver).var_out
             if receiver.type is None:
-                source_type = self._source_type_for_var(receiver)
+                inferred_receiver_type = getattr(expr.receiver, "type", None)
+                source_type = inferred_receiver_type or self._source_type_for_var(receiver)
+                if source_type is None and isinstance(expr.receiver, s.Expression_StructField):
+                    source_type = self._infer_struct_field_source_type(expr.receiver)
                 if source_type is not None:
                     receiver.type = self._translate_type(source_type)
                 elif isinstance(expr.receiver, s.Expression_Path) and len(expr.receiver.segments) == 1:
@@ -3417,6 +3457,11 @@ class EncoreToEHIRTranslator:
         return None
 
     def _canonical_type_name(self, name: str) -> str:
+        if "::" in name:
+            return name
+        module_aliases = self._module_type_aliases.get(self._current_module_id.resolve())
+        if module_aliases is not None and name in module_aliases:
+            return module_aliases[name]
         return self._type_aliases.get(name, name)
 
     def _translate_type(self, typ: Type) -> Type:

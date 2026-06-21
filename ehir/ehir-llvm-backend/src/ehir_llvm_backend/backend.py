@@ -25,6 +25,8 @@ class EHIR_LLVM_Backend:
         *,
         opt_profile: OptimizationProfile = OptimizationProfile.debug,
         output_path: Path | None = None,
+        native_objects: list[Path] | None = None,
+        native_link_args: list[str] | None = None,
     ) -> Path:
         llvm_mod = self._codegen.run(module)
         llvm_optimized_mod = self._optimizer.run(llvm_mod, opt_profile=opt_profile)
@@ -39,7 +41,12 @@ class EHIR_LLVM_Backend:
             opt_level=self._assembler_opt_level(opt_profile),
         )
         if self._has_entrypoint(module):
-            return self._linker.run(object_path, paths.output)
+            return self._linker.run(
+                object_path,
+                paths.output,
+                native_objects=native_objects,
+                native_link_args=native_link_args,
+            )
         return self._archiver.run(object_path, paths.output)
 
     def _artifact_paths(self, module: EHIR_ProcessedModule, output_path: Path | None) -> "_ArtifactPaths":
