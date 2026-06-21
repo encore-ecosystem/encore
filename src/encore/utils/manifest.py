@@ -3,7 +3,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic.fields import Field
 
 from encore import CORE_PATH, PROJECT_ROOT
@@ -41,7 +41,12 @@ class ProjectManifest(StrictModel):
     def read(cls, path: Path) -> Self:
         with path.open("rb") as f:
             data = tomllib.load(f)
-        result = cls(**data)
+
+        try:
+            result = cls(**data)
+        except ValidationError as e:
+            print(f"Validation error in manifest {path}:\n{e}")
+            exit(-1)
 
         # Inject libcore
         libcore = "sys@core"
