@@ -288,6 +288,7 @@ class EncoreToEHIRTranslator:
         imported_declarations: list[object] | None = None,
     ) -> EHIR_Module:
         self._current_module_id = module_id or Path()
+        self._module.id = self._current_module_id
         imported_declarations = imported_declarations or []
         declaration_entries = [*self._normalize_declaration_entries(imported_declarations)] + [
             (getattr(statement, "module_id", None) or self._current_module_id, statement, None, None)

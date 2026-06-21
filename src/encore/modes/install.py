@@ -8,10 +8,10 @@ from rich.console import Console
 
 from encore.modes.build import (
     AVAILABLE_BACKENDS,
-    _resolve_dependency,
+    AVAILABLE_OPTPROFILES,
     build_project,
-    load_manifest,
 )
+from encore.utils.manifest import ProjectManifest
 
 INDEX_GITHUB_PREFIX = "git@https://github.com/encore-language-index/"
 
@@ -44,7 +44,7 @@ def add_install_parser(subparsers) -> tuple[str, Callable]:
     install_parser.add_argument(
         "--profile",
         default="release",
-        choices=set(AVAILABLE_OPTPROFILES.keys()),
+        choices=set(AVAILABLE_OPTPROFILES),
         help="Build optimization profile. Defaults to release.",
     )
     install_parser.add_argument("--debug", action="store_true", help="Shortcut for --profile debug")
@@ -64,8 +64,6 @@ def handle_install(args: Namespace):
     console = Console(highlight=False)
 
     project_path = _resolve_install_project(args, cwd)
-    if resolve_project_target_type(project_path) != Refrain.TargetType.EXECUTABLE:
-        raise RuntimeError(f"install is only available for executable projects: {project_path}")
 
     profile = "debug" if args.debug else args.profile
     outputs = build_project(
@@ -77,7 +75,7 @@ def handle_install(args: Namespace):
     )
     _, executable_path = outputs[0]
 
-    manifest = load_manifest(project_path)
+    manifest = ProjectManifest.read_with_default_filename(project_path)
     installed_name = _validate_binary_name(args.name or manifest.project.name)
     if executable_path.suffix and not installed_name.endswith(executable_path.suffix):
         installed_name += executable_path.suffix
@@ -105,7 +103,7 @@ def _resolve_install_project(args: Namespace, cwd: Path) -> Path:
         return cwd
 
     dep_ref = _normalize_install_ref(args.package)
-    return _resolve_dependency(dep_ref, cwd, update=args.update)
+    raise RuntimeError(f"Package install from indexes is not available in this compiler path yet: {dep_ref}")
 
 
 def _normalize_install_ref(raw: str) -> str:

@@ -54,6 +54,7 @@ class ImportedTopLevelDeclaration:
 class CompiledRefrain:
     refrain: RefrainData
     ehir_module: EHIR_Module
+    output_path: Path
 
 
 @dataclass
@@ -85,7 +86,6 @@ class EncoreCompiler:
                 ehir_raw_module = EncoreToEHIRTranslator().translate_ast(refrain.ast, module_id=entrypoint)
                 ehir_resolved_module = EHIR_ProjectCompiler().compile_module(ehir_raw_module)
                 output_path = EHIR_LLVM_Backend().compile(ehir_resolved_module)
-                print(output_path)
             except Exception as exc:
                 raise with_diagnostic_context(
                     exc,
@@ -93,7 +93,13 @@ class EncoreCompiler:
                     module_id=entrypoint,
                     source_text=source_text,
                 ) from exc
-            result.append(CompiledRefrain(refrain=refrain, ehir_module=ehir_resolved_module))
+            result.append(
+                CompiledRefrain(
+                    refrain=refrain,
+                    ehir_module=ehir_resolved_module,
+                    output_path=output_path,
+                )
+            )
 
         return result
 

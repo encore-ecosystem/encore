@@ -1,11 +1,11 @@
 from argparse import Namespace
 from pathlib import Path
+import subprocess
 from typing import Callable
 
 from ehir_llvm_backend.optimizer import OptimizationProfile
 
 from encore.compiler import EncoreCompiler
-from encore.compiler.compiler import CompiledRefrain
 
 AVAILABLE_BACKENDS = ["llvm"]
 AVAILABLE_OPTPROFILES = [OptimizationProfile.debug, OptimizationProfile.release, OptimizationProfile.extreme]
@@ -52,14 +52,51 @@ def add_build_options(parser) -> None:
 
 def handle_build(args: Namespace):
     cwd = Path().resolve()
-    build_project(path=cwd, profile=OptimizationProfile.debug, show_status=True)
+    build_project(
+        path=cwd,
+        backend=args.backend,
+        profile=resolve_build_profile(args),
+        no_cache=args.no_cache,
+        cfg_overrides=args.cfg,
+        show_status=True,
+        profile_timings=profile_timings_enabled(args),
+    )
 
 
 def build_project(
     path: Path,
-    profile: OptimizationProfile,
+    backend: str | None = "llvm",
+    profile: OptimizationProfile | str | None = OptimizationProfile.debug,
     show_status: bool = False,
-) -> list[CompiledRefrain]:
+    **_unused,
+) -> list[tuple[str, Path]]:
+    if backend not in (None, "llvm"):
+        raise RuntimeError(f"Unsupported backend: {backend}")
     compiler = EncoreCompiler()
     compiler.add_compile_target(path)
-    return compiler.compile_all_targets()
+    compiled = compiler.compile_all_targets()
+    target_names = {target.name for target in compiler.targets}
+    outputs = [(item.refrain.name, item.output_path) for item in compiled]
+    return [
+        *[item for item in outputs if item[0] in target_names],
+        *[item for item in outputs if item[0] not in target_names],
+    ]
+
+
+def run_binary(executable_path: Path, program_args: list[str]) -> int:
+    result = subprocess.run([str(executable_path), *program_args], check=False)
+    return result.returncode
+
+
+def resolve_build_profile(args: Namespace) -> OptimizationProfile:
+    if args.profile in {OptimizationProfile.debug, OptimizationProfile.release, OptimizationProfile.extreme}:
+        return args.profile
+    if args.release:
+        return OptimizationProfile.release
+    if args.opt_profile is not None:
+        return args.opt_profile
+    return OptimizationProfile.debug
+
+
+def profile_timings_enabled(args: Namespace) -> bool:
+    return args.profile == PROFILE_TIMINGS_SENTINEL

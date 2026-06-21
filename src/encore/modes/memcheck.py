@@ -7,6 +7,8 @@ from typing import Callable
 from encore.modes.build import (
     add_build_options,
     build_project,
+    profile_timings_enabled,
+    resolve_build_profile,
 )
 
 
@@ -41,8 +43,6 @@ def add_memcheck_parser(subparsers) -> tuple[str, Callable]:
 
 def handle_memcheck(args: Namespace):
     cwd = Path().resolve()
-    if resolve_project_target_type(cwd) != Refrain.TargetType.EXECUTABLE:
-        raise RuntimeError("memcheck is only available for executable projects")
 
     valgrind = shutil.which(args.valgrind)
     if valgrind is None:

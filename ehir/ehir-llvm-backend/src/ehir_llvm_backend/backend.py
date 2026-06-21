@@ -19,8 +19,69 @@ class EHIR_LLVM_Backend:
         self._assembler = Assembler()
         self._linker = Linker()
 
-    def compile(self, module: EHIR_ProcessedModule) -> Path:
-        llvm_mod = Codegen().run(module)
-        llvm_optimized_mod = Optimizer().run(llvm_mod, opt_profile=OptimizationProfile.debug)
+    def compile(
+        self,
+        module: EHIR_ProcessedModule,
+        *,
+        opt_profile: OptimizationProfile = OptimizationProfile.debug,
+        output_path: Path | None = None,
+    ) -> Path:
+        llvm_mod = self._codegen.run(module)
+        llvm_optimized_mod = self._optimizer.run(llvm_mod, opt_profile=opt_profile)
 
-        print(llvm_optimized_mod)
+        paths = self._artifact_paths(module, output_path)
+        paths.object.parent.mkdir(parents=True, exist_ok=True)
+        paths.output.parent.mkdir(parents=True, exist_ok=True)
+
+        object_path = self._assembler.run(
+            llvm_optimized_mod,
+            paths.object,
+            opt_level=self._assembler_opt_level(opt_profile),
+        )
+        if self._has_entrypoint(module):
+            return self._linker.run(object_path, paths.output)
+        return self._archiver.run(object_path, paths.output)
+
+    def _artifact_paths(self, module: EHIR_ProcessedModule, output_path: Path | None) -> "_ArtifactPaths":
+        project_root = self._project_root(module)
+        profile = "debug"
+        name = self._module_name(module, project_root)
+        object_path = project_root / "target" / profile / "object" / f"{name}.o"
+
+        if output_path is not None:
+            return _ArtifactPaths(object=object_path, output=output_path)
+
+        if self._has_entrypoint(module):
+            return _ArtifactPaths(object=object_path, output=project_root / "target" / profile / name)
+        return _ArtifactPaths(object=object_path, output=project_root / "target" / profile / f"lib{name}.a")
+
+    def _project_root(self, module: EHIR_ProcessedModule) -> Path:
+        if module.id != Path():
+            source_path = module.id
+            if source_path.name in {"main.enq", "lib.enq"} and source_path.parent.name == "src":
+                return source_path.parent.parent
+            return source_path.parent
+        return Path.cwd()
+
+    def _module_name(self, module: EHIR_ProcessedModule, project_root: Path) -> str:
+        if project_root.name:
+            return project_root.name
+        if module.id != Path() and module.id.stem:
+            return module.id.stem
+        return "main"
+
+    def _has_entrypoint(self, module: EHIR_ProcessedModule) -> bool:
+        return any(func.name == "main" for func in module.funcs)
+
+    def _assembler_opt_level(self, opt_profile: OptimizationProfile) -> int:
+        if opt_profile == OptimizationProfile.debug:
+            return 0
+        if opt_profile == OptimizationProfile.release:
+            return 1
+        return 2
+
+
+@dataclass(frozen=True)
+class _ArtifactPaths:
+    object: Path
+    output: Path
