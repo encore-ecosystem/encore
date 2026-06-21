@@ -4,7 +4,7 @@ from pathlib import Path
 
 from ehir.builder import EHIR_Module
 from ehir.parser import Parser
-from ehir.postprocessor import ProcessedModule
+from ehir.postprocessor import EHIR_ProcessedModule
 from ehir.simplifier.passes import (
     ResolverPass,
 )
@@ -34,12 +34,12 @@ class CompileProfileRecord:
 class EHIR_ProjectCompiler:
     _parser: Parser = field(default_factory=Parser)
 
-    def compile(self, program: str) -> ProcessedModule:
+    def compile(self, program: str) -> EHIR_ProcessedModule:
         ast = self._parser.parse(program)
         mod = EHIR_Module(ast)
         return self.compile_module(mod)
 
-    def compile_module(self, module: EHIR_Module) -> ProcessedModule:
+    def compile_module(self, module: EHIR_Module) -> EHIR_ProcessedModule:
         a = ResolverPass().run(module)
         print(a)
 

@@ -78,7 +78,7 @@ from ehir.postprocessor.instructions import (
     ProcessedInstruction_switch,
     ProcessedInstruction_xor,
 )
-from ehir.postprocessor.module import ProcessedModule
+from ehir.postprocessor.module import EHIR_ProcessedModule
 from ehir.postprocessor.special import ProcessedBlock
 from ehir.simplifier.normalizer.norm_fn import Normalized_fn
 
@@ -90,7 +90,7 @@ from .derectives import (
 
 
 class Postprocessor:
-    def run(self, raw_mod: EHIR_Module) -> ProcessedModule:
+    def run(self, raw_mod: EHIR_Module) -> EHIR_ProcessedModule:
         self._known_type_suffixes = {
             directive.name for directive in raw_mod.ast if isinstance(directive, (Derective_struct, Derective_enum))
         } | {

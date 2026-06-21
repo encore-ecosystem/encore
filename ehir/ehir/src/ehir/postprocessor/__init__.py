@@ -1,7 +1,7 @@
-from .module import ProcessedModule
+from .module import EHIR_ProcessedModule
 from .postprocessor import Postprocessor
 
 __all__ = [
-    "ProcessedModule",
+    "EHIR_ProcessedModule",
     "Postprocessor",
 ]

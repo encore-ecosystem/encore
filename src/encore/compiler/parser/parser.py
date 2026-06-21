@@ -38,6 +38,7 @@ from ehir.core.instructions import (
 from ehir.core.instructions.base import Instruction
 from ehir.core.type import HeapSmartPointer, Pointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter
+from ehir.parser import Parser
 
 from encore.compiler.base import ParserBase
 from encore.compiler.lexer import LexerToken
@@ -84,7 +85,7 @@ FORBIDDEN_EHIR_INSTRUCTION_TYPES = (
 )
 
 
-class Parser(ParserBase[LexerToken, s.Statement]):
+class EncoreParser(ParserBase[LexerToken, s.Statement]):
     _module_id: Path | None = None
     _source_text: str = ""
 
@@ -97,13 +98,13 @@ class Parser(ParserBase[LexerToken, s.Statement]):
     ) -> list[s.Statement]:
         self._module_id = module_id
         self._source_text = source_text or ""
+        self._ehir_parser = Parser()
         return super().parse(source)
 
     def _parse(self) -> list[s.Statement]:
         self._parsing_match_header = False
         self._parsing_control_flow_header = False
         self._parsing_with_binding_expr = False
-        self._ehir_parser = EHIR_Parser()
         while not self._is_at_end():
             self._parse_top_level()
         return self._result
@@ -141,7 +142,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
             if attrs:
                 raise TypeError("Function attributes are only allowed on fn/extern fn")
             impl = self._parse_impl()
-            set_item_cfgs(impl, cfgs)
+            self._attach_span(impl, curr_token)
             self._push(impl)
             return
 
@@ -174,7 +175,6 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
         for statement in self._result[result_start:]:
             self._attach_span(statement, curr_token)
-            set_item_cfgs(statement, cfgs)
 
     def _parse_global_let(self, is_public: bool) -> s.Statement_Global:
         let_stmt = self._parse_let()
@@ -227,7 +227,6 @@ class Parser(ParserBase[LexerToken, s.Statement]):
         while self._peek_curr().type != TokenType.RIGHT_BRACE:
             attrs, cfgs = self._parse_metadata_directives()
             method = self._parse_function_signature(attrs=attrs)
-            set_item_cfgs(method, cfgs)
             body.append(method)
         self._safe_consume(TokenType.RIGHT_BRACE)
         self._push(s.Statement_Trait(is_public=is_public, name=name, generics=generics, body=body, bases=bases))
@@ -257,13 +256,12 @@ class Parser(ParserBase[LexerToken, s.Statement]):
                 sign = self._parse_function_signature(is_public, attrs=attrs)
                 fn_body = self._parse_block()
                 body.append(
-                    fn_def := s.Statement_FunctionDefinition(
+                    s.Statement_FunctionDefinition(
                         is_public=is_public,
                         signature=sign,
                         body=fn_body,
                     )
                 )
-                set_item_cfgs(fn_def, cfgs)
             self._safe_consume(TokenType.RIGHT_BRACE)
 
         return s.Statement_Impl(
@@ -1392,7 +1390,7 @@ class Parser(ParserBase[LexerToken, s.Statement]):
 
     @staticmethod
     def _is_numeric_type_name(name: str) -> bool:
-        return Parser._is_integer_type_name(name) or Parser._is_float_type_name(name)
+        return EncoreParser._is_integer_type_name(name) or EncoreParser._is_float_type_name(name)
 
     @staticmethod
     def _is_integer_type_name(name: str) -> bool:

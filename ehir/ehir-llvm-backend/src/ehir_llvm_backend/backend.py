@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from ehir.postprocessor import ProcessedModule
+from ehir.postprocessor import EHIR_ProcessedModule
 
 from ehir_llvm_backend.archiver import Archiver
 from ehir_llvm_backend.assembler import Assembler
@@ -19,7 +19,7 @@ class EHIR_LLVM_Backend:
         self._assembler = Assembler()
         self._linker = Linker()
 
-    def compile(self, module: ProcessedModule) -> Path:
+    def compile(self, module: EHIR_ProcessedModule) -> Path:
         llvm_mod = Codegen().run(module)
         llvm_optimized_mod = Optimizer().run(llvm_mod, opt_profile=OptimizationProfile.debug)
 

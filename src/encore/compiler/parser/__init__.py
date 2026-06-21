@@ -1,3 +1,3 @@
-from .parser import Parser
+from .parser import EncoreParser
 
-__all__ = ["Parser"]
+__all__ = ["EncoreParser"]

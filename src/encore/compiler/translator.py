@@ -39,11 +39,11 @@ from ehir.core.primitives import Float, Float_t, Isize, Isize_t, Str, Str_t, Usi
 from ehir.core.struct import Struct
 from ehir.core.type import HeapSmartPointer, Pointer, SmartPointer, StackSmartPointer, Type
 from ehir.core.variable import Parameter, Variable
+from ehir.parser import Parser
 
 from encore.compiler.inference import TypeInferer
 from encore.compiler.lexer import Lexer
 from encore.compiler.macro_expander import MacroExpander
-from encore.compiler.parser import Parser
 from encore.compiler.parser import statements as s
 from encore.compiler.parser.statements import Block
 from encore.compiler.types import (
@@ -147,7 +147,7 @@ BUILTIN_TYPE_NAMES = {
 }
 
 
-class Translator:
+class EncoreToEHIRTranslator:
     _funcs: dict[str, Derective_fn | Derective_extern_fn]
     _source_signatures: dict[str, s.FunctionSignature]
     _enums: dict[str, Derective_enum]
@@ -175,7 +175,7 @@ class Translator:
             self,
             *,
             scrutinee: Assignable,
-            base_scope: "Translator._ScopeSnapshot",
+            base_scope: "EncoreToEHIRTranslator._ScopeSnapshot",
             end_block,
             default_block,
             wildcard_arm: MatchBodyArmLike | None,
@@ -219,7 +219,7 @@ class Translator:
         self._reset_state()
 
     def _reset_state(self):
-        self._module = EHIR_Module(id=Path(), ast=[])
+        self._module = EHIR_Module(ast=[])
         self._builder = EHIR_Builder(self._module)
         self._current_function = None
         self._current_variable_name = "tmp"
@@ -228,7 +228,7 @@ class Translator:
         self._variables: dict[str, dict[str, Variable]] = {}
         self._while_counter = 0
         self._if_counter = 0
-        self._loop_stack: list[Translator._LoopContext] = []
+        self._loop_stack: list[EncoreToEHIRTranslator._LoopContext] = []
         self._with_cleanup_stack = []
         self._terminated_blocks: set[str] = set()
         self._var_vals: dict[str, Variable] = {}
@@ -290,7 +290,7 @@ class Translator:
         self._current_module_id = module_id or Path()
         imported_declarations = imported_declarations or []
         declaration_entries = [*self._normalize_declaration_entries(imported_declarations)] + [
-            (self._current_module_id, statement, None, None)
+            (getattr(statement, "module_id", None) or self._current_module_id, statement, None, None)
             for statement in ast
             if isinstance(statement, s.Statement_TopLevel)
         ]
@@ -1813,7 +1813,7 @@ class Translator:
 
         self._builder.position_at_end(body_block)
         self._loop_stack.append(
-            Translator._LoopContext(
+            EncoreToEHIRTranslator._LoopContext(
                 label=statement.label,
                 break_target=end_block.name,
                 continue_target=cond_block.name,
@@ -1840,7 +1840,7 @@ class Translator:
 
         self._builder.position_at_end(body_block)
         self._loop_stack.append(
-            Translator._LoopContext(
+            EncoreToEHIRTranslator._LoopContext(
                 label=None,
                 break_target=end_block.name,
                 continue_target=cond_block.name,
@@ -1872,7 +1872,7 @@ class Translator:
 
         self._builder.position_at_end(body_block)
         self._loop_stack.append(
-            Translator._LoopContext(
+            EncoreToEHIRTranslator._LoopContext(
                 label=statement.label,
                 break_target=end_block.name,
                 continue_target=latch_block.name,
@@ -1912,7 +1912,7 @@ class Translator:
 
         self._builder.position_at_end(body_block)
         self._loop_stack.append(
-            Translator._LoopContext(
+            EncoreToEHIRTranslator._LoopContext(
                 label=statement.label,
                 break_target=end_block.name,
                 continue_target=latch_block.name,

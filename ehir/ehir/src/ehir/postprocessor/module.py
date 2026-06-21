@@ -9,7 +9,7 @@ from .derectives import (
 
 
 @dataclass
-class ProcessedModule:
+class EHIR_ProcessedModule:
     id: Path
     structs: list[ProcessedDerective_struct]
     funcs: list[ProcessedDerective_extern_fn | ProcessedDerective_fn]
