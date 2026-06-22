@@ -332,27 +332,73 @@ class DowngraderPass(SimplifierPass):
     def _downgrade_wrap(self, instr: Instruction_wraps | Instruction_wraph) -> list[Instruction]:
         assert instr.variable.type is not None
         assert instr.var_out.type is not None
+        out_type = instr.var_out.type
+        box_struct = self._lookup_struct(out_type.name)
+        if box_struct is None or len(box_struct.params) < 2:
+            raise EhirCompileError(f"Cannot wrap value into unknown box type '{out_type}'", code="EHIR2201")
+
+        owner_type = Type("OwnerHeader")
+        owner_ptr = TypedVariable(name=f".{instr.var_out.name}_owner_ptr", type=Pointer(owner_type))
+        value_ptr = TypedVariable(name=f".{instr.var_out.name}_value_ptr", type=Pointer(instr.variable.type))
+
+        result: list[Instruction] = []
         if isinstance(instr, Instruction_wraph):
-            assert instr.var_out.type is not None
-            return [
+            result.append(Instruction_halloc(var_out=value_ptr, type=instr.variable.type))
+        else:
+            result.append(Instruction_salloc(var_out=value_ptr, type=instr.variable.type))
+
+        if needs_retain(instr.variable.type, self._aggregate_names):
+            result.append(
                 Instruction_call(
-                    var_out=instr.var_out,
-                    fn_name=f"{instr.var_out.type}::wrap",
+                    var_out=TypedVariable(f".retain_{instr.variable.name}", Type("void")),
+                    fn_name=retain_function_name(instr.variable.type),
                     generics=[],
                     args=[instr.variable],
                 )
-            ]
+            )
+        result.append(Instruction_store(var_src=instr.variable, var_dst=value_ptr))
 
-        temp_ptr = TypedVariable(name=f".{instr.var_out.name}_wrap_ptr", type=Pointer(instr.variable.type))
+        result.append(Instruction_halloc(var_out=owner_ptr, type=owner_type))
+        result.extend(self._initialize_box_owner(owner_ptr, heap=isinstance(instr, Instruction_wraph)))
+
+        box_ptr = TypedVariable(name=f".{instr.var_out.name}_box_ptr", type=Pointer(out_type))
+        result.append(Instruction_salloc(var_out=box_ptr, type=out_type))
+        result.extend(
+            [
+                *self._store_struct_field(box_ptr, "0", value_ptr),
+                *self._store_struct_field(box_ptr, "1", owner_ptr),
+                Instruction_load(var_out=instr.var_out, var=box_ptr),
+            ]
+        )
+        return result
+
+    def _initialize_box_owner(self, owner_ptr: TypedVariable, *, heap: bool) -> list[Instruction]:
+        kind = self._constant_value("heap_kind" if heap else "stack_kind", Usize(0 if heap else 1, 8))
+        ref_count = self._constant_value("ref_count", Usize(1))
+        false = self._constant_value("false", Usize(0, 1))
         return [
-            Instruction_salloc(var_out=temp_ptr, type=instr.variable.type),
-            Instruction_store(var_src=instr.variable, var_dst=temp_ptr),
-            Instruction_call(
-                var_out=instr.var_out,
-                fn_name=f"{instr.var_out.type}::from_stack_raw",
-                generics=[],
-                args=[temp_ptr],
-            ),
+            *kind[0],
+            *ref_count[0],
+            *false[0],
+            *self._store_struct_field(owner_ptr, "0", kind[1]),
+            *self._store_struct_field(owner_ptr, "1", ref_count[1]),
+            *self._store_struct_field(owner_ptr, "2", false[1]),
+            *self._store_struct_field(owner_ptr, "3", false[1]),
+            *self._store_struct_field(owner_ptr, "4", false[1]),
+            *self._store_struct_field(owner_ptr, "5", false[1]),
+        ]
+
+    def _constant_value(self, name: str, value: Usize) -> tuple[list[Instruction], TypedVariable]:
+        ptr = TypedVariable(name=f".{name}_{id(value)}_ptr", type=Pointer(value.type))
+        out = TypedVariable(name=f".{name}_{id(value)}", type=value.type)
+        return [Instruction_salloc(var_out=ptr, type=value.type), Instruction_put(var=ptr, primitive=value), Instruction_load(var_out=out, var=ptr)], out
+
+    def _store_struct_field(self, struct_ptr: TypedVariable, field: str, value: TypedVariable) -> list[Instruction]:
+        assert isinstance(struct_ptr.type, Pointer)
+        field_ptr = TypedVariable(name=f".{struct_ptr.name}.{field}", type=Pointer(value.type))
+        return [
+            Instruction_getfieldptr(var_out=field_ptr, src=struct_ptr, field=TypedVariable(name=field, type=value.type)),
+            Instruction_store(var_src=value, var_dst=field_ptr),
         ]
 
     def _lower_enum_derective(self, enum: Derective_enum) -> Derective_struct:

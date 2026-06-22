@@ -77,6 +77,7 @@ class Codegen:
 
     def _reset_state(self):
         self.module = ir.Module(context=ir.Context())
+        self.module.triple = llvm.get_default_triple()
         self.builder = ir.IRBuilder()
         self._variables: dict[str, object] = {}
         self._structs: dict[str, ir.BaseStructType] = {}
