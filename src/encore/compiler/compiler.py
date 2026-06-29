@@ -16,7 +16,7 @@ from ehir import EHIR_ProjectCompiler
 from encore.compiler.inference import TypeInferer
 from encore.compiler.parser import statements as s
 from encore.compiler.translator import EncoreToEHIRTranslator
-from encore.lsp import RefrainData, RefrainManager
+from encore.workspace import RefrainData, RefrainManager
 from encore.utils.diagnostics import with_diagnostic_context
 
 
