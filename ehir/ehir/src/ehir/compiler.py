@@ -10,7 +10,6 @@ from ehir.core.derectives import (
     Derective_impl,
     Derective_struct,
     Derective_trait,
-    Derective_typealias,
 )
 from ehir.core.derectives.base import Derective
 from ehir.parser import Parser
@@ -85,7 +84,7 @@ class EHIR_ProjectCompiler:
             directive
             for directive in ast
             if isinstance(directive, (Derective_struct, Derective_extern_fn, Normalized_fn))
-            and not isinstance(directive, (Derective_enum, Derective_trait, Derective_impl, Derective_typealias))
+            and not isinstance(directive, (Derective_enum, Derective_trait, Derective_impl))
         ]
 
     def _deduplicate_directives(self, ast: list[Derective]) -> list[Derective]:

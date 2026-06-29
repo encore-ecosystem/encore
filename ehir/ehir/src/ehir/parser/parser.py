@@ -8,7 +8,6 @@ from ehir.core.derectives import (
     Derective_impl,
     Derective_struct,
     Derective_trait,
-    Derective_typealias,
     TraitMethod,
 )
 from ehir.core.derectives.base import Derective
@@ -113,7 +112,7 @@ class Parser:
             elif current_token.type == TokenType.KW_STRUCT:
                 derective = self._parse_struct()
             elif current_token.type == TokenType.KW_TYPE:
-                derective = self._parse_typealias()
+                self._error_at(current_token, "typealias declarations are no longer supported")
             else:
                 self._error_at(current_token, "Unexpected token at top-level declaration")
 
@@ -153,8 +152,6 @@ class Parser:
             return "struct"
         if isinstance(derective, Derective_enum):
             return "enum"
-        if isinstance(derective, Derective_typealias):
-            return "typealias"
         if isinstance(derective, Derective_trait):
             return "trait"
         if isinstance(derective, Derective_impl):
@@ -169,15 +166,6 @@ class Parser:
                 self._error_at(self._lookup_curr(), f"Attribute 'safe' is not valid for {target}")
             if attr == "inline" and target not in {"fn", "extern_fn"}:
                 self._error_at(self._lookup_curr(), f"Attribute 'inline' is not valid for {target}")
-
-    def _parse_typealias(self) -> Derective_typealias:
-        self._safe_consume(TokenType.KW_TYPE)
-        name = self._safe_consume(TokenType.IDENTIFIER).value
-        self._safe_consume(TokenType.EQUAL)
-        target = self._parse_type()
-        if self._lookup_curr() == TokenType.OP_SCOPE:
-            self._safe_consume(TokenType.SEMICOLON)
-        return Derective_typealias(name=name, target=target)
 
     def _parse_metadata_directives(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         attrs: list[str] = []

@@ -91,6 +91,23 @@ fn first_or[T](value: Option[T], fallback: T) -> T {
 }
 ```
 
+## Unit Tests
+
+Use `#attr(test)` to mark a function as a unit test:
+
+```enq
+import core::vec::Vec
+
+#attr(test)
+fn vec_len_is_zero() -> bool {
+    let v = Vec[u32]::new()
+    ret v.len() == 0_usize
+}
+```
+
+The compiler expects unit tests to return `bool`, take no parameters and avoid
+generic parameters. `true` means pass, `false` means fail.
+
 ## Structs And Methods
 
 Struct fields are listed by name and type:

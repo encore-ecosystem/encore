@@ -1,5 +1,7 @@
+from collections import deque
 from copy import deepcopy
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
+from typing import Self
 
 from ehir.builder import EHIR_Module
 from ehir.core.derectives import (
@@ -9,7 +11,6 @@ from ehir.core.derectives import (
     Derective_impl,
     Derective_struct,
     Derective_trait,
-    Derective_typealias,
 )
 from ehir.core.derectives.base import Derective
 from ehir.core.enum import TupleLikeVariant, UnitLikeVariant
@@ -142,51 +143,93 @@ class InstanceCallLoweringPass:
 class EHIR_TypedModule(EHIR_Module): ...
 
 
+@dataclass
+class SymbolTable:
+    fn: dict[str, Derective_fn | Derective_extern_fn] = field(default_factory=dict)
+    structs: dict[str, Derective_struct] = field(default_factory=dict)
+    enums: dict[str, Derective_enum] = field(default_factory=dict)
+    traits: dict[str, Derective_trait] = field(default_factory=dict)
+    impls: list[Derective_impl] = field(default_factory=list)
+
+    @classmethod
+    def from_module(cls, mod: EHIR_Module) -> Self:
+        # @todo(m.shushkevich): handle duplicates
+        instance = cls()
+        for der in mod.ast:
+            if isinstance(der, (Derective_fn, Derective_extern_fn)):
+                instance.fn[der.name] = der
+            elif isinstance(der, Derective_struct):
+                instance.structs[der.name] = der
+            elif isinstance(der, Derective_enum):
+                instance.enums[der.name] = der
+            elif isinstance(der, Derective_trait):
+                instance.traits[der.name] = der
+            elif isinstance(der, Derective_impl):
+                instance.impls.append(der)
+            else:
+                raise RuntimeError(f"Unexpected symbol derective: {der}")
+        return instance
+
+
+@dataclass
+class _FnTypeState:
+    vars_by_name: dict[str, Type | None]
+    instructions: list[object] = field(default_factory=list)
+    watchers: dict[str, set[int]] = field(default_factory=dict)
+    queue: deque[int] = field(default_factory=deque)
+    queued: set[int] = field(default_factory=set)
+
+    def add_instruction(self, instr, dependencies: set[str]) -> None:
+        instr_id = len(self.instructions)
+        self.instructions.append(instr)
+        for name in dependencies:
+            self.watchers.setdefault(name, set()).add(instr_id)
+        self.enqueue(instr_id)
+
+    def enqueue(self, instr_id: int) -> None:
+        if instr_id in self.queued:
+            return
+        self.queued.add(instr_id)
+        self.queue.append(instr_id)
+
+    def pop(self) -> tuple[int, object]:
+        instr_id = self.queue.popleft()
+        self.queued.discard(instr_id)
+        return instr_id, self.instructions[instr_id]
+
+    def wake_watchers(self, var_name: str) -> None:
+        for instr_id in self.watchers.get(var_name, ()):
+            self.enqueue(instr_id)
+
+
 class Resolver:
-    fn: dict[str, Derective_fn | Derective_extern_fn]
-    structs: dict[str, Derective_struct]
-    enums: dict[str, Derective_enum]
-    traits: dict[str, Derective_trait]
-    impls: list[Derective_impl]
-    type_aliases: dict[str, Type]
     _trait_parents: dict[str, list[str]]
     _type_name_aliases: dict[str, str]
 
     def run(self, module: EHIR_Module) -> EHIR_TypedModule:
-        module = InstanceCallLoweringPass().run(module)
+        symbol_table = SymbolTable.from_module(module)
 
-        self.fn = {}
-        self.structs = {}
-        self.enums = {}
-        self.traits = {}
-        self.impls = []
-        self.type_aliases = {}
+        self.fn = symbol_table.fn
+        self.structs = symbol_table.structs
+        self.enums = symbol_table.enums
+        self.traits = symbol_table.traits
+        self.impls = symbol_table.impls
+
         self._current_fn_name: str | None = None
+        self._current_fn_state: _FnTypeState | None = None
         self._current_generic_names: set[str] = set()
         self._trait_parents = {}
         self._type_name_aliases = {}
         self._resolve_type_cache: dict[tuple[frozenset[str], tuple], Type] = {}
         self._types_compatible_cache: dict[tuple[frozenset[str], tuple, tuple], bool] = {}
 
-        for d in module.ast:
-            if isinstance(d, Derective_typealias):
-                self.type_aliases[d.name] = deepcopy(d.target)
-            elif isinstance(d, Derective_struct):
-                self.structs[d.name] = d
-            elif isinstance(d, Derective_enum):
-                self.enums[d.name] = d
-            elif isinstance(d, Derective_trait):
-                self.traits[d.name] = d
-            elif isinstance(d, Derective_impl):
-                self.impls.append(d)
-            elif isinstance(d, (Derective_fn, Derective_extern_fn)):
-                if isinstance(d.ret_type, Pointer):
-                    short_name = d.name.split("::")[-1]
-                    if not short_name.startswith("__"):
-                        raise EhirCompileError(
-                            f"Returning raw pointers is forbidden in EHIR: {d.name} -> {d.ret_type}", code="EHIR1001"
-                        )
-                self.fn[d.name] = d
+        for fn in self.fn.values():
+            if isinstance(fn.ret_type, Pointer):
+                short_name = fn.name.split("::")[-1]
+                if not short_name.startswith("__"):
+                    raise EhirCompileError(
+                        f"Returning raw pointers is forbidden in EHIR: {fn.name} -> {fn.ret_type}", code="EHIR1001"
+                    )
 
         self._build_type_name_aliases()
         self._validate_trait_hierarchy()
@@ -196,14 +239,13 @@ class Resolver:
         self._expand_trait_impl_methods(module.ast)
         self._rewrite_declaration_types(module.ast)
 
-        for fn in self.fn.values():
+        for fn in symbol_table.fn.values():
             if isinstance(fn, Derective_extern_fn):
                 continue
             self._resolve_fn(fn)
-        for impl in self.impls:
+        for impl in symbol_table.impls:
             for method in impl.methods:
                 self._resolve_fn(method)
-
         return module  # ty:ignore[invalid-return-type]
 
     def _build_type_name_aliases(self) -> None:
@@ -611,32 +653,89 @@ class Resolver:
 
     def _resolve_fn(self, fn: Derective_fn) -> None:
         self._current_fn_name = fn.name
-        previous_generic_names = self._current_generic_names
         self._current_generic_names = {generic.name for generic in fn.generics}
-        vars_by_name: dict[str, Type | None] = {}
-        for p in fn.params:
-            vars_by_name[p.name] = p.type
-
-        changed = True
-        rounds = 0
-        while changed and rounds < 32:
-            rounds += 1
-            changed = False
+        state = _FnTypeState(vars_by_name={p.name: p.type for p in fn.params})
+        self._current_fn_state = state
+        try:
             for block in fn.body:
                 for instr in block.get_body():
-                    changed |= self._resolve_instr(instr, fn.ret_type, vars_by_name)
+                    state.add_instruction(instr, self._instruction_dependencies(instr))
 
-        for block in fn.body:
-            for instr in block.get_body():
-                self._commit_instr_vars(instr, vars_by_name)
-        for i, p in enumerate(fn.params):
-            fn.params[i] = Parameter(p.name, self._must_get(vars_by_name, p.name, fn.name))
-        self._current_fn_name = None
-        self._current_generic_names = previous_generic_names
+            while state.queue:
+                _, instr = state.pop()
+                self._resolve_instr(instr, fn.ret_type, state)
 
-    def _resolve_instr(self, instr, fn_ret_type: Type, vars_by_name: dict[str, Type | None]) -> bool:
+            for block in fn.body:
+                for instr in block.get_body():
+                    self._commit_instr_vars(instr, state.vars_by_name)
+            for i, p in enumerate(fn.params):
+                fn.params[i] = Parameter(p.name, self._must_get(state.vars_by_name, p.name, fn.name))
+        finally:
+            self._current_fn_name = None
+            self._current_fn_state = None
+
+    def _instruction_dependencies(self, instr) -> set[str]:
+        deps: set[str] = set()
+        if isinstance(instr, Instruction_ret):
+            deps.add(instr.var.name)
+            return deps
+        if isinstance(instr, (*_BIN_SAME, *_BIN_BOOL)):
+            deps.update({instr.lhs.name, instr.rhs.name, instr.var_out.name})
+            return deps
+        if isinstance(instr, (Instruction_salloc, Instruction_halloc, Instruction_pcast)):
+            deps.add(instr.var_out.name)
+            return deps
+        if isinstance(instr, Instruction_load):
+            deps.update({instr.var.name, instr.var_out.name})
+            return deps
+        if isinstance(instr, Instruction_store):
+            deps.update({instr.var_src.name, instr.var_dst.name})
+            return deps
+        if isinstance(instr, (Instruction_wraps, Instruction_wraph)):
+            deps.update({instr.variable.name, instr.var_out.name})
+            return deps
+        if isinstance(instr, Instruction_capstruct):
+            deps.add(instr.var_out.name)
+            deps.update(arg.name for arg in instr.struct.fields)
+            return deps
+        if isinstance(instr, Instruction_capenum):
+            deps.add(instr.var_out.name)
+            deps.update(arg.name for arg in instr.enum.args)
+            return deps
+        if isinstance(instr, Instruction_call):
+            deps.add(instr.var_out.name)
+            deps.update(arg.name for arg in instr.args)
+            if "::" in instr.fn_name:
+                deps.add(instr.fn_name.rsplit("::", 1)[0])
+            return deps
+        if isinstance(instr, Instruction_callvoid):
+            deps.update(arg.name for arg in instr.args)
+            if instr.assign_to is not None:
+                deps.add(instr.assign_to.name)
+            if "::" in instr.fn_name:
+                deps.add(instr.fn_name.rsplit("::", 1)[0])
+            return deps
+        if isinstance(instr, (Instruction_getfield, Instruction_getfieldptr)):
+            deps.add(instr.src.name)
+            return deps
+        if isinstance(instr, (Instruction_sgetfield, Instruction_sgetfieldptr)):
+            deps.add(instr.src.name)
+            return deps
+        if isinstance(instr, Instruction_setfield):
+            deps.update({instr.var.name, instr.value.name})
+            return deps
+        if isinstance(instr, Instruction_match):
+            deps.add(instr.cond_var.name)
+            return deps
+        if isinstance(instr, Instruction_hrealloc):
+            deps.update({instr.var_out.name, instr.var.name})
+            return deps
+        return deps
+
+    def _resolve_instr(self, instr, fn_ret_type: Type, state: _FnTypeState) -> bool:
+        vars_by_name = state.vars_by_name
         if isinstance(instr, Instruction_capprim):
-            return self._set_var(vars_by_name, instr.var_out, instr.primitive.type)
+            return self._refine_and_wake(state, instr.var_out, instr.primitive.type)
 
         if isinstance(instr, Instruction_ret):
             return self._unify_var(vars_by_name, instr.var, fn_ret_type)
@@ -657,7 +756,7 @@ class Resolver:
             existing = vars_by_name.get(instr.var_out.name) or instr.var_out.type
             if isinstance(existing, Pointer) and self._contains_unbound_generic(instr.type):
                 instr.type = existing.pointee
-            changed = self._set_var(vars_by_name, instr.var_out, Pointer(instr.type))
+            changed = self._refine_and_wake(state, instr.var_out, Pointer(instr.type))
             resolved = self._var_type(vars_by_name, instr.var_out)
             if isinstance(resolved, Pointer) and self._types_compatible(instr.type, resolved.pointee):
                 instr.type = resolved.pointee
@@ -667,7 +766,7 @@ class Resolver:
             existing = vars_by_name.get(instr.var_out.name) or instr.var_out.type
             if isinstance(existing, Pointer) and self._contains_unbound_generic(instr.type):
                 instr.type = existing.pointee
-            changed = self._set_var(vars_by_name, instr.var_out, Pointer(instr.type))
+            changed = self._refine_and_wake(state, instr.var_out, Pointer(instr.type))
             resolved = self._var_type(vars_by_name, instr.var_out)
             if isinstance(resolved, Pointer) and self._types_compatible(instr.type, resolved.pointee):
                 instr.type = resolved.pointee
@@ -694,7 +793,7 @@ class Resolver:
             return changed
 
         if isinstance(instr, Instruction_pcast):
-            return self._set_var(vars_by_name, instr.var_out, instr.type)
+            return self._refine_and_wake(state, instr.var_out, instr.type)
 
         if isinstance(instr, (Instruction_wraps, Instruction_wraph)):
             value_t = self._var_type(vars_by_name, instr.variable)
@@ -703,7 +802,7 @@ class Resolver:
             current_t = self._var_type(vars_by_name, instr.var_out)
             if current_t is not None and current_t.name == concrete_box_type_name(value_t):
                 return False
-            return self._set_var(vars_by_name, instr.var_out, Type("Box", [value_t]))
+            return self._refine_and_wake(state, instr.var_out, Type("Box", [value_t]))
 
         if isinstance(instr, Instruction_capstruct):
             return self._resolve_capstruct(instr, vars_by_name)
@@ -745,6 +844,9 @@ class Resolver:
             return False
 
         return False
+
+    def _refine_and_wake(self, state: _FnTypeState, v: Variable, t: Type) -> bool:
+        return self._set_var(state.vars_by_name, v, t)
 
     def _resolve_capstruct(self, instr: Instruction_capstruct, vars_by_name: dict[str, Type | None]) -> bool:
         struct_decl = self.structs.get(instr.struct.name)
@@ -882,6 +984,10 @@ class Resolver:
         owner_text, method_name = instr.fn_name.rsplit("::", 1)
         owner_type = vars_by_name.get(owner_text)
         if owner_type is None:
+            return
+        if instr.args and instr.args[0].name == owner_text:
+            if isinstance(instr, Instruction_callvoid) and instr.assign_to is None:
+                instr.assign_to = Variable(name=owner_text, type=owner_type)
             return
         receiver = Variable(name=owner_text, type=owner_type)
         if isinstance(instr, Instruction_callvoid):
@@ -1507,13 +1613,19 @@ class Resolver:
         curr = vars_by_name.get(v.name) or v.type
         if curr is None:
             vars_by_name[v.name] = t
+            if self._current_fn_state is not None:
+                self._current_fn_state.wake_watchers(v.name)
             return True
         curr = self._resolve_type(curr)
+        if curr == t:
+            return False
         curr_base = curr.name.rsplit("::", 1)[-1]
         t_base = t.name.rsplit("::", 1)[-1]
         if curr.name == t.name:
             if not curr.generics and t.generics:
                 vars_by_name[v.name] = t
+                if self._current_fn_state is not None:
+                    self._current_fn_state.wake_watchers(v.name)
                 return True
             if curr.generics and not t.generics:
                 return False
@@ -1529,6 +1641,8 @@ class Resolver:
                     break
             if can_specialize:
                 vars_by_name[v.name] = t
+                if self._current_fn_state is not None:
+                    self._current_fn_state.wake_watchers(v.name)
                 return True
         if not self._types_compatible(curr, t):
             where = f" in fn '{self._current_fn_name}'" if self._current_fn_name else ""
@@ -1661,8 +1775,6 @@ class Resolver:
             return typ
         if not typ.generics and typ.name in self._current_generic_names:
             return Type(typ.name)
-        if not typ.generics and typ.name in self.type_aliases:
-            return self._resolve_type(deepcopy(self.type_aliases[typ.name]))
         if typ.name == "usize":
             return Usize_t()
         if typ.name == "isize":

@@ -49,7 +49,6 @@ Executable package:
 ```text
 encore.toml
 src/main.enq
-tests/smoke.enq
 ```
 
 Library package:
@@ -58,8 +57,10 @@ Library package:
 encore.toml
 src/lib.enq
 src/module/mod.enq
-tests/smoke.enq
 ```
+
+Unit tests live next to the code they exercise and are marked with
+`#attr(test)`.
 
 `src/lib.enq` commonly re-exports modules:
 

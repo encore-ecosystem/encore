@@ -2851,9 +2851,13 @@ class EncoreToEHIRTranslator:
         if var.type is None:
             raise TypeError(f"Unable to infer boolean type for {context}")
 
+        def leaf_type_name(name: str) -> str:
+            base = name.split("[", 1)[0]
+            return base.rsplit("::", 1)[-1]
+
         if isinstance(var.type, (Usize_t, Isize_t)) and var.type.size == 1:
             return var
-        if var.type.name in {"bool", "u1", "i1"}:
+        if leaf_type_name(var.type.name) in {"bool", "u1", "i1"}:
             return var
 
         raise TypeError(f"Expected bool for {context}, got {var.type}")

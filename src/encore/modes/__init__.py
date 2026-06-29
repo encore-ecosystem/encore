@@ -5,9 +5,9 @@ from .init import add_init_parser
 # from .install import add_install_parser
 from .memcheck import add_memcheck_parser
 from .run import add_run_parser
+from .test import add_test_parser
 
 # from .sync import add_sync_parser
-# from .test import add_test_parser
 # from .update import add_update_parser
 
 __all__ = [

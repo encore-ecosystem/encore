@@ -37,5 +37,5 @@ When reducing a compiler or library issue, include:
 - the exact command, for example `encore test --no-cache --filter dict`;
 - the complete diagnostic output.
 
-Prefer adding a regression test under `tests/` when the behavior is meant to be
-part of the beta surface.
+Prefer adding a regression test as a `#attr(test)` function in the relevant
+module when the behavior is meant to be part of the beta surface.

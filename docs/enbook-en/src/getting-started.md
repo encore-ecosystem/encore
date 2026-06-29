@@ -73,35 +73,26 @@ encore build --profile release
 
 ## Tests
 
-Tests are executable `.enq` files under `tests/`. A test passes when `main`
-returns `0_u32`.
+Unit tests are ordinary functions marked with `#attr(test)`. `encore test`
+discovers them across loaded refrains, compiles each test with a small harness,
+and treats the test as passed when it returns `true`.
 
 ```enq
-import core::testing::*
-
-fn main() -> u32 {
-    if !assert(2_u32 + 2_u32 == 4_u32) {
-        ret 1_u32
-    }
-    ret 0_u32
+#attr(test)
+fn math_works() -> bool {
+    ret 2_u32 + 2_u32 == 4_u32
 }
 ```
 
-Negative tests can assert expected compile diagnostics with a leading comment:
+Test functions should:
 
-```enq
-//@expect.compile_error=Non-exhaustive match for enum 'Option'
-import core::option::Option
+- return `bool`;
+- take no parameters;
+- be non-generic;
+- use `true` for pass and `false` for fail.
 
-fn main() -> u32 {
-    let value = Option[u32]::Some(1_u32)
-    match value {
-        Option::Some(x) => {
-            ret x
-        }
-    }
-}
-```
+The test harness wraps the function in a generated executable `main`, so the
+rest of the program can stay unchanged.
 
 ## Examples
 
