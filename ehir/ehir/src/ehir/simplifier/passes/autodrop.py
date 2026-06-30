@@ -56,6 +56,17 @@ class _ChildEdge:
     variant_name: str | None = None
 
 
+@dataclass(frozen=True)
+class _DynamicBuffer:
+    ptr_index: int
+    ptr_name: str
+    ptr_type: Pointer
+    len_index: int
+    len_name: str
+    len_type: Type
+    elem_type: Type
+
+
 class AutoDropPass(SimplifierPass):
     def __init__(self, trace_cfree: bool = False):
         self._trace_cfree = trace_cfree
@@ -148,6 +159,11 @@ class AutoDropPass(SimplifierPass):
             if concrete_type.name in self._structs:
                 concrete_struct = self._concrete_generic_struct(concrete_type)
                 if concrete_struct is not None:
+                    if is_box_struct(concrete_struct):
+                        for fn in self._generate_box_cfree_fns(concrete_struct, box_type=concrete_type):
+                            if fn.name not in existing_drop_names:
+                                generated.append(fn)
+                                existing_drop_names.add(fn.name)
                     generated.append(self._generate_struct_drop_fn(concrete_struct, self_type=concrete_type))
                     existing_drop_names.add(fn_name)
             elif concrete_type.name in self._enums:
@@ -196,7 +212,7 @@ class AutoDropPass(SimplifierPass):
         if reference_storage is not None:
             blocks = self._generate_reference_storage_drop_blocks(directive, reference_storage, self_var)
         elif is_box_struct(directive):
-            blocks = self._generate_box_drop_blocks(directive, self_var)
+            blocks = self._generate_box_drop_blocks(directive, self_var, self_type)
         else:
             body = self._generate_struct_drop_body(directive, self_var)
             blocks = [Block(name="entry", body=body)]
@@ -391,14 +407,20 @@ class AutoDropPass(SimplifierPass):
         body.append(Instruction_ret(TypedVariable(".drop_ret", Type("void"))))
         return body
 
-    def _generate_box_drop_blocks(self, directive: Derective_struct, self_var: TypedVariable) -> list[Block]:
+    def _generate_box_drop_blocks(
+        self,
+        directive: Derective_struct,
+        self_var: TypedVariable,
+        box_type: Type | None = None,
+    ) -> list[Block]:
+        box_type = deepcopy(box_type) if box_type is not None else Type(directive.name)
         return [
             Block(
                 name="entry",
                 body=[
                     Instruction_call(
                         var_out=TypedVariable(".drop_cfree", Type("void")),
-                        fn_name=self._cfree_name(Type(directive.name)),
+                        fn_name=self._cfree_name(box_type),
                         generics=[],
                         args=[deepcopy(self_var)],
                     ),
@@ -407,18 +429,19 @@ class AutoDropPass(SimplifierPass):
             )
         ]
 
-    def _generate_box_cfree_fns(self, directive: Derective_struct) -> list[Derective_fn]:
+    def _generate_box_cfree_fns(self, directive: Derective_struct, box_type: Type | None = None) -> list[Derective_fn]:
         ptr_type = directive.params[0].type
         assert isinstance(ptr_type, Pointer)
-        box_type = Type(directive.name)
+        box_type = deepcopy(box_type) if box_type is not None else Type(directive.name)
         edges = self._child_edges(ptr_type.pointee)
+        dynamic_buffer = self._dynamic_buffer(ptr_type.pointee)
         return [
             self._generate_cfree_initiator_fn(directive, box_type),
-            self._generate_cfree_pass0_fn(directive, box_type, edges),
-            self._generate_cfree_pass1_fn(directive, box_type, edges),
-            self._generate_cfree_mark_outer_fn(directive, box_type, edges),
-            self._generate_cfree_pass2_fn(directive, box_type, edges),
-            self._generate_cfree_pass3_fn(directive, box_type, edges),
+            self._generate_cfree_pass0_fn(directive, box_type, edges, dynamic_buffer),
+            self._generate_cfree_pass1_fn(directive, box_type, edges, dynamic_buffer),
+            self._generate_cfree_mark_outer_fn(directive, box_type, edges, dynamic_buffer),
+            self._generate_cfree_pass2_fn(directive, box_type, edges, dynamic_buffer),
+            self._generate_cfree_pass3_fn(directive, box_type, edges, dynamic_buffer),
         ]
 
     def _generate_cfree_initiator_fn(self, directive: Derective_struct, box_type: Type) -> Derective_fn:
@@ -494,6 +517,7 @@ class AutoDropPass(SimplifierPass):
         directive: Derective_struct,
         box_type: Type,
         edges: list[_ChildEdge],
+        dynamic_buffer: _DynamicBuffer | None,
     ) -> Derective_fn:
         self_var = TypedVariable("self", box_type)
         ptr_type = directive.params[0].type
@@ -519,11 +543,12 @@ class AutoDropPass(SimplifierPass):
 
         blocks = [Block(name="entry", body=entry_body)]
         blocks.extend(
-            self._edge_chain_blocks(
+            self._edge_walk_blocks(
                 start_name="visit",
                 start_body=visit_body,
                 value_var=value,
                 edges=edges,
+                dynamic_buffer=dynamic_buffer,
                 op=lambda body, child, prefix: self._emit_mark_outer_child(body, child, prefix),
                 final=Instruction_br(label="done"),
                 prefix=".cfree_outer",
@@ -537,6 +562,7 @@ class AutoDropPass(SimplifierPass):
         directive: Derective_struct,
         box_type: Type,
         edges: list[_ChildEdge],
+        dynamic_buffer: _DynamicBuffer | None,
     ) -> Derective_fn:
         self_var = TypedVariable("self", box_type)
         ptr_type = directive.params[0].type
@@ -562,11 +588,12 @@ class AutoDropPass(SimplifierPass):
 
         blocks = [Block(name="entry", body=entry_body)]
         blocks.extend(
-            self._edge_chain_blocks(
+            self._edge_walk_blocks(
                 start_name="visit",
                 start_body=visit_body,
                 value_var=value,
                 edges=edges,
+                dynamic_buffer=dynamic_buffer,
                 op=lambda body, child, prefix: self._emit_pass0_child(body, child, prefix),
                 final=Instruction_br(label="done"),
                 prefix=".cfree0",
@@ -580,6 +607,7 @@ class AutoDropPass(SimplifierPass):
         directive: Derective_struct,
         box_type: Type,
         edges: list[_ChildEdge],
+        dynamic_buffer: _DynamicBuffer | None,
     ) -> Derective_fn:
         self_var = TypedVariable("self", box_type)
         ptr_type = directive.params[0].type
@@ -623,11 +651,12 @@ class AutoDropPass(SimplifierPass):
 
         value_scan_body: list = []
         value_scan = self._emit_box_value(value_scan_body, self_var, ptr_type, ".cfree1_scan_value")
-        scan_blocks = self._edge_chain_blocks(
+        scan_blocks = self._edge_walk_blocks(
             start_name="scan",
             start_body=value_scan_body,
             value_var=value_scan,
             edges=edges,
+            dynamic_buffer=dynamic_buffer,
             op=lambda body, child, prefix: self._emit_pass_call(body, child, 1, prefix),
             final=Instruction_br(label="done"),
             prefix=".cfree1_scan",
@@ -647,6 +676,7 @@ class AutoDropPass(SimplifierPass):
         directive: Derective_struct,
         box_type: Type,
         edges: list[_ChildEdge],
+        dynamic_buffer: _DynamicBuffer | None,
     ) -> Derective_fn:
         self_var = TypedVariable("self", box_type)
         ptr_type = directive.params[0].type
@@ -679,11 +709,12 @@ class AutoDropPass(SimplifierPass):
 
         blocks = [Block(name="entry", body=entry_body), Block(name="check_deal", body=check_deal_body)]
         blocks.extend(
-            self._edge_chain_blocks(
+            self._edge_walk_blocks(
                 start_name="visit",
                 start_body=visit_body,
                 value_var=value,
                 edges=edges,
+                dynamic_buffer=dynamic_buffer,
                 op=lambda body, child, prefix: self._emit_count_free_edge(body, child, self_candidate, prefix),
                 final=Instruction_br(label="done"),
                 prefix=".cfree2_count",
@@ -697,6 +728,7 @@ class AutoDropPass(SimplifierPass):
         directive: Derective_struct,
         box_type: Type,
         edges: list[_ChildEdge],
+        dynamic_buffer: _DynamicBuffer | None,
     ) -> Derective_fn:
         self_var = TypedVariable("self", box_type)
         ptr_type = directive.params[0].type
@@ -761,11 +793,12 @@ class AutoDropPass(SimplifierPass):
             Block(name="decide", body=decide_body),
         ]
         blocks.extend(
-            self._edge_chain_blocks(
+            self._edge_walk_blocks(
                 start_name="free_visit",
                 start_body=free_visit_body,
                 value_var=value,
                 edges=edges,
+                dynamic_buffer=dynamic_buffer,
                 op=lambda body, child, prefix: self._emit_sweep_child_from_free(body, child, prefix),
                 final=Instruction_br(label="finish_free_candidate"),
                 prefix=".cfree3_free",
@@ -812,7 +845,14 @@ class AutoDropPass(SimplifierPass):
                 fd=fd,
                 prefix=".cfree3_trace_heap",
             )
-        free_heap_body.extend([Instruction_hfree(var=ptr), Instruction_br(label="free_owner")])
+        free_heap_blocks = self._dynamic_buffer_cleanup_blocks(
+            start_name="free_heap",
+            start_body=free_heap_body,
+            payload_ptr=ptr,
+            dynamic_buffer=dynamic_buffer,
+            final=Instruction_br(label="free_owner"),
+            prefix=".cfree3_free_heap",
+        )
 
         free_owner_body: list = []
         if self._trace_cfree:
@@ -849,16 +889,17 @@ class AutoDropPass(SimplifierPass):
             [
                 Block(name="finish_free_candidate", body=finish_free_body),
                 Block(name="free", body=free_body),
-                Block(name="free_heap", body=free_heap_body),
+                *free_heap_blocks,
                 Block(name="free_owner", body=free_owner_body),
             ]
         )
         blocks.extend(
-            self._edge_chain_blocks(
+            self._edge_walk_blocks(
                 start_name="survive",
                 start_body=survive_body,
                 value_var=survive_value,
                 edges=edges,
+                dynamic_buffer=dynamic_buffer,
                 op=lambda body, child, prefix: self._emit_sweep_child_from_survivor(body, child, prefix),
                 final=Instruction_br(label="done"),
                 prefix=".cfree3_survive",
@@ -867,6 +908,157 @@ class AutoDropPass(SimplifierPass):
 
         blocks.append(Block(name="done", body=[Instruction_ret(TypedVariable(".cfree3_ret", Type("void")))]))
         return self._cfree_fn(self._cfree_pass_name(box_type, 3), box_type, blocks)
+
+    def _edge_walk_blocks(
+        self,
+        *,
+        start_name: str,
+        start_body: list,
+        value_var: TypedVariable,
+        edges: list[_ChildEdge],
+        dynamic_buffer: _DynamicBuffer | None,
+        op,
+        final,
+        prefix: str,
+    ) -> list[Block]:
+        if dynamic_buffer is None:
+            return self._edge_chain_blocks(
+                start_name=start_name,
+                start_body=start_body,
+                value_var=value_var,
+                edges=edges,
+                op=op,
+                final=final,
+                prefix=prefix,
+            )
+
+        dynamic_start = f"{start_name}_dynamic"
+        blocks = self._edge_chain_blocks(
+            start_name=start_name,
+            start_body=start_body,
+            value_var=value_var,
+            edges=edges,
+            op=op,
+            final=Instruction_br(label=dynamic_start),
+            prefix=prefix,
+        )
+        blocks.extend(
+            self._dynamic_buffer_edge_blocks(
+                start_name=dynamic_start,
+                start_body=[],
+                value_var=value_var,
+                dynamic_buffer=dynamic_buffer,
+                op=op,
+                final=final,
+                prefix=f"{prefix}_dynamic",
+            )
+        )
+        return blocks
+
+    def _dynamic_buffer_edge_blocks(
+        self,
+        *,
+        start_name: str,
+        start_body: list,
+        value_var: TypedVariable,
+        dynamic_buffer: _DynamicBuffer,
+        op,
+        final,
+        prefix: str,
+    ) -> list[Block]:
+        targets = self._dynamic_element_edge_targets(dynamic_buffer.elem_type)
+        if not targets:
+            start_body.append(final)
+            return [Block(name=start_name, body=start_body)]
+
+        ptr = TypedVariable(f"{prefix}_ptr", deepcopy(dynamic_buffer.ptr_type))
+        length = TypedVariable(f"{prefix}_len", deepcopy(dynamic_buffer.len_type))
+        idx_ptr = TypedVariable(f"{prefix}_idx_ptr", Pointer(Usize_t()))
+        zero = self._emit_usize_const(start_body, 0, f"{prefix}_zero")
+        start_body.extend(
+            [
+                Instruction_getfield(
+                    var_out=ptr,
+                    src=value_var,
+                    field=TypedVariable(str(dynamic_buffer.ptr_index), deepcopy(dynamic_buffer.ptr_type)),
+                ),
+                Instruction_getfield(
+                    var_out=length,
+                    src=value_var,
+                    field=TypedVariable(str(dynamic_buffer.len_index), deepcopy(dynamic_buffer.len_type)),
+                ),
+                Instruction_salloc(var_out=idx_ptr, type=Usize_t()),
+                Instruction_store(var_src=zero, var_dst=idx_ptr),
+                Instruction_br(label=f"{start_name}_loop"),
+            ]
+        )
+
+        idx = TypedVariable(f"{prefix}_idx", Usize_t())
+        keep_going = TypedVariable(f"{prefix}_keep_going", Usize_t(1))
+        elem_ptr = TypedVariable(f"{prefix}_elem_ptr", Pointer(deepcopy(dynamic_buffer.elem_type)))
+        elem = TypedVariable(f"{prefix}_elem", deepcopy(dynamic_buffer.elem_type))
+        loop = Block(
+            name=f"{start_name}_loop",
+            body=[
+                Instruction_load(var_out=idx, var=idx_ptr),
+                Instruction_les(var_out=keep_going, lhs=idx, rhs=length),
+                Instruction_cbr(
+                    cond_var=keep_going,
+                    true_br_label=f"{start_name}_element",
+                    else_br_label=f"{start_name}_done",
+                ),
+            ],
+        )
+
+        element_body: list = [
+            Instruction_gep(var_out=elem_ptr, var=ptr, offset=idx),
+            Instruction_load(var_out=elem, var=elem_ptr),
+        ]
+        increment_label = f"{start_name}_next"
+        blocks = [Block(name=start_name, body=start_body), loop]
+
+        direct_targets = [target for target in targets if target.variant_index is None]
+        enum_targets = [target for target in targets if target.variant_index is not None]
+        if direct_targets:
+            for target_index, _ in enumerate(direct_targets):
+                op(element_body, elem, f"{prefix}_{target_index}")
+            element_body.append(Instruction_br(label=increment_label))
+            blocks.append(Block(name=f"{start_name}_element", body=element_body))
+        else:
+            cases = [
+                MatchCase(variant=target.variant_name or "Some", label=f"{start_name}_{target.variant_name}_some")
+                for target in enum_targets
+            ]
+            element_body.append(
+                Instruction_match(cond_var=elem, default_case=increment_label, cases=cases)
+            )
+            blocks.append(Block(name=f"{start_name}_element", body=element_body))
+            for target_index, target in enumerate(enum_targets):
+                child = TypedVariable(f"{prefix}_{target_index}_{target.variant_name}_child", deepcopy(target.child_type))
+                some_body: list = [
+                    Instruction_getfield(
+                        var_out=child,
+                        src=elem,
+                        field=TypedVariable(str(target.variant_index), deepcopy(target.child_type)),
+                    )
+                ]
+                op(some_body, child, f"{prefix}_{target_index}_some")
+                some_body.append(Instruction_br(label=increment_label))
+                blocks.append(Block(name=f"{start_name}_{target.variant_name}_some", body=some_body))
+
+        next_body: list = []
+        one = self._emit_usize_const(next_body, 1, f"{prefix}_one")
+        next_idx = TypedVariable(f"{prefix}_next_idx", Usize_t())
+        next_body.extend(
+            [
+                Instruction_add(var_out=next_idx, lhs=idx, rhs=one),
+                Instruction_store(var_src=next_idx, var_dst=idx_ptr),
+                Instruction_br(label=f"{start_name}_loop"),
+            ]
+        )
+        blocks.append(Block(name=increment_label, body=next_body))
+        blocks.append(Block(name=f"{start_name}_done", body=[final]))
+        return blocks
 
     def _edge_chain_blocks(
         self,
@@ -1232,6 +1424,170 @@ class AutoDropPass(SimplifierPass):
         body.append(Instruction_capprim(var_out=var, primitive=Usize(value, size=8)))
         return var
 
+    def _dynamic_buffer(self, typ: Type) -> _DynamicBuffer | None:
+        struct = self._structs.get(typ.name)
+        if struct is None:
+            return None
+        if struct.generics:
+            struct = self._concrete_generic_struct(typ)
+            if struct is None:
+                return None
+        if len(struct.params) < 3:
+            return None
+
+        ptr, length, cap = struct.params[:3]
+        if ptr.name != "ptr" or not isinstance(ptr.type, Pointer):
+            return None
+        if length.name != "len" or not self._is_usize_type(length.type):
+            return None
+        if cap.name != "cap" or not self._is_usize_type(cap.type):
+            return None
+        return _DynamicBuffer(
+            ptr_index=0,
+            ptr_name=ptr.name,
+            ptr_type=deepcopy(ptr.type),
+            len_index=1,
+            len_name=length.name,
+            len_type=Usize_t(),
+            elem_type=deepcopy(ptr.type.pointee),
+        )
+
+    @staticmethod
+    def _is_usize_type(typ: Type) -> bool:
+        return isinstance(typ, Usize_t) or (not isinstance(typ, (Pointer, Reference)) and typ.name == "usize")
+
+    def _dynamic_element_edge_targets(self, elem_type: Type) -> list[_ChildEdge]:
+        if self._is_concrete_box_type(elem_type):
+            return [
+                _ChildEdge(
+                    field_index=-1,
+                    field_name="element",
+                    field_type=deepcopy(elem_type),
+                    child_type=deepcopy(elem_type),
+                )
+            ]
+
+        enum = self._enums.get(elem_type.name)
+        if enum is None:
+            return []
+
+        result: list[_ChildEdge] = []
+        for variant_index, variant in enumerate(enum.variants, start=1):
+            payload_type = self._variant_payload_type(variant)
+            if payload_type is None or not self._is_concrete_box_type(payload_type):
+                continue
+            result.append(
+                _ChildEdge(
+                    field_index=-1,
+                    field_name="element",
+                    field_type=deepcopy(elem_type),
+                    child_type=deepcopy(payload_type),
+                    variant_index=variant_index,
+                    variant_name=variant.name,
+                )
+            )
+        return result
+
+    def _dynamic_element_has_box_edge(self, elem_type: Type) -> bool:
+        return bool(self._dynamic_element_edge_targets(elem_type))
+
+    def _dynamic_buffer_cleanup_blocks(
+        self,
+        *,
+        start_name: str,
+        start_body: list,
+        payload_ptr: TypedVariable,
+        dynamic_buffer: _DynamicBuffer | None,
+        final,
+        prefix: str,
+    ) -> list[Block]:
+        if dynamic_buffer is None:
+            start_body.extend([Instruction_hfree(var=payload_ptr), final])
+            return [Block(name=start_name, body=start_body)]
+
+        payload = TypedVariable(f"{prefix}_payload", deepcopy(payload_ptr.type.pointee))
+        data_ptr = TypedVariable(f"{prefix}_data_ptr", deepcopy(dynamic_buffer.ptr_type))
+        start_body.extend(
+            [
+                Instruction_load(var_out=payload, var=payload_ptr),
+                Instruction_getfield(
+                    var_out=data_ptr,
+                    src=payload,
+                    field=TypedVariable(str(dynamic_buffer.ptr_index), deepcopy(dynamic_buffer.ptr_type)),
+                ),
+            ]
+        )
+
+        elem_type = dynamic_buffer.elem_type
+        should_drop_elements = needs_drop(elem_type, self._aggregate_names) and not self._dynamic_element_has_box_edge(
+            elem_type
+        )
+        if not should_drop_elements:
+            start_body.extend(
+                [
+                    Instruction_hfree(var=data_ptr),
+                    Instruction_hfree(var=payload_ptr),
+                    final,
+                ]
+            )
+            return [Block(name=start_name, body=start_body)]
+
+        length = TypedVariable(f"{prefix}_len", deepcopy(dynamic_buffer.len_type))
+        idx_ptr = TypedVariable(f"{prefix}_idx_ptr", Pointer(Usize_t()))
+        zero = self._emit_usize_const(start_body, 0, f"{prefix}_zero")
+        start_body.extend(
+            [
+                Instruction_getfield(
+                    var_out=length,
+                    src=payload,
+                    field=TypedVariable(str(dynamic_buffer.len_index), deepcopy(dynamic_buffer.len_type)),
+                ),
+                Instruction_salloc(var_out=idx_ptr, type=Usize_t()),
+                Instruction_store(var_src=zero, var_dst=idx_ptr),
+                Instruction_br(label=f"{start_name}_drop_loop"),
+            ]
+        )
+
+        idx = TypedVariable(f"{prefix}_idx", Usize_t())
+        keep_going = TypedVariable(f"{prefix}_keep_going", Usize_t(1))
+        elem_ptr = TypedVariable(f"{prefix}_elem_ptr", Pointer(deepcopy(elem_type)))
+        elem = TypedVariable(f"{prefix}_elem", deepcopy(elem_type))
+        one = TypedVariable(f"{prefix}_one", Usize_t())
+        next_idx = TypedVariable(f"{prefix}_next_idx", Usize_t())
+        loop = Block(
+            name=f"{start_name}_drop_loop",
+            body=[
+                Instruction_load(var_out=idx, var=idx_ptr),
+                Instruction_les(var_out=keep_going, lhs=idx, rhs=length),
+                Instruction_cbr(
+                    cond_var=keep_going,
+                    true_br_label=f"{start_name}_drop_element",
+                    else_br_label=f"{start_name}_release_buffer",
+                ),
+            ],
+        )
+        drop_element = Block(
+            name=f"{start_name}_drop_element",
+            body=[
+                Instruction_gep(var_out=elem_ptr, var=data_ptr, offset=idx),
+                Instruction_load(var_out=elem, var=elem_ptr),
+                Instruction_drop(var=elem),
+                Instruction_capprim(var_out=one, primitive=Usize(1)),
+                Instruction_add(var_out=next_idx, lhs=idx, rhs=one),
+                Instruction_store(var_src=next_idx, var_dst=idx_ptr),
+                Instruction_br(label=f"{start_name}_drop_loop"),
+            ],
+        )
+        release = Block(
+            name=f"{start_name}_release_buffer",
+            body=[
+                Instruction_hfree(var=data_ptr),
+                Instruction_hfree(var=payload_ptr),
+                final,
+            ],
+        )
+        return [Block(name=start_name, body=start_body), loop, drop_element, release]
+
     def _child_edges(self, typ: Type) -> list[_ChildEdge]:
         struct = self._structs.get(typ.name)
         if struct is None:
@@ -1294,16 +1650,16 @@ class AutoDropPass(SimplifierPass):
         )
 
     def _cfree_name(self, box_type: Type) -> str:
-        return f"__cfree_{box_type.name}"
+        return f"__cfree_{mangle_type_name(box_type)}"
 
     def _cfree_pass_name(self, box_type: Type, pass_index: int) -> str:
-        return f"__cfree_pass{pass_index}_{box_type.name}"
+        return f"__cfree_pass{pass_index}_{mangle_type_name(box_type)}"
 
     def _cfree_mark_outer_name(self, box_type: Type) -> str:
-        return f"__cfree_mark_outer_{box_type.name}"
+        return f"__cfree_mark_outer_{mangle_type_name(box_type)}"
 
     def _cfree_cleanup_name(self, box_type: Type) -> str:
-        return f"__cfree_cleanup_{box_type.name}"
+        return f"__cfree_cleanup_{mangle_type_name(box_type)}"
 
     def _generate_enum_drop_blocks(self, directive: Derective_enum, self_var: TypedVariable) -> list[Block]:
         drop_variants = [

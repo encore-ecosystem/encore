@@ -8,19 +8,40 @@
 #endif
 
 typedef struct {
-    char *ptr;
+    size_t ref_count;
     size_t len;
+    char data[];
+} encore_str_object;
+
+typedef struct {
+    encore_str_object *object;
 } encore_str;
 
+static char *cad_str_data(encore_str value) {
+    if (value.object == NULL) {
+        return NULL;
+    }
+    return value.object->data;
+}
+
+static size_t cad_str_len(encore_str value) {
+    if (value.object == NULL) {
+        return 0;
+    }
+    return value.object->len;
+}
+
 static char *cad_to_cstr(encore_str value) {
-    char *out = malloc(value.len + 1);
+    size_t len = cad_str_len(value);
+    char *out = malloc(len + 1);
     if (out == NULL) {
         return NULL;
     }
-    if (value.len > 0 && value.ptr != NULL) {
-        memcpy(out, value.ptr, value.len);
+    char *data = cad_str_data(value);
+    if (len > 0 && data != NULL) {
+        memcpy(out, data, len);
     }
-    out[value.len] = '\0';
+    out[len] = '\0';
     return out;
 }
 
@@ -410,7 +431,7 @@ bool cad_gui_window_text(size_t handle, int32_t x, int32_t y, encore_str value, 
     }
 
     g_cad_x11.XSetForeground(state->display, state->gc, (unsigned long)color_rgb);
-    g_cad_x11.XDrawString(state->display, state->window, state->gc, x, y, text, (int)value.len);
+    g_cad_x11.XDrawString(state->display, state->window, state->gc, x, y, text, (int)cad_str_len(value));
     free(text);
     return true;
 }

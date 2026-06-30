@@ -11,7 +11,7 @@ from ehir.simplifier.base import SimplifierPass
 
 
 class ReferenceLoweringPass(SimplifierPass):
-    _BOX_STORAGE_FIELDS = {"ptr", "owner", "0", "1"}
+    _BOX_STORAGE_FIELDS = {"0", "1"}
 
     def run(self, module: EHIR_TypedModule) -> EHIR_TypedModule:
         module.ast = self._run_ast(module.ast)

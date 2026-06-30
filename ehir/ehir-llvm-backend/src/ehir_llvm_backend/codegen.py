@@ -1971,8 +1971,9 @@ class Codegen:
         if type.name.startswith("i") and type.name[1:].isdigit():
             return ir.IntType(bits=int(type.name[1:]))
 
-        if isinstance(type, Float_t):
-            match type.size:
+        if isinstance(type, Float_t) or (type.name.startswith("f") and type.name[1:].isdigit()):
+            size = type.size if isinstance(type, Float_t) else int(type.name[1:])
+            match size:
                 case 16:
                     return ir.HalfType()
                 case 32:
@@ -1985,7 +1986,7 @@ class Codegen:
                         raise ValueError("Current llvmlite build does not support f128")
                     return fp128_type()
                 case _:
-                    raise ValueError(f"Unsupported float size: f{type.size}")
+                    raise ValueError(f"Unsupported float size: f{size}")
 
         if isinstance(type, Str_t) or type.name == "str":
             return self._get_str_type()

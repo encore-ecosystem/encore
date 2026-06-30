@@ -36,6 +36,11 @@ MatchPatternLike = (
     | None
 )
 
+
+def _leaf_type_name(name: str) -> str:
+    base = name.split("[", 1)[0]
+    return base.rsplit("::", 1)[-1]
+
 OPERATOR_TRAIT_BOUNDS: dict[str, str] = {
     "+": "Add",
     "-": "Sub",
@@ -1092,7 +1097,7 @@ class TypeInferer:
 
             inner_type = unwrap_for_storage(inner_type)
             base_inner = inner_type.pointee if is_reference_like_type(inner_type) else inner_type
-            if base_inner.name != "Result" or len(base_inner.generics) != 2:
+            if _leaf_type_name(base_inner.name) != "Result" or len(base_inner.generics) != 2:
                 raise TypeError(f"'?' operator expects Result[T, E], got {inner_type}")
 
             ok_type, err_type = base_inner.generics
@@ -1101,7 +1106,7 @@ class TypeInferer:
                 fn_ret_base = (
                     current_fn_ret_type.pointee if is_reference_like_type(current_fn_ret_type) else current_fn_ret_type
                 )
-                if fn_ret_base.name != "Result" or len(fn_ret_base.generics) != 2:
+                if _leaf_type_name(fn_ret_base.name) != "Result" or len(fn_ret_base.generics) != 2:
                     raise TypeError("'?' operator can only be used in functions returning Result")
                 fn_err_type = fn_ret_base.generics[1]
                 if fn_err_type != err_type:

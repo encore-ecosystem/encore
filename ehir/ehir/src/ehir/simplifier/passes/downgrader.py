@@ -87,7 +87,7 @@ class DowngraderPass(SimplifierPass):
     _structs_to_add: list[Derective_struct]
     _fns: dict[str, Normalized_fn]
     _fns_to_add: list[Normalized_fn]
-    _BOX_STORAGE_FIELDS = {"ptr", "owner", "0", "1"}
+    _BOX_STORAGE_FIELDS = {"0", "1"}
 
     def _lookup_struct(self, type_name: str) -> Derective_struct | None:
         struct_decl = self._structs.get(type_name)
@@ -175,6 +175,7 @@ class DowngraderPass(SimplifierPass):
         return ast
 
     def _downgrade_function(self, fn: Normalized_fn):
+        self._current_fn_name = fn.name
         blocks_by_name = {block.name: block for block in fn.get_body()}
         for block in fn.get_body():
             assert isinstance(block, TerminatedBlock)
@@ -575,7 +576,11 @@ class DowngraderPass(SimplifierPass):
                 owner_t = pointee
             else:
                 struct_decl = self._lookup_struct(owner_t.name)
-            assert struct_decl is not None, f"Unknown struct for getfieldptr: {owner_t}"
+            assert struct_decl is not None, (
+                f"Unknown struct for getfieldptr: {owner_t}, field={field.name}, "
+                f"src={current_src.name}:{current_src.type}, out={instr.var_out.name}:{instr.var_out.type}, "
+                f"fn={getattr(self, '_current_fn_name', '<unknown>')}"
+            )
             field_index = int(field.name) if field.name.isdigit() else None
             if field_index is not None:
                 enum_variants = self._enum_variants.get(owner_t.name)
@@ -620,8 +625,11 @@ class DowngraderPass(SimplifierPass):
         return result
 
     def _downgrade_setfield(self, instr: Instruction_setfield) -> list[Instruction]:
-        assert instr.field.type is not None
         final_field = ([instr.field, *instr.field_path])[-1]
+        if final_field.type is None:
+            final_field.type = instr.value.type
+        if instr.field.type is None and not instr.field_path:
+            instr.field.type = final_field.type
         assert final_field.type is not None
         owner_type = instr.var.type
         assert owner_type is not None

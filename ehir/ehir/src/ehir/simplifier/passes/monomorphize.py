@@ -41,7 +41,7 @@ class MonomorphizationPass(SimplifierPass):
         box_struct = next((d for d in ast if isinstance(d, Derective_struct) and d.name == "Box" and d.generics), None)
         concrete_box_types = self._collect_concrete_box_types(ast)
         if box_struct is None:
-            if concrete_box_types:
+            if concrete_box_types or self._uses_box_type(ast):
                 ast = [*ast, *self._builtin_box_structs(ast, concrete_box_types)]
                 for i, directive in enumerate(ast):
                     ast[i] = self._rewrite_box_uses_in_value(directive)
@@ -131,9 +131,12 @@ class MonomorphizationPass(SimplifierPass):
 
     def _prune_unreferenced_generic_functions(self, ast: list[Derective]) -> list[Derective]:
         referenced_fn_names: set[str] = set()
-        for item in self._walk(ast):
-            if isinstance(item, Instruction_call):
-                referenced_fn_names.add(item.fn_name)
+        for directive in ast:
+            if isinstance(directive, Derective_fn) and self._is_unresolved_template_fn(directive):
+                continue
+            for item in self._walk(directive):
+                if isinstance(item, Instruction_call):
+                    referenced_fn_names.add(item.fn_name)
         impl_template_names = self._lifted_impl_template_names(ast)
         pruned: list[Derective] = []
         for directive in ast:
@@ -350,6 +353,9 @@ class MonomorphizationPass(SimplifierPass):
                 self._collect_from_type(item, observed)
         return list(observed.values())
 
+    def _uses_box_type(self, ast: list[Derective]) -> bool:
+        return any(isinstance(item, Type) and item.name == "Box" and len(item.generics) == 1 for item in self._walk(ast))
+
     def _collect_from_type(self, typ: Type, out: dict[str, Type]) -> None:
         if isinstance(typ, (Pointer, Reference)):
             self._collect_from_type(typ.pointee, out)
@@ -380,6 +386,18 @@ class MonomorphizationPass(SimplifierPass):
                 )
             )
             existing.add("OwnerHeader")
+        if "Box" not in existing:
+            result.append(
+                Derective_struct(
+                    name="Box",
+                    generics=[Type("T")],
+                    params=[
+                        Parameter("ptr", Pointer(Type("T"))),
+                        Parameter("owner", Pointer(Type("OwnerHeader"))),
+                    ],
+                )
+            )
+            existing.add("Box")
         for inner in concrete_box_types:
             name = concrete_box_type_name(inner)
             if name in existing:

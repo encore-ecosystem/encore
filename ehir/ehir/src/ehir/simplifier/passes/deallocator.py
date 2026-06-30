@@ -378,7 +378,11 @@ class DeallocatorPass(SimplifierPass):
                 block.term.default_case = dst_label
             for i, case in enumerate(block.term.cases):
                 if case.label == src_label:
-                    block.term.cases[i] = type(case)(variant=case.variant, label=dst_label)
+                    block.term.cases[i] = type(case)(
+                        variant=case.variant,
+                        label=dst_label,
+                        payload_var=case.payload_var,
+                    )
 
     @staticmethod
     def _compute_dominators(

@@ -37,7 +37,14 @@ from ehir.core.instructions import (
 from ehir.core.instructions.base import Assignable
 from ehir.core.primitives import Float, Float_t, Isize, Isize_t, Str, Str_t, Usize, Usize_t
 from ehir.core.struct import Struct
-from ehir.core.type import HeapSmartPointer, Pointer, SmartPointer, StackSmartPointer, Type
+from ehir.core.type import (
+    HeapSmartPointer,
+    Pointer,
+    SmartPointer,
+    StackSmartPointer,
+    Type,
+    is_box_type,
+)
 from ehir.core.variable import Parameter, Variable
 from ehir.parser import Parser
 
@@ -74,6 +81,11 @@ MatchPatternLike = (
     | s.Expression_StringLiteral
     | None
 )
+
+
+def leaf_type_name(name: str) -> str:
+    base = name.split("[", 1)[0]
+    return base.rsplit("::", 1)[-1]
 
 BINOP_MAPPING: dict[str, type[BinOp]] = {
     "+": Instruction_add,
@@ -144,6 +156,7 @@ BUILTIN_TYPE_NAMES = {
     "f32",
     "f64",
     "void",
+    "Box",
 }
 
 
@@ -469,7 +482,7 @@ class EncoreToEHIRTranslator:
                         )
                         self._register_source_signature(method_signature)
                 elif isinstance(statement, s.Statement_Impl):
-                    struct_type = self._translate_type(statement.struct)
+                    struct_type = self._impl_owner_type(statement.struct)
                     if statement.trait_name is not None:
                         resolved_trait_name = self._trait_aliases.get(statement.trait_name, statement.trait_name)
                         owner_generic = next(
@@ -627,6 +640,8 @@ class EncoreToEHIRTranslator:
         typ = unwrap_for_storage(typ)
         if is_reference_like_type(typ):
             return self._lookup_active_generic_bounds(typ.pointee)
+        if self._is_box_like_type(typ):
+            return self._lookup_active_generic_bounds(self._box_like_pointee(typ))
         if is_raw_pointer_type(typ):
             return self._lookup_active_generic_bounds(typ.pointee)
         return list(self._active_generic_bounds.get(typ.name, []))
@@ -640,7 +655,7 @@ class EncoreToEHIRTranslator:
     ) -> str:
         if receiver_type is not None:
             receiver_type = unwrap_for_storage(receiver_type)
-            receiver_type = receiver_type.pointee if is_reference_like_type(receiver_type) else receiver_type
+            receiver_type = self._method_owner_type(receiver_type)
             for bound in self._lookup_active_generic_bounds(receiver_type):
                 resolved_trait_name = self._trait_aliases.get(
                     bound.name,
@@ -698,7 +713,7 @@ class EncoreToEHIRTranslator:
             return out
 
         receiver_type = unwrap_for_storage(receiver_type)
-        base_receiver_type = receiver_type.pointee if is_reference_like_type(receiver_type) else receiver_type
+        base_receiver_type = self._method_owner_type(receiver_type)
         if is_dyn_trait_type(base_receiver_type):
             trait_type = base_receiver_type.generics[0]
             signature = self._lookup_trait_method_signature(
@@ -831,6 +846,20 @@ class EncoreToEHIRTranslator:
             f"inherent_name='{inherent_name}', suffix_matches={len(inherent_candidates)}, method_suffix_matches={len(similar)}"
         )
 
+    def _method_owner_type(self, typ: Type) -> Type:
+        typ = unwrap_for_storage(typ)
+        if is_reference_like_type(typ):
+            typ = typ.pointee
+        if self._is_box_like_type(typ):
+            return self._box_like_pointee(typ)
+        return typ
+
+    def _impl_owner_type(self, typ: Type) -> Type:
+        translated = self._translate_type(typ)
+        if self._is_box_like_type(translated):
+            return self._box_like_pointee(translated)
+        return self._method_owner_type(translated)
+
     def _receiver_satisfies_bounds(self, receiver_type: Type, bounds: list[Type]) -> bool:
         for bound in bounds:
             if not self._type_satisfies_bound(receiver_type, bound):
@@ -841,6 +870,8 @@ class EncoreToEHIRTranslator:
         concrete = unwrap_for_storage(concrete)
         if is_reference_like_type(concrete):
             return self._type_satisfies_bound(concrete.pointee, bound)
+        if self._is_box_like_type(concrete):
+            return self._type_satisfies_bound(self._box_like_pointee(concrete), bound)
         if is_raw_pointer_type(concrete):
             return self._type_satisfies_bound(concrete.pointee, bound)
         for trait_name in self._impl_traits.get(concrete.name, []):
@@ -1076,7 +1107,7 @@ class EncoreToEHIRTranslator:
         prev_impl_self_type = self._current_impl_self_type
         self._current_impl_self_type = statement.struct
         if statement.trait_name is None:
-            struct_type = self._translate_type(statement.struct)
+            struct_type = self._impl_owner_type(statement.struct)
             for method in statement.body:
                 impl_generic_names = {generic.name for generic in statement.generics}
                 merged_method_generics = [*statement.generics]
@@ -1440,7 +1471,13 @@ class EncoreToEHIRTranslator:
 
     def _is_source_reference_like(self, var: Variable) -> bool:
         source_type = self._source_type_for_var(var)
-        return is_reference_like_type(source_type) or is_reference_like_type(var.type) or is_raw_pointer_type(var.type)
+        return (
+            is_reference_like_type(source_type)
+            or self._is_hidden_reference_type(source_type)
+            or is_reference_like_type(var.type)
+            or self._is_box_like_type(var.type)
+            or is_raw_pointer_type(var.type)
+        )
 
     def _fresh_temp_name(self, prefix: str) -> str:
         while True:
@@ -2332,7 +2369,7 @@ class EncoreToEHIRTranslator:
     def _resolve_match_arm_common(self, scrutinee_type: Type, arm: MatchArmLike) -> tuple[str, int, Optional[Type]]:
         scrutinee_type = unwrap_for_storage(scrutinee_type)
         base_type = scrutinee_type.pointee if is_reference_like_type(scrutinee_type) else scrutinee_type
-        enum = self._enums.get(base_type.name)
+        enum = self._enums.get(base_type.name) or self._lookup_enum(base_type)
         if enum is None:
             raise TypeError(f"Match expression must be an enum, got {scrutinee_type}")
         generic_mapping = {generic.name: concrete for generic, concrete in zip(enum.generics, base_type.generics)}
@@ -2343,9 +2380,22 @@ class EncoreToEHIRTranslator:
         elif len(arm.pattern.segments) == 2:
             explicit_enum = arm.pattern.segments[0]
             translated_explicit_enum = self._translate_type(explicit_enum)
-            if translated_explicit_enum.name != base_type.name:
+            if (
+                translated_explicit_enum.name != base_type.name
+                and self._leaf_type_name(translated_explicit_enum.name) != self._leaf_type_name(base_type.name)
+            ):
                 raise TypeError(f"Pattern enum '{explicit_enum.name}' does not match scrutinee type '{base_type.name}'")
-            if translated_explicit_enum.generics and not self._types_compatible(translated_explicit_enum, base_type):
+            if (
+                translated_explicit_enum.generics
+                and not self._types_compatible(translated_explicit_enum, base_type)
+                and (
+                    len(translated_explicit_enum.generics) != len(base_type.generics)
+                    or any(
+                        not self._types_compatible(left, right)
+                        for left, right in zip(translated_explicit_enum.generics, base_type.generics, strict=False)
+                    )
+                )
+            ):
                 raise TypeError(f"Pattern enum '{explicit_enum}' does not match scrutinee type '{base_type}'")
             variant_name = arm.pattern.segments[1].name
         else:
@@ -2416,7 +2466,7 @@ class EncoreToEHIRTranslator:
                         cause=exc,
                     ) from exc
 
-            enum_expr = self._build_enum_from_path(expr)
+            enum_expr = self._build_enum_from_path(expr, expected_type=expected_type)
             if enum_expr is not None:
                 out = Variable(name or self._advance_variable())
                 self._builder._add(Instruction_capenum(var_out=out, enum=enum_expr))
@@ -2874,7 +2924,7 @@ class EncoreToEHIRTranslator:
         result_type = tried.var_out.type
         result_type = unwrap_for_storage(result_type)
         base_result_type = result_type.pointee if is_reference_like_type(result_type) else result_type
-        if base_result_type.name != "Result" or len(base_result_type.generics) != 2:
+        if leaf_type_name(base_result_type.name) != "Result" or len(base_result_type.generics) != 2:
             raise TypeError(f"'?' operator expects Result[T, E], got {result_type}")
         ok_type, err_type = base_result_type.generics
         ok_type = self._translate_type(ok_type)
@@ -2886,7 +2936,7 @@ class EncoreToEHIRTranslator:
         fn_ret_type = current_fn.ret_type
         fn_ret_type = unwrap_for_storage(fn_ret_type)
         base_fn_ret_type = fn_ret_type.pointee if is_reference_like_type(fn_ret_type) else fn_ret_type
-        if base_fn_ret_type.name != "Result" or len(base_fn_ret_type.generics) != 2:
+        if leaf_type_name(base_fn_ret_type.name) != "Result" or len(base_fn_ret_type.generics) != 2:
             raise TypeError("'?' operator can only be used in functions returning Result")
         fn_err_type = base_fn_ret_type.generics[1]
         if not self._types_compatible(fn_err_type, err_type):
@@ -2901,25 +2951,39 @@ class EncoreToEHIRTranslator:
         ok_payload = Variable(name or self._advance_variable(), ok_type)
         err_payload = Variable(self._advance_variable(), err_type)
         cases = [
-            MatchCase(variant="Ok", label=ok_block.name, payload_var=ok_payload),
-            MatchCase(variant="Err", label=err_block.name, payload_var=err_payload),
+            MatchCase(variant="Ok", label=ok_block.name, payload_var=None),
+            MatchCase(variant="Err", label=err_block.name, payload_var=None),
         ]
         self._builder.build_match(cond_var=tried.var_out, default_label=err_block.name, cases=cases)
         self._mark_current_block_terminated()
 
         self._builder.position_at_end(err_block)
+        self._builder._add(
+            Instruction_getfield(
+                var_out=err_payload,
+                src=tried.var_out,
+                field=Variable("Err", err_type),
+            )
+        )
         err_value = Variable(self._advance_variable(), fn_ret_type)
         err_enum = Enum(
             name=base_fn_ret_type.name,
             generics=base_fn_ret_type.generics,
             variant="Err",
-            payload=Struct(name=err_type.name, value=err_payload, type=err_type),
+            args=[err_payload],
         )
         self._builder._add(Instruction_capenum(var_out=err_value, enum=err_enum))
         self._builder.build_ret(err_value)
         self._mark_current_block_terminated()
 
         self._builder.position_at_end(ok_block)
+        self._builder._add(
+            Instruction_getfield(
+                var_out=ok_payload,
+                src=tried.var_out,
+                field=Variable("Ok", ok_type),
+            )
+        )
         return Assignable(ok_payload)
 
     def _translate_expression_block(
@@ -3246,9 +3310,12 @@ class EncoreToEHIRTranslator:
             return None
         if not isinstance(root_ptr.type, Pointer):
             return None
-        if is_reference_like_type(self._source_type_for_var(root_ptr)):
+        root_source_type = self._source_type_for_var(root_ptr)
+        if is_reference_like_type(root_source_type) or self._is_hidden_reference_type(root_source_type):
             return None
         if isinstance(root_ptr.type.pointee, SmartPointer):
+            return None
+        if self._is_box_like_type(root_ptr.type.pointee):
             return None
 
         src_ptr = root_ptr
@@ -3263,8 +3330,13 @@ class EncoreToEHIRTranslator:
         self, typ: Type, args: list[Variable], name: Optional[str] = None
     ) -> Assignable:
         source_type = unwrap_for_storage(typ)
-        struct_type = source_type.pointee if is_reference_like_type(source_type) else source_type
-        struct_type = self._translate_type(struct_type)
+        struct_source_type = source_type.pointee if is_reference_like_type(source_type) else source_type
+        if self._is_hidden_reference_type(struct_source_type):
+            struct_type = self._hidden_reference_payload_type(struct_source_type)
+        elif self._is_box_like_type(struct_source_type):
+            struct_type = self._box_like_pointee(struct_source_type)
+        else:
+            struct_type = self._translate_type(struct_source_type)
         struct = Struct(struct_type.name, struct_type.generics, args)
         out = Variable(name or self._advance_variable())
 
@@ -3286,21 +3358,38 @@ class EncoreToEHIRTranslator:
             self._builder._add(Instruction_wraps(var_out=out, variable=plain))
             return Assignable(out)
 
+        if self._is_hidden_reference_type(source_type):
+            plain = Variable(self._advance_variable(), struct.as_type())
+            self._remember_source_type(plain, source_type)
+            self._builder._add(Instruction_capstruct(var_out=plain, struct=struct))
+            out.type = self._translate_type(source_type)
+            self._remember_source_type(out, source_type)
+            self._builder._add(Instruction_wraph(var_out=out, variable=plain))
+            return Assignable(out)
+
         out.type = struct.as_type()
         self._remember_source_type(out, typ)
         self._builder._add(Instruction_capstruct(var_out=out, struct=struct))
         return Assignable(out)
 
-    def _build_enum_from_path(self, expr: s.Expression_Path) -> Enum | None:
+    def _build_enum_from_path(self, expr: s.Expression_Path, expected_type: Type | None = None) -> Enum | None:
         if len(expr.segments) < 2:
             return None
 
         enum_type = expr.segments[0]
         variant_name = expr.segments[-1].name
-        if len(expr.segments) != 2 or self._lookup_enum(enum_type) is None:
+        enum_def = self._lookup_enum(enum_type)
+        if len(expr.segments) != 2 or enum_def is None:
             return None
 
         translated_enum_type = self._translate_type(enum_type)
+        if translated_enum_type.name not in self._enums:
+            translated_enum_type = replace(translated_enum_type, name=enum_def.name)
+        if expected_type is not None and not translated_enum_type.generics:
+            expected_base = unwrap_for_storage(expected_type)
+            expected_base = expected_base.pointee if is_reference_like_type(expected_base) else expected_base
+            if self._leaf_type_name(expected_base.name) == self._leaf_type_name(translated_enum_type.name):
+                translated_enum_type = replace(translated_enum_type, generics=list(expected_base.generics))
         return Enum(
             name=translated_enum_type.name, generics=translated_enum_type.generics, variant=variant_name, args=[]
         )
@@ -3321,7 +3410,9 @@ class EncoreToEHIRTranslator:
             if payload_type is None:
                 raise NotImplementedError(f"Unable to resolve payload type for enum variant '{expr.name}'.")
 
-            payload_field_types = self._lookup_struct_field_types(payload_type)
+            payload_field_types = (
+                [] if self._is_box_like_type(payload_type) else self._lookup_struct_field_types(payload_type)
+            )
             if payload_field_types:
                 if len(expr.args) == 1:
                     first_expected = payload_field_types[0] if len(payload_field_types) == 1 else None
@@ -3359,7 +3450,17 @@ class EncoreToEHIRTranslator:
         )
 
     def _lookup_enum(self, typ: Type) -> Derective_enum | None:
-        return self._enums.get(self._translate_type(typ).name)
+        translated = self._translate_type(typ)
+        enum = self._enums.get(translated.name)
+        if enum is not None:
+            return enum
+        leaf = self._leaf_type_name(translated.name)
+        matches = [
+            enum_def
+            for name, enum_def in self._enums.items()
+            if self._leaf_type_name(name) == leaf
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def _lookup_enum_variant_type(self, enum_type: Type, variant_name: str) -> Optional[Type]:
         translated_enum_type = self._translate_type(enum_type)
@@ -3410,6 +3511,8 @@ class EncoreToEHIRTranslator:
     def _lookup_struct_field_types(self, typ: Type) -> list[Type]:
         typ = unwrap_for_storage(typ)
         base_type = typ.pointee if is_reference_like_type(typ) else typ
+        if self._is_box_like_type(base_type):
+            base_type = self._box_like_pointee(base_type)
         struct_def = self._resolve_struct_definition(base_type.name)
         if not isinstance(struct_def, s.CLikeStructureDefinition):
             return []
@@ -3426,6 +3529,8 @@ class EncoreToEHIRTranslator:
 
         typ = unwrap_for_storage(typ)
         base_type = typ.pointee if is_reference_like_type(typ) else typ
+        if self._is_box_like_type(base_type):
+            base_type = self._box_like_pointee(base_type)
         struct_def = self._resolve_struct_definition(base_type.name)
         if not isinstance(struct_def, s.CLikeStructureDefinition):
             return None
@@ -3462,6 +3567,42 @@ class EncoreToEHIRTranslator:
             return module_aliases[name]
         return self._type_aliases.get(name, name)
 
+    @staticmethod
+    def _leaf_type_name(name: str) -> str:
+        base = name.split("[", 1)[0]
+        return base.rsplit("::", 1)[-1]
+
+    def _is_hidden_reference_type(self, typ: Type | None) -> bool:
+        if typ is None:
+            return False
+        typ = unwrap_for_storage(typ)
+        if isinstance(typ, (AnySmartPointer, HeapSmartPointer, StackSmartPointer, Pointer)):
+            return False
+        if is_raw_pointer_type(typ) or is_dyn_trait_type(typ):
+            return False
+        if not isinstance(typ, Type):
+            return False
+        return self._leaf_type_name(self._canonical_type_name(typ.name)) == "Vec"
+
+    def _is_box_like_type(self, typ: Type | None) -> bool:
+        if typ is None or isinstance(typ, (Pointer, SmartPointer)):
+            return False
+        typ = unwrap_for_storage(typ)
+        return (
+            isinstance(typ, Type)
+            and len(typ.generics) == 1
+            and (is_box_type(typ) or self._leaf_type_name(typ.name) == "Box")
+        )
+
+    def _box_like_pointee(self, typ: Type) -> Type:
+        if not self._is_box_like_type(typ):
+            raise TypeError(f"{typ} is not Box-like")
+        return typ.generics[0]
+
+    def _hidden_reference_payload_type(self, typ: Type) -> Type:
+        typ = unwrap_for_storage(typ)
+        return Type(self._canonical_type_name(typ.name), [self._translate_type(generic) for generic in typ.generics])
+
     def _translate_type(self, typ: Type) -> Type:
         typ = unwrap_for_storage(typ)
         if isinstance(typ, AnySmartPointer):
@@ -3483,6 +3624,10 @@ class EncoreToEHIRTranslator:
             return Pointer(self._translate_type(typ.pointee))
         if is_dyn_trait_type(typ):
             return Type("dyn", [self._translate_trait_type(typ.generics[0])])
+        if self._is_box_like_type(typ):
+            return Type("Box", [self._box_like_pointee(typ)])
+        if self._is_hidden_reference_type(typ):
+            return Type("Box", [self._hidden_reference_payload_type(typ)])
         if typ.name == "bool":
             return Usize_t(1)
         if typ.name == "usize":

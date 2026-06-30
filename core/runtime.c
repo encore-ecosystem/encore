@@ -822,11 +822,24 @@ static bool g_args_initialized = false;
 static size_t g_argc = 0;
 static char **g_argv = NULL;
 
+static void encore_free_args(void) {
+    if (g_argv == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < g_argc; ++i) {
+        free(g_argv[i]);
+    }
+    free(g_argv);
+    g_argv = NULL;
+    g_argc = 0;
+}
+
 static void encore_init_args(void) {
     if (g_args_initialized) {
         return;
     }
     g_args_initialized = true;
+    atexit(encore_free_args);
 
     FILE *file = fopen("/proc/self/cmdline", "rb");
     if (file == NULL) {
