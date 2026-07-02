@@ -1944,7 +1944,77 @@ fn find_callable_workspace(workspace: Workspace, preferred: FrontendDocument, na
     ret Option[FrontendCallable]::None
 }
 
-fn find_callable_for_inlay(workspace: Workspace, preferred: FrontendDocument, extra_callables: Vec[FrontendCallable], name: str) -> Option[FrontendCallable] {
+fn import_target_root(target: str) -> str {
+    match find_substring(target, "::") {
+        Option[usize]::Some(index) => {
+            ret target.slice(0_usize, index)
+        }
+        Option[usize]::None => {
+            ret target
+        }
+    }
+}
+
+fn import_target_leaf(target: str) -> str {
+    let mut index = target.char_len()
+    while index > 1_usize {
+        index -= 1_usize
+        if starts_at(target, "::", index - 1_usize) {
+            ret target.slice(index + 1_usize, target.char_len() - index - 1_usize)
+        }
+    }
+    ret target
+}
+
+fn import_target_parent(target: str) -> str {
+    match find_substring(target, "::") {
+        Option[usize]::Some(first) => {
+            let mut index = target.char_len()
+            while index > first + 2_usize {
+                index -= 1_usize
+                if starts_at(target, "::", index - 1_usize) {
+                    ret target.slice(first + 2_usize, index - first - 3_usize)
+                }
+            }
+            ret ""
+        }
+        Option[usize]::None => {
+            ret ""
+        }
+    }
+}
+
+fn find_imported_callable_for_inlay(doc: Document, name: str) -> Option[FrontendCallable] {
+    for edge in doc.analysis.dependencies.all() {
+        if contains_text(edge.target, "{") || contains_text(edge.target, ",") {
+            continue
+        }
+        if import_target_leaf(edge.target) != name {
+            continue
+        }
+        let root = import_target_root(edge.target)
+        let parent = import_target_parent(edge.target)
+        match import_base_dir(doc, root) {
+            Option[str]::Some(base_dir) => {
+                match import_module_file(base_dir, parent) {
+                    Option[str]::Some(module_file) => {
+                        match find_callable_signature_in_text(read_file(module_file), name) {
+                            Option[FrontendCallable]::Some(callable) => {
+                                ret Option[FrontendCallable]::Some(callable)
+                            }
+                            Option[FrontendCallable]::None => {}
+                        }
+                    }
+                    Option[str]::None => {}
+                }
+            }
+            Option[str]::None => {}
+        }
+    }
+    ret Option[FrontendCallable]::None
+}
+
+fn find_callable_for_inlay(workspace: Workspace, doc: Document, preferred: FrontendDocument, extra_callables: Vec[FrontendCallable], name: str) -> Option[FrontendCallable] {
     match find_callable(preferred, name) {
         Option[FrontendCallable]::Some(callable) => {
             ret Option[FrontendCallable]::Some(callable)
@@ -1952,6 +2022,12 @@ fn find_callable_for_inlay(workspace: Workspace, preferred: FrontendDocument, ex
         Option[FrontendCallable]::None => {}
     }
     match find_callable_in_list(extra_callables, name) {
+        Option[FrontendCallable]::Some(callable) => {
+            ret Option[FrontendCallable]::Some(callable)
+        }
+        Option[FrontendCallable]::None => {}
+    }
+    match find_imported_callable_for_inlay(doc, name) {
         Option[FrontendCallable]::Some(callable) => {
             ret Option[FrontendCallable]::Some(callable)
         }
@@ -2055,14 +2131,14 @@ fn inlay_hints_json(analysis: FrontendDocument) -> str {
     ret out
 }
 
-fn inlay_hints_workspace_json(workspace: Workspace, analysis: FrontendDocument) -> str {
-    ret inlay_hints_workspace_json_offset(workspace, analysis, 0_usize, Vec[FrontendCallable]::new())
+fn inlay_hints_workspace_json(workspace: Workspace, doc: Document) -> str {
+    ret inlay_hints_workspace_json_offset(workspace, doc, doc.analysis, 0_usize, Vec[FrontendCallable]::new())
 }
 
-fn inlay_hints_workspace_json_offset(workspace: Workspace, analysis: FrontendDocument, line_offset: usize, extra_callables: Vec[FrontendCallable]) -> str {
+fn inlay_hints_workspace_json_offset(workspace: Workspace, doc: Document, analysis: FrontendDocument, line_offset: usize, extra_callables: Vec[FrontendCallable]) -> str {
     let mut out = "["
     let mut first = true
-    let type_hints = variable_type_inlay_hints_json(workspace, analysis, first, line_offset, extra_callables)
+    let type_hints = variable_type_inlay_hints_json(workspace, doc, analysis, first, line_offset, extra_callables)
     out += type_hints.0
     first = type_hints.1
 
@@ -2072,7 +2148,7 @@ fn inlay_hints_workspace_json_offset(workspace: Workspace, analysis: FrontendDoc
             Option[Token]::Some(token) => {
                 if token.type == TokenType::IDENTIFIER {
                     if is_callable_invocation_candidate(analysis, index) {
-                        match find_callable_for_inlay(workspace, analysis, extra_callables, token.value) {
+                        match find_callable_for_inlay(workspace, doc, analysis, extra_callables, token.value) {
                             Option[FrontendCallable]::Some(callable) => {
                                 let hints = call_inlay_hints_json(analysis, callable, index + 1_usize, first, line_offset)
                                 out += hints.0
@@ -2093,7 +2169,7 @@ fn inlay_hints_workspace_json_offset(workspace: Workspace, analysis: FrontendDoc
 
 fn inlay_hints_for_request(workspace: Workspace, doc: Document, request: Json) -> str {
     if doc.analysis.tokens.len() > 0_usize {
-        ret inlay_hints_workspace_json(workspace, doc.analysis)
+        ret inlay_hints_workspace_json(workspace, doc)
     }
 
     let start_line = json_request_range_line(request, "start", 0_usize)
@@ -2101,10 +2177,10 @@ fn inlay_hints_for_request(workspace: Workspace, doc: Document, request: Json) -
     let window = source_lines_window(doc.text, start_line, end_line)
     let analysis = analyze_source_lightweight(window)
     let extra_callables = collect_inlay_callable_index(doc.text, analysis)
-    ret inlay_hints_workspace_json_offset(workspace, analysis, start_line, extra_callables)
+    ret inlay_hints_workspace_json_offset(workspace, doc, analysis, start_line, extra_callables)
 }
 
-fn variable_type_inlay_hints_json(workspace: Workspace, analysis: FrontendDocument, first: bool, line_offset: usize, extra_callables: Vec[FrontendCallable]) -> (str, bool) {
+fn variable_type_inlay_hints_json(workspace: Workspace, doc: Document, analysis: FrontendDocument, first: bool, line_offset: usize, extra_callables: Vec[FrontendCallable]) -> (str, bool) {
     let mut out = ""
     let mut is_first = first
     let mut index = 0_usize
@@ -2112,7 +2188,7 @@ fn variable_type_inlay_hints_json(workspace: Workspace, analysis: FrontendDocume
         match analysis.tokens.get(index) {
             Option[Token]::Some(token) => {
                 if token.type == TokenType::KW_LET {
-                    match variable_type_hint_at(workspace, analysis, index, line_offset, extra_callables) {
+                    match variable_type_hint_at(workspace, doc, analysis, index, line_offset, extra_callables) {
                         Option[str]::Some(hint) => {
                             if !is_first {
                                 out += ","
@@ -2131,7 +2207,7 @@ fn variable_type_inlay_hints_json(workspace: Workspace, analysis: FrontendDocume
     ret (out, is_first)
 }
 
-fn variable_type_hint_at(workspace: Workspace, analysis: FrontendDocument, let_index: usize, line_offset: usize, extra_callables: Vec[FrontendCallable]) -> Option[str] {
+fn variable_type_hint_at(workspace: Workspace, doc: Document, analysis: FrontendDocument, let_index: usize, line_offset: usize, extra_callables: Vec[FrontendCallable]) -> Option[str] {
     let mut index = let_index + 1_usize
     if next_token_is_lsp(analysis, index, TokenType::KW_MUT) {
         index += 1_usize
@@ -2154,7 +2230,7 @@ fn variable_type_hint_at(workspace: Workspace, analysis: FrontendDocument, let_i
                     ret Option[str]::None
                 }
             }
-            match infer_expr_type(workspace, analysis, index + 2_usize, extra_callables) {
+            match infer_expr_type(workspace, doc, analysis, index + 2_usize, extra_callables) {
                 Option[str]::Some(typ) => {
                     ret Option[str]::Some(inlay_hint_json(name_token.line + line_offset, name_token.column + name_token.value.char_len(), ": " + typ, 1_usize))
                 }
@@ -2166,7 +2242,7 @@ fn variable_type_hint_at(workspace: Workspace, analysis: FrontendDocument, let_i
     ret Option[str]::None
 }
 
-fn infer_expr_type(workspace: Workspace, analysis: FrontendDocument, start: usize, extra_callables: Vec[FrontendCallable]) -> Option[str] {
+fn infer_expr_type(workspace: Workspace, doc: Document, analysis: FrontendDocument, start: usize, extra_callables: Vec[FrontendCallable]) -> Option[str] {
     match analysis.tokens.get(start) {
         Option[Token]::Some(token) => {
             if token.type == TokenType::INTEGER {
@@ -2182,11 +2258,11 @@ fn infer_expr_type(workspace: Workspace, analysis: FrontendDocument, start: usiz
                 ret Option[str]::Some("bool")
             }
             if token.type == TokenType::MINUS {
-                ret infer_expr_type(workspace, analysis, start + 1_usize, extra_callables)
+                ret infer_expr_type(workspace, doc, analysis, start + 1_usize, extra_callables)
             }
             if token.type == TokenType::IDENTIFIER {
                 if token.value == "vec" {
-                    match infer_vec_macro_type(workspace, analysis, start, extra_callables) {
+                    match infer_vec_macro_type(workspace, doc, analysis, start, extra_callables) {
                         Option[str]::Some(typ) => {
                             ret Option[str]::Some(typ)
                         }
@@ -2203,7 +2279,7 @@ fn infer_expr_type(workspace: Workspace, analysis: FrontendDocument, start: usiz
                     ret Option[str]::Some(token.value)
                 }
                 if next_token_is_lsp(analysis, start + 1_usize, TokenType::LEFT_PAREN) {
-                    match find_callable_for_inlay(workspace, analysis, extra_callables, token.value) {
+                    match find_callable_for_inlay(workspace, doc, analysis, extra_callables, token.value) {
                         Option[FrontendCallable]::Some(callable) => {
                             ret callable.ret_type
                         }
@@ -2299,14 +2375,14 @@ fn token_after_type_path(analysis: FrontendDocument, start: usize) -> Option[Tok
     ret Option[Token]::None
 }
 
-fn infer_vec_macro_type(workspace: Workspace, analysis: FrontendDocument, start: usize, extra_callables: Vec[FrontendCallable]) -> Option[str] {
+fn infer_vec_macro_type(workspace: Workspace, doc: Document, analysis: FrontendDocument, start: usize, extra_callables: Vec[FrontendCallable]) -> Option[str] {
     if !next_token_is_lsp(analysis, start + 1_usize, TokenType::BANG) {
         ret Option[str]::None
     }
     if !next_token_is_lsp(analysis, start + 2_usize, TokenType::LEFT_BRACKET) {
         ret Option[str]::None
     }
-    match infer_expr_type(workspace, analysis, start + 3_usize, extra_callables) {
+    match infer_expr_type(workspace, doc, analysis, start + 3_usize, extra_callables) {
         Option[str]::Some(item_type) => {
             ret Option[str]::Some("Vec[" + item_type + "]")
         }
@@ -2498,7 +2574,7 @@ fn hover_result(doc: Document, request: Json) -> str {
         }
         Option[usize]::None => {}
     }
-    ret "{\"contents\":{\"kind\":\"markdown\",\"value\":\"Encore source file.\"}}"
+    ret "null"
 }
 
 fn hover_workspace_result(workspace: Workspace, doc: Document, request: Json) -> str {
@@ -3003,7 +3079,7 @@ fn token_at(analysis: FrontendDocument, line: usize, character: usize) -> Option
     for token in analysis.tokens {
         if token.line == line {
             if character >= token.column {
-                if character < token.column + token.value.char_len() {
+                if character <= token.column + token.value.char_len() {
                     ret Option[Token]::Some(token)
                 }
             }
@@ -3772,12 +3848,12 @@ fn handle_request(workspace: mut Workspace, id: str, method: str, message: Json)
                         write_message(response(id, hover_workspace_result(workspace, doc, message)))
                     }
                     Option[Document]::None => {
-                        write_message(response(id, "{\"contents\":{\"kind\":\"markdown\",\"value\":\"Encore source file.\"}}"))
+                        write_message(response(id, "null"))
                     }
                 }
             }
             Option[str]::None => {
-                write_message(response(id, "{\"contents\":{\"kind\":\"markdown\",\"value\":\"Encore source file.\"}}"))
+                write_message(response(id, "null"))
             }
         }
         ret ()

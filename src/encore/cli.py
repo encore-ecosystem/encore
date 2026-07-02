@@ -8,7 +8,7 @@ MODES = [
     # modes.add_add_parser,
     modes.add_init_parser,
     modes.add_lsp_parser,
-    # modes.add_install_parser,
+    modes.add_install_parser,
     modes.add_build_parser,
     modes.add_run_parser,
     modes.add_memcheck_parser,

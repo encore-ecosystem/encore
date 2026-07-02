@@ -43,9 +43,9 @@ def add_install_parser(subparsers) -> tuple[str, Callable]:
     install_parser.add_argument("--backend", default="llvm", choices=set(AVAILABLE_BACKENDS), help="EHIR backend")
     install_parser.add_argument(
         "--profile",
-        default="release",
+        default="extreme",
         choices=set(AVAILABLE_OPTPROFILES),
-        help="Build optimization profile. Defaults to release.",
+        help="Build optimization profile. Defaults to extreme.",
     )
     install_parser.add_argument("--debug", action="store_true", help="Shortcut for --profile debug")
     install_parser.add_argument("--no-cache", action="store_true", help="Ignore existing EHIR cache for this build")

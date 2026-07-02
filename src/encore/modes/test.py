@@ -17,6 +17,7 @@ from ehir import EHIR_ProjectCompiler
 from ehir.compiler import CompileProfileRecord
 from ehir_llvm_backend import EHIR_LLVM_Backend
 from encore.compiler import EncoreCompiler
+from encore.compiler.compiler import ImportedTopLevelDeclaration
 from encore.compiler.inference import TypeInferer
 from encore.compiler.parser import statements as s
 from encore.compiler.translator import EncoreToEHIRTranslator
@@ -300,17 +301,16 @@ def _compile_test_binary(
     test: UnitTestCase,
 ) -> tuple[Path, list]:
     module_id = test.synthetic_module_id
-    imported_declarations = compiler._imported_declarations_for_module(refrain, test.module_id)
-    alias_declarations = compiler._flattened_alias_declarations(refrain)
+    imported_declarations = _test_imported_declarations(compiler, refrain, test.module_id)
 
-    module_ast = _build_test_module_ast(refrain, test)
+    module_ast = _build_test_module_ast(compiler, refrain, test)
     TypeInferer().infer(module_ast, imported_declarations=imported_declarations)
     _validate_test_function(module_ast, test)
 
     ehr = EncoreToEHIRTranslator().translate_ast(
         module_ast,
         module_id=module_id,
-        imported_declarations=alias_declarations,
+        imported_declarations=imported_declarations,
     )
     ehir_compiler = EHIR_ProjectCompiler()
     typed = ehir_compiler.resolve_module(ehr)
@@ -327,15 +327,66 @@ def _compile_test_binary(
     return binary_path, ehir_compiler.pass_timings
 
 
-def _build_test_module_ast(refrain, test: UnitTestCase) -> list[s.Statement]:
-    local_ast = deepcopy(refrain.symbols.local_ast_without_imports.get(test.module_id, []))
+def _build_test_module_ast(compiler: EncoreCompiler, refrain, test: UnitTestCase) -> list[s.Statement]:
+    module_ast = deepcopy(compiler.refrain_manager._parse_file(test.module_id))
     filtered_ast: list[s.Statement] = []
-    for statement in local_ast:
+    for statement in module_ast:
         if isinstance(statement, s.Statement_FunctionDefinition) and statement.name == "main":
             continue
         filtered_ast.append(statement)
     filtered_ast.append(_build_test_harness(test.function_name))
     return filtered_ast
+
+
+def _test_imported_declarations(compiler: EncoreCompiler, refrain, module_id: Path) -> list[ImportedTopLevelDeclaration]:
+    local_statements = refrain.symbols.local_ast_without_imports.get(module_id, [])
+    local_keys = {
+        (module_id.resolve(), type(statement).__name__, _top_level_name(statement))
+        for statement in local_statements
+        if isinstance(statement, s.Statement_TopLevel)
+    }
+    imported: list[ImportedTopLevelDeclaration] = []
+    seen: set[tuple[Path, str, str | None]] = set()
+    for statement in refrain.ast:
+        if not isinstance(statement, s.Statement_TopLevel):
+            continue
+        if isinstance(statement, s.Statement_FunctionDefinition) and statement.signature.name == "main":
+            continue
+        source_module_id = getattr(statement, "module_id", module_id)
+        if not isinstance(source_module_id, Path):
+            source_module_id = module_id
+        source_module_id = source_module_id.resolve()
+        key = (source_module_id, type(statement).__name__, _top_level_name(statement))
+        if key in local_keys or key in seen:
+            continue
+        seen.add(key)
+        imported.append(
+            ImportedTopLevelDeclaration(
+                module_id=source_module_id,
+                statement=statement,
+            )
+        )
+    return imported
+
+
+def _top_level_name(statement: s.Statement_TopLevel) -> str | None:
+    if isinstance(statement, s.Statement_FunctionDefinition):
+        return statement.signature.name
+    if isinstance(statement, s.FunctionSignature):
+        return statement.name
+    if isinstance(statement, s.Statement_StructureDefinition):
+        return statement.signature.name
+    if isinstance(statement, s.Statement_EnumDefinition):
+        return statement.name
+    if isinstance(statement, s.Statement_Trait):
+        return statement.name
+    if isinstance(statement, s.Statement_Global):
+        return statement.name
+    if isinstance(statement, s.Statement_Impl):
+        trait_name = statement.trait_name or ""
+        methods = ",".join(method.signature.name for method in statement.body)
+        return f"impl::{trait_name}::{statement.struct}::{methods}"
+    return None
 
 
 def _build_test_harness(test_function_name: str) -> s.Statement_FunctionDefinition:

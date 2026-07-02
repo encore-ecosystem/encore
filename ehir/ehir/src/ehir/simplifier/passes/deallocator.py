@@ -378,10 +378,14 @@ class DeallocatorPass(SimplifierPass):
                 block.term.default_case = dst_label
             for i, case in enumerate(block.term.cases):
                 if case.label == src_label:
+                    # `dst_label` is an intermediate deallocation block. Match payload
+                    # binding must stay with the original arm body, otherwise the
+                    # downgrader injects a second payload extraction into the
+                    # deallocation block and creates competing SSA definitions.
                     block.term.cases[i] = type(case)(
                         variant=case.variant,
                         label=dst_label,
-                        payload_var=case.payload_var,
+                        payload_var=None,
                     )
 
     @staticmethod

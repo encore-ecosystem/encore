@@ -131,9 +131,6 @@ Release-gate validation currently uses:
 cd bootstrap
 uv run --project .. encore test --no-cache
 
-cd ../ehir-llvm-backend
-uv run --project .. ehir-llvm-backend test
-
 cd ..
 uv run ruff check src core ehir/src ehir-llvm-backend/src
 uv run ty check src/encore/modes/build.py src/encore/modes/test.py

@@ -1,9 +1,9 @@
 # from .add import add_add_parser
 from .build import add_build_parser
 from .init import add_init_parser
+from .install import add_install_parser
 from .lsp import add_lsp_parser
 
-# from .install import add_install_parser
 from .memcheck import add_memcheck_parser
 from .run import add_run_parser
 from .test import add_test_parser

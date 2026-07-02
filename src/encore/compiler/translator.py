@@ -3379,17 +3379,31 @@ class EncoreToEHIRTranslator:
         enum_type = expr.segments[0]
         variant_name = expr.segments[-1].name
         enum_def = self._lookup_enum(enum_type)
-        if len(expr.segments) != 2 or enum_def is None:
+        if len(expr.segments) != 2:
             return None
 
-        translated_enum_type = self._translate_type(enum_type)
-        if translated_enum_type.name not in self._enums:
-            translated_enum_type = replace(translated_enum_type, name=enum_def.name)
-        if expected_type is not None and not translated_enum_type.generics:
+        translated_enum_type: Type | None = None
+        if enum_def is not None:
+            translated_enum_type = self._translate_type(enum_type)
+            if translated_enum_type.name not in self._enums:
+                translated_enum_type = replace(translated_enum_type, name=enum_def.name)
+
+        if expected_type is not None:
             expected_base = unwrap_for_storage(expected_type)
             expected_base = expected_base.pointee if is_reference_like_type(expected_base) else expected_base
-            if self._leaf_type_name(expected_base.name) == self._leaf_type_name(translated_enum_type.name):
-                translated_enum_type = replace(translated_enum_type, generics=list(expected_base.generics))
+            expected_enum_def = self._lookup_enum(expected_base)
+            if expected_enum_def is not None and any(variant.name == variant_name for variant in expected_enum_def.variants):
+                if translated_enum_type is None:
+                    enum_def = expected_enum_def
+                    translated_enum_type = replace(expected_base, name=expected_enum_def.name)
+                elif (
+                    not translated_enum_type.generics
+                    and self._leaf_type_name(expected_base.name) == self._leaf_type_name(translated_enum_type.name)
+                ):
+                    translated_enum_type = replace(translated_enum_type, generics=list(expected_base.generics))
+
+        if enum_def is None or translated_enum_type is None:
+            return None
         return Enum(
             name=translated_enum_type.name, generics=translated_enum_type.generics, variant=variant_name, args=[]
         )
