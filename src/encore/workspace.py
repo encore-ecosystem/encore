@@ -24,6 +24,8 @@ from encore.compiler.parser.statements import (
 )
 from encore.utils.manifest import ProjectManifest
 
+WORKSPACE_CACHE_SCHEMA = "workspace-v2"
+
 
 @dataclass(frozen=True)
 class SymbolBinding:
@@ -104,6 +106,7 @@ class RefrainData:
     import_graph: ImportGraph | None = None
     ast: list[Statement] = field(default_factory=list)
     dependencies: list["RefrainData"] = field(default_factory=list)
+    workspace_cache_key: str = ""
 
 
 @dataclass
@@ -145,7 +148,7 @@ class RefrainManager:
             dependency_path = self._resolve_dependency(dep=dependency, base_path=refrain_root)
             ref_data.dependencies.append(self.add_refrain_with_dependencies(dependency_path, False))
 
-        return self._resolve_refrain(ref_data)
+        return self._resolve_refrain(ref_data, load_cache=not self.source_overrides)
 
     def get_building_queue(self) -> deque[RefrainData]:
         nodes = dict(self._namespace)
@@ -185,21 +188,21 @@ class RefrainManager:
         return result
 
     def _resolve_refrain(self, data: RefrainData, load_cache: bool = False) -> RefrainData:
-        # cache forming
-        hasher = hashlib.sha256()
-        for deteriminant in map(str, [data.ast, data.version, __version__]):
-            hasher.update(deteriminant.encode("utf-8"))
-        refrain_cache = hasher.hexdigest()
-        cache_dump_path = ENCORE_CACHE_DIR / "local" / refrain_cache
-
-        # Cache hit
         if data.symbols.resolved:
             return data
+
+        data.workspace_cache_key = self._workspace_cache_key(data)
+        cache_dump_path = ENCORE_CACHE_DIR / "local" / f"{data.workspace_cache_key}.workspace"
 
         if load_cache and cache_dump_path.exists():
             print(f"[{data.name}] Cache hit")
             with cache_dump_path.open("rb") as f:
-                return pickle.load(f)
+                cached: RefrainData = pickle.load(f)
+            cached.dependencies = data.dependencies
+            cached.target_is_binary = data.target_is_binary
+            cached.workspace_cache_key = data.workspace_cache_key
+            self._namespace[data.name] = cached
+            return cached
 
         # Build import graph and flatten AST
         data.import_graph = self._build_import_graph(data)
@@ -215,6 +218,37 @@ class RefrainManager:
                 pickle.dump(data, f)
 
         return data
+
+    def _workspace_cache_key(self, data: RefrainData) -> str:
+        hasher = hashlib.sha256()
+        hasher.update(WORKSPACE_CACHE_SCHEMA.encode("utf-8"))
+        hasher.update(__version__.encode("utf-8"))
+        hasher.update(data.name.encode("utf-8"))
+        hasher.update(str(data.version).encode("utf-8"))
+        hasher.update(b"binary" if data.target_is_binary else b"library")
+
+        manifest_path = data.path / ProjectManifest.default_filename()
+        self._hash_file_if_exists(hasher, manifest_path, data.path)
+        self._hash_file_if_exists(hasher, data.path / "build.enq", data.path)
+
+        source_root = data.path / "src"
+        if source_root.exists():
+            for source_path in sorted(source_root.rglob("*.enq")):
+                self._hash_file_if_exists(hasher, source_path, data.path)
+
+        for dependency in sorted(data.dependencies, key=lambda item: item.name):
+            hasher.update(dependency.name.encode("utf-8"))
+            hasher.update(dependency.workspace_cache_key.encode("utf-8"))
+
+        return hasher.hexdigest()
+
+    def _hash_file_if_exists(self, hasher, path: Path, root: Path) -> None:
+        resolved = path.resolve()
+        hasher.update(str(resolved.relative_to(root.resolve()) if resolved.is_relative_to(root.resolve()) else resolved).encode("utf-8"))
+        if not path.exists():
+            hasher.update(b"\0missing")
+            return
+        hasher.update(hashlib.sha256(path.read_bytes()).digest())
 
     def _resolve_imports(self, data: RefrainData, graph: ImportGraph):
         resolving: set[Path] = set()

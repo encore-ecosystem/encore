@@ -74,6 +74,7 @@ class DeallocatorPass(SimplifierPass):
     _returned_stack_slot_blocks: dict[str, set[str]]
     _loaded_from_stack_slot: dict[str, str]
     _explicitly_dropped_stack_slots: dict[str, set[str]]
+    _needs_drop_cache: dict[str, bool]
 
     def run(self, module: EHIR_TypedModule) -> EHIR_TypedModule:
         module.ast = self._run_ast(module.ast)
@@ -104,6 +105,15 @@ class DeallocatorPass(SimplifierPass):
             or name.startswith("__cfree")
         )
 
+    def _needs_drop_type(self, typ: Type) -> bool:
+        key = str(typ)
+        cached = self._needs_drop_cache.get(key)
+        if cached is not None:
+            return cached
+        value = needs_drop(typ, self._aggregate_names)
+        self._needs_drop_cache[key] = value
+        return value
+
     def _place_cfree(self, fn: Normalized_fn):
         self._validate_manual_drop(fn)
         self._usages = {}
@@ -119,6 +129,7 @@ class DeallocatorPass(SimplifierPass):
         self._returned_stack_slot_blocks = {}
         self._loaded_from_stack_slot = {}
         self._explicitly_dropped_stack_slots = {}
+        self._needs_drop_cache = {}
         cfg: dict[str, list[str]] = {}
         predecessors: dict[str, set[str]] = {}
         observed: set[str] = set()
@@ -162,7 +173,7 @@ class DeallocatorPass(SimplifierPass):
         entry_initialized = {
             param.name
             for param in fn.params
-            if param.type is not None and needs_drop(param.type, self._aggregate_names)
+            if param.type is not None and self._needs_drop_type(param.type)
         }
         initialized_in = self._compute_definitely_initialized(
             fn=fn,
@@ -180,9 +191,9 @@ class DeallocatorPass(SimplifierPass):
         )
 
         for param in fn.params:
-            if param.type is None or not needs_drop(param.type, self._aggregate_names):
+            if param.type is None or not self._needs_drop_type(param.type):
                 continue
-            self._variables[param.name] = TypedVariable(param.name, deepcopy(param.type))
+            self._variables[param.name] = TypedVariable(param.name, param.type)
             self._captures[param.name] = fn.entry_block.name
             self._usages[param.name] = {fn.entry_block.name}
 
@@ -256,7 +267,7 @@ class DeallocatorPass(SimplifierPass):
             for instr in block.body:
                 if not isinstance(instr, Assignable):
                     continue
-                if instr.var_out.type is not None and needs_drop(instr.var_out.type, self._aggregate_names):
+                if instr.var_out.type is not None and self._needs_drop_type(instr.var_out.type):
                     gen_block.add(instr.var_out.name)
             gen[block_name] = gen_block
             candidate_vars |= gen_block
@@ -305,7 +316,7 @@ class DeallocatorPass(SimplifierPass):
                 fresh_owning_vars.discard(instr.var_src.name)
             if not isinstance(instr, Assignable):
                 continue
-            if instr.var_out.type is not None and needs_drop(instr.var_out.type, self._aggregate_names):
+            if instr.var_out.type is not None and self._needs_drop_type(instr.var_out.type):
                 initialized.add(instr.var_out.name)
                 if self._is_fresh_owning_result(instr):
                     fresh_owning_vars.add(instr.var_out.name)
@@ -318,7 +329,10 @@ class DeallocatorPass(SimplifierPass):
         block_order: list[str],
         initialized_in: dict[str, set[str]],
     ) -> None:
-        var_types: dict[str, Type] = {param.name: deepcopy(param.type) for param in fn.params if param.type is not None}
+        # Types are already fully resolved at this stage and treated as immutable
+        # metadata inside this pass. Re-copying them on every assignment dominates
+        # compile time for large modules.
+        var_types: dict[str, Type] = {param.name: param.type for param in fn.params if param.type is not None}
         for block_name in block_order:
             block = name2block[block_name]
             initialized = set(initialized_in[block_name])
@@ -337,12 +351,12 @@ class DeallocatorPass(SimplifierPass):
                         instr.var_out.name in initialized
                         and instr.var_out.name not in self._arg_names
                         and current_type is not None
-                        and needs_drop(current_type, self._aggregate_names)
+                        and self._needs_drop_type(current_type)
                     ):
-                        new_body.append(Instruction_drop(var=TypedVariable(instr.var_out.name, deepcopy(current_type))))
-                    if current_type is not None and needs_drop(current_type, self._aggregate_names):
+                        new_body.append(Instruction_drop(var=TypedVariable(instr.var_out.name, current_type)))
+                    if current_type is not None and self._needs_drop_type(current_type):
                         initialized.add(instr.var_out.name)
-                        var_types[instr.var_out.name] = deepcopy(current_type)
+                        var_types[instr.var_out.name] = current_type
                         if self._is_fresh_owning_result(instr):
                             self._fresh_owning_vars.add(instr.var_out.name)
                 new_body.append(instr)
@@ -510,11 +524,11 @@ class DeallocatorPass(SimplifierPass):
                 edge_key = (src, dst)
                 current_head = edge_heads.get(edge_key, dst)
                 drop_block_name = self._next_dealloc_block_name(f"slot_{slot}")
-                value = TypedVariable(f".drop_slot_{slot}_{self._dealloc_name_seq}", deepcopy(slot_type))
+                value = TypedVariable(f".drop_slot_{slot}_{self._dealloc_name_seq}", slot_type)
                 drop_block = TerminatedBlock(
                     name=drop_block_name,
                     body=[
-                        Instruction_load(var_out=value, var=TypedVariable(slot, Pointer(deepcopy(slot_type)))),
+                        Instruction_load(var_out=value, var=TypedVariable(slot, Pointer(slot_type))),
                         Instruction_drop(var=value),
                     ],
                     term=Instruction_br(label=current_head),
@@ -533,7 +547,7 @@ class DeallocatorPass(SimplifierPass):
         else:
             self._variables[var.name] = var
 
-        if var.type is not None and needs_drop(var.type, self._aggregate_names):
+        if var.type is not None and self._needs_drop_type(var.type):
             self._usages[var.name] = self._usages.get(var.name, set()) | {self._curr_block}
 
     def _add_stack_slot_usage(self, slot: str) -> None:
@@ -549,7 +563,7 @@ class DeallocatorPass(SimplifierPass):
         else:
             self._variables[var.name] = var
 
-        if var.type is not None and needs_drop(var.type, self._aggregate_names):
+        if var.type is not None and self._needs_drop_type(var.type):
             self._captures[var.name] = self._curr_block
             self._add_variable_usage(var)
 
@@ -560,13 +574,13 @@ class DeallocatorPass(SimplifierPass):
             if (
                 isinstance(instr, Instruction_salloc)
                 and isinstance(instr.var_out.type, Pointer)
-                and needs_drop(instr.var_out.type.pointee, self._aggregate_names)
+                and self._needs_drop_type(instr.var_out.type.pointee)
             ):
-                self._owning_stack_slots[instr.var_out.name] = deepcopy(instr.var_out.type.pointee)
+                self._owning_stack_slots[instr.var_out.name] = instr.var_out.type.pointee
                 self._stack_slot_defs[instr.var_out.name] = self._curr_block
             if isinstance(instr, Assignable):
                 self._add_variable_capture(instr.var_out)
-                if instr.var_out.type is not None and needs_drop(instr.var_out.type, self._aggregate_names):
+                if instr.var_out.type is not None and self._needs_drop_type(instr.var_out.type):
                     initialized.add(instr.var_out.name)
                     if self._is_fresh_owning_result(instr):
                         fresh_owning_vars.add(instr.var_out.name)

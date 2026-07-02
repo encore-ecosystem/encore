@@ -1,9 +1,11 @@
+from ehir_llvm_backend.optimizer import OptimizationProfile
 import ast
 import hashlib
 import json
 import re
 import subprocess
 import time
+import pickle
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from pathlib import Path
@@ -13,11 +15,14 @@ from ehir.compiler import CompileProfileRecord
 from ehir_llvm_backend import EHIR_LLVM_Backend
 
 from ehir import EHIR_ProjectCompiler
+from encore import __version__
 from encore.compiler.inference import TypeInferer
 from encore.compiler.parser import statements as s
 from encore.compiler.translator import EncoreToEHIRTranslator
 from encore.workspace import RefrainData, RefrainManager
 from encore.utils.diagnostics import with_diagnostic_context
+
+EHIR_CACHE_SCHEMA = "ehir-resolved-v2"
 
 
 class ExportKind(StrEnum):
@@ -79,7 +84,12 @@ class EncoreCompiler:
     def add_compile_target(self, path: Path):
         self.targets.append(self.refrain_manager.add_binary_target(path))
 
-    def compile_all_targets(self) -> list[CompiledRefrain]:
+    def compile_all_targets(
+        self,
+        opt_profile: OptimizationProfile,
+        *,
+        use_cache: bool = True,
+    ) -> list[CompiledRefrain]:
         building_queue = self.refrain_manager.get_building_queue()
         result: list[CompiledRefrain] = []
         native_inputs_by_refrain: dict[str, NativeLinkInputs] = {}
@@ -90,9 +100,8 @@ class EncoreCompiler:
 
             entrypoint = refrain.import_graph.entrypoint if refrain.import_graph is not None else None
             source_text = entrypoint.read_text() if entrypoint is not None and entrypoint.exists() else None
+            cache_path = self._ehir_cache_path_for_refrain(refrain)
             try:
-                self._infer_refrain_modules(refrain)
-                alias_declarations = self._flattened_alias_declarations(refrain)
                 native_inputs_by_refrain[refrain.name] = self._native_link_inputs_for_refrain(refrain)
             except Exception as exc:
                 raise with_diagnostic_context(
@@ -103,28 +112,63 @@ class EncoreCompiler:
                 ) from exc
 
             try:
-                ehir_raw_module = EncoreToEHIRTranslator().translate_ast(
-                    refrain.ast,
-                    module_id=entrypoint,
-                    imported_declarations=alias_declarations,
-                )
-                ehir_compiler = EHIR_ProjectCompiler()
-                ehir_typed_module = ehir_compiler.resolve_module(ehir_raw_module)
-                ehir_resolved_module = ehir_compiler.compile_module(ehir_typed_module)
-                self.profile_records.extend(
-                    CompileProfileRecord(
-                        module=refrain.name,
-                        stage=record.stage,
-                        seconds=record.seconds,
-                    )
-                    for record in ehir_compiler.pass_timings
-                )
+                loaded_from_cache = False
+                if use_cache and cache_path.exists():
+                    print("cache hit!")
+                    with cache_path.open("rb") as f:
+                        ehir_resolved_module = pickle.load(f)
+                    loaded_from_cache = True
+                else:
+                    self._infer_refrain_modules(refrain)
+                    legacy_cache_path = self._legacy_ehir_cache_path_for_refrain(refrain)
+                    if use_cache and legacy_cache_path.exists():
+                        print("cache hit! migrated")
+                        with legacy_cache_path.open("rb") as f:
+                            ehir_resolved_module = pickle.load(f)
+                        cache_path.parent.mkdir(exist_ok=True, parents=True)
+                        with cache_path.open("wb") as f:
+                            pickle.dump(ehir_resolved_module, f)
+                        loaded_from_cache = True
+                    else:
+                        alias_declarations = self._flattened_alias_declarations(refrain)
+                        ehir_raw_module = EncoreToEHIRTranslator().translate_ast(
+                            refrain.ast,
+                            module_id=entrypoint,
+                            imported_declarations=alias_declarations,
+                        )
+
+                        ehir_compiler = EHIR_ProjectCompiler()
+                        ehir_typed_module = ehir_compiler.resolve_module(ehir_raw_module)
+                        ehir_resolved_module = ehir_compiler.compile_module(ehir_typed_module)
+
+                        if use_cache:
+                            print("cache miss!")
+                            cache_path.parent.mkdir(exist_ok=True, parents=True)
+                            with cache_path.open("wb") as f:
+                                pickle.dump(ehir_resolved_module, f)
+
+                        self.profile_records.extend(
+                            CompileProfileRecord(
+                                module=refrain.name,
+                                stage=record.stage,
+                                seconds=record.seconds,
+                            )
+                            for record in ehir_compiler.pass_timings
+                        )
                 link_inputs = self._native_link_inputs_for_closure(refrain, native_inputs_by_refrain)
-                output_path = EHIR_LLVM_Backend().compile(
-                    ehir_resolved_module,
-                    native_objects=list(link_inputs.objects),
-                    native_link_args=list(link_inputs.link_args),
-                )
+                backend = EHIR_LLVM_Backend()
+                output_path = backend.artifact_output_path(ehir_resolved_module, opt_profile=opt_profile)
+                if not (
+                    loaded_from_cache
+                    and output_path.exists()
+                    and self._artifact_is_current(output_path, link_inputs)
+                ):
+                    output_path = backend.compile(
+                        ehir_resolved_module,
+                        opt_profile=opt_profile,
+                        native_objects=list(link_inputs.objects),
+                        native_link_args=list(link_inputs.link_args),
+                    )
             except Exception as exc:
                 raise with_diagnostic_context(
                     exc,
@@ -144,6 +188,36 @@ class EncoreCompiler:
             )
 
         return result
+
+    def _ehir_cache_path_for_refrain(self, refrain: RefrainData) -> Path:
+        hasher = hashlib.sha256()
+        hasher.update(EHIR_CACHE_SCHEMA.encode("utf-8"))
+        hasher.update(__version__.encode("utf-8"))
+        hasher.update(refrain.name.encode("utf-8"))
+        hasher.update(str(refrain.version).encode("utf-8"))
+
+        graph = refrain.import_graph
+        if graph is not None:
+            for module_id in sorted(graph.modules):
+                resolved = module_id.resolve()
+                hasher.update(str(resolved).encode("utf-8"))
+                source = resolved.read_bytes() if resolved.exists() else b""
+                hasher.update(hashlib.sha256(source).digest())
+
+        hasher.update(str(refrain.ast).encode("utf-8"))
+        cache_file = f"{hasher.hexdigest()}.encache"
+        return refrain.path / "target" / ".cache" / cache_file
+
+    def _legacy_ehir_cache_path_for_refrain(self, refrain: RefrainData) -> Path:
+        digest = hashlib.sha256(str(refrain.ast).encode("utf-8")).hexdigest()
+        return refrain.path / "target" / ".cache" / f"{digest}.encache"
+
+    def _artifact_is_current(self, output_path: Path, link_inputs: NativeLinkInputs) -> bool:
+        output_mtime = output_path.stat().st_mtime
+        for native_object in link_inputs.objects:
+            if native_object.exists() and native_object.stat().st_mtime > output_mtime:
+                return False
+        return True
 
     def _native_link_inputs_for_closure(
         self,

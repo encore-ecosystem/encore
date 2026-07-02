@@ -8,8 +8,12 @@ from prettytable import PrettyTable
 
 from encore.compiler import EncoreCompiler
 
-AVAILABLE_BACKENDS = ["llvm"]
-AVAILABLE_OPTPROFILES = [OptimizationProfile.debug, OptimizationProfile.release, OptimizationProfile.extreme]
+AVAILABLE_BACKENDS = ("llvm",)
+AVAILABLE_OPTPROFILES = {
+    "debug": OptimizationProfile.debug,
+    "release": OptimizationProfile.release,
+    "extreme": OptimizationProfile.extreme,
+}
 PROFILE_TIMINGS_SENTINEL = "timings"
 _ACTIVE_BUILD_SCRIPTS: set[Path] = set()
 
@@ -56,7 +60,7 @@ def handle_build(args: Namespace):
     build_project(
         path=cwd,
         backend=args.backend,
-        profile=resolve_build_profile(args),
+        opt_profile=resolve_build_profile(args),
         no_cache=args.no_cache,
         cfg_overrides=args.cfg,
         show_status=True,
@@ -67,16 +71,17 @@ def handle_build(args: Namespace):
 def build_project(
     path: Path,
     backend: str | None = "llvm",
-    profile: OptimizationProfile | str | None = OptimizationProfile.debug,
-    show_status: bool = False,
+    opt_profile: OptimizationProfile | str | None = OptimizationProfile.debug,
+    no_cache: bool = False,
     profile_timings: bool = False,
     **_unused,
 ) -> list[tuple[str, Path]]:
     if backend not in (None, "llvm"):
         raise RuntimeError(f"Unsupported backend: {backend}")
+    resolved_profile = normalize_build_profile(opt_profile)
     compiler = EncoreCompiler()
     compiler.add_compile_target(path)
-    compiled = compiler.compile_all_targets()
+    compiled = compiler.compile_all_targets(opt_profile=resolved_profile, use_cache=not no_cache)
     if profile_timings:
         print_profile_report(compiler)
     target_names = {target.name for target in compiler.targets}
@@ -134,13 +139,23 @@ def run_binary(executable_path: Path, program_args: list[str]) -> int:
 
 
 def resolve_build_profile(args: Namespace) -> OptimizationProfile:
-    if args.profile in {OptimizationProfile.debug, OptimizationProfile.release, OptimizationProfile.extreme}:
-        return args.profile
     if args.release:
         return OptimizationProfile.release
     if args.opt_profile is not None:
-        return args.opt_profile
+        return AVAILABLE_OPTPROFILES[args.opt_profile]
+    if args.profile in AVAILABLE_OPTPROFILES:
+        return AVAILABLE_OPTPROFILES[args.profile]
     return OptimizationProfile.debug
+
+
+def normalize_build_profile(profile: OptimizationProfile | str | None) -> OptimizationProfile:
+    if isinstance(profile, OptimizationProfile):
+        return profile
+    if profile is None:
+        return OptimizationProfile.debug
+    if profile in AVAILABLE_OPTPROFILES:
+        return AVAILABLE_OPTPROFILES[profile]
+    raise RuntimeError(f"Unsupported optimization profile: {profile}")
 
 
 def profile_timings_enabled(args: Namespace) -> bool:

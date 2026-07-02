@@ -1,5 +1,6 @@
 import core::option::Option
 import core::fmt::Debug
+import core::panic::panic
 import std::vec::Vec
 
 import refrain::frontend::parser::statements::EnumStmt
@@ -23,8 +24,13 @@ import refrain::frontend::parser::statements::LetStmt
 import refrain::frontend::parser::statements::EhirStmt
 import refrain::frontend::parser::statements::BinaryExpr
 import refrain::frontend::parser::statements::CallExpr
+import refrain::frontend::parser::statements::FieldExpr
+import refrain::frontend::parser::statements::ForStmt
+import refrain::frontend::parser::statements::MethodCallExpr
 import refrain::frontend::parser::statements::StructInitExpr
 import refrain::frontend::parser::statements::MatchStmt
+import refrain::frontend::parser::statements::MatchExpr
+import refrain::frontend::parser::statements::MatchExprArm
 import refrain::frontend::parser::statements::MatchPattern
 import refrain::frontend::parser::statements::ParsedMatchArm
 import refrain::frontend::parser::statements::MatchArmBody
@@ -36,7 +42,30 @@ struct LoweredExpr {
     typ: str
 }
 
+struct VarType {
+    name: str
+    typ: str
+}
+
+struct FunctionType {
+    name: str
+    ret_type: str
+}
+
+struct StructFieldType {
+    owner: str
+    field: str
+    typ: str
+}
+
+struct TranslatorContext {
+    vars: Vec[VarType]
+    functions: Vec[FunctionType]
+    fields: Vec[StructFieldType]
+}
+
 pub fn translate_to_ehir(ast: Vec[Statement]) -> str {
+    let mut ctx = collect_context(ast)
     let mut builder = EhirTextBuilder::new()
     for stmt in ast {
         match stmt {
@@ -50,13 +79,260 @@ pub fn translate_to_ehir(ast: Vec[Statement]) -> str {
                 builder = builder.append(translate_enum(enum_item))
             }
             Statement::Function(fn_item) => {
-                builder = builder.append(translate_function(fn_item))
+                builder = builder.append(translate_function(ctx, fn_item))
             }
             _ => {}
         }
         builder = builder.empty_line()
     }
     ret builder.finish()
+}
+
+fn collect_context(ast: Vec[Statement]) -> TranslatorContext {
+    let mut ctx = TranslatorContext{Vec[VarType]::new(), Vec[FunctionType]::new(), Vec[StructFieldType]::new()}
+    for stmt in ast {
+        match stmt {
+            Statement::Function(fn_item) => {
+                ctx_add_function(ctx, fn_item.name, function_ret_type(fn_item))
+            }
+            Statement::Struct(struct_item) => {
+                collect_struct_fields(ctx, struct_item)
+            }
+            Statement::Impl(impl_item) => {
+                for method in impl_item.methods {
+                    ctx_add_function(ctx, impl_item.target + "::" + method.name, function_ret_type(method))
+                }
+            }
+            _ => {}
+        }
+    }
+    ret ctx
+}
+
+fn collect_struct_fields(ctx: mut TranslatorContext, item: StructStmt) -> () {
+    if item.is_tuple {
+        let mut index = 0_usize
+        for typ in item.tuple_fields {
+            ctx.fields.push(StructFieldType{item.name, Debug::fmt(index), typ})
+            index = index + 1_usize
+        }
+        ret ()
+    }
+
+    for field in item.named_fields {
+        ctx.fields.push(StructFieldType{item.name, field.name, field.typ})
+    }
+    ret ()
+}
+
+fn ctx_add_function(ctx: mut TranslatorContext, name: str, ret_type: str) -> () {
+    ctx.functions.push(FunctionType{name, ret_type})
+    ret ()
+}
+
+fn ctx_add_var(ctx: mut TranslatorContext, name: str, typ: str) -> () {
+    let mut index = 0_usize
+    while index < ctx.vars.len() {
+        match ctx.vars.get(index) {
+            Option[VarType]::Some(item) => {
+                if item.name == name {
+                    ctx.vars.set(index, VarType{name, typ})
+                    ret ()
+                }
+            }
+            Option[VarType]::None => {}
+        }
+        index = index + 1_usize
+    }
+    ctx.vars.push(VarType{name, typ})
+    ret ()
+}
+
+fn ctx_lookup_var(ctx: TranslatorContext, name: str) -> Option[str] {
+    let mut index = ctx.vars.len()
+    while index > 0_usize {
+        index = index - 1_usize
+        match ctx.vars.get(index) {
+            Option[VarType]::Some(item) => {
+                if item.name == name {
+                    ret Option[str]::Some(item.typ)
+                }
+            }
+            Option[VarType]::None => {}
+        }
+    }
+    ret Option[str]::None
+}
+
+fn ctx_lookup_function(ctx: TranslatorContext, name: str) -> Option[str] {
+    for item in ctx.functions {
+        if item.name == name {
+            ret Option[str]::Some(item.ret_type)
+        }
+    }
+    ret Option[str]::None
+}
+
+fn ctx_lookup_field(ctx: TranslatorContext, owner: str, field: str) -> Option[str] {
+    let owner_base = base_type_name(owner)
+    let owner_leaf = leaf_type_name(owner_base)
+    for item in ctx.fields {
+        if item.field == field {
+            if item.owner == owner_base || leaf_type_name(item.owner) == owner_leaf {
+                ret Option[str]::Some(item.typ)
+            }
+        }
+    }
+    ret Option[str]::None
+}
+
+fn base_type_name(name: str) -> str {
+    let index = find_char(name, "[", 0_usize)
+    if index >= name.len() {
+        ret name
+    }
+    ret name.slice(0_usize, index)
+}
+
+fn leaf_type_name(name: str) -> str {
+    let mut index = name.len()
+    while index > 0_usize {
+        index = index - 1_usize
+        if index > 0_usize && name.slice(index - 1_usize, 2_usize) == "::" {
+            ret name.slice(index + 1_usize, name.len() - index - 1_usize)
+        }
+    }
+    ret name
+}
+
+fn method_owner_name(receiver_type: str) -> str {
+    ret leaf_type_name(base_type_name(receiver_type))
+}
+
+fn method_return_type(receiver_type: str, method_name: str) -> str {
+    let owner = method_owner_name(receiver_type)
+    if owner == "Vec" && method_name == "len" {
+        ret "usize"
+    }
+    if owner == "Vec" && method_name == "capacity" {
+        ret "usize"
+    }
+    if owner == "Vec" && method_name == "is_empty" {
+        ret "bool"
+    }
+    if owner == "Vec" && method_name == "push" {
+        ret "()"
+    }
+    if owner == "Vec" && method_name == "set" {
+        ret "()"
+    }
+    if owner == "Vec" && method_name == "get" {
+        ret "Option[" + first_generic_type(receiver_type) + "]"
+    }
+    if owner == "Vec" && method_name == "first" {
+        ret "Option[" + first_generic_type(receiver_type) + "]"
+    }
+    if owner == "Vec" && method_name == "last" {
+        ret "Option[" + first_generic_type(receiver_type) + "]"
+    }
+    if owner == "Vec" && method_name == "pop" {
+        ret "Option[" + first_generic_type(receiver_type) + "]"
+    }
+    if owner == "Vec" && method_name == "iter" {
+        ret "VecIter[" + first_generic_type(receiver_type) + "]"
+    }
+    if owner == "VecIter" && method_name == "iter" {
+        ret receiver_type
+    }
+    if owner == "VecIter" && method_name == "next" {
+        ret "__tuple_2[" + receiver_type + ", Option[" + first_generic_type(receiver_type) + "]]"
+    }
+    if owner == "String" && method_name == "len" {
+        ret "usize"
+    }
+    if owner == "String" && method_name == "byte_at" {
+        ret "Option[u8]"
+    }
+    if owner == "str" && method_name == "len" {
+        ret "usize"
+    }
+    if owner == "str" && method_name == "byte_at" {
+        ret "u8"
+    }
+    if owner == "Path" && method_name == "as_str" {
+        ret "str"
+    }
+    if owner == "Path" && method_name == "exists" {
+        ret "bool"
+    }
+    if owner == "Path" && method_name == "read_text" {
+        ret "str"
+    }
+    panic("Unable to resolve method return type for '" + owner + "::" + method_name + "'")
+    ret "void"
+}
+
+fn first_generic_type(receiver_type: str) -> str {
+    let open = find_char(receiver_type, "[", 0_usize)
+    if open >= receiver_type.len() {
+        panic("Unable to resolve generic argument for type '" + receiver_type + "'")
+        ret "void"
+    }
+
+    let mut index = open + 1_usize
+    let mut depth = 0_usize
+    while index < receiver_type.len() {
+        let ch = receiver_type.slice(index, 1_usize)
+        if ch == "[" {
+            depth = depth + 1_usize
+        }
+        else {
+            if ch == "]" {
+                if depth == 0_usize {
+                    ret receiver_type.slice(open + 1_usize, index - open - 1_usize)
+                }
+                depth = depth - 1_usize
+            }
+            else {
+                if ch == "," && depth == 0_usize {
+                    ret receiver_type.slice(open + 1_usize, index - open - 1_usize)
+                }
+            }
+        }
+        index = index + 1_usize
+    }
+
+    panic("Unterminated generic argument list in type '" + receiver_type + "'")
+    ret "void"
+}
+
+fn path_value_type(ctx: TranslatorContext, name: str) -> str {
+    match ctx_lookup_var(ctx, name) {
+        Option[str]::Some(found) => {
+            ret found
+        }
+        Option[str]::None => {}
+    }
+
+    let last_scope = last_scope_index(name)
+    if last_scope < name.len() {
+        ret name.slice(0_usize, last_scope)
+    }
+    ret "usize"
+}
+
+fn last_scope_index(value: str) -> usize {
+    if value.len() < 2_usize {
+        ret value.len()
+    }
+    let mut index = value.len() - 1_usize
+    while index > 0_usize {
+        if value.slice(index - 1_usize, 2_usize) == "::" {
+            ret index - 1_usize
+        }
+        index = index - 1_usize
+    }
+    ret value.len()
 }
 
 fn translate_struct(item: StructStmt) -> EhirTextBuilder {
@@ -100,7 +376,11 @@ fn translate_enum(item: EnumStmt) -> EhirTextBuilder {
     ret builder
 }
 
-fn translate_function(fn_item: FunctionItem) -> EhirTextBuilder {
+fn translate_function(ctx: mut TranslatorContext, fn_item: FunctionItem) -> EhirTextBuilder {
+    for param in fn_item.params {
+        ctx_add_var(ctx, param.name, unwrap_type_or_usize(param.typ))
+    }
+
     let mut builder = EhirTextBuilder::new()
     builder = builder.line("fn " + fn_item.name + "(" + translate_params(fn_item) + ") -> " + function_ret_type(fn_item) + " {")
     builder = builder.label("entry")
@@ -108,6 +388,7 @@ fn translate_function(fn_item: FunctionItem) -> EhirTextBuilder {
     match fn_item.body {
         Option[ParsedBlock]::Some(body) => {
             builder = builder.append(translate_statements(
+                ctx,
                 body.statements,
                 function_ret_type(fn_item),
                 "entry",
@@ -125,6 +406,7 @@ fn translate_function(fn_item: FunctionItem) -> EhirTextBuilder {
 }
 
 fn translate_statements(
+    ctx: mut TranslatorContext,
     statements: Vec[Statement],
     ret_type: str,
     prefix: str,
@@ -137,35 +419,38 @@ fn translate_statements(
     for stmt in statements {
         match stmt {
             Statement::Ret(expr) => {
-                builder = builder.append(translate_ret_expr(expr, ret_type))
+                builder = builder.append(translate_ret_expr(ctx, expr, ret_type))
                 saw_ret = true
             }
             Statement::If(if_stmt) => {
-                builder = builder.append(translate_if_stmt(if_stmt, ret_type, prefix, i, break_label, continue_label))
+                builder = builder.append(translate_if_stmt(ctx, if_stmt, ret_type, prefix, i, break_label, continue_label))
             }
             Statement::While(while_stmt) => {
-                builder = builder.append(translate_while_stmt(while_stmt, ret_type, prefix, i))
+                builder = builder.append(translate_while_stmt(ctx, while_stmt, ret_type, prefix, i))
             }
             Statement::Loop(loop_stmt) => {
-                builder = builder.append(translate_loop_stmt(loop_stmt, ret_type, prefix, i))
+                builder = builder.append(translate_loop_stmt(ctx, loop_stmt, ret_type, prefix, i))
             }
             Statement::DoWhile(do_stmt) => {
-                builder = builder.append(translate_do_while_stmt(do_stmt, ret_type, prefix, i))
+                builder = builder.append(translate_do_while_stmt(ctx, do_stmt, ret_type, prefix, i))
+            }
+            Statement::For(for_stmt) => {
+                builder = builder.append(translate_for_stmt(ctx, for_stmt, ret_type, prefix, i))
             }
             Statement::Let(let_stmt) => {
-                builder = builder.append(translate_let_stmt(let_stmt, prefix, i))
+                builder = builder.append(translate_let_stmt(ctx, let_stmt, prefix, i))
             }
             Statement::Assignment(assign_stmt) => {
-                builder = builder.append(translate_assignment_stmt(assign_stmt, prefix, i))
+                builder = builder.append(translate_assignment_stmt(ctx, assign_stmt, prefix, i))
             }
             Statement::Expr(expr_stmt) => {
-                builder = builder.append(translate_expr_stmt(expr_stmt, prefix, i))
+                builder = builder.append(translate_expr_stmt(ctx, expr_stmt, prefix, i))
             }
             Statement::Ehir(ehir_stmt) => {
                 builder = builder.append(translate_ehir_stmt(ehir_stmt))
             }
             Statement::Match(match_stmt) => {
-                builder = builder.append(translate_match_stmt(match_stmt, ret_type, prefix, i, break_label, continue_label))
+                builder = builder.append(translate_match_stmt(ctx, match_stmt, ret_type, prefix, i, break_label, continue_label))
             }
             Statement::Break(_) => {
                 match break_label {
@@ -193,33 +478,110 @@ fn translate_statements(
     ret builder
 }
 
-fn translate_let_stmt(let_stmt: LetStmt, prefix: str, idx: usize) -> EhirTextBuilder {
-    let lowered = lower_expr(let_stmt.expr, prefix + "_let", idx)
+fn translate_statements_no_default(
+    ctx: mut TranslatorContext,
+    statements: Vec[Statement],
+    ret_type: str,
+    prefix: str,
+    break_label: Option[str],
+    continue_label: Option[str]
+) -> EhirTextBuilder {
+    let mut builder = EhirTextBuilder::new()
+    let mut i = 0_usize
+    for stmt in statements {
+        match stmt {
+            Statement::Ret(expr) => {
+                builder = builder.append(translate_ret_expr(ctx, expr, ret_type))
+            }
+            Statement::If(if_stmt) => {
+                builder = builder.append(translate_if_stmt(ctx, if_stmt, ret_type, prefix, i, break_label, continue_label))
+            }
+            Statement::While(while_stmt) => {
+                builder = builder.append(translate_while_stmt(ctx, while_stmt, ret_type, prefix, i))
+            }
+            Statement::Loop(loop_stmt) => {
+                builder = builder.append(translate_loop_stmt(ctx, loop_stmt, ret_type, prefix, i))
+            }
+            Statement::DoWhile(do_stmt) => {
+                builder = builder.append(translate_do_while_stmt(ctx, do_stmt, ret_type, prefix, i))
+            }
+            Statement::For(for_stmt) => {
+                builder = builder.append(translate_for_stmt(ctx, for_stmt, ret_type, prefix, i))
+            }
+            Statement::Let(let_stmt) => {
+                builder = builder.append(translate_let_stmt(ctx, let_stmt, prefix, i))
+            }
+            Statement::Assignment(assign_stmt) => {
+                builder = builder.append(translate_assignment_stmt(ctx, assign_stmt, prefix, i))
+            }
+            Statement::Expr(expr_stmt) => {
+                builder = builder.append(translate_expr_stmt(ctx, expr_stmt, prefix, i))
+            }
+            Statement::Ehir(ehir_stmt) => {
+                builder = builder.append(translate_ehir_stmt(ehir_stmt))
+            }
+            Statement::Match(match_stmt) => {
+                builder = builder.append(translate_match_stmt(ctx, match_stmt, ret_type, prefix, i, break_label, continue_label))
+            }
+            Statement::Break(_) => {
+                match break_label {
+                    Option[str]::Some(target) => {
+                        builder = builder.instr("br $" + target)
+                    }
+                    Option[str]::None => {}
+                }
+            }
+            Statement::Continue(_) => {
+                match continue_label {
+                    Option[str]::Some(target) => {
+                        builder = builder.instr("br $" + target)
+                    }
+                    Option[str]::None => {}
+                }
+            }
+            _ => {}
+        }
+        i = i + 1_usize
+    }
+    ret builder
+}
+
+fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str, idx: usize) -> EhirTextBuilder {
+    let lowered = lower_expr(ctx, let_stmt.expr, prefix + "_let", idx)
     let mut builder = lowered.code
-    let typ = unwrap_type_or_usize(let_stmt.typ)
+    let mut typ = lowered.typ
+    match let_stmt.typ {
+        Option[str]::Some(explicit_type) => {
+            typ = explicit_type
+        }
+        Option[str]::None => {}
+    }
+    ctx_add_var(ctx, let_stmt.name, typ)
     builder = builder.instr(let_stmt.name + ": " + typ + " = " + lowered.value)
     ret builder
 }
 
-fn translate_assignment_stmt(assign_stmt: AssignmentStmt, prefix: str, idx: usize) -> EhirTextBuilder {
+fn translate_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: AssignmentStmt, prefix: str, idx: usize) -> EhirTextBuilder {
     let mut builder = EhirTextBuilder::new()
     let target = expr_path_or_empty(assign_stmt.target)
     if target == "" {
-        ret builder.instr("; TODO: complex assignment target is not implemented")
+        panic("Complex assignment targets are not implemented in bootstrap translator")
+        ret builder
     }
 
     if assign_stmt.operator == "=" {
-        let lowered = lower_expr(assign_stmt.expr, prefix + "_assign", idx)
+        let lowered = lower_expr(ctx, assign_stmt.expr, prefix + "_assign", idx)
         builder = builder.append(lowered.code)
         builder = builder.instr(target + " = " + lowered.value)
         ret builder
     }
 
-    let lowered = lower_expr(assign_stmt.expr, prefix + "_assign", idx)
+    let lowered = lower_expr(ctx, assign_stmt.expr, prefix + "_assign", idx)
     builder = builder.append(lowered.code)
     let op = assignment_op_to_ehir(assign_stmt.operator)
     if op == "" {
-        ret builder.instr("; TODO: unsupported assignment operator: " + assign_stmt.operator)
+        panic("Unsupported assignment operator in bootstrap translator: " + assign_stmt.operator)
+        ret builder
     }
     let tmp_name = prefix + "_assign_tmp_" + Debug::fmt(idx)
     builder = builder.instr(tmp_name + " = " + op + " " + target + ", " + lowered.value)
@@ -227,8 +589,8 @@ fn translate_assignment_stmt(assign_stmt: AssignmentStmt, prefix: str, idx: usiz
     ret builder
 }
 
-fn translate_expr_stmt(expr_stmt: ExprNode, prefix: str, idx: usize) -> EhirTextBuilder {
-    let lowered = lower_expr(expr_stmt, prefix + "_expr", idx)
+fn translate_expr_stmt(ctx: mut TranslatorContext, expr_stmt: ExprNode, prefix: str, idx: usize) -> EhirTextBuilder {
+    let lowered = lower_expr(ctx, expr_stmt, prefix + "_expr", idx)
     ret lowered.code
 }
 
@@ -262,7 +624,7 @@ fn assignment_op_to_ehir(op: str) -> str {
     ret ""
 }
 
-fn lower_expr(expr: ExprNode, prefix: str, idx: usize) -> LoweredExpr {
+fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usize) -> LoweredExpr {
     match expr.value {
         Expr::Integer(v) => {
             let name = prefix + "_int_" + Debug::fmt(idx)
@@ -296,35 +658,70 @@ fn lower_expr(expr: ExprNode, prefix: str, idx: usize) -> LoweredExpr {
             ret LoweredExpr{code, name, "bool"}
         }
         Expr::Path(name) => {
-            ret LoweredExpr{EhirTextBuilder::new(), name, "usize"}
+            let mut typ = path_value_type(ctx, name)
+            match ctx_lookup_var(ctx, name) {
+                Option[str]::Some(found) => {
+                    typ = found
+                }
+                Option[str]::None => {}
+            }
+            ret LoweredExpr{EhirTextBuilder::new(), name, typ}
         }
         Expr::Binary(bin) => {
-            let name = prefix + "_bin_" + Debug::fmt(idx)
-            let mut code = EhirTextBuilder::new()
-            code = code.instr(name + ": usize = capprim 0_usize")
-            code = code.instr("; TODO: binary lowering requires ExprNode/ExprNode<H> unification")
-            ret LoweredExpr{code, name, "usize"}
+            ret lower_binary_expr(ctx, bin, prefix, idx)
         }
         Expr::Call(call) => {
-            let name = prefix + "_call_" + Debug::fmt(idx)
-            let mut code = EhirTextBuilder::new()
-            code = code.instr(name + ": usize = capprim 0_usize")
-            code = code.instr("; TODO: call lowering requires ExprNode/ExprNode<H> unification")
-            ret LoweredExpr{code, name, "usize"}
+            ret lower_call_expr(ctx, call, prefix, idx)
         }
         Expr::StructInit(init_expr) => {
-            let name = prefix + "_struct_" + Debug::fmt(idx)
-            let mut code = EhirTextBuilder::new()
-            code = code.instr(name + ": usize = capprim 0_usize")
-            code = code.instr("; TODO: struct init lowering requires ExprNode/ExprNode<H> unification")
-            ret LoweredExpr{code, name, "usize"}
+            ret lower_struct_init_expr(ctx, init_expr, prefix, idx)
+        }
+        Expr::Field(field_expr) => {
+            ret lower_field_expr(ctx, field_expr, prefix, idx)
+        }
+        Expr::MethodCall(method_call) => {
+            ret lower_method_call_expr(ctx, method_call, prefix, idx)
+        }
+        Expr::Parenthesized(inner) => {
+            ret lower_expr_h(ctx, inner, prefix, idx)
+        }
+        Expr::Unary(_) => {
+            panic("Unary expression lowering is not implemented in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        Expr::Match(_) => {
+            match expr.value {
+                Expr::Match(match_expr) => {
+                    ret lower_match_expr(ctx, match_expr, prefix, idx)
+                }
+                _ => {}
+            }
+            panic("Internal translator error while lowering match expression")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        Expr::If(_) => {
+            panic("If expression lowering is not implemented in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        Expr::Block(_) => {
+            panic("Block expression lowering is not implemented in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        Expr::Index(_) => {
+            panic("Index expression lowering is not implemented in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        Expr::Try(_) => {
+            panic("Try expression lowering is not implemented in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        Expr::Unsafe(_) => {
+            panic("Unsafe expression lowering is not implemented in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
         }
         _ => {
-            let name = prefix + "_zero_" + Debug::fmt(idx)
-            let mut code = EhirTextBuilder::new()
-            code = code.instr(name + ": usize = capprim 0_usize")
-            code = code.instr("; TODO: expression lowering fallback")
-            ret LoweredExpr{code, name, "usize"}
+            panic("Unsupported expression kind in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
         }
     }
 }
@@ -346,30 +743,141 @@ fn binary_op_to_ehir(op: str) -> str {
     ret ""
 }
 
-fn lower_binary_expr(bin: BinaryExpr, prefix: str, idx: usize) -> LoweredExpr {
-    let lhs = expr_h_path_or_empty(bin.lhs)
-    let rhs = expr_h_path_or_empty(bin.rhs)
+fn binary_result_type(op: str, lhs_type: str) -> str {
+    if op == "==" { ret "bool" }
+    if op == "!=" { ret "bool" }
+    if op == "<" { ret "bool" }
+    if op == ">" { ret "bool" }
+    if op == "<=" { ret "bool" }
+    if op == ">=" { ret "bool" }
+    if op == "&&" { ret "bool" }
+    if op == "||" { ret "bool" }
+    ret lhs_type
+}
+
+fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx: usize) -> LoweredExpr {
+    match expr.value {
+        Expr::Integer(v) => {
+            let name = prefix + "_int_" + Debug::fmt(idx)
+            let typ = "usize"
+            let mut code = EhirTextBuilder::new()
+            code = code.instr(name + ": " + typ + " = capprim " + with_numeric_suffix(v, typ))
+            ret LoweredExpr{code, name, typ}
+        }
+        Expr::Float(v) => {
+            let name = prefix + "_float_" + Debug::fmt(idx)
+            let typ = "f64"
+            let mut code = EhirTextBuilder::new()
+            code = code.instr(name + ": " + typ + " = capprim " + with_numeric_suffix(v, typ))
+            ret LoweredExpr{code, name, typ}
+        }
+        Expr::StringLiteral(v) => {
+            let name = prefix + "_str_" + Debug::fmt(idx)
+            let typ = "str"
+            let mut code = EhirTextBuilder::new()
+            code = code.instr(name + ": str = capprim \"" + escape_str(v) + "\"_str")
+            ret LoweredExpr{code, name, typ}
+        }
+        Expr::Boolean(v) => {
+            let name = prefix + "_bool_" + Debug::fmt(idx)
+            let mut lit = "0_u1"
+            if v {
+                lit = "1_u1"
+            }
+            let mut code = EhirTextBuilder::new()
+            code = code.instr(name + ": bool = capprim " + lit)
+            ret LoweredExpr{code, name, "bool"}
+        }
+        Expr::Path(name) => {
+            let mut typ = path_value_type(ctx, name)
+            match ctx_lookup_var(ctx, name) {
+                Option[str]::Some(found) => {
+                    typ = found
+                }
+                Option[str]::None => {}
+            }
+            ret LoweredExpr{EhirTextBuilder::new(), name, typ}
+        }
+        Expr::Parenthesized(inner) => {
+            ret lower_expr_h(ctx, inner, prefix, idx)
+        }
+        Expr::Binary(bin) => {
+            ret lower_binary_expr(ctx, bin, prefix, idx)
+        }
+        Expr::Call(call) => {
+            ret lower_call_expr(ctx, call, prefix, idx)
+        }
+        Expr::StructInit(init_expr) => {
+            ret lower_struct_init_expr(ctx, init_expr, prefix, idx)
+        }
+        Expr::Unary(_) => {
+            panic("Unary expression lowering is not implemented in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        Expr::Field(field_expr) => {
+            ret lower_field_expr(ctx, field_expr, prefix, idx)
+        }
+        Expr::MethodCall(method_call) => {
+            ret lower_method_call_expr(ctx, method_call, prefix, idx)
+        }
+        Expr::Match(_) => {
+            match expr.value {
+                Expr::Match(match_expr) => {
+                    ret lower_match_expr(ctx, match_expr, prefix, idx)
+                }
+                _ => {}
+            }
+            panic("Internal translator error while lowering boxed match expression")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        Expr::If(_) => {
+            panic("If expression lowering is not implemented in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        Expr::Block(_) => {
+            panic("Block expression lowering is not implemented in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        Expr::Index(_) => {
+            panic("Index expression lowering is not implemented in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        Expr::Try(_) => {
+            panic("Try expression lowering is not implemented in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        Expr::Unsafe(_) => {
+            panic("Unsafe expression lowering is not implemented in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+        _ => {
+            panic("Unsupported boxed expression kind in bootstrap translator")
+            ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
+        }
+    }
+}
+
+fn lower_binary_expr(ctx: mut TranslatorContext, bin: BinaryExpr, prefix: str, idx: usize) -> LoweredExpr {
     let out_name = prefix + "_bin_" + Debug::fmt(idx)
     let mut code = EhirTextBuilder::new()
     let op = binary_op_to_ehir(bin.operator)
 
-    if lhs == "" || rhs == "" {
-        code = code.instr(out_name + ": usize = capprim 0_usize")
-        code = code.instr("; TODO: binary lowering currently supports Path/Path operands only")
-        ret LoweredExpr{code, out_name, "usize"}
-    }
-
     if op == "" {
-        code = code.instr(out_name + " = " + lhs)
-        code = code.instr("; TODO: unsupported binary operator: " + bin.operator)
+        panic("Unsupported binary operator in bootstrap translator: " + bin.operator)
         ret LoweredExpr{code, out_name, "usize"}
     }
 
-    code = code.instr(out_name + " = " + op + " " + lhs + ", " + rhs)
-    ret LoweredExpr{code, out_name, "usize"}
+    let lhs = lower_expr_h(ctx, bin.lhs, prefix + "_lhs", idx + 1_usize)
+    let rhs = lower_expr_h(ctx, bin.rhs, prefix + "_rhs", idx + 2_usize)
+    let result_type = binary_result_type(bin.operator, lhs.typ)
+
+    code = code.append(lhs.code)
+    code = code.append(rhs.code)
+    code = code.instr(out_name + ": " + result_type + " = " + op + " " + lhs.value + ", " + rhs.value)
+    ret LoweredExpr{code, out_name, result_type}
 }
 
-fn lower_call_expr(call: CallExpr, prefix: str, idx: usize) -> LoweredExpr {
+fn lower_call_expr(ctx: mut TranslatorContext, call: CallExpr, prefix: str, idx: usize) -> LoweredExpr {
     let callee = expr_h_path_or_empty(call.callee)
     let out_name = prefix + "_call_" + Debug::fmt(idx)
     let mut code = EhirTextBuilder::new()
@@ -377,35 +885,204 @@ fn lower_call_expr(call: CallExpr, prefix: str, idx: usize) -> LoweredExpr {
     let mut i = 0_usize
 
     for arg in call.args {
-        let lowered = lower_expr(arg, prefix + "_arg", idx + i + 1_usize)
+        let lowered = lower_expr(ctx, arg, prefix + "_arg", idx + i + 1_usize)
         code = code.append(lowered.code)
         arg_values.push(lowered.value)
         i = i + 1_usize
     }
 
     if callee == "" {
-        code = code.instr(out_name + ": usize = capprim 0_usize")
-        code = code.instr("; TODO: non-path callee is not implemented")
+        panic("Non-path call callee is not implemented in bootstrap translator")
         ret LoweredExpr{code, out_name, "usize"}
     }
 
-    code = code.instr(out_name + " = call " + callee + "(" + join_strs(arg_values, ", ") + ")")
-    ret LoweredExpr{code, out_name, "usize"}
+    let mut ret_type = "usize"
+    match ctx_lookup_function(ctx, callee) {
+        Option[str]::Some(found) => {
+            ret_type = found
+        }
+        Option[str]::None => {
+            ret_type = static_call_return_type(callee)
+        }
+    }
+
+    code = code.instr(out_name + ": " + ret_type + " = call " + callee + "(" + join_strs(arg_values, ", ") + ")")
+    ret LoweredExpr{code, out_name, ret_type}
 }
 
-fn lower_struct_init_expr(init_expr: StructInitExpr, prefix: str, idx: usize) -> LoweredExpr {
+fn static_call_return_type(callee: str) -> str {
+    if ends_with(callee, "::new") {
+        let owner = callee.slice(0_usize, callee.len() - 5_usize)
+        if method_owner_name(owner) == "Vec" {
+            ret owner
+        }
+        ret owner
+    }
+    if ends_with(callee, "::with_capacity") {
+        let owner = callee.slice(0_usize, callee.len() - 15_usize)
+        if method_owner_name(owner) == "Vec" {
+            ret owner
+        }
+    }
+    if ends_with(callee, "::singleton") {
+        let owner = callee.slice(0_usize, callee.len() - 11_usize)
+        if method_owner_name(owner) == "Vec" {
+            ret owner
+        }
+    }
+    ret "usize"
+}
+
+fn lower_struct_init_expr(ctx: mut TranslatorContext, init_expr: StructInitExpr, prefix: str, idx: usize) -> LoweredExpr {
     let out_name = prefix + "_struct_" + Debug::fmt(idx)
     let mut code = EhirTextBuilder::new()
     let mut values = Vec[str]::new()
     let mut i = 0_usize
     for item in init_expr.values {
-        let lowered = lower_expr(item, prefix + "_field", idx + i + 1_usize)
+        let lowered = lower_expr(ctx, item, prefix + "_field", idx + i + 1_usize)
         code = code.append(lowered.code)
         values.push(lowered.value)
         i = i + 1_usize
     }
     code = code.instr(out_name + " = capstruct " + init_expr.path + "(" + join_strs(values, ", ") + ")")
     ret LoweredExpr{code, out_name, init_expr.path}
+}
+
+fn lower_field_expr(ctx: mut TranslatorContext, field_expr: FieldExpr, prefix: str, idx: usize) -> LoweredExpr {
+    let base = lower_expr_h(ctx, field_expr.base, prefix + "_field_base", idx + 1_usize)
+    let mut field_type = "void"
+    match ctx_lookup_field(ctx, base.typ, field_expr.field) {
+        Option[str]::Some(found) => {
+            field_type = found
+        }
+        Option[str]::None => {
+            panic("Unable to resolve field '" + field_expr.field + "' for type '" + base.typ + "'")
+        }
+    }
+    let out_name = prefix + "_field_" + Debug::fmt(idx)
+    let mut code = base.code
+    code = code.instr(out_name + ": " + field_type + " = getfield " + base.value + ", " + field_expr.field)
+    ret LoweredExpr{code, out_name, field_type}
+}
+
+fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExpr, prefix: str, idx: usize) -> LoweredExpr {
+    let receiver = lower_expr_h(ctx, method_call.receiver, prefix + "_recv", idx + 1_usize)
+    let owner = method_owner_name(receiver.typ)
+    let fn_name = owner + "::" + method_call.method
+    let mut ret_type = "void"
+    match ctx_lookup_function(ctx, fn_name) {
+        Option[str]::Some(found) => {
+            ret_type = found
+        }
+        Option[str]::None => {
+            ret_type = method_return_type(receiver.typ, method_call.method)
+        }
+    }
+    let out_name = prefix + "_method_" + Debug::fmt(idx)
+    let mut code = receiver.code
+    let mut args = Vec[str]::new()
+    args.push(receiver.value)
+
+    let mut i = 0_usize
+    for arg in method_call.args {
+        let lowered = lower_expr(ctx, arg, prefix + "_method_arg", idx + i + 2_usize)
+        code = code.append(lowered.code)
+        args.push(lowered.value)
+        i = i + 1_usize
+    }
+
+    code = code.instr(out_name + ": " + ret_type + " = call " + fn_name + "(" + join_strs(args, ", ") + ")")
+    ret LoweredExpr{code, out_name, ret_type}
+}
+
+fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, prefix: str, idx: usize) -> LoweredExpr {
+    let cond = lower_expr_h(ctx, match_expr.expr, prefix + "_match_expr", idx)
+    let result_name = prefix + "_match_result_" + Debug::fmt(idx)
+    let result_slot = result_name + "_slot"
+    let result_type = infer_match_expr_result_type(ctx, match_expr)
+    let end_label = prefix + "_match_expr_end_" + Debug::fmt(idx)
+    let mut builder = cond.code
+    builder = builder.instr(result_slot + ": " + result_type + "* = salloc " + result_type)
+    let mut arm_idx = 0_usize
+
+    for arm in match_expr.arms {
+        let body_label = prefix + "_match_expr_body_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx)
+        let fail_label = prefix + "_match_expr_next_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx + 1_usize)
+        let test = lower_match_pattern_test(cond.value, cond.typ, arm.pattern, prefix, idx, arm_idx)
+        builder = builder.append(test.code)
+        if test.is_always_true {
+            builder = builder.instr("br $" + body_label)
+        }
+        else {
+            builder = builder.instr("cbr " + test.cond_value + ", $" + body_label + ", $" + fail_label)
+        }
+        builder = builder.label(body_label)
+        builder = builder.append(bind_match_payload(ctx, arm.pattern, cond.value, cond.typ))
+        let lowered = lower_expr(ctx, arm.expr, prefix + "_match_expr_arm_" + Debug::fmt(arm_idx), idx + arm_idx + 1_usize)
+        builder = builder.append(lowered.code)
+        builder = builder.instr("store " + lowered.value + ", " + result_slot)
+        builder = builder.instr("br $" + end_label)
+        builder = builder.label(fail_label)
+        arm_idx = arm_idx + 1_usize
+    }
+
+    builder = builder.instr("br $" + end_label)
+    builder = builder.label(end_label)
+    builder = builder.instr(result_name + ": " + result_type + " = load " + result_slot)
+    ret LoweredExpr{builder, result_name, result_type}
+}
+
+fn infer_match_expr_result_type(ctx: mut TranslatorContext, match_expr: MatchExpr) -> str {
+    match match_expr.arms.get(0_usize) {
+        Option[MatchExprArm]::Some(arm) => {
+            let lowered = lower_expr(ctx, arm.expr, "_match_type_probe", 0_usize)
+            ret lowered.typ
+        }
+        Option[MatchExprArm]::None => {
+            panic("Match expression must contain at least one arm")
+        }
+    }
+    ret "void"
+}
+
+fn bind_match_payload(ctx: mut TranslatorContext, pattern: MatchPattern, scrutinee_value: str, scrutinee_type: str) -> EhirTextBuilder {
+    let mut builder = EhirTextBuilder::new()
+    match pattern.binding {
+        Option[str]::Some(name) => {
+            let payload_type = match_payload_type(pattern, scrutinee_type)
+            ctx_add_var(ctx, name, payload_type)
+            builder = builder.instr(name + ": " + payload_type + " = getfield " + scrutinee_value + ", 1")
+        }
+        Option[str]::None => {}
+    }
+    ret builder
+}
+
+fn match_payload_type(pattern: MatchPattern, scrutinee_type: str) -> str {
+    match pattern.value {
+        Option[str]::Some(value) => {
+            if is_option_some_pattern(value) && base_type_name(scrutinee_type) == "Option" {
+                ret first_generic_type(scrutinee_type)
+            }
+            panic("Unable to resolve match payload type for pattern '" + value + "' and scrutinee type '" + scrutinee_type + "'")
+        }
+        Option[str]::None => {}
+    }
+    panic("Unable to resolve match payload type for scrutinee type '" + scrutinee_type + "'")
+    ret "void"
+}
+
+fn is_option_some_pattern(value: str) -> bool {
+    if value == "Some" {
+        ret true
+    }
+    if value == "Option::Some" {
+        ret true
+    }
+    if starts_with(value, "Option[") && ends_with(value, "::Some") {
+        ret true
+    }
+    ret false
 }
 
 fn expr_h_path_or_empty(expr: ExprNode<H>) -> str {
@@ -424,6 +1101,7 @@ fn expr_h_path_or_empty(expr: ExprNode<H>) -> str {
 }
 
 fn translate_match_stmt(
+    ctx: mut TranslatorContext,
     match_stmt: MatchStmt,
     ret_type: str,
     prefix: str,
@@ -432,7 +1110,7 @@ fn translate_match_stmt(
     continue_label: Option[str]
 ) -> EhirTextBuilder {
     let mut builder = EhirTextBuilder::new()
-    let cond = lower_expr(match_stmt.expr, prefix + "_match_expr", idx)
+    let cond = lower_expr(ctx, match_stmt.expr, prefix + "_match_expr", idx)
     builder = builder.append(cond.code)
 
     let end_label = prefix + "_match_end_" + Debug::fmt(idx)
@@ -450,7 +1128,8 @@ fn translate_match_stmt(
             builder = builder.instr("cbr " + test.cond_value + ", $" + body_label + ", $" + fail_label)
         }
         builder = builder.label(body_label)
-        builder = builder.append(translate_match_arm_body(arm, ret_type, prefix + "_match_arm_" + Debug::fmt(arm_idx), break_label, continue_label))
+        builder = builder.append(bind_match_payload(ctx, arm.pattern, cond.value, cond.typ))
+        builder = builder.append(translate_match_arm_body(ctx, arm, ret_type, prefix + "_match_arm_" + Debug::fmt(arm_idx), break_label, continue_label))
         builder = builder.instr("br $" + end_label)
         next_label = fail_label
         builder = builder.label(next_label)
@@ -515,12 +1194,12 @@ fn lower_match_pattern_test(
         Option[str]::None => {}
     }
 
-    code = code.instr(cond_name + ": bool = capprim 0_u1")
-    code = code.instr("; TODO: unsupported match pattern kind: " + pattern.kind)
+    panic("Unsupported match pattern kind in bootstrap translator: " + pattern.kind)
     ret LoweredPatternTest{code, cond_name, false}
 }
 
 fn translate_match_arm_body(
+    ctx: mut TranslatorContext,
     arm: ParsedMatchArm,
     ret_type: str,
     prefix: str,
@@ -529,23 +1208,24 @@ fn translate_match_arm_body(
 ) -> EhirTextBuilder {
     match arm.body {
         MatchArmBody::Block(block) => {
-            ret translate_statements(block.statements, ret_type, prefix, break_label, continue_label)
+            ret translate_statements(ctx, block.statements, ret_type, prefix, break_label, continue_label)
         }
         MatchArmBody::Expr(expr) => {
-            ret translate_expr_stmt(expr, prefix, 0_usize)
+            ret translate_expr_stmt(ctx, expr, prefix, 0_usize)
         }
     }
     ret EhirTextBuilder::new()
 }
 
-fn lower_cond(expr: ExprNode, temp_name: str) -> EhirTextBuilder {
-    let lowered = lower_expr(expr, temp_name, 0_usize)
+fn lower_cond(ctx: mut TranslatorContext, expr: ExprNode, temp_name: str) -> EhirTextBuilder {
+    let lowered = lower_expr(ctx, expr, temp_name, 0_usize)
     let mut builder = lowered.code
     builder = builder.instr(temp_name + ": bool = " + lowered.value)
     ret builder
 }
 
 fn translate_if_stmt(
+    ctx: mut TranslatorContext,
     if_stmt: IfStmt,
     ret_type: str,
     prefix: str,
@@ -562,10 +1242,11 @@ fn translate_if_stmt(
     let branches = if_stmt.branches
     match branches.get(0_usize) {
         Option[IfBranch]::Some(branch0) => {
-            builder = builder.append(lower_cond(branch0.condition, cond_name))
+            builder = builder.append(lower_cond(ctx, branch0.condition, cond_name))
             builder = builder.instr("cbr " + cond_name + ", $" + then_label + ", $" + else_label)
             builder = builder.label(then_label)
             builder = builder.append(translate_statements(
+                ctx,
                 branch0.body.statements,
                 ret_type,
                 then_label,
@@ -583,6 +1264,7 @@ fn translate_if_stmt(
     match if_stmt.else_body {
         Option[ParsedBlock]::Some(else_block) => {
             builder = builder.append(translate_statements(
+                ctx,
                 else_block.statements,
                 ret_type,
                 else_label,
@@ -599,7 +1281,7 @@ fn translate_if_stmt(
     ret builder
 }
 
-fn translate_while_stmt(while_stmt: WhileStmt, ret_type: str, prefix: str, idx: usize) -> EhirTextBuilder {
+fn translate_while_stmt(ctx: mut TranslatorContext, while_stmt: WhileStmt, ret_type: str, prefix: str, idx: usize) -> EhirTextBuilder {
     let cond_label = prefix + "_while_cond_" + Debug::fmt(idx)
     let body_label = prefix + "_while_body_" + Debug::fmt(idx)
     let end_label = prefix + "_while_end_" + Debug::fmt(idx)
@@ -608,10 +1290,11 @@ fn translate_while_stmt(while_stmt: WhileStmt, ret_type: str, prefix: str, idx: 
     let mut builder = EhirTextBuilder::new()
     builder = builder.instr("br $" + cond_label)
     builder = builder.label(cond_label)
-    builder = builder.append(lower_cond(while_stmt.condition, cond_name))
+    builder = builder.append(lower_cond(ctx, while_stmt.condition, cond_name))
     builder = builder.instr("cbr " + cond_name + ", $" + body_label + ", $" + end_label)
     builder = builder.label(body_label)
     builder = builder.append(translate_statements(
+        ctx,
         while_stmt.body.statements,
         ret_type,
         body_label,
@@ -623,13 +1306,14 @@ fn translate_while_stmt(while_stmt: WhileStmt, ret_type: str, prefix: str, idx: 
     ret builder
 }
 
-fn translate_loop_stmt(loop_stmt: LoopStmt, ret_type: str, prefix: str, idx: usize) -> EhirTextBuilder {
+fn translate_loop_stmt(ctx: mut TranslatorContext, loop_stmt: LoopStmt, ret_type: str, prefix: str, idx: usize) -> EhirTextBuilder {
     let body_label = prefix + "_loop_body_" + Debug::fmt(idx)
     let end_label = prefix + "_loop_end_" + Debug::fmt(idx)
     let mut builder = EhirTextBuilder::new()
     builder = builder.instr("br $" + body_label)
     builder = builder.label(body_label)
     builder = builder.append(translate_statements(
+        ctx,
         loop_stmt.body.statements,
         ret_type,
         body_label,
@@ -641,7 +1325,7 @@ fn translate_loop_stmt(loop_stmt: LoopStmt, ret_type: str, prefix: str, idx: usi
     ret builder
 }
 
-fn translate_do_while_stmt(do_stmt: DoWhileStmt, ret_type: str, prefix: str, idx: usize) -> EhirTextBuilder {
+fn translate_do_while_stmt(ctx: mut TranslatorContext, do_stmt: DoWhileStmt, ret_type: str, prefix: str, idx: usize) -> EhirTextBuilder {
     let body_label = prefix + "_do_body_" + Debug::fmt(idx)
     let cond_label = prefix + "_do_cond_" + Debug::fmt(idx)
     let end_label = prefix + "_do_end_" + Debug::fmt(idx)
@@ -650,6 +1334,7 @@ fn translate_do_while_stmt(do_stmt: DoWhileStmt, ret_type: str, prefix: str, idx
     builder = builder.instr("br $" + body_label)
     builder = builder.label(body_label)
     builder = builder.append(translate_statements(
+        ctx,
         do_stmt.body.statements,
         ret_type,
         body_label,
@@ -658,10 +1343,100 @@ fn translate_do_while_stmt(do_stmt: DoWhileStmt, ret_type: str, prefix: str, idx
     ))
     builder = builder.instr("br $" + cond_label)
     builder = builder.label(cond_label)
-    builder = builder.append(lower_cond(do_stmt.condition, cond_name))
+    builder = builder.append(lower_cond(ctx, do_stmt.condition, cond_name))
     builder = builder.instr("cbr " + cond_name + ", $" + body_label + ", $" + end_label)
     builder = builder.label(end_label)
     ret builder
+}
+
+fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: str, prefix: str, idx: usize) -> EhirTextBuilder {
+    let iter_prefix = prefix + "_for_" + Debug::fmt(idx)
+    let body_label = iter_prefix + "_body"
+    let end_label = iter_prefix + "_end"
+    let iter_slot = iter_prefix + "_iter_slot"
+    let iter_value_name = iter_prefix + "_iter"
+    let step_name = iter_prefix + "_step"
+    let next_iter_name = iter_prefix + "_next_iter"
+    let option_name = iter_prefix + "_option"
+
+    let iterable = lower_expr(ctx, for_stmt.iterable, iter_prefix + "_source", idx)
+    let iter_type = iterator_type_for(iterable.typ)
+    let item_type = iterator_item_type(iter_type)
+    let option_type = "Option[" + item_type + "]"
+    let step_type = "__tuple_2[" + iter_type + ", " + option_type + "]"
+
+    let mut builder = EhirTextBuilder::new()
+    builder = builder.append(iterable.code)
+    builder = builder.instr(iter_value_name + ": " + iter_type + " = call " + iterator_iter_function(iterable.typ) + "(" + iterable.value + ")")
+    builder = builder.instr(iter_slot + ": " + iter_type + "* = salloc " + iter_type)
+    builder = builder.instr("store " + iter_value_name + ", " + iter_slot)
+    builder = builder.instr("br $" + body_label)
+    builder = builder.label(body_label)
+    builder = builder.instr(iter_value_name + "_current: " + iter_type + " = load " + iter_slot)
+    builder = builder.instr(step_name + ": " + step_type + " = call " + iterator_next_function(iter_type) + "(" + iter_value_name + "_current)")
+    builder = builder.instr(next_iter_name + ": " + iter_type + " = getfield " + step_name + ", 0")
+    builder = builder.instr("store " + next_iter_name + ", " + iter_slot)
+    builder = builder.instr(option_name + ": " + option_type + " = getfield " + step_name + ", 1")
+    builder = builder.instr("match " + option_name + ", $" + end_label + " {")
+    builder = builder.instr("Some -> $" + body_label + "_some")
+    builder = builder.instr("None -> $" + end_label)
+    builder = builder.instr("}")
+    builder = builder.label(body_label + "_some")
+    builder = builder.instr(for_stmt.name + ": " + item_type + " = getfield " + option_name + ", 1")
+    ctx_add_var(ctx, for_stmt.name, item_type)
+    builder = builder.append(translate_statements_no_default(
+        ctx,
+        for_stmt.body.statements,
+        ret_type,
+        body_label + "_some",
+        Option[str]::Some(end_label),
+        Option[str]::Some(body_label)
+    ))
+    builder = builder.instr("br $" + body_label)
+    builder = builder.label(end_label)
+    ret builder
+}
+
+fn iterator_type_for(iterable_type: str) -> str {
+    let owner = method_owner_name(iterable_type)
+    if owner == "Vec" {
+        ret "VecIter[" + first_generic_type(iterable_type) + "]"
+    }
+    if owner == "VecIter" {
+        ret iterable_type
+    }
+    panic("Unable to resolve iterator type for '" + iterable_type + "'")
+    ret "void"
+}
+
+fn iterator_item_type(iter_type: str) -> str {
+    let owner = method_owner_name(iter_type)
+    if owner == "VecIter" {
+        ret first_generic_type(iter_type)
+    }
+    panic("Unable to resolve iterator item type for '" + iter_type + "'")
+    ret "void"
+}
+
+fn iterator_iter_function(iterable_type: str) -> str {
+    let owner = method_owner_name(iterable_type)
+    if owner == "Vec" {
+        ret "Vec::iter"
+    }
+    if owner == "VecIter" {
+        ret "VecIter::iter"
+    }
+    panic("Unable to resolve iter function for '" + iterable_type + "'")
+    ret ""
+}
+
+fn iterator_next_function(iter_type: str) -> str {
+    let owner = method_owner_name(iter_type)
+    if owner == "VecIter" {
+        ret "VecIter::next"
+    }
+    panic("Unable to resolve next function for '" + iter_type + "'")
+    ret ""
 }
 
 fn translate_params(fn_item: FunctionItem) -> str {
@@ -694,7 +1469,7 @@ fn unwrap_type_or_usize(typ: Option[str]) -> str {
     ret "usize"
 }
 
-fn translate_ret_expr(expr: ExprNode, ret_type: str) -> EhirTextBuilder {
+fn translate_ret_expr(ctx: mut TranslatorContext, expr: ExprNode, ret_type: str) -> EhirTextBuilder {
     let mut builder = EhirTextBuilder::new()
     match expr.value {
         Expr::Integer(v) => {
@@ -721,7 +1496,9 @@ fn translate_ret_expr(expr: ExprNode, ret_type: str) -> EhirTextBuilder {
             ret builder.instr("ret " + name + ": " + ret_type)
         }
         _ => {
-            ret translate_default_ret(ret_type)
+            let lowered = lower_expr(ctx, expr, "_ret_expr", 0_usize)
+            builder = builder.append(lowered.code)
+            ret builder.instr("ret " + lowered.value + ": " + ret_type)
         }
     }
 }
@@ -780,6 +1557,17 @@ fn starts_with(value: str, prefix: str) -> bool {
         ret false
     }
     ret value.slice(0_usize, prefix.len()) == prefix
+}
+
+fn find_char(value: str, needle: str, start: usize) -> usize {
+    let mut index = start
+    while index < value.len() {
+        if value.slice(index, 1_usize) == needle {
+            ret index
+        }
+        index = index + 1_usize
+    }
+    ret value.len()
 }
 
 fn ends_with(value: str, suffix: str) -> bool {

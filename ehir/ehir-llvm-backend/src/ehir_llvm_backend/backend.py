@@ -23,7 +23,7 @@ class EHIR_LLVM_Backend:
         self,
         module: EHIR_ProcessedModule,
         *,
-        opt_profile: OptimizationProfile = OptimizationProfile.debug,
+        opt_profile: OptimizationProfile,
         output_path: Path | None = None,
         native_objects: list[Path] | None = None,
         native_link_args: list[str] | None = None,
@@ -31,7 +31,7 @@ class EHIR_LLVM_Backend:
         llvm_mod = self._codegen.run(module)
         llvm_optimized_mod = self._optimizer.run(llvm_mod, opt_profile=opt_profile)
 
-        paths = self._artifact_paths(module, output_path)
+        paths = self._artifact_paths(module, opt_profile, output_path)
         paths.object.parent.mkdir(parents=True, exist_ok=True)
         paths.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -49,9 +49,8 @@ class EHIR_LLVM_Backend:
             )
         return self._archiver.run(object_path, paths.output)
 
-    def _artifact_paths(self, module: EHIR_ProcessedModule, output_path: Path | None) -> "_ArtifactPaths":
+    def _artifact_paths(self, module: EHIR_ProcessedModule, profile: OptimizationProfile, output_path: Path | None) -> "_ArtifactPaths":
         project_root = self._project_root(module)
-        profile = "debug"
         name = self._module_name(module, project_root)
         object_path = project_root / "target" / profile / "object" / f"{name}.o"
 
@@ -61,6 +60,15 @@ class EHIR_LLVM_Backend:
         if self._has_entrypoint(module):
             return _ArtifactPaths(object=object_path, output=project_root / "target" / profile / name)
         return _ArtifactPaths(object=object_path, output=project_root / "target" / profile / f"lib{name}.a")
+
+    def artifact_output_path(
+        self,
+        module: EHIR_ProcessedModule,
+        *,
+        opt_profile: OptimizationProfile,
+        output_path: Path | None = None,
+    ) -> Path:
+        return self._artifact_paths(module, opt_profile, output_path).output
 
     def _project_root(self, module: EHIR_ProcessedModule) -> Path:
         if module.id != Path():
