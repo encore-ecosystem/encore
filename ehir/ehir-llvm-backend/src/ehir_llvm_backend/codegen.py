@@ -525,7 +525,7 @@ class Codegen:
 
     def _build_store(self, instr: ProcessedInstruction_store):
         self._comment_instruction(instr)
-        value = self._variables.get(instr.var_src.name)
+        value = self._get_typed_value(instr.var_src)
         if value is None:
             src_t = instr.var_src.type
             if src_t is not None and src_t.name == "void":
@@ -687,6 +687,10 @@ class Codegen:
         indices = [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_index)]
 
         result = self.builder.gep(base, indices, name=instr.var_out.name)
+        if instr.var_out.type is not None:
+            expected_type = self._expected_pointer_result_type(instr.var_out.type)
+            if result.type != expected_type:
+                result = self.builder.bitcast(result, expected_type, name=f"{instr.var_out.name}.cast")
         self._variables[instr.var_out.name] = result
         return result
 
@@ -745,8 +749,18 @@ class Codegen:
             indices = [offset_value]
 
         result = self.builder.gep(base, indices, name=instr.var_out.name)
+        if instr.var_out.type is not None:
+            expected_type = self._expected_pointer_result_type(instr.var_out.type)
+            if result.type != expected_type:
+                result = self.builder.bitcast(result, expected_type, name=f"{instr.var_out.name}.cast")
         self._variables[instr.var_out.name] = result
         return result
+
+    def _expected_pointer_result_type(self, typ: Type) -> ir.PointerType:
+        built = self._build_type(typ)
+        if isinstance(built, ir.PointerType):
+            return built
+        return ir.PointerType(built)
 
     def _build_getfield(self, instr: Instruction_getfield):
         self._comment_instruction(instr)
@@ -986,6 +1000,8 @@ class Codegen:
                 raise TypeError(f"Invalid eq operands for str compare: {left.type} == {right.type}")
             eq_fn = self._get_str_eq_function()
             result = self.builder.call(eq_fn, [left, right], name=instr.var_out.name)
+        elif (enum_cmp := self._try_build_enum_like_eq(left, right, instr.var_out.name, negate=False)) is not None:
+            result = enum_cmp
         elif self._is_float_value(left):
             result = self.builder.fcmp_ordered("==", left, right, name=instr.var_out.name)
         elif self._is_unsigned_type(instr.lhs.type):
@@ -1005,6 +1021,8 @@ class Codegen:
             eq_fn = self._get_str_eq_function()
             eq_result = self.builder.call(eq_fn, [left, right], name=f"{instr.var_out.name}.eq")
             result = self.builder.icmp_unsigned("==", eq_result, ir.Constant(ir.IntType(1), 0), name=instr.var_out.name)
+        elif (enum_cmp := self._try_build_enum_like_eq(left, right, instr.var_out.name, negate=True)) is not None:
+            result = enum_cmp
         elif self._is_float_value(left):
             result = self.builder.fcmp_unordered("!=", left, right, name=instr.var_out.name)
         elif self._is_unsigned_type(instr.lhs.type):
@@ -1631,6 +1649,13 @@ class Codegen:
     def _get_typed_value(self, var: TypedVariable):
         value = self._variables.get(var.name)
         if value is not None:
+            if (
+                var.type is not None
+                and not isinstance(var.type, Pointer)
+                and isinstance(value.type, ir.PointerType)
+                and str(value.type.pointee) == str(self._build_type(var.type))
+            ):
+                return self.builder.load(value, name=f"{var.name}.load")
             return value
 
         if var.type is None:
@@ -1655,6 +1680,11 @@ class Codegen:
 
         if isinstance(value.type, ir.PointerType) and value.type.pointee == expected_type:
             return self.builder.load(value, name=f"{arg_name}.load")
+
+        if isinstance(expected_type, ir.PointerType) and str(value.type) == str(expected_type.pointee):
+            slot = self.builder.alloca(value.type, name=f"{arg_name}.addr")
+            self.builder.store(value, slot)
+            return slot
 
         if isinstance(value.type, ir.IntType) and isinstance(expected_type, ir.IntType):
             if value.type.width < expected_type.width:
@@ -1845,13 +1875,13 @@ class Codegen:
 
     def _build_cbr(self, instr: Instruction_cbr):
         self._comment_instruction(instr)
-        cond_value = self._variables[instr.cond_var.name]
+        cond_value = self._get_typed_value(instr.cond_var)
         self.builder.cbranch(cond_value, self._blocks[instr.true_br_label], self._blocks[instr.else_br_label])
 
     def _build_switch(self, instr: ProcessedInstruction_switch):
         self.builder.comment("")
         self.builder.comment("switch")
-        cond_value = self._variables[instr.cond_var.name]
+        cond_value = self._get_typed_value(instr.cond_var)
 
         blocks_mapping: dict[str, ir.Block] = {}
         for ir_block in self.builder.function.blocks:
@@ -1918,6 +1948,8 @@ class Codegen:
     def _build_type(self, type: Type) -> ir.Type:
         if type.name == "void":
             return ir.VoidType()
+        if type.name == "bool":
+            return ir.IntType(1)
 
         if isinstance(type, (HeapSmartPointer, StackSmartPointer)):
             wrapper_name = type.get_name()

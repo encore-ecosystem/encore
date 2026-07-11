@@ -11,6 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <crt_externs.h>
+#endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -30,6 +33,18 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #endif
+
+void *__ehir_pcast(size_t value) {
+    return (void *)(uintptr_t)value;
+}
+
+void *__ehir_hrealloc(void *ptr, size_t bytes) {
+    return realloc(ptr, bytes);
+}
+
+void __ehir_hfree(void *ptr) {
+    free(ptr);
+}
 
 typedef struct {
     size_t ref_count;
@@ -111,6 +126,42 @@ static encore_str encore_from_cstr_copy(const char *value) {
     }
     memcpy(buffer, value, len + 1);
     return encore_from_owned_buffer(buffer, len);
+}
+
+void *encore_str_from_cstr(const char *value) {
+    encore_str result = encore_from_cstr_copy(value);
+    return result.object;
+}
+
+typedef struct {
+    encore_str *ptr;
+    size_t len;
+    size_t cap;
+} encore_str_vec;
+
+encore_str encore_str_join_lines(encore_str_vec lines) {
+    size_t total = lines.len > 0 ? lines.len - 1 : 0;
+    for (size_t index = 0; index < lines.len; index += 1) {
+        total += encore_str_size(lines.ptr[index]);
+    }
+    char *buffer = malloc(total + 1);
+    if (buffer == NULL) {
+        return encore_empty_str();
+    }
+    size_t offset = 0;
+    for (size_t index = 0; index < lines.len; index += 1) {
+        if (index > 0) {
+            buffer[offset] = '\n';
+            offset += 1;
+        }
+        size_t len = encore_str_size(lines.ptr[index]);
+        if (len > 0) {
+            memcpy(buffer + offset, encore_str_data(lines.ptr[index]), len);
+            offset += len;
+        }
+    }
+    buffer[offset] = '\0';
+    return encore_from_owned_buffer(buffer, offset);
 }
 
 void encore_str_retain(encore_str value) {
@@ -271,6 +322,10 @@ static encore_str encore_str_copy_range(encore_str value, size_t start, size_t s
 
     memcpy(buffer, data + start, actual_len);
     return encore_from_owned_buffer(buffer, actual_len);
+}
+
+encore_str encore_str_slice_bytes(encore_str value, size_t start, size_t byte_len) {
+    return encore_str_copy_range(value, start, byte_len);
 }
 
 size_t encore_str_char_len(encore_str value) {
@@ -840,6 +895,26 @@ static void encore_init_args(void) {
     }
     g_args_initialized = true;
     atexit(encore_free_args);
+
+#ifdef __APPLE__
+    int argc = *_NSGetArgc();
+    char **argv = *_NSGetArgv();
+    if (argc <= 0 || argv == NULL) {
+        return;
+    }
+    g_argc = (size_t)argc;
+    g_argv = calloc(g_argc, sizeof(char *));
+    if (g_argv == NULL) {
+        g_argc = 0;
+        return;
+    }
+    for (size_t i = 0; i < g_argc; ++i) {
+        if (argv[i] != NULL) {
+            g_argv[i] = strdup(argv[i]);
+        }
+    }
+    return;
+#endif
 
     FILE *file = fopen("/proc/self/cmdline", "rb");
     if (file == NULL) {

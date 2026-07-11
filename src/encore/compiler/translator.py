@@ -305,13 +305,13 @@ class EncoreToEHIRTranslator:
         self._module.id = self._current_module_id
         imported_declarations = imported_declarations or []
         declaration_entries = [*self._normalize_declaration_entries(imported_declarations)] + [
-            (getattr(statement, "module_id", None) or self._current_module_id, statement, None, None)
+            (getattr(statement, "module_id", None) or self._current_module_id, statement, None, None, None)
             for statement in ast
             if isinstance(statement, s.Statement_TopLevel)
         ]
         self.preload_declarations(declaration_entries)
         emitted_declarations: set[tuple[object, ...]] = set()
-        for module_id, statement, local_name, source_name in declaration_entries:
+        for module_id, statement, local_name, source_name, _ in declaration_entries:
             self._translate_declaration_entry(
                 module_id=module_id,
                 statement=statement,
@@ -396,19 +396,28 @@ class EncoreToEHIRTranslator:
             return replace(statement, name=source_name)
         return statement
 
-    def preload_declarations(self, declarations: list[tuple[Path, s.Statement_TopLevel, str | None, str | None]]):
-        for module_id, statement, local_name, source_name in declarations:
+    def preload_declarations(
+        self,
+        declarations: list[tuple[Path, s.Statement_TopLevel, str | None, str | None, Path | None]],
+    ):
+        for module_id, statement, local_name, source_name, alias_module_id in declarations:
             prev_module_id = self._current_module_id
             self._current_module_id = module_id
             try:
-                self._register_declaration_alias(module_id, statement, local_name=local_name, source_name=source_name)
+                self._register_declaration_alias(
+                    module_id,
+                    statement,
+                    local_name=local_name,
+                    source_name=source_name,
+                    alias_module_id=alias_module_id,
+                )
                 if isinstance(statement, s.Statement_Global):
                     binding_name = local_name or statement.name
                     self._global_exprs[binding_name] = statement.expr
             finally:
                 self._current_module_id = prev_module_id
 
-        for module_id, statement, _, source_name in declarations:
+        for module_id, statement, _, source_name, _ in declarations:
             prev_module_id = self._current_module_id
             self._current_module_id = module_id
             try:
@@ -1303,8 +1312,8 @@ class EncoreToEHIRTranslator:
 
     def _normalize_declaration_entries(
         self, declarations: list[object]
-    ) -> list[tuple[Path, s.Statement_TopLevel, str | None, str | None]]:
-        normalized: list[tuple[Path, s.Statement_TopLevel, str | None, str | None]] = []
+    ) -> list[tuple[Path, s.Statement_TopLevel, str | None, str | None, Path | None]]:
+        normalized: list[tuple[Path, s.Statement_TopLevel, str | None, str | None, Path | None]] = []
         for declaration in declarations:
             module_id = getattr(declaration, "module_id", None)
             statement = getattr(declaration, "statement", None)
@@ -1312,7 +1321,8 @@ class EncoreToEHIRTranslator:
                 raise TypeError(f"Unsupported imported declaration payload: {declaration!r}")
             local_name = getattr(declaration, "local_name", None)
             source_name = getattr(declaration, "source_name", None)
-            normalized.append((module_id, statement, local_name, source_name))
+            alias_module_id = getattr(declaration, "alias_module_id", None)
+            normalized.append((module_id, statement, local_name, source_name, alias_module_id))
         return normalized
 
     def _register_declaration_alias(
@@ -1322,21 +1332,23 @@ class EncoreToEHIRTranslator:
         *,
         local_name: str | None = None,
         source_name: str | None = None,
+        alias_module_id: Path | None = None,
     ):
         source_name = source_name or local_name
+        alias_module_id = (alias_module_id or module_id).resolve()
         if isinstance(statement, s.Statement_StructureDefinition):
             local = local_name or statement.signature.name
             source = source_name or statement.signature.name
             qualified = self._qualify_type_name(module_id, source)
             self._type_aliases[local] = qualified
-            self._module_type_aliases.setdefault(module_id.resolve(), {})[local] = qualified
+            self._module_type_aliases.setdefault(alias_module_id, {})[local] = qualified
             return
         if isinstance(statement, s.Statement_EnumDefinition):
             local = local_name or statement.name
             source = source_name or statement.name
             qualified = self._qualify_type_name(module_id, source)
             self._type_aliases[local] = qualified
-            self._module_type_aliases.setdefault(module_id.resolve(), {})[local] = qualified
+            self._module_type_aliases.setdefault(alias_module_id, {})[local] = qualified
             return
         if isinstance(statement, s.Statement_Trait):
             local = local_name or statement.name

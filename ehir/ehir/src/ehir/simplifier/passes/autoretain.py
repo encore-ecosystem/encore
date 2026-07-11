@@ -19,7 +19,7 @@ from ehir.core.instructions import (
 )
 from ehir.core.primitives import Usize, Usize_t
 from ehir.core.primitives.base import Primitive, PrimitiveType
-from ehir.core.type import Pointer, Reference, Type, mangle_type_name
+from ehir.core.type import Pointer, Reference, Type, concrete_box_type_name, is_box_type, mangle_type_name
 from ehir.core.variable import Parameter, StructField, TypedVariable
 from ehir.simplifier.base import SimplifierPass
 from ehir.simplifier.drop_helper import (
@@ -492,7 +492,10 @@ class AutoRetainPass(SimplifierPass):
             return deepcopy(mapping[typ.name])
         if isinstance(typ, PrimitiveType):
             return deepcopy(typ)
-        return Type(typ.name, [self._replace_type(generic, mapping) for generic in typ.generics])
+        rewritten = Type(typ.name, [self._replace_type(generic, mapping) for generic in typ.generics])
+        if is_box_type(rewritten) and not self._is_placeholder_type(rewritten.generics[0]):
+            return Type(concrete_box_type_name(rewritten.generics[0]))
+        return rewritten
 
     def _uses_type(self, ast: list[Derective], needle: Type) -> bool:
         return any(isinstance(item, Type) and item.name == needle.name and item.generics == needle.generics for item in self._walk(ast))

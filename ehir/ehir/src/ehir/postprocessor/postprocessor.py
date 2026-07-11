@@ -1,3 +1,5 @@
+from dataclasses import fields, is_dataclass
+
 from ehir.builder import EHIR_Module
 from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_enum, Derective_extern_fn, Derective_struct
@@ -39,10 +41,10 @@ from ehir.core.instructions import (
     Instruction_switch,
     Instruction_xor,
 )
-from ehir.core.instructions.base import Instruction
+from ehir.core.instructions.base import Assignable, Instruction
 from ehir.core.primitives import Usize_t
-from ehir.core.type import Type
-from ehir.core.variable import TypedVariable
+from ehir.core.type import Pointer, Type
+from ehir.core.variable import TypedVariable, Variable
 from ehir.postprocessor.instructions import (
     ProcessedControlFlow,
     ProcessedInstruction,
@@ -112,13 +114,17 @@ class Postprocessor:
             "void",
         }
         self._fn_ret_by_emitted_name: dict[str, Type] = {}
+        self._fn_params_by_emitted_name: dict[str, list[Type]] = {}
+        self._current_vars: dict[str, Type] = {}
         for derective in raw_mod.ast:
             if isinstance(derective, (Normalized_fn, Derective_extern_fn)):
                 emitted_name = self._emit_symbol_name(derective.name, [param.type for param in derective.params])
                 self._fn_ret_by_emitted_name[emitted_name] = derective.ret_type
+                self._fn_params_by_emitted_name[emitted_name] = [param.type for param in derective.params]
         mod = EHIR_ProcessedModule(id=raw_mod.id, structs=[], funcs=[])
         for derective in raw_mod.ast:
             if isinstance(derective, Normalized_fn):
+                self._current_vars = {param.name: param.type for param in derective.params}
                 mod.funcs.append(
                     ProcessedDerective_fn(
                         name=self._emit_symbol_name(derective.name, [param.type for param in derective.params]),
@@ -152,11 +158,62 @@ class Postprocessor:
         return mod
 
     def _validate_block(self, block: TerminatedBlock) -> ProcessedBlock:
-        return ProcessedBlock(
-            name=block.name,
-            body=[self._validate_instr(instr) for instr in block.body],
-            term=self._validate_term(block.term),
-        )
+        body = []
+        for instr in block.body:
+            self._hydrate_variable_types(instr)
+            body.append(self._validate_instr(instr))
+            if isinstance(instr, Assignable) and instr.var_out.type is not None:
+                if isinstance(instr, Instruction_salloc) and not instr.var_out.name.startswith("."):
+                    self._current_vars[instr.var_out.name] = instr.type
+                else:
+                    self._current_vars[instr.var_out.name] = instr.var_out.type
+        self._hydrate_variable_types(block.term)
+        return ProcessedBlock(name=block.name, body=body, term=self._validate_term(block.term))
+
+    def _hydrate_variable_types(self, value) -> None:
+        if isinstance(value, Variable):
+            known = self._current_vars.get(value.name)
+            if value.type is None:
+                value.type = known
+            elif (
+                known is not None
+                and not value.name.startswith(".")
+                and isinstance(value.type, Pointer)
+                and str(value.type.pointee) == str(known)
+            ):
+                value.type = known
+            return
+        if isinstance(value, list):
+            for item in value:
+                self._hydrate_variable_types(item)
+            return
+        if isinstance(value, tuple):
+            for item in value:
+                self._hydrate_variable_types(item)
+            return
+        if is_dataclass(value) and not isinstance(value, Type):
+            for field in fields(value):
+                self._hydrate_variable_types(getattr(value, field.name))
+
+    def _normalize_call_arg_types(self, fn_name: str, args: list[Variable]) -> None:
+        if fn_name.startswith("__") or fn_name in {"malloc", "free", "realloc"}:
+            return
+        for arg in args:
+            if arg.name.startswith("."):
+                continue
+
+    def _rewrite_builtin_call(self, fn_name: str, args: list[Variable]) -> str:
+        if fn_name in {"Debug::fmt", "usize::fmt"} and len(args) == 1 and str(args[0].type) == "usize":
+            return "encore_fmt_u64"
+        return fn_name
+
+    def _apply_expected_call_arg_types(self, emitted_name: str, args: list[Variable]) -> None:
+        expected_params = self._fn_params_by_emitted_name.get(emitted_name)
+        if expected_params is None:
+            return
+        for arg, expected in zip(args, expected_params, strict=False):
+            if isinstance(expected, Pointer):
+                arg.type = expected
 
     def _validate_instr(self, instr: Instruction) -> ProcessedInstruction:
         if isinstance(instr, Instruction_salloc):
@@ -177,7 +234,10 @@ class Postprocessor:
                 var=TypedVariable(instr.var.name, instr.var.type),
             )
         if isinstance(instr, Instruction_call):
+            self._normalize_call_arg_types(instr.fn_name, instr.args)
+            instr.fn_name = self._rewrite_builtin_call(instr.fn_name, instr.args)
             emitted_name = self._emit_symbol_name(instr.fn_name, [arg.type for arg in instr.args])
+            self._apply_expected_call_arg_types(emitted_name, instr.args)
             if instr.var_out.type is None:
                 inferred_ret = self._fn_ret_by_emitted_name.get(emitted_name)
                 if inferred_ret is not None:
@@ -202,7 +262,10 @@ class Postprocessor:
                 args=args,
             )
         if isinstance(instr, Instruction_callvoid):
+            self._normalize_call_arg_types(instr.fn_name, instr.args)
+            instr.fn_name = self._rewrite_builtin_call(instr.fn_name, instr.args)
             emitted_name = self._emit_symbol_name(instr.fn_name, [arg.type for arg in instr.args])
+            self._apply_expected_call_arg_types(emitted_name, instr.args)
             if emitted_name not in self._fn_ret_by_emitted_name:
                 hint = [key for key in self._fn_ret_by_emitted_name if key.startswith(instr.fn_name)][:5]
                 raise AssertionError(
@@ -344,9 +407,36 @@ class Postprocessor:
         return method_name
 
     def _build_processed_binop(self, instr: BinOp):
-        assert instr.var_out.type
+        if instr.lhs.type is None and instr.rhs.type is not None:
+            instr.lhs.type = instr.rhs.type
+        if instr.rhs.type is None and instr.lhs.type is not None:
+            instr.rhs.type = instr.lhs.type
+        if instr.rhs.type is not None:
+            instr.lhs.type = self._strip_pointer_to_type(instr.lhs.type, instr.rhs.type)
+        if instr.lhs.type is not None:
+            instr.rhs.type = self._strip_pointer_to_type(instr.rhs.type, instr.lhs.type)
         assert instr.lhs.type
         assert instr.rhs.type
+        if isinstance(instr.var_out.type, Pointer) and str(instr.var_out.type.pointee) == str(instr.lhs.type):
+            instr.var_out.type = instr.var_out.type.pointee
+        if instr.var_out.type is None:
+            if isinstance(
+                instr,
+                (
+                    Instruction_and,
+                    Instruction_or,
+                    Instruction_ieq,
+                    Instruction_neq,
+                    Instruction_les,
+                    Instruction_grt,
+                    Instruction_leq,
+                    Instruction_geq,
+                ),
+            ):
+                instr.var_out.type = Type("bool")
+            else:
+                instr.var_out.type = instr.lhs.type
+        assert instr.var_out.type
         result = None
         if isinstance(instr, Instruction_add):
             result = ProcessedInstruction_add
@@ -402,3 +492,11 @@ class Postprocessor:
             lhs=TypedVariable(instr.lhs.name, instr.lhs.type),
             rhs=TypedVariable(instr.rhs.name, instr.rhs.type),
         )
+
+    def _strip_pointer_to_type(self, typ: Type | None, expected: Type) -> Type | None:
+        current = typ
+        while isinstance(current, Pointer):
+            if str(current.pointee) == str(expected):
+                return current.pointee
+            current = current.pointee
+        return typ

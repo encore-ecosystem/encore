@@ -22,7 +22,7 @@ from encore.compiler.translator import EncoreToEHIRTranslator
 from encore.workspace import RefrainData, RefrainManager
 from encore.utils.diagnostics import with_diagnostic_context
 
-EHIR_CACHE_SCHEMA = "ehir-resolved-v2"
+EHIR_CACHE_SCHEMA = "ehir-resolved-v4"
 
 
 class ExportKind(StrEnum):
@@ -60,6 +60,7 @@ class ImportedTopLevelDeclaration:
     statement: s.Statement_TopLevel
     local_name: str | None = None
     source_name: str | None = None
+    alias_module_id: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -335,16 +336,30 @@ class EncoreCompiler:
 
     def _flattened_alias_declarations(self, refrain: RefrainData) -> list[object]:
         aliases: list[object] = []
-        seen: set[tuple[Path, str, str, int]] = set()
-        for module_symbols in refrain.symbols.modules.values():
+        seen: set[tuple[Path, Path, str, str, int]] = set()
+        for alias_module_id, module_symbols in refrain.symbols.modules.items():
             for binding in module_symbols.values():
-                if binding.name == binding.source_name:
+                if binding.name == binding.source_name and binding.module_id.resolve() == alias_module_id.resolve():
                     continue
-                key = (binding.module_id.resolve(), binding.name, binding.source_name, id(binding.statement))
+                key = (
+                    alias_module_id.resolve(),
+                    binding.module_id.resolve(),
+                    binding.name,
+                    binding.source_name,
+                    id(binding.statement),
+                )
                 if key in seen:
                     continue
                 seen.add(key)
-                aliases.append(binding)
+                aliases.append(
+                    ImportedTopLevelDeclaration(
+                        module_id=binding.module_id,
+                        statement=binding.statement,
+                        local_name=binding.name,
+                        source_name=binding.source_name,
+                        alias_module_id=alias_module_id,
+                    )
+                )
         return aliases
 
     def _infer_refrain_modules(self, refrain: RefrainData) -> None:

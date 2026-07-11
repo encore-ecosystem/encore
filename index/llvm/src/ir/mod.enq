@@ -25,10 +25,13 @@ import refrain::core::llvm_br_term
 import refrain::core::llvm_basic_block
 import refrain::core::llvm_param
 
+extern fn encore_str_join_lines(lines: Vec[str]) -> str
+
 pub fn emit_module_lines(module: LLVMModule) -> Vec[str] {
     let header = "; ModuleID = '" + module.name + "'"
-    let with_header = append(single_line(header), single_line(""))
-    ret append(with_header, emit_functions(module.functions, Vec[str]::Empty))
+    let with_types = append(single_line(header), module.type_declarations)
+    let with_header = append(with_types, single_line(""))
+    ret append(with_header, emit_functions(module.functions, Vec[str]::new()))
 }
 
 pub fn emit_module_text(module: LLVMModule) -> str {
@@ -39,15 +42,12 @@ pub fn emit_module_to_file(module: LLVMModule, path: str) -> i32 {
     ret write_file(path, emit_module_text(module))
 }
 
-fn emit_functions(functions: Vec[LLVMFunction], acc: Vec[str]) -> Vec[str] {
-    if (is_empty(functions)) {
-        ret acc
+fn emit_functions(functions: Vec[LLVMFunction], acc: mut Vec[str]) -> Vec[str] {
+    for current in functions {
+        acc.extend(emit_function_lines(current))
+        acc.push("")
     }
-
-    let current = head_or(functions, default_function())
-    let rest = tail_or(functions, Vec[LLVMFunction]::Empty)
-    let with_fn = append(acc, emit_function_lines(current))
-    ret emit_functions(rest, append(with_fn, single_line("")))
+    ret acc
 }
 
 fn emit_function_lines(func: LLVMFunction) -> Vec[str] {
@@ -56,34 +56,24 @@ fn emit_function_lines(func: LLVMFunction) -> Vec[str] {
     }
 
     let header = render_function_signature(func, false) + " {"
-    let with_header = append(single_line(header), emit_blocks_lines(func.blocks, Vec[str]::Empty))
+    let with_header = append(single_line(header), emit_blocks_lines(func.blocks, Vec[str]::new()))
     ret append(with_header, single_line("}"))
 }
 
-fn emit_blocks_lines(blocks: Vec[LLVMBasicBlock], acc: Vec[str]) -> Vec[str] {
-    if (is_empty(blocks)) {
-        ret acc
-    }
-
-    let current = head_or(blocks, default_block())
-    let rest = tail_or(blocks, Vec[LLVMBasicBlock]::Empty)
-    ret emit_blocks_lines(rest, append(acc, emit_block_lines(current)))
+fn emit_blocks_lines(blocks: Vec[LLVMBasicBlock], acc: mut Vec[str]) -> Vec[str] {
+    for current in blocks { acc.extend(emit_block_lines(current)) }
+    ret acc
 }
 
 fn emit_block_lines(block: LLVMBasicBlock) -> Vec[str] {
     let label = block.name + ":"
-    let with_body = append(single_line(label), emit_instruction_lines(block.instructions, Vec[str]::Empty))
+    let with_body = append(single_line(label), emit_instruction_lines(block.instructions, Vec[str]::new()))
     ret append(with_body, single_line(render_terminator_line(block.terminator)))
 }
 
-fn emit_instruction_lines(instructions: Vec[LLVMInstruction], acc: Vec[str]) -> Vec[str] {
-    if (is_empty(instructions)) {
-        ret acc
-    }
-
-    let current = head_or(instructions, default_instruction())
-    let rest = tail_or(instructions, Vec[LLVMInstruction]::Empty)
-    ret emit_instruction_lines(rest, append(acc, single_line(render_instruction_line(current))))
+fn emit_instruction_lines(instructions: Vec[LLVMInstruction], acc: mut Vec[str]) -> Vec[str] {
+    for current in instructions { acc.push(render_instruction_line(current)) }
+    ret acc
 }
 
 fn single_line(line: str) -> Vec[str] {
@@ -107,7 +97,14 @@ fn signature_prefix(as_declare: bool) -> str {
 }
 
 fn render_params(params: Vec[LLVMParam]) -> str {
-    ret render_params_acc(params, "", true)
+    let mut out = ""
+    let mut first = true
+    for param in params {
+        if !first { out = out + ", " }
+        out = out + render_param(param)
+        first = false
+    }
+    ret out
 }
 
 fn render_params_acc(params: Vec[LLVMParam], acc: str, is_first: bool) -> str {
@@ -116,7 +113,7 @@ fn render_params_acc(params: Vec[LLVMParam], acc: str, is_first: bool) -> str {
     }
 
     let current = head_or(params, default_param())
-    let rest = tail_or(params, Vec[LLVMParam]::Empty)
+    let rest = tail_or(params, Vec[LLVMParam]::new())
     let head = render_param(current)
     let next_acc = concat_with_sep(acc, head, is_first, ", ")
     ret render_params_acc(rest, next_acc, false)
@@ -134,6 +131,9 @@ fn render_instruction_line(instr: LLVMInstruction) -> str {
         }
         Sub(sub_data) => {
             ret render_binary_instruction("sub", sub_data.out, sub_data.lhs, sub_data.rhs)
+        }
+        RawBinary(binary_data) => {
+            ret render_raw_binary_instruction(binary_data.op, binary_data.out, binary_data.lhs, binary_data.rhs)
         }
         Call(call_data) => {
             ret render_call_instruction(call_data.out, call_data.ret_type, call_data.callee, call_data.args)
@@ -173,6 +173,27 @@ fn render_instruction_line(instr: LLVMInstruction) -> str {
             }
             ret with_ptr_value + ", " + rendered_indices
         }
+        Bitcast(bitcast_data) => {
+            let out = "  " + value_text(bitcast_data.out) + " = select i1 true, "
+            let source = type_text(value_type(bitcast_data.src)) + " " + value_text(bitcast_data.src)
+            ret out + source + ", " + source
+        }
+        Cast(cast_data) => {
+            let out = "  " + value_text(cast_data.out) + " = " + cast_data.op + " "
+            let source = type_text(value_type(cast_data.src)) + " " + value_text(cast_data.src)
+            ret out + source + " to " + type_text(value_type(cast_data.out))
+        }
+        InsertValue(insert_data) => {
+            let out = "  " + value_text(insert_data.out) + " = insertvalue "
+            let aggregate = type_text(value_type(insert_data.aggregate)) + " " + value_text(insert_data.aggregate)
+            let value = type_text(value_type(insert_data.value)) + " " + value_text(insert_data.value)
+            ret out + aggregate + ", " + value + ", " + insert_data.index
+        }
+        ExtractValue(extract_data) => {
+            let out = "  " + value_text(extract_data.out) + " = extractvalue "
+            let aggregate = type_text(value_type(extract_data.aggregate)) + " " + value_text(extract_data.aggregate)
+            ret out + aggregate + ", " + extract_data.index
+        }
     }
 }
 
@@ -190,6 +211,12 @@ fn render_binary_instruction(op: str, out: LLVMValue, lhs: LLVMValue, rhs: LLVMV
     let with_type = with_op + " " + type_text(out.typ)
     let with_lhs = with_type + " " + value_text(lhs)
     ret with_lhs + ", " + value_text(rhs)
+}
+
+fn render_raw_binary_instruction(op: str, out: LLVMValue, lhs: LLVMValue, rhs: LLVMValue) -> str {
+    let begin = "  " + value_text(out) + " = " + op
+    let with_type = begin + " " + type_text(value_type(lhs))
+    ret with_type + " " + value_text(lhs) + ", " + value_text(rhs)
 }
 
 fn render_call_instruction(
@@ -216,7 +243,14 @@ fn render_call_instruction(
 }
 
 fn render_typed_values(values: Vec[LLVMValue]) -> str {
-    ret render_typed_values_acc(values, "", true)
+    let mut out = ""
+    let mut first = true
+    for value in values {
+        if !first { out = out + ", " }
+        out = out + render_typed_value(value)
+        first = false
+    }
+    ret out
 }
 
 fn render_typed_values_acc(values: Vec[LLVMValue], acc: str, is_first: bool) -> str {
@@ -225,7 +259,7 @@ fn render_typed_values_acc(values: Vec[LLVMValue], acc: str, is_first: bool) -> 
     }
 
     let current = head_or(values, default_value())
-    let rest = tail_or(values, Vec[LLVMValue]::Empty)
+    let rest = tail_or(values, Vec[LLVMValue]::new())
     let typed = render_typed_value(current)
     let next_acc = concat_with_sep(acc, typed, is_first, ", ")
     ret render_typed_values_acc(rest, next_acc, false)
@@ -238,6 +272,7 @@ fn render_typed_value(value: LLVMValue) -> str {
 
 fn render_terminator_line(term: LLVMTerminator) -> str {
     match term {
+        Unreachable => { ret "  unreachable" }
         Ret(ret_data) => {
             ret render_ret_terminator(ret_data.value, ret_data.ret_type)
         }
@@ -266,7 +301,9 @@ fn render_ret_terminator(value: Option[LLVMValue], ret_type: LLVMType) -> str {
 }
 
 fn join_lines(lines: Vec[str]) -> str {
-    ret join_lines_acc(lines, "", true)
+    ret unsafe {
+        encore_str_join_lines(lines)
+    }
 }
 
 fn join_lines_acc(lines: Vec[str], acc: str, is_first: bool) -> str {
@@ -275,7 +312,7 @@ fn join_lines_acc(lines: Vec[str], acc: str, is_first: bool) -> str {
     }
 
     let current = head_or(lines, "")
-    let rest = tail_or(lines, Vec[str]::Empty)
+    let rest = tail_or(lines, Vec[str]::new())
     let next_acc = concat_with_sep(acc, current, is_first, "\n")
     ret join_lines_acc(rest, next_acc, false)
 }
@@ -288,7 +325,7 @@ fn concat_with_sep(acc: str, piece: str, is_first: bool, sep: str) -> str {
 }
 
 fn default_function() -> LLVMFunction {
-    ret LLVMFunction{"", void_type(), Vec[LLVMParam]::Empty, Vec[LLVMBasicBlock]::Empty, true}
+    ret LLVMFunction{"", void_type(), Vec[LLVMParam]::new(), Vec[LLVMBasicBlock]::new(), true}
 }
 
 fn default_param() -> LLVMParam {
@@ -305,5 +342,5 @@ fn default_instruction() -> LLVMInstruction {
 }
 
 fn default_block() -> LLVMBasicBlock {
-    ret llvm_basic_block("", Vec[LLVMInstruction]::Empty, llvm_br_term(""))
+    ret llvm_basic_block("", Vec[LLVMInstruction]::new(), llvm_br_term(""))
 }

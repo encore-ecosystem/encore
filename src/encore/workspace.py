@@ -6,7 +6,7 @@ from pathlib import Path
 
 from git import Repo
 
-from encore import ENCORE_CACHE_DIR, ENCORE_INDEX_URL, PROJECT_ROOT, __version__
+from encore import ENCORE_CACHE_DIR, PROJECT_ROOT, __version__
 from encore.compiler.lexer import Lexer
 from encore.compiler.macro_expander import MacroExpander
 from encore.compiler.parser import EncoreParser
@@ -24,7 +24,7 @@ from encore.compiler.parser.statements import (
 )
 from encore.utils.manifest import ProjectManifest
 
-WORKSPACE_CACHE_SCHEMA = "workspace-v2"
+WORKSPACE_CACHE_SCHEMA = "workspace-v4"
 
 
 @dataclass(frozen=True)
@@ -537,6 +537,12 @@ class RefrainManager:
 
     def _build_import_graph(self, data: RefrainData) -> ImportGraph:
         entrypoint = self._entrypoint_of(data)
+        return self._build_import_graph_from_entrypoint(data, entrypoint)
+
+    def build_import_graph_from_entrypoint(self, data: RefrainData, entrypoint: Path) -> ImportGraph:
+        return self._build_import_graph_from_entrypoint(data, entrypoint.resolve())
+
+    def _build_import_graph_from_entrypoint(self, data: RefrainData, entrypoint: Path) -> ImportGraph:
         graph = ImportGraph(entrypoint=entrypoint)
         visited: set[Path] = set()
 
@@ -723,14 +729,32 @@ class RefrainManager:
     def _resolve_module_file(self, base_dir: Path, module_parts: tuple[str, ...]) -> Path | None:
         module_base = base_dir.joinpath(*module_parts) if module_parts else base_dir / "lib"
         direct_file = module_base.with_suffix(".enq")
-        if direct_file.exists():
+        if self._path_exists_case_sensitive(direct_file):
             return direct_file.resolve()
 
         mod_file = module_base / "mod.enq"
-        if mod_file.exists():
+        if self._path_exists_case_sensitive(mod_file):
             return mod_file.resolve()
 
         return None
+
+    def _path_exists_case_sensitive(self, path: Path) -> bool:
+        if not path.exists():
+            return False
+        parts = path.resolve().parts
+        if not parts:
+            return False
+
+        current = Path(parts[0])
+        for part in parts[1:]:
+            try:
+                names = {entry.name for entry in current.iterdir()}
+            except OSError:
+                return False
+            if part not in names:
+                return False
+            current = current / part
+        return True
 
     def _parse_file(self, program_path: Path) -> list[Statement]:
         program_path = program_path.resolve()
@@ -765,11 +789,10 @@ class RefrainManager:
             path = (base_path / dep.removeprefix("path@")).resolve()
             manifest_path = path / ProjectManifest.default_filename()
             if not manifest_path.exists():
-                parts = path.parts
-                if "index" in parts:
-                    pkg_name = path.name
-                    mapped_dep = f"{ENCORE_INDEX_URL}/{pkg_name}"
-                    return cls._resolve_dependency(mapped_dep, base_path, update=update)
+                raise RuntimeError(
+                    f"Unable to load path dependency '{dep}' from {base_path}: "
+                    f"{manifest_path} does not exist"
+                )
 
         else:
             raise RuntimeError(f"Unable to load dependency: {dep}")

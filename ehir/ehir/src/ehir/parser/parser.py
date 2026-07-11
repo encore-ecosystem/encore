@@ -14,6 +14,7 @@ from ehir.core.derectives.base import Derective
 from ehir.core.enum import Enum, TupleLikeVariant, UnitLikeVariant
 from ehir.core.instructions import (
     Instruction_add,
+    Instruction_alias,
     Instruction_and,
     Instruction_br,
     Instruction_call,
@@ -71,6 +72,10 @@ from ehir.parser.tokens import Token, TokenType
 
 class ParseError(ValueError):
     pass
+
+
+def set_item_cfgs(_item, _cfgs: tuple[str, ...]):
+    return None
 
 
 class Parser:
@@ -502,7 +507,10 @@ class Parser:
         self._safe_consume(TokenType.LEFT_BRACE)
         while self._lookup_curr() != TokenType.RIGHT_BRACE:
             val = self._parse_primitive()
-            self._safe_consume(TokenType.BOLD_ARROW)
+            if self._lookup_curr() == TokenType.BOLD_ARROW:
+                self._safe_consume(TokenType.BOLD_ARROW)
+            else:
+                self._safe_consume(TokenType.ARROW)
             label = self._parse_block_label()
             cases.append((val, label))
         self._safe_consume(TokenType.RIGHT_BRACE)
@@ -523,7 +531,10 @@ class Parser:
                 self._safe_consume(TokenType.LEFT_PAREN)
                 payload_var = self._parse_variable()
                 self._safe_consume(TokenType.RIGHT_PAREN)
-            self._safe_consume(TokenType.BOLD_ARROW)
+            if self._lookup_curr() == TokenType.BOLD_ARROW:
+                self._safe_consume(TokenType.BOLD_ARROW)
+            else:
+                self._safe_consume(TokenType.ARROW)
             label = self._parse_block_label()
             cases.append(MatchCase(variant=variant, label=label, payload_var=payload_var))
         self._safe_consume(TokenType.RIGHT_BRACE)
@@ -543,7 +554,7 @@ class Parser:
         self._safe_consume(TokenType.EQUAL)
 
         curr_token = self._consume()
-        match curr_token:
+        match curr_token.type:
             case TokenType.KW_CAPPRIM:
                 primitive = self._parse_primitive()
                 return Instruction_capprim(var_out=var, primitive=primitive)
@@ -738,6 +749,9 @@ class Parser:
                 return Instruction_sgetfieldptr(var_out=var, src=var_src, field=field)
 
             case _:
+                if curr_token.type == TokenType.IDENTIFIER:
+                    rhs = Variable(curr_token.value)
+                    return Instruction_alias(var_out=var, var=rhs)
                 self._error_at(curr_token, "Unexpected token in assignable expression")
 
     def _parse_struct_init(self) -> Struct:
@@ -820,6 +834,9 @@ class Parser:
             return Reference(inner)
 
         name = self._safe_consume(TokenType.IDENTIFIER).value
+
+        if name == "mut":
+            return Pointer(self._parse_type())
 
         if name == "dyn":
             trait_name = self._parse_name()

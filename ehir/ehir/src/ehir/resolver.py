@@ -146,6 +146,7 @@ class EHIR_TypedModule(EHIR_Module): ...
 @dataclass
 class SymbolTable:
     fn: dict[str, Derective_fn | Derective_extern_fn] = field(default_factory=dict)
+    fn_overloads: dict[str, list[Derective_fn | Derective_extern_fn]] = field(default_factory=dict)
     structs: dict[str, Derective_struct] = field(default_factory=dict)
     enums: dict[str, Derective_enum] = field(default_factory=dict)
     traits: dict[str, Derective_trait] = field(default_factory=dict)
@@ -157,6 +158,7 @@ class SymbolTable:
         instance = cls()
         for der in mod.ast:
             if isinstance(der, (Derective_fn, Derective_extern_fn)):
+                instance.fn_overloads.setdefault(der.name, []).append(der)
                 instance.fn[der.name] = der
             elif isinstance(der, Derective_struct):
                 instance.structs[der.name] = der
@@ -210,6 +212,7 @@ class Resolver:
         symbol_table = SymbolTable.from_module(module)
 
         self.fn = symbol_table.fn
+        self.fn_overloads = symbol_table.fn_overloads
         self.structs = symbol_table.structs
         self.enums = symbol_table.enums
         self.traits = symbol_table.traits
@@ -1115,6 +1118,44 @@ class Resolver:
                 ret=self._resolve_type(_apply_self_type(fn_directive.ret_type, self_type)),
             )
 
+        def select_direct(name: str, self_type: Type | None = None) -> tuple[_MethodSig, str] | None:
+            candidates = self.fn_overloads.get(name, [])
+            if not candidates:
+                direct = self.fn.get(name)
+                if direct is None:
+                    return None
+                return build_sig(direct, self_type), direct.name
+            if len(candidates) == 1:
+                return build_sig(candidates[0], self_type), candidates[0].name
+
+            matches: list[tuple[int, int, int, _MethodSig, Derective_fn | Derective_extern_fn, list[Type]]] = []
+            for order, candidate in enumerate(candidates):
+                saved_generics = deepcopy(instr.generics)
+                sig = build_sig(candidate, self_type)
+                known = 0
+                exact = 0
+                ok = True
+                for arg, expected in zip(instr.args, sig.params, strict=False):
+                    actual = self._var_type(vars_by_name, arg)
+                    if actual is None:
+                        continue
+                    known += 1
+                    if not self._can_pass_as(actual, expected):
+                        ok = False
+                        break
+                    if self._types_compatible(actual, expected):
+                        exact += 1
+                if ok and known > 0:
+                    matches.append((exact, known, -order, sig, candidate, deepcopy(instr.generics)))
+                instr.generics = saved_generics
+
+            if not matches:
+                return None
+            matches.sort(reverse=True, key=lambda item: (item[0], item[1], item[2]))
+            best = matches[0]
+            instr.generics = best[5]
+            return best[3], best[4].name
+
         trait_owner_call = False
         owner_text_for_trait: str | None = None
         if "::" in instr.fn_name:
@@ -1130,19 +1171,21 @@ class Resolver:
                     trait_owner_call = True
 
         if not trait_owner_call:
-            direct = self.fn.get(instr.fn_name)
+            direct = select_direct(instr.fn_name, _direct_self_type(self.fn.get(instr.fn_name), instr.fn_name))
             if direct is not None:
-                return (build_sig(direct, _direct_self_type(direct, instr.fn_name)), direct.name)
+                return direct
 
         if "::" in instr.fn_name:
             parts = instr.fn_name.split("::")
             if len(parts) >= 2:
                 tail = "::".join(parts[-2:])
-                tail_direct = self.fn.get(tail)
+                tail_direct = select_direct(tail, _direct_self_type(self.fn.get(tail), instr.fn_name))
                 if tail_direct is not None and not trait_owner_call:
-                    return (build_sig(tail_direct, _direct_self_type(tail_direct, instr.fn_name)), tail_direct.name)
+                    return tail_direct
 
         if "::" not in instr.fn_name:
+            if self.fn_overloads.get(instr.fn_name):
+                return None
             raise EhirCompileError(f"Unknown function '{instr.fn_name}'")
         owner_text, method_name = instr.fn_name.rsplit("::", 1)
         owner_type = self._parse_type_text(owner_text)
@@ -1150,9 +1193,9 @@ class Resolver:
             if "::" in owner_text:
                 short_owner = owner_text.split("::")[-1]
                 short_name = f"{short_owner}::{method_name}"
-                short_direct = self.fn.get(short_name)
+                short_direct = select_direct(short_name)
                 if short_direct is not None:
-                    return (build_sig(short_direct), short_direct.name)
+                    return short_direct
             raise EhirCompileError(f"Unknown function '{instr.fn_name}'")
         owner_type = self._resolve_type(owner_type)
         owner_base = owner_type.pointee if isinstance(owner_type, Reference) else owner_type
@@ -1337,7 +1380,8 @@ class Resolver:
             params = [self._resolve_type(self._replace_type(p.type, mapping, owner_base)) for p in method.params]
             ret_t = self._resolve_type(self._replace_type(method.ret_type, mapping, owner_base))
             resolved_method = method.name
-            if resolved_method != "op":
+            is_template_impl = bool(impl.generics or impl.for_type.generics or method.generics)
+            if resolved_method != "op" and not is_template_impl:
                 suffix = self._mangle_type_name(owner_base)
                 if suffix:
                     resolved_method = f"{resolved_method}__{suffix}"
@@ -1865,12 +1909,12 @@ class Resolver:
     def _find_top_level_char(text: str, needle: str) -> int:
         sq = 0
         for i, ch in enumerate(text):
+            if ch == needle and sq == 0:
+                return i
             if ch == "[":
                 sq += 1
             elif ch == "]":
                 sq -= 1
-            elif ch == needle and sq == 0:
-                return i
         return -1
 
     @staticmethod

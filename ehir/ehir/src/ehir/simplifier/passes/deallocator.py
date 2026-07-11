@@ -7,6 +7,7 @@ from ehir.core.derectives import Derective_enum, Derective_struct
 from ehir.core.derectives.base import Derective
 from ehir.core.instructions import (
     BinOp,
+    Instruction_alias,
     Instruction_br,
     Instruction_call,
     Instruction_callvoid,
@@ -661,6 +662,8 @@ class DeallocatorPass(SimplifierPass):
                     self._add_variable_usage(arg)
             elif isinstance(instr, (Instruction_wraps, Instruction_wraph)):
                 self._add_variable_usage(instr.variable)
+            elif isinstance(instr, Instruction_alias):
+                self._add_variable_usage(instr.var)
             elif isinstance(instr, BinOp):
                 self._add_variable_usage(instr.lhs)
                 self._add_variable_usage(instr.rhs)

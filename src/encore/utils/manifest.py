@@ -1,12 +1,11 @@
 import tomllib
-from enum import StrEnum
 from pathlib import Path
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic.fields import Field
 
-from encore import CORE_PATH, PROJECT_ROOT
+from encore import CORE_PATH
 
 
 class StrictModel(BaseModel):

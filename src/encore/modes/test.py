@@ -58,6 +58,32 @@ class UnitTestCase:
         return self.refrain_path / "target" / "tests" / safe / "src" / "main.enq"
 
 
+@dataclass(frozen=True)
+class StandaloneTestCase:
+    refrain_name: str
+    refrain_path: Path
+    module_id: Path
+    expected_compile_error: str | None = None
+
+    @property
+    def source_file(self) -> Path:
+        return self.module_id
+
+    @property
+    def module_display_name(self) -> str:
+        try:
+            return self.module_id.relative_to(self.refrain_path).as_posix()
+        except ValueError:
+            return self.module_id.name
+
+    @property
+    def display_name(self) -> str:
+        return f"{self.refrain_name}:{self.module_display_name}"
+
+
+TestCase = UnitTestCase | StandaloneTestCase
+
+
 def add_test_parser(subparsers) -> tuple[str, Callable]:
     section = "test"
     test_parser = subparsers.add_parser(section, help="Run unit tests marked with #attr(test)")
@@ -69,9 +95,11 @@ def add_test_parser(subparsers) -> tuple[str, Callable]:
         help="Only run tests whose display name contains this text",
     )
     test_parser.add_argument("-j", "--jobs", type=int, default=1, help="Number of test worker processes to run")
+    test_parser.add_argument("--test-timeout", type=float, default=30.0, help="Seconds to wait for each test binary")
     test_parser.add_argument("--_worker-refrain", dest="_worker_refrain", type=str, default=None, help=SUPPRESS)
     test_parser.add_argument("--_worker-module", dest="_worker_module", type=str, default=None, help=SUPPRESS)
     test_parser.add_argument("--_worker-function", dest="_worker_function", type=str, default=None, help=SUPPRESS)
+    test_parser.add_argument("--_worker-kind", dest="_worker_kind", type=str, default=None, help=SUPPRESS)
     return (section, handle_test)
 
 
@@ -96,7 +124,7 @@ def handle_test(args: Namespace):
     native_inputs_by_refrain = {
         refrain.name: compiler._native_link_inputs_for_refrain(refrain) for refrain in refrains
     }
-    tests = _collect_unit_tests(refrains, args.filter)
+    tests = _collect_tests(refrains, args.filter)
     if not tests:
         console.print("No tests found.")
         return
@@ -140,14 +168,16 @@ def _handle_test_worker(args: Namespace, cwd: Path) -> None:
     native_inputs_by_refrain = {
         refrain.name: compiler._native_link_inputs_for_refrain(refrain) for refrain in refrains
     }
-    tests = _collect_unit_tests(refrains, None)
+    tests = _collect_tests(refrains, None)
     for test in tests:
+        if args._worker_kind and _test_kind(test) != args._worker_kind:
+            continue
         if (
             test.refrain_name == args._worker_refrain
             and str(test.module_id.resolve()) == str(Path(args._worker_module).resolve())
-            and test.function_name == args._worker_function
+            and (not isinstance(test, UnitTestCase) or test.function_name == args._worker_function)
         ):
-            passed = _run_single_test(
+            passed = _run_single_test_case(
                 args,
                 compiler,
                 refrains_by_name[test.refrain_name],
@@ -164,7 +194,7 @@ def _handle_test_worker(args: Namespace, cwd: Path) -> None:
 
 
 def _run_tests_in_parallel(
-    args: Namespace, cwd: Path, tests: list[UnitTestCase], console: Console
+    args: Namespace, cwd: Path, tests: list[TestCase], console: Console
 ) -> tuple[int, int]:
     passed = 0
     failed = 0
@@ -198,14 +228,14 @@ def _run_tests_sequential(
     compiler: EncoreCompiler,
     refrains_by_name: dict[str, object],
     native_inputs_by_refrain: dict[str, object],
-    tests: list[UnitTestCase],
+    tests: list[TestCase],
     console: Console,
 ) -> tuple[int, int]:
     passed = 0
     failed = 0
     for test in tests:
         refrain = refrains_by_name[test.refrain_name]
-        result = _run_single_test(
+        result = _run_single_test_case(
             args,
             compiler,
             refrain,
@@ -222,7 +252,7 @@ def _run_tests_sequential(
     return passed, failed
 
 
-def _run_test_worker(args: Namespace, cwd: Path, test: UnitTestCase) -> subprocess.CompletedProcess[str]:
+def _run_test_worker(args: Namespace, cwd: Path, test: TestCase) -> subprocess.CompletedProcess[str]:
     cmd = [
         sys.executable,
         "-c",
@@ -236,33 +266,49 @@ def _run_test_worker(args: Namespace, cwd: Path, test: UnitTestCase) -> subproce
         test.refrain_name,
         "--_worker-module",
         str(test.module_id),
-        "--_worker-function",
-        test.function_name,
+        "--_worker-kind",
+        _test_kind(test),
     ]
+    if isinstance(test, UnitTestCase):
+        cmd.extend(["--_worker-function", test.function_name])
     if args.profile_timings:
         cmd.extend(["--profile", "timings"])
     if args.no_cache:
         cmd.append("--no-cache")
     for cfg in args.cfg:
         cmd.extend(["--cfg", cfg])
+    cmd.extend(["--test-timeout", str(args.test_timeout)])
 
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
 
 
-def _run_single_test(
+def _run_single_test_case(
     args: Namespace,
     compiler: EncoreCompiler,
     refrain,
     native_inputs_by_refrain: dict[str, object],
-    test: UnitTestCase,
+    test: TestCase,
     *,
     console: Console,
     print_summary: bool,
 ) -> bool:
     start = time.perf_counter()
     try:
-        binary_path, profile_records = _compile_test_binary(args, compiler, refrain, native_inputs_by_refrain, test)
-        result = _run_binary(binary_path, [])
+        if isinstance(test, UnitTestCase):
+            binary_path, profile_records = _compile_unit_test_binary(
+                args, compiler, refrain, native_inputs_by_refrain, test
+            )
+        else:
+            binary_path, profile_records = _compile_standalone_test_binary(
+                args, compiler, refrain, native_inputs_by_refrain, test
+            )
+        if isinstance(test, StandaloneTestCase) and test.expected_compile_error is not None:
+            duration = time.perf_counter() - start
+            console.print(f"test {test.display_name} ... [red]FAILED[/red] ({duration:.2f}s)")
+            console.print(f"expected compile error containing: {test.expected_compile_error}")
+            return False
+
+        result = _run_binary(binary_path, [], timeout=args.test_timeout)
         duration = time.perf_counter() - start
         if result.returncode == 0:
             if print_summary:
@@ -285,6 +331,14 @@ def _run_single_test(
         return False
     except Exception as exc:
         duration = time.perf_counter() - start
+        if isinstance(test, StandaloneTestCase) and test.expected_compile_error is not None:
+            failure_text = _render_failure(exc)
+            if test.expected_compile_error in failure_text or test.expected_compile_error in _exception_text(exc):
+                if print_summary:
+                    console.print(f"test {test.display_name} ... [green]ok[/green] ({duration:.2f}s)")
+                else:
+                    console.print(f"test {test.display_name} ... [green]ok[/green]")
+                return True
         if print_summary:
             console.print(f"test {test.display_name} ... [red]FAILED[/red] ({duration:.2f}s)")
         else:
@@ -293,7 +347,7 @@ def _run_single_test(
         return False
 
 
-def _compile_test_binary(
+def _compile_unit_test_binary(
     args: Namespace,
     compiler: EncoreCompiler,
     refrain,
@@ -325,6 +379,69 @@ def _compile_test_binary(
         native_link_args=list(link_inputs.link_args),
     )
     return binary_path, ehir_compiler.pass_timings
+
+
+def _compile_standalone_test_binary(
+    args: Namespace,
+    compiler: EncoreCompiler,
+    refrain,
+    native_inputs_by_refrain: dict[str, object],
+    test: StandaloneTestCase,
+) -> tuple[Path, list]:
+    graph = compiler.refrain_manager.build_import_graph_from_entrypoint(refrain, test.module_id)
+    compiler.refrain_manager._resolve_imports(refrain, graph)
+    module_ast = compiler.refrain_manager._flatten_import_graph_ast(graph)
+    imported_declarations = _graph_alias_declarations(refrain, graph)
+    TypeInferer().infer(module_ast, imported_declarations=imported_declarations)
+    _validate_standalone_main(module_ast, test)
+
+    ehr = EncoreToEHIRTranslator().translate_ast(
+        module_ast,
+        module_id=test.module_id,
+        imported_declarations=imported_declarations,
+    )
+    ehir_compiler = EHIR_ProjectCompiler()
+    typed = ehir_compiler.resolve_module(ehr)
+    processed = ehir_compiler.compile_module(typed)
+
+    link_inputs = compiler._native_link_inputs_for_closure(refrain, native_inputs_by_refrain)
+    backend = EHIR_LLVM_Backend()
+    binary_path = backend.compile(
+        processed,
+        opt_profile=args.resolved_profile,
+        native_objects=list(link_inputs.objects),
+        native_link_args=list(link_inputs.link_args),
+    )
+    return binary_path, ehir_compiler.pass_timings
+
+
+def _graph_alias_declarations(refrain, graph) -> list[ImportedTopLevelDeclaration]:
+    aliases: list[ImportedTopLevelDeclaration] = []
+    seen: set[tuple[Path, Path, str, str, int]] = set()
+    for alias_module_id in graph.modules:
+        for binding in refrain.symbols.modules.get(alias_module_id.resolve(), {}).values():
+            if binding.name == binding.source_name and binding.module_id.resolve() == alias_module_id.resolve():
+                continue
+            key = (
+                alias_module_id.resolve(),
+                binding.module_id.resolve(),
+                binding.name,
+                binding.source_name,
+                id(binding.statement),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            aliases.append(
+                ImportedTopLevelDeclaration(
+                    module_id=binding.module_id,
+                    statement=binding.statement,
+                    local_name=binding.name,
+                    source_name=binding.source_name,
+                    alias_module_id=alias_module_id,
+                )
+            )
+    return aliases
 
 
 def _build_test_module_ast(compiler: EncoreCompiler, refrain, test: UnitTestCase) -> list[s.Statement]:
@@ -441,11 +558,36 @@ def _validate_test_function(module_ast: list[s.Statement], test: UnitTestCase) -
         )
 
 
+def _validate_standalone_main(module_ast: list[s.Statement], test: StandaloneTestCase) -> None:
+    main_fn = _find_function(module_ast, "main")
+    if main_fn is None:
+        raise RuntimeError(f"Standalone test '{test.display_name}' must define main")
+    if main_fn.signature.is_extern:
+        raise RuntimeError(f"Standalone test '{test.display_name}' main can not be extern")
+    if main_fn.params:
+        raise RuntimeError(f"Standalone test '{test.display_name}' main must not accept parameters")
+    if main_fn.generics:
+        raise RuntimeError(f"Standalone test '{test.display_name}' main must not be generic")
+    if main_fn.type is None or getattr(main_fn.type, "name", None) != "u32":
+        raise RuntimeError(
+            f"Standalone test '{test.display_name}' main must return u32, "
+            f"got {main_fn.type if main_fn.type is not None else 'void'}"
+        )
+
+
 def _find_function(module_ast: list[s.Statement], function_name: str) -> s.Statement_FunctionDefinition | None:
     for statement in module_ast:
         if isinstance(statement, s.Statement_FunctionDefinition) and statement.name == function_name:
             return statement
     return None
+
+
+def _collect_tests(refrains: Iterable, filter_text: str | None) -> list[TestCase]:
+    tests: list[TestCase] = []
+    tests.extend(_collect_unit_tests(refrains, filter_text))
+    tests.extend(_collect_standalone_tests(refrains, filter_text))
+    tests.sort(key=lambda test: test.display_name)
+    return tests
 
 
 def _collect_unit_tests(refrains: Iterable, filter_text: str | None) -> list[UnitTestCase]:
@@ -466,8 +608,46 @@ def _collect_unit_tests(refrains: Iterable, filter_text: str | None) -> list[Uni
                 if filter_text and filter_text not in case.display_name:
                     continue
                 tests.append(case)
-    tests.sort(key=lambda test: test.display_name)
     return tests
+
+
+def _collect_standalone_tests(refrains: Iterable, filter_text: str | None) -> list[StandaloneTestCase]:
+    tests: list[StandaloneTestCase] = []
+    for refrain in refrains:
+        tests_dir = refrain.path / "tests"
+        if not tests_dir.exists():
+            continue
+        for module_id in sorted(tests_dir.glob("*.enq")):
+            case = StandaloneTestCase(
+                refrain_name=refrain.name,
+                refrain_path=refrain.path,
+                module_id=module_id.resolve(),
+                expected_compile_error=_expected_compile_error(module_id),
+            )
+            if filter_text and filter_text not in case.display_name:
+                continue
+            tests.append(case)
+    return tests
+
+
+def _test_kind(test: TestCase) -> str:
+    if isinstance(test, UnitTestCase):
+        return "unit"
+    return "standalone"
+
+
+def _expected_compile_error(module_id: Path) -> str | None:
+    try:
+        for line in module_id.read_text().splitlines()[:8]:
+            stripped = line.strip()
+            for prefix in ("//@expect.compile_error=", "// @expect.compile_error="):
+                if stripped.startswith(prefix):
+                    return stripped.removeprefix(prefix).strip()
+            if stripped and not stripped.startswith("//"):
+                return None
+    except OSError:
+        return None
+    return None
 
 
 def _append_profile_records(compiler: EncoreCompiler, test_name: str, records: list) -> None:
@@ -482,8 +662,8 @@ def _normalize_jobs(jobs: int) -> int:
     return jobs
 
 
-def _run_binary(executable_path: Path, program_args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([str(executable_path), *program_args], capture_output=True, text=True, check=False)
+def _run_binary(executable_path: Path, program_args: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([str(executable_path), *program_args], capture_output=True, text=True, check=False, timeout=timeout)
 
 
 def _sanitize_path_fragment(value: str) -> str:

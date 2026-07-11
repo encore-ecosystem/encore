@@ -2,7 +2,17 @@ from ehir.resolver import EHIR_TypedModule
 from ehir.core.block import TerminatedBlock
 from ehir.core.derectives import Derective_fn, Derective_impl
 from ehir.core.derectives.base import Derective
-from ehir.core.instructions import ControlFlow, Instruction_br, Instruction_load, Instruction_ret, Instruction_salloc, Instruction_store
+from ehir.core.instructions import (
+    ControlFlow,
+    Instruction_br,
+    Instruction_cbr,
+    Instruction_load,
+    Instruction_match,
+    Instruction_ret,
+    Instruction_salloc,
+    Instruction_store,
+    Instruction_switch,
+)
 from ehir.core.type import Pointer, Type
 from ehir.core.variable import TypedVariable
 from ehir.errors import EhirCompileError
@@ -37,6 +47,7 @@ class NormalizerPass(SimplifierPass):
 
     def _terminate_blocks(self, derective: Derective_fn):
         new_blocks = []
+        referenced_labels = self._referenced_labels(derective)
         for block_index, block in enumerate(derective.body):
             term_index = None
             for instr_index, instr in enumerate(block.body):
@@ -47,6 +58,8 @@ class NormalizerPass(SimplifierPass):
             if term_index is None:
                 if len(block.body) == 0:
                     if block_index + 1 >= len(derective.body):
+                        if block.name not in referenced_labels:
+                            continue
                         raise EhirCompileError(
                             f"Empty block has no successor: function '{derective.name}', block '{block.name}'"
                         )
@@ -62,6 +75,23 @@ class NormalizerPass(SimplifierPass):
             assert isinstance(term, ControlFlow)
             new_blocks.append(TerminatedBlock(name=block.name, body=block_body, term=term))
         derective.body = new_blocks
+
+    def _referenced_labels(self, derective: Derective_fn) -> set[str]:
+        labels: set[str] = set()
+        for block in derective.body:
+            for instr in block.body:
+                if isinstance(instr, Instruction_br):
+                    labels.add(instr.label)
+                elif isinstance(instr, Instruction_cbr):
+                    labels.add(instr.true_br_label)
+                    labels.add(instr.else_br_label)
+                elif isinstance(instr, Instruction_switch):
+                    labels.add(instr.default_case)
+                    labels.update(label for _, label in instr.cases)
+                elif isinstance(instr, Instruction_match):
+                    labels.add(instr.default_case)
+                    labels.update(case.label for case in instr.cases)
+        return labels
 
     def _normalize_fn(self, derective: Derective_fn) -> Normalized_fn:
         # Step 0: Prepare block mapping

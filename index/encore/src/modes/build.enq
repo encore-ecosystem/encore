@@ -3,7 +3,11 @@ import core::option::Option
 import std::io::println
 import std::os::write_file
 import std::path::Path
+import std::process::run
 import std::vec::Vec
+
+import ehirlib::parse_module_text
+import ehir_llvm_backend::codegen::emit_ir
 
 import refrain::frontend::sema::run_semantic_checks
 import refrain::frontend::translator::translate_to_ehir
@@ -27,8 +31,10 @@ fn compile_project(root: Path) -> u32 {
     println("modules: " + Debug::fmt(workspace.modules.len()))
     println("ast nodes: " + Debug::fmt(ast.len()))
 
+    let mut project_name = "program"
     match workspace_root_refrain(workspace) {
         Option[WorkspaceRefrain]::Some(root_refrain) => {
+            project_name = root_refrain.name
             println("root: " + root_refrain.name)
         }
         Option[WorkspaceRefrain]::None => {
@@ -53,8 +59,47 @@ fn compile_project(root: Path) -> u32 {
     }
     println("ehir out: " + out_path.as_str())
 
-    println(status_ok("Build frontend pipeline complete"))
+    println(status(Spinner::dots(), 3_usize, "Bootstrap LLVM lowering"))
+    let ehir_module = parse_module_text("encore_bootstrap", ehir_text)
+    let llvm_text = emit_ir(ehir_module)
+    let llvm_path = root.join("target.bootstrap.ll")
+    let llvm_write_code = write_file(native_path(llvm_path.as_str()), llvm_text)
+    if llvm_write_code != 0_i32 {
+        println(status_fail("Failed to write translated LLVM IR"))
+        ret 1_u32
+    }
+    println("llvm out: " + llvm_path.as_str())
+
+    println(status(Spinner::dots(), 4_usize, "Bootstrap native link"))
+    let target_dir = root.join("target")
+    let debug_dir = target_dir.join("debug")
+    target_dir.mkdir()
+    debug_dir.mkdir()
+    let binary_path = debug_dir.join(project_name)
+    let runtime_path = root.join("../../core/runtime.c").resolve()
+    let clang_command = "clang " + shell_quote(native_path(llvm_path.as_str())) + " " + shell_quote(native_path(runtime_path.as_str())) + " -o " + shell_quote(native_path(binary_path.as_str()))
+    let clang_code = run(clang_command)
+    if clang_code != 0_i32 {
+        println(status_fail("LLVM assembly or native link failed"))
+        ret 1_u32
+    }
+    println("binary out: " + binary_path.as_str())
+
+    println(status_ok("Self-hosted frontend and LLVM pipeline complete"))
     ret 0_u32
+}
+
+fn shell_quote(value: str) -> str {
+    if value.len() == 0_usize { ret "''" }
+    let mut out = "'"
+    let mut index = 0_usize
+    while index < value.len() {
+        let ch = value.slice(index, 1_usize)
+        if ch == "'" { out = out + "'\\''" }
+        else { out = out + ch }
+        index = index + 1_usize
+    }
+    ret out + "'"
 }
 
 fn native_path(value: str) -> str {

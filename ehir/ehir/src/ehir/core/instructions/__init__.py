@@ -17,6 +17,7 @@ from .binop import (
     Instruction_or,
     Instruction_xor,
 )
+from .alias import Instruction_alias
 from .call import Instruction_call
 from .callvoid import Instruction_callvoid
 from .capenum import Instruction_capenum
@@ -55,6 +56,7 @@ __all__ = [
     "BinOp",
     "ControlFlow",
     "Instruction_add",
+    "Instruction_alias",
     "Instruction_and",
     "Instruction_br",
     "Instruction_call",
