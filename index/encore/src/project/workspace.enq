@@ -1,8 +1,10 @@
-import core::fmt::Debug
 import core::option::Option
 import core::panic::panic
 import std::os::file_exists
 import std::os::read_file
+import std::os::core_dir
+import std::os::home_dir
+import std::process::run
 import std::path::Path
 import std::vec::Vec
 
@@ -15,6 +17,10 @@ import refrain::frontend::Token
 
 import mod::manifest::ProjectManifest
 import mod::manifest::read_project_manifest
+
+extern fn encore_strset_new() -> usize
+extern fn encore_strset_insert(set: usize, value: str) -> bool
+extern fn encore_strset_free(set: usize) -> ()
 
 
 pub struct WorkspaceRefrain {
@@ -62,6 +68,27 @@ pub fn load_binary_workspace(root: Path) -> ProjectWorkspace {
         }
     }
 
+    ret workspace
+}
+
+pub fn load_entry_workspace(root: Path, entrypoint: Path) -> ProjectWorkspace {
+    let mut workspace = ProjectWorkspace{"", Vec[WorkspaceRefrain]::new(), Vec[WorkspaceModule]::new(), Vec[Statement]::new()}
+    workspace_set_root_name(workspace, load_refrain(workspace, root.resolve(), true))
+    match workspace_root_refrain(workspace) {
+        Some(root_refrain) => {
+            let visited_paths = unsafe { encore_strset_new() }
+            let visited_sources = unsafe { encore_strset_new() }
+            let mut modules = Vec[WorkspaceModule]::new()
+            visit_module(workspace, root_refrain, entrypoint.resolve(), visited_paths, visited_sources, modules)
+            unsafe {
+                encore_strset_free(visited_paths)
+                encore_strset_free(visited_sources)
+            }
+            workspace_set_modules(workspace, modules)
+            workspace_set_flat_ast(workspace, flatten_modules(modules))
+        }
+        None => { panic("Workspace root is missing") }
+    }
     ret workspace
 }
 
@@ -124,35 +151,58 @@ fn load_refrain(workspace: mut ProjectWorkspace, root: Path, target_is_binary: b
     ret manifest.name
 }
 
-fn build_modules_for_refrain(workspace: ProjectWorkspace, refrain: WorkspaceRefrain) -> Vec[WorkspaceModule] {
+fn build_modules_for_refrain(workspace: mut ProjectWorkspace, refrain: WorkspaceRefrain) -> Vec[WorkspaceModule] {
     let entrypoint = entrypoint_of(refrain)
-    let mut visited = Vec[str]::new()
+    let visited_paths = unsafe { encore_strset_new() }
+    let visited_sources = unsafe { encore_strset_new() }
     let mut result = Vec[WorkspaceModule]::new()
-    visit_module(workspace, refrain, entrypoint, visited, result)
+    visit_module(workspace, refrain, entrypoint, visited_paths, visited_sources, result)
+    unsafe {
+        encore_strset_free(visited_paths)
+        encore_strset_free(visited_sources)
+    }
     ret result
 }
 
 fn visit_module(
-    workspace: ProjectWorkspace,
+    workspace: mut ProjectWorkspace,
     owner: WorkspaceRefrain,
     module_path: Path,
-    visited: mut Vec[str],
+    visited_paths: usize,
+    visited_sources: usize,
     result: mut Vec[WorkspaceModule]
 ) -> () {
     let resolved_path = module_path.resolve()
     let resolved_key = resolved_path.as_str()
-    if contains_string(visited, resolved_key) {
+    if !unsafe { encore_strset_insert(visited_paths, resolved_key) } {
         ret ()
     }
-    visited.push(resolved_key)
 
     let source = read_file(native_path(resolved_path.as_str()))
+    let source_is_new = unsafe { encore_strset_insert(visited_sources, source) }
     let mut lexer = Lexer::new()
     let tokens = lexer.tokenize(source)
     let imports = import_paths_from_tokens(tokens)
+    if !source_is_new {
+        visit_imports(workspace, owner, resolved_path, imports, visited_paths, visited_sources, result)
+        ret ()
+    }
     let mut parser = Parser::new()
     let ast = parser.parse(tokens)
+    visit_imports(workspace, owner, resolved_path, imports, visited_paths, visited_sources, result)
+    result.push(WorkspaceModule{owner.name, owner.root, resolved_path, source, ast, imports})
+    ret ()
+}
 
+fn visit_imports(
+    workspace: mut ProjectWorkspace,
+    owner: WorkspaceRefrain,
+    resolved_path: Path,
+    imports: Vec[str],
+    visited_paths: usize,
+    visited_sources: usize,
+    result: mut Vec[WorkspaceModule]
+) -> () {
     let mut import_index = 0_usize
     while import_index < imports.len() {
         match imports.get(import_index) {
@@ -164,7 +214,7 @@ fn visit_module(
                         Option[str]::Some(request_path) => {
                             match resolve_import_module(workspace, owner, resolved_path, request_path) {
                                 Option[ResolvedModule]::Some(target) => {
-                                    visit_module(workspace, target.owner, target.module_path, visited, result)
+                                    visit_module(workspace, target.owner, target.module_path, visited_paths, visited_sources, result)
                                 }
                                 Option[ResolvedModule]::None => {
                                 }
@@ -181,18 +231,7 @@ fn visit_module(
         }
         import_index = import_index + 1_usize
     }
-
-    if !contains_module_path(result, resolved_key) {
-        result.push(WorkspaceModule{owner.name, owner.root, resolved_path, source, ast, imports})
-    }
     ret ()
-}
-
-fn contains_module_path(modules: Vec[WorkspaceModule], resolved_path: str) -> bool {
-    for module in modules {
-        if module.module_path.resolve().as_str() == resolved_path { ret true }
-    }
-    ret false
 }
 
 fn flatten_modules(modules: Vec[WorkspaceModule]) -> Vec[Statement] {
@@ -380,15 +419,55 @@ fn resolve_dependency_refrain(
 
 fn resolve_dependency_root(dep_ref: str, base_root: Path) -> Path {
     if dep_ref == "sys@core" {
-        ret resolve_system_core_root(base_root)
+        ret Path::new(core_dir()).resolve()
     }
 
     if starts_with(dep_ref, "path@") {
         ret base_root.join(dep_ref.slice(5_usize, dep_ref.len() - 5_usize)).resolve()
     }
 
+    if starts_with(dep_ref, "git@") {
+        let url = dep_ref.slice(4_usize, dep_ref.len() - 4_usize)
+        let url_path = Path::new(url)
+        let mut repository = workspace_path_name_or(url_path, "repository")
+        if repository.len() > 4_usize && repository.slice(repository.len() - 4_usize, 4_usize) == ".git" {
+            repository = repository.slice(0_usize, repository.len() - 4_usize)
+        }
+        let owner = match url_path.parent() {
+            Some(parent) => workspace_path_name_or(parent, "git")
+            None => "git"
+        }
+        let destination = Path::new(home_dir()).join(".cache").join("encore").join("git").join(owner).join(repository)
+        if !file_exists(destination.join(".git").as_str()) {
+            match destination.parent() {
+                Some(parent) => { run("mkdir -p " + workspace_shell_quote(parent.as_str())) }
+                None => {}
+            }
+            if run("git clone " + workspace_shell_quote(url) + " " + workspace_shell_quote(destination.as_str())) != 0_i32 {
+                panic("Unable to clone dependency: " + url)
+            }
+        }
+        ret destination.resolve()
+    }
+
     panic("Unsupported dependency reference: " + dep_ref)
     ret base_root
+}
+
+fn workspace_path_name_or(path: Path, fallback: str) -> str {
+    match path.name() { Some(value) => { ret value } None => { ret fallback } }
+}
+
+fn workspace_shell_quote(value: str) -> str {
+    let mut out = "'"
+    let mut index = 0_usize
+    while index < value.len() {
+        let ch = value.slice(index, 1_usize)
+        if ch == "'" { out = out + "'\\''" }
+        else { out = out + ch }
+        index = index + 1_usize
+    }
+    ret out + "'"
 }
 
 fn resolve_system_core_root(base_root: Path) -> Path {

@@ -36,6 +36,7 @@ from ehir.core.instructions import (
     Instruction_pcast,
     Instruction_put,
     Instruction_ret,
+    Instruction_retain,
     Instruction_salloc,
     Instruction_scpos,
     Instruction_scstruct,
@@ -78,6 +79,7 @@ SKIPABLE = (
     Instruction_comment,
     Instruction_halloc,
     Instruction_hrealloc,
+    Instruction_retain,
 )
 
 ENABLE_COMMENTS: bool = True

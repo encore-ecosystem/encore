@@ -25,6 +25,7 @@ from ehir.core.instructions import (
     Instruction_cbr,
     Instruction_div,
     Instruction_drop,
+    Instruction_retain,
     Instruction_gep,
     Instruction_geq,
     Instruction_getfield,
@@ -424,6 +425,8 @@ class Parser:
                 return self._parse_hfree()
             case TokenType.KW_DROP:
                 return self._parse_drop()
+            case TokenType.KW_RETAIN:
+                return self._parse_retain()
             case TokenType.KW_CALL | TokenType.KW_UNSAFE:
                 return self._parse_callvoid()
 
@@ -440,6 +443,11 @@ class Parser:
         self._safe_consume(TokenType.KW_DROP)
         var = self._parse_variable()
         return Instruction_drop(var=var)
+
+    def _parse_retain(self) -> Instruction_retain:
+        self._safe_consume(TokenType.KW_RETAIN)
+        var = self._parse_variable()
+        return Instruction_retain(var=var)
 
     def _parse_callvoid(self) -> Instruction_callvoid:
         curr_token = self._consume()

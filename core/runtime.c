@@ -11,6 +11,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define ENCORE_ADDRESS_SANITIZER 1
+#endif
+#endif
 #ifdef __APPLE__
 #include <crt_externs.h>
 #endif
@@ -38,13 +43,75 @@ void *__ehir_pcast(size_t value) {
     return (void *)(uintptr_t)value;
 }
 
+#if defined(ENCORE_ADDRESS_SANITIZER)
+void *__ehir_hrealloc(void *ptr, size_t bytes) { return realloc(ptr, bytes); }
+void __ehir_hfree(void *ptr) { free(ptr); }
+#else
+typedef union encore_heap_block encore_heap_block;
+union encore_heap_block {
+    struct {
+        size_t capacity;
+        encore_heap_block *next;
+    } meta;
+    max_align_t alignment;
+};
+
+#define ENCORE_HEAP_MIN_SHIFT 4u
+#define ENCORE_HEAP_CLASS_COUNT 13u
+static encore_heap_block *g_heap_free_lists[ENCORE_HEAP_CLASS_COUNT];
+void __ehir_hfree(void *ptr);
+
+static size_t encore_heap_class(size_t bytes) {
+    size_t capacity = (size_t)1u << ENCORE_HEAP_MIN_SHIFT;
+    size_t index = 0;
+    while (capacity < bytes && index + 1 < ENCORE_HEAP_CLASS_COUNT) {
+        capacity <<= 1;
+        index += 1;
+    }
+    return capacity >= bytes ? index : ENCORE_HEAP_CLASS_COUNT;
+}
+
+static void *encore_heap_alloc(size_t bytes) {
+    if (bytes == 0) bytes = 1;
+    size_t class_index = encore_heap_class(bytes);
+    size_t capacity = bytes;
+    encore_heap_block *block = NULL;
+    if (class_index < ENCORE_HEAP_CLASS_COUNT) {
+        capacity = (size_t)1u << (ENCORE_HEAP_MIN_SHIFT + class_index);
+        block = g_heap_free_lists[class_index];
+        if (block != NULL) g_heap_free_lists[class_index] = block->meta.next;
+    }
+    if (block == NULL) block = malloc(sizeof(encore_heap_block) + capacity);
+    if (block == NULL) return NULL;
+    block->meta.capacity = capacity;
+    block->meta.next = NULL;
+    return block + 1;
+}
+
 void *__ehir_hrealloc(void *ptr, size_t bytes) {
-    return realloc(ptr, bytes);
+    if (ptr == NULL) return encore_heap_alloc(bytes);
+    encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
+    if (bytes <= block->meta.capacity) return ptr;
+    void *next = encore_heap_alloc(bytes);
+    if (next == NULL) return NULL;
+    memcpy(next, ptr, block->meta.capacity);
+    __ehir_hfree(ptr);
+    return next;
 }
 
 void __ehir_hfree(void *ptr) {
-    free(ptr);
+    if (ptr == NULL) return;
+    encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
+    size_t class_index = encore_heap_class(block->meta.capacity);
+    if (class_index < ENCORE_HEAP_CLASS_COUNT &&
+        block->meta.capacity == ((size_t)1u << (ENCORE_HEAP_MIN_SHIFT + class_index))) {
+        block->meta.next = g_heap_free_lists[class_index];
+        g_heap_free_lists[class_index] = block;
+        return;
+    }
+    free(block);
 }
+#endif
 
 typedef struct {
     size_t ref_count;
@@ -55,6 +122,9 @@ typedef struct {
 typedef struct {
     encore_str_object *object;
 } encore_str;
+
+static encore_str encore_empty_str(void);
+static encore_str encore_from_owned_buffer(char *buffer, size_t len);
 
 static struct {
     size_t ref_count;
@@ -74,6 +144,146 @@ static size_t encore_str_size(encore_str value) {
         return 0;
     }
     return value.object->len;
+}
+
+typedef struct {
+    uint64_t hash;
+    size_t len;
+    char *data;
+} encore_strset_entry;
+
+typedef struct {
+    size_t len;
+    size_t cap;
+    encore_strset_entry *entries;
+} encore_strset;
+
+static uint64_t encore_strset_hash(const char *data, size_t len) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t index = 0; index < len; ++index) {
+        hash ^= (unsigned char)data[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+static bool encore_strset_rehash(encore_strset *set, size_t next_cap) {
+    encore_strset_entry *next = calloc(next_cap, sizeof(encore_strset_entry));
+    if (next == NULL) return false;
+    for (size_t index = 0; index < set->cap; ++index) {
+        encore_strset_entry entry = set->entries[index];
+        if (entry.data == NULL) continue;
+        size_t slot = (size_t)(entry.hash % next_cap);
+        while (next[slot].data != NULL) slot = (slot + 1) % next_cap;
+        next[slot] = entry;
+    }
+    free(set->entries);
+    set->entries = next;
+    set->cap = next_cap;
+    return true;
+}
+
+void *encore_strset_new(void) {
+    encore_strset *set = calloc(1, sizeof(encore_strset));
+    if (set == NULL) return NULL;
+    if (!encore_strset_rehash(set, 64)) {
+        free(set);
+        return NULL;
+    }
+    return set;
+}
+
+bool encore_strset_insert(void *raw_set, encore_str value) {
+    encore_strset *set = raw_set;
+    if (set == NULL) return true;
+    if ((set->len + 1) * 10 >= set->cap * 7) {
+        if (!encore_strset_rehash(set, set->cap * 2)) return true;
+    }
+    const char *data = encore_str_data(value);
+    size_t len = encore_str_size(value);
+    uint64_t hash = encore_strset_hash(data, len);
+    size_t slot = (size_t)(hash % set->cap);
+    while (set->entries[slot].data != NULL) {
+        encore_strset_entry *entry = &set->entries[slot];
+        if (entry->hash == hash && entry->len == len && memcmp(entry->data, data, len) == 0) {
+            return false;
+        }
+        slot = (slot + 1) % set->cap;
+    }
+    char *copy = malloc(len + 1);
+    if (copy == NULL) return true;
+    if (len > 0) memcpy(copy, data, len);
+    copy[len] = '\0';
+    set->entries[slot] = (encore_strset_entry){.hash = hash, .len = len, .data = copy};
+    set->len += 1;
+    return true;
+}
+
+void encore_strset_free(void *raw_set) {
+    encore_strset *set = raw_set;
+    if (set == NULL) return;
+    for (size_t index = 0; index < set->cap; ++index) free(set->entries[index].data);
+    free(set->entries);
+    free(set);
+}
+
+typedef struct {
+    size_t len;
+    size_t cap;
+    char *data;
+} encore_text_builder;
+
+static bool encore_text_builder_reserve(encore_text_builder *builder, size_t additional) {
+    if (builder == NULL || additional > SIZE_MAX - builder->len) return false;
+    size_t required = builder->len + additional;
+    if (required <= builder->cap) return true;
+    size_t next_cap = builder->cap == 0 ? 256 : builder->cap;
+    while (next_cap < required) {
+        if (next_cap > SIZE_MAX / 2) {
+            next_cap = required;
+            break;
+        }
+        next_cap *= 2;
+    }
+    char *next = realloc(builder->data, next_cap);
+    if (next == NULL) return false;
+    builder->data = next;
+    builder->cap = next_cap;
+    return true;
+}
+
+void *encore_text_builder_new(void) {
+    return calloc(1, sizeof(encore_text_builder));
+}
+
+void encore_text_builder_append(void *raw_builder, encore_str value) {
+    encore_text_builder *builder = raw_builder;
+    size_t len = encore_str_size(value);
+    if (!encore_text_builder_reserve(builder, len)) return;
+    if (len > 0) memcpy(builder->data + builder->len, encore_str_data(value), len);
+    builder->len += len;
+}
+
+void encore_text_builder_append_builder(void *raw_builder, void *raw_other) {
+    encore_text_builder *builder = raw_builder;
+    encore_text_builder *other = raw_other;
+    if (builder == NULL || other == NULL || builder == other) return;
+    if (encore_text_builder_reserve(builder, other->len)) {
+        if (other->len > 0) memcpy(builder->data + builder->len, other->data, other->len);
+        builder->len += other->len;
+    }
+    free(other->data);
+    free(other);
+}
+
+encore_str encore_text_builder_finish(void *raw_builder) {
+    encore_text_builder *builder = raw_builder;
+    if (builder == NULL) return encore_empty_str();
+    char *data = builder->data;
+    size_t len = builder->len;
+    free(builder);
+    if (data == NULL) return encore_empty_str();
+    return encore_from_owned_buffer(data, len);
 }
 
 static encore_str encore_empty_str(void) {
@@ -99,7 +309,7 @@ static encore_str encore_from_owned_buffer(char *buffer, size_t len) {
     if (buffer == NULL) {
         return encore_empty_str();
     }
-    encore_str_object *object = malloc(sizeof(encore_str_object) + len + 1);
+    encore_str_object *object = __ehir_hrealloc(NULL, sizeof(encore_str_object) + len + 1);
     if (object == NULL) {
         free(buffer);
         return encore_empty_str();
@@ -112,6 +322,91 @@ static encore_str encore_from_owned_buffer(char *buffer, size_t len) {
     object->data[len] = '\0';
     free(buffer);
     return (encore_str){.object = object};
+}
+
+static int encore_hex_digit(unsigned char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+static size_t encore_utf8_encode(uint32_t value, char *out) {
+    if (value <= 0x7f) { out[0] = (char)value; return 1; }
+    if (value <= 0x7ff) {
+        out[0] = (char)(0xc0 | (value >> 6));
+        out[1] = (char)(0x80 | (value & 0x3f));
+        return 2;
+    }
+    if (value >= 0xd800 && value <= 0xdfff) return 0;
+    if (value <= 0xffff) {
+        out[0] = (char)(0xe0 | (value >> 12));
+        out[1] = (char)(0x80 | ((value >> 6) & 0x3f));
+        out[2] = (char)(0x80 | (value & 0x3f));
+        return 3;
+    }
+    if (value <= 0x10ffff) {
+        out[0] = (char)(0xf0 | (value >> 18));
+        out[1] = (char)(0x80 | ((value >> 12) & 0x3f));
+        out[2] = (char)(0x80 | ((value >> 6) & 0x3f));
+        out[3] = (char)(0x80 | (value & 0x3f));
+        return 4;
+    }
+    return 0;
+}
+
+encore_str encore_unescape_string_literal(encore_str value) {
+    const unsigned char *input = (const unsigned char *)encore_str_data(value);
+    size_t len = encore_str_size(value);
+    char *output = malloc(len + 1);
+    if (output == NULL) return encore_empty_str();
+    size_t read = 0, written = 0;
+    while (read < len) {
+        if (input[read] != '\\' || read + 1 >= len) {
+            output[written++] = (char)input[read++];
+            continue;
+        }
+        unsigned char escape = input[read + 1];
+        if (escape == 'n' || escape == 't' || escape == 'r' || escape == '\\' || escape == '"') {
+            output[written++] = escape == 'n' ? '\n' : escape == 't' ? '\t' : escape == 'r' ? '\r' : (char)escape;
+            read += 2;
+            continue;
+        }
+        if (escape == 'x' && read + 3 < len) {
+            int high = encore_hex_digit(input[read + 2]);
+            int low = encore_hex_digit(input[read + 3]);
+            if (high >= 0 && low >= 0) {
+                output[written++] = (char)((high << 4) | low);
+                read += 4;
+                continue;
+            }
+        }
+        if (escape == 'u' && read + 3 < len && input[read + 2] == '{') {
+            size_t end = read + 3;
+            uint32_t codepoint = 0;
+            size_t digits = 0;
+            while (end < len && input[end] != '}') {
+                int digit = encore_hex_digit(input[end]);
+                if (digit < 0 || codepoint > 0x10ffffu / 16u) break;
+                codepoint = codepoint * 16u + (uint32_t)digit;
+                digits += 1;
+                end += 1;
+            }
+            if (digits > 0 && end < len && input[end] == '}') {
+                size_t encoded = encore_utf8_encode(codepoint, output + written);
+                if (encoded > 0) {
+                    written += encoded;
+                    read = end + 1;
+                    continue;
+                }
+            }
+        }
+        output[written++] = '\\';
+        output[written++] = (char)escape;
+        read += 2;
+    }
+    output[written] = '\0';
+    return encore_from_owned_buffer(output, written);
 }
 
 static encore_str encore_from_cstr_copy(const char *value) {
@@ -131,6 +426,22 @@ static encore_str encore_from_cstr_copy(const char *value) {
 void *encore_str_from_cstr(const char *value) {
     encore_str result = encore_from_cstr_copy(value);
     return result.object;
+}
+
+encore_str encore_os_core_dir(void) {
+    const char *source = __FILE__;
+    const char *separator = strrchr(source, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(source, '\\');
+    if (backslash != NULL && (separator == NULL || backslash > separator)) separator = backslash;
+#endif
+    if (separator == NULL) return encore_from_cstr_copy(".");
+    size_t len = (size_t)(separator - source);
+    char *buffer = malloc(len + 1);
+    if (buffer == NULL) return encore_empty_str();
+    memcpy(buffer, source, len);
+    buffer[len] = '\0';
+    return encore_from_owned_buffer(buffer, len);
 }
 
 typedef struct {
@@ -164,6 +475,15 @@ encore_str encore_str_join_lines(encore_str_vec lines) {
     return encore_from_owned_buffer(buffer, offset);
 }
 
+encore_str encore_str_join_lines_parts(size_t raw_ptr, size_t len) {
+    encore_str_vec lines = {
+        .ptr = (encore_str *)(uintptr_t)raw_ptr,
+        .len = len,
+        .cap = len,
+    };
+    return encore_str_join_lines(lines);
+}
+
 void encore_str_retain(encore_str value) {
     if (value.object == NULL || value.object->ref_count == 0) {
         return;
@@ -182,7 +502,7 @@ void encore_str_drop(encore_str value) {
     if (value.object->ref_count != 0) {
         return;
     }
-    free(value.object);
+    __ehir_hfree(value.object);
 }
 
 static encore_str encore_format(const char *fmt, ...) {
@@ -324,6 +644,20 @@ static encore_str encore_str_copy_range(encore_str value, size_t start, size_t s
     return encore_from_owned_buffer(buffer, actual_len);
 }
 
+size_t encore_str_char_width_at_byte(encore_str value, size_t byte_index) {
+    size_t len = encore_str_size(value);
+    char *data = encore_str_data(value);
+    if (data == NULL || byte_index >= len) return 0;
+    size_t width = encore_utf8_char_width((uint8_t)data[byte_index]);
+    return byte_index + width <= len ? width : 1;
+}
+
+encore_str encore_str_char_at_byte(encore_str value, size_t byte_index) {
+    size_t width = encore_str_char_width_at_byte(value, byte_index);
+    if (width == 0) return encore_empty_str();
+    return encore_str_copy_range(value, byte_index, width);
+}
+
 encore_str encore_str_slice_bytes(encore_str value, size_t start, size_t byte_len) {
     return encore_str_copy_range(value, start, byte_len);
 }
@@ -437,6 +771,22 @@ encore_str encore_str_concat(encore_str lhs, encore_str rhs) {
     }
 
     return encore_from_owned_buffer(buffer, total_len);
+}
+
+encore_str encore_symbol_sanitize(encore_str value) {
+    size_t len = encore_str_size(value);
+    if (len == 0) return encore_from_cstr_copy("_");
+    const unsigned char *data = (const unsigned char *)encore_str_data(value);
+    char *buffer = malloc(len + 1);
+    if (buffer == NULL) return encore_empty_str();
+    for (size_t index = 0; index < len; ++index) {
+        unsigned char ch = data[index];
+        bool valid = ch == '_' || (ch >= '0' && ch <= '9') ||
+                     (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+        buffer[index] = valid ? (char)ch : '_';
+    }
+    buffer[len] = '\0';
+    return encore_from_owned_buffer(buffer, len);
 }
 
 encore_str encore_fmt_u64(uint64_t value) {

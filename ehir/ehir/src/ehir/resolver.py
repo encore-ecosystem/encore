@@ -24,6 +24,7 @@ from ehir.core.instructions import (
     Instruction_capstruct,
     Instruction_div,
     Instruction_drop,
+    Instruction_retain,
     Instruction_geq,
     Instruction_getfield,
     Instruction_getfieldptr,
@@ -843,7 +844,7 @@ class Resolver:
             # keep pointer-kind
             return self._unify_pair(vars_by_name, instr.var_out, instr.var)
 
-        if isinstance(instr, Instruction_drop):
+        if isinstance(instr, (Instruction_drop, Instruction_retain)):
             return False
 
         return False

@@ -19,6 +19,7 @@ from ehir.core.instructions import (
     Instruction_cpos,
     Instruction_cstruct,
     Instruction_drop,
+    Instruction_retain,
     Instruction_gep,
     Instruction_getfield,
     Instruction_getfieldptr,
@@ -655,6 +656,8 @@ class DeallocatorPass(SimplifierPass):
                 self._captures.pop(instr.var.name, None)
                 initialized.discard(instr.var.name)
                 fresh_owning_vars.discard(instr.var.name)
+            elif isinstance(instr, Instruction_retain):
+                self._add_variable_usage(instr.var)
             elif isinstance(instr, Instruction_pcast):
                 self._add_variable_usage(instr.var)
             elif isinstance(instr, (Instruction_call, Instruction_callvoid)):
@@ -794,6 +797,8 @@ class DeallocatorPass(SimplifierPass):
         if isinstance(instr, Instruction_hfree):
             return [instr.var]
         if isinstance(instr, Instruction_drop):
+            return [instr.var]
+        if isinstance(instr, Instruction_retain):
             return [instr.var]
         if isinstance(instr, Instruction_pcast):
             return [instr.var]
