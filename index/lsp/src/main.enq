@@ -16,6 +16,7 @@ import mod::paths::{uri_to_path, path_to_uri, join_path, ends_with, starts_with}
 import mod::protocol::{
     read_lsp_message,
     send_response,
+    send_error,
     send_notification,
     json_get,
     json_get_str,
@@ -39,6 +40,9 @@ import mod::text::{
     trim_trailing_index,
     min_usize,
     is_identifier_name,
+    utf16_len,
+    utf16_column,
+    character_index_from_utf16,
 }
 import mod::tokens::{is_keyword_token, is_operator_token}
 
@@ -78,6 +82,12 @@ struct ImportRequest {
     length: usize
 }
 
+struct ExpandedImportTarget {
+    target: str
+    alias: Option[str]
+    wildcard: bool
+}
+
 struct ResolvedReference {
     id: str
     label: str
@@ -95,6 +105,7 @@ struct LspDiagnostic {
 }
 
 struct ServerState {
+    initialized: bool
     shutdown_requested: bool
     documents: Vec[Document]
     workspace_roots: Vec[str]
@@ -115,6 +126,7 @@ impl for Document {
 impl for ServerState {
     fn new() -> Self {
         ret Self {
+            false,
             false,
             Vec[Document]::new(),
             Vec[str]::new(),
@@ -283,12 +295,24 @@ fn main() -> u32 {
 fn handle_message(state: mut ServerState, message: Json) -> bool {
     let method = json_get_str(message, "method", "")
     if method == "" {
+        if !json_get(message, "id").is_null() {
+            send_error(json_get(message, "id"), "-32600", "Invalid Request")
+        }
         ret true
     }
 
     if method == "initialize" {
+        if state.initialized {
+            send_error(json_get(message, "id"), "-32600", "Initialize request received more than once")
+            ret true
+        }
         handle_initialize_workspace(state, json_get(message, "params"))
+        state.initialized = true
         send_response(json_get(message, "id"), initialize_result())
+        ret true
+    }
+    if method == "initialized" {
+        index_workspace_roots_shallow(state)
         ret true
     }
     if method == "shutdown" {
@@ -302,6 +326,17 @@ fn handle_message(state: mut ServerState, message: Json) -> bool {
         }
         exit_process(1_i32)
         ret false
+    }
+    if method == "$/cancelRequest" || method == "$/setTrace" {
+        ret true
+    }
+    if !state.initialized {
+        send_error(json_get(message, "id"), "-32002", "Server not initialized")
+        ret true
+    }
+    if state.shutdown_requested {
+        send_error(json_get(message, "id"), "-32600", "Request received after shutdown")
+        ret true
     }
 
     if method == "textDocument/didOpen" {
@@ -318,6 +353,10 @@ fn handle_message(state: mut ServerState, message: Json) -> bool {
     }
     if method == "textDocument/didSave" {
         handle_did_save(state, json_get(message, "params"))
+        ret true
+    }
+    if method == "workspace/didChangeWorkspaceFolders" {
+        handle_workspace_folders_changed(state, json_get(message, "params"))
         ret true
     }
 
@@ -406,8 +445,43 @@ fn handle_message(state: mut ServerState, message: Json) -> bool {
         ret true
     }
 
-    send_response(json_get(message, "id"), Json::Null)
+    send_error(json_get(message, "id"), "-32601", "Method not found: " + method)
     ret true
+}
+
+fn index_workspace_roots_shallow(state: mut ServerState) -> () {
+    state.workspace_documents = Vec[Document]::new()
+    state.workspace_projects = Vec[ProjectRoot]::new()
+    let mut root_index = 0_usize
+    while root_index < state.workspace_roots.len() {
+        match state.workspace_roots.get(root_index) {
+            Some(root) => {
+                discover_workspace_projects_shallow(state, root)
+                if !workspace_root_was_discovered(state, root) { state.discovered_workspace_roots.push(root) }
+            }
+            None => {}
+        }
+        root_index = root_index + 1_usize
+    }
+    let mut project_index = 0_usize
+    while project_index < state.workspace_projects.len() {
+        match state.workspace_projects.get(project_index) {
+            Some(project) => { index_workspace_dir(state, join_path(project.root, "src")) }
+            None => {}
+        }
+        project_index = project_index + 1_usize
+    }
+    if state.workspace_projects.len() == 0_usize {
+        let mut fallback_index = 0_usize
+        while fallback_index < state.workspace_roots.len() {
+            match state.workspace_roots.get(fallback_index) {
+                Some(root) => { index_workspace_dir(state, join_path(root, "src")) }
+                None => {}
+            }
+            fallback_index = fallback_index + 1_usize
+        }
+    }
+    ret ()
 }
 
 fn handle_did_open(state: mut ServerState, params: Json) -> () {
@@ -520,6 +594,58 @@ fn handle_initialize_workspace(state: mut ServerState, params: Json) -> () {
     state.workspace_documents = Vec[Document]::new()
     state.workspace_projects = Vec[ProjectRoot]::new()
     state.discovered_workspace_roots = Vec[str]::new()
+    ret ()
+}
+
+fn handle_workspace_folders_changed(state: mut ServerState, params: Json) -> () {
+    let event = json_get(params, "event")
+    match json_get(event, "removed").as_array() {
+        Some(folders) => {
+            let mut index = 0_usize
+            while index < folders.len() {
+                match folders.get(index) {
+                    Some(folder) => {
+                        let uri = json_get_str(folder, "uri", "")
+                        if uri != "" { remove_workspace_root(state, uri_to_path(uri)) }
+                    }
+                    None => {}
+                }
+                index += 1_usize
+            }
+        }
+        None => {}
+    }
+    match json_get(event, "added").as_array() {
+        Some(folders) => {
+            let mut index = 0_usize
+            while index < folders.len() {
+                match folders.get(index) {
+                    Some(folder) => {
+                        let uri = json_get_str(folder, "uri", "")
+                        if uri != "" { state.add_workspace_root(uri_to_path(uri)) }
+                    }
+                    None => {}
+                }
+                index += 1_usize
+            }
+        }
+        None => {}
+    }
+    index_workspace_roots_shallow(state)
+    ret ()
+}
+
+fn remove_workspace_root(state: mut ServerState, root: str) -> () {
+    let mut roots = Vec[str]::new()
+    let mut index = 0_usize
+    while index < state.workspace_roots.len() {
+        match state.workspace_roots.get(index) {
+            Some(existing) => { if existing != root { roots.push(existing) } }
+            None => {}
+        }
+        index += 1_usize
+    }
+    state.workspace_roots = roots
     ret ()
 }
 
@@ -834,6 +960,13 @@ fn initialize_result() -> Json {
     capabilities.push(field("documentRangeFormattingProvider", Json::Bool(true)))
     capabilities.push(field("callHierarchyProvider", Json::Bool(true)))
     capabilities.push(field("diagnosticProvider", Json::Object(diagnostic_fields)))
+
+    let mut workspace_folders = Vec[(str, Json)]::new()
+    workspace_folders.push(field("supported", Json::Bool(true)))
+    workspace_folders.push(field("changeNotifications", Json::Bool(true)))
+    let mut workspace = Vec[(str, Json)]::new()
+    workspace.push(field("workspaceFolders", Json::Object(workspace_folders)))
+    capabilities.push(field("workspace", Json::Object(workspace)))
 
     let mut server_info = Vec[(str, Json)]::new()
     server_info.push(field("name", Json::String("encore-lsp")))
@@ -1582,7 +1715,7 @@ fn callable_range(doc: Document, callable: FrontendCallable) -> Json {
         }
         index += 1_usize
     }
-    ret make_range(callable.line, callable.column, callable.length)
+    ret lsp_range(doc, callable.line, callable.column, callable.length)
 }
 
 fn call_hierarchy_call_exists(items: Vec[Json], name: str) -> bool {
@@ -2027,7 +2160,7 @@ fn document_links(state: ServerState, params: Json) -> Json {
 
 fn document_link_for_import(state: ServerState, doc: Document, request: ImportRequest) -> Json {
     let mut fields = Vec[(str, Json)]::new()
-    fields.push(field("range", make_range(request.line, request.column, request.length)))
+    fields.push(field("range", lsp_range(doc, request.line, request.column, request.length)))
     match resolve_import_request_uri(state, doc, request) {
         Option[str]::Some(target_uri) => {
             fields.push(field("target", Json::String(target_uri)))
@@ -2089,11 +2222,11 @@ fn import_range(doc: Document, edge: DependencyEdge) -> Json {
     match line_text_at(doc.text, edge.line) {
         Option[str]::Some(line) => {
             let column = find_in_line_at_or_after(line, edge.target, 0_usize)
-            ret make_range(edge.line, column, edge.target.char_len())
+            ret lsp_range(doc, edge.line, column, edge.target.char_len())
         }
         Option[str]::None => {}
     }
-    ret make_range(edge.line, edge.column, edge.length)
+    ret lsp_range(doc, edge.line, edge.column, edge.length)
 }
 
 fn project_name_for_root(root: str) -> str {
@@ -2268,20 +2401,20 @@ fn push_import_requests_from_edge(out: mut Vec[ImportRequest], doc: Document, ed
     let mut index = 0_usize
     while index < items.len() {
         match items.get(index) {
-            Option[(str, Option[str], bool)]::Some(item) => {
+            Option[ExpandedImportTarget]::Some(item) => {
                 match line_text_at(doc.text, edge.line) {
                     Option[str]::Some(line) => {
-                        let label = import_request_label(item.0, item.1, item.2)
+                        let label = import_request_label(item.target, item.alias, item.wildcard)
                         let column = find_in_line_at_or_after(line, label, search_from)
                         search_from = column + label.len()
-                        out.push(ImportRequest{edge.source, item.0, item.1, item.2, edge.line, column, label.len()})
+                        out.push(ImportRequest{edge.source, item.target, item.alias, item.wildcard, edge.line, column, label.len()})
                     }
                     Option[str]::None => {
-                        out.push(ImportRequest{edge.source, item.0, item.1, item.2, edge.line, edge.column, edge.length})
+                        out.push(ImportRequest{edge.source, item.target, item.alias, item.wildcard, edge.line, edge.column, edge.length})
                     }
                 }
             }
-            Option[(str, Option[str], bool)]::None => {}
+            Option[ExpandedImportTarget]::None => {}
         }
         index += 1_usize
     }
@@ -2302,15 +2435,15 @@ fn import_request_label(target: str, alias: Option[str], wildcard: bool) -> str 
     ret out
 }
 
-fn expand_import_path_targets(raw: str) -> Vec[(str, Option[str], bool)] {
+fn expand_import_path_targets(raw: str) -> Vec[ExpandedImportTarget] {
     let cleaned = trim_spaces(raw)
     let brace_start = find_char(cleaned, "{", 0_usize)
     if brace_start >= cleaned.len() {
-        let mut out = Vec[(str, Option[str], bool)]::new()
+        let mut out = Vec[ExpandedImportTarget]::new()
         let stripped = strip_import_suffixes(cleaned)
         let wildcard = ends_with(stripped, "::*")
         let target = if wildcard { stripped.slice(0_usize, stripped.len() - 3_usize) } else { stripped }
-        out.push((target, import_alias(cleaned), wildcard))
+        out.push(ExpandedImportTarget{target, import_alias(cleaned), wildcard})
         ret out
     }
 
@@ -2319,7 +2452,7 @@ fn expand_import_path_targets(raw: str) -> Vec[(str, Option[str], bool)] {
     let inner = cleaned.slice(brace_start + 1_usize, brace_end - brace_start - 1_usize)
     let items = split_top_level_csv(inner)
 
-    let mut out = Vec[(str, Option[str], bool)]::new()
+    let mut out = Vec[ExpandedImportTarget]::new()
     let mut index = 0_usize
     while index < items.len() {
         match items.get(index) {
@@ -2328,10 +2461,10 @@ fn expand_import_path_targets(raw: str) -> Vec[(str, Option[str], bool)] {
                 let mut nested_index = 0_usize
                 while nested_index < nested.len() {
                     match nested.get(nested_index) {
-                        Option[(str, Option[str], bool)]::Some(expanded) => {
+                        Option[ExpandedImportTarget]::Some(expanded) => {
                             out.push(expanded)
                         }
-                        Option[(str, Option[str], bool)]::None => {}
+                        Option[ExpandedImportTarget]::None => {}
                     }
                     nested_index += 1_usize
                 }
@@ -2719,8 +2852,8 @@ fn split_scope_path(value: str) -> Vec[str] {
     let mut out = Vec[str]::new()
     let mut current = ""
     let mut index = 0_usize
-    while index < value.len() {
-        if index + 1_usize < value.len() && value.get(index).unwrap_or("") == ":" && value.get(index + 1_usize).unwrap_or("") == ":" {
+    while index < value.char_len() {
+        if index + 1_usize < value.char_len() && value.get(index).unwrap_or("") == ":" && value.get(index + 1_usize).unwrap_or("") == ":" {
             if current != "" {
                 out.push(current)
                 current = ""
@@ -2740,7 +2873,7 @@ fn split_scope_path(value: str) -> Vec[str] {
 fn find_matching_brace(value: str, start: usize) -> usize {
     let mut depth = 0_usize
     let mut index = start
-    while index < value.len() {
+    while index < value.char_len() {
         let ch = value.get(index).unwrap_or("")
         if ch == "{" {
             depth += 1_usize
@@ -2753,7 +2886,7 @@ fn find_matching_brace(value: str, start: usize) -> usize {
         }
         index += 1_usize
     }
-    ret value.len()
+    ret value.char_len()
 }
 
 fn split_top_level_csv(value: str) -> Vec[str] {
@@ -2761,7 +2894,7 @@ fn split_top_level_csv(value: str) -> Vec[str] {
     let mut current = ""
     let mut depth = 0_usize
     let mut index = 0_usize
-    while index < value.len() {
+    while index < value.char_len() {
         let ch = value.get(index).unwrap_or("")
         if ch == "{" {
             depth += 1_usize
@@ -2788,10 +2921,10 @@ fn split_top_level_csv(value: str) -> Vec[str] {
 
 fn trim_spaces(value: str) -> str {
     let mut start = 0_usize
-    while start < value.len() && is_space(value.get(start).unwrap_or("")) {
+    while start < value.char_len() && is_space(value.get(start).unwrap_or("")) {
         start += 1_usize
     }
-    let mut end = value.len()
+    let mut end = value.char_len()
     while end > start && is_space(value.get(end - 1_usize).unwrap_or("")) {
         end -= 1_usize
     }
@@ -2804,30 +2937,30 @@ fn is_space(ch: str) -> bool {
 
 fn find_char(value: str, needle: str, start: usize) -> usize {
     let mut index = start
-    while index < value.len() {
+    while index < value.char_len() {
         if value.get(index).unwrap_or("") == needle {
             ret index
         }
         index += 1_usize
     }
-    ret value.len()
+    ret value.char_len()
 }
 
 fn find_substring(value: str, needle: str) -> usize {
-    if needle.len() == 0_usize {
+    if needle.char_len() == 0_usize {
         ret 0_usize
     }
-    if needle.len() > value.len() {
-        ret value.len()
+    if needle.char_len() > value.char_len() {
+        ret value.char_len()
     }
     let mut index = 0_usize
-    while index + needle.len() <= value.len() {
-        if value.slice(index, needle.len()) == needle {
+    while index + needle.char_len() <= value.char_len() {
+        if value.slice(index, needle.char_len()) == needle {
             ret index
         }
         index += 1_usize
     }
-    ret value.len()
+    ret value.char_len()
 }
 
 fn folding_ranges(state: ServerState, params: Json) -> Json {
@@ -2903,14 +3036,15 @@ fn selection_ranges(state: ServerState, params: Json) -> Json {
 
 fn selection_range_for_position(doc: Document, position: Json) -> Json {
     let line = json_number_usize(json_get(position, "line"), 0_usize)
-    let character = json_number_usize(json_get(position, "character"), 0_usize)
+    let lsp_character = json_number_usize(json_get(position, "character"), 0_usize)
+    let character = request_character_index(doc, line, lsp_character)
     let mut fields = Vec[(str, Json)]::new()
     match identifier_at(doc, line, character) {
         Option[Token]::Some(token) => {
             fields.push(field("range", token_range(doc, token)))
         }
         Option[Token]::None => {
-            fields.push(field("range", make_range(line, character, 0_usize)))
+            fields.push(field("range", make_range(line, lsp_character, 0_usize)))
         }
     }
     ret Json::Object(fields)
@@ -2927,23 +3061,21 @@ fn semantic_tokens_full(state: ServerState, params: Json) -> Json {
             let last_line = document_last_line(doc.text)
             let mut line = 0_usize
             while line <= last_line {
-                let comment_start = line_comment_start(doc.text, line)
+                let comment_column = match line_comment_start(doc.text, line) {
+                    Option[usize]::Some(value) => value
+                    Option[usize]::None => doc.text.len() + 1_usize
+                }
                 let mut index = 0_usize
                 while index < doc.analysis.tokens.len() {
                     match doc.analysis.tokens.get(index) {
                         Option[Token]::Some(token) => {
                             if token.line == line {
-                                let start = actual_token_column_at_index(doc, index, token)
-                                let mut before_comment = true
-                                match comment_start {
-                                    Option[usize]::Some(comment_column) => {
-                                        before_comment = start < comment_column
-                                    }
-                                    Option[usize]::None => {}
-                                }
+                                let character_start = actual_token_column_at_index(doc, index, token)
+                                let before_comment = character_start < comment_column
                                 if before_comment {
                                     match semantic_token_kind(doc, token, index) {
                                         Option[usize]::Some(kind) => {
+                                            let start = lsp_column(doc, token.line, character_start)
                                             let mut delta_line = token.line
                                             let mut delta_start = start
                                             if !first {
@@ -2954,9 +3086,9 @@ fn semantic_tokens_full(state: ServerState, params: Json) -> Json {
                                             }
                                             data.push(json_usize(delta_line))
                                             data.push(json_usize(delta_start))
-                                            data.push(json_usize(token.value.char_len()))
+                                            data.push(json_usize(utf16_len(token.value)))
                                             data.push(json_usize(kind))
-                                            data.push(json_usize(semantic_token_modifiers(doc, token)))
+                                            data.push(json_usize(semantic_token_modifier_bits(doc, token)))
                                             previous_line = token.line
                                             previous_start = start
                                             first = false
@@ -2970,31 +3102,29 @@ fn semantic_tokens_full(state: ServerState, params: Json) -> Json {
                     }
                     index += 1_usize
                 }
-                match comment_start {
-                    Option[usize]::Some(comment_column) => {
-                        match line_text_at(doc.text, line) {
-                            Option[str]::Some(line_text) => {
+                match line_text_at(doc.text, line) {
+                    Option[str]::Some(line_text) => {
+                        if comment_column <= line_text.char_len() {
                                 let mut delta_line = line
-                                let mut delta_start = comment_column
+                                let lsp_comment_column = utf16_column(line_text, comment_column)
+                                let mut delta_start = lsp_comment_column
                                 if !first {
                                     delta_line = line - previous_line
                                     if delta_line == 0_usize {
-                                        delta_start = comment_column - previous_start
+                                    delta_start = lsp_comment_column - previous_start
                                     }
                                 }
                                 data.push(json_usize(delta_line))
                                 data.push(json_usize(delta_start))
-                                data.push(json_usize(line_text.len() - comment_column))
+                                data.push(json_usize(utf16_len(line_text.slice(comment_column, line_text.char_len() - comment_column))))
                                 data.push(json_usize(10_usize))
                                 data.push(Json::Number("0"))
                                 previous_line = line
-                                previous_start = comment_column
+                                previous_start = lsp_comment_column
                                 first = false
-                            }
-                            Option[str]::None => {}
                         }
                     }
-                    Option[usize]::None => {}
+                    Option[str]::None => {}
                 }
                 if line == last_line {
                     break
@@ -3018,7 +3148,7 @@ fn line_comment_start(text: str, line: usize) -> Option[usize] {
         Option[str]::Some(line_text) => {
             let mut index = 0_usize
             let mut in_string = false
-            while index + 1_usize < line_text.len() {
+            while index + 1_usize < line_text.char_len() {
                 match line_text.get(index) {
                     Option[str]::Some(ch) => {
                         if ch == "\"" {
@@ -3139,7 +3269,7 @@ fn import_path_scan_should_stop(token: Token) -> bool {
     ret false
 }
 
-fn semantic_token_modifiers(doc: Document, token: Token) -> usize {
+fn semantic_token_modifier_bits(doc: Document, token: Token) -> usize {
     if token.type != TokenType::IDENTIFIER {
         ret 0_usize
     }
@@ -3204,8 +3334,8 @@ fn trailing_whitespace_edits(doc: Document, start_line: usize, end_line: usize) 
         match line_text_at(doc.text, line) {
             Option[str]::Some(text) => {
                 let trimmed = trim_trailing_index(text)
-                if trimmed < text.len() {
-                    edits.push(text_edit(range_between(line, trimmed, line, text.len()), ""))
+                if trimmed < text.char_len() {
+                    edits.push(text_edit(range_between(line, utf16_column(text, trimmed), line, utf16_len(text)), ""))
                 }
             }
             Option[str]::None => {}
@@ -3221,7 +3351,7 @@ fn trailing_whitespace_edits(doc: Document, start_line: usize, end_line: usize) 
 fn identifier_at_request(doc: Document, params: Json) -> Option[Token] {
     let position = json_get(params, "position")
     let line = json_number_usize(json_get(position, "line"), 0_usize)
-    let character = json_number_usize(json_get(position, "character"), 0_usize)
+    let character = request_character_index(doc, line, json_number_usize(json_get(position, "character"), 0_usize))
     ret identifier_at(doc, line, character)
 }
 
@@ -3402,7 +3532,7 @@ fn callable_by_name(doc: Document, name: str) -> Option[FrontendCallable] {
 fn active_call_at_request(doc: Document, params: Json) -> Option[(str, usize)] {
     let position = json_get(params, "position")
     let line = json_number_usize(json_get(position, "line"), 0_usize)
-    let character = json_number_usize(json_get(position, "character"), 0_usize)
+    let character = request_character_index(doc, line, json_number_usize(json_get(position, "character"), 0_usize))
     ret active_call_at(doc, line, character)
 }
 
@@ -3550,17 +3680,42 @@ fn symbol_range(doc: Document, symbol: FrontendSymbol) -> Json {
         }
         index += 1_usize
     }
-    ret make_range(symbol.line, symbol.column, symbol.length)
+    ret lsp_range(doc, symbol.line, symbol.column, symbol.length)
 }
 
 fn token_range(doc: Document, token: Token) -> Json {
     let column = actual_token_column(doc, token)
-    ret make_range(token.line, column, token.value.char_len())
+    ret lsp_range(doc, token.line, column, token.value.char_len())
 }
 
 fn token_range_at_index(doc: Document, token_index: usize, token: Token) -> Json {
     let column = actual_token_column_at_index(doc, token_index, token)
-    ret make_range(token.line, column, token.value.char_len())
+    ret lsp_range(doc, token.line, column, token.value.char_len())
+}
+
+fn request_character_index(doc: Document, line: usize, lsp_character: usize) -> usize {
+    match line_text_at(doc.text, line) {
+        Some(text) => { ret character_index_from_utf16(text, lsp_character) }
+        None => { ret lsp_character }
+    }
+}
+
+fn lsp_column(doc: Document, line: usize, character: usize) -> usize {
+    match line_text_at(doc.text, line) {
+        Some(text) => { ret utf16_column(text, character) }
+        None => { ret character }
+    }
+}
+
+fn lsp_range(doc: Document, line: usize, character: usize, length: usize) -> Json {
+    match line_text_at(doc.text, line) {
+        Some(text) => {
+            let start = utf16_column(text, character)
+            let end = utf16_column(text, character + length)
+            ret range_between(line, start, line, end)
+        }
+        None => { ret make_range(line, character, length) }
+    }
 }
 
 fn actual_token_column(doc: Document, token: Token) -> usize {
@@ -3714,7 +3869,7 @@ fn push_unresolved_import_diagnostics(state: ServerState, items: mut Vec[LspDiag
                     else {
                         "unresolved import '" + request.target + "'"
                     }
-                    items.push(LspDiagnostic{make_range(request.line, request.column, request.length), 1_usize, "unresolved-import", message})
+                    items.push(LspDiagnostic{lsp_range(doc, request.line, request.column, request.length), 1_usize, "unresolved-import", message})
                 }
             }
             Option[ImportRequest]::None => {}
@@ -4105,12 +4260,12 @@ fn diagnostic_range(doc: Document, diagnostic: FrontendDiagnostic) -> Json {
     if starts_with(diagnostic.code, "unclosed-") {
         match line_text_at(doc.text, diagnostic.line) {
             Option[str]::Some(line) => {
-                ret make_range(diagnostic.line, line.len(), 1_usize)
+                ret range_between(diagnostic.line, utf16_len(line), diagnostic.line, utf16_len(line) + 1_usize)
             }
             Option[str]::None => {}
         }
     }
-    ret make_range(diagnostic.line, diagnostic.column, diagnostic.length)
+    ret lsp_range(doc, diagnostic.line, diagnostic.column, diagnostic.length)
 }
 
 fn request_uri(params: Json) -> str {

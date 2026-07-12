@@ -6,6 +6,7 @@ Current server capabilities:
 
 - JSON-RPC framing over stdio.
 - `initialize`, `shutdown`, `exit`.
+- Multi-root workspaces and `workspace/didChangeWorkspaceFolders`.
 - `textDocument/didOpen`, `textDocument/didChange`, `textDocument/didSave`, `textDocument/didClose`.
 - `textDocument/definition` and `textDocument/declaration` for symbols in open documents, indexed workspace files and resolved workspace imports.
 - `textDocument/implementation` for `impl Type` / `impl Trait` symbols in open documents and indexed workspace files.
@@ -33,9 +34,21 @@ Current server capabilities:
 - `src/text.enq`: text scanning, range support and identifier utilities.
 - `src/tokens.enq`: Encore token classification helpers for semantic tokens.
 
-Run from this directory:
+Build and run with the native compiler from this directory:
 
 ```sh
-uv run encore-py build
-./target/debug/lsp
+../encore/target/debug/encore build --profile release
+./target/release/lsp
+```
+
+The server communicates over stdio. Configure an editor client with the
+absolute path to `target/release/lsp`; no Python runtime or wrapper process is
+required. LSP positions and ranges use UTF-16 as required by the protocol, and
+message `Content-Length` is measured in UTF-8 bytes.
+
+Run the protocol and feature integration suites with:
+
+```sh
+ruby tests/protocol.rb target/release/lsp
+ruby tests/integration.rb target/release/lsp
 ```

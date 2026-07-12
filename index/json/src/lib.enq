@@ -3,6 +3,8 @@ import core::option::Option
 import core::result::Result
 import core::vec::Vec
 
+extern fn encore_str_from_codepoint(value: usize) -> str
+
 pub enum Json {
     Null
     Bool(bool)
@@ -131,7 +133,7 @@ pub fn parse(source: str) -> Result[Json, ParseError] {
     match parse_value(skip_ws(parser)) {
         Result[(Json, JsonParser), ParseError]::Ok(pair) => {
             let rest = skip_ws(pair.1)
-            if rest.index != rest.source.len() {
+            if rest.index != rest.source.byte_len() {
                 ret Result[Json, ParseError]::Err(ParseError::new("trailing characters after JSON value", rest.index))
             }
             ret Result[Json, ParseError]::Ok(pair.0)
@@ -186,7 +188,7 @@ fn object_get(fields: Vec[(str, Json)], key: str) -> Option[Json] {
 
 fn parse_value(parser: JsonParser) -> Result[(Json, JsonParser), ParseError] {
     let current = skip_ws(parser)
-    if current.index >= current.source.len() {
+    if current.index >= current.source.byte_len() {
         ret Result[(Json, JsonParser), ParseError]::Err(ParseError::new("expected JSON value", current.index))
     }
 
@@ -308,7 +310,7 @@ fn parse_string(parser: JsonParser) -> Result[(str, JsonParser), ParseError] {
     let mut out = ""
     let mut current = advance(parser, 1_usize)
     let mut segment_start = current.index
-    while current.index < current.source.len() {
+    while current.index < current.source.byte_len() {
         let b = current.source.byte_at(current.index)
         if b == 34_u8 {
             if current.index > segment_start {
@@ -320,7 +322,7 @@ fn parse_string(parser: JsonParser) -> Result[(str, JsonParser), ParseError] {
             if current.index > segment_start {
                 out += current.source.slice_bytes(segment_start, current.index - segment_start)
             }
-            if current.index + 1_usize >= current.source.len() {
+            if current.index + 1_usize >= current.source.byte_len() {
                 ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("unterminated escape sequence", current.index))
             }
             let esc = current.source.byte_at(current.index + 1_usize)
@@ -387,7 +389,9 @@ fn parse_string(parser: JsonParser) -> Result[(str, JsonParser), ParseError] {
             }
             ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("invalid escape sequence", current.index))
         }
-        if b < 32_u8 {
+        // Compare after widening: native i8 ordering is signed, so a direct
+        // comparison would misclassify every UTF-8 lead byte >= 0x80.
+        if (b as usize) < 32_usize {
             ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("control character in string", current.index))
         }
         current = advance(current, 1_usize)
@@ -396,7 +400,7 @@ fn parse_string(parser: JsonParser) -> Result[(str, JsonParser), ParseError] {
 }
 
 fn parse_unicode_escape(parser: JsonParser) -> Result[(str, JsonParser), ParseError] {
-    if parser.index + 6_usize > parser.source.len() {
+    if parser.index + 6_usize > parser.source.byte_len() {
         ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("incomplete unicode escape", parser.index))
     }
 
@@ -412,10 +416,32 @@ fn parse_unicode_escape(parser: JsonParser) -> Result[(str, JsonParser), ParseEr
         i += 1_usize
     }
 
-    if code < 128_usize {
-        ret ok_str_parser(ascii_code_to_str(code), advance(parser, 6_usize))
+    let mut next = advance(parser, 6_usize)
+    if code >= 55296_usize && code <= 56319_usize {
+        if next.index + 6_usize > next.source.byte_len() || next.source.byte_at(next.index) != 92_u8 || next.source.byte_at(next.index + 1_usize) != 117_u8 {
+            ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("missing low surrogate", parser.index))
+        }
+        let low_hex = next.source.slice_bytes(next.index + 2_usize, 4_usize)
+        let mut low = 0_usize
+        let mut low_index = 0_usize
+        while low_index < 4_usize {
+            let b = low_hex.byte_at(low_index)
+            if !is_hex_digit(b) {
+                ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("invalid low surrogate", next.index))
+            }
+            low = low * 16_usize + hex_value(b)
+            low_index += 1_usize
+        }
+        if low < 56320_usize || low > 57343_usize {
+            ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("invalid low surrogate", next.index))
+        }
+        code = 65536_usize + ((code - 55296_usize) * 1024_usize) + (low - 56320_usize)
+        next = advance(next, 6_usize)
     }
-    ret ok_str_parser("\\u" + hex, advance(parser, 6_usize))
+    elif code >= 56320_usize && code <= 57343_usize {
+        ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("unexpected low surrogate", parser.index))
+    }
+    ret ok_str_parser(unsafe { encore_str_from_codepoint(code) }, next)
 }
 
 fn parse_number(parser: JsonParser) -> Result[(Json, JsonParser), ParseError] {
@@ -425,7 +451,7 @@ fn parse_number(parser: JsonParser) -> Result[(Json, JsonParser), ParseError] {
         current = advance(current, 1_usize)
     }
 
-    if current.index >= current.source.len() {
+    if current.index >= current.source.byte_len() {
         ret Result[(Json, JsonParser), ParseError]::Err(ParseError::new("invalid number", start))
     }
 
@@ -433,7 +459,7 @@ fn parse_number(parser: JsonParser) -> Result[(Json, JsonParser), ParseError] {
         current = advance(current, 1_usize)
     }
     elif is_digit(peek_byte(current)) {
-        while current.index < current.source.len() {
+        while current.index < current.source.byte_len() {
             if !is_digit(peek_byte(current)) {
                 break
             }
@@ -449,7 +475,7 @@ fn parse_number(parser: JsonParser) -> Result[(Json, JsonParser), ParseError] {
         if !is_digit(peek_byte(current)) {
             ret Result[(Json, JsonParser), ParseError]::Err(ParseError::new("invalid fraction", current.index))
         }
-        while current.index < current.source.len() {
+        while current.index < current.source.byte_len() {
             if !is_digit(peek_byte(current)) {
                 break
             }
@@ -495,7 +521,7 @@ fn parse_exponent(parser: JsonParser) -> Result[JsonParser, ParseError] {
     if !is_digit(peek_byte(current)) {
         ret Result[JsonParser, ParseError]::Err(ParseError::new("invalid exponent", current.index))
     }
-    while current.index < current.source.len() {
+    while current.index < current.source.byte_len() {
         if !is_digit(peek_byte(current)) {
             break
         }
@@ -589,7 +615,7 @@ fn escape_string(value: str) -> str {
 
 fn skip_ws(parser: JsonParser) -> JsonParser {
     let mut index = parser.index
-    while index < parser.source.len() {
+    while index < parser.source.byte_len() {
         let b = parser.source.byte_at(index)
         if !is_ws(b) {
             break
@@ -604,7 +630,7 @@ fn advance(parser: JsonParser, count: usize) -> JsonParser {
 }
 
 fn peek_byte(parser: JsonParser) -> u8 {
-    if parser.index >= parser.source.len() {
+    if parser.index >= parser.source.byte_len() {
         ret 0_u8
     }
     ret parser.source.byte_at(parser.index)

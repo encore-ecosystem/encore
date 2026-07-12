@@ -355,6 +355,18 @@ static size_t encore_utf8_encode(uint32_t value, char *out) {
     return 0;
 }
 
+encore_str encore_str_from_codepoint(size_t value) {
+    char *buffer = malloc(5);
+    if (buffer == NULL) return encore_empty_str();
+    size_t encoded = encore_utf8_encode((uint32_t)value, buffer);
+    if (encoded == 0) {
+        free(buffer);
+        return encore_empty_str();
+    }
+    buffer[encoded] = '\0';
+    return encore_from_owned_buffer(buffer, encoded);
+}
+
 encore_str encore_unescape_string_literal(encore_str value) {
     const unsigned char *input = (const unsigned char *)encore_str_data(value);
     size_t len = encore_str_size(value);
