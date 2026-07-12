@@ -3,6 +3,9 @@ import core::option::Option
 import std::io::println
 import std::os::write_file
 import std::os::core_dir
+import std::os::remove_file
+import std::os::argc
+import std::os::argv
 import std::path::Path
 import std::process::run
 import std::vec::Vec
@@ -25,6 +28,15 @@ pub fn run_frontend_build() -> u32 {
 }
 
 pub fn compile_project(root: Path) -> u32 {
+    ret compile_project_with_profile(root, requested_profile("debug"))
+}
+
+pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
+    let profile = normalize_profile(requested)
+    if profile == "" {
+        println(status_fail("Unknown optimization profile: " + requested))
+        ret 1_u32
+    }
     let workspace = load_binary_workspace(root)
     let ast = workspace.flat_ast
 
@@ -45,6 +57,15 @@ pub fn compile_project(root: Path) -> u32 {
         }
     }
 
+    let target_dir = root.join("target")
+    let profile_dir = target_dir.join(profile)
+    if run("mkdir -p " + shell_quote(native_path(profile_dir.as_str()))) != 0_i32 {
+        println(status_fail("Failed to create target directory"))
+        ret 1_u32
+    }
+    remove_file(native_path(root.join("target.bootstrap.ehir").as_str()))
+    remove_file(native_path(root.join("target.bootstrap.ll").as_str()))
+
     println(status(Spinner::dots(), 1_usize, "Bootstrap semantic checks"))
     if !run_workspace_semantic_checks(workspace.modules) {
         println(status_fail("Semantic checks failed"))
@@ -53,7 +74,7 @@ pub fn compile_project(root: Path) -> u32 {
 
     println(status(Spinner::dots(), 2_usize, "Bootstrap EHIR translation"))
     let ehir_text = translate_to_ehir(ast)
-    let out_path = root.join("target.bootstrap.ehir")
+    let out_path = profile_dir.join(project_name + ".ehir")
     let write_code = write_file(native_path(out_path.as_str()), ehir_text)
     if write_code != 0_i32 {
         println(status_fail("Failed to write translated EHIR"))
@@ -64,7 +85,7 @@ pub fn compile_project(root: Path) -> u32 {
     println(status(Spinner::dots(), 3_usize, "Bootstrap LLVM lowering"))
     let ehir_module = parse_module_text("encore_bootstrap", ehir_text)
     let llvm_text = emit_ir(ehir_module)
-    let llvm_path = root.join("target.bootstrap.ll")
+    let llvm_path = profile_dir.join(project_name + ".ll")
     let llvm_write_code = write_file(native_path(llvm_path.as_str()), llvm_text)
     if llvm_write_code != 0_i32 {
         println(status_fail("Failed to write translated LLVM IR"))
@@ -73,15 +94,9 @@ pub fn compile_project(root: Path) -> u32 {
     println("llvm out: " + llvm_path.as_str())
 
     println(status(Spinner::dots(), 4_usize, "Bootstrap native link"))
-    let target_dir = root.join("target")
-    let debug_dir = target_dir.join("debug")
-    if run("mkdir -p " + shell_quote(native_path(debug_dir.as_str()))) != 0_i32 {
-        println(status_fail("Failed to create target directory"))
-        ret 1_u32
-    }
-    let binary_path = debug_dir.join(project_name)
+    let binary_path = profile_dir.join(project_name)
     let runtime_path = Path::new(core_dir()).join("runtime.c").resolve()
-    let clang_command = "clang -O3 " + shell_quote(native_path(llvm_path.as_str())) + " " + shell_quote(native_path(runtime_path.as_str())) + " -o " + shell_quote(native_path(binary_path.as_str()))
+    let clang_command = "clang " + clang_profile_flags(profile) + " " + shell_quote(native_path(llvm_path.as_str())) + " " + shell_quote(native_path(runtime_path.as_str())) + " -o " + shell_quote(native_path(binary_path.as_str()))
     let clang_code = run(clang_command)
     if clang_code != 0_i32 {
         println(status_fail("LLVM assembly or native link failed"))
@@ -91,6 +106,38 @@ pub fn compile_project(root: Path) -> u32 {
 
     println(status_ok("Self-hosted frontend and LLVM pipeline complete"))
     ret 0_u32
+}
+
+pub fn requested_profile(fallback: str) -> str {
+    let mut profile = fallback
+    let mut index = 2_usize
+    while index < argc() {
+        match argv(index) {
+            Some(arg) => {
+                if arg == "--" { ret profile }
+                if arg == "--release" { profile = "release" }
+                elif arg == "--debug" { profile = "debug" }
+                elif (arg == "--profile" || arg == "--opt-profile") && index + 1_usize < argc() {
+                    match argv(index + 1_usize) { Some(value) => { profile = value } None => {} }
+                    index = index + 1_usize
+                }
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret profile
+}
+
+fn normalize_profile(profile: str) -> str {
+    if profile == "debug" || profile == "release" || profile == "extreme" { ret profile }
+    ret ""
+}
+
+fn clang_profile_flags(profile: str) -> str {
+    if profile == "debug" { ret "-O0 -g" }
+    if profile == "release" { ret "-O2" }
+    ret "-O3"
 }
 
 pub fn compile_test_ast(root: Path, ast: Vec[Statement], binary_name: str) -> u32 {
