@@ -45,13 +45,18 @@ void *__ehir_pcast(size_t value) {
 
 #if defined(ENCORE_ADDRESS_SANITIZER)
 void *__ehir_hrealloc(void *ptr, size_t bytes) { return realloc(ptr, bytes); }
+
 void __ehir_hfree(void *ptr) { free(ptr); }
+void encore_heap_retain(void *ptr) { (void)ptr; }
+bool encore_heap_release(void *ptr) { (void)ptr; return true; }
 #else
 typedef union encore_heap_block encore_heap_block;
 union encore_heap_block {
     struct {
         size_t capacity;
+        size_t refs;
         encore_heap_block *next;
+        encore_heap_block *all_next;
     } meta;
     max_align_t alignment;
 };
@@ -59,7 +64,20 @@ union encore_heap_block {
 #define ENCORE_HEAP_MIN_SHIFT 4u
 #define ENCORE_HEAP_CLASS_COUNT 13u
 static encore_heap_block *g_heap_free_lists[ENCORE_HEAP_CLASS_COUNT];
+static encore_heap_block *g_heap_blocks;
+static bool g_heap_cleanup_registered;
 void __ehir_hfree(void *ptr);
+
+static void encore_heap_cleanup(void) {
+    encore_heap_block *block = g_heap_blocks;
+    while (block != NULL) {
+        encore_heap_block *next = block->meta.all_next;
+        free(block);
+        block = next;
+    }
+    g_heap_blocks = NULL;
+    memset(g_heap_free_lists, 0, sizeof(g_heap_free_lists));
+}
 
 static size_t encore_heap_class(size_t bytes) {
     size_t capacity = (size_t)1u << ENCORE_HEAP_MIN_SHIFT;
@@ -72,6 +90,10 @@ static size_t encore_heap_class(size_t bytes) {
 }
 
 static void *encore_heap_alloc(size_t bytes) {
+    if (!g_heap_cleanup_registered) {
+        atexit(encore_heap_cleanup);
+        g_heap_cleanup_registered = true;
+    }
     if (bytes == 0) bytes = 1;
     size_t class_index = encore_heap_class(bytes);
     size_t capacity = bytes;
@@ -81,9 +103,16 @@ static void *encore_heap_alloc(size_t bytes) {
         block = g_heap_free_lists[class_index];
         if (block != NULL) g_heap_free_lists[class_index] = block->meta.next;
     }
-    if (block == NULL) block = malloc(sizeof(encore_heap_block) + capacity);
+    if (block == NULL) {
+        block = malloc(sizeof(encore_heap_block) + capacity);
+        if (block != NULL) {
+            block->meta.all_next = g_heap_blocks;
+            g_heap_blocks = block;
+        }
+    }
     if (block == NULL) return NULL;
     block->meta.capacity = capacity;
+    block->meta.refs = 1;
     block->meta.next = NULL;
     return block + 1;
 }
@@ -100,18 +129,78 @@ void *__ehir_hrealloc(void *ptr, size_t bytes) {
 }
 
 void __ehir_hfree(void *ptr) {
+    /* Values are copied by value in EHIR, so an alias can outlive the local
+     * which requested the drop. The arena owns the storage until process
+     * teardown; logical drops still release nested ref-counted values. */
+    (void)ptr;
+}
+
+void encore_heap_retain(void *ptr) {
     if (ptr == NULL) return;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
-    size_t class_index = encore_heap_class(block->meta.capacity);
-    if (class_index < ENCORE_HEAP_CLASS_COUNT &&
-        block->meta.capacity == ((size_t)1u << (ENCORE_HEAP_MIN_SHIFT + class_index))) {
-        block->meta.next = g_heap_free_lists[class_index];
-        g_heap_free_lists[class_index] = block;
-        return;
+    block->meta.refs += 1;
+}
+
+bool encore_heap_release(void *ptr) {
+    if (ptr == NULL) return false;
+    encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
+    if (block->meta.refs > 1) {
+        block->meta.refs -= 1;
+        return false;
     }
-    free(block);
+    return true;
 }
 #endif
+
+typedef union {
+    struct {
+        size_t refs;
+        union encore_box_header_tag *next;
+    } meta;
+    max_align_t alignment;
+} encore_box_header;
+
+/* Enum/dynamic payloads use a tiny ref-counted arena. Keeping released nodes in
+ * the arena avoids allocator churn and lets the process teardown reclaim any
+ * payload still live because the program returned early. */
+static encore_box_header *g_box_headers;
+static bool g_box_cleanup_registered;
+
+static void encore_box_cleanup(void) {
+    encore_box_header *header = g_box_headers;
+    while (header != NULL) {
+        encore_box_header *next = (encore_box_header *)header->meta.next;
+        free(header);
+        header = next;
+    }
+    g_box_headers = NULL;
+}
+
+void *encore_box_alloc(size_t bytes) {
+    encore_box_header *header = malloc(sizeof(encore_box_header) + bytes);
+    if (header == NULL) return NULL;
+    if (!g_box_cleanup_registered) {
+        atexit(encore_box_cleanup);
+        g_box_cleanup_registered = true;
+    }
+    header->meta.refs = 1;
+    header->meta.next = (union encore_box_header_tag *)g_box_headers;
+    g_box_headers = header;
+    return (void *)(header + 1);
+}
+
+void encore_box_retain(void *payload) {
+    if (payload == NULL) return;
+    encore_box_header *header = ((encore_box_header *)payload) - 1;
+    header->meta.refs += 1;
+}
+
+void encore_box_drop(void *payload) {
+    if (payload == NULL) return;
+    encore_box_header *header = ((encore_box_header *)payload) - 1;
+    if (header->meta.refs > 1) { header->meta.refs -= 1; return; }
+    header->meta.refs = 0;
+}
 
 typedef struct {
     size_t ref_count;
@@ -365,6 +454,26 @@ encore_str encore_str_from_codepoint(size_t value) {
     }
     buffer[encoded] = '\0';
     return encore_from_owned_buffer(buffer, encoded);
+}
+
+encore_str encore_llvm_float_literal(encore_str value, size_t is_f32) {
+    size_t len = encore_str_size(value);
+    char *input = malloc(len + 1);
+    if (input == NULL) return encore_empty_str();
+    memcpy(input, encore_str_data(value), len);
+    input[len] = '\0';
+    double parsed = strtod(input, NULL);
+    free(input);
+    char *buffer = malloc(32);
+    if (buffer == NULL) return encore_empty_str();
+    union { double number; uint64_t bits; } encoded;
+    encoded.number = is_f32 ? (double)(float)parsed : parsed;
+    int written = snprintf(buffer, 32, "0x%016" PRIX64, encoded.bits);
+    if (written <= 0) {
+        free(buffer);
+        return encore_empty_str();
+    }
+    return encore_from_owned_buffer(buffer, (size_t)written);
 }
 
 encore_str encore_unescape_string_literal(encore_str value) {
@@ -1207,7 +1316,10 @@ int32_t encore_net_tcp_close(int32_t fd) {
 }
 
 int32_t encore_proc_exit(int32_t code) {
-    exit(code);
+    /* The Encore standard library also exports a function named `exit`.
+       Calling libc's exit here can therefore bind back to the generated
+       symbol and recurse forever. `_Exit` has no generated-name collision. */
+    _Exit(code);
     return code;
 }
 

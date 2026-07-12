@@ -1,5 +1,6 @@
 import refrain::frontend::lexer::Token
 import refrain::frontend::lexer::TokenType
+import refrain::frontend::lexer::Lexer
 
 import mod::statements::*
 
@@ -9,6 +10,129 @@ import core::option::Option
 import std::io::println
 import std::vec::Vec
 
+struct MacroArgument {
+    tokens: Vec[Token]
+}
+
+fn required_macro_token(tokens: Vec[Token], index: usize) -> Token {
+    match tokens.get(index) { Some(token) => { ret token } None => { panic("Malformed macro token stream at " + Debug::fmt(index) + "/" + Debug::fmt(tokens.len())) } }
+    ret Token::new(TokenType::UNKNOWN, "", 0_usize, 0_usize)
+}
+fn macro_token_value_or_empty(tokens: Vec[Token], index: usize) -> str { match tokens.get(index) { Some(token) => { ret token.value } None => { ret "" } } }
+fn macro_token_is_identifier(tokens: Vec[Token], index: usize) -> bool { match tokens.get(index) { Some(token) => { ret token.type == TokenType::IDENTIFIER } None => { ret false } } }
+
+fn macro_is_open(value: str) -> bool { ret value == "(" || value == "[" || value == "{" }
+fn macro_close_for(value: str) -> str {
+    if value == "(" { ret ")" }
+    if value == "[" { ret "]" }
+    if value == "{" { ret "}" }
+    ret ""
+}
+
+fn macro_matching_close(tokens: Vec[Token], open: usize) -> usize {
+    let opening = required_macro_token(tokens, open).value
+    let closing = macro_close_for(opening)
+    if closing == "" { panic("Macro delimiter expected") }
+    let mut depth = 1_usize
+    let mut index = open + 1_usize
+    while index < tokens.len() {
+        let value = required_macro_token(tokens, index).value
+        if value == opening { depth = depth + 1_usize }
+        elif value == closing {
+            depth = depth - 1_usize
+            if depth == 0_usize { ret index }
+        }
+        index = index + 1_usize
+    }
+    panic("Unclosed macro delimiter")
+    ret tokens.len()
+}
+
+fn macro_split_arguments(tokens: Vec[Token], start: usize, end: usize) -> Vec[MacroArgument] {
+    let mut out = Vec[MacroArgument]::new()
+    if start >= end { ret out }
+    let mut current = Vec[Token]::new()
+    let mut depth = 0_usize
+    let mut index = start
+    while index < end {
+        let token = required_macro_token(tokens, index)
+        if macro_is_open(token.value) { depth = depth + 1_usize }
+        elif token.value == ")" || token.value == "]" || token.value == "}" { if depth > 0_usize { depth = depth - 1_usize } }
+        if token.value == "," && depth == 0_usize {
+            out.push(MacroArgument{current})
+            current = Vec[Token]::new()
+        } else { current.push(token) }
+        index = index + 1_usize
+    }
+    out.push(MacroArgument{current})
+    ret out
+}
+
+fn macro_argument_for(definition: BootstrapMacro, args: Vec[MacroArgument], name: str) -> Vec[Token] {
+    let mut index = 0_usize
+    while index < definition.params.len() {
+        match definition.params.get(index) {
+            Some(param) => { if param == name { match args.get(index) { Some(arg) => { ret arg.tokens } None => {} } } }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret Vec[Token]::new()
+}
+
+fn expand_macro_template_once(definition: BootstrapMacro, template: Vec[Token], args: Vec[MacroArgument]) -> Vec[Token] {
+    let mut out = Vec[Token]::new()
+    let mut index = 0_usize
+    while index < template.len() {
+        let token = required_macro_token(template, index)
+        if token.value == "$" && index + 1_usize < template.len() {
+            let name = required_macro_token(template, index + 1_usize).value
+            if name != "(" {
+                out.extend(macro_argument_for(definition, args, name))
+                index = index + 2_usize
+                continue
+            }
+        }
+        out.push(token)
+        index = index + 1_usize
+    }
+    ret out
+}
+
+fn expand_bootstrap_macro(definition: BootstrapMacro, args: Vec[MacroArgument]) -> Vec[Token] {
+    if !definition.variadic { ret expand_macro_template_once(definition, definition.template, args) }
+    let template = definition.template
+    let mut repeat_open = template.len()
+    let mut index = 0_usize
+    while index + 1_usize < template.len() {
+        if required_macro_token(template, index).value == "$" && required_macro_token(template, index + 1_usize).value == "(" { repeat_open = index + 1_usize break }
+        index = index + 1_usize
+    }
+    if repeat_open >= template.len() { ret expand_macro_template_once(definition, template, args) }
+    let repeat_close = macro_matching_close(template, repeat_open)
+    let mut body = Vec[Token]::new()
+    index = repeat_open + 1_usize
+    while index < repeat_close { body.push(required_macro_token(template, index)) index = index + 1_usize }
+    let mut out = Vec[Token]::new()
+    index = 0_usize
+    while index + 1_usize < args.len() || index < args.len() {
+        let mut single_args = Vec[MacroArgument]::new()
+        match args.get(index) { Some(arg) => { single_args.push(arg) } None => {} }
+        out.extend(expand_macro_template_once(definition, body, single_args))
+        if index + 1_usize < args.len() && repeat_close + 1_usize < template.len() {
+            out.push(required_macro_token(template, repeat_close + 1_usize))
+        }
+        index = index + 1_usize
+    }
+    ret out
+}
+
+struct BootstrapMacro {
+    name: str
+    params: Vec[str]
+    template: Vec[Token]
+    variadic: bool
+}
 
 pub struct Parser {
     tokens: Vec[Token]
@@ -16,6 +140,8 @@ pub struct Parser {
     ast: Vec[Statement]
     parsing_match_header: bool
     parsing_control_flow_header: bool
+    parsing_with_binding_expr: bool
+    macros: Vec[BootstrapMacro]
 }
 
 
@@ -26,16 +152,20 @@ impl for Parser {
             0_usize,
             Vec[Statement]::new(),
             false,
-            false
+            false,
+            false,
+            Vec[BootstrapMacro]::new()
         }
     }
 
     pub fn parse(mut self, tokens: Vec[Token]) -> Vec[Statement] {
-        self.tokens = tokens
+        self.macros = Vec[BootstrapMacro]::new()
+        self.tokens = self.expand_macro_program(tokens)
         self.consumed = 0_usize
         self.ast = Vec[Statement]::new()
         self.parsing_match_header = false
         self.parsing_control_flow_header = false
+        self.parsing_with_binding_expr = false
 
         loop {
             if self.is_at_end() {
@@ -46,6 +176,84 @@ impl for Parser {
         }
 
         ret self.ast
+    }
+
+    fn expand_macro_program(mut self, input: Vec[Token]) -> Vec[Token] {
+        let mut cleaned = Vec[Token]::new()
+        let mut index = 0_usize
+        while index < input.len() {
+            let token = required_macro_token(input, index)
+            if token.type == TokenType::IDENTIFIER && token.value == "macro_" + "rules" && index + 3_usize < input.len()
+                && macro_token_value_or_empty(input, index + 1_usize) == "!"
+                && macro_token_is_identifier(input, index + 2_usize)
+                && macro_token_value_or_empty(input, index + 3_usize) == "{" {
+                let name = required_macro_token(input, index + 2_usize).value
+                let outer_open = index + 3_usize
+                let outer_close = macro_matching_close(input, outer_open)
+                let pattern_open = outer_open + 1_usize
+                let pattern_close = macro_matching_close(input, pattern_open)
+                let mut template_open = pattern_close + 1_usize
+                while template_open < outer_close && !macro_is_open(required_macro_token(input, template_open).value) { template_open = template_open + 1_usize }
+                let template_close = macro_matching_close(input, template_open)
+                let mut params = Vec[str]::new()
+                let mut variadic = false
+                let mut scan = pattern_open + 1_usize
+                while scan < pattern_close {
+                    if required_macro_token(input, scan).value == "$" && scan + 1_usize < pattern_close {
+                        let next = required_macro_token(input, scan + 1_usize).value
+                        if next == "(" { variadic = true }
+                        elif next != "$" { params.push(next) }
+                    }
+                    scan = scan + 1_usize
+                }
+                let mut template = Vec[Token]::new()
+                scan = template_open + 1_usize
+                while scan < template_close { template.push(required_macro_token(input, scan)) scan = scan + 1_usize }
+                self.macros.push(BootstrapMacro{name, params, template, variadic})
+                index = outer_close + 1_usize
+                continue
+            }
+            cleaned.push(token)
+            index = index + 1_usize
+        }
+
+        if self.macros.len() == 0_usize { ret cleaned }
+        let mut round = 0_usize
+        while round < 32_usize {
+            let expanded = self.expand_macro_round(cleaned)
+            cleaned = expanded.0
+            if !expanded.1 { break }
+            round = round + 1_usize
+        }
+        ret cleaned
+    }
+
+    fn expand_macro_round(mut self, input: Vec[Token]) -> (Vec[Token], bool) {
+        let mut out = Vec[Token]::new()
+        let mut changed = false
+        let mut index = 0_usize
+        while index < input.len() {
+            let token = required_macro_token(input, index)
+            let mut found = Option[BootstrapMacro]::None
+            if token.type == TokenType::IDENTIFIER && index + 2_usize < input.len() && macro_token_value_or_empty(input, index + 1_usize) == "!" && macro_is_open(macro_token_value_or_empty(input, index + 2_usize)) {
+                for definition in self.macros { if definition.name == token.value { found = Option[BootstrapMacro]::Some(definition) } }
+            }
+            match found {
+                Some(definition) => {
+                    let open = index + 2_usize
+                    let close = macro_matching_close(input, open)
+                    let args = macro_split_arguments(input, open + 1_usize, close)
+                    out.extend(expand_bootstrap_macro(definition, args))
+                    index = close + 1_usize
+                    changed = true
+                    continue
+                }
+                None => {}
+            }
+            out.push(token)
+            index = index + 1_usize
+        }
+        ret (out, changed)
     }
 
     fn mk_expr(mut self, value: Expr) -> ExprNode {
@@ -90,11 +298,29 @@ impl for Parser {
             TokenType::KW_EXTERN => {
                 ret self.parse_extern(is_public, attrs)
             }
+            TokenType::KW_LET => {
+                ret self.parse_global_constant(is_public)
+            }
             _ => {
                 self.unexpected_token("top-level statement", curr_token)
                 ret Statement::Import(ImportStmt{false, ""})
             }
         }
+    }
+
+    fn parse_global_constant(mut self, is_public: bool) -> Statement {
+        match self.parse_let() {
+            Statement::Let(item) => {
+                let mut statements = Vec[Statement]::new()
+                statements.push(Statement::Ret(item.expr))
+                ret Statement::Function(FunctionItem{
+                    Vec[str]::new(), is_public, false, item.name, Vec[GenericParam]::new(),
+                    Vec[FunctionParam]::new(), item.typ, Option[ParsedBlock]::Some(ParsedBlock{statements})
+                })
+            }
+            _ => {}
+        }
+        ret Statement::Import(ImportStmt{false, ""})
     }
 
     fn parse_import(mut self, is_public: bool) -> Statement {
@@ -411,6 +637,9 @@ impl for Parser {
             TokenType::KW_FOR => {
                 ret self.parse_for()
             }
+            TokenType::KW_WITH => {
+                ret self.parse_with()
+            }
             TokenType::KW_WHILE => {
                 ret self.parse_while()
             }
@@ -518,10 +747,36 @@ impl for Parser {
             panic("Expected `in` in for-loop, got: " + in_kw)
         }
         self.parsing_control_flow_header = true
-        let iterable = self.parse_expression()
+        let mut iterable = self.parse_expression()
+        if self.peek_curr_type() == TokenType::DOT && self.peek_next_type() == TokenType::DOT {
+            self.consume()
+            self.consume()
+            let mut range_function = "range"
+            if self.peek_curr_type() == TokenType::ASSIGN {
+                self.consume()
+                range_function = "range_inclusive"
+            }
+            let end = self.parse_expression()
+            let mut args = Vec[ExprNode]::new()
+            args.push(iterable)
+            args.push(end)
+            let callee = self.mk_expr(Expr::Path(range_function))
+            iterable = self.mk_expr(Expr::Call(CallExpr{self.box_expr(callee), Vec[str]::new(), args}))
+        }
         self.parsing_control_flow_header = false
         let body = self.parse_block()
         ret Statement::For(ForStmt{label, name, iterable, body})
+    }
+
+    fn parse_with(mut self) -> Statement {
+        self.safe_consume(TokenType::KW_WITH)
+        self.parsing_with_binding_expr = true
+        let expr = self.parse_expression()
+        self.parsing_with_binding_expr = false
+        self.safe_consume(TokenType::KW_AS)
+        let name = self.safe_consume_value(TokenType::IDENTIFIER)
+        let body = self.parse_block()
+        ret Statement::With(WithStmt{expr, name, body})
     }
 
     fn parse_if_statement(mut self) -> Statement {
@@ -864,7 +1119,7 @@ impl for Parser {
     }
 
     fn parse_multiplicative(mut self) -> ExprNode {
-        let mut left = self.parse_cast()
+        let mut left = self.parse_power()
         loop {
             let operator = self.peek_curr()
             if operator.type != TokenType::ASTERISK {
@@ -875,16 +1130,25 @@ impl for Parser {
                 }
             }
             self.consume()
-            let right = self.parse_unary()
+            let right = self.parse_power()
             left = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(left), operator.value, self.box_expr(right)}))
         }
         ret left
     }
 
+    fn parse_power(mut self) -> ExprNode {
+        let left = self.parse_cast()
+        let operator = self.peek_curr()
+        if operator.type != TokenType::POWER { ret left }
+        self.consume()
+        let right = self.parse_power()
+        ret self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(left), operator.value, self.box_expr(right)}))
+    }
+
     fn parse_cast(mut self) -> ExprNode {
         let mut expr = self.parse_unary()
         loop {
-            if self.peek_curr_type() != TokenType::KW_AS {
+            if self.peek_curr_type() != TokenType::KW_AS || self.parsing_with_binding_expr {
                 break
             }
             self.consume()
@@ -913,6 +1177,7 @@ impl for Parser {
                 continue
             }
             if curr_type == TokenType::DOT {
+                if self.peek_next_type() == TokenType::DOT { break }
                 expr = self.parse_dotted_postfix(expr)
                 continue
             }
@@ -1279,7 +1544,19 @@ impl for Parser {
                 ret self.parse_unsafe_expression()
             }
             TokenType::IDENTIFIER => {
+                if curr_token.value == "f" && self.peek_next_type() == TokenType::STRING {
+                    self.consume()
+                    ret self.parse_fstring(self.consume_value())
+                }
                 let path = self.parse_path()
+                if path == "format" && self.peek_curr_type() == TokenType::BANG {
+                    self.consume()
+                    ret self.parse_format_macro()
+                }
+                if path == "vec" && self.peek_curr_type() == TokenType::BANG {
+                    self.consume()
+                    ret self.parse_vec_literal()
+                }
                 if self.peek_curr_type() == TokenType::LEFT_BRACE {
                     if !self.parsing_match_header {
                         if !self.parsing_control_flow_header {
@@ -1294,6 +1571,97 @@ impl for Parser {
                 ret self.mk_expr(Expr::Path(""))
             }
         }
+    }
+
+    fn parse_vec_literal(mut self) -> ExprNode {
+        self.safe_consume(TokenType::LEFT_BRACKET)
+        let mut items = Vec[ExprNode]::new()
+        if self.peek_curr_type() != TokenType::RIGHT_BRACKET {
+            items.push(self.parse_expression())
+            while self.peek_curr_type() == TokenType::COMMA {
+                self.consume()
+                if self.peek_curr_type() == TokenType::RIGHT_BRACKET { break }
+                items.push(self.parse_expression())
+            }
+        }
+        self.safe_consume(TokenType::RIGHT_BRACKET)
+        ret self.mk_expr(Expr::VecLiteral(ArrayLiteralExpr{items}))
+    }
+
+    fn parse_fstring(mut self, raw: str) -> ExprNode {
+        ret self.build_format_expr(raw, Vec[ExprNode]::new())
+    }
+
+    fn parse_format_macro(mut self) -> ExprNode {
+        self.safe_consume(TokenType::LEFT_PAREN)
+        let raw = self.safe_consume_value(TokenType::STRING)
+        let mut positional = Vec[ExprNode]::new()
+        while self.peek_curr_type() == TokenType::COMMA {
+            self.consume()
+            if self.peek_curr_type() == TokenType::RIGHT_PAREN { break }
+            positional.push(self.parse_expression())
+        }
+        self.safe_consume(TokenType::RIGHT_PAREN)
+        ret self.build_format_expr(raw, positional)
+    }
+
+    fn parse_inline_expression(mut self, source: str) -> ExprNode {
+        let mut lexer = Lexer::new()
+        let tokens = lexer.tokenize(source)
+        let mut nested = Parser::new()
+        ret nested.parse_inline_tokens(tokens)
+    }
+
+    fn parse_inline_tokens(mut self, tokens: Vec[Token]) -> ExprNode {
+        self.tokens = tokens
+        self.consumed = 0_usize
+        ret self.parse_expression()
+    }
+
+    fn build_format_expr(mut self, raw: str, positional: Vec[ExprNode]) -> ExprNode {
+        let body = raw.slice(1_usize, raw.len() - 2_usize)
+        let mut result = self.mk_expr(Expr::StringLiteral("\"\""))
+        let mut cursor = 0_usize
+        let mut chunk_start = 0_usize
+        let mut positional_index = 0_usize
+        while cursor < body.len() {
+            if body.slice(cursor, 1_usize) == "{" {
+                if cursor > chunk_start {
+                    let literal = self.mk_expr(Expr::StringLiteral("\"" + body.slice(chunk_start, cursor - chunk_start) + "\""))
+                    result = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(result), "+", self.box_expr(literal)}))
+                }
+                let mut end = cursor + 1_usize
+                while end < body.len() && body.slice(end, 1_usize) != "}" { end = end + 1_usize }
+                if end >= body.len() {
+                    self.unexpected_token("closing '}' in f-string", self.peek_curr())
+                    ret result
+                }
+                let mut expression_source = body.slice(cursor + 1_usize, end - cursor - 1_usize)
+                let callee = self.mk_expr(Expr::Path("Debug::fmt"))
+                let mut args = Vec[ExprNode]::new()
+                if expression_source == "" {
+                    match positional.get(positional_index) {
+                        Some(value) => { args.push(value) }
+                        None => { self.unexpected_token("format positional argument", self.peek_curr()) }
+                    }
+                    positional_index = positional_index + 1_usize
+                } else {
+                    if expression_source.len() > 0_usize && expression_source.slice(0_usize, 1_usize) == "#" { expression_source = expression_source.slice(1_usize, expression_source.len() - 1_usize) }
+                    args.push(self.parse_inline_expression(expression_source))
+                }
+                let formatted = self.mk_expr(Expr::Call(CallExpr{self.box_expr(callee), Vec[str]::new(), args}))
+                result = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(result), "+", self.box_expr(formatted)}))
+                cursor = end + 1_usize
+                chunk_start = cursor
+                continue
+            }
+            cursor = cursor + 1_usize
+        }
+        if chunk_start < body.len() {
+            let literal = self.mk_expr(Expr::StringLiteral("\"" + body.slice(chunk_start, body.len() - chunk_start) + "\""))
+            result = self.mk_expr(Expr::Binary(BinaryExpr{self.box_expr(result), "+", self.box_expr(literal)}))
+        }
+        ret result
     }
 
     fn parse_assignment(mut self, target: ExprNode) -> Statement {
@@ -1410,6 +1778,12 @@ impl for Parser {
             out = out + "mut "
         }
 
+        let mut leading_reference = false
+        if self.peek_curr_type() == TokenType::AMPERSAND {
+            self.consume()
+            leading_reference = true
+        }
+
         let base = self.parse_type_base()
         out = out + base
         loop {
@@ -1430,6 +1804,9 @@ impl for Parser {
         }
         elif self.peek_curr_type() == TokenType::AMPERSAND {
             self.consume()
+            out = out + "&"
+        }
+        elif leading_reference {
             out = out + "&"
         }
 
@@ -1659,6 +2036,7 @@ impl for Parser {
             || token_type == TokenType::PLUS_EQUAL
             || token_type == TokenType::MINUS_EQUAL
             || token_type == TokenType::ASTERISK_EQUAL
+            || token_type == TokenType::POWER_EQUAL
             || token_type == TokenType::SLASH_EQUAL
             || token_type == TokenType::PERCENT_EQUAL
             || token_type == TokenType::AMPERSAND_EQUAL
