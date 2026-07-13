@@ -36,6 +36,11 @@ run_test() {
 
 run_test "$tmp/passing.log" --filter passing_unit
 grep -q "1 passed; 0 failed" "$tmp/passing.log"
+grep -q "test test_runner_fixture:src/main.enq::passing_unit ... ok (" "$tmp/passing.log"
+if grep -q "$tmp/project" "$tmp/passing.log"; then
+    echo "Test output contains an absolute project path" >&2
+    exit 1
+fi
 
 run_test "$tmp/expected.log" --filter expected_diagnostic
 grep -q "1 passed; 0 failed" "$tmp/expected.log"
@@ -47,6 +52,8 @@ set -e
 test "$wrong_code" -ne 0
 grep -q "expected compile error containing 'This diagnostic must not match'" "$tmp/wrong.log"
 grep -q "0 passed; 1 failed" "$tmp/wrong.log"
+grep -q "failures:" "$tmp/wrong.log"
+grep -q "    test_runner_fixture:tests/wrong_diagnostic.enq" "$tmp/wrong.log"
 
 set +e
 run_test "$tmp/signature.log" --filter invalid_signature
