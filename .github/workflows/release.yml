@@ -44,8 +44,48 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  build:
+  verify:
+    name: Verify native release
     needs: bootstrap-ir
+    runs-on: ubuntu-latest
+    env:
+      ENCORE_CORE_DIR: ${{ github.workspace }}/core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bootstrap-ir
+          path: index/encore/target
+      - name: Assemble native seed
+        run: |
+          mkdir -p index/encore/target/extreme
+          clang -O0 -w \
+            index/encore/target/x86_64-unknown-linux-gnu/extreme/encore.ll \
+            core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
+            -o index/encore/target/extreme/encore
+      - name: Double self-host
+        working-directory: index/encore
+        run: |
+          ./target/extreme/encore build --profile debug --target x86_64-unknown-linux-gnu
+          cp target/x86_64-unknown-linux-gnu/debug/encore target/extreme/encore
+          ./target/extreme/encore build --profile extreme --target x86_64-unknown-linux-gnu
+          cp target/x86_64-unknown-linux-gnu/extreme/encore target/extreme/encore
+      - name: Run full native test suite
+        run: |
+          compiler="$PWD/index/encore/target/extreme/encore"
+          for package in core index/ehir index/ehir-llvm-backend index/json index/log index/rich index/std index/toml; do
+            (cd "$package" && "$compiler" test)
+          done
+          (cd index/encore && ./target/extreme/encore test)
+      - name: Verify release installation
+        run: |
+          mkdir -p dist
+          archive=$(scripts/package-release.sh index/encore/target/extreme/encore x86_64-unknown-linux-gnu verify dist)
+          sha256sum "$archive" > "$archive.sha256"
+          scripts/smoke-install.sh "$archive"
+
+  build:
+    needs: [bootstrap-ir, verify]
     env:
       ENCORE_CORE_DIR: ${{ github.workspace }}/core
     strategy:
@@ -123,6 +163,10 @@ jobs:
           else
             shasum -a 256 "$archive" > "$archive.sha256"
           fi
+          case "${{ matrix.triple }}" in
+            *-windows-*) ;;
+            *) scripts/smoke-install.sh "$archive" ;;
+          esac
       - uses: actions/upload-artifact@v4
         with:
           name: encore-${{ matrix.triple }}
