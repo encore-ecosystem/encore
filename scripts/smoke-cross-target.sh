@@ -39,4 +39,17 @@ output=$(
 code=$?
 set -e
 test "$code" -ne 0
-printf '%s\n' "$output" | grep -q "freestanding binary requires target.runtime-sources"
+printf '%s\n' "$output" | grep -q "binary output requires builtin-runtime or target.runtime-sources"
+
+cp -R "$repo_root/examples/add_two_structs" "$tmp/custom-runtime"
+rm -rf "$tmp/custom-runtime/target"
+printf '\n[target]\nbuiltin-runtime = false\n' >> "$tmp/custom-runtime/encore.toml"
+set +e
+output=$(
+    cd "$tmp/custom-runtime"
+    "$compiler" build --profile debug 2>&1
+)
+code=$?
+set -e
+test "$code" -ne 0
+printf '%s\n' "$output" | grep -q "binary output requires builtin-runtime or target.runtime-sources"

@@ -46,6 +46,7 @@ target = "thumbv7em-none-eabihf"
 [target]
 linker = "clang"
 ar = "llvm-ar"
+builtin-runtime = false
 
 [target.thumbv7em-none-eabihf]
 linker = "arm-none-eabi-clang"
@@ -78,10 +79,12 @@ Select an intermediate or final artifact with `--emit ehir`, `--emit llvm-ir`,
 `--emit object`, or `--emit binary`. Hosted targets default to `binary`.
 Freestanding targets default to `object`, which requires no runtime or linker.
 
-A freestanding binary must configure `runtime-sources`. `linker-script`,
-`compile-args`, and `link-args` are resolved per target; relative source and
-script paths are resolved from the project root. This keeps board support in
-the project or platform package instead of hard-coding devices in the compiler.
+A freestanding binary must configure `runtime-sources`. Hosted targets use the
+bundled Encore runtime by default; set `builtin-runtime = false` when a target
+provides its own runtime instead. `linker-script`, `compile-args`, and
+`link-args` are resolved per target; relative source and script paths are
+resolved from the project root. This keeps board support in the project or
+platform package instead of hard-coding devices in the compiler.
 
 ## Conditional Compilation
 
