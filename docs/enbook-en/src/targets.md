@@ -17,6 +17,12 @@ encore target
 encore target thumbv7em-none-eabihf
 ```
 
+Encore derives ABI properties such as pointer width from the architecture and
+environment. An unknown architecture is rejected instead of being guessed as
+32-bit; this prevents silently generating incompatible `usize`, `isize`, and
+pointer layouts. ABI variants such as `gnux32`, `gnuabin32`, and `aarch64_32`
+are classified independently from their 64-bit base architecture.
+
 Build for a target with:
 
 ```sh

@@ -51,3 +51,10 @@ run_code=$?
 set -e
 test "$run_code" -ne 2
 grep -q "encore.toml" "$tmp/run-args.log"
+
+set +e
+(cd "$tmp" && "$compiler" target fictional-unknown-none) > "$tmp/target.log" 2>&1
+target_code=$?
+set -e
+test "$target_code" -eq 1
+grep -q "unsupported target architecture 'fictional'" "$tmp/target.log"
