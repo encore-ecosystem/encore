@@ -17,8 +17,15 @@ export PATH="$HOME/.encore/bin:$PATH"
 ```
 
 The installer verifies the release checksum. Set `ENCORE_VERSION` to install a
-specific tag, or run the installer again to update. Uninstall with
-`install.sh --uninstall`.
+specific tag, or update explicitly with:
+
+```sh
+install.sh --update
+install.sh --version 1.0.0
+```
+
+Use `--install-dir <path>` for a custom location and `--uninstall` to remove
+the installation.
 Set `ENCORE_RELEASE_BASE_URL` to an HTTPS release mirror containing archives
 and their `.sha256` files. `file://` URLs are accepted for offline installation
 and installer testing.

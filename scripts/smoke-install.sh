@@ -36,6 +36,11 @@ ENCORE_RELEASE_BASE_URL="file://$archive_dir" \
     "$repo_root/install.sh"
 "$tmp/home-v-prefix/bin/encore" --version
 
+printf 'stale\n' > "$tmp/home/VERSION"
+ENCORE_RELEASE_BASE_URL="file://$archive_dir" \
+    "$repo_root/install.sh" --update --version "$package_version" --install-dir "$tmp/home"
+test "$(cat "$tmp/home/VERSION")" = "$package_version"
+
 set +e
 mismatch_output=$(ENCORE_HOME="$tmp/mismatch" \
     ENCORE_VERSION=wrong-version \
@@ -45,6 +50,21 @@ mismatch_code=$?
 set -e
 test "$mismatch_code" -ne 0
 printf '%s\n' "$mismatch_output" | grep -q "Release version mismatch"
+
+mkdir -p "$tmp/bad-release" "$tmp/protected"
+cp "$archive" "$tmp/bad-release/$(basename -- "$archive")"
+printf '%064d  %s\n' 0 "$(basename -- "$archive")" > "$tmp/bad-release/$(basename -- "$checksum")"
+printf 'keep\n' > "$tmp/protected/VERSION"
+set +e
+ENCORE_HOME="$tmp/protected" \
+ENCORE_VERSION="$package_version" \
+ENCORE_RELEASE_BASE_URL="file://$tmp/bad-release" \
+    "$repo_root/install.sh" > "$tmp/checksum.log" 2>&1
+checksum_code=$?
+set -e
+test "$checksum_code" -ne 0
+grep -q "Checksum verification failed" "$tmp/checksum.log"
+test "$(cat "$tmp/protected/VERSION")" = keep
 
 cp -R "$repo_root/examples/add_two_structs" "$tmp/project"
 rm -rf "$tmp/project/target"
@@ -57,3 +77,21 @@ set +e
 code=$?
 set -e
 test "$code" -eq 12
+
+set +e
+unsafe_output=$(ENCORE_HOME=/ "$repo_root/install.sh" --uninstall 2>&1)
+unsafe_code=$?
+set -e
+test "$unsafe_code" -ne 0
+printf '%s\n' "$unsafe_output" | grep -q "Refusing unsafe Encore install directory"
+
+mkdir -p "$tmp/unsafe/child"
+set +e
+ENCORE_HOME="$tmp/unsafe/child/.." "$repo_root/install.sh" --uninstall > "$tmp/unsafe.log" 2>&1
+unsafe_code=$?
+set -e
+test "$unsafe_code" -ne 0
+test -d "$tmp/unsafe"
+
+"$repo_root/install.sh" --install-dir "$tmp/home-v-prefix" --uninstall
+test ! -e "$tmp/home-v-prefix"
