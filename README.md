@@ -43,6 +43,7 @@ encore sync
 encore install --path .
 encore target
 encore target list
+encore help build
 ```
 
 Cross-compile using an LLVM-compatible target triple:
