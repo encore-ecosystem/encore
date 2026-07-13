@@ -32,3 +32,22 @@ set -e
 test "$code" -ne 0
 grep -q "Unknown command: unknown-command" "$tmp/unknown.log"
 grep -q "encore --help" "$tmp/unknown.log"
+
+for invocation in "build --unknown" "build --target" "test --filter" "init extra" "add" "sync extra" "update extra" "install one two" "target one two"; do
+    set +e
+    (cd "$tmp" && "$compiler" $invocation) > "$tmp/invalid.log" 2>&1
+    invalid_code=$?
+    set -e
+    test "$invalid_code" -eq 2
+    grep -q "Error:" "$tmp/invalid.log"
+    grep -q -- "--help' for usage" "$tmp/invalid.log"
+done
+
+# Everything after the separator belongs to the compiled program. Validation
+# must reach project loading instead of rejecting these arguments.
+set +e
+(cd "$tmp" && "$compiler" run -- --unknown-program-flag) > "$tmp/run-args.log" 2>&1
+run_code=$?
+set -e
+test "$run_code" -ne 2
+grep -q "encore.toml" "$tmp/run-args.log"
