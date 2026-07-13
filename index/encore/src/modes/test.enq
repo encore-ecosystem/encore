@@ -1,7 +1,8 @@
 import core::fmt::Debug
 import core::option::Option
+import core::io::eprintln
 import std::io::println
-import std::os::{argc, argv, file_exists, read_dir, read_file}
+import std::os::{argc, argv, file_exists, read_dir, read_file, remove_file}
 import std::path::Path
 import std::process::{run_args, run_args_capture}
 import std::os::mkdir_all
@@ -9,6 +10,7 @@ import std::vec::Vec
 
 import mod::build::compile_test_ast
 import refrain::frontend::{Lexer, Parser, Statement}
+import refrain::frontend::sema::semantic_check_error
 import refrain::frontend::parser::statements::FunctionItem
 import refrain::project::{ProjectWorkspace, WorkspaceModule, load_library_workspace, load_entry_workspace}
 import refrain::target::{host_target, target_executable_name}
@@ -20,6 +22,11 @@ pub fn native_test() -> u32 {
     if worker_path != "" {
         let path = Path::new(worker_path).resolve()
         let worker_workspace = load_entry_workspace(root, path)
+        let semantic_error = workspace_semantic_error(worker_workspace)
+        if semantic_error != "" {
+            eprintln(semantic_error)
+            ret 1_u32
+        }
         if compile_and_run_result(root, worker_workspace.flat_ast, "worker:" + path.as_str()) == "" { ret 0_u32 }
         ret 1_u32
     }
@@ -88,7 +95,7 @@ pub fn native_test() -> u32 {
                         if filter == "" || contains(display, filter) {
                             found = found + 1_usize
                             progress.start_test(display, found, total)
-                            let failure = run_standalone_test(root, workspace, tests_dir.join(name), display)
+                            let failure = run_standalone_test(root, tests_dir.join(name), display)
                             if failure == "" { passed = passed + 1_usize progress.pass_test(display) }
                             else { failed = failed + 1_usize progress.fail_test(display, failure) }
                         }
@@ -105,6 +112,16 @@ pub fn native_test() -> u32 {
         ret 0_u32
     }
     ret 1_u32
+}
+
+fn workspace_semantic_error(workspace: ProjectWorkspace) -> str {
+    for module in workspace.modules {
+        match semantic_check_error(module.ast) {
+            Option[str]::Some(message) => { ret message }
+            Option[str]::None => {}
+        }
+    }
+    ret ""
 }
 
 fn count_selected_tests(workspace: ProjectWorkspace, filter: str) -> usize {
@@ -141,25 +158,27 @@ fn run_unit_test(root: Path, workspace: ProjectWorkspace, item: FunctionItem, di
     ret compile_and_run_result(root, ast, display)
 }
 
-fn run_standalone_test(root: Path, workspace: ProjectWorkspace, path: Path, display: str) -> str {
+fn run_standalone_test(root: Path, path: Path, display: str) -> str {
     let expected = expected_compile_error(read_file(path.as_str()))
+    let output_path = root.join("target").join("tests").join(sanitize(display) + ".output.txt")
+    mkdir_all(root.join("target").join("tests").as_str())
+    let executable = arg_or(0_usize, "encore")
+    let mut args = Vec[str]::new()
+    args.push("test")
+    args.push("--_worker-standalone")
+    args.push(path.as_str())
+    let code = run_args_capture(executable, args, output_path.as_str())
+    let output = read_file(output_path.as_str())
+    remove_file(output_path.as_str())
     if expected != "" {
-        let output_path = root.join("target").join("tests").join("expected_compile_error.txt")
-        mkdir_all(root.join("target").join("tests").as_str())
-        let executable = arg_or(0_usize, "encore")
-        let mut args = Vec[str]::new()
-        args.push("test")
-        args.push("--_worker-standalone")
-        args.push(path.as_str())
-        let code = run_args_capture(executable, args, output_path.as_str())
-        let output = read_file(output_path.as_str())
         if code != 0_i32 {
-            ret ""
+            if contains(output, expected) { ret "" }
+            ret "expected compile error containing '" + expected + "', got: " + summarize_output(output)
         }
         ret "expected compile error: " + expected
     }
-    let test_workspace = load_entry_workspace(root, path)
-    ret compile_and_run_result(root, test_workspace.flat_ast, display)
+    if code == 0_i32 { ret "" }
+    ret summarize_output(output)
 }
 
 fn compile_and_run_result(root: Path, ast: Vec[Statement], display: str) -> str {
@@ -265,6 +284,22 @@ fn expected_compile_error(source: str) -> str {
         index = index + 1_usize
     }
     ret ""
+}
+
+fn summarize_output(value: str) -> str {
+    let mut out = ""
+    let mut index = 0_usize
+    while index < value.len() && out.len() < 240_usize {
+        let ch = value.slice(index, 1_usize)
+        if ch == "\n" || ch == "\r" || ch == "\t" {
+            if out.len() > 0_usize && out.slice(out.len() - 1_usize, 1_usize) != " " { out = out + " " }
+        }
+        else { out = out + ch }
+        index = index + 1_usize
+    }
+    if index < value.len() { out = out + "..." }
+    if out == "" { ret "no compiler output" }
+    ret out
 }
 
 fn sanitize(value: str) -> str {

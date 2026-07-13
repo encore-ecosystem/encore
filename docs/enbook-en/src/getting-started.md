@@ -92,6 +92,11 @@ Test functions should:
 The test harness wraps the function in a generated executable `main`, so the
 rest of the program can stay unchanged.
 
+Standalone negative tests can declare an expected compiler diagnostic in their
+first kilobyte with `// @expect.compile_error=message`. The test passes only
+when compilation fails and its captured output contains `message`; an unrelated
+compiler or backend failure is reported as a failed test.
+
 ## Examples
 
 Practical packages live in `index/`:

@@ -1003,11 +1003,13 @@ fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, e
     ctx.vars = Vec[VarType]::new()
     ctx.owned_vars = Vec[VarType]::new()
     ctx.return_type = canonical_type(ret_type)
+    ensure_object_safe_type(ctx, ctx.return_type)
     for param in fn_item.params {
         let raw_param_type = unwrap_type_or_usize(param.typ)
         let param_type = if param.name == "self" && ctx.self_type != "" {
             if starts_with(raw_param_type, "mut ") { "mut " + ctx.self_type } else { ctx.self_type }
         } else { self_context_type(ctx, raw_param_type) }
+        ensure_object_safe_type(ctx, param_type)
         ctx_add_var(ctx, param.name, param_type)
         ctx_add_owned_var(ctx, param.name, param.name, param_type)
     }
@@ -1041,6 +1043,19 @@ fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, e
 
     builder = builder.line("}")
     ret builder
+}
+
+fn ensure_object_safe_type(ctx: mut TranslatorContext, typ: str) -> () {
+    let value = canonical_type(typ)
+    if !starts_with(value, "dyn ") { ret () }
+    let trait_name = value.slice(4_usize, value.len() - 4_usize)
+    let prefix = trait_name + "::"
+    for function in ctx.functions {
+        if starts_with(function.name, prefix) && base_type_name(function.ret_type) == trait_name {
+            panic("Trait '" + trait_name + "' is not object-safe because method '" + function.name.slice(prefix.len(), function.name.len() - prefix.len()) + "' returns Self")
+        }
+    }
+    ret ()
 }
 
 fn self_context_type(ctx: mut TranslatorContext, typ: str) -> str {
@@ -1664,12 +1679,14 @@ fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usiz
                 }
                 Option[str]::None => {}
             }
-            let mut typ = path_value_type(ctx, name)
+            let mut typ = ""
             match ctx_lookup_var(ctx, name) {
                 Option[str]::Some(found) => {
                     typ = found
                 }
-                Option[str]::None => {}
+                Option[str]::None => {
+                    panic("Unknown variable '" + name + "'")
+                }
             }
             if starts_with(typ, "mut ") {
                 let value_type = value_type_name(typ)
@@ -1839,12 +1856,14 @@ fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx:
                 }
                 Option[str]::None => {}
             }
-            let mut typ = path_value_type(ctx, name)
+            let mut typ = ""
             match ctx_lookup_var(ctx, name) {
                 Option[str]::Some(found) => {
                     typ = found
                 }
-                Option[str]::None => {}
+                Option[str]::None => {
+                    panic("Unknown variable '" + name + "'")
+                }
             }
             if starts_with(typ, "mut ") {
                 let value_type = value_type_name(typ)
@@ -3018,6 +3037,7 @@ fn json_payload_type(value: str) -> str {
 }
 
 fn is_option_some_pattern(value: str) -> bool {
+    if enum_variant_name(value) == "Some" { ret true }
     if value == "Some" {
         ret true
     }
@@ -3031,6 +3051,7 @@ fn is_option_some_pattern(value: str) -> bool {
 }
 
 fn is_result_ok_pattern(value: str) -> bool {
+    if enum_variant_name(value) == "Ok" { ret true }
     if value == "Ok" {
         ret true
     }
@@ -3044,6 +3065,7 @@ fn is_result_ok_pattern(value: str) -> bool {
 }
 
 fn is_result_err_pattern(value: str) -> bool {
+    if enum_variant_name(value) == "Err" { ret true }
     if value == "Err" {
         ret true
     }
@@ -3089,6 +3111,11 @@ fn translate_match_stmt(
     let end_label = prefix + "_match_end_" + Debug::fmt(idx)
     let mut next_label = prefix + "_match_next_" + Debug::fmt(idx) + "_0"
     let is_exhaustive = match_stmt_is_exhaustive_for_type(ctx, match_stmt, cond.typ)
+    match duplicate_match_variant(match_stmt) {
+        Option[str]::Some(variant) => { panic("Duplicate match arm for variant '" + variant + "'") }
+        Option[str]::None => {}
+    }
+    if !is_exhaustive { panic("Non-exhaustive match for enum '" + base_type_name(cond.typ) + "'") }
     let all_arms_return = match_stmt_always_returns(match_stmt)
     let outer_owned = ctx.owned_vars.len()
     let mut arm_idx = 0_usize
@@ -3142,6 +3169,25 @@ fn translate_match_stmt(
         builder = builder.label(end_label)
     }
     ret builder
+}
+
+fn duplicate_match_variant(match_stmt: MatchStmt) -> Option[str] {
+    let mut seen = Vec[str]::new()
+    for arm in match_stmt.arms {
+        if arm.pattern.kind == "path" {
+            match arm.pattern.value {
+                Option[str]::Some(value) => {
+                    let variant = enum_variant_name(value)
+                    for known in seen {
+                        if known == variant { ret Option[str]::Some(variant) }
+                    }
+                    seen.push(variant)
+                }
+                Option[str]::None => {}
+            }
+        }
+    }
+    ret Option[str]::None
 }
 
 fn match_arm_always_returns(arm: ParsedMatchArm) -> bool {
@@ -3311,6 +3357,7 @@ fn match_stmt_is_exhaustive_for_type(ctx: mut TranslatorContext, match_stmt: Mat
 }
 
 fn is_option_none_pattern(value: str) -> bool {
+    if enum_variant_name(value) == "None" { ret true }
     if value == "None" {
         ret true
     }
