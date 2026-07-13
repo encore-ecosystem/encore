@@ -1,0 +1,797 @@
+import core::option::Option
+import core::panic::panic
+import std::os::file_exists
+import std::os::read_file
+import std::os::core_dir
+import std::os::home_dir
+import std::process::run
+import std::path::Path
+import std::vec::Vec
+
+import refrain::frontend::DependencyGraph
+import refrain::frontend::DependencyEdge
+import refrain::frontend::Lexer
+import refrain::frontend::Parser
+import refrain::frontend::Statement
+import refrain::frontend::Token
+
+import mod::manifest::ProjectManifest
+import mod::manifest::read_project_manifest
+
+extern fn encore_strset_new() -> usize
+extern fn encore_strset_insert(set: usize, value: str) -> bool
+extern fn encore_strset_free(set: usize) -> ()
+
+
+pub struct WorkspaceRefrain {
+    name: str
+    root: Path
+    target_is_binary: bool
+    manifest: ProjectManifest
+    dependency_names: Vec[str]
+}
+
+pub struct WorkspaceModule {
+    owner_name: str
+    owner_root: Path
+    module_path: Path
+    source: str
+    ast: Vec[Statement]
+    imports: Vec[str]
+}
+
+pub struct ProjectWorkspace {
+    root_name: str
+    refrains: Vec[WorkspaceRefrain]
+    modules: Vec[WorkspaceModule]
+    flat_ast: Vec[Statement]
+}
+
+pub fn load_binary_workspace(root: Path) -> ProjectWorkspace {
+    ret load_workspace(root, true)
+}
+
+pub fn load_library_workspace(root: Path) -> ProjectWorkspace {
+    ret load_workspace(root, false)
+}
+
+fn load_workspace(root: Path, target_is_binary: bool) -> ProjectWorkspace {
+    let mut workspace = ProjectWorkspace{
+        "",
+        Vec[WorkspaceRefrain]::new(),
+        Vec[WorkspaceModule]::new(),
+        Vec[Statement]::new()
+    }
+
+    workspace_set_root_name(workspace, load_refrain(workspace, root.resolve(), target_is_binary))
+
+    match workspace_root_refrain(workspace) {
+        Option[WorkspaceRefrain]::Some(root_refrain) => {
+            let modules = build_modules_for_refrain(workspace, root_refrain)
+            workspace_set_modules(workspace, modules)
+            workspace_set_flat_ast(workspace, flatten_modules(workspace.modules))
+        }
+        Option[WorkspaceRefrain]::None => {
+            panic("Internal workspace error: root refrain metadata is missing")
+        }
+    }
+
+    ret workspace
+}
+
+pub fn load_entry_workspace(root: Path, entrypoint: Path) -> ProjectWorkspace {
+    let mut workspace = ProjectWorkspace{"", Vec[WorkspaceRefrain]::new(), Vec[WorkspaceModule]::new(), Vec[Statement]::new()}
+    workspace_set_root_name(workspace, load_refrain(workspace, root.resolve(), true))
+    match workspace_root_refrain(workspace) {
+        Some(root_refrain) => {
+            let visited_paths = unsafe { encore_strset_new() }
+            let visited_sources = unsafe { encore_strset_new() }
+            let mut modules = Vec[WorkspaceModule]::new()
+            match find_refrain_by_name(workspace, "core") {
+                Some(core_refrain) => {
+                    if core_refrain.name != workspace.root_name {
+                        visit_module(workspace, core_refrain, entrypoint_of(core_refrain), visited_paths, visited_sources, modules)
+                    }
+                }
+                None => {}
+            }
+            visit_module(workspace, root_refrain, entrypoint.resolve(), visited_paths, visited_sources, modules)
+            unsafe {
+                encore_strset_free(visited_paths)
+                encore_strset_free(visited_sources)
+            }
+            workspace_set_modules(workspace, modules)
+            workspace_set_flat_ast(workspace, flatten_modules(modules))
+        }
+        None => { panic("Workspace root is missing") }
+    }
+    ret workspace
+}
+
+pub fn workspace_root_refrain(workspace: ProjectWorkspace) -> Option[WorkspaceRefrain] {
+    ret find_refrain_by_name(workspace, workspace.root_name)
+}
+
+fn workspace_set_root_name(workspace: mut ProjectWorkspace, root_name: str) -> () {
+    workspace.root_name = root_name
+    ret ()
+}
+
+fn workspace_set_modules(workspace: mut ProjectWorkspace, modules: Vec[WorkspaceModule]) -> () {
+    workspace.modules = modules
+    ret ()
+}
+
+fn workspace_set_flat_ast(workspace: mut ProjectWorkspace, flat_ast: Vec[Statement]) -> () {
+    workspace.flat_ast = flat_ast
+    ret ()
+}
+
+fn load_refrain(workspace: mut ProjectWorkspace, root: Path, target_is_binary: bool) -> str {
+    match find_refrain_by_root(workspace, root) {
+        Option[WorkspaceRefrain]::Some(found) => {
+            ret found.name
+        }
+        Option[WorkspaceRefrain]::None => {
+        }
+    }
+
+    let manifest = read_project_manifest(root)
+    let dependency_refs = manifest.dependencies
+    let mut dependency_names = Vec[str]::new()
+
+    let mut index = 0_usize
+    while index < dependency_refs.len() {
+        match dependency_refs.get(index) {
+            Option[str]::Some(dep_ref) => {
+                let dep_root = resolve_dependency_root(dep_ref, root)
+                let dep_name = load_refrain(workspace, dep_root, false)
+                if !contains_string(dependency_names, dep_name) {
+                    dependency_names.push(dep_name)
+                }
+            }
+            Option[str]::None => {
+            }
+        }
+        index = index + 1_usize
+    }
+
+    let refrain = WorkspaceRefrain{
+        manifest.name,
+        root,
+        target_is_binary,
+        manifest,
+        dependency_names
+    }
+    workspace.refrains.push(refrain)
+    ret manifest.name
+}
+
+fn build_modules_for_refrain(workspace: mut ProjectWorkspace, refrain: WorkspaceRefrain) -> Vec[WorkspaceModule] {
+    let entrypoint = entrypoint_of(refrain)
+    let visited_paths = unsafe { encore_strset_new() }
+    let visited_sources = unsafe { encore_strset_new() }
+    let mut result = Vec[WorkspaceModule]::new()
+    visit_module(workspace, refrain, entrypoint, visited_paths, visited_sources, result)
+    unsafe {
+        encore_strset_free(visited_paths)
+        encore_strset_free(visited_sources)
+    }
+    ret result
+}
+
+fn visit_module(
+    workspace: mut ProjectWorkspace,
+    owner: WorkspaceRefrain,
+    module_path: Path,
+    visited_paths: usize,
+    visited_sources: usize,
+    result: mut Vec[WorkspaceModule]
+) -> () {
+    let resolved_path = module_path.resolve()
+    let resolved_key = resolved_path.as_str()
+    if !unsafe { encore_strset_insert(visited_paths, resolved_key) } {
+        ret ()
+    }
+
+    let source = read_file(native_path(resolved_path.as_str()))
+    let source_is_new = unsafe { encore_strset_insert(visited_sources, source) }
+    let mut lexer = Lexer::new()
+    let tokens = lexer.tokenize(source)
+    let imports = import_paths_from_tokens(tokens)
+    if !source_is_new {
+        visit_imports(workspace, owner, resolved_path, imports, visited_paths, visited_sources, result)
+        ret ()
+    }
+    let mut parser = Parser::new()
+    let ast = parser.parse(tokens)
+    visit_imports(workspace, owner, resolved_path, imports, visited_paths, visited_sources, result)
+    result.push(WorkspaceModule{owner.name, owner.root, resolved_path, source, ast, imports})
+    ret ()
+}
+
+fn visit_imports(
+    workspace: mut ProjectWorkspace,
+    owner: WorkspaceRefrain,
+    resolved_path: Path,
+    imports: Vec[str],
+    visited_paths: usize,
+    visited_sources: usize,
+    result: mut Vec[WorkspaceModule]
+) -> () {
+    let mut import_index = 0_usize
+    while import_index < imports.len() {
+        match imports.get(import_index) {
+            Option[str]::Some(import_path) => {
+                let expanded = expand_import_path(import_path)
+                let mut request_index = 0_usize
+                while request_index < expanded.len() {
+                    match expanded.get(request_index) {
+                        Option[str]::Some(request_path) => {
+                            match resolve_import_module(workspace, owner, resolved_path, request_path) {
+                                Option[ResolvedModule]::Some(target) => {
+                                    visit_module(workspace, target.owner, target.module_path, visited_paths, visited_sources, result)
+                                }
+                                Option[ResolvedModule]::None => {
+                                }
+                            }
+                        }
+                        Option[str]::None => {
+                        }
+                    }
+                    request_index = request_index + 1_usize
+                }
+            }
+            Option[str]::None => {
+            }
+        }
+        import_index = import_index + 1_usize
+    }
+    ret ()
+}
+
+fn flatten_modules(modules: Vec[WorkspaceModule]) -> Vec[Statement] {
+    let mut out = Vec[Statement]::new()
+    let mut seen_paths = Vec[str]::new()
+    let mut seen_sources = Vec[str]::new()
+    let mut module_index = 0_usize
+    while module_index < modules.len() {
+        match modules.get(module_index) {
+            Option[WorkspaceModule]::Some(module) => {
+                let module_key = module.module_path.resolve().as_str()
+                if contains_string(seen_paths, module_key) || contains_string(seen_sources, module.source) {
+                    module_index = module_index + 1_usize
+                    continue
+                }
+                seen_paths.push(module_key)
+                seen_sources.push(module.source)
+                let mut stmt_index = 0_usize
+                while stmt_index < module.ast.len() {
+                    match module.ast.get(stmt_index) {
+                        Option[Statement]::Some(stmt) => {
+                            match stmt {
+                                Statement::Import(imp) => {
+                                    let _ignored = imp
+                                }
+                                _ => {
+                                    out.push(stmt)
+                                }
+                            }
+                        }
+                        Option[Statement]::None => {
+                        }
+                    }
+                    stmt_index = stmt_index + 1_usize
+                }
+            }
+            Option[WorkspaceModule]::None => {
+            }
+        }
+        module_index = module_index + 1_usize
+    }
+    ret out
+}
+
+struct ResolvedModule {
+    owner: WorkspaceRefrain
+    module_path: Path
+}
+
+fn resolve_import_module(
+    workspace: ProjectWorkspace,
+    owner: WorkspaceRefrain,
+    source_module: Path,
+    import_path: str
+) -> Option[ResolvedModule] {
+    let cleaned = strip_import_suffixes(import_path)
+    if cleaned == "" {
+        ret Option[ResolvedModule]::None
+    }
+
+    let parts = split_scope_path(cleaned)
+    if parts.len() == 0_usize {
+        ret Option[ResolvedModule]::None
+    }
+
+    let mut root_name = ""
+    match parts.get(0_usize) {
+        Option[str]::Some(value) => {
+            root_name = value
+        }
+        Option[str]::None => {
+            ret Option[ResolvedModule]::None
+        }
+    }
+
+    let mut target_owner = owner
+    let mut base_dir = owner.root.join("src")
+    let mut start_index = 1_usize
+
+    if root_name == "mod" {
+        start_index = 1_usize
+        match source_module.parent() {
+            Option[Path]::Some(parent) => {
+                base_dir = parent
+            }
+            Option[Path]::None => {
+                ret Option[ResolvedModule]::None
+            }
+        }
+    }
+    elif root_name == "refrain" || root_name == "repo" || root_name == owner.name {
+        start_index = 1_usize
+        base_dir = owner.root.join("src")
+    }
+    else {
+        match resolve_dependency_refrain(workspace, owner, root_name) {
+            Option[WorkspaceRefrain]::Some(dependency) => {
+                target_owner = dependency
+                start_index = 1_usize
+                base_dir = dependency.root.join("src")
+            }
+            Option[WorkspaceRefrain]::None => {
+                ret Option[ResolvedModule]::None
+            }
+        }
+    }
+
+    let suffix_len = parts.len() - start_index
+    let mut module_part_count = suffix_len
+    loop {
+        match resolve_module_file(base_dir, parts, start_index, module_part_count) {
+            Option[Path]::Some(module_path) => {
+                ret Option[ResolvedModule]::Some(ResolvedModule{target_owner, module_path.resolve()})
+            }
+            Option[Path]::None => {
+            }
+        }
+
+        if module_part_count == 0_usize {
+            break
+        }
+        module_part_count = module_part_count - 1_usize
+    }
+
+    panic("Unable to resolve import '" + import_path + "' in " + source_module.as_str())
+    ret Option[ResolvedModule]::None
+}
+
+fn resolve_module_file(base_dir: Path, parts: Vec[str], start: usize, count: usize) -> Option[Path] {
+    let mut module_base = base_dir
+    if count == 0_usize {
+        module_base = module_base.join("lib")
+    }
+    else {
+        let mut index = 0_usize
+        while index < count {
+            match parts.get(start + index) {
+                Option[str]::Some(part) => {
+                    module_base = module_base.join(part)
+                }
+                Option[str]::None => {
+                    ret Option[Path]::None
+                }
+            }
+            index = index + 1_usize
+        }
+    }
+
+    let direct_file = module_base.with_suffix(".enq")
+    if file_exists(native_path(direct_file.as_str())) {
+        ret Option[Path]::Some(direct_file)
+    }
+
+    let mod_file = module_base.join("mod.enq")
+    if file_exists(native_path(mod_file.as_str())) {
+        ret Option[Path]::Some(mod_file)
+    }
+
+    ret Option[Path]::None
+}
+
+fn entrypoint_of(refrain: WorkspaceRefrain) -> Path {
+    let filename = if refrain.target_is_binary {
+        "main.enq"
+    } else {
+        "lib.enq"
+    }
+    let entrypoint = refrain.root.join("src").join(filename)
+    if !file_exists(native_path(entrypoint.as_str())) {
+        panic("Unable to find entrypoint for refrain '" + refrain.name + "': " + entrypoint.as_str())
+    }
+    ret entrypoint
+}
+
+fn resolve_dependency_refrain(
+    workspace: ProjectWorkspace,
+    owner: WorkspaceRefrain,
+    dependency_name: str
+) -> Option[WorkspaceRefrain] {
+    if contains_string(owner.dependency_names, dependency_name) {
+        ret find_refrain_by_name(workspace, dependency_name)
+    }
+    ret find_refrain_by_name(workspace, dependency_name)
+}
+
+fn resolve_dependency_root(dep_ref: str, base_root: Path) -> Path {
+    if dep_ref == "sys@core" {
+        ret Path::new(core_dir()).resolve()
+    }
+
+    if starts_with(dep_ref, "path@") {
+        ret base_root.join(dep_ref.slice(5_usize, dep_ref.len() - 5_usize)).resolve()
+    }
+
+    if starts_with(dep_ref, "git@") {
+        let url = dep_ref.slice(4_usize, dep_ref.len() - 4_usize)
+        let url_path = Path::new(url)
+        let mut repository = workspace_path_name_or(url_path, "repository")
+        if repository.len() > 4_usize && repository.slice(repository.len() - 4_usize, 4_usize) == ".git" {
+            repository = repository.slice(0_usize, repository.len() - 4_usize)
+        }
+        let owner = match url_path.parent() {
+            Some(parent) => workspace_path_name_or(parent, "git")
+            None => "git"
+        }
+        let destination = Path::new(home_dir()).join(".cache").join("encore").join("git").join(owner).join(repository)
+        if !file_exists(destination.join(".git").as_str()) {
+            match destination.parent() {
+                Some(parent) => { run("mkdir -p " + workspace_shell_quote(parent.as_str())) }
+                None => {}
+            }
+            if run("git clone " + workspace_shell_quote(url) + " " + workspace_shell_quote(destination.as_str())) != 0_i32 {
+                panic("Unable to clone dependency: " + url)
+            }
+        }
+        ret destination.resolve()
+    }
+
+    panic("Unsupported dependency reference: " + dep_ref)
+    ret base_root
+}
+
+fn workspace_path_name_or(path: Path, fallback: str) -> str {
+    match path.name() { Some(value) => { ret value } None => { ret fallback } }
+}
+
+fn workspace_shell_quote(value: str) -> str {
+    let mut out = "'"
+    let mut index = 0_usize
+    while index < value.len() {
+        let ch = value.slice(index, 1_usize)
+        if ch == "'" { out = out + "'\\''" }
+        else { out = out + ch }
+        index = index + 1_usize
+    }
+    ret out + "'"
+}
+
+fn resolve_system_core_root(base_root: Path) -> Path {
+    let mut cursor = base_root.resolve()
+    loop {
+        let candidate = cursor.join("core").join("encore.toml")
+        if file_exists(native_path(candidate.as_str())) {
+            match candidate.parent() {
+                Option[Path]::Some(core_dir) => {
+                    ret core_dir
+                }
+                Option[Path]::None => {
+                }
+            }
+        }
+
+        match cursor.parent() {
+            Option[Path]::Some(parent) => {
+                cursor = parent
+            }
+            Option[Path]::None => {
+                break
+            }
+        }
+    }
+
+    panic("Unable to resolve sys@core starting from " + base_root.as_str())
+    ret base_root
+}
+
+fn find_refrain_by_root(workspace: ProjectWorkspace, root: Path) -> Option[WorkspaceRefrain] {
+    let target = root.resolve().as_str()
+    let mut index = 0_usize
+    while index < workspace.refrains.len() {
+        match workspace.refrains.get(index) {
+            Option[WorkspaceRefrain]::Some(refrain) => {
+                if refrain.root.resolve().as_str() == target {
+                    ret Option[WorkspaceRefrain]::Some(refrain)
+                }
+            }
+            Option[WorkspaceRefrain]::None => {
+            }
+        }
+        index = index + 1_usize
+    }
+    ret Option[WorkspaceRefrain]::None
+}
+
+fn find_refrain_by_name(workspace: ProjectWorkspace, name: str) -> Option[WorkspaceRefrain] {
+    let mut index = 0_usize
+    while index < workspace.refrains.len() {
+        match workspace.refrains.get(index) {
+            Option[WorkspaceRefrain]::Some(refrain) => {
+                if refrain.name == name {
+                    ret Option[WorkspaceRefrain]::Some(refrain)
+                }
+            }
+            Option[WorkspaceRefrain]::None => {
+            }
+        }
+        index = index + 1_usize
+    }
+    ret Option[WorkspaceRefrain]::None
+}
+
+fn import_paths_from_tokens(tokens: Vec[Token]) -> Vec[str] {
+    let graph = DependencyGraph::from_tokens("", tokens)
+    let edges = graph.all()
+    let mut out = Vec[str]::new()
+    let mut index = 0_usize
+    while index < edges.len() {
+        match edges.get(index) {
+            Option[DependencyEdge]::Some(edge) => {
+                out.push(edge.target)
+            }
+            Option[DependencyEdge]::None => {
+            }
+        }
+        index = index + 1_usize
+    }
+    ret out
+}
+
+fn expand_import_path(raw: str) -> Vec[str] {
+    let cleaned = trim_spaces(raw)
+    let brace_start = find_char(cleaned, "{", 0_usize)
+    if brace_start >= cleaned.len() {
+        let mut out = Vec[str]::new()
+        out.push(strip_import_suffixes(cleaned))
+        ret out
+    }
+
+    let brace_end = find_matching_brace(cleaned, brace_start)
+    let prefix = cleaned.slice(0_usize, brace_start)
+    let inner = cleaned.slice(brace_start + 1_usize, brace_end - brace_start - 1_usize)
+    let suffix = cleaned.slice(brace_end + 1_usize, cleaned.len() - brace_end - 1_usize)
+    let items = split_top_level_csv(inner)
+
+    let mut out = Vec[str]::new()
+    let mut index = 0_usize
+    while index < items.len() {
+        match items.get(index) {
+            Option[str]::Some(item) => {
+                let nested = expand_import_path(prefix + item + suffix)
+                let mut nested_index = 0_usize
+                while nested_index < nested.len() {
+                    match nested.get(nested_index) {
+                        Option[str]::Some(value) => {
+                            out.push(strip_import_suffixes(value))
+                        }
+                        Option[str]::None => {
+                        }
+                    }
+                    nested_index = nested_index + 1_usize
+                }
+            }
+            Option[str]::None => {
+            }
+        }
+        index = index + 1_usize
+    }
+    ret out
+}
+
+fn split_scope_path(value: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut current = ""
+    let mut index = 0_usize
+    while index < value.len() {
+        if index + 1_usize < value.len() && value.byte_at(index) == 58_u8 && value.byte_at(index + 1_usize) == 58_u8 {
+            if current != "" {
+                out.push(current)
+                current = ""
+            }
+            index = index + 2_usize
+            continue
+        }
+        current = current + value.slice(index, 1_usize)
+        index = index + 1_usize
+    }
+    if current != "" {
+        out.push(current)
+    }
+    ret out
+}
+
+fn split_top_level_csv(value: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut current = ""
+    let mut depth = 0_usize
+    let mut index = 0_usize
+    while index < value.len() {
+        let ch = value.slice(index, 1_usize)
+        if ch == "{" {
+            depth = depth + 1_usize
+            current = current + ch
+            index = index + 1_usize
+            continue
+        }
+        if ch == "}" {
+            if depth > 0_usize {
+                depth = depth - 1_usize
+            }
+            current = current + ch
+            index = index + 1_usize
+            continue
+        }
+        if ch == "," && depth == 0_usize {
+            out.push(trim_spaces(current))
+            current = ""
+            index = index + 1_usize
+            continue
+        }
+        current = current + ch
+        index = index + 1_usize
+    }
+    if trim_spaces(current) != "" {
+        out.push(trim_spaces(current))
+    }
+    ret out
+}
+
+fn strip_import_suffixes(value: str) -> str {
+    let mut out = trim_spaces(value)
+    let alias_index = find_substring(out, " as ")
+    if alias_index < out.len() {
+        out = out.slice(0_usize, alias_index)
+    }
+    if ends_with(out, "::*") {
+        out = out.slice(0_usize, out.len() - 3_usize)
+    }
+    ret trim_spaces(out)
+}
+
+fn find_matching_brace(value: str, start: usize) -> usize {
+    let mut depth = 0_usize
+    let mut index = start
+    while index < value.len() {
+        let ch = value.slice(index, 1_usize)
+        if ch == "{" {
+            depth = depth + 1_usize
+        }
+        elif ch == "}" {
+            depth = depth - 1_usize
+            if depth == 0_usize {
+                ret index
+            }
+        }
+        index = index + 1_usize
+    }
+    panic("Unbalanced import braces: " + value)
+    ret start
+}
+
+fn trim_spaces(value: str) -> str {
+    let mut start = 0_usize
+    while start < value.len() && is_space(value.slice(start, 1_usize)) {
+        start = start + 1_usize
+    }
+
+    let mut end = value.len()
+    while end > start && is_space(value.slice(end - 1_usize, 1_usize)) {
+        end = end - 1_usize
+    }
+
+    ret value.slice(start, end - start)
+}
+
+fn is_space(ch: str) -> bool {
+    ret ch == " " || ch == "\n" || ch == "\t" || ch == "\r"
+}
+
+fn starts_with(value: str, prefix: str) -> bool {
+    if prefix.len() > value.len() {
+        ret false
+    }
+    ret value.slice(0_usize, prefix.len()) == prefix
+}
+
+fn ends_with(value: str, suffix: str) -> bool {
+    if suffix.len() > value.len() {
+        ret false
+    }
+    ret value.slice(value.len() - suffix.len(), suffix.len()) == suffix
+}
+
+fn find_substring(value: str, needle: str) -> usize {
+    if needle.len() == 0_usize {
+        ret 0_usize
+    }
+    if needle.len() > value.len() {
+        ret value.len()
+    }
+
+    let mut index = 0_usize
+    while index + needle.len() <= value.len() {
+        if value.slice(index, needle.len()) == needle {
+            ret index
+        }
+        index = index + 1_usize
+    }
+    ret value.len()
+}
+
+fn find_char(value: str, needle: str, start: usize) -> usize {
+    let mut index = start
+    while index < value.len() {
+        if value.slice(index, 1_usize) == needle {
+            ret index
+        }
+        index = index + 1_usize
+    }
+    ret value.len()
+}
+
+fn contains_string(items: Vec[str], target: str) -> bool {
+    let mut index = 0_usize
+    while index < items.len() {
+        match items.get(index) {
+            Option[str]::Some(value) => {
+                if value == target {
+                    ret true
+                }
+            }
+            Option[str]::None => {
+            }
+        }
+        index = index + 1_usize
+    }
+    ret false
+}
+
+fn native_path(value: str) -> str {
+    ret replace_backslashes(value)
+}
+
+fn replace_backslashes(value: str) -> str {
+    let mut out = ""
+    let mut index = 0_usize
+    while index < value.len() {
+        let ch = value.slice(index, 1_usize)
+        if ch == "\\" {
+            out = out + "/"
+        }
+        else {
+            out = out + ch
+        }
+        index = index + 1_usize
+    }
+    ret out
+}
