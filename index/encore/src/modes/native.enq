@@ -1,0 +1,265 @@
+import core::fmt::Debug
+import core::option::Option
+import std::io::println
+import std::os::{argc, argv, core_dir, file_exists, home_dir, write_file}
+import std::path::Path
+import std::process::run
+import std::vec::Vec
+
+import mod::build::{compile_project, compile_project_with_profile, requested_profile}
+import refrain::project::manifest::{ProjectManifest, project_manifest_add_dependency, project_manifest_dependencies, project_manifest_has_dependency, project_manifest_name, read_project_manifest, write_project_manifest}
+
+pub fn native_run() -> u32 {
+    let root = Path::new(".").resolve()
+    let profile = requested_profile("debug")
+    let code = compile_project_with_profile(root, profile)
+    if code != 0_u32 { ret code }
+    let manifest = read_project_manifest(root)
+    let binary = root.join("target").join(profile).join(project_manifest_name(manifest))
+    let mut command = shell_quote(binary.as_str())
+    let mut index = 2_usize
+    if arg_or(index, "") == "--" { index = index + 1_usize }
+    while index < argc() {
+        match argv(index) {
+            Some(value) => { command = command + " " + shell_quote(value) }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret normalize_exit(run(command))
+}
+
+pub fn native_init() -> u32 {
+    let root = Path::new(".").resolve()
+    let mut name = path_name_or(root, "project")
+    let mut index = 2_usize
+    while index < argc() {
+        let arg = arg_or(index, "")
+        if arg == "--name" && index + 1_usize < argc() {
+            name = arg_or(index + 1_usize, name)
+            index = index + 1_usize
+        }
+        index = index + 1_usize
+    }
+    let manifest_path = root.join("encore.toml")
+    if !file_exists(manifest_path.as_str()) {
+        let source = "[project]\nname = \"" + escape_toml(name) + "\"\nversion = \"0.0.0\"\ndescription = \"\"\nreadme = \"README.md\"\nlicence = \"MIT\"\ndependencies = []\n"
+        if write_file(manifest_path.as_str(), source) != 0_i32 { ret native_mode_fail("Unable to write encore.toml") }
+    }
+    let src = root.join("src")
+    if run("mkdir -p " + shell_quote(src.as_str())) != 0_i32 { ret native_mode_fail("Unable to create src") }
+    let main_path = src.join("main.enq")
+    if !file_exists(main_path.as_str()) {
+        if write_file(main_path.as_str(), "fn main() -> u32 {\n  ret 0\n}\n") != 0_i32 { ret native_mode_fail("Unable to write src/main.enq") }
+    }
+    let readme = root.join("README.md")
+    if !file_exists(readme.as_str()) { write_file(readme.as_str(), "") }
+    let gitignore = root.join(".gitignore")
+    if !file_exists(gitignore.as_str()) { write_file(gitignore.as_str(), "target\n") }
+    if !file_exists(root.join(".git").as_str()) {
+        if run("git init " + shell_quote(root.as_str())) != 0_i32 { ret native_mode_fail("git init failed") }
+    }
+    println("Initialized " + name + " in " + root.as_str())
+    ret 0_u32
+}
+
+pub fn native_add() -> u32 {
+    if argc() < 3_usize { ret native_mode_fail("Usage: encore add <name|git@repo|path@path>") }
+    let root = Path::new(".").resolve()
+    let raw = arg_or(2_usize, "")
+    if starts_with(raw, "sys@") { ret native_mode_fail("System dependencies cannot be added manually") }
+    let dependency = normalize_package_ref(raw)
+    let mut manifest = read_project_manifest(root)
+    if project_manifest_has_dependency(manifest, dependency) {
+        println("Dependency already exists: " + dependency)
+        ret 0_u32
+    }
+    if resolve_dependency(dependency, root, false) == "" { ret 1_u32 }
+    project_manifest_add_dependency(manifest, dependency)
+    if write_project_manifest(root, manifest) != 0_i32 { ret native_mode_fail("Unable to update encore.toml") }
+    ret sync_root(root, false, "Added: " + dependency)
+}
+
+pub fn native_sync(force_update: bool) -> u32 {
+    let mut update = force_update
+    let mut index = 2_usize
+    while index < argc() {
+        if arg_or(index, "") == "--update" { update = true }
+        index = index + 1_usize
+    }
+    ret sync_root(Path::new(".").resolve(), update, if update { "Updated dependencies" } else { "Synced dependencies" })
+}
+
+pub fn native_install() -> u32 {
+    let cwd = Path::new(".").resolve()
+    let mut project = cwd
+    let mut bin_dir = Path::new(home_dir()).join(".encore").join("bin")
+    let mut installed_name = ""
+    let mut force = false
+    let mut update = false
+    let mut package = ""
+    let mut profile = "extreme"
+    let mut index = 2_usize
+    while index < argc() {
+        let arg = arg_or(index, "")
+        if arg == "--path" && index + 1_usize < argc() { project = Path::new(arg_or(index + 1_usize, ".")).resolve() index = index + 1_usize }
+        elif arg == "--root" && index + 1_usize < argc() { bin_dir = Path::new(arg_or(index + 1_usize, "")).expanduser().resolve().join("bin") index = index + 1_usize }
+        elif arg == "--bin-dir" && index + 1_usize < argc() { bin_dir = Path::new(arg_or(index + 1_usize, "")).expanduser().resolve() index = index + 1_usize }
+        elif arg == "--name" && index + 1_usize < argc() { installed_name = arg_or(index + 1_usize, "") index = index + 1_usize }
+        elif arg == "--force" { force = true }
+        elif arg == "--update" { update = true }
+        elif arg == "--debug" { profile = "debug" }
+        elif (arg == "--profile" || arg == "--opt-profile") && index + 1_usize < argc() { profile = arg_or(index + 1_usize, profile) index = index + 1_usize }
+        elif !starts_with(arg, "-") && package == "" { package = arg }
+        index = index + 1_usize
+    }
+    if package != "" {
+        let reference = normalize_package_ref(package)
+        let resolved = resolve_dependency(reference, cwd, update)
+        if resolved == "" { ret 1_u32 }
+        project = Path::new(resolved)
+    }
+    let build_code = compile_project_with_profile(project, profile)
+    if build_code != 0_u32 { ret build_code }
+    let manifest = read_project_manifest(project)
+    let project_name = project_manifest_name(manifest)
+    if installed_name == "" { installed_name = project_name }
+    if installed_name == "" || installed_name == "." || installed_name == ".." || contains_separator(installed_name) { ret native_mode_fail("Invalid installed binary name") }
+    mkdir_parents(bin_dir)
+    let source = project.join("target").join(profile).join(project_name)
+    let destination = bin_dir.join(installed_name)
+    if file_exists(destination.as_str()) && !force { ret native_mode_fail("Installed binary already exists: " + destination.as_str() + ". Use --force") }
+    let command = "cp " + shell_quote(source.as_str()) + " " + shell_quote(destination.as_str()) + " && chmod +x " + shell_quote(destination.as_str())
+    if run(command) != 0_i32 { ret native_mode_fail("Unable to install binary") }
+    println("Installed " + project_name + " -> " + destination.as_str())
+    ret 0_u32
+}
+
+fn sync_root(root: Path, update: bool, message: str) -> u32 {
+    let manifest = read_project_manifest(root)
+    let dependencies = project_manifest_dependencies(manifest)
+    let mut lock = "# Generated by Encore.\n"
+    let mut count = 0_usize
+    let mut index = 0_usize
+    while index < dependencies.len() {
+        match dependencies.get(index) {
+            Some(dependency) => {
+                let resolved = resolve_dependency(dependency, root, update)
+                if resolved == "" { ret 1_u32 }
+                lock = lock + dependency + " = " + resolved + "\n"
+                count = count + 1_usize
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    if write_file(root.join("encore.lock").as_str(), lock) != 0_i32 { ret native_mode_fail("Unable to write encore.lock") }
+    println(message + ": " + Debug::fmt(count) + " packages -> encore.lock")
+    ret 0_u32
+}
+
+fn resolve_dependency(reference: str, base: Path, update: bool) -> str {
+    if reference == "sys@core" { ret Path::new(core_dir()).resolve().as_str() }
+    if starts_with(reference, "path@") {
+        let path = base.join(reference.slice(5_usize, reference.len() - 5_usize)).resolve()
+        if !file_exists(path.join("encore.toml").as_str()) { native_mode_fail("Invalid path dependency: " + path.as_str()) ret "" }
+        ret path.as_str()
+    }
+    if starts_with(reference, "git@") {
+        let url = reference.slice(4_usize, reference.len() - 4_usize)
+        let repository = trim_git_suffix(path_name_or(Path::new(url), "repository"))
+        let owner = parent_name_or(Path::new(url), "git")
+        let destination = Path::new(home_dir()).join(".cache").join("encore").join("git").join(owner).join(repository)
+        match destination.parent() { Some(value) => { mkdir_parents(value) } None => { mkdir_parents(destination) } }
+        if !file_exists(destination.join(".git").as_str()) {
+            if run("git clone " + shell_quote(url) + " " + shell_quote(destination.as_str())) != 0_i32 { native_mode_fail("Unable to clone " + url) ret "" }
+        }
+        elif update {
+            if run("git -C " + shell_quote(destination.as_str()) + " pull --ff-only") != 0_i32 { native_mode_fail("Unable to update " + url) ret "" }
+        }
+        ret destination.as_str()
+    }
+    native_mode_fail("Unsupported dependency reference: " + reference)
+    ret ""
+}
+
+fn locate_core(base: Path) -> Path {
+    let mut current = base
+    let mut depth = 0_usize
+    while depth < 12_usize {
+        let direct = current.join("core")
+        if file_exists(direct.join("encore.toml").as_str()) { ret direct }
+        match current.parent() { Some(parent) => { current = parent } None => { break } }
+        depth = depth + 1_usize
+    }
+    ret base.join("core")
+}
+
+fn mkdir_parents(path: Path) -> () {
+    run("mkdir -p " + shell_quote(path.as_str()))
+    ret ()
+}
+
+fn normalize_package_ref(raw: str) -> str {
+    if starts_with(raw, "git@") || starts_with(raw, "path@") { ret raw }
+    if starts_with(raw, ".") || starts_with(raw, "/") || starts_with(raw, "~") { ret "path@" + raw }
+    ret "git@https://github.com/encore-language-index/" + raw
+}
+
+fn arg_or(index: usize, fallback: str) -> str {
+    match argv(index) { Some(value) => { ret value } None => { ret fallback } }
+}
+fn normalize_exit(code: i32) -> u32 {
+    if code < 0_i32 { ret 1_u32 }
+    ret code as u32
+}
+fn native_mode_fail(message: str) -> u32 {
+    println("Error: " + message)
+    ret 1_u32
+}
+fn path_name_or(path: Path, fallback: str) -> str {
+    match path.name() { Some(value) => { ret value } None => { ret fallback } }
+}
+fn parent_name_or(path: Path, fallback: str) -> str {
+    match path.parent() {
+        Some(parent) => { ret path_name_or(parent, fallback) }
+        None => { ret fallback }
+    }
+}
+fn trim_git_suffix(value: str) -> str {
+    if value.len() > 4_usize && value.slice(value.len() - 4_usize, 4_usize) == ".git" { ret value.slice(0_usize, value.len() - 4_usize) }
+    ret value
+}
+fn contains_separator(value: str) -> bool { ret contains(value, "/") || contains(value, "\\") }
+fn contains(value: str, needle: str) -> bool {
+    let mut i = 0_usize
+    while i + needle.len() <= value.len() {
+        if value.slice(i, needle.len()) == needle { ret true }
+        i = i + 1_usize
+    }
+    ret false
+}
+fn starts_with(value: str, prefix: str) -> bool { ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix }
+fn shell_quote(value: str) -> str {
+    let mut out = "'"
+    let mut i = 0_usize
+    while i < value.len() {
+        let ch = value.slice(i, 1_usize)
+        if ch == "'" { out = out + "'\\''" }
+        else { out = out + ch }
+        i = i + 1_usize
+    }
+    ret out + "'"
+}
+fn escape_toml(value: str) -> str {
+    let mut out = ""
+    let mut i = 0_usize
+    while i < value.len() {
+        let ch = value.slice(i, 1_usize)
+        if ch == "\\" { out = out + "\\\\" }
+        elif ch == "\"" { out = out + "\\\"" }
+        else { out = out + ch }
+        i = i + 1_usize
+    }
+    ret out
+}
