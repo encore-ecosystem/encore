@@ -19,7 +19,14 @@ switch ($arch) {
     default { throw "Unsupported architecture: $arch" }
 }
 $repository = if ($env:ENCORE_REPOSITORY) { $env:ENCORE_REPOSITORY } else { "encore-language/encore" }
-$base = if ($Version -eq "latest") {
+$releaseBase = $env:ENCORE_RELEASE_BASE_URL
+$base = if ($releaseBase) {
+    $uri = [System.Uri]$releaseBase
+    if ($uri.Scheme -notin @("https", "file")) {
+        throw "ENCORE_RELEASE_BASE_URL must use https:// or file://"
+    }
+    $releaseBase.TrimEnd("/")
+} elseif ($Version -eq "latest") {
     "https://github.com/$repository/releases/latest/download"
 } else {
     "https://github.com/$repository/releases/download/$Version"
@@ -28,8 +35,15 @@ $asset = "encore-$triple.zip"
 $temp = Join-Path ([System.IO.Path]::GetTempPath()) ("encore-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $temp | Out-Null
 try {
-    Invoke-WebRequest "$base/$asset" -OutFile (Join-Path $temp $asset)
-    Invoke-WebRequest "$base/$asset.sha256" -OutFile (Join-Path $temp "$asset.sha256")
+    foreach ($name in @($asset, "$asset.sha256")) {
+        $source = [System.Uri]("$base/$name")
+        $destination = Join-Path $temp $name
+        if ($source.IsFile) {
+            Copy-Item -LiteralPath $source.LocalPath -Destination $destination
+        } else {
+            Invoke-WebRequest $source.AbsoluteUri -OutFile $destination
+        }
+    }
     $expected = ((Get-Content (Join-Path $temp "$asset.sha256")) -split "\s+")[0].ToLowerInvariant()
     $actual = (Get-FileHash (Join-Path $temp $asset) -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($expected -ne $actual) { throw "Checksum verification failed" }

@@ -1,0 +1,49 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$Archive
+)
+
+$ErrorActionPreference = "Stop"
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$archivePath = (Resolve-Path $Archive).Path
+$checksumPath = "$archivePath.sha256"
+if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) {
+    throw "Archive checksum is required: $checksumPath"
+}
+
+$temp = Join-Path ([System.IO.Path]::GetTempPath()) ("encore-smoke-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $temp | Out-Null
+$previousHome = $env:ENCORE_HOME
+$previousVersion = $env:ENCORE_VERSION
+$previousBase = $env:ENCORE_RELEASE_BASE_URL
+try {
+    $installRoot = Join-Path $temp "home"
+    $archiveDirectory = Split-Path -Parent $archivePath
+    $env:ENCORE_HOME = $installRoot
+    $env:ENCORE_VERSION = "smoke"
+    $env:ENCORE_RELEASE_BASE_URL = ([System.Uri]$archiveDirectory).AbsoluteUri
+    & (Join-Path $repoRoot "install.ps1")
+
+    $compiler = Join-Path $installRoot "bin/encore.exe"
+    & $compiler --version
+
+    $project = Join-Path $temp "project"
+    Copy-Item -Recurse (Join-Path $repoRoot "examples/add_two_structs") $project
+    Remove-Item -Recurse -Force (Join-Path $project "target") -ErrorAction SilentlyContinue
+    Push-Location $project
+    try {
+        & $compiler build --profile debug
+        if ($LASTEXITCODE -ne 0) { throw "Installed compiler failed to build smoke project" }
+        & (Join-Path $project "target/debug/add_two_structs.exe")
+        if ($LASTEXITCODE -ne 12) {
+            throw "Smoke binary returned $LASTEXITCODE instead of 12"
+        }
+    } finally {
+        Pop-Location
+    }
+} finally {
+    $env:ENCORE_HOME = $previousHome
+    $env:ENCORE_VERSION = $previousVersion
+    $env:ENCORE_RELEASE_BASE_URL = $previousBase
+    Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue
+}

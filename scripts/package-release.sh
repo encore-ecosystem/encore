@@ -11,6 +11,8 @@ triple=$2
 version=$3
 output_dir=$4
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+mkdir -p "$output_dir"
+output_dir=$(CDPATH= cd -- "$output_dir" && pwd)
 package_name="encore-${version}-${triple}"
 work_dir="${output_dir}/.package-${triple}"
 stage="${work_dir}/${package_name}"
@@ -30,7 +32,6 @@ cp "$repo_root/LICENSE" "$stage/share/doc/encore/LICENSE"
 cp "$repo_root/README.md" "$stage/share/doc/encore/README.md"
 printf '%s\n' "$version" > "$stage/VERSION"
 
-mkdir -p "$output_dir"
 if [ "$binary_name" = "encore.exe" ]; then
     archive="${output_dir}/encore-${triple}.zip"
     rm -f "$archive"

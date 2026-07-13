@@ -26,7 +26,8 @@ The installer verifies the release checksum. Set `ENCORE_VERSION` to install a
 specific tag, or run the installer again to update. Uninstall with
 `install.sh --uninstall` or `install.ps1 -Uninstall`.
 Set `ENCORE_RELEASE_BASE_URL` to an HTTPS release mirror containing archives
-and their `.sha256` files.
+and their `.sha256` files. `file://` URLs are accepted for offline installation
+and installer testing on Unix and Windows.
 
 Building programs requires `clang` or a configured target toolchain.
 
