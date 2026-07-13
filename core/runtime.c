@@ -1,4 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#ifdef _WIN32
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -25,7 +28,6 @@
 #include <mach-o/dyld.h>
 #endif
 #ifdef _WIN32
-#define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winsock2.h>
