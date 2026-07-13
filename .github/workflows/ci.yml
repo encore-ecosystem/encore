@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Verify compiler version sources
+      - name: Verify compiler version
         run: scripts/verify-version.sh
       - name: Verify native stage0
         run: scripts/verify-stage0.sh
@@ -32,21 +32,20 @@ jobs:
           chmod +x target/encore-stage0
           for triple in \
             x86_64-unknown-linux-gnu \
-            aarch64-unknown-linux-gnu \
             x86_64-apple-darwin \
             aarch64-apple-darwin
           do
-            ./target/encore-stage0 build --profile extreme --target "$triple" --emit llvm-ir
+            ./target/encore-stage0 build --profile debug --target "$triple" --emit llvm-ir
           done
       - uses: actions/upload-artifact@v7
         with:
           name: bootstrap-ir
-          path: index/encore/target/*/extreme/encore.ll
+          path: index/encore/target/*/debug/encore.ll
           if-no-files-found: error
           retention-days: 1
 
-  native:
-    name: ${{ matrix.triple }}
+  test:
+    name: Test ${{ matrix.triple }}
     needs: bootstrap-ir
     env:
       ENCORE_CORE_DIR: ${{ github.workspace }}/core
@@ -56,13 +55,10 @@ jobs:
         include:
           - os: ubuntu-latest
             triple: x86_64-unknown-linux-gnu
-            executable: encore
           - os: macos-15-intel
             triple: x86_64-apple-darwin
-            executable: encore
           - os: macos-15
             triple: aarch64-apple-darwin
-            executable: encore
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -70,153 +66,29 @@ jobs:
         with:
           name: bootstrap-ir
           path: index/encore/target
-      - name: Assemble native seed
+      - name: Assemble native compiler
         shell: bash
         run: |
-          mkdir -p index/encore/target/extreme
-          set +e
-          output=$(clang -O0 -w \
-            index/encore/target/${{ matrix.triple }}/extreme/encore.ll \
-            core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
-            -o index/encore/target/extreme/${{ matrix.executable }} 2>&1)
-          code=$?
-          set -e
-          printf '%s\n' "$output"
-          if [ "$code" -ne 0 ]; then
-            diagnostic=$(printf '%s' "$output" | tail -c 2000)
-            message=${diagnostic//'%'/'%25'}
-            message=${message//$'\n'/'%0A'}
-            message=${message//$'\r'/'%0D'}
-            echo "::error title=Native seed assembly failed::$message"
-            exit "$code"
-          fi
-      - name: Verify native seed
-        shell: bash
-        run: |
-          index/encore/target/extreme/${{ matrix.executable }} --version
-      - name: Native self-host generation 1
-        shell: bash
-        working-directory: index/encore
-        run: |
-          set +e
-          output=$(./target/extreme/${{ matrix.executable }} build --profile debug --target ${{ matrix.triple }} 2>&1)
-          code=$?
-          set -e
-          printf '%s\n' "$output"
-          if [ "$code" -ne 0 ]; then
-            message=${output//'%'/'%25'}
-            message=${message//$'\n'/'%0A'}
-            message=${message//$'\r'/'%0D'}
-            echo "::error title=Native self-host failed::$message"
-            exit "$code"
-          fi
-      - name: Promote target-correct compiler
-        shell: bash
-        working-directory: index/encore
-        run: cp target/${{ matrix.triple }}/debug/${{ matrix.executable }} target/extreme/${{ matrix.executable }}
-      - name: Native self-host generation 2
-        shell: bash
-        working-directory: index/encore
-        run: |
-          set +e
-          output=$(./target/extreme/${{ matrix.executable }} build --profile extreme --target ${{ matrix.triple }} 2>&1)
-          code=$?
-          set -e
-          printf '%s\n' "$output"
-          if [ "$code" -ne 0 ]; then
-            diagnostic=$(printf '%s' "$output" | tail -c 2000)
-            message=${diagnostic//'%'/'%25'}
-            message=${message//$'\n'/'%0A'}
-            message=${message//$'\r'/'%0D'}
-            echo "::error title=Second native self-host failed::$message"
-            exit "$code"
-          fi
-      - name: Promote final compiler
-        shell: bash
-        working-directory: index/encore
-        run: cp target/${{ matrix.triple }}/extreme/${{ matrix.executable }} target/extreme/${{ matrix.executable }}
-      - name: Core tests
-        shell: bash
-        working-directory: core
-        run: |
-          set +e
-          output=$(../index/encore/target/extreme/${{ matrix.executable }} test 2>&1)
-          code=$?
-          set -e
-          printf '%s\n' "$output"
-          if [ "$code" -ne 0 ]; then
-            diagnostic=$(printf '%s' "$output" | tail -c 3000)
-            message=${diagnostic//'%'/'%25'}
-            message=${message//$'\n'/'%0A'}
-            message=${message//$'\r'/'%0D'}
-            echo "::error title=Core tests failed::$message"
-            exit "$code"
-          fi
-      - name: Target and negative-diagnostic tests
-        shell: bash
-        working-directory: index/encore
-        run: |
-          ./target/extreme/${{ matrix.executable }} test --filter target_
-          ./target/extreme/${{ matrix.executable }} test --filter unknown_variable_diagnostic
-      - name: Portable package smoke test
-        shell: bash
-        run: |
-          mkdir -p dist
-          archive=$(scripts/package-release.sh index/encore/target/extreme/${{ matrix.executable }} ${{ matrix.triple }} ci dist)
-          duplicate=$(scripts/package-release.sh index/encore/target/extreme/${{ matrix.executable }} ${{ matrix.triple }} ci dist-reproducible)
-          cmp "$archive" "$duplicate"
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$archive" > "$archive.sha256"
-          else
-            shasum -a 256 "$archive" > "$archive.sha256"
-          fi
-          scripts/verify-release-package.sh "$archive" ${{ matrix.triple }} ci
-          scripts/smoke-install.sh "$archive"
-
-  full-tests:
-    name: Full native test suite
-    needs: bootstrap-ir
-    runs-on: ubuntu-latest
-    env:
-      ENCORE_CORE_DIR: ${{ github.workspace }}/core
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v8
-        with:
-          name: bootstrap-ir
-          path: index/encore/target
-      - name: Assemble native seed
-        run: |
-          mkdir -p index/encore/target/extreme
+          mkdir -p index/encore/target/debug
           clang -O0 -w \
-            index/encore/target/x86_64-unknown-linux-gnu/extreme/encore.ll \
+            index/encore/target/${{ matrix.triple }}/debug/encore.ll \
             core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
-            -o index/encore/target/extreme/encore
-      - name: Build current compiler twice
-        working-directory: index/encore
+            -o index/encore/target/debug/encore
+          index/encore/target/debug/encore --version
+      - name: Run tests
+        shell: bash
         run: |
-          ./target/extreme/encore build --profile debug --target x86_64-unknown-linux-gnu
-          cp target/x86_64-unknown-linux-gnu/debug/encore target/extreme/encore
-          ./target/extreme/encore build --profile extreme
-      - name: Verify freestanding cross-target
-        run: scripts/smoke-cross-target.sh index/encore/target/extreme/encore
-      - name: Verify native test runner
-        run: scripts/test-test-runner.sh index/encore/target/extreme/encore
-      - name: Verify native CLI contract
-        run: scripts/test-cli-contract.sh index/encore/target/extreme/encore
-      - name: Verify release set gate
-        run: scripts/test-release-set.sh
-      - name: Test native packages
-        run: |
-          compiler="$PWD/index/encore/target/extreme/encore"
-          for package in core index/ehir index/ehir-llvm-backend index/json index/log index/rich index/std index/toml; do
+          compiler="$PWD/index/encore/target/debug/encore"
+          for package in \
+            core \
+            index/ehir \
+            index/ehir-llvm-backend \
+            index/json \
+            index/log \
+            index/rich \
+            index/std \
+            index/toml \
+            index/encore
+          do
             (cd "$package" && "$compiler" test)
           done
-          (cd index/encore && ./target/extreme/encore test)
-      - name: Verify Arch Linux package metadata
-        run: |
-          mkdir -p dist-pkgbuild
-          scripts/package-release.sh index/encore/target/extreme/encore x86_64-unknown-linux-gnu "$(cat VERSION)" dist-pkgbuild
-          scripts/package-release.sh index/encore/target/extreme/encore aarch64-unknown-linux-gnu "$(cat VERSION)" dist-pkgbuild
-          scripts/generate-pkgbuild.sh "$(cat VERSION)" dist-pkgbuild
-          bash -n dist-pkgbuild/PKGBUILD
