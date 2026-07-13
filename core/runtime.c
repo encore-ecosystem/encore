@@ -33,6 +33,7 @@
 #include <io.h>
 #include <process.h>
 #pragma comment(lib, "Ws2_32.lib")
+#pragma comment(linker, "/STACK:8388608")
 #else
 #include <sys/time.h>
 #include <sys/wait.h>
