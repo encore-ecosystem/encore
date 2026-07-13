@@ -51,12 +51,16 @@ try {
     Expand-Archive (Join-Path $temp $asset) $unpack
     $package = Get-ChildItem $unpack -Directory | Select-Object -First 1
     if (-not $package) { throw "Release archive is empty" }
+    $packageVersion = Get-Content (Join-Path $package.FullName "VERSION")
+    if ($Version -ne "latest" -and $packageVersion -ne $Version) {
+        throw "Release version mismatch: requested $Version, archive contains $packageVersion"
+    }
     New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
     @("bin", "lib", "share", "VERSION") | ForEach-Object {
         Remove-Item -Recurse -Force (Join-Path $InstallRoot $_) -ErrorAction SilentlyContinue
         Copy-Item -Recurse -Force (Join-Path $package.FullName $_) $InstallRoot
     }
-    Write-Host "Installed Encore $(Get-Content (Join-Path $InstallRoot 'VERSION')) in $InstallRoot"
+    Write-Host "Installed Encore $packageVersion in $InstallRoot"
     Write-Host "Add $InstallRoot\bin to PATH"
 } finally {
     Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue

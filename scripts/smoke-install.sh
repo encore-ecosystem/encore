@@ -25,6 +25,17 @@ ENCORE_RELEASE_BASE_URL="file://$archive_dir" \
     "$repo_root/install.sh"
 
 "$tmp/home/bin/encore" --version
+
+set +e
+mismatch_output=$(ENCORE_HOME="$tmp/mismatch" \
+    ENCORE_VERSION=wrong-version \
+    ENCORE_RELEASE_BASE_URL="file://$archive_dir" \
+    "$repo_root/install.sh" 2>&1)
+mismatch_code=$?
+set -e
+test "$mismatch_code" -ne 0
+printf '%s\n' "$mismatch_output" | grep -q "Release version mismatch"
+
 cp -R "$repo_root/examples/add_two_structs" "$tmp/project"
 rm -rf "$tmp/project/target"
 set +e

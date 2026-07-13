@@ -27,6 +27,17 @@ try {
     $compiler = Join-Path $installRoot "bin/encore.exe"
     & $compiler --version
 
+    $env:ENCORE_HOME = Join-Path $temp "mismatch"
+    $env:ENCORE_VERSION = "wrong-version"
+    try {
+        & (Join-Path $repoRoot "install.ps1")
+        throw "Installer accepted an archive with the wrong version"
+    } catch {
+        if ($_.Exception.Message -notlike "*Release version mismatch*") { throw }
+    }
+    $env:ENCORE_HOME = $installRoot
+    $env:ENCORE_VERSION = "smoke"
+
     $project = Join-Path $temp "project"
     Copy-Item -Recurse (Join-Path $repoRoot "examples/add_two_structs") $project
     Remove-Item -Recurse -Force (Join-Path $project "target") -ErrorAction SilentlyContinue
