@@ -25,6 +25,8 @@ irm https://raw.githubusercontent.com/encore-language/encore/trunk/install.ps1 |
 The installer verifies the release checksum. Set `ENCORE_VERSION` to install a
 specific tag, or run the installer again to update. Uninstall with
 `install.sh --uninstall` or `install.ps1 -Uninstall`.
+Set `ENCORE_RELEASE_BASE_URL` to an HTTPS release mirror containing archives
+and their `.sha256` files.
 
 Building programs requires `clang` or a configured target toolchain.
 

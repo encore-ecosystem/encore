@@ -4,6 +4,7 @@ set -eu
 repository=${ENCORE_REPOSITORY:-encore-language/encore}
 install_root=${ENCORE_HOME:-"$HOME/.encore"}
 version=${ENCORE_VERSION:-latest}
+release_base=${ENCORE_RELEASE_BASE_URL:-}
 
 if [ "${1:-}" = "--uninstall" ]; then
     rm -rf "$install_root"
@@ -25,15 +26,26 @@ case "$os" in
 esac
 
 asset="encore-${triple}.tar.gz"
-if [ "$version" = "latest" ]; then
+if [ -n "$release_base" ]; then
+    case "$release_base" in
+        https://*|file://*) ;;
+        *) echo "ENCORE_RELEASE_BASE_URL must use https:// or file://" >&2; exit 1 ;;
+    esac
+    base_url=${release_base%/}
+elif [ "$version" = "latest" ]; then
     base_url="https://github.com/${repository}/releases/latest/download"
 else
     base_url="https://github.com/${repository}/releases/download/${version}"
 fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-curl --fail --location --proto '=https' --tlsv1.2 "$base_url/$asset" -o "$tmp/$asset"
-curl --fail --location --proto '=https' --tlsv1.2 "$base_url/$asset.sha256" -o "$tmp/$asset.sha256"
+if [ -n "$release_base" ]; then
+    curl --fail --location "$base_url/$asset" -o "$tmp/$asset"
+    curl --fail --location "$base_url/$asset.sha256" -o "$tmp/$asset.sha256"
+else
+    curl --fail --location --proto '=https' --tlsv1.2 "$base_url/$asset" -o "$tmp/$asset"
+    curl --fail --location --proto '=https' --tlsv1.2 "$base_url/$asset.sha256" -o "$tmp/$asset.sha256"
+fi
 expected=$(awk '{print $1}' "$tmp/$asset.sha256")
 if command -v sha256sum >/dev/null 2>&1; then
     actual=$(sha256sum "$tmp/$asset" | awk '{print $1}')
