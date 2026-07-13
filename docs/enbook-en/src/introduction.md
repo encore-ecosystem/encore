@@ -1,51 +1,35 @@
 # Introduction
 
-Encore is an experimental programming language and compiler built around EHIR,
-the Encore High Intermediate Representation. The `0.1.x` line targets an open
-beta: the local compiler, EHIR/LLVM backend, `core`, `std`, examples and
-regression tests are intended to be usable for real small programs.
+Encore is a self-hosted programming language and native compiler built around
+EHIR, the Encore High Intermediate Representation, and LLVM.
 
-This book documents the beta surface that users should rely on before reading
-compiler sources:
-
-- project setup and CLI workflow;
-- core language syntax used by the regression suite and examples;
-- package manifests and native build-script integration;
-- the public `core` and `std` APIs.
-
-Linux is the primary validated beta platform. Other platforms are part of the
-design, but broad cross-platform validation is not complete yet.
+This book documents project setup, language syntax, packages, target
+toolchains, the memory model, and the standard library.
 
 ## Repository Layout
 
 | Path | Purpose |
 | --- | --- |
-| `src/encore` | Python compiler frontend and CLI |
-| `ehir` | EHIR library and compiler pipeline |
-| `ehir-llvm-backend` | LLVM backend for EHIR |
-| `core` | low-level Encore package injected by the compiler |
-| `std` | application standard library package |
-| `bootstrap` | language regression tests and bootstrap examples |
-| `index` | practical example packages |
+| `index/encore` | native compiler frontend and CLI |
+| `index/ehir` | native EHIR library and parser |
+| `index/ehir-llvm-backend` | native LLVM backend |
+| `core` | low-level package and C runtime |
+| `index/std` | application standard library |
+| `index/rich` | terminal rendering and progress UI |
+| `examples` | executable language examples |
 | `docs/enbook-en` | this user guide |
 
 ## Requirements
 
-- Python `>=3.13,<3.14`
-- `uv`
-- `clang`
-- LLVM-compatible native toolchain for the bundled backend
+- an installed Encore native compiler;
+- `clang` or another configured target toolchain.
 
-Install the project from the repository root:
+Verify the installation and target:
 
 ```sh
-uv sync
-uv run encore --help
+encore --version
+encore target
 ```
 
-When running from a package subdirectory, pass the root project to `uv` if
-needed:
-
-```sh
-uv run --project /path/to/encore encore test --no-cache
-```
+Python is not part of the compiler or runtime. The retired Python compiler is
+preserved only in the `v0.1.2` release history as a bootstrap fallback.

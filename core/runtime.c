@@ -11,6 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
 #define ENCORE_ADDRESS_SANITIZER 1
@@ -18,6 +22,7 @@
 #endif
 #ifdef __APPLE__
 #include <crt_externs.h>
+#include <mach-o/dyld.h>
 #endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -26,10 +31,12 @@
 #include <ws2tcpip.h>
 #include <direct.h>
 #include <io.h>
+#include <process.h>
 #pragma comment(lib, "Ws2_32.lib")
 #else
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <sys/utsname.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <time.h>
@@ -493,6 +500,59 @@ void *encore_str_from_cstr(const char *value) {
 }
 
 encore_str encore_os_core_dir(void) {
+    const char *configured = getenv("ENCORE_CORE_DIR");
+    if (configured != NULL && configured[0] != '\0') {
+        return encore_from_cstr_copy(configured);
+    }
+
+    const char *home = getenv("ENCORE_HOME");
+    if (home != NULL && home[0] != '\0') {
+        size_t len = strlen(home);
+        const char *suffix = "/lib/encore/core";
+        char *path = malloc(len + strlen(suffix) + 1);
+        if (path != NULL) {
+            memcpy(path, home, len);
+            memcpy(path + len, suffix, strlen(suffix) + 1);
+            return encore_from_owned_buffer(path, len + strlen(suffix));
+        }
+    }
+
+    char executable[PATH_MAX];
+    size_t executable_len = 0;
+#ifdef _WIN32
+    DWORD written = GetModuleFileNameA(NULL, executable, (DWORD)sizeof(executable));
+    if (written > 0 && written < sizeof(executable)) executable_len = (size_t)written;
+#elif defined(__APPLE__)
+    uint32_t capacity = (uint32_t)sizeof(executable);
+    if (_NSGetExecutablePath(executable, &capacity) == 0) executable_len = strlen(executable);
+#else
+    ssize_t written = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+    if (written > 0) { executable[written] = '\0'; executable_len = (size_t)written; }
+#endif
+    if (executable_len > 0) {
+        char *separator = strrchr(executable, '/');
+#ifdef _WIN32
+        char *backslash = strrchr(executable, '\\');
+        if (backslash != NULL && (separator == NULL || backslash > separator)) separator = backslash;
+#endif
+        if (separator != NULL) {
+            size_t bin_dir_len = (size_t)(separator - executable);
+            const char *suffix = "/../lib/encore/core";
+            char *candidate = malloc(bin_dir_len + strlen(suffix) + 1);
+            if (candidate != NULL) {
+                memcpy(candidate, executable, bin_dir_len);
+                memcpy(candidate + bin_dir_len, suffix, strlen(suffix) + 1);
+                char manifest[PATH_MAX];
+                int length = snprintf(manifest, sizeof(manifest), "%s/encore.toml", candidate);
+                struct stat info;
+                if (length > 0 && (size_t)length < sizeof(manifest) && stat(manifest, &info) == 0) {
+                    return encore_from_owned_buffer(candidate, bin_dir_len + strlen(suffix));
+                }
+                free(candidate);
+            }
+        }
+    }
+
     const char *source = __FILE__;
     const char *separator = strrchr(source, '/');
 #ifdef _WIN32
@@ -1290,6 +1350,85 @@ int32_t encore_proc_run(encore_str command) {
 #endif
 }
 
+static int32_t encore_proc_run_args_impl(encore_str program, size_t raw_args, size_t args_len, const char *output_path) {
+    encore_str *args = (encore_str *)(uintptr_t)raw_args;
+    char *program_c = encore_to_cstr(program);
+    if (program_c == NULL) return -1;
+    char **argv = calloc(args_len + 2, sizeof(char *));
+    if (argv == NULL) { free(program_c); return -1; }
+    argv[0] = program_c;
+    size_t converted = 0;
+    for (; converted < args_len; converted += 1) {
+        argv[converted + 1] = encore_to_cstr(args[converted]);
+        if (argv[converted + 1] == NULL) break;
+    }
+    if (converted != args_len) {
+        for (size_t index = 0; index <= converted; index += 1) free(argv[index]);
+        free(argv);
+        return -1;
+    }
+
+    int32_t result = -1;
+#ifdef _WIN32
+    int saved_stdout = -1;
+    int saved_stderr = -1;
+    int output_fd = -1;
+    if (output_path != NULL) {
+        output_fd = _open(output_path, _O_CREAT | _O_TRUNC | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE);
+        if (output_fd < 0) goto cleanup;
+        saved_stdout = _dup(1);
+        saved_stderr = _dup(2);
+        if (saved_stdout < 0 || saved_stderr < 0 || _dup2(output_fd, 1) != 0 || _dup2(output_fd, 2) != 0) goto cleanup;
+    }
+    intptr_t status = _spawnvp(_P_WAIT, program_c, (const char *const *)argv);
+    if (status >= 0 && status <= INT32_MAX) result = (int32_t)status;
+cleanup:
+    if (saved_stdout >= 0) { fflush(stdout); _dup2(saved_stdout, 1); _close(saved_stdout); }
+    if (saved_stderr >= 0) { fflush(stderr); _dup2(saved_stderr, 2); _close(saved_stderr); }
+    if (output_fd >= 0) _close(output_fd);
+#else
+    pid_t child = fork();
+    if (child == 0) {
+        if (output_path != NULL) {
+            int output_fd = open(output_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (output_fd < 0 || dup2(output_fd, STDOUT_FILENO) < 0 || dup2(output_fd, STDERR_FILENO) < 0) _Exit(126);
+            close(output_fd);
+        }
+        execvp(program_c, argv);
+        _Exit(127);
+    }
+    if (child > 0) {
+        int status = 0;
+        if (waitpid(child, &status, 0) >= 0) {
+            if (WIFEXITED(status)) result = WEXITSTATUS(status);
+            else if (WIFSIGNALED(status)) result = 128 + WTERMSIG(status);
+        }
+    }
+#endif
+    for (size_t index = 0; index < args_len + 1; index += 1) free(argv[index]);
+    free(argv);
+    return result;
+}
+
+int32_t encore_proc_run_args_parts(encore_str program, size_t raw_args, size_t args_len) {
+    return encore_proc_run_args_impl(program, raw_args, args_len, NULL);
+}
+
+int32_t encore_proc_run_args_capture_parts(encore_str program, size_t raw_args, size_t args_len, encore_str output_path) {
+    char *output_c = encore_to_cstr(output_path);
+    if (output_c == NULL) return -1;
+    int32_t result = encore_proc_run_args_impl(program, raw_args, args_len, output_c);
+    free(output_c);
+    return result;
+}
+
+/* Compatibility with bootstrap objects emitted before Vec extern arguments
+ * were lowered to scalar ABI parts. LLVM passes this aggregate in registers. */
+int32_t encore_proc_run_args(encore_str program, encore_str *args, size_t len, size_t cap) {
+    (void)cap;
+    return encore_proc_run_args_parts(program, (size_t)(uintptr_t)args, len);
+}
+
 static bool g_args_initialized = false;
 static size_t g_argc = 0;
 static char **g_argv = NULL;
@@ -1481,6 +1620,35 @@ encore_str encore_os_home_dir(void) {
     return encore_from_cstr_copy(home);
 }
 
+encore_str encore_os_arch(void) {
+#ifdef _WIN32
+    SYSTEM_INFO info;
+    GetNativeSystemInfo(&info);
+    switch (info.wProcessorArchitecture) {
+        case PROCESSOR_ARCHITECTURE_AMD64: return encore_from_cstr_copy("x86_64");
+        case PROCESSOR_ARCHITECTURE_ARM64: return encore_from_cstr_copy("aarch64");
+        case PROCESSOR_ARCHITECTURE_INTEL: return encore_from_cstr_copy("i686");
+        case PROCESSOR_ARCHITECTURE_ARM: return encore_from_cstr_copy("arm");
+        default: return encore_from_cstr_copy("unknown");
+    }
+#else
+    struct utsname info;
+    if (uname(&info) != 0) return encore_from_cstr_copy("unknown");
+    if (strcmp(info.machine, "amd64") == 0) return encore_from_cstr_copy("x86_64");
+    if (strcmp(info.machine, "arm64") == 0) return encore_from_cstr_copy("aarch64");
+    return encore_from_cstr_copy(info.machine);
+#endif
+}
+
+encore_str encore_os_getenv(encore_str name) {
+    char *name_c = encore_to_cstr(name);
+    if (name_c == NULL) return encore_empty_str();
+    const char *value = getenv(name_c);
+    free(name_c);
+    if (value == NULL || value[0] == '\0') return encore_empty_str();
+    return encore_from_cstr_copy(value);
+}
+
 encore_str encore_fs_read_file(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
@@ -1557,6 +1725,40 @@ int32_t encore_fs_remove_file(encore_str path) {
     return result == 0 ? 0 : -1;
 }
 
+int32_t encore_fs_copy_file(encore_str source, encore_str destination) {
+    char *source_c = encore_to_cstr(source);
+    char *destination_c = encore_to_cstr(destination);
+    if (source_c == NULL || destination_c == NULL) { free(source_c); free(destination_c); return -1; }
+    FILE *input = fopen(source_c, "rb");
+    FILE *output = input == NULL ? NULL : fopen(destination_c, "wb");
+    free(source_c);
+    free(destination_c);
+    if (input == NULL || output == NULL) { if (input != NULL) fclose(input); if (output != NULL) fclose(output); return -1; }
+    char buffer[65536];
+    int32_t status = 0;
+    for (;;) {
+        size_t count = fread(buffer, 1, sizeof(buffer), input);
+        if (count > 0 && fwrite(buffer, 1, count, output) != count) { status = -1; break; }
+        if (count < sizeof(buffer)) { if (ferror(input)) status = -1; break; }
+    }
+    if (fclose(input) != 0 || fclose(output) != 0) status = -1;
+    return status;
+}
+
+int32_t encore_fs_set_executable(encore_str path) {
+#ifdef _WIN32
+    (void)path;
+    return 0;
+#else
+    char *path_c = encore_to_cstr(path);
+    if (path_c == NULL) return -1;
+    struct stat info;
+    int32_t status = stat(path_c, &info) == 0 && chmod(path_c, info.st_mode | S_IXUSR | S_IXGRP | S_IXOTH) == 0 ? 0 : -1;
+    free(path_c);
+    return status;
+#endif
+}
+
 int32_t encore_fs_mkdir(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
@@ -1567,11 +1769,38 @@ int32_t encore_fs_mkdir(encore_str path) {
 #ifdef _WIN32
         _mkdir(path_c);
 #else
-        mkdir(path_c, 0755);
+        mkdirat(AT_FDCWD, path_c, 0755);
 #endif
     int32_t status = (rc == 0 || errno == EEXIST) ? 0 : -1;
     free(path_c);
     return status;
+}
+
+int32_t encore_fs_mkdir_all(encore_str path) {
+    char *path_c = encore_to_cstr(path);
+    if (path_c == NULL || path_c[0] == '\0') { free(path_c); return -1; }
+    size_t len = strlen(path_c);
+    for (size_t index = 1; index <= len; index += 1) {
+        bool boundary = index == len || path_c[index] == '/' || path_c[index] == '\\';
+        if (!boundary) continue;
+#ifdef _WIN32
+        if (index == 2 && path_c[1] == ':') continue;
+#endif
+        char saved = path_c[index];
+        path_c[index] = '\0';
+        if (path_c[0] != '\0') {
+            int rc =
+#ifdef _WIN32
+                _mkdir(path_c);
+#else
+                mkdirat(AT_FDCWD, path_c, 0755);
+#endif
+            if (rc != 0 && errno != EEXIST) { free(path_c); return -1; }
+        }
+        path_c[index] = saved;
+    }
+    free(path_c);
+    return 0;
 }
 
 static bool encore_append_dir_entry(char **buffer, size_t *cap, size_t *len, const char *name) {

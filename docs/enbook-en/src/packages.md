@@ -125,13 +125,12 @@ fields let metadata apply only to matching compile-time configurations.
 
 ## Validation Commands
 
-Release-gate validation currently uses:
+Release-gate validation uses the native compiler:
 
 ```sh
-cd bootstrap
-uv run --project .. encore test --no-cache
-
-cd ..
-uv run ruff check src core ehir/src ehir-llvm-backend/src
-uv run ty check src/encore/modes/build.py src/encore/modes/test.py
+compiler="$PWD/index/encore/target/extreme/encore"
+for package in core index/ehir index/ehir-llvm-backend index/rich index/std; do
+    (cd "$package" && "$compiler" test)
+done
+(cd index/encore && ./target/extreme/encore test)
 ```

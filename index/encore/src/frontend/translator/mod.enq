@@ -48,6 +48,7 @@ import refrain::frontend::parser::statements::MatchPattern
 import refrain::frontend::parser::statements::ParsedMatchArm
 import refrain::frontend::parser::statements::MatchArmBody
 import ehirlib::EhirTextBuilder
+import refrain::target::{TargetSpec, cfg_active, host_target}
 
 struct LoweredExpr {
     code: EhirTextBuilder
@@ -99,10 +100,15 @@ struct TranslatorContext {
     self_type: str
     return_type: str
     expression_hint: str
+    target: TargetSpec
 }
 
 pub fn translate_to_ehir(ast: Vec[Statement]) -> str {
-    let mut ctx = collect_context(ast)
+    ret translate_to_ehir_for_target(ast, host_target())
+}
+
+pub fn translate_to_ehir_for_target(ast: Vec[Statement], target: TargetSpec) -> str {
+    let mut ctx = collect_context(ast, target)
     let mut builder = EhirTextBuilder::new()
     for stmt in ast {
         match stmt {
@@ -122,7 +128,7 @@ pub fn translate_to_ehir(ast: Vec[Statement]) -> str {
                 builder = builder.append(translate_impl(ctx, impl_item))
             }
             Statement::Function(fn_item) => {
-                if function_is_active(fn_item) {
+                if function_is_active(fn_item, target) {
                     builder = builder.append(translate_function(ctx, fn_item))
                 }
             }
@@ -133,12 +139,12 @@ pub fn translate_to_ehir(ast: Vec[Statement]) -> str {
     ret builder.finish()
 }
 
-fn collect_context(ast: Vec[Statement]) -> TranslatorContext {
-    let mut ctx = TranslatorContext{Vec[VarType]::new(), Vec[VarType]::new(), Vec[FunctionType]::new(), Vec[StructFieldType]::new(), Vec[EnumVariantType]::new(), Vec[LoopTargetType]::new(), Vec[VarType]::new(), Vec[str]::new(), "", "void", ""}
+fn collect_context(ast: Vec[Statement], target: TargetSpec) -> TranslatorContext {
+    let mut ctx = TranslatorContext{Vec[VarType]::new(), Vec[VarType]::new(), Vec[FunctionType]::new(), Vec[StructFieldType]::new(), Vec[EnumVariantType]::new(), Vec[LoopTargetType]::new(), Vec[VarType]::new(), Vec[str]::new(), "", "void", "", target}
     for stmt in ast {
         match stmt {
             Statement::Function(fn_item) => {
-                if function_is_active(fn_item) {
+                if function_is_active(fn_item, target) {
                     if fn_item.is_extern { ctx.extern_functions.push(fn_item.name) }
                     ctx_add_function(ctx, fn_item.name, function_ret_type(fn_item), function_param_types(fn_item), generic_param_names(fn_item.generics))
                 }
@@ -170,7 +176,7 @@ fn collect_context(ast: Vec[Statement]) -> TranslatorContext {
             }
             Statement::Impl(impl_item) => {
                 for method in impl_item.methods {
-                    if function_is_active(method) {
+                    if function_is_active(method, target) {
                         let mut method_name = method.name
                         match impl_item.trait_name {
                             Some(trait_name) => { if trait_name == "Pow" && method.name == "op" { method_name = "pow" } }
@@ -237,6 +243,8 @@ fn ctx_add_var_emitted(ctx: mut TranslatorContext, name: str, emitted_name: str,
 fn ctx_type_needs_ownership(ctx: mut TranslatorContext, typ: str) -> bool {
     let value = canonical_type(typ)
     if value == "str" { ret true }
+    if starts_with(value, "__tuple_") { ret true }
+    if starts_with(value, "dyn ") { ret true }
     if starts_with(value, "mut ") || ends_with(value, "*") || ends_with(value, "<S>") || ends_with(value, "<H>") { ret false }
     if value == "void" || value == "()" || value == "bool" || is_numeric_type(value) { ret false }
     let owner = base_type_name(value)
@@ -1080,7 +1088,7 @@ fn translate_impl(ctx: mut TranslatorContext, item: ImplStmt) -> EhirTextBuilder
     let old_self_type = ctx.self_type + ""
     ctx.self_type = item.target + ""
     for method in item.methods {
-        if function_is_active(method) {
+        if function_is_active(method, ctx.target) {
             let ret_type = function_ret_type_for_owner(method, item.target)
             let mut emitted_method_name = method.name
             match item.trait_name {
@@ -1323,9 +1331,6 @@ fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str
         ctx_add_owned_var(ctx, let_stmt.name, emitted_name, "mut " + typ)
         builder = builder.instr(emitted_name + ": " + typ + "* = salloc " + typ)
         builder = builder.instr("store " + lowered.value + ", " + emitted_name)
-        if !borrowed_copy && ctx_type_needs_ownership(ctx, typ) {
-            builder = builder.instr("drop " + lowered.value + ": " + typ)
-        }
         ret builder
     }
     ctx_add_var_emitted(ctx, let_stmt.name, emitted_name, typ)
@@ -3862,42 +3867,17 @@ fn find_top_level_comma(value: str) -> usize {
     ret value.len()
 }
 
-fn function_is_active(item: FunctionItem) -> bool {
+fn function_is_active(item: FunctionItem, target: TargetSpec) -> bool {
     for attr in item.attrs {
         if contains_substring(attr, "test") {
             ret false
         }
         if starts_with(attr, "cfg:") {
             let expr = attr.slice(4_usize, attr.len() - 4_usize)
-            if !cfg_expr_active(expr) {
+            if !cfg_active(target, expr) {
                 ret false
             }
         }
-    }
-    ret true
-}
-
-fn cfg_expr_active(expr: str) -> bool {
-    if expr == "macos" {
-        ret true
-    }
-    if expr == "unix" {
-        ret true
-    }
-    if expr == "linux" {
-        ret false
-    }
-    if expr == "windows" {
-        ret false
-    }
-    if starts_with(expr, "all(") {
-        if contains_substring(expr, "not(any(linux,macos))") {
-            ret false
-        }
-        ret contains_substring(expr, "unix")
-    }
-    if starts_with(expr, "any(") {
-        ret contains_substring(expr, "macos") || contains_substring(expr, "unix")
     }
     ret true
 }

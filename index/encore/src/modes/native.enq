@@ -1,12 +1,13 @@
 import core::fmt::Debug
 import core::option::Option
 import std::io::println
-import std::os::{argc, argv, core_dir, file_exists, home_dir, write_file}
+import std::os::{argc, argv, copy_file, core_dir, file_exists, home_dir, mkdir_all, set_executable, write_file}
 import std::path::Path
-import std::process::run
+import std::process::run_args
 import std::vec::Vec
 
-import mod::build::{compile_project, compile_project_with_profile, requested_profile}
+import mod::build::{compile_project, compile_project_with_profile, requested_profile, requested_target, target_profile_dir}
+import refrain::target::{target_executable_name, target_is_host}
 import refrain::project::manifest::{ProjectManifest, project_manifest_add_dependency, project_manifest_dependencies, project_manifest_has_dependency, project_manifest_name, read_project_manifest, write_project_manifest}
 
 pub fn native_run() -> u32 {
@@ -15,18 +16,19 @@ pub fn native_run() -> u32 {
     let code = compile_project_with_profile(root, profile)
     if code != 0_u32 { ret code }
     let manifest = read_project_manifest(root)
-    let binary = root.join("target").join(profile).join(project_manifest_name(manifest))
-    let mut command = shell_quote(binary.as_str())
-    let mut index = 2_usize
-    if arg_or(index, "") == "--" { index = index + 1_usize }
+    let target = requested_target(root)
+    if !target_is_host(target) { ret native_mode_fail("Cannot run cross-compiled target " + target.triple + " on this host") }
+    let binary = target_profile_dir(root, target, profile).join(target_executable_name(target, project_manifest_name(manifest)))
+    let mut args = Vec[str]::new()
+    let mut index = find_separator()
     while index < argc() {
         match argv(index) {
-            Some(value) => { command = command + " " + shell_quote(value) }
+            Some(value) => { args.push(value) }
             None => {}
         }
         index = index + 1_usize
     }
-    ret normalize_exit(run(command))
+    ret normalize_exit(run_args(binary.as_str(), args))
 }
 
 pub fn native_init() -> u32 {
@@ -43,11 +45,11 @@ pub fn native_init() -> u32 {
     }
     let manifest_path = root.join("encore.toml")
     if !file_exists(manifest_path.as_str()) {
-        let source = "[project]\nname = \"" + escape_toml(name) + "\"\nversion = \"0.0.0\"\ndescription = \"\"\nreadme = \"README.md\"\nlicence = \"MIT\"\ndependencies = []\n"
+        let source = "[project]\nname = \"" + escape_toml(name) + "\"\nversion = \"0.0.0\"\ndescription = \"\"\nreadme = \"README.md\"\nlicence = \"MIT\"\ntarget = \"auto\"\ndependencies = []\n"
         if write_file(manifest_path.as_str(), source) != 0_i32 { ret native_mode_fail("Unable to write encore.toml") }
     }
     let src = root.join("src")
-    if run("mkdir -p " + shell_quote(src.as_str())) != 0_i32 { ret native_mode_fail("Unable to create src") }
+    if mkdir_all(src.as_str()) != 0_i32 { ret native_mode_fail("Unable to create src") }
     let main_path = src.join("main.enq")
     if !file_exists(main_path.as_str()) {
         if write_file(main_path.as_str(), "fn main() -> u32 {\n  ret 0\n}\n") != 0_i32 { ret native_mode_fail("Unable to write src/main.enq") }
@@ -57,7 +59,10 @@ pub fn native_init() -> u32 {
     let gitignore = root.join(".gitignore")
     if !file_exists(gitignore.as_str()) { write_file(gitignore.as_str(), "target\n") }
     if !file_exists(root.join(".git").as_str()) {
-        if run("git init " + shell_quote(root.as_str())) != 0_i32 { ret native_mode_fail("git init failed") }
+        let mut args = Vec[str]::new()
+        args.push("init")
+        args.push(root.as_str())
+        if run_args("git", args) != 0_i32 { ret native_mode_fail("git init failed") }
     }
     println("Initialized " + name + " in " + root.as_str())
     ret 0_u32
@@ -126,11 +131,12 @@ pub fn native_install() -> u32 {
     if installed_name == "" { installed_name = project_name }
     if installed_name == "" || installed_name == "." || installed_name == ".." || contains_separator(installed_name) { ret native_mode_fail("Invalid installed binary name") }
     mkdir_parents(bin_dir)
-    let source = project.join("target").join(profile).join(project_name)
-    let destination = bin_dir.join(installed_name)
+    let target = requested_target(project)
+    if !target_is_host(target) { ret native_mode_fail("Cannot install cross-compiled target " + target.triple + " on this host") }
+    let source = target_profile_dir(project, target, profile).join(target_executable_name(target, project_name))
+    let destination = bin_dir.join(target_executable_name(target, installed_name))
     if file_exists(destination.as_str()) && !force { ret native_mode_fail("Installed binary already exists: " + destination.as_str() + ". Use --force") }
-    let command = "cp " + shell_quote(source.as_str()) + " " + shell_quote(destination.as_str()) + " && chmod +x " + shell_quote(destination.as_str())
-    if run(command) != 0_i32 { ret native_mode_fail("Unable to install binary") }
+    if copy_file(source.as_str(), destination.as_str()) != 0_i32 || set_executable(destination.as_str()) != 0_i32 { ret native_mode_fail("Unable to install binary") }
     println("Installed " + project_name + " -> " + destination.as_str())
     ret 0_u32
 }
@@ -172,10 +178,19 @@ fn resolve_dependency(reference: str, base: Path, update: bool) -> str {
         let destination = Path::new(home_dir()).join(".cache").join("encore").join("git").join(owner).join(repository)
         match destination.parent() { Some(value) => { mkdir_parents(value) } None => { mkdir_parents(destination) } }
         if !file_exists(destination.join(".git").as_str()) {
-            if run("git clone " + shell_quote(url) + " " + shell_quote(destination.as_str())) != 0_i32 { native_mode_fail("Unable to clone " + url) ret "" }
+            let mut args = Vec[str]::new()
+            args.push("clone")
+            args.push(url)
+            args.push(destination.as_str())
+            if run_args("git", args) != 0_i32 { native_mode_fail("Unable to clone " + url) ret "" }
         }
         elif update {
-            if run("git -C " + shell_quote(destination.as_str()) + " pull --ff-only") != 0_i32 { native_mode_fail("Unable to update " + url) ret "" }
+            let mut args = Vec[str]::new()
+            args.push("-C")
+            args.push(destination.as_str())
+            args.push("pull")
+            args.push("--ff-only")
+            if run_args("git", args) != 0_i32 { native_mode_fail("Unable to update " + url) ret "" }
         }
         ret destination.as_str()
     }
@@ -196,8 +211,17 @@ fn locate_core(base: Path) -> Path {
 }
 
 fn mkdir_parents(path: Path) -> () {
-    run("mkdir -p " + shell_quote(path.as_str()))
+    mkdir_all(path.as_str())
     ret ()
+}
+
+fn find_separator() -> usize {
+    let mut index = 2_usize
+    while index < argc() {
+        if arg_or(index, "") == "--" { ret index + 1_usize }
+        index = index + 1_usize
+    }
+    ret argc()
 }
 
 fn normalize_package_ref(raw: str) -> str {
@@ -240,17 +264,6 @@ fn contains(value: str, needle: str) -> bool {
     ret false
 }
 fn starts_with(value: str, prefix: str) -> bool { ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix }
-fn shell_quote(value: str) -> str {
-    let mut out = "'"
-    let mut i = 0_usize
-    while i < value.len() {
-        let ch = value.slice(i, 1_usize)
-        if ch == "'" { out = out + "'\\''" }
-        else { out = out + ch }
-        i = i + 1_usize
-    }
-    ret out + "'"
-}
 fn escape_toml(value: str) -> str {
     let mut out = ""
     let mut i = 0_usize

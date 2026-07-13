@@ -1,113 +1,82 @@
 # Encore
 
-Encore is an experimental programming language and compiler built around EHIR
-(Encore High Intermediate Representation). The current release line is focused
-on an open beta: real programs should be possible, but APIs and diagnostics may
-still change quickly.
+Encore is a self-hosted programming language and native compiler built around
+EHIR (Encore High Intermediate Representation) and LLVM.
 
-## Status
+The current development line is `0.1.3`. Python compiler development ended at
+`0.1.2`; current sources are compiled only by the native Encore compiler.
 
-Current compiler version: `0.1.2`.
+## Install
 
-The beta target is a usable local toolchain with:
-
-- project initialization, dependency sync, build, run and test commands;
-- EHIR/LLVM code generation through the bundled backend;
-- `core` and `std` libraries for common CLI and systems-style programs;
-- native support code provided by `core/build.enq`;
-- practical examples in `index/`.
-
-## Requirements
-
-- Python `>=3.13,<3.14`
-- `uv`
-- `clang`
-- an LLVM-compatible toolchain for the current EHIR LLVM backend
-
-Linux is the primary tested platform for this beta. Cross-platform support is
-being designed around `core/build.enq`, conditional compilation and native link
-configuration.
-
-## Installation
+Linux and macOS:
 
 ```sh
-git clone https://github.com/encore-language/encore
-cd encore
-uv sync
-uv run encore --help
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/encore-language/encore/trunk/install.sh | sh
+export PATH="$HOME/.encore/bin:$PATH"
 ```
 
-When running Encore from a subdirectory, use `--project` if `uv` cannot find the
-root project automatically:
+Windows PowerShell:
 
-```sh
-uv run --project /path/to/encore encore run
+```powershell
+irm https://raw.githubusercontent.com/encore-language/encore/trunk/install.ps1 | iex
 ```
 
-## Project Commands
+The installer verifies the release checksum. Set `ENCORE_VERSION` to install a
+specific tag, or run the installer again to update. Uninstall with
+`install.sh --uninstall` or `install.ps1 -Uninstall`.
+
+Building programs requires `clang` or a configured target toolchain.
+
+## Commands
 
 ```sh
-encore init --name <name>
-encore sync
-encore build
-encore run
+encore init --name hello
+encore build --profile release
+encore run -- arg1 arg2
 encore test
 encore add <package>
+encore sync
+encore install --path .
+encore target
+encore target list
 ```
 
-Useful beta flags:
+Cross-compile using an LLVM-compatible target triple:
 
 ```sh
-encore build --no-cache
-encore run --no-cache
-encore test --no-cache
-encore test --filter vec
-encore build --cfg linux
+encore build --target aarch64-unknown-linux-gnu --sysroot /opt/aarch64
 ```
 
-## Examples
+Toolchains can also be configured in `encore.toml`. See
+[`Targets And Cross-Compilation`](docs/enbook-en/src/targets.md).
 
-Applied examples live in `index/`.
+## Repository Layout
+
+| Path | Purpose |
+| --- | --- |
+| `core` | low-level language library and portable C runtime |
+| `index/encore` | native compiler frontend and CLI |
+| `index/ehir` | native EHIR representation and parser |
+| `index/ehir-llvm-backend` | native LLVM backend |
+| `index/std` | application standard library |
+| `index/rich` | terminal rendering and compiler/test progress |
+| `examples` | executable language examples |
+| `docs/enbook-en` | language and toolchain documentation |
+
+## Native Development
+
+With an existing native compiler at `index/encore/target/extreme/encore`:
 
 ```sh
-cd index/echo
-uv run --project ../.. encore run -- hello beta
-
-cd ../wc
-uv run --project ../.. encore run -- src/main.enq
-
-cd ../hello_server
-uv run --project ../.. encore run
+cd index/encore
+./target/extreme/encore build --profile extreme
+./target/extreme/encore test
 ```
 
-The example set includes CLI tools, sorting algorithms, path/string demos,
-networking smoke tests, a terminal donut renderer and small data-structure
-programs.
+CI performs two native self-host generations and tests Linux, Windows and
+macOS release packages. Tagged commits publish portable archives and checksums.
 
-## Documentation
+## License
 
-User-facing beta docs now live in `docs/enbook-en/src/`:
-
-- `getting-started.md` covers setup, manifests, commands and tests.
-- `language-basics.md` covers imports, functions, structs, enums, traits,
-  loops, `match`, `with` and common syntax.
-- `standard-library.md` covers the public `std` surface.
-
-Package-specific references are also available in `core/README.md` and
-`std/README.md`.
-
-## Validation
-
-The current beta gate is tracked in `TODO.md`. The latest completed validation
-covered:
-
-```sh
-cd bootstrap
-uv run --project .. encore test --no-cache
-
-cd ..
-uv run ruff check src core ehir/src ehir-llvm-backend/src
-uv run ty check src/encore/modes/build.py src/encore/modes/test.py
-```
-
-Known non-blocking beta limitations are documented in `TODO.md`.
+MIT. See [LICENSE](LICENSE).

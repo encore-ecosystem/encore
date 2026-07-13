@@ -3,24 +3,28 @@ import core::option::Option
 import core::io::eprintln
 import std::os::write_file
 import std::os::core_dir
+import std::os::env
 import std::os::remove_file
 import std::os::argc
 import std::os::argv
 import std::os::file_exists
+import std::os::mkdir_all
 import std::path::Path
-import std::process::run
+import std::process::run_args
 import std::vec::Vec
 
 import ehirlib::parse_module_text
-import ehir_llvm_backend::codegen::emit_ir
+import ehir_llvm_backend::codegen::{emit_ir, emit_ir_for_target}
 
-import refrain::frontend::sema::semantic_check_error
-import refrain::frontend::translator::translate_to_ehir
+import refrain::frontend::sema::{semantic_check_error, semantic_check_error_for_target}
+import refrain::frontend::translator::{translate_to_ehir, translate_to_ehir_for_target}
 import refrain::frontend::parser::statements::Statement
 import refrain::project::load_binary_workspace
 import refrain::project::WorkspaceModule
 import refrain::project::WorkspaceRefrain
 import refrain::project::workspace_root_refrain
+import refrain::project::manifest::{project_manifest_target, project_target_toolchain, read_project_manifest}
+import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host}
 
 import rich::BuildProgress
 
@@ -39,6 +43,16 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         ret 1_u32
     }
 
+    let manifest = read_project_manifest(root)
+    let manifest_target = project_manifest_target(manifest)
+    let target_request = requested_value("--target", manifest_target)
+    let target = if target_request == "" { host_target() } else { parse_target(target_request) }
+    let emit = normalize_emit(requested_value("--emit", if target.freestanding { "object" } else { "binary" }))
+    if emit == "" {
+        eprintln("Error: --emit must be one of: ehir, llvm-ir, object, binary")
+        ret 1_u32
+    }
+    let toolchain = requested_toolchain(root, target)
     let mut progress = BuildProgress::auto()
     progress.start_build(path_name_or(root, "project"), profile)
     progress.start_stage("Workspace", "workspace")
@@ -58,8 +72,8 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     progress.finish_stage(Debug::fmt(workspace.refrains.len()) + " refrains, " + Debug::fmt(workspace.modules.len()) + " modules, " + Debug::fmt(ast.len()) + " AST nodes")
 
     let target_dir = root.join("target")
-    let profile_dir = target_dir.join(profile)
-    if run("mkdir -p " + shell_quote(native_path(profile_dir.as_str()))) != 0_i32 {
+    let profile_dir = if target_request == "" || target_request == "auto" || target_request == "host" || target_request == "native" { target_dir.join(profile) } else { target_dir.join(target.triple).join(profile) }
+    if mkdir_all(native_path(profile_dir.as_str())) != 0_i32 {
         progress.start_stage("Prepare", "creating target directory")
         progress.fail_stage("failed to create target directory")
         ret 1_u32
@@ -68,7 +82,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     remove_file(native_path(root.join("target.bootstrap.ll").as_str()))
 
     progress.start_stage("Check", "workspace")
-    if !run_workspace_semantic_checks(workspace.modules, progress) {
+    if !run_workspace_semantic_checks(workspace.modules, target, progress) {
         progress.fail_stage("semantic checks failed")
         ret 1_u32
     }
@@ -76,7 +90,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
 
     progress.start_stage("Lower", project_name)
     progress.update(project_name, "EHIR", 1_usize, 1_usize)
-    let ehir_text = translate_to_ehir(ast)
+    let ehir_text = translate_to_ehir_for_target(ast, target)
     let out_path = profile_dir.join(project_name + ".ehir")
     let write_code = write_file(native_path(out_path.as_str()), ehir_text)
     if write_code != 0_i32 {
@@ -84,11 +98,15 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         ret 1_u32
     }
     progress.finish_stage("EHIR generated")
+    if emit == "ehir" {
+        progress.finish_artifact(profile, "EHIR", out_path.as_str())
+        ret 0_u32
+    }
 
     progress.start_stage("Codegen", "LLVM IR")
     progress.update(project_name, "LLVM IR", 1_usize, 1_usize)
     let ehir_module = parse_module_text("encore_bootstrap", ehir_text)
-    let llvm_text = emit_ir(ehir_module)
+    let llvm_text = emit_ir_for_target(ehir_module, target.triple, target.pointer_width)
     let llvm_path = profile_dir.join(project_name + ".ll")
     let llvm_write_code = write_file(native_path(llvm_path.as_str()), llvm_text)
     if llvm_write_code != 0_i32 {
@@ -96,29 +114,189 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         ret 1_u32
     }
     progress.finish_stage("LLVM IR generated")
+    if emit == "llvm-ir" {
+        remove_file(native_path(out_path.as_str()))
+        progress.finish_artifact(profile, "LLVM IR", llvm_path.as_str())
+        ret 0_u32
+    }
 
-    progress.start_stage("Link", project_name)
-    let binary_path = profile_dir.join(project_name)
+    progress.start_stage("Compile", "target objects")
+    let binary_path = profile_dir.join(target_executable_name(target, project_name))
+    let mut native_sources = Vec[Path]::new()
     let runtime_path = Path::new(core_dir()).join("runtime.c").resolve()
-    let mut native_sources = " " + shell_quote(native_path(runtime_path.as_str()))
+    if toolchain.hosted_runtime { native_sources.push(runtime_path) }
+    for configured_source in toolchain.runtime_sources {
+        native_sources.push(resolve_project_path(root, configured_source))
+    }
     for refrain in workspace.refrains {
         let candidate = refrain.root.join("runtime.c").resolve()
-        if candidate.as_str() != runtime_path.as_str() && file_exists(native_path(candidate.as_str())) {
-            native_sources = native_sources + " " + shell_quote(native_path(candidate.as_str()))
+        if !target.freestanding && candidate.as_str() != runtime_path.as_str() && file_exists(native_path(candidate.as_str())) {
+            native_sources.push(candidate)
         }
     }
-    let clang_command = "clang " + clang_profile_flags(profile) + " " + shell_quote(native_path(llvm_path.as_str())) + native_sources + " -o " + shell_quote(native_path(binary_path.as_str()))
+    let object_dir = profile_dir.join("object")
     progress.suspend()
-    let clang_code = run(clang_command)
+    if mkdir_all(native_path(object_dir.as_str())) != 0_i32 {
+        progress.fail_stage("failed to create object directory")
+        ret 1_u32
+    }
+    let object_suffix = if target.os == "windows" { ".obj" } else { ".o" }
+    let llvm_object = object_dir.join(project_name + object_suffix)
+    let mut llvm_args = compiler_args(profile, target, toolchain)
+    llvm_args.push("-c")
+    llvm_args.push(native_path(llvm_path.as_str()))
+    llvm_args.push("-o")
+    llvm_args.push(native_path(llvm_object.as_str()))
+    if run_args(toolchain.compiler, llvm_args) != 0_i32 {
+        progress.fail_stage("LLVM IR assembly failed for target " + target.triple)
+        ret 1_u32
+    }
+    if emit == "object" {
+        remove_file(native_path(out_path.as_str()))
+        remove_file(native_path(llvm_path.as_str()))
+        progress.finish_stage("1 target object")
+        progress.finish_artifact(profile, "Object", llvm_object.as_str())
+        ret 0_u32
+    }
+    let mut objects = Vec[str]::new()
+    objects.push(native_path(llvm_object.as_str()))
+    let mut source_index = 0_usize
+    while source_index < native_sources.len() {
+        match native_sources.get(source_index) {
+            Option[Path]::Some(source) => {
+                let object = object_dir.join("native_" + Debug::fmt(source_index) + object_suffix)
+                let mut native_args = compiler_args(profile, target, toolchain)
+                native_args.push("-c")
+                native_args.push(native_path(source.as_str()))
+                native_args.push("-o")
+                native_args.push(native_path(object.as_str()))
+                if run_args(toolchain.compiler, native_args) != 0_i32 {
+                    progress.fail_stage("native runtime compilation failed for target " + target.triple)
+                    ret 1_u32
+                }
+                objects.push(native_path(object.as_str()))
+            }
+            Option[Path]::None => {}
+        }
+        source_index = source_index + 1_usize
+    }
+    progress.finish_stage(Debug::fmt(native_sources.len() + 1_usize) + " target objects")
+
+    progress.start_stage("Link", project_name)
+    progress.suspend()
+    if target.freestanding && native_sources.len() == 0_usize {
+        progress.fail_stage("freestanding binary requires target.runtime-sources or target.hosted-runtime = true")
+        ret 1_u32
+    }
+    let mut link_args = target_tool_args(target, toolchain)
+    for object in objects { link_args.push(object) }
+    if toolchain.linker_script != "" { link_args.push("-T") link_args.push(native_path(resolve_project_path(root, toolchain.linker_script).as_str())) }
+    for arg in toolchain.link_args { link_args.push(arg) }
+    link_args.push("-o")
+    link_args.push(native_path(binary_path.as_str()))
+    let link_code = run_args(toolchain.linker, link_args)
     remove_file(native_path(out_path.as_str()))
     remove_file(native_path(llvm_path.as_str()))
-    if clang_code != 0_i32 {
-        progress.fail_stage("LLVM assembly or native link failed")
+    if link_code != 0_i32 {
+        progress.fail_stage("native link failed for target " + target.triple)
         ret 1_u32
     }
     progress.finish_stage("native binary")
     progress.finish_build(profile, binary_path.as_str())
     ret 0_u32
+}
+
+fn normalize_emit(value: str) -> str {
+    if value == "ehir" { ret "ehir" }
+    if value == "llvm-ir" || value == "llvm" || value == "ir" { ret "llvm-ir" }
+    if value == "object" || value == "obj" { ret "object" }
+    if value == "binary" || value == "bin" { ret "binary" }
+    ret ""
+}
+
+fn requested_toolchain(root: Path, target: TargetSpec) -> Toolchain {
+    let defaults = project_target_toolchain(root, target, default_toolchain(target))
+    ret Toolchain{
+        requested_value("--cc", defaults.compiler),
+        requested_value("--linker", defaults.linker),
+        requested_value("--ar", defaults.archiver),
+        requested_value("--sysroot", defaults.sysroot),
+        requested_value("--target-cpu", defaults.cpu),
+        requested_value("--target-features", defaults.features),
+        defaults.compile_args,
+        defaults.link_args,
+        defaults.runtime_sources,
+        requested_value("--linker-script", defaults.linker_script),
+        defaults.hosted_runtime
+    }
+}
+
+pub fn requested_target(root: Path) -> TargetSpec {
+    let manifest = read_project_manifest(root)
+    ret parse_target(requested_value("--target", project_manifest_target(manifest)))
+}
+
+pub fn target_profile_dir(root: Path, target: TargetSpec, profile: str) -> Path {
+    let raw = requested_value("--target", project_manifest_target(read_project_manifest(root)))
+    if raw == "" || raw == "auto" || raw == "host" || raw == "native" { ret root.join("target").join(profile) }
+    ret root.join("target").join(target.triple).join(profile)
+}
+
+fn compiler_args(profile: str, target: TargetSpec, toolchain: Toolchain) -> Vec[str] {
+    let mut args = target_tool_args(target, toolchain)
+    if profile == "debug" { args.push("-O0") args.push("-g") }
+    elif profile == "release" { args.push("-O2") }
+    else { args.push("-O3") }
+    args.push("-Wno-override-module")
+    for arg in toolchain.compile_args { args.push(arg) }
+    ret args
+}
+
+fn resolve_project_path(root: Path, value: str) -> Path {
+    let path = Path::new(value)
+    if path.is_absolute() { ret path.resolve() }
+    ret root.join(value).resolve()
+}
+
+fn target_tool_args(target: TargetSpec, toolchain: Toolchain) -> Vec[str] {
+    let mut args = Vec[str]::new()
+    if !target_is_host(target) { args.push("--target=" + target.triple) }
+    if toolchain.sysroot != "" { args.push("--sysroot=" + native_path(toolchain.sysroot)) }
+    if toolchain.cpu != "" { args.push("-mcpu=" + toolchain.cpu) }
+    append_target_features(args, toolchain.features)
+    if target.freestanding { args.push("-ffreestanding") }
+    ret args
+}
+
+fn append_target_features(args: mut Vec[str], features: str) -> () {
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index <= features.len() {
+        if index == features.len() || features.slice(index, 1_usize) == "," {
+            if index > start {
+                let feature = features.slice(start, index - start)
+                args.push("-Xclang")
+                args.push("-target-feature")
+                args.push("-Xclang")
+                args.push(feature)
+            }
+            start = index + 1_usize
+        }
+        index = index + 1_usize
+    }
+    ret ()
+}
+
+fn requested_value(name: str, fallback: str) -> str {
+    let mut index = 2_usize
+    while index + 1_usize < argc() {
+        match argv(index) {
+            Some(arg) => { if arg == name { match argv(index + 1_usize) { Some(value) => { ret value } None => {} } } }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret fallback
 }
 
 pub fn requested_profile(fallback: str) -> str {
@@ -147,16 +325,10 @@ fn normalize_profile(profile: str) -> str {
     ret ""
 }
 
-fn clang_profile_flags(profile: str) -> str {
-    if profile == "debug" { ret "-O0 -g -Wno-override-module" }
-    if profile == "release" { ret "-O2 -Wno-override-module" }
-    ret "-O3 -Wno-override-module"
-}
-
 pub fn compile_test_ast(root: Path, ast: Vec[Statement], binary_name: str) -> u32 {
     let ehir_text = translate_to_ehir(ast)
     let tests_dir = root.join("target").join("tests")
-    if run("mkdir -p " + shell_quote(native_path(tests_dir.as_str()))) != 0_i32 { ret 1_u32 }
+    if mkdir_all(native_path(tests_dir.as_str())) != 0_i32 { ret 1_u32 }
     let ehir_path = tests_dir.join(binary_name + ".ehir")
     let llvm_path = tests_dir.join(binary_name + ".ll")
     let binary_path = tests_dir.join(binary_name)
@@ -164,25 +336,32 @@ pub fn compile_test_ast(root: Path, ast: Vec[Statement], binary_name: str) -> u3
     let llvm_text = emit_ir(parse_module_text("encore_test", ehir_text))
     if write_file(native_path(llvm_path.as_str()), llvm_text) != 0_i32 { ret 1_u32 }
     let runtime_path = Path::new(core_dir()).join("runtime.c").resolve()
-    let command = "clang -O3 -Wno-override-module " + shell_quote(native_path(llvm_path.as_str())) + " " + shell_quote(native_path(runtime_path.as_str())) + " -o " + shell_quote(native_path(binary_path.as_str()))
-    let clang_code = run(command)
-    remove_file(native_path(ehir_path.as_str()))
-    remove_file(native_path(llvm_path.as_str()))
+    let mut args = Vec[str]::new()
+    args.push("-O0")
+    args.push("-g")
+    args.push("-Wno-override-module")
+    args.push(native_path(llvm_path.as_str()))
+    args.push(native_path(runtime_path.as_str()))
+    let package_runtime = root.join("runtime.c").resolve()
+    if package_runtime.as_str() != runtime_path.as_str() && file_exists(native_path(package_runtime.as_str())) {
+        args.push(native_path(package_runtime.as_str()))
+    }
+    args.push("-o")
+    args.push(native_path(binary_path.as_str()))
+    let clang_code = run_args("clang", args)
+    if !keep_temporary_artifacts() {
+        remove_file(native_path(ehir_path.as_str()))
+        remove_file(native_path(llvm_path.as_str()))
+    }
     if clang_code != 0_i32 { ret 1_u32 }
     ret 0_u32
 }
 
-fn shell_quote(value: str) -> str {
-    if value.len() == 0_usize { ret "''" }
-    let mut out = "'"
-    let mut index = 0_usize
-    while index < value.len() {
-        let ch = value.slice(index, 1_usize)
-        if ch == "'" { out = out + "'\\''" }
-        else { out = out + ch }
-        index = index + 1_usize
+fn keep_temporary_artifacts() -> bool {
+    match env("ENCORE_KEEP_TEMPS") {
+        Option[str]::Some(value) => { ret value == "1" || value == "true" }
+        Option[str]::None => { ret false }
     }
-    ret out + "'"
 }
 
 fn native_path(value: str) -> str {
@@ -201,13 +380,13 @@ fn native_path(value: str) -> str {
     ret out
 }
 
-fn run_workspace_semantic_checks(modules: Vec[WorkspaceModule], progress: mut BuildProgress) -> bool {
+fn run_workspace_semantic_checks(modules: Vec[WorkspaceModule], target: TargetSpec, progress: mut BuildProgress) -> bool {
     let mut index = 0_usize
     while index < modules.len() {
         match modules.get(index) {
             Option[WorkspaceModule]::Some(module) => {
                 progress.update(module.owner_name, module_display_name(module), index + 1_usize, modules.len())
-                match semantic_check_error(module.ast) {
+                match semantic_check_error_for_target(module.ast, target) {
                     Option[str]::Some(message) => {
                         progress.suspend()
                         eprintln("Semantic error: " + message)

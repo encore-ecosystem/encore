@@ -3,7 +3,7 @@
 Create a package in an empty directory:
 
 ```sh
-uv run --project /path/to/encore encore init --name hello
+encore init --name hello
 ```
 
 `encore init` creates:
@@ -37,7 +37,7 @@ description = ""
 readme = "README.md"
 licence = "MIT"
 dependencies = [
-    "path@/path/to/encore/std",
+    "path@/path/to/encore/index/std",
 ]
 ```
 
@@ -60,12 +60,10 @@ encore update
 Common beta flags:
 
 ```sh
-encore build --no-cache
-encore run --no-cache -- arg1 arg2
-encore test --no-cache
+encore run -- arg1 arg2
 encore test --filter dict
-encore build --cfg linux
 encore build --profile release
+encore build --target aarch64-unknown-linux-gnu
 ```
 
 `encore run` is only available for executable packages. Program arguments after
@@ -99,14 +97,14 @@ rest of the program can stay unchanged.
 Practical packages live in `index/`:
 
 ```sh
-cd index/echo
-uv run --project ../.. encore run -- hello beta
+cd examples/echo
+encore run -- hello beta
 
 cd ../wc
-uv run --project ../.. encore run -- src/main.enq
+encore run -- src/main.enq
 
 cd ../dict
-uv run --project ../.. encore run
+encore run
 ```
 
 The examples cover CLI programs, sorting, dictionaries, paths, strings,

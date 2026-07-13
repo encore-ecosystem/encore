@@ -1,62 +1,24 @@
 pkgname=encore-compiler
-pkgver=0.1.0
+pkgver=0.1.3
 pkgrel=1
-pkgdesc="Encore programming language compiler"
+pkgdesc="Encore programming language native compiler"
 arch=("x86_64" "aarch64")
 url="https://github.com/encore-language/encore"
 license=("MIT")
-depends=(
-  "python"
-  "clang"
-)
-makedepends=(
-  "git"
-  "uv"
-)
-source=(
-  "encore::git+https://github.com/encore-language/encore.git#branch=trunk"
-)
+depends=("clang")
+
+case "$CARCH" in
+  x86_64) _triple=x86_64-unknown-linux-gnu ;;
+  aarch64) _triple=aarch64-unknown-linux-gnu ;;
+esac
+
+source=("encore-${pkgver}-${CARCH}.tar.gz::${url}/releases/download/v${pkgver}/encore-${_triple}.tar.gz")
 sha256sums=("SKIP")
 
-prepare() {
-  cd "${srcdir}/encore"
-}
-
-build() {
-  cd "${srcdir}/encore/ehir"
-  uv build --wheel --no-sources
-
-  cd "${srcdir}/encore/ehir-llvm-backend"
-  uv build --wheel --no-sources
-
-  cd "${srcdir}/encore"
-  uv build --wheel --no-sources
-}
-
 package() {
-  local sitepkg="usr/lib/python$(python -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")')/site-packages"
-  local target="${pkgdir}/${sitepkg}"
-
-  install -d "${target}"
-
-  cd "${srcdir}/encore/ehir"
-  uv pip install --system --target "${target}" dist/*.whl
-
-  cd "${srcdir}/encore/ehir-llvm-backend"
-  uv pip install --system --target "${target}" dist/*.whl
-
-  cd "${srcdir}/encore"
-  uv pip install --system --target "${target}" dist/*.whl
-
-  install -d "${pkgdir}/usr/bin"
-  cat > "${pkgdir}/usr/bin/encore" <<'EOF'
-#!/usr/bin/env sh
-exec python -m encore.cli "$@"
-EOF
-  chmod 755 "${pkgdir}/usr/bin/encore"
-
-  install -d "${pkgdir}/usr/share/encore"
-  cp -r core std index bootstrap "${pkgdir}/usr/share/encore/"
-
-  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  local source_root
+  source_root=$(find "$srcdir" -maxdepth 1 -type d -name "encore-*-${_triple}" -print -quit)
+  install -d "$pkgdir/opt/encore" "$pkgdir/usr/bin"
+  cp -a "$source_root"/. "$pkgdir/opt/encore/"
+  ln -s /opt/encore/bin/encore "$pkgdir/usr/bin/encore"
 }

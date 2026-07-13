@@ -3,13 +3,15 @@ import core::option::Option
 import std::io::println
 import std::os::{argc, argv, file_exists, read_dir, read_file}
 import std::path::Path
-import std::process::run
+import std::process::{run_args, run_args_capture}
+import std::os::mkdir_all
 import std::vec::Vec
 
 import mod::build::compile_test_ast
 import refrain::frontend::{Lexer, Parser, Statement}
 import refrain::frontend::parser::statements::FunctionItem
 import refrain::project::{ProjectWorkspace, WorkspaceModule, load_library_workspace, load_entry_workspace}
+import rich::TestProgress
 
 pub fn native_test() -> u32 {
     let root = Path::new(".").resolve()
@@ -17,7 +19,7 @@ pub fn native_test() -> u32 {
     if worker_path != "" {
         let path = Path::new(worker_path).resolve()
         let worker_workspace = load_entry_workspace(root, path)
-        if compile_and_run(root, worker_workspace.flat_ast, "worker:" + path.as_str()) { ret 0_u32 }
+        if compile_and_run_result(root, worker_workspace.flat_ast, "worker:" + path.as_str()) == "" { ret 0_u32 }
         ret 1_u32
     }
     // A project may be either a library (`src/lib.enq`) or a binary
@@ -31,9 +33,13 @@ pub fn native_test() -> u32 {
         load_entry_workspace(root, root.join("src").join("main.enq"))
     }
     let filter = test_filter()
+    let total = count_selected_tests(workspace, filter)
+    if total == 0_usize { println("No tests found.") ret 0_u32 }
     let mut passed = 0_usize
     let mut failed = 0_usize
     let mut found = 0_usize
+    let mut progress = TestProgress::auto()
+    progress.start_suite(workspace.root_name, total)
 
     let mut module_index = 0_usize
     while module_index < workspace.modules.len() {
@@ -49,8 +55,10 @@ pub fn native_test() -> u32 {
                                         let display = module.owner_name + ":" + module.module_path.as_str() + "::" + item.name
                                         if filter == "" || contains(display, filter) {
                                             found = found + 1_usize
-                                            if run_unit_test(root, workspace, item, display) { passed = passed + 1_usize }
-                                            else { failed = failed + 1_usize }
+                                            progress.start_test(display, found, total)
+                                            let failure = run_unit_test(root, workspace, item, display)
+                                            if failure == "" { passed = passed + 1_usize progress.pass_test(display) }
+                                            else { failed = failed + 1_usize progress.fail_test(display, failure) }
                                         }
                                     }
                                 }
@@ -78,8 +86,10 @@ pub fn native_test() -> u32 {
                         let display = workspace.root_name + ":tests/" + name
                         if filter == "" || contains(display, filter) {
                             found = found + 1_usize
-                            if run_standalone_test(root, workspace, tests_dir.join(name), display) { passed = passed + 1_usize }
-                            else { failed = failed + 1_usize }
+                            progress.start_test(display, found, total)
+                            let failure = run_standalone_test(root, workspace, tests_dir.join(name), display)
+                            if failure == "" { passed = passed + 1_usize progress.pass_test(display) }
+                            else { failed = failed + 1_usize progress.fail_test(display, failure) }
                         }
                     }
                 }
@@ -89,55 +99,76 @@ pub fn native_test() -> u32 {
         }
     }
 
-    if found == 0_usize { println("No tests found.") ret 0_u32 }
+    progress.finish(passed, failed)
     if failed == 0_usize {
-        println("test result: ok. " + Debug::fmt(passed) + " passed; 0 failed")
         ret 0_u32
     }
-    println("test result: FAILED. " + Debug::fmt(passed) + " passed; " + Debug::fmt(failed) + " failed")
     ret 1_u32
 }
 
-fn run_unit_test(root: Path, workspace: ProjectWorkspace, item: FunctionItem, display: str) -> bool {
+fn count_selected_tests(workspace: ProjectWorkspace, filter: str) -> usize {
+    let mut total = 0_usize
+    for module in workspace.modules {
+        if module.owner_name == workspace.root_name {
+            for statement in module.ast {
+                match statement {
+                    Statement::Function(item) => {
+                        let display = module.owner_name + ":" + module.module_path.as_str() + "::" + item.name
+                        if has_attr(item, "test") && (filter == "" || contains(display, filter)) { total = total + 1_usize }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let tests_dir = Path::new(".").resolve().join("tests")
+    if file_exists(tests_dir.as_str()) {
+        for name in read_dir(tests_dir.as_str()) {
+            let display = workspace.root_name + ":tests/" + name
+            if ends_with(name, ".enq") && (filter == "" || contains(display, filter)) { total = total + 1_usize }
+        }
+    }
+    ret total
+}
+
+fn run_unit_test(root: Path, workspace: ProjectWorkspace, item: FunctionItem, display: str) -> str {
     if item.name == "main" || item.params.len() > 0_usize || item.generics.len() > 0_usize || item.is_extern || !returns_bool(item) {
-        println("test " + display + " ... FAILED (test must be fn() -> bool)")
-        ret false
+        ret "test must be fn() -> bool"
     }
     let mut ast = unit_test_ast(workspace.flat_ast, item.name)
     append_parsed(ast, "fn main() -> u32 { let result: bool = " + item.name + "() if result { ret 0_u32 } ret 1_u32 }")
-    ret compile_and_run(root, ast, display)
+    ret compile_and_run_result(root, ast, display)
 }
 
-fn run_standalone_test(root: Path, workspace: ProjectWorkspace, path: Path, display: str) -> bool {
+fn run_standalone_test(root: Path, workspace: ProjectWorkspace, path: Path, display: str) -> str {
     let expected = expected_compile_error(read_file(path.as_str()))
     if expected != "" {
         let output_path = root.join("target").join("tests").join("expected_compile_error.txt")
-        run("mkdir -p " + shell_quote(root.join("target").join("tests").as_str()))
+        mkdir_all(root.join("target").join("tests").as_str())
         let executable = arg_or(0_usize, "encore")
-        let command = shell_quote(executable) + " test --_worker-standalone " + shell_quote(path.as_str()) + " > " + shell_quote(output_path.as_str()) + " 2>&1"
-        let code = run(command)
+        let mut args = Vec[str]::new()
+        args.push("test")
+        args.push("--_worker-standalone")
+        args.push(path.as_str())
+        let code = run_args_capture(executable, args, output_path.as_str())
         let output = read_file(output_path.as_str())
         if code != 0_i32 {
-            println("test " + display + " ... ok")
-            ret true
+            ret ""
         }
-        println("test " + display + " ... FAILED (expected compile error: " + expected + ")")
-        ret false
+        ret "expected compile error: " + expected
     }
     let test_workspace = load_entry_workspace(root, path)
-    ret compile_and_run(root, test_workspace.flat_ast, display)
+    ret compile_and_run_result(root, test_workspace.flat_ast, display)
 }
 
-fn compile_and_run(root: Path, ast: Vec[Statement], display: str) -> bool {
+fn compile_and_run_result(root: Path, ast: Vec[Statement], display: str) -> str {
     let name = sanitize(display)
     if compile_test_ast(root, ast, name) != 0_u32 {
-        println("test " + display + " ... FAILED (compile)")
-        ret false
+        ret "compile failed"
     }
-    let code = run(shell_quote(root.join("target").join("tests").join(name).as_str()))
-    if code == 0_i32 { println("test " + display + " ... ok") ret true }
-    println("test " + display + " ... FAILED")
-    ret false
+    let code = run_args(root.join("target").join("tests").join(name).as_str(), Vec[str]::new())
+    if code == 0_i32 { ret "" }
+    ret "process exited with code " + Debug::fmt(code)
 }
 
 fn unit_test_ast(source: Vec[Statement], test_name: str) -> Vec[Statement] {
