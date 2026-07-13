@@ -98,11 +98,11 @@ fn platform_name() -> str { ret "linux" }
 fn platform_name() -> str { ret "arm-eabihf" }
 ```
 
-Available keys are `target_os`, `target_arch`, `target_env`, and
-`target_family`. Family aliases include `unix`, `windows`, and `none`.
-Desktop, mobile, WebAssembly, BSD, and bare-metal LLVM triples are classified
-independently; for example, Android and iOS do not alias Linux and macOS in
-`target_os`.
+Available keys are `target_os`, `target_arch`, `target_env`, `target_family`,
+`target_pointer_width`, and `target_endian`. Capability aliases include
+`hosted`, `freestanding`, `unix`, `windows`, and `none`. Desktop, mobile,
+WebAssembly, BSD, and bare-metal LLVM triples are classified independently;
+for example, Android and iOS do not alias Linux and macOS in `target_os`.
 
 Cross-compilation requires a linker and sysroot capable of producing binaries
 for the requested target. Bare-metal targets additionally require a compatible
