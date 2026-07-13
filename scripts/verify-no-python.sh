@@ -12,7 +12,7 @@ if [ -n "$tracked_python" ]; then
 fi
 
 if git grep -n -E '(^|[^[:alnum:]_-])(python[0-9.]*|pip[0-9.]*|encore-py)([^[:alnum:]_-]|$)' -- \
-    '.github/**' 'scripts/**' 'install.sh' 'install.ps1' '*.enq' '*.c' '*.toml' \
+    '.github/**' 'scripts/**' 'install.sh' '*.enq' '*.c' '*.toml' \
     ':(exclude)scripts/verify-no-python.sh'
 then
     echo "Production source or automation still invokes Python" >&2

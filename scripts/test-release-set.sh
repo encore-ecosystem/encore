@@ -25,14 +25,8 @@ do
     printf '%s\n' "$triple" > "$file"
     hash_sidecar "$file"
 done
-for triple in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
-    file="$tmp/encore-${triple}.zip"
-    printf '%s\n' "$triple" > "$file"
-    hash_sidecar "$file"
-done
-
 "$verifier" "$tmp"
-test "$(wc -l < "$tmp/SHA256SUMS" | tr -d ' ')" = 6
+test "$(wc -l < "$tmp/SHA256SUMS" | tr -d ' ')" = 4
 
 mv "$tmp/encore-aarch64-apple-darwin.tar.gz.sha256" "$tmp/missing"
 if "$verifier" "$tmp" >/dev/null 2>&1; then

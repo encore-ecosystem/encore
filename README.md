@@ -16,18 +16,12 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 export PATH="$HOME/.encore/bin:$PATH"
 ```
 
-Windows PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/encore-language/encore/trunk/install.ps1 | iex
-```
-
 The installer verifies the release checksum. Set `ENCORE_VERSION` to install a
 specific tag, or run the installer again to update. Uninstall with
-`install.sh --uninstall` or `install.ps1 -Uninstall`.
+`install.sh --uninstall`.
 Set `ENCORE_RELEASE_BASE_URL` to an HTTPS release mirror containing archives
 and their `.sha256` files. `file://` URLs are accepted for offline installation
-and installer testing on Unix and Windows.
+and installer testing.
 
 Building programs requires `clang` or a configured target toolchain.
 
@@ -78,9 +72,9 @@ cd index/encore
 ./target/extreme/encore test
 ```
 
-CI performs two native self-host generations and tests Linux and macOS release
-packages. Tagged commits publish portable archives and checksums, including
-Windows artifacts from the release workflow.
+Regular CI builds the native compiler and runs package tests on Linux and
+macOS. Tagged commits run the full self-host and release verification workflow,
+then publish Linux and macOS archives with checksums.
 
 Prepare a stable release version from a clean worktree with
 `scripts/set-version.sh MAJOR.MINOR.PATCH`. `VERSION` is canonical; CI verifies
