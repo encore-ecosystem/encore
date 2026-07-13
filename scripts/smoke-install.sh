@@ -30,6 +30,12 @@ ENCORE_RELEASE_BASE_URL="file://$archive_dir" \
 
 "$tmp/home/bin/encore" --version
 
+ENCORE_HOME="$tmp/home-v-prefix" \
+ENCORE_VERSION="v$package_version" \
+ENCORE_RELEASE_BASE_URL="file://$archive_dir" \
+    "$repo_root/install.sh"
+"$tmp/home-v-prefix/bin/encore" --version
+
 set +e
 mismatch_output=$(ENCORE_HOME="$tmp/mismatch" \
     ENCORE_VERSION=wrong-version \

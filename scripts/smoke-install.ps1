@@ -32,6 +32,11 @@ try {
     $compiler = Join-Path $installRoot "bin/encore.exe"
     & $compiler --version
 
+    $env:ENCORE_HOME = Join-Path $temp "home-v-prefix"
+    $env:ENCORE_VERSION = "v$packageVersion"
+    & (Join-Path $repoRoot "install.ps1")
+    & (Join-Path $env:ENCORE_HOME "bin/encore.exe") --version
+
     $env:ENCORE_HOME = Join-Path $temp "mismatch"
     $env:ENCORE_VERSION = "wrong-version"
     try {

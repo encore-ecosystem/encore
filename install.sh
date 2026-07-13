@@ -5,6 +5,15 @@ repository=${ENCORE_REPOSITORY:-encore-language/encore}
 install_root=${ENCORE_HOME:-"$HOME/.encore"}
 version=${ENCORE_VERSION:-latest}
 release_base=${ENCORE_RELEASE_BASE_URL:-}
+expected_version=$version
+release_tag=$version
+if [ "$version" != "latest" ]; then
+    expected_version=${version#v}
+    case "$version" in
+        v*) ;;
+        *) release_tag="v$version" ;;
+    esac
+fi
 
 if [ "${1:-}" = "--uninstall" ]; then
     rm -rf "$install_root"
@@ -35,7 +44,7 @@ if [ -n "$release_base" ]; then
 elif [ "$version" = "latest" ]; then
     base_url="https://github.com/${repository}/releases/latest/download"
 else
-    base_url="https://github.com/${repository}/releases/download/${version}"
+    base_url="https://github.com/${repository}/releases/download/${release_tag}"
 fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
@@ -62,8 +71,8 @@ tar -xzf "$tmp/$asset" -C "$tmp/unpack"
 package_dir=$(find "$tmp/unpack" -mindepth 1 -maxdepth 1 -type d | head -n 1)
 test -n "$package_dir"
 package_version=$(cat "$package_dir/VERSION")
-if [ "$version" != "latest" ] && [ "$package_version" != "$version" ]; then
-    echo "Release version mismatch: requested $version, archive contains $package_version" >&2
+if [ "$version" != "latest" ] && [ "$package_version" != "$expected_version" ]; then
+    echo "Release version mismatch: requested $expected_version, archive contains $package_version" >&2
     exit 1
 fi
 mkdir -p "$install_root"

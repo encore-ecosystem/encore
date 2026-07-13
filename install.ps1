@@ -6,6 +6,12 @@ param(
 $ErrorActionPreference = "Stop"
 if (-not $InstallRoot) { $InstallRoot = Join-Path $HOME ".encore" }
 if (-not $Version) { $Version = "latest" }
+$expectedVersion = $Version
+$releaseTag = $Version
+if ($Version -ne "latest") {
+    if ($Version.StartsWith("v")) { $expectedVersion = $Version.Substring(1) }
+    if (-not $Version.StartsWith("v")) { $releaseTag = "v$Version" }
+}
 if ($Uninstall) {
     Remove-Item -Recurse -Force $InstallRoot -ErrorAction SilentlyContinue
     Write-Host "Removed Encore from $InstallRoot"
@@ -29,7 +35,7 @@ $base = if ($releaseBase) {
 } elseif ($Version -eq "latest") {
     "https://github.com/$repository/releases/latest/download"
 } else {
-    "https://github.com/$repository/releases/download/$Version"
+    "https://github.com/$repository/releases/download/$releaseTag"
 }
 $asset = "encore-$triple.zip"
 $temp = Join-Path ([System.IO.Path]::GetTempPath()) ("encore-" + [guid]::NewGuid())
@@ -52,8 +58,8 @@ try {
     $package = Get-ChildItem $unpack -Directory | Select-Object -First 1
     if (-not $package) { throw "Release archive is empty" }
     $packageVersion = Get-Content (Join-Path $package.FullName "VERSION")
-    if ($Version -ne "latest" -and $packageVersion -ne $Version) {
-        throw "Release version mismatch: requested $Version, archive contains $packageVersion"
+    if ($Version -ne "latest" -and $packageVersion -ne $expectedVersion) {
+        throw "Release version mismatch: requested $expectedVersion, archive contains $packageVersion"
     }
     New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
     @("bin", "lib", "share", "VERSION") | ForEach-Object {
