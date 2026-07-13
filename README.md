@@ -20,8 +20,13 @@ The installer verifies the release checksum. Set `ENCORE_VERSION` to install a
 specific tag, or update explicitly with:
 
 ```sh
-install.sh --update
-install.sh --version 1.0.0
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/encore-language/encore/trunk/install.sh | \
+  sh -s -- --update
+
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/encore-language/encore/trunk/install.sh | \
+  sh -s -- --version 1.0.0
 ```
 
 Use `--install-dir <path>` for a custom location and `--uninstall` to remove
