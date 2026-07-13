@@ -74,8 +74,9 @@ cd index/encore
 ./target/extreme/encore test
 ```
 
-CI performs two native self-host generations and tests Linux, Windows and
-macOS release packages. Tagged commits publish portable archives and checksums.
+CI performs two native self-host generations and tests Linux and macOS release
+packages. Tagged commits publish portable archives and checksums, including
+Windows artifacts from the release workflow.
 
 ## License
 
