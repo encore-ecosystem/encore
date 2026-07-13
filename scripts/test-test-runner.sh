@@ -57,6 +57,14 @@ grep -q "failures:" "$tmp/wrong.log"
 grep -q "    test_runner_fixture:tests/wrong_diagnostic.enq" "$tmp/wrong.log"
 
 set +e
+run_test "$tmp/runtime.log" --filter runtime_failure
+runtime_code=$?
+set -e
+test "$runtime_code" -ne 0
+grep -q "process exited with code 7" "$tmp/runtime.log"
+grep -q "0 passed; 1 failed" "$tmp/runtime.log"
+
+set +e
 run_test "$tmp/signature.log" --filter invalid_signature
 signature_code=$?
 set -e
