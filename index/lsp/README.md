@@ -16,14 +16,14 @@ Current server capabilities:
 - `textDocument/documentHighlight` for same-document identifiers.
 - `textDocument/prepareRename` and `textDocument/rename` across open documents and indexed workspace files, including import-based top-level symbol usages.
 - `textDocument/documentSymbol` for `fn`, `struct`, `enum`, `trait`, `impl`.
-- `workspace/symbol` over open documents and indexed workspace project sources discovered from `encore.toml`.
+- `workspace/symbol` over open documents and indexed sources for workspace projects activated by open files; project roots are discovered from `encore.toml`.
 - `textDocument/completion` with Encore keywords and declarations from open documents and indexed workspace files.
 - `textDocument/documentLink` for import paths, including file targets resolved through workspace project/module discovery.
 - `textDocument/foldingRange` for brace-delimited blocks.
 - `textDocument/selectionRange` for identifier selections.
 - `textDocument/semanticTokens/full` for lexical semantic highlighting.
 - `textDocument/formatting` and `textDocument/rangeFormatting` for trailing whitespace cleanup.
-- Push and pull diagnostics for lexer, structural and basic semantic errors, including unresolved imports, unresolved calls, unknown types and call arity mismatches.
+- Push and per-document pull diagnostics for lexer, structural and basic semantic errors, including unresolved imports, unresolved calls, unknown types and call arity mismatches.
 - `textDocument/prepareCallHierarchy`, `callHierarchy/outgoingCalls`, `callHierarchy/incomingCalls` for callable symbols.
 
 ## Source Layout

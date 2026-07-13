@@ -55,84 +55,47 @@ union encore_heap_block {
     struct {
         size_t capacity;
         size_t refs;
-        encore_heap_block *next;
-        encore_heap_block *all_next;
     } meta;
     max_align_t alignment;
 };
 
-#define ENCORE_HEAP_MIN_SHIFT 4u
-#define ENCORE_HEAP_CLASS_COUNT 13u
-static encore_heap_block *g_heap_free_lists[ENCORE_HEAP_CLASS_COUNT];
-static encore_heap_block *g_heap_blocks;
-static bool g_heap_cleanup_registered;
 void __ehir_hfree(void *ptr);
 
-static void encore_heap_cleanup(void) {
-    encore_heap_block *block = g_heap_blocks;
-    while (block != NULL) {
-        encore_heap_block *next = block->meta.all_next;
-        free(block);
-        block = next;
-    }
-    g_heap_blocks = NULL;
-    memset(g_heap_free_lists, 0, sizeof(g_heap_free_lists));
-}
-
-static size_t encore_heap_class(size_t bytes) {
-    size_t capacity = (size_t)1u << ENCORE_HEAP_MIN_SHIFT;
-    size_t index = 0;
-    while (capacity < bytes && index + 1 < ENCORE_HEAP_CLASS_COUNT) {
-        capacity <<= 1;
-        index += 1;
-    }
-    return capacity >= bytes ? index : ENCORE_HEAP_CLASS_COUNT;
-}
-
 static void *encore_heap_alloc(size_t bytes) {
-    if (!g_heap_cleanup_registered) {
-        atexit(encore_heap_cleanup);
-        g_heap_cleanup_registered = true;
-    }
     if (bytes == 0) bytes = 1;
-    size_t class_index = encore_heap_class(bytes);
-    size_t capacity = bytes;
-    encore_heap_block *block = NULL;
-    if (class_index < ENCORE_HEAP_CLASS_COUNT) {
-        capacity = (size_t)1u << (ENCORE_HEAP_MIN_SHIFT + class_index);
-        block = g_heap_free_lists[class_index];
-        if (block != NULL) g_heap_free_lists[class_index] = block->meta.next;
-    }
-    if (block == NULL) {
-        block = malloc(sizeof(encore_heap_block) + capacity);
-        if (block != NULL) {
-            block->meta.all_next = g_heap_blocks;
-            g_heap_blocks = block;
-        }
-    }
+    encore_heap_block *block = malloc(sizeof(encore_heap_block) + bytes);
     if (block == NULL) return NULL;
-    block->meta.capacity = capacity;
+    block->meta.capacity = bytes;
     block->meta.refs = 1;
-    block->meta.next = NULL;
     return block + 1;
 }
 
 void *__ehir_hrealloc(void *ptr, size_t bytes) {
     if (ptr == NULL) return encore_heap_alloc(bytes);
+    if (bytes == 0) bytes = 1;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
     if (bytes <= block->meta.capacity) return ptr;
+    if (block->meta.refs == 1) {
+        encore_heap_block *resized = realloc(block, sizeof(encore_heap_block) + bytes);
+        if (resized == NULL) return NULL;
+        resized->meta.capacity = bytes;
+        return resized + 1;
+    }
     void *next = encore_heap_alloc(bytes);
     if (next == NULL) return NULL;
     memcpy(next, ptr, block->meta.capacity);
-    __ehir_hfree(ptr);
+    block->meta.refs -= 1;
     return next;
 }
 
 void __ehir_hfree(void *ptr) {
-    /* Values are copied by value in EHIR, so an alias can outlive the local
-     * which requested the drop. The arena owns the storage until process
-     * teardown; logical drops still release nested ref-counted values. */
-    (void)ptr;
+    if (ptr == NULL) return;
+    encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
+    if (block->meta.refs > 1) {
+        block->meta.refs -= 1;
+        return;
+    }
+    free(block);
 }
 
 void encore_heap_retain(void *ptr) {
@@ -155,37 +118,14 @@ bool encore_heap_release(void *ptr) {
 typedef union {
     struct {
         size_t refs;
-        union encore_box_header_tag *next;
     } meta;
     max_align_t alignment;
 } encore_box_header;
 
-/* Enum/dynamic payloads use a tiny ref-counted arena. Keeping released nodes in
- * the arena avoids allocator churn and lets the process teardown reclaim any
- * payload still live because the program returned early. */
-static encore_box_header *g_box_headers;
-static bool g_box_cleanup_registered;
-
-static void encore_box_cleanup(void) {
-    encore_box_header *header = g_box_headers;
-    while (header != NULL) {
-        encore_box_header *next = (encore_box_header *)header->meta.next;
-        free(header);
-        header = next;
-    }
-    g_box_headers = NULL;
-}
-
 void *encore_box_alloc(size_t bytes) {
     encore_box_header *header = malloc(sizeof(encore_box_header) + bytes);
     if (header == NULL) return NULL;
-    if (!g_box_cleanup_registered) {
-        atexit(encore_box_cleanup);
-        g_box_cleanup_registered = true;
-    }
     header->meta.refs = 1;
-    header->meta.next = (union encore_box_header_tag *)g_box_headers;
-    g_box_headers = header;
     return (void *)(header + 1);
 }
 
@@ -199,7 +139,7 @@ void encore_box_drop(void *payload) {
     if (payload == NULL) return;
     encore_box_header *header = ((encore_box_header *)payload) - 1;
     if (header->meta.refs > 1) { header->meta.refs -= 1; return; }
-    header->meta.refs = 0;
+    free(header);
 }
 
 typedef struct {
@@ -398,7 +338,10 @@ static encore_str encore_from_owned_buffer(char *buffer, size_t len) {
     if (buffer == NULL) {
         return encore_empty_str();
     }
-    encore_str_object *object = __ehir_hrealloc(NULL, sizeof(encore_str_object) + len + 1);
+    /* Strings have their own precise refcount, so they do not need the
+     * alias-tolerant aggregate arena. Releasing them eagerly is essential for
+     * compiler workloads that create millions of temporary IR fragments. */
+    encore_str_object *object = malloc(sizeof(encore_str_object) + len + 1);
     if (object == NULL) {
         free(buffer);
         return encore_empty_str();
@@ -623,7 +566,7 @@ void encore_str_drop(encore_str value) {
     if (value.object->ref_count != 0) {
         return;
     }
-    __ehir_hfree(value.object);
+    free(value.object);
 }
 
 static encore_str encore_format(const char *fmt, ...) {

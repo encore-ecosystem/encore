@@ -435,7 +435,34 @@ fn lower_struct_drop_function(params: Vec[Type], fields: Vec[Parameter], concret
         free_instructions.push(llvm_inst_call(Option[LLVMValue]::None, void_type(), "__ehir_hfree", vec_singleton(raw_data)))
         let params_data = vec_singleton(llvm_make_param("self", lower_type(concrete)))
         let mut body = Vec[LLVMBasicBlock]::new()
-        body.push(llvm_block("entry", instructions, llvm_term_cbr(is_last, "free", "done")))
+        if type_needs_drop(element_type) {
+            let len = reg("len", i64_type())
+            let index_ptr = reg("index_ptr", ptr_type(i64_type()))
+            instructions.push(llvm_inst_extractvalue(len, self_value, "1"))
+            instructions.push(llvm_inst_alloca(index_ptr, i64_type()))
+            instructions.push(llvm_inst_store(const_text("0", i64_type()), index_ptr))
+
+            let index = reg("index", i64_type())
+            let has_next = reg("has_next", i1_type())
+            let mut check_instructions = vec_singleton(llvm_inst_load(index, index_ptr))
+            check_instructions.push(llvm_inst_binary("icmp ult", has_next, index, len))
+
+            let element_ptr = reg("element_ptr", ptr_type(lower_type(element_type)))
+            let element = reg("element", lower_type(element_type))
+            let next_index = reg("next_index", i64_type())
+            let mut drop_instructions = vec_singleton(llvm_inst_gep(element_ptr, lower_type(element_type), typed_data, vec_singleton(index), true))
+            drop_instructions.push(llvm_inst_load(element, element_ptr))
+            drop_instructions.extend(lower_drop_value(element, element_type, "element"))
+            drop_instructions.push(llvm_inst_add(next_index, index, const_text("1", i64_type())))
+            drop_instructions.push(llvm_inst_store(next_index, index_ptr))
+
+            body.push(llvm_block("entry", instructions, llvm_term_cbr(is_last, "drop_check", "done")))
+            body.push(llvm_block("drop_check", check_instructions, llvm_term_cbr(has_next, "drop_element", "free")))
+            body.push(llvm_block("drop_element", drop_instructions, llvm_term_br("drop_check")))
+        }
+        else {
+            body.push(llvm_block("entry", instructions, llvm_term_cbr(is_last, "free", "done")))
+        }
         body.push(llvm_block("free", free_instructions, llvm_term_br("done")))
         body.push(llvm_block("done", Vec[LLVMInstruction]::new(), llvm_term_ret_void()))
         ret llvm_define_fn(drop_symbol(concrete), void_type(), params_data, body)
