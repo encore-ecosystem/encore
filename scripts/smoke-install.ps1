@@ -19,8 +19,13 @@ $previousBase = $env:ENCORE_RELEASE_BASE_URL
 try {
     $installRoot = Join-Path $temp "home"
     $archiveDirectory = Split-Path -Parent $archivePath
+    $inspectRoot = Join-Path $temp "inspect"
+    Expand-Archive $archivePath $inspectRoot
+    $inspectPackage = Get-ChildItem $inspectRoot -Directory | Select-Object -First 1
+    if (-not $inspectPackage) { throw "Release archive is empty" }
+    $packageVersion = Get-Content (Join-Path $inspectPackage.FullName "VERSION")
     $env:ENCORE_HOME = $installRoot
-    $env:ENCORE_VERSION = "smoke"
+    $env:ENCORE_VERSION = $packageVersion
     $env:ENCORE_RELEASE_BASE_URL = ([System.Uri]$archiveDirectory).AbsoluteUri
     & (Join-Path $repoRoot "install.ps1")
 
@@ -36,7 +41,7 @@ try {
         if ($_.Exception.Message -notlike "*Release version mismatch*") { throw }
     }
     $env:ENCORE_HOME = $installRoot
-    $env:ENCORE_VERSION = "smoke"
+    $env:ENCORE_VERSION = $packageVersion
 
     $project = Join-Path $temp "project"
     Copy-Item -Recurse (Join-Path $repoRoot "examples/add_two_structs") $project

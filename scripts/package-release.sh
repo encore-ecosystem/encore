@@ -32,14 +32,24 @@ cp "$repo_root/LICENSE" "$stage/share/doc/encore/LICENSE"
 cp "$repo_root/README.md" "$stage/share/doc/encore/README.md"
 printf '%s\n' "$version" > "$stage/VERSION"
 
+# Keep package metadata stable across clean checkouts and CI runners.
+find "$stage" -exec touch -t 200001010000.00 '{}' +
+
 if [ "$binary_name" = "encore.exe" ]; then
     archive="${output_dir}/encore-${triple}.zip"
     rm -f "$archive"
-    (cd "$work_dir" && tar -a -cf "$archive" "$package_name")
+    (cd "$work_dir" && find "$package_name" -print | LC_ALL=C sort | COPYFILE_DISABLE=1 tar --no-recursion -a -cf "$archive" -T -)
 else
     archive="${output_dir}/encore-${triple}.tar.gz"
     rm -f "$archive"
-    tar -C "$work_dir" -czf "$archive" "$package_name"
+    if tar --version 2>/dev/null | grep -q GNU; then
+        tar -C "$work_dir" --sort=name --owner=0 --group=0 --numeric-owner -czf "$archive" "$package_name"
+    else
+        plain_archive="${work_dir}/package.tar"
+        (cd "$work_dir" && find "$package_name" -print | LC_ALL=C sort | COPYFILE_DISABLE=1 tar --no-recursion --uid 0 --gid 0 --uname root --gname root -cf "$plain_archive" -T -)
+        gzip -n -c "$plain_archive" > "$archive"
+        rm -f "$plain_archive"
+    fi
 fi
 rm -rf "$work_dir"
 printf '%s\n' "$archive"

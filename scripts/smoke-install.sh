@@ -18,9 +18,13 @@ fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+mkdir -p "$tmp/inspect"
+tar -xf "$archive" -C "$tmp/inspect"
+package_dir=$(find "$tmp/inspect" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+package_version=$(cat "$package_dir/VERSION")
 
 ENCORE_HOME="$tmp/home" \
-ENCORE_VERSION=smoke \
+ENCORE_VERSION="$package_version" \
 ENCORE_RELEASE_BASE_URL="file://$archive_dir" \
     "$repo_root/install.sh"
 
