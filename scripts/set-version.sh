@@ -33,7 +33,7 @@ replace() {
 printf '%s\n' "$version" > "$repo_root/VERSION"
 replace "$repo_root/index/encore/src/main.enq" "s/encore $old/encore $version/"
 replace "$repo_root/index/encore/encore.toml" "s/^version = \"$old\"/version = \"$version\"/"
-replace "$repo_root/PKGBUILD" "s/^pkgver=$old/pkgver=$version/"
+replace "$repo_root/packaging/PKGBUILD.template" "s/^pkgver=$old/pkgver=$version/"
 replace "$repo_root/README.md" "s/current development line is \`$old\`/current development line is \`$version\`/"
 "$repo_root/scripts/verify-version.sh"
 printf 'Updated Encore version: %s -> %s\n' "$old" "$version"

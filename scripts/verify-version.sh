@@ -6,7 +6,7 @@ version=$(cat "$repo_root/VERSION")
 printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
 
 manifest_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo_root/index/encore/encore.toml" | head -n 1)
-pkg_version=$(sed -n 's/^pkgver=//p' "$repo_root/PKGBUILD" | head -n 1)
+pkg_version=$(sed -n 's/^pkgver=//p' "$repo_root/packaging/PKGBUILD.template" | head -n 1)
 test "$manifest_version" = "$version"
 test "$pkg_version" = "$version"
 grep -Fq "console.println(\"encore $version\")" "$repo_root/index/encore/src/main.enq"

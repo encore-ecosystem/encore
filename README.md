@@ -84,7 +84,9 @@ Windows artifacts from the release workflow.
 
 Prepare a stable release version from a clean worktree with
 `scripts/set-version.sh MAJOR.MINOR.PATCH`. `VERSION` is canonical; CI verifies
-that the native CLI, compiler manifest, README, and PKGBUILD stay synchronized.
+that the native CLI, compiler manifest, README, and PKGBUILD template stay
+synchronized. Tagged releases include a generated Arch Linux `PKGBUILD` pinned
+to the SHA-256 of both Linux architecture archives.
 
 ## License
 
