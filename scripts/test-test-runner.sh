@@ -27,6 +27,7 @@ cleanup() {
 trap 'cleanup $?' 0
 trap 'exit 1' HUP INT TERM
 cp -R "$repo_root/scripts/fixtures/test-runner" "$tmp/project"
+mkdir -p "$tmp/project/target/tests/test_runner_fixture_src_main_enq__passing_unit/target"
 
 run_test() {
     output_file=$1
