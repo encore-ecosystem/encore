@@ -1,19 +1,19 @@
 import argparse
-import sys
 from typing import Callable
 
-from encore import __version__
-from encore import modes
+from encore import __version__, modes
 from encore.utils.diagnostics import render_diagnostic
 
 MODES = [
-    modes.add_add_parser,
+    # modes.add_add_parser,
     modes.add_init_parser,
+    modes.add_install_parser,
     modes.add_build_parser,
     modes.add_run_parser,
-    modes.add_sync_parser,
+    modes.add_memcheck_parser,
+    # modes.add_sync_parser,
     modes.add_test_parser,
-    modes.add_update_parser,
+    # modes.add_update_parser,
 ]
 
 
@@ -36,5 +36,5 @@ def main():
     except KeyboardInterrupt:
         raise
     except Exception as exc:
-        print(render_diagnostic(exc), file=sys.stderr)
-        raise SystemExit(1) from None
+        print(render_diagnostic(exc))
+        raise SystemExit(1)
