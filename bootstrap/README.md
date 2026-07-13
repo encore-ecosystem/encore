@@ -6,15 +6,21 @@ compiler into target-specific LLVM IR. Each target runner then compiles that IR
 with its native Clang and performs two self-hosting generations before tests and
 packaging.
 
-The binary was generated from the `feature/v0.1.3` native compiler, linked in an
-Ubuntu 22.04 container, and requires glibc 2.34 or newer. Its compressed SHA-256
-is recorded alongside it. Once a native release is published, this seed should
-be regenerated from a pinned release artifact and its provenance updated here.
+The current binary was generated from commit
+`a74c00ba5627e2939d3870fd2ef46b399a2554a7` in an Ubuntu 22.04 container and
+requires glibc 2.34 or newer. Compressed and uncompressed SHA-256 files plus
+compiler version, source commit, target, and build system provenance are stored
+alongside it. CI verifies all metadata and executes `--version` before use.
 
-Reproduction after generating `encore.ll` for `x86_64-unknown-linux-gnu`:
+Regenerate all stage0 files from a clean checkout and an existing native
+compiler with:
 
 ```sh
-clang -O3 encore.ll core/runtime.c index/ehir-llvm-backend/runtime.c \
-  index/rich/runtime.c -o encore-stage0-linux-x86_64
-gzip -9 encore-stage0-linux-x86_64
+scripts/update-stage0.sh index/encore/target/extreme/encore
+git diff -- bootstrap
 ```
+
+The update uses deterministic gzip metadata and records the checked-out commit.
+Review and commit the binary, both hashes, and provenance together. Once a
+native release is published, regenerate this seed from a pinned release binary
+instead of a development build.
