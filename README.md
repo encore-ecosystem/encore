@@ -7,7 +7,7 @@ still change quickly.
 
 ## Status
 
-Current compiler version: `0.1.1`.
+Current compiler version: `0.1.2`.
 
 The beta target is a usable local toolchain with:
 
