@@ -13,11 +13,40 @@ on:
 permissions:
   contents: write
 
-env:
-  BOOTSTRAP_REF: e1fccafb2b3a37dcf549123ae3896fe80e96e03f
-
 jobs:
+  bootstrap-ir:
+    name: Generate bootstrap IR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify native stage0
+        run: sha256sum --check bootstrap/encore-stage0-linux-x86_64.sha256
+      - name: Generate target IR
+        working-directory: index/encore
+        run: |
+          gzip -dc ../../bootstrap/encore-stage0-linux-x86_64.gz > target/encore-stage0
+          chmod +x target/encore-stage0
+          for triple in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin \
+            x86_64-pc-windows-msvc \
+            aarch64-pc-windows-msvc
+          do
+            ./target/encore-stage0 build --profile extreme --target "$triple" --emit llvm-ir
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-ir
+          path: index/encore/target/*/extreme/encore.ll
+          if-no-files-found: error
+          retention-days: 1
+
   build:
+    needs: bootstrap-ir
+    env:
+      ENCORE_CORE_DIR: ${{ github.workspace }}/core
     strategy:
       fail-fast: false
       matrix:
@@ -43,25 +72,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          ref: ${{ env.BOOTSTRAP_REF }}
-          path: .bootstrap
-      - uses: astral-sh/setup-uv@v6
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - name: Bootstrap from frozen compiler
-        shell: bash
-        working-directory: .bootstrap/index/encore
-        env:
-          ENCORE_CACHE_DIR: ${{ runner.temp }}/encore-stage0-cache
-        run: uv run --no-dev --project ../.. encore-py build --profile extreme
-      - name: Promote frozen native seed
+          name: bootstrap-ir
+          path: index/encore/target
+      - name: Assemble native seed
         shell: bash
         run: |
           mkdir -p index/encore/target/extreme
-          cp .bootstrap/index/encore/target/extreme/${{ matrix.executable }} index/encore/target/extreme/${{ matrix.executable }}
+          clang -O3 -Wno-override-module \
+            index/encore/target/${{ matrix.triple }}/extreme/encore.ll \
+            core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
+            -o index/encore/target/extreme/${{ matrix.executable }}
+          index/encore/target/extreme/${{ matrix.executable }} --version
       - name: Native self-host and tests
         shell: bash
         working-directory: index/encore
