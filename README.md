@@ -82,6 +82,10 @@ CI performs two native self-host generations and tests Linux and macOS release
 packages. Tagged commits publish portable archives and checksums, including
 Windows artifacts from the release workflow.
 
+Prepare a stable release version from a clean worktree with
+`scripts/set-version.sh MAJOR.MINOR.PATCH`. `VERSION` is canonical; CI verifies
+that the native CLI, compiler manifest, README, and PKGBUILD stay synchronized.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
