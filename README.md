@@ -66,7 +66,7 @@ Toolchains can also be configured in `encore.toml`. See
 | Path | Purpose |
 | --- | --- |
 | `index/core` | low-level language library and portable C runtime |
-| `index/encore` | native compiler frontend and CLI |
+| repository root | native compiler frontend and CLI |
 | `index/ehir` | native EHIR representation and parser |
 | `index/ehir-llvm-backend` | native LLVM backend |
 | `index/std` | application standard library |
@@ -76,10 +76,9 @@ Toolchains can also be configured in `encore.toml`. See
 
 ## Native Development
 
-With an existing native compiler at `index/encore/target/extreme/encore`:
+With an existing native compiler at `target/extreme/encore`, run from the repository root:
 
 ```sh
-cd index/encore
 ./target/extreme/encore build --profile extreme
 ./target/extreme/encore test
 ```

@@ -128,9 +128,9 @@ fields let metadata apply only to matching compile-time configurations.
 Release-gate validation uses the native compiler:
 
 ```sh
-compiler="$PWD/index/encore/target/extreme/encore"
+compiler="$PWD/target/extreme/encore"
 for package in index/core index/ehir index/ehir-llvm-backend index/rich index/std; do
     (cd "$package" && "$compiler" test)
 done
-(cd index/encore && ./target/extreme/encore test)
+./target/extreme/encore test
 ```

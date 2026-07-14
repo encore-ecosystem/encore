@@ -29,7 +29,9 @@ test -s "$binary"
 test -f "$package/lib/encore/index/core/runtime.c"
 test -f "$package/lib/encore/index/core/encore.toml"
 test -f "$package/lib/encore/index/std/encore.toml"
-test -f "$package/lib/encore/index/encore/encore.toml"
+test -f "$package/lib/encore/encore.toml"
+test -f "$package/lib/encore/src/main.enq"
+test -f "$package/lib/encore/src/target/mod.enq"
 test -f "$package/share/doc/encore/LICENSE"
 test -f "$package/share/doc/encore/README.md"
 
@@ -37,7 +39,7 @@ if find "$package" -type l | grep -q .; then
     echo "Release package must not contain symbolic links" >&2
     exit 1
 fi
-if find "$package" -type d \( -name target -o -name .git -o -name .venv -o -name __pycache__ \) | grep -q .; then
+if find "$package" -type d \( \( -name target ! -path '*/src/target' \) -o -name .git -o -name .venv -o -name __pycache__ \) | grep -q .; then
     echo "Release package contains a build or cache directory" >&2
     exit 1
 fi

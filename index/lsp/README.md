@@ -37,7 +37,7 @@ Current server capabilities:
 Build and run with the native compiler from this directory:
 
 ```sh
-../encore/target/debug/encore build --profile release
+../../target/debug/encore build --profile release
 ./target/release/lsp
 ```
 

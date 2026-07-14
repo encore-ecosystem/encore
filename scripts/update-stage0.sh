@@ -25,11 +25,11 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 (
-    cd "$repo_root/index/encore"
+    cd "$repo_root"
     "$compiler" build --profile extreme --target "$target" --emit llvm-ir
 )
 clang -O3 \
-    "$repo_root/index/encore/target/$target/extreme/encore.ll" \
+    "$repo_root/target/$target/extreme/encore.ll" \
     "$repo_root/index/core/runtime.c" \
     "$repo_root/index/ehir-llvm-backend/runtime.c" \
     "$repo_root/index/rich/runtime.c" \

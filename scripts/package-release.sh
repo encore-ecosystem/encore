@@ -26,7 +26,9 @@ esac
 cp "$compiler" "$stage/bin/$binary_name"
 chmod +x "$stage/bin/$binary_name" 2>/dev/null || true
 cp -R "$repo_root/index" "$stage/lib/encore/index"
-find "$stage/lib/encore" -type d \( -name target -o -name .venv -o -name __pycache__ \) -prune -exec rm -rf '{}' +
+cp "$repo_root/encore.toml" "$repo_root/encore.lock" "$stage/lib/encore/"
+cp -R "$repo_root/src" "$repo_root/tests" "$stage/lib/encore/"
+find "$stage/lib/encore" -type d \( \( -name target ! -path '*/src/target' \) -o -name .venv -o -name __pycache__ \) -prune -exec rm -rf '{}' +
 cp "$repo_root/LICENSE" "$stage/share/doc/encore/LICENSE"
 cp "$repo_root/README.md" "$stage/share/doc/encore/README.md"
 printf '%s\n' "$version" > "$stage/VERSION"

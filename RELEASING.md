@@ -17,16 +17,14 @@ and release publication.
 3. Build the native compiler and run the local release-critical checks:
 
    ```sh
-   cd index/encore
    ./target/extreme/encore build --profile debug
-   cd ../..
-   scripts/verify-version.sh index/encore/target/debug/encore
+   scripts/verify-version.sh target/debug/encore
    scripts/verify-stage0.sh
    scripts/verify-no-python.sh
-   scripts/verify-self-host.sh index/encore/target/debug/encore index/encore x86_64-unknown-linux-gnu
-   scripts/smoke-cross-target.sh index/encore/target/debug/encore
-   scripts/test-test-runner.sh index/encore/target/debug/encore
-   scripts/test-cli-contract.sh index/encore/target/debug/encore
+   scripts/verify-self-host.sh target/debug/encore . x86_64-unknown-linux-gnu
+   scripts/smoke-cross-target.sh target/debug/encore
+   scripts/test-test-runner.sh target/debug/encore
+   scripts/test-cli-contract.sh target/debug/encore
    ```
 
 4. Review and commit the version changes. Regenerate stage0 only when changing

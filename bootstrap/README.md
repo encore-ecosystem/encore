@@ -17,7 +17,7 @@ Regenerate all stage0 files from a clean checkout and an existing native
 compiler with:
 
 ```sh
-scripts/update-stage0.sh index/encore/target/extreme/encore
+scripts/update-stage0.sh target/extreme/encore
 git diff -- bootstrap
 ```
 
