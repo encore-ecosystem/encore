@@ -58,3 +58,29 @@ target_code=$?
 set -e
 test "$target_code" -eq 1
 grep -q "unsupported target architecture 'fictional'" "$tmp/target.log"
+
+mkdir -p "$tmp/dependency/src" "$tmp/project/src"
+cat > "$tmp/dependency/encore.toml" <<'EOF'
+[project]
+name = "fixture_dependency"
+version = "1.2.3"
+dependencies = []
+EOF
+printf 'fn main() -> u32 { ret 0_u32 }\n' > "$tmp/dependency/src/main.enq"
+cat > "$tmp/project/encore.toml" <<'EOF'
+[project]
+name = "fixture_project"
+version = "0.0.0"
+dependencies = ["path@../dependency"]
+EOF
+printf 'fn main() -> u32 { ret 0_u32 }\n' > "$tmp/project/src/main.enq"
+(cd "$tmp/project" && "$compiler" sync) > "$tmp/sync.log"
+grep -q '^version = 1$' "$tmp/project/encore.lock"
+grep -q '^name = "fixture_dependency"$' "$tmp/project/encore.lock"
+grep -q '^ref = "path@../dependency"$' "$tmp/project/encore.lock"
+grep -q '^version = "1.2.3"$' "$tmp/project/encore.lock"
+grep -q '^ref = "sys@core"$' "$tmp/project/encore.lock"
+if grep -Fq "$tmp" "$tmp/project/encore.lock"; then
+    echo "encore.lock contains a machine-specific absolute path" >&2
+    exit 1
+fi
