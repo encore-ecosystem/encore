@@ -35,12 +35,44 @@ manually.
 
 Supported dependency references:
 
+- `index@json`
 - `path@../some-package`
 - `git@https://github.com/org/repo`
-- bare index names through `encore add <name>`
+- bare index names through `encore add <name>`; the command stores them as
+  `index@<name>`
 
 `encore sync` resolves dependencies and writes `encore.lock`.
-`encore update` pulls git dependencies and rewrites the lockfile.
+`encore update` refreshes index metadata, pulls git dependencies, and rewrites
+the lockfile. Normal builds and `encore sync` reuse the exact archive and
+SHA-256 recorded in the lockfile.
+
+## Official Package Index
+
+The default sparse index is
+`https://raw.githubusercontent.com/encore-language/index/refs/heads/main`. Package
+`json` is described by `js/json.json`; only that metadata file is downloaded.
+Set `ENCORE_INDEX_URL` to use a mirror and `ENCORE_REGISTRY_CACHE` to override
+the default cache under `~/.cache/encore/registry`.
+
+An index entry contains immutable release archives in publication order:
+
+```json
+{
+  "name": "json",
+  "versions": [
+    {
+      "version": "1.0.0",
+      "archive": "https://github.com/example/json/releases/download/v1.0.0/json-1.0.0.tar.gz",
+      "checksum": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "yanked": false
+    }
+  ]
+}
+```
+
+Each release archive must contain `encore.toml` at its root. Its project name
+and version must match the index entry. Old versions remain in the file;
+withdrawn versions are marked `yanked` instead of being removed or modified.
 
 ## Package Layout
 

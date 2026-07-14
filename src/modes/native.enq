@@ -9,6 +9,7 @@ import std::vec::Vec
 import mod::build::{compile_project, compile_project_with_profile, requested_profile, requested_target, target_profile_dir}
 import refrain::target::{target_executable_name, target_is_host}
 import refrain::project::manifest::{ProjectManifest, project_manifest_add_dependency, project_manifest_dependencies, project_manifest_has_dependency, project_manifest_name, project_manifest_version, read_project_manifest, write_project_manifest}
+import refrain::project::{normalize_dependency_reference, registry_lock_fields, resolve_index_dependency}
 import refrain::project::system_core_root
 
 pub fn native_run() -> u32 {
@@ -70,17 +71,17 @@ pub fn native_init() -> u32 {
 }
 
 pub fn native_add() -> u32 {
-    if argc() < 3_usize { ret native_mode_fail("Usage: encore add <name|git@repo|path@path>") }
+    if argc() < 3_usize { ret native_mode_fail("Usage: encore add <name|index@name|git@repo|path@path>") }
     let root = Path::new(".").resolve()
     let raw = arg_or(2_usize, "")
     if starts_with(raw, "sys@") { ret native_mode_fail("System dependencies cannot be added manually") }
-    let dependency = normalize_package_ref(raw)
+    let dependency = normalize_dependency_reference(raw)
     let mut manifest = read_project_manifest(root)
     if project_manifest_has_dependency(manifest, dependency) {
         println("Dependency already exists: " + dependency)
         ret 0_u32
     }
-    if resolve_dependency(dependency, root, false) == "" { ret 1_u32 }
+    if resolve_dependency(dependency, root, root, false) == "" { ret 1_u32 }
     project_manifest_add_dependency(manifest, dependency)
     if write_project_manifest(root, manifest) != 0_i32 { ret native_mode_fail("Unable to update encore.toml") }
     ret sync_root(root, false, "Added: " + dependency)
@@ -120,8 +121,8 @@ pub fn native_install() -> u32 {
         index = index + 1_usize
     }
     if package != "" {
-        let reference = normalize_package_ref(package)
-        let resolved = resolve_dependency(reference, cwd, update)
+        let reference = normalize_dependency_reference(package)
+        let resolved = resolve_dependency(reference, cwd, cwd, update)
         if resolved == "" { ret 1_u32 }
         project = Path::new(resolved)
     }
@@ -144,17 +145,42 @@ pub fn native_install() -> u32 {
 
 fn sync_root(root: Path, update: bool, message: str) -> u32 {
     let manifest = read_project_manifest(root)
-    let dependencies = project_manifest_dependencies(manifest)
     let mut lock = "version = 1\n"
     let mut count = 0_usize
+    let mut queue = Vec[(str, str)]::new()
+    let dependencies = project_manifest_dependencies(manifest)
     let mut index = 0_usize
     while index < dependencies.len() {
         match dependencies.get(index) {
-            Some(dependency) => {
-                let resolved = resolve_dependency(dependency, root, update)
-                if resolved == "" { ret 1_u32 }
-                lock = lock + lock_package(root, dependency, Path::new(resolved))
-                count = count + 1_usize
+            Some(dependency) => { queue.push((dependency, root.as_str())) }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    let mut seen = Vec[str]::new()
+    index = 0_usize
+    while index < queue.len() {
+        match queue.get(index) {
+            Some(item) => {
+                let reference = item.0
+                if !contains_item(seen, reference) {
+                    let base = Path::new(item.1)
+                    let resolved = resolve_dependency(reference, base, root, update)
+                    if resolved == "" { ret 1_u32 }
+                    let resolved_root = Path::new(resolved)
+                    lock = lock + lock_package(root, reference, resolved_root)
+                    seen.push(reference)
+                    count = count + 1_usize
+                    let nested = project_manifest_dependencies(read_project_manifest(resolved_root))
+                    let mut nested_index = 0_usize
+                    while nested_index < nested.len() {
+                        match nested.get(nested_index) {
+                            Some(dependency) => { queue.push((dependency, resolved_root.as_str())) }
+                            None => {}
+                        }
+                        nested_index = nested_index + 1_usize
+                    }
+                }
             }
             None => {}
         }
@@ -171,6 +197,7 @@ fn lock_package(root: Path, reference: str, resolved: Path) -> str {
     entry = entry + "name = \"" + escape_toml(project_manifest_name(manifest)) + "\"\n"
     entry = entry + "ref = \"" + escape_toml(reference) + "\"\n"
     entry = entry + "version = \"" + escape_toml(project_manifest_version(manifest)) + "\"\n"
+    if starts_with(reference, "index@") { entry = entry + registry_lock_fields(resolved) }
     if starts_with(reference, "git@") {
         let revision = git_revision(root, resolved)
         if revision == "" { ret "" }
@@ -210,8 +237,9 @@ fn trim_line_endings(value: str) -> str {
     ret value.slice(0_usize, end)
 }
 
-fn resolve_dependency(reference: str, base: Path, update: bool) -> str {
+fn resolve_dependency(reference: str, base: Path, lock_root: Path, update: bool) -> str {
     if reference == "sys@core" { ret system_core_root(base).as_str() }
+    if starts_with(reference, "index@") { ret resolve_index_dependency(reference, lock_root, update) }
     if starts_with(reference, "path@") {
         let path = base.join(reference.slice(5_usize, reference.len() - 5_usize)).resolve()
         if !file_exists(path.join("encore.toml").as_str()) { native_mode_fail("Invalid path dependency: " + path.as_str()) ret "" }
@@ -270,12 +298,6 @@ fn find_separator() -> usize {
     ret argc()
 }
 
-fn normalize_package_ref(raw: str) -> str {
-    if starts_with(raw, "git@") || starts_with(raw, "path@") { ret raw }
-    if starts_with(raw, ".") || starts_with(raw, "/") || starts_with(raw, "~") { ret "path@" + raw }
-    ret "git@https://github.com/encore-language-index/" + raw
-}
-
 fn arg_or(index: usize, fallback: str) -> str {
     match argv(index) { Some(value) => { ret value } None => { ret fallback } }
 }
@@ -306,6 +328,14 @@ fn contains(value: str, needle: str) -> bool {
     while i + needle.len() <= value.len() {
         if value.slice(i, needle.len()) == needle { ret true }
         i = i + 1_usize
+    }
+    ret false
+}
+fn contains_item(values: Vec[str], needle: str) -> bool {
+    let mut index = 0_usize
+    while index < values.len() {
+        match values.get(index) { Some(value) => { if value == needle { ret true } } None => {} }
+        index = index + 1_usize
     }
     ret false
 }

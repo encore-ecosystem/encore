@@ -35,7 +35,9 @@ Set `ENCORE_RELEASE_BASE_URL` to an HTTPS release mirror containing archives
 and their `.sha256` files. `file://` URLs are accepted for offline installation
 and installer testing.
 
-Building programs requires `clang` or a configured target toolchain.
+Building programs requires `clang` or a configured target toolchain. Resolving
+packages from the official index also requires `curl`, `tar`, and either
+`sha256sum` or `shasum`.
 
 ## Commands
 
@@ -51,6 +53,11 @@ encore target
 encore target list
 encore help build
 ```
+
+`encore add json` resolves `index@json` through the official sparse package
+index at `encore-language/index`. Published source archives are downloaded from
+GitHub Releases, verified with SHA-256, and cached locally. Existing lockfiles
+continue to use their exact archive and checksum without refreshing the index.
 
 Cross-compile using an LLVM-compatible target triple:
 

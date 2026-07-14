@@ -1,0 +1,300 @@
+import core::option::Option
+import core::result::Result
+import core::vec::Vec
+import json::{Json, ParseError, parse}
+import std::io::println
+import std::os::{env, file_exists, home_dir, mkdir_all, read_file, remove_file, write_file}
+import std::path::Path
+import std::process::{run_args, run_args_capture}
+import mod::manifest::{project_manifest_name, project_manifest_version, read_project_manifest}
+
+pub fn normalize_dependency_reference(raw: str) -> str {
+    if starts_with(raw, "git@") || starts_with(raw, "path@") || starts_with(raw, "index@") { ret raw }
+    if starts_with(raw, ".") || starts_with(raw, "/") || starts_with(raw, "~") { ret "path@" + raw }
+    ret "index@" + raw
+}
+
+pub fn resolve_index_dependency(reference: str, project_root: Path, update: bool) -> str {
+    if !starts_with(reference, "index@") { ret "" }
+    let name = reference.slice(6_usize, reference.len() - 6_usize)
+    if !valid_package_name(name) {
+        registry_error("Invalid package name '" + name + "'. Use lowercase ASCII letters, digits, '-' or '_'")
+        ret ""
+    }
+
+    if !update {
+        let locked = resolve_locked_package(project_root, reference)
+        if locked != "" { ret locked }
+    }
+
+    let metadata_path = registry_root().join("metadata").join(name + ".json")
+    mkdir_all(registry_root().join("metadata").as_str())
+    let metadata_url = registry_url() + "/" + name.slice(0_usize, 2_usize) + "/" + name + ".json"
+    if download(metadata_url, metadata_path) != 0_i32 {
+        registry_error("Package '" + name + "' was not found in " + registry_url())
+        ret ""
+    }
+
+    let version = latest_version(read_file(metadata_path.as_str()), name)
+    if version.version == "" { ret "" }
+    ret install_package(name, version)
+}
+
+pub fn registry_lock_fields(package_root: Path) -> str {
+    let marker = package_root.join(".encore-registry")
+    if !file_exists(marker.as_str()) { ret "" }
+    ret read_file(marker.as_str())
+}
+
+struct RegistryVersion {
+    version: str
+    archive: str
+    checksum: str
+}
+
+fn latest_version(source: str, expected_name: str) -> RegistryVersion {
+    match parse(source) {
+        Result[Json, ParseError]::Ok(document) => {
+            let name = json_string(document, "name")
+            if name != expected_name {
+                registry_error("Registry entry name '" + name + "' does not match package '" + expected_name + "'")
+                ret empty_version()
+            }
+            match document.get("versions") {
+                Some(value) => {
+                    match value.as_array() {
+                        Some(versions) => {
+                            let mut selected = empty_version()
+                            let mut index = 0_usize
+                            while index < versions.len() {
+                                match versions.get(index) {
+                                    Some(item) => {
+                                        let yanked = json_bool(item, "yanked")
+                                        if !yanked {
+                                            let candidate = RegistryVersion{
+                                                json_string(item, "version"),
+                                                json_string(item, "archive"),
+                                                json_string(item, "checksum")
+                                            }
+                                            if candidate.version != "" && candidate.archive != "" && valid_checksum(candidate.checksum) {
+                                                selected = candidate
+                                            }
+                                        }
+                                    }
+                                    None => {}
+                                }
+                                index = index + 1_usize
+                            }
+                            if selected.version != "" { ret selected }
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+            registry_error("Registry entry for '" + expected_name + "' has no usable version")
+            ret empty_version()
+        }
+        Result[Json, ParseError]::Err(error) => {
+            registry_error("Invalid registry metadata for '" + expected_name + "': " + error.message())
+            ret empty_version()
+        }
+    }
+}
+
+fn resolve_locked_package(project_root: Path, reference: str) -> str {
+    let lock = project_root.join("encore.lock")
+    if !file_exists(lock.as_str()) { ret "" }
+    let source = read_file(lock.as_str())
+    let block = lock_package_block(source, reference)
+    if block == "" { ret "" }
+    let name = lock_value(block, "name")
+    let version = lock_value(block, "version")
+    let checksum = lock_value(block, "checksum")
+    let archive = lock_value(block, "archive")
+    if name == "" || version == "" || archive == "" || !valid_checksum(checksum) { ret "" }
+    let root = package_cache_root(name, version, checksum)
+    if file_exists(root.join("encore.toml").as_str()) { ret root.as_str() }
+    ret install_package(name, RegistryVersion{version, archive, checksum})
+}
+
+fn install_package(name: str, version: RegistryVersion) -> str {
+    let package_root = package_cache_root(name, version.version, version.checksum)
+    if file_exists(package_root.join("encore.toml").as_str()) { ret package_root.as_str() }
+    mkdir_all(package_root.as_str())
+    let archive = registry_root().join("archives").join(name + "-" + version.version + "-" + version.checksum + ".tar.gz")
+    mkdir_all(registry_root().join("archives").as_str())
+    if !file_exists(archive.as_str()) && download(version.archive, archive) != 0_i32 {
+        registry_error("Unable to download " + name + " " + version.version)
+        ret ""
+    }
+    if file_sha256(archive) != version.checksum {
+        remove_file(archive.as_str())
+        registry_error("Checksum mismatch for " + name + " " + version.version)
+        ret ""
+    }
+    let listing = registry_root().join("archive-list.out")
+    let mut list_args = Vec[str]::new()
+    list_args.push("-tzf")
+    list_args.push(archive.as_str())
+    if run_args_capture("tar", list_args, listing.as_str()) != 0_i32 || !archive_paths_safe(read_file(listing.as_str())) {
+        remove_file(listing.as_str())
+        registry_error("Unsafe package archive for " + name + " " + version.version)
+        ret ""
+    }
+    remove_file(listing.as_str())
+    let mut extract_args = Vec[str]::new()
+    extract_args.push("-xzf")
+    extract_args.push(archive.as_str())
+    extract_args.push("-C")
+    extract_args.push(package_root.as_str())
+    if run_args("tar", extract_args) != 0_i32 || !file_exists(package_root.join("encore.toml").as_str()) {
+        registry_error("Invalid package archive for " + name + " " + version.version + ": encore.toml must be at the archive root")
+        ret ""
+    }
+    let manifest = read_project_manifest(package_root)
+    if project_manifest_name(manifest) != name || project_manifest_version(manifest) != version.version {
+        registry_error("Package manifest does not match registry entry for " + name + " " + version.version)
+        ret ""
+    }
+    let marker = "archive = \"" + version.archive + "\"\nchecksum = \"" + version.checksum + "\"\n"
+    write_file(package_root.join(".encore-registry").as_str(), marker)
+    ret package_root.as_str()
+}
+
+fn package_cache_root(name: str, version: str, checksum: str) -> Path {
+    ret registry_root().join("packages").join(name).join(version + "-" + checksum)
+}
+
+fn registry_root() -> Path {
+    match env("ENCORE_REGISTRY_CACHE") {
+        Some(value) => { ret Path::new(value).expanduser().resolve() }
+        None => { ret Path::new(home_dir()).join(".cache").join("encore").join("registry") }
+    }
+}
+
+fn registry_url() -> str {
+    match env("ENCORE_INDEX_URL") {
+        Some(value) => { ret trim_trailing_slash(value) }
+        None => { ret "https://raw.githubusercontent.com/encore-language/index/refs/heads/main" }
+    }
+}
+
+fn download(url: str, destination: Path) -> i32 {
+    let mut args = Vec[str]::new()
+    args.push("-fsSL")
+    args.push("--retry")
+    args.push("2")
+    args.push("-o")
+    args.push(destination.as_str())
+    args.push(url)
+    ret run_args("curl", args)
+}
+
+fn file_sha256(path: Path) -> str {
+    let output = registry_root().join("sha256.out")
+    let mut args = Vec[str]::new()
+    args.push(path.as_str())
+    let mut code = run_args_capture("sha256sum", args, output.as_str())
+    if code != 0_i32 {
+        args = Vec[str]::new()
+        args.push("-a")
+        args.push("256")
+        args.push(path.as_str())
+        code = run_args_capture("shasum", args, output.as_str())
+    }
+    if code != 0_i32 { remove_file(output.as_str()) ret "" }
+    let value = read_file(output.as_str())
+    remove_file(output.as_str())
+    if value.len() < 64_usize { ret "" }
+    ret value.slice(0_usize, 64_usize)
+}
+
+fn lock_package_block(source: str, reference: str) -> str {
+    let mut offset = 0_usize
+    while offset < source.len() {
+        let start = find_from(source, "[[packages]]", offset)
+        if start == source.len() { ret "" }
+        let next = find_from(source, "[[packages]]", start + 12_usize)
+        let block = source.slice(start, next - start)
+        if lock_value(block, "ref") == reference { ret block }
+        offset = next
+    }
+    ret ""
+}
+
+fn lock_value(block: str, key: str) -> str {
+    let prefix = key + " = \""
+    let start = find_from(block, prefix, 0_usize)
+    if start == block.len() { ret "" }
+    let value_start = start + prefix.len()
+    let end = find_from(block, "\"", value_start)
+    if end == block.len() { ret "" }
+    ret block.slice(value_start, end - value_start)
+}
+
+fn json_string(value: Json, key: str) -> str {
+    match value.get(key) {
+        Some(field) => { match field.as_str() { Some(text) => { ret text } None => {} } }
+        None => {}
+    }
+    ret ""
+}
+
+fn json_bool(value: Json, key: str) -> bool {
+    match value.get(key) {
+        Some(field) => { match field.as_bool() { Some(flag) => { ret flag } None => {} } }
+        None => {}
+    }
+    ret false
+}
+
+fn valid_package_name(name: str) -> bool {
+    if name.len() < 2_usize { ret false }
+    let mut index = 0_usize
+    while index < name.len() {
+        let ch = name.slice(index, 1_usize)
+        if find_from("abcdefghijklmnopqrstuvwxyz0123456789-_", ch, 0_usize) == 38_usize { ret false }
+        index = index + 1_usize
+    }
+    ret true
+}
+
+fn valid_checksum(value: str) -> bool {
+    if value.len() != 64_usize { ret false }
+    let mut index = 0_usize
+    while index < value.len() {
+        let ch = value.slice(index, 1_usize)
+        if find_from("0123456789abcdef", ch, 0_usize) == 16_usize { ret false }
+        index = index + 1_usize
+    }
+    ret true
+}
+
+fn archive_paths_safe(listing: str) -> bool {
+    let mut start = 0_usize
+    while start < listing.len() {
+        let end = find_from(listing, "\n", start)
+        let path = listing.slice(start, end - start)
+        if path != "" && (starts_with(path, "/") || starts_with(path, "../") || find_from(path, "/../", 0_usize) != path.len()) { ret false }
+        if end == listing.len() { break }
+        start = end + 1_usize
+    }
+    ret true
+}
+
+fn empty_version() -> RegistryVersion { ret RegistryVersion{"", "", ""} }
+fn registry_error(message: str) -> () { println("Error: " + message) ret () }
+fn starts_with(value: str, prefix: str) -> bool { ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix }
+fn trim_trailing_slash(value: str) -> str {
+    if value.len() > 0_usize && value.slice(value.len() - 1_usize, 1_usize) == "/" { ret value.slice(0_usize, value.len() - 1_usize) }
+    ret value
+}
+fn find_from(value: str, needle: str, start: usize) -> usize {
+    let mut index = start
+    while index + needle.len() <= value.len() {
+        if value.slice(index, needle.len()) == needle { ret index }
+        index = index + 1_usize
+    }
+    ret value.len()
+}
