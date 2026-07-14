@@ -84,3 +84,39 @@ if grep -Fq "$tmp" "$tmp/project/encore.lock"; then
     echo "encore.lock contains a machine-specific absolute path" >&2
     exit 1
 fi
+
+# Registry packages are sparse metadata entries backed by immutable release
+# archives. A lockfile must keep working after the index becomes unavailable.
+mkdir -p "$tmp/registry-package/src" "$tmp/index/re" "$tmp/registry-project/src" "$tmp/registry-cache"
+cat > "$tmp/registry-package/encore.toml" <<'EOF'
+[project]
+name = "registry_fixture"
+version = "1.2.3"
+dependencies = []
+EOF
+printf 'pub fn answer() -> u32 { ret 42_u32 }\n' > "$tmp/registry-package/src/lib.enq"
+(cd "$tmp/registry-package" && tar -czf "$tmp/registry_fixture-1.2.3.tar.gz" encore.toml src)
+if command -v sha256sum >/dev/null 2>&1; then
+    registry_checksum=$(sha256sum "$tmp/registry_fixture-1.2.3.tar.gz" | awk '{print $1}')
+else
+    registry_checksum=$(shasum -a 256 "$tmp/registry_fixture-1.2.3.tar.gz" | awk '{print $1}')
+fi
+cat > "$tmp/index/re/registry_fixture.json" <<EOF
+{"name":"registry_fixture","versions":[{"version":"1.2.3","archive":"file://$tmp/registry_fixture-1.2.3.tar.gz","checksum":"$registry_checksum","yanked":false}]}
+EOF
+cat > "$tmp/registry-project/encore.toml" <<'EOF'
+[project]
+name = "registry_project"
+version = "0.0.0"
+dependencies = []
+EOF
+printf 'fn main() -> u32 { ret 0_u32 }\n' > "$tmp/registry-project/src/main.enq"
+(cd "$tmp/registry-project" && ENCORE_INDEX_URL="file://$tmp/index" ENCORE_REGISTRY_CACHE="$tmp/registry-cache" "$compiler" add registry_fixture) > "$tmp/registry-add.log"
+grep -q '"index@registry_fixture"' "$tmp/registry-project/encore.toml"
+grep -q '^name = "registry_fixture"$' "$tmp/registry-project/encore.lock"
+grep -q '^ref = "index@registry_fixture"$' "$tmp/registry-project/encore.lock"
+grep -q '^version = "1.2.3"$' "$tmp/registry-project/encore.lock"
+grep -q "^checksum = \"$registry_checksum\"$" "$tmp/registry-project/encore.lock"
+rm -rf "$tmp/index" "$tmp/registry_fixture-1.2.3.tar.gz"
+(cd "$tmp/registry-project" && ENCORE_INDEX_URL="file://$tmp/index" ENCORE_REGISTRY_CACHE="$tmp/registry-cache" "$compiler" sync) > "$tmp/registry-sync.log"
+(cd "$tmp/registry-project" && ENCORE_INDEX_URL="file://$tmp/index" ENCORE_REGISTRY_CACHE="$tmp/registry-cache" "$compiler" build) > "$tmp/registry-build.log"

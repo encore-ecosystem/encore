@@ -27,6 +27,30 @@ and release publication.
    scripts/test-cli-contract.sh target/debug/encore
    ```
 
+   Verify the public package index from a fresh cache:
+
+   ```sh
+   repo=$PWD
+   compiler=$repo/target/debug/encore
+   tmp=$(mktemp -d)
+   mkdir -p "$tmp/project/src"
+   printf '%s\n' \
+     '[project]' \
+     'name = "release_index_smoke"' \
+     'version = "0.0.0"' \
+     'dependencies = []' > "$tmp/project/encore.toml"
+   printf 'fn main() -> u32 { ret 0_u32 }\n' > "$tmp/project/src/main.enq"
+   (
+     cd "$tmp/project"
+     ENCORE_CORE_DIR="$repo/index/core" ENCORE_REGISTRY_CACHE="$tmp/cache" "$compiler" add rich
+     ENCORE_CORE_DIR="$repo/index/core" ENCORE_REGISTRY_CACHE="$tmp/cache" "$compiler" build
+   )
+   rm -rf "$tmp"
+   ```
+
+   This gate requires the official index metadata and package release assets to
+   remain available with their published checksums.
+
 4. Review and commit the version changes. Regenerate stage0 only when changing
    the bootstrap trust root; commit its archive, both checksums, and provenance
    together.

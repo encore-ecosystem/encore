@@ -23,6 +23,7 @@ toolchains, the memory model, and the standard library.
 
 - an installed Encore native compiler;
 - `clang` or another configured target toolchain.
+- `curl`, `tar`, and `sha256sum` or `shasum` when resolving index packages.
 
 Verify the installation and target:
 

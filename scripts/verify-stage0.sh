@@ -21,7 +21,6 @@ printf '%s\n' "$source_commit" | grep -Eq '^[0-9a-f]{40}$'
 test "$target" = "x86_64-unknown-linux-gnu"
 if git -C "$repo_root" rev-parse --git-dir >/dev/null 2>&1; then
     git -C "$repo_root" cat-file -e "$source_commit^{commit}"
-    git -C "$repo_root" merge-base --is-ancestor "$source_commit" HEAD
 fi
 
 case "$(uname -s):$(uname -m)" in

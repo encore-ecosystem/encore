@@ -21,8 +21,8 @@ The current release gate validates:
 - Linux and macOS are the validated native release platforms.
 - Other LLVM-compatible targets are supported through explicit toolchain and
   runtime configuration but do not receive production compiler archives.
-- Package index behavior is usable for beta testing and may change before a
-  stable release.
+- The v1 package index selects the last non-yanked release and does not yet
+  support manifest version constraints or package search.
 - `async`/`await`, MLIR integration, structural inheritance and long-term
   backend dialect design are outside this release gate.
 - Full-repository static type checking still has known baseline diagnostics
