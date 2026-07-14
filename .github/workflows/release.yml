@@ -1,0 +1,215 @@
+name: Native Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version used inside archives
+        required: true
+        default: nightly
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap-ir:
+    name: Generate bootstrap IR
+    runs-on: ubuntu-latest
+    env:
+      ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Verify compiler version sources
+        run: scripts/verify-version.sh
+      - name: Verify native-only source tree
+        run: scripts/verify-no-python.sh
+      - name: Verify native stage0
+        run: scripts/verify-stage0.sh
+      - name: Generate target IR
+        run: |
+          mkdir -p target
+          gzip -dc bootstrap/encore-stage0-linux-x86_64.gz > target/encore-stage0
+          chmod +x target/encore-stage0
+          for triple in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin
+          do
+            ./target/encore-stage0 build --profile extreme --target "$triple" --emit llvm-ir
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bootstrap-ir
+          path: target/*/extreme/encore.ll
+          if-no-files-found: error
+          retention-days: 1
+
+  verify:
+    name: Verify native release
+    needs: bootstrap-ir
+    runs-on: ubuntu-latest
+    env:
+      ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: bootstrap-ir
+          path: target
+      - name: Assemble native seed
+        run: |
+          mkdir -p target/extreme
+          clang -O0 -w \
+            target/x86_64-unknown-linux-gnu/extreme/encore.ll \
+            index/core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
+            -o target/extreme/encore
+      - name: Verify self-host fixed point
+        run: scripts/verify-self-host.sh target/extreme/encore . x86_64-unknown-linux-gnu
+      - name: Verify tagged compiler version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          expected=${RELEASE_VERSION#v}
+          actual=$(target/extreme/encore --version)
+          test "$actual" = "encore $expected" || {
+            echo "::error title=Release version mismatch::Tag $RELEASE_VERSION requires 'encore $expected', got '$actual'"
+            exit 1
+          }
+      - name: Run full native test suite
+        run: |
+          compiler="$PWD/target/extreme/encore"
+          for package in index/core index/ehir index/ehir-llvm-backend index/json index/log index/rich index/std index/toml; do
+            (cd "$package" && "$compiler" test)
+          done
+          ./target/extreme/encore test
+      - name: Verify freestanding cross-target
+        run: scripts/smoke-cross-target.sh target/extreme/encore
+      - name: Verify native test runner
+        run: scripts/test-test-runner.sh target/extreme/encore
+      - name: Verify native CLI contract
+        run: scripts/test-cli-contract.sh target/extreme/encore
+      - name: Verify release installation
+        run: |
+          mkdir -p dist
+          archive=$(scripts/package-release.sh target/extreme/encore x86_64-unknown-linux-gnu verify dist)
+          sha256sum "$archive" > "$archive.sha256"
+          scripts/verify-release-package.sh "$archive" x86_64-unknown-linux-gnu verify
+          scripts/smoke-install.sh "$archive"
+      - name: Verify Arch Linux package metadata
+        run: |
+          mkdir -p dist-pkgbuild
+          scripts/package-release.sh target/extreme/encore x86_64-unknown-linux-gnu "$(cat VERSION)" dist-pkgbuild
+          scripts/package-release.sh target/extreme/encore aarch64-unknown-linux-gnu "$(cat VERSION)" dist-pkgbuild
+          scripts/generate-pkgbuild.sh "$(cat VERSION)" dist-pkgbuild
+          bash -n dist-pkgbuild/PKGBUILD
+
+  build:
+    needs: [bootstrap-ir, verify]
+    env:
+      ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            executable: encore
+          - os: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+            executable: encore
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
+            executable: encore
+          - os: macos-15
+            triple: aarch64-apple-darwin
+            executable: encore
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: bootstrap-ir
+          path: target
+      - name: Assemble native seed
+        shell: bash
+        run: |
+          mkdir -p target/extreme
+          set +e
+          output=$(clang -O0 -w \
+            target/${{ matrix.triple }}/extreme/encore.ll \
+            index/core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
+            -o target/extreme/${{ matrix.executable }} 2>&1)
+          code=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$code" -ne 0 ]; then
+            message=${output//'%'/'%25'}
+            message=${message//$'\n'/'%0A'}
+            message=${message//$'\r'/'%0D'}
+            echo "::error title=Native seed assembly failed::$message"
+            exit "$code"
+          fi
+      - name: Verify native seed
+        shell: bash
+        run: |
+          target/extreme/${{ matrix.executable }} --version
+      - name: Native self-host and tests
+        shell: bash
+        run: |
+          ./target/extreme/${{ matrix.executable }} build --profile debug --target ${{ matrix.triple }}
+          cp target/${{ matrix.triple }}/debug/${{ matrix.executable }} target/extreme/${{ matrix.executable }}
+          ./target/extreme/${{ matrix.executable }} build --profile extreme --target ${{ matrix.triple }}
+          cp target/${{ matrix.triple }}/extreme/${{ matrix.executable }} target/extreme/${{ matrix.executable }}
+          ./target/extreme/${{ matrix.executable }} test --filter target_
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+        run: |
+          package_version=${RELEASE_VERSION#v}
+          mkdir -p dist
+          scripts/package-release.sh target/extreme/${{ matrix.executable }} ${{ matrix.triple }} "$package_version" dist
+          archive=$(find dist -maxdepth 1 -type f | head -n 1)
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          scripts/verify-release-package.sh "$archive" ${{ matrix.triple }} "$package_version"
+          duplicate=$(scripts/package-release.sh target/extreme/${{ matrix.executable }} ${{ matrix.triple }} "$package_version" dist-reproducible)
+          cmp "$archive" "$duplicate"
+          scripts/smoke-install.sh "$archive"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: encore-${{ matrix.triple }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify complete release artifact set
+        run: scripts/verify-release-set.sh dist
+      - name: Generate checksum-pinned PKGBUILD
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: scripts/generate-pkgbuild.sh "${RELEASE_VERSION#v}" dist
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, 'nightly') || contains(github.ref_name, 'unstable') }}

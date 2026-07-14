@@ -1,0 +1,350 @@
+import core::fmt::Debug
+import core::option::Option
+import core::io::eprintln
+import std::io::println
+import std::os::{argc, argv, file_exists, read_dir, read_file, remove_file}
+import std::path::Path
+import std::process::{run_args, run_args_capture}
+import std::os::mkdir_all
+import std::vec::Vec
+
+import mod::build::compile_test_ast
+import refrain::frontend::{Lexer, Parser, Statement}
+import refrain::frontend::sema::semantic_check_error
+import refrain::frontend::parser::statements::FunctionItem
+import refrain::project::{ProjectWorkspace, WorkspaceModule, load_library_workspace, load_entry_workspace}
+import refrain::target::{host_target, target_executable_name}
+import rich::TestProgress
+
+pub fn native_test() -> u32 {
+    let root = Path::new(".").resolve()
+    let worker_path = option_value("--_worker-standalone")
+    if worker_path != "" {
+        let path = Path::new(worker_path).resolve()
+        let worker_workspace = load_entry_workspace(root, path)
+        let semantic_error = workspace_semantic_error(worker_workspace)
+        if semantic_error != "" {
+            eprintln(semantic_error)
+            ret 1_u32
+        }
+        let failure = compile_and_run_result(root, worker_workspace.flat_ast, "worker:" + path.as_str())
+        if failure == "" { ret 0_u32 }
+        eprintln(failure)
+        ret 1_u32
+    }
+    // A project may be either a library (`src/lib.enq`) or a binary
+    // (`src/main.enq`).  Tests are valid for both kinds.  Loading every
+    // project as a library used to panic for binaries and, because panic did
+    // not terminate the bootstrap process reliably, made `encore test` look
+    // like it had hung.
+    let workspace = if file_exists(root.join("src").join("lib.enq").as_str()) {
+        load_library_workspace(root)
+    } else {
+        load_entry_workspace(root, root.join("src").join("main.enq"))
+    }
+    let filter = test_filter()
+    let total = count_selected_tests(root, workspace, filter)
+    if total == 0_usize { println("No tests found.") ret 0_u32 }
+    let mut passed = 0_usize
+    let mut failed = 0_usize
+    let mut found = 0_usize
+    let mut progress = TestProgress::auto()
+    progress.start_suite(workspace.root_name, total)
+
+    let mut module_index = 0_usize
+    while module_index < workspace.modules.len() {
+        match workspace.modules.get(module_index) {
+            Some(module) => {
+                let mut statement_index = 0_usize
+                while module.owner_name == workspace.root_name && statement_index < module.ast.len() {
+                    match module.ast.get(statement_index) {
+                        Some(statement) => {
+                            match statement {
+                                Statement::Function(item) => {
+                                    if has_attr(item, "test") {
+                                        let display = unit_test_display(root, module, item.name)
+                                        if filter == "" || contains(display, filter) {
+                                            found = found + 1_usize
+                                            progress.start_test(display, found, total)
+                                            let failure = run_unit_test(root, workspace, item, display)
+                                            if failure == "" { passed = passed + 1_usize progress.pass_test(display) }
+                                            else { failed = failed + 1_usize progress.fail_test(display, failure) }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        None => {}
+                    }
+                    statement_index = statement_index + 1_usize
+                }
+            }
+            None => {}
+        }
+        module_index = module_index + 1_usize
+    }
+
+    let tests_dir = root.join("tests")
+    if file_exists(tests_dir.as_str()) {
+        let entries = read_dir(tests_dir.as_str())
+        let mut entry_index = 0_usize
+        while entry_index < entries.len() {
+            match entries.get(entry_index) {
+                Some(name) => {
+                    if ends_with(name, ".enq") {
+                        let display = workspace.root_name + ":tests/" + name
+                        if filter == "" || contains(display, filter) {
+                            found = found + 1_usize
+                            progress.start_test(display, found, total)
+                            let failure = run_standalone_test(root, tests_dir.join(name), display)
+                            if failure == "" { passed = passed + 1_usize progress.pass_test(display) }
+                            else { failed = failed + 1_usize progress.fail_test(display, failure) }
+                        }
+                    }
+                }
+                None => {}
+            }
+            entry_index = entry_index + 1_usize
+        }
+    }
+
+    progress.finish(passed, failed)
+    if failed == 0_usize {
+        ret 0_u32
+    }
+    ret 1_u32
+}
+
+fn workspace_semantic_error(workspace: ProjectWorkspace) -> str {
+    for module in workspace.modules {
+        match semantic_check_error(module.ast) {
+            Option[str]::Some(message) => { ret message }
+            Option[str]::None => {}
+        }
+    }
+    ret ""
+}
+
+fn count_selected_tests(root: Path, workspace: ProjectWorkspace, filter: str) -> usize {
+    let mut total = 0_usize
+    for module in workspace.modules {
+        if module.owner_name == workspace.root_name {
+            for statement in module.ast {
+                match statement {
+                    Statement::Function(item) => {
+                        let display = unit_test_display(root, module, item.name)
+                        if has_attr(item, "test") && (filter == "" || contains(display, filter)) { total = total + 1_usize }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let tests_dir = Path::new(".").resolve().join("tests")
+    if file_exists(tests_dir.as_str()) {
+        for name in read_dir(tests_dir.as_str()) {
+            let display = workspace.root_name + ":tests/" + name
+            if ends_with(name, ".enq") && (filter == "" || contains(display, filter)) { total = total + 1_usize }
+        }
+    }
+    ret total
+}
+
+fn unit_test_display(root: Path, module: WorkspaceModule, test_name: str) -> str {
+    let mut module_path = module.module_path.as_str()
+    let prefix = root.as_str() + "/"
+    if starts_with(module_path, prefix) { module_path = module_path.slice(prefix.len(), module_path.len() - prefix.len()) }
+    ret module.owner_name + ":" + module_path + "::" + test_name
+}
+
+fn run_unit_test(root: Path, workspace: ProjectWorkspace, item: FunctionItem, display: str) -> str {
+    if item.name == "main" || item.params.len() > 0_usize || item.generics.len() > 0_usize || item.is_extern || !returns_bool(item) {
+        ret "test must be fn() -> bool"
+    }
+    let mut ast = unit_test_ast(workspace.flat_ast, item.name)
+    append_parsed(ast, "fn main() -> u32 { let result: bool = " + item.name + "() if result { ret 0_u32 } ret 1_u32 }")
+    ret compile_and_run_result(root, ast, display)
+}
+
+fn run_standalone_test(root: Path, path: Path, display: str) -> str {
+    let expected = expected_compile_error(read_file(path.as_str()))
+    let output_path = root.join("target").join("tests").join(sanitize(display) + ".output.txt")
+    mkdir_all(root.join("target").join("tests").as_str())
+    let executable = arg_or(0_usize, "encore")
+    let mut args = Vec[str]::new()
+    args.push("test")
+    args.push("--_worker-standalone")
+    args.push(path.as_str())
+    let code = run_args_capture(executable, args, output_path.as_str())
+    let output = read_file(output_path.as_str())
+    remove_file(output_path.as_str())
+    if expected != "" {
+        if code != 0_i32 {
+            if contains(output, expected) { ret "" }
+            ret "expected compile error containing '" + expected + "', got: " + summarize_output(output)
+        }
+        ret "expected compile error: " + expected
+    }
+    if code == 0_i32 { ret "" }
+    ret summarize_output(output)
+}
+
+fn compile_and_run_result(root: Path, ast: Vec[Statement], display: str) -> str {
+    let name = sanitize(display)
+    if compile_test_ast(root, ast, name) != 0_u32 {
+        ret "compile failed"
+    }
+    let binary_name = target_executable_name(host_target(), name)
+    let code = run_args(root.join("target").join("tests").join("bin").join(binary_name).as_str(), Vec[str]::new())
+    if code == 0_i32 { ret "" }
+    ret "process exited with code " + Debug::fmt(code)
+}
+
+fn unit_test_ast(source: Vec[Statement], test_name: str) -> Vec[Statement] {
+    let mut out = Vec[Statement]::new()
+    let mut index = 0_usize
+    while index < source.len() {
+        match source.get(index) {
+            Some(statement) => {
+                match statement {
+                    Statement::Function(item) => {
+                        if item.name != "main" {
+                            if item.name == test_name {
+                                out.push(Statement::Function(FunctionItem{Vec[str]::new(), item.is_public, item.is_extern, item.name, item.generics, item.params, item.ret_type, item.body}))
+                            }
+                            else { out.push(Statement::Function(item)) }
+                        }
+                    }
+                    _ => { out.push(statement) }
+                }
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret out
+}
+
+fn dependency_ast(workspace: ProjectWorkspace) -> Vec[Statement] {
+    let mut out = Vec[Statement]::new()
+    let mut module_index = 0_usize
+    while module_index < workspace.modules.len() {
+        match workspace.modules.get(module_index) {
+            Some(module) => {
+                if module.owner_name != workspace.root_name { out.extend(module.ast) }
+            }
+            None => {}
+        }
+        module_index = module_index + 1_usize
+    }
+    ret out
+}
+
+fn append_parsed(out: mut Vec[Statement], source: str) -> () {
+    let mut lexer = Lexer::new()
+    let tokens = lexer.tokenize(source)
+    let mut parser = Parser::new()
+    out.extend(parser.parse(tokens))
+    ret ()
+}
+
+fn has_attr(item: FunctionItem, target: str) -> bool {
+    let mut index = 0_usize
+    while index < item.attrs.len() {
+        match item.attrs.get(index) { Some(attr) => { if attr == target { ret true } } None => {} }
+        index = index + 1_usize
+    }
+    ret false
+}
+
+fn returns_bool(item: FunctionItem) -> bool {
+    match item.ret_type { Some(value) => { ret value == "bool" || value == "u1" } None => { ret false } }
+}
+
+fn test_filter() -> str {
+    let mut index = 2_usize
+    while index < argc() {
+        if arg_or(index, "") == "--filter" && index + 1_usize < argc() { ret arg_or(index + 1_usize, "") }
+        index = index + 1_usize
+    }
+    ret ""
+}
+
+fn option_value(name: str) -> str {
+    let mut index = 2_usize
+    while index + 1_usize < argc() {
+        if arg_or(index, "") == name { ret arg_or(index + 1_usize, "") }
+        index = index + 1_usize
+    }
+    ret ""
+}
+
+fn expected_compile_error(source: str) -> str {
+    let marker = "expect.compile_error="
+    let mut index = 0_usize
+    while index + marker.len() <= source.len() && index < 1024_usize {
+        if source.slice(index, marker.len()) == marker {
+            let start = index + marker.len()
+            let mut end = start
+            while end < source.len() && source.slice(end, 1_usize) != "\n" { end = end + 1_usize }
+            ret source.slice(start, end - start)
+        }
+        index = index + 1_usize
+    }
+    ret ""
+}
+
+fn summarize_output(value: str) -> str {
+    let mut out = ""
+    let mut index = 0_usize
+    while index < value.len() && out.len() < 240_usize {
+        let ch = value.slice(index, 1_usize)
+        if ch == "\n" || ch == "\r" || ch == "\t" {
+            if out.len() > 0_usize && out.slice(out.len() - 1_usize, 1_usize) != " " { out = out + " " }
+        }
+        else { out = out + ch }
+        index = index + 1_usize
+    }
+    if index < value.len() { out = out + "..." }
+    if out == "" { ret "no compiler output" }
+    ret out
+}
+
+fn sanitize(value: str) -> str {
+    let mut out = ""
+    let mut index = 0_usize
+    while index < value.len() {
+        let ch = value.slice(index, 1_usize)
+        if is_alnum(ch) { out = out + ch } else { out = out + "_" }
+        index = index + 1_usize
+    }
+    ret out
+}
+fn is_alnum(ch: str) -> bool {
+    if ch.len() == 0_usize { ret false }
+    let value = ch.byte_at(0_usize)
+    ret (value >= 97_u8 && value <= 122_u8) || (value >= 65_u8 && value <= 90_u8) || (value >= 48_u8 && value <= 57_u8)
+}
+fn contains(value: str, needle: str) -> bool {
+    let mut index = 0_usize
+    while index + needle.len() <= value.len() {
+        if value.slice(index, needle.len()) == needle { ret true }
+        index = index + 1_usize
+    }
+    ret false
+}
+fn starts_with(value: str, prefix: str) -> bool { ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix }
+fn ends_with(value: str, suffix: str) -> bool { ret suffix.len() <= value.len() && value.slice(value.len() - suffix.len(), suffix.len()) == suffix }
+fn arg_or(index: usize, fallback: str) -> str { match argv(index) { Some(value) => { ret value } None => { ret fallback } } }
+fn shell_quote(value: str) -> str {
+    let mut out = "'"
+    let mut index = 0_usize
+    while index < value.len() {
+        let ch = value.slice(index, 1_usize)
+        if ch == "'" { out = out + "'\\''" }
+        else { out = out + ch }
+        index = index + 1_usize
+    }
+    ret out + "'"
+}

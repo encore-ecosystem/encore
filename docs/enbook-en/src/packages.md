@@ -94,7 +94,7 @@ encore test --cfg feature=my_feature
 
 ## Native Build Scripts
 
-Build scripts let packages publish native link metadata. `core/build.enq` is the
+Build scripts let packages publish native link metadata. `index/core/build.enq` is the
 reference pattern. It writes JSON to the path passed as argv `1`:
 
 ```json
@@ -125,13 +125,12 @@ fields let metadata apply only to matching compile-time configurations.
 
 ## Validation Commands
 
-Release-gate validation currently uses:
+Release-gate validation uses the native compiler:
 
 ```sh
-cd bootstrap
-uv run --project .. encore test --no-cache
-
-cd ..
-uv run ruff check src core ehir/src ehir-llvm-backend/src
-uv run ty check src/encore/modes/build.py src/encore/modes/test.py
+compiler="$PWD/target/extreme/encore"
+for package in index/core index/ehir index/ehir-llvm-backend index/rich index/std; do
+    (cd "$package" && "$compiler" test)
+done
+./target/extreme/encore test
 ```

@@ -94,6 +94,9 @@ import llvm::value::const_i32
 import llvm::value::const_text
 import llvm::value::value_type
 
+extern fn encore_llvm_set_target_pointer_width(bits: usize) -> ()
+extern fn encore_llvm_target_pointer_width() -> usize
+
 pub struct LoweredModule {
     module: Module
     ir: str
@@ -315,7 +318,7 @@ fn unique_functions(functions: Vec[LLVMFunction]) -> Vec[LLVMFunction] {
 
 fn runtime_declarations() -> Vec[LLVMFunction] {
     let mut out = Vec[LLVMFunction]::new()
-    let usize_type = i64_type()
+    let usize_type = pointer_int_type()
     let raw_ptr = ptr_type(i8_type())
     let mut realloc_params = Vec[LLVMParam]::new()
     realloc_params.push(llvm_make_param("ptr", raw_ptr))
@@ -436,24 +439,25 @@ fn lower_struct_drop_function(params: Vec[Type], fields: Vec[Parameter], concret
         let params_data = vec_singleton(llvm_make_param("self", lower_type(concrete)))
         let mut body = Vec[LLVMBasicBlock]::new()
         if type_needs_drop(element_type) {
-            let len = reg("len", i64_type())
-            let index_ptr = reg("index_ptr", ptr_type(i64_type()))
+            let usize_type = pointer_int_type()
+            let len = reg("len", usize_type)
+            let index_ptr = reg("index_ptr", ptr_type(usize_type))
             instructions.push(llvm_inst_extractvalue(len, self_value, "1"))
-            instructions.push(llvm_inst_alloca(index_ptr, i64_type()))
-            instructions.push(llvm_inst_store(const_text("0", i64_type()), index_ptr))
+            instructions.push(llvm_inst_alloca(index_ptr, usize_type))
+            instructions.push(llvm_inst_store(const_text("0", usize_type), index_ptr))
 
-            let index = reg("index", i64_type())
+            let index = reg("index", usize_type)
             let has_next = reg("has_next", i1_type())
             let mut check_instructions = vec_singleton(llvm_inst_load(index, index_ptr))
             check_instructions.push(llvm_inst_binary("icmp ult", has_next, index, len))
 
             let element_ptr = reg("element_ptr", ptr_type(lower_type(element_type)))
             let element = reg("element", lower_type(element_type))
-            let next_index = reg("next_index", i64_type())
+            let next_index = reg("next_index", usize_type)
             let mut drop_instructions = vec_singleton(llvm_inst_gep(element_ptr, lower_type(element_type), typed_data, vec_singleton(index), true))
             drop_instructions.push(llvm_inst_load(element, element_ptr))
             drop_instructions.extend(lower_drop_value(element, element_type, "element"))
-            drop_instructions.push(llvm_inst_add(next_index, index, const_text("1", i64_type())))
+            drop_instructions.push(llvm_inst_add(next_index, index, const_text("1", usize_type)))
             drop_instructions.push(llvm_inst_store(next_index, index_ptr))
 
             body.push(llvm_block("entry", instructions, llvm_term_cbr(is_last, "drop_check", "done")))
@@ -973,6 +977,13 @@ fn generic_symbol(name: str, args: Vec[Type]) -> str {
 pub fn emit_ir(module: Module) -> str {
     let lowered = lower(module)
     ret lowered.ir
+}
+
+pub fn emit_ir_for_target(module: Module, triple: str, pointer_width: usize) -> str {
+    unsafe { encore_llvm_set_target_pointer_width(pointer_width) }
+    let ir = emit_ir(module)
+    if triple == "" { ret ir }
+    ret "target triple = \"" + triple + "\"\n\n" + ir
 }
 
 fn str_len(value: str) -> usize {
@@ -1535,7 +1546,7 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
                     let payload_ptr_type = ptr_type(payload_type)
                     let safe_name = sanitize_symbol(enum_data.out.name) + "_payload"
                     let size_ptr = reg(safe_name + "_size_ptr", payload_ptr_type)
-                    let size = reg(safe_name + "_size", i64_type())
+                    let size = reg(safe_name + "_size", pointer_int_type())
                     let raw = reg(safe_name + "_raw", ptr_type(i8_type()))
                     let typed = reg(safe_name + "_typed", payload_ptr_type)
                     instructions.push(llvm_inst_gep(size_ptr, payload_type, const_text("null", payload_ptr_type), vec_singleton(const_text("1", i64_type())), false))
@@ -1659,7 +1670,7 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
                 let aggregate_ptr_type = ptr_type(aggregate_type)
                 let safe_name = sanitize_symbol(out_var.name)
                 let size_ptr = reg(safe_name + "_size_ptr", aggregate_ptr_type)
-                let size = reg(safe_name + "_size", i64_type())
+                let size = reg(safe_name + "_size", pointer_int_type())
                 let raw = reg(safe_name + "_raw", ptr_type(i8_type()))
                 let out = lower_variable(out_var)
                 let mut instructions = vec_singleton(llvm_inst_gep(size_ptr, aggregate_type, const_text("null", aggregate_ptr_type), vec_singleton(const_text("1", i64_type())), false))
@@ -1721,7 +1732,7 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
                 let concrete_type = lower_type(src_type)
                 let concrete_ptr_type = ptr_type(concrete_type)
                 let size_ptr = reg(prefix + "_box_size_ptr", concrete_ptr_type)
-                let size = reg(prefix + "_box_size", i64_type())
+                let size = reg(prefix + "_box_size", pointer_int_type())
                 let raw_box = reg(prefix + "_box_raw", ptr_type(i8_type()))
                 let typed_box = reg(prefix + "_box", concrete_ptr_type)
                 let with_data = reg(prefix + "_with_data", lower_type(target_type))
@@ -1786,8 +1797,8 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
             let element_ptr_type = ptr_type(element_type)
             let prefix = sanitize_symbol(realloc_data.out.name)
             let size_ptr = reg(prefix + "_size_ptr", element_ptr_type)
-            let size = reg(prefix + "_size", i64_type())
-            let bytes = reg(prefix + "_bytes", i64_type())
+            let size = reg(prefix + "_size", pointer_int_type())
+            let bytes = reg(prefix + "_bytes", pointer_int_type())
             let raw_src = reg(prefix + "_raw_src", ptr_type(i8_type()))
             let raw_out = reg(prefix + "_raw_out", ptr_type(i8_type()))
             let mut instructions = Vec[LLVMInstruction]::new()
@@ -1957,6 +1968,7 @@ fn lower_call(out_var: Variable, callee_name: str, generics: Vec[Type], args: Ve
 
 fn function_symbol(name: str) -> str {
     if name == "write" { ret "__encore_fn_write" }
+    if name == "exit" { ret "__encore_fn_exit" }
     ret sanitize_symbol(name)
 }
 
@@ -2233,8 +2245,8 @@ fn lower_plain_type(type_name: str) -> LLVMType {
     if (type_name == "i32") { ret i32_type() }
     if (type_name == "u64") { ret i64_type() }
     if (type_name == "i64") { ret i64_type() }
-    if (type_name == "usize") { ret i64_type() }
-    if (type_name == "isize") { ret i64_type() }
+    if (type_name == "usize") { ret pointer_int_type() }
+    if (type_name == "isize") { ret pointer_int_type() }
 
     if (type_name == "f16") { ret f16_type() }
     if (type_name == "f32") { ret f32_type() }
@@ -2269,7 +2281,13 @@ fn numeric_type_bits(typ: Type) -> usize {
     if typ.name == "f16" { ret 16_usize }
     if typ.name == "u32" || typ.name == "i32" { ret 32_usize }
     if typ.name == "f32" { ret 32_usize }
+    if typ.name == "usize" || typ.name == "isize" { ret unsafe { encore_llvm_target_pointer_width() } }
     ret 64_usize
+}
+
+fn pointer_int_type() -> LLVMType {
+    if unsafe { encore_llvm_target_pointer_width() } == 32_usize { ret i32_type() }
+    ret i64_type()
 }
 
 fn is_variant_symbol(value: str) -> bool {
