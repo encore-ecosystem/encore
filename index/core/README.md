@@ -73,7 +73,7 @@ fn weighted(values: Vec[u32]) -> u32 {
 
 ## Native Runtime
 
-`core/build.enq` publishes native link metadata for `core/runtime.c`. Backends
+`index/core/build.enq` publishes native link metadata for `index/core/runtime.c`. Backends
 consume that metadata instead of owning runtime C code directly. Package authors
 can use the same build-script pattern for native objects:
 

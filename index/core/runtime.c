@@ -512,7 +512,7 @@ encore_str encore_os_core_dir(void) {
     const char *home = getenv("ENCORE_HOME");
     if (home != NULL && home[0] != '\0') {
         size_t len = strlen(home);
-        const char *suffix = "/lib/encore/core";
+        const char *suffix = "/lib/encore/index/core";
         char *path = malloc(len + strlen(suffix) + 1);
         if (path != NULL) {
             memcpy(path, home, len);
@@ -541,7 +541,7 @@ encore_str encore_os_core_dir(void) {
 #endif
         if (separator != NULL) {
             size_t bin_dir_len = (size_t)(separator - executable);
-            const char *suffix = "/../lib/encore/core";
+            const char *suffix = "/../lib/encore/index/core";
             char *candidate = malloc(bin_dir_len + strlen(suffix) + 1);
             if (candidate != NULL) {
                 memcpy(candidate, executable, bin_dir_len);

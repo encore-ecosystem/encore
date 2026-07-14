@@ -13,7 +13,7 @@ toolchains, the memory model, and the standard library.
 | `index/encore` | native compiler frontend and CLI |
 | `index/ehir` | native EHIR library and parser |
 | `index/ehir-llvm-backend` | native LLVM backend |
-| `core` | low-level package and C runtime |
+| `index/core` | low-level package and C runtime |
 | `index/std` | application standard library |
 | `index/rich` | terminal rendering and progress UI |
 | `examples` | executable language examples |

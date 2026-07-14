@@ -26,8 +26,8 @@ case "$triple" in
     *) binary="$package/bin/encore" ;;
 esac
 test -s "$binary"
-test -f "$package/lib/encore/core/runtime.c"
-test -f "$package/lib/encore/core/encore.toml"
+test -f "$package/lib/encore/index/core/runtime.c"
+test -f "$package/lib/encore/index/core/encore.toml"
 test -f "$package/lib/encore/index/std/encore.toml"
 test -f "$package/lib/encore/index/encore/encore.toml"
 test -f "$package/share/doc/encore/LICENSE"

@@ -25,7 +25,6 @@ case "$triple" in
 esac
 cp "$compiler" "$stage/bin/$binary_name"
 chmod +x "$stage/bin/$binary_name" 2>/dev/null || true
-cp -R "$repo_root/core" "$stage/lib/encore/core"
 cp -R "$repo_root/index" "$stage/lib/encore/index"
 find "$stage/lib/encore" -type d \( -name target -o -name .venv -o -name __pycache__ \) -prune -exec rm -rf '{}' +
 cp "$repo_root/LICENSE" "$stage/share/doc/encore/LICENSE"

@@ -65,7 +65,7 @@ Toolchains can also be configured in `encore.toml`. See
 
 | Path | Purpose |
 | --- | --- |
-| `core` | low-level language library and portable C runtime |
+| `index/core` | low-level language library and portable C runtime |
 | `index/encore` | native compiler frontend and CLI |
 | `index/ehir` | native EHIR representation and parser |
 | `index/ehir-llvm-backend` | native LLVM backend |
