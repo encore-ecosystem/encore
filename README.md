@@ -58,6 +58,13 @@ encore help build
 index at `encore-language/index`. Published source archives are downloaded from
 GitHub Releases, verified with SHA-256, and cached locally. Existing lockfiles
 continue to use their exact archive and checksum without refreshing the index.
+The complete user and author workflows are documented in
+[`Packages And Build Scripts`](docs/enbook-en/src/packages.md) and
+[`Publishing Packages`](docs/enbook-en/src/publishing-packages.md).
+
+The initial official package set contains `std`, `json`, `rich`, `toml`, `log`,
+`colorterm`, and `dict` at version `1.0.0`. Index metadata and contribution
+rules live in [`encore-language/index`](https://github.com/encore-language/index).
 
 Cross-compile using an LLVM-compatible target triple:
 

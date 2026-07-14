@@ -26,7 +26,14 @@ fn main() -> u32 {
 }
 ```
 
-If the package uses `std`, add it to `encore.toml`:
+If the package uses `std`, add it from the official package index:
+
+```sh
+encore add std
+```
+
+The command resolves the package, writes `encore.lock`, and updates the
+manifest:
 
 ```toml
 [project]
@@ -37,12 +44,13 @@ description = ""
 readme = "README.md"
 licence = "MIT"
 dependencies = [
-    "path@/path/to/encore/index/std",
+    "index@std",
 ]
 ```
 
-For packages inside this repository's `index/`, examples usually use
-`path@../../std`.
+Do not copy an absolute path from the compiler source checkout into an
+application manifest. `path@...` is intended for local package development;
+published packages use `index@...` references.
 
 ## Commands
 
@@ -57,7 +65,21 @@ encore add <package>
 encore update
 ```
 
-Common beta flags:
+The dependency commands have distinct behavior:
+
+- `encore add <name>` adds the latest non-yanked index version and locks its
+  complete dependency graph;
+- `encore sync` restores exactly what is recorded in `encore.lock` and does
+  not select newer index versions;
+- `encore update` refreshes index metadata and rewrites the lockfile with the
+  latest available versions.
+
+Commit both `encore.toml` and `encore.lock` for applications. Once package
+archives are cached, ordinary builds do not need the index. See
+[Packages And Build Scripts](packages.md) for cache, offline, and source-reference
+details.
+
+Common flags:
 
 ```sh
 encore run -- arg1 arg2
