@@ -1,0 +1,107 @@
+name: Native CI
+
+on:
+  pull_request:
+  push:
+    branches: [trunk, nightly, "feature/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bootstrap-ir:
+    name: Generate bootstrap IR
+    runs-on: ubuntu-latest
+    env:
+      ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Verify compiler version
+        run: scripts/verify-version.sh
+      - name: Verify native stage0
+        run: scripts/verify-stage0.sh
+      - name: Generate target IR
+        run: |
+          mkdir -p target
+          gzip -dc bootstrap/encore-stage0-linux-x86_64.gz > target/encore-stage0
+          chmod +x target/encore-stage0
+          for triple in \
+            x86_64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin
+          do
+            ./target/encore-stage0 build --profile debug --target "$triple" --emit llvm-ir
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bootstrap-ir
+          path: target/*/debug/encore.ll
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    name: Test ${{ matrix.triple }}
+    needs: bootstrap-ir
+    env:
+      ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
+          - os: macos-15
+            triple: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: bootstrap-ir
+          path: target
+      - name: Assemble native compiler
+        shell: bash
+        run: |
+          mkdir -p target/debug
+          clang -O0 -w \
+            target/${{ matrix.triple }}/debug/encore.ll \
+            index/core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
+            -o target/debug/encore
+          target/debug/encore --version
+      - name: Run tests
+        shell: bash
+        run: |
+          compiler="$PWD/target/debug/encore"
+          for package in \
+            index/core \
+            index/ehir \
+            index/ehir-llvm-backend \
+            index/json \
+            index/log \
+            index/rich \
+            index/std \
+            index/toml \
+            .
+          do
+            set +e
+            output=$(cd "$package" && "$compiler" test 2>&1)
+            code=$?
+            set -e
+            printf '%s\n' "$output"
+            if [ "$code" -ne 0 ]; then
+              diagnostic=$(printf '%s' "$output" | tail -c 3000)
+              message=${diagnostic//'%'/'%25'}
+              message=${message//$'\n'/'%0A'}
+              message=${message//$'\r'/'%0D'}
+              echo "::error title=Tests failed in $package::$message"
+              exit "$code"
+            fi
+          done

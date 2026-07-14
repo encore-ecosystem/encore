@@ -18,9 +18,9 @@ The current release gate validates:
 
 ## Known Limits
 
-- Linux is the primary validated platform.
-- Cross-platform native metadata and conditional compilation are present, but
-  not broadly tested on every OS.
+- Linux and macOS are the validated native release platforms.
+- Other LLVM-compatible targets are supported through explicit toolchain and
+  runtime configuration but do not receive production compiler archives.
 - Package index behavior is usable for beta testing and may change before a
   stable release.
 - `async`/`await`, MLIR integration, structural inheritance and long-term
@@ -34,7 +34,7 @@ When reducing a compiler or library issue, include:
 
 - the package's `encore.toml`;
 - the smallest `.enq` file that reproduces it;
-- the exact command, for example `encore test --no-cache --filter dict`;
+- the exact command, for example `encore test --filter dict`;
 - the complete diagnostic output.
 
 Prefer adding a regression test as a `#attr(test)` function in the relevant

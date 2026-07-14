@@ -1,10 +1,10 @@
 ## Memory validation
 
-Use Valgrind through the compiler to validate heap ownership and cfree behavior:
+Build with debug information and run Valgrind directly:
 
 ```sh
-uv run encore-py memcheck --no-cache
+encore build --profile debug
+valgrind --leak-check=full --error-exitcode=1 target/debug/heap
 ```
 
-The command builds the executable and runs it under `valgrind --leak-check=full`.
-It exits with a non-zero status when Valgrind reports definite or possible leaks.
+Valgrind exits with a non-zero status when it reports memory errors.
