@@ -62,9 +62,10 @@ The complete user and author workflows are documented in
 [`Packages And Build Scripts`](docs/enbook-en/src/packages.md) and
 [`Publishing Packages`](docs/enbook-en/src/publishing-packages.md).
 
-The initial official package set contains `std`, `json`, `rich`, `toml`, `log`,
-`colorterm`, and `dict` at version `1.0.0`. Index metadata and contribution
-rules live in [`encore-language/index`](https://github.com/encore-language/index).
+The official package set includes `std`, `json`, `rich`, `toml`, `log`,
+`colorterm`, `dict`, `color`, `geometry`, and `encore_ui`. Index metadata and
+contribution rules live in
+[`encore-language/index`](https://github.com/encore-language/index).
 
 Cross-compile using an LLVM-compatible target triple:
 
@@ -79,8 +80,11 @@ Toolchains can also be configured in `encore.toml`. See
 
 | Path | Purpose |
 | --- | --- |
-| `index/core` | low-level language library and portable C runtime |
 | repository root | native compiler frontend and CLI |
+| `index/core` | low-level language library and portable C runtime |
+| `index/color` | reusable RGBA color primitives |
+| `index/encore-ui` | retained cross-platform native UI toolkit |
+| `index/geometry` | reusable two-dimensional geometry primitives |
 | `index/ehir` | native EHIR representation and parser |
 | `index/ehir-llvm-backend` | native LLVM backend |
 | `index/std` | application standard library |

@@ -19,6 +19,9 @@ encore run -- hello Encore
 The examples exercise language control flow, generics, collections, native
 runtime APIs, networking, terminal output, EHIR and LLVM generation.
 
+`encore_ui_demo` demonstrates retained native UI layout, styling, rendering,
+events, and hit testing through the SDL3 backend.
+
 `bare_metal` is a freestanding Cortex-M project. It demonstrates a custom
 startup source, memory layout, target flags, and linked firmware ELF without
 requiring board-specific behavior in the compiler.
