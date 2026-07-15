@@ -75,7 +75,7 @@ dependencies = ["path@../dependency"]
 EOF
 printf 'fn main() -> u32 { ret 0_u32 }\n' > "$tmp/project/src/main.enq"
 (cd "$tmp/project" && "$compiler" sync) > "$tmp/sync.log"
-grep -q '^version = 1$' "$tmp/project/encore.lock"
+grep -q '^version = 2$' "$tmp/project/encore.lock"
 grep -q '^name = "fixture_dependency"$' "$tmp/project/encore.lock"
 grep -q '^ref = "path@../dependency"$' "$tmp/project/encore.lock"
 grep -q '^version = "1.2.3"$' "$tmp/project/encore.lock"
@@ -85,17 +85,92 @@ if grep -Fq "$tmp" "$tmp/project/encore.lock"; then
     exit 1
 fi
 
+# Distribution-local workspace references with the same text must not collapse
+# across package boundaries.
+mkdir -p "$tmp/distribution-project/src" "$tmp/distribution-project/workspace/shared/src"
+mkdir -p "$tmp/other-distribution/src" "$tmp/other-distribution/workspace/shared/src"
+cat > "$tmp/distribution-project/encore.toml" <<'EOF'
+[project]
+name = "distribution_project"
+version = "0.0.0"
+dependencies = ["workspace@shared", "path@../other-distribution"]
+EOF
+printf 'fn main() -> u32 { ret 0_u32 }\n' > "$tmp/distribution-project/src/main.enq"
+cat > "$tmp/distribution-project/workspace/shared/encore.toml" <<'EOF'
+[project]
+name = "workspace_shared"
+version = "1.0.0"
+dependencies = []
+EOF
+printf 'pub fn workspace_value() -> u32 { ret 1_u32 }\n' > "$tmp/distribution-project/workspace/shared/src/lib.enq"
+cat > "$tmp/other-distribution/encore.toml" <<'EOF'
+[project]
+name = "other_distribution"
+version = "1.0.0"
+dependencies = ["workspace@shared"]
+EOF
+printf 'pub fn other() -> u32 { ret 2_u32 }\n' > "$tmp/other-distribution/src/lib.enq"
+cat > "$tmp/other-distribution/workspace/shared/encore.toml" <<'EOF'
+[project]
+name = "other_shared"
+version = "1.0.0"
+dependencies = []
+EOF
+printf 'pub fn other_shared_value() -> u32 { ret 3_u32 }\n' > "$tmp/other-distribution/workspace/shared/src/lib.enq"
+(cd "$tmp/distribution-project" && "$compiler" sync) > "$tmp/distribution-sync.log"
+test "$(grep -c '^ref = "workspace@shared"$' "$tmp/distribution-project/encore.lock")" -eq 2
+grep -q '^name = "workspace_shared"$' "$tmp/distribution-project/encore.lock"
+grep -q '^name = "other_shared"$' "$tmp/distribution-project/encore.lock"
+(cd "$tmp/distribution-project" && "$compiler" build) > "$tmp/distribution-build.log"
+
+mkdir -p "$tmp/cycle-project/src" "$tmp/cycle-project/workspace/alpha/src" "$tmp/cycle-project/workspace/beta/src"
+cat > "$tmp/cycle-project/encore.toml" <<'EOF'
+[project]
+name = "cycle_project"
+version = "0.0.0"
+dependencies = ["workspace@alpha"]
+EOF
+printf 'fn main() -> u32 { ret 0_u32 }\n' > "$tmp/cycle-project/src/main.enq"
+cat > "$tmp/cycle-project/workspace/alpha/encore.toml" <<'EOF'
+[project]
+name = "cycle_alpha"
+version = "1.0.0"
+dependencies = ["workspace@beta"]
+EOF
+printf 'pub fn alpha() -> u32 { ret 1_u32 }\n' > "$tmp/cycle-project/workspace/alpha/src/lib.enq"
+cat > "$tmp/cycle-project/workspace/beta/encore.toml" <<'EOF'
+[project]
+name = "cycle_beta"
+version = "1.0.0"
+dependencies = ["workspace@alpha"]
+EOF
+printf 'pub fn beta() -> u32 { ret 2_u32 }\n' > "$tmp/cycle-project/workspace/beta/src/lib.enq"
+set +e
+(cd "$tmp/cycle-project" && "$compiler" build) > "$tmp/cycle.log" 2>&1
+cycle_code=$?
+set -e
+test "$cycle_code" -ne 0
+grep -q 'Dependency cycle while loading refrain' "$tmp/cycle.log"
+
 # Registry packages are sparse metadata entries backed by immutable release
-# archives. A lockfile must keep working after the index becomes unavailable.
-mkdir -p "$tmp/registry-package/src" "$tmp/index/re" "$tmp/registry-project/src" "$tmp/registry-cache"
+# archives. A distribution may publish private workspace@ refrains, and its
+# lockfile must work after the remote index becomes unavailable.
+mkdir -p "$tmp/registry-package/src" "$tmp/registry-package/workspace/internal/src" "$tmp/index/re" "$tmp/registry-project/src" "$tmp/registry-cache"
 cat > "$tmp/registry-package/encore.toml" <<'EOF'
 [project]
 name = "registry_fixture"
 version = "1.2.3"
-dependencies = []
+dependencies = ["workspace@internal"]
 EOF
 printf 'pub fn answer() -> u32 { ret 42_u32 }\n' > "$tmp/registry-package/src/lib.enq"
-(cd "$tmp/registry-package" && tar -czf "$tmp/registry_fixture-1.2.3.tar.gz" encore.toml src)
+cat > "$tmp/registry-package/workspace/internal/encore.toml" <<'EOF'
+[project]
+name = "registry_fixture_internal"
+version = "1.2.3"
+dependencies = []
+EOF
+printf 'pub fn internal_answer() -> u32 { ret 42_u32 }\n' > "$tmp/registry-package/workspace/internal/src/lib.enq"
+(cd "$tmp/registry-package" && tar -czf "$tmp/registry_fixture-1.2.3.tar.gz" encore.toml src workspace)
 if command -v sha256sum >/dev/null 2>&1; then
     registry_checksum=$(sha256sum "$tmp/registry_fixture-1.2.3.tar.gz" | awk '{print $1}')
 else
@@ -117,6 +192,44 @@ grep -q '^name = "registry_fixture"$' "$tmp/registry-project/encore.lock"
 grep -q '^ref = "index@registry_fixture"$' "$tmp/registry-project/encore.lock"
 grep -q '^version = "1.2.3"$' "$tmp/registry-project/encore.lock"
 grep -q "^checksum = \"$registry_checksum\"$" "$tmp/registry-project/encore.lock"
+grep -q '^name = "registry_fixture_internal"$' "$tmp/registry-project/encore.lock"
+grep -q '^ref = "workspace@internal"$' "$tmp/registry-project/encore.lock"
+grep -q '^source = "embedded@registry_fixture"$' "$tmp/registry-project/encore.lock"
+grep -q '^path = "workspace/internal"$' "$tmp/registry-project/encore.lock"
+grep -q "^distribution-checksum = \"$registry_checksum\"$" "$tmp/registry-project/encore.lock"
 rm -rf "$tmp/index" "$tmp/registry_fixture-1.2.3.tar.gz"
 (cd "$tmp/registry-project" && ENCORE_INDEX_URL="file://$tmp/index" ENCORE_REGISTRY_CACHE="$tmp/registry-cache" "$compiler" sync) > "$tmp/registry-sync.log"
 (cd "$tmp/registry-project" && ENCORE_INDEX_URL="file://$tmp/index" ENCORE_REGISTRY_CACHE="$tmp/registry-cache" "$compiler" build) > "$tmp/registry-build.log"
+
+# Registry archives cannot use links to escape their distribution root.
+mkdir -p "$tmp/link-package/src" "$tmp/index/li" "$tmp/link-project/src"
+cat > "$tmp/link-package/encore.toml" <<'EOF'
+[project]
+name = "link_fixture"
+version = "1.0.0"
+dependencies = []
+EOF
+printf 'pub fn value() -> u32 { ret 1_u32 }\n' > "$tmp/link-package/src/lib.enq"
+ln -s /tmp "$tmp/link-package/workspace"
+(cd "$tmp/link-package" && tar -czf "$tmp/link_fixture-1.0.0.tar.gz" encore.toml src workspace)
+if command -v sha256sum >/dev/null 2>&1; then
+    link_checksum=$(sha256sum "$tmp/link_fixture-1.0.0.tar.gz" | awk '{print $1}')
+else
+    link_checksum=$(shasum -a 256 "$tmp/link_fixture-1.0.0.tar.gz" | awk '{print $1}')
+fi
+cat > "$tmp/index/li/link_fixture.json" <<EOF
+{"name":"link_fixture","versions":[{"version":"1.0.0","archive":"file://$tmp/link_fixture-1.0.0.tar.gz","checksum":"$link_checksum","yanked":false}]}
+EOF
+cat > "$tmp/link-project/encore.toml" <<'EOF'
+[project]
+name = "link_project"
+version = "0.0.0"
+dependencies = []
+EOF
+printf 'fn main() -> u32 { ret 0_u32 }\n' > "$tmp/link-project/src/main.enq"
+set +e
+(cd "$tmp/link-project" && ENCORE_INDEX_URL="file://$tmp/index" ENCORE_REGISTRY_CACHE="$tmp/link-cache" "$compiler" add link_fixture) > "$tmp/link.log" 2>&1
+link_code=$?
+set -e
+test "$link_code" -ne 0
+grep -q 'contains links or special files' "$tmp/link.log"

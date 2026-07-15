@@ -9,7 +9,7 @@ import std::vec::Vec
 import mod::build::{compile_project, compile_project_with_profile, requested_profile, requested_target, target_profile_dir}
 import refrain::target::{target_executable_name, target_is_host}
 import refrain::project::manifest::{ProjectManifest, project_manifest_add_dependency, project_manifest_dependencies, project_manifest_has_dependency, project_manifest_name, project_manifest_version, read_project_manifest, write_project_manifest}
-import refrain::project::{normalize_dependency_reference, registry_lock_fields, resolve_index_dependency}
+import refrain::project::{normalize_dependency_reference, registry_lock_fields, registry_package_checksum, resolve_index_dependency, valid_dependency_name}
 import refrain::project::system_core_root
 
 pub fn native_run() -> u32 {
@@ -71,7 +71,7 @@ pub fn native_init() -> u32 {
 }
 
 pub fn native_add() -> u32 {
-    if argc() < 3_usize { ret native_mode_fail("Usage: encore add <name|index@name|git@repo|path@path>") }
+    if argc() < 3_usize { ret native_mode_fail("Usage: encore add <name|index@name|workspace@name|git@repo|path@path>") }
     let root = Path::new(".").resolve()
     let raw = arg_or(2_usize, "")
     if starts_with(raw, "sys@") { ret native_mode_fail("System dependencies cannot be added manually") }
@@ -81,7 +81,7 @@ pub fn native_add() -> u32 {
         println("Dependency already exists: " + dependency)
         ret 0_u32
     }
-    if resolve_dependency(dependency, root, root, false) == "" { ret 1_u32 }
+    if resolve_dependency(dependency, root, root, "workspace:" + root.as_str(), root, false).root == "" { ret 1_u32 }
     project_manifest_add_dependency(manifest, dependency)
     if write_project_manifest(root, manifest) != 0_i32 { ret native_mode_fail("Unable to update encore.toml") }
     ret sync_root(root, false, "Added: " + dependency)
@@ -122,9 +122,9 @@ pub fn native_install() -> u32 {
     }
     if package != "" {
         let reference = normalize_dependency_reference(package)
-        let resolved = resolve_dependency(reference, cwd, cwd, update)
-        if resolved == "" { ret 1_u32 }
-        project = Path::new(resolved)
+        let resolved = resolve_dependency(reference, cwd, cwd, "workspace:" + cwd.as_str(), cwd, update)
+        if resolved.root == "" { ret 1_u32 }
+        project = Path::new(resolved.root)
     }
     let build_code = compile_project_with_profile(project, profile)
     if build_code != 0_u32 { ret build_code }
@@ -145,14 +145,14 @@ pub fn native_install() -> u32 {
 
 fn sync_root(root: Path, update: bool, message: str) -> u32 {
     let manifest = read_project_manifest(root)
-    let mut lock = "version = 1\n"
+    let mut lock = "version = 2\n"
     let mut count = 0_usize
-    let mut queue = Vec[(str, str)]::new()
+    let mut queue = Vec[DependencyQueueItem]::new()
     let dependencies = project_manifest_dependencies(manifest)
     let mut index = 0_usize
     while index < dependencies.len() {
         match dependencies.get(index) {
-            Some(dependency) => { queue.push((dependency, root.as_str())) }
+            Some(dependency) => { queue.push(DependencyQueueItem{dependency, root.as_str(), root.as_str(), "workspace:" + root.as_str()}) }
             None => {}
         }
         index = index + 1_usize
@@ -162,20 +162,19 @@ fn sync_root(root: Path, update: bool, message: str) -> u32 {
     while index < queue.len() {
         match queue.get(index) {
             Some(item) => {
-                let reference = item.0
-                if !contains_item(seen, reference) {
-                    let base = Path::new(item.1)
-                    let resolved = resolve_dependency(reference, base, root, update)
-                    if resolved == "" { ret 1_u32 }
-                    let resolved_root = Path::new(resolved)
-                    lock = lock + lock_package(root, reference, resolved_root)
-                    seen.push(reference)
+                let resolved = resolve_dependency(item.reference, Path::new(item.owner_root), Path::new(item.distribution_root), item.source_key, root, update)
+                if resolved.root == "" { ret 1_u32 }
+                if !contains_item(seen, resolved.identity) {
+                    let resolved_root = Path::new(resolved.root)
+                    let distribution_root = Path::new(resolved.distribution_root)
+                    lock = lock + lock_package(root, item.reference, resolved_root, distribution_root)
+                    seen.push(resolved.identity)
                     count = count + 1_usize
                     let nested = project_manifest_dependencies(read_project_manifest(resolved_root))
                     let mut nested_index = 0_usize
                     while nested_index < nested.len() {
                         match nested.get(nested_index) {
-                            Some(dependency) => { queue.push((dependency, resolved_root.as_str())) }
+                            Some(dependency) => { queue.push(DependencyQueueItem{dependency, resolved_root.as_str(), distribution_root.as_str(), resolved.source_key}) }
                             None => {}
                         }
                         nested_index = nested_index + 1_usize
@@ -191,13 +190,21 @@ fn sync_root(root: Path, update: bool, message: str) -> u32 {
     ret 0_u32
 }
 
-fn lock_package(root: Path, reference: str, resolved: Path) -> str {
+fn lock_package(root: Path, reference: str, resolved: Path, distribution_root: Path) -> str {
     let manifest = read_project_manifest(resolved)
     let mut entry = "\n[[packages]]\n"
     entry = entry + "name = \"" + escape_toml(project_manifest_name(manifest)) + "\"\n"
     entry = entry + "ref = \"" + escape_toml(reference) + "\"\n"
     entry = entry + "version = \"" + escape_toml(project_manifest_version(manifest)) + "\"\n"
     if starts_with(reference, "index@") { entry = entry + registry_lock_fields(resolved) }
+    if starts_with(reference, "workspace@") {
+        let distribution = read_project_manifest(distribution_root)
+        let embedded_name = reference.slice(10_usize, reference.len() - 10_usize)
+        entry = entry + "source = \"embedded@" + escape_toml(project_manifest_name(distribution)) + "\"\n"
+        entry = entry + "path = \"workspace/" + escape_toml(embedded_name) + "\"\n"
+        let checksum = registry_package_checksum(distribution_root)
+        if checksum != "" { entry = entry + "distribution-checksum = \"" + checksum + "\"\n" }
+    }
     if starts_with(reference, "git@") {
         let revision = git_revision(root, resolved)
         if revision == "" { ret "" }
@@ -237,13 +244,46 @@ fn trim_line_endings(value: str) -> str {
     ret value.slice(0_usize, end)
 }
 
-fn resolve_dependency(reference: str, base: Path, lock_root: Path, update: bool) -> str {
-    if reference == "sys@core" { ret system_core_root(base).as_str() }
-    if starts_with(reference, "index@") { ret resolve_index_dependency(reference, lock_root, update) }
+struct DependencyQueueItem {
+    reference: str
+    owner_root: str
+    distribution_root: str
+    source_key: str
+}
+
+struct DependencyResolution {
+    root: str
+    distribution_root: str
+    source_key: str
+    identity: str
+}
+
+fn resolve_dependency(reference: str, base: Path, distribution_root: Path, source_key: str, lock_root: Path, update: bool) -> DependencyResolution {
+    if reference == "sys@core" {
+        let root = system_core_root(base).resolve()
+        ret resolved_dependency(root, root, "sys@core", "sys@core")
+    }
+    if starts_with(reference, "index@") {
+        let resolved = resolve_index_dependency(reference, lock_root, update)
+        if resolved == "" { ret failed_dependency() }
+        let root = Path::new(resolved).resolve()
+        let checksum = registry_package_checksum(root)
+        let registry_source = reference + ":" + checksum
+        ret resolved_dependency(root, root, registry_source, registry_source)
+    }
+    if starts_with(reference, "workspace@") {
+        let name = reference.slice(10_usize, reference.len() - 10_usize)
+        if !valid_dependency_name(name) { native_mode_fail("Invalid workspace dependency name: " + name) ret failed_dependency() }
+        let root = distribution_root.join("workspace").join(name).resolve()
+        if !file_exists(root.join("encore.toml").as_str()) { native_mode_fail("Unable to find " + reference + " at " + root.as_str()) ret failed_dependency() }
+        let identity = source_key + "#workspace/" + name
+        ret resolved_dependency(root, distribution_root, source_key, identity)
+    }
     if starts_with(reference, "path@") {
         let path = base.join(reference.slice(5_usize, reference.len() - 5_usize)).resolve()
-        if !file_exists(path.join("encore.toml").as_str()) { native_mode_fail("Invalid path dependency: " + path.as_str()) ret "" }
-        ret path.as_str()
+        if !file_exists(path.join("encore.toml").as_str()) { native_mode_fail("Invalid path dependency: " + path.as_str()) ret failed_dependency() }
+        let path_source = "path:" + path.as_str()
+        ret resolved_dependency(path, path, path_source, path_source)
     }
     if starts_with(reference, "git@") {
         let url = reference.slice(4_usize, reference.len() - 4_usize)
@@ -256,7 +296,7 @@ fn resolve_dependency(reference: str, base: Path, lock_root: Path, update: bool)
             args.push("clone")
             args.push(url)
             args.push(destination.as_str())
-            if run_args("git", args) != 0_i32 { native_mode_fail("Unable to clone " + url) ret "" }
+            if run_args("git", args) != 0_i32 { native_mode_fail("Unable to clone " + url) ret failed_dependency() }
         }
         elif update {
             let mut args = Vec[str]::new()
@@ -264,13 +304,19 @@ fn resolve_dependency(reference: str, base: Path, lock_root: Path, update: bool)
             args.push(destination.as_str())
             args.push("pull")
             args.push("--ff-only")
-            if run_args("git", args) != 0_i32 { native_mode_fail("Unable to update " + url) ret "" }
+            if run_args("git", args) != 0_i32 { native_mode_fail("Unable to update " + url) ret failed_dependency() }
         }
-        ret destination.as_str()
+        let git_source = "git:" + url
+        ret resolved_dependency(destination.resolve(), destination.resolve(), git_source, git_source)
     }
     native_mode_fail("Unsupported dependency reference: " + reference)
-    ret ""
+    ret failed_dependency()
 }
+
+fn resolved_dependency(root: Path, distribution_root: Path, source_key: str, identity: str) -> DependencyResolution {
+    ret DependencyResolution{root.as_str(), distribution_root.as_str(), source_key, identity}
+}
+fn failed_dependency() -> DependencyResolution { ret DependencyResolution{"", "", "", ""} }
 
 fn locate_core(base: Path) -> Path {
     let mut current = base

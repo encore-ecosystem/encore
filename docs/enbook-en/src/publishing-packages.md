@@ -40,9 +40,11 @@ encore sync
 encore test
 ```
 
-Published manifests must not contain `path@` dependencies. Replace local paths
-with their `index@name` equivalents before creating the archive. Do not include
-`.git`, `target`, or machine-specific files.
+Published manifests must not contain `path@` dependencies. Replace dependencies
+on separately published packages with `index@name`. A private refrain may use
+`workspace@name` when its complete package is included at `workspace/name` in
+the same release archive. Do not include `.git`, `target`, or machine-specific
+files.
 
 ## Create A Release Archive
 
@@ -60,12 +62,15 @@ tar \
   --numeric-owner \
   --mtime='UTC 1970-01-01' \
   -czf "$package-$version.tar.gz" \
-  encore.toml src
+  encore.toml src workspace
 ```
 
 Include `README.md`, a license file, tests, examples, and native sources when
-they are part of the package. Every listed path must exist; keep generated
-build output out of the archive.
+they are part of the package. Omit `workspace` from the command when the
+distribution has no private refrains. Every listed path must exist; keep
+generated build output out of the archive. Archives may contain only regular
+files and directories; symbolic links, hard links, and special files are
+rejected.
 
 Inspect and hash the result:
 
