@@ -17,7 +17,11 @@ extern void *encore_str_from_cstr(const char *value);
 
 typedef struct UiSdlWindow UiSdlWindow;
 typedef struct UiSdlRenderer UiSdlRenderer;
+typedef struct UiSdlTexture UiSdlTexture;
+typedef struct UiSdlSurface UiSdlSurface;
+typedef struct UiTtfFont UiTtfFont;
 typedef struct { float x, y, w, h; } UiSdlFRect;
+typedef struct { uint8_t r, g, b, a; } UiSdlColor;
 
 typedef union {
     uint32_t type;
@@ -117,9 +121,25 @@ typedef struct {
     bool (*RenderRect)(UiSdlRenderer *, const UiSdlFRect *);
     bool (*RenderLine)(UiSdlRenderer *, float, float, float, float);
     bool (*RenderDebugText)(UiSdlRenderer *, float, float, const char *);
+    UiSdlTexture *(*CreateTextureFromSurface)(UiSdlRenderer *, UiSdlSurface *);
+    bool (*RenderTexture)(UiSdlRenderer *, UiSdlTexture *, const UiSdlFRect *, const UiSdlFRect *);
+    void (*DestroyTexture)(UiSdlTexture *);
+    void (*DestroySurface)(UiSdlSurface *);
     bool (*RenderPresent)(UiSdlRenderer *);
     const char *(*GetError)(void);
 } UiSdlApi;
+
+typedef struct {
+    void *library;
+    bool attempted;
+    bool ready;
+    bool (*Init)(void);
+    void (*Quit)(void);
+    UiTtfFont *(*OpenFont)(const char *, float);
+    void (*CloseFont)(UiTtfFont *);
+    bool (*GetStringSize)(UiTtfFont *, const char *, size_t, int *, int *);
+    UiSdlSurface *(*RenderTextBlended)(UiTtfFont *, const char *, size_t, UiSdlColor);
+} UiTtfApi;
 
 typedef struct {
     UiSdlWindow *window;
@@ -131,9 +151,11 @@ typedef struct {
     float wheel_x;
     float wheel_y;
     uint32_t event_key;
+    UiTtfFont *font;
 } UiWindow;
 
 static UiSdlApi g_sdl;
+static UiTtfApi g_ttf;
 static char g_error[256];
 static size_t g_window_count;
 
@@ -168,6 +190,14 @@ static void *ui_open_library(void) {
     }
     return NULL;
 }
+static void *ui_open_ttf_library(void) {
+    const char *names[] = {"SDL3_ttf.dll", NULL};
+    for (size_t i = 0; names[i] != NULL; ++i) {
+        HMODULE lib = LoadLibraryA(names[i]);
+        if (lib != NULL) return (void *)lib;
+    }
+    return NULL;
+}
 static void *ui_symbol(void *library, const char *name) {
     return (void *)GetProcAddress((HMODULE)library, name);
 }
@@ -177,6 +207,18 @@ static void *ui_open_library(void) {
     const char *names[] = {"libSDL3.0.dylib", "libSDL3.dylib", "/opt/homebrew/lib/libSDL3.dylib", NULL};
 #else
     const char *names[] = {"libSDL3.so.0", "libSDL3.so", NULL};
+#endif
+    for (size_t i = 0; names[i] != NULL; ++i) {
+        void *lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+        if (lib != NULL) return lib;
+    }
+    return NULL;
+}
+static void *ui_open_ttf_library(void) {
+#if defined(__APPLE__)
+    const char *names[] = {"libSDL3_ttf.0.dylib", "libSDL3_ttf.dylib", "/opt/homebrew/lib/libSDL3_ttf.dylib", NULL};
+#else
+    const char *names[] = {"libSDL3_ttf.so.0", "libSDL3_ttf.so", NULL};
 #endif
     for (size_t i = 0; names[i] != NULL; ++i) {
         void *lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
@@ -212,6 +254,10 @@ static bool ui_load_sdl(void) {
     UI_LOAD(RenderRect, "SDL_RenderRect");
     UI_LOAD(RenderLine, "SDL_RenderLine");
     UI_LOAD(RenderDebugText, "SDL_RenderDebugText");
+    UI_LOAD(CreateTextureFromSurface, "SDL_CreateTextureFromSurface");
+    UI_LOAD(RenderTexture, "SDL_RenderTexture");
+    UI_LOAD(DestroyTexture, "SDL_DestroyTexture");
+    UI_LOAD(DestroySurface, "SDL_DestroySurface");
     UI_LOAD(RenderPresent, "SDL_RenderPresent");
     UI_LOAD(GetError, "SDL_GetError");
     if (!g_sdl.Init(UI_SDL_INIT_VIDEO)) {
@@ -223,6 +269,35 @@ static bool ui_load_sdl(void) {
 }
 
 #undef UI_LOAD
+
+#define UI_TTF_LOAD(field, symbol) do { \
+    *(void **)(&g_ttf.field) = ui_symbol(g_ttf.library, symbol); \
+    if (g_ttf.field == NULL) { ui_set_error("SDL3_ttf is missing required font symbols"); return false; } \
+} while (0)
+
+static bool ui_load_ttf(void) {
+    if (g_ttf.attempted) return g_ttf.ready;
+    g_ttf.attempted = true;
+    g_ttf.library = ui_open_ttf_library();
+    if (g_ttf.library == NULL) {
+        ui_set_error("SDL3_ttf runtime was not found");
+        return false;
+    }
+    UI_TTF_LOAD(Init, "TTF_Init");
+    UI_TTF_LOAD(Quit, "TTF_Quit");
+    UI_TTF_LOAD(OpenFont, "TTF_OpenFont");
+    UI_TTF_LOAD(CloseFont, "TTF_CloseFont");
+    UI_TTF_LOAD(GetStringSize, "TTF_GetStringSize");
+    UI_TTF_LOAD(RenderTextBlended, "TTF_RenderText_Blended");
+    if (!g_ttf.Init()) {
+        ui_set_error(g_sdl.GetError());
+        return false;
+    }
+    g_ttf.ready = true;
+    return true;
+}
+
+#undef UI_TTF_LOAD
 
 static UiWindow *ui_window(size_t handle) {
     return handle == 0 ? NULL : (UiWindow *)(uintptr_t)handle;
@@ -254,11 +329,15 @@ size_t encore_ui_window_create(encore_str title, uint32_t width, uint32_t height
 bool encore_ui_window_destroy(size_t handle) {
     UiWindow *state = ui_window(handle);
     if (state == NULL) return false;
+    if (state->font != NULL && g_ttf.ready) g_ttf.CloseFont(state->font);
     if (state->renderer != NULL) g_sdl.DestroyRenderer(state->renderer);
     if (state->window != NULL) g_sdl.DestroyWindow(state->window);
     free(state);
     if (g_window_count > 0) g_window_count -= 1;
-    if (g_window_count == 0 && g_sdl.ready) { g_sdl.Quit(); g_sdl.ready = false; g_sdl.attempted = false; }
+    if (g_window_count == 0) {
+        if (g_ttf.ready) { g_ttf.Quit(); g_ttf.ready = false; g_ttf.attempted = false; }
+        if (g_sdl.ready) { g_sdl.Quit(); g_sdl.ready = false; g_sdl.attempted = false; }
+    }
     return true;
 }
 
@@ -331,8 +410,70 @@ bool encore_ui_line(size_t handle, float x0, float y0, float x1, float y1, uint3
 bool encore_ui_text(size_t handle, float x, float y, encore_str value, uint32_t color) {
     UiWindow *state = ui_window(handle); if (state == NULL || !state->open) return false;
     char *text = ui_to_cstr(value); if (text == NULL) return false;
-    ui_color(state, color); bool result = g_sdl.RenderDebugText(state->renderer, x, y, text); free(text); return result;
+    if (state->font == NULL) {
+        ui_color(state, color);
+        bool result = g_sdl.RenderDebugText(state->renderer, x, y, text);
+        free(text);
+        return result;
+    }
+    int width = 0;
+    int height = 0;
+    UiSdlColor foreground = {
+        (uint8_t)(color >> 24), (uint8_t)(color >> 16),
+        (uint8_t)(color >> 8), (uint8_t)color
+    };
+    UiSdlSurface *surface = g_ttf.RenderTextBlended(state->font, text, strlen(text), foreground);
+    free(text);
+    if (surface == NULL || !g_ttf.GetStringSize(state->font, value.object == NULL ? "" : value.object->data,
+            value.object == NULL ? 0 : value.object->len, &width, &height)) {
+        if (surface != NULL) g_sdl.DestroySurface(surface);
+        ui_set_error(g_sdl.GetError());
+        return false;
+    }
+    UiSdlTexture *texture = g_sdl.CreateTextureFromSurface(state->renderer, surface);
+    g_sdl.DestroySurface(surface);
+    if (texture == NULL) { ui_set_error(g_sdl.GetError()); return false; }
+    UiSdlFRect destination = {x, y, (float)width, (float)height};
+    bool result = g_sdl.RenderTexture(state->renderer, texture, NULL, &destination);
+    g_sdl.DestroyTexture(texture);
+    return result;
 }
+
+bool encore_ui_font_load(size_t handle, encore_str path, float size) {
+    UiWindow *state = ui_window(handle);
+    if (state == NULL || !state->open || size <= 0.0f || !ui_load_ttf()) return false;
+    char *file = ui_to_cstr(path);
+    if (file == NULL) { ui_set_error("Unable to allocate font path"); return false; }
+    UiTtfFont *font = g_ttf.OpenFont(file, size);
+    free(file);
+    if (font == NULL) { ui_set_error(g_sdl.GetError()); return false; }
+    if (state->font != NULL) g_ttf.CloseFont(state->font);
+    state->font = font;
+    return true;
+}
+
+bool encore_ui_font_clear(size_t handle) {
+    UiWindow *state = ui_window(handle);
+    if (state == NULL) return false;
+    if (state->font != NULL && g_ttf.ready) g_ttf.CloseFont(state->font);
+    state->font = NULL;
+    return true;
+}
+
+static float ui_text_extent(size_t handle, encore_str value, bool width) {
+    UiWindow *state = ui_window(handle);
+    if (state == NULL) return 0.0f;
+    if (state->font == NULL) return (float)(width ? (value.object == NULL ? 0 : value.object->len * 8) : 8);
+    int measured_width = 0;
+    int measured_height = 0;
+    const char *text = value.object == NULL ? "" : value.object->data;
+    size_t length = value.object == NULL ? 0 : value.object->len;
+    if (!g_ttf.GetStringSize(state->font, text, length, &measured_width, &measured_height)) return 0.0f;
+    return (float)(width ? measured_width : measured_height);
+}
+
+float encore_ui_text_width(size_t handle, encore_str value) { return ui_text_extent(handle, value, true); }
+float encore_ui_text_height(size_t handle, encore_str value) { return ui_text_extent(handle, value, false); }
 bool encore_ui_frame_end(size_t handle) {
     UiWindow *state = ui_window(handle); return state != NULL && state->open && g_sdl.RenderPresent(state->renderer);
 }

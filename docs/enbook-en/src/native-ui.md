@@ -48,6 +48,25 @@ macOS, and Windows library names are recognized. A missing runtime or video
 driver makes `Window::create` unavailable and exposes a message through
 `backend_error()`.
 
+## Fonts
+
+Fonts are optional and use a separately loaded SDL3_ttf runtime:
+
+```enq
+if !window.load_font("assets/Inter-Regular.ttf", 16.0_f32) {
+    println(backend_error())
+}
+
+let width = window.text_width("Measured UTF-8 text")
+window.text(20.0_f32, 20.0_f32, "Hello", Color::rgb(20_u8, 24_u8, 30_u8))
+```
+
+The file extension is not restricted by Encore. TrueType, OpenType, font
+collections, and other formats work when supported by the installed
+SDL3_ttf/FreeType build. `clear_font()` closes the active font and restores the
+built-in SDL debug font. Font loading errors are available from
+`backend_error()`.
+
 ## Styling And Layout
 
 `Style` values are immutable builders. They define colors, borders, padding,

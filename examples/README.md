@@ -24,6 +24,7 @@ Native UI examples:
 - `encore_ui_hello`: minimal retained window and layout;
 - `encore_ui_counter`: state, buttons, widget IDs, and hit testing;
 - `encore_ui_canvas`: immediate drawing for CAD and editor viewports;
+- `encore_ui_fonts`: TTF/OpenType loading, UTF-8 rendering, and measurement;
 - `encore_ui_demo`: composed toolbar and application workspace.
 
 `bare_metal` is a freestanding Cortex-M project. It demonstrates a custom

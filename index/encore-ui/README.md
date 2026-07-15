@@ -15,12 +15,19 @@ layout, styling, and hit testing can run in tests without a display server.
 - keyboard, pointer, scroll, and close events;
 - rectangle, border, line, and text rendering;
 - immediate 2D window drawing for custom viewports and engine tooling;
+- optional TTF/OpenType loading, UTF-8 rendering, and text measurement through
+  SDL3_ttf;
 - dynamically loaded SDL3 backend on Linux, macOS, and Windows.
 
 The SDL3 runtime must be installed on the target machine. It is loaded at run
 time, so building an application does not require SDL headers or linker flags.
 `Window::create` returns an unavailable window when SDL3 or a video driver is
 missing; `backend_error()` provides the reason.
+
+SDL3_ttf is loaded only when `Window::load_font(path, size)` is called. It
+supports TrueType, OpenType, font collections, and other formats enabled by its
+FreeType build. `Window::text_width` and `text_height` measure the active font.
+Calling `clear_font()` restores SDL3's built-in debug font.
 
 ## Example
 
@@ -40,8 +47,9 @@ fn view() -> Widget {
 }
 ```
 
-See `examples/encore_ui_hello`, `encore_ui_counter`, `encore_ui_canvas`, and
-`encore_ui_demo` for complete retained and immediate rendering loops.
+See `examples/encore_ui_hello`, `encore_ui_counter`, `encore_ui_canvas`,
+`encore_ui_fonts`, and `encore_ui_demo` for complete retained, immediate, and
+font rendering loops.
 
 ## Package Boundaries
 
