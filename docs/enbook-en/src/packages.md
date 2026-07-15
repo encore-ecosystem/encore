@@ -36,21 +36,31 @@ manually.
 Supported dependency references:
 
 - `index@json`
+- `workspace@ui-core`
 - `path@../some-package`
 - `git@https://github.com/org/repo`
 - bare index names through `encore add <name>`; the command stores them as
   `index@<name>`
 
-Use `index@` for published dependencies, `path@` while developing two packages
-in one checkout, and `git@` only when intentionally following a repository
-outside the official index. Relative `path@` references are resolved from the
-manifest that declares them.
+Use `index@` for packages published through the public index. Use `workspace@`
+for a private refrain shipped inside the same distribution under
+`workspace/<name>`. Use `path@` while developing two separate distributions in
+one checkout, and `git@` only when intentionally following a repository outside
+the official index. Relative `path@` references are resolved from the manifest
+that declares them.
+
+Every root, `path@`, `git@`, or `index@` package starts a distribution boundary.
+Within that boundary, `workspace@ui-core` always resolves to
+`<distribution-root>/workspace/ui-core`, including when it is declared by
+another embedded refrain. An embedded refrain can depend on another embedded
+refrain, but dependency cycles and duplicate refrain names are rejected.
 
 ## Dependency Commands
 
 | Command | Behavior |
 | --- | --- |
 | `encore add json` | resolve `index@json`, update the manifest, and lock the complete graph |
+| `encore add workspace@ui-core` | add `workspace/ui-core` from the current distribution |
 | `encore add path@../json` | add a local package without copying its absolute path into the lockfile |
 | `encore add git@https://github.com/org/repo` | add a Git repository dependency |
 | `encore sync` | use locked index archives when present and restore missing cache entries |
@@ -67,7 +77,7 @@ versions from the index.
 identified by an immutable archive URL and SHA-256:
 
 ```toml
-version = 1
+version = 2
 
 [[packages]]
 name = "json"
@@ -75,6 +85,14 @@ ref = "index@json"
 version = "1.0.0"
 archive = "https://github.com/example/json/releases/download/v1.0.0/json-1.0.0.tar.gz"
 checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[[packages]]
+name = "json_parser"
+ref = "workspace@parser"
+version = "1.0.0"
+source = "embedded@json"
+path = "workspace/parser"
+distribution-checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 ```
 
 Commit the lockfile for applications and tools. Library authors may also
@@ -111,8 +129,11 @@ An index entry contains immutable release archives in publication order:
 ```
 
 Each release archive must contain `encore.toml` at its root. Its project name
-and version must match the index entry. Old versions remain in the file;
-withdrawn versions are marked `yanked` instead of being removed or modified.
+and version must match the index entry. A package may include private refrains
+under `workspace/` and reference them with `workspace@`; they are part of the
+same immutable archive and are not separate public index entries. Old versions
+remain in the file; withdrawn versions are marked `yanked` instead of being
+removed or modified.
 
 The current v1 resolver selects the last valid non-yanked entry. Version
 constraints are not part of the v1 manifest syntax yet, so index maintainers
@@ -139,8 +160,8 @@ extracts it again. If both are missing, `encore sync` downloads the immutable
 archive URL from the lockfile without consulting the latest index entry.
 
 Registry resolution requires `curl`, `tar`, and either `sha256sum` or `shasum`.
-A checksum mismatch, unsafe archive path, missing root `encore.toml`, or
-manifest name/version mismatch aborts resolution.
+A checksum mismatch, unsafe archive path, archive link or special file, missing
+root `encore.toml`, or manifest name/version mismatch aborts resolution.
 
 See [Publishing Packages](publishing-packages.md) for archive and index PR
 requirements.
@@ -160,6 +181,17 @@ Library package:
 encore.toml
 src/lib.enq
 src/module/mod.enq
+```
+
+Distribution with private refrains:
+
+```text
+encore.toml
+src/lib.enq
+workspace/ui-core/encore.toml
+workspace/ui-core/src/lib.enq
+workspace/platform-linux/encore.toml
+workspace/platform-linux/src/lib.enq
 ```
 
 Unit tests live next to the code they exercise and are marked with
