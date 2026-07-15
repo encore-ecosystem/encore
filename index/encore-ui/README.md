@@ -40,7 +40,8 @@ fn view() -> Widget {
 }
 ```
 
-See `examples/encore_ui_demo` for the complete event and rendering loop.
+See `examples/encore_ui_hello`, `encore_ui_counter`, `encore_ui_canvas`, and
+`encore_ui_demo` for complete retained and immediate rendering loops.
 
 ## Package Boundaries
 
