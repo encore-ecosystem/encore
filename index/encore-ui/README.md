@@ -47,9 +47,8 @@ fn view() -> Widget {
 }
 ```
 
-See `examples/encore_ui_hello`, `encore_ui_counter`, `encore_ui_canvas`,
-`encore_ui_fonts`, and `encore_ui_demo` for complete retained, immediate, and
-font rendering loops.
+See `demo` for style gallery, counter, immediate canvas, and font rendering
+screens in one executable project.
 
 ## Package Boundaries
 

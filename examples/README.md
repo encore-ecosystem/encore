@@ -19,13 +19,9 @@ encore run -- hello Encore
 The examples exercise language control flow, generics, collections, native
 runtime APIs, networking, terminal output, EHIR and LLVM generation.
 
-Native UI examples:
-
-- `encore_ui_hello`: minimal retained window and layout;
-- `encore_ui_counter`: state, buttons, widget IDs, and hit testing;
-- `encore_ui_canvas`: immediate drawing for CAD and editor viewports;
-- `encore_ui_fonts`: TTF/OpenType loading, UTF-8 rendering, and measurement;
-- `encore_ui_demo`: composed toolbar and application workspace.
+The complete native UI demonstration now lives next to its package at
+`index/encore-ui/demo`. It includes style gallery, counter, canvas, and font
+screens in one project.
 
 `bare_metal` is a freestanding Cortex-M project. It demonstrates a custom
 startup source, memory layout, target flags, and linked firmware ELF without
