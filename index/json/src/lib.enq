@@ -7,6 +7,8 @@ extern fn encore_str_from_codepoint(value: usize) -> str
 extern fn encore_text_builder_new() -> usize
 extern fn encore_text_builder_append(builder: usize, value: str) -> ()
 extern fn encore_text_builder_finish(builder: usize) -> str
+extern fn encore_str_find_byte_from(value: str, needle: u8, start: usize) -> usize
+extern fn encore_str_find_control_from(value: str, start: usize) -> usize
 
 pub enum Json {
     Null
@@ -353,79 +355,98 @@ fn parse_string(parser: JsonParser) -> Result[(str, JsonParser), ParseError] {
     }
 
     let builder = text_builder_new()
-    let mut current = advance(parser, 1_usize)
-    let mut segment_start = current.index
-    while current.index < current.source.byte_len() {
-        let b = current.source.byte_at(current.index)
+    let source = parser.source
+    let mut index = parser.index + 1_usize
+    let mut segment_start = index
+    let end = source.byte_len()
+    let closing_quote = unsafe { encore_str_find_byte_from(source, 34_u8, index) }
+    let first_escape = unsafe { encore_str_find_byte_from(source, 92_u8, index) }
+    let first_control = unsafe { encore_str_find_control_from(source, index) }
+    if closing_quote < first_escape && closing_quote < first_control {
+        let value = source.slice_bytes(index, closing_quote - index)
+        text_builder_discard(builder)
+        ret ok_str_parser(value, JsonParser {source, closing_quote + 1_usize})
+    }
+    while index < end {
+        let next_quote = unsafe { encore_str_find_byte_from(source, 34_u8, index) }
+        let next_escape = unsafe { encore_str_find_byte_from(source, 92_u8, index) }
+        let next_control = unsafe { encore_str_find_control_from(source, index) }
+        let next_special = min_usize(next_quote, min_usize(next_escape, next_control))
+        if next_special > index {
+            index = next_special
+            continue
+        }
+        let b = source.byte_at(index)
         if b == 34_u8 {
-            if current.index > segment_start {
-                text_builder_append(builder, current.source.slice_bytes(segment_start, current.index - segment_start))
+            if index > segment_start {
+                text_builder_append(builder, source.slice_bytes(segment_start, index - segment_start))
             }
-            ret ok_str_parser(text_builder_finish(builder), advance(current, 1_usize))
+            ret ok_str_parser(text_builder_finish(builder), JsonParser {source, index + 1_usize})
         }
         if b == 92_u8 {
-            if current.index > segment_start {
-                text_builder_append(builder, current.source.slice_bytes(segment_start, current.index - segment_start))
+            if index > segment_start {
+                text_builder_append(builder, source.slice_bytes(segment_start, index - segment_start))
             }
-            if current.index + 1_usize >= current.source.byte_len() {
+            if index + 1_usize >= end {
                 text_builder_discard(builder)
-                ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("unterminated escape sequence", current.index))
+                ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("unterminated escape sequence", index))
             }
-            let esc = current.source.byte_at(current.index + 1_usize)
+            let esc = source.byte_at(index + 1_usize)
             if esc == 34_u8 {
                 text_builder_append(builder, "\"")
-                current = advance(current, 2_usize)
-                segment_start = current.index
+                index += 2_usize
+                segment_start = index
                 continue
             }
             if esc == 92_u8 {
                 text_builder_append(builder, "\\")
-                current = advance(current, 2_usize)
-                segment_start = current.index
+                index += 2_usize
+                segment_start = index
                 continue
             }
             if esc == 47_u8 {
                 text_builder_append(builder, "/")
-                current = advance(current, 2_usize)
-                segment_start = current.index
+                index += 2_usize
+                segment_start = index
                 continue
             }
             if esc == 98_u8 {
                 text_builder_append(builder, "\b")
-                current = advance(current, 2_usize)
-                segment_start = current.index
+                index += 2_usize
+                segment_start = index
                 continue
             }
             if esc == 102_u8 {
                 text_builder_append(builder, "\f")
-                current = advance(current, 2_usize)
-                segment_start = current.index
+                index += 2_usize
+                segment_start = index
                 continue
             }
             if esc == 110_u8 {
                 text_builder_append(builder, "\n")
-                current = advance(current, 2_usize)
-                segment_start = current.index
+                index += 2_usize
+                segment_start = index
                 continue
             }
             if esc == 114_u8 {
                 text_builder_append(builder, "\r")
-                current = advance(current, 2_usize)
-                segment_start = current.index
+                index += 2_usize
+                segment_start = index
                 continue
             }
             if esc == 116_u8 {
                 text_builder_append(builder, "\t")
-                current = advance(current, 2_usize)
-                segment_start = current.index
+                index += 2_usize
+                segment_start = index
                 continue
             }
             if esc == 117_u8 {
-                match parse_unicode_escape(current) {
+                let escape_parser = JsonParser {source, index}
+                match parse_unicode_escape(escape_parser) {
                     Result[(str, JsonParser), ParseError]::Ok(pair) => {
                         text_builder_append(builder, pair.0)
-                        current = pair.1
-                        segment_start = current.index
+                        index = pair.1.index
+                        segment_start = index
                         continue
                     }
                     Result[(str, JsonParser), ParseError]::Err(err) => {
@@ -435,18 +456,18 @@ fn parse_string(parser: JsonParser) -> Result[(str, JsonParser), ParseError] {
                 }
             }
             text_builder_discard(builder)
-            ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("invalid escape sequence", current.index))
+            ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("invalid escape sequence", index))
         }
         // Compare after widening: native i8 ordering is signed, so a direct
         // comparison would misclassify every UTF-8 lead byte >= 0x80.
         if (b as usize) < 32_usize {
             text_builder_discard(builder)
-            ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("control character in string", current.index))
+            ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("control character in string", index))
         }
-        current = advance(current, 1_usize)
+        index += 1_usize
     }
     text_builder_discard(builder)
-    ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("unterminated string", current.index))
+    ret Result[(str, JsonParser), ParseError]::Err(ParseError::new("unterminated string", index))
 }
 
 fn parse_unicode_escape(parser: JsonParser) -> Result[(str, JsonParser), ParseError] {
@@ -621,6 +642,11 @@ fn append_escaped_string(builder: usize, value: str) -> () {
 
 fn text_builder_new() -> usize {
     ret unsafe { encore_text_builder_new() }
+}
+
+fn min_usize(lhs: usize, rhs: usize) -> usize {
+    if lhs < rhs { ret lhs }
+    ret rhs
 }
 
 fn text_builder_append(builder: usize, value: str) -> () {

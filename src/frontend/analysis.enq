@@ -88,7 +88,7 @@ pub fn analyze_source_lightweight(source: str) -> FrontendDocument {
 pub fn analyze_module_lightweight(module_name: str, source: str) -> FrontendDocument {
     let mut lexer = Lexer::new()
     let tokens = lexer.tokenize(source)
-    let diagnostics = collect_lexer_diagnostics(tokens)
+    let mut diagnostics = collect_lexer_diagnostics(tokens)
     let symbols = collect_symbols(tokens)
     let callables = collect_callables(tokens)
     let dependencies = DependencyGraph::from_tokens(module_name, tokens)
@@ -118,6 +118,8 @@ pub fn analyze_module_lightweight(module_name: str, source: str) -> FrontendDocu
         }
     }
 
+    diagnostics.extend(collect_declaration_diagnostics(tokens))
+
     ret FrontendDocument {
         tokens,
         Vec[Statement]::new(),
@@ -130,9 +132,13 @@ pub fn analyze_module_lightweight(module_name: str, source: str) -> FrontendDocu
 }
 
 pub fn analyze_module(module_name: str, source: str) -> FrontendDocument {
+    ret analyze_named_module(module_name, module_name, source)
+}
+
+pub fn analyze_named_module(module_name: str, source_name: str, source: str) -> FrontendDocument {
     let mut lexer = Lexer::new()
     let tokens = lexer.tokenize(source)
-    let diagnostics = collect_lexer_diagnostics(tokens)
+    let mut diagnostics = collect_lexer_diagnostics(tokens)
     let symbols = collect_symbols(tokens)
     let callables = collect_callables(tokens)
 
@@ -161,7 +167,21 @@ pub fn analyze_module(module_name: str, source: str) -> FrontendDocument {
         }
     }
 
-    let mut parser = Parser::new()
+
+    diagnostics.extend(collect_declaration_diagnostics(tokens))
+    if diagnostics.len() > 0_usize {
+        ret FrontendDocument {
+            tokens,
+            Vec[Statement]::new(),
+            diagnostics,
+            symbols,
+            callables,
+            DependencyGraph::new(),
+            false
+        }
+    }
+
+    let mut parser = Parser::new_for_source(source_name)
     let ast = parser.parse(tokens)
     let dependencies = DependencyGraph::from_tokens(module_name, tokens)
 
@@ -179,7 +199,7 @@ pub fn analyze_module(module_name: str, source: str) -> FrontendDocument {
 fn collect_lexer_diagnostics(tokens: Vec[Token]) -> Vec[FrontendDiagnostic] {
     let mut out = Vec[FrontendDiagnostic]::new()
     for token in tokens {
-        if token.type == TokenType::UNKNOWN {
+        if token.type == TokenType::UNKNOWN && token.value != "$" {
             out.push(FrontendDiagnostic::new(1_usize, "unknown-token", "unknown token: " + token.value, token.line, token.column, token.value.char_len()))
         }
     }
@@ -244,6 +264,62 @@ fn collect_structural_diagnostics(tokens: Vec[Token]) -> Vec[FrontendDiagnostic]
     }
 
     ret out
+}
+
+fn collect_declaration_diagnostics(tokens: Vec[Token]) -> Vec[FrontendDiagnostic] {
+    let mut out = Vec[FrontendDiagnostic]::new()
+    let mut function_names = Vec[str]::new()
+    let mut brace_depth = 0_i32
+    let mut pending_attribute = false
+    let mut index = 0_usize
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Option[Token]::Some(token) => {
+                if brace_depth == 0_i32 && token.type == TokenType::HASH { pending_attribute = true }
+                elif token.type == TokenType::LEFT_BRACE { brace_depth += 1_i32 }
+                elif token.type == TokenType::RIGHT_BRACE { brace_depth -= 1_i32 }
+                elif brace_depth == 0_i32 && token.type == TokenType::KW_FN {
+                    match next_significant_token(tokens, index + 1_usize) {
+                        Option[Token]::Some(name) => {
+                            if name.type == TokenType::IDENTIFIER && !pending_attribute {
+                                if contains_name(function_names, name.value) {
+                                    out.push(FrontendDiagnostic::new(1_usize, "duplicate-function", "duplicate function declaration '" + name.value + "'", name.line, name.column, name.value.char_len()))
+                                } else {
+                                    function_names.push(name.value)
+                                }
+                            }
+                        }
+                        Option[Token]::None => {}
+                    }
+                    pending_attribute = false
+                }
+            }
+            Option[Token]::None => {}
+        }
+        index += 1_usize
+    }
+    ret out
+}
+
+fn next_significant_token(tokens: Vec[Token], start: usize) -> Option[Token] {
+    let mut index = start
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Option[Token]::Some(token) => {
+                if token.type != TokenType::WHITESPACE && token.type != TokenType::NEWLINE && token.type != TokenType::ONE_LINE_COMMENT && token.type != TokenType::MULTI_LINE_COMMENT {
+                    ret Option[Token]::Some(token)
+                }
+            }
+            Option[Token]::None => {}
+        }
+        index += 1_usize
+    }
+    ret Option[Token]::None
+}
+
+fn contains_name(names: Vec[str], needle: str) -> bool {
+    for name in names { if name == needle { ret true } }
+    ret false
 }
 
 fn last_token(tokens: Vec[Token]) -> Option[Token] {

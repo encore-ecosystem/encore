@@ -2,6 +2,7 @@ import core::fmt::Debug
 import core::option::Option
 import core::io::eprintln
 import std::os::write_file
+import std::os::read_file
 import std::os::env
 import std::os::remove_file
 import std::os::argc
@@ -15,15 +16,15 @@ import std::vec::Vec
 import ehirlib::parse_module_text
 import ehir_llvm_backend::codegen::{emit_ir, emit_ir_for_target}
 
-import refrain::frontend::sema::{semantic_check_error, semantic_check_error_for_target}
-import refrain::frontend::translator::{translate_to_ehir, translate_to_ehir_for_target}
+import refrain::frontend::sema::{semantic_check_error, semantic_check_error_for_target, semantic_check_error_for_target_and_features}
+import refrain::frontend::translator::{filter_ast_for_target, translate_to_ehir, translate_to_ehir_for_target, translate_to_ehir_for_target_and_features}
 import refrain::frontend::parser::statements::Statement
 import refrain::project::load_binary_workspace
 import refrain::project::WorkspaceModule
 import refrain::project::WorkspaceRefrain
-import refrain::project::{system_core_root, workspace_root_refrain}
+import refrain::project::{system_core_root, workspace_release_modules, workspace_root_refrain}
 import refrain::project::manifest::{project_manifest_target, project_target_toolchain, read_project_manifest}
-import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host, target_is_supported}
+import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host, target_is_supported, toolchain_driver_is_supported}
 
 import rich::BuildProgress
 
@@ -56,11 +57,16 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         ret 1_u32
     }
     let toolchain = requested_toolchain(root, target)
+    match validate_toolchain(root, target, toolchain, emit) {
+        Option[str]::Some(message) => { eprintln("Error: " + message) ret 1_u32 }
+        Option[str]::None => {}
+    }
     let mut progress = BuildProgress::auto()
     progress.start_build(path_name_or(root, "project"), profile)
     progress.start_stage("Workspace", "workspace")
-    let workspace = load_binary_workspace(root)
-    let ast = workspace.flat_ast
+    let mut workspace = load_binary_workspace(root)
+    let ast = filtered_workspace_ast(workspace.modules, target)
+    let module_count = workspace.modules.len()
 
     let mut project_name = "program"
     match workspace_root_refrain(workspace) {
@@ -72,7 +78,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             ret 1_u32
         }
     }
-    progress.finish_stage(Debug::fmt(workspace.refrains.len()) + " refrains, " + Debug::fmt(workspace.modules.len()) + " modules, " + Debug::fmt(ast.len()) + " AST nodes")
+    progress.finish_stage(Debug::fmt(workspace.refrains.len()) + " refrains, " + Debug::fmt(module_count) + " modules, " + Debug::fmt(ast.len()) + " AST nodes")
 
     let target_dir = root.join("target")
     let profile_dir = if target_request == "" || target_request == "auto" || target_request == "host" || target_request == "native" { target_dir.join(profile) } else { target_dir.join(target.triple).join(profile) }
@@ -89,14 +95,13 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         progress.fail_stage("semantic checks failed")
         ret 1_u32
     }
-    progress.finish_stage(Debug::fmt(workspace.modules.len()) + " modules")
+    progress.finish_stage(Debug::fmt(module_count) + " modules")
+    workspace_release_modules(workspace)
 
     progress.start_stage("Lower", project_name)
     progress.update(project_name, "EHIR", 1_usize, 1_usize)
-    let ehir_text = translate_to_ehir_for_target(ast, target)
     let out_path = profile_dir.join(project_name + ".ehir")
-    let write_code = write_file(native_path(out_path.as_str()), ehir_text)
-    if write_code != 0_i32 {
+    if !write_ehir_artifact(ast, target, out_path) {
         progress.fail_stage("failed to write translated EHIR")
         ret 1_u32
     }
@@ -108,11 +113,8 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
 
     progress.start_stage("Codegen", "LLVM IR")
     progress.update(project_name, "LLVM IR", 1_usize, 1_usize)
-    let ehir_module = parse_module_text("encore_bootstrap", ehir_text)
-    let llvm_text = emit_ir_for_target(ehir_module, target.triple, target.pointer_width)
     let llvm_path = profile_dir.join(project_name + ".ll")
-    let llvm_write_code = write_file(native_path(llvm_path.as_str()), llvm_text)
-    if llvm_write_code != 0_i32 {
+    if !write_llvm_artifact(out_path, llvm_path, target) {
         progress.fail_stage("failed to write translated LLVM IR")
         ret 1_u32
     }
@@ -135,6 +137,12 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         let candidate = refrain.root.join("runtime.c").resolve()
         if toolchain.hosted_runtime && !target.freestanding && candidate.as_str() != runtime_path.as_str() && file_exists(native_path(candidate.as_str())) {
             native_sources.push(candidate)
+        }
+        if toolchain.hosted_runtime && !target.freestanding {
+            for feature in refrain.enabled_features {
+                let feature_source = refrain.root.join("runtime." + feature + ".c").resolve()
+                if file_exists(native_path(feature_source.as_str())) { native_sources.push(feature_source) }
+            }
         }
     }
     let object_dir = profile_dir.join("object")
@@ -209,6 +217,18 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     ret 0_u32
 }
 
+fn write_ehir_artifact(ast: Vec[Statement], target: TargetSpec, path: Path) -> bool {
+    let text = translate_to_ehir_for_target(ast, target)
+    ret write_file(native_path(path.as_str()), text) == 0_i32
+}
+
+fn write_llvm_artifact(ehir_path: Path, llvm_path: Path, target: TargetSpec) -> bool {
+    let ehir_text = read_file(native_path(ehir_path.as_str()))
+    let module = parse_module_text("encore_bootstrap", ehir_text)
+    let llvm_text = emit_ir_for_target(module, target.triple, target.pointer_width)
+    ret write_file(native_path(llvm_path.as_str()), llvm_text) == 0_i32
+}
+
 fn normalize_emit(value: str) -> str {
     if value == "ehir" { ret "ehir" }
     if value == "llvm-ir" || value == "llvm" || value == "ir" { ret "llvm-ir" }
@@ -220,6 +240,7 @@ fn normalize_emit(value: str) -> str {
 fn requested_toolchain(root: Path, target: TargetSpec) -> Toolchain {
     let defaults = project_target_toolchain(root, target, default_toolchain(target))
     ret Toolchain{
+        defaults.driver,
         requested_value("--cc", defaults.compiler),
         requested_value("--linker", defaults.linker),
         requested_value("--ar", defaults.archiver),
@@ -232,6 +253,45 @@ fn requested_toolchain(root: Path, target: TargetSpec) -> Toolchain {
         requested_value("--linker-script", defaults.linker_script),
         defaults.hosted_runtime
     }
+}
+
+fn validate_toolchain(root: Path, target: TargetSpec, toolchain: Toolchain, emit: str) -> Option[str] {
+    if emit == "ehir" || emit == "llvm-ir" { ret Option[str]::None }
+    if !toolchain_driver_is_supported(toolchain.driver) {
+        ret Option[str]::Some("unsupported target toolchain driver '" + toolchain.driver + "'; supported drivers: clang")
+    }
+    if explicit_tool_path_missing(toolchain.compiler) { ret Option[str]::Some("target compiler does not exist: " + toolchain.compiler) }
+    if emit == "binary" && explicit_tool_path_missing(toolchain.linker) { ret Option[str]::Some("target linker does not exist: " + toolchain.linker) }
+    if toolchain.sysroot != "" && !file_exists(native_path(resolve_project_path(root, toolchain.sysroot).as_str())) {
+        ret Option[str]::Some("target sysroot does not exist: " + toolchain.sysroot)
+    }
+    for source in toolchain.runtime_sources {
+        if !file_exists(native_path(resolve_project_path(root, source).as_str())) {
+            ret Option[str]::Some("target runtime source does not exist: " + source)
+        }
+    }
+    if emit == "binary" && toolchain.linker_script != "" && !file_exists(native_path(resolve_project_path(root, toolchain.linker_script).as_str())) {
+        ret Option[str]::Some("target linker script does not exist: " + toolchain.linker_script)
+    }
+    if emit == "binary" && target.freestanding && !toolchain.hosted_runtime && toolchain.runtime_sources.len() == 0_usize {
+        ret Option[str]::Some("freestanding binary requires target.runtime-sources")
+    }
+    ret Option[str]::None
+}
+
+fn explicit_tool_path_missing(value: str) -> bool {
+    if !contains_path_separator(value) { ret false }
+    ret !file_exists(native_path(Path::new(value).resolve().as_str()))
+}
+
+fn contains_path_separator(value: str) -> bool {
+    let mut index = 0_usize
+    while index < value.len() {
+        let ch = value.slice(index, 1_usize)
+        if ch == "/" || ch == "\\" { ret true }
+        index += 1_usize
+    }
+    ret false
 }
 
 pub fn requested_target(root: Path) -> TargetSpec {
@@ -391,7 +451,14 @@ fn run_workspace_semantic_checks(modules: Vec[WorkspaceModule], target: TargetSp
         match modules.get(index) {
             Option[WorkspaceModule]::Some(module) => {
                 progress.update(module.owner_name, module_display_name(module), index + 1_usize, modules.len())
-                match semantic_check_error_for_target(module.ast, target) {
+                if module.diagnostics.len() > 0_usize {
+                    progress.suspend()
+                    for diagnostic in module.diagnostics {
+                        eprintln(native_path(module.module_path.as_str()) + ":" + Debug::fmt(diagnostic.line + 1_usize) + ":" + Debug::fmt(diagnostic.column + 1_usize) + ": error[" + diagnostic.code + "]: " + diagnostic.message)
+                    }
+                    ret false
+                }
+                match semantic_check_error_for_target_and_features(module.ast, target, module.enabled_features) {
                     Option[str]::Some(message) => {
                         progress.suspend()
                         eprintln("Semantic error: " + message)
@@ -407,6 +474,12 @@ fn run_workspace_semantic_checks(modules: Vec[WorkspaceModule], target: TargetSp
         index = index + 1_usize
     }
     ret true
+}
+
+fn filtered_workspace_ast(modules: Vec[WorkspaceModule], target: TargetSpec) -> Vec[Statement] {
+    let mut ast = Vec[Statement]::new()
+    for module in modules { ast.extend(filter_ast_for_target(module.ast, target, module.enabled_features)) }
+    ret ast
 }
 
 fn module_display_name(module: WorkspaceModule) -> str {

@@ -44,11 +44,13 @@ name = "firmware"
 target = "thumbv7em-none-eabihf"
 
 [target]
+driver = "clang"
 linker = "clang"
 ar = "llvm-ar"
 builtin-runtime = false
 
 [target.thumbv7em-none-eabihf]
+driver = "clang"
 linker = "arm-none-eabi-clang"
 ar = "arm-none-eabi-ar"
 sysroot = "/opt/arm-none-eabi"
@@ -70,8 +72,12 @@ encore build \
   --target-cpu cortex-a72
 ```
 
-The environment fallbacks are `ENCORE_CC`, `ENCORE_LINKER`, `ENCORE_AR`,
-`ENCORE_SYSROOT`, `ENCORE_TARGET_CPU`, and `ENCORE_TARGET_FEATURES`.
+The environment fallbacks are `ENCORE_TOOLCHAIN_DRIVER`, `ENCORE_CC`,
+`ENCORE_LINKER`, `ENCORE_AR`, `ENCORE_SYSROOT`, `ENCORE_TARGET_CPU`, and
+`ENCORE_TARGET_FEATURES`. The current production driver flavor is `clang`;
+declaring it explicitly keeps target configuration forward-compatible with
+future GCC, MSVC, and vendor driver adapters without interpreting their flags
+as Clang flags.
 
 ## Output Kinds
 

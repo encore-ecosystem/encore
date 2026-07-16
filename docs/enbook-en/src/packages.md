@@ -71,6 +71,14 @@ An ordinary `encore build`, `run`, or `test` does not update a locked index
 dependency. Use `encore update` when you deliberately want the current package
 versions from the index.
 
+Index references may include SemVer requirements, for example
+`index@json@^1.2.0`, `index@json@>=1.4.0, <2.0.0`, `index@json@1.4.*`, or
+`index@json@~1.4.2`. The resolver selects exactly one version of each named
+index package. It intersects direct and transitive requirements and chooses the
+highest non-yanked version that satisfies the complete graph. If a later
+constraint invalidates an earlier decision, the resolver backtracks and tries
+the next candidate instead of retaining two versions of the package.
+
 ## Lockfile
 
 `encore.lock` records every direct and transitive package. An index package is
@@ -135,10 +143,12 @@ same immutable archive and are not separate public index entries. Old versions
 remain in the file; withdrawn versions are marked `yanked` instead of being
 removed or modified.
 
-The current v1 resolver selects the last valid non-yanked entry. Version
-constraints are not part of the v1 manifest syntax yet, so index maintainers
-must append versions in release order. Existing lockfiles continue to use a
-yanked version; yanking only prevents new resolution to that version.
+The v1 resolver orders entries by SemVer rather than JSON array position.
+Existing lockfiles continue to use a yanked version; yanking only prevents new
+resolution to that version. Ordinary `encore sync` first attempts the locked
+graph. If changed manifest constraints make that graph impossible, it consults
+the index and backtracks to a compatible graph; `encore update` considers all
+non-yanked candidates immediately.
 
 ## Cache And Offline Builds
 

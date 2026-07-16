@@ -1,6 +1,7 @@
 import core::option::Option
-import core::panic::panic
 import core::fmt::Debug
+import core::io::eprintln
+import core::process::exit
 import std::vec::Vec
 import std::vec::append
 import std::vec::vec_singleton
@@ -43,6 +44,7 @@ import ehirlib::core::retain_value
 import ehirlib::core::pcast
 import ehirlib::core::hfree
 import ehirlib::core::mangle_type_name
+import ehirlib::validate_module
 import llvm::core::LLVMFunction
 import llvm::core::LLVMParam
 import llvm::core::LLVMBasicBlock
@@ -98,13 +100,13 @@ extern fn encore_llvm_set_target_pointer_width(bits: usize) -> ()
 extern fn encore_llvm_target_pointer_width() -> usize
 
 pub struct LoweredModule {
-    module: Module
     ir: str
 }
 
 struct GenericCall {
     name: str
     args: Vec[Type]
+    key: str
 }
 
 struct StringGlobal {
@@ -133,24 +135,23 @@ fn byte_slice(value: str, start: usize, byte_len: usize) -> str {
 pub fn lower(module: Module) -> LoweredModule {
     let directives = module.directives
     let module_name = module.name
-    let type_declarations = lower_type_declarations(directives)
     let mut generic_calls = collect_generic_calls(directives)
     expand_generic_calls(directives, generic_calls)
+    let concrete_types = collect_concrete_types(directives, generic_calls)
+    let type_declarations = lower_type_declarations(directives, concrete_types)
     let mut functions = lower_directives(directives)
     functions.extend(lower_generic_functions(directives, generic_calls))
-    functions.extend(lower_trait_dispatch_functions(directives))
-    functions.extend(lower_drop_functions(directives))
+    functions.extend(lower_trait_dispatch_functions(directives, concrete_types))
+    functions.extend(lower_drop_functions(directives, concrete_types))
     functions.extend(runtime_declarations())
     functions = unique_functions(functions)
     let safe_module_name = sanitize_symbol(module_name)
     let llvm_module = llvm_module_with_types(safe_module_name, type_declarations, functions)
-    let ir = llvm_to_text(llvm_module)
-    ret LoweredModule{module, ir}
+    ret LoweredModule{llvm_to_text(llvm_module)}
 }
 
-fn lower_trait_dispatch_functions(directives: Vec[Directive]) -> Vec[LLVMFunction] {
+fn lower_trait_dispatch_functions(directives: Vec[Directive], concrete_types: Vec[Type]) -> Vec[LLVMFunction] {
     let mut out = Vec[LLVMFunction]::new()
-    let concrete_types = collect_concrete_types(directives)
     for directive in directives {
         match directive {
             Directive::Trait(item) => {
@@ -344,8 +345,7 @@ fn runtime_declarations() -> Vec[LLVMFunction] {
     ret out
 }
 
-fn lower_drop_functions(directives: Vec[Directive]) -> Vec[LLVMFunction] {
-    let concrete_types = collect_concrete_types(directives)
+fn lower_drop_functions(directives: Vec[Directive], concrete_types: Vec[Type]) -> Vec[LLVMFunction] {
     let mut out = Vec[LLVMFunction]::new()
     for directive in directives {
         match directive {
@@ -381,6 +381,10 @@ fn lower_drop_functions(directives: Vec[Directive]) -> Vec[LLVMFunction] {
         }
     }
     for concrete in concrete_types {
+        if concrete.pointer == PointerKind::Heap {
+            out.push(lower_heap_drop_function(concrete))
+            out.push(lower_heap_retain_function(concrete))
+        }
         if has_prefix(concrete.name, "__tuple_") {
             let mut fields = Vec[Parameter]::new()
             let mut index = 0_usize
@@ -410,17 +414,49 @@ fn specialized_struct_needs_drop(params: Vec[Type], fields: Vec[Parameter], args
 }
 
 fn type_needs_drop(typ: Type) -> bool {
+    if typ.pointer == PointerKind::Heap { ret true }
     if typ.pointer != PointerKind::Plain { ret false }
     if typ.name == "str" { ret true }
     ret is_aggregate_ehir_type(typ)
 }
 
 fn drop_symbol(typ: Type) -> str {
-    ret "__drop_" + sanitize_symbol(mangle_type_name(Type{typ.name, typ.generics, PointerKind::Plain}))
+    ret "__drop_" + sanitize_symbol(mangle_type_name(typ))
 }
 
 fn retain_symbol(typ: Type) -> str {
-    ret "__retain_" + sanitize_symbol(mangle_type_name(Type{typ.name, typ.generics, PointerKind::Plain}))
+    ret "__retain_" + sanitize_symbol(mangle_type_name(typ))
+}
+
+fn lower_heap_drop_function(concrete: Type) -> LLVMFunction {
+    let self_value = reg("self", lower_type(concrete))
+    let raw = reg("raw", ptr_type(i8_type()))
+    let is_last = reg("is_last", i1_type())
+    let mut entry = Vec[LLVMInstruction]::new()
+    entry.push(llvm_inst_cast("bitcast", raw, self_value))
+    entry.push(llvm_inst_call(Option[LLVMValue]::Some(is_last), i1_type(), "encore_heap_release", vec_singleton(raw)))
+
+    let plain = Type{concrete.name, concrete.generics, PointerKind::Plain}
+    let pointee = reg("pointee", lower_type(plain))
+    let mut release = vec_singleton(llvm_inst_load(pointee, self_value))
+    release.extend(lower_drop_value(pointee, plain, "heap_pointee"))
+    release.push(llvm_inst_call(Option[LLVMValue]::None, void_type(), "__ehir_hfree", vec_singleton(raw)))
+
+    let mut blocks = Vec[LLVMBasicBlock]::new()
+    blocks.push(llvm_block("entry", entry, llvm_term_cbr(is_last, "release", "done")))
+    blocks.push(llvm_block("release", release, llvm_term_ret_void()))
+    blocks.push(llvm_block("done", Vec[LLVMInstruction]::new(), llvm_term_ret_void()))
+    ret llvm_define_fn(drop_symbol(concrete), void_type(), vec_singleton(llvm_make_param("self", lower_type(concrete))), blocks)
+}
+
+fn lower_heap_retain_function(concrete: Type) -> LLVMFunction {
+    let self_value = reg("self", lower_type(concrete))
+    let raw = reg("raw", ptr_type(i8_type()))
+    let mut instructions = Vec[LLVMInstruction]::new()
+    instructions.push(llvm_inst_cast("bitcast", raw, self_value))
+    instructions.push(llvm_inst_call(Option[LLVMValue]::None, void_type(), "encore_heap_retain", vec_singleton(raw)))
+    let body = vec_singleton(llvm_block("entry", instructions, llvm_term_ret_void()))
+    ret llvm_define_fn(retain_symbol(concrete), void_type(), vec_singleton(llvm_make_param("self", lower_type(concrete))), body)
 }
 
 fn lower_struct_drop_function(params: Vec[Type], fields: Vec[Parameter], concrete: Type) -> LLVMFunction {
@@ -614,6 +650,9 @@ fn lower_enum_retain_function(params: Vec[Type], variants: Vec[EnumVariant], con
 }
 
 fn lower_drop_value(value: LLVMValue, typ: Type, suffix: str) -> Vec[LLVMInstruction] {
+    if typ.pointer == PointerKind::Heap {
+        ret vec_singleton(llvm_inst_call(Option[LLVMValue]::None, void_type(), drop_symbol(typ), vec_singleton(value)))
+    }
     if typ.pointer != PointerKind::Plain { ret Vec[LLVMInstruction]::new() }
     if typ.name == "str" {
         ret vec_singleton(llvm_inst_call(Option[LLVMValue]::None, void_type(), "encore_str_drop", vec_singleton(value)))
@@ -625,6 +664,9 @@ fn lower_drop_value(value: LLVMValue, typ: Type, suffix: str) -> Vec[LLVMInstruc
 }
 
 fn lower_retain_value(value: LLVMValue, typ: Type) -> Vec[LLVMInstruction] {
+    if typ.pointer == PointerKind::Heap {
+        ret vec_singleton(llvm_inst_call(Option[LLVMValue]::None, void_type(), retain_symbol(typ), vec_singleton(value)))
+    }
     if typ.pointer != PointerKind::Plain { ret Vec[LLVMInstruction]::new() }
     if typ.name == "str" {
         ret vec_singleton(llvm_inst_call(Option[LLVMValue]::None, void_type(), "encore_str_retain", vec_singleton(value)))
@@ -656,14 +698,36 @@ fn collect_generic_calls(directives: Vec[Directive]) -> Vec[GenericCall] {
 }
 
 fn collect_direct_generic_calls(out: mut Vec[GenericCall], function: FnDirective) -> () {
-    for block_item in function.blocks {
-        for instruction in block_item.instructions {
-            match instruction {
-                Instruction::Call(data) => {
-                    if data.generics.len() > 0_usize { remember_generic_call(out, data.name, data.generics) }
-                }
-                _ => {}
+    let mut block_index = 0_usize
+    while block_index < function.blocks.len() {
+        let block_handle = unsafe { function.blocks.get_handle(block_index) }
+        unsafe {
+            unsafe ehir {
+                block_ptr: Block* = pcast block_handle: usize, Block*
+                block_item: Block = load block_ptr: Block*
             }
+            let mut instruction_index = 0_usize
+            while instruction_index < block_item.instructions.len() {
+                collect_direct_generic_call(out, block_item.instructions.get_handle(instruction_index))
+                instruction_index = instruction_index + 1_usize
+            }
+        }
+        block_index = block_index + 1_usize
+    }
+    ret ()
+}
+
+fn collect_direct_generic_call(out: mut Vec[GenericCall], instruction_handle: usize) -> () {
+    unsafe {
+        unsafe ehir {
+            instruction_ptr: Instruction* = pcast instruction_handle: usize, Instruction*
+            instruction: Instruction = load instruction_ptr: Instruction*
+        }
+        match instruction {
+            Instruction::Call(data) => {
+                if data.generics.len() > 0_usize { remember_generic_call(out, data.name, data.generics) }
+            }
+            _ => {}
         }
     }
     ret ()
@@ -674,23 +738,15 @@ fn expand_generic_calls(directives: Vec[Directive], calls: mut Vec[GenericCall])
     while index < calls.len() {
         match calls.get(index) {
             Option[GenericCall]::Some(current) => {
-                for directive in directives {
-                    match directive {
-                        Directive::Function(function) => {
-                            if function.name == current.name && function.generics.len() == current.args.len() {
-                                collect_nested_generic_calls(calls, function, function.generics, current.args)
-                            }
-                        }
-                        Directive::Impl(item) => {
-                            for method in item.methods {
-                                let full_name = item.for_type.name + "::" + method.name
-                                if full_name == current.name && item.generics.len() == current.args.len() {
-                                    collect_nested_generic_calls(calls, method, item.generics, current.args)
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
+                // Nested discovery can grow `calls` and reallocate its storage.
+                // Snapshot the item before passing its arguments into that walk.
+                let current_name = current.name
+                let mut current_args = Vec[Type]::new()
+                for arg in current.args { current_args.push(arg) }
+                let mut directive_index = 0_usize
+                while directive_index < directives.len() {
+                    expand_generic_call_in_directive(calls, directives.get_handle(directive_index), current_name, current_args)
+                    directive_index = directive_index + 1_usize
                 }
             }
             Option[GenericCall]::None => {}
@@ -700,40 +756,100 @@ fn expand_generic_calls(directives: Vec[Directive], calls: mut Vec[GenericCall])
     ret ()
 }
 
-fn collect_nested_generic_calls(out: mut Vec[GenericCall], function: FnDirective, params: Vec[Type], args: Vec[Type]) -> () {
-    for block_item in function.blocks {
-        for instruction in block_item.instructions {
-            match instruction {
-                Instruction::Call(data) => {
-                    if data.generics.len() > 0_usize {
-                        let mut concrete = Vec[Type]::new()
-                        for generic in data.generics { concrete.push(substitute_generic_type(generic, params, args)) }
-                        remember_generic_call(out, data.name, concrete)
+fn expand_generic_call_in_directive(out: mut Vec[GenericCall], directive_handle: usize, name: str, args: Vec[Type]) -> () {
+    unsafe {
+        unsafe ehir {
+            directive_ptr: Directive* = pcast directive_handle: usize, Directive*
+            directive: Directive = load directive_ptr: Directive*
+        }
+        match directive {
+            Directive::Function(function) => {
+                if function.name == name && function.generics.len() == args.len() {
+                    collect_nested_generic_calls(out, function, function.generics, args)
+                }
+            }
+            Directive::Impl(item) => {
+                let mut method_index = 0_usize
+                while method_index < item.methods.len() {
+                    let method_handle = item.methods.get_handle(method_index)
+                    unsafe ehir {
+                        method_ptr: FnDirective* = pcast method_handle: usize, FnDirective*
+                        method: FnDirective = load method_ptr: FnDirective*
                     }
-                    let mut owner_index = 0_usize
-                    while owner_index < params.len() && owner_index < args.len() {
-                        match params.get(owner_index) {
-                            Some(param_type) => {
-                                let prefix = param_type.name + "::"
-                                if has_prefix(data.name, prefix) {
-                                    match args.get(owner_index) {
-                                        Some(concrete_owner) => {
-                                            if concrete_owner.generics.len() > 0_usize {
-                                                let concrete_name = concrete_owner.name + data.name.slice(param_type.name.len(), data.name.len() - param_type.name.len())
-                                                remember_generic_call(out, concrete_name, concrete_owner.generics)
-                                            }
+                    let full_name = item.for_type.name + "::" + method.name
+                    if method.generics.len() == 0_usize {
+                        if full_name == name && item.generics.len() == args.len() { collect_nested_generic_calls(out, method, item.generics, args) }
+                    } elif item.generics.len() == 0_usize {
+                        if full_name == name && method.generics.len() == args.len() { collect_nested_generic_calls(out, method, method.generics, args) }
+                    } else {
+                        let params = combined_impl_method_generics(item.generics, method.generics)
+                        if full_name == name && params.len() == args.len() { collect_nested_generic_calls(out, method, params, args) }
+                    }
+                    method_index = method_index + 1_usize
+                }
+            }
+            _ => {}
+        }
+    }
+    ret ()
+}
+
+fn collect_nested_generic_calls(out: mut Vec[GenericCall], function: FnDirective, params: Vec[Type], args: Vec[Type]) -> () {
+    let mut block_index = 0_usize
+    while block_index < function.blocks.len() {
+        let block_handle = unsafe { function.blocks.get_handle(block_index) }
+        unsafe {
+            unsafe ehir {
+                block_ptr: Block* = pcast block_handle: usize, Block*
+                block_item: Block = load block_ptr: Block*
+            }
+            let mut instruction_index = 0_usize
+            while instruction_index < block_item.instructions.len() {
+                collect_nested_generic_call(out, block_item.instructions.get_handle(instruction_index), params, args)
+                instruction_index = instruction_index + 1_usize
+            }
+        }
+        block_index = block_index + 1_usize
+    }
+    ret ()
+}
+
+fn collect_nested_generic_call(out: mut Vec[GenericCall], instruction_handle: usize, params: Vec[Type], args: Vec[Type]) -> () {
+    unsafe {
+        unsafe ehir {
+            instruction_ptr: Instruction* = pcast instruction_handle: usize, Instruction*
+            instruction: Instruction = load instruction_ptr: Instruction*
+        }
+        match instruction {
+            Instruction::Call(data) => {
+                if data.generics.len() > 0_usize {
+                    let mut concrete = Vec[Type]::new()
+                    for generic in data.generics { concrete.push(substitute_generic_type(generic, params, args)) }
+                    remember_generic_call(out, data.name, concrete)
+                }
+                let mut owner_index = 0_usize
+                while owner_index < params.len() && owner_index < args.len() {
+                    match params.get(owner_index) {
+                        Some(param_type) => {
+                            let prefix = param_type.name + "::"
+                            if has_prefix(data.name, prefix) {
+                                match args.get(owner_index) {
+                                    Some(concrete_owner) => {
+                                        if concrete_owner.generics.len() > 0_usize {
+                                            let concrete_name = concrete_owner.name + data.name.slice(param_type.name.len(), data.name.len() - param_type.name.len())
+                                            remember_generic_call(out, concrete_name, concrete_owner.generics)
                                         }
-                                        None => {}
                                     }
+                                    None => {}
                                 }
                             }
-                            None => {}
                         }
-                        owner_index = owner_index + 1_usize
+                        None => {}
                     }
+                    owner_index = owner_index + 1_usize
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
     ret ()
@@ -742,9 +858,9 @@ fn collect_nested_generic_calls(out: mut Vec[GenericCall], function: FnDirective
 fn remember_generic_call(out: mut Vec[GenericCall], name: str, args: Vec[Type]) -> () {
     let key = generic_symbol(name, args)
     for item in out {
-        if generic_symbol(item.name, item.args) == key { ret () }
+        if item.key == key { ret () }
     }
-    out.push(GenericCall{name, args})
+    out.push(GenericCall{name, args, key})
     ret ()
 }
 
@@ -762,12 +878,27 @@ fn lower_generic_functions(directives: Vec[Directive], calls: Vec[GenericCall]) 
                 }
             }
             Directive::Impl(item) => {
-                if item.generics.len() > 0_usize {
-                    for method in item.methods {
-                        let full_name = item.for_type.name + "::" + method.name
+                for method in item.methods {
+                    let full_name = item.for_type.name + "::" + method.name
+                    if method.generics.len() == 0_usize && item.generics.len() > 0_usize {
                         for call_data in calls {
                             if call_data.name == full_name && call_data.args.len() == item.generics.len() {
                                 let template = fn_item(full_name, item.generics, method.params, method.ret_type, method.blocks)
+                                out.push(lower_function(specialize_function(template, call_data.args)))
+                            }
+                        }
+                    } elif item.generics.len() == 0_usize && method.generics.len() > 0_usize {
+                        for call_data in calls {
+                            if call_data.name == full_name && call_data.args.len() == method.generics.len() {
+                                let template = fn_item(full_name, method.generics, method.params, method.ret_type, method.blocks)
+                                out.push(lower_function(specialize_function(template, call_data.args)))
+                            }
+                        }
+                    } elif item.generics.len() > 0_usize && method.generics.len() > 0_usize {
+                        let params = combined_impl_method_generics(item.generics, method.generics)
+                        for call_data in calls {
+                            if call_data.name == full_name && call_data.args.len() == params.len() {
+                                let template = fn_item(full_name, params, method.params, method.ret_type, method.blocks)
                                 out.push(lower_function(specialize_function(template, call_data.args)))
                             }
                         }
@@ -777,6 +908,15 @@ fn lower_generic_functions(directives: Vec[Directive], calls: Vec[GenericCall]) 
             _ => {}
         }
     }
+    ret out
+}
+
+fn combined_impl_method_generics(impl_generics: Vec[Type], method_generics: Vec[Type]) -> Vec[Type] {
+    if method_generics.len() == 0_usize { ret impl_generics }
+    if impl_generics.len() == 0_usize { ret method_generics }
+    let mut out = Vec[Type]::new()
+    for generic in impl_generics { out.push(generic) }
+    for generic in method_generics { out.push(generic) }
     ret out
 }
 
@@ -975,8 +1115,17 @@ fn generic_symbol(name: str, args: Vec[Type]) -> str {
 }
 
 pub fn emit_ir(module: Module) -> str {
-    let lowered = lower(module)
-    ret lowered.ir
+    match validate_module(module) {
+        Err(message) => {
+            eprintln("error[ehir-validation]: " + message)
+            exit(1_i32)
+        }
+        Ok(validated) => {
+            let lowered = lower(validated)
+            ret lowered.ir
+        }
+    }
+    ret ""
 }
 
 pub fn emit_ir_for_target(module: Module, triple: str, pointer_width: usize) -> str {
@@ -1000,9 +1149,8 @@ fn lower_directives(directives: Vec[Directive]) -> Vec[LLVMFunction] {
     ret acc
 }
 
-fn lower_type_declarations(directives: Vec[Directive]) -> Vec[str] {
+fn lower_type_declarations(directives: Vec[Directive], concrete_types: Vec[Type]) -> Vec[str] {
     let mut out = Vec[str]::new()
-    let concrete_types = collect_concrete_types(directives)
     for directive in directives {
         match directive {
             Directive::Struct(item) => {
@@ -1233,7 +1381,7 @@ fn substitute_generic_type(typ: Type, params: Vec[Type], args: Vec[Type]) -> Typ
     ret Type{typ.name, generics, typ.pointer}
 }
 
-fn collect_concrete_types(directives: Vec[Directive]) -> Vec[Type] {
+fn collect_concrete_types(directives: Vec[Directive], calls: Vec[GenericCall]) -> Vec[Type] {
     let mut out = Vec[Type]::new()
     let seen = unsafe { encore_strset_new() }
     for directive in directives {
@@ -1241,14 +1389,14 @@ fn collect_concrete_types(directives: Vec[Directive]) -> Vec[Type] {
             Directive::Function(function) => { collect_function_types(out, seen, function) }
             Directive::Impl(item) => {
                 if item.generics.len() == 0_usize {
-                    for method in item.methods { collect_function_types(out, seen, method) }
+                    for method in item.methods {
+                        if method.generics.len() == 0_usize { collect_function_types(out, seen, method) }
+                    }
                 }
             }
             _ => {}
         }
     }
-    let mut calls = collect_generic_calls(directives)
-    expand_generic_calls(directives, calls)
     for call_data in calls {
         for directive in directives {
             match directive {
@@ -1260,10 +1408,28 @@ fn collect_concrete_types(directives: Vec[Directive]) -> Vec[Type] {
                 Directive::Impl(item) => {
                     if item.generics.len() == call_data.args.len() {
                         for method in item.methods {
+                            if method.generics.len() == 0_usize {
+                                let full_name = item.for_type.name + "::" + method.name
+                                if full_name == call_data.name {
+                                    let template = fn_item(full_name, item.generics, method.params, method.ret_type, method.blocks)
+                                    collect_function_types(out, seen, specialize_function(template, call_data.args))
+                                }
+                            }
+                        }
+                    }
+                    if impl_has_generic_methods(item.methods) {
+                        for method in item.methods {
+                            if method.generics.len() == 0_usize { continue }
                             let full_name = item.for_type.name + "::" + method.name
-                            if full_name == call_data.name {
-                                let template = fn_item(full_name, item.generics, method.params, method.ret_type, method.blocks)
+                            if item.generics.len() == 0_usize && full_name == call_data.name && method.generics.len() == call_data.args.len() {
+                                let template = fn_item(full_name, method.generics, method.params, method.ret_type, method.blocks)
                                 collect_function_types(out, seen, specialize_function(template, call_data.args))
+                            } elif item.generics.len() > 0_usize {
+                                let params = combined_impl_method_generics(item.generics, method.generics)
+                                if full_name == call_data.name && params.len() == call_data.args.len() {
+                                    let template = fn_item(full_name, params, method.params, method.ret_type, method.blocks)
+                                    collect_function_types(out, seen, specialize_function(template, call_data.args))
+                                }
                             }
                         }
                     }
@@ -1274,6 +1440,22 @@ fn collect_concrete_types(directives: Vec[Directive]) -> Vec[Type] {
     }
     unsafe { encore_strset_free(seen) }
     ret out
+}
+
+fn impl_has_generic_methods(methods: Vec[FnDirective]) -> bool {
+    let mut index = 0_usize
+    while index < methods.len() {
+        let method_handle = unsafe { methods.get_handle(index) }
+        unsafe {
+            unsafe ehir {
+                method_ptr: FnDirective* = pcast method_handle: usize, FnDirective*
+                method: FnDirective = load method_ptr: FnDirective*
+            }
+            if method.generics.len() > 0_usize { ret true }
+        }
+        index = index + 1_usize
+    }
+    ret false
 }
 
 fn collect_function_types(out: mut Vec[Type], seen: usize, function: FnDirective) -> () {
@@ -1336,6 +1518,11 @@ fn remember_variable_type(out: mut Vec[Type], seen: usize, value: Variable) -> (
 
 fn remember_concrete_type(out: mut Vec[Type], seen: usize, typ: Type) -> () {
     for generic in typ.generics { remember_concrete_type(out, seen, generic) }
+    if typ.pointer == PointerKind::Heap {
+        let heap_key = mangle_type_name(typ)
+        if unsafe { encore_strset_insert(seen, heap_key) } { out.push(typ) }
+        ret ()
+    }
     if typ.generics.len() == 0_usize && !is_dyn_type(typ) { ret () }
     let concrete = Type{typ.name, typ.generics, PointerKind::Plain}
     let key = mangle_type_name(concrete)
@@ -1422,9 +1609,9 @@ fn lower_directive(directive: Directive) -> Vec[LLVMFunction] {
             ret Vec[LLVMFunction]::new()
         }
         Impl(impl_data) => {
-            if impl_data.generics.len() > 0_usize { ret Vec[LLVMFunction]::new() }
             let mut methods = Vec[LLVMFunction]::new()
             for method in impl_data.methods {
+                if impl_data.generics.len() > 0_usize || method.generics.len() > 0_usize { continue }
                 let full_name = impl_data.for_type.name + "::" + method.name
                 let concrete = fn_item(full_name, Vec[Type]::new(), method.params, method.ret_type, method.blocks)
                 methods.push(lower_function(concrete))
@@ -1893,8 +2080,14 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
 }
 
 fn unsupported_instruction(name: str) -> Vec[LLVMInstruction] {
-    panic("Unsupported self-hosted LLVM instruction: " + name)
+    backend_invariant_error("unsupported self-hosted LLVM instruction '" + name + "'")
     ret Vec[LLVMInstruction]::new()
+}
+
+fn backend_invariant_error(message: str) -> () {
+    eprintln("error[backend-invariant]: " + message)
+    exit(1_i32)
+    ret ()
 }
 
 fn lower_literal(out_var: Variable, value: str) -> Vec[LLVMInstruction] {
@@ -2132,14 +2325,14 @@ fn required_variable_type(value: Variable) -> Type {
     match value.typ {
         Option[Type]::Some(typ) => { ret typ }
         Option[Type]::None => {
-            panic("LLVM lowering requires type for variable '" + value.name + "'")
+            backend_invariant_error("LLVM lowering requires a type for variable '" + value.name + "'")
         }
     }
     ret Type{"void", Vec[Type]::new(), PointerKind::Plain}
 }
 
 fn required_generic_type(value: Type, index: usize) -> Type {
-    match value.generics.get(index) { Some(item) => { ret item } None => { panic("Missing concrete generic type") } }
+    match value.generics.get(index) { Some(item) => { ret item } None => { backend_invariant_error("missing concrete generic type at index " + Debug::fmt(index) + " for '" + value.name + "'") } }
     ret Type{"void", Vec[Type]::new(), PointerKind::Plain}
 }
 

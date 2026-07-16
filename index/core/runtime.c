@@ -18,11 +18,6 @@
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer)
-#define ENCORE_ADDRESS_SANITIZER 1
-#endif
-#endif
 #ifdef __APPLE__
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
@@ -54,13 +49,6 @@ void *__ehir_pcast(size_t value) {
     return (void *)(uintptr_t)value;
 }
 
-#if defined(ENCORE_ADDRESS_SANITIZER)
-void *__ehir_hrealloc(void *ptr, size_t bytes) { return realloc(ptr, bytes); }
-
-void __ehir_hfree(void *ptr) { free(ptr); }
-void encore_heap_retain(void *ptr) { (void)ptr; }
-bool encore_heap_release(void *ptr) { (void)ptr; return true; }
-#else
 typedef union encore_heap_block encore_heap_block;
 union encore_heap_block {
     struct {
@@ -124,7 +112,12 @@ bool encore_heap_release(void *ptr) {
     }
     return true;
 }
-#endif
+
+bool encore_heap_is_unique(void *ptr) {
+    if (ptr == NULL) return true;
+    encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
+    return block->meta.refs == 1;
+}
 
 typedef union {
     struct {
@@ -612,6 +605,28 @@ encore_str encore_str_join_lines_parts(size_t raw_ptr, size_t len) {
     return encore_str_join_lines(lines);
 }
 
+encore_str encore_str_join_parts(size_t raw_ptr, size_t len) {
+    encore_str *parts = (encore_str *)(uintptr_t)raw_ptr;
+    size_t total = 0;
+    for (size_t index = 0; index < len; index += 1) {
+        size_t part_len = encore_str_size(parts[index]);
+        if (part_len > SIZE_MAX - total) return encore_empty_str();
+        total += part_len;
+    }
+    char *buffer = malloc(total + 1);
+    if (buffer == NULL) return encore_empty_str();
+    size_t offset = 0;
+    for (size_t index = 0; index < len; index += 1) {
+        size_t part_len = encore_str_size(parts[index]);
+        if (part_len > 0) {
+            memcpy(buffer + offset, encore_str_data(parts[index]), part_len);
+            offset += part_len;
+        }
+    }
+    buffer[offset] = '\0';
+    return encore_from_owned_buffer(buffer, offset);
+}
+
 void encore_str_retain(encore_str value) {
     if (value.object == NULL || value.object->ref_count == 0) {
         return;
@@ -736,6 +751,39 @@ uint8_t encore_str_byte_at(encore_str value, size_t index) {
         return 0;
     }
     return (uint8_t)data[index];
+}
+
+size_t encore_str_find_byte_from(encore_str value, uint8_t needle, size_t start) {
+    size_t len = encore_str_size(value);
+    const unsigned char *data = (const unsigned char *)encore_str_data(value);
+    if (data == NULL || start >= len) return len;
+    const unsigned char *found = memchr(data + start, needle, len - start);
+    return found == NULL ? len : (size_t)(found - data);
+}
+
+size_t encore_str_find_control_from(encore_str value, size_t start) {
+    size_t len = encore_str_size(value);
+    const unsigned char *data = (const unsigned char *)encore_str_data(value);
+    if (data == NULL || start >= len) return len;
+    for (size_t index = start; index < len; ++index) {
+        if (data[index] < 0x20) return index;
+    }
+    return len;
+}
+
+size_t encore_str_line_start_byte(encore_str value, size_t target_line) {
+    size_t len = encore_str_size(value);
+    const unsigned char *data = (const unsigned char *)encore_str_data(value);
+    if (target_line == 0) return 0;
+    if (data == NULL) return len + 1;
+    size_t line = 0;
+    for (size_t index = 0; index < len; ++index) {
+        if (data[index] == '\n') {
+            line += 1;
+            if (line == target_line) return index + 1;
+        }
+    }
+    return len + 1;
 }
 
 static size_t encore_utf8_char_width(uint8_t lead) {

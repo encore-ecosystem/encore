@@ -4,18 +4,24 @@ import refrain::frontend::lexer::Lexer
 
 import mod::statements::*
 
-import core::panic::panic
+import core::process::exit
+import core::io::eprintln
 import core::fmt::Debug
 import core::option::Option
-import std::io::println
 import std::vec::Vec
 
 struct MacroArgument {
     tokens: Vec[Token]
 }
 
+fn parser_error(message: str) -> () {
+    eprintln("error[parse]: " + message)
+    exit(1_i32)
+    ret ()
+}
+
 fn required_macro_token(tokens: Vec[Token], index: usize) -> Token {
-    match tokens.get(index) { Some(token) => { ret token } None => { panic("Malformed macro token stream at " + Debug::fmt(index) + "/" + Debug::fmt(tokens.len())) } }
+    match tokens.get(index) { Some(token) => { ret token } None => { parser_error("Malformed macro token stream at " + Debug::fmt(index) + "/" + Debug::fmt(tokens.len())) } }
     ret Token::new(TokenType::UNKNOWN, "", 0_usize, 0_usize)
 }
 fn macro_token_value_or_empty(tokens: Vec[Token], index: usize) -> str { match tokens.get(index) { Some(token) => { ret token.value } None => { ret "" } } }
@@ -32,7 +38,7 @@ fn macro_close_for(value: str) -> str {
 fn macro_matching_close(tokens: Vec[Token], open: usize) -> usize {
     let opening = required_macro_token(tokens, open).value
     let closing = macro_close_for(opening)
-    if closing == "" { panic("Macro delimiter expected") }
+    if closing == "" { parser_error("Macro delimiter expected") }
     let mut depth = 1_usize
     let mut index = open + 1_usize
     while index < tokens.len() {
@@ -44,7 +50,7 @@ fn macro_matching_close(tokens: Vec[Token], open: usize) -> usize {
         }
         index = index + 1_usize
     }
-    panic("Unclosed macro delimiter")
+    parser_error("Unclosed macro delimiter")
     ret tokens.len()
 }
 
@@ -135,6 +141,7 @@ struct BootstrapMacro {
 }
 
 pub struct Parser {
+    source_name: str
     tokens: Vec[Token]
     consumed: usize
     ast: Vec[Statement]
@@ -147,7 +154,12 @@ pub struct Parser {
 
 impl for Parser {
     pub fn new() -> Parser {
+        ret Parser::new_for_source("")
+    }
+
+    pub fn new_for_source(source_name: str) -> Parser {
         ret Parser{
+            source_name,
             Vec[Token]::new(),
             0_usize,
             Vec[Statement]::new(),
@@ -156,6 +168,13 @@ impl for Parser {
             false,
             Vec[BootstrapMacro]::new()
         }
+    }
+
+    fn error_at(mut self, message: str, token: Token) -> () {
+        let location = if self.source_name == "" { "" } else { self.source_name + ":" }
+        eprintln(location + Debug::fmt(token.line + 1_usize) + ":" + Debug::fmt(token.column + 1_usize) + ": error[parse]: " + message)
+        exit(1_i32)
+        ret ()
     }
 
     pub fn parse(mut self, tokens: Vec[Token]) -> Vec[Statement] {
@@ -257,11 +276,16 @@ impl for Parser {
     }
 
     fn mk_expr(mut self, value: Expr) -> ExprNode {
-        ret ExprNode{value}
+        let token = self.peek_curr()
+        ret ExprNode{value, token.line, token.column, token.value.char_len(), self.source_name}
+    }
+
+    fn mk_expr_at(mut self, value: Expr, token: Token) -> ExprNode {
+        ret ExprNode{value, token.line, token.column, token.value.char_len(), self.source_name}
     }
 
     fn box_expr(mut self, node: ExprNode) -> ExprNode<H> {
-        ret ExprNode<H>{node.value}
+        ret ExprNode<H>{node.value, node.line, node.column, node.length, node.source_name}
     }
 
     fn parse_top_level(mut self) -> Statement {
@@ -315,7 +339,7 @@ impl for Parser {
                 statements.push(Statement::Ret(item.expr))
                 ret Statement::Function(FunctionItem{
                     Vec[str]::new(), is_public, false, item.name, Vec[GenericParam]::new(),
-                    Vec[FunctionParam]::new(), item.typ, Option[ParsedBlock]::Some(ParsedBlock{statements})
+                    Vec[FunctionParam]::new(), item.typ, Option[ParsedBlock]::Some(ParsedBlock{statements}), item.expr.source_name, item.expr.line, item.expr.column
                 })
             }
             _ => {}
@@ -371,6 +395,7 @@ impl for Parser {
     }
 
     fn parse_trait(mut self, is_public: bool) -> Statement {
+        let declaration_token = self.peek_curr()
         self.safe_consume(TokenType::KW_TRAIT)
         let name = self.safe_consume_value(TokenType::IDENTIFIER)
         let generics = self.parse_possible_generic_params()
@@ -387,10 +412,11 @@ impl for Parser {
         }
         self.safe_consume(TokenType::RIGHT_BRACE)
 
-        ret Statement::Trait(TraitStmt{is_public, name, generics, bases, methods})
+        ret Statement::Trait(TraitStmt{is_public, name, generics, bases, methods, self.source_name, declaration_token.line, declaration_token.column})
     }
 
     fn parse_impl(mut self) -> Statement {
+        let declaration_token = self.peek_curr()
         self.safe_consume(TokenType::KW_IMPL)
         let generics = self.parse_possible_generic_params()
 
@@ -429,13 +455,16 @@ impl for Parser {
                     header.generics,
                     header.params,
                     header.ret_type,
-                    Option[ParsedBlock]::Some(body)
+                    Option[ParsedBlock]::Some(body),
+                    header.source_name,
+                    header.line,
+                    header.column
                 }
             )
         }
         self.safe_consume(TokenType::RIGHT_BRACE)
 
-        ret Statement::Impl(ImplStmt{generics, trait_name, trait_args, target, methods})
+        ret Statement::Impl(ImplStmt{generics, trait_name, trait_args, target, methods, self.source_name, declaration_token.line, declaration_token.column})
     }
 
     fn parse_fn(mut self, is_public: bool, attrs: Vec[str]) -> Statement {
@@ -450,7 +479,10 @@ impl for Parser {
                 header.generics,
                 header.params,
                 header.ret_type,
-                Option[ParsedBlock]::Some(body)
+                Option[ParsedBlock]::Some(body),
+                header.source_name,
+                header.line,
+                header.column
             }
         )
     }
@@ -460,6 +492,7 @@ impl for Parser {
     }
 
     fn parse_function_signature(mut self, is_public: bool, attrs: Vec[str]) -> FunctionItem {
+        let signature_token = self.peek_curr()
         let mut is_extern = false
         if self.peek_curr_type() == TokenType::KW_EXTERN {
             self.consume()
@@ -498,7 +531,10 @@ impl for Parser {
             generics,
             params,
             ret_type,
-            Option[ParsedBlock]::None
+            Option[ParsedBlock]::None,
+            self.source_name,
+            signature_token.line,
+            signature_token.column
         }
     }
 
@@ -742,9 +778,10 @@ impl for Parser {
         self.safe_consume(TokenType::KW_FOR)
         let label = self.parse_maybe_label()
         let name = self.safe_consume_value(TokenType::IDENTIFIER)
-        let in_kw = self.safe_consume_value(TokenType::IDENTIFIER)
+        let in_token = self.safe_consume(TokenType::IDENTIFIER)
+        let in_kw = in_token.value
         if in_kw != "in" {
-            panic("Expected `in` in for-loop, got: " + in_kw)
+            self.error_at("Expected `in` in for-loop, got: " + in_kw, in_token)
         }
         self.parsing_control_flow_header = true
         let mut iterable = self.parse_expression()
@@ -829,7 +866,7 @@ impl for Parser {
         }
 
         if self.peek_curr_type() != TokenType::KW_ELSE {
-            panic("If expression must have else branch")
+            self.error_at("If expression must have else branch", self.peek_curr())
             ret self.mk_expr(Expr::Path(""))
         }
         self.consume()
@@ -938,7 +975,7 @@ impl for Parser {
                 let value = self.literal_value(self.parse_float_literal())
                 ret MatchPattern{"float", Option[str]::Some(value), Option[str]::None}
             }
-            panic("Match pattern '-' must be followed by numeric literal")
+            self.error_at("Match pattern '-' must be followed by numeric literal", self.peek_curr())
             ret MatchPattern{"invalid", Option[str]::None, Option[str]::None}
         }
 
@@ -1196,6 +1233,7 @@ impl for Parser {
     }
 
     fn parse_integer_literal(mut self) -> ExprNode {
+        let token = self.peek_curr()
         let mut value = self.safe_consume_value(TokenType::INTEGER)
         match self.parse_numeric_literal_suffix() {
             Option[str]::Some(text) => {
@@ -1203,10 +1241,11 @@ impl for Parser {
             }
             Option[str]::None => {}
         }
-        ret self.mk_expr(Expr::Integer(value))
+        ret self.mk_expr_at(Expr::Integer(value), token)
     }
 
     fn parse_float_literal(mut self) -> ExprNode {
+        let token = self.peek_curr()
         let mut value = self.safe_consume_value(TokenType::FLOAT)
         match self.parse_numeric_literal_suffix() {
             Option[str]::Some(text) => {
@@ -1214,7 +1253,7 @@ impl for Parser {
             }
             Option[str]::None => {}
         }
-        ret self.mk_expr(Expr::Float(value))
+        ret self.mk_expr_at(Expr::Float(value), token)
     }
 
     fn parse_parenthesized_or_tuple(mut self) -> ExprNode {
@@ -1438,7 +1477,8 @@ impl for Parser {
                     ret expr
                 }
             }
-            let member = self.consume_value()
+            let member_token = self.consume()
+            let member = member_token.value
             let member_generics = self.parse_possible_generics()
 
             if self.peek_curr_type() == TokenType::LEFT_PAREN {
@@ -1450,11 +1490,11 @@ impl for Parser {
             }
 
             if member_generics.len() > 0_usize {
-                panic("Field can not have generic arguments")
+                self.error_at("Field can not have generic arguments", member_token)
                 ret expr
             }
 
-            expr = self.mk_expr(Expr::Field(FieldExpr{self.box_expr(expr), member}))
+            expr = self.mk_expr_at(Expr::Field(FieldExpr{self.box_expr(expr), member}), member_token)
         }
         ret expr
     }
@@ -1519,11 +1559,11 @@ impl for Parser {
             }
             TokenType::BOOLEAN => {
                 let token = self.consume()
-                ret self.mk_expr(Expr::Boolean(token.value == "true"))
+                ret self.mk_expr_at(Expr::Boolean(token.value == "true"), token)
             }
             TokenType::STRING => {
-                let value = self.consume_value()
-                ret self.mk_expr(Expr::StringLiteral(value))
+                let token = self.consume()
+                ret self.mk_expr_at(Expr::StringLiteral(token.value), token)
             }
             TokenType::LEFT_PAREN => {
                 ret self.parse_parenthesized_or_tuple()
@@ -1564,7 +1604,7 @@ impl for Parser {
                         }
                     }
                 }
-                ret self.mk_expr(Expr::Path(path))
+                ret self.mk_expr_at(Expr::Path(path), curr_token)
             }
             _ => {
                 self.unexpected_token("expression", curr_token)
@@ -1608,7 +1648,7 @@ impl for Parser {
     fn parse_inline_expression(mut self, source: str) -> ExprNode {
         let mut lexer = Lexer::new()
         let tokens = lexer.tokenize(source)
-        let mut nested = Parser::new()
+        let mut nested = Parser::new_for_source(self.source_name)
         ret nested.parse_inline_tokens(tokens)
     }
 
@@ -1874,7 +1914,7 @@ impl for Parser {
             self.consume()
             let token = self.safe_consume(TokenType::IDENTIFIER)
             if token.value != "self" {
-                panic("Only `self` may use prefix `mut` before the parameter name")
+                self.error_at("Only `self` may use prefix `mut` before the parameter name", token)
                 ret FunctionParam{"", Option[str]::None}
             }
             if self.peek_curr_type() == TokenType::COLON {
@@ -2104,18 +2144,14 @@ impl for Parser {
     }
 
     fn unexpected_token(mut self, expected: str, found: Token) -> () {
-        println("Parse error")
-        println("found: `" + found.value + "`")
-        println("expected: " + expected)
-        println("at line " + Debug::fmt(found.line) + ", column " + Debug::fmt(found.column))
-        panic("Unexpected token: " + found.value)
+        self.error_at("expected " + expected + ", found `" + found.value + "`", found)
         ret ()
     }
 
     fn safe_consume(mut self, expected_token_type: TokenType) -> Token {
         let token = self.consume()
         if token.type != expected_token_type {
-            self.unexpected_token("different token type", token)
+            self.unexpected_token(Debug::fmt(expected_token_type), token)
         }
         ret token
     }

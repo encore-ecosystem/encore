@@ -1,5 +1,6 @@
 import core::option::Option
-import core::panic::panic
+import core::io::eprintln
+import core::process::exit
 import std::os::file_exists
 import std::os::read_file
 import std::os::core_dir
@@ -14,10 +15,11 @@ import refrain::frontend::Lexer
 import refrain::frontend::Parser
 import refrain::frontend::Statement
 import refrain::frontend::Token
+import refrain::frontend::{FrontendDiagnostic, analyze_named_module}
 
 import mod::manifest::ProjectManifest
-import mod::manifest::read_project_manifest
-import mod::registry::{registry_package_checksum, resolve_index_dependency, valid_dependency_name}
+import mod::manifest::{project_manifest_feature_dependencies, project_manifest_resolve_features, read_project_manifest}
+import mod::registry::{dependency_base_reference, dependency_requested_features, registry_package_checksum, resolve_index_dependency, valid_dependency_name}
 
 extern fn encore_strset_new() -> usize
 extern fn encore_strset_insert(set: usize, value: str) -> bool
@@ -32,6 +34,7 @@ pub struct WorkspaceRefrain {
     target_is_binary: bool
     manifest: ProjectManifest
     dependency_names: Vec[str]
+    enabled_features: Vec[str]
 }
 
 pub struct WorkspaceModule {
@@ -41,6 +44,8 @@ pub struct WorkspaceModule {
     source: str
     ast: Vec[Statement]
     imports: Vec[str]
+    diagnostics: Vec[FrontendDiagnostic]
+    enabled_features: Vec[str]
 }
 
 pub struct ProjectWorkspace {
@@ -49,44 +54,52 @@ pub struct ProjectWorkspace {
     modules: Vec[WorkspaceModule]
     flat_ast: Vec[Statement]
     loading_roots: Vec[str]
+    enabled_features: Vec[str]
 }
 
 pub fn load_binary_workspace(root: Path) -> ProjectWorkspace {
-    ret load_workspace(root, true)
+    ret load_workspace(root, true, false)
 }
 
 pub fn load_library_workspace(root: Path) -> ProjectWorkspace {
-    ret load_workspace(root, false)
+    ret load_workspace(root, false, true)
 }
 
-fn load_workspace(root: Path, target_is_binary: bool) -> ProjectWorkspace {
+fn load_workspace(root: Path, target_is_binary: bool, build_flat_ast: bool) -> ProjectWorkspace {
     let mut workspace = ProjectWorkspace{
         "",
         Vec[WorkspaceRefrain]::new(),
         Vec[WorkspaceModule]::new(),
         Vec[Statement]::new(),
+        Vec[str]::new(),
         Vec[str]::new()
     }
 
-    workspace_set_root_name(workspace, load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), root.resolve(), target_is_binary))
+    workspace_set_root_name(workspace, load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), root.resolve(), target_is_binary, Vec[str]::new()))
 
     match workspace_root_refrain(workspace) {
         Option[WorkspaceRefrain]::Some(root_refrain) => {
             let modules = build_modules_for_refrain(workspace, root_refrain)
             workspace_set_modules(workspace, modules)
-            workspace_set_flat_ast(workspace, flatten_modules(workspace.modules))
+            if build_flat_ast { workspace_set_flat_ast(workspace, flatten_modules(workspace.modules)) }
         }
         Option[WorkspaceRefrain]::None => {
-            panic("Internal workspace error: root refrain metadata is missing")
+            workspace_invariant_error("root refrain metadata is missing")
         }
     }
 
     ret workspace
 }
 
+pub fn workspace_release_modules(workspace: mut ProjectWorkspace) -> () {
+    workspace.modules = Vec[WorkspaceModule]::new()
+    workspace.flat_ast = Vec[Statement]::new()
+    ret ()
+}
+
 pub fn load_entry_workspace(root: Path, entrypoint: Path) -> ProjectWorkspace {
-    let mut workspace = ProjectWorkspace{"", Vec[WorkspaceRefrain]::new(), Vec[WorkspaceModule]::new(), Vec[Statement]::new(), Vec[str]::new()}
-    workspace_set_root_name(workspace, load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), root.resolve(), true))
+    let mut workspace = ProjectWorkspace{"", Vec[WorkspaceRefrain]::new(), Vec[WorkspaceModule]::new(), Vec[Statement]::new(), Vec[str]::new(), Vec[str]::new()}
+    workspace_set_root_name(workspace, load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), root.resolve(), true, Vec[str]::new()))
     match workspace_root_refrain(workspace) {
         Some(root_refrain) => {
             let visited_paths = unsafe { encore_strset_new() }
@@ -108,9 +121,15 @@ pub fn load_entry_workspace(root: Path, entrypoint: Path) -> ProjectWorkspace {
             workspace_set_modules(workspace, modules)
             workspace_set_flat_ast(workspace, flatten_modules(modules))
         }
-        None => { panic("Workspace root is missing") }
+        None => { workspace_invariant_error("workspace root is missing") }
     }
     ret workspace
+}
+
+fn workspace_invariant_error(message: str) -> () {
+    eprintln("error[workspace-invariant]: " + message)
+    exit(1_i32)
+    ret ()
 }
 
 pub fn workspace_root_refrain(workspace: ProjectWorkspace) -> Option[WorkspaceRefrain] {
@@ -132,10 +151,10 @@ fn workspace_set_flat_ast(workspace: mut ProjectWorkspace, flat_ast: Vec[Stateme
     ret ()
 }
 
-fn load_refrain(workspace: mut ProjectWorkspace, root: Path, distribution_root: Path, source_key: str, lock_root: Path, target_is_binary: bool) -> str {
+fn load_refrain(workspace: mut ProjectWorkspace, root: Path, distribution_root: Path, source_key: str, lock_root: Path, target_is_binary: bool, requested_features: Vec[str]) -> str {
     match find_refrain_by_root(workspace, root) {
         Option[WorkspaceRefrain]::Some(found) => {
-            ret found.name
+            ret merge_loaded_refrain_features(workspace, found, requested_features, lock_root)
         }
         Option[WorkspaceRefrain]::None => {
         }
@@ -143,20 +162,25 @@ fn load_refrain(workspace: mut ProjectWorkspace, root: Path, distribution_root: 
 
     let normalized_root = root.resolve().as_str()
     if contains_string(workspace.loading_roots, normalized_root) {
-        panic("Dependency cycle while loading refrain at " + normalized_root)
+        workspace_error("Dependency cycle while loading refrain at " + normalized_root)
     }
     workspace.loading_roots.push(normalized_root)
 
     let manifest = read_project_manifest(root)
+    let enabled_features = project_manifest_resolve_features(manifest, requested_features)
+    for feature in enabled_features { if !contains_string(workspace.enabled_features, feature) { workspace.enabled_features.push(feature) } }
     match find_refrain_by_name(workspace, manifest.name) {
         Some(existing) => {
             if existing.root.resolve().as_str() != root.resolve().as_str() {
-                panic("Duplicate refrain name '" + manifest.name + "' at " + existing.root.as_str() + " and " + root.as_str())
+                workspace_error("Duplicate refrain name '" + manifest.name + "' at " + existing.root.as_str() + " and " + root.as_str())
             }
         }
         None => {}
     }
-    let dependency_refs = manifest.dependencies
+    let mut dependency_refs = manifest.dependencies
+    for dependency in project_manifest_feature_dependencies(manifest, enabled_features) {
+        if !contains_string(dependency_refs, dependency) { dependency_refs.push(dependency) }
+    }
     let mut dependency_names = Vec[str]::new()
 
     let mut index = 0_usize
@@ -164,7 +188,7 @@ fn load_refrain(workspace: mut ProjectWorkspace, root: Path, distribution_root: 
         match dependency_refs.get(index) {
             Option[str]::Some(dep_ref) => {
                 let dependency = resolve_dependency_root(dep_ref, root, distribution_root, source_key, lock_root)
-                let dep_name = load_refrain(workspace, dependency.root, dependency.distribution_root, dependency.source_key, lock_root, false)
+                let dep_name = load_refrain(workspace, dependency.root, dependency.distribution_root, dependency.source_key, lock_root, false, dependency_requested_features(dep_ref))
                 if !contains_string(dependency_names, dep_name) {
                     dependency_names.push(dep_name)
                 }
@@ -182,11 +206,36 @@ fn load_refrain(workspace: mut ProjectWorkspace, root: Path, distribution_root: 
         source_key,
         target_is_binary,
         manifest,
-        dependency_names
+        dependency_names,
+        enabled_features
     }
     workspace.refrains.push(refrain)
     workspace.loading_roots.pop()
     ret manifest.name
+}
+
+fn merge_loaded_refrain_features(workspace: mut ProjectWorkspace, found: WorkspaceRefrain, requested: Vec[str], lock_root: Path) -> str {
+    let mut combined = found.enabled_features
+    for feature in requested { if !contains_string(combined, feature) { combined.push(feature) } }
+    let enabled = project_manifest_resolve_features(found.manifest, combined)
+    if enabled.len() == found.enabled_features.len() { ret found.name }
+
+    let mut dependency_names = found.dependency_names
+    for dep_ref in project_manifest_feature_dependencies(found.manifest, enabled) {
+        let dependency = resolve_dependency_root(dep_ref, found.root, found.distribution_root, found.source_key, lock_root)
+        let dep_name = load_refrain(workspace, dependency.root, dependency.distribution_root, dependency.source_key, lock_root, false, dependency_requested_features(dep_ref))
+        if !contains_string(dependency_names, dep_name) { dependency_names.push(dep_name) }
+    }
+    for feature in enabled { if !contains_string(workspace.enabled_features, feature) { workspace.enabled_features.push(feature) } }
+
+    let replacement = WorkspaceRefrain{found.name, found.root, found.distribution_root, found.source_key, found.target_is_binary, found.manifest, dependency_names, enabled}
+    let mut refrains = Vec[WorkspaceRefrain]::new()
+    for refrain in workspace.refrains {
+        if refrain.root.resolve().as_str() == found.root.resolve().as_str() { refrains.push(replacement) }
+        else { refrains.push(refrain) }
+    }
+    workspace.refrains = refrains
+    ret found.name
 }
 
 fn build_modules_for_refrain(workspace: mut ProjectWorkspace, refrain: WorkspaceRefrain) -> Vec[WorkspaceModule] {
@@ -218,17 +267,19 @@ fn visit_module(
 
     let source = read_file(native_path(resolved_path.as_str()))
     let source_is_new = unsafe { encore_strset_insert(visited_sources, source) }
-    let mut lexer = Lexer::new()
-    let tokens = lexer.tokenize(source)
-    let imports = import_paths_from_tokens(tokens)
+    let document = analyze_named_module(owner.name, module_path.as_str(), source)
+    let tokens = document.tokens
+    let import_edges = import_edges_from_tokens(tokens)
+    let imports = import_paths_from_edges(import_edges)
+    let mut diagnostics = document.diagnostics
     if !source_is_new {
-        visit_imports(workspace, owner, resolved_path, imports, visited_paths, visited_sources, result)
+        let mut ignored_diagnostics = Vec[FrontendDiagnostic]::new()
+        visit_imports(workspace, owner, resolved_path, import_edges, visited_paths, visited_sources, result, ignored_diagnostics)
         ret ()
     }
-    let mut parser = Parser::new()
-    let ast = parser.parse(tokens)
-    visit_imports(workspace, owner, resolved_path, imports, visited_paths, visited_sources, result)
-    result.push(WorkspaceModule{owner.name, owner.root, resolved_path, source, ast, imports})
+    let ast = document.ast
+    visit_imports(workspace, owner, resolved_path, import_edges, visited_paths, visited_sources, result, diagnostics)
+    result.push(WorkspaceModule{owner.name, owner.root, resolved_path, source, ast, imports, diagnostics, owner.enabled_features})
     ret ()
 }
 
@@ -236,16 +287,17 @@ fn visit_imports(
     workspace: mut ProjectWorkspace,
     owner: WorkspaceRefrain,
     resolved_path: Path,
-    imports: Vec[str],
+    imports: Vec[DependencyEdge],
     visited_paths: usize,
     visited_sources: usize,
-    result: mut Vec[WorkspaceModule]
+    result: mut Vec[WorkspaceModule],
+    diagnostics: mut Vec[FrontendDiagnostic]
 ) -> () {
     let mut import_index = 0_usize
     while import_index < imports.len() {
         match imports.get(import_index) {
-            Option[str]::Some(import_path) => {
-                let expanded = expand_import_path(import_path)
+            Option[DependencyEdge]::Some(import_edge) => {
+                let expanded = expand_import_path(import_edge.target)
                 let mut request_index = 0_usize
                 while request_index < expanded.len() {
                     match expanded.get(request_index) {
@@ -255,6 +307,14 @@ fn visit_imports(
                                     visit_module(workspace, target.owner, target.module_path, visited_paths, visited_sources, result)
                                 }
                                 Option[ResolvedModule]::None => {
+                                    diagnostics.push(FrontendDiagnostic::new(
+                                        1_usize,
+                                        "unresolved-import",
+                                        "unresolved import '" + request_path + "'",
+                                        import_edge.line,
+                                        import_edge.column,
+                                        import_edge.length
+                                    ))
                                 }
                             }
                         }
@@ -264,7 +324,7 @@ fn visit_imports(
                     request_index = request_index + 1_usize
                 }
             }
-            Option[str]::None => {
+            Option[DependencyEdge]::None => {
             }
         }
         import_index = import_index + 1_usize
@@ -394,7 +454,7 @@ fn resolve_import_module(
         module_part_count = module_part_count - 1_usize
     }
 
-    panic("Unable to resolve import '" + import_path + "' in " + source_module.as_str())
+    workspace_error("Unable to resolve import '" + import_path + "' in " + source_module.as_str())
     ret Option[ResolvedModule]::None
 }
 
@@ -439,7 +499,7 @@ fn entrypoint_of(refrain: WorkspaceRefrain) -> Path {
     }
     let entrypoint = refrain.root.join("src").join(filename)
     if !file_exists(native_path(entrypoint.as_str())) {
-        panic("Unable to find entrypoint for refrain '" + refrain.name + "': " + entrypoint.as_str())
+        workspace_error("Unable to find entrypoint for refrain '" + refrain.name + "': " + entrypoint.as_str())
     }
     ret entrypoint
 }
@@ -452,7 +512,7 @@ fn resolve_dependency_refrain(
     if contains_string(owner.dependency_names, dependency_name) {
         ret find_refrain_by_name(workspace, dependency_name)
     }
-    ret find_refrain_by_name(workspace, dependency_name)
+    ret Option[WorkspaceRefrain]::None
 }
 
 struct WorkspaceDependency {
@@ -462,33 +522,34 @@ struct WorkspaceDependency {
 }
 
 fn resolve_dependency_root(dep_ref: str, base_root: Path, distribution_root: Path, source_key: str, lock_root: Path) -> WorkspaceDependency {
-    if dep_ref == "sys@core" {
+    let base_ref = dependency_base_reference(dep_ref)
+    if base_ref == "sys@core" {
         let root = system_core_root(base_root).resolve()
         ret WorkspaceDependency{root, root, "sys@core"}
     }
 
-    if starts_with(dep_ref, "path@") {
-        let root = base_root.join(dep_ref.slice(5_usize, dep_ref.len() - 5_usize)).resolve()
+    if starts_with(base_ref, "path@") {
+        let root = base_root.join(base_ref.slice(5_usize, base_ref.len() - 5_usize)).resolve()
         ret WorkspaceDependency{root, root, "path:" + root.as_str()}
     }
 
-    if starts_with(dep_ref, "workspace@") {
-        let name = dep_ref.slice(10_usize, dep_ref.len() - 10_usize)
-        if !valid_dependency_name(name) { panic("Invalid workspace dependency name: " + name) }
+    if starts_with(base_ref, "workspace@") {
+        let name = base_ref.slice(10_usize, base_ref.len() - 10_usize)
+        if !valid_dependency_name(name) { workspace_error("Invalid workspace dependency name: " + name) }
         let root = distribution_root.join("workspace").join(name).resolve()
-        if !file_exists(root.join("encore.toml").as_str()) { panic("Unable to find " + dep_ref + " at " + root.as_str()) }
+        if !file_exists(root.join("encore.toml").as_str()) { workspace_error("Unable to find " + dep_ref + " at " + root.as_str()) }
         ret WorkspaceDependency{root, distribution_root, source_key}
     }
 
-    if starts_with(dep_ref, "index@") {
-        let resolved = resolve_index_dependency(dep_ref, lock_root, false)
-        if resolved == "" { panic("Unable to resolve dependency: " + dep_ref) }
+    if starts_with(base_ref, "index@") {
+        let resolved = resolve_index_dependency(base_ref, lock_root, false)
+        if resolved == "" { workspace_error("Unable to resolve dependency: " + dep_ref) }
         let root = Path::new(resolved).resolve()
-        ret WorkspaceDependency{root, root, dep_ref + ":" + registry_package_checksum(root)}
+        ret WorkspaceDependency{root, root, base_ref + ":" + registry_package_checksum(root)}
     }
 
-    if starts_with(dep_ref, "git@") {
-        let url = dep_ref.slice(4_usize, dep_ref.len() - 4_usize)
+    if starts_with(base_ref, "git@") {
+        let url = base_ref.slice(4_usize, base_ref.len() - 4_usize)
         let url_path = Path::new(url)
         let mut repository = workspace_path_name_or(url_path, "repository")
         if repository.len() > 4_usize && repository.slice(repository.len() - 4_usize, 4_usize) == ".git" {
@@ -505,14 +566,14 @@ fn resolve_dependency_root(dep_ref: str, base_root: Path, distribution_root: Pat
                 None => {}
             }
             if run("git clone " + workspace_shell_quote(url) + " " + workspace_shell_quote(destination.as_str())) != 0_i32 {
-                panic("Unable to clone dependency: " + url)
+                workspace_error("Unable to clone dependency: " + url)
             }
         }
         let root = destination.resolve()
         ret WorkspaceDependency{root, root, "git:" + url}
     }
 
-    panic("Unsupported dependency reference: " + dep_ref)
+    workspace_error("Unsupported dependency reference: " + dep_ref)
     ret WorkspaceDependency{base_root, distribution_root, source_key}
 }
 
@@ -533,11 +594,6 @@ fn workspace_shell_quote(value: str) -> str {
 }
 
 pub fn system_core_root(base_root: Path) -> Path {
-    let configured = Path::new(core_dir()).resolve()
-    if file_exists(native_path(configured.join("encore.toml").as_str())) {
-        ret configured
-    }
-
     let mut cursor = base_root.resolve()
     loop {
         let candidate = cursor.join("index").join("core").join("encore.toml")
@@ -561,7 +617,12 @@ pub fn system_core_root(base_root: Path) -> Path {
         }
     }
 
-    panic("Unable to resolve sys@core starting from " + base_root.as_str())
+    let configured = Path::new(core_dir()).resolve()
+    if file_exists(native_path(configured.join("encore.toml").as_str())) {
+        ret configured
+    }
+
+    workspace_error("Unable to resolve sys@core starting from " + base_root.as_str())
     ret base_root
 }
 
@@ -600,9 +661,12 @@ fn find_refrain_by_name(workspace: ProjectWorkspace, name: str) -> Option[Worksp
     ret Option[WorkspaceRefrain]::None
 }
 
-fn import_paths_from_tokens(tokens: Vec[Token]) -> Vec[str] {
+fn import_edges_from_tokens(tokens: Vec[Token]) -> Vec[DependencyEdge] {
     let graph = DependencyGraph::from_tokens("", tokens)
-    let edges = graph.all()
+    ret graph.all()
+}
+
+fn import_paths_from_edges(edges: Vec[DependencyEdge]) -> Vec[str] {
     let mut out = Vec[str]::new()
     let mut index = 0_usize
     while index < edges.len() {
@@ -745,7 +809,7 @@ fn find_matching_brace(value: str, start: usize) -> usize {
         }
         index = index + 1_usize
     }
-    panic("Unbalanced import braces: " + value)
+    workspace_error("Unbalanced import braces: " + value)
     ret start
 }
 
@@ -765,6 +829,12 @@ fn trim_spaces(value: str) -> str {
 
 fn is_space(ch: str) -> bool {
     ret ch == " " || ch == "\n" || ch == "\t" || ch == "\r"
+}
+
+fn workspace_error(message: str) -> () {
+    eprintln("error[workspace]: " + message)
+    exit(1_i32)
+    ret ()
 }
 
 fn starts_with(value: str, prefix: str) -> bool {

@@ -3,6 +3,8 @@ import core::iter::IntoIterator
 import core::iter::Iterator
 import core::option::Option
 
+extern fn encore_heap_is_unique(ptr: usize) -> bool
+
 pub struct Vec[T] {
     ptr: T*
     len: usize
@@ -36,6 +38,7 @@ fn __vec_realloc[T](ptr: T*, count: usize) -> T* {
 }
 
 #attr(safe)
+#attr(borrowed_return)
 fn __vec_load[T](ptr: T*, index: usize) -> T {
     unsafe {
         unsafe ehir {
@@ -61,17 +64,8 @@ fn __vec_get_handle[T](ptr: T*, index: usize) -> usize {
 fn __vec_load_retained[T](ptr: T*, index: usize) -> T {
     unsafe {
         let value = __vec_load[T](ptr, index)
-        ret __vec_retain_value[T](value)
+        ret value
     }
-}
-
-fn __vec_retain_value[T](value: T) -> T {
-    unsafe {
-        unsafe ehir {
-            retain value: T
-        }
-    }
-    ret value
 }
 
 #attr(safe)
@@ -120,6 +114,16 @@ fn __vec_free_ptr[T](ptr: T*) -> bool {
     }
 }
 
+#attr(safe)
+fn __vec_is_unique[T](ptr: T*) -> bool {
+    unsafe {
+        unsafe ehir {
+            raw: usize = pcast ptr: T*, usize
+        }
+        ret encore_heap_is_unique(raw)
+    }
+}
+
 fn __vec_next_cap(current: usize) -> usize {
     if current == 0_usize {
         ret 4_usize
@@ -128,12 +132,21 @@ fn __vec_next_cap(current: usize) -> usize {
 }
 
 fn __vec_reserve_exact[T](vec: mut Vec[T], new_cap: usize) -> () {
-    if new_cap <= vec.cap {
+    if new_cap <= vec.cap && __vec_is_unique[T](vec.ptr) {
         ret ()
     }
 
     unsafe {
-        let next_ptr = __vec_realloc[T](vec.ptr, new_cap)
+        // Mutating a shared buffer would give aliases inconsistent lengths or
+        // elements. Clone through the typed ownership path before any write.
+        let old = Vec[T]{vec.ptr, vec.len, vec.cap}
+        let next_ptr = __vec_realloc[T](__vec_null_ptr[T](), new_cap)
+        let mut index = 0_usize
+        while index < old.len {
+            let value = __vec_load_retained[T](old.ptr, index)
+            __vec_store[T](next_ptr, index, value)
+            index = index + 1_usize
+        }
         vec.ptr = next_ptr
         vec.cap = new_cap
     }
@@ -175,11 +188,12 @@ impl[T] for Vec[T] {
 
     pub fn reserve(self: mut Vec[T], additional: usize) -> () {
         let required = self.len() + additional
-        if required <= self.capacity() {
+        if required <= self.capacity() && __vec_is_unique[T](self.ptr) {
             ret ()
         }
 
-        let mut next_cap = __vec_next_cap(self.capacity())
+        let mut next_cap = self.capacity()
+        if next_cap == 0_usize { next_cap = __vec_next_cap(0_usize) }
         while next_cap < required {
             next_cap = __vec_next_cap(next_cap)
         }
@@ -189,10 +203,7 @@ impl[T] for Vec[T] {
     }
 
     pub fn push(self: mut Vec[T], value: T) -> () {
-        let required = self.len + 1_usize
-        if required > self.cap {
-            self.reserve(1_usize)
-        }
+        self.reserve(1_usize)
         unsafe {
             __vec_store[T](self.ptr, self.len, value)
         }
@@ -204,6 +215,7 @@ impl[T] for Vec[T] {
         if index >= self.len {
             ret ()
         }
+        self.reserve(0_usize)
 
         unsafe {
             __vec_replace[T](self.ptr, index, value)
@@ -243,6 +255,7 @@ impl[T] for Vec[T] {
     }
 
     pub fn clear(self: mut Vec[T]) -> () {
+        self.reserve(0_usize)
         let mut index = 0_usize
         while index < self.len {
             unsafe {
@@ -258,10 +271,14 @@ impl[T] for Vec[T] {
         if self.len == 0_usize {
             ret Option[T]::None
         }
+        self.reserve(0_usize)
 
         let index = self.len - 1_usize
         match self.get(index) {
             Some(value) => {
+                unsafe {
+                    __vec_drop_at[T](self.ptr, index)
+                }
                 self.len = index
                 ret Option[T]::Some(value)
             }

@@ -1,6 +1,7 @@
 import core::option::Option
 import core::fmt::Debug
-import core::panic::panic
+import core::process::exit
+import core::io::eprintln
 import std::vec::Vec
 
 import refrain::frontend::parser::statements::EnumStmt
@@ -47,13 +48,28 @@ import refrain::frontend::parser::statements::MatchExprArm
 import refrain::frontend::parser::statements::MatchPattern
 import refrain::frontend::parser::statements::ParsedMatchArm
 import refrain::frontend::parser::statements::MatchArmBody
+import refrain::frontend::lexer::Lexer
+import refrain::frontend::parser::Parser
 import ehirlib::EhirTextBuilder
-import refrain::target::{TargetSpec, cfg_active, host_target}
+import refrain::target::{TargetSpec, cfg_active_with_features, host_target}
 
 struct LoweredExpr {
     code: EhirTextBuilder
     value: str
     typ: str
+}
+
+fn translation_invariant_error(message: str) -> () {
+    eprintln("error[translator-invariant]: " + message)
+    exit(1_i32)
+    ret ()
+}
+
+fn translation_error_at(source_name: str, line: usize, column: usize, code: str, message: str) -> () {
+    let location = if source_name == "" { "" } else { source_name + ":" + Debug::fmt(line + 1_usize) + ":" + Debug::fmt(column + 1_usize) + ": " }
+    eprintln(location + "error[" + code + "]: " + message)
+    exit(1_i32)
+    ret ()
 }
 
 struct VarType {
@@ -64,9 +80,32 @@ struct VarType {
 
 struct FunctionType {
     name: str
+    emitted_name: str
     ret_type: str
     params: Vec[str]
     generics: Vec[str]
+}
+
+struct TraitType {
+    name: str
+    generics: Vec[GenericParam]
+    bases: Vec[str]
+    methods: Vec[FunctionItem]
+    source_name: str
+    line: usize
+    column: usize
+}
+
+struct GenericCallable {
+    name: str
+    params: Vec[GenericParam]
+}
+
+struct TraitImplType {
+    trait_name: str
+    trait_args: Vec[str]
+    target: str
+    generics: Vec[GenericParam]
 }
 
 struct StructFieldType {
@@ -86,21 +125,62 @@ struct LoopTargetType {
     name: str
     break_target: str
     continue_target: str
+    owned_start: usize
 }
 
 struct TranslatorContext {
     vars: Vec[VarType]
     owned_vars: Vec[VarType]
     functions: Vec[FunctionType]
+    types: Vec[str]
+    traits: Vec[TraitType]
+    trait_impls: Vec[TraitImplType]
+    generic_callables: Vec[GenericCallable]
     fields: Vec[StructFieldType]
     enum_variants: Vec[EnumVariantType]
     loop_targets: Vec[LoopTargetType]
     with_cleanups: Vec[VarType]
     extern_functions: Vec[str]
+    borrowed_return_functions: Vec[str]
     self_type: str
     return_type: str
     expression_hint: str
+    active_generics: Vec[GenericParam]
     target: TargetSpec
+    features: Vec[str]
+}
+
+pub fn filter_ast_for_target(ast: Vec[Statement], target: TargetSpec, features: Vec[str]) -> Vec[Statement] {
+    let mut out = Vec[Statement]::new()
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => {
+                if function_is_active(item, target, features) { out.push(Statement::Function(without_cfg_attrs(item))) }
+            }
+            Statement::Impl(item) => {
+                let mut methods = Vec[FunctionItem]::new()
+                for method in item.methods {
+                    if function_is_active(method, target, features) { methods.push(without_cfg_attrs(method)) }
+                }
+                out.push(Statement::Impl(ImplStmt{item.generics, item.trait_name, item.trait_args, item.target, methods, item.source_name, item.line, item.column}))
+            }
+            Statement::Trait(item) => {
+                let mut methods = Vec[FunctionItem]::new()
+                for method in item.methods {
+                    if function_is_active(method, target, features) { methods.push(without_cfg_attrs(method)) }
+                }
+                out.push(Statement::Trait(TraitStmt{item.is_public, item.name, item.generics, item.bases, methods, item.source_name, item.line, item.column}))
+            }
+            _ => { out.push(statement) }
+        }
+    }
+    ret out
+}
+
+fn without_cfg_attrs(item: FunctionItem) -> FunctionItem {
+    let mut attrs = Vec[str]::new()
+    for attr in item.attrs { if !starts_with(attr, "cfg:") { attrs.push(attr) } }
+    ret FunctionItem{attrs, item.is_public, item.is_extern, item.name, item.generics, item.params, item.ret_type, item.body, item.source_name, item.line, item.column}
 }
 
 pub fn translate_to_ehir(ast: Vec[Statement]) -> str {
@@ -108,29 +188,21 @@ pub fn translate_to_ehir(ast: Vec[Statement]) -> str {
 }
 
 pub fn translate_to_ehir_for_target(ast: Vec[Statement], target: TargetSpec) -> str {
-    let mut ctx = collect_context(ast, target)
+    ret translate_to_ehir_for_target_and_features(ast, target, Vec[str]::new())
+}
+
+pub fn translate_to_ehir_for_target_and_features(ast: Vec[Statement], target: TargetSpec, features: Vec[str]) -> str {
+    let mut ctx = collect_context(ast, target, features)
     let mut builder = EhirTextBuilder::new()
     for stmt in ast {
         match stmt {
-            Statement::Import(imp_item) => {
-                let _ignored = imp_item
-            }
-            Statement::Struct(struct_item) => {
-                builder = builder.append(translate_struct(struct_item))
-            }
-            Statement::EnumItem(enum_item) => {
-                builder = builder.append(translate_enum(enum_item))
-            }
-            Statement::Trait(trait_item) => {
-                builder = builder.append(translate_trait(ctx, trait_item))
-            }
-            Statement::Impl(impl_item) => {
-                builder = builder.append(translate_impl(ctx, impl_item))
-            }
+            Statement::Import(imp_item) => { let _ignored = imp_item }
+            Statement::Struct(struct_item) => { builder = builder.append(translate_struct(struct_item)) }
+            Statement::EnumItem(enum_item) => { builder = builder.append(translate_enum(enum_item)) }
+            Statement::Trait(trait_item) => { builder = builder.append(translate_trait(ctx, trait_item)) }
+            Statement::Impl(impl_item) => { builder = builder.append(translate_impl(ctx, impl_item)) }
             Statement::Function(fn_item) => {
-                if function_is_active(fn_item, target) {
-                    builder = builder.append(translate_function(ctx, fn_item))
-                }
+                if function_is_active(fn_item, target, features) { builder = builder.append(translate_function(ctx, fn_item)) }
             }
             _ => {}
         }
@@ -139,59 +211,142 @@ pub fn translate_to_ehir_for_target(ast: Vec[Statement], target: TargetSpec) -> 
     ret builder.finish()
 }
 
-fn collect_context(ast: Vec[Statement], target: TargetSpec) -> TranslatorContext {
-    let mut ctx = TranslatorContext{Vec[VarType]::new(), Vec[VarType]::new(), Vec[FunctionType]::new(), Vec[StructFieldType]::new(), Vec[EnumVariantType]::new(), Vec[LoopTargetType]::new(), Vec[VarType]::new(), Vec[str]::new(), "", "void", "", target}
+fn collect_context(ast: Vec[Statement], target: TargetSpec, features: Vec[str]) -> TranslatorContext {
+    let mut ctx = TranslatorContext{Vec[VarType]::new(), Vec[VarType]::new(), Vec[FunctionType]::new(), Vec[str]::new(), Vec[TraitType]::new(), Vec[TraitImplType]::new(), Vec[GenericCallable]::new(), Vec[StructFieldType]::new(), Vec[EnumVariantType]::new(), Vec[LoopTargetType]::new(), Vec[VarType]::new(), Vec[str]::new(), Vec[str]::new(), "", "void", "", Vec[GenericParam]::new(), target, features}
     for stmt in ast {
         match stmt {
             Statement::Function(fn_item) => {
-                if function_is_active(fn_item, target) {
+                if function_is_active(fn_item, target, features) {
                     if fn_item.is_extern { ctx.extern_functions.push(fn_item.name) }
+                    if function_has_attr(fn_item, "borrowed_return") { ctx.borrowed_return_functions.push(fn_item.name) }
                     ctx_add_function(ctx, fn_item.name, function_ret_type(fn_item), function_param_types(fn_item), generic_param_names(fn_item.generics))
+                    remember_generic_callable(ctx, fn_item.name, fn_item.generics)
                 }
             }
-            Statement::Struct(struct_item) => {
-                collect_struct_fields(ctx, struct_item)
-            }
+            Statement::Struct(struct_item) => { remember_type(ctx, struct_item.name) collect_struct_fields(ctx, struct_item) }
             Statement::EnumItem(enum_item) => {
+                remember_type(ctx, enum_item.name)
                 for variant in enum_item.variants {
                     let mut payload_type = "void"
-                    match variant.tuple_fields.get(0_usize) {
-                        Option[str]::Some(found) => { payload_type = found }
-                        Option[str]::None => {}
-                    }
-                    match variant.named_fields.get(0_usize) {
-                        Option[NamedField]::Some(found) => { payload_type = found.typ }
-                        Option[NamedField]::None => {}
-                    }
+                    match variant.tuple_fields.get(0_usize) { Some(found) => { payload_type = found } None => {} }
+                    match variant.named_fields.get(0_usize) { Some(found) => { payload_type = found.typ } None => {} }
                     ctx.enum_variants.push(EnumVariantType{enum_item.name + "::" + variant.name, enum_item.name, payload_type})
                 }
             }
             Statement::Trait(trait_item) => {
+                remember_type(ctx, trait_item.name)
+                remember_trait(ctx, trait_item.name, trait_item.generics, trait_item.bases, trait_item.methods, trait_item.source_name, trait_item.line, trait_item.column)
                 let trait_generics = generic_param_names(trait_item.generics)
                 for method in trait_item.methods {
                     let mut method_generics = trait_generics
                     for generic_name in generic_param_names(method.generics) { method_generics.push(generic_name) }
                     ctx_add_function(ctx, trait_item.name + "::" + method.name, function_ret_type_for_owner(method, trait_item.name), function_param_types_for_owner(method, trait_item.name), method_generics)
+                    remember_generic_callable(ctx, trait_item.name + "::" + method.name, combined_generic_params(trait_item.generics, method.generics))
                 }
             }
             Statement::Impl(impl_item) => {
+                remember_trait_impl(ctx, impl_item)
                 for method in impl_item.methods {
-                    if function_is_active(method, target) {
+                    if function_is_active(method, target, features) {
                         let mut method_name = method.name
-                        match impl_item.trait_name {
-                            Some(trait_name) => { if trait_name == "Pow" && method.name == "op" { method_name = "pow" } }
-                            None => {}
-                        }
+                        match impl_item.trait_name { Some(trait_name) => { if trait_name == "Pow" && method.name == "op" { method_name = "pow" } } None => {} }
                         let mut method_generics = generic_param_names(impl_item.generics)
                         for generic_name in generic_param_names(method.generics) { method_generics.push(generic_name) }
                         ctx_add_function(ctx, base_type_name(impl_item.target) + "::" + method_name, function_ret_type_for_owner(method, impl_item.target), function_param_types_for_owner(method, impl_item.target), method_generics)
+                        remember_generic_callable(ctx, base_type_name(impl_item.target) + "::" + method_name, combined_generic_params(impl_item.generics, method.generics))
                     }
                 }
             }
             _ => {}
         }
     }
+    validate_trait_declarations(ctx)
     ret ctx
+}
+
+fn remember_type(ctx: mut TranslatorContext, name: str) -> () {
+    for known in ctx.types { if known == name { ret () } }
+    ctx.types.push(name)
+    ret ()
+}
+
+fn remember_trait(ctx: mut TranslatorContext, name: str, generics: Vec[GenericParam], bases: Vec[str], methods: Vec[FunctionItem], source_name: str, line: usize, column: usize) -> () {
+    for known in ctx.traits { if known.name == name { ret () } }
+    ctx.traits.push(TraitType{name, generics, bases, methods, source_name, line, column})
+    ret ()
+}
+
+fn validate_trait_declarations(ctx: mut TranslatorContext) -> () {
+    for trait_item in ctx.traits {
+        for base in trait_item.bases {
+            let base_name = base_type_name(base)
+            match lookup_trait(ctx, base_name) {
+                None => {
+                    translation_error_at(trait_item.source_name, trait_item.line, trait_item.column, "unknown-supertrait", "trait '" + trait_item.name + "' inherits from unknown trait '" + base_name + "'")
+                }
+                Some(base_trait) => {
+                    let actual_arity = generic_args_from_path(base).len()
+                    if actual_arity != base_trait.generics.len() {
+                        translation_error_at(trait_item.source_name, trait_item.line, trait_item.column, "supertrait-generic-arity-mismatch", "supertrait '" + base_name + "' expects " + Debug::fmt(base_trait.generics.len()) + " generic argument(s), got " + Debug::fmt(actual_arity))
+                    }
+                }
+            }
+        }
+        if trait_reaches(ctx, trait_item.name, trait_item.name, Vec[str]::new()) {
+            translation_error_at(trait_item.source_name, trait_item.line, trait_item.column, "cyclic-supertrait", "cyclic supertrait dependency involving '" + trait_item.name + "'")
+        }
+    }
+    ret ()
+}
+
+fn trait_reaches(ctx: mut TranslatorContext, current: str, target: str, visited: Vec[str]) -> bool {
+    if contains_str(visited, current) { ret false }
+    let mut next_visited = visited
+    next_visited.push(current)
+    match lookup_trait(ctx, current) {
+        Some(contract) => {
+            for base in contract.bases {
+                let base_name = base_type_name(base)
+                if base_name == target { ret true }
+                if trait_reaches(ctx, base_name, target, next_visited) { ret true }
+            }
+        }
+        None => {}
+    }
+    ret false
+}
+
+fn remember_trait_impl(ctx: mut TranslatorContext, item: ImplStmt) -> () {
+    match item.trait_name {
+        Option[str]::None => { ret () }
+        Option[str]::Some(trait_name) => {
+            let key = trait_name + "[" + join_strs(item.trait_args, ", ") + "] for " + canonical_type(item.target)
+            for known in ctx.trait_impls {
+                if trait_impl_key(known) == key {
+                    translation_error_at(item.source_name, item.line, item.column, "conflicting-trait-impl", "conflicting implementation of '" + key + "'")
+                }
+            }
+            ctx.trait_impls.push(TraitImplType{trait_name, item.trait_args, canonical_type(item.target), item.generics})
+        }
+    }
+    ret ()
+}
+
+fn trait_impl_key(item: TraitImplType) -> str {
+    ret item.trait_name + "[" + join_strs(item.trait_args, ", ") + "] for " + canonical_type(item.target)
+}
+
+fn combined_generic_params(owner: Vec[GenericParam], method: Vec[GenericParam]) -> Vec[GenericParam] {
+    let mut out = Vec[GenericParam]::new()
+    for generic in owner { out.push(generic) }
+    for generic in method { out.push(generic) }
+    ret out
+}
+
+fn remember_generic_callable(ctx: mut TranslatorContext, name: str, params: Vec[GenericParam]) -> () {
+    if params.len() == 0_usize { ret () }
+    ctx.generic_callables.push(GenericCallable{name, params})
+    ret ()
 }
 
 fn collect_struct_fields(ctx: mut TranslatorContext, item: StructStmt) -> () {
@@ -213,7 +368,12 @@ fn collect_struct_fields(ctx: mut TranslatorContext, item: StructStmt) -> () {
 }
 
 fn ctx_add_function(ctx: mut TranslatorContext, name: str, ret_type: str, params: Vec[str], generics: Vec[str]) -> () {
-    ctx.functions.push(FunctionType{name, ret_type, params, generics})
+    let mut overload_index = 0_usize
+    for function in ctx.functions {
+        if function.name == name { overload_index = overload_index + 1_usize }
+    }
+    let emitted_name = if overload_index == 0_usize { name } else { name + "__overload_" + Debug::fmt(overload_index) }
+    ctx.functions.push(FunctionType{name, emitted_name, ret_type, params, generics})
     ret ()
 }
 
@@ -245,7 +405,8 @@ fn ctx_type_needs_ownership(ctx: mut TranslatorContext, typ: str) -> bool {
     if value == "str" { ret true }
     if starts_with(value, "__tuple_") { ret true }
     if starts_with(value, "dyn ") { ret true }
-    if starts_with(value, "mut ") || ends_with(value, "*") || ends_with(value, "<S>") || ends_with(value, "<H>") { ret false }
+    if ends_with(value, "<H>") { ret true }
+    if starts_with(value, "mut ") || ends_with(value, "*") || ends_with(value, "<S>") { ret false }
     if value == "void" || value == "()" || value == "bool" || is_numeric_type(value) { ret false }
     let owner = base_type_name(value)
     for field in ctx.fields { if field.owner == owner { ret true } }
@@ -261,20 +422,10 @@ fn ctx_type_needs_ownership(ctx: mut TranslatorContext, typ: str) -> bool {
 }
 
 fn ctx_add_owned_var(ctx: mut TranslatorContext, name: str, emitted_name: str, typ: str) -> () {
-    if !ctx_type_needs_ownership(ctx, typ) { ret () }
-    let mut index = 0_usize
-    while index < ctx.owned_vars.len() {
-        match ctx.owned_vars.get(index) {
-            Option[VarType]::Some(item) => {
-                if item.name == name {
-                    ctx.owned_vars.set(index, VarType{name, emitted_name, typ})
-                    ret ()
-                }
-            }
-            Option[VarType]::None => {}
-        }
-        index = index + 1_usize
-    }
+    let ownership_type = if starts_with(typ, "mut ") { value_type_name(typ) } else { typ }
+    if !ctx_type_needs_ownership(ctx, ownership_type) { ret () }
+    // This is a cleanup stack, not a symbol table. Shadowed declarations have
+    // distinct storage and both values must be released when the scope exits.
     ctx.owned_vars.push(VarType{name, emitted_name, typ})
     ret ()
 }
@@ -355,6 +506,93 @@ fn ctx_lookup_function(ctx: mut TranslatorContext, name: str) -> Option[str] {
     ret Option[str]::None
 }
 
+fn function_type_matches(template: str, actual: str, generics: Vec[str]) -> bool {
+    let expected = trim_spaces(canonical_type(value_type_name(template)))
+    let found = trim_spaces(canonical_type(value_type_name(actual)))
+    if expected == found { ret true }
+    for generic in generics {
+        if expected == generic { ret true }
+    }
+    ret false
+}
+
+fn function_matches_args(function: FunctionType, actual_types: Vec[str]) -> bool {
+    if function.params.len() != actual_types.len() { ret false }
+    let mut index = 0_usize
+    while index < function.params.len() {
+        match function.params.get(index) {
+            Option[str]::Some(expected) => {
+                match actual_types.get(index) {
+                    Option[str]::Some(actual) => {
+                        if !function_type_matches(expected, actual, function.generics) { ret false }
+                    }
+                    Option[str]::None => { ret false }
+                }
+            }
+            Option[str]::None => { ret false }
+        }
+        index = index + 1_usize
+    }
+    ret true
+}
+
+fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, name: str, actual_types: Vec[str]) -> Option[FunctionType] {
+    let base = base_type_name(name)
+    let member = enum_variant_name(base)
+    let mut index = 0_usize
+    while index < ctx.functions.len() {
+        match ctx.functions.get(index) {
+            Option[FunctionType]::Some(function) => {
+                if function.name == base && function_matches_args(function, actual_types) {
+                    ret Option[FunctionType]::Some(function)
+                }
+            }
+            Option[FunctionType]::None => {}
+        }
+        index = index + 1_usize
+    }
+    if member == base { ret Option[FunctionType]::None }
+    index = 0_usize
+    while index < ctx.functions.len() {
+        match ctx.functions.get(index) {
+            Option[FunctionType]::Some(function) => {
+                if function.name == member && function_matches_args(function, actual_types) {
+                    ret Option[FunctionType]::Some(function)
+                }
+            }
+            Option[FunctionType]::None => {}
+        }
+        index = index + 1_usize
+    }
+    ret Option[FunctionType]::None
+}
+
+fn plain_function_argument_error(ctx: TranslatorContext, name: str, actual_types: Vec[str]) -> Option[str] {
+    if last_scope_index(name) < name.len() { ret Option[str]::None }
+    let base = base_type_name(name)
+    let mut found = false
+    let mut expected_count = 0_usize
+    for function in ctx.functions {
+        if function.name == base {
+            found = true
+            expected_count = function.params.len()
+            if function.params.len() == actual_types.len() {
+                if function.generics.len() > 0_usize { ret Option[str]::None }
+                ret Option[str]::Some("arguments to '" + name + "' have types [" + join_strs(actual_types, ", ") + "], expected [" + join_strs(function.params, ", ") + "]")
+            }
+        }
+    }
+    if found { ret Option[str]::Some("call to '" + name + "' expects " + Debug::fmt(expected_count) + " argument(s), got " + Debug::fmt(actual_types.len())) }
+    ret Option[str]::None
+}
+
+fn ctx_emitted_declaration_name(ctx: mut TranslatorContext, name: str, params: Vec[str]) -> str {
+    match ctx_lookup_function_for_args(ctx, name, params) {
+        Option[FunctionType]::Some(function) => { ret function.emitted_name }
+        Option[FunctionType]::None => { ret name }
+    }
+}
+
 fn ctx_lookup_function_param(ctx: mut TranslatorContext, name: str, index: usize, generic_args: Vec[str]) -> Option[str] {
     let base_name = base_type_name(name)
     let mut item_index = ctx.functions.len()
@@ -394,6 +632,14 @@ fn ctx_function_is_extern(ctx: mut TranslatorContext, name: str) -> bool {
     ret false
 }
 
+fn ctx_function_returns_borrowed(ctx: mut TranslatorContext, name: str) -> bool {
+    let base = base_type_name(name)
+    for item in ctx.borrowed_return_functions {
+        if item == name || item == base { ret true }
+    }
+    ret false
+}
+
 fn resolve_loop_target(ctx: mut TranslatorContext, label: Option[str], fallback: Option[str], is_continue: bool) -> Option[str] {
     match label {
         Some(name) => {
@@ -409,6 +655,28 @@ fn resolve_loop_target(ctx: mut TranslatorContext, label: Option[str], fallback:
         None => {}
     }
     ret fallback
+}
+
+fn loop_cleanup_start(ctx: mut TranslatorContext, label: Option[str]) -> usize {
+    let mut index = ctx.loop_targets.len()
+    while index > 0_usize {
+        index = index - 1_usize
+        match ctx.loop_targets.get(index) {
+            Some(target) => {
+                match label {
+                    Some(name) => { if target.name == name { ret target.owned_start } }
+                    None => { ret target.owned_start }
+                }
+            }
+            None => {}
+        }
+    }
+    ret ctx.owned_vars.len()
+}
+
+fn loop_label_name(label: Option[str]) -> str {
+    match label { Some(name) => { ret name } None => {} }
+    ret ""
 }
 
 fn generic_param_names(params: Vec[GenericParam]) -> Vec[str] {
@@ -626,35 +894,44 @@ fn method_owner_name(receiver_type: str) -> str {
     ret leaf_type_name(base_type_name(receiver_type))
 }
 
-fn method_return_type(receiver_type: str, method_name: str) -> str {
+fn method_return_type(receiver_type: str, method_name: str, source_name: str, line: usize, column: usize) -> str {
     if receiver_type == "Iter" && method_name == "next" { ret "__tuple_2[Iter, Option[T]]" }
     if starts_with(receiver_type, "dyn ") {
-        ret dyn_method_return_type(receiver_type, method_name)
+        let resolved = dyn_method_return_type(receiver_type, method_name)
+        if resolved != "" { ret resolved }
+        translation_error_at(source_name, line, column, "unknown-method", "type '" + receiver_type + "' has no method '" + method_name + "'")
     }
     let owner = method_owner_name(receiver_type)
     if owner == "Iter" && method_name == "next" { ret "__tuple_2[Iter, Option[T]]" }
     if owner == "Vec" {
-        ret vec_method_return_type(receiver_type, method_name)
+        let resolved = vec_method_return_type(receiver_type, method_name)
+        if resolved != "" { ret resolved }
     }
     if owner == "VecIter" {
-        ret vec_iter_method_return_type(receiver_type, method_name)
+        let resolved = vec_iter_method_return_type(receiver_type, method_name)
+        if resolved != "" { ret resolved }
     }
     if owner == "Option" {
-        ret option_method_return_type(receiver_type, method_name)
+        let resolved = option_method_return_type(receiver_type, method_name)
+        if resolved != "" { ret resolved }
     }
     if owner == "Result" {
-        ret result_method_return_type(receiver_type, method_name)
+        let resolved = result_method_return_type(receiver_type, method_name)
+        if resolved != "" { ret resolved }
     }
     if owner == "String" {
-        ret string_method_return_type(method_name)
+        let resolved = string_method_return_type(method_name)
+        if resolved != "" { ret resolved }
     }
     if owner == "str" {
-        ret str_method_return_type(method_name)
+        let resolved = str_method_return_type(method_name)
+        if resolved != "" { ret resolved }
     }
     if owner == "Path" {
-        ret path_method_return_type(method_name)
+        let resolved = path_method_return_type(method_name)
+        if resolved != "" { ret resolved }
     }
-    panic("Unable to resolve method return type for '" + owner + "::" + method_name + "'")
+    translation_error_at(source_name, line, column, "unknown-method", "type '" + receiver_type + "' has no method '" + method_name + "'")
     ret "void"
 }
 
@@ -662,8 +939,7 @@ fn dyn_method_return_type(receiver_type: str, method_name: str) -> str {
     let trait_name = receiver_type.slice(4_usize, receiver_type.len() - 4_usize)
     if trait_name == "LogSink" && method_name == "write" { ret "i32" }
     if trait_name == "Writable" && method_name == "write" { ret "i32" }
-    panic("Unable to resolve dyn method return type for '" + trait_name + "::" + method_name + "'")
-    ret "void"
+    ret ""
 }
 
 fn vec_method_return_type(receiver_type: str, method_name: str) -> str {
@@ -683,24 +959,21 @@ fn vec_method_return_type(receiver_type: str, method_name: str) -> str {
     if method_name == "iter" { ret "VecIter[" + first_generic_type(receiver_type) + "]" }
     if method_name == "into_iter" { ret "VecIter[" + first_generic_type(receiver_type) + "]" }
     if method_name == "fmt" { ret "str" }
-    panic("Unable to resolve Vec method return type for '" + method_name + "'")
-    ret "void"
+    ret ""
 }
 
 fn vec_iter_method_return_type(receiver_type: str, method_name: str) -> str {
     if method_name == "iter" { ret receiver_type }
     if method_name == "next" { ret "__tuple_2[" + receiver_type + ", Option[" + first_generic_type(receiver_type) + "]]" }
     if method_name == "into_iter" { ret receiver_type }
-    panic("Unable to resolve VecIter method return type for '" + method_name + "'")
-    ret "void"
+    ret ""
 }
 
 fn option_method_return_type(receiver_type: str, method_name: str) -> str {
     if method_name == "is_some" { ret "bool" }
     if method_name == "is_none" { ret "bool" }
     if method_name == "unwrap_or" { ret first_generic_type(receiver_type) }
-    panic("Unable to resolve Option method return type for '" + method_name + "'")
-    ret "void"
+    ret ""
 }
 
 fn result_method_return_type(receiver_type: str, method_name: str) -> str {
@@ -708,15 +981,13 @@ fn result_method_return_type(receiver_type: str, method_name: str) -> str {
     if method_name == "is_err" { ret "bool" }
     if method_name == "unwrap_or" { ret nth_generic_type(receiver_type, 0_usize) }
     if method_name == "unwrap_err_or" { ret nth_generic_type(receiver_type, 1_usize) }
-    panic("Unable to resolve Result method return type for '" + method_name + "'")
-    ret "void"
+    ret ""
 }
 
 fn string_method_return_type(method_name: str) -> str {
     if method_name == "len" { ret "usize" }
     if method_name == "byte_at" { ret "Option[u8]" }
-    panic("Unable to resolve String method return type for '" + method_name + "'")
-    ret "void"
+    ret ""
 }
 
 fn str_method_return_type(method_name: str) -> str {
@@ -726,16 +997,14 @@ fn str_method_return_type(method_name: str) -> str {
     if method_name == "get" { ret "Option[str]" }
     if method_name == "get_byte" || method_name == "get_byte_at" { ret "Option[u8]" }
     if method_name == "slice" || method_name == "slice_bytes" || method_name == "slice_chars" || method_name == "concat" { ret "str" }
-    panic("Unable to resolve str method return type for '" + method_name + "'")
-    ret "void"
+    ret ""
 }
 
 fn path_method_return_type(method_name: str) -> str {
     if method_name == "as_str" { ret "str" }
     if method_name == "exists" { ret "bool" }
     if method_name == "read_text" { ret "str" }
-    panic("Unable to resolve Path method return type for '" + method_name + "'")
-    ret "void"
+    ret ""
 }
 
 fn first_generic_type(receiver_type: str) -> str {
@@ -746,7 +1015,7 @@ fn nth_generic_type(receiver_type: str, target_index: usize) -> str {
     let value = value_type_name(receiver_type)
     let open = find_char(value, "[", 0_usize)
     if open >= value.len() {
-        panic("Unable to resolve generic argument for type '" + value + "'")
+        translation_invariant_error("unable to resolve a generic argument for type '" + value + "'")
         ret "void"
     }
 
@@ -774,7 +1043,7 @@ fn nth_generic_type(receiver_type: str, target_index: usize) -> str {
                     if generic_index == target_index {
                         ret canonical_type(value.slice(start, index - start))
                     }
-                    panic("Unable to resolve generic argument index in type '" + value + "'")
+                    translation_invariant_error("generic argument index is out of range for type '" + value + "'")
                     ret "void"
                 }
                 depth = depth - 1_usize
@@ -795,7 +1064,7 @@ fn nth_generic_type(receiver_type: str, target_index: usize) -> str {
         index = index + 1_usize
     }
 
-    panic("Unterminated generic argument list in type '" + value + "'")
+    translation_invariant_error("unterminated generic argument list in canonical type '" + value + "'")
     ret "void"
 }
 
@@ -999,22 +1268,32 @@ fn translate_trait(ctx: mut TranslatorContext, item: TraitStmt) -> EhirTextBuild
 }
 
 fn translate_function(ctx: mut TranslatorContext, fn_item: FunctionItem) -> EhirTextBuilder {
-    ret translate_function_named(ctx, fn_item, fn_item.name, function_ret_type(fn_item))
+    let emitted_name = if fn_item.is_extern { fn_item.name } else {
+        ctx_emitted_declaration_name(ctx, fn_item.name, function_param_types(fn_item))
+    }
+    ret translate_function_named(ctx, fn_item, emitted_name, function_ret_type(fn_item), Vec[GenericParam]::new())
 }
 
-fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, emitted_name: str, ret_type: str) -> EhirTextBuilder {
+fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, emitted_name: str, ret_type: str, scope_generics: Vec[GenericParam]) -> EhirTextBuilder {
     ctx.vars = Vec[VarType]::new()
     ctx.owned_vars = Vec[VarType]::new()
     ctx.return_type = canonical_type(ret_type)
-    ensure_object_safe_type(ctx, ctx.return_type)
+    ctx.active_generics = combined_generic_params(scope_generics, fn_item.generics)
+    let mut signature_generics = generic_param_names(ctx.active_generics)
+    for generic in generic_args_from_path(ctx.self_type) { if !contains_str(signature_generics, generic) { signature_generics.push(generic) } }
+    ensure_known_signature_type(ctx, ctx.return_type, signature_generics, fn_item.source_name, fn_item.line, fn_item.column)
+    ensure_object_safe_type(ctx, ctx.return_type, fn_item.source_name, fn_item.line, fn_item.column)
     for param in fn_item.params {
         let raw_param_type = unwrap_type_or_usize(param.typ)
         let param_type = if param.name == "self" && ctx.self_type != "" {
             if starts_with(raw_param_type, "mut ") { "mut " + ctx.self_type } else { ctx.self_type }
         } else { self_context_type(ctx, raw_param_type) }
-        ensure_object_safe_type(ctx, param_type)
+        ensure_known_signature_type(ctx, param_type, signature_generics, fn_item.source_name, fn_item.line, fn_item.column)
+        ensure_object_safe_type(ctx, param_type, fn_item.source_name, fn_item.line, fn_item.column)
         ctx_add_var(ctx, param.name, param_type)
-        ctx_add_owned_var(ctx, param.name, param.name, param_type)
+        // `mut T` parameters borrow caller-owned storage. Mutable locals are
+        // registered separately and own the value stored in their stack slot.
+        if !starts_with(param_type, "mut ") { ctx_add_owned_var(ctx, param.name, param.name, param_type) }
     }
 
     let mut builder = EhirTextBuilder::new()
@@ -1048,14 +1327,29 @@ fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, e
     ret builder
 }
 
-fn ensure_object_safe_type(ctx: mut TranslatorContext, typ: str) -> () {
+fn ensure_known_signature_type(ctx: TranslatorContext, typ: str, generics: Vec[str], source_name: str, line: usize, column: usize) -> () {
+    let mut value = trim_spaces(canonical_type(value_type_name(typ)))
+    if starts_with(value, "dyn ") { value = trim_spaces(value.slice(4_usize, value.len() - 4_usize)) }
+    let base = base_type_name(value)
+    if base == "" || base == "()" || base == "void" || base == "Self" || base == "bool" || base == "u1" || base == "str" || base == "usize" || base == "isize" || is_numeric_type(base) || starts_with(base, "__tuple_") || starts_with(base, "__array_") {
+        ret ()
+    }
+    if contains_str(generics, base) { ret () }
+    let mut known = false
+    for candidate in ctx.types { if candidate == base { known = true } }
+    if !known { translation_error_at(source_name, line, column, "unknown-type", "unknown type '" + base + "'") }
+    for argument in generic_args_from_path(value) { ensure_known_signature_type(ctx, argument, generics, source_name, line, column) }
+    ret ()
+}
+
+fn ensure_object_safe_type(ctx: mut TranslatorContext, typ: str, source_name: str, line: usize, column: usize) -> () {
     let value = canonical_type(typ)
     if !starts_with(value, "dyn ") { ret () }
     let trait_name = value.slice(4_usize, value.len() - 4_usize)
     let prefix = trait_name + "::"
     for function in ctx.functions {
         if starts_with(function.name, prefix) && base_type_name(function.ret_type) == trait_name {
-            panic("Trait '" + trait_name + "' is not object-safe because method '" + function.name.slice(prefix.len(), function.name.len() - prefix.len()) + "' returns Self")
+            translation_error_at(source_name, line, column, "object-unsafe-trait", "trait '" + trait_name + "' is not object-safe because method '" + function.name.slice(prefix.len(), function.name.len() - prefix.len()) + "' returns Self")
         }
     }
     ret ()
@@ -1079,6 +1373,7 @@ fn owner_context_type(owner: str, typ: str) -> str {
 }
 
 fn translate_impl(ctx: mut TranslatorContext, item: ImplStmt) -> EhirTextBuilder {
+    validate_trait_impl(ctx, item)
     let mut builder = EhirTextBuilder::new()
     let mut header = "impl"
     if item.generics.len() > 0_usize {
@@ -1106,19 +1401,305 @@ fn translate_impl(ctx: mut TranslatorContext, item: ImplStmt) -> EhirTextBuilder
     let old_self_type = ctx.self_type + ""
     ctx.self_type = item.target + ""
     for method in item.methods {
-        if function_is_active(method, ctx.target) {
+        if function_is_active(method, ctx.target, ctx.features) {
             let ret_type = function_ret_type_for_owner(method, item.target)
             let mut emitted_method_name = method.name
             match item.trait_name {
                 Some(trait_name) => { if trait_name == "Pow" && method.name == "op" { emitted_method_name = "pow" } }
                 None => {}
             }
-            builder = builder.append(translate_function_named(ctx, method, emitted_method_name, ret_type))
+            builder = builder.append(translate_function_named(ctx, method, emitted_method_name, ret_type, item.generics))
         }
     }
     ctx.self_type = old_self_type
     builder = builder.line("}")
     ret builder
+}
+
+fn validate_trait_impl(ctx: mut TranslatorContext, item: ImplStmt) -> () {
+    match item.trait_name {
+        Option[str]::None => { ret () }
+        Option[str]::Some(trait_name) => {
+            let trait_contract = lookup_trait(ctx, trait_name)
+            match trait_contract {
+                Option[TraitType]::None => {
+                    translation_error_at(item.source_name, item.line, item.column, "unknown-trait", "unknown trait '" + trait_name + "'")
+                }
+                Option[TraitType]::Some(contract) => {
+                    if contract.generics.len() != item.trait_args.len() {
+                        translation_error_at(item.source_name, item.line, item.column, "trait-generic-arity-mismatch", "trait '" + trait_name + "' expects " + Debug::fmt(contract.generics.len()) + " generic argument(s), got " + Debug::fmt(item.trait_args.len()))
+                    }
+                    validate_trait_argument_bounds(ctx, contract, item)
+                }
+            }
+            let prefix = trait_name + "::"
+            for method in item.methods {
+                let contract = trait_method_contract(ctx, trait_name, method.name)
+                match contract {
+                    Option[FunctionType]::None => {
+                        translation_error_at(method.source_name, method.line, method.column, "unknown-trait-method", "method '" + method.name + "' is not declared by trait '" + trait_name + "'")
+                    }
+                    Option[FunctionType]::Some(expected) => {
+                        let actual_params = function_param_types_for_owner(method, item.target)
+                        if expected.params.len() != actual_params.len() {
+                            translation_error_at(method.source_name, method.line, method.column, "trait-method-signature-mismatch", "method '" + method.name + "' has " + Debug::fmt(actual_params.len()) + " parameter(s), but trait '" + trait_name + "' requires " + Debug::fmt(expected.params.len()))
+                        }
+                        let contract_owner = function_owner_name(expected.name)
+                        let mut trait_generic_count = 0_usize
+                        match lookup_trait(ctx, contract_owner) { Some(owner_trait) => { trait_generic_count = owner_trait.generics.len() } None => {} }
+                        let expected_method_generics = if expected.generics.len() >= trait_generic_count { expected.generics.len() - trait_generic_count } else { 0_usize }
+                        if expected_method_generics != method.generics.len() {
+                            translation_error_at(method.source_name, method.line, method.column, "trait-method-generic-arity-mismatch", "method '" + method.name + "' declares " + Debug::fmt(method.generics.len()) + " generic parameter(s), but trait '" + contract_owner + "' requires " + Debug::fmt(expected_method_generics))
+                        }
+                        match trait_method_declaration(ctx, trait_name, method.name) {
+                            Some(declaration) => { validate_trait_method_bounds(ctx, declaration, method) }
+                            None => {}
+                        }
+                        let mut specialization_args = trait_args_for_owner(ctx, trait_name, item.trait_args, contract_owner)
+                        for generic_name in generic_param_names(method.generics) { specialization_args.push(generic_name) }
+                        validate_trait_method_types(expected, actual_params, function_ret_type_for_owner(method, item.target), item.target, specialization_args, method)
+                    }
+                }
+            }
+            ensure_trait_methods_implemented(ctx, item, trait_name, trait_name)
+        }
+    }
+    ret ()
+}
+
+fn validate_trait_argument_bounds(ctx: mut TranslatorContext, contract: TraitType, item: ImplStmt) -> () {
+    let mut index = 0_usize
+    while index < contract.generics.len() && index < item.trait_args.len() {
+        match contract.generics.get(index) {
+            Some(parameter) => {
+                match item.trait_args.get(index) {
+                    Some(argument) => {
+                        for bound in parameter.bounds {
+                            if !type_satisfies_trait_bound(ctx, item.generics, argument, bound.path) {
+                                translation_error_at(item.source_name, item.line, item.column, "trait-bound-not-satisfied", "type '" + canonical_type(argument) + "' does not satisfy bound '" + bound.path + "' for generic parameter '" + parameter.name + "' of trait '" + contract.name + "'")
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret ()
+}
+
+fn type_satisfies_trait_bound(ctx: mut TranslatorContext, impl_generics: Vec[GenericParam], typ: str, required_trait: str) -> bool {
+    let canonical = canonical_type(typ)
+    for generic in impl_generics {
+        if generic.name == canonical {
+            for bound in generic.bounds {
+                if trait_inherits_from(ctx, base_type_name(bound.path), base_type_name(required_trait)) { ret true }
+            }
+            ret false
+        }
+    }
+    for implementation in ctx.trait_impls {
+        if trait_impl_target_matches(ctx, implementation, canonical) {
+            if trait_inherits_from(ctx, implementation.trait_name, base_type_name(required_trait)) { ret true }
+        }
+    }
+    ret false
+}
+
+fn trait_impl_target_matches(ctx: mut TranslatorContext, implementation: TraitImplType, concrete: str) -> bool {
+    let template = canonical_type(implementation.target)
+    if template == concrete { ret true }
+    if base_type_name(template) != base_type_name(concrete) { ret false }
+    let template_args = generic_args_from_path(template)
+    let concrete_args = generic_args_from_path(concrete)
+    if template_args.len() != concrete_args.len() { ret false }
+    let mut index = 0_usize
+    while index < template_args.len() {
+        match template_args.get(index) {
+            Some(template_arg) => {
+                match concrete_args.get(index) {
+                    Some(concrete_arg) => {
+                        let mut matched_generic = false
+                        for generic in implementation.generics {
+                            if generic.name == template_arg {
+                                matched_generic = true
+                                for bound in generic.bounds {
+                                    if !type_satisfies_trait_bound(ctx, Vec[GenericParam]::new(), concrete_arg, bound.path) { ret false }
+                                }
+                            }
+                        }
+                        if !matched_generic && canonical_type(template_arg) != canonical_type(concrete_arg) { ret false }
+                    }
+                    None => { ret false }
+                }
+            }
+            None => { ret false }
+        }
+        index = index + 1_usize
+    }
+    ret true
+}
+
+fn trait_inherits_from(ctx: mut TranslatorContext, candidate: str, required: str) -> bool {
+    if candidate == required { ret true }
+    match lookup_trait(ctx, candidate) {
+        Some(contract) => {
+            for base in contract.bases {
+                if trait_inherits_from(ctx, base_type_name(base), required) { ret true }
+            }
+        }
+        None => {}
+    }
+    ret false
+}
+
+fn lookup_trait(ctx: mut TranslatorContext, name: str) -> Option[TraitType] {
+    for trait_item in ctx.traits {
+        if trait_item.name == name { ret Option[TraitType]::Some(trait_item) }
+    }
+    ret Option[TraitType]::None
+}
+
+fn function_owner_name(name: str) -> str {
+    let scope = last_scope_index(name)
+    if scope < name.len() { ret name.slice(0_usize, scope) }
+    ret ""
+}
+
+fn trait_args_for_owner(ctx: mut TranslatorContext, root_trait: str, root_args: Vec[str], owner: str) -> Vec[str] {
+    if root_trait == owner { ret root_args }
+    match lookup_trait(ctx, root_trait) {
+        Some(contract) => {
+            let root_params = generic_param_names(contract.generics)
+            for base in contract.bases {
+                let base_name = base_type_name(base)
+                let mut base_args = Vec[str]::new()
+                for arg in generic_args_from_path(base) { base_args.push(specialize_named_type(arg, root_params, root_args)) }
+                if base_name == owner { ret base_args }
+                let nested = trait_args_for_owner(ctx, base_name, base_args, owner)
+                if nested.len() > 0_usize { ret nested }
+            }
+        }
+        None => {}
+    }
+    ret Vec[str]::new()
+}
+
+fn trait_method_contract(ctx: mut TranslatorContext, trait_name: str, method_name: str) -> Option[FunctionType] {
+    let name = trait_name + "::" + method_name
+    for function in ctx.functions {
+        if function.name == name { ret Option[FunctionType]::Some(function) }
+    }
+    match lookup_trait(ctx, trait_name) {
+        Some(contract) => {
+            for base in contract.bases {
+                match trait_method_contract(ctx, base_type_name(base), method_name) {
+                    Some(found) => { ret Option[FunctionType]::Some(found) }
+                    None => {}
+                }
+            }
+        }
+        None => {}
+    }
+    ret Option[FunctionType]::None
+}
+
+fn trait_method_declaration(ctx: mut TranslatorContext, trait_name: str, method_name: str) -> Option[FunctionItem] {
+    match lookup_trait(ctx, trait_name) {
+        Some(contract) => {
+            for method in contract.methods {
+                if method.name == method_name { ret Option[FunctionItem]::Some(method) }
+            }
+            for base in contract.bases {
+                match trait_method_declaration(ctx, base_type_name(base), method_name) {
+                    Some(found) => { ret Option[FunctionItem]::Some(found) }
+                    None => {}
+                }
+            }
+        }
+        None => {}
+    }
+    ret Option[FunctionItem]::None
+}
+
+fn validate_trait_method_bounds(ctx: mut TranslatorContext, expected: FunctionItem, actual: FunctionItem) -> () {
+    let mut index = 0_usize
+    while index < actual.generics.len() && index < expected.generics.len() {
+        match actual.generics.get(index) {
+            Some(actual_generic) => {
+                match expected.generics.get(index) {
+                    Some(expected_generic) => {
+                        for actual_bound in actual_generic.bounds {
+                            let mut implied = false
+                            for expected_bound in expected_generic.bounds {
+                                if trait_inherits_from(ctx, base_type_name(expected_bound.path), base_type_name(actual_bound.path)) { implied = true }
+                            }
+                            if !implied {
+                                translation_error_at(actual.source_name, actual.line, actual.column, "trait-method-bound-mismatch", "generic parameter '" + actual_generic.name + "' of method '" + actual.name + "' adds bound '" + actual_bound.path + "' not required by the trait")
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret ()
+}
+
+fn ensure_trait_methods_implemented(ctx: mut TranslatorContext, item: ImplStmt, trait_name: str, root_trait_name: str) -> () {
+    let prefix = trait_name + "::"
+    for expected in ctx.functions {
+        if starts_with(expected.name, prefix) {
+            let method_name = expected.name.slice(prefix.len(), expected.name.len() - prefix.len())
+            if !impl_declares_method(item, method_name) {
+                translation_error_at(item.source_name, item.line, item.column, "missing-trait-method", "implementation of trait '" + root_trait_name + "' for '" + item.target + "' is missing method '" + method_name + "'")
+            }
+        }
+    }
+    match lookup_trait(ctx, trait_name) {
+        Some(contract) => {
+            for base in contract.bases { ensure_trait_methods_implemented(ctx, item, base_type_name(base), root_trait_name) }
+        }
+        None => {}
+    }
+    ret ()
+}
+
+fn impl_declares_method(item: ImplStmt, name: str) -> bool {
+    for method in item.methods { if method.name == name { ret true } }
+    ret false
+}
+
+fn validate_trait_method_types(expected: FunctionType, actual_params: Vec[str], actual_ret: str, target: str, specialization_args: Vec[str], method: FunctionItem) -> () {
+    let contract_owner = function_owner_name(expected.name)
+    let mut index = 0_usize
+    while index < expected.params.len() {
+        match expected.params.get(index) {
+            Some(raw_expected) => {
+                match actual_params.get(index) {
+                    Some(actual) => {
+                        let specialized = replace_type_token(specialize_named_type(raw_expected, expected.generics, specialization_args), contract_owner, canonical_type(target))
+                        if canonical_type(specialized) != canonical_type(actual) {
+                            translation_error_at(method.source_name, method.line, method.column, "trait-method-signature-mismatch", "parameter " + Debug::fmt(index + 1_usize) + " of method '" + method.name + "' has type '" + canonical_type(actual) + "', expected '" + canonical_type(specialized) + "'")
+                        }
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    let expected_ret = replace_type_token(specialize_named_type(expected.ret_type, expected.generics, specialization_args), contract_owner, canonical_type(target))
+    if canonical_type(expected_ret) != canonical_type(actual_ret) {
+        translation_error_at(method.source_name, method.line, method.column, "trait-method-signature-mismatch", "method '" + method.name + "' returns '" + canonical_type(actual_ret) + "', expected '" + canonical_type(expected_ret) + "'")
+    }
+    ret ()
 }
 
 fn translate_statements(
@@ -1192,6 +1773,7 @@ fn translate_statements(
             }
             Statement::Break(label) => {
                 builder = builder.append(translate_with_cleanups(ctx, prefix + "_break_cleanup_" + Debug::fmt(i)))
+                builder = append_owned_drops_from(ctx, builder, "", prefix + "_break_scope_" + Debug::fmt(i), loop_cleanup_start(ctx, label))
                 match resolve_loop_target(ctx, label, break_label, false) {
                     Option[str]::Some(target) => {
                         builder = builder.instr("br $" + target)
@@ -1201,6 +1783,7 @@ fn translate_statements(
             }
             Statement::Continue(label) => {
                 builder = builder.append(translate_with_cleanups(ctx, prefix + "_continue_cleanup_" + Debug::fmt(i)))
+                builder = append_owned_drops_from(ctx, builder, "", prefix + "_continue_scope_" + Debug::fmt(i), loop_cleanup_start(ctx, label))
                 match resolve_loop_target(ctx, label, continue_label, true) {
                     Option[str]::Some(target) => {
                         builder = builder.instr("br $" + target)
@@ -1279,6 +1862,7 @@ fn translate_statements_no_default(
             }
             Statement::Break(label) => {
                 builder = builder.append(translate_with_cleanups(ctx, prefix + "_break_cleanup_" + Debug::fmt(i)))
+                builder = append_owned_drops_from(ctx, builder, "", prefix + "_break_scope_" + Debug::fmt(i), loop_cleanup_start(ctx, label))
                 match resolve_loop_target(ctx, label, break_label, false) {
                     Option[str]::Some(target) => {
                         builder = builder.instr("br $" + target)
@@ -1288,6 +1872,7 @@ fn translate_statements_no_default(
             }
             Statement::Continue(label) => {
                 builder = builder.append(translate_with_cleanups(ctx, prefix + "_continue_cleanup_" + Debug::fmt(i)))
+                builder = append_owned_drops_from(ctx, builder, "", prefix + "_continue_scope_" + Debug::fmt(i), loop_cleanup_start(ctx, label))
                 match resolve_loop_target(ctx, label, continue_label, true) {
                     Option[str]::Some(target) => {
                         builder = builder.instr("br $" + target)
@@ -1321,13 +1906,22 @@ fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str
             }
         }
     }
-    let borrowed_copy = expr_is_borrowed_copy(let_stmt.expr)
+    let borrowed_copy = expr_is_borrowed_copy(let_stmt.expr) || expr_returns_borrowed(ctx, let_stmt.expr)
     match let_stmt.typ {
         Option[str]::Some(explicit_type) => { ctx.expression_hint = canonical_type(explicit_type) }
         Option[str]::None => { ctx.expression_hint = "" }
     }
     let lowered = lower_expr(ctx, let_stmt.expr, prefix + "_let", idx)
     ctx.expression_hint = ""
+    match let_stmt.typ {
+        Option[str]::Some(explicit_type) => {
+            let numeric_literal_coercion = expr_is_numeric_literal(let_stmt.expr) && is_numeric_type(value_type_name(explicit_type)) && is_numeric_type(value_type_name(lowered.typ))
+            if !numeric_literal_coercion && !function_type_matches(explicit_type, lowered.typ, Vec[str]::new()) {
+                translation_error_at(let_stmt.expr.source_name, let_stmt.expr.line, let_stmt.expr.column, "type-mismatch", "cannot initialize '" + let_stmt.name + "' of type '" + canonical_type(value_type_name(explicit_type)) + "' with value of type '" + canonical_type(value_type_name(lowered.typ)) + "'")
+            }
+        }
+        Option[str]::None => {}
+    }
     let mut builder = lowered.code
     let mut typ = lowered.typ
     match let_stmt.typ {
@@ -1349,6 +1943,9 @@ fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str
         ctx_add_owned_var(ctx, let_stmt.name, emitted_name, "mut " + typ)
         builder = builder.instr(emitted_name + ": " + typ + "* = salloc " + typ)
         builder = builder.instr("store " + lowered.value + ", " + emitted_name)
+        if ctx_type_needs_ownership(ctx, typ) {
+            builder = builder.instr("drop " + lowered.value + ": " + typ)
+        }
         ret builder
     }
     ctx_add_var_emitted(ctx, let_stmt.name, emitted_name, typ)
@@ -1357,11 +1954,32 @@ fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str
     ret builder
 }
 
+fn expr_is_numeric_literal(expr: ExprNode) -> bool {
+    match expr.value {
+        Expr::Integer(_) => { ret true }
+        Expr::Float(_) => { ret true }
+        Expr::Parenthesized(inner) => { ret expr_h_is_numeric_literal(inner) }
+        _ => { ret false }
+    }
+    ret false
+}
+
+fn expr_h_is_numeric_literal(expr: ExprNode<H>) -> bool {
+    match expr.value {
+        Expr::Integer(_) => { ret true }
+        Expr::Float(_) => { ret true }
+        Expr::Parenthesized(inner) => { ret expr_h_is_numeric_literal(inner) }
+        _ => { ret false }
+    }
+    ret false
+}
+
 fn expr_is_borrowed_copy(expr: ExprNode) -> bool {
     match expr.value {
         Expr::Path(_) => { ret true }
         Expr::Field(_) => { ret true }
         Expr::Index(_) => { ret true }
+        Expr::Block(block) => { ret expr_h_is_borrowed_copy(block.tail) }
         Expr::Parenthesized(inner) => { ret expr_h_is_borrowed_copy(inner) }
         _ => { ret false }
     }
@@ -1373,8 +1991,42 @@ fn expr_h_is_borrowed_copy(expr: ExprNode<H>) -> bool {
         Expr::Path(_) => { ret true }
         Expr::Field(_) => { ret true }
         Expr::Index(_) => { ret true }
+        Expr::Block(block) => { ret expr_h_is_borrowed_copy(block.tail) }
         Expr::Parenthesized(inner) => { ret expr_h_is_borrowed_copy(inner) }
         _ => { ret false }
+    }
+    ret false
+}
+
+fn expr_returns_borrowed(ctx: mut TranslatorContext, expr: ExprNode) -> bool {
+    match expr.value {
+        Expr::Call(call_expr) => { ret ctx_function_returns_borrowed(ctx, expr_h_path_or_empty(call_expr.callee)) }
+        Expr::Block(block) => { ret expr_h_returns_borrowed(ctx, block.tail) }
+        Expr::Parenthesized(inner) => { ret expr_h_returns_borrowed(ctx, inner) }
+        Expr::Unsafe(block) => {
+            if block.statements.len() == 0_usize { ret false }
+            match block.statements.get(block.statements.len() - 1_usize) {
+                Option[Statement]::Some(tail_stmt) => {
+                    match tail_stmt {
+                        Statement::Expr(tail) => { ret expr_returns_borrowed(ctx, tail) }
+                        Statement::Ret(tail) => { ret expr_returns_borrowed(ctx, tail) }
+                        _ => {}
+                    }
+                }
+                Option[Statement]::None => {}
+            }
+        }
+        _ => {}
+    }
+    ret false
+}
+
+fn expr_h_returns_borrowed(ctx: mut TranslatorContext, expr: ExprNode<H>) -> bool {
+    match expr.value {
+        Expr::Call(call_expr) => { ret ctx_function_returns_borrowed(ctx, expr_h_path_or_empty(call_expr.callee)) }
+        Expr::Block(block) => { ret expr_h_returns_borrowed(ctx, block.tail) }
+        Expr::Parenthesized(inner) => { ret expr_h_returns_borrowed(ctx, inner) }
+        _ => {}
     }
     ret false
 }
@@ -1387,47 +2039,54 @@ fn translate_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assignment
     }
 
     if assign_stmt.operator == "=" {
-        let borrowed_rhs = expr_is_borrowed_copy(assign_stmt.expr)
-        let lowered = lower_expr(ctx, assign_stmt.expr, prefix + "_assign", idx)
+        let borrowed_rhs = expr_is_borrowed_copy(assign_stmt.expr) || expr_returns_borrowed(ctx, assign_stmt.expr)
+        let mut lowered = lower_expr(ctx, assign_stmt.expr, prefix + "_assign", idx)
         builder = builder.append(lowered.code)
+        let mut target_type = ""
         match ctx_lookup_var(ctx, target) {
-            Option[str]::Some(target_type) => {
-                if starts_with(target_type, "mut ") {
-                    let value_type = value_type_name(target_type)
-                    let target_value = ctx_lookup_value_name(ctx, target)
-                    if ctx_type_needs_ownership(ctx, value_type) {
-                        let old_name = prefix + "_assign_old_" + Debug::fmt(idx) + "_" + lowered.value
-                        builder = builder.instr(old_name + ": " + value_type + " = load " + target_value)
-                        if borrowed_rhs { builder = builder.instr("retain " + lowered.value + ": " + value_type) }
-                        builder = builder.instr("store " + lowered.value + ", " + target_value)
-                        if !borrowed_rhs { builder = builder.instr("drop " + lowered.value + ": " + value_type) }
-                        ret builder.instr("drop " + old_name + ": " + value_type)
-                    }
-                    ret builder.instr("store " + lowered.value + ", " + target_value)
-                }
-                if ctx_type_needs_ownership(ctx, target_type) {
-                    if borrowed_rhs { builder = builder.instr("retain " + lowered.value + ": " + target_type) }
-                    builder = builder.instr("drop " + ctx_lookup_value_name(ctx, target) + ": " + target_type)
-                }
+            Option[str]::Some(found) => { target_type = found }
+            Option[str]::None => { translation_error_at(assign_stmt.target.source_name, assign_stmt.target.line, assign_stmt.target.column, "unknown-variable", "unknown variable '" + target + "'") }
+        }
+        let value_type = canonical_type(value_type_name(target_type))
+        if is_numeric_type(value_type) && is_numeric_type(lowered.typ) && value_type != canonical_type(value_type_name(lowered.typ)) {
+            let cast_name = prefix + "_assign_cast_" + Debug::fmt(idx)
+            builder = builder.instr(cast_name + ": " + value_type + " = pcast " + lowered.value + ": " + lowered.typ + ", " + value_type)
+            lowered = LoweredExpr{EhirTextBuilder::new(), cast_name, value_type}
+        } elif !function_type_matches(value_type, lowered.typ, Vec[str]::new()) {
+            translation_error_at(assign_stmt.expr.source_name, assign_stmt.expr.line, assign_stmt.expr.column, "assignment-type-mismatch", "cannot assign value of type '" + canonical_type(value_type_name(lowered.typ)) + "' to variable '" + target + "' of type '" + value_type + "'")
+        }
+        if starts_with(target_type, "mut ") {
+            let target_value = ctx_lookup_value_name(ctx, target)
+            if ctx_type_needs_ownership(ctx, value_type) {
+                let old_name = prefix + "_assign_old_" + Debug::fmt(idx) + "_" + lowered.value
+                builder = builder.instr(old_name + ": " + value_type + " = load " + target_value)
+                builder = builder.instr("store " + lowered.value + ", " + target_value)
+                if !borrowed_rhs { builder = builder.instr("drop " + lowered.value + ": " + value_type) }
+                ret builder.instr("drop " + old_name + ": " + value_type)
             }
-            Option[str]::None => {}
+            ret builder.instr("store " + lowered.value + ", " + target_value)
+        }
+        if ctx_type_needs_ownership(ctx, target_type) {
+            if borrowed_rhs { builder = builder.instr("retain " + lowered.value + ": " + target_type) }
+            builder = builder.instr("drop " + ctx_lookup_value_name(ctx, target) + ": " + target_type)
         }
         builder = builder.instr(target + " = " + lowered.value)
         ret builder
     }
 
+    let borrowed_rhs = expr_is_borrowed_copy(assign_stmt.expr) || expr_returns_borrowed(ctx, assign_stmt.expr)
     let mut lowered = lower_expr(ctx, assign_stmt.expr, prefix + "_assign", idx)
     builder = builder.append(lowered.code)
     let op = assignment_op_to_ehir(assign_stmt.operator)
     if op == "" {
-        panic("Unsupported assignment operator in bootstrap translator: " + assign_stmt.operator)
+        translation_error_at(assign_stmt.target.source_name, assign_stmt.target.line, assign_stmt.target.column, "unsupported-assignment-operator", "unsupported assignment operator '" + assign_stmt.operator + "'")
         ret builder
     }
     let tmp_name = prefix + "_assign_tmp_" + Debug::fmt(idx) + "_" + lowered.value
     let mut target_type = lowered.typ
     match ctx_lookup_var(ctx, target) {
         Option[str]::Some(found) => { target_type = found }
-        Option[str]::None => {}
+        Option[str]::None => { translation_error_at(assign_stmt.target.source_name, assign_stmt.target.line, assign_stmt.target.column, "unknown-variable", "unknown variable '" + target + "'") }
     }
     let value_type = value_type_name(target_type)
     if is_numeric_type(lowered.typ) && is_numeric_type(value_type) && lowered.typ != value_type {
@@ -1448,6 +2107,7 @@ fn translate_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assignment
         if ctx_type_needs_ownership(ctx, value_type) {
             builder = builder.instr("drop " + tmp_name + ": " + value_type)
             builder = builder.instr("drop " + lhs_name + ": " + value_type)
+            if !borrowed_rhs { builder = builder.instr("drop " + lowered.value + ": " + lowered.typ) }
         }
         ret builder
     }
@@ -1463,7 +2123,7 @@ fn translate_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assignment
 fn translate_field_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: AssignmentStmt, prefix: str, idx: usize) -> EhirTextBuilder {
     match assign_stmt.target.value {
         Expr::Field(field_expr) => {
-            let borrowed_rhs = expr_is_borrowed_copy(assign_stmt.expr)
+            let borrowed_rhs = expr_is_borrowed_copy(assign_stmt.expr) || expr_returns_borrowed(ctx, assign_stmt.expr)
             let base_path = expr_h_path_or_empty(field_expr.base)
             let mut base = lower_expr_h(ctx, field_expr.base, prefix + "_assign_field_base", idx + 1_usize)
             if base_path != "" {
@@ -1486,13 +2146,21 @@ fn translate_field_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assi
                     field_type = found
                 }
                 Option[str]::None => {
-                    panic("Unable to resolve assignment field '" + field_expr.field + "' for value '" + base.value + "' of type '" + base.typ + "'")
+                    translation_error_at(assign_stmt.target.source_name, assign_stmt.target.line, assign_stmt.target.column, "unknown-field", "type '" + base.typ + "' has no field '" + field_expr.field + "'")
                 }
             }
 
             let mut builder = base.code
-            let rhs = lower_expr(ctx, assign_stmt.expr, prefix + "_assign_field_rhs", idx + 2_usize)
+            let mut rhs = lower_expr(ctx, assign_stmt.expr, prefix + "_assign_field_rhs", idx + 2_usize)
             builder = builder.append(rhs.code)
+            let expected_type = canonical_type(value_type_name(field_type))
+            if is_numeric_type(expected_type) && is_numeric_type(rhs.typ) && expected_type != canonical_type(value_type_name(rhs.typ)) {
+                let cast_name = prefix + "_assign_field_cast_" + Debug::fmt(idx)
+                builder = builder.instr(cast_name + ": " + expected_type + " = pcast " + rhs.value + ": " + rhs.typ + ", " + expected_type)
+                rhs = LoweredExpr{EhirTextBuilder::new(), cast_name, expected_type}
+            } elif !function_type_matches(expected_type, rhs.typ, Vec[str]::new()) {
+                translation_error_at(assign_stmt.expr.source_name, assign_stmt.expr.line, assign_stmt.expr.column, "assignment-type-mismatch", "cannot assign value of type '" + canonical_type(value_type_name(rhs.typ)) + "' to field '" + field_expr.field + "' of type '" + expected_type + "'")
+            }
             if assign_stmt.operator == "=" {
                 let field_index = ctx_lookup_field_index(ctx, base.typ, field_expr.field)
                 if ctx_type_needs_ownership(ctx, field_type) {
@@ -1507,7 +2175,7 @@ fn translate_field_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assi
 
             let op = assignment_op_to_ehir(assign_stmt.operator)
             if op == "" {
-                panic("Unsupported assignment operator in bootstrap translator: " + assign_stmt.operator)
+                translation_error_at(assign_stmt.target.source_name, assign_stmt.target.line, assign_stmt.target.column, "unsupported-assignment-operator", "unsupported assignment operator '" + assign_stmt.operator + "'")
                 ret builder
             }
             let current_name = prefix + "_assign_field_current_" + Debug::fmt(idx)
@@ -1518,7 +2186,7 @@ fn translate_field_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assi
             ret builder.instr("setfield " + base.value + " > " + field_index + ", " + tmp_name)
         }
         _ => {
-            panic("Complex assignment targets are not implemented in bootstrap translator")
+            translation_error_at(assign_stmt.target.source_name, assign_stmt.target.line, assign_stmt.target.column, "unsupported-assignment-target", "assignment target must be a variable or field")
         }
     }
     ret EhirTextBuilder::new()
@@ -1526,7 +2194,11 @@ fn translate_field_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assi
 
 fn translate_expr_stmt(ctx: mut TranslatorContext, expr_stmt: ExprNode, prefix: str, idx: usize) -> EhirTextBuilder {
     let lowered = lower_expr(ctx, expr_stmt, prefix + "_expr", idx)
-    ret lowered.code
+    let mut builder = lowered.code
+    if ctx_type_needs_ownership(ctx, lowered.typ) {
+        builder = builder.instr("drop " + lowered.value + ": " + lowered.typ)
+    }
+    ret builder
 }
 
 fn translate_unsafe_stmt(
@@ -1688,7 +2360,7 @@ fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usiz
                     typ = found
                 }
                 Option[str]::None => {
-                    panic("Unknown variable '" + name + "'")
+                    translation_error_at(expr.source_name, expr.line, expr.column, "unknown-variable", "unknown variable '" + name + "'")
                 }
             }
             if starts_with(typ, "mut ") {
@@ -1701,10 +2373,10 @@ fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usiz
             ret LoweredExpr{EhirTextBuilder::new(), ctx_lookup_value_name(ctx, name), typ}
         }
         Expr::Binary(bin) => {
-            ret lower_binary_expr(ctx, bin, prefix, idx)
+            ret lower_binary_expr(ctx, bin, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::Call(call) => {
-            ret lower_call_expr(ctx, call, prefix, idx)
+            ret lower_call_expr(ctx, call, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::StructInit(init_expr) => {
             ret lower_struct_init_expr(ctx, init_expr, prefix, idx)
@@ -1713,25 +2385,25 @@ fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usiz
             ret lower_tuple_literal_expr(ctx, tuple_expr, prefix, idx)
         }
         Expr::ArrayLiteral(array_expr) => {
-            ret lower_array_literal_expr(ctx, array_expr, prefix, idx)
+            ret lower_array_literal_expr(ctx, array_expr, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::VecLiteral(vec_expr) => {
-            ret lower_vec_literal_expr(ctx, vec_expr, prefix, idx)
+            ret lower_vec_literal_expr(ctx, vec_expr, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::ArrayRepeat(repeat_expr) => {
             ret lower_array_repeat_expr(ctx, repeat_expr, prefix, idx)
         }
         Expr::Field(field_expr) => {
-            ret lower_field_expr(ctx, field_expr, prefix, idx)
+            ret lower_field_expr(ctx, field_expr, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::MethodCall(method_call) => {
-            ret lower_method_call_expr(ctx, method_call, prefix, idx)
+            ret lower_method_call_expr(ctx, method_call, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::Parenthesized(inner) => {
             ret lower_expr_h(ctx, inner, prefix, idx)
         }
         Expr::Unary(unary_expr) => {
-            ret lower_unary_expr(ctx, unary_expr, prefix, idx)
+            ret lower_unary_expr(ctx, unary_expr, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::Cast(cast_expr) => {
             ret lower_cast_expr(ctx, cast_expr, prefix, idx)
@@ -1739,11 +2411,11 @@ fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usiz
         Expr::Match(_) => {
             match expr.value {
                 Expr::Match(match_expr) => {
-                    ret lower_match_expr(ctx, match_expr, prefix, idx)
+                    ret lower_match_expr(ctx, match_expr, expr.source_name, expr.line, expr.column, prefix, idx)
                 }
                 _ => {}
             }
-            panic("Internal translator error while lowering match expression")
+            translation_error_at(expr.source_name, expr.line, expr.column, "translator-invariant", "match expression payload was lost during lowering")
             ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
         }
         Expr::If(if_expr) => {
@@ -1753,16 +2425,16 @@ fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usiz
             ret lower_block_expr(ctx, block_expr, prefix, idx)
         }
         Expr::Index(index_expr) => {
-            ret lower_index_expr(ctx, index_expr, prefix, idx)
+            ret lower_index_expr(ctx, index_expr, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::Try(inner) => {
-            ret lower_try_expr(ctx, inner, prefix, idx)
+            ret lower_try_expr(ctx, inner, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::Unsafe(block) => {
             ret lower_unsafe_expr(ctx, block, prefix, idx)
         }
         _ => {
-            panic("Unsupported expression kind in bootstrap translator")
+            translation_error_at(expr.source_name, expr.line, expr.column, "unsupported-expression", "unsupported expression kind")
             ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
         }
     }
@@ -1865,7 +2537,7 @@ fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx:
                     typ = found
                 }
                 Option[str]::None => {
-                    panic("Unknown variable '" + name + "'")
+                    translation_error_at(expr.source_name, expr.line, expr.column, "unknown-variable", "unknown variable '" + name + "'")
                 }
             }
             if starts_with(typ, "mut ") {
@@ -1881,10 +2553,10 @@ fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx:
             ret lower_expr_h(ctx, inner, prefix, idx)
         }
         Expr::Binary(bin) => {
-            ret lower_binary_expr(ctx, bin, prefix, idx)
+            ret lower_binary_expr(ctx, bin, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::Call(call) => {
-            ret lower_call_expr(ctx, call, prefix, idx)
+            ret lower_call_expr(ctx, call, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::StructInit(init_expr) => {
             ret lower_struct_init_expr(ctx, init_expr, prefix, idx)
@@ -1893,34 +2565,34 @@ fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx:
             ret lower_tuple_literal_expr(ctx, tuple_expr, prefix, idx)
         }
         Expr::ArrayLiteral(array_expr) => {
-            ret lower_array_literal_expr(ctx, array_expr, prefix, idx)
+            ret lower_array_literal_expr(ctx, array_expr, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::VecLiteral(vec_expr) => {
-            ret lower_vec_literal_expr(ctx, vec_expr, prefix, idx)
+            ret lower_vec_literal_expr(ctx, vec_expr, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::ArrayRepeat(repeat_expr) => {
             ret lower_array_repeat_expr(ctx, repeat_expr, prefix, idx)
         }
         Expr::Unary(unary_expr) => {
-            ret lower_unary_expr(ctx, unary_expr, prefix, idx)
+            ret lower_unary_expr(ctx, unary_expr, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::Cast(cast_expr) => {
             ret lower_cast_expr(ctx, cast_expr, prefix, idx)
         }
         Expr::Field(field_expr) => {
-            ret lower_field_expr(ctx, field_expr, prefix, idx)
+            ret lower_field_expr(ctx, field_expr, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::MethodCall(method_call) => {
-            ret lower_method_call_expr(ctx, method_call, prefix, idx)
+            ret lower_method_call_expr(ctx, method_call, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::Match(_) => {
             match expr.value {
                 Expr::Match(match_expr) => {
-                    ret lower_match_expr(ctx, match_expr, prefix, idx)
+                    ret lower_match_expr(ctx, match_expr, expr.source_name, expr.line, expr.column, prefix, idx)
                 }
                 _ => {}
             }
-            panic("Internal translator error while lowering boxed match expression")
+            translation_error_at(expr.source_name, expr.line, expr.column, "translator-invariant", "boxed match expression payload was lost during lowering")
             ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
         }
         Expr::If(if_expr) => {
@@ -1930,16 +2602,16 @@ fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx:
             ret lower_block_expr(ctx, block_expr, prefix, idx)
         }
         Expr::Index(index_expr) => {
-            ret lower_index_expr(ctx, index_expr, prefix, idx)
+            ret lower_index_expr(ctx, index_expr, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::Try(inner) => {
-            ret lower_try_expr(ctx, inner, prefix, idx)
+            ret lower_try_expr(ctx, inner, expr.source_name, expr.line, expr.column, prefix, idx)
         }
         Expr::Unsafe(block) => {
             ret lower_unsafe_expr(ctx, block, prefix, idx)
         }
         _ => {
-            panic("Unsupported boxed expression kind in bootstrap translator")
+            translation_error_at(expr.source_name, expr.line, expr.column, "unsupported-expression", "unsupported boxed expression kind")
             ret LoweredExpr{EhirTextBuilder::new(), "", "void"}
         }
     }
@@ -1953,22 +2625,22 @@ fn lower_cast_expr(ctx: mut TranslatorContext, cast_expr: CastExpr, prefix: str,
     ret LoweredExpr{code, out_name, cast_expr.target}
 }
 
-fn lower_try_expr(ctx: mut TranslatorContext, inner: ExprNode<H>, prefix: str, idx: usize) -> LoweredExpr {
+fn lower_try_expr(ctx: mut TranslatorContext, inner: ExprNode<H>, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
     let tried = lower_expr_h(ctx, inner, prefix + "_try_value", idx + 1_usize)
     let result_type = canonical_type(tried.typ)
     if method_owner_name(result_type) != "Result" {
-        panic("'?' operator expects Result[T, E], got " + result_type)
+        translation_error_at(source_name, line, column, "invalid-try-operand", "'?' operator expects Result[T, E], got '" + result_type + "'")
     }
 
     let ok_type = nth_generic_type(result_type, 0_usize)
     let err_type = nth_generic_type(result_type, 1_usize)
     let fn_ret_type = canonical_type(ctx.return_type)
     if method_owner_name(fn_ret_type) != "Result" {
-        panic("'?' operator can only be used in functions returning Result")
+        translation_error_at(source_name, line, column, "invalid-try-context", "'?' operator can only be used in functions returning Result")
     }
     let fn_err_type = nth_generic_type(fn_ret_type, 1_usize)
     if canonical_type(fn_err_type) != canonical_type(err_type) {
-        panic("'?' error type mismatch: function expects " + fn_err_type + ", got " + err_type)
+        translation_error_at(source_name, line, column, "try-error-type-mismatch", "function expects error type '" + fn_err_type + "', got '" + err_type + "'")
     }
 
     let ok_label = prefix + "_try_ok_" + Debug::fmt(idx)
@@ -1990,7 +2662,7 @@ fn lower_try_expr(ctx: mut TranslatorContext, inner: ExprNode<H>, prefix: str, i
     ret LoweredExpr{code, ok_payload, ok_type}
 }
 
-fn lower_unary_expr(ctx: mut TranslatorContext, unary_expr: UnaryExpr, prefix: str, idx: usize) -> LoweredExpr {
+fn lower_unary_expr(ctx: mut TranslatorContext, unary_expr: UnaryExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
     if unary_expr.operator == "-" {
         match unary_expr.expr.value {
             Expr::Integer(value) => {
@@ -2028,17 +2700,17 @@ fn lower_unary_expr(ctx: mut TranslatorContext, unary_expr: UnaryExpr, prefix: s
         ret LoweredExpr{code, out_name, operand.typ}
     }
 
-    panic("Unsupported unary operator in bootstrap translator: " + unary_expr.operator)
+    translation_error_at(source_name, line, column, "unsupported-unary-operator", "unsupported unary operator '" + unary_expr.operator + "'")
     ret LoweredExpr{code, out_name, "void"}
 }
 
-fn lower_binary_expr(ctx: mut TranslatorContext, bin: BinaryExpr, prefix: str, idx: usize) -> LoweredExpr {
+fn lower_binary_expr(ctx: mut TranslatorContext, bin: BinaryExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
     let out_name = prefix + "_bin_" + Debug::fmt(idx)
     let mut code = EhirTextBuilder::new()
     let op = binary_op_to_ehir(bin.operator)
 
     if op == "" {
-        panic("Unsupported binary operator in bootstrap translator: " + bin.operator)
+        translation_error_at(source_name, line, column, "unsupported-binary-operator", "unsupported binary operator '" + bin.operator + "'")
         ret LoweredExpr{code, out_name, "usize"}
     }
 
@@ -2106,7 +2778,7 @@ fn lower_binary_expr(ctx: mut TranslatorContext, bin: BinaryExpr, prefix: str, i
     ret LoweredExpr{code, out_name, result_type}
 }
 
-fn lower_call_expr(ctx: mut TranslatorContext, call: CallExpr, prefix: str, idx: usize) -> LoweredExpr {
+fn lower_call_expr(ctx: mut TranslatorContext, call: CallExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
     let mut callee = expr_h_path_or_empty(call.callee)
     if starts_with(callee, "Self::") && ctx.self_type != "" {
         callee = method_owner_name(ctx.self_type) + "::" + callee.slice(6_usize, callee.len() - 6_usize)
@@ -2156,7 +2828,18 @@ fn lower_call_expr(ctx: mut TranslatorContext, call: CallExpr, prefix: str, idx:
         i = i + 1_usize
     }
 
-    let dispatch_callee = resolve_module_function_call(ctx, resolve_static_trait_call(ctx, callee, arg_types))
+    let direct_function = ctx_lookup_function_for_args(ctx, callee, arg_types)
+    let mut dispatch_callee = callee
+    let mut matched_return_type = ""
+    match direct_function {
+        Option[FunctionType]::Some(function) => {
+            dispatch_callee = function.emitted_name
+            matched_return_type = function.ret_type
+        }
+        Option[FunctionType]::None => {
+            dispatch_callee = resolve_module_function_call(ctx, resolve_static_trait_call(ctx, callee, arg_types))
+        }
+    }
     let dispatch_base = base_type_name(dispatch_callee)
 
     if generic_args.len() == 0_usize {
@@ -2176,7 +2859,7 @@ fn lower_call_expr(ctx: mut TranslatorContext, call: CallExpr, prefix: str, idx:
     }
 
     if callee == "" {
-        panic("Non-path call callee is not implemented in bootstrap translator")
+        translation_error_at(source_name, line, column, "invalid-call-target", "call target must be a function or method path")
         ret LoweredExpr{code, out_name, "usize"}
     }
 
@@ -2195,6 +2878,18 @@ fn lower_call_expr(ctx: mut TranslatorContext, call: CallExpr, prefix: str, idx:
         Option[str]::None => {}
     }
 
+    match direct_function {
+        Some(_) => {}
+        None => {
+            match plain_function_argument_error(ctx, callee, arg_types) {
+                Some(message) => { translation_error_at(call.callee.source_name, call.callee.line, call.callee.column, "argument-mismatch", message) }
+                None => {}
+            }
+        }
+    }
+
+    validate_generic_call_bounds(ctx, dispatch_base, generic_args, source_name, line, column)
+
     let mut ret_type = "usize"
     let mut emitted_callee = canonical_scoped_name(dispatch_callee)
     if generic_args.len() > 0_usize && find_char(dispatch_callee, "[", 0_usize) >= dispatch_callee.len() {
@@ -2202,12 +2897,16 @@ fn lower_call_expr(ctx: mut TranslatorContext, call: CallExpr, prefix: str, idx:
         for generic in generic_args { generic_types.push(canonical_type(generic)) }
         emitted_callee = emitted_callee + "[" + join_strs(generic_types, ", ") + "]"
     }
-    match ctx_lookup_function(ctx, dispatch_base) {
-        Option[str]::Some(found) => {
-            ret_type = canonical_type(found)
-        }
-        Option[str]::None => {
-            ret_type = canonical_type(static_call_return_type(dispatch_callee))
+    if matched_return_type != "" {
+        ret_type = canonical_type(matched_return_type)
+    } else {
+        match ctx_lookup_function(ctx, dispatch_base) {
+            Option[str]::Some(found) => {
+                ret_type = canonical_type(found)
+            }
+            Option[str]::None => {
+                ret_type = canonical_type(static_call_return_type(dispatch_callee))
+            }
         }
     }
     ret_type = direct_generic_hint(specialize_function_return(ctx, dispatch_base, generic_args, ret_type), generic_args)
@@ -2530,7 +3229,7 @@ fn lower_tuple_literal_expr(ctx: mut TranslatorContext, tuple_expr: TupleLiteral
     ret LoweredExpr{code, out_name, tuple_type}
 }
 
-fn lower_array_literal_expr(ctx: mut TranslatorContext, array_expr: ArrayLiteralExpr, prefix: str, idx: usize) -> LoweredExpr {
+fn lower_array_literal_expr(ctx: mut TranslatorContext, array_expr: ArrayLiteralExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
     let out_name = prefix + "_array_" + Debug::fmt(idx)
     let mut code = EhirTextBuilder::new()
     let mut values = Vec[str]::new()
@@ -2546,16 +3245,16 @@ fn lower_array_literal_expr(ctx: mut TranslatorContext, array_expr: ArrayLiteral
         count = count + 1_usize
     }
     if count == 0_usize {
-        panic("Unable to infer type of empty array literal")
+        translation_error_at(source_name, line, column, "cannot-infer-empty-array", "cannot infer the element type of an empty array; add a type annotation")
     }
     let array_type = "__array_" + Debug::fmt(count) + "[" + item_type + "]"
     code = code.instr(out_name + ": " + array_type + " = capstruct " + array_type + "(" + join_strs(values, ", ") + ")")
     ret LoweredExpr{code, out_name, array_type}
 }
 
-fn lower_vec_literal_expr(ctx: mut TranslatorContext, vec_expr: ArrayLiteralExpr, prefix: str, idx: usize) -> LoweredExpr {
+fn lower_vec_literal_expr(ctx: mut TranslatorContext, vec_expr: ArrayLiteralExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
     if vec_expr.items.len() == 0_usize {
-        panic("Unable to infer type of empty vec! literal")
+        translation_error_at(source_name, line, column, "cannot-infer-empty-vec", "cannot infer the element type of an empty vec! literal; add a type annotation")
     }
     let mut code = EhirTextBuilder::new()
     let mut values = Vec[str]::new()
@@ -2600,7 +3299,7 @@ fn lower_array_repeat_expr(ctx: mut TranslatorContext, repeat_expr: ArrayRepeatE
     ret LoweredExpr{code, out_name, array_type}
 }
 
-fn lower_field_expr(ctx: mut TranslatorContext, field_expr: FieldExpr, prefix: str, idx: usize) -> LoweredExpr {
+fn lower_field_expr(ctx: mut TranslatorContext, field_expr: FieldExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
     let base = lower_expr_h(ctx, field_expr.base, prefix + "_field_base", idx + 1_usize)
     let mut field_type = "void"
     match ctx_lookup_field(ctx, base.typ, field_expr.field) {
@@ -2608,7 +3307,7 @@ fn lower_field_expr(ctx: mut TranslatorContext, field_expr: FieldExpr, prefix: s
             field_type = canonical_type(found)
         }
         Option[str]::None => {
-            panic("Unable to resolve field '" + field_expr.field + "' for value '" + base.value + "' of type '" + base.typ + "'")
+            translation_error_at(source_name, line, column, "unknown-field", "type '" + base.typ + "' has no field '" + field_expr.field + "'")
         }
     }
     let out_name = prefix + "_field_" + Debug::fmt(idx)
@@ -2617,7 +3316,7 @@ fn lower_field_expr(ctx: mut TranslatorContext, field_expr: FieldExpr, prefix: s
     ret LoweredExpr{code, out_name, field_type}
 }
 
-fn lower_index_expr(ctx: mut TranslatorContext, index_expr: IndexExpr, prefix: str, idx: usize) -> LoweredExpr {
+fn lower_index_expr(ctx: mut TranslatorContext, index_expr: IndexExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
     let base = lower_expr_h(ctx, index_expr.base, prefix + "_index_base", idx + 1_usize)
     let mut field = ""
     match index_expr.index.value {
@@ -2625,7 +3324,7 @@ fn lower_index_expr(ctx: mut TranslatorContext, index_expr: IndexExpr, prefix: s
             field = numeric_literal_value(raw_index)
         }
         _ => {
-            panic("Only constant integer indexing is currently supported")
+            translation_error_at(source_name, line, column, "unsupported-index", "only constant integer indexing is currently supported")
         }
     }
     let mut field_type = "void"
@@ -2634,7 +3333,7 @@ fn lower_index_expr(ctx: mut TranslatorContext, index_expr: IndexExpr, prefix: s
             field_type = canonical_type(found)
         }
         Option[str]::None => {
-            panic("Unable to resolve index '" + field + "' for value '" + base.value + "' of type '" + base.typ + "'")
+            translation_error_at(source_name, line, column, "invalid-index", "type '" + base.typ + "' has no index '" + field + "'")
         }
     }
 
@@ -2644,8 +3343,9 @@ fn lower_index_expr(ctx: mut TranslatorContext, index_expr: IndexExpr, prefix: s
     ret LoweredExpr{code, out_name, field_type}
 }
 
-fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExpr, prefix: str, idx: usize) -> LoweredExpr {
+fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
     let borrowed_receiver = expr_h_is_borrowed_copy(method_call.receiver)
+    let receiver_path = expr_h_path_or_empty(method_call.receiver)
     let receiver = lower_method_receiver(ctx, method_call.receiver, prefix + "_recv", idx + 1_usize)
     let mut owner = method_owner_name(receiver.typ)
     if starts_with(receiver.typ, "dyn ") {
@@ -2666,12 +3366,12 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
             if starts_with(receiver.typ, "dyn ") {
                 match ctx_lookup_method_return(ctx, method_call.method) {
                     Some(found) => { ret_type = canonical_type(found) }
-                    None => { ret_type = canonical_type(method_return_type(receiver.typ, method_call.method)) }
+                    None => { ret_type = canonical_type(method_return_type(receiver.typ, method_call.method, source_name, line, column)) }
                 }
             } elif receiver.typ == "Iter" && method_call.method == "next" {
                 ret_type = "__tuple_2[Iter, Option[T]]"
             } else {
-                ret_type = canonical_type(method_return_type(receiver.typ, method_call.method))
+                ret_type = canonical_type(method_return_type(receiver.typ, method_call.method, source_name, line, column))
             }
         }
     }
@@ -2681,6 +3381,7 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     let mut args = Vec[str]::new()
     let mut receiver_value = receiver.value
     let mut receiver_was_loaded = false
+    let mut receiver_uses_temporary_storage = false
     match ctx_lookup_function_param(ctx, fn_name, 0_usize, concrete_generics) {
         Option[str]::Some(expected_self) => {
             if starts_with(receiver.typ, "mut ") && !starts_with(expected_self, "mut ") {
@@ -2690,16 +3391,21 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
                 receiver_was_loaded = true
             }
             elif starts_with(expected_self, "mut ") && !starts_with(receiver.typ, "mut ") {
+                if receiver_path != "" {
+                    translation_error_at(source_name, line, column, "mutable-receiver-required", "method '" + method_call.method + "' requires a mutable receiver")
+                }
                 let storage_name = prefix + "_recv_storage_" + Debug::fmt(idx)
                 code = code.instr(storage_name + ": " + receiver.typ + "* = salloc " + receiver.typ)
                 code = code.instr("store " + receiver.value + ", " + storage_name)
+                if ctx_type_needs_ownership(ctx, receiver.typ) { code = code.instr("drop " + receiver.value + ": " + receiver.typ) }
                 receiver_value = storage_name
+                receiver_uses_temporary_storage = true
             }
         }
         Option[str]::None => {}
     }
     let receiver_value_type = value_type_name(receiver.typ)
-    if borrowed_receiver && (receiver_was_loaded || !starts_with(receiver.typ, "mut ")) && ctx_type_needs_ownership(ctx, receiver_value_type) {
+    if borrowed_receiver && !receiver_uses_temporary_storage && (receiver_was_loaded || !starts_with(receiver.typ, "mut ")) && ctx_type_needs_ownership(ctx, receiver_value_type) {
         code = code.instr("retain " + receiver_value + ": " + receiver_value_type)
     }
     args.push(receiver_value)
@@ -2728,12 +3434,57 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         i = i + 1_usize
     }
 
+    validate_generic_call_bounds(ctx, fn_name, concrete_generics, source_name, line, column)
+
     let mut emitted_name = fn_name
     if concrete_generics.len() > 0_usize {
         emitted_name = emitted_name + "[" + join_strs(concrete_generics, ", ") + "]"
     }
     code = code.instr(out_name + ": " + ret_type + " = call " + emitted_name + "(" + join_strs(args, ", ") + ")")
+    if receiver_uses_temporary_storage && ctx_type_needs_ownership(ctx, receiver_value_type) {
+        let cleanup_name = prefix + "_recv_cleanup_" + Debug::fmt(idx)
+        code = code.instr(cleanup_name + ": " + receiver_value_type + " = load " + receiver_value)
+        code = code.instr("drop " + cleanup_name + ": " + receiver_value_type)
+    }
     ret LoweredExpr{code, out_name, ret_type}
+}
+
+fn validate_generic_call_bounds(ctx: mut TranslatorContext, name: str, args: Vec[str], source_name: str, line: usize, column: usize) -> () {
+    let base = generic_dispatch_base_name(name)
+    let mut found_callable = false
+    let mut expected_arity = 0_usize
+    for callable in ctx.generic_callables {
+        if generic_dispatch_base_name(callable.name) == base {
+            found_callable = true
+            expected_arity = callable.params.len()
+        }
+        if generic_dispatch_base_name(callable.name) == base && callable.params.len() == args.len() {
+            let mut index = 0_usize
+            while index < callable.params.len() {
+                match callable.params.get(index) {
+                    Some(parameter) => {
+                        match args.get(index) {
+                            Some(argument) => {
+                                for bound in parameter.bounds {
+                                    if !type_satisfies_trait_bound(ctx, ctx.active_generics, argument, bound.path) {
+                                        translation_error_at(source_name, line, column, "generic-bound-not-satisfied", "type '" + canonical_type(argument) + "' does not satisfy bound '" + bound.path + "' for generic parameter '" + parameter.name + "' of '" + callable.name + "'")
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                    None => {}
+                }
+                index = index + 1_usize
+            }
+            ret ()
+        }
+    }
+    if found_callable {
+        translation_error_at(source_name, line, column, "generic-arity-mismatch", "generic callable '" + base + "' expects " + Debug::fmt(expected_arity) + " generic argument(s), got " + Debug::fmt(args.len()))
+    }
+    ret ()
 }
 
 fn lower_method_receiver(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx: usize) -> LoweredExpr {
@@ -2775,12 +3526,12 @@ fn lower_method_receiver(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: 
     ret lower_expr_h(ctx, expr, prefix, idx)
 }
 
-fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, prefix: str, idx: usize) -> LoweredExpr {
+fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
     let cond_borrowed = expr_h_is_borrowed_copy(match_expr.expr)
     let cond = lower_expr_h(ctx, match_expr.expr, prefix + "_match_expr", idx)
     let result_name = prefix + "_match_result_" + Debug::fmt(idx)
     let result_slot = result_name + "_slot"
-    let result_type = infer_match_expr_result_type(ctx, match_expr, cond.typ)
+    let result_type = infer_match_expr_result_type(ctx, match_expr, cond.typ, source_name, line, column)
     let end_label = prefix + "_match_expr_end_" + Debug::fmt(idx)
     let mut builder = cond.code
     if cond_borrowed && ctx_type_needs_ownership(ctx, cond.typ) { builder = builder.instr("retain " + cond.value + ": " + cond.typ) }
@@ -2791,7 +3542,7 @@ fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, prefix: s
     for arm in match_expr.arms {
         let body_label = prefix + "_match_expr_body_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx)
         let fail_label = prefix + "_match_expr_next_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx + 1_usize)
-        let test = lower_match_pattern_test(cond.value, cond.typ, arm.pattern, prefix, idx, arm_idx)
+        let test = lower_match_pattern_test(cond.value, cond.typ, arm.pattern, source_name, line, column, prefix, idx, arm_idx)
         builder = builder.append(test.code)
         if test.is_always_true {
             builder = builder.instr("br $" + body_label)
@@ -2800,7 +3551,7 @@ fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, prefix: s
             builder = builder.instr("cbr " + test.cond_value + ", $" + body_label + ", $" + fail_label)
         }
         builder = builder.label(body_label)
-        builder = builder.append(bind_match_payload(ctx, arm.pattern, cond.value, cond.typ, prefix + "_match_expr_binding_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx)))
+        builder = builder.append(bind_match_payload(ctx, arm.pattern, cond.value, cond.typ, source_name, line, column, prefix + "_match_expr_binding_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx)))
         if ctx_type_needs_ownership(ctx, cond.typ) { builder = builder.instr("drop " + cond.value + ": " + cond.typ) }
         let borrowed_result = expr_is_borrowed_copy(arm.expr)
         let lowered = lower_expr(ctx, arm.expr, prefix + "_match_expr_arm_" + Debug::fmt(arm_idx), idx + arm_idx + 1_usize)
@@ -2809,6 +3560,9 @@ fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, prefix: s
             builder = builder.instr("retain " + lowered.value + ": " + lowered.typ)
         }
         builder = builder.instr("store " + lowered.value + ", " + result_slot)
+        if ctx_type_needs_ownership(ctx, result_type) {
+            builder = builder.instr("drop " + lowered.value + ": " + result_type)
+        }
         builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", outer_owned)
         restore_owned_vars(ctx, outer_owned)
         builder = builder.instr("br $" + end_label)
@@ -2847,6 +3601,9 @@ fn lower_if_expr(ctx: mut TranslatorContext, if_expr: IfExpr, prefix: str, idx: 
             builder = builder.instr("retain " + lowered.value + ": " + lowered.typ)
         }
         builder = builder.instr("store " + lowered.value + ", " + result_slot)
+        if ctx_type_needs_ownership(ctx, result_type) {
+            builder = builder.instr("drop " + lowered.value + ": " + result_type)
+        }
         builder = append_owned_drops_from(ctx, builder, "", then_label + "_scope", outer_owned)
         restore_owned_vars(ctx, outer_owned)
         builder = builder.instr("br $" + end_label)
@@ -2854,13 +3611,16 @@ fn lower_if_expr(ctx: mut TranslatorContext, if_expr: IfExpr, prefix: str, idx: 
         branch_idx = branch_idx + 1_usize
     }
 
-    let borrowed_else = false
+    let borrowed_else = expr_h_is_borrowed_copy(if_expr.else_body)
     let else_lowered = lower_expr_h(ctx, if_expr.else_body, prefix + "_if_expr_else", idx + branch_idx + 1_usize)
     builder = builder.append(else_lowered.code)
     if borrowed_else && ctx_type_needs_ownership(ctx, else_lowered.typ) {
         builder = builder.instr("retain " + else_lowered.value + ": " + else_lowered.typ)
     }
     builder = builder.instr("store " + else_lowered.value + ", " + result_slot)
+    if ctx_type_needs_ownership(ctx, result_type) {
+        builder = builder.instr("drop " + else_lowered.value + ": " + result_type)
+    }
     builder = append_owned_drops_from(ctx, builder, "", prefix + "_if_expr_else_scope", outer_owned)
     restore_owned_vars(ctx, outer_owned)
     builder = builder.instr("br $" + end_label)
@@ -2945,28 +3705,28 @@ fn single_statement(stmt: Statement) -> Vec[Statement] {
     ret out
 }
 
-fn infer_match_expr_result_type(ctx: mut TranslatorContext, match_expr: MatchExpr, scrutinee_type: str) -> str {
+fn infer_match_expr_result_type(ctx: mut TranslatorContext, match_expr: MatchExpr, scrutinee_type: str, source_name: str, line: usize, column: usize) -> str {
     let owned_size = ctx.owned_vars.len()
     match match_expr.arms.get(0_usize) {
         Option[MatchExprArm]::Some(arm) => {
-            let _bindings = bind_match_payload(ctx, arm.pattern, "_match_type_probe_subject", scrutinee_type, "_match_type_probe_binding")
+            let _bindings = bind_match_payload(ctx, arm.pattern, "_match_type_probe_subject", scrutinee_type, source_name, line, column, "_match_type_probe_binding")
             let lowered = lower_expr(ctx, arm.expr, "_match_type_probe", 0_usize)
             let typ = canonical_type(lowered.typ)
             restore_owned_vars(ctx, owned_size)
             ret typ
         }
         Option[MatchExprArm]::None => {
-            panic("Match expression must contain at least one arm")
+            translation_error_at(source_name, line, column, "empty-match", "match expression must contain at least one arm")
         }
     }
     ret "void"
 }
 
-fn bind_match_payload(ctx: mut TranslatorContext, pattern: MatchPattern, scrutinee_value: str, scrutinee_type: str, binding_prefix: str) -> EhirTextBuilder {
+fn bind_match_payload(ctx: mut TranslatorContext, pattern: MatchPattern, scrutinee_value: str, scrutinee_type: str, source_name: str, line: usize, column: usize, binding_prefix: str) -> EhirTextBuilder {
     let mut builder = EhirTextBuilder::new()
     match pattern.binding {
         Option[str]::Some(name) => {
-            let payload_type = match_payload_type(ctx, pattern, scrutinee_type)
+            let payload_type = match_payload_type(ctx, pattern, scrutinee_type, source_name, line, column)
             let emitted_name = binding_prefix + "_" + match_payload_field(pattern) + "_" + name
             ctx_add_var_emitted(ctx, name, emitted_name, payload_type)
             builder = builder.instr(emitted_name + ": " + payload_type + " = getfield " + scrutinee_value + " > " + match_payload_field(pattern))
@@ -2990,7 +3750,7 @@ fn match_payload_field(pattern: MatchPattern) -> str {
     ret "1"
 }
 
-fn match_payload_type(ctx: mut TranslatorContext, pattern: MatchPattern, scrutinee_type: str) -> str {
+fn match_payload_type(ctx: mut TranslatorContext, pattern: MatchPattern, scrutinee_type: str, source_name: str, line: usize, column: usize) -> str {
     match pattern.value {
         Option[str]::Some(value) => {
             if is_option_some_pattern(value) && base_type_name(scrutinee_type) == "Option" {
@@ -3003,7 +3763,8 @@ fn match_payload_type(ctx: mut TranslatorContext, pattern: MatchPattern, scrutin
                 ret nth_generic_type(scrutinee_type, 1_usize)
             }
             if scrutinee_type == "Json" {
-                ret json_payload_type(value)
+                let payload = json_payload_type(value)
+                if payload != "" { ret payload }
             }
             let variant = enum_variant_name(value)
             for item in ctx.enum_variants {
@@ -3011,11 +3772,11 @@ fn match_payload_type(ctx: mut TranslatorContext, pattern: MatchPattern, scrutin
                     ret canonical_type(direct_generic_hint(item.payload_type, generic_args_from_path(scrutinee_type)))
                 }
             }
-            panic("Unable to resolve match payload type for pattern '" + value + "' and scrutinee type '" + scrutinee_type + "'")
+            translation_error_at(source_name, line, column, "invalid-match-payload", "pattern '" + value + "' has no payload compatible with type '" + scrutinee_type + "'")
         }
         Option[str]::None => {}
     }
-    panic("Unable to resolve match payload type for scrutinee type '" + scrutinee_type + "'")
+    translation_error_at(source_name, line, column, "invalid-match-payload", "cannot resolve a payload for type '" + scrutinee_type + "'")
     ret "void"
 }
 
@@ -3035,8 +3796,7 @@ fn json_payload_type(value: str) -> str {
     if value == "Json::Object" || value == "Object" {
         ret "Vec[__tuple_2[str, Json]]"
     }
-    panic("Unable to resolve Json payload type for pattern '" + value + "'")
-    ret "void"
+    ret ""
 }
 
 fn is_option_some_pattern(value: str) -> bool {
@@ -3115,10 +3875,10 @@ fn translate_match_stmt(
     let mut next_label = prefix + "_match_next_" + Debug::fmt(idx) + "_0"
     let is_exhaustive = match_stmt_is_exhaustive_for_type(ctx, match_stmt, cond.typ)
     match duplicate_match_variant(match_stmt) {
-        Option[str]::Some(variant) => { panic("Duplicate match arm for variant '" + variant + "'") }
+        Option[str]::Some(variant) => { translation_error_at(match_stmt.expr.source_name, match_stmt.expr.line, match_stmt.expr.column, "duplicate-match-arm", "duplicate match arm for variant '" + variant + "'") }
         Option[str]::None => {}
     }
-    if !is_exhaustive { panic("Non-exhaustive match for enum '" + base_type_name(cond.typ) + "'") }
+    if !is_exhaustive { translation_error_at(match_stmt.expr.source_name, match_stmt.expr.line, match_stmt.expr.column, "non-exhaustive-match", "non-exhaustive match for enum '" + base_type_name(cond.typ) + "'") }
     let all_arms_return = match_stmt_always_returns(match_stmt)
     let outer_owned = ctx.owned_vars.len()
     let mut arm_idx = 0_usize
@@ -3129,7 +3889,7 @@ fn translate_match_stmt(
         if is_exhaustive && is_last_arm {
             builder = builder.instr("br $" + body_label)
         } else {
-            let test = lower_match_pattern_test(cond.value, cond.typ, arm.pattern, prefix, idx, arm_idx)
+            let test = lower_match_pattern_test(cond.value, cond.typ, arm.pattern, match_stmt.expr.source_name, match_stmt.expr.line, match_stmt.expr.column, prefix, idx, arm_idx)
             builder = builder.append(test.code)
             if test.is_always_true {
                 builder = builder.instr("br $" + body_label)
@@ -3139,7 +3899,7 @@ fn translate_match_stmt(
             }
         }
         builder = builder.label(body_label)
-        builder = builder.append(bind_match_payload(ctx, arm.pattern, cond.value, cond.typ, prefix + "_match_binding_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx)))
+        builder = builder.append(bind_match_payload(ctx, arm.pattern, cond.value, cond.typ, match_stmt.expr.source_name, match_stmt.expr.line, match_stmt.expr.column, prefix + "_match_binding_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx)))
         if ctx_type_needs_ownership(ctx, cond.typ) { builder = builder.instr("drop " + cond.value + ": " + cond.typ) }
         let arm_returns = match_arm_always_returns(arm)
         let arm_terminates = match_arm_terminates_flow(arm)
@@ -3383,6 +4143,9 @@ fn lower_match_pattern_test(
     subject_value: str,
     subject_typ: str,
     pattern: MatchPattern,
+    source_name: str,
+    line: usize,
+    column: usize,
     prefix: str,
     idx: usize,
     arm_idx: usize
@@ -3417,6 +4180,7 @@ fn lower_match_pattern_test(
                 let literal_name = cond_name + "_literal"
                 code = code.instr(literal_name + ": str = capprim \"" + escape_str(string_token_body(value)) + "\"_str")
                 code = code.instr(cond_name + ": bool = unsafe call encore_str_eq(" + subject_value + ", " + literal_name + ")")
+                code = code.instr("drop " + literal_name + ": str")
                 ret LoweredPatternTest{code, cond_name, false}
             }
             if pattern.kind == "path" {
@@ -3431,7 +4195,7 @@ fn lower_match_pattern_test(
         Option[str]::None => {}
     }
 
-    panic("Unsupported match pattern kind in bootstrap translator: " + pattern.kind)
+    translation_error_at(source_name, line, column, "unsupported-match-pattern", "unsupported match pattern kind '" + pattern.kind + "'")
     ret LoweredPatternTest{code, cond_name, false}
 }
 
@@ -3500,7 +4264,7 @@ fn translate_if_stmt(
                 break_label,
                 continue_label
             ))
-            if !then_returns {
+            if !then_returns && !then_terminates {
                 builder = append_owned_drops_from(ctx, builder, "", then_label + "_scope", outer_owned)
             }
             if !then_terminates {
@@ -3528,7 +4292,7 @@ fn translate_if_stmt(
                 break_label,
                 continue_label
             ))
-            if !else_returns {
+            if !else_returns && !else_terminates {
                 builder = append_owned_drops_from(ctx, builder, "", else_label + "_scope", outer_owned)
             }
             if !else_terminates {
@@ -3558,6 +4322,8 @@ fn translate_while_stmt(ctx: mut TranslatorContext, while_stmt: WhileStmt, ret_t
     builder = builder.append(lower_cond(ctx, while_stmt.condition, cond_name))
     builder = builder.instr("cbr " + cond_name + ", $" + body_label + ", $" + end_label)
     builder = builder.label(body_label)
+    let loop_target_count = ctx.loop_targets.len()
+    ctx.loop_targets.push(LoopTargetType{loop_label_name(while_stmt.label), end_label, cond_label, outer_owned})
     builder = builder.append(translate_statements_no_default(
         ctx,
         while_stmt.body.statements,
@@ -3566,6 +4332,7 @@ fn translate_while_stmt(ctx: mut TranslatorContext, while_stmt: WhileStmt, ret_t
         Option[str]::Some(end_label),
         Option[str]::Some(cond_label)
     ))
+    while ctx.loop_targets.len() > loop_target_count { ctx.loop_targets.pop() }
     let body_terminates = block_terminates_flow(while_stmt.body)
     if !block_always_returns(while_stmt.body) && !body_terminates { builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", outer_owned) }
     restore_owned_vars(ctx, outer_owned)
@@ -3581,6 +4348,8 @@ fn translate_loop_stmt(ctx: mut TranslatorContext, loop_stmt: LoopStmt, ret_type
     let mut builder = EhirTextBuilder::new()
     builder = builder.instr("br $" + body_label)
     builder = builder.label(body_label)
+    let loop_target_count = ctx.loop_targets.len()
+    ctx.loop_targets.push(LoopTargetType{loop_label_name(loop_stmt.label), end_label, body_label, outer_owned})
     builder = builder.append(translate_statements_no_default(
         ctx,
         loop_stmt.body.statements,
@@ -3589,6 +4358,7 @@ fn translate_loop_stmt(ctx: mut TranslatorContext, loop_stmt: LoopStmt, ret_type
         Option[str]::Some(end_label),
         Option[str]::Some(body_label)
     ))
+    while ctx.loop_targets.len() > loop_target_count { ctx.loop_targets.pop() }
     let body_terminates = block_terminates_flow(loop_stmt.body)
     if !block_always_returns(loop_stmt.body) && !body_terminates { builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", outer_owned) }
     restore_owned_vars(ctx, outer_owned)
@@ -3606,6 +4376,8 @@ fn translate_do_while_stmt(ctx: mut TranslatorContext, do_stmt: DoWhileStmt, ret
     let mut builder = EhirTextBuilder::new()
     builder = builder.instr("br $" + body_label)
     builder = builder.label(body_label)
+    let loop_target_count = ctx.loop_targets.len()
+    ctx.loop_targets.push(LoopTargetType{"", end_label, cond_label, outer_owned})
     builder = builder.append(translate_statements_no_default(
         ctx,
         do_stmt.body.statements,
@@ -3614,6 +4386,7 @@ fn translate_do_while_stmt(ctx: mut TranslatorContext, do_stmt: DoWhileStmt, ret
         Option[str]::Some(end_label),
         Option[str]::Some(cond_label)
     ))
+    while ctx.loop_targets.len() > loop_target_count { ctx.loop_targets.pop() }
     let body_terminates = block_terminates_flow(do_stmt.body)
     if !block_always_returns(do_stmt.body) && !body_terminates { builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", outer_owned) }
     restore_owned_vars(ctx, outer_owned)
@@ -3661,6 +4434,7 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     let iter_prefix = prefix + "_for_" + Debug::fmt(idx)
     let body_label = iter_prefix + "_body"
     let end_label = iter_prefix + "_end"
+    let exhausted_label = iter_prefix + "_exhausted"
     let iter_slot = iter_prefix + "_iter_slot"
     let iter_value_name = iter_prefix + "_iter"
     let step_name = iter_prefix + "_step"
@@ -3671,8 +4445,8 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
 
     let borrowed_iterable = expr_is_borrowed_copy(for_stmt.iterable)
     let iterable = load_mutable_value(lower_expr(ctx, for_stmt.iterable, iter_prefix + "_source", idx), iter_prefix + "_source_load")
-    let iter_type = iterator_type_for(iterable.typ)
-    let item_type = iterator_item_type(iter_type)
+    let iter_type = iterator_type_for(iterable.typ, for_stmt.iterable.source_name, for_stmt.iterable.line, for_stmt.iterable.column)
+    let item_type = iterator_item_type(iter_type, for_stmt.iterable.source_name, for_stmt.iterable.line, for_stmt.iterable.column)
     let option_type = "Option[" + item_type + "]"
     let step_type = "__tuple_2[" + iter_type + ", " + option_type + "]"
 
@@ -3683,19 +4457,23 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     }
     let iter_generics = generic_args_from_path(iter_type)
     let generic_suffix = if iter_generics.len() == 0_usize { "" } else { "[" + join_strs(iter_generics, ", ") + "]" }
-    builder = builder.instr(iter_value_name + ": " + iter_type + " = call " + iterator_iter_function(iterable.typ) + generic_suffix + "(" + iterable.value + ")")
+    builder = builder.instr(iter_value_name + ": " + iter_type + " = call " + iterator_iter_function(iterable.typ, for_stmt.iterable.source_name, for_stmt.iterable.line, for_stmt.iterable.column) + generic_suffix + "(" + iterable.value + ")")
     builder = builder.instr(iter_slot + ": " + iter_type + "* = salloc " + iter_type)
     builder = builder.instr("store " + iter_value_name + ", " + iter_slot)
+    if ctx_type_needs_ownership(ctx, iter_type) {
+        ctx_add_owned_var(ctx, iter_prefix + "_iterator", iter_slot, "mut " + iter_type)
+    }
+    let body_owned = ctx.owned_vars.len()
     builder = builder.instr("br $" + body_label)
     builder = builder.label(body_label)
     builder = builder.instr(iter_value_name + "_current: " + iter_type + " = load " + iter_slot)
-    builder = builder.instr(step_name + ": " + step_type + " = call " + iterator_next_function(iter_type) + generic_suffix + "(" + iter_value_name + "_current)")
+    builder = builder.instr(step_name + ": " + step_type + " = call " + iterator_next_function(iter_type, for_stmt.iterable.source_name, for_stmt.iterable.line, for_stmt.iterable.column) + generic_suffix + "(" + iter_value_name + "_current)")
     builder = builder.instr(next_iter_name + ": " + iter_type + " = getfield " + step_name + " > 0")
     builder = builder.instr("store " + next_iter_name + ", " + iter_slot)
     builder = builder.instr(option_name + ": " + option_type + " = getfield " + step_name + " > 1")
-    builder = builder.instr("match " + option_name + ", $" + end_label + " {")
+    builder = builder.instr("match " + option_name + ", $" + exhausted_label + " {")
     builder = builder.instr("Some -> $" + body_label + "_some")
-    builder = builder.instr("None -> $" + end_label)
+    builder = builder.instr("None -> $" + exhausted_label)
     builder = builder.instr("}")
     builder = builder.label(body_label + "_some")
     builder = builder.instr(item_name + ": " + item_type + " = getfield " + option_name + " > Some")
@@ -3706,10 +4484,7 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     }
     builder = builder.instr("drop " + option_name + ": " + option_type)
     let loop_target_count = ctx.loop_targets.len()
-    match for_stmt.label {
-        Some(name) => { ctx.loop_targets.push(LoopTargetType{name, end_label, body_label}) }
-        None => {}
-    }
+    ctx.loop_targets.push(LoopTargetType{loop_label_name(for_stmt.label), end_label, body_label, body_owned})
     builder = builder.append(translate_statements_no_default(
         ctx,
         for_stmt.body.statements,
@@ -3720,14 +4495,23 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     ))
     while ctx.loop_targets.len() > loop_target_count { ctx.loop_targets.pop() }
     let body_terminates = block_terminates_flow(for_stmt.body)
-    if !block_always_returns(for_stmt.body) && !body_terminates { builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", outer_owned) }
-    restore_owned_vars(ctx, outer_owned)
+    if !block_always_returns(for_stmt.body) && !body_terminates { builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", body_owned) }
+    restore_owned_vars(ctx, body_owned)
     if !body_terminates { builder = builder.instr("br $" + body_label) }
+    builder = builder.label(exhausted_label)
+    builder = builder.instr("drop " + option_name + ": " + option_type)
+    builder = builder.instr("br $" + end_label)
     builder = builder.label(end_label)
+    let final_iter_name = iter_prefix + "_final_iter"
+    builder = builder.instr(final_iter_name + ": " + iter_type + " = load " + iter_slot)
+    if ctx_type_needs_ownership(ctx, iter_type) {
+        builder = builder.instr("drop " + final_iter_name + ": " + iter_type)
+    }
+    restore_owned_vars(ctx, outer_owned)
     ret builder
 }
 
-fn iterator_type_for(iterable_type: str) -> str {
+fn iterator_type_for(iterable_type: str, source_name: str, line: usize, column: usize) -> str {
     let owner = method_owner_name(iterable_type)
     if owner == "Vec" {
         ret "VecIter[" + first_generic_type(iterable_type) + "]"
@@ -3737,22 +4521,22 @@ fn iterator_type_for(iterable_type: str) -> str {
     }
     if owner == "Range" { ret "Range" }
     if owner == "Enumerate" { ret iterable_type }
-    panic("Unable to resolve iterator type for '" + iterable_type + "'")
+    translation_error_at(source_name, line, column, "not-iterable", "type '" + iterable_type + "' cannot be iterated")
     ret "void"
 }
 
-fn iterator_item_type(iter_type: str) -> str {
+fn iterator_item_type(iter_type: str, source_name: str, line: usize, column: usize) -> str {
     let owner = method_owner_name(iter_type)
     if owner == "VecIter" {
         ret first_generic_type(iter_type)
     }
     if owner == "Range" { ret "usize" }
     if owner == "Enumerate" { ret "__tuple_2[usize, " + nth_generic_type(iter_type, 0_usize) + "]" }
-    panic("Unable to resolve iterator item type for '" + iter_type + "'")
+    translation_error_at(source_name, line, column, "invalid-iterator", "cannot resolve item type for iterator '" + iter_type + "'")
     ret "void"
 }
 
-fn iterator_iter_function(iterable_type: str) -> str {
+fn iterator_iter_function(iterable_type: str, source_name: str, line: usize, column: usize) -> str {
     let owner = method_owner_name(iterable_type)
     if owner == "Vec" {
         ret "Vec::iter"
@@ -3762,18 +4546,18 @@ fn iterator_iter_function(iterable_type: str) -> str {
     }
     if owner == "Range" { ret "Range::iter" }
     if owner == "Enumerate" { ret "Enumerate::iter" }
-    panic("Unable to resolve iter function for '" + iterable_type + "'")
+    translation_error_at(source_name, line, column, "invalid-iterator", "cannot resolve iter function for type '" + iterable_type + "'")
     ret ""
 }
 
-fn iterator_next_function(iter_type: str) -> str {
+fn iterator_next_function(iter_type: str, source_name: str, line: usize, column: usize) -> str {
     let owner = method_owner_name(iter_type)
     if owner == "VecIter" {
         ret "VecIter::next"
     }
     if owner == "Range" { ret "Range::next" }
     if owner == "Enumerate" { ret "Enumerate::next" }
-    panic("Unable to resolve next function for '" + iter_type + "'")
+    translation_error_at(source_name, line, column, "invalid-iterator", "cannot resolve next function for iterator '" + iter_type + "'")
     ret ""
 }
 
@@ -3917,14 +4701,19 @@ fn find_top_level_comma(value: str) -> usize {
     ret value.len()
 }
 
-fn function_is_active(item: FunctionItem, target: TargetSpec) -> bool {
+fn function_has_attr(item: FunctionItem, expected: str) -> bool {
+    for attr in item.attrs { if attr == expected { ret true } }
+    ret false
+}
+
+fn function_is_active(item: FunctionItem, target: TargetSpec, features: Vec[str]) -> bool {
     for attr in item.attrs {
         if contains_substring(attr, "test") {
             ret false
         }
         if starts_with(attr, "cfg:") {
             let expr = attr.slice(4_usize, attr.len() - 4_usize)
-            if !cfg_active(target, expr) {
+            if !cfg_active_with_features(target, expr, features) {
                 ret false
             }
         }
@@ -3946,10 +4735,30 @@ fn translate_owned_ret_expr(ctx: mut TranslatorContext, expr: ExprNode, ret_type
     ctx.expression_hint = canonical_type(ret_type)
     let lowered = load_mutable_value(lower_expr(ctx, expr, result_prefix + "_expr", 0_usize), result_prefix + "_load")
     ctx.expression_hint = ""
+    let numeric_coercion = is_numeric_type(value_type_name(lowered.typ)) && is_numeric_type(value_type_name(ret_type))
+    if !numeric_coercion && !function_type_matches(ret_type, lowered.typ, Vec[str]::new()) {
+        translation_error_at(expr.source_name, expr.line, expr.column, "return-type-mismatch", "cannot return value of type '" + canonical_type(value_type_name(lowered.typ)) + "' from function returning '" + canonical_type(value_type_name(ret_type)) + "'")
+    }
     let mut builder = lowered.code
     builder = builder.append(translate_with_cleanups(ctx, result_prefix + "_with_cleanup"))
     if borrowed_copy && exclude_name == "" && ctx_type_needs_ownership(ctx, lowered.typ) {
         builder = builder.instr("retain " + lowered.value + ": " + lowered.typ)
+    }
+    if exclude_name != "" && expr_path_or_empty(expr) == "" {
+        match ctx_lookup_var(ctx, exclude_name) {
+            Option[str]::Some(owner_type) => {
+                let owner_value = ctx_lookup_value_name(ctx, exclude_name)
+                if starts_with(owner_type, "mut ") {
+                    let value_type = value_type_name(owner_type)
+                    let loaded = result_prefix + "_moved_owner"
+                    builder = builder.instr(loaded + ": " + value_type + " = load " + owner_value)
+                    builder = builder.instr("drop " + loaded + ": " + value_type)
+                } else {
+                    builder = builder.instr("drop " + owner_value + ": " + owner_type)
+                }
+            }
+            Option[str]::None => {}
+        }
     }
     builder = append_owned_drops(ctx, builder, exclude_name, result_prefix)
     if is_numeric_type(lowered.typ) && is_numeric_type(ret_type) && lowered.typ != ret_type {
@@ -4148,7 +4957,7 @@ fn decimal_digit(value: str) -> usize {
     if value == "7" { ret 7_usize }
     if value == "8" { ret 8_usize }
     if value == "9" { ret 9_usize }
-    panic("Invalid decimal array size: " + value)
+    translation_invariant_error("invalid decimal array size '" + value + "' reached lowering")
     ret 0_usize
 }
 
@@ -4185,6 +4994,13 @@ fn contains_substring(value: str, needle: str) -> bool {
             ret true
         }
         start = start + 1_usize
+    }
+    ret false
+}
+
+fn contains_str(values: Vec[str], needle: str) -> bool {
+    for value in values {
+        if value == needle { ret true }
     }
     ret false
 }
@@ -4254,4 +5070,16 @@ fn string_token_body(value: str) -> str {
         ret unsafe { encore_unescape_string_literal(value.slice(1_usize, chars - 2_usize)) }
     }
     ret unsafe { encore_unescape_string_literal(value) }
+}
+
+#attr(test)
+fn module_function_overload_contract() -> bool {
+    let source = "fn draw(value: u32) -> u32 { ret value }\nfn draw(value: str) -> str { ret value }\nfn main() -> u32 { let a = canvas::draw(7_u32)\nlet b = fonts::draw(\"Roboto\")\nret a }"
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new()
+    let output = translate_to_ehir(parser.parse(lexer.tokenize(source)))
+    ret output.contains("fn draw(value: u32) -> u32")
+        && output.contains("fn draw__overload_1(value: str) -> str")
+        && output.contains("call draw(")
+        && output.contains("call draw__overload_1(")
 }

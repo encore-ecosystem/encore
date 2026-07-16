@@ -1,14 +1,21 @@
 import core::option::Option
 import core::panic::panic
+import core::io::eprintln
+import core::process::exit
 import std::os::file_exists
 import std::os::read_file
 import std::os::write_file
 import std::path::Path
 import std::vec::Vec
 
-import toml::{TomlDocument, toml_get_bool, toml_get_string, toml_get_string_array, toml_parse_document}
+import toml::{TomlDocument, toml_get_bool, toml_get_string, toml_get_string_array, toml_parse_document, toml_section_keys}
 import refrain::target::{TargetSpec, Toolchain}
 
+
+pub struct ProjectFeature {
+    name: str
+    members: Vec[str]
+}
 
 pub struct ProjectManifest {
     name: str
@@ -19,6 +26,7 @@ pub struct ProjectManifest {
     dependencies: Vec[str]
     build: Option[str]
     target: str
+    features: Vec[ProjectFeature]
 }
 
 pub fn read_project_manifest(root: Path) -> ProjectManifest {
@@ -36,6 +44,13 @@ pub fn read_project_manifest(root: Path) -> ProjectManifest {
     let licence = project_string_or(doc, "licence", "MIT")
     let build = toml_get_string(doc, "project", "build")
     let target = project_string_or(doc, "target", "auto")
+    let mut features = Vec[ProjectFeature]::new()
+    for feature_name in toml_section_keys(doc, "features") {
+        match toml_get_string_array(doc, "features", feature_name) {
+            Some(members) => { features.push(ProjectFeature{feature_name, members}) }
+            None => { manifest_error("Feature '" + feature_name + "' must be a string array in " + manifest_path.as_str()) }
+        }
+    }
 
     let mut dependencies = Vec[str]::new()
     match toml_get_string_array(doc, "project", "dependencies") {
@@ -50,19 +65,64 @@ pub fn read_project_manifest(root: Path) -> ProjectManifest {
         dependencies.push("sys@core")
     }
 
-    ret ProjectManifest{name, version, description, readme, licence, dependencies, build, target}
+    ret ProjectManifest{name, version, description, readme, licence, dependencies, build, target, features}
 }
 
 pub fn project_manifest_name(manifest: ProjectManifest) -> str { ret manifest.name }
 pub fn project_manifest_version(manifest: ProjectManifest) -> str { ret manifest.version }
 pub fn project_manifest_dependencies(manifest: ProjectManifest) -> Vec[str] { ret manifest.dependencies }
 pub fn project_manifest_target(manifest: ProjectManifest) -> str { ret manifest.target }
+pub fn project_manifest_features(manifest: ProjectManifest) -> Vec[ProjectFeature] { ret manifest.features }
+
+pub fn project_manifest_resolve_features(manifest: ProjectManifest, requested: Vec[str]) -> Vec[str] {
+    let mut enabled = Vec[str]::new()
+    let mut queue = feature_members(manifest.features, "default")
+    for feature in requested { if !contains_string(queue, feature) { queue.push(feature) } }
+    let mut index = 0_usize
+    while index < queue.len() {
+        match queue.get(index) {
+            Some(feature) => {
+                if !is_dependency_member(feature) && !contains_string(enabled, feature) {
+                    if !has_feature(manifest.features, feature) { manifest_error("Unknown feature '" + feature + "' for package " + manifest.name) }
+                    enabled.push(feature)
+                    for member in feature_members(manifest.features, feature) {
+                        if !is_dependency_member(member) { queue.push(member) }
+                    }
+                }
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret enabled
+}
+
+pub fn project_manifest_feature_dependencies(manifest: ProjectManifest, enabled: Vec[str]) -> Vec[str] {
+    let mut dependencies = Vec[str]::new()
+    let mut queue = enabled
+    let mut index = 0_usize
+    while index < queue.len() {
+        match queue.get(index) {
+            Some(feature) => {
+                for member in feature_members(manifest.features, feature) {
+                    if is_dependency_member(member) {
+                        if !contains_string(dependencies, member) { dependencies.push(member) }
+                    } elif !contains_string(queue, member) { queue.push(member) }
+                }
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret dependencies
+}
 
 pub fn project_target_toolchain(root: Path, target: TargetSpec, defaults: Toolchain) -> Toolchain {
     let source = read_file(native_path(root.join("encore.toml").as_str()))
     let doc = toml_parse_document(source)
     let section = "target." + target.triple
     ret Toolchain{
+        target_setting(doc, section, "driver", target_setting(doc, "target", "driver", defaults.driver)),
         target_setting(doc, section, "cc", target_setting(doc, "target", "cc", defaults.compiler)),
         target_setting(doc, section, "linker", target_setting(doc, "target", "linker", defaults.linker)),
         target_setting(doc, section, "ar", target_setting(doc, "target", "ar", defaults.archiver)),
@@ -111,7 +171,45 @@ pub fn write_project_manifest(root: Path, manifest: ProjectManifest) -> i32 {
         Some(command) => { source = source + "build = \"" + toml_escape(command) + "\"\n" }
         None => {}
     }
+    if manifest.features.len() > 0_usize {
+        source = source + "\n[features]\n"
+        for feature in manifest.features {
+            source = source + feature.name + " = " + string_array(feature.members) + "\n"
+        }
+    }
     ret write_file(native_path(root.join("encore.toml").as_str()), source)
+}
+
+fn feature_members(features: Vec[ProjectFeature], name: str) -> Vec[str] {
+    for feature in features { if feature.name == name { ret feature.members } }
+    ret Vec[str]::new()
+}
+
+fn has_feature(features: Vec[ProjectFeature], name: str) -> bool {
+    for feature in features { if feature.name == name { ret true } }
+    ret false
+}
+
+fn is_dependency_member(value: str) -> bool {
+    ret starts_with_text(value, "index@") || starts_with_text(value, "workspace@") || starts_with_text(value, "path@") || starts_with_text(value, "git@")
+}
+
+fn starts_with_text(value: str, prefix: str) -> bool { ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix }
+
+fn string_array(values: Vec[str]) -> str {
+    let mut out = "["
+    let mut index = 0_usize
+    while index < values.len() {
+        match values.get(index) {
+            Some(value) => {
+                if index > 0_usize { out = out + ", " }
+                out = out + "\"" + toml_escape(value) + "\""
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret out + "]"
 }
 
 fn target_setting(doc: TomlDocument, section: str, key: str, fallback: str) -> str {
@@ -155,7 +253,7 @@ fn required_project_string(doc: TomlDocument, key: str, manifest_path: Path) -> 
             ret value
         }
         Option[str]::None => {
-            panic("Manifest " + manifest_path.as_str() + " is missing [project]." + key)
+            manifest_error("Manifest " + manifest_path.as_str() + " is missing [project]." + key)
             ret ""
         }
     }
@@ -190,7 +288,13 @@ fn contains_string(items: Vec[str], target: str) -> bool {
 }
 
 fn panic_missing_manifest(manifest_path: Path) -> () {
-    panic("Unable to find encore.toml at " + manifest_path.as_str())
+    manifest_error("Unable to find encore.toml at " + manifest_path.as_str())
+    ret ()
+}
+
+fn manifest_error(message: str) -> () {
+    eprintln("error[manifest]: " + message)
+    exit(1_i32)
     ret ()
 }
 
