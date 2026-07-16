@@ -23,8 +23,13 @@ import ehirlib::core::MatchInstruction
 import ehirlib::core::param
 import ehirlib::core::block
 import ehirlib::core::fn_item
+import ehirlib::core::async_fn_item
+import ehirlib::core::await_value
 import ehirlib::core::ret_term
 import ehirlib::core::cbr_term
+import ehirlib::core::match_arm
+import ehirlib::core::match_term
+import ehirlib::core::switch_term
 import ehirlib::core::binary
 import ehirlib::core::getfield
 import ehirlib::core::setfield
@@ -45,6 +50,7 @@ import ehirlib::core::pcast
 import ehirlib::core::hfree
 import ehirlib::core::mangle_type_name
 import ehirlib::validate_module
+import ehirlib::lower_coroutines
 import llvm::core::LLVMFunction
 import llvm::core::LLVMParam
 import llvm::core::LLVMBasicBlock
@@ -935,13 +941,16 @@ fn specialize_function(function: FnDirective, args: Vec[Type]) -> FnDirective {
         }
         specialized_blocks.push(block(block_item.name, instructions, terminator))
     }
-    ret fn_item(
-        generic_symbol(function.name, args),
-        Vec[Type]::new(),
-        specialized_params,
-        substitute_generic_type(function.ret_type, params, args),
-        specialized_blocks
-    )
+    if function.is_async {
+        ret async_fn_item(
+            generic_symbol(function.name, args),
+            Vec[Type]::new(),
+            specialized_params,
+            substitute_generic_type(function.ret_type, params, args),
+            specialized_blocks
+        )
+    }
+    ret fn_item(generic_symbol(function.name, args), Vec[Type]::new(), specialized_params, substitute_generic_type(function.ret_type, params, args), specialized_blocks)
 }
 
 fn specialize_instruction(instruction: Instruction, params: Vec[Type], args: Vec[Type]) -> Instruction {
@@ -1043,6 +1052,9 @@ fn specialize_instruction(instruction: Instruction, params: Vec[Type], args: Vec
             }
             ret call(specialize_variable(data.out, params, args), call_name, generics, values, data.is_unsafe)
         }
+        Instruction::Await(data) => {
+            ret await_value(specialize_variable(data.out, params, args), specialize_variable(data.future, params, args))
+        }
         Instruction::Store(data) => { ret store(specialize_variable(data.src, params, args), specialize_variable(data.dst, params, args)) }
         Instruction::Load(data) => { ret load(specialize_variable(data.out, params, args), specialize_variable(data.src, params, args)) }
         Instruction::Binary(data) => {
@@ -1090,6 +1102,20 @@ fn specialize_terminator(terminator: Terminator, params: Vec[Type], args: Vec[Ty
     match terminator {
         Terminator::Ret(data) => { ret ret_term(specialize_variable(data.value, params, args)) }
         Terminator::Cbr(data) => { ret cbr_term(specialize_variable(data.cond, params, args), data.true_label, data.false_label) }
+        Terminator::Match(data) => {
+            let mut arms = Vec[MatchArm]::new()
+            for arm in data.arms {
+                let payload = match arm.payload_var {
+                    Option[Variable]::Some(value) => { Option[Variable]::Some(specialize_variable(value, params, args)) }
+                    Option[Variable]::None => { Option[Variable]::None }
+                }
+                arms.push(match_arm(arm.variant, payload, arm.label))
+            }
+            ret match_term(specialize_variable(data.scrutinee, params, args), data.default_label, arms)
+        }
+        Terminator::Switch(data) => {
+            ret switch_term(specialize_variable(data.scrutinee, params, args), data.default_label, data.cases)
+        }
         _ => { ret terminator }
     }
 }
@@ -1121,8 +1147,17 @@ pub fn emit_ir(module: Module) -> str {
             exit(1_i32)
         }
         Ok(validated) => {
-            let lowered = lower(validated)
-            ret lowered.ir
+            let coroutine_lowered = lower_coroutines(validated)
+            match validate_module(coroutine_lowered) {
+                Err(message) => {
+                    eprintln("error[ehir-coroutine-validation]: " + message)
+                    exit(1_i32)
+                }
+                Ok(lowered_module) => {
+                    let lowered = lower(lowered_module)
+                    ret lowered.ir
+                }
+            }
         }
     }
     ret ""
@@ -1490,6 +1525,7 @@ fn collect_instruction_types(out: mut Vec[Type], seen: usize, instruction_handle
             Instruction::Lcsos(data) => { remember_variable_type(out, seen, data.out) }
             Instruction::Lceos(data) => { remember_variable_type(out, seen, data.out) }
             Instruction::Call(data) => { remember_variable_type(out, seen, data.out) }
+            Instruction::Await(data) => { remember_variable_type(out, seen, data.out) }
             Instruction::Load(data) => { remember_variable_type(out, seen, data.out) }
             Instruction::GetField(data) => { remember_variable_type(out, seen, data.out) }
             Instruction::GetFieldPtr(data) => { remember_variable_type(out, seen, data.out) }
@@ -1755,6 +1791,11 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
             let call_args: Vec[Variable] = call_data.args
             let lowered: LLVMInstruction = lower_call(out_var, callee_name, call_data.generics, call_args)
             ret vec_singleton(lowered)
+        }
+        Await(await_data) => {
+            eprintln("internal compiler error: unlowered EHIR await for '" + await_data.out.name + "' reached LLVM codegen")
+            exit(1_i32)
+            ret Vec[LLVMInstruction]::new()
         }
         Store(store_data) => {
             let src_var: Variable = store_data.src
