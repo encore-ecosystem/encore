@@ -84,6 +84,7 @@ struct FunctionType {
     ret_type: str
     params: Vec[str]
     generics: Vec[str]
+    is_async: bool
 }
 
 struct TraitType {
@@ -119,6 +120,7 @@ struct EnumVariantType {
     path: str
     owner: str
     payload_type: str
+    generics: Vec[str]
 }
 
 struct LoopTargetType {
@@ -148,6 +150,7 @@ struct TranslatorContext {
     active_generics: Vec[GenericParam]
     target: TargetSpec
     features: Vec[str]
+    in_async_function: bool
 }
 
 pub fn filter_ast_for_target(ast: Vec[Statement], target: TargetSpec, features: Vec[str]) -> Vec[Statement] {
@@ -180,7 +183,7 @@ pub fn filter_ast_for_target(ast: Vec[Statement], target: TargetSpec, features: 
 fn without_cfg_attrs(item: FunctionItem) -> FunctionItem {
     let mut attrs = Vec[str]::new()
     for attr in item.attrs { if !starts_with(attr, "cfg:") { attrs.push(attr) } }
-    ret FunctionItem{attrs, item.is_public, item.is_extern, item.name, item.generics, item.params, item.ret_type, item.body, item.source_name, item.line, item.column}
+    ret FunctionItem{attrs, item.is_public, item.is_extern, item.is_async, item.name, item.generics, item.params, item.ret_type, item.body, item.source_name, item.line, item.column}
 }
 
 pub fn translate_to_ehir(ast: Vec[Statement]) -> str {
@@ -212,14 +215,14 @@ pub fn translate_to_ehir_for_target_and_features(ast: Vec[Statement], target: Ta
 }
 
 fn collect_context(ast: Vec[Statement], target: TargetSpec, features: Vec[str]) -> TranslatorContext {
-    let mut ctx = TranslatorContext{Vec[VarType]::new(), Vec[VarType]::new(), Vec[FunctionType]::new(), Vec[str]::new(), Vec[TraitType]::new(), Vec[TraitImplType]::new(), Vec[GenericCallable]::new(), Vec[StructFieldType]::new(), Vec[EnumVariantType]::new(), Vec[LoopTargetType]::new(), Vec[VarType]::new(), Vec[str]::new(), Vec[str]::new(), "", "void", "", Vec[GenericParam]::new(), target, features}
+    let mut ctx = TranslatorContext{Vec[VarType]::new(), Vec[VarType]::new(), Vec[FunctionType]::new(), Vec[str]::new(), Vec[TraitType]::new(), Vec[TraitImplType]::new(), Vec[GenericCallable]::new(), Vec[StructFieldType]::new(), Vec[EnumVariantType]::new(), Vec[LoopTargetType]::new(), Vec[VarType]::new(), Vec[str]::new(), Vec[str]::new(), "", "void", "", Vec[GenericParam]::new(), target, features, false}
     for stmt in ast {
         match stmt {
             Statement::Function(fn_item) => {
                 if function_is_active(fn_item, target, features) {
                     if fn_item.is_extern { ctx.extern_functions.push(fn_item.name) }
                     if function_has_attr(fn_item, "borrowed_return") { ctx.borrowed_return_functions.push(fn_item.name) }
-                    ctx_add_function(ctx, fn_item.name, function_ret_type(fn_item), function_param_types(fn_item), generic_param_names(fn_item.generics))
+                    ctx_add_function(ctx, fn_item.name, function_ret_type(fn_item), function_param_types(fn_item), generic_param_names(fn_item.generics), fn_item.is_async)
                     remember_generic_callable(ctx, fn_item.name, fn_item.generics)
                 }
             }
@@ -230,7 +233,7 @@ fn collect_context(ast: Vec[Statement], target: TargetSpec, features: Vec[str]) 
                     let mut payload_type = "void"
                     match variant.tuple_fields.get(0_usize) { Some(found) => { payload_type = found } None => {} }
                     match variant.named_fields.get(0_usize) { Some(found) => { payload_type = found.typ } None => {} }
-                    ctx.enum_variants.push(EnumVariantType{enum_item.name + "::" + variant.name, enum_item.name, payload_type})
+                    ctx.enum_variants.push(EnumVariantType{enum_item.name + "::" + variant.name, enum_item.name, payload_type, generic_param_names(enum_item.generics)})
                 }
             }
             Statement::Trait(trait_item) => {
@@ -240,7 +243,7 @@ fn collect_context(ast: Vec[Statement], target: TargetSpec, features: Vec[str]) 
                 for method in trait_item.methods {
                     let mut method_generics = trait_generics
                     for generic_name in generic_param_names(method.generics) { method_generics.push(generic_name) }
-                    ctx_add_function(ctx, trait_item.name + "::" + method.name, function_ret_type_for_owner(method, trait_item.name), function_param_types_for_owner(method, trait_item.name), method_generics)
+                    ctx_add_function(ctx, trait_item.name + "::" + method.name, function_ret_type_for_owner(method, trait_item.name), function_param_types_for_owner(method, trait_item.name), method_generics, method.is_async)
                     remember_generic_callable(ctx, trait_item.name + "::" + method.name, combined_generic_params(trait_item.generics, method.generics))
                 }
             }
@@ -252,7 +255,7 @@ fn collect_context(ast: Vec[Statement], target: TargetSpec, features: Vec[str]) 
                         match impl_item.trait_name { Some(trait_name) => { if trait_name == "Pow" && method.name == "op" { method_name = "pow" } } None => {} }
                         let mut method_generics = generic_param_names(impl_item.generics)
                         for generic_name in generic_param_names(method.generics) { method_generics.push(generic_name) }
-                        ctx_add_function(ctx, base_type_name(impl_item.target) + "::" + method_name, function_ret_type_for_owner(method, impl_item.target), function_param_types_for_owner(method, impl_item.target), method_generics)
+                        ctx_add_function(ctx, base_type_name(impl_item.target) + "::" + method_name, function_ret_type_for_owner(method, impl_item.target), function_param_types_for_owner(method, impl_item.target), method_generics, method.is_async)
                         remember_generic_callable(ctx, base_type_name(impl_item.target) + "::" + method_name, combined_generic_params(impl_item.generics, method.generics))
                     }
                 }
@@ -367,13 +370,13 @@ fn collect_struct_fields(ctx: mut TranslatorContext, item: StructStmt) -> () {
     ret ()
 }
 
-fn ctx_add_function(ctx: mut TranslatorContext, name: str, ret_type: str, params: Vec[str], generics: Vec[str]) -> () {
+fn ctx_add_function(ctx: mut TranslatorContext, name: str, ret_type: str, params: Vec[str], generics: Vec[str], is_async: bool) -> () {
     let mut overload_index = 0_usize
     for function in ctx.functions {
         if function.name == name { overload_index = overload_index + 1_usize }
     }
     let emitted_name = if overload_index == 0_usize { name } else { name + "__overload_" + Debug::fmt(overload_index) }
-    ctx.functions.push(FunctionType{name, emitted_name, ret_type, params, generics})
+    ctx.functions.push(FunctionType{name, emitted_name, ret_type, params, generics, is_async})
     ret ()
 }
 
@@ -1275,9 +1278,13 @@ fn translate_function(ctx: mut TranslatorContext, fn_item: FunctionItem) -> Ehir
 }
 
 fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, emitted_name: str, ret_type: str, scope_generics: Vec[GenericParam]) -> EhirTextBuilder {
+    if fn_item.is_async && fn_item.is_extern {
+        translation_error_at(fn_item.source_name, fn_item.line, fn_item.column, "async-extern", "extern functions cannot be async")
+    }
     ctx.vars = Vec[VarType]::new()
     ctx.owned_vars = Vec[VarType]::new()
     ctx.return_type = canonical_type(ret_type)
+    ctx.in_async_function = fn_item.is_async
     ctx.active_generics = combined_generic_params(scope_generics, fn_item.generics)
     let mut signature_generics = generic_param_names(ctx.active_generics)
     for generic in generic_args_from_path(ctx.self_type) { if !contains_str(signature_generics, generic) { signature_generics.push(generic) } }
@@ -1676,6 +1683,11 @@ fn impl_declares_method(item: ImplStmt, name: str) -> bool {
 }
 
 fn validate_trait_method_types(expected: FunctionType, actual_params: Vec[str], actual_ret: str, target: str, specialization_args: Vec[str], method: FunctionItem) -> () {
+    if expected.is_async != method.is_async {
+        let expected_kind = if expected.is_async { "async" } else { "synchronous" }
+        let actual_kind = if method.is_async { "async" } else { "synchronous" }
+        translation_error_at(method.source_name, method.line, method.column, "trait-method-async-mismatch", "method '" + method.name + "' is " + actual_kind + ", but the trait requires " + expected_kind)
+    }
     let contract_owner = function_owner_name(expected.name)
     let mut index = 0_usize
     while index < expected.params.len() {
@@ -2402,6 +2414,13 @@ fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usiz
         Expr::Parenthesized(inner) => {
             ret lower_expr_h(ctx, inner, prefix, idx)
         }
+        Expr::Await(inner) => {
+            if !ctx.in_async_function {
+                translation_error_at(expr.source_name, expr.line, expr.column, "await-outside-async", "'await' can only be used inside an async function")
+            }
+            translation_error_at(expr.source_name, expr.line, expr.column, "async-lowering-invariant", "await expression reached ordinary expression lowering")
+            ret lower_expr_h(ctx, inner, prefix, idx)
+        }
         Expr::Unary(unary_expr) => {
             ret lower_unary_expr(ctx, unary_expr, expr.source_name, expr.line, expr.column, prefix, idx)
         }
@@ -2572,6 +2591,13 @@ fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx:
         }
         Expr::ArrayRepeat(repeat_expr) => {
             ret lower_array_repeat_expr(ctx, repeat_expr, prefix, idx)
+        }
+        Expr::Await(inner) => {
+            if !ctx.in_async_function {
+                translation_error_at(expr.source_name, expr.line, expr.column, "await-outside-async", "'await' can only be used inside an async function")
+            }
+            translation_error_at(expr.source_name, expr.line, expr.column, "async-lowering-invariant", "boxed await expression reached ordinary expression lowering")
+            ret lower_expr_h(ctx, inner, prefix, idx)
         }
         Expr::Unary(unary_expr) => {
             ret lower_unary_expr(ctx, unary_expr, expr.source_name, expr.line, expr.column, prefix, idx)
@@ -3363,6 +3389,9 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
             ret_type = canonical_type(found)
         }
         Option[str]::None => {
+            match generic_bound_method_return(ctx, owner, method_call.method) {
+                Some(found) => { ret_type = canonical_type(found) }
+                None => {
             if starts_with(receiver.typ, "dyn ") {
                 match ctx_lookup_method_return(ctx, method_call.method) {
                     Some(found) => { ret_type = canonical_type(found) }
@@ -3372,6 +3401,8 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
                 ret_type = "__tuple_2[Iter, Option[T]]"
             } else {
                 ret_type = canonical_type(method_return_type(receiver.typ, method_call.method, source_name, line, column))
+            }
+                }
             }
         }
     }
@@ -3447,6 +3478,30 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         code = code.instr("drop " + cleanup_name + ": " + receiver_value_type)
     }
     ret LoweredExpr{code, out_name, ret_type}
+}
+
+fn generic_bound_method_return(ctx: mut TranslatorContext, owner: str, method: str) -> Option[str] {
+    for generic in ctx.active_generics {
+        if generic.name == owner {
+            for bound in generic.bounds {
+                let trait_name = base_type_name(bound.path)
+                match trait_method_contract(ctx, trait_name, method) {
+                    Some(function) => {
+                        let mut specialized = replace_type_token(function.ret_type, trait_name, owner)
+                        match lookup_trait(ctx, trait_name) {
+                            Some(contract) => {
+                                specialized = specialize_named_type(specialized, generic_param_names(contract.generics), bound.args)
+                            }
+                            None => {}
+                        }
+                        ret Option[str]::Some(specialized)
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    ret Option[str]::None
 }
 
 fn validate_generic_call_bounds(ctx: mut TranslatorContext, name: str, args: Vec[str], source_name: str, line: usize, column: usize) -> () {
@@ -3769,7 +3824,7 @@ fn match_payload_type(ctx: mut TranslatorContext, pattern: MatchPattern, scrutin
             let variant = enum_variant_name(value)
             for item in ctx.enum_variants {
                 if item.owner == base_type_name(scrutinee_type) && enum_variant_name(item.path) == variant && item.payload_type != "void" {
-                    ret canonical_type(direct_generic_hint(item.payload_type, generic_args_from_path(scrutinee_type)))
+                    ret specialize_named_type(item.payload_type, item.generics, generic_args_from_path(scrutinee_type))
                 }
             }
             translation_error_at(source_name, line, column, "invalid-match-payload", "pattern '" + value + "' has no payload compatible with type '" + scrutinee_type + "'")
