@@ -1395,7 +1395,7 @@ fn translate_async_function(ctx: mut TranslatorContext, fn_item: FunctionItem, e
     let mut impl_header = "impl"
     if generic_names.len() > 0_usize { impl_header = impl_header + "[" + join_strs(generic_names, ", ") + "]" }
     builder = builder.line(impl_header + " Future[" + output_type + "] for " + future_type + " {")
-    builder = builder.line("fn poll(self: " + future_type + ") -> " + poll_type + " {")
+    builder = builder.line("fn poll(self: " + future_type + ", context: Context) -> " + poll_type + " {")
     builder = builder.label("entry")
 
     ctx.vars = Vec[VarType]::new()
@@ -1406,6 +1406,8 @@ fn translate_async_function(ctx: mut TranslatorContext, fn_item: FunctionItem, e
     ctx.async_poll_future_type = future_type
     ctx_add_var(ctx, "self", future_type)
     ctx_add_owned_var(ctx, "self", "self", future_type)
+    ctx_add_var(ctx, "context", "Context")
+    ctx_add_owned_var(ctx, "context", "context", "Context")
     let mut field_index = 1_usize
     for param in fn_item.params {
         let param_type = canonical_type(unwrap_type_or_usize(param.typ))
@@ -1564,7 +1566,7 @@ fn translate_direct_await_function(ctx: mut TranslatorContext, fn_item: Function
     builder = builder.line("}").empty_line()
 
     builder = builder.line("impl Future[" + output_type + "] for " + future_type + " {")
-    builder = builder.line("fn poll(self: " + future_type + ") -> " + poll_type + " {")
+    builder = builder.line("fn poll(self: " + future_type + ", context: Context) -> " + poll_type + " {")
     builder = builder.label("entry")
     builder = builder.instr("async_child_slot: " + child_type + "* = salloc " + child_type)
     builder = builder.instr("async_is_start: bool = ieq self, Start")
@@ -1605,7 +1607,7 @@ fn translate_direct_await_function(ctx: mut TranslatorContext, fn_item: Function
 
     builder = builder.label("async_poll_child")
     builder = builder.instr("async_child: " + child_type + " = load async_child_slot")
-    builder = builder.instr("async_child_step: " + child_poll_type + " = call " + child_owner + "::poll(async_child)")
+    builder = builder.instr("async_child_step: " + child_poll_type + " = call " + child_owner + "::poll(async_child, context)")
     builder = builder.instr("async_child_ready: bool = ieq async_child_step, Ready")
     builder = builder.instr("cbr async_child_ready, $async_child_ready_state, $async_child_pending_state")
 
@@ -1727,7 +1729,7 @@ fn translate_await_let_function(ctx: mut TranslatorContext, fn_item: FunctionIte
     builder = builder.line("}").empty_line()
 
     builder = builder.line("impl Future[" + output_type + "] for " + future_type + " {")
-    builder = builder.line("fn poll(self: " + future_type + ") -> " + poll_type + " {")
+    builder = builder.line("fn poll(self: " + future_type + ", context: Context) -> " + poll_type + " {")
     builder = builder.label("entry")
     builder = builder.instr("async_is_start: bool = ieq self, Start")
     builder = builder.instr("cbr async_is_start, $async_start_state, $async_waiting_state")
@@ -1753,7 +1755,7 @@ fn translate_await_let_function(ctx: mut TranslatorContext, fn_item: FunctionIte
     let start_child = lower_expr_h(ctx, plan.awaited, "async_start_child", 0_usize)
     builder = builder.append(start_child.code)
     move_var_out_of_context(ctx, moved_child)
-    builder = builder.instr("async_start_step: " + child_poll_type + " = call " + child_owner + "::poll(" + start_child.value + ")")
+    builder = builder.instr("async_start_step: " + child_poll_type + " = call " + child_owner + "::poll(" + start_child.value + ", context)")
     builder = builder.instr("async_start_ready: bool = ieq async_start_step, Ready")
     builder = builder.instr("cbr async_start_ready, $async_start_ready_state, $async_start_pending_state")
     let start_vars = ctx.vars
@@ -1786,7 +1788,7 @@ fn translate_await_let_function(ctx: mut TranslatorContext, fn_item: FunctionIte
     }
     builder = builder.instr("drop async_waiting_payload: " + waiting_type)
     builder = builder.instr("drop self: " + future_type)
-    builder = builder.instr("async_waiting_step: " + child_poll_type + " = call " + child_owner + "::poll(async_waiting_child)")
+    builder = builder.instr("async_waiting_step: " + child_poll_type + " = call " + child_owner + "::poll(async_waiting_child, context)")
     builder = builder.instr("async_waiting_ready: bool = ieq async_waiting_step, Ready")
     builder = builder.instr("cbr async_waiting_ready, $async_waiting_ready_state, $async_waiting_pending_state")
     let waiting_vars = ctx.vars
@@ -3941,7 +3943,7 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     let borrowed_receiver = expr_h_is_borrowed_copy(method_call.receiver)
     let receiver_path = expr_h_path_or_empty(method_call.receiver)
     let receiver = lower_method_receiver(ctx, method_call.receiver, prefix + "_recv", idx + 1_usize)
-    let mut owner = method_owner_name(receiver.typ)
+    let mut owner = method_owner_name(value_type_name(receiver.typ))
     if starts_with(receiver.typ, "dyn ") {
         owner = receiver.typ.slice(4_usize, receiver.typ.len() - 4_usize)
     }
@@ -3981,7 +3983,12 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     let mut receiver_value = receiver.value
     let mut receiver_was_loaded = false
     let mut receiver_uses_temporary_storage = false
-    match ctx_lookup_function_param(ctx, fn_name, 0_usize, concrete_generics) {
+    let mut receiver_param = ctx_lookup_function_param(ctx, fn_name, 0_usize, concrete_generics)
+    match receiver_param {
+        None => { receiver_param = generic_bound_method_param(ctx, owner, method_call.method, 0_usize) }
+        Some(_) => {}
+    }
+    match receiver_param {
         Option[str]::Some(expected_self) => {
             if starts_with(receiver.typ, "mut ") && !starts_with(expected_self, "mut ") {
                 let loaded_name = prefix + "_recv_load_" + Debug::fmt(idx)
@@ -4063,6 +4070,35 @@ fn generic_bound_method_return(ctx: mut TranslatorContext, owner: str, method: s
                             None => {}
                         }
                         ret Option[str]::Some(specialized)
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    ret Option[str]::None
+}
+
+fn generic_bound_method_param(ctx: mut TranslatorContext, owner: str, method: str, index: usize) -> Option[str] {
+    for generic in ctx.active_generics {
+        if generic.name == owner {
+            for bound in generic.bounds {
+                let trait_name = base_type_name(bound.path)
+                match trait_method_contract(ctx, trait_name, method) {
+                    Some(function) => {
+                        match function.params.get(index) {
+                            Some(param) => {
+                                let mut specialized = replace_type_token(param, trait_name, owner)
+                                match lookup_trait(ctx, trait_name) {
+                                    Some(contract) => {
+                                        specialized = specialize_named_type(specialized, generic_param_names(contract.generics), bound.args)
+                                    }
+                                    None => {}
+                                }
+                                ret Option[str]::Some(specialized)
+                            }
+                            None => {}
+                        }
                     }
                     None => {}
                 }

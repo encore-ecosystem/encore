@@ -33,6 +33,7 @@
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(linker, "/STACK:8388608")
 #else
+#include <pthread.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/utsname.h>
@@ -44,6 +45,78 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #endif
+
+typedef struct {
+#ifdef _WIN32
+    CRITICAL_SECTION lock;
+    CONDITION_VARIABLE condition;
+#else
+    pthread_mutex_t lock;
+    pthread_cond_t condition;
+#endif
+    bool signaled;
+} encore_async_event;
+
+size_t encore_async_waker_new(void) {
+    encore_async_event *event = calloc(1, sizeof(*event));
+    if (event == NULL) return 0;
+#ifdef _WIN32
+    InitializeCriticalSection(&event->lock);
+    InitializeConditionVariable(&event->condition);
+#else
+    if (pthread_mutex_init(&event->lock, NULL) != 0) { free(event); return 0; }
+    if (pthread_cond_init(&event->condition, NULL) != 0) {
+        pthread_mutex_destroy(&event->lock);
+        free(event);
+        return 0;
+    }
+#endif
+    return (size_t)(uintptr_t)event;
+}
+
+void encore_async_waker_wake(size_t token) {
+    encore_async_event *event = (encore_async_event *)(uintptr_t)token;
+    if (event == NULL) return;
+#ifdef _WIN32
+    EnterCriticalSection(&event->lock);
+    event->signaled = true;
+    WakeAllConditionVariable(&event->condition);
+    LeaveCriticalSection(&event->lock);
+#else
+    pthread_mutex_lock(&event->lock);
+    event->signaled = true;
+    pthread_cond_broadcast(&event->condition);
+    pthread_mutex_unlock(&event->lock);
+#endif
+}
+
+void encore_async_waker_wait(size_t token) {
+    encore_async_event *event = (encore_async_event *)(uintptr_t)token;
+    if (event == NULL) return;
+#ifdef _WIN32
+    EnterCriticalSection(&event->lock);
+    while (!event->signaled) SleepConditionVariableCS(&event->condition, &event->lock, INFINITE);
+    event->signaled = false;
+    LeaveCriticalSection(&event->lock);
+#else
+    pthread_mutex_lock(&event->lock);
+    while (!event->signaled) pthread_cond_wait(&event->condition, &event->lock);
+    event->signaled = false;
+    pthread_mutex_unlock(&event->lock);
+#endif
+}
+
+void encore_async_waker_drop(size_t token) {
+    encore_async_event *event = (encore_async_event *)(uintptr_t)token;
+    if (event == NULL) return;
+#ifdef _WIN32
+    DeleteCriticalSection(&event->lock);
+#else
+    pthread_cond_destroy(&event->condition);
+    pthread_mutex_destroy(&event->lock);
+#endif
+    free(event);
+}
 
 void *__ehir_pcast(size_t value) {
     return (void *)(uintptr_t)value;
