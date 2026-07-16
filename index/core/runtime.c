@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -56,6 +57,76 @@ typedef struct {
 #endif
     bool signaled;
 } encore_async_event;
+
+typedef void (*encore_thread_entry)(void *);
+
+typedef struct {
+#ifdef _WIN32
+    HANDLE thread;
+#else
+    pthread_t thread;
+#endif
+    encore_thread_entry entry;
+    void *payload;
+    bool started;
+} encore_thread_task;
+
+#ifdef _WIN32
+static DWORD WINAPI encore_thread_main(LPVOID raw) {
+#else
+static void *encore_thread_main(void *raw) {
+#endif
+    encore_thread_task *task = (encore_thread_task *)raw;
+    task->entry(task->payload);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+size_t encore_thread_spawn(encore_thread_entry entry, void *payload) {
+    if (entry == NULL) return 0;
+    encore_thread_task *task = malloc(sizeof(*task));
+    if (task == NULL) return 0;
+    task->entry = entry;
+    task->payload = payload;
+    task->started = false;
+#ifdef _WIN32
+    task->thread = CreateThread(NULL, 0, encore_thread_main, task, 0, NULL);
+    if (task->thread != NULL) task->started = true;
+#else
+    if (pthread_create(&task->thread, NULL, encore_thread_main, task) == 0) task->started = true;
+#endif
+    if (!task->started) task->entry(task->payload);
+    return (size_t)(uintptr_t)task;
+}
+
+void *encore_thread_join(size_t token) {
+    encore_thread_task *task = (encore_thread_task *)(uintptr_t)token;
+    if (task == NULL) return NULL;
+#ifdef _WIN32
+    if (task->started) {
+        WaitForSingleObject(task->thread, INFINITE);
+        CloseHandle(task->thread);
+    }
+#else
+    if (task->started) pthread_join(task->thread, NULL);
+#endif
+    void *payload = task->payload;
+    free(task);
+    return payload;
+}
+
+size_t encore_thread_available_parallelism(void) {
+#ifdef _WIN32
+    DWORD count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    return count == 0 ? 1 : (size_t)count;
+#else
+    long count = sysconf(_SC_NPROCESSORS_ONLN);
+    return count < 1 ? 1 : (size_t)count;
+#endif
+}
 
 size_t encore_async_waker_new(void) {
     encore_async_event *event = calloc(1, sizeof(*event));
@@ -126,7 +197,7 @@ typedef union encore_heap_block encore_heap_block;
 union encore_heap_block {
     struct {
         size_t capacity;
-        size_t refs;
+        _Atomic size_t refs;
     } meta;
     max_align_t alignment;
 };
@@ -138,7 +209,7 @@ static void *encore_heap_alloc(size_t bytes) {
     encore_heap_block *block = malloc(sizeof(encore_heap_block) + bytes);
     if (block == NULL) return NULL;
     block->meta.capacity = bytes;
-    block->meta.refs = 1;
+    atomic_init(&block->meta.refs, 1);
     return block + 1;
 }
 
@@ -147,7 +218,7 @@ void *__ehir_hrealloc(void *ptr, size_t bytes) {
     if (bytes == 0) bytes = 1;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
     if (bytes <= block->meta.capacity) return ptr;
-    if (block->meta.refs == 1) {
+    if (atomic_load_explicit(&block->meta.refs, memory_order_acquire) == 1) {
         encore_heap_block *resized = realloc(block, sizeof(encore_heap_block) + bytes);
         if (resized == NULL) return NULL;
         resized->meta.capacity = bytes;
@@ -156,32 +227,28 @@ void *__ehir_hrealloc(void *ptr, size_t bytes) {
     void *next = encore_heap_alloc(bytes);
     if (next == NULL) return NULL;
     memcpy(next, ptr, block->meta.capacity);
-    block->meta.refs -= 1;
+    atomic_fetch_sub_explicit(&block->meta.refs, 1, memory_order_acq_rel);
     return next;
 }
 
 void __ehir_hfree(void *ptr) {
     if (ptr == NULL) return;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
-    if (block->meta.refs > 1) {
-        block->meta.refs -= 1;
-        return;
-    }
-    free(block);
+    if (atomic_fetch_sub_explicit(&block->meta.refs, 1, memory_order_acq_rel) == 1) free(block);
 }
 
 void encore_heap_retain(void *ptr) {
     if (ptr == NULL) return;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
-    block->meta.refs += 1;
+    atomic_fetch_add_explicit(&block->meta.refs, 1, memory_order_relaxed);
 }
 
 bool encore_heap_release(void *ptr) {
     if (ptr == NULL) return false;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
-    if (block->meta.refs > 1) {
-        block->meta.refs -= 1;
-        return false;
+    size_t refs = atomic_load_explicit(&block->meta.refs, memory_order_acquire);
+    while (refs > 1) {
+        if (atomic_compare_exchange_weak_explicit(&block->meta.refs, &refs, refs - 1, memory_order_acq_rel, memory_order_acquire)) return false;
     }
     return true;
 }
@@ -189,12 +256,12 @@ bool encore_heap_release(void *ptr) {
 bool encore_heap_is_unique(void *ptr) {
     if (ptr == NULL) return true;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
-    return block->meta.refs == 1;
+    return atomic_load_explicit(&block->meta.refs, memory_order_acquire) == 1;
 }
 
 typedef union {
     struct {
-        size_t refs;
+        _Atomic size_t refs;
     } meta;
     max_align_t alignment;
 } encore_box_header;
@@ -202,25 +269,24 @@ typedef union {
 void *encore_box_alloc(size_t bytes) {
     encore_box_header *header = malloc(sizeof(encore_box_header) + bytes);
     if (header == NULL) return NULL;
-    header->meta.refs = 1;
+    atomic_init(&header->meta.refs, 1);
     return (void *)(header + 1);
 }
 
 void encore_box_retain(void *payload) {
     if (payload == NULL) return;
     encore_box_header *header = ((encore_box_header *)payload) - 1;
-    header->meta.refs += 1;
+    atomic_fetch_add_explicit(&header->meta.refs, 1, memory_order_relaxed);
 }
 
 void encore_box_drop(void *payload) {
     if (payload == NULL) return;
     encore_box_header *header = ((encore_box_header *)payload) - 1;
-    if (header->meta.refs > 1) { header->meta.refs -= 1; return; }
-    free(header);
+    if (atomic_fetch_sub_explicit(&header->meta.refs, 1, memory_order_acq_rel) == 1) free(header);
 }
 
 typedef struct {
-    size_t ref_count;
+    _Atomic size_t ref_count;
     size_t len;
     char data[];
 } encore_str_object;
@@ -233,7 +299,7 @@ static encore_str encore_empty_str(void);
 static encore_str encore_from_owned_buffer(char *buffer, size_t len);
 
 static struct {
-    size_t ref_count;
+    _Atomic size_t ref_count;
     size_t len;
     char data[1];
 } g_empty_str_object = {.ref_count = 0, .len = 0, .data = {0}};
@@ -423,7 +489,7 @@ static encore_str encore_from_owned_buffer(char *buffer, size_t len) {
         free(buffer);
         return encore_empty_str();
     }
-    object->ref_count = 1;
+    atomic_init(&object->ref_count, 1);
     object->len = len;
     if (len > 0) {
         memcpy(object->data, buffer, len);
@@ -701,24 +767,17 @@ encore_str encore_str_join_parts(size_t raw_ptr, size_t len) {
 }
 
 void encore_str_retain(encore_str value) {
-    if (value.object == NULL || value.object->ref_count == 0) {
+    if (value.object == NULL || atomic_load_explicit(&value.object->ref_count, memory_order_relaxed) == 0) {
         return;
     }
-    value.object->ref_count += 1;
+    atomic_fetch_add_explicit(&value.object->ref_count, 1, memory_order_relaxed);
 }
 
 void encore_str_drop(encore_str value) {
-    if (value.object == NULL || value.object->ref_count == 0) {
+    if (value.object == NULL || atomic_load_explicit(&value.object->ref_count, memory_order_relaxed) == 0) {
         return;
     }
-    if (value.object->ref_count == 0) {
-        return;
-    }
-    value.object->ref_count -= 1;
-    if (value.object->ref_count != 0) {
-        return;
-    }
-    free(value.object);
+    if (atomic_fetch_sub_explicit(&value.object->ref_count, 1, memory_order_acq_rel) == 1) free(value.object);
 }
 
 static encore_str encore_format(const char *fmt, ...) {

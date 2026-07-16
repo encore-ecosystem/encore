@@ -144,11 +144,13 @@ pub fn lower(module: Module) -> LoweredModule {
     let mut generic_calls = collect_generic_calls(directives)
     expand_generic_calls(directives, generic_calls)
     let concrete_types = collect_concrete_types(directives, generic_calls)
-    let type_declarations = lower_type_declarations(directives, concrete_types)
+    let mut type_declarations = lower_type_declarations(directives, concrete_types)
+    type_declarations.extend(thread_context_declarations(directives))
     let mut functions = lower_directives(directives)
     functions.extend(lower_generic_functions(directives, generic_calls))
     functions.extend(lower_trait_dispatch_functions(directives, concrete_types))
     functions.extend(lower_drop_functions(directives, concrete_types))
+    functions.extend(thread_trampolines(directives))
     functions.extend(runtime_declarations())
     functions = unique_functions(functions)
     let safe_module_name = sanitize_symbol(module_name)
@@ -348,6 +350,144 @@ fn runtime_declarations() -> Vec[LLVMFunction] {
     str_concat_params.push(llvm_make_param("lhs", raw_ptr))
     str_concat_params.push(llvm_make_param("rhs", raw_ptr))
     out.push(llvm_declare_fn("encore_str_concat", raw_ptr, str_concat_params, Vec[LLVMBasicBlock]::new()))
+    let fn_ptr = llvm_raw_type(LLVMTypeKind::POINTER, "void (i8*)*")
+    let mut spawn_params = Vec[LLVMParam]::new()
+    spawn_params.push(llvm_make_param("entry", fn_ptr))
+    spawn_params.push(llvm_make_param("payload", raw_ptr))
+    out.push(llvm_declare_fn("encore_thread_spawn", usize_type, spawn_params, Vec[LLVMBasicBlock]::new()))
+    out.push(llvm_declare_fn("encore_thread_join", raw_ptr, vec_singleton(llvm_make_param("token", usize_type)), Vec[LLVMBasicBlock]::new()))
+    ret out
+}
+
+fn is_thread_spawn_name(name: str) -> bool {
+    ret has_prefix(name, "__encore_thread_spawn__")
+}
+
+fn thread_spawn_target(name: str) -> str {
+    let prefix_len = 23_usize
+    if name.len() <= prefix_len { ret "" }
+    ret name.slice(prefix_len, name.len() - prefix_len)
+}
+
+fn thread_result_type(out: Variable) -> Type {
+    let handle = required_variable_type(out)
+    match handle.generics.get(0_usize) {
+        Some(result) => { ret result }
+        None => {
+            eprintln("internal compiler error: thread handle '" + handle.name + "' has no result type")
+            exit(1_i32)
+            ret Type{"usize", Vec[Type]::new(), PointerKind::Plain}
+        }
+    }
+}
+
+fn thread_result_is_void(result: Type) -> bool { ret result.name == "void" || result.name == "()" }
+
+fn thread_result_storage_type(result: Type) -> LLVMType {
+    if thread_result_is_void(result) { ret i8_type() }
+    ret lower_type(result)
+}
+
+fn thread_site_key(name: str, out: Variable, generics: Vec[Type], args: Vec[Variable]) -> str {
+    let mut raw = thread_spawn_target(name) + "_" + mangle_type_name(thread_result_type(out))
+    for generic in generics { raw = raw + "_g_" + mangle_type_name(generic) }
+    for arg in args { raw = raw + "_a_" + mangle_type_name(required_variable_type(arg)) }
+    ret sanitize_symbol(raw)
+}
+
+fn thread_context_type(name: str, out: Variable, generics: Vec[Type], args: Vec[Variable]) -> LLVMType {
+    ret named_struct_type("__encore_thread_context_" + thread_site_key(name, out, generics, args))
+}
+
+fn append_thread_context_declaration(out: mut Vec[str], seen: usize, instruction: Instruction) -> () {
+    match instruction {
+        Instruction::Call(data) => {
+            if required_variable_type(data.out).name != "JoinHandle" { ret () }
+            if !is_thread_spawn_name(data.name) { ret () }
+            let key = thread_site_key(data.name, data.out, data.generics, data.args)
+            if !unsafe { encore_strset_insert(seen, key) } { ret () }
+            let mut fields = type_text(thread_result_storage_type(thread_result_type(data.out)))
+            for arg in data.args { fields = fields + ", " + type_text(lower_type(required_variable_type(arg))) }
+            out.push("%__encore_thread_context_" + key + " = type { " + fields + " }")
+        }
+        _ => {}
+    }
+    ret ()
+}
+
+fn thread_context_declarations(directives: Vec[Directive]) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let seen = unsafe { encore_strset_new() }
+    for directive in directives {
+        match directive {
+            Directive::Function(function) => { for block_item in function.blocks { for instruction in block_item.instructions { append_thread_context_declaration(out, seen, instruction) } } }
+            Directive::Impl(item) => { for method in item.methods { for block_item in method.blocks { for instruction in block_item.instructions { append_thread_context_declaration(out, seen, instruction) } } } }
+            _ => {}
+        }
+    }
+    unsafe { encore_strset_free(seen) }
+    ret out
+}
+
+fn make_thread_trampoline(data: CallInstruction) -> LLVMFunction {
+    let key = thread_site_key(data.name, data.out, data.generics, data.args)
+    let context_type = thread_context_type(data.name, data.out, data.generics, data.args)
+    let context_ptr_type = ptr_type(context_type)
+    let raw_ptr_type = ptr_type(i8_type())
+    let raw_payload = reg("payload", raw_ptr_type)
+    let context = reg("context", context_ptr_type)
+    let mut instructions = vec_singleton(llvm_inst_cast("bitcast", context, raw_payload))
+    let mut args = Vec[LLVMValue]::new()
+    let mut index = 0_usize
+    for argument in data.args {
+        let arg_type = lower_type(required_variable_type(argument))
+        let arg_ptr = reg("arg_" + Debug::fmt(index) + "_ptr", ptr_type(arg_type))
+        let arg_value = reg("arg_" + Debug::fmt(index), arg_type)
+        instructions.push(llvm_inst_gep(arg_ptr, context_type, context, field_indices(Debug::fmt(index + 1_usize)), true))
+        instructions.push(llvm_inst_load(arg_value, arg_ptr))
+        args.push(arg_value)
+        index = index + 1_usize
+    }
+    let result_ehir_type = thread_result_type(data.out)
+    let result_type = lower_type(result_ehir_type)
+    let target = if data.generics.len() > 0_usize { generic_symbol(thread_spawn_target(data.name), data.generics) } else { function_symbol(thread_spawn_target(data.name)) }
+    if thread_result_is_void(result_ehir_type) {
+        instructions.push(llvm_inst_call(Option[LLVMValue]::None, void_type(), target, args))
+    } else {
+        let result = reg("result", result_type)
+        instructions.push(llvm_inst_call(Option[LLVMValue]::Some(result), result_type, target, args))
+        let result_ptr = reg("result_ptr", ptr_type(result_type))
+        instructions.push(llvm_inst_gep(result_ptr, context_type, context, field_indices("0"), true))
+        instructions.push(llvm_inst_store(result, result_ptr))
+    }
+    let params = vec_singleton(llvm_make_param("payload", raw_ptr_type))
+    let blocks = vec_singleton(llvm_block("entry", instructions, llvm_term_ret_void()))
+    ret llvm_define_fn("__encore_thread_trampoline_" + key, void_type(), params, blocks)
+}
+
+fn append_thread_trampoline(out: mut Vec[LLVMFunction], seen: usize, instruction: Instruction) -> () {
+    match instruction {
+        Instruction::Call(data) => {
+            if required_variable_type(data.out).name == "JoinHandle" {
+                if is_thread_spawn_name(data.name) && unsafe { encore_strset_insert(seen, thread_site_key(data.name, data.out, data.generics, data.args)) } { out.push(make_thread_trampoline(data)) }
+            }
+        }
+        _ => {}
+    }
+    ret ()
+}
+
+fn thread_trampolines(directives: Vec[Directive]) -> Vec[LLVMFunction] {
+    let mut out = Vec[LLVMFunction]::new()
+    let seen = unsafe { encore_strset_new() }
+    for directive in directives {
+        match directive {
+            Directive::Function(function) => { for block_item in function.blocks { for instruction in block_item.instructions { append_thread_trampoline(out, seen, instruction) } } }
+            Directive::Impl(item) => { for method in item.methods { for block_item in method.blocks { for instruction in block_item.instructions { append_thread_trampoline(out, seen, instruction) } } } }
+            _ => {}
+        }
+    }
+    unsafe { encore_strset_free(seen) }
     ret out
 }
 
@@ -468,6 +608,23 @@ fn lower_heap_retain_function(concrete: Type) -> LLVMFunction {
 fn lower_struct_drop_function(params: Vec[Type], fields: Vec[Parameter], concrete: Type) -> LLVMFunction {
     let self_value = reg("self", lower_type(concrete))
     let mut instructions = Vec[LLVMInstruction]::new()
+    if concrete.name == "JoinHandle" && concrete.generics.len() == 1_usize {
+        let result_type = required_generic_type(concrete, 0_usize)
+        let token = reg("token", pointer_int_type())
+        let raw = reg("context_raw", ptr_type(i8_type()))
+        instructions.push(llvm_inst_extractvalue(token, self_value, "0"))
+        instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw), ptr_type(i8_type()), "encore_thread_join", vec_singleton(token)))
+        if !thread_result_is_void(result_type) {
+            let result_ptr = reg("result_ptr", ptr_type(lower_type(result_type)))
+            let result = reg("result", lower_type(result_type))
+            instructions.push(llvm_inst_cast("bitcast", result_ptr, raw))
+            instructions.push(llvm_inst_load(result, result_ptr))
+            instructions.extend(lower_drop_value(result, result_type, "thread_result"))
+        }
+        instructions.push(llvm_inst_call(Option[LLVMValue]::None, void_type(), "__ehir_hfree", vec_singleton(raw)))
+        let params_data = vec_singleton(llvm_make_param("self", lower_type(concrete)))
+        ret llvm_define_fn(drop_symbol(concrete), void_type(), params_data, vec_singleton(llvm_block("entry", instructions, llvm_term_ret_void())))
+    }
     if concrete.name == "Vec" && concrete.generics.len() == 1_usize {
         let element_type = required_generic_type(concrete, 0_usize)
         let typed_data = reg("data", ptr_type(lower_type(element_type)))
@@ -731,7 +888,11 @@ fn collect_direct_generic_call(out: mut Vec[GenericCall], instruction_handle: us
         }
         match instruction {
             Instruction::Call(data) => {
-                if data.generics.len() > 0_usize { remember_generic_call(out, data.name, data.generics) }
+                if data.generics.len() > 0_usize {
+                    let is_spawn = required_variable_type(data.out).name == "JoinHandle" && is_thread_spawn_name(data.name)
+                    let name = if is_spawn { thread_spawn_target(data.name) } else { data.name }
+                    remember_generic_call(out, name, data.generics)
+                }
             }
             _ => {}
         }
@@ -1786,6 +1947,10 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
             ret instructions
         }
         Call(call_data) => {
+            if required_variable_type(call_data.out).name == "JoinHandle" {
+                if is_thread_spawn_name(call_data.name) { ret lower_thread_spawn(call_data) }
+            }
+            if call_data.name == "__encore_thread_join" { ret lower_thread_join(call_data) }
             let out_var: Variable = call_data.out
             let callee_name: str = call_data.name
             let call_args: Vec[Variable] = call_data.args
@@ -2116,6 +2281,63 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
         Retain(retain_data) => {
             let typ = required_variable_type(retain_data.value)
             ret lower_retain_value(lower_variable(retain_data.value), typ)
+        }
+    }
+}
+
+fn lower_thread_spawn(data: CallInstruction) -> Vec[LLVMInstruction] {
+    let prefix = sanitize_symbol(data.out.name)
+    let context_type = thread_context_type(data.name, data.out, data.generics, data.args)
+    let context_ptr_type = ptr_type(context_type)
+    let raw_ptr_type = ptr_type(i8_type())
+    let size_ptr = reg(prefix + "_context_size_ptr", context_ptr_type)
+    let size = reg(prefix + "_context_size", pointer_int_type())
+    let raw_context = reg(prefix + "_context_raw", raw_ptr_type)
+    let context = reg(prefix + "_context", context_ptr_type)
+    let mut instructions = vec_singleton(llvm_inst_gep(size_ptr, context_type, const_text("null", context_ptr_type), vec_singleton(const_text("1", i64_type())), false))
+    instructions.push(llvm_inst_cast("ptrtoint", size, size_ptr))
+    instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw_context), raw_ptr_type, "__ehir_hrealloc", append(vec_singleton(const_text("null", raw_ptr_type)), vec_singleton(size))))
+    instructions.push(llvm_inst_cast("bitcast", context, raw_context))
+    let mut index = 0_usize
+    for argument in data.args {
+        let value = lower_variable(argument)
+        let field_ptr = reg(prefix + "_arg_" + Debug::fmt(index) + "_ptr", ptr_type(value_type(value)))
+        instructions.push(llvm_inst_gep(field_ptr, context_type, context, field_indices(Debug::fmt(index + 1_usize)), true))
+        instructions.push(llvm_inst_store(value, field_ptr))
+        index = index + 1_usize
+    }
+    let function_ptr_type = llvm_raw_type(LLVMTypeKind::POINTER, "void (i8*)*")
+    let entry = const_text("@__encore_thread_trampoline_" + thread_site_key(data.name, data.out, data.generics, data.args), function_ptr_type)
+    let token = reg(prefix + "_token", pointer_int_type())
+    instructions.push(llvm_inst_call(Option[LLVMValue]::Some(token), pointer_int_type(), "encore_thread_spawn", append(vec_singleton(entry), vec_singleton(raw_context))))
+    let handle_type = lower_type(required_variable_type(data.out))
+    instructions.push(llvm_inst_insertvalue(lower_variable(data.out), const_text("undef", handle_type), token, "0"))
+    ret instructions
+}
+
+fn lower_thread_join(data: CallInstruction) -> Vec[LLVMInstruction] {
+    match data.args.get(0_usize) {
+        Some(handle_var) => {
+            let prefix = sanitize_symbol(data.out.name)
+            let handle = lower_variable(handle_var)
+            let token = reg(prefix + "_token", pointer_int_type())
+            let raw = reg(prefix + "_context_raw", ptr_type(i8_type()))
+            let result_ehir_type = required_variable_type(data.out)
+            let result_type = lower_type(result_ehir_type)
+            let mut instructions = vec_singleton(llvm_inst_extractvalue(token, handle, "0"))
+            instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw), ptr_type(i8_type()), "encore_thread_join", vec_singleton(token)))
+            if !thread_result_is_void(result_ehir_type) {
+                let result_ptr = reg(prefix + "_result_ptr", ptr_type(result_type))
+                instructions.push(llvm_inst_cast("bitcast", result_ptr, raw))
+                instructions.push(llvm_inst_load(lower_variable(data.out), result_ptr))
+            }
+            instructions.push(llvm_inst_call(Option[LLVMValue]::None, void_type(), "__ehir_hfree", vec_singleton(raw)))
+            ret instructions
+        }
+        None => {
+            eprintln("internal compiler error: thread join has no handle")
+            exit(1_i32)
+            ret Vec[LLVMInstruction]::new()
         }
     }
 }

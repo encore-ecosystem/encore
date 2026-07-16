@@ -499,6 +499,45 @@ fn ctx_type_needs_ownership(ctx: mut TranslatorContext, typ: str) -> bool {
     ret false
 }
 
+fn thread_type_is_send(ctx: mut TranslatorContext, typ: str, seen: Vec[str]) -> bool {
+    let raw = canonical_type(typ)
+    if starts_with(raw, "mut ") || ends_with(raw, "*") || ends_with(raw, "<H>") || ends_with(raw, "<S>") || starts_with(raw, "dyn ") { ret false }
+    let value = canonical_type(value_type_name(raw))
+    if value == "str" || value == "()" || value == "void" || value == "bool" || is_numeric_type(value) { ret true }
+    let owner = base_type_name(value)
+    if owner == "JoinHandle" { ret false }
+    if owner == "Vec" || starts_with(owner, "__tuple_") || starts_with(owner, "__array_") {
+        for generic in generic_args_from_path(value) { if !thread_type_is_send(ctx, generic, seen) { ret false } }
+        ret true
+    }
+    if contains_string(seen, value) { ret true }
+    let mut next_seen = seen
+    next_seen.push(value)
+    let mut found = false
+    for field in ctx.fields {
+        if field.owner == owner || leaf_type_name(field.owner) == leaf_type_name(owner) {
+            found = true
+            if !thread_type_is_send(ctx, direct_generic_hint(field.typ, generic_args_from_path(value)), next_seen) { ret false }
+        }
+    }
+    for variant in ctx.enum_variants {
+        if variant.owner == owner || leaf_type_name(variant.owner) == leaf_type_name(owner) {
+            found = true
+            if variant.payload_type != "" && !thread_type_is_send(ctx, direct_generic_hint(variant.payload_type, generic_args_from_path(value)), next_seen) { ret false }
+        }
+    }
+    // Fieldless value types are safe to move. Unknown pointer-like forms were
+    // rejected above, so an unresolved nominal type remains a value aggregate.
+    ret true
+}
+
+fn validate_thread_send_type(ctx: mut TranslatorContext, typ: str, source_name: str, line: usize, column: usize, role: str) -> () {
+    if !thread_type_is_send(ctx, typ, Vec[str]::new()) {
+        translation_error_at(source_name, line, column, "thread-unsafe-type", role + " type '" + canonical_type(typ) + "' cannot cross a thread boundary")
+    }
+    ret ()
+}
+
 fn ctx_add_owned_var(ctx: mut TranslatorContext, name: str, emitted_name: str, typ: str) -> () {
     let ownership_type = if starts_with(typ, "mut ") { value_type_name(typ) } else { typ }
     if !ctx_type_needs_ownership(ctx, ownership_type) { ret () }
@@ -2006,12 +2045,12 @@ fn translate_statements_no_default(
 }
 
 fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str, idx: usize) -> EhirTextBuilder {
+    let source_path = expr_path_or_empty(let_stmt.expr)
     // Mutable bindings of owned/reference values preserve identity.  Pointing
     // the new binding at the existing slot is also what makes mutations
     // visible through either name; copying the aggregate here silently broke
     // Encore's reference assignment semantics.
     if let_stmt.is_mut {
-        let source_path = expr_path_or_empty(let_stmt.expr)
         if source_path != "" {
             match ctx_lookup_var(ctx, source_path) {
                 Option[str]::Some(source_type) => {
@@ -2052,7 +2091,10 @@ fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str
     }
     let explicit_mut = starts_with(typ, "mut ")
     if explicit_mut { typ = value_type_name(typ) }
-    if borrowed_copy && ctx_type_needs_ownership(ctx, typ) {
+    if base_type_name(typ) == "JoinHandle" && source_path != "" {
+        move_var_out_of_context(ctx, source_path)
+    }
+    elif borrowed_copy && ctx_type_needs_ownership(ctx, typ) {
         builder = builder.instr("retain " + lowered.value + ": " + typ)
     }
     let emitted_name = prefix + "_letvar_" + let_stmt.name + "_" + Debug::fmt(idx)
@@ -2532,6 +2574,15 @@ fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usiz
             code = code.instr(out_name + ": " + output_type + " = await " + future.value + ": " + future.typ)
             ret LoweredExpr{code, out_name, output_type}
         }
+        Expr::Spawn(inner) => {
+            match inner.value {
+                Expr::Call(call) => { ret lower_spawn_expr(ctx, call, expr.source_name, expr.line, expr.column, prefix, idx) }
+                _ => {
+                    translation_error_at(expr.source_name, expr.line, expr.column, "invalid-spawn-target", "spawn expects a direct function call")
+                    ret LoweredExpr{EhirTextBuilder::new(), "", "JoinHandle[()]"}
+                }
+            }
+        }
         Expr::Unary(unary_expr) => {
             ret lower_unary_expr(ctx, unary_expr, expr.source_name, expr.line, expr.column, prefix, idx)
         }
@@ -2714,6 +2765,15 @@ fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx:
             let mut code = future.code
             code = code.instr(out_name + ": " + output_type + " = await " + future.value + ": " + future.typ)
             ret LoweredExpr{code, out_name, output_type}
+        }
+        Expr::Spawn(inner) => {
+            match inner.value {
+                Expr::Call(call) => { ret lower_spawn_expr(ctx, call, expr.source_name, expr.line, expr.column, prefix, idx) }
+                _ => {
+                    translation_error_at(expr.source_name, expr.line, expr.column, "invalid-spawn-target", "spawn expects a direct function call")
+                    ret LoweredExpr{EhirTextBuilder::new(), "", "JoinHandle[()]"}
+                }
+            }
         }
         Expr::Unary(unary_expr) => {
             ret lower_unary_expr(ctx, unary_expr, expr.source_name, expr.line, expr.column, prefix, idx)
@@ -2921,6 +2981,14 @@ fn lower_binary_expr(ctx: mut TranslatorContext, bin: BinaryExpr, source_name: s
 }
 
 fn lower_call_expr(ctx: mut TranslatorContext, call: CallExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
+    ret lower_invocation_expr(ctx, call, source_name, line, column, prefix, idx, false)
+}
+
+fn lower_spawn_expr(ctx: mut TranslatorContext, call: CallExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
+    ret lower_invocation_expr(ctx, call, source_name, line, column, prefix, idx, true)
+}
+
+fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize, spawning: bool) -> LoweredExpr {
     let mut callee = expr_h_path_or_empty(call.callee)
     if starts_with(callee, "Self::") && ctx.self_type != "" {
         callee = method_owner_name(ctx.self_type) + "::" + callee.slice(6_usize, callee.len() - 6_usize)
@@ -2962,7 +3030,10 @@ fn lower_call_expr(ctx: mut TranslatorContext, call: CallExpr, source_name: str,
             lowered = load_mutable_value(lowered, prefix + "_arg_load_" + Debug::fmt(idx + i))
         }
         code = code.append(lowered.code)
-        if borrowed_arg && ctx_type_needs_ownership(ctx, lowered.typ) {
+        if base_type_name(lowered.typ) == "JoinHandle" && arg_path != "" {
+            move_var_out_of_context(ctx, arg_path)
+        }
+        elif borrowed_arg && ctx_type_needs_ownership(ctx, lowered.typ) {
             code = code.instr("retain " + lowered.value + ": " + lowered.typ)
         }
         arg_values.push(lowered.value)
@@ -3053,6 +3124,16 @@ fn lower_call_expr(ctx: mut TranslatorContext, call: CallExpr, source_name: str,
     }
     ret_type = direct_generic_hint(specialize_function_return(ctx, dispatch_base, generic_args, ret_type), generic_args)
 
+    if spawning {
+        if ctx_function_is_extern(ctx, dispatch_base) {
+            translation_error_at(source_name, line, column, "extern-spawn-target", "spawn target must be an Encore function")
+        }
+        for arg_type in arg_types { validate_thread_send_type(ctx, arg_type, source_name, line, column, "argument") }
+        validate_thread_send_type(ctx, ret_type, source_name, line, column, "result")
+        let handle_type = "JoinHandle[" + ret_type + "]"
+        code = code.instr(out_name + ": " + handle_type + " = call __encore_thread_spawn__" + emitted_callee + "(" + join_strs(arg_values, ", ") + ")")
+        ret LoweredExpr{code, out_name, handle_type}
+    }
     code = code.instr(out_name + ": " + ret_type + " = call " + emitted_callee + "(" + join_strs(arg_values, ", ") + ")")
     if ctx_function_is_extern(ctx, dispatch_base) {
         let mut drop_index = 0_usize
@@ -3486,9 +3567,20 @@ fn lower_index_expr(ctx: mut TranslatorContext, index_expr: IndexExpr, source_na
 }
 
 fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExpr, source_name: str, line: usize, column: usize, prefix: str, idx: usize) -> LoweredExpr {
-    let borrowed_receiver = expr_h_is_borrowed_copy(method_call.receiver)
     let receiver_path = expr_h_path_or_empty(method_call.receiver)
     let receiver = lower_method_receiver(ctx, method_call.receiver, prefix + "_recv", idx + 1_usize)
+    if base_type_name(receiver.typ) == "JoinHandle" && method_call.method == "join" {
+        if method_call.args.len() != 0_usize || method_call.generics.len() != 0_usize {
+            translation_error_at(source_name, line, column, "invalid-join-call", "JoinHandle::join takes no arguments")
+        }
+        let output_type = first_generic_type(receiver.typ)
+        let out_name = prefix + "_join_" + Debug::fmt(idx)
+        let mut code = receiver.code
+        code = code.instr(out_name + ": " + output_type + " = call __encore_thread_join(" + receiver.value + ")")
+        move_var_out_of_context(ctx, receiver_path)
+        ret LoweredExpr{code, out_name, output_type}
+    }
+    let borrowed_receiver = expr_h_is_borrowed_copy(method_call.receiver)
     let mut owner = method_owner_name(value_type_name(receiver.typ))
     if starts_with(receiver.typ, "dyn ") {
         owner = receiver.typ.slice(4_usize, receiver.typ.len() - 4_usize)
