@@ -23,9 +23,27 @@ case "$triple" in
     *-windows-*) binary_name=encore.exe ;;
     *) binary_name=encore ;;
 esac
+test -s "$compiler"
 cp "$compiler" "$stage/bin/$binary_name"
 chmod +x "$stage/bin/$binary_name" 2>/dev/null || true
-cp -R "$repo_root/index" "$stage/lib/encore/index"
+mkdir -p "$stage/lib/encore/index"
+# Ship only the compiler's offline dependency closure. Public packages are
+# resolved through the registry and must not inflate every toolchain archive.
+for package in \
+    core \
+    std \
+    rich \
+    json \
+    ehir \
+    ehir-llvm-backend \
+    toml \
+    colorterm \
+    log \
+    llvm
+do
+    test -f "$repo_root/index/$package/encore.toml"
+    cp -R "$repo_root/index/$package" "$stage/lib/encore/index/$package"
+done
 cp "$repo_root/encore.toml" "$repo_root/encore.lock" "$stage/lib/encore/"
 cp -R "$repo_root/src" "$repo_root/tests" "$stage/lib/encore/"
 find "$stage/lib/encore" -type d \( \( -name target ! -path '*/src/target' \) -o -name .venv -o -name __pycache__ \) -prune -exec rm -rf '{}' +

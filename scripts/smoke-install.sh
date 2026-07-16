@@ -66,6 +66,44 @@ test "$checksum_code" -ne 0
 grep -q "Checksum verification failed" "$tmp/checksum.log"
 test "$(cat "$tmp/protected/VERSION")" = keep
 
+# The installer must reject path traversal and links before extraction. GNU
+# tar creates the traversal fixture; BSD tar still runs the link fixture.
+if tar --help 2>&1 | grep -q -- '--transform'; then
+    mkdir -p "$tmp/traversal-release"
+    printf 'escape\n' > "$tmp/escape"
+    (cd "$tmp" && tar -czf "$tmp/traversal-release/$(basename -- "$archive")" --transform='s|^escape$|../escape|' escape)
+    if command -v sha256sum >/dev/null 2>&1; then
+        (cd "$tmp/traversal-release" && sha256sum "$(basename -- "$archive")") > "$tmp/traversal-release/$(basename -- "$checksum")"
+    else
+        (cd "$tmp/traversal-release" && shasum -a 256 "$(basename -- "$archive")") > "$tmp/traversal-release/$(basename -- "$checksum")"
+    fi
+    set +e
+    ENCORE_HOME="$tmp/traversal-home" ENCORE_VERSION="$package_version" ENCORE_RELEASE_BASE_URL="file://$tmp/traversal-release" \
+        "$repo_root/install.sh" > "$tmp/traversal.log" 2>&1
+    traversal_code=$?
+    set -e
+    test "$traversal_code" -ne 0
+    grep -q "unsafe path" "$tmp/traversal.log"
+    test ! -e "$tmp/traversal-home"
+fi
+
+mkdir -p "$tmp/link-release/content/encore-$package_version-test/bin"
+ln -s /tmp "$tmp/link-release/content/encore-$package_version-test/lib"
+(cd "$tmp/link-release/content" && tar -czf "$tmp/link-release/$(basename -- "$archive")" .)
+if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$tmp/link-release" && sha256sum "$(basename -- "$archive")") > "$tmp/link-release/$(basename -- "$checksum")"
+else
+    (cd "$tmp/link-release" && shasum -a 256 "$(basename -- "$archive")") > "$tmp/link-release/$(basename -- "$checksum")"
+fi
+set +e
+ENCORE_HOME="$tmp/link-home" ENCORE_VERSION="$package_version" ENCORE_RELEASE_BASE_URL="file://$tmp/link-release" \
+    "$repo_root/install.sh" > "$tmp/link-archive.log" 2>&1
+link_archive_code=$?
+set -e
+test "$link_archive_code" -ne 0
+grep -q "links or special files" "$tmp/link-archive.log"
+test ! -e "$tmp/link-home"
+
 cp -R "$repo_root/examples/add_two_structs" "$tmp/project"
 rm -rf "$tmp/project/target"
 set +e

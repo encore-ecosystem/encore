@@ -35,6 +35,23 @@ test -f "$package/lib/encore/src/target/mod.enq"
 test -f "$package/share/doc/encore/LICENSE"
 test -f "$package/share/doc/encore/README.md"
 
+expected_index_packages='colorterm
+core
+ehir
+ehir-llvm-backend
+json
+llvm
+log
+rich
+std
+toml'
+actual_index_packages=$(find "$package/lib/encore/index" -mindepth 1 -maxdepth 1 -type d -exec basename '{}' \; | LC_ALL=C sort)
+if [ "$actual_index_packages" != "$expected_index_packages" ]; then
+    echo "Release package contains an unexpected compiler index closure" >&2
+    printf 'expected:\n%s\nactual:\n%s\n' "$expected_index_packages" "$actual_index_packages" >&2
+    exit 1
+fi
+
 if find "$package" -type l | grep -q .; then
     echo "Release package must not contain symbolic links" >&2
     exit 1
