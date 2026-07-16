@@ -3,6 +3,7 @@ import core::result::Result
 import std::vec::Vec
 
 import refrain::core::{Module, Directive, FnDirective, Block, Instruction, Terminator, Variable, Type, PointerKind, BinaryOpKind}
+import refrain::coroutine::validate_coroutine_moves
 
 pub fn validate_module(module: Module) -> Result[Module, str] {
     for directive in module.directives {
@@ -48,6 +49,17 @@ fn validate_function(function: FnDirective) -> Option[str] {
         labels.push(block_item.name)
     }
 
+    match validate_phi_nodes(function) {
+        Some(message) => { ret Option[str]::Some(message) }
+        None => {}
+    }
+    if function.is_async {
+        match validate_coroutine_moves(function) {
+            Some(message) => { ret invalid(function.name, message) }
+            None => {}
+        }
+    }
+
     let mut definitions = Vec[str]::new()
     for parameter in function.params {
         if parameter.name == "" { ret invalid(function.name, "parameter name must not be empty") }
@@ -84,9 +96,6 @@ fn validate_function(function: FnDirective) -> Option[str] {
 
 fn validate_instruction(function_name: str, is_async: bool, instruction: Instruction) -> Option[str] {
     match instruction {
-        Instruction::Phi(_) => {
-            if is_async { ret invalid(function_name, "phi instruction must be eliminated before coroutine lowering") }
-        }
         Instruction::Store(item) => {
             match required_type(function_name, item.src) { None => { ret missing_type(function_name, item.src.name) } Some(_) => {} }
             match required_type(function_name, item.dst) {
@@ -155,6 +164,63 @@ fn validate_instruction(function_name: str, is_async: bool, instruction: Instruc
         _ => {}
     }
     ret Option[str]::None
+}
+
+fn validate_phi_nodes(function: FnDirective) -> Option[str] {
+    for block_item in function.blocks {
+        let predecessors = predecessor_names(function.blocks, block_item.name)
+        let mut saw_non_phi = false
+        for instruction in block_item.instructions {
+            match instruction {
+                Instruction::Phi(item) => {
+                    if saw_non_phi { ret invalid(function.name, "phi instructions must appear at the start of block '" + block_item.name + "'") }
+                    if item.pairs.len() != predecessors.len() { ret invalid(function.name, "phi in block '" + block_item.name + "' must have one value for every predecessor") }
+                    let mut out_type = Type{"usize", Vec[Type]::new(), PointerKind::Plain}
+                    match required_type(function.name, item.out) {
+                        Some(typ) => { out_type = typ }
+                        None => { ret missing_type(function.name, item.out.name) }
+                    }
+                    let mut seen = Vec[str]::new()
+                    for pair in item.pairs {
+                        if !contains(predecessors, pair.label) { ret invalid(function.name, "phi references non-predecessor block '" + pair.label + "'") }
+                        if contains(seen, pair.label) { ret invalid(function.name, "phi contains duplicate predecessor '" + pair.label + "'") }
+                        seen.push(pair.label)
+                        match required_type(function.name, pair.value) {
+                            Some(value_type) => { if !same_type(out_type, value_type) { ret invalid(function.name, "phi input and output types do not match") } }
+                            None => { ret missing_type(function.name, pair.value.name) }
+                        }
+                    }
+                }
+                _ => { saw_non_phi = true }
+            }
+        }
+    }
+    ret Option[str]::None
+}
+
+fn predecessor_names(blocks: Vec[Block], target: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    for block_item in blocks {
+        if terminator_targets(block_item.terminator, target) { out.push(block_item.name) }
+    }
+    ret out
+}
+
+fn terminator_targets(terminator: Terminator, target: str) -> bool {
+    match terminator {
+        Terminator::Br(item) => { ret item.label == target }
+        Terminator::Cbr(item) => { ret item.true_label == target || item.false_label == target }
+        Terminator::Match(item) => {
+            if item.default_label == target { ret true }
+            for arm in item.arms { if arm.label == target { ret true } }
+        }
+        Terminator::Switch(item) => {
+            if item.default_label == target { ret true }
+            for case_item in item.cases { if case_item.label == target { ret true } }
+        }
+        _ => {}
+    }
+    ret false
 }
 
 fn validate_terminator(function: FnDirective, block_item: Block, labels: Vec[str]) -> Option[str] {

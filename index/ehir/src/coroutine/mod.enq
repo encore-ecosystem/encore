@@ -18,6 +18,157 @@ struct BlockLiveness {
     live_out: Vec[Variable]
 }
 
+struct MoveBlockState {
+    name: str
+    moved_in: Vec[str]
+    moved_out: Vec[str]
+}
+
+pub fn validate_coroutine_moves(function: FnDirective) -> Option[str] {
+    let mut states = Vec[MoveBlockState]::new()
+    for block_item in function.blocks { states.push(MoveBlockState{block_item.name, Vec[str]::new(), Vec[str]::new()}) }
+    let mut changed = true
+    while changed {
+        changed = false
+        let mut index = 0_usize
+        while index < function.blocks.len() {
+            match function.blocks.get(index) {
+                Some(block_item) => {
+                    let moved_in = predecessor_moves(function.blocks, states, block_item.name)
+                    let moved_out = transfer_moves(block_item, moved_in)
+                    match states.get(index) {
+                        Some(previous) => {
+                            if !same_strings(previous.moved_in, moved_in) || !same_strings(previous.moved_out, moved_out) {
+                                states.set(index, MoveBlockState{block_item.name, moved_in, moved_out})
+                                changed = true
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+            index = index + 1_usize
+        }
+    }
+    for block_item in function.blocks {
+        match check_moved_uses(block_item, move_state_in(states, block_item.name)) {
+            Some(message) => { ret Option[str]::Some(message) }
+            None => {}
+        }
+    }
+    ret Option[str]::None
+}
+
+fn transfer_moves(block_item: Block, moved_in: Vec[str]) -> Vec[str] {
+    let mut moved = clone_strings(moved_in)
+    for instruction in block_item.instructions {
+        match coroutine_instruction_output(instruction) {
+            Some(value) => { remove_string(moved, value.name) }
+            None => {}
+        }
+        match instruction {
+            Instruction::Await(item) => { add_unique_string(moved, item.future.name) }
+            Instruction::Drop(item) => { add_unique_string(moved, item.value.name) }
+            _ => {}
+        }
+    }
+    ret moved
+}
+
+fn check_moved_uses(block_item: Block, moved_in: Vec[str]) -> Option[str] {
+    let mut moved = clone_strings(moved_in)
+    for instruction in block_item.instructions {
+        match instruction {
+            Instruction::Drop(item) => { add_unique_string(moved, item.value.name) }
+            _ => {
+                let mut uses = Vec[Variable]::new()
+                add_instruction_uses(uses, instruction)
+                for value in uses {
+                    if contains_string(moved, value.name) { ret Option[str]::Some("use of moved future '" + value.name + "'") }
+                }
+            }
+        }
+        match coroutine_instruction_output(instruction) {
+            Some(value) => { remove_string(moved, value.name) }
+            None => {}
+        }
+        match instruction {
+            Instruction::Await(item) => { add_unique_string(moved, item.future.name) }
+            _ => {}
+        }
+    }
+    let mut terminator_uses = Vec[Variable]::new()
+    add_terminator_uses(terminator_uses, block_item.terminator)
+    for value in terminator_uses {
+        if contains_string(moved, value.name) { ret Option[str]::Some("use of moved future '" + value.name + "'") }
+    }
+    ret Option[str]::None
+}
+
+fn predecessor_moves(blocks: Vec[Block], states: Vec[MoveBlockState], target: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    for block_item in blocks {
+        if terminator_has_target(block_item.terminator, target) { extend_unique_strings(out, move_state_out(states, block_item.name)) }
+    }
+    ret out
+}
+
+fn terminator_has_target(terminator: Terminator, target: str) -> bool {
+    for successor in terminator_successors(terminator) { if successor == target { ret true } }
+    ret false
+}
+
+fn move_state_in(states: Vec[MoveBlockState], name: str) -> Vec[str] {
+    for state in states { if state.name == name { ret clone_strings(state.moved_in) } }
+    ret Vec[str]::new()
+}
+
+fn move_state_out(states: Vec[MoveBlockState], name: str) -> Vec[str] {
+    for state in states { if state.name == name { ret clone_strings(state.moved_out) } }
+    ret Vec[str]::new()
+}
+
+fn contains_string(values: Vec[str], value: str) -> bool {
+    for present in values { if present == value { ret true } }
+    ret false
+}
+
+fn extend_unique_strings(out: mut Vec[str], values: Vec[str]) -> () {
+    for value in values { add_unique_string(out, value) }
+    ret ()
+}
+
+fn remove_string(values: mut Vec[str], value: str) -> () {
+    let mut index = 0_usize
+    while index < values.len() {
+        match values.get(index) {
+            Some(present) => {
+                if present == value {
+                    match values.last() { Some(last) => { values.set(index, last) } None => {} }
+                    let _removed = values.pop()
+                    ret ()
+                }
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret ()
+}
+
+fn same_strings(lhs: Vec[str], rhs: Vec[str]) -> bool {
+    if lhs.len() != rhs.len() { ret false }
+    for value in lhs { if !contains_string(rhs, value) { ret false } }
+    ret true
+}
+
+fn clone_strings(values: Vec[str]) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    for value in values { out.push(value) }
+    ret out
+}
+
 struct CoroutineBuild {
     definitions: Vec[Variable]
     slots: Vec[Variable]
@@ -163,6 +314,7 @@ fn build_poll_blocks(function: FnDirective, build: mut CoroutineBuild, future_na
         site_index = site_index + 1_usize
     }
     for source_block in function.blocks { blocks.extend(lower_body_block(build, source_block, future_name)) }
+    blocks.extend(make_edge_blocks(function, build))
     blocks.push(block("__async_invalid_state", Vec[Instruction]::new(), unreachable_term()))
     ret blocks
 }
@@ -344,7 +496,7 @@ fn lower_body_block(build: mut CoroutineBuild, source: Block, future_name: str) 
         }
         instruction_index = instruction_index + 1_usize
     }
-    let terminator = normalize_terminator(build, instructions, source.terminator, future_name)
+    let terminator = normalize_terminator(build, instructions, source.name, source.terminator, future_name)
     out.push(block(body_label(source.name, segment), instructions, terminator))
     ret out
 }
@@ -353,6 +505,7 @@ fn normalize_instruction(build: mut CoroutineBuild, instruction: Instruction) ->
     let mut out = Vec[Instruction]::new()
     let mut lowered = instruction
     match instruction {
+        Instruction::Phi(_) => { ret out }
         Instruction::Alias(item) => { lowered = alias(item.out, read_value(build, out, item.src, "alias")) }
         Instruction::Lcsos(item) => { lowered = lcsos(item.out, item.typ, read_values(build, out, item.args, "struct")) }
         Instruction::Lceos(item) => {
@@ -377,7 +530,10 @@ fn normalize_instruction(build: mut CoroutineBuild, instruction: Instruction) ->
         Instruction::HeapFree(item) => { lowered = hfree(read_value(build, out, item.src, "free")) }
         Instruction::Binary(item) => { lowered = binary(item.out, read_value(build, out, item.lhs, "binary_lhs"), read_value(build, out, item.rhs, "binary_rhs"), item.op) }
         Instruction::Cfree(item) => { lowered = cfree(read_value(build, out, item.value, "cfree")) }
-        Instruction::Drop(item) => { lowered = drop_value(read_value(build, out, item.value, "drop")) }
+        Instruction::Drop(item) => {
+            if is_awaited_value(build, item.value.name) { ret out }
+            lowered = drop_value(read_value(build, out, item.value, "drop"))
+        }
         Instruction::Retain(item) => { lowered = retain_value(read_value(build, out, item.value, "retain")) }
         _ => {}
     }
@@ -391,7 +547,7 @@ fn normalize_instruction(build: mut CoroutineBuild, instruction: Instruction) ->
     ret out
 }
 
-fn normalize_terminator(build: mut CoroutineBuild, out: mut Vec[Instruction], terminator: Terminator, future_name: str) -> Terminator {
+fn normalize_terminator(build: mut CoroutineBuild, out: mut Vec[Instruction], source_name: str, terminator: Terminator, future_name: str) -> Terminator {
     match terminator {
         Terminator::Ret(item) => {
             let value = read_value(build, out, item.value, "return")
@@ -399,25 +555,102 @@ fn normalize_terminator(build: mut CoroutineBuild, out: mut Vec[Instruction], te
             out.push(lceos(ready, enum_value("Poll", pair_types(build.future_type, build.output_type), "Ready", Option[Variable]::Some(value))))
             ret ret_term(ready)
         }
-        Terminator::Br(item) => { ret br_term(body_label(item.label, 0_usize)) }
+        Terminator::Br(item) => { ret br_term(edge_label(source_name, item.label)) }
         Terminator::Cbr(item) => {
             let cond = read_value(build, out, item.cond, "branch")
-            ret cbr_term(cond, body_label(item.true_label, 0_usize), body_label(item.false_label, 0_usize))
+            ret cbr_term(cond, edge_label(source_name, item.true_label), edge_label(source_name, item.false_label))
         }
         Terminator::Match(item) => {
             let mut arms = Vec[MatchArm]::new()
-            for arm in item.arms { arms.push(match_arm(arm.variant, arm.payload_var, body_label(arm.label, 0_usize))) }
-            ret match_term(read_value(build, out, item.scrutinee, "match"), body_label(item.default_label, 0_usize), arms)
+            for arm in item.arms { arms.push(match_arm(arm.variant, arm.payload_var, edge_label(source_name, arm.label))) }
+            ret match_term(read_value(build, out, item.scrutinee, "match"), edge_label(source_name, item.default_label), arms)
         }
         Terminator::Switch(item) => {
             let mut cases = Vec[SwitchCase]::new()
-            for case_item in item.cases { cases.push(switch_case(case_item.value, body_label(case_item.label, 0_usize))) }
-            ret switch_term(read_value(build, out, item.scrutinee, "switch"), body_label(item.default_label, 0_usize), cases)
+            for case_item in item.cases { cases.push(switch_case(case_item.value, edge_label(source_name, case_item.label))) }
+            ret switch_term(read_value(build, out, item.scrutinee, "switch"), edge_label(source_name, item.default_label), cases)
         }
         Terminator::Unreachable => { ret unreachable_term() }
     }
     ret unreachable_term()
 }
+
+fn make_edge_blocks(function: FnDirective, build: mut CoroutineBuild) -> Vec[Block] {
+    let mut out = Vec[Block]::new()
+    for source in function.blocks {
+        for target in terminator_successors(source.terminator) {
+            let label = edge_label(source.name, target)
+            if !has_block_named(out, label) {
+                let mut instructions = Vec[Instruction]::new()
+                match find_block(function.blocks, target) {
+                    Some(target_block) => {
+                        for instruction in target_block.instructions {
+                            match instruction {
+                                Instruction::Phi(item) => {
+                                    match phi_value_for_predecessor(item, source.name) {
+                                        Some(value) => {
+                                            let loaded = read_value(build, instructions, value, "phi_edge")
+                                            instructions.push(store(loaded, slot_for(build, item.out.name)))
+                                        }
+                                        None => {}
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                out.push(block(label, instructions, br_term(body_label(target, 0_usize))))
+            }
+        }
+    }
+    ret out
+}
+
+fn terminator_successors(terminator: Terminator) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    match terminator {
+        Terminator::Br(item) => { add_unique_string(out, item.label) }
+        Terminator::Cbr(item) => {
+            add_unique_string(out, item.true_label)
+            add_unique_string(out, item.false_label)
+        }
+        Terminator::Match(item) => {
+            add_unique_string(out, item.default_label)
+            for arm in item.arms { add_unique_string(out, arm.label) }
+        }
+        Terminator::Switch(item) => {
+            add_unique_string(out, item.default_label)
+            for case_item in item.cases { add_unique_string(out, case_item.label) }
+        }
+        _ => {}
+    }
+    ret out
+}
+
+fn find_block(blocks: Vec[Block], name: str) -> Option[Block] {
+    for block_item in blocks { if block_item.name == name { ret Option[Block]::Some(block_item) } }
+    ret Option[Block]::None
+}
+
+fn phi_value_for_predecessor(item: PhiInstruction, predecessor: str) -> Option[Variable] {
+    for pair in item.pairs { if pair.label == predecessor { ret Option[Variable]::Some(pair.value) } }
+    ret Option[Variable]::None
+}
+
+fn has_block_named(blocks: Vec[Block], name: str) -> bool {
+    for block_item in blocks { if block_item.name == name { ret true } }
+    ret false
+}
+
+fn add_unique_string(values: mut Vec[str], value: str) -> () {
+    for present in values { if present == value { ret () } }
+    values.push(value)
+    ret ()
+}
+
+fn edge_label(source: str, target: str) -> str { ret "__async_edge_" + source + "_to_" + target }
 
 fn read_value(build: mut CoroutineBuild, out: mut Vec[Instruction], value: Variable, purpose: str) -> Variable {
     if !has_definition(build, value.name) { ret value }
@@ -494,6 +727,11 @@ fn slot_for(build: CoroutineBuild, name: str) -> Variable {
 
 fn has_definition(build: CoroutineBuild, name: str) -> bool {
     for value in build.definitions { if value.name == name { ret true } }
+    ret false
+}
+
+fn is_awaited_value(build: CoroutineBuild, name: str) -> bool {
+    for site in build.sites { if site.future.name == name { ret true } }
     ret false
 }
 
@@ -595,7 +833,7 @@ pub fn analyze_await_liveness(function: FnDirective) -> Vec[AwaitLiveness] {
             block_index = block_index - 1_usize
             match function.blocks.get(block_index) {
                 Some(block_item) => {
-                    let live_out = successor_liveness(block_item.terminator, states)
+                    let live_out = successor_liveness(block_item.name, block_item.terminator, states, function.blocks)
                     let live_in = transfer_block(block_item, live_out)
                     match states.get(block_index) {
                         Some(previous) => {
@@ -625,6 +863,7 @@ pub fn analyze_await_liveness(function: FnDirective) -> Vec[AwaitLiveness] {
                                 Instruction::Await(item) => {
                                     let mut captured = live_after_instruction(block_item, instruction_index, state_live_out(states, block_item.name))
                                     remove_name(captured, item.out.name)
+                                    remove_name(captured, item.future.name)
                                     sites.push(AwaitLiveness{block_item.name, instruction_index, item.out, item.future, captured})
                                 }
                                 _ => {}
@@ -682,23 +921,45 @@ fn transfer_block(block_item: Block, live_out: Vec[Variable]) -> Vec[Variable] {
     ret live
 }
 
-fn successor_liveness(terminator: Terminator, states: Vec[BlockLiveness]) -> Vec[Variable] {
+fn successor_liveness(predecessor: str, terminator: Terminator, states: Vec[BlockLiveness], blocks: Vec[Block]) -> Vec[Variable] {
     let mut out = Vec[Variable]::new()
     match terminator {
-        Terminator::Br(item) => { extend_unique(out, state_live_in(states, item.label)) }
+        Terminator::Br(item) => { extend_unique(out, edge_live_in(predecessor, item.label, states, blocks)) }
         Terminator::Cbr(item) => {
-            extend_unique(out, state_live_in(states, item.true_label))
-            extend_unique(out, state_live_in(states, item.false_label))
+            extend_unique(out, edge_live_in(predecessor, item.true_label, states, blocks))
+            extend_unique(out, edge_live_in(predecessor, item.false_label, states, blocks))
         }
         Terminator::Match(item) => {
-            extend_unique(out, state_live_in(states, item.default_label))
-            for arm in item.arms { extend_unique(out, state_live_in(states, arm.label)) }
+            extend_unique(out, edge_live_in(predecessor, item.default_label, states, blocks))
+            for arm in item.arms { extend_unique(out, edge_live_in(predecessor, arm.label, states, blocks)) }
         }
         Terminator::Switch(item) => {
-            extend_unique(out, state_live_in(states, item.default_label))
-            for case_item in item.cases { extend_unique(out, state_live_in(states, case_item.label)) }
+            extend_unique(out, edge_live_in(predecessor, item.default_label, states, blocks))
+            for case_item in item.cases { extend_unique(out, edge_live_in(predecessor, case_item.label, states, blocks)) }
         }
         _ => {}
+    }
+    ret out
+}
+
+fn edge_live_in(predecessor: str, target: str, states: Vec[BlockLiveness], blocks: Vec[Block]) -> Vec[Variable] {
+    let mut out = state_live_in(states, target)
+    match find_block(blocks, target) {
+        Some(target_block) => {
+            for instruction in target_block.instructions {
+                match instruction {
+                    Instruction::Phi(item) => {
+                        remove_name(out, item.out.name)
+                        match phi_value_for_predecessor(item, predecessor) {
+                            Some(value) => { add_unique(out, value) }
+                            None => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None => {}
     }
     ret out
 }
@@ -738,7 +999,7 @@ fn add_instruction_uses(out: mut Vec[Variable], instruction: Instruction) -> () 
             add_unique(out, item.lhs)
             add_unique(out, item.rhs)
         }
-        Instruction::Phi(item) => { for pair in item.pairs { add_unique(out, pair.value) } }
+        Instruction::Phi(_) => {}
         Instruction::Cfree(item) => { add_unique(out, item.value) }
         Instruction::Drop(item) => { add_unique(out, item.value) }
         Instruction::Retain(item) => { add_unique(out, item.value) }
