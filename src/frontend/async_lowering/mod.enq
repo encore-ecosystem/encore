@@ -1,0 +1,568 @@
+import core::option::Option
+import core::fmt::Debug
+import std::vec::Vec
+
+import refrain::frontend::parser::statements::{
+    AssignmentStmt,
+    BinaryExpr,
+    CallExpr,
+    Expr,
+    ExprNode,
+    FunctionItem,
+    IfStmt,
+    LetStmt,
+    ParsedBlock,
+    Statement,
+    UnaryExpr,
+    WhileStmt,
+}
+
+pub struct AsyncBinding {
+    name: str
+    expression: ExprNode
+}
+
+pub enum AsyncStep {
+    Evaluate(AsyncBinding)
+    Suspend(AsyncBinding)
+}
+
+pub struct NormalizedExpr {
+    steps: Vec[AsyncStep]
+    expression: ExprNode
+}
+
+pub struct AsyncSuspend {
+    id: usize
+    binding: str
+    expression: ExprNode
+    resume: usize
+}
+
+pub struct AsyncBranch {
+    condition: ExprNode
+    then_block: usize
+    else_block: usize
+}
+
+pub enum AsyncTerminator {
+    Goto(usize)
+    Branch(AsyncBranch)
+    Suspend(AsyncSuspend)
+    Return(ExprNode)
+    Unreachable
+}
+
+pub struct AsyncBlock {
+    id: usize
+    statements: Vec[Statement]
+    terminator: AsyncTerminator
+}
+
+pub struct AsyncCfg {
+    entry: usize
+    blocks: Vec[AsyncBlock]
+    suspension_count: usize
+    diagnostics: Vec[str]
+}
+
+pub struct SuspensionLiveness {
+    suspension: usize
+    values: Vec[str]
+}
+
+struct AsyncCfgBuilder {
+    blocks: Vec[AsyncBlock]
+    next_temp: usize
+    next_suspend: usize
+    diagnostics: Vec[str]
+}
+
+struct LoopTargets {
+    break_target: Option[usize]
+    continue_target: Option[usize]
+}
+
+fn empty_targets() -> LoopTargets {
+    ret LoopTargets{Option[usize]::None, Option[usize]::None}
+}
+
+fn fresh_temp(builder: mut AsyncCfgBuilder) -> str {
+    let name = "__async_tmp_" + Debug::fmt(builder.next_temp)
+    builder.next_temp = builder.next_temp + 1_usize
+    ret name
+}
+
+fn add_block(builder: mut AsyncCfgBuilder, statements: Vec[Statement], terminator: AsyncTerminator) -> usize {
+    let id = builder.blocks.len()
+    builder.blocks.push(AsyncBlock{id, statements, terminator})
+    ret id
+}
+
+fn empty_statements() -> Vec[Statement] {
+    ret Vec[Statement]::new()
+}
+
+fn one_statement(statement: Statement) -> Vec[Statement] {
+    let mut out = Vec[Statement]::new()
+    out.push(statement)
+    ret out
+}
+
+fn box_node(node: ExprNode) -> ExprNode<H> {
+    ret ExprNode<H>{node.value, node.line, node.column, node.length, node.source_name}
+}
+
+fn unbox_node(node: ExprNode<H>) -> ExprNode {
+    ret ExprNode{node.value, node.line, node.column, node.length, node.source_name}
+}
+
+fn replace_node(node: ExprNode, value: Expr) -> ExprNode {
+    ret ExprNode{value, node.line, node.column, node.length, node.source_name}
+}
+
+fn path_at(node: ExprNode, name: str) -> ExprNode {
+    ret replace_node(node, Expr::Path(name))
+}
+
+fn append_steps(out: mut Vec[AsyncStep], values: Vec[AsyncStep]) -> () {
+    for value in values { out.push(value) }
+    ret ()
+}
+
+fn steps_suspend(steps: Vec[AsyncStep]) -> bool {
+    for step in steps {
+        match step {
+            AsyncStep::Suspend(_) => { ret true }
+            _ => {}
+        }
+    }
+    ret false
+}
+
+fn materialize(builder: mut AsyncCfgBuilder, steps: mut Vec[AsyncStep], expression: ExprNode) -> ExprNode {
+    let name = fresh_temp(builder)
+    steps.push(AsyncStep::Evaluate(AsyncBinding{name, expression}))
+    ret path_at(expression, name)
+}
+
+fn normalize_h(builder: mut AsyncCfgBuilder, node: ExprNode<H>) -> NormalizedExpr {
+    ret normalize_expr(builder, unbox_node(node))
+}
+
+fn normalize_expr(builder: mut AsyncCfgBuilder, node: ExprNode) -> NormalizedExpr {
+    match node.value {
+        Expr::Await(inner) => {
+            let operand = normalize_h(builder, inner)
+            let mut steps = operand.steps
+            let name = fresh_temp(builder)
+            steps.push(AsyncStep::Suspend(AsyncBinding{name, operand.expression}))
+            ret NormalizedExpr{steps, path_at(node, name)}
+        }
+        Expr::Parenthesized(inner) => {
+            let normalized = normalize_h(builder, inner)
+            ret NormalizedExpr{normalized.steps, replace_node(node, Expr::Parenthesized(box_node(normalized.expression)))}
+        }
+        Expr::Unary(unary) => {
+            let normalized = normalize_h(builder, unary.expr)
+            ret NormalizedExpr{normalized.steps, replace_node(node, Expr::Unary(UnaryExpr{unary.operator, box_node(normalized.expression)}))}
+        }
+        Expr::Binary(binary) => {
+            let left = normalize_h(builder, binary.lhs)
+            let right = normalize_h(builder, binary.rhs)
+            let mut steps = left.steps
+            let mut lhs = left.expression
+            if steps_suspend(right.steps) { lhs = materialize(builder, steps, lhs) }
+            append_steps(steps, right.steps)
+            ret NormalizedExpr{steps, replace_node(node, Expr::Binary(BinaryExpr{box_node(lhs), binary.operator, box_node(right.expression)}))}
+        }
+        Expr::Call(call) => {
+            let callee = normalize_h(builder, call.callee)
+            let mut steps = callee.steps
+            let mut normalized_callee = callee.expression
+            let mut normalized_args = Vec[ExprNode]::new()
+            for argument in call.args {
+                let normalized = normalize_expr(builder, argument)
+                if steps_suspend(normalized.steps) {
+                    if normalized_args.len() == 0_usize { normalized_callee = materialize(builder, steps, normalized_callee) }
+                    let mut previous = Vec[ExprNode]::new()
+                    for value in normalized_args { previous.push(materialize(builder, steps, value)) }
+                    normalized_args = previous
+                }
+                append_steps(steps, normalized.steps)
+                normalized_args.push(normalized.expression)
+            }
+            ret NormalizedExpr{steps, replace_node(node, Expr::Call(CallExpr{box_node(normalized_callee), call.generics, normalized_args}))}
+        }
+        _ => { ret NormalizedExpr{Vec[AsyncStep]::new(), node} }
+    }
+}
+
+fn prepend_steps(builder: mut AsyncCfgBuilder, steps: Vec[AsyncStep], continuation: usize) -> usize {
+    let mut next = continuation
+    let mut index = steps.len()
+    while index > 0_usize {
+        index = index - 1_usize
+        match steps.get(index) {
+            Some(step) => {
+                match step {
+                    AsyncStep::Evaluate(binding) => {
+                        next = add_block(builder, one_statement(Statement::Let(LetStmt{binding.name, Option[str]::None, binding.expression, false})), AsyncTerminator::Goto(next))
+                    }
+                    AsyncStep::Suspend(binding) => {
+                        let suspend_id = builder.next_suspend
+                        builder.next_suspend = builder.next_suspend + 1_usize
+                        next = add_block(builder, empty_statements(), AsyncTerminator::Suspend(AsyncSuspend{suspend_id, binding.name, binding.expression, next}))
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    ret next
+}
+
+fn lower_return(builder: mut AsyncCfgBuilder, expression: ExprNode) -> usize {
+    let normalized = normalize_expr(builder, expression)
+    let terminal = add_block(builder, empty_statements(), AsyncTerminator::Return(normalized.expression))
+    ret prepend_steps(builder, normalized.steps, terminal)
+}
+
+fn lower_if(builder: mut AsyncCfgBuilder, item: IfStmt, continuation: usize, targets: LoopTargets) -> usize {
+    let mut else_entry = continuation
+    match item.else_body {
+        Some(body) => { else_entry = lower_sequence(builder, body.statements, continuation, targets) }
+        None => {}
+    }
+    let mut index = item.branches.len()
+    while index > 0_usize {
+        index = index - 1_usize
+        match item.branches.get(index) {
+            Some(branch) => {
+                let then_entry = lower_sequence(builder, branch.body.statements, continuation, targets)
+                let normalized = normalize_expr(builder, branch.condition)
+                let branch_block = add_block(builder, empty_statements(), AsyncTerminator::Branch(AsyncBranch{normalized.expression, then_entry, else_entry}))
+                else_entry = prepend_steps(builder, normalized.steps, branch_block)
+            }
+            None => {}
+        }
+    }
+    ret else_entry
+}
+
+fn lower_while(builder: mut AsyncCfgBuilder, item: WhileStmt, continuation: usize, targets: LoopTargets) -> usize {
+    let condition_id = add_block(builder, empty_statements(), AsyncTerminator::Unreachable)
+    let loop_targets = LoopTargets{Option[usize]::Some(continuation), Option[usize]::Some(condition_id)}
+    let body_entry = lower_sequence(builder, item.body.statements, condition_id, loop_targets)
+    let normalized = normalize_expr(builder, item.condition)
+    let branch_id = add_block(builder, empty_statements(), AsyncTerminator::Branch(AsyncBranch{normalized.expression, body_entry, continuation}))
+    let condition_entry = prepend_steps(builder, normalized.steps, branch_id)
+    match builder.blocks.get(condition_id) {
+        Some(_) => { builder.blocks.set(condition_id, AsyncBlock{condition_id, empty_statements(), AsyncTerminator::Goto(condition_entry)}) }
+        None => {}
+    }
+    ret condition_id
+}
+
+fn lower_statement(builder: mut AsyncCfgBuilder, statement: Statement, continuation: usize, targets: LoopTargets) -> usize {
+    match statement {
+        Statement::Ret(expression) => { ret lower_return(builder, expression) }
+        Statement::Let(item) => {
+            let normalized = normalize_expr(builder, item.expr)
+            let next = add_block(builder, one_statement(Statement::Let(LetStmt{item.name, item.typ, normalized.expression, item.is_mut})), AsyncTerminator::Goto(continuation))
+            ret prepend_steps(builder, normalized.steps, next)
+        }
+        Statement::Expr(expression) => {
+            let normalized = normalize_expr(builder, expression)
+            let next = add_block(builder, one_statement(Statement::Expr(normalized.expression)), AsyncTerminator::Goto(continuation))
+            ret prepend_steps(builder, normalized.steps, next)
+        }
+        Statement::Assignment(item) => {
+            let target = normalize_expr(builder, item.target)
+            let value = normalize_expr(builder, item.expr)
+            let mut steps = target.steps
+            let mut normalized_target = target.expression
+            if steps_suspend(value.steps) { normalized_target = materialize(builder, steps, normalized_target) }
+            append_steps(steps, value.steps)
+            let next = add_block(builder, one_statement(Statement::Assignment(AssignmentStmt{normalized_target, item.operator, value.expression})), AsyncTerminator::Goto(continuation))
+            ret prepend_steps(builder, steps, next)
+        }
+        Statement::If(item) => { ret lower_if(builder, item, continuation, targets) }
+        Statement::While(item) => { ret lower_while(builder, item, continuation, targets) }
+        Statement::Break(_) => {
+            match targets.break_target {
+                Some(target) => { ret add_block(builder, empty_statements(), AsyncTerminator::Goto(target)) }
+                None => { builder.diagnostics.push("break outside async loop") }
+            }
+        }
+        Statement::Continue(_) => {
+            match targets.continue_target {
+                Some(target) => { ret add_block(builder, empty_statements(), AsyncTerminator::Goto(target)) }
+                None => { builder.diagnostics.push("continue outside async loop") }
+            }
+        }
+        _ => { ret add_block(builder, one_statement(statement), AsyncTerminator::Goto(continuation)) }
+    }
+    ret continuation
+}
+
+fn lower_sequence(builder: mut AsyncCfgBuilder, statements: Vec[Statement], continuation: usize, targets: LoopTargets) -> usize {
+    let mut entry = continuation
+    let mut index = statements.len()
+    while index > 0_usize {
+        index = index - 1_usize
+        match statements.get(index) {
+            Some(statement) => { entry = lower_statement(builder, statement, entry, targets) }
+            None => {}
+        }
+    }
+    ret entry
+}
+
+fn contains_block(values: Vec[usize], id: usize) -> bool {
+    for value in values { if value == id { ret true } }
+    ret false
+}
+
+fn renumber_suspensions(builder: mut AsyncCfgBuilder, block_id: usize, visited: mut Vec[usize], next_id: usize) -> usize {
+    if contains_block(visited, block_id) { ret next_id }
+    visited.push(block_id)
+    match builder.blocks.get(block_id) {
+        Some(block) => {
+            match block.terminator {
+                AsyncTerminator::Suspend(item) => {
+                    builder.blocks.set(block_id, AsyncBlock{block.id, block.statements, AsyncTerminator::Suspend(AsyncSuspend{next_id, item.binding, item.expression, item.resume})})
+                    ret renumber_suspensions(builder, item.resume, visited, next_id + 1_usize)
+                }
+                AsyncTerminator::Goto(target) => { ret renumber_suspensions(builder, target, visited, next_id) }
+                AsyncTerminator::Branch(branch) => {
+                    let after_then = renumber_suspensions(builder, branch.then_block, visited, next_id)
+                    ret renumber_suspensions(builder, branch.else_block, visited, after_then)
+                }
+                _ => {}
+            }
+        }
+        None => {}
+    }
+    ret next_id
+}
+
+pub fn lower_async_function(item: FunctionItem) -> AsyncCfg {
+    let mut builder = AsyncCfgBuilder{Vec[AsyncBlock]::new(), 0_usize, 0_usize, Vec[str]::new()}
+    let terminal = add_block(builder, empty_statements(), AsyncTerminator::Unreachable)
+    let mut entry = terminal
+    match item.body {
+        Some(body) => { entry = lower_sequence(builder, body.statements, terminal, empty_targets()) }
+        None => { builder.diagnostics.push("async function has no body") }
+    }
+    let mut visited = Vec[usize]::new()
+    builder.next_suspend = renumber_suspensions(builder, entry, visited, 0_usize)
+    ret AsyncCfg{entry, builder.blocks, builder.next_suspend, builder.diagnostics}
+}
+
+fn contains_name(values: Vec[str], name: str) -> bool {
+    for value in values { if value == name { ret true } }
+    ret false
+}
+
+fn add_name(values: mut Vec[str], name: str) -> () {
+    if name != "" && !contains_name(values, name) { values.push(name) }
+    ret ()
+}
+
+fn add_names(values: mut Vec[str], additions: Vec[str]) -> () {
+    for name in additions { add_name(values, name) }
+    ret ()
+}
+
+fn names_equal(lhs: Vec[str], rhs: Vec[str]) -> bool {
+    if lhs.len() != rhs.len() { ret false }
+    for name in lhs { if !contains_name(rhs, name) { ret false } }
+    ret true
+}
+
+fn without_names(values: Vec[str], removed: Vec[str]) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    for name in values { if !contains_name(removed, name) { out.push(name) } }
+    ret out
+}
+
+fn expr_uses_h(node: ExprNode<H>, known: Vec[str], out: mut Vec[str]) -> () {
+    expr_uses(unbox_node(node), known, out)
+    ret ()
+}
+
+fn expr_uses(node: ExprNode, known: Vec[str], out: mut Vec[str]) -> () {
+    match node.value {
+        Expr::Path(name) => { if contains_name(known, name) { add_name(out, name) } }
+        Expr::Parenthesized(inner) => { expr_uses_h(inner, known, out) }
+        Expr::Unary(item) => { expr_uses_h(item.expr, known, out) }
+        Expr::Await(inner) => { expr_uses_h(inner, known, out) }
+        Expr::Cast(item) => { expr_uses_h(item.expr, known, out) }
+        Expr::Binary(item) => { expr_uses_h(item.lhs, known, out) expr_uses_h(item.rhs, known, out) }
+        Expr::Call(item) => {
+            expr_uses_h(item.callee, known, out)
+            for argument in item.args { expr_uses(argument, known, out) }
+        }
+        Expr::Field(item) => { expr_uses_h(item.base, known, out) }
+        Expr::MethodCall(item) => {
+            expr_uses_h(item.receiver, known, out)
+            for argument in item.args { expr_uses(argument, known, out) }
+        }
+        Expr::TupleLiteral(item) => { for value in item.items { expr_uses(value, known, out) } }
+        Expr::ArrayLiteral(item) => { for value in item.items { expr_uses(value, known, out) } }
+        Expr::VecLiteral(item) => { for value in item.items { expr_uses(value, known, out) } }
+        Expr::ArrayRepeat(item) => { expr_uses_h(item.value, known, out) }
+        Expr::StructInit(item) => { for value in item.values { expr_uses(value, known, out) } }
+        Expr::Index(item) => { expr_uses_h(item.base, known, out) expr_uses_h(item.index, known, out) }
+        Expr::Try(inner) => { expr_uses_h(inner, known, out) }
+        Expr::If(item) => {
+            for branch in item.branches { expr_uses(branch.condition, known, out) expr_uses(branch.body, known, out) }
+            expr_uses_h(item.else_body, known, out)
+        }
+        Expr::Match(item) => {
+            expr_uses_h(item.expr, known, out)
+            for arm in item.arms { expr_uses(arm.expr, known, out) }
+        }
+        Expr::Block(item) => {
+            for statement in item.statements { statement_uses(statement, known, out) }
+            expr_uses_h(item.tail, known, out)
+        }
+        Expr::Unsafe(block) => { for statement in block.statements { statement_uses(statement, known, out) } }
+        _ => {}
+    }
+    ret ()
+}
+
+fn statement_uses(statement: Statement, known: Vec[str], out: mut Vec[str]) -> () {
+    match statement {
+        Statement::Let(item) => { expr_uses(item.expr, known, out) }
+        Statement::Ret(expr) => { expr_uses(expr, known, out) }
+        Statement::Expr(expr) => { expr_uses(expr, known, out) }
+        Statement::Assignment(item) => { expr_uses(item.target, known, out) expr_uses(item.expr, known, out) }
+        Statement::If(item) => {
+            for branch in item.branches {
+                expr_uses(branch.condition, known, out)
+                for nested in branch.body.statements { statement_uses(nested, known, out) }
+            }
+            match item.else_body { Some(body) => { for nested in body.statements { statement_uses(nested, known, out) } } None => {} }
+        }
+        Statement::While(item) => { expr_uses(item.condition, known, out) for nested in item.body.statements { statement_uses(nested, known, out) } }
+        _ => {}
+    }
+    ret ()
+}
+
+fn statement_defs(statement: Statement, out: mut Vec[str]) -> () {
+    match statement {
+        Statement::Let(item) => { add_name(out, item.name) }
+        _ => {}
+    }
+    ret ()
+}
+
+fn collect_known_names(item: FunctionItem, cfg: AsyncCfg) -> Vec[str] {
+    let mut known = Vec[str]::new()
+    for param in item.params { add_name(known, param.name) }
+    for block in cfg.blocks {
+        for statement in block.statements { statement_defs(statement, known) }
+        match block.terminator {
+            AsyncTerminator::Suspend(item) => { add_name(known, item.binding) }
+            _ => {}
+        }
+    }
+    ret known
+}
+
+fn block_successors(block: AsyncBlock) -> Vec[usize] {
+    let mut out = Vec[usize]::new()
+    match block.terminator {
+        AsyncTerminator::Goto(target) => { out.push(target) }
+        AsyncTerminator::Branch(branch) => { out.push(branch.then_block) out.push(branch.else_block) }
+        AsyncTerminator::Suspend(item) => { out.push(item.resume) }
+        _ => {}
+    }
+    ret out
+}
+
+fn block_uses(block: AsyncBlock, known: Vec[str]) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    for statement in block.statements { statement_uses(statement, known, out) }
+    match block.terminator {
+        AsyncTerminator::Branch(item) => { expr_uses(item.condition, known, out) }
+        AsyncTerminator::Suspend(item) => { expr_uses(item.expression, known, out) }
+        AsyncTerminator::Return(expr) => { expr_uses(expr, known, out) }
+        _ => {}
+    }
+    ret out
+}
+
+fn block_defs(block: AsyncBlock) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    for statement in block.statements { statement_defs(statement, out) }
+    ret out
+}
+
+fn empty_name_sets(count: usize) -> Vec[Vec[str]] {
+    let mut out = Vec[Vec[str]]::new()
+    let mut index = 0_usize
+    while index < count { out.push(Vec[str]::new()) index = index + 1_usize }
+    ret out
+}
+
+pub fn analyze_async_liveness(item: FunctionItem, cfg: AsyncCfg) -> Vec[SuspensionLiveness] {
+    let known = collect_known_names(item, cfg)
+    let mut live_in = empty_name_sets(cfg.blocks.len())
+    let mut changed = true
+    while changed {
+        changed = false
+        let mut index = cfg.blocks.len()
+        while index > 0_usize {
+            index = index - 1_usize
+            match cfg.blocks.get(index) {
+                Some(block) => {
+                    let mut live_out = Vec[str]::new()
+                    for successor in block_successors(block) {
+                        match live_in.get(successor) { Some(values) => { add_names(live_out, values) } None => {} }
+                    }
+                    match block.terminator {
+                        AsyncTerminator::Suspend(suspend) => {
+                            let mut binding = Vec[str]::new()
+                            binding.push(suspend.binding)
+                            live_out = without_names(live_out, binding)
+                        }
+                        _ => {}
+                    }
+                    let mut next_in = block_uses(block, known)
+                    add_names(next_in, without_names(live_out, block_defs(block)))
+                    match live_in.get(index) {
+                        Some(previous) => {
+                            if !names_equal(previous, next_in) {
+                                live_in.set(index, next_in)
+                                changed = true
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    let mut out = Vec[SuspensionLiveness]::new()
+    for block in cfg.blocks {
+        match block.terminator {
+            AsyncTerminator::Suspend(suspend) => {
+                let mut values = Vec[str]::new()
+                match live_in.get(suspend.resume) { Some(resume_live) => { add_names(values, resume_live) } None => {} }
+                let mut binding = Vec[str]::new()
+                binding.push(suspend.binding)
+                values = without_names(values, binding)
+                out.push(SuspensionLiveness{suspend.id, values})
+            }
+            _ => {}
+        }
+    }
+    ret out
+}

@@ -1,0 +1,91 @@
+import core::option::Option
+import std::vec::Vec
+import refrain::frontend::lexer::Lexer
+import refrain::frontend::parser::Parser
+import refrain::frontend::parser::statements::{Expr, FunctionItem, Statement}
+import refrain::frontend::async_lowering::{AsyncTerminator, SuspensionLiveness, analyze_async_liveness, lower_async_function}
+
+fn parse_function(source: str, name: str) -> Option[FunctionItem] {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new()
+    for statement in parser.parse(lexer.tokenize(source)) {
+        match statement {
+            Statement::Function(item) => { if item.name == name { ret Option[FunctionItem]::Some(item) } }
+            _ => {}
+        }
+    }
+    ret Option[FunctionItem]::None
+}
+
+fn contains(values: Vec[str], expected: str) -> bool {
+    for value in values { if value == expected { ret true } }
+    ret false
+}
+
+fn starts_with(value: str, prefix: str) -> bool {
+    if prefix.len() > value.len() { ret false }
+    ret value.slice(0_usize, prefix.len()) == prefix
+}
+
+fn live_at(items: Vec[SuspensionLiveness], id: usize) -> Vec[str] {
+    for item in items { if item.suspension == id { ret item.values } }
+    ret Vec[str]::new()
+}
+
+fn check_cfg_shape() -> bool {
+    let source = "async fn flow(first: F, second: F, flag: bool) -> u32 { let value = side() + await first if flag { let other = await second ret value + other } while flag { let again = await second ret value + again } ret value }"
+    match parse_function(source, "flow") {
+        Option[FunctionItem]::Some(item) => {
+            let cfg = lower_async_function(item)
+            if cfg.diagnostics.len() != 0_usize || cfg.suspension_count != 3_usize { ret false }
+            let mut suspends = 0_usize
+            let mut materialized_call = false
+            for block in cfg.blocks {
+                match block.terminator { AsyncTerminator::Suspend(_) => { suspends = suspends + 1_usize } _ => {} }
+                for statement in block.statements {
+                    match statement {
+                        Statement::Let(binding) => {
+                            if starts_with(binding.name, "__async_tmp_") {
+                                match binding.expr.value { Expr::Call(_) => { materialized_call = true } _ => {} }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ret suspends == 3_usize && materialized_call
+        }
+        Option[FunctionItem]::None => {}
+    }
+    ret false
+}
+
+fn check_liveness() -> u32 {
+    let source = "async fn flow(first: F, second: F, keep: u32) -> u32 { let a = await first let dead = 9_u32 let b = await second ret keep + a + b }"
+    match parse_function(source, "flow") {
+        Option[FunctionItem]::Some(item) => {
+            let cfg = lower_async_function(item)
+            let liveness = analyze_async_liveness(item, cfg)
+            let first = live_at(liveness, 0_usize)
+            let second = live_at(liveness, 1_usize)
+            if !contains(first, "second") { ret 10_u32 }
+            if !contains(first, "keep") { ret 11_u32 }
+            if contains(first, "first") { ret 12_u32 }
+            if contains(first, "dead") { ret 13_u32 }
+            if !contains(second, "keep") { ret 14_u32 }
+            if !contains(second, "a") { ret 15_u32 }
+            if contains(second, "second") { ret 16_u32 }
+            if contains(second, "b") { ret 17_u32 }
+            ret 0_u32
+        }
+        Option[FunctionItem]::None => {}
+    }
+    ret 18_u32
+}
+
+fn main() -> u32 {
+    if !check_cfg_shape() { ret 1_u32 }
+    let liveness = check_liveness()
+    if liveness != 0_u32 { ret liveness }
+    ret 0_u32
+}
