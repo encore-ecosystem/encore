@@ -29,6 +29,29 @@ supports TrueType, OpenType, font collections, and other formats enabled by its
 FreeType build. `Window::text_width` and `text_height` measure the active font.
 Calling `clear_font()` restores SDL3's built-in debug font.
 
+## Features
+
+The base package does not expose font loading and measurement. Enable the
+`fonts` feature in the dependency reference:
+
+```toml
+dependencies = ["index@encore_ui[fonts]"]
+```
+
+The equivalent CLI command is `encore add encore_ui --features fonts`.
+Features are additive across a workspace and are recorded separately from the
+package source in `encore.lock`. Package authors declare them with a
+`[features]` table and can guard functions or methods with
+`#cfg(feature = "name")`. A feature can include another feature or an optional
+dependency reference:
+
+```toml
+[features]
+default = []
+fonts = []
+accessibility = ["workspace@ui_accessibility"]
+```
+
 ## Example
 
 ```enq

@@ -350,28 +350,34 @@ uint32_t encore_ui_window_poll(size_t handle) {
     UiWindow *state = ui_window(handle);
     if (state == NULL || !state->open) return UI_EVENT_CLOSE;
     state->event_kind = UI_EVENT_NONE;
+    state->event_key = 0;
     state->wheel_x = 0.0f;
     state->wheel_y = 0.0f;
     UiSdlEvent event;
+    bool had_motion = false;
     while (g_sdl.PollEvent(&event)) {
         if (event.type == UI_SDL_EVENT_QUIT || event.type == UI_SDL_EVENT_WINDOW_CLOSE) {
             state->open = false;
             state->event_kind = UI_EVENT_CLOSE;
+            return state->event_kind;
         } else if (event.type == UI_SDL_EVENT_KEY_DOWN || event.type == UI_SDL_EVENT_KEY_UP) {
             UiSdlKeyboardEvent *key = (UiSdlKeyboardEvent *)&event;
             state->event_kind = event.type == UI_SDL_EVENT_KEY_DOWN ? UI_EVENT_KEY_DOWN : UI_EVENT_KEY_UP;
             state->event_key = key->key;
+            return state->event_kind;
         } else if (event.type == UI_SDL_EVENT_MOUSE_MOTION) {
             UiSdlMouseMotionEvent *motion = (UiSdlMouseMotionEvent *)&event;
             state->event_kind = UI_EVENT_POINTER_MOVE;
             state->event_x = motion->x;
             state->event_y = motion->y;
+            had_motion = true;
         } else if (event.type == UI_SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == UI_SDL_EVENT_MOUSE_BUTTON_UP) {
             UiSdlMouseButtonEvent *button = (UiSdlMouseButtonEvent *)&event;
             state->event_kind = event.type == UI_SDL_EVENT_MOUSE_BUTTON_DOWN ? UI_EVENT_POINTER_DOWN : UI_EVENT_POINTER_UP;
             state->event_x = button->x;
             state->event_y = button->y;
             state->event_key = button->button;
+            return state->event_kind;
         } else if (event.type == UI_SDL_EVENT_MOUSE_WHEEL) {
             UiSdlMouseWheelEvent *wheel = (UiSdlMouseWheelEvent *)&event;
             state->event_kind = UI_EVENT_SCROLL;
@@ -379,8 +385,10 @@ uint32_t encore_ui_window_poll(size_t handle) {
             state->event_y = wheel->mouse_y;
             state->wheel_x = wheel->x;
             state->wheel_y = wheel->y;
+            return state->event_kind;
         }
     }
+    if (had_motion) { return UI_EVENT_POINTER_MOVE; }
     return state->event_kind;
 }
 
