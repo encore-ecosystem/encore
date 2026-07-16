@@ -131,6 +131,13 @@ struct LoopTargetType {
     owned_start: usize
 }
 
+struct AwaitLetPlan {
+    prefix: Vec[Statement]
+    binding: LetStmt
+    awaited: ExprNode<H>
+    suffix: Vec[Statement]
+}
+
 struct TranslatorContext {
     vars: Vec[VarType]
     owned_vars: Vec[VarType]
@@ -509,6 +516,17 @@ fn append_owned_drops_from(ctx: mut TranslatorContext, builder: EhirTextBuilder,
 
 fn restore_owned_vars(ctx: mut TranslatorContext, size: usize) -> () {
     while ctx.owned_vars.len() > size { ctx.owned_vars.pop() }
+    ret ()
+}
+
+fn move_var_out_of_context(ctx: mut TranslatorContext, name: str) -> () {
+    if name == "" { ret () }
+    let mut remaining_vars = Vec[VarType]::new()
+    for variable in ctx.vars { if variable.name != name { remaining_vars.push(variable) } }
+    ctx.vars = remaining_vars
+    let mut remaining_owned = Vec[VarType]::new()
+    for variable in ctx.owned_vars { if variable.name != name { remaining_owned.push(variable) } }
+    ctx.owned_vars = remaining_owned
     ret ()
 }
 
@@ -1334,6 +1352,10 @@ fn translate_async_function(ctx: mut TranslatorContext, fn_item: FunctionItem, e
         Some(awaited) => { ret translate_direct_await_function(ctx, fn_item, emitted_name, awaited) }
         None => {}
     }
+    match single_await_let_plan(fn_item) {
+        Some(plan) => { ret translate_await_let_function(ctx, fn_item, emitted_name, plan) }
+        None => {}
+    }
     let output_type = function_ret_type(fn_item)
     let future_type = async_future_type(fn_item.name, fn_item.generics)
     let future_base = base_type_name(future_type)
@@ -1406,6 +1428,65 @@ fn translate_async_function(ctx: mut TranslatorContext, fn_item: FunctionItem, e
     builder = builder.line("}")
     builder = builder.line("}")
     ret builder
+}
+
+fn single_await_let_plan(item: FunctionItem) -> Option[AwaitLetPlan] {
+    match item.body {
+        Some(body) => {
+            let mut await_index = body.statements.len()
+            let mut index = 0_usize
+            while index < body.statements.len() {
+                match body.statements.get(index) {
+                    Some(statement) => {
+                        match statement {
+                            Statement::Let(let_item) => {
+                                match let_item.expr.value {
+                                    Expr::Await(_) => { await_index = index }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    None => {}
+                }
+                if await_index < body.statements.len() { break }
+                index = index + 1_usize
+            }
+            if await_index < body.statements.len() {
+                let mut prefix = Vec[Statement]::new()
+                let mut suffix = Vec[Statement]::new()
+                index = 0_usize
+                while index < body.statements.len() {
+                    if index != await_index {
+                        match body.statements.get(index) {
+                            Some(statement) => {
+                                if index < await_index { prefix.push(statement) } else { suffix.push(statement) }
+                            }
+                            None => {}
+                        }
+                    }
+                    index = index + 1_usize
+                }
+                match body.statements.get(await_index) {
+                    Some(statement) => {
+                        match statement {
+                            Statement::Let(let_item) => {
+                                match let_item.expr.value {
+                                    Expr::Await(inner) => { ret Option[AwaitLetPlan]::Some(AwaitLetPlan{prefix, let_item, inner, suffix}) }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        None => {}
+    }
+    ret Option[AwaitLetPlan]::None
 }
 
 fn direct_return_await(item: FunctionItem) -> Option[ExprNode<H>] {
@@ -1509,7 +1590,7 @@ fn translate_direct_await_function(ctx: mut TranslatorContext, fn_item: Function
     let child = lower_expr_h(ctx, awaited, "async_child", 0_usize)
     builder = builder.append(child.code)
     builder = builder.instr("store " + child.value + ", async_child_slot")
-    builder = append_owned_drops(ctx, builder, "", "async_start_cleanup")
+    builder = append_owned_drops(ctx, builder, expr_h_path_or_empty(awaited), "async_start_cleanup")
     builder = builder.instr("br $async_poll_child")
 
     builder = builder.label("async_waiting_state")
@@ -1546,6 +1627,221 @@ fn translate_direct_await_function(ctx: mut TranslatorContext, fn_item: Function
     builder = builder.line("}")
     builder = builder.line("}")
     ret builder
+}
+
+fn future_output_type(ctx: mut TranslatorContext, future_type: str, source_name: str, line: usize, column: usize) -> str {
+    for implementation in ctx.trait_impls {
+        if implementation.trait_name == "Future" && base_type_name(implementation.target) == base_type_name(future_type) {
+            match implementation.trait_args.get(0_usize) {
+                Some(output) => { ret canonical_type(output) }
+                None => {}
+            }
+        }
+    }
+    translation_error_at(source_name, line, column, "invalid-await-operand", "await expects a Future, got '" + canonical_type(future_type) + "'")
+    ret "void"
+}
+
+fn translate_await_let_function(ctx: mut TranslatorContext, fn_item: FunctionItem, emitted_name: str, plan: AwaitLetPlan) -> EhirTextBuilder {
+    let output_type = function_ret_type(fn_item)
+    let future_type = async_future_type(fn_item.name, fn_item.generics)
+    let future_base = base_type_name(future_type)
+    let start_type = future_base + "__start"
+    let waiting_type = future_base + "__waiting"
+    if fn_item.generics.len() > 0_usize {
+        translation_error_at(fn_item.source_name, fn_item.line, fn_item.column, "async-generic-await", "generic futures across await are not lowered yet")
+    }
+
+    // Probe the synchronous prefix to determine the concrete set and types of
+    // values that must survive suspension. Mutable stack slots are deliberately
+    // rejected until borrow/move analysis can prove how they cross await.
+    ctx.vars = Vec[VarType]::new()
+    ctx.owned_vars = Vec[VarType]::new()
+    ctx.return_type = output_type
+    ctx.in_async_function = true
+    ctx.async_poll_future_type = ""
+    for param in fn_item.params {
+        let typ = canonical_type(unwrap_type_or_usize(param.typ))
+        if starts_with(typ, "mut ") { translation_error_at(fn_item.source_name, fn_item.line, fn_item.column, "borrow-across-await", "mutable parameters cannot cross await") }
+        ctx_add_var(ctx, param.name, typ)
+        ctx_add_owned_var(ctx, param.name, param.name, typ)
+    }
+    let _probe_prefix = translate_statements_no_default(ctx, plan.prefix, output_type, "async_probe", Option[str]::None, Option[str]::None)
+    let child_probe = lower_expr_h(ctx, plan.awaited, "async_probe_child", 0_usize)
+    let child_type = canonical_type(child_probe.typ)
+    let awaited_type = future_output_type(ctx, child_type, plan.binding.expr.source_name, plan.binding.expr.line, plan.binding.expr.column)
+    if generic_args_from_path(child_type).len() > 0_usize {
+        translation_error_at(fn_item.source_name, fn_item.line, fn_item.column, "async-generic-await", "generic futures across await are not lowered yet")
+    }
+    match plan.binding.typ {
+        Some(expected) => {
+            if !function_type_matches(expected, awaited_type, Vec[str]::new()) {
+                translation_error_at(plan.binding.expr.source_name, plan.binding.expr.line, plan.binding.expr.column, "type-mismatch", "cannot initialize '" + plan.binding.name + "' of type '" + canonical_type(expected) + "' with awaited value of type '" + awaited_type + "'")
+            }
+        }
+        None => {}
+    }
+    if plan.binding.is_mut { translation_error_at(plan.binding.expr.source_name, plan.binding.expr.line, plan.binding.expr.column, "mutable-await-binding", "mutable await bindings are not lowered yet") }
+    let moved_child = expr_h_path_or_empty(plan.awaited)
+    let mut live_vars = Vec[VarType]::new()
+    for variable in ctx.vars {
+        if variable.name != moved_child { live_vars.push(variable) }
+    }
+    for variable in live_vars {
+        if starts_with(variable.typ, "mut ") {
+            translation_error_at(plan.binding.expr.source_name, plan.binding.expr.line, plan.binding.expr.column, "borrow-across-await", "mutable local '" + variable.name + "' cannot cross await")
+        }
+    }
+
+    let poll_type = "Poll[" + future_type + ", " + output_type + "]"
+    let child_poll_type = "Poll[" + child_type + ", " + awaited_type + "]"
+    let child_owner = method_owner_name(child_type)
+    let mut builder = EhirTextBuilder::new()
+    builder = builder.line("struct " + start_type + " {")
+    for param in fn_item.params { builder = builder.line("  " + param.name + ": " + canonical_type(unwrap_type_or_usize(param.typ))) }
+    builder = builder.line("}").empty_line()
+    builder = builder.line("struct " + waiting_type + " {")
+    builder = builder.line("  child: " + child_type)
+    for variable in live_vars { builder = builder.line("  " + variable.name + ": " + canonical_type(variable.typ)) }
+    builder = builder.line("}").empty_line()
+    builder = builder.line("enum " + future_base + " {")
+    builder = builder.line("  Start(" + start_type + ")")
+    builder = builder.line("  Waiting(" + waiting_type + ")")
+    builder = builder.line("}").empty_line()
+
+    builder = builder.line("fn " + emitted_name + "(" + translate_params(fn_item) + ") -> " + future_type + " {")
+    builder = builder.label("entry")
+    let mut factory_values = Vec[str]::new()
+    for param in fn_item.params {
+        let typ = canonical_type(unwrap_type_or_usize(param.typ))
+        if ctx_type_needs_ownership(ctx, typ) { builder = builder.instr("retain " + param.name + ": " + typ) }
+        factory_values.push(param.name)
+    }
+    builder = builder.instr("async_start: " + start_type + " = capstruct " + start_type + "(" + join_strs(factory_values, ", ") + ")")
+    builder = builder.instr("async_future: " + future_type + " = capenum " + future_type + "::Start(async_start)")
+    for param in fn_item.params {
+        let typ = canonical_type(unwrap_type_or_usize(param.typ))
+        if ctx_type_needs_ownership(ctx, typ) { builder = builder.instr("drop " + param.name + ": " + typ) }
+    }
+    builder = builder.instr("ret async_future: " + future_type)
+    builder = builder.line("}").empty_line()
+
+    builder = builder.line("impl Future[" + output_type + "] for " + future_type + " {")
+    builder = builder.line("fn poll(self: " + future_type + ") -> " + poll_type + " {")
+    builder = builder.label("entry")
+    builder = builder.instr("async_is_start: bool = ieq self, Start")
+    builder = builder.instr("cbr async_is_start, $async_start_state, $async_waiting_state")
+
+    builder = builder.label("async_start_state")
+    builder = builder.instr("async_start_payload: " + start_type + " = getfield self > Start")
+    builder = builder.instr("retain async_start_payload: " + start_type)
+    ctx.vars = Vec[VarType]::new()
+    ctx.owned_vars = Vec[VarType]::new()
+    let mut field_index = 0_usize
+    for param in fn_item.params {
+        let typ = canonical_type(unwrap_type_or_usize(param.typ))
+        let loaded = "async_start_" + param.name
+        builder = builder.instr(loaded + ": " + typ + " = getfield async_start_payload > " + Debug::fmt(field_index))
+        if ctx_type_needs_ownership(ctx, typ) { builder = builder.instr("retain " + loaded + ": " + typ) }
+        ctx_add_var_emitted(ctx, param.name, loaded, typ)
+        ctx_add_owned_var(ctx, param.name, loaded, typ)
+        field_index = field_index + 1_usize
+    }
+    builder = builder.instr("drop async_start_payload: " + start_type)
+    builder = builder.instr("drop self: " + future_type)
+    builder = builder.append(translate_statements_no_default(ctx, plan.prefix, output_type, "async_start_prefix", Option[str]::None, Option[str]::None))
+    let start_child = lower_expr_h(ctx, plan.awaited, "async_start_child", 0_usize)
+    builder = builder.append(start_child.code)
+    move_var_out_of_context(ctx, moved_child)
+    builder = builder.instr("async_start_step: " + child_poll_type + " = call " + child_owner + "::poll(" + start_child.value + ")")
+    builder = builder.instr("async_start_ready: bool = ieq async_start_step, Ready")
+    builder = builder.instr("cbr async_start_ready, $async_start_ready_state, $async_start_pending_state")
+    let start_vars = ctx.vars
+    let start_owned_vars = ctx.owned_vars
+
+    builder = builder.label("async_start_ready_state")
+    builder = builder.append(translate_await_ready_continuation(ctx, plan, "async_start", "async_start_step", child_poll_type, awaited_type, future_type, output_type))
+
+    builder = builder.label("async_start_pending_state")
+    ctx.vars = start_vars
+    ctx.owned_vars = start_owned_vars
+    builder = builder.append(translate_await_pending_return(ctx, live_vars, "async_start", "async_start_step", child_poll_type, child_type, waiting_type, future_type, output_type))
+
+    builder = builder.label("async_waiting_state")
+    builder = builder.instr("async_waiting_payload: " + waiting_type + " = getfield self > Waiting")
+    builder = builder.instr("retain async_waiting_payload: " + waiting_type)
+    builder = builder.instr("async_waiting_child: " + child_type + " = getfield async_waiting_payload > 0")
+    if ctx_type_needs_ownership(ctx, child_type) { builder = builder.instr("retain async_waiting_child: " + child_type) }
+    ctx.vars = Vec[VarType]::new()
+    ctx.owned_vars = Vec[VarType]::new()
+    field_index = 1_usize
+    for variable in live_vars {
+        let typ = canonical_type(variable.typ)
+        let loaded = "async_waiting_" + variable.name
+        builder = builder.instr(loaded + ": " + typ + " = getfield async_waiting_payload > " + Debug::fmt(field_index))
+        if ctx_type_needs_ownership(ctx, typ) { builder = builder.instr("retain " + loaded + ": " + typ) }
+        ctx_add_var_emitted(ctx, variable.name, loaded, typ)
+        ctx_add_owned_var(ctx, variable.name, loaded, typ)
+        field_index = field_index + 1_usize
+    }
+    builder = builder.instr("drop async_waiting_payload: " + waiting_type)
+    builder = builder.instr("drop self: " + future_type)
+    builder = builder.instr("async_waiting_step: " + child_poll_type + " = call " + child_owner + "::poll(async_waiting_child)")
+    builder = builder.instr("async_waiting_ready: bool = ieq async_waiting_step, Ready")
+    builder = builder.instr("cbr async_waiting_ready, $async_waiting_ready_state, $async_waiting_pending_state")
+    let waiting_vars = ctx.vars
+    let waiting_owned_vars = ctx.owned_vars
+
+    builder = builder.label("async_waiting_ready_state")
+    builder = builder.append(translate_await_ready_continuation(ctx, plan, "async_waiting", "async_waiting_step", child_poll_type, awaited_type, future_type, output_type))
+
+    builder = builder.label("async_waiting_pending_state")
+    ctx.vars = waiting_vars
+    ctx.owned_vars = waiting_owned_vars
+    builder = builder.append(translate_await_pending_return(ctx, live_vars, "async_waiting", "async_waiting_step", child_poll_type, child_type, waiting_type, future_type, output_type))
+    builder = builder.line("}")
+    builder = builder.line("}")
+    ret builder
+}
+
+fn translate_await_ready_continuation(ctx: mut TranslatorContext, plan: AwaitLetPlan, prefix: str, step: str, child_poll_type: str, awaited_type: str, future_type: str, output_type: str) -> EhirTextBuilder {
+    let mut builder = EhirTextBuilder::new()
+    let value = prefix + "_awaited"
+    builder = builder.instr(value + ": " + awaited_type + " = getfield " + step + " > Ready")
+    if ctx_type_needs_ownership(ctx, awaited_type) { builder = builder.instr("retain " + value + ": " + awaited_type) }
+    builder = builder.instr("drop " + step + ": " + child_poll_type)
+    ctx_add_var_emitted(ctx, plan.binding.name, value, awaited_type)
+    ctx_add_owned_var(ctx, plan.binding.name, value, awaited_type)
+    ctx.return_type = output_type
+    ctx.in_async_function = true
+    ctx.async_poll_future_type = future_type
+    builder = builder.append(translate_statements(ctx, plan.suffix, output_type, prefix + "_continuation", Option[str]::None, Option[str]::None))
+    ctx.async_poll_future_type = ""
+    ret builder
+}
+
+fn translate_await_pending_return(ctx: mut TranslatorContext, live_vars: Vec[VarType], prefix: str, step: str, child_poll_type: str, child_type: str, waiting_type: str, future_type: str, output_type: str) -> EhirTextBuilder {
+    let mut builder = EhirTextBuilder::new()
+    let next_child = prefix + "_next_child"
+    builder = builder.instr(next_child + ": " + child_type + " = getfield " + step + " > Pending")
+    if ctx_type_needs_ownership(ctx, child_type) { builder = builder.instr("retain " + next_child + ": " + child_type) }
+    let mut values = Vec[str]::new()
+    values.push(next_child)
+    for variable in live_vars {
+        let value = ctx_lookup_value_name(ctx, variable.name)
+        if ctx_type_needs_ownership(ctx, variable.typ) { builder = builder.instr("retain " + value + ": " + variable.typ) }
+        values.push(value)
+    }
+    let waiting = prefix + "_next_waiting"
+    let next_future = prefix + "_next_future"
+    let pending = prefix + "_pending"
+    let poll_type = "Poll[" + future_type + ", " + output_type + "]"
+    builder = builder.instr(waiting + ": " + waiting_type + " = capstruct " + waiting_type + "(" + join_strs(values, ", ") + ")")
+    builder = builder.instr(next_future + ": " + future_type + " = capenum " + future_type + "::Waiting(" + waiting + ")")
+    builder = builder.instr(pending + ": " + poll_type + " = capenum " + poll_type + "::Pending(" + next_future + ")")
+    builder = append_owned_drops(ctx, builder, "", prefix + "_pending_cleanup")
+    builder = builder.instr("drop " + step + ": " + child_poll_type)
+    ret builder.instr("ret " + pending + ": " + poll_type)
 }
 
 fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, emitted_name: str, ret_type: str, scope_generics: Vec[GenericParam]) -> EhirTextBuilder {
