@@ -1,25 +1,41 @@
 import core::option::Option
 import core::vec::Vec
 import geometry::{Rect, Size}
+import refrain::style::GridPlacement
 
 pub fn horizontal() -> usize { ret 0_usize }
 pub fn vertical() -> usize { ret 1_usize }
+pub fn justify_start() -> usize { ret 0_usize }
+pub fn justify_center() -> usize { ret 1_usize }
+pub fn justify_end() -> usize { ret 2_usize }
+pub fn justify_space_between() -> usize { ret 3_usize }
+pub fn justify_space_around() -> usize { ret 4_usize }
+pub fn justify_space_evenly() -> usize { ret 5_usize }
+pub fn align_stretch() -> usize { ret 0_usize }
+pub fn align_start() -> usize { ret 1_usize }
+pub fn align_center() -> usize { ret 2_usize }
+pub fn align_end() -> usize { ret 3_usize }
 
 pub struct FlexItem {
     basis: f32
     grow: f32
+    shrink: f32
     min_size: f32
     max_size: f32
 }
 
 impl for FlexItem {
-    pub fn fixed(size: f32) -> FlexItem { ret FlexItem { size, 0.0_f32, size, size } }
-    pub fn flexible(grow: f32) -> FlexItem { ret FlexItem { 0.0_f32, grow, 0.0_f32, 1000000.0_f32 } }
+    pub fn fixed(size: f32) -> FlexItem { ret FlexItem { size, 0.0_f32, 0.0_f32, size, size } }
+    pub fn flexible(grow: f32) -> FlexItem { ret FlexItem { 0.0_f32, grow, 1.0_f32, 0.0_f32, 1000000.0_f32 } }
     pub fn constrained(basis: f32, grow: f32, min_size: f32, max_size: f32) -> FlexItem {
-        ret FlexItem { basis, grow, min_size, max_size }
+        ret FlexItem { basis, grow, 1.0_f32, min_size, max_size }
+    }
+    pub fn sized(basis: f32, grow: f32, shrink: f32, min_size: f32, max_size: f32) -> FlexItem {
+        ret FlexItem { basis, grow, shrink, min_size, max_size }
     }
     pub fn basis(self: Self) -> f32 { ret self.basis }
     pub fn grow(self: Self) -> f32 { ret self.grow }
+    pub fn shrink(self: Self) -> f32 { ret self.shrink }
     pub fn min_size(self: Self) -> f32 { ret self.min_size }
     pub fn max_size(self: Self) -> f32 { ret self.max_size }
 }
@@ -31,6 +47,10 @@ fn clamp(value: f32, minimum: f32, maximum: f32) -> f32 {
 }
 
 pub fn flex_layout(bounds: Rect, direction: usize, gap: f32, items: Vec[FlexItem]) -> Vec[Rect] {
+    ret flex_layout_aligned(bounds, direction, gap, justify_start(), items)
+}
+
+pub fn flex_layout_aligned(bounds: Rect, direction: usize, gap: f32, justify: usize, items: Vec[FlexItem]) -> Vec[Rect] {
     let mut result = Vec[Rect]::new()
     if items.len() == 0_usize { ret result }
 
@@ -38,34 +58,839 @@ pub fn flex_layout(bounds: Rect, direction: usize, gap: f32, items: Vec[FlexItem
     let gaps = gap * ((items.len() - 1_usize) as f32)
     let available = if main_size > gaps { main_size - gaps } else { 0.0_f32 }
     let mut used = 0.0_f32
-    let mut grow_total = 0.0_f32
+    let mut extents = Vec[f32]::new()
     let mut index = 0_usize
     while index < items.len() {
         match items.get(index) {
             Option[FlexItem]::Some(item) => {
-                used = used + clamp(item.basis(), item.min_size(), item.max_size())
-                grow_total = grow_total + item.grow()
+                let extent = clamp(item.basis(), item.min_size(), item.max_size())
+                extents.push(extent)
+                used = used + extent
             }
             Option[FlexItem]::None => {}
         }
         index = index + 1_usize
     }
-    let free = if available > used { available - used } else { 0.0_f32 }
-    let mut cursor = if direction == horizontal() { bounds.x() } else { bounds.y() }
+    if used < available { extents = distribute_grow(items, extents, available - used) }
+    elif used > available { extents = distribute_shrink(items, extents, used - available) }
+    let mut occupied = gaps + extent_sum(extents)
+    let remaining = if main_size > occupied { main_size - occupied } else { 0.0_f32 }
+    let mut effective_gap = gap
+    let mut offset = if justify == justify_center() { remaining / 2.0_f32 }
+        elif justify == justify_end() { remaining }
+        else { 0.0_f32 }
+    if justify == justify_space_between() && items.len() > 1_usize {
+        effective_gap = gap + remaining / ((items.len() - 1_usize) as f32)
+    }
+    elif justify == justify_space_around() {
+        let distributed = remaining / (items.len() as f32)
+        effective_gap = gap + distributed
+        offset = distributed / 2.0_f32
+    }
+    elif justify == justify_space_evenly() {
+        let distributed = remaining / ((items.len() + 1_usize) as f32)
+        effective_gap = gap + distributed
+        offset = distributed
+    }
+    let mut cursor = (if direction == horizontal() { bounds.x() } else { bounds.y() }) + offset
     index = 0_usize
-    while index < items.len() {
-        match items.get(index) {
-            Option[FlexItem]::Some(item) => {
-                let extra = if grow_total > 0.0_f32 { free * item.grow() / grow_total } else { 0.0_f32 }
-                let extent = clamp(item.basis() + extra, item.min_size(), item.max_size())
-                if direction == horizontal() {
-                    result.push(Rect::new(cursor, bounds.y(), extent, bounds.height()))
-                } else {
-                    result.push(Rect::new(bounds.x(), cursor, bounds.width(), extent))
-                }
-                cursor = cursor + extent + gap
+    while index < extents.len() {
+        match extents.get(index) {
+            Option[f32]::Some(extent) => {
+                if direction == horizontal() { result.push(Rect::new(cursor, bounds.y(), extent, bounds.height())) }
+                else { result.push(Rect::new(bounds.x(), cursor, bounds.width(), extent)) }
+                cursor = cursor + extent + effective_gap
             }
+            Option[f32]::None => {}
+        }
+        index = index + 1_usize
+    }
+    ret result
+}
+
+pub fn flex_layout_directional(bounds: Rect, direction: usize, gap: f32, justify: usize,
+    items: Vec[FlexItem], reverse: bool) -> Vec[Rect] {
+    if !reverse { ret flex_layout_aligned(bounds, direction, gap, justify, items) }
+    let reversed_items = reverse_flex_items(items)
+    let effective_justify = if justify == justify_start() { justify_end() }
+        elif justify == justify_end() { justify_start() } else { justify }
+    ret reverse_rects(flex_layout_aligned(bounds, direction, gap, effective_justify, reversed_items))
+}
+
+pub fn flex_wrap_layout(bounds: Rect, direction: usize, main_gap: f32, cross_gap: f32, justify: usize,
+    items: Vec[FlexItem], cross_extents: Vec[f32], main_reverse: bool, cross_reverse: bool,
+    align_content: usize) -> Vec[Rect] {
+    let mut result = Vec[Rect]::new()
+    if items.len() == 0_usize { ret result }
+    let main_size = if direction == horizontal() { bounds.width() } else { bounds.height() }
+    let mut starts = Vec[usize]::new()
+    let mut ends = Vec[usize]::new()
+    let mut start = 0_usize
+    while start < items.len() {
+        let mut end = start
+        let mut occupied = 0.0_f32
+        while end < items.len() {
+            let extent = flex_item_basis(items, end)
+            let required = extent + if end > start { main_gap } else { 0.0_f32 }
+            if end > start && occupied + required > main_size { break }
+            occupied = occupied + required
+            end = end + 1_usize
+        }
+        if end == start { end = start + 1_usize }
+        starts.push(start)
+        ends.push(end)
+        start = end
+    }
+    let line_count = starts.len()
+    let cross_size = if direction == horizontal() { bounds.height() } else { bounds.width() }
+    let mut line_sizes = Vec[f32]::new()
+    let mut line = 0_usize
+    while line < line_count {
+        let first = usize_at(starts, line)
+        let finish = usize_at(ends, line)
+        let mut maximum = 0.0_f32
+        let mut item_index = first
+        while item_index < finish {
+            let extent = f32_at(cross_extents, item_index)
+            if extent > maximum { maximum = extent }
+            item_index = item_index + 1_usize
+        }
+        line_sizes.push(maximum)
+        line = line + 1_usize
+    }
+    let gaps = cross_gap * ((line_count - 1_usize) as f32)
+    let occupied = extent_sum(line_sizes) + gaps
+    let remaining = if cross_size > occupied { cross_size - occupied } else { 0.0_f32 }
+    let mut effective_gap = cross_gap
+    let mut offset = 0.0_f32
+    if align_content == 0_usize {
+        let extra = remaining / line_count as f32
+        line = 0_usize
+        while line < line_sizes.len() {
+            line_sizes.set(line, f32_at(line_sizes, line) + extra)
+            line = line + 1_usize
+        }
+    } elif align_content == 2_usize { offset = remaining / 2.0_f32 }
+    elif align_content == 3_usize { offset = remaining }
+    elif align_content == 4_usize && line_count > 1_usize {
+        effective_gap = cross_gap + remaining / ((line_count - 1_usize) as f32)
+    } elif align_content == 5_usize {
+        let distributed = remaining / line_count as f32
+        effective_gap = cross_gap + distributed
+        offset = distributed / 2.0_f32
+    } elif align_content == 6_usize {
+        let distributed = remaining / ((line_count + 1_usize) as f32)
+        effective_gap = cross_gap + distributed
+        offset = distributed
+    }
+    let mut cross_cursor = if cross_reverse { cross_size - offset } else { offset }
+    line = 0_usize
+    while line < line_count {
+        let mut line_items = Vec[FlexItem]::new()
+        let first = usize_at(starts, line)
+        let finish = usize_at(ends, line)
+        let mut index = first
+        while index < finish {
+            match items.get(index) {
+                Option[FlexItem]::Some(item) => { line_items.push(item) }
+                Option[FlexItem]::None => {}
+            }
+            index = index + 1_usize
+        }
+        let line_cross = f32_at(line_sizes, line)
+        if cross_reverse { cross_cursor = cross_cursor - line_cross }
+        let cross_position = cross_cursor
+        let line_bounds = if direction == horizontal() {
+            Rect::new(bounds.x(), bounds.y() + cross_position, bounds.width(), line_cross)
+        } else {
+            Rect::new(bounds.x() + cross_position, bounds.y(), line_cross, bounds.height())
+        }
+        let rects = flex_layout_directional(line_bounds, direction, main_gap, justify, line_items, main_reverse)
+        index = 0_usize
+        while index < rects.len() {
+            match rects.get(index) {
+                Option[Rect]::Some(rect) => { result.push(rect) }
+                Option[Rect]::None => {}
+            }
+            index = index + 1_usize
+        }
+        if cross_reverse { cross_cursor = cross_cursor - effective_gap }
+        else { cross_cursor = cross_cursor + line_cross + effective_gap }
+        line = line + 1_usize
+    }
+    ret result
+}
+
+fn reverse_flex_items(values: Vec[FlexItem]) -> Vec[FlexItem] {
+    let mut result = Vec[FlexItem]::new()
+    let mut index = values.len()
+    while index > 0_usize {
+        index = index - 1_usize
+        match values.get(index) {
+            Option[FlexItem]::Some(value) => { result.push(value) }
             Option[FlexItem]::None => {}
+        }
+    }
+    ret result
+}
+
+fn reverse_rects(values: Vec[Rect]) -> Vec[Rect] {
+    let mut result = Vec[Rect]::new()
+    let mut index = values.len()
+    while index > 0_usize {
+        index = index - 1_usize
+        match values.get(index) {
+            Option[Rect]::Some(value) => { result.push(value) }
+            Option[Rect]::None => {}
+        }
+    }
+    ret result
+}
+
+fn flex_item_basis(items: Vec[FlexItem], index: usize) -> f32 {
+    match items.get(index) {
+        Option[FlexItem]::Some(item) => { ret clamp(item.basis(), item.min_size(), item.max_size()) }
+        Option[FlexItem]::None => { ret 0.0_f32 }
+    }
+}
+
+fn f32_at(values: Vec[f32], index: usize) -> f32 {
+    match values.get(index) {
+        Option[f32]::Some(value) => { ret value }
+        Option[f32]::None => { ret 0.0_f32 }
+    }
+}
+
+fn usize_at(values: Vec[usize], index: usize) -> usize {
+    match values.get(index) {
+        Option[usize]::Some(value) => { ret value }
+        Option[usize]::None => { ret 0_usize }
+    }
+}
+
+pub fn grid_layout(bounds: Rect, columns: usize, gap: f32, count: usize) -> Vec[Rect] {
+    ret grid_layout_gaps(bounds, columns, gap, gap, count)
+}
+
+pub fn grid_layout_gaps(bounds: Rect, columns: usize, row_gap: f32, column_gap: f32, count: usize) -> Vec[Rect] {
+    let mut result = Vec[Rect]::new()
+    if count == 0_usize { ret result }
+    let column_count = if columns > 0_usize { columns } else { 1_usize }
+    let rows = (count + column_count - 1_usize) / column_count
+    let horizontal_gaps = column_gap * ((column_count - 1_usize) as f32)
+    let vertical_gaps = row_gap * ((rows - 1_usize) as f32)
+    let width = if bounds.width() > horizontal_gaps { (bounds.width() - horizontal_gaps) / column_count as f32 } else { 0.0_f32 }
+    let height = if bounds.height() > vertical_gaps { (bounds.height() - vertical_gaps) / rows as f32 } else { 0.0_f32 }
+    let mut index = 0_usize
+    while index < count {
+        let column = index % column_count
+        let row = index / column_count
+        result.push(Rect::new(bounds.x() + (column as f32) * (width + column_gap),
+            bounds.y() + (row as f32) * (height + row_gap), width, height))
+        index = index + 1_usize
+    }
+    ret result
+}
+
+pub fn grid_layout_template(bounds: Rect, column_template: str, row_gap: f32, column_gap: f32, count: usize) -> Vec[Rect] {
+    ret grid_layout_tracks(bounds, column_template, "", row_gap, column_gap, count)
+}
+
+pub fn grid_layout_tracks(bounds: Rect, column_template: str, row_template: str,
+    row_gap: f32, column_gap: f32, count: usize) -> Vec[Rect] {
+    let mut placements = Vec[GridPlacement]::new()
+    let mut index = 0_usize
+    while index < count { placements.push(GridPlacement::auto()) index = index + 1_usize }
+    ret grid_layout_placed(bounds, column_template, row_template, row_gap, column_gap, placements)
+}
+
+struct GridCell {
+    column: usize
+    row: usize
+    column_span: usize
+    row_span: usize
+}
+
+pub fn grid_layout_placed(bounds: Rect, column_template: str, row_template: str,
+    row_gap: f32, column_gap: f32, placements: Vec[GridPlacement]) -> Vec[Rect] {
+    ret grid_layout_auto_placed(bounds, column_template, row_template, "", "", row_gap, column_gap, placements)
+}
+
+pub fn grid_layout_auto_placed(bounds: Rect, column_template: str, row_template: str,
+    auto_column_template: str, auto_row_template: str, row_gap: f32, column_gap: f32,
+    placements: Vec[GridPlacement]) -> Vec[Rect] {
+    ret grid_layout_flow_placed(bounds, column_template, row_template, auto_column_template, auto_row_template,
+        row_gap, column_gap, placements, false, false)
+}
+
+pub fn grid_layout_flow_placed(bounds: Rect, column_template: str, row_template: str,
+    auto_column_template: str, auto_row_template: str, row_gap: f32, column_gap: f32,
+    placements: Vec[GridPlacement], flow_column: bool, dense: bool) -> Vec[Rect] {
+    ret grid_layout_intrinsic_placed(bounds, column_template, row_template, auto_column_template, auto_row_template,
+        row_gap, column_gap, placements, Vec[Size]::new(), Vec[Size]::new(), flow_column, dense)
+}
+
+pub fn grid_layout_intrinsic_placed(bounds: Rect, column_template: str, row_template: str,
+    auto_column_template: str, auto_row_template: str, row_gap: f32, column_gap: f32,
+    placements: Vec[GridPlacement], minimum_content: Vec[Size], maximum_content: Vec[Size],
+    flow_column: bool, dense: bool) -> Vec[Rect] {
+    let explicit_columns = grid_track_tokens(column_template)
+    let column_count = implicit_column_count(explicit_columns.len(), placements)
+    let columns = extend_grid_tracks(explicit_columns, column_count, auto_column_template)
+    let cells = place_grid_items(columns.len(), placements, flow_column, dense)
+    let widths = grid_track_sizes_intrinsic(columns, bounds.width(), column_gap, cells, minimum_content, maximum_content, true)
+    let required_rows = grid_row_count(cells)
+    let explicit_rows = grid_track_tokens(row_template)
+    let rows = extend_grid_tracks(explicit_rows, required_rows, auto_row_template)
+    let heights = if rows.len() > 0_usize { grid_track_sizes_intrinsic(rows, bounds.height(), row_gap, cells, minimum_content, maximum_content, false) }
+        else { equal_track_sizes(bounds.height(), row_gap, required_rows) }
+    let mut result = Vec[Rect]::new()
+    let mut index = 0_usize
+    while index < cells.len() {
+        let cell = grid_cell_at(cells, index)
+        let width = track_span_extent(widths, cell.column, cell.column_span, column_gap)
+        let height = track_span_extent(heights, cell.row, cell.row_span, row_gap)
+        result.push(Rect::new(bounds.x() + track_offset(widths, cell.column, column_gap),
+            bounds.y() + track_offset(heights, cell.row, row_gap), width, height))
+        index = index + 1_usize
+    }
+    ret result
+}
+
+fn implicit_column_count(explicit: usize, placements: Vec[GridPlacement]) -> usize {
+    let mut result = if explicit > 0_usize { explicit } else { 1_usize }
+    let mut index = 0_usize
+    while index < placements.len() {
+        let placement = grid_placement_at(placements, index)
+        if placement.column() > 0_usize {
+            let required = placement.column() - 1_usize + placement.column_span()
+            if required > result { result = required }
+        }
+        index = index + 1_usize
+    }
+    ret result
+}
+
+fn extend_grid_tracks(explicit: Vec[str], count: usize, automatic: str) -> Vec[str] {
+    let mut result = Vec[str]::new()
+    let mut index = 0_usize
+    while index < explicit.len() { result.push(string_at(explicit, index)) index = index + 1_usize }
+    let automatic_tracks = grid_track_tokens(automatic)
+    while result.len() < count {
+        if automatic_tracks.len() > 0_usize { result.push(string_at(automatic_tracks, (result.len() - explicit.len()) % automatic_tracks.len())) }
+        else { result.push("1fr") }
+    }
+    ret result
+}
+
+fn place_grid_items(columns: usize, placements: Vec[GridPlacement], flow_column: bool, dense: bool) -> Vec[GridCell] {
+    let mut capacity_rows = placements.len() + 1_usize
+    let mut capacity_index = 0_usize
+    while capacity_index < placements.len() {
+        let placement = grid_placement_at(placements, capacity_index)
+        let required = placement.row() + placement.row_span()
+        if required > capacity_rows { capacity_rows = required }
+        capacity_index = capacity_index + 1_usize
+    }
+    let mut occupied = Vec[bool]::new()
+    let mut cells = Vec[GridCell]::new()
+    let mut index = 0_usize
+    while index < columns * capacity_rows { occupied.push(false) index = index + 1_usize }
+    index = 0_usize
+    while index < placements.len() { cells.push(GridCell { 0_usize, 0_usize, 1_usize, 1_usize }) index = index + 1_usize }
+    let mut explicit_pass = true
+    let mut cursor = 0_usize
+    while true {
+        index = 0_usize
+        while index < placements.len() {
+            let placement = grid_placement_at(placements, index)
+            let explicit = placement.column() > 0_usize || placement.row() > 0_usize
+            if explicit == explicit_pass {
+                let cell = if explicit {
+                    find_grid_cell(columns, capacity_rows, occupied, placement)
+                } else {
+                    find_auto_grid_cell(columns, capacity_rows, occupied, placement,
+                        if dense { 0_usize } else { cursor }, flow_column)
+                }
+                cells.set(index, cell)
+                mark_grid_cell(columns, occupied, cell)
+                if !explicit && !dense { cursor = grid_flow_index(cell, columns, capacity_rows, flow_column) + 1_usize }
+            }
+            index = index + 1_usize
+        }
+        if !explicit_pass { break }
+        explicit_pass = false
+    }
+    ret cells
+}
+
+fn find_auto_grid_cell(columns: usize, rows: usize, occupied: Vec[bool], placement: GridPlacement,
+    start: usize, flow_column: bool) -> GridCell {
+    let span_columns = if placement.column_span() < columns { placement.column_span() } else { columns }
+    let span_rows = placement.row_span()
+    let total = columns * rows
+    let mut offset = if start < total { start } else { total - 1_usize }
+    while offset < total {
+        let column = if flow_column { offset / rows } else { offset % columns }
+        let row = if flow_column { offset % rows } else { offset / columns }
+        if column + span_columns <= columns && row + span_rows <= rows &&
+            grid_cell_free(columns, occupied, column, row, span_columns, span_rows) {
+            ret GridCell { column, row, span_columns, span_rows }
+        }
+        offset = offset + 1_usize
+    }
+    ret GridCell { 0_usize, rows - 1_usize, span_columns, span_rows }
+}
+
+fn grid_flow_index(cell: GridCell, columns: usize, rows: usize, flow_column: bool) -> usize {
+    ret if flow_column { cell.column * rows + cell.row } else { cell.row * columns + cell.column }
+}
+
+fn find_grid_cell(columns: usize, rows: usize, occupied: Vec[bool], placement: GridPlacement) -> GridCell {
+    let span_columns = if placement.column_span() < columns { placement.column_span() } else { columns }
+    let span_rows = placement.row_span()
+    let fixed_column = if placement.column() > 0_usize { placement.column() - 1_usize } else { columns }
+    let fixed_row = if placement.row() > 0_usize { placement.row() - 1_usize } else { rows }
+    if fixed_column < columns && fixed_row < rows {
+        ret GridCell { fixed_column, fixed_row, span_columns, span_rows }
+    }
+    let mut row = if fixed_row < rows { fixed_row } else { 0_usize }
+    while row < rows {
+        let mut column = if fixed_column < columns { fixed_column } else { 0_usize }
+        while column + span_columns <= columns {
+            if grid_cell_free(columns, occupied, column, row, span_columns, span_rows) {
+                ret GridCell { column, row, span_columns, span_rows }
+            }
+            if fixed_column < columns { break }
+            column = column + 1_usize
+        }
+        if fixed_row < rows { break }
+        row = row + 1_usize
+    }
+    ret GridCell { 0_usize, rows - 1_usize, span_columns, span_rows }
+}
+
+fn grid_cell_free(columns: usize, occupied: Vec[bool], column: usize, row: usize, column_span: usize, row_span: usize) -> bool {
+    let mut y = row
+    while y < row + row_span {
+        let mut x = column
+        while x < column + column_span {
+            let slot = y * columns + x
+            if slot >= occupied.len() || bool_at(occupied, slot) { ret false }
+            x = x + 1_usize
+        }
+        y = y + 1_usize
+    }
+    ret true
+}
+
+fn mark_grid_cell(columns: usize, occupied: mut Vec[bool], cell: GridCell) -> () {
+    let mut y = cell.row
+    while y < cell.row + cell.row_span {
+        let mut x = cell.column
+        while x < cell.column + cell.column_span {
+            let slot = y * columns + x
+            if slot < occupied.len() { occupied.set(slot, true) }
+            x = x + 1_usize
+        }
+        y = y + 1_usize
+    }
+    ret ()
+}
+
+fn grid_row_count(cells: Vec[GridCell]) -> usize {
+    let mut rows = 0_usize
+    let mut index = 0_usize
+    while index < cells.len() {
+        let cell = grid_cell_at(cells, index)
+        let end = cell.row + cell.row_span
+        if end > rows { rows = end }
+        index = index + 1_usize
+    }
+    ret rows
+}
+
+fn track_span_extent(sizes: Vec[f32], start: usize, span: usize, gap: f32) -> f32 {
+    let mut result = 0.0_f32
+    let mut index = start
+    let finish = if start + span < sizes.len() { start + span } else { sizes.len() }
+    while index < finish {
+        if index > start { result = result + gap }
+        result = result + f32_at(sizes, index)
+        index = index + 1_usize
+    }
+    ret result
+}
+
+fn grid_placement_at(values: Vec[GridPlacement], index: usize) -> GridPlacement {
+    match values.get(index) { Option[GridPlacement]::Some(value) => { ret value } Option[GridPlacement]::None => { ret GridPlacement::auto() } }
+}
+
+fn grid_cell_at(values: Vec[GridCell], index: usize) -> GridCell {
+    match values.get(index) { Option[GridCell]::Some(value) => { ret value } Option[GridCell]::None => { ret GridCell { 0_usize, 0_usize, 1_usize, 1_usize } } }
+}
+
+fn bool_at(values: Vec[bool], index: usize) -> bool {
+    match values.get(index) { Option[bool]::Some(value) => { ret value } Option[bool]::None => { ret false } }
+}
+
+fn grid_track_sizes_intrinsic(tracks: Vec[str], extent: f32, gap: f32, cells: Vec[GridCell],
+    minimum_content: Vec[Size], maximum_content: Vec[Size], horizontal: bool) -> Vec[f32] {
+    let gaps = gap * ((tracks.len() - 1_usize) as f32)
+    let available = if extent > gaps { extent - gaps } else { 0.0_f32 }
+    let mut fixed = 0.0_f32
+    let mut fractions = 0.0_f32
+    let mut sizes = Vec[f32]::new()
+    let mut minima = Vec[f32]::new()
+    let mut index = 0_usize
+    while index < tracks.len() {
+        let track = layout_trim(string_at(tracks, index))
+        let intrinsic_minimum = intrinsic_track_extent(index, cells, minimum_content, horizontal)
+        let intrinsic_maximum = intrinsic_track_extent(index, cells, maximum_content, horizontal)
+        let minimum = grid_track_minimum(track, extent, intrinsic_minimum, intrinsic_maximum)
+        let weight = grid_track_fraction(track)
+        minima.push(minimum)
+        if weight > 0.0_f32 {
+            sizes.push(-weight)
+            fractions = fractions + weight
+            fixed = fixed + minimum
+        } else {
+            let size = grid_track_fixed(track, extent, intrinsic_minimum, intrinsic_maximum)
+            sizes.push(size)
+            fixed = fixed + size
+        }
+        index = index + 1_usize
+    }
+    let remainder = if available > fixed { available - fixed } else { 0.0_f32 }
+    index = 0_usize
+    while index < sizes.len() {
+        let size = f32_at(sizes, index)
+        if size < 0.0_f32 {
+            sizes.set(index, f32_at(minima, index) + if fractions > 0.0_f32 { remainder * (0.0_f32 - size) / fractions } else { 0.0_f32 })
+        }
+        index = index + 1_usize
+    }
+    sizes = apply_spanning_intrinsic(sizes, tracks, cells, minimum_content, maximum_content, horizontal, gap)
+    ret sizes
+}
+
+fn apply_spanning_intrinsic(sizes: Vec[f32], tracks: Vec[str], cells: Vec[GridCell],
+    minimum_content: Vec[Size], maximum_content: Vec[Size], horizontal: bool, gap: f32) -> Vec[f32] {
+    let mut result = sizes
+    let mut index = 0_usize
+    while index < cells.len() && index < minimum_content.len() {
+        let cell = grid_cell_at(cells, index)
+        let start = if horizontal { cell.column } else { cell.row }
+        let span = if horizontal { cell.column_span } else { cell.row_span }
+        if span > 1_usize {
+            let minimum = size_axis(size_at(minimum_content, index), horizontal)
+            result = grow_intrinsic_span(result, tracks, start, span, gap, minimum, false)
+            if index < maximum_content.len() {
+                let maximum = size_axis(size_at(maximum_content, index), horizontal)
+                result = grow_intrinsic_span(result, tracks, start, span, gap, maximum, true)
+            }
+        }
+        index = index + 1_usize
+    }
+    ret result
+}
+
+fn grow_intrinsic_span(sizes: Vec[f32], tracks: Vec[str], start: usize, span: usize,
+    gap: f32, desired: f32, maximum: bool) -> Vec[f32] {
+    let mut result = sizes
+    let finish = if start + span < result.len() { start + span } else { result.len() }
+    let mut occupied = if finish > start { gap * ((finish - start - 1_usize) as f32) } else { 0.0_f32 }
+    let mut eligible = 0_usize
+    let mut index = start
+    while index < finish {
+        occupied = occupied + f32_at(result, index)
+        if intrinsic_track_accepts(string_at(tracks, index), maximum) { eligible = eligible + 1_usize }
+        index = index + 1_usize
+    }
+    if desired <= occupied || eligible == 0_usize { ret result }
+    let addition = (desired - occupied) / (eligible as f32)
+    index = start
+    while index < finish {
+        if intrinsic_track_accepts(string_at(tracks, index), maximum) {
+            result.set(index, f32_at(result, index) + addition)
+        }
+        index = index + 1_usize
+    }
+    ret result
+}
+
+fn intrinsic_track_accepts(track: str, maximum: bool) -> bool {
+    let value = grid_track_maximum(layout_trim(track))
+    if maximum { ret value == "max-content" || value == "auto" || string_starts_with(value, "fit-content(") }
+    ret value == "min-content" || value == "max-content" || value == "auto" ||
+        string_starts_with(value, "fit-content(") || string_ends_with(value, "fr")
+}
+
+fn size_axis(value: Size, horizontal: bool) -> f32 { ret if horizontal { value.width() } else { value.height() } }
+
+fn grid_track_minimum(track: str, extent: f32, intrinsic_minimum: f32, intrinsic_maximum: f32) -> f32 {
+    if !string_starts_with(track, "minmax(") || !string_ends_with(track, ")") {
+        ret if track == "auto" || track == "min-content" { intrinsic_minimum }
+            elif track == "max-content" { intrinsic_maximum } else { 0.0_f32 }
+    }
+    let inner = track.slice(7_usize, track.char_len() - 8_usize)
+    let comma = string_character(inner, ",")
+    if comma == inner.char_len() { ret 0.0_f32 }
+    ret grid_track_fixed(layout_trim(inner.slice(0_usize, comma)), extent, intrinsic_minimum, intrinsic_maximum)
+}
+
+fn grid_track_fraction(track: str) -> f32 {
+    let value = grid_track_maximum(track)
+    if string_ends_with(value, "fr") {
+        let parsed = layout_number(value)
+        ret if parsed > 0.0_f32 { parsed } else { 1.0_f32 }
+    }
+    if value == "auto" { ret 1.0_f32 }
+    ret 0.0_f32
+}
+
+fn grid_track_fixed(track: str, extent: f32, intrinsic_minimum: f32, intrinsic_maximum: f32) -> f32 {
+    let value = grid_track_maximum(track)
+    if string_starts_with(value, "fit-content(") && string_ends_with(value, ")") {
+        let limit = grid_track_fixed(layout_trim(value.slice(12_usize, value.char_len() - 13_usize)), extent, intrinsic_minimum, intrinsic_maximum)
+        if intrinsic_maximum < limit { ret intrinsic_maximum }
+        ret if intrinsic_minimum > limit { intrinsic_minimum } else { limit }
+    }
+    if string_ends_with(value, "%") { ret extent * layout_number(value) / 100.0_f32 }
+    if value == "min-content" || value == "auto" { ret intrinsic_minimum }
+    if value == "max-content" { ret intrinsic_maximum }
+    ret layout_number(value)
+}
+
+fn intrinsic_track_extent(track: usize, cells: Vec[GridCell], sizes: Vec[Size], horizontal: bool) -> f32 {
+    let mut result = 0.0_f32
+    let mut index = 0_usize
+    while index < cells.len() && index < sizes.len() {
+        let cell = grid_cell_at(cells, index)
+        let starts = if horizontal { cell.column } else { cell.row }
+        let span = if horizontal { cell.column_span } else { cell.row_span }
+        if starts == track && span == 1_usize {
+            let size = size_at(sizes, index)
+            let extent = if horizontal { size.width() } else { size.height() }
+            if extent > result { result = extent }
+        }
+        index = index + 1_usize
+    }
+    ret result
+}
+
+fn size_at(values: Vec[Size], index: usize) -> Size {
+    match values.get(index) { Option[Size]::Some(value) => { ret value } Option[Size]::None => { ret Size::new(0.0_f32, 0.0_f32) } }
+}
+
+fn grid_track_maximum(track: str) -> str {
+    if !string_starts_with(track, "minmax(") || !string_ends_with(track, ")") { ret track }
+    let inner = track.slice(7_usize, track.char_len() - 8_usize)
+    let comma = string_character(inner, ",")
+    ret if comma == inner.char_len() { track }
+        else { layout_trim(inner.slice(comma + 1_usize, inner.char_len() - comma - 1_usize)) }
+}
+
+fn equal_track_sizes(extent: f32, gap: f32, count: usize) -> Vec[f32] {
+    let mut result = Vec[f32]::new()
+    if count == 0_usize { ret result }
+    let gaps = gap * ((count - 1_usize) as f32)
+    let size = if extent > gaps { (extent - gaps) / count as f32 } else { 0.0_f32 }
+    let mut index = 0_usize
+    while index < count { result.push(size) index = index + 1_usize }
+    ret result
+}
+
+fn track_offset(sizes: Vec[f32], index: usize, gap: f32) -> f32 {
+    let mut result = 0.0_f32
+    let mut current = 0_usize
+    while current < index {
+        result = result + if current < sizes.len() { f32_at(sizes, current) } else { 0.0_f32 }
+        result = result + gap
+        current = current + 1_usize
+    }
+    ret result
+}
+
+fn grid_track_tokens(value: str) -> Vec[str] {
+    let mut result = Vec[str]::new()
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index <= value.char_len() {
+        if index == value.char_len() || value.slice(index, 1_usize) == "|" {
+            if index > start { result.push(value.slice(start, index - start)) }
+            start = index + 1_usize
+        }
+        index = index + 1_usize
+    }
+    ret result
+}
+
+fn string_at(values: Vec[str], index: usize) -> str {
+    match values.get(index) { Option[str]::Some(value) => { ret value } Option[str]::None => { ret "" } }
+}
+
+fn string_ends_with(value: str, suffix: str) -> bool {
+    ret value.char_len() >= suffix.char_len() && value.slice(value.char_len() - suffix.char_len(), suffix.char_len()) == suffix
+}
+
+fn string_starts_with(value: str, prefix: str) -> bool {
+    ret value.char_len() >= prefix.char_len() && value.slice(0_usize, prefix.char_len()) == prefix
+}
+
+fn string_character(value: str, character: str) -> usize {
+    let mut index = 0_usize
+    while index < value.char_len() {
+        if value.slice(index, 1_usize) == character { ret index }
+        index = index + 1_usize
+    }
+    ret value.char_len()
+}
+
+fn layout_trim(value: str) -> str {
+    let mut start = 0_usize
+    let mut finish = value.char_len()
+    while start < finish && layout_whitespace(value.slice(start, 1_usize)) { start = start + 1_usize }
+    while finish > start && layout_whitespace(value.slice(finish - 1_usize, 1_usize)) { finish = finish - 1_usize }
+    ret value.slice(start, finish - start)
+}
+
+fn layout_whitespace(value: str) -> bool { ret value == " " || value == "\t" || value == "\n" || value == "\r" }
+
+fn layout_number(value: str) -> f32 {
+    let mut result = 0.0_f32
+    let mut fraction = 0.1_f32
+    let mut decimal = false
+    let mut negative = false
+    let mut index = 0_usize
+    while index < value.char_len() {
+        let current = value.slice(index, 1_usize)
+        if current == "-" && index == 0_usize { negative = true }
+        elif current == "." { decimal = true }
+        else {
+            let digit = layout_digit(current)
+            if digit < 0_i32 { break }
+            if decimal { result = result + (digit as f32) * fraction fraction = fraction * 0.1_f32 }
+            else { result = result * 10.0_f32 + (digit as f32) }
+        }
+        index = index + 1_usize
+    }
+    ret if negative { 0.0_f32 - result } else { result }
+}
+
+fn layout_digit(value: str) -> i32 {
+    if value == "0" { ret 0_i32 } if value == "1" { ret 1_i32 } if value == "2" { ret 2_i32 }
+    if value == "3" { ret 3_i32 } if value == "4" { ret 4_i32 } if value == "5" { ret 5_i32 }
+    if value == "6" { ret 6_i32 } if value == "7" { ret 7_i32 } if value == "8" { ret 8_i32 }
+    if value == "9" { ret 9_i32 } ret -1_i32
+}
+
+fn distribute_grow(items: Vec[FlexItem], extents: Vec[f32], amount: f32) -> Vec[f32] {
+    let mut result = extents
+    let mut remaining = amount
+    let mut pass = 0_usize
+    while remaining > 0.001_f32 && pass <= items.len() {
+        let mut weight = 0.0_f32
+        let mut index = 0_usize
+        while index < items.len() {
+            match items.get(index) {
+                Option[FlexItem]::Some(item) => {
+                    match result.get(index) {
+                        Option[f32]::Some(extent) => { if item.grow() > 0.0_f32 && extent < item.max_size() { weight = weight + item.grow() } }
+                        Option[f32]::None => {}
+                    }
+                }
+                Option[FlexItem]::None => {}
+            }
+            index = index + 1_usize
+        }
+        if weight <= 0.0_f32 { break }
+        let pass_amount = remaining
+        let mut distributed = 0.0_f32
+        index = 0_usize
+        while index < items.len() {
+            match items.get(index) {
+                Option[FlexItem]::Some(item) => {
+                    match result.get(index) {
+                        Option[f32]::Some(extent) => {
+                            if item.grow() > 0.0_f32 && extent < item.max_size() {
+                                let next = clamp(extent + pass_amount * item.grow() / weight, item.min_size(), item.max_size())
+                                distributed = distributed + next - extent
+                                result.set(index, next)
+                            }
+                        }
+                        Option[f32]::None => {}
+                    }
+                }
+                Option[FlexItem]::None => {}
+            }
+            index = index + 1_usize
+        }
+        if distributed <= 0.001_f32 { break }
+        remaining = remaining - distributed
+        pass = pass + 1_usize
+    }
+    ret result
+}
+
+fn distribute_shrink(items: Vec[FlexItem], extents: Vec[f32], amount: f32) -> Vec[f32] {
+    let mut result = extents
+    let mut remaining = amount
+    let mut pass = 0_usize
+    while remaining > 0.001_f32 && pass <= items.len() {
+        let mut weight = 0.0_f32
+        let mut index = 0_usize
+        while index < items.len() {
+            match items.get(index) {
+                Option[FlexItem]::Some(item) => {
+                    match result.get(index) {
+                        Option[f32]::Some(extent) => {
+                            if item.shrink() > 0.0_f32 && extent > item.min_size() { weight = weight + item.shrink() * item.basis() }
+                        }
+                        Option[f32]::None => {}
+                    }
+                }
+                Option[FlexItem]::None => {}
+            }
+            index = index + 1_usize
+        }
+        if weight <= 0.0_f32 { break }
+        let pass_amount = remaining
+        let mut distributed = 0.0_f32
+        index = 0_usize
+        while index < items.len() {
+            match items.get(index) {
+                Option[FlexItem]::Some(item) => {
+                    match result.get(index) {
+                        Option[f32]::Some(extent) => {
+                            if item.shrink() > 0.0_f32 && extent > item.min_size() {
+                                let share = pass_amount * item.shrink() * item.basis() / weight
+                                let next = clamp(extent - share, item.min_size(), item.max_size())
+                                distributed = distributed + extent - next
+                                result.set(index, next)
+                            }
+                        }
+                        Option[f32]::None => {}
+                    }
+                }
+                Option[FlexItem]::None => {}
+            }
+            index = index + 1_usize
+        }
+        if distributed <= 0.001_f32 { break }
+        remaining = remaining - distributed
+        pass = pass + 1_usize
+    }
+    ret result
+}
+
+fn extent_sum(values: Vec[f32]) -> f32 {
+    let mut result = 0.0_f32
+    let mut index = 0_usize
+    while index < values.len() {
+        match values.get(index) {
+            Option[f32]::Some(value) => { result = result + value }
+            Option[f32]::None => {}
         }
         index = index + 1_usize
     }
