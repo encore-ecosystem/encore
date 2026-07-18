@@ -1,0 +1,538 @@
+import core::fmt::Debug
+import core::io::println
+import core::option::Option
+import core::vec::Vec
+import linalg::Vec3
+import mod::assets::{MaterialAssets, MeshAssets, StandardMaterial}
+import mod::renderer::SceneRenderer
+import mod::rhi::*
+import mod::scene::camera::PerspectiveCamera
+import mod::scene::light::DirectionalLight
+import mod::scene::primitive::{cube_mesh, editor_grid_mesh, gizmo_ring_mesh, gizmo_tip_mesh}
+import mod::scene::renderable::Renderable
+import mod::scene::transform::Transform
+import mod::scene::world::Scene
+import mod::shaders::{cube_fragment_spirv, cube_vertex_spirv}
+
+pub struct ViewportRenderer {
+    instance: GraphicsInstance
+    device: GraphicsDevice
+    swapchain: Swapchain
+    vertex_shader: ShaderModule
+    fragment_shader: ShaderModule
+    layout: BindGroupLayout
+    pipeline: RenderPipeline
+    meshes: MeshAssets
+    materials: MaterialAssets
+    renderer: SceneRenderer
+    scene: Scene
+    cube: u64
+    cube_mesh: MeshId
+    cube_material: MaterialId
+    selected_material: MaterialId
+    cube_unlit_material: MaterialId
+    selected_unlit_material: MaterialId
+    selection_outline: u64
+    grid: u64
+    gizmo_tip_mesh: MeshId
+    gizmo_ring_mesh: MeshId
+    gizmo_x_material: MaterialId
+    gizmo_y_material: MaterialId
+    gizmo_z_material: MaterialId
+    gizmo_x: u64
+    gizmo_y: u64
+    gizmo_z: u64
+    gizmo_x_tip: u64
+    gizmo_y_tip: u64
+    gizmo_z_tip: u64
+    cubes: Vec[u64]
+    primary_position: Vec3
+    selected_cube: u32
+    gizmo_mode: u32
+    shading_mode: u32
+    camera: PerspectiveCamera
+    light: DirectionalLight
+    window: Option[GrapheneWindow]
+    viewport_width: u32
+    viewport_height: u32
+}
+
+fn viewport_target(instance: GraphicsInstance, device: GraphicsDevice, swapchain: Swapchain,
+    window: Option[GrapheneWindow]) -> Option[ViewportRenderer] {
+    let vertex_shader = device.create_shader_module(cube_vertex_spirv(), shader_stage_vertex())
+    let fragment_shader = device.create_shader_module(cube_fragment_spirv(), shader_stage_fragment())
+    let mut attributes = Vec[VertexAttribute]::new()
+    attributes.push(VertexAttribute::new(0_u32, vertex_format_float32x3(), 0_u32))
+    attributes.push(VertexAttribute::new(1_u32, vertex_format_float32x3(), 12_u32))
+    attributes.push(VertexAttribute::new(2_u32, vertex_format_float32x3(), 24_u32))
+    let mut entries = Vec[BindGroupLayoutEntry]::new()
+    entries.push(BindGroupLayoutEntry::uniform(0_u32, shader_stage_vertex() | shader_stage_fragment()))
+    let layout = device.create_bind_group_layout(entries)
+    let pipeline = device.create_render_pipeline_with_options(swapchain, vertex_shader, fragment_shader,
+        VertexBufferLayout::new(36_u32, attributes), layout,
+        RenderPipelineOptions::depth().with_backface_culling())
+    let mut meshes = MeshAssets::new()
+    let mesh_id = meshes.upload(device, cube_mesh(1.2_f32))
+    let grid_mesh_id = meshes.upload(device, editor_grid_mesh(20.0_f32, 20_u32))
+    let gizmo_tip_mesh_id = meshes.upload(device, gizmo_tip_mesh(0.28_f32, 0.36_f32))
+    let gizmo_ring_mesh_id = meshes.upload(device, gizmo_ring_mesh(1.55_f32, 0.045_f32, 64_u32))
+    let mut materials = MaterialAssets::new()
+    let material_id = materials.add(StandardMaterial::new(
+        Vec3::new(0.34_f32, 0.38_f32, 0.44_f32), 0.08_f32, 0.48_f32))
+    let grid_material_id = materials.add(StandardMaterial::new(
+        Vec3::new(0.62_f32, 0.65_f32, 0.70_f32), 0.0_f32, 0.94_f32).with_unlit())
+    let selected_material_id = materials.add(StandardMaterial::new(
+        Vec3::new(0.38_f32, 0.42_f32, 0.48_f32), 0.08_f32, 0.42_f32))
+    let unlit_material_id = materials.add(StandardMaterial::new(
+        Vec3::new(0.34_f32, 0.38_f32, 0.44_f32), 0.08_f32, 0.48_f32).with_unlit())
+    let selected_unlit_material_id = materials.add(StandardMaterial::new(
+        Vec3::new(0.38_f32, 0.42_f32, 0.48_f32), 0.08_f32, 0.42_f32).with_unlit())
+    let outline_material_id = materials.add(StandardMaterial::new(
+        Vec3::new(1.0_f32, 0.18_f32, 0.005_f32), 0.0_f32, 0.18_f32).with_unlit())
+    let gizmo_x_material = materials.add(StandardMaterial::new(
+        Vec3::new(0.80_f32, 0.02_f32, 0.025_f32), 0.0_f32, 0.35_f32).with_unlit())
+    let gizmo_y_material = materials.add(StandardMaterial::new(
+        Vec3::new(0.02_f32, 0.62_f32, 0.06_f32), 0.0_f32, 0.35_f32).with_unlit())
+    let gizmo_z_material = materials.add(StandardMaterial::new(
+        Vec3::new(0.015_f32, 0.16_f32, 1.0_f32), 0.0_f32, 0.35_f32).with_unlit())
+    let renderer = SceneRenderer::create(device, layout, swapchain.frames_in_flight())
+    if !device.available() || !swapchain.available() || !pipeline.available() || !renderer.available() ||
+        !meshes.contains(mesh_id) || !meshes.contains(grid_mesh_id) || !meshes.contains(gizmo_tip_mesh_id) ||
+        !meshes.contains(gizmo_ring_mesh_id) ||
+        !materials.get(material_id).is_some() || !materials.get(grid_material_id).is_some() ||
+        !materials.get(selected_material_id).is_some() || !materials.get(outline_material_id).is_some() ||
+        !materials.get(unlit_material_id).is_some() || !materials.get(selected_unlit_material_id).is_some() ||
+        !materials.get(gizmo_x_material).is_some() ||
+        !materials.get(gizmo_y_material).is_some() || !materials.get(gizmo_z_material).is_some() {
+        println("Graphene viewport initialization failed: " + device.error() + " " + swapchain.error() +
+            " " + pipeline.error())
+        ret Option[ViewportRenderer]::None
+    }
+    let mut scene = Scene::new()
+    let selection_outline = scene.create_entity("Selection Outline",
+        Transform::identity().with_scale(Vec3::new(1.035_f32, 1.035_f32, 1.035_f32)))
+    scene.set_renderable(selection_outline,
+        Option[Renderable]::Some(Renderable::new(mesh_id, outline_material_id)))
+    let cube = scene.create_entity("Viewport Cube", Transform::identity())
+    scene.set_renderable(cube, Option[Renderable]::Some(Renderable::new(mesh_id, selected_material_id)))
+    let mut cubes = Vec[u64]::new()
+    cubes.push(cube)
+    let grid = scene.create_entity("Editor Grid",
+        Transform::identity().with_position(Vec3::new(0.0_f32, -0.61_f32, 0.0_f32)))
+    scene.set_renderable(grid, Option[Renderable]::Some(Renderable::new(grid_mesh_id, grid_material_id)))
+    let gizmo_x = scene.create_entity("Translate X", Transform::identity()
+        .with_position(Vec3::new(0.95_f32, 0.0_f32, 0.0_f32))
+        .with_scale(Vec3::new(1.35_f32, 0.055_f32, 0.055_f32)))
+    scene.set_renderable(gizmo_x, Option[Renderable]::Some(Renderable::new(mesh_id, gizmo_x_material)))
+    let gizmo_y = scene.create_entity("Translate Y", Transform::identity()
+        .with_position(Vec3::new(0.0_f32, 0.95_f32, 0.0_f32))
+        .with_scale(Vec3::new(0.055_f32, 1.35_f32, 0.055_f32)))
+    scene.set_renderable(gizmo_y, Option[Renderable]::Some(Renderable::new(mesh_id, gizmo_y_material)))
+    let gizmo_z = scene.create_entity("Translate Z", Transform::identity()
+        .with_position(Vec3::new(0.0_f32, 0.0_f32, 0.95_f32))
+        .with_scale(Vec3::new(0.055_f32, 0.055_f32, 1.35_f32)))
+    scene.set_renderable(gizmo_z, Option[Renderable]::Some(Renderable::new(mesh_id, gizmo_z_material)))
+    let gizmo_x_tip = scene.create_entity("Translate X Tip", Transform::identity()
+        .with_position(Vec3::new(1.72_f32, 0.0_f32, 0.0_f32))
+        .with_rotation(Vec3::new(0.0_f32, 0.0_f32, -1.5707963_f32)))
+    scene.set_renderable(gizmo_x_tip, Option[Renderable]::Some(Renderable::new(gizmo_tip_mesh_id, gizmo_x_material)))
+    let gizmo_y_tip = scene.create_entity("Translate Y Tip", Transform::identity()
+        .with_position(Vec3::new(0.0_f32, 1.72_f32, 0.0_f32)))
+    scene.set_renderable(gizmo_y_tip, Option[Renderable]::Some(Renderable::new(gizmo_tip_mesh_id, gizmo_y_material)))
+    let gizmo_z_tip = scene.create_entity("Translate Z Tip", Transform::identity()
+        .with_position(Vec3::new(0.0_f32, 0.0_f32, 1.72_f32))
+        .with_rotation(Vec3::new(1.5707963_f32, 0.0_f32, 0.0_f32)))
+    scene.set_renderable(gizmo_z_tip, Option[Renderable]::Some(Renderable::new(gizmo_tip_mesh_id, gizmo_z_material)))
+    ret Option[ViewportRenderer]::Some(ViewportRenderer {
+        instance, device, swapchain, vertex_shader, fragment_shader, layout, pipeline,
+        meshes, materials, renderer, scene, cube, mesh_id, material_id, selected_material_id,
+        unlit_material_id, selected_unlit_material_id,
+        selection_outline, grid,
+        gizmo_tip_mesh_id, gizmo_ring_mesh_id, gizmo_x_material, gizmo_y_material, gizmo_z_material,
+        gizmo_x, gizmo_y, gizmo_z, gizmo_x_tip, gizmo_y_tip, gizmo_z_tip,
+        cubes, Vec3::zero(), 1_u32, 1_u32, 0_u32,
+        PerspectiveCamera::new(Vec3::new(3.2_f32, 2.35_f32, 4.2_f32), Vec3::zero(),
+            1.0471976_f32, 0.1_f32, 100.0_f32),
+        DirectionalLight::new(Vec3::new(-0.45_f32, -0.8_f32, -0.35_f32),
+            Vec3::new(1.0_f32, 0.97_f32, 0.92_f32), 1.15_f32), window,
+        swapchain.width(), swapchain.height()
+    })
+}
+
+impl for ViewportRenderer {
+    fn cube_material_for(self: Self, selected: bool) -> MaterialId {
+        if self.shading_mode == 1_u32 {
+            ret if selected { self.selected_unlit_material } else { self.cube_unlit_material }
+        }
+        ret if selected { self.selected_material } else { self.cube_material }
+    }
+
+    pub fn create(width: u32, height: u32) -> Option[ViewportRenderer] {
+        let instance = GraphicsInstance::create()
+        if !instance.available() {
+            println("Graphene viewport Vulkan initialization: " + instance.error())
+            ret Option[ViewportRenderer]::None
+        }
+        match instance.preferred_adapter() {
+            Option::Some(adapter) => {
+                let device = instance.create_device(adapter)
+                let swapchain = device.create_offscreen_target(width, height)
+                ret viewport_target(instance, device, swapchain, Option[GrapheneWindow]::None)
+            }
+            Option::None => { println("Graphene viewport: no Vulkan adapter found") }
+        }
+        ret Option[ViewportRenderer]::None
+    }
+
+    pub fn create_present(platform_handle: usize, width: u32, height: u32) -> Option[ViewportRenderer] {
+        let instance = GraphicsInstance::with_external_window_support(false)
+        if !instance.available() { println("Graphene window Vulkan initialization: " + instance.error()) ret Option[ViewportRenderer]::None }
+        let window = instance.attach_window(platform_handle, width, height)
+        if !window.available() { println("Graphene external window: " + window.error()) ret Option[ViewportRenderer]::None }
+        match instance.preferred_adapter() {
+            Option::Some(adapter) => {
+                let device = instance.create_present_device(adapter, window)
+                let swapchain = device.create_swapchain(window)
+                ret viewport_target(instance, device, swapchain, Option[GrapheneWindow]::Some(window))
+            }
+            Option::None => { println("Graphene viewport: no Vulkan adapter found") }
+        }
+        ret Option[ViewportRenderer]::None
+    }
+
+    pub fn render(self: mut Self) -> bool { ret self.render_camera(0.64_f32, 0.42_f32, 5.7_f32) }
+
+    fn camera_ray(self: Self, screen_x: f32, screen_y: f32, yaw: f32, pitch: f32,
+        distance: f32, target: Vec3) -> (Vec3, Vec3) {
+        let origin = target.add(Vec3::from_spherical(yaw, pitch).scale(distance))
+        let forward = target.sub(origin).normalized()
+        let right = forward.cross(Vec3::new(0.0_f32, 1.0_f32, 0.0_f32)).normalized()
+        let up = right.cross(forward).normalized()
+        let width = self.viewport_width as f32
+        let height = self.viewport_height as f32
+        let ndc_x = (screen_x / width) * 2.0_f32 - 1.0_f32
+        let ndc_y = 1.0_f32 - (screen_y / height) * 2.0_f32
+        let half_height = 0.5773503_f32
+        let direction = forward.add(right.scale(ndc_x * (width / height) * half_height))
+            .add(up.scale(ndc_y * half_height)).normalized()
+        ret (origin, direction)
+    }
+
+    pub fn pick_cube(self: Self, screen_x: f32, screen_y: f32, yaw: f32, pitch: f32,
+        distance: f32, positions: Vec[Vec3]) -> u32 {
+        ret self.pick_cube_at(screen_x, screen_y, yaw, pitch, distance, Vec3::zero(), positions)
+    }
+
+    pub fn pick_cube_at(self: Self, screen_x: f32, screen_y: f32, yaw: f32, pitch: f32,
+        distance: f32, target: Vec3, positions: Vec[Vec3]) -> u32 {
+        if screen_x < 0.0_f32 || screen_y < 0.0_f32 ||
+            screen_x >= self.viewport_width as f32 || screen_y >= self.viewport_height as f32 { ret 0_u32 }
+        let ray = self.camera_ray(screen_x, screen_y, yaw, pitch, distance, target)
+        let mut selected = 0_u32
+        let mut nearest = 1000000.0_f32
+        let mut index = 0_usize
+        while index < positions.len() {
+            match positions.get(index) {
+                Option::Some(center) => {
+                    let offset = ray.0.sub(center)
+                    let projected = offset.dot(ray.1)
+                    let discriminant = projected * projected - (offset.dot(offset) - 0.52_f32)
+                    if discriminant >= 0.0_f32 {
+                        let candidate = -projected
+                        if candidate > 0.0_f32 && candidate < nearest {
+                            nearest = candidate
+                            selected = index as u32 + 1_u32
+                        }
+                    }
+                }
+                Option::None => {}
+            }
+            index = index + 1_usize
+        }
+        ret selected
+    }
+
+    pub fn ground_point(self: Self, screen_x: f32, screen_y: f32, yaw: f32, pitch: f32,
+        distance: f32) -> Option[Vec3] {
+        ret self.ground_point_at(screen_x, screen_y, yaw, pitch, distance, Vec3::zero())
+    }
+
+    pub fn ground_point_at(self: Self, screen_x: f32, screen_y: f32, yaw: f32, pitch: f32,
+        distance: f32, target: Vec3) -> Option[Vec3] {
+        if screen_x < 0.0_f32 || screen_y < 0.0_f32 ||
+            screen_x >= self.viewport_width as f32 || screen_y >= self.viewport_height as f32 {
+            ret Option[Vec3]::None
+        }
+        let ray = self.camera_ray(screen_x, screen_y, yaw, pitch, distance, target)
+        if ray.1.y() > -0.0001_f32 && ray.1.y() < 0.0001_f32 { ret Option[Vec3]::None }
+        let distance_to_plane = -ray.0.y() / ray.1.y()
+        if distance_to_plane <= 0.0_f32 { ret Option[Vec3]::None }
+        ret Option[Vec3]::Some(ray.0.add(ray.1.scale(distance_to_plane)))
+    }
+
+    pub fn sync_cubes(self: mut Self, count: u32) -> () {
+        while self.cubes.len() < count as usize {
+            let index = self.cubes.len() as u32
+            let column = (index % 5_u32) as f32
+            let row = (index / 5_u32) as f32
+            let position = Vec3::new((column - 2.0_f32) * 2.1_f32, 0.0_f32, row * 2.1_f32)
+            let entity = self.scene.create_entity("Viewport Cube " + Debug::fmt(index + 1_u32),
+                Transform::identity().with_position(position))
+            self.scene.set_renderable(entity,
+                Option[Renderable]::Some(Renderable::new(self.cube_mesh, self.cube_material_for(false))))
+            self.cubes.push(entity)
+        }
+        ret ()
+    }
+
+    pub fn remove_cube(self: mut Self, cube_index: u32) -> bool {
+        if cube_index == 0_u32 || cube_index > self.cubes.len() as u32 { ret false }
+        let remove_index = (cube_index - 1_u32) as usize
+        let mut remaining = Vec[u64]::new()
+        let mut index = 0_usize
+        while index < self.cubes.len() {
+            match self.cubes.get(index) {
+                Option::Some(entity) => {
+                    if index == remove_index { self.scene.remove(entity) }
+                    else { remaining.push(entity) }
+                }
+                Option::None => {}
+            }
+            index = index + 1_usize
+        }
+        self.cubes = remaining
+        if self.selected_cube == cube_index {
+            self.selected_cube = 0_u32
+            self.scene.set_visible(self.selection_outline, false)
+            self.scene.set_visible(self.gizmo_x, false)
+            self.scene.set_visible(self.gizmo_y, false)
+            self.scene.set_visible(self.gizmo_z, false)
+            self.scene.set_visible(self.gizmo_x_tip, false)
+            self.scene.set_visible(self.gizmo_y_tip, false)
+            self.scene.set_visible(self.gizmo_z_tip, false)
+        }
+        elif self.selected_cube > cube_index { self.selected_cube = self.selected_cube - 1_u32 }
+        ret true
+    }
+
+    pub fn set_gizmo_mode(self: mut Self, mode: u32) -> () {
+        let next = if mode <= 3_u32 { mode } else { 0_u32 }
+        if self.gizmo_mode == next { ret () }
+        self.gizmo_mode = next
+        let axis_mesh = if next == 2_u32 { self.gizmo_ring_mesh } else { self.cube_mesh }
+        let tip_mesh = if next == 1_u32 { self.gizmo_tip_mesh } else { self.cube_mesh }
+        self.scene.set_renderable(self.gizmo_x, Option[Renderable]::Some(Renderable::new(axis_mesh, self.gizmo_x_material)))
+        self.scene.set_renderable(self.gizmo_y, Option[Renderable]::Some(Renderable::new(axis_mesh, self.gizmo_y_material)))
+        self.scene.set_renderable(self.gizmo_z, Option[Renderable]::Some(Renderable::new(axis_mesh, self.gizmo_z_material)))
+        self.scene.set_renderable(self.gizmo_x_tip, Option[Renderable]::Some(Renderable::new(tip_mesh, self.gizmo_x_material)))
+        self.scene.set_renderable(self.gizmo_y_tip, Option[Renderable]::Some(Renderable::new(tip_mesh, self.gizmo_y_material)))
+        self.scene.set_renderable(self.gizmo_z_tip, Option[Renderable]::Some(Renderable::new(tip_mesh, self.gizmo_z_material)))
+        let visible = next > 0_u32 && self.selected_cube > 0_u32 && self.selected_cube <= self.cubes.len() as u32
+        self.scene.set_visible(self.gizmo_x, visible)
+        self.scene.set_visible(self.gizmo_y, visible)
+        self.scene.set_visible(self.gizmo_z, visible)
+        self.scene.set_visible(self.gizmo_x_tip, visible && next != 2_u32)
+        self.scene.set_visible(self.gizmo_y_tip, visible && next != 2_u32)
+        self.scene.set_visible(self.gizmo_z_tip, visible && next != 2_u32)
+        ret ()
+    }
+
+    pub fn set_shading_mode(self: mut Self, mode: u32) -> () {
+        let next = if mode == 1_u32 { 1_u32 } else { 0_u32 }
+        if self.shading_mode == next { ret () }
+        self.shading_mode = next
+        let mut index = 0_usize
+        while index < self.cubes.len() {
+            match self.cubes.get(index) {
+                Option::Some(entity) => {
+                    self.scene.set_renderable(entity, Option[Renderable]::Some(Renderable::new(self.cube_mesh,
+                        self.cube_material_for(self.selected_cube == index as u32 + 1_u32))))
+                }
+                Option::None => {}
+            }
+            index = index + 1_usize
+        }
+        ret ()
+    }
+
+    pub fn shading_mode(self: Self) -> u32 { ret self.shading_mode }
+
+    pub fn set_grid_visible(self: mut Self, visible: bool) -> () {
+        self.scene.set_visible(self.grid, visible)
+        ret ()
+    }
+
+    pub fn select_cube(self: mut Self, selected: u32) -> () {
+        let next = if selected > 0_u32 && selected <= self.cubes.len() as u32 { selected } else { 0_u32 }
+        if self.selected_cube == next { ret () }
+        self.selected_cube = next
+        let mut index = 0_usize
+        while index < self.cubes.len() {
+            match self.cubes.get(index) {
+                Option::Some(entity) => {
+                    let material = self.cube_material_for(next == (index as u32) + 1_u32)
+                    self.scene.set_renderable(entity,
+                        Option[Renderable]::Some(Renderable::new(self.cube_mesh, material)))
+                }
+                Option::None => {}
+            }
+            index = index + 1_usize
+        }
+        let visible = self.gizmo_mode > 0_u32 && next > 0_u32
+        self.scene.set_visible(self.selection_outline, next > 0_u32)
+        self.scene.set_visible(self.gizmo_x, visible)
+        self.scene.set_visible(self.gizmo_y, visible)
+        self.scene.set_visible(self.gizmo_z, visible)
+        self.scene.set_visible(self.gizmo_x_tip, visible && self.gizmo_mode != 2_u32)
+        self.scene.set_visible(self.gizmo_y_tip, visible && self.gizmo_mode != 2_u32)
+        self.scene.set_visible(self.gizmo_z_tip, visible && self.gizmo_mode != 2_u32)
+        ret ()
+    }
+
+    pub fn sync_cube_transforms(self: mut Self, positions: Vec[Vec3], rotations: Vec[Vec3]) -> () {
+        let mut scales = Vec[Vec3]::new()
+        for _position in positions { scales.push(Vec3::new(1.0_f32, 1.0_f32, 1.0_f32)) }
+        self.sync_cube_transforms_scaled(positions, rotations, scales)
+        ret ()
+    }
+
+    pub fn sync_cube_transforms_scaled(self: mut Self, positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3]) -> () {
+        let mut index = 0_usize
+        while index < self.cubes.len() && index < positions.len() {
+            match self.cubes.get(index) {
+                Option::Some(entity) => {
+                    match positions.get(index) {
+                        Option::Some(position) => {
+                            if index == 0_usize { self.primary_position = position }
+                            let mut rotation = Vec3::zero()
+                            match rotations.get(index) {
+                                Option::Some(value) => { rotation = value }
+                                Option::None => {}
+                            }
+                            let mut scale = Vec3::new(1.0_f32, 1.0_f32, 1.0_f32)
+                            match scales.get(index) {
+                                Option::Some(value) => { scale = value }
+                                Option::None => {}
+                            }
+                            self.scene.set_transform(entity, Transform::identity().with_position(position)
+                                .with_rotation(rotation).with_scale(scale))
+                            if self.selected_cube == index as u32 + 1_u32 {
+                                self.scene.set_transform(self.selection_outline, Transform::identity().with_position(position)
+                                    .with_rotation(rotation).with_scale(scale.scale(1.035_f32)))
+                            }
+                        }
+                        Option::None => {}
+                    }
+                }
+                Option::None => {}
+            }
+            index = index + 1_usize
+        }
+        if self.selected_cube > 0_u32 {
+            match positions.get((self.selected_cube - 1_u32) as usize) {
+                Option::Some(position) => {
+                    if self.gizmo_mode == 2_u32 {
+                        self.scene.set_transform(self.gizmo_x, Transform::identity().with_position(position)
+                            .with_rotation(Vec3::new(0.0_f32, 0.0_f32, 1.5707963_f32)))
+                        self.scene.set_transform(self.gizmo_y, Transform::identity().with_position(position))
+                        self.scene.set_transform(self.gizmo_z, Transform::identity().with_position(position)
+                            .with_rotation(Vec3::new(1.5707963_f32, 0.0_f32, 0.0_f32)))
+                    } else {
+                        self.scene.set_transform(self.gizmo_x, Transform::identity()
+                            .with_position(position.add(Vec3::new(0.95_f32, 0.0_f32, 0.0_f32)))
+                            .with_scale(Vec3::new(1.35_f32, 0.055_f32, 0.055_f32)))
+                        self.scene.set_transform(self.gizmo_y, Transform::identity()
+                            .with_position(position.add(Vec3::new(0.0_f32, 0.95_f32, 0.0_f32)))
+                            .with_scale(Vec3::new(0.055_f32, 1.35_f32, 0.055_f32)))
+                        self.scene.set_transform(self.gizmo_z, Transform::identity()
+                            .with_position(position.add(Vec3::new(0.0_f32, 0.0_f32, 0.95_f32)))
+                            .with_scale(Vec3::new(0.055_f32, 0.055_f32, 1.35_f32)))
+                        let tip_scale = if self.gizmo_mode == 3_u32 {
+                            Vec3::new(0.18_f32, 0.18_f32, 0.18_f32)
+                        } else { Vec3::new(1.0_f32, 1.0_f32, 1.0_f32) }
+                        self.scene.set_transform(self.gizmo_x_tip, Transform::identity()
+                            .with_position(position.add(Vec3::new(1.72_f32, 0.0_f32, 0.0_f32)))
+                            .with_rotation(Vec3::new(0.0_f32, 0.0_f32, -1.5707963_f32)).with_scale(tip_scale))
+                        self.scene.set_transform(self.gizmo_y_tip, Transform::identity()
+                            .with_position(position.add(Vec3::new(0.0_f32, 1.72_f32, 0.0_f32))).with_scale(tip_scale))
+                        self.scene.set_transform(self.gizmo_z_tip, Transform::identity()
+                            .with_position(position.add(Vec3::new(0.0_f32, 0.0_f32, 1.72_f32)))
+                            .with_rotation(Vec3::new(1.5707963_f32, 0.0_f32, 0.0_f32)).with_scale(tip_scale))
+                    }
+                }
+                Option::None => {}
+            }
+        }
+        ret ()
+    }
+
+    pub fn render_camera(self: mut Self, yaw: f32, pitch: f32, distance: f32) -> bool {
+        ret self.render_camera_at(yaw, pitch, distance, Vec3::zero())
+    }
+
+    pub fn render_camera_at(self: mut Self, yaw: f32, pitch: f32, distance: f32, target: Vec3) -> bool {
+        let frame = self.swapchain.acquire_frame()
+        if !frame.available() { println("Graphene viewport: " + frame.error()) frame.destroy() ret false }
+        self.viewport_width = self.swapchain.width()
+        self.viewport_height = self.swapchain.height()
+        let aspect = (self.viewport_width as f32) / (self.viewport_height as f32)
+        let camera = PerspectiveCamera::new(target.add(Vec3::from_spherical(yaw, pitch).scale(distance)),
+            target, 1.0471976_f32, 0.1_f32, 100.0_f32)
+        let pass = frame.begin_render_pass(self.pipeline, 0.028_f32, 0.034_f32, 0.043_f32, 1.0_f32)
+        let recorded = self.renderer.render_scene(self.scene, camera, self.light, self.meshes, self.materials,
+            pass, frame.slot(), aspect) && pass.end()
+        let presented = recorded && frame.present()
+        if !presented { println("Graphene viewport: " + frame.error()) }
+        frame.destroy()
+        ret presented
+    }
+
+    pub fn render_editor(self: mut Self, yaw: f32, pitch: f32, distance: f32,
+        ui_pixels: usize, ui_width: u32, ui_height: u32, ui_pitch: u32,
+        viewport_x: u32, viewport_y: u32, viewport_width: u32, viewport_height: u32) -> bool {
+        ret self.render_editor_at(yaw, pitch, distance, Vec3::zero(), ui_pixels, ui_width, ui_height, ui_pitch,
+            viewport_x, viewport_y, viewport_width, viewport_height)
+    }
+
+    pub fn render_editor_at(self: mut Self, yaw: f32, pitch: f32, distance: f32, target: Vec3,
+        ui_pixels: usize, ui_width: u32, ui_height: u32, ui_pitch: u32,
+        viewport_x: u32, viewport_y: u32, viewport_width: u32, viewport_height: u32) -> bool {
+        let frame = self.swapchain.acquire_frame()
+        if !frame.available() { println("Graphene editor viewport: " + frame.error()) frame.destroy() ret false }
+        self.viewport_width = viewport_width
+        self.viewport_height = viewport_height
+        let aspect = (viewport_width as f32) / (viewport_height as f32)
+        let camera = PerspectiveCamera::new(target.add(Vec3::from_spherical(yaw, pitch).scale(distance)),
+            target, 1.0471976_f32, 0.1_f32, 100.0_f32)
+        let pass = frame.begin_render_pass(self.pipeline, 0.012_f32, 0.018_f32, 0.028_f32, 1.0_f32)
+        let viewport_set = frame.set_viewport(viewport_x, viewport_y, viewport_width, viewport_height)
+        let recorded = viewport_set && self.renderer.render_scene(self.scene, camera, self.light,
+            self.meshes, self.materials, pass, frame.slot(), aspect) && pass.end()
+        let composed = recorded && frame.upload_ui(ui_pixels, ui_width, ui_height, ui_pitch,
+            viewport_x, viewport_y, viewport_width, viewport_height)
+        let presented = composed && frame.present()
+        if !presented { println("Graphene editor viewport: " + frame.error()) }
+        frame.destroy()
+        ret presented
+    }
+
+    pub fn pixels(self: Self) -> usize { ret self.swapchain.pixels() }
+    pub fn available(self: Self) -> bool { ret self.swapchain.available() && self.renderer.available() }
+    pub fn width(self: Self) -> u32 { ret self.swapchain.width() }
+    pub fn height(self: Self) -> u32 { ret self.swapchain.height() }
+    pub fn pitch(self: Self) -> u32 { ret self.swapchain.pitch() }
+
+    pub fn destroy(self: Self) -> () {
+        self.swapchain.destroy()
+        self.pipeline.destroy()
+        self.renderer.destroy()
+        self.layout.destroy()
+        self.meshes.destroy()
+        self.vertex_shader.destroy()
+        self.fragment_shader.destroy()
+        self.device.destroy()
+        match self.window { Option::Some(window) => { window.destroy() } Option::None => {} }
+        self.instance.destroy()
+        ret ()
+    }
+}

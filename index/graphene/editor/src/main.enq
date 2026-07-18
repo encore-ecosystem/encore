@@ -1,0 +1,2272 @@
+import core::fmt::Debug
+import core::io::println
+import core::option::Option
+import core::os::{cwd, env, file_exists, mkdir_all, read_file, remove_file, write_file}
+import core::panic::panic
+import core::process::run_args_capture
+import core::thread::JoinHandle
+import core::time::{perf_counter_ms, sleep_ms}
+import core::vec::Vec
+import encore_ui::{Color, FontManager, IconManager, Insets, Style, SvgDocument, TextEditor, Widget, WidgetLayout, Window, event_close, event_key_down, event_pointer_down,
+    event_pointer_move, event_pointer_up, event_resize, event_scroll, event_text_input, backend_error, backend_name,
+    horizontal, key_backspace, key_delete, key_down, key_end, key_enter, key_home, key_left, key_right, key_up, text_end, vertical}
+import graphene::{MaterialId, MeshId, Renderable, Scene, SceneActor, SceneAsset, Transform, ViewportRenderer}
+import linalg::Vec3
+
+struct EditorIcons {
+    brand: SvgDocument
+    save: SvgDocument
+    undo: SvgDocument
+    redo: SvgDocument
+    duplicate: SvgDocument
+    delete: SvgDocument
+    build: SvgDocument
+    play: SvgDocument
+    select: SvgDocument
+    move: SvgDocument
+    rotate: SvgDocument
+    scale: SvgDocument
+    view: SvgDocument
+    lighting: SvgDocument
+    camera: SvgDocument
+    light: SvgDocument
+    mesh: SvgDocument
+    material: SvgDocument
+    script: SvgDocument
+    add: SvgDocument
+    minus: SvgDocument
+    settings: SvgDocument
+    search: SvgDocument
+    folder: SvgDocument
+    chevron: SvgDocument
+    expanded: SvgDocument
+    visible: SvgDocument
+    terminal: SvgDocument
+    grid: SvgDocument
+    snap: SvgDocument
+    speed: SvgDocument
+    level: SvgDocument
+    clean: SvgDocument
+    branch: SvgDocument
+    processor: SvgDocument
+    storage: SvgDocument
+    exit: SvgDocument
+    info: SvgDocument
+    panels: SvgDocument
+}
+
+impl for EditorIcons {
+    pub fn load(manager: IconManager) -> EditorIcons {
+        ret EditorIcons { manager.document("hexagon"), manager.document("save"), manager.document("undo"), manager.document("redo"),
+            manager.document("copy"), manager.document("trash-2"), manager.document("hammer"), manager.document("play"), manager.document("mouse-pointer-2"),
+            manager.document("move-3d"), manager.document("rotate-3d"), manager.document("scale-3d"),
+            manager.document("camera"), manager.document("sun"), manager.document("camera"),
+            manager.document("lightbulb"), manager.document("box"), manager.document("palette"),
+            manager.document("file-code"), manager.document("plus"), manager.document("minus"), manager.document("settings-2"),
+            manager.document("search"),
+            manager.document("folder"), manager.document("chevron-right"), manager.document("chevron-down"), manager.document("eye"),
+            manager.document("square-terminal"), manager.document("grid-3x3"), manager.document("magnet"), manager.document("gauge"),
+            manager.document("map"), manager.document("circle-check"), manager.document("git-branch"), manager.document("cpu"),
+            manager.document("database"), manager.document("log-out"), manager.document("info"), manager.document("panels-top-left") }
+    }
+}
+
+struct TransformEdit {
+    cube: u32
+    before_position: Vec3
+    before_rotation: Vec3
+    before_scale: Vec3
+    after_position: Vec3
+    after_rotation: Vec3
+    after_scale: Vec3
+}
+
+struct ProjectPaths {
+    root: str
+    marker: str
+    scene: str
+    script: str
+    manifest: str
+    build_log: str
+    build_completion: str
+}
+
+struct ProjectContents {
+    positions: Vec[Vec3]
+    rotations: Vec[Vec3]
+    scales: Vec[Vec3]
+    code: str
+}
+
+fn trim_trailing_separator(path: str) -> str {
+    let mut length = path.char_len()
+    while length > 1_usize && (path.slice(length - 1_usize, 1_usize) == "/" || path.slice(length - 1_usize, 1_usize) == "\\") {
+        length = length - 1_usize
+    }
+    ret path.slice(0_usize, length)
+}
+
+fn project_paths(root: str) -> ProjectPaths {
+    let base = trim_trailing_separator(root)
+    ret ProjectPaths { base, base + "/graphene.project", base + "/scene.graphene.json",
+        base + "/game/src/main.enq", base + "/game/encore.toml", base + "/game/.graphene-build.log",
+        base + "/game/.graphene-build-complete" }
+}
+
+fn project_valid(paths: ProjectPaths) -> bool {
+    ret file_exists(paths.marker) && file_exists(paths.scene) && file_exists(paths.manifest) && file_exists(paths.script)
+}
+
+fn create_project(root: str) -> bool {
+    let paths = project_paths(root)
+    if file_exists(paths.marker) || file_exists(paths.scene) || file_exists(paths.manifest) || file_exists(paths.script) { ret false }
+    if mkdir_all(paths.root + "/game/src") != 0_i32 { ret false }
+    let mut positions = Vec[Vec3]::new()
+    let mut rotations = Vec[Vec3]::new()
+    let mut scales = Vec[Vec3]::new()
+    positions.push(Vec3::zero())
+    rotations.push(Vec3::zero())
+    scales.push(Vec3::new(1.0_f32, 1.0_f32, 1.0_f32))
+    if write_file(paths.scene, scene_asset(positions, rotations, scales).stringify() + "\n") != 0_i32 { ret false }
+    if write_file(paths.manifest, "[project]\nname = \"graphene_game\"\nversion = \"0.1.0\"\ndependencies = []\n") != 0_i32 { ret false }
+    if write_file(paths.script, "fn main() -> u32 {\n    ret 0_u32\n}\n") != 0_i32 { ret false }
+    ret write_file(paths.marker, "[project]\nformat = 1\nscene = \"scene.graphene.json\"\ngame = \"game/encore.toml\"\n") == 0_i32
+}
+
+fn load_project(paths: ProjectPaths) -> Option[ProjectContents] {
+    if !project_valid(paths) { ret Option[ProjectContents]::None }
+    match SceneAsset::parse(read_file(paths.scene)) {
+        Option::Some(asset) => {
+            let mut positions = Vec[Vec3]::new()
+            let mut rotations = Vec[Vec3]::new()
+            let mut scales = Vec[Vec3]::new()
+            let mut index = 0_usize
+            while index < asset.len() {
+                match asset.actor(index) {
+                    Option::Some(actor) => {
+                        if actor.kind() == "cube" {
+                            positions.push(actor.transform().position())
+                            rotations.push(actor.transform().rotation())
+                            scales.push(actor.transform().scale())
+                        }
+                    }
+                    Option::None => {}
+                }
+                index = index + 1_usize
+            }
+            ret Option[ProjectContents]::Some(ProjectContents { positions, rotations, scales, read_file(paths.script) })
+        }
+        Option::None => { ret Option[ProjectContents]::None }
+    }
+}
+
+fn vec3_differs(lhs: Vec3, rhs: Vec3) -> bool {
+    ret lhs.x() != rhs.x() || lhs.y() != rhs.y() || lhs.z() != rhs.z()
+}
+
+fn compile_game(compiler: str, manifest: str, log_path: str, completion_path: str) -> i32 {
+    let mut args = Vec[str]::new()
+    args.push("build")
+    args.push("--manifest-path")
+    args.push(manifest)
+    let code = run_args_capture(compiler, args, log_path)
+    write_file(completion_path, Debug::fmt(code))
+    ret code
+}
+
+fn apply_transform_edit(positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3],
+    edit: TransformEdit, use_after: bool) -> (Vec[Vec3], Vec[Vec3], Vec[Vec3]) {
+    let position = if use_after { edit.after_position } else { edit.before_position }
+    let rotation = if use_after { edit.after_rotation } else { edit.before_rotation }
+    let scale = if use_after { edit.after_scale } else { edit.before_scale }
+    ret (set_position(positions, edit.cube, position), set_rotation(rotations, edit.cube, rotation),
+        set_scale(scales, edit.cube, scale))
+}
+
+fn theme_surface() -> Color { ret Color::rgb(24_u8, 24_u8, 27_u8) }
+fn theme_surface_raised() -> Color { ret Color::rgb(31_u8, 32_u8, 36_u8) }
+fn theme_control() -> Color { ret Color::rgb(28_u8, 29_u8, 33_u8) }
+fn theme_control_hover() -> Color { ret Color::rgb(46_u8, 47_u8, 52_u8) }
+fn theme_border() -> Color { ret Color::rgb(43_u8, 44_u8, 49_u8) }
+fn theme_border_hover() -> Color { ret Color::rgb(70_u8, 72_u8, 79_u8) }
+fn theme_accent() -> Color { ret Color::rgb(32_u8, 143_u8, 207_u8) }
+
+fn panel_style() -> Style {
+    ret Style::default().with_background(theme_surface())
+        .with_foreground(Color::rgb(202_u8, 204_u8, 209_u8))
+        .with_border(1.0_f32, theme_border())
+        .with_radius(0.0_f32).with_padding(Insets::all(6.0_f32)).with_gap(4.0_f32)
+}
+
+fn label(text: str) -> Widget {
+    ret Widget::label(text).with_flex(24.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(188_u8, 190_u8, 196_u8)).with_font_size(11.0_f32))
+}
+
+fn section_title(text: str) -> Widget {
+    let mut title = Widget::panel("section-" + text).with_direction(horizontal()).with_flex(24.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(31_u8, 31_u8, 35_u8))
+            .with_border(1.0_f32, Color::rgb(47_u8, 48_u8, 53_u8)).with_radius(0.0_f32).with_gap(0.0_f32))
+    title.push(Widget::panel("").with_flex(3.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(31_u8, 132_u8, 194_u8)).with_pointer_events(false)))
+    title.push(Widget::label(text).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(224_u8, 225_u8, 228_u8))
+            .with_padding(Insets::symmetric(4.0_f32, 7.0_f32)).with_font_size(10.0_f32).with_font_weight(600_u32)
+            .with_pointer_events(false)))
+    ret title
+}
+
+fn dock_badge(text: str, width: f32) -> Widget {
+    ret Widget::label(text).with_flex(width, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(27_u8, 28_u8, 32_u8)).with_foreground(Color::rgb(139_u8, 142_u8, 149_u8))
+            .with_border(1.0_f32, theme_border()).with_radius(2.0_f32).with_padding(Insets::symmetric(2.0_f32, 5.0_f32))
+            .with_font_size(8.0_f32).with_font_weight(600_u32).with_pointer_events(false))
+}
+
+fn dock_header(text: str, context: str, context_width: f32) -> Widget {
+    let mut header = Widget::panel("dock-header-" + text).with_direction(vertical()).with_flex(26.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(theme_surface_raised())
+            .with_border(1.0_f32, theme_border()).with_radius(1.0_f32).with_gap(0.0_f32))
+    header.push(Widget::panel("").with_flex(2.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(theme_accent()).with_pointer_events(false)))
+    let mut row = Widget::panel("").with_direction(horizontal()).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_padding(Insets::symmetric(2.0_f32, 7.0_f32)).with_gap(5.0_f32).with_pointer_events(false))
+    row.push(Widget::label(text).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(220_u8, 222_u8, 226_u8))
+            .with_font_size(10.0_f32).with_font_weight(600_u32)
+            .with_pointer_events(false)))
+    if context != "" { row.push(dock_badge(context, context_width)) }
+    header.push(row)
+    ret header
+}
+
+fn menu_item(id: str, text: str, hovered: str) -> Widget {
+    ret Widget::button(id, text).with_flex(if text == "Window" { 52.0_f32 } else { 40.0_f32 }, 0.0_f32).with_style(
+        Style::default().with_background(if hovered == id { Color::rgb(43_u8, 44_u8, 49_u8) } else { Color::rgb(15_u8, 15_u8, 17_u8) })
+            .with_foreground(Color::rgb(188_u8, 190_u8, 196_u8)).with_border(0.0_f32, Color::rgb(0_u8, 0_u8, 0_u8))
+            .with_radius(2.0_f32).with_padding(Insets::symmetric(3.0_f32, 6.0_f32)).with_font_size(10.0_f32))
+}
+
+fn popup_action(id: str, text: str, icon: SvgDocument, hovered: str, disabled: bool, active: bool) -> Widget {
+    ret Widget::icon_button(id, text, icon).with_flex(21.0_f32, 0.0_f32).with_disabled(disabled).with_style(
+        Style::default().with_background(if active { Color::rgb(30_u8, 66_u8, 89_u8) } else {
+            if hovered == id { Color::rgb(48_u8, 49_u8, 54_u8) } else { Color::rgb(25_u8, 25_u8, 28_u8) }
+        }).with_foreground(Color::rgb(218_u8, 220_u8, 224_u8)).with_border(0.0_f32, Color::rgb(0_u8, 0_u8, 0_u8))
+            .with_radius(1.0_f32).with_padding(Insets::symmetric(2.0_f32, 7.0_f32)).with_font_size(9.0_f32))
+}
+
+fn menu_popup(menu: str, hovered: str, project_dirty: bool, can_undo: bool, can_redo: bool, selected_cube: u32,
+    simulating: bool, building: bool, show_outliner: bool, show_details: bool, show_content: bool, icons: EditorIcons) -> Widget {
+    let left = if menu == "menu-file" { 112.0_f32 } else { if menu == "menu-edit" { 154.0_f32 } else {
+        if menu == "menu-window" { 196.0_f32 } else { if menu == "menu-tools" { 250.0_f32 } else { 292.0_f32 } }
+    } }
+    let height = if menu == "menu-edit" { 100.0_f32 } else { if menu == "menu-file" { 122.0_f32 } else {
+        if menu == "menu-window" { 76.0_f32 } else { 29.0_f32 }
+    } }
+    let mut popup = Widget::panel("menu-popup").with_direction(vertical()).with_style(
+        Style::default().with_background(Color::rgb(25_u8, 25_u8, 28_u8)).with_border(1.0_f32, Color::rgb(65_u8, 66_u8, 72_u8))
+            .with_radius(2.0_f32).with_padding(Insets::all(4.0_f32)).with_gap(2.0_f32).with_width(192.0_f32).with_height(height)
+            .with_absolute(true).with_left(left).with_top(24.0_f32).with_z_index(90_i32)
+            .with_shadow(0.0_f32, 5.0_f32, 14.0_f32, 0.0_f32, Color::rgba(0_u8, 0_u8, 0_u8, 170_u8), false))
+    if menu == "menu-file" {
+        popup.push(popup_action("menu-new-project-action", "New Project", icons.add, hovered, building || simulating, false))
+        popup.push(popup_action("menu-open-project-action", "Open Project", icons.folder, hovered, building || simulating, false))
+        popup.push(popup_action("menu-save-action", "Save Level", icons.save, hovered, !project_dirty || simulating, false))
+        popup.push(popup_action("menu-build-action", "Build Project", icons.build, hovered, building || simulating, false))
+        popup.push(popup_action("menu-exit-action", "Exit Graphene", icons.exit, hovered, false, false))
+    }
+    elif menu == "menu-edit" {
+        popup.push(popup_action("menu-undo-action", "Undo", icons.undo, hovered, !can_undo, false))
+        popup.push(popup_action("menu-redo-action", "Redo", icons.redo, hovered, !can_redo, false))
+        popup.push(popup_action("menu-duplicate-action", "Duplicate Actor", icons.duplicate, hovered, selected_cube == 0_u32 || simulating, false))
+        popup.push(popup_action("menu-delete-action", "Delete Actor", icons.delete, hovered, selected_cube == 0_u32 || simulating, false))
+    }
+    elif menu == "menu-window" {
+        popup.push(popup_action("menu-outliner-action", "World Outliner", icons.panels, hovered, false, show_outliner))
+        popup.push(popup_action("menu-details-action", "Details", icons.panels, hovered, false, show_details))
+        popup.push(popup_action("menu-content-action", "Content Browser", icons.panels, hovered, false, show_content))
+    }
+    elif menu == "menu-tools" {
+        popup.push(popup_action("menu-tools-build-action", "Build Project", icons.build, hovered, building || simulating, false))
+    }
+    else { popup.push(popup_action("menu-about-action", "About Graphene", icons.info, hovered, false, false)) }
+    ret popup
+}
+
+fn project_dialog(mode: str, path_editor: TextEditor, focused: bool, error: str, view_width: f32, view_height: f32) -> Widget {
+    let mut shade = Widget::panel("project-dialog-shade").with_direction(vertical()).with_style(
+        Style::default().with_background(Color::rgba(0_u8, 0_u8, 0_u8, 176_u8)).with_absolute(true)
+            .with_left(0.0_f32).with_top(0.0_f32).with_width(view_width).with_height(view_height).with_z_index(140_i32))
+    let width = 520.0_f32
+    let height = 224.0_f32
+    let mut dialog = Widget::panel("project-dialog").with_direction(vertical()).with_style(
+        Style::default().with_background(Color::rgb(28_u8, 29_u8, 33_u8)).with_border(1.0_f32, Color::rgb(74_u8, 76_u8, 83_u8))
+            .with_radius(4.0_f32).with_padding(Insets::all(16.0_f32)).with_gap(10.0_f32)
+            .with_width(width).with_height(height).with_absolute(true).with_left((view_width - width) * 0.5_f32)
+            .with_top((view_height - height) * 0.5_f32).with_z_index(141_i32)
+            .with_shadow(0.0_f32, 12.0_f32, 32.0_f32, 0.0_f32, Color::rgba(0_u8, 0_u8, 0_u8, 210_u8), false))
+    dialog.push(Widget::label(if mode == "new" { "Create Graphene Project" } else { "Open Graphene Project" })
+        .with_flex(28.0_f32, 0.0_f32).with_style(Style::default().with_foreground(Color::rgb(235_u8, 236_u8, 239_u8))
+            .with_font_size(16.0_f32).with_font_weight(600_u32)))
+    dialog.push(Widget::label(if mode == "new" { "Choose the new project directory." } else { "Choose a directory containing graphene.project." })
+        .with_flex(20.0_f32, 0.0_f32).with_style(Style::default().with_foreground(Color::rgb(157_u8, 160_u8, 167_u8)).with_font_size(10.0_f32)))
+    dialog.push(Widget::input("project-path", path_editor.value()).with_flex(38.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(17_u8, 18_u8, 21_u8)).with_foreground(Color::rgb(226_u8, 228_u8, 232_u8))
+            .with_border(1.0_f32, if focused { theme_accent() } else { theme_border_hover() }).with_radius(3.0_f32)
+            .with_padding(Insets::symmetric(7.0_f32, 9.0_f32)).with_font_size(11.0_f32)))
+    dialog.push(Widget::label(error).with_flex(20.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(218_u8, 103_u8, 94_u8)).with_font_size(10.0_f32)))
+    dialog.push(Widget::spacer(1.0_f32))
+    let mut actions = Widget::panel("project-dialog-actions").with_direction(horizontal()).with_flex(32.0_f32, 0.0_f32)
+        .with_style(Style::default().with_gap(8.0_f32))
+    actions.push(Widget::spacer(1.0_f32))
+    actions.push(Widget::button("project-cancel", "Cancel").with_flex(88.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(theme_control()).with_foreground(Color::rgb(210_u8, 212_u8, 217_u8))
+            .with_border(1.0_f32, theme_border_hover()).with_radius(3.0_f32).with_font_size(10.0_f32)))
+    actions.push(Widget::button("project-confirm", if mode == "new" { "Create" } else { "Open" }).with_flex(96.0_f32, 0.0_f32)
+        .with_style(Style::default().with_background(theme_accent()).with_foreground(Color::rgb(255_u8, 255_u8, 255_u8))
+            .with_border(1.0_f32, Color::rgb(55_u8, 166_u8, 226_u8)).with_radius(3.0_f32).with_font_size(10.0_f32).with_font_weight(600_u32)))
+    dialog.push(actions)
+    shade.push(dialog)
+    ret shade
+}
+
+fn dock_tab(id: str, text: str, active: bool) -> Widget {
+    let background = if active { Color::rgb(35_u8, 36_u8, 40_u8) } else { Color::rgb(22_u8, 22_u8, 25_u8) }
+    let mut tab = Widget::panel(id + "-surface").with_direction(vertical()).with_flex(128.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(background).with_border(1.0_f32, Color::rgb(48_u8, 49_u8, 54_u8))
+            .with_radius(1.0_f32).with_gap(0.0_f32))
+    tab.push(Widget::panel("").with_flex(2.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(if active { Color::rgb(32_u8, 143_u8, 207_u8) } else { background })
+            .with_pointer_events(false)))
+    tab.push(Widget::button(id, text).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_background(background).with_foreground(Color::rgb(218_u8, 219_u8, 223_u8))
+            .with_border(0.0_f32, Color::rgb(0_u8, 0_u8, 0_u8)).with_radius(0.0_f32)
+            .with_padding(Insets::symmetric(3.0_f32, 8.0_f32)).with_font_size(10.0_f32)
+            .with_font_weight(if active { 600_u32 } else { 400_u32 })))
+    ret tab
+}
+
+fn active_icon_tab(id: str, text: str, icon: SvgDocument, width: f32) -> Widget {
+    let mut tab = Widget::panel(id + "-surface").with_direction(vertical()).with_flex(width, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(35_u8, 36_u8, 40_u8))
+            .with_border(1.0_f32, Color::rgb(48_u8, 49_u8, 54_u8)).with_radius(1.0_f32).with_gap(0.0_f32))
+    tab.push(Widget::panel("").with_flex(2.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(32_u8, 143_u8, 207_u8)).with_pointer_events(false)))
+    tab.push(Widget::icon_button(id, text, icon).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_background(Color::rgb(35_u8, 36_u8, 40_u8)).with_foreground(Color::rgb(220_u8, 222_u8, 226_u8))
+            .with_border(0.0_f32, Color::rgb(0_u8, 0_u8, 0_u8)).with_radius(0.0_f32)
+            .with_padding(Insets::symmetric(3.0_f32, 8.0_f32)).with_font_size(10.0_f32).with_font_weight(600_u32)))
+    ret tab
+}
+
+fn property_value(text: str, axis: str) -> Widget {
+    let axis_color = if axis == "X" { Color::rgb(178_u8, 58_u8, 63_u8) } else {
+        if axis == "Y" { Color::rgb(67_u8, 148_u8, 82_u8) } else { Color::rgb(54_u8, 112_u8, 180_u8) }
+    }
+    let mut field = Widget::panel("property-" + axis + "-" + text).with_direction(horizontal()).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_background(Color::rgb(14_u8, 14_u8, 16_u8)).with_border(1.0_f32, Color::rgb(48_u8, 49_u8, 54_u8))
+            .with_radius(2.0_f32).with_padding(Insets::symmetric(2.0_f32, 4.0_f32)).with_gap(4.0_f32))
+    field.push(Widget::label(axis).with_flex(15.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(axis_color).with_foreground(Color::rgb(248_u8, 248_u8, 249_u8))
+            .with_radius(2.0_f32).with_font_size(9.0_f32).with_font_weight(700_u32)))
+    field.push(Widget::label(text).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(211_u8, 212_u8, 216_u8))
+            .with_font_family("Roboto Mono").with_font_size(9.0_f32)))
+    ret field
+}
+
+fn transform_scalar(value: f32) -> str {
+    let negative = value < 0.0_f32
+    let magnitude = if negative { -value } else { value }
+    let scaled = (magnitude * 1000.0_f32 + 0.5_f32) as u32
+    let whole = scaled / 1000_u32
+    let fraction = scaled % 1000_u32
+    let padding = if fraction < 10_u32 { "00" } else { if fraction < 100_u32 { "0" } else { "" } }
+    let sign = if negative { "-" } else { "" }
+    ret sign + Debug::fmt(whole) + "." + padding + Debug::fmt(fraction)
+}
+
+fn snap_scalar(value: f32, step: f32) -> f32 {
+    if step <= 0.0_f32 { ret value }
+    let scaled = value / step
+    let rounded = if scaled < 0.0_f32 { (scaled - 0.5_f32) as i32 } else { (scaled + 0.5_f32) as i32 }
+    ret (rounded as f32) * step
+}
+
+fn transform_property(name: str, value: Vec3) -> Widget {
+    let display = if name == "Rotation" { value.scale(57.29578_f32) } else { value }
+    let mut row = Widget::panel("transform-" + name).with_direction(horizontal()).with_flex(30.0_f32, 0.0_f32).with_style(
+        Style::default().with_gap(4.0_f32).with_padding(Insets::symmetric(2.0_f32, 0.0_f32)))
+    row.push(Widget::label(name).with_flex(58.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(181_u8, 183_u8, 188_u8)).with_font_size(10.0_f32)))
+    row.push(property_value(transform_scalar(display.x()), "X"))
+    row.push(property_value(transform_scalar(display.y()), "Y"))
+    row.push(property_value(transform_scalar(display.z()), "Z"))
+    ret row
+}
+
+fn interactive_background(hovered: bool) -> Color {
+    ret if hovered { theme_control_hover() } else { theme_control() }
+}
+
+fn interactive_border(hovered: bool) -> Color {
+    ret if hovered { theme_border_hover() } else { theme_border() }
+}
+
+fn control_style(active: bool, hovered: bool) -> Style {
+    let background = if active { Color::rgb(0_u8, 112_u8, 184_u8) } else {
+        interactive_background(hovered)
+    }
+    let border = if active { Color::rgb(22_u8, 136_u8, 212_u8) } else { interactive_border(hovered) }
+    ret Style::default().with_background(background).with_foreground(Color::rgb(232_u8, 233_u8, 236_u8))
+        .with_border(1.0_f32, border).with_radius(2.0_f32)
+        .with_padding(Insets::symmetric(5.0_f32, 9.0_f32)).with_font_size(11.0_f32)
+}
+
+fn compact_icon_style(hovered: bool) -> Style {
+    ret Style::default().with_background(interactive_background(hovered))
+        .with_foreground(Color::rgb(191_u8, 194_u8, 200_u8)).with_border(1.0_f32, interactive_border(hovered))
+        .with_radius(2.0_f32).with_padding(Insets::all(5.0_f32))
+}
+
+fn segmented_icon_style(active: bool, hovered: bool) -> Style {
+    let background = if active { Color::rgb(0_u8, 112_u8, 184_u8) } else { interactive_background(hovered) }
+    ret Style::default().with_background(background).with_foreground(Color::rgb(222_u8, 224_u8, 228_u8))
+        .with_border(0.0_f32, Color::rgb(0_u8, 0_u8, 0_u8)).with_radius(0.0_f32).with_padding(Insets::all(5.0_f32))
+}
+
+fn segmented_group() -> Widget {
+    ret Widget::panel("").with_direction(horizontal()).with_flex(124.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(theme_control()).with_border(1.0_f32, theme_border()).with_radius(2.0_f32)
+            .with_padding(Insets::all(1.0_f32)).with_gap(1.0_f32).with_overflow_hidden(true))
+}
+
+fn toolbar_action_group(width: f32) -> Widget {
+    ret Widget::panel("").with_direction(horizontal()).with_flex(width, 0.0_f32).with_style(
+        Style::default().with_background(theme_control()).with_border(1.0_f32, theme_border()).with_radius(2.0_f32)
+            .with_padding(Insets::all(1.0_f32)).with_gap(1.0_f32).with_overflow_hidden(true))
+}
+
+fn selector_control(id: str, text: str, icon: SvgDocument, chevron: SvgDocument, width: f32, hovered: bool) -> Widget {
+    let mut control = Widget::panel(id).with_direction(horizontal()).with_flex(width, 0.0_f32).with_style(
+        Style::default().with_background(interactive_background(hovered)).with_border(1.0_f32, interactive_border(hovered))
+            .with_radius(2.0_f32).with_padding(Insets::symmetric(4.0_f32, 6.0_f32)).with_gap(4.0_f32))
+    control.push(Widget::icon("", icon).with_flex(15.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(190_u8, 193_u8, 199_u8)).with_padding(Insets::all(2.0_f32))
+            .with_pointer_events(false)))
+    control.push(Widget::label(text).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(224_u8, 226_u8, 230_u8)).with_font_size(10.0_f32)
+            .with_pointer_events(false)))
+    control.push(Widget::icon("", chevron).with_flex(12.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(124_u8, 127_u8, 134_u8)).with_padding(Insets::all(2.0_f32))
+            .with_pointer_events(false)))
+    ret control
+}
+
+fn camera_mode_name(mode: str) -> str {
+    if mode == "top" { ret "Top" }
+    if mode == "front" { ret "Front" }
+    if mode == "right" { ret "Right" }
+    ret "Perspective"
+}
+
+fn shading_mode_name(mode: str) -> str { ret if mode == "unlit" { "Unlit" } else { "Lit" } }
+
+fn camera_speed_name(mode: str) -> str {
+    if mode == "0.25" { ret "0.25x" }
+    if mode == "0.5" { ret "0.5x" }
+    if mode == "2" { ret "2.0x" }
+    if mode == "4" { ret "4.0x" }
+    ret "1.0x"
+}
+
+fn camera_speed_value(mode: str) -> f32 {
+    if mode == "0.25" { ret 0.25_f32 }
+    if mode == "0.5" { ret 0.5_f32 }
+    if mode == "2" { ret 2.0_f32 }
+    if mode == "4" { ret 4.0_f32 }
+    ret 1.0_f32
+}
+
+fn camera_option(id: str, text: str, mode: str, active_mode: str, hovered: str, icons: EditorIcons) -> Widget {
+    ret Widget::icon_button(id, text, icons.view).with_flex(if mode == "perspective" { 108.0_f32 } else { 72.0_f32 }, 0.0_f32)
+        .with_style(control_style(mode == active_mode, hovered == id))
+}
+
+fn viewport_camera_strip(mode: str, hovered: str, icons: EditorIcons) -> Widget {
+    let mut strip = Widget::panel("viewport-camera-menu").with_direction(horizontal()).with_flex(34.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(17_u8, 18_u8, 21_u8)).with_border(1.0_f32, theme_border())
+            .with_padding(Insets::symmetric(3.0_f32, 6.0_f32)).with_gap(4.0_f32))
+    strip.push(Widget::label("CAMERA").with_flex(54.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(112_u8, 115_u8, 122_u8)).with_font_size(8.0_f32)
+            .with_font_weight(700_u32).with_pointer_events(false)))
+    strip.push(camera_option("camera-perspective", "Perspective", "perspective", mode, hovered, icons))
+    strip.push(camera_option("camera-top", "Top", "top", mode, hovered, icons))
+    strip.push(camera_option("camera-front", "Front", "front", mode, hovered, icons))
+    strip.push(camera_option("camera-right", "Right", "right", mode, hovered, icons))
+    strip.push(Widget::spacer(1.0_f32))
+    ret strip
+}
+
+fn viewport_shading_strip(mode: str, hovered: str, icons: EditorIcons) -> Widget {
+    let mut strip = Widget::panel("viewport-shading-menu").with_direction(horizontal()).with_flex(34.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(17_u8, 18_u8, 21_u8)).with_border(1.0_f32, theme_border())
+            .with_padding(Insets::symmetric(3.0_f32, 6.0_f32)).with_gap(4.0_f32))
+    strip.push(Widget::label("SHADING").with_flex(54.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(112_u8, 115_u8, 122_u8)).with_font_size(8.0_f32)
+            .with_font_weight(700_u32).with_pointer_events(false)))
+    strip.push(Widget::icon_button("shading-lit", "Lit", icons.lighting).with_flex(76.0_f32, 0.0_f32)
+        .with_style(control_style(mode == "lit", hovered == "shading-lit")))
+    strip.push(Widget::icon_button("shading-unlit", "Unlit", icons.lighting).with_flex(82.0_f32, 0.0_f32)
+        .with_style(control_style(mode == "unlit", hovered == "shading-unlit")))
+    strip.push(Widget::spacer(1.0_f32))
+    ret strip
+}
+
+fn viewport_speed_strip(mode: str, hovered: str, icons: EditorIcons) -> Widget {
+    let mut strip = Widget::panel("viewport-speed-menu").with_direction(horizontal()).with_flex(34.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(17_u8, 18_u8, 21_u8)).with_border(1.0_f32, theme_border())
+            .with_padding(Insets::symmetric(3.0_f32, 6.0_f32)).with_gap(4.0_f32))
+    strip.push(Widget::label("CAMERA SPEED").with_flex(82.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(112_u8, 115_u8, 122_u8)).with_font_size(8.0_f32)
+            .with_font_weight(700_u32).with_pointer_events(false)))
+    strip.push(Widget::icon_button("speed-025", "0.25x", icons.speed).with_flex(76.0_f32, 0.0_f32)
+        .with_style(control_style(mode == "0.25", hovered == "speed-025")))
+    strip.push(Widget::icon_button("speed-05", "0.5x", icons.speed).with_flex(72.0_f32, 0.0_f32)
+        .with_style(control_style(mode == "0.5", hovered == "speed-05")))
+    strip.push(Widget::icon_button("speed-1", "1.0x", icons.speed).with_flex(72.0_f32, 0.0_f32)
+        .with_style(control_style(mode == "1", hovered == "speed-1")))
+    strip.push(Widget::icon_button("speed-2", "2.0x", icons.speed).with_flex(72.0_f32, 0.0_f32)
+        .with_style(control_style(mode == "2", hovered == "speed-2")))
+    strip.push(Widget::icon_button("speed-4", "4.0x", icons.speed).with_flex(72.0_f32, 0.0_f32)
+        .with_style(control_style(mode == "4", hovered == "speed-4")))
+    strip.push(Widget::spacer(1.0_f32))
+    ret strip
+}
+
+fn search_field(id: str, placeholder: str, icon: SvgDocument, basis: f32, grow: f32) -> Widget {
+    let mut field = Widget::panel(id + "-surface").with_direction(horizontal()).with_flex(basis, grow).with_style(
+        Style::default().with_background(Color::rgb(15_u8, 15_u8, 17_u8))
+            .with_border(1.0_f32, Color::rgb(48_u8, 49_u8, 54_u8)).with_radius(2.0_f32)
+            .with_padding(Insets::symmetric(2.0_f32, 6.0_f32)).with_gap(4.0_f32))
+    field.push(Widget::icon("", icon).with_flex(14.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(112_u8, 115_u8, 122_u8))
+            .with_padding(Insets::all(1.0_f32)).with_pointer_events(false)))
+    field.push(Widget::input(id, placeholder).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_background(Color::rgb(15_u8, 15_u8, 17_u8)).with_foreground(Color::rgb(205_u8, 207_u8, 212_u8))
+            .with_border(0.0_f32, Color::rgb(0_u8, 0_u8, 0_u8)).with_radius(0.0_f32)
+            .with_padding(Insets::symmetric(2.0_f32, 0.0_f32)).with_font_size(10.0_f32)))
+    ret field
+}
+
+fn toolbar_divider() -> Widget {
+    ret Widget::panel("").with_flex(1.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(56_u8, 57_u8, 62_u8)).with_margin(Insets::symmetric(3.0_f32, 2.0_f32))
+            .with_pointer_events(false))
+}
+
+fn viewport_readout(text: str, icon: SvgDocument, width: f32) -> Widget {
+    let mut readout = Widget::panel("").with_direction(horizontal()).with_flex(width, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(27_u8, 28_u8, 32_u8)).with_border(1.0_f32, Color::rgb(45_u8, 46_u8, 51_u8))
+            .with_radius(2.0_f32).with_padding(Insets::symmetric(3.0_f32, 5.0_f32)).with_gap(3.0_f32).with_pointer_events(false))
+    readout.push(Widget::icon("", icon).with_flex(15.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(139_u8, 171_u8, 190_u8)).with_padding(Insets::all(2.0_f32)).with_pointer_events(false)))
+    readout.push(Widget::label(text).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(176_u8, 179_u8, 185_u8))
+            .with_font_family("Roboto Mono").with_font_size(9.0_f32).with_pointer_events(false)))
+    ret readout
+}
+
+fn viewport_toggle_readout(id: str, text: str, icon: SvgDocument, width: f32, active: bool, hovered: bool) -> Widget {
+    let background = if active { Color::rgb(27_u8, 67_u8, 92_u8) } else { interactive_background(hovered) }
+    let border = if active { Color::rgb(37_u8, 114_u8, 162_u8) } else { interactive_border(hovered) }
+    let mut readout = Widget::panel(id).with_direction(horizontal()).with_flex(width, 0.0_f32).with_style(
+        Style::default().with_background(background).with_border(1.0_f32, border).with_radius(2.0_f32)
+            .with_padding(Insets::symmetric(3.0_f32, 5.0_f32)).with_gap(3.0_f32))
+    readout.push(Widget::icon("", icon).with_flex(15.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(if active { Color::rgb(113_u8, 190_u8, 231_u8) } else { Color::rgb(139_u8, 142_u8, 149_u8) })
+            .with_padding(Insets::all(2.0_f32)).with_pointer_events(false)))
+    readout.push(Widget::label(text).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(204_u8, 207_u8, 212_u8)).with_font_family("Roboto Mono")
+            .with_font_size(9.0_f32).with_pointer_events(false)))
+    ret readout
+}
+
+fn viewport_status_item(text: str, icon: SvgDocument, width: f32, accent: Color) -> Widget {
+    let mut item = Widget::panel("").with_direction(horizontal()).with_flex(width, 0.0_f32).with_style(
+        Style::default().with_gap(4.0_f32).with_pointer_events(false))
+    item.push(Widget::icon("", icon).with_flex(14.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(accent).with_padding(Insets::all(2.0_f32)).with_pointer_events(false)))
+    item.push(Widget::label(text).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(154_u8, 157_u8, 164_u8)).with_font_size(9.0_f32).with_pointer_events(false)))
+    ret item
+}
+
+fn tool_name(tool: str) -> str {
+    if tool == "move" { ret "MOVE" }
+    if tool == "rotate" { ret "ROTATE" }
+    if tool == "scale" { ret "SCALE" }
+    ret "SELECT"
+}
+
+fn play_style(active: bool, hovered: bool) -> Style {
+    let background = if active { Color::rgb(31_u8, 111_u8, 67_u8) } else {
+        if hovered { Color::rgb(42_u8, 91_u8, 62_u8) } else { Color::rgb(34_u8, 57_u8, 45_u8) }
+    }
+    ret Style::default().with_background(background).with_foreground(Color::rgb(232_u8, 238_u8, 234_u8))
+        .with_border(1.0_f32, if active { Color::rgb(51_u8, 148_u8, 91_u8) } else { Color::rgb(55_u8, 75_u8, 64_u8) })
+        .with_radius(2.0_f32).with_padding(Insets::symmetric(5.0_f32, 9.0_f32)).with_font_size(11.0_f32)
+}
+
+fn build_style(building: bool, hovered: bool) -> Style {
+    if !building { ret control_style(false, hovered) }
+    ret Style::default().with_background(Color::rgb(105_u8, 73_u8, 29_u8)).with_foreground(Color::rgb(246_u8, 229_u8, 195_u8))
+        .with_border(1.0_f32, Color::rgb(151_u8, 105_u8, 39_u8)).with_radius(2.0_f32)
+        .with_padding(Insets::symmetric(5.0_f32, 9.0_f32)).with_font_size(11.0_f32)
+}
+
+fn status_segment(text: str, icon: SvgDocument, color: Color, width: f32, emphasized: bool) -> Widget {
+    let mut segment = Widget::panel("").with_direction(horizontal()).with_flex(width, 0.0_f32).with_style(
+        Style::default().with_background(if emphasized { Color::rgb(30_u8, 45_u8, 37_u8) } else { Color::rgb(18_u8, 18_u8, 21_u8) })
+            .with_border(1.0_f32, Color::rgb(43_u8, 44_u8, 49_u8)).with_padding(Insets::symmetric(2.0_f32, 5.0_f32))
+            .with_gap(4.0_f32).with_pointer_events(false))
+    segment.push(Widget::icon("", icon).with_flex(14.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(color).with_padding(Insets::all(2.0_f32)).with_pointer_events(false)))
+    segment.push(Widget::label(text).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(173_u8, 176_u8, 182_u8)).with_font_size(9.0_f32).with_pointer_events(false)))
+    ret segment
+}
+
+fn log_line(prefix: str, text: str, color: Color) -> Widget {
+    let mut row = Widget::panel("log-" + prefix + "-" + text).with_direction(horizontal()).with_flex(22.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(17_u8, 17_u8, 20_u8)).with_padding(Insets::symmetric(2.0_f32, 5.0_f32)).with_gap(6.0_f32))
+    row.push(Widget::panel("").with_flex(2.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(color).with_pointer_events(false)))
+    row.push(Widget::label(prefix).with_flex(48.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(color).with_font_family("Roboto Mono")
+            .with_font_size(9.0_f32).with_font_weight(600_u32)))
+    row.push(Widget::label(text).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(182_u8, 184_u8, 190_u8))
+            .with_font_family("Roboto Mono").with_font_size(9.0_f32)))
+    ret row
+}
+
+fn output_panel(simulating: bool, building: bool, status_message: str, build_output: str, icons: EditorIcons) -> Widget {
+    let mut output = Widget::panel("output").with_direction(vertical()).with_flex(300.0_f32, 0.0_f32).with_style(panel_style())
+    let mut output_tabs = Widget::panel("output-tabs").with_direction(horizontal()).with_flex(28.0_f32, 0.0_f32).with_style(
+        Style::default().with_gap(5.0_f32))
+    output_tabs.push(active_icon_tab("output-tab", "Output Log", icons.terminal, 124.0_f32))
+    output_tabs.push(Widget::spacer(1.0_f32))
+    output_tabs.push(dock_badge("5 MESSAGES", 76.0_f32))
+    output.push(output_tabs)
+    output.push(log_line("SYSTEM", "Graphene Editor initialized", Color::rgb(118_u8, 157_u8, 184_u8)))
+    output.push(log_line("RENDER", "Vulkan viewport ready", Color::rgb(72_u8, 153_u8, 204_u8)))
+    output.push(log_line("EDITOR", status_message, Color::rgb(146_u8, 149_u8, 157_u8)))
+    output.push(log_line("BUILD", build_output, if building { Color::rgb(201_u8, 151_u8, 68_u8) } else {
+        if build_output == "Gameplay build succeeded" { Color::rgb(78_u8, 170_u8, 106_u8) } else { Color::rgb(151_u8, 153_u8, 160_u8) }
+    }))
+    output.push(log_line("WORLD", if simulating { "Simulation running" } else { "Editor world ready" },
+        if simulating { Color::rgb(78_u8, 170_u8, 106_u8) } else { Color::rgb(132_u8, 135_u8, 143_u8) }))
+    output.push(Widget::spacer(1.0_f32))
+    ret output
+}
+
+fn axis_color(axis: str) -> Color {
+    ret if axis == "X" { Color::rgb(210_u8, 73_u8, 78_u8) } else {
+        if axis == "Y" { Color::rgb(80_u8, 172_u8, 93_u8) } else { Color::rgb(66_u8, 135_u8, 214_u8) }
+    }
+}
+
+fn axis_step_button(id: str, icon: SvgDocument, axis: str, hovered: str, disabled: bool) -> Widget {
+    let hot = if axis == "X" { Color::rgb(112_u8, 43_u8, 49_u8) } else {
+        if axis == "Y" { Color::rgb(42_u8, 94_u8, 53_u8) } else { Color::rgb(39_u8, 76_u8, 120_u8) }
+    }
+    ret Widget::icon_button(id, "", icon).with_flex(24.0_f32, 1.0_f32).with_disabled(disabled).with_style(
+        Style::default().with_background(if hovered == id { hot } else { Color::rgb(28_u8, 29_u8, 33_u8) })
+            .with_foreground(if hovered == id { Color::rgb(245_u8, 246_u8, 248_u8) } else { Color::rgb(174_u8, 176_u8, 183_u8) })
+            .with_border(0.0_f32, Color::rgb(0_u8, 0_u8, 0_u8)).with_radius(1.0_f32).with_padding(Insets::all(5.0_f32)))
+}
+
+fn axis_stepper(axis: str, minus_id: str, plus_id: str, icons: EditorIcons, hovered: str, disabled: bool) -> Widget {
+    let mut group = Widget::panel("").with_direction(horizontal()).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_background(Color::rgb(20_u8, 20_u8, 23_u8)).with_border(1.0_f32, Color::rgb(48_u8, 49_u8, 55_u8))
+            .with_radius(2.0_f32).with_padding(Insets::all(1.0_f32)).with_gap(1.0_f32).with_overflow_hidden(true))
+    group.push(Widget::label(axis).with_flex(20.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(24_u8, 25_u8, 29_u8)).with_foreground(axis_color(axis))
+            .with_font_size(9.0_f32).with_font_weight(700_u32).with_pointer_events(false)))
+    group.push(axis_step_button(minus_id, icons.minus, axis, hovered, disabled))
+    group.push(axis_step_button(plus_id, icons.add, axis, hovered, disabled))
+    ret group
+}
+
+fn actor_row(id: str, name: str, kind: str, icon: SvgDocument, selected: bool, hovered: str, nested: bool,
+    icons: EditorIcons) -> Widget {
+    let background = if selected { Color::rgb(31_u8, 70_u8, 97_u8) } else {
+        if hovered == id { Color::rgb(42_u8, 43_u8, 48_u8) } else { Color::rgb(24_u8, 24_u8, 27_u8) }
+    }
+    let mut row = Widget::panel(id).with_direction(horizontal()).with_flex(28.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(background).with_border(0.0_f32, Color::rgb(0_u8, 0_u8, 0_u8))
+            .with_radius(1.0_f32).with_padding(Insets::symmetric(3.0_f32, 4.0_f32)).with_gap(4.0_f32).with_overflow_hidden(true))
+    row.push(Widget::panel("").with_flex(2.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(if selected { Color::rgb(38_u8, 143_u8, 207_u8) } else { background })
+            .with_pointer_events(false)))
+    if nested {
+        row.push(Widget::panel("").with_flex(10.0_f32, 0.0_f32).with_style(
+            Style::default().with_pointer_events(false)))
+    }
+    row.push(Widget::icon("", icon).with_flex(18.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(if selected { Color::rgb(197_u8, 222_u8, 237_u8) } else { Color::rgb(151_u8, 178_u8, 195_u8) })
+            .with_padding(Insets::all(2.0_f32)).with_pointer_events(false)))
+    row.push(Widget::label(name).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(if selected { Color::rgb(235_u8, 238_u8, 241_u8) } else { Color::rgb(202_u8, 204_u8, 209_u8) })
+            .with_font_size(10.0_f32).with_overflow_hidden(true).with_pointer_events(false)))
+    row.push(Widget::label(kind).with_flex(32.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(111_u8, 114_u8, 121_u8)).with_font_size(7.0_f32)
+            .with_overflow_hidden(true).with_pointer_events(false)))
+    row.push(Widget::icon("", icons.visible).with_flex(16.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(123_u8, 126_u8, 133_u8)).with_padding(Insets::all(2.0_f32)).with_pointer_events(false)))
+    ret row
+}
+
+fn collection_row(name: str, icons: EditorIcons) -> Widget {
+    let mut row = Widget::panel("collection-" + name).with_direction(horizontal()).with_flex(25.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(21_u8, 21_u8, 24_u8)).with_padding(Insets::symmetric(3.0_f32, 5.0_f32)).with_gap(4.0_f32)
+            .with_pointer_events(false))
+    row.push(Widget::icon("", icons.expanded).with_flex(13.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(125_u8, 128_u8, 135_u8)).with_padding(Insets::all(2.0_f32)).with_pointer_events(false)))
+    row.push(Widget::icon("", icons.folder).with_flex(17.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(185_u8, 144_u8, 66_u8)).with_padding(Insets::all(2.0_f32)).with_pointer_events(false)))
+    row.push(Widget::label(name).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(169_u8, 172_u8, 178_u8)).with_font_size(9.0_f32).with_font_weight(600_u32)
+            .with_pointer_events(false)))
+    ret row
+}
+
+fn hierarchy(selected: str, object_count: u32, hovered: str, icons: EditorIcons) -> Widget {
+    let mut panel = Widget::panel("hierarchy").with_direction(vertical()).with_flex(242.0_f32, 0.0_f32).with_style(panel_style())
+    panel.push(dock_header("WORLD OUTLINER", Debug::fmt(object_count + 2_u32) + " ACTORS", 62.0_f32))
+    let mut search = Widget::panel("outliner-tools").with_direction(horizontal()).with_flex(30.0_f32, 0.0_f32).with_style(
+        Style::default().with_gap(4.0_f32))
+    search.push(search_field("scene-search", "Search actors", icons.search, 0.0_f32, 1.0_f32))
+    search.push(Widget::icon_button("outliner-add", "", icons.add).with_flex(30.0_f32, 0.0_f32)
+        .with_style(compact_icon_style(hovered == "outliner-add")))
+    search.push(Widget::icon_button("outliner-settings", "", icons.settings).with_flex(30.0_f32, 0.0_f32)
+        .with_style(compact_icon_style(hovered == "outliner-settings")))
+    panel.push(search)
+    panel.push(actor_row("entity-camera", "Camera", "CAM", icons.camera, selected == "Camera", hovered, false, icons))
+    panel.push(actor_row("entity-light", "Directional Light", "LIGHT", icons.light, selected == "Directional Light", hovered, false, icons))
+    panel.push(collection_row("Geometry", icons))
+    let mut index = 0_u32
+    while index < object_count {
+        let name = "Cube " + Debug::fmt(index + 1_u32)
+        let id = "entity-cube-" + Debug::fmt(index + 1_u32)
+        panel.push(actor_row(id, name, "MESH", icons.mesh, selected == name, hovered, true, icons))
+        index = index + 1_u32
+    }
+    panel.push(Widget::spacer(1.0_f32))
+    ret panel
+}
+
+fn viewport(simulating: bool, dragging: bool, object_count: u32, selected: str, active_tool: str, camera_mode: str,
+    shading_mode: str, camera_speed: str, grid_visible: bool, rotation_snap: bool, open_viewport_menu: str, hovered: str,
+    compact: bool, icons: EditorIcons) -> Widget {
+    let mut viewport = Widget::panel("viewport").with_direction(vertical()).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_background(Color::rgb(13_u8, 14_u8, 16_u8))
+            .with_border(if dragging { 2.0_f32 } else { 1.0_f32 },
+                if dragging { Color::rgb(22_u8, 136_u8, 212_u8) } else { Color::rgb(43_u8, 44_u8, 49_u8) })
+            .with_padding(Insets::all(0.0_f32)).with_gap(0.0_f32))
+    let mut viewport_bar = Widget::panel("viewport-bar").with_direction(horizontal()).with_flex(30.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(20_u8, 20_u8, 23_u8)).with_border(1.0_f32, Color::rgb(43_u8, 44_u8, 49_u8))
+            .with_padding(Insets::symmetric(3.0_f32, 6.0_f32)).with_gap(5.0_f32))
+    viewport_bar.push(selector_control("viewport-camera", camera_mode_name(camera_mode), icons.view, icons.expanded, 108.0_f32,
+        hovered == "viewport-camera"))
+    viewport_bar.push(selector_control("viewport-lit", shading_mode_name(shading_mode), icons.lighting, icons.expanded, 76.0_f32,
+        hovered == "viewport-lit"))
+    let mut tools = segmented_group()
+    tools.push(Widget::icon_button("tool-select", "", icons.select).with_flex(30.0_f32, 1.0_f32).with_style(
+        segmented_icon_style(active_tool == "select", hovered == "tool-select")))
+    tools.push(Widget::icon_button("tool-move", "", icons.move).with_flex(30.0_f32, 1.0_f32).with_style(
+        segmented_icon_style(active_tool == "move", hovered == "tool-move")))
+    tools.push(Widget::icon_button("tool-rotate", "", icons.rotate).with_flex(30.0_f32, 1.0_f32).with_style(
+        segmented_icon_style(active_tool == "rotate", hovered == "tool-rotate")))
+    tools.push(Widget::icon_button("tool-scale", "", icons.scale).with_flex(30.0_f32, 1.0_f32).with_style(
+        segmented_icon_style(active_tool == "scale", hovered == "tool-scale")))
+    viewport_bar.push(tools)
+    if !compact {
+        viewport_bar.push(Widget::panel("").with_flex(1.0_f32, 0.0_f32).with_style(
+            Style::default().with_background(Color::rgb(54_u8, 55_u8, 60_u8)).with_pointer_events(false)))
+        viewport_bar.push(viewport_toggle_readout("grid-toggle", "10", icons.grid, 48.0_f32, grid_visible,
+            hovered == "grid-toggle"))
+        viewport_bar.push(viewport_toggle_readout("snap-toggle", "10 deg", icons.snap, 66.0_f32, rotation_snap,
+            hovered == "snap-toggle"))
+        viewport_bar.push(selector_control("viewport-speed", camera_speed_name(camera_speed), icons.speed, icons.expanded,
+            78.0_f32, hovered == "viewport-speed"))
+    }
+    viewport_bar.push(Widget::spacer(1.0_f32))
+    viewport_bar.push(label(if simulating { "SIMULATING" } else { "EDITOR" }).with_flex(72.0_f32, 0.0_f32))
+    viewport.push(viewport_bar)
+    if open_viewport_menu == "camera" { viewport.push(viewport_camera_strip(camera_mode, hovered, icons)) }
+    if open_viewport_menu == "shading" { viewport.push(viewport_shading_strip(shading_mode, hovered, icons)) }
+    if open_viewport_menu == "speed" { viewport.push(viewport_speed_strip(camera_speed, hovered, icons)) }
+    viewport.push(Widget::panel("viewport-surface").with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_background(Color::rgb(12_u8, 16_u8, 22_u8))
+            .with_padding(Insets::all(0.0_f32)).with_gap(0.0_f32)))
+    let mut viewport_status = Widget::panel("viewport-status").with_direction(horizontal()).with_flex(22.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(17_u8, 17_u8, 20_u8)).with_border(1.0_f32, Color::rgb(41_u8, 42_u8, 47_u8))
+            .with_padding(Insets::symmetric(3.0_f32, 7.0_f32)).with_gap(8.0_f32))
+    viewport_status.push(viewport_status_item(selected,
+        if selected == "Camera" { icons.camera } else { if selected == "Directional Light" { icons.light } else { icons.mesh } },
+        if compact { 104.0_f32 } else { 132.0_f32 }, Color::rgb(91_u8, 166_u8, 209_u8)))
+    viewport_status.push(viewport_status_item(tool_name(active_tool),
+        if active_tool == "move" { icons.move } else { if active_tool == "rotate" { icons.rotate } else {
+            if active_tool == "scale" { icons.scale } else { icons.select }
+        } }, if compact { 64.0_f32 } else { 76.0_f32 }, Color::rgb(182_u8, 144_u8, 73_u8)))
+    if !compact { viewport_status.push(label("Actors " + Debug::fmt(object_count)).with_flex(64.0_f32, 0.0_f32)) }
+    viewport_status.push(Widget::spacer(1.0_f32))
+    viewport_status.push(label(if compact { "RMB Orbit   MMB Pan   Wheel Zoom" } else { "RMB Orbit   MMB Pan   Wheel Zoom   F Focus" })
+        .with_flex(if compact { 198.0_f32 } else { 248.0_f32 }, 0.0_f32))
+    viewport.push(viewport_status)
+    ret viewport
+}
+
+fn viewport_width(layout: WidgetLayout) -> u32 {
+    match layout.find_bounds("viewport-surface") {
+        Option::Some(bounds) => { ret if bounds.width() >= 64.0_f32 { bounds.width() as u32 } else { 64_u32 } }
+        Option::None => { ret 960_u32 }
+    }
+}
+
+fn viewport_height(layout: WidgetLayout) -> u32 {
+    match layout.find_bounds("viewport-surface") {
+        Option::Some(bounds) => { ret if bounds.height() >= 64.0_f32 { bounds.height() as u32 } else { 64_u32 } }
+        Option::None => { ret 540_u32 }
+    }
+}
+
+fn viewport_pixel_x(layout: WidgetLayout, density: f32) -> u32 {
+    match layout.find_bounds("viewport-surface") { Option::Some(bounds) => { ret (bounds.x() * density) as u32 } Option::None => { ret 0_u32 } }
+}
+
+fn viewport_pixel_y(layout: WidgetLayout, density: f32) -> u32 {
+    match layout.find_bounds("viewport-surface") { Option::Some(bounds) => { ret (bounds.y() * density) as u32 } Option::None => { ret 0_u32 } }
+}
+
+fn viewport_point(layout: WidgetLayout, x: f32, y: f32) -> Option[(f32, f32)] {
+    match layout.find_bounds("viewport-surface") {
+        Option::Some(bounds) => {
+            let local_x = x - bounds.x()
+            let local_y = y - bounds.y()
+            if local_x >= 0.0_f32 && local_y >= 0.0_f32 &&
+                local_x < bounds.width() && local_y < bounds.height() {
+                ret Option[(f32, f32)]::Some((local_x, local_y))
+            }
+        }
+        Option::None => {}
+    }
+    ret Option[(f32, f32)]::None
+}
+
+fn gizmo_mode(tool: str) -> u32 {
+    if tool == "move" { ret 1_u32 }
+    if tool == "rotate" { ret 2_u32 }
+    if tool == "scale" { ret 3_u32 }
+    ret 0_u32
+}
+
+fn position_at(positions: Vec[Vec3], cube_index: u32) -> Vec3 {
+    if cube_index == 0_u32 { ret Vec3::zero() }
+    match positions.get((cube_index - 1_u32) as usize) {
+        Option::Some(position) => { ret position }
+        Option::None => { ret Vec3::zero() }
+    }
+}
+
+fn rotation_at(rotations: Vec[Vec3], cube_index: u32) -> Vec3 {
+    if cube_index == 0_u32 { ret Vec3::zero() }
+    match rotations.get((cube_index - 1_u32) as usize) {
+        Option::Some(rotation) => { ret rotation }
+        Option::None => { ret Vec3::zero() }
+    }
+}
+
+fn scale_at(scales: Vec[Vec3], cube_index: u32) -> Vec3 {
+    if cube_index == 0_u32 { ret Vec3::new(1.0_f32, 1.0_f32, 1.0_f32) }
+    match scales.get((cube_index - 1_u32) as usize) {
+        Option::Some(scale) => { ret scale }
+        Option::None => { ret Vec3::new(1.0_f32, 1.0_f32, 1.0_f32) }
+    }
+}
+
+fn create_viewport_renderer(window: Window) -> ViewportRenderer {
+    match ViewportRenderer::create_present(window.platform_handle(), window.surface_width(), window.surface_height()) {
+        Option::Some(renderer) => { ret renderer }
+        Option::None => {
+            panic("Graphene Editor: unable to create Vulkan viewport")
+            ret create_viewport_renderer(window)
+        }
+    }
+}
+
+fn nudge_position(positions: Vec[Vec3], cube_index: u32, dx: f32, dy: f32, dz: f32) -> Vec[Vec3] {
+    let mut result = positions
+    if cube_index == 0_u32 { ret result }
+    let index = (cube_index - 1_u32) as usize
+    match result.get(index) {
+        Option::Some(position) => {
+            result.set(index, Vec3::new(position.x() + dx, position.y() + dy, position.z() + dz))
+        }
+        Option::None => {}
+    }
+    ret result
+}
+
+fn set_position(positions: Vec[Vec3], cube_index: u32, position: Vec3) -> Vec[Vec3] {
+    let mut result = positions
+    if cube_index > 0_u32 && cube_index <= result.len() as u32 {
+        result.set((cube_index - 1_u32) as usize, position)
+    }
+    ret result
+}
+
+fn set_rotation(rotations: Vec[Vec3], cube_index: u32, rotation: Vec3) -> Vec[Vec3] {
+    let mut result = rotations
+    if cube_index > 0_u32 && cube_index <= result.len() as u32 {
+        result.set((cube_index - 1_u32) as usize, rotation)
+    }
+    ret result
+}
+
+fn set_scale(scales: Vec[Vec3], cube_index: u32, scale: Vec3) -> Vec[Vec3] {
+    let mut result = scales
+    if cube_index > 0_u32 && cube_index <= result.len() as u32 {
+        result.set((cube_index - 1_u32) as usize, scale)
+    }
+    ret result
+}
+
+fn remove_vec3_at(values: Vec[Vec3], index: usize) -> Vec[Vec3] {
+    let mut result = Vec[Vec3]::new()
+    let mut current = 0_usize
+    for value in values {
+        if current != index { result.push(value) }
+        current = current + 1_usize
+    }
+    ret result
+}
+
+fn remove_u64_at(values: Vec[u64], index: usize) -> Vec[u64] {
+    let mut result = Vec[u64]::new()
+    let mut current = 0_usize
+    for value in values {
+        if current != index { result.push(value) }
+        current = current + 1_usize
+    }
+    ret result
+}
+
+fn scene_asset(positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3]) -> SceneAsset {
+    let mut asset = SceneAsset::new()
+    let mut index = 0_usize
+    while index < positions.len() {
+        match positions.get(index) {
+            Option::Some(position) => {
+                let rotation = rotation_at(rotations, index as u32 + 1_u32)
+                let scale = scale_at(scales, index as u32 + 1_u32)
+                asset.add(SceneActor::new("Cube " + Debug::fmt(index + 1_usize), "cube",
+                    Transform::identity().with_position(position).with_rotation(rotation).with_scale(scale)))
+            }
+            Option::None => {}
+        }
+        index = index + 1_usize
+    }
+    ret asset
+}
+
+fn save_editor_project(scene_path: str, script_path: str, positions: Vec[Vec3], rotations: Vec[Vec3],
+    scales: Vec[Vec3], code: str) -> bool {
+    let scene_saved = write_file(scene_path, scene_asset(positions, rotations, scales).stringify() + "\n") == 0_i32
+    let script_saved = write_file(script_path, code) == 0_i32
+    ret scene_saved && script_saved
+}
+
+fn detail_row(name: str, value: str, accent: Color) -> Widget {
+    let mut row = Widget::panel("detail-" + name).with_direction(horizontal()).with_flex(27.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(18_u8, 18_u8, 21_u8)).with_border(1.0_f32, Color::rgb(42_u8, 43_u8, 48_u8))
+            .with_padding(Insets::symmetric(3.0_f32, 6.0_f32)).with_gap(5.0_f32))
+    row.push(Widget::panel("").with_flex(2.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(accent).with_pointer_events(false)))
+    row.push(Widget::label(name).with_flex(78.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(147_u8, 150_u8, 157_u8)).with_font_size(9.0_f32).with_pointer_events(false)))
+    row.push(Widget::label(value).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(211_u8, 213_u8, 217_u8)).with_font_size(10.0_f32).with_pointer_events(false)))
+    ret row
+}
+
+fn inspector(selected: str, position: Vec3, rotation: Vec3, scale: Vec3, cube_selected: bool, hovered: str,
+    icons: EditorIcons) -> Widget {
+    let mut panel = Widget::panel("inspector").with_direction(vertical()).with_flex(292.0_f32, 0.0_f32).with_style(panel_style())
+    panel.push(dock_header("DETAILS", selected, 72.0_f32))
+    let mut identity = Widget::panel("object-identity").with_direction(horizontal()).with_flex(38.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(20_u8, 20_u8, 23_u8)).with_border(1.0_f32, Color::rgb(45_u8, 46_u8, 51_u8))
+            .with_padding(Insets::all(4.0_f32)).with_gap(5.0_f32))
+    identity.push(Widget::icon("", if cube_selected { icons.mesh } else { if selected == "Camera" { icons.camera } else { icons.light } })
+        .with_flex(24.0_f32, 0.0_f32).with_style(Style::default().with_background(Color::rgb(28_u8, 50_u8, 64_u8))
+            .with_foreground(Color::rgb(143_u8, 190_u8, 217_u8)).with_radius(2.0_f32).with_padding(Insets::all(4.0_f32)).with_pointer_events(false)))
+    identity.push(Widget::input("entity-name", selected).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_background(Color::rgb(15_u8, 15_u8, 17_u8)).with_foreground(Color::rgb(216_u8, 217_u8, 221_u8))
+            .with_border(1.0_f32, Color::rgb(48_u8, 49_u8, 54_u8)).with_radius(2.0_f32).with_padding(Insets::symmetric(4.0_f32, 7.0_f32))))
+    identity.push(Widget::label(if cube_selected { "ACTOR" } else { "SCENE" }).with_flex(42.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(34_u8, 61_u8, 78_u8)).with_foreground(Color::rgb(167_u8, 207_u8, 229_u8))
+            .with_border(1.0_f32, Color::rgb(43_u8, 82_u8, 105_u8)).with_radius(2.0_f32).with_padding(Insets::symmetric(3.0_f32, 5.0_f32))
+            .with_font_size(8.0_f32).with_font_weight(700_u32).with_pointer_events(false)))
+    panel.push(identity)
+    panel.push(section_title("TRANSFORM"))
+    panel.push(transform_property("Location", position))
+    let mut location_tools = Widget::panel("location-tools").with_direction(horizontal()).with_flex(32.0_f32, 0.0_f32)
+        .with_style(Style::default().with_gap(4.0_f32))
+    location_tools.push(axis_stepper("X", "move-x-minus", "move-x-plus", icons, hovered, !cube_selected))
+    location_tools.push(axis_stepper("Y", "move-y-minus", "move-y-plus", icons, hovered, !cube_selected))
+    location_tools.push(axis_stepper("Z", "move-z-minus", "move-z-plus", icons, hovered, !cube_selected))
+    panel.push(location_tools)
+    panel.push(transform_property("Rotation", rotation))
+    panel.push(transform_property("Scale", scale))
+    panel.push(Widget::separator())
+    panel.push(section_title("STATIC MESH"))
+    let has_mesh = selected.slice(0_usize, if selected.char_len() < 4_usize { selected.char_len() } else { 4_usize }) == "Cube"
+    let mut mesh = Widget::panel("mesh-component").with_direction(vertical()).with_flex(72.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(19_u8, 19_u8, 22_u8)).with_border(1.0_f32, Color::rgb(45_u8, 46_u8, 51_u8))
+            .with_radius(1.0_f32).with_padding(Insets::all(5.0_f32)).with_gap(3.0_f32))
+    mesh.push(detail_row("Static Mesh", if has_mesh { "Cube" } else { "None" }, Color::rgb(83_u8, 143_u8, 178_u8)))
+    mesh.push(detail_row("Material", if has_mesh { "Graphene Default" } else { "None" }, Color::rgb(180_u8, 132_u8, 63_u8)))
+    panel.push(mesh)
+    panel.push(Widget::spacer(1.0_f32))
+    ret panel
+}
+
+fn asset_tile(id: str, name: str, kind: str, icon: SvgDocument, accent: Color, active: bool, hovered: str) -> Widget {
+    let background = if active { Color::rgb(32_u8, 52_u8, 65_u8) } else {
+        interactive_background(hovered == id)
+    }
+    let border = if active { Color::rgb(49_u8, 112_u8, 151_u8) } else {
+        interactive_border(hovered == id)
+    }
+    let mut tile = Widget::panel(id).with_direction(vertical()).with_flex(80.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(background).with_border(1.0_f32, border).with_radius(2.0_f32)
+            .with_padding(Insets::all(4.0_f32)).with_gap(1.0_f32))
+    tile.push(Widget::panel("").with_flex(2.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(if active { theme_accent() } else { background }).with_radius(1.0_f32)
+            .with_pointer_events(false)))
+    tile.push(Widget::icon("", icon).with_flex(48.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(if active { Color::rgb(22_u8, 32_u8, 39_u8) } else { Color::rgb(20_u8, 20_u8, 23_u8) }).with_foreground(accent)
+            .with_radius(1.0_f32).with_padding(Insets::all(10.0_f32)).with_pointer_events(false)))
+    tile.push(Widget::label(name).with_flex(18.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(218_u8, 220_u8, 224_u8)).with_font_size(9.0_f32)
+            .with_font_weight(500_u32).with_pointer_events(false)))
+    tile.push(Widget::label(kind).with_flex(15.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(132_u8, 135_u8, 143_u8)).with_font_size(8.0_f32)
+            .with_pointer_events(false)))
+    ret tile
+}
+
+fn content_browser(dragging: bool, selected_asset: str, hovered: str, icons: EditorIcons) -> Widget {
+    let mut panel = Widget::panel("content-browser").with_direction(vertical()).with_flex(270.0_f32, 0.0_f32).with_style(panel_style())
+    let mut tabs = Widget::panel("content-tabs").with_direction(horizontal()).with_flex(26.0_f32, 0.0_f32).with_style(
+        Style::default().with_gap(2.0_f32))
+    tabs.push(dock_tab("content-tab", "Content Browser", true))
+    tabs.push(Widget::spacer(1.0_f32))
+    tabs.push(dock_badge("3 ASSETS", 64.0_f32))
+    panel.push(tabs)
+    let mut path = Widget::panel("content-path").with_direction(horizontal()).with_flex(28.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(19_u8, 19_u8, 22_u8)).with_border(1.0_f32, Color::rgb(43_u8, 44_u8, 48_u8))
+            .with_padding(Insets::symmetric(3.0_f32, 5.0_f32)).with_gap(4.0_f32))
+    path.push(Widget::icon_button("content-add", "Add", icons.add).with_flex(54.0_f32, 0.0_f32)
+        .with_style(compact_icon_style(hovered == "content-add")))
+    path.push(Widget::icon("content-folder", icons.folder).with_flex(17.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(197_u8, 157_u8, 72_u8)).with_padding(Insets::all(2.0_f32)).with_pointer_events(false)))
+    path.push(Widget::label("Content").with_flex(48.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(202_u8, 204_u8, 209_u8)).with_font_size(10.0_f32).with_pointer_events(false)))
+    path.push(Widget::icon("content-path-chevron", icons.chevron).with_flex(14.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(116_u8, 119_u8, 126_u8)).with_padding(Insets::all(2.0_f32)).with_pointer_events(false)))
+    path.push(Widget::label("Game").with_flex(36.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(154_u8, 157_u8, 164_u8)).with_font_size(10.0_f32).with_pointer_events(false)))
+    path.push(Widget::spacer(1.0_f32))
+    panel.push(path)
+    panel.push(search_field("asset-search", "Search assets", icons.search, 30.0_f32, 0.0_f32))
+    let mut assets = Widget::panel("asset-grid").with_direction(horizontal()).with_flex(94.0_f32, 0.0_f32).with_style(
+        Style::default().with_gap(5.0_f32).with_padding(Insets::symmetric(3.0_f32, 0.0_f32)))
+    assets.push(asset_tile("asset-cube", if dragging { "Moving..." } else { "Cube" }, "Static Mesh", icons.mesh,
+        Color::rgb(145_u8, 179_u8, 201_u8), selected_asset == "asset-cube", hovered))
+    assets.push(asset_tile("asset-material", "Default", "Material", icons.material,
+        Color::rgb(193_u8, 145_u8, 75_u8), selected_asset == "asset-material", hovered))
+    assets.push(asset_tile("asset-script", "Player", "Encore Script", icons.script,
+        Color::rgb(80_u8, 157_u8, 208_u8), selected_asset == "asset-script", hovered))
+    panel.push(assets)
+    panel.push(Widget::spacer(1.0_f32))
+    ret panel
+}
+
+fn code_line_numbers(text: str) -> str {
+    let mut result = "1"
+    let mut line = 1_usize
+    let mut index = 0_usize
+    while index < text.char_len() {
+        match text.get(index) {
+            Option::Some(character) => {
+                if character == "\n" && index + 1_usize < text.char_len() {
+                    line = line + 1_usize
+                    result = result + "\n" + Debug::fmt(line)
+                }
+            }
+            Option::None => {}
+        }
+        index = index + 1_usize
+    }
+    ret result
+}
+
+fn code_cursor_location(text: str, cursor: usize) -> (usize, usize) {
+    let mut line = 1_usize
+    let mut column = 1_usize
+    let mut index = 0_usize
+    while index < cursor && index < text.char_len() {
+        match text.get(index) {
+            Option::Some(character) => {
+                if character == "\n" { line = line + 1_usize column = 1_usize }
+                else { column = column + 1_usize }
+            }
+            Option::None => {}
+        }
+        index = index + 1_usize
+    }
+    ret (line, column)
+}
+
+fn code_panel(editor: TextEditor, focused: bool, icons: EditorIcons) -> Widget {
+    let mut panel = Widget::panel("code-panel").with_direction(vertical()).with_flex(0.0_f32, 1.0_f32).with_style(
+        panel_style().with_overflow_hidden(true))
+    let mut tabs = Widget::panel("code-tabs").with_direction(horizontal()).with_flex(28.0_f32, 0.0_f32).with_style(Style::default().with_gap(6.0_f32))
+    tabs.push(active_icon_tab("code-tab", "player_controller.enq", icons.script, 176.0_f32))
+    tabs.push(Widget::spacer(1.0_f32))
+    tabs.push(dock_badge(if focused { "EDITING" } else { "ENCORE" }, 58.0_f32))
+    panel.push(tabs)
+    let mut editor_surface = Widget::panel("code-surface").with_direction(horizontal()).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_background(Color::rgb(13_u8, 13_u8, 15_u8)).with_border(1.0_f32,
+            if focused { Color::rgb(31_u8, 116_u8, 170_u8) } else { Color::rgb(43_u8, 44_u8, 49_u8) })
+            .with_gap(0.0_f32).with_overflow_hidden(true))
+    editor_surface.push(Widget::textarea("", code_line_numbers(editor.value())).with_flex(34.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(18_u8, 18_u8, 21_u8)).with_foreground(Color::rgb(92_u8, 96_u8, 104_u8))
+            .with_border(1.0_f32, Color::rgb(38_u8, 39_u8, 44_u8)).with_padding(Insets::symmetric(9.0_f32, 5.0_f32))
+            .with_font_family("Roboto Mono").with_font_size(11.0_f32).with_text_align(text_end())
+            .with_overflow_hidden(true).with_pointer_events(false)))
+    editor_surface.push(Widget::textarea("code-editor", editor.value()).with_focus(focused)
+        .with_selection(editor.selection_start(), editor.selection_end()).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_background(Color::rgb(13_u8, 13_u8, 15_u8)).with_foreground(Color::rgb(214_u8, 215_u8, 220_u8))
+            .with_border(0.0_f32, Color::rgb(0_u8, 0_u8, 0_u8)).with_radius(0.0_f32)
+            .with_padding(Insets::all(9.0_f32)).with_font_family("Roboto Mono").with_font_size(11.0_f32)))
+    panel.push(editor_surface)
+    let location = code_cursor_location(editor.value(), editor.cursor())
+    let mut editor_status = Widget::panel("code-status").with_direction(horizontal()).with_flex(20.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(19_u8, 19_u8, 22_u8)).with_border(1.0_f32, Color::rgb(41_u8, 42_u8, 47_u8))
+            .with_padding(Insets::symmetric(2.0_f32, 6.0_f32)).with_gap(10.0_f32))
+    editor_status.push(Widget::label("Ln " + Debug::fmt(location.0) + ", Col " + Debug::fmt(location.1)).with_flex(92.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(142_u8, 145_u8, 152_u8))
+            .with_font_family("Roboto Mono").with_font_size(9.0_f32).with_pointer_events(false)))
+    editor_status.push(Widget::spacer(1.0_f32))
+    editor_status.push(Widget::label("Spaces: 4   UTF-8   LF").with_flex(120.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(121_u8, 124_u8, 131_u8))
+            .with_font_family("Roboto Mono").with_font_size(9.0_f32).with_pointer_events(false)))
+    panel.push(editor_status)
+    ret panel
+}
+
+fn tooltip_text(target: str) -> str {
+    if target == "save" { ret "Save level (Ctrl+S)" }
+    if target == "undo" { ret "Undo (Ctrl+Z)" }
+    if target == "redo" { ret "Redo (Ctrl+Shift+Z)" }
+    if target == "duplicate" { ret "Duplicate selected actor" }
+    if target == "delete" { ret "Delete selected actor" }
+    if target == "build-game" { ret "Build gameplay project" }
+    if target == "play" { ret "Play in editor" }
+    if target == "stop" { ret "Stop simulation" }
+    if target == "simulate" { ret "Simulate world" }
+    if target == "viewport-camera" { ret "Perspective camera" }
+    if target == "viewport-lit" { ret "Lit view mode" }
+    if target == "viewport-speed" { ret "Camera movement speed" }
+    if target == "grid-toggle" { ret "Toggle editor grid" }
+    if target == "snap-toggle" { ret "Toggle 10 degree rotation snapping" }
+    if target == "tool-select" { ret "Select tool (Q)" }
+    if target == "tool-move" { ret "Move tool (W)" }
+    if target == "tool-rotate" { ret "Rotate tool (E)" }
+    if target == "tool-scale" { ret "Scale tool (R)" }
+    if target == "outliner-add" { ret "Add actor" }
+    if target == "outliner-settings" { ret "Outliner settings" }
+    if target == "content-add" { ret "Add or import content" }
+    ret ""
+}
+
+fn tooltip(text: str, pointer_x: f32, pointer_y: f32, view_width: f32, view_height: f32) -> Widget {
+    let left = if pointer_x + 192.0_f32 > view_width { pointer_x - 190.0_f32 } else { pointer_x + 12.0_f32 }
+    let top = if pointer_y + 44.0_f32 > view_height { pointer_y - 34.0_f32 } else { pointer_y + 18.0_f32 }
+    ret Widget::label(text).with_flex(180.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(24_u8, 24_u8, 27_u8)).with_foreground(Color::rgb(224_u8, 225_u8, 229_u8))
+            .with_border(1.0_f32, Color::rgb(68_u8, 70_u8, 76_u8)).with_radius(2.0_f32)
+            .with_padding(Insets::symmetric(5.0_f32, 8.0_f32)).with_font_size(10.0_f32)
+            .with_width(180.0_f32).with_height(26.0_f32).with_absolute(true).with_left(left).with_top(top)
+            .with_z_index(100_i32).with_pointer_events(false))
+}
+
+fn editor_view(simulating: bool, selected: str, selected_position: Vec3, selected_rotation: Vec3, selected_scale: Vec3,
+    selected_cube: u32, dragging: bool, selected_asset: str, object_count: u32, code_editor: TextEditor,
+    code_focused: bool, status_message: str,
+    project_dirty: bool, active_tool: str, camera_mode: str, shading_mode: str, camera_speed: str,
+    grid_visible: bool, rotation_snap: bool,
+    can_undo: bool, can_redo: bool,
+    building: bool, build_output: str, hovered: str,
+    pointer_x: f32, pointer_y: f32, compact: bool, open_menu: str, show_outliner: bool, show_details: bool,
+    show_content: bool, open_viewport_menu: str, project_root: str, project_dialog_mode: str,
+    project_path_editor: TextEditor, project_path_focused: bool, project_error: str,
+    view_width: f32, view_height: f32, icons: EditorIcons) -> Widget {
+    let mut root = Widget::panel("root").with_direction(vertical()).with_style(
+        Style::default().with_background(Color::rgb(13_u8, 13_u8, 15_u8)).with_foreground(Color::rgb(202_u8, 204_u8, 209_u8))
+            .with_font_family("Roboto").with_font_size(11.0_f32).with_gap(1.0_f32))
+    let mut menu = Widget::panel("menu-bar").with_direction(horizontal()).with_flex(25.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(15_u8, 15_u8, 17_u8)).with_border(1.0_f32, Color::rgb(38_u8, 39_u8, 43_u8))
+            .with_padding(Insets::symmetric(3.0_f32, 8.0_f32)).with_gap(8.0_f32))
+    menu.push(Widget::icon("graphene-mark", icons.brand).with_flex(18.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(42_u8, 147_u8, 210_u8)).with_padding(Insets::all(2.0_f32))))
+    menu.push(Widget::label("GRAPHENE").with_flex(72.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(232_u8, 233_u8, 236_u8)).with_font_size(10.0_f32).with_font_weight(700_u32)))
+    menu.push(menu_item("menu-file", "File", if open_menu == "menu-file" { "menu-file" } else { hovered }))
+    menu.push(menu_item("menu-edit", "Edit", if open_menu == "menu-edit" { "menu-edit" } else { hovered }))
+    menu.push(menu_item("menu-window", "Window", if open_menu == "menu-window" { "menu-window" } else { hovered }))
+    menu.push(menu_item("menu-tools", "Tools", if open_menu == "menu-tools" { "menu-tools" } else { hovered }))
+    menu.push(menu_item("menu-help", "Help", if open_menu == "menu-help" { "menu-help" } else { hovered }))
+    menu.push(Widget::spacer(1.0_f32))
+    menu.push(Widget::label(project_root + " / scene.graphene.json").with_flex(280.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(137_u8, 140_u8, 147_u8)).with_font_size(10.0_f32)))
+    root.push(menu)
+    let mut toolbar = Widget::panel("toolbar").with_direction(horizontal()).with_flex(42.0_f32, 0.0_f32).with_style(
+        panel_style().with_background(Color::rgb(21_u8, 21_u8, 24_u8)).with_padding(Insets::symmetric(4.0_f32, 7.0_f32)).with_gap(5.0_f32))
+    let mut history_tools = toolbar_action_group(104.0_f32)
+    history_tools.push(Widget::icon_button("save", "", icons.save).with_flex(33.0_f32, 1.0_f32)
+        .with_disabled(!project_dirty || simulating).with_style(segmented_icon_style(false, hovered == "save")))
+    history_tools.push(Widget::icon_button("undo", "", icons.undo).with_flex(33.0_f32, 1.0_f32).with_disabled(!can_undo)
+        .with_style(segmented_icon_style(false, hovered == "undo")))
+    history_tools.push(Widget::icon_button("redo", "", icons.redo).with_flex(33.0_f32, 1.0_f32).with_disabled(!can_redo)
+        .with_style(segmented_icon_style(false, hovered == "redo")))
+    toolbar.push(history_tools)
+    toolbar.push(toolbar_divider())
+    let mut actor_tools = toolbar_action_group(69.0_f32)
+    actor_tools.push(Widget::icon_button("duplicate", "", icons.duplicate).with_flex(33.0_f32, 1.0_f32)
+        .with_disabled(selected_cube == 0_u32 || simulating).with_style(segmented_icon_style(false, hovered == "duplicate")))
+    actor_tools.push(Widget::icon_button("delete", "", icons.delete).with_flex(33.0_f32, 1.0_f32)
+        .with_disabled(selected_cube == 0_u32 || simulating).with_style(segmented_icon_style(false, hovered == "delete")))
+    toolbar.push(actor_tools)
+    toolbar.push(toolbar_divider())
+    toolbar.push(Widget::icon_button("build-game", if building { "Building..." } else { "Build" }, icons.build)
+        .with_flex(88.0_f32, 0.0_f32).with_disabled(building || simulating).with_style(build_style(building, hovered == "build-game")))
+    toolbar.push(Widget::spacer(1.0_f32))
+    toolbar.push(Widget::icon_button(if simulating { "stop" } else { "play" }, if simulating { "Stop" } else { "Play" }, icons.play)
+        .with_flex(76.0_f32, 0.0_f32).with_style(play_style(simulating, hovered == if simulating { "stop" } else { "play" })))
+    toolbar.push(Widget::icon_button("simulate", "Simulate", icons.play).with_flex(88.0_f32, 0.0_f32)
+        .with_style(play_style(false, hovered == "simulate")))
+    toolbar.push(Widget::spacer(1.0_f32))
+    toolbar.push(Widget::label("Linux  |  Vulkan").with_flex(94.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(29_u8, 30_u8, 34_u8)).with_foreground(Color::rgb(164_u8, 167_u8, 174_u8))
+            .with_border(1.0_f32, Color::rgb(46_u8, 47_u8, 52_u8)).with_radius(2.0_f32)
+            .with_padding(Insets::symmetric(4.0_f32, 7.0_f32)).with_font_size(10.0_f32)))
+    root.push(toolbar)
+
+    let mut workspace_tabs = Widget::panel("workspace-tabs").with_direction(horizontal()).with_flex(28.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(16_u8, 16_u8, 19_u8)).with_border(1.0_f32, Color::rgb(39_u8, 40_u8, 45_u8))
+            .with_padding(Insets::symmetric(2.0_f32, 6.0_f32)).with_gap(4.0_f32))
+    workspace_tabs.push(active_icon_tab("level-tab", "scene.graphene.json" + if project_dirty { "  *" } else { "" },
+        icons.level, 196.0_f32))
+    workspace_tabs.push(Widget::spacer(1.0_f32))
+    workspace_tabs.push(Widget::label("LEVEL EDITOR").with_flex(78.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(105_u8, 108_u8, 115_u8)).with_font_size(8.0_f32).with_font_weight(700_u32)
+            .with_pointer_events(false)))
+    root.push(workspace_tabs)
+
+    let mut upper = Widget::panel("upper").with_direction(horizontal()).with_flex(0.0_f32, 4.0_f32).with_style(Style::default().with_gap(1.0_f32))
+    if show_outliner { upper.push(hierarchy(selected, object_count, hovered, icons)) }
+    upper.push(viewport(simulating, dragging, object_count, selected, active_tool, camera_mode, shading_mode, camera_speed, grid_visible,
+        rotation_snap, open_viewport_menu, hovered, compact, icons))
+    if show_details { upper.push(inspector(selected, selected_position, selected_rotation, selected_scale, selected_cube > 0_u32, hovered, icons)) }
+    root.push(upper)
+
+    let mut lower = Widget::panel("lower").with_direction(horizontal()).with_flex(0.0_f32, 1.55_f32).with_style(Style::default().with_gap(1.0_f32))
+    if show_content { lower.push(content_browser(dragging, selected_asset, hovered, icons)) }
+    lower.push(code_panel(code_editor, code_focused, icons))
+    lower.push(output_panel(simulating, building, status_message, build_output, icons))
+    root.push(lower)
+
+    let mut status = Widget::panel("status").with_direction(horizontal()).with_flex(23.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(18_u8, 18_u8, 21_u8)).with_border(1.0_f32, Color::rgb(42_u8, 43_u8, 47_u8))
+            .with_padding(Insets::symmetric(3.0_f32, 8.0_f32)))
+    status.push(status_segment(if building { "BUILDING" } else { if simulating { "SIMULATING" } else { "READY" } },
+        if building { icons.build } else { if simulating { icons.play } else { icons.clean } },
+        if building { Color::rgb(205_u8, 154_u8, 70_u8) } else {
+            if simulating { Color::rgb(81_u8, 181_u8, 113_u8) } else { Color::rgb(81_u8, 157_u8, 203_u8) }
+        }, 92.0_f32, building || simulating))
+    status.push(Widget::label(status_message).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(163_u8, 166_u8, 173_u8)).with_font_size(10.0_f32)))
+    status.push(Widget::spacer(1.0_f32))
+    status.push(status_segment(if project_dirty { "Unsaved" } else { "Saved" }, if project_dirty { icons.save } else { icons.clean },
+        if project_dirty { Color::rgb(209_u8, 157_u8, 72_u8) } else { Color::rgb(79_u8, 169_u8, 106_u8) }, 82.0_f32, false))
+    status.push(status_segment("Source Control", icons.branch, Color::rgb(132_u8, 164_u8, 185_u8), 108.0_f32, false))
+    status.push(status_segment("Vulkan", icons.processor, Color::rgb(99_u8, 166_u8, 207_u8), 72.0_f32, false))
+    status.push(status_segment("Shaders 2", icons.storage, Color::rgb(155_u8, 158_u8, 165_u8), 78.0_f32, false))
+    status.push(label("Actors " + Debug::fmt(object_count)).with_flex(68.0_f32, 0.0_f32))
+    root.push(status)
+    if open_menu != "" {
+        root.push(menu_popup(open_menu, hovered, project_dirty, can_undo, can_redo, selected_cube, simulating, building,
+            show_outliner, show_details, show_content, icons))
+    }
+    if project_dialog_mode != "" {
+        root.push(project_dialog(project_dialog_mode, project_path_editor, project_path_focused, project_error, view_width, view_height))
+    }
+    let hint = tooltip_text(hovered)
+    if hint != "" { root.push(tooltip(hint, pointer_x, pointer_y, view_width, view_height)) }
+    ret root
+}
+
+fn main() -> u32 {
+    let window = Window::create_gpu_surface("Graphene Editor", 1440_u32, 900_u32)
+        .with_background(Color::rgb(13_u8, 13_u8, 15_u8))
+    if !window.available() {
+        println("Graphene Editor: unable to create " + backend_name() + " window: " + backend_error())
+        ret 1_u32
+    }
+    let mut font_manager = FontManager::with_bundled("../../encore-ui/assets/fonts")
+    font_manager.register_all(window)
+    font_manager = font_manager.activate(window, "Roboto", 12.0_f32, 400_u32)
+    if font_manager.error() != "" {
+        println("Graphene Editor: unable to activate Roboto: " + font_manager.error())
+    }
+    let icon_manager = IconManager::with_bundled("../../encore-ui/assets/icons")
+    let icons = EditorIcons::load(icon_manager)
+    let mut simulating = env("GRAPHENE_AUTOPLAY").is_some()
+    let mut selected = "Cube 1"
+    let mut selected_cube = 1_u32
+    let mut dragging = false
+    let mut selected_asset = match env("GRAPHENE_SELECTED_ASSET") {
+        Option::Some(name) => {
+            if name == "material" { "asset-material" } elif name == "script" { "asset-script" } else { "asset-cube" }
+        }
+        Option::None => { "asset-cube" }
+    }
+    let mut project_root = match env("GRAPHENE_PROJECT") {
+        Option::Some(path) => { trim_trailing_separator(path) }
+        Option::None => { cwd() }
+    }
+    let mut paths = project_paths(project_root)
+    let mut scene_path = paths.scene
+    let mut status_message = "New unsaved scene"
+    let mut editor_scene = Scene::new()
+    editor_scene.create_entity("Camera", Transform::identity().with_position(Vec3::new(0.0_f32, 2.0_f32, 6.0_f32)))
+    editor_scene.create_entity("Directional Light", Transform::identity().with_rotation(Vec3::new(-0.7_f32, -0.4_f32, 0.0_f32)))
+    let mut cube_entities = Vec[u64]::new()
+    let mut cube_positions = Vec[Vec3]::new()
+    let mut cube_rotations = Vec[Vec3]::new()
+    let mut cube_scales = Vec[Vec3]::new()
+    let mut render_rotations = Vec[Vec3]::new()
+    if file_exists(scene_path) {
+        match SceneAsset::parse(read_file(scene_path)) {
+            Option::Some(asset) => {
+                let mut actor_index = 0_usize
+                while actor_index < asset.len() {
+                    match asset.actor(actor_index) {
+                        Option::Some(actor) => {
+                            if actor.kind() == "cube" {
+                                let transform = actor.transform()
+                                let entity = editor_scene.create_entity("Cube " + Debug::fmt(cube_entities.len() + 1_usize), transform)
+                                editor_scene.set_renderable(entity,
+                                    Option[Renderable]::Some(Renderable::new(MeshId::new(1_u64), MaterialId::new(1_u64))))
+                                cube_entities.push(entity)
+                                cube_positions.push(transform.position())
+                                cube_rotations.push(transform.rotation())
+                                cube_scales.push(transform.scale())
+                                render_rotations.push(transform.rotation())
+                            }
+                        }
+                        Option::None => {}
+                    }
+                    actor_index = actor_index + 1_usize
+                }
+                status_message = "Loaded " + scene_path
+            }
+            Option::None => { status_message = "Unable to parse " + scene_path }
+        }
+    }
+    if cube_entities.len() == 0_usize {
+        let first_cube = editor_scene.create_entity("Cube 1", Transform::identity())
+        editor_scene.set_renderable(first_cube,
+            Option[Renderable]::Some(Renderable::new(MeshId::new(1_u64), MaterialId::new(1_u64))))
+        cube_entities.push(first_cube)
+        cube_positions.push(Vec3::zero())
+        cube_rotations.push(Vec3::zero())
+        cube_scales.push(Vec3::new(1.0_f32, 1.0_f32, 1.0_f32))
+        render_rotations.push(Vec3::zero())
+    }
+    let mut object_count = cube_entities.len() as u32
+    let mut simulation_started = perf_counter_ms()
+    let mut code_focused = false
+    let mut active_tool = "move"
+    let mut camera_mode = match env("GRAPHENE_CAMERA_MODE") {
+        Option::Some(mode) => {
+            if mode == "top" || mode == "front" || mode == "right" { mode } else { "perspective" }
+        }
+        Option::None => { "perspective" }
+    }
+    let mut shading_mode = match env("GRAPHENE_SHADING_MODE") {
+        Option::Some(mode) => { if mode == "unlit" { "unlit" } else { "lit" } }
+        Option::None => { "lit" }
+    }
+    let mut camera_speed = match env("GRAPHENE_CAMERA_SPEED") {
+        Option::Some(mode) => {
+            if mode == "0.25" || mode == "0.5" || mode == "2" || mode == "4" { mode } else { "1" }
+        }
+        Option::None => { "1" }
+    }
+    let mut grid_visible = match env("GRAPHENE_GRID_VISIBLE") {
+        Option::Some(value) => { value != "0" && value != "false" }
+        Option::None => { true }
+    }
+    let mut rotation_snap = match env("GRAPHENE_ROTATION_SNAP") {
+        Option::Some(value) => { value != "0" && value != "false" }
+        Option::None => { true }
+    }
+    let mut undo_stack = Vec[TransformEdit]::new()
+    let mut redo_stack = Vec[TransformEdit]::new()
+    let mut transform_editing = false
+    let mut edit_start_position = Vec3::zero()
+    let mut edit_start_rotation = Vec3::zero()
+    let mut edit_start_scale = Vec3::new(1.0_f32, 1.0_f32, 1.0_f32)
+    let mut script_path = paths.script
+    let mut game_manifest = paths.manifest
+    let mut build_log_path = paths.build_log
+    let mut build_completion_path = paths.build_completion
+    let compiler = match env("ENCORE_COMPILER") {
+        Option::Some(path) => { path }
+        Option::None => { "encore" }
+    }
+    let default_code = "fn main() -> u32 {\n    ret 0_u32\n}\n"
+    let mut code_editor = TextEditor::new(if file_exists(script_path) { read_file(script_path) } else { default_code })
+    let mut project_dirty = !file_exists(scene_path) || !file_exists(script_path)
+    let mut building = false
+    let mut build_output = "Gameplay project has not been built"
+    let mut build_handle = Option[JoinHandle[i32]]::None
+    let mut autobuild_pending = env("GRAPHENE_AUTOBUILD").is_some()
+    let mut hovered = match env("GRAPHENE_HOVER_TARGET") {
+        Option::Some(target) => { target }
+        Option::None => { "" }
+    }
+    let mut pointer_x = 0.0_f32
+    let mut pointer_y = 0.0_f32
+    let mut compact = window.surface_width() < 1200_u32
+    let mut open_menu = match env("GRAPHENE_OPEN_MENU") {
+        Option::Some(name) => {
+            if name == "file" || name == "edit" || name == "window" || name == "tools" || name == "help" { "menu-" + name }
+            else { "" }
+        }
+        Option::None => { "" }
+    }
+    let mut show_outliner = true
+    let mut show_details = true
+    let mut show_content = true
+    let mut open_viewport_menu = match env("GRAPHENE_OPEN_VIEWPORT_MENU") {
+        Option::Some(menu) => { if menu == "camera" || menu == "shading" || menu == "speed" { menu } else { "" } }
+        Option::None => { "" }
+    }
+    let mut project_dialog_mode = ""
+    let mut project_path_editor = TextEditor::new(project_root)
+    let mut project_path_focused = false
+    let mut project_error = ""
+    let mut layout = window.layout(editor_view(simulating, selected, position_at(cube_positions, selected_cube),
+        rotation_at(render_rotations, selected_cube), scale_at(cube_scales, selected_cube), selected_cube, dragging,
+        selected_asset, object_count, code_editor, code_focused, status_message, project_dirty, active_tool, camera_mode,
+        shading_mode, camera_speed, grid_visible, rotation_snap,
+        false, false, building, build_output, hovered,
+        pointer_x, pointer_y, compact, open_menu, show_outliner, show_details, show_content,
+        open_viewport_menu, project_root, project_dialog_mode, project_path_editor, project_path_focused, project_error,
+        window.surface_width() as f32, window.surface_height() as f32, icons))
+    let mut render_width = viewport_width(layout)
+    let mut render_height = viewport_height(layout)
+    let mut viewport_renderer = create_viewport_renderer(window)
+    let mut camera_yaw = if camera_mode == "front" { 1.5707963_f32 } else {
+        if camera_mode == "perspective" { 0.64_f32 } else { 0.0_f32 }
+    }
+    let mut camera_pitch = if camera_mode == "top" { 1.35_f32 } else {
+        if camera_mode == "perspective" { 0.42_f32 } else { 0.0_f32 }
+    }
+    let mut camera_distance = 5.7_f32
+    let mut camera_target = Vec3::zero()
+    let mut viewport_focused = false
+    let mut orbiting = false
+    let mut panning = false
+    let mut orbit_x = 0.0_f32
+    let mut orbit_y = 0.0_f32
+    let mut moving_cube = false
+    let mut move_offset = Vec3::zero()
+    let mut rotate_drag_y = 0.0_f32
+    let profiling = env("GRAPHENE_PROFILE").is_some()
+    let mut profile_frames = 0_u64
+    let mut profile_render_ms = 0_u64
+    let mut profile_ui_ms = 0_u64
+    let mut layout_cached = window.cache_layout(layout)
+    if !layout_cached { println("Graphene Editor: unable to cache UI layout: " + backend_error()) }
+    let mut first_frame_drawn = false
+    viewport_renderer.set_shading_mode(if shading_mode == "unlit" { 1_u32 } else { 0_u32 })
+    viewport_renderer.set_grid_visible(grid_visible)
+    viewport_renderer.set_gizmo_mode(gizmo_mode(active_tool))
+    viewport_renderer.sync_cubes(object_count)
+    viewport_renderer.select_cube(selected_cube)
+    viewport_renderer.sync_cube_transforms_scaled(cube_positions, render_rotations, cube_scales)
+    let ui_drawn = if layout_cached { window.draw_cached_layout() } else { window.draw_layout(layout) }
+    let density = window.pixel_density()
+    if ui_drawn {
+        first_frame_drawn = viewport_renderer.render_editor_at(camera_yaw, camera_pitch, camera_distance, camera_target,
+            window.surface_pixels(), window.surface_width(), window.surface_height(), window.surface_pitch(),
+            viewport_pixel_x(layout, density), viewport_pixel_y(layout, density),
+            ((render_width as f32) * density) as u32, ((render_height as f32) * density) as u32)
+    }
+    if !first_frame_drawn {
+        println("Graphene Editor: unable to draw first frame using " + backend_name() + ": " + backend_error())
+        window.destroy()
+        ret 2_u32
+    }
+    let mut redraw_pending = false
+    while window.is_open() {
+        let event = window.poll()
+        if event.kind() == event_close() { break }
+        let mut dirty = event.kind() == event_resize() || redraw_pending
+        let mut layout_dirty = dirty
+        let mut viewport_only = false
+        let mut request_undo = false
+        let mut request_redo = false
+        let mut request_duplicate = false
+        let mut request_delete = false
+        let mut request_save = false
+        let mut request_build = autobuild_pending
+        let mut request_exit = false
+        autobuild_pending = false
+        redraw_pending = false
+        if event.kind() == event_pointer_move() {
+            pointer_x = event.x()
+            pointer_y = event.y()
+            let next_hovered = layout.hit(event.x(), event.y())
+            if next_hovered != hovered {
+                hovered = next_hovered
+                dirty = true
+            }
+        }
+        if building && file_exists(build_completion_path) {
+            match build_handle {
+                Option::Some(handle) => {
+                    let code = handle.join()
+                    build_output = if code == 0_i32 { "Gameplay build succeeded" }
+                        else { "Gameplay build failed; see " + build_log_path }
+                    status_message = build_output
+                }
+                Option::None => { build_output = "Gameplay build worker was lost" }
+            }
+            build_handle = Option[JoinHandle[i32]]::None
+            building = false
+            remove_file(build_completion_path)
+            dirty = true
+        }
+        if event.kind() == event_pointer_down() {
+            let target = layout.hit(event.x(), event.y())
+            let viewport_location = viewport_point(layout, event.x(), event.y())
+            viewport_focused = viewport_location.is_some() && project_dialog_mode == ""
+            if target == "project-path" { project_path_focused = true code_focused = false dirty = true }
+            elif target == "project-cancel" {
+                project_dialog_mode = "" project_path_focused = false project_error = "" dirty = true
+            }
+            elif target == "project-confirm" {
+                let requested_root = trim_trailing_separator(project_path_editor.value())
+                let requested_paths = project_paths(requested_root)
+                let ready = if project_dialog_mode == "new" { create_project(requested_root) } else { project_valid(requested_paths) }
+                if ready {
+                    match load_project(requested_paths) {
+                        Option::Some(contents) => {
+                            while object_count > 0_u32 { viewport_renderer.remove_cube(1_u32) object_count = object_count - 1_u32 }
+                            project_root = requested_root
+                            paths = requested_paths
+                            scene_path = paths.scene
+                            script_path = paths.script
+                            game_manifest = paths.manifest
+                            build_log_path = paths.build_log
+                            build_completion_path = paths.build_completion
+                            cube_positions = contents.positions
+                            cube_rotations = contents.rotations
+                            cube_scales = contents.scales
+                            render_rotations = cube_rotations
+                            editor_scene = Scene::new()
+                            editor_scene.create_entity("Camera", Transform::identity().with_position(Vec3::new(0.0_f32, 2.0_f32, 6.0_f32)))
+                            editor_scene.create_entity("Directional Light", Transform::identity().with_rotation(Vec3::new(-0.7_f32, -0.4_f32, 0.0_f32)))
+                            cube_entities = Vec[u64]::new()
+                            let mut loaded_index = 0_usize
+                            while loaded_index < cube_positions.len() {
+                                let transform = Transform::identity().with_position(position_at(cube_positions, loaded_index as u32 + 1_u32))
+                                    .with_rotation(rotation_at(cube_rotations, loaded_index as u32 + 1_u32))
+                                    .with_scale(scale_at(cube_scales, loaded_index as u32 + 1_u32))
+                                let entity = editor_scene.create_entity("Cube " + Debug::fmt(loaded_index + 1_usize), transform)
+                                editor_scene.set_renderable(entity, Option[Renderable]::Some(Renderable::new(MeshId::new(1_u64), MaterialId::new(1_u64))))
+                                cube_entities.push(entity)
+                                loaded_index = loaded_index + 1_usize
+                            }
+                            object_count = cube_entities.len() as u32
+                            selected_cube = if object_count > 0_u32 { 1_u32 } else { 0_u32 }
+                            selected = if selected_cube > 0_u32 { "Cube 1" } else { "Camera" }
+                            code_editor = TextEditor::new(contents.code)
+                            undo_stack.clear()
+                            redo_stack.clear()
+                            project_dirty = false
+                            project_dialog_mode = ""
+                            project_path_focused = false
+                            project_error = ""
+                            status_message = "Loaded project " + project_root
+                            viewport_renderer.sync_cubes(object_count)
+                            viewport_renderer.select_cube(selected_cube)
+                            viewport_renderer.sync_cube_transforms_scaled(cube_positions, render_rotations, cube_scales)
+                        }
+                        Option::None => { project_error = "The project scene is invalid." }
+                    }
+                } else {
+                    project_error = if project_dialog_mode == "new" { "Unable to create project. The directory may already contain a project." }
+                        else { "No valid Graphene project was found at this path." }
+                }
+                dirty = true
+            }
+            if target != "menu-file" && target != "menu-edit" && target != "menu-window" &&
+                target != "menu-tools" && target != "menu-help" { open_menu = "" }
+            if target != "viewport-camera" && target != "camera-perspective" && target != "camera-top" &&
+                target != "camera-front" && target != "camera-right" && target != "viewport-lit" &&
+                target != "shading-lit" && target != "shading-unlit" && target != "viewport-speed" &&
+                target != "speed-025" && target != "speed-05" && target != "speed-1" && target != "speed-2" &&
+                target != "speed-4" { open_viewport_menu = "" }
+            if target == "menu-file" || target == "menu-edit" || target == "menu-window" ||
+                target == "menu-tools" || target == "menu-help" {
+                open_menu = if open_menu == target { "" } else { target }
+                dirty = true
+            }
+            elif target == "menu-new-project-action" || target == "menu-open-project-action" {
+                project_dialog_mode = if target == "menu-new-project-action" { "new" } else { "open" }
+                project_path_editor = TextEditor::new(if project_dialog_mode == "new" { cwd() + "/GrapheneProject" } else { project_root })
+                project_path_focused = true
+                project_error = ""
+                code_focused = false
+                dirty = true
+            }
+            elif target == "menu-save-action" { request_save = true dirty = true }
+            elif target == "menu-build-action" || target == "menu-tools-build-action" { request_build = true dirty = true }
+            elif target == "menu-exit-action" { request_exit = true }
+            elif target == "menu-undo-action" { request_undo = true dirty = true }
+            elif target == "menu-redo-action" { request_redo = true dirty = true }
+            elif target == "menu-duplicate-action" { request_duplicate = true dirty = true }
+            elif target == "menu-delete-action" { request_delete = true dirty = true }
+            elif target == "menu-outliner-action" { show_outliner = !show_outliner dirty = true }
+            elif target == "menu-details-action" { show_details = !show_details dirty = true }
+            elif target == "menu-content-action" { show_content = !show_content dirty = true }
+            elif target == "menu-about-action" { status_message = "Graphene Editor - Vulkan development build" dirty = true }
+            elif target == "viewport-camera" {
+                open_viewport_menu = if open_viewport_menu == "camera" { "" } else { "camera" }
+                dirty = true
+            }
+            elif target == "viewport-lit" {
+                open_viewport_menu = if open_viewport_menu == "shading" { "" } else { "shading" }
+                dirty = true
+            }
+            elif target == "viewport-speed" {
+                open_viewport_menu = if open_viewport_menu == "speed" { "" } else { "speed" }
+                dirty = true
+            }
+            elif target == "camera-perspective" || target == "camera-top" || target == "camera-front" || target == "camera-right" {
+                if target == "camera-top" {
+                    camera_mode = "top" camera_yaw = 0.0_f32 camera_pitch = 1.35_f32
+                }
+                elif target == "camera-front" {
+                    camera_mode = "front" camera_yaw = 1.5707963_f32 camera_pitch = 0.0_f32
+                }
+                elif target == "camera-right" {
+                    camera_mode = "right" camera_yaw = 0.0_f32 camera_pitch = 0.0_f32
+                }
+                else {
+                    camera_mode = "perspective" camera_yaw = 0.64_f32 camera_pitch = 0.42_f32
+                }
+                open_viewport_menu = "" status_message = camera_mode_name(camera_mode) + " camera" dirty = true
+            }
+            elif target == "shading-lit" || target == "shading-unlit" {
+                shading_mode = if target == "shading-unlit" { "unlit" } else { "lit" }
+                viewport_renderer.set_shading_mode(if shading_mode == "unlit" { 1_u32 } else { 0_u32 })
+                open_viewport_menu = "" status_message = shading_mode_name(shading_mode) + " shading" dirty = true
+            }
+            elif target == "speed-025" || target == "speed-05" || target == "speed-1" ||
+                target == "speed-2" || target == "speed-4" {
+                camera_speed = if target == "speed-025" { "0.25" } else {
+                    if target == "speed-05" { "0.5" } else {
+                        if target == "speed-2" { "2" } else { if target == "speed-4" { "4" } else { "1" } }
+                    }
+                }
+                open_viewport_menu = "" status_message = "Camera speed " + camera_speed_name(camera_speed) dirty = true
+            }
+            elif target == "grid-toggle" {
+                grid_visible = !grid_visible
+                viewport_renderer.set_grid_visible(grid_visible)
+                status_message = if grid_visible { "Editor grid visible" } else { "Editor grid hidden" }
+                dirty = true
+            }
+            elif target == "snap-toggle" {
+                rotation_snap = !rotation_snap
+                status_message = if rotation_snap { "Rotation snap 10 deg" } else { "Rotation snap disabled" }
+                dirty = true
+            }
+            elif target == "save" && !simulating {
+                request_save = true
+            }
+            elif target == "undo" && undo_stack.len() > 0_usize { request_undo = true }
+            elif target == "redo" && redo_stack.len() > 0_usize { request_redo = true }
+            elif target == "duplicate" && selected_cube > 0_u32 && !simulating { request_duplicate = true }
+            elif target == "delete" && selected_cube > 0_u32 && !simulating { request_delete = true }
+            elif target == "build-game" && !building && !simulating { request_build = true }
+            elif target == "play" || target == "simulate" {
+                simulation_started = perf_counter_ms()
+                simulating = true
+                dragging = false
+                moving_cube = false
+                dirty = true
+            }
+            elif target == "stop" {
+                simulating = false
+                let mut rotation_index = 0_usize
+                while rotation_index < render_rotations.len() {
+                    match cube_rotations.get(rotation_index) {
+                        Option::Some(rotation) => { render_rotations.set(rotation_index, rotation) }
+                        Option::None => {}
+                    }
+                    rotation_index = rotation_index + 1_usize
+                }
+                dirty = true
+            }
+            elif target == "entity-camera" { selected = "Camera" selected_cube = 0_u32 dirty = true }
+            elif target == "entity-light" { selected = "Directional Light" selected_cube = 0_u32 dirty = true }
+            elif target == "asset-cube" { selected_asset = target dragging = true dirty = true }
+            elif target == "asset-material" {
+                selected_asset = target
+                dragging = false
+                status_message = "Selected Default material"
+                dirty = true
+            }
+            elif target == "asset-script" {
+                selected_asset = target
+                dragging = false
+                status_message = "Selected Player script"
+                dirty = true
+            }
+            elif target == "tool-select" { active_tool = "select" moving_cube = false dirty = true }
+            elif target == "tool-move" { active_tool = "move" moving_cube = false dirty = true }
+            elif target == "tool-rotate" { active_tool = "rotate" moving_cube = false dirty = true }
+            elif target == "tool-scale" { active_tool = "scale" moving_cube = false dirty = true }
+            elif event.key() == 3_u32 && viewport_location.is_some() {
+                orbiting = true orbit_x = event.x() orbit_y = event.y()
+            }
+            elif event.key() == 2_u32 && viewport_location.is_some() {
+                panning = true orbit_x = event.x() orbit_y = event.y()
+            }
+            elif !simulating && event.key() == 1_u32 && viewport_location.is_some() {
+                match viewport_location {
+                    Option::Some(point) => {
+                        let picked = viewport_renderer.pick_cube_at(point.0 * window.pixel_density(), point.1 * window.pixel_density(), camera_yaw, camera_pitch,
+                            camera_distance, camera_target, cube_positions)
+                        if picked > 0_u32 {
+                            selected_cube = picked
+                            selected = "Cube " + Debug::fmt(picked)
+                            if active_tool == "move" {
+                                match viewport_renderer.ground_point_at(point.0 * window.pixel_density(), point.1 * window.pixel_density(), camera_yaw, camera_pitch,
+                                    camera_distance, camera_target) {
+                                    Option::Some(ground) => {
+                                        move_offset = position_at(cube_positions, selected_cube).sub(ground)
+                                        moving_cube = true
+                                    }
+                                    Option::None => {}
+                                }
+                            }
+                            elif active_tool == "rotate" || active_tool == "scale" {
+                                moving_cube = true
+                                orbit_x = event.x()
+                                if active_tool == "rotate" { rotate_drag_y = rotation_at(cube_rotations, selected_cube).y() }
+                            }
+                            if moving_cube {
+                                transform_editing = true
+                                edit_start_position = position_at(cube_positions, selected_cube)
+                                edit_start_rotation = rotation_at(cube_rotations, selected_cube)
+                                edit_start_scale = scale_at(cube_scales, selected_cube)
+                            }
+                            dirty = true
+                        }
+                    }
+                    Option::None => {}
+                }
+            }
+            elif !simulating && selected_cube > 0_u32 && (target == "move-x-minus" || target == "move-x-plus" ||
+                target == "move-y-minus" || target == "move-y-plus" ||
+                target == "move-z-minus" || target == "move-z-plus") {
+                let dx = if target == "move-x-minus" { -0.25_f32 } else { if target == "move-x-plus" { 0.25_f32 } else { 0.0_f32 } }
+                let dy = if target == "move-y-minus" { -0.25_f32 } else { if target == "move-y-plus" { 0.25_f32 } else { 0.0_f32 } }
+                let dz = if target == "move-z-minus" { -0.25_f32 } else { if target == "move-z-plus" { 0.25_f32 } else { 0.0_f32 } }
+                let before_position = position_at(cube_positions, selected_cube)
+                let before_rotation = rotation_at(cube_rotations, selected_cube)
+                let before_scale = scale_at(cube_scales, selected_cube)
+                cube_positions = nudge_position(cube_positions, selected_cube, dx, dy, dz)
+                undo_stack.push(TransformEdit{selected_cube, before_position, before_rotation, before_scale,
+                    position_at(cube_positions, selected_cube), before_rotation, before_scale})
+                redo_stack.clear()
+                project_dirty = true
+                match cube_entities.get((selected_cube - 1_u32) as usize) {
+                    Option::Some(entity) => {
+                        editor_scene.set_transform(entity, Transform::identity()
+                            .with_position(position_at(cube_positions, selected_cube))
+                            .with_rotation(rotation_at(cube_rotations, selected_cube))
+                            .with_scale(scale_at(cube_scales, selected_cube)))
+                    }
+                    Option::None => {}
+                }
+                dirty = true
+            }
+            else {
+                let mut cube_index = 0_u32
+                while cube_index < object_count {
+                    if target == "entity-cube-" + Debug::fmt(cube_index + 1_u32) {
+                        selected = "Cube " + Debug::fmt(cube_index + 1_u32)
+                        selected_cube = cube_index + 1_u32
+                        dirty = true
+                    }
+                    cube_index = cube_index + 1_u32
+                }
+            }
+            if target == "code-editor" {
+                match layout.find_bounds("code-editor") {
+                    Option::Some(bounds) => {
+                        let cursor = window.wrapped_text_index(code_editor.value(), bounds.width() - 20.0_f32,
+                            event.x() - bounds.x() - 10.0_f32, event.y() - bounds.y() - 10.0_f32)
+                        code_editor = code_editor.with_cursor(cursor)
+                    }
+                    Option::None => {}
+                }
+            }
+            code_focused = target == "code-editor"
+        }
+        if request_exit { break }
+        if event.kind() == event_pointer_move() && orbiting {
+            camera_yaw = camera_yaw + (event.x() - orbit_x) * 0.006_f32
+            camera_pitch = camera_pitch + (event.y() - orbit_y) * 0.006_f32
+            if camera_pitch > 1.35_f32 { camera_pitch = 1.35_f32 }
+            if camera_pitch < -1.35_f32 { camera_pitch = -1.35_f32 }
+            orbit_x = event.x()
+            orbit_y = event.y()
+            dirty = true
+            viewport_only = true
+        }
+        if event.kind() == event_pointer_move() && panning {
+            let forward = Vec3::zero().sub(Vec3::from_spherical(camera_yaw, camera_pitch)).normalized()
+            let right = forward.cross(Vec3::new(0.0_f32, 1.0_f32, 0.0_f32)).normalized()
+            let up = right.cross(forward).normalized()
+            let speed = camera_distance * 0.0015_f32 * camera_speed_value(camera_speed)
+            camera_target = camera_target.add(right.scale((orbit_x - event.x()) * speed))
+                .add(up.scale((event.y() - orbit_y) * speed))
+            orbit_x = event.x()
+            orbit_y = event.y()
+            dirty = true
+            viewport_only = true
+        }
+        if event.kind() == event_pointer_move() && moving_cube && selected_cube > 0_u32 {
+            if active_tool == "move" {
+                match viewport_point(layout, event.x(), event.y()) {
+                    Option::Some(point) => {
+                        match viewport_renderer.ground_point_at(point.0 * window.pixel_density(), point.1 * window.pixel_density(), camera_yaw, camera_pitch,
+                            camera_distance, camera_target) {
+                            Option::Some(ground) => {
+                                cube_positions = set_position(cube_positions, selected_cube, ground.add(move_offset))
+                            }
+                            Option::None => {}
+                        }
+                    }
+                    Option::None => {}
+                }
+            }
+            elif active_tool == "rotate" {
+                let current = rotation_at(cube_rotations, selected_cube)
+                rotate_drag_y = rotate_drag_y + (event.x() - orbit_x) * 0.01_f32
+                let displayed_y = if rotation_snap { snap_scalar(rotate_drag_y, 0.1745329_f32) } else { rotate_drag_y }
+                let next = Vec3::new(current.x(), displayed_y, current.z())
+                cube_rotations = set_rotation(cube_rotations, selected_cube, next)
+                render_rotations = set_rotation(render_rotations, selected_cube, next)
+                orbit_x = event.x()
+            }
+            elif active_tool == "scale" {
+                let current = scale_at(cube_scales, selected_cube)
+                let mut value = current.x() + (event.x() - orbit_x) * 0.01_f32
+                if value < 0.1_f32 { value = 0.1_f32 }
+                cube_scales = set_scale(cube_scales, selected_cube, Vec3::new(value, value, value))
+                orbit_x = event.x()
+            }
+            match cube_entities.get((selected_cube - 1_u32) as usize) {
+                Option::Some(entity) => {
+                    editor_scene.set_transform(entity, Transform::identity()
+                        .with_position(position_at(cube_positions, selected_cube))
+                        .with_rotation(rotation_at(cube_rotations, selected_cube))
+                        .with_scale(scale_at(cube_scales, selected_cube)))
+                }
+                Option::None => {}
+            }
+            dirty = true
+            viewport_only = true
+        }
+        if event.kind() == event_pointer_up() && event.key() == 3_u32 { orbiting = false }
+        if event.kind() == event_pointer_up() && event.key() == 2_u32 { panning = false }
+        if event.kind() == event_pointer_up() && event.key() == 1_u32 {
+            if transform_editing && selected_cube > 0_u32 {
+                let after_position = position_at(cube_positions, selected_cube)
+                let after_rotation = rotation_at(cube_rotations, selected_cube)
+                let after_scale = scale_at(cube_scales, selected_cube)
+                if vec3_differs(edit_start_position, after_position) ||
+                    vec3_differs(edit_start_rotation, after_rotation) || vec3_differs(edit_start_scale, after_scale) {
+                    undo_stack.push(TransformEdit{selected_cube, edit_start_position, edit_start_rotation,
+                        edit_start_scale, after_position, after_rotation, after_scale})
+                    redo_stack.clear()
+                    project_dirty = true
+                }
+                dirty = true
+            }
+            transform_editing = false
+            moving_cube = false
+        }
+        if event.kind() == event_key_down() && event.key() == 102_u32 && viewport_focused && selected_cube > 0_u32 {
+            camera_target = position_at(cube_positions, selected_cube)
+            dirty = true
+            viewport_only = true
+        }
+        if event.kind() == event_key_down() && viewport_focused && !code_focused {
+            if event.key() == 113_u32 { active_tool = "select" dirty = true }
+            elif event.key() == 119_u32 { active_tool = "move" dirty = true }
+            elif event.key() == 101_u32 { active_tool = "rotate" dirty = true }
+            elif event.key() == 114_u32 { active_tool = "scale" dirty = true }
+        }
+        if event.kind() == event_key_down() && event.control() && !code_focused {
+            if event.key() == 122_u32 && event.shift() { request_redo = true }
+            elif event.key() == 122_u32 { request_undo = true }
+            elif event.key() == 121_u32 { request_redo = true }
+            elif event.key() == 100_u32 && selected_cube > 0_u32 && !simulating { request_duplicate = true }
+        }
+        if event.kind() == event_key_down() && event.control() && event.key() == 115_u32 && !simulating {
+            request_save = true
+        }
+        if event.kind() == event_key_down() && event.key() == 127_u32 && viewport_focused &&
+            selected_cube > 0_u32 && !simulating { request_delete = true }
+        if event.kind() == event_scroll() {
+            if viewport_point(layout, event.x(), event.y()).is_some() {
+                camera_distance = camera_distance - event.wheel_y() * 0.45_f32 * camera_speed_value(camera_speed)
+                if camera_distance < 2.0_f32 { camera_distance = 2.0_f32 }
+                if camera_distance > 14.0_f32 { camera_distance = 14.0_f32 }
+                dirty = true
+                viewport_only = true
+            }
+        }
+        if !simulating && event.kind() == event_pointer_up() && dragging {
+            match viewport_point(layout, event.x(), event.y()) {
+                Option::Some(point) => {
+                object_count = object_count + 1_u32
+                selected = "Cube " + Debug::fmt(object_count)
+                selected_cube = object_count
+                let mut position = Vec3::zero()
+                match viewport_renderer.ground_point_at(point.0 * window.pixel_density(), point.1 * window.pixel_density(), camera_yaw, camera_pitch, camera_distance, camera_target) {
+                    Option::Some(ground) => { position = ground }
+                    Option::None => {}
+                }
+                let entity = editor_scene.create_entity(selected, Transform::identity().with_position(position))
+                editor_scene.set_renderable(entity,
+                    Option[Renderable]::Some(Renderable::new(MeshId::new(1_u64), MaterialId::new(1_u64))))
+                cube_entities.push(entity)
+                cube_positions.push(position)
+                cube_rotations.push(Vec3::zero())
+                cube_scales.push(Vec3::new(1.0_f32, 1.0_f32, 1.0_f32))
+                render_rotations.push(Vec3::zero())
+                project_dirty = true
+                }
+                Option::None => {}
+            }
+            dragging = false
+            dirty = true
+        }
+        if request_save {
+            if save_editor_project(scene_path, script_path, cube_positions, cube_rotations, cube_scales,
+                code_editor.value()) {
+                status_message = "Saved scene and " + script_path
+                project_dirty = false
+            } else { status_message = "Unable to save editor project" }
+            dirty = true
+        }
+        if request_build {
+            if save_editor_project(scene_path, script_path, cube_positions, cube_rotations, cube_scales,
+                code_editor.value()) {
+                project_dirty = false
+                remove_file(build_completion_path)
+                remove_file(build_log_path)
+                build_handle = Option[JoinHandle[i32]]::Some(
+                    spawn compile_game(compiler, game_manifest, build_log_path, build_completion_path))
+                building = true
+                build_output = "Compiling gameplay project..."
+                status_message = build_output
+            } else {
+                build_output = "Unable to save gameplay project"
+                status_message = build_output
+            }
+            dirty = true
+        }
+        if request_duplicate && selected_cube > 0_u32 {
+            let source_position = position_at(cube_positions, selected_cube)
+            let position = source_position.add(Vec3::new(0.75_f32, 0.0_f32, 0.0_f32))
+            let rotation = rotation_at(cube_rotations, selected_cube)
+            let scale = scale_at(cube_scales, selected_cube)
+            object_count = object_count + 1_u32
+            selected_cube = object_count
+            selected = "Cube " + Debug::fmt(selected_cube)
+            let entity = editor_scene.create_entity(selected, Transform::identity().with_position(position)
+                .with_rotation(rotation).with_scale(scale))
+            editor_scene.set_renderable(entity,
+                Option[Renderable]::Some(Renderable::new(MeshId::new(1_u64), MaterialId::new(1_u64))))
+            cube_entities.push(entity)
+            cube_positions.push(position)
+            cube_rotations.push(rotation)
+            cube_scales.push(scale)
+            render_rotations.push(rotation)
+            undo_stack.clear()
+            redo_stack.clear()
+            status_message = "Duplicated " + selected
+            project_dirty = true
+            dirty = true
+        }
+        if request_delete && selected_cube > 0_u32 && selected_cube <= object_count {
+            let removed = selected_cube
+            let removed_index = (removed - 1_u32) as usize
+            match cube_entities.get(removed_index) {
+                Option::Some(entity) => { editor_scene.remove(entity) }
+                Option::None => {}
+            }
+            viewport_renderer.remove_cube(removed)
+            cube_entities = remove_u64_at(cube_entities, removed_index)
+            cube_positions = remove_vec3_at(cube_positions, removed_index)
+            cube_rotations = remove_vec3_at(cube_rotations, removed_index)
+            cube_scales = remove_vec3_at(cube_scales, removed_index)
+            render_rotations = remove_vec3_at(render_rotations, removed_index)
+            object_count = object_count - 1_u32
+            if object_count == 0_u32 {
+                selected_cube = 0_u32
+                selected = "Camera"
+            } else {
+                selected_cube = if removed > object_count { object_count } else { removed }
+                selected = "Cube " + Debug::fmt(selected_cube)
+            }
+            transform_editing = false
+            moving_cube = false
+            undo_stack.clear()
+            redo_stack.clear()
+            status_message = "Deleted Cube " + Debug::fmt(removed)
+            project_dirty = true
+            dirty = true
+        }
+        if request_undo {
+            match undo_stack.pop() {
+                Option::Some(edit) => {
+                    let restored = apply_transform_edit(cube_positions, cube_rotations, cube_scales, edit, false)
+                    cube_positions = restored.0
+                    cube_rotations = restored.1
+                    cube_scales = restored.2
+                    render_rotations = cube_rotations
+                    selected_cube = edit.cube
+                    selected = "Cube " + Debug::fmt(edit.cube)
+                    redo_stack.push(edit)
+                    status_message = "Undo transform"
+                    project_dirty = true
+                    match cube_entities.get((edit.cube - 1_u32) as usize) {
+                        Option::Some(entity) => {
+                            editor_scene.set_transform(entity, Transform::identity()
+                                .with_position(position_at(cube_positions, edit.cube))
+                                .with_rotation(rotation_at(cube_rotations, edit.cube))
+                                .with_scale(scale_at(cube_scales, edit.cube)))
+                        }
+                        Option::None => {}
+                    }
+                    dirty = true
+                }
+                Option::None => {}
+            }
+        }
+        if request_redo {
+            match redo_stack.pop() {
+                Option::Some(edit) => {
+                    let restored = apply_transform_edit(cube_positions, cube_rotations, cube_scales, edit, true)
+                    cube_positions = restored.0
+                    cube_rotations = restored.1
+                    cube_scales = restored.2
+                    render_rotations = cube_rotations
+                    selected_cube = edit.cube
+                    selected = "Cube " + Debug::fmt(edit.cube)
+                    undo_stack.push(edit)
+                    status_message = "Redo transform"
+                    project_dirty = true
+                    match cube_entities.get((edit.cube - 1_u32) as usize) {
+                        Option::Some(entity) => {
+                            editor_scene.set_transform(entity, Transform::identity()
+                                .with_position(position_at(cube_positions, edit.cube))
+                                .with_rotation(rotation_at(cube_rotations, edit.cube))
+                                .with_scale(scale_at(cube_scales, edit.cube)))
+                        }
+                        Option::None => {}
+                    }
+                    dirty = true
+                }
+                Option::None => {}
+            }
+        }
+        if project_dialog_mode != "" && project_path_focused && event.kind() == event_text_input() && event.text() != "" {
+            project_path_editor = project_path_editor.insert(event.text())
+            project_error = ""
+            dirty = true
+        }
+        if project_dialog_mode != "" && project_path_focused && event.kind() == event_key_down() {
+            let extend = event.shift()
+            if event.control() && event.key() == 97_u32 { project_path_editor = project_path_editor.select_all() dirty = true }
+            elif event.control() && event.key() == 99_u32 {
+                if project_path_editor.has_selection() { window.set_clipboard(project_path_editor.selected_text()) }
+            }
+            elif event.control() && event.key() == 120_u32 {
+                if project_path_editor.has_selection() {
+                    window.set_clipboard(project_path_editor.selected_text())
+                    project_path_editor = project_path_editor.cut()
+                    dirty = true
+                }
+            }
+            elif event.control() && event.key() == 118_u32 { project_path_editor = project_path_editor.paste(window.clipboard_text()) dirty = true }
+            elif event.key() == key_backspace() { project_path_editor = project_path_editor.backspace() dirty = true }
+            elif event.key() == key_delete() { project_path_editor = project_path_editor.delete() dirty = true }
+            elif event.key() == key_left() { project_path_editor = project_path_editor.move_left(extend) dirty = true }
+            elif event.key() == key_right() { project_path_editor = project_path_editor.move_right(extend) dirty = true }
+            elif event.key() == key_home() { project_path_editor = project_path_editor.move_home(extend) dirty = true }
+            elif event.key() == key_end() { project_path_editor = project_path_editor.move_end(extend) dirty = true }
+        }
+        if code_focused && project_dialog_mode == "" && event.kind() == event_text_input() && event.text() != "" {
+            code_editor = code_editor.insert(event.text())
+            project_dirty = true
+            dirty = true
+        }
+        if code_focused && project_dialog_mode == "" && event.kind() == event_key_down() {
+            let extend = event.shift()
+            if event.control() && event.key() == 97_u32 { code_editor = code_editor.select_all() dirty = true }
+            elif event.control() && event.key() == 99_u32 {
+                if code_editor.has_selection() { window.set_clipboard(code_editor.selected_text()) }
+            }
+            elif event.control() && event.key() == 120_u32 {
+                if code_editor.has_selection() {
+                    window.set_clipboard(code_editor.selected_text())
+                    code_editor = code_editor.cut()
+                    project_dirty = true
+                    dirty = true
+                }
+            }
+            elif event.control() && event.key() == 118_u32 {
+                code_editor = code_editor.paste(window.clipboard_text())
+                project_dirty = true
+                dirty = true
+            }
+            elif event.key() == key_backspace() { code_editor = code_editor.backspace() project_dirty = true dirty = true }
+            elif event.key() == key_delete() { code_editor = code_editor.delete() project_dirty = true dirty = true }
+            elif event.key() == key_enter() { code_editor = code_editor.insert("\n") project_dirty = true dirty = true }
+            elif event.key() == key_left() { code_editor = code_editor.move_left(extend) dirty = true }
+            elif event.key() == key_right() { code_editor = code_editor.move_right(extend) dirty = true }
+            elif event.key() == key_up() { code_editor = code_editor.move_up(extend) dirty = true }
+            elif event.key() == key_down() { code_editor = code_editor.move_down(extend) dirty = true }
+            elif event.key() == key_home() { code_editor = code_editor.move_line_home(extend) dirty = true }
+            elif event.key() == key_end() { code_editor = code_editor.move_line_end(extend) dirty = true }
+        }
+        if simulating {
+            let seconds = ((perf_counter_ms() - simulation_started) as f32) * 0.001_f32
+            let mut simulation_index = 0_usize
+            while simulation_index < cube_entities.len() {
+                match cube_entities.get(simulation_index) {
+                    Option::Some(_) => {
+                        let rotation = Vec3::new(0.0_f32, seconds, 0.0_f32)
+                        let base = rotation_at(cube_rotations, simulation_index as u32 + 1_u32)
+                        render_rotations.set(simulation_index,
+                            Vec3::new(base.x(), base.y() + rotation.y(), base.z()))
+                    }
+                    Option::None => {}
+                }
+                simulation_index = simulation_index + 1_usize
+            }
+        }
+        if dirty && !viewport_only { layout_dirty = true }
+        if layout_dirty {
+            compact = window.surface_width() < 1200_u32
+            layout = window.layout(editor_view(simulating, selected, position_at(cube_positions, selected_cube),
+                rotation_at(render_rotations, selected_cube), scale_at(cube_scales, selected_cube), selected_cube,
+                dragging, selected_asset, object_count, code_editor, code_focused, status_message, project_dirty, active_tool,
+                camera_mode, shading_mode, camera_speed, grid_visible, rotation_snap,
+                undo_stack.len() > 0_usize, redo_stack.len() > 0_usize, building, build_output, hovered,
+                pointer_x, pointer_y, compact, open_menu, show_outliner, show_details, show_content,
+                open_viewport_menu, project_root, project_dialog_mode, project_path_editor, project_path_focused, project_error,
+                window.surface_width() as f32, window.surface_height() as f32, icons))
+            let next_width = viewport_width(layout)
+            let next_height = viewport_height(layout)
+            if next_width != render_width || next_height != render_height {
+                render_width = next_width
+                render_height = next_height
+            }
+            layout_cached = window.cache_layout(layout)
+        }
+        if dirty || simulating {
+            let render_started = perf_counter_ms()
+            viewport_renderer.set_gizmo_mode(gizmo_mode(active_tool))
+            viewport_renderer.sync_cubes(object_count)
+            viewport_renderer.select_cube(selected_cube)
+            viewport_renderer.sync_cube_transforms_scaled(cube_positions, render_rotations, cube_scales)
+            let mut ui_drawn = true
+            if layout_dirty {
+                ui_drawn = if layout_cached { window.draw_cached_layout() } else { window.draw_layout(layout) }
+            }
+            let density = window.pixel_density()
+            let rendered = ui_drawn && viewport_renderer.render_editor_at(camera_yaw, camera_pitch, camera_distance, camera_target,
+                window.surface_pixels(), window.surface_width(), window.surface_height(), window.surface_pitch(),
+                viewport_pixel_x(layout, density), viewport_pixel_y(layout, density),
+                ((render_width as f32) * density) as u32, ((render_height as f32) * density) as u32)
+            redraw_pending = !rendered
+            let render_finished = perf_counter_ms()
+            if profiling {
+                let frame_finished = perf_counter_ms()
+                profile_frames = profile_frames + 1_u64
+                profile_render_ms = profile_render_ms + (render_finished - render_started)
+                profile_ui_ms = profile_ui_ms + (frame_finished - render_finished)
+                if profile_frames >= 120_u64 {
+                    println("Graphene profile: render " + Debug::fmt(profile_render_ms / profile_frames) +
+                        " ms, UI " + Debug::fmt(profile_ui_ms / profile_frames) + " ms")
+                    profile_frames = 0_u64
+                    profile_render_ms = 0_u64
+                    profile_ui_ms = 0_u64
+                }
+            }
+        }
+        if event.kind() == event_none() && !simulating && !redraw_pending {
+            sleep_ms(1_u64)
+        }
+    }
+    match build_handle {
+        Option::Some(handle) => { let _build_code = handle.join() }
+        Option::None => {}
+    }
+    viewport_renderer.destroy()
+    window.destroy()
+    ret 0_u32
+}
