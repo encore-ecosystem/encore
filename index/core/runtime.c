@@ -1971,6 +1971,22 @@ int32_t encore_fs_status(encore_str path) {
     return result;
 }
 
+bool encore_fs_is_directory(encore_str path) {
+    char *path_c = encore_to_cstr(path);
+    if (path_c == NULL) return false;
+    struct stat st;
+    bool result = false;
+    if (stat(path_c, &st) == 0) {
+#ifdef _WIN32
+        result = (st.st_mode & _S_IFDIR) != 0;
+#else
+        result = S_ISDIR(st.st_mode);
+#endif
+    }
+    free(path_c);
+    return result;
+}
+
 int32_t encore_fs_remove_file(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
