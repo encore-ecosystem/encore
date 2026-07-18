@@ -9,6 +9,7 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <signal.h>
 #endif
 
 typedef struct { size_t ref_count; size_t len; char data[]; } encore_str_object;
@@ -18,7 +19,16 @@ extern void *encore_str_from_cstr(const char *value);
 typedef struct UiSdlWindow UiSdlWindow;
 typedef struct UiSdlRenderer UiSdlRenderer;
 typedef struct UiSdlTexture UiSdlTexture;
-typedef struct UiSdlSurface UiSdlSurface;
+typedef struct UiSdlSurface {
+    uint32_t flags;
+    uint32_t format;
+    int width;
+    int height;
+    int pitch;
+    void *pixels;
+    int refcount;
+    void *reserved;
+} UiSdlSurface;
 typedef struct UiTtfFont UiTtfFont;
 typedef struct { float x, y, w, h; } UiSdlFRect;
 typedef struct { float x, y; } UiSdlFPoint;
@@ -134,6 +144,7 @@ enum {
     UI_SDL_INIT_VIDEO = 0x00000020u,
     UI_SDL_EVENT_QUIT = 0x100,
     UI_SDL_EVENT_WINDOW_CLOSE = 0x210,
+    UI_SDL_EVENT_WINDOW_EXPOSED = 0x204,
     UI_SDL_EVENT_WINDOW_RESIZED = 0x206,
     UI_SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED = 0x207,
     UI_SDL_EVENT_KEY_DOWN = 0x300,
@@ -164,8 +175,12 @@ typedef struct {
     bool ready;
     bool (*Init)(uint32_t);
     void (*Quit)(void);
+    UiSdlWindow *(*CreateWindow)(const char *, int, int, uint64_t);
     bool (*CreateWindowAndRenderer)(const char *, int, int, uint64_t, UiSdlWindow **, UiSdlRenderer **);
+    UiSdlSurface *(*CreateSurface)(int, int, uint32_t);
+    UiSdlRenderer *(*CreateSoftwareRenderer)(UiSdlSurface *);
     float (*GetWindowPixelDensity)(UiSdlWindow *);
+    bool (*GetWindowSizeInPixels)(UiSdlWindow *, int *, int *);
     void (*DestroyRenderer)(UiSdlRenderer *);
     void (*DestroyWindow)(UiSdlWindow *);
     bool (*PollEvent)(UiSdlEvent *);
@@ -185,6 +200,9 @@ typedef struct {
     bool (*RenderGeometry)(UiSdlRenderer *, UiSdlTexture *, const UiSdlVertex *, int, const int *, int);
     bool (*RenderDebugText)(UiSdlRenderer *, float, float, const char *);
     UiSdlTexture *(*CreateTextureFromSurface)(UiSdlRenderer *, UiSdlSurface *);
+    UiSdlTexture *(*CreateTexture)(UiSdlRenderer *, uint32_t, int, int, int);
+    bool (*UpdateTexture)(UiSdlTexture *, const UiSdlRect *, const void *, int);
+    bool (*SetRenderTarget)(UiSdlRenderer *, UiSdlTexture *);
     bool (*RenderTexture)(UiSdlRenderer *, UiSdlTexture *, const UiSdlFRect *, const UiSdlFRect *);
     void (*DestroyTexture)(UiSdlTexture *);
     void (*DestroySurface)(UiSdlSurface *);
@@ -240,12 +258,27 @@ typedef struct {
     uint64_t text_cache_tick;
     UiSdlFPoint vector_path[4096];
     size_t vector_path_count;
+    UiSdlTexture *pixels_texture;
+    uint32_t pixels_width;
+    uint32_t pixels_height;
+    UiSdlTexture *layout_texture;
+    uint32_t layout_width;
+    uint32_t layout_height;
+    UiSdlSurface *software_surface;
+    bool external_presentation;
 } UiWindow;
 
 static UiSdlApi g_sdl;
 static UiTtfApi g_ttf;
 static char g_error[256];
 static size_t g_window_count;
+#if !defined(_WIN32)
+static volatile sig_atomic_t g_terminate_requested;
+static void ui_termination_signal(int signal_number) {
+    (void)signal_number;
+    g_terminate_requested = 1;
+}
+#endif
 
 static encore_str ui_string(const char *value) {
     encore_str result = {(encore_str_object *)encore_str_from_cstr(value == NULL ? "" : value)};
@@ -332,6 +365,11 @@ static void *ui_symbol(void *library, const char *name) { return dlsym(library, 
 static bool ui_load_sdl(void) {
     if (g_sdl.attempted) return g_sdl.ready;
     g_sdl.attempted = true;
+#if !defined(_WIN32) && !defined(__APPLE__)
+    if (getenv("SDL_VIDEODRIVER") == NULL && getenv("WAYLAND_DISPLAY") != NULL) {
+        setenv("SDL_VIDEODRIVER", "wayland", 0);
+    }
+#endif
     g_sdl.library = ui_open_library();
     if (g_sdl.library == NULL) {
         ui_set_error("SDL3 runtime was not found");
@@ -339,8 +377,12 @@ static bool ui_load_sdl(void) {
     }
     UI_LOAD(Init, "SDL_Init");
     UI_LOAD(Quit, "SDL_Quit");
+    UI_LOAD(CreateWindow, "SDL_CreateWindow");
     UI_LOAD(CreateWindowAndRenderer, "SDL_CreateWindowAndRenderer");
+    UI_LOAD(CreateSurface, "SDL_CreateSurface");
+    UI_LOAD(CreateSoftwareRenderer, "SDL_CreateSoftwareRenderer");
     UI_LOAD(GetWindowPixelDensity, "SDL_GetWindowPixelDensity");
+    UI_LOAD(GetWindowSizeInPixels, "SDL_GetWindowSizeInPixels");
     UI_LOAD(DestroyRenderer, "SDL_DestroyRenderer");
     UI_LOAD(DestroyWindow, "SDL_DestroyWindow");
     UI_LOAD(PollEvent, "SDL_PollEvent");
@@ -360,6 +402,9 @@ static bool ui_load_sdl(void) {
     UI_LOAD(RenderGeometry, "SDL_RenderGeometry");
     UI_LOAD(RenderDebugText, "SDL_RenderDebugText");
     UI_LOAD(CreateTextureFromSurface, "SDL_CreateTextureFromSurface");
+    UI_LOAD(CreateTexture, "SDL_CreateTexture");
+    UI_LOAD(UpdateTexture, "SDL_UpdateTexture");
+    UI_LOAD(SetRenderTarget, "SDL_SetRenderTarget");
     UI_LOAD(RenderTexture, "SDL_RenderTexture");
     UI_LOAD(DestroyTexture, "SDL_DestroyTexture");
     UI_LOAD(DestroySurface, "SDL_DestroySurface");
@@ -424,6 +469,31 @@ static void ui_clear_text_cache(UiWindow *state) {
     state->text_cache_count = 0;
     state->text_cache_bytes = 0;
     state->text_cache_tick = 0;
+}
+
+static bool ui_resize_software_surface(UiWindow *state) {
+    if (state == NULL || !state->external_presentation || state->window == NULL) return true;
+    int width = 0, height = 0;
+    if (!g_sdl.GetWindowSizeInPixels(state->window, &width, &height) || width <= 0 || height <= 0) return false;
+    state->width = (uint32_t)((float)width / state->pixel_density);
+    state->height = (uint32_t)((float)height / state->pixel_density);
+    if (state->software_surface != NULL && state->software_surface->width == width &&
+        state->software_surface->height == height) return true;
+    ui_clear_text_cache(state);
+    if (state->pixels_texture != NULL) { g_sdl.DestroyTexture(state->pixels_texture); state->pixels_texture = NULL; }
+    if (state->layout_texture != NULL) { g_sdl.DestroyTexture(state->layout_texture); state->layout_texture = NULL; }
+    if (state->renderer != NULL) g_sdl.DestroyRenderer(state->renderer);
+    if (state->software_surface != NULL) g_sdl.DestroySurface(state->software_surface);
+    state->renderer = NULL;
+    state->software_surface = g_sdl.CreateSurface(width, height, 0x16362004u);
+    state->renderer = state->software_surface == NULL ? NULL : g_sdl.CreateSoftwareRenderer(state->software_surface);
+    if (state->renderer == NULL || !g_sdl.SetRenderDrawBlendMode(state->renderer, 1u) ||
+        !g_sdl.SetRenderScale(state->renderer, state->pixel_density, state->pixel_density)) {
+        ui_set_error(g_sdl.GetError()); return false;
+    }
+    state->layout_width = 0;
+    state->layout_height = 0;
+    return true;
 }
 
 static void ui_remove_text_cache_entry(UiWindow *state, size_t index) {
@@ -528,6 +598,47 @@ size_t encore_ui_window_create(encore_str title, uint32_t width, uint32_t height
     state->height = height;
     ui_refresh_pixel_density(state);
     g_window_count += 1;
+#if !defined(_WIN32)
+    if (g_window_count == 1) {
+        g_terminate_requested = 0;
+        signal(SIGTERM, ui_termination_signal);
+        signal(SIGINT, ui_termination_signal);
+    }
+#endif
+    return (size_t)(uintptr_t)state;
+}
+
+size_t encore_ui_gpu_window_create(encore_str title, uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0 || !ui_load_sdl()) return 0;
+    UiWindow *state = (UiWindow *)calloc(1, sizeof(UiWindow));
+    char *name = ui_to_cstr(title);
+    if (state == NULL || name == NULL) {
+        free(state); free(name); ui_set_error("Unable to allocate GPU UI window"); return 0;
+    }
+    state->window = g_sdl.CreateWindow(name, (int)width, (int)height,
+        0x10000000ull | 0x20ull | 0x2000ull);
+    free(name);
+    if (state->window == NULL) { ui_set_error(g_sdl.GetError()); free(state); return 0; }
+    state->pixel_density = g_sdl.GetWindowPixelDensity(state->window);
+    if (state->pixel_density < 1.0f) state->pixel_density = 1.0f;
+    int pixel_width = (int)((float)width * state->pixel_density);
+    int pixel_height = (int)((float)height * state->pixel_density);
+    state->software_surface = g_sdl.CreateSurface(pixel_width, pixel_height, 0x16362004u);
+    state->renderer = state->software_surface == NULL ? NULL : g_sdl.CreateSoftwareRenderer(state->software_surface);
+    if (state->renderer == NULL || !g_sdl.SetRenderDrawBlendMode(state->renderer, 1u) ||
+        !g_sdl.SetRenderScale(state->renderer, state->pixel_density, state->pixel_density) ||
+        !g_sdl.StartTextInput(state->window)) {
+        ui_set_error(g_sdl.GetError());
+        if (state->renderer != NULL) g_sdl.DestroyRenderer(state->renderer);
+        if (state->software_surface != NULL) g_sdl.DestroySurface(state->software_surface);
+        g_sdl.DestroyWindow(state->window); free(state); return 0;
+    }
+    state->external_presentation = true;
+    state->text_input_started = true;
+    state->open = true;
+    state->width = width;
+    state->height = height;
+    g_window_count += 1;
     return (size_t)(uintptr_t)state;
 }
 
@@ -536,7 +647,10 @@ bool encore_ui_window_destroy(size_t handle) {
     if (state == NULL) return false;
     if (state->window != NULL && state->text_input_started) g_sdl.StopTextInput(state->window);
     ui_clear_fonts(state);
+    if (state->pixels_texture != NULL) g_sdl.DestroyTexture(state->pixels_texture);
+    if (state->layout_texture != NULL) g_sdl.DestroyTexture(state->layout_texture);
     if (state->renderer != NULL) g_sdl.DestroyRenderer(state->renderer);
+    if (state->software_surface != NULL) g_sdl.DestroySurface(state->software_surface);
     if (state->window != NULL) g_sdl.DestroyWindow(state->window);
     free(state);
     if (g_window_count > 0) g_window_count -= 1;
@@ -555,6 +669,21 @@ bool encore_ui_window_open(size_t handle) {
 uint32_t encore_ui_window_poll(size_t handle) {
     UiWindow *state = ui_window(handle);
     if (state == NULL || !state->open) return UI_EVENT_CLOSE;
+#if !defined(_WIN32)
+    if (g_terminate_requested) {
+        state->open = false;
+        state->event_kind = UI_EVENT_CLOSE;
+        return state->event_kind;
+    }
+#endif
+    int previous_surface_width = state->software_surface == NULL ? 0 : state->software_surface->width;
+    int previous_surface_height = state->software_surface == NULL ? 0 : state->software_surface->height;
+    if (!ui_resize_software_surface(state)) {
+        state->open = false; state->event_kind = UI_EVENT_CLOSE; return state->event_kind;
+    }
+    bool surface_resized = state->software_surface != NULL &&
+        (state->software_surface->width != previous_surface_width ||
+         state->software_surface->height != previous_surface_height);
     state->event_kind = UI_EVENT_NONE;
     state->event_key = 0;
     state->event_modifiers = 0;
@@ -563,12 +692,15 @@ uint32_t encore_ui_window_poll(size_t handle) {
     state->wheel_y = 0.0f;
     UiSdlEvent event;
     bool had_motion = false;
-    bool had_resize = false;
+    bool had_resize = surface_resized;
     while (g_sdl.PollEvent(&event)) {
         if (event.type == UI_SDL_EVENT_QUIT || event.type == UI_SDL_EVENT_WINDOW_CLOSE) {
             state->open = false;
             state->event_kind = UI_EVENT_CLOSE;
             return state->event_kind;
+        } else if (event.type == UI_SDL_EVENT_WINDOW_EXPOSED) {
+            state->event_kind = UI_EVENT_RESIZE;
+            had_resize = true;
         } else if (event.type == UI_SDL_EVENT_WINDOW_RESIZED) {
             UiSdlWindowEvent *window = (UiSdlWindowEvent *)&event;
             if (window->data1 > 0 && window->data2 > 0) {
@@ -617,7 +749,10 @@ uint32_t encore_ui_window_poll(size_t handle) {
             return state->event_kind;
         }
     }
-    if (had_resize) { return UI_EVENT_RESIZE; }
+    if (had_resize) {
+        if (!ui_resize_software_surface(state)) state->open = false;
+        return state->open ? UI_EVENT_RESIZE : UI_EVENT_CLOSE;
+    }
     if (had_motion) { return UI_EVENT_POINTER_MOVE; }
     return state->event_kind;
 }
@@ -630,6 +765,11 @@ encore_str encore_ui_event_text(size_t handle) { UiWindow *s = ui_window(handle)
 uint32_t encore_ui_window_width(size_t handle) { UiWindow *s = ui_window(handle); return s == NULL ? 0 : s->width; }
 uint32_t encore_ui_window_height(size_t handle) { UiWindow *s = ui_window(handle); return s == NULL ? 0 : s->height; }
 float encore_ui_window_pixel_density(size_t handle) { UiWindow *s = ui_window(handle); return s == NULL || s->pixel_density <= 0.0f ? 1.0f : s->pixel_density; }
+size_t encore_ui_window_platform_handle(size_t handle) { UiWindow *s = ui_window(handle); return s == NULL ? 0 : (size_t)(uintptr_t)s->window; }
+size_t encore_ui_window_surface_pixels(size_t handle) { UiWindow *s = ui_window(handle); return s == NULL || s->software_surface == NULL ? 0 : (size_t)(uintptr_t)s->software_surface->pixels; }
+uint32_t encore_ui_window_surface_width(size_t handle) { UiWindow *s = ui_window(handle); return s == NULL || s->software_surface == NULL ? 0 : (uint32_t)s->software_surface->width; }
+uint32_t encore_ui_window_surface_height(size_t handle) { UiWindow *s = ui_window(handle); return s == NULL || s->software_surface == NULL ? 0 : (uint32_t)s->software_surface->height; }
+uint32_t encore_ui_window_surface_pitch(size_t handle) { UiWindow *s = ui_window(handle); return s == NULL || s->software_surface == NULL ? 0 : (uint32_t)s->software_surface->pitch; }
 float encore_ui_event_wheel_x(size_t handle) { UiWindow *s = ui_window(handle); return s == NULL ? 0.0f : s->wheel_x; }
 float encore_ui_event_wheel_y(size_t handle) { UiWindow *s = ui_window(handle); return s == NULL ? 0.0f : s->wheel_y; }
 
@@ -654,6 +794,43 @@ bool encore_ui_frame_begin(size_t handle, uint32_t color) {
     UiWindow *state = ui_window(handle); if (state == NULL || !state->open) return false;
     g_sdl.SetRenderClipRect(state->renderer, NULL);
     return ui_color(state, color) && g_sdl.RenderClear(state->renderer);
+}
+
+bool encore_ui_layout_cache_begin(size_t handle, uint32_t color) {
+    UiWindow *state = ui_window(handle);
+    if (state == NULL || !state->open || state->renderer == NULL) return false;
+    uint32_t width = (uint32_t)((float)state->width * state->pixel_density);
+    uint32_t height = (uint32_t)((float)state->height * state->pixel_density);
+    if (width == 0 || height == 0) return false;
+    if (state->layout_texture == NULL || state->layout_width != width || state->layout_height != height) {
+        if (state->layout_texture != NULL) g_sdl.DestroyTexture(state->layout_texture);
+        state->layout_texture = g_sdl.CreateTexture(state->renderer, 0x16362004u, 2, (int)width, (int)height);
+        state->layout_width = width;
+        state->layout_height = height;
+    }
+    if (state->layout_texture == NULL || !g_sdl.SetRenderTarget(state->renderer, state->layout_texture)) {
+        ui_set_error(g_sdl.GetError()); return false;
+    }
+    g_sdl.SetRenderScale(state->renderer, state->pixel_density, state->pixel_density);
+    g_sdl.SetRenderClipRect(state->renderer, NULL);
+    return ui_color(state, color) && g_sdl.RenderClear(state->renderer);
+}
+
+bool encore_ui_layout_cache_end(size_t handle) {
+    UiWindow *state = ui_window(handle);
+    if (state == NULL || state->renderer == NULL || !g_sdl.SetRenderTarget(state->renderer, NULL)) return false;
+    return g_sdl.SetRenderScale(state->renderer, state->pixel_density, state->pixel_density);
+}
+
+bool encore_ui_cached_frame_begin(size_t handle, uint32_t color) {
+    UiWindow *state = ui_window(handle);
+    if (state == NULL || state->renderer == NULL || state->layout_texture == NULL) return false;
+    if (!g_sdl.SetRenderTarget(state->renderer, NULL)) return false;
+    g_sdl.SetRenderScale(state->renderer, state->pixel_density, state->pixel_density);
+    g_sdl.SetRenderClipRect(state->renderer, NULL);
+    if (!ui_color(state, color) || !g_sdl.RenderClear(state->renderer)) return false;
+    UiSdlFRect destination = {0.0f, 0.0f, (float)state->width, (float)state->height};
+    return g_sdl.RenderTexture(state->renderer, state->layout_texture, NULL, &destination);
 }
 bool encore_ui_clip_rect(size_t handle, bool enabled, float x, float y, float width, float height) {
     UiWindow *state = ui_window(handle); if (state == NULL || !state->open) return false;
@@ -1119,7 +1296,33 @@ size_t encore_ui_text_index(size_t handle, encore_str value, float max_width) {
     return characters;
 }
 bool encore_ui_frame_end(size_t handle) {
-    UiWindow *state = ui_window(handle); return state != NULL && state->open && g_sdl.RenderPresent(state->renderer);
+    UiWindow *state = ui_window(handle);
+    if (state == NULL || !state->open) return false;
+    /* A software renderer still needs RenderPresent to flush commands into its surface. */
+    if (state->external_presentation) return g_sdl.RenderPresent(state->renderer);
+    return g_sdl.RenderPresent(state->renderer);
+}
+
+bool encore_ui_pixels(size_t handle, size_t pixels_handle, uint32_t source_width, uint32_t source_height,
+    uint32_t source_pitch, float x, float y, float width, float height) {
+    UiWindow *state = ui_window(handle);
+    const void *pixels = (const void *)(uintptr_t)pixels_handle;
+    if (state == NULL || state->renderer == NULL || pixels == NULL || source_width == 0 || source_height == 0 ||
+        source_pitch < source_width * 4 || width <= 0.0f || height <= 0.0f) return false;
+    /* SDL_PIXELFORMAT_ARGB8888 is BGRA byte order on little-endian hosts, matching Vulkan B8G8R8A8. */
+    if (state->pixels_texture == NULL || state->pixels_width != source_width || state->pixels_height != source_height) {
+        if (state->pixels_texture != NULL) g_sdl.DestroyTexture(state->pixels_texture);
+        state->pixels_texture = g_sdl.CreateTexture(state->renderer, 0x16362004u, 1,
+            (int)source_width, (int)source_height);
+        state->pixels_width = source_width;
+        state->pixels_height = source_height;
+    }
+    if (state->pixels_texture == NULL) { ui_set_error(g_sdl.GetError()); return false; }
+    bool updated = g_sdl.UpdateTexture(state->pixels_texture, NULL, pixels, (int)source_pitch);
+    UiSdlFRect destination = {x, y, width, height};
+    bool rendered = updated && g_sdl.RenderTexture(state->renderer, state->pixels_texture, NULL, &destination);
+    if (!rendered) ui_set_error(g_sdl.GetError());
+    return rendered;
 }
 encore_str encore_ui_backend_name(void) { return ui_string(g_sdl.ready ? "SDL3" : "unavailable"); }
 encore_str encore_ui_backend_error(void) { return ui_string(g_error); }
