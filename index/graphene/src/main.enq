@@ -1,13 +1,13 @@
 import core::fmt::Debug
 import core::io::println
 import core::option::Option
-import core::os::{cwd, env, file_exists, mkdir_all, read_file, remove_file, write_file}
+import core::os::{argc, argv, cwd, env, file_exists, home_dir, mkdir_all, read_file, remove_file, write_file}
 import core::panic::panic
 import core::process::run_args_capture
 import core::thread::JoinHandle
 import core::time::{perf_counter_ms, sleep_ms}
 import core::vec::Vec
-import encore_ui::{Color, FontManager, IconManager, Insets, Style, SvgDocument, TextEditor, Widget, WidgetLayout, Window, event_close, event_key_down, event_pointer_down,
+import encore_ui::{Color, FilePicker, FilePickerIcons, FontManager, IconManager, Insets, Style, SvgDocument, TextEditor, Widget, WidgetLayout, Window, event_close, event_key_down, event_pointer_down,
     event_pointer_move, event_pointer_up, event_resize, event_scroll, event_text_input, backend_error, backend_name,
     horizontal, key_backspace, key_delete, key_down, key_end, key_enter, key_home, key_left, key_right, key_up, text_end, vertical}
 import graphene::{MaterialId, MeshId, Renderable, Scene, SceneActor, SceneAsset, Transform, ViewportRenderer}
@@ -53,6 +53,11 @@ struct EditorIcons {
     exit: SvgDocument
     info: SvgDocument
     panels: SvgDocument
+    file: SvgDocument
+    home: SvgDocument
+    up: SvgDocument
+    refresh: SvgDocument
+    hidden: SvgDocument
 }
 
 impl for EditorIcons {
@@ -67,8 +72,13 @@ impl for EditorIcons {
             manager.document("folder"), manager.document("chevron-right"), manager.document("chevron-down"), manager.document("eye"),
             manager.document("square-terminal"), manager.document("grid-3x3"), manager.document("magnet"), manager.document("gauge"),
             manager.document("map"), manager.document("circle-check"), manager.document("git-branch"), manager.document("cpu"),
-            manager.document("database"), manager.document("log-out"), manager.document("info"), manager.document("panels-top-left") }
+            manager.document("database"), manager.document("log-out"), manager.document("info"), manager.document("panels-top-left"),
+            manager.document("file"), manager.document("house"), manager.document("arrow-up"), manager.document("refresh-cw"), manager.document("eye-off") }
     }
+}
+
+fn file_picker_icons(icons: EditorIcons) -> FilePickerIcons {
+    ret FilePickerIcons::new(icons.folder, icons.file, icons.home, icons.up, icons.refresh, icons.add, icons.hidden)
 }
 
 struct TransformEdit {
@@ -326,6 +336,199 @@ fn project_dialog(mode: str, path_editor: TextEditor, focused: bool, error: str,
     dialog.push(actions)
     shade.push(dialog)
     ret shade
+}
+
+fn split_lines(value: str) -> Vec[str] {
+    let mut result = Vec[str]::new()
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index < value.char_len() {
+        if value.slice(index, 1_usize) == "\n" {
+            if index > start { result.push(value.slice(start, index - start)) }
+            start = index + 1_usize
+        }
+        index = index + 1_usize
+    }
+    if start < value.char_len() { result.push(value.slice(start, value.char_len() - start)) }
+    ret result
+}
+
+fn project_name(path: str) -> str {
+    let trimmed = trim_trailing_separator(path)
+    let mut index = trimmed.char_len()
+    while index > 0_usize {
+        let token = trimmed.slice(index - 1_usize, 1_usize)
+        if token == "/" || token == "\\" { ret trimmed.slice(index, trimmed.char_len() - index) }
+        index = index - 1_usize
+    }
+    ret trimmed
+}
+
+fn recent_projects_path() -> str { ret home_dir() + "/.graphene/recent-projects" }
+
+fn recent_projects() -> Vec[str] {
+    let mut result = Vec[str]::new()
+    if !file_exists(recent_projects_path()) { ret result }
+    for path in split_lines(read_file(recent_projects_path())) {
+        if project_valid(project_paths(path)) { result.push(path) }
+    }
+    ret result
+}
+
+fn remember_project(path: str) -> () {
+    mkdir_all(home_dir() + "/.graphene")
+    let mut output = path + "\n"
+    let mut count = 1_usize
+    for recent in recent_projects() {
+        if recent != path && count < 8_usize { output = output + recent + "\n" count = count + 1_usize }
+    }
+    write_file(recent_projects_path(), output)
+    ret ()
+}
+
+fn requested_project_path() -> str {
+    let mut index = 1_usize
+    while index < argc() {
+        match argv(index) {
+            Option::Some(value) => {
+                if value == "--project" && index + 1_usize < argc() {
+                    match argv(index + 1_usize) { Option::Some(path) => { ret trim_trailing_separator(path) } Option::None => {} }
+                }
+                elif value.char_len() > 0_usize && value.slice(0_usize, 1_usize) != "-" { ret trim_trailing_separator(value) }
+            }
+            Option::None => {}
+        }
+        index = index + 1_usize
+    }
+    match env("GRAPHENE_PROJECT") { Option::Some(path) => { ret trim_trailing_separator(path) } Option::None => {} }
+    ret ""
+}
+
+fn project_card(id: str, path: str, icons: EditorIcons) -> Widget {
+    let mut card = Widget::panel(id).with_direction(vertical()).with_flex(176.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(27_u8, 28_u8, 32_u8)).with_border(1.0_f32, Color::rgb(53_u8, 55_u8, 61_u8))
+            .with_radius(5.0_f32).with_padding(Insets::all(7.0_f32)).with_gap(5.0_f32))
+    let mut preview = Widget::panel(id).with_direction(vertical()).with_flex(96.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(Color::rgb(17_u8, 22_u8, 27_u8)).with_radius(3.0_f32).with_padding(Insets::all(25.0_f32)))
+    preview.push(Widget::icon(id, icons.level).with_flex(46.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(45_u8, 146_u8, 205_u8)).with_pointer_events(false)))
+    card.push(preview)
+    card.push(Widget::label(project_name(path)).with_flex(22.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(231_u8, 232_u8, 235_u8)).with_font_size(11.0_f32).with_font_weight(600_u32).with_pointer_events(false)))
+    card.push(Widget::label(path).with_flex(30.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(126_u8, 129_u8, 137_u8)).with_font_size(8.0_f32).with_pointer_events(false)))
+    ret card
+}
+
+fn project_browser_view(mode: str, picker: FilePicker, name: TextEditor, error: str, icons: EditorIcons,
+    width: f32, height: f32) -> Widget {
+    let mut root = Widget::panel("project-browser").with_direction(vertical()).with_style(
+        Style::default().with_background(Color::rgb(13_u8, 14_u8, 17_u8)).with_foreground(Color::rgb(220_u8, 222_u8, 226_u8))
+            .with_font_family("Roboto").with_padding(Insets::all(24.0_f32)).with_gap(14.0_f32))
+    let mut brand = Widget::panel("project-browser-brand").with_direction(horizontal()).with_flex(72.0_f32, 0.0_f32).with_style(Style::default().with_gap(12.0_f32))
+    brand.push(Widget::icon("", icons.brand).with_flex(52.0_f32, 0.0_f32).with_style(Style::default().with_foreground(theme_accent()).with_pointer_events(false)))
+    brand.push(Widget::heading("GRAPHENE").with_flex(190.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(239_u8, 240_u8, 243_u8)).with_font_size(25.0_f32).with_font_weight(700_u32).with_pointer_events(false)))
+    brand.push(Widget::spacer(1.0_f32))
+    if mode != "home" { brand.push(Widget::button("browser-back", "Back to Projects").with_flex(130.0_f32, 0.0_f32)) }
+    root.push(brand)
+    if mode == "home" {
+        let mut hero = Widget::panel("browser-hero").with_direction(vertical()).with_flex(160.0_f32, 0.0_f32).with_style(
+            Style::default().with_background(Color::rgb(19_u8, 20_u8, 24_u8)).with_border(1.0_f32, Color::rgb(43_u8, 45_u8, 51_u8))
+                .with_radius(5.0_f32).with_padding(Insets::all(20.0_f32)).with_gap(9.0_f32))
+        hero.push(Widget::icon("", icons.brand).with_flex(66.0_f32, 0.0_f32).with_style(Style::default().with_foreground(theme_accent()).with_pointer_events(false)))
+        hero.push(Widget::label("Build worlds with Graphene").with_flex(28.0_f32, 0.0_f32).with_style(
+            Style::default().with_foreground(Color::rgb(235_u8, 236_u8, 239_u8)).with_font_size(17.0_f32).with_font_weight(600_u32).with_pointer_events(false)))
+        let mut actions = Widget::panel("browser-actions").with_direction(horizontal()).with_flex(38.0_f32, 0.0_f32).with_style(Style::default().with_gap(8.0_f32))
+        actions.push(Widget::icon_button("browser-new", "New Project", icons.add).with_flex(132.0_f32, 0.0_f32))
+        actions.push(Widget::icon_button("browser-open", "Open Project", icons.folder).with_flex(132.0_f32, 0.0_f32))
+        hero.push(actions)
+        root.push(hero)
+        root.push(Widget::label("RECENT PROJECTS").with_flex(24.0_f32, 0.0_f32).with_style(
+            Style::default().with_foreground(Color::rgb(137_u8, 140_u8, 148_u8)).with_font_size(9.0_f32).with_font_weight(700_u32)))
+        let mut cards = Widget::panel("recent-projects").with_direction(horizontal()).with_flex(0.0_f32, 1.0_f32).with_style(Style::default().with_gap(10.0_f32))
+        let recent = recent_projects()
+        let mut index = 0_usize
+        while index < recent.len() {
+            match recent.get(index) { Option::Some(path) => { cards.push(project_card("recent-project-" + index.fmt(), path, icons)) } Option::None => {} }
+            index = index + 1_usize
+        }
+        if recent.len() == 0_usize { cards.push(Widget::label("No recent projects").with_style(Style::default().with_foreground(Color::rgb(112_u8, 115_u8, 123_u8)))) }
+        root.push(cards)
+    } else {
+        root.push(Widget::label(if mode == "new" { "CREATE PROJECT" } else { "OPEN PROJECT" }).with_flex(25.0_f32, 0.0_f32).with_style(
+            Style::default().with_foreground(Color::rgb(225_u8, 227_u8, 231_u8)).with_font_size(12.0_f32).with_font_weight(700_u32)))
+        if mode == "new" { root.push(Widget::input("browser-project-name", name.value()).with_flex(38.0_f32, 0.0_f32).with_focus(true)) }
+        root.push(picker.view(file_picker_icons(icons)))
+        let mut footer = Widget::panel("browser-footer").with_direction(horizontal()).with_flex(38.0_f32, 0.0_f32).with_style(Style::default().with_gap(8.0_f32))
+        footer.push(Widget::label(error).with_flex(0.0_f32, 1.0_f32).with_style(Style::default().with_foreground(Color::rgb(220_u8, 102_u8, 94_u8)).with_font_size(10.0_f32)))
+        footer.push(Widget::button("browser-confirm", if mode == "new" { "Create Project" } else { "Open Project" }).with_flex(118.0_f32, 0.0_f32))
+        root.push(footer)
+    }
+    ret root
+}
+
+fn browse_for_project(window: Window, icons: EditorIcons) -> Option[str] {
+    let mut mode = "home"
+    let mut picker = FilePicker::new(home_dir())
+    let mut name = TextEditor::new("GrapheneProject")
+    let mut focus = "name"
+    let mut error = ""
+    let mut layout = window.layout(project_browser_view(mode, picker, name, error, icons,
+        window.surface_width() as f32, window.surface_height() as f32))
+    window.draw_layout(layout)
+    while window.is_open() {
+        let event = window.poll()
+        if event.kind() == event_close() { ret Option[str]::None }
+        let mut dirty = event.kind() == event_resize()
+        if event.kind() == event_pointer_down() {
+            let target = layout.hit(event.x(), event.y())
+            if target == "browser-new" { mode = "new" picker = FilePicker::new(home_dir()) focus = "name" error = "" }
+            elif target == "browser-open" { mode = "open" picker = FilePicker::new(home_dir()) focus = "picker" error = "" }
+            elif target == "browser-back" { mode = "home" error = "" }
+            elif target == "browser-project-name" { focus = "name" }
+            elif target == "file-picker-create-folder" { picker = picker.create_folder() focus = "picker" }
+            elif target == "browser-confirm" {
+                let path = if mode == "new" { picker.directory() + "/" + name.value() } else { picker.directory() }
+                let ready = if mode == "new" { create_project(path) } else { project_valid(project_paths(path)) }
+                if ready { remember_project(path) ret Option[str]::Some(path) }
+                error = if mode == "new" { "Unable to create project at this location" } else { "This folder is not a Graphene project" }
+            } else {
+                let mut recent_index = 0_usize
+                let recent = recent_projects()
+                while recent_index < recent.len() {
+                    if target == "recent-project-" + recent_index.fmt() {
+                        match recent.get(recent_index) { Option::Some(path) => { remember_project(path) ret Option[str]::Some(path) } Option::None => {} }
+                    }
+                    recent_index = recent_index + 1_usize
+                }
+                picker = picker.click(target)
+                focus = "picker"
+            }
+            dirty = true
+        }
+        if event.kind() == event_text_input() && event.text() != "" {
+            if mode == "new" && focus == "name" { name = name.insert(event.text()) } else { picker = picker.input(event.text()) }
+            dirty = true
+        }
+        if event.kind() == event_key_down() && event.key() == key_backspace() {
+            if mode == "new" && focus == "name" { name = name.backspace() } else { picker = picker.backspace() }
+            dirty = true
+        }
+        if event.kind() == event_key_down() && event.key() == key_enter() {
+            if picker.creating_folder() && focus == "picker" { picker = picker.create_folder() }
+            elif focus == "picker" { picker = picker.confirm_path() }
+            dirty = true
+        }
+        if event.kind() == event_scroll() && mode != "home" { picker = picker.scroll_by(0.0_f32 - event.wheel_y() * 24.0_f32) dirty = true }
+        if dirty {
+            layout = window.layout(project_browser_view(mode, picker, name, error, icons,
+                window.surface_width() as f32, window.surface_height() as f32))
+            window.draw_layout(layout)
+        }
+        if event.kind() == event_none() { sleep_ms(2_u64) }
+    }
+    ret Option[str]::None
 }
 
 fn dock_tab(id: str, text: str, active: bool) -> Widget {
@@ -1344,6 +1547,15 @@ fn main() -> u32 {
     }
     let icon_manager = IconManager::with_bundled("../encore-ui/assets/icons")
     let icons = EditorIcons::load(icon_manager)
+    let requested_project = requested_project_path()
+    let mut startup_project = Option[str]::None
+    if requested_project != "" && project_valid(project_paths(requested_project)) {
+        remember_project(requested_project)
+        startup_project = Option[str]::Some(requested_project)
+    } else { startup_project = browse_for_project(window, icons) }
+    let mut project_at_startup = ""
+    match startup_project { Option::Some(path) => { project_at_startup = path } Option::None => {} }
+    if project_at_startup == "" { window.destroy() ret 0_u32 }
     let mut simulating = env("GRAPHENE_AUTOPLAY").is_some()
     let mut selected = "Cube 1"
     let mut selected_cube = 1_u32
@@ -1354,10 +1566,7 @@ fn main() -> u32 {
         }
         Option::None => { "asset-cube" }
     }
-    let mut project_root = match env("GRAPHENE_PROJECT") {
-        Option::Some(path) => { trim_trailing_separator(path) }
-        Option::None => { cwd() }
-    }
+    let mut project_root = project_at_startup
     let mut paths = project_paths(project_root)
     let mut scene_path = paths.scene
     let mut status_message = if project_valid(paths) { "Loading project " + project_root } else { "No project loaded" }
