@@ -35,6 +35,7 @@
 #pragma comment(linker, "/STACK:8388608")
 #else
 #include <pthread.h>
+#include <spawn.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/utsname.h>
@@ -45,6 +46,9 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#if !defined(__APPLE__)
+extern char **environ;
+#endif
 #endif
 
 typedef struct {
@@ -59,6 +63,7 @@ typedef struct {
 } encore_async_event;
 
 typedef void (*encore_thread_entry)(void *);
+typedef void (*encore_thread_cleanup)(void *);
 
 typedef struct {
 #ifdef _WIN32
@@ -67,8 +72,16 @@ typedef struct {
     pthread_t thread;
 #endif
     encore_thread_entry entry;
+    encore_thread_cleanup cleanup;
     void *payload;
     bool started;
+    bool joined;
+    atomic_size_t references;
+#ifdef _WIN32
+    CRITICAL_SECTION join_lock;
+#else
+    pthread_mutex_t join_lock;
+#endif
 } encore_thread_task;
 
 #ifdef _WIN32
@@ -85,20 +98,28 @@ static void *encore_thread_main(void *raw) {
 #endif
 }
 
-size_t encore_thread_spawn(encore_thread_entry entry, void *payload) {
+size_t encore_thread_spawn(encore_thread_entry entry, void *payload, encore_thread_cleanup cleanup) {
     if (entry == NULL) return 0;
     encore_thread_task *task = malloc(sizeof(*task));
     if (task == NULL) return 0;
     task->entry = entry;
+    task->cleanup = cleanup;
     task->payload = payload;
     task->started = false;
+    task->joined = false;
+    atomic_init(&task->references, 1);
+#ifdef _WIN32
+    InitializeCriticalSection(&task->join_lock);
+#else
+    pthread_mutex_init(&task->join_lock, NULL);
+#endif
 #ifdef _WIN32
     task->thread = CreateThread(NULL, 0, encore_thread_main, task, 0, NULL);
     if (task->thread != NULL) task->started = true;
 #else
     if (pthread_create(&task->thread, NULL, encore_thread_main, task) == 0) task->started = true;
 #endif
-    if (!task->started) task->entry(task->payload);
+    if (!task->started) { task->entry(task->payload); task->joined = true; }
     return (size_t)(uintptr_t)task;
 }
 
@@ -106,16 +127,35 @@ void *encore_thread_join(size_t token) {
     encore_thread_task *task = (encore_thread_task *)(uintptr_t)token;
     if (task == NULL) return NULL;
 #ifdef _WIN32
-    if (task->started) {
-        WaitForSingleObject(task->thread, INFINITE);
-        CloseHandle(task->thread);
+    EnterCriticalSection(&task->join_lock);
+    if (!task->joined && task->started) {
+        WaitForSingleObject(task->thread, INFINITE); CloseHandle(task->thread); task->joined = true;
     }
+    LeaveCriticalSection(&task->join_lock);
 #else
-    if (task->started) pthread_join(task->thread, NULL);
+    pthread_mutex_lock(&task->join_lock);
+    if (!task->joined && task->started) { pthread_join(task->thread, NULL); task->joined = true; }
+    pthread_mutex_unlock(&task->join_lock);
 #endif
-    void *payload = task->payload;
+    return task->payload;
+}
+
+void encore_thread_retain(size_t token) {
+    encore_thread_task *task = (encore_thread_task *)(uintptr_t)token;
+    if (task != NULL) atomic_fetch_add_explicit(&task->references, 1, memory_order_relaxed);
+}
+
+void encore_thread_release(size_t token) {
+    encore_thread_task *task = (encore_thread_task *)(uintptr_t)token;
+    if (task == NULL || atomic_fetch_sub_explicit(&task->references, 1, memory_order_acq_rel) != 1) return;
+    encore_thread_join(token);
+    if (task->cleanup != NULL) task->cleanup(task->payload);
+#ifdef _WIN32
+    DeleteCriticalSection(&task->join_lock);
+#else
+    pthread_mutex_destroy(&task->join_lock);
+#endif
     free(task);
-    return payload;
 }
 
 size_t encore_thread_available_parallelism(void) {
@@ -1571,17 +1611,26 @@ cleanup:
     if (saved_stderr >= 0) { fflush(stderr); _dup2(saved_stderr, 2); _close(saved_stderr); }
     if (output_fd >= 0) _close(output_fd);
 #else
-    pid_t child = fork();
-    if (child == 0) {
-        if (output_path != NULL) {
-            int output_fd = open(output_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-            if (output_fd < 0 || dup2(output_fd, STDOUT_FILENO) < 0 || dup2(output_fd, STDERR_FILENO) < 0) _Exit(126);
-            close(output_fd);
-        }
-        execvp(program_c, argv);
-        _Exit(127);
+    posix_spawn_file_actions_t actions;
+    bool actions_initialized = posix_spawn_file_actions_init(&actions) == 0;
+    bool actions_ready = actions_initialized;
+    int output_fd = -1;
+    if (actions_ready && output_path != NULL) {
+        output_fd = open(output_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+        if (output_fd < 0 || posix_spawn_file_actions_adddup2(&actions, output_fd, STDOUT_FILENO) != 0 ||
+            posix_spawn_file_actions_adddup2(&actions, output_fd, STDERR_FILENO) != 0 ||
+            posix_spawn_file_actions_addclose(&actions, output_fd) != 0) actions_ready = false;
     }
-    if (child > 0) {
+    pid_t child = -1;
+#ifdef __APPLE__
+    char **envp = *_NSGetEnviron();
+#else
+    char **envp = environ;
+#endif
+    int spawn_status = actions_ready ? posix_spawnp(&child, program_c, &actions, NULL, argv, envp) : EINVAL;
+    if (output_fd >= 0) close(output_fd);
+    if (actions_initialized) posix_spawn_file_actions_destroy(&actions);
+    if (spawn_status == 0 && child > 0) {
         int status = 0;
         if (waitpid(child, &status, 0) >= 0) {
             if (WIFEXITED(status)) result = WEXITSTATUS(status);

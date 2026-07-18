@@ -12,16 +12,18 @@ import std::os::mkdir_all
 import std::path::Path
 import std::process::run_args
 import std::vec::Vec
+import std::dict::Hashable
 
 import ehirlib::parse_module_text
 import ehir_llvm_backend::codegen::{emit_ir, emit_ir_for_target}
 
 import refrain::frontend::sema::{semantic_check_error, semantic_check_error_for_target, semantic_check_error_for_target_and_features}
-import refrain::frontend::translator::{filter_ast_for_target, translate_to_ehir, translate_to_ehir_for_target, translate_to_ehir_for_target_and_features}
+import refrain::frontend::translator::{TranslationModule, filter_ast_for_target, translate_modules_to_ehir, translate_to_ehir, translate_to_ehir_for_target, translate_to_ehir_for_target_and_features}
 import refrain::frontend::parser::statements::Statement
 import refrain::project::load_binary_workspace
 import refrain::project::WorkspaceModule
 import refrain::project::WorkspaceRefrain
+import refrain::project::ProjectWorkspace
 import refrain::project::{system_core_root, workspace_release_modules, workspace_root_refrain}
 import refrain::project::manifest::{project_manifest_target, project_target_toolchain, read_project_manifest}
 import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host, target_is_supported, toolchain_driver_is_supported}
@@ -29,7 +31,17 @@ import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, 
 import rich::BuildProgress
 
 pub fn run_frontend_build() -> u32 {
-    ret compile_project(Path::new(".").resolve())
+    ret compile_project(requested_project_root())
+}
+
+pub fn requested_project_root() -> Path {
+    let value = requested_value("--manifest-path", "")
+    if value == "" { ret Path::new(".").resolve() }
+    let manifest = Path::new(value).expanduser().resolve()
+    match manifest.parent() {
+        Option[Path]::Some(parent) => { ret parent }
+        Option[Path]::None => { ret Path::new(".").resolve() }
+    }
 }
 
 pub fn compile_project(root: Path) -> u32 {
@@ -65,8 +77,8 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     progress.start_build(path_name_or(root, "project"), profile)
     progress.start_stage("Workspace", "workspace")
     let mut workspace = load_binary_workspace(root)
-    let ast = filtered_workspace_ast(workspace.modules, target)
     let module_count = workspace.modules.len()
+    let ast_count = workspace_ast_count(workspace.modules)
 
     let mut project_name = "program"
     match workspace_root_refrain(workspace) {
@@ -78,7 +90,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             ret 1_u32
         }
     }
-    progress.finish_stage(Debug::fmt(workspace.refrains.len()) + " refrains, " + Debug::fmt(module_count) + " modules, " + Debug::fmt(ast.len()) + " AST nodes")
+    progress.finish_stage(Debug::fmt(workspace.refrains.len()) + " refrains, " + Debug::fmt(module_count) + " modules, " + Debug::fmt(ast_count) + " AST nodes")
 
     let target_dir = root.join("target")
     let profile_dir = if target_request == "" || target_request == "auto" || target_request == "host" || target_request == "native" { target_dir.join(profile) } else { target_dir.join(target.triple).join(profile) }
@@ -87,46 +99,70 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         progress.fail_stage("failed to create target directory")
         ret 1_u32
     }
+    let binary_path = profile_dir.join(target_executable_name(target, project_name))
+    let fingerprint_path = profile_dir.join(".encore-fingerprint")
+    let codegen_fingerprint_path = profile_dir.join(".encore-codegen-fingerprint")
+    let fingerprint = workspace_build_fingerprint(root, workspace, target, toolchain, profile, emit)
+    let codegen_fingerprint = workspace_codegen_fingerprint(root, workspace, target, toolchain, profile, emit)
+    if emit == "binary" && file_exists(native_path(binary_path.as_str())) &&
+        file_exists(native_path(fingerprint_path.as_str())) &&
+        read_file(native_path(fingerprint_path.as_str())) == fingerprint {
+        workspace_release_modules(workspace)
+        progress.finish_build(profile, binary_path.as_str())
+        ret 0_u32
+    }
+    remove_file(native_path(fingerprint_path.as_str()))
     remove_file(native_path(root.join("target.bootstrap.ehir").as_str()))
     remove_file(native_path(root.join("target.bootstrap.ll").as_str()))
-
-    progress.start_stage("Check", "workspace")
-    if !run_workspace_semantic_checks(workspace.modules, target, progress) {
-        progress.fail_stage("semantic checks failed")
-        ret 1_u32
-    }
-    progress.finish_stage(Debug::fmt(module_count) + " modules")
-    workspace_release_modules(workspace)
-
-    progress.start_stage("Lower", project_name)
-    progress.update(project_name, "EHIR", 1_usize, 1_usize)
     let out_path = profile_dir.join(project_name + ".ehir")
-    if !write_ehir_artifact(ast, target, out_path) {
-        progress.fail_stage("failed to write translated EHIR")
-        ret 1_u32
+    let llvm_path = profile_dir.join(project_name + ".ll")
+    let object_dir = profile_dir.join("object")
+    let object_suffix = if target.os == "windows" { ".obj" } else { ".o" }
+    let llvm_object = object_dir.join(project_name + object_suffix)
+    let codegen_cached = file_exists(native_path(codegen_fingerprint_path.as_str())) &&
+        read_file(native_path(codegen_fingerprint_path.as_str())) == codegen_fingerprint &&
+        file_exists(native_path(out_path.as_str())) && file_exists(native_path(llvm_path.as_str())) &&
+        file_exists(native_path(llvm_object.as_str()))
+    if codegen_cached {
+        workspace_release_modules(workspace)
+        progress.start_stage("Codegen", project_name)
+        progress.finish_stage("cached EHIR, LLVM IR and object")
+    } else {
+        progress.start_stage("Check", "workspace")
+        if !run_workspace_semantic_checks(workspace.modules, target, progress) {
+            progress.fail_stage("semantic checks failed")
+            ret 1_u32
+        }
+        progress.finish_stage(Debug::fmt(module_count) + " modules")
+        let translation_modules = workspace_translation_modules(workspace.modules, target)
+        workspace_release_modules(workspace)
+
+        progress.start_stage("Lower", project_name)
+        progress.update(project_name, "EHIR", 1_usize, 1_usize)
+        if !write_ehir_artifact(translation_modules, target, out_path) {
+            progress.fail_stage("failed to write translated EHIR")
+            ret 1_u32
+        }
+        progress.finish_stage("EHIR generated")
+
+        progress.start_stage("Codegen", "LLVM IR")
+        progress.update(project_name, "LLVM IR", 1_usize, 1_usize)
+        if !write_llvm_artifact(out_path, llvm_path, target) {
+            progress.fail_stage("failed to write translated LLVM IR")
+            ret 1_u32
+        }
+        progress.finish_stage("LLVM IR generated")
     }
-    progress.finish_stage("EHIR generated")
     if emit == "ehir" {
         progress.finish_artifact(profile, "EHIR", out_path.as_str())
         ret 0_u32
     }
-
-    progress.start_stage("Codegen", "LLVM IR")
-    progress.update(project_name, "LLVM IR", 1_usize, 1_usize)
-    let llvm_path = profile_dir.join(project_name + ".ll")
-    if !write_llvm_artifact(out_path, llvm_path, target) {
-        progress.fail_stage("failed to write translated LLVM IR")
-        ret 1_u32
-    }
-    progress.finish_stage("LLVM IR generated")
     if emit == "llvm-ir" {
-        remove_file(native_path(out_path.as_str()))
         progress.finish_artifact(profile, "LLVM IR", llvm_path.as_str())
         ret 0_u32
     }
 
     progress.start_stage("Compile", "target objects")
-    let binary_path = profile_dir.join(target_executable_name(target, project_name))
     let mut native_sources = Vec[Path]::new()
     let runtime_path = system_core_root(root).join("runtime.c").resolve()
     if toolchain.hosted_runtime { native_sources.push(runtime_path) }
@@ -145,45 +181,59 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             }
         }
     }
-    let object_dir = profile_dir.join("object")
     progress.suspend()
     if mkdir_all(native_path(object_dir.as_str())) != 0_i32 {
         progress.fail_stage("failed to create object directory")
         ret 1_u32
     }
-    let object_suffix = if target.os == "windows" { ".obj" } else { ".o" }
-    let llvm_object = object_dir.join(project_name + object_suffix)
-    let mut llvm_args = compiler_args(profile, target, toolchain)
-    llvm_args.push("-c")
-    llvm_args.push(native_path(llvm_path.as_str()))
-    llvm_args.push("-o")
-    llvm_args.push(native_path(llvm_object.as_str()))
-    if run_args(toolchain.compiler, llvm_args) != 0_i32 {
-        progress.fail_stage("LLVM IR assembly failed for target " + target.triple)
-        ret 1_u32
+    if !codegen_cached {
+        let mut llvm_args = compiler_args(profile, target, toolchain)
+        llvm_args.push("-c")
+        llvm_args.push(native_path(llvm_path.as_str()))
+        llvm_args.push("-o")
+        llvm_args.push(native_path(llvm_object.as_str()))
+        if run_args(toolchain.compiler, llvm_args) != 0_i32 {
+            progress.fail_stage("LLVM IR assembly failed for target " + target.triple)
+            ret 1_u32
+        }
+        if write_file(native_path(codegen_fingerprint_path.as_str()), codegen_fingerprint) != 0_i32 {
+            progress.fail_stage("failed to write codegen fingerprint")
+            ret 1_u32
+        }
     }
     if emit == "object" {
-        remove_file(native_path(out_path.as_str()))
-        remove_file(native_path(llvm_path.as_str()))
         progress.finish_stage("1 target object")
         progress.finish_artifact(profile, "Object", llvm_object.as_str())
         ret 0_u32
     }
     let mut objects = Vec[str]::new()
     objects.push(native_path(llvm_object.as_str()))
+    let mut compiled_native_count = 0_usize
     let mut source_index = 0_usize
     while source_index < native_sources.len() {
         match native_sources.get(source_index) {
             Option[Path]::Some(source) => {
                 let object = object_dir.join("native_" + Debug::fmt(source_index) + object_suffix)
-                let mut native_args = compiler_args(profile, target, toolchain)
-                native_args.push("-c")
-                native_args.push(native_path(source.as_str()))
-                native_args.push("-o")
-                native_args.push(native_path(object.as_str()))
-                if run_args(toolchain.compiler, native_args) != 0_i32 {
-                    progress.fail_stage("native runtime compilation failed for target " + target.triple)
-                    ret 1_u32
+                let object_fingerprint_path = Path::new(object.as_str() + ".fingerprint")
+                let object_fingerprint = native_object_fingerprint(source, target, toolchain, profile)
+                let object_cached = file_exists(native_path(object.as_str())) &&
+                    file_exists(native_path(object_fingerprint_path.as_str())) &&
+                    read_file(native_path(object_fingerprint_path.as_str())) == object_fingerprint
+                if !object_cached {
+                    let mut native_args = compiler_args(profile, target, toolchain)
+                    native_args.push("-c")
+                    native_args.push(native_path(source.as_str()))
+                    native_args.push("-o")
+                    native_args.push(native_path(object.as_str()))
+                    if run_args(toolchain.compiler, native_args) != 0_i32 {
+                        progress.fail_stage("native runtime compilation failed for target " + target.triple)
+                        ret 1_u32
+                    }
+                    if write_file(native_path(object_fingerprint_path.as_str()), object_fingerprint) != 0_i32 {
+                        progress.fail_stage("failed to write native object fingerprint")
+                        ret 1_u32
+                    }
+                    compiled_native_count = compiled_native_count + 1_usize
                 }
                 objects.push(native_path(object.as_str()))
             }
@@ -191,7 +241,8 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         }
         source_index = source_index + 1_usize
     }
-    progress.finish_stage(Debug::fmt(native_sources.len() + 1_usize) + " target objects")
+    progress.finish_stage(Debug::fmt(compiled_native_count + (if codegen_cached { 0_usize } else { 1_usize })) +
+        " of " + Debug::fmt(native_sources.len() + 1_usize) + " objects")
 
     progress.start_stage("Link", project_name)
     progress.suspend()
@@ -206,10 +257,12 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     link_args.push("-o")
     link_args.push(native_path(binary_path.as_str()))
     let link_code = run_args(toolchain.linker, link_args)
-    remove_file(native_path(out_path.as_str()))
-    remove_file(native_path(llvm_path.as_str()))
     if link_code != 0_i32 {
         progress.fail_stage("native link failed for target " + target.triple)
+        ret 1_u32
+    }
+    if write_file(native_path(fingerprint_path.as_str()), fingerprint) != 0_i32 {
+        progress.fail_stage("failed to write build fingerprint")
         ret 1_u32
     }
     progress.finish_stage("native binary")
@@ -217,8 +270,116 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     ret 0_u32
 }
 
-fn write_ehir_artifact(ast: Vec[Statement], target: TargetSpec, path: Path) -> bool {
-    let text = translate_to_ehir_for_target(ast, target)
+fn workspace_build_fingerprint(root: Path, workspace: ProjectWorkspace, target: TargetSpec, toolchain: Toolchain, profile: str, emit: str) -> str {
+    let mut value = workspace_codegen_fingerprint(root, workspace, target, toolchain, profile, emit)
+    for source in toolchain.runtime_sources {
+        value = fingerprint_native_file(value, resolve_project_path(root, source), 0_u32)
+    }
+    let core_runtime = system_core_root(root).join("runtime.c").resolve()
+    value = fingerprint_native_file(value, core_runtime, 0_u32)
+    for refrain in workspace.refrains {
+        value = fingerprint_native_file(value, refrain.root.join("runtime.c").resolve(), 0_u32)
+        for feature in refrain.enabled_features {
+            value = fingerprint_native_file(value,
+                refrain.root.join("runtime." + feature + ".c").resolve(), 0_u32)
+        }
+    }
+    ret Debug::fmt(value.hash())
+}
+
+fn workspace_codegen_fingerprint(root: Path, workspace: ProjectWorkspace, target: TargetSpec,
+    toolchain: Toolchain, profile: str, emit: str) -> str {
+    let mut value = "encore-codegen-cache-v4\ncompiler=encore-0.1.3\nownership=owned-assignment-transfer-v2\nmethod-receiver=mutable-field-load-v1\nthread-handle=shared-token-v1\n" +
+        target.triple + "\n" + profile + "\n" + emit
+    value = fingerprint_mix(value, toolchain.driver)
+    value = fingerprint_mix(value, toolchain.compiler)
+    value = fingerprint_mix(value, toolchain.linker)
+    value = fingerprint_mix(value, toolchain.sysroot)
+    value = fingerprint_mix(value, toolchain.cpu)
+    value = fingerprint_mix(value, toolchain.features)
+    value = fingerprint_mix(value, toolchain.linker_script)
+    value = fingerprint_mix(value, Debug::fmt(toolchain.hosted_runtime))
+    for arg in toolchain.compile_args { value = fingerprint_mix(value, arg) }
+    for arg in toolchain.link_args { value = fingerprint_mix(value, arg) }
+    for source in toolchain.runtime_sources {
+        value = fingerprint_mix(value, resolve_project_path(root, source).as_str())
+    }
+    for module in workspace.modules {
+        value = fingerprint_mix(value, module.owner_name)
+        value = fingerprint_mix(value, module.module_path.as_str())
+        value = fingerprint_mix(value, module.source)
+        for feature in module.enabled_features { value = fingerprint_mix(value, feature) }
+    }
+    let manifest_path = root.join("encore.toml")
+    if file_exists(native_path(manifest_path.as_str())) { value = fingerprint_mix(value, read_file(native_path(manifest_path.as_str()))) }
+    let lock_path = root.join("encore.lock")
+    if file_exists(native_path(lock_path.as_str())) { value = fingerprint_mix(value, read_file(native_path(lock_path.as_str()))) }
+    ret Debug::fmt(value.hash())
+}
+
+fn fingerprint_native_file(current: str, path: Path, depth: u32) -> str {
+    if depth >= 32_u32 || !file_exists(native_path(path.as_str())) { ret current }
+    let source = read_file(native_path(path.as_str()))
+    let mut value = fingerprint_mix(current, path.as_str())
+    value = fingerprint_mix(value, source)
+    match path.parent() {
+        Option[Path]::Some(parent) => {
+            for include in quoted_c_includes(source) {
+                value = fingerprint_native_file(value, parent.join(include).resolve(), depth + 1_u32)
+            }
+        }
+        Option[Path]::None => {}
+    }
+    ret value
+}
+
+fn native_object_fingerprint(source: Path, target: TargetSpec, toolchain: Toolchain, profile: str) -> str {
+    let mut value = "encore-native-object-v1\n" + target.triple + "\n" + profile
+    value = fingerprint_mix(value, toolchain.compiler)
+    value = fingerprint_mix(value, toolchain.sysroot)
+    value = fingerprint_mix(value, toolchain.cpu)
+    value = fingerprint_mix(value, toolchain.features)
+    for arg in toolchain.compile_args { value = fingerprint_mix(value, arg) }
+    value = fingerprint_native_file(value, source, 0_u32)
+    ret Debug::fmt(value.hash())
+}
+
+fn quoted_c_includes(source: str) -> Vec[str] {
+    let mut includes = Vec[str]::new()
+    let mut index = 0_usize
+    while index < source.len() {
+        if source.byte_at(index) != 35_u8 { index = index + 1_usize continue }
+        let mut token = index + 1_usize
+        while token < source.len() && (source.byte_at(token) == 32_u8 || source.byte_at(token) == 9_u8) {
+            token = token + 1_usize
+        }
+        if token + 7_usize > source.len() || source.slice(token, 7_usize) != "include" {
+            index = index + 1_usize continue
+        }
+        token = token + 7_usize
+        while token < source.len() && source.byte_at(token) != 10_u8 && source.byte_at(token) != 34_u8 {
+            token = token + 1_usize
+        }
+        if token >= source.len() || source.byte_at(token) != 34_u8 { index = token continue }
+        let start = token + 1_usize
+        token = start
+        while token < source.len() && source.byte_at(token) != 10_u8 && source.byte_at(token) != 34_u8 {
+            token = token + 1_usize
+        }
+        if token < source.len() && source.byte_at(token) == 34_u8 && token > start {
+            includes.push(source.slice(start, token - start))
+        }
+        index = token + 1_usize
+    }
+    ret includes
+}
+
+fn fingerprint_mix(current: str, value: str) -> str {
+    ret Debug::fmt((current + "\n" + value).hash())
+}
+
+fn write_ehir_artifact(modules: Vec[TranslationModule], target: TargetSpec, path: Path) -> bool {
+    let text = translate_modules_to_ehir(modules, target)
     ret write_file(native_path(path.as_str()), text) == 0_i32
 }
 
@@ -480,6 +641,26 @@ fn filtered_workspace_ast(modules: Vec[WorkspaceModule], target: TargetSpec) -> 
     let mut ast = Vec[Statement]::new()
     for module in modules { ast.extend(filter_ast_for_target(module.ast, target, module.enabled_features)) }
     ret ast
+}
+
+fn workspace_ast_count(modules: Vec[WorkspaceModule]) -> usize {
+    let mut count = 0_usize
+    for module in modules { count = count + module.ast.len() }
+    ret count
+}
+
+fn workspace_translation_modules(modules: Vec[WorkspaceModule], target: TargetSpec) -> Vec[TranslationModule] {
+    let mut out = Vec[TranslationModule]::new()
+    for module in modules {
+        out.push(TranslationModule{
+            module.module_id,
+            module.module_path.as_str(),
+            module.resolved_imports,
+            filter_ast_for_target(module.ast, target, module.enabled_features),
+            module.enabled_features
+        })
+    }
+    ret out
 }
 
 fn module_display_name(module: WorkspaceModule) -> str {
