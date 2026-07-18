@@ -416,6 +416,14 @@ size_t graphene_vk_frame_acquire(size_t swapchain_handle) {
         strncpy(frame->error, "Swapchain cannot acquire another frame", sizeof(frame->error) - 1); return (size_t)frame;
     }
     GrapheneVkDevice *device = swapchain->owner;
+    if (!swapchain->offscreen && swapchain->window != NULL) {
+        graphene_vk_window_refresh(swapchain->window);
+        if ((swapchain->window->width != swapchain->width || swapchain->window->height != swapchain->height) &&
+            !graphene_vk_swapchain_rebuild(swapchain)) {
+            strncpy(frame->error, swapchain->error, sizeof(frame->error) - 1);
+            return (size_t)frame;
+        }
+    }
     for (uint32_t attempt = 0; attempt < 2; ++attempt) {
         frame->frame_index = swapchain->frame_index;
         if (device->wait_for_fences(device->device, 1, &swapchain->fences[frame->frame_index], 1, UINT64_MAX) != VK_SUCCESS) {
@@ -601,20 +609,11 @@ bool graphene_vk_frame_upload_ui(size_t frame_handle, size_t pixels_handle,
     unsigned char *destination = (unsigned char *)(frame->frame_index == 0
         ? swapchain->readback_pixels : swapchain->ui_staging_pixels);
     if (staging_buffer == NULL || destination == NULL) return false;
-    bool matching_extent = width == swapchain->width && height == swapchain->height;
-    if (!matching_extent) {
-        for (uint32_t row = 0; row < swapchain->height; ++row) {
-            uint32_t source_y = (uint32_t)(((uint64_t)row * height) / swapchain->height);
-            for (uint32_t column = 0; column < swapchain->width; ++column) {
-                uint32_t source_x = (uint32_t)(((uint64_t)column * width) / swapchain->width);
-                memcpy(destination + (size_t)row * swapchain->readback_pitch + (size_t)column * 4u,
-                    source + (size_t)source_y * pitch + (size_t)source_x * 4u, 4u);
-            }
-        }
-        hole_x = (uint32_t)(((uint64_t)hole_x * swapchain->width) / width);
-        hole_y = (uint32_t)(((uint64_t)hole_y * swapchain->height) / height);
-        hole_width = (uint32_t)(((uint64_t)hole_width * swapchain->width) / width);
-        hole_height = (uint32_t)(((uint64_t)hole_height * swapchain->height) / height);
+    if (width != swapchain->width || height != swapchain->height) {
+        if (graphene_vk_trace_enabled()) fprintf(stderr,
+            "graphene-vk: UI extent %ux%u does not match swapchain %ux%u; waiting for rebuild\n",
+            width, height, swapchain->width, swapchain->height);
+        return false;
     }
     width = swapchain->width;
     height = swapchain->height;
@@ -624,13 +623,11 @@ bool graphene_vk_frame_upload_ui(size_t frame_handle, size_t pixels_handle,
     if (hole_height > height - hole_y) hole_height = height - hole_y;
     uint32_t hole_right = hole_x + hole_width;
     uint32_t hole_bottom = hole_y + hole_height;
-    if (matching_extent) {
-        graphene_vk_stage_ui_region(swapchain, destination, source, pitch, 0, 0, width, hole_y);
-        graphene_vk_stage_ui_region(swapchain, destination, source, pitch, 0, hole_bottom, width, height - hole_bottom);
-        graphene_vk_stage_ui_region(swapchain, destination, source, pitch, 0, hole_y, hole_x, hole_height);
-        graphene_vk_stage_ui_region(swapchain, destination, source, pitch, hole_right, hole_y,
-            width - hole_right, hole_height);
-    }
+    graphene_vk_stage_ui_region(swapchain, destination, source, pitch, 0, 0, width, hole_y);
+    graphene_vk_stage_ui_region(swapchain, destination, source, pitch, 0, hole_bottom, width, height - hole_bottom);
+    graphene_vk_stage_ui_region(swapchain, destination, source, pitch, 0, hole_y, hole_x, hole_height);
+    graphene_vk_stage_ui_region(swapchain, destination, source, pitch, hole_right, hole_y,
+        width - hole_right, hole_height);
     VkImageMemoryBarrier to_copy = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
