@@ -474,7 +474,9 @@ static void ui_clear_text_cache(UiWindow *state) {
 static bool ui_resize_software_surface(UiWindow *state) {
     if (state == NULL || !state->external_presentation || state->window == NULL) return true;
     int width = 0, height = 0;
-    if (!g_sdl.GetWindowSizeInPixels(state->window, &width, &height) || width <= 0 || height <= 0) return false;
+    /* Wayland compositors may temporarily report no extent while a window is
+       minimized, moved between tags, or passing through a resize animation. */
+    if (!g_sdl.GetWindowSizeInPixels(state->window, &width, &height) || width <= 0 || height <= 0) return true;
     state->width = (uint32_t)((float)width / state->pixel_density);
     state->height = (uint32_t)((float)height / state->pixel_density);
     if (state->software_surface != NULL && state->software_surface->width == width &&
@@ -639,6 +641,13 @@ size_t encore_ui_gpu_window_create(encore_str title, uint32_t width, uint32_t he
     state->width = width;
     state->height = height;
     g_window_count += 1;
+#if !defined(_WIN32)
+    if (g_window_count == 1) {
+        g_terminate_requested = 0;
+        signal(SIGTERM, ui_termination_signal);
+        signal(SIGINT, ui_termination_signal);
+    }
+#endif
     return (size_t)(uintptr_t)state;
 }
 
