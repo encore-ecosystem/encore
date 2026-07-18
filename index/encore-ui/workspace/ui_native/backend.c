@@ -1005,7 +1005,7 @@ static int ui_round_boundary(float x, float y, float width, float height, float 
     return count;
 }
 
-static bool ui_fill_rounded_aa(UiWindow *state, float x, float y, float width, float height, float radius, uint32_t color) {
+static bool ui_fill_rounded_geometry(UiWindow *state, float x, float y, float width, float height, float radius, uint32_t color) {
     UiSdlFPoint inner[36], outer[36];
     int count = ui_round_boundary(x, y, width, height, radius, inner);
     ui_round_boundary(x - 1.0f, y - 1.0f, width + 2.0f, height + 2.0f, radius + 1.0f, outer);
@@ -1028,6 +1028,23 @@ static bool ui_fill_rounded_aa(UiWindow *state, float x, float y, float width, f
         indices[at++] = inner_next; indices[at++] = outer_i; indices[at++] = outer_next;
     }
     return g_sdl.RenderGeometry(state->renderer, NULL, vertices, 1 + count * 2, indices, at);
+}
+
+static bool ui_fill_rounded_aa(UiWindow *state, float x, float y, float width, float height, float radius, uint32_t color) {
+    float r = radius;
+    if (r > width * 0.5f) r = width * 0.5f;
+    if (r > height * 0.5f) r = height * 0.5f;
+    if (r <= 0.0f || !ui_color(state, color)) return false;
+    UiSdlFRect horizontal = {x + r, y, width - r * 2.0f, height};
+    UiSdlFRect vertical = {x, y + r, width, height - r * 2.0f};
+    bool result = true;
+    if (horizontal.w > 0.0f) result = g_sdl.RenderFillRect(state->renderer, &horizontal) && result;
+    if (vertical.h > 0.0f) result = g_sdl.RenderFillRect(state->renderer, &vertical) && result;
+    result = ui_fill_rounded_geometry(state, x, y, r * 2.0f, r * 2.0f, r, color) && result;
+    result = ui_fill_rounded_geometry(state, x + width - r * 2.0f, y, r * 2.0f, r * 2.0f, r, color) && result;
+    result = ui_fill_rounded_geometry(state, x + width - r * 2.0f, y + height - r * 2.0f, r * 2.0f, r * 2.0f, r, color) && result;
+    result = ui_fill_rounded_geometry(state, x, y + height - r * 2.0f, r * 2.0f, r * 2.0f, r, color) && result;
+    return result;
 }
 
 static bool ui_stroke_rounded_aa(size_t handle, float x, float y, float width, float height, float radius, uint32_t color) {
