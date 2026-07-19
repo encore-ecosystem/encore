@@ -704,7 +704,6 @@ uint32_t encore_ui_window_poll(size_t handle) {
     bool had_resize = surface_resized;
     while (g_sdl.PollEvent(&event)) {
         if (event.type == UI_SDL_EVENT_QUIT || event.type == UI_SDL_EVENT_WINDOW_CLOSE) {
-            state->open = false;
             state->event_kind = UI_EVENT_CLOSE;
             return state->event_kind;
         } else if (event.type == UI_SDL_EVENT_WINDOW_EXPOSED) {
