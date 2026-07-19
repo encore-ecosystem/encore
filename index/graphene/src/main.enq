@@ -11,7 +11,7 @@ import core::vec::Vec
 import encore_ui::{Color, FilePicker, FilePickerIcons, FontManager, IconManager, Insets, Style, SvgDocument, TextEditor, Widget, WidgetLayout, Window, event_close, event_key_down, event_pointer_down,
     event_pointer_move, event_pointer_up, event_resize, event_scroll, event_text_input, backend_error, backend_name,
     align_start, horizontal, key_backspace, key_delete, key_down, key_end, key_enter, key_home, key_left, key_right, key_up, text_end, vertical}
-import graphene::{ActorRecord, EditorActors, EditorEdit, ImportedMeshAsset, MaterialId, MeshId, RenameEdit, Renderable, Scene, SceneActor, SceneAsset,
+import graphene::{ActorRecord, EditorActors, EditorEdit, ImportedMeshAsset, MaterialId, MeshId, ParentEdit, RenameEdit, Renderable, Scene, SceneActor, SceneAsset,
     Transform, TransformEdit, ViewportRenderer, VisibilityEdit, add_actor_mesh_name, apply_editor_transform,
     action_needs_confirmation, discover_obj_assets, guard_editor_action, guarded_action, import_obj_asset, plane_mesh, sphere_mesh}
 import linalg::Vec3
@@ -1228,7 +1228,7 @@ fn axis_stepper(axis: str, minus_id: str, plus_id: str, icons: EditorIcons, hove
     ret group
 }
 
-fn actor_row(id: str, name: str, kind: str, icon: SvgDocument, selected: bool, visible: bool, hovered: str, nested: bool,
+fn actor_row(id: str, name: str, kind: str, icon: SvgDocument, selected: bool, visible: bool, hovered: str, depth: u32,
     icons: EditorIcons) -> Widget {
     let background = if selected { Color::rgb(31_u8, 70_u8, 97_u8) } else {
         if hovered == id { Color::rgb(42_u8, 43_u8, 48_u8) } else { Color::rgb(24_u8, 24_u8, 27_u8) }
@@ -1239,8 +1239,8 @@ fn actor_row(id: str, name: str, kind: str, icon: SvgDocument, selected: bool, v
     row.push(Widget::panel("").with_flex(2.0_f32, 0.0_f32).with_style(
         Style::default().with_background(if selected { Color::rgb(38_u8, 143_u8, 207_u8) } else { background })
             .with_pointer_events(false)))
-    if nested {
-        row.push(Widget::panel("").with_flex(10.0_f32, 0.0_f32).with_style(
+    if depth > 0_u32 {
+        row.push(Widget::panel("").with_flex(10.0_f32 * depth as f32, 0.0_f32).with_style(
             Style::default().with_pointer_events(false)))
     }
     row.push(Widget::icon("", icon).with_flex(18.0_f32, 0.0_f32).with_style(
@@ -1252,7 +1252,7 @@ fn actor_row(id: str, name: str, kind: str, icon: SvgDocument, selected: bool, v
     row.push(Widget::label(kind).with_flex(32.0_f32, 0.0_f32).with_style(
         Style::default().with_foreground(Color::rgb(111_u8, 114_u8, 121_u8)).with_font_size(7.0_f32)
             .with_overflow_hidden(true).with_pointer_events(false)))
-    if nested {
+    if depth > 0_u32 {
         row.push(Widget::icon_button("toggle-visible-" + id, "", icons.visible).with_flex(18.0_f32, 0.0_f32).with_style(
             Style::default().with_background(if hovered == "toggle-visible-" + id { Color::rgb(50_u8, 52_u8, 58_u8) } else { background })
                 .with_foreground(if visible { Color::rgb(148_u8, 170_u8, 184_u8) } else { Color::rgb(69_u8, 71_u8, 77_u8) })
@@ -1262,6 +1262,40 @@ fn actor_row(id: str, name: str, kind: str, icon: SvgDocument, selected: bool, v
             Style::default().with_foreground(Color::rgb(112_u8, 114_u8, 121_u8)).with_padding(Insets::all(2.0_f32)).with_pointer_events(false)))
     }
     ret row
+}
+
+fn actor_index_for_id(ids: Vec[u64], id: u64) -> u32 {
+    let mut index = 0_usize
+    while index < ids.len() {
+        match ids.get(index) { Option::Some(value) => { if value == id { ret index as u32 + 1_u32 } } Option::None => {} }
+        index = index + 1_usize
+    }
+    ret 0_u32
+}
+
+fn actor_hierarchy_depth(actor: usize, ids: Vec[u64], parents: Vec[Option[u64]]) -> u32 {
+    let mut depth = 1_u32
+    let mut steps = 0_usize
+    let mut parent = match parents.get(actor) {
+        Option::Some(value) => value
+        Option::None => Option[u64]::None
+    }
+    while parent.is_some() && steps < ids.len() {
+        match parent {
+            Option::Some(parent_id) => {
+                let parent_index = actor_index_for_id(ids, parent_id)
+                if parent_index == 0_u32 { break }
+                depth = depth + 1_u32
+                parent = match parents.get((parent_index - 1_u32) as usize) {
+                    Option::Some(value) => value
+                    Option::None => Option[u64]::None
+                }
+            }
+            Option::None => { break }
+        }
+        steps = steps + 1_usize
+    }
+    ret depth
 }
 
 fn collection_row(name: str, icons: EditorIcons) -> Widget {
@@ -1278,8 +1312,8 @@ fn collection_row(name: str, icons: EditorIcons) -> Widget {
     ret row
 }
 
-fn hierarchy(selected: str, actor_names: Vec[str], actor_visibilities: Vec[bool], object_count: u32, search_editor: TextEditor, search_focused: bool,
-    hovered: str, icons: EditorIcons) -> Widget {
+fn hierarchy(selected: str, actor_ids: Vec[u64], actor_parents: Vec[Option[u64]], actor_names: Vec[str], actor_visibilities: Vec[bool],
+    object_count: u32, search_editor: TextEditor, search_focused: bool, hovered: str, icons: EditorIcons) -> Widget {
     let mut panel = Widget::panel("hierarchy").with_direction(vertical()).with_flex(242.0_f32, 0.0_f32).with_style(panel_style())
     panel.push(dock_header("WORLD OUTLINER", Debug::fmt(object_count + 2_u32) + " ACTORS", 62.0_f32))
     let mut search = Widget::panel("outliner-tools").with_direction(horizontal()).with_flex(30.0_f32, 0.0_f32).with_style(
@@ -1292,20 +1326,21 @@ fn hierarchy(selected: str, actor_names: Vec[str], actor_visibilities: Vec[bool]
     panel.push(search)
     let query = search_editor.value()
     if query == "" || "Camera".contains(query) {
-        panel.push(actor_row("entity-camera", "Camera", "CAM", icons.camera, selected == "Camera", true, hovered, false, icons))
+        panel.push(actor_row("entity-camera", "Camera", "CAM", icons.camera, selected == "Camera", true, hovered, 0_u32, icons))
     }
     if query == "" || "Directional Light".contains(query) {
-        panel.push(actor_row("entity-light", "Directional Light", "LIGHT", icons.light, selected == "Directional Light", true, hovered, false, icons))
+        panel.push(actor_row("entity-light", "Directional Light", "LIGHT", icons.light, selected == "Directional Light", true, hovered, 0_u32, icons))
     }
     panel.push(collection_row("Geometry", icons))
-    let mut index = 0_u32
-    while index < object_count {
-        let name = actor_name_at(actor_names, index + 1_u32)
+    let mut index = 0_usize
+    while index < actor_ids.len() {
+        let actor = index as u32 + 1_u32
+        let name = actor_name_at(actor_names, actor)
         if query == "" || name.contains(query) {
-            let id = "entity-cube-" + Debug::fmt(index + 1_u32)
-            panel.push(actor_row(id, name, "MESH", icons.mesh, selected == name, bool_at(actor_visibilities, index + 1_u32, true), hovered, true, icons))
+            panel.push(actor_row("entity-cube-" + Debug::fmt(actor), name, "MESH", icons.mesh, selected == name,
+                bool_at(actor_visibilities, actor, true), hovered, actor_hierarchy_depth(index, actor_ids, actor_parents), icons))
         }
-        index = index + 1_u32
+        index = index + 1_usize
     }
     panel.push(Widget::spacer(1.0_f32))
     ret panel
@@ -1728,6 +1763,51 @@ fn scene_actor_parents(scene: Scene, actor_ids: Vec[u64]) -> Vec[Option[u64]] {
     ret parents
 }
 
+fn parent_display_name(parent: Option[u64], actor_ids: Vec[u64], actor_names: Vec[str]) -> str {
+    match parent {
+        Option::Some(id) => {
+            let index = actor_index_for_id(actor_ids, id)
+            if index > 0_u32 { ret actor_name_at(actor_names, index) }
+            ret "Missing Actor"
+        }
+        Option::None => { ret "None (World)" }
+    }
+}
+
+fn parent_selector(selected_id: u64, selected_parent: Option[u64], actor_ids: Vec[u64], actor_names: Vec[str],
+    open: bool, hovered: str, icons: EditorIcons) -> Widget {
+    let mut group = Widget::panel("parent-control").with_direction(vertical()).with_flex(if open { 36.0_f32 + (actor_ids.len() as f32) * 24.0_f32 } else { 34.0_f32 }, 0.0_f32)
+        .with_style(Style::default().with_gap(2.0_f32))
+    let mut control = Widget::panel("parent-selector").with_direction(horizontal()).with_flex(32.0_f32, 0.0_f32).with_style(
+        Style::default().with_background(if hovered == "parent-selector" { Color::rgb(43_u8, 44_u8, 49_u8) } else { Color::rgb(19_u8, 19_u8, 22_u8) })
+            .with_border(1.0_f32, if open { theme_accent() } else { Color::rgb(48_u8, 49_u8, 55_u8) }).with_radius(2.0_f32)
+            .with_padding(Insets::symmetric(4.0_f32, 7.0_f32)).with_gap(5.0_f32))
+    control.push(Widget::label("Parent").with_flex(62.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(143_u8, 146_u8, 153_u8)).with_font_size(9.0_f32).with_pointer_events(false)))
+    control.push(Widget::label(parent_display_name(selected_parent, actor_ids, actor_names)).with_flex(0.0_f32, 1.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(216_u8, 218_u8, 222_u8)).with_font_size(10.0_f32).with_pointer_events(false)))
+    control.push(Widget::icon("", icons.expanded).with_flex(14.0_f32, 0.0_f32).with_style(
+        Style::default().with_foreground(Color::rgb(139_u8, 142_u8, 149_u8)).with_padding(Insets::all(2.0_f32)).with_pointer_events(false)))
+    group.push(control)
+    if open {
+        group.push(popup_action("parent-none", "None (World)", icons.level, hovered, false, selected_parent.is_none()))
+        let mut index = 0_usize
+        while index < actor_ids.len() {
+            match actor_ids.get(index) {
+                Option::Some(id) => {
+                    if id != selected_id {
+                        group.push(popup_action("parent-actor-" + Debug::fmt(index + 1_usize), actor_name_at(actor_names, index as u32 + 1_u32),
+                            icons.mesh, hovered, false, selected_parent == Option[u64]::Some(id)))
+                    }
+                }
+                Option::None => {}
+            }
+            index = index + 1_usize
+        }
+    }
+    ret group
+}
+
 fn detail_row(name: str, value: str, accent: Color) -> Widget {
     let mut row = Widget::panel("detail-" + name).with_direction(horizontal()).with_flex(27.0_f32, 0.0_f32).with_style(
         Style::default().with_background(Color::rgb(18_u8, 18_u8, 21_u8)).with_border(1.0_f32, Color::rgb(42_u8, 43_u8, 48_u8))
@@ -1743,7 +1823,8 @@ fn detail_row(name: str, value: str, accent: Color) -> Widget {
 
 fn inspector(selected: str, name_editor: TextEditor, name_focused: bool, position: Vec3, rotation: Vec3, scale: Vec3,
     transform_field: str, transform_editor: TextEditor, transform_invalid: bool,
-    cube_selected: bool, selected_mesh_name: str, hovered: str, icons: EditorIcons) -> Widget {
+    cube_selected: bool, selected_id: u64, selected_parent: Option[u64], actor_ids: Vec[u64], actor_names: Vec[str],
+    parent_menu_open: bool, selected_mesh_name: str, hovered: str, icons: EditorIcons) -> Widget {
     let mut panel = Widget::panel("inspector").with_direction(vertical()).with_flex(292.0_f32, 0.0_f32).with_style(panel_style())
     panel.push(dock_header("DETAILS", selected, 72.0_f32))
     let mut identity = Widget::panel("object-identity").with_direction(horizontal()).with_flex(38.0_f32, 0.0_f32).with_style(
@@ -1761,6 +1842,10 @@ fn inspector(selected: str, name_editor: TextEditor, name_focused: bool, positio
             .with_border(1.0_f32, Color::rgb(43_u8, 82_u8, 105_u8)).with_radius(2.0_f32).with_padding(Insets::symmetric(3.0_f32, 5.0_f32))
             .with_font_size(8.0_f32).with_font_weight(700_u32).with_pointer_events(false)))
     panel.push(identity)
+    if cube_selected {
+        panel.push(section_title("HIERARCHY"))
+        panel.push(parent_selector(selected_id, selected_parent, actor_ids, actor_names, parent_menu_open, hovered, icons))
+    }
     panel.push(section_title("TRANSFORM"))
     panel.push(transform_property("Location", "location", position, transform_field, transform_editor, transform_invalid, !cube_selected))
     let mut location_tools = Widget::panel("location-tools").with_direction(horizontal()).with_flex(32.0_f32, 0.0_f32)
@@ -1981,7 +2066,8 @@ fn tooltip(text: str, pointer_x: f32, pointer_y: f32, view_width: f32, view_heig
 }
 
 fn editor_view(simulating: bool, selected: str, selected_position: Vec3, selected_rotation: Vec3, selected_scale: Vec3,
-    selected_cube: u32, selected_mesh_name: str, actor_names: Vec[str], actor_visibilities: Vec[bool], name_editor: TextEditor, name_focused: bool,
+    selected_cube: u32, selected_mesh_name: str, actor_ids: Vec[u64], actor_parents: Vec[Option[u64]], actor_names: Vec[str], actor_visibilities: Vec[bool],
+    name_editor: TextEditor, name_focused: bool, parent_menu_open: bool,
     transform_field: str, transform_editor: TextEditor, transform_invalid: bool,
     outliner_search: TextEditor, outliner_search_focused: bool,
     dragging: bool, selected_asset: str, imported_meshes: Vec[ImportedMeshAsset], object_count: u32, code_editor: TextEditor,
@@ -2057,12 +2143,19 @@ fn editor_view(simulating: bool, selected: str, selected_position: Vec3, selecte
     root.push(workspace_tabs)
 
     let mut upper = Widget::panel("upper").with_direction(horizontal()).with_flex(0.0_f32, 4.0_f32).with_style(Style::default().with_gap(1.0_f32))
-    if show_outliner { upper.push(hierarchy(selected, actor_names, actor_visibilities, object_count,
+    if show_outliner { upper.push(hierarchy(selected, actor_ids, actor_parents, actor_names, actor_visibilities, object_count,
         outliner_search, outliner_search_focused, hovered, icons)) }
     upper.push(viewport(simulating, dragging, object_count, selected, active_tool, camera_mode, shading_mode, camera_speed, grid_visible,
         rotation_snap, open_viewport_menu, hovered, compact, icons))
+    let selected_id = match actor_ids.get(if selected_cube > 0_u32 { (selected_cube - 1_u32) as usize } else { actor_ids.len() }) {
+        Option::Some(id) => id Option::None => 0_u64
+    }
+    let selected_parent = match actor_parents.get(if selected_cube > 0_u32 { (selected_cube - 1_u32) as usize } else { actor_parents.len() }) {
+        Option::Some(parent) => parent Option::None => Option[u64]::None
+    }
     if show_details { upper.push(inspector(selected, name_editor, name_focused, selected_position, selected_rotation, selected_scale,
-        transform_field, transform_editor, transform_invalid, selected_cube > 0_u32, selected_mesh_name, hovered, icons)) }
+        transform_field, transform_editor, transform_invalid, selected_cube > 0_u32, selected_id, selected_parent, actor_ids, actor_names,
+        parent_menu_open, selected_mesh_name, hovered, icons)) }
     root.push(upper)
 
     let mut lower = Widget::panel("lower").with_direction(horizontal()).with_flex(0.0_f32, 1.55_f32).with_style(Style::default().with_gap(1.0_f32))
@@ -2317,9 +2410,11 @@ fn main() -> u32 {
     let mut project_path_focused = project_dialog_mode != ""
     let mut project_error = ""
     let mut asset_picker = FilePicker::new(home_dir())
+    let mut parent_menu_open = false
     let mut layout = window.layout(editor_view(simulating, selected, position_at(cube_positions, selected_cube),
-        rotation_at(render_rotations, selected_cube), scale_at(cube_scales, selected_cube), selected_cube, mesh_name_at(cube_mesh_names, selected_cube), actor_names, actor_visibilities,
-        actor_name_editor, actor_name_focused, transform_field, transform_editor, transform_invalid, outliner_search, outliner_search_focused, dragging,
+        rotation_at(render_rotations, selected_cube), scale_at(cube_scales, selected_cube), selected_cube, mesh_name_at(cube_mesh_names, selected_cube),
+        cube_entities, scene_actor_parents(editor_scene, cube_entities), actor_names, actor_visibilities,
+        actor_name_editor, actor_name_focused, parent_menu_open, transform_field, transform_editor, transform_invalid, outliner_search, outliner_search_focused, dragging,
         selected_asset, imported_meshes, object_count, code_editor, code_focused, status_message, project_loaded, project_dirty, active_tool, camera_mode,
         shading_mode, camera_speed, grid_visible, rotation_snap,
         false, false, building, build_output, hovered,
@@ -2571,6 +2666,7 @@ fn main() -> u32 {
                             project_dirty = false
                             project_dialog_mode = ""
                             project_path_focused = false
+                            parent_menu_open = false
                             project_error = ""
                             status_message = "Loaded project " + project_root
                             viewport_renderer.sync_cubes(object_count)
@@ -2604,6 +2700,9 @@ fn main() -> u32 {
             if target != "outliner-add" && target != "add-actor-cube" && target != "add-actor-plane" &&
                 target != "add-actor-sphere" && !target.contains("add-actor-imported-") {
                 add_actor_open = false
+            }
+            if target != "parent-selector" && target != "parent-none" && !target.contains("parent-actor-") {
+                parent_menu_open = false
             }
             if target != "viewport-camera" && target != "camera-perspective" && target != "camera-top" &&
                 target != "camera-front" && target != "camera-right" && target != "viewport-lit" &&
@@ -2799,6 +2898,46 @@ fn main() -> u32 {
                     visibility_index = visibility_index + 1_u32
                 }
             }
+            elif target == "parent-selector" && selected_cube > 0_u32 && !simulating {
+                parent_menu_open = !parent_menu_open
+                actor_name_focused = false
+                transform_field = ""
+                dirty = true
+            }
+            elif (target == "parent-none" || target.contains("parent-actor-")) && selected_cube > 0_u32 && !simulating {
+                let selected_index = (selected_cube - 1_u32) as usize
+                match cube_entities.get(selected_index) {
+                    Option::Some(actor_id) => {
+                        let mut next_parent = Option[u64]::None
+                        if target != "parent-none" {
+                            let mut parent_index = 0_usize
+                            while parent_index < cube_entities.len() {
+                                if target == "parent-actor-" + Debug::fmt(parent_index + 1_usize) {
+                                    match cube_entities.get(parent_index) {
+                                        Option::Some(parent_id) => { next_parent = Option[u64]::Some(parent_id) }
+                                        Option::None => {}
+                                    }
+                                }
+                                parent_index = parent_index + 1_usize
+                            }
+                        }
+                        let before_parent = match editor_scene.get(actor_id) {
+                            Option::Some(entity) => entity.parent() Option::None => Option[u64]::None
+                        }
+                        if before_parent != next_parent {
+                            if editor_scene.set_parent(actor_id, next_parent) {
+                                undo_stack.push(EditorEdit::Parent(ParentEdit::new(actor_id, before_parent, next_parent)))
+                                redo_stack.clear()
+                                project_dirty = true
+                                status_message = selected + " parent: " + parent_display_name(next_parent, cube_entities, actor_names)
+                            } else { status_message = "Cannot create a hierarchy cycle" }
+                        }
+                    }
+                    Option::None => {}
+                }
+                parent_menu_open = false
+                dirty = true
+            }
             elif target == "entity-name" && selected_cube > 0_u32 {
                 actor_name_before_edit = selected
                 actor_name_editor = TextEditor::new(selected).select_all()
@@ -2806,8 +2945,8 @@ fn main() -> u32 {
                 code_focused = false
                 dirty = true
             }
-            elif target == "entity-camera" { selected = "Camera" selected_cube = 0_u32 dirty = true }
-            elif target == "entity-light" { selected = "Directional Light" selected_cube = 0_u32 dirty = true }
+            elif target == "entity-camera" { selected = "Camera" selected_cube = 0_u32 parent_menu_open = false dirty = true }
+            elif target == "entity-light" { selected = "Directional Light" selected_cube = 0_u32 parent_menu_open = false dirty = true }
             elif target == "content-add" && project_loaded && !simulating {
                 project_dialog_mode = "import"
                 asset_picker = FilePicker::new(home_dir())
@@ -2931,6 +3070,7 @@ fn main() -> u32 {
                     if target == "entity-cube-" + Debug::fmt(cube_index + 1_u32) {
                         selected = actor_name_at(actor_names, cube_index + 1_u32)
                         selected_cube = cube_index + 1_u32
+                        parent_menu_open = false
                         dirty = true
                     }
                     cube_index = cube_index + 1_u32
@@ -3230,6 +3370,7 @@ fn main() -> u32 {
                 selected_cube = if removed > object_count { object_count } else { removed }
                 selected = actor_name_at(actor_names, selected_cube)
             }
+            parent_menu_open = false
             transform_editing = false
             moving_cube = false
             undo_stack.push(EditorEdit::Delete(removed_actor))
@@ -3306,6 +3447,16 @@ fn main() -> u32 {
                         }
                         status_message = if history_redo { "Redo visibility" } else { "Undo visibility" }
                     }
+                    EditorEdit::Parent(value) => {
+                        history_actor = actor_index_for_id(cube_entities, value.actor_id())
+                        if history_actor > 0_u32 {
+                            if !editor_scene.set_parent(value.actor_id(), value.value(history_redo)) {
+                                status_message = "Unable to restore actor parent"
+                            } else {
+                                status_message = if history_redo { "Redo parent change" } else { "Undo parent change" }
+                            }
+                        }
+                    }
                 }
                 object_count = cube_positions.len() as u32
                 if structural {
@@ -3321,6 +3472,7 @@ fn main() -> u32 {
                         imported_meshes, imported_gpu_meshes, selected_cube)
                 } else { selected_cube = history_actor viewport_renderer.select_cube(selected_cube) }
                 selected = if selected_cube > 0_u32 { actor_name_at(actor_names, selected_cube) } else { "Camera" }
+                parent_menu_open = false
                 actor_name_editor = TextEditor::new(selected)
                 project_dirty = true dirty = true
             }
@@ -3549,8 +3701,9 @@ fn main() -> u32 {
         if layout_dirty {
             compact = window.surface_width() < 1200_u32
             layout = window.layout(editor_view(simulating, selected, position_at(cube_positions, selected_cube),
-                rotation_at(render_rotations, selected_cube), scale_at(cube_scales, selected_cube), selected_cube, mesh_name_at(cube_mesh_names, selected_cube), actor_names, actor_visibilities,
-                actor_name_editor, actor_name_focused, transform_field, transform_editor, transform_invalid, outliner_search, outliner_search_focused, dragging,
+                rotation_at(render_rotations, selected_cube), scale_at(cube_scales, selected_cube), selected_cube, mesh_name_at(cube_mesh_names, selected_cube),
+                cube_entities, scene_actor_parents(editor_scene, cube_entities), actor_names, actor_visibilities,
+                actor_name_editor, actor_name_focused, parent_menu_open, transform_field, transform_editor, transform_invalid, outliner_search, outliner_search_focused, dragging,
                 selected_asset, imported_meshes, object_count, code_editor, code_focused, status_message, project_loaded, project_dirty, active_tool,
                 camera_mode, shading_mode, camera_speed, grid_visible, rotation_snap,
                 undo_stack.len() > 0_usize, redo_stack.len() > 0_usize, building, build_output, hovered,
