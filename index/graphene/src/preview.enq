@@ -178,6 +178,14 @@ impl for ViewportRenderer {
         ret self.cube_visible((cube_index - 1_u32) as usize)
     }
 
+    fn cube_world_visible(self: Self, index: usize) -> bool {
+        match self.cubes.get(index) {
+            Option::Some(entity) => { ret self.scene.world_visible(entity) }
+            Option::None => {}
+        }
+        ret false
+    }
+
     pub fn set_cube_visible(self: mut Self, cube_index: u32, visible: bool) -> bool {
         if cube_index == 0_u32 || cube_index > self.cubes.len() as u32 { ret false }
         match self.cubes.get((cube_index - 1_u32) as usize) {
@@ -387,7 +395,8 @@ impl for ViewportRenderer {
         self.scene.set_renderable(self.gizmo_x_tip, Option[Renderable]::Some(Renderable::new(tip_mesh, self.gizmo_x_material)))
         self.scene.set_renderable(self.gizmo_y_tip, Option[Renderable]::Some(Renderable::new(tip_mesh, self.gizmo_y_material)))
         self.scene.set_renderable(self.gizmo_z_tip, Option[Renderable]::Some(Renderable::new(tip_mesh, self.gizmo_z_material)))
-        let visible = next > 0_u32 && self.selected_cube > 0_u32 && self.selected_cube <= self.cubes.len() as u32
+        let visible = next > 0_u32 && self.selected_cube > 0_u32 && self.selected_cube <= self.cubes.len() as u32 &&
+            self.cube_world_visible((self.selected_cube - 1_u32) as usize)
         self.scene.set_visible(self.gizmo_x, visible)
         self.scene.set_visible(self.gizmo_y, visible)
         self.scene.set_visible(self.gizmo_z, visible)
@@ -446,7 +455,7 @@ impl for ViewportRenderer {
             }
             index = index + 1_usize
         }
-        let selected_visible = next > 0_u32 && self.cube_visible((next - 1_u32) as usize)
+        let selected_visible = next > 0_u32 && self.cube_world_visible((next - 1_u32) as usize)
         let visible = self.gizmo_mode > 0_u32 && selected_visible
         self.scene.set_visible(self.selection_outline, selected_visible && outline_visible)
         self.scene.set_visible(self.gizmo_x, visible)
@@ -466,13 +475,28 @@ impl for ViewportRenderer {
     }
 
     pub fn sync_cube_transforms_scaled(self: mut Self, positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3]) -> () {
+        let mut parents = Vec[u32]::new()
+        for _position in positions { parents.push(0_u32) }
+        self.sync_cube_transforms_hierarchical(positions, rotations, scales, parents)
+        ret ()
+    }
+
+    pub fn sync_cube_transforms_hierarchical(self: mut Self, positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3],
+        parents: Vec[u32]) -> () {
         let mut index = 0_usize
+        while index < self.cubes.len() {
+            match self.cubes.get(index) {
+                Option::Some(entity) => { self.scene.set_parent(entity, Option[u64]::None) }
+                Option::None => {}
+            }
+            index = index + 1_usize
+        }
+        index = 0_usize
         while index < self.cubes.len() && index < positions.len() {
             match self.cubes.get(index) {
                 Option::Some(entity) => {
                     match positions.get(index) {
                         Option::Some(position) => {
-                            if index == 0_usize { self.primary_position = position }
                             let mut rotation = Vec3::zero()
                             match rotations.get(index) {
                                 Option::Some(value) => { rotation = value }
@@ -485,10 +509,6 @@ impl for ViewportRenderer {
                             }
                             self.scene.set_transform(entity, Transform::identity().with_position(position)
                                 .with_rotation(rotation).with_scale(scale))
-                            if self.selected_cube == index as u32 + 1_u32 {
-                                self.scene.set_transform(self.selection_outline, Transform::identity().with_position(position)
-                                    .with_rotation(rotation).with_scale(scale.scale(1.035_f32)))
-                            }
                         }
                         Option::None => {}
                     }
@@ -497,9 +517,51 @@ impl for ViewportRenderer {
             }
             index = index + 1_usize
         }
+        index = 0_usize
+        while index < self.cubes.len() && index < parents.len() {
+            match parents.get(index) {
+                Option::Some(parent_index) => {
+                    if parent_index > 0_u32 && parent_index <= self.cubes.len() as u32 && parent_index != index as u32 + 1_u32 {
+                        match self.cubes.get(index) {
+                            Option::Some(entity) => { match self.cubes.get((parent_index - 1_u32) as usize) {
+                                Option::Some(parent_entity) => { self.scene.set_parent(entity, Option[u64]::Some(parent_entity)) }
+                                Option::None => {}
+                            } }
+                            Option::None => {}
+                        }
+                    }
+                }
+                Option::None => {}
+            }
+            index = index + 1_usize
+        }
+        self.select_cube(self.selected_cube)
+        match self.cubes.get(0_usize) {
+            Option::Some(entity) => { match self.scene.world_matrix(entity) {
+                Option::Some(matrix) => { self.primary_position = matrix.transform_point(Vec3::zero()) }
+                Option::None => {}
+            } }
+            Option::None => {}
+        }
+        let mut selected_position = Vec3::zero()
+        let mut has_selected_position = false
         if self.selected_cube > 0_u32 {
-            match positions.get((self.selected_cube - 1_u32) as usize) {
-                Option::Some(position) => {
+            match self.cubes.get((self.selected_cube - 1_u32) as usize) {
+                Option::Some(selected_entity) => {
+                    self.scene.set_parent(self.selection_outline, Option[u64]::Some(selected_entity))
+                    self.scene.set_transform(self.selection_outline, Transform::identity().with_scale(Vec3::new(1.035_f32, 1.035_f32, 1.035_f32)))
+                    match self.scene.world_matrix(selected_entity) {
+                        Option::Some(matrix) => { selected_position = matrix.transform_point(Vec3::zero()) has_selected_position = true }
+                        Option::None => {}
+                    }
+                }
+                Option::None => {}
+            }
+        } else {
+            self.scene.set_parent(self.selection_outline, Option[u64]::None)
+        }
+        if has_selected_position {
+            let position = selected_position
                     if self.gizmo_mode == 2_u32 {
                         self.scene.set_transform(self.gizmo_x, Transform::identity().with_position(position)
                             .with_rotation(Vec3::new(0.0_f32, 0.0_f32, 1.5707963_f32)))
@@ -528,9 +590,6 @@ impl for ViewportRenderer {
                             .with_position(position.add(Vec3::new(0.0_f32, 0.0_f32, 1.72_f32)))
                             .with_rotation(Vec3::new(1.5707963_f32, 0.0_f32, 0.0_f32)).with_scale(tip_scale))
                     }
-                }
-                Option::None => {}
-            }
         }
         ret ()
     }
