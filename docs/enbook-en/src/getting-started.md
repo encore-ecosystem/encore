@@ -88,6 +88,11 @@ encore build --profile release
 encore build --target aarch64-unknown-linux-gnu
 ```
 
+`debug` builds use `-O0` with debug information and frame pointers. `release`
+uses portable `-O2`. `extreme` enables `-O3`, ThinLTO through LLVM `lld`, and
+32-byte hot-loop alignment; for a host build it also targets the native CPU
+unless `target-cpu` is configured.
+
 `encore run` is only available for executable packages. Program arguments after
 `--` are passed to the compiled binary.
 

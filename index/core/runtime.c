@@ -286,13 +286,17 @@ void encore_heap_retain(void *ptr) {
 bool encore_heap_release(void *ptr) {
     if (ptr == NULL) return false;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
-    size_t refs = atomic_load_explicit(&block->meta.refs, memory_order_acquire);
-    while (refs > 1) {
-        if (atomic_compare_exchange_weak_explicit(&block->meta.refs, &refs, refs - 1, memory_order_acq_rel, memory_order_acquire)) return false;
-    }
-    return true;
+    return atomic_fetch_sub_explicit(&block->meta.refs, 1, memory_order_acq_rel) == 1;
 }
 
+void encore_heap_free_released(void *ptr) {
+    if (ptr == NULL) return;
+    free(((encore_heap_block *)ptr) - 1);
+}
+
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((visibility("hidden"), always_inline))
+#endif
 bool encore_heap_is_unique(void *ptr) {
     if (ptr == NULL) return true;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
@@ -431,6 +435,23 @@ bool encore_strset_insert(void *raw_set, encore_str value) {
     return true;
 }
 
+bool encore_strset_contains(void *raw_set, encore_str value) {
+    encore_strset *set = raw_set;
+    if (set == NULL || set->cap == 0) return false;
+    const char *data = encore_str_data(value);
+    size_t len = encore_str_size(value);
+    uint64_t hash = encore_strset_hash(data, len);
+    size_t slot = (size_t)(hash % set->cap);
+    while (set->entries[slot].data != NULL) {
+        encore_strset_entry *entry = &set->entries[slot];
+        if (entry->hash == hash && entry->len == len && memcmp(entry->data, data, len) == 0) {
+            return true;
+        }
+        slot = (slot + 1) % set->cap;
+    }
+    return false;
+}
+
 void encore_strset_free(void *raw_set) {
     encore_strset *set = raw_set;
     if (set == NULL) return;
@@ -440,9 +461,99 @@ void encore_strset_free(void *raw_set) {
 }
 
 typedef struct {
+    uint64_t hash;
+    size_t len;
+    char *data;
+    size_t value;
+} encore_strmap_entry;
+
+typedef struct {
     size_t len;
     size_t cap;
-    char *data;
+    encore_strmap_entry *entries;
+} encore_strmap;
+
+static bool encore_strmap_rehash(encore_strmap *map, size_t next_cap) {
+    encore_strmap_entry *next = calloc(next_cap, sizeof(encore_strmap_entry));
+    if (next == NULL) return false;
+    for (size_t index = 0; index < map->cap; ++index) {
+        encore_strmap_entry entry = map->entries[index];
+        if (entry.data == NULL) continue;
+        size_t slot = (size_t)(entry.hash % next_cap);
+        while (next[slot].data != NULL) slot = (slot + 1) % next_cap;
+        next[slot] = entry;
+    }
+    free(map->entries);
+    map->entries = next;
+    map->cap = next_cap;
+    return true;
+}
+
+void *encore_strmap_new(void) {
+    encore_strmap *map = calloc(1, sizeof(encore_strmap));
+    if (map == NULL) return NULL;
+    if (!encore_strmap_rehash(map, 64)) {
+        free(map);
+        return NULL;
+    }
+    return map;
+}
+
+void encore_strmap_put(void *raw_map, encore_str key, size_t value) {
+    encore_strmap *map = raw_map;
+    if (map == NULL) return;
+    if ((map->len + 1) * 10 >= map->cap * 7 &&
+        !encore_strmap_rehash(map, map->cap * 2)) return;
+    const char *data = encore_str_data(key);
+    size_t len = encore_str_size(key);
+    uint64_t hash = encore_strset_hash(data, len);
+    size_t slot = (size_t)(hash % map->cap);
+    while (map->entries[slot].data != NULL) {
+        encore_strmap_entry *entry = &map->entries[slot];
+        if (entry->hash == hash && entry->len == len && memcmp(entry->data, data, len) == 0) {
+            entry->value = value;
+            return;
+        }
+        slot = (slot + 1) % map->cap;
+    }
+    char *copy = malloc(len + 1);
+    if (copy == NULL) return;
+    if (len > 0) memcpy(copy, data, len);
+    copy[len] = '\0';
+    map->entries[slot] = (encore_strmap_entry){hash, len, copy, value};
+    map->len += 1;
+}
+
+size_t encore_strmap_get(void *raw_map, encore_str key) {
+    encore_strmap *map = raw_map;
+    if (map == NULL || map->cap == 0) return 0;
+    const char *data = encore_str_data(key);
+    size_t len = encore_str_size(key);
+    uint64_t hash = encore_strset_hash(data, len);
+    size_t slot = (size_t)(hash % map->cap);
+    while (map->entries[slot].data != NULL) {
+        encore_strmap_entry *entry = &map->entries[slot];
+        if (entry->hash == hash && entry->len == len && memcmp(entry->data, data, len) == 0) {
+            return entry->value;
+        }
+        slot = (slot + 1) % map->cap;
+    }
+    return 0;
+}
+
+void encore_strmap_free(void *raw_map) {
+    encore_strmap *map = raw_map;
+    if (map == NULL) return;
+    for (size_t index = 0; index < map->cap; ++index) free(map->entries[index].data);
+    free(map->entries);
+    free(map);
+}
+
+typedef struct {
+    size_t len;
+    size_t cap;
+    encore_str_object *object;
+    bool failed;
 } encore_text_builder;
 
 static bool encore_text_builder_reserve(encore_text_builder *builder, size_t additional) {
@@ -457,9 +568,15 @@ static bool encore_text_builder_reserve(encore_text_builder *builder, size_t add
         }
         next_cap *= 2;
     }
-    char *next = realloc(builder->data, next_cap);
+    if (next_cap > SIZE_MAX - sizeof(encore_str_object) - 1) {
+        builder->failed = true;
+        return false;
+    }
+    encore_str_object *next = realloc(builder->object,
+        sizeof(encore_str_object) + next_cap + 1);
     if (next == NULL) return false;
-    builder->data = next;
+    if (builder->object == NULL) atomic_init(&next->ref_count, 1);
+    builder->object = next;
     builder->cap = next_cap;
     return true;
 }
@@ -470,9 +587,13 @@ void *encore_text_builder_new(void) {
 
 void encore_text_builder_append(void *raw_builder, encore_str value) {
     encore_text_builder *builder = raw_builder;
+    if (builder == NULL || builder->failed) return;
     size_t len = encore_str_size(value);
-    if (!encore_text_builder_reserve(builder, len)) return;
-    if (len > 0) memcpy(builder->data + builder->len, encore_str_data(value), len);
+    if (!encore_text_builder_reserve(builder, len)) {
+        builder->failed = true;
+        return;
+    }
+    if (len > 0) memcpy(builder->object->data + builder->len, encore_str_data(value), len);
     builder->len += len;
 }
 
@@ -480,22 +601,40 @@ void encore_text_builder_append_builder(void *raw_builder, void *raw_other) {
     encore_text_builder *builder = raw_builder;
     encore_text_builder *other = raw_other;
     if (builder == NULL || other == NULL || builder == other) return;
-    if (encore_text_builder_reserve(builder, other->len)) {
-        if (other->len > 0) memcpy(builder->data + builder->len, other->data, other->len);
+    if (other->failed) {
+        builder->failed = true;
+    } else if (encore_text_builder_reserve(builder, other->len)) {
+        if (other->len > 0) memcpy(builder->object->data + builder->len,
+            other->object->data, other->len);
         builder->len += other->len;
+    } else {
+        builder->failed = true;
     }
-    free(other->data);
+    free(other->object);
     free(other);
 }
 
 encore_str encore_text_builder_finish(void *raw_builder) {
     encore_text_builder *builder = raw_builder;
     if (builder == NULL) return encore_empty_str();
-    char *data = builder->data;
+    encore_str_object *object = builder->object;
     size_t len = builder->len;
+    bool failed = builder->failed;
     free(builder);
-    if (data == NULL) return encore_empty_str();
-    return encore_from_owned_buffer(data, len);
+    if (failed || object == NULL) {
+        free(object);
+        return encore_empty_str();
+    }
+    object->len = len;
+    object->data[len] = '\0';
+    return (encore_str){.object = object};
+}
+
+void encore_text_builder_discard(void *raw_builder) {
+    encore_text_builder *builder = raw_builder;
+    if (builder == NULL) return;
+    free(builder->object);
+    free(builder);
 }
 
 static encore_str encore_empty_str(void) {

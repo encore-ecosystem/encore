@@ -53,6 +53,15 @@ import refrain::frontend::parser::Parser
 import ehirlib::EhirTextBuilder
 import refrain::target::{TargetSpec, cfg_active_with_features, host_target}
 
+extern fn encore_strset_new() -> usize
+extern fn encore_strset_insert(set: usize, value: str) -> bool
+extern fn encore_strset_contains(set: usize, value: str) -> bool
+extern fn encore_strset_free(set: usize) -> ()
+extern fn encore_strmap_new() -> usize
+extern fn encore_strmap_put(map: usize, key: str, value: usize) -> ()
+extern fn encore_strmap_get(map: usize, key: str) -> usize
+extern fn encore_strmap_free(map: usize) -> ()
+
 struct LoweredExpr {
     code: EhirTextBuilder
     value: str
@@ -152,16 +161,26 @@ struct TranslatorContext {
     functions: Vec[FunctionType]
     modules: Vec[TranslationModule]
     module_visibility: Vec[(str, str)]
+    module_index: usize
+    module_prefixes: Vec[str]
+    visibility_index: usize
+    function_heads: usize
+    function_overload_counts: usize
+    function_next: Vec[usize]
+    type_index: usize
     types: Vec[str]
     traits: Vec[TraitType]
     trait_impls: Vec[TraitImplType]
     generic_callables: Vec[GenericCallable]
     fields: Vec[StructFieldType]
+    field_index: usize
+    owning_type_index: usize
     enum_variants: Vec[EnumVariantType]
     loop_targets: Vec[LoopTargetType]
     with_cleanups: Vec[VarType]
     extern_functions: Vec[str]
     borrowed_return_functions: Vec[str]
+    borrowed_self_functions: Vec[str]
     self_type: str
     return_type: str
     expression_hint: str
@@ -223,8 +242,47 @@ pub fn translate_modules_to_ehir(modules: Vec[TranslationModule], target: Target
     ret translate_ast_to_ehir(ast, modules, target, Vec[str]::new())
 }
 
+pub fn translate_modules_to_ehir_bundle(modules: Vec[TranslationModule], target: TargetSpec, entry_module: str) -> str {
+    let mut ast = Vec[Statement]::new()
+    for module in modules { ast.extend(module.ast) }
+    let mut ctx = collect_context(ast, modules, target, Vec[str]::new())
+    let mut bundle = EhirTextBuilder::new()
+    bundle = bundle.line("entry " + entry_module)
+    bundle = bundle.empty_line()
+    for module in modules {
+        bundle = bundle.line("module " + module.module_id + " {")
+        for imported in module.imports { bundle = bundle.line("import " + imported) }
+        if module.imports.len() > 0_usize { bundle = bundle.empty_line() }
+        bundle = bundle.append(translate_ast_with_context(ctx, module.ast, target, module.features))
+        bundle = bundle.line("}")
+        bundle = bundle.empty_line()
+    }
+    let text = bundle.finish()
+    free_translation_indexes(ctx)
+    ret text
+}
+
 fn translate_ast_to_ehir(ast: Vec[Statement], modules: Vec[TranslationModule], target: TargetSpec, features: Vec[str]) -> str {
     let mut ctx = collect_context(ast, modules, target, features)
+    let text = translate_ast_with_context(ctx, ast, target, features).finish()
+    free_translation_indexes(ctx)
+    ret text
+}
+
+fn free_translation_indexes(ctx: TranslatorContext) -> () {
+    unsafe {
+        encore_strmap_free(ctx.module_index)
+        encore_strset_free(ctx.visibility_index)
+        encore_strmap_free(ctx.function_heads)
+        encore_strmap_free(ctx.function_overload_counts)
+        encore_strmap_free(ctx.type_index)
+        encore_strmap_free(ctx.field_index)
+        encore_strset_free(ctx.owning_type_index)
+    }
+    ret ()
+}
+
+fn translate_ast_with_context(ctx: mut TranslatorContext, ast: Vec[Statement], target: TargetSpec, features: Vec[str]) -> EhirTextBuilder {
     let mut builder = EhirTextBuilder::new()
     for stmt in ast {
         match stmt {
@@ -240,12 +298,29 @@ fn translate_ast_to_ehir(ast: Vec[Statement], modules: Vec[TranslationModule], t
         }
         builder = builder.empty_line()
     }
-    ret builder.finish()
+    ret builder
 }
 
 fn collect_context(ast: Vec[Statement], modules: Vec[TranslationModule], target: TargetSpec, features: Vec[str]) -> TranslatorContext {
     let module_visibility = build_module_visibility(modules)
-    let mut ctx = TranslatorContext{Vec[VarType]::new(), Vec[VarType]::new(), Vec[FunctionType]::new(), modules, module_visibility, Vec[str]::new(), Vec[TraitType]::new(), Vec[TraitImplType]::new(), Vec[GenericCallable]::new(), Vec[StructFieldType]::new(), Vec[EnumVariantType]::new(), Vec[LoopTargetType]::new(), Vec[VarType]::new(), Vec[str]::new(), Vec[str]::new(), "", "void", "", Vec[GenericParam]::new(), target, features, false, ""}
+    let module_index = unsafe { encore_strmap_new() }
+    let mut module_prefixes = Vec[str]::new()
+    let mut module_position = 0_usize
+    for module in modules {
+        unsafe { encore_strmap_put(module_index, module.source_name, module_position + 1_usize) }
+        module_prefixes.push("__encore_m" + encode_module_identity(module.module_id) + "__")
+        module_position = module_position + 1_usize
+    }
+    let visibility_index = unsafe { encore_strset_new() }
+    for edge in module_visibility {
+        let _inserted = unsafe { encore_strset_insert(visibility_index, edge.0 + "\n" + edge.1) }
+    }
+    let mut ctx = TranslatorContext{Vec[VarType]::new(), Vec[VarType]::new(), Vec[FunctionType]::new(), modules, module_visibility,
+        module_index, module_prefixes, visibility_index, unsafe { encore_strmap_new() }, unsafe { encore_strmap_new() }, Vec[usize]::new(), unsafe { encore_strmap_new() },
+        Vec[str]::new(), Vec[TraitType]::new(), Vec[TraitImplType]::new(), Vec[GenericCallable]::new(), Vec[StructFieldType]::new(),
+        unsafe { encore_strmap_new() }, unsafe { encore_strset_new() }, Vec[EnumVariantType]::new(), Vec[LoopTargetType]::new(),
+        Vec[VarType]::new(), Vec[str]::new(), Vec[str]::new(), Vec[str]::new(), "", "void", "",
+        Vec[GenericParam]::new(), target, features, false, ""}
     for stmt in ast {
         match stmt {
             Statement::Function(fn_item) => {
@@ -267,6 +342,7 @@ fn collect_context(ast: Vec[Statement], modules: Vec[TranslationModule], target:
                     match variant.tuple_fields.get(0_usize) { Some(found) => { payload_type = found } None => {} }
                     match variant.named_fields.get(0_usize) { Some(found) => { payload_type = found.typ } None => {} }
                     ctx.enum_variants.push(EnumVariantType{enum_item.name + "::" + variant.name, enum_item.name, payload_type, generic_param_names(enum_item.generics)})
+                    let _inserted = unsafe { encore_strset_insert(ctx.owning_type_index, enum_item.name) }
                 }
             }
             Statement::Trait(trait_item) => {
@@ -278,6 +354,7 @@ fn collect_context(ast: Vec[Statement], modules: Vec[TranslationModule], target:
                     for generic_name in generic_param_names(method.generics) { method_generics.push(generic_name) }
                     let output_type = function_ret_type_for_owner(method, trait_item.name)
                     let callable_name = trait_item.name + "::" + method.name
+                    if function_has_attr(method, "borrowed_self") { ctx.borrowed_self_functions.push(callable_name) }
                     let callable_type = if method.is_async { async_future_type(ctx_next_emitted_name(ctx, method.source_name, callable_name), combined_generic_params(trait_item.generics, method.generics)) } else { output_type }
                     ctx_add_function(ctx, method.source_name, trait_item.name + "::" + method.name, callable_type, function_param_types_for_owner(method, trait_item.name), method_generics, false, method.is_async, output_type)
                     if method.is_async { remember_async_future_output(ctx, method, callable_type, output_type) }
@@ -294,6 +371,7 @@ fn collect_context(ast: Vec[Statement], modules: Vec[TranslationModule], target:
                         for generic_name in generic_param_names(method.generics) { method_generics.push(generic_name) }
                         let output_type = function_ret_type_for_owner(method, impl_item.target)
                         let callable_name = base_type_name(impl_item.target) + "::" + method_name
+                        if function_has_attr(method, "borrowed_self") { ctx.borrowed_self_functions.push(callable_name) }
                         let callable_type = if method.is_async { async_future_type(ctx_next_emitted_name(ctx, method.source_name, callable_name), combined_generic_params(impl_item.generics, method.generics)) } else { output_type }
                         ctx_add_function(ctx, method.source_name, callable_name, callable_type, function_param_types_for_owner(method, impl_item.target), method_generics, false, method.is_async, output_type)
                         if method.is_async { remember_async_future_output(ctx, method, callable_type, output_type) }
@@ -309,8 +387,9 @@ fn collect_context(ast: Vec[Statement], modules: Vec[TranslationModule], target:
 }
 
 fn remember_type(ctx: mut TranslatorContext, name: str) -> () {
-    for known in ctx.types { if known == name { ret () } }
+    if unsafe { encore_strmap_get(ctx.type_index, name) } != 0_usize { ret () }
     ctx.types.push(name)
+    unsafe { encore_strmap_put(ctx.type_index, name, ctx.types.len()) }
     ret ()
 }
 
@@ -393,11 +472,24 @@ fn remember_generic_callable(ctx: mut TranslatorContext, name: str, params: Vec[
     ret ()
 }
 
+fn ctx_add_field(ctx: mut TranslatorContext, field: StructFieldType) -> () {
+    ctx.fields.push(field)
+    let encoded = ctx.fields.len()
+    unsafe {
+        encore_strmap_put(ctx.field_index, field.owner + "\n" + field.field, encoded)
+        encore_strmap_put(ctx.field_index, leaf_type_name(field.owner) + "\n" + field.field, encoded)
+        encore_strmap_put(ctx.field_index, field.owner + "\n#" + field.index, encoded)
+        encore_strmap_put(ctx.field_index, leaf_type_name(field.owner) + "\n#" + field.index, encoded)
+    }
+    let _inserted = unsafe { encore_strset_insert(ctx.owning_type_index, field.owner) }
+    ret ()
+}
+
 fn collect_struct_fields(ctx: mut TranslatorContext, item: StructStmt) -> () {
     if item.is_tuple {
         let mut index = 0_usize
         for typ in item.tuple_fields {
-            ctx.fields.push(StructFieldType{item.name, Debug::fmt(index), typ, Debug::fmt(index)})
+            ctx_add_field(ctx, StructFieldType{item.name, Debug::fmt(index), typ, Debug::fmt(index)})
             index = index + 1_usize
         }
         ret ()
@@ -405,7 +497,7 @@ fn collect_struct_fields(ctx: mut TranslatorContext, item: StructStmt) -> () {
 
     let mut index = 0_usize
     for field in item.named_fields {
-        ctx.fields.push(StructFieldType{item.name, field.name, field.typ, Debug::fmt(index)})
+        ctx_add_field(ctx, StructFieldType{item.name, field.name, field.typ, Debug::fmt(index)})
         index = index + 1_usize
     }
     ret ()
@@ -441,10 +533,10 @@ fn remember_async_future(ctx: mut TranslatorContext, item: FunctionItem, typ: st
 fn remember_async_future_output(ctx: mut TranslatorContext, item: FunctionItem, typ: str, output_type: str) -> () {
     let owner = base_type_name(typ)
     remember_type(ctx, owner)
-    ctx.fields.push(StructFieldType{owner, "state", "usize", "0"})
+    ctx_add_field(ctx, StructFieldType{owner, "state", "usize", "0"})
     let mut index = 0_usize
     for param in item.params {
-        ctx.fields.push(StructFieldType{owner, param.name, unwrap_type_or_usize(param.typ), Debug::fmt(index + 1_usize)})
+        ctx_add_field(ctx, StructFieldType{owner, param.name, unwrap_type_or_usize(param.typ), Debug::fmt(index + 1_usize)})
         index = index + 1_usize
     }
     let mut trait_args = Vec[str]::new()
@@ -467,20 +559,27 @@ fn future_output_type(ctx: TranslatorContext, future_type: str, source_name: str
 }
 
 fn ctx_add_function(ctx: mut TranslatorContext, source_name: str, name: str, ret_type: str, params: Vec[str], generics: Vec[str], is_extern: bool, is_async: bool, output_type: str) -> () {
-    let mut overload_index = 0_usize
-    for function in ctx.functions {
-        if function.source_name == source_name && function.name == name { overload_index = overload_index + 1_usize }
-    }
+    let overload_key = source_name + "\n" + name
+    let encoded_overload_count = unsafe { encore_strmap_get(ctx.function_overload_counts, overload_key) }
+    let overload_index = if encoded_overload_count == 0_usize { 0_usize } else { encoded_overload_count - 1_usize }
     let local_name = if overload_index == 0_usize { name } else { name + "__overload_" + Debug::fmt(overload_index) }
     let is_member = last_scope_index(name) < name.len()
     let emitted_name = if is_extern || name == "main" || is_member { local_name } else { module_symbol_prefix(ctx, source_name) + local_name }
+    let previous_head = unsafe { encore_strmap_get(ctx.function_heads, name) }
+    ctx.function_next.push(previous_head)
     ctx.functions.push(FunctionType{name, emitted_name, source_name, ret_type, params, generics, is_async, output_type})
+    unsafe { encore_strmap_put(ctx.function_heads, name, ctx.functions.len()) }
+    unsafe { encore_strmap_put(ctx.function_overload_counts, overload_key, overload_index + 2_usize) }
     ret ()
 }
 
 fn module_identity_for_source(ctx: TranslatorContext, source_name: str) -> str {
-    for module in ctx.modules {
-        if module.source_name == source_name { ret module.module_id }
+    let encoded = unsafe { encore_strmap_get(ctx.module_index, source_name) }
+    if encoded > 0_usize {
+        match ctx.modules.get(encoded - 1_usize) {
+            Some(module) => { ret module.module_id }
+            None => {}
+        }
     }
     ret source_name
 }
@@ -502,14 +601,19 @@ fn encode_module_identity(value: str) -> str {
 }
 
 fn module_symbol_prefix(ctx: TranslatorContext, source_name: str) -> str {
-    ret "__encore_m" + encode_module_identity(module_identity_for_source(ctx, source_name)) + "__"
+    let encoded = unsafe { encore_strmap_get(ctx.module_index, source_name) }
+    if encoded > 0_usize {
+        match ctx.module_prefixes.get(encoded - 1_usize) {
+            Some(prefix) => { ret prefix }
+            None => {}
+        }
+    }
+    ret "__encore_m" + encode_module_identity(source_name) + "__"
 }
 
 fn ctx_next_emitted_name(ctx: TranslatorContext, source_name: str, name: str) -> str {
-    let mut overload_index = 0_usize
-    for function in ctx.functions {
-        if function.source_name == source_name && function.name == name { overload_index = overload_index + 1_usize }
-    }
+    let encoded_overload_count = unsafe { encore_strmap_get(ctx.function_overload_counts, source_name + "\n" + name) }
+    let overload_index = if encoded_overload_count == 0_usize { 0_usize } else { encoded_overload_count - 1_usize }
     let local_name = if overload_index == 0_usize { name } else { name + "__overload_" + Debug::fmt(overload_index) }
     let is_member = last_scope_index(name) < name.len()
     ret if name == "main" || is_member { local_name } else { module_symbol_prefix(ctx, source_name) + local_name }
@@ -558,8 +662,7 @@ fn ctx_type_needs_ownership(ctx: mut TranslatorContext, typ: str) -> bool {
     if starts_with(value, "mut ") || ends_with(value, "*") || ends_with(value, "<S>") { ret false }
     if value == "void" || value == "()" || value == "bool" || is_numeric_type(value) { ret false }
     let owner = base_type_name(value)
-    for field in ctx.fields { if field.owner == owner { ret true } }
-    for variant in ctx.enum_variants { if variant.owner == owner { ret true } }
+    if unsafe { encore_strset_contains(ctx.owning_type_index, owner) } { ret true }
     // Generic and not-yet-resolved nominal types may have descriptive names
     // such as `Iter`, not only single-letter names such as `T`. Their concrete
     // specialization can own data, so lowering must preserve borrowed copies.
@@ -765,9 +868,10 @@ fn function_matches_args(function: FunctionType, actual_types: Vec[str]) -> bool
 fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, source_name: str, name: str, actual_types: Vec[str]) -> Option[FunctionType] {
     let base = base_type_name(name)
     let member = enum_variant_name(base)
-    let mut local_index = 0_usize
-    while local_index < ctx.functions.len() {
-        match ctx.functions.get(local_index) {
+    let mut encoded = unsafe { encore_strmap_get(ctx.function_heads, base) }
+    while encoded > 0_usize {
+        let index = encoded - 1_usize
+        match ctx.functions.get(index) {
             Option[FunctionType]::Some(function) => {
                 if function.source_name == source_name && function.name == base && function_matches_args(function, actual_types) {
                     ret Option[FunctionType]::Some(function)
@@ -775,10 +879,11 @@ fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, source_name: str, na
             }
             Option[FunctionType]::None => {}
         }
-        local_index = local_index + 1_usize
+        match ctx.function_next.get(index) { Some(next) => { encoded = next } None => { encoded = 0_usize } }
     }
-    let mut index = 0_usize
-    while index < ctx.functions.len() {
+    encoded = unsafe { encore_strmap_get(ctx.function_heads, base) }
+    while encoded > 0_usize {
+        let index = encoded - 1_usize
         match ctx.functions.get(index) {
             Option[FunctionType]::Some(function) => {
                 if function.name == base && function_matches_args(function, actual_types) && function_visible_from(ctx, source_name, function.source_name) {
@@ -787,11 +892,12 @@ fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, source_name: str, na
             }
             Option[FunctionType]::None => {}
         }
-        index = index + 1_usize
+        match ctx.function_next.get(index) { Some(next) => { encoded = next } None => { encoded = 0_usize } }
     }
     if member == base { ret Option[FunctionType]::None }
-    index = 0_usize
-    while index < ctx.functions.len() {
+    encoded = unsafe { encore_strmap_get(ctx.function_heads, member) }
+    while encoded > 0_usize {
+        let index = encoded - 1_usize
         match ctx.functions.get(index) {
             Option[FunctionType]::Some(function) => {
                 if function.name == member && function_matches_args(function, actual_types) && function_visible_from(ctx, source_name, function.source_name) {
@@ -800,7 +906,7 @@ fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, source_name: str, na
             }
             Option[FunctionType]::None => {}
         }
-        index = index + 1_usize
+        match ctx.function_next.get(index) { Some(next) => { encoded = next } None => { encoded = 0_usize } }
     }
     ret Option[FunctionType]::None
 }
@@ -810,10 +916,7 @@ fn function_visible_from(ctx: TranslatorContext, caller_source: str, function_so
     if ctx.modules.len() == 0_usize { ret true }
     let caller = module_identity_for_source(ctx, caller_source)
     let target = module_identity_for_source(ctx, function_source)
-    for edge in ctx.module_visibility {
-        if edge.0 == caller && edge.1 == target { ret true }
-    }
-    ret false
+    ret unsafe { encore_strset_contains(ctx.visibility_index, caller + "\n" + target) }
 }
 
 fn build_module_visibility(modules: Vec[TranslationModule]) -> Vec[(str, str)] {
@@ -947,6 +1050,14 @@ fn ctx_function_is_extern(ctx: mut TranslatorContext, name: str) -> bool {
 fn ctx_function_returns_borrowed(ctx: mut TranslatorContext, name: str) -> bool {
     let base = base_type_name(name)
     for item in ctx.borrowed_return_functions {
+        if item == name || item == base { ret true }
+    }
+    ret false
+}
+
+fn ctx_function_borrows_self(ctx: mut TranslatorContext, name: str) -> bool {
+    let base = base_type_name(name)
+    for item in ctx.borrowed_self_functions {
         if item == name || item == base { ret true }
     }
     ret false
@@ -1098,15 +1209,18 @@ fn ctx_lookup_field(ctx: mut TranslatorContext, owner: str, field: str) -> Optio
     if starts_with(owner_base, "__array_") {
         ret Option[str]::Some(nth_generic_type(owner, 0_usize))
     }
-    for item in ctx.fields {
-        if item.field == field {
-            if item.owner == owner_base || leaf_type_name(item.owner) == owner_leaf {
+    let mut encoded = unsafe { encore_strmap_get(ctx.field_index, owner_base + "\n" + field) }
+    if encoded == 0_usize { encoded = unsafe { encore_strmap_get(ctx.field_index, owner_leaf + "\n" + field) } }
+    if encoded > 0_usize {
+        match ctx.fields.get(encoded - 1_usize) {
+            Some(item) => {
                 let owner_generics = generic_args_from_path(owner)
                 if item.owner == owner_base && owner_generics.len() > 0_usize {
                     ret Option[str]::Some(direct_generic_hint(item.typ, owner_generics))
                 }
                 ret Option[str]::Some(item.typ)
             }
+            None => {}
         }
     }
     ret Option[str]::None
@@ -1115,9 +1229,12 @@ fn ctx_lookup_field(ctx: mut TranslatorContext, owner: str, field: str) -> Optio
 fn ctx_lookup_field_at_position(ctx: mut TranslatorContext, owner: str, position: str) -> Option[str] {
     let owner_base = base_type_name(owner)
     let owner_leaf = leaf_type_name(owner_base)
-    for item in ctx.fields {
-        if item.index == position && (item.owner == owner_base || leaf_type_name(item.owner) == owner_leaf) {
-            ret Option[str]::Some(direct_generic_hint(item.typ, generic_args_from_path(owner)))
+    let mut encoded = unsafe { encore_strmap_get(ctx.field_index, owner_base + "\n#" + position) }
+    if encoded == 0_usize { encoded = unsafe { encore_strmap_get(ctx.field_index, owner_leaf + "\n#" + position) } }
+    if encoded > 0_usize {
+        match ctx.fields.get(encoded - 1_usize) {
+            Some(item) => { ret Option[str]::Some(direct_generic_hint(item.typ, generic_args_from_path(owner))) }
+            None => {}
         }
     }
     ret Option[str]::None
@@ -1126,9 +1243,12 @@ fn ctx_lookup_field_at_position(ctx: mut TranslatorContext, owner: str, position
 fn ctx_lookup_field_index(ctx: mut TranslatorContext, owner: str, field: str) -> str {
     let owner_base = base_type_name(owner)
     let owner_leaf = leaf_type_name(owner_base)
-    for item in ctx.fields {
-        if item.field == field && (item.owner == owner_base || leaf_type_name(item.owner) == owner_leaf) {
-            ret item.index
+    let mut encoded = unsafe { encore_strmap_get(ctx.field_index, owner_base + "\n" + field) }
+    if encoded == 0_usize { encoded = unsafe { encore_strmap_get(ctx.field_index, owner_leaf + "\n" + field) } }
+    if encoded > 0_usize {
+        match ctx.fields.get(encoded - 1_usize) {
+            Some(item) => { ret item.index }
+            None => {}
         }
     }
     ret field
@@ -1620,7 +1740,9 @@ fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, e
         ctx_add_var(ctx, param.name, param_type)
         // `mut T` parameters borrow caller-owned storage. Mutable locals are
         // registered separately and own the value stored in their stack slot.
-        if !starts_with(param_type, "mut ") { ctx_add_owned_var(ctx, param.name, param.name, param_type) }
+        if !starts_with(param_type, "mut ") && !(param.name == "self" && function_has_attr(fn_item, "borrowed_self")) {
+            ctx_add_owned_var(ctx, param.name, param.name, param_type)
+        }
     }
 
     let mut builder = EhirTextBuilder::new()
@@ -1663,8 +1785,7 @@ fn ensure_known_signature_type(ctx: TranslatorContext, typ: str, generics: Vec[s
         ret ()
     }
     if contains_str(generics, base) { ret () }
-    let mut known = false
-    for candidate in ctx.types { if candidate == base { known = true } }
+    let known = unsafe { encore_strmap_get(ctx.type_index, base) } != 0_usize
     if !known { translation_error_at(source_name, line, column, "unknown-type", "unknown type '" + base + "'") }
     for argument in generic_args_from_path(value) { ensure_known_signature_type(ctx, argument, generics, source_name, line, column) }
     ret ()
@@ -3209,7 +3330,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         if base_type_name(lowered.typ) == "JoinHandle" && arg_path != "" {
             move_var_out_of_context(ctx, arg_path)
         }
-        elif borrowed_arg && ctx_type_needs_ownership(ctx, lowered.typ) {
+        elif borrowed_arg && !(i == 0_usize && !spawning && ctx_function_borrows_self(ctx, callee_base)) && ctx_type_needs_ownership(ctx, lowered.typ) {
             code = code.instr("retain " + lowered.value + ": " + lowered.typ)
         }
         arg_values.push(lowered.value)
@@ -3865,7 +3986,7 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         }
     }
     let receiver_value_type = value_type_name(receiver.typ)
-    if borrowed_receiver && !receiver_uses_temporary_storage && (receiver_was_loaded || !starts_with(receiver.typ, "mut ")) && ctx_type_needs_ownership(ctx, receiver_value_type) {
+    if borrowed_receiver && !ctx_function_borrows_self(ctx, fn_name) && !receiver_uses_temporary_storage && (receiver_was_loaded || !starts_with(receiver.typ, "mut ")) && ctx_type_needs_ownership(ctx, receiver_value_type) {
         code = code.instr("retain " + receiver_value + ": " + receiver_value_type)
     }
     args.push(receiver_value)
