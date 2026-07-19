@@ -33,6 +33,8 @@ The scene layer remains independent from the RHI. `Transform` stores position, E
 
 The scene layer also provides CPU-side `MeshData`, built-in primitive generation and `DirectionalLight`. `cube_mesh` emits 24 position/normal/color vertices so each face keeps a flat normal, plus 36 consistently wound indices. The lit cube shader consumes model and camera matrices with directional light parameters from a frame-ring uniform.
 
+The editor exposes Cube, Plane and UV Sphere as built-in actors. Their scene identities are stable (`cube`, `plane`, and `sphere`), while imported geometry continues to use `mesh:<filename>`. Open `examples/primitives` to inspect all built-in meshes in one project.
+
 `ObjectUniforms` is the renderer-side bridge for a visible object. It owns one 192-byte uniform buffer and bind group per frame in flight, updates only the acquired frame slot, and keeps this transient GPU state outside `Scene`. Applications must destroy it before its bind-group layout and device.
 
 `GpuTexture` supports device-local 2D images with explicit format, usage and mip count. Texture upload and layout transitions are recorded separately by command encoders.
