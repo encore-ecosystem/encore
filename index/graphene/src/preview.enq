@@ -8,7 +8,7 @@ import mod::renderer::SceneRenderer
 import mod::rhi::*
 import mod::scene::camera::PerspectiveCamera
 import mod::scene::light::DirectionalLight
-import mod::scene::primitive::{cube_mesh, editor_grid_mesh, gizmo_ring_mesh, gizmo_tip_mesh}
+import mod::scene::primitive::{MeshData, cube_mesh, editor_grid_mesh, gizmo_ring_mesh, gizmo_tip_mesh}
 import mod::scene::renderable::Renderable
 import mod::scene::transform::Transform
 import mod::scene::world::Scene
@@ -31,6 +31,7 @@ pub struct ViewportRenderer {
     selected_material: MaterialId
     cube_unlit_material: MaterialId
     selected_unlit_material: MaterialId
+    selection_material: MaterialId
     selection_outline: u64
     grid: u64
     gizmo_tip_mesh: MeshId
@@ -45,6 +46,7 @@ pub struct ViewportRenderer {
     gizmo_y_tip: u64
     gizmo_z_tip: u64
     cubes: Vec[u64]
+    object_meshes: Vec[MeshId]
     primary_position: Vec3
     selected_cube: u32
     gizmo_mode: u32
@@ -142,11 +144,11 @@ fn viewport_target(instance: GraphicsInstance, device: GraphicsDevice, swapchain
     ret Option[ViewportRenderer]::Some(ViewportRenderer {
         instance, device, swapchain, vertex_shader, fragment_shader, layout, pipeline,
         meshes, materials, renderer, scene, mesh_id, material_id, selected_material_id,
-        unlit_material_id, selected_unlit_material_id,
+        unlit_material_id, selected_unlit_material_id, outline_material_id,
         selection_outline, grid,
         gizmo_tip_mesh_id, gizmo_ring_mesh_id, gizmo_x_material, gizmo_y_material, gizmo_z_material,
         gizmo_x, gizmo_y, gizmo_z, gizmo_x_tip, gizmo_y_tip, gizmo_z_tip,
-        cubes, Vec3::zero(), 0_u32, 1_u32, 0_u32,
+        cubes, Vec[MeshId]::new(), Vec3::zero(), 0_u32, 1_u32, 0_u32,
         PerspectiveCamera::new(Vec3::new(3.2_f32, 2.35_f32, 4.2_f32), Vec3::zero(),
             1.0471976_f32, 0.1_f32, 100.0_f32),
         DirectionalLight::new(Vec3::new(-0.45_f32, -0.8_f32, -0.35_f32),
@@ -156,6 +158,35 @@ fn viewport_target(instance: GraphicsInstance, device: GraphicsDevice, swapchain
 }
 
 impl for ViewportRenderer {
+    fn object_mesh(self: Self, index: usize) -> MeshId {
+        match self.object_meshes.get(index) { Option::Some(mesh) => { ret mesh } Option::None => {} }
+        ret self.cube_mesh
+    }
+
+    pub fn upload_mesh(self: mut Self, data: MeshData) -> MeshId { ret self.meshes.upload(self.device, data) }
+
+    pub fn set_cube_mesh(self: mut Self, cube_index: u32, mesh: MeshId) -> bool {
+        if cube_index == 0_u32 || cube_index > self.cubes.len() as u32 || !self.meshes.contains(mesh) { ret false }
+        let index = (cube_index - 1_u32) as usize
+        self.object_meshes.set(index, mesh)
+        match self.cubes.get(index) {
+            Option::Some(entity) => {
+                self.scene.set_renderable(entity, Option[Renderable]::Some(Renderable::new(mesh,
+                    self.cube_material_for(self.selected_cube == cube_index))))
+            }
+            Option::None => { ret false }
+        }
+        if self.selected_cube == cube_index {
+            let cube_outline = mesh.value() == self.cube_mesh.value()
+            if cube_outline {
+                self.scene.set_renderable(self.selection_outline, Option[Renderable]::Some(Renderable::new(mesh,
+                    self.selection_material)))
+            }
+            self.scene.set_visible(self.selection_outline, cube_outline)
+        }
+        ret true
+    }
+
     fn cube_material_for(self: Self, selected: bool) -> MaterialId {
         if self.shading_mode == 1_u32 {
             ret if selected { self.selected_unlit_material } else { self.cube_unlit_material }
@@ -280,6 +311,7 @@ impl for ViewportRenderer {
             self.scene.set_renderable(entity,
                 Option[Renderable]::Some(Renderable::new(self.cube_mesh, self.cube_material_for(false))))
             self.cubes.push(entity)
+            self.object_meshes.push(self.cube_mesh)
         }
         ret ()
     }
@@ -288,18 +320,23 @@ impl for ViewportRenderer {
         if cube_index == 0_u32 || cube_index > self.cubes.len() as u32 { ret false }
         let remove_index = (cube_index - 1_u32) as usize
         let mut remaining = Vec[u64]::new()
+        let mut remaining_meshes = Vec[MeshId]::new()
         let mut index = 0_usize
         while index < self.cubes.len() {
             match self.cubes.get(index) {
                 Option::Some(entity) => {
                     if index == remove_index { self.scene.remove(entity) }
-                    else { remaining.push(entity) }
+                    else {
+                        remaining.push(entity)
+                        match self.object_meshes.get(index) { Option::Some(mesh) => { remaining_meshes.push(mesh) } Option::None => {} }
+                    }
                 }
                 Option::None => {}
             }
             index = index + 1_usize
         }
         self.cubes = remaining
+        self.object_meshes = remaining_meshes
         if self.selected_cube == cube_index {
             self.selected_cube = 0_u32
             self.scene.set_visible(self.selection_outline, false)
@@ -344,7 +381,7 @@ impl for ViewportRenderer {
         while index < self.cubes.len() {
             match self.cubes.get(index) {
                 Option::Some(entity) => {
-                    self.scene.set_renderable(entity, Option[Renderable]::Some(Renderable::new(self.cube_mesh,
+                    self.scene.set_renderable(entity, Option[Renderable]::Some(Renderable::new(self.object_mesh(index),
                         self.cube_material_for(self.selected_cube == index as u32 + 1_u32))))
                 }
                 Option::None => {}
@@ -365,20 +402,29 @@ impl for ViewportRenderer {
         let next = if selected > 0_u32 && selected <= self.cubes.len() as u32 { selected } else { 0_u32 }
         if self.selected_cube == next { ret () }
         self.selected_cube = next
+        let mut outline_visible = false
         let mut index = 0_usize
         while index < self.cubes.len() {
             match self.cubes.get(index) {
                 Option::Some(entity) => {
-                    let material = self.cube_material_for(next == (index as u32) + 1_u32)
-                    self.scene.set_renderable(entity,
-                        Option[Renderable]::Some(Renderable::new(self.cube_mesh, material)))
+                    let selected_here = next == (index as u32) + 1_u32
+                    let material = self.cube_material_for(selected_here)
+                    let mesh = self.object_mesh(index)
+                    self.scene.set_renderable(entity, Option[Renderable]::Some(Renderable::new(mesh, material)))
+                    if selected_here {
+                        outline_visible = mesh.value() == self.cube_mesh.value()
+                        if outline_visible {
+                            self.scene.set_renderable(self.selection_outline,
+                                Option[Renderable]::Some(Renderable::new(mesh, self.selection_material)))
+                        }
+                    }
                 }
                 Option::None => {}
             }
             index = index + 1_usize
         }
         let visible = self.gizmo_mode > 0_u32 && next > 0_u32
-        self.scene.set_visible(self.selection_outline, next > 0_u32)
+        self.scene.set_visible(self.selection_outline, next > 0_u32 && outline_visible)
         self.scene.set_visible(self.gizmo_x, visible)
         self.scene.set_visible(self.gizmo_y, visible)
         self.scene.set_visible(self.gizmo_z, visible)
