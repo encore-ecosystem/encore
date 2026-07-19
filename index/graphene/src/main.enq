@@ -11,7 +11,8 @@ import core::vec::Vec
 import encore_ui::{Color, FilePicker, FilePickerIcons, FontManager, IconManager, Insets, Style, SvgDocument, TextEditor, Widget, WidgetLayout, Window, event_close, event_key_down, event_pointer_down,
     event_pointer_move, event_pointer_up, event_resize, event_scroll, event_text_input, backend_error, backend_name,
     align_start, horizontal, key_backspace, key_delete, key_down, key_end, key_enter, key_home, key_left, key_right, key_up, text_end, vertical}
-import graphene::{ImportedMeshAsset, MaterialId, MeshId, Renderable, Scene, SceneActor, SceneAsset, Transform, ViewportRenderer, add_actor_mesh_name, apply_editor_transform,
+import graphene::{ActorRecord, EditorActors, EditorEdit, ImportedMeshAsset, MaterialId, MeshId, RenameEdit, Renderable, Scene, SceneActor, SceneAsset,
+    Transform, TransformEdit, ViewportRenderer, VisibilityEdit, add_actor_mesh_name, apply_editor_transform,
     discover_obj_assets, import_obj_asset, plane_mesh, sphere_mesh}
 import linalg::Vec3
 
@@ -81,16 +82,6 @@ impl for EditorIcons {
 
 fn file_picker_icons(icons: EditorIcons) -> FilePickerIcons {
     ret FilePickerIcons::new(icons.folder, icons.file, icons.home, icons.up, icons.refresh, icons.add, icons.hidden)
-}
-
-struct TransformEdit {
-    cube: u32
-    before_position: Vec3
-    before_rotation: Vec3
-    before_scale: Vec3
-    after_position: Vec3
-    after_rotation: Vec3
-    after_scale: Vec3
 }
 
 struct ProjectPaths {
@@ -215,11 +206,9 @@ fn compile_game(compiler: str, manifest: str, log_path: str, completion_path: st
 
 fn apply_transform_edit(positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3],
     edit: TransformEdit, use_after: bool) -> (Vec[Vec3], Vec[Vec3], Vec[Vec3]) {
-    let position = if use_after { edit.after_position } else { edit.before_position }
-    let rotation = if use_after { edit.after_rotation } else { edit.before_rotation }
-    let scale = if use_after { edit.after_scale } else { edit.before_scale }
-    ret (set_position(positions, edit.cube, position), set_rotation(rotations, edit.cube, rotation),
-        set_scale(scales, edit.cube, scale))
+    ret (set_position(positions, edit.actor(), edit.position(use_after)),
+        set_rotation(rotations, edit.actor(), edit.rotation(use_after)),
+        set_scale(scales, edit.actor(), edit.scale(use_after)))
 }
 
 fn theme_surface() -> Color { ret Color::rgb(24_u8, 24_u8, 27_u8) }
@@ -1564,6 +1553,51 @@ fn remove_bool_at(values: Vec[bool], index: usize) -> Vec[bool] {
     ret result
 }
 
+fn actor_record(index: u32, names: Vec[str], meshes: Vec[str], visibilities: Vec[bool],
+    positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3]) -> ActorRecord {
+    ret ActorRecord::new(index, actor_name_at(names, index), mesh_name_at(meshes, index),
+        bool_at(visibilities, index, true), position_at(positions, index), rotation_at(rotations, index), scale_at(scales, index))
+}
+
+fn rebuild_editor_scene(names: Vec[str], visibilities: Vec[bool], positions: Vec[Vec3], rotations: Vec[Vec3],
+    scales: Vec[Vec3]) -> (Scene, Vec[u64]) {
+    let mut scene = Scene::new()
+    scene.create_entity("Camera", Transform::identity().with_position(Vec3::new(0.0_f32, 2.0_f32, 6.0_f32)))
+    scene.create_entity("Directional Light", Transform::identity().with_rotation(Vec3::new(-0.7_f32, -0.4_f32, 0.0_f32)))
+    let mut entities = Vec[u64]::new()
+    let mut index = 0_usize
+    while index < positions.len() {
+        let actor = index as u32 + 1_u32
+        let entity = scene.create_entity(actor_name_at(names, actor), Transform::identity()
+            .with_position(position_at(positions, actor)).with_rotation(rotation_at(rotations, actor)).with_scale(scale_at(scales, actor)))
+        scene.set_renderable(entity, Option[Renderable]::Some(Renderable::new(MeshId::new(1_u64), MaterialId::new(1_u64))))
+        scene.set_visible(entity, bool_at(visibilities, actor, true))
+        entities.push(entity)
+        index = index + 1_usize
+    }
+    ret (scene, entities)
+}
+
+fn rebuild_viewport_actors(renderer: mut ViewportRenderer, previous_count: u32, meshes: Vec[str],
+    visibilities: Vec[bool], positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3], plane: MeshId, sphere: MeshId,
+    imported: Vec[ImportedMeshAsset], uploaded: Vec[MeshId], selected_actor: u32) -> () {
+    let mut remaining = previous_count
+    while remaining > 0_u32 { renderer.remove_cube(1_u32) remaining = remaining - 1_u32 }
+    renderer.sync_cubes(positions.len() as u32)
+    let mut index = 0_usize
+    while index < positions.len() {
+        let actor = index as u32 + 1_u32
+        let mesh_name = mesh_name_at(meshes, actor)
+        let mesh = resolve_actor_gpu_mesh(mesh_name, plane, sphere, imported, uploaded)
+        if mesh.valid() { renderer.set_cube_mesh(actor, mesh) }
+        renderer.set_cube_visible(actor, bool_at(visibilities, actor, true))
+        index = index + 1_usize
+    }
+    renderer.sync_cube_transforms_scaled(positions, rotations, scales)
+    renderer.select_cube(selected_actor)
+    ret ()
+}
+
 fn scene_asset(positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3]) -> SceneAsset {
     ret scene_asset_with_meshes(positions, rotations, scales, Vec[str]::new(), Vec[str]::new(), Vec[bool]::new())
 }
@@ -2094,6 +2128,7 @@ fn main() -> u32 {
     selected = if selected_cube > 0_u32 { actor_name_at(actor_names, selected_cube) } else { "Camera" }
     let mut actor_name_editor = TextEditor::new(selected)
     let mut actor_name_focused = false
+    let mut actor_name_before_edit = selected
     let mut transform_field = ""
     let mut transform_editor = TextEditor::new("")
     let mut transform_invalid = false
@@ -2126,8 +2161,8 @@ fn main() -> u32 {
         Option::Some(value) => { value != "0" && value != "false" }
         Option::None => { true }
     }
-    let mut undo_stack = Vec[TransformEdit]::new()
-    let mut redo_stack = Vec[TransformEdit]::new()
+    let mut undo_stack = Vec[EditorEdit]::new()
+    let mut redo_stack = Vec[EditorEdit]::new()
     let mut transform_editing = false
     let mut edit_start_position = Vec3::zero()
     let mut edit_start_rotation = Vec3::zero()
@@ -2577,7 +2612,8 @@ fn main() -> u32 {
                 if gpu_mesh.valid() { viewport_renderer.set_cube_mesh(selected_cube, gpu_mesh) }
                 viewport_renderer.select_cube(selected_cube)
                 selected_asset = if mesh_name == "" { "asset-cube" } else { target }
-                undo_stack.clear()
+                undo_stack.push(EditorEdit::Add(actor_record(selected_cube, actor_names, cube_mesh_names, actor_visibilities,
+                    cube_positions, cube_rotations, cube_scales)))
                 redo_stack.clear()
                 add_actor_open = false
                 project_dirty = true
@@ -2590,7 +2626,8 @@ fn main() -> u32 {
                 while visibility_index < object_count {
                     if target == "toggle-visible-entity-cube-" + Debug::fmt(visibility_index + 1_u32) {
                         let actor_index = visibility_index + 1_u32
-                        let visible = !bool_at(actor_visibilities, actor_index, true)
+                        let before_visible = bool_at(actor_visibilities, actor_index, true)
+                        let visible = !before_visible
                         actor_visibilities.set(visibility_index as usize, visible)
                         viewport_renderer.set_cube_visible(actor_index, visible)
                         match cube_entities.get(visibility_index as usize) {
@@ -2598,6 +2635,8 @@ fn main() -> u32 {
                             Option::None => {}
                         }
                         status_message = actor_name_at(actor_names, actor_index) + if visible { " shown" } else { " hidden" }
+                        undo_stack.push(EditorEdit::Visibility(VisibilityEdit::new(actor_index, before_visible, visible)))
+                        redo_stack.clear()
                         project_dirty = true
                         dirty = true
                     }
@@ -2605,6 +2644,7 @@ fn main() -> u32 {
                 }
             }
             elif target == "entity-name" && selected_cube > 0_u32 {
+                actor_name_before_edit = selected
                 actor_name_editor = TextEditor::new(selected).select_all()
                 actor_name_focused = true
                 code_focused = false
@@ -2715,8 +2755,8 @@ fn main() -> u32 {
                 let after_position = position_at(cube_positions, selected_cube)
                 let after_rotation = rotation_at(cube_rotations, selected_cube)
                 let after_scale = scale_at(cube_scales, selected_cube)
-                undo_stack.push(TransformEdit{selected_cube, before_position, before_rotation, before_scale,
-                    after_position, after_rotation, after_scale})
+                undo_stack.push(EditorEdit::Transform(TransformEdit::new(selected_cube, before_position, before_rotation, before_scale,
+                    after_position, after_rotation, after_scale)))
                 redo_stack.clear()
                 project_dirty = true
                 status_message = "Adjusted " + kind + " for " + selected
@@ -2751,7 +2791,13 @@ fn main() -> u32 {
                 }
             }
             code_focused = target == "code-editor"
-            if target != "entity-name" { actor_name_focused = false actor_name_editor = TextEditor::new(selected) }
+            if target != "entity-name" {
+                if actor_name_focused && selected_cube > 0_u32 && actor_name_before_edit != selected {
+                    undo_stack.push(EditorEdit::Rename(RenameEdit::new(selected_cube, actor_name_before_edit, selected)))
+                    redo_stack.clear()
+                }
+                actor_name_focused = false actor_name_before_edit = selected actor_name_editor = TextEditor::new(selected)
+            }
             if target != "scene-search" { outliner_search_focused = false }
         }
         if request_exit { break }
@@ -2829,8 +2875,8 @@ fn main() -> u32 {
                 let after_scale = scale_at(cube_scales, selected_cube)
                 if vec3_differs(edit_start_position, after_position) ||
                     vec3_differs(edit_start_rotation, after_rotation) || vec3_differs(edit_start_scale, after_scale) {
-                    undo_stack.push(TransformEdit{selected_cube, edit_start_position, edit_start_rotation,
-                        edit_start_scale, after_position, after_rotation, after_scale})
+                    undo_stack.push(EditorEdit::Transform(TransformEdit::new(selected_cube, edit_start_position, edit_start_rotation,
+                        edit_start_scale, after_position, after_rotation, after_scale)))
                     redo_stack.clear()
                     project_dirty = true
                 }
@@ -2912,6 +2958,9 @@ fn main() -> u32 {
                 render_rotations.push(Vec3::zero())
                 viewport_renderer.sync_cubes(object_count)
                 if placed_mesh.valid() { viewport_renderer.set_cube_mesh(selected_cube, placed_mesh) }
+                undo_stack.push(EditorEdit::Add(actor_record(selected_cube, actor_names, cube_mesh_names, actor_visibilities,
+                    cube_positions, cube_rotations, cube_scales)))
+                redo_stack.clear()
                 project_dirty = true
                 }
                 Option::None => {}
@@ -2975,7 +3024,8 @@ fn main() -> u32 {
             let duplicate_mesh = resolve_actor_gpu_mesh(source_mesh_name, plane_gpu_mesh, sphere_gpu_mesh,
                 imported_meshes, imported_gpu_meshes)
             if duplicate_mesh.valid() { viewport_renderer.set_cube_mesh(selected_cube, duplicate_mesh) }
-            undo_stack.clear()
+            undo_stack.push(EditorEdit::Add(actor_record(selected_cube, actor_names, cube_mesh_names, actor_visibilities,
+                cube_positions, cube_rotations, cube_scales)))
             redo_stack.clear()
             status_message = "Duplicated " + selected
             project_dirty = true
@@ -2984,6 +3034,8 @@ fn main() -> u32 {
         if request_delete && selected_cube > 0_u32 && selected_cube <= object_count {
             let removed = selected_cube
             let removed_index = (removed - 1_u32) as usize
+            let removed_actor = actor_record(removed, actor_names, cube_mesh_names, actor_visibilities,
+                cube_positions, cube_rotations, cube_scales)
             match cube_entities.get(removed_index) {
                 Option::Some(entity) => { editor_scene.remove(entity) }
                 Option::None => {}
@@ -3007,65 +3059,95 @@ fn main() -> u32 {
             }
             transform_editing = false
             moving_cube = false
-            undo_stack.clear()
+            undo_stack.push(EditorEdit::Delete(removed_actor))
             redo_stack.clear()
-            status_message = "Deleted Cube " + Debug::fmt(removed)
+            status_message = "Deleted " + removed_actor.name()
             project_dirty = true
             dirty = true
         }
-        if request_undo {
-            match undo_stack.pop() {
-                Option::Some(edit) => {
-                    let restored = apply_transform_edit(cube_positions, cube_rotations, cube_scales, edit, false)
-                    cube_positions = restored.0
-                    cube_rotations = restored.1
-                    cube_scales = restored.2
-                    render_rotations = cube_rotations
-                    selected_cube = edit.cube
-                    selected = actor_name_at(actor_names, edit.cube)
-                    redo_stack.push(edit)
-                    status_message = "Undo transform"
-                    project_dirty = true
-                    match cube_entities.get((edit.cube - 1_u32) as usize) {
-                        Option::Some(entity) => {
-                            editor_scene.set_transform(entity, Transform::identity()
-                                .with_position(position_at(cube_positions, edit.cube))
-                                .with_rotation(rotation_at(cube_rotations, edit.cube))
-                                .with_scale(scale_at(cube_scales, edit.cube)))
+        let mut history_edit = Option[EditorEdit]::None
+        let history_redo = request_redo
+        if request_undo { history_edit = undo_stack.pop() }
+        elif request_redo { history_edit = redo_stack.pop() }
+        match history_edit {
+            Option::Some(edit) => {
+                if history_redo { undo_stack.push(edit) } else { redo_stack.push(edit) }
+                let previous_count = object_count
+                let mut structural = false
+                let mut history_actor = selected_cube
+                match edit {
+                    EditorEdit::Transform(value) => {
+                        let restored = apply_transform_edit(cube_positions, cube_rotations, cube_scales, value, history_redo)
+                        cube_positions = restored.0 cube_rotations = restored.1 cube_scales = restored.2
+                        render_rotations = cube_rotations history_actor = value.actor()
+                        match cube_entities.get((history_actor - 1_u32) as usize) {
+                            Option::Some(entity) => { editor_scene.set_transform(entity, Transform::identity()
+                                .with_position(position_at(cube_positions, history_actor))
+                                .with_rotation(rotation_at(cube_rotations, history_actor))
+                                .with_scale(scale_at(cube_scales, history_actor))) }
+                            Option::None => {}
                         }
-                        Option::None => {}
+                        status_message = if history_redo { "Redo transform" } else { "Undo transform" }
                     }
-                    dirty = true
-                }
-                Option::None => {}
-            }
-        }
-        if request_redo {
-            match redo_stack.pop() {
-                Option::Some(edit) => {
-                    let restored = apply_transform_edit(cube_positions, cube_rotations, cube_scales, edit, true)
-                    cube_positions = restored.0
-                    cube_rotations = restored.1
-                    cube_scales = restored.2
-                    render_rotations = cube_rotations
-                    selected_cube = edit.cube
-                    selected = actor_name_at(actor_names, edit.cube)
-                    undo_stack.push(edit)
-                    status_message = "Redo transform"
-                    project_dirty = true
-                    match cube_entities.get((edit.cube - 1_u32) as usize) {
-                        Option::Some(entity) => {
-                            editor_scene.set_transform(entity, Transform::identity()
-                                .with_position(position_at(cube_positions, edit.cube))
-                                .with_rotation(rotation_at(cube_rotations, edit.cube))
-                                .with_scale(scale_at(cube_scales, edit.cube)))
+                    EditorEdit::Add(record) => {
+                        history_actor = record.index()
+                        let restored = EditorActors::new(actor_names, cube_mesh_names, actor_visibilities,
+                            cube_positions, cube_rotations, cube_scales).apply(record, history_redo)
+                        actor_names = restored.names() cube_mesh_names = restored.mesh_names()
+                        actor_visibilities = restored.visibilities() cube_positions = restored.positions()
+                        cube_rotations = restored.rotations() cube_scales = restored.scales()
+                        structural = true
+                        status_message = if history_redo { "Redo add actor" } else { "Undo add actor" }
+                    }
+                    EditorEdit::Delete(record) => {
+                        history_actor = record.index()
+                        let restored = EditorActors::new(actor_names, cube_mesh_names, actor_visibilities,
+                            cube_positions, cube_rotations, cube_scales).apply(record, !history_redo)
+                        actor_names = restored.names() cube_mesh_names = restored.mesh_names()
+                        actor_visibilities = restored.visibilities() cube_positions = restored.positions()
+                        cube_rotations = restored.rotations() cube_scales = restored.scales()
+                        structural = true
+                        status_message = if history_redo { "Redo delete actor" } else { "Undo delete actor" }
+                    }
+                    EditorEdit::Rename(value) => {
+                        history_actor = value.actor()
+                        let name = value.value(history_redo)
+                        actor_names.set((history_actor - 1_u32) as usize, name)
+                        match cube_entities.get((history_actor - 1_u32) as usize) {
+                            Option::Some(entity) => { editor_scene.rename(entity, name) }
+                            Option::None => {}
                         }
-                        Option::None => {}
+                        status_message = if history_redo { "Redo rename actor" } else { "Undo rename actor" }
                     }
-                    dirty = true
+                    EditorEdit::Visibility(value) => {
+                        history_actor = value.actor()
+                        let visible = value.value(history_redo)
+                        actor_visibilities.set((history_actor - 1_u32) as usize, visible)
+                        viewport_renderer.set_cube_visible(history_actor, visible)
+                        match cube_entities.get((history_actor - 1_u32) as usize) {
+                            Option::Some(entity) => { editor_scene.set_visible(entity, visible) }
+                            Option::None => {}
+                        }
+                        status_message = if history_redo { "Redo visibility" } else { "Undo visibility" }
+                    }
                 }
-                Option::None => {}
+                object_count = cube_positions.len() as u32
+                if structural {
+                    render_rotations = cube_rotations
+                    let rebuilt = rebuild_editor_scene(actor_names, actor_visibilities, cube_positions, cube_rotations, cube_scales)
+                    editor_scene = rebuilt.0 cube_entities = rebuilt.1
+                    selected_cube = if object_count == 0_u32 { 0_u32 } else {
+                        if history_actor > object_count { object_count } else { history_actor }
+                    }
+                    rebuild_viewport_actors(viewport_renderer, previous_count, cube_mesh_names, actor_visibilities,
+                        cube_positions, render_rotations, cube_scales, plane_gpu_mesh, sphere_gpu_mesh,
+                        imported_meshes, imported_gpu_meshes, selected_cube)
+                } else { selected_cube = history_actor viewport_renderer.select_cube(selected_cube) }
+                selected = if selected_cube > 0_u32 { actor_name_at(actor_names, selected_cube) } else { "Camera" }
+                actor_name_editor = TextEditor::new(selected)
+                project_dirty = true dirty = true
             }
+            Option::None => {}
         }
         if project_dialog_mode == "import" && event.kind() == event_text_input() && event.text() != "" {
             asset_picker = asset_picker.input(event.text())
@@ -3148,8 +3230,8 @@ fn main() -> u32 {
                         render_rotations = cube_rotations
                         if vec3_differs(before_position, values.position()) || vec3_differs(before_rotation, values.rotation()) ||
                             vec3_differs(before_scale, values.scale()) {
-                            undo_stack.push(TransformEdit{selected_cube, before_position, before_rotation, before_scale,
-                                values.position(), values.rotation(), values.scale()})
+                            undo_stack.push(EditorEdit::Transform(TransformEdit::new(selected_cube, before_position, before_rotation, before_scale,
+                                values.position(), values.rotation(), values.scale())))
                             redo_stack.clear()
                             project_dirty = true
                         }
@@ -3219,7 +3301,13 @@ fn main() -> u32 {
             elif event.key() == key_right() { actor_name_editor = actor_name_editor.move_right(extend) dirty = true }
             elif event.key() == key_home() { actor_name_editor = actor_name_editor.move_home(extend) dirty = true }
             elif event.key() == key_end() { actor_name_editor = actor_name_editor.move_end(extend) dirty = true }
-            elif event.key() == key_enter() { actor_name_focused = false dirty = true }
+            elif event.key() == key_enter() {
+                if actor_name_before_edit != selected {
+                    undo_stack.push(EditorEdit::Rename(RenameEdit::new(selected_cube, actor_name_before_edit, selected)))
+                    redo_stack.clear()
+                }
+                actor_name_before_edit = selected actor_name_focused = false dirty = true
+            }
             if actor_name_editor.value() != "" {
                 selected = actor_name_editor.value()
                 actor_names.set((selected_cube - 1_u32) as usize, selected)
