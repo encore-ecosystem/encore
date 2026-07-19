@@ -1,4 +1,8 @@
 #include <stddef.h>
+#if defined(__linux__)
+#include <stdio.h>
+#include <unistd.h>
+#endif
 
 static size_t encore_target_pointer_width = sizeof(void *) * 8u;
 
@@ -8,4 +12,18 @@ void encore_llvm_set_target_pointer_width(size_t bits) {
 
 size_t encore_llvm_target_pointer_width(void) {
     return encore_target_pointer_width;
+}
+
+size_t encore_codegen_rss_kb(void) {
+#if defined(__linux__)
+    FILE *file = fopen("/proc/self/statm", "r");
+    unsigned long pages = 0;
+    unsigned long resident = 0;
+    if (file == NULL) return 0;
+    if (fscanf(file, "%lu %lu", &pages, &resident) != 2) resident = 0;
+    fclose(file);
+    return (size_t)(resident * (unsigned long)sysconf(_SC_PAGESIZE) / 1024ul);
+#else
+    return 0;
+#endif
 }

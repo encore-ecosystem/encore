@@ -2,6 +2,7 @@ import core::option::Option
 import core::fmt::Debug
 import core::io::eprintln
 import core::process::exit
+import core::os::env
 import std::vec::Vec
 import std::vec::vec_singleton
 import ehirlib::core::Module
@@ -95,6 +96,7 @@ import llvm::builder::llvm_term_ret_void
 import llvm::builder::llvm_term_br
 import llvm::builder::llvm_term_cbr
 import llvm::builder::llvm_term_unreachable
+import llvm::ir::{append_builder_line, append_function_to_builder}
 import llvm::types::void_type
 import llvm::types::i1_type
 import llvm::types::i8_type
@@ -146,48 +148,91 @@ extern fn encore_llvm_float_literal(value: str, is_f32: usize) -> str
 extern fn encore_strset_new() -> usize
 extern fn encore_strset_insert(set: usize, value: str) -> bool
 extern fn encore_strset_free(set: usize) -> ()
+extern fn encore_text_builder_new() -> usize
+extern fn encore_text_builder_finish(builder: usize) -> str
+extern fn encore_codegen_rss_kb() -> usize
+
+fn profile_codegen_memory(stage: str) -> () {
+    if env("ENCORE_CODEGEN_PROFILE").is_some() {
+        eprintln("codegen-memory " + stage + ": " + Debug::fmt(unsafe { encore_codegen_rss_kb() }) + " KiB")
+    }
+    ret ()
+}
 
 fn byte_slice(value: str, start: usize, byte_len: usize) -> str {
     ret unsafe { encore_str_slice_bytes(value, start, byte_len) }
 }
 
 pub fn lower(module: Module) -> LoweredModule {
+    profile_codegen_memory("lower-start")
     let directives = module.directives
     let module_name = module.name
     let mut generic_calls = collect_generic_calls(directives)
+    profile_codegen_memory("generic-calls-collected")
     expand_generic_calls(directives, generic_calls)
+    profile_codegen_memory("generic-calls-expanded")
     let concrete_types = collect_concrete_types(directives, generic_calls)
+    profile_codegen_memory("concrete-types-collected")
     let mut type_declarations = lower_type_declarations(directives, concrete_types)
     type_declarations.extend(thread_context_declarations(directives))
-    let mut functions = lower_directives(directives)
-    functions.extend(lower_generic_functions(directives, generic_calls))
-    functions.extend(lower_trait_dispatch_functions(directives, concrete_types))
-    functions.extend(lower_drop_functions(directives, concrete_types))
-    functions.extend(thread_trampolines(directives))
-    functions.extend(runtime_declarations())
-    functions = unique_functions(functions)
+    profile_codegen_memory("types-lowered")
     let safe_module_name = sanitize_symbol(module_name)
-    let llvm_module = llvm_module_with_types(safe_module_name, type_declarations, functions)
-    ret LoweredModule{llvm_to_text(llvm_module)}
+    let builder = unsafe { encore_text_builder_new() }
+    append_builder_line(builder, "; ModuleID = '" + safe_module_name + "'")
+    for declaration in type_declarations { append_builder_line(builder, declaration) }
+    append_builder_line(builder, "")
+    let seen = unsafe { encore_strset_new() }
+    let mut emitted = false
+    emitted = append_lowered_directives(builder, directives, seen, emitted)
+    profile_codegen_memory("directives-lowered")
+    emitted = append_lowered_generic_functions(builder, directives, generic_calls, seen, emitted)
+    profile_codegen_memory("generics-lowered")
+    emitted = append_lowered_trait_dispatch_functions(builder, directives, concrete_types, seen, emitted)
+    profile_codegen_memory("traits-lowered")
+    emitted = append_lowered_drop_functions(builder, directives, concrete_types, seen, emitted)
+    profile_codegen_memory("ownership-lowered")
+    emitted = append_unique_functions(builder, thread_trampolines(directives), seen, emitted)
+    emitted = append_unique_functions(builder, runtime_declarations(), seen, emitted)
+    unsafe { encore_strset_free(seen) }
+    ret LoweredModule{unsafe { encore_text_builder_finish(builder) }}
 }
 
-fn lower_trait_dispatch_functions(directives: Vec[Directive], concrete_types: Vec[Type]) -> Vec[LLVMFunction] {
-    let mut out = Vec[LLVMFunction]::new()
+fn append_unique_functions(builder: usize, functions: Vec[LLVMFunction], seen: usize, emitted: bool) -> bool {
+    let mut any = emitted
+    for function in functions {
+        if unsafe { encore_strset_insert(seen, function.name) } {
+            if any { append_builder_line(builder, "") }
+            append_function_to_builder(builder, function)
+            any = true
+        }
+    }
+    ret any
+}
+
+fn append_lowered_directives(builder: usize, directives: Vec[Directive], seen: usize, emitted: bool) -> bool {
+    let mut any = emitted
+    for directive in directives { any = append_unique_functions(builder, lower_directive(directive), seen, any) }
+    ret any
+}
+
+fn append_lowered_trait_dispatch_functions(builder: usize, directives: Vec[Directive], concrete_types: Vec[Type],
+    seen: usize, emitted: bool) -> bool {
+    let mut any = emitted
     for directive in directives {
         match directive {
             Directive::Trait(item) => {
                 if trait_is_used_dynamically(concrete_types, item.name) {
-                    out.push(lower_dyn_ownership_function(directives, item.name, false))
-                    out.push(lower_dyn_ownership_function(directives, item.name, true))
+                    any = append_unique_functions(builder, vec_singleton(lower_dyn_ownership_function(directives, item.name, false)), seen, any)
+                    any = append_unique_functions(builder, vec_singleton(lower_dyn_ownership_function(directives, item.name, true)), seen, any)
                     for method in item.methods {
-                        out.push(lower_trait_dispatch_function(directives, item.name, method))
+                        any = append_unique_functions(builder, vec_singleton(lower_trait_dispatch_function(directives, item.name, method)), seen, any)
                     }
                 }
             }
             _ => {}
         }
     }
-    ret out
+    ret any
 }
 
 fn lower_dyn_ownership_function(directives: Vec[Directive], trait_name: str, retain: bool) -> LLVMFunction {
@@ -322,20 +367,6 @@ fn lower_trait_dispatch_function(directives: Vec[Directive], trait_name: str, me
         blocks.push(llvm_block("missing", Vec[LLVMInstruction]::new(), llvm_term_unreachable()))
     }
     ret llvm_define_fn(sanitize_symbol(trait_name + "::" + method.name), ret_type, params_data, blocks)
-}
-
-fn unique_functions(functions: Vec[LLVMFunction]) -> Vec[LLVMFunction] {
-    let mut out = Vec[LLVMFunction]::new()
-    let mut names = Vec[str]::new()
-    for function in functions {
-        let mut seen = false
-        for name in names { if name == function.name { seen = true } }
-        if !seen {
-            names.push(function.name)
-            out.push(function)
-        }
-    }
-    ret out
 }
 
 fn runtime_declarations() -> Vec[LLVMFunction] {
@@ -531,20 +562,28 @@ fn thread_trampolines(directives: Vec[Directive]) -> Vec[LLVMFunction] {
     ret out
 }
 
-fn lower_drop_functions(directives: Vec[Directive], concrete_types: Vec[Type]) -> Vec[LLVMFunction] {
-    let mut out = Vec[LLVMFunction]::new()
+fn append_lowered_drop_pair(builder: usize, drop_function: LLVMFunction, retain_function: LLVMFunction,
+    seen: usize, emitted: bool) -> bool {
+    let mut any = append_unique_functions(builder, vec_singleton(drop_function), seen, emitted)
+    any = append_unique_functions(builder, vec_singleton(retain_function), seen, any)
+    ret any
+}
+
+fn append_lowered_drop_functions(builder: usize, directives: Vec[Directive], concrete_types: Vec[Type],
+    seen: usize, emitted: bool) -> bool {
+    let mut any = emitted
     for directive in directives {
         match directive {
             Directive::Struct(item) => {
                 if item.generics.len() == 0_usize {
                     let concrete = Type{item.name, Vec[Type]::new(), PointerKind::Plain}
-                    out.push(lower_struct_drop_function(item.generics, item.fields, concrete))
-                    out.push(lower_struct_retain_function(item.generics, item.fields, concrete))
+                    any = append_lowered_drop_pair(builder, lower_struct_drop_function(item.generics, item.fields, concrete),
+                        lower_struct_retain_function(item.generics, item.fields, concrete), seen, any)
                 } else {
                     for concrete in concrete_types {
                         if concrete.name == item.name && concrete.generics.len() == item.generics.len() {
-                            out.push(lower_struct_drop_function(item.generics, item.fields, concrete))
-                            out.push(lower_struct_retain_function(item.generics, item.fields, concrete))
+                            any = append_lowered_drop_pair(builder, lower_struct_drop_function(item.generics, item.fields, concrete),
+                                lower_struct_retain_function(item.generics, item.fields, concrete), seen, any)
                         }
                     }
                 }
@@ -552,13 +591,13 @@ fn lower_drop_functions(directives: Vec[Directive], concrete_types: Vec[Type]) -
             Directive::Enum(item) => {
                 if item.generics.len() == 0_usize {
                     let concrete = Type{item.name, Vec[Type]::new(), PointerKind::Plain}
-                    out.push(lower_enum_drop_function(item.generics, item.variants, concrete))
-                    out.push(lower_enum_retain_function(item.generics, item.variants, concrete))
+                    any = append_lowered_drop_pair(builder, lower_enum_drop_function(item.generics, item.variants, concrete),
+                        lower_enum_retain_function(item.generics, item.variants, concrete), seen, any)
                 } else {
                     for concrete in concrete_types {
                         if concrete.name == item.name && concrete.generics.len() == item.generics.len() {
-                            out.push(lower_enum_drop_function(item.generics, item.variants, concrete))
-                            out.push(lower_enum_retain_function(item.generics, item.variants, concrete))
+                            any = append_lowered_drop_pair(builder, lower_enum_drop_function(item.generics, item.variants, concrete),
+                                lower_enum_retain_function(item.generics, item.variants, concrete), seen, any)
                         }
                     }
                 }
@@ -568,8 +607,7 @@ fn lower_drop_functions(directives: Vec[Directive], concrete_types: Vec[Type]) -
     }
     for concrete in concrete_types {
         if concrete.pointer == PointerKind::Heap {
-            out.push(lower_heap_drop_function(concrete))
-            out.push(lower_heap_retain_function(concrete))
+            any = append_lowered_drop_pair(builder, lower_heap_drop_function(concrete), lower_heap_retain_function(concrete), seen, any)
         }
         if has_prefix(concrete.name, "__tuple_") {
             let mut fields = Vec[Parameter]::new()
@@ -578,11 +616,11 @@ fn lower_drop_functions(directives: Vec[Directive], concrete_types: Vec[Type]) -
                 fields.push(param("_" + Debug::fmt(index), item_type))
                 index = index + 1_usize
             }
-            out.push(lower_struct_drop_function(Vec[Type]::new(), fields, concrete))
-            out.push(lower_struct_retain_function(Vec[Type]::new(), fields, concrete))
+            any = append_lowered_drop_pair(builder, lower_struct_drop_function(Vec[Type]::new(), fields, concrete),
+                lower_struct_retain_function(Vec[Type]::new(), fields, concrete), seen, any)
         }
     }
-    ret out
+    ret any
 }
 
 fn struct_needs_drop(fields: Vec[Parameter]) -> bool {
@@ -1069,8 +1107,8 @@ fn remember_generic_call(out: mut Vec[GenericCall], name: str, args: Vec[Type]) 
     ret ()
 }
 
-fn lower_generic_functions(directives: Vec[Directive], calls: Vec[GenericCall]) -> Vec[LLVMFunction] {
-    let mut out = Vec[LLVMFunction]::new()
+fn append_lowered_generic_functions(builder: usize, directives: Vec[Directive], calls: Vec[GenericCall], seen: usize, emitted: bool) -> bool {
+    let mut any = emitted
     for directive in directives {
         match directive {
             Directive::Function(function) => {
@@ -1078,7 +1116,8 @@ fn lower_generic_functions(directives: Vec[Directive], calls: Vec[GenericCall]) 
                     for call_data in calls {
                         if generic_function_name_matches(function.name, call_data.name) && call_data.args.len() == function.generics.len() {
                             let template = generic_function_template_for_call(function, call_data.name)
-                            out.push(lower_function(specialize_function(template, call_data.args)))
+                            any = append_unique_functions(builder,
+                                vec_singleton(lower_function(specialize_function(template, call_data.args))), seen, any)
                         }
                     }
                 }
@@ -1090,14 +1129,16 @@ fn lower_generic_functions(directives: Vec[Directive], calls: Vec[GenericCall]) 
                         for call_data in calls {
                             if call_data.name == full_name && call_data.args.len() == item.generics.len() {
                                 let template = fn_item(full_name, item.generics, method.params, method.ret_type, method.blocks)
-                                out.push(lower_function(specialize_function(template, call_data.args)))
+                                any = append_unique_functions(builder,
+                                    vec_singleton(lower_function(specialize_function(template, call_data.args))), seen, any)
                             }
                         }
                     } elif item.generics.len() == 0_usize && method.generics.len() > 0_usize {
                         for call_data in calls {
                             if call_data.name == full_name && call_data.args.len() == method.generics.len() {
                                 let template = fn_item(full_name, method.generics, method.params, method.ret_type, method.blocks)
-                                out.push(lower_function(specialize_function(template, call_data.args)))
+                                any = append_unique_functions(builder,
+                                    vec_singleton(lower_function(specialize_function(template, call_data.args))), seen, any)
                             }
                         }
                     } elif item.generics.len() > 0_usize && method.generics.len() > 0_usize {
@@ -1105,7 +1146,8 @@ fn lower_generic_functions(directives: Vec[Directive], calls: Vec[GenericCall]) 
                         for call_data in calls {
                             if call_data.name == full_name && call_data.args.len() == params.len() {
                                 let template = fn_item(full_name, params, method.params, method.ret_type, method.blocks)
-                                out.push(lower_function(specialize_function(template, call_data.args)))
+                                any = append_unique_functions(builder,
+                                    vec_singleton(lower_function(specialize_function(template, call_data.args))), seen, any)
                             }
                         }
                     }
@@ -1114,7 +1156,7 @@ fn lower_generic_functions(directives: Vec[Directive], calls: Vec[GenericCall]) 
             _ => {}
         }
     }
-    ret out
+    ret any
 }
 
 fn generic_function_name_matches(template_name: str, call_name: str) -> bool {
@@ -1353,19 +1395,23 @@ fn generic_symbol(name: str, args: Vec[Type]) -> str {
 }
 
 pub fn emit_ir(module: Module) -> str {
+    profile_codegen_memory("emit-start")
     match validate_module(module) {
         Err(message) => {
             eprintln("error[ehir-validation]: " + message)
             exit(1_i32)
         }
         Ok(validated) => {
+            profile_codegen_memory("module-validated")
             let coroutine_lowered = lower_coroutines(validated)
+            profile_codegen_memory("coroutines-lowered")
             match validate_module(coroutine_lowered) {
                 Err(message) => {
                     eprintln("error[ehir-coroutine-validation]: " + message)
                     exit(1_i32)
                 }
                 Ok(lowered_module) => {
+                    profile_codegen_memory("coroutines-validated")
                     let lowered = lower(lowered_module)
                     ret lowered.ir
                 }
@@ -1386,14 +1432,6 @@ fn str_len(value: str) -> usize {
     ret unsafe {
         encore_str_len(value)
     }
-}
-
-fn lower_directives(directives: Vec[Directive]) -> Vec[LLVMFunction] {
-    let mut acc = Vec[LLVMFunction]::new()
-    for current in directives {
-        acc.extend(lower_directive(current))
-    }
-    ret acc
 }
 
 fn lower_type_declarations(directives: Vec[Directive], concrete_types: Vec[Type]) -> Vec[str] {
