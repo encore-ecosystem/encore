@@ -414,6 +414,11 @@ fn runtime_declarations() -> Vec[LLVMFunction] {
     out.push(llvm_declare_fn("encore_box_drop", void_type(), vec_singleton(llvm_make_param("ptr", raw_ptr)), Vec[LLVMBasicBlock]::new()))
     out.push(llvm_declare_fn("encore_heap_retain", void_type(), vec_singleton(llvm_make_param("ptr", raw_ptr)), Vec[LLVMBasicBlock]::new()))
     out.push(llvm_declare_fn("encore_heap_release", i1_type(), vec_singleton(llvm_make_param("ptr", raw_ptr)), Vec[LLVMBasicBlock]::new()))
+    let destroy_fn_ptr = llvm_raw_type(LLVMTypeKind::POINTER, "void (i8*)*")
+    let mut deferred_release_params = Vec[LLVMParam]::new()
+    deferred_release_params.push(llvm_make_param("ptr", raw_ptr))
+    deferred_release_params.push(llvm_make_param("destroy", destroy_fn_ptr))
+    out.push(llvm_declare_fn("encore_heap_release_deferred", void_type(), deferred_release_params, Vec[LLVMBasicBlock]::new()))
     out.push(llvm_declare_fn("encore_heap_free_released", void_type(), vec_singleton(llvm_make_param("ptr", raw_ptr)), Vec[LLVMBasicBlock]::new()))
     out.push(llvm_declare_fn("encore_str_drop", void_type(), vec_singleton(llvm_make_param("value", raw_ptr)), Vec[LLVMBasicBlock]::new()))
     out.push(llvm_declare_fn("encore_str_retain", void_type(), vec_singleton(llvm_make_param("value", raw_ptr)), Vec[LLVMBasicBlock]::new()))
@@ -639,6 +644,8 @@ fn append_lowered_drop_functions(builder: usize, directives: Vec[Directive], con
     }
     for concrete in concrete_types {
         if concrete.pointer == PointerKind::Heap {
+            any = append_unique_functions(builder,
+                vec_singleton(odr_function(lower_heap_destroy_function(concrete))), seen, any)
             any = append_lowered_drop_pair(builder, lower_heap_drop_function(concrete), lower_heap_retain_function(concrete), seen, any)
         }
         if has_prefix(concrete.name, "__tuple_") {
@@ -684,25 +691,38 @@ fn retain_symbol(typ: Type) -> str {
     ret "__retain_" + sanitize_symbol(mangle_type_name(typ))
 }
 
+fn destroy_symbol(typ: Type) -> str {
+    ret "__destroy_" + sanitize_symbol(mangle_type_name(typ))
+}
+
 fn lower_heap_drop_function(concrete: Type) -> LLVMFunction {
     let self_value = reg("self", lower_type(concrete))
     let raw = reg("raw", ptr_type(i8_type()))
-    let is_last = reg("is_last", i1_type())
-    let mut entry = Vec[LLVMInstruction]::new()
-    entry.push(llvm_inst_cast("bitcast", raw, self_value))
-    entry.push(llvm_inst_call(Option[LLVMValue]::Some(is_last), i1_type(), "encore_heap_release", vec_singleton(raw)))
+    let destroy_fn_ptr = llvm_raw_type(LLVMTypeKind::POINTER, "void (i8*)*")
+    let destroy = const_text("@" + destroy_symbol(concrete), destroy_fn_ptr)
+    let mut instructions = Vec[LLVMInstruction]::new()
+    instructions.push(llvm_inst_cast("bitcast", raw, self_value))
+    let mut args = Vec[LLVMValue]::new()
+    args.push(raw)
+    args.push(destroy)
+    instructions.push(llvm_inst_call(Option[LLVMValue]::None, void_type(), "encore_heap_release_deferred", args))
+    let blocks = vec_singleton(llvm_block("entry", instructions, llvm_term_ret_void()))
+    ret llvm_define_fn(drop_symbol(concrete), void_type(), vec_singleton(llvm_make_param("self", lower_type(concrete))), blocks)
+}
 
+fn lower_heap_destroy_function(concrete: Type) -> LLVMFunction {
+    let raw_type = ptr_type(i8_type())
+    let raw = reg("raw", raw_type)
+    let self_value = reg("self", lower_type(concrete))
     let plain = Type{concrete.name, concrete.generics, PointerKind::Plain}
     let pointee = reg("pointee", lower_type(plain))
-    let mut release = vec_singleton(llvm_inst_load(pointee, self_value))
-    release.extend(lower_drop_value(pointee, plain, "heap_pointee"))
-    release.push(llvm_inst_call(Option[LLVMValue]::None, void_type(), "encore_heap_free_released", vec_singleton(raw)))
-
-    let mut blocks = Vec[LLVMBasicBlock]::new()
-    blocks.push(llvm_block("entry", entry, llvm_term_cbr(is_last, "release", "done")))
-    blocks.push(llvm_block("release", release, llvm_term_ret_void()))
-    blocks.push(llvm_block("done", Vec[LLVMInstruction]::new(), llvm_term_ret_void()))
-    ret llvm_define_fn(drop_symbol(concrete), void_type(), vec_singleton(llvm_make_param("self", lower_type(concrete))), blocks)
+    let mut instructions = Vec[LLVMInstruction]::new()
+    instructions.push(llvm_inst_cast("bitcast", self_value, raw))
+    instructions.push(llvm_inst_load(pointee, self_value))
+    instructions.extend(lower_drop_value(pointee, plain, "heap_pointee"))
+    instructions.push(llvm_inst_call(Option[LLVMValue]::None, void_type(), "encore_heap_free_released", vec_singleton(raw)))
+    let blocks = vec_singleton(llvm_block("entry", instructions, llvm_term_ret_void()))
+    ret llvm_define_fn(destroy_symbol(concrete), void_type(), vec_singleton(llvm_make_param("raw", raw_type)), blocks)
 }
 
 fn lower_heap_retain_function(concrete: Type) -> LLVMFunction {
