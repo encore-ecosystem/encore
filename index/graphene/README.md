@@ -27,6 +27,8 @@ Static geometry should live in device-local memory. Create a host-visible `buffe
 
 The scene layer remains independent from the RHI. `Transform` stores position, Euler rotation and scale, while `Scene` assigns stable entity IDs and resolves parent-child world matrices. Parenting rejects missing entities, self-parenting and cycles. Visibility is inherited through the parent chain. Entities contain serializable engine data rather than backend handles.
 
+Scene files use format version 2. Every actor stores a non-zero persistent `id` and a nullable `parent` ID. Loading validates duplicate IDs, missing parents and hierarchy cycles. Version 1 scenes remain readable and are assigned deterministic sequential IDs when migrated; the next editor save writes version 2. Structural undo and redo preserve IDs and restore child relationships.
+
 `Renderable` attaches backend-neutral `MeshId` and `MaterialId` values to an entity. `Scene::visible_render_items` resolves hierarchy and emits a render queue containing only valid, world-visible objects. Asset IDs are stable scene references; renderer asset registries map them to backend resources.
 
 `MeshAssets` uploads CPU `MeshData`, owns the resulting `GpuMesh` resources and resolves stable `MeshId` values while recording draws. It intentionally does not expose owned mesh handles, preventing accidental double destruction. `MaterialAssets` stores `StandardMaterial` values keyed by `MaterialId`; base color, metallic and roughness are uploaded with each object's frame-ring uniform and affect the lit shader.

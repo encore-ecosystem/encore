@@ -95,6 +95,8 @@ struct ProjectPaths {
 }
 
 struct ProjectContents {
+    actor_ids: Vec[u64]
+    parents: Vec[Option[u64]]
     positions: Vec[Vec3]
     rotations: Vec[Vec3]
     scales: Vec[Vec3]
@@ -159,6 +161,8 @@ fn load_project(paths: ProjectPaths) -> Option[ProjectContents] {
     match SceneAsset::parse(read_file(paths.scene)) {
         Option::Some(asset) => {
             let mut positions = Vec[Vec3]::new()
+            let mut actor_ids = Vec[u64]::new()
+            let mut parents = Vec[Option[u64]]::new()
             let mut rotations = Vec[Vec3]::new()
             let mut scales = Vec[Vec3]::new()
             let mut actor_names = Vec[str]::new()
@@ -170,6 +174,8 @@ fn load_project(paths: ProjectPaths) -> Option[ProjectContents] {
                     Option::Some(actor) => {
                         match actor_mesh_name(actor.kind()) {
                             Option::Some(mesh_name) => {
+                                actor_ids.push(actor.id())
+                                parents.push(actor.parent())
                                 positions.push(actor.transform().position())
                                 rotations.push(actor.transform().rotation())
                                 scales.push(actor.transform().scale())
@@ -184,7 +190,7 @@ fn load_project(paths: ProjectPaths) -> Option[ProjectContents] {
                 }
                 index = index + 1_usize
             }
-            ret Option[ProjectContents]::Some(ProjectContents { positions, rotations, scales, actor_names, mesh_names, visibilities, read_file(paths.script) })
+            ret Option[ProjectContents]::Some(ProjectContents { actor_ids, parents, positions, rotations, scales, actor_names, mesh_names, visibilities, read_file(paths.script) })
         }
         Option::None => { ret Option[ProjectContents]::None }
     }
@@ -1599,27 +1605,53 @@ fn remove_bool_at(values: Vec[bool], index: usize) -> Vec[bool] {
 }
 
 fn actor_record(index: u32, names: Vec[str], meshes: Vec[str], visibilities: Vec[bool],
-    positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3]) -> ActorRecord {
-    ret ActorRecord::new(index, actor_name_at(names, index), mesh_name_at(meshes, index),
+    positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3], ids: Vec[u64], parents: Vec[Option[u64]]) -> ActorRecord {
+    let id = match ids.get((index - 1_u32) as usize) { Option::Some(value) => value Option::None => 0_u64 }
+    let parent = match parents.get((index - 1_u32) as usize) { Option::Some(value) => value Option::None => Option[u64]::None }
+    let mut children = Vec[u64]::new()
+    let mut child_index = 0_usize
+    while child_index < ids.len() && child_index < parents.len() {
+        match ids.get(child_index) {
+            Option::Some(child_id) => { match parents.get(child_index) {
+                Option::Some(child_parent) => { if child_parent == Option[u64]::Some(id) { children.push(child_id) } }
+                Option::None => {}
+            } }
+            Option::None => {}
+        }
+        child_index = child_index + 1_usize
+    }
+    ret ActorRecord::new(index, id, parent, children, actor_name_at(names, index), mesh_name_at(meshes, index),
         bool_at(visibilities, index, true), position_at(positions, index), rotation_at(rotations, index), scale_at(scales, index))
 }
 
 fn rebuild_editor_scene(names: Vec[str], visibilities: Vec[bool], positions: Vec[Vec3], rotations: Vec[Vec3],
-    scales: Vec[Vec3]) -> (Scene, Vec[u64]) {
+    scales: Vec[Vec3], ids: Vec[u64], parents: Vec[Option[u64]]) -> (Scene, Vec[u64]) {
     let mut scene = Scene::new()
-    scene.create_entity("Camera", Transform::identity().with_position(Vec3::new(0.0_f32, 2.0_f32, 6.0_f32)))
-    scene.create_entity("Directional Light", Transform::identity().with_rotation(Vec3::new(-0.7_f32, -0.4_f32, 0.0_f32)))
     let mut entities = Vec[u64]::new()
     let mut index = 0_usize
     while index < positions.len() {
         let actor = index as u32 + 1_u32
-        let entity = scene.create_entity(actor_name_at(names, actor), Transform::identity()
+        let entity = match ids.get(index) { Option::Some(value) => value Option::None => index as u64 + 1_u64 }
+        scene.create_entity_with_id(entity, actor_name_at(names, actor), Transform::identity()
             .with_position(position_at(positions, actor)).with_rotation(rotation_at(rotations, actor)).with_scale(scale_at(scales, actor)))
         scene.set_renderable(entity, Option[Renderable]::Some(Renderable::new(MeshId::new(1_u64), MaterialId::new(1_u64))))
         scene.set_visible(entity, bool_at(visibilities, actor, true))
         entities.push(entity)
         index = index + 1_usize
     }
+    let mut parent_index = 0_usize
+    while parent_index < entities.len() {
+        match entities.get(parent_index) {
+            Option::Some(entity) => { match parents.get(parent_index) {
+                Option::Some(parent) => { scene.set_parent(entity, parent) }
+                Option::None => {}
+            } }
+            Option::None => {}
+        }
+        parent_index = parent_index + 1_usize
+    }
+    scene.create_entity("Camera", Transform::identity().with_position(Vec3::new(0.0_f32, 2.0_f32, 6.0_f32)))
+    scene.create_entity("Directional Light", Transform::identity().with_rotation(Vec3::new(-0.7_f32, -0.4_f32, 0.0_f32)))
     ret (scene, entities)
 }
 
@@ -1644,11 +1676,12 @@ fn rebuild_viewport_actors(renderer: mut ViewportRenderer, previous_count: u32, 
 }
 
 fn scene_asset(positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3]) -> SceneAsset {
-    ret scene_asset_with_meshes(positions, rotations, scales, Vec[str]::new(), Vec[str]::new(), Vec[bool]::new())
+    ret scene_asset_with_meshes(positions, rotations, scales, Vec[str]::new(), Vec[str]::new(), Vec[bool]::new(),
+        Vec[u64]::new(), Vec[Option[u64]]::new())
 }
 
 fn scene_asset_with_meshes(positions: Vec[Vec3], rotations: Vec[Vec3], scales: Vec[Vec3], actor_names: Vec[str],
-    mesh_names: Vec[str], visibilities: Vec[bool]) -> SceneAsset {
+    mesh_names: Vec[str], visibilities: Vec[bool], actor_ids: Vec[u64], parents: Vec[Option[u64]]) -> SceneAsset {
     let mut asset = SceneAsset::new()
     let mut index = 0_usize
     while index < positions.len() {
@@ -1661,8 +1694,11 @@ fn scene_asset_with_meshes(positions: Vec[Vec3], rotations: Vec[Vec3], scales: V
                 let kind = actor_kind_for_mesh(mesh_name)
                 let fallback_name = actor_name_for_mesh(mesh_name, index as u32 + 1_u32)
                 let name = match actor_names.get(index) { Option::Some(value) => { if value == "" { fallback_name } else { value } } Option::None => fallback_name }
+                let actor_id = match actor_ids.get(index) { Option::Some(value) => value Option::None => index as u64 + 1_u64 }
+                let parent = match parents.get(index) { Option::Some(value) => value Option::None => Option[u64]::None }
                 asset.add(SceneActor::new(name, kind,
                     Transform::identity().with_position(position).with_rotation(rotation).with_scale(scale))
+                    .with_identity(actor_id).with_parent(parent)
                     .with_visible(bool_at(visibilities, index as u32 + 1_u32, true)))
             }
             Option::None => {}
@@ -1673,10 +1709,23 @@ fn scene_asset_with_meshes(positions: Vec[Vec3], rotations: Vec[Vec3], scales: V
 }
 
 fn save_editor_project(scene_path: str, script_path: str, positions: Vec[Vec3], rotations: Vec[Vec3],
-    scales: Vec[Vec3], actor_names: Vec[str], mesh_names: Vec[str], visibilities: Vec[bool], code: str) -> bool {
-    let scene_saved = write_file(scene_path, scene_asset_with_meshes(positions, rotations, scales, actor_names, mesh_names, visibilities).stringify() + "\n") == 0_i32
+    scales: Vec[Vec3], actor_names: Vec[str], mesh_names: Vec[str], visibilities: Vec[bool], actor_ids: Vec[u64],
+    parents: Vec[Option[u64]], code: str) -> bool {
+    let scene_saved = write_file(scene_path, scene_asset_with_meshes(positions, rotations, scales, actor_names, mesh_names, visibilities,
+        actor_ids, parents).stringify() + "\n") == 0_i32
     let script_saved = write_file(script_path, code) == 0_i32
     ret scene_saved && script_saved
+}
+
+fn scene_actor_parents(scene: Scene, actor_ids: Vec[u64]) -> Vec[Option[u64]] {
+    let mut parents = Vec[Option[u64]]::new()
+    for id in actor_ids {
+        match scene.get(id) {
+            Option::Some(entity) => { parents.push(entity.parent()) }
+            Option::None => { parents.push(Option[u64]::None) }
+        }
+    }
+    ret parents
 }
 
 fn detail_row(name: str, value: str, accent: Color) -> Widget {
@@ -2120,8 +2169,6 @@ fn main() -> u32 {
     let mut scene_path = paths.scene
     let mut status_message = if project_valid(paths) { "Loading project " + project_root } else { "No project loaded" }
     let mut editor_scene = Scene::new()
-    editor_scene.create_entity("Camera", Transform::identity().with_position(Vec3::new(0.0_f32, 2.0_f32, 6.0_f32)))
-    editor_scene.create_entity("Directional Light", Transform::identity().with_rotation(Vec3::new(-0.7_f32, -0.4_f32, 0.0_f32)))
     let mut cube_entities = Vec[u64]::new()
     let mut cube_positions = Vec[Vec3]::new()
     let mut cube_rotations = Vec[Vec3]::new()
@@ -2142,7 +2189,8 @@ fn main() -> u32 {
                                 Option::Some(mesh_name) => {
                                     let transform = actor.transform()
                                     let actor_name = if actor.name() == "" { actor_name_for_mesh(mesh_name, cube_entities.len() as u32 + 1_u32) } else { actor.name() }
-                                    let entity = editor_scene.create_entity(actor_name, transform)
+                                    let entity = actor.id()
+                                    editor_scene.create_entity_with_id(entity, actor_name, transform)
                                     editor_scene.set_renderable(entity,
                                         Option[Renderable]::Some(Renderable::new(MeshId::new(1_u64), MaterialId::new(1_u64))))
                                     cube_entities.push(entity)
@@ -2162,12 +2210,22 @@ fn main() -> u32 {
                     }
                     actor_index = actor_index + 1_usize
                 }
+                let mut parent_index = 0_usize
+                while parent_index < asset.len() {
+                    match asset.actor(parent_index) {
+                        Option::Some(actor) => { editor_scene.set_parent(actor.id(), actor.parent()) }
+                        Option::None => {}
+                    }
+                    parent_index = parent_index + 1_usize
+                }
                 scene_loaded = true
                 status_message = "Loaded " + scene_path
             }
             Option::None => { status_message = "Unable to parse " + scene_path }
         }
     }
+    editor_scene.create_entity("Camera", Transform::identity().with_position(Vec3::new(0.0_f32, 2.0_f32, 6.0_f32)))
+    editor_scene.create_entity("Directional Light", Transform::identity().with_rotation(Vec3::new(-0.7_f32, -0.4_f32, 0.0_f32)))
     let mut object_count = cube_entities.len() as u32
     let mut project_loaded = project_valid(paths) && scene_loaded
     selected_cube = if object_count > 0_u32 { 1_u32 } else { 0_u32 }
@@ -2475,20 +2533,34 @@ fn main() -> u32 {
                             imported_gpu_meshes.clear()
                             for asset in imported_meshes { imported_gpu_meshes.push(viewport_renderer.upload_mesh(asset.mesh())) }
                             editor_scene = Scene::new()
-                            editor_scene.create_entity("Camera", Transform::identity().with_position(Vec3::new(0.0_f32, 2.0_f32, 6.0_f32)))
-                            editor_scene.create_entity("Directional Light", Transform::identity().with_rotation(Vec3::new(-0.7_f32, -0.4_f32, 0.0_f32)))
                             cube_entities = Vec[u64]::new()
                             let mut loaded_index = 0_usize
                             while loaded_index < cube_positions.len() {
                                 let transform = Transform::identity().with_position(position_at(cube_positions, loaded_index as u32 + 1_u32))
                                     .with_rotation(rotation_at(cube_rotations, loaded_index as u32 + 1_u32))
                                     .with_scale(scale_at(cube_scales, loaded_index as u32 + 1_u32))
-                                let entity = editor_scene.create_entity(actor_name_at(actor_names, loaded_index as u32 + 1_u32), transform)
+                                let entity = match contents.actor_ids.get(loaded_index) {
+                                    Option::Some(id) => id Option::None => loaded_index as u64 + 1_u64
+                                }
+                                editor_scene.create_entity_with_id(entity, actor_name_at(actor_names, loaded_index as u32 + 1_u32), transform)
                                 editor_scene.set_renderable(entity, Option[Renderable]::Some(Renderable::new(MeshId::new(1_u64), MaterialId::new(1_u64))))
                                 cube_entities.push(entity)
                                 editor_scene.set_visible(entity, bool_at(actor_visibilities, loaded_index as u32 + 1_u32, true))
                                 loaded_index = loaded_index + 1_usize
                             }
+                            let mut loaded_parent_index = 0_usize
+                            while loaded_parent_index < cube_entities.len() {
+                                match cube_entities.get(loaded_parent_index) {
+                                    Option::Some(entity) => { match contents.parents.get(loaded_parent_index) {
+                                        Option::Some(parent) => { editor_scene.set_parent(entity, parent) }
+                                        Option::None => {}
+                                    } }
+                                    Option::None => {}
+                                }
+                                loaded_parent_index = loaded_parent_index + 1_usize
+                            }
+                            editor_scene.create_entity("Camera", Transform::identity().with_position(Vec3::new(0.0_f32, 2.0_f32, 6.0_f32)))
+                            editor_scene.create_entity("Directional Light", Transform::identity().with_rotation(Vec3::new(-0.7_f32, -0.4_f32, 0.0_f32)))
                             object_count = cube_entities.len() as u32
                             selected_cube = if object_count > 0_u32 { 1_u32 } else { 0_u32 }
                             selected = if selected_cube > 0_u32 { actor_name_at(actor_names, selected_cube) } else { "Camera" }
@@ -2697,7 +2769,7 @@ fn main() -> u32 {
                 viewport_renderer.select_cube(selected_cube)
                 selected_asset = if mesh_name == "" { "asset-cube" } else { target }
                 undo_stack.push(EditorEdit::Add(actor_record(selected_cube, actor_names, cube_mesh_names, actor_visibilities,
-                    cube_positions, cube_rotations, cube_scales)))
+                    cube_positions, cube_rotations, cube_scales, cube_entities, scene_actor_parents(editor_scene, cube_entities))))
                 redo_stack.clear()
                 add_actor_open = false
                 project_dirty = true
@@ -3046,7 +3118,7 @@ fn main() -> u32 {
                 viewport_renderer.sync_cubes(object_count)
                 if placed_mesh.valid() { viewport_renderer.set_cube_mesh(selected_cube, placed_mesh) }
                 undo_stack.push(EditorEdit::Add(actor_record(selected_cube, actor_names, cube_mesh_names, actor_visibilities,
-                    cube_positions, cube_rotations, cube_scales)))
+                    cube_positions, cube_rotations, cube_scales, cube_entities, scene_actor_parents(editor_scene, cube_entities))))
                 redo_stack.clear()
                 project_dirty = true
                 }
@@ -3057,7 +3129,7 @@ fn main() -> u32 {
         }
         if request_save {
             if save_editor_project(scene_path, script_path, cube_positions, cube_rotations, cube_scales, actor_names, cube_mesh_names, actor_visibilities,
-                code_editor.value()) {
+                cube_entities, scene_actor_parents(editor_scene, cube_entities), code_editor.value()) {
                 status_message = "Saved scene and " + script_path
                 project_dirty = false
                 if action_after_save != "" {
@@ -3079,7 +3151,7 @@ fn main() -> u32 {
         if request_exit { break }
         if request_build {
             if save_editor_project(scene_path, script_path, cube_positions, cube_rotations, cube_scales, actor_names, cube_mesh_names, actor_visibilities,
-                code_editor.value()) {
+                cube_entities, scene_actor_parents(editor_scene, cube_entities), code_editor.value()) {
                 project_dirty = false
                 remove_file(build_completion_path)
                 remove_file(build_log_path)
@@ -3126,7 +3198,7 @@ fn main() -> u32 {
                 imported_meshes, imported_gpu_meshes)
             if duplicate_mesh.valid() { viewport_renderer.set_cube_mesh(selected_cube, duplicate_mesh) }
             undo_stack.push(EditorEdit::Add(actor_record(selected_cube, actor_names, cube_mesh_names, actor_visibilities,
-                cube_positions, cube_rotations, cube_scales)))
+                cube_positions, cube_rotations, cube_scales, cube_entities, scene_actor_parents(editor_scene, cube_entities))))
             redo_stack.clear()
             status_message = "Duplicated " + selected
             project_dirty = true
@@ -3136,7 +3208,7 @@ fn main() -> u32 {
             let removed = selected_cube
             let removed_index = (removed - 1_u32) as usize
             let removed_actor = actor_record(removed, actor_names, cube_mesh_names, actor_visibilities,
-                cube_positions, cube_rotations, cube_scales)
+                cube_positions, cube_rotations, cube_scales, cube_entities, scene_actor_parents(editor_scene, cube_entities))
             match cube_entities.get(removed_index) {
                 Option::Some(entity) => { editor_scene.remove(entity) }
                 Option::None => {}
@@ -3176,6 +3248,7 @@ fn main() -> u32 {
                 let previous_count = object_count
                 let mut structural = false
                 let mut history_actor = selected_cube
+                let mut structural_parents = scene_actor_parents(editor_scene, cube_entities)
                 match edit {
                     EditorEdit::Transform(value) => {
                         let restored = apply_transform_edit(cube_positions, cube_rotations, cube_scales, value, history_redo)
@@ -3192,8 +3265,9 @@ fn main() -> u32 {
                     }
                     EditorEdit::Add(record) => {
                         history_actor = record.index()
-                        let restored = EditorActors::new(actor_names, cube_mesh_names, actor_visibilities,
+                        let restored = EditorActors::new(cube_entities, structural_parents, actor_names, cube_mesh_names, actor_visibilities,
                             cube_positions, cube_rotations, cube_scales).apply(record, history_redo)
+                        cube_entities = restored.ids() structural_parents = restored.parents()
                         actor_names = restored.names() cube_mesh_names = restored.mesh_names()
                         actor_visibilities = restored.visibilities() cube_positions = restored.positions()
                         cube_rotations = restored.rotations() cube_scales = restored.scales()
@@ -3202,8 +3276,9 @@ fn main() -> u32 {
                     }
                     EditorEdit::Delete(record) => {
                         history_actor = record.index()
-                        let restored = EditorActors::new(actor_names, cube_mesh_names, actor_visibilities,
+                        let restored = EditorActors::new(cube_entities, structural_parents, actor_names, cube_mesh_names, actor_visibilities,
                             cube_positions, cube_rotations, cube_scales).apply(record, !history_redo)
+                        cube_entities = restored.ids() structural_parents = restored.parents()
                         actor_names = restored.names() cube_mesh_names = restored.mesh_names()
                         actor_visibilities = restored.visibilities() cube_positions = restored.positions()
                         cube_rotations = restored.rotations() cube_scales = restored.scales()
@@ -3235,7 +3310,8 @@ fn main() -> u32 {
                 object_count = cube_positions.len() as u32
                 if structural {
                     render_rotations = cube_rotations
-                    let rebuilt = rebuild_editor_scene(actor_names, actor_visibilities, cube_positions, cube_rotations, cube_scales)
+                    let rebuilt = rebuild_editor_scene(actor_names, actor_visibilities, cube_positions, cube_rotations, cube_scales,
+                        cube_entities, structural_parents)
                     editor_scene = rebuilt.0 cube_entities = rebuilt.1
                     selected_cube = if object_count == 0_u32 { 0_u32 } else {
                         if history_actor > object_count { object_count } else { history_actor }
