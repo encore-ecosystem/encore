@@ -1,6 +1,7 @@
 import core::fmt::Debug
 import core::option::Option
 import core::io::eprintln
+import core::thread::JoinHandle
 import std::os::write_file
 import std::os::read_file
 import std::os::env
@@ -29,6 +30,8 @@ import refrain::project::manifest::{project_manifest_target, project_target_tool
 import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host, target_is_supported, toolchain_driver_is_supported}
 
 import rich::BuildProgress
+
+extern fn encore_compiler_release_heap() -> ()
 
 pub fn run_frontend_build() -> u32 {
     ret compile_project(requested_project_root())
@@ -145,9 +148,15 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         }
         progress.finish_stage("EHIR generated")
 
+        if emit == "ehir" {
+            progress.finish_artifact(profile, "EHIR", out_path.as_str())
+            ret 0_u32
+        }
+
         progress.start_stage("Codegen", "LLVM IR")
         progress.update(project_name, "LLVM IR", 1_usize, 1_usize)
-        if !write_llvm_artifact(out_path, llvm_path, target) {
+        unsafe { encore_compiler_release_heap() }
+        if !run_llvm_codegen_worker(out_path, llvm_path, target) {
             progress.fail_stage("failed to write translated LLVM IR")
             ret 1_u32
         }
@@ -186,22 +195,26 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         progress.fail_stage("failed to create object directory")
         ret 1_u32
     }
+    let mut llvm_compile = Option[JoinHandle[i32]]::None
     if !codegen_cached {
         let mut llvm_args = compiler_args(profile, target, toolchain)
         llvm_args.push("-c")
         llvm_args.push(native_path(llvm_path.as_str()))
         llvm_args.push("-o")
         llvm_args.push(native_path(llvm_object.as_str()))
-        if run_args(toolchain.compiler, llvm_args) != 0_i32 {
-            progress.fail_stage("LLVM IR assembly failed for target " + target.triple)
-            ret 1_u32
-        }
-        if write_file(native_path(codegen_fingerprint_path.as_str()), codegen_fingerprint) != 0_i32 {
-            progress.fail_stage("failed to write codegen fingerprint")
-            ret 1_u32
-        }
+        llvm_compile = Option[JoinHandle[i32]]::Some(spawn compile_object_job(toolchain.compiler, llvm_args,
+            native_path(codegen_fingerprint_path.as_str()), codegen_fingerprint))
     }
     if emit == "object" {
+        match llvm_compile {
+            Some(handle) => {
+                if handle.join() != 0_i32 {
+                    progress.fail_stage("LLVM IR assembly failed for target " + target.triple)
+                    ret 1_u32
+                }
+            }
+            None => {}
+        }
         progress.finish_stage("1 target object")
         progress.finish_artifact(profile, "Object", llvm_object.as_str())
         ret 0_u32
@@ -209,6 +222,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     let mut objects = Vec[str]::new()
     objects.push(native_path(llvm_object.as_str()))
     let mut compiled_native_count = 0_usize
+    let mut native_compiles = Vec[JoinHandle[i32]]::new()
     let mut source_index = 0_usize
     while source_index < native_sources.len() {
         match native_sources.get(source_index) {
@@ -225,14 +239,8 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
                     native_args.push(native_path(source.as_str()))
                     native_args.push("-o")
                     native_args.push(native_path(object.as_str()))
-                    if run_args(toolchain.compiler, native_args) != 0_i32 {
-                        progress.fail_stage("native runtime compilation failed for target " + target.triple)
-                        ret 1_u32
-                    }
-                    if write_file(native_path(object_fingerprint_path.as_str()), object_fingerprint) != 0_i32 {
-                        progress.fail_stage("failed to write native object fingerprint")
-                        ret 1_u32
-                    }
+                    native_compiles.push(spawn compile_object_job(toolchain.compiler, native_args,
+                        native_path(object_fingerprint_path.as_str()), object_fingerprint))
                     compiled_native_count = compiled_native_count + 1_usize
                 }
                 objects.push(native_path(object.as_str()))
@@ -240,6 +248,22 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             Option[Path]::None => {}
         }
         source_index = source_index + 1_usize
+    }
+    match llvm_compile {
+        Some(handle) => {
+            if handle.join() != 0_i32 {
+                for pending in native_compiles { let _ignored = pending.join() }
+                progress.fail_stage("LLVM IR assembly failed for target " + target.triple)
+                ret 1_u32
+            }
+        }
+        None => {}
+    }
+    for pending in native_compiles {
+        if pending.join() != 0_i32 {
+            progress.fail_stage("native runtime compilation failed for target " + target.triple)
+            ret 1_u32
+        }
     }
     progress.finish_stage(Debug::fmt(compiled_native_count + (if codegen_cached { 0_usize } else { 1_usize })) +
         " of " + Debug::fmt(native_sources.len() + 1_usize) + " objects")
@@ -383,11 +407,41 @@ fn write_ehir_artifact(modules: Vec[TranslationModule], target: TargetSpec, path
     ret write_file(native_path(path.as_str()), text) == 0_i32
 }
 
+fn compile_object_job(compiler: str, args: Vec[str], fingerprint_path: str, fingerprint: str) -> i32 {
+    let code = run_args(compiler, args)
+    if code != 0_i32 { ret code }
+    if fingerprint_path != "" && write_file(fingerprint_path, fingerprint) != 0_i32 { ret 1_i32 }
+    ret 0_i32
+}
+
 fn write_llvm_artifact(ehir_path: Path, llvm_path: Path, target: TargetSpec) -> bool {
     let ehir_text = read_file(native_path(ehir_path.as_str()))
     let module = parse_module_text("encore_bootstrap", ehir_text)
     let llvm_text = emit_ir_for_target(module, target.triple, target.pointer_width)
     ret write_file(native_path(llvm_path.as_str()), llvm_text) == 0_i32
+}
+
+fn run_llvm_codegen_worker(ehir_path: Path, llvm_path: Path, target: TargetSpec) -> bool {
+    let executable = match argv(0_usize) { Some(value) => value None => "encore" }
+    let mut args = Vec[str]::new()
+    args.push("__codegen")
+    args.push(native_path(ehir_path.as_str()))
+    args.push(native_path(llvm_path.as_str()))
+    args.push(target.triple)
+    ret run_args(executable, args) == 0_i32
+}
+
+pub fn run_codegen_worker() -> u32 {
+    let mut ehir_path = ""
+    let mut llvm_path = ""
+    let mut triple = ""
+    match argv(2_usize) { Some(value) => { ehir_path = value } None => { eprintln("Error: codegen worker requires an EHIR input") ret 2_u32 } }
+    match argv(3_usize) { Some(value) => { llvm_path = value } None => { eprintln("Error: codegen worker requires an LLVM output") ret 2_u32 } }
+    match argv(4_usize) { Some(value) => { triple = value } None => { eprintln("Error: codegen worker requires a target triple") ret 2_u32 } }
+    let target = parse_target(triple)
+    if !target_is_supported(target) { eprintln("Error: unsupported codegen worker target '" + triple + "'") ret 2_u32 }
+    if !file_exists(ehir_path) { eprintln("Error: EHIR input does not exist: " + ehir_path) ret 2_u32 }
+    ret if write_llvm_artifact(Path::new(ehir_path), Path::new(llvm_path), target) { 0_u32 } else { 1_u32 }
 }
 
 fn normalize_emit(value: str) -> str {

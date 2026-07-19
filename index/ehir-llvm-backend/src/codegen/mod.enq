@@ -3,7 +3,6 @@ import core::fmt::Debug
 import core::io::eprintln
 import core::process::exit
 import std::vec::Vec
-import std::vec::append
 import std::vec::vec_singleton
 import ehirlib::core::Module
 import ehirlib::core::Directive
@@ -51,6 +50,20 @@ import ehirlib::core::hfree
 import ehirlib::core::mangle_type_name
 import ehirlib::validate_module
 import ehirlib::lower_coroutines
+
+fn concat_instructions(left: Vec[LLVMInstruction], right: Vec[LLVMInstruction]) -> Vec[LLVMInstruction] {
+    let mut out = Vec[LLVMInstruction]::new()
+    out.extend(left)
+    out.extend(right)
+    ret out
+}
+
+fn concat_values(left: Vec[LLVMValue], right: Vec[LLVMValue]) -> Vec[LLVMValue] {
+    let mut out = Vec[LLVMValue]::new()
+    out.extend(left)
+    out.extend(right)
+    ret out
+}
 import llvm::core::LLVMFunction
 import llvm::core::LLVMParam
 import llvm::core::LLVMBasicBlock
@@ -294,7 +307,7 @@ fn lower_trait_dispatch_function(directives: Vec[Directive], trait_name: str, me
             let mut dispatch_instructions = Vec[LLVMInstruction]::new()
             dispatch_instructions.push(llvm_inst_cast("bitcast", typed_data, raw_data))
             dispatch_instructions.push(llvm_inst_load(concrete_value, typed_data))
-            let args = append(vec_singleton(concrete_value), call_tail)
+            let args = concat_values(vec_singleton(concrete_value), call_tail)
             let callee = sanitize_symbol(concrete.name + "::" + method.name)
             if method.ret_type.name == "void" || method.ret_type.name == "()" {
                 dispatch_instructions.push(llvm_inst_call(Option[LLVMValue]::None, void_type(), callee, args))
@@ -956,7 +969,7 @@ fn expand_generic_call_in_directive(out: mut Vec[GenericCall], directive_handle:
         }
         match directive {
             Directive::Function(function) => {
-                if function.name == name && function.generics.len() == args.len() {
+                if generic_function_name_matches(function.name, name) && function.generics.len() == args.len() {
                     collect_nested_generic_calls(out, function, function.generics, args)
                 }
             }
@@ -1063,8 +1076,9 @@ fn lower_generic_functions(directives: Vec[Directive], calls: Vec[GenericCall]) 
             Directive::Function(function) => {
                 if function.generics.len() > 0_usize {
                     for call_data in calls {
-                        if call_data.name == function.name && call_data.args.len() == function.generics.len() {
-                            out.push(lower_function(specialize_function(function, call_data.args)))
+                        if generic_function_name_matches(function.name, call_data.name) && call_data.args.len() == function.generics.len() {
+                            let template = generic_function_template_for_call(function, call_data.name)
+                            out.push(lower_function(specialize_function(template, call_data.args)))
                         }
                     }
                 }
@@ -1101,6 +1115,18 @@ fn lower_generic_functions(directives: Vec[Directive], calls: Vec[GenericCall]) 
         }
     }
     ret out
+}
+
+fn generic_function_name_matches(template_name: str, call_name: str) -> bool {
+    if template_name == call_name { ret true }
+    if call_name.contains("::") { ret false }
+    ret str_ends_with(template_name, "__" + call_name)
+}
+
+fn generic_function_template_for_call(function: FnDirective, call_name: str) -> FnDirective {
+    if function.name == call_name { ret function }
+    if function.is_async { ret async_fn_item(call_name, function.generics, function.params, function.ret_type, function.blocks) }
+    ret fn_item(call_name, function.generics, function.params, function.ret_type, function.blocks)
 }
 
 fn combined_impl_method_generics(impl_generics: Vec[Type], method_generics: Vec[Type]) -> Vec[Type] {
@@ -1622,8 +1648,9 @@ fn collect_concrete_types(directives: Vec[Directive], calls: Vec[GenericCall]) -
         for directive in directives {
             match directive {
                 Directive::Function(function) => {
-                    if function.name == call_data.name && function.generics.len() == call_data.args.len() {
-                        collect_function_types(out, seen, specialize_function(function, call_data.args))
+                    if generic_function_name_matches(function.name, call_data.name) && function.generics.len() == call_data.args.len() {
+                        let template = generic_function_template_for_call(function, call_data.name)
+                        collect_function_types(out, seen, specialize_function(template, call_data.args))
                     }
                 }
                 Directive::Impl(item) => {
@@ -1911,7 +1938,7 @@ fn lower_match_blocks(block_name: str, base_instructions: Vec[LLVMInstruction], 
         let next_name = if index + 1_usize < data.arms.len() { block_name + "_match_check_" + Debug::fmt(index + 1_usize) } else { block_symbol(data.default_label) }
         let matches = reg(block_name + "_match_case_" + Debug::fmt(index), i1_type())
         let compare = llvm_inst_binary("icmp eq", matches, tag, const_i32(enum_variant_tag(arm.variant)))
-        let instructions = if index == 0_usize { append(first_instructions, vec_singleton(compare)) } else { vec_singleton(compare) }
+        let instructions = if index == 0_usize { concat_instructions(first_instructions, vec_singleton(compare)) } else { vec_singleton(compare) }
         out.push(llvm_block(check_name, instructions, llvm_term_cbr(matches, block_symbol(arm.label), next_name)))
         index = index + 1_usize
     }
@@ -2045,7 +2072,7 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
             let ptr_value: LLVMValue = reg(ptr_name, ptr_llvm_type)
             let gep: LLVMInstruction = lower_getfieldptr_with(ptr_value, src_var, field_var)
             let load: LLVMInstruction = llvm_inst_load(out_value, ptr_value)
-            ret append(vec_singleton(gep), vec_singleton(load))
+            ret concat_instructions(vec_singleton(gep), vec_singleton(load))
         }
         SetField(setfield_data) => {
             let src_type = required_variable_type(setfield_data.src)
@@ -2060,7 +2087,7 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
                 ptr_type(value_type(value))
             )
             let address = llvm_inst_gep(field_ptr, lower_pointee_type(src_type), src, field_indices(setfield_data.field.name), true)
-            ret append(vec_singleton(address), vec_singleton(llvm_inst_store(value, field_ptr)))
+            ret concat_instructions(vec_singleton(address), vec_singleton(llvm_inst_store(value, field_ptr)))
         }
         GetFieldPtr(getfieldptr_data) => {
             let out_var: Variable = getfieldptr_data.out
@@ -2074,7 +2101,7 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
             let out_value = lower_variable(out_var)
             let ptr_value = reg(sanitize_symbol(out_var.name) + "_field_ptr", ptr_type(lower_type(required_variable_type(out_var))))
             let address = lower_getfieldptr_with(ptr_value, sgetfield_data.src, sgetfield_data.field)
-            ret append(vec_singleton(address), vec_singleton(llvm_inst_load(out_value, ptr_value)))
+            ret concat_instructions(vec_singleton(address), vec_singleton(llvm_inst_load(out_value, ptr_value)))
         }
         SGetFieldPtr(sgetfieldptr_data) => {
             ret vec_singleton(lower_getfieldptr(sgetfieldptr_data.out, sgetfieldptr_data.src, sgetfieldptr_data.field))
@@ -2093,7 +2120,7 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
                 let out = lower_variable(out_var)
                 let mut instructions = vec_singleton(llvm_inst_gep(size_ptr, aggregate_type, const_text("null", aggregate_ptr_type), vec_singleton(const_text("1", i64_type())), false))
                 instructions.push(llvm_inst_cast("ptrtoint", size, size_ptr))
-                instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw), ptr_type(i8_type()), "__ehir_hrealloc", append(vec_singleton(const_text("null", ptr_type(i8_type()))), vec_singleton(size))))
+                instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw), ptr_type(i8_type()), "__ehir_hrealloc", concat_values(vec_singleton(const_text("null", ptr_type(i8_type()))), vec_singleton(size))))
                 instructions.push(llvm_inst_cast("bitcast", out, raw))
                 let mut index = 0_usize
                 for argument in raw_args {
@@ -2157,7 +2184,7 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
                 let mut instructions = Vec[LLVMInstruction]::new()
                 instructions.push(llvm_inst_gep(size_ptr, concrete_type, const_text("null", concrete_ptr_type), vec_singleton(const_text("1", i64_type())), false))
                 instructions.push(llvm_inst_cast("ptrtoint", size, size_ptr))
-                instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw_box), ptr_type(i8_type()), "__ehir_hrealloc", append(vec_singleton(const_text("null", ptr_type(i8_type()))), vec_singleton(size))))
+                instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw_box), ptr_type(i8_type()), "__ehir_hrealloc", concat_values(vec_singleton(const_text("null", ptr_type(i8_type()))), vec_singleton(size))))
                 instructions.push(llvm_inst_cast("bitcast", typed_box, raw_box))
                 instructions.push(llvm_inst_store(src_value, typed_box))
                 instructions.push(llvm_inst_insertvalue(with_data, const_text("undef", lower_type(target_type)), raw_box, "0"))
@@ -2205,7 +2232,7 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
             let raw = reg(sanitize_symbol(src_var.name) + "_free_raw", ptr_type(i8_type()))
             let cast = llvm_inst_cast("bitcast", raw, src_value)
             let inst: LLVMInstruction = llvm_inst_call(Option[LLVMValue]::None, void_type(), "__ehir_hfree", vec_singleton(raw))
-            ret append(vec_singleton(cast), vec_singleton(inst))
+            ret concat_instructions(vec_singleton(cast), vec_singleton(inst))
         }
         HeapRealloc(realloc_data) => {
             let out = lower_variable(realloc_data.out)
@@ -2224,7 +2251,7 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
             instructions.push(llvm_inst_cast("ptrtoint", size, size_ptr))
             instructions.push(llvm_inst_binary("mul", bytes, count, size))
             instructions.push(llvm_inst_cast("bitcast", raw_src, src))
-            let args = append(vec_singleton(raw_src), vec_singleton(bytes))
+            let args = concat_values(vec_singleton(raw_src), vec_singleton(bytes))
             instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw_out), ptr_type(i8_type()), "__ehir_hrealloc", args))
             instructions.push(llvm_inst_cast("bitcast", out, raw_out))
             ret instructions
@@ -2248,7 +2275,7 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
                             let tag = const_i32(enum_variant_tag(enum_variant_symbol_name(rhs_var.name)))
                             let predicate = if op == BinaryOpKind::IEQ { "icmp eq" } else { "icmp ne" }
                             let compare = llvm_inst_binary(predicate, lower_variable(out_var), tag_out, tag)
-                            ret append(vec_singleton(extract), vec_singleton(compare))
+                            ret concat_instructions(vec_singleton(extract), vec_singleton(compare))
                         }
                     }
                     Option[Type]::None => {}
@@ -2258,7 +2285,7 @@ fn lower_instruction(instruction: Instruction) -> Vec[LLVMInstruction] {
                 match lhs_var.typ {
                     Option[Type]::Some(lhs_type) => {
                         if lhs_type.name == "str" {
-                            let args = append(vec_singleton(lower_variable(lhs_var)), vec_singleton(lower_variable(rhs_var)))
+                            let args = concat_values(vec_singleton(lower_variable(lhs_var)), vec_singleton(lower_variable(rhs_var)))
                             if op == BinaryOpKind::IEQ {
                                 ret vec_singleton(llvm_inst_call(Option[LLVMValue]::Some(lower_variable(out_var)), i1_type(), "encore_str_eq", args))
                             }
@@ -2321,7 +2348,7 @@ fn lower_thread_spawn(data: CallInstruction) -> Vec[LLVMInstruction] {
     let context = reg(prefix + "_context", context_ptr_type)
     let mut instructions = vec_singleton(llvm_inst_gep(size_ptr, context_type, const_text("null", context_ptr_type), vec_singleton(const_text("1", i64_type())), false))
     instructions.push(llvm_inst_cast("ptrtoint", size, size_ptr))
-    instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw_context), raw_ptr_type, "__ehir_hrealloc", append(vec_singleton(const_text("null", raw_ptr_type)), vec_singleton(size))))
+    instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw_context), raw_ptr_type, "__ehir_hrealloc", concat_values(vec_singleton(const_text("null", raw_ptr_type)), vec_singleton(size))))
     instructions.push(llvm_inst_cast("bitcast", context, raw_context))
     let mut index = 0_usize
     for argument in data.args {
@@ -2336,7 +2363,7 @@ fn lower_thread_spawn(data: CallInstruction) -> Vec[LLVMInstruction] {
     let cleanup = const_text("@__encore_thread_cleanup_" + thread_site_key(data.name, data.out, data.generics, data.args), function_ptr_type)
     let token = reg(prefix + "_token", pointer_int_type())
     instructions.push(llvm_inst_call(Option[LLVMValue]::Some(token), pointer_int_type(), "encore_thread_spawn",
-        append(append(vec_singleton(entry), vec_singleton(raw_context)), vec_singleton(cleanup))))
+        concat_values(concat_values(vec_singleton(entry), vec_singleton(raw_context)), vec_singleton(cleanup))))
     let handle_type = lower_type(required_variable_type(data.out))
     instructions.push(llvm_inst_insertvalue(lower_variable(data.out), const_text("undef", handle_type), token, "0"))
     ret instructions
@@ -2405,10 +2432,10 @@ fn lower_literal(out_var: Variable, value: str) -> Vec[LLVMInstruction] {
         let array_type_value = array_type(Debug::fmt(string_literal_byte_len(body) + 1_usize), i8_type())
         let global = const_text("@" + string_literal_global_name(body), ptr_type(array_type_value))
         let ptr = reg(sanitize_symbol(out_var.name) + "_literal_ptr", ptr_type(i8_type()))
-        let indices = append(vec_singleton(const_i32("0")), vec_singleton(const_i32("0")))
+        let indices = concat_values(vec_singleton(const_i32("0")), vec_singleton(const_i32("0")))
         let address = llvm_inst_gep(ptr, array_type_value, global, indices, true)
         let call_inst = llvm_inst_call(Option[LLVMValue]::Some(out), ret_type, "encore_str_from_cstr", vec_singleton(ptr))
-        ret append(vec_singleton(address), vec_singleton(call_inst))
+        ret concat_instructions(vec_singleton(address), vec_singleton(call_inst))
     }
     ret vec_singleton(llvm_inst_bitcast(out, const_text("null", ret_type)))
 }
@@ -2480,7 +2507,7 @@ fn lower_binary(out_var: Variable, lhs_var: Variable, rhs_var: Variable, op: Bin
     match op {
         ADD => {
             if fallback_type.name == "str" {
-                ret llvm_inst_call(Option[LLVMValue]::Some(out), lower_type(fallback_type), "encore_str_concat", append(vec_singleton(lhs), vec_singleton(rhs)))
+                ret llvm_inst_call(Option[LLVMValue]::Some(out), lower_type(fallback_type), "encore_str_concat", concat_values(vec_singleton(lhs), vec_singleton(rhs)))
             }
             if is_float { ret llvm_inst_binary("fadd", out, lhs, rhs) }
             ret llvm_inst_add(out, lhs, rhs)
@@ -2810,7 +2837,7 @@ fn enum_variant_tag_value(value: str) -> usize {
 fn field_indices(field_name: str) -> Vec[LLVMValue] {
     let first = const_i32("0")
     let second = const_i32(field_index_text(field_name))
-    ret append(vec_singleton(first), vec_singleton(second))
+    ret concat_values(vec_singleton(first), vec_singleton(second))
 }
 
 fn field_index_text(field_name: str) -> str {

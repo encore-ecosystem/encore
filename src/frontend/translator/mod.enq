@@ -98,6 +98,12 @@ pub struct TranslationModule {
     features: Vec[str]
 }
 
+impl for TranslationModule {
+    pub fn new(module_id: str, source_name: str, imports: Vec[str], ast: Vec[Statement], features: Vec[str]) -> TranslationModule {
+        ret TranslationModule{module_id, source_name, imports, ast, features}
+    }
+}
+
 struct TraitType {
     name: str
     generics: Vec[GenericParam]
@@ -146,7 +152,7 @@ struct TranslatorContext {
     owned_vars: Vec[VarType]
     functions: Vec[FunctionType]
     modules: Vec[TranslationModule]
-    module_visibility: Vec[str]
+    module_visibility: Vec[(u64, u64)]
     types: Vec[str]
     traits: Vec[TraitType]
     trait_impls: Vec[TraitImplType]
@@ -468,13 +474,20 @@ fn ctx_add_function(ctx: mut TranslatorContext, source_name: str, name: str, ret
     }
     let local_name = if overload_index == 0_usize { name } else { name + "__overload_" + Debug::fmt(overload_index) }
     let is_member = last_scope_index(name) < name.len()
-    let emitted_name = if is_extern || name == "main" || is_member { local_name } else { module_symbol_prefix(source_name) + local_name }
+    let emitted_name = if is_extern || name == "main" || is_member { local_name } else { module_symbol_prefix(ctx, source_name) + local_name }
     ctx.functions.push(FunctionType{name, emitted_name, source_name, ret_type, params, generics, is_async, output_type})
     ret ()
 }
 
-fn module_symbol_prefix(source_name: str) -> str {
-    ret "__encore_m" + Debug::fmt(source_name.hash()) + "__"
+fn module_identity_for_source(ctx: TranslatorContext, source_name: str) -> str {
+    for module in ctx.modules {
+        if module.source_name == source_name { ret module.module_id }
+    }
+    ret source_name
+}
+
+fn module_symbol_prefix(ctx: TranslatorContext, source_name: str) -> str {
+    ret "__encore_m" + Debug::fmt(module_identity_for_source(ctx, source_name).hash()) + "__"
 }
 
 fn ctx_next_emitted_name(ctx: TranslatorContext, source_name: str, name: str) -> str {
@@ -484,7 +497,7 @@ fn ctx_next_emitted_name(ctx: TranslatorContext, source_name: str, name: str) ->
     }
     let local_name = if overload_index == 0_usize { name } else { name + "__overload_" + Debug::fmt(overload_index) }
     let is_member = last_scope_index(name) < name.len()
-    ret if name == "main" || is_member { local_name } else { module_symbol_prefix(source_name) + local_name }
+    ret if name == "main" || is_member { local_name } else { module_symbol_prefix(ctx, source_name) + local_name }
 }
 
 fn resolve_async_future_aliases(ctx: TranslatorContext, source_name: str, typ: str) -> str {
@@ -692,7 +705,26 @@ fn function_type_matches(template: str, actual: str, generics: Vec[str]) -> bool
     for generic in generics {
         if expected == generic { ret true }
     }
-    ret false
+    if base_type_name(expected) != base_type_name(found) { ret false }
+    let expected_args = generic_args_from_path(expected)
+    let found_args = generic_args_from_path(found)
+    if expected_args.len() == 0_usize || expected_args.len() != found_args.len() { ret false }
+    let mut index = 0_usize
+    while index < expected_args.len() {
+        match expected_args.get(index) {
+            Some(expected_arg) => {
+                match found_args.get(index) {
+                    Some(found_arg) => {
+                        if !function_type_matches(expected_arg, found_arg, generics) { ret false }
+                    }
+                    None => { ret false }
+                }
+            }
+            None => { ret false }
+        }
+        index = index + 1_usize
+    }
+    ret true
 }
 
 fn function_matches_args(function: FunctionType, actual_types: Vec[str]) -> bool {
@@ -761,11 +793,16 @@ fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, source_name: str, na
 fn function_visible_from(ctx: TranslatorContext, caller_source: str, function_source: str) -> bool {
     if caller_source == function_source { ret true }
     if ctx.modules.len() == 0_usize { ret true }
-    ret contains_str(ctx.module_visibility, caller_source + "\n" + function_source)
+    let caller = module_identity_for_source(ctx, caller_source).hash()
+    let target = module_identity_for_source(ctx, function_source).hash()
+    for edge in ctx.module_visibility {
+        if edge.0 == caller && edge.1 == target { ret true }
+    }
+    ret false
 }
 
-fn build_module_visibility(modules: Vec[TranslationModule]) -> Vec[str] {
-    let mut out = Vec[str]::new()
+fn build_module_visibility(modules: Vec[TranslationModule]) -> Vec[(u64, u64)] {
+    let mut out = Vec[(u64, u64)]::new()
     for origin in modules {
         let mut queue = origin.imports
         let mut visited = Vec[str]::new()
@@ -777,8 +814,8 @@ fn build_module_visibility(modules: Vec[TranslationModule]) -> Vec[str] {
                         visited.push(module_id)
                         for target in modules {
                             if target.module_id == module_id {
-                                let key = origin.source_name + "\n" + target.source_name
-                                if !contains_str(out, key) { out.push(key) }
+                                let edge = (origin.module_id.hash(), target.module_id.hash())
+                                if !contains_visibility_edge(out, edge) { out.push(edge) }
                                 for imported in target.imports {
                                     if !contains_str(visited, imported) { queue.push(imported) }
                                 }
@@ -792,6 +829,13 @@ fn build_module_visibility(modules: Vec[TranslationModule]) -> Vec[str] {
         }
     }
     ret out
+}
+
+fn contains_visibility_edge(edges: Vec[(u64, u64)], expected: (u64, u64)) -> bool {
+    for edge in edges {
+        if edge.0 == expected.0 && edge.1 == expected.1 { ret true }
+    }
+    ret false
 }
 
 fn plain_function_argument_error(ctx: TranslatorContext, source_name: str, name: str, actual_types: Vec[str]) -> Option[str] {
@@ -5585,4 +5629,26 @@ fn module_function_identity_contract() -> bool {
         && output.contains("fn " + beta + "label() -> u32")
         && output.contains("call " + alpha + "label(")
         && output.contains("call " + beta + "label(")
+}
+
+#attr(test)
+fn nested_generic_module_dispatch_contract() -> bool {
+    let mut lexer_a = Lexer::new()
+    let mut parser_a = Parser::new_for_source("collections.enq")
+    let ast_a = parser_a.parse(lexer_a.tokenize(
+        "struct Vec[T] { value: T }\nfn append[T](left: Vec[T], right: Vec[T]) -> Vec[T] { ret left }"))
+    let mut lexer_b = Lexer::new()
+    let mut parser_b = Parser::new_for_source("consumer.enq")
+    let ast_b = parser_b.parse(lexer_b.tokenize(
+        "fn combine(values: Vec[u32]) -> Vec[u32] { ret append(values, values) }"))
+    let mut imports_a = Vec[str]::new()
+    let mut imports_b = Vec[str]::new()
+    imports_b.push("collections")
+    let mut modules = Vec[TranslationModule]::new()
+    modules.push(TranslationModule{"collections", "collections.enq", imports_a, ast_a, Vec[str]::new()})
+    modules.push(TranslationModule{"consumer", "consumer.enq", imports_b, ast_b, Vec[str]::new()})
+    let output = translate_modules_to_ehir(modules, host_target())
+    let collections = "__encore_m" + Debug::fmt("collections".hash()) + "__"
+    ret output.contains("fn " + collections + "append[T](left: Vec[T], right: Vec[T]) -> Vec[T]") &&
+        output.contains("call " + collections + "append[u32](")
 }
