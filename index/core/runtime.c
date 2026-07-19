@@ -2142,10 +2142,41 @@ int32_t encore_fs_copy_file(encore_str source, encore_str destination) {
     char *destination_c = encore_to_cstr(destination);
     if (source_c == NULL || destination_c == NULL) { free(source_c); free(destination_c); return -1; }
     FILE *input = fopen(source_c, "rb");
-    FILE *output = input == NULL ? NULL : fopen(destination_c, "wb");
     free(source_c);
-    free(destination_c);
-    if (input == NULL || output == NULL) { if (input != NULL) fclose(input); if (output != NULL) fclose(output); return -1; }
+    if (input == NULL) { free(destination_c); return -1; }
+
+    size_t destination_len = strlen(destination_c);
+    if (destination_len > SIZE_MAX - 32) { fclose(input); free(destination_c); return -1; }
+    char *temporary_c = malloc(destination_len + 32);
+    if (temporary_c == NULL) { fclose(input); free(destination_c); return -1; }
+    memcpy(temporary_c, destination_c, destination_len);
+#ifdef _WIN32
+    int temporary_fd = -1;
+    unsigned long process_id = GetCurrentProcessId();
+    for (unsigned int attempt = 0; attempt < 100 && temporary_fd < 0; ++attempt) {
+        snprintf(temporary_c + destination_len, 32, ".tmp.%lu.%u", process_id, attempt);
+        temporary_fd = _open(temporary_c, _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY,
+                             _S_IREAD | _S_IWRITE);
+    }
+#else
+    memcpy(temporary_c + destination_len, ".tmp.XXXXXX", 12);
+    int temporary_fd = mkstemp(temporary_c);
+#endif
+    FILE *output = temporary_fd < 0 ? NULL : fdopen(temporary_fd, "wb");
+    if (output == NULL) {
+        if (temporary_fd >= 0) {
+#ifdef _WIN32
+            _close(temporary_fd);
+#else
+            close(temporary_fd);
+#endif
+        }
+        fclose(input);
+        remove(temporary_c);
+        free(temporary_c);
+        free(destination_c);
+        return -1;
+    }
     char buffer[65536];
     int32_t status = 0;
     for (;;) {
@@ -2154,6 +2185,17 @@ int32_t encore_fs_copy_file(encore_str source, encore_str destination) {
         if (count < sizeof(buffer)) { if (ferror(input)) status = -1; break; }
     }
     if (fclose(input) != 0 || fclose(output) != 0) status = -1;
+    if (status == 0) {
+#ifdef _WIN32
+        if (!MoveFileExA(temporary_c, destination_c,
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) status = -1;
+#else
+        if (rename(temporary_c, destination_c) != 0) status = -1;
+#endif
+    }
+    if (status != 0) remove(temporary_c);
+    free(temporary_c);
+    free(destination_c);
     return status;
 }
 
