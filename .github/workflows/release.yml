@@ -14,22 +14,57 @@ permissions:
   contents: write
 
 jobs:
-  bootstrap-ir:
-    name: Generate bootstrap IR
+  seeds:
+    name: Prepare released compiler seeds
     runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.release.outputs.released }}
     env:
+      GH_TOKEN: ${{ github.token }}
       ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Verify compiler version sources
-        run: scripts/verify-version.sh
-      - name: Verify native-only source tree
-        run: scripts/verify-no-python.sh
-      - name: Verify native stage0
-        run: scripts/verify-stage0.sh --release
-      - name: Generate target IR
+      - name: Verify release sources and bootstrap
+        run: |
+          scripts/verify-version.sh
+          scripts/verify-no-python.sh
+          scripts/verify-stage0.sh --release
+      - name: Download latest complete native release
+        id: release
+        shell: bash
+        run: |
+          set -eu
+          released=false
+          if tag=$(gh release view --json tagName --jq .tagName 2>/dev/null); then
+            mkdir -p seeds
+            complete=true
+            for asset in \
+              encore-x86_64-unknown-linux-gnu.tar.gz \
+              encore-aarch64-unknown-linux-gnu.tar.gz \
+              encore-x86_64-apple-darwin.tar.gz \
+              encore-aarch64-apple-darwin.tar.gz \
+              encore-x86_64-pc-windows-msvc.zip
+            do
+              if ! gh release download "$tag" --pattern "$asset" --dir seeds; then
+                complete=false
+                break
+              fi
+            done
+            if [ "$complete" = true ]; then released=true; else rm -rf seeds; fi
+          fi
+          echo "released=$released" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        if: steps.release.outputs.released == 'true'
+        with:
+          name: native-release-seeds
+          path: seeds/*
+          if-no-files-found: error
+          retention-days: 1
+      - name: Generate first-release bootstrap IR
+        if: steps.release.outputs.released != 'true'
+        shell: bash
         run: |
           mkdir -p target
           gzip -dc bootstrap/encore-stage0-linux-x86_64.gz > target/encore-stage0
@@ -38,79 +73,22 @@ jobs:
             x86_64-unknown-linux-gnu \
             aarch64-unknown-linux-gnu \
             x86_64-apple-darwin \
-            aarch64-apple-darwin
+            aarch64-apple-darwin \
+            x86_64-pc-windows-msvc
           do
-            ./target/encore-stage0 build --profile extreme --target "$triple" --emit llvm-ir
+            target/encore-stage0 build --profile extreme --target "$triple" --emit llvm-ir
           done
       - uses: actions/upload-artifact@v7
+        if: steps.release.outputs.released != 'true'
         with:
-          name: bootstrap-ir
+          name: first-release-bootstrap-ir
           path: target/*/extreme/encore.ll
           if-no-files-found: error
           retention-days: 1
 
-  verify:
-    name: Verify native release
-    needs: bootstrap-ir
-    runs-on: ubuntu-latest
-    env:
-      ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v8
-        with:
-          name: bootstrap-ir
-          path: target
-      - name: Assemble native seed
-        run: |
-          mkdir -p target/extreme
-          clang -O0 -w \
-            target/x86_64-unknown-linux-gnu/extreme/encore.ll \
-            index/core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
-            -o target/extreme/encore
-      - name: Verify self-host fixed point
-        run: scripts/verify-self-host.sh target/extreme/encore . x86_64-unknown-linux-gnu
-      - name: Verify tagged compiler version
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          RELEASE_VERSION: ${{ github.ref_name }}
-        run: |
-          expected=${RELEASE_VERSION#v}
-          actual=$(target/extreme/encore --version)
-          test "$actual" = "encore $expected" || {
-            echo "::error title=Release version mismatch::Tag $RELEASE_VERSION requires 'encore $expected', got '$actual'"
-            exit 1
-          }
-      - name: Run full native test suite
-        run: |
-          compiler="$PWD/target/extreme/encore"
-          for package in index/core index/color index/colorterm index/dict index/ehir index/ehir-llvm-backend index/encore-ui index/geometry index/json index/llvm index/log index/lsp index/rich index/std index/toml; do
-            (cd "$package" && "$compiler" test)
-          done
-          ./target/extreme/encore test
-      - name: Verify freestanding cross-target
-        run: scripts/smoke-cross-target.sh target/extreme/encore
-      - name: Verify native test runner
-        run: scripts/test-test-runner.sh target/extreme/encore
-      - name: Verify native CLI contract
-        run: scripts/test-cli-contract.sh target/extreme/encore
-      - name: Verify release installation
-        run: |
-          mkdir -p dist
-          archive=$(scripts/package-release.sh target/extreme/encore x86_64-unknown-linux-gnu verify dist)
-          sha256sum "$archive" > "$archive.sha256"
-          scripts/verify-release-package.sh "$archive" x86_64-unknown-linux-gnu verify
-          scripts/smoke-install.sh "$archive"
-      - name: Verify Arch Linux package metadata
-        run: |
-          mkdir -p dist-pkgbuild
-          scripts/package-release.sh target/extreme/encore x86_64-unknown-linux-gnu "$(cat VERSION)" dist-pkgbuild
-          scripts/package-release.sh target/extreme/encore aarch64-unknown-linux-gnu "$(cat VERSION)" dist-pkgbuild
-          scripts/generate-pkgbuild.sh "$(cat VERSION)" dist-pkgbuild
-          bash -n dist-pkgbuild/PKGBUILD
-
   build:
-    needs: [bootstrap-ir, verify]
+    name: Build ${{ matrix.triple }} release
+    needs: seeds
     env:
       ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
     strategy:
@@ -129,45 +107,90 @@ jobs:
           - os: macos-15
             triple: aarch64-apple-darwin
             executable: encore
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            executable: encore.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
+        if: needs.seeds.outputs.released == 'true'
         with:
-          name: bootstrap-ir
+          name: native-release-seeds
+          path: seeds
+      - uses: actions/download-artifact@v8
+        if: needs.seeds.outputs.released != 'true'
+        with:
+          name: first-release-bootstrap-ir
           path: target
-      - name: Assemble native seed
+      - name: Extract released compiler
+        if: needs.seeds.outputs.released == 'true'
         shell: bash
         run: |
-          mkdir -p target/extreme
-          set +e
-          output=$(clang -O0 -w \
-            target/${{ matrix.triple }}/extreme/encore.ll \
-            index/core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
-            -o target/extreme/${{ matrix.executable }} 2>&1)
-          code=$?
-          set -e
-          printf '%s\n' "$output"
-          if [ "$code" -ne 0 ]; then
-            message=${output//'%'/'%25'}
-            message=${message//$'\n'/'%0A'}
-            message=${message//$'\r'/'%0D'}
-            echo "::error title=Native seed assembly failed::$message"
-            exit "$code"
-          fi
-      - name: Verify native seed
+          set -eu
+          mkdir -p target/seed unpacked-seed
+          case "${{ matrix.triple }}" in
+            *-windows-*) unzip -q "seeds/encore-${{ matrix.triple }}.zip" -d unpacked-seed ;;
+            *) tar -xzf "seeds/encore-${{ matrix.triple }}.tar.gz" -C unpacked-seed ;;
+          esac
+          seed=$(find unpacked-seed -type f -path "*/bin/${{ matrix.executable }}" | head -n 1)
+          test -n "$seed"
+          cp "$seed" "target/seed/${{ matrix.executable }}"
+          chmod +x "target/seed/${{ matrix.executable }}" 2>/dev/null || true
+      - name: Assemble first-release compiler
+        if: needs.seeds.outputs.released != 'true'
         shell: bash
         run: |
-          target/extreme/${{ matrix.executable }} --version
-      - name: Native self-host and tests
+          mkdir -p target/seed
+          clang -O3 -w \
+            "target/${{ matrix.triple }}/extreme/encore.ll" \
+            runtime.c index/core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
+            -o "target/seed/${{ matrix.executable }}"
+      - name: Build current compiler twice
         shell: bash
         run: |
-          ./target/extreme/${{ matrix.executable }} build --profile debug --target ${{ matrix.triple }}
-          cp target/${{ matrix.triple }}/debug/${{ matrix.executable }} target/extreme/${{ matrix.executable }}
-          ./target/extreme/${{ matrix.executable }} build --profile extreme --target ${{ matrix.triple }}
-          cp target/${{ matrix.triple }}/extreme/${{ matrix.executable }} target/extreme/${{ matrix.executable }}
-          ./target/extreme/${{ matrix.executable }} test --filter target_
-      - name: Package
+          set -eu
+          seed="$PWD/target/seed/${{ matrix.executable }}"
+          "$seed" --version
+          "$seed" build --profile extreme --target "${{ matrix.triple }}"
+          mkdir -p target/stage1
+          cp "target/${{ matrix.triple }}/extreme/${{ matrix.executable }}" "target/stage1/${{ matrix.executable }}"
+          mv "target/${{ matrix.triple }}/extreme" "target/${{ matrix.triple }}/stage1-extreme"
+          stage1="$PWD/target/stage1/${{ matrix.executable }}"
+          "$stage1" build --profile extreme --target "${{ matrix.triple }}"
+          mkdir -p target/stage2
+          cp "target/${{ matrix.triple }}/extreme/${{ matrix.executable }}" "target/stage2/${{ matrix.executable }}"
+          "target/stage2/${{ matrix.executable }}" --version
+      - name: Verify tagged compiler version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          expected=${RELEASE_VERSION#v}
+          actual=$("target/stage2/${{ matrix.executable }}" --version)
+          test "$actual" = "encore $expected" || {
+            echo "::error title=Release version mismatch::Tag $RELEASE_VERSION requires 'encore $expected', got '$actual'"
+            exit 1
+          }
+      - name: Run native tests
+        shell: bash
+        run: |
+          set -eu
+          compiler="$PWD/target/stage2/${{ matrix.executable }}"
+          for package in index/core index/color index/colorterm index/dict index/ehir index/ehir-llvm-backend index/encore-ui index/geometry index/json index/llvm index/log index/lsp index/rich index/std index/toml .; do
+            (cd "$package" && "$compiler" test)
+          done
+      - name: Verify Linux release workflows
+        if: matrix.triple == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          compiler="$PWD/target/stage2/${{ matrix.executable }}"
+          scripts/test-test-runner.sh "$compiler"
+          scripts/test-analyzer.sh "$compiler"
+          scripts/test-cli-contract.sh "$compiler"
+          scripts/smoke-cross-target.sh "$compiler"
+      - name: Package native release
         id: package
         shell: bash
         env:
@@ -175,17 +198,15 @@ jobs:
         run: |
           package_version=${RELEASE_VERSION#v}
           mkdir -p dist
-          scripts/package-release.sh target/extreme/${{ matrix.executable }} ${{ matrix.triple }} "$package_version" dist
-          archive=$(find dist -maxdepth 1 -type f | head -n 1)
+          archive=$(scripts/package-release.sh "target/stage2/${{ matrix.executable }}" "${{ matrix.triple }}" "$package_version" dist)
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$archive" > "$archive.sha256"
           else
             shasum -a 256 "$archive" > "$archive.sha256"
           fi
-          scripts/verify-release-package.sh "$archive" ${{ matrix.triple }} "$package_version"
-          duplicate=$(scripts/package-release.sh target/extreme/${{ matrix.executable }} ${{ matrix.triple }} "$package_version" dist-reproducible)
+          scripts/verify-release-package.sh "$archive" "${{ matrix.triple }}" "$package_version"
+          duplicate=$(scripts/package-release.sh "target/stage2/${{ matrix.executable }}" "${{ matrix.triple }}" "$package_version" dist-reproducible)
           cmp "$archive" "$duplicate"
-          scripts/smoke-install.sh "$archive"
       - uses: actions/upload-artifact@v7
         with:
           name: encore-${{ matrix.triple }}

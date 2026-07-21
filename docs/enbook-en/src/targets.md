@@ -17,6 +17,11 @@ encore target
 encore target thumbv7em-none-eabihf
 ```
 
+Native release and CI targets currently cover Linux and macOS on x86-64 and
+AArch64, plus Windows on x86-64 (`x86_64-pc-windows-msvc`). Windows compiler
+archives use ZIP and contain `bin/encore.exe`; Unix compiler archives use
+`tar.gz` and contain `bin/encore`.
+
 Encore derives ABI properties such as pointer width from the architecture and
 environment. An unknown architecture is rejected instead of being guessed as
 32-bit; this prevents silently generating incompatible `usize`, `isize`, and

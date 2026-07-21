@@ -57,7 +57,7 @@ find "$stage" -exec touch -t 200001010000.00 '{}' +
 if [ "$binary_name" = "encore.exe" ]; then
     archive="${output_dir}/encore-${triple}.zip"
     rm -f "$archive"
-    (cd "$work_dir" && find "$package_name" -print | LC_ALL=C sort | COPYFILE_DISABLE=1 tar --no-recursion -a -cf "$archive" -T -)
+    (cd "$work_dir" && COPYFILE_DISABLE=1 tar -a -cf "$archive" "$package_name")
 else
     archive="${output_dir}/encore-${triple}.tar.gz"
     rm -f "$archive"

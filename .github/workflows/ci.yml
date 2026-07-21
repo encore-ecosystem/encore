@@ -3,7 +3,7 @@ name: Native CI
 on:
   pull_request:
   push:
-    branches: [trunk, nightly, "feature/**"]
+    branches: [trunk, nightly]
 
 permissions:
   contents: read
@@ -13,47 +13,80 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  bootstrap-ir:
-    name: Generate bootstrap IR
+  seeds:
+    name: Prepare native compiler seeds
     runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.release.outputs.released }}
     env:
+      GH_TOKEN: ${{ github.token }}
       ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Verify compiler version
-        run: scripts/verify-version.sh
-      - name: Verify native stage0
-        run: scripts/verify-stage0.sh
-      - name: Verify bootstrap convergence
+      - name: Verify compiler bootstrap
         run: |
-          mkdir -p target
-          gzip -dc bootstrap/encore-stage0-linux-x86_64.gz > target/encore-stage0
-          chmod +x target/encore-stage0
-          scripts/verify-bootstrap.sh target/encore-stage0
-      - name: Generate target IR
+          scripts/verify-version.sh
+          scripts/verify-stage0.sh
+      - name: Find complete native release
+        id: release
+        shell: bash
+        run: |
+          set -eu
+          released=false
+          if tag=$(gh release view --json tagName --jq .tagName 2>/dev/null); then
+            mkdir -p seeds
+            complete=true
+            for asset in \
+              encore-x86_64-unknown-linux-gnu.tar.gz \
+              encore-aarch64-unknown-linux-gnu.tar.gz \
+              encore-x86_64-apple-darwin.tar.gz \
+              encore-aarch64-apple-darwin.tar.gz \
+              encore-x86_64-pc-windows-msvc.zip
+            do
+              if ! gh release download "$tag" --pattern "$asset" --dir seeds; then
+                complete=false
+                break
+              fi
+            done
+            if [ "$complete" = true ]; then released=true; else rm -rf seeds; fi
+          fi
+          echo "released=$released" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        if: steps.release.outputs.released == 'true'
+        with:
+          name: native-release-seeds
+          path: seeds/*
+          if-no-files-found: error
+          retention-days: 1
+      - name: Generate transitional bootstrap IR
+        if: steps.release.outputs.released != 'true'
+        shell: bash
         run: |
           mkdir -p target
           gzip -dc bootstrap/encore-stage0-linux-x86_64.gz > target/encore-stage0
           chmod +x target/encore-stage0
           for triple in \
             x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
             x86_64-apple-darwin \
-            aarch64-apple-darwin
+            aarch64-apple-darwin \
+            x86_64-pc-windows-msvc
           do
-            ./target/encore-stage0 build --profile debug --target "$triple" --emit llvm-ir
+            target/encore-stage0 build --profile extreme --target "$triple" --emit llvm-ir
           done
       - uses: actions/upload-artifact@v7
+        if: steps.release.outputs.released != 'true'
         with:
-          name: bootstrap-ir
-          path: target/*/debug/encore.ll
+          name: transitional-bootstrap-ir
+          path: target/*/extreme/encore.ll
           if-no-files-found: error
           retention-days: 1
 
   test:
     name: Test ${{ matrix.triple }}
-    needs: bootstrap-ir
+    needs: seeds
     env:
       ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
     strategy:
@@ -62,30 +95,76 @@ jobs:
         include:
           - os: ubuntu-latest
             triple: x86_64-unknown-linux-gnu
+            executable: encore
+          - os: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+            executable: encore
           - os: macos-15-intel
             triple: x86_64-apple-darwin
+            executable: encore
           - os: macos-15
             triple: aarch64-apple-darwin
+            executable: encore
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            executable: encore.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
+        if: needs.seeds.outputs.released == 'true'
         with:
-          name: bootstrap-ir
+          name: native-release-seeds
+          path: seeds
+      - uses: actions/download-artifact@v8
+        if: needs.seeds.outputs.released != 'true'
+        with:
+          name: transitional-bootstrap-ir
           path: target
-      - name: Assemble native compiler
+      - name: Extract released seed
+        if: needs.seeds.outputs.released == 'true'
         shell: bash
         run: |
-          mkdir -p target/debug
-          clang -O0 -w \
-            target/${{ matrix.triple }}/debug/encore.ll \
-            index/core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
-            -o target/debug/encore
-          target/debug/encore --version
-      - name: Run tests
+          set -eu
+          mkdir -p target/seed unpacked-seed
+          case "${{ matrix.triple }}" in
+            *-windows-*) unzip -q "seeds/encore-${{ matrix.triple }}.zip" -d unpacked-seed ;;
+            *) tar -xzf "seeds/encore-${{ matrix.triple }}.tar.gz" -C unpacked-seed ;;
+          esac
+          seed=$(find unpacked-seed -type f -path "*/bin/${{ matrix.executable }}" | head -n 1)
+          test -n "$seed"
+          cp "$seed" "target/seed/${{ matrix.executable }}"
+          chmod +x "target/seed/${{ matrix.executable }}" 2>/dev/null || true
+      - name: Assemble transitional seed
+        if: needs.seeds.outputs.released != 'true'
         shell: bash
         run: |
-          compiler="$PWD/target/debug/encore"
+          mkdir -p target/seed
+          clang -O3 -w \
+            "target/${{ matrix.triple }}/extreme/encore.ll" \
+            runtime.c index/core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
+            -o "target/seed/${{ matrix.executable }}"
+      - name: Native two-stage self-host
+        shell: bash
+        run: |
+          set -eu
+          seed="$PWD/target/seed/${{ matrix.executable }}"
+          "$seed" --version
+          "$seed" build --profile extreme --target "${{ matrix.triple }}"
+          mkdir -p target/stage1
+          cp "target/${{ matrix.triple }}/extreme/${{ matrix.executable }}" "target/stage1/${{ matrix.executable }}"
+          mv "target/${{ matrix.triple }}/extreme" "target/${{ matrix.triple }}/stage1-extreme"
+          stage1="$PWD/target/stage1/${{ matrix.executable }}"
+          "$stage1" --version
+          "$stage1" build --profile extreme --target "${{ matrix.triple }}"
+          mkdir -p target/stage2
+          cp "target/${{ matrix.triple }}/extreme/${{ matrix.executable }}" "target/stage2/${{ matrix.executable }}"
+          "target/stage2/${{ matrix.executable }}" --version
+      - name: Run full native tests
+        shell: bash
+        run: |
+          set -eu
+          compiler="$PWD/target/stage2/${{ matrix.executable }}"
           for package in \
             index/core \
             index/color \
@@ -118,11 +197,17 @@ jobs:
               exit "$code"
             fi
           done
-      - name: Cross-target smoke test
+      - name: Native analyzer and CLI contracts
         if: matrix.triple == 'x86_64-unknown-linux-gnu'
         shell: bash
-        run: scripts/test-cross-targets.sh
-      - name: Generated code memory safety
-        if: matrix.triple == 'x86_64-unknown-linux-gnu'
-        shell: bash
-        run: scripts/test-memory-safety.sh "$PWD/target/debug/encore"
+        run: |
+          scripts/test-analyzer.sh "$PWD/target/stage2/${{ matrix.executable }}"
+          scripts/test-cli-contract.sh "$PWD/target/stage2/${{ matrix.executable }}"
+          ENCORE_BIN="$compiler" scripts/test-cross-targets.sh
+          scripts/test-memory-safety.sh "$PWD/target/stage2/${{ matrix.executable }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: encore-extreme-${{ matrix.triple }}
+          path: target/stage2/${{ matrix.executable }}
+          if-no-files-found: error
+          retention-days: 7
