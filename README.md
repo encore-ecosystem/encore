@@ -54,6 +54,17 @@ encore target list
 encore help build
 ```
 
+Build profiles have distinct optimization contracts:
+
+- `debug`: `-O0`, debug information, and frame pointers.
+- `release`: portable `-O2` code with assertions disabled.
+- `extreme`: `-O3`, ThinLTO through LLVM `lld`, 32-byte hot-loop alignment,
+  and the native host CPU when building for the host without an explicit
+  `target-cpu`.
+
+Use `release` for distributable binaries that must run on a broad CPU baseline.
+Use `extreme` for the fastest local or explicitly targeted production binary.
+
 `encore add json` resolves `index@json` through the official sparse package
 index at `encore-language/index`. Published source archives are downloaded from
 GitHub Releases, verified with SHA-256, and cached locally. Existing lockfiles
@@ -89,6 +100,7 @@ Toolchains can also be configured in `encore.toml`. See
 | `index/ehir-llvm-backend` | native LLVM backend |
 | `index/std` | application standard library |
 | `index/rich` | terminal rendering and compiler/test progress |
+| `benchmark` | equivalent Encore and Rust performance benchmarks |
 | `examples` | executable language examples |
 | `docs/enbook-en` | language and toolchain documentation |
 

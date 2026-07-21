@@ -40,12 +40,22 @@ pub struct WorkspaceRefrain {
 pub struct WorkspaceModule {
     owner_name: str
     owner_root: Path
+    module_id: str
     module_path: Path
     source: str
     ast: Vec[Statement]
     imports: Vec[str]
+    resolved_imports: Vec[str]
     diagnostics: Vec[FrontendDiagnostic]
     enabled_features: Vec[str]
+}
+
+impl for WorkspaceModule {
+    pub fn id(self: WorkspaceModule) -> str { ret self.module_id }
+
+    pub fn path(self: WorkspaceModule) -> str { ret self.module_path.as_str() }
+
+    pub fn resolved_import_ids(self: WorkspaceModule) -> Vec[str] { ret self.resolved_imports }
 }
 
 pub struct ProjectWorkspace {
@@ -55,6 +65,10 @@ pub struct ProjectWorkspace {
     flat_ast: Vec[Statement]
     loading_roots: Vec[str]
     enabled_features: Vec[str]
+}
+
+impl for ProjectWorkspace {
+    pub fn loaded_modules(self: ProjectWorkspace) -> Vec[WorkspaceModule] { ret self.modules }
 }
 
 pub fn load_binary_workspace(root: Path) -> ProjectWorkspace {
@@ -103,20 +117,18 @@ pub fn load_entry_workspace(root: Path, entrypoint: Path) -> ProjectWorkspace {
     match workspace_root_refrain(workspace) {
         Some(root_refrain) => {
             let visited_paths = unsafe { encore_strset_new() }
-            let visited_sources = unsafe { encore_strset_new() }
             let mut modules = Vec[WorkspaceModule]::new()
             match find_refrain_by_name(workspace, "core") {
                 Some(core_refrain) => {
                     if core_refrain.name != workspace.root_name {
-                        visit_module(workspace, core_refrain, entrypoint_of(core_refrain), visited_paths, visited_sources, modules)
+                        visit_module(workspace, core_refrain, entrypoint_of(core_refrain), visited_paths, modules)
                     }
                 }
                 None => {}
             }
-            visit_module(workspace, root_refrain, entrypoint.resolve(), visited_paths, visited_sources, modules)
+            visit_module(workspace, root_refrain, entrypoint.resolve(), visited_paths, modules)
             unsafe {
                 encore_strset_free(visited_paths)
-                encore_strset_free(visited_sources)
             }
             workspace_set_modules(workspace, modules)
             workspace_set_flat_ast(workspace, flatten_modules(modules))
@@ -241,12 +253,10 @@ fn merge_loaded_refrain_features(workspace: mut ProjectWorkspace, found: Workspa
 fn build_modules_for_refrain(workspace: mut ProjectWorkspace, refrain: WorkspaceRefrain) -> Vec[WorkspaceModule] {
     let entrypoint = entrypoint_of(refrain)
     let visited_paths = unsafe { encore_strset_new() }
-    let visited_sources = unsafe { encore_strset_new() }
     let mut result = Vec[WorkspaceModule]::new()
-    visit_module(workspace, refrain, entrypoint, visited_paths, visited_sources, result)
+    visit_module(workspace, refrain, entrypoint, visited_paths, result)
     unsafe {
         encore_strset_free(visited_paths)
-        encore_strset_free(visited_sources)
     }
     ret result
 }
@@ -256,7 +266,6 @@ fn visit_module(
     owner: WorkspaceRefrain,
     module_path: Path,
     visited_paths: usize,
-    visited_sources: usize,
     result: mut Vec[WorkspaceModule]
 ) -> () {
     let resolved_path = module_path.resolve()
@@ -266,21 +275,45 @@ fn visit_module(
     }
 
     let source = read_file(native_path(resolved_path.as_str()))
-    let source_is_new = unsafe { encore_strset_insert(visited_sources, source) }
     let document = analyze_named_module(owner.name, module_path.as_str(), source)
     let tokens = document.tokens
     let import_edges = import_edges_from_tokens(tokens)
     let imports = import_paths_from_edges(import_edges)
     let mut diagnostics = document.diagnostics
-    if !source_is_new {
-        let mut ignored_diagnostics = Vec[FrontendDiagnostic]::new()
-        visit_imports(workspace, owner, resolved_path, import_edges, visited_paths, visited_sources, result, ignored_diagnostics)
-        ret ()
-    }
     let ast = document.ast
-    visit_imports(workspace, owner, resolved_path, import_edges, visited_paths, visited_sources, result, diagnostics)
-    result.push(WorkspaceModule{owner.name, owner.root, resolved_path, source, ast, imports, diagnostics, owner.enabled_features})
+    visit_imports(workspace, owner, resolved_path, import_edges, visited_paths, result, diagnostics)
+    let module_id = workspace_module_id(owner, resolved_path)
+    let resolved_imports = resolved_module_import_ids(workspace, owner, resolved_path, ast)
+    result.push(WorkspaceModule{owner.name, owner.root, module_id, resolved_path, source, ast, imports, resolved_imports, diagnostics, owner.enabled_features})
     ret ()
+}
+
+fn workspace_module_id(owner: WorkspaceRefrain, module_path: Path) -> str {
+    let source_root = owner.root.resolve().join("src").as_str()
+    let full = module_path.resolve().as_str()
+    let relative = if full.len() > source_root.len() { full.slice(source_root.len() + 1_usize, full.len() - source_root.len() - 1_usize) } else { "lib.enq" }
+    ret owner.name + "@" + relative
+}
+
+fn resolved_module_import_ids(workspace: ProjectWorkspace, owner: WorkspaceRefrain, source_module: Path, ast: Vec[Statement]) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    for statement in ast {
+        match statement {
+            Statement::Import(item) => {
+                for request in expand_import_path(item.path) {
+                    match resolve_import_module(workspace, owner, source_module, request) {
+                        Option[ResolvedModule]::Some(target) => {
+                            let id = workspace_module_id(target.owner, target.module_path)
+                            if !contains_string(out, id) { out.push(id) }
+                        }
+                        Option[ResolvedModule]::None => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ret out
 }
 
 fn visit_imports(
@@ -289,7 +322,6 @@ fn visit_imports(
     resolved_path: Path,
     imports: Vec[DependencyEdge],
     visited_paths: usize,
-    visited_sources: usize,
     result: mut Vec[WorkspaceModule],
     diagnostics: mut Vec[FrontendDiagnostic]
 ) -> () {
@@ -304,7 +336,7 @@ fn visit_imports(
                         Option[str]::Some(request_path) => {
                             match resolve_import_module(workspace, owner, resolved_path, request_path) {
                                 Option[ResolvedModule]::Some(target) => {
-                                    visit_module(workspace, target.owner, target.module_path, visited_paths, visited_sources, result)
+                                    visit_module(workspace, target.owner, target.module_path, visited_paths, result)
                                 }
                                 Option[ResolvedModule]::None => {
                                     diagnostics.push(FrontendDiagnostic::new(

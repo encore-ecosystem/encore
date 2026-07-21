@@ -1,0 +1,434 @@
+import core::option::Option
+import core::io::println
+import core::vec::Vec
+import core::os::{read_file, remove_file, write_file}
+import graphene::{ApiVersion, BindGroupLayoutEntry, DirectionalLight, GraphicsDevice, GraphicsInstance, ObjectUniforms,
+    MaterialAssets, MaterialId, MeshAssets, MeshData, MeshId, PerspectiveCamera, Renderable, Scene, SceneActor, SceneAsset,
+    StandardMaterial, Transform, buffer_storage,
+    buffer_transfer_destination, buffer_transfer_source, buffer_uniform, buffer_vertex, double_words, format_rgba8_unorm,
+    cube_mesh, editor_grid_mesh, gizmo_ring_mesh, gizmo_tip_mesh, shader_stage_compute, shader_stage_fragment, shader_stage_vertex,
+    texture_layout_shader_read, texture_layout_transfer_destination,
+    texture_sampled, texture_transfer_destination}
+import linalg::{Mat4, Vec3}
+
+fn version_contract() -> bool {
+    let version = ApiVersion::from_raw((1_u32 << 22_u32) | (3_u32 << 12_u32) | 275_u32)
+    ret version.major() == 1_u32 && version.minor() == 3_u32 && version.patch() == 275_u32 &&
+        version.at_least(1_u32, 2_u32) && !version.at_least(2_u32, 0_u32)
+}
+
+fn neutral_vertex_colors(mesh: MeshData) -> bool {
+    let vertices = mesh.vertices()
+    let mut color = 6_usize
+    while color + 2_usize < vertices.len() {
+        match vertices.get(color) {
+            Option::Some(red) => { if red != 1.0_f32 { ret false } }
+            Option::None => { ret false }
+        }
+        match vertices.get(color + 1_usize) {
+            Option::Some(green) => { if green != 1.0_f32 { ret false } }
+            Option::None => { ret false }
+        }
+        match vertices.get(color + 2_usize) {
+            Option::Some(blue) => { if blue != 1.0_f32 { ret false } }
+            Option::None => { ret false }
+        }
+        color = color + 9_usize
+    }
+    ret color == vertices.len() + 6_usize
+}
+
+fn scene_contract() -> bool {
+    let cube = cube_mesh(2.0_f32)
+    let grid = editor_grid_mesh(10.0_f32, 10_u32)
+    let gizmo_tip = gizmo_tip_mesh(0.28_f32, 0.36_f32)
+    let gizmo_ring = gizmo_ring_mesh(1.55_f32, 0.045_f32, 16_u32)
+    let light = DirectionalLight::new(Vec3::new(0.0_f32, -2.0_f32, 0.0_f32),
+        Vec3::new(1.0_f32, 0.8_f32, 0.6_f32), 1.25_f32)
+    let mut scene = Scene::new()
+    let root = scene.create_entity("root", Transform::identity().with_position(Vec3::new(2.0_f32, 0.0_f32, 0.0_f32)))
+    let child = scene.create_entity("child", Transform::identity().with_position(Vec3::new(0.0_f32, 3.0_f32, 0.0_f32)))
+    let parented = scene.set_parent(child, Option[u64]::Some(root))
+    let cycle_rejected = !scene.set_parent(root, Option[u64]::Some(child))
+    let visibility_changed = scene.set_visible(child, false)
+    let root_renderable = scene.set_renderable(root,
+        Option[Renderable]::Some(Renderable::new(MeshId::new(1_u64), MaterialId::new(1_u64))))
+    let child_renderable = scene.set_renderable(child,
+        Option[Renderable]::Some(Renderable::new(MeshId::new(1_u64), MaterialId::new(2_u64))))
+    let mut hierarchy_correct = false
+    match scene.world_matrix(child) {
+        Option::Some(matrix) => {
+            let point = matrix.transform_point(Vec3::zero())
+            hierarchy_correct = point.x() > 1.999_f32 && point.x() < 2.001_f32 &&
+                point.y() > 2.999_f32 && point.y() < 3.001_f32
+        }
+        Option::None => {}
+    }
+    let mut hierarchy_updates = scene.set_transform(root,
+        Transform::identity().with_position(Vec3::new(5.0_f32, 0.0_f32, 0.0_f32)))
+    match scene.world_matrix(child) {
+        Option::Some(matrix) => {
+            let point = matrix.transform_point(Vec3::zero())
+            hierarchy_updates = hierarchy_updates && point.x() > 4.999_f32 && point.x() < 5.001_f32 &&
+                point.y() > 2.999_f32 && point.y() < 3.001_f32
+        }
+        Option::None => { hierarchy_updates = false }
+    }
+    let parent_transform = Transform::identity().with_position(Vec3::new(5.0_f32, -1.0_f32, 2.0_f32))
+        .with_rotation(Vec3::new(0.2_f32, 0.7_f32, -0.1_f32)).with_scale(Vec3::new(2.0_f32, 0.5_f32, 3.0_f32))
+    let expected_local = Vec3::new(1.0_f32, 2.0_f32, -0.5_f32)
+    let desired_world = parent_transform.matrix().transform_point(expected_local)
+    let mut world_local_correct = scene.set_transform(root, parent_transform)
+    match scene.local_position_for_world(child, desired_world) {
+        Option::Some(local) => {
+            world_local_correct = world_local_correct && local.x() > 0.999_f32 && local.x() < 1.001_f32 &&
+                local.y() > 1.999_f32 && local.y() < 2.001_f32 && local.z() > -0.501_f32 && local.z() < -0.499_f32
+        }
+        Option::None => { world_local_correct = false }
+    }
+    let mut child_hidden = false
+    match scene.get(child) {
+        Option::Some(entity) => { child_hidden = !entity.visible() && entity.name() == "child" }
+        Option::None => {}
+    }
+    let render_items = scene.visible_render_items()
+    let mut queue_correct = render_items.len() == 1_usize
+    match render_items.get(0_usize) {
+        Option::Some(item) => {
+            queue_correct = queue_correct && item.entity() == root && item.mesh().value() == 1_u64 &&
+                item.material().value() == 1_u64
+        }
+        Option::None => { queue_correct = false }
+    }
+    scene.set_visible(child, true)
+    scene.set_visible(root, false)
+    let inherited_visibility = !scene.world_visible(child) && scene.visible_render_items().len() == 0_usize
+    let mut removal_scene = Scene::new()
+    let removal_parent = removal_scene.create_entity("parent", Transform::identity())
+    let removal_child = removal_scene.create_entity("child", Transform::identity())
+    removal_scene.set_parent(removal_child, Option[u64]::Some(removal_parent))
+    let removed_parent = removal_scene.remove(removal_parent)
+    let mut removal_correct = removed_parent && removal_scene.get(removal_parent).is_none() && removal_scene.len() == 1_usize
+    match removal_scene.get(removal_child) {
+        Option::Some(entity) => { removal_correct = removal_correct && entity.parent().is_none() }
+        Option::None => { removal_correct = false }
+    }
+    let mut materials = MaterialAssets::new()
+    let material_id = materials.add(StandardMaterial::new(Vec3::new(0.2_f32, 0.4_f32, 0.8_f32),
+        -1.0_f32, 2.0_f32).with_unlit())
+    let mut material_correct = false
+    match materials.get(material_id) {
+        Option::Some(material) => {
+            let uniforms = material.uniform_values()
+            material_correct = material.metallic() == 0.0_f32 && material.roughness() == 1.0_f32 && material.unlit() &&
+                material.base_color().z() > 0.799_f32 && uniforms.len() == 8_usize &&
+                match uniforms.get(6_usize) { Option::Some(flag) => { flag == 1.0_f32 } Option::None => { false } }
+        }
+        Option::None => {}
+    }
+    let replacement = StandardMaterial::new(Vec3::new(0.9_f32, 0.1_f32, 0.2_f32), 0.6_f32, 0.3_f32)
+    material_correct = material_correct && materials.set(material_id, replacement)
+    match materials.get(material_id) {
+        Option::Some(material) => {
+            material_correct = material_correct && material.base_color().x() > 0.899_f32 &&
+                material.metallic() > 0.599_f32 && material.roughness() > 0.299_f32 && !material.unlit()
+        }
+        Option::None => { material_correct = false }
+    }
+    material_correct = material_correct && !materials.set(MaterialId::new(9999_u64), replacement)
+    ret cube.stride() == 36_u32 && cube.vertex_count() == 24_usize && cube.index_count() == 36_usize &&
+        neutral_vertex_colors(cube) &&
+        grid.stride() == 36_u32 && grid.vertex_count() == 168_usize && grid.index_count() == 504_usize &&
+        gizmo_tip.stride() == 36_u32 && gizmo_tip.vertex_count() == 16_usize && gizmo_tip.index_count() == 18_usize &&
+        gizmo_ring.stride() == 36_u32 && gizmo_ring.vertex_count() == 64_usize && gizmo_ring.index_count() == 192_usize &&
+        light.uniform_values().len() == 8_usize && light.direction().y() < -0.999_f32 && scene.len() == 2_usize &&
+        root != child && parented && cycle_rejected && visibility_changed && scene.rename(child, "Renamed Child") &&
+        match scene.get(child) { Option::Some(entity) => entity.name() == "Renamed Child" Option::None => false } &&
+        root_renderable && child_renderable &&
+        hierarchy_correct && hierarchy_updates && world_local_correct && child_hidden && queue_correct && inherited_visibility && materials.len() == 1_usize &&
+        material_correct && removal_correct
+}
+
+fn scene_asset_contract() -> bool {
+    let mut asset = SceneAsset::new()
+    asset.add(SceneActor::new("Cube 1", "cube", Transform::identity()
+        .with_position(Vec3::new(-1.25_f32, 2.5_f32, 3.75_f32))
+        .with_rotation(Vec3::new(0.1_f32, -0.2_f32, 0.3_f32))
+        .with_scale(Vec3::new(1.5_f32, 1.5_f32, 1.5_f32))).with_identity(41_u64))
+    asset.add(SceneActor::new("Imported Pyramid", "mesh:pyramid.obj", Transform::identity())
+        .with_identity(99_u64).with_parent(Option[u64]::Some(41_u64)).with_visible(false))
+    let encoded = asset.stringify()
+    if !encoded.contains("graphene-scene") || !encoded.contains("Cube 1") || !encoded.contains("Imported Pyramid") { ret false }
+    match SceneAsset::parse(encoded) {
+        Option::Some(decoded) => {
+            if decoded.version() != 2_u32 || decoded.len() != 2_usize || !decoded.valid_hierarchy() { ret false }
+            match decoded.actor(0_usize) {
+                Option::Some(actor) => {
+                    let transform = actor.transform()
+                    if actor.id() != 41_u64 || actor.parent().is_some() || actor.name() != "Cube 1" || actor.kind() != "cube" ||
+                        transform.position().x() > -1.249_f32 || transform.position().x() < -1.251_f32 ||
+                        transform.position().y() < 2.499_f32 || transform.position().y() > 2.501_f32 ||
+                        transform.rotation().z() < 0.299_f32 || transform.rotation().z() > 0.301_f32 ||
+                        transform.scale().x() < 1.499_f32 || transform.scale().x() > 1.501_f32 {
+                        ret false
+                    }
+                }
+                Option::None => { ret false }
+            }
+            match decoded.actor(1_usize) {
+                Option::Some(actor) => {
+                    if actor.id() != 99_u64 || actor.parent() != Option[u64]::Some(41_u64) ||
+                        actor.name() != "Imported Pyramid" || actor.kind() != "mesh:pyramid.obj" || actor.visible() { ret false }
+                }
+                Option::None => { ret false }
+            }
+        }
+        Option::None => { ret false }
+    }
+    let path = "/tmp/graphene_scene_asset_contract.json"
+    if write_file(path, encoded) != 0_i32 { ret false }
+    let loaded = SceneAsset::parse(read_file(path)).is_some()
+    remove_file(path)
+    if !loaded { ret false }
+    match SceneAsset::parse("{\"format\":\"graphene-scene\",\"version\":1,\"actors\":[{\"name\":\"Legacy\",\"kind\":\"cube\",\"transform\":{\"position\":[0,0,0],\"rotation\":[0,0,0],\"scale\":[1,1,1]}}]}") {
+        Option::Some(legacy) => { match legacy.actor(0_usize) { Option::Some(actor) => {
+            if legacy.version() != 2_u32 || actor.id() != 1_u64 || actor.parent().is_some() || !actor.visible() { ret false }
+        } Option::None => { ret false } } }
+        Option::None => { ret false }
+    }
+    let missing_parent = "{\"format\":\"graphene-scene\",\"version\":2,\"actors\":[{\"id\":1,\"parent\":2,\"name\":\"Broken\",\"kind\":\"cube\",\"transform\":{\"position\":[0,0,0],\"rotation\":[0,0,0],\"scale\":[1,1,1]}}]}"
+    let cycle = "{\"format\":\"graphene-scene\",\"version\":2,\"actors\":[{\"id\":1,\"parent\":2,\"name\":\"A\",\"kind\":\"cube\",\"transform\":{\"position\":[0,0,0],\"rotation\":[0,0,0],\"scale\":[1,1,1]}},{\"id\":2,\"parent\":1,\"name\":\"B\",\"kind\":\"cube\",\"transform\":{\"position\":[0,0,0],\"rotation\":[0,0,0],\"scale\":[1,1,1]}}]}"
+    ret SceneAsset::parse(missing_parent).is_none() && SceneAsset::parse(cycle).is_none()
+}
+
+fn compute_contract(device: GraphicsDevice) -> bool {
+    let mut entries = Vec[BindGroupLayoutEntry]::new()
+    entries.push(BindGroupLayoutEntry::storage(0_u32, shader_stage_compute()))
+    let layout = device.create_bind_group_layout(entries)
+    let buffer = device.create_buffer(16_u64, buffer_storage(), true)
+    let group = device.create_storage_bind_group(layout, buffer, 0_u64, 16_u64)
+    let shader = device.create_shader_module(double_words(), shader_stage_compute())
+    let pipeline = device.create_compute_pipeline(shader, layout)
+    let initialized = layout.available() && buffer.available() && group.available() && shader.available() &&
+        pipeline.available() && buffer.write_u32(0_u64, 1_u32) && buffer.write_u32(4_u64, 2_u32) &&
+        buffer.write_u32(8_u64, 3_u32) && buffer.write_u32(12_u64, 4_u32)
+    let encoder = device.create_encoder()
+    let executed = initialized && encoder.available() && encoder.bind_compute_pipeline(pipeline) &&
+        encoder.bind_compute_group(pipeline, group) && encoder.dispatch(4_u32, 1_u32, 1_u32) &&
+        encoder.storage_host_barrier() && encoder.submit_and_wait()
+    encoder.destroy()
+    let correct = executed && buffer.read_u32(0_u64) == 2_u32 && buffer.read_u32(4_u64) == 4_u32 &&
+        buffer.read_u32(8_u64) == 6_u32 && buffer.read_u32(12_u64) == 8_u32
+    pipeline.destroy()
+    shader.destroy()
+    group.destroy()
+    buffer.destroy()
+    layout.destroy()
+    ret correct
+}
+
+fn main() -> u32 {
+    if !version_contract() || !scene_contract() || !scene_asset_contract() { ret 1_u32 }
+    let instance = GraphicsInstance::create()
+    if !instance.available() { println("Vulkan instance: " + instance.error()) ret 2_u32 }
+    if !instance.api_version().at_least(1_u32, 0_u32) { instance.destroy() ret 3_u32 }
+    match instance.preferred_adapter() {
+        Option::Some(adapter) => {
+            if adapter.name() == "" || !adapter.api_version().at_least(1_u32, 0_u32) {
+                instance.destroy()
+                ret 4_u32
+            }
+            let device = instance.create_device(adapter)
+            if !device.available() || !device.graphics() || !device.compute() {
+                println("Vulkan device: " + device.error())
+                device.destroy()
+                instance.destroy()
+                ret 6_u32
+            }
+            let offscreen = device.create_offscreen_target(64_u32, 48_u32)
+            if !offscreen.available() || offscreen.width() != 64_u32 || offscreen.height() != 48_u32 ||
+                offscreen.pitch() != 256_u32 || offscreen.frames_in_flight() != 2_u32 {
+                offscreen.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 21_u32
+            }
+            offscreen.destroy()
+            let invalid_shader = device.create_shader_module(Vec[u32]::new(), shader_stage_vertex())
+            if invalid_shader.available() || invalid_shader.error() == "" {
+                invalid_shader.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 13_u32
+            }
+            invalid_shader.destroy()
+            if !compute_contract(device) {
+                device.destroy()
+                instance.destroy()
+                ret 16_u32
+            }
+            let uniform_layout = device.create_uniform_bind_group_layout(0_u32, shader_stage_vertex())
+            let uniform_buffer = device.create_buffer(16_u64, buffer_uniform(), true)
+            let uniform_group = device.create_uniform_bind_group(uniform_layout, uniform_buffer, 0_u64, 16_u64)
+            if !uniform_layout.available() || !uniform_buffer.available() ||
+                !uniform_buffer.write_f32(0_u64, 1.0_f32) || !uniform_group.available() {
+                uniform_group.destroy()
+                uniform_layout.destroy()
+                uniform_buffer.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 14_u32
+            }
+            uniform_group.destroy()
+            let object_uniforms = ObjectUniforms::create(device, uniform_layout, 2_u32)
+            let object_camera = PerspectiveCamera::new(Vec3::new(0.0_f32, 0.0_f32, 3.0_f32),
+                Vec3::zero(), 1.0471976_f32, 0.1_f32, 100.0_f32)
+            let object_light = DirectionalLight::new(Vec3::new(0.0_f32, -1.0_f32, 0.0_f32),
+                Vec3::new(1.0_f32, 1.0_f32, 1.0_f32), 1.0_f32)
+            if !object_uniforms.available() || object_uniforms.frame_count() != 2_u32 ||
+                !object_uniforms.update(0_u32, object_camera, Mat4::identity(), 1.0_f32, object_light,
+                    StandardMaterial::default()) ||
+                object_uniforms.update(2_u32, object_camera, Mat4::identity(), 1.0_f32, object_light,
+                    StandardMaterial::default()) {
+                object_uniforms.destroy()
+                uniform_layout.destroy()
+                uniform_buffer.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 19_u32
+            }
+            object_uniforms.destroy()
+            uniform_layout.destroy()
+            uniform_buffer.destroy()
+            let encoder = device.create_encoder()
+            if !encoder.available() || !encoder.submit_and_wait() {
+                encoder.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 7_u32
+            }
+            encoder.destroy()
+            let async_encoder = device.create_encoder()
+            if !async_encoder.available() {
+                async_encoder.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 9_u32
+            }
+            let submission = async_encoder.submit()
+            async_encoder.destroy()
+            submission.complete()
+            if !submission.available() || !submission.wait(1000000000_u64) || !submission.complete() {
+                submission.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 10_u32
+            }
+            submission.destroy()
+            let buffer = device.create_buffer(256_u64, buffer_vertex() | buffer_transfer_source(), true)
+            if !buffer.available() || buffer.size() != 256_u64 || !buffer.host_visible() ||
+                !buffer.write_u32(0_u64, 305419896_u32) || !buffer.write_f32(4_u64, 3.5_f32) ||
+                buffer.write_u32(254_u64, 1_u32) || buffer.write_f32(255_u64, 1.0_f32) {
+                buffer.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 8_u32
+            }
+            buffer.destroy()
+            let copy_source = device.create_buffer(16_u64, buffer_transfer_source(), true)
+            let copy_destination = device.create_buffer(16_u64, buffer_transfer_destination(), true)
+            let copy_encoder = device.create_encoder()
+            let copied = copy_source.write_u32(0_u64, 3735928559_u32) && copy_encoder.available() &&
+                copy_encoder.copy_buffer(copy_source, copy_destination, 0_u64, 4_u64, 4_u64) &&
+                !copy_encoder.copy_buffer(copy_destination, copy_source, 0_u64, 0_u64, 4_u64) &&
+                copy_encoder.transfer_host_barrier() && copy_encoder.submit_and_wait() &&
+                copy_destination.read_u32(4_u64) == 3735928559_u32
+            copy_encoder.destroy()
+            copy_source.destroy()
+            copy_destination.destroy()
+            if !copied {
+                device.destroy()
+                instance.destroy()
+                ret 17_u32
+            }
+            let mut mesh_vertices = Vec[f32]::new()
+            mesh_vertices.push(-1.0_f32) mesh_vertices.push(-1.0_f32)
+            mesh_vertices.push(1.0_f32) mesh_vertices.push(-1.0_f32)
+            mesh_vertices.push(0.0_f32) mesh_vertices.push(1.0_f32)
+            let mut mesh_indices = Vec[u32]::new()
+            mesh_indices.push(0_u32) mesh_indices.push(1_u32) mesh_indices.push(2_u32)
+            let mesh = device.create_mesh(mesh_vertices, mesh_indices)
+            if !mesh.available() || mesh.index_count() != 3_u32 || mesh.vertex_buffer().host_visible() ||
+                mesh.index_buffer().host_visible() {
+                mesh.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 18_u32
+            }
+            mesh.destroy()
+            let mut mesh_assets = MeshAssets::new()
+            let cube_id = mesh_assets.upload(device, cube_mesh(1.0_f32))
+            if !cube_id.valid() || !mesh_assets.contains(cube_id) || mesh_assets.len() != 1_usize {
+                mesh_assets.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 20_u32
+            }
+            mesh_assets.destroy()
+            let staging = device.create_buffer(64_u64 * 64_u64 * 4_u64, buffer_transfer_source(), true)
+            let texture = device.create_texture_2d(64_u32, 64_u32, 1_u32, format_rgba8_unorm(),
+                texture_sampled() | texture_transfer_destination())
+            if !staging.available() || !staging.write_u32(0_u64, 4294901760_u32) ||
+                !texture.available() || texture.width() != 64_u32 || texture.height() != 64_u32 ||
+                texture.mip_levels() != 1_u32 || texture.format() != format_rgba8_unorm() {
+                staging.destroy()
+                texture.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 11_u32
+            }
+            let upload = device.create_encoder()
+            if !upload.transition_texture(texture, texture_layout_transfer_destination()) ||
+                !upload.copy_buffer_to_texture(staging, texture, 64_u32, 64_u32, 0_u32) ||
+                !upload.transition_texture(texture, texture_layout_shader_read()) ||
+                texture.layout() != texture_layout_shader_read() || !upload.submit_and_wait() {
+                upload.destroy()
+                staging.destroy()
+                texture.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 12_u32
+            }
+            upload.destroy()
+            let mut material_entries = Vec[BindGroupLayoutEntry]::new()
+            material_entries.push(BindGroupLayoutEntry::uniform(0_u32, shader_stage_vertex()))
+            material_entries.push(BindGroupLayoutEntry::texture_sampler(1_u32, shader_stage_fragment()))
+            let material_layout = device.create_bind_group_layout(material_entries)
+            let material_uniform = device.create_buffer(16_u64, buffer_uniform(), true)
+            let sampler = device.create_sampler()
+            let material = device.create_material_bind_group(material_layout, 0_u32, material_uniform,
+                0_u64, 16_u64, 1_u32, texture, sampler)
+            if !material_layout.available() || !material_uniform.available() || !sampler.available() || !material.available() {
+                material.destroy()
+                sampler.destroy()
+                material_uniform.destroy()
+                material_layout.destroy()
+                staging.destroy()
+                texture.destroy()
+                device.destroy()
+                instance.destroy()
+                ret 15_u32
+            }
+            material.destroy()
+            sampler.destroy()
+            material_uniform.destroy()
+            material_layout.destroy()
+            staging.destroy()
+            texture.destroy()
+            device.destroy()
+        }
+        Option::None => { instance.destroy() ret 5_u32 }
+    }
+    instance.destroy()
+    ret 0_u32
+}
