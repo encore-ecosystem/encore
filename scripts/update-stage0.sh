@@ -39,6 +39,7 @@ trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 )
 clang -O3 \
     "$repo_root/target/$target/extreme/encore.ll" \
+    "$repo_root/runtime.c" \
     "$repo_root/index/core/runtime.c" \
     "$repo_root/index/ehir-llvm-backend/runtime.c" \
     "$repo_root/index/rich/runtime.c" \
