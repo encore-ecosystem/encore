@@ -2456,7 +2456,9 @@ fn expr_is_borrowed_copy(expr: ExprNode) -> bool {
         Expr::Path(_) => { ret true }
         Expr::Field(_) => { ret true }
         Expr::Index(_) => { ret true }
-        Expr::Block(block) => { ret expr_h_is_borrowed_copy(block.tail) }
+        Expr::Block(block) => {
+            match block.tail { Some(tail) => { ret expr_h_is_borrowed_copy(tail) } None => { ret false } }
+        }
         Expr::Parenthesized(inner) => { ret expr_h_is_borrowed_copy(inner) }
         _ => { ret false }
     }
@@ -2468,7 +2470,9 @@ fn expr_h_is_borrowed_copy(expr: ExprNode<H>) -> bool {
         Expr::Path(_) => { ret true }
         Expr::Field(_) => { ret true }
         Expr::Index(_) => { ret true }
-        Expr::Block(block) => { ret expr_h_is_borrowed_copy(block.tail) }
+        Expr::Block(block) => {
+            match block.tail { Some(tail) => { ret expr_h_is_borrowed_copy(tail) } None => { ret false } }
+        }
         Expr::Parenthesized(inner) => { ret expr_h_is_borrowed_copy(inner) }
         _ => { ret false }
     }
@@ -2478,7 +2482,9 @@ fn expr_h_is_borrowed_copy(expr: ExprNode<H>) -> bool {
 fn expr_returns_borrowed(ctx: mut TranslatorContext, expr: ExprNode) -> bool {
     match expr.value {
         Expr::Call(call_expr) => { ret ctx_function_returns_borrowed(ctx, expr_h_path_or_empty(call_expr.callee)) }
-        Expr::Block(block) => { ret expr_h_returns_borrowed(ctx, block.tail) }
+        Expr::Block(block) => {
+            match block.tail { Some(tail) => { ret expr_h_returns_borrowed(ctx, tail) } None => { ret false } }
+        }
         Expr::Parenthesized(inner) => { ret expr_h_returns_borrowed(ctx, inner) }
         Expr::Unsafe(block) => {
             if block.statements.len() == 0_usize { ret false }
@@ -2501,7 +2507,9 @@ fn expr_returns_borrowed(ctx: mut TranslatorContext, expr: ExprNode) -> bool {
 fn expr_h_returns_borrowed(ctx: mut TranslatorContext, expr: ExprNode<H>) -> bool {
     match expr.value {
         Expr::Call(call_expr) => { ret ctx_function_returns_borrowed(ctx, expr_h_path_or_empty(call_expr.callee)) }
-        Expr::Block(block) => { ret expr_h_returns_borrowed(ctx, block.tail) }
+        Expr::Block(block) => {
+            match block.tail { Some(tail) => { ret expr_h_returns_borrowed(ctx, tail) } None => { ret false } }
+        }
         Expr::Parenthesized(inner) => { ret expr_h_returns_borrowed(ctx, inner) }
         _ => {}
     }
@@ -4211,18 +4219,20 @@ fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, source_na
         builder = builder.append(bind_match_payload(ctx, arm.pattern, cond.value, cond.typ, source_name, line, column, prefix + "_match_expr_binding_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx)))
         if ctx_type_needs_ownership(ctx, cond.typ) { builder = builder.instr("drop " + cond.value + ": " + cond.typ) }
         let borrowed_result = expr_is_borrowed_copy(arm.expr)
-        let lowered = lower_expr(ctx, arm.expr, prefix + "_match_expr_arm_" + Debug::fmt(arm_idx), idx + arm_idx + 1_usize)
+        let lowered = lower_expr(ctx, arm.expr, prefix + "_match_expr_arm_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx), idx + arm_idx + 1_usize)
         builder = builder.append(lowered.code)
-        if borrowed_result && ctx_type_needs_ownership(ctx, lowered.typ) {
-            builder = builder.instr("retain " + lowered.value + ": " + lowered.typ)
+        if lowered.typ != "!" {
+            if borrowed_result && ctx_type_needs_ownership(ctx, lowered.typ) {
+                builder = builder.instr("retain " + lowered.value + ": " + lowered.typ)
+            }
+            builder = builder.instr("store " + lowered.value + ", " + result_slot)
+            if ctx_type_needs_ownership(ctx, result_type) {
+                builder = builder.instr("drop " + lowered.value + ": " + result_type)
+            }
+            builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", outer_owned)
+            builder = builder.instr("br $" + end_label)
         }
-        builder = builder.instr("store " + lowered.value + ", " + result_slot)
-        if ctx_type_needs_ownership(ctx, result_type) {
-            builder = builder.instr("drop " + lowered.value + ": " + result_type)
-        }
-        builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", outer_owned)
         restore_owned_vars(ctx, outer_owned)
-        builder = builder.instr("br $" + end_label)
         builder = builder.label(fail_label)
         arm_idx = arm_idx + 1_usize
     }
@@ -4307,14 +4317,21 @@ fn lower_block_expr(ctx: mut TranslatorContext, block_expr: BlockExpr, prefix: s
     let mut builder = translate_statements_no_default(
         ctx,
         block_expr.statements,
-        "void",
+        ctx.return_type,
         prefix + "_block",
         Option[str]::None,
         Option[str]::None
     )
-    let tail = lower_expr_h(ctx, block_expr.tail, prefix + "_block_tail", idx + 1_usize)
-    builder = builder.append(tail.code)
-    ret LoweredExpr{builder, tail.value, tail.typ}
+    match block_expr.tail {
+        Option[ExprNode<H>]::Some(tail_expr) => {
+            let tail = lower_expr_h(ctx, tail_expr, prefix + "_block_tail", idx + 1_usize)
+            builder = builder.append(tail.code)
+            ret LoweredExpr{builder, tail.value, tail.typ}
+        }
+        Option[ExprNode<H>]::None => {
+            ret LoweredExpr{builder, "", "!"}
+        }
+    }
 }
 
 fn lower_unsafe_expr(ctx: mut TranslatorContext, block: ParsedBlock, prefix: str, idx: usize) -> LoweredExpr {
@@ -4364,19 +4381,15 @@ fn single_statement(stmt: Statement) -> Vec[Statement] {
 
 fn infer_match_expr_result_type(ctx: mut TranslatorContext, match_expr: MatchExpr, scrutinee_type: str, source_name: str, line: usize, column: usize) -> str {
     let owned_size = ctx.owned_vars.len()
-    match match_expr.arms.get(0_usize) {
-        Option[MatchExprArm]::Some(arm) => {
-            let _bindings = bind_match_payload(ctx, arm.pattern, "_match_type_probe_subject", scrutinee_type, source_name, line, column, "_match_type_probe_binding")
-            let lowered = lower_expr(ctx, arm.expr, "_match_type_probe", 0_usize)
-            let typ = canonical_type(lowered.typ)
-            restore_owned_vars(ctx, owned_size)
-            ret typ
-        }
-        Option[MatchExprArm]::None => {
-            translation_error_at(source_name, line, column, "empty-match", "match expression must contain at least one arm")
-        }
+    for arm in match_expr.arms {
+        let _bindings = bind_match_payload(ctx, arm.pattern, "_match_type_probe_subject", scrutinee_type, source_name, line, column, "_match_type_probe_binding")
+        let lowered = lower_expr(ctx, arm.expr, "_match_type_probe", 0_usize)
+        let typ = canonical_type(lowered.typ)
+        restore_owned_vars(ctx, owned_size)
+        if typ != "!" { ret typ }
     }
-    ret "void"
+    translation_error_at(source_name, line, column, "diverging-match-expression", "match expression has no value-producing arm")
+    ret "!"
 }
 
 fn bind_match_payload(ctx: mut TranslatorContext, pattern: MatchPattern, scrutinee_value: str, scrutinee_type: str, source_name: str, line: usize, column: usize, binding_prefix: str) -> EhirTextBuilder {
