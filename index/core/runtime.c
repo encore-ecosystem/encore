@@ -2171,7 +2171,11 @@ int32_t encore_fs_copy_file(encore_str source, encore_str destination) {
     memcpy(temporary_c + destination_len, ".tmp.XXXXXX", 12);
     int temporary_fd = mkstemp(temporary_c);
 #endif
+#ifdef _WIN32
+    FILE *output = temporary_fd < 0 ? NULL : _fdopen(temporary_fd, "wb");
+#else
     FILE *output = temporary_fd < 0 ? NULL : fdopen(temporary_fd, "wb");
+#endif
     if (output == NULL) {
         if (temporary_fd >= 0) {
 #ifdef _WIN32
