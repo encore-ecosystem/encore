@@ -58,6 +58,7 @@ typedef struct {
 typedef struct {
     UiSdlTexture *texture;
     char *text;
+    size_t text_length;
     size_t face;
     float font_size;
     uint32_t font_weight;
@@ -298,6 +299,20 @@ static char *ui_copy_cstr(const char *value) {
     size_t length = strlen(value);
     char *result = (char *)malloc(length + 1);
     if (result != NULL) memcpy(result, value, length + 1);
+    return result;
+}
+
+static bool ui_str_equals_cstr(encore_str value, const char *text) {
+    size_t length = value.object == NULL ? 0 : value.object->len;
+    size_t text_length = text == NULL ? 0 : strlen(text);
+    return length == text_length && (length == 0 || memcmp(value.object->data, text, length) == 0);
+}
+
+static char *ui_copy_text(const char *value, size_t length) {
+    char *result = (char *)malloc(length + 1);
+    if (result == NULL) return NULL;
+    if (length > 0) memcpy(result, value, length);
+    result[length] = '\0';
     return result;
 }
 
@@ -1075,7 +1090,7 @@ bool encore_ui_round_rect(size_t handle, float x, float y, float width, float he
     return filled ? ui_fill_rounded_aa(state, x, y, width, height, r, color)
         : ui_stroke_rounded_aa(handle, x, y, width, height, r, color);
 }
-static UiSdlTexture *ui_text_texture(UiWindow *state, const char *text, uint32_t color,
+static UiSdlTexture *ui_text_texture(UiWindow *state, const char *text, size_t length, uint32_t color,
         int wrap_width, int *width, int *height, bool *transient) {
     *transient = false;
     ++state->text_cache_tick;
@@ -1083,7 +1098,8 @@ static UiSdlTexture *ui_text_texture(UiWindow *state, const char *text, uint32_t
         UiTextCacheEntry *entry = &state->text_cache[i];
         if (entry->face == state->current_face && entry->font_size == state->font_size &&
                 entry->font_weight == state->font_weight && entry->color == color &&
-                entry->wrap_width == wrap_width && strcmp(entry->text, text) == 0) {
+                entry->wrap_width == wrap_width && entry->text_length == length &&
+                (length == 0 || memcmp(entry->text, text, length) == 0)) {
             entry->used_at = state->text_cache_tick;
             *width = entry->width;
             *height = entry->height;
@@ -1094,7 +1110,6 @@ static UiSdlTexture *ui_text_texture(UiWindow *state, const char *text, uint32_t
         (uint8_t)(color >> 24), (uint8_t)(color >> 16),
         (uint8_t)(color >> 8), (uint8_t)color
     };
-    size_t length = strlen(text);
     UiSdlSurface *surface = wrap_width > 0
         ? g_ttf.RenderTextBlendedWrapped(state->font, text, length, foreground, wrap_width)
         : g_ttf.RenderTextBlended(state->font, text, length, foreground);
@@ -1116,14 +1131,14 @@ static UiSdlTexture *ui_text_texture(UiWindow *state, const char *text, uint32_t
         *transient = true;
         return texture;
     }
-    char *owned_text = ui_copy_cstr(text);
+    char *owned_text = ui_copy_text(text, length);
     if (owned_text == NULL) { g_sdl.DestroyTexture(texture); ui_set_error("Unable to cache rendered text"); return NULL; }
     while (state->text_cache_count > 0 &&
             (state->text_cache_count >= 128 || state->text_cache_bytes + bytes > byte_limit)) {
         ui_remove_text_cache_entry(state, ui_oldest_text_cache_entry(state));
     }
     size_t slot = state->text_cache_count++;
-    state->text_cache[slot] = (UiTextCacheEntry){texture, owned_text, state->current_face,
+    state->text_cache[slot] = (UiTextCacheEntry){texture, owned_text, length, state->current_face,
         state->font_size, state->font_weight, color, wrap_width, *width, *height, bytes, state->text_cache_tick};
     state->text_cache_bytes += bytes;
     return texture;
@@ -1131,18 +1146,19 @@ static UiSdlTexture *ui_text_texture(UiWindow *state, const char *text, uint32_t
 
 bool encore_ui_text(size_t handle, float x, float y, encore_str value, uint32_t color) {
     UiWindow *state = ui_window(handle); if (state == NULL || !state->open) return false;
-    char *text = ui_to_cstr(value); if (text == NULL) return false;
+    const char *text = value.object == NULL ? "" : value.object->data;
+    size_t length = value.object == NULL ? 0 : value.object->len;
     if (state->font == NULL) {
-        if (!ui_color(state, color)) { free(text); return false; }
-        bool result = g_sdl.RenderDebugText(state->renderer, x, y, text);
-        free(text);
+        char *terminated = ui_copy_text(text, length); if (terminated == NULL) return false;
+        if (!ui_color(state, color)) { free(terminated); return false; }
+        bool result = g_sdl.RenderDebugText(state->renderer, x, y, terminated);
+        free(terminated);
         return result;
     }
     int width = 0;
     int height = 0;
     bool transient = false;
-    UiSdlTexture *texture = ui_text_texture(state, text, color, 0, &width, &height, &transient);
-    free(text);
+    UiSdlTexture *texture = ui_text_texture(state, text, length, color, 0, &width, &height, &transient);
     if (texture == NULL) return false;
     float density = state->pixel_density > 0.0f ? state->pixel_density : 1.0f;
     UiSdlFRect destination = {x, y, (float)width / density, (float)height / density};
@@ -1153,11 +1169,13 @@ bool encore_ui_text(size_t handle, float x, float y, encore_str value, uint32_t 
 
 bool encore_ui_text_wrapped(size_t handle, float x, float y, encore_str value, uint32_t color, float wrap_width) {
     UiWindow *state = ui_window(handle); if (state == NULL || !state->open || wrap_width <= 0.0f) return false;
-    char *text = ui_to_cstr(value); if (text == NULL) return false;
+    const char *text = value.object == NULL ? "" : value.object->data;
+    size_t length = value.object == NULL ? 0 : value.object->len;
     if (state->font == NULL) {
-        if (!ui_color(state, color)) { free(text); return false; }
-        bool result = g_sdl.RenderDebugText(state->renderer, x, y, text);
-        free(text);
+        char *terminated = ui_copy_text(text, length); if (terminated == NULL) return false;
+        if (!ui_color(state, color)) { free(terminated); return false; }
+        bool result = g_sdl.RenderDebugText(state->renderer, x, y, terminated);
+        free(terminated);
         return result;
     }
     float density = state->pixel_density > 0.0f ? state->pixel_density : 1.0f;
@@ -1165,8 +1183,7 @@ bool encore_ui_text_wrapped(size_t handle, float x, float y, encore_str value, u
     int width = 0;
     int height = 0;
     bool transient = false;
-    UiSdlTexture *texture = ui_text_texture(state, text, color, limit, &width, &height, &transient);
-    free(text);
+    UiSdlTexture *texture = ui_text_texture(state, text, length, color, limit, &width, &height, &transient);
     if (texture == NULL) return false;
     UiSdlFRect destination = {x, y, (float)width / density, (float)height / density};
     bool result = g_sdl.RenderTexture(state->renderer, texture, NULL, &destination);
@@ -1257,6 +1274,10 @@ static bool ui_select_font(UiWindow *state, size_t face, float size, uint32_t we
 bool encore_ui_font_select(size_t handle, encore_str family, float size, uint32_t weight) {
     UiWindow *state = ui_window(handle);
     if (state == NULL || !state->open) return false;
+    if (state->current_face < state->font_face_count &&
+            ui_str_equals_cstr(family, state->font_faces[state->current_face].family)) {
+        return ui_select_font(state, state->current_face, size, weight);
+    }
     char *name = ui_to_cstr(family);
     if (name == NULL) return false;
     size_t face = state->font_face_count;
@@ -1289,6 +1310,16 @@ static float ui_text_extent(size_t handle, encore_str value, bool width) {
     int measured_height = 0;
     const char *text = value.object == NULL ? "" : value.object->data;
     size_t length = value.object == NULL ? 0 : value.object->len;
+    for (size_t i = 0; i < state->text_cache_count; ++i) {
+        UiTextCacheEntry *entry = &state->text_cache[i];
+        if (entry->face == state->current_face && entry->font_size == state->font_size &&
+                entry->font_weight == state->font_weight && entry->wrap_width == 0 &&
+                entry->text_length == length &&
+                (length == 0 || memcmp(entry->text, text, length) == 0)) {
+            return (float)(width ? entry->width : entry->height) /
+                (state->pixel_density > 0.0f ? state->pixel_density : 1.0f);
+        }
+    }
     if (!g_ttf.GetStringSize(state->font, text, length, &measured_width, &measured_height)) return 0.0f;
     float density = state->pixel_density > 0.0f ? state->pixel_density : 1.0f;
     return (float)(width ? measured_width : measured_height) / density;
