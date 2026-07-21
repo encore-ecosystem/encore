@@ -22,6 +22,7 @@
 #ifdef __APPLE__
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
+#include <sys/sysctl.h>
 #endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -162,6 +163,11 @@ size_t encore_thread_available_parallelism(void) {
 #ifdef _WIN32
     DWORD count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     return count == 0 ? 1 : (size_t)count;
+#elif defined(__APPLE__)
+    int count = 0;
+    size_t size = sizeof(count);
+    if (sysctlbyname("hw.logicalcpu", &count, &size, NULL, 0) != 0 || count < 1) return 1;
+    return (size_t)count;
 #else
     long count = sysconf(_SC_NPROCESSORS_ONLN);
     return count < 1 ? 1 : (size_t)count;
