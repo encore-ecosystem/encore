@@ -7,6 +7,11 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+/* windows.h maps CreateWindow to CreateWindowA/CreateWindowW.  The SDL
+ * dispatch table deliberately uses the backend-neutral SDL symbol name. */
+#ifdef CreateWindow
+#undef CreateWindow
+#endif
 #else
 #include <dlfcn.h>
 #include <signal.h>
