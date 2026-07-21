@@ -46,7 +46,7 @@ int encore_compiler_exec_parts(encore_compiler_str program, size_t raw_args, siz
         if (argv[index + 1] == NULL) return -1;
     }
 #ifdef _WIN32
-    return (int)_spawnvp(_P_OVERLAY, argv[0], (const char *const *)argv);
+    return (int)_spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
 #else
     execvp(argv[0], argv);
     return -1;
