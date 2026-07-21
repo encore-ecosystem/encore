@@ -1,0 +1,161 @@
+import core::option::Option
+import core::testing::assert
+import std::vec::Vec
+
+import refrain::frontend::AnalysisDatabase
+import refrain::frontend::analyze_module
+import refrain::frontend::parser::Statement
+import refrain::frontend::translator::TranslationModule
+import refrain::frontend::translator::translate_modules_to_ehir_bundle
+import refrain::target::host_target
+import ehirlib::parse_module_bundle_text
+
+fn main() -> u32 {
+    let source = "//! Networking primitives.\n" +
+        "//!\n" +
+        "//! Shared by blocking and asynchronous APIs.\n\n" +
+        "/// A TCP endpoint.\n" +
+        "pub struct Endpoint {\n" +
+        "    /// Host name or address.\n" +
+        "    host: str\n" +
+        "}\n\n" +
+        "/// Opens a connection.\n" +
+        "///\n" +
+        "/// # Errors\n" +
+        "/// Returns an error when the endpoint is unavailable.\n" +
+        "pub fn connect(endpoint: Endpoint) -> u32 {\n" +
+        "    ret 0_u32\n" +
+        "}\n"
+
+    let document = analyze_module("net", source)
+    if !assert(document.parsed) { ret 1_u32 }
+    match document.module_documentation {
+        Option::Some(doc) => {
+            if !assert(doc.text == "Networking primitives.\n\nShared by blocking and asynchronous APIs.") { ret 2_u32 }
+        }
+        Option::None => { ret 3_u32 }
+    }
+
+    let mut saw_endpoint = false
+    let mut saw_connect = false
+    for statement in document.ast {
+        match statement {
+            Statement::Struct(item) => {
+                if item.name == "Endpoint" {
+                    match item.documentation {
+                        Option::Some(doc) => {
+                            if !assert(doc.text == "A TCP endpoint.") { ret 4_u32 }
+                        }
+                        Option::None => { ret 5_u32 }
+                    }
+                    match item.named_fields.get(0_usize) {
+                        Option::Some(field) => {
+                            match field.documentation {
+                                Option::Some(doc) => {
+                                    if !assert(doc.text == "Host name or address.") { ret 6_u32 }
+                                }
+                                Option::None => { ret 7_u32 }
+                            }
+                        }
+                        Option::None => { ret 8_u32 }
+                    }
+                    saw_endpoint = true
+                }
+            }
+            Statement::Function(item) => {
+                if item.name == "connect" {
+                    match item.documentation {
+                        Option::Some(doc) => {
+                            if !assert(doc.text.contains("# Errors")) { ret 9_u32 }
+                            if !assert(doc.text.contains("endpoint is unavailable")) { ret 10_u32 }
+                        }
+                        Option::None => { ret 11_u32 }
+                    }
+                    saw_connect = true
+                }
+            }
+            _ => {}
+        }
+    }
+    if !assert(saw_endpoint && saw_connect) { ret 12_u32 }
+
+    let mut symbol_has_docs = false
+    for symbol in document.symbols {
+        if symbol.name == "connect" {
+            match symbol.documentation {
+                Option::Some(doc) => {
+                    if !assert(doc.text.contains("Opens a connection")) { ret 13_u32 }
+                    symbol_has_docs = true
+                }
+                Option::None => { ret 14_u32 }
+            }
+        }
+    }
+    if !assert(symbol_has_docs) { ret 15_u32 }
+
+    let mut modules = Vec[TranslationModule]::new()
+    modules.push(TranslationModule::new_documented(
+        "net@lib.enq",
+        "net.enq",
+        document.module_documentation,
+        Vec[str]::new(),
+        document.ast,
+        Vec[str]::new()
+    ))
+    let bundle_text = translate_modules_to_ehir_bundle(modules, host_target(), "net@lib.enq")
+    let bundle = parse_module_bundle_text("net@lib.enq", bundle_text)
+    match bundle.modules.get(0_usize) {
+        Option::Some(module) => {
+            match module.documentation {
+                Option::Some(doc) => {
+                    if !assert(doc.contains("Shared by blocking and asynchronous APIs")) { ret 25_u32 }
+                }
+                Option::None => { ret 26_u32 }
+            }
+            let mut found_ehir_docs = false
+            for doc in module.symbol_documentation {
+                if doc.text.contains("Opens a connection") { found_ehir_docs = true }
+            }
+            if !assert(found_ehir_docs) { ret 27_u32 }
+        }
+        Option::None => { ret 28_u32 }
+    }
+
+    let mut database = AnalysisDatabase::new()
+    database.set_module("net", "net.enq", source)
+    database.set_module("app", "app.enq", "import net::*\nfn main() -> u32 { ret connect(Endpoint {\"localhost\"}) }")
+
+    let indexed_connect = database.symbols_named("connect")
+    if !assert(indexed_connect.len() == 1_usize) { ret 29_u32 }
+    match indexed_connect.get(0_usize) {
+        Option::Some(indexed) => {
+            if !assert(indexed.module_name == "net") { ret 30_u32 }
+            match indexed.symbol.documentation {
+                Option::Some(doc) => {
+                    if !assert(doc.text.contains("Opens a connection")) { ret 31_u32 }
+                }
+                Option::None => { ret 32_u32 }
+            }
+        }
+        Option::None => { ret 33_u32 }
+    }
+
+    match database.document("app") {
+        Option::Some(app) => { if !assert(app.parsed) { ret 16_u32 } }
+        Option::None => { ret 17_u32 }
+    }
+    if !assert(!database.module_is_dirty("app")) { ret 18_u32 }
+    let previous_revision = database.module_analysis_revision("app")
+
+    database.set_module("net", "net.enq", source + "\n/// Connection state.\npub struct ConnectionState;\n")
+    if !assert(database.module_is_dirty("net")) { ret 19_u32 }
+    if !assert(database.module_is_dirty("app")) { ret 20_u32 }
+
+    match database.document("app") {
+        Option::Some(app) => { if !assert(app.parsed) { ret 21_u32 } }
+        Option::None => { ret 22_u32 }
+    }
+    if !assert(!database.module_is_dirty("app")) { ret 23_u32 }
+    if !assert(database.module_analysis_revision("app") > previous_revision) { ret 24_u32 }
+    ret 0_u32
+}

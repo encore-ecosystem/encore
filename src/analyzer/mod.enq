@@ -1,0 +1,180 @@
+//! Provides the shared rule engine used by Encore tooling.
+
+import core::option::Option
+import std::vec::Vec
+import refrain::frontend::{FrontendDocument, FrontendDiagnostic, Statement, Token, TokenType}
+import refrain::frontend::parser::Documentation
+
+/// Selects whether a rule is disabled, emits a warning, or emits an error.
+pub enum RuleLevel { Allow Warn Deny }
+
+struct RuleSetting { code: str level: RuleLevel }
+
+/// Stores analyzer rule levels for one invocation.
+pub struct AnalyzerConfig { settings: Vec[RuleSetting] }
+
+/// Describes one configurable analyzer finding.
+pub struct AnalyzerDiagnostic {
+    path: str
+    severity: RuleLevel
+    code: str
+    message: str
+    line: usize
+    column: usize
+    length: usize
+}
+
+/// Returns whether a selector names a built-in rule or the `all` group.
+pub fn rule_is_known(code: str) -> bool {
+    ret code == "all" || code == "missing-module-docstring" || code == "missing-public-docstring"
+}
+
+impl for AnalyzerConfig {
+    /// Creates a configuration with the standard docstring rules enabled as warnings.
+    pub fn new() -> Self {
+        let mut settings = Vec[RuleSetting]::new()
+        settings.push(RuleSetting{"missing-module-docstring", RuleLevel::Warn})
+        settings.push(RuleSetting{"missing-public-docstring", RuleLevel::Warn})
+        ret Self{settings}
+    }
+
+    /// Overrides the level of a named rule or all known rules.
+    pub fn set_level(self: mut Self, code: str, level: RuleLevel) -> () {
+        if code == "all" {
+            let mut updated = Vec[RuleSetting]::new()
+            for setting in self.settings { updated.push(RuleSetting{setting.code, level}) }
+            self.settings = updated
+            ret ()
+        }
+        let mut updated = Vec[RuleSetting]::new()
+        let mut replaced = false
+        for setting in self.settings {
+            if setting.code == code { updated.push(RuleSetting{code, level}) replaced = true }
+            else { updated.push(setting) }
+        }
+        if !replaced { updated.push(RuleSetting{code, level}) }
+        self.settings = updated
+        ret ()
+    }
+
+    /// Returns the configured level, disabling unknown rules.
+    pub fn level(self: Self, code: str) -> RuleLevel {
+        for setting in self.settings { if setting.code == code { ret setting.level } }
+        ret RuleLevel::Allow
+    }
+}
+
+/// Runs all enabled rules over an already parsed frontend document.
+pub fn analyze_document(path: str, document: FrontendDocument, config: AnalyzerConfig) -> Vec[AnalyzerDiagnostic] {
+    let mut out = Vec[AnalyzerDiagnostic]::new()
+    emit_module_docstring(path, document, config, out)
+    emit_public_docstrings(path, document, config, out)
+    ret out
+}
+
+/// Converts analyzer findings for consumers that use frontend diagnostics.
+pub fn analyzer_frontend_diagnostics(diagnostics: Vec[AnalyzerDiagnostic]) -> Vec[FrontendDiagnostic] {
+    let mut out = Vec[FrontendDiagnostic]::new()
+    for diagnostic in diagnostics {
+        let severity = match diagnostic.severity { RuleLevel::Allow => 3_usize RuleLevel::Warn => 2_usize RuleLevel::Deny => 1_usize }
+        if diagnostic.severity != RuleLevel::Allow {
+            out.push(FrontendDiagnostic::new(severity, diagnostic.code, diagnostic.message, diagnostic.line, diagnostic.column, diagnostic.length))
+        }
+    }
+    ret out
+}
+
+fn emit_module_docstring(path: str, document: FrontendDocument, config: AnalyzerConfig, out: mut Vec[AnalyzerDiagnostic]) -> () {
+    let level = config.level("missing-module-docstring")
+    if level == RuleLevel::Allow { ret () }
+    match document.module_documentation {
+        Option[Documentation]::Some(doc) => { if doc.text != "" { ret () } }
+        Option[Documentation]::None => {}
+    }
+    let location = first_location(document.tokens)
+    out.push(AnalyzerDiagnostic{path, level, "missing-module-docstring", "module has no //! documentation", location.0, location.1, location.2})
+    ret ()
+}
+
+fn emit_public_docstrings(path: str, document: FrontendDocument, config: AnalyzerConfig, out: mut Vec[AnalyzerDiagnostic]) -> () {
+    let level = config.level("missing-public-docstring")
+    if level == RuleLevel::Allow { ret () }
+    for statement in document.ast {
+        match statement {
+            Statement::Function(item) => {
+                if item.is_public && !has_documentation(item.documentation) { push_missing(path, level, "function", item.name, item.line, item.column, item.name.len(), out) }
+            }
+            Statement::Import(item) => {
+                if item.is_public && !has_documentation(item.documentation) {
+                    let location = named_location(document.tokens, item.path, TokenType::KW_IMPORT)
+                    push_missing(path, level, "public import", item.path, location.0, location.1, location.2, out)
+                }
+            }
+            Statement::Struct(item) => {
+                if item.is_public {
+                    let location = named_location(document.tokens, item.name, TokenType::KW_STRUCT)
+                    if !has_documentation(item.documentation) { push_missing(path, level, "struct", item.name, location.0, location.1, location.2, out) }
+                    for field in item.named_fields {
+                        if !has_documentation(field.documentation) {
+                            let field_location = named_location(document.tokens, field.name, TokenType::IDENTIFIER)
+                            push_missing(path, level, "field", field.name, field_location.0, field_location.1, field_location.2, out)
+                        }
+                    }
+                }
+            }
+            Statement::EnumItem(item) => {
+                if item.is_public {
+                    let location = named_location(document.tokens, item.name, TokenType::KW_ENUM)
+                    if !has_documentation(item.documentation) { push_missing(path, level, "enum", item.name, location.0, location.1, location.2, out) }
+                    for variant in item.variants {
+                        if !has_documentation(variant.documentation) {
+                            let variant_location = named_location(document.tokens, variant.name, TokenType::IDENTIFIER)
+                            push_missing(path, level, "enum variant", variant.name, variant_location.0, variant_location.1, variant_location.2, out)
+                        }
+                        for field in variant.named_fields {
+                            if !has_documentation(field.documentation) {
+                                let field_location = named_location(document.tokens, field.name, TokenType::IDENTIFIER)
+                                push_missing(path, level, "variant field", field.name, field_location.0, field_location.1, field_location.2, out)
+                            }
+                        }
+                    }
+                }
+            }
+            Statement::Trait(item) => {
+                if item.is_public {
+                    if !has_documentation(item.documentation) { push_missing(path, level, "trait", item.name, item.line, item.column, item.name.len(), out) }
+                    for method in item.methods {
+                        if !has_documentation(method.documentation) { push_missing(path, level, "trait method", method.name, method.line, method.column, method.name.len(), out) }
+                    }
+                }
+            }
+            Statement::Impl(item) => {
+                for method in item.methods {
+                    if method.is_public && !has_documentation(method.documentation) { push_missing(path, level, "method", method.name, method.line, method.column, method.name.len(), out) }
+                }
+            }
+            _ => {}
+        }
+    }
+    ret ()
+}
+
+fn has_documentation(documentation: Option[Documentation]) -> bool {
+    ret match documentation { Option[Documentation]::Some(doc) => doc.text != "" Option[Documentation]::None => false }
+}
+
+fn push_missing(path: str, level: RuleLevel, kind: str, name: str, line: usize, column: usize, length: usize, out: mut Vec[AnalyzerDiagnostic]) -> () {
+    out.push(AnalyzerDiagnostic{path, level, "missing-public-docstring", "public " + kind + " '" + name + "' has no /// documentation", line, column, length})
+    ret ()
+}
+
+fn first_location(tokens: Vec[Token]) -> (usize, usize, usize) {
+    match tokens.get(0_usize) { Option[Token]::Some(token) => { ret (token.line, token.column, token.value.len()) } Option[Token]::None => {} }
+    ret (0_usize, 0_usize, 1_usize)
+}
+
+fn named_location(tokens: Vec[Token], name: str, fallback: TokenType) -> (usize, usize, usize) {
+    for token in tokens { if token.value == name { ret (token.line, token.column, token.value.len()) } }
+    for token in tokens { if token.type == fallback { ret (token.line, token.column, token.value.len()) } }
+    ret first_location(tokens)
+}

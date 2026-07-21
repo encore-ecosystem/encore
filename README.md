@@ -46,6 +46,7 @@ encore init --name hello
 encore build --profile release
 encore run -- arg1 arg2
 encore test
+encore analyze
 encore add <package>
 encore sync
 encore install --path .

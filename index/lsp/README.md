@@ -11,6 +11,8 @@ Current server capabilities:
 - `textDocument/definition` and `textDocument/declaration` for symbols in open documents, indexed workspace files and resolved workspace imports.
 - `textDocument/implementation` for `impl Type` / `impl Trait` symbols in open documents and indexed workspace files.
 - `textDocument/hover` for identifiers and declarations from open documents, indexed workspace files and resolved workspace imports.
+- Markdown hover includes structured `///` documentation for local and imported
+  declarations.
 - `textDocument/signatureHelp` for function calls in open documents and indexed workspace files.
 - `textDocument/references` across open documents and indexed workspace files, using workspace import resolution for top-level symbols.
 - `textDocument/documentHighlight` for same-document identifiers.
@@ -23,8 +25,13 @@ Current server capabilities:
 - `textDocument/selectionRange` for identifier selections.
 - `textDocument/semanticTokens/full` for lexical semantic highlighting.
 - `textDocument/formatting` and `textDocument/rangeFormatting` for trailing whitespace cleanup.
-- Push and per-document pull diagnostics for lexer, structural and basic semantic errors, including unresolved imports, unresolved calls, unknown types and call arity mismatches.
+- Push and per-document pull diagnostics for lexer, structural and basic semantic errors, including unresolved imports, unresolved calls, unknown types and call arity mismatches. The native docstring analyzer also reports `missing-module-docstring` and `missing-public-docstring` warnings.
 - `textDocument/prepareCallHierarchy`, `callHierarchy/outgoingCalls`, `callHierarchy/incomingCalls` for callable symbols.
+
+Document analysis is stored in the shared frontend `AnalysisDatabase`. Source
+updates carry revisions and invalidate modules that depend on the changed
+module; the LSP requests the tolerant lightweight view needed while code is
+temporarily incomplete.
 
 ## Source Layout
 
@@ -46,9 +53,11 @@ absolute path to `target/release/lsp`; no Python runtime or wrapper process is
 required. LSP positions and ranges use UTF-16 as required by the protocol, and
 message `Content-Length` is measured in UTF-8 bytes.
 
-Run the protocol and feature integration suites with:
+Run the protocol and feature integration suites with Python 3:
 
 ```sh
-ruby tests/protocol.rb target/release/lsp
-ruby tests/integration.rb target/release/lsp
+python3 tests/docstrings.py target/debug/lsp
 ```
+
+The integration tests use only the Python standard library. If future tests
+gain Python dependencies, run and lock them with `uv`.

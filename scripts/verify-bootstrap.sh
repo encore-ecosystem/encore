@@ -3,7 +3,18 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+profile_dir=""
+cleanup() {
+    if [ -n "$profile_dir" ] && [ ! -e "$profile_dir" ]; then
+        if [ -d "$tmp/original-profile" ]; then
+            mv "$tmp/original-profile" "$profile_dir"
+        elif [ -d "$tmp/stage3-profile" ]; then
+            mv "$tmp/stage3-profile" "$profile_dir"
+        fi
+    fi
+    rm -rf "$tmp"
+}
+trap cleanup EXIT HUP INT TERM
 
 if [ "$#" -gt 1 ]; then
     echo "usage: verify-bootstrap.sh [stage0-compiler]" >&2
@@ -19,7 +30,10 @@ fi
 chmod +x "$tmp/stage0"
 
 target=x86_64-unknown-linux-gnu
-runtime_sources="$repo_root/index/core/runtime.c $repo_root/index/ehir-llvm-backend/runtime.c $repo_root/index/rich/runtime.c"
+profile=${ENCORE_BOOTSTRAP_PROFILE:-extreme}
+profile_dir="$repo_root/target/$target/$profile"
+runtime_sources="$repo_root/runtime.c $repo_root/index/core/runtime.c $repo_root/index/ehir-llvm-backend/runtime.c $repo_root/index/rich/runtime.c"
+if [ -d "$profile_dir" ]; then mv "$profile_dir" "$tmp/original-profile"; fi
 
 stage=1
 while [ "$stage" -le 3 ]; do
@@ -27,12 +41,13 @@ while [ "$stage" -le 3 ]; do
     (
         cd "$repo_root"
         ENCORE_CORE_DIR="$repo_root/index/core" "$tmp/stage$previous" \
-            build --profile debug --target "$target" --emit llvm-ir
+            build --profile "$profile" --target "$target" --emit llvm-ir
     )
-    cp "$repo_root/target/$target/debug/encore.ll" "$tmp/stage$stage.ll"
+    cp "$profile_dir/encore.ll" "$tmp/stage$stage.ll"
+    mv "$profile_dir" "$tmp/stage$stage-profile"
     if [ "$stage" -lt 3 ]; then
         # shellcheck disable=SC2086
-        clang -O0 -w "$tmp/stage$stage.ll" $runtime_sources -o "$tmp/stage$stage"
+        clang -O3 -w "$tmp/stage$stage.ll" $runtime_sources -o "$tmp/stage$stage"
     fi
     stage=$((stage + 1))
 done

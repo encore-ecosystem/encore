@@ -7,7 +7,9 @@ import encore::frontend::FrontendDocument
 import encore::frontend::FrontendSymbol
 import encore::frontend::DependencyEdge
 import encore::frontend::FrontendCallable
+import encore::frontend::AnalysisDatabase
 import encore::frontend::analyze_source_lightweight
+import encore::analyzer::{AnalyzerConfig, analyze_document, analyzer_frontend_diagnostics}
 import encore::frontend::Token
 import encore::frontend::TokenType
 import json::Json
@@ -116,6 +118,7 @@ struct TypeDiagnosticResolution {
 struct ServerState {
     initialized: bool
     shutdown_requested: bool
+    analysis: AnalysisDatabase
     documents: Vec[Document]
     workspace_roots: Vec[str]
     discovered_workspace_roots: Vec[str]
@@ -135,6 +138,7 @@ impl for ServerState {
         ret Self {
             false,
             false,
+            AnalysisDatabase::new(),
             Vec[Document]::new(),
             Vec[str]::new(),
             Vec[str]::new(),
@@ -145,12 +149,13 @@ impl for ServerState {
     }
 
     fn upsert_document(self: mut Self, uri: str, text: str) -> () {
+        let analyzed = self.analyze_document(uri, text)
         let mut index = 0_usize
         while index < self.documents.len() {
             match self.documents.get(index) {
                 Option[Document]::Some(doc) => {
                     if doc.uri == uri {
-                        self.documents.set(index, Document::new(uri, text))
+                        self.documents.set(index, Document{uri, text, analyzed})
                         ret ()
                     }
                 }
@@ -158,7 +163,7 @@ impl for ServerState {
             }
             index += 1_usize
         }
-        self.documents.push(Document::new(uri, text))
+        self.documents.push(Document{uri, text, analyzed})
         ret ()
     }
 
@@ -229,12 +234,13 @@ impl for ServerState {
     }
 
     fn upsert_workspace_document(self: mut Self, uri: str, text: str) -> () {
+        let analyzed = self.analyze_document(uri, text)
         let mut index = 0_usize
         while index < self.workspace_documents.len() {
             match self.workspace_documents.get(index) {
                 Option[Document]::Some(doc) => {
                     if doc.uri == uri {
-                        self.workspace_documents.set(index, Document::new(uri, text))
+                        self.workspace_documents.set(index, Document{uri, text, analyzed})
                         ret ()
                     }
                 }
@@ -242,7 +248,7 @@ impl for ServerState {
             }
             index += 1_usize
         }
-        self.workspace_documents.push(Document::new(uri, text))
+        self.workspace_documents.push(Document{uri, text, analyzed})
         ret ()
     }
 
@@ -271,7 +277,13 @@ impl for ServerState {
             match self.workspace_documents.get(index) {
                 Option[Document]::Some(doc) => {
                     if doc.uri == uri {
-                        self.workspace_documents.set(index, Document::new(uri, text))
+                        match self.document(uri) {
+                            Option[Document]::Some(current) => { self.workspace_documents.set(index, current) }
+                            Option[Document]::None => {
+                                let analyzed = self.analyze_document(uri, text)
+                                self.workspace_documents.set(index, Document{uri, text, analyzed})
+                            }
+                        }
                         ret ()
                     }
                 }
@@ -280,6 +292,15 @@ impl for ServerState {
             index += 1_usize
         }
         ret ()
+    }
+
+    fn analyze_document(self: mut Self, uri: str, text: str) -> FrontendDocument {
+        let module_name = analysis_module_name(self, uri)
+        self.analysis.set_module(module_name, uri_to_path(uri), text)
+        match self.analysis.document_lightweight(module_name) {
+            Option[FrontendDocument]::Some(document) => { ret document }
+            Option[FrontendDocument]::None => { ret FrontendDocument::empty() }
+        }
     }
 }
 
@@ -1437,7 +1458,7 @@ fn hover_result(state: ServerState, params: Json) -> Json {
                     }
 
                     let mut contents = Vec[(str, Json)]::new()
-                    contents.push(field("kind", Json::String("plaintext")))
+                    contents.push(field("kind", Json::String("markdown")))
                     contents.push(field("value", Json::String(value)))
 
                     let mut result = Vec[(str, Json)]::new()
@@ -2569,6 +2590,16 @@ fn module_ref_for_uri(state: ServerState, uri: str) -> Option[ModuleRef] {
     }
     let module_name = module_name_from_relative_path(relative)
     ret Option[ModuleRef]::Some(ModuleRef{matched_root, matched_name, source_dir, module_name, uri, path})
+}
+
+fn analysis_module_name(state: ServerState, uri: str) -> str {
+    match module_ref_for_uri(state, uri) {
+        Option[ModuleRef]::Some(module) => {
+            if module.module_name == "" { ret module.project_name }
+            ret module.project_name + "::" + module.module_name
+        }
+        Option[ModuleRef]::None => { ret uri }
+    }
 }
 
 fn module_name_from_relative_path(relative: str) -> str {
@@ -3907,19 +3938,27 @@ fn token_cursor_index(doc: Document, line: usize, character: usize) -> usize {
 }
 
 fn symbol_hover_text(symbol: FrontendSymbol) -> str {
+    let mut signature = symbol.name
     if symbol.kind == 12_usize {
-        ret "fn " + symbol.name
+        signature = "fn " + symbol.name
     }
-    if symbol.kind == 23_usize {
-        ret "struct " + symbol.name
+    elif symbol.kind == 23_usize {
+        signature = "struct " + symbol.name
     }
-    if symbol.kind == 10_usize {
-        ret "enum " + symbol.name
+    elif symbol.kind == 10_usize {
+        signature = "enum " + symbol.name
     }
-    if symbol.kind == 11_usize {
-        ret "trait " + symbol.name
+    elif symbol.kind == 11_usize {
+        signature = "trait " + symbol.name
     }
-    ret symbol.name
+    let mut hover = "```encore\n" + signature + "\n```"
+    match symbol.documentation {
+        Option::Some(documentation) => {
+            if documentation.text != "" { hover = hover + "\n\n" + documentation.text }
+        }
+        Option::None => {}
+    }
+    ret hover
 }
 
 fn symbol_range(doc: Document, symbol: FrontendSymbol) -> Json {
@@ -4070,6 +4109,8 @@ fn symbol_completion_kind(symbol_kind: usize) -> usize {
 
 fn document_diagnostics_json(state: ServerState, doc: Document) -> Vec[Json] {
     let mut items = diagnostics_to_lsp(doc, doc.analysis.diagnostics)
+    let analyzer_diagnostics = analyzer_frontend_diagnostics(analyze_document(doc.uri, doc.analysis, AnalyzerConfig::new()))
+    items.extend(diagnostics_to_lsp(doc, analyzer_diagnostics))
     let semantic = semantic_diagnostics(state, doc)
     let mut index = 0_usize
     while index < semantic.len() {

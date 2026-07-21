@@ -95,10 +95,13 @@ import refrain::core::fn_directive
 import refrain::core::extern_fn_directive
 import refrain::core::make_module
 import refrain::core::make_module_with_imports
+import refrain::core::make_module_with_metadata
 import refrain::core::make_module_bundle
 import refrain::core::ehir_import
 import refrain::core::EhirImport
 import refrain::core::ModuleBundle
+import refrain::core::EhirDocumentation
+import refrain::core::ehir_documentation
 import refrain::core::fn_item
 import refrain::core::plain_type
 import refrain::core::EnumVariant
@@ -630,11 +633,24 @@ fn resolve_terminator_types(terminator: Terminator, known: Vec[Parameter]) -> Te
 pub fn parse_module_text(name: str, source: str) -> Module {
     let lines = split_lines_text(source)
     let mut imports = Vec[EhirImport]::new()
+    let mut documentation = Option[str]::None
+    let mut symbol_documentation = Vec[EhirDocumentation]::new()
+    let mut pending_documentation = Option[str]::None
     let mut directives = Vec[Directive]::new()
     let mut index = 0_usize
     while index < lines.len() {
         let line = trim_text(required_part(lines, index))
         if line.len() == 0_usize {
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "//!") {
+            documentation = Option[str]::Some(append_documentation_line(documentation, documentation_comment_text(line)))
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "///") {
+            pending_documentation = Option[str]::Some(append_documentation_line(pending_documentation, documentation_comment_text(line)))
             index = index + 1_usize
             continue
         }
@@ -646,7 +662,9 @@ pub fn parse_module_text(name: str, source: str) -> Module {
             continue
         }
         if starts_with_text(line, "extern fn ") {
-            directives.push(Directive::Function(parse_function_text(line)))
+            let directive = Directive::Function(parse_function_text(line))
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
             index = index + 1_usize
             continue
         }
@@ -659,36 +677,84 @@ pub fn parse_module_text(name: str, source: str) -> Module {
                 depth = depth + brace_delta(body_line)
                 index = index + 1_usize
             }
-            directives.push(Directive::Function(parse_function_text(join_line_range(lines, start, index))))
+            let directive = Directive::Function(parse_function_text(join_line_range(lines, start, index)))
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
             continue
         }
         if starts_with_text(line, "struct ") {
             let chunk = collect_braced_text(lines, index)
-            directives.push(parse_struct_text(chunk.text))
+            let directive = parse_struct_text(chunk.text)
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
             index = chunk.next_index
             continue
         }
         if starts_with_text(line, "enum ") {
             let chunk = collect_braced_text(lines, index)
-            directives.push(parse_enum_text(chunk.text))
+            let directive = parse_enum_text(chunk.text)
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
             index = chunk.next_index
             continue
         }
         if starts_with_text(line, "trait ") {
             let chunk = collect_braced_text(lines, index)
-            directives.push(parse_trait_text(chunk.text))
+            let directive = parse_trait_text(chunk.text)
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
             index = chunk.next_index
             continue
         }
         if starts_with_text(line, "impl") {
             let chunk = collect_braced_text(lines, index)
-            directives.push(parse_impl_text(chunk.text))
+            let directive = parse_impl_text(chunk.text)
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
             index = chunk.next_index
             continue
         }
         panic("Unsupported top-level EHIR directive: " + line)
     }
-    ret make_module_with_imports(name, imports, directives)
+    ret make_module_with_metadata(name, imports, documentation, symbol_documentation, directives)
+}
+
+fn documentation_comment_text(line: str) -> str {
+    if line.len() <= 3_usize { ret "" }
+    let mut text = line.slice(3_usize, line.len() - 3_usize)
+    if starts_with_text(text, " ") { text = text.slice(1_usize, text.len() - 1_usize) }
+    ret text
+}
+
+fn append_documentation_line(current: Option[str], line: str) -> str {
+    match current {
+        Option[str]::Some(text) => { ret text + "\n" + line }
+        Option[str]::None => { ret line }
+    }
+}
+
+fn push_documented_directive(
+    directives: mut Vec[Directive],
+    documentation: mut Vec[EhirDocumentation],
+    directive: Directive,
+    pending: Option[str]
+) -> () {
+    match pending {
+        Option[str]::Some(text) => { documentation.push(ehir_documentation(directive_name(directive), text)) }
+        Option[str]::None => {}
+    }
+    directives.push(directive)
+    ret ()
+}
+
+fn directive_name(directive: Directive) -> str {
+    match directive {
+        Directive::Struct(item) => { ret item.name }
+        Directive::Enum(item) => { ret item.name }
+        Directive::Function(item) => { ret item.name }
+        Directive::Trait(item) => { ret item.name }
+        Directive::Impl(item) => { ret "impl " + item.for_type.name }
+    }
 }
 
 pub fn parse_module_bundle_text(entry_module: str, source: str) -> ModuleBundle {
@@ -737,6 +803,7 @@ pub fn parse_trait_text(source: str) -> Directive {
         let line = trim_text(required_part(lines, index))
         index = index + 1_usize
         if line.len() == 0_usize || line == "}" { continue }
+        if starts_with_text(line, "///") { continue }
         methods.push(parse_trait_method_text(line))
     }
     ret trait_directive(declaration.name, declaration.generics, methods)
@@ -778,6 +845,10 @@ pub fn parse_impl_text(source: str) -> Directive {
     while index < lines.len() {
         let line = trim_text(required_part(lines, index))
         if line.len() == 0_usize || line == "}" {
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "///") {
             index = index + 1_usize
             continue
         }

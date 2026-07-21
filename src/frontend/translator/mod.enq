@@ -1,3 +1,5 @@
+//! Translates the Encore syntax tree into EHIR.
+
 import core::option::Option
 import core::fmt::Debug
 import core::process::exit
@@ -8,6 +10,7 @@ import refrain::frontend::parser::statements::EnumStmt
 import refrain::frontend::parser::statements::Expr
 import refrain::frontend::parser::statements::ExprNode
 import refrain::frontend::parser::statements::FunctionItem
+import refrain::frontend::parser::statements::Documentation
 import refrain::frontend::parser::statements::FunctionParam
 import refrain::frontend::parser::statements::GenericParam
 import refrain::frontend::parser::statements::IfBranch
@@ -98,17 +101,25 @@ struct FunctionType {
     output_type: str
 }
 
+/// Supplies one resolved source module to EHIR translation.
 pub struct TranslationModule {
     module_id: str
     source_name: str
+    documentation: Option[Documentation]
     imports: Vec[str]
     ast: Vec[Statement]
     features: Vec[str]
 }
 
 impl for TranslationModule {
+    /// Creates a translation module without module documentation.
     pub fn new(module_id: str, source_name: str, imports: Vec[str], ast: Vec[Statement], features: Vec[str]) -> TranslationModule {
-        ret TranslationModule{module_id, source_name, imports, ast, features}
+        ret TranslationModule{module_id, source_name, Option[Documentation]::None, imports, ast, features}
+    }
+
+    /// Creates a translation module with structured module documentation.
+    pub fn new_documented(module_id: str, source_name: str, documentation: Option[Documentation], imports: Vec[str], ast: Vec[Statement], features: Vec[str]) -> TranslationModule {
+        ret TranslationModule{module_id, source_name, documentation, imports, ast, features}
     }
 }
 
@@ -191,6 +202,7 @@ struct TranslatorContext {
     async_poll_future_type: str
 }
 
+/// Removes declarations disabled by target and feature configuration.
 pub fn filter_ast_for_target(ast: Vec[Statement], target: TargetSpec, features: Vec[str]) -> Vec[Statement] {
     let mut out = Vec[Statement]::new()
     for statement in ast {
@@ -203,14 +215,14 @@ pub fn filter_ast_for_target(ast: Vec[Statement], target: TargetSpec, features: 
                 for method in item.methods {
                     if function_is_active(method, target, features) { methods.push(without_cfg_attrs(method)) }
                 }
-                out.push(Statement::Impl(ImplStmt{item.generics, item.trait_name, item.trait_args, item.target, methods, item.source_name, item.line, item.column}))
+                out.push(Statement::Impl(ImplStmt{item.documentation, item.generics, item.trait_name, item.trait_args, item.target, methods, item.source_name, item.line, item.column}))
             }
             Statement::Trait(item) => {
                 let mut methods = Vec[FunctionItem]::new()
                 for method in item.methods {
                     if function_is_active(method, target, features) { methods.push(without_cfg_attrs(method)) }
                 }
-                out.push(Statement::Trait(TraitStmt{item.is_public, item.name, item.generics, item.bases, methods, item.source_name, item.line, item.column}))
+                out.push(Statement::Trait(TraitStmt{item.is_public, item.name, item.documentation, item.generics, item.bases, methods, item.source_name, item.line, item.column}))
             }
             _ => { out.push(statement) }
         }
@@ -221,27 +233,32 @@ pub fn filter_ast_for_target(ast: Vec[Statement], target: TargetSpec, features: 
 fn without_cfg_attrs(item: FunctionItem) -> FunctionItem {
     let mut attrs = Vec[str]::new()
     for attr in item.attrs { if !starts_with(attr, "cfg:") { attrs.push(attr) } }
-    ret FunctionItem{attrs, item.is_public, item.is_extern, item.is_async, item.name, item.generics, item.params, item.ret_type, item.body, item.source_name, item.line, item.column}
+    ret FunctionItem{attrs, item.is_public, item.is_extern, item.is_async, item.name, item.documentation, item.generics, item.params, item.ret_type, item.body, item.source_name, item.line, item.column}
 }
 
+/// Translates a flat AST to EHIR for the host target.
 pub fn translate_to_ehir(ast: Vec[Statement]) -> str {
     ret translate_to_ehir_for_target(ast, host_target())
 }
 
+/// Translates a flat AST to EHIR for an explicit target.
 pub fn translate_to_ehir_for_target(ast: Vec[Statement], target: TargetSpec) -> str {
     ret translate_to_ehir_for_target_and_features(ast, target, Vec[str]::new())
 }
 
+/// Translates a flat AST using an explicit target and enabled features.
 pub fn translate_to_ehir_for_target_and_features(ast: Vec[Statement], target: TargetSpec, features: Vec[str]) -> str {
     ret translate_ast_to_ehir(ast, Vec[TranslationModule]::new(), target, features)
 }
 
+/// Translates resolved modules into one flattened EHIR program.
 pub fn translate_modules_to_ehir(modules: Vec[TranslationModule], target: TargetSpec) -> str {
     let mut ast = Vec[Statement]::new()
     for module in modules { ast.extend(module.ast) }
     ret translate_ast_to_ehir(ast, modules, target, Vec[str]::new())
 }
 
+/// Translates resolved modules into a virtual EHIR module bundle.
 pub fn translate_modules_to_ehir_bundle(modules: Vec[TranslationModule], target: TargetSpec, entry_module: str) -> str {
     let mut ast = Vec[Statement]::new()
     for module in modules { ast.extend(module.ast) }
@@ -251,6 +268,7 @@ pub fn translate_modules_to_ehir_bundle(modules: Vec[TranslationModule], target:
     bundle = bundle.empty_line()
     for module in modules {
         bundle = bundle.line("module " + module.module_id + " {")
+        bundle = append_ehir_documentation(bundle, module.documentation, "//!")
         for imported in module.imports { bundle = bundle.line("import " + imported) }
         if module.imports.len() > 0_usize { bundle = bundle.empty_line() }
         bundle = bundle.append(translate_ast_with_context(ctx, module.ast, target, module.features))
@@ -1618,6 +1636,7 @@ fn last_scope_index(value: str) -> usize {
 
 fn translate_struct(item: StructStmt) -> EhirTextBuilder {
     let mut builder = EhirTextBuilder::new()
+    builder = append_ehir_documentation(builder, item.documentation, "///")
     let mut header = "struct " + item.name
     if item.generics.len() > 0_usize {
         header = header + "[" + translate_generic_params(item.generics) + "]"
@@ -1641,6 +1660,7 @@ fn translate_struct(item: StructStmt) -> EhirTextBuilder {
 
 fn translate_enum(item: EnumStmt) -> EhirTextBuilder {
     let mut builder = EhirTextBuilder::new()
+    builder = append_ehir_documentation(builder, item.documentation, "///")
     let mut header = "enum " + item.name
     if item.generics.len() > 0_usize {
         header = header + "[" + translate_generic_params(item.generics) + "]"
@@ -1671,6 +1691,7 @@ fn translate_enum(item: EnumStmt) -> EhirTextBuilder {
 
 fn translate_trait(ctx: mut TranslatorContext, item: TraitStmt) -> EhirTextBuilder {
     let mut builder = EhirTextBuilder::new()
+    builder = append_ehir_documentation(builder, item.documentation, "///")
     let mut header = "trait " + item.name
     if item.generics.len() > 0_usize {
         header = header + "[" + translate_generic_params(item.generics) + "]"
@@ -1746,6 +1767,7 @@ fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, e
     }
 
     let mut builder = EhirTextBuilder::new()
+    builder = append_ehir_documentation(builder, fn_item.documentation, "///")
     let mut header = if fn_item.is_extern { "extern fn " + emitted_name } else { "fn " + emitted_name }
     if fn_item.is_async { header = "async fn " + emitted_name }
     if fn_item.generics.len() > 0_usize {
@@ -1824,6 +1846,7 @@ fn owner_context_type(owner: str, typ: str) -> str {
 fn translate_impl(ctx: mut TranslatorContext, item: ImplStmt) -> EhirTextBuilder {
     validate_trait_impl(ctx, item)
     let mut builder = EhirTextBuilder::new()
+    builder = append_ehir_documentation(builder, item.documentation, "///")
     let mut header = "impl"
     if item.generics.len() > 0_usize {
         header = header + "[" + translate_generic_params(item.generics) + "]"
@@ -5645,6 +5668,36 @@ fn starts_with(value: str, prefix: str) -> bool {
     ret value.slice(0_usize, prefix.len()) == prefix
 }
 
+fn append_ehir_documentation(builder: EhirTextBuilder, documentation: Option[Documentation], prefix: str) -> EhirTextBuilder {
+    let mut out = builder
+    match documentation {
+        Option[Documentation]::Some(doc) => {
+            let mut line = prefix
+            let mut has_text = false
+            let mut index = 0_usize
+            while index < doc.text.char_len() {
+                match doc.text.get(index) {
+                    Option[str]::Some(ch) => {
+                        if ch == "\n" {
+                            out = out.line(line)
+                            line = prefix
+                            has_text = false
+                        } else {
+                            if !has_text { line = line + " " has_text = true }
+                            line = line + ch
+                        }
+                    }
+                    Option[str]::None => { break }
+                }
+                index += 1_usize
+            }
+            out = out.line(line)
+        }
+        Option[Documentation]::None => {}
+    }
+    ret out
+}
+
 fn contains_substring(value: str, needle: str) -> bool {
     if needle.len() == 0_usize {
         ret true
@@ -5781,8 +5834,8 @@ fn nested_generic_module_dispatch_contract() -> bool {
     let mut imports_b = Vec[str]::new()
     imports_b.push("collections")
     let mut modules = Vec[TranslationModule]::new()
-    modules.push(TranslationModule{"collections", "collections.enq", imports_a, ast_a, Vec[str]::new()})
-    modules.push(TranslationModule{"consumer", "consumer.enq", imports_b, ast_b, Vec[str]::new()})
+    modules.push(TranslationModule{"collections", "collections.enq", Option[Documentation]::None, imports_a, ast_a, Vec[str]::new()})
+    modules.push(TranslationModule{"consumer", "consumer.enq", Option[Documentation]::None, imports_b, ast_b, Vec[str]::new()})
     let output = translate_modules_to_ehir(modules, host_target())
     let collections = "__encore_m636f6c6c656374696f6e73__"
     ret output.contains("fn " + collections + "append[T](left: Vec[T], right: Vec[T]) -> Vec[T]") &&

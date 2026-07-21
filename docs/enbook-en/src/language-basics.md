@@ -46,6 +46,53 @@ explicit bounds, import the trait as well as the type:
 import std::dict::{Dict, Hashable}
 ```
 
+## Documentation Comments
+
+Use `//!` at the beginning of a source file to document its module. Use `///`
+immediately before a declaration to document that declaration:
+
+```enq
+//! Synchronous and asynchronous networking primitives.
+
+/// Opens a connection to an endpoint.
+///
+/// # Errors
+/// Returns an error when the endpoint cannot be reached.
+pub fn connect(endpoint: Endpoint) -> Result[Connection, IoError] {
+    // ...
+}
+```
+
+Consecutive documentation comments are joined with newlines. An empty `///`
+line starts a new paragraph. Declaration documentation is available to the
+compiler analysis API, EHIR module metadata and language-server hover,
+including hover for symbols reached through imports. Ordinary `//` and
+`/* ... */` comments are not documentation.
+
+Run the shared analyzer without compiling the project:
+
+```sh
+encore analyze
+encore analyze src/net/mod.enq
+encore analyze --deny missing-public-docstring
+encore analyze --format json
+```
+
+Analyzer rules default to warnings. Configure persistent levels in
+`encore.toml`; command-line levels take precedence:
+
+```toml
+[analyzer.rules]
+all = "warn"
+missing-module-docstring = "allow"
+missing-public-docstring = "deny"
+```
+
+`allow` disables a rule, `warn` reports it without failing the command, and
+`deny` reports an error and makes `encore analyze` return exit status 1. The
+same analyzer engine supplies LSP diagnostics, so rule behavior does not
+diverge between the command line and editors.
+
 ## Values And Mutability
 
 Use `let` for immutable bindings and `let mut` for mutable bindings:
