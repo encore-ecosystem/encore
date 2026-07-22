@@ -228,14 +228,30 @@ MSYS2_ARG_CONV_EXCL='/CN=' "$openssl_bin" req -newkey rsa:2048 -nodes -subj "/CN
 "$openssl_bin" x509 -req -in "$temporary/tls/server.csr" -CA "$temporary/tls/ca.pem" \
     -CAkey "$temporary/tls/ca.key" -CAcreateserial -days 1 -extfile "$temporary/tls/extensions.cnf" \
     -out "$temporary/tls/server.pem" >/dev/null 2>&1
-port=$((25000 + ($$ % 25000)))
+port=$((25000 + ($$ % 24000)))
+server_log="$temporary/tls/server.log"
+server_started=false
+for offset in 0 1 2 3 4 5 6 7 8 9; do
+    candidate_port=$((port + offset))
+    (cd "$mirror" && exec "$openssl_bin" s_server -quiet -WWW -accept "$candidate_port" \
+        -cert "$temporary/tls/server.pem" -key "$temporary/tls/server.key" </dev/null >"$server_log" 2>&1) &
+    server_pid=$!
+    sleep 1
+    if kill -0 "$server_pid" 2>/dev/null; then
+        port=$candidate_port
+        server_started=true
+        break
+    fi
+    wait "$server_pid" 2>/dev/null || true
+    server_pid=
+done
+if [ "$server_started" != true ]; then
+    cat "$server_log" >&2
+    echo "unable to start the local HTTPS update server" >&2
+    exit 1
+fi
 archive_url="https://localhost:$port/$(basename -- "$archive")"
 write_manifest "$mirror/channels/stable.json" "$checksum" stable
-(cd "$mirror" && exec "$openssl_bin" s_server -quiet -WWW -accept "$port" \
-    -cert "$temporary/tls/server.pem" -key "$temporary/tls/server.key" </dev/null >/dev/null 2>&1) &
-server_pid=$!
-sleep 1
-kill -0 "$server_pid"
 native_ca="$temporary/tls/ca.pem"
 if [ "$os" = windows ]; then
     native_ca=$(native_path "$native_ca")
