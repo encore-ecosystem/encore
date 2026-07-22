@@ -50,10 +50,29 @@ encore analyze
 encore add <package>
 encore sync
 encore install --path .
+encore self update
+encore self channel beta
 encore target
 encore target list
 encore help build
 ```
+
+`encore self update` updates the complete managed compiler distribution while
+keeping `encore update` dedicated to project dependencies. Encore release
+channels are `stable`, `beta`, and `nightly`:
+
+```sh
+encore self channel              # show the selected channel
+encore self channel nightly      # persist a channel
+encore self update --check
+encore self update
+encore self install 0.2.0        # install an exact immutable release
+```
+
+Updates use the native HTTPS stack, verify the release SHA-256, validate the
+archive, and replace the installation transactionally. A failed update leaves
+the previous compiler usable. Set `ENCORE_SELF_UPDATE_BASE_URL` to an HTTPS
+release mirror; `file://` is accepted for offline testing.
 
 Build profiles have distinct optimization contracts:
 
@@ -116,7 +135,8 @@ With an existing native compiler at `target/extreme/encore`, run from the reposi
 
 Regular CI builds the native compiler and runs package tests on Linux and
 macOS. Tagged commits run the full self-host and release verification workflow,
-then publish Linux and macOS archives with checksums.
+then publish Linux, macOS, and Windows archives with checksums and channel
+manifests.
 
 Prepare a stable release version from a clean worktree with
 `scripts/set-version.sh MAJOR.MINOR.PATCH`. `VERSION` is canonical; CI verifies

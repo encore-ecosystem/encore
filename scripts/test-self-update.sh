@@ -1,0 +1,207 @@
+#!/usr/bin/env sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+    echo "usage: test-self-update.sh <encore-compiler>" >&2
+    exit 2
+fi
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+compiler=$(CDPATH= cd -- "$(dirname -- "$1")" && pwd)/$(basename -- "$1")
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/encore-self-update.XXXXXX")
+server_pid=
+cleanup() {
+    if [ -n "$server_pid" ]; then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+    fi
+    rm -rf "$temporary"
+}
+trap cleanup EXIT HUP INT TERM
+
+version=$($compiler --version | awk '{print $2}')
+case "$version" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) echo "compiler reported an invalid version: $version" >&2; exit 1 ;;
+esac
+
+case "$(uname -s)" in
+    Linux) os=linux ;;
+    Darwin) os=macos ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) os=windows ;;
+    *) echo "unsupported test operating system" >&2; exit 1 ;;
+esac
+case "$(uname -m)" in
+    x86_64|amd64) arch=x86_64 ;;
+    arm64|aarch64) arch=aarch64 ;;
+    *) echo "unsupported test architecture" >&2; exit 1 ;;
+esac
+case "$os" in
+    linux) triple="${arch}-unknown-linux-gnu"; executable=encore; format=tar.gz ;;
+    macos) triple="${arch}-apple-darwin"; executable=encore; format=tar.gz ;;
+    windows) triple="${arch}-pc-windows-msvc"; executable=encore.exe; format=zip ;;
+esac
+
+install_root="$temporary/install"
+mirror="$temporary/mirror"
+package_name="encore-${version}-${triple}"
+package_root="$temporary/package/$package_name"
+mkdir -p "$install_root/bin" "$install_root/lib" "$install_root/share" \
+    "$mirror/channels" "$mirror/versions" "$package_root/bin" \
+    "$package_root/lib/encore" "$package_root/share"
+cp "$compiler" "$install_root/bin/$executable"
+cp "$compiler" "$package_root/bin/$executable"
+chmod +x "$install_root/bin/$executable" "$package_root/bin/$executable" 2>/dev/null || true
+printf '%s\n' "$version" > "$install_root/VERSION"
+printf '%s\n' "$version" > "$package_root/VERSION"
+printf 'old\n' > "$install_root/share/update-marker"
+printf 'new\n' > "$package_root/share/update-marker"
+printf 'complete distribution\n' > "$package_root/lib/encore/update-marker"
+
+archive="$mirror/encore-${triple}.$format"
+if [ "$format" = zip ]; then
+    (cd "$temporary/package" && COPYFILE_DISABLE=1 tar -a -cf "$archive" "$package_name")
+else
+    (cd "$temporary/package" && COPYFILE_DISABLE=1 tar -czf "$archive" "$package_name")
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+    checksum=$(sha256sum "$archive" | awk '{print $1}')
+else
+    checksum=$(shasum -a 256 "$archive" | awk '{print $1}')
+fi
+
+archive_url="file://$archive"
+write_manifest() {
+    destination=$1
+    digest=$2
+    channel=$3
+    cat > "$destination" <<EOF
+{"schema":1,"channel":"$channel","version":"$version","tag":"v$version","commit":"test-commit","assets":[{"triple":"$triple","url":"$archive_url","sha256":"$digest","format":"$format"}]}
+EOF
+}
+write_manifest "$mirror/channels/stable.json" "$checksum" stable
+write_manifest "$mirror/channels/beta.json" "$checksum" beta
+write_manifest "$mirror/channels/nightly.json" "$checksum" nightly
+write_manifest "$mirror/versions/$version.json" "$checksum" stable
+
+installed="$install_root/bin/$executable"
+base="file://$mirror"
+
+wait_for_transaction() {
+    attempt=0
+    while [ "$attempt" -lt 200 ] && { [ -d "$temporary/.encore-update" ] || [ ! -x "$installed" ]; }; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    test ! -d "$temporary/.encore-update"
+    test -x "$installed"
+}
+
+ENCORE_HOME="$install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self channel > "$temporary/channel-default.log"
+grep -q '^stable$' "$temporary/channel-default.log"
+ENCORE_HOME="$install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self channel beta > "$temporary/channel-beta.log"
+grep -q 'Switched Encore update channel to beta' "$temporary/channel-beta.log"
+grep -q '^channel = "beta"$' "$install_root/settings.toml"
+ENCORE_HOME="$install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self channel stable > "$temporary/channel-stable.log"
+grep -q '^channel = "stable"$' "$install_root/settings.toml"
+
+ENCORE_HOME="$install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --check > "$temporary/check.log"
+grep -q "Encore $version is up to date on stable" "$temporary/check.log"
+ENCORE_HOME="$install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --channel beta --check > "$temporary/check-beta.log"
+grep -q "Encore $version is up to date on beta" "$temporary/check-beta.log"
+grep -q '^channel = "stable"$' "$install_root/settings.toml"
+test "$(cat "$install_root/share/update-marker")" = old
+
+ENCORE_HOME="$install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --force > "$temporary/update.log"
+attempt=0
+while [ "$attempt" -lt 100 ] && [ "$(cat "$install_root/share/update-marker" 2>/dev/null || true)" != new ]; do
+    sleep 0.1
+    attempt=$((attempt + 1))
+done
+wait_for_transaction
+test "$(cat "$install_root/share/update-marker")" = new
+test "$(cat "$install_root/lib/encore/update-marker")" = "complete distribution"
+grep -q '^channel = "stable"$' "$install_root/settings.toml"
+"$installed" --version | grep -q "^encore $version$"
+
+# Exercise the updater itself over verified HTTPS rather than relying only on
+# the lower-level HTTP client integration test.
+openssl_bin=$(command -v openssl 2>/dev/null || true)
+if [ -z "$openssl_bin" ]; then
+    for candidate in "/c/Program Files/OpenSSL/bin/openssl.exe" "/c/Program Files/OpenSSL-Win64/bin/openssl.exe"; do
+        if [ -x "$candidate" ]; then openssl_bin=$candidate; break; fi
+    done
+fi
+test -n "$openssl_bin"
+mkdir -p "$temporary/tls"
+cat > "$temporary/tls/extensions.cnf" <<'EOF'
+subjectAltName=DNS:localhost
+extendedKeyUsage=serverAuth
+EOF
+MSYS2_ARG_CONV_EXCL='/CN=' "$openssl_bin" req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=Encore Self Update Test CA" \
+    -keyout "$temporary/tls/ca.key" -out "$temporary/tls/ca.pem" >/dev/null 2>&1
+MSYS2_ARG_CONV_EXCL='/CN=' "$openssl_bin" req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
+    -keyout "$temporary/tls/server.key" -out "$temporary/tls/server.csr" >/dev/null 2>&1
+"$openssl_bin" x509 -req -in "$temporary/tls/server.csr" -CA "$temporary/tls/ca.pem" \
+    -CAkey "$temporary/tls/ca.key" -CAcreateserial -days 1 -extfile "$temporary/tls/extensions.cnf" \
+    -out "$temporary/tls/server.pem" >/dev/null 2>&1
+port=$((25000 + ($$ % 25000)))
+archive_url="https://localhost:$port/$(basename -- "$archive")"
+write_manifest "$mirror/channels/stable.json" "$checksum" stable
+(cd "$mirror" && exec "$openssl_bin" s_server -quiet -WWW -accept "$port" \
+    -cert "$temporary/tls/server.pem" -key "$temporary/tls/server.key" </dev/null >/dev/null 2>&1) &
+server_pid=$!
+sleep 1
+kill -0 "$server_pid"
+ENCORE_HOME="$install_root" ENCORE_SELF_UPDATE_BASE_URL="https://localhost:$port" \
+    ENCORE_SELF_UPDATE_CA_FILE="$temporary/tls/ca.pem" \
+    "$installed" self update --force > "$temporary/https-update.log"
+wait_for_transaction
+kill "$server_pid" 2>/dev/null || true
+wait "$server_pid" 2>/dev/null || true
+server_pid=
+grep -q "Updated Encore from $version to $version on stable" "$temporary/https-update.log"
+"$installed" --version | grep -q "^encore $version$"
+
+# Exact installation uses an immutable version manifest and does not alter the
+# persisted release channel.
+ENCORE_HOME="$install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self install "$version" --force > "$temporary/install.log"
+wait_for_transaction
+grep -q "Installed Encore $version" "$temporary/install.log"
+grep -q '^channel = "stable"$' "$install_root/settings.toml"
+
+# A corrupt or substituted archive must not modify the working installation.
+bad_checksum=$(printf '%064d' 0)
+archive_url="file://$archive"
+write_manifest "$mirror/channels/stable.json" "$bad_checksum" stable
+set +e
+ENCORE_HOME="$install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --force > "$temporary/bad-checksum.log" 2>&1
+bad_code=$?
+set -e
+test "$bad_code" -ne 0
+grep -q 'Checksum verification failed' "$temporary/bad-checksum.log"
+test "$(cat "$install_root/share/update-marker")" = new
+"$installed" --version | grep -q "^encore $version$"
+
+# Invalid manifests, channels and insecure mirrors fail before installation.
+printf '{not json}\n' > "$mirror/channels/stable.json"
+set +e
+ENCORE_HOME="$install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --force > "$temporary/invalid-manifest.log" 2>&1
+manifest_code=$?
+ENCORE_HOME="$install_root" "$installed" self channel alpha > "$temporary/invalid-channel.log" 2>&1
+channel_code=$?
+ENCORE_HOME="$install_root" "$installed" self update --version ../../escape > "$temporary/invalid-version.log" 2>&1
+version_code=$?
+ENCORE_HOME="$install_root" ENCORE_SELF_UPDATE_BASE_URL="http://example.invalid" "$installed" self update --force > "$temporary/insecure.log" 2>&1
+insecure_code=$?
+set -e
+test "$manifest_code" -ne 0
+test "$channel_code" -eq 2
+test "$version_code" -ne 0
+test "$insecure_code" -ne 0
+grep -q 'Invalid update manifest' "$temporary/invalid-manifest.log"
+grep -q 'stable, beta, or nightly' "$temporary/invalid-channel.log"
+grep -q 'Invalid Encore version' "$temporary/invalid-version.log"
+grep -q 'must use https:// or file://' "$temporary/insecure.log"
+
+echo "Self-update channel, transaction, checksum, and rollback integration: ok"

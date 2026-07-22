@@ -61,6 +61,8 @@ done
 
 scripts/test-analyzer.sh "$compiler"
 scripts/test-cli-contract.sh "$compiler"
+scripts/test-release-channels.sh
+scripts/test-self-update.sh "$compiler"
 ENCORE_BIN="$compiler" scripts/test-cross-targets.sh
 scripts/test-memory-safety.sh "$compiler"
 scripts/test-https-stack.sh "$compiler"

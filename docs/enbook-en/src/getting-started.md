@@ -64,6 +64,7 @@ encore test
 encore analyze
 encore add <package>
 encore update
+encore self update
 ```
 
 The dependency commands have distinct behavior:
@@ -74,6 +75,21 @@ The dependency commands have distinct behavior:
   not select newer index versions;
 - `encore update` refreshes index metadata and rewrites the lockfile with the
   latest available versions.
+
+Compiler updates are intentionally separate from dependency updates:
+
+```sh
+encore self channel
+encore self channel beta
+encore self update --check
+encore self update
+encore self install 0.2.0
+```
+
+`stable` is the default compiler channel. `beta` receives numbered preview
+releases and `nightly` receives date-stamped builds. The selected channel is
+stored in the managed Encore installation. An explicit `self install` does not
+change it.
 
 Commit both `encore.toml` and `encore.lock` for applications. Once package
 archives are cached, ordinary builds do not need the index. See

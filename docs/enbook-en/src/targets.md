@@ -17,7 +17,7 @@ encore target
 encore target thumbv7em-none-eabihf
 ```
 
-Native release and CI targets currently cover Linux and macOS on x86-64 and
+Native release and CI targets currently cover Linux, macOS, and Windows on x86-64 and
 AArch64, plus Windows on x86-64 (`x86_64-pc-windows-msvc`). Windows compiler
 archives use ZIP and contain `bin/encore.exe`; Unix compiler archives use
 `tar.gz` and contain `bin/encore`.

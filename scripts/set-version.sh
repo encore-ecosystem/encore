@@ -6,9 +6,9 @@ if [ "$#" -ne 1 ]; then
     exit 2
 fi
 
-version=$1
-printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
-    echo "Version must use MAJOR.MINOR.PATCH" >&2
+version=${1#v}
+printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-(beta\.[0-9]+|nightly\.[0-9]{8}))?$' || {
+    echo "Version must use MAJOR.MINOR.PATCH, MAJOR.MINOR.PATCH-beta.N, or MAJOR.MINOR.PATCH-nightly.YYYYMMDD" >&2
     exit 2
 }
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -31,9 +31,12 @@ replace() {
 }
 
 printf '%s\n' "$version" > "$repo_root/VERSION"
-replace "$repo_root/src/main.enq" "s/encore $old/encore $version/"
+replace "$repo_root/src/version.enq" "s/ret \"$old\"/ret \"$version\"/"
 replace "$repo_root/encore.toml" "s/^version = \"$old\"/version = \"$version\"/"
-replace "$repo_root/packaging/PKGBUILD.template" "s/^pkgver=$old/pkgver=$version/"
+case "$version" in
+    *-*) ;;
+    *) sed -i "s/^pkgver=.*/pkgver=$version/" "$repo_root/packaging/PKGBUILD.template" ;;
+esac
 replace "$repo_root/README.md" "s/current development line is \`$old\`/current development line is \`$version\`/"
 "$repo_root/scripts/verify-version.sh"
 printf 'Updated Encore version: %s -> %s\n' "$old" "$version"

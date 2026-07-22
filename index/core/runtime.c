@@ -2650,6 +2650,26 @@ encore_str encore_os_getenv(encore_str name) {
     return encore_from_cstr_copy(value);
 }
 
+encore_str encore_os_executable_path(void) {
+    char executable[PATH_MAX];
+#ifdef _WIN32
+    DWORD written = GetModuleFileNameA(NULL, executable, (DWORD)sizeof(executable));
+    if (written == 0 || written >= sizeof(executable)) return encore_empty_str();
+    return encore_from_cstr_copy(executable);
+#elif defined(__APPLE__)
+    uint32_t capacity = (uint32_t)sizeof(executable);
+    if (_NSGetExecutablePath(executable, &capacity) != 0) return encore_empty_str();
+    char resolved[PATH_MAX];
+    if (realpath(executable, resolved) != NULL) return encore_from_cstr_copy(resolved);
+    return encore_from_cstr_copy(executable);
+#else
+    ssize_t written = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+    if (written <= 0) return encore_empty_str();
+    executable[written] = '\0';
+    return encore_from_cstr_copy(executable);
+#endif
+}
+
 encore_str encore_fs_read_file(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
@@ -2701,6 +2721,131 @@ int32_t encore_fs_write_file(encore_str path, encore_str contents) {
     size_t written = fwrite(contents_data, 1, contents_len, file);
     fclose(file);
     return written == contents_len ? 0 : -1;
+}
+
+typedef struct {
+    uint32_t state[8];
+    uint64_t bit_count;
+    uint8_t block[64];
+    size_t block_length;
+} encore_sha256_context;
+
+static uint32_t encore_sha256_rotate(uint32_t value, unsigned int bits) {
+    return (value >> bits) | (value << (32U - bits));
+}
+
+static void encore_sha256_transform(encore_sha256_context *context, const uint8_t block[64]) {
+    static const uint32_t constants[64] = {
+        0x428a2f98U,0x71374491U,0xb5c0fbcfU,0xe9b5dba5U,0x3956c25bU,0x59f111f1U,0x923f82a4U,0xab1c5ed5U,
+        0xd807aa98U,0x12835b01U,0x243185beU,0x550c7dc3U,0x72be5d74U,0x80deb1feU,0x9bdc06a7U,0xc19bf174U,
+        0xe49b69c1U,0xefbe4786U,0x0fc19dc6U,0x240ca1ccU,0x2de92c6fU,0x4a7484aaU,0x5cb0a9dcU,0x76f988daU,
+        0x983e5152U,0xa831c66dU,0xb00327c8U,0xbf597fc7U,0xc6e00bf3U,0xd5a79147U,0x06ca6351U,0x14292967U,
+        0x27b70a85U,0x2e1b2138U,0x4d2c6dfcU,0x53380d13U,0x650a7354U,0x766a0abbU,0x81c2c92eU,0x92722c85U,
+        0xa2bfe8a1U,0xa81a664bU,0xc24b8b70U,0xc76c51a3U,0xd192e819U,0xd6990624U,0xf40e3585U,0x106aa070U,
+        0x19a4c116U,0x1e376c08U,0x2748774cU,0x34b0bcb5U,0x391c0cb3U,0x4ed8aa4aU,0x5b9cca4fU,0x682e6ff3U,
+        0x748f82eeU,0x78a5636fU,0x84c87814U,0x8cc70208U,0x90befffaU,0xa4506cebU,0xbef9a3f7U,0xc67178f2U
+    };
+    uint32_t words[64];
+    for (size_t index = 0; index < 16; ++index) {
+        size_t offset = index * 4;
+        words[index] = ((uint32_t)block[offset] << 24) | ((uint32_t)block[offset + 1] << 16) |
+                       ((uint32_t)block[offset + 2] << 8) | (uint32_t)block[offset + 3];
+    }
+    for (size_t index = 16; index < 64; ++index) {
+        uint32_t x = words[index - 15];
+        uint32_t y = words[index - 2];
+        uint32_t small0 = encore_sha256_rotate(x, 7) ^ encore_sha256_rotate(x, 18) ^ (x >> 3);
+        uint32_t small1 = encore_sha256_rotate(y, 17) ^ encore_sha256_rotate(y, 19) ^ (y >> 10);
+        words[index] = words[index - 16] + small0 + words[index - 7] + small1;
+    }
+    uint32_t a = context->state[0], b = context->state[1], c = context->state[2], d = context->state[3];
+    uint32_t e = context->state[4], f = context->state[5], g = context->state[6], h = context->state[7];
+    for (size_t index = 0; index < 64; ++index) {
+        uint32_t big1 = encore_sha256_rotate(e, 6) ^ encore_sha256_rotate(e, 11) ^ encore_sha256_rotate(e, 25);
+        uint32_t choose = (e & f) ^ ((~e) & g);
+        uint32_t temp1 = h + big1 + choose + constants[index] + words[index];
+        uint32_t big0 = encore_sha256_rotate(a, 2) ^ encore_sha256_rotate(a, 13) ^ encore_sha256_rotate(a, 22);
+        uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t temp2 = big0 + majority;
+        h = g; g = f; f = e; e = d + temp1; d = c; c = b; b = a; a = temp1 + temp2;
+    }
+    context->state[0] += a; context->state[1] += b; context->state[2] += c; context->state[3] += d;
+    context->state[4] += e; context->state[5] += f; context->state[6] += g; context->state[7] += h;
+}
+
+static void encore_sha256_init(encore_sha256_context *context) {
+    static const uint32_t initial[8] = {
+        0x6a09e667U,0xbb67ae85U,0x3c6ef372U,0xa54ff53aU,
+        0x510e527fU,0x9b05688cU,0x1f83d9abU,0x5be0cd19U
+    };
+    memcpy(context->state, initial, sizeof(initial));
+    context->bit_count = 0;
+    context->block_length = 0;
+}
+
+static void encore_sha256_update(encore_sha256_context *context, const uint8_t *data, size_t length) {
+    context->bit_count += (uint64_t)length * 8U;
+    while (length > 0) {
+        size_t available = 64 - context->block_length;
+        size_t count = length < available ? length : available;
+        memcpy(context->block + context->block_length, data, count);
+        context->block_length += count;
+        data += count;
+        length -= count;
+        if (context->block_length == 64) {
+            encore_sha256_transform(context, context->block);
+            context->block_length = 0;
+        }
+    }
+}
+
+static void encore_sha256_finish(encore_sha256_context *context, uint8_t digest[32]) {
+    context->block[context->block_length++] = 0x80U;
+    if (context->block_length > 56) {
+        memset(context->block + context->block_length, 0, 64 - context->block_length);
+        encore_sha256_transform(context, context->block);
+        context->block_length = 0;
+    }
+    memset(context->block + context->block_length, 0, 56 - context->block_length);
+    for (size_t index = 0; index < 8; ++index) {
+        context->block[63 - index] = (uint8_t)(context->bit_count >> (index * 8));
+    }
+    encore_sha256_transform(context, context->block);
+    for (size_t index = 0; index < 8; ++index) {
+        digest[index * 4] = (uint8_t)(context->state[index] >> 24);
+        digest[index * 4 + 1] = (uint8_t)(context->state[index] >> 16);
+        digest[index * 4 + 2] = (uint8_t)(context->state[index] >> 8);
+        digest[index * 4 + 3] = (uint8_t)context->state[index];
+    }
+}
+
+encore_str encore_fs_sha256(encore_str path) {
+    char *path_c = encore_to_cstr(path);
+    if (path_c == NULL) return encore_empty_str();
+    FILE *file = fopen(path_c, "rb");
+    free(path_c);
+    if (file == NULL) return encore_empty_str();
+    encore_sha256_context context;
+    encore_sha256_init(&context);
+    uint8_t buffer[65536];
+    bool failed = false;
+    for (;;) {
+        size_t count = fread(buffer, 1, sizeof(buffer), file);
+        if (count > 0) encore_sha256_update(&context, buffer, count);
+        if (count < sizeof(buffer)) { if (ferror(file)) failed = true; break; }
+    }
+    if (fclose(file) != 0) failed = true;
+    if (failed) return encore_empty_str();
+    uint8_t digest[32];
+    char encoded[65];
+    static const char hexadecimal[] = "0123456789abcdef";
+    encore_sha256_finish(&context, digest);
+    for (size_t index = 0; index < 32; ++index) {
+        encoded[index * 2] = hexadecimal[digest[index] >> 4];
+        encoded[index * 2 + 1] = hexadecimal[digest[index] & 15U];
+    }
+    encoded[64] = '\0';
+    return encore_from_cstr_copy(encoded);
 }
 
 int32_t encore_fs_status(encore_str path) {
@@ -2964,4 +3109,175 @@ encore_str encore_fs_read_dir(encore_str path) {
         len -= 1;
     }
     return encore_from_owned_buffer(buffer, len);
+}
+
+static int encore_remove_tree_c(const char *path) {
+#ifdef _WIN32
+    DWORD attributes = GetFileAttributesA(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES) return GetLastError() == ERROR_FILE_NOT_FOUND ? 0 : -1;
+    if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+        return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? (RemoveDirectoryA(path) ? 0 : -1)
+                                                           : (DeleteFileA(path) ? 0 : -1);
+    }
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+        return DeleteFileA(path) ? 0 : -1;
+    }
+    size_t length = strlen(path);
+    char *pattern = malloc(length + 3);
+    if (pattern == NULL) return -1;
+    snprintf(pattern, length + 3, "%s\\*", path);
+    WIN32_FIND_DATAA data;
+    HANDLE search = FindFirstFileA(pattern, &data);
+    free(pattern);
+    if (search != INVALID_HANDLE_VALUE) {
+        do {
+            if (strcmp(data.cFileName, ".") == 0 || strcmp(data.cFileName, "..") == 0) continue;
+            size_t child_length = length + strlen(data.cFileName) + 2;
+            char *child = malloc(child_length);
+            if (child == NULL) { FindClose(search); return -1; }
+            snprintf(child, child_length, "%s\\%s", path, data.cFileName);
+            int status = encore_remove_tree_c(child);
+            free(child);
+            if (status != 0) { FindClose(search); return -1; }
+        } while (FindNextFileA(search, &data));
+        FindClose(search);
+    }
+    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+    return RemoveDirectoryA(path) ? 0 : -1;
+#else
+    struct stat info;
+    if (lstat(path, &info) != 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(info.st_mode) || S_ISLNK(info.st_mode)) return unlink(path) == 0 ? 0 : -1;
+    DIR *directory = opendir(path);
+    if (directory == NULL) return -1;
+    struct dirent *entry;
+    int status = 0;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        size_t child_length = strlen(path) + strlen(entry->d_name) + 2;
+        char *child = malloc(child_length);
+        if (child == NULL) { status = -1; break; }
+        snprintf(child, child_length, "%s/%s", path, entry->d_name);
+        if (encore_remove_tree_c(child) != 0) status = -1;
+        free(child);
+        if (status != 0) break;
+    }
+    closedir(directory);
+    if (status != 0) return -1;
+    return rmdir(path) == 0 ? 0 : -1;
+#endif
+}
+
+int32_t encore_fs_remove_dir_all(encore_str path) {
+    char *path_c = encore_to_cstr(path);
+    if (path_c == NULL) return -1;
+    int32_t status = encore_remove_tree_c(path_c);
+    free(path_c);
+    return status;
+}
+
+static int encore_move_path_c(const char *source, const char *destination) {
+#ifdef _WIN32
+    return MoveFileExA(source, destination, MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+#else
+    return rename(source, destination) == 0 ? 0 : -1;
+#endif
+}
+
+static int encore_replace_installation_c(const char *staged, const char *root) {
+    size_t backup_length = strlen(root) + 19;
+    char *backup = malloc(backup_length);
+    if (backup == NULL) return -1;
+    snprintf(backup, backup_length, "%s.previous", root);
+    if (encore_remove_tree_c(backup) != 0) { free(backup); return -1; }
+    if (encore_move_path_c(root, backup) != 0) { free(backup); return -1; }
+    if (encore_move_path_c(staged, root) != 0) {
+        encore_move_path_c(backup, root);
+        free(backup);
+        return -1;
+    }
+    (void)encore_remove_tree_c(backup);
+    free(backup);
+    return 0;
+}
+
+#ifdef _WIN32
+static bool encore_windows_safe_argument(const char *value) {
+    return value != NULL && strchr(value, '"') == NULL && strchr(value, '\r') == NULL && strchr(value, '\n') == NULL;
+}
+
+static char *encore_windows_update_command(const char *helper, DWORD parent, const char *staged,
+                                           const char *root, const char *workspace) {
+    if (!encore_windows_safe_argument(helper) || !encore_windows_safe_argument(staged) ||
+        !encore_windows_safe_argument(root) || !encore_windows_safe_argument(workspace)) return NULL;
+    size_t capacity = strlen(helper) * 2 + strlen(staged) * 2 + strlen(root) * 2 + strlen(workspace) * 2 + 160;
+    char *command = malloc(capacity);
+    if (command == NULL) return NULL;
+    snprintf(command, capacity, "\"%s\" __self_update_apply %lu \"%s\" \"%s\" \"%s\" \"%s\"",
+             helper, (unsigned long)parent, staged, root, workspace, helper);
+    return command;
+}
+#endif
+
+int32_t encore_self_update_commit(encore_str staged_root, encore_str install_root,
+                                  encore_str new_executable, encore_str workspace) {
+    char *staged = encore_to_cstr(staged_root);
+    char *root = encore_to_cstr(install_root);
+    char *new_binary = encore_to_cstr(new_executable);
+    char *work = encore_to_cstr(workspace);
+    if (staged == NULL || root == NULL || new_binary == NULL || work == NULL) {
+        free(staged); free(root); free(new_binary); free(work); return -1;
+    }
+#ifdef _WIN32
+    size_t helper_length = strlen(root) + 40;
+    char *helper = malloc(helper_length);
+    if (helper == NULL) { free(staged); free(root); free(new_binary); free(work); return -1; }
+    snprintf(helper, helper_length, "%s.update-helper-%lu.exe", root, (unsigned long)GetCurrentProcessId());
+    encore_str source_value = encore_from_cstr_copy(new_binary);
+    encore_str helper_value = encore_from_cstr_copy(helper);
+    if (encore_fs_copy_file(source_value, helper_value) != 0) {
+        free(helper); free(staged); free(root); free(new_binary); free(work); return -1;
+    }
+    char *command = encore_windows_update_command(helper, GetCurrentProcessId(), staged, root, work);
+    STARTUPINFOA startup;
+    PROCESS_INFORMATION process;
+    memset(&startup, 0, sizeof(startup)); startup.cb = sizeof(startup);
+    memset(&process, 0, sizeof(process));
+    BOOL started = command != NULL && CreateProcessA(helper, command, NULL, NULL, FALSE,
+                                                      CREATE_NO_WINDOW | DETACHED_PROCESS,
+                                                      NULL, NULL, &startup, &process);
+    if (started) { CloseHandle(process.hThread); CloseHandle(process.hProcess); }
+    free(command); free(helper); free(staged); free(root); free(new_binary); free(work);
+    return started ? 1 : -1;
+#else
+    int32_t status = encore_replace_installation_c(staged, root);
+    if (status == 0) encore_remove_tree_c(work);
+    free(staged); free(root); free(new_binary); free(work);
+    return status;
+#endif
+}
+
+int32_t encore_self_update_apply(size_t parent_pid, encore_str staged_root, encore_str install_root,
+                                 encore_str workspace, encore_str helper_path) {
+#ifdef _WIN32
+    HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)parent_pid);
+    if (parent != NULL) { WaitForSingleObject(parent, INFINITE); CloseHandle(parent); }
+    char *staged = encore_to_cstr(staged_root);
+    char *root = encore_to_cstr(install_root);
+    char *work = encore_to_cstr(workspace);
+    char *helper = encore_to_cstr(helper_path);
+    if (staged == NULL || root == NULL || work == NULL || helper == NULL) {
+        free(staged); free(root); free(work); free(helper); return -1;
+    }
+    int32_t status = encore_replace_installation_c(staged, root);
+    if (status == 0) encore_remove_tree_c(work);
+    MoveFileExA(helper, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+    free(staged); free(root); free(work); free(helper);
+    return status;
+#else
+    (void)parent_pid; (void)staged_root; (void)install_root; (void)workspace; (void)helper_path;
+    return -1;
+#endif
 }
