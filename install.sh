@@ -140,6 +140,20 @@ if [ "$actual" != "$expected" ]; then
 fi
 
 mkdir -p "$download_dir/unpack"
+tar -tzf "$download_dir/$asset" > "$download_dir/archive.list"
+while IFS= read -r path; do
+    case "$path" in
+        ""|/*|../*|*/../*|*/..) echo "Release archive contains an unsafe path: $path" >&2; exit 1 ;;
+    esac
+done < "$download_dir/archive.list"
+tar -tvzf "$download_dir/$asset" > "$download_dir/archive.types"
+while IFS= read -r entry; do
+    case "$entry" in
+        -*) ;;
+        d*) ;;
+        *) echo "Release archive contains links or special files" >&2; exit 1 ;;
+    esac
+done < "$download_dir/archive.types"
 tar -xzf "$download_dir/$asset" -C "$download_dir/unpack"
 package_count=$(find "$download_dir/unpack" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
 [ "$package_count" = 1 ] || { echo "Release archive must contain exactly one package directory" >&2; exit 1; }
@@ -159,6 +173,11 @@ transaction_dir=$(mktemp -d "$install_parent/.encore-install.XXXXXX")
 mkdir -p "$transaction_dir/new"
 cp -R "$package_dir/bin" "$package_dir/lib" "$package_dir/share" "$package_dir/VERSION" "$transaction_dir/new/"
 chmod +x "$transaction_dir/new/bin/encore"
+installed_version=$($transaction_dir/new/bin/encore --version 2>/dev/null || true)
+if [ "$installed_version" != "encore $package_version" ]; then
+    echo "Compiler version mismatch: archive contains $package_version, binary reports '${installed_version:-unavailable}'" >&2
+    exit 1
+fi
 if [ -e "$install_root" ] || [ -L "$install_root" ]; then
     mv "$install_root" "$transaction_dir/previous"
 fi

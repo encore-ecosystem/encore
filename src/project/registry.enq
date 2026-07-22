@@ -1,3 +1,5 @@
+//! Resolves package registry references and versions.
+
 import core::option::Option
 import core::result::Result
 import core::vec::Vec
@@ -8,22 +10,81 @@ import std::path::Path
 import std::process::{run_args, run_args_capture}
 import mod::manifest::{project_manifest_name, project_manifest_version, read_project_manifest}
 
+/// Performs the `normalize_dependency_reference` operation.
 pub fn normalize_dependency_reference(raw: str) -> str {
     if starts_with(raw, "git@") || starts_with(raw, "path@") || starts_with(raw, "index@") || starts_with(raw, "workspace@") { ret raw }
     if starts_with(raw, ".") || starts_with(raw, "/") || starts_with(raw, "~") { ret "path@" + raw }
     ret "index@" + raw
 }
 
+/// Performs the `dependency_base_reference` operation.
+pub fn dependency_base_reference(reference: str) -> str {
+    let open = feature_suffix_start(reference)
+    if open == reference.len() { ret reference }
+    ret reference.slice(0_usize, open)
+}
+
+/// Performs the `dependency_requested_features` operation.
+pub fn dependency_requested_features(reference: str) -> Vec[str] {
+    let mut features = Vec[str]::new()
+    let open = feature_suffix_start(reference)
+    if open == reference.len() { ret features }
+    let body = reference.slice(open + 1_usize, reference.len() - open - 2_usize)
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index <= body.len() {
+        if index == body.len() || body.slice(index, 1_usize) == "," {
+            let feature = trim_feature_name(body.slice(start, index - start))
+            if feature != "" && valid_feature_name(feature) && !contains_feature(features, feature) { features.push(feature) }
+            start = index + 1_usize
+        }
+        index = index + 1_usize
+    }
+    ret features
+}
+
+/// Performs the `dependency_with_features` operation.
+pub fn dependency_with_features(reference: str, features: Vec[str]) -> str {
+    let base = dependency_base_reference(reference)
+    let mut merged = dependency_requested_features(reference)
+    for feature in features {
+        if valid_feature_name(feature) && !contains_feature(merged, feature) { merged.push(feature) }
+    }
+    if merged.len() == 0_usize { ret base }
+    let mut out = base + "["
+    let mut index = 0_usize
+    while index < merged.len() {
+        match merged.get(index) {
+            Some(feature) => {
+                if index > 0_usize { out = out + "," }
+                out = out + feature
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret out + "]"
+}
+
+/// Performs the `resolve_index_dependency` operation.
 pub fn resolve_index_dependency(reference: str, project_root: Path, update: bool) -> str {
-    if !starts_with(reference, "index@") { ret "" }
-    let name = reference.slice(6_usize, reference.len() - 6_usize)
+    let base_reference = dependency_base_reference(reference)
+    if !starts_with(base_reference, "index@") { ret "" }
+    let spec = base_reference.slice(6_usize, base_reference.len() - 6_usize)
+    let requirement_start = find_from(spec, "@", 0_usize)
+    let name = spec.slice(0_usize, requirement_start)
+    let requirement = if requirement_start < spec.len() { spec.slice(requirement_start + 1_usize, spec.len() - requirement_start - 1_usize) } else { "" }
     if !valid_package_name(name) {
         registry_error("Invalid package name '" + name + "'. Use lowercase ASCII letters, digits, '-' or '_'")
         ret ""
     }
+    if !registry_version_requirement_valid(requirement) {
+        registry_error("Invalid version requirement '" + requirement + "' for package '" + name + "'")
+        ret ""
+    }
 
     if !update {
-        let locked = resolve_locked_package(project_root, reference)
+        let locked = resolve_locked_package(project_root, base_reference)
         if locked != "" { ret locked }
     }
 
@@ -35,23 +96,64 @@ pub fn resolve_index_dependency(reference: str, project_root: Path, update: bool
         ret ""
     }
 
-    let version = latest_version(read_file(metadata_path.as_str()), name)
+    let version = latest_version(read_file(metadata_path.as_str()), name, requirement)
     if version.version == "" { ret "" }
     ret install_package(name, version)
 }
 
+fn feature_suffix_start(reference: str) -> usize {
+    if reference.len() < 3_usize || reference.slice(reference.len() - 1_usize, 1_usize) != "]" { ret reference.len() }
+    let mut index = reference.len() - 1_usize
+    while index > 0_usize {
+        index = index - 1_usize
+        if reference.slice(index, 1_usize) == "[" { ret index }
+    }
+    ret reference.len()
+}
+
+fn trim_feature_name(value: str) -> str {
+    let mut start = 0_usize
+    let mut end = value.len()
+    while start < end && (value.slice(start, 1_usize) == " " || value.slice(start, 1_usize) == "\t") { start = start + 1_usize }
+    while end > start && (value.slice(end - 1_usize, 1_usize) == " " || value.slice(end - 1_usize, 1_usize) == "\t") { end = end - 1_usize }
+    ret value.slice(start, end - start)
+}
+
+fn valid_feature_name(name: str) -> bool {
+    if name == "" { ret false }
+    let mut index = 0_usize
+    while index < name.len() {
+        let ch = name.slice(index, 1_usize)
+        if find_from("abcdefghijklmnopqrstuvwxyz0123456789-_", ch, 0_usize) == 38_usize { ret false }
+        index = index + 1_usize
+    }
+    ret true
+}
+
+fn contains_feature(features: Vec[str], feature: str) -> bool {
+    let mut index = 0_usize
+    while index < features.len() {
+        match features.get(index) { Some(value) => { if value == feature { ret true } } None => {} }
+        index = index + 1_usize
+    }
+    ret false
+}
+
+/// Performs the `registry_lock_fields` operation.
 pub fn registry_lock_fields(package_root: Path) -> str {
     let marker = package_root.join(".encore-registry")
     if !file_exists(marker.as_str()) { ret "" }
     ret read_file(marker.as_str())
 }
 
+/// Performs the `registry_package_checksum` operation.
 pub fn registry_package_checksum(package_root: Path) -> str {
     let marker = package_root.join(".encore-registry")
     if !file_exists(marker.as_str()) { ret "" }
     ret lock_value(read_file(marker.as_str()), "checksum")
 }
 
+/// Performs the `valid_dependency_name` operation.
 pub fn valid_dependency_name(name: str) -> bool { ret valid_package_name(name) }
 
 struct RegistryVersion {
@@ -60,7 +162,125 @@ struct RegistryVersion {
     checksum: str
 }
 
-fn latest_version(source: str, expected_name: str) -> RegistryVersion {
+/// Stores the state of a `RegistryCandidate` value.
+pub struct RegistryCandidate {
+    version: str
+    archive: str
+    checksum: str
+}
+
+/// Performs the `registry_install_candidate` operation.
+pub fn registry_install_candidate(name: str, candidate: RegistryCandidate) -> str {
+    ret install_package(name, RegistryVersion{candidate.version, candidate.archive, candidate.checksum})
+}
+
+/// Performs the `registry_candidates` operation.
+pub fn registry_candidates(reference: str, project_root: Path, update: bool) -> Vec[RegistryCandidate] {
+    let mut out = Vec[RegistryCandidate]::new()
+    let base_reference = dependency_base_reference(reference)
+    if !starts_with(base_reference, "index@") { ret out }
+    let spec = base_reference.slice(6_usize, base_reference.len() - 6_usize)
+    let requirement_start = find_from(spec, "@", 0_usize)
+    let name = spec.slice(0_usize, requirement_start)
+    let requirement = if requirement_start < spec.len() { spec.slice(requirement_start + 1_usize, spec.len() - requirement_start - 1_usize) } else { "" }
+    if !valid_package_name(name) || !registry_version_requirement_valid(requirement) { ret out }
+
+    if !update {
+        let locked = locked_registry_candidate(project_root, base_reference)
+        match locked {
+            Some(candidate) => { out.push(candidate) ret out }
+            None => {}
+        }
+    }
+
+    let metadata_path = registry_root().join("metadata").join(name + ".json")
+    mkdir_all(registry_root().join("metadata").as_str())
+    let metadata_url = registry_url() + "/" + name.slice(0_usize, 2_usize) + "/" + name + ".json"
+    if download(metadata_url, metadata_path) != 0_i32 { ret out }
+    let mut unsorted = registry_candidates_from_source(read_file(metadata_path.as_str()), name, requirement)
+    while out.len() < unsorted.len() {
+        let mut selected_index = unsorted.len()
+        let mut candidate_index = 0_usize
+        while candidate_index < unsorted.len() {
+            match unsorted.get(candidate_index) {
+                Some(candidate) => {
+                    if !contains_candidate_version(out, candidate.version) {
+                        if selected_index == unsorted.len() { selected_index = candidate_index }
+                        else {
+                            match unsorted.get(selected_index) {
+                                Some(current) => { if semantic_version_greater(candidate.version, current.version) { selected_index = candidate_index } }
+                                None => {}
+                            }
+                        }
+                    }
+                }
+                None => {}
+            }
+            candidate_index += 1_usize
+        }
+        if selected_index == unsorted.len() { break }
+        match unsorted.get(selected_index) { Some(candidate) => { out.push(candidate) } None => { break } }
+    }
+    ret out
+}
+
+fn registry_candidates_from_source(source: str, expected_name: str, requirement: str) -> Vec[RegistryCandidate] {
+    let mut out = Vec[RegistryCandidate]::new()
+    match parse(source) {
+        Result[Json, ParseError]::Ok(document) => {
+            if json_string(document, "name") != expected_name { ret out }
+            match document.get("versions") {
+                Some(value) => {
+                    match value.as_array() {
+                        Some(versions) => {
+                            for item in versions {
+                                if !json_bool(item, "yanked") {
+                                    let candidate = RegistryCandidate{json_string(item, "version"), json_string(item, "archive"), json_string(item, "checksum")}
+                                    if candidate.version != "" && candidate.archive != "" && valid_checksum(candidate.checksum) && registry_version_matches(candidate.version, requirement) {
+                                        out.push(candidate)
+                                    }
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        }
+        Result[Json, ParseError]::Err(_) => {}
+    }
+    ret out
+}
+
+fn locked_registry_candidate(project_root: Path, reference: str) -> Option[RegistryCandidate] {
+    let lock = project_root.join("encore.lock")
+    if !file_exists(lock.as_str()) { ret Option[RegistryCandidate]::None }
+    let source = read_file(lock.as_str())
+    let mut block = lock_package_block(source, reference)
+    if block == "" { block = compatible_lock_package_block(source, reference) }
+    if block == "" { ret Option[RegistryCandidate]::None }
+    let version = lock_value(block, "version")
+    let archive = lock_value(block, "archive")
+    let checksum = lock_value(block, "checksum")
+    if version == "" || archive == "" || !valid_checksum(checksum) { ret Option[RegistryCandidate]::None }
+    ret Option[RegistryCandidate]::Some(RegistryCandidate{version, archive, checksum})
+}
+
+fn contains_candidate_version(candidates: Vec[RegistryCandidate], version: str) -> bool {
+    for candidate in candidates { if candidate.version == version { ret true } }
+    ret false
+}
+
+struct SemanticVersion {
+    major: usize
+    minor: usize
+    patch: usize
+    prerelease: str
+    valid: bool
+}
+
+fn latest_version(source: str, expected_name: str, requirement: str) -> RegistryVersion {
     match parse(source) {
         Result[Json, ParseError]::Ok(document) => {
             let name = json_string(document, "name")
@@ -84,7 +304,7 @@ fn latest_version(source: str, expected_name: str) -> RegistryVersion {
                                                 json_string(item, "archive"),
                                                 json_string(item, "checksum")
                                             }
-                                            if candidate.version != "" && candidate.archive != "" && valid_checksum(candidate.checksum) {
+                                            if candidate.version != "" && candidate.archive != "" && valid_checksum(candidate.checksum) && registry_version_matches(candidate.version, requirement) && semantic_version_greater(candidate.version, selected.version) {
                                                 selected = candidate
                                             }
                                         }
@@ -100,7 +320,11 @@ fn latest_version(source: str, expected_name: str) -> RegistryVersion {
                 }
                 None => {}
             }
-            registry_error("Registry entry for '" + expected_name + "' has no usable version")
+            if requirement == "" || requirement == "*" {
+                registry_error("Registry entry for '" + expected_name + "' has no usable version")
+            } else {
+                registry_error("No version of '" + expected_name + "' satisfies '" + requirement + "'")
+            }
             ret empty_version()
         }
         Result[Json, ParseError]::Err(error) => {
@@ -110,20 +334,333 @@ fn latest_version(source: str, expected_name: str) -> RegistryVersion {
     }
 }
 
+fn semantic_version_greater(candidate: str, selected: str) -> bool {
+    let lhs = parse_semantic_version(candidate)
+    if !lhs.valid { ret false }
+    if selected == "" { ret true }
+    let rhs = parse_semantic_version(selected)
+    if !rhs.valid { ret true }
+    ret semantic_version_compare(lhs, rhs) > 0_i32
+}
+
+/// Performs the `registry_version_is_newer` operation.
+pub fn registry_version_is_newer(candidate: str, selected: str) -> bool {
+    ret semantic_version_greater(candidate, selected)
+}
+
+/// Performs the `registry_version_matches` operation.
+pub fn registry_version_matches(version: str, requirement: str) -> bool {
+    let actual = parse_semantic_version(version)
+    if !actual.valid { ret false }
+    if requirement == "" || requirement == "*" { ret true }
+    if actual.prerelease != "" && !requirement_allows_prerelease(actual, requirement) { ret false }
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index <= requirement.len() {
+        if index == requirement.len() || requirement.slice(index, 1_usize) == "," {
+            let item = trim_requirement(requirement.slice(start, index - start))
+            if item == "" || !registry_version_matches_single(actual, item) { ret false }
+            start = index + 1_usize
+        }
+        index += 1_usize
+    }
+    ret true
+}
+
+/// Performs the `registry_version_requirement_valid` operation.
+pub fn registry_version_requirement_valid(requirement: str) -> bool {
+    if requirement == "" || requirement == "*" { ret true }
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index <= requirement.len() {
+        if index == requirement.len() || requirement.slice(index, 1_usize) == "," {
+            let item = trim_requirement(requirement.slice(start, index - start))
+            if item == "" || !registry_version_requirement_single_valid(item) { ret false }
+            start = index + 1_usize
+        }
+        index += 1_usize
+    }
+    ret true
+}
+
+fn registry_version_requirement_single_valid(requirement: str) -> bool {
+    let mut operator_len = 0_usize
+    if starts_with(requirement, ">=") || starts_with(requirement, "<=") { operator_len = 2_usize }
+    elif starts_with(requirement, ">") || starts_with(requirement, "<") || starts_with(requirement, "^") || starts_with(requirement, "~") || starts_with(requirement, "=") { operator_len = 1_usize }
+    let value = trim_requirement(requirement.slice(operator_len, requirement.len() - operator_len))
+    if value == "" { ret false }
+    if operator_len == 0_usize && parse_partial_requirement(value).valid { ret true }
+    ret parse_semantic_version(value).valid
+}
+
+fn registry_version_matches_single(actual: SemanticVersion, requirement: str) -> bool {
+    let mut operator = ""
+    let mut operator_len = 0_usize
+    if starts_with(requirement, ">=") || starts_with(requirement, "<=") { operator = requirement.slice(0_usize, 2_usize) operator_len = 2_usize }
+    elif starts_with(requirement, ">") || starts_with(requirement, "<") || starts_with(requirement, "^") || starts_with(requirement, "~") || starts_with(requirement, "=") {
+        operator = requirement.slice(0_usize, 1_usize)
+        operator_len = 1_usize
+    }
+    let requested_text = trim_requirement(requirement.slice(operator_len, requirement.len() - operator_len))
+    if operator == "" {
+        let partial = parse_partial_requirement(requested_text)
+        if partial.valid {
+            if partial.parts == 0_usize { ret true }
+            if actual.major != partial.major { ret false }
+            if partial.parts == 1_usize { ret true }
+            if actual.minor != partial.minor { ret false }
+            if partial.parts == 2_usize { ret true }
+        }
+    }
+    let requested = parse_semantic_version(requested_text)
+    if !requested.valid { ret false }
+    let compared = semantic_version_compare(actual, requested)
+    if operator == ">=" { ret compared >= 0_i32 }
+    if operator == "<=" { ret compared <= 0_i32 }
+    if operator == ">" { ret compared > 0_i32 }
+    if operator == "<" { ret compared < 0_i32 }
+    if operator != "^" && operator != "~" { ret compared == 0_i32 }
+    if !semantic_version_at_least(actual, requested) { ret false }
+    if operator == "~" { ret actual.major == requested.major && actual.minor == requested.minor }
+    if requested.major > 0_usize { ret actual.major == requested.major }
+    if requested.minor > 0_usize { ret actual.major == 0_usize && actual.minor == requested.minor }
+    ret actual.major == 0_usize && actual.minor == 0_usize && actual.patch == requested.patch
+}
+
+struct PartialRequirement {
+    major: usize
+    minor: usize
+    parts: usize
+    valid: bool
+}
+
+fn parse_partial_requirement(value: str) -> PartialRequirement {
+    if value == "*" || value == "x" || value == "X" { ret PartialRequirement{0_usize, 0_usize, 0_usize, true} }
+    if find_from(value, "-", 0_usize) < value.len() || find_from(value, "+", 0_usize) < value.len() { ret invalid_partial_requirement() }
+    let first = find_from(value, ".", 0_usize)
+    if first == value.len() {
+        let major = parse_decimal_component(value)
+        if major.valid { ret PartialRequirement{major.value, 0_usize, 1_usize, true} }
+        ret invalid_partial_requirement()
+    }
+    let major = parse_decimal_component(value.slice(0_usize, first))
+    if !major.valid { ret invalid_partial_requirement() }
+    let second = find_from(value, ".", first + 1_usize)
+    let minor_text = value.slice(first + 1_usize, second - first - 1_usize)
+    if minor_text == "*" || minor_text == "x" || minor_text == "X" {
+        if second == value.len() { ret PartialRequirement{major.value, 0_usize, 1_usize, true} }
+        ret invalid_partial_requirement()
+    }
+    let minor = parse_decimal_component(minor_text)
+    if !minor.valid { ret invalid_partial_requirement() }
+    if second == value.len() { ret PartialRequirement{major.value, minor.value, 2_usize, true} }
+    if find_from(value, ".", second + 1_usize) < value.len() { ret invalid_partial_requirement() }
+    let patch = value.slice(second + 1_usize, value.len() - second - 1_usize)
+    if patch == "*" || patch == "x" || patch == "X" { ret PartialRequirement{major.value, minor.value, 2_usize, true} }
+    ret invalid_partial_requirement()
+}
+
+fn invalid_partial_requirement() -> PartialRequirement { ret PartialRequirement{0_usize, 0_usize, 0_usize, false} }
+
+fn requirement_allows_prerelease(actual: SemanticVersion, requirement: str) -> bool {
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index <= requirement.len() {
+        if index == requirement.len() || requirement.slice(index, 1_usize) == "," {
+            let mut item = trim_requirement(requirement.slice(start, index - start))
+            if starts_with(item, ">=") || starts_with(item, "<=") { item = trim_requirement(item.slice(2_usize, item.len() - 2_usize)) }
+            elif starts_with(item, ">") || starts_with(item, "<") || starts_with(item, "^") || starts_with(item, "~") || starts_with(item, "=") { item = trim_requirement(item.slice(1_usize, item.len() - 1_usize)) }
+            let requested = parse_semantic_version(item)
+            if requested.valid && requested.prerelease != "" && requested.major == actual.major && requested.minor == actual.minor && requested.patch == actual.patch { ret true }
+            start = index + 1_usize
+        }
+        index += 1_usize
+    }
+    ret false
+}
+
+fn trim_requirement(value: str) -> str {
+    let mut start = 0_usize
+    let mut end = value.len()
+    while start < end && (value.slice(start, 1_usize) == " " || value.slice(start, 1_usize) == "\t") { start += 1_usize }
+    while end > start && (value.slice(end - 1_usize, 1_usize) == " " || value.slice(end - 1_usize, 1_usize) == "\t") { end -= 1_usize }
+    ret value.slice(start, end - start)
+}
+
+fn semantic_version_equal(lhs: SemanticVersion, rhs: SemanticVersion) -> bool {
+    ret semantic_version_compare(lhs, rhs) == 0_i32
+}
+
+fn semantic_version_at_least(lhs: SemanticVersion, rhs: SemanticVersion) -> bool {
+    ret semantic_version_compare(lhs, rhs) >= 0_i32
+}
+
+fn parse_semantic_version(value: str) -> SemanticVersion {
+    let dash = find_from(value, "-", 0_usize)
+    let plus = find_from(value, "+", 0_usize)
+    if plus < value.len() && dash < value.len() && plus < dash { ret invalid_semantic_version() }
+    let core_end = minimum_index(dash, plus)
+    let core = value.slice(0_usize, core_end)
+    let first = find_from(core, ".", 0_usize)
+    if first == core.len() { ret invalid_semantic_version() }
+    let second = find_from(core, ".", first + 1_usize)
+    if second == core.len() || find_from(core, ".", second + 1_usize) != core.len() { ret invalid_semantic_version() }
+    let major = parse_decimal_component(core.slice(0_usize, first))
+    let minor = parse_decimal_component(core.slice(first + 1_usize, second - first - 1_usize))
+    let patch = parse_decimal_component(core.slice(second + 1_usize, core.len() - second - 1_usize))
+    if !major.valid || !minor.valid || !patch.valid { ret invalid_semantic_version() }
+    let prerelease_end = if plus < value.len() { plus } else { value.len() }
+    let prerelease = if dash < value.len() { value.slice(dash + 1_usize, prerelease_end - dash - 1_usize) } else { "" }
+    let metadata = if plus < value.len() { value.slice(plus + 1_usize, value.len() - plus - 1_usize) } else { "" }
+    if dash < value.len() && !valid_semantic_identifiers(prerelease, true) { ret invalid_semantic_version() }
+    if plus < value.len() && !valid_semantic_identifiers(metadata, false) { ret invalid_semantic_version() }
+    ret SemanticVersion{major.value, minor.value, patch.value, prerelease, true}
+}
+
+struct DecimalComponent { value: usize valid: bool }
+
+fn parse_decimal_component(value: str) -> DecimalComponent {
+    if value == "" || (value.len() > 1_usize && value.slice(0_usize, 1_usize) == "0") { ret DecimalComponent{0_usize, false} }
+    let mut out = 0_usize
+    let mut index = 0_usize
+    while index < value.len() {
+        let digit = find_from("0123456789", value.slice(index, 1_usize), 0_usize)
+        if digit == 10_usize { ret DecimalComponent{0_usize, false} }
+        out = out * 10_usize + digit
+        index = index + 1_usize
+    }
+    ret DecimalComponent{out, true}
+}
+
+fn invalid_semantic_version() -> SemanticVersion { ret SemanticVersion{0_usize, 0_usize, 0_usize, "", false} }
+fn minimum_index(lhs: usize, rhs: usize) -> usize { if lhs < rhs { ret lhs } ret rhs }
+
+fn semantic_version_compare(lhs: SemanticVersion, rhs: SemanticVersion) -> i32 {
+    if lhs.major != rhs.major { if lhs.major > rhs.major { ret 1_i32 } ret -1_i32 }
+    if lhs.minor != rhs.minor { if lhs.minor > rhs.minor { ret 1_i32 } ret -1_i32 }
+    if lhs.patch != rhs.patch { if lhs.patch > rhs.patch { ret 1_i32 } ret -1_i32 }
+    if lhs.prerelease == "" && rhs.prerelease == "" { ret 0_i32 }
+    if lhs.prerelease == "" { ret 1_i32 }
+    if rhs.prerelease == "" { ret -1_i32 }
+    ret compare_prerelease(lhs.prerelease, rhs.prerelease)
+}
+
+fn compare_prerelease(lhs: str, rhs: str) -> i32 {
+    let mut lhs_start = 0_usize
+    let mut rhs_start = 0_usize
+    loop {
+        let lhs_end = find_from(lhs, ".", lhs_start)
+        let rhs_end = find_from(rhs, ".", rhs_start)
+        let lhs_item = lhs.slice(lhs_start, lhs_end - lhs_start)
+        let rhs_item = rhs.slice(rhs_start, rhs_end - rhs_start)
+        let compared = compare_prerelease_identifier(lhs_item, rhs_item)
+        if compared != 0_i32 { ret compared }
+        let lhs_done = lhs_end == lhs.len()
+        let rhs_done = rhs_end == rhs.len()
+        if lhs_done && rhs_done { ret 0_i32 }
+        if lhs_done { ret -1_i32 }
+        if rhs_done { ret 1_i32 }
+        lhs_start = lhs_end + 1_usize
+        rhs_start = rhs_end + 1_usize
+    }
+    ret 0_i32
+}
+
+fn compare_prerelease_identifier(lhs: str, rhs: str) -> i32 {
+    let lhs_numeric = semantic_identifier_is_numeric(lhs)
+    let rhs_numeric = semantic_identifier_is_numeric(rhs)
+    if lhs_numeric && !rhs_numeric { ret -1_i32 }
+    if !lhs_numeric && rhs_numeric { ret 1_i32 }
+    if lhs_numeric && rhs_numeric {
+        if lhs.len() != rhs.len() { if lhs.len() > rhs.len() { ret 1_i32 } ret -1_i32 }
+    }
+    ret compare_ascii(lhs, rhs)
+}
+
+fn compare_ascii(lhs: str, rhs: str) -> i32 {
+    let limit = if lhs.len() < rhs.len() { lhs.len() } else { rhs.len() }
+    let mut index = 0_usize
+    while index < limit {
+        let left = lhs.byte_at(index)
+        let right = rhs.byte_at(index)
+        if left != right { if left > right { ret 1_i32 } ret -1_i32 }
+        index += 1_usize
+    }
+    if lhs.len() == rhs.len() { ret 0_i32 }
+    if lhs.len() > rhs.len() { ret 1_i32 }
+    ret -1_i32
+}
+
+fn valid_semantic_identifiers(value: str, reject_numeric_leading_zero: bool) -> bool {
+    if value == "" { ret false }
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index <= value.len() {
+        if index == value.len() || value.slice(index, 1_usize) == "." {
+            if index == start { ret false }
+            let item = value.slice(start, index - start)
+            if reject_numeric_leading_zero && semantic_identifier_is_numeric(item) && item.len() > 1_usize && item.slice(0_usize, 1_usize) == "0" { ret false }
+            start = index + 1_usize
+        } else {
+            let ch = value.byte_at(index)
+            let valid = (ch >= 48_u8 && ch <= 57_u8) || (ch >= 65_u8 && ch <= 90_u8) || (ch >= 97_u8 && ch <= 122_u8) || ch == 45_u8
+            if !valid { ret false }
+        }
+        index += 1_usize
+    }
+    ret true
+}
+
+fn semantic_identifier_is_numeric(value: str) -> bool {
+    if value == "" { ret false }
+    let mut index = 0_usize
+    while index < value.len() {
+        let ch = value.byte_at(index)
+        if ch < 48_u8 || ch > 57_u8 { ret false }
+        index += 1_usize
+    }
+    ret true
+}
+
 fn resolve_locked_package(project_root: Path, reference: str) -> str {
     let lock = project_root.join("encore.lock")
     if !file_exists(lock.as_str()) { ret "" }
     let source = read_file(lock.as_str())
-    let block = lock_package_block(source, reference)
+    let mut block = lock_package_block(source, reference)
+    if block == "" { block = compatible_lock_package_block(source, reference) }
     if block == "" { ret "" }
     let name = lock_value(block, "name")
     let version = lock_value(block, "version")
     let checksum = lock_value(block, "checksum")
     let archive = lock_value(block, "archive")
     if name == "" || version == "" || archive == "" || !valid_checksum(checksum) { ret "" }
+    let spec = dependency_base_reference(reference).slice(6_usize, dependency_base_reference(reference).len() - 6_usize)
+    let requirement_start = find_from(spec, "@", 0_usize)
+    let expected_name = spec.slice(0_usize, requirement_start)
+    let requirement = if requirement_start < spec.len() { spec.slice(requirement_start + 1_usize, spec.len() - requirement_start - 1_usize) } else { "" }
+    if name != expected_name || !registry_version_matches(version, requirement) { ret "" }
     let root = package_cache_root(name, version, checksum)
     if file_exists(root.join("encore.toml").as_str()) { ret root.as_str() }
     ret install_package(name, RegistryVersion{version, archive, checksum})
+}
+
+fn compatible_lock_package_block(source: str, reference: str) -> str {
+    let base = dependency_base_reference(reference)
+    if !starts_with(base, "index@") { ret "" }
+    let spec = base.slice(6_usize, base.len() - 6_usize)
+    let requirement_start = find_from(spec, "@", 0_usize)
+    let expected_name = spec.slice(0_usize, requirement_start)
+    let requirement = if requirement_start < spec.len() { spec.slice(requirement_start + 1_usize, spec.len() - requirement_start - 1_usize) } else { "" }
+    let mut offset = 0_usize
+    while offset < source.len() {
+        let start = find_from(source, "[[packages]]", offset)
+        if start == source.len() { break }
+        let next = find_from(source, "[[packages]]", start + 12_usize)
+        let block = source.slice(start, next - start)
+        if lock_value(block, "name") == expected_name && registry_version_matches(lock_value(block, "version"), requirement) { ret block }
+        offset = next
+    }
+    ret ""
 }
 
 fn install_package(name: str, version: RegistryVersion) -> str {

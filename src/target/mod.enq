@@ -1,7 +1,10 @@
+//! Describes native compilation targets and their capabilities.
+
 import core::option::Option
 import std::os::{arch_name, env, os_name}
 import std::vec::Vec
 
+/// Describes a normalized LLVM-compatible native target.
 pub struct TargetSpec {
     triple: str
     arch: str
@@ -15,7 +18,9 @@ pub struct TargetSpec {
     freestanding: bool
 }
 
+/// Configures the compiler, linker, archiver, sysroot, and target flags.
 pub struct Toolchain {
+    driver: str
     compiler: str
     linker: str
     archiver: str
@@ -29,10 +34,12 @@ pub struct Toolchain {
     hosted_runtime: bool
 }
 
+/// Returns the normalized target specification of the current host.
 pub fn host_target() -> TargetSpec {
     ret parse_target(host_triple())
 }
 
+/// Returns the LLVM-compatible target triple of the current host.
 pub fn host_triple() -> str {
     let arch = canonical_arch(arch_name())
     let os = os_name()
@@ -42,6 +49,7 @@ pub fn host_triple() -> str {
     ret arch + "-unknown-" + os
 }
 
+/// Parses a target triple or resolves `auto`, `host`, and `native`.
 pub fn parse_target(raw: str) -> TargetSpec {
     let triple = if raw == "" || raw == "auto" || raw == "host" || raw == "native" { host_triple() } else { raw }
     let arch = canonical_arch(segment(triple, 0_usize))
@@ -56,31 +64,48 @@ pub fn parse_target(raw: str) -> TargetSpec {
     ret TargetSpec{triple, arch, vendor, os, environment, family, pointer_width, endian, executable_suffix, freestanding}
 }
 
+/// Builds the default toolchain from environment overrides and target type.
 pub fn default_toolchain(target: TargetSpec) -> Toolchain {
+    let driver = env_or("ENCORE_TOOLCHAIN_DRIVER", "clang")
     let compiler = env_or("ENCORE_CC", "clang")
     let linker = env_or("ENCORE_LINKER", compiler)
     let archiver = env_or("ENCORE_AR", "llvm-ar")
     let sysroot = env_or("ENCORE_SYSROOT", "")
     let cpu = env_or("ENCORE_TARGET_CPU", "")
     let features = env_or("ENCORE_TARGET_FEATURES", "")
-    ret Toolchain{compiler, linker, archiver, sysroot, cpu, features, Vec[str]::new(), Vec[str]::new(), Vec[str]::new(), "", !target.freestanding}
+    ret Toolchain{driver, compiler, linker, archiver, sysroot, cpu, features, Vec[str]::new(), Vec[str]::new(), Vec[str]::new(), "", !target.freestanding}
 }
 
+/// Returns whether the named build driver is supported.
+pub fn toolchain_driver_is_supported(driver: str) -> bool { ret driver == "clang" }
+
+/// Returns whether `target` exactly matches the current host triple.
 pub fn target_is_host(target: TargetSpec) -> bool { ret target.triple == host_triple() }
-pub fn target_is_supported(target: TargetSpec) -> bool { ret target.pointer_width != 0_usize }
+/// Returns whether the compiler recognizes the target architecture and OS.
+pub fn target_is_supported(target: TargetSpec) -> bool {
+    ret target.pointer_width != 0_usize && target.os != "unknown" && target_segment_count(target.triple) >= 3_usize
+}
+/// Adds the target-specific executable suffix to a binary name.
 pub fn target_executable_name(target: TargetSpec, name: str) -> str { ret name + target.executable_suffix }
 
+/// Evaluates a conditional-compilation expression without project features.
 pub fn cfg_active(target: TargetSpec, expr: str) -> bool {
+    ret cfg_active_with_features(target, expr, Vec[str]::new())
+}
+
+/// Evaluates a conditional-compilation expression for a target and features.
+pub fn cfg_active_with_features(target: TargetSpec, expr: str, features: Vec[str]) -> bool {
     let value = compact(expr)
     if starts_with(value, "not(") && ends_with(value, ")") {
-        ret !cfg_active(target, value.slice(4_usize, value.len() - 5_usize))
+        ret !cfg_active_with_features(target, value.slice(4_usize, value.len() - 5_usize), features)
     }
     if starts_with(value, "all(") && ends_with(value, ")") {
-        ret cfg_list(target, value.slice(4_usize, value.len() - 5_usize), true)
+        ret cfg_list(target, value.slice(4_usize, value.len() - 5_usize), true, features)
     }
     if starts_with(value, "any(") && ends_with(value, ")") {
-        ret cfg_list(target, value.slice(4_usize, value.len() - 5_usize), false)
+        ret cfg_list(target, value.slice(4_usize, value.len() - 5_usize), false, features)
     }
+    if starts_with(value, "feature=") { ret contains_string(features, strip_quotes(value.slice(8_usize, value.len() - 8_usize))) }
     if starts_with(value, "target_os=") { ret strip_quotes(value.slice(10_usize, value.len() - 10_usize)) == target.os }
     if starts_with(value, "target_arch=") { ret strip_quotes(value.slice(12_usize, value.len() - 12_usize)) == target.arch }
     if starts_with(value, "target_env=") { ret strip_quotes(value.slice(11_usize, value.len() - 11_usize)) == target.environment }
@@ -94,7 +119,7 @@ pub fn cfg_active(target: TargetSpec, expr: str) -> bool {
     ret false
 }
 
-fn cfg_list(target: TargetSpec, body: str, require_all: bool) -> bool {
+fn cfg_list(target: TargetSpec, body: str, require_all: bool, features: Vec[str]) -> bool {
     let mut start = 0_usize
     let mut index = 0_usize
     let mut depth = 0_usize
@@ -104,7 +129,7 @@ fn cfg_list(target: TargetSpec, body: str, require_all: bool) -> bool {
         if ch == "(" { depth = depth + 1_usize }
         elif ch == ")" { depth = depth - 1_usize }
         if ch == "," && depth == 0_usize {
-            let active = cfg_active(target, body.slice(start, index - start))
+            let active = cfg_active_with_features(target, body.slice(start, index - start), features)
             if require_all && !active { ret false }
             if !require_all && active { ret true }
             start = index + 1_usize
@@ -112,6 +137,11 @@ fn cfg_list(target: TargetSpec, body: str, require_all: bool) -> bool {
         index = index + 1_usize
     }
     ret require_all
+}
+
+fn contains_string(values: Vec[str], needle: str) -> bool {
+    for value in values { if value == needle { ret true } }
+    ret false
 }
 
 fn target_os(triple: str) -> str {
@@ -212,6 +242,17 @@ fn segment(value: str, wanted: usize) -> str {
     ret "unknown"
 }
 
+fn target_segment_count(value: str) -> usize {
+    if value == "" { ret 0_usize }
+    let mut count = 1_usize
+    let mut index = 0_usize
+    while index < value.len() {
+        if value.slice(index, 1_usize) == "-" { count += 1_usize }
+        index += 1_usize
+    }
+    ret count
+}
+
 fn compact(value: str) -> str {
     let mut out = ""
     let mut index = 0_usize
@@ -298,4 +339,18 @@ fn target_endian_contract() -> bool {
 fn target_unknown_architecture_contract() -> bool {
     let target = parse_target("fictional-unknown-none")
     ret target.pointer_width == 0_usize && !target_is_supported(target)
+}
+
+#attr(test)
+fn target_unknown_operating_system_contract() -> bool {
+    ret !target_is_supported(parse_target("x86_64-unknown-fictional"))
+        && !target_is_supported(parse_target("x86_64-linux"))
+}
+
+#attr(test)
+fn target_toolchain_driver_contract() -> bool {
+    ret toolchain_driver_is_supported("clang")
+        && !toolchain_driver_is_supported("gcc")
+        && !toolchain_driver_is_supported("clang-cl")
+        && !toolchain_driver_is_supported("")
 }

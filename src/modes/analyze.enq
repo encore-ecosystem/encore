@@ -1,0 +1,154 @@
+//! Implements the `encore analyze` command.
+
+import core::fmt::Debug
+import core::option::Option
+import core::io::eprintln
+import std::io::println
+import std::os::{argc, argv, file_exists, read_file}
+import std::path::Path
+import std::vec::Vec
+
+import json::{Json, field, stringify}
+import toml::{toml_get_string, toml_parse_document, toml_section_keys}
+import refrain::analyzer::{AnalyzerConfig, AnalyzerDiagnostic, RuleLevel, analyze_document, rule_is_known}
+import refrain::frontend::analyze_named_module
+import refrain::project::{ProjectWorkspace, load_binary_workspace, load_library_workspace}
+
+/// Runs the shared analyzer over a project or selected source file.
+pub fn native_analyze() -> u32 {
+    let mut root = Path::new(".").resolve()
+    let selected = analyze_path()
+    if selected != "" && !ends_with(selected, ".enq") { root = Path::new(selected).resolve() }
+
+    let mut config = AnalyzerConfig::new()
+    if !load_manifest_config(root, config) { ret 2_u32 }
+    if !apply_cli_levels(config) { ret 2_u32 }
+    let format = option_value("--format")
+    if format != "" && format != "full" && format != "json" {
+        eprintln("Error: unsupported analyzer format '" + format + "'")
+        ret 2_u32
+    }
+
+    let mut diagnostics = Vec[AnalyzerDiagnostic]::new()
+    let mut module_count = 0_usize
+    if selected != "" && ends_with(selected, ".enq") {
+        let path = Path::new(selected).resolve()
+        if !file_exists(path.as_str()) { eprintln("Error: analyzer path does not exist: " + selected) ret 2_u32 }
+        let document = analyze_named_module(path.as_str(), path.as_str(), read_file(path.as_str()))
+        diagnostics.extend(analyze_document(path.as_str(), document, config))
+        module_count = 1_usize
+    } else {
+        if !file_exists(root.join("encore.toml").as_str()) { eprintln("error[manifest]: Unable to find encore.toml at " + root.join("encore.toml").as_str()) ret 1_u32 }
+        let workspace = load_analysis_workspace(root)
+        for module in workspace.modules {
+            if module.owner_name == workspace.root_name {
+                diagnostics.extend(analyze_document(module.path(), module.analysis, config))
+                module_count += 1_usize
+            }
+        }
+    }
+
+    let mut denied = false
+    for diagnostic in diagnostics {
+        if diagnostic.severity == RuleLevel::Deny { denied = true }
+        if format == "json" { println(diagnostic_json(diagnostic)) }
+        else { print_diagnostic(diagnostic) }
+    }
+    if format != "json" {
+        let suffix = if module_count == 1_usize { "" } else { "s" }
+        println("Analyzed " + Debug::fmt(module_count) + " module" + suffix)
+    }
+    if denied { ret 1_u32 }
+    ret 0_u32
+}
+
+fn load_analysis_workspace(root: Path) -> ProjectWorkspace {
+    if file_exists(root.join("src").join("lib.enq").as_str()) { ret load_library_workspace(root) }
+    ret load_binary_workspace(root)
+}
+
+fn load_manifest_config(root: Path, config: mut AnalyzerConfig) -> bool {
+    let path = root.join("encore.toml")
+    if !file_exists(path.as_str()) { ret true }
+    let document = toml_parse_document(read_file(path.as_str()))
+    for code in toml_section_keys(document, "analyzer.rules") {
+        if !rule_is_known(code) { eprintln("Error: unknown analyzer rule '" + code + "'") ret false }
+        match toml_get_string(document, "analyzer.rules", code) {
+            Option[str]::Some(value) => {
+                match parse_level(value) {
+                    Option[RuleLevel]::Some(level) => { config.set_level(code, level) }
+                    Option[RuleLevel]::None => { eprintln("Error: invalid analyzer level '" + value + "' for " + code) ret false }
+                }
+            }
+            Option[str]::None => { eprintln("Error: analyzer rule '" + code + "' must be a string") ret false }
+        }
+    }
+    ret true
+}
+
+fn apply_cli_levels(config: mut AnalyzerConfig) -> bool {
+    let mut index = 2_usize
+    while index < argc() {
+        let arg = argument(index)
+        if arg == "--allow" || arg == "--warn" || arg == "--deny" {
+            if index + 1_usize >= argc() { ret false }
+            if !rule_is_known(argument(index + 1_usize)) { eprintln("Error: unknown analyzer rule '" + argument(index + 1_usize) + "'") ret false }
+            let level = if arg == "--allow" { RuleLevel::Allow } elif arg == "--warn" { RuleLevel::Warn } else { RuleLevel::Deny }
+            config.set_level(argument(index + 1_usize), level)
+            index += 1_usize
+        } elif arg == "--format" { index += 1_usize }
+        index += 1_usize
+    }
+    ret true
+}
+
+fn parse_level(value: str) -> Option[RuleLevel] {
+    if value == "allow" { ret Option[RuleLevel]::Some(RuleLevel::Allow) }
+    if value == "warn" { ret Option[RuleLevel]::Some(RuleLevel::Warn) }
+    if value == "deny" { ret Option[RuleLevel]::Some(RuleLevel::Deny) }
+    ret Option[RuleLevel]::None
+}
+
+fn print_diagnostic(diagnostic: AnalyzerDiagnostic) -> () {
+    let severity = if diagnostic.severity == RuleLevel::Deny { "error" } else { "warning" }
+    eprintln(diagnostic.path + ":" + Debug::fmt(diagnostic.line + 1_usize) + ":" + Debug::fmt(diagnostic.column + 1_usize) + ": " + severity + "[" + diagnostic.code + "]: " + diagnostic.message)
+    ret ()
+}
+
+fn diagnostic_json(diagnostic: AnalyzerDiagnostic) -> str {
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("path", Json::String(diagnostic.path)))
+    fields.push(field("line", Json::Number(Debug::fmt(diagnostic.line + 1_usize))))
+    fields.push(field("column", Json::Number(Debug::fmt(diagnostic.column + 1_usize))))
+    fields.push(field("severity", Json::String(if diagnostic.severity == RuleLevel::Deny { "error" } else { "warning" })))
+    fields.push(field("code", Json::String(diagnostic.code)))
+    fields.push(field("message", Json::String(diagnostic.message)))
+    ret stringify(Json::Object(fields))
+}
+
+fn analyze_path() -> str {
+    let mut index = 2_usize
+    while index < argc() {
+        let arg = argument(index)
+        if arg == "--allow" || arg == "--warn" || arg == "--deny" || arg == "--format" { index += 1_usize }
+        elif !starts_with(arg, "-") { ret arg }
+        index += 1_usize
+    }
+    ret ""
+}
+
+fn option_value(name: str) -> str {
+    let mut index = 2_usize
+    while index + 1_usize < argc() {
+        if argument(index) == name { ret argument(index + 1_usize) }
+        index += 1_usize
+    }
+    ret ""
+}
+
+fn argument(index: usize) -> str {
+    match argv(index) { Option[str]::Some(value) => { ret value } Option[str]::None => { ret "" } }
+}
+
+fn starts_with(value: str, prefix: str) -> bool { ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix }
+fn ends_with(value: str, suffix: str) -> bool { ret suffix.len() <= value.len() && value.slice(value.len() - suffix.len(), suffix.len()) == suffix }

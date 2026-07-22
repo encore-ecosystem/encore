@@ -1,8 +1,11 @@
+//! Tokenizes Encore source code.
+
 import mod::token::Token
 import mod::token::TokenType
 
 import core::option::Option
-import core::panic::panic
+import core::io::eprintln
+import core::process::exit
 import std::vec::Vec
 
 import std::io::println
@@ -12,34 +15,42 @@ import core::fmt::Debug
 extern fn encore_str_char_width_at_byte(value: str, byte_index: usize) -> usize
 extern fn encore_str_char_at_byte(value: str, byte_index: usize) -> str
 
+/// Stores the state of a `Lexer` value.
 pub struct Lexer {
     line: usize
     column: usize
     consumed: usize
     token_start: usize
+    token_line: usize
+    token_column: usize
     program: str
     tokens: Vec[Token]
 }
 
 
 impl for Lexer {
+    /// Creates a new value with its default initial state.
     pub fn new() -> Lexer {
-        ret Lexer{0_usize, 0_usize, 0_usize, 0_usize, "", Vec[Token]::new()}
+        ret Lexer{0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0_usize, "", Vec[Token]::new()}
     }
 
+    /// Performs the `tokenize` operation.
     pub fn tokenize(mut self, p: str) -> Vec[Token] {
         self.line = 0_usize
         self.column = 0_usize
         self.consumed = 0_usize
         self.token_start = 0_usize
+        self.token_line = 0_usize
+        self.token_column = 0_usize
         self.program = p
         self.tokens = Vec[Token]::new()
 
         let mut progress_guard = 0_usize
         loop {
             progress_guard = progress_guard + 1_usize
-            if progress_guard > self.program.len() * 4_usize + 16_usize {
-                panic("Lexer made no progress at byte/char index " + Debug::fmt(self.consumed))
+            if progress_guard > self.program.byte_len() * 4_usize + 16_usize {
+                eprintln("error[lexer-invariant]: lexer made no progress at byte index " + Debug::fmt(self.consumed))
+                exit(1_i32)
             }
             match self.peek_curr() {
                 "" => {
@@ -52,15 +63,11 @@ impl for Lexer {
                     self.consume_and_push(TokenType::WHITESPACE)
                 }
                 "\r" => {
-                    self.line = self.line + 1_usize
-                    self.column = 0_usize
                     self.consume()
-                    if self.peek_curr() == "\n" { self.consume() }
+                    if self.peek_curr() == "\n" { self.consumed += 1_usize }
                     self.push_token(TokenType::NEWLINE)
                 }
                 "\n" => {
-                    self.line = self.line + 1_usize
-                    self.column = 0_usize
                     self.consume_and_push(TokenType::NEWLINE)
                 }
                 "+" => {
@@ -112,30 +119,21 @@ impl for Lexer {
                     self.consume()
                     if self.peek_curr() == "/" {
                         self.consume()
-                        loop {
-                            if self.is_at_end() {
-                                break
-                            }
-                            if is_newline_char(self.peek_curr()) {
-                                break
-                            }
+                        let mut comment_type = TokenType::ONE_LINE_COMMENT
+                        if self.peek_curr() == "/" {
                             self.consume()
+                            comment_type = TokenType::DOC_COMMENT
                         }
-                        self.push_token(TokenType::ONE_LINE_COMMENT)
+                        elif self.peek_curr() == "!" {
+                            self.consume()
+                            comment_type = TokenType::MODULE_DOC_COMMENT
+                        }
+                        self.skip_one_line_comment()
+                        self.push_token(comment_type)
                     }
                     elif self.peek_curr() == "*" {
                         self.consume()
-                        loop {
-                            if self.is_at_end() {
-                                break
-                            }
-                            if self.peek_curr() == "*" {
-                                if self.peek_next() == "/" {
-                                    break
-                                }
-                            }
-                            self.consume()
-                        }
+                        self.skip_multi_line_comment_body()
 
                         if self.is_at_end() {
                             self.push_token(TokenType::UNKNOWN)
@@ -376,6 +374,50 @@ impl for Lexer {
         }
 
         self.consumed = self.consumed + unsafe { encore_str_char_width_at_byte(self.program, self.consumed) }
+        if curr_char == "\n" || curr_char == "\r" {
+            self.line += 1_usize
+            self.column = 0_usize
+        } else {
+            self.column += 1_usize
+        }
+        ret ()
+    }
+
+    fn skip_one_line_comment(mut self) -> () {
+        let end = self.program.byte_len()
+        while self.consumed < end {
+            let byte = self.program.byte_at(self.consumed)
+            if byte == 10_u8 || byte == 13_u8 { break }
+            let width = unsafe { encore_str_char_width_at_byte(self.program, self.consumed) }
+            if width == 0_usize { break }
+            self.consumed += width
+            self.column += 1_usize
+        }
+        ret ()
+    }
+
+    fn skip_multi_line_comment_body(mut self) -> () {
+        let end = self.program.byte_len()
+        while self.consumed < end {
+            let byte = self.program.byte_at(self.consumed)
+            if byte == 42_u8 && self.consumed + 1_usize < end && self.program.byte_at(self.consumed + 1_usize) == 47_u8 { break }
+            if byte == 13_u8 {
+                self.consumed += 1_usize
+                if self.consumed < end && self.program.byte_at(self.consumed) == 10_u8 { self.consumed += 1_usize }
+                self.line += 1_usize
+                self.column = 0_usize
+            }
+            elif byte == 10_u8 {
+                self.consumed += 1_usize
+                self.line += 1_usize
+                self.column = 0_usize
+            } else {
+                let width = unsafe { encore_str_char_width_at_byte(self.program, self.consumed) }
+                if width == 0_usize { break }
+                self.consumed += width
+                self.column += 1_usize
+            }
+        }
         ret ()
     }
 
@@ -388,6 +430,10 @@ impl for Lexer {
     fn push_token(mut self, token_type: TokenType) -> () {
         let token_value = self.program.slice_bytes(self.token_start, self.consumed - self.token_start)
         self.token_start = self.consumed
+        let line = self.token_line
+        let column = self.token_column
+        self.token_line = self.line
+        self.token_column = self.column
         match token_type {
             TokenType::NEWLINE => {
                 ret ()
@@ -407,15 +453,15 @@ impl for Lexer {
         let token = Token::new(
             token_type,
             token_value,
-            self.line,
-            self.column
+            line,
+            column
         )
         self.tokens.push(token)
         ret ()
     }
 
     fn is_at_end(mut self) -> bool {
-        ret self.consumed >= self.program.len()
+        ret self.consumed >= self.program.byte_len()
     }
 
     fn peek_curr(mut self) -> str {
@@ -435,7 +481,7 @@ impl for Lexer {
             byte_index = byte_index + width
             remaining = remaining - 1_usize
         }
-        if byte_index >= self.program.len() { ret "" }
+        if byte_index >= self.program.byte_len() { ret "" }
         ret unsafe { encore_str_char_at_byte(self.program, byte_index) }
     }
 }
@@ -444,6 +490,9 @@ impl for Lexer {
 fn identifier_token_type(raw: str) -> TokenType {
     ret match raw {
         "fn" => TokenType::KW_FN
+        "async" => TokenType::KW_ASYNC
+        "await" => TokenType::KW_AWAIT
+        "spawn" => TokenType::KW_SPAWN
         "struct" => TokenType::KW_STRUCT
         "enum" => TokenType::KW_ENUM
         "trait" => TokenType::KW_TRAIT
@@ -538,6 +587,25 @@ fn lexer_accepts_windows_line_endings() -> bool {
         if token.type == TokenType::UNKNOWN { ret false }
     }
     ret true
+}
+
+#attr(test)
+fn lexer_tracks_token_positions() -> bool {
+    let mut lexer = Lexer::new()
+    let tokens = lexer.tokenize("fn main() {\n    /* first\n       second */ ret 0_u32\n}\n")
+    let mut saw_main = false
+    let mut saw_ret = false
+    for token in tokens {
+        if token.value == "main" {
+            if token.line != 0_usize || token.column != 3_usize { ret false }
+            saw_main = true
+        }
+        if token.value == "ret" {
+            if token.line != 2_usize || token.column != 17_usize { ret false }
+            saw_ret = true
+        }
+    }
+    ret saw_main && saw_ret
 }
 
 fn is_double_quote_char(ch: str) -> bool {

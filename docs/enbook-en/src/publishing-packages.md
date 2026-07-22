@@ -155,8 +155,10 @@ transitive dependencies work together.
 4. Append the new version to the metadata file.
 5. Open an index PR.
 
-After merge, new projects and `encore update` select the appended version.
-Existing projects remain on the version recorded in `encore.lock`.
+After merge, new projects and `encore update` select the highest compatible
+SemVer version. Existing projects remain on the version recorded in
+`encore.lock` unless their manifest constraints can no longer be satisfied by
+that locked graph.
 
 ## Yank A Version
 

@@ -10,7 +10,8 @@ release_dir=$(CDPATH= cd -- "$1" && pwd)
 triples='x86_64-unknown-linux-gnu
 aarch64-unknown-linux-gnu
 x86_64-apple-darwin
-aarch64-apple-darwin'
+aarch64-apple-darwin
+x86_64-pc-windows-msvc'
 expected=$(mktemp)
 actual=$(mktemp)
 checksums=$(mktemp)
@@ -26,6 +27,7 @@ hash_file() {
 
 for triple in $triples; do
     extension=tar.gz
+    case "$triple" in *-windows-*) extension=zip ;; esac
     archive="encore-${triple}.${extension}"
     printf '%s\n%s\n' "$archive" "$archive.sha256" >> "$expected"
 done
@@ -40,6 +42,7 @@ fi
 
 for triple in $triples; do
     extension=tar.gz
+    case "$triple" in *-windows-*) extension=zip ;; esac
     archive="encore-${triple}.${extension}"
     sidecar="$release_dir/$archive.sha256"
 

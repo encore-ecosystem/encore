@@ -1,21 +1,29 @@
+//! Parses Encore tokens into the compiler syntax tree.
+
 import refrain::frontend::lexer::Token
 import refrain::frontend::lexer::TokenType
 import refrain::frontend::lexer::Lexer
 
 import mod::statements::*
 
-import core::panic::panic
+import core::process::exit
+import core::io::eprintln
 import core::fmt::Debug
 import core::option::Option
-import std::io::println
 import std::vec::Vec
 
 struct MacroArgument {
     tokens: Vec[Token]
 }
 
+fn parser_error(message: str) -> () {
+    eprintln("error[parse]: " + message)
+    exit(1_i32)
+    ret ()
+}
+
 fn required_macro_token(tokens: Vec[Token], index: usize) -> Token {
-    match tokens.get(index) { Some(token) => { ret token } None => { panic("Malformed macro token stream at " + Debug::fmt(index) + "/" + Debug::fmt(tokens.len())) } }
+    match tokens.get(index) { Some(token) => { ret token } None => { parser_error("Malformed macro token stream at " + Debug::fmt(index) + "/" + Debug::fmt(tokens.len())) } }
     ret Token::new(TokenType::UNKNOWN, "", 0_usize, 0_usize)
 }
 fn macro_token_value_or_empty(tokens: Vec[Token], index: usize) -> str { match tokens.get(index) { Some(token) => { ret token.value } None => { ret "" } } }
@@ -32,7 +40,7 @@ fn macro_close_for(value: str) -> str {
 fn macro_matching_close(tokens: Vec[Token], open: usize) -> usize {
     let opening = required_macro_token(tokens, open).value
     let closing = macro_close_for(opening)
-    if closing == "" { panic("Macro delimiter expected") }
+    if closing == "" { parser_error("Macro delimiter expected") }
     let mut depth = 1_usize
     let mut index = open + 1_usize
     while index < tokens.len() {
@@ -44,7 +52,7 @@ fn macro_matching_close(tokens: Vec[Token], open: usize) -> usize {
         }
         index = index + 1_usize
     }
-    panic("Unclosed macro delimiter")
+    parser_error("Unclosed macro delimiter")
     ret tokens.len()
 }
 
@@ -134,7 +142,9 @@ struct BootstrapMacro {
     variadic: bool
 }
 
+/// Parses a token stream into Encore syntax-tree statements.
 pub struct Parser {
+    source_name: str
     tokens: Vec[Token]
     consumed: usize
     ast: Vec[Statement]
@@ -146,8 +156,15 @@ pub struct Parser {
 
 
 impl for Parser {
+    /// Creates a parser without a diagnostic source name.
     pub fn new() -> Parser {
+        ret Parser::new_for_source("")
+    }
+
+    /// Creates a parser that reports errors against `source_name`.
+    pub fn new_for_source(source_name: str) -> Parser {
         ret Parser{
+            source_name,
             Vec[Token]::new(),
             0_usize,
             Vec[Statement]::new(),
@@ -158,6 +175,14 @@ impl for Parser {
         }
     }
 
+    fn error_at(mut self, message: str, token: Token) -> () {
+        let location = if self.source_name == "" { "" } else { self.source_name + ":" }
+        eprintln(location + Debug::fmt(token.line + 1_usize) + ":" + Debug::fmt(token.column + 1_usize) + ": error[parse]: " + message)
+        exit(1_i32)
+        ret ()
+    }
+
+    /// Parses a complete token stream into top-level statements.
     pub fn parse(mut self, tokens: Vec[Token]) -> Vec[Statement] {
         self.macros = Vec[BootstrapMacro]::new()
         self.tokens = self.expand_macro_program(tokens)
@@ -257,15 +282,26 @@ impl for Parser {
     }
 
     fn mk_expr(mut self, value: Expr) -> ExprNode {
-        ret ExprNode{value}
+        let token = self.peek_curr()
+        ret ExprNode{value, token.line, token.column, token.value.char_len(), self.source_name}
+    }
+
+    fn mk_expr_at(mut self, value: Expr, token: Token) -> ExprNode {
+        ret ExprNode{value, token.line, token.column, token.value.char_len(), self.source_name}
     }
 
     fn box_expr(mut self, node: ExprNode) -> ExprNode<H> {
-        ret ExprNode<H>{node.value}
+        ret ExprNode<H>{node.value, node.line, node.column, node.length, node.source_name}
     }
 
     fn parse_top_level(mut self) -> Statement {
+        while self.peek_curr_type() == TokenType::MODULE_DOC_COMMENT { self.consume() }
+        let mut documentation = self.parse_documentation()
         let attrs = self.parse_function_attrs()
+        match documentation {
+            Option[Documentation]::None => { documentation = self.parse_documentation() }
+            Option[Documentation]::Some(_) => {}
+        }
         let mut is_public = false
         if self.peek_curr_type() == TokenType::KW_PUB {
             self.consume()
@@ -273,63 +309,66 @@ impl for Parser {
         }
 
         let curr_token = self.peek_curr()
-        if attrs.len() > 0_usize && curr_token.type != TokenType::KW_FN && curr_token.type != TokenType::KW_EXTERN {
+        if attrs.len() > 0_usize && curr_token.type != TokenType::KW_FN && curr_token.type != TokenType::KW_ASYNC && curr_token.type != TokenType::KW_EXTERN {
             self.unexpected_token("function after attributes", curr_token)
         }
         match curr_token.type {
             TokenType::KW_IMPORT => {
-                ret self.parse_import(is_public)
+                ret self.parse_import(is_public, documentation)
             }
             TokenType::KW_ENUM => {
-                ret self.parse_enum(is_public)
+                ret self.parse_enum(is_public, documentation)
             }
             TokenType::KW_STRUCT => {
-                ret self.parse_struct(is_public)
+                ret self.parse_struct(is_public, documentation)
             }
             TokenType::KW_TRAIT => {
-                ret self.parse_trait(is_public)
+                ret self.parse_trait(is_public, documentation)
             }
             TokenType::KW_IMPL => {
-                ret self.parse_impl()
+                ret self.parse_impl(documentation)
             }
             TokenType::KW_FN => {
-                ret self.parse_fn(is_public, attrs)
+                ret self.parse_fn(is_public, attrs, documentation)
+            }
+            TokenType::KW_ASYNC => {
+                ret self.parse_fn(is_public, attrs, documentation)
             }
             TokenType::KW_EXTERN => {
-                ret self.parse_extern(is_public, attrs)
+                ret self.parse_extern(is_public, attrs, documentation)
             }
             TokenType::KW_LET => {
-                ret self.parse_global_constant(is_public)
+                ret self.parse_global_constant(is_public, documentation)
             }
             _ => {
                 self.unexpected_token("top-level statement", curr_token)
-                ret Statement::Import(ImportStmt{false, ""})
+                ret Statement::Import(ImportStmt{false, "", Option[Documentation]::None})
             }
         }
     }
 
-    fn parse_global_constant(mut self, is_public: bool) -> Statement {
+    fn parse_global_constant(mut self, is_public: bool, documentation: Option[Documentation]) -> Statement {
         match self.parse_let() {
             Statement::Let(item) => {
                 let mut statements = Vec[Statement]::new()
                 statements.push(Statement::Ret(item.expr))
                 ret Statement::Function(FunctionItem{
-                    Vec[str]::new(), is_public, false, item.name, Vec[GenericParam]::new(),
-                    Vec[FunctionParam]::new(), item.typ, Option[ParsedBlock]::Some(ParsedBlock{statements})
+                    Vec[str]::new(), is_public, false, false, item.name, documentation, Vec[GenericParam]::new(),
+                    Vec[FunctionParam]::new(), item.typ, Option[ParsedBlock]::Some(ParsedBlock{statements}), item.expr.source_name, item.expr.line, item.expr.column
                 })
             }
             _ => {}
         }
-        ret Statement::Import(ImportStmt{false, ""})
+        ret Statement::Import(ImportStmt{false, "", Option[Documentation]::None})
     }
 
-    fn parse_import(mut self, is_public: bool) -> Statement {
+    fn parse_import(mut self, is_public: bool, documentation: Option[Documentation]) -> Statement {
         self.safe_consume(TokenType::KW_IMPORT)
         let path = self.parse_import_path()
-        ret Statement::Import(ImportStmt{is_public, path})
+        ret Statement::Import(ImportStmt{is_public, path, documentation})
     }
 
-    fn parse_enum(mut self, is_public: bool) -> Statement {
+    fn parse_enum(mut self, is_public: bool, documentation: Option[Documentation]) -> Statement {
         self.safe_consume(TokenType::KW_ENUM)
         let name = self.safe_consume_value(TokenType::IDENTIFIER)
         let generics = self.parse_possible_generic_params()
@@ -340,7 +379,8 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                 break
             }
-            variants.push(self.parse_structure_shape())
+            let variant_documentation = self.parse_documentation()
+            variants.push(self.parse_structure_shape(variant_documentation))
             let curr_type = self.peek_curr_type()
             if curr_type == TokenType::COMMA {
                 self.consume()
@@ -351,16 +391,17 @@ impl for Parser {
         }
         self.safe_consume(TokenType::RIGHT_BRACE)
 
-        ret Statement::EnumItem(EnumStmt{is_public, name, generics, variants})
+        ret Statement::EnumItem(EnumStmt{is_public, name, documentation, generics, variants})
     }
 
-    fn parse_struct(mut self, is_public: bool) -> Statement {
+    fn parse_struct(mut self, is_public: bool, documentation: Option[Documentation]) -> Statement {
         self.safe_consume(TokenType::KW_STRUCT)
-        let shape = self.parse_structure_shape()
+        let shape = self.parse_structure_shape(Option[Documentation]::None)
         ret Statement::Struct(
             StructStmt{
                 is_public,
                 shape.name,
+                documentation,
                 shape.generics,
                 shape.named_fields,
                 shape.tuple_fields,
@@ -370,7 +411,8 @@ impl for Parser {
         )
     }
 
-    fn parse_trait(mut self, is_public: bool) -> Statement {
+    fn parse_trait(mut self, is_public: bool, documentation: Option[Documentation]) -> Statement {
+        let declaration_token = self.peek_curr()
         self.safe_consume(TokenType::KW_TRAIT)
         let name = self.safe_consume_value(TokenType::IDENTIFIER)
         let generics = self.parse_possible_generic_params()
@@ -382,15 +424,21 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                 break
             }
+            let mut method_documentation = self.parse_documentation()
             let attrs = self.parse_function_attrs()
-            methods.push(self.parse_function_signature(false, attrs))
+            match method_documentation {
+                Option[Documentation]::None => { method_documentation = self.parse_documentation() }
+                Option[Documentation]::Some(_) => {}
+            }
+            methods.push(self.parse_function_signature(false, attrs, method_documentation))
         }
         self.safe_consume(TokenType::RIGHT_BRACE)
 
-        ret Statement::Trait(TraitStmt{is_public, name, generics, bases, methods})
+        ret Statement::Trait(TraitStmt{is_public, name, documentation, generics, bases, methods, self.source_name, declaration_token.line, declaration_token.column})
     }
 
-    fn parse_impl(mut self) -> Statement {
+    fn parse_impl(mut self, documentation: Option[Documentation]) -> Statement {
+        let declaration_token = self.peek_curr()
         self.safe_consume(TokenType::KW_IMPL)
         let generics = self.parse_possible_generic_params()
 
@@ -411,55 +459,79 @@ impl for Parser {
                 break
             }
 
+            let mut method_documentation = self.parse_documentation()
             let attrs = self.parse_function_attrs()
+            match method_documentation {
+                Option[Documentation]::None => { method_documentation = self.parse_documentation() }
+                Option[Documentation]::Some(_) => {}
+            }
             let mut is_public = false
             if self.peek_curr_type() == TokenType::KW_PUB {
                 self.consume()
                 is_public = true
             }
 
-            let header = self.parse_function_signature(is_public, attrs)
+            let header = self.parse_function_signature(is_public, attrs, method_documentation)
             let body = self.parse_block()
             methods.push(
                 FunctionItem{
                     header.attrs,
                     header.is_public,
                     header.is_extern,
+                    header.is_async,
                     header.name,
+                    header.documentation,
                     header.generics,
                     header.params,
                     header.ret_type,
-                    Option[ParsedBlock]::Some(body)
+                    Option[ParsedBlock]::Some(body),
+                    header.source_name,
+                    header.line,
+                    header.column
                 }
             )
         }
         self.safe_consume(TokenType::RIGHT_BRACE)
 
-        ret Statement::Impl(ImplStmt{generics, trait_name, trait_args, target, methods})
+        ret Statement::Impl(ImplStmt{documentation, generics, trait_name, trait_args, target, methods, self.source_name, declaration_token.line, declaration_token.column})
     }
 
-    fn parse_fn(mut self, is_public: bool, attrs: Vec[str]) -> Statement {
-        let header = self.parse_function_signature(is_public, attrs)
+    fn parse_fn(mut self, is_public: bool, attrs: Vec[str], documentation: Option[Documentation]) -> Statement {
+        let header = self.parse_function_signature(is_public, attrs, documentation)
+        if header.is_extern {
+            ret Statement::Function(header)
+        }
         let body = self.parse_block()
         ret Statement::Function(
             FunctionItem{
                 header.attrs,
                 header.is_public,
                 header.is_extern,
+                header.is_async,
                 header.name,
+                header.documentation,
                 header.generics,
                 header.params,
                 header.ret_type,
-                Option[ParsedBlock]::Some(body)
+                Option[ParsedBlock]::Some(body),
+                header.source_name,
+                header.line,
+                header.column
             }
         )
     }
 
-    fn parse_extern(mut self, is_public: bool, attrs: Vec[str]) -> Statement {
-        ret Statement::Function(self.parse_function_signature(is_public, attrs))
+    fn parse_extern(mut self, is_public: bool, attrs: Vec[str], documentation: Option[Documentation]) -> Statement {
+        ret Statement::Function(self.parse_function_signature(is_public, attrs, documentation))
     }
 
-    fn parse_function_signature(mut self, is_public: bool, attrs: Vec[str]) -> FunctionItem {
+    fn parse_function_signature(mut self, is_public: bool, attrs: Vec[str], documentation: Option[Documentation]) -> FunctionItem {
+        let signature_token = self.peek_curr()
+        let mut is_async = false
+        if self.peek_curr_type() == TokenType::KW_ASYNC {
+            self.consume()
+            is_async = true
+        }
         let mut is_extern = false
         if self.peek_curr_type() == TokenType::KW_EXTERN {
             self.consume()
@@ -494,11 +566,16 @@ impl for Parser {
             attrs,
             is_public,
             is_extern,
+            is_async,
             name,
+            documentation,
             generics,
             params,
             ret_type,
-            Option[ParsedBlock]::None
+            Option[ParsedBlock]::None,
+            self.source_name,
+            signature_token.line,
+            signature_token.column
         }
     }
 
@@ -525,6 +602,34 @@ impl for Parser {
             }
         }
         ret attrs
+    }
+
+    fn parse_documentation(mut self) -> Option[Documentation] {
+        if self.peek_curr_type() != TokenType::DOC_COMMENT {
+            ret Option[Documentation]::None
+        }
+        let first = self.peek_curr()
+        let mut text = ""
+        let mut previous_line = first.line
+        let mut line_count = 0_usize
+        loop {
+            if self.peek_curr_type() != TokenType::DOC_COMMENT { break }
+            let token = self.peek_curr()
+            if token.line > previous_line + 1_usize { break }
+            self.consume()
+            let mut line = ""
+            if token.value.len() >= 3_usize {
+                line = token.value.slice(3_usize, token.value.len() - 3_usize)
+            }
+            if line.len() > 0_usize && line.slice(0_usize, 1_usize) == " " {
+                line = line.slice(1_usize, line.len() - 1_usize)
+            }
+            if line_count > 0_usize { text = text + "\n" }
+            text = text + line
+            line_count += 1_usize
+            previous_line = token.line
+        }
+        ret Option[Documentation]::Some(Documentation::new(text, first.line, first.column))
     }
 
     fn metadata_directive(mut self, raw: str) -> str {
@@ -559,7 +664,7 @@ impl for Parser {
         ret out
     }
 
-    fn parse_structure_shape(mut self) -> ParsedEnumVariant {
+    fn parse_structure_shape(mut self, documentation: Option[Documentation]) -> ParsedEnumVariant {
         let name = self.safe_consume_value(TokenType::IDENTIFIER)
         let generics = self.parse_possible_generic_params()
 
@@ -570,10 +675,11 @@ impl for Parser {
                 if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                     break
                 }
+                let field_documentation = self.parse_documentation()
                 let field_name = self.safe_consume_value(TokenType::IDENTIFIER)
                 self.safe_consume(TokenType::COLON)
                 let field_type = self.parse_type()
-                named_fields.push(NamedField{field_name, field_type})
+                named_fields.push(NamedField{field_name, field_type, field_documentation})
                 let curr_type = self.peek_curr_type()
                 if curr_type == TokenType::COMMA {
                     self.consume()
@@ -583,7 +689,7 @@ impl for Parser {
                 }
             }
             self.safe_consume(TokenType::RIGHT_BRACE)
-            ret ParsedEnumVariant{name, generics, named_fields, Vec[str]::new(), false, false}
+            ret ParsedEnumVariant{name, documentation, generics, named_fields, Vec[str]::new(), false, false}
         }
 
         if self.peek_curr_type() == TokenType::LEFT_PAREN {
@@ -603,10 +709,10 @@ impl for Parser {
                 }
             }
             self.safe_consume(TokenType::RIGHT_PAREN)
-            ret ParsedEnumVariant{name, generics, Vec[NamedField]::new(), tuple_fields, true, false}
+            ret ParsedEnumVariant{name, documentation, generics, Vec[NamedField]::new(), tuple_fields, true, false}
         }
 
-        ret ParsedEnumVariant{name, generics, Vec[NamedField]::new(), Vec[str]::new(), false, true}
+        ret ParsedEnumVariant{name, documentation, generics, Vec[NamedField]::new(), Vec[str]::new(), false, true}
     }
 
     fn parse_block(mut self) -> ParsedBlock {
@@ -742,9 +848,10 @@ impl for Parser {
         self.safe_consume(TokenType::KW_FOR)
         let label = self.parse_maybe_label()
         let name = self.safe_consume_value(TokenType::IDENTIFIER)
-        let in_kw = self.safe_consume_value(TokenType::IDENTIFIER)
+        let in_token = self.safe_consume(TokenType::IDENTIFIER)
+        let in_kw = in_token.value
         if in_kw != "in" {
-            panic("Expected `in` in for-loop, got: " + in_kw)
+            self.error_at("Expected `in` in for-loop, got: " + in_kw, in_token)
         }
         self.parsing_control_flow_header = true
         let mut iterable = self.parse_expression()
@@ -829,7 +936,7 @@ impl for Parser {
         }
 
         if self.peek_curr_type() != TokenType::KW_ELSE {
-            panic("If expression must have else branch")
+            self.error_at("If expression must have else branch", self.peek_curr())
             ret self.mk_expr(Expr::Path(""))
         }
         self.consume()
@@ -938,7 +1045,7 @@ impl for Parser {
                 let value = self.literal_value(self.parse_float_literal())
                 ret MatchPattern{"float", Option[str]::Some(value), Option[str]::None}
             }
-            panic("Match pattern '-' must be followed by numeric literal")
+            self.error_at("Match pattern '-' must be followed by numeric literal", self.peek_curr())
             ret MatchPattern{"invalid", Option[str]::None, Option[str]::None}
         }
 
@@ -1160,6 +1267,16 @@ impl for Parser {
 
     fn parse_unary(mut self) -> ExprNode {
         let token = self.peek_curr()
+        if token.type == TokenType::KW_AWAIT {
+            self.consume()
+            let expr = self.parse_unary()
+            ret self.mk_expr_at(Expr::Await(self.box_expr(expr)), token)
+        }
+        if token.type == TokenType::KW_SPAWN {
+            self.consume()
+            let expr = self.parse_unary()
+            ret self.mk_expr_at(Expr::Spawn(self.box_expr(expr)), token)
+        }
         if self.is_unary_operator(token.type) {
             self.consume()
             let expr = self.parse_unary()
@@ -1196,6 +1313,7 @@ impl for Parser {
     }
 
     fn parse_integer_literal(mut self) -> ExprNode {
+        let token = self.peek_curr()
         let mut value = self.safe_consume_value(TokenType::INTEGER)
         match self.parse_numeric_literal_suffix() {
             Option[str]::Some(text) => {
@@ -1203,10 +1321,11 @@ impl for Parser {
             }
             Option[str]::None => {}
         }
-        ret self.mk_expr(Expr::Integer(value))
+        ret self.mk_expr_at(Expr::Integer(value), token)
     }
 
     fn parse_float_literal(mut self) -> ExprNode {
+        let token = self.peek_curr()
         let mut value = self.safe_consume_value(TokenType::FLOAT)
         match self.parse_numeric_literal_suffix() {
             Option[str]::Some(text) => {
@@ -1214,7 +1333,7 @@ impl for Parser {
             }
             Option[str]::None => {}
         }
-        ret self.mk_expr(Expr::Float(value))
+        ret self.mk_expr_at(Expr::Float(value), token)
     }
 
     fn parse_parenthesized_or_tuple(mut self) -> ExprNode {
@@ -1286,9 +1405,12 @@ impl for Parser {
             }
             statements.push(self.parse_inner_level())
         }
-        let tail = self.parse_expression()
+        let mut tail = Option[ExprNode<H>]::None
+        if self.peek_curr_type() != TokenType::RIGHT_BRACE {
+            tail = Option[ExprNode<H>]::Some(self.box_expr(self.parse_expression()))
+        }
         self.safe_consume(TokenType::RIGHT_BRACE)
-        ret self.mk_expr(Expr::Block(BlockExpr{statements, self.box_expr(tail)}))
+        ret self.mk_expr(Expr::Block(BlockExpr{statements, tail}))
     }
 
     fn starts_expression_block_statement(mut self) -> bool {
@@ -1438,7 +1560,8 @@ impl for Parser {
                     ret expr
                 }
             }
-            let member = self.consume_value()
+            let member_token = self.consume()
+            let member = member_token.value
             let member_generics = self.parse_possible_generics()
 
             if self.peek_curr_type() == TokenType::LEFT_PAREN {
@@ -1450,11 +1573,11 @@ impl for Parser {
             }
 
             if member_generics.len() > 0_usize {
-                panic("Field can not have generic arguments")
+                self.error_at("Field can not have generic arguments", member_token)
                 ret expr
             }
 
-            expr = self.mk_expr(Expr::Field(FieldExpr{self.box_expr(expr), member}))
+            expr = self.mk_expr_at(Expr::Field(FieldExpr{self.box_expr(expr), member}), member_token)
         }
         ret expr
     }
@@ -1519,11 +1642,11 @@ impl for Parser {
             }
             TokenType::BOOLEAN => {
                 let token = self.consume()
-                ret self.mk_expr(Expr::Boolean(token.value == "true"))
+                ret self.mk_expr_at(Expr::Boolean(token.value == "true"), token)
             }
             TokenType::STRING => {
-                let value = self.consume_value()
-                ret self.mk_expr(Expr::StringLiteral(value))
+                let token = self.consume()
+                ret self.mk_expr_at(Expr::StringLiteral(token.value), token)
             }
             TokenType::LEFT_PAREN => {
                 ret self.parse_parenthesized_or_tuple()
@@ -1564,7 +1687,7 @@ impl for Parser {
                         }
                     }
                 }
-                ret self.mk_expr(Expr::Path(path))
+                ret self.mk_expr_at(Expr::Path(path), curr_token)
             }
             _ => {
                 self.unexpected_token("expression", curr_token)
@@ -1608,7 +1731,7 @@ impl for Parser {
     fn parse_inline_expression(mut self, source: str) -> ExprNode {
         let mut lexer = Lexer::new()
         let tokens = lexer.tokenize(source)
-        let mut nested = Parser::new()
+        let mut nested = Parser::new_for_source(self.source_name)
         ret nested.parse_inline_tokens(tokens)
     }
 
@@ -1874,7 +1997,7 @@ impl for Parser {
             self.consume()
             let token = self.safe_consume(TokenType::IDENTIFIER)
             if token.value != "self" {
-                panic("Only `self` may use prefix `mut` before the parameter name")
+                self.error_at("Only `self` may use prefix `mut` before the parameter name", token)
                 ret FunctionParam{"", Option[str]::None}
             }
             if self.peek_curr_type() == TokenType::COLON {
@@ -2104,18 +2227,14 @@ impl for Parser {
     }
 
     fn unexpected_token(mut self, expected: str, found: Token) -> () {
-        println("Parse error")
-        println("found: `" + found.value + "`")
-        println("expected: " + expected)
-        println("at line " + Debug::fmt(found.line) + ", column " + Debug::fmt(found.column))
-        panic("Unexpected token: " + found.value)
+        self.error_at("expected " + expected + ", found `" + found.value + "`", found)
         ret ()
     }
 
     fn safe_consume(mut self, expected_token_type: TokenType) -> Token {
         let token = self.consume()
         if token.type != expected_token_type {
-            self.unexpected_token("different token type", token)
+            self.unexpected_token(Debug::fmt(expected_token_type), token)
         }
         ret token
     }

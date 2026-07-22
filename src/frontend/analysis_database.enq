@@ -1,0 +1,243 @@
+//! Maintains incremental analysis state for Encore modules.
+
+import core::option::Option
+import std::vec::Vec
+
+import refrain::frontend::analysis::FrontendDocument
+import refrain::frontend::analysis::FrontendSymbol
+import refrain::frontend::analysis::analyze_named_module
+import refrain::frontend::analysis::analyze_module_lightweight
+
+struct AnalysisSource {
+    module_name: str
+    source_name: str
+    source: str
+    document: FrontendDocument
+    dirty: bool
+    analysis_revision: usize
+}
+
+/// Caches analyzed modules and invalidates dependants when source changes.
+pub struct AnalysisDatabase {
+    sources: Vec[AnalysisSource]
+    revision: usize
+}
+
+/// Associates a frontend symbol with the module that declares it.
+pub struct AnalysisSymbol {
+    module_name: str
+    symbol: FrontendSymbol
+}
+
+impl for AnalysisDatabase {
+    /// Creates an empty analysis database at revision zero.
+    pub fn new() -> Self {
+        ret Self {Vec[AnalysisSource]::new(), 0_usize}
+    }
+
+    /// Returns the current source revision of the database.
+    pub fn revision(self: Self) -> usize {
+        ret self.revision
+    }
+
+    /// Inserts or replaces a module and invalidates its transitive dependants.
+    pub fn set_module(self: mut Self, module_name: str, source_name: str, source: str) -> () {
+        self.revision += 1_usize
+        let mut index = 0_usize
+        while index < self.sources.len() {
+            match self.sources.get(index) {
+                Option[AnalysisSource]::Some(entry) => {
+                    if entry.module_name == module_name {
+                        self.sources.set(index, AnalysisSource{
+                            module_name,
+                            source_name,
+                            source,
+                            entry.document,
+                            true,
+                            entry.analysis_revision
+                        })
+                        self.invalidate_dependents(module_name)
+                        ret ()
+                    }
+                }
+                Option[AnalysisSource]::None => {}
+            }
+            index += 1_usize
+        }
+        self.sources.push(AnalysisSource{
+            module_name,
+            source_name,
+            source,
+            FrontendDocument::empty(),
+            true,
+            0_usize
+        })
+        self.invalidate_dependents(module_name)
+        ret ()
+    }
+
+    /// Removes a module and invalidates modules that imported it.
+    pub fn remove_module(self: mut Self, module_name: str) -> () {
+        self.revision += 1_usize
+        let mut next = Vec[AnalysisSource]::new()
+        for entry in self.sources {
+            if entry.module_name != module_name { next.push(entry) }
+        }
+        self.sources = next
+        self.invalidate_dependents(module_name)
+        ret ()
+    }
+
+    /// Returns a fully parsed document, computing it lazily when dirty.
+    pub fn document(self: mut Self, module_name: str) -> Option[FrontendDocument] {
+        let mut index = 0_usize
+        while index < self.sources.len() {
+            match self.sources.get(index) {
+                Option[AnalysisSource]::Some(entry) => {
+                    if entry.module_name == module_name {
+                        if !entry.dirty { ret Option[FrontendDocument]::Some(entry.document) }
+                        let document = analyze_named_module(entry.module_name, entry.source_name, entry.source)
+                        self.sources.set(index, AnalysisSource{
+                            entry.module_name,
+                            entry.source_name,
+                            entry.source,
+                            document,
+                            false,
+                            self.revision
+                        })
+                        ret Option[FrontendDocument]::Some(document)
+                    }
+                }
+                Option[AnalysisSource]::None => {}
+            }
+            index += 1_usize
+        }
+        ret Option[FrontendDocument]::None
+    }
+
+    /// Returns a tolerant editor-oriented document, computing it when dirty.
+    pub fn document_lightweight(self: mut Self, module_name: str) -> Option[FrontendDocument] {
+        let mut index = 0_usize
+        while index < self.sources.len() {
+            match self.sources.get(index) {
+                Option[AnalysisSource]::Some(entry) => {
+                    if entry.module_name == module_name {
+                        if !entry.dirty { ret Option[FrontendDocument]::Some(entry.document) }
+                        let document = analyze_module_lightweight(entry.module_name, entry.source)
+                        self.sources.set(index, AnalysisSource{
+                            entry.module_name,
+                            entry.source_name,
+                            entry.source,
+                            document,
+                            false,
+                            self.revision
+                        })
+                        ret Option[FrontendDocument]::Some(document)
+                    }
+                }
+                Option[AnalysisSource]::None => {}
+            }
+            index += 1_usize
+        }
+        ret Option[FrontendDocument]::None
+    }
+
+    /// Returns whether a module must be analyzed again.
+    pub fn module_is_dirty(self: Self, module_name: str) -> bool {
+        for entry in self.sources {
+            if entry.module_name == module_name { ret entry.dirty }
+        }
+        ret false
+    }
+
+    /// Returns the database revision at which a module was last analyzed.
+    pub fn module_analysis_revision(self: Self, module_name: str) -> usize {
+        for entry in self.sources {
+            if entry.module_name == module_name { ret entry.analysis_revision }
+        }
+        ret 0_usize
+    }
+
+    /// Returns the current symbol index across all registered modules.
+    pub fn all_symbols(self: mut Self) -> Vec[AnalysisSymbol] {
+        let mut out = Vec[AnalysisSymbol]::new()
+        let mut index = 0_usize
+        while index < self.sources.len() {
+            match self.sources.get(index) {
+                Option[AnalysisSource]::Some(entry) => {
+                    match self.document_lightweight(entry.module_name) {
+                        Option[FrontendDocument]::Some(document) => {
+                            for symbol in document.symbols { out.push(AnalysisSymbol{entry.module_name, symbol}) }
+                        }
+                        Option[FrontendDocument]::None => {}
+                    }
+                }
+                Option[AnalysisSource]::None => {}
+            }
+            index += 1_usize
+        }
+        ret out
+    }
+
+    /// Finds all indexed declarations with the exact supplied name.
+    pub fn symbols_named(self: mut Self, name: str) -> Vec[AnalysisSymbol] {
+        let mut out = Vec[AnalysisSymbol]::new()
+        for indexed in self.all_symbols() {
+            if indexed.symbol.name == name { out.push(indexed) }
+        }
+        ret out
+    }
+
+    fn invalidate_dependents(self: mut Self, changed_module: str) -> () {
+        let mut changed = Vec[str]::new()
+        changed.push(changed_module)
+        let mut cursor = 0_usize
+        while cursor < changed.len() {
+            let dependency = match changed.get(cursor) {
+                Option[str]::Some(value) => value
+                Option[str]::None => ""
+            }
+            let mut index = 0_usize
+            while index < self.sources.len() {
+                match self.sources.get(index) {
+                    Option[AnalysisSource]::Some(entry) => {
+                        if entry.module_name == dependency || document_imports_module(entry.document, dependency) {
+                            if !entry.dirty {
+                                self.sources.set(index, AnalysisSource{
+                                    entry.module_name,
+                                    entry.source_name,
+                                    entry.source,
+                                    entry.document,
+                                    true,
+                                    entry.analysis_revision
+                                })
+                                if !contains_string(changed, entry.module_name) { changed.push(entry.module_name) }
+                            }
+                        }
+                    }
+                    Option[AnalysisSource]::None => {}
+                }
+                index += 1_usize
+            }
+            cursor += 1_usize
+        }
+        ret ()
+    }
+}
+
+fn document_imports_module(document: FrontendDocument, module_name: str) -> bool {
+    for edge in document.dependencies.all() {
+        if edge.target == module_name { ret true }
+        if starts_with(edge.target, module_name + "::") { ret true }
+    }
+    ret false
+}
+
+fn contains_string(items: Vec[str], needle: str) -> bool {
+    for item in items { if item == needle { ret true } }
+    ret false
+}
+
+fn starts_with(value: str, prefix: str) -> bool {
+    ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix
+}

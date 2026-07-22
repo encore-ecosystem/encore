@@ -1,4 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 #ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -6,6 +9,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -18,14 +22,10 @@
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer)
-#define ENCORE_ADDRESS_SANITIZER 1
-#endif
-#endif
 #ifdef __APPLE__
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
+#include <sys/sysctl.h>
 #endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -38,6 +38,8 @@
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(linker, "/STACK:8388608")
 #else
+#include <pthread.h>
+#include <spawn.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/utsname.h>
@@ -48,24 +50,203 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#if !defined(__APPLE__)
+extern char **environ;
 #endif
+#endif
+
+typedef struct {
+#ifdef _WIN32
+    CRITICAL_SECTION lock;
+    CONDITION_VARIABLE condition;
+#else
+    pthread_mutex_t lock;
+    pthread_cond_t condition;
+#endif
+    bool signaled;
+} encore_async_event;
+
+typedef void (*encore_thread_entry)(void *);
+typedef void (*encore_thread_cleanup)(void *);
+
+typedef struct {
+#ifdef _WIN32
+    HANDLE thread;
+#else
+    pthread_t thread;
+#endif
+    encore_thread_entry entry;
+    encore_thread_cleanup cleanup;
+    void *payload;
+    bool started;
+    bool joined;
+    atomic_size_t references;
+#ifdef _WIN32
+    CRITICAL_SECTION join_lock;
+#else
+    pthread_mutex_t join_lock;
+#endif
+} encore_thread_task;
+
+#ifdef _WIN32
+static DWORD WINAPI encore_thread_main(LPVOID raw) {
+#else
+static void *encore_thread_main(void *raw) {
+#endif
+    encore_thread_task *task = (encore_thread_task *)raw;
+    task->entry(task->payload);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+size_t encore_thread_spawn(encore_thread_entry entry, void *payload, encore_thread_cleanup cleanup) {
+    if (entry == NULL) return 0;
+    encore_thread_task *task = malloc(sizeof(*task));
+    if (task == NULL) return 0;
+    task->entry = entry;
+    task->cleanup = cleanup;
+    task->payload = payload;
+    task->started = false;
+    task->joined = false;
+    atomic_init(&task->references, 1);
+#ifdef _WIN32
+    InitializeCriticalSection(&task->join_lock);
+#else
+    pthread_mutex_init(&task->join_lock, NULL);
+#endif
+#ifdef _WIN32
+    task->thread = CreateThread(NULL, 0, encore_thread_main, task, 0, NULL);
+    if (task->thread != NULL) task->started = true;
+#else
+    if (pthread_create(&task->thread, NULL, encore_thread_main, task) == 0) task->started = true;
+#endif
+    if (!task->started) { task->entry(task->payload); task->joined = true; }
+    return (size_t)(uintptr_t)task;
+}
+
+void *encore_thread_join(size_t token) {
+    encore_thread_task *task = (encore_thread_task *)(uintptr_t)token;
+    if (task == NULL) return NULL;
+#ifdef _WIN32
+    EnterCriticalSection(&task->join_lock);
+    if (!task->joined && task->started) {
+        WaitForSingleObject(task->thread, INFINITE); CloseHandle(task->thread); task->joined = true;
+    }
+    LeaveCriticalSection(&task->join_lock);
+#else
+    pthread_mutex_lock(&task->join_lock);
+    if (!task->joined && task->started) { pthread_join(task->thread, NULL); task->joined = true; }
+    pthread_mutex_unlock(&task->join_lock);
+#endif
+    return task->payload;
+}
+
+void encore_thread_retain(size_t token) {
+    encore_thread_task *task = (encore_thread_task *)(uintptr_t)token;
+    if (task != NULL) atomic_fetch_add_explicit(&task->references, 1, memory_order_relaxed);
+}
+
+void encore_thread_release(size_t token) {
+    encore_thread_task *task = (encore_thread_task *)(uintptr_t)token;
+    if (task == NULL || atomic_fetch_sub_explicit(&task->references, 1, memory_order_acq_rel) != 1) return;
+    encore_thread_join(token);
+    if (task->cleanup != NULL) task->cleanup(task->payload);
+#ifdef _WIN32
+    DeleteCriticalSection(&task->join_lock);
+#else
+    pthread_mutex_destroy(&task->join_lock);
+#endif
+    free(task);
+}
+
+size_t encore_thread_available_parallelism(void) {
+#ifdef _WIN32
+    DWORD count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    return count == 0 ? 1 : (size_t)count;
+#elif defined(__APPLE__)
+    int count = 0;
+    size_t size = sizeof(count);
+    if (sysctlbyname("hw.logicalcpu", &count, &size, NULL, 0) != 0 || count < 1) return 1;
+    return (size_t)count;
+#else
+    long count = sysconf(_SC_NPROCESSORS_ONLN);
+    return count < 1 ? 1 : (size_t)count;
+#endif
+}
+
+size_t encore_async_waker_new(void) {
+    encore_async_event *event = calloc(1, sizeof(*event));
+    if (event == NULL) return 0;
+#ifdef _WIN32
+    InitializeCriticalSection(&event->lock);
+    InitializeConditionVariable(&event->condition);
+#else
+    if (pthread_mutex_init(&event->lock, NULL) != 0) { free(event); return 0; }
+    if (pthread_cond_init(&event->condition, NULL) != 0) {
+        pthread_mutex_destroy(&event->lock);
+        free(event);
+        return 0;
+    }
+#endif
+    return (size_t)(uintptr_t)event;
+}
+
+void encore_async_waker_wake(size_t token) {
+    encore_async_event *event = (encore_async_event *)(uintptr_t)token;
+    if (event == NULL) return;
+#ifdef _WIN32
+    EnterCriticalSection(&event->lock);
+    event->signaled = true;
+    WakeAllConditionVariable(&event->condition);
+    LeaveCriticalSection(&event->lock);
+#else
+    pthread_mutex_lock(&event->lock);
+    event->signaled = true;
+    pthread_cond_broadcast(&event->condition);
+    pthread_mutex_unlock(&event->lock);
+#endif
+}
+
+void encore_async_waker_wait(size_t token) {
+    encore_async_event *event = (encore_async_event *)(uintptr_t)token;
+    if (event == NULL) return;
+#ifdef _WIN32
+    EnterCriticalSection(&event->lock);
+    while (!event->signaled) SleepConditionVariableCS(&event->condition, &event->lock, INFINITE);
+    event->signaled = false;
+    LeaveCriticalSection(&event->lock);
+#else
+    pthread_mutex_lock(&event->lock);
+    while (!event->signaled) pthread_cond_wait(&event->condition, &event->lock);
+    event->signaled = false;
+    pthread_mutex_unlock(&event->lock);
+#endif
+}
+
+void encore_async_waker_drop(size_t token) {
+    encore_async_event *event = (encore_async_event *)(uintptr_t)token;
+    if (event == NULL) return;
+#ifdef _WIN32
+    DeleteCriticalSection(&event->lock);
+#else
+    pthread_cond_destroy(&event->condition);
+    pthread_mutex_destroy(&event->lock);
+#endif
+    free(event);
+}
 
 void *__ehir_pcast(size_t value) {
     return (void *)(uintptr_t)value;
 }
 
-#if defined(ENCORE_ADDRESS_SANITIZER)
-void *__ehir_hrealloc(void *ptr, size_t bytes) { return realloc(ptr, bytes); }
-
-void __ehir_hfree(void *ptr) { free(ptr); }
-void encore_heap_retain(void *ptr) { (void)ptr; }
-bool encore_heap_release(void *ptr) { (void)ptr; return true; }
-#else
 typedef union encore_heap_block encore_heap_block;
 union encore_heap_block {
     struct {
         size_t capacity;
-        size_t refs;
+        _Atomic size_t refs;
     } meta;
     max_align_t alignment;
 };
@@ -77,7 +258,7 @@ static void *encore_heap_alloc(size_t bytes) {
     encore_heap_block *block = malloc(sizeof(encore_heap_block) + bytes);
     if (block == NULL) return NULL;
     block->meta.capacity = bytes;
-    block->meta.refs = 1;
+    atomic_init(&block->meta.refs, 1);
     return block + 1;
 }
 
@@ -86,7 +267,7 @@ void *__ehir_hrealloc(void *ptr, size_t bytes) {
     if (bytes == 0) bytes = 1;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
     if (bytes <= block->meta.capacity) return ptr;
-    if (block->meta.refs == 1) {
+    if (atomic_load_explicit(&block->meta.refs, memory_order_acquire) == 1) {
         encore_heap_block *resized = realloc(block, sizeof(encore_heap_block) + bytes);
         if (resized == NULL) return NULL;
         resized->meta.capacity = bytes;
@@ -95,40 +276,45 @@ void *__ehir_hrealloc(void *ptr, size_t bytes) {
     void *next = encore_heap_alloc(bytes);
     if (next == NULL) return NULL;
     memcpy(next, ptr, block->meta.capacity);
-    block->meta.refs -= 1;
+    atomic_fetch_sub_explicit(&block->meta.refs, 1, memory_order_acq_rel);
     return next;
 }
 
 void __ehir_hfree(void *ptr) {
     if (ptr == NULL) return;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
-    if (block->meta.refs > 1) {
-        block->meta.refs -= 1;
-        return;
-    }
-    free(block);
+    if (atomic_fetch_sub_explicit(&block->meta.refs, 1, memory_order_acq_rel) == 1) free(block);
 }
 
 void encore_heap_retain(void *ptr) {
     if (ptr == NULL) return;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
-    block->meta.refs += 1;
+    atomic_fetch_add_explicit(&block->meta.refs, 1, memory_order_relaxed);
 }
 
 bool encore_heap_release(void *ptr) {
     if (ptr == NULL) return false;
     encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
-    if (block->meta.refs > 1) {
-        block->meta.refs -= 1;
-        return false;
-    }
-    return true;
+    return atomic_fetch_sub_explicit(&block->meta.refs, 1, memory_order_acq_rel) == 1;
 }
+
+void encore_heap_free_released(void *ptr) {
+    if (ptr == NULL) return;
+    free(((encore_heap_block *)ptr) - 1);
+}
+
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((visibility("hidden"), always_inline))
 #endif
+bool encore_heap_is_unique(void *ptr) {
+    if (ptr == NULL) return true;
+    encore_heap_block *block = ((encore_heap_block *)ptr) - 1;
+    return atomic_load_explicit(&block->meta.refs, memory_order_acquire) == 1;
+}
 
 typedef union {
     struct {
-        size_t refs;
+        _Atomic size_t refs;
     } meta;
     max_align_t alignment;
 } encore_box_header;
@@ -136,25 +322,24 @@ typedef union {
 void *encore_box_alloc(size_t bytes) {
     encore_box_header *header = malloc(sizeof(encore_box_header) + bytes);
     if (header == NULL) return NULL;
-    header->meta.refs = 1;
+    atomic_init(&header->meta.refs, 1);
     return (void *)(header + 1);
 }
 
 void encore_box_retain(void *payload) {
     if (payload == NULL) return;
     encore_box_header *header = ((encore_box_header *)payload) - 1;
-    header->meta.refs += 1;
+    atomic_fetch_add_explicit(&header->meta.refs, 1, memory_order_relaxed);
 }
 
 void encore_box_drop(void *payload) {
     if (payload == NULL) return;
     encore_box_header *header = ((encore_box_header *)payload) - 1;
-    if (header->meta.refs > 1) { header->meta.refs -= 1; return; }
-    free(header);
+    if (atomic_fetch_sub_explicit(&header->meta.refs, 1, memory_order_acq_rel) == 1) free(header);
 }
 
 typedef struct {
-    size_t ref_count;
+    _Atomic size_t ref_count;
     size_t len;
     char data[];
 } encore_str_object;
@@ -167,7 +352,7 @@ static encore_str encore_empty_str(void);
 static encore_str encore_from_owned_buffer(char *buffer, size_t len);
 
 static struct {
-    size_t ref_count;
+    _Atomic size_t ref_count;
     size_t len;
     char data[1];
 } g_empty_str_object = {.ref_count = 0, .len = 0, .data = {0}};
@@ -259,6 +444,23 @@ bool encore_strset_insert(void *raw_set, encore_str value) {
     return true;
 }
 
+bool encore_strset_contains(void *raw_set, encore_str value) {
+    encore_strset *set = raw_set;
+    if (set == NULL || set->cap == 0) return false;
+    const char *data = encore_str_data(value);
+    size_t len = encore_str_size(value);
+    uint64_t hash = encore_strset_hash(data, len);
+    size_t slot = (size_t)(hash % set->cap);
+    while (set->entries[slot].data != NULL) {
+        encore_strset_entry *entry = &set->entries[slot];
+        if (entry->hash == hash && entry->len == len && memcmp(entry->data, data, len) == 0) {
+            return true;
+        }
+        slot = (slot + 1) % set->cap;
+    }
+    return false;
+}
+
 void encore_strset_free(void *raw_set) {
     encore_strset *set = raw_set;
     if (set == NULL) return;
@@ -268,9 +470,99 @@ void encore_strset_free(void *raw_set) {
 }
 
 typedef struct {
+    uint64_t hash;
+    size_t len;
+    char *data;
+    size_t value;
+} encore_strmap_entry;
+
+typedef struct {
     size_t len;
     size_t cap;
-    char *data;
+    encore_strmap_entry *entries;
+} encore_strmap;
+
+static bool encore_strmap_rehash(encore_strmap *map, size_t next_cap) {
+    encore_strmap_entry *next = calloc(next_cap, sizeof(encore_strmap_entry));
+    if (next == NULL) return false;
+    for (size_t index = 0; index < map->cap; ++index) {
+        encore_strmap_entry entry = map->entries[index];
+        if (entry.data == NULL) continue;
+        size_t slot = (size_t)(entry.hash % next_cap);
+        while (next[slot].data != NULL) slot = (slot + 1) % next_cap;
+        next[slot] = entry;
+    }
+    free(map->entries);
+    map->entries = next;
+    map->cap = next_cap;
+    return true;
+}
+
+void *encore_strmap_new(void) {
+    encore_strmap *map = calloc(1, sizeof(encore_strmap));
+    if (map == NULL) return NULL;
+    if (!encore_strmap_rehash(map, 64)) {
+        free(map);
+        return NULL;
+    }
+    return map;
+}
+
+void encore_strmap_put(void *raw_map, encore_str key, size_t value) {
+    encore_strmap *map = raw_map;
+    if (map == NULL) return;
+    if ((map->len + 1) * 10 >= map->cap * 7 &&
+        !encore_strmap_rehash(map, map->cap * 2)) return;
+    const char *data = encore_str_data(key);
+    size_t len = encore_str_size(key);
+    uint64_t hash = encore_strset_hash(data, len);
+    size_t slot = (size_t)(hash % map->cap);
+    while (map->entries[slot].data != NULL) {
+        encore_strmap_entry *entry = &map->entries[slot];
+        if (entry->hash == hash && entry->len == len && memcmp(entry->data, data, len) == 0) {
+            entry->value = value;
+            return;
+        }
+        slot = (slot + 1) % map->cap;
+    }
+    char *copy = malloc(len + 1);
+    if (copy == NULL) return;
+    if (len > 0) memcpy(copy, data, len);
+    copy[len] = '\0';
+    map->entries[slot] = (encore_strmap_entry){hash, len, copy, value};
+    map->len += 1;
+}
+
+size_t encore_strmap_get(void *raw_map, encore_str key) {
+    encore_strmap *map = raw_map;
+    if (map == NULL || map->cap == 0) return 0;
+    const char *data = encore_str_data(key);
+    size_t len = encore_str_size(key);
+    uint64_t hash = encore_strset_hash(data, len);
+    size_t slot = (size_t)(hash % map->cap);
+    while (map->entries[slot].data != NULL) {
+        encore_strmap_entry *entry = &map->entries[slot];
+        if (entry->hash == hash && entry->len == len && memcmp(entry->data, data, len) == 0) {
+            return entry->value;
+        }
+        slot = (slot + 1) % map->cap;
+    }
+    return 0;
+}
+
+void encore_strmap_free(void *raw_map) {
+    encore_strmap *map = raw_map;
+    if (map == NULL) return;
+    for (size_t index = 0; index < map->cap; ++index) free(map->entries[index].data);
+    free(map->entries);
+    free(map);
+}
+
+typedef struct {
+    size_t len;
+    size_t cap;
+    encore_str_object *object;
+    bool failed;
 } encore_text_builder;
 
 static bool encore_text_builder_reserve(encore_text_builder *builder, size_t additional) {
@@ -285,9 +577,15 @@ static bool encore_text_builder_reserve(encore_text_builder *builder, size_t add
         }
         next_cap *= 2;
     }
-    char *next = realloc(builder->data, next_cap);
+    if (next_cap > SIZE_MAX - sizeof(encore_str_object) - 1) {
+        builder->failed = true;
+        return false;
+    }
+    encore_str_object *next = realloc(builder->object,
+        sizeof(encore_str_object) + next_cap + 1);
     if (next == NULL) return false;
-    builder->data = next;
+    if (builder->object == NULL) atomic_init(&next->ref_count, 1);
+    builder->object = next;
     builder->cap = next_cap;
     return true;
 }
@@ -298,9 +596,13 @@ void *encore_text_builder_new(void) {
 
 void encore_text_builder_append(void *raw_builder, encore_str value) {
     encore_text_builder *builder = raw_builder;
+    if (builder == NULL || builder->failed) return;
     size_t len = encore_str_size(value);
-    if (!encore_text_builder_reserve(builder, len)) return;
-    if (len > 0) memcpy(builder->data + builder->len, encore_str_data(value), len);
+    if (!encore_text_builder_reserve(builder, len)) {
+        builder->failed = true;
+        return;
+    }
+    if (len > 0) memcpy(builder->object->data + builder->len, encore_str_data(value), len);
     builder->len += len;
 }
 
@@ -308,22 +610,40 @@ void encore_text_builder_append_builder(void *raw_builder, void *raw_other) {
     encore_text_builder *builder = raw_builder;
     encore_text_builder *other = raw_other;
     if (builder == NULL || other == NULL || builder == other) return;
-    if (encore_text_builder_reserve(builder, other->len)) {
-        if (other->len > 0) memcpy(builder->data + builder->len, other->data, other->len);
+    if (other->failed) {
+        builder->failed = true;
+    } else if (encore_text_builder_reserve(builder, other->len)) {
+        if (other->len > 0) memcpy(builder->object->data + builder->len,
+            other->object->data, other->len);
         builder->len += other->len;
+    } else {
+        builder->failed = true;
     }
-    free(other->data);
+    free(other->object);
     free(other);
 }
 
 encore_str encore_text_builder_finish(void *raw_builder) {
     encore_text_builder *builder = raw_builder;
     if (builder == NULL) return encore_empty_str();
-    char *data = builder->data;
+    encore_str_object *object = builder->object;
     size_t len = builder->len;
+    bool failed = builder->failed;
     free(builder);
-    if (data == NULL) return encore_empty_str();
-    return encore_from_owned_buffer(data, len);
+    if (failed || object == NULL) {
+        free(object);
+        return encore_empty_str();
+    }
+    object->len = len;
+    object->data[len] = '\0';
+    return (encore_str){.object = object};
+}
+
+void encore_text_builder_discard(void *raw_builder) {
+    encore_text_builder *builder = raw_builder;
+    if (builder == NULL) return;
+    free(builder->object);
+    free(builder);
 }
 
 static encore_str encore_empty_str(void) {
@@ -357,7 +677,7 @@ static encore_str encore_from_owned_buffer(char *buffer, size_t len) {
         free(buffer);
         return encore_empty_str();
     }
-    object->ref_count = 1;
+    atomic_init(&object->ref_count, 1);
     object->len = len;
     if (len > 0) {
         memcpy(object->data, buffer, len);
@@ -612,25 +932,40 @@ encore_str encore_str_join_lines_parts(size_t raw_ptr, size_t len) {
     return encore_str_join_lines(lines);
 }
 
+encore_str encore_str_join_parts(size_t raw_ptr, size_t len) {
+    encore_str *parts = (encore_str *)(uintptr_t)raw_ptr;
+    size_t total = 0;
+    for (size_t index = 0; index < len; index += 1) {
+        size_t part_len = encore_str_size(parts[index]);
+        if (part_len > SIZE_MAX - total) return encore_empty_str();
+        total += part_len;
+    }
+    char *buffer = malloc(total + 1);
+    if (buffer == NULL) return encore_empty_str();
+    size_t offset = 0;
+    for (size_t index = 0; index < len; index += 1) {
+        size_t part_len = encore_str_size(parts[index]);
+        if (part_len > 0) {
+            memcpy(buffer + offset, encore_str_data(parts[index]), part_len);
+            offset += part_len;
+        }
+    }
+    buffer[offset] = '\0';
+    return encore_from_owned_buffer(buffer, offset);
+}
+
 void encore_str_retain(encore_str value) {
-    if (value.object == NULL || value.object->ref_count == 0) {
+    if (value.object == NULL || atomic_load_explicit(&value.object->ref_count, memory_order_relaxed) == 0) {
         return;
     }
-    value.object->ref_count += 1;
+    atomic_fetch_add_explicit(&value.object->ref_count, 1, memory_order_relaxed);
 }
 
 void encore_str_drop(encore_str value) {
-    if (value.object == NULL || value.object->ref_count == 0) {
+    if (value.object == NULL || atomic_load_explicit(&value.object->ref_count, memory_order_relaxed) == 0) {
         return;
     }
-    if (value.object->ref_count == 0) {
-        return;
-    }
-    value.object->ref_count -= 1;
-    if (value.object->ref_count != 0) {
-        return;
-    }
-    free(value.object);
+    if (atomic_fetch_sub_explicit(&value.object->ref_count, 1, memory_order_acq_rel) == 1) free(value.object);
 }
 
 static encore_str encore_format(const char *fmt, ...) {
@@ -736,6 +1071,39 @@ uint8_t encore_str_byte_at(encore_str value, size_t index) {
         return 0;
     }
     return (uint8_t)data[index];
+}
+
+size_t encore_str_find_byte_from(encore_str value, uint8_t needle, size_t start) {
+    size_t len = encore_str_size(value);
+    const unsigned char *data = (const unsigned char *)encore_str_data(value);
+    if (data == NULL || start >= len) return len;
+    const unsigned char *found = memchr(data + start, needle, len - start);
+    return found == NULL ? len : (size_t)(found - data);
+}
+
+size_t encore_str_find_control_from(encore_str value, size_t start) {
+    size_t len = encore_str_size(value);
+    const unsigned char *data = (const unsigned char *)encore_str_data(value);
+    if (data == NULL || start >= len) return len;
+    for (size_t index = start; index < len; ++index) {
+        if (data[index] < 0x20) return index;
+    }
+    return len;
+}
+
+size_t encore_str_line_start_byte(encore_str value, size_t target_line) {
+    size_t len = encore_str_size(value);
+    const unsigned char *data = (const unsigned char *)encore_str_data(value);
+    if (target_line == 0) return 0;
+    if (data == NULL) return len + 1;
+    size_t line = 0;
+    for (size_t index = 0; index < len; ++index) {
+        if (data[index] == '\n') {
+            line += 1;
+            if (line == target_line) return index + 1;
+        }
+    }
+    return len + 1;
 }
 
 static size_t encore_utf8_char_width(uint8_t lead) {
@@ -1391,17 +1759,26 @@ cleanup:
     if (saved_stderr >= 0) { fflush(stderr); _dup2(saved_stderr, 2); _close(saved_stderr); }
     if (output_fd >= 0) _close(output_fd);
 #else
-    pid_t child = fork();
-    if (child == 0) {
-        if (output_path != NULL) {
-            int output_fd = open(output_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-            if (output_fd < 0 || dup2(output_fd, STDOUT_FILENO) < 0 || dup2(output_fd, STDERR_FILENO) < 0) _Exit(126);
-            close(output_fd);
-        }
-        execvp(program_c, argv);
-        _Exit(127);
+    posix_spawn_file_actions_t actions;
+    bool actions_initialized = posix_spawn_file_actions_init(&actions) == 0;
+    bool actions_ready = actions_initialized;
+    int output_fd = -1;
+    if (actions_ready && output_path != NULL) {
+        output_fd = open(output_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+        if (output_fd < 0 || posix_spawn_file_actions_adddup2(&actions, output_fd, STDOUT_FILENO) != 0 ||
+            posix_spawn_file_actions_adddup2(&actions, output_fd, STDERR_FILENO) != 0 ||
+            posix_spawn_file_actions_addclose(&actions, output_fd) != 0) actions_ready = false;
     }
-    if (child > 0) {
+    pid_t child = -1;
+#ifdef __APPLE__
+    char **envp = *_NSGetEnviron();
+#else
+    char **envp = environ;
+#endif
+    int spawn_status = actions_ready ? posix_spawnp(&child, program_c, &actions, NULL, argv, envp) : EINVAL;
+    if (output_fd >= 0) close(output_fd);
+    if (actions_initialized) posix_spawn_file_actions_destroy(&actions);
+    if (spawn_status == 0 && child > 0) {
         int status = 0;
         if (waitpid(child, &status, 0) >= 0) {
             if (WIFEXITED(status)) result = WEXITSTATUS(status);
@@ -1742,6 +2119,22 @@ int32_t encore_fs_status(encore_str path) {
     return result;
 }
 
+bool encore_fs_is_directory(encore_str path) {
+    char *path_c = encore_to_cstr(path);
+    if (path_c == NULL) return false;
+    struct stat st;
+    bool result = false;
+    if (stat(path_c, &st) == 0) {
+#ifdef _WIN32
+        result = (st.st_mode & _S_IFDIR) != 0;
+#else
+        result = S_ISDIR(st.st_mode);
+#endif
+    }
+    free(path_c);
+    return result;
+}
+
 int32_t encore_fs_remove_file(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) {
@@ -1758,10 +2151,45 @@ int32_t encore_fs_copy_file(encore_str source, encore_str destination) {
     char *destination_c = encore_to_cstr(destination);
     if (source_c == NULL || destination_c == NULL) { free(source_c); free(destination_c); return -1; }
     FILE *input = fopen(source_c, "rb");
-    FILE *output = input == NULL ? NULL : fopen(destination_c, "wb");
     free(source_c);
-    free(destination_c);
-    if (input == NULL || output == NULL) { if (input != NULL) fclose(input); if (output != NULL) fclose(output); return -1; }
+    if (input == NULL) { free(destination_c); return -1; }
+
+    size_t destination_len = strlen(destination_c);
+    if (destination_len > SIZE_MAX - 32) { fclose(input); free(destination_c); return -1; }
+    char *temporary_c = malloc(destination_len + 32);
+    if (temporary_c == NULL) { fclose(input); free(destination_c); return -1; }
+    memcpy(temporary_c, destination_c, destination_len);
+#ifdef _WIN32
+    int temporary_fd = -1;
+    unsigned long process_id = GetCurrentProcessId();
+    for (unsigned int attempt = 0; attempt < 100 && temporary_fd < 0; ++attempt) {
+        snprintf(temporary_c + destination_len, 32, ".tmp.%lu.%u", process_id, attempt);
+        temporary_fd = _open(temporary_c, _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY,
+                             _S_IREAD | _S_IWRITE);
+    }
+#else
+    memcpy(temporary_c + destination_len, ".tmp.XXXXXX", 12);
+    int temporary_fd = mkstemp(temporary_c);
+#endif
+#ifdef _WIN32
+    FILE *output = temporary_fd < 0 ? NULL : _fdopen(temporary_fd, "wb");
+#else
+    FILE *output = temporary_fd < 0 ? NULL : fdopen(temporary_fd, "wb");
+#endif
+    if (output == NULL) {
+        if (temporary_fd >= 0) {
+#ifdef _WIN32
+            _close(temporary_fd);
+#else
+            close(temporary_fd);
+#endif
+        }
+        fclose(input);
+        remove(temporary_c);
+        free(temporary_c);
+        free(destination_c);
+        return -1;
+    }
     char buffer[65536];
     int32_t status = 0;
     for (;;) {
@@ -1770,6 +2198,17 @@ int32_t encore_fs_copy_file(encore_str source, encore_str destination) {
         if (count < sizeof(buffer)) { if (ferror(input)) status = -1; break; }
     }
     if (fclose(input) != 0 || fclose(output) != 0) status = -1;
+    if (status == 0) {
+#ifdef _WIN32
+        if (!MoveFileExA(temporary_c, destination_c,
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) status = -1;
+#else
+        if (rename(temporary_c, destination_c) != 0) status = -1;
+#endif
+    }
+    if (status != 0) remove(temporary_c);
+    free(temporary_c);
+    free(destination_c);
     return status;
 }
 
@@ -1930,320 +2369,3 @@ encore_str encore_fs_read_dir(encore_str path) {
     }
     return encore_from_owned_buffer(buffer, len);
 }
-
-#ifndef _WIN32
-typedef void EncoreGuiDisplay;
-typedef void *EncoreGuiGc;
-typedef unsigned long EncoreGuiWindowId;
-typedef unsigned long EncoreGuiAtom;
-
-typedef struct {
-    bool initialized;
-    bool available;
-    void *lib;
-
-    EncoreGuiDisplay *(*XOpenDisplay)(const char *);
-    int (*XDefaultScreen)(EncoreGuiDisplay *);
-    EncoreGuiWindowId (*XRootWindow)(EncoreGuiDisplay *, int);
-    unsigned long (*XBlackPixel)(EncoreGuiDisplay *, int);
-    unsigned long (*XWhitePixel)(EncoreGuiDisplay *, int);
-    EncoreGuiWindowId (*XCreateSimpleWindow)(
-        EncoreGuiDisplay *,
-        EncoreGuiWindowId,
-        int,
-        int,
-        unsigned int,
-        unsigned int,
-        unsigned int,
-        unsigned long,
-        unsigned long);
-    int (*XStoreName)(EncoreGuiDisplay *, EncoreGuiWindowId, const char *);
-    int (*XSelectInput)(EncoreGuiDisplay *, EncoreGuiWindowId, long);
-    int (*XMapWindow)(EncoreGuiDisplay *, EncoreGuiWindowId);
-    EncoreGuiGc (*XCreateGC)(EncoreGuiDisplay *, EncoreGuiWindowId, unsigned long, void *);
-    int (*XFreeGC)(EncoreGuiDisplay *, EncoreGuiGc);
-    int (*XSetForeground)(EncoreGuiDisplay *, EncoreGuiGc, unsigned long);
-    int (*XFillRectangle)(EncoreGuiDisplay *, EncoreGuiWindowId, EncoreGuiGc, int, int, unsigned int, unsigned int);
-    int (*XFlush)(EncoreGuiDisplay *);
-    int (*XPending)(EncoreGuiDisplay *);
-    int (*XNextEvent)(EncoreGuiDisplay *, void *);
-    int (*XDestroyWindow)(EncoreGuiDisplay *, EncoreGuiWindowId);
-    int (*XCloseDisplay)(EncoreGuiDisplay *);
-    EncoreGuiAtom (*XInternAtom)(EncoreGuiDisplay *, const char *, int);
-    int (*XSetWMProtocols)(EncoreGuiDisplay *, EncoreGuiWindowId, EncoreGuiAtom *, int);
-} EncoreGuiX11Api;
-
-typedef struct {
-    EncoreGuiDisplay *display;
-    EncoreGuiWindowId window;
-    EncoreGuiGc gc;
-    EncoreGuiAtom wm_delete;
-    bool open;
-    uint32_t width;
-    uint32_t height;
-} EncoreGuiWindow;
-
-typedef struct {
-    int type;
-    unsigned long serial;
-    int send_event;
-    EncoreGuiDisplay *display;
-    EncoreGuiWindowId window;
-    EncoreGuiAtom message_type;
-    int format;
-    union {
-        char b[20];
-        short s[10];
-        long l[5];
-    } data;
-} EncoreGuiXClientMessageEvent;
-
-static EncoreGuiX11Api g_gui_x11 = {0};
-
-#define ENCORE_X11_LOAD(field)                                                            \
-    do {                                                                                  \
-        *(void **)(&g_gui_x11.field) = dlsym(g_gui_x11.lib, #field);                      \
-        if (g_gui_x11.field == NULL) {                                                     \
-            dlclose(g_gui_x11.lib);                                                        \
-            memset(&g_gui_x11, 0, sizeof(g_gui_x11));                                      \
-            g_gui_x11.initialized = true;                                                  \
-            return false;                                                                  \
-        }                                                                                  \
-    } while (0)
-
-static bool encore_gui_x11_load(void) {
-    if (g_gui_x11.initialized) {
-        return g_gui_x11.available;
-    }
-
-    g_gui_x11.initialized = true;
-    g_gui_x11.lib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
-    if (g_gui_x11.lib == NULL) {
-        g_gui_x11.lib = dlopen("libX11.so", RTLD_LAZY | RTLD_LOCAL);
-    }
-    if (g_gui_x11.lib == NULL) {
-        return false;
-    }
-
-    ENCORE_X11_LOAD(XOpenDisplay);
-    ENCORE_X11_LOAD(XDefaultScreen);
-    ENCORE_X11_LOAD(XRootWindow);
-    ENCORE_X11_LOAD(XBlackPixel);
-    ENCORE_X11_LOAD(XWhitePixel);
-    ENCORE_X11_LOAD(XCreateSimpleWindow);
-    ENCORE_X11_LOAD(XStoreName);
-    ENCORE_X11_LOAD(XSelectInput);
-    ENCORE_X11_LOAD(XMapWindow);
-    ENCORE_X11_LOAD(XCreateGC);
-    ENCORE_X11_LOAD(XFreeGC);
-    ENCORE_X11_LOAD(XSetForeground);
-    ENCORE_X11_LOAD(XFillRectangle);
-    ENCORE_X11_LOAD(XFlush);
-    ENCORE_X11_LOAD(XPending);
-    ENCORE_X11_LOAD(XNextEvent);
-    ENCORE_X11_LOAD(XDestroyWindow);
-    ENCORE_X11_LOAD(XCloseDisplay);
-    ENCORE_X11_LOAD(XInternAtom);
-    ENCORE_X11_LOAD(XSetWMProtocols);
-
-    g_gui_x11.available = true;
-    return true;
-}
-
-#undef ENCORE_X11_LOAD
-
-static EncoreGuiWindow *encore_gui_window_from_handle(size_t handle) {
-    if (handle == 0) {
-        return NULL;
-    }
-    return (EncoreGuiWindow *)(uintptr_t)handle;
-}
-
-size_t encore_gui_window_create(encore_str title, uint32_t width, uint32_t height) {
-    if (width == 0 || height == 0 || !encore_gui_x11_load()) {
-        return 0;
-    }
-
-    EncoreGuiDisplay *display = g_gui_x11.XOpenDisplay(NULL);
-    if (display == NULL) {
-        return 0;
-    }
-
-    EncoreGuiWindow *state = calloc(1, sizeof(EncoreGuiWindow));
-    if (state == NULL) {
-        g_gui_x11.XCloseDisplay(display);
-        return 0;
-    }
-
-    int screen = g_gui_x11.XDefaultScreen(display);
-    EncoreGuiWindowId root = g_gui_x11.XRootWindow(display, screen);
-    unsigned long black = g_gui_x11.XBlackPixel(display, screen);
-    unsigned long white = g_gui_x11.XWhitePixel(display, screen);
-
-    EncoreGuiWindowId window = g_gui_x11.XCreateSimpleWindow(display, root, 0, 0, width, height, 0, black, white);
-    if (window == 0) {
-        free(state);
-        g_gui_x11.XCloseDisplay(display);
-        return 0;
-    }
-
-    EncoreGuiGc gc = g_gui_x11.XCreateGC(display, window, 0, NULL);
-    if (gc == NULL) {
-        g_gui_x11.XDestroyWindow(display, window);
-        free(state);
-        g_gui_x11.XCloseDisplay(display);
-        return 0;
-    }
-
-    char *title_c = encore_to_cstr(title);
-    if (title_c != NULL) {
-        g_gui_x11.XStoreName(display, window, title_c);
-        free(title_c);
-    }
-
-    const long event_mask = (1L << 15) | (1L << 17) | (1L << 0);
-    g_gui_x11.XSelectInput(display, window, event_mask);
-
-    EncoreGuiAtom wm_delete = g_gui_x11.XInternAtom(display, "WM_DELETE_WINDOW", 0);
-    if (wm_delete != 0) {
-        g_gui_x11.XSetWMProtocols(display, window, &wm_delete, 1);
-    }
-
-    g_gui_x11.XMapWindow(display, window);
-    g_gui_x11.XFlush(display);
-
-    state->display = display;
-    state->window = window;
-    state->gc = gc;
-    state->wm_delete = wm_delete;
-    state->open = true;
-    state->width = width;
-    state->height = height;
-
-    return (size_t)(uintptr_t)state;
-}
-
-bool encore_gui_window_is_open(size_t handle) {
-    EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
-    return state != NULL && state->open;
-}
-
-bool encore_gui_window_poll(size_t handle) {
-    EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
-    if (state == NULL || !state->open) {
-        return false;
-    }
-
-    while (g_gui_x11.XPending(state->display) > 0) {
-        long event_storage[24];
-        memset(event_storage, 0, sizeof(event_storage));
-        g_gui_x11.XNextEvent(state->display, event_storage);
-
-        int type = *((int *)event_storage);
-        if (type == 17) {
-            state->open = false;
-        } else if (type == 33 && state->wm_delete != 0) {
-            EncoreGuiXClientMessageEvent *client = (EncoreGuiXClientMessageEvent *)event_storage;
-            if (client->format == 32 && (EncoreGuiAtom)client->data.l[0] == state->wm_delete) {
-                state->open = false;
-            }
-        }
-    }
-
-    return state->open;
-}
-
-bool encore_gui_window_clear(size_t handle, uint32_t color_rgb) {
-    EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
-    if (state == NULL || !state->open) {
-        return false;
-    }
-
-    g_gui_x11.XSetForeground(state->display, state->gc, (unsigned long)color_rgb);
-    g_gui_x11.XFillRectangle(state->display, state->window, state->gc, 0, 0, state->width, state->height);
-    return true;
-}
-
-bool encore_gui_window_fill_rect(size_t handle, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t color_rgb) {
-    EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
-    if (state == NULL || !state->open || width == 0 || height == 0) {
-        return false;
-    }
-
-    g_gui_x11.XSetForeground(state->display, state->gc, (unsigned long)color_rgb);
-    g_gui_x11.XFillRectangle(state->display, state->window, state->gc, x, y, width, height);
-    return true;
-}
-
-bool encore_gui_window_present(size_t handle) {
-    EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
-    if (state == NULL || !state->open) {
-        return false;
-    }
-    g_gui_x11.XFlush(state->display);
-    return true;
-}
-
-bool encore_gui_window_destroy(size_t handle) {
-    EncoreGuiWindow *state = encore_gui_window_from_handle(handle);
-    if (state == NULL) {
-        return false;
-    }
-
-    if (state->display != NULL) {
-        if (state->gc != NULL) {
-            g_gui_x11.XFreeGC(state->display, state->gc);
-        }
-        if (state->window != 0) {
-            g_gui_x11.XDestroyWindow(state->display, state->window);
-        }
-        g_gui_x11.XCloseDisplay(state->display);
-    }
-
-    free(state);
-    return true;
-}
-#else
-size_t encore_gui_window_create(encore_str title, uint32_t width, uint32_t height) {
-    (void)title;
-    (void)width;
-    (void)height;
-    return 0;
-}
-
-bool encore_gui_window_is_open(size_t handle) {
-    (void)handle;
-    return false;
-}
-
-bool encore_gui_window_poll(size_t handle) {
-    (void)handle;
-    return false;
-}
-
-bool encore_gui_window_clear(size_t handle, uint32_t color_rgb) {
-    (void)handle;
-    (void)color_rgb;
-    return false;
-}
-
-bool encore_gui_window_fill_rect(size_t handle, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t color_rgb) {
-    (void)handle;
-    (void)x;
-    (void)y;
-    (void)width;
-    (void)height;
-    (void)color_rgb;
-    return false;
-}
-
-bool encore_gui_window_present(size_t handle) {
-    (void)handle;
-    return false;
-}
-
-bool encore_gui_window_destroy(size_t handle) {
-    (void)handle;
-    return false;
-}
-#endif

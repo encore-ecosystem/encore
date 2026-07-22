@@ -1,3 +1,5 @@
+//! Provides the `native` module.
+
 import core::fmt::Debug
 import core::option::Option
 import std::io::println
@@ -6,14 +8,15 @@ import std::path::Path
 import std::process::{run_args, run_args_capture}
 import std::vec::Vec
 
-import mod::build::{compile_project, compile_project_with_profile, requested_profile, requested_target, target_profile_dir}
+import mod::build::{compile_project, compile_project_with_profile, requested_profile, requested_project_root, requested_target, target_profile_dir}
 import refrain::target::{target_executable_name, target_is_host}
-import refrain::project::manifest::{ProjectManifest, project_manifest_add_dependency, project_manifest_dependencies, project_manifest_has_dependency, project_manifest_name, project_manifest_version, read_project_manifest, write_project_manifest}
-import refrain::project::{normalize_dependency_reference, registry_lock_fields, registry_package_checksum, resolve_index_dependency, valid_dependency_name}
+import refrain::project::manifest::{ProjectManifest, project_manifest_add_dependency, project_manifest_dependencies, project_manifest_feature_dependencies, project_manifest_has_dependency, project_manifest_name, project_manifest_resolve_features, project_manifest_version, read_project_manifest, write_project_manifest}
+import refrain::project::{dependency_base_reference, dependency_requested_features, dependency_with_features, normalize_dependency_reference, registry_candidates, registry_install_candidate, registry_lock_fields, registry_package_checksum, registry_version_matches, resolve_index_dependency, valid_dependency_name}
 import refrain::project::system_core_root
 
+/// Performs the `native_run` operation.
 pub fn native_run() -> u32 {
-    let root = Path::new(".").resolve()
+    let root = requested_project_root()
     let profile = requested_profile("debug")
     let code = compile_project_with_profile(root, profile)
     if code != 0_u32 { ret code }
@@ -33,6 +36,7 @@ pub fn native_run() -> u32 {
     ret normalize_exit(run_args(binary.as_str(), args))
 }
 
+/// Performs the `native_init` operation.
 pub fn native_init() -> u32 {
     let root = Path::new(".").resolve()
     let mut name = path_name_or(root, "project")
@@ -70,12 +74,22 @@ pub fn native_init() -> u32 {
     ret 0_u32
 }
 
+/// Performs the `native_add` operation.
 pub fn native_add() -> u32 {
-    if argc() < 3_usize { ret native_mode_fail("Usage: encore add <name|index@name|workspace@name|git@repo|path@path>") }
+    if argc() < 3_usize { ret native_mode_fail("Usage: encore add <package[features]> [--features feature,...]") }
     let root = Path::new(".").resolve()
     let raw = arg_or(2_usize, "")
     if starts_with(raw, "sys@") { ret native_mode_fail("System dependencies cannot be added manually") }
-    let dependency = normalize_dependency_reference(raw)
+    let mut requested = Vec[str]::new()
+    let mut arg_index = 3_usize
+    while arg_index < argc() {
+        if arg_or(arg_index, "") == "--features" && arg_index + 1_usize < argc() {
+            requested = split_features(arg_or(arg_index + 1_usize, ""))
+            arg_index = arg_index + 1_usize
+        }
+        arg_index = arg_index + 1_usize
+    }
+    let dependency = dependency_with_features(normalize_dependency_reference(raw), requested)
     let mut manifest = read_project_manifest(root)
     if project_manifest_has_dependency(manifest, dependency) {
         println("Dependency already exists: " + dependency)
@@ -87,6 +101,7 @@ pub fn native_add() -> u32 {
     ret sync_root(root, false, "Added: " + dependency)
 }
 
+/// Performs the `native_sync` operation.
 pub fn native_sync(force_update: bool) -> u32 {
     let mut update = force_update
     let mut index = 2_usize
@@ -97,6 +112,7 @@ pub fn native_sync(force_update: bool) -> u32 {
     ret sync_root(Path::new(".").resolve(), update, if update { "Updated dependencies" } else { "Synced dependencies" })
 }
 
+/// Performs the `native_install` operation.
 pub fn native_install() -> u32 {
     let cwd = Path::new(".").resolve()
     let mut project = cwd
@@ -146,7 +162,6 @@ pub fn native_install() -> u32 {
 fn sync_root(root: Path, update: bool, message: str) -> u32 {
     let manifest = read_project_manifest(root)
     let mut lock = "version = 2\n"
-    let mut count = 0_usize
     let mut queue = Vec[DependencyQueueItem]::new()
     let dependencies = project_manifest_dependencies(manifest)
     let mut index = 0_usize
@@ -157,55 +172,228 @@ fn sync_root(root: Path, update: bool, message: str) -> u32 {
         }
         index = index + 1_usize
     }
-    let mut seen = Vec[str]::new()
-    index = 0_usize
-    while index < queue.len() {
-        match queue.get(index) {
-            Some(item) => {
-                let resolved = resolve_dependency(item.reference, Path::new(item.owner_root), Path::new(item.distribution_root), item.source_key, root, update)
-                if resolved.root == "" { ret 1_u32 }
-                if !contains_item(seen, resolved.identity) {
-                    let resolved_root = Path::new(resolved.root)
-                    let distribution_root = Path::new(resolved.distribution_root)
-                    lock = lock + lock_package(root, item.reference, resolved_root, distribution_root)
-                    seen.push(resolved.identity)
-                    count = count + 1_usize
-                    let nested = project_manifest_dependencies(read_project_manifest(resolved_root))
-                    let mut nested_index = 0_usize
-                    while nested_index < nested.len() {
-                        match nested.get(nested_index) {
-                            Some(dependency) => { queue.push(DependencyQueueItem{dependency, resolved_root.as_str(), distribution_root.as_str(), resolved.source_key}) }
-                            None => {}
-                        }
-                        nested_index = nested_index + 1_usize
-                    }
-                }
-            }
-            None => {}
-        }
-        index = index + 1_usize
+    let solved = solve_dependency_queue(queue, 0_usize, Vec[LockPackageRecord]::new(), root, update)
+    if !solved.success { ret native_mode_fail(solved.error) }
+    let records = solved.records
+    for record in records {
+        lock = lock + lock_package(root, dependency_with_features(record.reference, record.features), Path::new(record.resolved_root), Path::new(record.distribution_root))
     }
     if write_file(root.join("encore.lock").as_str(), lock) != 0_i32 { ret native_mode_fail("Unable to write encore.lock") }
-    println(message + ": " + Debug::fmt(count) + " packages -> encore.lock")
+    println(message + ": " + Debug::fmt(records.len()) + " packages -> encore.lock")
     ret 0_u32
 }
 
+struct DependencySolveResult {
+    records: Vec[LockPackageRecord]
+    success: bool
+    error: str
+}
+
+fn solve_dependency_queue(queue: Vec[DependencyQueueItem], index: usize, records: Vec[LockPackageRecord], root: Path, update: bool) -> DependencySolveResult {
+    if index >= queue.len() { ret DependencySolveResult{records, true, ""} }
+    let item = queue_item_or_empty(queue, index)
+    let base_reference = dependency_base_reference(item.reference)
+    if starts_with(base_reference, "index@") {
+        let resolution_reference = combined_registry_reference(item.reference, queue, records)
+        let identity = "index:" + index_reference_name(resolution_reference)
+        let existing_index = lock_record_index(records, identity)
+        if existing_index < records.len() {
+            match records.get(existing_index) {
+                Some(existing) => {
+                let selected_version = project_manifest_version(read_project_manifest(Path::new(existing.resolved_root)))
+                if !registry_version_matches(selected_version, index_reference_requirement(resolution_reference)) {
+                    ret dependency_solve_failure(records, "Dependency conflict: " + index_reference_name(resolution_reference) + " " + selected_version + " does not satisfy " + index_reference_requirement(resolution_reference))
+                }
+                let resolved_manifest = read_project_manifest(Path::new(existing.resolved_root))
+                let active_features = project_manifest_resolve_features(resolved_manifest, dependency_requested_features(item.reference))
+                let merged = merge_lock_record(records, LockPackageRecord{resolution_reference, existing.resolved_root, existing.distribution_root, identity, active_features})
+                if merged.conflict != "" { ret dependency_solve_failure(records, merged.conflict) }
+                let next_queue = if merged.changed { enqueue_manifest_dependencies(queue, resolved_manifest, merged.features, existing.resolved_root, existing.distribution_root, base_reference + ":" + registry_package_checksum(Path::new(existing.resolved_root))) } else { queue }
+                ret solve_dependency_queue(next_queue, index + 1_usize, merged.records, root, update)
+                }
+                None => {}
+            }
+        } else {
+                let mut last_error = "Dependency conflict while resolving " + index_reference_name(resolution_reference)
+                let mut round = 0_usize
+                let rounds = if update { 1_usize } else { 2_usize }
+                while round < rounds {
+                    let candidates = registry_candidates(resolution_reference, root, update || round > 0_usize)
+                    let mut candidate_index = 0_usize
+                    while candidate_index < candidates.len() {
+                        match candidates.get(candidate_index) {
+                            Some(candidate) => {
+                                let resolved = registry_install_candidate(index_reference_name(resolution_reference), candidate)
+                                if resolved != "" {
+                                    let resolved_root = Path::new(resolved).resolve()
+                                    let resolved_manifest = read_project_manifest(resolved_root)
+                                    let active_features = project_manifest_resolve_features(resolved_manifest, dependency_requested_features(item.reference))
+                                    let candidate_records = clone_lock_records(records)
+                                    let merged = merge_lock_record(candidate_records, LockPackageRecord{resolution_reference, resolved_root.as_str(), resolved_root.as_str(), identity, active_features})
+                                    let candidate_queue = enqueue_manifest_dependencies(clone_dependency_queue(queue), resolved_manifest, merged.features, resolved_root.as_str(), resolved_root.as_str(), base_reference + ":" + registry_package_checksum(resolved_root))
+                                    let solved = solve_dependency_queue(candidate_queue, index + 1_usize, merged.records, root, update)
+                                    if solved.success { ret solved }
+                                    last_error = solved.error
+                                }
+                            }
+                            None => {}
+                        }
+                        candidate_index += 1_usize
+                    }
+                    round += 1_usize
+                }
+                if starts_with(last_error, "Dependency conflict while resolving") {
+                    let requirement = index_reference_requirement(resolution_reference)
+                    let detail = if requirement == "" { "no usable version" } else { "no version satisfies " + requirement }
+                    last_error = "Unable to resolve " + index_reference_name(resolution_reference) + ": " + detail
+                }
+                ret dependency_solve_failure(records, last_error)
+        }
+    }
+
+    let resolved = resolve_dependency(item.reference, Path::new(item.owner_root), Path::new(item.distribution_root), item.source_key, root, update)
+    if resolved.root == "" { ret dependency_solve_failure(records, "Unable to resolve dependency " + item.reference) }
+    let resolved_root = Path::new(resolved.root)
+    let resolved_manifest = read_project_manifest(resolved_root)
+    let active_features = project_manifest_resolve_features(resolved_manifest, dependency_requested_features(item.reference))
+    let merged = merge_lock_record(records, LockPackageRecord{base_reference, resolved.root, resolved.distribution_root, resolved.identity, active_features})
+    if merged.conflict != "" { ret dependency_solve_failure(records, merged.conflict) }
+    let next_queue = if merged.changed { enqueue_manifest_dependencies(queue, resolved_manifest, merged.features, resolved.root, resolved.distribution_root, resolved.source_key) } else { queue }
+    ret solve_dependency_queue(next_queue, index + 1_usize, merged.records, root, update)
+}
+
+fn enqueue_manifest_dependencies(queue: Vec[DependencyQueueItem], manifest: ProjectManifest, features: Vec[str], owner_root: str, distribution_root: str, source_key: str) -> Vec[DependencyQueueItem] {
+    let mut out = queue
+    let mut nested = project_manifest_dependencies(manifest)
+    for dependency in project_manifest_feature_dependencies(manifest, features) { if !contains_item(nested, dependency) { nested.push(dependency) } }
+    for dependency in nested { out.push(DependencyQueueItem{dependency, owner_root, distribution_root, source_key}) }
+    ret out
+}
+
+fn lock_record_index(records: Vec[LockPackageRecord], identity: str) -> usize {
+    let mut index = 0_usize
+    while index < records.len() {
+        match records.get(index) { Some(record) => { if record.identity == identity { ret index } } None => {} }
+        index += 1_usize
+    }
+    ret records.len()
+}
+
+fn clone_dependency_queue(queue: Vec[DependencyQueueItem]) -> Vec[DependencyQueueItem] {
+    let mut out = Vec[DependencyQueueItem]::new()
+    for item in queue { out.push(DependencyQueueItem{item.reference, item.owner_root, item.distribution_root, item.source_key}) }
+    ret out
+}
+
+fn clone_lock_records(records: Vec[LockPackageRecord]) -> Vec[LockPackageRecord] {
+    let mut out = Vec[LockPackageRecord]::new()
+    for record in records {
+        let mut features = Vec[str]::new()
+        for feature in record.features { features.push(feature) }
+        out.push(LockPackageRecord{record.reference, record.resolved_root, record.distribution_root, record.identity, features})
+    }
+    ret out
+}
+
+fn queue_item_or_empty(queue: Vec[DependencyQueueItem], index: usize) -> DependencyQueueItem {
+    match queue.get(index) { Some(item) => { ret item } None => { ret DependencyQueueItem{"", "", "", ""} } }
+}
+
+fn dependency_solve_failure(records: Vec[LockPackageRecord], message: str) -> DependencySolveResult {
+    ret DependencySolveResult{records, false, message}
+}
+
+fn combined_registry_reference(reference: str, queue: Vec[DependencyQueueItem], records: Vec[LockPackageRecord]) -> str {
+    let base = dependency_base_reference(reference)
+    if !starts_with(base, "index@") { ret base }
+    let name = index_reference_name(base)
+    let mut requirements = Vec[str]::new()
+    for item in queue {
+        let candidate = dependency_base_reference(item.reference)
+        if starts_with(candidate, "index@") && index_reference_name(candidate) == name {
+            let requirement = index_reference_requirement(candidate)
+            if requirement != "" && requirement != "*" && !contains_item(requirements, requirement) { requirements.push(requirement) }
+        }
+    }
+    for record in records {
+        if starts_with(record.reference, "index@") && index_reference_name(record.reference) == name {
+            for requirement in split_requirements(index_reference_requirement(record.reference)) {
+                if requirement != "" && requirement != "*" && !contains_item(requirements, requirement) { requirements.push(requirement) }
+            }
+        }
+    }
+    if requirements.len() == 0_usize { ret "index@" + name }
+    let mut out = "index@" + name + "@"
+    let mut index = 0_usize
+    while index < requirements.len() {
+        match requirements.get(index) {
+            Some(requirement) => { if index > 0_usize { out = out + ", " } out = out + requirement }
+            None => {}
+        }
+        index += 1_usize
+    }
+    ret out
+}
+
+fn index_reference_name(reference: str) -> str {
+    let base = dependency_base_reference(reference)
+    if !starts_with(base, "index@") { ret "" }
+    let spec = base.slice(6_usize, base.len() - 6_usize)
+    let separator = find_from(spec, "@", 0_usize)
+    ret spec.slice(0_usize, separator)
+}
+
+fn index_reference_requirement(reference: str) -> str {
+    let base = dependency_base_reference(reference)
+    if !starts_with(base, "index@") { ret "" }
+    let spec = base.slice(6_usize, base.len() - 6_usize)
+    let separator = find_from(spec, "@", 0_usize)
+    if separator == spec.len() { ret "" }
+    ret spec.slice(separator + 1_usize, spec.len() - separator - 1_usize)
+}
+
+fn split_requirements(value: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index <= value.len() {
+        if index == value.len() || value.slice(index, 1_usize) == "," {
+            let item = trim_spaces(value.slice(start, index - start))
+            if item != "" { out.push(item) }
+            start = index + 1_usize
+        }
+        index += 1_usize
+    }
+    ret out
+}
+
+fn trim_spaces(value: str) -> str {
+    let mut start = 0_usize
+    let mut end = value.len()
+    while start < end && (value.slice(start, 1_usize) == " " || value.slice(start, 1_usize) == "\t") { start += 1_usize }
+    while end > start && (value.slice(end - 1_usize, 1_usize) == " " || value.slice(end - 1_usize, 1_usize) == "\t") { end -= 1_usize }
+    ret value.slice(start, end - start)
+}
+
 fn lock_package(root: Path, reference: str, resolved: Path, distribution_root: Path) -> str {
+    let base_reference = dependency_base_reference(reference)
     let manifest = read_project_manifest(resolved)
     let mut entry = "\n[[packages]]\n"
     entry = entry + "name = \"" + escape_toml(project_manifest_name(manifest)) + "\"\n"
-    entry = entry + "ref = \"" + escape_toml(reference) + "\"\n"
+    entry = entry + "ref = \"" + escape_toml(base_reference) + "\"\n"
     entry = entry + "version = \"" + escape_toml(project_manifest_version(manifest)) + "\"\n"
-    if starts_with(reference, "index@") { entry = entry + registry_lock_fields(resolved) }
-    if starts_with(reference, "workspace@") {
+    let features = project_manifest_resolve_features(manifest, dependency_requested_features(reference))
+    if features.len() > 0_usize { entry = entry + "features = " + toml_string_array(features) + "\n" }
+    if starts_with(base_reference, "index@") { entry = entry + registry_lock_fields(resolved) }
+    if starts_with(base_reference, "workspace@") {
         let distribution = read_project_manifest(distribution_root)
-        let embedded_name = reference.slice(10_usize, reference.len() - 10_usize)
+        let embedded_name = base_reference.slice(10_usize, base_reference.len() - 10_usize)
         entry = entry + "source = \"embedded@" + escape_toml(project_manifest_name(distribution)) + "\"\n"
         entry = entry + "path = \"workspace/" + escape_toml(embedded_name) + "\"\n"
         let checksum = registry_package_checksum(distribution_root)
         if checksum != "" { entry = entry + "distribution-checksum = \"" + checksum + "\"\n" }
     }
-    if starts_with(reference, "git@") {
+    if starts_with(base_reference, "git@") {
         let revision = git_revision(root, resolved)
         if revision == "" { ret "" }
         entry = entry + "commit = \"" + revision + "\"\n"
@@ -251,6 +439,46 @@ struct DependencyQueueItem {
     source_key: str
 }
 
+struct LockPackageRecord {
+    reference: str
+    resolved_root: str
+    distribution_root: str
+    identity: str
+    features: Vec[str]
+}
+
+struct LockMergeResult {
+    records: Vec[LockPackageRecord]
+    features: Vec[str]
+    changed: bool
+    conflict: str
+}
+
+fn merge_lock_record(records: Vec[LockPackageRecord], incoming: LockPackageRecord) -> LockMergeResult {
+    let mut found = false
+    let mut changed = false
+    let mut merged_features = incoming.features
+    let mut out = Vec[LockPackageRecord]::new()
+    for record in records {
+        if record.identity == incoming.identity {
+            found = true
+            if record.resolved_root != incoming.resolved_root {
+                ret LockMergeResult{records, merged_features, false, "Dependency conflict for " + incoming.identity + ": " + record.reference + " resolves to " + project_manifest_version(read_project_manifest(Path::new(record.resolved_root))) + ", but " + incoming.reference + " resolves to " + project_manifest_version(read_project_manifest(Path::new(incoming.resolved_root)))}
+            }
+            merged_features = record.features
+            for feature in incoming.features {
+                if !contains_item(merged_features, feature) { merged_features.push(feature) changed = true }
+            }
+            out.push(LockPackageRecord{record.reference, record.resolved_root, record.distribution_root, record.identity, merged_features})
+        } else { out.push(record) }
+    }
+    if !found {
+        out.push(incoming)
+        changed = true
+    }
+    ret LockMergeResult{out, merged_features, changed, ""}
+}
+
 struct DependencyResolution {
     root: str
     distribution_root: str
@@ -259,34 +487,35 @@ struct DependencyResolution {
 }
 
 fn resolve_dependency(reference: str, base: Path, distribution_root: Path, source_key: str, lock_root: Path, update: bool) -> DependencyResolution {
-    if reference == "sys@core" {
+    let base_reference = dependency_base_reference(reference)
+    if base_reference == "sys@core" {
         let root = system_core_root(base).resolve()
         ret resolved_dependency(root, root, "sys@core", "sys@core")
     }
-    if starts_with(reference, "index@") {
-        let resolved = resolve_index_dependency(reference, lock_root, update)
+    if starts_with(base_reference, "index@") {
+        let resolved = resolve_index_dependency(base_reference, lock_root, update)
         if resolved == "" { ret failed_dependency() }
         let root = Path::new(resolved).resolve()
         let checksum = registry_package_checksum(root)
-        let registry_source = reference + ":" + checksum
-        ret resolved_dependency(root, root, registry_source, registry_source)
+        let registry_source = base_reference + ":" + checksum
+        ret resolved_dependency(root, root, registry_source, "index:" + project_manifest_name(read_project_manifest(root)))
     }
-    if starts_with(reference, "workspace@") {
-        let name = reference.slice(10_usize, reference.len() - 10_usize)
+    if starts_with(base_reference, "workspace@") {
+        let name = base_reference.slice(10_usize, base_reference.len() - 10_usize)
         if !valid_dependency_name(name) { native_mode_fail("Invalid workspace dependency name: " + name) ret failed_dependency() }
         let root = distribution_root.join("workspace").join(name).resolve()
         if !file_exists(root.join("encore.toml").as_str()) { native_mode_fail("Unable to find " + reference + " at " + root.as_str()) ret failed_dependency() }
         let identity = source_key + "#workspace/" + name
         ret resolved_dependency(root, distribution_root, source_key, identity)
     }
-    if starts_with(reference, "path@") {
-        let path = base.join(reference.slice(5_usize, reference.len() - 5_usize)).resolve()
+    if starts_with(base_reference, "path@") {
+        let path = base.join(base_reference.slice(5_usize, base_reference.len() - 5_usize)).resolve()
         if !file_exists(path.join("encore.toml").as_str()) { native_mode_fail("Invalid path dependency: " + path.as_str()) ret failed_dependency() }
         let path_source = "path:" + path.as_str()
         ret resolved_dependency(path, path, path_source, path_source)
     }
-    if starts_with(reference, "git@") {
-        let url = reference.slice(4_usize, reference.len() - 4_usize)
+    if starts_with(base_reference, "git@") {
+        let url = base_reference.slice(4_usize, base_reference.len() - 4_usize)
         let repository = trim_git_suffix(path_name_or(Path::new(url), "repository"))
         let owner = parent_name_or(Path::new(url), "git")
         let destination = Path::new(home_dir()).join(".cache").join("encore").join("git").join(owner).join(repository)
@@ -385,6 +614,20 @@ fn contains_item(values: Vec[str], needle: str) -> bool {
     }
     ret false
 }
+fn split_features(value: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index <= value.len() {
+        if index == value.len() || value.slice(index, 1_usize) == "," {
+            let item = value.slice(start, index - start)
+            if item != "" && !contains_item(out, item) { out.push(item) }
+            start = index + 1_usize
+        }
+        index = index + 1_usize
+    }
+    ret out
+}
 fn starts_with(value: str, prefix: str) -> bool { ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix }
 fn escape_toml(value: str) -> str {
     let mut out = ""
@@ -397,4 +640,19 @@ fn escape_toml(value: str) -> str {
         i = i + 1_usize
     }
     ret out
+}
+fn toml_string_array(values: Vec[str]) -> str {
+    let mut out = "["
+    let mut index = 0_usize
+    while index < values.len() {
+        match values.get(index) {
+            Some(value) => {
+                if index > 0_usize { out = out + ", " }
+                out = out + "\"" + escape_toml(value) + "\""
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret out + "]"
 }

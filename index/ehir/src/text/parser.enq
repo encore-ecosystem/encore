@@ -4,9 +4,25 @@ import core::fmt::Debug
 import std::vec::Vec
 
 extern fn encore_str_slice_bytes(value: str, start: usize, byte_len: usize) -> str
+extern fn encore_text_builder_new() -> usize
+extern fn encore_text_builder_append(builder: usize, value: str) -> ()
+extern fn encore_text_builder_finish(builder: usize) -> str
 
 fn byte_slice(value: str, start: usize, byte_len: usize) -> str {
     ret unsafe { encore_str_slice_bytes(value, start, byte_len) }
+}
+
+fn join_line_range(lines: Vec[str], start: usize, end: usize) -> str {
+    let builder = unsafe { encore_text_builder_new() }
+    let mut index = start
+    while index < end && index < lines.len() {
+        unsafe {
+            encore_text_builder_append(builder, required_part(lines, index))
+            encore_text_builder_append(builder, "\n")
+        }
+        index = index + 1_usize
+    }
+    ret unsafe { encore_text_builder_finish(builder) }
 }
 
 import refrain::core::PointerKind
@@ -21,6 +37,7 @@ import refrain::core::untyped_var
 import refrain::core::Instruction
 import refrain::core::Terminator
 import refrain::core::MatchArm
+import refrain::core::PhiPair
 import refrain::core::lcpos
 import refrain::core::alias
 import refrain::core::call
@@ -61,6 +78,8 @@ import refrain::core::and_op
 import refrain::core::or_op
 import refrain::core::xor_op
 import refrain::core::binary
+import refrain::core::phi_pair
+import refrain::core::phi
 import refrain::core::ret_term
 import refrain::core::br_term
 import refrain::core::cbr_term
@@ -75,6 +94,14 @@ import refrain::core::block
 import refrain::core::fn_directive
 import refrain::core::extern_fn_directive
 import refrain::core::make_module
+import refrain::core::make_module_with_imports
+import refrain::core::make_module_with_metadata
+import refrain::core::make_module_bundle
+import refrain::core::ehir_import
+import refrain::core::EhirImport
+import refrain::core::ModuleBundle
+import refrain::core::EhirDocumentation
+import refrain::core::ehir_documentation
 import refrain::core::fn_item
 import refrain::core::plain_type
 import refrain::core::EnumVariant
@@ -226,6 +253,7 @@ pub fn parse_instruction_text(source: str) -> Instruction {
 
     if opcode == "lcpos" || opcode == "capprim" { ret lcpos(out, operands_text) }
     if opcode == "alias" { ret alias(out, parse_variable_text(operands_text)) }
+    if opcode == "await" { ret await_value(out, parse_variable_text(operands_text)) }
     if opcode == "call" || opcode == "unsafe" {
         let call_text = if opcode == "unsafe" { trim_text(operands_text.slice(5_usize, operands_text.len() - 5_usize)) } else { operands_text }
         let open = find_top_level_char(call_text, "(")
@@ -287,6 +315,16 @@ pub fn parse_instruction_text(source: str) -> Instruction {
     if opcode == "gep" {
         let operands = split_top_level_text(operands_text, ",")
         ret gep(out, parse_variable_text(required_part(operands, 0_usize)), parse_variable_text(required_part(operands, 1_usize)))
+    }
+    if opcode == "phi" {
+        let mut pairs = Vec[PhiPair]::new()
+        for operand in split_top_level_text(operands_text, ",") {
+            let separator = find_text(operand, " $")
+            if separator >= operand.len() { panic("Malformed EHIR phi pair: " + operand) }
+            let label = trim_text(operand.slice(separator + 2_usize, operand.len() - separator - 2_usize))
+            pairs.push(phi_pair(parse_variable_text(trim_text(operand.slice(0_usize, separator))), label))
+        }
+        ret phi(out, pairs)
     }
 
     let operands = split_top_level_text(operands_text, ",")
@@ -372,10 +410,16 @@ fn parse_match_terminator_text(value: str) -> Terminator {
 pub fn parse_function_text(source: str) -> FnDirective {
     let lines = split_lines_text(source)
     if lines.len() == 0_usize { panic("EHIR function must not be empty") }
-    let header = required_part(lines, 0_usize)
+    let header = trim_text(required_part(lines, 0_usize))
     let is_extern = starts_with_text(header, "extern fn ")
-    let prefix_len = if is_extern { 10_usize } else { 3_usize }
-    if !is_extern && !starts_with_text(header, "fn ") {
+    let is_async = starts_with_text(header, "async fn ")
+    let mut prefix_len = 3_usize
+    if is_extern {
+        prefix_len = 10_usize
+    } else {
+        if is_async { prefix_len = 9_usize }
+    }
+    if !is_extern && !is_async && !starts_with_text(header, "fn ") {
         panic("Expected EHIR function header: " + header)
     }
 
@@ -461,7 +505,12 @@ pub fn parse_function_text(source: str) -> FnDirective {
     if block_name.len() > 0_usize {
         blocks.push(finish_parsed_block(block_name, instructions, terminator))
     }
-    match fn_directive(name, generics, params, ret_type, blocks) {
+    let directive = if is_async {
+        async_fn_directive(name, generics, params, ret_type, blocks)
+    } else {
+        fn_directive(name, generics, params, ret_type, blocks)
+    }
+    match directive {
         Directive::Function(function) => { ret function }
         _ => { panic("Internal EHIR function construction error") }
     }
@@ -496,6 +545,7 @@ fn resolve_variables(values: Vec[Variable], known: Vec[Parameter]) -> Vec[Variab
 fn resolve_instruction_types(instruction: Instruction, known: Vec[Parameter]) -> Instruction {
     match instruction {
         Instruction::Alias(data) => { ret alias(resolve_variable_type(data.out, known), resolve_variable_type(data.src, known)) }
+        Instruction::Await(data) => { ret await_value(data.out, resolve_variable_type(data.future, known)) }
         Instruction::Call(data) => { ret call(data.out, data.name, data.generics, resolve_variables(data.args, known), data.is_unsafe) }
         Instruction::Lcsos(data) => { ret lcsos(data.out, data.typ, resolve_variables(data.args, known)) }
         Instruction::Store(data) => { ret store(resolve_variable_type(data.src, known), resolve_variable_type(data.dst, known)) }
@@ -509,6 +559,11 @@ fn resolve_instruction_types(instruction: Instruction, known: Vec[Parameter]) ->
         Instruction::SGetFieldPtr(data) => { ret sgetfieldptr(data.out, resolve_variable_type(data.src, known), data.field) }
         Instruction::Gep(data) => { ret gep(data.out, resolve_variable_type(data.src, known), resolve_variable_type(data.offset, known)) }
         Instruction::Binary(data) => { ret binary(data.out, resolve_variable_type(data.lhs, known), resolve_variable_type(data.rhs, known), data.op) }
+        Instruction::Phi(data) => {
+            let mut pairs = Vec[PhiPair]::new()
+            for pair in data.pairs { pairs.push(phi_pair(resolve_variable_type(pair.value, known), pair.label)) }
+            ret phi(data.out, pairs)
+        }
         Instruction::Lceos(data) => {
             let value = data.value
             let payload = match value.payload {
@@ -535,6 +590,7 @@ fn remember_instruction_output(known: mut Vec[Parameter], instruction: Instructi
         Instruction::Lcsos(data) => { remember_variable(known, data.out) }
         Instruction::Lceos(data) => { remember_variable(known, data.out) }
         Instruction::Call(data) => { remember_variable(known, data.out) }
+        Instruction::Await(data) => { remember_variable(known, data.out) }
         Instruction::Load(data) => { remember_variable(known, data.out) }
         Instruction::GetPtr(data) => { remember_variable(known, data.out) }
         Instruction::PtrCast(data) => { remember_variable(known, data.out) }
@@ -547,6 +603,7 @@ fn remember_instruction_output(known: mut Vec[Parameter], instruction: Instructi
         Instruction::HeapRealloc(data) => { remember_variable(known, data.out) }
         Instruction::StackAlloc(data) => { remember_variable(known, data.out) }
         Instruction::Binary(data) => { remember_variable(known, data.out) }
+        Instruction::Phi(data) => { remember_variable(known, data.out) }
         _ => {}
     }
     ret ()
@@ -575,6 +632,10 @@ fn resolve_terminator_types(terminator: Terminator, known: Vec[Parameter]) -> Te
 
 pub fn parse_module_text(name: str, source: str) -> Module {
     let lines = split_lines_text(source)
+    let mut imports = Vec[EhirImport]::new()
+    let mut documentation = Option[str]::None
+    let mut symbol_documentation = Vec[EhirDocumentation]::new()
+    let mut pending_documentation = Option[str]::None
     let mut directives = Vec[Directive]::new()
     let mut index = 0_usize
     while index < lines.len() {
@@ -583,51 +644,149 @@ pub fn parse_module_text(name: str, source: str) -> Module {
             index = index + 1_usize
             continue
         }
-        if starts_with_text(line, "extern fn ") {
-            directives.push(Directive::Function(parse_function_text(line)))
+        if starts_with_text(line, "//!") {
+            documentation = Option[str]::Some(append_documentation_line(documentation, documentation_comment_text(line)))
             index = index + 1_usize
             continue
         }
-        if starts_with_text(line, "fn ") {
-            let mut text = line + "\n"
+        if starts_with_text(line, "///") {
+            pending_documentation = Option[str]::Some(append_documentation_line(pending_documentation, documentation_comment_text(line)))
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "import ") {
+            let module_id = trim_text(line.slice(7_usize, line.len() - 7_usize))
+            if module_id == "" { panic("Malformed EHIR import: " + line) }
+            imports.push(ehir_import(module_id))
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "extern fn ") {
+            let directive = Directive::Function(parse_function_text(line))
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "fn ") || starts_with_text(line, "async fn ") {
+            let start = index
             let mut depth = brace_delta(line)
             index = index + 1_usize
             while index < lines.len() && depth > 0_isize {
                 let body_line = required_part(lines, index)
-                text = text + body_line + "\n"
                 depth = depth + brace_delta(body_line)
                 index = index + 1_usize
             }
-            directives.push(Directive::Function(parse_function_text(text)))
+            let directive = Directive::Function(parse_function_text(join_line_range(lines, start, index)))
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
             continue
         }
         if starts_with_text(line, "struct ") {
             let chunk = collect_braced_text(lines, index)
-            directives.push(parse_struct_text(chunk.text))
+            let directive = parse_struct_text(chunk.text)
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
             index = chunk.next_index
             continue
         }
         if starts_with_text(line, "enum ") {
             let chunk = collect_braced_text(lines, index)
-            directives.push(parse_enum_text(chunk.text))
+            let directive = parse_enum_text(chunk.text)
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
             index = chunk.next_index
             continue
         }
         if starts_with_text(line, "trait ") {
             let chunk = collect_braced_text(lines, index)
-            directives.push(parse_trait_text(chunk.text))
+            let directive = parse_trait_text(chunk.text)
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
             index = chunk.next_index
             continue
         }
         if starts_with_text(line, "impl") {
             let chunk = collect_braced_text(lines, index)
-            directives.push(parse_impl_text(chunk.text))
+            let directive = parse_impl_text(chunk.text)
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
             index = chunk.next_index
             continue
         }
         panic("Unsupported top-level EHIR directive: " + line)
     }
-    ret make_module(name, directives)
+    ret make_module_with_metadata(name, imports, documentation, symbol_documentation, directives)
+}
+
+fn documentation_comment_text(line: str) -> str {
+    if line.len() <= 3_usize { ret "" }
+    let mut text = line.slice(3_usize, line.len() - 3_usize)
+    if starts_with_text(text, " ") { text = text.slice(1_usize, text.len() - 1_usize) }
+    ret text
+}
+
+fn append_documentation_line(current: Option[str], line: str) -> str {
+    match current {
+        Option[str]::Some(text) => { ret text + "\n" + line }
+        Option[str]::None => { ret line }
+    }
+}
+
+fn push_documented_directive(
+    directives: mut Vec[Directive],
+    documentation: mut Vec[EhirDocumentation],
+    directive: Directive,
+    pending: Option[str]
+) -> () {
+    match pending {
+        Option[str]::Some(text) => { documentation.push(ehir_documentation(directive_name(directive), text)) }
+        Option[str]::None => {}
+    }
+    directives.push(directive)
+    ret ()
+}
+
+fn directive_name(directive: Directive) -> str {
+    match directive {
+        Directive::Struct(item) => { ret item.name }
+        Directive::Enum(item) => { ret item.name }
+        Directive::Function(item) => { ret item.name }
+        Directive::Trait(item) => { ret item.name }
+        Directive::Impl(item) => { ret "impl " + item.for_type.name }
+    }
+}
+
+pub fn parse_module_bundle_text(entry_module: str, source: str) -> ModuleBundle {
+    let lines = split_lines_text(source)
+    let mut entry = entry_module
+    let mut modules = Vec[Module]::new()
+    let mut index = 0_usize
+    while index < lines.len() {
+        let line = trim_text(required_part(lines, index))
+        if line == "" { index = index + 1_usize continue }
+        if starts_with_text(line, "entry ") {
+            entry = trim_text(line.slice(6_usize, line.len() - 6_usize))
+            if entry == "" { panic("EHIR bundle entry must not be empty") }
+            index = index + 1_usize
+            continue
+        }
+        if !starts_with_text(line, "module ") || !ends_with_text(line, " {") {
+            panic("Malformed EHIR module header: " + line)
+        }
+        let module_id = trim_text(line.slice(7_usize, line.len() - 9_usize))
+        if module_id == "" { panic("EHIR module id must not be empty") }
+        let start = index + 1_usize
+        let mut depth = brace_delta(line)
+        index = start
+        while index < lines.len() && depth > 0_isize {
+            depth = depth + brace_delta(required_part(lines, index))
+            index = index + 1_usize
+        }
+        if depth != 0_isize { panic("Unclosed EHIR module: " + module_id) }
+        modules.push(parse_module_text(module_id, join_line_range(lines, start, index - 1_usize)))
+    }
+    ret make_module_bundle(entry, modules)
 }
 
 pub fn parse_trait_text(source: str) -> Directive {
@@ -644,6 +803,7 @@ pub fn parse_trait_text(source: str) -> Directive {
         let line = trim_text(required_part(lines, index))
         index = index + 1_usize
         if line.len() == 0_usize || line == "}" { continue }
+        if starts_with_text(line, "///") { continue }
         methods.push(parse_trait_method_text(line))
     }
     ret trait_directive(declaration.name, declaration.generics, methods)
@@ -688,7 +848,11 @@ pub fn parse_impl_text(source: str) -> Directive {
             index = index + 1_usize
             continue
         }
-        if starts_with_text(line, "fn ") {
+        if starts_with_text(line, "///") {
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "fn ") || starts_with_text(line, "async fn ") {
             let chunk = collect_braced_text(lines, index)
             methods.push(parse_function_text(chunk.text))
             index = chunk.next_index
@@ -738,17 +902,15 @@ struct BracedText {
 
 fn collect_braced_text(lines: Vec[str], start: usize) -> BracedText {
     let mut index = start
-    let mut text = ""
     let mut depth = 0_isize
     loop {
         if index >= lines.len() { break }
         let line = required_part(lines, index)
-        text = text + line + "\n"
         depth = depth + brace_delta(line)
         index = index + 1_usize
         if depth == 0_isize { break }
     }
-    ret BracedText{text, index}
+    ret BracedText{join_line_range(lines, start, index), index}
 }
 
 pub fn parse_struct_text(source: str) -> Directive {

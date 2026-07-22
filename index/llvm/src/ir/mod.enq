@@ -1,10 +1,14 @@
 import core::option::Option
 import std::vec::Vec
-import std::vec::append
-import std::vec::is_empty
-import std::vec::head_or
-import std::vec::tail_or
 import std::vec::vec_singleton
+
+fn concat_lines(left: Vec[str], right: Vec[str]) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    out.extend(left)
+    out.extend(right)
+    ret out
+}
+
 import std::os::write_file
 import refrain::types::LLVMType
 import refrain::types::type_text
@@ -26,16 +30,30 @@ import refrain::core::llvm_basic_block
 import refrain::core::llvm_param
 
 extern fn encore_str_join_lines_parts(data: usize, len: usize) -> str
+extern fn encore_text_builder_new() -> usize
+extern fn encore_text_builder_append(builder: usize, value: str) -> ()
+extern fn encore_text_builder_finish(builder: usize) -> str
 
 pub fn emit_module_lines(module: LLVMModule) -> Vec[str] {
     let header = "; ModuleID = '" + module.name + "'"
-    let with_types = append(single_line(header), module.type_declarations)
-    let with_header = append(with_types, single_line(""))
-    ret append(with_header, emit_functions(module.functions))
+    let with_types = concat_lines(single_line(header), module.type_declarations)
+    let with_header = concat_lines(with_types, single_line(""))
+    ret concat_lines(with_header, emit_functions(module.functions))
 }
 
 pub fn emit_module_text(module: LLVMModule) -> str {
-    ret join_lines(emit_module_lines(module))
+    let builder = unsafe { encore_text_builder_new() }
+    append_builder_line(builder, "; ModuleID = '" + module.name + "'")
+    for declaration in module.type_declarations { append_builder_line(builder, declaration) }
+    append_builder_line(builder, "")
+    let function_count = module.functions.len()
+    let mut function_index = 0_usize
+    for function in module.functions {
+        append_function_to_builder(builder, function)
+        if function_index + 1_usize < function_count { append_builder_line(builder, "") }
+        function_index = function_index + 1_usize
+    }
+    ret unsafe { encore_text_builder_finish(builder) }
 }
 
 pub fn emit_module_to_file(module: LLVMModule, path: str) -> i32 {
@@ -51,14 +69,40 @@ fn emit_functions(functions: Vec[LLVMFunction]) -> Vec[str] {
     ret acc
 }
 
+pub fn append_function_to_builder(builder: usize, function: LLVMFunction) -> () {
+    if function.is_extern {
+        append_builder_line(builder, render_function_signature(function, true))
+        ret ()
+    }
+
+    append_builder_line(builder, render_function_signature(function, false) + " {")
+    for block_item in function.blocks {
+        append_builder_line(builder, block_item.name + ":")
+        for instruction in block_item.instructions {
+            append_builder_line(builder, render_instruction_line(instruction))
+        }
+        append_builder_line(builder, render_terminator_line(block_item.terminator))
+    }
+    append_builder_line(builder, "}")
+    ret ()
+}
+
+pub fn append_builder_line(builder: usize, value: str) -> () {
+    unsafe {
+        encore_text_builder_append(builder, value)
+        encore_text_builder_append(builder, "\n")
+    }
+    ret ()
+}
+
 fn emit_function_lines(func: LLVMFunction) -> Vec[str] {
     if (func.is_extern) {
         ret single_line(render_function_signature(func, true))
     }
 
     let header = render_function_signature(func, false) + " {"
-    let with_header = append(single_line(header), emit_blocks_lines(func.blocks))
-    ret append(with_header, single_line("}"))
+    let with_header = concat_lines(single_line(header), emit_blocks_lines(func.blocks))
+    ret concat_lines(with_header, single_line("}"))
 }
 
 fn emit_blocks_lines(blocks: Vec[LLVMBasicBlock]) -> Vec[str] {
@@ -69,8 +113,8 @@ fn emit_blocks_lines(blocks: Vec[LLVMBasicBlock]) -> Vec[str] {
 
 fn emit_block_lines(block: LLVMBasicBlock) -> Vec[str] {
     let label = block.name + ":"
-    let with_body = append(single_line(label), emit_instruction_lines(block.instructions))
-    ret append(with_body, single_line(render_terminator_line(block.terminator)))
+    let with_body = concat_lines(single_line(label), emit_instruction_lines(block.instructions))
+    ret concat_lines(with_body, single_line(render_terminator_line(block.terminator)))
 }
 
 fn emit_instruction_lines(instructions: Vec[LLVMInstruction]) -> Vec[str] {
@@ -84,12 +128,13 @@ fn single_line(line: str) -> Vec[str] {
 }
 
 fn render_function_signature(func: LLVMFunction, as_declare: bool) -> str {
-    let prefix = signature_prefix(as_declare)
+    let prefix = signature_prefix(as_declare) + if as_declare || func.linkage == "" { "" } else { func.linkage + " " }
     let typed_prefix = prefix + type_text(func.ret_type)
     let with_name = typed_prefix + " @" + func.name
     let with_open = with_name + "("
     let with_params = with_open + render_params(func.params)
-    ret with_params + ")"
+    let suffix = if func.attributes == "" { "" } else { " " + func.attributes }
+    ret with_params + ")" + suffix
 }
 
 fn signature_prefix(as_declare: bool) -> str {
@@ -108,18 +153,6 @@ fn render_params(params: Vec[LLVMParam]) -> str {
         first = false
     }
     ret out
-}
-
-fn render_params_acc(params: Vec[LLVMParam], acc: str, is_first: bool) -> str {
-    if (is_empty(params)) {
-        ret acc
-    }
-
-    let current = head_or(params, default_param())
-    let rest = tail_or(params, Vec[LLVMParam]::new())
-    let head = render_param(current)
-    let next_acc = concat_with_sep(acc, head, is_first, ", ")
-    ret render_params_acc(rest, next_acc, false)
 }
 
 fn render_param(param: LLVMParam) -> str {
@@ -256,18 +289,6 @@ fn render_typed_values(values: Vec[LLVMValue]) -> str {
     ret out
 }
 
-fn render_typed_values_acc(values: Vec[LLVMValue], acc: str, is_first: bool) -> str {
-    if (is_empty(values)) {
-        ret acc
-    }
-
-    let current = head_or(values, default_value())
-    let rest = tail_or(values, Vec[LLVMValue]::new())
-    let typed = render_typed_value(current)
-    let next_acc = concat_with_sep(acc, typed, is_first, ", ")
-    ret render_typed_values_acc(rest, next_acc, false)
-}
-
 fn render_typed_value(value: LLVMValue) -> str {
     let with_type = type_text(value.typ) + " "
     ret with_type + value_text(value)
@@ -309,17 +330,6 @@ fn join_lines(lines: Vec[str]) -> str {
     ret unsafe { encore_str_join_lines_parts(data, len) }
 }
 
-fn join_lines_acc(lines: Vec[str], acc: str, is_first: bool) -> str {
-    if (is_empty(lines)) {
-        ret acc
-    }
-
-    let current = head_or(lines, "")
-    let rest = tail_or(lines, Vec[str]::new())
-    let next_acc = concat_with_sep(acc, current, is_first, "\n")
-    ret join_lines_acc(rest, next_acc, false)
-}
-
 fn concat_with_sep(acc: str, piece: str, is_first: bool, sep: str) -> str {
     if (is_first) {
         ret acc + piece
@@ -328,7 +338,7 @@ fn concat_with_sep(acc: str, piece: str, is_first: bool, sep: str) -> str {
 }
 
 fn default_function() -> LLVMFunction {
-    ret LLVMFunction{"", void_type(), Vec[LLVMParam]::new(), Vec[LLVMBasicBlock]::new(), true}
+    ret LLVMFunction{"", void_type(), Vec[LLVMParam]::new(), Vec[LLVMBasicBlock]::new(), true, "", ""}
 }
 
 fn default_param() -> LLVMParam {
