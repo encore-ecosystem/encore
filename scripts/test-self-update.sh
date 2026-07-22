@@ -105,19 +105,47 @@ wait_for_transaction() {
     test -x "$installed"
 }
 
+assert_contains() {
+    expected=$1
+    source=$2
+    if ! tr -d '\r' < "$source" | grep -Fq "$expected"; then
+        echo "expected '$expected' in $source" >&2
+        tr -d '\r' < "$source" >&2
+        return 1
+    fi
+}
+
+assert_line() {
+    expected=$1
+    source=$2
+    if ! tr -d '\r' < "$source" | grep -Fqx "$expected"; then
+        echo "expected line '$expected' in $source" >&2
+        tr -d '\r' < "$source" >&2
+        return 1
+    fi
+}
+
+assert_installed_version() {
+    actual=$($installed --version | tr -d '\r')
+    if [ "$actual" != "encore $version" ]; then
+        echo "installed compiler reported '$actual', expected 'encore $version'" >&2
+        return 1
+    fi
+}
+
 ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self channel > "$temporary/channel-default.log"
-grep -q '^stable$' "$temporary/channel-default.log"
+assert_line stable "$temporary/channel-default.log"
 ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self channel beta > "$temporary/channel-beta.log"
-grep -q 'Switched Encore update channel to beta' "$temporary/channel-beta.log"
-grep -q '^channel = "beta"$' "$install_root/settings.toml"
+assert_contains 'Switched Encore update channel to beta' "$temporary/channel-beta.log"
+assert_line 'channel = "beta"' "$install_root/settings.toml"
 ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self channel stable > "$temporary/channel-stable.log"
-grep -q '^channel = "stable"$' "$install_root/settings.toml"
+assert_line 'channel = "stable"' "$install_root/settings.toml"
 
 ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --check > "$temporary/check.log"
-grep -q "Encore $version is up to date on stable" "$temporary/check.log"
+assert_contains "Encore $version is up to date on stable" "$temporary/check.log"
 ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --channel beta --check > "$temporary/check-beta.log"
-grep -q "Encore $version is up to date on beta" "$temporary/check-beta.log"
-grep -q '^channel = "stable"$' "$install_root/settings.toml"
+assert_contains "Encore $version is up to date on beta" "$temporary/check-beta.log"
+assert_line 'channel = "stable"' "$install_root/settings.toml"
 test "$(cat "$install_root/share/update-marker")" = old
 
 ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --force > "$temporary/update.log"
@@ -129,8 +157,8 @@ done
 wait_for_transaction
 test "$(cat "$install_root/share/update-marker")" = new
 test "$(cat "$install_root/lib/encore/update-marker")" = "complete distribution"
-grep -q '^channel = "stable"$' "$install_root/settings.toml"
-"$installed" --version | grep -q "^encore $version$"
+assert_line 'channel = "stable"' "$install_root/settings.toml"
+assert_installed_version
 
 # Exercise the updater itself over verified HTTPS rather than relying only on
 # the lower-level HTTP client integration test.
@@ -170,15 +198,15 @@ wait_for_transaction
 kill "$server_pid" 2>/dev/null || true
 wait "$server_pid" 2>/dev/null || true
 server_pid=
-grep -q "Updated Encore from $version to $version on stable" "$temporary/https-update.log"
-"$installed" --version | grep -q "^encore $version$"
+assert_contains "Updated Encore from $version to $version on stable" "$temporary/https-update.log"
+assert_installed_version
 
 # Exact installation uses an immutable version manifest and does not alter the
 # persisted release channel.
 ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self install "$version" --force > "$temporary/install.log"
 wait_for_transaction
-grep -q "Installed Encore $version" "$temporary/install.log"
-grep -q '^channel = "stable"$' "$install_root/settings.toml"
+assert_contains "Installed Encore $version" "$temporary/install.log"
+assert_line 'channel = "stable"' "$install_root/settings.toml"
 
 # A corrupt or substituted archive must not modify the working installation.
 bad_checksum=$(printf '%064d' 0)
@@ -189,9 +217,9 @@ ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$install
 bad_code=$?
 set -e
 test "$bad_code" -ne 0
-grep -q 'Checksum verification failed' "$temporary/bad-checksum.log"
+assert_contains 'Checksum verification failed' "$temporary/bad-checksum.log"
 test "$(cat "$install_root/share/update-marker")" = new
-"$installed" --version | grep -q "^encore $version$"
+assert_installed_version
 
 # Invalid manifests, channels and insecure mirrors fail before installation.
 printf '{not json}\n' > "$mirror/channels/stable.json"
@@ -209,9 +237,9 @@ test "$manifest_code" -ne 0
 test "$channel_code" -eq 2
 test "$version_code" -ne 0
 test "$insecure_code" -ne 0
-grep -q 'Invalid update manifest' "$temporary/invalid-manifest.log"
-grep -q 'stable, beta, or nightly' "$temporary/invalid-channel.log"
-grep -q 'Invalid Encore version' "$temporary/invalid-version.log"
-grep -q 'must use https:// or file://' "$temporary/insecure.log"
+assert_contains 'Invalid update manifest' "$temporary/invalid-manifest.log"
+assert_contains 'stable, beta, or nightly' "$temporary/invalid-channel.log"
+assert_contains 'Invalid Encore version' "$temporary/invalid-version.log"
+assert_contains 'must use https:// or file://' "$temporary/insecure.log"
 
 echo "Self-update channel, transaction, checksum, and rollback integration: ok"
