@@ -82,3 +82,14 @@ can use the same build-script pattern for native objects:
 3. Return a non-zero exit code if metadata generation fails.
 
 The current beta validates this flow on Linux first.
+
+## TLS
+
+`core::tls` provides a verified blocking client stream. `TlsClientConfig::system()`
+uses the platform trust store and a 30 second I/O timeout. Applications can use
+`with_ca_file(path)` for a private CA and `with_timeout_ms(value)` to bound each
+connect, handshake, read and write wait. `TlsStream::connect` always verifies the
+certificate chain and requested hostname and enables TLS 1.2 or newer.
+
+The native backend is OpenSSL on Linux, Security.framework on macOS and Schannel
+on Windows. The Encore API does not expose backend-specific handles.

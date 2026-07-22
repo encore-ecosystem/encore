@@ -2678,7 +2678,15 @@ fn translate_field_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assi
             let field_index = ctx_lookup_field_index(ctx, base.typ, field_expr.field)
             builder = builder.instr(current_name + ": " + field_type + " = getfield " + base.value + " > " + field_index)
             builder = builder.instr(tmp_name + ": " + field_type + " = " + op + " " + current_name + ", " + rhs.value)
-            ret builder.instr("setfield " + base.value + " > " + field_index + ", " + tmp_name)
+            builder = builder.instr("setfield " + base.value + " > " + field_index + ", " + tmp_name)
+            if ctx_type_needs_ownership(ctx, field_type) {
+                // `getfield` borrows the old slot while the compound result is
+                // moved into it. Release the displaced owner and a produced
+                // RHS after the operation has consumed neither input.
+                builder = builder.instr("drop " + current_name + ": " + field_type)
+                if !borrowed_rhs { builder = builder.instr("drop " + rhs.value + ": " + rhs.typ) }
+            }
+            ret builder
         }
         _ => {
             translation_error_at(assign_stmt.target.source_name, assign_stmt.target.line, assign_stmt.target.column, "unsupported-assignment-target", "assignment target must be a variable or field")
@@ -4272,16 +4280,18 @@ fn lower_if_expr(ctx: mut TranslatorContext, if_expr: IfExpr, prefix: str, idx: 
         let borrowed_result = expr_is_borrowed_copy(branch.body)
         let lowered = lower_expr(ctx, branch.body, prefix + "_if_expr_body_" + Debug::fmt(branch_idx), idx + branch_idx + 1_usize)
         builder = builder.append(lowered.code)
-        if borrowed_result && ctx_type_needs_ownership(ctx, lowered.typ) {
-            builder = builder.instr("retain " + lowered.value + ": " + lowered.typ)
+        if canonical_type(lowered.typ) != "!" {
+            if borrowed_result && ctx_type_needs_ownership(ctx, lowered.typ) {
+                builder = builder.instr("retain " + lowered.value + ": " + lowered.typ)
+            }
+            builder = builder.instr("store " + lowered.value + ", " + result_slot)
+            if ctx_type_needs_ownership(ctx, result_type) {
+                builder = builder.instr("drop " + lowered.value + ": " + result_type)
+            }
+            builder = append_owned_drops_from(ctx, builder, "", then_label + "_scope", outer_owned)
+            builder = builder.instr("br $" + end_label)
         }
-        builder = builder.instr("store " + lowered.value + ", " + result_slot)
-        if ctx_type_needs_ownership(ctx, result_type) {
-            builder = builder.instr("drop " + lowered.value + ": " + result_type)
-        }
-        builder = append_owned_drops_from(ctx, builder, "", then_label + "_scope", outer_owned)
         restore_owned_vars(ctx, outer_owned)
-        builder = builder.instr("br $" + end_label)
         builder = builder.label(next_label)
         branch_idx = branch_idx + 1_usize
     }
@@ -4289,16 +4299,18 @@ fn lower_if_expr(ctx: mut TranslatorContext, if_expr: IfExpr, prefix: str, idx: 
     let borrowed_else = expr_h_is_borrowed_copy(if_expr.else_body)
     let else_lowered = lower_expr_h(ctx, if_expr.else_body, prefix + "_if_expr_else", idx + branch_idx + 1_usize)
     builder = builder.append(else_lowered.code)
-    if borrowed_else && ctx_type_needs_ownership(ctx, else_lowered.typ) {
-        builder = builder.instr("retain " + else_lowered.value + ": " + else_lowered.typ)
+    if canonical_type(else_lowered.typ) != "!" {
+        if borrowed_else && ctx_type_needs_ownership(ctx, else_lowered.typ) {
+            builder = builder.instr("retain " + else_lowered.value + ": " + else_lowered.typ)
+        }
+        builder = builder.instr("store " + else_lowered.value + ", " + result_slot)
+        if ctx_type_needs_ownership(ctx, result_type) {
+            builder = builder.instr("drop " + else_lowered.value + ": " + result_type)
+        }
+        builder = append_owned_drops_from(ctx, builder, "", prefix + "_if_expr_else_scope", outer_owned)
+        builder = builder.instr("br $" + end_label)
     }
-    builder = builder.instr("store " + else_lowered.value + ", " + result_slot)
-    if ctx_type_needs_ownership(ctx, result_type) {
-        builder = builder.instr("drop " + else_lowered.value + ": " + result_type)
-    }
-    builder = append_owned_drops_from(ctx, builder, "", prefix + "_if_expr_else_scope", outer_owned)
     restore_owned_vars(ctx, outer_owned)
-    builder = builder.instr("br $" + end_label)
     builder = builder.label(end_label)
     builder = builder.instr(result_name + ": " + result_type + " = load " + result_slot)
     ret LoweredExpr{builder, result_name, result_type}
@@ -4306,14 +4318,11 @@ fn lower_if_expr(ctx: mut TranslatorContext, if_expr: IfExpr, prefix: str, idx: 
 
 fn infer_if_expr_result_type(ctx: mut TranslatorContext, if_expr: IfExpr) -> str {
     let owned_size = ctx.owned_vars.len()
-    match if_expr.branches.get(0_usize) {
-        Option[IfExprBranch]::Some(branch) => {
-            let lowered = lower_expr(ctx, branch.body, "_if_type_probe", 0_usize)
-            let typ = lowered.typ
-            restore_owned_vars(ctx, owned_size)
-            ret typ
-        }
-        Option[IfExprBranch]::None => {}
+    for branch in if_expr.branches {
+        let lowered = lower_expr(ctx, branch.body, "_if_type_probe", 0_usize)
+        let typ = canonical_type(lowered.typ)
+        restore_owned_vars(ctx, owned_size)
+        if typ != "!" { ret typ }
     }
     let lowered_else = lower_expr_h(ctx, if_expr.else_body, "_if_type_probe_else", 0_usize)
     let typ = lowered_else.typ
@@ -5411,7 +5420,13 @@ fn translate_owned_ret_expr(ctx: mut TranslatorContext, expr: ExprNode, ret_type
     if ctx.async_poll_future_type != "" {
         ret translate_async_ready_ret(ctx, expr, ret_type, result_prefix)
     }
-    let exclude_name = returned_owner_name(ctx, expr)
+    let mut exclude_name = returned_owner_name(ctx, expr)
+    if exclude_name != "" {
+        match ctx_lookup_var(ctx, exclude_name) {
+            Option[str]::Some(owner_type) => { if starts_with(owner_type, "mut ") { exclude_name = "" } }
+            Option[str]::None => {}
+        }
+    }
     let borrowed_copy = expr_is_borrowed_copy(expr)
     ctx.expression_hint = canonical_type(ret_type)
     let lowered = load_mutable_value(lower_expr(ctx, expr, result_prefix + "_expr", 0_usize), result_prefix + "_load")

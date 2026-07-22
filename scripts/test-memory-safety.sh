@@ -23,6 +23,7 @@ for test_name in \
     owned_shadowing_lifetime \
     owned_reassignment_lifetime \
     temporary_mutable_receiver_lifetime \
+    temporary_owned_mutable_receiver_lifetime \
     ehir_parser_lifetime \
     heap_path_lifetime \
     vec_owned_cow_lifetime \
@@ -40,6 +41,7 @@ do
     fi
     clang -O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
         -Wno-override-module "$llvm_path" "$repo_root/index/core/runtime.c" \
+        -lssl -lcrypto \
         -o "$tmp/$test_name"
     ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
         UBSAN_OPTIONS=halt_on_error=1 \
