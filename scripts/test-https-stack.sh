@@ -37,9 +37,9 @@ extendedKeyUsage=serverAuth
 EOF
 printf 'secure\n' > "$temporary/index.html"
 
-"$openssl_bin" req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=Encore Test CA" \
+MSYS2_ARG_CONV_EXCL='/CN=' "$openssl_bin" req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=Encore Test CA" \
     -keyout "$temporary/ca.key" -out "$temporary/ca.pem" >/dev/null
-"$openssl_bin" req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
+MSYS2_ARG_CONV_EXCL='/CN=' "$openssl_bin" req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
     -keyout "$temporary/server.key" -out "$temporary/server.csr" >/dev/null
 "$openssl_bin" x509 -req -in "$temporary/server.csr" -CA "$temporary/ca.pem" \
     -CAkey "$temporary/ca.key" -CAcreateserial -days 1 \

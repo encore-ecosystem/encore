@@ -1709,6 +1709,7 @@ typedef struct {
     int fd;
     SSLContextRef context;
     bool read_failed;
+    bool received_data;
 } encore_tls_client;
 
 static int encore_apple_tls_socket(const char *host, size_t port, size_t timeout_ms) {
@@ -1831,7 +1832,7 @@ size_t encore_tls_client_connect(encore_str host, size_t port, encore_str ca_fil
     }
     encore_tls_client *client = malloc(sizeof(*client));
     if (client == NULL) { encore_set_net_error_cstr("TLS allocation failed"); SSLClose(context); CFRelease(context); close(fd); free(host_c); free(ca_c); return 0; }
-    client->fd = fd; client->context = context; client->read_failed = false;
+    client->fd = fd; client->context = context; client->read_failed = false; client->received_data = false;
     free(host_c); free(ca_c);
     return (size_t)(uintptr_t)client;
 }
@@ -1844,9 +1845,13 @@ encore_str encore_tls_read(size_t handle, size_t max) {
     if (buffer == NULL) { client->read_failed = true; encore_set_net_error_cstr("TLS read allocation failed"); return encore_empty_str(); }
     size_t count = 0;
     OSStatus status = SSLRead(client->context, buffer, max, &count);
-    if (count > 0) return encore_from_owned_buffer(buffer, count);
+    if (count > 0) {
+        client->received_data = true;
+        return encore_from_owned_buffer(buffer, count);
+    }
     free(buffer);
-    if (status != errSSLClosedGraceful && status != errSSLClosedNoNotify) {
+    if (status != errSSLClosedGraceful && status != errSSLClosedNoNotify &&
+        !(status == errSSLClosedAbort && client->received_data)) {
         client->read_failed = true;
         encore_set_net_error_cstr(status == errSSLWouldBlock ? "TLS read timed out" : "TLS read failed");
     }
