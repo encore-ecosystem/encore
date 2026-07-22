@@ -2414,7 +2414,7 @@ fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str
     if base_type_name(typ) == "JoinHandle" && source_path != "" {
         move_var_out_of_context(ctx, source_path)
     }
-    elif borrowed_copy && ctx_type_needs_ownership(ctx, typ) {
+    elif borrowed_copy && !(let_stmt.is_mut || explicit_mut) && ctx_type_needs_ownership(ctx, typ) {
         builder = builder.instr("retain " + lowered.value + ": " + typ)
     }
     let emitted_name = prefix + "_letvar_" + let_stmt.name + "_" + Debug::fmt(idx)
@@ -2423,6 +2423,13 @@ fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str
         ctx_add_owned_var(ctx, let_stmt.name, emitted_name, "mut " + typ)
         builder = builder.instr(emitted_name + ": " + typ + "* = salloc " + typ)
         builder = builder.instr("store " + lowered.value + ", " + emitted_name)
+        // Storing into a mutable slot retains its value. A freshly produced
+        // owned RHS is therefore transferred by releasing the temporary
+        // owner after the store; borrowed RHS values keep their original
+        // owner and need no release here.
+        if !borrowed_copy && ctx_type_needs_ownership(ctx, typ) {
+            builder = builder.instr("drop " + lowered.value + ": " + typ)
+        }
         ret builder
     }
     ctx_add_var_emitted(ctx, let_stmt.name, emitted_name, typ)
@@ -2545,10 +2552,11 @@ fn translate_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assignment
             if ctx_type_needs_ownership(ctx, value_type) {
                 let old_name = prefix + "_assign_old_" + Debug::fmt(idx) + "_" + lowered.value
                 builder = builder.instr(old_name + ": " + value_type + " = load " + target_value)
-                // A produced owned value is moved into the mutable slot. A
-                // borrowed value needs one retain for the new slot owner.
-                if borrowed_rhs { builder = builder.instr("retain " + lowered.value + ": " + value_type) }
                 builder = builder.instr("store " + lowered.value + ", " + target_value)
+                // `store` retains the new slot value. Release a produced RHS
+                // to complete the move; a borrowed RHS keeps its existing
+                // owner and the store's retain creates the slot owner.
+                if !borrowed_rhs { builder = builder.instr("drop " + lowered.value + ": " + value_type) }
                 ret builder.instr("drop " + old_name + ": " + value_type)
             }
             ret builder.instr("store " + lowered.value + ", " + target_value)
