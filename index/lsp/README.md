@@ -31,7 +31,10 @@ Current server capabilities:
 Document analysis is stored in the shared frontend `AnalysisDatabase`. Source
 updates carry revisions and invalidate modules that depend on the changed
 module; the LSP requests the tolerant lightweight view needed while code is
-temporarily incomplete.
+temporarily incomplete. Body-only edits retain dependant results because
+invalidation follows declaration-interface fingerprints. Navigation and rename
+use deterministic frontend `ModuleId`/`SymbolId` identities instead of
+URI-and-name identities.
 
 ## Source Layout
 

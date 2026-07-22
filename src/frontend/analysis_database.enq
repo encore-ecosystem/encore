@@ -1,32 +1,82 @@
-//! Maintains incremental analysis state for Encore modules.
+//! Maintains typed incremental analysis state for Encore modules.
 
 import core::option::Option
+import core::fmt::Debug
+import std::dict::Hashable
 import std::vec::Vec
 
 import refrain::frontend::analysis::FrontendDocument
 import refrain::frontend::analysis::FrontendSymbol
 import refrain::frontend::analysis::analyze_named_module
+import refrain::frontend::analysis::analyze_named_tokens
 import refrain::frontend::analysis::analyze_module_lightweight
+import refrain::frontend::lexer::Token
+import refrain::frontend::lexer::TokenType
+
+/// Deterministic identity of a module across analysis database instances.
+pub struct ModuleId { raw: u64 key: str }
+
+/// Deterministic identity of a scoped declaration across database instances.
+pub struct SymbolId { raw: u64 key: str }
+
+struct AnalysisSymbolIdentity {
+    name: str
+    kind: usize
+    ordinal: usize
+    id: SymbolId
+}
 
 struct AnalysisSource {
+    id: ModuleId
     module_name: str
     source_name: str
     source: str
-    document: FrontendDocument
-    dirty: bool
+    source_fingerprint: u64
+    interface_fingerprint: u64
+    interface_revision: usize
+    lightweight: FrontendDocument
+    full: FrontendDocument
+    full_dirty: bool
     analysis_revision: usize
+    lightweight_count: usize
+    parse_count: usize
 }
 
-/// Caches analyzed modules and invalidates dependants when source changes.
+/// Caches analysis queries and invalidates dependants only when a module's
+/// declaration interface changes.
 pub struct AnalysisDatabase {
     sources: Vec[AnalysisSource]
     revision: usize
 }
 
-/// Associates a frontend symbol with the module that declares it.
+/// Associates a stable identity and declaring module with a frontend symbol.
 pub struct AnalysisSymbol {
+    id: SymbolId
+    module_id: ModuleId
     module_name: str
     symbol: FrontendSymbol
+}
+
+impl for ModuleId {
+    /// Returns an identity that never names a registered module.
+    pub fn invalid() -> Self { ret Self{0_u64, ""} }
+
+    /// Returns the opaque numeric representation for persistence and tests.
+    pub fn value(self: Self) -> u64 { ret self.raw }
+
+    /// Returns the collision-free canonical identity used by persistent data.
+    pub fn key(self: Self) -> str { ret self.key }
+}
+
+impl for SymbolId {
+    /// Returns an identity that never names a registered symbol.
+    pub fn invalid() -> Self { ret Self{0_u64, ""} }
+
+    /// Returns the opaque numeric representation for persistence and tests.
+    pub fn value(self: Self) -> u64 { ret self.raw }
+
+    /// Returns the collision-free canonical identity used by persistent data.
+    pub fn key(self: Self) -> str { ret self.key }
 }
 
 impl for AnalysisDatabase {
@@ -36,27 +86,52 @@ impl for AnalysisDatabase {
     }
 
     /// Returns the current source revision of the database.
-    pub fn revision(self: Self) -> usize {
-        ret self.revision
+    pub fn revision(self: Self) -> usize { ret self.revision }
+
+    /// Returns the stable identity assigned to a registered module.
+    pub fn module_id(self: Self, module_name: str) -> Option[ModuleId] {
+        for entry in self.sources {
+            if entry.module_name == module_name { ret Option[ModuleId]::Some(entry.id) }
+        }
+        ret Option[ModuleId]::None
     }
 
-    /// Inserts or replaces a module and invalidates its transitive dependants.
+    /// Inserts or replaces a module. Identical source updates are no-ops.
+    ///
+    /// The tolerant declaration query runs eagerly so dependency and interface
+    /// changes are known before another module is requested. Full parsing stays
+    /// lazy and is performed by `document`.
     pub fn set_module(self: mut Self, module_name: str, source_name: str, source: str) -> () {
-        self.revision += 1_usize
+        let source_fingerprint = source.hash()
         let mut index = 0_usize
         while index < self.sources.len() {
             match self.sources.get(index) {
                 Option[AnalysisSource]::Some(entry) => {
                     if entry.module_name == module_name {
+                        if entry.source_fingerprint == source_fingerprint && entry.source == source && entry.source_name == source_name {
+                            ret ()
+                        }
+                        self.revision += 1_usize
+                        let lightweight = analyze_module_lightweight(module_name, source)
+                        let interface_fingerprint = module_interface_fingerprint(lightweight.tokens)
+                        let interface_changed = interface_fingerprint != entry.interface_fingerprint
+                        let interface_revision = if interface_changed { self.revision } else { entry.interface_revision }
                         self.sources.set(index, AnalysisSource{
+                            entry.id,
                             module_name,
                             source_name,
                             source,
-                            entry.document,
+                            source_fingerprint,
+                            interface_fingerprint,
+                            interface_revision,
+                            lightweight,
+                            entry.full,
                             true,
-                            entry.analysis_revision
+                            entry.analysis_revision,
+                            entry.lightweight_count + 1_usize,
+                            entry.parse_count
                         })
-                        self.invalidate_dependents(module_name)
+                        if interface_changed { self.invalidate_dependents(module_name) }
                         ret ()
                     }
                 }
@@ -64,13 +139,90 @@ impl for AnalysisDatabase {
             }
             index += 1_usize
         }
+
+        self.revision += 1_usize
+        let id = module_identity(module_name)
+        let lightweight = analyze_module_lightweight(module_name, source)
+        let interface_fingerprint = module_interface_fingerprint(lightweight.tokens)
         self.sources.push(AnalysisSource{
+            id,
             module_name,
             source_name,
             source,
+            source_fingerprint,
+            interface_fingerprint,
+            self.revision,
+            lightweight,
             FrontendDocument::empty(),
             true,
+            0_usize,
+            1_usize,
             0_usize
+        })
+        self.invalidate_dependents(module_name)
+        ret ()
+    }
+
+    /// Registers valid compiler input using one strict parse instead of first
+    /// computing the tolerant editor query. This keeps cold compiler loading
+    /// on a single lex/parse pass while sharing the same database and indexes.
+    pub fn set_module_full(self: mut Self, module_name: str, source_name: str, source: str) -> () {
+        let source_fingerprint = source.hash()
+        let mut index = 0_usize
+        while index < self.sources.len() {
+            match self.sources.get(index) {
+                Option[AnalysisSource]::Some(entry) => {
+                    if entry.module_name == module_name {
+                        if entry.source_fingerprint == source_fingerprint && entry.source == source && entry.source_name == source_name {
+                            ret ()
+                        }
+                        self.revision += 1_usize
+                        let document = analyze_named_module(module_name, source_name, source)
+                        let interface_fingerprint = module_interface_fingerprint(document.tokens)
+                        let interface_changed = interface_fingerprint != entry.interface_fingerprint
+                        let interface_revision = if interface_changed { self.revision } else { entry.interface_revision }
+                        self.sources.set(index, AnalysisSource{
+                            entry.id,
+                            module_name,
+                            source_name,
+                            source,
+                            source_fingerprint,
+                            interface_fingerprint,
+                            interface_revision,
+                            document,
+                            document,
+                            false,
+                            self.revision,
+                            entry.lightweight_count,
+                            entry.parse_count + 1_usize
+                        })
+                        if interface_changed { self.invalidate_dependents(module_name) }
+                        ret ()
+                    }
+                }
+                Option[AnalysisSource]::None => {}
+            }
+            index += 1_usize
+        }
+
+        self.revision += 1_usize
+        let id = module_identity(module_name)
+        let document = analyze_named_module(module_name, source_name, source)
+        let interface_fingerprint = module_interface_fingerprint(document.tokens)
+        self.sources.push(AnalysisSource{
+            id,
+            module_name,
+            source_name,
+            source,
+            source_fingerprint,
+            interface_fingerprint,
+            self.revision,
+            document,
+            document,
+            false,
+            self.revision,
+            0_usize,
+            1_usize
         })
         self.invalidate_dependents(module_name)
         ret ()
@@ -78,32 +230,42 @@ impl for AnalysisDatabase {
 
     /// Removes a module and invalidates modules that imported it.
     pub fn remove_module(self: mut Self, module_name: str) -> () {
-        self.revision += 1_usize
+        let mut found = false
         let mut next = Vec[AnalysisSource]::new()
         for entry in self.sources {
-            if entry.module_name != module_name { next.push(entry) }
+            if entry.module_name == module_name { found = true }
+            else { next.push(entry) }
         }
+        if !found { ret () }
+        self.revision += 1_usize
         self.sources = next
         self.invalidate_dependents(module_name)
         ret ()
     }
 
-    /// Returns a fully parsed document, computing it lazily when dirty.
+    /// Returns a fully parsed document, computing only this query when dirty.
     pub fn document(self: mut Self, module_name: str) -> Option[FrontendDocument] {
         let mut index = 0_usize
         while index < self.sources.len() {
             match self.sources.get(index) {
                 Option[AnalysisSource]::Some(entry) => {
                     if entry.module_name == module_name {
-                        if !entry.dirty { ret Option[FrontendDocument]::Some(entry.document) }
-                        let document = analyze_named_module(entry.module_name, entry.source_name, entry.source)
+                        if !entry.full_dirty { ret Option[FrontendDocument]::Some(entry.full) }
+                        let document = analyze_named_tokens(entry.module_name, entry.source_name, entry.lightweight.tokens)
                         self.sources.set(index, AnalysisSource{
+                            entry.id,
                             entry.module_name,
                             entry.source_name,
                             entry.source,
+                            entry.source_fingerprint,
+                            entry.interface_fingerprint,
+                            entry.interface_revision,
+                            entry.lightweight,
                             document,
                             false,
-                            self.revision
+                            self.revision,
+                            entry.lightweight_count,
+                            entry.parse_count + 1_usize
                         })
                         ret Option[FrontendDocument]::Some(document)
                     }
@@ -115,42 +277,23 @@ impl for AnalysisDatabase {
         ret Option[FrontendDocument]::None
     }
 
-    /// Returns a tolerant editor-oriented document, computing it when dirty.
+    /// Returns the independently cached tolerant editor-oriented document.
     pub fn document_lightweight(self: mut Self, module_name: str) -> Option[FrontendDocument] {
-        let mut index = 0_usize
-        while index < self.sources.len() {
-            match self.sources.get(index) {
-                Option[AnalysisSource]::Some(entry) => {
-                    if entry.module_name == module_name {
-                        if !entry.dirty { ret Option[FrontendDocument]::Some(entry.document) }
-                        let document = analyze_module_lightweight(entry.module_name, entry.source)
-                        self.sources.set(index, AnalysisSource{
-                            entry.module_name,
-                            entry.source_name,
-                            entry.source,
-                            document,
-                            false,
-                            self.revision
-                        })
-                        ret Option[FrontendDocument]::Some(document)
-                    }
-                }
-                Option[AnalysisSource]::None => {}
-            }
-            index += 1_usize
+        for entry in self.sources {
+            if entry.module_name == module_name { ret Option[FrontendDocument]::Some(entry.lightweight) }
         }
         ret Option[FrontendDocument]::None
     }
 
-    /// Returns whether a module must be analyzed again.
+    /// Returns whether the module's full-document query must be recomputed.
     pub fn module_is_dirty(self: Self, module_name: str) -> bool {
         for entry in self.sources {
-            if entry.module_name == module_name { ret entry.dirty }
+            if entry.module_name == module_name { ret entry.full_dirty }
         }
         ret false
     }
 
-    /// Returns the database revision at which a module was last analyzed.
+    /// Returns the revision of the last full-document computation.
     pub fn module_analysis_revision(self: Self, module_name: str) -> usize {
         for entry in self.sources {
             if entry.module_name == module_name { ret entry.analysis_revision }
@@ -158,34 +301,87 @@ impl for AnalysisDatabase {
         ret 0_usize
     }
 
-    /// Returns the current symbol index across all registered modules.
-    pub fn all_symbols(self: mut Self) -> Vec[AnalysisSymbol] {
+    /// Returns the revision at which the module interface last changed.
+    pub fn module_interface_revision(self: Self, module_name: str) -> usize {
+        for entry in self.sources {
+            if entry.module_name == module_name { ret entry.interface_revision }
+        }
+        ret 0_usize
+    }
+
+    /// Returns how many tolerant declaration queries were computed.
+    pub fn module_lightweight_count(self: Self, module_name: str) -> usize {
+        for entry in self.sources {
+            if entry.module_name == module_name { ret entry.lightweight_count }
+        }
+        ret 0_usize
+    }
+
+    /// Returns how many full parse queries were computed.
+    pub fn module_parse_count(self: Self, module_name: str) -> usize {
+        for entry in self.sources {
+            if entry.module_name == module_name { ret entry.parse_count }
+        }
+        ret 0_usize
+    }
+
+    /// Returns the current stable symbol index across all modules.
+    pub fn all_symbols(self: Self) -> Vec[AnalysisSymbol] {
         let mut out = Vec[AnalysisSymbol]::new()
-        let mut index = 0_usize
-        while index < self.sources.len() {
-            match self.sources.get(index) {
-                Option[AnalysisSource]::Some(entry) => {
-                    match self.document_lightweight(entry.module_name) {
-                        Option[FrontendDocument]::Some(document) => {
-                            for symbol in document.symbols { out.push(AnalysisSymbol{entry.module_name, symbol}) }
-                        }
-                        Option[FrontendDocument]::None => {}
-                    }
-                }
-                Option[AnalysisSource]::None => {}
+        for entry in self.sources {
+            let identities = symbol_identities(entry.module_name, entry.lightweight.symbols)
+            let mut symbol_index = 0_usize
+            for symbol in entry.lightweight.symbols {
+                let id = identity_at(identities, symbol_index)
+                out.push(AnalysisSymbol{id, entry.id, entry.module_name, symbol})
+                symbol_index += 1_usize
             }
-            index += 1_usize
         }
         ret out
     }
 
-    /// Finds all indexed declarations with the exact supplied name.
-    pub fn symbols_named(self: mut Self, name: str) -> Vec[AnalysisSymbol] {
+    /// Finds all indexed declarations with the supplied exact name.
+    pub fn symbols_named(self: Self, name: str) -> Vec[AnalysisSymbol] {
         let mut out = Vec[AnalysisSymbol]::new()
         for indexed in self.all_symbols() {
             if indexed.symbol.name == name { out.push(indexed) }
         }
         ret out
+    }
+
+    /// Returns the stable identity of a named declaration in one module.
+    pub fn symbol_id(self: Self, module_name: str, name: str) -> Option[SymbolId] {
+        for indexed in self.symbols_named(name) {
+            if indexed.module_name == module_name { ret Option[SymbolId]::Some(indexed.id) }
+        }
+        ret Option[SymbolId]::None
+    }
+
+    /// Returns the stable identity of an exact symbol record, including its
+    /// declaration scope. This distinguishes same-named methods in impls.
+    pub fn symbol_id_for(self: Self, module_name: str, needle: FrontendSymbol) -> Option[SymbolId] {
+        for entry in self.sources {
+            if entry.module_name == module_name {
+                let identities = symbol_identities(entry.module_name, entry.lightweight.symbols)
+                let mut index = 0_usize
+                for symbol in entry.lightweight.symbols {
+                    if symbol.name == needle.name && symbol.scope == needle.scope && symbol.kind == needle.kind && symbol.line == needle.line && symbol.column == needle.column {
+                        ret Option[SymbolId]::Some(identity_at(identities, index))
+                    }
+                    index += 1_usize
+                }
+            }
+        }
+        ret Option[SymbolId]::None
+    }
+
+    /// Resolves a stable symbol identity against the current database revision.
+    pub fn symbol_by_id(self: Self, id: SymbolId) -> Option[AnalysisSymbol] {
+        if id.raw == 0_u64 || id.key == "" { ret Option[AnalysisSymbol]::None }
+        for indexed in self.all_symbols() {
+            if indexed.id.raw == id.raw && indexed.id.key == id.key { ret Option[AnalysisSymbol]::Some(indexed) }
+        }
+        ret Option[AnalysisSymbol]::None
     }
 
     fn invalidate_dependents(self: mut Self, changed_module: str) -> () {
@@ -201,18 +397,25 @@ impl for AnalysisDatabase {
             while index < self.sources.len() {
                 match self.sources.get(index) {
                     Option[AnalysisSource]::Some(entry) => {
-                        if entry.module_name == dependency || document_imports_module(entry.document, dependency) {
-                            if !entry.dirty {
+                        if entry.module_name != dependency && document_imports_module(entry.lightweight, dependency) {
+                            if !entry.full_dirty {
                                 self.sources.set(index, AnalysisSource{
+                                    entry.id,
                                     entry.module_name,
                                     entry.source_name,
                                     entry.source,
-                                    entry.document,
+                                    entry.source_fingerprint,
+                                    entry.interface_fingerprint,
+                                    entry.interface_revision,
+                                    entry.lightweight,
+                                    entry.full,
                                     true,
-                                    entry.analysis_revision
+                                    entry.analysis_revision,
+                                    entry.lightweight_count,
+                                    entry.parse_count
                                 })
-                                if !contains_string(changed, entry.module_name) { changed.push(entry.module_name) }
                             }
+                            if !contains_string(changed, entry.module_name) { changed.push(entry.module_name) }
                         }
                     }
                     Option[AnalysisSource]::None => {}
@@ -225,12 +428,99 @@ impl for AnalysisDatabase {
     }
 }
 
+fn module_identity(module_name: str) -> ModuleId {
+    ret ModuleId{stable_hash_nonzero(module_name), module_name}
+}
+
+fn symbol_identities(module_name: str, symbols: Vec[FrontendSymbol]) -> Vec[AnalysisSymbolIdentity] {
+    let mut out = Vec[AnalysisSymbolIdentity]::new()
+    for symbol in symbols {
+        let scoped_name = if symbol.scope == "" { symbol.name } else { symbol.scope + "::" + symbol.name }
+        let ordinal = next_symbol_ordinal(out, scoped_name, symbol.kind)
+        let key = module_name + "#" + Debug::fmt(symbol.kind) + "#" + scoped_name + "#" + Debug::fmt(ordinal)
+        out.push(AnalysisSymbolIdentity{scoped_name, symbol.kind, ordinal, SymbolId{stable_hash_nonzero(key), key}})
+    }
+    ret out
+}
+
+fn stable_hash_nonzero(value: str) -> u64 {
+    let hashed = value.hash()
+    if hashed == 0_u64 { ret 1_u64 }
+    ret hashed
+}
+
+fn identity_at(identities: Vec[AnalysisSymbolIdentity], index: usize) -> SymbolId {
+    match identities.get(index) {
+        Option[AnalysisSymbolIdentity]::Some(identity) => { ret identity.id }
+        Option[AnalysisSymbolIdentity]::None => { ret SymbolId::invalid() }
+    }
+    ret SymbolId::invalid()
+}
+
+fn next_symbol_ordinal(identities: Vec[AnalysisSymbolIdentity], name: str, kind: usize) -> usize {
+    let mut ordinal = 0_usize
+    for identity in identities {
+        if identity.name == name && identity.kind == kind { ordinal += 1_usize }
+    }
+    ret ordinal
+}
+
 fn document_imports_module(document: FrontendDocument, module_name: str) -> bool {
     for edge in document.dependencies.all() {
         if edge.target == module_name { ret true }
         if starts_with(edge.target, module_name + "::") { ret true }
     }
     ret false
+}
+
+// Produces a declaration fingerprint while deliberately omitting function
+// bodies. This is tolerant of incomplete editor input and ensures body-only
+// changes do not invalidate importing modules.
+fn module_interface_fingerprint(tokens: Vec[Token]) -> u64 {
+    let mut fingerprint = 1469598103934665603_u64
+    let prime = 1099511628211_u64
+    let mut index = 0_usize
+    let mut awaiting_function_body = false
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Option[Token]::Some(token) => {
+                if awaiting_function_body && token.type != TokenType::KW_FN && declaration_starts(token.type) {
+                    awaiting_function_body = false
+                }
+                if token.type == TokenType::KW_FN { awaiting_function_body = true }
+                if awaiting_function_body && token.type == TokenType::LEFT_BRACE {
+                    fingerprint = (fingerprint ^ 31613_u64) * prime
+                    let mut depth = 1_usize
+                    index += 1_usize
+                    while index < tokens.len() && depth > 0_usize {
+                        match tokens.get(index) {
+                            Option[Token]::Some(body_token) => {
+                                if body_token.type == TokenType::LEFT_BRACE { depth += 1_usize }
+                                elif body_token.type == TokenType::RIGHT_BRACE { depth -= 1_usize }
+                            }
+                            Option[Token]::None => {}
+                        }
+                        index += 1_usize
+                    }
+                    awaiting_function_body = false
+                    continue
+                }
+                fingerprint = (fingerprint ^ token.value.hash()) * prime
+            }
+            Option[Token]::None => {}
+        }
+        index += 1_usize
+    }
+    ret fingerprint
+}
+
+fn declaration_starts(token_type: TokenType) -> bool {
+    ret token_type == TokenType::KW_IMPORT
+        || token_type == TokenType::KW_STRUCT
+        || token_type == TokenType::KW_ENUM
+        || token_type == TokenType::KW_TRAIT
+        || token_type == TokenType::KW_IMPL
+        || token_type == TokenType::KW_LET
 }
 
 fn contains_string(items: Vec[str], needle: str) -> bool {

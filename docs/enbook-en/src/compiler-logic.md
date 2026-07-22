@@ -4,6 +4,34 @@ This chapter describes the current shape of the EHIR resolver. It focuses on
 type resolution inside EHIR functions, because that stage feeds later lowering,
 retain/drop insertion and backend validation.
 
+## Incremental Frontend Database
+
+The compiler, analyzer and language server share the typed
+`AnalysisDatabase`. A module is interned under a deterministic `ModuleId`, and
+its declarations receive deterministic `SymbolId` values derived from the
+module identity, declaration kind, name and overload ordinal. These canonical
+keys are stable across database instances and are suitable for future on-disk
+module caches.
+
+The database keeps independent tolerant and strict queries:
+
+- the lightweight query supplies tokens, declarations, imports and diagnostics
+  while an editor buffer may be incomplete;
+- the full query supplies the parsed AST required by the compiler and analyzer;
+- compiler workspace ingestion uses `set_module_full`, so valid build input is
+  lexed and parsed only once.
+
+Every source update receives a revision, except an update whose path and
+contents are unchanged. The declaration interface has its own fingerprint and
+revision. Function bodies are omitted from this fingerprint, so editing an
+implementation invalidates that module's full query but preserves cached
+queries for importers. Changing a signature, type declaration, import or other
+interface token invalidates transitive dependants through the module graph.
+
+Query counters are exposed for behavioral tests. Incremental behavior is
+therefore verified by proving that an unaffected query was not recomputed,
+rather than only comparing its returned value.
+
 ## STIV Model
 
 The resolver uses a three-layer model:
