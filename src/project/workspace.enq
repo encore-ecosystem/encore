@@ -18,7 +18,7 @@ import refrain::frontend::Lexer
 import refrain::frontend::Parser
 import refrain::frontend::Statement
 import refrain::frontend::Token
-import refrain::frontend::{FrontendDocument, FrontendDiagnostic, Documentation, analyze_named_module}
+import refrain::frontend::{AnalysisDatabase, ModuleId, FrontendDocument, FrontendDiagnostic, Documentation}
 
 import mod::manifest::ProjectManifest
 import mod::manifest::{project_manifest_feature_dependencies, project_manifest_resolve_features, read_project_manifest}
@@ -46,6 +46,7 @@ pub struct WorkspaceModule {
     owner_name: str
     owner_root: Path
     module_id: str
+    analysis_id: ModuleId
     module_path: Path
     source: str
     analysis: FrontendDocument
@@ -60,6 +61,9 @@ pub struct WorkspaceModule {
 impl for WorkspaceModule {
     /// Returns the stable module identity used in EHIR bundles.
     pub fn id(self: WorkspaceModule) -> str { ret self.module_id }
+
+    /// Returns the shared frontend identity used by compiler and editor tools.
+    pub fn analysis_module_id(self: WorkspaceModule) -> ModuleId { ret self.analysis_id }
 
     /// Returns the resolved source path of this module.
     pub fn path(self: WorkspaceModule) -> str { ret self.module_path.as_str() }
@@ -76,6 +80,7 @@ pub struct ProjectWorkspace {
     flat_ast: Vec[Statement]
     loading_roots: Vec[str]
     enabled_features: Vec[str]
+    analysis: AnalysisDatabase
 }
 
 impl for ProjectWorkspace {
@@ -100,7 +105,8 @@ fn load_workspace(root: Path, target_is_binary: bool, build_flat_ast: bool) -> P
         Vec[WorkspaceModule]::new(),
         Vec[Statement]::new(),
         Vec[str]::new(),
-        Vec[str]::new()
+        Vec[str]::new(),
+        AnalysisDatabase::new()
     }
 
     workspace_set_root_name(workspace, load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), root.resolve(), target_is_binary, Vec[str]::new()))
@@ -123,12 +129,13 @@ fn load_workspace(root: Path, target_is_binary: bool, build_flat_ast: bool) -> P
 pub fn workspace_release_modules(workspace: mut ProjectWorkspace) -> () {
     workspace.modules = Vec[WorkspaceModule]::new()
     workspace.flat_ast = Vec[Statement]::new()
+    workspace.analysis = AnalysisDatabase::new()
     ret ()
 }
 
 /// Loads a workspace starting from an explicit source entrypoint.
 pub fn load_entry_workspace(root: Path, entrypoint: Path) -> ProjectWorkspace {
-    let mut workspace = ProjectWorkspace{"", Vec[WorkspaceRefrain]::new(), Vec[WorkspaceModule]::new(), Vec[Statement]::new(), Vec[str]::new(), Vec[str]::new()}
+    let mut workspace = ProjectWorkspace{"", Vec[WorkspaceRefrain]::new(), Vec[WorkspaceModule]::new(), Vec[Statement]::new(), Vec[str]::new(), Vec[str]::new(), AnalysisDatabase::new()}
     workspace_set_root_name(workspace, load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), root.resolve(), true, Vec[str]::new()))
     match workspace_root_refrain(workspace) {
         Some(root_refrain) => {
@@ -292,7 +299,17 @@ fn visit_module(
     }
 
     let source = read_file(native_path(resolved_path.as_str()))
-    let document = analyze_named_module(owner.name, module_path.as_str(), source)
+    let module_id = workspace_module_id(owner, resolved_path)
+    let analysis_name = workspace_analysis_module_name(owner, resolved_path)
+    workspace.analysis.set_module_full(analysis_name, module_path.as_str(), source)
+    let analysis_id = match workspace.analysis.module_id(analysis_name) {
+        Option[ModuleId]::Some(value) => value
+        Option[ModuleId]::None => ModuleId::invalid()
+    }
+    let document = match workspace.analysis.document(analysis_name) {
+        Option[FrontendDocument]::Some(value) => value
+        Option[FrontendDocument]::None => FrontendDocument::empty()
+    }
     let tokens = document.tokens
     let import_edges = import_edges_from_tokens(tokens)
     let imports = import_paths_from_edges(import_edges)
@@ -300,9 +317,8 @@ fn visit_module(
     let ast = document.ast
     let documentation = document.module_documentation
     visit_imports(workspace, owner, resolved_path, import_edges, visited_paths, result, diagnostics)
-    let module_id = workspace_module_id(owner, resolved_path)
     let resolved_imports = resolved_module_import_ids(workspace, owner, resolved_path, ast)
-    result.push(WorkspaceModule{owner.name, owner.root, module_id, resolved_path, source, document, ast, documentation, imports, resolved_imports, diagnostics, owner.enabled_features})
+    result.push(WorkspaceModule{owner.name, owner.root, module_id, analysis_id, resolved_path, source, document, ast, documentation, imports, resolved_imports, diagnostics, owner.enabled_features})
     ret ()
 }
 
@@ -311,6 +327,33 @@ fn workspace_module_id(owner: WorkspaceRefrain, module_path: Path) -> str {
     let full = module_path.resolve().as_str()
     let relative = if full.len() > source_root.len() { full.slice(source_root.len() + 1_usize, full.len() - source_root.len() - 1_usize) } else { "lib.enq" }
     ret owner.name + "@" + relative
+}
+
+fn workspace_analysis_module_name(owner: WorkspaceRefrain, module_path: Path) -> str {
+    let source_root = owner.root.resolve().join("src").as_str()
+    let full = module_path.resolve().as_str()
+    let relative = if full.len() > source_root.len() { full.slice(source_root.len() + 1_usize, full.len() - source_root.len() - 1_usize) } else { "lib.enq" }
+    ret analysis_module_name_from_relative(owner.name, relative)
+}
+
+fn analysis_module_name_from_relative(owner_name: str, relative: str) -> str {
+    if relative == "" || relative == "lib.enq" || relative == "main.enq" { ret owner_name }
+    let mut trimmed = relative
+    if ends_with(trimmed, "/mod.enq") || ends_with(trimmed, "\\mod.enq") {
+        trimmed = trimmed.slice(0_usize, trimmed.len() - 8_usize)
+    }
+    elif ends_with(trimmed, ".enq") {
+        trimmed = trimmed.slice(0_usize, trimmed.len() - 4_usize)
+    }
+    let mut out = ""
+    let mut index = 0_usize
+    while index < trimmed.len() {
+        let ch = trimmed.get(index).unwrap_or("")
+        if ch == "/" || ch == "\\" { out += "::" }
+        else { out += ch }
+        index += 1_usize
+    }
+    ret owner_name + "::" + out
 }
 
 fn resolved_module_import_ids(workspace: ProjectWorkspace, owner: WorkspaceRefrain, source_module: Path, ast: Vec[Statement]) -> Vec[str] {
