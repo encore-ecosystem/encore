@@ -8,6 +8,7 @@ fi
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 compiler=$(CDPATH= cd -- "$(dirname -- "$1")" && pwd)/$(basename -- "$1")
+executor=${ENCORE_TEST_EXECUTOR:-}
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/encore-self-update.XXXXXX")
 server_pid=
 cleanup() {
@@ -19,19 +20,63 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-version=$($compiler --version | awk '{print $2}')
+run_compiler() {
+    if [ -n "$executor" ]; then
+        "$executor" "$compiler" "$@"
+    else
+        "$compiler" "$@"
+    fi
+}
+
+run_installed() {
+    if [ -n "$executor" ]; then
+        "$executor" "$installed" "$@"
+    else
+        "$installed" "$@"
+    fi
+}
+
+run_installed_logged() {
+    output=$1
+    shift
+    set +e
+    run_installed "$@" > "$output" 2>&1
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+        echo "command failed with status $status: encore $*" >&2
+        tr -d '\r' < "$output" >&2
+        return "$status"
+    fi
+}
+
+native_path() {
+    source_path=$1
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$source_path"
+    elif command -v winepath >/dev/null 2>&1; then
+        winepath -w "$source_path"
+    elif [ -n "$executor" ]; then
+        printf 'Z:%s\n' "$source_path"
+    else
+        echo "Windows self-update test requires cygpath or winepath" >&2
+        return 1
+    fi
+}
+
+version=$(run_compiler --version | tr -d '\r' | awk '{print $2}')
 case "$version" in
     [0-9]*.[0-9]*.[0-9]*) ;;
     *) echo "compiler reported an invalid version: $version" >&2; exit 1 ;;
 esac
 
-case "$(uname -s)" in
+case "${ENCORE_TEST_OS:-$(uname -s)}" in
     Linux) os=linux ;;
     Darwin) os=macos ;;
     MINGW*|MSYS*|CYGWIN*|Windows_NT) os=windows ;;
     *) echo "unsupported test operating system" >&2; exit 1 ;;
 esac
-case "$(uname -m)" in
+case "${ENCORE_TEST_ARCH:-$(uname -m)}" in
     x86_64|amd64) arch=x86_64 ;;
     arm64|aarch64) arch=aarch64 ;;
     *) echo "unsupported test architecture" >&2; exit 1 ;;
@@ -47,8 +92,8 @@ mirror="$temporary/mirror"
 native_install_root="$install_root"
 native_mirror="$mirror"
 if [ "$os" = windows ]; then
-    native_install_root=$(cygpath -m "$install_root")
-    native_mirror=$(cygpath -m "$mirror")
+    native_install_root=$(native_path "$install_root")
+    native_mirror=$(native_path "$mirror")
 fi
 package_name="encore-${version}-${triple}"
 package_root="$temporary/package/$package_name"
@@ -71,7 +116,9 @@ else
     (cd "$temporary/package" && COPYFILE_DISABLE=1 tar -czf "$archive" "$package_name")
 fi
 native_archive="$archive"
-if [ "$os" = windows ]; then native_archive=$(cygpath -m "$archive"); fi
+if [ "$os" = windows ]; then
+    native_archive=$(native_path "$archive")
+fi
 if command -v sha256sum >/dev/null 2>&1; then
     checksum=$(sha256sum "$archive" | awk '{print $1}')
 else
@@ -126,29 +173,29 @@ assert_line() {
 }
 
 assert_installed_version() {
-    actual=$($installed --version | tr -d '\r')
+    actual=$(run_installed --version | tr -d '\r')
     if [ "$actual" != "encore $version" ]; then
         echo "installed compiler reported '$actual', expected 'encore $version'" >&2
         return 1
     fi
 }
 
-ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self channel > "$temporary/channel-default.log"
+ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" run_installed_logged "$temporary/channel-default.log" self channel
 assert_line stable "$temporary/channel-default.log"
-ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self channel beta > "$temporary/channel-beta.log"
+ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" run_installed_logged "$temporary/channel-beta.log" self channel beta
 assert_contains 'Switched Encore update channel to beta' "$temporary/channel-beta.log"
 assert_line 'channel = "beta"' "$install_root/settings.toml"
-ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self channel stable > "$temporary/channel-stable.log"
+ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" run_installed_logged "$temporary/channel-stable.log" self channel stable
 assert_line 'channel = "stable"' "$install_root/settings.toml"
 
-ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --check > "$temporary/check.log"
+ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" run_installed_logged "$temporary/check.log" self update --check
 assert_contains "Encore $version is up to date on stable" "$temporary/check.log"
-ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --channel beta --check > "$temporary/check-beta.log"
+ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" run_installed_logged "$temporary/check-beta.log" self update --channel beta --check
 assert_contains "Encore $version is up to date on beta" "$temporary/check-beta.log"
 assert_line 'channel = "stable"' "$install_root/settings.toml"
 test "$(cat "$install_root/share/update-marker")" = old
 
-ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --force > "$temporary/update.log"
+ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" run_installed_logged "$temporary/update.log" self update --force
 attempt=0
 while [ "$attempt" -lt 100 ] && [ "$(cat "$install_root/share/update-marker" 2>/dev/null || true)" != new ]; do
     sleep 0.1
@@ -190,10 +237,12 @@ server_pid=$!
 sleep 1
 kill -0 "$server_pid"
 native_ca="$temporary/tls/ca.pem"
-if [ "$os" = windows ]; then native_ca=$(cygpath -m "$native_ca"); fi
+if [ "$os" = windows ]; then
+    native_ca=$(native_path "$native_ca")
+fi
 ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="https://localhost:$port" \
     ENCORE_SELF_UPDATE_CA_FILE="$native_ca" \
-    "$installed" self update --force > "$temporary/https-update.log"
+    run_installed_logged "$temporary/https-update.log" self update --force
 wait_for_transaction
 kill "$server_pid" 2>/dev/null || true
 wait "$server_pid" 2>/dev/null || true
@@ -203,7 +252,7 @@ assert_installed_version
 
 # Exact installation uses an immutable version manifest and does not alter the
 # persisted release channel.
-ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self install "$version" --force > "$temporary/install.log"
+ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" run_installed_logged "$temporary/install.log" self install "$version" --force
 wait_for_transaction
 assert_contains "Installed Encore $version" "$temporary/install.log"
 assert_line 'channel = "stable"' "$install_root/settings.toml"
@@ -213,7 +262,7 @@ bad_checksum=$(printf '%064d' 0)
 archive_url="file://$native_archive"
 write_manifest "$mirror/channels/stable.json" "$bad_checksum" stable
 set +e
-ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --force > "$temporary/bad-checksum.log" 2>&1
+ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" run_installed self update --force > "$temporary/bad-checksum.log" 2>&1
 bad_code=$?
 set -e
 test "$bad_code" -ne 0
@@ -224,13 +273,13 @@ assert_installed_version
 # Invalid manifests, channels and insecure mirrors fail before installation.
 printf '{not json}\n' > "$mirror/channels/stable.json"
 set +e
-ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" "$installed" self update --force > "$temporary/invalid-manifest.log" 2>&1
+ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="$base" run_installed self update --force > "$temporary/invalid-manifest.log" 2>&1
 manifest_code=$?
-ENCORE_HOME="$native_install_root" "$installed" self channel alpha > "$temporary/invalid-channel.log" 2>&1
+ENCORE_HOME="$native_install_root" run_installed self channel alpha > "$temporary/invalid-channel.log" 2>&1
 channel_code=$?
-ENCORE_HOME="$native_install_root" "$installed" self update --version ../../escape > "$temporary/invalid-version.log" 2>&1
+ENCORE_HOME="$native_install_root" run_installed self update --version ../../escape > "$temporary/invalid-version.log" 2>&1
 version_code=$?
-ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="http://example.invalid" "$installed" self update --force > "$temporary/insecure.log" 2>&1
+ENCORE_HOME="$native_install_root" ENCORE_SELF_UPDATE_BASE_URL="http://example.invalid" run_installed self update --force > "$temporary/insecure.log" 2>&1
 insecure_code=$?
 set -e
 test "$manifest_code" -ne 0

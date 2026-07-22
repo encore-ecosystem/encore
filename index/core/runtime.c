@@ -2430,8 +2430,13 @@ static void encore_init_args(void) {
     atexit(encore_free_args);
 
 #ifdef _WIN32
+#ifdef __MINGW32__
+    int argc = __argc;
+    char **argv = __argv;
+#else
     int argc = *__p___argc();
     char **argv = *__p___argv();
+#endif
     if (argc <= 0 || argv == NULL) {
         return;
     }
