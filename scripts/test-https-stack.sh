@@ -26,7 +26,11 @@ if [ -z "$openssl_bin" ]; then
 fi
 
 cleanup() {
-    if [ -n "$server_pid" ]; then kill "$server_pid" 2>/dev/null || true; fi
+    if [ -n "$server_pid" ]; then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+        server_pid=
+    fi
     rm -rf "$temporary"
 }
 trap cleanup EXIT HUP INT TERM
