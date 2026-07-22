@@ -34,7 +34,11 @@ module; the LSP requests the tolerant lightweight view needed while code is
 temporarily incomplete. Body-only edits retain dependant results because
 invalidation follows declaration-interface fingerprints. Navigation and rename
 use deterministic frontend `ModuleId`/`SymbolId` identities instead of
-URI-and-name identities.
+URI-and-name identities. Function-level semantic queries provide the same
+typed diagnostics used during compiler checking. Inlay hints first consult
+their inferred binding types, including return types obtained through imported
+function calls, and retain the tolerant token inference as an incomplete-code
+fallback.
 
 ## Source Layout
 

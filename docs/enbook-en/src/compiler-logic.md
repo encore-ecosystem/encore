@@ -32,6 +32,26 @@ Query counters are exposed for behavioral tests. Incremental behavior is
 therefore verified by proving that an unaffected query was not recomputed,
 rather than only comparing its returned value.
 
+### Function semantic queries
+
+Semantic analysis is also cached at function-body granularity. A
+`SemanticBody` is addressed by the declaration's stable `SymbolId` and stores
+inferred local binding types, structured diagnostics, and the callable
+signatures read while checking the body. Its cache entry is validated against
+both a fingerprint of that exact body and fingerprints of those signatures.
+
+Consequently, changing one function body does not recompute neighbouring
+functions, including same-named methods in different `impl` scopes. Changing
+an imported function signature invalidates bodies that called that declaration
+without invalidating unrelated bodies in the importing module. Semantic errors
+are returned as `FrontendDiagnostic` values; compiler checking can stop before
+EHIR lowering without terminating from inside the query.
+
+The current semantic result models primitive literals, local bindings,
+explicit binding annotations, binary results, casts and direct function calls.
+Additional expression and control-flow forms should extend this result rather
+than introduce a second type model in the compiler or language server.
+
 ## STIV Model
 
 The resolver uses a three-layer model:

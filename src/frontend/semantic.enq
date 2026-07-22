@@ -1,0 +1,331 @@
+//! Defines reusable, incremental semantic results for function-body queries.
+
+import core::option::Option
+import std::dict::Hashable
+import std::vec::Vec
+
+import refrain::frontend::analysis::FrontendDiagnostic
+import refrain::frontend::parser::{Expr, ExprNode, FunctionItem, Statement}
+
+/// Records the inferred type of a local binding.
+pub struct SemanticBinding {
+    name: str
+    typ: str
+    line: usize
+    column: usize
+}
+
+/// Identifies a declaration signature read while checking a body.
+pub struct SemanticDependency {
+    module_name: str
+    name: str
+    signature: u64
+}
+
+/// Describes one callable visible to a semantic body query.
+pub struct SemanticCallable {
+    module_name: str
+    name: str
+    params: Vec[str]
+    ret_type: str
+    signature: u64
+}
+
+/// Contains the reusable semantic facts and diagnostics of one function body.
+pub struct SemanticBody {
+    bindings: Vec[SemanticBinding]
+    diagnostics: Vec[FrontendDiagnostic]
+    dependencies: Vec[SemanticDependency]
+    return_type: str
+}
+
+struct SemanticContext {
+    callables: Vec[SemanticCallable]
+    bindings: Vec[SemanticBinding]
+    diagnostics: Vec[FrontendDiagnostic]
+    dependencies: Vec[SemanticDependency]
+}
+
+impl for SemanticBody {
+    /// Returns an empty result for callers handling a missing declaration.
+    pub fn empty() -> Self {
+        ret Self{Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(), ""}
+    }
+
+    /// Returns the inferred or declared type of a local binding.
+    pub fn binding_type(self: Self, name: str) -> Option[str] {
+        for binding in self.bindings {
+            if binding.name == name { ret Option[str]::Some(binding.typ) }
+        }
+        ret Option[str]::None
+    }
+}
+
+impl for SemanticCallable {
+    /// Creates a callable and its deterministic declaration fingerprint.
+    pub fn new(module_name: str, name: str, params: Vec[str], ret_type: str) -> Self {
+        let mut key = module_name + "#" + name + "("
+        for param in params { key += param + "," }
+        key += ")->" + ret_type
+        ret Self{module_name, name, params, ret_type, nonzero_hash(key)}
+    }
+}
+
+/// Checks one function body without performing EHIR lowering.
+pub fn check_function_body(item: FunctionItem, callables: Vec[SemanticCallable]) -> SemanticBody {
+    let mut ctx = SemanticContext{callables, Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new()}
+    for param in item.params {
+        match param.typ {
+            Option[str]::Some(typ) => { ctx.bindings.push(SemanticBinding{param.name, typ, item.line, item.column}) }
+            Option[str]::None => {}
+        }
+    }
+    let return_type = item.ret_type.unwrap_or("void")
+    match item.body {
+        Option::Some(body) => {
+            check_statements(ctx, body.statements, return_type)
+        }
+        Option::None => {}
+    }
+    ret SemanticBody{ctx.bindings, ctx.diagnostics, ctx.dependencies, return_type}
+}
+
+/// Checks every function body in a parsed module in one AST traversal.
+/// This is the cold compiler path; individual editor queries remain cached by
+/// stable symbol identity in the analysis database.
+pub fn check_module_bodies(ast: Vec[Statement], callables: Vec[SemanticCallable]) -> Vec[FrontendDiagnostic] {
+    let mut out = Vec[FrontendDiagnostic]::new()
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => { out.extend(check_function_body(item, callables).diagnostics) }
+            Statement::Trait(item) => {
+                for method in item.methods { out.extend(check_function_body(method, callables).diagnostics) }
+            }
+            Statement::Impl(item) => {
+                for method in item.methods { out.extend(check_function_body(method, callables).diagnostics) }
+            }
+            _ => {}
+        }
+    }
+    ret out
+}
+
+fn check_statements(
+    ctx: mut SemanticContext,
+    statements: Vec[Statement],
+    return_type: str
+) -> () {
+    for statement in statements {
+        match statement {
+            Statement::Let(item) => {
+                let flexible_numeric = expression_is_flexible_numeric(item.expr)
+                let inferred = infer_expression(ctx, item.expr)
+                let declared = item.typ.unwrap_or(inferred)
+                if inferred != "" && declared != inferred && !flexible_numeric {
+                    ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "type-mismatch", "cannot initialize '" + item.name + "' of type '" + declared + "' with value of type '" + inferred + "'", item.expr.line, item.expr.column, item.expr.length))
+                }
+                ctx.bindings.push(SemanticBinding{item.name, declared, item.expr.line, item.expr.column})
+            }
+            Statement::Ret(expr) => {
+                let _actual = infer_expression(ctx, expr)
+            }
+            Statement::Expr(expr) => { let _ignored = infer_expression(ctx, expr) }
+            _ => {}
+        }
+    }
+    ret ()
+}
+
+fn infer_expression(
+    ctx: mut SemanticContext,
+    expr: ExprNode
+) -> str {
+    let line = expr.line
+    let column = expr.column
+    let length = expr.length
+    match expr.value {
+        Expr::StringLiteral(value) => { let _ignored = value ret "str" }
+        Expr::Boolean(value) => { let _ignored = value ret "bool" }
+        Expr::Integer(value) => { ret integer_type(value) }
+        Expr::Float(value) => { ret float_type(value) }
+        Expr::Path(name) => {
+            for binding in ctx.bindings { if binding.name == name { ret binding.typ } }
+            ret ""
+        }
+        Expr::Parenthesized(inner) => { ret infer_expression_h(ctx, inner) }
+        Expr::Cast(cast) => {
+            let target = cast.target
+            let _ignored = infer_expression_h(ctx, cast.expr)
+            ret target
+        }
+        Expr::Binary(binary) => {
+            let operator = binary.operator
+            let lhs = infer_expression_h(ctx, binary.lhs)
+            let rhs = infer_expression_h(ctx, binary.rhs)
+            if operator == "==" || operator == "!=" || operator == "<" || operator == "<=" || operator == ">" || operator == ">=" || operator == "&&" || operator == "||" { ret "bool" }
+            if lhs != "" { ret lhs }
+            ret rhs
+        }
+        Expr::Call(call) => {
+            let name = expression_path_h(call.callee)
+            if name != "" {
+                match resolve_call(ctx, name, call.args) {
+                    Option[SemanticCallable]::Some(callable) => {
+                        remember_dependency(ctx, callable)
+                        ret callable.ret_type
+                    }
+                    Option[SemanticCallable]::None => {}
+                }
+            }
+            ret ""
+        }
+        _ => { ret "" }
+    }
+    ret ""
+}
+
+fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode<H>) -> str {
+    let line = expr.line
+    let column = expr.column
+    let length = expr.length
+    match expr.value {
+        Expr::StringLiteral(value) => { let _ignored = value ret "str" }
+        Expr::Boolean(value) => { let _ignored = value ret "bool" }
+        Expr::Integer(value) => { ret integer_type(value) }
+        Expr::Float(value) => { ret float_type(value) }
+        Expr::Path(name) => {
+            for binding in ctx.bindings { if binding.name == name { ret binding.typ } }
+            ret ""
+        }
+        Expr::Parenthesized(inner) => { ret infer_expression_h(ctx, inner) }
+        Expr::Cast(cast) => {
+            let target = cast.target
+            let _ignored = infer_expression_h(ctx, cast.expr)
+            ret target
+        }
+        Expr::Binary(binary) => {
+            let operator = binary.operator
+            let lhs = infer_expression_h(ctx, binary.lhs)
+            let rhs = infer_expression_h(ctx, binary.rhs)
+            if operator == "==" || operator == "!=" || operator == "<" || operator == "<=" || operator == ">" || operator == ">=" || operator == "&&" || operator == "||" { ret "bool" }
+            if lhs != "" { ret lhs }
+            ret rhs
+        }
+        Expr::Call(call) => {
+            let name = expression_path_h(call.callee)
+            if name != "" {
+                match resolve_call(ctx, name, call.args) {
+                    Option[SemanticCallable]::Some(callable) => {
+                        remember_dependency(ctx, callable)
+                        ret callable.ret_type
+                    }
+                    Option[SemanticCallable]::None => {}
+                }
+            }
+            ret ""
+        }
+        _ => { ret "" }
+    }
+    ret ""
+}
+
+fn expression_path_h(expr: ExprNode<H>) -> str {
+    match expr.value {
+        Expr::Path(name) => { ret name }
+        Expr::Parenthesized(inner) => { ret expression_path_h(inner) }
+        _ => {}
+    }
+    ret ""
+}
+
+fn resolve_call(ctx: mut SemanticContext, name: str, args: Vec[ExprNode]) -> Option[SemanticCallable] {
+    let mut argument_types = Vec[str]::new()
+    for argument in args { argument_types.push(infer_expression(ctx, argument)) }
+    for callable in ctx.callables {
+        if callable.name == name && callable.params.len() == argument_types.len() && parameter_types_match(callable.params, argument_types) {
+            ret Option[SemanticCallable]::Some(callable)
+        }
+    }
+    ret Option[SemanticCallable]::None
+}
+
+fn parameter_types_match(params: Vec[str], arguments: Vec[str]) -> bool {
+    let mut index = 0_usize
+    while index < params.len() {
+        match params.get(index) {
+            Option[str]::Some(param) => {
+                match arguments.get(index) {
+                    Option[str]::Some(argument) => {
+                        if param != "" && argument != "" && param != argument && !generic_placeholder(param) { ret false }
+                    }
+                    Option[str]::None => { ret false }
+                }
+            }
+            Option[str]::None => { ret false }
+        }
+        index += 1_usize
+    }
+    ret true
+}
+
+fn generic_placeholder(value: str) -> bool {
+    if value.len() != 1_usize { ret false }
+    let byte = value.byte_at(0_usize)
+    ret byte >= 65_u8 && byte <= 90_u8
+}
+
+fn expression_is_flexible_numeric(expr: ExprNode) -> bool {
+    match expr.value {
+        Expr::Integer(value) => { ret !contains(value, "_") }
+        Expr::Float(value) => { ret !contains(value, "_") }
+        _ => {}
+    }
+    ret false
+}
+
+fn contains(value: str, needle: str) -> bool {
+    if needle.len() == 0_usize { ret true }
+    if needle.len() > value.len() { ret false }
+    let mut index = 0_usize
+    while index + needle.len() <= value.len() {
+        if value.slice(index, needle.len()) == needle { ret true }
+        index += 1_usize
+    }
+    ret false
+}
+
+fn remember_dependency(ctx: mut SemanticContext, callable: SemanticCallable) -> () {
+    for dependency in ctx.dependencies {
+        if dependency.module_name == callable.module_name && dependency.name == callable.name { ret () }
+    }
+    ctx.dependencies.push(SemanticDependency{callable.module_name, callable.name, callable.signature})
+    ret ()
+}
+
+fn integer_type(value: str) -> str {
+    if ends_with(value, "_u8") { ret "u8" }
+    if ends_with(value, "_u16") { ret "u16" }
+    if ends_with(value, "_u32") { ret "u32" }
+    if ends_with(value, "_u64") { ret "u64" }
+    if ends_with(value, "_usize") { ret "usize" }
+    if ends_with(value, "_i8") { ret "i8" }
+    if ends_with(value, "_i16") { ret "i16" }
+    if ends_with(value, "_i32") { ret "i32" }
+    if ends_with(value, "_i64") { ret "i64" }
+    ret "i32"
+}
+
+fn float_type(value: str) -> str {
+    if ends_with(value, "_f32") { ret "f32" }
+    ret "f64"
+}
+
+fn ends_with(value: str, suffix: str) -> bool {
+    ret suffix.len() <= value.len() && value.slice(value.len() - suffix.len(), suffix.len()) == suffix
+}
+
+fn nonzero_hash(value: str) -> u64 {
+    let hashed = value.hash()
+    if hashed == 0_u64 { ret 1_u64 }
+    ret hashed
+}

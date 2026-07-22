@@ -12,6 +12,8 @@ import refrain::frontend::analysis::analyze_named_tokens
 import refrain::frontend::analysis::analyze_module_lightweight
 import refrain::frontend::lexer::Token
 import refrain::frontend::lexer::TokenType
+import refrain::frontend::parser::{FunctionItem, Statement}
+import refrain::frontend::semantic::{SemanticBody, SemanticCallable, SemanticDependency, check_function_body, check_module_bodies}
 
 /// Deterministic identity of a module across analysis database instances.
 pub struct ModuleId { raw: u64 key: str }
@@ -42,10 +44,20 @@ struct AnalysisSource {
     parse_count: usize
 }
 
+struct SemanticBodyCache {
+    id: SymbolId
+    module_name: str
+    symbol_name: str
+    body_fingerprint: u64
+    result: SemanticBody
+    count: usize
+}
+
 /// Caches analysis queries and invalidates dependants only when a module's
 /// declaration interface changes.
 pub struct AnalysisDatabase {
     sources: Vec[AnalysisSource]
+    semantic_bodies: Vec[SemanticBodyCache]
     revision: usize
 }
 
@@ -82,7 +94,7 @@ impl for SymbolId {
 impl for AnalysisDatabase {
     /// Creates an empty analysis database at revision zero.
     pub fn new() -> Self {
-        ret Self {Vec[AnalysisSource]::new(), 0_usize}
+        ret Self {Vec[AnalysisSource]::new(), Vec[SemanticBodyCache]::new(), 0_usize}
     }
 
     /// Returns the current source revision of the database.
@@ -239,6 +251,11 @@ impl for AnalysisDatabase {
         if !found { ret () }
         self.revision += 1_usize
         self.sources = next
+        let mut semantic_bodies = Vec[SemanticBodyCache]::new()
+        for cached in self.semantic_bodies {
+            if cached.module_name != module_name { semantic_bodies.push(cached) }
+        }
+        self.semantic_bodies = semantic_bodies
         self.invalidate_dependents(module_name)
         ret ()
     }
@@ -329,13 +346,7 @@ impl for AnalysisDatabase {
     pub fn all_symbols(self: Self) -> Vec[AnalysisSymbol] {
         let mut out = Vec[AnalysisSymbol]::new()
         for entry in self.sources {
-            let identities = symbol_identities(entry.module_name, entry.lightweight.symbols)
-            let mut symbol_index = 0_usize
-            for symbol in entry.lightweight.symbols {
-                let id = identity_at(identities, symbol_index)
-                out.push(AnalysisSymbol{id, entry.id, entry.module_name, symbol})
-                symbol_index += 1_usize
-            }
+            out.extend(analysis_symbols_for_source(entry))
         }
         ret out
     }
@@ -378,10 +389,216 @@ impl for AnalysisDatabase {
     /// Resolves a stable symbol identity against the current database revision.
     pub fn symbol_by_id(self: Self, id: SymbolId) -> Option[AnalysisSymbol] {
         if id.raw == 0_u64 || id.key == "" { ret Option[AnalysisSymbol]::None }
-        for indexed in self.all_symbols() {
-            if indexed.id.raw == id.raw && indexed.id.key == id.key { ret Option[AnalysisSymbol]::Some(indexed) }
+        for entry in self.sources {
+            if starts_with(id.key, entry.module_name + "#") {
+                for indexed in analysis_symbols_for_source(entry) {
+                    if indexed.id.raw == id.raw && indexed.id.key == id.key { ret Option[AnalysisSymbol]::Some(indexed) }
+                }
+                ret Option[AnalysisSymbol]::None
+            }
         }
         ret Option[AnalysisSymbol]::None
+    }
+
+    /// Returns the cached semantic result for one function declaration.
+    ///
+    /// The query is recomputed only when that function body or one of the
+    /// declaration signatures read by its previous result has changed.
+    pub fn semantic_body(self: mut Self, id: SymbolId) -> Option[SemanticBody] {
+        let indexed = match self.symbol_by_id(id) {
+            Option[AnalysisSymbol]::Some(value) => value
+            Option[AnalysisSymbol]::None => { ret Option[SemanticBody]::None }
+        }
+        if indexed.symbol.kind != 12_usize { ret Option[SemanticBody]::None }
+        let callables = self.visible_semantic_callables(indexed.module_name)
+        ret self.semantic_body_for(indexed, callables)
+    }
+
+    fn semantic_body_for(self: mut Self, indexed: AnalysisSymbol, callables: Vec[SemanticCallable]) -> Option[SemanticBody] {
+        let id = indexed.id
+        let fingerprint = match self.source_lightweight_document(indexed.module_name) {
+            Option[FrontendDocument]::Some(value) => function_body_fingerprint(value.tokens, indexed.symbol.name, indexed.symbol.line, indexed.symbol.column)
+            Option[FrontendDocument]::None => { ret Option[SemanticBody]::None }
+        }
+        let mut cache_index = 0_usize
+        while cache_index < self.semantic_bodies.len() {
+            match self.semantic_bodies.get(cache_index) {
+                Option[SemanticBodyCache]::Some(cached) => {
+                    if same_symbol_id(cached.id, id) {
+                        if cached.body_fingerprint == fingerprint && self.semantic_dependencies_are_current(cached.result.dependencies) {
+                            ret Option[SemanticBody]::Some(cached.result)
+                        }
+                        let document = if cached.body_fingerprint == fingerprint {
+                            self.stored_full_document(indexed.module_name).unwrap_or(FrontendDocument::empty())
+                        } else {
+                            self.document(indexed.module_name).unwrap_or(FrontendDocument::empty())
+                        }
+                        let item = match find_function(document.ast, indexed.symbol.name, indexed.symbol.line, indexed.symbol.column) {
+                            Option[FunctionItem]::Some(value) => value
+                            Option[FunctionItem]::None => { ret Option[SemanticBody]::None }
+                        }
+                        let result = check_function_body(item, callables)
+                        self.semantic_bodies.set(cache_index, SemanticBodyCache{id, indexed.module_name, indexed.symbol.name, fingerprint, result, cached.count + 1_usize})
+                        ret Option[SemanticBody]::Some(result)
+                    }
+                }
+                Option[SemanticBodyCache]::None => {}
+            }
+            cache_index += 1_usize
+        }
+        let document = self.document(indexed.module_name).unwrap_or(FrontendDocument::empty())
+        let item = match find_function(document.ast, indexed.symbol.name, indexed.symbol.line, indexed.symbol.column) {
+            Option[FunctionItem]::Some(value) => value
+            Option[FunctionItem]::None => { ret Option[SemanticBody]::None }
+        }
+        let result = check_function_body(item, callables)
+        self.semantic_bodies.push(SemanticBodyCache{id, indexed.module_name, indexed.symbol.name, fingerprint, result, 1_usize})
+        ret Option[SemanticBody]::Some(result)
+    }
+
+    /// Returns whether a cached semantic body must be recomputed.
+    pub fn semantic_body_is_dirty(self: mut Self, id: SymbolId) -> bool {
+        for cached in self.semantic_bodies {
+            if same_symbol_id(cached.id, id) {
+                let document = match self.source_lightweight_document(cached.module_name) {
+                    Option[FrontendDocument]::Some(value) => value
+                    Option[FrontendDocument]::None => { ret true }
+                }
+                let indexed = match self.symbol_by_id(id) {
+                    Option[AnalysisSymbol]::Some(value) => value
+                    Option[AnalysisSymbol]::None => { ret true }
+                }
+                if function_body_fingerprint(document.tokens, cached.symbol_name, indexed.symbol.line, indexed.symbol.column) != cached.body_fingerprint { ret true }
+                ret !self.semantic_dependencies_are_current(cached.result.dependencies)
+            }
+        }
+        ret true
+    }
+
+    /// Returns how many times a function semantic query was executed.
+    pub fn semantic_body_count(self: Self, id: SymbolId) -> usize {
+        for cached in self.semantic_bodies {
+            if same_symbol_id(cached.id, id) { ret cached.count }
+        }
+        ret 0_usize
+    }
+
+    /// Returns cached semantic diagnostics for all top-level function bodies
+    /// in a module. Compiler and editor clients consume this same query.
+    pub fn module_semantic_diagnostics(self: mut Self, module_name: str) -> Vec[FrontendDiagnostic] {
+        let callables = self.visible_semantic_callables(module_name)
+        let document = match self.stored_full_document(module_name) {
+            Option[FrontendDocument]::Some(value) => value
+            Option[FrontendDocument]::None => {
+                match self.document(module_name) {
+                    Option[FrontendDocument]::Some(value) => value
+                    Option[FrontendDocument]::None => { ret Vec[FrontendDiagnostic]::new() }
+                }
+            }
+        }
+        ret check_module_bodies(document.ast, callables)
+    }
+
+    /// Returns the semantic type of a local binding at a source line.
+    pub fn semantic_binding_type(self: mut Self, module_name: str, name: str, line: usize) -> Option[str] {
+        let symbols = self.module_analysis_symbols(module_name)
+        let callables = self.visible_semantic_callables(module_name)
+        let mut adjacent = Option[str]::None
+        for indexed in symbols {
+            if indexed.symbol.kind == 12_usize {
+                match self.semantic_body_for(indexed, callables) {
+                    Option[SemanticBody]::Some(body) => {
+                        for binding in body.bindings {
+                            if binding.name == name && binding.line == line { ret Option[str]::Some(binding.typ) }
+                            if binding.name == name && (binding.line == line + 1_usize || (line > 0_usize && binding.line + 1_usize == line)) {
+                                adjacent = Option[str]::Some(binding.typ)
+                            }
+                        }
+                    }
+                    Option[SemanticBody]::None => {}
+                }
+            }
+        }
+        ret adjacent
+    }
+
+    fn module_analysis_symbols(self: Self, module_name: str) -> Vec[AnalysisSymbol] {
+        for entry in self.sources {
+            if entry.module_name == module_name { ret analysis_symbols_for_source(entry) }
+        }
+        ret Vec[AnalysisSymbol]::new()
+    }
+
+    fn source_lightweight_document(self: Self, module_name: str) -> Option[FrontendDocument] {
+        for source in self.sources {
+            if source.module_name == module_name { ret Option[FrontendDocument]::Some(source.lightweight) }
+        }
+        ret Option[FrontendDocument]::None
+    }
+
+    fn stored_full_document(self: Self, module_name: str) -> Option[FrontendDocument] {
+        for source in self.sources {
+            if source.module_name == module_name && source.full.parsed { ret Option[FrontendDocument]::Some(source.full) }
+        }
+        ret Option[FrontendDocument]::None
+    }
+
+    fn semantic_dependencies_are_current(self: mut Self, dependencies: Vec[SemanticDependency]) -> bool {
+        for dependency in dependencies {
+            match self.semantic_callable(dependency.module_name, dependency.name) {
+                Option[SemanticCallable]::Some(callable) => {
+                    if callable.signature != dependency.signature { ret false }
+                }
+                Option[SemanticCallable]::None => { ret false }
+            }
+        }
+        ret true
+    }
+
+    fn semantic_callable(self: mut Self, module_name: str, name: str) -> Option[SemanticCallable] {
+        let document = match self.document(module_name) {
+            Option[FrontendDocument]::Some(value) => value
+            Option[FrontendDocument]::None => { ret Option[SemanticCallable]::None }
+        }
+        for statement in document.ast {
+            match statement {
+                Statement::Function(item) => {
+                    if item.name == name { ret Option[SemanticCallable]::Some(callable_from_function(module_name, item)) }
+                }
+                _ => {}
+            }
+        }
+        ret Option[SemanticCallable]::None
+    }
+
+    fn visible_semantic_callables(self: mut Self, module_name: str) -> Vec[SemanticCallable] {
+        let mut visible_modules = Vec[str]::new()
+        visible_modules.push(module_name)
+        for source in self.sources {
+            if source.module_name == module_name {
+                for edge in source.lightweight.dependencies.all() {
+                    for candidate in self.sources {
+                        if edge.target == candidate.module_name || starts_with(edge.target, candidate.module_name + "::") {
+                            if !contains_string(visible_modules, candidate.module_name) { visible_modules.push(candidate.module_name) }
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec[SemanticCallable]::new()
+        for visible in visible_modules {
+            let document = match if visible == module_name { self.stored_full_document(visible) } else { self.document(visible) } {
+                Option[FrontendDocument]::Some(value) => value
+                Option[FrontendDocument]::None => FrontendDocument::empty()
+            }
+            for statement in document.ast {
+                match statement {
+                    Statement::Function(item) => { out.push(callable_from_function(visible, item)) }
+                    _ => {}
+                }
+            }
+        }
+        ret out
     }
 
     fn invalidate_dependents(self: mut Self, changed_module: str) -> () {
@@ -426,6 +643,127 @@ impl for AnalysisDatabase {
         }
         ret ()
     }
+}
+
+fn analysis_symbols_for_source(entry: AnalysisSource) -> Vec[AnalysisSymbol] {
+    let mut out = Vec[AnalysisSymbol]::new()
+    let identities = symbol_identities(entry.module_name, entry.lightweight.symbols)
+    let mut symbol_index = 0_usize
+    for symbol in entry.lightweight.symbols {
+        let id = identity_at(identities, symbol_index)
+        out.push(AnalysisSymbol{id, entry.id, entry.module_name, symbol})
+        symbol_index += 1_usize
+    }
+    ret out
+}
+
+fn callable_from_function(module_name: str, item: FunctionItem) -> SemanticCallable {
+    let mut params = Vec[str]::new()
+    for param in item.params { params.push(param.typ.unwrap_or("")) }
+    ret SemanticCallable::new(module_name, item.name, params, item.ret_type.unwrap_or("void"))
+}
+
+fn find_function(ast: Vec[Statement], name: str, line: usize, column: usize) -> Option[FunctionItem] {
+    let mut fallback = Option[FunctionItem]::None
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => {
+                if item.name == name {
+                    if item.line == line { ret Option[FunctionItem]::Some(item) }
+                    fallback = Option[FunctionItem]::Some(item)
+                }
+            }
+            Statement::Trait(item) => {
+                for method in item.methods {
+                    if method.name == name {
+                        if method.line == line { ret Option[FunctionItem]::Some(method) }
+                        fallback = Option[FunctionItem]::Some(method)
+                    }
+                }
+            }
+            Statement::Impl(item) => {
+                for method in item.methods {
+                    if method.name == name {
+                        if method.line == line { ret Option[FunctionItem]::Some(method) }
+                        fallback = Option[FunctionItem]::Some(method)
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ret fallback
+}
+
+fn function_body_fingerprint(tokens: Vec[Token], name: str, line: usize, column: usize) -> u64 {
+    let mut fallback = 0_u64
+    let mut index = 0_usize
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Option[Token]::Some(token) => {
+                if token.type == TokenType::KW_FN {
+                    match next_identifier_token_at(tokens, index + 1_usize) {
+                        Option[Token]::Some(found) => {
+                            if found.value == name {
+                                let fingerprint = hash_function_tokens(tokens, index)
+                                if found.line == line && found.column == column { ret fingerprint }
+                                fallback = fingerprint
+                            }
+                        }
+                        Option[Token]::None => {}
+                    }
+                }
+            }
+            Option[Token]::None => {}
+        }
+        index += 1_usize
+    }
+    ret fallback
+}
+
+fn next_identifier_token_at(tokens: Vec[Token], start: usize) -> Option[Token] {
+    let mut index = start
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Option[Token]::Some(token) => {
+                if token.type == TokenType::IDENTIFIER { ret Option[Token]::Some(token) }
+                if token.type == TokenType::LEFT_BRACE { ret Option[Token]::None }
+            }
+            Option[Token]::None => {}
+        }
+        index += 1_usize
+    }
+    ret Option[Token]::None
+}
+
+fn hash_function_tokens(tokens: Vec[Token], start: usize) -> u64 {
+    let mut fingerprint = 1469598103934665603_u64
+    let prime = 1099511628211_u64
+    let mut index = start
+    let mut body_started = false
+    let mut depth = 0_usize
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Option[Token]::Some(token) => {
+                fingerprint = (fingerprint ^ token.value.hash()) * prime
+                if token.type == TokenType::LEFT_BRACE {
+                    body_started = true
+                    depth += 1_usize
+                }
+                elif body_started && token.type == TokenType::RIGHT_BRACE {
+                    depth -= 1_usize
+                    if depth == 0_usize { ret fingerprint }
+                }
+            }
+            Option[Token]::None => {}
+        }
+        index += 1_usize
+    }
+    ret fingerprint
+}
+
+fn same_symbol_id(lhs: SymbolId, rhs: SymbolId) -> bool {
+    ret lhs.raw == rhs.raw && lhs.key == rhs.key
 }
 
 fn module_identity(module_name: str) -> ModuleId {
