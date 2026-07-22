@@ -37,7 +37,14 @@ if [ "$release" = true ] && [ "$source_dirty" = true ]; then
     exit 1
 fi
 if git -C "$repo_root" rev-parse --git-dir >/dev/null 2>&1; then
-    git -C "$repo_root" cat-file -e "$source_commit^{commit}"
+    # A PR checkout can contain complete history for its fetched refs without
+    # containing the feature-branch object recorded by an older stage0. The
+    # archive and binary checksums above are authoritative; validate the Git
+    # object when it is present, but do not make selective ref fetching part of
+    # the bootstrap format.
+    if git -C "$repo_root" cat-file -e "$source_commit^{commit}" 2>/dev/null; then
+        test "$(git -C "$repo_root" cat-file -t "$source_commit")" = "commit"
+    fi
 fi
 
 case "$(uname -s):$(uname -m)" in

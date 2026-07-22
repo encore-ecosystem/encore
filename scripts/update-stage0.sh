@@ -43,6 +43,7 @@ clang -O3 \
     "$repo_root/index/core/runtime.c" \
     "$repo_root/index/ehir-llvm-backend/runtime.c" \
     "$repo_root/index/rich/runtime.c" \
+    -lssl -lcrypto \
     -o "$tmp/encore-stage0-linux-x86_64"
 gzip -9n -c "$tmp/encore-stage0-linux-x86_64" > "$tmp/encore-stage0-linux-x86_64.gz"
 

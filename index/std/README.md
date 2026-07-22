@@ -285,6 +285,33 @@ fn show(count: usize) {
 `TcpStream` and `TcpListener` implement `ContextManager`, so they can be used
 with `with` when the program should close them at block exit.
 
+`std::tls` re-exports the verified blocking TLS client from `core::tls`.
+`std::http` builds a synchronous HTTPS-only HTTP/1.1 client on that stream:
+
+- `Url::parse(value)` parses absolute `https://` URLs;
+- `HttpRequest::get(url)` and `encode()` create HTTP/1.1 requests;
+- `HttpClient::new().get(url)` follows HTTPS redirects and returns `HttpResponse`;
+- `HttpClientConfig` configures a private CA file, redirect limit, response-body
+  limit and per-operation timeout.
+
+```enq
+import core::result::Result
+import std::http::HttpClient
+
+fn fetch() -> str {
+    match HttpClient::new().get("https://example.com/") {
+        Result::Ok(response) => { ret response.body() }
+        Result::Err(error) => { ret "request failed: " + error }
+    }
+    ret ""
+}
+```
+
+The initial client is blocking and supports HTTP/1.0 and HTTP/1.1 responses,
+`Content-Length`, connection-close framing, chunked transfer encoding and
+absolute or root-relative HTTPS redirects. Async networking, HTTP/2, connection
+pooling and server-side TLS remain separate follow-up work.
+
 ## Math And Random
 
 ### `std::math`

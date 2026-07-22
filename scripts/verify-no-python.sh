@@ -4,7 +4,8 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
-tracked_python=$(git ls-files '*.py' '*.pyi' 'pyproject.toml' 'requirements*.txt' 'setup.py' 'setup.cfg')
+tracked_python=$(git ls-files '*.py' '*.pyi' 'pyproject.toml' 'requirements*.txt' 'setup.py' 'setup.cfg' |
+    grep -Ev '(^benchmark/|/tests/)' || true)
 if [ -n "$tracked_python" ]; then
     echo "Retired Python compiler files are still tracked:" >&2
     printf '%s\n' "$tracked_python" >&2

@@ -47,7 +47,7 @@ while [ "$stage" -le 3 ]; do
     mv "$profile_dir" "$tmp/stage$stage-profile"
     if [ "$stage" -lt 3 ]; then
         # shellcheck disable=SC2086
-        clang -O3 -w "$tmp/stage$stage.ll" $runtime_sources -o "$tmp/stage$stage"
+        clang -O3 -w "$tmp/stage$stage.ll" $runtime_sources -lssl -lcrypto -o "$tmp/stage$stage"
     fi
     stage=$((stage + 1))
 done

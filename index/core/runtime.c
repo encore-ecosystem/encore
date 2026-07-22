@@ -4,6 +4,7 @@
 #endif
 #ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
+#define SECURITY_WIN32
 #endif
 
 #include <stdbool.h>
@@ -25,6 +26,9 @@
 #ifdef __APPLE__
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
+#include <Security/SecureTransport.h>
 #include <sys/sysctl.h>
 #endif
 #ifdef _WIN32
@@ -35,7 +39,12 @@
 #include <direct.h>
 #include <io.h>
 #include <process.h>
+#include <security.h>
+#include <schannel.h>
+#include <wincrypt.h>
 #pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Secur32.lib")
+#pragma comment(lib, "Crypt32.lib")
 #pragma comment(linker, "/STACK:8388608")
 #else
 #include <pthread.h>
@@ -49,8 +58,13 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
-#if !defined(__APPLE__)
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+extern char **environ;
+#elif !defined(__APPLE__)
 extern char **environ;
 #endif
 #endif
@@ -1689,6 +1703,588 @@ int32_t encore_net_tcp_close(int32_t fd) {
     }
     return 0;
 }
+
+#if defined(__APPLE__)
+typedef struct {
+    int fd;
+    SSLContextRef context;
+    bool read_failed;
+    bool received_data;
+} encore_tls_client;
+
+static int encore_apple_tls_socket(const char *host, size_t port, size_t timeout_ms) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_buf[16];
+    snprintf(port_buf, sizeof(port_buf), "%zu", port);
+    struct addrinfo *results = NULL;
+    if (getaddrinfo(host, port_buf, &hints, &results) != 0 || results == NULL) return -1;
+    int connected = -1;
+    for (struct addrinfo *it = results; it != NULL; it = it->ai_next) {
+        int fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (fd < 0) continue;
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int result = connect(fd, it->ai_addr, it->ai_addrlen);
+        if (result == 0) connected = fd;
+        else if (errno == EINPROGRESS) {
+            struct pollfd pending = {fd, POLLOUT, 0};
+            int wait_ms = timeout_ms > 250 ? 250 : (int)timeout_ms;
+            if (poll(&pending, 1, wait_ms) > 0) {
+                int socket_error = 0;
+                socklen_t error_size = sizeof(socket_error);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_size) == 0 && socket_error == 0) connected = fd;
+            }
+        }
+        if (connected >= 0) {
+            if (flags >= 0) fcntl(fd, F_SETFL, flags);
+            struct timeval timeout = {(time_t)(timeout_ms / 1000), (suseconds_t)((timeout_ms % 1000) * 1000)};
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            break;
+        }
+        close(fd);
+    }
+    freeaddrinfo(results);
+    return connected;
+}
+
+static OSStatus encore_apple_tls_read(SSLConnectionRef connection, void *data, size_t *length) {
+    int fd = (int)(intptr_t)connection;
+    ssize_t count = recv(fd, data, *length, 0);
+    if (count > 0) { *length = (size_t)count; return noErr; }
+    *length = 0;
+    if (count == 0) return errSSLClosedGraceful;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return errSSLWouldBlock;
+    return errSSLClosedAbort;
+}
+
+static OSStatus encore_apple_tls_write(SSLConnectionRef connection, const void *data, size_t *length) {
+    int fd = (int)(intptr_t)connection;
+    ssize_t count = send(fd, data, *length, 0);
+    if (count >= 0) { *length = (size_t)count; return noErr; }
+    *length = 0;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return errSSLWouldBlock;
+    return errSSLClosedAbort;
+}
+
+static bool encore_apple_add_ca(SecTrustRef trust, const char *path) {
+    if (path[0] == '\0') return true;
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return false;
+    if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return false; }
+    long file_size = ftell(file);
+    if (file_size <= 0 || fseek(file, 0, SEEK_SET) != 0) { fclose(file); return false; }
+    UInt8 *bytes = malloc((size_t)file_size);
+    if (bytes == NULL || fread(bytes, 1, (size_t)file_size, file) != (size_t)file_size) { free(bytes); fclose(file); return false; }
+    fclose(file);
+    CFDataRef data = CFDataCreate(NULL, bytes, (CFIndex)file_size);
+    free(bytes);
+    if (data == NULL) return false;
+    SecExternalFormat format = kSecFormatUnknown;
+    SecExternalItemType type = kSecItemTypeCertificate;
+    CFArrayRef items = NULL;
+    OSStatus status = SecItemImport(data, NULL, &format, &type, 0, NULL, NULL, &items);
+    CFRelease(data);
+    if (status != errSecSuccess || items == NULL || CFArrayGetCount(items) == 0) {
+        if (items != NULL) CFRelease(items);
+        return false;
+    }
+    status = SecTrustSetAnchorCertificates(trust, items);
+    if (status == errSecSuccess) status = SecTrustSetAnchorCertificatesOnly(trust, false);
+    CFRelease(items);
+    return status == errSecSuccess;
+}
+
+size_t encore_tls_client_connect(encore_str host, size_t port, encore_str ca_file, size_t timeout_ms) {
+    char *host_c = encore_to_cstr(host);
+    char *ca_c = encore_to_cstr(ca_file);
+    if (host_c == NULL || ca_c == NULL || port == 0 || port > 65535 || timeout_ms == 0) {
+        free(host_c); free(ca_c); encore_set_net_error_cstr("invalid TLS endpoint"); return 0;
+    }
+    int fd = encore_apple_tls_socket(host_c, port, timeout_ms);
+    if (fd < 0) { free(host_c); free(ca_c); encore_set_net_error_cstr("TLS TCP connect failed"); return 0; }
+    SSLContextRef context = SSLCreateContext(NULL, kSSLClientSide, kSSLStreamType);
+    if (context == NULL) { close(fd); free(host_c); free(ca_c); encore_set_net_error_cstr("TLS context failed"); return 0; }
+    OSStatus status = SSLSetIOFuncs(context, encore_apple_tls_read, encore_apple_tls_write);
+    if (status == noErr) status = SSLSetConnection(context, (SSLConnectionRef)(intptr_t)fd);
+    if (status == noErr) status = SSLSetPeerDomainName(context, host_c, strlen(host_c));
+    if (status == noErr) status = SSLSetProtocolVersionMin(context, kTLSProtocol12);
+    if (status == noErr) status = SSLSetSessionOption(context, kSSLSessionOptionBreakOnServerAuth, true);
+    if (status == noErr) status = SSLHandshake(context);
+    if (status == errSSLServerAuthCompleted) {
+        SecTrustRef trust = NULL;
+        status = SSLCopyPeerTrust(context, &trust);
+        if (status == noErr && !encore_apple_add_ca(trust, ca_c)) status = errSSLXCertChainInvalid;
+        if (status == noErr) {
+            SecTrustResultType result = kSecTrustResultInvalid;
+            status = SecTrustEvaluate(trust, &result);
+            if (status == noErr && result != kSecTrustResultProceed && result != kSecTrustResultUnspecified) status = errSSLXCertChainInvalid;
+        }
+        if (trust != NULL) CFRelease(trust);
+        if (status == noErr) status = SSLHandshake(context);
+    }
+    if (status != noErr) {
+        char detail[96]; snprintf(detail, sizeof(detail), "TLS handshake failed (%d)", (int)status);
+        encore_set_net_error_cstr(detail); CFRelease(context); close(fd); free(host_c); free(ca_c); return 0;
+    }
+    encore_tls_client *client = malloc(sizeof(*client));
+    if (client == NULL) { encore_set_net_error_cstr("TLS allocation failed"); SSLClose(context); CFRelease(context); close(fd); free(host_c); free(ca_c); return 0; }
+    client->fd = fd; client->context = context; client->read_failed = false; client->received_data = false;
+    free(host_c); free(ca_c);
+    return (size_t)(uintptr_t)client;
+}
+
+encore_str encore_tls_read(size_t handle, size_t max) {
+    encore_tls_client *client = (encore_tls_client *)(uintptr_t)handle;
+    if (client == NULL || max == 0) return encore_empty_str();
+    client->read_failed = false;
+    char *buffer = malloc(max + 1);
+    if (buffer == NULL) { client->read_failed = true; encore_set_net_error_cstr("TLS read allocation failed"); return encore_empty_str(); }
+    size_t count = 0;
+    OSStatus status = SSLRead(client->context, buffer, max, &count);
+    if (count > 0) {
+        client->received_data = true;
+        return encore_from_owned_buffer(buffer, count);
+    }
+    free(buffer);
+    if (status != errSSLClosedGraceful && status != errSSLClosedNoNotify &&
+        !(status == errSSLClosedAbort && client->received_data)) {
+        client->read_failed = true;
+        encore_set_net_error_cstr(status == errSSLWouldBlock ? "TLS read timed out" : "TLS read failed");
+    }
+    return encore_empty_str();
+}
+
+bool encore_tls_read_failed(size_t handle) {
+    encore_tls_client *client = (encore_tls_client *)(uintptr_t)handle;
+    return client != NULL && client->read_failed;
+}
+
+int32_t encore_tls_write(size_t handle, encore_str data) {
+    encore_tls_client *client = (encore_tls_client *)(uintptr_t)handle;
+    if (client == NULL) return -1;
+    size_t length = encore_str_size(data), offset = 0;
+    const char *bytes = encore_str_data(data);
+    while (offset < length) {
+        size_t written = 0;
+        OSStatus status = SSLWrite(client->context, bytes + offset, length - offset, &written);
+        offset += written;
+        if (status != noErr) { encore_set_net_error_cstr(status == errSSLWouldBlock ? "TLS write timed out" : "TLS write failed"); return -1; }
+    }
+    return offset > (size_t)INT32_MAX ? INT32_MAX : (int32_t)offset;
+}
+
+int32_t encore_tls_close(size_t handle) {
+    encore_tls_client *client = (encore_tls_client *)(uintptr_t)handle;
+    if (client == NULL) return 0;
+    SSLClose(client->context); CFRelease(client->context); close(client->fd); free(client);
+    return 0;
+}
+#elif defined(__linux__) && !defined(__ANDROID__)
+typedef struct {
+    int fd;
+    SSL_CTX *context;
+    SSL *ssl;
+    bool read_failed;
+} encore_tls_client;
+
+static int encore_tls_connect_socket(const char *host, size_t port, size_t timeout_ms) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_buf[16];
+    snprintf(port_buf, sizeof(port_buf), "%zu", port);
+    struct addrinfo *results = NULL;
+    if (getaddrinfo(host, port_buf, &hints, &results) != 0 || results == NULL) return -1;
+    int connected = -1;
+    for (struct addrinfo *it = results; it != NULL; it = it->ai_next) {
+        int fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (fd < 0) continue;
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int result = connect(fd, it->ai_addr, it->ai_addrlen);
+        if (result == 0) { connected = fd; }
+        else if (errno == EINPROGRESS) {
+            struct pollfd pending = {fd, POLLOUT, 0};
+            /* Try the next DNS address quickly (Happy-Eyeballs-style fallback)
+               instead of stalling on an unreachable IPv6 route. */
+            int wait_ms = timeout_ms > 250 ? 250 : (int)timeout_ms;
+            if (poll(&pending, 1, wait_ms) > 0) {
+                int socket_error = 0;
+                socklen_t error_size = sizeof(socket_error);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_size) == 0 && socket_error == 0) connected = fd;
+            }
+        }
+        if (connected >= 0) {
+            if (flags >= 0) fcntl(fd, F_SETFL, flags);
+            struct timeval timeout = {(time_t)(timeout_ms / 1000), (suseconds_t)((timeout_ms % 1000) * 1000)};
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            break;
+        }
+        close(fd);
+    }
+    freeaddrinfo(results);
+    return connected;
+}
+
+static void encore_set_tls_error(const char *prefix) {
+    unsigned long code = ERR_get_error();
+    if (code == 0) { encore_set_net_error_cstr(prefix); return; }
+    char detail[160];
+    ERR_error_string_n(code, detail, sizeof(detail));
+    snprintf(g_net_last_error, sizeof(g_net_last_error), "%s: %s", prefix, detail);
+}
+
+size_t encore_tls_client_connect(encore_str host, size_t port, encore_str ca_file, size_t timeout_ms) {
+    char *host_c = encore_to_cstr(host);
+    char *ca_c = encore_to_cstr(ca_file);
+    if (host_c == NULL || ca_c == NULL || port == 0 || port > 65535 || timeout_ms == 0) {
+        free(host_c); free(ca_c); encore_set_net_error_cstr("invalid TLS endpoint"); return 0;
+    }
+    SSL_CTX *context = SSL_CTX_new(TLS_client_method());
+    if (context == NULL) { free(host_c); free(ca_c); encore_set_tls_error("TLS context failed"); return 0; }
+    SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION);
+#ifdef SSL_OP_IGNORE_UNEXPECTED_EOF
+    /* HTTP/1.1 connection-close framing is commonly terminated without a TLS
+       close-notify. Treat that transport EOF as EOF; certificate and hostname
+       verification remain mandatory. */
+    SSL_CTX_set_options(context, SSL_OP_IGNORE_UNEXPECTED_EOF);
+#endif
+    SSL_CTX_set_verify(context, SSL_VERIFY_PEER, NULL);
+    int trust_ok = ca_c[0] == '\0' ? SSL_CTX_set_default_verify_paths(context) : SSL_CTX_load_verify_locations(context, ca_c, NULL);
+    if (trust_ok != 1) {
+        encore_set_tls_error("TLS CA loading failed"); SSL_CTX_free(context); free(host_c); free(ca_c); return 0;
+    }
+    int fd = encore_tls_connect_socket(host_c, port, timeout_ms);
+    if (fd < 0) {
+        encore_set_net_error_code("TLS TCP connect failed", errno); SSL_CTX_free(context); free(host_c); free(ca_c); return 0;
+    }
+    SSL *ssl = SSL_new(context);
+    if (ssl == NULL || SSL_set_fd(ssl, fd) != 1 || SSL_set_tlsext_host_name(ssl, host_c) != 1 || SSL_set1_host(ssl, host_c) != 1 || SSL_connect(ssl) != 1) {
+        encore_set_tls_error("TLS handshake failed");
+        if (ssl != NULL) SSL_free(ssl);
+        close(fd); SSL_CTX_free(context); free(host_c); free(ca_c); return 0;
+    }
+    encore_tls_client *client = malloc(sizeof(*client));
+    if (client == NULL) {
+        encore_set_net_error_cstr("TLS allocation failed"); SSL_shutdown(ssl); SSL_free(ssl); close(fd); SSL_CTX_free(context); free(host_c); free(ca_c); return 0;
+    }
+    client->fd = fd; client->context = context; client->ssl = ssl; client->read_failed = false;
+    free(host_c); free(ca_c);
+    return (size_t)(uintptr_t)client;
+}
+
+encore_str encore_tls_read(size_t handle, size_t max) {
+    encore_tls_client *client = (encore_tls_client *)(uintptr_t)handle;
+    if (client == NULL || max == 0) return encore_empty_str();
+    client->read_failed = false;
+    if (max > (size_t)INT_MAX) max = INT_MAX;
+    char *buffer = malloc(max + 1);
+    if (buffer == NULL) { encore_set_net_error_cstr("TLS read allocation failed"); return encore_empty_str(); }
+    int count = SSL_read(client->ssl, buffer, (int)max);
+    if (count > 0) return encore_from_owned_buffer(buffer, (size_t)count);
+    int error = SSL_get_error(client->ssl, count);
+    free(buffer);
+    if (error != SSL_ERROR_ZERO_RETURN) { client->read_failed = true; encore_set_tls_error("TLS read failed"); }
+    return encore_empty_str();
+}
+
+bool encore_tls_read_failed(size_t handle) {
+    encore_tls_client *client = (encore_tls_client *)(uintptr_t)handle;
+    return client != NULL && client->read_failed;
+}
+
+int32_t encore_tls_write(size_t handle, encore_str data) {
+    encore_tls_client *client = (encore_tls_client *)(uintptr_t)handle;
+    if (client == NULL) { encore_set_net_error_cstr("invalid TLS handle"); return -1; }
+    size_t length = encore_str_size(data);
+    const char *bytes = encore_str_data(data);
+    size_t offset = 0;
+    while (offset < length) {
+        size_t remaining = length - offset;
+        int amount = remaining > (size_t)INT_MAX ? INT_MAX : (int)remaining;
+        int written = SSL_write(client->ssl, bytes + offset, amount);
+        if (written <= 0) { encore_set_tls_error("TLS write failed"); return -1; }
+        offset += (size_t)written;
+    }
+    return offset > (size_t)INT32_MAX ? INT32_MAX : (int32_t)offset;
+}
+
+int32_t encore_tls_close(size_t handle) {
+    encore_tls_client *client = (encore_tls_client *)(uintptr_t)handle;
+    if (client == NULL) return 0;
+    SSL_shutdown(client->ssl);
+    SSL_free(client->ssl);
+    close(client->fd);
+    SSL_CTX_free(client->context);
+    free(client);
+    return 0;
+}
+#elif defined(_WIN32)
+typedef struct {
+    SOCKET socket;
+    CredHandle credentials;
+    CtxtHandle context;
+    SecPkgContext_StreamSizes sizes;
+    unsigned char encrypted[131072];
+    size_t encrypted_len;
+    unsigned char *plain;
+    size_t plain_len;
+    size_t plain_offset;
+    bool read_failed;
+} encore_tls_client;
+
+static void encore_windows_tls_status(const char *operation, SECURITY_STATUS status) {
+    snprintf(g_net_last_error, sizeof(g_net_last_error), "%s (0x%08lx)", operation, (unsigned long)status);
+}
+
+static SOCKET encore_windows_tls_socket(const char *host, size_t port, size_t timeout_ms) {
+    if (!encore_net_init()) return INVALID_SOCKET;
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_buf[16];
+    snprintf(port_buf, sizeof(port_buf), "%zu", port);
+    struct addrinfo *results = NULL;
+    if (getaddrinfo(host, port_buf, &hints, &results) != 0) return INVALID_SOCKET;
+    SOCKET connected = INVALID_SOCKET;
+    for (struct addrinfo *it = results; it != NULL; it = it->ai_next) {
+        SOCKET socket_fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (socket_fd == INVALID_SOCKET) continue;
+        u_long nonblocking = 1;
+        ioctlsocket(socket_fd, FIONBIO, &nonblocking);
+        int result = connect(socket_fd, it->ai_addr, (int)it->ai_addrlen);
+        if (result == 0 || WSAGetLastError() == WSAEWOULDBLOCK) {
+            fd_set writable;
+            FD_ZERO(&writable); FD_SET(socket_fd, &writable);
+            struct timeval wait = {(long)(timeout_ms / 1000), (long)((timeout_ms % 1000) * 1000)};
+            if (result == 0 || select(0, NULL, &writable, NULL, &wait) > 0) {
+                int socket_error = 0; int error_size = sizeof(socket_error);
+                if (getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, (char *)&socket_error, &error_size) == 0 && socket_error == 0) connected = socket_fd;
+            }
+        }
+        if (connected != INVALID_SOCKET) {
+            nonblocking = 0; ioctlsocket(socket_fd, FIONBIO, &nonblocking);
+            DWORD timeout = timeout_ms > UINT32_MAX ? UINT32_MAX : (DWORD)timeout_ms;
+            setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+            setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
+            break;
+        }
+        closesocket(socket_fd);
+    }
+    freeaddrinfo(results);
+    return connected;
+}
+
+static bool encore_windows_send_all(SOCKET socket_fd, const void *data, size_t length) {
+    const char *bytes = data;
+    size_t offset = 0;
+    while (offset < length) {
+        int amount = length - offset > INT_MAX ? INT_MAX : (int)(length - offset);
+        int written = send(socket_fd, bytes + offset, amount, 0);
+        if (written <= 0) return false;
+        offset += (size_t)written;
+    }
+    return true;
+}
+
+static bool encore_windows_validate_certificate(CtxtHandle *context, const wchar_t *host, const char *ca_file) {
+    PCCERT_CONTEXT certificate = NULL;
+    SECURITY_STATUS status = QueryContextAttributes(context, SECPKG_ATTR_REMOTE_CERT_CONTEXT, &certificate);
+    if (status != SEC_E_OK || certificate == NULL) return false;
+    HCERTCHAINENGINE engine = HCCE_CURRENT_USER;
+    HCERTSTORE store = NULL;
+    PCCERT_CONTEXT root = NULL;
+    if (ca_file[0] != '\0') {
+        FILE *file = fopen(ca_file, "rb");
+        if (file == NULL) { CertFreeCertificateContext(certificate); return false; }
+        fseek(file, 0, SEEK_END); long file_size = ftell(file); rewind(file);
+        char *encoded = file_size > 0 ? malloc((size_t)file_size + 1) : NULL;
+        if (encoded == NULL || fread(encoded, 1, (size_t)file_size, file) != (size_t)file_size) { fclose(file); free(encoded); CertFreeCertificateContext(certificate); return false; }
+        fclose(file); encoded[file_size] = '\0';
+        DWORD der_size = 0;
+        bool pem = CryptStringToBinaryA(encoded, (DWORD)file_size, CRYPT_STRING_BASE64HEADER, NULL, &der_size, NULL, NULL) != 0;
+        if (!pem) der_size = (DWORD)file_size;
+        BYTE *der = malloc(der_size);
+        if (der != NULL && pem) pem = CryptStringToBinaryA(encoded, (DWORD)file_size, CRYPT_STRING_BASE64HEADER, der, &der_size, NULL, NULL) != 0;
+        else if (der != NULL) memcpy(der, encoded, der_size);
+        free(encoded);
+        if (der == NULL || (pem == false && der_size == 0)) { free(der); CertFreeCertificateContext(certificate); return false; }
+        root = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, der, der_size);
+        free(der);
+        store = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+        if (root == NULL || store == NULL || !CertAddCertificateContextToStore(store, root, CERT_STORE_ADD_ALWAYS, NULL)) {
+            if (root != NULL) CertFreeCertificateContext(root); if (store != NULL) CertCloseStore(store, 0); CertFreeCertificateContext(certificate); return false;
+        }
+        CERT_CHAIN_ENGINE_CONFIG config;
+        memset(&config, 0, sizeof(config)); config.cbSize = sizeof(config); config.hExclusiveRoot = store;
+        if (!CertCreateCertificateChainEngine(&config, &engine)) { CertFreeCertificateContext(root); CertCloseStore(store, 0); CertFreeCertificateContext(certificate); return false; }
+    }
+    CERT_CHAIN_PARA chain_parameters;
+    memset(&chain_parameters, 0, sizeof(chain_parameters)); chain_parameters.cbSize = sizeof(chain_parameters);
+    PCCERT_CHAIN_CONTEXT chain = NULL;
+    BOOL chain_ok = CertGetCertificateChain(engine, certificate, NULL, certificate->hCertStore, &chain_parameters, 0, NULL, &chain);
+    HTTPSPolicyCallbackData policy_data;
+    memset(&policy_data, 0, sizeof(policy_data)); policy_data.cbStruct = sizeof(policy_data); policy_data.dwAuthType = AUTHTYPE_SERVER; policy_data.pwszServerName = (wchar_t *)host;
+    CERT_CHAIN_POLICY_PARA policy_parameters;
+    memset(&policy_parameters, 0, sizeof(policy_parameters)); policy_parameters.cbSize = sizeof(policy_parameters); policy_parameters.pvExtraPolicyPara = &policy_data;
+    CERT_CHAIN_POLICY_STATUS policy_status;
+    memset(&policy_status, 0, sizeof(policy_status)); policy_status.cbSize = sizeof(policy_status);
+    BOOL policy_ok = chain_ok && CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, chain, &policy_parameters, &policy_status) && policy_status.dwError == 0;
+    if (chain != NULL) CertFreeCertificateChain(chain);
+    if (ca_file[0] != '\0') { CertFreeCertificateChainEngine(engine); CertFreeCertificateContext(root); CertCloseStore(store, 0); }
+    CertFreeCertificateContext(certificate);
+    return policy_ok != 0;
+}
+
+size_t encore_tls_client_connect(encore_str host, size_t port, encore_str ca_file, size_t timeout_ms) {
+    char *host_c = encore_to_cstr(host), *ca_c = encore_to_cstr(ca_file);
+    if (host_c == NULL || ca_c == NULL || port == 0 || port > 65535 || timeout_ms == 0) { free(host_c); free(ca_c); encore_set_net_error_cstr("invalid TLS endpoint"); return 0; }
+    int wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, host_c, -1, NULL, 0);
+    wchar_t *host_w = wide_len > 0 ? malloc((size_t)wide_len * sizeof(wchar_t)) : NULL;
+    if (host_w == NULL || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, host_c, -1, host_w, wide_len) == 0) { free(host_w); free(host_c); free(ca_c); encore_set_net_error_cstr("invalid TLS host"); return 0; }
+    SOCKET socket_fd = encore_windows_tls_socket(host_c, port, timeout_ms);
+    if (socket_fd == INVALID_SOCKET) { free(host_w); free(host_c); free(ca_c); encore_set_net_error_cstr("TLS TCP connect failed"); return 0; }
+    SCHANNEL_CRED credential_data;
+    memset(&credential_data, 0, sizeof(credential_data)); credential_data.dwVersion = SCHANNEL_CRED_VERSION;
+    credential_data.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT;
+#ifdef SP_PROT_TLS1_3_CLIENT
+    credential_data.grbitEnabledProtocols |= SP_PROT_TLS1_3_CLIENT;
+#endif
+    credential_data.dwFlags = SCH_CRED_MANUAL_CRED_VALIDATION | SCH_CRED_NO_DEFAULT_CREDS;
+    CredHandle credentials; TimeStamp expiry;
+    SECURITY_STATUS status = AcquireCredentialsHandleW(NULL, UNISP_NAME_W, SECPKG_CRED_OUTBOUND, NULL, &credential_data, NULL, NULL, &credentials, &expiry);
+    if (status != SEC_E_OK) { encore_windows_tls_status("TLS credentials failed", status); closesocket(socket_fd); free(host_w); free(host_c); free(ca_c); return 0; }
+    DWORD flags = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT | ISC_REQ_CONFIDENTIALITY | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM;
+    DWORD attributes = 0;
+    CtxtHandle context;
+    SecInvalidateHandle(&context);
+    SecBuffer output_buffer = {0, SECBUFFER_TOKEN, NULL}; SecBufferDesc output = {SECBUFFER_VERSION, 1, &output_buffer};
+    status = InitializeSecurityContextW(&credentials, NULL, host_w, flags, 0, SECURITY_NATIVE_DREP, NULL, 0, &context, &output, &attributes, &expiry);
+    if (status == SEC_I_COMPLETE_NEEDED || status == SEC_I_COMPLETE_AND_CONTINUE) {
+        SECURITY_STATUS completed = CompleteAuthToken(&context, &output);
+        if (completed != SEC_E_OK) status = completed;
+        else status = status == SEC_I_COMPLETE_NEEDED ? SEC_E_OK : SEC_I_CONTINUE_NEEDED;
+    }
+    if (output_buffer.pvBuffer != NULL) { if (!encore_windows_send_all(socket_fd, output_buffer.pvBuffer, output_buffer.cbBuffer)) status = SEC_E_INTERNAL_ERROR; FreeContextBuffer(output_buffer.pvBuffer); }
+    unsigned char incoming[131072]; size_t incoming_len = 0;
+    while (status == SEC_I_CONTINUE_NEEDED || status == SEC_E_INCOMPLETE_MESSAGE) {
+        if (incoming_len == sizeof(incoming)) { status = SEC_E_BUFFER_TOO_SMALL; break; }
+        int received = recv(socket_fd, (char *)incoming + incoming_len, (int)(sizeof(incoming) - incoming_len), 0);
+        if (received <= 0) { status = SEC_E_INTERNAL_ERROR; break; }
+        incoming_len += (size_t)received;
+        SecBuffer input_buffers[2] = {{(ULONG)incoming_len, SECBUFFER_TOKEN, incoming}, {0, SECBUFFER_EMPTY, NULL}};
+        SecBufferDesc input = {SECBUFFER_VERSION, 2, input_buffers};
+        output_buffer.cbBuffer = 0; output_buffer.BufferType = SECBUFFER_TOKEN; output_buffer.pvBuffer = NULL;
+        status = InitializeSecurityContextW(&credentials, &context, host_w, flags, 0, SECURITY_NATIVE_DREP, &input, 0, NULL, &output, &attributes, &expiry);
+        if (status == SEC_I_COMPLETE_NEEDED || status == SEC_I_COMPLETE_AND_CONTINUE) {
+            SECURITY_STATUS completed = CompleteAuthToken(&context, &output);
+            if (completed != SEC_E_OK) status = completed;
+            else status = status == SEC_I_COMPLETE_NEEDED ? SEC_E_OK : SEC_I_CONTINUE_NEEDED;
+        }
+        if (output_buffer.pvBuffer != NULL) { if (!encore_windows_send_all(socket_fd, output_buffer.pvBuffer, output_buffer.cbBuffer)) status = SEC_E_INTERNAL_ERROR; FreeContextBuffer(output_buffer.pvBuffer); }
+        if (status != SEC_E_INCOMPLETE_MESSAGE) {
+            if (input_buffers[1].BufferType == SECBUFFER_EXTRA) { incoming_len = input_buffers[1].cbBuffer; memmove(incoming, input_buffers[1].pvBuffer, incoming_len); }
+            else incoming_len = 0;
+        }
+    }
+    if (status != SEC_E_OK || !encore_windows_validate_certificate(&context, host_w, ca_c)) {
+        if (status != SEC_E_OK) encore_windows_tls_status("TLS handshake failed", status); else encore_set_net_error_cstr("TLS certificate or hostname verification failed");
+        if (SecIsValidHandle(&context)) DeleteSecurityContext(&context); FreeCredentialsHandle(&credentials); closesocket(socket_fd); free(host_w); free(host_c); free(ca_c); return 0;
+    }
+    encore_tls_client *client = calloc(1, sizeof(*client));
+    if (client == NULL || QueryContextAttributes(&context, SECPKG_ATTR_STREAM_SIZES, client != NULL ? &client->sizes : NULL) != SEC_E_OK) {
+        free(client); if (SecIsValidHandle(&context)) DeleteSecurityContext(&context); FreeCredentialsHandle(&credentials); closesocket(socket_fd); free(host_w); free(host_c); free(ca_c); encore_set_net_error_cstr("TLS stream setup failed"); return 0;
+    }
+    client->socket = socket_fd; client->credentials = credentials; client->context = context; client->encrypted_len = incoming_len; memcpy(client->encrypted, incoming, incoming_len);
+    free(host_w); free(host_c); free(ca_c); return (size_t)(uintptr_t)client;
+}
+
+encore_str encore_tls_read(size_t handle, size_t max) {
+    encore_tls_client *client = (encore_tls_client *)(uintptr_t)handle;
+    if (client == NULL || max == 0) return encore_empty_str();
+    client->read_failed = false;
+    if (client->plain_offset < client->plain_len) {
+        size_t count = client->plain_len - client->plain_offset; if (count > max) count = max;
+        char *out = malloc(count + 1); if (out == NULL) { client->read_failed = true; return encore_empty_str(); }
+        memcpy(out, client->plain + client->plain_offset, count); client->plain_offset += count;
+        if (client->plain_offset == client->plain_len) { free(client->plain); client->plain = NULL; client->plain_len = client->plain_offset = 0; }
+        return encore_from_owned_buffer(out, count);
+    }
+    for (;;) {
+        if (client->encrypted_len == sizeof(client->encrypted)) { client->read_failed = true; encore_set_net_error_cstr("TLS record exceeds buffer"); return encore_empty_str(); }
+        if (client->encrypted_len == 0) {
+            int received = recv(client->socket, (char *)client->encrypted, (int)sizeof(client->encrypted), 0);
+            if (received == 0) return encore_empty_str();
+            if (received < 0) { client->read_failed = true; encore_set_net_error_cstr(WSAGetLastError() == WSAETIMEDOUT ? "TLS read timed out" : "TLS read failed"); return encore_empty_str(); }
+            client->encrypted_len = (size_t)received;
+        }
+        SecBuffer buffers[4] = {{(ULONG)client->encrypted_len, SECBUFFER_DATA, client->encrypted}, {0, SECBUFFER_EMPTY, NULL}, {0, SECBUFFER_EMPTY, NULL}, {0, SECBUFFER_EMPTY, NULL}};
+        SecBufferDesc message = {SECBUFFER_VERSION, 4, buffers};
+        SECURITY_STATUS status = DecryptMessage(&client->context, &message, 0, NULL);
+        if (status == SEC_E_INCOMPLETE_MESSAGE) {
+            int received = recv(client->socket, (char *)client->encrypted + client->encrypted_len, (int)(sizeof(client->encrypted) - client->encrypted_len), 0);
+            if (received <= 0) { client->read_failed = true; encore_set_net_error_cstr("TLS read failed"); return encore_empty_str(); }
+            client->encrypted_len += (size_t)received; continue;
+        }
+        if (status == SEC_I_CONTEXT_EXPIRED) { client->encrypted_len = 0; return encore_empty_str(); }
+        if (status != SEC_E_OK && status != SEC_I_RENEGOTIATE) { client->read_failed = true; encore_windows_tls_status("TLS decrypt failed", status); return encore_empty_str(); }
+        SecBuffer *data = NULL, *extra = NULL;
+        for (size_t index = 1; index < 4; index++) { if (buffers[index].BufferType == SECBUFFER_DATA) data = &buffers[index]; else if (buffers[index].BufferType == SECBUFFER_EXTRA) extra = &buffers[index]; }
+        unsigned char *plain = data != NULL && data->cbBuffer > 0 ? malloc(data->cbBuffer) : NULL;
+        if (data != NULL && data->cbBuffer > 0 && plain == NULL) { client->read_failed = true; return encore_empty_str(); }
+        if (plain != NULL) memcpy(plain, data->pvBuffer, data->cbBuffer);
+        if (extra != NULL) { memmove(client->encrypted, extra->pvBuffer, extra->cbBuffer); client->encrypted_len = extra->cbBuffer; } else client->encrypted_len = 0;
+        if (plain != NULL) { client->plain = plain; client->plain_len = data->cbBuffer; client->plain_offset = 0; return encore_tls_read(handle, max); }
+        if (status == SEC_I_RENEGOTIATE) { client->read_failed = true; encore_set_net_error_cstr("TLS renegotiation is not supported"); return encore_empty_str(); }
+    }
+}
+
+bool encore_tls_read_failed(size_t handle) { encore_tls_client *client = (encore_tls_client *)(uintptr_t)handle; return client != NULL && client->read_failed; }
+
+int32_t encore_tls_write(size_t handle, encore_str data) {
+    encore_tls_client *client = (encore_tls_client *)(uintptr_t)handle;
+    if (client == NULL) return -1;
+    const unsigned char *bytes = (const unsigned char *)encore_str_data(data); size_t length = encore_str_size(data), offset = 0;
+    size_t record_capacity = client->sizes.cbHeader + client->sizes.cbMaximumMessage + client->sizes.cbTrailer;
+    unsigned char *record = malloc(record_capacity); if (record == NULL) return -1;
+    while (offset < length) {
+        size_t count = length - offset; if (count > client->sizes.cbMaximumMessage) count = client->sizes.cbMaximumMessage;
+        memcpy(record + client->sizes.cbHeader, bytes + offset, count);
+        SecBuffer buffers[4] = {{client->sizes.cbHeader, SECBUFFER_STREAM_HEADER, record}, {(ULONG)count, SECBUFFER_DATA, record + client->sizes.cbHeader}, {client->sizes.cbTrailer, SECBUFFER_STREAM_TRAILER, record + client->sizes.cbHeader + count}, {0, SECBUFFER_EMPTY, NULL}};
+        SecBufferDesc message = {SECBUFFER_VERSION, 4, buffers}; SECURITY_STATUS status = EncryptMessage(&client->context, 0, &message, 0);
+        if (status != SEC_E_OK || !encore_windows_send_all(client->socket, record, buffers[0].cbBuffer + buffers[1].cbBuffer + buffers[2].cbBuffer)) { free(record); encore_set_net_error_cstr("TLS write failed"); return -1; }
+        offset += count;
+    }
+    free(record); return offset > INT32_MAX ? INT32_MAX : (int32_t)offset;
+}
+
+int32_t encore_tls_close(size_t handle) {
+    encore_tls_client *client = (encore_tls_client *)(uintptr_t)handle; if (client == NULL) return 0;
+    DWORD shutdown = SCHANNEL_SHUTDOWN; SecBuffer buffer = {sizeof(shutdown), SECBUFFER_TOKEN, &shutdown}; SecBufferDesc message = {SECBUFFER_VERSION, 1, &buffer}; ApplyControlToken(&client->context, &message);
+    SecBuffer output_buffer = {0, SECBUFFER_TOKEN, NULL}; SecBufferDesc output = {SECBUFFER_VERSION, 1, &output_buffer}; DWORD attributes = 0; TimeStamp expiry;
+    SECURITY_STATUS status = InitializeSecurityContextW(&client->credentials, &client->context, NULL, ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM, 0, SECURITY_NATIVE_DREP, NULL, 0, NULL, &output, &attributes, &expiry);
+    if ((status == SEC_E_OK || status == SEC_I_CONTEXT_EXPIRED) && output_buffer.pvBuffer != NULL) encore_windows_send_all(client->socket, output_buffer.pvBuffer, output_buffer.cbBuffer);
+    if (output_buffer.pvBuffer != NULL) FreeContextBuffer(output_buffer.pvBuffer);
+    DeleteSecurityContext(&client->context); FreeCredentialsHandle(&client->credentials); closesocket(client->socket); free(client->plain); free(client); return 0;
+}
+#else
+size_t encore_tls_client_connect(encore_str host, size_t port, encore_str ca_file, size_t timeout_ms) {
+    (void)host; (void)port; (void)ca_file; (void)timeout_ms;
+    encore_set_net_error_cstr("system TLS backend is not implemented on this platform");
+    return 0;
+}
+encore_str encore_tls_read(size_t handle, size_t max) { (void)handle; (void)max; return encore_empty_str(); }
+bool encore_tls_read_failed(size_t handle) { (void)handle; return true; }
+int32_t encore_tls_write(size_t handle, encore_str data) { (void)handle; (void)data; return -1; }
+int32_t encore_tls_close(size_t handle) { (void)handle; return 0; }
+#endif
 
 int32_t encore_proc_exit(int32_t code) {
     /* The Encore standard library also exports a function named `exit`.
