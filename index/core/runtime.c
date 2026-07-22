@@ -1846,7 +1846,10 @@ encore_str encore_tls_read(size_t handle, size_t max) {
     OSStatus status = SSLRead(client->context, buffer, max, &count);
     if (count > 0) return encore_from_owned_buffer(buffer, count);
     free(buffer);
-    if (status != errSSLClosedGraceful) { client->read_failed = true; encore_set_net_error_cstr(status == errSSLWouldBlock ? "TLS read timed out" : "TLS read failed"); }
+    if (status != errSSLClosedGraceful && status != errSSLClosedNoNotify) {
+        client->read_failed = true;
+        encore_set_net_error_cstr(status == errSSLWouldBlock ? "TLS read timed out" : "TLS read failed");
+    }
     return encore_empty_str();
 }
 

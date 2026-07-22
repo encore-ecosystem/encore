@@ -10,6 +10,20 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 compiler=$(CDPATH= cd -- "$(dirname -- "$1")" && pwd)/$(basename -- "$1")
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/encore-https.XXXXXX")
 server_pid=
+openssl_bin=$(command -v openssl 2>/dev/null || true)
+if [ -z "$openssl_bin" ]; then
+    for candidate in \
+        "/c/Program Files/OpenSSL/bin/openssl.exe" \
+        "/c/Program Files/OpenSSL-Win64/bin/openssl.exe" \
+        "/c/Program Files/OpenSSL-Win32/bin/openssl.exe"
+    do
+        if [ -x "$candidate" ]; then openssl_bin=$candidate; break; fi
+    done
+fi
+if [ -z "$openssl_bin" ]; then
+    echo "OpenSSL command is required for the local HTTPS test server" >&2
+    exit 1
+fi
 
 cleanup() {
     if [ -n "$server_pid" ]; then kill "$server_pid" 2>/dev/null || true; fi
@@ -23,18 +37,18 @@ extendedKeyUsage=serverAuth
 EOF
 printf 'secure\n' > "$temporary/index.html"
 
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=Encore Test CA" \
-    -keyout "$temporary/ca.key" -out "$temporary/ca.pem" >/dev/null 2>&1
-openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
-    -keyout "$temporary/server.key" -out "$temporary/server.csr" >/dev/null 2>&1
-openssl x509 -req -in "$temporary/server.csr" -CA "$temporary/ca.pem" \
+"$openssl_bin" req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=Encore Test CA" \
+    -keyout "$temporary/ca.key" -out "$temporary/ca.pem" >/dev/null
+"$openssl_bin" req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
+    -keyout "$temporary/server.key" -out "$temporary/server.csr" >/dev/null
+"$openssl_bin" x509 -req -in "$temporary/server.csr" -CA "$temporary/ca.pem" \
     -CAkey "$temporary/ca.key" -CAcreateserial -days 1 \
-    -extfile "$temporary/extensions.cnf" -out "$temporary/server.pem" >/dev/null 2>&1
+    -extfile "$temporary/extensions.cnf" -out "$temporary/server.pem" >/dev/null
 
 # Use a high randomized port and fail before testing if the local server cannot
 # bind. CI machines are isolated, so a collision is exceedingly unlikely.
 port=$((20000 + ($$ % 30000)))
-(cd "$temporary" && exec openssl s_server -quiet -WWW -accept "$port" \
+(cd "$temporary" && exec "$openssl_bin" s_server -quiet -WWW -accept "$port" \
     -cert server.pem -key server.key </dev/null >/dev/null 2>&1) &
 server_pid=$!
 sleep 1
