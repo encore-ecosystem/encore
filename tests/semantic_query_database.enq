@@ -1,0 +1,98 @@
+//! Verifies function-grained incremental semantic queries end to end.
+
+import core::option::Option
+import core::testing::assert
+import refrain::frontend::{AnalysisDatabase, SemanticBody, SymbolId}
+
+fn require_symbol(database: AnalysisDatabase, module_name: str, name: str) -> SymbolId {
+    match database.symbol_id(module_name, name) {
+        Option[SymbolId]::Some(id) => { ret id }
+        Option[SymbolId]::None => { ret SymbolId::invalid() }
+    }
+    ret SymbolId::invalid()
+}
+
+fn require_semantics(database: mut AnalysisDatabase, id: SymbolId) -> SemanticBody {
+    match database.semantic_body(id) {
+        Option[SemanticBody]::Some(body) => { ret body }
+        Option[SemanticBody]::None => { ret SemanticBody::empty() }
+    }
+    ret SemanticBody::empty()
+}
+
+fn main() -> u32 {
+    let mut database = AnalysisDatabase::new()
+    database.set_module("library", "library.enq", "pub fn value() -> u32 { ret 41_u32 }\n")
+    database.set_module("application", "application.enq", "import library::value\nfn consume() -> u32 { let answer = value() ret answer }\nfn independent() -> str { let label = \"ok\" ret label }\n")
+
+    let consume_id = require_symbol(database, "application", "consume")
+    let independent_id = require_symbol(database, "application", "independent")
+    let consume = require_semantics(database, consume_id)
+    let independent = require_semantics(database, independent_id)
+    if !assert(consume.binding_type("answer").unwrap_or("") == "u32") { ret 1_u32 }
+    if !assert(independent.binding_type("label").unwrap_or("") == "str") { ret 2_u32 }
+    if !assert(consume.diagnostics.len() == 0_usize) { ret 3_u32 }
+    if !assert(database.semantic_body_count(consume_id) == 1_usize) { ret 4_u32 }
+    if !assert(database.semantic_body_count(independent_id) == 1_usize) { ret 5_u32 }
+
+    // Repeated queries return the memoized semantic result.
+    require_semantics(database, consume_id)
+    require_semantics(database, independent_id)
+    if !assert(database.semantic_body_count(consume_id) == 1_usize) { ret 6_u32 }
+    if !assert(database.semantic_body_count(independent_id) == 1_usize) { ret 7_u32 }
+
+    // Editing one body preserves the stable declaration IDs and the semantic
+    // result of its unchanged neighbour.
+    database.set_module("application", "application.enq", "import library::value\nfn consume() -> u32 { let answer = value() + 1_u32 ret answer }\nfn independent() -> str { let label = \"ok\" ret label }\n")
+    if !assert(require_symbol(database, "application", "consume").key() == consume_id.key()) { ret 8_u32 }
+    if !assert(database.semantic_body_is_dirty(consume_id)) { ret 9_u32 }
+    if !assert(!database.semantic_body_is_dirty(independent_id)) { ret 10_u32 }
+    require_semantics(database, consume_id)
+    require_semantics(database, independent_id)
+    if !assert(database.semantic_body_count(consume_id) == 2_usize) { ret 11_u32 }
+    if !assert(database.semantic_body_count(independent_id) == 1_usize) { ret 12_u32 }
+
+    // Only the body that reads an imported declaration is invalidated when
+    // that declaration's signature changes.
+    database.set_module("library", "library.enq", "pub fn value() -> u64 { ret 41_u64 }\n")
+    if !assert(database.semantic_body_is_dirty(consume_id)) { ret 13_u32 }
+    if !assert(!database.semantic_body_is_dirty(independent_id)) { ret 14_u32 }
+    let updated = require_semantics(database, consume_id)
+    if !assert(updated.binding_type("answer").unwrap_or("") == "u64") { ret 15_u32 }
+    if !assert(database.semantic_body_count(consume_id) == 3_usize) { ret 16_u32 }
+
+    // Type errors are query values with stable codes and ranges, not process
+    // exits hidden inside EHIR lowering.
+    database.set_module("application", "application.enq", "import library::value\nfn consume() -> u32 { let answer: str = value() ret 0_u32 }\nfn independent() -> str { let label = \"ok\" ret label }\n")
+    let invalid = require_semantics(database, consume_id)
+    if !assert(invalid.diagnostics.len() == 1_usize) { ret 17_u32 }
+    match invalid.diagnostics.get(0_usize) {
+        Option::Some(diagnostic) => {
+            if !assert(diagnostic.code == "type-mismatch") { ret 18_u32 }
+            if !assert(diagnostic.line == 1_usize) { ret 19_u32 }
+        }
+        Option::None => { ret 20_u32 }
+    }
+    if !assert(database.semantic_body_count(independent_id) == 1_usize) { ret 21_u32 }
+
+    // Same-named methods in different impl scopes own independent body queries.
+    let mut methods = AnalysisDatabase::new()
+    methods.set_module("methods", "methods.enq", "struct Left { marker: u32 }\nstruct Right { marker: u32 }\nimpl for Left { fn run(self: Self) -> u32 { let value = 1_u32 ret value } }\nimpl for Right { fn run(self: Self) -> str { let value = \"right\" ret value } }\n")
+    let run_symbols = methods.symbols_named("run")
+    match run_symbols.get(0_usize) {
+        Option::Some(left) => {
+            match run_symbols.get(1_usize) {
+                Option::Some(right) => {
+                    if !assert(require_semantics(methods, left.id).binding_type("value").unwrap_or("") == "u32") { ret 22_u32 }
+                    if !assert(require_semantics(methods, right.id).binding_type("value").unwrap_or("") == "str") { ret 23_u32 }
+                    methods.set_module("methods", "methods.enq", "struct Left { marker: u32 }\nstruct Right { marker: u32 }\nimpl for Left { fn run(self: Self) -> u32 { let value = 2_u32 ret value } }\nimpl for Right { fn run(self: Self) -> str { let value = \"right\" ret value } }\n")
+                    if !assert(methods.semantic_body_is_dirty(left.id)) { ret 24_u32 }
+                    if !assert(!methods.semantic_body_is_dirty(right.id)) { ret 25_u32 }
+                }
+                Option::None => { ret 26_u32 }
+            }
+        }
+        Option::None => { ret 27_u32 }
+    }
+    ret 0_u32
+}

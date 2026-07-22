@@ -97,6 +97,39 @@ set -e
 test "$target_code" -eq 1
 grep -q "unsupported target architecture 'fictional'" "$tmp/target.log"
 
+# The shared semantic query layer must reject a typed body before EHIR
+# lowering, while accepting the equivalent correctly typed project.
+mkdir -p "$tmp/semantic-valid/src" "$tmp/semantic-invalid/src"
+cat > "$tmp/semantic-valid/encore.toml" <<'EOF'
+[project]
+name = "semantic_valid"
+version = "0.0.0"
+dependencies = []
+EOF
+cat > "$tmp/semantic-valid/src/main.enq" <<'EOF'
+fn value() -> u32 { ret 42_u32 }
+fn main() -> u32 { let answer: u32 = value() ret answer }
+EOF
+cp "$tmp/semantic-valid/encore.toml" "$tmp/semantic-invalid/encore.toml"
+sed 's/semantic_valid/semantic_invalid/' "$tmp/semantic-invalid/encore.toml" > "$tmp/semantic-invalid/encore.toml.next"
+mv "$tmp/semantic-invalid/encore.toml.next" "$tmp/semantic-invalid/encore.toml"
+cat > "$tmp/semantic-invalid/src/main.enq" <<'EOF'
+fn value() -> u32 { ret 42_u32 }
+fn main() -> u32 { let answer: str = value() ret 0_u32 }
+EOF
+(cd "$tmp/semantic-valid" && "$compiler" build) > "$tmp/semantic-valid.log" 2>&1
+set +e
+(cd "$tmp/semantic-invalid" && "$compiler" build) > "$tmp/semantic-invalid.log" 2>&1
+semantic_invalid_code=$?
+set -e
+test "$semantic_invalid_code" -eq 1
+grep -q 'error\[type-mismatch\]' "$tmp/semantic-invalid.log"
+grep -q 'semantic checks failed' "$tmp/semantic-invalid.log"
+if grep -q 'Compiling semantic_invalid' "$tmp/semantic-invalid.log"; then
+    echo "semantic diagnostics must stop the build before EHIR lowering" >&2
+    exit 1
+fi
+
 mkdir -p "$tmp/dependency/src" "$tmp/project/src"
 cat > "$tmp/dependency/encore.toml" <<'EOF'
 [project]

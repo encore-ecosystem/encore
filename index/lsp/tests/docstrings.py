@@ -58,7 +58,10 @@ def main() -> None:
 pub fn connect() -> u32 { ret 0_u32 }
 """
         main_source = """import doc_hover::net::connect
-fn main() -> u32 { ret connect() }
+fn main() -> u32 {
+    let answer = connect()
+    ret answer
+}
 """
         net_path = source_dir / "net.enq"
         main_path = source_dir / "main.enq"
@@ -107,7 +110,7 @@ fn main() -> u32 { ret connect() }
                     },
                 )
 
-            character = main_source.splitlines()[1].index("connect") + 2
+            character = main_source.splitlines()[2].index("connect") + 2
             send_message(
                 process,
                 {
@@ -116,7 +119,7 @@ fn main() -> u32 { ret connect() }
                     "method": "textDocument/hover",
                     "params": {
                         "textDocument": {"uri": main_path.as_uri()},
-                        "position": {"line": 1, "character": character},
+                        "position": {"line": 2, "character": character},
                     },
                 },
             )
@@ -128,8 +131,26 @@ fn main() -> u32 { ret connect() }
             assert "Opens a connection." in value, value
             assert "# Errors" in value, value
 
-            send_message(process, {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": None})
-            response_for(process, 3)
+            send_message(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "textDocument/inlayHint",
+                    "params": {
+                        "textDocument": {"uri": main_path.as_uri()},
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 4, "character": 0},
+                        },
+                    },
+                },
+            )
+            hints = response_for(process, 3)["result"]
+            assert any(hint.get("label") == ": u32" for hint in hints), hints
+
+            send_message(process, {"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": None})
+            response_for(process, 4)
             send_message(process, {"jsonrpc": "2.0", "method": "exit", "params": None})
             assert process.stdin is not None
             process.stdin.close()
@@ -145,4 +166,4 @@ fn main() -> u32 { ret connect() }
 
 if __name__ == "__main__":
     main()
-    print("docstring hover integration: ok")
+    print("docstring hover and semantic inlay integration: ok")

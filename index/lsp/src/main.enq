@@ -1156,23 +1156,24 @@ fn completion_trigger_characters() -> Json {
     ret Json::Array(values)
 }
 
-fn inlay_hint_result(state: ServerState, params: Json) -> Json {
+fn inlay_hint_result(state: mut ServerState, params: Json) -> Json {
     let uri = request_uri(params)
     match state.document(uri) {
         Option[Document]::Some(doc) => {
             let range = json_get(params, "range")
             let start_line = json_number_usize(json_get(json_get(range, "start"), "line"), 0_usize)
             let end_line = json_number_usize(json_get(json_get(range, "end"), "line"), document_last_line(doc.text))
-            ret inferred_let_hints(doc, start_line, end_line)
+            ret inferred_let_hints(state, doc, start_line, end_line)
         }
         Option[Document]::None => {}
     }
     ret Json::Array(Vec[Json]::new())
 }
 
-fn inferred_let_hints(doc: Document, start_line: usize, end_line: usize) -> Json {
+fn inferred_let_hints(state: mut ServerState, doc: Document, start_line: usize, end_line: usize) -> Json {
     let mut hints = Vec[Json]::new()
     let mut bindings = Vec[InferredBinding]::new()
+    let module_name = analysis_module_name(state, doc.uri)
     let mut index = 0_usize
     while index < doc.analysis.tokens.len() {
         match doc.analysis.tokens.get(index) {
@@ -1185,7 +1186,7 @@ fn inferred_let_hints(doc: Document, start_line: usize, end_line: usize) -> Json
                             Some(name_token) => {
                                 let after_name = name_index + 1_usize
                                 if !token_has_type(doc, after_name, TokenType::COLON) && token_has_type(doc, after_name, TokenType::ASSIGN) {
-                                    let inferred_type = infer_expression_type(doc, after_name + 1_usize, bindings).unwrap_or("")
+                                    let inferred_type = state.analysis.semantic_binding_type(module_name, name_token.value, name_token.line).unwrap_or(infer_expression_type(doc, after_name + 1_usize, bindings).unwrap_or(""))
                                     if inferred_type != "" {
                                         bindings.push(InferredBinding{name_token.value, inferred_type})
                                         if name_token.line >= start_line && name_token.line <= end_line {
@@ -4114,10 +4115,15 @@ fn symbol_completion_kind(symbol_kind: usize) -> usize {
     ret 9_usize
 }
 
-fn document_diagnostics_json(state: ServerState, doc: Document) -> Vec[Json] {
+fn document_diagnostics_json(state: mut ServerState, doc: Document) -> Vec[Json] {
     let mut items = diagnostics_to_lsp(doc, doc.analysis.diagnostics)
     let analyzer_diagnostics = analyzer_frontend_diagnostics(analyze_document(doc.uri, doc.analysis, AnalyzerConfig::new()))
     items.extend(diagnostics_to_lsp(doc, analyzer_diagnostics))
+    if doc.analysis.diagnostics.len() == 0_usize {
+        let module_name = analysis_module_name(state, doc.uri)
+        let typed_diagnostics = state.analysis.module_semantic_diagnostics(module_name)
+        items.extend(diagnostics_to_lsp(doc, typed_diagnostics))
+    }
     let semantic = semantic_diagnostics(state, doc)
     let mut index = 0_usize
     while index < semantic.len() {
@@ -4568,7 +4574,7 @@ fn lsp_diagnostic_to_json(diagnostic: LspDiagnostic) -> Json {
     ret Json::Object(fields)
 }
 
-fn document_diagnostic_result(state: ServerState, params: Json) -> Json {
+fn document_diagnostic_result(state: mut ServerState, params: Json) -> Json {
     let uri = request_uri(params)
     let mut fields = Vec[(str, Json)]::new()
     fields.push(field("kind", Json::String("full")))
@@ -4589,7 +4595,7 @@ fn workspace_diagnostic_result(_state: ServerState) -> Json {
     ret Json::Object(fields)
 }
 
-fn publish_diagnostics_for_uri(state: ServerState, uri: str) -> () {
+fn publish_diagnostics_for_uri(state: mut ServerState, uri: str) -> () {
     match state.document(uri) {
         Option[Document]::Some(doc) => {
             send_notification("textDocument/publishDiagnostics", publish_diagnostics_params(uri, document_diagnostics_json(state, doc)))
