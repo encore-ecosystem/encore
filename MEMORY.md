@@ -68,13 +68,15 @@ README or `docs/` page.
 
 ## Likely implementation order
 
-1. Structured docstrings and the reusable incremental analysis database. This
-   is the explicitly selected next major direction.
-2. Check/type diagnostics, linting, formatting and LSP migration onto it.
-3. Minimal native AI IDE with a stable plugin host.
-4. Graphene integration plugin and agent-facing scene tools.
-5. Async runtime plus TCP/UDP/DNS and a blocking facade.
-6. TLS/HTTP, then the typed web framework.
+1. Build structured docstrings, the reusable incremental analysis database,
+   check/type diagnostics, linting, formatting, and the corresponding LSP
+   migration together in one feature branch. Keep these as separately tested,
+   reviewable layers inside the branch, but deliver them as one coherent
+   vertical tooling foundation.
+2. Minimal native AI IDE with a stable plugin host.
+3. Graphene integration plugin and agent-facing scene tools.
+4. Async runtime plus TCP/UDP/DNS and a blocking facade.
+5. TLS/HTTP, then the typed web framework.
 
 This ordering is a working preference, not an immutable specification. Update
 it when measurements or implementation constraints suggest a better path.
