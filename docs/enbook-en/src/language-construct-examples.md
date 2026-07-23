@@ -162,10 +162,6 @@ let whole = twice!(half)
 let negated = -4_i32
 let unchanged = +4_i32
 let inverted = !false
-let complemented = ~0_u32
-let mut cursor = 0_usize
-let next = ++cursor
-let previous = --cursor
 
 let arithmetic = (2_u32 + 3_u32) * 4_u32 / 2_u32
 let remainder = arithmetic % 3_u32
