@@ -1,21 +1,27 @@
-//! Implements the `encore analyze` command.
+//! Implements `encore lint` and its deprecated `analyze` alias.
 
 import core::fmt::Debug
 import core::option::Option
 import core::io::eprintln
 import std::io::println
-import std::os::{argc, argv, file_exists, read_file}
+import std::os::{argc, argv, file_exists, read_file, write_file}
 import std::path::Path
 import std::vec::Vec
 
 import json::{Json, field, stringify}
-import toml::{toml_get_string, toml_parse_document, toml_section_keys}
-import refrain::analyzer::{AnalyzerConfig, AnalyzerDiagnostic, RuleLevel, analyze_document, rule_is_known}
+import toml::{TomlDocument, toml_get_string, toml_parse_document, toml_section_keys}
+import refrain::analyzer::{AnalyzerConfig, AnalyzerDiagnostic, RuleLevel, lint_source_document, fix_source, rule_is_known}
 import refrain::frontend::{AnalysisDatabase, FrontendDocument}
 import refrain::project::{ProjectWorkspace, load_binary_workspace, load_library_workspace}
 
 /// Runs the shared analyzer over a project or selected source file.
 pub fn native_analyze() -> u32 {
+    eprintln("warning: 'encore analyze' is deprecated; use 'encore lint'")
+    ret native_lint()
+}
+
+/// Runs the shared linter over a project or selected source file.
+pub fn native_lint() -> u32 {
     let mut root = Path::new(".").resolve()
     let selected = analyze_path()
     if selected != "" && !ends_with(selected, ".enq") { root = Path::new(selected).resolve() }
@@ -31,23 +37,46 @@ pub fn native_analyze() -> u32 {
 
     let mut diagnostics = Vec[AnalyzerDiagnostic]::new()
     let mut module_count = 0_usize
+    let mut fixed_count = 0_usize
+    let apply_fixes = has_option("--fix")
     if selected != "" && ends_with(selected, ".enq") {
         let path = Path::new(selected).resolve()
         if !file_exists(path.as_str()) { eprintln("Error: analyzer path does not exist: " + selected) ret 2_u32 }
+        let mut source = read_file(path.as_str())
+        if apply_fixes {
+            let fixed = fix_source(source, config)
+            if fixed != source {
+                if write_file(path.as_str(), fixed) != 0_i32 { eprintln("Error: unable to write " + path.as_str()) ret 2_u32 }
+                source = fixed
+                fixed_count += 1_usize
+            }
+        }
         let mut database = AnalysisDatabase::new()
-        database.set_module_full(path.as_str(), path.as_str(), read_file(path.as_str()))
+        database.set_module_full(path.as_str(), path.as_str(), source)
         let document = match database.document(path.as_str()) {
             Option[FrontendDocument]::Some(value) => value
             Option[FrontendDocument]::None => FrontendDocument::empty()
         }
-        diagnostics.extend(analyze_document(path.as_str(), document, config))
+        diagnostics.extend(lint_source_document(path.as_str(), source, document, config))
         module_count = 1_usize
     } else {
         if !file_exists(root.join("encore.toml").as_str()) { eprintln("error[manifest]: Unable to find encore.toml at " + root.join("encore.toml").as_str()) ret 1_u32 }
-        let workspace = load_analysis_workspace(root)
+        let mut workspace = load_analysis_workspace(root)
+        if apply_fixes {
+            for module in workspace.modules {
+                if module.owner_name == workspace.root_name {
+                    let fixed = fix_source(module.source, config)
+                    if fixed != module.source {
+                        if write_file(module.path(), fixed) != 0_i32 { eprintln("Error: unable to write " + module.path()) ret 2_u32 }
+                        fixed_count += 1_usize
+                    }
+                }
+            }
+            if fixed_count > 0_usize { workspace = load_analysis_workspace(root) }
+        }
         for module in workspace.modules {
             if module.owner_name == workspace.root_name {
-                diagnostics.extend(analyze_document(module.path(), module.analysis, config))
+                diagnostics.extend(lint_source_document(module.path(), module.source, module.analysis, config))
                 module_count += 1_usize
             }
         }
@@ -60,8 +89,12 @@ pub fn native_analyze() -> u32 {
         else { print_diagnostic(diagnostic) }
     }
     if format != "json" {
+        if apply_fixes {
+            let fixed_suffix = if fixed_count == 1_usize { "" } else { "s" }
+            println("Fixed " + Debug::fmt(fixed_count) + " file" + fixed_suffix)
+        }
         let suffix = if module_count == 1_usize { "" } else { "s" }
-        println("Analyzed " + Debug::fmt(module_count) + " module" + suffix)
+        println("Linted " + Debug::fmt(module_count) + " module" + suffix)
     }
     if denied { ret 1_u32 }
     ret 0_u32
@@ -76,16 +109,21 @@ fn load_manifest_config(root: Path, config: mut AnalyzerConfig) -> bool {
     let path = root.join("encore.toml")
     if !file_exists(path.as_str()) { ret true }
     let document = toml_parse_document(read_file(path.as_str()))
-    for code in toml_section_keys(document, "analyzer.rules") {
-        if !rule_is_known(code) { eprintln("Error: unknown analyzer rule '" + code + "'") ret false }
-        match toml_get_string(document, "analyzer.rules", code) {
+    if !load_rule_section(document, "analyzer.rules", config) { ret false }
+    ret load_rule_section(document, "lint.rules", config)
+}
+
+fn load_rule_section(document: TomlDocument, section: str, config: mut AnalyzerConfig) -> bool {
+    for code in toml_section_keys(document, section) {
+        if !rule_is_known(code) { eprintln("Error: unknown lint rule '" + code + "'") ret false }
+        match toml_get_string(document, section, code) {
             Option[str]::Some(value) => {
                 match parse_level(value) {
                     Option[RuleLevel]::Some(level) => { config.set_level(code, level) }
-                    Option[RuleLevel]::None => { eprintln("Error: invalid analyzer level '" + value + "' for " + code) ret false }
+                    Option[RuleLevel]::None => { eprintln("Error: invalid lint level '" + value + "' for " + code) ret false }
                 }
             }
-            Option[str]::None => { eprintln("Error: analyzer rule '" + code + "' must be a string") ret false }
+            Option[str]::None => { eprintln("Error: lint rule '" + code + "' must be a string") ret false }
         }
     }
     ret true
@@ -97,7 +135,7 @@ fn apply_cli_levels(config: mut AnalyzerConfig) -> bool {
         let arg = argument(index)
         if arg == "--allow" || arg == "--warn" || arg == "--deny" {
             if index + 1_usize >= argc() { ret false }
-            if !rule_is_known(argument(index + 1_usize)) { eprintln("Error: unknown analyzer rule '" + argument(index + 1_usize) + "'") ret false }
+            if !rule_is_known(argument(index + 1_usize)) { eprintln("Error: unknown lint rule '" + argument(index + 1_usize) + "'") ret false }
             let level = if arg == "--allow" { RuleLevel::Allow } elif arg == "--warn" { RuleLevel::Warn } else { RuleLevel::Deny }
             config.set_level(argument(index + 1_usize), level)
             index += 1_usize
@@ -136,10 +174,20 @@ fn analyze_path() -> str {
     while index < argc() {
         let arg = argument(index)
         if arg == "--allow" || arg == "--warn" || arg == "--deny" || arg == "--format" { index += 1_usize }
+        elif arg == "--fix" {}
         elif !starts_with(arg, "-") { ret arg }
         index += 1_usize
     }
     ret ""
+}
+
+fn has_option(name: str) -> bool {
+    let mut index = 2_usize
+    while index < argc() {
+        if argument(index) == name { ret true }
+        index += 1_usize
+    }
+    ret false
 }
 
 fn option_value(name: str) -> str {

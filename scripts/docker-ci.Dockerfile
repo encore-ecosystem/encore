@@ -21,6 +21,7 @@ RUN sed -i \
         lld \
         llvm \
         openssl \
+        python3 \
         unzip \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*

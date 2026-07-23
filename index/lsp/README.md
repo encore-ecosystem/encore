@@ -24,7 +24,8 @@ Current server capabilities:
 - `textDocument/foldingRange` for brace-delimited blocks.
 - `textDocument/selectionRange` for identifier selections.
 - `textDocument/semanticTokens/full` for lexical semantic highlighting.
-- `textDocument/formatting` and `textDocument/rangeFormatting` for trailing whitespace cleanup.
+- `textDocument/formatting` and `textDocument/rangeFormatting` through the same
+  deterministic lossless formatter used by `encore format`.
 - Push and per-document pull diagnostics for lexer, structural and basic semantic errors, including unresolved imports, unresolved calls, unknown types and call arity mismatches. The native docstring analyzer also reports `missing-module-docstring` and `missing-public-docstring` warnings.
 - `textDocument/prepareCallHierarchy`, `callHierarchy/outgoingCalls`, `callHierarchy/incomingCalls` for callable symbols.
 

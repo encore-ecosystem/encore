@@ -69,29 +69,38 @@ compiler analysis API, EHIR module metadata and language-server hover,
 including hover for symbols reached through imports. Ordinary `//` and
 `/* ... */` comments are not documentation.
 
-Run the shared analyzer without compiling the project:
+Use the shared tooling database without compiling the project:
 
 ```sh
-encore analyze
-encore analyze src/net/mod.enq
-encore analyze --deny missing-public-docstring
-encore analyze --format json
+encore check
+encore lint
+encore lint src/net/mod.enq
+encore lint --deny missing-public-docstring
+encore lint --format json
+encore format --check
+encore format
 ```
 
-Analyzer rules default to warnings. Configure persistent levels in
+`check` reports parser, declaration and type diagnostics without generating
+EHIR, object files or a `target` directory. `format --check` reports formatting
+drift without writing files; plain `format` applies the deterministic style.
+
+Lint rules default to warnings. Configure persistent levels in
 `encore.toml`; command-line levels take precedence:
 
 ```toml
-[analyzer.rules]
+[lint.rules]
 all = "warn"
 missing-module-docstring = "allow"
 missing-public-docstring = "deny"
 ```
 
 `allow` disables a rule, `warn` reports it without failing the command, and
-`deny` reports an error and makes `encore analyze` return exit status 1. The
-same analyzer engine supplies LSP diagnostics, so rule behavior does not
-diverge between the command line and editors.
+`deny` reports an error and makes `encore lint` return exit status 1. The same
+analysis and formatting queries supply compiler and LSP behavior, so diagnostic
+codes and formatting do not diverge between the command line and editors.
+`encore analyze` remains a deprecated compatibility alias for `encore lint`
+and prints a warning on every invocation.
 
 ## Values And Mutability
 

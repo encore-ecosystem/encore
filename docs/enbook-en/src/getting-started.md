@@ -61,7 +61,9 @@ encore sync
 encore build
 encore run
 encore test
-encore analyze
+encore check
+encore lint
+encore format --check
 encore add <package>
 encore update
 encore self update
@@ -101,7 +103,8 @@ Common flags:
 ```sh
 encore run -- arg1 arg2
 encore test --filter dict
-encore analyze --deny missing-public-docstring
+encore lint --deny missing-public-docstring
+encore format
 encore build --profile release
 encore build --target aarch64-unknown-linux-gnu
 ```

@@ -2,7 +2,7 @@
 
 import core::option::Option
 import std::vec::Vec
-import refrain::frontend::{FrontendDocument, FrontendDiagnostic, Statement, Token, TokenType}
+import refrain::frontend::{FrontendDocument, FrontendDiagnostic, Lexer, Statement, Token, TokenType}
 import refrain::frontend::parser::Documentation
 
 /// Selects whether a rule is disabled, emits a warning, or emits an error.
@@ -26,7 +26,7 @@ pub struct AnalyzerDiagnostic {
 
 /// Returns whether a selector names a built-in rule or the `all` group.
 pub fn rule_is_known(code: str) -> bool {
-    ret code == "all" || code == "missing-module-docstring" || code == "missing-public-docstring"
+    ret code == "all" || code == "missing-module-docstring" || code == "missing-public-docstring" || code == "trailing-whitespace"
 }
 
 impl for AnalyzerConfig {
@@ -35,6 +35,7 @@ impl for AnalyzerConfig {
         let mut settings = Vec[RuleSetting]::new()
         settings.push(RuleSetting{"missing-module-docstring", RuleLevel::Warn})
         settings.push(RuleSetting{"missing-public-docstring", RuleLevel::Warn})
+        settings.push(RuleSetting{"trailing-whitespace", RuleLevel::Warn})
         ret Self{settings}
     }
 
@@ -66,9 +67,44 @@ impl for AnalyzerConfig {
 
 /// Runs all enabled rules over an already parsed frontend document.
 pub fn analyze_document(path: str, document: FrontendDocument, config: AnalyzerConfig) -> Vec[AnalyzerDiagnostic] {
+    ret analyze_source_document(path, "", document, config)
+}
+
+/// Runs all enabled rules with access to the exact source representation.
+pub fn analyze_source_document(path: str, source: str, document: FrontendDocument, config: AnalyzerConfig) -> Vec[AnalyzerDiagnostic] {
     let mut out = Vec[AnalyzerDiagnostic]::new()
     emit_module_docstring(path, document, config, out)
     emit_public_docstrings(path, document, config, out)
+    if source != "" { emit_trailing_whitespace(path, source, config, out) }
+    ret out
+}
+
+/// Runs lint rules and includes fatal frontend diagnostics in the same stream.
+pub fn lint_source_document(path: str, source: str, document: FrontendDocument, config: AnalyzerConfig) -> Vec[AnalyzerDiagnostic] {
+    let mut out = Vec[AnalyzerDiagnostic]::new()
+    for diagnostic in document.diagnostics {
+        out.push(AnalyzerDiagnostic{path, RuleLevel::Deny, diagnostic.code, diagnostic.message, diagnostic.line, diagnostic.column, diagnostic.length})
+    }
+    out.extend(analyze_source_document(path, source, document, config))
+    ret out
+}
+
+/// Applies all enabled, semantics-preserving analyzer fixes.
+pub fn fix_source(source: str, config: AnalyzerConfig) -> str {
+    if config.level("trailing-whitespace") == RuleLevel::Allow { ret source }
+    let mut lexer = Lexer::new()
+    let tokens = lexer.tokenize_lossless(source)
+    let mut out = ""
+    let mut index = 0_usize
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Option[Token]::Some(token) => {
+                if token.type != TokenType::WHITESPACE || !trivia_run_ends_line(tokens, index) { out += token.value }
+            }
+            Option[Token]::None => {}
+        }
+        index += 1_usize
+    }
     ret out
 }
 
@@ -157,6 +193,67 @@ fn emit_public_docstrings(path: str, document: FrontendDocument, config: Analyze
         }
     }
     ret ()
+}
+
+fn emit_trailing_whitespace(path: str, source: str, config: AnalyzerConfig, out: mut Vec[AnalyzerDiagnostic]) -> () {
+    let level = config.level("trailing-whitespace")
+    if level == RuleLevel::Allow { ret () }
+    let mut lexer = Lexer::new()
+    let tokens = lexer.tokenize_lossless(source)
+    let mut index = 0_usize
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Option[Token]::Some(token) => {
+                if token.type == TokenType::WHITESPACE && trivia_run_ends_line(tokens, index) && !previous_is_whitespace(tokens, index) {
+                    let length = whitespace_run_length(tokens, index)
+                    out.push(AnalyzerDiagnostic{path, level, "trailing-whitespace", "trailing whitespace", token.line, token.column, length})
+                }
+            }
+            Option[Token]::None => {}
+        }
+        index += 1_usize
+    }
+    ret ()
+}
+
+fn trivia_run_ends_line(tokens: Vec[Token], start: usize) -> bool {
+    let mut index = start
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Option[Token]::Some(token) => {
+                if token.type == TokenType::WHITESPACE { index += 1_usize continue }
+                ret token.type == TokenType::NEWLINE
+            }
+            Option[Token]::None => {}
+        }
+        ret true
+    }
+    ret true
+}
+
+fn previous_is_whitespace(tokens: Vec[Token], index: usize) -> bool {
+    if index == 0_usize { ret false }
+    match tokens.get(index - 1_usize) {
+        Option[Token]::Some(token) => { ret token.type == TokenType::WHITESPACE }
+        Option[Token]::None => {}
+    }
+    ret false
+}
+
+fn whitespace_run_length(tokens: Vec[Token], start: usize) -> usize {
+    let mut index = start
+    let mut length = 0_usize
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Option[Token]::Some(token) => {
+                if token.type != TokenType::WHITESPACE { break }
+                length += token.value.char_len()
+            }
+            Option[Token]::None => { break }
+        }
+        index += 1_usize
+    }
+    ret length
 }
 
 fn has_documentation(documentation: Option[Documentation]) -> bool {

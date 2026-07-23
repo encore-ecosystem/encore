@@ -13,7 +13,9 @@ import refrain::frontend::analysis::analyze_module_lightweight
 import refrain::frontend::lexer::Token
 import refrain::frontend::lexer::TokenType
 import refrain::frontend::parser::{FunctionItem, Statement}
-import refrain::frontend::semantic::{SemanticBody, SemanticCallable, SemanticDependency, check_function_body, check_module_bodies}
+import refrain::frontend::semantic::{SemanticBody, SemanticCallable, SemanticDependency, check_function_body, check_module_bodies, check_module_declarations}
+import refrain::frontend::syntax::SyntaxDocument
+import refrain::target::{TargetSpec, host_target}
 
 /// Deterministic identity of a module across analysis database instances.
 pub struct ModuleId { raw: u64 key: str }
@@ -42,6 +44,9 @@ struct AnalysisSource {
     analysis_revision: usize
     lightweight_count: usize
     parse_count: usize
+    syntax: SyntaxDocument
+    syntax_dirty: bool
+    syntax_count: usize
 }
 
 struct SemanticBodyCache {
@@ -141,7 +146,10 @@ impl for AnalysisDatabase {
                             true,
                             entry.analysis_revision,
                             entry.lightweight_count + 1_usize,
-                            entry.parse_count
+                            entry.parse_count,
+                            SyntaxDocument::empty(),
+                            true,
+                            entry.syntax_count
                         })
                         if interface_changed { self.invalidate_dependents(module_name) }
                         ret ()
@@ -169,6 +177,9 @@ impl for AnalysisDatabase {
             true,
             0_usize,
             1_usize,
+            0_usize,
+            SyntaxDocument::empty(),
+            true,
             0_usize
         })
         self.invalidate_dependents(module_name)
@@ -206,7 +217,10 @@ impl for AnalysisDatabase {
                             false,
                             self.revision,
                             entry.lightweight_count,
-                            entry.parse_count + 1_usize
+                            entry.parse_count + 1_usize,
+                            SyntaxDocument::empty(),
+                            true,
+                            entry.syntax_count
                         })
                         if interface_changed { self.invalidate_dependents(module_name) }
                         ret ()
@@ -234,7 +248,10 @@ impl for AnalysisDatabase {
             false,
             self.revision,
             0_usize,
-            1_usize
+            1_usize,
+            SyntaxDocument::empty(),
+            true,
+            0_usize
         })
         self.invalidate_dependents(module_name)
         ret ()
@@ -282,7 +299,10 @@ impl for AnalysisDatabase {
                             false,
                             self.revision,
                             entry.lightweight_count,
-                            entry.parse_count + 1_usize
+                            entry.parse_count + 1_usize,
+                            entry.syntax,
+                            entry.syntax_dirty,
+                            entry.syntax_count
                         })
                         ret Option[FrontendDocument]::Some(document)
                     }
@@ -300,6 +320,59 @@ impl for AnalysisDatabase {
             if entry.module_name == module_name { ret Option[FrontendDocument]::Some(entry.lightweight) }
         }
         ret Option[FrontendDocument]::None
+    }
+
+    /// Returns the exact source registered for a module.
+    pub fn source_text(self: Self, module_name: str) -> Option[str] {
+        for entry in self.sources {
+            if entry.module_name == module_name { ret Option[str]::Some(entry.source) }
+        }
+        ret Option[str]::None
+    }
+
+    /// Returns a lazily computed lossless syntax query.
+    pub fn syntax_document(self: mut Self, module_name: str) -> Option[SyntaxDocument] {
+        let mut index = 0_usize
+        while index < self.sources.len() {
+            match self.sources.get(index) {
+                Option[AnalysisSource]::Some(entry) => {
+                    if entry.module_name == module_name {
+                        if !entry.syntax_dirty { ret Option[SyntaxDocument]::Some(entry.syntax) }
+                        let syntax = SyntaxDocument::parse(entry.source)
+                        self.sources.set(index, AnalysisSource{
+                            entry.id,
+                            entry.module_name,
+                            entry.source_name,
+                            entry.source,
+                            entry.source_fingerprint,
+                            entry.interface_fingerprint,
+                            entry.interface_revision,
+                            entry.lightweight,
+                            entry.full,
+                            entry.full_dirty,
+                            entry.analysis_revision,
+                            entry.lightweight_count,
+                            entry.parse_count,
+                            syntax,
+                            false,
+                            entry.syntax_count + 1_usize
+                        })
+                        ret Option[SyntaxDocument]::Some(syntax)
+                    }
+                }
+                Option[AnalysisSource]::None => {}
+            }
+            index += 1_usize
+        }
+        ret Option[SyntaxDocument]::None
+    }
+
+    /// Returns how often the lossless syntax query was recomputed.
+    pub fn module_syntax_count(self: Self, module_name: str) -> usize {
+        for entry in self.sources {
+            if entry.module_name == module_name { ret entry.syntax_count }
+        }
+        ret 0_usize
     }
 
     /// Returns whether the module's full-document query must be recomputed.
@@ -486,6 +559,12 @@ impl for AnalysisDatabase {
     /// Returns cached semantic diagnostics for all top-level function bodies
     /// in a module. Compiler and editor clients consume this same query.
     pub fn module_semantic_diagnostics(self: mut Self, module_name: str) -> Vec[FrontendDiagnostic] {
+        ret self.module_semantic_diagnostics_for_target(module_name, host_target(), Vec[str]::new())
+    }
+
+    /// Returns the shared semantic diagnostics for a concrete compilation
+    /// target and enabled feature set.
+    pub fn module_semantic_diagnostics_for_target(self: mut Self, module_name: str, target: TargetSpec, features: Vec[str]) -> Vec[FrontendDiagnostic] {
         let callables = self.visible_semantic_callables(module_name)
         let document = match self.stored_full_document(module_name) {
             Option[FrontendDocument]::Some(value) => value
@@ -496,7 +575,9 @@ impl for AnalysisDatabase {
                 }
             }
         }
-        ret check_module_bodies(document.ast, callables)
+        let mut diagnostics = check_module_declarations(document.ast, target, features)
+        diagnostics.extend(check_module_bodies(document.ast, callables))
+        ret diagnostics
     }
 
     /// Returns the semantic type of a local binding at a source line.
@@ -629,7 +710,10 @@ impl for AnalysisDatabase {
                                     true,
                                     entry.analysis_revision,
                                     entry.lightweight_count,
-                                    entry.parse_count
+                                    entry.parse_count,
+                                    entry.syntax,
+                                    entry.syntax_dirty,
+                                    entry.syntax_count
                                 })
                             }
                             if !contains_string(changed, entry.module_name) { changed.push(entry.module_name) }

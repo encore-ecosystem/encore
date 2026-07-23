@@ -9,7 +9,9 @@ import encore::frontend::DependencyEdge
 import encore::frontend::FrontendCallable
 import encore::frontend::AnalysisDatabase
 import encore::frontend::analyze_source_lightweight
-import encore::analyzer::{AnalyzerConfig, analyze_document, analyzer_frontend_diagnostics}
+import encore::analyzer::{AnalyzerConfig, analyze_source_document, analyzer_frontend_diagnostics}
+import encore::formatter::{FormatConfig, format_syntax}
+import encore::frontend::SyntaxDocument
 import encore::frontend::Token
 import encore::frontend::TokenType
 import json::Json
@@ -38,7 +40,6 @@ import mod::text::{
     find_in_line_at_or_after,
     contains_substring,
     document_last_line,
-    trim_trailing_index,
     min_usize,
     is_identifier_name,
     utf16_len,
@@ -3593,53 +3594,30 @@ fn token_is_call(doc: Document, token_index: usize) -> bool {
     }
 }
 
-fn formatting_edits(state: ServerState, params: Json) -> Json {
+fn formatting_edits(state: mut ServerState, params: Json) -> Json {
     let uri = request_uri(params)
     match state.document(uri) {
         Option[Document]::Some(doc) => {
-            let lsp_range = json_get(params, "range")
-            if lsp_range.is_null() {
-                ret Json::Array(trailing_whitespace_edits(doc, 0_usize, document_last_line(doc.text)))
+            let module_name = analysis_module_name(state, doc.uri)
+            let syntax = match state.analysis.syntax_document(module_name) {
+                Option[SyntaxDocument]::Some(value) => value
+                Option[SyntaxDocument]::None => SyntaxDocument::empty()
             }
-            let start = json_get(lsp_range, "start")
-            let end = json_get(lsp_range, "end")
-            let start_line = json_number_usize(json_get(start, "line"), 0_usize)
-            let mut end_line = json_number_usize(json_get(end, "line"), start_line)
-            let end_character = json_number_usize(json_get(end, "character"), 0_usize)
-            if end_character == 0_usize && end_line > start_line {
-                end_line -= 1_usize
+            let result = format_syntax(syntax, doc.analysis.diagnostics, FormatConfig::new())
+            if !result.is_valid() || !result.is_changed() { ret Json::Array(Vec[Json]::new()) }
+            let last_line = document_last_line(doc.text)
+            let mut last_character = 0_usize
+            match line_text_at(doc.text, last_line) {
+                Option[str]::Some(text) => { last_character = utf16_len(text) }
+                Option[str]::None => {}
             }
-            ret Json::Array(trailing_whitespace_edits(doc, start_line, end_line))
+            let mut edits = Vec[Json]::new()
+            edits.push(text_edit(range_between(0_usize, 0_usize, last_line, last_character), result.text()))
+            ret Json::Array(edits)
         }
         Option[Document]::None => {}
     }
     ret Json::Array(Vec[Json]::new())
-}
-
-fn trailing_whitespace_edits(doc: Document, start_line: usize, end_line: usize) -> Vec[Json] {
-    let mut edits = Vec[Json]::new()
-    let last_line = document_last_line(doc.text)
-    let mut line = start_line
-    let mut stop = end_line
-    if stop > last_line {
-        stop = last_line
-    }
-    while line <= stop {
-        match line_text_at(doc.text, line) {
-            Option[str]::Some(text) => {
-                let trimmed = trim_trailing_index(text)
-                if trimmed < text.char_len() {
-                    edits.push(text_edit(range_between(line, utf16_column(text, trimmed), line, utf16_len(text)), ""))
-                }
-            }
-            Option[str]::None => {}
-        }
-        if line == stop {
-            break
-        }
-        line += 1_usize
-    }
-    ret edits
 }
 
 fn identifier_at_request(doc: Document, params: Json) -> Option[Token] {
@@ -4117,7 +4095,7 @@ fn symbol_completion_kind(symbol_kind: usize) -> usize {
 
 fn document_diagnostics_json(state: mut ServerState, doc: Document) -> Vec[Json] {
     let mut items = diagnostics_to_lsp(doc, doc.analysis.diagnostics)
-    let analyzer_diagnostics = analyzer_frontend_diagnostics(analyze_document(doc.uri, doc.analysis, AnalyzerConfig::new()))
+    let analyzer_diagnostics = analyzer_frontend_diagnostics(analyze_source_document(doc.uri, doc.text, doc.analysis, AnalyzerConfig::new()))
     items.extend(diagnostics_to_lsp(doc, analyzer_diagnostics))
     if doc.analysis.diagnostics.len() == 0_usize {
         let module_name = analysis_module_name(state, doc.uri)
@@ -4199,29 +4177,6 @@ fn module_name_matches_import(uri: str, target: str) -> bool {
     ret module_base == last_scope_segment(target)
 }
 
-fn source_declares_symbol(text: str, name: str) -> bool {
-    if source_declares_type(text, name) {
-        ret true
-    }
-    if contains_substring(text, "fn " + name) {
-        ret true
-    }
-    ret false
-}
-
-fn source_declares_type(text: str, name: str) -> bool {
-    if contains_substring(text, "struct " + name) {
-        ret true
-    }
-    if contains_substring(text, "enum " + name) {
-        ret true
-    }
-    if contains_substring(text, "trait " + name) {
-        ret true
-    }
-    ret false
-}
-
 fn imported_type_name_resolves_lightweight(state: ServerState, doc: Document, name: str) -> bool {
     let imports = import_requests_from_doc(doc)
     let mut index = 0_usize
@@ -4299,21 +4254,10 @@ fn type_resolution_status(state: ServerState, doc: Document, token: Token) -> us
 
 fn indexed_symbol_type_status(state: ServerState, name: str) -> usize {
     let mut found_non_type = false
-    for document in state.documents {
-        for symbol in document.analysis.symbols {
-            if symbol.name == name {
-                if symbol.kind == 23_usize || symbol.kind == 10_usize || symbol.kind == 11_usize { ret 1_usize }
-                found_non_type = true
-            }
-        }
-    }
-    for document in state.workspace_documents {
-        for symbol in document.analysis.symbols {
-            if symbol.name == name {
-                if symbol.kind == 23_usize || symbol.kind == 10_usize || symbol.kind == 11_usize { ret 1_usize }
-                found_non_type = true
-            }
-        }
+    for indexed in state.analysis.symbols_named(name) {
+        let symbol = indexed.symbol
+        if symbol.kind == 23_usize || symbol.kind == 10_usize || symbol.kind == 11_usize { ret 1_usize }
+        found_non_type = true
     }
     if found_non_type { ret 2_usize }
     ret 3_usize
@@ -4327,10 +4271,10 @@ fn push_call_diagnostics_for_token(state: ServerState, items: mut Vec[LspDiagnos
         Option[ResolvedReference]::Some(reference) => {
             match reference.callable {
                 Option[FrontendCallable]::Some(callable) => {
-                    let args = call_argument_count(doc, token_index)
-                    if args != callable.params.len() {
-                        items.push(LspDiagnostic{token_range(doc, token), 1_usize, "arity-mismatch", "call to '" + token.value + "' expects " + usize_text(callable.params.len()) + " argument(s), got " + usize_text(args)})
-                    }
+                    // Arity and argument typing are emitted by the shared
+                    // semantic query consumed above.
+                    let _args = call_argument_count(doc, token_index)
+                    let _callable = callable
                 }
                 Option[FrontendCallable]::None => {
                     if !resolved_reference_is_type(reference) {

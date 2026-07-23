@@ -1,11 +1,13 @@
 //! Defines reusable, incremental semantic results for function-body queries.
 
 import core::option::Option
+import core::fmt::Debug
 import std::dict::Hashable
 import std::vec::Vec
 
 import refrain::frontend::analysis::FrontendDiagnostic
-import refrain::frontend::parser::{Expr, ExprNode, FunctionItem, Statement}
+import refrain::frontend::parser::{Expr, ExprNode, FunctionItem, MatchArmBody, Statement}
+import refrain::target::{TargetSpec, cfg_active_with_features}
 
 /// Records the inferred type of a local binding.
 pub struct SemanticBinding {
@@ -76,7 +78,7 @@ pub fn check_function_body(item: FunctionItem, callables: Vec[SemanticCallable])
     let mut ctx = SemanticContext{callables, Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new()}
     for param in item.params {
         match param.typ {
-            Option[str]::Some(typ) => { ctx.bindings.push(SemanticBinding{param.name, typ, item.line, item.column}) }
+            Option[str]::Some(typ) => { ctx.bindings.push(SemanticBinding{param.name, semantic_type_name(typ), item.line, item.column}) }
             Option[str]::None => {}
         }
     }
@@ -110,6 +112,101 @@ pub fn check_module_bodies(ast: Vec[Statement], callables: Vec[SemanticCallable]
     ret out
 }
 
+/// Checks declaration invariants that depend on target and feature selection.
+pub fn check_module_declarations(ast: Vec[Statement], target: TargetSpec, features: Vec[str]) -> Vec[FrontendDiagnostic] {
+    let mut out = Vec[FrontendDiagnostic]::new()
+    let mut names = Vec[str]::new()
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => {
+                if semantic_function_is_active(item, target, features) {
+                    if contains_name(names, item.name) {
+                        out.push(FrontendDiagnostic::new(1_usize, "duplicate-function", "duplicate function declaration '" + item.name + "'", item.line, item.column, item.name.len()))
+                    } else {
+                        names.push(item.name)
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ret out
+}
+
+fn semantic_function_is_active(item: FunctionItem, target: TargetSpec, features: Vec[str]) -> bool {
+    for attr in item.attrs {
+        if contains_substring(attr, "test") { ret false }
+        if starts_with(attr, "cfg:") {
+            let expr = attr.slice(4_usize, attr.len() - 4_usize)
+            if !cfg_active_with_features(target, expr, features) { ret false }
+        }
+    }
+    ret true
+}
+
+fn contains_name(names: Vec[str], name: str) -> bool {
+    for existing in names { if existing == name { ret true } }
+    ret false
+}
+
+fn semantic_type_name(typ: str) -> str {
+    if starts_with(typ, "mut ") { ret typ.slice(4_usize, typ.len() - 4_usize) }
+    ret typ
+}
+
+fn semantic_types_compatible(expected: str, actual: str) -> bool {
+    if expected == actual || expected == "Self" || actual == "Self" { ret true }
+    if generic_placeholder(expected) || generic_placeholder(actual) { ret true }
+    if generic_container_compatible(expected, actual) { ret true }
+    ret false
+}
+
+fn generic_container_compatible(expected: str, actual: str) -> bool {
+    let expected_base = type_base(expected)
+    let actual_base = type_base(actual)
+    if expected_base == "" || expected_base != actual_base { ret false }
+    ret contains_generic_argument(expected) || contains_generic_argument(actual)
+}
+
+fn contains_generic_argument(typ: str) -> bool {
+    let mut index = 0_usize
+    while index < typ.len() {
+        let byte = typ.byte_at(index)
+        if byte >= 65_u8 && byte <= 90_u8 {
+            let previous_ok = index > 0_usize && (typ.byte_at(index - 1_usize) == 91_u8 || typ.byte_at(index - 1_usize) == 44_u8 || typ.byte_at(index - 1_usize) == 32_u8)
+            let next_ok = index + 1_usize >= typ.len() || typ.byte_at(index + 1_usize) == 44_u8 || typ.byte_at(index + 1_usize) == 93_u8 || typ.byte_at(index + 1_usize) == 32_u8
+            if previous_ok && next_ok { ret true }
+        }
+        index += 1_usize
+    }
+    ret false
+}
+
+fn type_base(typ: str) -> str {
+    let mut index = 0_usize
+    while index < typ.len() {
+        if typ.slice(index, 1_usize) == "[" { ret typ.slice(0_usize, index) }
+        index += 1_usize
+    }
+    ret ""
+}
+
+fn starts_with(value: str, prefix: str) -> bool {
+    if prefix.len() > value.len() { ret false }
+    ret value.slice(0_usize, prefix.len()) == prefix
+}
+
+fn contains_substring(value: str, needle: str) -> bool {
+    if needle.len() == 0_usize { ret true }
+    if needle.len() > value.len() { ret false }
+    let mut start = 0_usize
+    while start + needle.len() <= value.len() {
+        if value.slice(start, needle.len()) == needle { ret true }
+        start += 1_usize
+    }
+    ret false
+}
+
 fn check_statements(
     ctx: mut SemanticContext,
     statements: Vec[Statement],
@@ -121,17 +218,89 @@ fn check_statements(
                 let flexible_numeric = expression_is_flexible_numeric(item.expr)
                 let inferred = infer_expression(ctx, item.expr)
                 let declared = item.typ.unwrap_or(inferred)
-                if inferred != "" && declared != inferred && !flexible_numeric {
+                if inferred != "" && !semantic_types_compatible(declared, inferred) && !flexible_numeric {
                     ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "type-mismatch", "cannot initialize '" + item.name + "' of type '" + declared + "' with value of type '" + inferred + "'", item.expr.line, item.expr.column, item.expr.length))
                 }
                 ctx.bindings.push(SemanticBinding{item.name, declared, item.expr.line, item.expr.column})
             }
             Statement::Ret(expr) => {
-                let _actual = infer_expression(ctx, expr)
+                let flexible_numeric = expression_is_flexible_numeric(expr)
+                let actual = infer_expression(ctx, expr)
+                if return_type != "" && return_type != "void" && actual != "" && !semantic_types_compatible(return_type, actual) && !flexible_numeric {
+                    ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "return-type-mismatch", "expected return type '" + return_type + "', found '" + actual + "'", expr.line, expr.column, expr.length))
+                }
             }
             Statement::Expr(expr) => { let _ignored = infer_expression(ctx, expr) }
+            Statement::Assignment(item) => {
+                let target = infer_expression(ctx, item.target)
+                let actual = infer_expression(ctx, item.expr)
+                if target != "" && actual != "" && !semantic_types_compatible(target, actual) && !expression_is_flexible_numeric(item.expr) {
+                    ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "assignment-type-mismatch", "cannot assign value of type '" + actual + "' to target of type '" + target + "'", item.expr.line, item.expr.column, item.expr.length))
+                }
+            }
+            Statement::If(item) => {
+                for branch in item.branches {
+                    check_boolean_condition(ctx, branch.condition)
+                    check_statements(ctx, branch.body.statements, return_type)
+                }
+                match item.else_body {
+                    Option::Some(body) => { check_statements(ctx, body.statements, return_type) }
+                    Option::None => {}
+                }
+            }
+            Statement::Match(item) => {
+                let _matched = infer_expression(ctx, item.expr)
+                let outer_bindings = ctx.bindings
+                for arm in item.arms {
+                    replace_bindings(ctx, outer_bindings)
+                    match arm.pattern.binding {
+                        Option[str]::Some(name) => { ctx.bindings.push(SemanticBinding{name, "", item.expr.line, item.expr.column}) }
+                        Option[str]::None => {}
+                    }
+                    match arm.body {
+                        MatchArmBody::Block(body) => { check_statements(ctx, body.statements, return_type) }
+                        MatchArmBody::Expr(expr) => { let _arm = infer_expression(ctx, expr) }
+                    }
+                }
+                replace_bindings(ctx, outer_bindings)
+            }
+            Statement::While(item) => {
+                check_boolean_condition(ctx, item.condition)
+                check_statements(ctx, item.body.statements, return_type)
+            }
+            Statement::Loop(item) => { check_statements(ctx, item.body.statements, return_type) }
+            Statement::DoWhile(item) => {
+                check_statements(ctx, item.body.statements, return_type)
+                check_boolean_condition(ctx, item.condition)
+            }
+            Statement::For(item) => {
+                let _iterable = infer_expression(ctx, item.iterable)
+                check_statements(ctx, item.body.statements, return_type)
+            }
+            Statement::With(item) => {
+                let _resource = infer_expression(ctx, item.expr)
+                check_statements(ctx, item.body.statements, return_type)
+            }
+            Statement::Unsafe(body) => { check_statements(ctx, body.statements, return_type) }
             _ => {}
         }
+    }
+    ret ()
+}
+
+/// Establishes the lexical binding snapshot used by the next semantic scope.
+///
+/// Keeping scope replacement as one operation also lets older bootstrap
+/// compilers build the analysis foundation before they contain the backend fix
+/// for repeated identical `setfield` instructions across basic blocks.
+fn replace_bindings(ctx: mut SemanticContext, bindings: Vec[SemanticBinding]) -> () {
+    ctx.bindings = bindings
+}
+
+fn check_boolean_condition(ctx: mut SemanticContext, expr: ExprNode) -> () {
+    let actual = infer_expression(ctx, expr)
+    if actual != "" && actual != "bool" {
+        ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "condition-type-mismatch", "condition must have type 'bool', found '" + actual + "'", expr.line, expr.column, expr.length))
     }
     ret ()
 }
@@ -149,8 +318,7 @@ fn infer_expression(
         Expr::Integer(value) => { ret integer_type(value) }
         Expr::Float(value) => { ret float_type(value) }
         Expr::Path(name) => {
-            for binding in ctx.bindings { if binding.name == name { ret binding.typ } }
-            ret ""
+            ret binding_type(ctx.bindings, name)
         }
         Expr::Parenthesized(inner) => { ret infer_expression_h(ctx, inner) }
         Expr::Cast(cast) => {
@@ -169,7 +337,7 @@ fn infer_expression(
         Expr::Call(call) => {
             let name = expression_path_h(call.callee)
             if name != "" {
-                match resolve_call(ctx, name, call.args) {
+                match resolve_call(ctx, name, call.args, line, column, length) {
                     Option[SemanticCallable]::Some(callable) => {
                         remember_dependency(ctx, callable)
                         ret callable.ret_type
@@ -194,8 +362,7 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode<H>) -> str {
         Expr::Integer(value) => { ret integer_type(value) }
         Expr::Float(value) => { ret float_type(value) }
         Expr::Path(name) => {
-            for binding in ctx.bindings { if binding.name == name { ret binding.typ } }
-            ret ""
+            ret binding_type(ctx.bindings, name)
         }
         Expr::Parenthesized(inner) => { ret infer_expression_h(ctx, inner) }
         Expr::Cast(cast) => {
@@ -214,7 +381,7 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode<H>) -> str {
         Expr::Call(call) => {
             let name = expression_path_h(call.callee)
             if name != "" {
-                match resolve_call(ctx, name, call.args) {
+                match resolve_call(ctx, name, call.args, line, column, length) {
                     Option[SemanticCallable]::Some(callable) => {
                         remember_dependency(ctx, callable)
                         ret callable.ret_type
@@ -229,6 +396,20 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode<H>) -> str {
     ret ""
 }
 
+fn binding_type(bindings: Vec[SemanticBinding], name: str) -> str {
+    let mut index = bindings.len()
+    while index > 0_usize {
+        index -= 1_usize
+        match bindings.get(index) {
+            Option[SemanticBinding]::Some(binding) => {
+                if binding.name == name { ret binding.typ }
+            }
+            Option[SemanticBinding]::None => {}
+        }
+    }
+    ret ""
+}
+
 fn expression_path_h(expr: ExprNode<H>) -> str {
     match expr.value {
         Expr::Path(name) => { ret name }
@@ -238,13 +419,22 @@ fn expression_path_h(expr: ExprNode<H>) -> str {
     ret ""
 }
 
-fn resolve_call(ctx: mut SemanticContext, name: str, args: Vec[ExprNode]) -> Option[SemanticCallable] {
+fn resolve_call(ctx: mut SemanticContext, name: str, args: Vec[ExprNode], line: usize, column: usize, length: usize) -> Option[SemanticCallable] {
     let mut argument_types = Vec[str]::new()
     for argument in args { argument_types.push(infer_expression(ctx, argument)) }
+    let mut saw_name = false
+    let mut expected_arity = 0_usize
     for callable in ctx.callables {
-        if callable.name == name && callable.params.len() == argument_types.len() && parameter_types_match(callable.params, argument_types) {
-            ret Option[SemanticCallable]::Some(callable)
+        if callable.name == name {
+            saw_name = true
+            expected_arity = callable.params.len()
+            if callable.params.len() == argument_types.len() && parameter_types_match(callable.params, argument_types) {
+                ret Option[SemanticCallable]::Some(callable)
+            }
         }
+    }
+    if saw_name && expected_arity != argument_types.len() {
+        ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "arity-mismatch", "call to '" + name + "' expects " + Debug::fmt(expected_arity) + " argument(s), got " + Debug::fmt(argument_types.len()), line, column, length))
     }
     ret Option[SemanticCallable]::None
 }
@@ -303,15 +493,20 @@ fn remember_dependency(ctx: mut SemanticContext, callable: SemanticCallable) -> 
 }
 
 fn integer_type(value: str) -> str {
+    if ends_with(value, "_f32") { ret "f32" }
+    if ends_with(value, "_f64") { ret "f64" }
     if ends_with(value, "_u8") { ret "u8" }
     if ends_with(value, "_u16") { ret "u16" }
     if ends_with(value, "_u32") { ret "u32" }
     if ends_with(value, "_u64") { ret "u64" }
+    if ends_with(value, "_u128") { ret "u128" }
     if ends_with(value, "_usize") { ret "usize" }
     if ends_with(value, "_i8") { ret "i8" }
     if ends_with(value, "_i16") { ret "i16" }
     if ends_with(value, "_i32") { ret "i32" }
     if ends_with(value, "_i64") { ret "i64" }
+    if ends_with(value, "_i128") { ret "i128" }
+    if ends_with(value, "_isize") { ret "isize" }
     ret "i32"
 }
 
