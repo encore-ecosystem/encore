@@ -2218,7 +2218,6 @@ encore_str encore_tls_read(size_t handle, size_t max) {
         return encore_from_owned_buffer(out, count);
     }
     for (;;) {
-        if (client->encrypted_len == sizeof(client->encrypted)) { client->read_failed = true; encore_set_net_error_cstr("TLS record exceeds buffer"); return encore_empty_str(); }
         if (client->encrypted_len == 0) {
             int received = recv(client->socket, (char *)client->encrypted, (int)sizeof(client->encrypted), 0);
             if (received == 0) return encore_empty_str();
@@ -2229,6 +2228,11 @@ encore_str encore_tls_read(size_t handle, size_t max) {
         SecBufferDesc message = {SECBUFFER_VERSION, 4, buffers};
         SECURITY_STATUS status = DecryptMessage(&client->context, &message, 0, NULL);
         if (status == SEC_E_INCOMPLETE_MESSAGE) {
+            if (client->encrypted_len == sizeof(client->encrypted)) {
+                client->read_failed = true;
+                encore_set_net_error_cstr("TLS record exceeds buffer");
+                return encore_empty_str();
+            }
             int received = recv(client->socket, (char *)client->encrypted + client->encrypted_len, (int)(sizeof(client->encrypted) - client->encrypted_len), 0);
             if (received <= 0) { client->read_failed = true; encore_set_net_error_cstr("TLS read failed"); return encore_empty_str(); }
             client->encrypted_len += (size_t)received; continue;
