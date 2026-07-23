@@ -149,8 +149,62 @@ fn main() -> u32 {
             hints = response_for(process, 3)["result"]
             assert any(hint.get("label") == ": u32" for hint in hints), hints
 
-            send_message(process, {"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": None})
-            response_for(process, 4)
+            formatting_source = """//! Formatting fixture.
+fn value(lhs:u32,rhs:u32)->u32{ret lhs+rhs}
+fn main()->u32{ret value(1_u32)}
+"""
+            formatting_path = source_dir / "formatting.enq"
+            formatting_path.write_text(formatting_source)
+            send_message(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {
+                        "textDocument": {
+                            "uri": formatting_path.as_uri(),
+                            "languageId": "encore",
+                            "version": 1,
+                            "text": formatting_source,
+                        }
+                    },
+                },
+            )
+            send_message(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "textDocument/formatting",
+                    "params": {
+                        "textDocument": {"uri": formatting_path.as_uri()},
+                        "options": {"tabSize": 4, "insertSpaces": True},
+                    },
+                },
+            )
+            formatting = response_for(process, 4)["result"]
+            assert len(formatting) == 1, formatting
+            formatted = formatting[0]["newText"]
+            assert "//! Formatting fixture." in formatted, formatted
+            assert "fn value(lhs: u32, rhs: u32) -> u32 {" in formatted, formatted
+            assert "    ret lhs + rhs" in formatted, formatted
+
+            send_message(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "textDocument/diagnostic",
+                    "params": {"textDocument": {"uri": formatting_path.as_uri()}},
+                },
+            )
+            diagnostics = response_for(process, 5)["result"]["items"]
+            arity = [item for item in diagnostics if item.get("code") == "arity-mismatch"]
+            assert len(arity) == 1, diagnostics
+            assert "expects 2 argument(s), got 1" in arity[0]["message"], arity
+
+            send_message(process, {"jsonrpc": "2.0", "id": 6, "method": "shutdown", "params": None})
+            response_for(process, 6)
             send_message(process, {"jsonrpc": "2.0", "method": "exit", "params": None})
             assert process.stdin is not None
             process.stdin.close()

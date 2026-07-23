@@ -1,0 +1,375 @@
+//! Formats Encore source from the shared lossless syntax stream.
+
+import std::vec::Vec
+
+import refrain::frontend::{FrontendDiagnostic, SyntaxDocument, Token, TokenType, analyze_source_lightweight}
+
+/// Controls deterministic Encore source formatting.
+pub struct FormatConfig {
+    indent_width: usize
+}
+
+/// Contains a transactional formatting result.
+pub struct FormatResult {
+    source: str
+    changed: bool
+    diagnostics: Vec[FrontendDiagnostic]
+}
+
+struct FormatState {
+    document: FormatDocument
+    has_output: bool
+    depth: usize
+    line_has_content: bool
+    pending_breaks: usize
+    pending_space: bool
+    previous: TokenType
+    has_previous: bool
+}
+
+enum FormatElement {
+    Text(str)
+    Space
+    Line(usize)
+    Indent(usize)
+}
+
+/// A small document IR keeps layout decisions separate from rendering.
+struct FormatDocument {
+    elements: Vec[FormatElement]
+}
+
+impl for FormatConfig {
+    /// Returns the stable default style.
+    pub fn new() -> Self { ret Self{4_usize} }
+}
+
+impl for FormatResult {
+    /// Returns source to write when formatting succeeded.
+    pub fn text(self: Self) -> str { ret self.source }
+
+    /// Returns whether formatting changes the source.
+    pub fn is_changed(self: Self) -> bool { ret self.changed }
+
+    /// Returns diagnostics that prevented transactional formatting.
+    pub fn errors(self: Self) -> Vec[FrontendDiagnostic] { ret self.diagnostics }
+
+    /// Returns whether the source was valid enough to format safely.
+    pub fn is_valid(self: Self) -> bool { ret self.diagnostics.len() == 0_usize }
+}
+
+impl for FormatState {
+    fn new() -> Self {
+        ret Self{FormatDocument::new(), false, 0_usize, false, 0_usize, false, TokenType::UNKNOWN, false}
+    }
+
+    fn request_space(self: mut Self) -> () {
+        if self.line_has_content && self.pending_breaks == 0_usize { self.pending_space = true }
+        ret ()
+    }
+
+    fn request_break(self: mut Self, count: usize) -> () {
+        let requested = if count > 2_usize { 2_usize } else { count }
+        if requested > self.pending_breaks { self.pending_breaks = requested }
+        self.pending_space = false
+        ret ()
+    }
+
+    fn flush_prefix(self: mut Self, config: FormatConfig) -> () {
+        if self.pending_breaks > 0_usize {
+            let mut count = self.pending_breaks
+            if !self.line_has_content && !self.has_output { count = 0_usize }
+            if count > 0_usize { self.document.push_line(count) }
+            self.line_has_content = false
+            self.pending_breaks = 0_usize
+            self.pending_space = false
+        }
+        if !self.line_has_content {
+            self.document.push_indent(self.depth * config.indent_width)
+            self.line_has_content = true
+        } elif self.pending_space {
+            self.document.push_space()
+        }
+        self.pending_space = false
+        ret ()
+    }
+
+    fn write(self: mut Self, value: str, config: FormatConfig) -> () {
+        self.flush_prefix(config)
+        self.document.push_text(value)
+        self.has_output = true
+        ret ()
+    }
+
+    fn trim_space(self: mut Self) -> () {
+        self.pending_space = false
+        ret ()
+    }
+
+    fn remember(self: mut Self, typ: TokenType) -> () {
+        self.previous = typ
+        self.has_previous = true
+        ret ()
+    }
+
+    fn finish(self: mut Self) -> str {
+        self.pending_space = false
+        self.pending_breaks = 0_usize
+        if !self.has_output { ret "" }
+        self.document.push_line(1_usize)
+        ret self.document.render()
+    }
+}
+
+impl for FormatDocument {
+    fn new() -> Self { ret Self{Vec[FormatElement]::new()} }
+
+    fn push_text(self: mut Self, value: str) -> () { self.elements.push(FormatElement::Text(value)) ret () }
+    fn push_space(self: mut Self) -> () { self.elements.push(FormatElement::Space) ret () }
+    fn push_line(self: mut Self, count: usize) -> () { self.elements.push(FormatElement::Line(count)) ret () }
+    fn push_indent(self: mut Self, width: usize) -> () {
+        if width > 0_usize { self.elements.push(FormatElement::Indent(width)) }
+        ret ()
+    }
+
+    fn render(self: Self) -> str {
+        let mut out = ""
+        for element in self.elements {
+            match element {
+                FormatElement::Text(value) => { out += value }
+                FormatElement::Space => { out += " " }
+                FormatElement::Line(count) => {
+                    let mut remaining = count
+                    while remaining > 0_usize { out += "\n" remaining -= 1_usize }
+                }
+                FormatElement::Indent(width) => {
+                    let mut remaining = width
+                    while remaining > 0_usize { out += " " remaining -= 1_usize }
+                }
+            }
+        }
+        ret out
+    }
+}
+
+/// Formats valid source and leaves invalid source byte-for-byte unchanged.
+pub fn format_source(source: str, config: FormatConfig) -> FormatResult {
+    let syntax = SyntaxDocument::parse(source)
+    let document = analyze_source_lightweight(source)
+    ret format_syntax(syntax, document.diagnostics, config)
+}
+
+/// Formats a cached lossless syntax query using existing frontend diagnostics.
+pub fn format_syntax(syntax: SyntaxDocument, diagnostics: Vec[FrontendDiagnostic], config: FormatConfig) -> FormatResult {
+    let source = syntax.text()
+    let fatal = formatter_syntax_diagnostics(diagnostics)
+    if !syntax.is_valid() || fatal.len() > 0_usize { ret FormatResult{source, false, fatal} }
+    let formatted = format_tokens(syntax.lossless_tokens(), config)
+    let formatted_syntax = SyntaxDocument::parse(formatted)
+    if !same_significant_tokens(syntax.lossless_tokens(), formatted_syntax.lossless_tokens()) {
+        let mut invariant = Vec[FrontendDiagnostic]::new()
+        invariant.push(FrontendDiagnostic::new(1_usize, "formatter-invariant", "formatting changed the significant token stream", 0_usize, 0_usize, 1_usize))
+        ret FormatResult{source, false, invariant}
+    }
+    ret FormatResult{formatted, formatted != source, Vec[FrontendDiagnostic]::new()}
+}
+
+fn formatter_syntax_diagnostics(diagnostics: Vec[FrontendDiagnostic]) -> Vec[FrontendDiagnostic] {
+    let mut out = Vec[FrontendDiagnostic]::new()
+    for diagnostic in diagnostics {
+        if diagnostic.code == "unknown-token" || starts_with(diagnostic.code, "unmatched-") || starts_with(diagnostic.code, "unclosed-") {
+            out.push(diagnostic)
+        }
+    }
+    ret out
+}
+
+fn format_tokens(tokens: Vec[Token], config: FormatConfig) -> str {
+    let mut state = FormatState::new()
+    let mut source_breaks = 0_usize
+
+    for token in tokens {
+        if token.type == TokenType::WHITESPACE {
+            state.request_space()
+            continue
+        }
+        if token.type == TokenType::NEWLINE {
+            source_breaks += 1_usize
+            state.request_break(if source_breaks > 1_usize { 2_usize } else { 1_usize })
+            continue
+        }
+        source_breaks = 0_usize
+
+        if token.type == TokenType::ONE_LINE_COMMENT || token.type == TokenType::DOC_COMMENT || token.type == TokenType::MODULE_DOC_COMMENT {
+            if state.line_has_content { state.request_space() }
+            state.write(token.value, config)
+            state.request_break(1_usize)
+            state.remember(token.type)
+            continue
+        }
+        if token.type == TokenType::MULTI_LINE_COMMENT {
+            if state.line_has_content { state.request_space() }
+            state.write(token.value, config)
+            state.request_break(1_usize)
+            state.remember(token.type)
+            continue
+        }
+        if token.type == TokenType::LEFT_BRACE {
+            state.request_space()
+            state.write("{", config)
+            state.depth += 1_usize
+            state.request_break(1_usize)
+            state.remember(token.type)
+            continue
+        }
+        if token.type == TokenType::RIGHT_BRACE {
+            if state.depth > 0_usize { state.depth -= 1_usize }
+            state.request_break(1_usize)
+            state.write("}", config)
+            state.request_break(1_usize)
+            state.remember(token.type)
+            continue
+        }
+        if token.type == TokenType::COMMA {
+            state.trim_space()
+            state.write(",", config)
+            state.request_space()
+            state.remember(token.type)
+            continue
+        }
+        if token.type == TokenType::COLON {
+            state.trim_space()
+            state.write(":", config)
+            state.request_space()
+            state.remember(token.type)
+            continue
+        }
+        if token.type == TokenType::SEMICOLON {
+            state.trim_space()
+            state.write(";", config)
+            state.request_break(1_usize)
+            state.remember(token.type)
+            continue
+        }
+        if token.type == TokenType::DOT || token.type == TokenType::SCOPE {
+            state.trim_space()
+            state.write(token.value, config)
+            state.remember(token.type)
+            continue
+        }
+        if token.type == TokenType::LEFT_PAREN || token.type == TokenType::LEFT_BRACKET {
+            if state.has_previous && control_keyword(state.previous) { state.request_space() }
+            else { state.trim_space() }
+            state.write(token.value, config)
+            state.depth += 1_usize
+            state.remember(token.type)
+            continue
+        }
+        if token.type == TokenType::RIGHT_PAREN || token.type == TokenType::RIGHT_BRACKET {
+            if state.depth > 0_usize { state.depth -= 1_usize }
+            state.trim_space()
+            state.write(token.value, config)
+            state.remember(token.type)
+            continue
+        }
+        if binary_operator(token.type) || token.type == TokenType::ARROW || token.type == TokenType::FAT_ARROW || token.type == TokenType::ASSIGN {
+            state.request_space()
+            state.write(token.value, config)
+            state.request_space()
+            state.remember(token.type)
+            continue
+        }
+        if token.type == TokenType::KW_ELSE || token.type == TokenType::KW_ELIF {
+            if state.pending_breaks > 0_usize && state.has_previous && state.previous == TokenType::RIGHT_BRACE {
+                state.pending_breaks = 0_usize
+                state.request_space()
+            }
+        }
+        if needs_implicit_space(state, token.type) { state.request_space() }
+        state.write(token.value, config)
+        state.remember(token.type)
+    }
+    ret state.finish()
+}
+
+fn same_significant_tokens(lhs: Vec[Token], rhs: Vec[Token]) -> bool {
+    let mut left = 0_usize
+    let mut right = 0_usize
+    loop {
+        while left < lhs.len() {
+            match lhs.get(left) {
+                Option[Token]::Some(token) => {
+                    if !trivia(token.type) { break }
+                }
+                Option[Token]::None => {}
+            }
+            left += 1_usize
+        }
+        while right < rhs.len() {
+            match rhs.get(right) {
+                Option[Token]::Some(token) => {
+                    if !trivia(token.type) { break }
+                }
+                Option[Token]::None => {}
+            }
+            right += 1_usize
+        }
+        if left >= lhs.len() || right >= rhs.len() { ret left >= lhs.len() && right >= rhs.len() }
+        let left_token = lhs.get(left).unwrap_or(Token::new(TokenType::UNKNOWN, "", 0_usize, 0_usize))
+        let right_token = rhs.get(right).unwrap_or(Token::new(TokenType::UNKNOWN, "", 0_usize, 0_usize))
+        if left_token.type != right_token.type || left_token.value != right_token.value { ret false }
+        left += 1_usize
+        right += 1_usize
+    }
+    ret true
+}
+
+fn trivia(typ: TokenType) -> bool {
+    ret typ == TokenType::WHITESPACE || typ == TokenType::NEWLINE
+}
+
+fn needs_implicit_space(state: FormatState, current: TokenType) -> bool {
+    if !state.has_previous { ret false }
+    if state.previous == TokenType::LEFT_PAREN || state.previous == TokenType::LEFT_BRACKET || state.previous == TokenType::DOT || state.previous == TokenType::SCOPE { ret false }
+    if current == TokenType::LEFT_PAREN || current == TokenType::LEFT_BRACKET || current == TokenType::DOT || current == TokenType::SCOPE { ret false }
+    if current == TokenType::COMMA || current == TokenType::COLON || current == TokenType::RIGHT_PAREN || current == TokenType::RIGHT_BRACKET { ret false }
+    if state.previous == TokenType::BANG || state.previous == TokenType::HASH { ret false }
+    if (state.previous == TokenType::INTEGER || state.previous == TokenType::FLOAT) && current == TokenType::IDENTIFIER { ret false }
+    ret word_token(state.previous) && word_token(current)
+}
+
+fn word_token(typ: TokenType) -> bool {
+    ret typ == TokenType::IDENTIFIER || typ == TokenType::INTEGER || typ == TokenType::FLOAT || typ == TokenType::BOOLEAN || typ == TokenType::STRING
+        || keyword(typ) || typ == TokenType::RIGHT_PAREN || typ == TokenType::RIGHT_BRACKET
+}
+
+fn keyword(typ: TokenType) -> bool {
+    ret typ == TokenType::KW_FN || typ == TokenType::KW_ASYNC || typ == TokenType::KW_AWAIT || typ == TokenType::KW_SPAWN
+        || typ == TokenType::KW_STRUCT || typ == TokenType::KW_TRAIT || typ == TokenType::KW_ENUM || typ == TokenType::KW_IMPL
+        || typ == TokenType::KW_FOR || typ == TokenType::KW_LET || typ == TokenType::KW_MUT || typ == TokenType::KW_RET
+        || typ == TokenType::KW_WHILE || typ == TokenType::KW_LOOP || typ == TokenType::KW_DO || typ == TokenType::KW_CONTINUE
+        || typ == TokenType::KW_BREAK || typ == TokenType::KW_IF || typ == TokenType::KW_ELIF || typ == TokenType::KW_ELSE
+        || typ == TokenType::KW_MATCH || typ == TokenType::KW_PUB || typ == TokenType::KW_IMPORT || typ == TokenType::KW_AS
+        || typ == TokenType::KW_DYN || typ == TokenType::KW_EXTERN || typ == TokenType::KW_UNSAFE || typ == TokenType::KW_EHIR
+        || typ == TokenType::KW_WITH
+}
+
+fn control_keyword(typ: TokenType) -> bool {
+    ret typ == TokenType::KW_IF || typ == TokenType::KW_ELIF || typ == TokenType::KW_WHILE || typ == TokenType::KW_FOR || typ == TokenType::KW_MATCH
+}
+
+fn binary_operator(typ: TokenType) -> bool {
+    ret typ == TokenType::PLUS || typ == TokenType::MINUS || typ == TokenType::ASTERISK || typ == TokenType::POWER
+        || typ == TokenType::SLASH || typ == TokenType::PERCENT || typ == TokenType::EQUAL_EQUAL || typ == TokenType::BANG_EQUAL
+        || typ == TokenType::LESS || typ == TokenType::GREATER || typ == TokenType::LESS_EQUAL || typ == TokenType::GREATER_EQUAL
+        || typ == TokenType::AND_AND || typ == TokenType::PIPE_PIPE || typ == TokenType::AMPERSAND || typ == TokenType::PIPE
+        || typ == TokenType::CARET || typ == TokenType::LEFT_SHIFT || typ == TokenType::RIGHT_SHIFT || typ == TokenType::PLUS_EQUAL
+        || typ == TokenType::MINUS_EQUAL || typ == TokenType::ASTERISK_EQUAL || typ == TokenType::POWER_EQUAL || typ == TokenType::SLASH_EQUAL
+        || typ == TokenType::PERCENT_EQUAL || typ == TokenType::AMPERSAND_EQUAL || typ == TokenType::PIPE_EQUAL || typ == TokenType::CARET_EQUAL
+        || typ == TokenType::LEFT_SHIFT_EQUAL || typ == TokenType::RIGHT_SHIFT_EQUAL
+}
+
+fn starts_with(value: str, prefix: str) -> bool {
+    if prefix.len() > value.len() { ret false }
+    ret value.slice(0_usize, prefix.len()) == prefix
+}

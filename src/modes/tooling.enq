@@ -1,0 +1,238 @@
+//! Implements shared `check` and `format` tooling commands.
+
+import core::fmt::Debug
+import core::io::eprintln
+import core::option::Option
+import std::io::println
+import std::os::{argc, argv, file_exists, read_file, write_file}
+import std::path::Path
+import std::vec::Vec
+
+import json::{Json, field, stringify}
+import refrain::formatter::{FormatConfig, FormatResult, format_syntax}
+import refrain::frontend::{AnalysisDatabase, FrontendDiagnostic, FrontendDocument, SyntaxDocument}
+import refrain::project::{ProjectWorkspace, load_binary_workspace, load_library_workspace}
+
+struct ToolDiagnostic {
+    path: str
+    diagnostic: FrontendDiagnostic
+}
+
+/// Type-checks a project or source file without generating artifacts.
+pub fn native_check() -> u32 {
+    let selected = selected_path()
+    let format = option_value("--format")
+    let mut diagnostics = Vec[ToolDiagnostic]::new()
+    let mut module_count = 0_usize
+
+    if selected != "" && ends_with(selected, ".enq") {
+        let path = Path::new(selected).resolve()
+        if !file_exists(path.as_str()) { eprintln("error[path]: source path does not exist: " + selected) ret 2_u32 }
+        let source = read_file(path.as_str())
+        let mut database = AnalysisDatabase::new()
+        database.set_module_full(path.as_str(), path.as_str(), source)
+        match database.document(path.as_str()) {
+            Option[FrontendDocument]::Some(document) => {
+                append_diagnostics(path.as_str(), document.diagnostics, diagnostics)
+                if document.diagnostics.len() == 0_usize {
+                    append_diagnostics(path.as_str(), database.module_semantic_diagnostics(path.as_str()), diagnostics)
+                }
+            }
+            Option[FrontendDocument]::None => {}
+        }
+        module_count = 1_usize
+    } else {
+        let root = if selected == "" { Path::new(".").resolve() } else { Path::new(selected).resolve() }
+        if !file_exists(root.join("encore.toml").as_str()) { eprintln("error[manifest]: Unable to find encore.toml at " + root.join("encore.toml").as_str()) ret 2_u32 }
+        let mut workspace = load_analysis_workspace(root)
+        for module in workspace.modules {
+            if module.owner_name == workspace.root_name {
+                append_diagnostics(module.path(), module.diagnostics, diagnostics)
+                if module.diagnostics.len() == 0_usize {
+                    append_diagnostics(module.path(), workspace.analysis.module_semantic_diagnostics(module.analysis_id.key()), diagnostics)
+                }
+                module_count += 1_usize
+            }
+        }
+    }
+
+    for item in diagnostics {
+        if format == "json" { println(frontend_diagnostic_json(item)) }
+        else { print_frontend_diagnostic(item) }
+    }
+    if diagnostics.len() > 0_usize { ret 1_u32 }
+    if format != "json" {
+        let suffix = if module_count == 1_usize { "" } else { "s" }
+        println("Checked " + Debug::fmt(module_count) + " module" + suffix)
+    }
+    ret 0_u32
+}
+
+/// Formats a project or source file transactionally.
+pub fn native_format() -> u32 {
+    let selected = selected_path()
+    let check_only = has_option("--check")
+    let mut paths = Vec[str]::new()
+    let mut module_names = Vec[str]::new()
+    let mut database = AnalysisDatabase::new()
+
+    if selected != "" && ends_with(selected, ".enq") {
+        let path = Path::new(selected).resolve()
+        if !file_exists(path.as_str()) { eprintln("error[path]: source path does not exist: " + selected) ret 2_u32 }
+        paths.push(path.as_str())
+        module_names.push(path.as_str())
+        database.set_module(path.as_str(), path.as_str(), read_file(path.as_str()))
+    } else {
+        let root = if selected == "" { Path::new(".").resolve() } else { Path::new(selected).resolve() }
+        if !file_exists(root.join("encore.toml").as_str()) { eprintln("error[manifest]: Unable to find encore.toml at " + root.join("encore.toml").as_str()) ret 2_u32 }
+        let workspace = load_analysis_workspace(root)
+        database = workspace.analysis
+        for module in workspace.modules {
+            if module.owner_name == workspace.root_name {
+                paths.push(module.path())
+                module_names.push(module.analysis_id.key())
+            }
+        }
+    }
+
+    let mut results = Vec[FormatResult]::new()
+    let mut failed = false
+    let mut index = 0_usize
+    while index < paths.len() {
+        match module_names.get(index) {
+            Option[str]::Some(module_name) => {
+                let syntax = match database.syntax_document(module_name) {
+                    Option[SyntaxDocument]::Some(value) => value
+                    Option[SyntaxDocument]::None => SyntaxDocument::empty()
+                }
+                let diagnostics = match database.document_lightweight(module_name) {
+                    Option[FrontendDocument]::Some(value) => value.diagnostics
+                    Option[FrontendDocument]::None => Vec[FrontendDiagnostic]::new()
+                }
+                let result = format_syntax(syntax, diagnostics, FormatConfig::new())
+                if !result.is_valid() {
+                    failed = true
+                    match paths.get(index) {
+                        Option[str]::Some(path) => {
+                            for diagnostic in result.errors() { print_format_diagnostic(ToolDiagnostic{path, diagnostic}) }
+                        }
+                        Option[str]::None => {}
+                    }
+                }
+                results.push(result)
+            }
+            Option[str]::None => {}
+        }
+        index += 1_usize
+    }
+    if failed { ret 1_u32 }
+
+    let mut changed = 0_usize
+    index = 0_usize
+    while index < results.len() {
+        match results.get(index) {
+            Option[FormatResult]::Some(result) => {
+                if result.is_changed() {
+                    changed += 1_usize
+                    if !check_only {
+                        match paths.get(index) {
+                            Option[str]::Some(path) => {
+                                if write_file(path, result.text()) != 0_i32 { eprintln("error[format-write]: unable to write " + path) ret 2_u32 }
+                            }
+                            Option[str]::None => {}
+                        }
+                    }
+                }
+            }
+            Option[FormatResult]::None => {}
+        }
+        index += 1_usize
+    }
+
+    let suffix = if changed == 1_usize { "" } else { "s" }
+    if check_only {
+        println("Would format " + Debug::fmt(changed) + " file" + suffix)
+        if changed > 0_usize { ret 1_u32 }
+    } else {
+        println("Formatted " + Debug::fmt(changed) + " file" + suffix)
+    }
+    ret 0_u32
+}
+
+fn load_analysis_workspace(root: Path) -> ProjectWorkspace {
+    if file_exists(root.join("src").join("lib.enq").as_str()) { ret load_library_workspace(root) }
+    ret load_binary_workspace(root)
+}
+
+fn append_diagnostics(path: str, values: Vec[FrontendDiagnostic], out: mut Vec[ToolDiagnostic]) -> () {
+    for diagnostic in values { out.push(ToolDiagnostic{path, diagnostic}) }
+    ret ()
+}
+
+fn print_frontend_diagnostic(item: ToolDiagnostic) -> () {
+    let severity = if item.diagnostic.severity == 1_usize { "error" } else { "warning" }
+    eprintln(item.path + ":" + Debug::fmt(item.diagnostic.line + 1_usize) + ":" + Debug::fmt(item.diagnostic.column + 1_usize) + ": " + severity + "[" + item.diagnostic.code + "]: " + item.diagnostic.message)
+    ret ()
+}
+
+fn print_format_diagnostic(item: ToolDiagnostic) -> () {
+    eprintln(item.path + ":" + Debug::fmt(item.diagnostic.line + 1_usize) + ":" + Debug::fmt(item.diagnostic.column + 1_usize) + ": error[" + item.diagnostic.code + "]: " + item.diagnostic.message)
+    ret ()
+}
+
+fn frontend_diagnostic_json(item: ToolDiagnostic) -> str {
+    let severity = if item.diagnostic.severity == 1_usize { "error" } else { "warning" }
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("path", Json::String(item.path)))
+    fields.push(field("line", Json::Number(Debug::fmt(item.diagnostic.line + 1_usize))))
+    fields.push(field("column", Json::Number(Debug::fmt(item.diagnostic.column + 1_usize))))
+    fields.push(field("severity", Json::String(severity)))
+    fields.push(field("code", Json::String(item.diagnostic.code)))
+    fields.push(field("message", Json::String(item.diagnostic.message)))
+    ret stringify(Json::Object(fields))
+}
+
+fn selected_path() -> str {
+    let mut index = 2_usize
+    while index < argc() {
+        let arg = argument(index)
+        if arg == "--format" { index += 1_usize }
+        elif arg == "--check" {}
+        elif !starts_with(arg, "-") { ret arg }
+        index += 1_usize
+    }
+    ret ""
+}
+
+fn option_value(name: str) -> str {
+    let mut index = 2_usize
+    while index + 1_usize < argc() {
+        if argument(index) == name { ret argument(index + 1_usize) }
+        index += 1_usize
+    }
+    ret ""
+}
+
+fn has_option(name: str) -> bool {
+    let mut index = 2_usize
+    while index < argc() {
+        if argument(index) == name { ret true }
+        index += 1_usize
+    }
+    ret false
+}
+
+fn argument(index: usize) -> str {
+    match argv(index) { Option[str]::Some(value) => { ret value } Option[str]::None => {} }
+    ret ""
+}
+
+fn starts_with(value: str, prefix: str) -> bool {
+    if prefix.len() > value.len() { ret false }
+    ret value.slice(0_usize, prefix.len()) == prefix
+}
+
+fn ends_with(value: str, suffix: str) -> bool {
+    if suffix.len() > value.len() { ret false }
+    ret value.slice(value.len() - suffix.len(), suffix.len()) == suffix
+}

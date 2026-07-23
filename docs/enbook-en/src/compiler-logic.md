@@ -6,7 +6,7 @@ retain/drop insertion and backend validation.
 
 ## Incremental Frontend Database
 
-The compiler, analyzer and language server share the typed
+The compiler, checker, linter, formatter and language server share the typed
 `AnalysisDatabase`. A module is interned under a deterministic `ModuleId`, and
 its declarations receive deterministic `SymbolId` values derived from the
 module identity, declaration kind, name and overload ordinal. These canonical
@@ -18,6 +18,8 @@ The database keeps independent tolerant and strict queries:
 - the lightweight query supplies tokens, declarations, imports and diagnostics
   while an editor buffer may be incomplete;
 - the full query supplies the parsed AST required by the compiler and analyzer;
+- the lossless syntax query retains whitespace, line endings and every comment
+  for formatting and source transformations, and is computed only on demand;
 - compiler workspace ingestion uses `set_module_full`, so valid build input is
   lexed and parsed only once.
 
@@ -31,6 +33,10 @@ interface token invalidates transitive dependants through the module graph.
 Query counters are exposed for behavioral tests. Incremental behavior is
 therefore verified by proving that an unaffected query was not recomputed,
 rather than only comparing its returned value.
+
+The formatter consumes the lossless query and existing frontend diagnostics.
+It never writes invalid input, returns an unchanged result on errors and is
+idempotent. The CLI and LSP use this same formatting implementation.
 
 ### Function semantic queries
 
@@ -47,10 +53,12 @@ without invalidating unrelated bodies in the importing module. Semantic errors
 are returned as `FrontendDiagnostic` values; compiler checking can stop before
 EHIR lowering without terminating from inside the query.
 
-The current semantic result models primitive literals, local bindings,
-explicit binding annotations, binary results, casts and direct function calls.
-Additional expression and control-flow forms should extend this result rather
-than introduce a second type model in the compiler or language server.
+The semantic result models primitive literals, local bindings, explicit
+binding annotations, assignments, returns, conditions, nested control flow,
+binary results, casts and direct function calls. Declaration checks, call
+arity, return types and body diagnostics are emitted through the same query.
+Additional language forms must extend this result rather than introduce a
+second type model in the compiler or language server.
 
 ## STIV Model
 
