@@ -197,10 +197,14 @@ jobs:
           scripts/test-test-runner.sh "$compiler"
           scripts/test-analyzer.sh "$compiler"
           scripts/test-cli-contract.sh "$compiler"
+          scripts/test-release-channels.sh
           scripts/smoke-cross-target.sh "$compiler"
       - name: Verified native HTTPS integration
         shell: bash
         run: scripts/test-https-stack.sh "$PWD/target/stage2/${{ matrix.executable }}"
+      - name: Verified native self update
+        shell: bash
+        run: scripts/test-self-update.sh "$PWD/target/stage2/${{ matrix.executable }}"
       - name: Package native release
         id: package
         shell: bash
@@ -236,7 +240,20 @@ jobs:
           merge-multiple: true
       - name: Verify complete release artifact set
         run: scripts/verify-release-set.sh dist
+      - name: Resolve release channel and generate update manifest
+        id: release_meta
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          version=${RELEASE_VERSION#v}
+          channel=$(scripts/release-channel.sh "$version")
+          scripts/generate-release-manifest.sh \
+            dist "$version" "$RELEASE_VERSION" "$GITHUB_SHA" "$GITHUB_REPOSITORY" channel.json
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - name: Generate checksum-pinned PKGBUILD
+        if: steps.release_meta.outputs.channel == 'stable'
         env:
           RELEASE_VERSION: ${{ github.ref_name }}
         run: scripts/generate-pkgbuild.sh "${RELEASE_VERSION#v}" dist
@@ -244,4 +261,23 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, 'nightly') || contains(github.ref_name, 'unstable') }}
+          prerelease: ${{ steps.release_meta.outputs.channel != 'stable' }}
+      - name: Publish atomic channel pointer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ steps.release_meta.outputs.channel }}
+          VERSION: ${{ steps.release_meta.outputs.version }}
+        run: |
+          set -eu
+          pointer="channel-$CHANNEL"
+          if gh release view "$pointer" >/dev/null 2>&1; then
+            gh release upload "$pointer" dist/channel.json --clobber
+            gh release edit "$pointer" --notes "Current $CHANNEL compiler: Encore $VERSION"
+          else
+            gh release create "$pointer" dist/channel.json \
+              --target "$GITHUB_SHA" \
+              --title "Encore $CHANNEL channel" \
+              --notes "Current $CHANNEL compiler: Encore $VERSION" \
+              --prerelease
+          fi

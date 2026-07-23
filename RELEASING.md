@@ -1,7 +1,7 @@
 # Releasing Encore
 
 The release workflow publishes native archives for Linux and macOS on x86_64
-and aarch64. Creating the final version commit and tag is a maintainer action;
+and aarch64, plus Windows on x86_64. Creating the final version commit and tag is a maintainer action;
 GitHub Actions performs bootstrap verification, tests, packaging, checksums,
 and release publication.
 
@@ -25,6 +25,8 @@ and release publication.
    scripts/smoke-cross-target.sh target/debug/encore
    scripts/test-test-runner.sh target/debug/encore
    scripts/test-cli-contract.sh target/debug/encore
+   scripts/test-release-channels.sh
+   scripts/test-self-update.sh target/debug/encore
    ```
 
    Verify the public package index from a fresh cache:
@@ -67,9 +69,16 @@ git tag -s v1.0.0 -m "Encore v1.0.0"
 git push origin v1.0.0
 ```
 
-The tag must match `VERSION`; the workflow rejects a mismatch. After it
-finishes, verify that the release contains four archives, four sidecar checksum
-files, `SHA256SUMS`, and the checksum-pinned `PKGBUILD`. Finally, install from
+Stable tags use `vMAJOR.MINOR.PATCH`, beta tags use
+`vMAJOR.MINOR.PATCH-beta.N`, and nightly tags use
+`vMAJOR.MINOR.PATCH-nightly.YYYYMMDD`. The tag must match `VERSION`; the
+workflow rejects a mismatch. Each successful publication atomically refreshes
+the corresponding `channel-stable`, `channel-beta`, or `channel-nightly`
+pointer release.
+
+After it finishes, verify that the release contains five archives, five
+sidecar checksum files, `SHA256SUMS`, and `channel.json`. Stable releases also
+contain the checksum-pinned `PKGBUILD`. Finally, install from
 the public release and compile a project:
 
 ```sh
@@ -77,4 +86,5 @@ curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/encore-language/encore/trunk/install.sh | \
   sh -s -- --version 1.0.0
 encore --version
+encore self update --check
 ```

@@ -3,13 +3,13 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 version=$(cat "$repo_root/VERSION")
-printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-(beta\.[0-9]+|nightly\.[0-9]{8}))?$'
 
 manifest_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo_root/encore.toml" | head -n 1)
 pkg_version=$(sed -n 's/^pkgver=//p' "$repo_root/packaging/PKGBUILD.template" | head -n 1)
 test "$manifest_version" = "$version"
-test "$pkg_version" = "$version"
-grep -Fq "console.println(\"encore $version\")" "$repo_root/src/main.enq"
+case "$version" in *-*) ;; *) test "$pkg_version" = "$version" ;; esac
+grep -Fq "pub fn compiler_version() -> str { ret \"$version\" }" "$repo_root/src/version.enq"
 grep -Fq "The current development line is \`$version\`." "$repo_root/README.md"
 
 if [ "$#" -gt 1 ]; then

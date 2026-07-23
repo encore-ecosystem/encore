@@ -16,9 +16,9 @@ grep -q "Usage: encore <command> \[options\]" "$tmp/global.log"
 (cd "$tmp" && "$compiler" --help) > "$tmp/help.log" 2>&1
 cmp "$tmp/global.log" "$tmp/help.log"
 (cd "$tmp" && "$compiler" -h) > /dev/null
-(cd "$tmp" && "$compiler" -V) | grep -Eq '^encore [0-9]+\.[0-9]+\.[0-9]+$'
+(cd "$tmp" && "$compiler" -V) | grep -Eq '^encore [0-9]+\.[0-9]+\.[0-9]+(-(beta\.[0-9]+|nightly\.[0-9]{8}))?$'
 
-for command in build run test analyze init add sync update install target; do
+for command in build run test analyze init add sync update install target self; do
     (cd "$tmp" && "$compiler" "$command" --help) > "$tmp/$command.log" 2>&1
     grep -q "Usage: encore $command" "$tmp/$command.log"
     (cd "$tmp" && "$compiler" help "$command") > "$tmp/$command-help.log" 2>&1
@@ -33,7 +33,7 @@ test "$code" -ne 0
 grep -q "Unknown command: unknown-command" "$tmp/unknown.log"
 grep -q "encore --help" "$tmp/unknown.log"
 
-for invocation in "build --unknown" "build --target" "test --filter" "analyze --deny" "analyze one two" "init extra" "add" "sync extra" "update extra" "install one two" "target one two"; do
+for invocation in "build --unknown" "build --target" "test --filter" "analyze --deny" "analyze one two" "init extra" "add" "sync extra" "update extra" "install one two" "target one two" "self" "self unknown" "self channel alpha" "self update --channel" "self update --version" "self install" "self install one two"; do
     set +e
     (cd "$tmp" && "$compiler" $invocation) > "$tmp/invalid.log" 2>&1
     invalid_code=$?

@@ -1,0 +1,481 @@
+//! Implements native, channel-aware compiler self updates.
+
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+import json::{Json, parse}
+import std::http::{HttpClient, HttpClientConfig}
+import std::io::println
+import std::os::{apply_self_update, argc, argv, commit_self_update, copy_file, env, executable_path, file_exists, file_sha256, home_dir, is_directory, mkdir_all, read_file, remove_dir_all, write_file}
+import std::path::Path
+import std::process::{run_args, run_args_capture}
+import std::vec::Vec
+
+import refrain::target::{host_triple, target_executable_name, host_target}
+import refrain::version::compiler_version
+
+struct UpdateAsset {
+    triple: str
+    url: str
+    checksum: str
+    format: str
+}
+
+struct UpdateManifest {
+    channel: str
+    version: str
+    tag: str
+    commit: str
+    asset: UpdateAsset
+}
+
+struct UpdateRequest {
+    channel: str
+    version: str
+    check: bool
+    force: bool
+    exact: bool
+}
+
+/// Runs `encore self`.
+pub fn native_self() -> u32 {
+    let action = argument(2_usize)
+    if action == "channel" { ret run_channel() }
+    if action == "update" { ret run_update(parse_update_request()) }
+    if action == "install" {
+        let version = normalize_version(argument(3_usize))
+        if version == "" { ret fail("Invalid Encore version '" + argument(3_usize) + "'") }
+        ret run_update(UpdateRequest{"", version, false, has_argument("--force"), true})
+    }
+    ret fail("Unknown self command: " + action)
+}
+
+/// Completes the detached Windows replacement after the invoking compiler has
+/// exited and released its executable image.
+pub fn native_self_update_apply() -> u32 {
+    if argc() != 7_usize { ret 2_u32 }
+    let parent = parse_decimal(argument(2_usize))
+    if parent == 0_usize { ret 2_u32 }
+    let status = apply_self_update(parent, argument(3_usize), argument(4_usize), argument(5_usize), argument(6_usize))
+    ret if status == 0_i32 { 0_u32 } else { 1_u32 }
+}
+
+fn run_channel() -> u32 {
+    let root = settings_root()
+    if argc() == 3_usize {
+        println(selected_channel(root))
+        ret 0_u32
+    }
+    let channel = argument(3_usize)
+    if !valid_channel(channel) { ret fail("Channel must be stable, beta, or nightly") }
+    if mkdir_all(root.as_str()) != 0_i32 { ret fail("Unable to create " + root.as_str()) }
+    if write_file(root.join("settings.toml").as_str(), "channel = \"" + channel + "\"\n") != 0_i32 {
+        ret fail("Unable to save the Encore update channel")
+    }
+    println("Switched Encore update channel to " + channel)
+    ret 0_u32
+}
+
+fn parse_update_request() -> UpdateRequest {
+    let mut channel = ""
+    let mut version = ""
+    let mut check = false
+    let mut force = false
+    let mut exact = false
+    let mut index = 3_usize
+    while index < argc() {
+        let arg = argument(index)
+        if arg == "--check" { check = true }
+        elif arg == "--force" { force = true }
+        elif arg == "--channel" { index += 1_usize channel = argument(index) }
+        elif arg == "--version" { index += 1_usize version = normalize_version(argument(index)) exact = true }
+        index += 1_usize
+    }
+    ret UpdateRequest{channel, version, check, force, exact}
+}
+
+fn run_update(request: UpdateRequest) -> u32 {
+    if request.check && request.force { ret fail("--check and --force cannot be used together") }
+    if request.exact && request.channel != "" { ret fail("--version and --channel cannot be used together") }
+    if request.exact && request.version == "" { ret fail("Invalid Encore version") }
+
+    let root = installation_root()
+    if !safe_installation_root(root) { ret fail("Unable to determine a managed Encore installation root") }
+    if !file_exists(root.join("VERSION").as_str()) || !is_directory(root.join("bin").as_str()) {
+        ret fail("Encore is not installed as a managed distribution in " + root.as_str())
+    }
+
+    let channel = if request.exact { "" } elif request.channel != "" { request.channel } else { selected_channel(root) }
+    let manifest_url = update_manifest_url(channel, request.version, request.exact)
+    let manifest_source = match fetch(manifest_url, 1024_usize * 1024_usize) {
+        Result::Ok(value) => value
+        Result::Err(error) => { ret fail(error) }
+    }
+    let manifest = match decode_manifest(manifest_source, channel, request.version, request.exact) {
+        Result::Ok(value) => value
+        Result::Err(error) => { ret fail(error) }
+    }
+    let installed_version = trim_line_endings(read_file(root.join("VERSION").as_str()))
+    let label = if request.exact { "version " + manifest.version } else { channel }
+    if installed_version == manifest.version && !request.force {
+        println("Encore " + installed_version + " is up to date on " + label)
+        ret 0_u32
+    }
+    if request.check {
+        println("Encore " + installed_version + " can be updated to " + manifest.version + " from " + label)
+        ret 0_u32
+    }
+
+    let parent = match root.parent() { Some(value) => value None => { ret fail("Invalid Encore installation root") } }
+    let workspace = parent.join(".encore-update")
+    if file_exists(workspace.as_str()) && remove_dir_all(workspace.as_str()) != 0_i32 {
+        ret fail("Another Encore update is active in " + workspace.as_str())
+    }
+    if mkdir_all(workspace.join("unpack").as_str()) != 0_i32 { ret fail("Unable to create update workspace") }
+    let archive = workspace.join("release." + manifest.asset.format)
+    let payload = match fetch(manifest.asset.url, 512_usize * 1024_usize * 1024_usize) {
+        Result::Ok(value) => value
+        Result::Err(error) => {
+            let _cleaned = cleanup(workspace)
+            ret fail(error)
+        }
+    }
+    if write_file(archive.as_str(), payload) != 0_i32 {
+        let _cleaned = cleanup(workspace)
+        ret fail("Unable to write downloaded release archive")
+    }
+    if file_sha256(archive.as_str()) != manifest.asset.checksum {
+        let _cleaned = cleanup(workspace)
+        ret fail("Checksum verification failed for Encore " + manifest.version)
+    }
+    let staged = match extract_release(archive, workspace.join("unpack"), manifest) {
+        Result::Ok(value) => value
+        Result::Err(error) => {
+            let _cleaned = cleanup(workspace)
+            ret fail(error)
+        }
+    }
+    let settings = root.join("settings.toml")
+    if file_exists(settings.as_str()) && copy_file(settings.as_str(), staged.join("settings.toml").as_str()) != 0_i32 {
+        let _cleaned = cleanup(workspace)
+        ret fail("Unable to preserve Encore settings")
+    }
+    if !verify_staged_compiler(staged, manifest.version, workspace) {
+        let _cleaned = cleanup(workspace)
+        ret fail("Downloaded compiler does not report Encore " + manifest.version)
+    }
+    let new_executable = staged.join("bin").join(target_executable_name(host_target(), "encore"))
+    let commit = commit_self_update(staged.as_str(), root.as_str(), new_executable.as_str(), workspace.as_str())
+    if commit < 0_i32 {
+        let _cleaned = cleanup(workspace)
+        ret fail("Unable to activate Encore " + manifest.version + "; the previous installation was restored")
+    }
+    if request.exact { println("Installed Encore " + manifest.version) }
+    else { println("Updated Encore from " + installed_version + " to " + manifest.version + " on " + channel) }
+    if commit == 1_i32 { println("The Windows update will finish after this process exits") }
+    ret 0_u32
+}
+
+fn decode_manifest(source: str, requested_channel: str, requested_version: str, exact: bool) -> Result[UpdateManifest, str] {
+    let document = match parse(source) {
+        Result::Ok(value) => value
+        Result::Err(error) => { ret Result::Err("Invalid update manifest: " + error.message()) }
+    }
+    if json_number(document, "schema") != "1" { ret Result::Err("Invalid update manifest: unsupported schema") }
+    let channel = json_string(document, "channel")
+    let version = normalize_version(json_string(document, "version"))
+    let tag = json_string(document, "tag")
+    let commit = json_string(document, "commit")
+    if version == "" || tag == "" || commit == "" { ret Result::Err("Invalid update manifest: missing release identity") }
+    if exact && requested_version != version { ret Result::Err("Invalid update manifest: requested " + requested_version + " but received " + version) }
+    if !exact && channel != requested_channel { ret Result::Err("Invalid update manifest: requested channel " + requested_channel + " but received " + channel) }
+    let assets = match document.get("assets") {
+        Some(value) => match value.as_array() { Some(items) => items None => { ret Result::Err("Invalid update manifest: assets must be an array") } }
+        None => { ret Result::Err("Invalid update manifest: missing assets") }
+    }
+    let triple = host_triple()
+    for item in assets {
+        if json_string(item, "triple") == triple {
+            let url = json_string(item, "url")
+            let checksum = ascii_lower(json_string(item, "sha256"))
+            let format = json_string(item, "format")
+            if !safe_download_url(url) || !valid_checksum(checksum) || (format != "tar.gz" && format != "zip") {
+                ret Result::Err("Invalid update manifest: invalid asset for " + triple)
+            }
+            if (format == "zip") != contains(triple, "windows") { ret Result::Err("Invalid update manifest: archive format does not match " + triple) }
+            ret Result::Ok(UpdateManifest{channel, version, tag, commit, UpdateAsset{triple, url, checksum, format}})
+        }
+    }
+    ret Result::Err("Encore " + version + " has no release asset for " + triple)
+}
+
+fn extract_release(archive: Path, unpack: Path, manifest: UpdateManifest) -> Result[Path, str] {
+    let tool = archive_tool()
+    let listing = unpack.join("archive.list")
+    let mut args = Vec[str]::new()
+    args.push("-tf")
+    args.push(archive.as_str())
+    let inspect_status = run_args_capture(tool, args, listing.as_str())
+    if inspect_status != 0_i32 {
+        let detail = trim_line_endings(read_file(listing.as_str()))
+        let suffix = if detail == "" { " (exit status " + Debug::fmt(inspect_status) + ")" } else { ": " + detail }
+        ret Result::Err("Unable to inspect release archive with " + tool + suffix)
+    }
+    let entries = split_lines(read_file(listing.as_str()))
+    if entries.len() == 0_usize { ret Result::Err("Release archive is empty") }
+    let mut package_name = ""
+    for path in entries {
+        if !safe_archive_path(path) { ret Result::Err("Release archive contains an unsafe path: " + path) }
+        let root_name = first_component(path)
+        if package_name == "" { package_name = root_name }
+        elif package_name != root_name { ret Result::Err("Release archive must contain exactly one package directory") }
+    }
+    let types = unpack.join("archive.types")
+    args = Vec[str]::new()
+    args.push("-tvf")
+    args.push(archive.as_str())
+    if run_args_capture(tool, args, types.as_str()) != 0_i32 || !safe_archive_types(read_file(types.as_str())) {
+        ret Result::Err("Release archive contains links or special files")
+    }
+    args = Vec[str]::new()
+    args.push("-xf")
+    args.push(archive.as_str())
+    args.push("-C")
+    args.push(unpack.as_str())
+    if run_args(tool, args) != 0_i32 { ret Result::Err("Unable to extract Encore release archive") }
+    let staged = unpack.join(package_name)
+    let executable = staged.join("bin").join(target_executable_name(host_target(), "encore"))
+    if !is_directory(staged.join("bin").as_str()) || !is_directory(staged.join("lib").as_str()) ||
+       !is_directory(staged.join("share").as_str()) || !file_exists(executable.as_str()) ||
+       trim_line_endings(read_file(staged.join("VERSION").as_str())) != manifest.version {
+        ret Result::Err("Release archive is not a complete Encore " + manifest.version + " distribution")
+    }
+    ret Result::Ok(staged)
+}
+
+fn archive_tool() -> str {
+    if host_target().os == "windows" {
+        match env("WINDIR") {
+            Some(root) => {
+                let system_tar = Path::new(root).join("System32").join("tar.exe")
+                if file_exists(system_tar.as_str()) { ret system_tar.as_str() }
+            }
+            None => {}
+        }
+    }
+    ret "tar"
+}
+
+fn verify_staged_compiler(staged: Path, version: str, workspace: Path) -> bool {
+    let executable = staged.join("bin").join(target_executable_name(host_target(), "encore"))
+    let output = workspace.join("compiler-version.out")
+    let mut args = Vec[str]::new()
+    args.push("--version")
+    if run_args_capture(executable.as_str(), args, output.as_str()) != 0_i32 { ret false }
+    ret trim_line_endings(read_file(output.as_str())) == "encore " + version
+}
+
+fn fetch(url: str, limit: usize) -> Result[str, str] {
+    if starts_with(url, "file://") {
+        let path = url.slice(7_usize, url.len() - 7_usize)
+        if !file_exists(path) { ret Result::Err("Unable to download " + url) }
+        ret Result::Ok(read_file(path))
+    }
+    if !starts_with(url, "https://") { ret Result::Err("Update URLs must use https:// or file://") }
+    let ca_file = match env("ENCORE_SELF_UPDATE_CA_FILE") { Some(value) => value None => "" }
+    let client = HttpClient::with_config(HttpClientConfig::default().with_ca_file(ca_file).with_max_body_size(limit).with_max_redirects(8_usize).with_timeout_ms(60000_usize))
+    match client.get(url) {
+        Result::Err(error) => { ret Result::Err("Unable to download " + url + ": " + error) }
+        Result::Ok(response) => {
+            if response.status() != 200_u16 { ret Result::Err("Unable to download " + url + ": HTTP " + Debug::fmt(response.status())) }
+            ret Result::Ok(response.body())
+        }
+    }
+}
+
+fn installation_root() -> Path {
+    match env("ENCORE_HOME") { Some(value) => { ret Path::new(value).resolve() } None => {} }
+    let executable = Path::new(executable_path())
+    let fallback = Path::new(home_dir()).join(".encore").resolve()
+    ret match executable.parent() {
+        Some(bin) => match bin.parent() { Some(root) => root.resolve() None => fallback }
+        None => fallback
+    }
+}
+
+fn settings_root() -> Path {
+    match env("ENCORE_HOME") { Some(value) => { ret Path::new(value).resolve() } None => {} }
+    let managed = installation_root()
+    if file_exists(managed.join("VERSION").as_str()) { ret managed }
+    ret Path::new(home_dir()).join(".encore").resolve()
+}
+
+fn selected_channel(root: Path) -> str {
+    let source = read_file(root.join("settings.toml").as_str())
+    for line in split_lines(source) {
+        let prefix = "channel = \""
+        if starts_with(line, prefix) && line.len() > prefix.len() && line.slice(line.len() - 1_usize, 1_usize) == "\"" {
+            let value = line.slice(prefix.len(), line.len() - prefix.len() - 1_usize)
+            if valid_channel(value) { ret value }
+        }
+    }
+    ret "stable"
+}
+
+fn update_manifest_url(channel: str, version: str, exact: bool) -> str {
+    match env("ENCORE_SELF_UPDATE_BASE_URL") {
+        Some(value) => {
+            let base = trim_trailing_slash(value)
+            if !safe_download_url(base) { ret base }
+            if exact { ret base + "/versions/" + version + ".json" }
+            ret base + "/channels/" + channel + ".json"
+        }
+        None => {
+            let releases = "https://github.com/encore-language/encore/releases/download"
+            if exact { ret releases + "/v" + version + "/channel.json" }
+            ret releases + "/channel-" + channel + "/channel.json"
+        }
+    }
+}
+
+fn safe_installation_root(root: Path) -> bool {
+    let value = root.as_str()
+    if value == "" || value == "/" || value == "\\" || value == home_dir() { ret false }
+    match root.name() { Some(name) => { ret name != "." && name != ".." } None => { ret false } }
+}
+
+fn safe_archive_path(path: str) -> bool {
+    if path == "" || starts_with(path, "/") || starts_with(path, "\\") || contains(path, "\\") || contains(path, ":") { ret false }
+    if path == ".." || starts_with(path, "../") || contains(path, "/../") || ends_with(path, "/..") { ret false }
+    ret first_component(path) != "." && first_component(path) != ".."
+}
+
+fn safe_archive_types(source: str) -> bool {
+    for line in split_lines(source) {
+        if line != "" {
+            let kind = line.slice(0_usize, 1_usize)
+            if kind != "-" && kind != "d" { ret false }
+        }
+    }
+    ret true
+}
+
+fn first_component(path: str) -> str {
+    let mut index = 0_usize
+    while index < path.len() && path.slice(index, 1_usize) != "/" { index += 1_usize }
+    ret path.slice(0_usize, index)
+}
+
+fn json_string(value: Json, key: str) -> str {
+    ret match value.get(key) {
+        Some(found) => match found.as_str() { Some(text) => text None => "" }
+        None => ""
+    }
+}
+
+fn json_number(value: Json, key: str) -> str {
+    ret match value.get(key) {
+        Some(found) => match found.as_number() { Some(text) => text None => "" }
+        None => ""
+    }
+}
+
+fn normalize_version(raw: str) -> str {
+    let value = if starts_with(raw, "v") { raw.slice(1_usize, raw.len() - 1_usize) } else { raw }
+    if value == "" { ret "" }
+    let allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-+"
+    let mut index = 0_usize
+    while index < value.len() {
+        if !contains(allowed, value.slice(index, 1_usize)) { ret "" }
+        index += 1_usize
+    }
+    if !contains(value, ".") { ret "" }
+    ret value
+}
+
+fn valid_channel(value: str) -> bool { ret value == "stable" || value == "beta" || value == "nightly" }
+fn valid_checksum(value: str) -> bool {
+    if value.len() != 64_usize { ret false }
+    let mut index = 0_usize
+    while index < value.len() {
+        if !contains("0123456789abcdef", value.slice(index, 1_usize)) { ret false }
+        index += 1_usize
+    }
+    ret true
+}
+fn safe_download_url(value: str) -> bool { ret starts_with(value, "https://") || starts_with(value, "file://") }
+fn cleanup(workspace: Path) -> bool {
+    if file_exists(workspace.as_str()) { let _status = remove_dir_all(workspace.as_str()) }
+    ret true
+}
+fn has_argument(needle: str) -> bool {
+    let mut index = 3_usize
+    while index < argc() {
+        if argument(index) == needle { ret true }
+        index += 1_usize
+    }
+    ret false
+}
+fn argument(index: usize) -> str {
+    match argv(index) { Some(value) => { ret value } None => { ret "" } }
+}
+fn parse_decimal(value: str) -> usize {
+    let mut out = 0_usize
+    let mut index = 0_usize
+    while index < value.len() {
+        let byte = value.byte_at(index)
+        if byte < 48_u8 || byte > 57_u8 { ret 0_usize }
+        out = out * 10_usize + (byte - 48_u8) as usize
+        index += 1_usize
+    }
+    ret out
+}
+fn split_lines(value: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index <= value.len() {
+        if index == value.len() || value.slice(index, 1_usize) == "\n" {
+            let mut line = value.slice(start, index - start)
+            if ends_with(line, "\r") { line = line.slice(0_usize, line.len() - 1_usize) }
+            if line != "" { out.push(line) }
+            start = index + 1_usize
+        }
+        index += 1_usize
+    }
+    ret out
+}
+fn trim_line_endings(value: str) -> str {
+    let mut end = value.len()
+    while end > 0_usize && (value.slice(end - 1_usize, 1_usize) == "\n" || value.slice(end - 1_usize, 1_usize) == "\r") { end -= 1_usize }
+    ret value.slice(0_usize, end)
+}
+fn trim_trailing_slash(value: str) -> str {
+    let mut end = value.len()
+    while end > 0_usize && value.slice(end - 1_usize, 1_usize) == "/" { end -= 1_usize }
+    ret value.slice(0_usize, end)
+}
+fn ascii_lower(value: str) -> str {
+    let mut out = ""
+    let lower = "abcdefghijklmnopqrstuvwxyz"
+    let mut index = 0_usize
+    while index < value.len() {
+        let byte = value.byte_at(index)
+        if byte >= 65_u8 && byte <= 90_u8 { out += lower.slice((byte - 65_u8) as usize, 1_usize) }
+        else { out += value.slice(index, 1_usize) }
+        index += 1_usize
+    }
+    ret out
+}
+fn contains(value: str, needle: str) -> bool {
+    if needle == "" { ret true }
+    let mut index = 0_usize
+    while index + needle.len() <= value.len() {
+        if value.slice(index, needle.len()) == needle { ret true }
+        index += 1_usize
+    }
+    ret false
+}
+fn starts_with(value: str, prefix: str) -> bool { ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix }
+fn ends_with(value: str, suffix: str) -> bool { ret suffix.len() <= value.len() && value.slice(value.len() - suffix.len(), suffix.len()) == suffix }
+fn fail(message: str) -> u32 { println("Error: " + message) ret 1_u32 }
