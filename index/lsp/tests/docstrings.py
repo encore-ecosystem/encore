@@ -47,6 +47,7 @@ def main() -> None:
         source_dir.mkdir()
         (root / "encore.toml").write_text(
             '[project]\nname = "doc_hover"\nversion = "0.1.0"\ndependencies = []\n'
+            '\n[format]\nindent-width = 2\n'
         )
 
         net_source = """//! Networking primitives.
@@ -151,7 +152,11 @@ fn main() -> u32 {
 
             formatting_source = """//! Formatting fixture.
 fn value(lhs:u32,rhs:u32)->u32{ret lhs+rhs}
-fn main()->u32{ret value(1_u32)}
+fn main()->u32{
+let expected:str="answer"
+expected=1_u32
+ret value(1_u32)
+}
 """
             formatting_path = source_dir / "formatting.enq"
             formatting_path.write_text(formatting_source)
@@ -187,7 +192,7 @@ fn main()->u32{ret value(1_u32)}
             formatted = formatting[0]["newText"]
             assert "//! Formatting fixture." in formatted, formatted
             assert "fn value(lhs: u32, rhs: u32) -> u32 {" in formatted, formatted
-            assert "    ret lhs + rhs" in formatted, formatted
+            assert "  ret lhs + rhs" in formatted, formatted
 
             send_message(
                 process,
@@ -199,9 +204,14 @@ fn main()->u32{ret value(1_u32)}
                 },
             )
             diagnostics = response_for(process, 5)["result"]["items"]
-            arity = [item for item in diagnostics if item.get("code") == "arity-mismatch"]
+            arity = [item for item in diagnostics if item.get("code") == "argument-mismatch"]
             assert len(arity) == 1, diagnostics
             assert "expects 2 argument(s), got 1" in arity[0]["message"], arity
+            assignment = [item for item in diagnostics if item.get("code") == "assignment-type-mismatch"]
+            assert len(assignment) == 1, diagnostics
+            assert assignment[0].get("relatedInformation"), assignment
+            assert assignment[0].get("data", {}).get("suggestions"), assignment
+            assert "help:" in assignment[0]["message"], assignment
 
             send_message(process, {"jsonrpc": "2.0", "id": 6, "method": "shutdown", "params": None})
             response_for(process, 6)

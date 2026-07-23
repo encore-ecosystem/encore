@@ -7,6 +7,11 @@ import refrain::frontend::{FrontendDiagnostic, SyntaxDocument, Token, TokenType,
 /// Controls deterministic Encore source formatting.
 pub struct FormatConfig {
     indent_width: usize
+    line_width: usize
+    newline_style: str
+    trailing_comma: str
+    reorder_imports: bool
+    format_docstrings: bool
 }
 
 /// Contains a transactional formatting result.
@@ -41,7 +46,21 @@ struct FormatDocument {
 
 impl for FormatConfig {
     /// Returns the stable default style.
-    pub fn new() -> Self { ret Self{4_usize} }
+    pub fn new() -> Self { ret Self{4_usize, 100_usize, "auto", "vertical", true, true} }
+
+    pub fn with_indent_width(self: mut Self, value: usize) -> Self { self.indent_width = value ret self }
+    pub fn with_line_width(self: mut Self, value: usize) -> Self { self.line_width = value ret self }
+    pub fn with_newline_style(self: mut Self, value: str) -> Self { self.newline_style = value ret self }
+    pub fn with_trailing_comma(self: mut Self, value: str) -> Self { self.trailing_comma = value ret self }
+    pub fn with_reorder_imports(self: mut Self, value: bool) -> Self { self.reorder_imports = value ret self }
+    pub fn with_format_docstrings(self: mut Self, value: bool) -> Self { self.format_docstrings = value ret self }
+
+    pub fn indent(self: Self) -> usize { ret self.indent_width }
+    pub fn width(self: Self) -> usize { ret self.line_width }
+    pub fn newline(self: Self) -> str { ret self.newline_style }
+    pub fn comma_style(self: Self) -> str { ret self.trailing_comma }
+    pub fn imports_are_reordered(self: Self) -> bool { ret self.reorder_imports }
+    pub fn docstrings_are_formatted(self: Self) -> bool { ret self.format_docstrings }
 }
 
 impl for FormatResult {
@@ -112,12 +131,12 @@ impl for FormatState {
         ret ()
     }
 
-    fn finish(self: mut Self) -> str {
+    fn finish(self: mut Self, config: FormatConfig) -> str {
         self.pending_space = false
         self.pending_breaks = 0_usize
         if !self.has_output { ret "" }
         self.document.push_line(1_usize)
-        ret self.document.render()
+        ret self.document.render(config)
     }
 }
 
@@ -132,19 +151,37 @@ impl for FormatDocument {
         ret ()
     }
 
-    fn render(self: Self) -> str {
+    fn render(self: Self, config: FormatConfig) -> str {
         let mut out = ""
+        let newline = if config.newline_style == "crlf" { "\r\n" } else { "\n" }
+        let mut column = 0_usize
+        let mut current_indent = 0_usize
         for element in self.elements {
             match element {
-                FormatElement::Text(value) => { out += value }
-                FormatElement::Space => { out += " " }
+                FormatElement::Text(value) => {
+                    out += value
+                    column += value.char_len()
+                }
+                FormatElement::Space => {
+                    if column >= config.line_width {
+                        out += newline
+                        column = 0_usize
+                        let mut remaining = current_indent
+                        while remaining > 0_usize { out += " " remaining -= 1_usize column += 1_usize }
+                    } else {
+                        out += " "
+                        column += 1_usize
+                    }
+                }
                 FormatElement::Line(count) => {
                     let mut remaining = count
-                    while remaining > 0_usize { out += "\n" remaining -= 1_usize }
+                    while remaining > 0_usize { out += newline remaining -= 1_usize }
+                    column = 0_usize
                 }
                 FormatElement::Indent(width) => {
+                    current_indent = width
                     let mut remaining = width
-                    while remaining > 0_usize { out += " " remaining -= 1_usize }
+                    while remaining > 0_usize { out += " " remaining -= 1_usize column += 1_usize }
                 }
             }
         }
@@ -164,9 +201,18 @@ pub fn format_syntax(syntax: SyntaxDocument, diagnostics: Vec[FrontendDiagnostic
     let source = syntax.text()
     let fatal = formatter_syntax_diagnostics(diagnostics)
     if !syntax.is_valid() || fatal.len() > 0_usize { ret FormatResult{source, false, fatal} }
-    let formatted = format_tokens(syntax.lossless_tokens(), config)
+    let mut effective = config
+    if effective.newline_style == "auto" {
+        // Keep default output reproducible across hosts and source checkout
+        // settings. Projects that require CRLF opt in explicitly.
+        effective.newline_style = "lf"
+    }
+    let working_source = if effective.reorder_imports { reorder_import_source(source) } else { source }
+    let working_syntax = SyntaxDocument::parse(working_source)
+    let layout_tokens = normalize_trailing_commas(working_syntax.lossless_tokens(), effective)
+    let formatted = format_tokens(layout_tokens, effective)
     let formatted_syntax = SyntaxDocument::parse(formatted)
-    if !same_significant_tokens(syntax.lossless_tokens(), formatted_syntax.lossless_tokens()) {
+    if !same_significant_tokens(layout_tokens, formatted_syntax.lossless_tokens()) {
         let mut invariant = Vec[FrontendDiagnostic]::new()
         invariant.push(FrontendDiagnostic::new(1_usize, "formatter-invariant", "formatting changed the significant token stream", 0_usize, 0_usize, 1_usize))
         ret FormatResult{source, false, invariant}
@@ -202,7 +248,7 @@ fn format_tokens(tokens: Vec[Token], config: FormatConfig) -> str {
 
         if token.type == TokenType::ONE_LINE_COMMENT || token.type == TokenType::DOC_COMMENT || token.type == TokenType::MODULE_DOC_COMMENT {
             if state.line_has_content { state.request_space() }
-            state.write(token.value, config)
+            state.write(format_comment(token.value, token.type, config), config)
             state.request_break(1_usize)
             state.remember(token.type)
             continue
@@ -289,7 +335,158 @@ fn format_tokens(tokens: Vec[Token], config: FormatConfig) -> str {
         state.write(token.value, config)
         state.remember(token.type)
     }
-    ret state.finish()
+    ret state.finish(config)
+}
+
+fn normalize_trailing_commas(tokens: Vec[Token], config: FormatConfig) -> Vec[Token] {
+    let mut out = Vec[Token]::new()
+    let mut opens = Vec[TokenType]::new()
+    let mut saw_comma = Vec[bool]::new()
+    let mut saw_newline = Vec[bool]::new()
+    let mut previous_significant = TokenType::UNKNOWN
+    let mut index = 0_usize
+    while index < tokens.len() {
+        let token = tokens.get(index).unwrap_or(Token::new(TokenType::UNKNOWN, "", 0_usize, 0_usize))
+        if token.type == TokenType::LEFT_PAREN {
+            opens.push(token.type)
+            saw_comma.push(false)
+            saw_newline.push(false)
+        } elif token.type == TokenType::NEWLINE && opens.len() > 0_usize {
+            saw_newline.set(opens.len() - 1_usize, true)
+        } elif token.type == TokenType::COMMA && opens.len() > 0_usize {
+            saw_comma.set(opens.len() - 1_usize, true)
+            if config.trailing_comma == "never" && next_significant_is(tokens, index + 1_usize, TokenType::RIGHT_PAREN) {
+                index += 1_usize
+                continue
+            }
+        } elif token.type == TokenType::RIGHT_PAREN && opens.len() > 0_usize {
+            let depth = opens.len() - 1_usize
+            let list = saw_comma.get(depth).unwrap_or(false)
+            let vertical = saw_newline.get(depth).unwrap_or(false)
+            let should_add = config.trailing_comma == "always" || (config.trailing_comma == "vertical" && vertical)
+            if list && should_add && previous_significant != TokenType::COMMA {
+                let mut trailing = Vec[Token]::new()
+                while out.len() > 0_usize {
+                    let last = out.get(out.len() - 1_usize).unwrap_or(Token::new(TokenType::UNKNOWN, "", 0_usize, 0_usize))
+                    if !trivia(last.type) { break }
+                    match out.pop() { Option[Token]::Some(value) => { trailing.push(value) } Option[Token]::None => {} }
+                }
+                out.push(Token::new(TokenType::COMMA, ",", token.line, token.column))
+                while trailing.len() > 0_usize {
+                    match trailing.pop() { Option[Token]::Some(value) => { out.push(value) } Option[Token]::None => {} }
+                }
+            }
+            opens.pop()
+            saw_comma.pop()
+            saw_newline.pop()
+        }
+        out.push(token)
+        if !trivia(token.type) { previous_significant = token.type }
+        index += 1_usize
+    }
+    ret out
+}
+
+fn next_significant_is(tokens: Vec[Token], start: usize, expected: TokenType) -> bool {
+    let mut index = start
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Option[Token]::Some(token) => {
+                if !trivia(token.type) { ret token.type == expected }
+            }
+            Option[Token]::None => {}
+        }
+        index += 1_usize
+    }
+    ret false
+}
+
+fn format_comment(value: str, typ: TokenType, config: FormatConfig) -> str {
+    if !config.format_docstrings || (typ != TokenType::DOC_COMMENT && typ != TokenType::MODULE_DOC_COMMENT) { ret value }
+    if value.len() < 3_usize { ret value }
+    let marker = value.slice(0_usize, 3_usize)
+    let mut body = value.slice(3_usize, value.len() - 3_usize)
+    while body.len() > 0_usize && (body.slice(0_usize, 1_usize) == " " || body.slice(0_usize, 1_usize) == "\t") {
+        body = body.slice(1_usize, body.len() - 1_usize)
+    }
+    if body == "" { ret marker }
+    ret marker + " " + body
+}
+
+fn reorder_import_source(source: str) -> str {
+    let mut lines = split_source_lines(source)
+    let mut index = 0_usize
+    while index < lines.len() {
+        if !import_line(lines.get(index).unwrap_or("")) { index += 1_usize continue }
+        let start = index
+        while index < lines.len() && import_line(lines.get(index).unwrap_or("")) { index += 1_usize }
+        let end = index
+        let mut left = start + 1_usize
+        while left < end {
+            let value = lines.get(left).unwrap_or("")
+            let mut cursor = left
+            while cursor > start {
+                let previous = lines.get(cursor - 1_usize).unwrap_or("")
+                if !text_less(value, previous) { break }
+                lines.set(cursor, previous)
+                cursor -= 1_usize
+            }
+            lines.set(cursor, value)
+            left += 1_usize
+        }
+    }
+    let mut out = ""
+    index = 0_usize
+    while index < lines.len() {
+        if index > 0_usize { out += "\n" }
+        out += lines.get(index).unwrap_or("")
+        index += 1_usize
+    }
+    if source.len() > 0_usize && (source.slice(source.len() - 1_usize, 1_usize) == "\n") { out += "\n" }
+    ret out
+}
+
+fn split_source_lines(source: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut current = ""
+    let mut index = 0_usize
+    while index < source.len() {
+        let ch = source.slice(index, 1_usize)
+        if ch == "\n" {
+            if current.len() > 0_usize && current.slice(current.len() - 1_usize, 1_usize) == "\r" { current = current.slice(0_usize, current.len() - 1_usize) }
+            out.push(current)
+            current = ""
+        } else {
+            current += ch
+        }
+        index += 1_usize
+    }
+    if current != "" { out.push(current) }
+    ret out
+}
+
+fn import_line(line: str) -> bool {
+    let trimmed = trim_left(line)
+    ret starts_with(trimmed, "import ") || starts_with(trimmed, "pub import ")
+}
+
+fn trim_left(value: str) -> str {
+    let mut start = 0_usize
+    while start < value.len() && (value.slice(start, 1_usize) == " " || value.slice(start, 1_usize) == "\t") { start += 1_usize }
+    ret value.slice(start, value.len() - start)
+}
+
+fn text_less(left: str, right: str) -> bool {
+    let limit = if left.byte_len() < right.byte_len() { left.byte_len() } else { right.byte_len() }
+    let mut index = 0_usize
+    while index < limit {
+        let lhs = left.byte_at(index)
+        let rhs = right.byte_at(index)
+        if lhs < rhs { ret true }
+        if lhs > rhs { ret false }
+        index += 1_usize
+    }
+    ret left.byte_len() < right.byte_len()
 }
 
 fn same_significant_tokens(lhs: Vec[Token], rhs: Vec[Token]) -> bool {
@@ -317,7 +514,8 @@ fn same_significant_tokens(lhs: Vec[Token], rhs: Vec[Token]) -> bool {
         if left >= lhs.len() || right >= rhs.len() { ret left >= lhs.len() && right >= rhs.len() }
         let left_token = lhs.get(left).unwrap_or(Token::new(TokenType::UNKNOWN, "", 0_usize, 0_usize))
         let right_token = rhs.get(right).unwrap_or(Token::new(TokenType::UNKNOWN, "", 0_usize, 0_usize))
-        if left_token.type != right_token.type || left_token.value != right_token.value { ret false }
+        if left_token.type != right_token.type { ret false }
+        if !comment_token(left_token.type) && left_token.value != right_token.value { ret false }
         left += 1_usize
         right += 1_usize
     }
@@ -326,6 +524,10 @@ fn same_significant_tokens(lhs: Vec[Token], rhs: Vec[Token]) -> bool {
 
 fn trivia(typ: TokenType) -> bool {
     ret typ == TokenType::WHITESPACE || typ == TokenType::NEWLINE
+}
+
+fn comment_token(typ: TokenType) -> bool {
+    ret typ == TokenType::ONE_LINE_COMMENT || typ == TokenType::MULTI_LINE_COMMENT || typ == TokenType::DOC_COMMENT || typ == TokenType::MODULE_DOC_COMMENT
 }
 
 fn needs_implicit_space(state: FormatState, current: TokenType) -> bool {

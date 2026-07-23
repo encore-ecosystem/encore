@@ -61,6 +61,7 @@ done
 
 scripts/test-analyzer.sh "$compiler"
 scripts/test-tooling-foundation.sh "$compiler"
+scripts/test-complete-analysis.sh "$compiler"
 scripts/test-lsp-integration.sh "$compiler"
 scripts/test-cli-contract.sh "$compiler"
 scripts/test-release-channels.sh

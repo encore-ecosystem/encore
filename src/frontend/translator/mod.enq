@@ -5,6 +5,9 @@ import core::fmt::Debug
 import core::process::exit
 import core::io::eprintln
 import std::vec::Vec
+import std::os::{file_exists, read_file}
+import rich::panel::Panel
+import rich::style::{accent, error_text, muted}
 
 import refrain::frontend::parser::statements::EnumStmt
 import refrain::frontend::parser::statements::Expr
@@ -53,7 +56,7 @@ import refrain::frontend::parser::statements::ParsedMatchArm
 import refrain::frontend::parser::statements::MatchArmBody
 import refrain::frontend::lexer::Lexer
 import refrain::frontend::parser::Parser
-import ehirlib::EhirTextBuilder
+import ehirlib::{EhirTextBuilder, suppress_text_builder_output}
 import refrain::target::{TargetSpec, cfg_active_with_features, host_target}
 
 extern fn encore_strset_new() -> usize
@@ -64,6 +67,9 @@ extern fn encore_strmap_new() -> usize
 extern fn encore_strmap_put(map: usize, key: str, value: usize) -> ()
 extern fn encore_strmap_get(map: usize, key: str) -> usize
 extern fn encore_strmap_free(map: usize) -> ()
+extern fn encore_translation_diagnostic_set_json(enabled: bool) -> ()
+extern fn encore_translation_diagnostic_is_json() -> bool
+extern fn encore_terminal_is_tty(fd: i32) -> bool
 
 struct LoweredExpr {
     code: EhirTextBuilder
@@ -79,9 +85,105 @@ fn translation_invariant_error(message: str) -> () {
 
 fn translation_error_at(source_name: str, line: usize, column: usize, code: str, message: str) -> () {
     let location = if source_name == "" { "" } else { source_name + ":" + Debug::fmt(line + 1_usize) + ":" + Debug::fmt(column + 1_usize) + ": " }
-    eprintln(location + "error[" + code + "]: " + message)
+    if unsafe { encore_translation_diagnostic_is_json() } {
+        eprintln(
+            "{\"path\":\"" + translation_json_escape(source_name)
+                + "\",\"line\":" + Debug::fmt(line + 1_usize)
+                + ",\"column\":" + Debug::fmt(column + 1_usize)
+                + ",\"severity\":\"error\",\"code\":\"" + translation_json_escape(code)
+                + "\",\"message\":\"" + translation_json_escape(message)
+                + "\",\"labels\":[{\"path\":\"" + translation_json_escape(source_name)
+                + "\",\"line\":" + Debug::fmt(line + 1_usize)
+                + ",\"column\":" + Debug::fmt(column + 1_usize)
+                + ",\"length\":1,\"kind\":\"primary\",\"message\":\"reported during complete semantic validation\"}]"
+                + ",\"notes\":[\"reported by the lowering-time semantic validator\"],\"helps\":[],\"suggestions\":[]}"
+        )
+    } else {
+        let interactive = unsafe { encore_terminal_is_tty(2_i32) }
+        let mut rendered = translation_rich_location(location, interactive)
+            + translation_rich_error("error[" + code + "]", interactive) + ": " + message
+        if source_name != "" {
+            let frame_title = "--> " + source_name + ":" + Debug::fmt(line + 1_usize) + ":" + Debug::fmt(column + 1_usize) + " (primary)"
+            let mut frame_body = ""
+            if file_exists(source_name) {
+                let source_line = translation_source_line(read_file(source_name), line)
+                frame_body = translation_rich_accent(Debug::fmt(line + 1_usize), interactive)
+                    + " " + translation_rich_muted("│", interactive) + " " + source_line
+                    + "\n  " + translation_rich_muted("│", interactive) + " "
+                let mut spaces = column
+                while spaces > 0_usize { frame_body += " " spaces -= 1_usize }
+                frame_body += translation_rich_error("^", interactive)
+            } else {
+                frame_body = translation_rich_muted("source text is unavailable", interactive)
+            }
+            rendered += "\n" + Panel::titled(translation_rich_accent(frame_title, interactive), frame_body).render()
+            rendered += "\n  " + translation_rich_muted("= note:", interactive) + " reported by the complete lowering-time semantic validator"
+        }
+        eprintln(rendered)
+    }
     exit(1_i32)
     ret ()
+}
+
+fn translation_rich_location(value: str, interactive: bool) -> str {
+    if interactive { ret muted(value) }
+    ret value
+}
+
+fn translation_rich_error(value: str, interactive: bool) -> str {
+    if interactive { ret error_text(value) }
+    ret value
+}
+
+fn translation_rich_accent(value: str, interactive: bool) -> str {
+    if interactive { ret accent(value) }
+    ret value
+}
+
+fn translation_rich_muted(value: str, interactive: bool) -> str {
+    if interactive { ret muted(value) }
+    ret value
+}
+
+/// Selects the projection used by validation-only translation diagnostics.
+pub fn set_translation_diagnostic_json(enabled: bool) -> () {
+    unsafe { encore_translation_diagnostic_set_json(enabled) }
+    ret ()
+}
+
+fn translation_source_line(source: str, target: usize) -> str {
+    let mut current = ""
+    let mut line = 0_usize
+    let mut index = 0_usize
+    while index < source.len() {
+        let ch = source.slice(index, 1_usize)
+        if ch == "\n" {
+            if line == target { ret current }
+            current = ""
+            line += 1_usize
+        } elif ch != "\r" {
+            current += ch
+        }
+        index += 1_usize
+    }
+    if line == target { ret current }
+    ret ""
+}
+
+fn translation_json_escape(value: str) -> str {
+    let mut out = ""
+    let mut index = 0_usize
+    while index < value.len() {
+        let ch = value.slice(index, 1_usize)
+        if ch == "\\" { out += "\\\\" }
+        elif ch == "\"" { out += "\\\"" }
+        elif ch == "\n" { out += "\\n" }
+        elif ch == "\r" { out += "\\r" }
+        elif ch == "\t" { out += "\\t" }
+        else { out += ch }
+        index += 1_usize
+    }
+    ret out
 }
 
 struct VarType {
@@ -278,6 +380,25 @@ pub fn translate_modules_to_ehir_bundle(modules: Vec[TranslationModule], target:
     let text = bundle.finish()
     free_translation_indexes(ctx)
     ret text
+}
+
+/// Runs the complete lowering-time semantic validator without retaining EHIR
+/// text. This preserves the mature checks for generics, traits, ownership,
+/// async control flow and exhaustiveness while the shared query engine adopts
+/// them incrementally.
+pub fn validate_translation_modules(modules: Vec[TranslationModule], target: TargetSpec, entry_module: str) -> () {
+    suppress_text_builder_output(true)
+    let _discarded = translate_modules_to_ehir_bundle(modules, target, entry_module)
+    suppress_text_builder_output(false)
+    ret ()
+}
+
+/// Validation-only counterpart for a standalone source AST.
+pub fn validate_ast_for_target(ast: Vec[Statement], target: TargetSpec) -> () {
+    suppress_text_builder_output(true)
+    let _discarded = translate_to_ehir_for_target(ast, target)
+    suppress_text_builder_output(false)
+    ret ()
 }
 
 fn translate_ast_to_ehir(ast: Vec[Statement], modules: Vec[TranslationModule], target: TargetSpec, features: Vec[str]) -> str {
@@ -702,7 +823,7 @@ fn thread_type_is_send(ctx: mut TranslatorContext, typ: str, seen: Vec[str]) -> 
         for generic in generic_args_from_path(value) { if !thread_type_is_send(ctx, generic, seen) { ret false } }
         ret true
     }
-    if contains_string(seen, value) { ret true }
+    if contains_str(seen, value) { ret true }
     let mut next_seen = seen
     next_seen.push(value)
     let mut found = false
@@ -3365,6 +3486,14 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
                 Option[str]::Some(found) => {
                     if starts_with(found, "mut ") {
                         lowered = LoweredExpr{EhirTextBuilder::new(), ctx_lookup_value_name(ctx, arg_path), found}
+                    } else {
+                        translation_error_at(
+                            arg.source_name,
+                            arg.line,
+                            arg.column,
+                            "mutable-argument-required",
+                            "parameter " + Debug::fmt(i + 1_usize) + " of '" + callee_base + "' requires a mutable argument; declare '" + arg_path + "' with 'let mut'"
+                        )
                     }
                 }
                 Option[str]::None => {}
