@@ -90,7 +90,7 @@ set +e
 arity_code=$?
 set -e
 test "$arity_code" -eq 1
-grep -q 'error\[arity-mismatch\]' "$tmp/check-arity.log"
+grep -q 'error\[argument-mismatch\]' "$tmp/check-arity.log"
 
 cat > "$tmp/project/src/main.enq" <<'EOF'
 fn main() -> str { ret 0_u32 }

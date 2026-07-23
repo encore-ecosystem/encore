@@ -31,6 +31,7 @@ pub struct ProjectManifest {
     build: Option[str]
     target: str
     features: Vec[ProjectFeature]
+    original_source: str
 }
 
 /// Reads and validates `encore.toml` from a project root.
@@ -70,7 +71,7 @@ pub fn read_project_manifest(root: Path) -> ProjectManifest {
         dependencies.push("sys@core")
     }
 
-    ret ProjectManifest{name, version, description, readme, licence, dependencies, build, target, features}
+    ret ProjectManifest{name, version, description, readme, licence, dependencies, build, target, features, source}
 }
 
 /// Returns the project package name.
@@ -163,6 +164,10 @@ pub fn project_manifest_add_dependency(manifest: mut ProjectManifest, dependency
 
 /// Serializes the normalized manifest back to `encore.toml`.
 pub fn write_project_manifest(root: Path, manifest: ProjectManifest) -> i32 {
+    if manifest.original_source != "" {
+        let updated = replace_project_dependencies(manifest.original_source, string_array(manifest.dependencies))
+        ret write_file(native_path(root.join("encore.toml").as_str()), updated)
+    }
     let mut source = "[project]\n"
     source = source + "name = \"" + toml_escape(manifest.name) + "\"\n"
     source = source + "version = \"" + toml_escape(manifest.version) + "\"\n"
@@ -194,6 +199,81 @@ pub fn write_project_manifest(root: Path, manifest: ProjectManifest) -> i32 {
         }
     }
     ret write_file(native_path(root.join("encore.toml").as_str()), source)
+}
+
+fn replace_project_dependencies(source: str, dependencies: str) -> str {
+    let lines = manifest_lines(source)
+    let mut out = ""
+    let mut in_project = false
+    let mut wrote = false
+    let mut skipping_array = false
+    for line in lines {
+        let trimmed = trim_manifest_line(line)
+        if skipping_array {
+            if contains_manifest_text(trimmed, "]") { skipping_array = false }
+            continue
+        }
+        if starts_with_text(trimmed, "[") {
+            if in_project && !wrote {
+                out += "dependencies = " + dependencies + "\n"
+                wrote = true
+            }
+            in_project = trimmed == "[project]"
+        }
+        if in_project && starts_with_text(trimmed, "dependencies") {
+            out += "dependencies = " + dependencies + "\n"
+            wrote = true
+            if !contains_manifest_text(trimmed, "]") { skipping_array = true }
+            continue
+        }
+        out += line + "\n"
+    }
+    if in_project && !wrote { out += "dependencies = " + dependencies + "\n" }
+    ret out
+}
+
+fn manifest_lines(source: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut line = ""
+    let mut index = 0_usize
+    while index < source.len() {
+        let ch = source.slice(index, 1_usize)
+        if ch == "\n" {
+            if line.len() > 0_usize && line.slice(line.len() - 1_usize, 1_usize) == "\r" { line = line.slice(0_usize, line.len() - 1_usize) }
+            out.push(line)
+            line = ""
+        } else { line += ch }
+        index += 1_usize
+    }
+    if line != "" { out.push(line) }
+    ret out
+}
+
+fn trim_manifest_line(value: str) -> str {
+    let mut start = 0_usize
+    let mut end = value.len()
+    while start < end && (value.slice(start, 1_usize) == " " || value.slice(start, 1_usize) == "\t") { start += 1_usize }
+    while end > start && (value.slice(end - 1_usize, 1_usize) == " " || value.slice(end - 1_usize, 1_usize) == "\t") { end -= 1_usize }
+    ret value.slice(start, end - start)
+}
+
+fn contains_manifest_text(value: str, needle: str) -> bool {
+    if needle.len() == 0_usize { ret true }
+    let mut index = 0_usize
+    while index + needle.len() <= value.len() {
+        if value.slice(index, needle.len()) == needle { ret true }
+        index += 1_usize
+    }
+    ret false
+}
+
+#attr(test)
+fn manifest_dependency_update_preserves_tooling_sections() -> bool {
+    let source = "[project]\nname = \"sample\"\ndependencies = [\n  \"path@one\",\n]\n\n[lint.rules]\nunused-imports = \"deny\"\n\n[format]\nindent-width = 2\n"
+    let updated = replace_project_dependencies(source, "[\"path@one\", \"path@two\"]")
+    ret contains_manifest_text(updated, "dependencies = [\"path@one\", \"path@two\"]")
+        && contains_manifest_text(updated, "[lint.rules]\nunused-imports = \"deny\"")
+        && contains_manifest_text(updated, "[format]\nindent-width = 2")
 }
 
 fn feature_members(features: Vec[ProjectFeature], name: str) -> Vec[str] {

@@ -85,8 +85,11 @@ encore format
 EHIR, object files or a `target` directory. `format --check` reports formatting
 drift without writing files; plain `format` applies the deterministic style.
 
-Lint rules default to warnings. Configure persistent levels in
-`encore.toml`; command-line levels take precedence:
+Most lint rules default to warnings. `missing-public-docstring` is disabled by
+default so applications are not forced to document every exported
+implementation detail; enable it explicitly for library-quality API policy.
+Configure persistent levels in `encore.toml`; command-line levels take
+precedence:
 
 ```toml
 [lint.rules]

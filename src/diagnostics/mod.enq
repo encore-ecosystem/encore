@@ -1,0 +1,208 @@
+//! Renders the structured diagnostics shared by compiler tools.
+
+import core::fmt::Debug
+import std::vec::Vec
+import rich::panel::Panel
+import rich::style::{accent, error_text, muted, success_text, warn_text}
+
+import refrain::frontend::{DiagnosticLabel, DiagnosticLabelKind, FrontendDiagnostic, SuggestionApplicability}
+
+extern fn encore_terminal_is_tty(fd: i32) -> bool
+
+/// Renders a diagnostic in the source-oriented terminal style used by Encore.
+pub fn render_diagnostic(path: str, source: str, diagnostic: FrontendDiagnostic) -> str {
+    let interactive = unsafe { encore_terminal_is_tty(2_i32) }
+    let severity = severity_name(diagnostic.severity)
+    let location = path + ":" + Debug::fmt(diagnostic.line + 1_usize) + ":" + Debug::fmt(diagnostic.column + 1_usize)
+    let token = severity + "[" + diagnostic.code + "]"
+    let mut out = rich_location(location, interactive) + ": "
+        + rich_severity(token, diagnostic.severity, interactive) + ": " + diagnostic.message + "\n"
+    out += render_source_frame(
+        path,
+        source,
+        diagnostic.line,
+        diagnostic.column,
+        diagnostic.length,
+        primary_label_message(path, diagnostic),
+        true,
+        diagnostic.severity,
+        interactive
+    )
+    for label in diagnostic.labels {
+        if !label_is_primary_frame(path, diagnostic, label) {
+            out += render_related_label(path, source, label, label.kind == DiagnosticLabelKind::Primary, diagnostic.severity, interactive)
+        }
+    }
+    for note in diagnostic.notes { out += render_annotation("note", note, 0_usize, interactive) }
+    for help in diagnostic.helps { out += render_annotation("help", help, 3_usize, interactive) }
+    for suggestion in diagnostic.suggestions {
+        let mut suggestion_text = suggestion.message
+        if suggestion.replacement != "" { suggestion_text += ": `" + suggestion.replacement + "`" }
+        out += render_annotation("suggestion (" + applicability_name(suggestion.applicability) + ")", suggestion_text, 2_usize, interactive)
+    }
+    ret out
+}
+
+/// Returns the stable textual name used by JSON and terminal suggestions.
+pub fn applicability_name(value: SuggestionApplicability) -> str {
+    match value {
+        SuggestionApplicability::MachineApplicable => { ret "machine-applicable" }
+        SuggestionApplicability::MaybeIncorrect => { ret "maybe-incorrect" }
+        SuggestionApplicability::HasPlaceholders => { ret "has-placeholders" }
+        SuggestionApplicability::Unspecified => { ret "unspecified" }
+    }
+    ret "unspecified"
+}
+
+fn primary_label_message(path: str, diagnostic: FrontendDiagnostic) -> str {
+    for label in diagnostic.labels {
+        if label_is_primary_frame(path, diagnostic, label) { ret label.message }
+    }
+    ret ""
+}
+
+fn label_is_primary_frame(path: str, diagnostic: FrontendDiagnostic, label: DiagnosticLabel) -> bool {
+    let label_path = if label.source_name == "" { path } else { label.source_name }
+    ret label.kind == DiagnosticLabelKind::Primary
+        && label_path == path
+        && label.line == diagnostic.line
+        && label.column == diagnostic.column
+        && label.length == diagnostic.length
+}
+
+fn render_related_label(default_path: str, source: str, label: DiagnosticLabel, primary: bool, severity: usize, interactive: bool) -> str {
+    let label_path = if label.source_name == "" { default_path } else { label.source_name }
+    if label_path == default_path {
+        ret render_source_frame(label_path, source, label.line, label.column, label.length, label.message, primary, severity, interactive)
+    }
+    let kind = if primary { "primary" } else { "secondary" }
+    let location = ":::" + " " + label_path + ":" + Debug::fmt(label.line + 1_usize) + ":" + Debug::fmt(label.column + 1_usize) + " (" + kind + ")"
+    let body = if label.message == "" { rich_muted("source text is not loaded for this related span", interactive) } else { label.message }
+    ret Panel::titled(rich_frame_title(location, primary, interactive), body).render() + "\n"
+}
+
+fn render_source_frame(
+    path: str,
+    source: str,
+    line: usize,
+    column: usize,
+    length: usize,
+    message: str,
+    primary: bool,
+    severity: usize,
+    interactive: bool
+) -> str {
+    let text = source_line(source, line)
+    let number = Debug::fmt(line + 1_usize)
+    let gutter = rich_muted("│", interactive)
+    let mut body = rich_accent(pad_left(number, 4_usize), interactive) + " " + gutter + " " + text + "\n"
+    body += "     " + gutter + " "
+    let mut spaces = column
+    while spaces > 0_usize { body += " " spaces -= 1_usize }
+    let marker = if primary { "^" } else { "-" }
+    let mut markers = if length == 0_usize { 1_usize } else { length }
+    let mut marker_text = ""
+    while markers > 0_usize { marker_text += marker markers -= 1_usize }
+    body += rich_marker(marker_text, primary, severity, interactive)
+    if message != "" { body += " " + rich_label_message(message, primary, severity, interactive) }
+    let arrow = if primary { "-->" } else { ":::" }
+    let kind = if primary { "primary" } else { "secondary" }
+    let title = arrow + " " + path + ":" + Debug::fmt(line + 1_usize) + ":" + Debug::fmt(column + 1_usize) + " (" + kind + ")"
+    ret Panel::titled(rich_frame_title(title, primary, interactive), body).render() + "\n"
+}
+
+fn render_annotation(kind: str, message: str, color: usize, interactive: bool) -> str {
+    let label = "= " + kind + ":"
+    let rendered_label = if color == 3_usize { rich_success(label, interactive) }
+        elif color == 2_usize { rich_accent(label, interactive) }
+        else { rich_muted(label, interactive) }
+    ret "  " + rendered_label + " " + message + "\n"
+}
+
+fn rich_location(value: str, interactive: bool) -> str {
+    if interactive { ret muted(value) }
+    ret value
+}
+
+fn rich_severity(value: str, severity: usize, interactive: bool) -> str {
+    if !interactive { ret value }
+    if severity == 1_usize { ret error_text(value) }
+    if severity == 2_usize { ret warn_text(value) }
+    ret accent(value)
+}
+
+fn rich_frame_title(value: str, primary: bool, interactive: bool) -> str {
+    if !interactive { ret value }
+    if primary { ret accent(value) }
+    ret muted(value)
+}
+
+fn rich_marker(value: str, primary: bool, severity: usize, interactive: bool) -> str {
+    if !interactive { ret value }
+    if !primary { ret accent(value) }
+    if severity == 1_usize { ret error_text(value) }
+    if severity == 2_usize { ret warn_text(value) }
+    ret accent(value)
+}
+
+fn rich_label_message(value: str, primary: bool, severity: usize, interactive: bool) -> str {
+    if !interactive { ret value }
+    if !primary { ret accent(value) }
+    if severity == 1_usize { ret error_text(value) }
+    if severity == 2_usize { ret warn_text(value) }
+    ret value
+}
+
+fn rich_accent(value: str, interactive: bool) -> str {
+    if interactive { ret accent(value) }
+    ret value
+}
+
+fn rich_muted(value: str, interactive: bool) -> str {
+    if interactive { ret muted(value) }
+    ret value
+}
+
+fn rich_success(value: str, interactive: bool) -> str {
+    if interactive { ret success_text(value) }
+    ret value
+}
+
+fn source_line(source: str, target: usize) -> str {
+    let mut line = 0_usize
+    let mut current = ""
+    let mut index = 0_usize
+    while index < source.len() {
+        let ch = source.slice(index, 1_usize)
+        if ch == "\n" {
+            if line == target { ret strip_cr(current) }
+            current = ""
+            line += 1_usize
+        } else {
+            current += ch
+        }
+        index += 1_usize
+    }
+    if line == target { ret strip_cr(current) }
+    ret ""
+}
+
+fn strip_cr(value: str) -> str {
+    if value.len() > 0_usize && value.slice(value.len() - 1_usize, 1_usize) == "\r" {
+        ret value.slice(0_usize, value.len() - 1_usize)
+    }
+    ret value
+}
+
+fn pad_left(value: str, width: usize) -> str {
+    let mut out = ""
+    let mut remaining = if value.len() < width { width - value.len() } else { 0_usize }
+    while remaining > 0_usize { out += " " remaining -= 1_usize }
+    ret out + value
+}
+
+fn severity_name(severity: usize) -> str {
+    if severity == 1_usize { ret "error" }
+    if severity == 2_usize { ret "warning" }
+    ret "note"
+}

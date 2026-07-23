@@ -9,12 +9,19 @@ import std::path::Path
 import std::vec::Vec
 
 import json::{Json, field, stringify}
+import refrain::diagnostics::{applicability_name, render_diagnostic}
 import refrain::formatter::{FormatConfig, FormatResult, format_syntax}
-import refrain::frontend::{AnalysisDatabase, FrontendDiagnostic, FrontendDocument, SyntaxDocument}
-import refrain::project::{ProjectWorkspace, load_binary_workspace, load_library_workspace}
+import refrain::frontend::{AnalysisDatabase, DiagnosticLabelKind, FrontendDiagnostic, FrontendDocument, SyntaxDocument}
+import refrain::frontend::parser::statements::Statement
+import refrain::frontend::translator::{TranslationModule, filter_ast_for_target, set_translation_diagnostic_json, validate_ast_for_target, validate_translation_modules}
+import refrain::project::{ProjectToolingConfig, ProjectWorkspace, load_binary_workspace, load_entry_workspace, load_library_workspace, read_project_tooling_config}
+import refrain::target::{TargetSpec, host_target}
+
+import mod::build::requested_target
 
 struct ToolDiagnostic {
     path: str
+    source: str
     diagnostic: FrontendDiagnostic
 }
 
@@ -22,37 +29,79 @@ struct ToolDiagnostic {
 pub fn native_check() -> u32 {
     let selected = selected_path()
     let format = option_value("--format")
+    if format != "" && format != "full" && format != "json" {
+        eprintln("error[argument]: unsupported diagnostic format '" + format + "'")
+        ret 2_u32
+    }
     let mut diagnostics = Vec[ToolDiagnostic]::new()
     let mut module_count = 0_usize
+    let mut standalone_ast = Option[Vec[Statement]]::None
+    let mut validation_modules = Vec[TranslationModule]::new()
+    let mut validation_target = host_target()
+    let mut validation_entry = ""
+    let config_root = if selected == "" || ends_with(selected, ".enq") { Path::new(".").resolve() } else { Path::new(selected).resolve() }
+    if file_exists(config_root.join("encore.toml").as_str()) {
+        let tooling = read_project_tooling_config(config_root)
+        if !tooling.is_valid() { eprintln("error[manifest]: " + tooling.error_message()) ret 2_u32 }
+    }
 
     if selected != "" && ends_with(selected, ".enq") {
         let path = Path::new(selected).resolve()
         if !file_exists(path.as_str()) { eprintln("error[path]: source path does not exist: " + selected) ret 2_u32 }
-        let source = read_file(path.as_str())
-        let mut database = AnalysisDatabase::new()
-        database.set_module_full(path.as_str(), path.as_str(), source)
-        match database.document(path.as_str()) {
-            Option[FrontendDocument]::Some(document) => {
-                append_diagnostics(path.as_str(), document.diagnostics, diagnostics)
-                if document.diagnostics.len() == 0_usize {
-                    append_diagnostics(path.as_str(), database.module_semantic_diagnostics(path.as_str()), diagnostics)
+        let project_root = source_project_root(path)
+        if file_exists(project_root.join("encore.toml").as_str()) {
+            let mut workspace = load_entry_workspace(project_root, path)
+            validation_target = requested_target(project_root)
+            for module in workspace.modules {
+                if module.path() == path.as_str() {
+                    append_diagnostics(module.path(), module.source, module.diagnostics, diagnostics)
+                    append_diagnostics(module.path(), module.source, workspace.analysis.module_semantic_diagnostics(module.analysis_id.key()), diagnostics)
+                    validation_entry = module.module_id
+                    module_count = 1_usize
                 }
+                validation_modules.push(TranslationModule{
+                    module.module_id,
+                    module.module_path.as_str(),
+                    module.documentation,
+                    module.resolved_imports,
+                    filter_ast_for_target(module.ast, validation_target, module.enabled_features),
+                    module.enabled_features
+                })
             }
-            Option[FrontendDocument]::None => {}
+        } else {
+            let source = read_file(path.as_str())
+            let mut database = AnalysisDatabase::new()
+            database.set_module_full(path.as_str(), path.as_str(), source)
+            match database.document(path.as_str()) {
+                Option[FrontendDocument]::Some(document) => {
+                    append_diagnostics(path.as_str(), source, document.diagnostics, diagnostics)
+                    append_diagnostics(path.as_str(), source, database.module_semantic_diagnostics(path.as_str()), diagnostics)
+                    standalone_ast = Option[Vec[Statement]]::Some(document.ast)
+                }
+                Option[FrontendDocument]::None => {}
+            }
+            module_count = 1_usize
         }
-        module_count = 1_usize
     } else {
         let root = if selected == "" { Path::new(".").resolve() } else { Path::new(selected).resolve() }
         if !file_exists(root.join("encore.toml").as_str()) { eprintln("error[manifest]: Unable to find encore.toml at " + root.join("encore.toml").as_str()) ret 2_u32 }
         let mut workspace = load_analysis_workspace(root)
+        validation_target = requested_target(root)
+        validation_entry = workspace.root_name + "@main.enq"
         for module in workspace.modules {
             if module.owner_name == workspace.root_name {
-                append_diagnostics(module.path(), module.diagnostics, diagnostics)
-                if module.diagnostics.len() == 0_usize {
-                    append_diagnostics(module.path(), workspace.analysis.module_semantic_diagnostics(module.analysis_id.key()), diagnostics)
-                }
+                append_diagnostics(module.path(), module.source, module.diagnostics, diagnostics)
+                append_diagnostics(module.path(), module.source, workspace.analysis.module_semantic_diagnostics(module.analysis_id.key()), diagnostics)
                 module_count += 1_usize
             }
+            validation_modules.push(TranslationModule{
+                module.module_id,
+                module.module_path.as_str(),
+                module.documentation,
+                module.resolved_imports,
+                filter_ast_for_target(module.ast, validation_target, module.enabled_features),
+                module.enabled_features
+            })
         }
     }
 
@@ -61,6 +110,15 @@ pub fn native_check() -> u32 {
         else { print_frontend_diagnostic(item) }
     }
     if diagnostics.len() > 0_usize { ret 1_u32 }
+    set_translation_diagnostic_json(format == "json")
+    match standalone_ast {
+        Option::Some(ast) => { validate_ast_for_target(ast, validation_target) }
+        Option::None => {
+            if validation_modules.len() > 0_usize {
+                validate_translation_modules(validation_modules, validation_target, validation_entry)
+            }
+        }
+    }
     if format != "json" {
         let suffix = if module_count == 1_usize { "" } else { "s" }
         println("Checked " + Debug::fmt(module_count) + " module" + suffix)
@@ -75,16 +133,26 @@ pub fn native_format() -> u32 {
     let mut paths = Vec[str]::new()
     let mut module_names = Vec[str]::new()
     let mut database = AnalysisDatabase::new()
+    let mut config = FormatConfig::new()
 
     if selected != "" && ends_with(selected, ".enq") {
         let path = Path::new(selected).resolve()
         if !file_exists(path.as_str()) { eprintln("error[path]: source path does not exist: " + selected) ret 2_u32 }
+        let root = Path::new(".").resolve()
+        if file_exists(root.join("encore.toml").as_str()) {
+            let tooling = read_project_tooling_config(root)
+            if !tooling.is_valid() { eprintln("error[manifest]: " + tooling.error_message()) ret 2_u32 }
+            config = tooling.format_config()
+        }
         paths.push(path.as_str())
         module_names.push(path.as_str())
         database.set_module(path.as_str(), path.as_str(), read_file(path.as_str()))
     } else {
         let root = if selected == "" { Path::new(".").resolve() } else { Path::new(selected).resolve() }
         if !file_exists(root.join("encore.toml").as_str()) { eprintln("error[manifest]: Unable to find encore.toml at " + root.join("encore.toml").as_str()) ret 2_u32 }
+        let tooling = read_project_tooling_config(root)
+        if !tooling.is_valid() { eprintln("error[manifest]: " + tooling.error_message()) ret 2_u32 }
+        config = tooling.format_config()
         let workspace = load_analysis_workspace(root)
         database = workspace.analysis
         for module in workspace.modules {
@@ -109,12 +177,12 @@ pub fn native_format() -> u32 {
                     Option[FrontendDocument]::Some(value) => value.diagnostics
                     Option[FrontendDocument]::None => Vec[FrontendDiagnostic]::new()
                 }
-                let result = format_syntax(syntax, diagnostics, FormatConfig::new())
+                let result = format_syntax(syntax, diagnostics, config)
                 if !result.is_valid() {
                     failed = true
                     match paths.get(index) {
                         Option[str]::Some(path) => {
-                            for diagnostic in result.errors() { print_format_diagnostic(ToolDiagnostic{path, diagnostic}) }
+                            for diagnostic in result.errors() { print_format_diagnostic(ToolDiagnostic{path, read_file(path), diagnostic}) }
                         }
                         Option[str]::None => {}
                     }
@@ -164,19 +232,44 @@ fn load_analysis_workspace(root: Path) -> ProjectWorkspace {
     ret load_binary_workspace(root)
 }
 
-fn append_diagnostics(path: str, values: Vec[FrontendDiagnostic], out: mut Vec[ToolDiagnostic]) -> () {
-    for diagnostic in values { out.push(ToolDiagnostic{path, diagnostic}) }
+fn source_project_root(path: Path) -> Path {
+    let mut current = match path.parent() {
+        Option[Path]::Some(value) => value
+        Option[Path]::None => { ret Path::new(".").resolve() }
+    }
+    loop {
+        if file_exists(current.join("encore.toml").as_str()) { ret current }
+        match current.parent() {
+            Option[Path]::Some(parent) => {
+                if parent.as_str() == current.as_str() { break }
+                current = parent
+            }
+            Option[Path]::None => { break }
+        }
+    }
+    ret Path::new(".").resolve()
+}
+
+fn append_diagnostics(path: str, source: str, values: Vec[FrontendDiagnostic], out: mut Vec[ToolDiagnostic]) -> () {
+    for diagnostic in values {
+        let mut duplicate = false
+        for existing in out {
+            if existing.path == path && existing.diagnostic.code == diagnostic.code && existing.diagnostic.line == diagnostic.line && existing.diagnostic.column == diagnostic.column {
+                duplicate = true
+            }
+        }
+        if !duplicate { out.push(ToolDiagnostic{path, source, diagnostic}) }
+    }
     ret ()
 }
 
 fn print_frontend_diagnostic(item: ToolDiagnostic) -> () {
-    let severity = if item.diagnostic.severity == 1_usize { "error" } else { "warning" }
-    eprintln(item.path + ":" + Debug::fmt(item.diagnostic.line + 1_usize) + ":" + Debug::fmt(item.diagnostic.column + 1_usize) + ": " + severity + "[" + item.diagnostic.code + "]: " + item.diagnostic.message)
+    eprintln(render_diagnostic(item.path, item.source, item.diagnostic))
     ret ()
 }
 
 fn print_format_diagnostic(item: ToolDiagnostic) -> () {
-    eprintln(item.path + ":" + Debug::fmt(item.diagnostic.line + 1_usize) + ":" + Debug::fmt(item.diagnostic.column + 1_usize) + ": error[" + item.diagnostic.code + "]: " + item.diagnostic.message)
+    eprintln(render_diagnostic(item.path, item.source, item.diagnostic))
     ret ()
 }
 
@@ -189,6 +282,37 @@ fn frontend_diagnostic_json(item: ToolDiagnostic) -> str {
     fields.push(field("severity", Json::String(severity)))
     fields.push(field("code", Json::String(item.diagnostic.code)))
     fields.push(field("message", Json::String(item.diagnostic.message)))
+    let mut labels = Vec[Json]::new()
+    for label in item.diagnostic.labels {
+        let mut label_fields = Vec[(str, Json)]::new()
+        label_fields.push(field("path", Json::String(if label.source_name == "" { item.path } else { label.source_name })))
+        label_fields.push(field("line", Json::Number(Debug::fmt(label.line + 1_usize))))
+        label_fields.push(field("column", Json::Number(Debug::fmt(label.column + 1_usize))))
+        label_fields.push(field("length", Json::Number(Debug::fmt(label.length))))
+        label_fields.push(field("kind", Json::String(if label.kind == DiagnosticLabelKind::Primary { "primary" } else { "secondary" })))
+        label_fields.push(field("message", Json::String(label.message)))
+        labels.push(Json::Object(label_fields))
+    }
+    fields.push(field("labels", Json::Array(labels)))
+    let mut notes = Vec[Json]::new()
+    for note in item.diagnostic.notes { notes.push(Json::String(note)) }
+    fields.push(field("notes", Json::Array(notes)))
+    let mut helps = Vec[Json]::new()
+    for help in item.diagnostic.helps { helps.push(Json::String(help)) }
+    fields.push(field("helps", Json::Array(helps)))
+    let mut suggestions = Vec[Json]::new()
+    for suggestion in item.diagnostic.suggestions {
+        let mut suggestion_fields = Vec[(str, Json)]::new()
+        suggestion_fields.push(field("path", Json::String(if suggestion.source_name == "" { item.path } else { suggestion.source_name })))
+        suggestion_fields.push(field("line", Json::Number(Debug::fmt(suggestion.line + 1_usize))))
+        suggestion_fields.push(field("column", Json::Number(Debug::fmt(suggestion.column + 1_usize))))
+        suggestion_fields.push(field("length", Json::Number(Debug::fmt(suggestion.length))))
+        suggestion_fields.push(field("replacement", Json::String(suggestion.replacement)))
+        suggestion_fields.push(field("message", Json::String(suggestion.message)))
+        suggestion_fields.push(field("applicability", Json::String(applicability_name(suggestion.applicability))))
+        suggestions.push(Json::Object(suggestion_fields))
+    }
+    fields.push(field("suggestions", Json::Array(suggestions)))
     ret stringify(Json::Object(fields))
 }
 

@@ -9,10 +9,10 @@ import std::path::Path
 import std::vec::Vec
 
 import json::{Json, field, stringify}
-import toml::{TomlDocument, toml_get_string, toml_parse_document, toml_section_keys}
-import refrain::analyzer::{AnalyzerConfig, AnalyzerDiagnostic, RuleLevel, lint_source_document, fix_source, rule_is_known}
+import refrain::analyzer::{AnalyzerConfig, AnalyzerDiagnostic, RuleLevel, analyzer_diagnostic_to_frontend, lint_source_document, fix_source, rule_is_known}
+import refrain::diagnostics::{applicability_name, render_diagnostic}
 import refrain::frontend::{AnalysisDatabase, FrontendDocument}
-import refrain::project::{ProjectWorkspace, load_binary_workspace, load_library_workspace}
+import refrain::project::{ProjectToolingConfig, ProjectWorkspace, load_binary_workspace, load_library_workspace, read_project_tooling_config}
 
 /// Runs the shared analyzer over a project or selected source file.
 pub fn native_analyze() -> u32 {
@@ -27,7 +27,11 @@ pub fn native_lint() -> u32 {
     if selected != "" && !ends_with(selected, ".enq") { root = Path::new(selected).resolve() }
 
     let mut config = AnalyzerConfig::new()
-    if !load_manifest_config(root, config) { ret 2_u32 }
+    if file_exists(root.join("encore.toml").as_str()) {
+        let tooling = read_project_tooling_config(root)
+        if !tooling.is_valid() { eprintln("error[manifest]: " + tooling.error_message()) ret 2_u32 }
+        config = tooling.lint_config()
+    }
     if !apply_cli_levels(config) { ret 2_u32 }
     let format = option_value("--format")
     if format != "" && format != "full" && format != "json" {
@@ -78,13 +82,16 @@ pub fn native_lint() -> u32 {
             if module.owner_name == workspace.root_name {
                 diagnostics.extend(lint_source_document(module.path(), module.source, module.analysis, config))
                 module_count += 1_usize
+            } elif config.dependencies_are_enabled() {
+                diagnostics.extend(lint_source_document(module.path(), module.source, module.analysis, config.for_dependency()))
+                module_count += 1_usize
             }
         }
     }
 
     let mut denied = false
     for diagnostic in diagnostics {
-        if diagnostic.severity == RuleLevel::Deny { denied = true }
+        if diagnostic.severity == RuleLevel::Deny || diagnostic.severity == RuleLevel::Forbid { denied = true }
         if format == "json" { println(diagnostic_json(diagnostic)) }
         else { print_diagnostic(diagnostic) }
     }
@@ -105,38 +112,14 @@ fn load_analysis_workspace(root: Path) -> ProjectWorkspace {
     ret load_binary_workspace(root)
 }
 
-fn load_manifest_config(root: Path, config: mut AnalyzerConfig) -> bool {
-    let path = root.join("encore.toml")
-    if !file_exists(path.as_str()) { ret true }
-    let document = toml_parse_document(read_file(path.as_str()))
-    if !load_rule_section(document, "analyzer.rules", config) { ret false }
-    ret load_rule_section(document, "lint.rules", config)
-}
-
-fn load_rule_section(document: TomlDocument, section: str, config: mut AnalyzerConfig) -> bool {
-    for code in toml_section_keys(document, section) {
-        if !rule_is_known(code) { eprintln("Error: unknown lint rule '" + code + "'") ret false }
-        match toml_get_string(document, section, code) {
-            Option[str]::Some(value) => {
-                match parse_level(value) {
-                    Option[RuleLevel]::Some(level) => { config.set_level(code, level) }
-                    Option[RuleLevel]::None => { eprintln("Error: invalid lint level '" + value + "' for " + code) ret false }
-                }
-            }
-            Option[str]::None => { eprintln("Error: lint rule '" + code + "' must be a string") ret false }
-        }
-    }
-    ret true
-}
-
 fn apply_cli_levels(config: mut AnalyzerConfig) -> bool {
     let mut index = 2_usize
     while index < argc() {
         let arg = argument(index)
-        if arg == "--allow" || arg == "--warn" || arg == "--deny" {
+        if arg == "--allow" || arg == "--warn" || arg == "--deny" || arg == "--forbid" {
             if index + 1_usize >= argc() { ret false }
             if !rule_is_known(argument(index + 1_usize)) { eprintln("Error: unknown lint rule '" + argument(index + 1_usize) + "'") ret false }
-            let level = if arg == "--allow" { RuleLevel::Allow } elif arg == "--warn" { RuleLevel::Warn } else { RuleLevel::Deny }
+            let level = if arg == "--allow" { RuleLevel::Allow } elif arg == "--warn" { RuleLevel::Warn } elif arg == "--deny" { RuleLevel::Deny } else { RuleLevel::Forbid }
             config.set_level(argument(index + 1_usize), level)
             index += 1_usize
         } elif arg == "--format" { index += 1_usize }
@@ -145,16 +128,9 @@ fn apply_cli_levels(config: mut AnalyzerConfig) -> bool {
     ret true
 }
 
-fn parse_level(value: str) -> Option[RuleLevel] {
-    if value == "allow" { ret Option[RuleLevel]::Some(RuleLevel::Allow) }
-    if value == "warn" { ret Option[RuleLevel]::Some(RuleLevel::Warn) }
-    if value == "deny" { ret Option[RuleLevel]::Some(RuleLevel::Deny) }
-    ret Option[RuleLevel]::None
-}
-
 fn print_diagnostic(diagnostic: AnalyzerDiagnostic) -> () {
-    let severity = if diagnostic.severity == RuleLevel::Deny { "error" } else { "warning" }
-    eprintln(diagnostic.path + ":" + Debug::fmt(diagnostic.line + 1_usize) + ":" + Debug::fmt(diagnostic.column + 1_usize) + ": " + severity + "[" + diagnostic.code + "]: " + diagnostic.message)
+    let source = if file_exists(diagnostic.path) { read_file(diagnostic.path) } else { "" }
+    eprintln(render_diagnostic(diagnostic.path, source, analyzer_diagnostic_to_frontend(diagnostic)))
     ret ()
 }
 
@@ -163,9 +139,28 @@ fn diagnostic_json(diagnostic: AnalyzerDiagnostic) -> str {
     fields.push(field("path", Json::String(diagnostic.path)))
     fields.push(field("line", Json::Number(Debug::fmt(diagnostic.line + 1_usize))))
     fields.push(field("column", Json::Number(Debug::fmt(diagnostic.column + 1_usize))))
-    fields.push(field("severity", Json::String(if diagnostic.severity == RuleLevel::Deny { "error" } else { "warning" })))
+    fields.push(field("severity", Json::String(if diagnostic.severity == RuleLevel::Deny || diagnostic.severity == RuleLevel::Forbid { "error" } else { "warning" })))
     fields.push(field("code", Json::String(diagnostic.code)))
     fields.push(field("message", Json::String(diagnostic.message)))
+    let structured = analyzer_diagnostic_to_frontend(diagnostic)
+    let mut notes = Vec[Json]::new()
+    for note in structured.notes { notes.push(Json::String(note)) }
+    fields.push(field("notes", Json::Array(notes)))
+    let mut helps = Vec[Json]::new()
+    for help in structured.helps { helps.push(Json::String(help)) }
+    fields.push(field("helps", Json::Array(helps)))
+    let mut suggestions = Vec[Json]::new()
+    for suggestion in structured.suggestions {
+        let mut item = Vec[(str, Json)]::new()
+        item.push(field("line", Json::Number(Debug::fmt(suggestion.line + 1_usize))))
+        item.push(field("column", Json::Number(Debug::fmt(suggestion.column + 1_usize))))
+        item.push(field("length", Json::Number(Debug::fmt(suggestion.length))))
+        item.push(field("replacement", Json::String(suggestion.replacement)))
+        item.push(field("message", Json::String(suggestion.message)))
+        item.push(field("applicability", Json::String(applicability_name(suggestion.applicability))))
+        suggestions.push(Json::Object(item))
+    }
+    fields.push(field("suggestions", Json::Array(suggestions)))
     ret stringify(Json::Object(fields))
 }
 
@@ -173,7 +168,7 @@ fn analyze_path() -> str {
     let mut index = 2_usize
     while index < argc() {
         let arg = argument(index)
-        if arg == "--allow" || arg == "--warn" || arg == "--deny" || arg == "--format" { index += 1_usize }
+        if arg == "--allow" || arg == "--warn" || arg == "--deny" || arg == "--forbid" || arg == "--format" { index += 1_usize }
         elif arg == "--fix" {}
         elif !starts_with(arg, "-") { ret arg }
         index += 1_usize

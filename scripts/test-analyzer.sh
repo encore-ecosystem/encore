@@ -71,7 +71,10 @@ EOF
 # Warnings are visible but do not fail a local analysis run by default.
 (cd "$tmp/missing" && "$compiler" lint) > "$tmp/warn.log" 2>&1
 grep -q 'warning\[missing-module-docstring\]' "$tmp/warn.log"
-test "$(grep -c 'warning\[missing-public-docstring\]' "$tmp/warn.log")" -ge 6
+if grep -q 'missing-public-docstring' "$tmp/warn.log"; then
+    echo "missing-public-docstring must be disabled by default" >&2
+    exit 1
+fi
 
 # Command-line levels override defaults and determine the exit status.
 set +e

@@ -1,0 +1,150 @@
+//! Loads normalized lint and formatter policy from `encore.toml`.
+
+import core::option::Option
+import std::os::{file_exists, read_file}
+import std::path::Path
+
+import toml::{TomlDocument, toml_get_bool, toml_get_integer, toml_get_string, toml_parse_document, toml_section_keys}
+import refrain::analyzer::{AnalyzerConfig, RuleLevel, rule_is_known}
+import refrain::formatter::FormatConfig
+
+/// A validated project tooling configuration.
+pub struct ProjectToolingConfig {
+    valid: bool
+    error: str
+    lint: AnalyzerConfig
+    format: FormatConfig
+}
+
+impl for ProjectToolingConfig {
+    pub fn is_valid(self: Self) -> bool { ret self.valid }
+    pub fn error_message(self: Self) -> str { ret self.error }
+    pub fn lint_config(self: Self) -> AnalyzerConfig { ret self.lint }
+    pub fn format_config(self: Self) -> FormatConfig { ret self.format }
+}
+
+/// Reads and validates all tooling sections. Unknown options are rejected.
+pub fn read_project_tooling_config(root: Path) -> ProjectToolingConfig {
+    let path = root.join("encore.toml")
+    if !file_exists(path.as_str()) {
+        ret invalid_tooling("Unable to find encore.toml at " + path.as_str())
+    }
+    ret parse_project_tooling_config(toml_parse_document(read_file(path.as_str())))
+}
+
+/// String-path convenience API for protocol adapters and embedded tools.
+pub fn read_project_tooling_config_at(root: str) -> ProjectToolingConfig {
+    ret read_project_tooling_config(Path::new(root))
+}
+
+/// Normalizes tooling policy from an already parsed manifest document.
+pub fn parse_project_tooling_config(document: TomlDocument) -> ProjectToolingConfig {
+    let mut lint = AnalyzerConfig::new()
+    let mut format = FormatConfig::new()
+
+    for key in toml_section_keys(document, "lint") {
+        if key != "default" && key != "dependencies" && key != "cap" {
+            ret invalid_tooling("unknown lint option '" + key + "'")
+        }
+    }
+    match configured_level(document, "lint", "default") {
+        Option[RuleLevel]::Some(level) => { lint.set_default_level(level) }
+        Option[RuleLevel]::None => {
+            if has_key(document, "lint", "default") { ret invalid_tooling("invalid lint level for [lint].default") }
+        }
+    }
+    match configured_level(document, "lint", "dependencies") {
+        Option[RuleLevel]::Some(level) => { lint.set_dependency_level(level) }
+        Option[RuleLevel]::None => {
+            if has_key(document, "lint", "dependencies") { ret invalid_tooling("invalid lint level for [lint].dependencies") }
+        }
+    }
+    match configured_level(document, "lint", "cap") {
+        Option[RuleLevel]::Some(level) => { lint.set_cap_level(level) }
+        Option[RuleLevel]::None => {
+            if has_key(document, "lint", "cap") { ret invalid_tooling("invalid lint level for [lint].cap") }
+        }
+    }
+
+    // Deprecated compatibility: old manifests are read first so [lint.rules]
+    // can override them while projects migrate without changing behaviour.
+    for rule in toml_section_keys(document, "analyzer.rules") {
+        if !rule_is_known(rule) { ret invalid_tooling("unknown lint rule '" + rule + "'") }
+        match configured_level(document, "analyzer.rules", rule) {
+            Option[RuleLevel]::Some(level) => { lint.set_level(rule, level) }
+            Option[RuleLevel]::None => { ret invalid_tooling("invalid lint level for rule '" + rule + "'") }
+        }
+    }
+
+    for rule in toml_section_keys(document, "lint.rules") {
+        if !rule_is_known(rule) { ret invalid_tooling("unknown lint rule '" + rule + "'") }
+        match configured_level(document, "lint.rules", rule) {
+            Option[RuleLevel]::Some(level) => { lint.set_level(rule, level) }
+            Option[RuleLevel]::None => { ret invalid_tooling("invalid lint level for rule '" + rule + "'") }
+        }
+    }
+
+    for key in toml_section_keys(document, "format") {
+        if key == "indent-width" {
+            match toml_get_integer(document, "format", key) {
+                Option[i32]::Some(value) => {
+                    if value < 1_i32 || value > 16_i32 { ret invalid_tooling("formatter indent-width must be between 1 and 16") }
+                    format = format.with_indent_width(value as usize)
+                }
+                Option[i32]::None => { ret invalid_tooling("formatter option 'indent-width' must be an integer") }
+            }
+        } elif key == "line-width" {
+            match toml_get_integer(document, "format", key) {
+                Option[i32]::Some(value) => {
+                    if value < 40_i32 || value > 320_i32 { ret invalid_tooling("formatter line-width must be between 40 and 320") }
+                    format = format.with_line_width(value as usize)
+                }
+                Option[i32]::None => { ret invalid_tooling("formatter option 'line-width' must be an integer") }
+            }
+        } elif key == "newline-style" {
+            let value = toml_get_string(document, "format", key).unwrap_or("")
+            if value != "auto" && value != "lf" && value != "crlf" { ret invalid_tooling("formatter newline-style must be auto, lf, or crlf") }
+            format = format.with_newline_style(value)
+        } elif key == "trailing-comma" {
+            let value = toml_get_string(document, "format", key).unwrap_or("")
+            if value != "always" && value != "never" && value != "vertical" { ret invalid_tooling("formatter trailing-comma must be always, never, or vertical") }
+            format = format.with_trailing_comma(value)
+        } elif key == "reorder-imports" {
+            match toml_get_bool(document, "format", key) {
+                Option[u1]::Some(value) => { format = format.with_reorder_imports(value == true) }
+                Option[u1]::None => { ret invalid_tooling("formatter option 'reorder-imports' must be a boolean") }
+            }
+        } elif key == "format-docstrings" {
+            match toml_get_bool(document, "format", key) {
+                Option[u1]::Some(value) => { format = format.with_format_docstrings(value == true) }
+                Option[u1]::None => { ret invalid_tooling("formatter option 'format-docstrings' must be a boolean") }
+            }
+        } else {
+            ret invalid_tooling("unknown formatter option '" + key + "'")
+        }
+    }
+
+    ret ProjectToolingConfig{true, "", lint, format}
+}
+
+fn configured_level(document: TomlDocument, section: str, key: str) -> Option[RuleLevel] {
+    match toml_get_string(document, section, key) {
+        Option[str]::Some(value) => {
+            if value == "allow" { ret Option[RuleLevel]::Some(RuleLevel::Allow) }
+            if value == "warn" { ret Option[RuleLevel]::Some(RuleLevel::Warn) }
+            if value == "deny" { ret Option[RuleLevel]::Some(RuleLevel::Deny) }
+            if value == "forbid" { ret Option[RuleLevel]::Some(RuleLevel::Forbid) }
+        }
+        Option[str]::None => {}
+    }
+    ret Option[RuleLevel]::None
+}
+
+fn has_key(document: TomlDocument, section: str, key: str) -> bool {
+    for candidate in toml_section_keys(document, section) { if candidate == key { ret true } }
+    ret false
+}
+
+fn invalid_tooling(message: str) -> ProjectToolingConfig {
+    ret ProjectToolingConfig{false, message, AnalyzerConfig::new(), FormatConfig::new()}
+}

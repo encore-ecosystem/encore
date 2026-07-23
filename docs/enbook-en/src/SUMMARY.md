@@ -7,6 +7,7 @@
 - [Memory Model](memory-model.md)
 - [Concurrency](concurrency.md)
 - [Compiler Logic](compiler-logic.md)
+- [Analysis and Tooling](analysis-tooling.md)
 - [Packages And Build Scripts](packages.md)
   - [Publishing Packages](publishing-packages.md)
 - [Targets And Cross-Compilation](targets.md)

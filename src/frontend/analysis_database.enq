@@ -6,16 +6,23 @@ import std::dict::Hashable
 import std::vec::Vec
 
 import refrain::frontend::analysis::FrontendDocument
+import refrain::frontend::analysis::DiagnosticLabelKind
 import refrain::frontend::analysis::FrontendSymbol
 import refrain::frontend::analysis::analyze_named_module
 import refrain::frontend::analysis::analyze_named_tokens
 import refrain::frontend::analysis::analyze_module_lightweight
 import refrain::frontend::lexer::Token
 import refrain::frontend::lexer::TokenType
+import refrain::frontend::hir::{DefinitionId, DefinitionKind, DefinitionNamespace, HirDefinition, ModuleDefMap, TypeId, definition_id}
 import refrain::frontend::parser::{FunctionItem, Statement}
-import refrain::frontend::semantic::{SemanticBody, SemanticCallable, SemanticDependency, check_function_body, check_module_bodies, check_module_declarations}
+import refrain::frontend::semantic::{SemanticBody, SemanticCallable, SemanticDependency, SemanticField, SemanticMethod, check_function_body, check_module_bodies, check_module_declarations}
 import refrain::frontend::syntax::SyntaxDocument
 import refrain::target::{TargetSpec, host_target}
+
+extern fn encore_strset_new() -> usize
+extern fn encore_strset_insert(set: usize, value: str) -> bool
+extern fn encore_strset_contains(set: usize, value: str) -> bool
+extern fn encore_strset_free(set: usize) -> ()
 
 /// Deterministic identity of a module across analysis database instances.
 pub struct ModuleId { raw: u64 key: str }
@@ -58,11 +65,19 @@ struct SemanticBodyCache {
     count: usize
 }
 
+struct DefMapCache {
+    module_name: str
+    interface_fingerprint: u64
+    result: ModuleDefMap
+    count: usize
+}
+
 /// Caches analysis queries and invalidates dependants only when a module's
 /// declaration interface changes.
 pub struct AnalysisDatabase {
     sources: Vec[AnalysisSource]
     semantic_bodies: Vec[SemanticBodyCache]
+    def_maps: Vec[DefMapCache]
     revision: usize
 }
 
@@ -99,7 +114,7 @@ impl for SymbolId {
 impl for AnalysisDatabase {
     /// Creates an empty analysis database at revision zero.
     pub fn new() -> Self {
-        ret Self {Vec[AnalysisSource]::new(), Vec[SemanticBodyCache]::new(), 0_usize}
+        ret Self {Vec[AnalysisSource]::new(), Vec[SemanticBodyCache]::new(), Vec[DefMapCache]::new(), 0_usize}
     }
 
     /// Returns the current source revision of the database.
@@ -424,6 +439,172 @@ impl for AnalysisDatabase {
         ret out
     }
 
+    /// Lowers one module's declarations into a backend-neutral definition map.
+    ///
+    /// The map is the shared name-resolution boundary for the compiler, LSP,
+    /// IDE and structured agent tools; consumers do not walk parser nodes.
+    pub fn module_def_map(self: mut Self, module_name: str) -> Option[ModuleDefMap] {
+        let interface_fingerprint = self.module_interface_fingerprint_value(module_name)
+        let mut cache_index = 0_usize
+        while cache_index < self.def_maps.len() {
+            match self.def_maps.get(cache_index) {
+                Option[DefMapCache]::Some(cached) => {
+                    if cached.module_name == module_name && cached.interface_fingerprint == interface_fingerprint {
+                        ret Option[ModuleDefMap]::Some(cached.result)
+                    }
+                }
+                Option[DefMapCache]::None => {}
+            }
+            cache_index += 1_usize
+        }
+        let document = match self.document(module_name) {
+            Option[FrontendDocument]::Some(value) => value
+            Option[FrontendDocument]::None => { ret Option[ModuleDefMap]::None }
+        }
+        let mut map = ModuleDefMap::new(module_name)
+        // Publish an in-progress sentinel before following re-exports. Cyclic
+        // module graphs then observe an empty map for the active edge instead
+        // of recursively rebuilding the same module forever.
+        let mut sentinel_index = 0_usize
+        let mut sentinel_written = false
+        while sentinel_index < self.def_maps.len() {
+            match self.def_maps.get(sentinel_index) {
+                Option[DefMapCache]::Some(cached) => {
+                    if cached.module_name == module_name {
+                        self.def_maps.set(sentinel_index, DefMapCache{module_name, interface_fingerprint, map, cached.count})
+                        sentinel_written = true
+                        break
+                    }
+                }
+                Option[DefMapCache]::None => {}
+            }
+            sentinel_index += 1_usize
+        }
+        if !sentinel_written { self.def_maps.push(DefMapCache{module_name, interface_fingerprint, map, 0_usize}) }
+        let source_name = self.module_source_name(module_name)
+        let mut identity_keys = Vec[str]::new()
+        for statement in document.ast {
+            match statement {
+                Statement::Import(item) => {
+                    self.insert_import_definitions(module_name, item.path, item.is_public, map)
+                }
+                Statement::Function(item) => {
+                    let id = next_definition_id(module_name, "", "function", item.name, identity_keys)
+                    map.insert(HirDefinition::new(id, module_name, item.name, DefinitionKind::Function, DefinitionNamespace::Value, item.is_public, item.source_name, item.line, item.column, item.name.len(), TypeId::named(function_type_key(item), item.ret_type.unwrap_or("void"))))
+                }
+                Statement::Struct(item) => {
+                    let id = next_definition_id(module_name, "", "struct", item.name, identity_keys)
+                    let position = symbol_position(document.symbols, item.name, 23_usize)
+                    map.insert(HirDefinition::new(id, module_name, item.name, DefinitionKind::Struct, DefinitionNamespace::Type, item.is_public, source_name, position.0, position.1, position.2, TypeId::named(item.name, item.name)))
+                }
+                Statement::EnumItem(item) => {
+                    let id = next_definition_id(module_name, "", "enum", item.name, identity_keys)
+                    let position = symbol_position(document.symbols, item.name, 10_usize)
+                    map.insert(HirDefinition::new(id, module_name, item.name, DefinitionKind::Enum, DefinitionNamespace::Type, item.is_public, source_name, position.0, position.1, position.2, TypeId::named(item.name, item.name)))
+                }
+                Statement::Trait(item) => {
+                    let id = next_definition_id(module_name, "", "trait", item.name, identity_keys)
+                    map.insert(HirDefinition::new(id, module_name, item.name, DefinitionKind::Trait, DefinitionNamespace::Trait, item.is_public, item.source_name, item.line, item.column, item.name.len(), TypeId::named("dyn " + item.name, item.name)))
+                    for method in item.methods {
+                        let method_id = next_definition_id(module_name, item.name, "method", method.name, identity_keys)
+                        map.insert(HirDefinition::new(method_id, module_name, method.name, DefinitionKind::Method, DefinitionNamespace::Value, item.is_public, method.source_name, method.line, method.column, method.name.len(), TypeId::named(function_type_key(method), method.ret_type.unwrap_or("void"))))
+                    }
+                }
+                Statement::Impl(item) => {
+                    for method in item.methods {
+                        let method_id = next_definition_id(module_name, item.target, "method", method.name, identity_keys)
+                        map.insert(HirDefinition::new(method_id, module_name, method.name, DefinitionKind::Method, DefinitionNamespace::Value, false, method.source_name, method.line, method.column, method.name.len(), TypeId::named(function_type_key(method), method.ret_type.unwrap_or("void"))))
+                    }
+                }
+                _ => {}
+            }
+        }
+        cache_index = 0_usize
+        while cache_index < self.def_maps.len() {
+            match self.def_maps.get(cache_index) {
+                Option[DefMapCache]::Some(cached) => {
+                    if cached.module_name == module_name {
+                        self.def_maps.set(cache_index, DefMapCache{module_name, interface_fingerprint, map, cached.count + 1_usize})
+                        ret Option[ModuleDefMap]::Some(map)
+                    }
+                }
+                Option[DefMapCache]::None => {}
+            }
+            cache_index += 1_usize
+        }
+        self.def_maps.push(DefMapCache{module_name, interface_fingerprint, map, 1_usize})
+        ret Option[ModuleDefMap]::Some(map)
+    }
+
+    fn insert_import_definitions(
+        self: mut Self,
+        module_name: str,
+        path: str,
+        is_public: bool,
+        map: mut ModuleDefMap
+    ) -> () {
+        let normalized = self.resolved_import_target(module_name, path)
+        let mut owner_name = ""
+        for source in self.sources {
+            if (normalized == source.module_name || starts_with(normalized, source.module_name + "::")) && source.module_name.len() > owner_name.len() {
+                owner_name = source.module_name
+            }
+        }
+        if owner_name == "" { ret () }
+        let requested = import_binding_names(normalized, owner_name)
+        let mut exported = match self.module_def_map(owner_name) {
+            Option[ModuleDefMap]::Some(target) => target.all_definitions()
+            Option[ModuleDefMap]::None => Vec[HirDefinition]::new()
+        }
+        // A directory module is the public namespace of its source fragments.
+        // This mirrors normal Encore resolution where
+        // `refrain::frontend::parser::Expr` may be declared in
+        // `frontend/parser/statements.enq`.
+        let mut fragments = Vec[str]::new()
+        for source in self.sources {
+            if starts_with(source.module_name, owner_name + "::") { fragments.push(source.module_name) }
+        }
+        for fragment in fragments {
+            match self.module_def_map(fragment) {
+                Option[ModuleDefMap]::Some(fragment_map) => {
+                    for definition in fragment_map.all_definitions() {
+                        if definition.is_public() { exported.push(definition) }
+                    }
+                }
+                Option[ModuleDefMap]::None => {}
+            }
+        }
+        for binding in requested {
+            for definition in exported {
+                if definition.is_public() && (binding.0 == "*" || definition.name() == binding.0) {
+                    let alias = if binding.0 == "*" { definition.name() } else { binding.1 }
+                    insert_import_definition(definition, alias, is_public, map)
+                }
+            }
+        }
+        ret ()
+    }
+
+    /// Returns how often the module definition-map query was recomputed.
+    pub fn module_def_map_count(self: Self, module_name: str) -> usize {
+        for cached in self.def_maps { if cached.module_name == module_name { ret cached.count } }
+        ret 0_usize
+    }
+
+    fn module_interface_fingerprint_value(self: Self, module_name: str) -> u64 {
+        for source in self.sources {
+            if source.module_name == module_name { ret source.interface_fingerprint }
+        }
+        ret 0_u64
+    }
+
+    fn module_source_name(self: Self, module_name: str) -> str {
+        for source in self.sources {
+            if source.module_name == module_name { ret source.source_name }
+        }
+        ret ""
+    }
+
     /// Finds all indexed declarations with the supplied exact name.
     pub fn symbols_named(self: Self, name: str) -> Vec[AnalysisSymbol] {
         let mut out = Vec[AnalysisSymbol]::new()
@@ -484,10 +665,18 @@ impl for AnalysisDatabase {
         }
         if indexed.symbol.kind != 12_usize { ret Option[SemanticBody]::None }
         let callables = self.visible_semantic_callables(indexed.module_name)
-        ret self.semantic_body_for(indexed, callables)
+        let fields = self.visible_semantic_fields(indexed.module_name)
+        let methods = self.visible_semantic_methods(indexed.module_name)
+        ret self.semantic_body_for(indexed, callables, fields, methods)
     }
 
-    fn semantic_body_for(self: mut Self, indexed: AnalysisSymbol, callables: Vec[SemanticCallable]) -> Option[SemanticBody] {
+    fn semantic_body_for(
+        self: mut Self,
+        indexed: AnalysisSymbol,
+        callables: Vec[SemanticCallable],
+        fields: Vec[SemanticField],
+        methods: Vec[SemanticMethod]
+    ) -> Option[SemanticBody] {
         let id = indexed.id
         let fingerprint = match self.source_lightweight_document(indexed.module_name) {
             Option[FrontendDocument]::Some(value) => function_body_fingerprint(value.tokens, indexed.symbol.name, indexed.symbol.line, indexed.symbol.column)
@@ -510,7 +699,7 @@ impl for AnalysisDatabase {
                             Option[FunctionItem]::Some(value) => value
                             Option[FunctionItem]::None => { ret Option[SemanticBody]::None }
                         }
-                        let result = check_function_body(item, callables)
+                        let result = check_function_body(item, callables, fields, methods, semantic_owner_type(indexed.symbol.scope))
                         self.semantic_bodies.set(cache_index, SemanticBodyCache{id, indexed.module_name, indexed.symbol.name, fingerprint, result, cached.count + 1_usize})
                         ret Option[SemanticBody]::Some(result)
                     }
@@ -524,7 +713,7 @@ impl for AnalysisDatabase {
             Option[FunctionItem]::Some(value) => value
             Option[FunctionItem]::None => { ret Option[SemanticBody]::None }
         }
-        let result = check_function_body(item, callables)
+        let result = check_function_body(item, callables, fields, methods, semantic_owner_type(indexed.symbol.scope))
         self.semantic_bodies.push(SemanticBodyCache{id, indexed.module_name, indexed.symbol.name, fingerprint, result, 1_usize})
         ret Option[SemanticBody]::Some(result)
     }
@@ -566,6 +755,8 @@ impl for AnalysisDatabase {
     /// target and enabled feature set.
     pub fn module_semantic_diagnostics_for_target(self: mut Self, module_name: str, target: TargetSpec, features: Vec[str]) -> Vec[FrontendDiagnostic] {
         let callables = self.visible_semantic_callables(module_name)
+        let fields = self.visible_semantic_fields(module_name)
+        let methods = self.visible_semantic_methods(module_name)
         let document = match self.stored_full_document(module_name) {
             Option[FrontendDocument]::Some(value) => value
             Option[FrontendDocument]::None => {
@@ -576,18 +767,143 @@ impl for AnalysisDatabase {
             }
         }
         let mut diagnostics = check_module_declarations(document.ast, target, features)
-        diagnostics.extend(check_module_bodies(document.ast, callables))
+        diagnostics.extend(self.module_resolution_diagnostics(module_name, document))
+        diagnostics.extend(check_module_bodies(document.ast, callables, fields, methods))
         ret diagnostics
+    }
+
+    fn module_resolution_diagnostics(self: mut Self, module_name: str, document: FrontendDocument) -> Vec[FrontendDiagnostic] {
+        let mut diagnostics = Vec[FrontendDiagnostic]::new()
+        for edge in document.dependencies.all() {
+            if !self.import_target_resolves(module_name, edge.target) {
+                diagnostics.push(
+                    FrontendDiagnostic::new(
+                        1_usize,
+                        "unresolved-import",
+                        "unresolved import `" + edge.target + "`",
+                        edge.line,
+                        edge.column,
+                        if edge.length == 0_usize { 1_usize } else { edge.length }
+                    ).with_label("", edge.line, edge.column, edge.length, DiagnosticLabelKind::Primary, "cannot resolve this import")
+                )
+            }
+        }
+
+        let generics = module_generic_names(document.ast)
+        let mut known_types = Vec[str]::new()
+        let mut known_callables = Vec[str]::new()
+        match self.module_def_map(module_name) {
+            Option[ModuleDefMap]::Some(map) => {
+                for definition in map.all_definitions() {
+                    match definition.namespace() {
+                        DefinitionNamespace::Type => { known_types.push(definition.name()) }
+                        DefinitionNamespace::Trait => { known_types.push(definition.name()) }
+                        DefinitionNamespace::Value => {
+                            match definition.kind() {
+                                DefinitionKind::Function => { known_callables.push(definition.name()) }
+                                DefinitionKind::Import => { known_callables.push(definition.name()) }
+                                _ => {}
+                            }
+                        }
+                        DefinitionNamespace::Module => {}
+                    }
+                }
+            }
+            Option[ModuleDefMap]::None => {}
+        }
+        // Core declarations form the language prelude and are visible without
+        // an explicit source import. No other workspace module is consulted.
+        for source in self.sources {
+            if source.module_name == "core" || starts_with(source.module_name, "core::") {
+                for symbol in source.lightweight.symbols {
+                    if symbol.scope == "" {
+                        if symbol.kind == 23_usize || symbol.kind == 10_usize || symbol.kind == 11_usize { known_types.push(symbol.name) }
+                        elif symbol.kind == 12_usize { known_callables.push(symbol.name) }
+                    }
+                }
+            }
+        }
+        let type_set = unsafe { encore_strset_new() }
+        let callable_set = unsafe { encore_strset_new() }
+        let generic_set = unsafe { encore_strset_new() }
+        for name in known_types { let _inserted = unsafe { encore_strset_insert(type_set, name) } }
+        for name in known_callables { let _inserted = unsafe { encore_strset_insert(callable_set, name) } }
+        for name in generics { let _inserted = unsafe { encore_strset_insert(generic_set, name) } }
+        let mut index = 0_usize
+        let mut previous_type = TokenType::UNKNOWN
+        let mut in_attribute = false
+        let mut attribute_depth = 0_i32
+        while index < document.tokens.len() {
+            match document.tokens.get(index) {
+                Option[Token]::Some(token) => {
+                    if token.type == TokenType::HASH {
+                        in_attribute = true
+                        attribute_depth = 0_i32
+                    } elif in_attribute && token.type == TokenType::LEFT_PAREN {
+                        attribute_depth += 1_i32
+                    } elif in_attribute && token.type == TokenType::RIGHT_PAREN {
+                        attribute_depth -= 1_i32
+                        if attribute_depth <= 0_i32 { in_attribute = false }
+                    }
+                    let type_position = previous_type == TokenType::COLON || previous_type == TokenType::ARROW || previous_type == TokenType::KW_AS || previous_type == TokenType::KW_IMPL
+                    if token.type == TokenType::IDENTIFIER && type_position {
+                        if starts_with_uppercase(token.value) && !builtin_type_name(token.value) && !unsafe { encore_strset_contains(generic_set, token.value) } && !unsafe { encore_strset_contains(type_set, token.value) } {
+                            let code = if previous_type == TokenType::KW_IMPL { "unknown-trait" } else { "unknown-type" }
+                            let message = if previous_type == TokenType::KW_IMPL { "unknown trait '" + token.value + "'" } else { "unknown type '" + token.value + "'" }
+                            diagnostics.push(
+                                FrontendDiagnostic::new(1_usize, code, message, token.line, token.column, token.value.len())
+                                    .with_label("", token.line, token.column, token.value.len(), DiagnosticLabelKind::Primary, "not found in this scope")
+                            )
+                        }
+                    }
+                    let mut followed_by_call = false
+                    match document.tokens.get(index + 1_usize) {
+                        Option[Token]::Some(next) => { followed_by_call = next.type == TokenType::LEFT_PAREN }
+                        Option[Token]::None => {}
+                    }
+                    let qualified = previous_type == TokenType::DOT || previous_type == TokenType::SCOPE || previous_type == TokenType::KW_FN || previous_type == TokenType::HASH
+                    if token.type == TokenType::IDENTIFIER && followed_by_call && !qualified && !in_attribute {
+                        if !unsafe { encore_strset_contains(callable_set, token.value) } && !starts_with_uppercase(token.value) {
+                            diagnostics.push(
+                                FrontendDiagnostic::new(1_usize, "unresolved-call", "cannot find function `" + token.value + "` in this scope", token.line, token.column, token.value.len())
+                                    .with_label("", token.line, token.column, token.value.len(), DiagnosticLabelKind::Primary, "not found in this scope")
+                            )
+                        }
+                    }
+                    previous_type = token.type
+                }
+                Option[Token]::None => {}
+            }
+            index += 1_usize
+        }
+        unsafe {
+            encore_strset_free(type_set)
+            encore_strset_free(callable_set)
+            encore_strset_free(generic_set)
+        }
+        let _ignored = module_name
+        ret diagnostics
+    }
+
+    fn import_target_resolves(self: Self, module_name: str, target: str) -> bool {
+        let cleaned = strip_import_alias(self.resolved_import_target(module_name, target))
+        for source in self.sources {
+            if cleaned == source.module_name { ret true }
+            if starts_with(cleaned, source.module_name + "::") { ret true }
+        }
+        ret false
     }
 
     /// Returns the semantic type of a local binding at a source line.
     pub fn semantic_binding_type(self: mut Self, module_name: str, name: str, line: usize) -> Option[str] {
         let symbols = self.module_analysis_symbols(module_name)
         let callables = self.visible_semantic_callables(module_name)
+        let fields = self.visible_semantic_fields(module_name)
+        let methods = self.visible_semantic_methods(module_name)
         let mut adjacent = Option[str]::None
         for indexed in symbols {
             if indexed.symbol.kind == 12_usize {
-                match self.semantic_body_for(indexed, callables) {
+                match self.semantic_body_for(indexed, callables, fields, methods) {
                     Option[SemanticBody]::Some(body) => {
                         for binding in body.bindings {
                             if binding.name == name && binding.line == line { ret Option[str]::Some(binding.typ) }
@@ -653,19 +969,7 @@ impl for AnalysisDatabase {
     }
 
     fn visible_semantic_callables(self: mut Self, module_name: str) -> Vec[SemanticCallable] {
-        let mut visible_modules = Vec[str]::new()
-        visible_modules.push(module_name)
-        for source in self.sources {
-            if source.module_name == module_name {
-                for edge in source.lightweight.dependencies.all() {
-                    for candidate in self.sources {
-                        if edge.target == candidate.module_name || starts_with(edge.target, candidate.module_name + "::") {
-                            if !contains_string(visible_modules, candidate.module_name) { visible_modules.push(candidate.module_name) }
-                        }
-                    }
-                }
-            }
-        }
+        let visible_modules = self.visible_semantic_modules(module_name)
         let mut out = Vec[SemanticCallable]::new()
         for visible in visible_modules {
             let document = match if visible == module_name { self.stored_full_document(visible) } else { self.document(visible) } {
@@ -680,6 +984,149 @@ impl for AnalysisDatabase {
             }
         }
         ret out
+    }
+
+    fn visible_semantic_fields(self: mut Self, module_name: str) -> Vec[SemanticField] {
+        let mut out = Vec[SemanticField]::new()
+        for visible in self.visible_semantic_modules(module_name) {
+            let document = match if visible == module_name { self.stored_full_document(visible) } else { self.document(visible) } {
+                Option[FrontendDocument]::Some(value) => value
+                Option[FrontendDocument]::None => FrontendDocument::empty()
+            }
+            for statement in document.ast {
+                match statement {
+                    Statement::Struct(item) => {
+                        for field in item.named_fields {
+                            out.push(SemanticField::new(visible, item.name, field.name, field.typ))
+                        }
+                        let mut field_index = 0_usize
+                        for field_type in item.tuple_fields {
+                            out.push(SemanticField::new(visible, item.name, Debug::fmt(field_index), field_type))
+                            field_index += 1_usize
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ret out
+    }
+
+    fn visible_semantic_methods(self: mut Self, module_name: str) -> Vec[SemanticMethod] {
+        let mut out = Vec[SemanticMethod]::new()
+        // Inherent methods belong to their receiver type, not to the lexical
+        // import scope of the call site. Once a type is reachable, its impl
+        // methods must remain discoverable even when the type flowed through
+        // another public API (for example FrontendDocument.dependencies).
+        let mut method_modules = Vec[str]::new()
+        for source in self.sources {
+            if !contains_string(method_modules, source.module_name) {
+                method_modules.push(source.module_name)
+            }
+        }
+        for visible in method_modules {
+            let document = match if visible == module_name { self.stored_full_document(visible) } else { self.document(visible) } {
+                Option[FrontendDocument]::Some(value) => value
+                Option[FrontendDocument]::None => FrontendDocument::empty()
+            }
+            for statement in document.ast {
+                match statement {
+                    Statement::Impl(item) => {
+                        for method in item.methods {
+                            let mut params = Vec[str]::new()
+                            let mut index = 0_usize
+                            for param in method.params {
+                                if index > 0_usize { params.push(param.typ.unwrap_or("")) }
+                                index += 1_usize
+                            }
+                            out.push(SemanticMethod::new(visible, item.target, method.name, params, method.ret_type.unwrap_or("void")))
+                        }
+                    }
+                    Statement::Trait(item) => {
+                        for method in item.methods {
+                            let mut params = Vec[str]::new()
+                            let mut index = 0_usize
+                            for param in method.params {
+                                if index > 0_usize { params.push(param.typ.unwrap_or("")) }
+                                index += 1_usize
+                            }
+                            out.push(SemanticMethod::new(visible, "dyn " + item.name, method.name, params, method.ret_type.unwrap_or("void")))
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for source in self.sources {
+            let document = self.document(source.module_name).unwrap_or(FrontendDocument::empty())
+            for statement in document.ast {
+                match statement {
+                    Statement::Trait(child) => {
+                        for base in child.bases {
+                            for base_source in self.sources {
+                                let base_document = self.document(base_source.module_name).unwrap_or(FrontendDocument::empty())
+                                for candidate in base_document.ast {
+                                    match candidate {
+                                        Statement::Trait(parent) => {
+                                            if parent.name == base {
+                                                for method in parent.methods {
+                                                    let mut params = Vec[str]::new()
+                                                    let mut index = 0_usize
+                                                    for param in method.params {
+                                                        if index > 0_usize { params.push(param.typ.unwrap_or("")) }
+                                                        index += 1_usize
+                                                    }
+                                                    out.push(SemanticMethod::new(base_source.module_name, "dyn " + child.name, method.name, params, method.ret_type.unwrap_or("void")))
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ret out
+    }
+
+    fn visible_semantic_modules(self: Self, module_name: str) -> Vec[str] {
+        let mut visible_modules = Vec[str]::new()
+        visible_modules.push(module_name)
+        for source in self.sources {
+            if source.module_name == module_name {
+                for edge in source.lightweight.dependencies.all() {
+                    let normalized = self.resolved_import_target(module_name, edge.target)
+                    for candidate in self.sources {
+                        if normalized == candidate.module_name || starts_with(normalized, candidate.module_name + "::") {
+                            if !contains_string(visible_modules, candidate.module_name) { visible_modules.push(candidate.module_name) }
+                        }
+                    }
+                }
+            }
+        }
+        ret visible_modules
+    }
+
+    fn resolved_import_target(self: Self, module_name: str, target: str) -> str {
+        let direct = normalized_import_target(module_name, target)
+        if !starts_with(target, "mod::") { ret direct }
+        let mut source_name = ""
+        for source in self.sources {
+            if source.module_name == module_name { source_name = source.source_name break }
+        }
+        if ends_with_analysis(source_name, "/mod.enq") || ends_with_analysis(source_name, "\\mod.enq")
+            || ends_with_analysis(source_name, "/lib.enq") || ends_with_analysis(source_name, "\\lib.enq")
+            || ends_with_analysis(source_name, "/main.enq") || ends_with_analysis(source_name, "\\main.enq")
+            || source_name == "mod.enq" || source_name == "lib.enq" || source_name == "main.enq" {
+            ret direct
+        }
+        let parent = parent_module_name(module_name)
+        if parent == "" { ret direct }
+        ret parent + "::" + target.slice(5_usize, target.len() - 5_usize)
     }
 
     fn invalidate_dependents(self: mut Self, changed_module: str) -> () {
@@ -745,6 +1192,42 @@ fn callable_from_function(module_name: str, item: FunctionItem) -> SemanticCalla
     let mut params = Vec[str]::new()
     for param in item.params { params.push(param.typ.unwrap_or("")) }
     ret SemanticCallable::new(module_name, item.name, params, item.ret_type.unwrap_or("void"))
+}
+
+fn function_type_key(item: FunctionItem) -> str {
+    let mut out = "fn("
+    for param in item.params { out += param.typ.unwrap_or("_") + "," }
+    ret out + ")->" + item.ret_type.unwrap_or("void")
+}
+
+fn symbol_position(symbols: Vec[FrontendSymbol], name: str, kind: usize) -> (usize, usize, usize) {
+    for symbol in symbols {
+        if symbol.name == name && symbol.kind == kind { ret (symbol.line, symbol.column, symbol.length) }
+    }
+    ret (0_usize, 0_usize, if name.len() == 0_usize { 1_usize } else { name.len() })
+}
+
+fn semantic_owner_type(scope: str) -> str {
+    let mut owner_scope = scope
+    let mut separator = 0_usize
+    let mut index = 0_usize
+    while index + 1_usize < owner_scope.len() {
+        if owner_scope.slice(index, 2_usize) == "::" { separator = index + 2_usize }
+        index += 1_usize
+    }
+    if separator > 0_usize { owner_scope = owner_scope.slice(separator, owner_scope.len() - separator) }
+    if !starts_with(owner_scope, "impl") { ret "" }
+    let mut for_index = 0_usize
+    index = 4_usize
+    while index + 3_usize <= owner_scope.len() {
+        if owner_scope.slice(index, 3_usize) == "for" { for_index = index + 3_usize }
+        index += 1_usize
+    }
+    if for_index > 0_usize && for_index < owner_scope.len() {
+        ret owner_scope.slice(for_index, owner_scope.len() - for_index)
+    }
+    if owner_scope.len() > 4_usize { ret owner_scope.slice(4_usize, owner_scope.len() - 4_usize) }
+    ret ""
 }
 
 fn find_function(ast: Vec[Statement], name: str, line: usize, column: usize) -> Option[FunctionItem] {
@@ -950,6 +1433,281 @@ fn contains_string(items: Vec[str], needle: str) -> bool {
     ret false
 }
 
+fn module_generic_names(ast: Vec[Statement]) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => { for generic in item.generics { if !contains_string(out, generic.name) { out.push(generic.name) } } }
+            Statement::Struct(item) => { for generic in item.generics { if !contains_string(out, generic.name) { out.push(generic.name) } } }
+            Statement::EnumItem(item) => { for generic in item.generics { if !contains_string(out, generic.name) { out.push(generic.name) } } }
+            Statement::Trait(item) => {
+                for generic in item.generics { if !contains_string(out, generic.name) { out.push(generic.name) } }
+                for method in item.methods { for generic in method.generics { if !contains_string(out, generic.name) { out.push(generic.name) } } }
+            }
+            Statement::Impl(item) => {
+                for generic in item.generics { if !contains_string(out, generic.name) { out.push(generic.name) } }
+                for method in item.methods { for generic in method.generics { if !contains_string(out, generic.name) { out.push(generic.name) } } }
+            }
+            _ => {}
+        }
+    }
+    ret out
+}
+
+fn builtin_type_name(name: str) -> bool {
+    ret name == "Self" || name == "str" || name == "bool" || name == "void"
+        || name == "u1" || name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "u128" || name == "usize"
+        || name == "i8" || name == "i16" || name == "i32" || name == "i64" || name == "i128" || name == "isize"
+        || name == "f32" || name == "f64" || name == "any"
+}
+
+fn starts_with_uppercase(value: str) -> bool {
+    if value.len() == 0_usize { ret false }
+    let byte = value.byte_at(0_usize)
+    ret byte >= 65_u8 && byte <= 90_u8
+}
+
+fn strip_import_alias(value: str) -> str {
+    let mut index = 0_usize
+    while index + 4_usize <= value.len() {
+        if value.slice(index, 4_usize) == " as " { ret value.slice(0_usize, index) }
+        index += 1_usize
+    }
+    ret value
+}
+
+fn module_root_name(module_name: str) -> str {
+    let mut index = 0_usize
+    while index + 2_usize <= module_name.len() {
+        if module_name.slice(index, 2_usize) == "::" { ret module_name.slice(0_usize, index) }
+        index += 1_usize
+    }
+    ret module_name
+}
+
+fn normalized_import_target(module_name: str, target: str) -> str {
+    let mut cleaned = target
+    if starts_with(cleaned, "mod::") {
+        ret module_name + "::" + cleaned.slice(5_usize, cleaned.len() - 5_usize)
+    }
+    if starts_with(cleaned, "refrain::") || starts_with(cleaned, "repo::") {
+        let prefix_len = if starts_with(cleaned, "refrain::") { 9_usize } else { 6_usize }
+        ret module_root_name(module_name) + "::" + cleaned.slice(prefix_len, cleaned.len() - prefix_len)
+    }
+    ret cleaned
+}
+
+fn parent_module_name(module_name: str) -> str {
+    let mut index = module_name.len()
+    while index >= 2_usize {
+        if module_name.slice(index - 2_usize, 2_usize) == "::" {
+            ret module_name.slice(0_usize, index - 2_usize)
+        }
+        index -= 1_usize
+    }
+    ret ""
+}
+
+fn import_binding_names(path: str, owner: str) -> Vec[(str, str)] {
+    let mut out = Vec[(str, str)]::new()
+    if path.len() <= owner.len() + 2_usize { out.push(("*", "*")) ret out }
+    let suffix = path.slice(owner.len() + 2_usize, path.len() - owner.len() - 2_usize)
+    if starts_with(suffix, "{") {
+        let mut inner = suffix.slice(1_usize, suffix.len() - 1_usize)
+        if inner.len() > 0_usize && inner.slice(inner.len() - 1_usize, 1_usize) == "}" { inner = inner.slice(0_usize, inner.len() - 1_usize) }
+        for item in split_import_items(inner) { out.push(import_binding(item)) }
+        ret out
+    }
+    out.push(import_binding(suffix))
+    ret out
+}
+
+fn split_import_items(value: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut current = ""
+    let mut index = 0_usize
+    while index < value.len() {
+        let ch = value.slice(index, 1_usize)
+        if ch == "," { if trim_analysis_text(current) != "" { out.push(trim_analysis_text(current)) } current = "" }
+        else { current += ch }
+        index += 1_usize
+    }
+    if trim_analysis_text(current) != "" { out.push(trim_analysis_text(current)) }
+    ret out
+}
+
+fn import_binding(value: str) -> (str, str) {
+    let trimmed = trim_analysis_text(value)
+    let mut index = 0_usize
+    while index + 4_usize <= trimmed.len() {
+        if trimmed.slice(index, 4_usize) == " as " {
+            ret (trim_analysis_text(trimmed.slice(0_usize, index)), trim_analysis_text(trimmed.slice(index + 4_usize, trimmed.len() - index - 4_usize)))
+        }
+        index += 1_usize
+    }
+    ret (trimmed, trimmed)
+}
+
+fn trim_analysis_text(value: str) -> str {
+    let mut start = 0_usize
+    let mut end = value.len()
+    while start < end && (value.slice(start, 1_usize) == " " || value.slice(start, 1_usize) == "\t") { start += 1_usize }
+    while end > start && (value.slice(end - 1_usize, 1_usize) == " " || value.slice(end - 1_usize, 1_usize) == "\t") { end -= 1_usize }
+    ret value.slice(start, end - start)
+}
+
+fn next_definition_id(
+    module_name: str,
+    owner: str,
+    kind: str,
+    name: str,
+    identity_keys: mut Vec[str]
+) -> DefinitionId {
+    let key = owner + "#" + kind + "#" + name
+    let mut ordinal = 0_usize
+    for existing in identity_keys { if existing == key { ordinal += 1_usize } }
+    identity_keys.push(key)
+    ret definition_id(module_name, owner, kind, name, ordinal)
+}
+
+fn insert_import_definition(
+    definition: HirDefinition,
+    alias: str,
+    is_public: bool,
+    map: mut ModuleDefMap
+) -> () {
+    map.insert(HirDefinition::new(
+        definition.id(),
+        definition.module_name(),
+        alias,
+        DefinitionKind::Import,
+        definition.namespace(),
+        is_public,
+        definition.source_name(),
+        definition.line(),
+        definition.column(),
+        definition.length(),
+        definition.typ()
+    ))
+    ret ()
+}
+
+fn contains_string_value(value: str, needle: str) -> bool {
+    if needle.len() == 0_usize { ret true }
+    if needle.len() > value.len() { ret false }
+    let mut index = 0_usize
+    while index + needle.len() <= value.len() {
+        if value.slice(index, needle.len()) == needle { ret true }
+        index += 1_usize
+    }
+    ret false
+}
+
 fn starts_with(value: str, prefix: str) -> bool {
     ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix
+}
+
+fn ends_with_analysis(value: str, suffix: str) -> bool {
+    ret suffix.len() <= value.len() && value.slice(value.len() - suffix.len(), suffix.len()) == suffix
+}
+
+#attr(test)
+fn semantic_hir_def_map_contract() -> bool {
+    let mut database = AnalysisDatabase::new()
+    database.set_module_full(
+        "sample",
+        "sample.enq",
+        "pub struct User { name: str }\npub trait Named { fn name(self: Self) -> str }\npub fn make() -> User { ret User{\"Ada\"} }\n"
+    )
+    let map = match database.module_def_map("sample") {
+        Option[ModuleDefMap]::Some(value) => value
+        Option[ModuleDefMap]::None => { ret false }
+    }
+    let user = match map.resolve("User", DefinitionNamespace::Type) {
+        Option::Some(value) => value
+        Option::None => { ret false }
+    }
+    let make = match map.resolve("make", DefinitionNamespace::Value) {
+        Option::Some(value) => value
+        Option::None => { ret false }
+    }
+    ret user.value() != 0_u64 && make.value() != 0_u64 && user.key() != make.key()
+}
+
+#attr(test)
+fn semantic_hir_ids_survive_body_edits_contract() -> bool {
+    let mut database = AnalysisDatabase::new()
+    database.set_module_full("sample", "sample.enq", "pub fn answer() -> u32 { ret 1_u32 }\n")
+    let mut first = DefinitionId::invalid()
+    match database.module_def_map("sample") {
+        Option[ModuleDefMap]::Some(map) => {
+            match map.resolve("answer", DefinitionNamespace::Value) {
+                Option::Some(value) => { first = value }
+                Option::None => {}
+            }
+        }
+        Option[ModuleDefMap]::None => {}
+    }
+    if database.module_def_map_count("sample") != 1_usize { ret false }
+    database.set_module_full(
+        "sample",
+        "sample.enq",
+        "pub struct Unrelated { value: u32 }\npub fn answer() -> u32 { ret 2_u32 }\n"
+    )
+    let mut second = DefinitionId::invalid()
+    match database.module_def_map("sample") {
+        Option[ModuleDefMap]::Some(map) => {
+            match map.resolve("answer", DefinitionNamespace::Value) {
+                Option::Some(value) => { second = value }
+                Option::None => {}
+            }
+        }
+        Option[ModuleDefMap]::None => {}
+    }
+    ret first.value() != 0_u64 && first.value() == second.value() && first.key() == second.key()
+        && database.module_def_map_count("sample") == 2_usize
+}
+
+#attr(test)
+fn semantic_hir_import_namespace_contract() -> bool {
+    let mut database = AnalysisDatabase::new()
+    database.set_module_full("dependency", "dependency.enq", "pub struct Item { value: u32 }\npub fn make() -> Item { ret Item{1_u32} }\n")
+    database.set_module_full("consumer", "consumer.enq", "import dependency::Item as ImportedItem\nimport dependency::make\nfn main() -> u32 { let item = make() ret item.value }\n")
+    let map = match database.module_def_map("consumer") {
+        Option[ModuleDefMap]::Some(value) => value
+        Option[ModuleDefMap]::None => { ret false }
+    }
+    let imported_item = map.resolve("ImportedItem", DefinitionNamespace::Type)
+    let imported_make = map.resolve("make", DefinitionNamespace::Value)
+    let dependency = match database.module_def_map("dependency") {
+        Option[ModuleDefMap]::Some(value) => value
+        Option[ModuleDefMap]::None => { ret false }
+    }
+    ret imported_item.is_some()
+        && imported_make.is_some()
+        && imported_item.unwrap_or(DefinitionId::invalid()).key()
+            == dependency.resolve("Item", DefinitionNamespace::Type).unwrap_or(DefinitionId::invalid()).key()
+        && imported_make.unwrap_or(DefinitionId::invalid()).key()
+            == dependency.resolve("make", DefinitionNamespace::Value).unwrap_or(DefinitionId::invalid()).key()
+}
+
+#attr(test)
+fn semantic_hir_relative_module_import_contract() -> bool {
+    let mut database = AnalysisDatabase::new()
+    database.set_module_full(
+        "sample::frontend::lexer::token",
+        "token.enq",
+        "pub struct Token {}\npub enum TokenType { Unknown }\n"
+    )
+    database.set_module_full(
+        "sample::frontend::lexer::lexer",
+        "lexer.enq",
+        "import mod::token::Token\nimport mod::token::TokenType\nfn consume(value: Token, kind: TokenType) -> () { ret () }\n"
+    )
+    let map = match database.module_def_map("sample::frontend::lexer::lexer") {
+        Option[ModuleDefMap]::Some(value) => value
+        Option[ModuleDefMap]::None => { ret false }
+    }
+    ret map.resolve("Token", DefinitionNamespace::Type).is_some()
+        && map.resolve("TokenType", DefinitionNamespace::Type).is_some()
 }

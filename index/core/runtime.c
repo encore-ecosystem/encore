@@ -83,6 +83,14 @@ typedef struct {
 typedef void (*encore_thread_entry)(void *);
 typedef void (*encore_thread_cleanup)(void *);
 
+bool encore_terminal_is_tty(int32_t fd) {
+#ifdef _WIN32
+    return fd >= 0 && _isatty(fd) != 0;
+#else
+    return fd >= 0 && isatty(fd) != 0;
+#endif
+}
+
 typedef struct {
 #ifdef _WIN32
     HANDLE thread;
@@ -579,6 +587,21 @@ typedef struct {
     bool failed;
 } encore_text_builder;
 
+static _Thread_local bool encore_text_builder_suppressed = false;
+static _Thread_local bool encore_translation_diagnostic_json = false;
+
+void encore_text_builder_set_suppressed(bool suppressed) {
+    encore_text_builder_suppressed = suppressed;
+}
+
+void encore_translation_diagnostic_set_json(bool enabled) {
+    encore_translation_diagnostic_json = enabled;
+}
+
+bool encore_translation_diagnostic_is_json(void) {
+    return encore_translation_diagnostic_json;
+}
+
 static bool encore_text_builder_reserve(encore_text_builder *builder, size_t additional) {
     if (builder == NULL || additional > SIZE_MAX - builder->len) return false;
     size_t required = builder->len + additional;
@@ -611,6 +634,7 @@ void *encore_text_builder_new(void) {
 void encore_text_builder_append(void *raw_builder, encore_str value) {
     encore_text_builder *builder = raw_builder;
     if (builder == NULL || builder->failed) return;
+    if (encore_text_builder_suppressed) return;
     size_t len = encore_str_size(value);
     if (!encore_text_builder_reserve(builder, len)) {
         builder->failed = true;
@@ -624,6 +648,11 @@ void encore_text_builder_append_builder(void *raw_builder, void *raw_other) {
     encore_text_builder *builder = raw_builder;
     encore_text_builder *other = raw_other;
     if (builder == NULL || other == NULL || builder == other) return;
+    if (encore_text_builder_suppressed) {
+        free(other->object);
+        free(other);
+        return;
+    }
     if (other->failed) {
         builder->failed = true;
     } else if (encore_text_builder_reserve(builder, other->len)) {
