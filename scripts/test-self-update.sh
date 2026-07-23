@@ -216,6 +216,13 @@ if [ -z "$openssl_bin" ]; then
     done
 fi
 test -n "$openssl_bin"
+http_server_binmode=
+if "$openssl_bin" s_server -help 2>&1 | grep -Fq -- '-http_server_binmode'; then
+    http_server_binmode=-http_server_binmode
+elif [ "$os" = windows ]; then
+    echo "the Windows HTTPS updater test requires OpenSSL -http_server_binmode" >&2
+    exit 1
+fi
 mkdir -p "$temporary/tls"
 cat > "$temporary/tls/extensions.cnf" <<'EOF'
 subjectAltName=DNS:localhost
@@ -230,10 +237,18 @@ MSYS2_ARG_CONV_EXCL='/CN=' "$openssl_bin" req -newkey rsa:2048 -nodes -subj "/CN
     -out "$temporary/tls/server.pem" >/dev/null 2>&1
 port=$((25000 + ($$ % 24000)))
 server_log="$temporary/tls/server.log"
+https_mirror="$temporary/https-mirror"
+mkdir -p "$https_mirror/channels"
+response="$https_mirror/release.http"
+archive_size=$(wc -c < "$archive" | tr -d ' ')
+{
+    printf 'HTTP/1.1 200 OK\r\nContent-Length: %s\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n' "$archive_size"
+    cat "$archive"
+} > "$response"
 server_started=false
 for offset in 0 1 2 3 4 5 6 7 8 9; do
     candidate_port=$((port + offset))
-    (cd "$mirror" && exec "$openssl_bin" s_server -quiet -WWW -accept "$candidate_port" \
+    (cd "$https_mirror" && exec "$openssl_bin" s_server -quiet -HTTP $http_server_binmode -accept "$candidate_port" \
         -cert "$temporary/tls/server.pem" -key "$temporary/tls/server.key" </dev/null >"$server_log" 2>&1) &
     server_pid=$!
     sleep 1
@@ -250,8 +265,13 @@ if [ "$server_started" != true ]; then
     echo "unable to start the local HTTPS update server" >&2
     exit 1
 fi
-archive_url="https://localhost:$port/$(basename -- "$archive")"
+archive_url="https://localhost:$port/$(basename -- "$response")"
 write_manifest "$mirror/channels/stable.json" "$checksum" stable
+manifest_size=$(wc -c < "$mirror/channels/stable.json" | tr -d ' ')
+{
+    printf 'HTTP/1.1 200 OK\r\nContent-Length: %s\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n' "$manifest_size"
+    cat "$mirror/channels/stable.json"
+} > "$https_mirror/channels/stable.json"
 native_ca="$temporary/tls/ca.pem"
 if [ "$os" = windows ]; then
     native_ca=$(native_path "$native_ca")
