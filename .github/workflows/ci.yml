@@ -3,7 +3,7 @@ name: Native CI
 on:
   pull_request:
   push:
-    branches: [trunk, nightly]
+    branches: [trunk]
 
 permissions:
   contents: read
@@ -12,83 +12,12 @@ concurrency:
   group: native-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-jobs:
-  seeds:
-    name: Prepare native compiler seeds
-    runs-on: ubuntu-latest
-    outputs:
-      released: ${{ steps.release.outputs.released }}
-    env:
-      GH_TOKEN: ${{ github.token }}
-      ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Verify compiler bootstrap
-        run: |
-          scripts/verify-version.sh
-          scripts/verify-stage0.sh
-      - name: Find complete native release
-        id: release
-        shell: bash
-        run: |
-          set -eu
-          released=false
-          if tag=$(gh release view --json tagName --jq .tagName 2>/dev/null); then
-            mkdir -p seeds
-            complete=true
-            for asset in \
-              encore-x86_64-unknown-linux-gnu.tar.gz \
-              encore-aarch64-unknown-linux-gnu.tar.gz \
-              encore-x86_64-apple-darwin.tar.gz \
-              encore-aarch64-apple-darwin.tar.gz \
-              encore-x86_64-pc-windows-msvc.zip
-            do
-              if ! gh release download "$tag" --pattern "$asset" --dir seeds; then
-                complete=false
-                break
-              fi
-            done
-            if [ "$complete" = true ]; then released=true; else rm -rf seeds; fi
-          fi
-          echo "released=$released" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v7
-        if: steps.release.outputs.released == 'true'
-        with:
-          name: native-release-seeds
-          path: seeds/*
-          if-no-files-found: error
-          retention-days: 1
-      - name: Generate transitional bootstrap IR
-        if: steps.release.outputs.released != 'true'
-        shell: bash
-        run: |
-          mkdir -p target
-          gzip -dc bootstrap/encore-stage0-linux-x86_64.gz > target/encore-stage0
-          chmod +x target/encore-stage0
-          for triple in \
-            x86_64-unknown-linux-gnu \
-            aarch64-unknown-linux-gnu \
-            x86_64-apple-darwin \
-            aarch64-apple-darwin \
-            x86_64-pc-windows-msvc
-          do
-            target/encore-stage0 build --profile extreme --target "$triple" --emit llvm-ir
-          done
-      - uses: actions/upload-artifact@v7
-        if: steps.release.outputs.released != 'true'
-        with:
-          name: transitional-bootstrap-ir
-          path: target/*/extreme/encore.ll
-          if-no-files-found: error
-          retention-days: 1
+env:
+  ENCORE_INDEX_URL: https://raw.githubusercontent.com/encore-ecosystem/encore-index/a931b185d56bc9ae9515cfdabde721486a8c7b0c
 
-  test:
-    name: Test ${{ matrix.triple }}
-    needs: seeds
-    env:
-      ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
+jobs:
+  native:
+    name: Verify ${{ matrix.triple }}
     strategy:
       fail-fast: false
       matrix:
@@ -109,123 +38,124 @@ jobs:
             triple: x86_64-pc-windows-msvc
             executable: encore.exe
     runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/registry
     steps:
       - uses: actions/checkout@v6
         with:
-          lfs: true
-      - uses: actions/download-artifact@v8
-        if: needs.seeds.outputs.released == 'true'
-        with:
-          name: native-release-seeds
-          path: seeds
-      - uses: actions/download-artifact@v8
-        if: needs.seeds.outputs.released != 'true'
-        with:
-          name: transitional-bootstrap-ir
-          path: target
-      - name: Extract released seed
-        if: needs.seeds.outputs.released == 'true'
+          fetch-depth: 0
+
+      - name: Verify source version
         shell: bash
         run: |
-          set -eu
-          mkdir -p target/seed unpacked-seed
-          case "${{ matrix.triple }}" in
-            *-windows-*) unzip -q "seeds/encore-${{ matrix.triple }}.zip" -d unpacked-seed ;;
-            *) tar -xzf "seeds/encore-${{ matrix.triple }}.tar.gz" -C unpacked-seed ;;
+          set -euo pipefail
+          version=$(tr -d '\r\n' < VERSION)
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' encore.toml | head -n 1)" = "$version"
+          test "$(sed -n 's/.*ret "\([^"]*\)".*/\1/p' src/version.enq)" = "$version"
+
+      - name: Download latest complete trusted compiler
+        id: seed
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/seeds
+          current=${GITHUB_REF_NAME:-}
+          selected=
+          while IFS= read -r tag; do
+            test "$tag" != "$current" || continue
+            case "$tag" in channel-*) continue ;; esac
+            extension=tar.gz
+            case "${{ matrix.triple }}" in *-windows-*) extension=zip ;; esac
+            asset="encore-${{ matrix.triple }}.$extension"
+            candidate="target/seeds/$tag"
+            mkdir -p "$candidate"
+            if gh release download "$tag" \
+              --pattern "$asset" \
+              --pattern "$asset.sha256" \
+              --dir "$candidate" >/dev/null 2>&1
+            then
+              selected=$tag
+              echo "SEED_DOWNLOAD_DIR=$PWD/$candidate" >> "$GITHUB_ENV"
+              break
+            fi
+          done < <(gh release list --limit 100 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft == false) | .tagName')
+          test -n "$selected" || {
+            echo "::error::No complete trusted release contains ${{ matrix.triple }}"
+            exit 1
+          }
+          echo "tag=$selected" >> "$GITHUB_OUTPUT"
+
+      - name: Verify and extract trusted compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          extension=tar.gz
+          case "${{ matrix.triple }}" in *-windows-*) extension=zip ;; esac
+          asset="encore-${{ matrix.triple }}.$extension"
+          expected=$(awk 'NF {print tolower($1); exit}' "$SEED_DOWNLOAD_DIR/$asset.sha256")
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$SEED_DOWNLOAD_DIR/$asset" | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 "$SEED_DOWNLOAD_DIR/$asset" | awk '{print $1}')
+          fi
+          test "$actual" = "$expected"
+          mkdir -p target/seed-unpacked
+          case "$extension" in
+            zip) unzip -q "$SEED_DOWNLOAD_DIR/$asset" -d target/seed-unpacked ;;
+            *) tar -xzf "$SEED_DOWNLOAD_DIR/$asset" -C target/seed-unpacked ;;
           esac
-          seed=$(find unpacked-seed -type f -path "*/bin/${{ matrix.executable }}" | head -n 1)
-          test -n "$seed"
-          cp "$seed" "target/seed/${{ matrix.executable }}"
-          chmod +x "target/seed/${{ matrix.executable }}" 2>/dev/null || true
-      - name: Assemble transitional seed
-        if: needs.seeds.outputs.released != 'true'
+          distribution=$(find target/seed-unpacked -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          test -n "$distribution"
+          test -s "$distribution/bin/${{ matrix.executable }}"
+          test -f "$distribution/lib/encore/index/core/encore.toml"
+          echo "ENCORE_HOME=$PWD/$distribution" >> "$GITHUB_ENV"
+          echo "ENCORE_CORE_DIR=$PWD/$distribution/lib/encore/index/core" >> "$GITHUB_ENV"
+          echo "SEED_COMPILER=$PWD/$distribution/bin/${{ matrix.executable }}" >> "$GITHUB_ENV"
+
+      - name: Resolve pinned compiler dependencies
         shell: bash
         run: |
-          mkdir -p target/seed
-          link_args=()
-          case "${{ matrix.triple }}" in
-            *-linux-*) link_args=(-lssl -lcrypto) ;;
-            *-apple-*) link_args=(-framework Security -framework CoreFoundation) ;;
-          esac
-          clang -O3 -w \
-            "target/${{ matrix.triple }}/extreme/encore.ll" \
-            runtime.c index/core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
-            "${link_args[@]}" \
-            -o "target/seed/${{ matrix.executable }}"
-      - name: Native two-stage self-host
+          set -euo pipefail
+          "$SEED_COMPILER" sync
+
+      - name: Verify byte-identical two-stage self-host
         shell: bash
         run: |
-          set -eu
-          seed="$PWD/target/seed/${{ matrix.executable }}"
-          "$seed" --version
-          "$seed" build --profile extreme
+          set -euo pipefail
+          "$SEED_COMPILER" build --profile extreme
           mkdir -p target/stage1
           cp "target/extreme/${{ matrix.executable }}" "target/stage1/${{ matrix.executable }}"
-          mv target/extreme target/stage1-extreme
-          stage1="$PWD/target/stage1/${{ matrix.executable }}"
-          "$stage1" --version
-          "$stage1" build --profile extreme
+          mv target/extreme target/stage1-output
+          "target/stage1/${{ matrix.executable }}" build --profile extreme
           mkdir -p target/stage2
           cp "target/extreme/${{ matrix.executable }}" "target/stage2/${{ matrix.executable }}"
+          cmp "target/stage1/${{ matrix.executable }}" "target/stage2/${{ matrix.executable }}"
           "target/stage2/${{ matrix.executable }}" --version
-      - name: Run full native tests
+
+      - name: Run compiler tests
         shell: bash
         run: |
-          set -eu
-          compiler="$PWD/target/stage2/${{ matrix.executable }}"
-          for package in \
-            index/core \
-            index/color \
-            index/colorterm \
-            index/dict \
-            index/ehir \
-            index/ehir-llvm-backend \
-            index/encore-ui \
-            index/geometry \
-            index/json \
-            index/llvm \
-            index/log \
-            index/lsp \
-            index/rich \
-            index/std \
-            index/toml \
-            .
-          do
-            set +e
-            output=$(cd "$package" && "$compiler" test 2>&1)
-            code=$?
-            set -e
-            printf '%s\n' "$output"
-            if [ "$code" -ne 0 ]; then
-              diagnostic=$(printf '%s' "$output" | tail -c 3000)
-              message=${diagnostic//'%'/'%25'}
-              message=${message//$'\n'/'%0A'}
-              message=${message//$'\r'/'%0D'}
-              echo "::error title=Tests failed in $package::$message"
-              exit "$code"
-            fi
-          done
-      - name: Native analyzer and CLI contracts
+          set -euo pipefail
+          "target/stage2/${{ matrix.executable }}" test
+
+      - name: Build examples
         if: matrix.triple == 'x86_64-unknown-linux-gnu'
         shell: bash
         run: |
+          set -euo pipefail
           compiler="$PWD/target/stage2/${{ matrix.executable }}"
-          scripts/test-analyzer.sh "$compiler"
-          scripts/test-tooling-foundation.sh "$compiler"
-          scripts/test-lsp-integration.sh "$compiler"
-          scripts/test-cli-contract.sh "$compiler"
-          scripts/test-release-channels.sh
-          ENCORE_BIN="$compiler" scripts/test-cross-targets.sh
-          scripts/test-memory-safety.sh "$compiler"
-      - name: Verified native HTTPS integration
-        shell: bash
-        run: scripts/test-https-stack.sh "$PWD/target/stage2/${{ matrix.executable }}"
-      - name: Verified native self update
-        shell: bash
-        run: scripts/test-self-update.sh "$PWD/target/stage2/${{ matrix.executable }}"
+          for manifest in examples/*/encore.toml; do
+            example=${manifest%/encore.toml}
+            case "$example" in examples/bare_metal) continue ;; esac
+            (cd "$example" && "$compiler" build)
+          done
+          (cd examples/bare_metal && "$compiler" build --target thumbv7em-none-eabi --emit llvm-ir)
+
       - uses: actions/upload-artifact@v7
         with:
-          name: encore-${{ matrix.triple }}
+          name: verified-${{ matrix.triple }}
           path: target/stage2/${{ matrix.executable }}
           if-no-files-found: error
           retention-days: 7

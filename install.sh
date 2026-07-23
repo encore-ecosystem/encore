@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-repository=${ENCORE_REPOSITORY:-encore-language/encore}
+repository=${ENCORE_REPOSITORY:-encore-ecosystem/encore}
 install_root=${ENCORE_HOME:-"$HOME/.encore"}
 version=${ENCORE_VERSION:-latest}
 release_base=${ENCORE_RELEASE_BASE_URL:-}

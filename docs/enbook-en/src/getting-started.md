@@ -147,7 +147,8 @@ compiler or backend failure is reported as a failed test.
 
 ## Examples
 
-Practical packages live in `index/`:
+Practical programs live in `examples/` and resolve libraries through the
+official package index:
 
 ```sh
 cd examples/echo
@@ -156,8 +157,6 @@ encore run -- hello beta
 cd ../wc
 encore run -- src/main.enq
 
-cd ../dict
-encore run
 ```
 
 The examples cover CLI programs, sorting, dictionaries, paths, strings,
