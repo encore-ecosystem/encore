@@ -19,9 +19,10 @@ generic-bound, async, and exhaustive-match rules) run through a
 validation-only translation pass which discards EHIR output. This preserves
 complete compiler behaviour while those checks migrate into reusable queries.
 
-`index/lsp` remains as a thin JSON-RPC/LSP transport adapter. It uses the same
-analysis database, formatter, lint engine, project configuration, ranges, and
-suggestions as the compiler; it does not contain a second language analyzer.
+The separately distributed LSP remains a thin JSON-RPC transport adapter over
+the compiler's public analysis database, formatter, lint engine, project
+configuration, ranges, and suggestions; it does not contain a second language
+analyzer.
 
 Changing a function body must not invalidate unrelated module interfaces.
 Changing a public signature invalidates only queries which read that

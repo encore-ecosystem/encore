@@ -4,6 +4,7 @@
 
 - [Getting Started](getting-started.md)
 - [Language Basics](language-basics.md)
+- [Language Construct Examples](language-construct-examples.md)
 - [Memory Model](memory-model.md)
 - [Concurrency](concurrency.md)
 - [Compiler Logic](compiler-logic.md)

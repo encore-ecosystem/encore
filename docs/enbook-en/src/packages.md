@@ -115,7 +115,7 @@ archive and verifies the recorded checksum.
 ## Official Package Index
 
 The default sparse index is
-`https://raw.githubusercontent.com/encore-language/index/refs/heads/main`. Package
+`https://raw.githubusercontent.com/encore-ecosystem/encore-index/refs/heads/main`. Package
 `json` is described by `js/json.json`; only that metadata file is downloaded.
 Set `ENCORE_INDEX_URL` to use a mirror and `ENCORE_REGISTRY_CACHE` to override
 the default cache under `~/.cache/encore/registry`.
@@ -239,8 +239,9 @@ encore test --cfg feature=my_feature
 
 ## Native Build Scripts
 
-Build scripts let packages publish native link metadata. `index/core/build.enq` is the
-reference pattern. It writes JSON to the path passed as argv `1`:
+Build scripts let packages publish native link metadata. The official `core`
+package in `encore-ecosystem/encore-index` is the reference pattern. A build
+script writes JSON to the path passed as argv `1`:
 
 ```json
 {
@@ -273,9 +274,5 @@ fields let metadata apply only to matching compile-time configurations.
 Release-gate validation uses the native compiler:
 
 ```sh
-compiler="$PWD/target/extreme/encore"
-for package in index/core index/ehir index/ehir-llvm-backend index/rich index/std; do
-    (cd "$package" && "$compiler" test)
-done
 ./target/extreme/encore test
 ```

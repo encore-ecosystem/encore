@@ -1,7 +1,7 @@
 # Publishing Packages
 
 Encore uses GitHub as package storage and
-[`encore-language/index`](https://github.com/encore-language/index) as a sparse
+[`encore-ecosystem/encore-index`](https://github.com/encore-ecosystem/encore-index) as a sparse
 metadata catalog. Package source can live in any public GitHub repository. A
 published version is a maintainer-created `.tar.gz` asset attached to a GitHub
 Release; automatically generated source archives are not used.
@@ -97,7 +97,7 @@ version and a new URL.
 
 ## Add The Index Entry
 
-Fork `encore-language/index`. Metadata paths use the first two package-name
+Fork `encore-ecosystem/encore-index`. Metadata paths use the first two package-name
 characters:
 
 ```text
@@ -134,7 +134,7 @@ merging.
 Push the metadata branch and point Encore to its immutable Git commit:
 
 ```sh
-export ENCORE_INDEX_URL="https://raw.githubusercontent.com/<fork>/index/<commit>"
+export ENCORE_INDEX_URL="https://raw.githubusercontent.com/<fork>/encore-index/<commit>"
 export ENCORE_REGISTRY_CACHE="$(mktemp -d)"
 
 mkdir package-smoke

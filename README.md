@@ -3,7 +3,7 @@
 Encore is a self-hosted programming language and native compiler built around
 EHIR (Encore High Intermediate Representation) and LLVM.
 
-The current development line is `0.1.3`. Python compiler development ended at
+The current development line is `0.1.4`. Python compiler development ended at
 `0.1.2`; current sources are compiled only by the native Encore compiler.
 
 ## Install
@@ -12,7 +12,7 @@ Linux and macOS:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/encore-language/encore/trunk/install.sh | sh
+  https://raw.githubusercontent.com/encore-ecosystem/encore/trunk/install.sh | sh
 export PATH="$HOME/.encore/bin:$PATH"
 ```
 
@@ -21,12 +21,12 @@ specific tag, or update explicitly with:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/encore-language/encore/trunk/install.sh | \
+  https://raw.githubusercontent.com/encore-ecosystem/encore/trunk/install.sh | \
   sh -s -- --update
 
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/encore-language/encore/trunk/install.sh | \
-  sh -s -- --version 1.0.0
+  https://raw.githubusercontent.com/encore-ecosystem/encore/trunk/install.sh | \
+  sh -s -- --version 0.1.4
 ```
 
 Use `--install-dir <path>` for a custom location and `--uninstall` to remove
@@ -88,7 +88,7 @@ Use `release` for distributable binaries that must run on a broad CPU baseline.
 Use `extreme` for the fastest local or explicitly targeted production binary.
 
 `encore add json` resolves `index@json` through the official sparse package
-index at `encore-language/index`. Published source archives are downloaded from
+index at `encore-ecosystem/encore-index`. Published source archives are downloaded from
 GitHub Releases, verified with SHA-256, and cached locally. Existing lockfiles
 continue to use their exact archive and checksum without refreshing the index.
 The complete user and author workflows are documented in
@@ -96,9 +96,9 @@ The complete user and author workflows are documented in
 [`Publishing Packages`](docs/enbook-en/src/publishing-packages.md).
 
 The official package set includes `std`, `json`, `rich`, `toml`, `log`,
-`colorterm`, `dict`, `color`, `geometry`, and `encore_ui`. Index metadata and
+`colorterm`, `dict`, `color`, and `geometry`. Index metadata and
 contribution rules live in
-[`encore-language/index`](https://github.com/encore-language/index).
+[`encore-ecosystem/encore-index`](https://github.com/encore-ecosystem/encore-index).
 
 Cross-compile using an LLVM-compatible target triple:
 
@@ -114,17 +114,13 @@ Toolchains can also be configured in `encore.toml`. See
 | Path | Purpose |
 | --- | --- |
 | repository root | native compiler frontend and CLI |
-| `index/core` | low-level language library and portable C runtime |
-| `index/color` | reusable RGBA color primitives |
-| `index/encore-ui` | retained cross-platform native UI toolkit |
-| `index/geometry` | reusable two-dimensional geometry primitives |
-| `index/ehir` | native EHIR representation and parser |
-| `index/ehir-llvm-backend` | native LLVM backend |
-| `index/std` | application standard library |
-| `index/rich` | terminal rendering and compiler/test progress |
-| `benchmark` | equivalent Encore and Rust performance benchmarks |
+| `src` | compiler, package manager, diagnostics and CLI implementation |
+| `tests` | end-to-end compiler tests |
 | `examples` | executable language examples |
 | `docs/enbook-en` | language and toolchain documentation |
+
+Compiler and standard-library packages are published through
+`encore-ecosystem/encore-index`; they are not duplicated in this repository.
 
 ## Native Development
 
@@ -135,17 +131,16 @@ With an existing native compiler at `target/extreme/encore`, run from the reposi
 ./target/extreme/encore test
 ```
 
-Regular CI builds the native compiler and runs package tests on Linux and
-macOS. Tagged commits run the full self-host and release verification workflow,
-then publish Linux, macOS, and Windows archives with checksums and channel
-manifests.
+Regular CI downloads the latest complete trusted release, builds the compiler
+twice, requires byte-identical stage-1 and stage-2 binaries, and runs tests on
+all five supported native targets. Version tags publish self-contained
+toolchain archives, checksums, and update-channel manifests:
 
-Prepare a stable release version from a clean worktree with
-`scripts/set-version.sh MAJOR.MINOR.PATCH`. `VERSION` is canonical; CI verifies
-that the native CLI, compiler manifest, README, and PKGBUILD template stay
-synchronized. Tagged releases include a generated Arch Linux `PKGBUILD` pinned
-to the SHA-256 of both Linux architecture archives. The complete maintainer
-procedure is in [`RELEASING.md`](RELEASING.md).
+- `vMAJOR.MINOR.PATCH` publishes stable;
+- `vMAJOR.MINOR.PATCH-beta.N` publishes beta;
+- `vMAJOR.MINOR.PATCH-nightly.YYYYMMDD` publishes nightly.
+
+`VERSION`, `encore.toml`, and `src/version.enq` must contain the tag version.
 
 ## License
 

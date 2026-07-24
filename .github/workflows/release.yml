@@ -2,95 +2,18 @@ name: Native Release
 
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Version used inside archives
-        required: true
-        default: nightly
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
 
 permissions:
   contents: write
 
-jobs:
-  seeds:
-    name: Prepare released compiler seeds
-    runs-on: ubuntu-latest
-    outputs:
-      released: ${{ steps.release.outputs.released }}
-    env:
-      GH_TOKEN: ${{ github.token }}
-      ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Verify release sources and bootstrap
-        run: |
-          scripts/verify-version.sh
-          scripts/verify-no-python.sh
-          scripts/verify-stage0.sh --release
-      - name: Download latest complete native release
-        id: release
-        shell: bash
-        run: |
-          set -eu
-          released=false
-          if tag=$(gh release view --json tagName --jq .tagName 2>/dev/null); then
-            mkdir -p seeds
-            complete=true
-            for asset in \
-              encore-x86_64-unknown-linux-gnu.tar.gz \
-              encore-aarch64-unknown-linux-gnu.tar.gz \
-              encore-x86_64-apple-darwin.tar.gz \
-              encore-aarch64-apple-darwin.tar.gz \
-              encore-x86_64-pc-windows-msvc.zip
-            do
-              if ! gh release download "$tag" --pattern "$asset" --dir seeds; then
-                complete=false
-                break
-              fi
-            done
-            if [ "$complete" = true ]; then released=true; else rm -rf seeds; fi
-          fi
-          echo "released=$released" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v7
-        if: steps.release.outputs.released == 'true'
-        with:
-          name: native-release-seeds
-          path: seeds/*
-          if-no-files-found: error
-          retention-days: 1
-      - name: Generate first-release bootstrap IR
-        if: steps.release.outputs.released != 'true'
-        shell: bash
-        run: |
-          mkdir -p target
-          gzip -dc bootstrap/encore-stage0-linux-x86_64.gz > target/encore-stage0
-          chmod +x target/encore-stage0
-          for triple in \
-            x86_64-unknown-linux-gnu \
-            aarch64-unknown-linux-gnu \
-            x86_64-apple-darwin \
-            aarch64-apple-darwin \
-            x86_64-pc-windows-msvc
-          do
-            target/encore-stage0 build --profile extreme --target "$triple" --emit llvm-ir
-          done
-      - uses: actions/upload-artifact@v7
-        if: steps.release.outputs.released != 'true'
-        with:
-          name: first-release-bootstrap-ir
-          path: target/*/extreme/encore.ll
-          if-no-files-found: error
-          retention-days: 1
+env:
+  ENCORE_INDEX_URL: https://raw.githubusercontent.com/encore-ecosystem/encore-index/a931b185d56bc9ae9515cfdabde721486a8c7b0c
 
+jobs:
   build:
-    name: Build ${{ matrix.triple }} release
-    needs: seeds
-    env:
-      ENCORE_CORE_DIR: ${{ github.workspace }}/index/core
+    name: Build ${{ matrix.triple }}
     strategy:
       fail-fast: false
       matrix:
@@ -111,119 +34,183 @@ jobs:
             triple: x86_64-pc-windows-msvc
             executable: encore.exe
     runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/registry
     steps:
       - uses: actions/checkout@v6
         with:
-          lfs: true
-      - uses: actions/download-artifact@v8
-        if: needs.seeds.outputs.released == 'true'
-        with:
-          name: native-release-seeds
-          path: seeds
-      - uses: actions/download-artifact@v8
-        if: needs.seeds.outputs.released != 'true'
-        with:
-          name: first-release-bootstrap-ir
-          path: target
-      - name: Extract released compiler
-        if: needs.seeds.outputs.released == 'true'
+          fetch-depth: 0
+
+      - name: Verify release identity
         shell: bash
         run: |
-          set -eu
-          mkdir -p target/seed unpacked-seed
-          case "${{ matrix.triple }}" in
-            *-windows-*) unzip -q "seeds/encore-${{ matrix.triple }}.zip" -d unpacked-seed ;;
-            *) tar -xzf "seeds/encore-${{ matrix.triple }}.tar.gz" -C unpacked-seed ;;
-          esac
-          seed=$(find unpacked-seed -type f -path "*/bin/${{ matrix.executable }}" | head -n 1)
-          test -n "$seed"
-          cp "$seed" "target/seed/${{ matrix.executable }}"
-          chmod +x "target/seed/${{ matrix.executable }}" 2>/dev/null || true
-      - name: Assemble first-release compiler
-        if: needs.seeds.outputs.released != 'true'
-        shell: bash
-        run: |
-          mkdir -p target/seed
-          link_args=()
-          case "${{ matrix.triple }}" in
-            *-linux-*) link_args=(-lssl -lcrypto) ;;
-            *-apple-*) link_args=(-framework Security -framework CoreFoundation) ;;
-          esac
-          clang -O3 -w \
-            "target/${{ matrix.triple }}/extreme/encore.ll" \
-            runtime.c index/core/runtime.c index/ehir-llvm-backend/runtime.c index/rich/runtime.c \
-            "${link_args[@]}" \
-            -o "target/seed/${{ matrix.executable }}"
-      - name: Build current compiler twice
-        shell: bash
-        run: |
-          set -eu
-          seed="$PWD/target/seed/${{ matrix.executable }}"
-          "$seed" --version
-          "$seed" build --profile extreme
-          mkdir -p target/stage1
-          cp "target/extreme/${{ matrix.executable }}" "target/stage1/${{ matrix.executable }}"
-          mv target/extreme target/stage1-extreme
-          stage1="$PWD/target/stage1/${{ matrix.executable }}"
-          "$stage1" build --profile extreme
-          mkdir -p target/stage2
-          cp "target/extreme/${{ matrix.executable }}" "target/stage2/${{ matrix.executable }}"
-          "target/stage2/${{ matrix.executable }}" --version
-      - name: Verify tagged compiler version
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        env:
-          RELEASE_VERSION: ${{ github.ref_name }}
-        run: |
-          expected=${RELEASE_VERSION#v}
-          actual=$("target/stage2/${{ matrix.executable }}" --version)
-          test "$actual" = "encore $expected" || {
-            echo "::error title=Release version mismatch::Tag $RELEASE_VERSION requires 'encore $expected', got '$actual'"
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          test "$(tr -d '\r\n' < VERSION)" = "$version"
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' encore.toml | head -n 1)" = "$version"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+|-nightly\.[0-9]{8})?$ ]] || {
+            echo "Unsupported release version: $version" >&2
             exit 1
           }
-      - name: Run native tests
+
+      - name: Download previous complete trusted compiler
         shell: bash
         run: |
-          set -eu
-          compiler="$PWD/target/stage2/${{ matrix.executable }}"
-          for package in index/core index/color index/colorterm index/dict index/ehir index/ehir-llvm-backend index/encore-ui index/geometry index/json index/llvm index/log index/lsp index/rich index/std index/toml .; do
-            (cd "$package" && "$compiler" test)
-          done
-      - name: Verify Linux release workflows
-        if: matrix.triple == 'x86_64-unknown-linux-gnu'
+          set -euo pipefail
+          mkdir -p target/seeds
+          extension=tar.gz
+          case "${{ matrix.triple }}" in *-windows-*) extension=zip ;; esac
+          asset="encore-${{ matrix.triple }}.$extension"
+          selected=
+          while IFS= read -r tag; do
+            test "$tag" != "$GITHUB_REF_NAME" || continue
+            case "$tag" in channel-*) continue ;; esac
+            candidate="target/seeds/$tag"
+            mkdir -p "$candidate"
+            if gh release download "$tag" \
+              --pattern "$asset" \
+              --pattern "$asset.sha256" \
+              --dir "$candidate" >/dev/null 2>&1
+            then
+              selected=$tag
+              echo "SEED_DOWNLOAD_DIR=$PWD/$candidate" >> "$GITHUB_ENV"
+              break
+            fi
+          done < <(gh release list --limit 100 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft == false) | .tagName')
+          test -n "$selected" || {
+            echo "::error::No previous complete trusted release contains ${{ matrix.triple }}"
+            exit 1
+          }
+          echo "Using trusted compiler $selected"
+
+      - name: Verify and extract trusted compiler
         shell: bash
         run: |
-          compiler="$PWD/target/stage2/${{ matrix.executable }}"
-          scripts/test-test-runner.sh "$compiler"
-          scripts/test-analyzer.sh "$compiler"
-          scripts/test-tooling-foundation.sh "$compiler"
-          scripts/test-lsp-integration.sh "$compiler"
-          scripts/test-cli-contract.sh "$compiler"
-          scripts/test-release-channels.sh
-          scripts/smoke-cross-target.sh "$compiler"
-      - name: Verified native HTTPS integration
-        shell: bash
-        run: scripts/test-https-stack.sh "$PWD/target/stage2/${{ matrix.executable }}"
-      - name: Verified native self update
-        shell: bash
-        run: scripts/test-self-update.sh "$PWD/target/stage2/${{ matrix.executable }}"
-      - name: Package native release
-        id: package
-        shell: bash
-        env:
-          RELEASE_VERSION: ${{ github.event.inputs.version || github.ref_name }}
-        run: |
-          package_version=${RELEASE_VERSION#v}
-          mkdir -p dist
-          archive=$(scripts/package-release.sh "target/stage2/${{ matrix.executable }}" "${{ matrix.triple }}" "$package_version" dist)
+          set -euo pipefail
+          extension=tar.gz
+          case "${{ matrix.triple }}" in *-windows-*) extension=zip ;; esac
+          asset="encore-${{ matrix.triple }}.$extension"
+          expected=$(awk 'NF {print tolower($1); exit}' "$SEED_DOWNLOAD_DIR/$asset.sha256")
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$archive" > "$archive.sha256"
+            actual=$(sha256sum "$SEED_DOWNLOAD_DIR/$asset" | awk '{print $1}')
           else
-            shasum -a 256 "$archive" > "$archive.sha256"
+            actual=$(shasum -a 256 "$SEED_DOWNLOAD_DIR/$asset" | awk '{print $1}')
           fi
-          scripts/verify-release-package.sh "$archive" "${{ matrix.triple }}" "$package_version"
-          duplicate=$(scripts/package-release.sh "target/stage2/${{ matrix.executable }}" "${{ matrix.triple }}" "$package_version" dist-reproducible)
-          cmp "$archive" "$duplicate"
+          test "$actual" = "$expected"
+          mkdir -p target/seed-unpacked
+          case "$extension" in
+            zip) unzip -q "$SEED_DOWNLOAD_DIR/$asset" -d target/seed-unpacked ;;
+            *) tar -xzf "$SEED_DOWNLOAD_DIR/$asset" -C target/seed-unpacked ;;
+          esac
+          distribution=$(find target/seed-unpacked -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          test -s "$distribution/bin/${{ matrix.executable }}"
+          test -f "$distribution/lib/encore/index/core/encore.toml"
+          echo "ENCORE_HOME=$PWD/$distribution" >> "$GITHUB_ENV"
+          echo "ENCORE_CORE_DIR=$PWD/$distribution/lib/encore/index/core" >> "$GITHUB_ENV"
+          echo "SEED_COMPILER=$PWD/$distribution/bin/${{ matrix.executable }}" >> "$GITHUB_ENV"
+
+      - name: Resolve dependencies and reach a three-stage fixed point
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test "${{ matrix.triple }}" = x86_64-pc-windows-msvc; then
+            awk '
+              function emit() { if (name != "" && archive != "") print name "\t" version "\t" checksum "\t" archive }
+              /^\[\[packages\]\]$/ { emit(); name=version=checksum=archive=""; next }
+              /^name = / { name=$3; gsub(/"/, "", name) }
+              /^version = / { version=$3; gsub(/"/, "", version) }
+              /^checksum = / { checksum=$3; gsub(/"/, "", checksum) }
+              /^archive = / { archive=$3; gsub(/"/, "", archive) }
+              END { emit() }
+            ' encore.lock |
+            while IFS=$'\t' read -r name version checksum archive; do
+              destination="$PWD/target/registry/packages/$name/$version-$checksum"
+              mkdir -p "$destination"
+              curl --fail --location --retry 5 "$archive" -o target/registry-package.tar.gz
+              tar -xzf target/registry-package.tar.gz -C "$destination"
+            done
+          fi
+          "$SEED_COMPILER" sync
+          "$SEED_COMPILER" build --profile extreme
+          mkdir -p target/stage1
+          cp "target/extreme/${{ matrix.executable }}" "target/stage1/${{ matrix.executable }}"
+          mv target/extreme target/stage1-output
+          "target/stage1/${{ matrix.executable }}" build --profile extreme
+          mkdir -p target/stage2
+          cp "target/extreme/${{ matrix.executable }}" "target/stage2/${{ matrix.executable }}"
+          mv target/extreme target/stage2-output
+          "target/stage2/${{ matrix.executable }}" build --profile extreme
+          mkdir -p target/stage3
+          cp "target/extreme/${{ matrix.executable }}" "target/stage3/${{ matrix.executable }}"
+          cmp "target/stage2/${{ matrix.executable }}" "target/stage3/${{ matrix.executable }}"
+          test "$("target/stage3/${{ matrix.executable }}" --version)" = "encore ${GITHUB_REF_NAME#v}"
+
+      - name: Run release tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          "target/stage3/${{ matrix.executable }}" test
+
+      - name: Assemble reproducible toolchain archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          package="encore-$version-${{ matrix.triple }}"
+          root="$PWD/target/package/$package"
+          mkdir -p "$root/bin" "$root/lib/encore/index" "$root/share/doc/encore" dist
+          cp "target/stage3/${{ matrix.executable }}" "$root/bin/${{ matrix.executable }}"
+          chmod +x "$root/bin/${{ matrix.executable }}" 2>/dev/null || true
+          for name in core std rich json ehirlib ehir_llvm_backend toml colorterm log llvm; do
+            if test "$name" = core; then
+              source="$ENCORE_CORE_DIR"
+              destination=core
+            else
+              source=$(find "$PWD/target/registry/packages/$name" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+              destination=$name
+              case "$name" in ehirlib) destination=ehir ;; ehir_llvm_backend) destination=ehir-llvm-backend ;; esac
+            fi
+            test -f "$source/encore.toml"
+            cp -R "$source" "$root/lib/encore/index/$destination"
+          done
+          cp LICENSE README.md "$root/share/doc/encore/"
+          printf '%s\n' "$version" > "$root/VERSION"
+          find "$root" -exec touch -t 200001010000.00 {} +
+          case "${{ matrix.triple }}" in
+            *-windows-*)
+              archive="$PWD/dist/encore-${{ matrix.triple }}.zip"
+              (cd target/package && 7z a -tzip -mtc=off -mta=off "$archive" "$package")
+              ;;
+            *)
+              archive="$PWD/dist/encore-${{ matrix.triple }}.tar.gz"
+              if tar --version 2>/dev/null | grep -q GNU; then
+                tar -C target/package --sort=name --owner=0 --group=0 --numeric-owner -czf "$archive" "$package"
+              else
+                (cd target/package && find "$package" -print | LC_ALL=C sort |
+                  COPYFILE_DISABLE=1 tar --no-recursion --uid 0 --gid 0 --uname root --gname root -cf - -T - |
+                  gzip -n > "$archive")
+              fi
+              ;;
+          esac
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
+          else
+            (cd dist && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
+          fi
+
+      - name: Smoke-test packaged distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/package-smoke
+          archive=$(find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) | head -n 1)
+          tar -xf "$archive" -C target/package-smoke
+          root=$(find target/package-smoke -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          test "$("$root/bin/${{ matrix.executable }}" --version)" = "encore ${GITHUB_REF_NAME#v}"
+          test -f "$root/lib/encore/index/core/runtime.c"
+
       - uses: actions/upload-artifact@v7
         with:
           name: encore-${{ matrix.triple }}
@@ -231,7 +218,6 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -240,46 +226,71 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Verify complete release artifact set
-        run: scripts/verify-release-set.sh dist
-      - name: Resolve release channel and generate update manifest
-        id: release_meta
+
+      - name: Verify release set and generate manifests
+        id: metadata
         shell: bash
-        env:
-          RELEASE_VERSION: ${{ github.ref_name }}
         run: |
-          version=${RELEASE_VERSION#v}
-          channel=$(scripts/release-channel.sh "$version")
-          scripts/generate-release-manifest.sh \
-            dist "$version" "$RELEASE_VERSION" "$GITHUB_SHA" "$GITHUB_REPOSITORY" channel.json
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}$ ]]; then
+            channel=nightly
+          elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
+            channel=beta
+          elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            channel=stable
+          else
+            echo "Unsupported release channel: $version" >&2
+            exit 1
+          fi
+          assets=
+          checksums=dist/SHA256SUMS
+          : > "$checksums"
+          for triple in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin \
+            x86_64-pc-windows-msvc
+          do
+            extension=tar.gz
+            format=tar.gz
+            case "$triple" in *-windows-*) extension=zip; format=zip ;; esac
+            asset="encore-$triple.$extension"
+            test -s "dist/$asset"
+            test -s "dist/$asset.sha256"
+            checksum=$(awk 'NF {print tolower($1); exit}' "dist/$asset.sha256")
+            printf '%s  %s\n' "$checksum" "$asset" >> "$checksums"
+            entry="{\"triple\":\"$triple\",\"url\":\"https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$asset\",\"sha256\":\"$checksum\",\"format\":\"$format\"}"
+            if test -n "$assets"; then assets="$assets,$entry"; else assets=$entry; fi
+          done
+          LC_ALL=C sort -o "$checksums" "$checksums"
+          printf '{"schema":1,"channel":"%s","version":"%s","tag":"%s","commit":"%s","assets":[%s]}\n' \
+            "$channel" "$version" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$assets" > dist/channel.json
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
-      - name: Generate checksum-pinned PKGBUILD
-        if: steps.release_meta.outputs.channel == 'stable'
-        env:
-          RELEASE_VERSION: ${{ github.ref_name }}
-        run: scripts/generate-pkgbuild.sh "${RELEASE_VERSION#v}" dist
+
       - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
-          prerelease: ${{ steps.release_meta.outputs.channel != 'stable' }}
+          prerelease: ${{ steps.metadata.outputs.channel != 'stable' }}
+
       - name: Publish atomic channel pointer
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          CHANNEL: ${{ steps.release_meta.outputs.channel }}
-          VERSION: ${{ steps.release_meta.outputs.version }}
+          CHANNEL: ${{ steps.metadata.outputs.channel }}
         run: |
-          set -eu
+          set -euo pipefail
           pointer="channel-$CHANNEL"
           if gh release view "$pointer" >/dev/null 2>&1; then
             gh release upload "$pointer" dist/channel.json --clobber
-            gh release edit "$pointer" --notes "Current $CHANNEL compiler: Encore $VERSION"
+            gh release edit "$pointer" --target "$GITHUB_SHA" \
+              --notes "Current $CHANNEL compiler: Encore ${GITHUB_REF_NAME#v}"
           else
             gh release create "$pointer" dist/channel.json \
               --target "$GITHUB_SHA" \
               --title "Encore $CHANNEL channel" \
-              --notes "Current $CHANNEL compiler: Encore $VERSION" \
+              --notes "Current $CHANNEL compiler: Encore ${GITHUB_REF_NAME#v}" \
               --prerelease
           fi

@@ -25,10 +25,6 @@ Concurrency examples:
 - `multithreading` divides CPU work between native threads with `spawn` and
   collects typed results with `JoinHandle::join`.
 
-The complete native UI demonstration now lives next to its package at
-`index/encore-ui/demo`. It includes style gallery, counter, canvas, and font
-screens in one project.
-
 `bare_metal` is a freestanding Cortex-M project. It demonstrates a custom
 startup source, memory layout, target flags, and linked firmware ELF without
 requiring board-specific behavior in the compiler.

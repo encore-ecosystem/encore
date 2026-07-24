@@ -11,13 +11,13 @@ toolchains, the memory model, and the standard library.
 | Path | Purpose |
 | --- | --- |
 | repository root | native compiler frontend and CLI |
-| `index/ehir` | native EHIR library and parser |
-| `index/ehir-llvm-backend` | native LLVM backend |
-| `index/core` | low-level package and C runtime |
-| `index/std` | application standard library |
-| `index/rich` | terminal rendering and progress UI |
+| `src` | compiler, package manager, diagnostics and CLI |
+| `tests` | compiler integration tests |
 | `examples` | executable language examples |
 | `docs/enbook-en` | this user guide |
+
+Core, EHIR, backend, and standard-library packages are distributed through the
+official `encore-ecosystem/encore-index` sparse registry.
 
 ## Requirements
 
