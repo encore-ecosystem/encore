@@ -2,9 +2,9 @@
 
 import core::fmt::Debug
 import core::option::Option
-import core::io::eprintln
-import core::thread::JoinHandle
-import core::thread::available_parallelism
+import std::io::eprintln
+import std::thread::JoinHandle
+import std::thread::available_parallelism
 import std::os::write_file
 import std::os::read_file
 import std::os::env
@@ -30,8 +30,9 @@ import refrain::project::WorkspaceModule
 import refrain::project::WorkspaceRefrain
 import refrain::project::ProjectWorkspace
 import refrain::project::{system_core_root, workspace_release_modules, workspace_root_refrain}
-import refrain::project::manifest::{project_manifest_target, project_target_toolchain, read_project_manifest}
+import refrain::project::manifest::{project_manifest_name, project_manifest_target, project_target_toolchain, read_project_manifest}
 import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host, target_is_supported, toolchain_driver_is_supported}
+import refrain::target::kits::{target_kit_installed, target_kit_toolchain, target_platform_root}
 
 import rich::BuildProgress
 
@@ -229,7 +230,11 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         progress.fail_stage("failed to create object directory")
         ret 1_u32
     }
+    // COFF GNU linkers do not coalesce LLVM linkonce_odr helper symbols unless
+    // every helper is assigned an explicit COMDAT. Until the IR model carries
+    // COMDAT groups, emit one aggregate module for Windows GNU targets.
     let modular_codegen = emit == "binary" && module_llvm_paths.len() > 0_usize
+        && !(target.os == "windows" && target.environment == "gnu")
     let mut llvm_compile = Option[JoinHandle[i32]]::None
     if !codegen_cached && !modular_codegen {
         let mut llvm_args = compiler_args(profile, target, toolchain)
@@ -382,7 +387,7 @@ fn workspace_build_fingerprint(root: Path, workspace: ProjectWorkspace, target: 
 
 fn workspace_codegen_fingerprint(root: Path, workspace: ProjectWorkspace, target: TargetSpec,
     toolchain: Toolchain, profile: str, emit: str) -> str {
-    let mut value = "encore-codegen-cache-v9\ncompiler=encore-0.1.4\nmodule-identity=canonical-symbol-v3\nownership=single-atomic-release-v3\nmethod-receiver=mutable-field-load-v1\nthread-handle=shared-token-v1\nllvm-modules=virtual-import-bundle-v1\nprofile-flags=debug-release-extreme-v3\n" +
+    let mut value = "encore-codegen-cache-v10\ncompiler=encore-0.1.5\nmodule-identity=canonical-symbol-v3\nownership=single-atomic-release-v3\nmethod-receiver=mutable-field-load-v1\nthread-handle=shared-token-v1\nllvm-modules=virtual-import-bundle-v1\nprofile-flags=debug-release-extreme-v3\n" +
         target.triple + "\n" + profile + "\n" + emit
     value = fingerprint_mix(value, toolchain.driver)
     value = fingerprint_mix(value, toolchain.compiler)
@@ -617,7 +622,11 @@ fn write_llvm_artifact(ehir_path: Path, llvm_path: Path, target: TargetSpec) -> 
     let ehir_text = read_file(native_path(ehir_path.as_str()))
     let is_bundle = (ehir_text.len() >= 7_usize && ehir_text.slice(0_usize, 7_usize) == "module ") ||
         (ehir_text.len() >= 6_usize && ehir_text.slice(0_usize, 6_usize) == "entry ")
+    // COFF GNU linkers require explicit COMDAT groups for the linkonce_odr
+    // helpers emitted into separate modules. Keep Windows GNU as one module
+    // until those groups are represented in the LLVM IR model.
     let modular = normalize_emit(requested_value("--emit", "binary")) == "binary"
+        && !(target.os == "windows" && target.environment == "gnu")
     if is_bundle && modular {
         let bundle = parse_module_bundle_text("encore_bootstrap", ehir_text)
         let modules = emit_ir_bundle_for_target_parallel(bundle, target.triple, target.pointer_width, requested_jobs())
@@ -746,7 +755,13 @@ fn normalize_emit(value: str) -> str {
 }
 
 fn requested_toolchain(root: Path, target: TargetSpec) -> Toolchain {
-    let defaults = project_target_toolchain(root, target, default_toolchain(target))
+    let native_defaults = default_toolchain(target)
+    let kit_defaults = target_kit_toolchain(target, native_defaults)
+    let defaults = project_target_toolchain(root, target, kit_defaults)
+    let mut compile_args = defaults.compile_args
+    compile_args.extend(requested_values("--compile-arg"))
+    let mut link_args = defaults.link_args
+    link_args.extend(requested_values("--link-arg"))
     ret Toolchain{
         defaults.driver,
         requested_value("--cc", defaults.compiler),
@@ -755,8 +770,8 @@ fn requested_toolchain(root: Path, target: TargetSpec) -> Toolchain {
         requested_value("--sysroot", defaults.sysroot),
         requested_value("--target-cpu", defaults.cpu),
         requested_value("--target-features", defaults.features),
-        defaults.compile_args,
-        defaults.link_args,
+        compile_args,
+        link_args,
         defaults.runtime_sources,
         requested_value("--linker-script", defaults.linker_script),
         defaults.hosted_runtime
@@ -765,6 +780,9 @@ fn requested_toolchain(root: Path, target: TargetSpec) -> Toolchain {
 
 fn validate_toolchain(root: Path, target: TargetSpec, toolchain: Toolchain, emit: str) -> Option[str] {
     if emit == "ehir" || emit == "llvm-ir" { ret Option[str]::None }
+    if managed_cross_target(target) && !target_kit_installed(target) && !custom_toolchain_requested(root, target) {
+        ret Option[str]::Some("target kit for " + target.triple + " is not installed; run `encore target install " + target.triple + "`")
+    }
     if !toolchain_driver_is_supported(toolchain.driver) {
         ret Option[str]::Some("unsupported target toolchain driver '" + toolchain.driver + "'; supported drivers: clang")
     }
@@ -785,6 +803,30 @@ fn validate_toolchain(root: Path, target: TargetSpec, toolchain: Toolchain, emit
         ret Option[str]::Some("freestanding binary requires target.runtime-sources")
     }
     ret Option[str]::None
+}
+
+fn managed_cross_target(target: TargetSpec) -> bool {
+    ret !target_is_host(target) && (
+        target.triple == "x86_64-unknown-linux-gnu"
+        || target.triple == "aarch64-unknown-linux-gnu"
+        || target.triple == "x86_64-w64-windows-gnu"
+        || target.triple == "aarch64-w64-windows-gnu"
+    )
+}
+
+fn custom_toolchain_requested(root: Path, target: TargetSpec) -> bool {
+    let native = default_toolchain(target)
+    let configured = project_target_toolchain(root, target, native)
+    ret configured.compiler != native.compiler || configured.linker != native.linker
+        || configured.archiver != native.archiver || configured.sysroot != native.sysroot
+        || configured.compile_args.len() != native.compile_args.len()
+        || configured.link_args.len() != native.link_args.len()
+        || configured.runtime_sources.len() != native.runtime_sources.len()
+        || configured.linker_script != native.linker_script
+        || requested_value("--cc", "") != "" || requested_value("--linker", "") != ""
+        || requested_value("--ar", "") != "" || requested_value("--sysroot", "") != ""
+        || requested_values("--compile-arg").len() > 0_usize
+        || requested_values("--link-arg").len() > 0_usize
 }
 
 fn explicit_tool_path_missing(value: str) -> bool {
@@ -859,6 +901,14 @@ fn append_profile_link_args(args: mut Vec[str], profile: str, target: TargetSpec
 fn append_tls_link_args(args: mut Vec[str], target: TargetSpec) -> () {
     if target.os == "linux" { args.push("-lssl") args.push("-lcrypto") }
     elif target.os == "macos" { args.push("-framework") args.push("Security") args.push("-framework") args.push("CoreFoundation") }
+    elif target.os == "windows" {
+        // platform/runtime.c uses Winsock, SChannel/SSPI and CryptoAPI.
+        // Spell these out for both Clang GNU cross kits and native Clang/MSVC
+        // drivers instead of relying on an environment's implicit defaults.
+        args.push("-lws2_32")
+        args.push("-lsecur32")
+        args.push("-lcrypt32")
+    }
     ret ()
 }
 
@@ -909,6 +959,24 @@ fn requested_value(name: str, fallback: str) -> str {
     ret fallback
 }
 
+fn requested_values(name: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut index = 2_usize
+    while index + 1_usize < argc() {
+        match argv(index) {
+            Some(arg) => {
+                if arg == name {
+                    match argv(index + 1_usize) { Some(value) => { out.push(value) } None => {} }
+                    index = index + 1_usize
+                }
+            }
+            None => {}
+        }
+        index = index + 1_usize
+    }
+    ret out
+}
+
 /// Performs the `requested_profile` operation.
 pub fn requested_profile(fallback: str) -> str {
     let mut profile = fallback
@@ -956,8 +1024,15 @@ pub fn compile_test_ast(root: Path, ast: Vec[Statement], binary_name: str) -> u3
     args.push("-Wno-override-module")
     args.push(native_path(llvm_path.as_str()))
     args.push(native_path(runtime_path.as_str()))
+    let platform_runtime = target_platform_root(host_target()).join("runtime.c").resolve()
+    if target_kit_installed(host_target()) && file_exists(native_path(platform_runtime.as_str())) {
+        args.push(native_path(platform_runtime.as_str()))
+    }
     let package_runtime = root.join("runtime.c").resolve()
-    if package_runtime.as_str() != runtime_path.as_str() && file_exists(native_path(package_runtime.as_str())) {
+    if project_manifest_name(read_project_manifest(root)) != "platform"
+        && package_runtime.as_str() != runtime_path.as_str()
+        && package_runtime.as_str() != platform_runtime.as_str()
+        && file_exists(native_path(package_runtime.as_str())) {
         args.push(native_path(package_runtime.as_str()))
     }
     append_tls_link_args(args, host_target())

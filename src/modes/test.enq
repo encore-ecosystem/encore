@@ -2,13 +2,15 @@
 
 import core::fmt::Debug
 import core::option::Option
-import core::io::eprintln
+import std::io::eprintln
+import std::time::perf_counter_ms
 import std::io::println
-import std::os::{argc, argv, file_exists, read_dir, read_file, remove_file}
+import std::os::{argc, argv, file_exists, read_dir, read_file, remove_file, write_file}
 import std::path::Path
 import std::process::{run_args, run_args_capture}
 import std::os::mkdir_all
 import std::vec::Vec
+import json::{Json, field, stringify}
 
 import mod::build::compile_test_ast
 import refrain::diagnostics::render_diagnostic
@@ -17,6 +19,19 @@ import refrain::frontend::parser::statements::FunctionItem
 import refrain::project::{ProjectWorkspace, WorkspaceModule, load_library_workspace, load_entry_workspace}
 import refrain::target::{host_target, target_executable_name}
 import rich::TestProgress
+
+struct TestSelection {
+    filter: str
+    shard_index: usize
+    shard_count: usize
+}
+
+struct TestRecord {
+    id: str
+    status: str
+    duration_ms: u64
+    message: str
+}
 
 /// Performs the `native_test` operation.
 pub fn native_test() -> u32 {
@@ -45,12 +60,20 @@ pub fn native_test() -> u32 {
     } else {
         load_entry_workspace(root, root.join("src").join("main.enq"))
     }
-    let filter = test_filter()
-    let total = count_selected_tests(root, workspace, filter)
-    if total == 0_usize { println("No tests found.") ret 0_u32 }
+    let selection = test_selection()
+    if has_switch("--list") {
+        ret list_selected_tests(root, workspace, selection)
+    }
+    let total = count_selected_tests(root, workspace, selection)
+    if total == 0_usize {
+        if !write_test_report_if_requested(selection, Vec[TestRecord]::new(), 0_usize, 0_usize) { ret 1_u32 }
+        println("No tests found.")
+        ret 0_u32
+    }
     let mut passed = 0_usize
     let mut failed = 0_usize
     let mut found = 0_usize
+    let mut records = Vec[TestRecord]::new()
     let mut progress = TestProgress::auto()
     progress.start_suite(workspace.root_name, total)
 
@@ -66,12 +89,22 @@ pub fn native_test() -> u32 {
                                 Statement::Function(item) => {
                                     if has_attr(item, "test") {
                                         let display = unit_test_display(root, module, item.name)
-                                        if filter == "" || contains(display, filter) {
+                                        if test_selected(display, selection) {
                                             found = found + 1_usize
                                             progress.start_test(display, found, total)
+                                            let started = perf_counter_ms()
                                             let failure = run_unit_test(root, workspace, item, display)
-                                            if failure == "" { passed = passed + 1_usize progress.pass_test(display) }
-                                            else { failed = failed + 1_usize progress.fail_test(display, failure) }
+                                            let duration = perf_counter_ms() - started
+                                            if failure == "" {
+                                                passed = passed + 1_usize
+                                                records.push(TestRecord{display, "passed", duration, ""})
+                                                progress.pass_test(display)
+                                            }
+                                            else {
+                                                failed = failed + 1_usize
+                                                records.push(TestRecord{display, "failed", duration, failure})
+                                                progress.fail_test(display, failure)
+                                            }
                                         }
                                     }
                                 }
@@ -97,12 +130,22 @@ pub fn native_test() -> u32 {
                 Some(name) => {
                     if ends_with(name, ".enq") {
                         let display = workspace.root_name + ":tests/" + name
-                        if filter == "" || contains(display, filter) {
+                        if test_selected(display, selection) {
                             found = found + 1_usize
                             progress.start_test(display, found, total)
+                            let started = perf_counter_ms()
                             let failure = run_standalone_test(root, tests_dir.join(name), display)
-                            if failure == "" { passed = passed + 1_usize progress.pass_test(display) }
-                            else { failed = failed + 1_usize progress.fail_test(display, failure) }
+                            let duration = perf_counter_ms() - started
+                            if failure == "" {
+                                passed = passed + 1_usize
+                                records.push(TestRecord{display, "passed", duration, ""})
+                                progress.pass_test(display)
+                            }
+                            else {
+                                failed = failed + 1_usize
+                                records.push(TestRecord{display, "failed", duration, failure})
+                                progress.fail_test(display, failure)
+                            }
                         }
                     }
                 }
@@ -113,6 +156,7 @@ pub fn native_test() -> u32 {
     }
 
     progress.finish(passed, failed)
+    if !write_test_report_if_requested(selection, records, passed, failed) { ret 1_u32 }
     if failed == 0_usize {
         ret 0_u32
     }
@@ -131,7 +175,7 @@ fn workspace_semantic_error(workspace: mut ProjectWorkspace) -> str {
     ret ""
 }
 
-fn count_selected_tests(root: Path, workspace: ProjectWorkspace, filter: str) -> usize {
+fn count_selected_tests(root: Path, workspace: ProjectWorkspace, selection: TestSelection) -> usize {
     let mut total = 0_usize
     for module in workspace.modules {
         if module.owner_name == workspace.root_name {
@@ -139,21 +183,155 @@ fn count_selected_tests(root: Path, workspace: ProjectWorkspace, filter: str) ->
                 match statement {
                     Statement::Function(item) => {
                         let display = unit_test_display(root, module, item.name)
-                        if has_attr(item, "test") && (filter == "" || contains(display, filter)) { total = total + 1_usize }
+                        if has_attr(item, "test") && test_selected(display, selection) { total = total + 1_usize }
                     }
                     _ => {}
                 }
             }
         }
     }
-    let tests_dir = Path::new(".").resolve().join("tests")
+    let tests_dir = root.join("tests")
     if file_exists(tests_dir.as_str()) {
         for name in read_dir(tests_dir.as_str()) {
             let display = workspace.root_name + ":tests/" + name
-            if ends_with(name, ".enq") && (filter == "" || contains(display, filter)) { total = total + 1_usize }
+            if ends_with(name, ".enq") && test_selected(display, selection) { total = total + 1_usize }
         }
     }
     ret total
+}
+
+fn selected_test_ids(root: Path, workspace: ProjectWorkspace, selection: TestSelection) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    for module in workspace.modules {
+        if module.owner_name == workspace.root_name {
+            for statement in module.ast {
+                match statement {
+                    Statement::Function(item) => {
+                        let display = unit_test_display(root, module, item.name)
+                        if has_attr(item, "test") && test_selected(display, selection) { out.push(display) }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let tests_dir = root.join("tests")
+    if file_exists(tests_dir.as_str()) {
+        for name in read_dir(tests_dir.as_str()) {
+            let display = workspace.root_name + ":tests/" + name
+            if ends_with(name, ".enq") && test_selected(display, selection) { out.push(display) }
+        }
+    }
+    ret out
+}
+
+fn list_selected_tests(root: Path, workspace: ProjectWorkspace, selection: TestSelection) -> u32 {
+    let ids = selected_test_ids(root, workspace, selection)
+    if option_value("--format") == "json" {
+        let mut values = Vec[Json]::new()
+        for id in ids { values.push(Json::String(id)) }
+        println(stringify(Json::Array(values)))
+        ret 0_u32
+    }
+    for id in ids { println(id) }
+    ret 0_u32
+}
+
+fn test_selected(id: str, selection: TestSelection) -> bool {
+    if selection.filter != "" && !contains(id, selection.filter) { ret false }
+    if selection.shard_count <= 1_usize { ret true }
+    ret (id.hash() as usize) % selection.shard_count == selection.shard_index
+}
+
+#attr(test)
+fn deterministic_test_shards_partition_ids() -> bool {
+    let mut ids = Vec[str]::new()
+    ids.push("sample:src/lib.enq::first")
+    ids.push("sample:src/lib.enq::second")
+    ids.push("sample:tests/negative.enq")
+    ids.push("sample:tests/integration.enq")
+    for id in ids {
+        let mut matches = 0_usize
+        let mut shard = 0_usize
+        while shard < 4_usize {
+            let selection = TestSelection{"", shard, 4_usize}
+            if test_selected(id, selection) { matches += 1_usize }
+            shard += 1_usize
+        }
+        if matches != 1_usize { ret false }
+    }
+    ret true
+}
+
+fn test_selection() -> TestSelection {
+    let shard = option_value("--shard")
+    if shard == "" { ret TestSelection{test_filter(), 0_usize, 1_usize} }
+    let separator = find_character(shard, "/")
+    let selected = decimal_value(shard.slice(0_usize, separator))
+    let total = decimal_value(shard.slice(separator + 1_usize, shard.len() - separator - 1_usize))
+    ret TestSelection{test_filter(), selected - 1_usize, total}
+}
+
+fn find_character(value: str, needle: str) -> usize {
+    let mut index = 0_usize
+    while index < value.len() {
+        if value.slice(index, 1_usize) == needle { ret index }
+        index += 1_usize
+    }
+    ret value.len()
+}
+
+fn decimal_value(value: str) -> usize {
+    let mut result = 0_usize
+    let mut index = 0_usize
+    while index < value.len() {
+        result = result * 10_usize + (value.byte_at(index) - 48_u8) as usize
+        index += 1_usize
+    }
+    ret result
+}
+
+fn write_test_report_if_requested(
+    selection: TestSelection,
+    records: Vec[TestRecord],
+    passed: usize,
+    failed: usize
+) -> bool {
+    let report_path = option_value("--report")
+    if report_path == "" { ret true }
+    let mut tests = Vec[Json]::new()
+    let mut total_duration = 0_u64
+    for record in records {
+        total_duration += record.duration_ms
+        let mut item = Vec[(str, Json)]::new()
+        item.push(field("id", Json::String(record.id)))
+        item.push(field("status", Json::String(record.status)))
+        item.push(field("duration_ms", Json::Number(Debug::fmt(record.duration_ms))))
+        item.push(field("message", Json::String(record.message)))
+        tests.push(Json::Object(item))
+    }
+    let mut shard = Vec[(str, Json)]::new()
+    shard.push(field("index", Json::Number(Debug::fmt(selection.shard_index + 1_usize))))
+    shard.push(field("count", Json::Number(Debug::fmt(selection.shard_count))))
+    let mut summary = Vec[(str, Json)]::new()
+    summary.push(field("selected", Json::Number(Debug::fmt(passed + failed))))
+    summary.push(field("passed", Json::Number(Debug::fmt(passed))))
+    summary.push(field("failed", Json::Number(Debug::fmt(failed))))
+    summary.push(field("duration_ms", Json::Number(Debug::fmt(total_duration))))
+    let mut root = Vec[(str, Json)]::new()
+    root.push(field("schema", Json::Number("1")))
+    root.push(field("shard", Json::Object(shard)))
+    root.push(field("summary", Json::Object(summary)))
+    root.push(field("tests", Json::Array(tests)))
+    match Path::new(report_path).parent() {
+        Some(parent) => { mkdir_all(parent.as_str()) }
+        None => {}
+    }
+    if write_file(report_path, stringify(Json::Object(root)) + "\n") != 0_i32 {
+        eprintln("Unable to write test report: " + report_path)
+        ret false
+    }
+    ret true
 }
 
 fn unit_test_display(root: Path, module: WorkspaceModule, test_name: str) -> str {
@@ -283,6 +461,15 @@ fn option_value(name: str) -> str {
         index = index + 1_usize
     }
     ret ""
+}
+
+fn has_switch(name: str) -> bool {
+    let mut index = 2_usize
+    while index < argc() {
+        if arg_or(index, "") == name { ret true }
+        index += 1_usize
+    }
+    ret false
 }
 
 fn expected_compile_error(source: str) -> str {

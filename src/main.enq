@@ -84,6 +84,9 @@ fn main() -> u32 {
         "install" => {
             ret modes::run_install()
         }
+        "publish" => {
+            ret modes::run_publish()
+        }
         "target" => {
             ret modes::run_target()
         }
@@ -116,6 +119,7 @@ fn print_global_help() -> () {
     println("  sync       Resolve project dependencies")
     println("  update     Update project dependencies")
     println("  install    Build and install a binary")
+    println("  publish    Publish a package through the reviewed index")
     println("  target     Inspect compilation targets")
     println("  self       Manage the Encore compiler installation")
     println("  help       Show command help")
@@ -143,10 +147,14 @@ fn print_command_help(command: str, console: Console) -> u32 {
         "test" => {
             println("Run unit and standalone tests")
             println("")
-            println("Usage: encore test [--filter <text>]")
+            println("Usage: encore test [options]")
             println("")
             println("Options:")
             println("      --filter <text>    Run tests whose full name contains text")
+            println("      --list             List selected tests without running them")
+            println("      --shard <n>/<m>    Run one one-based deterministic test shard")
+            println("      --format <kind>    Listing format: full or json")
+            println("      --report <path>    Write a machine-readable JSON test report")
             println("  -h, --help             Show help")
         }
         "analyze" => {
@@ -238,10 +246,19 @@ fn print_command_help(command: str, console: Console) -> u32 {
             println("      --force             Replace an existing binary")
             println("  -h, --help              Show help")
         }
-        "target" => {
-            println("Inspect the host or an LLVM-compatible target")
+        "publish" => {
+            println("Publish the current package through GitHub and the reviewed index")
             println("")
-            println("Usage: encore target [list|show <triple>|<triple>]")
+            println("Usage: encore publish [--dry-run]")
+            println("")
+            println("Options:")
+            println("      --dry-run    Validate and create the exact archive without remote changes")
+            println("  -h, --help       Show help")
+        }
+        "target" => {
+            println("Inspect and install compiler-managed targets")
+            println("")
+            println("Usage: encore target <list|show <triple>|install <triple>>")
         }
         "self" => {
             println("Manage the Encore compiler installation")
@@ -285,6 +302,8 @@ fn print_build_options() -> () {
     println("      --sysroot <path>          Select the target sysroot")
     println("      --target-cpu <cpu>        Select the target CPU")
     println("      --target-features <list>  Select LLVM target features")
+    println("      --compile-arg <value>     Append a target compiler argument (repeatable)")
+    println("      --link-arg <value>        Append a target linker argument (repeatable)")
     println("      --linker-script <path>    Select a linker script")
     println("  -h, --help                    Show help")
     ret ()
@@ -303,6 +322,7 @@ fn validate_command_args(command: str, console: Console) -> bool {
     if command == "sync" { ret validate_switch_only_args(command, "--update", console) }
     if command == "update" { ret validate_positional_args(command, 0_usize, 0_usize, console) }
     if command == "install" { ret validate_install_args(console) }
+    if command == "publish" { ret validate_switch_only_args(command, "--dry-run", console) }
     if command == "target" { ret validate_target_args(console) }
     if command == "self" { ret validate_self_args(console) }
     ret true
@@ -373,7 +393,7 @@ fn validate_add_args(console: Console) -> bool {
 fn validate_target_args(console: Console) -> bool {
     let count = if argc() > 2_usize { argc() - 2_usize } else { 0_usize }
     if count <= 1_usize { ret true }
-    if count == 2_usize && argument(2_usize) == "show" { ret true }
+    if count == 2_usize && (argument(2_usize) == "show" || argument(2_usize) == "install") { ret true }
     ret argument_error("target", "unexpected argument '" + argument(3_usize) + "'", console)
 }
 
@@ -414,21 +434,66 @@ fn is_build_value_option(arg: str) -> bool {
     ret arg == "--profile" || arg == "--opt-profile" || arg == "--target" || arg == "--emit"
         || arg == "--cc" || arg == "--linker" || arg == "--ar" || arg == "--sysroot"
         || arg == "--target-cpu" || arg == "--target-features" || arg == "--linker-script"
+        || arg == "--compile-arg" || arg == "--link-arg"
         || arg == "--manifest-path" || arg == "--jobs"
 }
 
 fn validate_test_args(console: Console) -> bool {
     let mut index = 2_usize
+    let mut list = false
+    let mut format = "full"
     while index < argc() {
         let arg = argument(index)
-        if arg == "--filter" || arg == "--_worker-standalone" {
+        if arg == "--filter" || arg == "--_worker-standalone" || arg == "--shard" || arg == "--format" || arg == "--report" {
             if index + 1_usize >= argc() { ret argument_error("test", "option '" + arg + "' requires a value", console) }
             index = index + 1_usize
+            if arg == "--shard" && !valid_test_shard(argument(index)) {
+                ret argument_error("test", "option '--shard' must be one-based N/M with N <= M", console)
+            }
+            if arg == "--format" {
+                format = argument(index)
+                if format != "full" && format != "json" {
+                    ret argument_error("test", "--format must be full or json", console)
+                }
+            }
         }
+        elif arg == "--list" { list = true }
         else { ret unknown_argument("test", arg, console) }
         index = index + 1_usize
     }
+    if format == "json" && !list {
+        ret argument_error("test", "--format json currently requires --list", console)
+    }
     ret true
+}
+
+fn valid_test_shard(value: str) -> bool {
+    let mut separator = value.len()
+    let mut index = 0_usize
+    while index < value.len() {
+        if value.slice(index, 1_usize) == "/" {
+            if separator != value.len() { ret false }
+            separator = index
+        }
+        index += 1_usize
+    }
+    if separator == 0_usize || separator + 1_usize >= value.len() { ret false }
+    let selected = positive_decimal_value(value.slice(0_usize, separator))
+    let total = positive_decimal_value(value.slice(separator + 1_usize, value.len() - separator - 1_usize))
+    ret selected > 0_usize && total > 0_usize && selected <= total
+}
+
+fn positive_decimal_value(value: str) -> usize {
+    if value.len() == 0_usize { ret 0_usize }
+    let mut result = 0_usize
+    let mut index = 0_usize
+    while index < value.len() {
+        let byte = value.byte_at(index)
+        if byte < 48_u8 || byte > 57_u8 { ret 0_usize }
+        result = result * 10_usize + (byte - 48_u8) as usize
+        index += 1_usize
+    }
+    ret result
 }
 
 fn validate_rule_args(command: str, allow_fix: bool, console: Console) -> bool {

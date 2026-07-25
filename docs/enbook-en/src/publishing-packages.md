@@ -6,8 +6,16 @@ metadata catalog. Package source can live in any public GitHub repository. A
 published version is a maintainer-created `.tar.gz` asset attached to a GitHub
 Release; automatically generated source archives are not used.
 
-There is no `encore publish` command in v1. Publication is a reviewed pull
-request workflow.
+Encore 0.1.5 automates the release and reviewed index pull request:
+
+```sh
+encore publish --dry-run
+encore publish
+```
+
+The dry run performs the same local verification and creates the exact archive
+without changing GitHub. Normal publication uses the current `gh auth`
+session. It is safe to resume when existing remote state matches exactly.
 
 ## Package Requirements
 
@@ -25,19 +33,29 @@ Letters, digits, `-`, and `_` are accepted.
 [project]
 name = "example_math"
 version = "1.0.0"
+repository = "https://github.com/owner/example_math"
+encore = ">=0.1.5, <0.2.0"
 description = "Math helpers for Encore"
 readme = "README.md"
 licence = "MIT"
 dependencies = [
     "index@std",
 ]
+
+[publish]
+include = []
+exclude = ["notes/**"]
 ```
 
-Before publishing:
+Before publishing, `encore publish` verifies the equivalent of:
 
 ```sh
 encore sync
+encore format --check
+encore check
+encore lint
 encore test
+encore build
 ```
 
 Published manifests must not contain `path@` dependencies. Replace dependencies

@@ -10,33 +10,126 @@ permissions:
 
 concurrency:
   group: native-ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  ENCORE_INDEX_URL: https://raw.githubusercontent.com/encore-ecosystem/encore-index/a931b185d56bc9ae9515cfdabde721486a8c7b0c
+  ENCORE_INDEX_URL: https://raw.githubusercontent.com/encore-ecosystem/encore-index/529a9672038a7a7262c7582187c5d12733178a0c
 
 jobs:
-  native:
-    name: Verify ${{ matrix.triple }}
+  resolve-inputs:
+    name: Resolve trusted inputs
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/dependencies/registry
+    outputs:
+      seed_tag: ${{ steps.seed.outputs.tag }}
+      index_sha: ${{ steps.index.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Select latest complete stable compiler once
+        id: seed
+        shell: bash
+        run: |
+          set -euo pipefail
+          selected=
+          required='[
+            "encore-x86_64-unknown-linux-gnu.tar.gz",
+            "encore-aarch64-unknown-linux-gnu.tar.gz",
+            "encore-x86_64-apple-darwin.tar.gz",
+            "encore-aarch64-apple-darwin.tar.gz",
+            "encore-x86_64-pc-windows-msvc.zip"
+          ]'
+          while IFS= read -r tag; do
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            assets=$(gh release view "$tag" --json isDraft,isPrerelease,assets)
+            test "$(jq -r '.isDraft or .isPrerelease' <<<"$assets")" = false || continue
+            if jq -e --argjson required "$required" \
+              '([.assets[].name] as $actual | $required - $actual | length) == 0' <<<"$assets" >/dev/null
+            then
+              selected=$tag
+              break
+            fi
+          done < <(gh release list --limit 100 --json tagName,publishedAt \
+            --jq 'sort_by(.publishedAt) | reverse | .[].tagName')
+          test -n "$selected" || {
+            echo "::error::No complete stable release contains every bootstrap target"
+            exit 1
+          }
+          echo "tag=$selected" >> "$GITHUB_OUTPUT"
+          echo "### Trusted seed: \`$selected\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pin system-library source
+        id: index
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git ls-remote https://github.com/encore-ecosystem/encore-index.git \
+            refs/heads/main | awk 'NF {print $1; exit}')
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "### System libraries: \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build verified dependency bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/seed target/dependencies
+          asset=encore-x86_64-unknown-linux-gnu.tar.gz
+          gh release download "${{ steps.seed.outputs.tag }}" \
+            --pattern "$asset" --pattern "$asset.sha256" --dir target/seed
+          expected=$(awk 'NF {print tolower($1); exit}' "target/seed/$asset.sha256")
+          test "$(sha256sum "target/seed/$asset" | awk '{print $1}')" = "$expected"
+          tar -xzf "target/seed/$asset" -C target/seed
+          distribution=$(find target/seed -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          compiler="$distribution/bin/encore"
+          test -x "$compiler"
+          export ENCORE_CORE_DIR="$distribution/lib/encore/index/core"
+          "$compiler" sync
+          cp -R "$ENCORE_CORE_DIR" target/dependencies/core
+          cp encore.lock target/dependencies/encore.lock
+          find target/dependencies -exec touch -t 200001010000.00 {} +
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            -C target -czf target/dependencies.tar.gz dependencies
+          sha256sum target/dependencies.tar.gz > target/dependencies.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: trusted-dependencies
+          path: |
+            target/dependencies.tar.gz
+            target/dependencies.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  stage1:
+    name: Produce stage1 on ${{ matrix.producer }}
+    needs: resolve-inputs
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            triple: x86_64-unknown-linux-gnu
-            executable: encore
-          - os: ubuntu-24.04-arm
-            triple: aarch64-unknown-linux-gnu
-            executable: encore
-          - os: macos-15-intel
-            triple: x86_64-apple-darwin
-            executable: encore
-          - os: macos-15
-            triple: aarch64-apple-darwin
-            executable: encore
-          - os: windows-latest
-            triple: x86_64-pc-windows-msvc
-            executable: encore.exe
+          - producer: linux
+            os: ubuntu-latest
+            seed_triple: x86_64-unknown-linux-gnu
+            seed_executable: encore
+            targets: >-
+              x86_64-unknown-linux-gnu
+              aarch64-unknown-linux-gnu
+              x86_64-w64-windows-gnu
+              aarch64-w64-windows-gnu
+          - producer: darwin
+            os: macos-15
+            seed_triple: aarch64-apple-darwin
+            seed_executable: encore
+            targets: >-
+              aarch64-apple-darwin
+              x86_64-apple-darwin
+          - producer: windows
+            os: windows-latest
+            seed_triple: x86_64-pc-windows-msvc
+            seed_executable: encore.exe
+            targets: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     env:
       GH_TOKEN: ${{ github.token }}
@@ -46,6 +139,207 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: trusted-dependencies
+          path: target/dependency-download
+
+      - name: Activate verified offline dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=$(awk 'NF {print tolower($1); exit}' target/dependency-download/dependencies.tar.gz.sha256)
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum target/dependency-download/dependencies.tar.gz | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 target/dependency-download/dependencies.tar.gz | awk '{print $1}')
+          fi
+          test "$actual" = "$expected"
+          tar -xzf target/dependency-download/dependencies.tar.gz -C target
+          mv target/dependencies/registry target/registry
+          cmp encore.lock target/dependencies/encore.lock
+          echo "ENCORE_CORE_DIR=$PWD/target/dependencies/core" >> "$GITHUB_ENV"
+          echo "ENCORE_INDEX_URL=http://127.0.0.1:9" >> "$GITHUB_ENV"
+
+      - name: Download and verify producer seed
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/seed
+          extension=tar.gz
+          [[ "${{ matrix.seed_triple }}" == *-windows-* ]] && extension=zip
+          asset="encore-${{ matrix.seed_triple }}.$extension"
+          gh release download "${{ needs.resolve-inputs.outputs.seed_tag }}" \
+            --pattern "$asset" --pattern "$asset.sha256" --dir target/seed
+          expected=$(awk 'NF {print tolower($1); exit}' "target/seed/$asset.sha256")
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "target/seed/$asset" | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 "target/seed/$asset" | awk '{print $1}')
+          fi
+          test "$actual" = "$expected"
+          mkdir -p target/seed-unpacked
+          case "$extension" in
+            zip) unzip -q "target/seed/$asset" -d target/seed-unpacked ;;
+            *) tar -xzf "target/seed/$asset" -C target/seed-unpacked ;;
+          esac
+          distribution=$(find target/seed-unpacked -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          seed="$PWD/$distribution/bin/${{ matrix.seed_executable }}"
+          test -s "$seed"
+          chmod +x "$seed" 2>/dev/null || true
+          echo "SEED_COMPILER=$seed" >> "$GITHUB_ENV"
+
+      - name: Install Linux cross toolchains
+        if: matrix.producer == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=20260616
+          archive="llvm-mingw-$version-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          url="https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive"
+          curl -fsSL --retry 2 "$url" -o "target/$archive"
+          test "$(sha256sum "target/$archive" | awk '{print $1}')" = \
+            "534b92e067b22a6b4441f48ae9240a3341b17825d04d577eab0cf85c44b4deda"
+          mkdir -p target/llvm-mingw
+          tar -xJf "target/$archive" -C target/llvm-mingw --strip-components=1
+          scripts/build-linux-aarch64-sysroot.sh \
+            target/llvm-mingw/linux-aarch64-sysroot
+          echo "LLVM_MINGW_ROOT=$PWD/target/llvm-mingw" >> "$GITHUB_ENV"
+
+      - name: Build producer once, then emit target stage1 artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci-produce-stage1.sh
+          scripts/ci-produce-stage1.sh \
+            "$SEED_COMPILER" \
+            "${{ matrix.producer }}" \
+            "${{ needs.resolve-inputs.outputs.seed_tag }}" \
+            ${{ matrix.targets }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: stage1-${{ matrix.producer }}
+          path: target/stage1-artifacts
+          if-no-files-found: error
+          retention-days: 7
+
+  target-kits:
+    name: Target kit ${{ matrix.target }}
+    needs: resolve-inputs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-w64-windows-gnu
+            kind: windows
+          - target: aarch64-w64-windows-gnu
+            kind: windows
+          - target: aarch64-unknown-linux-gnu
+            kind: linux-aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: encore-ecosystem/encore-index
+          ref: ${{ needs.resolve-inputs.outputs.index_sha }}
+          path: target/system-index
+      - name: Download verified Linux llvm-mingw
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=20260616
+          archive="llvm-mingw-$version-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          curl -fsSL --retry 2 \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive" \
+            -o "target/$archive"
+          test "$(sha256sum "target/$archive" | awk '{print $1}')" = \
+            "534b92e067b22a6b4441f48ae9240a3341b17825d04d577eab0cf85c44b4deda"
+          mkdir -p target/llvm-mingw
+          tar -xJf "target/$archive" -C target/llvm-mingw --strip-components=1
+      - name: Assemble Linux AArch64 sysroot
+        if: matrix.kind == 'linux-aarch64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/build-linux-aarch64-sysroot.sh target/llvm-mingw/sysroot
+      - name: Build reproducible target kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(tr -d '\r\n' < VERSION)
+          args=(
+            --host x86_64-unknown-linux-gnu \
+            --target "${{ matrix.target }}" \
+            --toolchain target/llvm-mingw \
+            --platform target/system-index/packages/platform \
+            --out target/target-kits \
+            --compiler bin/clang \
+            --linker bin/clang \
+            --archiver bin/llvm-ar \
+            --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/v$version"
+          )
+          if [[ "${{ matrix.kind }}" == linux-aarch64 ]]; then
+            args+=(--sysroot sysroot --link-arg "-fuse-ld=lld")
+          fi
+          scripts/build-target-kit.sh "${args[@]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-target-kit-${{ matrix.target }}
+          path: target/target-kits
+          if-no-files-found: error
+          retention-days: 30
+
+  converge:
+    name: Converge ${{ matrix.triple }}
+    needs: [resolve-inputs, stage1]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            executable: encore
+            producer: linux
+          - os: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+            executable: encore
+            producer: linux
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
+            executable: encore
+            producer: darwin
+          - os: macos-15
+            triple: aarch64-apple-darwin
+            executable: encore
+            producer: darwin
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            executable: encore.exe
+            producer: windows
+          - os: windows-latest
+            triple: x86_64-w64-windows-gnu
+            executable: encore.exe
+            producer: linux
+          - os: windows-11-arm
+            triple: aarch64-w64-windows-gnu
+            executable: encore.exe
+            producer: linux
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/registry
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v6
+        with:
+          repository: encore-ecosystem/encore-index
+          ref: ${{ needs.resolve-inputs.outputs.index_sha }}
+          path: target/system-index
+
       - name: Verify source version
         shell: bash
         run: |
@@ -54,103 +348,93 @@ jobs:
           test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' encore.toml | head -n 1)" = "$version"
           test "$(sed -n 's/.*ret "\([^"]*\)".*/\1/p' src/version.enq)" = "$version"
 
-      - name: Download latest complete trusted compiler
+      - uses: actions/download-artifact@v8
+        with:
+          name: trusted-dependencies
+          path: target/dependency-download
+
+      - name: Activate verified offline dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=$(awk 'NF {print tolower($1); exit}' target/dependency-download/dependencies.tar.gz.sha256)
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum target/dependency-download/dependencies.tar.gz | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 target/dependency-download/dependencies.tar.gz | awk '{print $1}')
+          fi
+          test "$actual" = "$expected"
+          tar -xzf target/dependency-download/dependencies.tar.gz -C target
+          rm -rf target/registry
+          mv target/dependencies/registry target/registry
+          cmp encore.lock target/dependencies/encore.lock
+          echo "ENCORE_CORE_DIR=$PWD/target/dependencies/core" >> "$GITHUB_ENV"
+          export ENCORE_INDEX_URL=http://127.0.0.1:9
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: stage1-${{ matrix.producer }}
+          path: target/stage1-download
+
+      - name: Verify cross-produced stage1
         id: seed
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/seeds
-          current=${GITHUB_REF_NAME:-}
-          selected=
-          while IFS= read -r tag; do
-            test "$tag" != "$current" || continue
-            case "$tag" in channel-*) continue ;; esac
-            extension=tar.gz
-            case "${{ matrix.triple }}" in *-windows-*) extension=zip ;; esac
-            asset="encore-${{ matrix.triple }}.$extension"
-            candidate="target/seeds/$tag"
-            mkdir -p "$candidate"
-            if gh release download "$tag" \
-              --pattern "$asset" \
-              --pattern "$asset.sha256" \
-              --dir "$candidate" >/dev/null 2>&1
-            then
-              selected=$tag
-              echo "SEED_DOWNLOAD_DIR=$PWD/$candidate" >> "$GITHUB_ENV"
-              break
-            fi
-          done < <(gh release list --limit 100 --json tagName,isDraft \
-            --jq '.[] | select(.isDraft == false) | .tagName')
-          test -n "$selected" || {
-            echo "::error::No complete trusted release contains ${{ matrix.triple }}"
-            exit 1
-          }
-          echo "tag=$selected" >> "$GITHUB_OUTPUT"
-
-      - name: Verify and extract trusted compiler
-        shell: bash
-        run: |
-          set -euo pipefail
-          extension=tar.gz
-          case "${{ matrix.triple }}" in *-windows-*) extension=zip ;; esac
-          asset="encore-${{ matrix.triple }}.$extension"
-          expected=$(awk 'NF {print tolower($1); exit}' "$SEED_DOWNLOAD_DIR/$asset.sha256")
+          root="target/stage1-download/${{ matrix.triple }}"
+          manifest="$root/manifest.json"
+          test "$(jq -r '.schema' "$manifest")" = 1
+          test "$(jq -r '.commit' "$manifest")" = "$GITHUB_SHA"
+          test "$(jq -r '.version' "$manifest")" = "$(tr -d '\r\n' < VERSION)"
+          test "$(jq -r '.seed' "$manifest")" = "${{ needs.resolve-inputs.outputs.seed_tag }}"
+          test "$(jq -r '.target' "$manifest")" = "${{ matrix.triple }}"
+          version=$(tr -d '\r\n' < VERSION)
+          target_kit_abi=$(printf '%s\n' "$version" | awk -F. '{print $1 "." $2}')
+          test "$(jq -r '.target_kit_abi' "$manifest")" = "$target_kit_abi"
+          expected_dependencies=$(awk 'NF {print tolower($1); exit}' \
+            target/dependency-download/dependencies.tar.gz.sha256)
+          test "$(jq -r '.dependencies_sha256' "$manifest")" = "$expected_dependencies"
+          compiler="$PWD/$root/${{ matrix.executable }}"
           if command -v sha256sum >/dev/null 2>&1; then
-            actual=$(sha256sum "$SEED_DOWNLOAD_DIR/$asset" | awk '{print $1}')
+            actual=$(sha256sum "$compiler" | awk '{print $1}')
           else
-            actual=$(shasum -a 256 "$SEED_DOWNLOAD_DIR/$asset" | awk '{print $1}')
+            actual=$(shasum -a 256 "$compiler" | awk '{print $1}')
           fi
-          test "$actual" = "$expected"
-          mkdir -p target/seed-unpacked
-          case "$extension" in
-            zip) unzip -q "$SEED_DOWNLOAD_DIR/$asset" -d target/seed-unpacked ;;
-            *) tar -xzf "$SEED_DOWNLOAD_DIR/$asset" -C target/seed-unpacked ;;
-          esac
-          distribution=$(find target/seed-unpacked -mindepth 1 -maxdepth 1 -type d | head -n 1)
-          test -n "$distribution"
-          test -s "$distribution/bin/${{ matrix.executable }}"
-          test -f "$distribution/lib/encore/index/core/encore.toml"
-          echo "ENCORE_HOME=$PWD/$distribution" >> "$GITHUB_ENV"
-          echo "ENCORE_CORE_DIR=$PWD/$distribution/lib/encore/index/core" >> "$GITHUB_ENV"
-          echo "SEED_COMPILER=$PWD/$distribution/bin/${{ matrix.executable }}" >> "$GITHUB_ENV"
+          test "$actual" = "$(jq -r '.executable_sha256' "$manifest")"
+          chmod +x "$compiler" 2>/dev/null || true
+          echo "STAGE1_COMPILER=$compiler" >> "$GITHUB_ENV"
+          echo "tag=${{ needs.resolve-inputs.outputs.seed_tag }}" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve pinned compiler dependencies
+      - name: Install matching Windows GNU host toolchain
+        if: contains(matrix.triple, 'w64-windows-gnu')
         shell: bash
         run: |
           set -euo pipefail
-          if test "${{ matrix.triple }}" = x86_64-pc-windows-msvc; then
-            mkdir -p target/registry/metadata
-            awk '
-              function emit() { if (name != "" && archive != "") print name "\t" version "\t" checksum "\t" archive }
-              /^\[\[packages\]\]$/ { emit(); name=version=checksum=archive=""; next }
-              /^name = / { name=$3; gsub(/"/, "", name) }
-              /^version = / { version=$3; gsub(/"/, "", version) }
-              /^checksum = / { checksum=$3; gsub(/"/, "", checksum) }
-              /^archive = / { archive=$3; gsub(/"/, "", archive) }
-              END { emit() }
-            ' encore.lock |
-            while IFS=$'\t' read -r name version checksum archive; do
-              destination="$PWD/target/registry/packages/$name/$version-$checksum"
-              mkdir -p "$destination"
-              curl --fail --location --retry 5 "$archive" -o target/registry-package.tar.gz
-              tar -xzf target/registry-package.tar.gz -C "$destination"
-              metadata="target/registry/metadata/$name.json"
-              curl --fail --location --retry 5 --retry-all-errors \
-                "$ENCORE_INDEX_URL/${name:0:2}/$name.json" -o "$metadata.pending"
-              mv "$metadata.pending" "$metadata"
-            done
+          version=20260616
+          arch=x86_64
+          checksum=b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35
+          if [[ "${{ matrix.triple }}" == aarch64-* ]]; then
+            arch=aarch64
+            checksum=312593669435bd0bfc1a43ac3fba23c8b27e0610bade88b2738e5a01702a99ba
           fi
-          "$SEED_COMPILER" sync
+          archive="llvm-mingw-$version-ucrt-$arch.zip"
+          curl -fsSL --retry 2 \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive" \
+            -o "target/$archive"
+          test "$(sha256sum "target/$archive" | awk '{print $1}')" = "$checksum"
+          mkdir -p target/llvm-mingw-host
+          unzip -q "target/$archive" -d target/llvm-mingw-host
+          root=$(find target/llvm-mingw-host -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          test -x "$root/bin/clang.exe"
+          echo "ENCORE_CC=$PWD/$root/bin/clang.exe" >> "$GITHUB_ENV"
+          echo "ENCORE_LINKER=$PWD/$root/bin/clang.exe" >> "$GITHUB_ENV"
+          echo "ENCORE_AR=$PWD/$root/bin/llvm-ar.exe" >> "$GITHUB_ENV"
 
-      - name: Verify byte-identical three-stage self-host
+      - name: Verify byte-identical stage2/stage3 fixed point
         shell: bash
         run: |
           set -euo pipefail
-          "$SEED_COMPILER" build --profile extreme
-          mkdir -p target/stage1
-          cp "target/extreme/${{ matrix.executable }}" "target/stage1/${{ matrix.executable }}"
-          mv target/extreme target/stage1-output
-          "target/stage1/${{ matrix.executable }}" build --profile extreme
+          "$STAGE1_COMPILER" build --profile extreme
           mkdir -p target/stage2
           cp "target/extreme/${{ matrix.executable }}" "target/stage2/${{ matrix.executable }}"
           mv target/extreme target/stage2-output
@@ -159,21 +443,6 @@ jobs:
           cp "target/extreme/${{ matrix.executable }}" "target/stage3/${{ matrix.executable }}"
           cmp "target/stage2/${{ matrix.executable }}" "target/stage3/${{ matrix.executable }}"
           "target/stage3/${{ matrix.executable }}" --version
-
-      - name: Verify offline Windows codegen resume
-        if: matrix.triple == 'x86_64-pc-windows-msvc'
-        shell: bash
-        env:
-          ENCORE_INDEX_URL: http://127.0.0.1:9
-        run: |
-          set -euo pipefail
-          "target/stage3/${{ matrix.executable }}" test --filter power_operator
-
-      - name: Run compiler tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          "target/stage3/${{ matrix.executable }}" test
 
       - name: Build examples
         if: matrix.triple == 'x86_64-unknown-linux-gnu'
@@ -188,9 +457,198 @@ jobs:
           done
           (cd examples/bare_metal && "$compiler" build --target thumbv7em-none-eabi --emit llvm-ir)
 
+      - name: Assemble offline test context
+        shell: bash
+        run: |
+          set -euo pipefail
+          context=target/test-context
+          mkdir -p "$context/bin" "$context/core"
+          cp "target/stage3/${{ matrix.executable }}" "$context/bin/${{ matrix.executable }}"
+          cp -R "$ENCORE_CORE_DIR"/. "$context/core/"
+          cp -R target/registry "$context/registry"
+          "target/stage3/${{ matrix.executable }}" test --list --format json > "$context/test-plan.json"
+
       - uses: actions/upload-artifact@v7
         with:
-          name: verified-${{ matrix.triple }}
-          path: target/stage3/${{ matrix.executable }}
+          name: test-context-${{ matrix.triple }}
+          path: target/test-context
           if-no-files-found: error
+          retention-days: 7
+
+      - name: Assemble release candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(tr -d '\r\n' < VERSION)
+          package="encore-$version-${{ matrix.triple }}"
+          root="$PWD/target/package/$package"
+          mkdir -p "$root/bin" "$root/lib/encore/index" "$root/share/doc/encore" dist
+          cp "target/stage3/${{ matrix.executable }}" "$root/bin/${{ matrix.executable }}"
+          chmod +x "$root/bin/${{ matrix.executable }}" 2>/dev/null || true
+          for name in core platform std rich json log; do
+            source_name=$name
+            test -f "$PWD/target/system-index/packages/$source_name/encore.toml"
+            cp -R "$PWD/target/system-index/packages/$source_name" "$root/lib/encore/index/$name"
+          done
+          cp -R "$PWD/target/system-index/packages/ehir-llvm-backend" \
+            "$root/lib/encore/index/ehir-llvm-backend"
+          for name in ehirlib toml colorterm llvm; do
+            source=$(find "$PWD/target/registry/packages/$name" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+            destination=$name
+            case "$name" in ehirlib) destination=ehir ;; esac
+            test -f "$source/encore.toml"
+            cp -R "$source" "$root/lib/encore/index/$destination"
+          done
+          cp LICENSE README.md "$root/share/doc/encore/"
+          printf '%s\n' "$version" > "$root/VERSION"
+          printf '{"schema":1,"commit":"%s","version":"%s","seed":"%s","target":"%s"}\n' \
+            "$GITHUB_SHA" "$version" "${{ steps.seed.outputs.tag }}" "${{ matrix.triple }}" \
+            > "dist/provenance-${{ matrix.triple }}.json"
+          find "$root" -exec touch -t 200001010000.00 {} +
+          case "${{ matrix.triple }}" in
+            *-windows-*)
+              archive="$PWD/dist/encore-${{ matrix.triple }}.zip"
+              (cd target/package && 7z a -tzip -mtc=off -mta=off "$archive" "$package")
+              ;;
+            *)
+              archive="$PWD/dist/encore-${{ matrix.triple }}.tar.gz"
+              if tar --version 2>/dev/null | grep -q GNU; then
+                tar -C target/package --sort=name --owner=0 --group=0 --numeric-owner -czf "$archive" "$package"
+              else
+                (cd target/package && find "$package" -print | LC_ALL=C sort |
+                  COPYFILE_DISABLE=1 tar --no-recursion --uid 0 --gid 0 --uname root --gname root -cf - -T - |
+                  gzip -n > "$archive")
+              fi
+              ;;
+          esac
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
+          else
+            (cd dist && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-${{ matrix.triple }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  tests:
+    name: Test ${{ matrix.triple }} (${{ matrix.shard }}/4)
+    needs: converge
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - linux-x86
+          - linux-arm
+          - macos-x86
+          - macos-arm
+          - windows-msvc-x86
+          - windows-gnu-x86
+          - windows-gnu-arm
+        shard: [1, 2, 3, 4]
+        include:
+          - target: linux-x86
+            os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            executable: encore
+          - target: linux-arm
+            os: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+            executable: encore
+          - target: macos-x86
+            os: macos-15-intel
+            triple: x86_64-apple-darwin
+            executable: encore
+          - target: macos-arm
+            os: macos-15
+            triple: aarch64-apple-darwin
+            executable: encore
+          - target: windows-msvc-x86
+            os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            executable: encore.exe
+          - target: windows-gnu-x86
+            os: windows-latest
+            triple: x86_64-w64-windows-gnu
+            executable: encore.exe
+          - target: windows-gnu-arm
+            os: windows-11-arm
+            triple: aarch64-w64-windows-gnu
+            executable: encore.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      ENCORE_INDEX_URL: http://127.0.0.1:9
+      ENCORE_CORE_DIR: ${{ github.workspace }}/target/test-context/core
+      ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/test-context/registry
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: test-context-${{ matrix.triple }}
+          path: target/test-context
+      - name: Run deterministic offline test shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler="$PWD/target/test-context/bin/${{ matrix.executable }}"
+          chmod +x "$compiler" 2>/dev/null || true
+          "$compiler" test \
+            --shard "${{ matrix.shard }}/4" \
+            --report "target/test-report-${{ matrix.shard }}.json"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: test-report-${{ matrix.triple }}-${{ matrix.shard }}
+          path: target/test-report-${{ matrix.shard }}.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  aggregate:
+    name: Verify tests ${{ matrix.triple }}
+    if: always()
+    needs: [converge, tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+          - triple: aarch64-unknown-linux-gnu
+          - triple: x86_64-apple-darwin
+          - triple: aarch64-apple-darwin
+          - triple: x86_64-pc-windows-msvc
+          - triple: x86_64-w64-windows-gnu
+          - triple: aarch64-w64-windows-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: test-context-${{ matrix.triple }}
+          path: target/context
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: test-report-${{ matrix.triple }}-*
+          path: target/reports
+      - name: Validate complete test set and generate JUnit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t reports < <(find target/reports -name '*.json' -type f | sort)
+          test "${#reports[@]}" = 4
+          scripts/merge-test-reports.py \
+            --plan target/context/test-plan.json \
+            --json "target/test-results-${{ matrix.triple }}.json" \
+            --junit "target/test-results-${{ matrix.triple }}.xml" \
+            "${reports[@]}"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: test-results-${{ matrix.triple }}
+          path: |
+            target/test-results-${{ matrix.triple }}.json
+            target/test-results-${{ matrix.triple }}.xml
+          if-no-files-found: warn
           retention-days: 7

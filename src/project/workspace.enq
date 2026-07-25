@@ -1,8 +1,8 @@
 //! Discovers, resolves, and analyzes modules in a project workspace.
 
 import core::option::Option
-import core::io::eprintln
-import core::process::exit
+import std::io::eprintln
+import std::process::exit
 import std::os::file_exists
 import std::os::read_dir
 import std::os::read_file
@@ -19,6 +19,9 @@ import refrain::frontend::Parser
 import refrain::frontend::Statement
 import refrain::frontend::Token
 import refrain::frontend::{AnalysisDatabase, ModuleId, FrontendDocument, FrontendDiagnostic, Documentation}
+import refrain::target::{TargetSpec, parse_target}
+import refrain::target::kits::{target_kit_installed, target_platform_root}
+import std::os::{argc, argv}
 
 import mod::manifest::ProjectManifest
 import mod::manifest::{project_manifest_feature_dependencies, project_manifest_resolve_features, read_project_manifest}
@@ -403,7 +406,7 @@ fn visit_imports(
                                     diagnostics.push(FrontendDiagnostic::new(
                                         1_usize,
                                         "unresolved-import",
-                                        "unresolved import '" + request_path + "'",
+                                        workspace_unresolved_import_message(request_path),
                                         import_edge.line,
                                         import_edge.column,
                                         import_edge.length
@@ -423,6 +426,34 @@ fn visit_imports(
         import_index = import_index + 1_usize
     }
     ret ()
+}
+
+fn workspace_unresolved_import_message(path: str) -> str {
+    let modules = "io os process thread time net http tls fs path"
+    if starts_with(path, "core::") {
+        let rest = path.slice(6_usize, path.len() - 6_usize)
+        let module = first_path_component(rest)
+        if contains_word(modules, module) {
+            ret "platform API '" + path + "' moved to 'std::" + rest + "'"
+        }
+    }
+    ret "unresolved import '" + path + "'"
+}
+
+fn first_path_component(value: str) -> str {
+    let mut index = 0_usize
+    while index + 1_usize < value.len() {
+        if value.slice(index, 2_usize) == "::" { ret value.slice(0_usize, index) }
+        index += 1_usize
+    }
+    ret value
+}
+
+fn contains_word(words: str, target: str) -> bool {
+    let _ignored = words
+    ret target == "io" || target == "os" || target == "process" || target == "thread"
+        || target == "time" || target == "net" || target == "http" || target == "tls"
+        || target == "fs" || target == "path"
 }
 
 fn flatten_modules(modules: Vec[WorkspaceModule]) -> Vec[Statement] {
@@ -663,6 +694,18 @@ fn resolve_dependency_root(dep_ref: str, base_root: Path, distribution_root: Pat
         let root = system_core_root(base_root).resolve()
         ret WorkspaceDependency{root, root, "sys@core"}
     }
+    if base_ref == "sys@platform" {
+        let owner_manifest = read_project_manifest(base_root)
+        if owner_manifest.name != "std" {
+            workspace_error("sys@platform is internal and may only be imported by std")
+        }
+        let target = selected_workspace_target()
+        if !target_kit_installed(target) {
+            workspace_error("Target kit for " + target.triple + " is not installed; run `encore target install " + target.triple + "`")
+        }
+        let root = target_platform_root(target).resolve()
+        ret WorkspaceDependency{root, root, "sys@platform:" + target.triple}
+    }
 
     if starts_with(base_ref, "path@") {
         let root = base_root.join(base_ref.slice(5_usize, base_ref.len() - 5_usize)).resolve()
@@ -711,6 +754,18 @@ fn resolve_dependency_root(dep_ref: str, base_root: Path, distribution_root: Pat
 
     workspace_error("Unsupported dependency reference: " + dep_ref)
     ret WorkspaceDependency{base_root, distribution_root, source_key}
+}
+
+fn selected_workspace_target() -> TargetSpec {
+    let mut index = 2_usize
+    while index + 1_usize < argc() {
+        match argv(index) {
+            Some(value) => { if value == "--target" { match argv(index + 1_usize) { Some(raw) => { ret parse_target(raw) } None => {} } } }
+            None => {}
+        }
+        index += 1_usize
+    }
+    ret parse_target("")
 }
 
 fn workspace_path_name_or(path: Path, fallback: str) -> str {

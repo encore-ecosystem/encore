@@ -3,7 +3,7 @@
 Encore is a self-hosted programming language and native compiler built around
 EHIR (Encore High Intermediate Representation) and LLVM.
 
-The current development line is `0.1.4`. Python compiler development ended at
+The current development line is `0.1.5`. Python compiler development ended at
 `0.1.2`; current sources are compiled only by the native Encore compiler.
 
 ## Install
@@ -26,7 +26,7 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/encore-ecosystem/encore/trunk/install.sh | \
-  sh -s -- --version 0.1.4
+  sh -s -- --version 0.1.5
 ```
 
 Use `--install-dir <path>` for a custom location and `--uninstall` to remove

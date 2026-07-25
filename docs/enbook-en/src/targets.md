@@ -8,13 +8,13 @@ compatible triple:
 <architecture>-<vendor>-<operating-system>-<environment>
 ```
 
-The compiler accepts arbitrary triples. `encore target list` reports the
-desktop targets for which release artifacts are produced; it is not a
-whitelist. Inspect the host or another target with:
+The compiler accepts arbitrary triples. `encore target list` reports managed
+and native targets; it is not a whitelist. Inspect or install a target kit:
 
 ```sh
 encore target
-encore target thumbv7em-none-eabihf
+encore target show thumbv7em-none-eabihf
+encore target install aarch64-unknown-linux-gnu
 ```
 
 Native release and CI targets currently cover Linux, macOS, and Windows on x86-64 and
@@ -33,6 +33,16 @@ Build for a target with:
 ```sh
 encore build --target aarch64-unknown-linux-gnu
 ```
+
+For a managed cross target, a missing kit is an error and the diagnostic prints
+the exact install command. Kits are compiler-ABI-coupled, checksummed, installed
+atomically under `~/.encore/targets`, and contain host tools plus target
+sysroot/runtime/platform sources. Once installed, builds can run offline.
+
+Guaranteed managed cross targets are Linux x86-64/AArch64 and Windows GNU
+x86-64/AArch64. Darwin remains native because Encore does not redistribute
+Apple SDKs. Windows MSVC remains a native target. A fully configured custom
+toolchain remains available without a managed kit.
 
 Native artifacts remain under `target/<profile>`. An explicit cross-target is
 written under `target/<triple>/<profile>` so artifacts for different devices
@@ -66,6 +76,19 @@ linker-script = "platform/memory.ld"
 compile-args = ["-mthumb"]
 link-args = ["-nostdlib", "-Wl,--gc-sections"]
 ```
+
+For one-off toolchain experiments, append arguments without changing the
+manifest:
+
+```sh
+encore build --target aarch64-unknown-linux-gnu \
+  --compile-arg -fno-omit-frame-pointer \
+  --link-arg -fuse-ld=lld
+```
+
+Both switches are repeatable. They append to the selected project or
+target-kit defaults; explicit compiler, linker, sysroot, and runtime switches
+continue to take precedence over the kit.
 
 Command-line options have the highest priority:
 

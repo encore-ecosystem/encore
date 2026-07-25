@@ -1,255 +1,35 @@
-name: Native Release
+name: Promote Native Release
 
 on:
   push:
     tags:
       - "v[0-9]*.[0-9]*.[0-9]*"
+      - "v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*"
+      - "v[0-9]*.[0-9]*.[0-9]*-nightly.[0-9]*"
 
 permissions:
+  actions: read
   contents: write
 
-env:
-  ENCORE_INDEX_URL: https://raw.githubusercontent.com/encore-ecosystem/encore-index/a931b185d56bc9ae9515cfdabde721486a8c7b0c
-
 jobs:
-  build:
-    name: Build ${{ matrix.triple }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            triple: x86_64-unknown-linux-gnu
-            executable: encore
-          - os: ubuntu-24.04-arm
-            triple: aarch64-unknown-linux-gnu
-            executable: encore
-          - os: macos-15-intel
-            triple: x86_64-apple-darwin
-            executable: encore
-          - os: macos-15
-            triple: aarch64-apple-darwin
-            executable: encore
-          - os: windows-latest
-            triple: x86_64-pc-windows-msvc
-            executable: encore.exe
-    runs-on: ${{ matrix.os }}
+  promote:
+    runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
-      ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/registry
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Verify release identity
+      - name: Verify tag and exact green trunk candidate
+        id: candidate
         shell: bash
         run: |
           set -euo pipefail
           version=${GITHUB_REF_NAME#v}
           test "$(tr -d '\r\n' < VERSION)" = "$version"
           test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' encore.toml | head -n 1)" = "$version"
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+|-nightly\.[0-9]{8})?$ ]] || {
-            echo "Unsupported release version: $version" >&2
-            exit 1
-          }
-
-      - name: Download previous complete trusted compiler
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/seeds
-          extension=tar.gz
-          case "${{ matrix.triple }}" in *-windows-*) extension=zip ;; esac
-          asset="encore-${{ matrix.triple }}.$extension"
-          selected=
-          while IFS= read -r tag; do
-            test "$tag" != "$GITHUB_REF_NAME" || continue
-            case "$tag" in channel-*) continue ;; esac
-            candidate="target/seeds/$tag"
-            mkdir -p "$candidate"
-            if gh release download "$tag" \
-              --pattern "$asset" \
-              --pattern "$asset.sha256" \
-              --dir "$candidate" >/dev/null 2>&1
-            then
-              selected=$tag
-              echo "SEED_DOWNLOAD_DIR=$PWD/$candidate" >> "$GITHUB_ENV"
-              break
-            fi
-          done < <(gh release list --limit 100 --json tagName,isDraft \
-            --jq '.[] | select(.isDraft == false) | .tagName')
-          test -n "$selected" || {
-            echo "::error::No previous complete trusted release contains ${{ matrix.triple }}"
-            exit 1
-          }
-          echo "Using trusted compiler $selected"
-
-      - name: Verify and extract trusted compiler
-        shell: bash
-        run: |
-          set -euo pipefail
-          extension=tar.gz
-          case "${{ matrix.triple }}" in *-windows-*) extension=zip ;; esac
-          asset="encore-${{ matrix.triple }}.$extension"
-          expected=$(awk 'NF {print tolower($1); exit}' "$SEED_DOWNLOAD_DIR/$asset.sha256")
-          if command -v sha256sum >/dev/null 2>&1; then
-            actual=$(sha256sum "$SEED_DOWNLOAD_DIR/$asset" | awk '{print $1}')
-          else
-            actual=$(shasum -a 256 "$SEED_DOWNLOAD_DIR/$asset" | awk '{print $1}')
-          fi
-          test "$actual" = "$expected"
-          mkdir -p target/seed-unpacked
-          case "$extension" in
-            zip) unzip -q "$SEED_DOWNLOAD_DIR/$asset" -d target/seed-unpacked ;;
-            *) tar -xzf "$SEED_DOWNLOAD_DIR/$asset" -C target/seed-unpacked ;;
-          esac
-          distribution=$(find target/seed-unpacked -mindepth 1 -maxdepth 1 -type d | head -n 1)
-          test -s "$distribution/bin/${{ matrix.executable }}"
-          test -f "$distribution/lib/encore/index/core/encore.toml"
-          echo "ENCORE_HOME=$PWD/$distribution" >> "$GITHUB_ENV"
-          echo "ENCORE_CORE_DIR=$PWD/$distribution/lib/encore/index/core" >> "$GITHUB_ENV"
-          echo "SEED_COMPILER=$PWD/$distribution/bin/${{ matrix.executable }}" >> "$GITHUB_ENV"
-
-      - name: Resolve dependencies and reach a three-stage fixed point
-        shell: bash
-        run: |
-          set -euo pipefail
-          if test "${{ matrix.triple }}" = x86_64-pc-windows-msvc; then
-            mkdir -p target/registry/metadata
-            awk '
-              function emit() { if (name != "" && archive != "") print name "\t" version "\t" checksum "\t" archive }
-              /^\[\[packages\]\]$/ { emit(); name=version=checksum=archive=""; next }
-              /^name = / { name=$3; gsub(/"/, "", name) }
-              /^version = / { version=$3; gsub(/"/, "", version) }
-              /^checksum = / { checksum=$3; gsub(/"/, "", checksum) }
-              /^archive = / { archive=$3; gsub(/"/, "", archive) }
-              END { emit() }
-            ' encore.lock |
-            while IFS=$'\t' read -r name version checksum archive; do
-              destination="$PWD/target/registry/packages/$name/$version-$checksum"
-              mkdir -p "$destination"
-              curl --fail --location --retry 5 "$archive" -o target/registry-package.tar.gz
-              tar -xzf target/registry-package.tar.gz -C "$destination"
-              metadata="target/registry/metadata/$name.json"
-              curl --fail --location --retry 5 --retry-all-errors \
-                "$ENCORE_INDEX_URL/${name:0:2}/$name.json" -o "$metadata.pending"
-              mv "$metadata.pending" "$metadata"
-            done
-          fi
-          "$SEED_COMPILER" sync
-          "$SEED_COMPILER" build --profile extreme
-          mkdir -p target/stage1
-          cp "target/extreme/${{ matrix.executable }}" "target/stage1/${{ matrix.executable }}"
-          mv target/extreme target/stage1-output
-          "target/stage1/${{ matrix.executable }}" build --profile extreme
-          mkdir -p target/stage2
-          cp "target/extreme/${{ matrix.executable }}" "target/stage2/${{ matrix.executable }}"
-          mv target/extreme target/stage2-output
-          "target/stage2/${{ matrix.executable }}" build --profile extreme
-          mkdir -p target/stage3
-          cp "target/extreme/${{ matrix.executable }}" "target/stage3/${{ matrix.executable }}"
-          cmp "target/stage2/${{ matrix.executable }}" "target/stage3/${{ matrix.executable }}"
-          test "$("target/stage3/${{ matrix.executable }}" --version)" = "encore ${GITHUB_REF_NAME#v}"
-
-      - name: Verify offline Windows codegen resume
-        if: matrix.triple == 'x86_64-pc-windows-msvc'
-        shell: bash
-        env:
-          ENCORE_INDEX_URL: http://127.0.0.1:9
-        run: |
-          set -euo pipefail
-          "target/stage3/${{ matrix.executable }}" test --filter power_operator
-
-      - name: Run release tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          "target/stage3/${{ matrix.executable }}" test
-
-      - name: Assemble reproducible toolchain archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          version=${GITHUB_REF_NAME#v}
-          package="encore-$version-${{ matrix.triple }}"
-          root="$PWD/target/package/$package"
-          mkdir -p "$root/bin" "$root/lib/encore/index" "$root/share/doc/encore" dist
-          cp "target/stage3/${{ matrix.executable }}" "$root/bin/${{ matrix.executable }}"
-          chmod +x "$root/bin/${{ matrix.executable }}" 2>/dev/null || true
-          for name in core std rich json ehirlib ehir_llvm_backend toml colorterm log llvm; do
-            if test "$name" = core; then
-              source="$ENCORE_CORE_DIR"
-              destination=core
-            else
-              source=$(find "$PWD/target/registry/packages/$name" -mindepth 1 -maxdepth 1 -type d | head -n 1)
-              destination=$name
-              case "$name" in ehirlib) destination=ehir ;; ehir_llvm_backend) destination=ehir-llvm-backend ;; esac
-            fi
-            test -f "$source/encore.toml"
-            cp -R "$source" "$root/lib/encore/index/$destination"
-          done
-          cp LICENSE README.md "$root/share/doc/encore/"
-          printf '%s\n' "$version" > "$root/VERSION"
-          find "$root" -exec touch -t 200001010000.00 {} +
-          case "${{ matrix.triple }}" in
-            *-windows-*)
-              archive="$PWD/dist/encore-${{ matrix.triple }}.zip"
-              (cd target/package && 7z a -tzip -mtc=off -mta=off "$archive" "$package")
-              ;;
-            *)
-              archive="$PWD/dist/encore-${{ matrix.triple }}.tar.gz"
-              if tar --version 2>/dev/null | grep -q GNU; then
-                tar -C target/package --sort=name --owner=0 --group=0 --numeric-owner -czf "$archive" "$package"
-              else
-                (cd target/package && find "$package" -print | LC_ALL=C sort |
-                  COPYFILE_DISABLE=1 tar --no-recursion --uid 0 --gid 0 --uname root --gname root -cf - -T - |
-                  gzip -n > "$archive")
-              fi
-              ;;
-          esac
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
-          else
-            (cd dist && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
-          fi
-
-      - name: Smoke-test packaged distribution
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/package-smoke
-          archive=$(find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) | head -n 1)
-          case "$archive" in
-            *.zip) unzip -q "$archive" -d target/package-smoke ;;
-            *) tar -xf "$archive" -C target/package-smoke ;;
-          esac
-          root=$(find target/package-smoke -mindepth 1 -maxdepth 1 -type d | head -n 1)
-          test "$("$root/bin/${{ matrix.executable }}" --version)" = "encore ${GITHUB_REF_NAME#v}"
-          test -f "$root/lib/encore/index/core/runtime.c"
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: encore-${{ matrix.triple }}
-          path: dist/*
-          if-no-files-found: error
-
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Verify release set and generate manifests
-        id: metadata
-        shell: bash
-        run: |
-          set -euo pipefail
-          version=${GITHUB_REF_NAME#v}
+          test "$(sed -n 's/.*ret "\([^"]*\)".*/\1/p' src/version.enq)" = "$version"
           if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}$ ]]; then
             channel=nightly
           elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
@@ -257,46 +37,118 @@ jobs:
           elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             channel=stable
           else
-            echo "Unsupported release channel: $version" >&2
+            echo "::error::Unsupported release version $version"
             exit 1
           fi
-          assets=
-          checksums=dist/SHA256SUMS
-          : > "$checksums"
+          git fetch origin trunk
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/trunk
+          run_id=$(gh run list \
+            --workflow ci.yml \
+            --branch trunk \
+            --commit "$GITHUB_SHA" \
+            --status success \
+            --limit 20 \
+            --json databaseId,headSha,conclusion,event \
+            --jq 'map(select(.headSha == env.GITHUB_SHA and .conclusion == "success" and .event == "push")) | first | .databaseId')
+          test -n "$run_id" && test "$run_id" != null || {
+            echo "::error::No successful trunk CI run exists for exact commit $GITHUB_SHA"
+            exit 1
+          }
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact tested artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
           for triple in \
             x86_64-unknown-linux-gnu \
             aarch64-unknown-linux-gnu \
             x86_64-apple-darwin \
             aarch64-apple-darwin \
-            x86_64-pc-windows-msvc
+            x86_64-pc-windows-msvc \
+            x86_64-w64-windows-gnu \
+            aarch64-w64-windows-gnu
           do
+            gh run download "${{ steps.candidate.outputs.run_id }}" \
+              --name "release-candidate-$triple" \
+              --dir "target/candidates/$triple"
+            cp "target/candidates/$triple"/* dist/
+          done
+          for target in \
+            x86_64-w64-windows-gnu \
+            aarch64-w64-windows-gnu \
+            aarch64-unknown-linux-gnu
+          do
+            gh run download "${{ steps.candidate.outputs.run_id }}" \
+              --name "release-candidate-target-kit-$target" \
+              --dir "target/candidates/target-kit-$target"
+            cp "target/candidates/target-kit-$target"/* dist/
+          done
+
+      - name: Verify provenance and generate release manifest
+        shell: bash
+        env:
+          CHANNEL: ${{ steps.candidate.outputs.channel }}
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          assets=
+          : > dist/SHA256SUMS
+          for triple in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin \
+            x86_64-pc-windows-msvc \
+            x86_64-w64-windows-gnu \
+            aarch64-w64-windows-gnu
+          do
+            grep -Fq "\"commit\":\"$GITHUB_SHA\"" "dist/provenance-$triple.json"
+            grep -Fq "\"version\":\"$version\"" "dist/provenance-$triple.json"
+            grep -Fq "\"target\":\"$triple\"" "dist/provenance-$triple.json"
             extension=tar.gz
             format=tar.gz
             case "$triple" in *-windows-*) extension=zip; format=zip ;; esac
             asset="encore-$triple.$extension"
-            test -s "dist/$asset"
-            test -s "dist/$asset.sha256"
-            checksum=$(awk 'NF {print tolower($1); exit}' "dist/$asset.sha256")
-            printf '%s  %s\n' "$checksum" "$asset" >> "$checksums"
-            entry="{\"triple\":\"$triple\",\"url\":\"https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$asset\",\"sha256\":\"$checksum\",\"format\":\"$format\"}"
+            expected=$(awk 'NF {print tolower($1); exit}' "dist/$asset.sha256")
+            actual=$(sha256sum "dist/$asset" | awk '{print $1}')
+            test "$actual" = "$expected"
+            printf '%s  %s\n' "$actual" "$asset" >> dist/SHA256SUMS
+            entry="{\"triple\":\"$triple\",\"url\":\"https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$asset\",\"sha256\":\"$actual\",\"format\":\"$format\"}"
             if test -n "$assets"; then assets="$assets,$entry"; else assets=$entry; fi
           done
-          LC_ALL=C sort -o "$checksums" "$checksums"
-          printf '{"schema":1,"channel":"%s","version":"%s","tag":"%s","commit":"%s","assets":[%s]}\n' \
-            "$channel" "$version" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$assets" > dist/channel.json
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          for descriptor in dist/target-kit-*.json; do
+            test "$(jq -r '.schema' "$descriptor")" = 1
+            target_kit_abi=$(printf '%s\n' "$version" | awk -F. '{print $1 "." $2}')
+            test "$(jq -r '.abi' "$descriptor")" = "$target_kit_abi"
+            archive=$(basename "$(jq -r '.archive' "$descriptor")")
+            expected=$(jq -r '.sha256' "$descriptor")
+            test "$expected" = "$(sha256sum "dist/$archive" | awk '{print $1}')"
+            test "$expected" = "$(awk 'NF {print tolower($1); exit}' "dist/$archive.sha256")"
+            printf '%s  %s\n' "$expected" "$archive" >> dist/SHA256SUMS
+          done
+          LC_ALL=C sort -o dist/SHA256SUMS dist/SHA256SUMS
+          printf '{"schema":1,"channel":"%s","version":"%s","tag":"%s","commit":"%s","candidate_run":%s,"assets":[%s]}\n' \
+            "$CHANNEL" "$version" "$GITHUB_REF_NAME" "$GITHUB_SHA" \
+            "${{ steps.candidate.outputs.run_id }}" "$assets" > dist/channel.json
 
       - uses: softprops/action-gh-release@v3
         with:
-          files: dist/*
+          files: |
+            dist/encore-*
+            dist/target-kit-*
+            dist/SHA256SUMS
+            dist/channel.json
+            dist/provenance-*
           generate_release_notes: true
-          prerelease: ${{ steps.metadata.outputs.channel != 'stable' }}
+          prerelease: ${{ steps.candidate.outputs.channel != 'stable' }}
 
       - name: Publish atomic channel pointer
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          CHANNEL: ${{ steps.metadata.outputs.channel }}
+          CHANNEL: ${{ steps.candidate.outputs.channel }}
         run: |
           set -euo pipefail
           pointer="channel-$CHANNEL"
