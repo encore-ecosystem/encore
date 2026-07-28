@@ -4,6 +4,7 @@ import core::fmt::Debug
 import core::option::Option
 import std::io::eprintln
 import std::time::perf_counter_ms
+import std::thread::{JoinHandle, available_parallelism}
 import std::io::println
 import std::os::{argc, argv, file_exists, read_dir, read_file, remove_file, write_file}
 import std::path::Path
@@ -22,8 +23,6 @@ import rich::TestProgress
 
 struct TestSelection {
     filter: str
-    shard_index: usize
-    shard_count: usize
 }
 
 struct TestRecord {
@@ -33,19 +32,56 @@ struct TestRecord {
     message: str
 }
 
+struct StandaloneTestJob {
+    index: usize
+    path: str
+    display: str
+    weight: usize
+}
+
+struct StandaloneTestResult {
+    index: usize
+    display: str
+    duration_ms: u64
+    failure: str
+}
+
+struct UnitTestJob {
+    index: usize
+    display: str
+    weight: usize
+}
+
 /// Performs the `native_test` operation.
 pub fn native_test() -> u32 {
     let root = Path::new(".").resolve()
+    let worker_unit = option_value("--_worker-unit")
+    if worker_unit != "" {
+        let mut worker_workspace = if file_exists(root.join("src").join("lib.enq").as_str()) {
+            load_library_workspace(root)
+        } else {
+            load_entry_workspace(root, root.join("src").join("main.enq"))
+        }
+        let failure = run_selected_unit_test(root, worker_workspace, worker_unit)
+        if failure == "" { ret 0_u32 }
+        eprintln(failure)
+        ret 1_u32
+    }
     let worker_path = option_value("--_worker-standalone")
     if worker_path != "" {
         let path = Path::new(worker_path).resolve()
         let mut worker_workspace = load_entry_workspace(root, path)
-        let semantic_error = workspace_semantic_error(worker_workspace)
-        if semantic_error != "" {
-            eprintln(semantic_error)
-            ret 1_u32
+        // Negative tests need the early semantic diagnostic they assert on.
+        // Positive tests can go straight to the cached compile path; a cache
+        // miss still runs the complete lowering-time validator.
+        if expected_compile_error(read_file(path.as_str())) != "" {
+            let semantic_error = workspace_semantic_error(worker_workspace)
+            if semantic_error != "" {
+                eprintln(semantic_error)
+                ret 1_u32
+            }
         }
-        let failure = compile_and_run_result(root, worker_workspace.flat_ast, "worker:" + path.as_str())
+        let failure = compile_and_run_result(root, worker_workspace, worker_workspace.flat_ast, "worker:" + path.as_str())
         if failure == "" { ret 0_u32 }
         eprintln(failure)
         ret 1_u32
@@ -77,6 +113,7 @@ pub fn native_test() -> u32 {
     let mut progress = TestProgress::auto()
     progress.start_suite(workspace.root_name, total)
 
+    let mut unit_jobs = Vec[UnitTestJob]::new()
     let mut module_index = 0_usize
     while module_index < workspace.modules.len() {
         match workspace.modules.get(module_index) {
@@ -90,21 +127,9 @@ pub fn native_test() -> u32 {
                                     if has_attr(item, "test") {
                                         let display = unit_test_display(root, module, item.name)
                                         if test_selected(display, selection) {
-                                            found = found + 1_usize
-                                            progress.start_test(display, found, total)
-                                            let started = perf_counter_ms()
-                                            let failure = run_unit_test(root, workspace, item, display)
-                                            let duration = perf_counter_ms() - started
-                                            if failure == "" {
-                                                passed = passed + 1_usize
-                                                records.push(TestRecord{display, "passed", duration, ""})
-                                                progress.pass_test(display)
-                                            }
-                                            else {
-                                                failed = failed + 1_usize
-                                                records.push(TestRecord{display, "failed", duration, failure})
-                                                progress.fail_test(display, failure)
-                                            }
+                                            unit_jobs.push(UnitTestJob{
+                                                unit_jobs.len(), display, module.source.len()
+                                            })
                                         }
                                     }
                                 }
@@ -120,8 +145,36 @@ pub fn native_test() -> u32 {
         }
         module_index = module_index + 1_usize
     }
+    let scheduled_unit_jobs = schedule_unit_test_jobs(unit_jobs)
+    let unit_worker_count = min_test_jobs(requested_test_jobs(), scheduled_unit_jobs.len())
+    let mut unit_pending = Vec[JoinHandle[Vec[StandaloneTestResult]]]::new()
+    let mut unit_worker = 0_usize
+    while unit_worker < unit_worker_count {
+        unit_pending.push(spawn run_unit_test_batch(root, scheduled_unit_jobs, unit_worker, unit_worker_count))
+        unit_worker += 1_usize
+    }
+    let mut unit_results = Vec[StandaloneTestResult]::new()
+    for handle in unit_pending { unit_results.extend(handle.join()) }
+    let mut unit_result_index = 0_usize
+    while unit_result_index < unit_jobs.len() {
+        for result in unit_results {
+            if result.index == unit_result_index {
+                found += 1_usize
+                if result.failure == "" {
+                    passed += 1_usize
+                    records.push(TestRecord{result.display, "passed", result.duration_ms, ""})
+                } else {
+                    failed += 1_usize
+                    records.push(TestRecord{result.display, "failed", result.duration_ms, result.failure})
+                }
+                print_parallel_test_result(result)
+            }
+        }
+        unit_result_index += 1_usize
+    }
 
     let tests_dir = root.join("tests")
+    let mut standalone_jobs = Vec[StandaloneTestJob]::new()
     if file_exists(tests_dir.as_str()) {
         let entries = read_dir(tests_dir.as_str())
         let mut entry_index = 0_usize
@@ -131,21 +184,11 @@ pub fn native_test() -> u32 {
                     if ends_with(name, ".enq") {
                         let display = workspace.root_name + ":tests/" + name
                         if test_selected(display, selection) {
-                            found = found + 1_usize
-                            progress.start_test(display, found, total)
-                            let started = perf_counter_ms()
-                            let failure = run_standalone_test(root, tests_dir.join(name), display)
-                            let duration = perf_counter_ms() - started
-                            if failure == "" {
-                                passed = passed + 1_usize
-                                records.push(TestRecord{display, "passed", duration, ""})
-                                progress.pass_test(display)
-                            }
-                            else {
-                                failed = failed + 1_usize
-                                records.push(TestRecord{display, "failed", duration, failure})
-                                progress.fail_test(display, failure)
-                            }
+                            let path = tests_dir.join(name)
+                            standalone_jobs.push(StandaloneTestJob{
+                                standalone_jobs.len(), path.as_str(), display,
+                                read_file(path.as_str()).len()
+                            })
                         }
                     }
                 }
@@ -153,6 +196,33 @@ pub fn native_test() -> u32 {
             }
             entry_index = entry_index + 1_usize
         }
+    }
+    let scheduled_jobs = schedule_standalone_test_jobs(standalone_jobs)
+    let worker_count = min_test_jobs(requested_test_jobs(), scheduled_jobs.len())
+    let mut pending = Vec[JoinHandle[Vec[StandaloneTestResult]]]::new()
+    let mut worker = 0_usize
+    while worker < worker_count {
+        pending.push(spawn run_standalone_test_batch(root, scheduled_jobs, worker, worker_count))
+        worker += 1_usize
+    }
+    let mut standalone_results = Vec[StandaloneTestResult]::new()
+    for handle in pending { standalone_results.extend(handle.join()) }
+    let mut result_index = 0_usize
+    while result_index < standalone_jobs.len() {
+        for result in standalone_results {
+            if result.index == result_index {
+                found += 1_usize
+                if result.failure == "" {
+                    passed += 1_usize
+                    records.push(TestRecord{result.display, "passed", result.duration_ms, ""})
+                } else {
+                    failed += 1_usize
+                    records.push(TestRecord{result.display, "failed", result.duration_ms, result.failure})
+                }
+                print_parallel_test_result(result)
+            }
+        }
+        result_index += 1_usize
     }
 
     progress.finish(passed, failed)
@@ -239,46 +309,11 @@ fn list_selected_tests(root: Path, workspace: ProjectWorkspace, selection: TestS
 
 fn test_selected(id: str, selection: TestSelection) -> bool {
     if selection.filter != "" && !contains(id, selection.filter) { ret false }
-    if selection.shard_count <= 1_usize { ret true }
-    ret (id.hash() as usize) % selection.shard_count == selection.shard_index
-}
-
-#attr(test)
-fn deterministic_test_shards_partition_ids() -> bool {
-    let mut ids = Vec[str]::new()
-    ids.push("sample:src/lib.enq::first")
-    ids.push("sample:src/lib.enq::second")
-    ids.push("sample:tests/negative.enq")
-    ids.push("sample:tests/integration.enq")
-    for id in ids {
-        let mut matches = 0_usize
-        let mut shard = 0_usize
-        while shard < 4_usize {
-            let selection = TestSelection{"", shard, 4_usize}
-            if test_selected(id, selection) { matches += 1_usize }
-            shard += 1_usize
-        }
-        if matches != 1_usize { ret false }
-    }
     ret true
 }
 
 fn test_selection() -> TestSelection {
-    let shard = option_value("--shard")
-    if shard == "" { ret TestSelection{test_filter(), 0_usize, 1_usize} }
-    let separator = find_character(shard, "/")
-    let selected = decimal_value(shard.slice(0_usize, separator))
-    let total = decimal_value(shard.slice(separator + 1_usize, shard.len() - separator - 1_usize))
-    ret TestSelection{test_filter(), selected - 1_usize, total}
-}
-
-fn find_character(value: str, needle: str) -> usize {
-    let mut index = 0_usize
-    while index < value.len() {
-        if value.slice(index, 1_usize) == needle { ret index }
-        index += 1_usize
-    }
-    ret value.len()
+    ret TestSelection{test_filter()}
 }
 
 fn decimal_value(value: str) -> usize {
@@ -310,9 +345,6 @@ fn write_test_report_if_requested(
         item.push(field("message", Json::String(record.message)))
         tests.push(Json::Object(item))
     }
-    let mut shard = Vec[(str, Json)]::new()
-    shard.push(field("index", Json::Number(Debug::fmt(selection.shard_index + 1_usize))))
-    shard.push(field("count", Json::Number(Debug::fmt(selection.shard_count))))
     let mut summary = Vec[(str, Json)]::new()
     summary.push(field("selected", Json::Number(Debug::fmt(passed + failed))))
     summary.push(field("passed", Json::Number(Debug::fmt(passed))))
@@ -320,7 +352,6 @@ fn write_test_report_if_requested(
     summary.push(field("duration_ms", Json::Number(Debug::fmt(total_duration))))
     let mut root = Vec[(str, Json)]::new()
     root.push(field("schema", Json::Number("1")))
-    root.push(field("shard", Json::Object(shard)))
     root.push(field("summary", Json::Object(summary)))
     root.push(field("tests", Json::Array(tests)))
     match Path::new(report_path).parent() {
@@ -347,7 +378,100 @@ fn run_unit_test(root: Path, workspace: ProjectWorkspace, item: FunctionItem, di
     }
     let mut ast = unit_test_ast(workspace.flat_ast, item.name)
     append_parsed(ast, "fn main() -> u32 { let result: bool = " + item.name + "() if result { ret 0_u32 } ret 1_u32 }")
-    ret compile_and_run_result(root, ast, display)
+    ret compile_and_run_result(root, workspace, ast, display)
+}
+
+fn run_selected_unit_test(root: Path, workspace: ProjectWorkspace, selected: str) -> str {
+    for module in workspace.modules {
+        if module.owner_name == workspace.root_name {
+            for statement in module.ast {
+                match statement {
+                    Statement::Function(item) => {
+                        if has_attr(item, "test") && unit_test_display(root, module, item.name) == selected {
+                            ret run_unit_test(root, workspace, item, selected)
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    ret "unit test not found: " + selected
+}
+
+fn run_unit_test_isolated(root: Path, display: str) -> str {
+    let output_path = root.join("target").join("tests").join(sanitize(display) + ".output.txt")
+    mkdir_all(root.join("target").join("tests").as_str())
+    let executable = arg_or(0_usize, "encore")
+    let mut args = Vec[str]::new()
+    args.push("test")
+    args.push("--_worker-unit")
+    args.push(display)
+    args.push("--jobs")
+    args.push("1")
+    let code = run_args_capture(executable, args, output_path.as_str())
+    let output = read_file(output_path.as_str())
+    remove_file(output_path.as_str())
+    if code == 0_i32 { ret "" }
+    ret summarize_output(output)
+}
+
+fn schedule_unit_test_jobs(jobs: mut Vec[UnitTestJob]) -> Vec[UnitTestJob] {
+    let mut index = 1_usize
+    while index < jobs.len() {
+        let mut position = index
+        while position > 0_usize {
+            let mut swap = false
+            match jobs.get(position) {
+                Some(right) => {
+                    match jobs.get(position - 1_usize) {
+                        Some(left) => {
+                            swap = right.weight > left.weight ||
+                                (right.weight == left.weight && right.index < left.index)
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+            if !swap { break }
+            match jobs.get(position) {
+                Some(right) => {
+                    match jobs.get(position - 1_usize) {
+                        Some(left) => {
+                            jobs.set(position - 1_usize, right)
+                            jobs.set(position, left)
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+            position -= 1_usize
+        }
+        index += 1_usize
+    }
+    ret jobs
+}
+
+fn run_unit_test_batch(root: Path, jobs: Vec[UnitTestJob], worker_index: usize,
+    worker_count: usize) -> Vec[StandaloneTestResult] {
+    let mut out = Vec[StandaloneTestResult]::new()
+    let mut index = worker_index
+    while index < jobs.len() {
+        match jobs.get(index) {
+            Some(job) => {
+                let started = perf_counter_ms()
+                let failure = run_unit_test_isolated(root, job.display)
+                out.push(StandaloneTestResult{
+                    job.index, job.display, perf_counter_ms() - started, failure
+                })
+            }
+            None => {}
+        }
+        index += worker_count
+    }
+    ret out
 }
 
 fn run_standalone_test(root: Path, path: Path, display: str) -> str {
@@ -359,6 +483,8 @@ fn run_standalone_test(root: Path, path: Path, display: str) -> str {
     args.push("test")
     args.push("--_worker-standalone")
     args.push(path.as_str())
+    args.push("--jobs")
+    args.push("1")
     let code = run_args_capture(executable, args, output_path.as_str())
     let output = read_file(output_path.as_str())
     remove_file(output_path.as_str())
@@ -373,9 +499,97 @@ fn run_standalone_test(root: Path, path: Path, display: str) -> str {
     ret summarize_output(output)
 }
 
-fn compile_and_run_result(root: Path, ast: Vec[Statement], display: str) -> str {
+fn requested_test_jobs() -> usize {
+    let available = available_parallelism()
+    let fallback = if available == 0_usize { 1_usize } else { available }
+    let requested = decimal_value(option_value("--jobs"))
+    if requested == 0_usize { ret fallback }
+    if available == 0_usize || requested < available { ret requested }
+    ret available
+}
+
+fn min_test_jobs(requested: usize, count: usize) -> usize {
+    if count == 0_usize { ret 0_usize }
+    if requested < count { ret requested }
+    ret count
+}
+
+fn schedule_standalone_test_jobs(jobs: mut Vec[StandaloneTestJob]) -> Vec[StandaloneTestJob] {
+    let mut index = 1_usize
+    while index < jobs.len() {
+        let mut position = index
+        while position > 0_usize {
+            let mut swap = false
+            match jobs.get(position) {
+                Some(right) => {
+                    match jobs.get(position - 1_usize) {
+                        Some(left) => {
+                            swap = right.weight > left.weight ||
+                                (right.weight == left.weight && right.index < left.index)
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+            if !swap { break }
+            match jobs.get(position) {
+                Some(right) => {
+                    match jobs.get(position - 1_usize) {
+                        Some(left) => {
+                            jobs.set(position - 1_usize, right)
+                            jobs.set(position, left)
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+            position -= 1_usize
+        }
+        index += 1_usize
+    }
+    ret jobs
+}
+
+fn run_standalone_test_batch(root: Path, jobs: Vec[StandaloneTestJob], worker_index: usize,
+    worker_count: usize) -> Vec[StandaloneTestResult] {
+    let mut out = Vec[StandaloneTestResult]::new()
+    let mut index = worker_index
+    while index < jobs.len() {
+        match jobs.get(index) {
+            Some(job) => {
+                let started = perf_counter_ms()
+                let failure = run_standalone_test(root, Path::new(job.path), job.display)
+                out.push(StandaloneTestResult{
+                    job.index, job.display, perf_counter_ms() - started, failure
+                })
+            }
+            None => {}
+        }
+        index += worker_count
+    }
+    ret out
+}
+
+fn print_parallel_test_result(result: StandaloneTestResult) -> () {
+    let status = if result.failure == "" { "ok" } else { "FAILED" }
+    eprintln("test " + result.display + " ... " + status + " (" +
+        format_test_duration(result.duration_ms) + ")")
+    if result.failure != "" { eprintln("    " + result.failure) }
+    ret ()
+}
+
+fn format_test_duration(milliseconds: u64) -> str {
+    if milliseconds < 1000_u64 { ret Debug::fmt(milliseconds) + " ms" }
+    let seconds = milliseconds / 1000_u64
+    let tenths = (milliseconds % 1000_u64) / 100_u64
+    ret Debug::fmt(seconds) + "." + Debug::fmt(tenths) + "s"
+}
+
+fn compile_and_run_result(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], display: str) -> str {
     let name = sanitize(display)
-    if compile_test_ast(root, ast, name) != 0_u32 {
+    if compile_test_ast(root, workspace, ast, name) != 0_u32 {
         ret "compile failed"
     }
     let binary_name = target_executable_name(host_target(), name)

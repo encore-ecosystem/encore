@@ -773,7 +773,7 @@ fn infer_expression(
         Expr::VecLiteral(array) => { ret array_type(ctx, array.items, true) }
         Expr::ArrayRepeat(array) => {
             let item = infer_expression_h(ctx, array.value)
-            ret "[" + item + "; " + array.size + "]"
+            ret "[" + item + "; " + semantic_numeric_literal_value(array.size) + "]"
         }
         Expr::Block(block) => {
             check_statements(ctx, block.statements, "")
@@ -879,7 +879,7 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode<H>) -> str {
         Expr::VecLiteral(array) => { ret array_type(ctx, array.items, true) }
         Expr::ArrayRepeat(array) => {
             let item = infer_expression_h(ctx, array.value)
-            ret "[" + item + "; " + array.size + "]"
+            ret "[" + item + "; " + semantic_numeric_literal_value(array.size) + "]"
         }
         Expr::Block(block) => {
             check_statements(ctx, block.statements, "")
@@ -1146,6 +1146,7 @@ fn resolve_call(ctx: mut SemanticContext, name: str, args: Vec[ExprNode], line: 
     let mut saw_arity = false
     let mut expected_arity = 0_usize
     let mut expected_params = Vec[str]::new()
+    let mut out_of_range = false
     for callable in ctx.callables {
         if callable.name == name {
             saw_name = true
@@ -1153,12 +1154,24 @@ fn resolve_call(ctx: mut SemanticContext, name: str, args: Vec[ExprNode], line: 
             expected_params = callable.params
             if callable.params.len() == argument_types.len() {
                 saw_arity = true
-                if parameter_types_match(callable.params, argument_types) {
+                if parameter_types_match_contextual(callable.params, argument_types, args) {
                     remember_dependency(ctx, callable)
-                    ret Option[str]::Some(substitute_return_type(callable.ret_type, callable.params, argument_types))
+                    ret Option[str]::Some(substitute_return_type(
+                            callable.ret_type, callable.params, argument_types,))
+                } elif contextual_integer_out_of_range(callable.params, args) {
+                    out_of_range = true
                 }
             }
         }
+    }
+    if out_of_range {
+        ctx.diagnostics.push(
+            FrontendDiagnostic::new(1_usize, "integer-literal-out-of-range",
+                "integer literal is outside the range of the expected parameter type",
+                line, column, length,)
+                .with_help("use a wider integer parameter or a value within its range")
+        )
+        ret Option[str]::None
     }
     if saw_name && expected_arity != argument_types.len() {
         ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "argument-mismatch", "call to '" + name + "' expects " + Debug::fmt(expected_arity) + " argument(s), got " + Debug::fmt(argument_types.len()), line, column, length))
@@ -1700,6 +1713,153 @@ fn parameter_types_match(params: Vec[str], arguments: Vec[str]) -> bool {
         index += 1_usize
     }
     ret true
+}
+
+fn parameter_types_match_contextual(params: Vec[str], arguments: Vec[str],
+    expressions: Vec[ExprNode],) -> bool {
+    let mut index = 0_usize
+    while index < params.len() {
+        let param = params.get(index).unwrap_or("")
+        let argument = arguments.get(index).unwrap_or("")
+        let expression = match expressions.get(index) {
+            Option::Some(value) => { value }
+            Option::None => { ret false }
+        }
+        if !semantic_types_compatible(param, argument) {
+            match expression.value {
+                Expr::Integer(value) => {
+                    if contains(value, "_") || !integer_semantic_type(param) ||
+                        !integer_literal_fits(value, param) {
+                        ret false
+                    }
+                }
+                _ => { ret false }
+            }
+        }
+        index += 1_usize
+    }
+    ret true
+}
+
+fn contextual_integer_out_of_range(params: Vec[str], expressions: Vec[ExprNode]) -> bool {
+    let mut index = 0_usize
+    while index < params.len() && index < expressions.len() {
+        let param = params.get(index).unwrap_or("")
+        match expressions.get(index) {
+            Option::Some(expression) => {
+                match expression.value {
+                    Expr::Integer(value) => {
+                        if !contains(value, "_") && integer_semantic_type(param) &&
+                            !integer_literal_fits(value, param) {
+                            ret true
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Option::None => {}
+        }
+        index += 1_usize
+    }
+    ret false
+}
+
+fn integer_semantic_type(typ: str) -> bool {
+    ret typ == "u8" || typ == "u16" || typ == "u32" || typ == "u64" ||
+        typ == "u128" || typ == "usize" || typ == "i8" || typ == "i16" ||
+        typ == "i32" || typ == "i64" || typ == "i128" || typ == "isize"
+}
+
+fn integer_literal_fits(value: str, typ: str) -> bool {
+    let decimal = semantic_numeric_literal_value(value)
+    let maximum = if typ == "u8" { "255" }
+        else { if typ == "u16" { "65535" }
+        else { if typ == "u32" { "4294967295" }
+        else { if typ == "u64" || typ == "usize" { "18446744073709551615" }
+        else { if typ == "u128" { "340282366920938463463374607431768211455" }
+        else { if typ == "i8" { "127" }
+        else { if typ == "i16" { "32767" }
+        else { if typ == "i32" { "2147483647" }
+        else { if typ == "i64" || typ == "isize" { "9223372036854775807" }
+        else { if typ == "i128" { "170141183460469231731687303715884105727" }
+        else { "" } } } } } } } } } }
+    if maximum == "" { ret false }
+    let normalized = trim_leading_numeric_zeroes(decimal)
+    if normalized.len() != maximum.len() { ret normalized.len() < maximum.len() }
+    let mut index = 0_usize
+    while index < normalized.len() {
+        let actual = normalized.byte_at(index)
+        let limit = maximum.byte_at(index)
+        if actual < limit { ret true }
+        if actual > limit { ret false }
+        index += 1_usize
+    }
+    ret true
+}
+
+fn semantic_numeric_literal_value(value: str) -> str {
+    let mut end = value.len()
+    let mut index = 0_usize
+    while index < value.len() {
+        if value.slice(index, 1_usize) == "_" { end = index break }
+        index += 1_usize
+    }
+    let raw = value.slice(0_usize, end)
+    if raw.len() < 3_usize || raw.slice(0_usize, 1_usize) != "0" { ret raw }
+    let prefix = raw.slice(1_usize, 1_usize)
+    let base = if prefix == "x" || prefix == "X" { 16_u32 }
+        else { if prefix == "b" || prefix == "B" { 2_u32 }
+        else { if prefix == "o" || prefix == "O" { 8_u32 } else { 0_u32 } } }
+    if base == 0_u32 { ret raw }
+    let mut decimal = "0"
+    index = 2_usize
+    while index < raw.len() {
+        decimal = semantic_decimal_multiply_add(decimal, base,
+            semantic_radix_digit(raw.slice(index, 1_usize)),)
+        index += 1_usize
+    }
+    ret decimal
+}
+
+fn semantic_radix_digit(value: str) -> u32 {
+    if value.len() != 1_usize { ret 0_u32 }
+    let code = value.byte_at(0_usize)
+    if code >= 48_u8 && code <= 57_u8 { ret (code - 48_u8) as u32 }
+    if code >= 65_u8 && code <= 70_u8 { ret (code - 65_u8) as u32 + 10_u32 }
+    if code >= 97_u8 && code <= 102_u8 { ret (code - 97_u8) as u32 + 10_u32 }
+    ret 0_u32
+}
+
+fn semantic_decimal_multiply_add(value: str, multiplier: u32, addition: u32) -> str {
+    let mut reversed = ""
+    let mut carry = addition
+    let mut index = value.len()
+    while index > 0_usize {
+        index -= 1_usize
+        let digit = (value.byte_at(index) - 48_u8) as u32
+        let product = digit * multiplier + carry
+        reversed += Debug::fmt(product % 10_u32)
+        carry = product / 10_u32
+    }
+    while carry > 0_u32 {
+        reversed += Debug::fmt(carry % 10_u32)
+        carry = carry / 10_u32
+    }
+    let mut out = ""
+    index = reversed.len()
+    while index > 0_usize {
+        index -= 1_usize
+        out += reversed.slice(index, 1_usize)
+    }
+    ret out
+}
+
+fn trim_leading_numeric_zeroes(value: str) -> str {
+    let mut start = 0_usize
+    while start + 1_usize < value.len() && value.slice(start, 1_usize) == "0" {
+        start += 1_usize
+    }
+    ret value.slice(start, value.len() - start)
 }
 
 fn generic_placeholder(value: str) -> bool {

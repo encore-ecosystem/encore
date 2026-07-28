@@ -5,6 +5,7 @@ import core::option::Option
 import std::io::eprintln
 import std::thread::JoinHandle
 import std::thread::available_parallelism
+import std::time::perf_counter_ms
 import std::os::write_file
 import std::os::read_file
 import std::os::env
@@ -22,7 +23,8 @@ import ehirlib::parse_module_text
 import ehirlib::{parse_module_bundle_text, flatten_module_bundle}
 import ehir_llvm_backend::codegen::{emit_ir, emit_ir_for_target, emit_ir_bundle_for_target_parallel}
 
-import refrain::frontend::translator::{TranslationModule, filter_ast_for_target, translate_modules_to_ehir, translate_modules_to_ehir_bundle, translate_to_ehir, translate_to_ehir_for_target, translate_to_ehir_for_target_and_features}
+import refrain::frontend::translator::{TranslationModule, filter_ast_for_target, translate_ast_with_modules_to_ehir, translate_modules_to_ehir, translate_modules_to_ehir_bundle, translate_modules_to_ehir_bundle_parallel, translate_to_ehir, translate_to_ehir_for_target, translate_to_ehir_for_target_and_features}
+import refrain::frontend::{FrontendDiagnostic, PreparedSemanticModule, check_prepared_semantic_module}
 import refrain::frontend::parser::statements::Statement
 import refrain::diagnostics::render_diagnostic
 import refrain::project::load_binary_workspace
@@ -30,7 +32,7 @@ import refrain::project::WorkspaceModule
 import refrain::project::WorkspaceRefrain
 import refrain::project::ProjectWorkspace
 import refrain::project::{system_core_root, workspace_release_modules, workspace_root_refrain}
-import refrain::project::manifest::{project_manifest_name, project_manifest_target, project_target_toolchain, read_project_manifest}
+import refrain::project::manifest::{project_manifest_target, project_target_toolchain, read_project_manifest}
 import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host, target_is_supported, toolchain_driver_is_supported}
 import refrain::target::kits::{target_kit_installed, target_kit_toolchain, target_platform_root}
 
@@ -38,6 +40,24 @@ import rich::BuildProgress
 
 extern fn encore_compiler_release_heap() -> ()
 extern fn encore_compiler_exec_parts(program: str, data: usize, len: usize) -> i32
+
+struct SemanticModuleJob {
+    index: usize
+    weight: usize
+    prepared: PreparedSemanticModule
+}
+
+struct SemanticDiagnosticChunk {
+    index: usize
+    diagnostics: Vec[FrontendDiagnostic]
+}
+
+struct ObjectCompileJob {
+    compiler: str
+    args: Vec[str]
+    fingerprint_path: str
+    fingerprint: str
+}
 
 /// Performs the `run_frontend_build` operation.
 pub fn run_frontend_build() -> u32 {
@@ -62,6 +82,12 @@ pub fn compile_project(root: Path) -> u32 {
 
 /// Performs the `compile_project_with_profile` operation.
 pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
+    let requested_pipeline_start = parse_positive_u64(requested_value("--_pipeline-start-ms", ""))
+    let pipeline_started_ms = if requested_pipeline_start == 0_u64 {
+        perf_counter_ms()
+    } else {
+        requested_pipeline_start
+    }
     let profile = normalize_profile(requested)
     if profile == "" {
         eprintln("Error: unknown optimization profile: " + requested)
@@ -114,15 +140,17 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     }
     let binary_path = profile_dir.join(target_executable_name(target, project_name))
     let fingerprint_path = profile_dir.join(".encore-fingerprint")
+    let ehir_fingerprint_path = profile_dir.join(".encore-ehir-fingerprint")
     let codegen_fingerprint_path = profile_dir.join(".encore-codegen-fingerprint")
     let llvm_fingerprint_path = profile_dir.join(".encore-llvm-fingerprint")
     let fingerprint = workspace_build_fingerprint(root, workspace, target, toolchain, profile, emit)
+    let ehir_fingerprint = workspace_ehir_fingerprint(root, workspace, target)
     let codegen_fingerprint = workspace_codegen_fingerprint(root, workspace, target, toolchain, profile, emit)
     if emit == "binary" && file_exists(native_path(binary_path.as_str())) &&
         file_exists(native_path(fingerprint_path.as_str())) &&
         read_file(native_path(fingerprint_path.as_str())) == fingerprint {
         workspace_release_modules(workspace)
-        progress.finish_build(profile, binary_path.as_str())
+        finish_pipeline_artifact(progress, profile, "Binary", binary_path.as_str(), pipeline_started_ms)
         ret 0_u32
     }
     remove_file(native_path(fingerprint_path.as_str()))
@@ -135,6 +163,9 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     let llvm_object = object_dir.join(project_name + object_suffix)
     let module_llvm_paths = read_nonempty_lines(llvm_modules_manifest_path(llvm_path))
     let modular_objects_cached = module_objects_exist(module_llvm_paths, object_suffix)
+    let ehir_cached = file_exists(native_path(ehir_fingerprint_path.as_str())) &&
+        read_file(native_path(ehir_fingerprint_path.as_str())) == ehir_fingerprint &&
+        file_exists(native_path(out_path.as_str()))
     let codegen_cached = file_exists(native_path(codegen_fingerprint_path.as_str())) &&
         read_file(native_path(codegen_fingerprint_path.as_str())) == codegen_fingerprint &&
         file_exists(native_path(out_path.as_str())) &&
@@ -152,32 +183,45 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         progress.start_stage("Codegen", project_name)
         progress.finish_stage("cached EHIR and LLVM IR")
     } else {
-        progress.start_stage("Check", "workspace")
-        if !run_workspace_semantic_checks(workspace, target, progress) {
-            progress.fail_stage("semantic checks failed")
-            ret 1_u32
-        }
-        progress.finish_stage(Debug::fmt(module_count) + " modules")
-        let translation_modules = workspace_translation_modules(workspace.modules, target)
-        workspace_release_modules(workspace)
+        if ehir_cached {
+            workspace_release_modules(workspace)
+            progress.start_stage("Lower", project_name)
+            progress.finish_stage("cached EHIR")
+        } else {
+            remove_file(native_path(ehir_fingerprint_path.as_str()))
+            progress.start_stage("Check", "workspace")
+            if !run_workspace_semantic_checks(workspace, target, progress) {
+                progress.fail_stage("semantic checks failed")
+                ret 1_u32
+            }
+            progress.finish_stage(Debug::fmt(module_count) + " modules")
+            let translation_modules = workspace_translation_modules(workspace.modules, target)
+            workspace_release_modules(workspace)
 
-        progress.start_stage("Lower", project_name)
-        progress.update(project_name, "EHIR", 1_usize, 1_usize)
-        if !write_ehir_artifact(translation_modules, target, project_name + "@main.enq", out_path) {
-            progress.fail_stage("failed to write translated EHIR")
-            ret 1_u32
+            progress.start_stage("Lower", project_name)
+            progress.update(project_name, "EHIR", 1_usize, 1_usize)
+            if !write_ehir_artifact(translation_modules, target, project_name + "@main.enq", out_path,
+                requested_jobs(),) {
+                progress.fail_stage("failed to write translated EHIR")
+                ret 1_u32
+            }
+            if write_file(native_path(ehir_fingerprint_path.as_str()), ehir_fingerprint) != 0_i32 {
+                progress.fail_stage("failed to write EHIR fingerprint")
+                ret 1_u32
+            }
+            progress.finish_stage("EHIR generated")
         }
-        progress.finish_stage("EHIR generated")
 
         if emit == "ehir" {
-            progress.finish_artifact(profile, "EHIR", out_path.as_str())
+            finish_pipeline_artifact(progress, profile, "EHIR", out_path.as_str(), pipeline_started_ms)
             ret 0_u32
         }
 
         progress.start_stage("Codegen", "LLVM IR")
         progress.update(project_name, "LLVM IR", 1_usize, 1_usize)
         unsafe { encore_compiler_release_heap() }
-        if !exec_llvm_codegen_worker(out_path, llvm_path, target, llvm_fingerprint_path, codegen_fingerprint) {
+        if !exec_llvm_codegen_worker(out_path, llvm_path, target, llvm_fingerprint_path, codegen_fingerprint,
+            pipeline_started_ms,) {
             progress.fail_stage("failed to write translated LLVM IR")
             ret 1_u32
         }
@@ -189,6 +233,8 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
                 match argv(arg_index) { Some(value) => { continuation.push(value) } None => {} }
                 arg_index = arg_index + 1_usize
             }
+            continuation.push("--_pipeline-start-ms")
+            continuation.push(Debug::fmt(pipeline_started_ms))
             if !exec_compiler(executable, continuation) {
                 progress.fail_stage("failed to resume build after LLVM codegen")
                 ret 1_u32
@@ -198,11 +244,11 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         ret 1_u32
     }
     if emit == "ehir" {
-        progress.finish_artifact(profile, "EHIR", out_path.as_str())
+        finish_pipeline_artifact(progress, profile, "EHIR", out_path.as_str(), pipeline_started_ms)
         ret 0_u32
     }
     if emit == "llvm-ir" {
-        progress.finish_artifact(profile, "LLVM IR", llvm_path.as_str())
+        finish_pipeline_artifact(progress, profile, "LLVM IR", llvm_path.as_str(), pipeline_started_ms)
         ret 0_u32
     }
 
@@ -236,6 +282,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     let modular_codegen = emit == "binary" && module_llvm_paths.len() > 0_usize
         && !(target.os == "windows" && target.environment == "gnu")
     let mut llvm_compile = Option[JoinHandle[i32]]::None
+    let mut llvm_compile_active = false
     if !codegen_cached && !modular_codegen {
         let mut llvm_args = compiler_args(profile, target, toolchain)
         llvm_args.push("-c")
@@ -244,6 +291,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         llvm_args.push(native_path(llvm_object.as_str()))
         llvm_compile = Option[JoinHandle[i32]]::Some(spawn compile_object_job(toolchain.compiler, llvm_args,
             native_path(codegen_fingerprint_path.as_str()), codegen_fingerprint))
+        llvm_compile_active = true
     }
     if emit == "object" {
         match llvm_compile {
@@ -256,7 +304,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             None => {}
         }
         progress.finish_stage("1 target object")
-        progress.finish_artifact(profile, "Object", llvm_object.as_str())
+        finish_pipeline_artifact(progress, profile, "Object", llvm_object.as_str(), pipeline_started_ms)
         ret 0_u32
     }
     let mut objects = Vec[str]::new()
@@ -294,7 +342,23 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         if !codegen_cached { compiled_llvm_count = 1_usize }
     }
     let mut compiled_native_count = 0_usize
-    let mut native_compiles = Vec[JoinHandle[i32]]::new()
+    // A single job budget governs both compiler processes and Encore workers.
+    // Native sources are batched instead of spawning one unbounded process per
+    // source. In the strict serial mode, finish the aggregate LLVM object first.
+    if requested_jobs() == 1_usize {
+        match llvm_compile {
+            Some(handle) => {
+                if handle.join() != 0_i32 {
+                    progress.fail_stage("LLVM IR assembly failed for target " + target.triple)
+                    ret 1_u32
+                }
+                llvm_compile = Option[JoinHandle[i32]]::None
+                llvm_compile_active = false
+            }
+            None => {}
+        }
+    }
+    let mut native_jobs = Vec[ObjectCompileJob]::new()
     let mut source_index = 0_usize
     while source_index < native_sources.len() {
         match native_sources.get(source_index) {
@@ -311,8 +375,12 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
                     native_args.push(native_path(source.as_str()))
                     native_args.push("-o")
                     native_args.push(native_path(object.as_str()))
-                    native_compiles.push(spawn compile_object_job(toolchain.compiler, native_args,
-                        native_path(object_fingerprint_path.as_str()), object_fingerprint))
+                    native_jobs.push(ObjectCompileJob{
+                        toolchain.compiler,
+                        native_args,
+                        native_path(object_fingerprint_path.as_str()),
+                        object_fingerprint
+                    })
                     compiled_native_count = compiled_native_count + 1_usize
                 }
                 objects.push(native_path(object.as_str()))
@@ -320,6 +388,18 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             Option[Path]::None => {}
         }
         source_index = source_index + 1_usize
+    }
+    let native_budget = if llvm_compile_active && requested_jobs() > 1_usize {
+        requested_jobs() - 1_usize
+    } else {
+        requested_jobs()
+    }
+    let native_worker_count = min_usize(native_budget, native_jobs.len())
+    let mut native_compiles = Vec[JoinHandle[i32]]::new()
+    let mut native_worker = 0_usize
+    while native_worker < native_worker_count {
+        native_compiles.push(spawn compile_object_batch(native_jobs, native_worker, native_worker_count))
+        native_worker += 1_usize
     }
     match llvm_compile {
         Some(handle) => {
@@ -364,8 +444,24 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         ret 1_u32
     }
     progress.finish_stage("native binary")
-    progress.finish_build(profile, binary_path.as_str())
+    finish_pipeline_artifact(progress, profile, "Binary", binary_path.as_str(), pipeline_started_ms)
     ret 0_u32
+}
+
+fn finish_pipeline_artifact(progress: mut BuildProgress, profile: str, kind: str, path: str,
+    pipeline_started_ms: u64,) -> () {
+    progress.suspend()
+    let elapsed = perf_counter_ms() - pipeline_started_ms
+    eprintln("    Finished `" + profile + "` profile in " + format_pipeline_duration(elapsed))
+    eprintln("      " + kind + " " + path)
+    ret ()
+}
+
+fn format_pipeline_duration(milliseconds: u64) -> str {
+    if milliseconds < 1000_u64 { ret Debug::fmt(milliseconds) + " ms" }
+    let seconds = milliseconds / 1000_u64
+    let tenths = (milliseconds % 1000_u64) / 100_u64
+    ret Debug::fmt(seconds) + "." + Debug::fmt(tenths) + "s"
 }
 
 fn workspace_build_fingerprint(root: Path, workspace: ProjectWorkspace, target: TargetSpec, toolchain: Toolchain, profile: str, emit: str) -> str {
@@ -381,6 +477,28 @@ fn workspace_build_fingerprint(root: Path, workspace: ProjectWorkspace, target: 
             value = fingerprint_native_file(value,
                 refrain.root.join("runtime." + feature + ".c").resolve(), 0_u32)
         }
+    }
+    ret Debug::fmt(value.hash())
+}
+
+fn workspace_ehir_fingerprint(root: Path, workspace: ProjectWorkspace, target: TargetSpec) -> str {
+    let mut value = "encore-ehir-cache-v1\ncompiler=encore-0.1.5\nfrontend=parallel-module-lowering-v1\n"
+        + target.triple
+    for module in workspace.modules {
+        value = fingerprint_mix(value, module.owner_name)
+        value = fingerprint_mix(value, module.module_id)
+        value = fingerprint_mix(value, module.module_path.as_str())
+        value = fingerprint_mix(value, module.source)
+        for feature in module.enabled_features { value = fingerprint_mix(value, feature) }
+        for import_name in module.resolved_imports { value = fingerprint_mix(value, import_name) }
+    }
+    let manifest_path = root.join("encore.toml")
+    if file_exists(native_path(manifest_path.as_str())) {
+        value = fingerprint_mix(value, read_file(native_path(manifest_path.as_str())))
+    }
+    let lock_path = root.join("encore.lock")
+    if file_exists(native_path(lock_path.as_str())) {
+        value = fingerprint_mix(value, read_file(native_path(lock_path.as_str())))
     }
     ret Debug::fmt(value.hash())
 }
@@ -481,8 +599,9 @@ fn fingerprint_mix(current: str, value: str) -> str {
     ret Debug::fmt((current + "\n" + value).hash())
 }
 
-fn write_ehir_artifact(modules: Vec[TranslationModule], target: TargetSpec, entry_module: str, path: Path) -> bool {
-    let text = translate_modules_to_ehir_bundle(modules, target, entry_module)
+fn write_ehir_artifact(modules: Vec[TranslationModule], target: TargetSpec, entry_module: str, path: Path,
+    jobs: usize,) -> bool {
+    let text = translate_modules_to_ehir_bundle_parallel(modules, target, entry_module, jobs)
     ret write_file(native_path(path.as_str()), text) == 0_i32
 }
 
@@ -490,6 +609,22 @@ fn compile_object_job(compiler: str, args: Vec[str], fingerprint_path: str, fing
     let code = run_args(compiler, args)
     if code != 0_i32 { ret code }
     if fingerprint_path != "" && write_file(fingerprint_path, fingerprint) != 0_i32 { ret 1_i32 }
+    ret 0_i32
+}
+
+fn compile_object_batch(jobs: Vec[ObjectCompileJob], worker_index: usize, worker_count: usize) -> i32 {
+    let mut index = worker_index
+    while index < jobs.len() {
+        match jobs.get(index) {
+            Some(job) => {
+                if compile_object_job(job.compiler, job.args, job.fingerprint_path, job.fingerprint) != 0_i32 {
+                    ret 1_i32
+                }
+            }
+            None => {}
+        }
+        index += worker_count
+    }
     ret 0_i32
 }
 
@@ -511,9 +646,22 @@ fn parse_positive_usize(value: str) -> usize {
     ret result
 }
 
+fn parse_positive_u64(value: str) -> u64 {
+    if value.len() == 0_usize { ret 0_u64 }
+    let mut result = 0_u64
+    let mut index = 0_usize
+    while index < value.len() {
+        let byte = value.byte_at(index)
+        if byte < 48_u8 || byte > 57_u8 { ret 0_u64 }
+        result = result * 10_u64 + (byte - 48_u8) as u64
+        index += 1_usize
+    }
+    ret result
+}
+
 fn requested_jobs() -> usize {
     let available = available_parallelism()
-    let fallback = min_usize(if available == 0_usize { 1_usize } else { available }, 8_usize)
+    let fallback = if available == 0_usize { 1_usize } else { available }
     let requested = parse_positive_usize(requested_value("--jobs", ""))
     if requested == 0_usize { ret fallback }
     if available == 0_usize { ret requested }
@@ -695,7 +843,7 @@ fn exec_compiler(executable: str, args: Vec[str]) -> bool {
 }
 
 fn exec_llvm_codegen_worker(ehir_path: Path, llvm_path: Path, target: TargetSpec,
-    fingerprint_path: Path, fingerprint: str) -> bool {
+    fingerprint_path: Path, fingerprint: str, pipeline_started_ms: u64,) -> bool {
     let executable = match argv(0_usize) { Some(value) => value None => "encore" }
     let mut args = Vec[str]::new()
     args.push("__codegen")
@@ -713,6 +861,8 @@ fn exec_llvm_codegen_worker(ehir_path: Path, llvm_path: Path, target: TargetSpec
             match argv(index) { Some(value) => { args.push(value) } None => {} }
             index = index + 1_usize
         }
+        args.push("--_pipeline-start-ms")
+        args.push(Debug::fmt(pipeline_started_ms))
     }
     ret exec_compiler(executable, args)
 }
@@ -1005,8 +1155,8 @@ fn normalize_profile(profile: str) -> str {
 }
 
 /// Performs the `compile_test_ast` operation.
-pub fn compile_test_ast(root: Path, ast: Vec[Statement], binary_name: str) -> u32 {
-    let ehir_text = translate_to_ehir(ast)
+pub fn compile_test_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str) -> u32 {
+    let target = host_target()
     let tests_dir = root.join("target").join("tests")
     if mkdir_all(native_path(tests_dir.as_str())) != 0_i32 { ret 1_u32 }
     let binary_dir = tests_dir.join("bin")
@@ -1014,26 +1164,64 @@ pub fn compile_test_ast(root: Path, ast: Vec[Statement], binary_name: str) -> u3
     let ehir_path = tests_dir.join(binary_name + ".ehir")
     let llvm_path = tests_dir.join(binary_name + ".ll")
     let binary_path = binary_dir.join(target_executable_name(host_target(), binary_name))
+    let test_fingerprint_path = Path::new(binary_path.as_str() + ".fingerprint")
+    let runtime_path = system_core_root(root).join("runtime.c").resolve()
+    let platform_runtime = target_platform_root(host_target()).join("runtime.c").resolve()
+    let mut test_fingerprint = "encore-test-binary-cache-v3\ncompiler=encore-0.1.5\n"
+        + target.triple + "\n" + binary_name
+    for module in workspace.modules {
+        test_fingerprint = fingerprint_mix(test_fingerprint, module.owner_name)
+        test_fingerprint = fingerprint_mix(test_fingerprint, module.module_id)
+        test_fingerprint = fingerprint_mix(test_fingerprint, module.module_path.as_str())
+        test_fingerprint = fingerprint_mix(test_fingerprint, module.source)
+        for feature in module.enabled_features { test_fingerprint = fingerprint_mix(test_fingerprint, feature) }
+        for import_name in module.resolved_imports { test_fingerprint = fingerprint_mix(test_fingerprint, import_name) }
+    }
+    test_fingerprint = fingerprint_native_file(test_fingerprint, runtime_path, 0_u32)
+    if target_kit_installed(host_target()) {
+        test_fingerprint = fingerprint_native_file(test_fingerprint, platform_runtime, 0_u32)
+    }
+    for refrain in workspace.refrains {
+        test_fingerprint = fingerprint_native_file(test_fingerprint, refrain.root.join("runtime.c").resolve(), 0_u32)
+        for feature in refrain.enabled_features {
+            test_fingerprint = fingerprint_native_file(test_fingerprint,
+                refrain.root.join("runtime." + feature + ".c").resolve(), 0_u32)
+        }
+    }
+    test_fingerprint = Debug::fmt(test_fingerprint.hash())
+    if file_exists(native_path(binary_path.as_str())) &&
+        file_exists(native_path(test_fingerprint_path.as_str())) &&
+        read_file(native_path(test_fingerprint_path.as_str())) == test_fingerprint {
+        ret 0_u32
+    }
+    remove_file(native_path(test_fingerprint_path.as_str()))
+    let translation_modules = workspace_translation_modules(workspace.modules, target)
+    let ehir_text = translate_ast_with_modules_to_ehir(ast, translation_modules, target)
     if write_file(native_path(ehir_path.as_str()), ehir_text) != 0_i32 { ret 1_u32 }
     let llvm_text = emit_ir(parse_module_text("encore_test", ehir_text))
     if write_file(native_path(llvm_path.as_str()), llvm_text) != 0_i32 { ret 1_u32 }
-    let runtime_path = system_core_root(root).join("runtime.c").resolve()
     let mut args = Vec[str]::new()
     args.push("-O0")
     args.push("-g")
     args.push("-Wno-override-module")
     args.push(native_path(llvm_path.as_str()))
     args.push(native_path(runtime_path.as_str()))
-    let platform_runtime = target_platform_root(host_target()).join("runtime.c").resolve()
     if target_kit_installed(host_target()) && file_exists(native_path(platform_runtime.as_str())) {
         args.push(native_path(platform_runtime.as_str()))
     }
-    let package_runtime = root.join("runtime.c").resolve()
-    if project_manifest_name(read_project_manifest(root)) != "platform"
-        && package_runtime.as_str() != runtime_path.as_str()
-        && package_runtime.as_str() != platform_runtime.as_str()
-        && file_exists(native_path(package_runtime.as_str())) {
-        args.push(native_path(package_runtime.as_str()))
+    for refrain in workspace.refrains {
+        let package_runtime = refrain.root.join("runtime.c").resolve()
+        if package_runtime.as_str() != runtime_path.as_str()
+            && package_runtime.as_str() != platform_runtime.as_str()
+            && file_exists(native_path(package_runtime.as_str())) {
+            args.push(native_path(package_runtime.as_str()))
+        }
+        for feature in refrain.enabled_features {
+            let feature_runtime = refrain.root.join("runtime." + feature + ".c").resolve()
+            if file_exists(native_path(feature_runtime.as_str())) {
+                args.push(native_path(feature_runtime.as_str()))
+            }
+        }
     }
     append_tls_link_args(args, host_target())
     args.push("-o")
@@ -1044,6 +1232,7 @@ pub fn compile_test_ast(root: Path, ast: Vec[Statement], binary_name: str) -> u3
         remove_file(native_path(llvm_path.as_str()))
     }
     if clang_code != 0_i32 { ret 1_u32 }
+    if write_file(native_path(test_fingerprint_path.as_str()), test_fingerprint) != 0_i32 { ret 1_u32 }
     ret 0_u32
 }
 
@@ -1072,6 +1261,9 @@ fn native_path(value: str) -> str {
 
 fn run_workspace_semantic_checks(workspace: mut ProjectWorkspace, target: TargetSpec, progress: mut BuildProgress) -> bool {
     let modules = workspace.modules
+    if requested_jobs() <= 1_usize || modules.len() <= 1_usize {
+        ret run_workspace_semantic_checks_serial(workspace, target, progress)
+    }
     let mut failed = false
     let mut index = 0_usize
     while index < modules.len() {
@@ -1085,7 +1277,64 @@ fn run_workspace_semantic_checks(workspace: mut ProjectWorkspace, target: Target
                     }
                     failed = true
                 }
-                let semantic_diagnostics = workspace.analysis.module_semantic_diagnostics_for_target(module.analysis_id.key(), target, module.enabled_features)
+            }
+            Option[WorkspaceModule]::None => {
+            }
+        }
+        index = index + 1_usize
+    }
+    let jobs = prepare_semantic_module_jobs(workspace, modules, target)
+    let worker_count = min_usize(requested_jobs(), jobs.len())
+    let mut pending = Vec[JoinHandle[Vec[SemanticDiagnosticChunk]]]::new()
+    let mut worker = 0_usize
+    while worker < worker_count {
+        pending.push(spawn check_semantic_module_batch(jobs, worker, worker_count))
+        worker += 1_usize
+    }
+    let mut chunks = Vec[SemanticDiagnosticChunk]::new()
+    for handle in pending {
+        chunks.extend(handle.join())
+    }
+    index = 0_usize
+    while index < modules.len() {
+        match modules.get(index) {
+            Some(module) => {
+                for chunk in chunks {
+                    if chunk.index == index && chunk.diagnostics.len() > 0_usize {
+                        progress.suspend()
+                        for diagnostic in chunk.diagnostics {
+                            eprintln(render_diagnostic(native_path(module.module_path.as_str()), module.source,
+                                    diagnostic,))
+                        }
+                        failed = true
+                    }
+                }
+            }
+            None => {}
+        }
+        index += 1_usize
+    }
+    ret !failed
+}
+
+fn run_workspace_semantic_checks_serial(workspace: mut ProjectWorkspace, target: TargetSpec,
+    progress: mut BuildProgress,) -> bool {
+    let modules = workspace.modules
+    let mut failed = false
+    let mut index = 0_usize
+    while index < modules.len() {
+        match modules.get(index) {
+            Option[WorkspaceModule]::Some(module) => {
+                progress.update(module.owner_name, module_display_name(module), index + 1_usize, modules.len())
+                if module.diagnostics.len() > 0_usize {
+                    progress.suspend()
+                    for diagnostic in module.diagnostics {
+                        eprintln(render_diagnostic(native_path(module.module_path.as_str()), module.source, diagnostic))
+                    }
+                    failed = true
+                }
+                let semantic_diagnostics = workspace.analysis.module_semantic_diagnostics_for_target(
+                    module.analysis_id.key(), target, module.enabled_features)
                 if semantic_diagnostics.len() > 0_usize {
                     progress.suspend()
                     for diagnostic in semantic_diagnostics {
@@ -1094,12 +1343,80 @@ fn run_workspace_semantic_checks(workspace: mut ProjectWorkspace, target: Target
                     failed = true
                 }
             }
-            Option[WorkspaceModule]::None => {
-            }
+            Option[WorkspaceModule]::None => {}
         }
-        index = index + 1_usize
+        index += 1_usize
     }
     ret !failed
+}
+
+fn prepare_semantic_module_jobs(workspace: mut ProjectWorkspace, modules: Vec[WorkspaceModule],
+    target: TargetSpec,) -> Vec[SemanticModuleJob] {
+    let mut jobs = Vec[SemanticModuleJob]::new()
+    let mut module_index = 0_usize
+    for module in modules {
+        jobs.push(SemanticModuleJob{
+            module_index,
+            module.source.len(),
+            workspace.analysis.prepare_module_semantic_check_for_target(
+                module.analysis_id.key(), target, module.enabled_features)
+        })
+        module_index += 1_usize
+    }
+    let mut index = 1_usize
+    while index < jobs.len() {
+        let mut position = index
+        while position > 0_usize {
+            let mut swap = false
+            match jobs.get(position) {
+                Some(right) => {
+                    match jobs.get(position - 1_usize) {
+                        Some(left) => {
+                            swap = right.weight > left.weight ||
+                                (right.weight == left.weight && right.index < left.index)
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+            if !swap { break }
+            match jobs.get(position) {
+                Some(right) => {
+                    match jobs.get(position - 1_usize) {
+                        Some(left) => {
+                            jobs.set(position - 1_usize, right)
+                            jobs.set(position, left)
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+            position -= 1_usize
+        }
+        index += 1_usize
+    }
+    ret jobs
+}
+
+fn check_semantic_module_batch(jobs: Vec[SemanticModuleJob], worker_index: usize, worker_count: usize)
+-> Vec[SemanticDiagnosticChunk] {
+    let mut out = Vec[SemanticDiagnosticChunk]::new()
+    let mut job_index = worker_index
+    while job_index < jobs.len() {
+        match jobs.get(job_index) {
+            Some(job) => {
+                out.push(SemanticDiagnosticChunk{
+                    job.index,
+                    check_prepared_semantic_module(job.prepared)
+                })
+            }
+            None => {}
+        }
+        job_index += worker_count
+    }
+    ret out
 }
 
 fn filtered_workspace_ast(modules: Vec[WorkspaceModule], target: TargetSpec) -> Vec[Statement] {
@@ -1120,10 +1437,12 @@ fn workspace_translation_modules(modules: Vec[WorkspaceModule], target: TargetSp
         out.push(TranslationModule{
             module.module_id,
             module.module_path.as_str(),
+            module.source,
             module.documentation,
             module.resolved_imports,
             filter_ast_for_target(module.ast, target, module.enabled_features),
-            module.enabled_features
+            module.enabled_features,
+            module.source.len()
         })
     }
     ret out

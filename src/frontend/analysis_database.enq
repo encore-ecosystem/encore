@@ -89,6 +89,29 @@ pub struct AnalysisSymbol {
     symbol: FrontendSymbol
 }
 
+/// Immutable, thread-safe input for checking one module outside the mutable
+/// analysis database.
+pub struct PreparedSemanticModule {
+    module_name: str
+    source_name: str
+    source: str
+    target: TargetSpec
+    features: Vec[str]
+    callables: Vec[SemanticCallable]
+    fields: Vec[SemanticField]
+    methods: Vec[SemanticMethod]
+    resolution_diagnostics: Vec[FrontendDiagnostic]
+}
+
+/// Checks one prepared module without reading or mutating an analysis database.
+pub fn check_prepared_semantic_module(prepared: PreparedSemanticModule) -> Vec[FrontendDiagnostic] {
+    let document = analyze_named_module(prepared.module_name, prepared.source_name, prepared.source)
+    let mut diagnostics = check_module_declarations(document.ast, prepared.target, prepared.features)
+    diagnostics.extend(prepared.resolution_diagnostics)
+    diagnostics.extend(check_module_bodies(document.ast, prepared.callables, prepared.fields, prepared.methods))
+    ret diagnostics
+}
+
 impl for ModuleId {
     /// Returns an identity that never names a registered module.
     pub fn invalid() -> Self { ret Self{0_u64, ""} }
@@ -770,6 +793,41 @@ impl for AnalysisDatabase {
         diagnostics.extend(self.module_resolution_diagnostics(module_name, document))
         diagnostics.extend(check_module_bodies(document.ast, callables, fields, methods))
         ret diagnostics
+    }
+
+    /// Freezes all workspace-dependent facts needed to check one module on a
+    /// worker thread. The returned value contains no AST graph handles.
+    pub fn prepare_module_semantic_check_for_target(self: mut Self, module_name: str, target: TargetSpec,
+        features: Vec[str],) -> PreparedSemanticModule {
+        let callables = self.visible_semantic_callables(module_name)
+        let fields = self.visible_semantic_fields(module_name)
+        let methods = self.visible_semantic_methods(module_name)
+        let document = match self.stored_full_document(module_name) {
+            Option[FrontendDocument]::Some(value) => value
+            Option[FrontendDocument]::None => {
+                self.document(module_name).unwrap_or(FrontendDocument::empty())
+            }
+        }
+        let mut source_name = ""
+        let mut source = ""
+        for entry in self.sources {
+            if entry.module_name == module_name {
+                source_name = entry.source_name
+                source = entry.source
+            }
+        }
+        let resolution_diagnostics = self.module_resolution_diagnostics(module_name, document)
+        ret PreparedSemanticModule{
+            module_name,
+            source_name,
+            source,
+            target,
+            features,
+            callables,
+            fields,
+            methods,
+            resolution_diagnostics
+        }
     }
 
     fn module_resolution_diagnostics(self: mut Self, module_name: str, document: FrontendDocument) -> Vec[FrontendDiagnostic] {

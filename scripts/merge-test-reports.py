@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate Encore test shards and merge their JSON reports into JSON/JUnit."""
+"""Validate an Encore test report against its plan and emit JSON/JUnit."""
 
 from __future__ import annotations
 
@@ -33,42 +33,19 @@ def main() -> int:
         raise ValueError("test plan contains duplicate IDs")
 
     records: list[dict[str, object]] = []
-    shard_keys: set[tuple[int, int]] = set()
-    expected_shard_count: int | None = None
+    if len(args.reports) != 1:
+        raise ValueError(f"expected one complete test report, got {len(args.reports)}")
     for path in args.reports:
         report = load_json(path)
         if not isinstance(report, dict) or report.get("schema") != 1:
             raise ValueError(f"{path}: unsupported report schema")
-        shard = report.get("shard")
         tests = report.get("tests")
-        if not isinstance(shard, dict) or not isinstance(tests, list):
-            raise ValueError(f"{path}: malformed shard report")
-        index = shard.get("index")
-        count = shard.get("count")
-        if not isinstance(index, int) or not isinstance(count, int) or not 1 <= index <= count:
-            raise ValueError(f"{path}: invalid shard identity")
-        if expected_shard_count is None:
-            expected_shard_count = count
-        elif expected_shard_count != count:
-            raise ValueError("reports disagree on shard count")
-        key = (index, count)
-        if key in shard_keys:
-            raise ValueError(f"duplicate shard report {index}/{count}")
-        shard_keys.add(key)
+        if not isinstance(tests, list):
+            raise ValueError(f"{path}: malformed test report")
         for record in tests:
             if not isinstance(record, dict):
                 raise ValueError(f"{path}: malformed test record")
             records.append(record)
-
-    if expected_shard_count is None:
-        raise ValueError("no shard reports")
-    expected_shards = {
-        (index, expected_shard_count)
-        for index in range(1, expected_shard_count + 1)
-    }
-    if shard_keys != expected_shards:
-        missing = sorted(expected_shards - shard_keys)
-        raise ValueError(f"missing shard reports: {missing}")
 
     observed_ids = [record.get("id") for record in records]
     if not all(isinstance(item, str) for item in observed_ids):
@@ -132,7 +109,7 @@ def main() -> int:
     if failures:
         print(f"{failures} test(s) failed", file=sys.stderr)
         return 1
-    print(f"validated {len(records)} tests across {expected_shard_count} shards")
+    print(f"validated {len(records)} tests")
     return 0
 
 

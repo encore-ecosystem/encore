@@ -25,8 +25,8 @@ and Windows retains the native MSVC lineage.
 
 Each target executes its downloaded stage1 natively to build stage2, then uses
 stage2 to build stage3. Stage2 and stage3 must be byte-identical. The verified
-stage3 compiler is then tested in four deterministic shards. Aggregation fails
-on missing, duplicate, or failed tests.
+stage3 compiler then runs the complete test plan through its bounded parallel
+worker pool. Aggregation fails on missing, duplicate, or failed tests.
 
 The Linux producer creates a relocatable Ubuntu AArch64 sysroot and uses the
 pinned LLVM-MinGW clang/lld distribution as its cross driver. Candidate

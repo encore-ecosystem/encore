@@ -140,15 +140,16 @@ Test functions should:
 The test harness wraps the function in a generated executable `main`, so the
 rest of the program can stay unchanged.
 
-CI and large projects can list and deterministically shard the same test set:
+CI and large projects can list the test set and let the bounded worker pool run
+it in parallel:
 
 ```sh
 encore test --list --format json
-encore test --shard 1/4 --report target/test-results.json
+encore test --jobs 8 --report target/test-results.json
 ```
 
-Filtering happens before sharding. A test's stable fully qualified ID always
-maps to exactly one shard for a given shard count.
+Test results are reported in stable discovery order even though execution is
+parallel.
 
 Standalone negative tests can declare an expected compiler diagnostic in their
 first kilobyte with `// @expect.compile_error=message`. The test passes only

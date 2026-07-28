@@ -131,8 +131,11 @@ esac
 [ "$(printf '%s' "$expected" | wc -c | tr -d ' ')" = 64 ] || { echo "Invalid release checksum" >&2; exit 1; }
 if command -v sha256sum >/dev/null 2>&1; then
     actual=$(sha256sum "$download_dir/$asset" | awk '{print $1}')
-else
+elif command -v shasum >/dev/null 2>&1; then
     actual=$(shasum -a 256 "$download_dir/$asset" | awk '{print $1}')
+else
+    echo "Install sha256sum or shasum to verify the release" >&2
+    exit 1
 fi
 if [ "$actual" != "$expected" ]; then
     echo "Checksum verification failed" >&2
