@@ -119,24 +119,92 @@ When resolver learns a new type fact for a variable, it:
 This means variable knowledge only becomes more precise over time. Resolver does
 not rely on toggling between alternative states.
 
-## Hidden Reference Representation
+## Value And Node Representations
 
-Encore surface types and EHIR runtime representation are not identical.
-Aggregate values behave as reference types in the language, while EHIR lowers
-them through hidden `Box`-based graph nodes. Resolver accounts for that during
-compatibility checks and call argument binding.
+The resolver preserves the representation of every type. For payload `T`, the
+forms `T`, `T<S>`, `T<H>`, `T&` and `T*` are different types:
 
-This is why type resolution cannot be reduced to plain string equality between
-surface names. Field access, calls and payload extraction may propagate either a
-surface aggregate type or its hidden boxed form depending on the instruction.
+- `T` is an inline value;
+- `<S>`, `<H>` and `&` are owning node handles;
+- `*` is an unsafe raw address.
+
+`T<S>` and `T<H>` can satisfy a `T&` parameter without changing the one-word
+runtime ABI. The reverse conversion requires placement proof. `T*` never
+satisfies `T&`.
+
+Mutability is not represented by a pointer kind. Encore initially lowers local
+bindings to local-cell operations. A dedicated pass resolves mutable aliases
+and promotes those cells to SSA values and phi nodes.
+
+## Canonical Function Pipeline
+
+EHIR functions begin as graph-transforming state machines with one entry and
+possibly several normal returns. Compilation uses this fixed pass order:
+
+1. resolve declarations, generics and all instruction operand types;
+2. monomorphize concrete functions and lifecycle descriptions;
+3. convert local cells and mutable aliases to SSA;
+4. normalize every normal return into one typed exit phi and one `ret`;
+5. lower coroutine suspension, then normalize generated functions again;
+6. infer `T&` escape effects and validate stack-node regions;
+7. compute CFG liveness and lower implicit ownership to explicit operations;
+8. synthesize structural value helpers and node descriptors;
+9. validate canonical ownership, CFG and types;
+10. lower the validated module to a backend dialect.
+
+The unique exit is represented with a phi value rather than an alloca. This
+keeps mutable source constructs out of the backend and prevents loop-lifetime
+temporaries from accumulating in one generated stack frame.
+
+`unreachable` is an abnormal terminal assertion and is not counted as another
+normal exit.
+
+## Ownership Lowering
+
+Encore does not insert ad-hoc retain/drop sequences while translating syntax.
+The EHIR ownership pass operates on the complete typed CFG and handles:
+
+- inline structural copy and move;
+- node-handle acquire, transfer and last use;
+- arguments and return values;
+- phi edges, matches, loops and early returns;
+- field reads and transactional replacements;
+- initialized container elements.
+
+A source value may be moved instead of retained when liveness proves its owner
+ends at that transition. The pass emits `cfree` for the last use of a node
+handle and structural `drop` for inline values. The LLVM backend does not infer
+ownership from names, library types or source constructs.
+
+## Escape And Effect Analysis
+
+Each `T<S>` carries its allocating frame region. The analysis rejects any path
+which can retain that node after the frame exits, including returns, heap or
+global stores, thread transfer and coroutine suspension.
+
+A body-defined `T&` parameter receives an inferred escape summary. An extern
+parameter needs an explicit `noescape` contract before a stack node can be
+passed. Returning an alias and storing a handle are distinct effects and are
+part of the function signature used by incremental semantic queries.
+
+## EHIR Validation Boundary
+
+The backend accepts only canonical EHIR. Validation proves:
+
+- one entry and one normal exit;
+- exact field, call and phi types;
+- no use after ownership transfer or drop;
+- no owner leaked from a normal path;
+- no invalid stack escape;
+- no safe raw-memory copy of an owning value;
+- lifecycle metadata for every concrete node payload.
+
+Diagnostics retain their original Encore `SourceSpan`; parsing a serialized
+EHIR cache must preserve the same location metadata.
 
 ## Why This Matters
 
-Later compiler stages assume that EHIR is fully typed:
-
-- postprocessing requires resolved call signatures and field types;
-- retain/drop passes need to distinguish value types from reference types;
-- backend validation expects concrete instruction operand types.
-
-The event-driven STIV resolver exists to make those guarantees without
-repeatedly re-running whole-function type inference.
+The event-driven STIV resolver establishes types, but type resolution alone is
+not memory safety. SSA, region validation, ownership lowering and ERN runtime
+semantics are separate required proofs. A source program passing `encore check`
+cannot bypass any of them when it is built.

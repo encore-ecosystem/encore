@@ -19,12 +19,12 @@ import refrain::frontend::Parser
 import refrain::frontend::Statement
 import refrain::frontend::Token
 import refrain::frontend::{AnalysisDatabase, ModuleId, FrontendDocument, FrontendDiagnostic, Documentation}
-import refrain::target::{TargetSpec, parse_target}
+import refrain::target::{TargetSpec, parse_target, target_is_host}
 import refrain::target::kits::{target_kit_installed, target_platform_root}
-import std::os::{argc, argv}
+import argparse::{process_arg_count, process_arg}
 
 import mod::manifest::ProjectManifest
-import mod::manifest::{project_manifest_feature_dependencies, project_manifest_resolve_features, read_project_manifest}
+import mod::manifest::{project_manifest_feature_dependencies, project_manifest_name, project_manifest_resolve_features, read_project_manifest}
 import mod::registry::{dependency_base_reference, dependency_requested_features, registry_package_checksum, resolve_index_dependency, valid_dependency_name}
 
 extern fn encore_strset_new() -> usize
@@ -281,6 +281,20 @@ fn build_modules_for_refrain(workspace: mut ProjectWorkspace, refrain: Workspace
     let entrypoint = entrypoint_of(refrain)
     let visited_paths = unsafe { encore_strset_new() }
     let mut result = Vec[WorkspaceModule]::new()
+    // Every source program sees the core prelude, including library and unit
+    // test workspaces whose own entrypoint does not spell an import for each
+    // intrinsic method.  Entry workspaces already did this explicitly; keep
+    // the shared workspace builder consistent so `str.char_len`, operators,
+    // Option and the other prelude declarations are also emitted by test
+    // workers instead of merely being accepted as compiler built-ins.
+    if refrain.name != "core" {
+        match find_refrain_by_name(workspace, "core") {
+            Some(core_refrain) => {
+                visit_module(workspace, core_refrain, entrypoint_of(core_refrain), visited_paths, result)
+            }
+            None => {}
+        }
+    }
     visit_module(workspace, refrain, entrypoint, visited_paths, result)
     unsafe {
         encore_strset_free(visited_paths)
@@ -379,6 +393,9 @@ fn resolved_module_import_ids(workspace: ProjectWorkspace, owner: WorkspaceRefra
     }
     ret out
 }
+
+fn argc() -> usize { ret process_arg_count() }
+fn argv(index: usize) -> Option[str] { ret process_arg(index) }
 
 fn visit_imports(
     workspace: mut ProjectWorkspace,
@@ -691,7 +708,10 @@ struct WorkspaceDependency {
 fn resolve_dependency_root(dep_ref: str, base_root: Path, distribution_root: Path, source_key: str, lock_root: Path) -> WorkspaceDependency {
     let base_ref = dependency_base_reference(dep_ref)
     if base_ref == "sys@core" {
-        let root = system_core_root(base_root).resolve()
+        // Anchor the implicit core package at the workspace/lock root. A
+        // target-platform manifest also receives the implicit dependency, but
+        // its kit directory is not the distribution that owns core.
+        let root = system_core_root(lock_root).resolve()
         ret WorkspaceDependency{root, root, "sys@core"}
     }
     if base_ref == "sys@platform" {
@@ -700,10 +720,7 @@ fn resolve_dependency_root(dep_ref: str, base_root: Path, distribution_root: Pat
             workspace_error("sys@platform is internal and may only be imported by std")
         }
         let target = selected_workspace_target()
-        if !target_kit_installed(target) {
-            workspace_error("Target kit for " + target.triple + " is not installed; run `encore target install " + target.triple + "`")
-        }
-        let root = target_platform_root(target).resolve()
+        let root = system_platform_root(lock_root, target).resolve()
         ret WorkspaceDependency{root, root, "sys@platform:" + target.triple}
     }
 
@@ -788,16 +805,14 @@ fn workspace_shell_quote(value: str) -> str {
 pub fn system_core_root(base_root: Path) -> Path {
     let mut cursor = base_root.resolve()
     loop {
-        let candidate = cursor.join("index").join("core").join("encore.toml")
-        if file_exists(native_path(candidate.as_str())) {
-            match candidate.parent() {
-                Option[Path]::Some(core_dir) => {
-                    ret core_dir
-                }
-                Option[Path]::None => {
-                }
-            }
-        }
+        // Installed distribution, direct encore-index checkout, and the
+        // compiler repository beside an encore-index checkout respectively.
+        let distribution = cursor.join("index").join("core")
+        if core_package_exists(distribution) { ret distribution }
+        let index_checkout = cursor.join("packages").join("core")
+        if core_package_exists(index_checkout) { ret index_checkout }
+        let compiler_checkout = cursor.join("encore-index").join("packages").join("core")
+        if core_package_exists(compiler_checkout) { ret compiler_checkout }
 
         match cursor.parent() {
             Option[Path]::Some(parent) => {
@@ -810,12 +825,80 @@ pub fn system_core_root(base_root: Path) -> Path {
     }
 
     let configured = Path::new(core_dir()).resolve()
-    if file_exists(native_path(configured.join("encore.toml").as_str())) {
-        ret configured
+    if core_package_exists(configured) { ret configured }
+    // A project-local compiler links the platform runtime from source, so the
+    // runtime's __FILE__ fallback points at packages/platform rather than the
+    // installed distribution. Resolve core as its sibling in that layout.
+    match configured.parent() {
+        Some(parent) => {
+            let sibling = parent.join("core")
+            if core_package_exists(sibling) { ret sibling }
+        }
+        None => {}
+    }
+    // Target-kit runtimes live under <encore-home>/targets/.../platform while
+    // the language core package lives under <encore-home>/lib/encore/index.
+    // Walk from the configured runtime path so custom Encore homes work too.
+    let mut installed_cursor = configured
+    loop {
+        let installed = installed_cursor.join("lib").join("encore").join("index").join("core")
+        if core_package_exists(installed) { ret installed }
+        match installed_cursor.parent() {
+            Some(parent) => { installed_cursor = parent }
+            None => { break }
+        }
     }
 
     workspace_error("Unable to resolve sys@core starting from " + base_root.as_str())
     ret base_root
+}
+
+/// Resolves the platform refrain for `target` without requiring a separately
+/// installed target kit for the native host. Release distributions already
+/// ship their native platform package beside core; source checkouts keep it in
+/// encore-index/packages. Cross targets continue to require a target kit.
+pub fn system_platform_root(base_root: Path, target: TargetSpec) -> Path {
+    if target_is_host(target) {
+        let mut cursor = base_root.resolve()
+        loop {
+            let distribution = cursor.join("index").join("platform")
+            if platform_package_exists(distribution) { ret distribution }
+            let index_checkout = cursor.join("packages").join("platform")
+            if platform_package_exists(index_checkout) { ret index_checkout }
+            let compiler_checkout = cursor.join("encore-index").join("packages").join("platform")
+            if platform_package_exists(compiler_checkout) { ret compiler_checkout }
+
+            match cursor.parent() {
+                Some(parent) => { cursor = parent }
+                None => { break }
+            }
+        }
+
+        let configured_core = Path::new(core_dir()).resolve()
+        match configured_core.parent() {
+            Some(parent) => {
+                let installed = parent.join("platform")
+                if platform_package_exists(installed) { ret installed }
+            }
+            None => {}
+        }
+    }
+
+    if target_kit_installed(target) {
+        ret target_platform_root(target).resolve()
+    }
+    workspace_error("Target kit for " + target.triple + " is not installed; run `encore target install " + target.triple + "`")
+    ret base_root
+}
+
+fn core_package_exists(root: Path) -> bool {
+    if !file_exists(native_path(root.join("encore.toml").as_str())) { ret false }
+    ret project_manifest_name(read_project_manifest(root)) == "core"
+}
+
+fn platform_package_exists(root: Path) -> bool {
+    if !file_exists(native_path(root.join("encore.toml").as_str())) { ret false }
+    ret project_manifest_name(read_project_manifest(root)) == "platform"
 }
 
 fn find_refrain_by_root(workspace: ProjectWorkspace, root: Path) -> Option[WorkspaceRefrain] {

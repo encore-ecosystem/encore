@@ -1,7 +1,20 @@
-# Beta Notes
+# Release Notes
 
-The `0.1.x` beta is intended for testing and feedback, not long-term API
-stability.
+## Encore 0.2.0
+
+- Compile-time decorators support arguments, stacking, functions, methods,
+  synchronous code, and asynchronous code. Decorator calls lower directly to
+  hidden implementations without runtime callable dispatch.
+- Immutable `static` declarations enable named decorator-manager syntax such
+  as `@RENDER_PROFILE.profile("draw_frame")`.
+- The `profile` package provides process-wide aggregated nanosecond timing.
+- The LLVM backend emits shared generic, ownership, trait-dispatch, and graph
+  support once per compilation bundle instead of duplicating it in every code
+  generation unit.
+- Large generated state machines avoid the quadratic source mem2reg path while
+  retaining entry-block stack-allocation hoisting.
+- Clean self-host compilation is substantially faster and uses much less peak
+  memory than 0.1.5.
 
 ## Validated Surface
 
@@ -23,8 +36,8 @@ The current release gate validates:
   runtime configuration but do not receive production compiler archives.
 - The v1 package index selects the last non-yanked release and does not yet
   support manifest version constraints or package search.
-- `async`/`await`, MLIR integration, structural inheritance and long-term
-  backend dialect design are outside this release gate.
+- MLIR integration, structural inheritance and long-term backend dialect
+  design are outside this release gate.
 - Full-repository static type checking still has known baseline diagnostics
   outside the release-critical build/test command paths.
 

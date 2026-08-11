@@ -77,32 +77,12 @@ compile-args = ["-mthumb"]
 link-args = ["-nostdlib", "-Wl,--gc-sections"]
 ```
 
-For one-off toolchain experiments, append arguments without changing the
-manifest:
-
-```sh
-encore build --target aarch64-unknown-linux-gnu \
-  --compile-arg -fno-omit-frame-pointer \
-  --link-arg -fuse-ld=lld
-```
-
-Both switches are repeatable. They append to the selected project or
-target-kit defaults; explicit compiler, linker, sysroot, and runtime switches
-continue to take precedence over the kit.
-
-Command-line options have the highest priority:
-
-```sh
-encore build \
-  --target aarch64-unknown-linux-gnu \
-  --linker clang \
-  --sysroot /opt/aarch64-sysroot \
-  --target-cpu cortex-a72
-```
-
-The environment fallbacks are `ENCORE_TOOLCHAIN_DRIVER`, `ENCORE_CC`,
-`ENCORE_LINKER`, `ENCORE_AR`, `ENCORE_SYSROOT`, `ENCORE_TARGET_CPU`, and
-`ENCORE_TARGET_FEATURES`. The current production driver flavor is `clang`;
+Toolchain experiments are configured in the manifest or target kit rather
+than through ad-hoc compiler arguments.  This keeps the command line small,
+reproducible, and independent of a particular native driver.  The environment
+fallbacks are `ENCORE_TOOLCHAIN_DRIVER`, `ENCORE_CC`, `ENCORE_LINKER`,
+`ENCORE_AR`, `ENCORE_SYSROOT`, `ENCORE_TARGET_CPU`, and
+`ENCORE_TARGET_FEATURES`.  The current production driver flavor is `clang`;
 declaring it explicitly keeps target configuration forward-compatible with
 future GCC, MSVC, and vendor driver adapters without interpreting their flags
 as Clang flags.

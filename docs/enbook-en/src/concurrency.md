@@ -16,18 +16,23 @@ fn main() -> u32 {
 }
 ```
 
-`spawn function(args...)` moves an owned copy of every argument into a native
-thread and returns `JoinHandle[T]`. Calling `join()` blocks until that thread
-finishes and moves its result back to the caller. A handle can be joined only
-once. Dropping an unjoined handle performs a structured join and drops the
+`spawn function(args...)` moves an owned inline value for every argument into a
+native thread and returns `JoinHandle[T]`. Calling `join()` blocks until that
+thread finishes and moves its result back to the caller. A handle can be joined
+only once. Dropping an unjoined handle performs a structured join and drops the
 result, so a thread cannot outlive the scope that owns its handle.
 
 Values crossing a thread boundary must be structurally safe to send. Numeric
-values, booleans, strings, tuples, arrays, vectors, enums, and value structs
-are accepted when all their elements are safe. Mutable references, raw
-pointers, heap/stack pointers, dynamic trait objects, and thread handles are
-rejected. Reference counts used by strings and copy-on-write aggregates are
-atomic across threads.
+values, booleans, strings, tuples, arrays, enums and inline structs are accepted
+when every nested value is safe. Public node handles `T<S>`, `T<H>` and `T&`,
+raw pointers, mutable-local aliases, dynamic trait objects and thread handles
+are rejected. Mutable collections are graph nodes and therefore do not cross a
+`spawn` boundary; an application sends an explicit immutable snapshot instead.
+
+Runtime-internal immutable graph storage, including string storage, can be
+shared between threads. Retain, release, graph-edge mutation and synchronous
+ERN classification use the common graph synchronization protocol. This does
+not make user-visible mutable node payloads `Send`.
 
 Use `core::thread::available_parallelism()` to inspect the number of logical
 processors available to the process. Native threads are intended for CPU

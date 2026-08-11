@@ -20,7 +20,7 @@ SHA-256 checksum and replaces an existing installation transactionally.
 # Install an exact release.
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/encore-ecosystem/encore/trunk/install.sh |
-  sh -s -- --version 0.1.5
+  sh -s -- --version 0.2.0
 
 ~/.encore/bin/encore --version
 

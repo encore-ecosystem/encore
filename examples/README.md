@@ -25,6 +25,9 @@ Concurrency examples:
 - `multithreading` divides CPU work between native threads with `spawn` and
   collects typed results with `JoinHandle::join`.
 
+`decorator_profile` demonstrates a parameterized compile-time decorator with
+the exact `@RENDER_PROFILE.profile("draw_frame")` manager syntax.
+
 `bare_metal` is a freestanding Cortex-M project. It demonstrates a custom
 startup source, memory layout, target flags, and linked firmware ELF without
 requiring board-specific behavior in the compiler.

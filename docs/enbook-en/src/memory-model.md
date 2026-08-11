@@ -1,494 +1,372 @@
 # Memory Model
 
-Encore uses a graph-based memory model built on top of EHIR, the Encore High
-Intermediate Representation. The goal is to give users the ergonomics of
-reference-based languages while keeping deterministic cleanup and avoiding a
-tracing garbage collector.
+EHIR is a state machine over graph memory. Encore is a source-language layer
+which lowers imports, loops, pattern matching and other compound constructs to
+that machine; it does not define a second ownership model.
 
-The short version is:
+The model has two kinds of runtime data:
 
-- primitive values are copied directly;
-- every aggregate value is a reference to one heap resource node;
-- the compiler retains references when they are shared;
-- the compiler drops references when they leave scope;
-- when the last reference to a node disappears, EHIR performs cascading
-  deallocation for the part of the object graph that is no longer reachable.
+- an **inline value** contains its complete payload;
+- a **node handle** is an owning edge to an object node.
 
-Users normally do not write `Box` explicitly. The compiler uses it internally to
-represent aggregate values as graph nodes.
+Every EHIR node handle is owning by definition. Ownership is not an optional
+qualifier and there is no borrowed form of an EHIR node handle.
 
-## Two Kinds Of Types
+## Values, nodes and type forms
 
-Encore separates types into `ValueType` and `ReferenceType`.
+For an aggregate payload type `T`, EHIR and Encore use these forms:
 
-### ValueType
+| Form | Meaning |
+| --- | --- |
+| `T` | the complete aggregate payload stored inline |
+| `T<S>` | an owning handle to a node placed in the current stack frame |
+| `T<H>` | an owning handle to a heap node |
+| `T&` | an owning handle whose stack/heap placement is erased |
+| `T*` | a raw machine address, available only through `unsafe` |
 
-Value types are copied directly and do not own graph resources.
+`T<S>`, `T<H>` and `T&` have the same one-word handle ABI. `T&` means "either
+safe node placement"; it does not mean borrow, weak reference or raw pointer.
+A `T&` value can be produced from `T<S>` or `T<H>`, but it cannot be used to
+recover a more specific placement without proof.
 
-Current value types are the primitive types:
-
-- `bool`
-- integer types such as `u8`, `u32`, `i32`, `usize`
-- floating-point types such as `f32`, `f64`
-- unit `()`
-
-Assigning, passing or returning a primitive copies the bits:
-
-```enq
-let a = 10_u32
-let b = a
-```
-
-After this code, `a` and `b` are independent `u32` values.
-
-### ReferenceType
-
-Reference types are aggregate values. They are represented as references to heap
-nodes.
-
-Reference types include:
-
-- structs;
-- enums;
-- tuples;
-- `str`;
-- `Vec[T]`;
-- dictionaries and other containers;
-- file, socket, window and other resource handles;
-- user-defined aggregate types.
-
-For example:
-
-```enq
-struct Path {
-    root: str
-    parts: Vec[str]
-}
-```
-
-`Path`, `str` and `Vec[str]` are all reference types.
-
-## Hidden Box Representation
-
-Every reference type is lowered as if it were stored inside a smart pointer:
-
-```text
-Path    -> Box[PathObject]
-str     -> Box[StrObject]
-Vec[T]  -> Box[VecObject[T]]
-```
-
-This `Box` is normally hidden from the user. It exists so EHIR can represent
-memory as a graph:
-
-```text
-Path node
-  root  -> Str node
-  parts -> Vec node
-             [0] -> Str node
-             [1] -> Str node
-```
-
-The box/node stores the data needed by the memory model, including reference
-counting metadata and the edges to other nodes.
-
-From the user's point of view, the code still uses ordinary types:
-
-```enq
-let path = Path::new("src")
-println(path.as_str())
-```
-
-The hidden representation is a compiler and EHIR detail.
-
-## Sharing Is Retain
-
-Reference values have reference semantics. When a reference value is assigned,
-passed, returned or read from a field, the compiler retains the underlying node.
-
-Assignment retains:
-
-```enq
-let a = Path::new("src")
-let b = a
-```
-
-After this code, `a` and `b` refer to the same `Path` node. The node has two
-live references.
-
-Function calls retain arguments:
-
-```enq
-fn print_path(path: Path) -> () {
-    println(path.as_str())
-}
-
-let p = Path::new("src")
-print_path(p)
-```
-
-The call receives a retained reference. When `print_path` returns, its local
-reference is dropped. The caller's `p` remains valid.
-
-Field access retains reference fields:
-
-```enq
-let root = path.root
-```
-
-`root` is another reference to the same string node stored in `path.root`.
-
-Loop variables retain elements:
-
-```enq
-for part in path.parts {
-    println(part)
-}
-```
-
-Each `part` is retained for the duration of the iteration and dropped at the end
-of that iteration.
-
-## Mutation Uses Shared Objects
-
-Because aggregates are reference types, mutation changes the referenced object.
-
-```enq
-let mut values = Vec[u32]::new()
-values.push(1_u32)
-values.push(2_u32)
-```
-
-`Vec.push` mutates the vector node. It does not need to return a new vector for
-ordinary mutation.
-
-Sharing is visible:
-
-```enq
-let mut a = Vec[u32]::new()
-let b = a
-b.push(1_u32)
-
-// a and b refer to the same vector node.
-// a.len() is now 1.
-```
-
-This is intentional. Encore aggregate assignment behaves like sharing a Python
-object or an ARC-managed object, not like copying a Rust `Vec`.
-
-If code needs an independent aggregate, it must use an explicit clone-like API:
-
-```enq
-let b = a.clone()
-```
-
-The exact cloning API is library-defined.
-
-## Dropping References
-
-When a reference leaves scope, the compiler emits a drop operation for that
-reference. Dropping a reference decreases the node's reference count.
-
-```enq
-fn make_path() -> Path {
-    let path = Path::new("src")
-    ret path
-}
-```
-
-The returned value is transferred to the caller as a live reference. Local
-references that are not returned are dropped before the function exits.
-
-Explicit early release is also possible at the EHIR level through `drop`. The
-Encore surface should only expose early release where the compiler can prove
-that the value is not used afterward.
-
-After a value has been dropped, using it again is a language error.
-
-## Field Replacement
-
-Replacing a reference field must preserve graph correctness.
-
-Conceptually:
-
-```enq
-object.field = new_value
-```
-
-lowers to:
-
-1. retain `new_value` for the field;
-2. load the old field value;
-3. store the new field value;
-4. drop the old field value.
-
-This order ensures that assigning the same value back into a field is safe and
-that the old object is released exactly once.
-
-Example:
+Primitive values and inline aggregates are values, not object nodes. A value
+may contain node handles. Each such handle is still one owning root or edge in
+the graph.
 
 ```enq
 struct Target {
-    id: usize
+    value: u32
 }
 
-struct Holder {
-    target: Target
+let payload = Target{1_u32}       // Target, stored inline
+let local = Target<S>{2_u32}      // stack node
+let shared = Target<H>{3_u32}     // heap node
+```
+
+Node placement is explicit. A compiler must not silently turn a rejected
+`T<S>` construction into `T<H>`.
+
+### Inline copying
+
+Copying an inline aggregate creates an independent payload. Primitive fields
+are copied, nested inline fields are copied recursively and every nested node
+handle gains one owning reference.
+
+```enq
+struct Pair {
+    left: u32
+    target: Target<H>
 }
 
-let old_target = Target{1_usize}
-let holder = Holder{old_target}
-let new_target = Target{2_usize}
-
-holder.target = new_target
-```
-
-The old target is dropped from the field. If `old_target` is still live
-elsewhere, the node remains allocated. If the field was the last reference, the
-old target becomes eligible for cascading deallocation.
-
-## Cascading Free And ERN
-
-EHIR deallocates memory using graph reachability.
-
-When the last reference to a node disappears, EHIR runs `cfree` for that node.
-`cfree` does not blindly free every descendant. It frees only the nodes that are
-exclusively reachable from the dropped node.
-
-This set is called the ERN set: Exclusively Reachable Nodes.
-
-Informally:
-
-```text
-ERN(v) = nodes reachable from v
-         minus nodes that are also reachable from still-live roots
-```
-
-If a node is still reachable through another live object, it is not freed.
-
-Example:
-
-```enq
-let target = Target{1_usize}
-let a = Holder{target}
-let b = target
-
-drop a
-```
-
-Dropping `a` releases its edge to `target`, but `b` still points to the same
-target node. Therefore the target node remains alive.
-
-If `b` is later dropped too, the target node can be freed.
-
-## Containers Are Not Special
-
-Containers follow the same reference-type rule as every other aggregate.
-
-```enq
-let item = Node{10_usize}
-let mut values = Vec[Node]::new()
-values.push(item)
-```
-
-`Vec[Node]` is a reference node. `item` is also a reference node. Inserting the
-item into the vector retains it for the vector storage.
-
-When the vector is freed, it drops the references to its elements. If an element
-is still referenced by another variable, that element stays alive.
-
-```enq
-let item = Node{10_usize}
-let mut values = Vec[Node]::new()
-values.push(item)
-
-drop values
-
-// item is still valid here because it has its own reference.
-println(item.value)
-```
-
-There is no separate ownership model for "containers with heap elements". They
-are just graph nodes with edges to other graph nodes.
-
-## Strings
-
-`str` is a reference type.
-
-String literals and string operations produce string nodes:
-
-```enq
-let a = "he"
-let b = a + "llo"
-```
-
-`a` points to the `"he"` string node. The concatenation creates a new `"hello"`
-string node for `b`. When `a` is no longer used, its reference is dropped. When
-`b` is no longer used, the `"hello"` node is dropped.
-
-Encore does not need a separate user-facing `String` type for ordinary owned
-text. The `str` type is the standard text resource.
-
-## Enums And Tuples
-
-Enums and tuples are reference types.
-
-```enq
-enum Option[T] {
-    Some(T)
-    None
-}
-```
-
-`Option[Path]::Some(path)` stores an edge to the `Path` node. Matching the enum
-retains payload values bound into local variables:
-
-```enq
-match maybe_path {
-    Option[Path]::Some(path) => {
-        println(path.as_str())
-    }
-    Option[Path]::None => {}
-}
-```
-
-The payload binding `path` is dropped when the match arm exits.
-
-## Function Boundaries
-
-Function boundaries follow the same retain/drop rules.
-
-Passing a reference argument:
-
-```enq
-fn len(value: Vec[u32]) -> usize {
-    ret value.len()
-}
-```
-
-The callee receives a retained reference. The callee drops its local reference
-before returning. The caller's reference remains alive.
-
-Returning a reference:
-
-```enq
-fn make_vec() -> Vec[u32] {
-    let mut values = Vec[u32]::new()
-    values.push(1_u32)
-    ret values
-}
-```
-
-The returned vector reference remains live in the caller. The compiler must not
-drop the returned reference as a dead local.
-
-## Native And Runtime Boundaries
-
-Native functions that create or consume reference values must follow the same
-ownership contract.
-
-A native function returning `str`, `Vec[T]`, a file handle or another aggregate
-returns a live reference node. The caller owns one reference and must eventually
-drop it.
-
-A native function receiving a reference type receives a retained reference. It
-must not store that reference beyond the call unless the ABI explicitly says it
-retains or transfers it.
-
-Backend and build-script integrations must describe native ownership clearly.
-The memory model cannot be correct if native code returns raw buffers whose
-ownership is not specified.
-
-## What This Means For Users
-
-For new Encore users, the practical rules are:
-
-- primitives behave like numbers in C or Rust;
-- structs, enums, tuples, strings and vectors behave like shared objects;
-- assigning an aggregate does not clone it;
-- passing an aggregate to a function does not invalidate the caller's value;
-- mutating an aggregate can be observed through all references to that object;
-- use explicit clone APIs when an independent copy is needed;
-- the compiler releases references automatically.
-
-Example:
-
-```enq
-let mut first = Vec[u32]::new()
+let first = Pair{1_u32, Target<H>{10_u32}}
 let second = first
-
-second.push(10_u32)
-
-// first and second point to the same Vec node.
-println(first.len()) // 1
 ```
 
-This is expected behavior.
+`first` and `second` are independent `Pair` payloads, but their `target` fields
+are two owning handles to the same node.
 
-## What This Means For Compiler Work
-
-Compiler passes and coding agents should treat the following rules as
-non-negotiable invariants.
-
-1. Primitive types are value types.
-2. Every aggregate type is a reference type.
-3. Every reference type is represented as a graph node through hidden `Box`.
-4. Assignment of a reference type emits retain.
-5. Function argument passing of a reference type emits retain.
-6. Field access of a reference type emits retain.
-7. `for` loop element binding of a reference type emits retain for the loop
-   variable.
-8. Leaving scope emits drop for every live reference local that is not returned
-   or otherwise transferred.
-9. Field replacement retains the new value and drops the old value.
-10. `cfree` frees only the ERN set, not every descendant blindly.
-11. Containers are normal reference nodes and must not receive special ownership
-    rules.
-12. User-facing code should not expose hidden `Box` unless the API explicitly
-    works with low-level EHIR concepts.
-
-If a fix requires adding a special case for `str`, `Vec`, `Option`, a particular
-module path or a particular test name, the fix is probably wrong. The correct
-place to solve memory behavior is the general ValueType/ReferenceType lowering,
-retain/drop placement or EHIR graph deallocation logic.
-
-## Debugging Memory Issues
-
-Memory bugs should be reduced to graph behavior:
-
-- Which reference nodes exist?
-- Which edges exist between them?
-- Which variables are live roots?
-- Which operation retains a reference?
-- Which operation drops a reference?
-- Which node starts `cfree`?
-- Which nodes are in the ERN set?
-
-Useful validation tools include:
-
-- `--trace-cfree` to inspect deallocation order and released nodes;
-- `valgrind` to detect leaked native allocations;
-- regression tests with shared nodes, field replacement, nested structures and
-  containers of reference values.
-
-A good memory regression test should check both cases:
-
-1. the old node is freed when no other reference exists;
-2. the old node remains alive when another reference still points to it.
-
-For example, when replacing `a.b.c.target`, test both:
+One local-binding rule is intentionally different. If `a` is already a
+mutable local path, `let mut b = a` gives `b` another name for the same local
+cell. It does not copy the value and does not create another graph edge.
+Aliases are resolved before canonical SSA EHIR:
 
 ```enq
-a.b.c.target = Target{2_usize}
+let mut a = Pair{1_u32, Target<H>{10_u32}}
+let mut b = a
+b.left = 2_u32
+// a.left is now 2 because a and b name the same local cell.
 ```
 
-and:
+An immutable binding, an expression, or a non-mutable source is copied rather
+than aliased.
+
+### Mutation
+
+`mut` applies to a local cell, not to a pointer kind. It permits rebinding or
+updating that local inline value. It is removed by the local-to-SSA pass and
+must never be represented as `T<S>`.
+
+Inline `mut T` function parameters and receivers are not supported. A function
+which mutates an object accepts `T<S>`, `T<H>` or, normally, `T&`. Every owning
+handle may mutate its node payload; `mut` on the handle binding is needed only
+to replace the handle itself.
 
 ```enq
-let saved = a.b.c.target
-a.b.c.target = Target{2_usize}
-println(saved.id)
+fn increment(counter: Counter&) -> () {
+    counter.value += 1_u32
+}
 ```
 
-The first case should free the old target. The second case must keep it alive
-until `saved` is dropped.
+Mutable standard collections follow the same rule. `Vec[T]`, dictionaries and
+similar containers expose heap-node constructors and handle receivers. Copying
+their handle shares the collection; an explicit `clone` operation creates an
+independent collection.
+
+## Graph-memory foundation
+
+Let the memory state be a directed graph $G = (V, E)$. `V` contains object
+nodes and live root vertices such as active function state, globals and native
+pins. Each edge in $E$ is one owning EHIR reference. Inline fields in a local
+value originate at its root vertex; fields in a node originate at that node.
+
+A node is logically alive while at least one owning path from a live root
+requires it to remain alive. Cycles are valid graph structures.
+
+Raw pointers are not graph edges. Safe EHIR never derives lifetime guarantees
+from `T*`; code using a raw address must satisfy a separate unsafe contract.
+
+## ERN set operator
+
+For a stable graph snapshot, let $P_G(v)$ be the set reachable from $v$ by zero
+or more directed edges. Thus $v \in P_G(v)$. The complement is relative to the
+complete vertex set:
+
+$$
+\overline{P_G(v)} = V \setminus P_G(v)
+$$
+
+Let every vertex outside the candidate region contribute everything it can
+reach:
+
+$$
+Q_G(v) = \bigcup_{k \in \overline{P_G(v)}} P_G(k)
+$$
+
+The Exclusively Reachable Nodes set is:
+
+$$
+ERN_G(v) = P_G(v) \setminus Q_G(v)
+$$
+
+ERN is a pure set-selection operator. Evaluating it does not mutate $G$.
+
+Root vertices are important. A remaining local, global or native pin lies
+outside $P_G(v)$ and its path excludes the referenced object from
+$ERN_G(v)$. The owner being released is removed from the snapshot before ERN
+is classified.
+
+### Lifetime dominance
+
+For the current graph snapshot, $v$ lifetime-dominates every object selected by
+its ERN set:
+
+$$
+x \in ERN_G(v) \land Alive_G(v) \Longrightarrow Alive_G(x)
+$$
+
+This is memory-lifetime dominance, not control-flow dominance.
+
+## Cascading deallocation
+
+Removing one owning handle removes exactly one incoming graph edge. At its
+EHIR-determined last use, the operation is synchronous: it classifies the ERN
+region which became exclusive and logically deletes that complete region as
+one transaction.
+
+For $S = ERN_G(v)$:
+
+$$
+Deallocate_G(v) : G \longrightarrow G[V \setminus S]
+$$
+
+Logical death precedes physical reclamation:
+
+- heap-node storage is returned to the heap allocator;
+- a stack node is marked logically dead, while its bytes are reclaimed by slot
+  reuse or by leaving its frame.
+
+The ERN definition guarantees that no owning edge enters the deleted set from
+a survivor:
+
+$$
+x \in S \land (u \rightarrow x) \in E \Longrightarrow u \in S
+$$
+
+Therefore no surviving safe EHIR reference points into deleted storage. This
+is the central use-after-free safety property.
+
+### Runtime algorithm
+
+The implementation may use reference counts as an index into the graph
+algorithm, but ordinary reference counting is not the semantic model and may
+not leak cycles.
+
+The required implementation is:
+
+1. Remove the released incoming edge.
+2. Use a zero-count work queue as the fast path for acyclic regions.
+3. For a possible cycle, collect $P_G(v)$ iteratively.
+4. For each candidate node compute `trial = refcount - internal_in_degree`.
+5. Mark nodes with a positive trial count as externally reachable and
+   propagate that mark through their outgoing edges.
+6. Treat the remaining nodes as one ERN transaction.
+7. Detach edges to survivors, mark the ERN nodes dead, then run shallow
+   finalization and physical reclamation.
+
+Safe graph mutation, retain and ERN classification share one graph lock so the
+proof observes one snapshot. Shallow finalization runs after the lock is
+released. User code cannot resurrect a logically dead node.
+
+## Stack placement
+
+A stack node belongs to a specific frame $f$ and is valid only when:
+
+$$
+Storage(v) = Stack(f) \Longrightarrow Lifetime(v) \subseteq Lifetime(f)
+$$
+
+The EHIR validator rejects a stack node which can escape through:
+
+- a return from its owning frame;
+- a heap or global field which can outlive the frame;
+- `spawn` or another thread boundary;
+- a coroutine suspension point whose frame does not own the node;
+- a native call without a verified non-escaping contract.
+
+Passing `T<S>` to a known non-escaping `T&` parameter is valid. Returning a
+fresh `T<S>` from the frame which allocated it is not.
+
+Stack allocation sites use lifetime regions and slot reuse. A construction in
+a loop is accepted when an instance dies before the next iteration, or when a
+finite maximum number of overlapping instances is proven. The compiler reports
+an error rather than silently using the heap for an unbounded overlap.
+
+## Ownership at function boundaries
+
+Function parameters, locals, fields, container elements, globals and native
+pins are graph roots or edges while they exist. Canonical EHIR uses these
+rules:
+
+- copying a node handle creates one new owner;
+- a call parameter owns its incoming handle;
+- a return transfers one live owner to the caller;
+- a phi transfers the owner selected on its incoming control-flow edge;
+- reading a node-handle field creates a new owner unless the field is moved;
+- leaving a path drops every live owner not transferred elsewhere.
+
+The ownership pass may replace an acquire followed by a release with a move
+when liveness proves there is no interval containing both owners. This is an
+optimization of the physical operations, not a different abstract model.
+
+Arguments are evaluated from left to right. All argument values are
+materialized before last-use transfers are committed, so passing one handle in
+several arguments produces the required number of owners independently of
+argument order.
+
+## Field and element replacement
+
+Replacing storage which contains owning handles is transactional:
+
+1. copy or acquire the complete new value;
+2. snapshot the old value;
+3. install the new value;
+4. drop the old value.
+
+This order makes self-assignment safe. It applies recursively to inline
+aggregates, node fields and container elements.
+
+Raw `load` and `store` are bit operations and never infer ownership. Trusted
+container/runtime code uses ownership-aware load, initialization, replacement
+and drop-place EHIR operations instead. The LLVM backend must not decide
+ownership from a type name or variable-name suffix.
+
+## Type lifecycle metadata
+
+Every monomorphized payload used as a node has a descriptor which can:
+
+- enumerate all outgoing node-handle edges;
+- report whether a cycle is possible;
+- perform shallow finalization of non-graph storage.
+
+Structural descriptors for structs, enums, tuples and arrays are synthesized.
+Opaque runtime-backed types declare the same lifecycle contract explicitly.
+`Vec`, `str`, `Option`, a module path or a test name must never be a backend
+ownership special case.
+
+Shallow finalization does not release child graph handles: the ERN transaction
+has already classified and detached those edges. Arbitrary user destructors and
+resurrection are not part of this model.
+
+## Strings, enums and dynamic values
+
+`str` keeps its ordinary surface spelling and immutable value behavior. Its
+storage is backed by the common heap-node runtime and copying a string value
+creates another owning handle to that storage.
+
+Enums, including `Option[T]` and `Result[T, E]`, are inline tagged values by
+default. Their payload is stored inline and follows the recursive copy/drop
+rules. An enum becomes a node only when written with `<S>`, `<H>` or `&`.
+
+A dynamic trait value contains a node handle plus its vtable identity. Casting
+an inline aggregate to `dyn Trait` first places that value in a heap node;
+casting an existing node handle retains the same node.
+
+## Mutable collections
+
+Mutable collections are normal graph nodes rather than backend-specific
+reference-counted buffers. For example, the public vector API uses
+`Vec[T]<H>` and `Self&` receivers. Its descriptor enumerates node handles
+contained recursively in every initialized element.
+
+```enq
+let values = Vec[Target<H>]::new()
+values.push(Target<H>{1_u32})
+let same = values
+same.push(Target<H>{2_u32})
+// values and same refer to the same vector node.
+```
+
+`values.clone()` is the library operation for an independent vector.
+
+## Concurrency
+
+Public node handles `T<S>`, `T<H>` and `T&` are not `Send`. `spawn` accepts an
+inline value only when its complete structure is `Send`; a nested node handle,
+raw pointer or mutable local alias rejects the transfer.
+
+Runtime-internal immutable nodes, such as string storage, may cross threads.
+The common graph lock and atomic publication rules keep their ownership
+metadata safe without exposing shared mutable node payloads to Encore code.
+
+## Native boundaries
+
+Every native signature declares whether an input is an inline value, node
+handle or raw pointer. A native function receiving an owning handle gets one
+owner for the call. It cannot retain that handle beyond the call without an
+explicit transfer contract.
+
+An extern `T&` parameter accepts a stack node only when declared `noescape`.
+Raw pointers are allowed only through `unsafe`; native pins which keep a node
+alive must be represented as roots visible to the graph runtime.
+
+## Compiler invariants
+
+The following properties are mandatory:
+
+1. `T`, `T<S>`, `T<H>`, `T&` and `T*` remain distinct through EHIR validation.
+2. `T&` is an owning node handle, never a raw pointer or borrow.
+3. `mut` is eliminated by SSA construction and never selects node placement.
+4. Canonical functions have one entry and one normal exit.
+5. Every ownership creation, transfer, replacement and last use is handled by
+   the general EHIR ownership pass.
+6. Stack placement is proven not to escape.
+7. `cfree` selects precisely the ERN region, including cycles.
+8. The LLVM backend only lowers explicit, validated EHIR semantics.
+9. Containers and runtime-backed values describe ownership through lifecycle
+   metadata, not backend name checks.
+10. Safe raw-memory operations cannot silently copy or destroy owning values.
+
+## Validation and debugging
+
+Memory regressions should state the graph explicitly: roots, node edges, the
+released edge and the expected ERN set. Tests must cover both a fully exclusive
+region and a shared descendant which must survive.
+
+Use:
+
+- `--trace-cfree` to record the selected ERN nodes and reclamation order;
+- Valgrind for invalid native memory access and leaks;
+- generated-EHIR assertions for ownership and single-exit form;
+- long-running real applications to exercise repeated graph transformations.
+
+A passing type check or LLVM build alone is not proof of memory correctness.

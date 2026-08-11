@@ -61,6 +61,53 @@ fn small_helper(value: u32) -> u32 {
 }
 ```
 
+### Compile-time decorators
+
+`#attr(decorator)` marks a function or method as a decorator template. Its
+first two compiler parameters are a `Callable` for the wrapped implementation
+and the matching argument tuple. Parameters after those two are supplied by
+the decorator application:
+
+```enq
+import core::fmt::Debug
+import std::io::println
+import std::time::perf_counter_ns
+
+struct ProfileManager {}
+
+impl for ProfileManager {
+    #attr(decorator)
+    fn profile[Args, Result](
+        self: Self,
+        func: Callable[Args, Result],
+        args: Args,
+        label: str
+    ) -> Result {
+        let start = perf_counter_ns()
+        let result = func(args)
+        println(label + ": " + Debug::fmt(perf_counter_ns() - start))
+        ret result
+    }
+}
+
+static RENDER_PROFILE = ProfileManager{}
+
+@RENDER_PROFILE.profile("draw_frame")
+fn draw_frame(frame: u64) -> u64 {
+    ret frame + 1_u64
+}
+```
+
+The compiler emits the original body under a private generated name and
+expands the decorator body into `draw_frame`. Calls written as `func(args)` in
+the template become direct calls to that generated function. No runtime
+`Callable`, closure, vtable, reflection lookup, or decorator dispatch remains.
+
+Decorator applications may be stacked. They compose in Python order: the
+application nearest the function wraps the body first, and the topmost
+application is the outermost wrapper. An async target must use an async
+decorator and explicitly `await func(args)`.
+
 ## Bindings, assignment, and return
 
 Bindings may be inferred or explicitly typed. Only `mut` bindings may be
@@ -202,16 +249,39 @@ let values: Vec[u32] = Vec[u32]::new()
 let callback: dyn Handler = handler as dyn Handler
 ```
 
-Raw pointer types (`T*`), graph handles (`T<H>`), stack handles (`T<S>`), and
-borrow/reference spellings (`T&` or `&T`) are primarily compiler and runtime
-building blocks. Use safe library abstractions unless implementing such a
-building block:
+An aggregate name without a suffix is its complete inline value. Node handles
+use `T<H>` for heap placement, `T<S>` for stack placement and `T&` (or `&T`)
+when a function accepts either placement. All three handle forms are owning.
+`T*` is a raw pointer and requires `unsafe`:
 
 ```enq
 extern fn inspect_raw(value: u8*) -> u32
 extern fn inspect_graph(value: Node<H>) -> u32
 extern fn inspect_stack(value: Node<S>) -> u32
-extern fn inspect_borrow(value: str&) -> u32
+fn inspect_node(value: Node&) -> u32 {
+    ret value.id
+}
+```
+
+`T&` is not a borrow or a raw address. It has the same one-word ABI as
+`T<S>`/`T<H>` and owns its reference for as long as the value exists. A raw
+pointer cannot be passed where `T&` is expected.
+
+Construction selects the representation explicitly:
+
+```enq
+let value = Node{1_u32}       // inline Node
+let local = Node<S>{2_u32}    // stack node
+let shared = Node<H>{3_u32}   // heap node
+```
+
+Inline mutable values may be edited locally, but functions do not accept
+`mut T` inout parameters. Mutating APIs receive a node handle instead:
+
+```enq
+fn increment(node: Node&) -> () {
+    node.id += 1_u32
+}
 ```
 
 ## Functions and calls
@@ -426,6 +496,37 @@ fn dynamic_name(value: dyn Named) -> str {
 let erased = User{7_u64, "Ada"} as dyn Named
 let name = dynamic_name(erased)
 ```
+
+## Pipe closures
+
+A pipe closure is contextually converted to a non-generic dynamic trait that
+declares exactly one method. Parameter types may be omitted because the target
+method supplies them:
+
+```enq
+trait ClickHandler {
+    fn handle(self: Self, event: u32) -> ()
+}
+
+fn dispatch(handler: dyn ClickHandler) -> () {
+    handler.handle(1_u32)
+    ret ()
+}
+
+let state = Counter<H>{0_usize}
+dispatch(|event| {
+    state.increment()
+    println("handled")
+})
+```
+
+The closure environment is an ordinary owning heap node lowered to EHIR plus
+an implementation of the target trait. Captured values are owned by that node.
+Because the environment may escape the current function, capturing an `<S>`
+node or a mutable local slot is rejected; capture a heap node such as
+`Signal[T]<H>` for shared mutable UI state. `|| expression` declares a closure
+without parameters. Generic dynamic traits and traits with more than one method
+are not closure targets in the current implementation.
 
 ## Conditional statements
 

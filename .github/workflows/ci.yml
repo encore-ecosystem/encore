@@ -12,9 +12,6 @@ concurrency:
   group: native-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  ENCORE_INDEX_URL: https://raw.githubusercontent.com/encore-ecosystem/encore-index/529a9672038a7a7262c7582187c5d12733178a0c
-
 jobs:
   resolve-inputs:
     name: Resolve trusted inputs
@@ -74,11 +71,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Transitional source snapshot containing core/platform/std. Restore
-          # dynamic main resolution after encore-index#2 is merged.
-          sha=10f114d97e4b26b856a3e6debfab16ec16aa90ce
+          sha=$(git ls-remote https://github.com/encore-ecosystem/encore-index.git refs/heads/main | awk '{print $1}')
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "ENCORE_INDEX_URL=https://raw.githubusercontent.com/encore-ecosystem/encore-index/$sha" >> "$GITHUB_ENV"
           echo "### System libraries: \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build verified dependency bundle
@@ -145,6 +141,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/registry
+      ENCORE_INDEX_URL: https://raw.githubusercontent.com/encore-ecosystem/encore-index/${{ needs.resolve-inputs.outputs.index_sha }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -341,6 +338,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/registry
+      ENCORE_INDEX_URL: https://raw.githubusercontent.com/encore-ecosystem/encore-index/${{ needs.resolve-inputs.outputs.index_sha }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -468,6 +466,38 @@ jobs:
           done
           (cd examples/bare_metal && "$compiler" build --target thumbv7em-none-eabi --emit llvm-ir)
 
+      - name: Verify source tooling gates
+        if: matrix.triple == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler="$PWD/target/stage3/${{ matrix.executable }}"
+          "$compiler" format --check
+          "$compiler" check
+          "$compiler" lint
+
+      - name: Build matching Encore language server
+        shell: bash
+        run: |
+          set -euo pipefail
+          index_root="$PWD/../encore-index-release"
+          test ! -e "$index_root"
+          cp -R target/system-index "$index_root"
+          test -f "$index_root/lsp/encore.toml"
+          compiler="$PWD/target/stage3/${{ matrix.executable }}"
+          (cd "$index_root/lsp" && "$compiler" build --profile release --jobs 4)
+          source_name=lsp
+          installed_name=encore-lsp
+          if [[ "${{ matrix.triple }}" == *-windows-* ]]; then
+            source_name=lsp.exe
+            installed_name=encore-lsp.exe
+          fi
+          cp "$index_root/lsp/target/release/$source_name" "target/stage3/$installed_name"
+          chmod +x "target/stage3/$installed_name" 2>/dev/null || true
+          if [[ "${{ matrix.triple }}" == x86_64-unknown-linux-gnu ]]; then
+            python3 "$index_root/lsp/tests/docstrings.py" "target/stage3/$installed_name"
+          fi
+
       - name: Assemble offline test context
         shell: bash
         run: |
@@ -496,7 +526,11 @@ jobs:
           mkdir -p "$root/bin" "$root/lib/encore/index" "$root/share/doc/encore" dist
           cp "target/stage3/${{ matrix.executable }}" "$root/bin/${{ matrix.executable }}"
           chmod +x "$root/bin/${{ matrix.executable }}" 2>/dev/null || true
-          for name in core platform std rich json log; do
+          lsp_executable=encore-lsp
+          [[ "${{ matrix.triple }}" == *-windows-* ]] && lsp_executable=encore-lsp.exe
+          cp "target/stage3/$lsp_executable" "$root/bin/$lsp_executable"
+          chmod +x "$root/bin/$lsp_executable" 2>/dev/null || true
+          for name in core platform std rich json log profile; do
             source_name=$name
             test -f "$PWD/target/system-index/packages/$source_name/encore.toml"
             cp -R "$PWD/target/system-index/packages/$source_name" "$root/lib/encore/index/$name"
