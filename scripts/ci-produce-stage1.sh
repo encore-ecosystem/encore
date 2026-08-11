@@ -41,25 +41,25 @@ for target in "${targets[@]}"; do
   target_executable=encore
   [[ "$target" == *-windows-* ]] && target_executable=encore.exe
   args=(build --profile extreme --target "$target")
+  env_args=()
 
   case "$target" in
     aarch64-unknown-linux-gnu)
       : "${LLVM_MINGW_ROOT:?LLVM_MINGW_ROOT is required for Linux AArch64 stage1}"
-      args+=(--cc "$LLVM_MINGW_ROOT/bin/clang"
-        --linker "$LLVM_MINGW_ROOT/bin/clang"
-        --ar "$LLVM_MINGW_ROOT/bin/llvm-ar"
-        --sysroot "$LLVM_MINGW_ROOT/linux-aarch64-sysroot"
-        --link-arg "-fuse-ld=lld")
+      env_args+=("ENCORE_CC=$LLVM_MINGW_ROOT/bin/clang"
+        "ENCORE_LINKER=$LLVM_MINGW_ROOT/bin/clang"
+        "ENCORE_AR=$LLVM_MINGW_ROOT/bin/llvm-ar"
+        "ENCORE_SYSROOT=$LLVM_MINGW_ROOT/linux-aarch64-sysroot")
       ;;
     x86_64-w64-windows-gnu|aarch64-w64-windows-gnu)
       : "${LLVM_MINGW_ROOT:?LLVM_MINGW_ROOT is required for Windows GNU stage1}"
-      args+=(--cc "$LLVM_MINGW_ROOT/bin/clang"
-        --linker "$LLVM_MINGW_ROOT/bin/clang"
-        --ar "$LLVM_MINGW_ROOT/bin/llvm-ar")
+      env_args+=("ENCORE_CC=$LLVM_MINGW_ROOT/bin/clang"
+        "ENCORE_LINKER=$LLVM_MINGW_ROOT/bin/clang"
+        "ENCORE_AR=$LLVM_MINGW_ROOT/bin/llvm-ar")
       ;;
   esac
 
-  "$builder" "${args[@]}"
+  env "${env_args[@]}" "$builder" "${args[@]}"
   source="target/$target/extreme/$target_executable"
   if [[ "$target" == "$(uname -m)-unknown-linux-gnu" && "$producer" == linux ]]; then
     source="target/$target/extreme/$target_executable"
