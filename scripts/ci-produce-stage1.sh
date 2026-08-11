@@ -41,7 +41,8 @@ for target in "${targets[@]}"; do
   target_executable=encore
   [[ "$target" == *-windows-* ]] && target_executable=encore.exe
   args=(build --profile extreme --target "$target")
-  env_args=()
+  # Keep argv non-empty for the Bash 3 shipped by macOS under `set -u`.
+  env_args=(env)
 
   case "$target" in
     aarch64-unknown-linux-gnu)
@@ -59,7 +60,7 @@ for target in "${targets[@]}"; do
       ;;
   esac
 
-  env "${env_args[@]}" "$builder" "${args[@]}"
+  "${env_args[@]}" "$builder" "${args[@]}"
   source="target/$target/extreme/$target_executable"
   if [[ "$target" == "$(uname -m)-unknown-linux-gnu" && "$producer" == linux ]]; then
     source="target/$target/extreme/$target_executable"
