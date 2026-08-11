@@ -29,6 +29,14 @@ cp "target/extreme/$executable" "target/stage1-builder/$executable"
 builder="$PWD/target/stage1-builder/$executable"
 chmod +x "$builder" 2>/dev/null || true
 
+# The seed can only parse the pre-edge core used for the bridge build. Restore
+# the exact pinned release core before stage1 compiles any release artifact.
+: "${ENCORE_RELEASE_CORE_DIR:?ENCORE_RELEASE_CORE_DIR is required}"
+index_root="$PWD/../encore-index"
+rm -rf "$index_root/packages/core"
+cp -R "$ENCORE_RELEASE_CORE_DIR" "$index_root/packages/core"
+export ENCORE_CORE_DIR="$index_root/packages/core"
+
 for target in "${targets[@]}"; do
   target_executable=encore
   [[ "$target" == *-windows-* ]] && target_executable=encore.exe
