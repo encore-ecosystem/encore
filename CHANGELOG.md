@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 — 2026-08-14
+
+- Made local and global EHIR/LLVM incremental caches content-addressed and
+  verified with SHA-256 commit markers before reuse.
+- Added regression coverage for no-op builds, dependency-interface
+  invalidation, global hydration, cache corruption, and clean-build parity.
+- Accepted canonical `=>` match/switch terminators throughout EHIR text
+  parsing while retaining legacy `->` input compatibility.
+- Updated the Encore LSP, Tree-sitter grammar, Zed integration, and language
+  book for the current syntax and standard library.
+
 ## 0.2.0 — 2026-08-11
 
 ### Added

@@ -85,7 +85,7 @@ encore self channel
 encore self channel beta
 encore self update --check
 encore self update
-encore self install 0.2.0
+encore self install 0.2.1
 ```
 
 `stable` is the default compiler channel. `beta` receives numbered preview

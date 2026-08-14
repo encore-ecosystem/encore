@@ -6,7 +6,7 @@ metadata catalog. Package source can live in any public GitHub repository. A
 published version is a maintainer-created `.tar.gz` asset attached to a GitHub
 Release; automatically generated source archives are not used.
 
-Encore 0.2.0 automates the release and reviewed index pull request:
+Encore 0.2.1 automates the release and reviewed index pull request:
 
 ```sh
 encore publish --dry-run
@@ -34,7 +34,7 @@ Letters, digits, `-`, and `_` are accepted.
 name = "example_math"
 version = "1.0.0"
 repository = "https://github.com/owner/example_math"
-encore = ">=0.2.0, <0.3.0"
+encore = ">=0.2.1, <0.3.0"
 description = "Math helpers for Encore"
 readme = "README.md"
 licence = "MIT"

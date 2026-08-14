@@ -202,25 +202,28 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     let object_dir = profile_dir.join("object")
     let object_suffix = if target.os == "windows" { ".obj" } else { ".o" }
     let llvm_object = object_dir.join(project_name + object_suffix)
-    if !file_exists(native_path(llvm_modules_manifest_path(llvm_path).as_str())) ||
+    if !verified_artifact(llvm_modules_manifest_path(llvm_path)) ||
         !file_exists(native_path(llvm_fingerprint_path.as_str())) ||
         read_file(native_path(llvm_fingerprint_path.as_str())) != llvm_fingerprint {
         reuse_sibling_profile_llvm(profile_dir, llvm_path, project_name + ".ll.modules",
             llvm_fingerprint_path, llvm_fingerprint,)
     }
-    let mut module_llvm_paths = read_nonempty_lines(llvm_modules_manifest_path(llvm_path))
+    let mut module_llvm_paths = if verified_artifact(llvm_modules_manifest_path(llvm_path)) {
+        read_nonempty_lines(llvm_modules_manifest_path(llvm_path))
+    } else { Vec[Path]::new() }
     let modular_objects_cached = module_objects_exist(module_llvm_paths, object_suffix)
+    let modular_llvm_cached = module_ir_artifacts_verified(module_llvm_paths)
     let ehir_cached = file_exists(native_path(ehir_fingerprint_path.as_str())) &&
         read_file(native_path(ehir_fingerprint_path.as_str())) == ehir_fingerprint &&
-        file_exists(native_path(out_path.as_str()))
+        verified_artifact(out_path)
     let codegen_cached = file_exists(native_path(codegen_fingerprint_path.as_str())) &&
         read_file(native_path(codegen_fingerprint_path.as_str())) == codegen_fingerprint &&
         file_exists(native_path(out_path.as_str())) &&
         ((file_exists(native_path(llvm_path.as_str())) && file_exists(native_path(llvm_object.as_str()))) || modular_objects_cached)
     let llvm_cached = file_exists(native_path(llvm_fingerprint_path.as_str())) &&
         read_file(native_path(llvm_fingerprint_path.as_str())) == llvm_fingerprint &&
-        file_exists(native_path(out_path.as_str())) &&
-        (file_exists(native_path(llvm_path.as_str())) || module_llvm_paths.len() > 0_usize)
+        verified_artifact(out_path) &&
+        (verified_artifact(llvm_path) || modular_llvm_cached)
     let mut fresh_ehir_text = ""
     if codegen_cached {
         workspace_release_modules(workspace)
@@ -257,7 +260,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             progress.update(project_name, "EHIR", 1_usize, 1_usize)
             fresh_ehir_text = write_ehir_artifact(translation_modules, incremental_modules, target,
                 project_name + "@main.enq", out_path, profile_dir.join("ehir-cache"),
-                incremental_cache_configuration(root, target, "ehir-module-v2"),)
+                incremental_cache_configuration(root, target, "ehir-module-v3"),)
             if fresh_ehir_text == "" {
                 progress.fail_stage("failed to write translated EHIR")
                 ret 1_u32
@@ -851,11 +854,11 @@ fn reuse_sibling_profile_llvm(profile_dir: Path, llvm_path: Path, manifest_name:
         if !file_exists(native_path(sibling_fingerprint.as_str())) ||
             read_file(native_path(sibling_fingerprint.as_str())) != fingerprint { continue }
         let sibling_manifest = sibling.join(manifest_name)
-        if !file_exists(native_path(sibling_manifest.as_str())) { continue }
+        if !verified_artifact(sibling_manifest) { continue }
         let paths = read_nonempty_lines(sibling_manifest)
         let mut complete = paths.len() > 0_usize
         for path in paths {
-            if !file_exists(native_path(path.as_str())) { complete = false }
+            if !verified_artifact(path) { complete = false }
         }
         if !complete { continue }
         let local_modules = profile_dir.join("modules")
@@ -864,13 +867,13 @@ fn reuse_sibling_profile_llvm(profile_dir: Path, llvm_path: Path, manifest_name:
         let mut index = 0_usize
         for path in paths {
             let local = local_modules.join("module_" + Debug::fmt(index) + ".ll")
-            if write_file(native_path(local.as_str()), read_file(native_path(path.as_str()))) != 0_i32 {
+            if !write_verified_artifact(local, read_file(native_path(path.as_str()))) {
                 complete = false
             }
             manifest = manifest + native_path(local.as_str()) + "\n"
             index += 1_usize
         }
-        if complete && write_file(native_path(llvm_modules_manifest_path(llvm_path).as_str()), manifest) == 0_i32 &&
+        if complete && write_verified_artifact(llvm_modules_manifest_path(llvm_path), manifest) &&
             write_file(native_path(fingerprint_path.as_str()), fingerprint) == 0_i32 {
             ret true
         }
@@ -1079,23 +1082,73 @@ fn write_incremental_module_snapshot(path: Path, header: str, configuration: str
     ret write_file(native_path(path.as_str()), text) == 0_i32
 }
 
+fn artifact_checksum_path(path: Path) -> Path {
+    ret Path::new(path.as_str() + ".sha256")
+}
+
+fn artifact_digest(path: Path) -> str {
+    if !file_exists(native_path(path.as_str())) { ret "" }
+    ret file_sha256(native_path(path.as_str()))
+}
+
+fn artifact_matches(path: Path, expected: str) -> bool {
+    ret expected != "" && file_exists(native_path(path.as_str())) &&
+        artifact_digest(path) == expected
+}
+
+fn verified_artifact(path: Path) -> bool {
+    let lines = read_nonempty_text_lines(artifact_checksum_path(path))
+    if lines.len() != 1_usize { ret false }
+    match lines.get(0_usize) {
+        Some(expected) => { ret artifact_matches(path, expected) }
+        None => { ret false }
+    }
+}
+
+// The checksum is the commit marker. Readers never accept a cache artifact
+// until both the payload and its final sidecar are present and agree.
+fn write_verified_artifact(path: Path, text: str) -> bool {
+    if write_file(native_path(path.as_str()), text) != 0_i32 { ret false }
+    let digest = artifact_digest(path)
+    if digest == "" { ret false }
+    if write_file(native_path(artifact_checksum_path(path).as_str()), digest + "\n") != 0_i32 {
+        ret false
+    }
+    ret artifact_matches(path, digest)
+}
+
+fn copy_verified_artifact(source: Path, destination: Path) -> bool {
+    let lines = read_nonempty_text_lines(artifact_checksum_path(source))
+    if lines.len() != 1_usize { ret false }
+    let expected = match lines.get(0_usize) { Some(value) => value None => { ret false } }
+    if !artifact_matches(source, expected) { ret false }
+    if copy_file(native_path(source.as_str()), native_path(destination.as_str())) != 0_i32 {
+        ret false
+    }
+    if !artifact_matches(destination, expected) { ret false }
+    if write_file(native_path(artifact_checksum_path(destination).as_str()),
+        expected + "\n",) != 0_i32 { ret false }
+    ret true
+}
+
 fn ehir_cache_plan(path: Path, configuration: str, states: Vec[IncrementalModuleState])
 -> EhirCachePlan {
     let lines = read_nonempty_text_lines(path)
-    if !incremental_snapshot_shape_matches(lines, "encore-ehir-module-cache-v2",
-        configuration, states, 5_usize,) {
+    if !incremental_snapshot_shape_matches(lines, "encore-ehir-module-cache-v3",
+        configuration, states, 6_usize,) {
         ret EhirCachePlan{false, lines, all_module_indices(states)}
     }
     let mut selected = Vec[usize]::new()
     let mut index = 0_usize
     for state in states {
-        let source_matches = incremental_record_value(lines, state.module_id, 5_usize, 1_usize) ==
+        let source_matches = incremental_record_value(lines, state.module_id, 6_usize, 1_usize) ==
             state.source_digest
-        let dependency_matches = incremental_record_value(lines, state.module_id, 5_usize,
+        let dependency_matches = incremental_record_value(lines, state.module_id, 6_usize,
             3_usize,) == state.dependency_fingerprint
-        let chunk_path = incremental_record_value(lines, state.module_id, 5_usize, 4_usize)
+        let chunk_path = incremental_record_value(lines, state.module_id, 6_usize, 4_usize)
+        let chunk_digest = incremental_record_value(lines, state.module_id, 6_usize, 5_usize)
         if !source_matches || !dependency_matches || chunk_path == "" ||
-            !file_exists(native_path(chunk_path)) {
+            !artifact_matches(Path::new(chunk_path), chunk_digest) {
             selected.push(index)
         }
         index += 1_usize
@@ -1122,8 +1175,10 @@ fn fresh_ehir_chunk(chunks: Vec[TranslatedModuleChunk], index: usize) -> str {
     ret ""
 }
 
-fn ehir_chunk_cache_path(cache_root: Path, state: IncrementalModuleState, index: usize) -> Path {
-    let name = Debug::fmt(state.module_id.hash()) + "-" + Debug::fmt(index) + "-" +
+fn ehir_chunk_cache_path(cache_root: Path, state: IncrementalModuleState, _index: usize) -> Path {
+    let identity = state.module_id + "\n" + state.source_digest + "\n" +
+        state.interface_fingerprint + "\n" + state.dependency_fingerprint
+    let name = Debug::fmt(state.module_id.hash()) + "-" + Debug::fmt(identity.hash()) + "-" +
         state.source_digest + ".ehir"
     ret cache_root.join("chunks").join(name)
 }
@@ -1142,7 +1197,10 @@ fn global_ehir_cache_root(target: TargetSpec) -> Path {
 }
 
 fn global_ehir_chunk_path(target: TargetSpec, state: IncrementalModuleState) -> Path {
-    let name = Debug::fmt(state.module_id.hash()) + "-" + state.source_digest + ".ehir"
+    let identity = state.module_id + "\n" + state.source_digest + "\n" +
+        state.interface_fingerprint + "\n" + state.dependency_fingerprint
+    let name = Debug::fmt(state.module_id.hash()) + "-" + Debug::fmt(identity.hash()) + "-" +
+        state.source_digest + ".ehir"
     ret global_ehir_cache_root(target).join(name)
 }
 
@@ -1150,21 +1208,22 @@ fn hydrate_global_ehir_cache(cache_root: Path, target: TargetSpec, configuration
     states: Vec[IncrementalModuleState],) -> bool {
     let current_path = cache_root.join("current.state")
     if file_exists(native_path(current_path.as_str())) { ret false }
-    let mut manifest = "encore-ehir-module-cache-v2\n"
+    let mut manifest = "encore-ehir-module-cache-v3\n"
     manifest = manifest + configuration + "\n"
     let mut index = 0_usize
     let mut hydrated = false
     for state in states {
         let local = ehir_chunk_cache_path(cache_root, state, index)
         let global = global_ehir_chunk_path(target, state)
-        if !file_exists(native_path(local.as_str())) {
-            if !file_exists(native_path(global.as_str())) { ret false }
-            if copy_file(native_path(global.as_str()), native_path(local.as_str())) != 0_i32 { ret false }
+        if !verified_artifact(global) { ret false }
+        if !verified_artifact(local) {
+            if !copy_verified_artifact(global, local) { ret false }
             hydrated = true
         }
+        let digest = artifact_digest(local)
         manifest = manifest + state.module_id + "\n" + state.source_digest + "\n" +
             state.interface_fingerprint + "\n" + state.dependency_fingerprint + "\n" +
-            local.as_str() + "\n"
+            local.as_str() + "\n" + digest + "\n"
         index += 1_usize
     }
     if !hydrated { ret false }
@@ -1172,12 +1231,16 @@ fn hydrate_global_ehir_cache(cache_root: Path, target: TargetSpec, configuration
 }
 
 fn publish_global_ehir_chunk(target: TargetSpec, state: IncrementalModuleState,
-    text: str,) -> () {
+    local: Path, digest: str,) -> () {
     let root = global_ehir_cache_root(target)
     if mkdir_all(native_path(root.as_str())) != 0_i32 { ret () }
     let path = global_ehir_chunk_path(target, state)
-    if !file_exists(native_path(path.as_str())) {
-        let _ignored = write_file(native_path(path.as_str()), text)
+    if verified_artifact(path) && artifact_digest(path) == digest { ret () }
+    if !artifact_matches(local, digest) { ret () }
+    let _ignored = copy_file(native_path(local.as_str()), native_path(path.as_str()))
+    if artifact_matches(path, digest) {
+        let _sidecar = write_file(native_path(artifact_checksum_path(path).as_str()),
+            digest + "\n",)
     }
     ret ()
 }
@@ -1194,14 +1257,16 @@ fn write_ehir_artifact(modules: Vec[TranslationModule], states: Vec[IncrementalM
     let selected = if plan.valid { plan.selected } else { all_module_indices(states) }
     let fresh = translate_selected_modules_to_ehir_chunks(modules, target, selected)
     let mut assembled = Vec[TranslatedModuleChunk]::new()
-    let mut manifest = "encore-ehir-module-cache-v2\n" + configuration + "\n"
+    let mut manifest = "encore-ehir-module-cache-v3\n" + configuration + "\n"
     let mut index = 0_usize
     for state in states {
         let mut text = ""
         let mut chunk_path = ""
+        let mut chunk_digest = ""
         if !module_is_selected(selected, index) {
-            chunk_path = incremental_record_value(plan.manifest, state.module_id, 5_usize, 4_usize)
-            if chunk_path != "" && file_exists(native_path(chunk_path)) {
+            chunk_path = incremental_record_value(plan.manifest, state.module_id, 6_usize, 4_usize)
+            chunk_digest = incremental_record_value(plan.manifest, state.module_id, 6_usize, 5_usize)
+            if chunk_path != "" && artifact_matches(Path::new(chunk_path), chunk_digest) {
                 text = read_file(native_path(chunk_path))
             }
         }
@@ -1211,16 +1276,19 @@ fn write_ehir_artifact(modules: Vec[TranslationModule], states: Vec[IncrementalM
             let fresh_path = ehir_chunk_cache_path(cache_root, state, index)
             if write_file(native_path(fresh_path.as_str()), text) != 0_i32 { ret "" }
             chunk_path = fresh_path.as_str()
+            chunk_digest = artifact_digest(fresh_path)
+            if chunk_digest == "" { ret "" }
         }
-        publish_global_ehir_chunk(target, state, text)
+        let local_path = Path::new(chunk_path)
+        publish_global_ehir_chunk(target, state, local_path, chunk_digest)
         assembled.push(TranslatedModuleChunk::new(index, text))
         manifest = manifest + state.module_id + "\n" + state.source_digest + "\n" +
             state.interface_fingerprint + "\n" + state.dependency_fingerprint + "\n" +
-            chunk_path + "\n"
+            chunk_path + "\n" + chunk_digest + "\n"
         index += 1_usize
     }
     let text = assemble_ehir_module_bundle(assembled, states.len(), entry_module)
-    if write_file(native_path(path.as_str()), text) != 0_i32 { ret "" }
+    if !write_verified_artifact(path, text) { ret "" }
     // Manifests form a two-generation project-local cache. Chunk files are
     // immutable and may be shared by both generations, so preserving the old
     // current generation costs only a small metadata write.
@@ -1441,6 +1509,7 @@ fn module_llvm_fingerprint(path: Path, compiler: str, args: Vec[str]) -> str {
 
 fn write_llvm_artifact(ehir_path: Path, llvm_path: Path, target: TargetSpec,
     incremental_configuration: str,) -> bool {
+    if !verified_artifact(ehir_path) { ret false }
     let ehir_text = read_file(native_path(ehir_path.as_str()))
     ret write_llvm_artifact_text(ehir_text, llvm_path, target, incremental_configuration, false)
 }
@@ -1491,33 +1560,35 @@ fn write_llvm_artifact_text(ehir_text: str, llvm_path: Path, target: TargetSpec,
         let state_path = Path::new(llvm_path.as_str() + ".incremental-state")
         let context_path = Path::new(llvm_path.as_str() + ".cgu-context.ehir")
         let request_path = Path::new(llvm_path.as_str() + ".incremental-request.ehir")
-        let previous_state = read_nonempty_text_lines(state_path)
+        let previous_state = if verified_artifact(state_path) {
+            read_nonempty_text_lines(state_path)
+        } else { Vec[str]::new() }
         let mut selected = Vec[usize]::new()
         let state_matches = llvm_incremental_state_matches(previous_state,
             incremental_configuration, module_sources,)
         let request_available = file_exists(native_path(request_path.as_str()))
-        let valid_state = state_matches && file_exists(native_path(context_path.as_str())) &&
+        let valid_state = state_matches && verified_artifact(context_path) &&
             (request_available || llvm_incremental_context_matches(
                 read_file(native_path(context_path.as_str())), previous_state, module_sources,))
         let mut source_index = 0_usize
         for source in module_sources {
             let path = module_dir.join("module_" + Debug::fmt(source_index) + ".ll")
             let global_path = global_llvm_module_path(target, global_bundle_key, source_index, source)
-            if !file_exists(native_path(path.as_str())) && file_exists(native_path(global_path.as_str())) {
-                if copy_file(native_path(global_path.as_str()), native_path(path.as_str())) != 0_i32 {
-                    ret false
-                }
+            let expected_artifact_digest = incremental_record_value(previous_state,
+                source.id(), 4_usize, 3_usize,)
+            if !artifact_matches(path, expected_artifact_digest) && verified_artifact(global_path) {
+                let _hydrated = copy_verified_artifact(global_path, path)
             }
             let digest = llvm_module_source_digest(source.source())
-            let cached_path = incremental_record_value(previous_state, source.id(), 3_usize, 2_usize)
+            let cached_path = incremental_record_value(previous_state, source.id(), 4_usize, 2_usize)
             // A state-shape mismatch means module indices may have shifted
             // (for example after adding a dependency). Never reuse a local
             // path by index in that case: it may contain another module's
             // definitions and can reintroduce duplicate entrypoints.
             if source_index == 0_usize || !valid_state ||
-                (valid_state && (incremental_record_value(previous_state, source.id(), 3_usize, 1_usize) != digest ||
+                (valid_state && (incremental_record_value(previous_state, source.id(), 4_usize, 1_usize) != digest ||
                     cached_path != native_path(path.as_str()) ||
-                    !file_exists(native_path(path.as_str())))) {
+                    !artifact_matches(path, expected_artifact_digest))) {
                 selected.push(source_index)
             }
             source_index += 1_usize
@@ -1525,7 +1596,7 @@ fn write_llvm_artifact_text(ehir_text: str, llvm_path: Path, target: TargetSpec,
         let mut modules = Vec[EmittedIrModule]::new()
         if selected.len() > 0_usize {
             let use_compact_context = valid_state && selected.len() < module_sources.len() &&
-                file_exists(native_path(context_path.as_str()))
+                verified_artifact(context_path)
             let mut codegen_text = ehir_text
             if request_available {
                 codegen_text = read_file(native_path(request_path.as_str()))
@@ -1548,8 +1619,8 @@ fn write_llvm_artifact_text(ehir_text: str, llvm_path: Path, target: TargetSpec,
                 // graph directly to codegen instead of parsing the 20 MiB
                 // textual artifact a second time.
                 let context_bundle = incremental_codegen_context_bundle(bundle)
-                if write_file(native_path(context_path.as_str()),
-                    module_bundle_to_string(context_bundle)) != 0_i32 { ret false }
+                if !write_verified_artifact(context_path,
+                    module_bundle_to_string(context_bundle),) { ret false }
             }
             if use_compact_context {
                 let analysis_bundle = if prefer_typed_bundle {
@@ -1568,7 +1639,7 @@ fn write_llvm_artifact_text(ehir_text: str, llvm_path: Path, target: TargetSpec,
             }
         }
         let mut manifest = ""
-        let mut state = "encore-llvm-cgu-state-v1\n" + incremental_configuration + "\n"
+        let mut state = "encore-llvm-cgu-state-v2\n" + incremental_configuration + "\n"
         let mut index = 0_usize
         for source in module_sources {
             let path = module_dir.join("module_" + Debug::fmt(index) + ".ll")
@@ -1582,17 +1653,22 @@ fn write_llvm_artifact_text(ehir_text: str, llvm_path: Path, target: TargetSpec,
                 }
                 if !written { ret false }
             }
-            publish_global_llvm_module(target, global_bundle_key, index, source, path)
+            let artifact_sha256 = artifact_digest(path)
+            if artifact_sha256 == "" { ret false }
+            if write_file(native_path(artifact_checksum_path(path).as_str()),
+                artifact_sha256 + "\n",) != 0_i32 { ret false }
+            publish_global_llvm_module(target, global_bundle_key, index, source, path,
+                artifact_sha256,)
             manifest = manifest + native_path(path.as_str()) + "\n"
             state = state + source.id() + "\n" + llvm_module_source_digest(source.source()) +
-                "\n" + native_path(path.as_str()) + "\n"
+                "\n" + native_path(path.as_str()) + "\n" + artifact_sha256 + "\n"
             index = index + 1_usize
         }
         remove_file(native_path(llvm_path.as_str()))
-        if write_file(native_path(llvm_modules_manifest_path(llvm_path).as_str()), manifest) != 0_i32 {
+        if !write_verified_artifact(llvm_modules_manifest_path(llvm_path), manifest) {
             ret false
         }
-        let state_written = write_file(native_path(state_path.as_str()), state) == 0_i32
+        let state_written = write_verified_artifact(state_path, state)
         remove_file(native_path(request_path.as_str()))
         ret state_written
     }
@@ -1601,7 +1677,7 @@ fn write_llvm_artifact_text(ehir_text: str, llvm_path: Path, target: TargetSpec,
         flatten_module_bundle("encore_bootstrap", parse_module_bundle_text("encore_bootstrap", ehir_text))
     } else { parse_module_text("encore_bootstrap", ehir_text) }
     let llvm_text = emit_ir_for_target(module, target.triple, target.pointer_width)
-    ret write_file(native_path(llvm_path.as_str()), llvm_text) == 0_i32
+    ret write_verified_artifact(llvm_path, llvm_text)
 }
 
 fn llvm_module_source_digest(source: str) -> str {
@@ -1622,12 +1698,16 @@ fn global_llvm_module_path(target: TargetSpec, bundle_key: str, index: usize,
 }
 
 fn publish_global_llvm_module(target: TargetSpec, bundle_key: str, index: usize,
-    source: EhirModuleSource, local: Path) -> () {
+    source: EhirModuleSource, local: Path, digest: str,) -> () {
     let root = global_llvm_cache_root(target, bundle_key)
     if mkdir_all(native_path(root.as_str())) != 0_i32 { ret () }
     let global = global_llvm_module_path(target, bundle_key, index, source)
-    if !file_exists(native_path(global.as_str())) && file_exists(native_path(local.as_str())) {
-        let _ignored = copy_file(native_path(local.as_str()), native_path(global.as_str()))
+    if verified_artifact(global) && artifact_digest(global) == digest { ret () }
+    if !artifact_matches(local, digest) { ret () }
+    let _ignored = copy_file(native_path(local.as_str()), native_path(global.as_str()))
+    if artifact_matches(global, digest) {
+        let _sidecar = write_file(native_path(artifact_checksum_path(global).as_str()),
+            digest + "\n",)
     }
     ret ()
 }
@@ -1661,7 +1741,7 @@ fn llvm_incremental_context_matches(context_text: str, state: Vec[str],
     if context_sources.len() != sources.len() { ret false }
     let mut index = 0_usize
     for source in sources {
-        if incremental_record_value(state, source.id(), 3_usize, 1_usize) !=
+        if incremental_record_value(state, source.id(), 4_usize, 1_usize) !=
             llvm_module_source_digest(source.source()) {
             let single_text = "entry " + source.id() + "\n\n" + source.source() + "\n"
             let compact_bundle = incremental_codegen_context_bundle(
@@ -1688,10 +1768,10 @@ fn llvm_incremental_context_matches(context_text: str, state: Vec[str],
 
 fn llvm_incremental_state_matches(lines: Vec[str], configuration: str,
     sources: Vec[EhirModuleSource],) -> bool {
-    if lines.len() < 2_usize || (lines.len() - 2_usize) % 3_usize != 0_usize ||
-        (lines.len() - 2_usize) / 3_usize != sources.len() { ret false }
+    if lines.len() < 2_usize || (lines.len() - 2_usize) % 4_usize != 0_usize ||
+        (lines.len() - 2_usize) / 4_usize != sources.len() { ret false }
     match lines.get(0_usize) {
-        Some(value) => { if value != "encore-llvm-cgu-state-v1" { ret false } }
+        Some(value) => { if value != "encore-llvm-cgu-state-v2" { ret false } }
         None => { ret false }
     }
     match lines.get(1_usize) {
@@ -1699,7 +1779,9 @@ fn llvm_incremental_state_matches(lines: Vec[str], configuration: str,
         None => { ret false }
     }
     for source in sources {
-        if incremental_record_value(lines, source.id(), 3_usize, 2_usize) == "" { ret false }
+        let path = incremental_record_value(lines, source.id(), 4_usize, 2_usize)
+        let digest = incremental_record_value(lines, source.id(), 4_usize, 3_usize)
+        if path == "" || !artifact_matches(Path::new(path), digest) { ret false }
     }
     ret true
 }
@@ -1735,6 +1817,12 @@ fn module_objects_exist(paths: Vec[Path], object_suffix: str) -> bool {
         if !file_exists(native_path(object.as_str())) ||
             !file_exists(native_path(Path::new(object.as_str() + ".fingerprint").as_str())) { ret false }
     }
+    ret true
+}
+
+fn module_ir_artifacts_verified(paths: Vec[Path]) -> bool {
+    if paths.len() == 0_usize { ret false }
+    for path in paths { if !verified_artifact(path) { ret false } }
     ret true
 }
 
@@ -1789,14 +1877,16 @@ fn llvm_codegen_is_incremental_update(ehir_path: Path, llvm_path: Path,
     incremental_configuration: str,) -> bool {
     let request_path = Path::new(llvm_path.as_str() + ".incremental-request.ehir")
     remove_file(native_path(request_path.as_str()))
-    if !file_exists(native_path(ehir_path.as_str())) { ret false }
+    if !verified_artifact(ehir_path) { ret false }
     let ehir_text = read_file(native_path(ehir_path.as_str()))
     let sources = split_module_bundle_text(ehir_text)
     if sources.len() == 0_usize { ret false }
-    let state = read_nonempty_text_lines(Path::new(llvm_path.as_str() + ".incremental-state"))
+    let state_path = Path::new(llvm_path.as_str() + ".incremental-state")
+    if !verified_artifact(state_path) { ret false }
+    let state = read_nonempty_text_lines(state_path)
     if !llvm_incremental_state_matches(state, incremental_configuration, sources) { ret false }
     let context_path = Path::new(llvm_path.as_str() + ".cgu-context.ehir")
-    if !file_exists(native_path(context_path.as_str())) { ret false }
+    if !verified_artifact(context_path) { ret false }
     let context_text = read_file(native_path(context_path.as_str()))
     if !llvm_incremental_context_matches(context_text, state, sources) { ret false }
     let module_dir = match llvm_path.parent() {
@@ -1807,9 +1897,10 @@ fn llvm_codegen_is_incremental_update(ehir_path: Path, llvm_path: Path,
     let mut index = 0_usize
     for source in sources {
         let path = module_dir.join("module_" + Debug::fmt(index) + ".ll")
-        if incremental_record_value(state, source.id(), 3_usize, 1_usize) !=
+        let expected_digest = incremental_record_value(state, source.id(), 4_usize, 3_usize)
+        if incremental_record_value(state, source.id(), 4_usize, 1_usize) !=
             llvm_module_source_digest(source.source()) ||
-            !file_exists(native_path(path.as_str())) { selected.push(index) }
+            !artifact_matches(path, expected_digest) { selected.push(index) }
         index += 1_usize
     }
     if selected.len() >= sources.len() { ret false }
