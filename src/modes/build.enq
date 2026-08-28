@@ -17,7 +17,9 @@ import std::os::mkdir_all
 import std::os::copy_file
 import std::os::home_dir
 import std::path::Path
+import std::path::clone_path
 import std::process::run_args
+import std::process::run_args_owned
 import std::process::exit
 import std::vec::Vec
 import std::dict::Hashable
@@ -570,7 +572,9 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     for arg in toolchain.link_args { link_args.push(arg) }
     link_args.push("-o")
     link_args.push(native_path(binary_path.as_str()))
-    let link_code = run_args(toolchain.linker, link_args)
+    let mut owned_link_args = Vec[str]::new()
+    for arg in link_args { owned_link_args.push("" + arg) }
+    let link_code = run_args_owned(toolchain.linker, owned_link_args)
     if link_code != 0_i32 {
         progress.fail_stage("native link failed for target " + target.triple)
         ret 1_u32
@@ -1308,19 +1312,20 @@ fn write_ehir_artifact(modules: Vec[TranslationModule], states: Vec[IncrementalM
     ret text
 }
 
-fn compile_object_job(compiler: str, args: Vec[str], fingerprint_path: str, fingerprint: str) -> i32 {
+fn compile_object_job(compiler: str, args: frozen Vec[str], fingerprint_path: str, fingerprint: str) -> i32 {
     let code = run_args(compiler, args)
     if code != 0_i32 { ret code }
     if fingerprint_path != "" && write_file(fingerprint_path, fingerprint) != 0_i32 { ret 1_i32 }
     ret 0_i32
 }
 
-fn compile_object_batch(jobs: Vec[ObjectCompileJob], worker_index: usize, worker_count: usize) -> i32 {
+fn compile_object_batch(jobs: frozen Vec[ObjectCompileJob], worker_index: usize, worker_count: usize) -> i32 {
     let mut index = worker_index
     while index < jobs.len() {
         match jobs.get(index) {
             Some(job) => {
-                if compile_object_job(job.compiler, job.args, job.fingerprint_path, job.fingerprint) != 0_i32 {
+                if compile_object_job("" + job.compiler, job.args, "" + job.fingerprint_path,
+                    "" + job.fingerprint,) != 0_i32 {
                     ret 1_i32
                 }
             }
@@ -1417,7 +1422,7 @@ fn adaptive_codegen_jobs(requested: usize, count: usize) -> usize {
     ret min_usize(requested_limit, memory_limit)
 }
 
-fn clone_string_vec(values: Vec[str]) -> Vec[str] {
+fn clone_string_vec(values: frozen Vec[str]) -> Vec[str] {
     let mut out = Vec[str]::new()
     for value in values { out.push(value) }
     ret out
@@ -1476,13 +1481,14 @@ fn schedule_module_paths(paths: Vec[Path]) -> Vec[Path] {
     ret out
 }
 
-fn compile_module_object_batch(compiler: str, base_args: Vec[str], paths: Vec[Path],
+fn compile_module_object_batch(compiler: str, base_args: frozen Vec[str], paths: frozen Vec[Path],
     object_suffix: str, worker_index: usize, worker_count: usize) -> i32 {
     let mut index = worker_index
     let mut compiled = 0_i32
     while index < paths.len() {
         match paths.get(index) {
             Option[Path]::Some(module_llvm) => {
+                let module_llvm = clone_path(module_llvm)
                 let object = module_object_path(module_llvm, object_suffix)
                 let fingerprint_path = Path::new(object.as_str() + ".fingerprint")
                 let fingerprint = module_llvm_fingerprint(module_llvm, compiler, base_args)
@@ -1496,7 +1502,7 @@ fn compile_module_object_batch(compiler: str, base_args: Vec[str], paths: Vec[Pa
                 args.push(native_path(module_llvm.as_str()))
                 args.push("-o")
                 args.push(native_path(object.as_str()))
-                let code = run_args(compiler, args)
+                let code = run_args_owned(compiler, args)
                 if code != 0_i32 { ret -1_i32 }
                 if write_file(native_path(fingerprint_path.as_str()), fingerprint) != 0_i32 { ret -1_i32 }
                 compiled = compiled + 1_i32
@@ -1508,7 +1514,7 @@ fn compile_module_object_batch(compiler: str, base_args: Vec[str], paths: Vec[Pa
     ret compiled
 }
 
-fn module_llvm_fingerprint(path: Path, compiler: str, args: Vec[str]) -> str {
+fn module_llvm_fingerprint(path: Path, compiler: str, args: frozen Vec[str]) -> str {
     let mut value = "encore-llvm-module-object-v1\n" + compiler
     for arg in args { value = fingerprint_mix(value, arg) }
     value = fingerprint_mix(value, read_file(native_path(path.as_str())))
@@ -1878,7 +1884,7 @@ fn run_llvm_codegen_worker(ehir_path: Path, llvm_path: Path, target: TargetSpec,
     args.push(native_path(fingerprint_path.as_str()))
     args.push(fingerprint)
     args.push(incremental_configuration)
-    ret run_args(executable, args) == 0_i32
+    ret run_args_owned(executable, args) == 0_i32
 }
 
 fn llvm_codegen_is_incremental_update(ehir_path: Path, llvm_path: Path,
@@ -2363,7 +2369,7 @@ pub fn compile_test_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
     // Respect the resolved host toolchain. This is essential for packaged
     // Windows GNU compilers, whose workers must be linked by LLVM-MinGW rather
     // than an unrelated clang/MSVC installation from PATH.
-    let clang_code = run_args(test_toolchain.compiler, args)
+    let clang_code = run_args_owned(test_toolchain.compiler, args)
     if !keep_temporary_artifacts() {
         remove_file(native_path(ehir_path.as_str()))
         remove_file(native_path(llvm_path.as_str()))
@@ -2422,17 +2428,7 @@ fn run_workspace_semantic_checks(workspace: mut ProjectWorkspace, target: Target
         index = index + 1_usize
     }
     let jobs = prepare_semantic_module_jobs(workspace, modules, target, selected)
-    let worker_count = min_usize(requested_jobs(), jobs.len())
-    let mut pending = Vec[JoinHandle[Vec[SemanticDiagnosticChunk]]]::new()
-    let mut worker = 0_usize
-    while worker < worker_count {
-        pending.push(spawn check_semantic_module_batch(jobs, worker, worker_count))
-        worker += 1_usize
-    }
-    let mut chunks = Vec[SemanticDiagnosticChunk]::new()
-    for handle in pending {
-        chunks.extend(handle.join())
-    }
+    let chunks = check_semantic_module_batch(jobs, 0_usize, 1_usize)
     index = 0_usize
     while index < modules.len() {
         match modules.get(index) {
