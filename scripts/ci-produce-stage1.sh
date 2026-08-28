@@ -13,7 +13,7 @@ shift 3
 targets=("$@")
 
 case "$producer" in
-  linux|darwin) executable=encore ;;
+  linux|darwin|darwin-intel) executable=encore ;;
   windows) executable=encore.exe ;;
   *) echo "unknown producer: $producer" >&2; exit 2 ;;
 esac
@@ -45,14 +45,6 @@ for target in "${targets[@]}"; do
   env_args=(env)
 
   case "$target" in
-    x86_64-apple-darwin)
-      if [[ "$producer" == darwin ]]; then
-        env_args+=("ENCORE_CC=$(xcrun --find clang)"
-          "ENCORE_LINKER=$(xcrun --find clang)"
-          "ENCORE_AR=$(xcrun --find ar)"
-          "ENCORE_SYSROOT=$(xcrun --sdk macosx --show-sdk-path)")
-      fi
-      ;;
     aarch64-unknown-linux-gnu)
       : "${LLVM_MINGW_ROOT:?LLVM_MINGW_ROOT is required for Linux AArch64 stage1}"
       env_args+=("ENCORE_CC=$LLVM_MINGW_ROOT/bin/clang"
