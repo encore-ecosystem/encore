@@ -72,7 +72,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sha=$(git ls-remote https://github.com/encore-ecosystem/encore-index.git refs/heads/main | awk '{print $1}')
+          version=$(tr -d '\r\n' < VERSION)
+          if test "$version" = 0.3.0-beta.0; then
+            # beta.0 is the syntax bridge that bootstraps the strict beta.1
+            # compiler. Keep its system libraries on the pre-capability API;
+            # the one compatibility change removes platform's redundant
+            # path@../core dependency so target kits resolve sys@core once.
+            sha=2809e8bdf34808c8552dbc440e0cd2b36eafc50e
+          else
+            sha=$(git ls-remote https://github.com/encore-ecosystem/encore-index.git refs/heads/main | awk '{print $1}')
+          fi
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "ENCORE_INDEX_URL=https://raw.githubusercontent.com/encore-ecosystem/encore-index/$sha" >> "$GITHUB_ENV"
@@ -100,7 +109,7 @@ jobs:
 
   stage1:
     name: Produce stage1 on ${{ matrix.producer }}
-    needs: resolve-inputs
+    needs: [resolve-inputs, target-kits]
     strategy:
       fail-fast: false
       matrix:
@@ -118,9 +127,12 @@ jobs:
             os: macos-15
             seed_triple: aarch64-apple-darwin
             seed_executable: encore
-            targets: >-
-              aarch64-apple-darwin
-              x86_64-apple-darwin
+            targets: aarch64-apple-darwin
+          - producer: darwin-intel
+            os: macos-15-intel
+            seed_triple: x86_64-apple-darwin
+            seed_executable: encore
+            targets: x86_64-apple-darwin
           - producer: windows
             os: windows-latest
             seed_triple: x86_64-pc-windows-msvc
@@ -140,32 +152,55 @@ jobs:
           repository: encore-ecosystem/encore-index
           ref: ${{ needs.resolve-inputs.outputs.index_sha }}
           path: target/system-index
-      # The audited 0.1.4 seed predates graph-edge EHIR instructions. Its only
-      # bootstrap input is therefore the last compatible core implementation;
-      # the resulting stage1 immediately switches back to the pinned current
-      # index and compiles the release with the new graph-memory core.
       - uses: actions/checkout@v6
         with:
           repository: encore-ecosystem/encore-index
-          ref: 4bdb5ca59a7532f2e513707646eb184cfa49654e
+          ref: 2809e8bdf34808c8552dbc440e0cd2b36eafc50e
           path: target/bootstrap-index
-
       - name: Activate pinned path dependencies
         shell: bash
         run: |
           set -euo pipefail
           index_root="$PWD/../encore-index"
           test ! -e "$index_root"
-          cp -R target/system-index "$index_root"
-          rm -rf "$index_root/packages/core"
-          cp -R target/bootstrap-index/packages/core "$index_root/packages/core"
+          cp -R target/bootstrap-index "$index_root"
           echo "ENCORE_CORE_DIR=$index_root/packages/core" >> "$GITHUB_ENV"
-          echo "ENCORE_RELEASE_CORE_DIR=$PWD/target/system-index/packages/core" >> "$GITHUB_ENV"
+          echo "ENCORE_RELEASE_INDEX_DIR=$PWD/target/system-index" >> "$GITHUB_ENV"
 
       - uses: actions/download-artifact@v8
         with:
           name: trusted-dependencies
           path: target/dependency-download
+
+      - name: Download locally built target kits
+        if: matrix.producer == 'linux'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-candidate-target-kit-*
+          path: target/target-kit-download
+          merge-multiple: true
+
+      - name: Activate locally built target kits
+        if: matrix.producer == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(tr -d '\r\n' < VERSION)
+          abi=$(printf '%s\n' "$version" | awk -F. '{print $1 "." $2}')
+          targets_root="$PWD/target/installed-target-kits"
+          mkdir -p "$targets_root/$abi"
+          for manifest in target/target-kit-download/target-kit-*.json; do
+            test "$(jq -r '.schema' "$manifest")" = 1
+            test "$(jq -r '.abi' "$manifest")" = "$abi"
+            test "$(jq -r '.host' "$manifest")" = x86_64-unknown-linux-gnu
+            target=$(jq -r '.target' "$manifest")
+            archive="target/target-kit-download/target-kit-x86_64-unknown-linux-gnu--$target.tar.xz"
+            expected=$(jq -r '.sha256' "$manifest")
+            test "$(sha256sum "$archive" | awk '{print $1}')" = "$expected"
+            mkdir -p "$targets_root/$abi/$target"
+            tar -xJf "$archive" -C "$targets_root/$abi/$target"
+          done
+          echo "ENCORE_TARGETS_DIR=$targets_root" >> "$GITHUB_ENV"
 
       - name: Activate verified offline dependencies
         shell: bash
@@ -331,7 +366,7 @@ jobs:
           - os: macos-15-intel
             triple: x86_64-apple-darwin
             executable: encore
-            producer: darwin
+            producer: darwin-intel
           - os: macos-15
             triple: aarch64-apple-darwin
             executable: encore

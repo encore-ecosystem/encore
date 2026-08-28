@@ -497,7 +497,8 @@ fn without_cfg_attrs(item: FunctionItem) -> FunctionItem {
     }
     ret FunctionItem {
         attrs, item.decorators, item.is_public, item.is_extern, item.is_async, item.name, item.documentation, item.generics,
-        item.params, item.ret_type, item.body, item.source_name, item.line, item.column
+        item.params, item.ret_type, item.returns_sending, item.returns_frozen, item.body,
+        item.source_name, item.line, item.column
     }
 }
 
@@ -2679,6 +2680,26 @@ fn ctx_lookup_function_param(ctx: mut TranslatorContext, source_name: str, name:
             }
         }
     }
+    // Re-exported nominal types keep their defining method name while the
+    // caller sees the public alias. Recover that signature so borrowed or
+    // mutable receivers are lowered with their real ABI.
+    let mut fallback_index = ctx.functions.len()
+    while fallback_index > 0_usize {
+        fallback_index -= 1_usize
+        match ctx.functions.get(fallback_index) {
+            Some(item) => {
+                if item.name == name {
+                    match item.params.get(index) {
+                        Some(typ) => {
+                            ret Option[str]::Some(specialize_named_type(typ, item.generics, generic_args))
+                        }
+                        None => { ret Option[str]::None }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
     ret Option[str]::None
 }
 
@@ -3700,8 +3721,8 @@ fn decorator_named(ctx: mut TranslatorContext, name: str, owner: str, source_nam
     }
     ret DecoratorType{"", FunctionItem{Vec[str]::new(), Vec[DecoratorApplication]::new(), false,
         false, false, "", Option[Documentation]::None, Vec[GenericParam]::new(),
-        Vec[FunctionParam]::new(), Option[str]::None, Option[ParsedBlock]::None, source_name, line,
-        column}}
+        Vec[FunctionParam]::new(), Option[str]::None, false, false, Option[ParsedBlock]::None,
+        source_name, line, column}}
 }
 
 fn decorator_receiver_owner(ctx: mut TranslatorContext, receiver: ExprNode) -> str {
@@ -3752,7 +3773,7 @@ fn resolve_decorator(ctx: mut TranslatorContext, application: DecoratorApplicati
     }
     ret ResolvedDecorator{"", FunctionItem{Vec[str]::new(), Vec[DecoratorApplication]::new(), false,
         false, false, "", Option[Documentation]::None, Vec[GenericParam]::new(),
-        Vec[FunctionParam]::new(), Option[str]::None, Option[ParsedBlock]::None,
+        Vec[FunctionParam]::new(), Option[str]::None, false, false, Option[ParsedBlock]::None,
         expression.source_name, expression.line, expression.column}, Option[ExprNode]::None,
         Vec[ExprNode]::new()}
 }
@@ -3767,7 +3788,8 @@ fn decorator_wrapper_params(item: FunctionItem) -> Vec[FunctionParam] {
     let mut params = Vec[FunctionParam]::new()
     let mut index = 0_usize
     for param in item.params {
-        params.push(FunctionParam{"__decorated_arg_" + Debug::fmt(index), param.typ})
+        params.push(FunctionParam{"__decorated_arg_" + Debug::fmt(index), param.typ,
+                param.is_sending, param.is_frozen})
         index += 1_usize
     }
     ret params
@@ -3788,7 +3810,7 @@ fn required_decorator_param(item: FunctionItem, index: usize, source_name: str, 
                 "decorator '" + item.name + "' does not declare its required compiler parameters",)
         }
     }
-    ret FunctionParam{"", Option[str]::None}
+    ret FunctionParam{"", Option[str]::None, false, false}
 }
 
 fn decorator_wrapper_body(resolved: ResolvedDecorator, target: FunctionItem) -> ParsedBlock {
@@ -3866,8 +3888,9 @@ fn translate_decorated_function(ctx: mut TranslatorContext, item: FunctionItem,
     }
     let raw_name = decorator_hidden_name(item, item.decorators.len())
     let raw_item = FunctionItem{Vec[str]::new(), Vec[DecoratorApplication]::new(), false, false,
-        item.is_async, raw_name, Option[Documentation]::None, item.generics, item.params, item.ret_type,
-        item.body, item.source_name, item.line, item.column}
+        item.is_async, raw_name, Option[Documentation]::None, item.generics, item.params,
+        item.ret_type, item.returns_sending, item.returns_frozen, item.body, item.source_name,
+        item.line, item.column}
     let raw_emitted = register_decorator_layer(ctx, raw_item, raw_name)
     let mut builder = translate_function_named(ctx, raw_item, raw_emitted, function_ret_type(item),
         Vec[GenericParam]::new(),)
@@ -3898,7 +3921,7 @@ fn translate_decorated_function(ctx: mut TranslatorContext, item: FunctionItem,
         let wrapper_item = FunctionItem{item.attrs, Vec[DecoratorApplication]::new(),
             layer == 0_usize && item.is_public, false, item.is_async, wrapper_name,
             if layer == 0_usize { item.documentation } else { Option[Documentation]::None },
-            item.generics, wrapper_params, item.ret_type,
+            item.generics, wrapper_params, item.ret_type, item.returns_sending, item.returns_frozen,
             Option[ParsedBlock]::Some(decorator_wrapper_body(resolved, item)), item.source_name,
             item.line, item.column}
         let wrapper_emitted = if layer == 0_usize { emitted_name } else {
@@ -4193,7 +4216,8 @@ EhirTextBuilder {
     let raw_name = decorator_hidden_name(item, item.decorators.len())
     let raw_item = FunctionItem{Vec[str]::new(), Vec[DecoratorApplication]::new(), false, false,
         item.is_async, raw_name, Option[Documentation]::None, item.generics, item.params,
-        item.ret_type, item.body, item.source_name, item.line, item.column}
+        item.ret_type, item.returns_sending, item.returns_frozen, item.body, item.source_name,
+        item.line, item.column}
     register_decorator_method_layer(ctx, raw_item, owner, impl_generics)
     let mut builder = translate_function_named(ctx, raw_item, raw_name, ret_type, impl_generics)
     let owner_base = base_type_name(owner)
@@ -4224,7 +4248,7 @@ EhirTextBuilder {
         let wrapper_item = FunctionItem{item.attrs, Vec[DecoratorApplication]::new(),
             layer == 0_usize && item.is_public, false, item.is_async, wrapper_name,
             if layer == 0_usize { item.documentation } else { Option[Documentation]::None },
-            item.generics, wrapper_params, item.ret_type,
+            item.generics, wrapper_params, item.ret_type, item.returns_sending, item.returns_frozen,
             Option[ParsedBlock]::Some(decorator_wrapper_body(resolved, item)), item.source_name,
             item.line, item.column}
         if layer > 0_usize {
