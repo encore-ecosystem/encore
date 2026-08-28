@@ -2,13 +2,14 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: build-target-kit.sh --host TRIPLE --target TRIPLE --toolchain DIR --platform DIR --out DIR --compiler PATH --linker PATH --archiver PATH [--sysroot PATH] [--compile-arg ARG] [--link-arg ARG] [--base-url URL]" >&2
+  echo "usage: build-target-kit.sh --host TRIPLE --target TRIPLE --toolchain DIR --core DIR --platform DIR --out DIR --compiler PATH --linker PATH --archiver PATH [--sysroot PATH] [--compile-arg ARG] [--link-arg ARG] [--base-url URL]" >&2
   exit 2
 }
 
 host=
 target=
 toolchain=
+core=
 platform=
 out=
 compiler=
@@ -23,6 +24,7 @@ while (($#)); do
     --host) host=$2; shift 2 ;;
     --target) target=$2; shift 2 ;;
     --toolchain) toolchain=$2; shift 2 ;;
+    --core) core=$2; shift 2 ;;
     --platform) platform=$2; shift 2 ;;
     --out) out=$2; shift 2 ;;
     --compiler) compiler=$2; shift 2 ;;
@@ -37,7 +39,8 @@ while (($#)); do
 done
 
 test -n "$host" && test -n "$target" && test -d "$toolchain" &&
-  test -d "$platform" && test -n "$out" && test -n "$compiler" &&
+  test -d "$core" && test -f "$core/encore.toml" &&
+  test -d "$platform" && test -f "$platform/encore.toml" && test -n "$out" && test -n "$compiler" &&
   test -n "$linker" && test -n "$archiver" || usage
 
 version=$(tr -d '\r\n' < "$(dirname "$0")/../VERSION")
@@ -47,6 +50,7 @@ trap 'rm -rf "$work"' EXIT
 payload="$work/payload"
 mkdir -p "$payload/toolchain" "$out"
 cp -RL "$toolchain"/. "$payload/toolchain/"
+cp -RL "$core" "$payload/core"
 cp -RL "$platform" "$payload/platform"
 
 compiler_path="toolchain/$compiler"
