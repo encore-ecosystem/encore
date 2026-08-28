@@ -31,10 +31,10 @@ chmod +x "$builder" 2>/dev/null || true
 
 # The seed can only parse the pre-edge core used for the bridge build. Restore
 # the exact pinned release core before stage1 compiles any release artifact.
-: "${ENCORE_RELEASE_CORE_DIR:?ENCORE_RELEASE_CORE_DIR is required}"
+: "${ENCORE_RELEASE_INDEX_DIR:?ENCORE_RELEASE_INDEX_DIR is required}"
 index_root="$PWD/../encore-index"
-rm -rf "$index_root/packages/core"
-cp -R "$ENCORE_RELEASE_CORE_DIR" "$index_root/packages/core"
+rm -rf "$index_root"
+cp -R "$ENCORE_RELEASE_INDEX_DIR" "$index_root"
 export ENCORE_CORE_DIR="$index_root/packages/core"
 
 for target in "${targets[@]}"; do
