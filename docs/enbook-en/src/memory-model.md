@@ -65,34 +65,31 @@ let second = first
 `first` and `second` are independent `Pair` payloads, but their `target` fields
 are two owning handles to the same node.
 
-One local-binding rule is intentionally different. If `a` is already a
-mutable local path, `let mut b = a` gives `b` another name for the same local
-cell. It does not copy the value and does not create another graph edge.
-Aliases are resolved before canonical SSA EHIR:
+An immutable binding is a read-only capability. `mut` may be introduced for a
+fresh expression, but cannot be recovered from an immutable path. This closes
+the alias-laundering hole where a new binding could manufacture a writer from
+a reader:
 
 ```enq
-let mut a = Pair{1_u32, Target<H>{10_u32}}
-let mut b = a
-b.left = 2_u32
-// a.left is now 2 because a and b name the same local cell.
+let a = Pair{1_u32, Target<H>{10_u32}}
+// let mut b = a  // error: mutable-alias-from-readonly
 ```
 
-An immutable binding, an expression, or a non-mutable source is copied rather
-than aliased.
+A mutable capability can instead be passed directly to a `mut` parameter or
+receiver. Ordinary value copies remain ordinary read-only bindings.
 
 ### Mutation
 
-`mut` applies to a local cell, not to a pointer kind. It permits rebinding or
-updating that local inline value. It is removed by the local-to-SSA pass and
-must never be represented as `T<S>`.
+`mut` is a deep path capability, not a pointer kind. It permits rebinding and
+mutation through every field or element projected from that path. It is
+removed by the local-to-SSA pass and must never be represented as `T<S>`.
 
-Inline `mut T` function parameters and receivers are not supported. A function
-which mutates an object accepts `T<S>`, `T<H>` or, normally, `T&`. Every owning
-handle may mutate its node payload; `mut` on the handle binding is needed only
-to replace the handle itself.
+Function parameters and receivers opt into mutation explicitly with `mut T`.
+An ordinary parameter, including ordinary `self`, is read-only. Owning a node
+handle does not implicitly grant write access to its payload.
 
 ```enq
-fn increment(counter: Counter&) -> () {
+fn increment(counter: mut Counter&) -> () {
     counter.value += 1_u32
 }
 ```

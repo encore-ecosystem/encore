@@ -2,6 +2,11 @@ name: Native CI
 
 on:
   workflow_dispatch:
+    inputs:
+      seed_tag:
+        description: Exact official compiler release tag used for bootstrap
+        required: false
+        type: string
   pull_request:
   push:
     branches: [trunk]
@@ -25,11 +30,14 @@ jobs:
       index_sha: ${{ steps.index.outputs.sha }}
     steps:
       - uses: actions/checkout@v6
-      - name: Select latest complete stable compiler once
+      - name: Select compatible complete compiler once
         id: seed
         shell: bash
+        env:
+          REQUESTED_SEED_TAG: ${{ inputs.seed_tag }}
         run: |
           set -euo pipefail
+          version=$(tr -d '\r\n' < VERSION)
           selected=
           required='[
             "encore-x86_64-unknown-linux-gnu.tar.gz",
@@ -38,27 +46,52 @@ jobs:
             "encore-aarch64-apple-darwin.tar.gz",
             "encore-x86_64-pc-windows-msvc.zip"
           ]'
-          while IFS= read -r tag; do
-            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-            assets=$(gh release view "$tag" --json isDraft,isPrerelease,assets)
-            test "$(jq -r '.isDraft or .isPrerelease' <<<"$assets")" = false || continue
+          if test "$version" = 0.3.0-beta.1; then
+            selected=v0.3.0-beta.0.1
+            if test -n "$REQUESTED_SEED_TAG" && test "$REQUESTED_SEED_TAG" != "$selected"; then
+              echo "::error::Encore $version requires bridge seed $selected, got $REQUESTED_SEED_TAG"
+              exit 1
+            fi
+            assets=$(gh release view "$selected" --json isDraft,assets)
+            test "$(jq -r '.isDraft' <<<"$assets")" = false
+            if ! jq -e --argjson required "$required" \
+              '([.assets[].name] as $actual | $required - $actual | length) == 0' <<<"$assets" >/dev/null
+            then
+              echo "::error::Bridge seed $selected is missing required bootstrap assets"
+              exit 1
+            fi
+          elif test -n "$REQUESTED_SEED_TAG"; then
+            selected=$REQUESTED_SEED_TAG
+            assets=$(gh release view "$selected" --json isDraft,assets)
+            test "$(jq -r '.isDraft' <<<"$assets")" = false
             if jq -e --argjson required "$required" \
               '([.assets[].name] as $actual | $required - $actual | length) == 0' <<<"$assets" >/dev/null
             then
-              selected=$tag
-              break
+              :
+            else
+              echo "::error::Requested seed $selected is missing required bootstrap assets"
+              exit 1
             fi
-          done < <(gh release list --limit 100 --json tagName,publishedAt \
-            --jq 'sort_by(.publishedAt) | reverse | .[].tagName')
-          # No immutable stable distribution predates the 0.1.5 pipeline.
-          # Keep the audited one-time bootstrap as the explicit transition
-          # seed until the first complete stable candidate is promoted.
-          if test -z "$selected"; then
-            selected=bootstrap/v0.1.4.3
-            assets=$(gh release view "$selected" --json assets)
-            jq -e --argjson required "$required" \
-              '([.assets[].name] as $actual | $required - $actual | length) == 0' \
-              <<<"$assets" >/dev/null
+          else
+            while IFS= read -r tag; do
+              [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+              assets=$(gh release view "$tag" --json isDraft,isPrerelease,assets)
+              test "$(jq -r '.isDraft or .isPrerelease' <<<"$assets")" = false || continue
+              if jq -e --argjson required "$required" \
+                '([.assets[].name] as $actual | $required - $actual | length) == 0' <<<"$assets" >/dev/null
+              then
+                selected=$tag
+                break
+              fi
+            done < <(gh release list --limit 100 --json tagName,publishedAt \
+              --jq 'sort_by(.publishedAt) | reverse | .[].tagName')
+            if test -z "$selected"; then
+              selected=bootstrap/v0.1.4.3
+              assets=$(gh release view "$selected" --json assets)
+              jq -e --argjson required "$required" \
+                '([.assets[].name] as $actual | $required - $actual | length) == 0' \
+                <<<"$assets" >/dev/null
+            fi
           fi
           test -n "$selected" || {
             echo "::error::No complete stable release contains every bootstrap target"
@@ -155,7 +188,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: encore-ecosystem/encore-index
-          ref: 2809e8bdf34808c8552dbc440e0cd2b36eafc50e
+          ref: d98d316b665d2798a035ea91d7e16d19f9b03a2b
           path: target/bootstrap-index
       - name: Activate pinned path dependencies
         shell: bash
