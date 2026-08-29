@@ -5,6 +5,7 @@ on:
     tags:
       - "v[0-9]*.[0-9]*.[0-9]*"
       - "v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*"
+      - "v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*.[0-9]*"
       - "v[0-9]*.[0-9]*.[0-9]*-nightly.[0-9]*"
 
 permissions:
@@ -32,7 +33,7 @@ jobs:
           test "$(sed -n 's/.*ret "\([^"]*\)".*/\1/p' src/version.enq)" = "$version"
           if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}$ ]]; then
             channel=nightly
-          elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
+          elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+(\.[0-9]+)?$ ]]; then
             channel=beta
           elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             channel=stable
@@ -136,6 +137,10 @@ jobs:
 
       - uses: softprops/action-gh-release@v3
         with:
+          # Immutable releases must receive every asset while they are still a
+          # draft. Publishing a prerelease first makes all subsequent uploads
+          # fail, leaving behind an empty release.
+          draft: true
           files: |
             dist/encore-*
             dist/target-kit-*
@@ -151,15 +156,28 @@ jobs:
           CHANNEL: ${{ steps.candidate.outputs.channel }}
         run: |
           set -euo pipefail
-          pointer="channel-$CHANNEL"
-          if gh release view "$pointer" >/dev/null 2>&1; then
-            gh release upload "$pointer" dist/channel.json --clobber
-            gh release edit "$pointer" --target "$GITHUB_SHA" \
-              --notes "Current $CHANNEL compiler: Encore ${GITHUB_REF_NAME#v}"
-          else
-            gh release create "$pointer" dist/channel.json \
-              --target "$GITHUB_SHA" \
-              --title "Encore $CHANNEL channel" \
-              --notes "Current $CHANNEL compiler: Encore ${GITHUB_REF_NAME#v}" \
-              --prerelease
+          pointer_branch="release-channel-$CHANNEL"
+          pointer_index=$(mktemp)
+          trap 'rm -f "$pointer_index"' EXIT
+          export GIT_INDEX_FILE=$pointer_index
+          parent_args=()
+          git read-tree --empty
+          if git fetch origin "refs/heads/$pointer_branch"; then
+            git read-tree FETCH_HEAD
+            parent_args=(-p FETCH_HEAD)
           fi
+          blob=$(git hash-object -w dist/channel.json)
+          git update-index --add --cacheinfo 100644 "$blob" channel.json
+          tree=$(git write-tree)
+          export GIT_AUTHOR_NAME=github-actions GIT_COMMITTER_NAME=github-actions
+          export GIT_AUTHOR_EMAIL=41898282+github-actions[bot]@users.noreply.github.com
+          export GIT_COMMITTER_EMAIL=$GIT_AUTHOR_EMAIL
+          commit=$(printf 'Update %s release channel to %s\n' "$CHANNEL" "$GITHUB_REF_NAME" | \
+            git commit-tree "$tree" "${parent_args[@]}")
+          git push origin "$commit:refs/heads/$pointer_branch"
+
+      - name: Publish immutable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$GITHUB_REF_NAME" --draft=false
