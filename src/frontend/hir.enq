@@ -65,6 +65,7 @@ pub struct HirDefinition {
     column: usize
     length: usize
     typ: TypeId
+    rename_binding: str
 }
 
 /// One imported or locally declared name in a module namespace.
@@ -96,12 +97,23 @@ impl for HirDefinition {
         typ: TypeId,
     ) -> Self {
         ret Self {
-            id, module_name, name, kind, namespace, is_public, source_name, line, column, length, typ
+            id, module_name, name, kind, namespace, is_public, source_name, line, column, length, typ, ""
         }
     }
 
     pub fn id(self: Self) -> DefinitionId {
         ret self.id
+    }
+    /// Physical declaration identity shared by logical and URI module views.
+    /// Owner, kind, name and ordinal remain stable when preceding lines change.
+    pub fn source_identity(self: Self) -> DefinitionId {
+        if self.source_name == "" {
+            ret self.id
+        }
+        let key = self.source_name + self.id.key.slice(self.module_name.len(), self.id.key.len() - self.module_name.len())
+        ret DefinitionId {
+            nonzero_hash(key), key
+        }
     }
     pub fn module_name(self: Self) -> str {
         ret self.module_name
@@ -132,6 +144,18 @@ impl for HirDefinition {
     }
     pub fn typ(self: Self) -> TypeId {
         ret self.typ
+    }
+    /// An explicit import alias has an independent rename identity, but keeps
+    /// the original declaration ID and span for navigation and type analysis.
+    pub fn rename_binding(self: Self) -> str {
+        ret self.rename_binding
+    }
+    pub fn with_rename_binding(self: Self, binding: str) -> Self {
+        ret Self {
+            self.id, self.module_name, self.name, self.kind, self.namespace,
+            self.is_public, self.source_name, self.line, self.column, self.length,
+            self.typ, binding
+        }
     }
 }
 
@@ -178,6 +202,17 @@ impl for ExpressionId {
 }
 
 impl for TypeId {
+    /// Gives a nominal type its physical declaration identity, independently
+    /// of imports, aliases, and logical module views of the same source.
+    pub fn declared(id: DefinitionId, module_name: str, source_name: str, display: str) -> Self {
+        let identity = if source_name == "" {
+            id.key()
+        } else {
+            source_name + id.key().slice(module_name.len(), id.key().len() - module_name.len())
+        }
+        ret Self::named("declaration:" + identity, display)
+    }
+
     pub fn unknown() -> Self {
         ret Self {
             0_u64, "", ""
@@ -221,22 +256,59 @@ impl for ModuleDefMap {
     }
 
     pub fn insert(self: mut Self, definition: HirDefinition) ->() {
-        self.scope.push(ScopeEntry {
-                definition.name, definition.namespace, definition.id
-            }
-            ,
-        )
+        // Receiver members have an owner scope, not the module namespace.
+        let module_scoped = match definition.kind {
+            DefinitionKind::Method => false
+            DefinitionKind::Field => false
+            DefinitionKind::Variant => false
+            DefinitionKind::Parameter => false
+            DefinitionKind::GenericParameter => false
+            _ => true
+        }
+        if module_scoped {
+            self.scope.push(ScopeEntry {
+                    definition.name, definition.namespace, definition.id
+                }
+                ,)
+        }
         self.definitions.push(definition)
         ret()
     }
 
     pub fn resolve(self: Self, name: str, namespace: DefinitionNamespace) -> Option[DefinitionId] {
-        for entry in self.scope {
-            if entry.name == name && same_namespace(entry.namespace, namespace) {
-                ret Option[DefinitionId]::Some(entry.definition)
+        match self.named_definition(name, namespace) {
+            Some(definition) => {
+                ret Option[DefinitionId]::Some(definition.id)
+            }
+            None => {
+                ret Option[DefinitionId]::None
             }
         }
-        ret Option[DefinitionId]::None
+    }
+
+    /// Resolve the scope entry itself: several aliases can share a declaration ID.
+    pub fn named_definition(self: Self, name: str, namespace: DefinitionNamespace) -> Option[HirDefinition] {
+        let mut imported = Option[HirDefinition]::None
+        for entry in self.scope {
+            if entry.name == name && same_namespace(entry.namespace, namespace) {
+                for definition in self.definitions {
+                    if definition.name == name && same_namespace(definition.namespace, namespace)
+                    && definition.id.key == entry.definition.key {
+                        match definition.kind {
+                            DefinitionKind::Import => {
+                                if imported.is_none() {
+                                    imported = Option[HirDefinition]::Some(definition)
+                                }
+                            }
+                            _ => {
+                                ret Option[HirDefinition]::Some(definition)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ret imported
     }
 
     pub fn definition(self: Self, id: DefinitionId) -> Option[HirDefinition] {

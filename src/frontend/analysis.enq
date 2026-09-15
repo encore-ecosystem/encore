@@ -206,6 +206,14 @@ impl for FrontendDocument {
         }
     }
 
+    /// Projects declaration metadata without exposing retained syntax trees.
+    pub fn declarations(self: Self) -> Self {
+        ret Self {
+            self.tokens, Vec[Statement]::new(), self.module_documentation,
+            self.diagnostics, self.symbols, self.callables, self.dependencies, self.parsed
+        }
+    }
+
     /// Creates a fast declaration outline for latency-sensitive editor requests.
     pub fn outline(module_name: str, source: str) -> Self {
         let mut lexer = Lexer::new()
@@ -337,6 +345,11 @@ fn push_fstring_tooling_tokens(out: mut Vec[Token], string_token: Token) ->() {
 ///
 /// This mode is suitable for editors while a document is incomplete.
 pub fn analyze_module_lightweight(module_name: str, source: str) -> FrontendDocument {
+    ret analyze_named_editor_module(module_name, module_name, source).declarations()
+}
+
+/// Retains recovered syntax and physical source identity for worker ingestion.
+pub fn analyze_named_editor_module(module_name: str, source_name: str, source: str) -> FrontendDocument {
     let mut lexer = Lexer::new()
     let tokens = lexer.tokenize(source)
     let module_documentation = collect_module_documentation(tokens)
@@ -374,15 +387,24 @@ pub fn analyze_module_lightweight(module_name: str, source: str) -> FrontendDocu
 
     diagnostics.extend(collect_declaration_diagnostics(tokens))
 
+    // Structural balance is not a successful parse. Validate editor input
+    // through the same recoverable parser before scheduling deeper queries.
+    let mut parser = Parser::new_for_source(source_name)
+    let parsed = parser.parse_recovering(tokens)
+    for failure in parsed.failures {
+        diagnostics.push(FrontendDiagnostic::new(1_usize, "parse-error", failure.message,
+                failure.line, failure.column, 1_usize,))
+    }
+
     ret FrontendDocument {
         tokens,
-        Vec[Statement]::new(),
+        parsed.statements,
         module_documentation,
         diagnostics,
         symbols,
         callables,
         dependencies,
-        true
+        diagnostics.len() == 0_usize
     }
 }
 
@@ -422,36 +444,16 @@ pub fn analyze_named_tokens(module_name: str, source_name: str, tokens: Vec[Toke
         }
     }
 
-    let structural_diagnostics = collect_structural_diagnostics(tokens)
-    if structural_diagnostics.len() > 0_usize {
-        ret FrontendDocument {
-            tokens,
-            Vec[Statement]::new(),
-            module_documentation,
-            structural_diagnostics,
-            symbols,
-            callables,
-            DependencyGraph::new(),
-            false
-        }
-    }
-
+    diagnostics.extend(collect_structural_diagnostics(tokens))
     diagnostics.extend(collect_declaration_diagnostics(tokens))
-    if diagnostics.len() > 0_usize {
-        ret FrontendDocument {
-            tokens,
-            Vec[Statement]::new(),
-            module_documentation,
-            diagnostics,
-            symbols,
-            callables,
-            DependencyGraph::new(),
-            false
-        }
-    }
 
     let mut parser = Parser::new_for_source(source_name)
-    let ast = parser.parse(tokens)
+    let report = parser.parse_recovering(tokens)
+    let ast = report.statements
+    for failure in report.failures {
+        diagnostics.push(FrontendDiagnostic::new(1_usize, "parse-error", failure.message,
+                failure.line, failure.column, 1_usize,))
+    }
     let dependencies = DependencyGraph::from_tokens(module_name, tokens)
 
     ret FrontendDocument {
@@ -462,7 +464,7 @@ pub fn analyze_named_tokens(module_name: str, source_name: str, tokens: Vec[Toke
         symbols,
         callables,
         dependencies,
-        true
+        diagnostics.len() == 0_usize
     }
 }
 

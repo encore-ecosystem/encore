@@ -4,12 +4,13 @@ import core::option::Option
 import core::result::Result
 import core::vec::Vec
 import json::{Json, ParseError, parse}
-import std::io::println
+import std::io::eprintln
 import std::os::{env, file_exists, file_sha256, home_dir, mkdir_all, read_file, remove_file, write_file}
 import std::path::Path
 import std::process::{run_args, run_args_capture}
 import refrain::version::compiler_version
-import mod::manifest::{project_manifest_name, project_manifest_version, read_project_manifest}
+import mod::manifest::{project_manifest_name, project_manifest_version, try_read_project_manifest, ProjectManifest}
+import mod::failure::ProjectFailure
 
 /// Performs the `normalize_dependency_reference` operation.
 pub fn normalize_dependency_reference(raw: str) -> str {
@@ -664,6 +665,18 @@ fn semantic_identifier_is_numeric(value: str) -> bool {
 }
 
 fn resolve_locked_package(project_root: Path, reference: str) -> str {
+    ret locked_package_root(project_root, reference, true)
+}
+
+/// Finds an installed, lockfile-compatible package without network or writes.
+/// Editor discovery must never download dependencies as a side effect.
+pub fn resolve_cached_index_dependency(reference: str, project_root: Path) -> str {
+    let base = dependency_base_reference(reference)
+    if !starts_with(base, "index@") { ret "" }
+    ret locked_package_root(project_root, base, false)
+}
+
+fn locked_package_root(project_root: Path, reference: str, allow_install: bool) -> str {
     let lock = project_root.join("encore.lock")
     if !file_exists(lock.as_str()) { ret "" }
     let source = read_file(lock.as_str())
@@ -682,6 +695,7 @@ fn resolve_locked_package(project_root: Path, reference: str) -> str {
     if name != expected_name || !registry_version_matches(version, requirement) { ret "" }
     let root = package_cache_root(name, version, checksum)
     if file_exists(root.join("encore.toml").as_str()) { ret root.as_str() }
+    if !allow_install { ret "" }
     ret install_package(name, RegistryVersion{version, archive, checksum})
 }
 
@@ -748,8 +762,7 @@ fn install_package(name: str, version: RegistryVersion) -> str {
         registry_error("Invalid package archive for " + name + " " + version.version + ": encore.toml must be at the archive root")
         ret ""
     }
-    let manifest = read_project_manifest(package_root)
-    if project_manifest_name(manifest) != name || project_manifest_version(manifest) != version.version {
+    if !registry_manifest_matches(package_root, name, version.version) {
         registry_error("Package manifest does not match registry entry for " + name + " " + version.version)
         ret ""
     }
@@ -888,7 +901,20 @@ fn archive_entry_types_safe(listing: str) -> bool {
 }
 
 fn empty_version() -> RegistryVersion { ret RegistryVersion{"", "", ""} }
-fn registry_error(message: str) -> () { println("Error: " + message) ret () }
+fn registry_manifest_matches(root: Path, name: str, version: str) -> bool {
+    match try_read_project_manifest(root) {
+        Result[ProjectManifest, ProjectFailure]::Ok(manifest) => {
+            ret project_manifest_name(manifest) == name && project_manifest_version(manifest) == version
+        }
+        Result[ProjectManifest, ProjectFailure]::Err(failure) => {
+            registry_error(failure.message)
+            ret false
+        }
+    }
+    ret false
+}
+
+fn registry_error(message: str) -> () { eprintln("Error: " + message) ret () }
 fn starts_with(value: str, prefix: str) -> bool { ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix }
 fn trim_trailing_slash(value: str) -> str {
     if value.len() > 0_usize && value.slice(value.len() - 1_usize, 1_usize) == "/" { ret value.slice(0_usize, value.len() - 1_usize) }
