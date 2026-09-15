@@ -1,0 +1,86 @@
+//! Resolved import edges preserve source identity across aliases and workspaces.
+
+import core::testing::assert
+import core::option::Option
+import core::vec::Vec
+import refrain::frontend::{AnalysisDatabase, ModuleImportTarget, DefinitionNamespace, HirDefinition, Lexer, DependencyGraph}
+
+fn main() -> u32 {
+    let mut lexer = Lexer::new()
+    let graph = DependencyGraph::from_tokens("sample", lexer.tokenize("import library::io as console"))
+    for edge in graph.all() {
+        if !assert(edge.target == "library::io as console") { ret 6_u32 }
+    }
+    let mut database = AnalysisDatabase::new()
+    database.set_module("file:///one/api", "one/api.enq", "pub import bridge::value as renamed")
+    database.set_module("file:///one/impl", "one/impl.enq", "pub fn value() -> u32 { ret 1 }")
+    database.set_module("file:///two/impl", "two/impl.enq", "pub fn value() -> u32 { ret 2 }")
+    let mut targets = Vec[ModuleImportTarget]::new()
+    targets.push(ModuleImportTarget { "bridge", "file:///one/impl" })
+    database.set_module_import_targets("file:///one/api", targets)
+    let exports = database.module_exports("file:///one/api")
+    if !assert(exports.len() == 1_usize) { ret 9_u32 }
+    for exported in exports {
+        if !assert(exported.name() == "renamed" && exported.source_name() == "one/impl.enq") { ret 10_u32 }
+    }
+    match database.module_definition("file:///one/api", "renamed", DefinitionNamespace::Value) {
+        Option[HirDefinition]::Some(definition) => {
+            if !assert(definition.source_name() == "one/impl.enq") { ret 1_u32 }
+        }
+        Option[HirDefinition]::None => { ret 2_u32 }
+    }
+    let revision = database.revision()
+    database.set_module_import_targets("file:///one/api", targets)
+    if !assert(database.revision() == revision) { ret 3_u32 }
+    // A line-only edit moves declaration spans without changing its type.
+    database.set_module("file:///one/impl", "one/impl.enq", "\n\npub fn value() -> u32 { ret 1 }")
+    match database.module_definition("file:///one/api", "renamed", DefinitionNamespace::Value) {
+        Option[HirDefinition]::Some(definition) => {
+            if !assert(definition.line() == 2_usize && definition.column() == 7_usize) { ret 7_u32 }
+        }
+        Option[HirDefinition]::None => { ret 8_u32 }
+    }
+    let mut replacement = Vec[ModuleImportTarget]::new()
+    replacement.push(ModuleImportTarget { "bridge", "file:///two/impl" })
+    database.set_module_import_targets("file:///one/api", replacement)
+    match database.module_definition("file:///one/api", "renamed", DefinitionNamespace::Value) {
+        Option[HirDefinition]::Some(definition) => {
+            if !assert(definition.source_name() == "two/impl.enq") { ret 4_u32 }
+        }
+        Option[HirDefinition]::None => { ret 5_u32 }
+    }
+    database.set_module("file:///one/api", "one/api.enq",
+        "import bridge::value as renamed\nfn renamed() -> u32 { ret 3 }\npub trait Reader { fn read(self: Self) -> u32 }")
+    match database.module_definition("file:///one/api", "renamed", DefinitionNamespace::Value) {
+        Some(definition) => {
+            if !assert(definition.source_name() == "one/api.enq") { ret 11_u32 }
+        }
+        None => { ret 12_u32 }
+    }
+    if !assert(database.module_definition("file:///one/api", "read", DefinitionNamespace::Value).is_none()) { ret 13_u32 }
+    for exported in database.module_exports("file:///one/api") {
+        if !assert(exported.name() == "Reader") { ret 14_u32 }
+    }
+    database.set_module("file:///one/api", "one/api.enq",
+        "pub import bridge::{value as first, value as second, value as value}\n")
+    let first = database.module_definition("file:///one/api", "first", DefinitionNamespace::Value)
+    let second = database.module_definition("file:///one/api", "second", DefinitionNamespace::Value)
+    match first {
+        Some(a) => {
+            match second {
+                Some(b) => {
+                    if !assert(a.id().key() == b.id().key()) { ret 15_u32 }
+                    if !assert(a.name() == "first" && b.name() == "second") { ret 16_u32 }
+                    if !assert(a.rename_binding() != b.rename_binding() && a.rename_binding() != "") { ret 17_u32 }
+                }
+                None => { ret 18_u32 }
+            }
+        }
+        None => { ret 19_u32 }
+    }
+    match database.module_definition("file:///one/api", "value", DefinitionNamespace::Value) {
+        Some(a) => { if !assert(a.rename_binding() != "") { ret 20_u32 } }
+        None => { ret 21_u32 }
+    }
+    ret 0_u32
+}

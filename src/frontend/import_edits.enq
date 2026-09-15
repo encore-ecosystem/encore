@@ -1,0 +1,128 @@
+//! Plans import insertion without rewriting documentation or existing imports.
+
+import core::option::Option
+import refrain::frontend::lexer::{Lexer, Token, TokenType}
+
+pub struct ImportInsertion {
+    line: usize
+    column: usize
+    text: str
+}
+
+fn trivia(kind: TokenType) -> bool {
+    ret kind == TokenType::WHITESPACE || kind == TokenType::NEWLINE
+    || kind == TokenType::ONE_LINE_COMMENT || kind == TokenType::MULTI_LINE_COMMENT
+    || kind == TokenType::MODULE_DOC_COMMENT
+}
+
+fn token_end(token: Token) ->(usize, usize) {
+    let mut line = token.line
+    let mut last_line = 0_usize
+    let mut index = 0_usize
+    while index < token.value.byte_len() {
+        if token.value.byte_at(index) == 10_u8 {
+            line += 1_usize
+            last_line = index + 1_usize
+        }
+        index += 1_usize
+    }
+    let column = if line == token.line {
+        token.column + token.value.char_len()
+    } else {
+        token.value.slice_bytes(last_line, token.value.byte_len() - last_line).char_len()
+    }
+    ret(line, column)
+}
+
+/// Inserts after module documentation and imports, before item documentation.
+/// The caller resolves visibility and duplicate bindings before requesting it.
+pub fn plan_import_insertion(source: str, path: str) -> Option[ImportInsertion] {
+    if path == "" {
+        ret Option[ImportInsertion]::None
+    }
+    let mut lexer = Lexer::new()
+    let tokens = lexer.tokenize_lossless(source)
+    let fallback = Token::new(TokenType::EOF, "", 0_usize, 0_usize)
+    let mut index = 0_usize
+    while index < tokens.len() && trivia(tokens.get(index).unwrap_or(fallback).type) {
+        index += 1_usize
+    }
+    let first = tokens.get(index).unwrap_or(fallback)
+    let mut insertion_line = first.line
+    let mut insertion_column = first.column
+    loop {
+        let mut start = index
+        if tokens.get(start).unwrap_or(fallback).type == TokenType::KW_PUB {
+            start += 1_usize
+            while trivia(tokens.get(start).unwrap_or(fallback).type) {
+                start += 1_usize
+            }
+        }
+        if tokens.get(start).unwrap_or(fallback).type != TokenType::KW_IMPORT {
+            break
+        }
+        index = start + 1_usize
+        let mut depth = 0_usize
+        let mut last = TokenType::KW_IMPORT
+        let mut end = token_end(tokens.get(start).unwrap_or(fallback))
+        loop {
+            let token = tokens.get(index).unwrap_or(fallback)
+            if token.type == TokenType::EOF {
+                break
+            }
+            if token.type == TokenType::NEWLINE && depth == 0_usize && last != TokenType::SCOPE {
+                end = token_end(token)
+                index += 1_usize
+                break
+            }
+            if trivia(token.type) {
+                end = token_end(token)
+                index += 1_usize
+                continue
+            }
+            if token.type == TokenType::LEFT_BRACE {
+                depth += 1_usize
+            } elif token.type == TokenType::RIGHT_BRACE {
+                if depth == 0_usize {
+                    ret Option[ImportInsertion]::None
+                }
+                depth -= 1_usize
+            } elif token.type != TokenType::IDENTIFIER && token.type != TokenType::SCOPE
+            && token.type != TokenType::COMMA && token.type != TokenType::KW_AS && token.value != "*" {
+                break
+            }
+            last = token.type
+            end = token_end(token)
+            index += 1_usize
+        }
+        if depth != 0_usize || last == TokenType::KW_IMPORT || last == TokenType::SCOPE
+        || last == TokenType::KW_AS || last == TokenType::COMMA {
+            ret Option[ImportInsertion]::None
+        }
+        insertion_line = end.0
+        insertion_column = end.1
+        while trivia(tokens.get(index).unwrap_or(fallback).type) {
+            index += 1_usize
+        }
+    }
+    let mut newline = "\n"
+    let mut byte = 0_usize
+    while byte < source.byte_len() {
+        if source.byte_at(byte) == 10_u8 {
+            if byte > 0_usize && source.byte_at(byte - 1_usize) == 13_u8 {
+                newline = "\r\n"
+            }
+            break
+        }
+        byte += 1_usize
+    }
+    let prefix = if insertion_column > 0_usize {
+        newline
+    } else {
+        ""
+    }
+    ret Option[ImportInsertion]::Some(ImportInsertion {
+            insertion_line, insertion_column, prefix + "import " + path + newline
+        }
+        ,)
+}

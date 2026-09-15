@@ -3236,6 +3236,16 @@ fn resolve_loop_target(ctx: mut TranslatorContext, label: Option[str], fallback:
             }
         }
         None => {
+            // Expression lowering does not thread statement-level fallback
+            // labels, but still shares the enclosing lexical loop stack.
+            if ctx.loop_targets.len() > 0_usize {
+                match ctx.loop_targets.get(ctx.loop_targets.len() - 1_usize) {
+                    Some(target) => {
+                        ret Option[str]::Some(if is_continue { target.continue_target } else { target.break_target })
+                    }
+                    None => {}
+                }
+            }
         }
     }
     ret fallback
@@ -3508,7 +3518,10 @@ fn ctx_enum_variant_owner(ctx: mut TranslatorContext, path: str) -> Option[str] 
     if scope >= path.len() {
         ret Option[str]::None
     }
-    let requested_owner = path.slice(0_usize, scope)
+    // Constructor paths are type positions too: resolve Self before splitting
+    // the owner so both bare and nested generic enum constructors agree with
+    // the impl's parameter and return annotations.
+    let requested_owner = self_context_type(ctx, path.slice(0_usize, scope))
     let requested_base = base_type_name(requested_owner)
     // `Opt` is the conventional prelude alias for Option. Import statements
     // are flattened before bootstrap translation, so preserve this alias at
@@ -4311,7 +4324,7 @@ fn decorator_wrapper_params(item: FunctionItem) -> Vec[FunctionParam] {
     for param in item.params {
         params.push(FunctionParam {
                 "__decorated_arg_" + Debug::fmt(index), param.typ,
-                param.is_sending, param.is_frozen
+                param.is_sending, param.is_frozen, param.line, param.column
             }
             ,)
         index += 1_usize
@@ -4339,7 +4352,7 @@ fn required_decorator_param(item: FunctionItem, index: usize, source_name: str, 
         }
     }
     ret FunctionParam {
-        "", Option[str]::None, false, false
+        "", Option[str]::None, false, false, line, column
     }
 }
 
@@ -4373,7 +4386,7 @@ fn decorator_wrapper_body(resolved: ResolvedDecorator, target: FunctionItem) -> 
                 }
                 statements.push(Statement::Let(LetStmt {
                             receiver_param.name, receiver_type,
-                            receiver, false
+                            receiver, false, receiver.line, receiver.column, receiver.line, receiver.column
                         }
                         ,))
             }
@@ -4390,7 +4403,8 @@ fn decorator_wrapper_body(resolved: ResolvedDecorator, target: FunctionItem) -> 
                 let parameter = required_decorator_param(resolved.item, config_start + index,
                     target.source_name, target.line, target.column,)
                 statements.push(Statement::Let(LetStmt {
-                            parameter.name, parameter.typ, argument, false
+                            parameter.name, parameter.typ, argument, false, argument.line, argument.column,
+                            argument.line, argument.column
                         }
                         ,
                     ))
@@ -4409,9 +4423,7 @@ fn decorator_wrapper_body(resolved: ResolvedDecorator, target: FunctionItem) -> 
                 "decorator-without-body", "decorator '" + resolved.item.name + "' must have a body",)
         }
     }
-    ret ParsedBlock {
-        statements
-    }
+    ret ParsedBlock::synthetic(statements)
 }
 
 fn register_decorator_layer(ctx: mut TranslatorContext, item: FunctionItem, logical_name: str) -> str {
@@ -7193,7 +7205,8 @@ fn lower_closure_expr(ctx: mut TranslatorContext, closure: ClosureExpr, source_n
             }
         }
         effective_params.push(FunctionParam {
-                parameter.name, Option[str]::Some(expected_type), parameter.is_sending
+                parameter.name, Option[str]::Some(expected_type), parameter.is_sending, parameter.is_frozen,
+                parameter.line, parameter.column
             }
             ,
         )
@@ -7401,10 +7414,7 @@ fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, 
 fn closure_body_always_returns(body: ExprNode < H >) -> bool {
     match body.value {
         Expr::Block(block) => {
-            ret block_always_returns(ParsedBlock {
-                    block.statements
-                }
-            )
+            ret block_always_returns(ParsedBlock::synthetic(block.statements))
         }
         _ => {
         }
@@ -10778,15 +10788,17 @@ fn lower_match_pattern_test(
     match pattern.value {
         Option[str]::Some(value) => {
             if pattern.kind == "integer" {
-                let lit = with_numeric_suffix(value, subject_typ)
-                code = code.instr(cond_name + " = ieq " + subject_value + ", " + lit)
+                let lit = lower_integer_literal(value, subject_typ, cond_name, arm_idx)
+                code = code.append(lit.code)
+                code = code.instr(cond_name + " = ieq " + subject_value + ", " + lit.value)
                 ret LoweredPatternTest {
                     code, cond_name, false
                 }
             }
             if pattern.kind == "float" {
-                let lit = with_numeric_suffix(value, subject_typ)
-                code = code.instr(cond_name + " = ieq " + subject_value + ", " + lit)
+                let lit = lower_float_literal(value, subject_typ, cond_name, arm_idx)
+                code = code.append(lit.code)
+                code = code.instr(cond_name + " = ieq " + subject_value + ", " + lit.value)
                 ret LoweredPatternTest {
                     code, cond_name, false
                 }
@@ -10796,7 +10808,9 @@ fn lower_match_pattern_test(
                 if value == "true" {
                     lit = "1_u1"
                 }
-                code = code.instr(cond_name + " = ieq " + subject_value + ", " + lit)
+                let literal_name = cond_name + "_literal"
+                code = code.instr(literal_name + ": bool = capprim " + lit)
+                code = code.instr(cond_name + " = ieq " + subject_value + ", " + literal_name)
                 ret LoweredPatternTest {
                     code, cond_name, false
                 }
@@ -12182,16 +12196,8 @@ fn nested_generic_module_dispatch_contract() -> bool {
     let mut imports_b = Vec[str]::new()
     imports_b.push("collections")
     let mut modules = Vec[TranslationModule]::new()
-    modules.push(TranslationModule {
-            "collections", "collections.enq", Option[Documentation]::None, imports_a, ast_a, Vec[str]::new()
-        }
-        ,
-    )
-    modules.push(TranslationModule {
-            "consumer", "consumer.enq", Option[Documentation]::None, imports_b, ast_b, Vec[str]::new()
-        }
-        ,
-    )
+    modules.push(TranslationModule::new("collections", "collections.enq", imports_a, ast_a, Vec[str]::new()))
+    modules.push(TranslationModule::new("consumer", "consumer.enq", imports_b, ast_b, Vec[str]::new()))
     let output = translate_modules_to_ehir(modules, host_target())
     let collections = "__encore_m636f6c6c656374696f6e73__"
     ret output.contains("fn " + collections + "append[T](left: Vec[T], right: Vec[T]) -> Vec[T]") &&

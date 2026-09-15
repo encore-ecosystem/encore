@@ -1,6 +1,8 @@
 //! Discovers, resolves, and analyzes modules in a project workspace.
 
 import core::option::Option
+import core::result::Result
+import mod::failure::ProjectFailure
 import std::io::eprintln
 import std::os::core_dir
 import std::os::file_exists
@@ -23,9 +25,10 @@ import refrain::frontend::{AnalysisDatabase, ModuleId, FrontendDocument, Fronten
 import refrain::target::kits::{target_kit_installed, target_platform_root}
 import refrain::target::{TargetSpec, parse_target, target_is_host}
 
+import mod::manifest::{try_project_manifest_resolve_features, try_read_project_manifest}
 import mod::manifest::ProjectManifest
 import mod::manifest::{project_manifest_dependencies, project_manifest_feature_dependencies, project_manifest_name, project_manifest_resolve_features, read_project_manifest}
-import mod::registry::{dependency_base_reference, dependency_requested_features, registry_package_checksum, resolve_index_dependency, valid_dependency_name}
+import mod::registry::{dependency_base_reference, dependency_requested_features, registry_package_checksum, resolve_index_dependency, resolve_cached_index_dependency, valid_dependency_name}
 
 extern fn encore_strset_new() -> usize
 extern fn encore_strset_insert(set: usize, value: str) -> bool
@@ -103,6 +106,7 @@ pub struct ProjectWorkspace {
     analysis: AnalysisDatabase
     overlay_path: str
     overlay_source: str
+    allow_dependency_install: bool
 }
 
 impl for ProjectWorkspace {
@@ -113,16 +117,16 @@ impl for ProjectWorkspace {
 }
 
 /// Loads a binary workspace and its transitive module graph.
-pub fn load_binary_workspace(root: Path) -> ProjectWorkspace {
-    ret load_workspace(root, true, false)
+pub fn try_load_binary_workspace(root: Path) -> Result[ProjectWorkspace, ProjectFailure] {
+    ret  Result[ProjectWorkspace, ProjectFailure]::Ok(try_load_workspace(root, true, false)?)
 }
 
 /// Loads a library workspace and builds its flattened AST.
-pub fn load_library_workspace(root: Path) -> ProjectWorkspace {
-    ret load_workspace(root, false, true)
+pub fn try_load_library_workspace(root: Path) -> Result[ProjectWorkspace, ProjectFailure] {
+    ret  Result[ProjectWorkspace, ProjectFailure]::Ok(try_load_workspace(root, false, true)?)
 }
 
-fn load_workspace(root: Path, target_is_binary: bool, build_flat_ast: bool) -> ProjectWorkspace {
+fn try_load_workspace(root: Path, target_is_binary: bool, build_flat_ast: bool) -> Result[ProjectWorkspace, ProjectFailure] {
     let mut workspace = ProjectWorkspace {
         "",
         Vec[WorkspaceRefrain]::new(),
@@ -132,25 +136,25 @@ fn load_workspace(root: Path, target_is_binary: bool, build_flat_ast: bool) -> P
         Vec[str]::new(),
         AnalysisDatabase::new(),
         "",
-        ""
+        "", true
     }
 
-    workspace_set_root_name(workspace, load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), root.resolve(), target_is_binary, Vec[str]::new()))
+    workspace_set_root_name(workspace, try_load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), root.resolve(), target_is_binary, Vec[str]::new())?)
 
     match workspace_root_refrain(workspace) {
         Option[WorkspaceRefrain]::Some(root_refrain) => {
-            let modules = build_modules_for_refrain(workspace, root_refrain)
+            let modules = try_build_modules_for_refrain(workspace, root_refrain)?
             workspace_set_modules(workspace, modules)
             if build_flat_ast {
                 workspace_set_flat_ast(workspace, flatten_modules(workspace.modules))
             }
         }
         Option[WorkspaceRefrain]::None => {
-            workspace_invariant_error("root refrain metadata is missing")
+            try_workspace_invariant_error("root refrain metadata is missing")?
         }
     }
 
-    ret workspace
+    ret  Result[ProjectWorkspace, ProjectFailure]::Ok(workspace)
 }
 
 /// Releases loaded module and flattened-AST storage after translation.
@@ -162,17 +166,23 @@ pub fn workspace_release_modules(workspace: mut ProjectWorkspace) ->() {
 }
 
 /// Loads a workspace starting from an explicit source entrypoint.
-pub fn load_entry_workspace(root: Path, entrypoint: Path) -> ProjectWorkspace {
-    ret load_entry_workspace_impl(root, entrypoint, false, "")
+pub fn try_load_entry_workspace(root: Path, entrypoint: Path) -> Result[ProjectWorkspace, ProjectFailure] {
+    ret  Result[ProjectWorkspace, ProjectFailure]::Ok(try_load_entry_workspace_impl(root, entrypoint, false, "", true)?)
 }
 
 /// Loads one editor entrypoint and its dependency graph, optionally replacing
 /// the entrypoint's disk contents with an unsaved source overlay.
-pub fn load_entry_workspace_source(root: Path, entrypoint: Path, source: str) -> ProjectWorkspace {
-    ret load_entry_workspace_impl(root, entrypoint, true, source)
+pub fn try_load_entry_workspace_source(root: Path, entrypoint: Path, source: str) -> Result[ProjectWorkspace, ProjectFailure] {
+    ret  Result[ProjectWorkspace, ProjectFailure]::Ok(try_load_entry_workspace_impl(root, entrypoint, true, source, true)?)
 }
 
-fn load_entry_workspace_impl(root: Path, entrypoint: Path, has_overlay: bool, source: str) -> ProjectWorkspace {
+/// Loads an editor graph using installed dependencies only, including transitives.
+/// Missing packages produce a recoverable failure; no download or clone is started.
+pub fn try_load_cached_entry_workspace_source(root: Path, entrypoint: Path, source: str) -> Result[ProjectWorkspace, ProjectFailure] {
+    ret try_load_entry_workspace_impl(root, entrypoint, true, source, false)
+}
+
+fn try_load_entry_workspace_impl(root: Path, entrypoint: Path, has_overlay: bool, source: str, allow_dependency_install: bool) -> Result[ProjectWorkspace, ProjectFailure] {
     let resolved_entrypoint = entrypoint.resolve()
     let mut workspace = ProjectWorkspace {
         "", Vec[WorkspaceRefrain]::new(), Vec[WorkspaceModule]::new(), Vec[Statement]::new(), Vec[str]::new(), Vec[str]::new(), AnalysisDatabase::new(), if has_overlay {
@@ -180,9 +190,9 @@ fn load_entry_workspace_impl(root: Path, entrypoint: Path, has_overlay: bool, so
         } else {
             ""
         }
-        , source
+        , source, allow_dependency_install
     }
-    workspace_set_root_name(workspace, load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), root.resolve(), true, Vec[str]::new()))
+    workspace_set_root_name(workspace, try_load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), root.resolve(), true, Vec[str]::new())?)
     match workspace_root_refrain(workspace) {
         Some(root_refrain) => {
             let visited_paths = unsafe {
@@ -192,13 +202,13 @@ fn load_entry_workspace_impl(root: Path, entrypoint: Path, has_overlay: bool, so
             match find_refrain_by_name(workspace, "core") {
                 Some(core_refrain) => {
                     if core_refrain.name != workspace.root_name {
-                        visit_module(workspace, core_refrain, entrypoint_of(core_refrain), visited_paths, modules)
+                        try_visit_module(workspace, core_refrain, try_entrypoint_of(core_refrain)?, visited_paths, modules)?
                     }
                 }
                 None => {
                 }
             }
-            visit_module(workspace, root_refrain, resolved_entrypoint, visited_paths, modules)
+            try_visit_module(workspace, root_refrain, resolved_entrypoint, visited_paths, modules)?
             unsafe {
                 encore_strset_free(visited_paths)
             }
@@ -206,16 +216,14 @@ fn load_entry_workspace_impl(root: Path, entrypoint: Path, has_overlay: bool, so
             workspace_set_flat_ast(workspace, flatten_modules(modules))
         }
         None => {
-            workspace_invariant_error("workspace root is missing")
+            try_workspace_invariant_error("workspace root is missing")?
         }
     }
-    ret workspace
+    ret  Result[ProjectWorkspace, ProjectFailure]::Ok(workspace)
 }
 
-fn workspace_invariant_error(message: str) ->() {
-    eprintln("error[workspace-invariant]: " + message)
-    exit(1_i32)
-    ret()
+fn try_workspace_invariant_error(message: str) ->Result[bool, ProjectFailure] {
+    ret Result[bool, ProjectFailure]::Err(ProjectFailure { "workspace-invariant", message })
 }
 
 /// Returns metadata for the root package of a workspace.
@@ -238,10 +246,10 @@ fn workspace_set_flat_ast(workspace: mut ProjectWorkspace, flat_ast: Vec[Stateme
     ret()
 }
 
-fn load_refrain(workspace: mut ProjectWorkspace, root: Path, distribution_root: Path, source_key: str, lock_root: Path, target_is_binary: bool, requested_features: Vec[str]) -> str {
+fn try_load_refrain(workspace: mut ProjectWorkspace, root: Path, distribution_root: Path, source_key: str, lock_root: Path, target_is_binary: bool, requested_features: Vec[str]) -> Result[str, ProjectFailure] {
     match find_refrain_by_root(workspace, root) {
         Option[WorkspaceRefrain]::Some(found) => {
-            ret merge_loaded_refrain_features(workspace, found, requested_features, lock_root)
+            ret  Result[str, ProjectFailure]::Ok(try_merge_loaded_refrain_features(workspace, found, requested_features, lock_root)?)
         }
         Option[WorkspaceRefrain]::None => {
         }
@@ -249,12 +257,12 @@ fn load_refrain(workspace: mut ProjectWorkspace, root: Path, distribution_root: 
 
     let normalized_root = root.resolve().as_str()
     if contains_string(workspace.loading_roots, normalized_root) {
-        workspace_error("Dependency cycle while loading refrain at " + normalized_root)
+        try_workspace_error("Dependency cycle while loading refrain at " + normalized_root)?
     }
     workspace.loading_roots.push(normalized_root)
 
-    let manifest = read_project_manifest(root)
-    let enabled_features = project_manifest_resolve_features(manifest, requested_features)
+    let manifest = try_read_project_manifest(root)?
+    let enabled_features = try_project_manifest_resolve_features(manifest, requested_features)?
     for feature in enabled_features {
         if !contains_string(workspace.enabled_features, feature) {
             workspace.enabled_features.push(feature)
@@ -263,7 +271,7 @@ fn load_refrain(workspace: mut ProjectWorkspace, root: Path, distribution_root: 
     match find_refrain_by_name(workspace, manifest.name) {
         Some(existing) => {
             if existing.root.resolve().as_str() != root.resolve().as_str() {
-                workspace_error("Duplicate refrain name '" + manifest.name + "' at " + existing.root.as_str() + " and " + root.as_str())
+                try_workspace_error("Duplicate refrain name '" + manifest.name + "' at " + existing.root.as_str() + " and " + root.as_str())?
             }
         }
         None => {
@@ -281,8 +289,8 @@ fn load_refrain(workspace: mut ProjectWorkspace, root: Path, distribution_root: 
     while index < dependency_refs.len() {
         match dependency_refs.get(index) {
             Option[str]::Some(dep_ref) => {
-                let dependency = resolve_dependency_root(dep_ref, root, distribution_root, source_key, lock_root)
-                let dep_name = load_refrain(workspace, dependency.root, dependency.distribution_root, dependency.source_key, lock_root, false, dependency_requested_features(dep_ref))
+                let dependency = try_resolve_dependency_root(dep_ref, root, distribution_root, source_key, lock_root, workspace.allow_dependency_install)?
+                let dep_name = try_load_refrain(workspace, dependency.root, dependency.distribution_root, dependency.source_key, lock_root, false, dependency_requested_features(dep_ref))?
                 if !contains_string(dependency_names, dep_name) {
                     dependency_names.push(dep_name)
                 }
@@ -305,25 +313,25 @@ fn load_refrain(workspace: mut ProjectWorkspace, root: Path, distribution_root: 
     }
     workspace.refrains.push(refrain)
     workspace.loading_roots.pop()
-    ret manifest.name
+    ret  Result[str, ProjectFailure]::Ok(manifest.name)
 }
 
-fn merge_loaded_refrain_features(workspace: mut ProjectWorkspace, found: WorkspaceRefrain, requested: Vec[str], lock_root: Path) -> str {
+fn try_merge_loaded_refrain_features(workspace: mut ProjectWorkspace, found: WorkspaceRefrain, requested: Vec[str], lock_root: Path) -> Result[str, ProjectFailure] {
     let mut combined = found.enabled_features
     for feature in requested {
         if !contains_string(combined, feature) {
             combined.push(feature)
         }
     }
-    let enabled = project_manifest_resolve_features(found.manifest, combined)
+    let enabled = try_project_manifest_resolve_features(found.manifest, combined)?
     if enabled.len() == found.enabled_features.len() {
-        ret found.name
+        ret  Result[str, ProjectFailure]::Ok(found.name)
     }
 
     let mut dependency_names = found.dependency_names
     for dep_ref in project_manifest_feature_dependencies(found.manifest, enabled) {
-        let dependency = resolve_dependency_root(dep_ref, found.root, found.distribution_root, found.source_key, lock_root)
-        let dep_name = load_refrain(workspace, dependency.root, dependency.distribution_root, dependency.source_key, lock_root, false, dependency_requested_features(dep_ref))
+        let dependency = try_resolve_dependency_root(dep_ref, found.root, found.distribution_root, found.source_key, lock_root, workspace.allow_dependency_install)?
+        let dep_name = try_load_refrain(workspace, dependency.root, dependency.distribution_root, dependency.source_key, lock_root, false, dependency_requested_features(dep_ref))?
         if !contains_string(dependency_names, dep_name) {
             dependency_names.push(dep_name)
         }
@@ -346,11 +354,11 @@ fn merge_loaded_refrain_features(workspace: mut ProjectWorkspace, found: Workspa
         }
     }
     workspace.refrains = refrains
-    ret found.name
+    ret  Result[str, ProjectFailure]::Ok(found.name)
 }
 
-fn build_modules_for_refrain(workspace: mut ProjectWorkspace, refrain: WorkspaceRefrain) -> Vec[WorkspaceModule] {
-    let entrypoint = entrypoint_of(refrain)
+fn try_build_modules_for_refrain(workspace: mut ProjectWorkspace, refrain: WorkspaceRefrain) -> Result[Vec[WorkspaceModule], ProjectFailure] {
+    let entrypoint = try_entrypoint_of(refrain)?
     let visited_paths = unsafe {
         encore_strset_new()
     }
@@ -364,33 +372,33 @@ fn build_modules_for_refrain(workspace: mut ProjectWorkspace, refrain: Workspace
     if refrain.name != "core" {
         match find_refrain_by_name(workspace, "core") {
             Some(core_refrain) => {
-                visit_module(workspace, core_refrain, entrypoint_of(core_refrain), visited_paths, result)
+                try_visit_module(workspace, core_refrain, try_entrypoint_of(core_refrain)?, visited_paths, result)?
             }
             None => {
             }
         }
     }
-    visit_module(workspace, refrain, entrypoint, visited_paths, result)
+    try_visit_module(workspace, refrain, entrypoint, visited_paths, result)?
     unsafe {
         encore_strset_free(visited_paths)
     }
-    ret result
+    ret  Result[Vec[WorkspaceModule], ProjectFailure]::Ok(result)
 }
 
-fn visit_module(
+fn try_visit_module(
     workspace: mut ProjectWorkspace,
     owner: WorkspaceRefrain,
     module_path: Path,
     visited_paths: usize,
     result: mut Vec[WorkspaceModule],
-) ->() {
+) ->Result[bool, ProjectFailure] {
     let resolved_path = module_path.resolve()
     let resolved_key = resolved_path.as_str()
     if !unsafe {
         encore_strset_insert(visited_paths, resolved_key)
     }
     {
-        ret()
+        ret Result[bool, ProjectFailure]::Ok(true)
     }
 
     let source = if workspace.overlay_path != "" && resolved_key == workspace.overlay_path {
@@ -415,14 +423,14 @@ fn visit_module(
     let mut diagnostics = document.diagnostics
     let ast = document.ast
     let documentation = document.module_documentation
-    visit_imports(workspace, owner, resolved_path, import_edges, visited_paths, result, diagnostics)
-    let resolved_imports = resolved_module_import_ids(workspace, owner, resolved_path, ast)
+    try_visit_imports(workspace, owner, resolved_path, import_edges, visited_paths, result, diagnostics)?
+    let resolved_imports = try_resolved_module_import_ids(workspace, owner, resolved_path, ast)?
     result.push(WorkspaceModule {
             owner.name, owner.root, module_id, analysis_id, resolved_path, source, document, ast, documentation, imports, resolved_imports, diagnostics, owner.enabled_features
         }
         ,
     )
-    ret()
+    ret Result[bool, ProjectFailure]::Ok(true)
 }
 
 fn workspace_module_id(owner: WorkspaceRefrain, module_path: Path) -> str {
@@ -473,12 +481,12 @@ fn analysis_module_name_from_relative(owner_name: str, relative: str) -> str {
     ret owner_name + "::" + out
 }
 
-fn resolved_module_import_ids(workspace: ProjectWorkspace, owner: WorkspaceRefrain, source_module: Path, ast: Vec[Statement]) -> Vec[str] {
+fn try_resolved_module_import_ids(workspace: ProjectWorkspace, owner: WorkspaceRefrain, source_module: Path, ast: Vec[Statement]) -> Result[Vec[str], ProjectFailure] {
     let mut out = Vec[str]::new()
     for statement in ast {
         match statement {
             Statement::Import(item) => {
-                for request in expand_import_path(item.path) {
+                for request in try_expand_import_path(item.path)? {
                     match resolve_import_module(workspace, owner, source_module, request) {
                         Option[ResolvedModule]::Some(target) => {
                             let id = workspace_module_id(target.owner, target.module_path)
@@ -495,7 +503,7 @@ fn resolved_module_import_ids(workspace: ProjectWorkspace, owner: WorkspaceRefra
             }
         }
     }
-    ret out
+    ret  Result[Vec[str], ProjectFailure]::Ok(out)
 }
 
 fn argc() -> usize {
@@ -505,7 +513,7 @@ fn argv(index: usize) -> Option[str] {
     ret process_arg(index)
 }
 
-fn visit_imports(
+fn try_visit_imports(
     workspace: mut ProjectWorkspace,
     owner: WorkspaceRefrain,
     resolved_path: Path,
@@ -513,19 +521,19 @@ fn visit_imports(
     visited_paths: usize,
     result: mut Vec[WorkspaceModule],
     diagnostics: mut Vec[FrontendDiagnostic],
-) ->() {
+) ->Result[bool, ProjectFailure] {
     let mut import_index = 0_usize
     while import_index < imports.len() {
         match imports.get(import_index) {
             Option[DependencyEdge]::Some(import_edge) => {
-                let expanded = expand_import_path(import_edge.target)
+                let expanded = try_expand_import_path(import_edge.target)?
                 let mut request_index = 0_usize
                 while request_index < expanded.len() {
                     match expanded.get(request_index) {
                         Option[str]::Some(request_path) => {
                             match resolve_import_module(workspace, owner, resolved_path, request_path) {
                                 Option[ResolvedModule]::Some(target) => {
-                                    visit_module(workspace, target.owner, target.module_path, visited_paths, result)
+                                    try_visit_module(workspace, target.owner, target.module_path, visited_paths, result)?
                                 }
                                 Option[ResolvedModule]::None => {
                                     diagnostics.push(FrontendDiagnostic::new(
@@ -550,7 +558,7 @@ fn visit_imports(
         }
         import_index = import_index + 1_usize
     }
-    ret()
+    ret Result[bool, ProjectFailure]::Ok(true)
 }
 
 fn workspace_unresolved_import_message(path: str) -> str {
@@ -803,7 +811,7 @@ fn workspace_module_identity_uses_portable_separators() -> bool {
     ret replace_backslashes("iter\\mod.enq") == "iter/mod.enq"
 }
 
-fn entrypoint_of(refrain: WorkspaceRefrain) -> Path {
+fn try_entrypoint_of(refrain: WorkspaceRefrain) -> Result[Path, ProjectFailure] {
     let filename = if refrain.target_is_binary {
         "main.enq"
     } else {
@@ -811,9 +819,9 @@ fn entrypoint_of(refrain: WorkspaceRefrain) -> Path {
     }
     let entrypoint = refrain.root.join("src").join(filename)
     if !file_exists(native_path(entrypoint.as_str())) {
-        workspace_error("Unable to find entrypoint for refrain '" + refrain.name + "': " + entrypoint.as_str())
+        try_workspace_error("Unable to find entrypoint for refrain '" + refrain.name + "': " + entrypoint.as_str())?
     }
-    ret entrypoint
+    ret  Result[Path, ProjectFailure]::Ok(entrypoint)
 }
 
 fn resolve_dependency_refrain(
@@ -833,59 +841,68 @@ struct WorkspaceDependency {
     source_key: str
 }
 
-fn resolve_dependency_root(dep_ref: str, base_root: Path, distribution_root: Path, source_key: str, lock_root: Path) -> WorkspaceDependency {
+/// Resolves a direct editor dependency without installing or changing packages.
+pub fn try_cached_project_dependency_root(root: Path, dependency: str) -> Result[Path, ProjectFailure] {
+    let resolved = try_resolve_dependency_root(dependency, root, root, "workspace:" + root.as_str(), root, false)?
+    ret Result[Path, ProjectFailure]::Ok(resolved.root)
+}
+
+fn try_resolve_dependency_root(dep_ref: str, base_root: Path, distribution_root: Path, source_key: str, lock_root: Path, allow_install: bool) -> Result[WorkspaceDependency, ProjectFailure] {
     let base_ref = dependency_base_reference(dep_ref)
     if base_ref == "sys@core" {
         // Anchor the implicit core package at the workspace/lock root. A
         // target-platform manifest also receives the implicit dependency, but
         // its kit directory is not the distribution that owns core.
-        let root = system_core_root(lock_root).resolve()
-        ret WorkspaceDependency {
+        let root = try_system_core_root(lock_root)?.resolve()
+        ret  Result[WorkspaceDependency, ProjectFailure]::Ok(WorkspaceDependency {
             root, root, "sys@core"
-        }
+        })
     }
     if base_ref == "sys@platform" {
-        let owner_manifest = read_project_manifest(base_root)
+        let owner_manifest = try_read_project_manifest(base_root)?
         if owner_manifest.name != "std" {
-            workspace_error("sys@platform is internal and may only be imported by std")
+            try_workspace_error("sys@platform is internal and may only be imported by std")?
         }
         let target = selected_workspace_target()
-        let root = system_platform_root(lock_root, target).resolve()
-        ret WorkspaceDependency {
+        let root = try_system_platform_root(lock_root, target)?.resolve()
+        ret  Result[WorkspaceDependency, ProjectFailure]::Ok(WorkspaceDependency {
             root, root, "sys@platform:" + target.triple
-        }
+        })
     }
 
     if starts_with(base_ref, "path@") {
         let root = base_root.join(base_ref.slice(5_usize, base_ref.len() - 5_usize)).resolve()
-        ret WorkspaceDependency {
+        ret  Result[WorkspaceDependency, ProjectFailure]::Ok(WorkspaceDependency {
             root, root, "path:" + root.as_str()
-        }
+        })
     }
 
     if starts_with(base_ref, "workspace@") {
         let name = base_ref.slice(10_usize, base_ref.len() - 10_usize)
         if !valid_dependency_name(name) {
-            workspace_error("Invalid workspace dependency name: " + name)
+            try_workspace_error("Invalid workspace dependency name: " + name)?
         }
         let root = distribution_root.join("workspace").join(name).resolve()
         if !file_exists(root.join("encore.toml").as_str()) {
-            workspace_error("Unable to find " + dep_ref + " at " + root.as_str())
+            try_workspace_error("Unable to find " + dep_ref + " at " + root.as_str())?
         }
-        ret WorkspaceDependency {
+        ret  Result[WorkspaceDependency, ProjectFailure]::Ok(WorkspaceDependency {
             root, distribution_root, source_key
-        }
+        })
     }
 
     if starts_with(base_ref, "index@") {
-        let resolved = resolve_index_dependency(base_ref, lock_root, false)
+        let resolved = if allow_install { resolve_index_dependency(base_ref, lock_root, false) } else { resolve_cached_index_dependency(base_ref, lock_root) }
         if resolved == "" {
-            workspace_error("Unable to resolve dependency: " + dep_ref)
+            if !allow_install {
+                try_workspace_error("Dependency is not installed: " + dep_ref + "; run `encore sync`")?
+            }
+            try_workspace_error("Unable to resolve dependency: " + dep_ref)?
         }
         let root = Path::new(resolved).resolve()
-        ret WorkspaceDependency {
+        ret  Result[WorkspaceDependency, ProjectFailure]::Ok(WorkspaceDependency {
             root, root, base_ref + ":" + registry_package_checksum(root)
-        }
+        })
     }
 
     if starts_with(base_ref, "git@") {
@@ -901,6 +918,9 @@ fn resolve_dependency_root(dep_ref: str, base_root: Path, distribution_root: Pat
         }
         let destination = Path::new(home_dir()).join(".cache").join("encore").join("git").join(owner).join(repository)
         if !file_exists(destination.join(".git").as_str()) {
+            if !allow_install {
+                try_workspace_error("Dependency is not installed: " + dep_ref + "; run `encore sync`")?
+            }
             match destination.parent() {
                 Some(parent) => {
                     run("mkdir -p " + workspace_shell_quote(parent.as_str()))
@@ -909,19 +929,19 @@ fn resolve_dependency_root(dep_ref: str, base_root: Path, distribution_root: Pat
                 }
             }
             if run("git clone " + workspace_shell_quote(url) + " " + workspace_shell_quote(destination.as_str())) != 0_i32 {
-                workspace_error("Unable to clone dependency: " + url)
+                try_workspace_error("Unable to clone dependency: " + url)?
             }
         }
         let root = destination.resolve()
-        ret WorkspaceDependency {
+        ret  Result[WorkspaceDependency, ProjectFailure]::Ok(WorkspaceDependency {
             root, root, "git:" + url
-        }
+        })
     }
 
-    workspace_error("Unsupported dependency reference: " + dep_ref)
-    ret WorkspaceDependency {
+    try_workspace_error("Unsupported dependency reference: " + dep_ref)?
+    ret  Result[WorkspaceDependency, ProjectFailure]::Ok(WorkspaceDependency {
         base_root, distribution_root, source_key
-    }
+    })
 }
 
 fn selected_workspace_target() -> TargetSpec {
@@ -974,22 +994,22 @@ fn workspace_shell_quote(value: str) -> str {
 }
 
 /// Performs the `system_core_root` operation.
-pub fn system_core_root(base_root: Path) -> Path {
+pub fn try_system_core_root(base_root: Path) -> Result[Path, ProjectFailure] {
     let mut cursor = base_root.resolve()
     loop {
         // Installed distribution, direct encore-index checkout, and the
         // compiler repository beside an encore-index checkout respectively.
         let distribution = cursor.join("index").join("core")
-        if core_package_exists(distribution) {
-            ret distribution
+        if try_core_package_exists(distribution)? {
+            ret  Result[Path, ProjectFailure]::Ok(distribution)
         }
         let index_checkout = cursor.join("packages").join("core")
-        if core_package_exists(index_checkout) {
-            ret index_checkout
+        if try_core_package_exists(index_checkout)? {
+            ret  Result[Path, ProjectFailure]::Ok(index_checkout)
         }
         let compiler_checkout = cursor.join("encore-index").join("packages").join("core")
-        if core_package_exists(compiler_checkout) {
-            ret compiler_checkout
+        if try_core_package_exists(compiler_checkout)? {
+            ret  Result[Path, ProjectFailure]::Ok(compiler_checkout)
         }
 
         match cursor.parent() {
@@ -1003,8 +1023,8 @@ pub fn system_core_root(base_root: Path) -> Path {
     }
 
     let configured = Path::new(core_dir()).resolve()
-    if core_package_exists(configured) {
-        ret configured
+    if try_core_package_exists(configured)? {
+        ret  Result[Path, ProjectFailure]::Ok(configured)
     }
     // A project-local compiler links the platform runtime from source, so the
     // runtime's __FILE__ fallback points at packages/platform rather than the
@@ -1012,8 +1032,8 @@ pub fn system_core_root(base_root: Path) -> Path {
     match configured.parent() {
         Some(parent) => {
             let sibling = parent.join("core")
-            if core_package_exists(sibling) {
-                ret sibling
+            if try_core_package_exists(sibling)? {
+                ret  Result[Path, ProjectFailure]::Ok(sibling)
             }
         }
         None => {
@@ -1025,8 +1045,8 @@ pub fn system_core_root(base_root: Path) -> Path {
     let mut installed_cursor = Path::new(configured.as_str())
     loop {
         let installed = installed_cursor.join("lib").join("encore").join("index").join("core")
-        if core_package_exists(installed) {
-            ret installed
+        if try_core_package_exists(installed)? {
+            ret  Result[Path, ProjectFailure]::Ok(installed)
         }
         match installed_cursor.parent() {
             Some(parent) => {
@@ -1038,29 +1058,29 @@ pub fn system_core_root(base_root: Path) -> Path {
         }
     }
 
-    workspace_error("Unable to resolve sys@core starting from " + base_root.as_str())
-    ret base_root
+    try_workspace_error("Unable to resolve sys@core starting from " + base_root.as_str())?
+    ret  Result[Path, ProjectFailure]::Ok(base_root)
 }
 
 /// Resolves the platform refrain for `target` without requiring a separately
 /// installed target kit for the native host. Release distributions already
 /// ship their native platform package beside core; source checkouts keep it in
 /// encore-index/packages. Cross targets continue to require a target kit.
-pub fn system_platform_root(base_root: Path, target: TargetSpec) -> Path {
+pub fn try_system_platform_root(base_root: Path, target: TargetSpec) -> Result[Path, ProjectFailure] {
     if target_is_host(target) {
         let mut cursor = base_root.resolve()
         loop {
             let distribution = cursor.join("index").join("platform")
-            if platform_package_exists(distribution) {
-                ret distribution
+            if try_platform_package_exists(distribution)? {
+                ret  Result[Path, ProjectFailure]::Ok(distribution)
             }
             let index_checkout = cursor.join("packages").join("platform")
-            if platform_package_exists(index_checkout) {
-                ret index_checkout
+            if try_platform_package_exists(index_checkout)? {
+                ret  Result[Path, ProjectFailure]::Ok(index_checkout)
             }
             let compiler_checkout = cursor.join("encore-index").join("packages").join("platform")
-            if platform_package_exists(compiler_checkout) {
-                ret compiler_checkout
+            if try_platform_package_exists(compiler_checkout)? {
+                ret  Result[Path, ProjectFailure]::Ok(compiler_checkout)
             }
 
             match cursor.parent() {
@@ -1077,8 +1097,8 @@ pub fn system_platform_root(base_root: Path, target: TargetSpec) -> Path {
         match configured_core.parent() {
             Some(parent) => {
                 let installed = parent.join("platform")
-                if platform_package_exists(installed) {
-                    ret installed
+                if try_platform_package_exists(installed)? {
+                    ret  Result[Path, ProjectFailure]::Ok(installed)
                 }
             }
             None => {
@@ -1087,24 +1107,24 @@ pub fn system_platform_root(base_root: Path, target: TargetSpec) -> Path {
     }
 
     if target_kit_installed(target) {
-        ret target_platform_root(target).resolve()
+        ret  Result[Path, ProjectFailure]::Ok(target_platform_root(target).resolve())
     }
-    workspace_error("Target kit for " + target.triple + " is not installed; run `encore target install " + target.triple + "`")
-    ret base_root
+    try_workspace_error("Target kit for " + target.triple + " is not installed; run `encore target install " + target.triple + "`")?
+    ret  Result[Path, ProjectFailure]::Ok(base_root)
 }
 
-fn core_package_exists(root: Path) -> bool {
+fn try_core_package_exists(root: Path) -> Result[bool, ProjectFailure] {
     if !file_exists(native_path(root.join("encore.toml").as_str())) {
-        ret false
+        ret  Result[bool, ProjectFailure]::Ok(false)
     }
-    ret project_manifest_name(read_project_manifest(root)) == "core"
+    ret  Result[bool, ProjectFailure]::Ok(project_manifest_name(try_read_project_manifest(root)?) == "core")
 }
 
-fn platform_package_exists(root: Path) -> bool {
+fn try_platform_package_exists(root: Path) -> Result[bool, ProjectFailure] {
     if !file_exists(native_path(root.join("encore.toml").as_str())) {
-        ret false
+        ret  Result[bool, ProjectFailure]::Ok(false)
     }
-    ret project_manifest_name(read_project_manifest(root)) == "platform"
+    ret  Result[bool, ProjectFailure]::Ok(project_manifest_name(try_read_project_manifest(root)?) == "platform")
 }
 
 fn find_refrain_by_root(workspace: ProjectWorkspace, root: Path) -> Option[WorkspaceRefrain] {
@@ -1163,16 +1183,16 @@ fn import_paths_from_edges(edges: Vec[DependencyEdge]) -> Vec[str] {
     ret out
 }
 
-fn expand_import_path(raw: str) -> Vec[str] {
+fn try_expand_import_path(raw: str) -> Result[Vec[str], ProjectFailure] {
     let cleaned = trim_spaces(raw)
     let brace_start = find_char(cleaned, "{", 0_usize)
     if brace_start >= cleaned.len() {
         let mut out = Vec[str]::new()
         out.push(strip_import_suffixes(cleaned))
-        ret out
+        ret  Result[Vec[str], ProjectFailure]::Ok(out)
     }
 
-    let brace_end = find_matching_brace(cleaned, brace_start)
+    let brace_end = try_find_matching_brace(cleaned, brace_start)?
     let prefix = cleaned.slice(0_usize, brace_start)
     let inner = cleaned.slice(brace_start + 1_usize, brace_end - brace_start - 1_usize)
     let suffix = cleaned.slice(brace_end + 1_usize, cleaned.len() - brace_end - 1_usize)
@@ -1183,7 +1203,7 @@ fn expand_import_path(raw: str) -> Vec[str] {
     while index < items.len() {
         match items.get(index) {
             Option[str]::Some(item) => {
-                let nested = expand_import_path(prefix + item + suffix)
+                let nested = try_expand_import_path(prefix + item + suffix)?
                 let mut nested_index = 0_usize
                 while nested_index < nested.len() {
                     match nested.get(nested_index) {
@@ -1201,7 +1221,7 @@ fn expand_import_path(raw: str) -> Vec[str] {
         }
         index = index + 1_usize
     }
-    ret out
+    ret  Result[Vec[str], ProjectFailure]::Ok(out)
 }
 
 fn split_scope_path(value: str) -> Vec[str] {
@@ -1274,7 +1294,7 @@ fn strip_import_suffixes(value: str) -> str {
     ret trim_spaces(out)
 }
 
-fn find_matching_brace(value: str, start: usize) -> usize {
+fn try_find_matching_brace(value: str, start: usize) -> Result[usize, ProjectFailure] {
     let mut depth = 0_usize
     let mut index = start
     while index < value.len() {
@@ -1284,13 +1304,13 @@ fn find_matching_brace(value: str, start: usize) -> usize {
         } elif ch == "}" {
             depth = depth - 1_usize
             if depth == 0_usize {
-                ret index
+                ret  Result[usize, ProjectFailure]::Ok(index)
             }
         }
         index = index + 1_usize
     }
-    workspace_error("Unbalanced import braces: " + value)
-    ret start
+    try_workspace_error("Unbalanced import braces: " + value)?
+    ret  Result[usize, ProjectFailure]::Ok(start)
 }
 
 fn trim_spaces(value: str) -> str {
@@ -1311,10 +1331,8 @@ fn is_space(ch: str) -> bool {
     ret ch == " " || ch == "\n" || ch == "\t" || ch == "\r"
 }
 
-fn workspace_error(message: str) ->() {
-    eprintln("error[workspace]: " + message)
-    exit(1_i32)
-    ret()
+fn try_workspace_error(message: str) ->Result[bool, ProjectFailure] {
+    ret Result[bool, ProjectFailure]::Err(ProjectFailure { "workspace", message })
 }
 
 fn starts_with(value: str, prefix: str) -> bool {
@@ -1394,4 +1412,262 @@ fn replace_backslashes(value: str) -> str {
         index = index + 1_usize
     }
     ret out
+}
+
+// Strict CLI compatibility wrappers; editor clients use try_* entry points.
+
+fn build_modules_for_refrain(workspace: mut ProjectWorkspace, refrain: WorkspaceRefrain) -> Vec[WorkspaceModule] {
+    match try_build_modules_for_refrain(workspace, refrain) {
+        Result[Vec[WorkspaceModule], ProjectFailure]::Ok(value) => { ret value }
+        Result[Vec[WorkspaceModule], ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn core_package_exists(root: Path) -> bool {
+    match try_core_package_exists(root) {
+        Result[bool, ProjectFailure]::Ok(value) => { ret value }
+        Result[bool, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn entrypoint_of(refrain: WorkspaceRefrain) -> Path {
+    match try_entrypoint_of(refrain) {
+        Result[Path, ProjectFailure]::Ok(value) => { ret value }
+        Result[Path, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn expand_import_path(raw: str) -> Vec[str] {
+    match try_expand_import_path(raw) {
+        Result[Vec[str], ProjectFailure]::Ok(value) => { ret value }
+        Result[Vec[str], ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn find_matching_brace(value: str, start: usize) -> usize {
+    match try_find_matching_brace(value, start) {
+        Result[usize, ProjectFailure]::Ok(value) => { ret value }
+        Result[usize, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+pub fn load_binary_workspace(root: Path) -> ProjectWorkspace {
+    match try_load_binary_workspace(root) {
+        Result[ProjectWorkspace, ProjectFailure]::Ok(value) => { ret value }
+        Result[ProjectWorkspace, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+pub fn load_entry_workspace(root: Path, entrypoint: Path) -> ProjectWorkspace {
+    match try_load_entry_workspace(root, entrypoint) {
+        Result[ProjectWorkspace, ProjectFailure]::Ok(value) => { ret value }
+        Result[ProjectWorkspace, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn load_entry_workspace_impl(root: Path, entrypoint: Path, has_overlay: bool, source: str) -> ProjectWorkspace {
+    match try_load_entry_workspace_impl(root, entrypoint, has_overlay, source, true) {
+        Result[ProjectWorkspace, ProjectFailure]::Ok(value) => { ret value }
+        Result[ProjectWorkspace, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+pub fn load_entry_workspace_source(root: Path, entrypoint: Path, source: str) -> ProjectWorkspace {
+    match try_load_entry_workspace_source(root, entrypoint, source) {
+        Result[ProjectWorkspace, ProjectFailure]::Ok(value) => { ret value }
+        Result[ProjectWorkspace, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+pub fn load_library_workspace(root: Path) -> ProjectWorkspace {
+    match try_load_library_workspace(root) {
+        Result[ProjectWorkspace, ProjectFailure]::Ok(value) => { ret value }
+        Result[ProjectWorkspace, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn load_refrain(workspace: mut ProjectWorkspace, root: Path, distribution_root: Path, source_key: str, lock_root: Path, target_is_binary: bool, requested_features: Vec[str]) -> str {
+    match try_load_refrain(workspace, root, distribution_root, source_key, lock_root, target_is_binary, requested_features) {
+        Result[str, ProjectFailure]::Ok(value) => { ret value }
+        Result[str, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn load_workspace(root: Path, target_is_binary: bool, build_flat_ast: bool) -> ProjectWorkspace {
+    match try_load_workspace(root, target_is_binary, build_flat_ast) {
+        Result[ProjectWorkspace, ProjectFailure]::Ok(value) => { ret value }
+        Result[ProjectWorkspace, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn merge_loaded_refrain_features(workspace: mut ProjectWorkspace, found: WorkspaceRefrain, requested: Vec[str], lock_root: Path) -> str {
+    match try_merge_loaded_refrain_features(workspace, found, requested, lock_root) {
+        Result[str, ProjectFailure]::Ok(value) => { ret value }
+        Result[str, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn platform_package_exists(root: Path) -> bool {
+    match try_platform_package_exists(root) {
+        Result[bool, ProjectFailure]::Ok(value) => { ret value }
+        Result[bool, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn resolve_dependency_root(dep_ref: str, base_root: Path, distribution_root: Path, source_key: str, lock_root: Path) -> WorkspaceDependency {
+    match try_resolve_dependency_root(dep_ref, base_root, distribution_root, source_key, lock_root, true) {
+        Result[WorkspaceDependency, ProjectFailure]::Ok(value) => { ret value }
+        Result[WorkspaceDependency, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn resolved_module_import_ids(workspace: ProjectWorkspace, owner: WorkspaceRefrain, source_module: Path, ast: Vec[Statement]) -> Vec[str] {
+    match try_resolved_module_import_ids(workspace, owner, source_module, ast) {
+        Result[Vec[str], ProjectFailure]::Ok(value) => { ret value }
+        Result[Vec[str], ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+pub fn system_core_root(base_root: Path) -> Path {
+    match try_system_core_root(base_root) {
+        Result[Path, ProjectFailure]::Ok(value) => { ret value }
+        Result[Path, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+pub fn system_platform_root(base_root: Path, target: TargetSpec) -> Path {
+    match try_system_platform_root(base_root, target) {
+        Result[Path, ProjectFailure]::Ok(value) => { ret value }
+        Result[Path, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn visit_imports(
+    workspace: mut ProjectWorkspace,
+    owner: WorkspaceRefrain,
+    resolved_path: Path,
+    imports: Vec[DependencyEdge],
+    visited_paths: usize,
+    result: mut Vec[WorkspaceModule],
+    diagnostics: mut Vec[FrontendDiagnostic],
+) ->() {
+    match try_visit_imports(workspace, owner, resolved_path, imports, visited_paths, result, diagnostics) {
+        Result[bool, ProjectFailure]::Ok(value) => { ret () }
+        Result[bool, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn visit_module(
+    workspace: mut ProjectWorkspace,
+    owner: WorkspaceRefrain,
+    module_path: Path,
+    visited_paths: usize,
+    result: mut Vec[WorkspaceModule],
+) ->() {
+    match try_visit_module(workspace, owner, module_path, visited_paths, result) {
+        Result[bool, ProjectFailure]::Ok(value) => { ret () }
+        Result[bool, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn workspace_error(message: str) ->() {
+    match try_workspace_error(message) {
+        Result[bool, ProjectFailure]::Ok(value) => { ret () }
+        Result[bool, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
+}
+
+fn workspace_invariant_error(message: str) ->() {
+    match try_workspace_invariant_error(message) {
+        Result[bool, ProjectFailure]::Ok(value) => { ret () }
+        Result[bool, ProjectFailure]::Err(failure) => {
+            eprintln("error[" + failure.code + "]: " + failure.message)
+            exit(1_i32)
+            loop {}
+        }
+    }
 }

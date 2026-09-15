@@ -5,8 +5,11 @@ import core::option::Option
 import std::dict::Hashable
 import std::vec::Vec
 
-import refrain::frontend::analysis::{DiagnosticLabelKind, FrontendDiagnostic, SuggestionApplicability}
+import refrain::frontend::analysis::{DiagnosticLabelKind, FrontendDiagnostic, SuggestionApplicability, DiagnosticLabel, DiagnosticSuggestion}
+import refrain::frontend::parser::BlockExpr
+import refrain::frontend::parser::ParsedBlock
 import refrain::frontend::parser::{Expr, ExprNode, FunctionItem, FunctionParam, GenericParam, IfExprBranch, ImplStmt, MatchArmBody, MatchPattern, Statement, TraitStmt}
+import refrain::frontend::type_scope::{TypeNameBinding, scope_type, display_type, declaration_type_name}
 import refrain::target::{TargetSpec, cfg_active_with_features}
 
 /// Records the inferred type of a local binding.
@@ -17,11 +20,29 @@ pub struct SemanticBinding {
     column: usize
 }
 
+/// One binding with its lexical lifetime and post-initializer visibility.
+pub struct ScopedSemanticBinding {
+    binding: SemanticBinding
+    scope:(usize, usize, usize, usize)
+    visible_line: usize
+    visible_column: usize
+}
+
 /// Identifies a declaration signature read while checking a body.
+pub enum SemanticDependencyKind {
+    Function
+    FunctionBinding
+    TypeScope
+    Method
+    Field
+    LookupScope
+}
+
 pub struct SemanticDependency {
     module_name: str
     name: str
     signature: u64
+    kind: SemanticDependencyKind
 }
 
 /// Describes one callable visible to a semantic body query.
@@ -31,6 +52,10 @@ pub struct SemanticCallable {
     params: Vec[str]
     ret_type: str
     signature: u64
+    declaration_name: str
+    lookup_module: str
+    binding_identity: u64
+    generic_names: Vec[str]
 }
 
 /// Describes one field available through a resolved aggregate type.
@@ -40,6 +65,8 @@ pub struct SemanticField {
     name: str
     typ: str
     signature: u64
+    generic_names: Vec[str]
+    declaration_owner: str
 }
 
 /// Describes one inherent or trait method after impl resolution.
@@ -50,6 +77,96 @@ pub struct SemanticMethod {
     params: Vec[str]
     ret_type: str
     signature: u64
+    declaration_receiver: str
+    generic_names: Vec[str]
+    is_static: bool
+}
+
+/// One field or method offered for a concrete receiver type.
+pub struct SemanticMember {
+    name: str
+    typ: str
+    params: Vec[str]
+    is_method: bool
+    declaration_module: str
+    declaration_owner: str
+}
+
+/// Uses the same receiver matching and generic substitution as body checking.
+pub fn semantic_members(receiver: str, fields: Vec[SemanticField], methods: Vec[SemanticMethod]) -> Vec[SemanticMember] {
+    ret semantic_named_members(receiver, "", fields, methods)
+}
+
+/// Resolves one member name without specializing unrelated fields and methods.
+/// An empty name requests the complete completion environment.
+pub fn semantic_named_members(receiver: str, name_filter: str, fields: Vec[SemanticField], methods: Vec[SemanticMethod]) -> Vec[SemanticMember] {
+    ret semantic_access_members(receiver, name_filter, fields, methods, false)
+}
+
+/// Specializes static members with the same receiver rules as associated calls.
+pub fn semantic_associated_members(receiver: str, name: str, methods: Vec[SemanticMethod]) -> Vec[SemanticMember] {
+    ret semantic_access_members(receiver, name, Vec[SemanticField]::new(), methods, true)
+}
+
+fn semantic_access_members(receiver: str, name_filter: str, fields: Vec[SemanticField], methods: Vec[SemanticMethod], is_static: bool) -> Vec[SemanticMember] {
+    let mut out = Vec[SemanticMember]::new()
+    if receiver == "" {
+        ret out
+    }
+    if !is_static && starts_with(receiver, "(") {
+        let mut index = 0_usize
+        loop {
+            let name = Debug::fmt(index)
+            let typ = tuple_element_type(receiver, name)
+            if typ == "" {
+                break
+            }
+            if name_filter == "" || name == name_filter {
+                out.push(SemanticMember {
+                        name, typ, Vec[str]::new(), false, "", ""
+                    }
+                    ,
+                )
+            }
+            index += 1_usize
+        }
+    }
+    for field in fields {
+        if name_filter != "" && field.name != name_filter {
+            continue
+        }
+        if semantic_receiver_matches(field.owner_type, receiver, field.generic_names) {
+            out.push(SemanticMember {
+                    field.name, specialize_method_type(field.typ, field.owner_type, receiver, field.generic_names),
+                    Vec[str]::new(), false, field.module_name, semantic_root_type(field.declaration_owner)
+                }
+                ,)
+        }
+    }
+    for method in methods {
+        if method.is_static != is_static {
+            continue
+        }
+        if name_filter != "" && method.name != name_filter {
+            continue
+        }
+        if semantic_receiver_matches(method.receiver_type, receiver, method.generic_names) {
+            out.push(SemanticMember {
+                    method.name, specialize_method_type(method.ret_type, method.receiver_type, receiver, method.generic_names),
+                    specialize_method_types(method.params, method.receiver_type, receiver, method.generic_names), true,
+                    method.module_name, method_declaration_owner(method.declaration_receiver)
+                }
+                ,)
+        }
+    }
+    ret out
+}
+
+fn method_declaration_owner(receiver: str) -> str {
+    if starts_with(receiver, "dyn ") {
+        ret semantic_root_type(receiver.slice(4_usize, receiver.len() - 4_usize))
+    }
+    ret receiver
 }
 
 /// Contains the reusable semantic facts and diagnostics of one function body.
@@ -58,6 +175,10 @@ pub struct SemanticBody {
     diagnostics: Vec[FrontendDiagnostic]
     dependencies: Vec[SemanticDependency]
     return_type: str
+    scoped_bindings: Vec[ScopedSemanticBinding]
+    member_receivers: Vec[(usize, usize, str)]
+    bound_methods: Vec[SemanticMethod]
+    type_names: Vec[TypeNameBinding]
 }
 
 struct SemanticContext {
@@ -69,6 +190,12 @@ struct SemanticContext {
     bindings: Vec[SemanticBinding]
     diagnostics: Vec[FrontendDiagnostic]
     dependencies: Vec[SemanticDependency]
+    scope:(usize, usize, usize, usize)
+    scoped_bindings: Vec[ScopedSemanticBinding]
+    aggregate_names: Vec[str]
+    member_receivers: Vec[(usize, usize, str)]
+    type_names: Vec[TypeNameBinding]
+    type_scope: str
 }
 
 impl for SemanticBody {
@@ -76,8 +203,23 @@ impl for SemanticBody {
     pub fn empty() -> Self {
         ret Self {
             Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(),
-            ""
+            "", Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), Vec[TypeNameBinding]::new()
         }
+    }
+
+    /// Returns the inferred receiver at a field or method token, including a missing member.
+    pub fn member_receiver_at(self: Self, line: usize, column: usize) -> str {
+        ret display_type(self.canonical_member_receiver_at(line, column), self.type_names)
+    }
+
+    /// Internal receiver identity for semantic matching, not user-facing text.
+    pub fn canonical_member_receiver_at(self: Self, line: usize, column: usize) -> str {
+        for receiver in self.member_receivers {
+            if receiver.0 == line && receiver.1 == column {
+                ret receiver.2
+            }
+        }
+        ret ""
     }
 
     /// Returns the inferred or declared type of a local binding.
@@ -89,6 +231,107 @@ impl for SemanticBody {
         }
         ret Option[str]::None
     }
+
+    /// Resolves shadowing only among bindings visible at this source position.
+    pub fn bindings_at(self: Self, line: usize, column: usize) -> Vec[SemanticBinding] {
+        let mut out = Vec[SemanticBinding]::new()
+        let mut index = self.scoped_bindings.len()
+        while index > 0_usize {
+            index -= 1_usize
+            match self.scoped_bindings.get(index) {
+                Some(site) => {
+                    if !position_before_or_equal(site.scope.0, site.scope.1, line, column)
+                    || !position_before_or_equal(line, column, site.scope.2, site.scope.3)
+                    || !position_before_or_equal(site.visible_line, site.visible_column, line, column) {
+                        continue
+                    }
+                    let mut duplicate = false
+                    for existing in out {
+                        if existing.name == site.binding.name {
+                            duplicate = true break
+                        }
+                    }
+                    if !duplicate {
+                        out.push(site.binding)
+                    }
+                }
+                None => {
+                }
+            }
+        }
+        ret out
+    }
+
+    /// Resolves shadowing only among bindings visible at this source position.
+    pub fn binding_at(self: Self, name: str, line: usize, column: usize) -> Option[SemanticBinding] {
+        ret self.binding_at_with_rename(name, line, column, 0_usize, 0_usize, "", false)
+    }
+
+    /// Checks lexical identity under a hypothetical rename without changing the AST or cache.
+    pub fn rename_preserves_binding(self: Self, name: str, line: usize, column: usize,
+        declaration_line: usize, declaration_column: usize, new_name: str,) -> bool {
+        let before = self.binding_at(name, line, column)
+        let mut queried_name = name
+        match before {
+            Some(binding) => {
+                if binding.line == declaration_line && binding.column == declaration_column {
+                    queried_name = new_name
+                }
+            }
+            None => {
+            }
+        }
+        let after = self.binding_at_with_rename(queried_name, line, column,
+            declaration_line, declaration_column, new_name, true,)
+        match before {
+            Some(binding) => {
+                match after {
+                    Some(changed) => {
+                        ret binding.line == changed.line && binding.column == changed.column
+                    }
+                    None => {
+                        ret false
+                    }
+                }
+            }
+            None => {
+                ret after.is_none()
+            }
+        }
+    }
+
+    fn binding_at_with_rename(self: Self, name: str, line: usize, column: usize,
+        declaration_line: usize, declaration_column: usize, new_name: str,
+        rename: bool,) -> Option[SemanticBinding] {
+        let mut index = self.scoped_bindings.len()
+        while index > 0_usize {
+            index -= 1_usize
+            match self.scoped_bindings.get(index) {
+                Some(site) => {
+                    let candidate_name = if rename && site.binding.line == declaration_line
+                    && site.binding.column == declaration_column {
+                        new_name
+                    } else {
+                        site.binding.name
+                    }
+                    if candidate_name == name
+                    &&((site.binding.line == line && site.binding.column == column)
+                        ||(position_before_or_equal(site.scope.0, site.scope.1, line, column)
+                            && position_before_or_equal(line, column, site.scope.2, site.scope.3)
+                            && position_before_or_equal(site.visible_line, site.visible_column, line, column))) {
+                        ret Option[SemanticBinding]::Some(site.binding)
+                    }
+                }
+                None => {
+                }
+            }
+        }
+        ret Option[SemanticBinding]::None
+    }
+}
+
+fn position_before_or_equal(a_line: usize, a_column: usize, b_line: usize, b_column: usize) -> bool {
+    ret a_line < b_line ||(a_line == b_line && a_column <= b_column)
 }
 
 impl for SemanticCallable {
@@ -100,7 +343,23 @@ impl for SemanticCallable {
         }
         key += ")->" + ret_type
         ret Self {
-            module_name, name, params, ret_type, nonzero_hash(key)
+            module_name, name, params, ret_type, nonzero_hash(key), name, "", 0_u64, Vec[str]::new()
+        }
+    }
+
+    /// Changes only the visible spelling, preserving dependency identity.
+    pub fn in_scope(self: Self, name: str, module_name: str, identity: u64) -> Self {
+        ret Self {
+            self.module_name, name, self.params, self.ret_type, self.signature,
+            self.declaration_name, module_name, identity, self.generic_names
+        }
+    }
+
+    pub fn with_generics(self: Self, names: Vec[str]) -> Self {
+        ret Self {
+            self.module_name, self.name, self.params, self.ret_type,
+            generic_signature(self.signature, names), self.declaration_name, self.lookup_module,
+            self.binding_identity, names
         }
     }
 }
@@ -109,7 +368,22 @@ impl for SemanticField {
     pub fn new(module_name: str, owner_type: str, name: str, typ: str) -> Self {
         let key = module_name + "#" + owner_type + "." + name + ":" + typ
         ret Self {
-            module_name, owner_type, name, typ, nonzero_hash(key)
+            module_name, owner_type, name, typ, nonzero_hash(key), Vec[str]::new(), owner_type
+        }
+    }
+
+    pub fn with_generics(self: Self, names: Vec[str]) -> Self {
+        ret Self {
+            self.module_name, self.owner_type, self.name, self.typ,
+            generic_signature(self.signature, names), names, self.declaration_owner
+        }
+    }
+
+    /// Changes lookup types without moving the declaration or its cache key.
+    pub fn in_receiver_scope(self: Self, owner: str, typ: str) -> Self {
+        ret Self {
+            self.module_name, owner, self.name, typ, self.signature,
+            self.generic_names, self.declaration_owner
         }
     }
 }
@@ -123,8 +397,44 @@ impl for SemanticMethod {
         }
         key += ")->" + ret_type
         ret Self {
-            module_name, receiver_type, name, params, ret_type, nonzero_hash(key)
+            module_name, receiver_type, name, params, ret_type, nonzero_hash(key), receiver_type, Vec[str]::new(), false
         }
+    }
+
+    pub fn with_generics(self: Self, names: Vec[str]) -> Self {
+        ret Self {
+            self.module_name, self.receiver_type, self.name, self.params, self.ret_type,
+            generic_signature(self.signature, names), self.declaration_receiver, names, self.is_static
+        }
+    }
+
+    pub fn with_static(self: Self, is_static: bool) -> Self {
+        let signature = if is_static {
+            nonzero_hash(Debug::fmt(self.signature) + "#static")
+        } else {
+            self.signature
+        }
+        ret Self {
+            self.module_name, self.receiver_type, self.name, self.params, self.ret_type,
+            signature, self.declaration_receiver, self.generic_names, is_static
+        }
+    }
+
+    /// Exposes an inherited method while preserving the signature's true owner.
+    pub fn inherited_by(self: Self, receiver: str, parent: str, generics: Vec[str]) -> Option[SemanticMethod] {
+        if semantic_root_type(self.receiver_type) != semantic_root_type(parent) {
+            ret Option[SemanticMethod]::None
+        }
+        let mut params = Vec[str]::new()
+        for param in self.params {
+            params.push(specialize_method_type_with_self(param, self.receiver_type, parent, "Self", self.generic_names))
+        }
+        let result = specialize_method_type_with_self(self.ret_type, self.receiver_type, parent, "Self", self.generic_names)
+        ret Option[SemanticMethod]::Some(Self {
+                self.module_name, receiver, self.name, params, result,
+                self.signature, self.declaration_receiver, generics, self.is_static
+            }
+            ,)
     }
 }
 
@@ -136,52 +446,90 @@ pub fn check_function_body(
     methods: Vec[SemanticMethod],
     self_type: str,
 ) -> SemanticBody {
+    ret check_function_body_with_types(item, callables, fields, methods, self_type, Vec[str]::new())
+}
+
+/// Checks with explicit known aggregate names, including types with no fields.
+pub fn check_function_body_with_types(item: FunctionItem, callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
+    aggregate_names: Vec[str],) -> SemanticBody {
     if semantic_function_has_attr(item, "decorator") {
         ret SemanticBody {
             Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(),
-            item.ret_type.unwrap_or("void")
+            item.ret_type.unwrap_or("void"), Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), Vec[TypeNameBinding]::new()
         }
     }
-    ret check_function_body_with_scope(item, callables, fields, methods, self_type, Vec[str]::new())
+    ret check_function_body_with_scope(item, callables, fields, methods, self_type, Vec[GenericParam]::new(), aggregate_names)
 }
 
-fn check_function_body_with_scope(
+pub fn check_function_body_with_scope(
     item: FunctionItem,
     callables: Vec[SemanticCallable],
     fields: Vec[SemanticField],
     methods: Vec[SemanticMethod],
     self_type: str,
-    scope_generics: Vec[str],
+    scope_generics: Vec[GenericParam],
+    aggregate_names: Vec[str],
 ) -> SemanticBody {
+    ret check_function_body_with_type_scope(item, callables, fields, methods, self_type,
+        scope_generics, aggregate_names, "", Vec[TypeNameBinding]::new(),)
+}
+
+pub fn check_function_body_with_type_scope(item: FunctionItem, callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
+    scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str,
+    type_names: Vec[TypeNameBinding],) -> SemanticBody {
     if semantic_function_has_attr(item, "decorator") {
         ret SemanticBody {
             Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(),
-            item.ret_type.unwrap_or("void")
+            item.ret_type.unwrap_or("void"), Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), type_names
         }
     }
     let mut generic_names = Vec[str]::new()
-    for generic_name in scope_generics {
-        generic_names.push(generic_name)
+    let mut generics = Vec[GenericParam]::new()
+    for generic in scope_generics {
+        generic_names.push(generic.name)
+        generics.push(generic)
     }
     for generic in item.generics {
         generic_names.push(generic.name)
+        generics.push(generic)
     }
+    let bound_methods = methods_for_generic_bounds(generics, methods, type_scope, type_names)
+    let scoped_methods = append_bound_methods(methods, bound_methods)
     let mut ctx = SemanticContext {
-        callables, fields, methods, self_type, generic_names, Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(),
-        Vec[SemanticDependency]::new()
+        callables, fields, scoped_methods, self_type, generic_names, Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(),
+        Vec[SemanticDependency]::new(),
+        (0_usize, 0_usize, 0_usize, 0_usize), Vec[ScopedSemanticBinding]::new(), aggregate_names,
+        Vec[(usize, usize, str)]::new(), type_names, type_scope
+    }
+    for generic in generics {
+        if generic.bounds.len() > 0_usize {
+            remember_failed_lookup(ctx) break
+        }
+    }
+    if scope_generics.len() > 0_usize {
+        remember_failed_lookup(ctx)
+    }
+    match item.body {
+        Some(body) => {
+            replace_scope(ctx, block_scope(body))
+        }
+        None => {
+        }
     }
     for param in item.params {
         match param.typ {
             Option[str]::Some(typ) => {
                 let resolved = if self_type != "" {
-                    replace_type_name(semantic_type_name(typ), "Self", self_type)
+                    local_type(ctx, replace_type_name(semantic_type_name(typ), "Self", self_type))
                 } else {
-                    semantic_type_name(typ)
+                    local_type(ctx, semantic_type_name(typ))
                 }
-                ctx.bindings.push(SemanticBinding {
-                        param.name, resolved, item.line, item.column
+                push_binding(ctx, SemanticBinding {
+                        param.name, resolved, param.line, param.column
                     }
-                    ,
+                    , item.line, item.column,
                 )
             }
             Option[str]::None => {
@@ -192,6 +540,7 @@ fn check_function_body_with_scope(
     if self_type != "" {
         return_type = replace_type_name(semantic_type_name(return_type), "Self", self_type)
     }
+    return_type = local_type(ctx, return_type)
     match item.body {
         Option::Some(body) => {
             check_statements(ctx, body.statements, return_type)
@@ -216,9 +565,68 @@ fn check_function_body_with_scope(
         Option::None => {
         }
     }
-    ret SemanticBody {
-        ctx.bindings, ctx.diagnostics, ctx.dependencies, return_type
+    let mut public_bindings = Vec[SemanticBinding]::new()
+    for binding in ctx.bindings {
+        public_bindings.push(present_binding(binding, type_names))
     }
+    let mut public_scoped = Vec[ScopedSemanticBinding]::new()
+    for site in ctx.scoped_bindings {
+        public_scoped.push(ScopedSemanticBinding {
+                present_binding(site.binding, type_names),
+                site.scope, site.visible_line, site.visible_column
+            }
+            ,)
+    }
+    let mut public_diagnostics = Vec[FrontendDiagnostic]::new()
+    for diagnostic in ctx.diagnostics {
+        public_diagnostics.push(present_diagnostic(diagnostic, type_names))
+    }
+    ret SemanticBody {
+        public_bindings, public_diagnostics, ctx.dependencies, display_type(return_type, type_names), public_scoped,
+        ctx.member_receivers, bound_methods, type_names
+    }
+}
+
+fn present_diagnostic(diagnostic: FrontendDiagnostic, names: Vec[TypeNameBinding]) -> FrontendDiagnostic {
+    let mut labels = Vec[DiagnosticLabel]::new()
+    for label in diagnostic.labels {
+        labels.push(DiagnosticLabel {
+                label.source_name, label.line, label.column, label.length, label.kind,
+                display_type(label.message, names)
+            }
+            ,)
+    }
+    let mut notes = Vec[str]::new()
+    for note in diagnostic.notes {
+        notes.push(display_type(note, names))
+    }
+    let mut helps = Vec[str]::new()
+    for help in diagnostic.helps {
+        helps.push(display_type(help, names))
+    }
+    let mut suggestions = Vec[DiagnosticSuggestion]::new()
+    for suggestion in diagnostic.suggestions {
+        suggestions.push(DiagnosticSuggestion {
+                suggestion.source_name, suggestion.line, suggestion.column,
+                suggestion.length, display_type(suggestion.replacement, names), display_type(suggestion.message, names),
+                suggestion.applicability
+            }
+            ,)
+    }
+    ret FrontendDiagnostic {
+        diagnostic.severity, diagnostic.code, display_type(diagnostic.message, names),
+        diagnostic.line, diagnostic.column, diagnostic.length, labels, notes, helps, suggestions
+    }
+}
+
+fn present_binding(binding: SemanticBinding, names: Vec[TypeNameBinding]) -> SemanticBinding {
+    ret SemanticBinding {
+        binding.name, display_type(binding.typ, names), binding.line, binding.column
+    }
+}
+
+fn local_type(ctx: SemanticContext, typ: str) -> str {
+    ret scope_type(typ, ctx.type_scope, ctx.type_names, ctx.generic_names)
 }
 
 fn statements_definitely_return(statements: Vec[Statement]) -> bool {
@@ -366,26 +774,45 @@ pub fn check_module_bodies(
     fields: Vec[SemanticField],
     methods: Vec[SemanticMethod],
 ) -> Vec[FrontendDiagnostic] {
+    ret check_module_bodies_with_types(ast, callables, fields, methods, semantic_aggregate_names(ast))
+}
+
+pub fn semantic_aggregate_names(ast: Vec[Statement]) -> Vec[str] {
+    let mut names = Vec[str]::new()
+    for statement in ast {
+        match statement {
+            Statement::Struct(item) => {
+                names.push(item.name)
+            }
+            _ => {
+            }
+        }
+    }
+    ret names
+}
+
+pub fn check_module_bodies_with_types(ast: Vec[Statement], callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],) -> Vec[FrontendDiagnostic] {
     let mut out = Vec[FrontendDiagnostic]::new()
     let mut traits = Vec[TraitStmt]::new()
     for statement in ast {
         match statement {
             Statement::Function(item) => {
-                out.extend(check_function_body(item, callables, fields, methods, "").diagnostics)
+                out.extend(check_function_body_with_types(item, callables, fields, methods, "", aggregate_names).diagnostics)
             }
             Statement::Trait(item) => {
-                let scope_generics = generic_param_names(item.generics)
+                let scope_generics = item.generics
                 for method in item.methods {
                     out.extend(check_function_body_with_scope(method, callables, fields, methods, item.name,
-                            scope_generics,).diagnostics)
+                            scope_generics, aggregate_names,).diagnostics)
                 }
                 traits.push(item)
             }
             Statement::Impl(item) => {
-                let scope_generics = generic_param_names(item.generics)
+                let scope_generics = item.generics
                 for method in item.methods {
                     out.extend(check_function_body_with_scope(method, callables, fields, methods, item.target,
-                            scope_generics,).diagnostics)
+                            scope_generics, aggregate_names,).diagnostics)
                 }
             }
             _ => {
@@ -398,6 +825,59 @@ pub fn check_module_bodies(
                 check_local_trait_impl(item, traits, out)
             }
             _ => {
+            }
+        }
+    }
+    ret out
+}
+
+pub fn append_bound_methods(methods: Vec[SemanticMethod], bound_methods: Vec[SemanticMethod]) -> Vec[SemanticMethod] {
+    if bound_methods.len() == 0_usize {
+        ret methods
+    }
+    let mut out = Vec[SemanticMethod]::new()
+    for method in methods {
+        out.push(method)
+    }
+    for method in bound_methods {
+        out.push(method)
+    }
+    ret out
+}
+
+fn methods_for_generic_bounds(generics: Vec[GenericParam], methods: Vec[SemanticMethod], type_scope: str,
+    type_names: Vec[TypeNameBinding],) -> Vec[SemanticMethod] {
+    let mut out = Vec[SemanticMethod]::new()
+    for generic in generics {
+        for bound in generic.bounds {
+            let mut receiver = "dyn " + bound.path
+            if bound.args.len() > 0_usize {
+                receiver += "["
+                let mut index = 0_usize
+                for arg in bound.args {
+                    if index > 0_usize {
+                        receiver += ", "
+                    }
+                    receiver += arg
+                    index += 1_usize
+                }
+                receiver += "]"
+            }
+            receiver = scope_type(receiver, type_scope, type_names, generic_param_names(generics))
+            for method in methods {
+                if semantic_root_type(semantic_type_name(method.receiver_type)) != semantic_root_type(semantic_type_name(receiver)) {
+                    continue
+                }
+                let mut params = Vec[str]::new()
+                for param in method.params {
+                    params.push(specialize_method_type_with_self(param, method.receiver_type, receiver, generic.name, method.generic_names))
+                }
+                let result = specialize_method_type_with_self(method.ret_type, method.receiver_type, receiver, generic.name, method.generic_names)
+                out.push(SemanticMethod {
+                        method.module_name, generic.name, method.name, params,
+                        result, method.signature, method.declaration_receiver, Vec[str]::new(), method.is_static
+                    }
+                    ,)
             }
         }
     }
@@ -792,7 +1272,7 @@ fn check_statements(
             Statement::Let(item) => {
                 let flexible_numeric = expression_is_flexible_numeric(item.expr)
                 let inferred = infer_expression(ctx, item.expr)
-                let mut declared = item.typ.unwrap_or(inferred)
+                let mut declared = local_type(ctx, item.typ.unwrap_or(inferred))
                 if semantic_type_name(declared) == "Self" && ctx.self_type != "" {
                     declared = ctx.self_type
                 }
@@ -803,10 +1283,10 @@ fn check_statements(
                             + "'",
                             item.expr.line, item.expr.column, item.expr.length,))
                 }
-                ctx.bindings.push(SemanticBinding {
-                        item.name, declared, item.expr.line, item.expr.column
+                push_binding(ctx, SemanticBinding {
+                        item.name, declared, item.line, item.column
                     }
-                    ,
+                    , item.visible_line, item.visible_column,
                 )
             }
             Statement::Ret(expr) => {
@@ -882,11 +1362,11 @@ fn check_statements(
             Statement::If(item) => {
                 for branch in item.branches {
                     check_boolean_condition(ctx, branch.condition)
-                    check_statements(ctx, branch.body.statements, return_type)
+                    check_scoped_statements(ctx, branch.body, return_type)
                 }
                 match item.else_body {
                     Option::Some(body) => {
-                        check_statements(ctx, body.statements, return_type)
+                        check_scoped_statements(ctx, body, return_type)
                     }
                     Option::None => {
                     }
@@ -894,16 +1374,25 @@ fn check_statements(
             }
             Statement::Match(item) => {
                 let matched = infer_expression(ctx, item.expr)
-                let outer_bindings = ctx.bindings
+                let outer_bindings = ctx.bindings.len()
+                let outer_scope = ctx.scope
                 for arm in item.arms {
                     replace_bindings(ctx, outer_bindings)
+                    match arm.body {
+                        MatchArmBody::Block(body) => {
+                            replace_scope(ctx, block_scope(body))
+                        }
+                        MatchArmBody::Expr(expr) => {
+                            replace_scope(ctx,(expr.line, expr.column, expr.line, expr.column + expr.length))
+                        }
+                    }
                     match arm.pattern.binding {
                         Option[str]::Some(name) => {
-                            ctx.bindings.push(SemanticBinding {
-                                    name, match_pattern_binding_type(matched, arm.pattern), item.expr.line,
+                            push_binding(ctx, SemanticBinding {
+                                    name, match_pattern_binding_type(ctx, matched, arm.pattern), item.expr.line,
                                     item.expr.column
                                 }
-                                ,
+                                , ctx.scope.0, ctx.scope.1,
                             )
                         }
                         Option[str]::None => {
@@ -919,42 +1408,49 @@ fn check_statements(
                     }
                 }
                 replace_bindings(ctx, outer_bindings)
+                replace_scope(ctx, outer_scope)
             }
             Statement::While(item) => {
                 check_boolean_condition(ctx, item.condition)
-                check_statements(ctx, item.body.statements, return_type)
+                check_scoped_statements(ctx, item.body, return_type)
             }
             Statement::Loop(item) => {
-                check_statements(ctx, item.body.statements, return_type)
+                check_scoped_statements(ctx, item.body, return_type)
             }
             Statement::DoWhile(item) => {
-                check_statements(ctx, item.body.statements, return_type)
+                check_scoped_statements(ctx, item.body, return_type)
                 check_boolean_condition(ctx, item.condition)
             }
             Statement::For(item) => {
                 let iterable = infer_expression(ctx, item.iterable)
-                let outer_bindings = ctx.bindings
-                ctx.bindings.push(SemanticBinding {
-                        item.name, iterable_item_type(iterable), item.iterable.line, item.iterable.column
+                let outer_bindings = ctx.bindings.len()
+                let outer_scope = ctx.scope
+                replace_scope(ctx, block_scope(item.body))
+                push_binding(ctx, SemanticBinding {
+                        item.name, iterable_item_type(ctx, iterable), item.iterable.line, item.iterable.column
                     }
-                    ,
+                    , item.body.start_line, item.body.start_column,
                 )
                 check_statements(ctx, item.body.statements, return_type)
                 replace_bindings(ctx, outer_bindings)
+                replace_scope(ctx, outer_scope)
             }
             Statement::With(item) => {
                 let resource = infer_expression(ctx, item.expr)
-                let outer_bindings = ctx.bindings
-                ctx.bindings.push(SemanticBinding {
+                let outer_bindings = ctx.bindings.len()
+                let outer_scope = ctx.scope
+                replace_scope(ctx, block_scope(item.body))
+                push_binding(ctx, SemanticBinding {
                         item.name, resource, item.expr.line, item.expr.column
                     }
-                    ,
+                    , item.body.start_line, item.body.start_column,
                 )
                 check_statements(ctx, item.body.statements, return_type)
                 replace_bindings(ctx, outer_bindings)
+                replace_scope(ctx, outer_scope)
             }
             Statement::Unsafe(body) => {
-                check_statements(ctx, body.statements, return_type)
+                check_scoped_statements(ctx, body, return_type)
             }
             Statement::Ehir(item) => {
                 register_ehir_bindings(ctx, item.body)
@@ -964,6 +1460,64 @@ fn check_statements(
         }
     }
     ret()
+}
+
+fn push_binding(ctx: mut SemanticContext, binding: SemanticBinding, line: usize, column: usize) ->() {
+    ctx.bindings.push(binding)
+    ctx.scoped_bindings.push(ScopedSemanticBinding {
+            binding, ctx.scope, line, column
+        }
+        ,
+    )
+    ret()
+}
+
+fn block_scope(body: ParsedBlock) ->(usize, usize, usize, usize) {
+    ret(body.start_line, body.start_column, body.end_line, body.end_column)
+}
+
+fn replace_scope(ctx: mut SemanticContext, scope:(usize, usize, usize, usize)) ->() {
+    ctx.scope = scope
+    ret()
+}
+
+fn check_scoped_statements(ctx: mut SemanticContext, body: ParsedBlock, return_type: str) ->() {
+    let outer = ctx.bindings.len()
+    let outer_scope = ctx.scope
+    replace_scope(ctx, block_scope(body))
+    check_statements(ctx, body.statements, return_type)
+    replace_bindings(ctx, outer)
+    replace_scope(ctx, outer_scope)
+    ret()
+}
+
+fn infer_block(ctx: mut SemanticContext, block: BlockExpr) -> str {
+    let outer = ctx.bindings.len()
+    let outer_scope = ctx.scope
+    replace_scope(ctx,(block.start_line, block.start_column, block.end_line, block.end_column))
+    check_statements(ctx, block.statements, "")
+    let result = match block.tail {
+        Some(tail) => infer_expression_h(ctx, tail)
+        None => if statements_diverge(block.statements) {
+            "never"
+        } else {
+            "void"
+        }
+    }
+    replace_bindings(ctx, outer)
+    replace_scope(ctx, outer_scope)
+    ret result
+}
+
+fn infer_unsafe_block(ctx: mut SemanticContext, body: ParsedBlock) -> str {
+    let outer = ctx.bindings.len()
+    let outer_scope = ctx.scope
+    replace_scope(ctx, block_scope(body))
+    check_statements(ctx, body.statements, "")
+    let result = unsafe_block_type(ctx, body.statements)
+    replace_bindings(ctx, outer)
+    replace_scope(ctx, outer_scope)
+    ret result
 }
 
 fn register_ehir_bindings(ctx: mut SemanticContext, body: str) ->() {
@@ -1004,13 +1558,12 @@ fn register_ehir_bindings(ctx: mut SemanticContext, body: str) ->() {
     ret()
 }
 
-/// Establishes the lexical binding snapshot used by the next semantic scope.
-///
-/// Keeping scope replacement as one operation also lets older bootstrap
-/// compilers build the analysis foundation before they contain the backend fix
-/// for repeated identical `setfield` instructions across basic blocks.
-fn replace_bindings(ctx: mut SemanticContext, bindings: Vec[SemanticBinding]) ->() {
-    ctx.bindings = bindings
+/// Restores the lexical stack to its entry depth. Copying a Vec handle would
+/// share the same storage, not snapshot it; lengths are immutable checkpoints.
+fn replace_bindings(ctx: mut SemanticContext, length: usize) ->() {
+    while ctx.bindings.len() > length {
+        let _removed = ctx.bindings.pop()
+    }
     ret()
 }
 
@@ -1055,7 +1608,7 @@ fn infer_expression(
             ret infer_expression_h(ctx, inner)
         }
         Expr::Cast(cast) => {
-            let mut target = cast.target
+            let mut target = local_type(ctx, cast.target)
             if semantic_type_name(target) == "Self" && ctx.self_type != "" {
                 target = ctx.self_type
             }
@@ -1097,18 +1650,7 @@ fn infer_expression(
             ret "[" + item + "; " + semantic_numeric_literal_value(array.size) + "]"
         }
         Expr::Block(block) => {
-            check_statements(ctx, block.statements, "")
-            match block.tail {
-                Option::Some(tail) => {
-                    ret infer_expression_h(ctx, tail)
-                }
-                Option::None => {
-                }
-            }
-            if statements_diverge(block.statements) {
-                ret "never"
-            }
-            ret "void"
+            ret infer_block(ctx, block)
         }
         Expr::If(item) => {
             ret infer_if_expression(ctx, item.branches, item.else_body, line, column, length)
@@ -1116,13 +1658,13 @@ fn infer_expression(
         Expr::Match(item) => {
             let matched = infer_expression_h(ctx, item.expr)
             let mut resolved = ""
-            let outer_bindings = ctx.bindings
+            let outer_bindings = ctx.bindings.len()
             for arm in item.arms {
                 replace_bindings(ctx, outer_bindings)
                 match arm.pattern.binding {
                     Option[str]::Some(name) => {
                         ctx.bindings.push(SemanticBinding {
-                                name, match_pattern_binding_type(matched, arm.pattern), arm.expr.line,
+                                name, match_pattern_binding_type(ctx, matched, arm.pattern), arm.expr.line,
                                 arm.expr.column
                             }
                             ,
@@ -1140,7 +1682,7 @@ fn infer_expression(
         Expr::Index(item) => {
             let base = infer_expression_h(ctx, item.base)
             let _index = infer_expression_h(ctx, item.index)
-            ret indexed_type(base)
+            ret indexed_type(ctx, base)
         }
         Expr::Await(inner) => {
             ret first_type_argument(infer_expression_h(ctx, inner))
@@ -1149,11 +1691,10 @@ fn infer_expression(
             ret first_type_argument(infer_expression_h(ctx, inner))
         }
         Expr::Spawn(inner) => {
-            ret "Task[" + infer_expression_h(ctx, inner) + "]"
+            ret local_type(ctx, "JoinHandle[" + infer_expression_h(ctx, inner) + "]")
         }
         Expr::Unsafe(body) => {
-            check_statements(ctx, body.statements, "")
-            ret unsafe_block_type(ctx, body.statements)
+            ret infer_unsafe_block(ctx, body)
         }
         Expr::Call(call) => {
             let name = expression_path_h(call.callee)
@@ -1169,19 +1710,24 @@ fn infer_expression(
             ret ""
         }
         Expr::StructInit(initializer) => {
-            check_struct_initializer(ctx, initializer.path, initializer.values, source_name, line, column,
+            check_struct_initializer(ctx, local_type(ctx, initializer.path), initializer.values, source_name, line, column,
                 length,)
             if initializer.path == "Self" && ctx.self_type != "" {
                 ret ctx.self_type
             }
-            ret initializer.path
+            ret local_type(ctx, initializer.path)
         }
         Expr::Field(field) => {
             let owner = infer_expression_h(ctx, field.base)
+            ctx.member_receivers.push((line, column, owner))
+            if field.field == "" {
+                ret ""
+            }
             ret resolve_field_expression(ctx, owner, field.field, source_name, line, column, length)
         }
         Expr::MethodCall(call) => {
             let receiver = infer_expression_h(ctx, call.receiver)
+            ctx.member_receivers.push((line, column, receiver))
             ret resolve_method_call(ctx, receiver, call.method, call.args, source_name, line, column,
                 length,)
         }
@@ -1221,7 +1767,7 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode < H >) -> str {
             ret infer_expression_h(ctx, inner)
         }
         Expr::Cast(cast) => {
-            let mut target = cast.target
+            let mut target = local_type(ctx, cast.target)
             if semantic_type_name(target) == "Self" && ctx.self_type != "" {
                 target = ctx.self_type
             }
@@ -1263,18 +1809,7 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode < H >) -> str {
             ret "[" + item + "; " + semantic_numeric_literal_value(array.size) + "]"
         }
         Expr::Block(block) => {
-            check_statements(ctx, block.statements, "")
-            match block.tail {
-                Option::Some(tail) => {
-                    ret infer_expression_h(ctx, tail)
-                }
-                Option::None => {
-                }
-            }
-            if statements_diverge(block.statements) {
-                ret "never"
-            }
-            ret "void"
+            ret infer_block(ctx, block)
         }
         Expr::If(item) => {
             ret infer_if_expression(ctx, item.branches, item.else_body, line, column, length)
@@ -1282,13 +1817,13 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode < H >) -> str {
         Expr::Match(item) => {
             let matched = infer_expression_h(ctx, item.expr)
             let mut resolved = ""
-            let outer_bindings = ctx.bindings
+            let outer_bindings = ctx.bindings.len()
             for arm in item.arms {
                 replace_bindings(ctx, outer_bindings)
                 match arm.pattern.binding {
                     Option[str]::Some(name) => {
                         ctx.bindings.push(SemanticBinding {
-                                name, match_pattern_binding_type(matched, arm.pattern), arm.expr.line,
+                                name, match_pattern_binding_type(ctx, matched, arm.pattern), arm.expr.line,
                                 arm.expr.column
                             }
                             ,
@@ -1306,7 +1841,7 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode < H >) -> str {
         Expr::Index(item) => {
             let base = infer_expression_h(ctx, item.base)
             let _index = infer_expression_h(ctx, item.index)
-            ret indexed_type(base)
+            ret indexed_type(ctx, base)
         }
         Expr::Await(inner) => {
             ret first_type_argument(infer_expression_h(ctx, inner))
@@ -1315,11 +1850,10 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode < H >) -> str {
             ret first_type_argument(infer_expression_h(ctx, inner))
         }
         Expr::Spawn(inner) => {
-            ret "Task[" + infer_expression_h(ctx, inner) + "]"
+            ret local_type(ctx, "JoinHandle[" + infer_expression_h(ctx, inner) + "]")
         }
         Expr::Unsafe(body) => {
-            check_statements(ctx, body.statements, "")
-            ret unsafe_block_type(ctx, body.statements)
+            ret infer_unsafe_block(ctx, body)
         }
         Expr::Call(call) => {
             let name = expression_path_h(call.callee)
@@ -1335,19 +1869,24 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode < H >) -> str {
             ret ""
         }
         Expr::StructInit(initializer) => {
-            check_struct_initializer(ctx, initializer.path, initializer.values, source_name, line, column,
+            check_struct_initializer(ctx, local_type(ctx, initializer.path), initializer.values, source_name, line, column,
                 length,)
             if initializer.path == "Self" && ctx.self_type != "" {
                 ret ctx.self_type
             }
-            ret initializer.path
+            ret local_type(ctx, initializer.path)
         }
         Expr::Field(field) => {
             let owner = infer_expression_h(ctx, field.base)
+            ctx.member_receivers.push((line, column, owner))
+            if field.field == "" {
+                ret ""
+            }
             ret resolve_field_expression(ctx, owner, field.field, source_name, line, column, length)
         }
         Expr::MethodCall(call) => {
             let receiver = infer_expression_h(ctx, call.receiver)
+            ctx.member_receivers.push((line, column, receiver))
             ret resolve_method_call(ctx, receiver, call.method, call.args, source_name, line, column,
                 length,)
         }
@@ -1417,6 +1956,7 @@ fn report_unknown_value(
             ret()
         }
     }
+    remember_failed_lookup(ctx)
     let nearest = nearest_value_name(ctx.bindings, name)
     let mut diagnostic = FrontendDiagnostic::new(
         1_usize,
@@ -1618,11 +2158,68 @@ fn expression_path_h(expr: ExprNode < H >) -> str {
     ret ""
 }
 
+fn resolve_associated_call(ctx: mut SemanticContext, path: str, args: Vec[ExprNode], argument_types: Vec[str],
+    line: usize, column: usize, length: usize,) -> Option[str] {
+    let mut separator = 0_usize
+    let mut index = 0_usize
+    let mut depth = 0_usize
+    while index + 1_usize < path.len() {
+        let ch = path.slice(index, 1_usize)
+        if ch == "[" {
+            depth += 1_usize
+        } elif ch == "]" && depth > 0_usize {
+            depth -= 1_usize
+        } elif depth == 0_usize && path.slice(index, 2_usize) == "::" {
+            separator = index
+        }
+        index += 1_usize
+    }
+    if separator == 0_usize {
+        ret Option[str]::None
+    }
+    let mut receiver = local_type(ctx, path.slice(0_usize, separator))
+    if receiver == "Self" {
+        receiver = ctx.self_type
+    }
+    let name = path.slice(separator + 2_usize, path.len() - separator - 2_usize)
+    let mut expected = Vec[str]::new()
+    let mut found = false
+    for method in ctx.methods {
+        if !method.is_static || method.name != name {
+            continue
+        }
+        if !semantic_receiver_matches(method.receiver_type, receiver, method.generic_names) {
+            continue
+        }
+        found = true
+        expected = specialize_method_types(method.params, method.receiver_type, receiver, method.generic_names)
+        if expected.len() == argument_types.len() && parameter_types_match_contextual(expected, argument_types, args) {
+            remember_method_dependency(ctx, method)
+            ret Option[str]::Some(specialize_method_type(method.ret_type, method.receiver_type, receiver, method.generic_names))
+        }
+    }
+    if found {
+        ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "argument-mismatch",
+                "arguments to associated function '" + path + "' do not match " + type_list(expected),
+                line, column, length,))
+    }
+    ret Option[str]::None
+}
+
 fn resolve_call(ctx: mut SemanticContext, name: str, args: Vec[ExprNode], line: usize, column: usize,
     length: usize,) -> Option[str] {
     let mut argument_types = Vec[str]::new()
     for argument in args {
         argument_types.push(infer_expression(ctx, argument))
+    }
+    if contains_substring(name, "::") {
+        match resolve_associated_call(ctx, name, args, argument_types, line, column, length) {
+            Some(typ) => {
+                ret Option[str]::Some(typ)
+            }
+            None => {
+            }
+        }
     }
     let mut saw_name = false
     let mut saw_arity = false
@@ -1646,6 +2243,7 @@ fn resolve_call(ctx: mut SemanticContext, name: str, args: Vec[ExprNode], line: 
             }
         }
     }
+    remember_failed_lookup(ctx)
     if out_of_range {
         ctx.diagnostics.push(
             FrontendDiagnostic::new(1_usize, "integer-literal-out-of-range",
@@ -1724,13 +2322,28 @@ fn substitute_return_type(ret_type: str, params: Vec[str], arguments: Vec[str]) 
     ret ret_type
 }
 
-fn resolve_field_type(fields: Vec[SemanticField], owner: str, name: str) -> str {
+fn resolve_field_type(ctx: mut SemanticContext, owner: str, name: str) -> str {
     if starts_with(owner, "(") {
         ret tuple_element_type(owner, name)
     }
-    for field in fields {
-        if semantic_types_compatible(field.owner_type, owner) && field.name == name {
-            ret field.typ
+    for field in ctx.fields {
+        if semantic_receiver_matches(field.owner_type, owner, field.generic_names) && field.name == name {
+            let mut recorded = false
+            for dependency in ctx.dependencies {
+                if dependency.kind == SemanticDependencyKind::Field
+                && dependency.module_name == field.module_name
+                && dependency.name == field.declaration_owner + "." + field.name {
+                    recorded = true break
+                }
+            }
+            if !recorded {
+                ctx.dependencies.push(SemanticDependency {
+                        field.module_name,
+                        field.declaration_owner + "." + field.name, field.signature, SemanticDependencyKind::Field
+                    }
+                    ,)
+            }
+            ret specialize_method_type(field.typ, field.owner_type, owner, field.generic_names)
         }
     }
     ret ""
@@ -1748,18 +2361,24 @@ fn resolve_field_expression(
     if owner == "" {
         ret ""
     }
-    let typ = resolve_field_type(ctx.fields, owner, name)
+    let typ = resolve_field_type(ctx, owner, name)
     if typ != "" {
         ret typ
     }
+    remember_failed_lookup(ctx)
     if owner == "" || builtin_receiver_type(owner) {
         ret ""
     }
     let mut saw_owner = false
+    for aggregate in ctx.aggregate_names {
+        if aggregate == semantic_root_type(semantic_type_name(owner)) {
+            saw_owner = true break
+        }
+    }
     let mut nearest = ""
     let mut best = 4_usize
     for field in ctx.fields {
-        if field.owner_type == owner {
+        if semantic_receiver_matches(field.owner_type, owner, field.generic_names) {
             saw_owner = true
             let distance = edit_distance(field.name, name)
             if distance < best {
@@ -1797,7 +2416,7 @@ fn check_struct_initializer(
     }
     let mut expected = Vec[SemanticField]::new()
     for field in ctx.fields {
-        if field.owner_type == resolved_owner {
+        if semantic_receiver_matches(field.owner_type, resolved_owner, field.generic_names) {
             expected.push(field)
         }
     }
@@ -1818,10 +2437,11 @@ fn check_struct_initializer(
     while index < expected.len() {
         let field = expected.get(index).unwrap_or(SemanticField::new("", "", "", ""))
         let actual = actual_types.get(index).unwrap_or("")
-        if actual != "" && !semantic_types_compatible(field.typ, actual) {
+        let expected_type = specialize_method_type(field.typ, field.owner_type, resolved_owner, field.generic_names)
+        if actual != "" && !semantic_types_compatible(expected_type, actual) {
             ctx.diagnostics.push(
                 FrontendDiagnostic::new(1_usize, "struct-field-type-mismatch", "field `" + field.name
-                    + "` expects `" + field.typ + "`, found `" + actual + "`", line, column, length,)
+                    + "` expects `" + expected_type + "`, found `" + actual + "`", line, column, length,)
                 .with_label(source_name, line, column, length, DiagnosticLabelKind::Primary, "invalid value for field `"
                     + field.name + "`",)
             )
@@ -1866,7 +2486,7 @@ fn array_type(ctx: mut SemanticContext, items: Vec[ExprNode], vector: bool) -> s
         ret ""
     }
     if vector {
-        ret "Vec[" + element + "]"
+        ret local_type(ctx, "Vec[" + element + "]")
     }
     ret "[" + element + "; " + Debug::fmt(count) + "]"
 }
@@ -1929,8 +2549,9 @@ fn merge_expression_type_at(
     ret expected
 }
 
-fn indexed_type(typ: str) -> str {
-    if starts_with(typ, "Vec[") || starts_with(typ, "Option[") || starts_with(typ, "Result[") {
+fn indexed_type(ctx: SemanticContext, typ: str) -> str {
+    let root = declaration_type_name(semantic_root_type(typ), ctx.type_names)
+    if root == "Vec" || root == "Option" || root == "Result" {
         ret first_type_argument(typ)
     }
     if starts_with(typ, "[") {
@@ -1945,13 +2566,13 @@ fn indexed_type(typ: str) -> str {
     ret ""
 }
 
-fn iterable_item_type(typ: str) -> str {
-    let item = indexed_type(typ)
+fn iterable_item_type(ctx: SemanticContext, typ: str) -> str {
+    let item = indexed_type(ctx, typ)
     if item != "" {
         ret item
     }
     // Range iterators in the prelude yield `usize`.
-    if typ == "Range" {
+    if declaration_type_name(typ, ctx.type_names) == "Range" {
         ret "usize"
     }
     ret ""
@@ -2005,17 +2626,18 @@ fn nth_type_argument(typ: str, wanted: usize) -> str {
     ret ""
 }
 
-fn match_pattern_binding_type(matched: str, pattern: MatchPattern) -> str {
+fn match_pattern_binding_type(ctx: SemanticContext, matched: str, pattern: MatchPattern) -> str {
+    let root = declaration_type_name(semantic_root_type(matched), ctx.type_names)
     match pattern.value {
         Option[str]::Some(value) => {
             let variant = semantic_variant_name(value)
-            if variant == "Err" && starts_with(matched, "Result[") {
+            if variant == "Err" && root == "Result" {
                 ret nth_type_argument(matched, 1_usize)
             }
-            if variant == "Ok" && starts_with(matched, "Result[") {
+            if variant == "Ok" && root == "Result" {
                 ret nth_type_argument(matched, 0_usize)
             }
-            if variant == "Some" && starts_with(matched, "Option[") {
+            if variant == "Some" && root == "Option" {
                 ret nth_type_argument(matched, 0_usize)
             }
         }
@@ -2107,16 +2729,15 @@ fn resolve_method_call(
     if receiver == "" {
         ret ""
     }
-    if (starts_with(receiver, "Task[") || starts_with(receiver, "JoinHandle[")) && name == "join" {
+    let receiver_name = declaration_type_name(semantic_root_type(receiver), ctx.type_names)
+    if (receiver_name == "Task" || receiver_name == "JoinHandle") && name == "join" {
         if args.len() == 0_usize {
             ret first_type_argument(receiver)
         }
         ret ""
     }
     let generic_receiver = type_base_or_self(receiver)
-    if contains_name(ctx.generic_names, generic_receiver) {
-        ret ""
-    }
+    let is_generic_receiver = contains_name(ctx.generic_names, generic_receiver)
     let mut argument_types = Vec[str]::new()
     for argument in args {
         argument_types.push(infer_expression(ctx, argument))
@@ -2126,18 +2747,24 @@ fn resolve_method_call(
     let mut expected_arity = 0_usize
     let mut expected_params = Vec[str]::new()
     for method in ctx.methods {
-        if semantic_types_compatible(method.receiver_type, receiver) {
+        if method.is_static {
+            continue
+        }
+        if is_generic_receiver && semantic_type_name(method.receiver_type) != generic_receiver {
+            continue
+        }
+        if semantic_receiver_matches(method.receiver_type, receiver, method.generic_names) {
             saw_receiver = true
             if method.name == name {
                 saw_name = true
-                let concrete_params = specialize_method_types(method.params, method.receiver_type, receiver)
+                let concrete_params = specialize_method_types(method.params, method.receiver_type, receiver, method.generic_names)
                 expected_arity = concrete_params.len()
                 expected_params = concrete_params
                 if concrete_params.len() == argument_types.len() && parameter_types_match(concrete_params,
                     argument_types,) {
                     remember_method_dependency(ctx, method)
                     let specialized_return = specialize_method_type(method.ret_type, method.receiver_type,
-                        receiver,)
+                        receiver, method.generic_names,)
                     let resolved = substitute_return_type(specialized_return, concrete_params, argument_types)
                     if semantic_type_name(resolved) == "Self" {
                         ret receiver
@@ -2148,6 +2775,10 @@ fn resolve_method_call(
         }
     }
 
+    remember_failed_lookup(ctx)
+    if is_generic_receiver && !saw_name {
+        ret ""
+    }
     if saw_name {
         if expected_arity != argument_types.len() {
             ctx.diagnostics.push(
@@ -2218,27 +2849,92 @@ fn replace_self_types(types: Vec[str], receiver: str) -> Vec[str] {
     ret out
 }
 
-fn specialize_method_types(types: Vec[str], declared_receiver: str, receiver: str) -> Vec[str] {
+fn generic_signature(signature: u64, names: Vec[str]) -> u64 {
+    if names.len() == 0_usize {
+        ret signature
+    }
+    let mut key = Debug::fmt(signature) + "#generics"
+    for name in names {
+        key += ":" + name
+    }
+    ret nonzero_hash(key)
+}
+
+fn semantic_receiver_matches(declared: str, receiver: str, generics: Vec[str]) -> bool {
+    let mut substitutions = Vec[(str, str)]::new()
+    ret receiver_substitutions(declared, receiver, generics, substitutions)
+}
+
+fn receiver_substitutions(declared: str, receiver: str, generics: Vec[str], substitutions: mut Vec[(str, str)]) -> bool {
+    let pattern = compact_type(semantic_type_name(declared))
+    let actual = compact_type(semantic_type_name(receiver))
+    if contains_name(generics, pattern) {
+        for entry in substitutions {
+            if entry.0 == pattern {
+                ret entry.1 == actual
+            }
+        }
+        substitutions.push((pattern, actual))
+        ret true
+    }
+    if semantic_root_type(pattern) != semantic_root_type(actual) {
+        ret false
+    }
+    let mut index = 0_usize
+    loop {
+        let expected_arg = nth_type_argument(pattern, index)
+        let actual_arg = nth_type_argument(actual, index)
+        if expected_arg == "" && actual_arg == "" {
+            ret true
+        }
+        if expected_arg == "" || actual_arg == "" {
+            ret false
+        }
+        if !receiver_substitutions(expected_arg, actual_arg, generics, substitutions) {
+            ret false
+        }
+        index += 1_usize
+    }
+}
+
+fn specialize_method_types(types: Vec[str], declared_receiver: str, receiver: str, generics: Vec[str]) -> Vec[str] {
     let mut out = Vec[str]::new()
     for typ in types {
-        out.push(specialize_method_type(typ, declared_receiver, receiver))
+        out.push(specialize_method_type(typ, declared_receiver, receiver, generics))
     }
     ret out
 }
 
-fn specialize_method_type(typ: str, declared_receiver: str, receiver: str) -> str {
-    let mut out = replace_type_name(typ, "Self", receiver)
+fn specialize_method_type(typ: str, declared_receiver: str, receiver: str, generics: Vec[str]) -> str {
+    ret specialize_method_type_with_self(typ, declared_receiver, receiver, receiver, generics)
+}
+
+fn specialize_method_type_with_self(typ: str, declared_receiver: str, receiver: str, self_type: str, generics: Vec[str]) -> str {
+    let mut substitutions = Vec[(str, str)]::new()
+    substitutions.push(("Self", self_type))
+    receiver_substitutions(declared_receiver, receiver, generics, substitutions)
+    // Apply mappings simultaneously: Parent[A,B] -> Parent[B,A] must not
+    // rewrite the newly inserted B a second time. Self has the same rule.
+    let mut out = ""
     let mut index = 0_usize
-    while true {
-        let generic_name = nth_type_argument(declared_receiver, index)
-        let concrete_type = nth_type_argument(receiver, index)
-        if generic_name == "" || concrete_type == "" {
-            break
+    while index < typ.len() {
+        if identifier_byte(typ.byte_at(index)) {
+            let start = index
+            while index < typ.len() && identifier_byte(typ.byte_at(index)) {
+                index += 1_usize
+            }
+            let token = typ.slice(start, index - start)
+            let mut replacement = token
+            for entry in substitutions {
+                if entry.0 == token {
+                    replacement = entry.1 break
+                }
+            }
+            out += replacement
+        } else {
+            out += typ.slice(index, 1_usize)
+            index += 1_usize
         }
-        if generic_placeholder(generic_name) {
-            out = replace_type_name(out, generic_name, concrete_type)
-        }
-        index += 1_usize
     }
     ret out
 }
@@ -2255,15 +2951,34 @@ fn builtin_receiver_type(typ: str) -> bool {
     ret base == "Vec" || base == "Option" || base == "Result" || base == "Box" || base == "Dict"
 }
 
-fn remember_method_dependency(ctx: mut SemanticContext, method: SemanticMethod) ->() {
+fn remember_failed_lookup(ctx: mut SemanticContext) ->() {
     for dependency in ctx.dependencies {
-        if dependency.module_name == method.module_name && dependency.name == method.receiver_type +
+        if dependency.kind == SemanticDependencyKind::LookupScope {
+            ret()
+        }
+    }
+    // The database binds this query dependency to the caller's visible scope.
+    ctx.dependencies.push(SemanticDependency {
+            "", "", 0_u64, SemanticDependencyKind::LookupScope
+        }
+        ,
+    )
+    ret()
+}
+
+fn remember_method_dependency(ctx: mut SemanticContext, method: SemanticMethod) ->() {
+    // The trait ancestry can change even when the inherited signature does not.
+    if method.receiver_type != method.declaration_receiver {
+        remember_failed_lookup(ctx)
+    }
+    for dependency in ctx.dependencies {
+        if dependency.kind == SemanticDependencyKind::Method && dependency.module_name == method.module_name && dependency.name == method.declaration_receiver +
         "." + method.name {
             ret()
         }
     }
     ctx.dependencies.push(SemanticDependency {
-            method.module_name, method.receiver_type + "." + method.name, method.signature
+            method.module_name, method.declaration_receiver + "." + method.name, method.signature, SemanticDependencyKind::Method
         }
         ,
     )
@@ -2274,7 +2989,10 @@ fn nearest_method(methods: Vec[SemanticMethod], receiver: str, name: str) -> str
     let mut nearest = ""
     let mut best = 4_usize
     for method in methods {
-        if semantic_types_compatible(method.receiver_type, receiver) {
+        if method.is_static {
+            continue
+        }
+        if semantic_receiver_matches(method.receiver_type, receiver, method.generic_names) {
             let distance = edit_distance(method.name, name)
             if distance < best {
                 best = distance
@@ -2617,13 +3335,29 @@ fn contains(value: str, needle: str) -> bool {
 }
 
 fn remember_dependency(ctx: mut SemanticContext, callable: SemanticCallable) ->() {
+    if callable.lookup_module != "" {
+        let mut recorded = false
+        for dependency in ctx.dependencies {
+            if dependency.kind == SemanticDependencyKind::FunctionBinding
+            && dependency.module_name == callable.lookup_module && dependency.name == callable.name {
+                recorded = true
+            }
+        }
+        if !recorded {
+            ctx.dependencies.push(SemanticDependency {
+                    callable.lookup_module, callable.name,
+                    callable.binding_identity, SemanticDependencyKind::FunctionBinding
+                }
+                ,)
+        }
+    }
     for dependency in ctx.dependencies {
-        if dependency.module_name == callable.module_name && dependency.name == callable.name {
+        if dependency.kind == SemanticDependencyKind::Function && dependency.module_name == callable.module_name && dependency.name == callable.declaration_name {
             ret()
         }
     }
     ctx.dependencies.push(SemanticDependency {
-            callable.module_name, callable.name, callable.signature
+            callable.module_name, callable.declaration_name, callable.signature, SemanticDependencyKind::Function
         }
         ,
     )

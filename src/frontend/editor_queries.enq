@@ -1,0 +1,418 @@
+//! Cursor queries shared by language tooling, independent of JSON-RPC.
+
+import core::option::Option
+import core::vec::Vec
+import refrain::frontend::analysis::tooling_tokens_from_tokens
+import refrain::frontend::lexer::{Token, TokenType}
+
+/// The source position and prefix of a member; its receiver is typed by the AST.
+pub struct MemberCompletionContext {
+    prefix: str
+    line: usize
+    column: usize
+}
+
+/// Finds the callee token and argument index using cached document tokens.
+/// A containing f-string is expanded locally without re-lexing the whole file.
+/// The token's position lets semantic resolution distinguish receiver methods
+/// and qualified functions from unrelated declarations with the same name.
+pub fn cursor_call_context(tokens: Vec[Token], line: usize, column: usize) -> Option[(Token, usize)] {
+    let mut previous = Token::new(TokenType::EOF, "", 0_usize, 0_usize)
+    for token in tokens {
+        if token.type == TokenType::STRING && previous.type == TokenType::IDENTIFIER && previous.value == "f"
+        && token.line <= line {
+            let mut end_line = token.line
+            let mut end_column = token.column
+            let mut byte = 0_usize
+            while byte < token.value.byte_len() {
+                let value = token.value.byte_at(byte)
+                if value == 10_u8 {
+                    end_line += 1_usize end_column = 0_usize
+                } elif value < 128_u8 || value >= 192_u8 {
+                    end_column += 1_usize
+                }
+                byte += 1_usize
+            }
+            if (line > token.line || column >= token.column)
+            &&(line < end_line ||(line == end_line && column < end_column)) {
+                let mut fragment = Vec[Token]::new()
+                fragment.push(previous)
+                fragment.push(token)
+                match call_context_in_tokens(tooling_tokens_from_tokens(fragment), line, column) {
+                    Some(context) => {
+                        ret Option[(Token, usize)]::Some(context)
+                    }
+                    None => {
+                    }
+                }
+            }
+        }
+        previous = token
+    }
+    ret call_context_in_tokens(tokens, line, column)
+}
+
+fn call_context_in_tokens(tokens: Vec[Token], line: usize, column: usize) -> Option[(Token, usize)] {
+    let mut cursor = 0_usize
+    for token in tokens {
+        if token.type == TokenType::EOF || token.line > line
+        ||(token.line == line && token.column >= column) {
+            break
+        }
+        cursor += 1_usize
+    }
+    let fallback = Token::new(TokenType::EOF, "", line, column)
+    let mut depth = 0_usize
+    let mut index = cursor
+    while index > 0_usize {
+        index -= 1_usize
+        let token = tokens.get(index).unwrap_or(fallback)
+        if token.type == TokenType::RIGHT_PAREN {
+            depth += 1_usize
+        } elif token.type == TokenType::LEFT_PAREN {
+            if depth > 0_usize {
+                depth -= 1_usize continue
+            }
+            if index == 0_usize {
+                ret Option[(Token, usize)]::None
+            }
+            let mut name_index = index - 1_usize
+            if tokens.get(name_index).unwrap_or(fallback).type == TokenType::RIGHT_BRACKET {
+                let mut brackets = 1_usize
+                while name_index > 0_usize && brackets > 0_usize {
+                    name_index -= 1_usize
+                    let part = tokens.get(name_index).unwrap_or(fallback)
+                    if part.type == TokenType::RIGHT_BRACKET {
+                        brackets += 1_usize
+                    } elif part.type == TokenType::LEFT_BRACKET {
+                        brackets -= 1_usize
+                    }
+                }
+                if brackets > 0_usize || name_index == 0_usize {
+                    ret Option[(Token, usize)]::None
+                }
+                name_index -= 1_usize
+            }
+            let name = tokens.get(name_index).unwrap_or(fallback)
+            // Grouping inside an argument is not itself a call. Continue to
+            // the enclosing call instead of hiding its signature help.
+            if name.type != TokenType::IDENTIFIER {
+                continue
+            }
+            if name_index > 0_usize && tokens.get(name_index - 1_usize).unwrap_or(fallback).type == TokenType::KW_FN {
+                ret Option[(Token, usize)]::None
+            }
+            let mut active = 0_usize
+            let mut parens = 0_usize
+            let mut brackets = 0_usize
+            let mut braces = 0_usize
+            let mut argument = index + 1_usize
+            while argument < cursor {
+                let part = tokens.get(argument).unwrap_or(fallback)
+                if part.type == TokenType::LEFT_PAREN {
+                    parens += 1_usize
+                } elif part.type == TokenType::RIGHT_PAREN && parens > 0_usize {
+                    parens -= 1_usize
+                } elif part.type == TokenType::LEFT_BRACKET {
+                    brackets += 1_usize
+                } elif part.type == TokenType::RIGHT_BRACKET && brackets > 0_usize {
+                    brackets -= 1_usize
+                } elif part.type == TokenType::LEFT_BRACE {
+                    braces += 1_usize
+                } elif part.type == TokenType::RIGHT_BRACE && braces > 0_usize {
+                    braces -= 1_usize
+                } elif part.type == TokenType::COMMA && parens == 0_usize && brackets == 0_usize && braces == 0_usize {
+                    active += 1_usize
+                }
+                argument += 1_usize
+            }
+            ret Option[(Token, usize)]::Some((name, active))
+        }
+    }
+    ret Option[(Token, usize)]::None
+}
+
+pub fn cursor_member_context(tokens: Vec[Token], line: usize, column: usize) -> Option[MemberCompletionContext] {
+    let mut count = 0_usize
+    for token in tokens {
+        if token.type == TokenType::EOF || token.line > line
+        ||(token.line == line && token.column >= column) {
+            break
+        }
+        count += 1_usize
+    }
+    if count < 2_usize {
+        ret Option[MemberCompletionContext]::None
+    }
+    let fallback = Token::new(TokenType::EOF, "", line, column)
+    let last = tokens.get(count - 1_usize).unwrap_or(fallback)
+    let mut dot = count - 1_usize
+    let mut prefix = ""
+    if last.type == TokenType::IDENTIFIER {
+        if last.line != line || column > last.column + last.value.char_len() {
+            ret Option[MemberCompletionContext]::None
+        }
+        prefix = last.value.slice(0_usize, column - last.column)
+        dot -= 1_usize
+    }
+    if tokens.get(dot).unwrap_or(fallback).type != TokenType::DOT || dot == 0_usize {
+        ret Option[MemberCompletionContext]::None
+    }
+    let point = tokens.get(dot).unwrap_or(fallback)
+    let member_line = if prefix == "" {
+        point.line
+    } else {
+        last.line
+    }
+    let member_column = if prefix == "" {
+        point.column + 1_usize
+    } else {
+        last.column
+    }
+    ret Option[MemberCompletionContext]::Some(MemberCompletionContext {
+            prefix, member_line, member_column
+        }
+        ,
+    )
+}
+
+/// Returns the syntactic owner before `::name`, preserving generic arguments.
+/// Whether this is a type or a module is decided by semantic resolution.
+pub fn cursor_associated_owner(tokens: Vec[Token], line: usize, column: usize) -> str {
+    let fallback = Token::new(TokenType::EOF, "", line, column)
+    let mut selected = 0_usize
+    for token in tokens {
+        if token.line == line && token.type == TokenType::IDENTIFIER
+        && token.column <= column && column < token.column + token.value.char_len() {
+            break
+        }
+        selected += 1_usize
+    }
+    if selected < 2_usize || selected >= tokens.len() {
+        ret ""
+    }
+    if tokens.get(selected - 1_usize).unwrap_or(fallback).type != TokenType::SCOPE {
+        ret ""
+    }
+    ret associated_owner_before_scope(tokens, selected - 1_usize, fallback)
+}
+
+/// Finds a qualified completion owner and a possibly empty member prefix.
+/// This is syntax only: the database decides whether the owner names a type.
+pub fn cursor_associated_context(tokens: Vec[Token], line: usize, column: usize) -> Option[(str, str)] {
+    let fallback = Token::new(TokenType::EOF, "", line, column)
+    let mut count = 0_usize
+    for token in tokens {
+        if token.type == TokenType::EOF || token.line > line
+        ||(token.line == line && token.column >= column) {
+            break
+        }
+        count += 1_usize
+    }
+    if count < 2_usize {
+        ret Option[(str, str)]::None
+    }
+    let last = tokens.get(count - 1_usize).unwrap_or(fallback)
+    let mut scope = count - 1_usize
+    let mut prefix = ""
+    if last.type == TokenType::IDENTIFIER {
+        if last.line != line || column > last.column + last.value.char_len() {
+            ret Option[(str, str)]::None
+        }
+        prefix = last.value.slice(0_usize, column - last.column)
+        scope -= 1_usize
+    } elif last.line != line || column < last.column + last.value.char_len() {
+        ret Option[(str, str)]::None
+    }
+    if scope == 0_usize || tokens.get(scope).unwrap_or(fallback).type != TokenType::SCOPE {
+        ret Option[(str, str)]::None
+    }
+    let owner = associated_owner_before_scope(tokens, scope, fallback)
+    if owner == "" {
+        ret Option[(str, str)]::None
+    }
+    ret Option[(str, str)]::Some((owner, prefix))
+}
+
+fn associated_owner_before_scope(tokens: Vec[Token], end: usize, fallback: Token) -> str {
+    let mut start = end - 1_usize
+    loop {
+        if tokens.get(start).unwrap_or(fallback).type == TokenType::RIGHT_BRACKET {
+            let mut depth = 1_usize
+            while start > 0_usize && depth > 0_usize {
+                start -= 1_usize
+                let part = tokens.get(start).unwrap_or(fallback)
+                if part.type == TokenType::RIGHT_BRACKET {
+                    depth += 1_usize
+                } elif part.type == TokenType::LEFT_BRACKET {
+                    depth -= 1_usize
+                }
+            }
+            if depth > 0_usize || start == 0_usize {
+                ret ""
+            }
+            start -= 1_usize
+        }
+        if tokens.get(start).unwrap_or(fallback).type != TokenType::IDENTIFIER {
+            ret ""
+        }
+        if start < 2_usize || tokens.get(start - 1_usize).unwrap_or(fallback).type != TokenType::SCOPE {
+            break
+        }
+        start -= 2_usize
+    }
+    if import_symbol_path(tokens, start) != "" {
+        ret ""
+    }
+    let mut owner = ""
+    while start < end {
+        let token = tokens.get(start).unwrap_or(fallback)
+        owner += token.value
+        if token.value == "dyn" || token.value == "mut" || token.value == "frozen" || token.value == "sending" {
+            owner += " "
+        }
+        start += 1_usize
+    }
+    ret owner
+}
+
+/// Returns the qualified identifier ending at the selected path segment.
+/// Later segments are deliberately excluded when hovering an earlier module.
+pub fn cursor_symbol_path(tokens: Vec[Token], line: usize, column: usize) -> str {
+    let mut index = 0_usize
+    while index < tokens.len() {
+        let token = tokens.get(index).unwrap_or(Token::new(TokenType::EOF, "", line, column))
+        if token.type == TokenType::IDENTIFIER && token.line == line
+        && token.column <= column && column < token.column + token.value.char_len() {
+            let imported_path = import_symbol_path(tokens, index)
+            if imported_path != "" {
+                ret imported_path
+            }
+            let mut path = token.value
+            let mut before = index
+            while before >= 2_usize {
+                let separator = tokens.get(before - 1_usize).unwrap_or(token)
+                let prefix = tokens.get(before - 2_usize).unwrap_or(token)
+                if separator.value != "::" || prefix.type != TokenType::IDENTIFIER {
+                    break
+                }
+                path = prefix.value + "::" + path
+                before -= 2_usize
+            }
+            ret path
+        }
+        index += 1_usize
+    }
+    ret ""
+}
+
+// Preserve the enclosing module prefix for each leaf of a grouped import.
+// Alias declarations deliberately resolve in the importing module's namespace.
+fn import_symbol_path(tokens: Vec[Token], selected: usize) -> str {
+    let mut active = false
+    let mut alias = false
+    let mut path = ""
+    let mut groups = Vec[str]::new()
+    let mut index = 0_usize
+    for token in tokens {
+        if index > selected {
+            break
+        }
+        if token.type == TokenType::KW_IMPORT {
+            active = true
+            alias = false
+            path = ""
+            groups = Vec[str]::new()
+        } elif active {
+            if token.value == "as" {
+                alias = true
+            } elif token.type == TokenType::IDENTIFIER {
+                if index == selected {
+                    if alias {
+                        ret token.value
+                    }
+                    let mut full = ""
+                    for group in groups {
+                        full += group
+                    }
+                    ret full + path + token.value
+                }
+                if !alias {
+                    path += token.value
+                }
+            } elif token.type == TokenType::SCOPE {
+                path += "::"
+            } elif token.type == TokenType::LEFT_BRACE {
+                groups.push(path)
+                path = ""
+            } elif token.type == TokenType::COMMA {
+                path = ""
+                alias = false
+            } elif token.type == TokenType::RIGHT_BRACE {
+                if groups.len() > 0_usize {
+                    groups.pop()
+                }
+                path = ""
+                alias = false
+            } else {
+                active = false
+            }
+        }
+        index += 1_usize
+    }
+    ret ""
+}
+
+/// Tests whether a cursor is inside a type annotation, including incomplete syntax.
+/// Coordinates use lexer character columns; clients convert UTF-16 at the boundary.
+pub fn cursor_expects_type(tokens: Vec[Token], line: usize, column: usize) -> bool {
+    let mut end = tokens.len()
+    while end > 0_usize {
+        let token = tokens.get(end - 1_usize).unwrap_or(Token::new(TokenType::EOF, "", line, column))
+        if token.line < line ||(token.line == line && token.column < column) {
+            break
+        }
+        end -= 1_usize
+    }
+    let mut marker = false
+    let mut field_header = false
+    let mut unannotated_separator = false
+    let mut closed_type_depth = 0_usize
+    while end > 0_usize {
+        end -= 1_usize
+        let token = tokens.get(end).unwrap_or(Token::new(TokenType::EOF, "", line, column))
+        if token.type == TokenType::COLON || token.type == TokenType::ARROW {
+            if unannotated_separator {
+                ret false
+            }
+            marker = true
+        } elif token.type == TokenType::COMMA && !marker {
+            unannotated_separator = true
+        } elif token.type == TokenType::RIGHT_BRACKET || token.type == TokenType::RIGHT_PAREN {
+            closed_type_depth += 1_usize
+        } elif token.type == TokenType::LEFT_BRACKET || token.type == TokenType::LEFT_PAREN {
+            // A comma inside a tuple/generic type is not a parameter boundary.
+            if closed_type_depth > 0_usize {
+                closed_type_depth -= 1_usize
+            } else {
+                unannotated_separator = false
+            }
+        } elif token.value == "as" {
+            ret true
+        } elif token.value == "=" || token.value == ";" || token.type == TokenType::RIGHT_BRACE {
+            ret false
+        } elif token.type == TokenType::KW_LET || token.type == TokenType::KW_STATIC {
+            ret marker && !field_header
+        } elif token.type == TokenType::KW_FN {
+            ret marker && !field_header
+        } elif token.type == TokenType::LEFT_BRACE {
+            if !marker || field_header {
+                ret false
+            }
+            field_header = true
+        } elif token.type == TokenType::KW_STRUCT || token.type == TokenType::KW_ENUM {
+            ret marker
+        }
+    }
+    ret false
+}
