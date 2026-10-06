@@ -7,11 +7,13 @@ import core::result::Result
 import core::vec::Vec
 import json::{Json, ParseError, field, parse, stringify}
 import std::io::{eprintln, println}
-import std::os::{file_exists, file_sha256, mkdir_all, read_file, remove_dir_all, remove_file, write_file,}
+import std::os::{env, file_exists, file_sha256, mkdir_all, read_file, remove_dir_all, remove_file, write_file,}
 import std::path::Path
 import std::process::{run_args, run_args_capture}
 
+import mod::registry_auth::{registry_credential, registry_http, registry_origin}
 import refrain::project::manifest::{ProjectManifest, project_manifest_compiler_requirement, project_manifest_dependencies, project_manifest_name, project_manifest_publish_exclude, project_manifest_publish_include, project_manifest_repository, project_manifest_source_with_dependencies, project_manifest_version, read_project_manifest,}
+import refrain::project::registry_index_url
 import refrain::project::{dependency_base_reference, registry_version_matches, registry_version_requirement_valid,}
 import refrain::version::{compiler_registry_epoch, compiler_release_name, compiler_version}
 
@@ -34,6 +36,13 @@ struct PublishContext {
 
 /// Validates, packages, and optionally publishes the current package.
 pub fn native_publish() -> u32 {
+    let selected_index = registry_index_url(Path::new(".").resolve())
+    if selected_index == "" {
+        ret 1_u32
+    }
+    if selected_index != "https://raw.githubusercontent.com/encore-ecosystem/encore-index/refs/heads/main" {
+        ret publish_to_registry(selected_index)
+    }
     let dry_run = has_switch("--dry-run")
     let release_only = has_switch("--release-only")
     let release_name = option_value("--release-name", compiler_release_name())
@@ -71,6 +80,169 @@ pub fn native_publish() -> u32 {
     }
     println("Publication submitted for review.")
     ret 0_u32
+}
+
+// Custom services use the same immutable archive format, without a GitHub
+// account, remote, release, or index pull request. Only tracked files are sent.
+fn publish_to_registry(index: str) -> u32 {
+    if has_switch("--release-only") {
+        publish_error("--release-only is only for the legacy GitHub index") ret 1_u32
+    }
+    let root = Path::new(".").resolve()
+    let manifest = read_project_manifest(root)
+    let name = project_manifest_name(manifest)
+    let version = project_manifest_version(manifest)
+    let nametag = option_value("--release-name", compiler_release_name())
+    if !valid_registry_package_name(name) || !registry_version_matches(version, version) || !valid_release_name(nametag)
+    || project_manifest_compiler_requirement(manifest) == ""
+    || !registry_version_requirement_valid(project_manifest_compiler_requirement(manifest)) {
+        publish_error("invalid package name, version, encore requirement or release name") ret 1_u32
+    }
+    let work = root.join("target").join("publish")
+    mkdir_all(work.as_str())
+    let repository = capture(work, "repository-root.txt", "git", args4("-C", root.as_str(), "rev-parse", "--show-toplevel"))
+    if repository == "" {
+        publish_error("run git init and git add first; publication includes only tracked files (no remote or commit required)") ret 1_u32
+    }
+    let repo = Path::new(repository).resolve()
+    let files = publish_files(repo, relative_path(repo, root), manifest, work)
+    if !contains_file(files, "encore.toml") || !contains_source_file(files) {
+        publish_error("package needs tracked encore.toml and src/*.enq") ret 1_u32
+    }
+    let mut dependencies = Vec[str]::new()
+    for dependency in project_manifest_dependencies(manifest) {
+        let base = dependency_base_reference(dependency)
+        if starts_with(base, "path@") {
+            let dep = read_project_manifest(root.join(base.slice(5_usize, base.len() - 5_usize)).resolve())
+            let dep_name = project_manifest_name(dep)
+            let dep_version = project_manifest_version(dep)
+            if dep_name == "" || !registry_version_matches(dep_version, dep_version) {
+                publish_error("invalid path dependency " + dependency) ret 1_u32
+            }
+            dependencies.push("index@" + dep_name + "@" + dep_version + dependency.slice(base.len(), dependency.len() - base.len()))
+        } else {
+            dependencies.push(dependency)
+        }
+    }
+    let archive = work.join(name + "-" + version + ".tar.gz")
+    let mut args = vec!["-czf", archive.as_str(), "-C", root.as_str(), "--"]
+    for file in files {
+        args.push(file)
+    }
+    if run_args("tar", args) != 0_i32 || !verify_archive(work, archive)
+    || !normalize_publish_archive(work, archive, manifest, dependencies, true) || !verify_archive(work, archive) {
+        ret 1_u32
+    }
+    let bytes = read_file(archive.as_str())
+    if bytes.byte_len() == 0_usize || bytes.byte_len() > 4194304_usize {
+        publish_error("registry archive must be between 1 byte and 4 MiB") ret 1_u32
+    }
+    let checksum = file_sha256(archive.as_str())
+    println("Archive: " + archive.as_str())
+    println("SHA-256: " + checksum)
+    if has_switch("--dry-run") {
+        println("Dry run complete; no network requests or remote changes.") ret 0_u32
+    }
+    let origin = registry_origin(index)
+    if origin == "" {
+        publish_error("publication requires HTTPS or a loopback HTTP service") ret 1_u32
+    }
+    let token = match registry_credential(index) {
+        Result::Ok(value) => value
+        Result::Err(error) => {
+            ret registry_publish_failure(error)
+        }
+    }
+    let discovery = registry_request("GET", index + "/config.json", "", "")
+    let config = match parse(discovery) {
+        Result::Ok(value) => value Result::Err(_) => Json::Null
+    }
+    if config.is_null() {
+        publish_error("registry discovery failed; no GitHub fallback") ret 1_u32
+    }
+    if json_string(config, "api") != "/api/v1" || stringify(config.get("schema").unwrap_or(Json::Null)) != "1"
+    || stringify(config.get("chunk_size").unwrap_or(Json::Null)) != "65536" {
+        publish_error("unsupported registry API; cross-origin authentication is forbidden") ret 1_u32
+    }
+    let api = origin + "/api/v1"
+    let created = registry_request("POST", api + "/uploads", "", token)
+    let data = match parse(created) {
+        Result::Ok(value) => value Result::Err(_) => Json::Null
+    }
+    let upload = json_string(data, "upload")
+    if upload.len() != 64_usize {
+        publish_error("invalid upload response") ret 1_u32
+    }
+    let mut i = 0_usize
+    while i < upload.len() {
+        if !contains("0123456789abcdef", upload.slice(i, 1_usize)) {
+            ret 1_u32
+        }
+        i += 1_usize
+    }
+    let mut offset = 0_usize
+    while offset < bytes.byte_len() {
+        let size = if bytes.byte_len() - offset > 65536_usize {
+            65536_usize
+        } else {
+            bytes.byte_len() - offset
+        }
+        let chunk_offset: usize = offset
+        if registry_request("PUT", api + "/uploads/" + upload + "/" + Debug::fmt(chunk_offset), bytes.slice_bytes(offset, size), token) == "" {
+            let _cancelled = registry_request("DELETE", api + "/uploads/" + upload, "", token)
+            ret 1_u32
+        }
+        offset += size
+    }
+    let finished = registry_request("POST", api + "/uploads/" + upload + "/finish", "{\"checksum\":\"" + checksum + "\",\"nametag\":\"" + nametag + "\"}", token)
+    if finished == "" {
+        let _cancelled = registry_request("DELETE", api + "/uploads/" + upload, "", token)
+        ret 1_u32
+    }
+    let result = match parse(finished) {
+        Result::Ok(value) => value Result::Err(_) => Json::Null
+    }
+    if !result.get("published").unwrap_or(Json::Bool(false)).as_bool().unwrap_or(false) {
+        publish_error("registry did not confirm publication") ret 1_u32
+    }
+    println("Published " + name + " " + version + "-" + nametag + " to " + index)
+    ret 0_u32
+}
+
+fn registry_request(method: str, url: str, body: str, token: str) -> str {
+    let response = match registry_http(method, url, body, token, false) {
+        Result::Ok(value) => value
+        Result::Err(_) => {
+            ret registry_transport_failure()
+        }
+    }
+    if response.status() != 200_u16 && response.status() != 201_u16 {
+        publish_error("registry HTTP " + Debug::fmt(response.status()) + ": request rejected; publication not confirmed") ret ""
+    }
+    ret response.body()
+}
+
+fn registry_publish_failure(error: str) -> u32 {
+    publish_error(error)
+    ret 1_u32
+}
+fn registry_transport_failure() -> str {
+    publish_error("registry transport failed; publication not confirmed")
+    ret ""
+}
+
+fn valid_registry_package_name(value: str) -> bool {
+    if value.len() < 2_usize || value.len() > 64_usize {
+        ret false
+    }
+    let mut i = 0_usize
+    while i < value.len() {
+        if !contains("abcdefghijklmnopqrstuvwxyz0123456789-_", value.slice(i, 1_usize)) {
+            ret false
+        }
+        i += 1_usize
+    }
+    ret true
 }
 
 fn prepare_publish(package_root: Path, manifest: ProjectManifest, release_name: str) -> PublishContext {

@@ -24,6 +24,9 @@ README.md
 .gitignore
 ```
 
+The generated `.gitignore` excludes `target/` and the local LSP cache
+`.encore_cache/`. An existing `.gitignore` is preserved.
+
 A minimal executable is:
 
 ```enq

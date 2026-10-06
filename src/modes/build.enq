@@ -1518,8 +1518,36 @@ fn publish_global_ehir_chunk(target: TargetSpec, state: IncrementalModuleState,
     ret()
 }
 
-fn write_ehir_artifact(modules: Vec[TranslationModule], states: Vec[IncrementalModuleState],
+fn nominal_cache_states(modules: Vec[TranslationModule], original: Vec[IncrementalModuleState]) -> Vec[IncrementalModuleState] {
+    // Nominal mangling depends on declarations across the whole workspace,
+    // including modules that are not dependencies of a cached module.
+    // Separate both local and global chunks when that naming context changes.
+    let mut context = "nominal-context-v1"
+    for module in modules {
+        context = fingerprint_mix(context, module.source_name)
+        for statement in module.ast {
+            let name = match statement {
+                Statement::Struct(item) => item.name
+                Statement::EnumItem(item) => item.name
+                Statement::Trait(item) => item.name
+                _ => ""
+            }
+            if name != "" { context = fingerprint_mix(context, name) }
+        }
+    }
+    let mut states = Vec[IncrementalModuleState]::new()
+    for state in original {
+        states.push(IncrementalModuleState {
+            state.module_id, state.source_digest, state.interface_fingerprint,
+            fingerprint_mix(state.dependency_fingerprint, context)
+        })
+    }
+    ret states
+}
+
+fn write_ehir_artifact(modules: Vec[TranslationModule], original_states: Vec[IncrementalModuleState],
     target: TargetSpec, entry_module: str, path: Path, cache_root: Path, configuration: str,) -> str {
+    let states = nominal_cache_states(modules, original_states)
     let current_path = cache_root.join("current.state")
     let previous_path = cache_root.join("previous.state")
     if mkdir_all(native_path(cache_root.join("chunks").as_str())) != 0_i32 {
@@ -2922,8 +2950,8 @@ pub fn compile_test_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
         ret 0_u32
     }
     remove_file(native_path(test_fingerprint_path.as_str()))
-    let translation_modules = workspace_translation_modules(workspace.modules, target)
-    let ehir_text = translate_ast_with_modules_to_ehir(ast, translation_modules, target)
+    let translation_modules = test_translation_modules(workspace.modules, ast, target)
+    let ehir_text = translate_modules_to_ehir(translation_modules, target)
     let llvm_text = emit_ir(parse_module_text("encore_test", ehir_text))
     if write_file(native_path(ehir_path.as_str()), ehir_text) != 0_i32 {
         ret 1_u32
@@ -3183,6 +3211,36 @@ fn workspace_ast_count(modules: Vec[WorkspaceModule]) -> usize {
         count = count + module.ast.len()
     }
     ret count
+}
+
+// Test harnesses replace/remove free functions, but retain type declarations
+// and impls. Keep each declaration in its source module so flat test emission
+// uses the same nominal identities as a normal build.
+fn test_translation_modules(modules: Vec[WorkspaceModule], ast: Vec[Statement], target: TargetSpec) -> Vec[TranslationModule] {
+    let mut out = Vec[TranslationModule]::new()
+    for module in modules {
+        let mut body = Vec[Statement]::new()
+        for statement in module.ast {
+            match statement {
+                Statement::Function(_) => {}
+                _ => { body.push(statement) }
+            }
+        }
+        for statement in ast {
+            match statement {
+                Statement::Function(item) => {
+                    if item.source_name == module.module_path.as_str() { body.push(statement) }
+                }
+                _ => {}
+            }
+        }
+        out.push(TranslationModule {
+            module.module_id, module.module_path.as_str(), module.source, module.documentation,
+            module.resolved_imports, filter_ast_for_target(body, target, module.enabled_features),
+            module.enabled_features, module.source.len()
+        })
+    }
+    ret out
 }
 
 fn workspace_translation_modules(modules: Vec[WorkspaceModule], target: TargetSpec) -> Vec[TranslationModule] {

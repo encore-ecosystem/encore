@@ -16,13 +16,21 @@ import refrain::frontend::lexer::Lexer
 import refrain::frontend::lexer::Token
 import refrain::frontend::lexer::TokenType
 import refrain::frontend::parser::{FunctionItem, Statement, GenericParam}
+import refrain::frontend::safety::{FunctionSafety, SafetyFunction, infer_safety_with_known, safety_dependencies}
 import refrain::frontend::semantic::check_function_body_with_type_scope
 import refrain::frontend::semantic::{SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticField, SemanticMethod, check_function_body, check_module_bodies, check_module_declarations}
 import refrain::frontend::semantic::{SemanticMember, SemanticDependencyKind, semantic_members, semantic_named_members, semantic_associated_members, append_bound_methods}
 import refrain::frontend::semantic::{check_function_body_with_types, check_function_body_with_scope, check_module_bodies_with_types, semantic_aggregate_names}
 import refrain::frontend::syntax::SyntaxDocument
 import refrain::frontend::type_scope::{TypeNameBinding, scope_type, display_type, names_in_scope}
-import refrain::target::{TargetSpec, host_target}
+import refrain::target::{TargetSpec, host_target, cfg_active_with_features}
+
+struct SafetyConfiguration {
+    module_name: str
+    target: TargetSpec
+    features: Vec[str]
+    key: str
+}
 
 extern fn encore_strset_new() -> usize
 extern fn encore_strset_insert(set: usize, value: str) -> bool
@@ -136,6 +144,9 @@ pub struct AnalysisDatabase {
     nominal_types: Vec[TypeId]
     type_scopes: Vec[TypeScopeCache]
     scoped_environments: Vec[ScopedEnvironmentCache]
+    safety_revision: usize
+    safety_effects: Vec[FunctionSafety]
+    safety_configurations: Vec[SafetyConfiguration]
 }
 
 /// Associates a stable identity and declaring module with a frontend symbol.
@@ -307,13 +318,195 @@ impl for AnalysisDatabase {
         ret Self {
             Vec[AnalysisSource]::new(), Vec[SemanticBodyCache]::new(), Vec[DefMapCache]::new(), 0_usize,
             Vec[ModuleImportResolution]::new(), Vec[FieldEnvironmentCache]::new(), Vec[MethodEnvironmentCache]::new(),
-            Vec[TypeId]::new(), Vec[TypeScopeCache]::new(), Vec[ScopedEnvironmentCache]::new()
+            Vec[TypeId]::new(), Vec[TypeScopeCache]::new(), Vec[ScopedEnvironmentCache]::new(),
+            0_usize, Vec[FunctionSafety]::new(), Vec[SafetyConfiguration]::new()
         }
     }
 
     /// Returns the current source revision of the database.
     pub fn revision(self: Self) -> usize {
         ret self.revision
+    }
+
+    /// Returns the caller-visible safety effect; missing callable information is not trusted.
+    pub fn function_is_unsafe(self: mut Self, id: SymbolId) -> bool {
+        match self.function_safety(id) {
+            Some(effect) => {
+                ret effect.is_unsafe()
+            }
+            None => {
+                ret true
+            }
+        }
+    }
+
+    /// Keeps conditional effects aligned with each package's target and enabled features.
+    pub fn configure_safety(self: mut Self, module_name: str, target: TargetSpec, features: Vec[str]) ->() {
+        let mut key = target.triple
+        for feature in features {
+            key += "\n" + feature
+        }
+        let mut index = 0_usize
+        for configuration in self.safety_configurations {
+            if configuration.module_name == module_name {
+                if configuration.key == key {
+                    ret()
+                }
+                self.safety_configurations.set(index, SafetyConfiguration {
+                        module_name, target, features, key
+                    }
+                    ,
+                )
+                self.safety_effects = Vec[FunctionSafety]::new()
+                ret()
+            }
+            index += 1_usize
+        }
+        self.safety_configurations.push(SafetyConfiguration {
+                module_name, target, features, key
+            }
+            ,
+        )
+        self.safety_effects = Vec[FunctionSafety]::new()
+    }
+
+    /// Computes only the reachable callable graph, then caches it for this source revision.
+    pub fn function_safety(self: mut Self, id: SymbolId) -> Option[FunctionSafety] {
+        let indexed = match self.symbol_by_id(id) {
+            Some(value) => value
+            None => {
+                ret Option[FunctionSafety]::None
+            }
+        }
+        if indexed.symbol.kind != 12_usize {
+            ret Option[FunctionSafety]::None
+        }
+        if self.safety_revision != self.revision {
+            self.safety_effects = Vec[FunctionSafety]::new()
+            self.safety_revision = self.revision
+        }
+        for effect in self.safety_effects {
+            if effect.module_name == indexed.module_name && effect.name == indexed.symbol.name &&
+            effect.line == indexed.symbol.line && effect.column == indexed.symbol.column {
+                ret Option[FunctionSafety]::Some(effect)
+            }
+        }
+        let symbols = self.all_symbols()
+        let mut queue = Vec[AnalysisSymbol]::new()
+        queue.push(indexed)
+        let mut functions = Vec[SafetyFunction]::new()
+        let mut next = 0_usize
+        while next < queue.len() {
+            let selected = queue.get(next).unwrap_or(indexed)
+            next += 1_usize
+            match self.safety_function_input(selected) {
+                Some(function) => {
+                    functions.push(function)
+                    for dependency in safety_dependencies(function) {
+                        for candidate in symbols {
+                            if candidate.symbol.kind != 12_usize || candidate.module_name != dependency.0 || candidate.symbol.name != dependency.2 {
+                                continue
+                            }
+                            let mut seen = false
+                            for queued in queue {
+                                if queued.id.key() == candidate.id.key() {
+                                    seen = true break
+                                }
+                            }
+                            for cached in self.safety_effects {
+                                if cached.module_name == candidate.module_name && cached.name == candidate.symbol.name && cached.line == candidate.symbol.line && cached.column == candidate.symbol.column {
+                                    seen = true break
+                                }
+                            }
+                            if seen {
+                                continue
+                            }
+                            let document = self.document(candidate.module_name).unwrap_or(FrontendDocument::empty())
+                            match find_function(document.ast, candidate.symbol.name, candidate.symbol.line, candidate.symbol.column) {
+                                Some(item) => {
+                                    if safety_owner(document.ast, item) == dependency.1 {
+                                        queue.push(candidate)
+                                    }
+                                }
+                                None => {
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                }
+            }
+        }
+        let inferred = infer_safety_with_known(functions, self.safety_effects)
+        for effect in inferred {
+            let mut found = false
+            for cached in self.safety_effects {
+                if cached.module_name == effect.module_name && cached.name == effect.name && cached.line == effect.line && cached.column == effect.column {
+                    found = true break
+                }
+            }
+            if !found {
+                self.safety_effects.push(effect)
+            }
+        }
+        self.safety_revision = self.revision
+        for effect in inferred {
+            if effect.module_name == indexed.module_name && effect.name == indexed.symbol.name && effect.line == indexed.symbol.line && effect.column == indexed.symbol.column {
+                ret Option[FunctionSafety]::Some(effect)
+            }
+        }
+        ret Option[FunctionSafety]::None
+    }
+
+    fn safety_function_input(self: mut Self, indexed: AnalysisSymbol) -> Option[SafetyFunction] {
+        let name = indexed.module_name
+        let document = self.document(name).unwrap_or(FrontendDocument::empty())
+        let item = match find_function(document.ast, indexed.symbol.name, indexed.symbol.line, indexed.symbol.column) {
+            Some(found) => found None => {
+                ret Option[SafetyFunction]::None
+            }
+        }
+        let mut target = host_target()
+        let mut features = Vec[str]::new()
+        for configuration in self.safety_configurations {
+            if configuration.module_name == name {
+                target = configuration.target features = configuration.features break
+            }
+        }
+        for attr in item.attrs {
+            if starts_with(attr, "cfg:") && !cfg_active_with_features(target, attr.slice(4_usize, attr.len() - 4_usize), features) {
+                ret Option[SafetyFunction]::None
+            }
+        }
+        let callables = self.visible_semantic_callables(name)
+        let fields = self.visible_semantic_fields(name)
+        let methods = self.visible_semantic_methods(name)
+        let body = self.check_scoped_body(indexed, item, document, callables, fields, methods)
+        let mut constructors = Vec[str]::new()
+        for binding in body.type_names {
+            if binding.scope != name {
+                continue
+            }
+            for variant in self.enum_variant_definitions(name, binding.name) {
+                constructors.push(binding.identity + "::" + variant.name())
+            }
+        }
+        ret Option[SafetyFunction]::Some(SafetyFunction {
+                name, safety_owner(document.ast, item), item, body,
+                callables, append_bound_methods(self.scoped_environment(name).methods, body.bound_methods), indexed.symbol.line, indexed.symbol.column, constructors
+            }
+            ,)
+    }
+
+    /// Bulk query for compiler metadata; editor queries use function_safety instead.
+    pub fn function_safety_effects(self: mut Self) -> Vec[FunctionSafety] {
+        for indexed in self.all_symbols() {
+            if indexed.symbol.kind == 12_usize {
+                let _ = self.function_safety(indexed.id)
+            }
+        }
+        ret self.safety_effects
     }
 
     /// Copies immutable source inputs for an isolated worker-side semantic check.
@@ -3080,6 +3273,30 @@ fn function_owner_generics(ast: Vec[Statement], selected: FunctionItem) -> Vec[G
         }
     }
     ret Vec[GenericParam]::new()
+}
+
+fn safety_owner(ast: Vec[Statement], selected: FunctionItem) -> str {
+    for statement in ast {
+        match statement {
+            Statement::Impl(item) => {
+                for method in item.methods {
+                    if method.name == selected.name && method.line == selected.line && method.column == selected.column {
+                        ret item.target
+                    }
+                }
+            }
+            Statement::Trait(item) => {
+                for method in item.methods {
+                    if method.name == selected.name && method.line == selected.line && method.column == selected.column {
+                        ret item.name
+                    }
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret ""
 }
 
 fn semantic_owner_type(scope: str) -> str {

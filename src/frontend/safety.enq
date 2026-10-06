@@ -1,0 +1,579 @@
+//! Backend-independent callable safety effects. An explicit safe contract is a trust boundary.
+import core::option::Option
+import refrain::frontend::parser::{Expr, ExprNode, FunctionItem, Statement, MatchArmBody}
+import refrain::frontend::semantic::{SemanticBody, SemanticCallable, SemanticMethod, SemanticField, semantic_named_members, semantic_associated_members}
+import refrain::frontend::type_scope::scope_type
+import std::vec::Vec
+
+/// Stable declaration and the resolved lexical environment of its body.
+pub struct SafetyFunction {
+    module_name: str
+    owner: str
+    item: FunctionItem
+    body: SemanticBody
+    callables: Vec[SemanticCallable]
+    methods: Vec[SemanticMethod]
+    symbol_line: usize
+    symbol_column: usize
+    constructors: Vec[str]
+}
+
+/// Both internal operations and the caller-visible contract are retained.
+pub struct FunctionSafety {
+    module_name: str
+    owner: str
+    name: str
+    line: usize
+    column: usize
+    body_unsafe: bool
+    asserted_safe: bool
+    returns_unsafe_callable: bool
+}
+
+impl for FunctionSafety {
+    pub fn is_unsafe(self: Self) -> bool {
+        ret self.body_unsafe && !self.asserted_safe
+    }
+}
+
+struct CallableValue {
+    unsafe_call: bool
+    unsafe_result: bool
+}
+
+struct SafetyContext {
+    function: SafetyFunction
+    effects: Vec[FunctionSafety]
+    bindings: Vec[(str, CallableValue)]
+    executed: bool
+    returned: bool
+    dependencies: Vec[(str, str, str)]
+}
+
+/// Collects resolved declarations without recursively asking for their effects.
+pub fn safety_dependencies(function: SafetyFunction) -> Vec[(str, str, str)] {
+    let mut ctx = SafetyContext {
+        function, Vec[FunctionSafety]::new(), Vec[(str, CallableValue)]::new(), false, false, Vec[(str, str, str)]::new()
+    }
+    for param in function.item.params {
+        ctx.bindings.push((param.name, unknown_value()))
+    }
+    match function.item.body {
+        Some(body) => {
+            statements(ctx, body.statements)
+        }
+        None => {
+        }
+    }
+    ret ctx.dependencies
+}
+
+/// Monotone least fixed point, including recursive strongly connected components.
+pub fn infer_safety(functions: Vec[SafetyFunction]) -> Vec[FunctionSafety] {
+    ret infer_safety_with_known(functions, Vec[FunctionSafety]::new())
+}
+
+/// Reuses already closed dependency subgraphs from the same source revision.
+pub fn infer_safety_with_known(functions: Vec[SafetyFunction], known: Vec[FunctionSafety]) -> Vec[FunctionSafety] {
+    let mut effects = Vec[FunctionSafety]::new()
+    for function in functions {
+        let mut safe = false
+        for attr in function.item.attrs {
+            if attr == "safe" || attr == "attr:safe" {
+                safe = true
+            }
+        }
+        effects.push(FunctionSafety {
+                function.module_name, function.owner, function.item.name, function.symbol_line,
+                function.symbol_column, function.item.is_extern || function.item.body.is_none() || function.item.decorators.len() > 0_usize,
+                safe, function.item.is_extern || function.item.body.is_none() || function.item.decorators.len() > 0_usize
+            }
+            ,)
+    }
+    effects.extend(known)
+    let mut changed = true
+    while changed {
+        changed = false
+        let mut index = 0_usize
+        for function in functions {
+            let before = match effects.get(index) {
+                Some(value) => value None => {
+                    ret effects
+                }
+            }
+            let mut ctx = SafetyContext {
+                function, effects, Vec[(str, CallableValue)]::new(), before.body_unsafe, before.returns_unsafe_callable, Vec[(str, str, str)]::new()
+            }
+            for param in function.item.params {
+                ctx.bindings.push((param.name, unknown_value()))
+            }
+            match function.item.body {
+                Some(body) => {
+                    statements(ctx, body.statements)
+                }
+                None => {
+                }
+            }
+            if ctx.executed != before.body_unsafe || ctx.returned != before.returns_unsafe_callable {
+                effects.set(index, FunctionSafety {
+                        before.module_name, before.owner, before.name,
+                        before.line, before.column, ctx.executed, before.asserted_safe, ctx.returned
+                    }
+                    ,)
+                changed = true
+            }
+            index += 1_usize
+        }
+    }
+    ret effects
+}
+
+fn unknown_value() -> CallableValue {
+    ret CallableValue {
+        true, true
+    }
+}
+fn plain_value() -> CallableValue {
+    ret CallableValue {
+        false, false
+    }
+}
+fn join_value(left: CallableValue, right: CallableValue) -> CallableValue {
+    ret CallableValue {
+        left.unsafe_call || right.unsafe_call, left.unsafe_result || right.unsafe_result
+    }
+}
+fn without_type_arguments(name: str) -> str {
+    let mut out = ""
+    let mut depth = 0_usize
+    let mut index = 0_usize
+    while index < name.char_len() {
+        let part = name.slice(index, 1_usize)
+        if part == "[" {
+            depth += 1_usize
+        } elif part == "]" {
+            if depth > 0_usize {
+                depth -= 1_usize
+            }
+        } elif depth == 0_usize {
+            out += part
+        }
+        index += 1_usize
+    }
+    ret out
+}
+fn declaration(ctx: mut SafetyContext, module_name: str, owner: str, name: str) -> CallableValue {
+    let dependency =(module_name, owner, name)
+    let mut recorded = false
+    for existing in ctx.dependencies {
+        if existing.0 == module_name && existing.1 == owner && existing.2 == name {
+            recorded = true break
+        }
+    }
+    if !recorded {
+        ctx.dependencies.push(dependency)
+    }
+    let mut found = false
+    let mut out = plain_value()
+    for effect in ctx.effects {
+        if effect.module_name == module_name && effect.owner == owner && effect.name == name {
+            found = true
+            out = join_value(out, CallableValue {
+                    effect.is_unsafe(), effect.returns_unsafe_callable
+                }
+                ,
+            )
+        }
+    }
+    ret if found {
+        out
+    } else {
+        unknown_value()
+    }
+}
+fn path_value(ctx: mut SafetyContext, name: str) -> CallableValue {
+    let mut index = ctx.bindings.len()
+    while index > 0_usize {
+        index -= 1_usize
+        let binding = match ctx.bindings.get(index) {
+            Some(value) => value None => {
+                ret unknown_value()
+            }
+        }
+        if binding.0 == name {
+            ret binding.1
+        }
+    }
+    let callable_name = without_type_arguments(name)
+    for callable in ctx.function.callables {
+        if callable.name == callable_name {
+            ret declaration(ctx, callable.module_name, "", callable.declaration_name)
+        }
+    }
+    let mut separator = name.len()
+    let mut cursor = 0_usize
+    let mut depth = 0_usize
+    while cursor + 1_usize < name.len() {
+        let part = name.slice(cursor, 1_usize)
+        if part == "[" {
+            depth += 1_usize
+        } elif part == "]" && depth > 0_usize {
+            depth -= 1_usize
+        }
+        if depth == 0_usize && name.slice(cursor, 2_usize) == "::" {
+            separator = cursor
+        }
+        cursor += 1_usize
+    }
+    if separator < name.len() {
+        let owner_name = name.slice(0_usize, separator)
+        let owner = if owner_name == "Self" {
+            scope_type(ctx.function.owner, ctx.function.module_name, ctx.function.body.type_names, Vec[str]::new())
+        } else {
+            scope_type(owner_name, ctx.function.module_name, ctx.function.body.type_names, Vec[str]::new())
+        }
+        let method_name = without_type_arguments(name.slice(separator + 2_usize, name.len() - separator - 2_usize))
+        let mut out = plain_value()
+        let mut found = false
+        for member in semantic_associated_members(owner, method_name, ctx.function.methods) {
+            found = true
+            out = join_value(out, declaration(ctx, member.declaration_module, member.declaration_owner, method_name))
+        }
+        if found {
+            ret out
+        }
+        let constructor = without_type_arguments(owner) + "::" + method_name
+        for known in ctx.function.constructors {
+            if known == constructor {
+                ret plain_value()
+            }
+        }
+    }
+    ret unknown_value()
+}
+fn scoped(ctx: mut SafetyContext, body: Vec[Statement]) ->() {
+    let size = ctx.bindings.len()
+    statements(ctx, body)
+    while ctx.bindings.len() > size {
+        let _ = ctx.bindings.pop()
+    }
+}
+// Includes calls inserted by lowering; these are not visible as Call AST nodes.
+fn protocol_call(ctx: mut SafetyContext, receiver: str, name: str) -> str {
+    let mut result = ""
+    let mut found = false
+    let mut members = semantic_named_members(receiver, name, Vec[SemanticField]::new(), ctx.function.methods)
+    members.extend(semantic_associated_members(receiver, name, ctx.function.methods))
+    for member in members {
+        if member.is_method {
+            found = true
+            let value = declaration(ctx, member.declaration_module, member.declaration_owner, name)
+            ctx.executed = ctx.executed || value.unsafe_call
+            result = member.typ
+        }
+    }
+    if !found {
+        ctx.executed = true
+    }
+    ret result
+}
+fn implicit_calls(ctx: mut SafetyContext, line: usize, column: usize, operation: str) ->() {
+    for site in ctx.function.body.implicit_receivers {
+        if site.0 != line || site.1 != column || site.2 != operation {
+            continue
+        }
+        if operation == "binary" {
+            let _ = protocol_call(ctx, site.3, "op")
+        }
+        if operation == "for" {
+            let conversions = semantic_named_members(site.3, "into_iter", Vec[SemanticField]::new(), ctx.function.methods)
+            let mut iterator = site.3
+            if conversions.len() > 0_usize {
+                iterator = protocol_call(ctx, site.3, "into_iter")
+            }
+            let _ = protocol_call(ctx, iterator, "next")
+        }
+        if operation == "with" {
+            let _ = protocol_call(ctx, site.3, "with_enter")
+            let _ = protocol_call(ctx, site.3, "with_exit")
+        }
+    }
+}
+fn statements(ctx: mut SafetyContext, body: Vec[Statement]) ->() {
+    for statement in body {
+        match statement {
+            Statement::Let(item) => {
+                let value = expression(ctx, item.expr.value, item.expr.line, item.expr.column)
+                ctx.bindings.push((item.name, if item.is_mut {
+                            unknown_value()
+                        } else {
+                            value
+                        }
+                        ,
+                    ))
+            }
+            Statement::Ret(item) => {
+                let value = expression(ctx, item.value, item.line, item.column)
+                ctx.returned = ctx.returned || value.unsafe_call
+            }
+            Statement::Expr(item) => {
+                let _ = expression(ctx, item.value, item.line, item.column)
+            }
+            Statement::Unsafe(block) => {
+                ctx.executed = true scoped(ctx, block.statements)
+            }
+            // Opaque EHIR can contain raw calls even without an unsafe block.
+            Statement::Ehir(item) => {
+                ctx.executed = true
+            }
+            Statement::Function(item) => {
+                ctx.bindings.push((item.name, unknown_value()))
+            }
+            Statement::Assignment(item) => {
+                let value = expression(ctx, item.expr.value, item.expr.line, item.expr.column)
+                let _ = expression(ctx, item.target.value, item.target.line, item.target.column)
+                match item.target.value {
+                    Expr::Path(name) => {
+                        let mut index = ctx.bindings.len()
+                        while index > 0_usize {
+                            index -= 1_usize
+                            let previous = ctx.bindings.get(index).unwrap_or((name, unknown_value()))
+                            if previous.0 == name {
+                                ctx.bindings.set(index,(name, join_value(previous.1, value)))
+                                break
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            Statement::If(item) => {
+                for branch in item.branches {
+                    let _ = expression(ctx, branch.condition.value, branch.condition.line, branch.condition.column)
+                    scoped(ctx, branch.body.statements)
+                }
+                match item.else_body {
+                    Some(body) => {
+                        scoped(ctx, body.statements)
+                    }
+                    None => {
+                    }
+                }
+            }
+            Statement::Match(item) => {
+                let _ = expression(ctx, item.expr.value, item.expr.line, item.expr.column)
+                for arm in item.arms {
+                    let size = ctx.bindings.len()
+                    match arm.pattern.binding {
+                        Some(name) => {
+                            ctx.bindings.push((name, unknown_value()))
+                        }
+                        None => {
+                        }
+                    }
+                    match arm.body {
+                        MatchArmBody::Block(body) => {
+                            scoped(ctx, body.statements)
+                        }
+                        MatchArmBody::Expr(expr) => {
+                            let _ = expression(ctx, expr.value, expr.line, expr.column)
+                        }
+                    }
+                    while ctx.bindings.len() > size {
+                        let _ = ctx.bindings.pop()
+                    }
+                }
+            }
+            Statement::While(item) => {
+                let _ = expression(ctx, item.condition.value, item.condition.line, item.condition.column)
+                scoped(ctx, item.body.statements)
+            }
+            Statement::DoWhile(item) => {
+                scoped(ctx, item.body.statements)
+                let _ = expression(ctx, item.condition.value, item.condition.line, item.condition.column)
+            }
+            Statement::Loop(item) => {
+                scoped(ctx, item.body.statements)
+            }
+            Statement::For(item) => {
+                let _ = expression(ctx, item.iterable.value, item.iterable.line, item.iterable.column)
+                implicit_calls(ctx, item.iterable.line, item.iterable.column, "for")
+                let size = ctx.bindings.len()
+                ctx.bindings.push((item.name, unknown_value()))
+                scoped(ctx, item.body.statements)
+                while ctx.bindings.len() > size {
+                    let _ = ctx.bindings.pop()
+                }
+            }
+            Statement::With(item) => {
+                let _ = expression(ctx, item.expr.value, item.expr.line, item.expr.column)
+                implicit_calls(ctx, item.expr.line, item.expr.column, "with")
+                let size = ctx.bindings.len()
+                ctx.bindings.push((item.name, unknown_value()))
+                scoped(ctx, item.body.statements)
+                while ctx.bindings.len() > size {
+                    let _ = ctx.bindings.pop()
+                }
+            }
+            _ => {
+            }
+        }
+    }
+}
+fn expressions(ctx: mut SafetyContext, items: Vec[ExprNode]) -> CallableValue {
+    let mut out = plain_value()
+    for item in items {
+        out = join_value(out, expression(ctx, item.value, item.line, item.column))
+    }
+    ret out
+}
+fn expression(ctx: mut SafetyContext, expr: Expr, line: usize, column: usize) -> CallableValue {
+    match expr {
+        Expr::Path(name) => {
+            ret path_value(ctx, name)
+        }
+        Expr::Unsafe(body) => {
+            ctx.executed = true scoped(ctx, body.statements) ret unknown_value()
+        }
+        Expr::Call(call) => {
+            let callee = expression(ctx, call.callee.value, call.callee.line, call.callee.column)
+            let _ = expressions(ctx, call.args)
+            ctx.executed = ctx.executed || callee.unsafe_call
+            ret CallableValue {
+                callee.unsafe_result, true
+            }
+        }
+        Expr::MethodCall(call) => {
+            let receiver_value = expression(ctx, call.receiver.value, call.receiver.line, call.receiver.column)
+            let _ = expressions(ctx, call.args)
+            let receiver = ctx.function.body.canonical_member_receiver_at(line, column)
+            let members = semantic_named_members(receiver, call.method, Vec[SemanticField]::new(), ctx.function.methods)
+            let mut value = plain_value()
+            let mut found = false
+            for member in members {
+                if member.is_method {
+                    found = true
+                    value = join_value(value, declaration(ctx, member.declaration_module, member.declaration_owner, call.method))
+                }
+            }
+            if !found {
+                value = if call.method == "call" {
+                    receiver_value
+                } else {
+                    unknown_value()
+                }
+            }
+            ctx.executed = ctx.executed || value.unsafe_call
+            ret CallableValue {
+                value.unsafe_result, true
+            }
+        }
+        Expr::Closure(closure) => {
+            let mut bindings = Vec[(str, CallableValue)]::new()
+            for binding in ctx.bindings {
+                bindings.push(binding)
+            }
+            for param in closure.params {
+                bindings.push((param.name, unknown_value()))
+            }
+            let mut nested = SafetyContext {
+                ctx.function, ctx.effects, bindings, false, false, Vec[(str, str, str)]::new()
+            }
+            let value = expression(nested, closure.body.value, closure.body.line, closure.body.column)
+            ctx.dependencies.extend(nested.dependencies)
+            ret CallableValue {
+                nested.executed, nested.returned || value.unsafe_call
+            }
+        }
+        Expr::Parenthesized(inner) => {
+            ret expression(ctx, inner.value, inner.line, inner.column)
+        }
+        Expr::Await(inner) => {
+            ret expression(ctx, inner.value, inner.line, inner.column)
+        }
+        Expr::Spawn(inner) => {
+            ret expression(ctx, inner.value, inner.line, inner.column)
+        }
+        Expr::Try(inner) => {
+            ret expression(ctx, inner.value, inner.line, inner.column)
+        }
+        Expr::Unary(item) => {
+            ret expression(ctx, item.expr.value, item.expr.line, item.expr.column)
+        }
+        Expr::Cast(item) => {
+            ret expression(ctx, item.expr.value, item.expr.line, item.expr.column)
+        }
+        Expr::Binary(item) => {
+            let left = expression(ctx, item.lhs.value, item.lhs.line, item.lhs.column)
+            implicit_calls(ctx, line, column, "binary")
+            ret join_value(left, expression(ctx, item.rhs.value, item.rhs.line, item.rhs.column))
+        }
+        Expr::Field(item) => {
+            let _ = expression(ctx, item.base.value, item.base.line, item.base.column)
+            ret unknown_value()
+        }
+        Expr::Index(item) => {
+            let _ = expression(ctx, item.base.value, item.base.line, item.base.column)
+            let _ = expression(ctx, item.index.value, item.index.line, item.index.column)
+            ret unknown_value()
+        }
+        Expr::StructInit(item) => {
+            let _ = expressions(ctx, item.values) ret plain_value()
+        }
+        Expr::VecLiteral(item) => {
+            ret expressions(ctx, item.items)
+        }
+        Expr::ArrayLiteral(item) => {
+            ret expressions(ctx, item.items)
+        }
+        Expr::TupleLiteral(item) => {
+            ret expressions(ctx, item.items)
+        }
+        Expr::ArrayRepeat(item) => {
+            ret expression(ctx, item.value.value, item.value.line, item.value.column)
+        }
+        Expr::Block(block) => {
+            let size = ctx.bindings.len()
+            statements(ctx, block.statements)
+            let value = match block.tail {
+                Some(tail) => expression(ctx, tail.value, tail.line, tail.column)
+                None => plain_value()
+            }
+            while ctx.bindings.len() > size {
+                let _ = ctx.bindings.pop()
+            }
+            ret value
+        }
+        Expr::If(item) => {
+            let mut value = plain_value()
+            for branch in item.branches {
+                let _ = expression(ctx, branch.condition.value, branch.condition.line, branch.condition.column)
+                value = join_value(value, expression(ctx, branch.body.value, branch.body.line, branch.body.column))
+            }
+            ret join_value(value, expression(ctx, item.else_body.value, item.else_body.line, item.else_body.column))
+        }
+        Expr::Match(item) => {
+            let _ = expression(ctx, item.expr.value, item.expr.line, item.expr.column)
+            let mut value = plain_value()
+            for arm in item.arms {
+                let size = ctx.bindings.len()
+                match arm.pattern.binding {
+                    Some(name) => {
+                        ctx.bindings.push((name, unknown_value()))
+                    }
+                    None => {
+                    }
+                }
+                value = join_value(value, expression(ctx, arm.expr.value, arm.expr.line, arm.expr.column))
+                while ctx.bindings.len() > size {
+                    let _ = ctx.bindings.pop()
+                }
+            }
+            ret value
+        }
+        _ => {
+            ret plain_value()
+        }
+    }
+}

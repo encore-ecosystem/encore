@@ -27,13 +27,22 @@ dependencies_checksum=$(awk 'NF {print tolower($1); exit}' \
   target/dependency-download/dependencies.tar.gz.sha256)
 mkdir -p target/stage1-builder target/stage1-artifacts
 
+bootstrap=null
+if [[ "$seed_tag" == v0.1.0-neumann ]]; then
+  # The published seed cannot lower unit enum payloads. Rebuild its pinned
+  # sources with a minimal backport; never substitute a developer binary.
+  bash scripts/bootstrap-unit.sh "$seed_compiler" "$PWD/target/unit-bootstrap"
+  seed_compiler="$PWD/target/unit-bootstrap/bin/$executable"
+  bootstrap=$(cat target/unit-bootstrap/provenance.json)
+fi
+
 "$seed_compiler" build --profile extreme
 cp "target/extreme/$executable" "target/stage1-builder/$executable"
 builder="$PWD/target/stage1-builder/$executable"
 chmod +x "$builder" 2>/dev/null || true
 
-# The transition seed and stage1 use the same immutable system-library input.
-# Never replace the graph midway through self-hosting.
+# Every build of the current compiler uses the same immutable library graph.
+# The optional old-source seed backport above has its own recorded graph.
 index_root="$PWD/../encore-index"
 test -f "$index_root/packages/core/encore.toml"
 export ENCORE_CORE_DIR="$index_root/packages/core"
@@ -87,6 +96,7 @@ for target in "${targets[@]}"; do
     --arg nametag "$release_name" \
     --arg release "$release" \
     --arg seed "$seed_tag" \
+    --argjson bootstrap "$bootstrap" \
     --arg producer "$producer" \
     --arg target "$target" \
     --arg target_kit_abi "$target_kit_abi" \
@@ -100,6 +110,7 @@ for target in "${targets[@]}"; do
       nametag: $nametag,
       release: $release,
       seed: $seed,
+      bootstrap: $bootstrap,
       producer: $producer,
       target: $target,
       target_kit_abi: $target_kit_abi,

@@ -93,6 +93,129 @@ struct LoweredExpr {
     typ: str
 }
 
+// Call operands stay rooted while subsequent operands are evaluated. A
+// borrowed-self call leaves that root with the caller; a value call transfers
+// it to the callee. Both forms use the ordinary control-flow cleanup stack.
+struct CallOwner {
+    name: str
+    value: str
+    typ: str
+    caller_owned: bool
+}
+
+fn track_call_owner(ctx: mut TranslatorContext, owners: mut Vec[CallOwner],
+    value: str, typ: str, caller_owned: bool, prefix: str,) ->() {
+    let ownership_type = if starts_with(typ, "mut ") {
+        typ.slice(4_usize, typ.len() - 4_usize)
+    } else {
+        typ
+    }
+    if !ctx_type_needs_ownership(ctx, ownership_type) {
+        ret()
+    }
+    let name = prefix + "_call_owner_" + Debug::fmt(owners.len())
+    ctx_add_owned_var(ctx, name, value, typ)
+    owners.push(CallOwner {
+            name, value, typ, caller_owned
+        }
+        ,
+    )
+    ret()
+}
+
+fn finish_call_owners(ctx: mut TranslatorContext, code: EhirTextBuilder,
+    owners: Vec[CallOwner], prefix: str, retain_inputs: bool,) -> EhirTextBuilder {
+    let mut out = code
+    let mut index = owners.len()
+    while index > 0_usize {
+        index -= 1_usize
+        match owners.get(index) {
+            Some(owner) => {
+                if owner.caller_owned || retain_inputs {
+                    if starts_with(owner.typ, "mut ") {
+                        let typ = value_type_name(owner.typ)
+                        let loaded = prefix + "_call_cleanup_" + Debug::fmt(index)
+                        out = out.instr(loaded + ": " + typ + " = load " + owner.value)
+                        out = out.instr("drop " + loaded + ": " + typ)
+                    } else {
+                        out = out.instr("drop " + owner.value + ": " + owner.typ)
+                    }
+                }
+                untrack_call_owner(ctx, owner.name)
+            }
+            None => {
+            }
+        }
+    }
+    ret out
+}
+
+fn untrack_call_owner(ctx: mut TranslatorContext, name: str) ->() {
+    // Normal calls unwind a suffix of the cleanup stack. Avoid rebuilding the
+    // entire list for every argument; blocks with live local bindings still
+    // use the general name-based removal path.
+    if ctx.owned_vars.len() > 0_usize {
+        match ctx.owned_vars.get(ctx.owned_vars.len() - 1_usize) {
+            Some(owner) => {
+                if owner.name == name {
+                    ctx.owned_vars.pop()
+                    ret()
+                }
+            }
+            None => {
+            }
+        }
+    }
+    ctx_move_owned_var(ctx, name)
+    ret()
+}
+
+// Normalize the trusted borrowed-return ABI at the call boundary. Outside
+// this boundary every produced call result owns its contents, including when
+// the receiver is about to be released. Consumers must not retain it again.
+fn own_call_result(ctx: mut TranslatorContext, code: EhirTextBuilder,
+    callee: str, value: str, typ: str,) -> EhirTextBuilder {
+    if ctx_function_returns_borrowed(ctx, callee) && ctx_type_needs_ownership(ctx, typ) {
+        ret code.instr("retain " + value + ": " + typ)
+    }
+    ret code
+}
+
+// A borrowed result may point into any input. Keep a caller root for inputs
+// which an ordinary value callee consumes; native/borrowed-self calls already
+// leave their input owners with the caller. Acquire these roots only after all
+// operands are evaluated, so an earlier `?` uses the ordinary cleanup stack.
+fn protect_call_result_inputs(ctx: mut TranslatorContext, code: EhirTextBuilder,
+    owners: Vec[CallOwner], callee: str,) -> EhirTextBuilder {
+    let mut out = code
+    if ctx_function_returns_borrowed(ctx, callee) && !ctx_function_is_extern(ctx, callee) {
+        for owner in owners {
+            if !owner.caller_owned {
+                out = out.instr("retain " + owner.value + ": " + owner.typ)
+            }
+        }
+    }
+    ret out
+}
+
+// A diverging operand already emitted cleanup on its outgoing edge. Remove
+// only translation-time bookkeeping; emitting post-call drops would duplicate
+// that cleanup on an unreachable continuation.
+fn abandon_call_owners(ctx: mut TranslatorContext, owners: Vec[CallOwner]) ->() {
+    let mut index = owners.len()
+    while index > 0_usize {
+        index -= 1_usize
+        match owners.get(index) {
+            Some(owner) => {
+                untrack_call_owner(ctx, owner.name)
+            }
+            None => {
+            }
+        }
+    }
+    ret()
+}
+
 struct VisibilityModule {
     module_id: str
     imports: Vec[str]
@@ -398,6 +521,7 @@ struct LoopTargetType {
     break_target: str
     continue_target: str
     owned_start: usize
+    with_start: usize
 }
 
 struct ClosureSignature {
@@ -441,6 +565,7 @@ struct TranslatorContext {
     expression_hint: str
     return_is_sending: bool
     return_is_frozen: bool
+    return_is_borrowed: bool
     active_generics: Vec[GenericParam]
     target: TargetSpec
     features: Vec[str]
@@ -938,15 +1063,19 @@ fn resolve_type_declaration_module(ctx: mut TranslatorContext, current: Translat
 
     let mut direct = ""
     for candidate in ctx.modules {
-        if candidate.module_id != current.module_id && module_declares_type(candidate, name) &&
+        if candidate.module_id != current.module_id &&
         contains_str(current.imports, candidate.module_id) {
             match direct_import_allows(ctx, current.source_name, candidate.module_id, name) {
                 Some(allowed) => {
                     if allowed {
-                        if direct != "" && direct != candidate.module_id {
+                        let owner = exported_type_owner(ctx, candidate, name, 0_usize)
+                        if owner == "" {
+                            continue
+                        }
+                        if direct != "" && direct != owner {
                             ret ""
                         }
-                        direct = candidate.module_id
+                        direct = owner
                     }
                 }
                 _ => {
@@ -973,6 +1102,69 @@ fn resolve_type_declaration_module(ctx: mut TranslatorContext, current: Translat
         }
     }
     ret visible
+}
+
+// A selected import from a facade belongs to its public declaration, not to
+// every same-named type reachable through the facade's private dependencies.
+fn exported_type_owner(ctx: mut TranslatorContext, module: TranslationModule,
+    name: str, depth: usize,) -> str {
+    if depth > ctx.modules.len() {
+        ret ""
+    }
+    for statement in module.ast {
+        match statement {
+            Statement::Struct(item) => {
+                if item.name == name && item.is_public {
+                    ret module.module_id
+                }
+            }
+            Statement::EnumItem(item) => {
+                if item.name == name && item.is_public {
+                    ret module.module_id
+                }
+            }
+            Statement::Trait(item) => {
+                if item.name == name && item.is_public {
+                    ret module.module_id
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    let mut owner = ""
+    for candidate in ctx.modules {
+        if !contains_str(module.imports, candidate.module_id) {
+            continue
+        }
+        for statement in module.ast {
+            match statement {
+                Statement::Import(item) => {
+                    if !item.is_public {
+                        continue
+                    }
+                    let mut path = item.path
+                    if starts_with(path, "mod::") {
+                        let root = module.module_id.slice(0_usize,
+                            find_char(module.module_id, "@", 0_usize),)
+                        path = root + path.slice(3_usize, path.len() - 3_usize)
+                    }
+                    if import_path_allows(path, module_import_path(candidate.module_id), name) {
+                        let found = exported_type_owner(ctx, candidate, name, depth + 1_usize)
+                        if found != "" {
+                            if owner != "" && owner != found {
+                                ret ""
+                            }
+                            owner = found
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    ret owner
 }
 
 // Replace an EHIR identifier without touching quoted program strings or
@@ -1161,7 +1353,7 @@ fn collect_context(ast: Vec[Statement], modules: Vec[TranslationModule], target:
             encore_strset_new()
         }
         , Vec[EnumVariantType]::new(), Vec[LoopTargetType]::new(),
-        Vec[VarType]::new(), Vec[str]::new(), Vec[str]::new(), Vec[str]::new(), "", "void", "", false, false,
+        Vec[VarType]::new(), Vec[str]::new(), Vec[str]::new(), Vec[str]::new(), "", "void", "", false, false, false,
         Vec[GenericParam]::new(), target, features, false, "", "", "", "", "", Vec[str]::new(),
         Vec[str]::new(), Vec[VariableRegion]::new(), Vec[usize]::new(), Vec[usize]::new(),
         Vec[usize]::new(), Vec[usize]::new(), Vec[str]::new(), Vec[str]::new(),
@@ -1284,7 +1476,8 @@ fn collect_context(ast: Vec[Statement], modules: Vec[TranslationModule], target:
                             method_generics.push(generic_name)
                         }
                         let output_type = function_ret_type_for_owner(method, impl_item.target)
-                        let callable_name = base_type_name(impl_item.target) + "::" + method_name
+                        let callable_name = qualified_callable_name(ctx, method.source_name,
+                            base_type_name(impl_item.target) + "::" + method_name,)
                         if function_has_attr(method, "borrowed_self") {
                             ctx.borrowed_self_functions.push(callable_name)
                         }
@@ -1304,7 +1497,7 @@ fn collect_context(ast: Vec[Statement], modules: Vec[TranslationModule], target:
                         if method.is_async {
                             remember_async_future_output(ctx, method, callable_type, output_type)
                         }
-                        remember_generic_callable(ctx, base_type_name(impl_item.target) + "::" + method_name,
+                        remember_generic_callable(ctx, callable_name,
                             combined_generic_params(impl_item.generics, method.generics),)
                     }
                 }
@@ -1424,6 +1617,18 @@ fn remember_type(ctx: mut TranslatorContext, name: str) ->() {
 // metadata, so a consumer can simultaneously hold values returned by two
 // modules that both define (for example) `Output`.
 fn qualified_type_for_source(ctx: mut TranslatorContext, source_name: str, typ: str) -> str {
+    // Do not materialize a module (and its AST ownership graph) for primitive
+    // and non-colliding types. This also keeps generic constructor lookup cheap.
+    let mut collision_candidate = false
+    for name in ctx.type_collisions {
+        if contains_substring(typ, name) {
+            collision_candidate = true
+            break
+        }
+    }
+    if !collision_candidate {
+        ret canonical_type(typ)
+    }
     let encoded = lookup_module_source_alias(ctx.module_index, source_name)
     if encoded == 0_usize {
         ret canonical_type(typ)
@@ -1520,7 +1725,8 @@ fn remember_trait_impl(ctx: mut TranslatorContext, item: ImplStmt) ->() {
             ret()
         }
         Option[str]::Some(trait_name) => {
-            let key = trait_name + "[" + join_strs(item.trait_args, ", ") + "] for " + canonical_type(item.target)
+            let target = qualified_type_for_source(ctx, item.source_name, item.target)
+            let key = trait_name + "[" + join_strs(item.trait_args, ", ") + "] for " + target
             for known in ctx.trait_impls {
                 if trait_impl_key(known) == key {
                     translation_error_at(item.source_name, item.line, item.column, "conflicting-trait-impl",
@@ -1528,7 +1734,7 @@ fn remember_trait_impl(ctx: mut TranslatorContext, item: ImplStmt) ->() {
                 }
             }
             ctx.trait_impls.push(TraitImplType {
-                    trait_name, item.trait_args, canonical_type(item.target), item.generics
+                    trait_name, item.trait_args, target, item.generics
                 }
                 ,
             )
@@ -1835,7 +2041,16 @@ fn module_symbol_prefix(ctx: mut TranslatorContext, source_name: str) -> str {
     ret "__encore_m" + encode_module_identity(canonical_source_identity(source_name)) + "__"
 }
 
-fn ctx_next_emitted_name(ctx: mut TranslatorContext, source_name: str, name: str) -> str {
+fn qualified_callable_name(ctx: mut TranslatorContext, source_name: str, name: str) -> str {
+    let owner = function_owner_name(name)
+    if owner == "" || !contains_str(ctx.type_collisions, base_type_name(owner)) || source_declares_trait(ctx, source_name, owner) {
+        ret name
+    }
+    ret qualified_type_for_source(ctx, source_name, name)
+}
+
+fn ctx_next_emitted_name(ctx: mut TranslatorContext, source_name: str, raw_name: str) -> str {
+    let name = qualified_callable_name(ctx, source_name, raw_name)
     let encoded_overload_count = unsafe {
         encore_strmap_get(ctx.function_overload_counts, source_name + "\n" + name)
     }
@@ -2089,6 +2304,9 @@ fn ctx_type_needs_ownership(ctx: mut TranslatorContext, typ: str) -> bool {
     }
     if starts_with(value, "mut ") || ends_with(value, "*") {
         ret false
+    }
+    if starts_with(value, "__array_") {
+        ret true
     }
     if value == "void" || value == "()" || value == "bool" || is_numeric_type(value) {
         ret false
@@ -2387,6 +2605,17 @@ fn restore_owned_vars(ctx: mut TranslatorContext, size: usize) ->() {
         ctx.owned_vars.pop()
     }
     ret()
+}
+
+// A typed store creates a slot owner. Release a produced (not borrowed) input
+// after storing it to transfer ownership rather than leaking an extra root.
+fn store_transferred_value(ctx: mut TranslatorContext, builder: EhirTextBuilder,
+    value: str, typ: str, slot: str,) -> EhirTextBuilder {
+    let mut out = builder.instr("store " + value + ", " + slot)
+    if ctx_type_needs_ownership(ctx, typ) {
+        out = out.instr("drop " + value + ": " + typ)
+    }
+    ret out
 }
 
 fn move_var_out_of_context(ctx: mut TranslatorContext, name: str) ->() {
@@ -3063,7 +3292,12 @@ fn plain_function_argument_error(ctx: mut TranslatorContext, source_name: str, n
 
 fn ctx_emitted_declaration_name(ctx: mut TranslatorContext, source_name: str, name: str, params: Vec[str])
 -> str {
-    match ctx_lookup_function_for_args(ctx, source_name, name, params) {
+    let mut resolved_params = Vec[str]::new()
+    for param in params {
+        resolved_params.push(qualified_type_for_source(ctx, source_name, param))
+    }
+    let resolved_name = qualified_callable_name(ctx, source_name, name)
+    match ctx_lookup_function_for_args(ctx, source_name, resolved_name, resolved_params) {
         Option[FunctionType]::Some(function) => {
             ret function.emitted_name
         }
@@ -3241,9 +3475,15 @@ fn resolve_loop_target(ctx: mut TranslatorContext, label: Option[str], fallback:
             if ctx.loop_targets.len() > 0_usize {
                 match ctx.loop_targets.get(ctx.loop_targets.len() - 1_usize) {
                     Some(target) => {
-                        ret Option[str]::Some(if is_continue { target.continue_target } else { target.break_target })
+                        ret Option[str]::Some(if is_continue {
+                                target.continue_target
+                            } else {
+                                target.break_target
+                            }
+                        )
                     }
-                    None => {}
+                    None => {
+                    }
                 }
             }
         }
@@ -3273,6 +3513,30 @@ fn loop_cleanup_start(ctx: mut TranslatorContext, label: Option[str]) -> usize {
         }
     }
     ret ctx.owned_vars.len()
+}
+
+fn loop_with_cleanup_start(ctx: mut TranslatorContext, label: Option[str]) -> usize {
+    let mut index = ctx.loop_targets.len()
+    while index > 0_usize {
+        index = index - 1_usize
+        match ctx.loop_targets.get(index) {
+            Some(target) => {
+                match label {
+                    Some(name) => {
+                        if target.name == name {
+                            ret target.with_start
+                        }
+                    }
+                    None => {
+                        ret target.with_start
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
+    ret ctx.with_cleanups.len()
 }
 
 fn loop_label_name(label: Option[str]) -> str {
@@ -3513,7 +3777,7 @@ fn ctx_lookup_field_index(ctx: mut TranslatorContext, owner: str, field: str) ->
     ret field
 }
 
-fn ctx_enum_variant_owner(ctx: mut TranslatorContext, path: str) -> Option[str] {
+fn ctx_enum_variant_owner(ctx: mut TranslatorContext, source_name: str, path: str) -> Option[str] {
     let scope = last_scope_index(path)
     if scope >= path.len() {
         ret Option[str]::None
@@ -3521,7 +3785,8 @@ fn ctx_enum_variant_owner(ctx: mut TranslatorContext, path: str) -> Option[str] 
     // Constructor paths are type positions too: resolve Self before splitting
     // the owner so both bare and nested generic enum constructors agree with
     // the impl's parameter and return annotations.
-    let requested_owner = self_context_type(ctx, path.slice(0_usize, scope))
+    let requested_owner = qualified_type_for_source(ctx, source_name,
+        self_context_type(ctx, path.slice(0_usize, scope)),)
     let requested_base = base_type_name(requested_owner)
     // `Opt` is the conventional prelude alias for Option. Import statements
     // are flattened before bootstrap translation, so preserve this alias at
@@ -4572,6 +4837,7 @@ fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, e
     ctx.return_type = qualified_type_for_source(ctx, fn_item.source_name, ret_type)
     ctx.return_is_sending = fn_item.returns_sending
     ctx.return_is_frozen = fn_item.returns_frozen
+    ctx.return_is_borrowed = function_has_attr(fn_item, "borrowed_return")
     if fn_item.returns_sending && fn_item.returns_frozen {
         translation_error_at(fn_item.source_name, fn_item.line, fn_item.column,
             "conflicting-return-capabilities", "a return type cannot be both sending and frozen",)
@@ -5115,7 +5381,7 @@ fn trait_impl_target_matches(ctx: mut TranslatorContext, implementation: TraitIm
                             if generic.name == template_arg {
                                 matched_generic = true
                                 for bound in generic.bounds {
-                                    if !type_satisfies_trait_bound(ctx, Vec[GenericParam]::new(), concrete_arg,
+                                    if !type_satisfies_trait_bound(ctx, ctx.active_generics, concrete_arg,
                                         bound.path,) {
                                         ret false
                                     }
@@ -5442,6 +5708,7 @@ fn translate_statements(
     let mut saw_ret = false
     let mut i = 0_usize
     for stmt in statements {
+        let terminates = statement_terminates_flow(stmt)
         match stmt {
             Statement::Ret(expr) => {
                 builder = builder.append(translate_owned_ret_expr(ctx, expr, ret_type, prefix + "_ret_"
@@ -5505,7 +5772,7 @@ fn translate_statements(
                 }
             }
             Statement::Break(label) => {
-                builder = builder.append(translate_with_cleanups(ctx, prefix + "_break_cleanup_" + Debug::fmt(i)))
+                builder = builder.append(translate_with_cleanups_from(ctx, prefix + "_break_cleanup_" + Debug::fmt(i), loop_with_cleanup_start(ctx, label)))
                 builder = append_owned_drops_from(ctx, builder, "", prefix + "_break_scope_" + Debug::fmt(i),
                     loop_cleanup_start(ctx, label),)
                 match resolve_loop_target(ctx, label, break_label, false) {
@@ -5517,8 +5784,8 @@ fn translate_statements(
                 }
             }
             Statement::Continue(label) => {
-                builder = builder.append(translate_with_cleanups(ctx, prefix + "_continue_cleanup_" +
-                        Debug::fmt(i),))
+                builder = builder.append(translate_with_cleanups_from(ctx, prefix + "_continue_cleanup_" +
+                        Debug::fmt(i), loop_with_cleanup_start(ctx, label),))
                 builder = append_owned_drops_from(ctx, builder, "", prefix + "_continue_scope_" + Debug::fmt(i),
                     loop_cleanup_start(ctx, label),)
                 match resolve_loop_target(ctx, label, continue_label, true) {
@@ -5531,6 +5798,10 @@ fn translate_statements(
             }
             _ => {
             }
+        }
+        if terminates {
+            saw_ret = true
+            break
         }
         i = i + 1_usize
     }
@@ -5552,6 +5823,7 @@ fn translate_statements_no_default(
     let mut builder = EhirTextBuilder::new()
     let mut i = 0_usize
     for stmt in statements {
+        let terminates = statement_terminates_flow(stmt)
         match stmt {
             Statement::Ret(expr) => {
                 builder = builder.append(translate_owned_ret_expr(ctx, expr, ret_type, prefix + "_ret_"
@@ -5611,7 +5883,7 @@ fn translate_statements_no_default(
                 }
             }
             Statement::Break(label) => {
-                builder = builder.append(translate_with_cleanups(ctx, prefix + "_break_cleanup_" + Debug::fmt(i)))
+                builder = builder.append(translate_with_cleanups_from(ctx, prefix + "_break_cleanup_" + Debug::fmt(i), loop_with_cleanup_start(ctx, label)))
                 builder = append_owned_drops_from(ctx, builder, "", prefix + "_break_scope_" + Debug::fmt(i),
                     loop_cleanup_start(ctx, label),)
                 match resolve_loop_target(ctx, label, break_label, false) {
@@ -5623,8 +5895,8 @@ fn translate_statements_no_default(
                 }
             }
             Statement::Continue(label) => {
-                builder = builder.append(translate_with_cleanups(ctx, prefix + "_continue_cleanup_" +
-                        Debug::fmt(i),))
+                builder = builder.append(translate_with_cleanups_from(ctx, prefix + "_continue_cleanup_" +
+                        Debug::fmt(i), loop_with_cleanup_start(ctx, label),))
                 builder = append_owned_drops_from(ctx, builder, "", prefix + "_continue_scope_" + Debug::fmt(i),
                     loop_cleanup_start(ctx, label),)
                 match resolve_loop_target(ctx, label, continue_label, true) {
@@ -5637,6 +5909,9 @@ fn translate_statements_no_default(
             }
             _ => {
             }
+        }
+        if terminates {
+            break
         }
         i = i + 1_usize
     }
@@ -5679,7 +5954,7 @@ fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str
             }
         }
     }
-    let borrowed_copy = expr_is_borrowed_copy(let_stmt.expr) || expr_returns_borrowed(ctx, let_stmt.expr)
+    let borrowed_copy = expr_is_borrowed_copy(let_stmt.expr)
     match let_stmt.typ {
         Option[str]::Some(explicit_type) => {
             ctx.expression_hint = qualified_type_for_source(ctx, let_stmt.expr.source_name, explicit_type)
@@ -5696,6 +5971,9 @@ fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str
     let initializer_is_frozen = ctx_value_is_frozen(ctx, lowered.value) || ctx_path_is_frozen(ctx,
         source_path,)
     ctx.expression_hint = ""
+    if lowered.typ == "!" {
+        ret lowered.code
+    }
     match let_stmt.typ {
         Option[str]::Some(explicit_type) => {
             let resolved_explicit_type = qualified_type_for_source(ctx, let_stmt.expr.source_name, explicit_type)
@@ -5828,11 +6106,11 @@ fn expr_is_borrowed_copy(expr: ExprNode) -> bool {
         Expr::Path(_) => {
             ret true
         }
-        Expr::Field(_) => {
-            ret true
+        Expr::Field(field) => {
+            ret expr_h_is_borrowed_copy(field.base)
         }
-        Expr::Index(_) => {
-            ret true
+        Expr::Index(index) => {
+            ret expr_h_is_borrowed_copy(index.base)
         }
         Expr::Block(block) => {
             match block.tail {
@@ -5859,11 +6137,11 @@ fn expr_h_is_borrowed_copy(expr: ExprNode < H >) -> bool {
         Expr::Path(_) => {
             ret true
         }
-        Expr::Field(_) => {
-            ret true
+        Expr::Field(field) => {
+            ret expr_h_is_borrowed_copy(field.base)
         }
-        Expr::Index(_) => {
-            ret true
+        Expr::Index(index) => {
+            ret expr_h_is_borrowed_copy(index.base)
         }
         Expr::Block(block) => {
             match block.tail {
@@ -5883,96 +6161,6 @@ fn expr_h_is_borrowed_copy(expr: ExprNode < H >) -> bool {
         }
     }
     ret false
-}
-
-fn expr_returns_borrowed(ctx: mut TranslatorContext, expr: ExprNode) -> bool {
-    match expr.value {
-        Expr::Call(call_expr) => {
-            ret ctx_function_returns_borrowed(ctx, expr_h_path_or_empty(call_expr.callee))
-        }
-        Expr::MethodCall(call_expr) => {
-            ret method_call_returns_borrowed(ctx, call_expr)
-        }
-        Expr::Block(block) => {
-            match block.tail {
-                Some(tail) => {
-                    ret expr_h_returns_borrowed(ctx, tail)
-                }
-                None => {
-                    ret false
-                }
-            }
-        }
-        Expr::Parenthesized(inner) => {
-            ret expr_h_returns_borrowed(ctx, inner)
-        }
-        Expr::Unsafe(block) => {
-            if block.statements.len() == 0_usize {
-                ret false
-            }
-            match block.statements.get(block.statements.len() - 1_usize) {
-                Option[Statement]::Some(tail_stmt) => {
-                    match tail_stmt {
-                        Statement::Expr(tail) => {
-                            ret expr_returns_borrowed(ctx, tail)
-                        }
-                        Statement::Ret(tail) => {
-                            ret expr_returns_borrowed(ctx, tail)
-                        }
-                        _ => {
-                        }
-                    }
-                }
-                Option[Statement]::None => {
-                }
-            }
-        }
-        _ => {
-        }
-    }
-    ret false
-}
-
-fn expr_h_returns_borrowed(ctx: mut TranslatorContext, expr: ExprNode < H >) -> bool {
-    match expr.value {
-        Expr::Call(call_expr) => {
-            ret ctx_function_returns_borrowed(ctx, expr_h_path_or_empty(call_expr.callee))
-        }
-        Expr::MethodCall(call_expr) => {
-            ret method_call_returns_borrowed(ctx, call_expr)
-        }
-        Expr::Block(block) => {
-            match block.tail {
-                Some(tail) => {
-                    ret expr_h_returns_borrowed(ctx, tail)
-                }
-                None => {
-                    ret false
-                }
-            }
-        }
-        Expr::Parenthesized(inner) => {
-            ret expr_h_returns_borrowed(ctx, inner)
-        }
-        _ => {
-        }
-    }
-    ret false
-}
-
-fn method_call_returns_borrowed(ctx: mut TranslatorContext, call: MethodCallExpr) -> bool {
-    let receiver_type = value_type_name(translator_dispatch_type_h(ctx, call.receiver))
-    let mut owner = method_owner_name(receiver_type)
-    if starts_with(receiver_type, "dyn ") {
-        owner = receiver_type.slice(4_usize, receiver_type.len() - 4_usize)
-    }
-    if owner == "Self" && ctx.self_type != "" {
-        owner = method_owner_name(ctx.self_type)
-    }
-    if owner == "" {
-        ret false
-    }
-    ret ctx_function_returns_borrowed(ctx, owner + "::" + call.method)
 }
 
 // A call that receives the assignment target through a `mut` parameter may
@@ -6171,10 +6359,12 @@ fn translate_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assignment
 
     if assign_stmt.operator == "=" {
         let borrowed_rhs = expr_is_borrowed_copy(assign_stmt.expr) ||
-        expr_returns_borrowed(ctx, assign_stmt.expr) ||
         expr_mutably_aliases_path(ctx, assign_stmt.expr, target)
         let mut lowered = lower_expr(ctx, assign_stmt.expr, prefix + "_assign", idx)
         builder = builder.append(lowered.code)
+        if lowered.typ == "!" {
+            ret builder
+        }
         let mut target_type = ""
         match ctx_lookup_var(ctx, target) {
             Option[str]::Some(found) => {
@@ -6249,9 +6439,12 @@ fn translate_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assignment
         ret builder
     }
 
-    let borrowed_rhs = expr_is_borrowed_copy(assign_stmt.expr) || expr_returns_borrowed(ctx, assign_stmt.expr)
+    let borrowed_rhs = expr_is_borrowed_copy(assign_stmt.expr)
     let mut lowered = lower_expr(ctx, assign_stmt.expr, prefix + "_assign", idx)
     builder = builder.append(lowered.code)
+    if lowered.typ == "!" {
+        ret builder
+    }
     let op = assignment_op_to_ehir(assign_stmt.operator)
     if op == "" {
         translation_error_at(assign_stmt.target.source_name, assign_stmt.target.line, assign_stmt.target.column,
@@ -6315,8 +6508,7 @@ fn translate_field_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assi
     idx: usize,) -> EhirTextBuilder {
     match assign_stmt.target.value {
         Expr::Field(field_expr) => {
-            let borrowed_rhs = expr_is_borrowed_copy(assign_stmt.expr) || expr_returns_borrowed(ctx,
-                assign_stmt.expr,)
+            let borrowed_rhs = expr_is_borrowed_copy(assign_stmt.expr)
             let root_path = expr_h_frozen_root_path(field_expr.base)
             if strict_thread_capabilities() && !ctx_path_is_mutable(ctx, root_path) {
                 translation_error_at(assign_stmt.target.source_name, assign_stmt.target.line,
@@ -6664,7 +6856,7 @@ fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usiz
                     }
                 }
             }
-            match ctx_enum_variant_owner(ctx, name) {
+            match ctx_enum_variant_owner(ctx, expr.source_name, name) {
                 Option[str]::Some(owner) => {
                     let out_name = prefix + "_enum_" + Debug::fmt(idx)
                     let mut code = EhirTextBuilder::new()
@@ -6998,7 +7190,7 @@ fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode < H >, prefix: str, i
                     }
                 }
             }
-            match ctx_enum_variant_owner(ctx, name) {
+            match ctx_enum_variant_owner(ctx, expr.source_name, name) {
                 Option[str]::Some(owner) => {
                     let out_name = prefix + "_enum_" + Debug::fmt(idx)
                     let mut code = EhirTextBuilder::new()
@@ -7317,6 +7509,7 @@ fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, 
     let saved_cleanups = ctx.with_cleanups
     let saved_self = ctx.self_type
     let saved_return = ctx.return_type
+    let saved_borrowed_return = ctx.return_is_borrowed
     let saved_hint = ctx.expression_hint
     let saved_generics = ctx.active_generics
     let saved_async = ctx.in_async_function
@@ -7328,6 +7521,7 @@ fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, 
     ctx.with_cleanups = Vec[VarType]::new()
     ctx.self_type = closure_type
     ctx.return_type = signature.ret_type
+    ctx.return_is_borrowed = false
     ctx.expression_hint = signature.ret_type
     ctx.active_generics = Vec[GenericParam]::new()
     ctx.in_async_function = false
@@ -7404,6 +7598,7 @@ fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, 
     ctx.with_cleanups = saved_cleanups
     ctx.self_type = saved_self
     ctx.return_type = saved_return
+    ctx.return_is_borrowed = saved_borrowed_return
     ctx.expression_hint = saved_hint
     ctx.active_generics = saved_generics
     ctx.in_async_function = saved_async
@@ -7791,11 +7986,33 @@ fn lower_try_expr(ctx: mut TranslatorContext, inner: ExprNode < H >, source_name
     code = code.instr("cbr " + cond_name + ", $" + ok_label + ", $" + err_label)
     code = code.label(err_label)
     code = code.instr(err_payload + ": " + err_type + " = getfield " + tried.value + " > Err")
+    // Preserve the payload before closing resources and dropping local owners.
+    if ctx_type_needs_ownership(ctx, err_type) {
+        code = code.instr("retain " + err_payload + ": " + err_type)
+    }
     code = code.instr(err_result + ": " + fn_ret_type + " = capenum " + fn_ret_type + "::Err(" + err_payload
         + ")")
-    code = code.instr("ret " + err_result + ": " + fn_ret_type)
+    if !expr_h_is_borrowed_copy(inner) && ctx_type_needs_ownership(ctx, result_type) {
+        code = code.instr("drop " + tried.value + ": " + result_type)
+    }
+    code = code.append(translate_with_cleanups(ctx, prefix + "_try_with_cleanup_" + Debug::fmt(idx)))
+    code = append_owned_drops(ctx, code, "", prefix + "_try_scope_" + Debug::fmt(idx))
+    if ctx.async_poll_future_type != "" {
+        let poll_type = "Poll[" + ctx.async_poll_future_type + ", " + fn_ret_type + "]"
+        let ready_value = err_result + "_ready"
+        code = code.instr(ready_value + ": " + poll_type + " = capenum " + poll_type + "::Ready(" + err_result + ")")
+        code = code.instr("ret " + ready_value + ": " + poll_type)
+    } else {
+        code = code.instr("ret " + err_result + ": " + fn_ret_type)
+    }
     code = code.label(ok_label)
     code = code.instr(ok_payload + ": " + ok_type + " = getfield " + tried.value + " > Ok")
+    if ctx_type_needs_ownership(ctx, ok_type) {
+        code = code.instr("retain " + ok_payload + ": " + ok_type)
+    }
+    if !expr_h_is_borrowed_copy(inner) && ctx_type_needs_ownership(ctx, result_type) {
+        code = code.instr("drop " + tried.value + ": " + result_type)
+    }
     ret LoweredExpr {
         code, ok_payload, ok_type
     }
@@ -8098,6 +8315,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
     if starts_with(callee, "Self::") && ctx.self_type != "" {
         callee = method_owner_name(ctx.self_type) + "::" + callee.slice(6_usize, callee.len() - 6_usize)
     }
+    callee = qualified_callable_name(ctx, source_name, callee)
     let callee_base = base_type_name(callee)
     let mut generic_args = call.generics
     if generic_args.len() == 0_usize {
@@ -8112,6 +8330,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
     let mut arg_frozen_roots = Vec[str]::new()
     let mut arg_is_frozen = Vec[bool]::new()
     let mut arg_borrowed = Vec[bool]::new()
+    let mut call_owners = Vec[CallOwner]::new()
     let mut i = 0_usize
 
     for arg in call.args {
@@ -8138,9 +8357,10 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         let arg_path = expr_path_or_empty(arg)
         let frozen_root = expr_frozen_root_path(arg)
         let expects_borrowed = ends_with(canonical_type(expected), "&")
+        let borrows_self = i == 0_usize && !spawning && ctx_function_borrows_self(ctx, callee_base)
         let mut lowered = if expects_borrowed {
             lower_borrowed_call_argument(ctx, arg,
-                prefix + "_arg_borrow_" + Debug::fmt(idx), idx + i + 1_usize,)
+                prefix + "_arg_borrow_" + Debug::fmt(idx), idx + i + 1_usize, !borrows_self,)
         } elif starts_with(hint, "mut ") {
             lower_mutable_call_argument(ctx, arg,
                 prefix + "_arg_mut_" + Debug::fmt(idx), idx + i + 1_usize,)
@@ -8150,6 +8370,12 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         }
         let argument_is_frozen_now = ctx_path_is_frozen(ctx, frozen_root) ||
         ctx_value_is_frozen(ctx, lowered.value)
+        if lowered.typ == "!" {
+            abandon_call_owners(ctx, call_owners)
+            ret LoweredExpr {
+                code.append(lowered.code), "", "!"
+            }
+        }
         if starts_with(hint, "mut ") {
             if !starts_with(lowered.typ, "mut ") && !argument_is_frozen_now && !expects_borrowed {
                 translation_error_at(
@@ -8184,6 +8410,12 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         arg_frozen_roots.push(frozen_root)
         arg_is_frozen.push(argument_is_frozen_now)
         arg_borrowed.push(borrowed_arg)
+        if (!borrows_self || !borrowed_arg) &&
+        (!starts_with(lowered.typ, "mut ") || expects_borrowed) {
+            track_call_owner(ctx, call_owners, lowered.value, lowered.typ,
+                borrows_self,
+                prefix + "_" + Debug::fmt(idx),)
+        }
         i = i + 1_usize
     }
 
@@ -8306,7 +8538,8 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
     }
     let mut resolved_generic_args = Vec[str]::new()
     for generic_arg in generic_args {
-        resolved_generic_args.push(resolve_async_future_aliases(ctx, source_name, generic_arg))
+        resolved_generic_args.push(qualified_type_for_source(ctx, source_name,
+                resolve_async_future_aliases(ctx, source_name, generic_arg),))
     }
     generic_args = resolved_generic_args
 
@@ -8317,7 +8550,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         }
     }
 
-    match ctx_enum_variant_owner(ctx, callee) {
+    match ctx_enum_variant_owner(ctx, source_name, callee) {
         Option[str]::Some(owner) => {
             let mut canonical_owner = resolve_async_future_aliases(ctx, source_name, owner)
             if generic_args_from_path(canonical_owner).len() == 0_usize && ctx.expression_hint != ""
@@ -8327,8 +8560,17 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
                 }
             }
             let variant = enum_variant_name(callee)
+            // Unit has no SSA register. Preserve its type for enum lowering
+            // instead of emitting an untyped reference to a register named void.
+            if arg_types.len() == 1_usize {
+                let payload_type = arg_types.get(0_usize).unwrap_or("")
+                if payload_type == "()" || payload_type == "void" {
+                    arg_values.set(0_usize, "void: ()")
+                }
+            }
             code = code.instr(out_name + ": " + canonical_owner + " = capenum " + canonical_owner + "::"
                 + variant + "(" + join_strs(arg_values, ", ") + ")")
+            code = finish_call_owners(ctx, code, call_owners, out_name, false)
             ret LoweredExpr {
                 code, out_name, canonical_owner
             }
@@ -8392,7 +8634,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
                 ret_type = canonical_type(found)
             }
             Option[str]::None => {
-                ret_type = canonical_type(static_call_return_type(dispatch_callee))
+                ret_type = qualified_type_for_source(ctx, source_name, static_call_return_type(dispatch_callee))
             }
         }
     }
@@ -8443,6 +8685,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         let handle_type = "JoinHandle[" + ret_type + "]"
         code = code.instr(out_name + ": " + handle_type + " = call __encore_thread_spawn__" + emitted_callee
             + "(" + join_strs(arg_values, ", ") + ")")
+        code = finish_call_owners(ctx, code, call_owners, out_name, false)
         if result_is_frozen {
             ctx_mark_value_frozen(ctx, out_name)
         }
@@ -8450,8 +8693,10 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
             code, out_name, handle_type
         }
     }
+    code = protect_call_result_inputs(ctx, code, call_owners, semantic_dispatch_base)
     code = code.instr(out_name + ": " + ret_type + " = call " + emitted_callee + "(" + join_strs(arg_values,
             ", ",) + ")")
+    code = own_call_result(ctx, code, semantic_dispatch_base, out_name, ret_type)
     match direct_function {
         Some(function) => {
             if function.returns_frozen && !thread_type_is_send(ctx, ret_type, Vec[str]::new()) {
@@ -8461,27 +8706,8 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         None => {
         }
     }
-    if ctx_function_is_extern(ctx, dispatch_base) {
-        let mut drop_index = 0_usize
-        while drop_index < arg_values.len() && drop_index < arg_types.len() {
-            match arg_values.get(drop_index) {
-                Some(arg_value) => {
-                    match arg_types.get(drop_index) {
-                        Some(arg_type) => {
-                            if ctx_type_needs_ownership(ctx, arg_type) {
-                                code = code.instr("drop " + arg_value + ": " + arg_type)
-                            }
-                        }
-                        None => {
-                        }
-                    }
-                }
-                None => {
-                }
-            }
-            drop_index = drop_index + 1_usize
-        }
-    }
+    code = finish_call_owners(ctx, code, call_owners, out_name,
+        ctx_function_is_extern(ctx, dispatch_base) || ctx_function_returns_borrowed(ctx, semantic_dispatch_base),)
     ret LoweredExpr {
         code, out_name, ret_type
     }
@@ -9186,6 +9412,9 @@ fn lower_array_literal_expr(ctx: mut TranslatorContext, array_expr: ArrayLiteral
     for item in array_expr.items {
         let lowered = lower_expr(ctx, item, prefix + "_array_item", idx + count + 1_usize)
         code = code.append(lowered.code)
+        if expr_is_borrowed_copy(item) && ctx_type_needs_ownership(ctx, lowered.typ) {
+            code = code.instr("retain " + lowered.value + ": " + lowered.typ)
+        }
         values.push(lowered.value)
         if count == 0_usize {
             item_type = canonical_type(lowered.typ)
@@ -9215,6 +9444,11 @@ fn lower_vec_literal_expr(ctx: mut TranslatorContext, vec_expr: ArrayLiteralExpr
     for item in vec_expr.items {
         let lowered = lower_expr(ctx, item, prefix + "_vec_item", idx + item_index + 1_usize)
         code = code.append(lowered.code)
+        // push consumes its value parameter, just like an ordinary call.
+        // A literal element projected from existing storage needs a new owner.
+        if expr_is_borrowed_copy(item) && ctx_type_needs_ownership(ctx, lowered.typ) {
+            code = code.instr("retain " + lowered.value + ": " + lowered.typ)
+        }
         if item_index == 0_usize {
             item_type = canonical_type(lowered.typ)
         }
@@ -9227,7 +9461,7 @@ fn lower_vec_literal_expr(ctx: mut TranslatorContext, vec_expr: ArrayLiteralExpr
     let out_name = prefix + "_vec_" + Debug::fmt(idx)
     code = code.instr(initial + ": " + vec_type + " = call Vec::new[" + item_type + "]()")
     code = code.instr(storage + ": " + vec_type + "* = salloc " + vec_type)
-    code = code.instr("store " + initial + ", " + storage)
+    code = store_transferred_value(ctx, code, initial, vec_type, storage)
     let mut push_index = 0_usize
     for value in values {
         code = code.instr(prefix + "_vec_push_" + Debug::fmt(idx) + "_" + Debug::fmt(push_index) + ": () = call Vec::push["
@@ -9253,6 +9487,22 @@ fn lower_array_repeat_expr(ctx: mut TranslatorContext, repeat_expr: ArrayRepeatE
     let array_type = "__array_" + Debug::fmt(count) + "[" + canonical_type(item.typ) + "]"
     let out_name = prefix + "_array_repeat_" + Debug::fmt(idx)
     let mut code = item.code
+    if ctx_type_needs_ownership(ctx, item.typ) {
+        // Each array element owns a copy. A produced initializer transfers its
+        // first owner; a borrowed initializer must acquire every element owner.
+        let mut retained = if expr_h_is_borrowed_copy(repeat_expr.value) {
+            0_usize
+        } else {
+            1_usize
+        }
+        while retained < count {
+            code = code.instr("retain " + item.value + ": " + item.typ)
+            retained += 1_usize
+        }
+        if count == 0_usize && retained == 1_usize {
+            code = code.instr("drop " + item.value + ": " + item.typ)
+        }
+    }
     code = code.instr(out_name + ": " + array_type + " = capstruct " + array_type + "(" + join_strs(values,
             ", ",) + ")")
     ret LoweredExpr {
@@ -9298,6 +9548,12 @@ fn lower_field_expr(ctx: mut TranslatorContext, field_expr: FieldExpr, source_na
     let mut code = base.code
     code = code.instr(out_name + ": " + field_type + " = getfield " + base.value + " > " + ctx_lookup_field_index(ctx,
             base.typ, field_expr.field,))
+    if !expr_h_is_borrowed_copy(field_expr.base) && ctx_type_needs_ownership(ctx, base.typ) {
+        if ctx_type_needs_ownership(ctx, field_type) {
+            code = code.instr("retain " + out_name + ": " + field_type)
+        }
+        code = code.instr("drop " + base.value + ": " + base.typ)
+    }
     if base_is_frozen && !thread_type_is_send(ctx, field_type, Vec[str]::new()) {
         ctx_mark_value_frozen(ctx, out_name)
     }
@@ -9334,6 +9590,12 @@ fn lower_index_expr(ctx: mut TranslatorContext, index_expr: IndexExpr, source_na
     let out_name = prefix + "_index_" + Debug::fmt(idx)
     let mut code = base.code
     code = code.instr(out_name + ": " + field_type + " = getfield " + base.value + " > " + field)
+    if !expr_h_is_borrowed_copy(index_expr.base) && ctx_type_needs_ownership(ctx, base.typ) {
+        if ctx_type_needs_ownership(ctx, field_type) {
+            code = code.instr("retain " + out_name + ": " + field_type)
+        }
+        code = code.instr("drop " + base.value + ": " + base.typ)
+    }
     if base_is_frozen && !thread_type_is_send(ctx, field_type, Vec[str]::new()) {
         ctx_mark_value_frozen(ctx, out_name)
     }
@@ -9347,6 +9609,9 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     let receiver_path = expr_h_path_or_empty(method_call.receiver)
     let receiver_root = expr_h_frozen_root_path(method_call.receiver)
     let receiver = lower_method_receiver(ctx, method_call.receiver, prefix + "_recv", idx + 1_usize)
+    if receiver.typ == "!" {
+        ret receiver
+    }
     if base_type_name(receiver.typ) == "JoinHandle" && method_call.method == "join" {
         if method_call.args.len() != 0_usize || method_call.generics.len() != 0_usize {
             translation_error_at(source_name, line, column, "invalid-join-call", "JoinHandle::join takes no arguments")
@@ -9446,7 +9711,12 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     let mut receiver_was_loaded = false
     let mut receiver_uses_temporary_storage = false
     let mut receiver_expects_borrow = false
-    let receiver_value_type = value_type_name(receiver.typ)
+    let mut call_owners = Vec[CallOwner]::new()
+    let receiver_value_type = if starts_with(receiver.typ, "mut ") {
+        receiver.typ.slice(4_usize, receiver.typ.len() - 4_usize)
+    } else {
+        receiver.typ
+    }
     let mut receiver_param = ctx_lookup_function_param(ctx, source_name, fn_name, 0_usize, concrete_generics)
     match receiver_param {
         None => {
@@ -9479,7 +9749,7 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
                     receiver_value = loaded_receiver
                     receiver_was_loaded = true
                 }
-                if borrowed_receiver {
+                if borrowed_receiver && !ctx_function_borrows_self(ctx, fn_name) {
                     code = code.instr("retain " + receiver_value + ": " + concrete_receiver_type)
                 }
                 if !ends_with(concrete_receiver_type, "&") {
@@ -9501,12 +9771,14 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
                 }
                 let storage_name = prefix + "_recv_storage_" + Debug::fmt(idx)
                 code = code.instr(storage_name + ": " + receiver.typ + "* = salloc " + receiver.typ)
-                code = code.instr("store " + receiver.value + ", " + storage_name)
-                // The receiver's owned value is moved into the temporary
-                // mutable slot.  Its single cleanup below releases that
-                // ownership after the call.  Dropping the SSA value here as
-                // well releases the same root twice (most visibly when the
-                // receiver was loaded from an owned aggregate field).
+                if borrowed_receiver {
+                    code = code.instr("store " + receiver.value + ", " + storage_name)
+                } else {
+                    code = store_transferred_value(ctx, code, receiver.value, receiver.typ, storage_name)
+                }
+                // The slot owns its retained value until post-call cleanup.
+                // A borrowed receiver retains its original owner; a fresh
+                // receiver transfers that owner into this temporary slot.
                 receiver_value = storage_name
                 receiver_uses_temporary_storage = true
             }
@@ -9537,6 +9809,21 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     capability_frozen.push(receiver_is_frozen)
     capability_borrowed.push(borrowed_receiver)
 
+    let borrows_self = ctx_function_borrows_self(ctx, fn_name)
+    if receiver_uses_temporary_storage {
+        track_call_owner(ctx, call_owners, receiver_value, "mut " + receiver_value_type,
+            true, prefix + "_" + Debug::fmt(idx),)
+    } elif (!borrows_self || !borrowed_receiver) &&
+    (receiver_was_loaded || !starts_with(receiver.typ, "mut ") || receiver_expects_borrow) {
+        let cleanup_type = if receiver_expects_borrow {
+            value_type_name(receiver.typ) + "&"
+        } else {
+            receiver_value_type
+        }
+        track_call_owner(ctx, call_owners, receiver_value, cleanup_type,
+            borrows_self, prefix + "_" + Debug::fmt(idx),)
+    }
+
     let mut i = 0_usize
     for arg in method_call.args {
         let borrowed_arg = expr_is_borrowed_copy(arg)
@@ -9552,7 +9839,7 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         }
         let lowered = if ends_with(canonical_type(expected), "&") {
             lower_borrowed_call_argument(ctx, arg,
-                prefix + "_method_arg_borrow_" + Debug::fmt(idx), idx + i + 2_usize,)
+                prefix + "_method_arg_borrow_" + Debug::fmt(idx), idx + i + 2_usize, true,)
         } elif starts_with(expected, "mut ") {
             lower_mutable_call_argument(ctx, arg,
                 prefix + "_method_arg_mut_" + Debug::fmt(idx), idx + i + 2_usize,)
@@ -9562,6 +9849,12 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         }
         let argument_is_frozen_now = ctx_path_is_frozen(ctx, frozen_root) ||
         ctx_value_is_frozen(ctx, lowered.value)
+        if lowered.typ == "!" {
+            abandon_call_owners(ctx, call_owners)
+            ret LoweredExpr {
+                code.append(lowered.code), "", "!"
+            }
+        }
         if starts_with(expected, "mut ") && !starts_with(lowered.typ, "mut ") &&
         !argument_is_frozen_now && !ends_with(canonical_type(expected), "&") {
             translation_error_at(
@@ -9591,6 +9884,10 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         capability_roots.push(frozen_root)
         capability_frozen.push(argument_is_frozen_now)
         capability_borrowed.push(borrowed_arg)
+        if !starts_with(lowered.typ, "mut ") || ends_with(canonical_type(expected), "&") {
+            track_call_owner(ctx, call_owners, lowered.value, lowered.typ,
+                false, prefix + "_" + Debug::fmt(idx),)
+        }
         i = i + 1_usize
     }
 
@@ -9704,16 +10001,15 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     if concrete_generics.len() > 0_usize {
         emitted_name = emitted_name + "[" + join_strs(concrete_generics, ", ") + "]"
     }
+    code = protect_call_result_inputs(ctx, code, call_owners, fn_name)
     code = code.instr(out_name + ": " + ret_type + " = call " + emitted_name + "(" + join_strs(args,
             ", ",) + ")")
+    code = own_call_result(ctx, code, fn_name, out_name, ret_type)
     if receiver_is_frozen && !thread_type_is_send(ctx, ret_type, Vec[str]::new()) {
         ctx_mark_value_frozen(ctx, out_name)
     }
-    if receiver_uses_temporary_storage && ctx_type_needs_ownership(ctx, receiver_value_type) {
-        let cleanup_name = prefix + "_recv_cleanup_" + Debug::fmt(idx)
-        code = code.instr(cleanup_name + ": " + receiver_value_type + " = load " + receiver_value)
-        code = code.instr("drop " + cleanup_name + ": " + receiver_value_type)
-    }
+    code = finish_call_owners(ctx, code, call_owners, out_name,
+        ctx_function_is_extern(ctx, fn_name) || ctx_function_returns_borrowed(ctx, fn_name),)
     ret LoweredExpr {
         code, out_name, ret_type
     }
@@ -9867,7 +10163,7 @@ fn lower_mutable_call_argument(ctx: mut TranslatorContext, expr: ExprNode,
 }
 
 fn lower_borrowed_call_argument(ctx: mut TranslatorContext, expr: ExprNode,
-    prefix: str, idx: usize,) -> LoweredExpr {
+    prefix: str, idx: usize, acquires_owner: bool,) -> LoweredExpr {
     let source_name = expr.source_name
     let source_line = expr.line
     let source_column = expr.column
@@ -9896,7 +10192,7 @@ fn lower_borrowed_call_argument(ctx: mut TranslatorContext, expr: ExprNode,
         )
     }
 
-    if copies_existing_owner {
+    if copies_existing_owner && acquires_owner {
         code = code.instr("retain " + lowered_value + ": " + lowered_type)
     }
     if ends_with(lowered_type, "&") {
@@ -9921,11 +10217,11 @@ LoweredExpr {
             match ctx_lookup_var(ctx, name) {
                 Option[str]::Some(found) => {
                     if is_mutable_handle_slot(found) {
-                        let handle_type = mutable_handle_slot_type(found)
-                        let out = prefix + "_handle_ptr_" + Debug::fmt(idx)
-                        let code = EhirTextBuilder::new().instr(out + ": " + handle_type +
-                            "* = pcast " + ctx_lookup_value_name(ctx, name) + ": usize*, " +
-                            handle_type + "*",)
+                        let node = lower_expr_h(ctx, expr, prefix, idx)
+                        let handle_type = value_type_name(node.typ) + "&"
+                        let out = prefix + "_node_any_" + Debug::fmt(idx)
+                        let code = node.code.instr(out + ": " + handle_type + " = pcast " +
+                            node.value + ": " + node.typ + ", " + handle_type)
                         ret LoweredExpr {
                             code, out, "mut " + handle_type
                         }
@@ -10009,6 +10305,20 @@ fn lower_mutable_field_place(ctx: mut TranslatorContext, field_expr: FieldExpr,
                 "type '" + owner_type + "' has no field '" + field_expr.field + "'",)
         }
     }
+    if is_node_handle_type_text(field_type) {
+        // A node field contains a handle, not an inline aggregate. Project
+        // through that handle without inventing an unrepresentable T<H>*
+        // pointer-to-handle type. The mutable root keeps the node alive.
+        let node = prefix + "_node_handle_" + Debug::fmt(idx)
+        let erased = prefix + "_node_any_" + Debug::fmt(idx)
+        let erased_type = value_type_name(field_type) + "&"
+        let code = base.code.instr(node + ": " + field_type + " = getfield " +
+            base.value + " > " + ctx_lookup_field_index(ctx, owner_type, field_expr.field))
+        .instr(erased + ": " + erased_type + " = pcast " + node + ": " + field_type + ", " + erased_type)
+        ret LoweredExpr {
+            code, erased, "mut " + erased_type
+        }
+    }
     let out_name = prefix + "_field_ptr_" + Debug::fmt(idx)
     let code = base.code.instr(out_name + ": " + field_type + "* = getfieldptr " +
         base.value + " > " + ctx_lookup_field_index(ctx, owner_type, field_expr.field),)
@@ -10037,7 +10347,7 @@ fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, source_na
         let body_label = prefix + "_match_expr_body_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx)
         let fail_label = prefix + "_match_expr_next_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx +
             1_usize)
-        let test = lower_match_pattern_test(cond.value, cond.typ, arm.pattern, source_name, line, column,
+        let test = lower_match_pattern_test(ctx, cond.value, cond.typ, arm.pattern, source_name, line, column,
             prefix, idx, arm_idx,)
         builder = builder.append(test.code)
         if test.is_always_true {
@@ -10169,6 +10479,13 @@ fn lower_block_expr(ctx: mut TranslatorContext, block_expr: BlockExpr, prefix: s
         Option[str]::None,
         Option[str]::None,
     )
+    for statement in block_expr.statements {
+        if statement_terminates_flow(statement) {
+            ret LoweredExpr {
+                builder, "", "!"
+            }
+        }
+    }
     match block_expr.tail {
         Option[ExprNode < H >]::Some(tail_expr) => {
             let tail = lower_expr_h(ctx, tail_expr, prefix + "_block_tail", idx + 1_usize)
@@ -10446,7 +10763,7 @@ fn translate_match_stmt(
         translation_error_at(match_stmt.expr.source_name, match_stmt.expr.line, match_stmt.expr.column,
             "non-exhaustive-match", "non-exhaustive match for enum '" + base_type_name(cond.typ) + "'",)
     }
-    let all_arms_return = match_stmt_always_returns(match_stmt)
+    let all_arms_terminate = match_stmt_terminates_flow(match_stmt)
     let outer_owned = ctx.owned_vars.len()
     let mut arm_idx = 0_usize
     for arm in match_stmt.arms {
@@ -10456,7 +10773,7 @@ fn translate_match_stmt(
         if is_exhaustive && is_last_arm {
             builder = builder.instr("br $" + body_label)
         } else {
-            let test = lower_match_pattern_test(cond.value, cond.typ, arm.pattern, match_stmt.expr.source_name,
+            let test = lower_match_pattern_test(ctx, cond.value, cond.typ, arm.pattern, match_stmt.expr.source_name,
                 match_stmt.expr.line, match_stmt.expr.column, prefix, idx, arm_idx,)
             builder = builder.append(test.code)
             if test.is_always_true {
@@ -10502,7 +10819,7 @@ fn translate_match_stmt(
         }
         builder = builder.instr("br $" + end_label)
     }
-    if !(is_exhaustive && all_arms_return) {
+    if !(is_exhaustive && all_arms_terminate) {
         builder = builder.label(end_label)
     }
     ret builder
@@ -10554,8 +10871,8 @@ fn match_arm_terminates_flow(arm: ParsedMatchArm) -> bool {
 
 fn block_always_returns(block: ParsedBlock) -> bool {
     for stmt in block.statements {
-        if statement_always_returns(stmt) {
-            ret true
+        if statement_terminates_flow(stmt) {
+            ret statement_always_returns(stmt)
         }
     }
     ret false
@@ -10572,6 +10889,15 @@ fn block_terminates_flow(block: ParsedBlock) -> bool {
 
 fn statement_terminates_flow(stmt: Statement) -> bool {
     match stmt {
+        Statement::Expr(expr) => {
+            ret expression_terminates_flow(expr.value)
+        }
+        Statement::Let(binding) => {
+            ret expression_terminates_flow(binding.expr.value)
+        }
+        Statement::Assignment(assignment) => {
+            ret expression_terminates_flow(assignment.expr.value)
+        }
         Statement::Ret(_) => {
             ret true
         }
@@ -10582,10 +10908,72 @@ fn statement_terminates_flow(stmt: Statement) -> bool {
             ret true
         }
         Statement::Match(match_stmt) => {
-            ret match_stmt_always_returns(match_stmt)
+            ret match_stmt_terminates_flow(match_stmt)
         }
         Statement::If(if_stmt) => {
-            ret if_stmt_always_returns(if_stmt)
+            for branch in if_stmt.branches {
+                if !block_terminates_flow(branch.body) {
+                    ret false
+                }
+            }
+            match if_stmt.else_body {
+                Some(block) => {
+                    ret block_terminates_flow(block)
+                }
+                None => {
+                }
+            }
+        }
+        Statement::With(with_stmt) => {
+            ret block_terminates_flow(with_stmt.body)
+        }
+        Statement::Unsafe(block) => {
+            ret block_terminates_flow(block)
+        }
+        _ => {
+        }
+    }
+    ret false
+}
+
+// A call cannot complete when evaluating an operand leaves the enclosing
+// flow. In particular, do not synthesize a default return after an operand's
+// explicit return, or append dead stores after its cleanup edge.
+fn expression_terminates_flow(value: Expr) -> bool {
+    match value {
+        Expr::Call(call) => {
+            for argument in call.args {
+                if expression_terminates_flow(argument.value) {
+                    ret true
+                }
+            }
+        }
+        Expr::MethodCall(call) => {
+            if expression_terminates_flow(call.receiver.value) {
+                ret true
+            }
+            for argument in call.args {
+                if expression_terminates_flow(argument.value) {
+                    ret true
+                }
+            }
+        }
+        Expr::Block(block) => {
+            for statement in block.statements {
+                if statement_terminates_flow(statement) {
+                    ret true
+                }
+            }
+            match block.tail {
+                Some(tail) => {
+                    ret expression_terminates_flow(tail.value)
+                }
+                None => {
+                }
+            }
+        }
+        Expr::Parenthesized(inner) => {
+            ret expression_terminates_flow(inner.value)
         }
         _ => {
         }
@@ -10604,10 +10992,28 @@ fn statement_always_returns(stmt: Statement) -> bool {
         Statement::If(if_stmt) => {
             ret if_stmt_always_returns(if_stmt)
         }
+        Statement::With(with_stmt) => {
+            ret block_always_returns(with_stmt.body)
+        }
+        Statement::Unsafe(block) => {
+            ret block_always_returns(block)
+        }
         _ => {
         }
     }
     ret false
+}
+
+fn match_stmt_terminates_flow(match_stmt: MatchStmt) -> bool {
+    if match_stmt.arms.len() == 0_usize {
+        ret false
+    }
+    for arm in match_stmt.arms {
+        if !match_arm_terminates_flow(arm) {
+            ret false
+        }
+    }
+    ret true
 }
 
 fn match_stmt_always_returns(match_stmt: MatchStmt) -> bool {
@@ -10767,6 +11173,7 @@ struct LoweredPatternTest {
 }
 
 fn lower_match_pattern_test(
+    ctx: mut TranslatorContext,
     subject_value: str,
     subject_typ: str,
     pattern: MatchPattern,
@@ -10830,6 +11237,16 @@ fn lower_match_pattern_test(
                 let mut rhs = value
                 if is_enum_variant_path(value) {
                     rhs = enum_variant_name(value)
+                }
+                // Match the variant of the resolved subject enum. Qualified
+                // collision identities start with '__', and must not leak
+                // into EHIR's unqualified variant-tag operand.
+                for item in ctx.enum_variants {
+                    if item.owner == base_type_name(subject_typ) &&
+                    enum_variant_name(item.path) == enum_variant_name(value) {
+                        rhs = enum_variant_name(value)
+                        break
+                    }
                 }
                 code = code.instr(cond_name + " = ieq " + subject_value + ", " + rhs)
                 ret LoweredPatternTest {
@@ -10994,7 +11411,7 @@ fn translate_while_stmt(ctx: mut TranslatorContext, while_stmt: WhileStmt, ret_t
     builder = builder.label(body_label)
     let loop_target_count = ctx.loop_targets.len()
     ctx.loop_targets.push(LoopTargetType {
-            loop_label_name(while_stmt.label), end_label, cond_label, outer_owned
+            loop_label_name(while_stmt.label), end_label, cond_label, outer_owned, ctx.with_cleanups.len()
         }
         ,
     )
@@ -11031,7 +11448,7 @@ fn translate_loop_stmt(ctx: mut TranslatorContext, loop_stmt: LoopStmt, ret_type
     builder = builder.label(body_label)
     let loop_target_count = ctx.loop_targets.len()
     ctx.loop_targets.push(LoopTargetType {
-            loop_label_name(loop_stmt.label), end_label, body_label, outer_owned
+            loop_label_name(loop_stmt.label), end_label, body_label, outer_owned, ctx.with_cleanups.len()
         }
         ,
     )
@@ -11070,7 +11487,7 @@ fn translate_do_while_stmt(ctx: mut TranslatorContext, do_stmt: DoWhileStmt, ret
     builder = builder.label(body_label)
     let loop_target_count = ctx.loop_targets.len()
     ctx.loop_targets.push(LoopTargetType {
-            "", end_label, cond_label, outer_owned
+            "", end_label, cond_label, outer_owned, ctx.with_cleanups.len()
         }
         ,
     )
@@ -11101,9 +11518,13 @@ fn translate_do_while_stmt(ctx: mut TranslatorContext, do_stmt: DoWhileStmt, ret
 }
 
 fn translate_with_cleanups(ctx: mut TranslatorContext, prefix: str) -> EhirTextBuilder {
+    ret translate_with_cleanups_from(ctx, prefix, 0_usize)
+}
+
+fn translate_with_cleanups_from(ctx: mut TranslatorContext, prefix: str, start: usize) -> EhirTextBuilder {
     let mut builder = EhirTextBuilder::new()
     let mut index = ctx.with_cleanups.len()
-    while index > 0_usize {
+    while index > start {
         index = index - 1_usize
         match ctx.with_cleanups.get(index) {
             Some(resource) => {
@@ -11124,6 +11545,12 @@ fn translate_with_stmt(ctx: mut TranslatorContext, with_stmt: WithStmt, ret_type
     let resource_type = value_type_name(source.typ)
     let resource_name = prefix + "_with_resource_" + with_stmt.name + "_" + Debug::fmt(idx)
     let mut builder = source.code
+    // with_enter consumes its argument, just like an ordinary value call.
+    // A named resource must remain valid after the context has closed.
+    if expr_is_borrowed_copy(with_stmt.expr) &&
+    ctx_type_needs_ownership(ctx, resource_type) {
+        builder = builder.instr("retain " + source.value + ": " + resource_type)
+    }
     builder = builder.instr(resource_name + ": " + resource_type + " = call " + method_owner_name(resource_type)
         + "::with_enter(" + source.value + ")")
     ctx_add_var_emitted(ctx, with_stmt.name, resource_name, resource_type)
@@ -11152,7 +11579,7 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     let end_label = iter_prefix + "_end"
     let exhausted_label = iter_prefix + "_exhausted"
     let iter_slot = iter_prefix + "_iter_slot"
-    let iter_value_name = iter_prefix + "_iter"
+    let mut iter_value_name = iter_prefix + "_iter"
     let step_name = iter_prefix + "_step"
     let next_iter_name = iter_prefix + "_next_iter"
     let option_name = iter_prefix + "_option"
@@ -11162,10 +11589,16 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     let borrowed_iterable = expr_is_borrowed_copy(for_stmt.iterable)
     let iterable = load_mutable_value(lower_expr(ctx, for_stmt.iterable, iter_prefix + "_source", idx),
         iter_prefix + "_source_load",)
-    let iter_type = iterator_type_for(iterable.typ, for_stmt.iterable.source_name, for_stmt.iterable.line,
+    let iter_type = iterator_type_for(ctx, iterable.typ, for_stmt.iterable.source_name, for_stmt.iterable.line,
         for_stmt.iterable.column,)
-    let item_type = iterator_item_type(iter_type, for_stmt.iterable.source_name, for_stmt.iterable.line,
+    let item_type = iterator_item_type(ctx, iter_type, for_stmt.iterable.source_name, for_stmt.iterable.line,
         for_stmt.iterable.column,)
+    let declared_item = iterator_declared_item(ctx, iterable.typ, "IntoIterator")
+    if declared_item != "" && canonical_type(declared_item) != canonical_type(item_type) {
+        translation_error_at(for_stmt.iterable.source_name, for_stmt.iterable.line, for_stmt.iterable.column,
+            "iterator-item-mismatch", "IntoIterator item '" + declared_item
+            + "' differs from Iterator item '" + item_type + "'",)
+    }
     let option_type = "Option[" + item_type + "]"
     let step_type = "__tuple_2[" + iter_type + ", " + option_type + "]"
 
@@ -11180,11 +11613,21 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     } else {
         "[" + join_strs(iter_generics, ", ") + "]"
     }
-    builder = builder.instr(iter_value_name + ": " + iter_type + " = call " + iterator_iter_function(iterable.typ,
-            for_stmt.iterable.source_name, for_stmt.iterable.line, for_stmt.iterable.column,) + generic_suffix
-        + "(" + iterable.value + ")")
+    let into_function = iterator_iter_function(ctx, iterable.typ)
+    if into_function == "" {
+        iter_value_name = iterable.value
+    } else {
+        let source_generics = generic_args_from_path(iterable.typ)
+        let source_suffix = if source_generics.len() == 0_usize {
+            ""
+        } else {
+            "[" + join_strs(source_generics, ", ") + "]"
+        }
+        builder = builder.instr(iter_value_name + ": " + iter_type + " = call " + into_function
+            + source_suffix + "(" + iterable.value + ")")
+    }
     builder = builder.instr(iter_slot + ": " + iter_type + "* = salloc " + iter_type)
-    builder = builder.instr("store " + iter_value_name + ", " + iter_slot)
+    builder = store_transferred_value(ctx, builder, iter_value_name, iter_type, iter_slot)
     if ctx_type_needs_ownership(ctx, iter_type) {
         ctx_add_owned_var(ctx, iter_prefix + "_iterator", iter_slot, "mut " + iter_type)
     }
@@ -11192,11 +11635,12 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     builder = builder.instr("br $" + body_label)
     builder = builder.label(body_label)
     builder = builder.instr(iter_value_name + "_current: " + iter_type + " = load " + iter_slot)
-    builder = builder.instr(step_name + ": " + step_type + " = call " + iterator_next_function(iter_type,
-            for_stmt.iterable.source_name, for_stmt.iterable.line, for_stmt.iterable.column,) + generic_suffix
+    builder = builder.instr(step_name + ": " + step_type + " = call " + iterator_next_function(iter_type) + generic_suffix
         + "(" + iter_value_name + "_current)")
     builder = builder.instr(next_iter_name + ": " + iter_type + " = getfield " + step_name + " > 0")
-    builder = builder.instr("store " + next_iter_name + ", " + iter_slot)
+    // next consumes the old iterator and returns (iterator, option). Transfer
+    // only its first field here: dropping the tuple would invalidate option.
+    builder = store_transferred_value(ctx, builder, next_iter_name, iter_type, iter_slot)
     builder = builder.instr(option_name + ": " + option_type + " = getfield " + step_name + " > 1")
     builder = builder.instr("match " + option_name + ", $" + exhausted_label + " {")
     builder = builder.instr("Some -> $" + body_label + "_some")
@@ -11212,7 +11656,7 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     builder = builder.instr("drop " + option_name + ": " + option_type)
     let loop_target_count = ctx.loop_targets.len()
     ctx.loop_targets.push(LoopTargetType {
-            loop_label_name(for_stmt.label), end_label, body_label, body_owned
+            loop_label_name(for_stmt.label), end_label, body_label, body_owned, ctx.with_cleanups.len()
         }
         ,
     )
@@ -11248,73 +11692,93 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     ret builder
 }
 
-fn iterator_type_for(iterable_type: str, source_name: str, line: usize, column: usize) -> str {
-    let owner = method_owner_name(iterable_type)
-    if owner == "Vec" {
-        ret "VecIter[" + first_generic_type(iterable_type) + "]"
+fn iterator_declared_item(ctx: mut TranslatorContext, receiver: str, trait_name: str) -> str {
+    for generic in ctx.active_generics {
+        if generic.name == receiver {
+            for bound in generic.bounds {
+                if base_type_name(bound.path) == trait_name {
+                    ret bound.args.get(0_usize).unwrap_or("")
+                }
+            }
+        }
     }
-    if owner == "VecIter" {
-        ret iterable_type
+    for implementation in ctx.trait_impls {
+        if base_type_name(implementation.trait_name) == trait_name &&
+        trait_impl_target_matches(ctx, implementation, receiver) {
+            let mut arguments = Vec[str]::new()
+            for generic in implementation.generics {
+                arguments.push(infer_generic_from_types(implementation.target, receiver, generic.name))
+            }
+            ret specialize_named_type(implementation.trait_args.get(0_usize).unwrap_or(""),
+                generic_param_names(implementation.generics), arguments,)
+        }
     }
-    if owner == "Range" {
-        ret "Range"
-    }
-    if owner == "Enumerate" {
-        ret iterable_type
-    }
-    translation_error_at(source_name, line, column, "not-iterable", "type '" + iterable_type + "' cannot be iterated")
-    ret "void"
-}
-
-fn iterator_item_type(iter_type: str, source_name: str, line: usize, column: usize) -> str {
-    let owner = method_owner_name(iter_type)
-    if owner == "VecIter" {
-        ret first_generic_type(iter_type)
-    }
-    if owner == "Range" {
-        ret "usize"
-    }
-    if owner == "Enumerate" {
-        ret "__tuple_2[usize, " + nth_generic_type(iter_type, 0_usize) + "]"
-    }
-    translation_error_at(source_name, line, column, "invalid-iterator", "cannot resolve item type for iterator '"
-        + iter_type + "'",)
-    ret "void"
-}
-
-fn iterator_iter_function(iterable_type: str, source_name: str, line: usize, column: usize) -> str {
-    let owner = method_owner_name(iterable_type)
-    if owner == "Vec" {
-        ret "Vec::iter"
-    }
-    if owner == "VecIter" {
-        ret "VecIter::iter"
-    }
-    if owner == "Range" {
-        ret "Range::iter"
-    }
-    if owner == "Enumerate" {
-        ret "Enumerate::iter"
-    }
-    translation_error_at(source_name, line, column, "invalid-iterator", "cannot resolve iter function for type '"
-        + iterable_type + "'",)
     ret ""
 }
 
-fn iterator_next_function(iter_type: str, source_name: str, line: usize, column: usize) -> str {
-    let owner = method_owner_name(iter_type)
-    if owner == "VecIter" {
-        ret "VecIter::next"
+fn iterator_method_return(ctx: mut TranslatorContext, receiver: str, method: str,
+    source_name: str, line: usize, column: usize,) -> str {
+    let owner = method_owner_name(receiver)
+    let name = owner + "::" + method
+    match ctx_lookup_function(ctx, name) {
+        Some(found) => {
+            ret canonical_type(specialize_function_return(ctx, name, generic_args_from_path(receiver), found))
+        }
+        None => {
+            match generic_bound_method_return(ctx, owner, method) {
+                Some(found) => {
+                    ret canonical_type(found)
+                }
+                None => {
+                }
+            }
+        }
     }
-    if owner == "Range" {
-        ret "Range::next"
+    translation_error_at(source_name, line, column, "invalid-iterator",
+        "cannot resolve '" + method + "' for '" + receiver + "'",)
+    ret "void"
+}
+
+fn iterator_type_for(ctx: mut TranslatorContext, iterable_type: str, source_name: str, line: usize, column: usize) -> str {
+    if type_satisfies_trait_bound(ctx, ctx.active_generics, iterable_type, "IntoIterator") {
+        ret iterator_method_return(ctx, iterable_type, "into_iter", source_name, line, column)
     }
-    if owner == "Enumerate" {
-        ret "Enumerate::next"
+    if type_satisfies_trait_bound(ctx, ctx.active_generics, iterable_type, "Iterator") {
+        ret iterable_type
     }
-    translation_error_at(source_name, line, column, "invalid-iterator", "cannot resolve next function for iterator '"
-        + iter_type + "'",)
+    translation_error_at(source_name, line, column, "not-iterable",
+        "type '" + iterable_type + "' must implement IntoIterator or Iterator",)
+    ret "void"
+}
+
+fn iterator_item_type(ctx: mut TranslatorContext, iter_type: str, source_name: str, line: usize, column: usize) -> str {
+    if !type_satisfies_trait_bound(ctx, ctx.active_generics, iter_type, "Iterator") {
+        translation_error_at(source_name, line, column, "invalid-iterator",
+            "IntoIterator must return a type implementing Iterator, got '" + iter_type + "'",)
+    }
+    let step = iterator_method_return(ctx, iter_type, "next", source_name, line, column)
+    let args = generic_args_from_path(step)
+    if base_type_name(step) == "__tuple_2" && args.len() == 2_usize {
+        let next_type = nth_generic_type(step, 0_usize)
+        let option = nth_generic_type(step, 1_usize)
+        if canonical_type(next_type) == canonical_type(iter_type) && base_type_name(option) == "Option" {
+            ret first_generic_type(option)
+        }
+    }
+    translation_error_at(source_name, line, column, "invalid-iterator",
+        "Iterator::next must return (Self, Option[Item]), got '" + step + "'",)
+    ret "void"
+}
+
+fn iterator_iter_function(ctx: mut TranslatorContext, iterable_type: str) -> str {
+    if type_satisfies_trait_bound(ctx, ctx.active_generics, iterable_type, "IntoIterator") {
+        ret method_owner_name(iterable_type) + "::into_iter"
+    }
     ret ""
+}
+
+fn iterator_next_function(iter_type: str) -> str {
+    ret method_owner_name(iter_type) + "::next"
 }
 
 fn translate_params(fn_item: FunctionItem) -> str {
@@ -11536,6 +12000,9 @@ fn translate_owned_ret_expr(ctx: mut TranslatorContext, expr: ExprNode, ret_type
         ret translate_async_ready_ret(ctx, expr, ret_type, result_prefix)
     }
     let mut exclude_name = returned_owner_name(ctx, expr)
+    if ctx.return_is_borrowed {
+        exclude_name = ""
+    }
     if exclude_name != "" {
         match ctx_lookup_var(ctx, exclude_name) {
             Option[str]::Some(owner_type) => {
@@ -11552,6 +12019,9 @@ fn translate_owned_ret_expr(ctx: mut TranslatorContext, expr: ExprNode, ret_type
     let lowered = load_mutable_value(lower_expr(ctx, expr, result_prefix + "_expr", 0_usize), result_prefix
         + "_load",)
     ctx.expression_hint = ""
+    if lowered.typ == "!" {
+        ret lowered.code
+    }
     let numeric_coercion = is_numeric_type(value_type_name(lowered.typ)) && is_numeric_type(value_type_name(ret_type))
     if !numeric_coercion && !function_type_matches(ret_type, lowered.typ, Vec[str]::new()) {
         translation_error_at(expr.source_name, expr.line, expr.column, "return-type-mismatch", "cannot return value of type '"
@@ -11567,27 +12037,13 @@ fn translate_owned_ret_expr(ctx: mut TranslatorContext, expr: ExprNode, ret_type
             expr.source_name, expr.line, expr.column,)
     }
     let mut builder = lowered.code
-    builder = builder.append(translate_with_cleanups(ctx, result_prefix + "_with_cleanup"))
-    if borrowed_copy && exclude_name == "" && ctx_type_needs_ownership(ctx, lowered.typ) {
+    if !ctx.return_is_borrowed && borrowed_copy && exclude_name == "" && ctx_type_needs_ownership(ctx, lowered.typ) {
         builder = builder.instr("retain " + lowered.value + ": " + lowered.typ)
     }
-    if exclude_name != "" && expr_path_or_empty(expr) == "" {
-        match ctx_lookup_var(ctx, exclude_name) {
-            Option[str]::Some(owner_type) => {
-                let owner_value = ctx_lookup_value_name(ctx, exclude_name)
-                if starts_with(owner_type, "mut ") {
-                    let value_type = value_type_name(owner_type)
-                    let loaded = result_prefix + "_moved_owner"
-                    builder = builder.instr(loaded + ": " + value_type + " = load " + owner_value)
-                    builder = builder.instr("drop " + loaded + ": " + value_type)
-                } else {
-                    builder = builder.instr("drop " + owner_value + ": " + owner_type)
-                }
-            }
-            Option[str]::None => {
-            }
-        }
+    if ctx.return_is_borrowed && !borrowed_copy && ctx_type_needs_ownership(ctx, lowered.typ) {
+        builder = builder.instr("drop " + lowered.value + ": " + lowered.typ)
     }
+    builder = builder.append(translate_with_cleanups(ctx, result_prefix + "_with_cleanup"))
     builder = append_owned_drops(ctx, builder, exclude_name, result_prefix)
     if is_numeric_type(lowered.typ) && is_numeric_type(ret_type) && lowered.typ != ret_type {
         let casted = result_prefix + "_coerce"
@@ -11606,6 +12062,9 @@ fn translate_async_ready_ret(ctx: mut TranslatorContext, expr: ExprNode, output_
     let mut lowered = load_mutable_value(lower_expr(ctx, expr, result_prefix + "_expr", 0_usize), result_prefix
         + "_load",)
     ctx.expression_hint = ""
+    if lowered.typ == "!" {
+        ret lowered.code
+    }
     let numeric_coercion = is_numeric_type(value_type_name(lowered.typ)) && is_numeric_type(value_type_name(output_type))
     if !numeric_coercion && !function_type_matches(output_type, lowered.typ, Vec[str]::new()) {
         translation_error_at(expr.source_name, expr.line, expr.column, "return-type-mismatch", "cannot return value of type '"
@@ -11642,44 +12101,18 @@ fn translate_async_ready_ret(ctx: mut TranslatorContext, expr: ExprNode, output_
 }
 
 fn returned_owner_name(ctx: mut TranslatorContext, expr: ExprNode) -> str {
-    let direct = expr_path_or_empty(expr)
-    if direct != "" {
-        ret direct
-    }
-    match expr.value {
-        Expr::Call(call_expr) => {
-            let callee = expr_h_path_or_empty(call_expr.callee)
-            match ctx_enum_variant_owner(ctx, callee) {
-                Option[str]::Some(_) => {
-                    if call_expr.args.len() == 1_usize {
-                        match call_expr.args.get(0_usize) {
-                            Option[ExprNode]::Some(arg) => {
-                                ret expr_path_or_empty(arg)
-                            }
-                            Option[ExprNode]::None => {
-                            }
-                        }
-                    }
-                }
-                Option[str]::None => {
-                }
-            }
-        }
-        Expr::StructInit(init_expr) => {
-            if init_expr.values.len() == 1_usize {
-                match init_expr.values.get(0_usize) {
-                    Option[ExprNode]::Some(arg) => {
-                        ret expr_path_or_empty(arg)
-                    }
-                    Option[ExprNode]::None => {
-                    }
-                }
-            }
-        }
-        _ => {
+    // Only a directly returned local transfers its existing root. Aggregate
+    // constructors already retain borrowed fields, so their input locals
+    // need the same typed cleanup as every other local (including node slots).
+    let candidate = expr_path_or_empty(expr)
+    // Context bindings are consumed by with_exit, not by the local drop list.
+    // Preserve the existing return rules for other owners and borrowed APIs.
+    for resource in ctx.with_cleanups {
+        if resource.name == candidate && resource.emitted_name == ctx_lookup_value_name(ctx, candidate) {
+            ret ""
         }
     }
-    ret ""
+    ret candidate
 }
 
 fn translate_ret_expr(ctx: mut TranslatorContext, expr: ExprNode, ret_type: str, result_prefix: str)
@@ -11710,7 +12143,7 @@ fn translate_ret_expr(ctx: mut TranslatorContext, expr: ExprNode, ret_type: str,
             ret builder.instr("ret " + result_prefix + ": bool")
         }
         Expr::Path(name) => {
-            match ctx_enum_variant_owner(ctx, name) {
+            match ctx_enum_variant_owner(ctx, expr.source_name, name) {
                 Option[str]::Some(_) => {
                     ctx.expression_hint = canonical_type(ret_type)
                     let lowered = lower_expr(ctx, expr, result_prefix + "_expr", 0_usize)

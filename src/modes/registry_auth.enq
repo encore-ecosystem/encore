@@ -1,0 +1,337 @@
+//! Origin-pinned registry authentication without shell commands or token files.
+import argparse::{process_arg, process_arg_count}
+import core::option::Option
+import core::result::Result
+import json::{Json, parse, stringify}
+import refrain::project::{normalize_registry_url, registry_index_url}
+import secret_store
+import std::http::{HttpClient, HttpClientConfig, HttpRequest, HttpResponse, Url}
+import std::io::{println, eprintln}
+import std::os::env
+import std::path::Path
+import std::time::{perf_counter_ms, sleep_ms}
+
+fn text(data: Json, key: str) -> str {
+    ret data.get(key).unwrap_or(Json::Null).as_str().unwrap_or("")
+}
+fn document(response: HttpResponse) -> Json {
+    ret parse(response.body()).unwrap_or(Json::Null)
+}
+fn fail(message: str) -> u32 {
+    eprintln("Error: " + message)
+    ret 1_u32
+}
+fn key(index: str) -> str {
+    ret "encore.registry:" + index
+}
+
+/// Pins credential storage to the canonical, complete configured index URL.
+pub fn registry_origin(index: str) -> str {
+    if index == "" || index.len() > 900_usize || normalize_registry_url(index) != index {
+        ret ""
+    }
+    let url = match Url::parse(index) {
+        Result::Ok(value) => value Result::Err(_) => {
+            ret ""
+        }
+    }
+    let mut end = if url.scheme() == "https" {
+        8_usize
+    } else {
+        7_usize
+    }
+    while end < index.len() && index.slice(end, 1_usize) != "/" {
+        end += 1_usize
+    }
+    ret index.slice(0_usize, end)
+}
+
+/// Accepts only registry API credentials, never browser or provider tokens.
+pub fn valid_registry_token(value: str) -> bool {
+    if value.len() != 68_usize {
+        ret false
+    }
+    let prefix = value.slice(0_usize, 4_usize)
+    if prefix != "end_" && prefix != "enc_" && prefix != "enr_" {
+        ret false
+    }
+    let mut i = 4_usize
+    while i < value.len() {
+        let byte = value.byte_at(i)
+        if !((byte >= 48_u8 && byte <= 57_u8) ||(byte >= 97_u8 && byte <= 102_u8)) {
+            ret false
+        }
+        i += 1_usize
+    }
+    ret true
+}
+
+/// Environment credentials require an explicit matching index binding.
+pub fn registry_credential(index: str) -> Result[str, str] {
+    if registry_origin(index) == "" {
+        ret Result::Err("invalid authenticated registry URL")
+    }
+    let token = env("ENCORE_REGISTRY_TOKEN").unwrap_or("")
+    if token != "" {
+        if normalize_registry_url(env("ENCORE_REGISTRY_TOKEN_INDEX").unwrap_or("")) != index {
+            ret Result::Err("set ENCORE_REGISTRY_TOKEN_INDEX to the intended index URL; token forwarding to another registry is forbidden")
+        }
+        if !valid_registry_token(token) {
+            ret Result::Err("invalid registry API token")
+        }
+        ret Result::Ok(token)
+    }
+    let stored = match secret_store::get(key(index)) {
+        Result::Ok(value) => value.unwrap_or("")
+        Result::Err(_) => {
+            ret Result::Err("OS credential store unavailable, locked or denied; unlock it or use an index-bound CI token")
+        }
+    }
+    if !valid_registry_token(stored) {
+        ret Result::Err("not signed in to this registry; run encore login")
+    }
+    ret Result::Ok(stored)
+}
+
+/// Sends one request; neither redirects nor retries can forward credentials.
+pub fn registry_http(method: str, url: str, body: str, token: str, form: bool) -> Result[HttpResponse, str] {
+    let parsed = match Url::parse(url) {
+        Result::Ok(value) => value Result::Err(error) => {
+            ret Result::Err(error)
+        }
+    }
+    let mut request = HttpRequest::new(method, parsed).with_header("Accept", "application/json").with_body(body)
+    if token != "" {
+        if !valid_registry_token(token) {
+            ret Result::Err("invalid registry credential")
+        }
+        request = request.with_header("Authorization", "Bearer " + token)
+    }
+    if form {
+        request = request.with_header("Content-Type", "application/x-www-form-urlencoded")
+    }
+    ret HttpClient::with_config(HttpClientConfig::default().with_max_redirects(0_usize).with_max_body_size(1048576_usize).with_timeout_ms(10000_usize)).send(request)
+}
+
+fn supported_auth(index: str, origin: str) -> bool {
+    let response = match registry_http("GET", index + "/config.json", "", "", false) {
+        Result::Ok(value) => value Result::Err(_) => {
+            ret false
+        }
+    }
+    if response.status() != 200_u16 {
+        ret false
+    }
+    let config = document(response)
+    let auth = config.get("auth").unwrap_or(Json::Null)
+    ret stringify(config.get("schema").unwrap_or(Json::Null)) == "1" &&
+    stringify(auth.get("version").unwrap_or(Json::Null)) == "1" &&
+    text(config, "api") == "/api/v1" && text(auth, "device") == "/api/v1/auth/device" &&
+    text(auth, "token") == "/api/v1/auth/token" && text(auth, "me") == "/api/v1/me" &&
+    text(auth, "logout") == "/api/v1/auth/logout" && origin != ""
+}
+
+fn selected_index() -> str {
+    let mut i = 2_usize
+    while i < process_arg_count() {
+        if process_arg(i).unwrap_or("") == "--registry" {
+            ret normalize_registry_url(process_arg(i + 1_usize).unwrap_or(""))
+        }
+        i += 1_usize
+    }
+    ret registry_index_url(Path::new(".").resolve())
+}
+
+/// Runs login/whoami/logout for the explicitly selected or project registry.
+pub fn native_registry_auth(action: str) -> u32 {
+    let index = selected_index()
+    let origin = registry_origin(index)
+    if origin == "" {
+        ret fail("authentication requires an HTTPS or IPv4 loopback HTTP index URL")
+    }
+    println("Registry: " + index)
+    if !supported_auth(index, origin) {
+        ret fail("registry authentication discovery unavailable or unsupported; no fallback")
+    }
+    if action == "login" {
+        ret login(index, origin)
+    }
+    let token = match registry_credential(index) {
+        Result::Ok(value) => value Result::Err(error) => {
+            ret fail(error)
+        }
+    }
+    let path = if action == "whoami" {
+        "/api/v1/me"
+    } else {
+        "/api/v1/auth/logout"
+    }
+    let response = match registry_http(if action == "whoami" {
+            "GET"
+        } else {
+            "POST"
+        }
+        , origin + path, "", token, false,) {
+        Result::Ok(value) => value Result::Err(_) => {
+            ret fail("registry request failed; local credential retained")
+        }
+    }
+    if action == "whoami" {
+        if response.status() != 200_u16 {
+            ret fail("registry rejected the credential; run encore login")
+        }
+        let name = text(document(response), "name")
+        if !safe_display(name, 128_usize) {
+            ret fail("invalid account response")
+        }
+        println(name)
+        ret 0_u32
+    }
+    if response.status() != 200_u16 && response.status() != 401_u16 {
+        ret fail("revocation failed; local credential retained")
+    }
+    if env("ENCORE_REGISTRY_TOKEN").unwrap_or("") == "" {
+        if secret_store::delete(key(index)).is_err() {
+            ret fail("remote credential revoked, but OS credential store removal failed")
+        }
+    }
+    println("Signed out. The remote credential is no longer usable.")
+    ret 0_u32
+}
+
+fn safe_display(value: str, limit: usize) -> bool {
+    if value == "" || value.len() > limit {
+        ret false
+    }
+    let mut i = 0_usize
+    while i < value.len() {
+        if value.byte_at(i) < 32_u8 || value.byte_at(i) >= 127_u8 {
+            ret false
+        }
+        i += 1_usize
+    }
+    ret true
+}
+
+fn login(index: str, origin: str) -> u32 {
+    if env("ENCORE_REGISTRY_TOKEN").unwrap_or("") != "" {
+        ret fail("unset ENCORE_REGISTRY_TOKEN before interactive login")
+    }
+    if secret_store::get(key(index)).is_err() {
+        ret fail("OS credential store unavailable or locked; login never stores plaintext files")
+    }
+    let response = match registry_http("POST", origin + "/api/v1/auth/device", "client_id=encore&device_name=Encore%20CLI", "", true) {
+        Result::Ok(value) => value Result::Err(_) => {
+            ret fail("cannot start device login")
+        }
+    }
+    if response.status() != 200_u16 {
+        ret fail("registry rejected device login")
+    }
+    let grant = document(response)
+    let code = text(grant, "device_code")
+    let user_code = text(grant, "user_code")
+    let lifetime = positive_seconds(grant, "expires_in", 600_u64)
+    let polling = positive_seconds(grant, "interval", 60_u64)
+    if !safe_display(code, 128_usize) || !safe_display(user_code, 32_usize) ||
+    text(grant, "verification_uri") != origin + "/auth/device" || lifetime == 0_u64 || polling == 0_u64 {
+        ret fail("invalid or cross-origin device grant")
+    }
+    // Never auto-open a URL supplied by an untrusted project or discovery file.
+    println("Open " + origin + "/auth/device and enter code: " + user_code)
+    println("Approve only the device request you just started. Waiting up to 10 minutes…")
+    let deadline = perf_counter_ms() + lifetime * 1000_u64
+    let mut interval = polling * 1000_u64
+    while perf_counter_ms() < deadline {
+        let now = perf_counter_ms()
+        if now >= deadline || deadline - now <= interval {
+            break
+        }
+        let _slept = sleep_ms(interval)
+        let result = registry_http("POST", origin + "/api/v1/auth/token", "client_id=encore&grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code&device_code=" + encode_form(code), "", true)
+        let poll = match result {
+            Result::Ok(value) => value Result::Err(_) => {
+                ret fail("device polling failed; retry login")
+            }
+        }
+        let data = document(poll)
+        if poll.status() == 200_u16 {
+            let token = text(data, "access_token")
+            if !valid_registry_token(token) || token.slice(0_usize, 4_usize) != "end_" || text(data, "token_type") != "Bearer" {
+                ret fail("invalid device credential response")
+            }
+            let previous = secret_store::get(key(index)).unwrap_or(Option[str]::None).unwrap_or("")
+            if secret_store::set(key(index), token).is_err() {
+                if !revoke(origin, token) {
+                    eprintln("Warning: remove the new device in the registry account page; automatic revocation failed.")
+                }
+                ret fail("credential storage failed; token was not saved")
+            }
+            if valid_registry_token(previous) && previous != token {
+                if !revoke(origin, previous) {
+                    eprintln("Warning: old credential revocation failed; revoke it in the account page.")
+                }
+            }
+            println("Signed in. Credential saved in the OS keyring.")
+            ret 0_u32
+        }
+        if poll.status() != 400_u16 {
+            ret fail("device polling rejected")
+        }
+        let error = text(data, "error")
+        if error == "slow_down" {
+            interval += 5000_u64
+        } elif error != "authorization_pending" {
+            ret fail("device login denied or expired")
+        }
+        if interval > 60000_u64 {
+            ret fail("device polling rate limit exceeded; retry later")
+        }
+    }
+    ret fail("device login expired")
+}
+
+fn revoke(origin: str, token: str) -> bool {
+    let response = registry_http("POST", origin + "/api/v1/auth/logout", "", token, false).unwrap_or(HttpResponse::empty())
+    ret response.status() == 200_u16 || response.status() == 401_u16
+}
+
+fn positive_seconds(data: Json, name: str, maximum: u64) -> u64 {
+    let raw = stringify(data.get(name).unwrap_or(Json::Null))
+    if raw == "" || raw.len() > 6_usize {
+        ret 0_u64
+    }
+    let mut number = 0_u64
+    let mut i = 0_usize
+    while i < raw.len() {
+        let byte = raw.byte_at(i)
+        if byte < 48_u8 || byte > 57_u8 {
+            ret 0_u64
+        }
+        number = number * 10_u64 +(byte - 48_u8) as u64
+        if number > maximum {
+            ret 0_u64
+        }
+        i += 1_usize
+    }
+    ret number
+}
+
+fn encode_form(value: str) -> str {
+    let mut result = ""
+    let mut i = 0_usize
+    while i < value.len() {
+        let byte = value.byte_at(i) as usize
+        result += "%" + "0123456789ABCDEF".slice(byte / 16_usize, 1_usize) + "0123456789ABCDEF".slice(byte % 16_usize, 1_usize)
+        i += 1_usize
+    }
+    ret result
+}
+
+#attr(test)
+fn rejects_unsafe_credential_destinations() -> bool {
+    ret registry_origin("https://example.org/index") == "https://example.org" &&
+    registry_origin("http://localhost:8137/index") == "http://localhost:8137" &&
+    registry_origin("http://localhost.evil/index") == "" && registry_origin("file:///tmp/index") == "" &&
+    registry_origin("https://user@example.org/index") == "" && !valid_registry_token("ens_session")
+}

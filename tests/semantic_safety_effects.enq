@@ -1,0 +1,125 @@
+//! Safety effects propagate through resolved calls, not spelling or declaration order.
+import core::testing::assert
+import refrain::frontend::{AnalysisDatabase, SymbolId}
+import refrain::target::parse_target
+import std::vec::Vec
+
+fn main() -> u32 {
+    let mut db = AnalysisDatabase::new()
+    db.set_module("native", "native.enq", "pub extern fn raw() -> u32\npub fn leaf() -> u32 { unsafe { ret raw() } }\n#attr(safe)\npub fn boundary() -> u32 { ret leaf() }")
+    db.set_module("facade", "facade.enq", "pub import native::leaf as exported")
+    db.set_module("app", "app.enq", "import facade::exported as call\nimport native::boundary\nfn transit() -> u32 { ret call() }\nfn clean() -> u32 { ret boundary() }\nfn a() -> u32 { ret b() }\nfn b() -> u32 { if false { ret a() } ret call() }\nfn construct() { let task = || unsafe { 1_u32 } }\nfn invoke() { let task = || unsafe { 1_u32 } let value = task() }")
+    if !assert(db.function_is_unsafe(db.symbol_id("app", "transit").unwrap_or(SymbolId::invalid()))) {
+        ret 1_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("app", "clean").unwrap_or(SymbolId::invalid()))) {
+        ret 2_u32
+    }
+    if !assert(db.function_is_unsafe(db.symbol_id("app", "a").unwrap_or(SymbolId::invalid()))) {
+        ret 3_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("app", "construct").unwrap_or(SymbolId::invalid()))) {
+        ret 4_u32
+    }
+    if !assert(db.function_is_unsafe(db.symbol_id("app", "invoke").unwrap_or(SymbolId::invalid()))) {
+        ret 5_u32
+    }
+    // A body-only edit changes callers' effects even when signatures are unchanged.
+    db.set_module("native", "native.enq", "pub fn leaf() -> u32 { ret 1_u32 }\npub fn boundary() -> u32 { ret leaf() }")
+    if !assert(!db.function_is_unsafe(db.symbol_id("app", "transit").unwrap_or(SymbolId::invalid()))) {
+        ret 6_u32
+    }
+    db.set_module("methods", "methods.enq", "struct Box[T] { value: T }\nimpl[T] for Box[T] { fn new(value: T) -> Self { ret Self { value } } fn clean(self: Self) -> u32 { ret 1_u32 } fn raw(self: Self) -> u32 { unsafe { ret 1_u32 } } #attr(safe) fn trusted(self: Self) -> u32 { ret self.raw() } }\nfn pure(value: Box[u32]) -> u32 { ret value.clean() }\nfn impure(value: Box[u32]) -> u32 { ret value.raw() }\nfn trusted_use(value: Box[u32]) -> u32 { ret value.trusted() }\nfn construct() { let value = Box[u32]::new(1_u32) }")
+    if !assert(!db.function_is_unsafe(db.symbol_id("methods", "pure").unwrap_or(SymbolId::invalid()))) {
+        ret 7_u32
+    }
+    if !assert(db.function_is_unsafe(db.symbol_id("methods", "impure").unwrap_or(SymbolId::invalid()))) {
+        ret 8_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("methods", "trusted_use").unwrap_or(SymbolId::invalid()))) {
+        ret 9_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("methods", "construct").unwrap_or(SymbolId::invalid()))) {
+        ret 10_u32
+    }
+    db.set_module("values", "values.enq", "fn raw() -> u32 { unsafe { ret 1_u32 } }\nfn clean() -> u32 { ret 1_u32 }\nfn alias() { let f = raw let result = f() }\nfn safe_alias() { let f = clean let result = f() }\nfn returned() { ret || unsafe { 1_u32 } }\nfn invoke_returned() { let f = returned() let result = f() }\nfn factory_only() { let f = returned() }\nfn shadow() { let f = raw { let f = clean let value = f() } }\nfn mutable_capture() { let mut f = clean let g = || f() f = raw let result = g() }")
+    if !assert(db.function_is_unsafe(db.symbol_id("values", "alias").unwrap_or(SymbolId::invalid()))) {
+        ret 11_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("values", "safe_alias").unwrap_or(SymbolId::invalid()))) {
+        ret 12_u32
+    }
+    if !assert(db.function_is_unsafe(db.symbol_id("values", "invoke_returned").unwrap_or(SymbolId::invalid()))) {
+        ret 13_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("values", "factory_only").unwrap_or(SymbolId::invalid()))) {
+        ret 14_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("values", "shadow").unwrap_or(SymbolId::invalid()))) {
+        ret 15_u32
+    }
+    if !assert(db.function_is_unsafe(db.symbol_id("values", "mutable_capture").unwrap_or(SymbolId::invalid()))) {
+        ret 16_u32
+    }
+    db.set_module("contracts", "contracts.enq", "trait Trusted { #attr(safe) fn run(self: Self) -> u32 }\ntrait Unknown { fn run(self: Self) -> u32 }\nfn trusted(value: dyn Trusted) -> u32 { ret value.run() }\nfn unknown(value: dyn Unknown) -> u32 { ret value.run() }\nfn generic[T: Unknown](value: T) -> u32 { ret value.run() }")
+    if !assert(!db.function_is_unsafe(db.symbol_id("contracts", "trusted").unwrap_or(SymbolId::invalid()))) {
+        ret 17_u32
+    }
+    if !assert(db.function_is_unsafe(db.symbol_id("contracts", "unknown").unwrap_or(SymbolId::invalid()))) {
+        ret 18_u32
+    }
+    if !assert(db.function_is_unsafe(db.symbol_id("contracts", "generic").unwrap_or(SymbolId::invalid()))) {
+        ret 19_u32
+    }
+    db.set_module("conditional", "conditional.enq", "#cfg(windows)\nfn leaf() -> u32 { unsafe { ret 1_u32 } }\n#cfg(linux)\nfn leaf() -> u32 { ret 1_u32 }\nfn caller() -> u32 { ret leaf() }")
+    let caller = db.symbol_id("conditional", "caller").unwrap_or(SymbolId::invalid())
+    db.configure_safety("conditional", parse_target("x86_64-unknown-linux-gnu"), Vec[str]::new())
+    if !assert(!db.function_is_unsafe(caller)) {
+        ret 20_u32
+    }
+    db.configure_safety("conditional", parse_target("x86_64-pc-windows-msvc"), Vec[str]::new())
+    if !assert(db.function_is_unsafe(caller)) {
+        ret 21_u32
+    }
+    // Unrelated modules remain unparsed by a reachable-function query.
+    db.set_module("unrelated", "unrelated.enq", "fn unrelated() { unsafe {} }")
+    let _ = db.function_is_unsafe(caller)
+    if !assert(db.module_parse_count("unrelated") == 0_usize) {
+        ret 22_u32
+    }
+    db.set_module("implicit", "implicit.enq", "struct Value { value: u32 }\nimpl for Value { fn op(self: Self, other: Self) -> Self { unsafe { ret self } } fn with_enter(self: Self) -> Self { ret self } fn with_exit(self: Self) -> bool { unsafe { ret true } } }\nfn add(a: Value, b: Value) -> Value { ret a + b }\nfn primitive(a: u32, b: u32) -> u32 { ret a + b }\nfn resource(a: Value) { with a as value {} }\nfn factory(a: Value, b: Value) { let f = || a + b }\nfn identity[T](value: T) -> T { ret value }\nfn generic() { let value = identity[u32](1_u32) }")
+    if !assert(db.function_is_unsafe(db.symbol_id("implicit", "add").unwrap_or(SymbolId::invalid()))) {
+        ret 23_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("implicit", "primitive").unwrap_or(SymbolId::invalid()))) {
+        ret 24_u32
+    }
+    if !assert(db.function_is_unsafe(db.symbol_id("implicit", "resource").unwrap_or(SymbolId::invalid()))) {
+        ret 25_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("implicit", "factory").unwrap_or(SymbolId::invalid()))) {
+        ret 26_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("implicit", "generic").unwrap_or(SymbolId::invalid()))) {
+        ret 27_u32
+    }
+    db.set_module("trusted_factory", "trusted_factory.enq", "#attr(safe)\nfn factory() { ret || unsafe { 1_u32 } }\nfn invoke() { let f = factory() let result = f() }\nfn create() { let f = factory() }\nstruct Value { value: u32 }\nimpl for Value { fn new() -> Self { ret Self { 1_u32 } } fn clone(self: Self) -> Self { ret Self::new() } fn op(left: Self, right: Self) -> Self { ret left } }\nfn add(a: Value, b: Value) -> Value { ret a + b }\nfn duplicate(a: Value) -> Value { ret a.clone() }")
+    if !assert(db.function_is_unsafe(db.symbol_id("trusted_factory", "invoke").unwrap_or(SymbolId::invalid()))) {
+        ret 28_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("trusted_factory", "create").unwrap_or(SymbolId::invalid()))) {
+        ret 29_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("trusted_factory", "add").unwrap_or(SymbolId::invalid()))) {
+        ret 30_u32
+    }
+    if !assert(!db.function_is_unsafe(db.symbol_id("trusted_factory", "duplicate").unwrap_or(SymbolId::invalid()))) {
+        ret 31_u32
+    }
+    db.set_module("variants", "variants.enq", "pub enum Maybe[T] { Some(T) None }")
+    db.set_module("variant_use", "variant_use.enq", "import variants::Maybe as Value\nfn make() -> Value[u32] { ret Value[u32]::Some(1_u32) }")
+    if !assert(!db.function_is_unsafe(db.symbol_id("variant_use", "make").unwrap_or(SymbolId::invalid()))) {
+        ret 32_u32
+    }
+    ret 0_u32
+}
