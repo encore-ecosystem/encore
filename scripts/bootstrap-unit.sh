@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild the published 0.1.0 source with the minimal unit-payload backport.
+# Rebuild published 0.1.0 sources with unit-payload and native TLS backports.
 # This is a build tool, never an installed or published replacement release.
 set -euo pipefail
 if [[ $# != 2 ]]; then
@@ -32,6 +32,12 @@ fetch_source encore-index "$index_commit"
 git init --quiet "$work"
 git -C "$work" apply --check "$repository/scripts/bootstrap-unit.patch"
 git -C "$work" apply "$repository/scripts/bootstrap-unit.patch"
+git -C "$work" apply --check "$repository/scripts/bootstrap-network.patch"
+git -C "$work" apply "$repository/scripts/bootstrap-network.patch"
+# Use the same TLS adapter as the verified current dependency graph, not a
+# second copy embedded in a patch. Record its identity in provenance below.
+tls_adapter="$repository/../encore-index/packages/platform/tls_apple.h"
+cp "$tls_adapter" "$work/encore-index/packages/platform/tls_apple.h"
 (
   cd "$work/encore"
   ENCORE_CORE_DIR="$work/encore-index/packages/core" \
@@ -54,6 +60,9 @@ hash_file() {
 }
 jq -n --arg compiler "$compiler_commit" --arg index "$index_commit" \
   --arg patch "$(hash_file "$repository/scripts/bootstrap-unit.patch")" \
+  --arg network_patch "$(hash_file "$repository/scripts/bootstrap-network.patch")" \
+  --arg tls_adapter "$(hash_file "$tls_adapter")" \
   --arg seed "$(hash_file "$seed")" --arg binary "$(hash_file "$output/bin/$executable")" \
-  '{kind:"unit-payload-backport",compiler_commit:$compiler,index_commit:$index,
-    patch_sha256:$patch,seed_sha256:$seed,compiler_sha256:$binary}' > "$output/provenance.json"
+  '{kind:"unit-payload-and-network-backport",compiler_commit:$compiler,index_commit:$index,
+    patch_sha256:$patch,network_patch_sha256:$network_patch,tls_adapter_sha256:$tls_adapter,
+    seed_sha256:$seed,compiler_sha256:$binary}' > "$output/provenance.json"
