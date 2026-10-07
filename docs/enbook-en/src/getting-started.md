@@ -133,8 +133,9 @@ unless `target-cpu` is configured.
 ## Tests
 
 Unit tests are ordinary functions marked with `#attr(test)`. `encore test`
-discovers them across loaded refrains, compiles each test with a small harness,
-and treats the test as passed when it returns `true`.
+discovers them in the current package, compiles one shared harness, and treats
+each test as passed when it returns `true`. Every test runs in a fresh process,
+so a panic or process-local state cannot affect other tests.
 
 ```enq
 #attr(test)
@@ -148,10 +149,12 @@ Test functions should:
 - return `bool`;
 - take no parameters;
 - be non-generic;
+- be synchronous;
 - use `true` for pass and `false` for fail.
 
-The test harness wraps the function in a generated executable `main`, so the
-rest of the program can stay unchanged.
+The harness replaces the application entry point with a generated dispatcher,
+so the rest of the program can stay unchanged. Changing `--filter` reuses the
+same cached harness; standalone programs in `tests/` still compile separately.
 
 CI and large projects can list the test set and let the bounded worker pool run
 it in parallel:

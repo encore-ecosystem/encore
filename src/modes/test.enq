@@ -1,26 +1,26 @@
 //! Provides the `test` module.
 
+import argparse::{process_arg_count, process_arg}
 import core::fmt::Debug
 import core::option::Option
+import json::{Json, field, stringify}
 import std::io::eprintln
-import std::time::perf_counter_ms
-import std::thread::{JoinHandle, available_parallelism}
 import std::io::println
+import std::os::mkdir_all
 import std::os::{file_exists, read_dir, read_file, remove_file, write_file}
-import argparse::{process_arg_count, process_arg}
 import std::path::Path
 import std::path::clone_path
 import std::process::{run_args, run_args_capture}
-import std::os::mkdir_all
+import std::thread::{JoinHandle, available_parallelism}
+import std::time::perf_counter_ms
 import std::vec::Vec
-import json::{Json, field, stringify}
 
 import mod::build::compile_test_ast
 import refrain::diagnostics::render_diagnostic
-import refrain::frontend::{Lexer, Parser, Statement}
 import refrain::frontend::parser::statements::FunctionItem
+import refrain::frontend::{Lexer, Parser, Statement}
 import refrain::project::{ProjectWorkspace, WorkspaceModule, load_library_workspace, load_entry_workspace}
-import refrain::target::{host_target, target_executable_name}
+import refrain::target::{cfg_active_with_features, host_target, target_executable_name}
 import rich::TestProgress
 
 struct TestSelection {
@@ -52,22 +52,19 @@ struct UnitTestJob {
     index: usize
     display: str
     weight: usize
+    failure: str
 }
 
 /// Performs the `native_test` operation.
 pub fn native_test() -> u32 {
     let root = Path::new(".").resolve()
-    let worker_unit = option_value("--_worker-unit")
-    if worker_unit != "" {
-        let mut worker_workspace = if file_exists(root.join("src").join("lib.enq").as_str()) {
+    if has_switch("--_worker-harness") {
+        let workspace = if file_exists(root.join("src").join("lib.enq").as_str()) {
             load_library_workspace(root)
         } else {
             load_entry_workspace(root, root.join("src").join("main.enq"))
         }
-        let failure = run_selected_unit_test(root, worker_workspace, worker_unit)
-        if failure == "" { ret 0_u32 }
-        eprintln(failure)
-        ret 1_u32
+        ret compile_test_ast(root, workspace, unit_test_harness_ast(root, workspace), "__encore_unit_harness")
     }
     let worker_path = option_value("--_worker-standalone")
     if worker_path != "" {
@@ -84,7 +81,9 @@ pub fn native_test() -> u32 {
             }
         }
         let failure = compile_and_run_result(root, worker_workspace, worker_workspace.flat_ast, "worker:" + path.as_str())
-        if failure == "" { ret 0_u32 }
+        if failure == "" {
+            ret 0_u32
+        }
         eprintln(failure)
         ret 1_u32
     }
@@ -104,7 +103,9 @@ pub fn native_test() -> u32 {
     }
     let total = count_selected_tests(root, workspace, selection)
     if total == 0_usize {
-        if !write_test_report_if_requested(selection, Vec[TestRecord]::new(), 0_usize, 0_usize) { ret 1_u32 }
+        if !write_test_report_if_requested(selection, Vec[TestRecord]::new(), 0_usize, 0_usize) {
+            ret 1_u32
+        }
         println("No tests found.")
         ret 0_u32
     }
@@ -126,26 +127,45 @@ pub fn native_test() -> u32 {
                         Some(statement) => {
                             match statement {
                                 Statement::Function(item) => {
-                                    if has_attr(item, "test") {
+                                    if unit_test_enabled(module, item) {
                                         let display = unit_test_display(root, module, item.name)
                                         if test_selected(display, selection) {
-                                            unit_jobs.push(UnitTestJob{
-                                                unit_jobs.len(), display, module.source.len()
-                                            })
+                                            unit_jobs.push(UnitTestJob {
+                                                    unit_jobs.len(), display, module.source.len(),
+                                                    unit_test_signature_error(item)
+                                                }
+                                                ,)
                                         }
                                     }
                                 }
-                                _ => {}
+                                _ => {
+                                }
                             }
                         }
-                        None => {}
+                        None => {
+                        }
                     }
                     statement_index = statement_index + 1_usize
                 }
             }
-            None => {}
+            None => {
+            }
         }
         module_index = module_index + 1_usize
+    }
+    let mut harness_failure = ""
+    let mut needs_harness = false
+    for job in unit_jobs {
+        if job.failure == "" {
+            needs_harness = true
+        }
+    }
+    if needs_harness {
+        let started = perf_counter_ms()
+        harness_failure = prepare_unit_test_harness(root)
+        if harness_failure == "" {
+            eprintln("Prepared unit test harness in " + format_test_duration(perf_counter_ms() - started))
+        }
     }
     let scheduled_unit_jobs = schedule_unit_test_jobs(unit_jobs)
     let unit_worker_count = min_test_jobs(requested_test_jobs(), scheduled_unit_jobs.len())
@@ -153,11 +173,14 @@ pub fn native_test() -> u32 {
     let mut unit_pending = Vec[JoinHandle[Vec[StandaloneTestResult]]]::new()
     let mut unit_worker = 0_usize
     while unit_worker < unit_worker_count {
-        unit_pending.push(spawn run_unit_test_batch(unit_root, scheduled_unit_jobs, unit_worker, unit_worker_count))
+        unit_pending.push(spawn run_unit_test_batch(unit_root, scheduled_unit_jobs,
+                harness_failure, unit_worker, unit_worker_count,))
         unit_worker += 1_usize
     }
     let mut unit_results = Vec[StandaloneTestResult]::new()
-    for handle in unit_pending { unit_results.extend(handle.join()) }
+    for handle in unit_pending {
+        unit_results.extend(handle.join())
+    }
     let mut unit_result_index = 0_usize
     while unit_result_index < unit_jobs.len() {
         for result in unit_results {
@@ -165,10 +188,18 @@ pub fn native_test() -> u32 {
                 found += 1_usize
                 if result.failure == "" {
                     passed += 1_usize
-                    records.push(TestRecord{result.display, "passed", result.duration_ms, ""})
+                    records.push(TestRecord {
+                            result.display, "passed", result.duration_ms, ""
+                        }
+                        ,
+                    )
                 } else {
                     failed += 1_usize
-                    records.push(TestRecord{result.display, "failed", result.duration_ms, result.failure})
+                    records.push(TestRecord {
+                            result.display, "failed", result.duration_ms, result.failure
+                        }
+                        ,
+                    )
                 }
                 print_parallel_test_result(result)
             }
@@ -188,14 +219,16 @@ pub fn native_test() -> u32 {
                         let display = workspace.root_name + ":tests/" + name
                         if test_selected(display, selection) {
                             let path = tests_dir.join(name)
-                            standalone_jobs.push(StandaloneTestJob{
-                                standalone_jobs.len(), path.as_str(), display,
-                                read_file(path.as_str()).len()
-                            })
+                            standalone_jobs.push(StandaloneTestJob {
+                                    standalone_jobs.len(), path.as_str(), display,
+                                    read_file(path.as_str()).len()
+                                }
+                                ,)
                         }
                     }
                 }
-                None => {}
+                None => {
+                }
             }
             entry_index = entry_index + 1_usize
         }
@@ -210,7 +243,9 @@ pub fn native_test() -> u32 {
         worker += 1_usize
     }
     let mut standalone_results = Vec[StandaloneTestResult]::new()
-    for handle in pending { standalone_results.extend(handle.join()) }
+    for handle in pending {
+        standalone_results.extend(handle.join())
+    }
     let mut result_index = 0_usize
     while result_index < standalone_jobs.len() {
         for result in standalone_results {
@@ -218,10 +253,18 @@ pub fn native_test() -> u32 {
                 found += 1_usize
                 if result.failure == "" {
                     passed += 1_usize
-                    records.push(TestRecord{result.display, "passed", result.duration_ms, ""})
+                    records.push(TestRecord {
+                            result.display, "passed", result.duration_ms, ""
+                        }
+                        ,
+                    )
                 } else {
                     failed += 1_usize
-                    records.push(TestRecord{result.display, "failed", result.duration_ms, result.failure})
+                    records.push(TestRecord {
+                            result.display, "failed", result.duration_ms, result.failure
+                        }
+                        ,
+                    )
                 }
                 print_parallel_test_result(result)
             }
@@ -230,7 +273,9 @@ pub fn native_test() -> u32 {
     }
 
     progress.finish(passed, failed)
-    if !write_test_report_if_requested(selection, records, passed, failed) { ret 1_u32 }
+    if !write_test_report_if_requested(selection, records, passed, failed) {
+        ret 1_u32
+    }
     if failed == 0_usize {
         ret 0_u32
     }
@@ -257,9 +302,12 @@ fn count_selected_tests(root: Path, workspace: ProjectWorkspace, selection: Test
                 match statement {
                     Statement::Function(item) => {
                         let display = unit_test_display(root, module, item.name)
-                        if has_attr(item, "test") && test_selected(display, selection) { total = total + 1_usize }
+                        if unit_test_enabled(module, item) && test_selected(display, selection) {
+                            total = total + 1_usize
+                        }
                     }
-                    _ => {}
+                    _ => {
+                    }
                 }
             }
         }
@@ -268,7 +316,9 @@ fn count_selected_tests(root: Path, workspace: ProjectWorkspace, selection: Test
     if file_exists(tests_dir.as_str()) {
         for name in read_dir(tests_dir.as_str()) {
             let display = workspace.root_name + ":tests/" + name
-            if ends_with(name, ".enq") && test_selected(display, selection) { total = total + 1_usize }
+            if ends_with(name, ".enq") && test_selected(display, selection) {
+                total = total + 1_usize
+            }
         }
     }
     ret total
@@ -282,9 +332,12 @@ fn selected_test_ids(root: Path, workspace: ProjectWorkspace, selection: TestSel
                 match statement {
                     Statement::Function(item) => {
                         let display = unit_test_display(root, module, item.name)
-                        if has_attr(item, "test") && test_selected(display, selection) { out.push(display) }
+                        if unit_test_enabled(module, item) && test_selected(display, selection) {
+                            out.push(display)
+                        }
                     }
-                    _ => {}
+                    _ => {
+                    }
                 }
             }
         }
@@ -293,7 +346,9 @@ fn selected_test_ids(root: Path, workspace: ProjectWorkspace, selection: TestSel
     if file_exists(tests_dir.as_str()) {
         for name in read_dir(tests_dir.as_str()) {
             let display = workspace.root_name + ":tests/" + name
-            if ends_with(name, ".enq") && test_selected(display, selection) { out.push(display) }
+            if ends_with(name, ".enq") && test_selected(display, selection) {
+                out.push(display)
+            }
         }
     }
     ret out
@@ -303,28 +358,36 @@ fn list_selected_tests(root: Path, workspace: ProjectWorkspace, selection: TestS
     let ids = selected_test_ids(root, workspace, selection)
     if option_value("--format") == "json" {
         let mut values = Vec[Json]::new()
-        for id in ids { values.push(Json::String(id)) }
+        for id in ids {
+            values.push(Json::String(id))
+        }
         println(stringify(Json::Array(values)))
         ret 0_u32
     }
-    for id in ids { println(id) }
+    for id in ids {
+        println(id)
+    }
     ret 0_u32
 }
 
 fn test_selected(id: str, selection: TestSelection) -> bool {
-    if selection.filter != "" && !contains(id, selection.filter) { ret false }
+    if selection.filter != "" && !contains(id, selection.filter) {
+        ret false
+    }
     ret true
 }
 
 fn test_selection() -> TestSelection {
-    ret TestSelection{test_filter()}
+    ret TestSelection {
+        test_filter()
+    }
 }
 
 fn decimal_value(value: str) -> usize {
     let mut result = 0_usize
     let mut index = 0_usize
     while index < value.len() {
-        result = result * 10_usize + (value.byte_at(index) - 48_u8) as usize
+        result = result * 10_usize +(value.byte_at(index) - 48_u8) as usize
         index += 1_usize
     }
     ret result
@@ -334,10 +397,12 @@ fn write_test_report_if_requested(
     selection: TestSelection,
     records: Vec[TestRecord],
     passed: usize,
-    failed: usize
+    failed: usize,
 ) -> bool {
     let report_path = option_value("--report")
-    if report_path == "" { ret true }
+    if report_path == "" {
+        ret true
+    }
     let mut tests = Vec[Json]::new()
     let mut total_duration = 0_u64
     for record in records {
@@ -359,8 +424,11 @@ fn write_test_report_if_requested(
     root.push(field("summary", Json::Object(summary)))
     root.push(field("tests", Json::Array(tests)))
     match Path::new(report_path).parent() {
-        Some(parent) => { mkdir_all(parent.as_str()) }
-        None => {}
+        Some(parent) => {
+            mkdir_all(parent.as_str())
+        }
+        None => {
+        }
     }
     if write_file(report_path, stringify(Json::Object(root)) + "\n") != 0_i32 {
         eprintln("Unable to write test report: " + report_path)
@@ -372,57 +440,172 @@ fn write_test_report_if_requested(
 fn unit_test_display(root: Path, module: WorkspaceModule, test_name: str) -> str {
     let mut module_path = module.module_path.as_str()
     let prefix = root.as_str() + "/"
-    if starts_with(module_path, prefix) { module_path = module_path.slice(prefix.len(), module_path.len() - prefix.len()) }
+    if starts_with(module_path, prefix) {
+        module_path = module_path.slice(prefix.len(), module_path.len() - prefix.len())
+    }
     ret module.owner_name + ":" + module_path + "::" + test_name
 }
 
-fn run_unit_test(root: Path, workspace: ProjectWorkspace, item: FunctionItem, display: str) -> str {
-    if item.name == "main" || item.params.len() > 0_usize || item.generics.len() > 0_usize || item.is_extern || !returns_bool(item) {
+fn unit_test_signature_error(item: FunctionItem) -> str {
+    if item.name == "main" || item.params.len() > 0_usize || item.generics.len() > 0_usize || item.is_extern || item.is_async || !returns_bool(item) {
         ret "test must be fn() -> bool"
     }
-    let mut ast = unit_test_ast(workspace.flat_ast, item.name)
-    append_parsed(ast, "fn main() -> u32 { let result: bool = " + item.name + "() if result { ret 0_u32 } ret 1_u32 }", item.source_name)
-    ret compile_and_run_result(root, workspace, ast, display)
+    ret ""
 }
 
-fn run_selected_unit_test(root: Path, workspace: ProjectWorkspace, selected: str) -> str {
+fn unit_test_enabled(module: WorkspaceModule, item: FunctionItem) -> bool {
+    if !has_attr(item, "test") {
+        ret false
+    }
+    for attr in item.attrs {
+        if starts_with(attr, "cfg:") && !cfg_active_with_features(host_target(),
+            attr.slice(4_usize, attr.len() - 4_usize), module.enabled_features,) {
+            ret false
+        }
+    }
+    ret true
+}
+
+fn unit_test_active_attrs(item: FunctionItem) -> Vec[str] {
+    let mut attrs = Vec[str]::new()
+    for attr in item.attrs {
+        if attr != "test" {
+            attrs.push(attr)
+        }
+    }
+    ret attrs
+}
+
+// Activate tests in their original modules. Module-local wrappers preserve
+// private visibility and disambiguate tests sharing a name in different files.
+fn unit_test_harness_ast(root: Path, workspace: ProjectWorkspace) -> Vec[Statement] {
+    let mut out = Vec[Statement]::new()
+    for statement in workspace.flat_ast {
+        match statement {
+            Statement::Function(item) => {
+                if item.name != "main" {
+                    if has_attr(item, "test") && unit_test_signature_error(item) == "" &&
+                    unit_test_owned_by_root(workspace, item) {
+                        out.push(Statement::Function(FunctionItem {
+                                    unit_test_active_attrs(item), item.decorators,
+                                    item.is_public, item.is_extern, item.is_async, item.name,
+                                    item.documentation, item.generics, item.params, item.ret_type,
+                                    item.returns_sending, item.returns_frozen, item.body,
+                                    item.source_name, item.line, item.column,
+                                }
+                                ,))
+                    } else {
+                        out.push(statement)
+                    }
+                }
+            }
+            _ => {
+                out.push(statement)
+            }
+        }
+    }
+    let mut main_source = "extern fn encore_os_argc() -> usize\nextern fn encore_os_argv(index: usize) -> str\n"
+    main_source += "#attr(safe)\nfn main() -> u32 { let count = unsafe { encore_os_argc() } if count != 2_usize { ret 2_u32 } let selected = unsafe { encore_os_argv(1_usize) }\n"
+    let mut selector = 0_usize
     for module in workspace.modules {
         if module.owner_name == workspace.root_name {
             for statement in module.ast {
                 match statement {
                     Statement::Function(item) => {
-                        if has_attr(item, "test") && unit_test_display(root, module, item.name) == selected {
-                            ret run_unit_test(root, workspace, item, selected)
+                        if unit_test_enabled(module, item) && unit_test_signature_error(item) == "" {
+                            let wrapper = unit_test_wrapper_name(workspace, selector)
+                            append_parsed(out, "pub fn " + wrapper + "() -> bool { ret " + item.name + "() }", item.source_name)
+                            let display = unit_test_display(root, module, item.name)
+                            main_source += "if selected == " + stringify(Json::String(display)) + " { ret if " +
+                            wrapper + "() { 0_u32 } else { 1_u32 } }\n"
+                            selector += 1_usize
                         }
                     }
-                    _ => {}
+                    _ => {
+                    }
                 }
             }
         }
     }
-    ret "unit test not found: " + selected
+    main_source += "ret 2_u32 }"
+    let entry = if file_exists(root.join("src").join("lib.enq").as_str()) {
+        root.join("src").join("lib.enq")
+    } else {
+        root.join("src").join("main.enq")
+    }
+    append_parsed(out, main_source, entry.as_str())
+    ret out
 }
 
-fn run_unit_test_isolated(root: Path, display: str) -> str {
-    let output_path = root.join("target").join("tests").join(sanitize(display) + ".output.txt")
+fn unit_test_owned_by_root(workspace: ProjectWorkspace, item: FunctionItem) -> bool {
+    for module in workspace.modules {
+        if module.owner_name == workspace.root_name && module.module_path.as_str() == item.source_name {
+            ret unit_test_enabled(module, item)
+        }
+    }
+    ret false
+}
+
+fn unit_test_wrapper_name(workspace: ProjectWorkspace, selector: usize) -> str {
+    let mut name = "__encore_unit_test_" + Debug::fmt(selector)
+    let mut available = false
+    while !available {
+        available = true
+        for statement in workspace.flat_ast {
+            match statement {
+                Statement::Function(item) => {
+                    if item.name == name {
+                        available = false
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        if !available {
+            name += "_"
+        }
+    }
+    ret name
+}
+
+// Lowering can terminate the compiler on a diagnostic. Compile once in a
+// child so one malformed suite still produces a complete report and does not
+// prevent independent standalone/negative tests from running.
+fn prepare_unit_test_harness(root: Path) -> str {
+    let output_path = root.join("target").join("tests").join("__encore_unit_harness.output.txt")
     mkdir_all(root.join("target").join("tests").as_str())
-    let executable = arg_or(0_usize, "encore")
     let mut args = Vec[str]::new()
     args.push("test")
-    args.push("--_worker-unit")
-    args.push(display)
+    args.push("--_worker-harness")
     args.push("--jobs")
     args.push("1")
+    let code = run_args_capture(arg_or(0_usize, "encore"), args, output_path.as_str())
+    if code == 0_i32 {
+        remove_file(output_path.as_str())
+        ret ""
+    }
+    ret "unit test harness compilation failed: " + summarize_output(read_file(output_path.as_str()))
+}
+
+fn run_unit_test_isolated(root: Path, job: UnitTestJob) -> str {
+    let display = job.display
+    let output_path = root.join("target").join("tests").join(sanitize(display) + ".output.txt")
+    mkdir_all(root.join("target").join("tests").as_str())
+    let executable = root.join("target").join("tests").join("bin").join(
+        target_executable_name(host_target(), "__encore_unit_harness")).as_str()
+    let mut args = Vec[str]::new()
+    args.push(display)
     let code = run_args_capture(executable, args, output_path.as_str())
     let output = read_file(output_path.as_str())
     if code == 0_i32 {
         remove_file(output_path.as_str())
         ret ""
     }
-    // Preserve the complete child compiler/linker output for CI artifacts.
+    // Preserve complete runtime output for CI artifacts.
     // The compact JSON report remains readable, while failures retain the
-    // exact unresolved symbol and command diagnostics needed for triage.
-    ret summarize_output(output)
+    // exact panic and process diagnostics needed for triage.
+    ret "process exited with code " + Debug::fmt(code) + ": " + summarize_output(output)
 }
 
 fn schedule_unit_test_jobs(jobs: mut Vec[UnitTestJob]) -> Vec[UnitTestJob] {
@@ -436,14 +619,18 @@ fn schedule_unit_test_jobs(jobs: mut Vec[UnitTestJob]) -> Vec[UnitTestJob] {
                     match jobs.get(position - 1_usize) {
                         Some(left) => {
                             swap = right.weight > left.weight ||
-                                (right.weight == left.weight && right.index < left.index)
+                            (right.weight == left.weight && right.index < left.index)
                         }
-                        None => {}
+                        None => {
+                        }
                     }
                 }
-                None => {}
+                None => {
+                }
             }
-            if !swap { break }
+            if !swap {
+                break
+            }
             match jobs.get(position) {
                 Some(right) => {
                     match jobs.get(position - 1_usize) {
@@ -451,10 +638,12 @@ fn schedule_unit_test_jobs(jobs: mut Vec[UnitTestJob]) -> Vec[UnitTestJob] {
                             jobs.set(position - 1_usize, right)
                             jobs.set(position, left)
                         }
-                        None => {}
+                        None => {
+                        }
                     }
                 }
-                None => {}
+                None => {
+                }
             }
             position -= 1_usize
         }
@@ -463,8 +652,8 @@ fn schedule_unit_test_jobs(jobs: mut Vec[UnitTestJob]) -> Vec[UnitTestJob] {
     ret jobs
 }
 
-fn run_unit_test_batch(root: frozen Path, jobs: frozen Vec[UnitTestJob], worker_index: usize,
-    worker_count: usize) -> sending Vec[StandaloneTestResult] {
+fn run_unit_test_batch(root: frozen Path, jobs: frozen Vec[UnitTestJob], harness_failure: frozen str, worker_index: usize,
+    worker_count: usize,) -> sending Vec[StandaloneTestResult] {
     let root = clone_path(root)
     let mut out = Vec[StandaloneTestResult]::new()
     let mut index = worker_index
@@ -473,12 +662,20 @@ fn run_unit_test_batch(root: frozen Path, jobs: frozen Vec[UnitTestJob], worker_
             Some(job) => {
                 let started = perf_counter_ms()
                 let display = "" + job.display
-                let failure = run_unit_test_isolated(root, display)
-                out.push(StandaloneTestResult{
-                    job.index, display, perf_counter_ms() - started, failure
-                })
+                let failure = if job.failure != "" {
+                    job.failure
+                } elif harness_failure != "" {
+                    "" + harness_failure
+                } else {
+                    run_unit_test_isolated(root, job)
+                }
+                out.push(StandaloneTestResult {
+                        job.index, display, perf_counter_ms() - started, failure
+                    }
+                    ,)
             }
-            None => {}
+            None => {
+            }
         }
         index += worker_count
     }
@@ -517,16 +714,28 @@ fn run_standalone_test(root: Path, path: Path, display: str) -> str {
 
 fn requested_test_jobs() -> usize {
     let available = available_parallelism()
-    let fallback = if available == 0_usize { 1_usize } else { available }
+    let fallback = if available == 0_usize {
+        1_usize
+    } else {
+        available
+    }
     let requested = decimal_value(option_value("--jobs"))
-    if requested == 0_usize { ret fallback }
-    if available == 0_usize || requested < available { ret requested }
+    if requested == 0_usize {
+        ret fallback
+    }
+    if available == 0_usize || requested < available {
+        ret requested
+    }
     ret available
 }
 
 fn min_test_jobs(requested: usize, count: usize) -> usize {
-    if count == 0_usize { ret 0_usize }
-    if requested < count { ret requested }
+    if count == 0_usize {
+        ret 0_usize
+    }
+    if requested < count {
+        ret requested
+    }
     ret count
 }
 
@@ -541,14 +750,18 @@ fn schedule_standalone_test_jobs(jobs: mut Vec[StandaloneTestJob]) -> Vec[Standa
                     match jobs.get(position - 1_usize) {
                         Some(left) => {
                             swap = right.weight > left.weight ||
-                                (right.weight == left.weight && right.index < left.index)
+                            (right.weight == left.weight && right.index < left.index)
                         }
-                        None => {}
+                        None => {
+                        }
                     }
                 }
-                None => {}
+                None => {
+                }
             }
-            if !swap { break }
+            if !swap {
+                break
+            }
             match jobs.get(position) {
                 Some(right) => {
                     match jobs.get(position - 1_usize) {
@@ -556,10 +769,12 @@ fn schedule_standalone_test_jobs(jobs: mut Vec[StandaloneTestJob]) -> Vec[Standa
                             jobs.set(position - 1_usize, right)
                             jobs.set(position, left)
                         }
-                        None => {}
+                        None => {
+                        }
                     }
                 }
-                None => {}
+                None => {
+                }
             }
             position -= 1_usize
         }
@@ -569,7 +784,7 @@ fn schedule_standalone_test_jobs(jobs: mut Vec[StandaloneTestJob]) -> Vec[Standa
 }
 
 fn run_standalone_test_batch(root: frozen Path, jobs: frozen Vec[StandaloneTestJob], worker_index: usize,
-    worker_count: usize) -> sending Vec[StandaloneTestResult] {
+    worker_count: usize,) -> sending Vec[StandaloneTestResult] {
     let root = clone_path(root)
     let mut out = Vec[StandaloneTestResult]::new()
     let mut index = worker_index
@@ -579,29 +794,39 @@ fn run_standalone_test_batch(root: frozen Path, jobs: frozen Vec[StandaloneTestJ
                 let started = perf_counter_ms()
                 let display = "" + job.display
                 let failure = run_standalone_test(root, Path::new("" + job.path), display)
-                out.push(StandaloneTestResult{
-                    job.index, display, perf_counter_ms() - started, failure
-                })
+                out.push(StandaloneTestResult {
+                        job.index, display, perf_counter_ms() - started, failure
+                    }
+                    ,)
             }
-            None => {}
+            None => {
+            }
         }
         index += worker_count
     }
     ret out
 }
 
-fn print_parallel_test_result(result: StandaloneTestResult) -> () {
-    let status = if result.failure == "" { "ok" } else { "FAILED" }
+fn print_parallel_test_result(result: StandaloneTestResult) ->() {
+    let status = if result.failure == "" {
+        "ok"
+    } else {
+        "FAILED"
+    }
     eprintln("test " + result.display + " ... " + status + " (" +
         format_test_duration(result.duration_ms) + ")")
-    if result.failure != "" { eprintln("    " + result.failure) }
-    ret ()
+    if result.failure != "" {
+        eprintln("    " + result.failure)
+    }
+    ret()
 }
 
 fn format_test_duration(milliseconds: u64) -> str {
-    if milliseconds < 1000_u64 { ret Debug::fmt(milliseconds) + " ms" }
+    if milliseconds < 1000_u64 {
+        ret Debug::fmt(milliseconds) + " ms"
+    }
     let seconds = milliseconds / 1000_u64
-    let tenths = (milliseconds % 1000_u64) / 100_u64
+    let tenths =(milliseconds % 1000_u64) / 100_u64
     ret Debug::fmt(seconds) + "." + Debug::fmt(tenths) + "s"
 }
 
@@ -612,37 +837,10 @@ fn compile_and_run_result(root: Path, workspace: ProjectWorkspace, ast: Vec[Stat
     }
     let binary_name = target_executable_name(host_target(), name)
     let code = run_args(root.join("target").join("tests").join("bin").join(binary_name).as_str(), Vec[str]::new())
-    if code == 0_i32 { ret "" }
-    ret "process exited with code " + Debug::fmt(code)
-}
-
-fn unit_test_ast(source: Vec[Statement], test_name: str) -> Vec[Statement] {
-    let mut out = Vec[Statement]::new()
-    let mut index = 0_usize
-    while index < source.len() {
-        match source.get(index) {
-            Some(statement) => {
-                match statement {
-                    Statement::Function(item) => {
-                        if item.name != "main" {
-                            if item.name == test_name {
-                                out.push(Statement::Function(FunctionItem{Vec[str]::new(), item.decorators,
-                                    item.is_public, item.is_extern, item.is_async, item.name,
-                                    item.documentation, item.generics, item.params, item.ret_type,
-                                    item.returns_sending, item.returns_frozen, item.body,
-                                    item.source_name, item.line, item.column,}))
-                            }
-                            else { out.push(Statement::Function(item)) }
-                        }
-                    }
-                    _ => { out.push(statement) }
-                }
-            }
-            None => {}
-        }
-        index = index + 1_usize
+    if code == 0_i32 {
+        ret ""
     }
-    ret out
+    ret "process exited with code " + Debug::fmt(code)
 }
 
 fn dependency_ast(workspace: ProjectWorkspace) -> Vec[Statement] {
@@ -651,40 +849,60 @@ fn dependency_ast(workspace: ProjectWorkspace) -> Vec[Statement] {
     while module_index < workspace.modules.len() {
         match workspace.modules.get(module_index) {
             Some(module) => {
-                if module.owner_name != workspace.root_name { out.extend(module.ast) }
+                if module.owner_name != workspace.root_name {
+                    out.extend(module.ast)
+                }
             }
-            None => {}
+            None => {
+            }
         }
         module_index = module_index + 1_usize
     }
     ret out
 }
 
-fn append_parsed(out: mut Vec[Statement], source: str, source_name: str) -> () {
+fn append_parsed(out: mut Vec[Statement], source: str, source_name: str) ->() {
     let mut lexer = Lexer::new()
     let tokens = lexer.tokenize(source)
     let mut parser = Parser::new_for_source(source_name)
     out.extend(parser.parse(tokens))
-    ret ()
+    ret()
 }
 
 fn has_attr(item: FunctionItem, target: str) -> bool {
     let mut index = 0_usize
     while index < item.attrs.len() {
-        match item.attrs.get(index) { Some(attr) => { if attr == target { ret true } } None => {} }
+        match item.attrs.get(index) {
+            Some(attr) => {
+                if attr == target {
+                    ret true
+                }
+            }
+            None => {
+            }
+        }
         index = index + 1_usize
     }
     ret false
 }
 
 fn returns_bool(item: FunctionItem) -> bool {
-    match item.ret_type { Some(value) => { ret value == "bool" || value == "u1" } None => { ret false } }
+    match item.ret_type {
+        Some(value) => {
+            ret value == "bool" || value == "u1"
+        }
+        None => {
+            ret false
+        }
+    }
 }
 
 fn test_filter() -> str {
     let mut index = 2_usize
     while index < argc() {
-        if arg_or(index, "") == "--filter" && index + 1_usize < argc() { ret arg_or(index + 1_usize, "") }
+        if arg_or(index, "") == "--filter" && index + 1_usize < argc() {
+            ret arg_or(index + 1_usize, "")
+        }
         index = index + 1_usize
     }
     ret ""
@@ -693,7 +911,9 @@ fn test_filter() -> str {
 fn option_value(name: str) -> str {
     let mut index = 2_usize
     while index + 1_usize < argc() {
-        if arg_or(index, "") == name { ret arg_or(index + 1_usize, "") }
+        if arg_or(index, "") == name {
+            ret arg_or(index + 1_usize, "")
+        }
         index = index + 1_usize
     }
     ret ""
@@ -702,7 +922,9 @@ fn option_value(name: str) -> str {
 fn has_switch(name: str) -> bool {
     let mut index = 2_usize
     while index < argc() {
-        if arg_or(index, "") == name { ret true }
+        if arg_or(index, "") == name {
+            ret true
+        }
         index += 1_usize
     }
     ret false
@@ -715,7 +937,9 @@ fn expected_compile_error(source: str) -> str {
         if source.slice(index, marker.len()) == marker {
             let start = index + marker.len()
             let mut end = start
-            while end < source.len() && source.slice(end, 1_usize) != "\n" && source.slice(end, 1_usize) != "\r" { end = end + 1_usize }
+            while end < source.len() && source.slice(end, 1_usize) != "\n" && source.slice(end, 1_usize) != "\r" {
+                end = end + 1_usize
+            }
             ret source.slice(start, end - start)
         }
         index = index + 1_usize
@@ -732,9 +956,12 @@ fn summarize_output(value: str) -> str {
     while index < value.len() && out.len() < head_limit {
         let ch = value.slice(index, 1_usize)
         if ch == "\n" || ch == "\r" || ch == "\t" {
-            if out.len() > 0_usize && out.slice(out.len() - 1_usize, 1_usize) != " " { out = out + " " }
+            if out.len() > 0_usize && out.slice(out.len() - 1_usize, 1_usize) != " " {
+                out = out + " "
+            }
+        } else {
+            out = out + ch
         }
-        else { out = out + ch }
         index = index + 1_usize
     }
     if index < value.len() {
@@ -742,35 +969,57 @@ fn summarize_output(value: str) -> str {
         let mut marker_index = 0_usize
         let mut error_index = value.len()
         while marker_index + marker.len() <= value.len() {
-            if value.slice(marker_index, marker.len()) == marker { error_index = marker_index }
+            if value.slice(marker_index, marker.len()) == marker {
+                error_index = marker_index
+            }
             marker_index = marker_index + 1_usize
         }
         if error_index < value.len() {
             out = out + " ... error context: "
-            let context_start = if error_index > 80_usize { error_index - 80_usize } else { 0_usize }
-            let context_end = if error_index + 320_usize < value.len() { error_index + 320_usize } else { value.len() }
+            let context_start = if error_index > 80_usize {
+                error_index - 80_usize
+            } else {
+                0_usize
+            }
+            let context_end = if error_index + 320_usize < value.len() {
+                error_index + 320_usize
+            } else {
+                value.len()
+            }
             let mut context_index = context_start
             while context_index < context_end {
                 let ch = value.slice(context_index, 1_usize)
                 if ch == "\n" || ch == "\r" || ch == "\t" {
-                    if out.len() > 0_usize && out.slice(out.len() - 1_usize, 1_usize) != " " { out = out + " " }
+                    if out.len() > 0_usize && out.slice(out.len() - 1_usize, 1_usize) != " " {
+                        out = out + " "
+                    }
+                } else {
+                    out = out + ch
                 }
-                else { out = out + ch }
                 context_index = context_index + 1_usize
             }
         }
         out = out + " ... tail: "
-        let mut tail_index = if value.len() > tail_limit { value.len() - tail_limit } else { index }
+        let mut tail_index = if value.len() > tail_limit {
+            value.len() - tail_limit
+        } else {
+            index
+        }
         while tail_index < value.len() {
             let ch = value.slice(tail_index, 1_usize)
             if ch == "\n" || ch == "\r" || ch == "\t" {
-                if out.len() > 0_usize && out.slice(out.len() - 1_usize, 1_usize) != " " { out = out + " " }
+                if out.len() > 0_usize && out.slice(out.len() - 1_usize, 1_usize) != " " {
+                    out = out + " "
+                }
+            } else {
+                out = out + ch
             }
-            else { out = out + ch }
             tail_index = tail_index + 1_usize
         }
     }
-    if out == "" { ret "no compiler output" }
+    if out == "" {
+        ret "no compiler output"
+    }
     ret out
 }
 
@@ -779,38 +1028,66 @@ fn sanitize(value: str) -> str {
     let mut index = 0_usize
     while index < value.len() {
         let ch = value.slice(index, 1_usize)
-        if is_alnum(ch) { out = out + ch } else { out = out + "_" }
+        if is_alnum(ch) {
+            out = out + ch
+        } else {
+            out = out + "_"
+        }
         index = index + 1_usize
     }
     ret out
 }
 fn is_alnum(ch: str) -> bool {
-    if ch.len() == 0_usize { ret false }
+    if ch.len() == 0_usize {
+        ret false
+    }
     let value = ch.byte_at(0_usize)
-    ret (value >= 97_u8 && value <= 122_u8) || (value >= 65_u8 && value <= 90_u8) || (value >= 48_u8 && value <= 57_u8)
+    ret(value >= 97_u8 && value <= 122_u8) ||(value >= 65_u8 && value <= 90_u8) ||(value >= 48_u8 && value <= 57_u8)
 }
 fn contains(value: str, needle: str) -> bool {
     let mut index = 0_usize
     while index + needle.len() <= value.len() {
-        if value.slice(index, needle.len()) == needle { ret true }
+        if value.slice(index, needle.len()) == needle {
+            ret true
+        }
         index = index + 1_usize
     }
     ret false
 }
-fn starts_with(value: str, prefix: str) -> bool { ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix }
-fn ends_with(value: str, suffix: str) -> bool { ret suffix.len() <= value.len() && value.slice(value.len() - suffix.len(), suffix.len()) == suffix }
-fn arg_or(index: usize, fallback: str) -> str { match argv(index) { Some(value) => { ret value } None => { ret fallback } } }
+fn starts_with(value: str, prefix: str) -> bool {
+    ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix
+}
+fn ends_with(value: str, suffix: str) -> bool {
+    ret suffix.len() <= value.len() && value.slice(value.len() - suffix.len(), suffix.len()) == suffix
+}
+fn arg_or(index: usize, fallback: str) -> str {
+    match argv(index) {
+        Some(value) => {
+            ret value
+        }
+        None => {
+            ret fallback
+        }
+    }
+}
 fn shell_quote(value: str) -> str {
     let mut out = "'"
     let mut index = 0_usize
     while index < value.len() {
         let ch = value.slice(index, 1_usize)
-        if ch == "'" { out = out + "'\\''" }
-        else { out = out + ch }
+        if ch == "'" {
+            out = out + "'\\''"
+        } else {
+            out = out + ch
+        }
         index = index + 1_usize
     }
     ret out + "'"
 }
 
-fn argc() -> usize { ret process_arg_count() }
-fn argv(index: usize) -> Option[str] { ret process_arg(index) }
+fn argc() -> usize {
+    ret process_arg_count()
+}
+fn argv(index: usize) -> Option[str] {
+    ret process_arg(index)
+}
