@@ -8,13 +8,31 @@ on:
 
 permissions:
   contents: read
+  actions: read
+  pull-requests: read
 
 concurrency:
   group: native-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  candidate:
+    name: Select verified candidate
+    runs-on: ubuntu-latest
+    outputs:
+      reused: ${{ steps.select.outputs.reused }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Reuse identical merged PR build
+        id: select
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/select-ci-candidate.py
+
   resolve-inputs:
+    needs: candidate
+    if: needs.candidate.outputs.reused != 'true'
     name: Resolve trusted inputs
     runs-on: ubuntu-latest
     env:
@@ -25,6 +43,16 @@ jobs:
       index_sha: ${{ steps.index.outputs.sha }}
     steps:
       - uses: actions/checkout@v6
+      - name: Record original build identity
+        shell: bash
+        run: |
+          jq -n --arg commit "$GITHUB_SHA" --arg tree "$(git rev-parse HEAD^{tree})" \
+            '{commit: $commit, tree: $tree}' > build-identity.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-identity
+          path: build-identity.json
+          retention-days: 30
       - name: Select latest stable compiler once
         id: seed
         shell: bash
@@ -62,7 +90,9 @@ jobs:
           version=${release%%-*}
           release_name=${release#*-}
           test "$release" = "$version-$release_name"
-          sha=$(git ls-remote https://github.com/encore-ecosystem/encore-index.git refs/heads/main | awk '{print $1}')
+          # Reviewed Neumann 0.1.1 system sources, shared by bootstrap and tests.
+          # Keep this immutable: rebuilding a compiler commit must not follow main.
+          sha=dee46d96cb0e846f1884bc14e4f2566526004ed0
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "ENCORE_INDEX_URL=https://raw.githubusercontent.com/encore-ecosystem/encore-index/$sha" >> "$GITHUB_ENV"
@@ -243,6 +273,11 @@ jobs:
             target/llvm-mingw/linux-aarch64-sysroot
           echo "LLVM_MINGW_ROOT=$PWD/target/llvm-mingw" >> "$GITHUB_ENV"
 
+      - name: Verify macOS Network.framework TLS
+        if: matrix.producer == 'darwin' || matrix.producer == 'darwin-intel'
+        shell: bash
+        run: python3 ../encore-index/scripts/test-apple-tls.py
+
       - name: Build producer once, then emit target stage1 artifacts
         shell: bash
         run: |
@@ -310,6 +345,15 @@ jobs:
         run: |
           set -euo pipefail
           scripts/build-linux-aarch64-sysroot.sh target/llvm-mingw/sysroot
+
+      - name: Check Windows credential runtime before bootstrapping
+        if: matrix.kind == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/llvm-mingw/bin/clang --target="${{ matrix.target }}" \
+            -Wall -Wextra -Werror -c target/system-index/packages/secret-store/runtime.c \
+            -o target/secret-store.obj
       - name: Build reproducible target kit
         shell: bash
         run: |
@@ -463,6 +507,7 @@ jobs:
           test "$actual" = "$(jq -r '.executable_sha256' "$manifest")"
           chmod +x "$compiler" 2>/dev/null || true
           echo "STAGE1_COMPILER=$compiler" >> "$GITHUB_ENV"
+          echo "STAGE1_MANIFEST=$PWD/$manifest" >> "$GITHUB_ENV"
           echo "tag=${{ needs.resolve-inputs.outputs.seed_tag }}" >> "$GITHUB_OUTPUT"
 
       - name: Install matching Windows GNU host toolchain
@@ -490,6 +535,21 @@ jobs:
           echo "ENCORE_LINKER=$PWD/$root/bin/clang.exe" >> "$GITHUB_ENV"
           echo "ENCORE_AR=$PWD/$root/bin/llvm-ar.exe" >> "$GITHUB_ENV"
 
+      - name: Verify Windows process capture
+        if: contains(matrix.triple, 'windows')
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=../encore-index/packages/platform/tests/process_windows.c
+          if [[ "${{ matrix.triple }}" == *-msvc ]]; then
+            clang -std=c11 -Wall -Wextra -Werror "$source" -lshell32 \
+              -o target/process-windows.exe
+          else
+            "$ENCORE_CC" -std=c11 -Wall -Wextra -Werror "$source" -lshell32 \
+              -o target/process-windows.exe
+          fi
+          target/process-windows.exe
+
       - name: Verify byte-identical stage2/stage3 fixed point
         shell: bash
         run: |
@@ -510,6 +570,15 @@ jobs:
           set -euo pipefail
           python3 scripts/test-incremental-cache.py \
             "target/stage3/${{ matrix.executable }}"
+
+      - name: Verify standard library and interactive input
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler="$PWD/target/stage3/${{ matrix.executable }}"
+          (cd ../encore-index/packages/std && "$compiler" test --jobs 2)
+          python3 scripts/test-std-input.py "$compiler"
+          ENCORE_TEST_COMPILER="$compiler" python3 ../encore-index/scripts/test-http-send.py
 
       - name: Build examples
         if: matrix.triple == 'x86_64-unknown-linux-gnu'
@@ -538,6 +607,11 @@ jobs:
           "$compiler" format --check
           "$compiler" check
           "$compiler" lint
+          python3 scripts/test-init.py "$compiler"
+          python3 scripts/test-safety.py "$compiler"
+          python3 scripts/test-type-identity.py "$compiler"
+          python3 scripts/test-unit-harness.py "$compiler"
+          python3 scripts/test-registry-sources.py "$compiler"
 
       - name: Build matching Encore language server
         shell: bash
@@ -594,7 +668,7 @@ jobs:
           [[ "${{ matrix.triple }}" == *-windows-* ]] && lsp_executable=encore-lsp.exe
           cp "target/stage3/$lsp_executable" "$root/bin/$lsp_executable"
           chmod +x "$root/bin/$lsp_executable" 2>/dev/null || true
-          for name in core platform std rich json log profile ehir toml colorterm llvm argparse; do
+          for name in core platform std rich json log profile ehir toml colorterm llvm argparse secret-store; do
             source_name=$name
             test -f "$PWD/target/system-index/packages/$source_name/encore.toml"
             cp -R "$PWD/target/system-index/packages/$source_name" "$root/lib/encore/index/$name"
@@ -617,6 +691,12 @@ jobs:
             "${{ needs.resolve-inputs.outputs.index_sha }}" "$dependencies_sha" "${{ matrix.triple }}" \
             "$stage3_sha" "$lsp_sha" "$stage2_sha" "$stage3_sha" \
             > "dist/provenance-${{ matrix.triple }}.json"
+          jq --slurpfile stage1 "$STAGE1_MANIFEST" \
+            '. + {bootstrap: $stage1[0].bootstrap}' \
+            "dist/provenance-${{ matrix.triple }}.json" \
+            > "dist/provenance-${{ matrix.triple }}.json.pending"
+          mv "dist/provenance-${{ matrix.triple }}.json.pending" \
+            "dist/provenance-${{ matrix.triple }}.json"
           find "$root" -exec touch -t 200001010000.00 {} +
           case "${{ matrix.triple }}" in
             *-windows-*)

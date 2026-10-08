@@ -36,8 +36,8 @@ Prefer `match` when both cases need distinct behavior.
 
 ```enq
 let mut values = Vec[u32]::new()
-values = values.push(3_u32)
-values = values.push(5_u32)
+values.push(3)
+values.push(5)
 ```
 
 Main methods:
@@ -52,7 +52,8 @@ Main methods:
 
 ## `Dict`
 
-`Dict[K, V]` is a hash dictionary. Keys need `Hashable + Eq`. `std` implements
+`Dict[K, V]` is a dictionary with linear lookup in 0.1.1; hash-table
+optimization is deferred. Keys need `Hashable + Eq`. `std` implements
 `Hashable` for `str`, `bool` and integer types.
 
 ```enq
@@ -61,7 +62,7 @@ import std::option::Option
 
 fn lookup() -> u32 {
     let mut dict = Dict[str, u32]::new()
-    dict = dict.insert("answer", 42_u32)
+    dict.insert("answer", 42)
 
     match dict.get("answer") {
         Option[u32]::Some(value) => value
@@ -72,6 +73,20 @@ fn lookup() -> u32 {
 
 Main methods: `new`, `with_capacity`, `len`, `capacity`, `is_empty`, `clear`,
 `insert`, `get`, `contains_key`, `remove`.
+
+`insert` and `remove` mutate the dictionary and return the previous value as
+`Option[V]`. Copies share storage; `clone()` creates an independent collection.
+`keys()`, `values()` and `items()` return snapshots, not lazy views.
+Lookup, insertion and removal are O(n).
+
+## Sets and integer parsing
+
+[`Set[T]`](library/std/set.md) provides unique values, membership checks,
+union, intersection and difference, using the same key bounds as `Dict`.
+
+[`std::num`](library/std/num.md) provides checked `parse[T](text)` for decimal
+integers and `parse_radix[T](text, radix)` for bases 2–36. Radix zero detects
+`0x`, `0o` and `0b`. Overflow and invalid input return `Result::Err`.
 
 ## `String`
 
@@ -111,13 +126,22 @@ Main `Path` methods:
 - `with_suffix`, `with_name`
 - `exists`, `mkdir`, `remove_file`, `read_text`, `write_text`
 
-`std::fs` exposes string-path helpers: `exists`, `read_to_string`,
-`read_to_str`, `write`, `remove_file`, `create_dir`, `read_dir`.
+Prefer `std::fs::read(path)` and `write(path, contents)`: they return
+`Result[str, IoError]` and `Result[(), IoError]`, respectively, and check close
+errors. `File` provides buffered reads and a lazy `lines()` iterator; keep it
+inside a `with` context so early returns also close the file.
+
+Legacy `read_to_string`/`read_to_str` use fallback values, while `fs_write`,
+`remove_file` and directory creation return native status codes. These older
+APIs have not been silently changed to `Result`.
 
 ## IO, Formatting, OS, Process And Time
 
 `std::io`: `print`, `println`, `eprint`, `eprintln`, `print_debug`,
-`println_debug`.
+`println_debug`, `input`, `try_input`, and checked `File` streams.
+`input(prompt)` prints and flushes the prompt, then returns a line without LF
+or CRLF. It panics on EOF or IO failure; use `try_input(prompt)` to recover.
+Pass `""` when no prompt is needed.
 
 `std::fmt`: `Debug::fmt(value)` for primitive values, `String`, `Option`,
 `Result` and `Vec`.
@@ -129,6 +153,8 @@ Main `Path` methods:
 `exit_failure`.
 
 `std::time`: `time_ms`, `time`, `perf_counter_ms`, `perf_counter`, `sleep_ms`.
+Use `Instant::now()` and `elapsed()` for monotonic elapsed time, and `Duration`
+for checked arithmetic. See [`std::time`](library/std/time.md).
 
 ## Networking
 

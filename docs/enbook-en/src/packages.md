@@ -117,8 +117,43 @@ archive and verifies the recorded checksum.
 The default sparse index is
 `https://raw.githubusercontent.com/encore-ecosystem/encore-index/refs/heads/main`. Package
 `json` is described by `js/json.json`; only that metadata file is downloaded.
-Set `ENCORE_INDEX_URL` to use a mirror and `ENCORE_REGISTRY_CACHE` to override
+Set `ENCORE_DEFAULT_INDEX` to choose your default index without adding a registry
+section to every project, and `ENCORE_REGISTRY_CACHE` to override
 the default cache under `~/.cache/encore/registry`.
+
+The root project can instead select one index in `encore.toml`:
+
+```toml
+[registry]
+index = "https://packages.example.org/index"
+```
+
+Selection priority is `ENCORE_INDEX_URL`, the root manifest's `[registry].index`,
+`ENCORE_DEFAULT_INDEX`, then the built-in public index. For local development:
+
+```sh
+export ENCORE_DEFAULT_INDEX="http://127.0.0.1:8137/index"
+```
+
+The same selection applies to resolution, publication and authentication.
+Empty environment variables are treated as unset. A nonempty invalid selected
+URL is an error, not a reason to try another index.
+Dependencies cannot override the
+root's selection, and resolution never falls back to another index. HTTPS is
+required except for loopback HTTP development servers and absolute `file://`
+fixture indexes. Credentials, queries and fragments are not accepted in index
+URLs. Tokens must not be stored in this field.
+
+Newly resolved packages record `registry` in `encore.lock` and use separate cache
+namespaces for each normalized index URL. After changing the index, run
+`encore update` explicitly; ordinary builds and sync refuse to replace a pinned
+source. Old lockfiles without `registry` retain their exact archive URLs and
+checksums until an explicit update.
+
+Custom-index resolution and publication use the selected service. `encore publish`
+discovers `/config.json` below the index URL and uploads through its same-origin
+API with `ENCORE_REGISTRY_TOKEN`. A missing or incompatible service is an error,
+never a fallback to GitHub. See [custom registry publication](publishing-packages.md#custom-registry-service).
 
 An index entry contains immutable release archives in publication order:
 

@@ -12,6 +12,7 @@ on:
 permissions:
   actions: read
   contents: write
+  pull-requests: read
 
 jobs:
   promote:
@@ -23,7 +24,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify tag and exact green trunk candidate
+      - name: Verify tag and exact green source-tree candidate
         id: candidate
         shell: bash
         run: |
@@ -49,19 +50,7 @@ jobs:
           fi
           git fetch origin trunk
           git merge-base --is-ancestor "$GITHUB_SHA" origin/trunk
-          run_id=$(gh run list \
-            --workflow ci.yml \
-            --branch trunk \
-            --commit "$GITHUB_SHA" \
-            --status success \
-            --limit 20 \
-            --json databaseId,headSha,conclusion,event \
-            --jq 'map(select(.headSha == env.GITHUB_SHA and .conclusion == "success" and (.event == "push" or .event == "workflow_dispatch"))) | first | .databaseId')
-          test -n "$run_id" && test "$run_id" != null || {
-            echo "::error::No successful trunk CI run exists for exact commit $GITHUB_SHA"
-            exit 1
-          }
-          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          python3 scripts/select-ci-candidate.py --required
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "release=$release" >> "$GITHUB_OUTPUT"
@@ -122,7 +111,7 @@ jobs:
             x86_64-w64-windows-gnu \
             aarch64-w64-windows-gnu
           do
-            jq -e --arg commit "$GITHUB_SHA" --arg version "$version" \
+            jq -e --arg commit "${{ steps.candidate.outputs.source_commit }}" --arg version "$version" \
               --arg nametag "$release_name" --arg release "$release" --arg target "$triple" '
               .schema == 2 and .commit == $commit and .version == $version and
               .nametag == $nametag and .release == $release and .target == $target and
@@ -189,6 +178,13 @@ jobs:
             printf '%s  %s\n' "$expected" "$archive" >> dist/SHA256SUMS
           done
           LC_ALL=C sort -o dist/SHA256SUMS dist/SHA256SUMS
+          # Keep original build provenance unchanged; record adoption separately.
+          jq -n --arg release_commit "$GITHUB_SHA" \
+            --arg source_commit "${{ steps.candidate.outputs.source_commit }}" \
+            --arg tree "$(git rev-parse HEAD^{tree})" \
+            --arg run_id "${{ steps.candidate.outputs.run_id }}" \
+            '{schema:1, release_commit:$release_commit, source_commit:$source_commit,
+              source_tree:$tree, verified_run_id:$run_id}' > dist/adoption.json
           printf '{"schema":2,"channel":"%s","version":"%s","nametag":"%s","release":"%s","tag":"%s","commit":"%s","verification":{"converged":true,"targets":7},"assets":[%s]}\n' \
             "$CHANNEL" "$version" "$release_name" "$release" "$GITHUB_REF_NAME" "$GITHUB_SHA" \
             "$assets" > dist/channel.json
@@ -205,6 +201,7 @@ jobs:
             dist/SHA256SUMS
             dist/channel.json
             dist/provenance-*
+            dist/adoption.json
           generate_release_notes: true
           name: Encore ${{ steps.candidate.outputs.version }} — ${{ steps.candidate.outputs.display_name }}
           prerelease: ${{ steps.candidate.outputs.channel != 'stable' }}

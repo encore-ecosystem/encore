@@ -12,7 +12,7 @@ import std::vec::Vec
 import json::{Json, field, stringify}
 import refrain::diagnostics::{applicability_name, render_diagnostic}
 import refrain::formatter::{FormatConfig, FormatResult, format_syntax}
-import refrain::frontend::{AnalysisDatabase, DiagnosticLabelKind, FrontendDiagnostic, FrontendDocument, SyntaxDocument}
+import refrain::frontend::{AnalysisDatabase, DiagnosticLabelKind, FrontendDiagnostic, FrontendDocument, SyntaxDocument, FunctionSafety}
 import refrain::frontend::parser::statements::Statement
 import refrain::frontend::translator::{TranslationModule, filter_ast_for_target, set_translation_diagnostic_json, validate_ast_for_target, validate_translation_modules}
 import refrain::project::{ProjectToolingConfig, ProjectWorkspace, load_binary_workspace, load_entry_workspace, load_library_workspace, read_project_tooling_config}
@@ -35,6 +35,7 @@ pub fn native_check() -> u32 {
         ret 2_u32
     }
     let mut diagnostics = Vec[ToolDiagnostic]::new()
+    let mut safety_report = Vec[(str, FunctionSafety)]::new()
     let mut module_count = 0_usize
     let mut standalone_ast = Option[Vec[Statement]]::None
     let mut validation_modules = Vec[TranslationModule]::new()
@@ -54,9 +55,13 @@ pub fn native_check() -> u32 {
             let mut workspace = load_entry_workspace(project_root, path)
             validation_target = requested_target(project_root)
             for module in workspace.modules {
+                workspace.analysis.configure_safety(module.analysis_id.key(), validation_target, module.enabled_features)
+            }
+            for module in workspace.modules {
                 if module.path() == path.as_str() {
                     append_diagnostics(module.path(), module.source, module.diagnostics, diagnostics)
                     append_diagnostics(module.path(), module.source, workspace.analysis.module_semantic_diagnostics(module.analysis_id.key()), diagnostics)
+                    if has_option("--safety") { collect_safety(workspace.analysis, module.analysis_id.key(), module.path(), safety_report) }
                     validation_entry = module.module_id
                     module_count = 1_usize
                 }
@@ -79,6 +84,7 @@ pub fn native_check() -> u32 {
                 Option[FrontendDocument]::Some(document) => {
                     append_diagnostics(path.as_str(), source, document.diagnostics, diagnostics)
                     append_diagnostics(path.as_str(), source, database.module_semantic_diagnostics(path.as_str()), diagnostics)
+                    if has_option("--safety") { collect_safety(database, path.as_str(), path.as_str(), safety_report) }
                     standalone_ast = Option[Vec[Statement]]::Some(document.ast)
                 }
                 Option[FrontendDocument]::None => {}
@@ -90,11 +96,15 @@ pub fn native_check() -> u32 {
         if !file_exists(root.join("encore.toml").as_str()) { eprintln("error[manifest]: Unable to find encore.toml at " + root.join("encore.toml").as_str()) ret 2_u32 }
         let mut workspace = load_analysis_workspace(root)
         validation_target = requested_target(root)
+        for module in workspace.modules {
+            workspace.analysis.configure_safety(module.analysis_id.key(), validation_target, module.enabled_features)
+        }
         validation_entry = workspace.root_name + "@main.enq"
         for module in workspace.modules {
             if module.owner_name == workspace.root_name {
                 append_diagnostics(module.path(), module.source, module.diagnostics, diagnostics)
                 append_diagnostics(module.path(), module.source, workspace.analysis.module_semantic_diagnostics(module.analysis_id.key()), diagnostics)
+                if has_option("--safety") { collect_safety(workspace.analysis, module.analysis_id.key(), module.path(), safety_report) }
                 module_count += 1_usize
             }
             validation_modules.push(TranslationModule{
@@ -124,11 +134,41 @@ pub fn native_check() -> u32 {
             }
         }
     }
+    for entry in safety_report {
+        let effect = entry.1
+        if format == "json" {
+            let mut values = Vec[(str, Json)]::new()
+            values.push(field("kind", Json::String("function-safety")))
+            values.push(field("path", Json::String(entry.0)))
+            values.push(field("name", Json::String(effect.name)))
+            values.push(field("owner", Json::String(effect.owner)))
+            values.push(field("line", Json::Number(Debug::fmt(effect.line + 1_usize))))
+            values.push(field("column", Json::Number(Debug::fmt(effect.column + 1_usize))))
+            values.push(field("unsafe", Json::Bool(effect.is_unsafe())))
+            values.push(field("body_unsafe", Json::Bool(effect.body_unsafe)))
+            values.push(field("asserted_safe", Json::Bool(effect.asserted_safe)))
+            println(stringify(Json::Object(values)))
+        } else {
+            println("Safety: " + (if effect.is_unsafe() { "unsafe " } else { "safe " }) + effect.module_name + "::" +
+                (if effect.owner == "" { "" } else { effect.owner + "::" }) + effect.name +
+                (if effect.asserted_safe { " (#attr(safe))" } else { "" }))
+        }
+    }
     if format != "json" {
         let suffix = if module_count == 1_usize { "" } else { "s" }
         println("Checked " + Debug::fmt(module_count) + " module" + suffix)
     }
     ret 0_u32
+}
+
+fn collect_safety(database: mut AnalysisDatabase, module_name: str, path: str, report: mut Vec[(str, FunctionSafety)]) ->() {
+    for indexed in database.all_symbols() {
+        if indexed.module_name != module_name || indexed.symbol.kind != 12_usize { continue }
+        match database.function_safety(indexed.id) {
+            Some(effect) => { report.push((path, effect)) }
+            None => {}
+        }
+    }
 }
 
 /// Formats a project or source file transactionally.

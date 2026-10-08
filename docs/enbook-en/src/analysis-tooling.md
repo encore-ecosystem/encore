@@ -24,6 +24,16 @@ the compiler's public analysis database, formatter, lint engine, project
 configuration, ranges, and suggestions; it does not contain a second language
 analyzer.
 
+Callable safety is a backend-independent query in that database. It resolves
+the reachable call graph and computes a monotone fixed point, including
+recursive components. Summaries retain both internal unsafe effects and the
+external `#attr(safe)` boundary. Closure creation and invocation are distinct;
+implicit operator, iterator and context-manager calls participate too.
+Results are cached within a source revision and invalidated by body-only edits
+as well as target/feature configuration changes. A single query does not parse
+unrelated module bodies. `encore check --safety` and callable hover consume the
+same summaries rather than scanning source text independently.
+
 Worker-side syntax validation retains its recovered AST. The database reuses
 that immutable result when a semantic query first requests the full document,
 instead of discarding it and parsing the same tokens again. Persistent

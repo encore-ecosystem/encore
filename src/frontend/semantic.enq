@@ -179,6 +179,7 @@ pub struct SemanticBody {
     member_receivers: Vec[(usize, usize, str)]
     bound_methods: Vec[SemanticMethod]
     type_names: Vec[TypeNameBinding]
+    implicit_receivers: Vec[(usize, usize, str, str)]
 }
 
 struct SemanticContext {
@@ -196,6 +197,7 @@ struct SemanticContext {
     member_receivers: Vec[(usize, usize, str)]
     type_names: Vec[TypeNameBinding]
     type_scope: str
+    implicit_receivers: Vec[(usize, usize, str, str)]
 }
 
 impl for SemanticBody {
@@ -203,7 +205,7 @@ impl for SemanticBody {
     pub fn empty() -> Self {
         ret Self {
             Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(),
-            "", Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), Vec[TypeNameBinding]::new()
+            "", Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), Vec[TypeNameBinding]::new(), Vec[(usize, usize, str, str)]::new()
         }
     }
 
@@ -456,7 +458,7 @@ pub fn check_function_body_with_types(item: FunctionItem, callables: Vec[Semanti
     if semantic_function_has_attr(item, "decorator") {
         ret SemanticBody {
             Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(),
-            item.ret_type.unwrap_or("void"), Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), Vec[TypeNameBinding]::new()
+            item.ret_type.unwrap_or("void"), Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), Vec[TypeNameBinding]::new(), Vec[(usize, usize, str, str)]::new()
         }
     }
     ret check_function_body_with_scope(item, callables, fields, methods, self_type, Vec[GenericParam]::new(), aggregate_names)
@@ -482,7 +484,7 @@ pub fn check_function_body_with_type_scope(item: FunctionItem, callables: Vec[Se
     if semantic_function_has_attr(item, "decorator") {
         ret SemanticBody {
             Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(),
-            item.ret_type.unwrap_or("void"), Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), type_names
+            item.ret_type.unwrap_or("void"), Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), type_names, Vec[(usize, usize, str, str)]::new()
         }
     }
     let mut generic_names = Vec[str]::new()
@@ -501,7 +503,7 @@ pub fn check_function_body_with_type_scope(item: FunctionItem, callables: Vec[Se
         callables, fields, scoped_methods, self_type, generic_names, Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(),
         Vec[SemanticDependency]::new(),
         (0_usize, 0_usize, 0_usize, 0_usize), Vec[ScopedSemanticBinding]::new(), aggregate_names,
-        Vec[(usize, usize, str)]::new(), type_names, type_scope
+        Vec[(usize, usize, str)]::new(), type_names, type_scope, Vec[(usize, usize, str, str)]::new()
     }
     for generic in generics {
         if generic.bounds.len() > 0_usize {
@@ -583,7 +585,7 @@ pub fn check_function_body_with_type_scope(item: FunctionItem, callables: Vec[Se
     }
     ret SemanticBody {
         public_bindings, public_diagnostics, ctx.dependencies, display_type(return_type, type_names), public_scoped,
-        ctx.member_receivers, bound_methods, type_names
+        ctx.member_receivers, bound_methods, type_names, ctx.implicit_receivers
     }
 }
 
@@ -1423,6 +1425,7 @@ fn check_statements(
             }
             Statement::For(item) => {
                 let iterable = infer_expression(ctx, item.iterable)
+                ctx.implicit_receivers.push((item.iterable.line, item.iterable.column, "for", iterable))
                 let outer_bindings = ctx.bindings.len()
                 let outer_scope = ctx.scope
                 replace_scope(ctx, block_scope(item.body))
@@ -1437,6 +1440,7 @@ fn check_statements(
             }
             Statement::With(item) => {
                 let resource = infer_expression(ctx, item.expr)
+                ctx.implicit_receivers.push((item.expr.line, item.expr.column, "with", resource))
                 let outer_bindings = ctx.bindings.len()
                 let outer_scope = ctx.scope
                 replace_scope(ctx, block_scope(item.body))
@@ -1619,6 +1623,9 @@ fn infer_expression(
             let operator = binary.operator
             let lhs = infer_expression_h(ctx, binary.lhs)
             let rhs = infer_expression_h(ctx, binary.rhs)
+            if operator == "+" && !numeric_semantic_type(lhs) && lhs != "str" {
+                ctx.implicit_receivers.push((line, column, "binary", lhs))
+            }
             check_binary_operands(ctx, operator, lhs, rhs, source_name, line, column, length)
             if operator == "==" || operator == "!=" || operator == "<" || operator == "<=" || operator
             == ">" || operator == ">=" || operator == "&&" || operator == "||" {
@@ -1778,6 +1785,9 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode < H >) -> str {
             let operator = binary.operator
             let lhs = infer_expression_h(ctx, binary.lhs)
             let rhs = infer_expression_h(ctx, binary.rhs)
+            if operator == "+" && !numeric_semantic_type(lhs) && lhs != "str" {
+                ctx.implicit_receivers.push((line, column, "binary", lhs))
+            }
             check_binary_operands(ctx, operator, lhs, rhs, source_name, line, column, length)
             if operator == "==" || operator == "!=" || operator == "<" || operator == "<=" || operator
             == ">" || operator == ">=" || operator == "&&" || operator == "||" {
@@ -2566,7 +2576,31 @@ fn indexed_type(ctx: SemanticContext, typ: str) -> str {
     ret ""
 }
 
-fn iterable_item_type(ctx: SemanticContext, typ: str) -> str {
+fn iterable_method_return(ctx: mut SemanticContext, receiver: str, name: str) -> str {
+    for method in ctx.methods {
+        if !method.is_static && method.name == name &&
+        semantic_receiver_matches(method.receiver_type, receiver, method.generic_names) {
+            remember_method_dependency(ctx, method)
+            ret specialize_method_type(method.ret_type, method.receiver_type, receiver, method.generic_names)
+        }
+    }
+    remember_failed_lookup(ctx)
+    ret ""
+}
+
+fn iterable_item_type(ctx: mut SemanticContext, typ: str) -> str {
+    let mut iterator = typ
+    let converted = iterable_method_return(ctx, typ, "into_iter")
+    if converted != "" {
+        iterator = converted
+    }
+    let step = iterable_method_return(ctx, iterator, "next")
+    if step != "" {
+        let option = tuple_element_type(step, "1")
+        if declaration_type_name(semantic_root_type(option), ctx.type_names) == "Option" {
+            ret first_type_argument(option)
+        }
+    }
     let item = indexed_type(ctx, typ)
     if item != "" {
         ret item

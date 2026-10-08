@@ -1,6 +1,61 @@
 # Publishing Packages
 
-Encore uses GitHub as package storage and
+## Custom registry service
+
+Set `ENCORE_DEFAULT_INDEX` once in your environment to select a service for all
+projects. A project can override that default in its root manifest:
+
+```toml
+[registry]
+index = "https://packages.example.org/index"
+```
+
+`encore publish` discovers its schema-1 API at `<index>/config.json`, uploads in
+64 KiB chunks and asks the service to commit the SHA-256-verified archive.
+Authenticated publication uses the native HTTP client, not curl. Requests stay
+on the index origin and never follow redirects. A failed custom service never
+falls back to GitHub. Plain HTTP is allowed only for `localhost`/`127.0.0.1`
+development services; `localhost` connects directly to IPv4 loopback without DNS.
+
+For a service advertising device authentication:
+
+```sh
+encore login
+# Open the printed URL, sign in and approve the displayed device code.
+encore whoami
+encore publish
+encore logout
+```
+
+`login`, `whoami` and `logout` accept `--registry <index-url>` outside a project.
+Otherwise they use `ENCORE_INDEX_URL`, the root manifest, or
+`ENCORE_DEFAULT_INDEX`, in that order. Login stores the
+credential in the OS keyring, keyed by the complete canonical index URL:
+libsecret on Linux, Keychain on macOS, Credential Manager on Windows. A missing,
+locked or denied keyring is an error; there is no plaintext-file fallback.
+Logout revokes remotely before removing the local credential. If revocation
+cannot be confirmed, the local credential is retained so you can retry.
+
+In CI, create a short-lived, package-scoped token in the registry account page.
+Inject it as `ENCORE_REGISTRY_TOKEN` through your CI secret manager and set
+`ENCORE_REGISTRY_TOKEN_INDEX=https://packages.example.org/index`. Both are
+required: a project's registry override must not receive a token intended for
+another index. Tokens never appear in command arguments or request files.
+Unset `ENCORE_REGISTRY_TOKEN` before interactive login. The default legacy
+GitHub index does not provide device authentication; it still uses `gh auth`.
+
+The API path needs Git **locally** for tracked-file selection and deterministic
+archives, but no commit, remote, GitHub repository, clean worktree or push.
+Root path dependencies are rewritten in staging. `encore publish --dry-run`
+checks and creates the archive without HTTP requests, authentication or running
+tests; run `encore check` and `encore test` beforehand. The first service version
+accepts at most 4 MiB compressed. Same version + identical archive is idempotent;
+different bytes for an existing version are rejected. Retry the command after
+an interrupted transfer. `--release-only` is not supported by this API.
+
+## Default GitHub index
+
+Without a custom registry, Encore uses GitHub as package storage and
 [`encore-ecosystem/encore-index`](https://github.com/encore-ecosystem/encore-index) as a sparse
 metadata catalog. Package source can live in any public GitHub repository. A
 published version is a maintainer-created `.tar.gz` asset attached to a GitHub

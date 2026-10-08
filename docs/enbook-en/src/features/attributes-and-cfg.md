@@ -21,6 +21,11 @@ see [decorators](decorators.md). An arbitrary attribute name is not a portable
 extension point just because it parses. Only rely on implemented, documented
 attributes for the compiler version in use.
 
+`#attr(safe)` declares a caller-visible safe contract even when the function
+contains unsafe operations. It is an explicit acceptance of responsibility,
+not an automatic proof. Without this annotation, unsafe effects propagate
+through calls. See [inferred function safety](unsafe-and-ehir.md#inferred-function-safety).
+
 See [packages](../packages.md#conditional-compilation) for CLI configuration
 and build metadata. Test each configuration you distribute: compiling one
 branch does not type-check code excluded by another target's configuration.
