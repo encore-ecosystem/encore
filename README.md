@@ -31,7 +31,7 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 ```
 
 Use `--install-dir <path>` for another location. The installer supports Linux
-and macOS on x86-64 and AArch64.
+on x86-64 and AArch64, and macOS on Apple Silicon (M1 or newer).
 
 ## Quick Start
 
