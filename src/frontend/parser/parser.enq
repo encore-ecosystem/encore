@@ -4,7 +4,7 @@ import refrain::frontend::lexer::Lexer
 import refrain::frontend::lexer::Token
 import refrain::frontend::lexer::TokenType
 
-import mod::statements:: *
+import mod::statements::*
 
 import core::fmt::Debug
 import core::option::Option
@@ -2333,7 +2333,9 @@ impl for Parser {
             TokenType::IDENTIFIER => {
                 if curr_token.value == "f" && self.peek_next_type() == TokenType::STRING {
                     self.consume()
-                    ret Result[ExprNode, ParseFailure]::Ok(self.parse_fstring(self.consume_value())?)
+                    let literal = self.peek_curr()
+                    self.consume()
+                    ret Result[ExprNode, ParseFailure]::Ok(self.parse_fstring(literal)?)
                 }
                 let path = self.parse_path()?
                 if path == "format" && self.peek_curr_type() == TokenType::BANG {
@@ -2448,13 +2450,13 @@ impl for Parser {
                 )))
     }
 
-    fn parse_fstring(mut self, raw: str) -> Result[ExprNode, ParseFailure] {
+    fn parse_fstring(mut self, raw: Token) -> Result[ExprNode, ParseFailure] {
         ret Result[ExprNode, ParseFailure]::Ok(self.build_format_expr(raw, Vec[ExprNode]::new())?)
     }
 
     fn parse_format_macro(mut self) -> Result[ExprNode, ParseFailure] {
         self.safe_consume(TokenType::LEFT_PAREN)?
-        let raw = self.safe_consume_value(TokenType::STRING)?
+        let raw = self.safe_consume(TokenType::STRING)?
         let mut positional = Vec[ExprNode]::new()
         while self.peek_curr_type() == TokenType::COMMA {
             self.consume()
@@ -2467,9 +2469,9 @@ impl for Parser {
         ret Result[ExprNode, ParseFailure]::Ok(self.build_format_expr(raw, positional)?)
     }
 
-    fn parse_inline_expression(mut self, source: str) -> Result[ExprNode, ParseFailure] {
+    fn parse_inline_expression(mut self, source: str, line: usize, column: usize) -> Result[ExprNode, ParseFailure] {
         let mut lexer = Lexer::new()
-        let tokens = lexer.tokenize(source)
+        let tokens = lexer.tokenize_at(source, line, column)
         let mut nested = Parser::new_for_source(self.source_name)
         ret Result[ExprNode, ParseFailure]::Ok(nested.parse_inline_tokens(tokens)?)
     }
@@ -2480,16 +2482,18 @@ impl for Parser {
         ret Result[ExprNode, ParseFailure]::Ok(self.parse_expression()?)
     }
 
-    fn build_format_expr(mut self, raw: str, positional: Vec[ExprNode]) -> Result[ExprNode, ParseFailure] {
-        let body = raw.slice(1_usize, raw.len() - 2_usize)
+    fn build_format_expr(mut self, raw: Token, positional: Vec[ExprNode]) -> Result[ExprNode, ParseFailure] {
+        let body = raw.value.slice_bytes(1_usize, raw.value.byte_len() - 2_usize)
         let mut result = self.mk_expr(Expr::StringLiteral("\"\""))
         let mut cursor = 0_usize
         let mut chunk_start = 0_usize
         let mut positional_index = 0_usize
-        while cursor < body.len() {
-            if body.slice(cursor, 1_usize) == "{" {
+        let mut line = raw.line
+        let mut column = raw.column + 1
+        while cursor < body.byte_len() {
+            if body.byte_at(cursor) == 123 {
                 if cursor > chunk_start {
-                    let literal = self.mk_expr(Expr::StringLiteral("\"" + body.slice(chunk_start, cursor
+                    let literal = self.mk_expr(Expr::StringLiteral("\"" + body.slice_bytes(chunk_start, cursor
                                 - chunk_start,) + "\""))
                     result = self.mk_expr(Expr::Binary(BinaryExpr {
                                 self.box_expr(result), "+", self.box_expr(literal)
@@ -2498,14 +2502,14 @@ impl for Parser {
                         ))
                 }
                 let mut end = cursor + 1_usize
-                while end < body.len() && body.slice(end, 1_usize) != "}" {
+                while end < body.byte_len() && body.byte_at(end) != 125 {
                     end = end + 1_usize
                 }
-                if end >= body.len() {
+                if end >= body.byte_len() {
                     self.unexpected_token("closing '}' in f-string", self.peek_curr())?
                     ret Result[ExprNode, ParseFailure]::Ok(result)
                 }
-                let mut expression_source = body.slice(cursor + 1_usize, end - cursor - 1_usize)
+                let mut expression_source = body.slice_bytes(cursor + 1_usize, end - cursor - 1_usize)
                 let callee = self.mk_expr(Expr::Path("Debug::fmt"))
                 let mut args = Vec[ExprNode]::new()
                 if expression_source == "" {
@@ -2519,12 +2523,18 @@ impl for Parser {
                     }
                     positional_index = positional_index + 1_usize
                 } else {
-                    if expression_source.len() > 0_usize && expression_source.slice(0_usize, 1_usize)
-                    == "#" {
-                        expression_source = expression_source.slice(1_usize, expression_source.len()
+                    let tagged = expression_source.byte_at(0) == 35
+                    if tagged {
+                        expression_source = expression_source.slice_bytes(1_usize, expression_source.byte_len()
                             - 1_usize,)
                     }
-                    args.push(self.parse_inline_expression(expression_source)?)
+                    args.push(self.parse_inline_expression(expression_source, line, column + 1 + if tagged {
+                                1
+                            } else {
+                                0
+                            }
+                            ,
+                        )?)
                 }
                 let formatted = self.mk_expr(Expr::Call(CallExpr {
                             self.box_expr(callee), Vec[str]::new(), args
@@ -2536,14 +2546,28 @@ impl for Parser {
                         }
                         ,
                     ))
-                cursor = end + 1_usize
+                while cursor <= end {
+                    let byte = body.byte_at(cursor)
+                    if byte == 10 {
+                        line += 1 column = 0
+                    } elif byte < 128 || byte >= 192 {
+                        column += 1
+                    }
+                    cursor += 1
+                }
                 chunk_start = cursor
                 continue
             }
+            let byte = body.byte_at(cursor)
+            if byte == 10 {
+                line += 1 column = 0
+            } elif byte < 128 || byte >= 192 {
+                column += 1
+            }
             cursor = cursor + 1_usize
         }
-        if chunk_start < body.len() {
-            let literal = self.mk_expr(Expr::StringLiteral("\"" + body.slice(chunk_start, body.len()
+        if chunk_start < body.byte_len() {
+            let literal = self.mk_expr(Expr::StringLiteral("\"" + body.slice_bytes(chunk_start, body.byte_len()
                         - chunk_start,) + "\""))
             result = self.mk_expr(Expr::Binary(BinaryExpr {
                         self.box_expr(result), "+", self.box_expr(literal)

@@ -86,6 +86,138 @@ impl for Lexer {
         ret self.tokenize_source(p)
     }
 
+    /// Lexes an embedded expression at its physical source position.
+    pub fn tokenize_at(mut self, source: str, line: usize, column: usize) -> Vec[Token] {
+        let tokens = self.tokenize(source)
+        let mut out = Vec[Token]::new()
+        for token in tokens {
+            out.push(Token::new(token.type, token.value, line + token.line,
+                    if token.line == 0 {
+                        column + token.column
+                    } else {
+                        token.column
+                    }
+                    ,))
+        }
+        ret out
+    }
+
+    /// Exposes expression tokens inside f-strings for source tools, retaining
+    /// the original literal for syntax/formatting consumers. Strict parsing
+    /// continues to use the original compact stream.
+    pub fn expand_interpolations(self: Self, tokens: Vec[Token]) -> Vec[Token] {
+        ret self.project_interpolations(tokens, false)
+    }
+
+    /// Produces disjoint literal/expression spans for semantic highlighting,
+    /// including clients which disable their syntax highlighter entirely.
+    pub fn highlight_tokens(self: Self, tokens: Vec[Token]) -> Vec[Token] {
+        ret self.project_interpolations(tokens, true)
+    }
+
+    fn project_interpolations(self: Self, tokens: Vec[Token], literal_parts: bool) -> Vec[Token] {
+        let mut needed = false
+        let mut previous = Token::new(TokenType::EOF, "", 0, 0)
+        for token in tokens {
+            if token.type == TokenType::STRING && previous.type == TokenType::IDENTIFIER && previous.value == "f" {
+                needed = true break
+            }
+            previous = token
+        }
+        if !needed {
+            ret tokens
+        }
+        let mut out = Vec[Token]::new()
+        previous = Token::new(TokenType::EOF, "", 0, 0)
+        let mut index = 0
+        for token in tokens {
+            index += 1
+            let prefix = token.type == TokenType::IDENTIFIER && token.value == "f"
+            && match tokens.get(index) {
+                Some(next) => next.type == TokenType::STRING None => false
+            }
+            if token.type == TokenType::STRING && previous.type == TokenType::IDENTIFIER && previous.value == "f" {
+                if !literal_parts {
+                    out.push(token)
+                }
+                let raw = token.value
+                let mut cursor = 0
+                let mut line = token.line
+                let mut column = token.column
+                let mut chunk_start = 0
+                let mut chunk_line = token.line
+                let mut chunk_column = previous.column
+                while cursor < raw.byte_len() {
+                    let byte = raw.byte_at(cursor)
+                    if byte == 123 {
+                        let mut end = cursor + 1
+                        while end < raw.byte_len() && raw.byte_at(end) != 125 {
+                            end += 1
+                        }
+                        if end < raw.byte_len() {
+                            if literal_parts && cursor > chunk_start {
+                                let text = raw.slice_bytes(chunk_start, cursor - chunk_start)
+                                out.push(Token::new(TokenType::STRING, if chunk_start == 0 {
+                                            "f" + text
+                                        } else {
+                                            text
+                                        }
+                                        , chunk_line, chunk_column,))
+                            }
+                            let start = cursor + 1
+                            let tagged = raw.byte_at(start) == 35
+                            let offset = if tagged {
+                                1
+                            } else {
+                                0
+                            }
+                            let mut nested = Lexer::new()
+                            for inner in nested.tokenize_at(raw.slice_bytes(start + offset, end - start - offset), line, column + 1 + offset) {
+                                if inner.type != TokenType::EOF {
+                                    out.push(inner)
+                                }
+                            }
+                            while cursor <= end {
+                                let current = raw.byte_at(cursor)
+                                if current == 10 {
+                                    line += 1 column = 0
+                                } elif current < 128 || current >= 192 {
+                                    column += 1
+                                }
+                                cursor += 1
+                            }
+                            chunk_start = cursor
+                            chunk_line = line
+                            chunk_column = column
+                            continue
+                        }
+                    }
+                    if byte == 10 {
+                        line += 1 column = 0
+                    } elif byte < 128 || byte >= 192 {
+                        column += 1
+                    }
+                    cursor += 1
+                }
+                if literal_parts && chunk_start < raw.byte_len() {
+                    let text = raw.slice_bytes(chunk_start, raw.byte_len() - chunk_start)
+                    out.push(Token::new(TokenType::STRING, if chunk_start == 0 {
+                                "f" + text
+                            } else {
+                                text
+                            }
+                            , chunk_line, chunk_column,))
+                }
+            } else {
+                if !literal_parts || !prefix {
+                    out.push(token)
+                }
+            }
+            previous = token
+        }
+        ret out
+    }
+
     fn tokenize_source(mut self, p: str) -> Vec[Token] {
         self.line = 0_usize
         self.column = 0_usize
@@ -797,4 +929,28 @@ fn lexer_tracks_token_positions() -> bool {
         }
     }
     ret saw_main && saw_ret
+}
+
+#attr(test)
+fn lexer_embedded_expression_positions() -> bool {
+    let mut lexer = Lexer::new()
+    let tokens = lexer.tokenize_at("value +\n other", 8, 14)
+    let first = tokens.get(0).unwrap_or(Token::new(TokenType::EOF, "", 0, 0))
+    let last = tokens.get(2).unwrap_or(Token::new(TokenType::EOF, "", 0, 0))
+    ret first.value == "value" && first.line == 8 && first.column == 14
+    && last.value == "other" && last.line == 9 && last.column == 1
+}
+
+#attr(test)
+fn lexer_interpolation_unicode_and_multiline() -> bool {
+    let lexer = Lexer::new()
+    let mut compact = Vec[Token]::new()
+    compact.push(Token::new(TokenType::IDENTIFIER, "f", 10, 6))
+    compact.push(Token::new(TokenType::STRING, "\"😀 {value}\r\n{#value}\"", 10, 7))
+    let projected = lexer.expand_interpolations(compact)
+    let first = projected.get(2).unwrap_or(Token::new(TokenType::EOF, "", 0, 0))
+    let second = projected.get(3).unwrap_or(Token::new(TokenType::EOF, "", 0, 0))
+    ret projected.len() == 4 && compact.len() == 2 && first.value == "value"
+    && first.line == 10 && first.column == 11 && second.value == "value"
+    && second.line == 11 && second.column == 2
 }

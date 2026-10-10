@@ -2,6 +2,8 @@
 
 import std::vec::Vec
 
+import refrain::frontend::analysis::analyze_named_editor_module
+import refrain::frontend::parser::Statement
 import refrain::frontend::{FrontendDiagnostic, SyntaxDocument, Token, TokenType, analyze_source_lightweight}
 
 /// Controls deterministic Encore source formatting.
@@ -289,7 +291,7 @@ pub fn format_syntax(syntax: SyntaxDocument, diagnostics: Vec[FrontendDiagnostic
     }
     let working_syntax = SyntaxDocument::parse(working_source)
     let mut layout_tokens = normalize_trailing_commas(working_syntax.lossless_tokens(), effective)
-    let mut formatted = format_tokens(layout_tokens, effective)
+    let mut formatted = format_tokens(layout_tokens, effective, working_source)
     // A multiline grouped import becomes one logical line above. Reorder once
     // more on that canonical representation so the first formatter pass is
     // already a fixed point.
@@ -298,7 +300,7 @@ pub fn format_syntax(syntax: SyntaxDocument, diagnostics: Vec[FrontendDiagnostic
         if canonical_imports != formatted {
             let canonical_syntax = SyntaxDocument::parse(canonical_imports)
             layout_tokens = normalize_trailing_commas(canonical_syntax.lossless_tokens(), effective)
-            formatted = format_tokens(layout_tokens, effective)
+            formatted = format_tokens(layout_tokens, effective, canonical_imports)
         }
     }
     // Rendering may introduce a line break at the configured width, turning a
@@ -307,7 +309,7 @@ pub fn format_syntax(syntax: SyntaxDocument, diagnostics: Vec[FrontendDiagnostic
     // pass already reaches the same fixed point as the next pass.
     let stabilized_syntax = SyntaxDocument::parse(formatted)
     let stabilized_tokens = normalize_trailing_commas(stabilized_syntax.lossless_tokens(), effective)
-    let stabilized = format_tokens(stabilized_tokens, effective)
+    let stabilized = format_tokens(stabilized_tokens, effective, formatted)
     if stabilized != formatted {
         layout_tokens = stabilized_tokens
         formatted = stabilized
@@ -337,11 +339,23 @@ fn formatter_syntax_diagnostics(diagnostics: Vec[FrontendDiagnostic]) -> Vec[Fro
     ret out
 }
 
-fn format_tokens(tokens: Vec[Token], config: FormatConfig) -> str {
+fn format_tokens(tokens: Vec[Token], config: FormatConfig, source: str) -> str {
     let mut state = FormatState::new()
     let mut source_breaks = 0_usize
+    let fields = struct_field_positions(tokens, source)
+    let mut field_index = 0_usize
 
     for token in tokens {
+        match fields.get(field_index) {
+            Some(position) => {
+                if token.line == position.0 && token.column == position.1 {
+                    state.request_break(1)
+                    field_index += 1
+                }
+            }
+            None => {
+            }
+        }
         // EOF carries a cursor position, not printable source. Flushing pending
         // line breaks for its empty value would grow trailing blank lines.
         if token.type == TokenType::EOF {
@@ -471,6 +485,12 @@ fn format_tokens(tokens: Vec[Token], config: FormatConfig) -> str {
             state.remember(token.type)
             continue
         }
+        if token.type == TokenType::ASTERISK && state.has_previous && state.previous == TokenType::SCOPE {
+            state.trim_space()
+            state.write(token.value, config)
+            state.remember(token.type)
+            continue
+        }
         if binary_operator(token.type) || token.type == TokenType::ARROW || token.type == TokenType::FAT_ARROW
         || token.type == TokenType::ASSIGN {
             state.request_space()
@@ -493,6 +513,34 @@ fn format_tokens(tokens: Vec[Token], config: FormatConfig) -> str {
         state.remember(token.type)
     }
     ret state.finish(config)
+}
+
+// Field boundaries come from the shared parser, not guesses about type syntax.
+// Positions stay ordered, so applying them to the lossless stream is linear.
+fn struct_field_positions(tokens: Vec[Token], source: str) -> Vec[(usize, usize)] {
+    let mut positions = Vec[(usize, usize)]::new()
+    let mut has_struct = false
+    for token in tokens {
+        if token.type == TokenType::KW_STRUCT {
+            has_struct = true break
+        }
+    }
+    if !has_struct {
+        ret positions
+    }
+    let document = analyze_named_editor_module("formatter", "formatter", source)
+    for statement in document.ast {
+        match statement {
+            Statement::Struct(item) => {
+                for field in item.named_fields {
+                    positions.push((field.line, field.column))
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret positions
 }
 
 fn normalize_trailing_commas(tokens: Vec[Token], config: FormatConfig) -> Vec[Token] {

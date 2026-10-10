@@ -11,13 +11,16 @@ import refrain::frontend::analysis::FrontendSymbol
 import refrain::frontend::analysis::analyze_named_editor_module
 import refrain::frontend::analysis::analyze_named_module
 import refrain::frontend::analysis::analyze_named_tokens
+import refrain::frontend::dependency_graph::DependencyGraph
 import refrain::frontend::hir::{DefinitionId, DefinitionKind, DefinitionNamespace, HirDefinition, ModuleDefMap, TypeId, definition_id}
 import refrain::frontend::lexer::Lexer
 import refrain::frontend::lexer::Token
 import refrain::frontend::lexer::TokenType
 import refrain::frontend::parser::{FunctionItem, Statement, GenericParam}
 import refrain::frontend::safety::{FunctionSafety, SafetyFunction, infer_safety_with_known, safety_dependencies}
+import refrain::frontend::semantic::ScopedSemanticBinding
 import refrain::frontend::semantic::check_function_body_with_type_scope
+import refrain::frontend::semantic::specialize_method_type_with_self
 import refrain::frontend::semantic::{SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticField, SemanticMethod, check_function_body, check_module_bodies, check_module_declarations}
 import refrain::frontend::semantic::{SemanticMember, SemanticDependencyKind, semantic_members, semantic_named_members, semantic_associated_members, append_bound_methods}
 import refrain::frontend::semantic::{check_function_body_with_types, check_function_body_with_scope, check_module_bodies_with_types, semantic_aggregate_names}
@@ -43,12 +46,14 @@ extern fn encore_strmap_free(map: usize) ->()
 
 /// Deterministic identity of a module across analysis database instances.
 pub struct ModuleId {
-    raw: u64 key: str
+    raw: u64
+    key: str
 }
 
 /// Deterministic identity of a scoped declaration across database instances.
 pub struct SymbolId {
-    raw: u64 key: str
+    raw: u64
+    key: str
 }
 
 struct AnalysisSymbolIdentity {
@@ -75,6 +80,7 @@ struct AnalysisSource {
     syntax: SyntaxDocument
     syntax_dirty: bool
     syntax_count: usize
+    source_revision: usize
 }
 
 struct SemanticBodyCache {
@@ -188,6 +194,21 @@ pub struct MemberDetails {
     is_method: bool
 }
 
+/// A resolved implementation location, independent of an editor's URI format.
+pub struct AnalysisImplementation {
+    source_name: str
+    line: usize
+    column: usize
+    length: usize
+}
+
+/// A lexically scoped editor binding, with parameter identity kept separate
+/// from the optional/inferred type used by the semantic checker.
+pub struct EditorBindingSite {
+    site: ScopedSemanticBinding
+    is_parameter: bool
+}
+
 /// Immutable source snapshot for a complete semantic check on a worker.
 pub struct PreparedSemanticWorkspace {
     module_name: str
@@ -250,6 +271,14 @@ pub fn prepare_cached_lightweight_module(module_name: str, source_name: str, sou
 }
 
 impl for PreparedLightweightModule {
+    /// Reuses one worker parse under a transport-specific module identity.
+    pub fn with_module_name(self: Self, module_name: str) -> sending Self {
+        ret Self {
+            module_name, self.source_name, self.source, self.source_fingerprint,
+            self.interface_fingerprint, self.document
+        }
+    }
+
     /// Returns the completed tolerant frontend document.
     pub fn document(self: Self) -> FrontendDocument {
         ret self.document.declarations()
@@ -545,6 +574,29 @@ impl for AnalysisDatabase {
                 ret()
             }
         }
+        // Logical package modules and editor URI modules often refer to the
+        // same bytes. Reuse their syntax, never their namespace or def map.
+        // The exact source/path comparison also keeps unsaved overlays separate.
+        for entry in self.sources {
+            if source_name != "" && entry.source_name == source_name && entry.source == source
+            && entry.lightweight.ast.len() > 0 {
+                let original = entry.lightweight
+                let mut dependencies = DependencyGraph::new()
+                for edge in original.dependencies.all() {
+                    dependencies.add_at(module_name, edge.target, edge.is_public, edge.line, edge.column, edge.length)
+                }
+                let document = FrontendDocument {
+                    original.tokens, original.ast, original.module_documentation,
+                    original.diagnostics, original.symbols, original.callables, dependencies, original.parsed
+                }
+                self.install_prepared_lightweight(PreparedLightweightModule {
+                        module_name, source_name, source, entry.source_fingerprint,
+                        entry.interface_fingerprint, document
+                    }
+                    ,)
+                ret()
+            }
+        }
         self.apply_prepared_lightweight(prepare_lightweight_module(module_name, source_name, source))
         ret()
     }
@@ -552,6 +604,10 @@ impl for AnalysisDatabase {
     /// Installs a tolerant query produced by `prepare_lightweight_module`
     /// without repeating lexer or declaration work on this thread.
     pub fn apply_prepared_lightweight(self: mut Self, prepared: sending PreparedLightweightModule) ->() {
+        self.install_prepared_lightweight(prepared)
+    }
+
+    fn install_prepared_lightweight(self: mut Self, prepared: PreparedLightweightModule) ->() {
         let module_name = prepared.module_name
         let source_name = prepared.source_name
         let source = prepared.source
@@ -590,7 +646,8 @@ impl for AnalysisDatabase {
                                 entry.parse_count,
                                 SyntaxDocument::empty(),
                                 true,
-                                entry.syntax_count
+                                entry.syntax_count,
+                                self.revision
                             }
                             ,)
                         self.invalidate_definition_maps(module_name)
@@ -624,7 +681,8 @@ impl for AnalysisDatabase {
                 0_usize,
                 SyntaxDocument::empty(),
                 true,
-                0_usize
+                0_usize,
+                self.revision
             }
             ,)
         self.invalidate_dependents(module_name)
@@ -670,7 +728,8 @@ impl for AnalysisDatabase {
                                 entry.parse_count + 1_usize,
                                 SyntaxDocument::empty(),
                                 true,
-                                entry.syntax_count
+                                entry.syntax_count,
+                                self.revision
                             }
                             ,)
                         self.invalidate_definition_maps(module_name)
@@ -706,7 +765,8 @@ impl for AnalysisDatabase {
                 1_usize,
                 SyntaxDocument::empty(),
                 true,
-                0_usize
+                0_usize,
+                self.revision
             }
             ,)
         self.invalidate_dependents(module_name)
@@ -779,7 +839,8 @@ impl for AnalysisDatabase {
                                 entry.parse_count + 1_usize,
                                 entry.syntax,
                                 entry.syntax_dirty,
-                                entry.syntax_count
+                                entry.syntax_count,
+                                entry.source_revision
                             }
                             ,)
                         ret Option[FrontendDocument]::Some(document)
@@ -840,7 +901,8 @@ impl for AnalysisDatabase {
                                 entry.parse_count,
                                 syntax,
                                 false,
-                                entry.syntax_count + 1_usize
+                                entry.syntax_count + 1_usize,
+                                entry.source_revision
                             }
                             ,)
                         ret Option[SyntaxDocument]::Some(syntax)
@@ -872,6 +934,45 @@ impl for AnalysisDatabase {
             }
         }
         ret false
+    }
+
+    /// Captures the exact registered dependency graph for an editor response.
+    /// Unrelated background modules do not invalidate it; body edits and
+    /// changed import targets do, including safety effects and aliases.
+    pub fn module_query_revision(self: Self, module_name: str) -> str {
+        let mut names = Vec[str]::new()
+        names.push(module_name)
+        let mut cursor = 0_usize
+        let mut revision = ""
+        while cursor < names.len() {
+            let name = names.get(cursor).unwrap_or("")
+            cursor += 1_usize
+            revision += Debug::fmt(name.byte_len()) + ":" + name + ":"
+            for source in self.sources {
+                if source.module_name == name {
+                    revision += Debug::fmt(source.source_revision) + "\n"
+                    break
+                }
+            }
+            for configuration in self.safety_configurations {
+                if configuration.module_name == name {
+                    revision += Debug::fmt(configuration.key.byte_len()) + ":" + configuration.key + "\n"
+                    break
+                }
+            }
+            for resolution in self.import_resolutions {
+                if resolution.owner == name {
+                    for target in resolution.targets {
+                        revision += Debug::fmt(target.target.byte_len()) + ":" + target.target + ":" + target.module_name + "\n"
+                        if !contains_string(names, target.module_name) {
+                            names.push(target.module_name)
+                        }
+                    }
+                    break
+                }
+            }
+        }
+        ret revision
     }
 
     /// Returns the revision of the last full-document computation.
@@ -997,11 +1098,11 @@ impl for AnalysisDatabase {
                 }
                 Statement::Function(item) => {
                     let id = next_definition_id(module_name, "", "function", item.name, identity_keys)
-                    let position = symbol_position(document.symbols, item.name, 12_usize)
+                    let position = function_name_position(document.tokens, item)
                     map.insert(HirDefinition::new(id, module_name, item.name, DefinitionKind::Function,
                             DefinitionNamespace::Value, item.is_public, item.source_name, position.0,
                             position.1,
-                            position.2, TypeId::named(function_type_key(item), item.ret_type.unwrap_or("void")),))
+                            item.name.char_len(), TypeId::named(function_type_key(item), item.ret_type.unwrap_or("void")),))
                 }
                 Statement::Struct(item) => {
                     let id = next_definition_id(module_name, "", "struct", item.name, identity_keys)
@@ -1818,6 +1919,34 @@ impl for AnalysisDatabase {
         }
     }
 
+    /// Highlighting needs lexical identity, not a workspace's inferred types.
+    /// Reuse the checker with an empty environment to avoid materializing every
+    /// dependency just to color parameters and locals in a document.
+    pub fn lexical_binding_sites(self: mut Self, module_name: str) -> Vec[EditorBindingSite] {
+        let mut out = Vec[EditorBindingSite]::new()
+        let document = self.document(module_name).unwrap_or(FrontendDocument::empty())
+        for statement in document.ast {
+            match statement {
+                Statement::Function(item) => {
+                    out.extend(lexical_function_sites(item))
+                }
+                Statement::Impl(item) => {
+                    for method in item.methods {
+                        out.extend(lexical_function_sites(method))
+                    }
+                }
+                Statement::Trait(item) => {
+                    for method in item.methods {
+                        out.extend(lexical_function_sites(method))
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        ret sorted_editor_bindings(out)
+    }
+
     /// Returns lexical bindings from one cached containing body, with shadowing applied.
     pub fn semantic_bindings_at(self: mut Self, module_name: str, line: usize,
         column: usize,) -> Vec[SemanticBinding] {
@@ -1931,21 +2060,9 @@ impl for AnalysisDatabase {
         for scope in self.reachable_semantic_modules(module_name) {
             match self.module_def_map(scope) {
                 Some(map) => {
-                    for definition in map.all_definitions() {
-                        if definition.namespace() != DefinitionNamespace::Type
-                        && definition.namespace() != DefinitionNamespace::Trait {
-                            continue
-                        }
-                        match map.named_definition(definition.name(), definition.namespace()) {
-                            Some(selected) => {
-                                if selected.id().key() != definition.id().key() {
-                                    continue
-                                }
-                            }
-                            None => {
-                                continue
-                            }
-                        }
+                    let mut definitions = map.namespace_definitions(DefinitionNamespace::Type)
+                    definitions.extend(map.namespace_definitions(DefinitionNamespace::Trait))
+                    for definition in definitions {
                         names.push(TypeNameBinding {
                                 scope, definition.name(), self.intern_nominal_type(definition.typ()),
                                 if scope == module_name {
@@ -2488,6 +2605,109 @@ impl for AnalysisDatabase {
         ret Option[HirDefinition]::None
     }
 
+    /// Resolves an original declaration span independently of an imported alias.
+    pub fn declaration_at(self: mut Self, module_name: str, line: usize, column: usize) -> Option[HirDefinition] {
+        match self.module_def_map(module_name) {
+            Some(map) => {
+                for definition in map.all_definitions() {
+                    if definition.module_name() == module_name && definition.line() == line && definition.column() == column {
+                        ret Option[HirDefinition]::Some(definition)
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        ret Option[HirDefinition]::None
+    }
+
+    /// Finds impls by physical type/trait identity, not by their visible name.
+    pub fn implementations_of(self: mut Self, definition: HirDefinition) -> Vec[AnalysisImplementation] {
+        let mut locations = Vec[AnalysisImplementation]::new()
+        let mut target = definition
+        let method_name = if definition.kind() == DefinitionKind::Method {
+            definition.name()
+        } else {
+            ""
+        }
+        if method_name != "" {
+            target = match self.module_definition(definition.module_name(), definition.owner(), DefinitionNamespace::Trait) {
+                Some(owner) => owner
+                None => match self.qualified_type_definition(definition.module_name(), definition.owner()) {
+                    Some(owner) => owner
+                    None => {
+                        ret locations
+                    }
+                }
+            }
+        }
+        if target.kind() != DefinitionKind::Trait && target.kind() != DefinitionKind::Struct
+        && target.kind() != DefinitionKind::Enum {
+            ret locations
+        }
+        let seen = encore_strset_new()
+        for source in self.sources {
+            let document = self.document(source.module_name).unwrap_or(FrontendDocument::empty())
+            for statement in document.ast {
+                match statement {
+                    Statement::Impl(item) => {
+                        let implemented = if target.kind() == DefinitionKind::Trait {
+                            match item.trait_name {
+                                Some(name) => self.module_definition(source.module_name, name, DefinitionNamespace::Trait)
+                                None => Option[HirDefinition]::None
+                            }
+                        } else {
+                            // Strip only specialization arguments; the resolved nominal declaration owns the impl.
+                            let mut end = 0_usize
+                            while end < item.target.byte_len() && item.target.byte_at(end) != 91 {
+                                end += 1
+                            }
+                            self.qualified_type_definition(source.module_name, item.target.slice_bytes(0, end))
+                        }
+                        match implemented {
+                            Some(owner) => {
+                                if owner.source_identity().key() != target.source_identity().key() {
+                                    continue
+                                }
+                                if method_name == "" {
+                                    let key = source.source_name + ":" + Debug::fmt(item.line) + ":" + Debug::fmt(item.column)
+                                    if encore_strset_insert(seen, key) {
+                                        locations.push(AnalysisImplementation {
+                                                source.source_name, item.line, item.column, 4
+                                            }
+                                            ,
+                                        )
+                                    }
+                                } else {
+                                    for method in item.methods {
+                                        if method.name != method_name {
+                                            continue
+                                        }
+                                        let position = function_name_position(document.tokens, method)
+                                        let key = source.source_name + ":" + Debug::fmt(position.0) + ":" + Debug::fmt(position.1)
+                                        if encore_strset_insert(seen, key) {
+                                            locations.push(AnalysisImplementation {
+                                                    source.source_name, position.0, position.1, method.name.char_len()
+                                                }
+                                                ,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            None => {
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        encore_strset_free(seen)
+        ret locations
+    }
+
     /// Returns the semantic type of a binding declaration for inlay hints.
     pub fn semantic_binding_type(self: mut Self, module_name: str, name: str, line: usize) -> Option[str]
     {
@@ -2973,6 +3193,10 @@ impl for AnalysisDatabase {
         // Close the reachable inheritance graph without reparsing every pair
         // of modules. Existing child declarations win; cycles reach a fixed point.
         let mut changed = true
+        let inherited_names = encore_strset_new()
+        for method in out {
+            let _ = encore_strset_insert(inherited_names, method.receiver_type + "." + method.name)
+        }
         while changed {
             changed = false
             for edge in trait_edges {
@@ -2983,15 +3207,11 @@ impl for AnalysisDatabase {
                     index += 1_usize
                     match entry {
                         Some(method) => {
-                            let mut exists = false
-                            for candidate in out {
-                                if candidate.receiver_type == edge.0 && candidate.name == method.name {
-                                    exists = true break
-                                }
-                            }
-                            if !exists {
+                            let key = edge.0 + "." + method.name
+                            if !encore_strset_contains(inherited_names, key) {
                                 match method.inherited_by(edge.0, edge.1, edge.2) {
                                     Some(inherited) => {
+                                        let _ = encore_strset_insert(inherited_names, key)
                                         out.push(inherited) changed = true
                                     }
                                     None => {
@@ -3005,6 +3225,7 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        encore_strset_free(inherited_names)
         ret out
     }
 
@@ -3155,7 +3376,8 @@ impl for AnalysisDatabase {
                                         entry.parse_count,
                                         entry.syntax,
                                         entry.syntax_dirty,
-                                        entry.syntax_count
+                                        entry.syntax_count,
+                                        entry.source_revision
                                     }
                                     ,)
                             }
@@ -3840,6 +4062,37 @@ fn declaration_generic_names(generics: Vec[GenericParam]) -> Vec[str] {
     ret names
 }
 
+#attr(test)
+fn semantic_hir_physical_module_views_contract() -> bool {
+    let mut database = AnalysisDatabase::new()
+    let source = "import core::option::Option\npub struct Item { value: u32 }\n"
+    database.set_module("package::model", "/project/model.enq", source)
+    database.set_module("file:///project/model.enq", "/project/model.enq", source)
+    let left = match database.module_definition("package::model", "Item", DefinitionNamespace::Type) {
+        Some(value) => value None => {
+            ret false
+        }
+    }
+    let right = match database.module_definition("file:///project/model.enq", "Item", DefinitionNamespace::Type) {
+        Some(value) => value None => {
+            ret false
+        }
+    }
+    if left.id().key() == right.id().key() || left.source_identity().key() != right.source_identity().key() {
+        ret false
+    }
+    let view = database.document("file:///project/model.enq").unwrap_or(FrontendDocument::empty())
+    for edge in view.dependencies.all() {
+        if edge.source != "file:///project/model.enq" {
+            ret false
+        }
+    }
+    database.set_module("file:///project/model.enq", "/project/model.enq", "pub struct Other { value: str }\n")
+    ret database.module_definition("package::model", "Item", DefinitionNamespace::Type).is_some()
+    && database.module_definition("file:///project/model.enq", "Item", DefinitionNamespace::Type).is_none()
+    && database.module_definition("file:///project/model.enq", "Other", DefinitionNamespace::Type).is_some()
+}
+
 fn member_details(document: FrontendDocument, definition: HirDefinition, types: Vec[str], typ: str,
     specialized: bool,) -> MemberDetails {
     let mut documentation = ""
@@ -3872,6 +4125,27 @@ fn member_details(document: FrontendDocument, definition: HirDefinition, types: 
                             }
                             None => {
                             }
+                        }
+                        let names = declaration_generic_names(item.generics)
+                        let mut suffix = 0_usize
+                        while suffix < typ.byte_len() && typ.byte_at(suffix) != 91 {
+                            suffix += 1
+                        }
+                        let receiver = item.name + typ.slice_bytes(suffix, typ.byte_len() - suffix)
+                        let mut pattern = item.name
+                        if names.len() > 0 {
+                            pattern += "["
+                            let mut separator = ""
+                            for name in names {
+                                pattern += separator + name separator = ","
+                            }
+                            pattern += "]"
+                        }
+                        for field_type in variant.tuple_fields {
+                            params.push(specialize_method_type_with_self(field_type, pattern, receiver, typ, names))
+                        }
+                        for field in variant.named_fields {
+                            params.push(field.name + ": " + specialize_method_type_with_self(field.typ, pattern, receiver, typ, names))
                         }
                     }
                 }
@@ -3925,8 +4199,23 @@ fn member_details(document: FrontendDocument, definition: HirDefinition, types: 
 }
 
 fn function_name_position(tokens: Vec[Token], item: FunctionItem) ->(usize, usize) {
+    // Tokens are source ordered. Start at the declaration's line instead of
+    // rescanning the whole module once for every function or method.
+    let mut low = 0_usize
+    let mut high = tokens.len()
+    while low < high {
+        let middle = low +(high - low) / 2_usize
+        let token = tokens.get(middle).unwrap_or(Token::new(TokenType::EOF, "", 0, 0))
+        if token.line < item.line {
+            low = middle + 1_usize
+        } else {
+            high = middle
+        }
+    }
     let mut after_fn = false
-    for token in tokens {
+    while low < tokens.len() {
+        let token = tokens.get(low).unwrap_or(Token::new(TokenType::EOF, "", 0, 0))
+        low += 1_usize
         if token.line < item.line ||(token.line == item.line && token.column < item.column) {
             continue
         }
@@ -4001,12 +4290,144 @@ fn contains_string_value(value: str, needle: str) -> bool {
     ret false
 }
 
+fn lexical_function_sites(item: FunctionItem) -> Vec[EditorBindingSite] {
+    let body = check_function_body(item, Vec[SemanticCallable]::new(), Vec[SemanticField]::new(),
+        Vec[SemanticMethod]::new(), "",)
+    let mut out = Vec[EditorBindingSite]::new()
+    for site in body.binding_sites() {
+        let mut parameter = false
+        for param in item.params {
+            if param.name == site.binding.name && param.line == site.binding.line
+            && param.column == site.binding.column {
+                parameter = true break
+            }
+        }
+        out.push(EditorBindingSite {
+                site, parameter
+            }
+            ,
+        )
+    }
+    ret out
+}
+
+// Stable source order lets tooling sweep tokens and activate each binding once,
+// rather than searching thousands of future same-name function parameters.
+fn sorted_editor_bindings(values: Vec[EditorBindingSite]) -> Vec[EditorBindingSite] {
+    let mut out = Vec[EditorBindingSite]::new()
+    out.extend(values)
+    let count = out.len()
+    let mut width = 1
+    while width < count {
+        let mut merged = Vec[EditorBindingSite]::new()
+        let mut start = 0
+        while start < count {
+            let middle = if start + width < count {
+                start + width
+            } else {
+                count
+            }
+            let end = if middle + width < count {
+                middle + width
+            } else {
+                count
+            }
+            let mut left = start
+            let mut right = middle
+            while left < middle || right < end {
+                let choose_left = if left >= middle {
+                    false
+                } elif right >= end {
+                    true
+                } else {
+                    match out.get(left) {
+                        Some(a) => {
+                            match out.get(right) {
+                                Some(b) => a.site.binding.line < b.site.binding.line
+                                ||(a.site.binding.line == b.site.binding.line
+                                    && a.site.binding.column <= b.site.binding.column)
+                                None => true
+                            }
+                        }
+                        None => false
+                    }
+                }
+                let selected = if choose_left {
+                    left
+                } else {
+                    right
+                }
+                match out.get(selected) {
+                    Some(value) => merged.push(value) None => {
+                    }
+                }
+                if choose_left {
+                    left += 1
+                } else {
+                    right += 1
+                }
+            }
+            start = end
+        }
+        out = merged
+        width *= 2
+    }
+    ret out
+}
+
 fn starts_with(value: str, prefix: str) -> bool {
     ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix
 }
 
 fn ends_with_analysis(value: str, suffix: str) -> bool {
     ret suffix.len() <= value.len() && value.slice(value.len() - suffix.len(), suffix.len()) == suffix
+}
+
+#attr(test)
+fn semantic_hir_query_revision_contract() -> bool {
+    let mut database = AnalysisDatabase::new()
+    database.set_module("main", "main.enq", "import dep::value\nfn main() { value() }")
+    database.set_module("dep", "dep.enq", "pub fn value() -> u32 { ret 1 }")
+    let mut targets = Vec[ModuleImportTarget]::new()
+    targets.push(ModuleImportTarget {
+            "dep", "dep"
+        }
+        ,
+    )
+    database.set_module_import_targets("main", targets)
+    let initial = database.module_query_revision("main")
+    database.set_module("unrelated", "unrelated.enq", "pub fn extra() {}")
+    if database.module_query_revision("main") != initial {
+        ret false
+    }
+    database.set_module("dep", "dep.enq", "pub fn value() -> u32 { unsafe { ret 1 } }")
+    let edited = database.module_query_revision("main")
+    if edited == initial {
+        ret false
+    }
+    let mut cycle = Vec[ModuleImportTarget]::new()
+    cycle.push(ModuleImportTarget {
+            "main", "main"
+        }
+        ,
+    )
+    database.set_module_import_targets("dep", cycle)
+    let cyclic = database.module_query_revision("main")
+    if cyclic == edited || cyclic != database.module_query_revision("main") {
+        ret false
+    }
+    let _materialized = database.document("main")
+    let _syntax = database.syntax_document("main")
+    if database.module_query_revision("main") != cyclic {
+        ret false
+    }
+    database.configure_safety("dep", host_target(), Vec[str]::new())
+    let configured = database.module_query_revision("main")
+    if configured == cyclic {
+        ret false
+    }
+    database.remove_module("dep")
+    ret database.module_query_revision("main") != configured
 }
 
 #attr(test)

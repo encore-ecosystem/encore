@@ -9,24 +9,34 @@ import core::option::Option
 import std::dict::Hashable
 import std::vec::Vec
 
+extern fn encore_strmap_new() -> usize
+extern fn encore_strmap_put(map: usize, key: str, value: usize) ->()
+extern fn encore_strmap_get(map: usize, key: str) -> usize
+extern fn encore_strmap_free(map: usize) ->()
+
 /// Stable identity of a declaration across database revisions.
 pub struct DefinitionId {
-    raw: u64 key: str
+    raw: u64
+    key: str
 }
 
 /// Stable identity of a function or method body.
 pub struct BodyId {
-    raw: u64 key: str
+    raw: u64
+    key: str
 }
 
 /// Stable identity of an expression inside a body.
 pub struct ExpressionId {
-    raw: u64 key: str
+    raw: u64
+    key: str
 }
 
 /// Interned semantic type identity. Display text is presentation-only.
 pub struct TypeId {
-    raw: u64 key: str display: str
+    raw: u64
+    key: str
+    display: str
 }
 
 /// Namespace occupied by a definition.
@@ -120,6 +130,16 @@ impl for HirDefinition {
     }
     pub fn name(self: Self) -> str {
         ret self.name
+    }
+    /// Returns the owner recorded in this declaration's semantic identity.
+    pub fn owner(self: Self) -> str {
+        let start = self.module_name.byte_len() + 1
+        let key = self.id.key
+        let mut end = start
+        while end < key.byte_len() && key.byte_at(end) != 35 {
+            end += 1
+        }
+        ret key.slice_bytes(start, end - start)
     }
     pub fn kind(self: Self) -> DefinitionKind {
         ret self.kind
@@ -323,6 +343,54 @@ impl for ModuleDefMap {
     pub fn all_definitions(self: Self) -> Vec[HirDefinition] {
         ret self.definitions
     }
+
+    /// Resolves a complete module namespace in one pass. Local declarations
+    /// override imports exactly as in `named_definition`; members stay scoped.
+    pub fn namespace_definitions(self: Self, namespace: DefinitionNamespace) -> Vec[HirDefinition] {
+        let mut selected = Vec[HirDefinition]::new()
+        let slots = encore_strmap_new()
+        for definition in self.definitions {
+            if !same_namespace(definition.namespace, namespace) {
+                continue
+            }
+            match definition.kind {
+                DefinitionKind::Method => {
+                    continue
+                }
+                DefinitionKind::Field => {
+                    continue
+                }
+                DefinitionKind::Variant => {
+                    continue
+                }
+                DefinitionKind::Parameter => {
+                    continue
+                }
+                DefinitionKind::GenericParameter => {
+                    continue
+                }
+                _ => {
+                }
+            }
+            let slot = encore_strmap_get(slots, definition.name)
+            if slot == 0 {
+                selected.push(definition)
+                encore_strmap_put(slots, definition.name, selected.len())
+            } else {
+                match selected.get(slot - 1) {
+                    Some(previous) => {
+                        if previous.kind == DefinitionKind::Import && definition.kind != DefinitionKind::Import {
+                            selected.set(slot - 1, definition)
+                        }
+                    }
+                    None => {
+                    }
+                }
+            }
+        }
+        encore_strmap_free(slots)
+        ret selected
+    }
 }
 
 /// Creates a deterministic definition identity from semantic ownership.
@@ -349,6 +417,36 @@ fn same_namespace(left: DefinitionNamespace, right: DefinitionNamespace) -> bool
             ret right == DefinitionNamespace::Module
         }
     }
+}
+
+#attr(test)
+fn semantic_hir_namespace_batch_contract() -> bool {
+    let mut map = ModuleDefMap::new("scope")
+    map.insert(HirDefinition::new(definition_id("imported", "", "struct", "Item", 0),
+            "imported", "Item", DefinitionKind::Import, DefinitionNamespace::Type, true,
+            "/imported.enq", 0, 0, 4, TypeId::named("imported", "Item"),))
+    map.insert(HirDefinition::new(definition_id("scope", "", "struct", "Item", 0),
+            "scope", "Item", DefinitionKind::Struct, DefinitionNamespace::Type, true,
+            "/scope.enq", 1, 0, 4, TypeId::named("local", "Item"),))
+    map.insert(HirDefinition::new(definition_id("scope", "Item", "field", "hidden", 0),
+            "scope", "hidden", DefinitionKind::Field, DefinitionNamespace::Value, true,
+            "/scope.enq", 1, 6, 6, TypeId::named("u32", "u32"),))
+    let values = map.namespace_definitions(DefinitionNamespace::Type)
+    if values.len() != 1 || map.namespace_definitions(DefinitionNamespace::Value).len() != 0 {
+        ret false
+    }
+    let actual = match values.get(0) {
+        Some(value) => value None => {
+            ret false
+        }
+    }
+    let expected = match map.named_definition("Item", DefinitionNamespace::Type) {
+        Some(value) => value None => {
+            ret false
+        }
+    }
+    ret actual.typ().key() == "local"
+    && actual.id().key() == expected.id().key()
 }
 
 fn nonzero_hash(value: str) -> u64 {
