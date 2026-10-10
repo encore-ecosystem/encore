@@ -1,0 +1,452 @@
+name: Native target verification
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+      triple:
+        required: true
+        type: string
+      executable:
+        required: true
+        type: string
+      producer:
+        required: true
+        type: string
+      seed_tag:
+        required: true
+        type: string
+      index_sha:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  converge:
+    name: Converge ${{ inputs.triple }}
+    runs-on: ${{ inputs.runner }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/registry
+      ENCORE_INDEX_URL: https://raw.githubusercontent.com/encore-ecosystem/encore-index/${{ inputs.index_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify source version
+        shell: bash
+        run: |
+          set -euo pipefail
+          release=$(tr -d '\r\n' < VERSION)
+          version=${release%%-*}
+          release_name=${release#*-}
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' encore.toml | head -n 1)" = "$version"
+          test "$release" = "$version-$release_name"
+          grep -Fq "ret \"$version\"" src/version.enq
+          grep -Fq "ret \"$release_name\"" src/version.enq
+          grep -Fq "ret \"$release\"" src/version.enq
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: trusted-dependencies
+          path: target/dependency-download
+
+      - name: Activate verified offline dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=$(awk 'NF {print tolower($1); exit}' target/dependency-download/dependencies.tar.gz.sha256)
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum target/dependency-download/dependencies.tar.gz | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 target/dependency-download/dependencies.tar.gz | awk '{print $1}')
+          fi
+          test "$actual" = "$expected"
+          tar -xzf target/dependency-download/dependencies.tar.gz -C target
+          rm -rf target/registry
+          mv target/dependencies/registry target/registry
+          cmp <(tr -d '\r' < encore.lock) target/dependencies/encore.lock
+          test "$(cat target/dependencies/index-commit)" = "${{ inputs.index_sha }}"
+          mv target/dependencies/system-index target/system-index
+          index_root="$PWD/../encore-index"
+          test ! -e "$index_root"
+          cp -R target/system-index "$index_root"
+          echo "ENCORE_CORE_DIR=$index_root/packages/core" >> "$GITHUB_ENV"
+          echo "ENCORE_INDEX_URL=http://127.0.0.1:9" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: stage1-${{ inputs.producer }}
+          path: target/stage1-download
+
+      - name: Verify cross-produced stage1
+        id: seed
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="target/stage1-download/${{ inputs.triple }}"
+          manifest="$root/manifest.json"
+          test "$(jq -r '.schema' "$manifest")" = 2
+          test "$(jq -r '.commit' "$manifest")" = "$GITHUB_SHA"
+          release=$(tr -d '\r\n' < VERSION)
+          test "$(jq -r '.version' "$manifest")" = "${release%%-*}"
+          test "$(jq -r '.nametag' "$manifest")" = "${release#*-}"
+          test "$(jq -r '.release' "$manifest")" = "$release"
+          test "$(jq -r '.seed' "$manifest")" = "${{ inputs.seed_tag }}"
+          test "$(jq -r '.target' "$manifest")" = "${{ inputs.triple }}"
+          release=$(tr -d '\r\n' < VERSION)
+          version=${release%%-*}
+          release_name=${release#*-}
+          target_kit_abi=$(printf '%s\n' "$version" | awk -F. '{print $1 "." $2}')
+          test "$(jq -r '.target_kit_abi' "$manifest")" = "$target_kit_abi"
+          expected_dependencies=$(awk 'NF {print tolower($1); exit}' \
+            target/dependency-download/dependencies.tar.gz.sha256)
+          test "$(jq -r '.dependencies_sha256' "$manifest")" = "$expected_dependencies"
+          compiler="$PWD/$root/${{ inputs.executable }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$compiler" | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 "$compiler" | awk '{print $1}')
+          fi
+          test "$actual" = "$(jq -r '.executable_sha256' "$manifest")"
+          chmod +x "$compiler" 2>/dev/null || true
+          echo "STAGE1_COMPILER=$compiler" >> "$GITHUB_ENV"
+          echo "STAGE1_MANIFEST=$PWD/$manifest" >> "$GITHUB_ENV"
+          echo "tag=${{ inputs.seed_tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Install matching Windows GNU host toolchain
+        if: contains(inputs.triple, 'w64-windows-gnu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=20260616
+          arch=x86_64
+          checksum=b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35
+          if [[ "${{ inputs.triple }}" == aarch64-* ]]; then
+            arch=aarch64
+            checksum=312593669435bd0bfc1a43ac3fba23c8b27e0610bade88b2738e5a01702a99ba
+          fi
+          archive="llvm-mingw-$version-ucrt-$arch.zip"
+          curl -fsSL --retry 2 \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive" \
+            -o "target/$archive"
+          test "$(sha256sum "target/$archive" | awk '{print $1}')" = "$checksum"
+          mkdir -p target/llvm-mingw-host
+          unzip -q "target/$archive" -d target/llvm-mingw-host
+          root=$(find target/llvm-mingw-host -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          test -x "$root/bin/clang.exe"
+          echo "ENCORE_CC=$PWD/$root/bin/clang.exe" >> "$GITHUB_ENV"
+          echo "ENCORE_LINKER=$PWD/$root/bin/clang.exe" >> "$GITHUB_ENV"
+          echo "ENCORE_AR=$PWD/$root/bin/llvm-ar.exe" >> "$GITHUB_ENV"
+
+      - name: Verify Windows process capture
+        if: contains(inputs.triple, 'windows')
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=../encore-index/packages/platform/tests/process_windows.c
+          if [[ "${{ inputs.triple }}" == *-msvc ]]; then
+            clang -std=c11 -Wall -Wextra -Werror "$source" -lshell32 \
+              -o target/process-windows.exe
+          else
+            "$ENCORE_CC" -std=c11 -Wall -Wextra -Werror "$source" -lshell32 \
+              -o target/process-windows.exe
+          fi
+          target/process-windows.exe
+
+      - name: Verify byte-identical stage2/stage3 fixed point
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$STAGE1_COMPILER" build --profile extreme
+          mkdir -p target/stage2
+          cp "target/extreme/${{ inputs.executable }}" "target/stage2/${{ inputs.executable }}"
+          mv target/extreme target/stage2-output
+          "target/stage2/${{ inputs.executable }}" build --profile extreme
+          mkdir -p target/stage3
+          cp "target/extreme/${{ inputs.executable }}" "target/stage3/${{ inputs.executable }}"
+          cmp "target/stage2/${{ inputs.executable }}" "target/stage3/${{ inputs.executable }}"
+          "target/stage3/${{ inputs.executable }}" --version
+
+      - name: Verify incremental cache integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/test-incremental-cache.py \
+            "target/stage3/${{ inputs.executable }}"
+
+      - name: Verify standard library and interactive input
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler="$PWD/target/stage3/${{ inputs.executable }}"
+          (cd ../encore-index/packages/std && "$compiler" test --jobs 2)
+          python3 scripts/test-std-input.py "$compiler"
+          ENCORE_TEST_COMPILER="$compiler" python3 ../encore-index/scripts/test-http-send.py
+
+      - name: Build examples
+        if: inputs.triple == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler="$PWD/target/stage3/${{ inputs.executable }}"
+          while IFS= read -r manifest; do
+            example=${manifest%/encore.toml}
+            case "$example" in examples/bare_metal|*/compile_fail) continue ;; esac
+            if test -f "$example/src/main.enq"; then
+              (cd "$example" && "$compiler" build)
+            else
+              (cd "$example" && "$compiler" check)
+            fi
+          done < <(find examples -mindepth 2 -name encore.toml -print | LC_ALL=C sort)
+          (cd examples/bare_metal && "$compiler" build --target thumbv7em-none-eabi --emit llvm-ir)
+          (cd docs/enbook-en/examples/guide && "$compiler" build)
+
+      - name: Verify source tooling gates
+        if: inputs.triple == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler="$PWD/target/stage3/${{ inputs.executable }}"
+          "$compiler" format --check
+          "$compiler" check
+          "$compiler" lint
+          python3 scripts/test-ci-candidate.py
+          python3 scripts/test-init.py "$compiler"
+          python3 scripts/test-safety.py "$compiler"
+          python3 scripts/test-system-safety.py "$compiler"
+          python3 scripts/test-self-update.py "$compiler"
+          python3 scripts/test-type-identity.py "$compiler"
+          python3 scripts/test-unit-harness.py "$compiler"
+          python3 scripts/test-registry-sources.py "$compiler"
+
+      - name: Verify native allocation and concurrent environment contracts
+        if: inputs.triple == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang -std=c11 -Wall -Wextra -Werror \
+            ../encore-index/packages/core/runtime.c \
+            ../encore-index/packages/core/tests/heap_capacity.c \
+            -pthread -lm -o target/heap-capacity
+          target/heap-capacity
+          for mode in overflow header-overflow; do
+            if target/heap-capacity "$mode" >target/heap-overflow.log 2>&1; then
+              echo "::error::Allocation overflow was accepted"
+              exit 1
+            fi
+            grep -Fq 'Vec capacity overflow' target/heap-overflow.log
+          done
+          clang -std=c11 -Wall -Wextra -Werror \
+            ../encore-index/packages/core/runtime.c \
+            ../encore-index/packages/platform/runtime.c \
+            ../encore-index/packages/platform/tests/environment_threads.c \
+            -pthread -lm -lssl -lcrypto -o target/environment-threads
+          target/environment-threads
+
+      - name: Build matching Encore language server
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep the index at its source-relative sibling path while building
+          # the LSP: lsp/encore.toml intentionally resolves ../../encore back
+          # to this compiler checkout.
+          index_root="$PWD/../encore-index"
+          test -f "$index_root/lsp/encore.toml"
+          compiler="$PWD/target/stage3/${{ inputs.executable }}"
+          (cd "$index_root/lsp" && ENCORE_CORE_DIR="$index_root/packages/core" \
+            "$compiler" build --profile release)
+          source_name=lsp
+          installed_name=encore-lsp
+          if [[ "${{ inputs.triple }}" == *-windows-* ]]; then
+            source_name=lsp.exe
+            installed_name=encore-lsp.exe
+          fi
+          cp "$index_root/lsp/target/release/$source_name" "target/stage3/$installed_name"
+          chmod +x "target/stage3/$installed_name" 2>/dev/null || true
+
+      - name: Assemble offline test context
+        shell: bash
+        run: |
+          set -euo pipefail
+          context=target/test-context
+          mkdir -p "$context/bin"
+          cp "target/stage3/${{ inputs.executable }}" "$context/bin/${{ inputs.executable }}"
+          cp -R target/registry "$context/registry"
+          cp -R target/system-index "$context/system-index"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: test-context-${{ inputs.triple }}
+          path: target/test-context
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Assemble release candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          release=$(tr -d '\r\n' < VERSION)
+          version=${release%%-*}
+          release_name=${release#*-}
+          test "$release" = "$version-$release_name"
+          package="encore-$release-${{ inputs.triple }}"
+          root="$PWD/target/package/$package"
+          mkdir -p "$root/bin" "$root/lib/encore/index" "$root/share/doc/encore" dist
+          cp "target/stage3/${{ inputs.executable }}" "$root/bin/${{ inputs.executable }}"
+          chmod +x "$root/bin/${{ inputs.executable }}" 2>/dev/null || true
+          lsp_executable=encore-lsp
+          [[ "${{ inputs.triple }}" == *-windows-* ]] && lsp_executable=encore-lsp.exe
+          cp "target/stage3/$lsp_executable" "$root/bin/$lsp_executable"
+          chmod +x "$root/bin/$lsp_executable" 2>/dev/null || true
+          for name in core platform std rich json log profile ehir toml colorterm llvm argparse secret-store; do
+            source_name=$name
+            test -f "$PWD/target/system-index/packages/$source_name/encore.toml"
+            cp -R "$PWD/target/system-index/packages/$source_name" "$root/lib/encore/index/$name"
+          done
+          cp -R "$PWD/target/system-index/packages/ehir-llvm-backend" \
+            "$root/lib/encore/index/ehir-llvm-backend"
+          cp LICENSE README.md "$root/share/doc/encore/"
+          printf '%s\n' "$release" > "$root/VERSION"
+          hash_file() {
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+            else shasum -a 256 "$1" | awk '{print $1}'; fi
+          }
+          stage2_sha=$(hash_file "target/stage2/${{ inputs.executable }}")
+          stage3_sha=$(hash_file "target/stage3/${{ inputs.executable }}")
+          test "$stage2_sha" = "$stage3_sha"
+          lsp_sha=$(hash_file "target/stage3/$lsp_executable")
+          dependencies_sha=$(awk 'NF {print tolower($1); exit}' target/dependency-download/dependencies.tar.gz.sha256)
+          printf '{"schema":2,"commit":"%s","version":"%s","nametag":"%s","release":"%s","seed":"%s","index_commit":"%s","dependencies_sha256":"%s","target":"%s","compiler_sha256":"%s","lsp_sha256":"%s","stage2_sha256":"%s","stage3_sha256":"%s","converged":true}\n' \
+            "$GITHUB_SHA" "$version" "$release_name" "$release" "${{ steps.seed.outputs.tag }}" \
+            "${{ inputs.index_sha }}" "$dependencies_sha" "${{ inputs.triple }}" \
+            "$stage3_sha" "$lsp_sha" "$stage2_sha" "$stage3_sha" \
+            > "dist/provenance-${{ inputs.triple }}.json"
+          jq --slurpfile stage1 "$STAGE1_MANIFEST" \
+            '. + {bootstrap: $stage1[0].bootstrap}' \
+            "dist/provenance-${{ inputs.triple }}.json" \
+            > "dist/provenance-${{ inputs.triple }}.json.pending"
+          mv "dist/provenance-${{ inputs.triple }}.json.pending" \
+            "dist/provenance-${{ inputs.triple }}.json"
+          find "$root" -exec touch -t 200001010000.00 {} +
+          case "${{ inputs.triple }}" in
+            *-windows-*)
+              archive="$PWD/dist/encore-${{ inputs.triple }}.zip"
+              (cd target/package && 7z a -tzip -mtc=off -mta=off "$archive" "$package")
+              ;;
+            *)
+              archive="$PWD/dist/encore-${{ inputs.triple }}.tar.gz"
+              if tar --version 2>/dev/null | grep -q GNU; then
+                tar -C target/package --sort=name --owner=0 --group=0 --numeric-owner -czf "$archive" "$package"
+              else
+                (cd target/package && find "$package" -print | LC_ALL=C sort |
+                  COPYFILE_DISABLE=1 tar --no-recursion --uid 0 --gid 0 --uname root --gname root -cf - -T - |
+                  gzip -n > "$archive")
+              fi
+              ;;
+          esac
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
+          else
+            (cd dist && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
+          fi
+
+      - name: Verify packaged language server without global installation
+        if: inputs.triple == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          release=$(tr -d '\r\n' < VERSION)
+          root="$PWD/target/package/encore-$release-${{ inputs.triple }}"
+          # No HOME, ENCORE_HOME or development overrides: discover libraries
+          # beside the packaged executable, exactly as a fresh installation.
+          for suite in docstrings protocol_features scheduler workspace_graph \
+            autoimports offline_dependencies member_completion code_actions \
+            semantic_tokens local_navigation qualified_navigation empty_aggregate \
+            member_details cache_query_parity import_rename import_exports \
+            member_navigation import_editing enum_navigation associated_navigation \
+            associated_type_identity instance_type_identity inlay_types \
+            editor_matrix import_segments relative_wildcard struct_fields \
+            dependency_revisions formatted_strings incremental_unicode \
+            registry_installation protocol_framing request_lifecycle semantic_scopes \
+            call_hierarchy_identity implementation_identity system_library_safety; do
+            env -i PATH=/usr/bin:/bin LANG=C.UTF-8 \
+              ENCORE_INDEX_URL=http://127.0.0.1:9 \
+              timeout 180 python3 "$PWD/../encore-index/lsp/tests/$suite.py" \
+              "$root/bin/encore-lsp"
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-${{ inputs.triple }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  tests:
+    name: Test ${{ inputs.triple }}
+    needs: converge
+    runs-on: ${{ inputs.runner }}
+    env:
+      ENCORE_INDEX_URL: http://127.0.0.1:9
+      ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/test-context/registry
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: test-context-${{ inputs.triple }}
+          path: target/test-context
+      - name: Activate pinned path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          index_root="$PWD/../encore-index"
+          test ! -e "$index_root"
+          cp -R target/test-context/system-index "$index_root"
+      - name: Install matching Windows GNU host toolchain
+        if: contains(inputs.triple, 'w64-windows-gnu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=20260616
+          arch=x86_64
+          checksum=b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35
+          if [[ "${{ inputs.triple }}" == aarch64-* ]]; then
+            arch=aarch64
+            checksum=312593669435bd0bfc1a43ac3fba23c8b27e0610bade88b2738e5a01702a99ba
+          fi
+          archive="llvm-mingw-$version-ucrt-$arch.zip"
+          curl -fsSL --retry 2 \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive" \
+            -o "target/$archive"
+          test "$(sha256sum "target/$archive" | awk '{print $1}')" = "$checksum"
+          mkdir -p target/llvm-mingw-host
+          unzip -q "target/$archive" -d target/llvm-mingw-host
+          root=$(find target/llvm-mingw-host -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          test -x "$root/bin/clang.exe"
+          echo "ENCORE_CC=$PWD/$root/bin/clang.exe" >> "$GITHUB_ENV"
+          echo "ENCORE_LINKER=$PWD/$root/bin/clang.exe" >> "$GITHUB_ENV"
+          echo "ENCORE_AR=$PWD/$root/bin/llvm-ar.exe" >> "$GITHUB_ENV"
+      - name: Run deterministic offline test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler="$PWD/target/test-context/bin/${{ inputs.executable }}"
+          chmod +x "$compiler" 2>/dev/null || true
+          "$compiler" test \
+            --report "target/test-report.json"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: test-report-${{ inputs.triple }}
+          path: |
+            target/test-report.json
+            target/tests/*.output.txt
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,170 @@
+name: Native stage1 producer
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+      producer:
+        required: true
+        type: string
+      seed_triple:
+        required: true
+        type: string
+      seed_executable:
+        required: true
+        type: string
+      targets:
+        required: true
+        type: string
+      seed_tag:
+        required: true
+        type: string
+      index_sha:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    name: Produce stage1 on ${{ inputs.producer }}
+    runs-on: ${{ inputs.runner }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/registry
+      ENCORE_INDEX_URL: https://raw.githubusercontent.com/encore-ecosystem/encore-index/${{ inputs.index_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: trusted-dependencies
+          path: target/dependency-download
+
+      - name: Download locally built target kits
+        if: inputs.producer == 'linux'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-candidate-target-kit-*
+          path: target/target-kit-download
+          merge-multiple: true
+
+      - name: Activate locally built target kits
+        if: inputs.producer == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          release=$(tr -d '\r\n' < VERSION)
+          version=${release%%-*}
+          release_name=${release#*-}
+          abi=$(printf '%s\n' "$version" | awk -F. '{print $1 "." $2}')
+          targets_root="$PWD/target/installed-target-kits"
+          mkdir -p "$targets_root/$abi"
+          for manifest in target/target-kit-download/target-kit-*.json; do
+            test "$(jq -r '.schema' "$manifest")" = 1
+            test "$(jq -r '.abi' "$manifest")" = "$abi"
+            test "$(jq -r '.host' "$manifest")" = x86_64-unknown-linux-gnu
+            target=$(jq -r '.target' "$manifest")
+            archive="target/target-kit-download/target-kit-x86_64-unknown-linux-gnu--$target.tar.xz"
+            expected=$(jq -r '.sha256' "$manifest")
+            test "$(sha256sum "$archive" | awk '{print $1}')" = "$expected"
+            mkdir -p "$targets_root/$abi/$target"
+            tar -xJf "$archive" -C "$targets_root/$abi/$target"
+          done
+          echo "ENCORE_TARGETS_DIR=$targets_root" >> "$GITHUB_ENV"
+
+      - name: Activate verified offline dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=$(awk 'NF {print tolower($1); exit}' target/dependency-download/dependencies.tar.gz.sha256)
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum target/dependency-download/dependencies.tar.gz | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 target/dependency-download/dependencies.tar.gz | awk '{print $1}')
+          fi
+          test "$actual" = "$expected"
+          tar -xzf target/dependency-download/dependencies.tar.gz -C target
+          mv target/dependencies/registry target/registry
+          cmp <(tr -d '\r' < encore.lock) target/dependencies/encore.lock
+          test "$(cat target/dependencies/index-commit)" = "${{ inputs.index_sha }}"
+          mv target/dependencies/system-index target/system-index
+          index_root="$PWD/../encore-index"
+          test ! -e "$index_root"
+          cp -R target/system-index "$index_root"
+          echo "ENCORE_CORE_DIR=$index_root/packages/core" >> "$GITHUB_ENV"
+          echo "ENCORE_INDEX_URL=http://127.0.0.1:9" >> "$GITHUB_ENV"
+
+      - name: Download and verify producer seed
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/seed
+          extension=tar.gz
+          [[ "${{ inputs.seed_triple }}" == *-windows-* ]] && extension=zip
+          asset="encore-${{ inputs.seed_triple }}.$extension"
+          gh release download "${{ inputs.seed_tag }}" \
+            --pattern "$asset" --pattern "$asset.sha256" --dir target/seed
+          expected=$(awk 'NF {print tolower($1); exit}' "target/seed/$asset.sha256")
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "target/seed/$asset" | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 "target/seed/$asset" | awk '{print $1}')
+          fi
+          test "$actual" = "$expected"
+          mkdir -p target/seed-unpacked
+          case "$extension" in
+            zip) unzip -q "target/seed/$asset" -d target/seed-unpacked ;;
+            *) tar -xzf "target/seed/$asset" -C target/seed-unpacked ;;
+          esac
+          distribution=$(find target/seed-unpacked -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          seed="$PWD/$distribution/bin/${{ inputs.seed_executable }}"
+          test -s "$seed"
+          chmod +x "$seed" 2>/dev/null || true
+          echo "SEED_COMPILER=$seed" >> "$GITHUB_ENV"
+
+      - name: Install Linux cross toolchains
+        if: inputs.producer == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=20260616
+          archive="llvm-mingw-$version-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          url="https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive"
+          curl -fsSL --retry 2 "$url" -o "target/$archive"
+          test "$(sha256sum "target/$archive" | awk '{print $1}')" = \
+            "534b92e067b22a6b4441f48ae9240a3341b17825d04d577eab0cf85c44b4deda"
+          mkdir -p target/llvm-mingw
+          tar -xJf "target/$archive" -C target/llvm-mingw --strip-components=1
+          scripts/build-linux-aarch64-sysroot.sh \
+            target/llvm-mingw/linux-aarch64-sysroot
+          echo "LLVM_MINGW_ROOT=$PWD/target/llvm-mingw" >> "$GITHUB_ENV"
+
+      - name: Verify macOS Network.framework TLS
+        if: inputs.producer == 'darwin'
+        shell: bash
+        run: python3 ../encore-index/scripts/test-apple-tls.py
+
+      - name: Build producer once, then emit target stage1 artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci-produce-stage1.sh
+          scripts/ci-produce-stage1.sh \
+            "$SEED_COMPILER" \
+            "${{ inputs.producer }}" \
+            "${{ inputs.seed_tag }}" \
+            ${{ inputs.targets }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: stage1-${{ inputs.producer }}
+          path: target/stage1-artifacts
+          if-no-files-found: error
+          retention-days: 7
