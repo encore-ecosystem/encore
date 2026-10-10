@@ -13,7 +13,7 @@ shift 3
 targets=("$@")
 
 case "$producer" in
-  linux|darwin|darwin-intel) executable=encore ;;
+  linux|darwin) executable=encore ;;
   windows) executable=encore.exe ;;
   *) echo "unknown producer: $producer" >&2; exit 2 ;;
 esac

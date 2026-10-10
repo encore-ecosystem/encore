@@ -84,7 +84,13 @@ case "$arch" in
 esac
 case "$os" in
     Linux) triple="${arch}-unknown-linux-gnu" ;;
-    Darwin) triple="${arch}-apple-darwin" ;;
+    Darwin)
+        [ "$arch" = aarch64 ] || {
+            echo "Encore macOS releases require Apple Silicon (M1 or newer); Intel Macs are no longer supported" >&2
+            exit 1
+        }
+        triple="${arch}-apple-darwin"
+        ;;
     *) echo "Unsupported operating system: $os" >&2; exit 1 ;;
 esac
 
