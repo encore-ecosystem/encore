@@ -1,0 +1,169 @@
+//! Verified package cache transactions; an OS lock owns each content key.
+
+import core::option::Option
+import core::result::Result
+import mod::build_artifacts::{UnitReady, read_unit_ready, read_unit_complete, verify_validated_unit_copy, encode_unit_complete}
+import mod::build_metadata::{MetadataContext, MetadataDependency}
+import refrain::cache_identity::compiler_content_digest
+import std::os::{file_exists, file_sha256, mkdir_all, read_file, remove_file, write_file}
+import std::path::Path
+import std::vec::Vec
+
+extern fn encore_compiler_cache_lock_open(path: str) -> usize
+extern fn encore_compiler_cache_lock_try(lock: usize) -> i32
+extern fn encore_compiler_cache_lock_close(lock: usize) ->()
+extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
+
+/// The coordinator retains this handle until a worker is reaped and its
+/// complete result is committed, or until cancellation has reaped every child.
+pub struct UnitCacheLock {
+    directory: Path
+    handle: usize
+}
+
+/// Contention is not an error or a resource reservation. Poll other units
+/// before retrying this key; no CPU or RAM lease is held while waiting.
+#attr(safe)
+pub fn try_unit_cache_lock(root: Path, key: str) -> Result[Option[UnitCacheLock], str] {
+    if !root.is_absolute() || !valid_key(key) {
+        ret Result[Option[UnitCacheLock], str]::Err("invalid package cache location")
+    }
+    if mkdir_all(root.as_str()) != 0 {
+        ret Result[Option[UnitCacheLock], str]::Err("cannot create package cache root")
+    }
+    let handle = unsafe {
+        encore_compiler_cache_lock_open(root.join(key + ".lock").as_str())
+    }
+    if handle == 0 {
+        ret Result[Option[UnitCacheLock], str]::Err("cannot open package cache lock")
+    }
+    let status = unsafe {
+        encore_compiler_cache_lock_try(handle)
+    }
+    if status == 1 {
+        ret Result[Option[UnitCacheLock], str]::Ok(Option[UnitCacheLock]::Some(UnitCacheLock {
+                    root.join(key), handle
+                }
+                ,
+            ))
+    }
+    unsafe {
+        encore_compiler_cache_lock_close(handle)
+    }
+    if status == 0 {
+        ret Result[Option[UnitCacheLock], str]::Ok(Option[UnitCacheLock]::None)
+    }
+    ret Result[Option[UnitCacheLock], str]::Err("cannot acquire package cache lock")
+}
+
+#attr(safe)
+pub fn close_unit_cache_lock(lock: UnitCacheLock) ->() {
+    unsafe {
+        encore_compiler_cache_lock_close(lock.handle)
+    }
+}
+
+/// A corrupt or incomplete entry is a miss, never compiler input. Hydrate a
+/// private build snapshot while locked so later users cannot alter link inputs.
+pub fn restore_unit_cache(lock: UnitCacheLock, context: MetadataContext,
+    dependencies: Vec[MetadataDependency], native: str, destination: Path,) -> Result[Option[UnitReady], str] {
+    let ready = match read_unit_ready(lock.directory, context, dependencies) {
+        Ok(value) => value
+        Err(_) => {
+            ret Result[Option[UnitReady], str]::Ok(Option[UnitReady]::None)
+        }
+    }
+    let archive = match read_unit_complete(lock.directory, ready, native) {
+        Ok(value) => value
+        Err(_) => {
+            ret Result[Option[UnitReady], str]::Ok(Option[UnitReady]::None)
+        }
+    }
+    copy_committed_unit(lock.directory, destination, ready, archive, native, false)?
+    verify_validated_unit_copy(destination, ready)?
+    let _archive = read_unit_complete(destination, ready, native)?
+    ret Result[Option[UnitReady], str]::Ok(Option[UnitReady]::Some(ready))
+}
+
+/// Validate the producer before touching the shared slot. Invalidate its old
+/// commit record first and publish the replacement commit record last. Crash
+/// at any intermediate point leaves a miss, not a partially usable entry.
+pub fn commit_unit_cache(lock: UnitCacheLock, source: Path, context: MetadataContext,
+    dependencies: Vec[MetadataDependency], native: str,) -> Result[(), str] {
+    let ready = read_unit_ready(source, context, dependencies)?
+    let archive = read_unit_complete(source, ready, native)?
+    copy_committed_unit(source, lock.directory, ready, archive, native, true)?
+    verify_validated_unit_copy(lock.directory, ready)?
+    let _copied_archive = read_unit_complete(lock.directory, ready, native)?
+    ret Result[(), str]::Ok(())
+}
+
+#attr(safe)
+fn copy_committed_unit(source: Path, destination: Path, ready: UnitReady, archive: str, native: str,
+    durable: bool,) -> Result[(), str] {
+    if !destination.is_absolute() || source.as_str() == destination.as_str() || mkdir_all(destination.as_str()) != 0 {
+        ret Result[(), str]::Err("invalid package cache transaction")
+    }
+    let marker = destination.join("unit.complete")
+    if file_exists(marker.as_str()) && remove_file(marker.as_str()) != 0 {
+        ret Result[(), str]::Err("cannot invalidate package cache commit")
+    }
+    let mut files = Vec[(str, str)]::new()
+    files.push(("unit.ermeta", ready.metadata_digest))
+    files.push(("unit.ertemplate", ready.template_digest))
+    files.push(("unit.errequirements", ready.requirements_digest))
+    files.push(("unit.erlib", archive))
+    files.push(("unit.ready", compiler_content_digest(ready.encode()?)))
+    for file in files {
+        let input = source.join(file.0)
+        let output = destination.join(file.0)
+        let contents = read_file(input.as_str())
+        // read_file and the atomic writer preserve byte lengths, including NUL
+        // bytes in native archives. Never use a C-string conversion for payloads.
+        // Bind the exact bytes read to the previously validated snapshot. The
+        // caller verifies destination hashes once after all writes; hashing
+        // each source/destination again inside this loop adds no protection.
+        if !file_exists(input.as_str()) || !valid_key(file.1) || compiler_content_digest(contents) != file.1 {
+            ret Result[(), str]::Err("cannot commit package cache payload: " + file.0)
+        }
+        // Shared CAS publication is durable. Hydration owns an unpublished,
+        // fresh private snapshot: only its readiness/completion receipts need
+        // atomic publication, not a separate fsync for every copied payload.
+        // No worker receives this path until destination SHA validation passes.
+        let written = if durable || file.0 == "unit.ready" {
+            unsafe {
+                encore_compiler_write_atomic(output.as_str(), contents)
+            }
+        } else {
+            write_file(output.as_str(), contents) == 0
+        }
+        if !written {
+            ret Result[(), str]::Err("cannot write package snapshot: " + file.0)
+        }
+    }
+    // Publish completion last, using validated bindings rather than rereading
+    // a mutable source receipt after its validation.
+    let complete = encode_unit_complete(ready, native, archive)?
+    if !unsafe {
+        encore_compiler_write_atomic(marker.as_str(), complete)
+    }
+    {
+        ret Result[(), str]::Err("cannot commit package cache receipt")
+    }
+    ret Result[(), str]::Ok(())
+}
+
+fn valid_key(value: str) -> bool {
+    if value.byte_len() != 64 {
+        ret false
+    }
+    let mut index = 0_usize
+    while index < 64 {
+        let byte = value.byte_at(index)
+        if !(byte >= 48 && byte <= 57) && !(byte >= 97 && byte <= 102) {
+            ret false
+        }
+        index += 1
+    }
+    ret true
+}

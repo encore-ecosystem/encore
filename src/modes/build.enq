@@ -3,9 +3,10 @@
 import argparse::{process_arg_count, process_arg}
 import core::fmt::Debug
 import core::option::Option
+import core::result::Result
+import json::{Json, stringify, parse}
 import std::dict::Hashable
 import std::io::eprintln
-import std::os::copy_file
 import std::os::env
 import std::os::file_exists
 import std::os::file_sha256
@@ -14,6 +15,7 @@ import std::os::mkdir_all
 import std::os::read_file
 import std::os::remove_file
 import std::os::write_file
+import std::os::{copy_file, set_executable}
 import std::path::Path
 import std::path::clone_path
 import std::process::exit
@@ -21,14 +23,24 @@ import std::process::run_args
 import std::process::run_args_owned
 import std::thread::JoinHandle
 import std::thread::available_parallelism
-import std::time::perf_counter_ms
+import std::time::{perf_counter_ms, perf_counter_ns}
 import std::vec::Vec
 
 import ehir_llvm_backend::codegen::{EmittedIrModule, emit_ir, emit_ir_for_target, emit_ir_bundle_for_target_parallel, emit_ir_bundle_for_target_selected, emit_ir_bundle_for_target_selected_with_analysis, incremental_codegen_context_bundle}
 import ehirlib::parse_module_text
 import ehirlib::{EhirModuleSource, ModuleBundle, parse_module_bundle_artifact_parallel, parse_module_bundle_text, split_module_bundle_text, flatten_module_bundle, module_bundle_to_string}
 
-import refrain::cache_identity::compiler_binary_identity
+import ehir_llvm_backend::codegen::{CodegenRequirements, emit_program_support}
+import ehirlib::Module
+import ehirlib::core::make_module_bundle
+import mod::build_archive::{UnitNativePlan, run_program_tool, stable_module_ir}
+import mod::build_artifacts::UnitReady
+import mod::build_cache::{UnitCacheLock, try_unit_cache_lock, close_unit_cache_lock}
+import mod::build_coordinator::{CompiledPackage, compile_cached_package_graph}
+import mod::build_metadata::{MetadataContext, metadata_name_before}
+import mod::build_native_inputs::{native_source_identity, native_source_identities}
+import mod::build_requirements::UnitRequirements
+import refrain::cache_identity::{compiler_binary_identity, compiler_content_digest}
 import refrain::diagnostics::render_diagnostic
 import refrain::frontend::parser::statements::Statement
 import refrain::frontend::translator::{TranslationModule, TranslatedModuleChunk, assemble_ehir_module_bundle, filter_ast_for_target, translate_ast_with_modules_to_ehir, translate_modules_to_ehir, translate_modules_to_ehir_bundle, translate_modules_to_ehir_bundle_parallel, translate_selected_modules_to_ehir_chunks, translate_to_ehir, translate_to_ehir_for_target, translate_to_ehir_for_target_and_features}
@@ -38,15 +50,25 @@ import refrain::project::WorkspaceModule
 import refrain::project::WorkspaceRefrain
 import refrain::project::load_binary_workspace
 import refrain::project::manifest::{project_manifest_name, project_manifest_target, project_target_toolchain, read_project_manifest}
+import refrain::project::workspace::{ResolvedPackageGraph, try_resolve_package_graph}
 import refrain::project::{system_core_root, system_platform_root, workspace_release_modules, workspace_root_refrain}
 import refrain::target::kits::{target_kit_installed, target_kit_toolchain, target_platform_root}
 import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host, target_is_supported, toolchain_driver_is_supported}
 import refrain::version::compiler_release_version
+import std::time::sleep_ms
 
 import rich::BuildProgress
 
 extern fn encore_compiler_release_heap() ->()
 extern fn encore_compiler_exec_parts(program: str, data: usize, len: usize) -> i32
+extern fn encore_build_queue_new(count: usize) -> usize
+extern fn encore_build_queue_next(queue: usize) -> usize
+extern fn encore_build_queue_cancel(queue: usize) ->()
+extern fn encore_build_queue_free(queue: usize) ->()
+extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
+extern fn encore_compiler_memory_budget() -> u64
+extern fn encore_compiler_process_id() -> u64
+extern fn encore_compiler_worker_interrupted() -> i32
 
 struct SemanticModuleJob {
     index: usize
@@ -167,6 +189,20 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     let input_configuration = build_input_configuration(root, target, toolchain, profile, emit)
     let mut progress = BuildProgress::auto()
     progress.start_build(path_name_or(root, "project"), profile)
+    if emit == "binary" {
+        progress.start_stage("Packages", "dependency graph")
+        progress.suspend()
+        match compile_package_binary(root, target, toolchain, profile, profile_dir, binary_path) {
+            Ok(_) => {
+                progress.finish_stage("package archives and final support")
+                finish_pipeline_artifact(progress, profile, "Binary", binary_path.as_str(), pipeline_started_ms)
+                ret 0
+            }
+            Err(error) => {
+                progress.fail_stage(error) ret 1
+            }
+        }
+    }
     if emit == "binary" && file_exists(native_path(binary_path.as_str())) &&
     file_exists(native_path(fingerprint_path.as_str())) &&
     build_input_snapshot_matches(input_snapshot_path, input_configuration) {
@@ -493,19 +529,34 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             let worker_count = min_usize(requested_jobs(), scheduled_module_paths.len())
             let mut module_compiles = Vec[JoinHandle[i32]]::new()
             let base_args = compiler_args(profile, target, toolchain)
+            let queue = unsafe {
+                encore_build_queue_new(scheduled_module_paths.len())
+            }
+            if queue == 0_usize {
+                progress.fail_stage("failed to allocate object work queue")
+                ret 1_u32
+            }
             let mut worker = 0_usize
             while worker < worker_count {
                 module_compiles.push(spawn compile_module_object_batch(toolchain.compiler, base_args,
-                        scheduled_module_paths, object_suffix, worker, worker_count,))
+                        scheduled_module_paths, object_suffix, queue,))
                 worker = worker + 1_usize
             }
+            let mut module_compile_failed = false
             for pending in module_compiles {
                 let compiled = pending.join()
                 if compiled < 0_i32 {
-                    progress.fail_stage("LLVM module compilation failed for target " + target.triple)
-                    ret 1_u32
+                    module_compile_failed = true
+                } else {
+                    compiled_llvm_count = compiled_llvm_count +(compiled as usize)
                 }
-                compiled_llvm_count = compiled_llvm_count +(compiled as usize)
+            }
+            unsafe {
+                encore_build_queue_free(queue)
+            }
+            if module_compile_failed {
+                progress.fail_stage("LLVM module compilation failed for target " + target.triple)
+                ret 1_u32
             }
             if write_file(native_path(codegen_fingerprint_path.as_str()), codegen_fingerprint) != 0_i32 {
                 progress.fail_stage("failed to write modular codegen fingerprint")
@@ -576,16 +627,29 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     }
     let native_worker_count = min_usize(native_budget, native_jobs.len())
     let mut native_compiles = Vec[JoinHandle[i32]]::new()
+    let native_queue = unsafe {
+        encore_build_queue_new(native_jobs.len())
+    }
+    if native_queue == 0_usize {
+        progress.fail_stage("failed to allocate native work queue")
+        ret 1_u32
+    }
     let mut native_worker = 0_usize
     while native_worker < native_worker_count {
-        native_compiles.push(spawn compile_object_batch(native_jobs, native_worker, native_worker_count))
+        native_compiles.push(spawn compile_object_batch(native_jobs, native_queue))
         native_worker += 1_usize
     }
     match llvm_compile {
         Some(handle) => {
             if handle.join() != 0_i32 {
                 for pending in native_compiles {
+                    unsafe {
+                        encore_build_queue_cancel(native_queue)
+                    }
                     let _ignored = pending.join()
+                }
+                unsafe {
+                    encore_build_queue_free(native_queue)
                 }
                 progress.fail_stage("LLVM IR assembly failed for target " + target.triple)
                 ret 1_u32
@@ -594,11 +658,18 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         None => {
         }
     }
+    let mut native_compile_failed = false
     for pending in native_compiles {
         if pending.join() != 0_i32 {
-            progress.fail_stage("native runtime compilation failed for target " + target.triple)
-            ret 1_u32
+            native_compile_failed = true
         }
+    }
+    unsafe {
+        encore_build_queue_free(native_queue)
+    }
+    if native_compile_failed {
+        progress.fail_stage("native runtime compilation failed for target " + target.triple)
+        ret 1_u32
     }
     let llvm_object_count = if modular_codegen {
         module_llvm_paths.len()
@@ -616,16 +687,13 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     }
     let mut link_args = target_tool_args(target, toolchain)
     append_profile_link_args(link_args, profile, target)
-    if profile == "extreme" && target.os == "linux" {
-        let thinlto_cache = profile_dir.join("thinlto-cache")
-        if mkdir_all(native_path(thinlto_cache.as_str())) != 0_i32 {
-            progress.fail_stage("failed to create ThinLTO cache")
+    match append_thinlto_cache_args(link_args, profile, target, profile_dir) {
+        Ok(_) => {
+        }
+        Err(error) => {
+            progress.fail_stage(error)
             ret 1_u32
         }
-        link_args.push("-Wl,--thinlto-cache-dir=" + native_path(thinlto_cache.as_str()))
-        // Retain the useful current and immediately preceding ThinLTO object
-        // generations while bounding a project-local cache on workstations.
-        link_args.push("-Wl,--thinlto-cache-policy=cache_size_bytes=4294967296:cache_size_files=20000")
     }
     for object in objects {
         link_args.push(object)
@@ -654,6 +722,343 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     progress.finish_stage("native binary")
     finish_pipeline_artifact(progress, profile, "Binary", binary_path.as_str(), pipeline_started_ms)
     ret 0_u32
+}
+
+/// Package compilation never opens dependency bodies in the coordinator.
+/// Only compact verified templates are read again for the single support CGU.
+#attr(safe)
+pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolchain,
+    profile: str, profile_dir: Path, binary: Path,) -> Result[(), str] {
+    let pipeline_started = perf_counter_ms()
+    let graph = match try_resolve_package_graph(root, true, true) {
+        Ok(value) => value
+        Err(failure) => {
+            ret Result[(), str]::Err(failure.message)
+        }
+    }
+    let staging = profile_dir.join("packages-" + Debug::fmt(unsafe {
+                encore_compiler_process_id()
+            }
+        ) +
+        "-" + Debug::fmt(perf_counter_ns())).resolve()
+    let native = UnitNativePlan {
+        resolve_native_program(toolchain.compiler)?,
+        resolve_native_program(toolchain.archiver)?, compiler_args(profile, target, toolchain)
+    }
+    let cache = env("ENCORE_BUILD_CACHE").unwrap_or(home_dir() + "/.cache/encore/units-v1")
+    let packages = compile_cached_package_graph(graph, target.triple, profile, requested_jobs(),
+        unsafe {
+            encore_compiler_memory_budget()
+        }
+        , staging, native, Option[Path]::Some(Path::new(cache).expanduser().resolve()),)?
+    let packages_ms = perf_counter_ms() - pipeline_started
+    let sources = package_native_sources(root, graph, target, toolchain)
+    if sources.len() == 0 {
+        ret Result[(), str]::Err("binary output requires builtin-runtime or target.runtime-sources")
+    }
+    let native_keys = native_source_identities(sources, native, staging, requested_jobs())?
+    let mut link_inputs = Vec[Json]::new()
+    link_inputs.push(Json::String("encore-package-link-1"))
+    link_inputs.push(Json::String(native.identity()?))
+    link_inputs.push(Json::String(file_sha256(resolve_native_program(toolchain.linker)?)))
+    for argument in target_tool_args(target, toolchain) {
+        link_inputs.push(Json::String(argument))
+    }
+    for argument in toolchain.link_args {
+        link_inputs.push(Json::String(argument))
+    }
+    if toolchain.linker_script != "" {
+        link_inputs.push(Json::String(file_sha256(resolve_project_path(root, toolchain.linker_script).as_str())))
+    }
+    for key in native_keys {
+        link_inputs.push(Json::String(key))
+    }
+    for package in packages {
+        let mut record = Vec[Json]::new()
+        record.push(Json::String(package.ready.context.unit))
+        record.push(Json::String(package.archive_digest))
+        record.push(Json::String(package.ready.template_digest))
+        record.push(Json::String(package.ready.requirements_digest))
+        link_inputs.push(Json::Array(record))
+    }
+    let link_key = compiler_content_digest(stringify(Json::Array(link_inputs)))
+    let link_record = profile_dir.join(".encore-package-link")
+    let previous = if verified_artifact(link_record) {
+        parse(read_file(link_record.as_str())).unwrap_or(Json::Null)
+    } else {
+        Json::Null
+    }
+    if previous.get("key").unwrap_or(Json::Null).as_str().unwrap_or("") == link_key &&
+    previous.get("binary").unwrap_or(Json::Null).as_str().unwrap_or("") == file_sha256(binary.as_str()) &&
+    file_exists(binary.as_str()) {
+        write_package_pipeline_timing(profile_dir, packages, packages_ms, 0, 0, perf_counter_ms() - pipeline_started, true)?
+        ret Result[(), str]::Ok(())
+    }
+    let mut names = Vec[str]::new()
+    for package in packages {
+        names.push(package.ready.context.unit)
+    }
+    // Graph and manifest order are not final support identities either.
+    let mut index = 1_usize
+    while index < names.len() {
+        let mut cursor = index
+        while cursor > 0 {
+            let current = names.get(cursor).unwrap_or("")
+            let previous = names.get(cursor - 1).unwrap_or("")
+            if !metadata_name_before(current, previous) {
+                break
+            }
+            names.set(cursor - 1, current) names.set(cursor, previous) cursor -= 1
+        }
+        index += 1
+    }
+    let mut contexts = Vec[Module]::new()
+    let mut requirements = Vec[CodegenRequirements]::new()
+    let mut archives = Vec[str]::new()
+    for name in names {
+        for package in packages {
+            if package.ready.context.unit != name {
+                continue
+            }
+            let bundle = parse_module_bundle_text("", read_file(package.directory.join("unit.ertemplate").as_str()))
+            contexts.extend(bundle.modules)
+            requirements.push(UnitRequirements::decode(read_file(package.directory.join("unit.errequirements").as_str()),
+                    package.ready.context,)?.requirements)
+            archives.push(package.directory.join("unit.erlib").as_str())
+        }
+    }
+    let entry = graph.root_name + "@main.enq"
+    let support = emit_program_support(make_module_bundle(entry, contexts), requirements, target.triple, target.pointer_width)
+    let support_path = staging.join("support.ll")
+    if !write_verified_artifact(support_path, stable_module_ir(support.ir, graph.root_name + "@__program_support")) {
+        ret Result[(), str]::Err("cannot commit final support code")
+    }
+    let mut objects = Vec[str]::new()
+    let support_object = staging.join("support.o")
+    let mut support_args = compiler_args(profile, target, toolchain)
+    support_args.push("--target=" + target.triple)
+    support_args.push("-c") support_args.push(support_path.as_str())
+    support_args.push("-o") support_args.push(support_object.as_str())
+    run_program_tool(resolve_native_program(toolchain.compiler)?, support_args, staging, "support")?
+    objects.push(support_object.as_str())
+    index = 0
+    for source in sources {
+        let object = staging.join("native-" + Debug::fmt(index) + ".o")
+        let mut args = compiler_args(profile, target, toolchain)
+        args.push("-c") args.push(native_path(source.as_str())) args.push("-o") args.push(object.as_str())
+        compile_cached_native_object(source, native, args, staging, profile_dir, object,
+            native_keys.get(index).unwrap_or(""), index,)?
+        objects.push(object.as_str())
+        index += 1
+    }
+    let mut link_args = target_tool_args(target, toolchain)
+    // Keep libraries after objects/archives for linkers using left-to-right
+    // symbol resolution. The earlier monolithic path has no archive ordering.
+    for object in objects {
+        link_args.push(object)
+    }
+    if target.os == "linux" {
+        link_args.push("-Wl,--start-group")
+    }
+    for archive in archives {
+        if target.os == "macos" {
+            link_args.push("-Wl,-force_load," + archive)
+        } elif target.os == "windows" && target.environment == "msvc" {
+            link_args.push("-Wl,/wholearchive:" + archive)
+        } else {
+            link_args.push(archive)
+        }
+    }
+    if target.os == "linux" {
+        link_args.push("-Wl,--end-group")
+    }
+    append_profile_link_args(link_args, profile, target)
+    append_thinlto_cache_args(link_args, profile, target, profile_dir)?
+    if toolchain.linker_script != "" {
+        link_args.push("-T") link_args.push(native_path(resolve_project_path(root, toolchain.linker_script).as_str()))
+    }
+    for argument in toolchain.link_args {
+        link_args.push(argument)
+    }
+    let support_native_ms = perf_counter_ms() - pipeline_started - packages_ms
+    // Publish only a successfully linked binary, never truncate the executable
+    // that another process is still running or retain a failed partial link.
+    let linked = staging.join("linked" + target.executable_suffix)
+    link_args.push("-o") link_args.push(linked.as_str())
+    run_program_tool(resolve_native_program(toolchain.linker)?, link_args, staging, "link")?
+    if copy_file(linked.as_str(), binary.as_str()) != 0 || set_executable(binary.as_str()) != 0 {
+        ret Result[(), str]::Err("cannot install linked binary")
+    }
+    let mut committed = Vec[(str, Json)]::new()
+    committed.push(("key", Json::String(link_key)))
+    committed.push(("binary", Json::String(file_sha256(binary.as_str()))))
+    if !write_verified_artifact(link_record, stringify(Json::Object(committed))) {
+        ret Result[(), str]::Err("cannot commit final binary identity")
+    }
+    write_package_pipeline_timing(profile_dir, packages, packages_ms, support_native_ms,
+        perf_counter_ms() - pipeline_started - packages_ms - support_native_ms, perf_counter_ms() - pipeline_started, false,)?
+    ret Result[(), str]::Ok(())
+}
+
+fn append_thinlto_cache_args(args: mut Vec[str], profile: str, target: TargetSpec,
+    profile_dir: Path,) -> Result[(), str] {
+    if profile == "extreme" && target.os == "linux" {
+        let directory = profile_dir.join("thinlto-cache")
+        if mkdir_all(native_path(directory.as_str())) != 0_i32 {
+            ret Result[(), str]::Err("failed to create ThinLTO cache")
+        }
+        args.push("-Wl,--thinlto-cache-dir=" + native_path(directory.as_str()))
+        args.push("-Wl,--thinlto-cache-policy=cache_size_bytes=4294967296:cache_size_files=20000")
+        args.push("-Wl,--thinlto-jobs=" + Debug::fmt(requested_jobs()))
+    }
+    ret Result[(), str]::Ok(())
+}
+
+fn write_package_pipeline_timing(profile_dir: Path, packages: Vec[CompiledPackage], packages_ms: u64,
+    support_native_ms: u64, link_ms: u64, total_ms: u64, cached: bool,) -> Result[(), str] {
+    let mut units = Vec[Json]::new()
+    for package in packages {
+        units.push(parse(read_file(package.directory.join("timing.json").as_str())).unwrap_or(Json::Null))
+    }
+    let mut timings = Vec[(str, Json)]::new()
+    timings.push(("schema", Json::Number("1")))
+    timings.push(("packages_ms", Json::Number(Debug::fmt(packages_ms))))
+    timings.push(("support_and_runtime_ms", Json::Number(Debug::fmt(support_native_ms))))
+    timings.push(("link_ms", Json::Number(Debug::fmt(link_ms))))
+    timings.push(("total_ms", Json::Number(Debug::fmt(total_ms))))
+    timings.push(("link_cache_hit", Json::Bool(cached)))
+    timings.push(("units", Json::Array(units)))
+    if !write_verified_artifact(profile_dir.join("encore-timings.json"), stringify(Json::Object(timings))) {
+        ret Result[(), str]::Err("cannot record package pipeline timings")
+    }
+    ret Result[(), str]::Ok(())
+}
+
+#attr(safe)
+fn compile_cached_native_object(source: Path, plan: UnitNativePlan, args: Vec[str], staging: Path,
+    profile_dir: Path, output: Path, key: str, index: usize,) -> Result[(), str] {
+    let root = profile_dir.join("native-cache-v1").resolve()
+    let mut acquired = Option[UnitCacheLock]::None
+    while acquired.is_none() {
+        if unsafe {
+            encore_compiler_worker_interrupted()
+        }
+        != 0 {
+            ret Result[(), str]::Err("native cache wait cancelled")
+        }
+        acquired = try_unit_cache_lock(root, key)?
+        if acquired.is_none() {
+            let _sleep = sleep_ms(5)
+        }
+    }
+    let lock = match acquired {
+        Some(value) => value None => {
+            ret Result[(), str]::Err("missing native cache lock")
+        }
+    }
+    let result = compile_locked_native_object(lock, source, plan, args, staging, output, key, index)
+    close_unit_cache_lock(lock)
+    ret result
+}
+
+fn compile_locked_native_object(lock: UnitCacheLock, source: Path, plan: UnitNativePlan, args: Vec[str],
+    staging: Path, output: Path, key: str, index: usize,) -> Result[(), str] {
+    let object = lock.directory.join("native.o")
+    if verified_artifact(object) && copy_verified_artifact(object, output) {
+        ret Result[(), str]::Ok(())
+    }
+    if mkdir_all(lock.directory.as_str()) != 0 {
+        ret Result[(), str]::Err("cannot create native object cache")
+    }
+    run_program_tool(plan.compiler, args, staging, "native-" + Debug::fmt(index))?
+    if native_source_identity(source, plan, staging, index)? != key {
+        ret Result[(), str]::Err("native inputs changed while compiling: " + source.as_str())
+    }
+    if !write_verified_artifact(object, read_file(output.as_str())) {
+        ret Result[(), str]::Err("cannot commit native object")
+    }
+    ret Result[(), str]::Ok(())
+}
+
+fn package_native_sources(root: Path, graph: ResolvedPackageGraph, target: TargetSpec, toolchain: Toolchain) -> Vec[Path] {
+    let mut sources = Vec[Path]::new()
+    let runtime = resolved_core_runtime(root)
+    let override = configured_runtime_path("ENCORE_PLATFORM_RUNTIME")
+    let platform = if toolchain.hosted_runtime && !target.freestanding && target_is_host(target) {
+        system_platform_root(root, target).join("runtime.c").resolve()
+    } else {
+        Path::new("")
+    }
+    if toolchain.hosted_runtime {
+        sources.push(runtime)
+    }
+    if toolchain.hosted_runtime && !target.freestanding && override != "" && override != runtime.as_str() {
+        sources.push(Path::new(override))
+    }
+    if platform.as_str() != "" && platform.as_str() != override && file_exists(platform.as_str()) {
+        sources.push(platform)
+    }
+    for configured in toolchain.runtime_sources {
+        sources.push(resolve_project_path(root, configured))
+    }
+    for package in graph.refrains {
+        let candidate = package.root.join("runtime.c").resolve()
+        if toolchain.hosted_runtime && !target.freestanding && package.name != "core" &&
+        candidate.as_str() != runtime.as_str() && candidate.as_str() != override && candidate.as_str() != platform.as_str() && file_exists(candidate.as_str()) {
+            sources.push(candidate)
+        }
+        if toolchain.hosted_runtime && !target.freestanding {
+            for feature in package.enabled_features {
+                let candidate = package.root.join("runtime." + feature + ".c").resolve()
+                if file_exists(candidate.as_str()) {
+                    sources.push(candidate)
+                }
+            }
+        }
+    }
+    ret sources
+}
+
+fn resolve_native_program(program: str) -> Result[str, str] {
+    let explicit = Path::new(program)
+    if explicit.is_absolute() || explicit.parent().is_some() {
+        let path = explicit.resolve()
+        if file_exists(path.as_str()) {
+            ret Result[str, str]::Ok(path.as_str())
+        }
+        ret Result[str, str]::Err("native tool does not exist: " + program)
+    }
+    let paths = env("PATH").unwrap_or("")
+    let separator = if host_target().os == "windows" {
+        59_u8
+    } else {
+        58_u8
+    }
+    let mut start = 0_usize
+    let mut cursor = 0_usize
+    while cursor <= paths.byte_len() {
+        if cursor == paths.byte_len() || paths.byte_at(cursor) == separator {
+            let directory = paths.slice_bytes(start, cursor - start)
+            let candidate = Path::new(if directory == "" {
+                    "."
+                } else {
+                    directory
+                }
+            ).join(program).resolve()
+            if file_exists(candidate.as_str()) {
+                ret Result[str, str]::Ok(candidate.as_str())
+            }
+            if host_target().os == "windows" && candidate.extension().unwrap_or("") != "exe" {
+                let executable = candidate.as_str() + ".exe"
+                if file_exists(executable) {
+                    ret Result[str, str]::Ok(executable)
+                }
+            }
+            start = cursor + 1
+        }
+        cursor += 1
+    }
+    ret Result[str, str]::Err("native tool is not on PATH: " + program)
 }
 
 fn finish_pipeline_artifact(progress: mut BuildProgress, profile: str, kind: str, path: str,
@@ -1331,14 +1736,23 @@ fn verified_artifact(path: Path) -> bool {
 // The checksum is the commit marker. Readers never accept a cache artifact
 // until both the payload and its final sidecar are present and agree.
 fn write_verified_artifact(path: Path, text: str) -> bool {
-    if write_file(native_path(path.as_str()), text) != 0_i32 {
-        ret false
-    }
-    let digest = artifact_digest(path)
+    let digest = compiler_content_digest(text)
     if digest == "" {
         ret false
     }
-    if write_file(native_path(artifact_checksum_path(path).as_str()), digest + "\n") != 0_i32 {
+    if !unsafe {
+        encore_compiler_write_atomic(native_path(path.as_str()), text)
+    }
+    {
+        ret false
+    }
+    if !artifact_matches(path, digest) {
+        ret false
+    }
+    if !unsafe {
+        encore_compiler_write_atomic(native_path(artifact_checksum_path(path).as_str()), digest + "\n")
+    }
+    {
         ret false
     }
     ret artifact_matches(path, digest)
@@ -1633,20 +2047,31 @@ fn compile_object_job(compiler: str, args: frozen Vec[str], fingerprint_path: st
     ret 0_i32
 }
 
-fn compile_object_batch(jobs: frozen Vec[ObjectCompileJob], worker_index: usize, worker_count: usize) -> i32 {
-    let mut index = worker_index
-    while index < jobs.len() {
+fn compile_object_batch(jobs: frozen Vec[ObjectCompileJob], queue: usize) -> i32 {
+    loop {
+        let index = unsafe {
+            encore_build_queue_next(queue)
+        }
+        if index >= jobs.len() {
+            break
+        }
         match jobs.get(index) {
             Some(job) => {
                 if compile_object_job("" + job.compiler, job.args, "" + job.fingerprint_path,
                     "" + job.fingerprint,) != 0_i32 {
+                    unsafe {
+                        encore_build_queue_cancel(queue)
+                    }
                     ret 1_i32
                 }
             }
             None => {
+                unsafe {
+                    encore_build_queue_cancel(queue)
+                }
+                ret 1_i32
             }
         }
-        index += worker_count
     }
     ret 0_i32
 }
@@ -1840,10 +2265,15 @@ fn schedule_module_paths(paths: Vec[Path]) -> Vec[Path] {
 }
 
 fn compile_module_object_batch(compiler: str, base_args: frozen Vec[str], paths: frozen Vec[Path],
-    object_suffix: str, worker_index: usize, worker_count: usize,) -> i32 {
-    let mut index = worker_index
+    object_suffix: str, queue: usize,) -> i32 {
     let mut compiled = 0_i32
-    while index < paths.len() {
+    loop {
+        let index = unsafe {
+            encore_build_queue_next(queue)
+        }
+        if index >= paths.len() {
+            break
+        }
         match paths.get(index) {
             Option[Path]::Some(module_llvm) => {
                 let module_llvm = clone_path(module_llvm)
@@ -1852,7 +2282,6 @@ fn compile_module_object_batch(compiler: str, base_args: frozen Vec[str], paths:
                 let fingerprint = module_llvm_fingerprint(module_llvm, compiler, base_args)
                 if file_exists(native_path(object.as_str())) && file_exists(native_path(fingerprint_path.as_str())) &&
                 read_file(native_path(fingerprint_path.as_str())) == fingerprint {
-                    index = index + worker_count
                     continue
                 }
                 let mut args = clone_string_vec(base_args)
@@ -1862,18 +2291,26 @@ fn compile_module_object_batch(compiler: str, base_args: frozen Vec[str], paths:
                 args.push(native_path(object.as_str()))
                 let code = run_args_owned(compiler, args)
                 if code != 0_i32 {
+                    unsafe {
+                        encore_build_queue_cancel(queue)
+                    }
                     ret - 1_i32
                 }
                 if write_file(native_path(fingerprint_path.as_str()), fingerprint) != 0_i32 {
+                    unsafe {
+                        encore_build_queue_cancel(queue)
+                    }
                     ret - 1_i32
                 }
                 compiled = compiled + 1_i32
             }
             Option[Path]::None => {
+                unsafe {
+                    encore_build_queue_cancel(queue)
+                }
                 ret - 1_i32
             }
         }
-        index = index + worker_count
     }
     ret compiled
 }
@@ -2630,6 +3067,10 @@ pub fn target_profile_dir(root: Path, target: TargetSpec, profile: str) -> Path 
 
 fn compiler_args(profile: str, target: TargetSpec, toolchain: Toolchain) -> Vec[str] {
     let mut args = target_tool_args(target, toolchain)
+    // Clang records a compilation directory even in ThinLTO's NoDebug
+    // compile units. A PID-scoped staging cwd changes module hashes, promoted
+    // local symbol names and PE build IDs across otherwise identical links.
+    args.push("-fdebug-compilation-dir=.")
     if target.os == "macos" {
         args.push("-fblocks")
     }
@@ -2674,8 +3115,16 @@ fn append_profile_link_args(args: mut Vec[str], profile: str, target: TargetSpec
         args.push("-flto=thin")
         if target.os == "linux" {
             args.push("-Wl,--mllvm=-align-loops=32")
-        } elif target.os == "windows" {
+        }
+    }
+    // Rebuilding cached objects must not change a PE image just because the
+    // linker embeds today's timestamp. This applies to dev/debug as well as
+    // release/extreme, and each Windows linker flavor has its own spelling.
+    if target.os == "windows" {
+        if target.environment == "msvc" {
             args.push("-Wl,/Brepro")
+        } else {
+            args.push("-Wl,--no-insert-timestamp")
         }
     }
     // lld is substantially faster than the system GNU linker for the many
@@ -2739,9 +3188,9 @@ fn configured_runtime_path(name: str) -> str {
 
 fn target_tool_args(target: TargetSpec, toolchain: Toolchain) -> Vec[str] {
     let mut args = Vec[str]::new()
-    if !target_is_host(target) {
-        args.push("--target=" + target.triple)
-    }
+    // Clang's configured default need not match Encore's host ABI. LLVM IR,
+    // native sources, dependency scans and linking must use one exact target.
+    args.push("--target=" + target.triple)
     if toolchain.sysroot != "" {
         args.push("--sysroot=" + native_path(toolchain.sysroot))
     }
@@ -2753,6 +3202,66 @@ fn target_tool_args(target: TargetSpec, toolchain: Toolchain) -> Vec[str] {
         args.push("-ffreestanding")
     }
     ret args
+}
+
+#attr(test)
+fn native_explicit_target_contract() -> bool {
+    let host = host_target()
+    let host_args = target_tool_args(host, default_toolchain(host))
+    let gnu = parse_target("x86_64-w64-windows-gnu")
+    let gnu_args = target_tool_args(gnu, default_toolchain(gnu))
+    let mut stable_directory = false
+    for argument in compiler_args("extreme", host, default_toolchain(host)) {
+        if argument == "-fdebug-compilation-dir=." {
+            stable_directory = true
+        }
+    }
+    ret host_args.get(0).unwrap_or("") == "--target=" + host.triple
+    && gnu_args.get(0).unwrap_or("") == "--target=x86_64-w64-windows-gnu"
+    && stable_directory
+}
+
+#attr(test)
+fn native_windows_reproducible_link_contract() -> bool {
+    let mut profiles = Vec[str]::new()
+    profiles.push("dev")
+    profiles.push("debug")
+    profiles.push("release")
+    profiles.push("extreme")
+    let mut triples = Vec[str]::new()
+    triples.push("x86_64-pc-windows-msvc")
+    triples.push("x86_64-w64-windows-gnu")
+    triples.push("aarch64-w64-windows-gnu")
+    for profile in profiles {
+        for triple in triples {
+            let target = parse_target(triple)
+            let mut args = Vec[str]::new()
+            append_profile_link_args(args, profile, target)
+            let expected = if target.environment == "msvc" {
+                "-Wl,/Brepro"
+            } else {
+                "-Wl,--no-insert-timestamp"
+            }
+            let wrong = if target.environment == "msvc" {
+                "-Wl,--no-insert-timestamp"
+            } else {
+                "-Wl,/Brepro"
+            }
+            let mut found = false
+            for argument in args {
+                if argument == wrong {
+                    ret false
+                }
+                if argument == expected {
+                    found = true
+                }
+            }
+            if !found {
+                ret false
+            }
+        }
+    }
+    ret true
 }
 
 fn append_target_features(args: mut Vec[str], features: str) ->() {

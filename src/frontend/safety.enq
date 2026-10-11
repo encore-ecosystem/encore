@@ -1,8 +1,11 @@
 //! Backend-independent callable safety effects. An explicit safe contract is a trust boundary.
+import core::fmt::Debug
 import core::option::Option
+import refrain::frontend::analysis::analyze_named_module
 import refrain::frontend::parser::{Expr, ExprNode, FunctionItem, Statement, MatchArmBody}
-import refrain::frontend::semantic::{SemanticBody, SemanticCallable, SemanticMethod, SemanticField, semantic_named_members, semantic_associated_members}
+import refrain::frontend::semantic::{SemanticBody, SemanticCallable, SemanticMethod, SemanticField, semantic_named_members, semantic_associated_members, check_function_body_with_types}
 import refrain::frontend::type_scope::scope_type
+import std::io::eprintln
 import std::vec::Vec
 
 /// Stable declaration and the resolved lexical environment of its body.
@@ -91,18 +94,177 @@ pub fn infer_safety_with_known(functions: Vec[SafetyFunction], known: Vec[Functi
             ,)
     }
     effects.extend(known)
+    // Declaration resolution is independent of inferred effects. Build the
+    // reverse graph once rather than walking every AST on every fixed-point
+    // round. Keep all overloads: a call joins their effects conservatively.
+    let mut dependents = Vec[Vec[usize]]::new()
+    let mut pending = Vec[usize]::new()
+    let mut queued = Vec[bool]::new()
+    let mut index = 0_usize
+    for function in functions {
+        dependents.push(Vec[usize]::new())
+        pending.push(index)
+        queued.push(true)
+        index += 1
+    }
+    index = 0_usize
+    for function in functions {
+        for dependency in safety_dependencies(function) {
+            let mut source = 0_usize
+            while source < functions.len() {
+                match effects.get(source) {
+                    Some(effect) => {
+                        if effect.module_name == dependency.0 && effect.owner == dependency.1 && effect.name == dependency.2 {
+                            let mut consumers = dependents.get(source).unwrap_or(Vec[usize]::new())
+                            let mut present = false
+                            for consumer in consumers {
+                                if consumer == index {
+                                    present = true break
+                                }
+                            }
+                            if !present {
+                                consumers.push(index) dependents.set(source, consumers)
+                            }
+                        }
+                    }
+                    None => {
+                        ret effects
+                    }
+                }
+                source += 1
+            }
+        }
+        index += 1
+    }
+    let mut cursor = 0_usize
+    while cursor < pending.len() {
+        let index = pending.get(cursor).unwrap_or(functions.len())
+        cursor += 1
+        queued.set(index, false)
+        match functions.get(index) {
+            Some(function) => {
+                let before = match effects.get(index) {
+                    Some(value) => value None => {
+                        ret effects
+                    }
+                }
+                let mut ctx = SafetyContext {
+                    function, effects, Vec[(str, CallableValue)]::new(), before.body_unsafe, before.returns_unsafe_callable, Vec[(str, str, str)]::new()
+                }
+                for param in function.item.params {
+                    ctx.bindings.push((param.name, unknown_value()))
+                }
+                match function.item.body {
+                    Some(body) => {
+                        statements(ctx, body.statements)
+                    }
+                    None => {
+                    }
+                }
+                if ctx.executed != before.body_unsafe || ctx.returned != before.returns_unsafe_callable {
+                    effects.set(index, FunctionSafety {
+                            before.module_name, before.owner, before.name,
+                            before.line, before.column, ctx.executed, before.asserted_safe, ctx.returned
+                        }
+                        ,)
+                    for consumer in dependents.get(index).unwrap_or(Vec[usize]::new()) {
+                        if !queued.get(consumer).unwrap_or(true) {
+                            queued.set(consumer, true)
+                            pending.push(consumer)
+                        }
+                    }
+                }
+            }
+            None => {
+                ret effects
+            }
+        }
+    }
+    ret effects
+}
+
+#attr(test)
+fn semantic_safety_worklist_matches_scan_contract() -> bool {
+    let mut source = "extern fn raw() -> u32\n#attr(safe) fn trusted() -> u32 { ret raw() }\n" +
+    "fn safe_caller() -> u32 { ret trusted() }\nfn recursive_a() -> u32 { ret recursive_b() }\n" +
+    "fn recursive_b() -> u32 { if true { ret raw() } ret recursive_a() }\n" +
+    "fn callback() { let operation = raw\noperation() }\nfn plain() -> u32 { ret 1 }\n"
+    let mut index = 0_usize
+    while index < 32 {
+        source += "fn chain_" + Debug::fmt(index) + "() -> u32 { ret chain_" + Debug::fmt(index + 1) + "() }\n"
+        index += 1
+    }
+    source += "fn chain_32() -> u32 { ret raw() }\n"
+    let document = analyze_named_module("main", "main.enq", source)
+    if document.diagnostics.len() != 0 {
+        for diagnostic in document.diagnostics {
+            eprintln(diagnostic.message)
+        }
+        ret false
+    }
+    let mut callables = Vec[SemanticCallable]::new()
+    for statement in document.ast {
+        match statement {
+            Statement::Function(item) => {
+                let mut params = Vec[str]::new()
+                for param in item.params {
+                    params.push(param.typ.unwrap_or(""))
+                }
+                callables.push(SemanticCallable {
+                        "main", item.name, params, item.ret_type.unwrap_or("void"),
+                        0, item.name, "main", 0, Vec[str]::new()
+                    }
+                    ,)
+            }
+            _ => {
+            }
+        }
+    }
+    let mut functions = Vec[SafetyFunction]::new()
+    for statement in document.ast {
+        match statement {
+            Statement::Function(item) => {
+                let body = check_function_body_with_types(item, callables, Vec[SemanticField]::new(), Vec[SemanticMethod]::new(), "", Vec[str]::new())
+                functions.push(SafetyFunction {
+                        "main", "", item, body, callables, Vec[SemanticMethod]::new(), item.line, item.column, Vec[str]::new()
+                    }
+                    ,
+                )
+            }
+            _ => {
+            }
+        }
+    }
+    let actual = infer_safety(functions)
+    // Independent reference: the previous full-scan least-fixed-point solver.
+    let mut expected = Vec[FunctionSafety]::new()
+    for function in functions {
+        let mut safe = false
+        for attr in function.item.attrs {
+            if attr == "safe" || attr == "attr:safe" {
+                safe = true
+            }
+        }
+        expected.push(FunctionSafety {
+                function.module_name, function.owner, function.item.name,
+                function.symbol_line, function.symbol_column, function.item.is_extern || function.item.body.is_none(),
+                safe, function.item.is_extern || function.item.body.is_none()
+            }
+            ,)
+    }
     let mut changed = true
     while changed {
         changed = false
         let mut index = 0_usize
         for function in functions {
-            let before = match effects.get(index) {
+            let before = match expected.get(index) {
                 Some(value) => value None => {
-                    ret effects
+                    ret false
                 }
             }
             let mut ctx = SafetyContext {
-                function, effects, Vec[(str, CallableValue)]::new(), before.body_unsafe, before.returns_unsafe_callable, Vec[(str, str, str)]::new()
+                function, expected, Vec[(str, CallableValue)]::new(), before.body_unsafe,
+                before.returns_unsafe_callable, Vec[(str, str, str)]::new()
             }
             for param in function.item.params {
                 ctx.bindings.push((param.name, unknown_value()))
@@ -115,17 +277,35 @@ pub fn infer_safety_with_known(functions: Vec[SafetyFunction], known: Vec[Functi
                 }
             }
             if ctx.executed != before.body_unsafe || ctx.returned != before.returns_unsafe_callable {
-                effects.set(index, FunctionSafety {
-                        before.module_name, before.owner, before.name,
-                        before.line, before.column, ctx.executed, before.asserted_safe, ctx.returned
+                expected.set(index, FunctionSafety {
+                        before.module_name, before.owner, before.name, before.line, before.column,
+                        ctx.executed, before.asserted_safe, ctx.returned
                     }
                     ,)
                 changed = true
             }
-            index += 1_usize
+            index += 1
         }
     }
-    ret effects
+    if actual.len() != expected.len() || actual.len() != 40 {
+        eprintln("safety reference size: " + Debug::fmt(actual.len()) + " / " + Debug::fmt(expected.len()))
+        ret false
+    }
+    let mut index = 0_usize
+    for effect in expected {
+        let observed = match actual.get(index) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+        if observed.body_unsafe != effect.body_unsafe || observed.asserted_safe != effect.asserted_safe ||
+        observed.returns_unsafe_callable != effect.returns_unsafe_callable {
+            eprintln("safety reference mismatch: " + effect.name)
+            ret false
+        }
+        index += 1
+    }
+    ret true
 }
 
 fn unknown_value() -> CallableValue {

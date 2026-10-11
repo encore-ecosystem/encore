@@ -1,0 +1,923 @@
+//! Versioned dependency declarations, independent of source parsing and archives.
+
+import core::option::Option
+import core::result::Result
+import core::fmt::Debug
+import json::{Json, parse, stringify}
+import std::vec::Vec
+import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::metadata_ast::{encode_metadata_ast, encode_metadata_ast_for_module, encode_metadata_contract_ast, decode_metadata_ast, metadata_interface_ast,
+    encode_metadata_documentation, decode_metadata_documentation, decode_metadata_position}
+import refrain::frontend::parser::{Statement, Documentation}
+import refrain::frontend::safety::FunctionSafety
+import refrain::frontend::analysis::{FrontendDocument, FrontendSymbol, FrontendCallable, FrontendDiagnostic}
+import refrain::frontend::dependency_graph::{DependencyGraph, DependencyEdge}
+import refrain::frontend::lexer::Token
+import refrain::project::workspace::CompiledWorkspaceModule
+
+/// Interface and template identities consumed by one dependent package.
+/// Ordinary body/archive hashes intentionally are not frontend dependencies.
+pub struct MetadataDependency {
+    unit: str
+    interface_digest: str
+    template_digest: str
+}
+
+/// One package-owned module. No source text or dependency parser is involved.
+pub struct MetadataModule {
+    id: str
+    source: str
+    imports: Vec[str]
+    declarations: Vec[Statement]
+    documentation: Option[Documentation]
+    safety: Vec[FunctionSafety]
+    symbols: Vec[FrontendSymbol]
+    callables: Vec[FrontendCallable]
+    edges: Vec[DependencyEdge]
+}
+
+impl for MetadataModule {
+    /// Captures facts already checked by this package worker, not sources of
+    /// its dependencies. The enclosing encoder removes runtime bodies.
+    pub fn from_document(id: str, source: str, document: FrontendDocument,
+        imports: Vec[str], safety: Vec[FunctionSafety]) -> Self {
+        ret Self{id, source, imports, document.ast, document.module_documentation,
+            safety, document.symbols, document.callables, document.dependencies.all()}
+    }
+
+    /// Gives semantic analysis its normal declaration representation while
+    /// keeping both lexer tokens and source text absent at this boundary.
+    pub fn document(self: Self) -> FrontendDocument {
+        let mut graph = DependencyGraph::new()
+        for edge in self.edges { graph.add_at(edge.source, edge.target, edge.is_public, edge.line, edge.column, edge.length) }
+        ret FrontendDocument{Vec[Token]::new(), metadata_interface_ast(self.declarations), self.documentation,
+            Vec[FrontendDiagnostic]::new(), self.symbols, self.callables, graph, true}
+    }
+}
+
+/// Checked compiler/target context; a cache key is never an ABI symbol name.
+pub struct MetadataContext {
+    unit: str
+    compiler_digest: str
+    target: str
+    profile: str
+    input_digest: str
+    features: Vec[str]
+}
+
+impl for MetadataContext {
+    /// The private worker protocol reuses the artifact's checked context codec.
+    pub fn encode(self: Self) -> Result[Json, str] { ret encode_context(self) }
+
+    /// Decodes a coordinator-supplied expected context, never a cache fallback.
+    pub fn decode(value: Json) -> Result[Self, str] { ret decode_context(value) }
+}
+
+/// Metadata readiness is separate from availability of the package archive.
+pub struct RefrainMetadata {
+    context: MetadataContext
+    dependencies: Vec[MetadataDependency]
+    modules: Vec[MetadataModule]
+    template_digest: str
+}
+
+/// Hashes canonical structured data, including domain and schema separation.
+pub fn metadata_digest(domain: str, data: Json) -> str {
+    ret compiler_content_digest("encore-refrain-metadata-v1\n" + domain + "\n" + stringify(data))
+}
+
+impl for RefrainMetadata {
+    /// Reuses checked declarations when only dependency template bodies changed.
+    /// The original snapshot is fully decoded before its template edges change;
+    /// every current dependency must retain the same caller-visible interface.
+    pub fn decode_frontend(text: str, expected: MetadataContext,
+        dependencies: Vec[MetadataDependency]) -> Result[Self, str] {
+        let data = match parse(text) { Ok(value) => value Err(_) => { ret Result[Self, str]::Err("invalid frontend metadata JSON") } }
+        let previous = decode_dependencies(data.get("dependencies").unwrap_or(Json::Null))?
+        let mut restored = Self::decode(text, expected, previous)?
+        if previous.len() != dependencies.len() { ret Result[Self, str]::Err("frontend dependency set changed") }
+        for dependency in dependencies {
+            let mut found = false
+            for old in previous {
+                if old.unit == dependency.unit && old.interface_digest == dependency.interface_digest { found = true }
+            }
+            if !found { ret Result[Self, str]::Err("frontend dependency interface changed") }
+        }
+        let _valid = encode_dependencies(dependencies)?
+        restored.dependencies = dependencies
+        ret Result[Self, str]::Ok(restored)
+    }
+
+    /// The frontend contract key deliberately excludes source/body checksums,
+    /// native archive identities, template bodies, docs and source coordinates.
+    /// Changing a transitive template alone is a backend invalidation instead.
+    pub fn interface_digest(self: Self) -> Result[str, str] {
+        validate_context(self.context)?
+        let _valid_dependencies = encode_dependencies(self.dependencies)?
+        let mut contract = Vec[Json]::new()
+        contract.push(Json::String(self.context.unit))
+        contract.push(Json::String(self.context.compiler_digest))
+        contract.push(Json::String(self.context.target))
+        contract.push(Json::String(self.context.profile))
+        contract.push(encode_names(self.context.features)?)
+        let mut dependencies = Vec[str]::new()
+        for dependency in self.dependencies {
+            let mut fields = Vec[Json]::new()
+            fields.push(Json::String(dependency.unit)) fields.push(Json::String(dependency.interface_digest))
+            dependencies.push(stringify(Json::Array(fields)))
+        }
+        contract.push(encode_names(dependencies)?)
+        let mut names = Vec[str]::new()
+        for module in self.modules { names.push(module.id) }
+        for name in sorted_names(names)? {
+            for module in self.modules {
+                if module.id != name { continue }
+                if !module_identity_valid(self.context.unit, module.id, module.source) { ret Result[str, str]::Err("invalid metadata module identity") }
+                let mut fields = Vec[Json]::new()
+                fields.push(Json::String(module.id)) fields.push(encode_names(module.imports)?)
+                fields.push(encode_metadata_contract_ast(module.declarations))
+                let mut safety = Vec[str]::new()
+                for effect in module.safety {
+                    let mut entry = Vec[Json]::new()
+                    entry.push(Json::String(effect.module_name)) entry.push(Json::String(effect.owner))
+                    entry.push(Json::String(effect.name)) entry.push(Json::Bool(effect.is_unsafe()))
+                    entry.push(Json::Bool(effect.returns_unsafe_callable))
+                    let identity = stringify(Json::Array(entry))
+                    // Trait and inherent implementations can expose the same
+                    // caller-visible effect (for example Range::next). Their
+                    // declarations are distinct AST contracts; identical
+                    // effect facts are a set, not duplicate package identities.
+                    let mut present = false
+                    for known in safety { if known == identity { present = true } }
+                    if !present { safety.push(identity) }
+                }
+                fields.push(encode_names(safety)?)
+                contract.push(Json::Array(fields))
+            }
+        }
+        ret Result[str, str]::Ok(metadata_digest("interface", Json::Array(contract)))
+    }
+
+    /// Supplies the worker loader with already validated declarations. The
+    /// source text, tokens and parser bodies are not part of this transfer.
+    pub fn compiled_modules(self: Self) -> Result[Vec[CompiledWorkspaceModule], str] {
+        let digest = self.interface_digest()?
+        let mut out = Vec[CompiledWorkspaceModule]::new()
+        for module in self.modules {
+            out.push(CompiledWorkspaceModule{self.context.unit, module.source, digest,
+                module.document(), module.safety, module.imports})
+        }
+        ret Result[Vec[CompiledWorkspaceModule], str]::Ok(out)
+    }
+
+    /// Serializes declarations only. EHIR templates have a separate digest and
+    /// an independent readiness marker; an archive need not exist yet.
+    pub fn encode(self: Self) -> Result[str, str] {
+        validate_context(self.context)?
+        if !digest_valid(self.template_digest) { ret Result[str, str]::Err("invalid EHIR template digest") }
+        let mut fields = Vec[(str, Json)]::new()
+        fields.push(("schema", Json::Number("1")))
+        fields.push(("abi", Json::String("encore-refrain-1")))
+        fields.push(("context", encode_context(self.context)?))
+        fields.push(("dependencies", encode_dependencies(self.dependencies)?))
+        fields.push(("modules", encode_modules(self.context.unit, self.modules)?))
+        fields.push(("templates", Json::String(self.template_digest)))
+        ret Result[str, str]::Ok(stringify(Json::Object(fields)))
+    }
+
+    /// Rejects stale compilers, targets, profiles and input/dependency identities
+    /// before any declarations can enter the consumer's analysis database.
+    pub fn decode(text: str, expected: MetadataContext,
+        dependencies: Vec[MetadataDependency]) -> Result[Self, str] {
+        let data = match parse(text) { Ok(value) => value
+            Err(error) => { ret Result[Self, str]::Err("invalid refrain metadata JSON") } }
+        if data.get("schema").unwrap_or(Json::Null).as_number().unwrap_or("") != "1"
+            || required_string(data, "abi")? != "encore-refrain-1" {
+            ret Result[Self, str]::Err("unsupported refrain metadata schema or ABI")
+        }
+        let context = decode_context(data.get("context").unwrap_or(Json::Null))?
+        if stringify(encode_context(context)?) != stringify(encode_context(expected)?) {
+            ret Result[Self, str]::Err("refrain metadata compiler/target/input context mismatch")
+        }
+        let restored_dependencies = decode_dependencies(data.get("dependencies").unwrap_or(Json::Null))?
+        if stringify(encode_dependencies(restored_dependencies)?) != stringify(encode_dependencies(dependencies)?) {
+            ret Result[Self, str]::Err("refrain metadata dependency mismatch")
+        }
+        let templates = required_string(data, "templates")?
+        if !digest_valid(templates) { ret Result[Self, str]::Err("invalid EHIR template digest") }
+        let modules = decode_modules(context.unit, data.get("modules").unwrap_or(Json::Null))?
+        ret Result[Self, str]::Ok(Self{context, restored_dependencies, modules, templates})
+    }
+}
+
+fn required_string(data: Json, key: str) -> Result[str, str] {
+    match data.get(key).unwrap_or(Json::Null) {
+        Json::String(value) => { ret Result[str, str]::Ok(value) }
+        _ => { ret Result[str, str]::Err("missing/invalid metadata string: " + key) }
+    }
+    ret Result[str, str]::Err("missing metadata string")
+}
+
+fn required_list(data: Json) -> Result[Vec[Json], str] {
+    ret match data { Json::Array(values) => Result[Vec[Json], str]::Ok(values)
+        _ => Result[Vec[Json], str]::Err("metadata field must be an array") }
+}
+
+fn string_list(data: Json) -> Result[Vec[str], str] {
+    let values = required_list(data)?
+    let mut out = Vec[str]::new()
+    for value in values {
+        match value {
+            Json::String(text) => { out.push(text) }
+            _ => { ret Result[Vec[str], str]::Err("metadata list must contain strings") }
+        }
+    }
+    ret Result[Vec[str], str]::Ok(out)
+}
+
+/// Canonical UTF-8 byte ordering for artifact identities, independent of locale
+/// and bootstrap compiler support for language-level string ordering.
+pub fn metadata_name_before(left: str, right: str) -> bool {
+    let mut index = 0_usize
+    while index < left.byte_len() && index < right.byte_len() {
+        if left.byte_at(index) != right.byte_at(index) { ret left.byte_at(index) < right.byte_at(index) }
+        index += 1
+    }
+    ret left.byte_len() < right.byte_len()
+}
+
+fn sorted_names(values: Vec[str]) -> Result[Vec[str], str] {
+    let mut out = Vec[str]::new()
+    for value in values {
+        if value == "" { ret Result[Vec[str], str]::Err("empty metadata identity") }
+        for present in out { if present == value { ret Result[Vec[str], str]::Err("duplicate metadata identity: " + value) } }
+        out.push(value)
+        let mut index = out.len() - 1
+        while index > 0 {
+            let left = out.get(index - 1).unwrap_or("")
+            let right = out.get(index).unwrap_or("")
+            if !metadata_name_before(right, left) { break }
+            out.set(index - 1, right) out.set(index, left) index -= 1
+        }
+    }
+    ret Result[Vec[str], str]::Ok(out)
+}
+
+fn encode_names(values: Vec[str]) -> Result[Json, str] {
+    let mut out = Vec[Json]::new()
+    for value in sorted_names(values)? { out.push(Json::String(value)) }
+    ret Result[Json, str]::Ok(Json::Array(out))
+}
+
+fn digest_valid(value: str) -> bool {
+    if value.byte_len() != 64 { ret false }
+    let mut index = 0_usize
+    while index < value.byte_len() {
+        let byte = value.byte_at(index)
+        if !(byte >= 48 && byte <= 57) && !(byte >= 97 && byte <= 102) { ret false }
+        index += 1
+    }
+    ret true
+}
+
+fn validate_context(value: MetadataContext) -> Result[bool, str] {
+    if value.unit == "" || value.target == "" || value.profile == "" || !digest_valid(value.compiler_digest)
+        || !digest_valid(value.input_digest) { ret Result[bool, str]::Err("invalid refrain metadata context") }
+    let _features = sorted_names(value.features)?
+    ret Result[bool, str]::Ok(true)
+}
+
+fn encode_context(value: MetadataContext) -> Result[Json, str] {
+    validate_context(value)?
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(("unit", Json::String(value.unit)))
+    fields.push(("compiler", Json::String(value.compiler_digest)))
+    fields.push(("target", Json::String(value.target)))
+    fields.push(("profile", Json::String(value.profile)))
+    fields.push(("input", Json::String(value.input_digest)))
+    fields.push(("features", encode_names(value.features)?))
+    ret Result[Json, str]::Ok(Json::Object(fields))
+}
+
+fn decode_context(data: Json) -> Result[MetadataContext, str] {
+    let context = MetadataContext{required_string(data, "unit")?, required_string(data, "compiler")?,
+        required_string(data, "target")?, required_string(data, "profile")?, required_string(data, "input")?,
+        string_list(data.get("features").unwrap_or(Json::Null))?}
+    validate_context(context)?
+    ret Result[MetadataContext, str]::Ok(context)
+}
+
+fn encode_dependencies(values: Vec[MetadataDependency]) -> Result[Json, str] {
+    let mut names = Vec[str]::new()
+    for value in values { names.push(value.unit) }
+    let mut out = Vec[Json]::new()
+    for name in sorted_names(names)? {
+        for value in values {
+            if value.unit != name { continue }
+            if !digest_valid(value.interface_digest) || !digest_valid(value.template_digest) {
+                ret Result[Json, str]::Err("invalid dependency metadata digest: " + name)
+            }
+            let mut fields = Vec[(str, Json)]::new()
+            fields.push(("unit", Json::String(name)))
+            fields.push(("interface", Json::String(value.interface_digest)))
+            fields.push(("templates", Json::String(value.template_digest)))
+            out.push(Json::Object(fields))
+        }
+    }
+    ret Result[Json, str]::Ok(Json::Array(out))
+}
+
+fn decode_dependencies(data: Json) -> Result[Vec[MetadataDependency], str] {
+    let mut out = Vec[MetadataDependency]::new()
+    for value in required_list(data)? {
+        out.push(MetadataDependency{required_string(value, "unit")?, required_string(value, "interface")?,
+            required_string(value, "templates")?})
+    }
+    let _validated = encode_dependencies(out)?
+    ret Result[Vec[MetadataDependency], str]::Ok(out)
+}
+
+fn module_identity_valid(unit: str, id: str, source: str) -> bool {
+    if source == "" || id != unit + "@" + source { ret false }
+    if source.byte_at(0) == 47 || source.byte_at(0) == 92 { ret false }
+    let mut component = ""
+    let mut index = 0_usize
+    while index <= source.byte_len() {
+        if index == source.byte_len() || source.byte_at(index) == 47 {
+            if component == "" || component == "." || component == ".." { ret false }
+            component = ""
+        } else {
+            let byte = source.byte_at(index)
+            if byte == 0 || byte == 58 || byte == 92 { ret false }
+            component += source.slice_bytes(index, 1)
+        }
+        index += 1
+    }
+    ret true
+}
+
+fn encode_modules(unit: str, values: Vec[MetadataModule]) -> Result[Json, str] {
+    let mut names = Vec[str]::new()
+    for value in values { names.push(value.id) }
+    let mut out = Vec[Json]::new()
+    for name in sorted_names(names)? {
+        for value in values {
+            if value.id != name { continue }
+            if !module_identity_valid(unit, value.id, value.source) { ret Result[Json, str]::Err("invalid metadata module identity") }
+            let mut fields = Vec[(str, Json)]::new()
+            fields.push(("id", Json::String(value.id)))
+            fields.push(("source", Json::String(value.source)))
+            fields.push(("imports", encode_names(value.imports)?))
+            fields.push(("declarations", encode_metadata_ast_for_module(metadata_interface_ast(value.declarations), value.id)))
+            fields.push(("documentation", encode_metadata_documentation(value.documentation)))
+            fields.push(("safety", encode_safety(value.safety)))
+            fields.push(("symbols", encode_symbols(value.symbols)))
+            fields.push(("callables", encode_callables(value.callables)))
+            fields.push(("edges", encode_edges(value.edges)))
+            out.push(Json::Object(fields))
+        }
+    }
+    ret Result[Json, str]::Ok(Json::Array(out))
+}
+
+fn decode_modules(unit: str, data: Json) -> Result[Vec[MetadataModule], str] {
+    let mut out = Vec[MetadataModule]::new()
+    for value in required_list(data)? {
+        let id = required_string(value, "id")?
+        let source = required_string(value, "source")?
+        if !module_identity_valid(unit, id, source) { ret Result[Vec[MetadataModule], str]::Err("invalid metadata module identity") }
+        let declarations = decode_metadata_ast(value.get("declarations").unwrap_or(Json::Null))?
+        // Metadata must not smuggle ordinary bodies back across the boundary.
+        if stringify(encode_metadata_ast(declarations)) !=
+            stringify(encode_metadata_ast(metadata_interface_ast(declarations))) {
+            ret Result[Vec[MetadataModule], str]::Err("ordinary runtime body in declaration metadata")
+        }
+        out.push(MetadataModule{id, source, string_list(value.get("imports").unwrap_or(Json::Null))?, declarations,
+            decode_metadata_documentation(value.get("documentation").unwrap_or(Json::Null))?,
+            decode_safety(value.get("safety").unwrap_or(Json::Null))?,
+            decode_symbols(value.get("symbols").unwrap_or(Json::Null))?,
+            decode_callables(value.get("callables").unwrap_or(Json::Null))?,
+            decode_edges(value.get("edges").unwrap_or(Json::Null))?})
+    }
+    let _validated = encode_modules(unit, out)?
+    ret Result[Vec[MetadataModule], str]::Ok(out)
+}
+
+fn encode_safety(values: Vec[FunctionSafety]) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        let mut fields = Vec[Json]::new()
+        fields.push(Json::String(value.module_name)) fields.push(Json::String(value.owner))
+        fields.push(Json::String(value.name)) fields.push(Json::Number(Debug::fmt(value.line)))
+        fields.push(Json::Number(Debug::fmt(value.column))) fields.push(Json::Bool(value.body_unsafe))
+        fields.push(Json::Bool(value.asserted_safe)) fields.push(Json::Bool(value.returns_unsafe_callable))
+        out.push(Json::Array(fields))
+    }
+    ret Json::Array(out)
+}
+
+fn safety_bool(value: Json) -> Result[bool, str] {
+    ret match value { Json::Bool(enabled) => Result[bool, str]::Ok(enabled)
+        _ => Result[bool, str]::Err("invalid metadata safety flag") }
+}
+
+fn safety_string(value: Json) -> Result[str, str] {
+    ret match value { Json::String(text) => Result[str, str]::Ok(text)
+        _ => Result[str, str]::Err("invalid metadata safety identity") }
+}
+
+fn decode_safety(data: Json) -> Result[Vec[FunctionSafety], str] {
+    let mut out = Vec[FunctionSafety]::new()
+    for value in required_list(data)? {
+        let fields = required_list(value)?
+        if fields.len() != 8 { ret Result[Vec[FunctionSafety], str]::Err("invalid metadata safety record") }
+        out.push(FunctionSafety{safety_string(fields.get(0).unwrap_or(Json::Null))?,
+            safety_string(fields.get(1).unwrap_or(Json::Null))?, safety_string(fields.get(2).unwrap_or(Json::Null))?,
+            decode_metadata_position(fields.get(3).unwrap_or(Json::Null))?, decode_metadata_position(fields.get(4).unwrap_or(Json::Null))?,
+            safety_bool(fields.get(5).unwrap_or(Json::Null))?, safety_bool(fields.get(6).unwrap_or(Json::Null))?,
+            safety_bool(fields.get(7).unwrap_or(Json::Null))?})
+    }
+    ret Result[Vec[FunctionSafety], str]::Ok(out)
+}
+
+fn encode_symbols(values: Vec[FrontendSymbol]) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        let mut fields = Vec[Json]::new()
+        fields.push(Json::String(value.name)) fields.push(Json::String(value.scope))
+        fields.push(Json::Number(Debug::fmt(value.kind))) fields.push(Json::Number(Debug::fmt(value.line)))
+        fields.push(Json::Number(Debug::fmt(value.column))) fields.push(Json::Number(Debug::fmt(value.length)))
+        fields.push(encode_metadata_documentation(value.documentation)) out.push(Json::Array(fields))
+    }
+    ret Json::Array(out)
+}
+
+fn decode_symbols(data: Json) -> Result[Vec[FrontendSymbol], str] {
+    let mut out = Vec[FrontendSymbol]::new()
+    for value in required_list(data)? {
+        let fields = required_list(value)?
+        if fields.len() != 7 { ret Result[Vec[FrontendSymbol], str]::Err("invalid metadata symbol record") }
+        out.push(FrontendSymbol{safety_string(fields.get(0).unwrap_or(Json::Null))?, safety_string(fields.get(1).unwrap_or(Json::Null))?,
+            decode_metadata_position(fields.get(2).unwrap_or(Json::Null))?, decode_metadata_position(fields.get(3).unwrap_or(Json::Null))?,
+            decode_metadata_position(fields.get(4).unwrap_or(Json::Null))?, decode_metadata_position(fields.get(5).unwrap_or(Json::Null))?,
+            decode_metadata_documentation(fields.get(6).unwrap_or(Json::Null))?})
+    }
+    ret Result[Vec[FrontendSymbol], str]::Ok(out)
+}
+
+fn encode_optional_string(value: Option[str]) -> Json {
+    ret match value { Some(text) => Json::String(text) None => Json::Null }
+}
+
+fn decode_optional_string(data: Json) -> Result[Option[str], str] {
+    if data.is_null() { ret Result[Option[str], str]::Ok(Option[str]::None) }
+    ret Result[Option[str], str]::Ok(Option[str]::Some(safety_string(data)?))
+}
+
+fn encode_callables(values: Vec[FrontendCallable]) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        let mut fields = Vec[Json]::new()
+        let mut params = Vec[Json]::new()
+        for param in value.params { params.push(Json::String(param)) }
+        fields.push(Json::String(value.name)) fields.push(Json::Array(params)) fields.push(encode_optional_string(value.ret_type))
+        fields.push(Json::Number(Debug::fmt(value.line))) fields.push(Json::Number(Debug::fmt(value.column)))
+        fields.push(Json::Number(Debug::fmt(value.length))) out.push(Json::Array(fields))
+    }
+    ret Json::Array(out)
+}
+
+fn decode_callables(data: Json) -> Result[Vec[FrontendCallable], str] {
+    let mut out = Vec[FrontendCallable]::new()
+    for value in required_list(data)? {
+        let fields = required_list(value)?
+        if fields.len() != 6 { ret Result[Vec[FrontendCallable], str]::Err("invalid metadata callable record") }
+        out.push(FrontendCallable{safety_string(fields.get(0).unwrap_or(Json::Null))?, string_list(fields.get(1).unwrap_or(Json::Null))?,
+            decode_optional_string(fields.get(2).unwrap_or(Json::Null))?, decode_metadata_position(fields.get(3).unwrap_or(Json::Null))?,
+            decode_metadata_position(fields.get(4).unwrap_or(Json::Null))?, decode_metadata_position(fields.get(5).unwrap_or(Json::Null))?})
+    }
+    ret Result[Vec[FrontendCallable], str]::Ok(out)
+}
+
+fn encode_edges(values: Vec[DependencyEdge]) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        let mut fields = Vec[Json]::new()
+        fields.push(Json::String(value.source)) fields.push(Json::String(value.target)) fields.push(Json::Bool(value.is_public))
+        fields.push(Json::Number(Debug::fmt(value.line))) fields.push(Json::Number(Debug::fmt(value.column)))
+        fields.push(Json::Number(Debug::fmt(value.length))) out.push(Json::Array(fields))
+    }
+    ret Json::Array(out)
+}
+
+fn decode_edges(data: Json) -> Result[Vec[DependencyEdge], str] {
+    let mut out = Vec[DependencyEdge]::new()
+    for value in required_list(data)? {
+        let fields = required_list(value)?
+        if fields.len() != 6 { ret Result[Vec[DependencyEdge], str]::Err("invalid metadata import record") }
+        out.push(DependencyEdge{safety_string(fields.get(0).unwrap_or(Json::Null))?, safety_string(fields.get(1).unwrap_or(Json::Null))?,
+            safety_bool(fields.get(2).unwrap_or(Json::Null))?, decode_metadata_position(fields.get(3).unwrap_or(Json::Null))?,
+            decode_metadata_position(fields.get(4).unwrap_or(Json::Null))?, decode_metadata_position(fields.get(5).unwrap_or(Json::Null))?})
+    }
+    ret Result[Vec[DependencyEdge], str]::Ok(out)
+}
+
+import refrain::frontend::lexer::Lexer
+import refrain::frontend::parser::Parser
+import refrain::frontend::analysis_database::AnalysisDatabase
+import refrain::project::workspace::{ResolvedPackageGraph, WorkspaceRefrain, try_load_compilation_unit}
+import refrain::project::manifest::try_parse_project_manifest
+import refrain::project::build_graph::{encode_build_graph, decode_build_graph}
+import refrain::project::failure::ProjectFailure
+import std::path::Path
+import std::os::{mkdir, mkdir_all, write_file, remove_file, remove_dir_all}
+import std::time::perf_counter_ms
+
+fn fixture_context() -> MetadataContext {
+    ret MetadataContext{"sample", compiler_content_digest("compiler"), "x86_64-unknown-linux-gnu",
+        "dev", compiler_content_digest("source"), Vec[str]::new()}
+}
+
+fn fixture_metadata() -> RefrainMetadata {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source("sample@model.enq")
+    let declarations = parser.parse_result(lexer.tokenize("pub fn value() -> u32 { ret 42 }")).unwrap_or(Vec[Statement]::new())
+    let mut modules = Vec[MetadataModule]::new()
+    let mut safety = Vec[FunctionSafety]::new()
+    safety.push(FunctionSafety{"sample::model", "", "value", 0, 7, false, true, false})
+    modules.push(MetadataModule{"sample@model.enq", "model.enq", Vec[str]::new(), declarations,
+        Option[Documentation]::Some(Documentation::new("Module description", 0, 0)), safety,
+        Vec[FrontendSymbol]::new(), Vec[FrontendCallable]::new(), Vec[DependencyEdge]::new()})
+    ret RefrainMetadata{fixture_context(), Vec[MetadataDependency]::new(), modules, compiler_content_digest("templates")}
+}
+
+#attr(test)
+fn metadata_envelope_digest_vectors_contract() -> bool {
+    ret compiler_content_digest("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        && compiler_content_digest("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        && metadata_digest("interface", Json::String("same")) != metadata_digest("template", Json::String("same"))
+}
+
+#attr(test)
+fn metadata_envelope_round_trip_contract() -> bool {
+    let original = fixture_metadata()
+    let text = match original.encode() { Ok(value) => value Err(error) => { ret false } }
+    let restored = match RefrainMetadata::decode(text, original.context, original.dependencies) {
+        Ok(value) => value Err(error) => { ret false }
+    }
+    if restored.modules.len() != 1 { ret false }
+    for module in restored.modules {
+        if module.documentation.unwrap_or(Documentation::new("", 0, 0)).text != "Module description"
+            || module.safety.len() != 1 || module.declarations.len() != 1 { ret false }
+        for effect in module.safety { if effect.is_unsafe() || !effect.asserted_safe { ret false } }
+        for statement in module.declarations {
+            match statement { Statement::Function(item) => { if item.body.is_some() { ret false } }
+                _ => { ret false } }
+        }
+    }
+    ret restored.encode().unwrap_or("") == text
+}
+
+#attr(test)
+fn metadata_repeated_safety_contract_is_not_duplicate_identity() -> bool {
+    let original = fixture_metadata()
+    let baseline = original.interface_digest().unwrap_or("")
+    let mut modules = original.modules
+    let module = match modules.get(0) { Some(value) => value None => { ret false } }
+    let mut effects = module.safety
+    let effect = match effects.get(0) { Some(value) => value None => { ret false } }
+    effects.push(FunctionSafety{effect.module_name, effect.owner, effect.name, 20, 3,
+        effect.body_unsafe, effect.asserted_safe, effect.returns_unsafe_callable})
+    modules.set(0, MetadataModule{module.id, module.source, module.imports, module.declarations,
+        module.documentation, effects, module.symbols, module.callables, module.edges})
+    let repeated = RefrainMetadata{original.context, original.dependencies, modules, original.template_digest}
+    ret baseline != "" && baseline == repeated.interface_digest().unwrap_or("")
+}
+
+#attr(test)
+fn metadata_envelope_context_rejection_contract() -> bool {
+    let original = fixture_metadata()
+    let text = original.encode().unwrap_or("")
+    let c = original.context
+    let mut wrong = Vec[MetadataContext]::new()
+    wrong.push(MetadataContext{"other", c.compiler_digest, c.target, c.profile, c.input_digest, c.features})
+    wrong.push(MetadataContext{c.unit, compiler_content_digest("other compiler"), c.target, c.profile, c.input_digest, c.features})
+    wrong.push(MetadataContext{c.unit, c.compiler_digest, "aarch64-apple-darwin", c.profile, c.input_digest, c.features})
+    wrong.push(MetadataContext{c.unit, c.compiler_digest, c.target, "extreme", c.input_digest, c.features})
+    wrong.push(MetadataContext{c.unit, c.compiler_digest, c.target, c.profile, compiler_content_digest("other source"), c.features})
+    let mut features = Vec[str]::new() features.push("new-feature")
+    wrong.push(MetadataContext{c.unit, c.compiler_digest, c.target, c.profile, c.input_digest, features})
+    for context in wrong { if RefrainMetadata::decode(text, context, original.dependencies).is_ok() { ret false } }
+    ret text != ""
+}
+
+#attr(test)
+fn metadata_envelope_dependency_rejection_contract() -> bool {
+    let original = fixture_metadata()
+    let text = original.encode().unwrap_or("")
+    let mut dependencies = Vec[MetadataDependency]::new()
+    dependencies.push(MetadataDependency{"core", compiler_content_digest("interface"), compiler_content_digest("template")})
+    ret text != "" && RefrainMetadata::decode(text, original.context, dependencies).is_err()
+}
+
+#attr(test)
+fn metadata_envelope_portable_identity_contract() -> bool {
+    ret module_identity_valid("package", "package@nested/model.enq", "nested/model.enq")
+        && !module_identity_valid("package", "other@model.enq", "model.enq")
+        && !module_identity_valid("package", "package@../model.enq", "../model.enq")
+        && !module_identity_valid("package", "package@/model.enq", "/model.enq")
+        && !module_identity_valid("package", "package@C:\\model.enq", "C:\\model.enq")
+        && !module_identity_valid("package", "package@a//b.enq", "a//b.enq")
+        && !module_identity_valid("package", "package@a/./b.enq", "a/./b.enq")
+        && !module_identity_valid("package", "package@a/../b.enq", "a/../b.enq")
+}
+
+#attr(test)
+fn metadata_envelope_canonical_sets_contract() -> bool {
+    let mut left = Vec[str]::new() left.push("z") left.push("a")
+    let mut right = Vec[str]::new() right.push("a") right.push("z")
+    let mut duplicate = Vec[str]::new() duplicate.push("a") duplicate.push("a")
+    ret stringify(encode_names(left).unwrap_or(Json::Null)) == stringify(encode_names(right).unwrap_or(Json::Null))
+        && encode_names(duplicate).is_err() && !digest_valid("invalid")
+}
+
+#attr(test)
+fn metadata_envelope_schema_rejection_contract() -> bool {
+    let c = fixture_context()
+    let dependencies = Vec[MetadataDependency]::new()
+    ret RefrainMetadata::decode("{", c, dependencies).is_err()
+        && RefrainMetadata::decode("{}", c, dependencies).is_err()
+        && RefrainMetadata::decode("{\"schema\":2}", c, dependencies).is_err()
+}
+
+fn replace_field(data: Json, name: str, value: Json) -> Json {
+    let mut fields = Vec[(str, Json)]::new()
+    for field in data.as_object().unwrap_or(Vec[(str, Json)]::new()) {
+        fields.push((field.0, if field.0 == name { value } else { field.1 }))
+    }
+    ret Json::Object(fields)
+}
+
+#attr(test)
+fn metadata_envelope_body_smuggling_rejected_contract() -> bool {
+    let original = fixture_metadata()
+    let data = parse(original.encode().unwrap_or("")).unwrap_or(Json::Null)
+    let modules = data.get("modules").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new())
+    let mut changed = Vec[Json]::new()
+    for module in original.modules {
+        changed.push(replace_field(modules.get(0).unwrap_or(Json::Null), "declarations", encode_metadata_ast(module.declarations)))
+    }
+    let invalid = replace_field(data, "modules", Json::Array(changed))
+    ret RefrainMetadata::decode(stringify(invalid), original.context, original.dependencies).is_err()
+}
+
+fn analysis_fixture_metadata() -> RefrainMetadata {
+    let mut producer = AnalysisDatabase::new()
+    producer.set_module_full("sample", "/producer/src/lib.enq",
+        "//! Dependency documentation\npub struct Item { value: u32 }\n" +
+        "pub fn dangerous() -> u32 { unsafe { ret 1 } }\n" +
+        "#attr(safe)\npub fn trusted() -> u32 { unsafe { ret 2 } }\n")
+    let document = producer.document("sample").unwrap_or(FrontendDocument::empty())
+    let mut modules = Vec[MetadataModule]::new()
+    modules.push(MetadataModule::from_document("sample@lib.enq", "lib.enq", document,
+        Vec[str]::new(), producer.function_safety_effects()))
+    ret RefrainMetadata{fixture_context(), Vec[MetadataDependency]::new(), modules, compiler_content_digest("templates")}
+}
+
+#attr(test)
+fn metadata_analysis_without_source_or_parse_contract() -> bool {
+    let original = analysis_fixture_metadata()
+    let restored = match RefrainMetadata::decode(original.encode().unwrap_or(""), original.context, original.dependencies) {
+        Ok(value) => value Err(error) => { ret false }
+    }
+    let mut consumer = AnalysisDatabase::new()
+    for module in restored.modules {
+        consumer.install_metadata_module("sample", "/absent/dependency/src/lib.enq", original.context.input_digest,
+            module.document(), module.safety)
+    }
+    consumer.set_module_full("consumer", "/consumer/src/lib.enq",
+        "import sample::{Item, trusted}\nfn value() -> u32 { ret trusted() }\n")
+    if consumer.module_semantic_diagnostics("consumer").len() != 0 { ret false }
+    let mut checked = 0_usize
+    for symbol in consumer.all_symbols() {
+        if symbol.module_name != "sample" { continue }
+        if symbol.symbol.name == "trusted" {
+            if consumer.function_is_unsafe(symbol.id) { ret false }
+            checked += 1
+        }
+        if symbol.symbol.name == "dangerous" {
+            if !consumer.function_is_unsafe(symbol.id) { ret false }
+            checked += 1
+        }
+    }
+    ret checked == 2 && consumer.module_parse_count("sample") == 0
+        && consumer.module_lightweight_count("sample") == 0
+        && consumer.document("sample").unwrap_or(FrontendDocument::empty()).tokens.len() == 0
+}
+
+#attr(test)
+fn metadata_analysis_source_replacement_invalidates_effect_contract() -> bool {
+    let original = analysis_fixture_metadata()
+    let restored = match RefrainMetadata::decode(original.encode().unwrap_or(""), original.context, original.dependencies) {
+        Ok(value) => value Err(error) => { ret false }
+    }
+    let mut consumer = AnalysisDatabase::new()
+    for module in restored.modules {
+        consumer.install_metadata_module("sample", "/absent/dependency/src/lib.enq", original.context.input_digest,
+            module.document(), module.safety)
+    }
+    consumer.set_module_full("sample", "/absent/dependency/src/lib.enq", "pub fn trusted() -> u32 { unsafe { ret 2 } }")
+    for symbol in consumer.all_symbols() {
+        if symbol.module_name == "sample" && symbol.symbol.name == "trusted" {
+            ret consumer.function_is_unsafe(symbol.id) && consumer.module_parse_count("sample") == 1
+        }
+    }
+    ret false
+}
+
+fn contract_fixture(source: str) -> RefrainMetadata {
+    let mut producer = AnalysisDatabase::new()
+    producer.set_module_full("sample", "/producer/src/lib.enq", source)
+    let document = producer.document("sample").unwrap_or(FrontendDocument::empty())
+    let mut modules = Vec[MetadataModule]::new()
+    modules.push(MetadataModule::from_document("sample@lib.enq", "lib.enq", document,
+        Vec[str]::new(), producer.function_safety_effects()))
+    let c = fixture_context()
+    ret RefrainMetadata{MetadataContext{c.unit, c.compiler_digest, c.target, c.profile,
+        compiler_content_digest(source), c.features}, Vec[MetadataDependency]::new(), modules,
+        compiler_content_digest("templates")}
+}
+
+#attr(test)
+fn metadata_interface_body_docs_and_positions_independent_contract() -> bool {
+    let original = contract_fixture("/// First docs\npub fn value() -> u32 { ret 1 }\n")
+    let changed = contract_fixture("\n\n/// Better documentation\npub fn value() -> u32 { let n = 42 ret n }\n")
+    ret original.encode().unwrap_or("") != changed.encode().unwrap_or("")
+        && original.interface_digest().unwrap_or("") != ""
+        && original.interface_digest().unwrap_or("") == changed.interface_digest().unwrap_or("")
+}
+
+#attr(test)
+fn metadata_interface_signature_and_safety_changes_contract() -> bool {
+    let safe = contract_fixture("pub fn value() -> u32 { ret 1 }\n")
+    let unsafe_value = contract_fixture("pub fn value() -> u32 { unsafe { ret 1 } }\n")
+    let wider = contract_fixture("pub fn value() -> u64 { ret 1 }\n")
+    let digest = safe.interface_digest().unwrap_or("")
+    ret digest != "" && digest != unsafe_value.interface_digest().unwrap_or("")
+        && digest != wider.interface_digest().unwrap_or("")
+}
+
+#attr(test)
+fn metadata_interface_template_and_dependency_keys_contract() -> bool {
+    let original = analysis_fixture_metadata()
+    let c = original.context
+    let mut deps = Vec[MetadataDependency]::new()
+    deps.push(MetadataDependency{"core", compiler_content_digest("core ABI"), compiler_content_digest("core template")})
+    let first = RefrainMetadata{c, deps, original.modules, original.template_digest}
+    let mut different_template = Vec[MetadataDependency]::new()
+    different_template.push(MetadataDependency{"core", compiler_content_digest("core ABI"), compiler_content_digest("new core template")})
+    let body_context = MetadataContext{c.unit, c.compiler_digest, c.target, c.profile, compiler_content_digest("new body"), c.features}
+    let second = RefrainMetadata{body_context, different_template, original.modules, compiler_content_digest("new templates")}
+    let mut different_interface = Vec[MetadataDependency]::new()
+    different_interface.push(MetadataDependency{"core", compiler_content_digest("new core ABI"), compiler_content_digest("core template")})
+    let third = RefrainMetadata{c, different_interface, original.modules, original.template_digest}
+    ret first.interface_digest().unwrap_or("") == second.interface_digest().unwrap_or("")
+        && first.interface_digest().unwrap_or("") != third.interface_digest().unwrap_or("")
+}
+
+#attr(test)
+fn metadata_interface_compile_time_body_changes_contract() -> bool {
+    let first = contract_fixture("#attr(decorator)\nfn replace() -> u32 { ret 1 }\n")
+    let second = contract_fixture("#attr(decorator)\nfn replace() -> u32 { ret 2 }\n")
+    ret first.interface_digest().unwrap_or("") != ""
+        && first.interface_digest().unwrap_or("") != second.interface_digest().unwrap_or("")
+}
+
+#attr(test)
+fn metadata_frontend_checkpoint_template_rebind_contract() -> bool {
+    let mut original = fixture_metadata()
+    original.dependencies.push(MetadataDependency{"core", compiler_content_digest("interface"), compiler_content_digest("template")})
+    let mut changed = Vec[MetadataDependency]::new()
+    for dependency in original.dependencies {
+        changed.push(MetadataDependency{dependency.unit, dependency.interface_digest, compiler_content_digest("changed template")})
+    }
+    let restored = match RefrainMetadata::decode_frontend(original.encode().unwrap_or(""), original.context, changed) {
+        Ok(value) => value Err(_) => { ret false }
+    }
+    ret restored.interface_digest().unwrap_or("") == original.interface_digest().unwrap_or("") &&
+        restored.encode().unwrap_or("") != original.encode().unwrap_or("")
+}
+
+#attr(test)
+fn metadata_frontend_checkpoint_interface_rejection_contract() -> bool {
+    let mut original = fixture_metadata()
+    original.dependencies.push(MetadataDependency{"core", compiler_content_digest("interface"), compiler_content_digest("template")})
+    let mut changed = Vec[MetadataDependency]::new()
+    for dependency in original.dependencies {
+        changed.push(MetadataDependency{dependency.unit, compiler_content_digest("changed interface"), dependency.template_digest})
+    }
+    ret RefrainMetadata::decode_frontend(original.encode().unwrap_or(""), original.context, changed).is_err() &&
+        RefrainMetadata::decode_frontend(original.encode().unwrap_or(""), original.context, Vec[MetadataDependency]::new()).is_err()
+}
+
+fn unit_fixture_graph(root: Path) -> Result[ResolvedPackageGraph, ProjectFailure] {
+    let consumer = try_parse_project_manifest("[project]\nname=\"consumer\"\nversion=\"0.0.0\"\ndependencies=[]\n", root.join("consumer/encore.toml"))?
+    let sample = try_parse_project_manifest("[project]\nname=\"sample\"\nversion=\"0.0.0\"\ndependencies=[]\n", root.join("sample/encore.toml"))?
+    let mut dependencies = Vec[str]::new() dependencies.push("sample")
+    let mut refrains = Vec[WorkspaceRefrain]::new()
+    refrains.push(WorkspaceRefrain{"consumer", root.join("consumer"), root, "fixture:consumer", true,
+        consumer, dependencies, Vec[str]::new()})
+    refrains.push(WorkspaceRefrain{"sample", root.join("sample"), root, "fixture:sample", false,
+        sample, Vec[str]::new(), Vec[str]::new()})
+    ret Result[ResolvedPackageGraph, ProjectFailure]::Ok(ResolvedPackageGraph{"consumer", refrains, Vec[str]::new()})
+}
+
+fn unit_fixture_run(root: Path) -> bool {
+    if mkdir_all(root.join("consumer/src").as_str()) != 0 || mkdir_all(root.join("sample/src").as_str()) != 0 { ret false }
+    if write_file(root.join("consumer/src/main.enq").as_str(),
+        "import sample::{Item, trusted}\nfn main() -> u32 { let value = Item{1} ret trusted() }\n") != 0 { ret false }
+    // There is a real dependency source on disk, but it must not be read.
+    let dependency_source = root.join("sample/src/lib.enq")
+    if write_file(dependency_source.as_str(), "this deliberately cannot parse { [") != 0 { ret false }
+    let graph = match unit_fixture_graph(root) { Ok(value) => value Err(_) => { ret false } }
+    let original = analysis_fixture_metadata()
+    let compiled = original.compiled_modules().unwrap_or(Vec[CompiledWorkspaceModule]::new())
+    if compiled.len() != 1 { ret false }
+    let mut pass = 0_usize
+    while pass < 2 {
+        let mut unit = match try_load_compilation_unit(graph, "consumer", compiled) { Ok(value) => value Err(_) => { ret false } }
+        if unit.modules.len() != 2 || unit.analysis.module_parse_count("sample") != 0
+            || unit.analysis.module_lightweight_count("sample") != 0 || unit.analysis.module_parse_count("consumer") != 1
+            || unit.analysis.module_semantic_diagnostics("consumer").len() != 0 { ret false }
+        for module in unit.modules {
+            if module.owner_name == "sample" && (module.source != "" || module.analysis.tokens.len() != 0) { ret false }
+            if module.owner_name == "consumer" && (module.resolved_imports.len() != 1 || module.diagnostics.len() != 0) { ret false }
+        }
+        if pass == 0 && remove_file(dependency_source.as_str()) != 0 { ret false }
+        pass += 1
+    }
+    if try_load_compilation_unit(graph, "consumer", Vec[CompiledWorkspaceModule]::new()).is_ok() { ret false }
+    let mut duplicate = Vec[CompiledWorkspaceModule]::new() duplicate.extend(compiled) duplicate.extend(compiled)
+    if try_load_compilation_unit(graph, "consumer", duplicate).is_ok() { ret false }
+    let first = compiled.get(0).unwrap_or(CompiledWorkspaceModule{"", "", "", FrontendDocument::empty(), Vec[FunctionSafety]::new(), Vec[str]::new()})
+    let mut invalid = Vec[CompiledWorkspaceModule]::new()
+    invalid.push(CompiledWorkspaceModule{first.owner_name, "../outside.enq", first.interface_digest, first.document, first.safety, first.resolved_imports})
+    if try_load_compilation_unit(graph, "consumer", invalid).is_ok() { ret false }
+    let mut unresolved = Vec[str]::new() unresolved.push("sample@missing.enq")
+    let mut absent = Vec[CompiledWorkspaceModule]::new()
+    absent.push(CompiledWorkspaceModule{first.owner_name, first.source, first.interface_digest, first.document, first.safety, unresolved})
+    ret try_load_compilation_unit(graph, "consumer", absent).is_err()
+}
+
+#attr(test)
+fn metadata_unit_loader_never_reads_dependencies_contract() -> bool {
+    let parent = Path::new("target").resolve()
+    if mkdir_all(parent.as_str()) != 0 { ret false }
+    let prefix = "metadata-unit-" + Debug::fmt(perf_counter_ms()) + "-"
+    let mut root = Path::new("")
+    let mut attempt = 0_usize
+    while attempt < 100 {
+        let candidate = parent.join(prefix + Debug::fmt(attempt))
+        if mkdir(candidate.as_str()) == 0 { root = candidate break }
+        attempt += 1
+    }
+    if attempt == 100 { ret false }
+    let success = unit_fixture_run(root)
+    let removed = remove_dir_all(root.as_str())
+    ret success && removed == 0
+}
+
+#attr(test)
+fn metadata_graph_snapshot_no_manifest_files_contract() -> bool {
+    let root = Path::new("target/does-not-exist-graph-snapshot").resolve()
+    let graph = match unit_fixture_graph(root) { Ok(value) => value Err(_) => { ret false } }
+    let text = encode_build_graph(graph).unwrap_or("")
+    let restored = match decode_build_graph(text) { Ok(value) => value Err(_) => { ret false } }
+    ret text != "" && restored.root_name == "consumer" && restored.refrains.len() == 2
+        && encode_build_graph(restored).unwrap_or("") == text
+}
+
+#attr(test)
+fn metadata_graph_snapshot_rejects_bad_identities_contract() -> bool {
+    let graph = match unit_fixture_graph(Path::new("target/graph-snapshot").resolve()) { Ok(value) => value Err(_) => { ret false } }
+    let mut duplicate = Vec[WorkspaceRefrain]::new() duplicate.extend(graph.refrains) duplicate.extend(graph.refrains)
+    let duplicates = ResolvedPackageGraph{graph.root_name, duplicate, graph.enabled_features}
+    let missing_root = ResolvedPackageGraph{"missing-root", graph.refrains, graph.enabled_features}
+    if encode_build_graph(duplicates).is_ok() { ret false }
+    if encode_build_graph(missing_root).is_ok() { ret false }
+    ret decode_build_graph("{}").is_err() && decode_build_graph("{\"schema\":2}").is_err()
+}
+
+#attr(test)
+fn metadata_graph_snapshot_rejects_dependency_cycles_contract() -> bool {
+    let graph = match unit_fixture_graph(Path::new("target/graph-snapshot").resolve()) { Ok(value) => value Err(_) => { ret false } }
+    let mut cycle = Vec[WorkspaceRefrain]::new()
+    for package in graph.refrains {
+        if package.name == "sample" {
+            let mut dependencies = Vec[str]::new() dependencies.push("consumer")
+            cycle.push(WorkspaceRefrain{package.name, package.root, package.distribution_root, package.source_key,
+                package.target_is_binary, package.manifest, dependencies, package.enabled_features})
+        } else { cycle.push(package) }
+    }
+    ret encode_build_graph(ResolvedPackageGraph{graph.root_name, cycle, graph.enabled_features}).is_err()
+}

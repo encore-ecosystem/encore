@@ -1,0 +1,161 @@
+//! A guarded compiler process owns exactly one package and one CPU lease.
+
+import argparse::{process_arg, process_arg_count}
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+import json::{Json, stringify}
+import mod::build_archive::{UnitNativePlan, emit_budgeted_package_archive}
+import mod::build_artifacts::{UnitReady, read_unit_ready, publish_unit_ready, publish_unit_complete}
+import mod::build_metadata::RefrainMetadata
+import mod::build_prepared_cache::publish_prepared_unit
+import mod::build_request::BuildUnitRequest
+import mod::build_unit::{prepare_package_worker, package_backend_fingerprint, package_owned_checkpoint}
+import refrain::cache_identity::compiler_content_digest
+import refrain::target::parse_target
+import std::io::eprintln
+import std::os::{executable_path, file_sha256, read_file, write_file, file_exists}
+import std::path::Path
+import std::time::{sleep_ms, perf_counter_ms}
+import std::vec::Vec
+
+extern fn encore_compiler_worker_watch_parent(parent: u64) -> bool
+extern fn encore_compiler_jobserver_attach(path: str, memory: u64) -> usize
+extern fn encore_compiler_jobserver_try_acquire(server: usize) -> i32
+extern fn encore_compiler_jobserver_release(server: usize) -> bool
+extern fn encore_compiler_jobserver_close(server: usize) ->()
+
+/// Private IPC entrypoint. There is no package resolution, source fallback,
+/// independent job count, shell invocation or globally installed compiler here.
+#attr(safe)
+pub fn run_package_worker() -> u32 {
+    if process_arg_count() != 7 {
+        eprintln("invalid package worker arguments") ret 2
+    }
+    let parent = positive_u64(process_arg(5).unwrap_or(""))
+    let memory = positive_u64(process_arg(6).unwrap_or(""))
+    if parent == 0 || memory == 0 {
+        eprintln("invalid package worker reservation") ret 2
+    }
+    let guarded = unsafe {
+        encore_compiler_worker_watch_parent(parent)
+    }
+    if !guarded {
+        eprintln("cannot guard package worker parent") ret 1
+    }
+    let server = unsafe {
+        encore_compiler_jobserver_attach(process_arg(4).unwrap_or(""), memory)
+    }
+    if server == 0 {
+        eprintln("cannot attach package worker budget") ret 1
+    }
+    let mut acquired = false
+    loop {
+        let state = unsafe {
+            encore_compiler_jobserver_try_acquire(server)
+        }
+        if state > 0 {
+            acquired = true break
+        }
+        if state < 0 {
+            break
+        }
+        let _sleep = sleep_ms(5)
+    }
+    if !acquired {
+        unsafe {
+            encore_compiler_jobserver_close(server)
+        }
+        eprintln("package worker budget cancelled") ret 1
+    }
+    // Cleanup occurs after Result is captured, including every early ? return
+    // inside execute_package. The OS also reclaims leases after worker crashes.
+    let result = execute_package(process_arg(2).unwrap_or(""), process_arg(3).unwrap_or(""), server)
+    let _released = unsafe {
+        encore_compiler_jobserver_release(server)
+    }
+    unsafe {
+        encore_compiler_jobserver_close(server)
+    }
+    match result {
+        Ok(_) => {
+            ret 0
+        }
+        Err(error) => {
+            eprintln(error) ret 1
+        }
+    }
+}
+
+fn execute_package(request_path: str, native_path: str, server: usize) -> Result[bool, str] {
+    let request = BuildUnitRequest::decode(read_file(request_path))?
+    let executable = executable_path()
+    if executable == "" || file_sha256(executable) != request.context.compiler_digest {
+        ret Result[bool, str]::Err("package worker compiler identity mismatch")
+    }
+    let native = UnitNativePlan::decode(read_file(native_path))?
+    let native_digest = native.identity()?
+    // One admitted CPU lease covers preparation, LLVM and the serial Clang/ar
+    // children. Their parent sleeps, instead of spending a second CPU token.
+    let started = perf_counter_ms()
+    let backend_hit = file_exists(request.output.join("unit.backend").as_str())
+    let frontend_hit = backend_hit || file_exists(request.output.join("unit.frontend").as_str())
+    let worker = prepare_package_worker(request, 1)?
+    let metadata = RefrainMetadata::decode(worker.metadata_text, request.context, worker.metadata_dependencies)?
+    let prospective = UnitReady {
+        request.context, compiler_content_digest(worker.metadata_text),
+        compiler_content_digest(worker.templates_text), compiler_content_digest(worker.requirements_text), worker.interface_digest
+    }
+    // A hydrated backend checkpoint is already ready before this worker starts.
+    // The coordinator may have admitted consumers: never withdraw or rewrite
+    // their immutable metadata while regenerating native objects.
+    let cached_ready = if backend_hit {
+        Option[UnitReady]::Some(read_unit_ready(request.output, request.context, worker.metadata_dependencies)?)
+    } else {
+        Option[UnitReady]::None
+    }
+    if !backend_hit {
+        publish_prepared_unit(request.output, prospective, package_backend_fingerprint(request)?,
+            package_owned_checkpoint(request, worker)?,)?
+    }
+    let ready = match cached_ready {
+        Some(value) => value
+        None => publish_unit_ready(request.output, metadata, worker.templates_text, worker.requirements_text)?
+    }
+    let prepared_ms = perf_counter_ms() - started
+    let target = parse_target(request.context.target)
+    let _archive = emit_budgeted_package_archive(worker.prepared, request.output, target, native, server)?
+    let native_ms = perf_counter_ms() - started - prepared_ms
+    let mut timings = Vec[(str, Json)]::new()
+    timings.push(("prepare_ms", Json::Number(Debug::fmt(prepared_ms))))
+    timings.push(("native_ms", Json::Number(Debug::fmt(native_ms))))
+    timings.push(("backend_cache_hit", Json::Bool(backend_hit)))
+    timings.push(("frontend_cache_hit", Json::Bool(frontend_hit)))
+    timings.push(("native_peak_bound_bytes", Json::Number(Debug::fmt(positive_u64(read_file(request.output.join("native-peak").as_str()))))))
+    if write_file(request.output.join("phases.json").as_str(), stringify(Json::Object(timings))) != 0 {
+        ret Result[bool, str]::Err("cannot record worker phases")
+    }
+    let _complete = publish_unit_complete(request.output, ready, native_digest)?
+    ret Result[bool, str]::Ok(true)
+}
+
+fn positive_u64(text: str) -> u64 {
+    if text == "" {
+        ret 0
+    }
+    let mut value = 0_u64
+    let mut index = 0_usize
+    while index < text.byte_len() {
+        let byte = text.byte_at(index)
+        if byte < 48 || byte > 57 {
+            ret 0
+        }
+        let digit =(byte - 48) as u64
+        if value >(18446744073709551615_u64 - digit) / 10 {
+            ret 0
+        }
+        value = value * 10 + digit
+        index += 1
+    }
+    ret value
+}

@@ -1,0 +1,242 @@
+//! Native cache input closure comes from the selected compiler, not include guesses.
+
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+import json::{Json, stringify}
+import mod::build_archive::{UnitNativePlan, start_program_tool, finish_unit_tool, close_program_tool}
+import mod::build_metadata::metadata_name_before
+import refrain::cache_identity::compiler_content_digest
+import std::os::{file_exists, file_sha256, read_file}
+import std::path::Path
+import std::vec::Vec
+
+/// Includes every active C/SDK header, including angle-bracket includes and
+/// conditional/platform headers. Clang emits escaped make dependencies. Flags
+/// are exactly those used for compilation; no handwritten recursive scanner.
+pub fn native_source_identity(source: Path, plan: UnitNativePlan, directory: Path,
+    ordinal: usize,) -> Result[str, str] {
+    let child = start_native_scan(source, plan, directory, ordinal)?
+    let stem = "headers-" + Debug::fmt(ordinal)
+    finish_unit_tool(child, plan.compiler, directory, stem)?
+    ret native_scan_identity(plan, directory, ordinal)
+}
+
+/// The package phase is already reaped. This phase has at most `jobs` guarded
+/// tools; all handles, failure cleanup and result ordering stay on one thread.
+pub fn native_source_identities(sources: Vec[Path], plan: UnitNativePlan, directory: Path,
+    jobs: usize,) -> Result[Vec[str], str] {
+    if jobs == 0 {
+        ret Result[Vec[str], str]::Err("native scan needs a CPU budget")
+    }
+    let mut results = Vec[str]::new()
+    let mut offset = 0_usize
+    while offset < sources.len() {
+        let mut children = Vec[usize]::new()
+        let mut failure = ""
+        let mut index = offset
+        while index < sources.len() && index - offset < jobs {
+            match sources.get(index) {
+                Some(source) => {
+                    match start_native_scan(source, plan, directory, index) {
+                        Ok(child) => {
+                            children.push(child)
+                        }
+                        Err(error) => {
+                            failure = error break
+                        }
+                    }
+                }
+                None => {
+                    failure = "native source disappeared" break
+                }
+            }
+            index += 1
+        }
+        index = offset
+        for child in children {
+            if failure == "" {
+                match finish_unit_tool(child, plan.compiler, directory, "headers-" + Debug::fmt(index)) {
+                    Ok(_) => {
+                        match native_scan_identity(plan, directory, index) {
+                            Ok(identity) => {
+                                results.push(identity)
+                            }
+                            Err(error) => {
+                                failure = error
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        failure = error
+                    }
+                }
+            }
+            close_program_tool(child)
+            index += 1
+        }
+        if failure != "" {
+            ret Result[Vec[str], str]::Err(failure)
+        }
+        offset = index
+    }
+    ret Result[Vec[str], str]::Ok(results)
+}
+
+fn start_native_scan(source: Path, plan: UnitNativePlan, directory: Path,
+    ordinal: usize,) -> Result[usize, str] {
+    let stem = "headers-" + Debug::fmt(ordinal)
+    let dependency_file = directory.join(stem + ".d")
+    let mut args = Vec[str]::new()
+    for argument in plan.args {
+        args.push(argument)
+    }
+    args.push("-M") args.push("-MT") args.push("encore") args.push("-MF") args.push(dependency_file.as_str())
+    args.push(source.as_str())
+    ret start_program_tool(plan.compiler, args, directory, stem)
+}
+
+fn native_scan_identity(plan: UnitNativePlan, directory: Path, ordinal: usize) -> Result[str, str] {
+    let dependency_file = directory.join("headers-" + Debug::fmt(ordinal) + ".d")
+    let mut names = make_dependency_paths(read_file(dependency_file.as_str()))?
+    let mut index = 1_usize
+    while index < names.len() {
+        let mut cursor = index
+        while cursor > 0 {
+            let current = names.get(cursor).unwrap_or("")
+            let previous = names.get(cursor - 1).unwrap_or("")
+            if !metadata_name_before(current, previous) {
+                break
+            }
+            names.set(cursor - 1, current) names.set(cursor, previous) cursor -= 1
+        }
+        index += 1
+    }
+    let mut records = Vec[Json]::new()
+    for name in names {
+        let path = if Path::new(name).is_absolute() {
+            Path::new(name)
+        } else {
+            directory.join(name)
+        }
+        let digest = file_sha256(path.as_str())
+        if !file_exists(path.as_str()) || digest.byte_len() != 64 {
+            ret Result[str, str]::Err("cannot identify native header: " + name)
+        }
+        let mut record = Vec[Json]::new()
+        record.push(Json::String(path.as_str())) record.push(Json::String(digest))
+        records.push(Json::Array(record))
+    }
+    let mut fields = Vec[Json]::new()
+    fields.push(Json::String("encore-native-headers-1"))
+    fields.push(Json::String(plan.identity()?)) fields.push(Json::Array(records))
+    ret Result[str, str]::Ok(compiler_content_digest(stringify(Json::Array(fields))))
+}
+
+fn make_dependency_paths(text: str) -> Result[Vec[str], str] {
+    if text.byte_len() < 7 || text.slice_bytes(0, 7) != "encore:" {
+        ret Result[Vec[str], str]::Err("invalid native dependency record")
+    }
+    let mut paths = Vec[str]::new()
+    let mut current = ""
+    let mut index = 7_usize
+    while index < text.byte_len() {
+        let byte = text.byte_at(index)
+        if byte == 92 {
+            let start = index
+            while index < text.byte_len() && text.byte_at(index) == 92 {
+                index += 1
+            }
+            if index >= text.byte_len() {
+                ret Result[Vec[str], str]::Err("truncated native dependency escape")
+            }
+            let count = index - start
+            let escaped = text.byte_at(index)
+            // Clang leaves ordinary backslashes (including UNC prefixes)
+            // untouched. Only runs preceding whitespace are doubled.
+            if escaped == 32 || escaped == 9 {
+                current = current + text.slice_bytes(start, count / 2)
+                if count % 2 == 1 {
+                    current = current + text.slice_bytes(index, 1)
+                } else {
+                    index -= 1
+                }
+            } elif escaped == 35 || escaped == 58 {
+                current = current + text.slice_bytes(start, count - 1) + text.slice_bytes(index, 1)
+            } elif escaped == 10 ||(escaped == 13 && index + 1 < text.byte_len() && text.byte_at(index + 1) == 10) {
+                current = current + text.slice_bytes(start, count - 1)
+                if escaped == 13 {
+                    index += 1
+                }
+            } else {
+                current = current + text.slice_bytes(start, count)
+                current = current + text.slice_bytes(index, 1)
+            }
+        } elif byte == 36 && index + 1 < text.byte_len() && text.byte_at(index + 1) == 36 {
+            current = current + "$" index += 1
+        } elif byte == 32 || byte == 9 || byte == 10 || byte == 13 {
+            if current != "" {
+                append_unique(paths, current) current = ""
+            }
+        } else {
+            current = current + text.slice_bytes(index, 1)
+        }
+        index += 1
+    }
+    if current != "" {
+        append_unique(paths, current)
+    }
+    if paths.len() == 0 {
+        ret Result[Vec[str], str]::Err("empty native dependency record")
+    }
+    ret Result[Vec[str], str]::Ok(paths)
+}
+
+fn append_unique(paths: mut Vec[str], name: str) ->() {
+    for existing in paths {
+        if existing == name {
+            ret()
+        }
+    }
+    paths.push(name)
+}
+
+#attr(test)
+fn metadata_native_dependencies_escaped_paths_contract() -> bool {
+    let paths = match make_dependency_paths("encore: /source\\ with\\ spaces.c \\\n /sdk/header.h /source\\ with\\ spaces.c C\\:/sdk/Win.h dollar$$.h\n") {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    ret paths.len() == 4 && paths.get(0).unwrap_or("") == "/source with spaces.c" &&
+    paths.get(1).unwrap_or("") == "/sdk/header.h" && paths.get(2).unwrap_or("") == "C:/sdk/Win.h" &&
+    paths.get(3).unwrap_or("") == "dollar$.h"
+}
+
+#attr(test)
+fn metadata_native_dependencies_reject_incomplete_record() -> bool {
+    ret make_dependency_paths("wrong: /header.h").is_err() && make_dependency_paths("encore: ").is_err() &&
+    make_dependency_paths("encore: /header\\").is_err()
+}
+
+#attr(test)
+fn metadata_native_dependencies_windows_sdk_paths_contract() -> bool {
+    let paths = match make_dependency_paths("encore: C:\\Program\\ Files\\ (x86)\\Windows\\ Kits\\10\\Include\\10.0.26100.0\\shared\\apiset.h \\\r\n D:\\a\\encore\\runtime.c \\\\server\\share\\header.h\r\n") {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    ret paths.len() == 3 && paths.get(0).unwrap_or("") == "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\shared\\apiset.h" &&
+    paths.get(1).unwrap_or("") == "D:\\a\\encore\\runtime.c" && paths.get(2).unwrap_or("") == "\\\\server\\share\\header.h"
+}
+
+#attr(test)
+fn metadata_native_dependencies_literal_backslashes_contract() -> bool {
+    let paths = match make_dependency_paths("encore: dir\\\\\\ with\\ space.h hash\\#name.h dir\\\\header.h\n") {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    ret paths.len() == 3 && paths.get(0).unwrap_or("") == "dir\\ with space.h" &&
+    paths.get(1).unwrap_or("") == "hash#name.h" && paths.get(2).unwrap_or("") == "dir\\\\header.h"
+}

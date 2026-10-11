@@ -1,0 +1,90 @@
+//! Backend checkpoints reuse checked/lowered bodies when native flags change.
+
+import core::option::Option
+import core::result::Result
+import json::{Json, parse, stringify}
+import std::os::{file_exists, file_sha256, mkdir_all, read_file, remove_file}
+import std::path::Path
+import std::vec::Vec
+import refrain::cache_identity::compiler_content_digest
+import mod::build_metadata::{MetadataContext, MetadataDependency}
+import mod::build_artifacts::{UnitReady, read_unit_ready, verify_validated_unit_copy}
+import mod::build_cache::UnitCacheLock
+
+extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
+
+/// Receipt ties normalized owned EHIR to the exact verified declarations,
+/// templates and requirements. It is written before unit.ready is published.
+pub fn publish_prepared_unit(directory: Path, ready: UnitReady, key: str, owned: str) -> Result[(), str] {
+    if mkdir_all(directory.as_str()) != 0 { ret Result[(), str]::Err("cannot stage prepared package") }
+    atomic_copy_text(directory.join("unit.erowned"), owned)?
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(("schema", Json::Number("1")))
+    fields.push(("key", Json::String(key)))
+    fields.push(("ready", Json::String(compiler_content_digest(ready.encode()?))))
+    fields.push(("owned", Json::String(compiler_content_digest(owned))))
+    atomic_copy_text(directory.join("unit.backend"), stringify(Json::Object(fields)))?
+    ret Result[(), str]::Ok(())
+}
+
+pub fn read_prepared_unit(directory: Path, ready: UnitReady, key: str) -> Result[str, str] {
+    let record = parse(read_file(directory.join("unit.backend").as_str())).unwrap_or(Json::Null)
+    if record.get("schema").unwrap_or(Json::Null).as_number().unwrap_or("") != "1" ||
+        record.get("key").unwrap_or(Json::Null).as_str().unwrap_or("") != key ||
+        record.get("ready").unwrap_or(Json::Null).as_str().unwrap_or("") != compiler_content_digest(ready.encode()?) {
+        ret Result[str, str]::Err("prepared package identity mismatch")
+    }
+    let expected = record.get("owned").unwrap_or(Json::Null).as_str().unwrap_or("")
+    let path = directory.join("unit.erowned")
+    let owned = read_file(path.as_str())
+    if expected.byte_len() != 64 || !file_exists(path.as_str()) || file_sha256(path.as_str()) != expected ||
+        compiler_content_digest(owned) != expected { ret Result[str, str]::Err("missing or corrupt prepared package body") }
+    ret Result[str, str]::Ok(owned)
+}
+
+pub fn restore_prepared_cache(lock: UnitCacheLock, context: MetadataContext, dependencies: Vec[MetadataDependency],
+    key: str, destination: Path) -> Result[bool, str] {
+    let ready = match read_unit_ready(lock.directory, context, dependencies) { Ok(value) => value Err(_) => { ret Result[bool, str]::Ok(false) } }
+    if read_prepared_unit(lock.directory, ready, key).is_err() { ret Result[bool, str]::Ok(false) }
+    copy_prepared(lock.directory, destination)?
+    verify_validated_unit_copy(destination, ready)?
+    let _owned = read_prepared_unit(destination, ready, key)?
+    ret Result[bool, str]::Ok(true)
+}
+
+pub fn commit_prepared_cache(lock: UnitCacheLock, context: MetadataContext, dependencies: Vec[MetadataDependency],
+    key: str, source: Path) -> Result[(), str] {
+    let ready = read_unit_ready(source, context, dependencies)?
+    let _owned = read_prepared_unit(source, ready, key)?
+    copy_prepared(source, lock.directory)?
+    verify_validated_unit_copy(lock.directory, ready)?
+    let _copied_owned = read_prepared_unit(lock.directory, ready, key)?
+    ret Result[(), str]::Ok(())
+}
+
+fn copy_prepared(source: Path, destination: Path) -> Result[(), str] {
+    if source.as_str() == destination.as_str() || !destination.is_absolute() || mkdir_all(destination.as_str()) != 0 {
+        ret Result[(), str]::Err("invalid prepared cache transaction")
+    }
+    let marker = destination.join("unit.ready")
+    if file_exists(marker.as_str()) && remove_file(marker.as_str()) != 0 { ret Result[(), str]::Err("cannot invalidate prepared cache record") }
+    let mut files = Vec[str]::new()
+    files.push("unit.ermeta") files.push("unit.ertemplate") files.push("unit.errequirements")
+    files.push("unit.erowned") files.push("unit.backend") files.push("unit.ready")
+    for name in files {
+        let input = source.join(name)
+        let contents = read_file(input.as_str())
+        if !file_exists(input.as_str()) || file_sha256(input.as_str()) != compiler_content_digest(contents) {
+            ret Result[(), str]::Err("prepared package changed during cache copy")
+        }
+        atomic_copy_text(destination.join(name), contents)?
+    }
+    ret Result[(), str]::Ok(())
+}
+
+#attr(safe)
+fn atomic_copy_text(path: Path, contents: str) -> Result[(), str] {
+    if !unsafe { encore_compiler_write_atomic(path.as_str(), contents) } ||
+        file_sha256(path.as_str()) != compiler_content_digest(contents) { ret Result[(), str]::Err("cannot commit prepared package") }
+    ret Result[(), str]::Ok(())
+}

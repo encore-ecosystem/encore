@@ -1,0 +1,139 @@
+//! Private coordinator/worker graph snapshots; no Encore source is parsed here.
+
+import core::option::Option
+import core::result::Result
+import json::{Json, parse, stringify}
+import std::path::Path
+import std::vec::Vec
+import mod::manifest::try_parse_project_manifest
+import mod::failure::ProjectFailure
+import mod::workspace::{ResolvedPackageGraph, WorkspaceRefrain}
+
+/// Encodes already resolved package manifests and their exact dependency
+/// edges once. Absolute roots are private same-host IPC, not artifact ABI or
+/// portable cache metadata. Workers never re-resolve the registry graph.
+pub fn encode_build_graph(graph: ResolvedPackageGraph) -> Result[str, str] {
+    validate_build_graph(graph)?
+    let mut packages = Vec[Json]::new()
+    for package in graph.refrains {
+        let mut record = Vec[(str, Json)]::new()
+        record.push(("name", Json::String(package.name)))
+        record.push(("root", Json::String(package.root.resolve().as_str())))
+        record.push(("distribution", Json::String(package.distribution_root.resolve().as_str())))
+        record.push(("source", Json::String(package.source_key)))
+        record.push(("binary", Json::Bool(package.target_is_binary)))
+        record.push(("manifest", Json::String(package.manifest.original_source)))
+        record.push(("dependencies", encode_strings(package.dependency_names)))
+        record.push(("features", encode_strings(package.enabled_features)))
+        packages.push(Json::Object(record))
+    }
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(("schema", Json::Number("1")))
+    fields.push(("root", Json::String(graph.root_name)))
+    fields.push(("features", encode_strings(graph.enabled_features)))
+    fields.push(("packages", Json::Array(packages)))
+    ret Result[str, str]::Ok(stringify(Json::Object(fields)))
+}
+
+/// Restores manifest snapshots rather than reading mutable encore.toml files
+/// a second time. There is no source loading, network or registry fallback.
+pub fn decode_build_graph(text: str) -> Result[ResolvedPackageGraph, str] {
+    let data = match parse(text) { Ok(value) => value Err(_) => { ret Result[ResolvedPackageGraph, str]::Err("invalid build graph JSON") } }
+    if data.get("schema").unwrap_or(Json::Null).as_number().unwrap_or("") != "1" {
+        ret Result[ResolvedPackageGraph, str]::Err("unsupported build graph schema")
+    }
+    let root_name = string_field(data, "root")?
+    let mut packages = Vec[WorkspaceRefrain]::new()
+    let records = array(data.get("packages").unwrap_or(Json::Null))?
+    for record in records {
+        let name = string_field(record, "name")?
+        let root = Path::new(string_field(record, "root")?)
+        let distribution = Path::new(string_field(record, "distribution")?)
+        if !root.is_absolute() || !distribution.is_absolute() { ret Result[ResolvedPackageGraph, str]::Err("build graph roots must be absolute") }
+        let manifest_source = string_field(record, "manifest")?
+        let manifest = match try_parse_project_manifest(manifest_source, root.join("encore.toml")) {
+            Ok(value) => value Err(failure) => { ret Result[ResolvedPackageGraph, str]::Err(failure.message) }
+        }
+        let binary = match record.get("binary").unwrap_or(Json::Null) {
+            Json::Bool(value) => value _ => { ret Result[ResolvedPackageGraph, str]::Err("invalid build graph target") }
+        }
+        packages.push(WorkspaceRefrain{name, root, distribution, string_field(record, "source")?, binary, manifest,
+            strings(record.get("dependencies").unwrap_or(Json::Null))?, strings(record.get("features").unwrap_or(Json::Null))?})
+    }
+    let graph = ResolvedPackageGraph{root_name, packages, strings(data.get("features").unwrap_or(Json::Null))?}
+    validate_build_graph(graph)?
+    ret Result[ResolvedPackageGraph, str]::Ok(graph)
+}
+
+fn encode_strings(values: Vec[str]) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values { out.push(Json::String(value)) }
+    ret Json::Array(out)
+}
+
+fn array(data: Json) -> Result[Vec[Json], str] {
+    ret match data { Json::Array(values) => Result[Vec[Json], str]::Ok(values)
+        _ => Result[Vec[Json], str]::Err("build graph field must be an array") }
+}
+
+fn strings(data: Json) -> Result[Vec[str], str] {
+    let mut out = Vec[str]::new()
+    for value in array(data)? {
+        match value { Json::String(text) => { out.push(text) }
+            _ => { ret Result[Vec[str], str]::Err("build graph list must contain strings") } }
+    }
+    if !unique(out) { ret Result[Vec[str], str]::Err("duplicate or empty build graph entry") }
+    ret Result[Vec[str], str]::Ok(out)
+}
+
+fn string_field(data: Json, name: str) -> Result[str, str] {
+    ret match data.get(name).unwrap_or(Json::Null) { Json::String(text) => Result[str, str]::Ok(text)
+        _ => Result[str, str]::Err("missing build graph string: " + name) }
+}
+
+fn contains(values: Vec[str], needle: str) -> bool {
+    for value in values { if value == needle { ret true } }
+    ret false
+}
+
+fn unique(values: Vec[str]) -> bool {
+    let mut seen = Vec[str]::new()
+    for value in values {
+        if value == "" || contains(seen, value) { ret false }
+        seen.push(value)
+    }
+    ret true
+}
+
+/// Validates an in-memory graph before allocating workers or staging outputs.
+pub fn validate_build_graph(graph: ResolvedPackageGraph) -> Result[bool, str] {
+    let mut names = Vec[str]::new()
+    for package in graph.refrains {
+        if package.name == "" || package.manifest.name != package.name || package.source_key == ""
+            || !package.root.is_absolute() || !package.distribution_root.is_absolute()
+            || !unique(package.dependency_names) || !unique(package.enabled_features) {
+            ret Result[bool, str]::Err("invalid build graph package: " + package.name)
+        }
+        names.push(package.name)
+    }
+    if !unique(names) || !contains(names, graph.root_name) || !unique(graph.enabled_features) {
+        ret Result[bool, str]::Err("invalid build graph package identities")
+    }
+    for package in graph.refrains {
+        for dependency in package.dependency_names {
+            if !contains(names, dependency) { ret Result[bool, str]::Err("unknown graph dependency: " + dependency) }
+        }
+    }
+    let mut complete = Vec[str]::new()
+    while complete.len() < names.len() {
+        let before = complete.len()
+        for package in graph.refrains {
+            if contains(complete, package.name) { continue }
+            let mut ready = true
+            for dependency in package.dependency_names { if !contains(complete, dependency) { ready = false } }
+            if ready { complete.push(package.name) }
+        }
+        if before == complete.len() { ret Result[bool, str]::Err("build graph dependency cycle") }
+    }
+    ret Result[bool, str]::Ok(true)
+}

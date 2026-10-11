@@ -1,0 +1,50 @@
+//! Checks update transactions against a disposable, local release channel.
+
+import std::os::{copy_file, set_executable, file_sha256, file_exists, arch_name}
+import std::vec::Vec
+import std::string::String
+import refrain::ci_helpers::{Fixture, set_env, replace}
+
+#cfg(target_os = "linux")
+#attr(test)
+fn integration_self_update_transaction_contract() -> bool {
+    let fixture = Fixture::new("self-update")
+    let version_output = fixture.command(vec!["--version"])
+    if !version_output.success() { ret fixture.finish(false) }
+    let release = String::from_str(replace(version_output.text(), "encore ", "")).trim().as_str()
+    let version = String::from_str(release).split_char("-").get(0).unwrap_or(String::new()).as_str()
+    let nametag = release.slice_bytes(version.byte_len() + 1, release.byte_len() - version.byte_len() - 1)
+    let installed = fixture.root.join("installation with spaces/bin/encore")
+    fixture.put("installation with spaces/VERSION", "0.0.0-neumann\n")
+    fixture.put("installation with spaces/settings.toml", "channel = \"stable\"\n")
+    fixture.put("installation with spaces/bin/placeholder", "")
+    fixture.put("package/bin/placeholder", "")
+    fixture.put("package/lib/placeholder", "")
+    fixture.put("package/share/placeholder", "")
+    fixture.put("package/VERSION", release + "\n")
+    if copy_file(fixture.compiler, installed.as_str()) != 0 || set_executable(installed.as_str()) != 0 ||
+        copy_file(fixture.compiler, fixture.root.join("package/bin/encore").as_str()) != 0 ||
+        set_executable(fixture.root.join("package/bin/encore").as_str()) != 0 { ret fixture.finish(false) }
+    if !fixture.tool("tar", vec!["-czf", "release.tar.gz", "--transform=s,^package,encore,", "package"]).success() { ret fixture.finish(false) }
+    let checksum = file_sha256(fixture.root.join("release.tar.gz").as_str())
+    let metadata = "{\"schema\":2,\"channel\":\"stable\",\"version\":\"" + version +
+        "\",\"nametag\":\"" + nametag + "\",\"release\":\"" + release + "\",\"tag\":\"v" + release +
+        "\",\"commit\":\"fixture\",\"assets\":[{\"triple\":\"" + arch_name() + "-unknown-linux-gnu\",\"url\":\"file://" +
+        fixture.root.join("release.tar.gz").as_str() + "\",\"sha256\":\"" + checksum + "\",\"format\":\"tar.gz\"}]}"
+    fixture.put("channels/stable.json", metadata)
+    set_env("ENCORE_HOME", fixture.root.join("installation with spaces").as_str())
+    set_env("ENCORE_SELF_UPDATE_BASE_URL", "file://" + fixture.root.as_str())
+    let managed = Fixture { fixture.root, installed.as_str() }
+    let before = file_sha256(installed.as_str())
+    let check = managed.command(vec!["self", "update", "--check"])
+    if !check.success() || !String::from_str(check.text()).contains("can be updated") || fixture.read("installation with spaces/VERSION") != "0.0.0-neumann\n" { ret fixture.finish(false) }
+    fixture.put("channels/stable.json", replace(metadata, checksum, "0000000000000000000000000000000000000000000000000000000000000000"))
+    let rejected = managed.command(vec!["self", "update"])
+    if rejected.success() || !String::from_str(rejected.text()).contains("Checksum verification failed") || file_sha256(installed.as_str()) != before || fixture.read("installation with spaces/settings.toml") != "channel = \"stable\"\n" { ret fixture.finish(false) }
+    fixture.put("channels/stable.json", metadata)
+    let updated = managed.command(vec!["self", "update"])
+    if !updated.success() || fixture.read("installation with spaces/VERSION") != release + "\n" ||
+        fixture.read("installation with spaces/settings.toml") != "channel = \"stable\"\n" || file_exists(fixture.root.join(".encore-update").as_str()) { ret fixture.finish(false) }
+    let noop = managed.command(vec!["self", "update"])
+    ret fixture.finish(noop.success() && String::from_str(noop.text()).contains("up to date"))
+}

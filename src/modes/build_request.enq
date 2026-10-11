@@ -1,0 +1,355 @@
+//! Private package-worker requests and source-only content identities.
+
+import core::option::Option
+import core::result::Result
+import json::{Json, parse, stringify}
+import std::os::{file_exists, file_sha256, is_directory, read_dir}
+import std::path::Path
+import std::vec::Vec
+import refrain::cache_identity::compiler_content_digest
+import refrain::project::workspace::{ResolvedPackageGraph, WorkspaceRefrain}
+import refrain::project::manifest::ProjectManifest
+import refrain::project::manifest::try_parse_project_manifest
+import refrain::project::failure::ProjectFailure
+import std::os::{mkdir_all, write_file, remove_dir_all}
+import std::time::perf_counter_ns
+import refrain::project::build_graph::{encode_build_graph, decode_build_graph}
+import mod::build_metadata::MetadataContext
+
+/// One already produced dependency; these hashes come from the coordinator's
+/// verified completion record, not from unchecked fields in the cache file.
+pub struct UnitMetadataInput {
+    context: MetadataContext
+    directory: Path
+    metadata_digest: str
+    template_digest: str
+}
+
+/// Same-host IPC. Absolute paths are intentionally not part of nominal ABI.
+pub struct BuildUnitRequest {
+    graph: ResolvedPackageGraph
+    context: MetadataContext
+    inputs: Vec[UnitMetadataInput]
+    output: Path
+}
+
+impl for BuildUnitRequest {
+    /// Serializes manifests once, including dependencies that have no sources
+    /// available in this worker. There are no network requests in this codec.
+    pub fn encode(self: Self) -> Result[str, str] {
+        validate_request(self)?
+        let mut inputs = Vec[Json]::new()
+        for input in self.inputs {
+            let mut fields = Vec[(str, Json)]::new()
+            fields.push(("context", input.context.encode()?))
+            fields.push(("directory", Json::String(input.directory.as_str())))
+            fields.push(("metadata", Json::String(input.metadata_digest)))
+            fields.push(("templates", Json::String(input.template_digest)))
+            inputs.push(Json::Object(fields))
+        }
+        let mut fields = Vec[(str, Json)]::new()
+        fields.push(("schema", Json::Number("1")))
+        fields.push(("graph", Json::String(encode_build_graph(self.graph)?)))
+        fields.push(("context", self.context.encode()?))
+        fields.push(("inputs", Json::Array(inputs)))
+        fields.push(("output", Json::String(self.output.as_str())))
+        ret Result[str, str]::Ok(stringify(Json::Object(fields)))
+    }
+
+    /// Rejects duplicate/missing/unrelated dependencies and inconsistent
+    /// target/compiler/profile/features before installing any declarations.
+    pub fn decode(text: str) -> Result[Self, str] {
+        let data = match parse(text) {
+            Ok(value) => value
+            Err(_) => { ret Result[Self, str]::Err("invalid compilation request JSON") }
+        }
+        if data.get("schema").unwrap_or(Json::Null).as_number().unwrap_or("") != "1" {
+            ret Result[Self, str]::Err("unsupported compilation request schema")
+        }
+        let graph = decode_build_graph(string_field(data, "graph")?)?
+        let context = MetadataContext::decode(data.get("context").unwrap_or(Json::Null))?
+        let mut inputs = Vec[UnitMetadataInput]::new()
+        let records = match data.get("inputs").unwrap_or(Json::Null) {
+            Json::Array(values) => values
+            _ => { ret Result[Self, str]::Err("invalid compilation request dependencies") }
+        }
+        for record in records {
+            inputs.push(UnitMetadataInput {
+                MetadataContext::decode(record.get("context").unwrap_or(Json::Null))?,
+                Path::new(string_field(record, "directory")?), string_field(record, "metadata")?,
+                string_field(record, "templates")?
+            })
+        }
+        let request = Self {graph, context, inputs, Path::new(string_field(data, "output")?)}
+        validate_request(request)?
+        ret Result[Self, str]::Ok(request)
+    }
+}
+
+/// All transitive dependency names, excluding the unit itself. Graph validation
+/// has already rejected cycles and unknown edges; this traversal does no IO.
+pub fn unit_dependencies(graph: ResolvedPackageGraph, unit: str) -> Result[Vec[str], str] {
+    let owner = graph_package(graph, unit)?
+    let mut names = Vec[str]::new()
+    names.extend(owner.dependency_names)
+    let mut index = 0_usize
+    while index < names.len() {
+        let dependency = graph_package(graph, names.get(index).unwrap_or(""))?
+        for name in dependency.dependency_names {
+            if name == unit { ret Result[Vec[str], str]::Err("compilation dependency cycle") }
+            if !contains(names, name) { names.push(name) }
+        }
+        index += 1
+    }
+    ret Result[Vec[str], str]::Ok(names)
+}
+
+/// Locates the immutable manifest snapshot rather than reopening encore.toml.
+pub fn graph_package(graph: ResolvedPackageGraph, unit: str) -> Result[WorkspaceRefrain, str] {
+    for package in graph.refrains {
+        if package.name == unit { ret Result[WorkspaceRefrain, str]::Ok(package) }
+    }
+    ret Result[WorkspaceRefrain, str]::Err("unknown compilation unit: " + unit)
+}
+
+/// Hashes one package's own source files and manifest without lexing them.
+/// Dependency interfaces/templates have separate identities. File names and
+/// hashes are JSON records, so delimiters cannot manufacture a collision.
+pub fn unit_source_digest(package: WorkspaceRefrain) -> Result[str, str] {
+    let sources = source_records(package.root.join("src"), "", 0)?
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(("schema", Json::String("encore-unit-input-1")))
+    fields.push(("unit", Json::String(package.name)))
+    fields.push(("manifest", Json::String(package.manifest.original_source)))
+    fields.push(("sources", Json::Array(sources)))
+    ret Result[str, str]::Ok(compiler_content_digest(stringify(Json::Object(fields))))
+}
+
+fn source_records(root: Path, relative: str, depth: usize) -> Result[Vec[Json], str] {
+    if depth > 128 { ret Result[Vec[Json], str]::Err("source directory nesting exceeds build limit") }
+    let directory = if relative == "" { root } else { root.join(relative) }
+    if !is_directory(directory.as_str()) {
+        ret Result[Vec[Json], str]::Err("missing package source directory: " + directory.as_str())
+    }
+    let mut names = read_dir(directory.as_str())
+    sort(names)
+    let mut records = Vec[Json]::new()
+    for name in names {
+        if name == "." || name == ".." || name == "" { continue }
+        let source = if relative == "" { name } else { relative + "/" + name }
+        let path = root.join(source)
+        if is_directory(path.as_str()) {
+            records.extend(source_records(root, source, depth + 1)?)
+        } elif path.extension().unwrap_or("") == "enq" {
+            let digest = file_sha256(path.as_str())
+            if !file_exists(path.as_str()) || !valid_digest(digest) {
+                ret Result[Vec[Json], str]::Err("unable to hash package source: " + path.as_str())
+            }
+            let mut fields = Vec[(str, Json)]::new()
+            fields.push(("source", Json::String(source)))
+            fields.push(("sha256", Json::String(digest)))
+            records.push(Json::Object(fields))
+        }
+    }
+    ret Result[Vec[Json], str]::Ok(records)
+}
+
+fn validate_request(request: BuildUnitRequest) -> Result[bool, str] {
+    let _graph = encode_build_graph(request.graph)?
+    let _context = request.context.encode()?
+    let owner = graph_package(request.graph, request.context.unit)?
+    if !request.output.is_absolute() || !same_names(owner.enabled_features, request.context.features) {
+        ret Result[bool, str]::Err("invalid compilation output or unit features")
+    }
+    let reachable = unit_dependencies(request.graph, request.context.unit)?
+    let mut seen = Vec[str]::new()
+    for input in request.inputs {
+        let _input_context = input.context.encode()?
+        let package = graph_package(request.graph, input.context.unit)?
+        if !contains(reachable, input.context.unit) || contains(seen, input.context.unit)
+            || !input.directory.is_absolute() || !valid_digest(input.metadata_digest)
+            || !valid_digest(input.template_digest)
+            || input.context.compiler_digest != request.context.compiler_digest
+            || input.context.target != request.context.target || input.context.profile != request.context.profile
+            || !same_names(input.context.features, package.enabled_features) {
+            ret Result[bool, str]::Err("invalid dependency compilation context: " + input.context.unit)
+        }
+        seen.push(input.context.unit)
+    }
+    if seen.len() != reachable.len() { ret Result[bool, str]::Err("missing dependency compilation context") }
+    ret Result[bool, str]::Ok(true)
+}
+
+fn same_names(left: Vec[str], right: Vec[str]) -> bool {
+    if left.len() != right.len() { ret false }
+    for name in left { if !contains(right, name) { ret false } }
+    ret true
+}
+
+fn contains(values: Vec[str], name: str) -> bool {
+    for value in values { if value == name { ret true } }
+    ret false
+}
+
+fn sort(values: mut Vec[str]) -> () {
+    let mut index = 1_usize
+    while index < values.len() {
+        let mut position = index
+        while position > 0 {
+            let right = values.get(position).unwrap_or("")
+            let left = values.get(position - 1).unwrap_or("")
+            if !less(right, left) { break }
+            values.set(position - 1, right)
+            values.set(position, left)
+            position -= 1
+        }
+        index += 1
+    }
+}
+
+fn valid_digest(value: str) -> bool {
+    if value.len() != 64 { ret false }
+    let mut index = 0_usize
+    while index < value.byte_len() {
+        let byte = value.byte_at(index)
+        if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { ret false }
+        index += 1
+    }
+    ret true
+}
+
+fn less(left: str, right: str) -> bool {
+    let mut index = 0_usize
+    while index < left.byte_len() && index < right.byte_len() {
+        if left.byte_at(index) != right.byte_at(index) { ret left.byte_at(index) < right.byte_at(index) }
+        index += 1
+    }
+    ret left.byte_len() < right.byte_len()
+}
+
+fn string_field(data: Json, key: str) -> Result[str, str] {
+    ret match data.get(key).unwrap_or(Json::Null) {
+        Json::String(value) => Result[str, str]::Ok(value)
+        _ => Result[str, str]::Err("missing compilation request string: " + key)
+    }
+}
+
+fn metadata_request_fixture() -> Result[BuildUnitRequest, str] {
+    let root = Path::new("target/request tests").resolve()
+    let source = "[project]\nname = \"consumer\"\nversion = \"0.0.0\"\ndependencies = []\n"
+    let dependency_source = "[project]\nname = \"sample\"\nversion = \"0.0.0\"\ndependencies = []\n"
+    let own_manifest = match try_parse_project_manifest(source, root.join("consumer/encore.toml")) {
+        Ok(value) => value Err(failure) => { ret Result[BuildUnitRequest, str]::Err(failure.message) }
+    }
+    let dependency_manifest = match try_parse_project_manifest(dependency_source, root.join("sample/encore.toml")) {
+        Ok(value) => value Err(failure) => { ret Result[BuildUnitRequest, str]::Err(failure.message) }
+    }
+    let mut dependencies = Vec[str]::new()
+    dependencies.push("sample")
+    let mut packages = Vec[WorkspaceRefrain]::new()
+    packages.push(WorkspaceRefrain{"consumer", root.join("consumer"), root.join("consumer"), "consumer-fixture",
+        true, own_manifest, dependencies, Vec[str]::new()})
+    packages.push(WorkspaceRefrain{"sample", root.join("sample"), root.join("sample"), "dependency-fixture",
+        false, dependency_manifest, Vec[str]::new(), Vec[str]::new()})
+    let digest = compiler_content_digest("fixture")
+    let context = MetadataContext{"consumer", digest, "x86_64-unknown-linux-gnu", "dev", digest, Vec[str]::new()}
+    let dependency_context = MetadataContext{"sample", digest, context.target, context.profile, digest, Vec[str]::new()}
+    let mut inputs = Vec[UnitMetadataInput]::new()
+    inputs.push(UnitMetadataInput{dependency_context, root.join("not-downloaded/sample"), digest, digest})
+    ret Result[BuildUnitRequest, str]::Ok(BuildUnitRequest{ResolvedPackageGraph{"consumer", packages, Vec[str]::new()}, context, inputs, root.join("out")})
+}
+
+#attr(test)
+fn metadata_request_roundtrip_without_dependency_sources() -> bool {
+    let request = match metadata_request_fixture() { Ok(value) => value Err(_) => { ret false } }
+    let text = request.encode().unwrap_or("")
+    let restored = match BuildUnitRequest::decode(text) { Ok(value) => value Err(_) => { ret false } }
+    ret text != "" && restored.encode().unwrap_or("") == text && restored.graph.refrains.len() == 2
+}
+
+#attr(test)
+fn metadata_request_rejects_incomplete_or_duplicate_inputs() -> bool {
+    let mut missing = match metadata_request_fixture() { Ok(value) => value Err(_) => { ret false } }
+    missing.inputs = Vec[UnitMetadataInput]::new()
+    if missing.encode().is_ok() { ret false }
+    let mut duplicate = match metadata_request_fixture() { Ok(value) => value Err(_) => { ret false } }
+    let input = match duplicate.inputs.get(0) { Some(value) => value None => { ret false } }
+    duplicate.inputs.push(input)
+    ret duplicate.encode().is_err()
+}
+
+#attr(test)
+fn metadata_request_rejects_wrong_compiler_target_profile_and_features() -> bool {
+    let original = match metadata_request_fixture() { Ok(value) => value Err(_) => { ret false } }
+    let input = match original.inputs.get(0) { Some(value) => value None => { ret false } }
+    let mut contexts = Vec[MetadataContext]::new()
+    let compiler = MetadataContext{input.context.unit, compiler_content_digest("different"),
+        input.context.target, input.context.profile, input.context.input_digest, Vec[str]::new()}
+    contexts.push(compiler)
+    let target = MetadataContext{input.context.unit, input.context.compiler_digest,
+        "aarch64-apple-darwin", input.context.profile, input.context.input_digest, Vec[str]::new()}
+    contexts.push(target)
+    let profile = MetadataContext{input.context.unit, input.context.compiler_digest,
+        input.context.target, "extreme", input.context.input_digest, Vec[str]::new()}
+    contexts.push(profile)
+    let mut features = Vec[str]::new()
+    features.push("unexpected")
+    contexts.push(MetadataContext{input.context.unit, input.context.compiler_digest,
+        input.context.target, input.context.profile, input.context.input_digest, features})
+    for context in contexts {
+        let mut request = match metadata_request_fixture() { Ok(value) => value Err(_) => { ret false } }
+        let mut inputs = Vec[UnitMetadataInput]::new()
+        inputs.push(UnitMetadataInput{context, input.directory, input.metadata_digest, input.template_digest})
+        request.inputs = inputs
+        if request.encode().is_ok() { ret false }
+    }
+    ret true
+}
+
+#attr(test)
+fn metadata_request_rejects_corrupt_digest_and_relative_output() -> bool {
+    let original = match metadata_request_fixture() { Ok(value) => value Err(_) => { ret false } }
+    let mut request = match metadata_request_fixture() { Ok(value) => value Err(_) => { ret false } }
+    request.output = Path::new("relative")
+    if request.encode().is_ok() { ret false }
+    let input = match original.inputs.get(0) { Some(value) => value None => { ret false } }
+    let mut inputs = Vec[UnitMetadataInput]::new()
+    inputs.push(UnitMetadataInput{input.context, input.directory, "bad", input.template_digest})
+    request = match metadata_request_fixture() { Ok(value) => value Err(_) => { ret false } }
+    request.inputs = inputs
+    ret request.encode().is_err() && BuildUnitRequest::decode("{\"schema\":2}").is_err()
+}
+
+#attr(test)
+fn metadata_request_source_identity_is_owned_content_not_path() -> bool {
+    let request = match metadata_request_fixture() { Ok(value) => value Err(_) => { ret false } }
+    let package = match graph_package(request.graph, "consumer") { Ok(value) => value Err(_) => { ret false } }
+    let root = f"target/request-digest-{perf_counter_ns()}"
+    let directory = Path::new(root).resolve()
+    if mkdir_all(directory.join("first/src").as_str()) != 0 || mkdir_all(directory.join("second/src").as_str()) != 0 { ret false }
+    let left = directory.join("first")
+    let right = directory.join("second")
+    write_file(left.join("src/lib.enq").as_str(), "pub fn value() -> u32 { ret 1 }\n")
+    write_file(right.join("src/lib.enq").as_str(), "pub fn value() -> u32 { ret 1 }\n")
+    let left_package = WorkspaceRefrain{package.name, left, package.distribution_root, package.source_key,
+        package.target_is_binary, package.manifest, package.dependency_names, package.enabled_features}
+    let right_package = WorkspaceRefrain{package.name, right, package.distribution_root, package.source_key,
+        package.target_is_binary, package.manifest, package.dependency_names, package.enabled_features}
+    let before = unit_source_digest(left_package).unwrap_or("")
+    let moved = unit_source_digest(right_package).unwrap_or("")
+    write_file(right.join("src/lib.enq").as_str(), "pub fn value() -> u32 { ret 2 }\n")
+    let edited = unit_source_digest(right_package).unwrap_or("")
+    write_file(right.join("src/extra.enq").as_str(), "")
+    let added = unit_source_digest(right_package).unwrap_or("")
+    remove_dir_all(directory.as_str())
+    ret before != "" && before == moved && edited != moved && added != edited
+}
+
+#attr(test)
+fn metadata_request_lexical_sort_is_deterministic() -> bool {
+    let mut values = Vec[str]::new()
+    values.push("b") values.push("aa") values.push("a") values.push("z")
+    sort(values)
+    ret values.get(0).unwrap_or("") == "a" && values.get(1).unwrap_or("") == "aa"
+        && values.get(2).unwrap_or("") == "b" && values.get(3).unwrap_or("") == "z"
+}

@@ -43,8 +43,9 @@ declaration documentation and editor hover provide additional API detail.
 | `examples` | executable language examples |
 | `docs/enbook-en` | this user guide |
 
-Core, EHIR, backend, and standard-library packages are distributed through the
-official `encore-ecosystem/encore-index` sparse registry.
+Compiler distributions bundle their compatible system libraries. Other index
+dependencies are resolved through the selected registry API; their source
+repositories can remain on GitHub. See [registry setup](packages.md#official-package-index).
 
 ## Requirements
 

@@ -28,7 +28,7 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/select-ci-candidate.py
+        run: bash scripts/select-ci-candidate.sh
 
   resolve-inputs:
     needs: candidate
@@ -89,12 +89,13 @@ jobs:
           version=${release%%-*}
           release_name=${release#*-}
           test "$release" = "$version-$release_name"
-          # Reviewed Neumann 0.1.2 system sources, shared by bootstrap and tests.
+          # Reviewed Neumann 0.1.4 system sources, shared by bootstrap and tests.
           # Keep this immutable: rebuilding a compiler commit must not follow main.
-          sha=63872a4599b566356774dda667eef4a3ad5c06d3
+          sha=f44acd80afe344542f5bbaea12cbee4feaca0a52
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "ENCORE_INDEX_URL=https://raw.githubusercontent.com/encore-ecosystem/encore-index/$sha" >> "$GITHUB_ENV"
+          # Packages come from the verified bundle, never a live registry.
+          echo "ENCORE_INDEX_URL=http://127.0.0.1:9/index" >> "$GITHUB_ENV"
           echo "### System libraries: \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/checkout@v6
@@ -127,201 +128,139 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  target-kits:
-    name: Target kit ${{ matrix.target }}
+  kit-windows-gnu-x86:
     needs: resolve-inputs
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-w64-windows-gnu
-            kind: windows
-          - target: aarch64-w64-windows-gnu
-            kind: windows
-          - target: aarch64-unknown-linux-gnu
-            kind: linux-aarch64
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v8
-        with:
-          name: trusted-dependencies
-          path: target/dependency-download
-      - name: Activate verified target-kit sources
-        shell: bash
-        run: |
-          set -euo pipefail
-          expected=$(awk 'NF {print tolower($1); exit}' target/dependency-download/dependencies.tar.gz.sha256)
-          actual=$(sha256sum target/dependency-download/dependencies.tar.gz | awk '{print $1}')
-          test "$actual" = "$expected"
-          tar -xzf target/dependency-download/dependencies.tar.gz -C target
-          test "$(cat target/dependencies/index-commit)" = "${{ needs.resolve-inputs.outputs.index_sha }}"
-          mv target/dependencies/system-index target/system-index
-      - name: Download verified Linux llvm-mingw
-        shell: bash
-        run: |
-          set -euo pipefail
-          version=20260616
-          archive="llvm-mingw-$version-ucrt-ubuntu-22.04-x86_64.tar.xz"
-          curl -fsSL --retry 2 \
-            "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive" \
-            -o "target/$archive"
-          test "$(sha256sum "target/$archive" | awk '{print $1}')" = \
-            "534b92e067b22a6b4441f48ae9240a3341b17825d04d577eab0cf85c44b4deda"
-          mkdir -p target/llvm-mingw
-          tar -xJf "target/$archive" -C target/llvm-mingw --strip-components=1
-      - name: Assemble Linux AArch64 sysroot
-        if: matrix.kind == 'linux-aarch64'
-        shell: bash
-        run: |
-          set -euo pipefail
-          scripts/build-linux-aarch64-sysroot.sh target/llvm-mingw/sysroot
+    uses: ./.github/workflows/ci-target-kit.yml
+    with:
+      target: x86_64-w64-windows-gnu
+      kind: windows
+      index_sha: ${{ needs.resolve-inputs.outputs.index_sha }}
 
-      - name: Check Windows credential runtime before bootstrapping
-        if: matrix.kind == 'windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          target/llvm-mingw/bin/clang --target="${{ matrix.target }}" \
-            -Wall -Wextra -Werror -c target/system-index/packages/secret-store/runtime.c \
-            -o target/secret-store.obj
-      - name: Build reproducible target kit
-        shell: bash
-        run: |
-          set -euo pipefail
-          release=$(tr -d '\r\n' < VERSION)
-          version=${release%%-*}
-          release_name=${release#*-}
-          test "$release" = "$version-$release_name"
-          args=(
-            --host x86_64-unknown-linux-gnu \
-            --target "${{ matrix.target }}" \
-            --toolchain target/llvm-mingw \
-            --platform target/system-index/packages/platform \
-            --out target/target-kits \
-            --compiler bin/clang \
-            --linker bin/clang \
-            --archiver bin/llvm-ar \
-            --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/v$release"
-          )
-          if [[ "${{ matrix.kind }}" == linux-aarch64 ]]; then
-            args+=(--sysroot sysroot --link-arg "-fuse-ld=lld")
-          fi
-          scripts/build-target-kit.sh "${args[@]}"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: release-candidate-target-kit-${{ matrix.target }}
-          path: target/target-kits
-          if-no-files-found: error
-          retention-days: 30
+  kit-windows-gnu-arm:
+    needs: resolve-inputs
+    uses: ./.github/workflows/ci-target-kit.yml
+    with:
+      target: aarch64-w64-windows-gnu
+      kind: windows
+      index_sha: ${{ needs.resolve-inputs.outputs.index_sha }}
 
-  stage1-linux:
-    name: Stage1 linux
-    needs: [resolve-inputs, target-kits]
+  kit-linux-arm:
+    needs: resolve-inputs
+    uses: ./.github/workflows/ci-target-kit.yml
+    with:
+      target: aarch64-unknown-linux-gnu
+      kind: linux-aarch64
+      index_sha: ${{ needs.resolve-inputs.outputs.index_sha }}
+
+  bridge-windows-gnu-x86:
+    name: Temporary bridge x86_64-w64-windows-gnu
+    needs: [resolve-inputs, kit-windows-gnu-x86]
     uses: ./.github/workflows/ci-stage1.yml
     with:
       runner: ubuntu-latest
-      producer: linux
+      producer: x86_64-w64-windows-gnu
       seed_triple: x86_64-unknown-linux-gnu
       seed_executable: encore
-      targets: x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-w64-windows-gnu aarch64-w64-windows-gnu
+      targets: x86_64-w64-windows-gnu
       seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
       index_sha: ${{ needs.resolve-inputs.outputs.index_sha }}
 
-  stage1-darwin:
-    name: Stage1 darwin
-    needs: resolve-inputs
+  bridge-windows-gnu-arm:
+    name: Temporary bridge aarch64-w64-windows-gnu
+    needs: [resolve-inputs, kit-windows-gnu-arm]
     uses: ./.github/workflows/ci-stage1.yml
     with:
-      runner: macos-15
-      producer: darwin
-      seed_triple: aarch64-apple-darwin
+      runner: ubuntu-latest
+      producer: aarch64-w64-windows-gnu
+      seed_triple: x86_64-unknown-linux-gnu
       seed_executable: encore
-      targets: aarch64-apple-darwin
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-      index_sha: ${{ needs.resolve-inputs.outputs.index_sha }}
-
-  stage1-windows:
-    name: Stage1 windows
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-stage1.yml
-    with:
-      runner: windows-latest
-      producer: windows
-      seed_triple: x86_64-pc-windows-msvc
-      seed_executable: encore.exe
-      targets: x86_64-pc-windows-msvc
+      targets: aarch64-w64-windows-gnu
       seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
       index_sha: ${{ needs.resolve-inputs.outputs.index_sha }}
 
   verify-linux-x86:
     name: Verify x86_64-unknown-linux-gnu
-    needs: [resolve-inputs, stage1-linux]
+    needs: resolve-inputs
     uses: ./.github/workflows/ci-native.yml
     with:
       runner: ubuntu-latest
       triple: x86_64-unknown-linux-gnu
       executable: encore
-      producer: linux
       seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
       index_sha: ${{ needs.resolve-inputs.outputs.index_sha }}
 
   verify-linux-arm:
     name: Verify aarch64-unknown-linux-gnu
-    needs: [resolve-inputs, stage1-linux]
+    needs: resolve-inputs
     uses: ./.github/workflows/ci-native.yml
     with:
       runner: ubuntu-24.04-arm
       triple: aarch64-unknown-linux-gnu
       executable: encore
-      producer: linux
       seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
       index_sha: ${{ needs.resolve-inputs.outputs.index_sha }}
 
   verify-macos-arm:
     name: Verify aarch64-apple-darwin
-    needs: [resolve-inputs, stage1-darwin]
+    needs: resolve-inputs
     uses: ./.github/workflows/ci-native.yml
     with:
       runner: macos-15
       triple: aarch64-apple-darwin
       executable: encore
-      producer: darwin
       seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
       index_sha: ${{ needs.resolve-inputs.outputs.index_sha }}
 
   verify-windows-msvc-x86:
     name: Verify x86_64-pc-windows-msvc
-    needs: [resolve-inputs, stage1-windows]
+    needs: resolve-inputs
     uses: ./.github/workflows/ci-native.yml
     with:
       runner: windows-latest
       triple: x86_64-pc-windows-msvc
       executable: encore.exe
-      producer: windows
       seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
       index_sha: ${{ needs.resolve-inputs.outputs.index_sha }}
 
   verify-windows-gnu-x86:
     name: Verify x86_64-w64-windows-gnu
-    needs: [resolve-inputs, stage1-linux]
+    needs: [resolve-inputs, bridge-windows-gnu-x86]
     uses: ./.github/workflows/ci-native.yml
     with:
       runner: windows-latest
       triple: x86_64-w64-windows-gnu
       executable: encore.exe
-      producer: linux
+      producer: x86_64-w64-windows-gnu
       seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
       index_sha: ${{ needs.resolve-inputs.outputs.index_sha }}
 
   verify-windows-gnu-arm:
     name: Verify aarch64-w64-windows-gnu
-    needs: [resolve-inputs, stage1-linux]
+    needs: [resolve-inputs, bridge-windows-gnu-arm]
     uses: ./.github/workflows/ci-native.yml
     with:
       runner: windows-11-arm
       triple: aarch64-w64-windows-gnu
       executable: encore.exe
-      producer: linux
+      producer: aarch64-w64-windows-gnu
       seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
       index_sha: ${{ needs.resolve-inputs.outputs.index_sha }}
+
+  complete:
+    name: CI complete
+    if: always()
+    needs: [candidate, resolve-inputs, kit-windows-gnu-x86, kit-windows-gnu-arm, kit-linux-arm, verify-linux-x86, verify-linux-arm, verify-macos-arm, verify-windows-msvc-x86, verify-windows-gnu-x86, verify-windows-gnu-arm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a complete verified candidate
+        env:
+          REUSED: ${{ needs.candidate.outputs.reused }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          if test "$REUSED" = true; then
+            jq -e '.candidate.result == "success" and
+              (to_entries | all(.[]; .value.result == "success" or .value.result == "skipped"))' <<<"$RESULTS"
+          else
+            jq -e 'all(.[]; .result == "success")' <<<"$RESULTS"
+          fi
