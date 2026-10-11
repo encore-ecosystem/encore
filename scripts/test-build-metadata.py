@@ -53,7 +53,7 @@ def main():
             raise AssertionError(result.stdout + result.stderr + "\n" + details + "\nEvidence: " + str(evidence))
         print(result.stdout + result.stderr, end="", flush=True)
         report = json.loads((root / "report.json").read_text(encoding="utf-8"))
-        assert report["summary"]["passed"] == 82 and report["summary"]["failed"] == 0, report
+        assert report["summary"]["passed"] == 84 and report["summary"]["failed"] == 0, report
         indexed = subprocess.run(
             [str(compiler), "test", "--filter", "index_matches_reverse_scan_contract",
              "--jobs", "2", "--report", "index-report.json"], cwd=root,

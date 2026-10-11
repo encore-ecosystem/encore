@@ -1,4 +1,7 @@
 #ifndef _WIN32
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "../../runtime/build_artifact.h"

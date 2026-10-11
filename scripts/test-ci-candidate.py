@@ -202,6 +202,41 @@ class CandidateTests(unittest.TestCase):
             self.assertNotIn("lsp/tests/", text, workflow.name)
             self.assertNotIn("Verify packaged language server", text, workflow.name)
 
+    def test_archiver_is_prepared_in_every_build_job(self):
+        root = Path(__file__).resolve().parents[1] / ".github/workflows"
+        for workflow in ("ci-stage1.yml", "ci-native.yml"):
+            for name, block in workflow_jobs(root / workflow).items():
+                with self.subTest(workflow=workflow, job=name):
+                    self.assertIn("run: bash scripts/ci-prepare-toolchain.sh", block)
+                    build = next(marker for marker in (
+                        "- name: Build producer once", "- name: Verify byte-identical",
+                        "- name: Run deterministic offline") if marker in block)
+                    self.assertLess(block.index("run: bash scripts/ci-prepare-toolchain.sh"), block.index(build))
+                    if name != "tests":
+                        self.assertIn('"$compiler" -std=c11 -Wall -Wextra -Werror -fsyntax-only runtime.c', block)
+                        self.assertLess(block.index("-fsyntax-only runtime.c"), block.index(build))
+
+    @unittest.skipIf(os.name == "nt", "POSIX toolchain script")
+    def test_archiver_override_is_verified_and_preserved(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(prefix="encore-toolchain-") as directory:
+            scratch = Path(directory)
+            archiver = scratch / "explicit archiver"
+            archiver.write_text('#!/bin/sh\n[ "$1" = --version ] || exit 2\necho fixture-llvm-ar\n')
+            archiver.chmod(0o755)
+            output = scratch / "github-env"
+            environment = {**os.environ, "ENCORE_AR": str(archiver), "GITHUB_ENV": str(output)}
+            result = subprocess.run(["bash", str(root / "scripts/ci-prepare-toolchain.sh")],
+                                    env=environment, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("fixture-llvm-ar", result.stdout)
+            self.assertEqual(output.read_text(), f"ENCORE_AR={archiver}\n")
+            environment["ENCORE_AR"] = str(scratch / "missing archiver")
+            result = subprocess.run(["bash", str(root / "scripts/ci-prepare-toolchain.sh")],
+                                    env=environment, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(output.read_text(), f"ENCORE_AR={archiver}\n")
+
     @unittest.skipIf(os.name == "nt", "POSIX installer")
     def test_installer_rejects_intel_macos_before_downloading(self):
         root = Path(__file__).resolve().parents[1]

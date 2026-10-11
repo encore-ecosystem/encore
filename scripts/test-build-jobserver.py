@@ -51,6 +51,8 @@ def main():
         root = Path(directory)
         library_path = root / ("probe.dll" if os.name == "nt" else "probe.so")
         native_flags = [] if os.name == "nt" else ["-pthread", "-fPIC", "-D_POSIX_C_SOURCE=200809L"]
+        if sys.platform == "darwin":
+            native_flags.append("-D_DARWIN_C_SOURCE")
         subprocess.run([
             os.environ.get("CC", "clang"), "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
             "-shared", *native_flags, str(repository / "tests/native/build_jobserver.c"),
