@@ -1,6 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+[[ $# -le 1 ]] || { echo 'usage: ci-prepare-toolchain.sh [TARGET_TRIPLE]' >&2; exit 2; }
+triple=${1:-}
+if [[ "$triple" == *-w64-windows-gnu ]]; then
+  version=20260616
+  case "$triple" in
+    x86_64-w64-windows-gnu)
+      arch=x86_64
+      checksum=b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35
+      ;;
+    aarch64-w64-windows-gnu)
+      arch=aarch64
+      checksum=312593669435bd0bfc1a43ac3fba23c8b27e0610bade88b2738e5a01702a99ba
+      ;;
+    *) echo "Unsupported Windows GNU target: $triple" >&2; exit 2 ;;
+  esac
+  archive="llvm-mingw-$version-ucrt-$arch.zip"
+  curl -fsSL --retry 2 \
+    "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive" \
+    -o "target/$archive"
+  test "$(sha256sum "target/$archive" | awk '{print $1}')" = "$checksum"
+  mkdir -p target/llvm-mingw-host
+  unzip -q "target/$archive" -d target/llvm-mingw-host
+  root=$(find target/llvm-mingw-host -mindepth 1 -maxdepth 1 -type d | head -n 1)
+  test -x "$root/bin/clang.exe"
+  export ENCORE_CC="$PWD/$root/bin/clang.exe"
+  printf 'ENCORE_CC=%s\n' "$ENCORE_CC" >> "${GITHUB_ENV:?GITHUB_ENV is required}"
+  export ENCORE_LINKER="$PWD/$root/bin/clang.exe"
+  printf 'ENCORE_LINKER=%s\n' "$ENCORE_LINKER" >> "$GITHUB_ENV"
+  export ENCORE_AR="$PWD/$root/bin/llvm-ar.exe"
+fi
+
 # Package archives require LLVM's archiver even when the seed used only Clang.
 # Validate it before spending time on bootstrap or convergence. Do not replace
 # an explicitly selected cross toolchain with the host's tools.
