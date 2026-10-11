@@ -21,6 +21,7 @@
 #include "runtime/build_artifact.h"
 #include "runtime/build_resources.h"
 #include "runtime/build_identity.h"
+#include "runtime/build_target.h"
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif

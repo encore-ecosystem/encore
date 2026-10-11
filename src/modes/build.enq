@@ -3067,6 +3067,10 @@ pub fn target_profile_dir(root: Path, target: TargetSpec, profile: str) -> Path 
 
 fn compiler_args(profile: str, target: TargetSpec, toolchain: Toolchain) -> Vec[str] {
     let mut args = target_tool_args(target, toolchain)
+    // Clang records a compilation directory even in ThinLTO's NoDebug
+    // compile units. A PID-scoped staging cwd changes module hashes, promoted
+    // local symbol names and PE build IDs across otherwise identical links.
+    args.push("-fdebug-compilation-dir=.")
     if target.os == "macos" {
         args.push("-fblocks")
     }
@@ -3111,8 +3115,16 @@ fn append_profile_link_args(args: mut Vec[str], profile: str, target: TargetSpec
         args.push("-flto=thin")
         if target.os == "linux" {
             args.push("-Wl,--mllvm=-align-loops=32")
-        } elif target.os == "windows" {
+        }
+    }
+    // Rebuilding cached objects must not change a PE image just because the
+    // linker embeds today's timestamp. This applies to dev/debug as well as
+    // release/extreme, and each Windows linker flavor has its own spelling.
+    if target.os == "windows" {
+        if target.environment == "msvc" {
             args.push("-Wl,/Brepro")
+        } else {
+            args.push("-Wl,--no-insert-timestamp")
         }
     }
     // lld is substantially faster than the system GNU linker for the many
@@ -3176,9 +3188,9 @@ fn configured_runtime_path(name: str) -> str {
 
 fn target_tool_args(target: TargetSpec, toolchain: Toolchain) -> Vec[str] {
     let mut args = Vec[str]::new()
-    if !target_is_host(target) {
-        args.push("--target=" + target.triple)
-    }
+    // Clang's configured default need not match Encore's host ABI. LLVM IR,
+    // native sources, dependency scans and linking must use one exact target.
+    args.push("--target=" + target.triple)
     if toolchain.sysroot != "" {
         args.push("--sysroot=" + native_path(toolchain.sysroot))
     }
@@ -3190,6 +3202,66 @@ fn target_tool_args(target: TargetSpec, toolchain: Toolchain) -> Vec[str] {
         args.push("-ffreestanding")
     }
     ret args
+}
+
+#attr(test)
+fn native_explicit_target_contract() -> bool {
+    let host = host_target()
+    let host_args = target_tool_args(host, default_toolchain(host))
+    let gnu = parse_target("x86_64-w64-windows-gnu")
+    let gnu_args = target_tool_args(gnu, default_toolchain(gnu))
+    let mut stable_directory = false
+    for argument in compiler_args("extreme", host, default_toolchain(host)) {
+        if argument == "-fdebug-compilation-dir=." {
+            stable_directory = true
+        }
+    }
+    ret host_args.get(0).unwrap_or("") == "--target=" + host.triple
+    && gnu_args.get(0).unwrap_or("") == "--target=x86_64-w64-windows-gnu"
+    && stable_directory
+}
+
+#attr(test)
+fn native_windows_reproducible_link_contract() -> bool {
+    let mut profiles = Vec[str]::new()
+    profiles.push("dev")
+    profiles.push("debug")
+    profiles.push("release")
+    profiles.push("extreme")
+    let mut triples = Vec[str]::new()
+    triples.push("x86_64-pc-windows-msvc")
+    triples.push("x86_64-w64-windows-gnu")
+    triples.push("aarch64-w64-windows-gnu")
+    for profile in profiles {
+        for triple in triples {
+            let target = parse_target(triple)
+            let mut args = Vec[str]::new()
+            append_profile_link_args(args, profile, target)
+            let expected = if target.environment == "msvc" {
+                "-Wl,/Brepro"
+            } else {
+                "-Wl,--no-insert-timestamp"
+            }
+            let wrong = if target.environment == "msvc" {
+                "-Wl,--no-insert-timestamp"
+            } else {
+                "-Wl,/Brepro"
+            }
+            let mut found = false
+            for argument in args {
+                if argument == wrong {
+                    ret false
+                }
+                if argument == expected {
+                    found = true
+                }
+            }
+            if !found {
+                ret false
+            }
+        }
+    }
+    ret true
 }
 
 fn append_target_features(args: mut Vec[str], features: str) ->() {
