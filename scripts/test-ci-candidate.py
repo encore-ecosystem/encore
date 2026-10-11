@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -143,6 +144,33 @@ class CandidateTests(unittest.TestCase):
         for producer in ("darwin", "windows"):
             self.assertEqual(job_needs(jobs["stage1-" + producer]), {"resolve-inputs"})
         self.assertEqual(job_needs(jobs["stage1-linux"]), {"resolve-inputs", "target-kits"})
+
+    @unittest.skipIf(os.name == "nt", "POSIX release workflow")
+    def test_channel_metadata_counts_actual_assets(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github/workflows/release.yml").read_text()
+        match = re.search(r'^          jq -n --arg channel .*?^          \' > dist/channel.json$',
+                          workflow, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match, "channel metadata must use structured JSON generation")
+        script = textwrap.dedent(match[0])
+        for count in (1, len(candidate.TARGETS), 7):
+            assets = [{"triple": "target-" + str(index), "url": 'https://example.com/a"b',
+                       "sha256": "a" * 64, "format": "tar.gz"} for index in range(count)]
+            environment = {**os.environ, "CHANNEL": "stable", "version": "0.1.2",
+                           "release_name": "neumann", "release": "0.1.2-neumann",
+                           "GITHUB_REF_NAME": "v0.1.2-neumann", "GITHUB_SHA": "b" * 40,
+                           "assets": json.dumps(assets)[1:-1]}
+            with self.subTest(count=count), tempfile.TemporaryDirectory(prefix="encore-channel-") as directory:
+                scratch = Path(directory)
+                (scratch / "dist").mkdir()
+                subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=scratch,
+                               env=environment, check=True, capture_output=True, text=True, timeout=10)
+                manifest = json.loads((scratch / "dist/channel.json").read_text())
+                self.assertEqual(manifest["verification"], {"converged": True, "targets": count})
+                self.assertEqual(manifest["assets"], assets)
+                self.assertEqual(manifest["release"], "0.1.2-neumann")
+                self.assertEqual(manifest["tag"], "v0.1.2-neumann")
+                self.assertEqual(manifest["schema"], 2)
 
     def test_tests_wait_only_for_their_own_convergence(self):
         root = Path(__file__).resolve().parents[1] / ".github/workflows"
