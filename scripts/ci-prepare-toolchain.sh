@@ -29,5 +29,8 @@ if [[ -z "$archiver" ]]; then
     esac
   fi
 fi
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) archiver=$(cygpath -m "$archiver") ;;
+esac
 "$archiver" --version
 printf 'ENCORE_AR=%s\n' "$archiver" >> "${GITHUB_ENV:?GITHUB_ENV is required}"
