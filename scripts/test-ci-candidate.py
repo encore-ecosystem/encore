@@ -216,6 +216,17 @@ class CandidateTests(unittest.TestCase):
                         self.assertIn('"$compiler" -std=c11 -Wall -Wextra -Werror -fsyntax-only runtime.c', block)
                         self.assertLess(block.index("-fsyntax-only runtime.c"), block.index(build))
 
+    def test_tool_isolation_is_checked_before_expensive_target_builds(self):
+        root = Path(__file__).resolve().parents[1]
+        producer = (root / "scripts/ci-produce-stage1.sh").read_text()
+        self.assertIn('python3 scripts/test-build-tool-isolation.py "$builder"', producer)
+        self.assertLess(producer.index('python3 scripts/test-build-tool-isolation.py'),
+                        producer.index('for target in'))
+        native = workflow_jobs(root / ".github/workflows/ci-native.yml")["converge"]
+        self.assertIn('run: python3 scripts/test-build-tool-isolation.py "$STAGE1_COMPILER"', native)
+        self.assertLess(native.index('scripts/test-build-tool-isolation.py'),
+                        native.index('- name: Verify byte-identical'))
+
     @unittest.skipIf(os.name == "nt", "POSIX toolchain script")
     def test_archiver_override_is_verified_and_preserved(self):
         root = Path(__file__).resolve().parents[1]

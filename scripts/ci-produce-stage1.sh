@@ -40,6 +40,7 @@ fi
 cp "target/extreme/$executable" "target/stage1-builder/$executable"
 builder="$PWD/target/stage1-builder/$executable"
 chmod +x "$builder" 2>/dev/null || true
+python3 scripts/test-build-tool-isolation.py "$builder"
 
 # Every build of the current compiler uses the same immutable library graph.
 # The optional old-source seed backport above has its own recorded graph.
