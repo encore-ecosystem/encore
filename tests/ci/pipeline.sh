@@ -6,6 +6,56 @@ scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 cd "$scratch"
 case "$CI_PROBE_CASE" in
+  restore-context)
+    awk '/^      run: \|$/ { body=1; next } body { sub(/^        /, ""); print }' \
+      "$repository/.github/actions/stage3-context/action.yml" > restore.sh
+    test -s restore.sh
+    export CI_TARGET=x86_64-unknown-linux-gnu CI_EXECUTABLE=encore
+    export CI_SEED_TAG=v0.1.1-neumann CI_INDEX_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    for scenario in empty populated corrupt missing-sources; do
+      workspace="$scratch/$scenario/encore"
+      context="$workspace/target/test-context"
+      mkdir -p "$context/bin" "$context/system-index/packages/core"
+      cp "$repository/VERSION" "$workspace/VERSION"
+      cp "$repository/tests/ci/mock-compiler.sh" "$context/bin/encore"
+      cp "$repository/../encore-index/packages/core/encore.toml" "$context/system-index/packages/core/"
+      digest=$(sha256sum "$context/bin/encore" | awk '{print $1}')
+      release=$(tr -d '\r\n' < "$workspace/VERSION")
+      jq -n --arg commit "$GITHUB_SHA" --arg release "$release" \
+        --arg target "$CI_TARGET" --arg seed "$CI_SEED_TAG" --arg index "$CI_INDEX_SHA" \
+        --arg digest "$digest" \
+        '{schema:2, commit:$commit, release:$release, target:$target, seed:$seed,
+          index_commit:$index, converged:true, stage2_sha256:$digest,
+          stage3_sha256:$digest, compiler_sha256:$digest, dependencies_sha256:$digest}' \
+        > "$context/provenance.json"
+      export GITHUB_ENV="$workspace/environment"
+      case "$scenario" in
+        populated)
+          mkdir -p "$context/registry/packages"
+          printf 'cached package\n' > "$context/registry/packages/fixture"
+          ;;
+        corrupt) printf 'corrupted\n' >> "$context/bin/encore" ;;
+        missing-sources) mv "$context/system-index" "$workspace/removed-sources" ;;
+      esac
+      if [[ "$scenario" == corrupt || "$scenario" == missing-sources ]]; then
+        if (cd "$workspace" && bash "$scratch/restore.sh"); then exit 1; fi
+        test ! -e "$GITHUB_ENV"
+      else
+        (cd "$workspace" && bash "$scratch/restore.sh")
+        cmp "$context/bin/encore" "$workspace/target/stage3/encore"
+        test -x "$workspace/target/stage3/encore"
+        test -d "$workspace/target/registry"
+        cmp "$context/system-index/packages/core/encore.toml" "$workspace/../encore-index/packages/core/encore.toml"
+        grep -qx 'ENCORE_INDEX_URL=http://127.0.0.1:9/index' "$GITHUB_ENV"
+        if [[ "$scenario" == populated ]]; then
+          cmp "$context/registry/packages/fixture" "$workspace/target/registry/packages/fixture"
+        else
+          test -z "$(ls -A "$workspace/target/registry")"
+        fi
+      fi
+    done
+    ;;
   bridge-x86|bridge-arm)
     mkdir -p encore/target/dependency-download encore-index/packages/core seed
     cp "$repository/tests/ci/mock-compiler.sh" seed/encore
