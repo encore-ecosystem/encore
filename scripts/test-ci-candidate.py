@@ -191,6 +191,17 @@ class CandidateTests(unittest.TestCase):
             self.assertNotIn("matrix.", text)
             self.assertNotIn("needs.resolve-inputs", text)
 
+    def test_lsp_is_packaged_without_running_its_suite(self):
+        root = Path(__file__).resolve().parents[1] / ".github/workflows"
+        native = (root / "ci-native.yml").read_text()
+        self.assertIn("name: Build matching Encore language server", native)
+        self.assertIn('cp "target/stage3/$lsp_executable" "$root/bin/$lsp_executable"', native)
+        self.assertIn("lsp_sha256", native)
+        for workflow in root.glob("*.yml"):
+            text = workflow.read_text()
+            self.assertNotIn("lsp/tests/", text, workflow.name)
+            self.assertNotIn("Verify packaged language server", text, workflow.name)
+
     @unittest.skipIf(os.name == "nt", "POSIX installer")
     def test_installer_rejects_intel_macos_before_downloading(self):
         root = Path(__file__).resolve().parents[1]

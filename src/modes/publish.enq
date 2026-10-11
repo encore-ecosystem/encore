@@ -1,92 +1,31 @@
-//! Implements reproducible, reviewed package publication.
+//! Publishes immutable packages through the selected registry API.
 
 import argparse::{process_arg_count, process_arg}
 import core::fmt::Debug
 import core::option::Option
 import core::result::Result
 import core::vec::Vec
-import json::{Json, ParseError, field, parse, stringify}
+import json::{Json, parse, stringify}
 import std::io::{eprintln, println}
-import std::os::{env, file_exists, file_sha256, mkdir_all, read_file, remove_dir_all, remove_file, write_file,}
+import std::os::{file_exists, file_sha256, mkdir_all, read_file, remove_dir_all, remove_file, write_file}
 import std::path::Path
 import std::process::{run_args, run_args_capture}
-
 import mod::registry_auth::{registry_credential, registry_http, registry_origin}
-import refrain::project::manifest::{ProjectManifest, project_manifest_compiler_requirement, project_manifest_dependencies, project_manifest_name, project_manifest_publish_exclude, project_manifest_publish_include, project_manifest_repository, project_manifest_source_with_dependencies, project_manifest_version, read_project_manifest,}
+import refrain::project::manifest::{ProjectManifest, project_manifest_compiler_requirement, project_manifest_dependencies, project_manifest_name, project_manifest_publish_exclude, project_manifest_publish_include, project_manifest_source_with_dependencies, project_manifest_version, read_project_manifest}
 import refrain::project::registry_index_url
-import refrain::project::{dependency_base_reference, registry_version_matches, registry_version_requirement_valid,}
-import refrain::version::{compiler_registry_epoch, compiler_release_name, compiler_version}
+import refrain::project::registry_service::registry_service_config
+import refrain::project::{dependency_base_reference, registry_version_matches, registry_version_requirement_valid}
+import refrain::version::{compiler_release_name, compiler_version}
 
-struct PublishContext {
-    package_root: Path
-    repository_root: Path
-    repository_slug: str
-    source_subdir: str
-    source_commit: str
-    package_name: str
-    version: str
-    release_name: str
-    release: str
-    compiler_requirement: str
-    tag: str
-    archive: Path
-    checksum: str
-    metadata: str
-}
-
-/// Validates, packages, and optionally publishes the current package.
 pub fn native_publish() -> u32 {
-    let selected_index = registry_index_url(Path::new(".").resolve())
-    if selected_index == "" {
-        ret 1_u32
-    }
-    if selected_index != "https://raw.githubusercontent.com/encore-ecosystem/encore-index/refs/heads/main" {
-        ret publish_to_registry(selected_index)
-    }
-    let dry_run = has_switch("--dry-run")
-    let release_only = has_switch("--release-only")
-    let release_name = option_value("--release-name", compiler_release_name())
-    let package_root = Path::new(".").resolve()
-    let manifest = read_project_manifest(package_root)
-    let prepared = prepare_publish(package_root, manifest, release_name)
-    if prepared.package_name == "" {
-        ret 1_u32
-    }
-
-    println("Package:    " + prepared.package_name + " " + prepared.release)
-    println("Repository: " + prepared.repository_slug)
-    println("Commit:     " + prepared.source_commit)
-    println("Tag:        " + prepared.tag)
-    println("Archive:    " + prepared.archive.as_str())
-    println("SHA-256:    " + prepared.checksum)
-    println("Metadata:   " + prepared.metadata)
-    if dry_run {
-        println("Dry run complete; no tag, release, or index pull request was created.")
-        ret 0_u32
-    }
-
-    if !github_ready(prepared) {
-        ret 1_u32
-    }
-    if !create_package_release(prepared) {
-        ret 1_u32
-    }
-    if release_only {
-        println("Package release published; index metadata was not changed.")
-        ret 0_u32
-    }
-    if !open_index_pull_request(prepared) {
-        ret 1_u32
-    }
-    println("Publication submitted for review.")
-    ret 0_u32
+    ret publish_to_registry(registry_index_url(Path::new(".").resolve()))
 }
 
 // Custom services use the same immutable archive format, without a GitHub
 // account, remote, release, or index pull request. Only tracked files are sent.
 fn publish_to_registry(index: str) -> u32 {
-    if has_switch("--release-only") {
-        publish_error("--release-only is only for the legacy GitHub index") ret 1_u32
+    if index == "" && !has_switch("--dry-run") {
+        publish_error("No registry configured; set ENCORE_DEFAULT_INDEX or [registry].index") ret 1_u32
     }
     let root = Path::new(".").resolve()
     let manifest = read_project_manifest(root)
@@ -97,6 +36,9 @@ fn publish_to_registry(index: str) -> u32 {
     || project_manifest_compiler_requirement(manifest) == ""
     || !registry_version_requirement_valid(project_manifest_compiler_requirement(manifest)) {
         publish_error("invalid package name, version, encore requirement or release name") ret 1_u32
+    }
+    if !registry_version_matches(compiler_version(), project_manifest_compiler_requirement(manifest)) {
+        publish_error("compiler does not satisfy the package's encore requirement") ret 1_u32
     }
     let work = root.join("target").join("publish")
     mkdir_all(work.as_str())
@@ -153,12 +95,9 @@ fn publish_to_registry(index: str) -> u32 {
             ret registry_publish_failure(error)
         }
     }
-    let discovery = registry_request("GET", index + "/config.json", "", "")
-    let config = match parse(discovery) {
-        Result::Ok(value) => value Result::Err(_) => Json::Null
-    }
-    if config.is_null() {
-        publish_error("registry discovery failed; no GitHub fallback") ret 1_u32
+    let config = match registry_service_config(index) {
+        Result::Ok(value) => value
+        Result::Err(error) => { ret registry_publish_failure(error) }
     }
     if json_string(config, "api") != "/api/v1" || stringify(config.get("schema").unwrap_or(Json::Null)) != "1"
     || stringify(config.get("chunk_size").unwrap_or(Json::Null)) != "65536" {
@@ -243,183 +182,6 @@ fn valid_registry_package_name(value: str) -> bool {
         i += 1_usize
     }
     ret true
-}
-
-fn prepare_publish(package_root: Path, manifest: ProjectManifest, release_name: str) -> PublishContext {
-    let empty = empty_context(package_root)
-    let name = project_manifest_name(manifest)
-    let version = project_manifest_version(manifest)
-    let repository = project_manifest_repository(manifest)
-    let compiler_requirement = project_manifest_compiler_requirement(manifest)
-    if name == "" || version == "" {
-        publish_error("manifest requires package name and version") ret empty
-    }
-    if !registry_version_matches(version, version) {
-        publish_error("package version must be valid SemVer: " + version) ret empty
-    }
-    if !valid_release_name(release_name) {
-        publish_error("release name must contain lowercase letters, digits, and hyphens") ret empty
-    }
-    let release = version + "-" + release_name
-    if repository_slug(repository) == "" {
-        publish_error("[project].repository must be a public GitHub repository URL")
-        ret empty
-    }
-    if compiler_requirement == "" || !registry_version_requirement_valid(compiler_requirement) {
-        publish_error("[project].encore must be a valid non-empty compiler SemVer requirement")
-        ret empty
-    }
-    if !registry_version_matches(compiler_version(), compiler_requirement) {
-        publish_error("compiler " + compiler_version() + " does not satisfy package requirement " + compiler_requirement)
-        ret empty
-    }
-    let mut published_dependencies = Vec[str]::new()
-    let mut rewrite_dependencies = false
-    for dependency in project_manifest_dependencies(manifest) {
-        let base = dependency_base_reference(dependency)
-        if starts_with(base, "path@") {
-            let dependency_root = package_root.join(base.slice(5_usize, base.len() - 5_usize)).resolve()
-            let dependency_manifest = read_project_manifest(dependency_root)
-            let dependency_name = project_manifest_name(dependency_manifest)
-            let dependency_version = project_manifest_version(dependency_manifest)
-            if dependency_name == "" || dependency_version == "" || !registry_version_matches(dependency_version, dependency_version) {
-                publish_error("path dependency has no publishable package identity: " + dependency)
-                ret empty
-            }
-            let suffix = dependency.slice(base.len(), dependency.len() - base.len())
-            published_dependencies.push("index@" + dependency_name + "@" + dependency_version + suffix)
-            rewrite_dependencies = true
-        } else {
-            published_dependencies.push(dependency)
-        }
-    }
-
-    let work = package_root.join("target").join("publish")
-    mkdir_all(work.as_str())
-    let repository_root_text = capture(
-        work,
-        "repository-root.txt",
-        "git",
-        args4("-C", package_root.as_str(), "rev-parse", "--show-toplevel"),
-    )
-    if repository_root_text == "" {
-        publish_error("package is not inside a Git repository") ret empty
-    }
-    let repository_root = Path::new(first_line(repository_root_text)).resolve()
-    let source_subdir = relative_path(repository_root, package_root)
-    let target_path = if source_subdir == "" {
-        "target"
-    } else {
-        source_subdir + "/target"
-    }
-    let mut status_args = Vec[str]::new()
-    status_args.push("-C")
-    status_args.push(repository_root.as_str())
-    status_args.push("status")
-    status_args.push("--porcelain")
-    status_args.push("--")
-    status_args.push(".")
-    status_args.push(":(exclude)" + target_path)
-    let status = capture(
-        work,
-        "status.txt",
-        "git",
-        status_args,
-    )
-    if status != "" {
-        publish_error("Git worktree must be clean before publication") ret empty
-    }
-    let commit = first_line(capture(
-            work,
-            "commit.txt",
-            "git",
-            args4("-C", repository_root.as_str(), "rev-parse", "HEAD"),
-        ))
-    let upstream = first_line(capture(
-            work,
-            "upstream.txt",
-            "git",
-            args4("-C", repository_root.as_str(), "rev-parse", "@{upstream}"),
-        ))
-    if commit == "" || upstream == "" || commit != upstream {
-        publish_error("HEAD must be pushed and equal to its upstream branch")
-        ret empty
-    }
-    let remote = first_line(capture(
-            work,
-            "remote.txt",
-            "git",
-            args5("-C", repository_root.as_str(), "remote", "get-url", "origin"),
-        ))
-    let slug = repository_slug(repository)
-    if repository_slug(remote) != slug {
-        publish_error("manifest repository '" + slug + "' does not match Git origin '" + repository_slug(remote) + "'")
-        ret empty
-    }
-    if !verify_package(package_root, repository_root) {
-        ret empty
-    }
-
-    let files = publish_files(repository_root, source_subdir, manifest, work)
-    if !contains_file(files, "encore.toml") || !contains_source_file(files) {
-        publish_error("archive must contain encore.toml and at least one tracked src/*.enq file")
-        ret empty
-    }
-    let archive = work.join(name + "-" + version + ".tar.gz")
-    remove_file(archive.as_str())
-    let tree = if source_subdir == "" {
-        "HEAD"
-    } else {
-        "HEAD:" + source_subdir
-    }
-    let mut archive_args = Vec[str]::new()
-    archive_args.push("-C")
-    archive_args.push(repository_root.as_str())
-    archive_args.push("archive")
-    archive_args.push("--format=tar.gz")
-    archive_args.push("--output=" + archive.as_str())
-    archive_args.push(tree)
-    for file in files {
-        archive_args.push(file)
-    }
-    if run_args("git", archive_args) != 0_i32 || !file_exists(archive.as_str()) {
-        publish_error("unable to create package archive")
-        ret empty
-    }
-    // Validate before staging: extraction must never follow repository links.
-    if !verify_archive(work, archive) {
-        ret empty
-    }
-    // Git archives of subtree objects use the current time. Normalize every
-    // archive, including packages that need no dependency rewriting.
-    if !normalize_publish_archive(work, archive, manifest, published_dependencies, rewrite_dependencies) {
-        ret empty
-    }
-    if !verify_archive(work, archive) {
-        ret empty
-    }
-    let checksum = file_sha256(archive.as_str())
-    if checksum.len() != 64_usize {
-        publish_error("unable to hash package archive") ret empty
-    }
-    let tag = name + "-v" + release
-    let metadata = publish_metadata(name, version, release_name, slug, source_subdir, commit, compiler_requirement, archive, checksum, tag)
-    ret PublishContext {
-        package_root,
-        repository_root,
-        slug,
-        source_subdir,
-        commit,
-        name,
-        version,
-        release_name,
-        release,
-        compiler_requirement,
-        tag,
-        archive,
-        checksum,
-        metadata,
-    }
 }
 
 fn normalize_publish_archive(work: Path, archive: Path, manifest: ProjectManifest, dependencies: Vec[str], rewrite_dependencies: bool) -> bool {
@@ -590,419 +352,6 @@ fn verify_archive(work: Path, archive: Path) -> bool {
     ret true
 }
 
-fn github_ready(context: PublishContext) -> bool {
-    let mut auth = Vec[str]::new()
-    auth.push("auth")
-    auth.push("status")
-    if run_args("gh", auth) != 0_i32 {
-        publish_error("authenticate with gh auth login before publishing") ret false
-    }
-    ret true
-}
-
-fn create_package_release(context: PublishContext) -> bool {
-    let work = context.package_root.join("target").join("publish")
-    let local_tag = first_line(capture(
-            work,
-            "local-tag.txt",
-            "git",
-            args6("-C", context.repository_root.as_str(), "rev-list", "-n", "1", context.tag),
-        ))
-    let remote_tag = first_column(capture(
-            work,
-            "remote-tag.txt",
-            "git",
-            args3("ls-remote", "origin", "refs/tags/" + context.tag + "^{}"),
-        ))
-    if local_tag != "" && local_tag != context.source_commit {
-        publish_error("local tag " + context.tag + " points to a different commit")
-        ret false
-    }
-    if remote_tag != "" && remote_tag != context.source_commit {
-        publish_error("remote tag " + context.tag + " points to a different commit")
-        ret false
-    }
-    if local_tag == "" && remote_tag == "" {
-        let mut tag_args = Vec[str]::new()
-        tag_args.push("-C")
-        tag_args.push(context.repository_root.as_str())
-        tag_args.push("tag")
-        tag_args.push("-a")
-        tag_args.push(context.tag)
-        tag_args.push("-m")
-        tag_args.push(context.package_name + " " + context.release)
-        if run_args("git", tag_args) != 0_i32 {
-            publish_error("unable to create package tag") ret false
-        }
-    }
-    if remote_tag == "" {
-        let mut push_args = Vec[str]::new()
-        push_args.push("-C")
-        push_args.push(context.repository_root.as_str())
-        push_args.push("push")
-        push_args.push("origin")
-        push_args.push("refs/tags/" + context.tag)
-        if run_args("git", push_args) != 0_i32 {
-            publish_error("unable to push package tag") ret false
-        }
-    }
-    if release_asset_matches(context, work) {
-        println("Reusing matching GitHub Release " + context.tag)
-        ret true
-    }
-    let mut existing = Vec[str]::new()
-    existing.push("release")
-    existing.push("view")
-    existing.push(context.tag)
-    existing.push("--repo")
-    existing.push(context.repository_slug)
-    if run_args("gh", existing) == 0_i32 {
-        publish_error("release " + context.tag + " exists without the exact package asset")
-        ret false
-    }
-    let mut release_args = Vec[str]::new()
-    release_args.push("release")
-    release_args.push("create")
-    release_args.push(context.tag)
-    release_args.push(context.archive.as_str())
-    release_args.push("--repo")
-    release_args.push(context.repository_slug)
-    release_args.push("--title")
-    release_args.push(context.package_name + " " + context.release)
-    if run_args("gh", release_args) != 0_i32 {
-        publish_error("unable to create GitHub Release") ret false
-    }
-    ret true
-}
-
-fn release_asset_matches(context: PublishContext, work: Path) -> bool {
-    let destination = work.join("remote-release")
-    if file_exists(destination.as_str()) {
-        remove_dir_all(destination.as_str())
-    }
-    mkdir_all(destination.as_str())
-    let mut args = Vec[str]::new()
-    args.push("release")
-    args.push("download")
-    args.push(context.tag)
-    args.push("--repo")
-    args.push(context.repository_slug)
-    args.push("--pattern")
-    args.push(context.package_name + "-" + context.version + ".tar.gz")
-    args.push("--dir")
-    args.push(destination.as_str())
-    if run_args("gh", args) != 0_i32 {
-        ret false
-    }
-    let asset = destination.join(context.package_name + "-" + context.version + ".tar.gz")
-    ret file_exists(asset.as_str()) && file_sha256(asset.as_str()) == context.checksum
-}
-
-fn open_index_pull_request(context: PublishContext) -> bool {
-    let work = context.package_root.join("target").join("publish")
-    let login = first_line(capture(work, "github-login.txt", "gh", args3("api", "user", "--jq=.login")))
-    if login == "" {
-        publish_error("unable to determine authenticated GitHub user") ret false
-    }
-    let mut fork_args = Vec[str]::new()
-    fork_args.push("repo")
-    fork_args.push("fork")
-    fork_args.push("encore-ecosystem/encore-index")
-    fork_args.push("--clone=false")
-    if run_args("gh", fork_args) != 0_i32 {
-        // Existing forks also return successfully in current gh versions; clone below is authoritative.
-    }
-    let checkout = work.join("encore-index")
-    if file_exists(checkout.as_str()) {
-        remove_dir_all(checkout.as_str())
-    }
-    let mut clone_args = Vec[str]::new()
-    clone_args.push("repo")
-    clone_args.push("clone")
-    clone_args.push(login + "/encore-index")
-    clone_args.push(checkout.as_str())
-    if run_args("gh", clone_args) != 0_i32 {
-        publish_error("unable to clone encore-index fork") ret false
-    }
-    let mut remote_args = Vec[str]::new()
-    remote_args.push("-C")
-    remote_args.push(checkout.as_str())
-    remote_args.push("remote")
-    remote_args.push("add")
-    remote_args.push("upstream")
-    remote_args.push("https://github.com/encore-ecosystem/encore-index.git")
-    run_args("git", remote_args)
-    let mut fetch_args = Vec[str]::new()
-    fetch_args.push("-C")
-    fetch_args.push(checkout.as_str())
-    fetch_args.push("fetch")
-    fetch_args.push("upstream")
-    fetch_args.push("main")
-    if run_args("git", fetch_args) != 0_i32 {
-        publish_error("unable to fetch index main") ret false
-    }
-    let branch = "publish/" + context.package_name + "-" + context.release
-    let mut branch_args = Vec[str]::new()
-    branch_args.push("-C")
-    branch_args.push(checkout.as_str())
-    branch_args.push("checkout")
-    branch_args.push("-B")
-    branch_args.push(branch)
-    branch_args.push("upstream/main")
-    if run_args("git", branch_args) != 0_i32 {
-        publish_error("unable to create index branch") ret false
-    }
-
-    let epoch_path = checkout.join("index.json")
-    if !file_exists(epoch_path.as_str()) || !publish_index_epoch_matches(read_file(epoch_path.as_str())) {
-        publish_error("index epoch does not match this compiler; use a matching compiler or prepare an explicit registry cutover with --release-only")
-        ret false
-    }
-    let metadata_path = checkout.join(context.package_name.slice(0_usize, 2_usize)).join(context.package_name + ".json")
-    mkdir_all(metadata_path.parent().unwrap_or(checkout).as_str())
-    let source = if file_exists(metadata_path.as_str()) {
-        read_file(metadata_path.as_str())
-    } else {
-        ""
-    }
-    let updated = append_index_metadata(source, context)
-    if updated == "" || write_file(metadata_path.as_str(), updated + "\n") != 0_i32 {
-        publish_error("unable to update index metadata")
-        ret false
-    }
-    let mut add_args = Vec[str]::new()
-    add_args.push("-C")
-    add_args.push(checkout.as_str())
-    add_args.push("add")
-    add_args.push(".")
-    if run_args("git", add_args) != 0_i32 {
-        ret false
-    }
-    let mut diff_args = Vec[str]::new()
-    diff_args.push("-C")
-    diff_args.push(checkout.as_str())
-    diff_args.push("diff")
-    diff_args.push("--cached")
-    diff_args.push("--quiet")
-    if run_args("git", diff_args) == 0_i32 {
-        println("Matching package metadata is already present in the index.")
-        ret true
-    }
-    let mut commit_args = Vec[str]::new()
-    commit_args.push("-C")
-    commit_args.push(checkout.as_str())
-    commit_args.push("-c")
-    commit_args.push("user.name=Encore Publisher")
-    commit_args.push("-c")
-    commit_args.push("user.email=publish@encore.invalid")
-    commit_args.push("commit")
-    commit_args.push("-m")
-    commit_args.push("Publish " + context.package_name + " " + context.release)
-    if run_args("git", commit_args) != 0_i32 {
-        publish_error("unable to commit index metadata") ret false
-    }
-    let mut push_args = Vec[str]::new()
-    push_args.push("-C")
-    push_args.push(checkout.as_str())
-    push_args.push("push")
-    push_args.push("--force-with-lease")
-    push_args.push("origin")
-    push_args.push(branch)
-    if run_args("git", push_args) != 0_i32 {
-        publish_error("unable to push index branch") ret false
-    }
-    let mut pr_args = Vec[str]::new()
-    pr_args.push("pr")
-    pr_args.push("create")
-    pr_args.push("--repo")
-    pr_args.push("encore-ecosystem/encore-index")
-    pr_args.push("--head")
-    pr_args.push(login + ":" + branch)
-    pr_args.push("--base")
-    pr_args.push("main")
-    pr_args.push("--title")
-    pr_args.push("Publish " + context.package_name + " " + context.release)
-    pr_args.push("--body")
-    pr_args.push("Created by `encore publish` from " + context.repository_slug + " at " + context.source_commit + ".")
-    if run_args("gh", pr_args) != 0_i32 {
-        publish_error("unable to open index pull request") ret false
-    }
-    ret true
-}
-
-fn append_index_metadata(source: str, context: PublishContext) -> str {
-    let version = publish_version_json(context)
-    if source == "" {
-        let mut root = Vec[(str, Json)]::new()
-        root.push(field("name", Json::String(context.package_name)))
-        root.push(field("repository", Json::String("https://github.com/" + context.repository_slug)))
-        let mut versions = Vec[Json]::new()
-        versions.push(version)
-        root.push(field("versions", Json::Array(versions)))
-        ret stringify(Json::Object(root))
-    }
-    match parse(source) {
-        Result[Json, ParseError]::Ok(document) => {
-            if json_string(document, "name") != context.package_name {
-                publish_error("index package name mismatch") ret ""
-            }
-            if repository_slug(json_string(document, "repository")) != context.repository_slug {
-                publish_error("index package is owned by another repository")
-                ret ""
-            }
-            let mut versions = Vec[Json]::new()
-            match document.get("versions") {
-                Some(value) => {
-                    match value.as_array() {
-                        Some(items) => {
-                            for item in items {
-                                if json_string(item, "version") == context.version {
-                                    if immutable_publish_metadata_matches(item, version) {
-                                        ret source
-                                    }
-                                    publish_error("package version already exists in index with different immutable metadata")
-                                    ret ""
-                                }
-                                versions.push(item)
-                            }
-                        }
-                        None => {
-                            ret ""
-                        }
-                    }
-                }
-                None => {
-                }
-            }
-            versions.push(version)
-            let mut root = Vec[(str, Json)]::new()
-            root.push(field("name", Json::String(context.package_name)))
-            root.push(field("repository", Json::String("https://github.com/" + context.repository_slug)))
-            root.push(field("versions", Json::Array(versions)))
-            ret stringify(Json::Object(root))
-        }
-        Result[Json, ParseError]::Err(_) => {
-            publish_error("existing index metadata is invalid")
-        }
-    }
-    ret ""
-}
-
-/// Checks immutable registry fields without changing the registry's yank policy.
-pub fn immutable_publish_metadata_matches(existing: Json, expected: Json) -> bool {
-    for key in vec!["version", "epoch", "nametag", "release", "archive", "checksum", "encore", "commit", "subdir"] {
-        if json_string(existing, key) != json_string(expected, key) {
-            ret false
-        }
-    }
-    // Yanking is registry policy; retrying publication must not undo it.
-    ret true
-}
-
-/// Validates the registry generation before preparing an index update.
-pub fn publish_index_epoch_matches(source: str) -> bool {
-    match parse(source) {
-        Result[Json, ParseError]::Ok(document) => {
-            match document.get("schema") {
-                Some(schema) => {
-                    if stringify(schema) != "2" {
-                        ret false
-                    }
-                }
-                None => {
-                    ret false
-                }
-            }
-            ret json_string(document, "epoch") == compiler_registry_epoch()
-        }
-        Result[Json, ParseError]::Err(_) => {
-            ret false
-        }
-    }
-}
-
-fn publish_version_json(context: PublishContext) -> Json {
-    let mut item = Vec[(str, Json)]::new()
-    item.push(field("version", Json::String(context.version)))
-    item.push(field("epoch", Json::String(compiler_registry_epoch())))
-    item.push(field("nametag", Json::String(context.release_name)))
-    item.push(field("release", Json::String(context.release)))
-    item.push(field(
-            "archive",
-            Json::String(
-                "https://github.com/" + context.repository_slug + "/releases/download/"
-                + context.tag + "/" + context.package_name + "-" + context.version + ".tar.gz"
-            ),
-        ))
-    item.push(field("checksum", Json::String(context.checksum)))
-    item.push(field("yanked", Json::Bool(false)))
-    item.push(field("encore", Json::String(context.compiler_requirement)))
-    item.push(field("commit", Json::String(context.source_commit)))
-    item.push(field("subdir", Json::String(context.source_subdir)))
-    ret Json::Object(item)
-}
-
-fn publish_metadata(
-    name: str,
-    version: str,
-    release_name: str,
-    slug: str,
-    subdir: str,
-    commit: str,
-    requirement: str,
-    archive: Path,
-    checksum: str,
-    tag: str,
-) -> str {
-    let context = PublishContext {
-        Path::new("."),
-        Path::new("."),
-        slug,
-        subdir,
-        commit,
-        name,
-        version,
-        release_name,
-        version + "-" + release_name,
-        requirement,
-        tag,
-        archive,
-        checksum,
-        "",
-    }
-    ret stringify(publish_version_json(context))
-}
-
-fn repository_slug(value: str) -> str {
-    let mut normalized = value
-    if starts_with(normalized, "git@github.com:") {
-        normalized = normalized.slice(15_usize, normalized.len() - 15_usize)
-    } elif starts_with(normalized, "ssh://git@github.com/") {
-        normalized = normalized.slice(21_usize, normalized.len() - 21_usize)
-    } elif starts_with(normalized, "https://github.com/") {
-        normalized = normalized.slice(19_usize, normalized.len() - 19_usize)
-    } else {
-        ret ""
-    }
-    if ends_with(normalized, ".git") {
-        normalized = normalized.slice(0_usize, normalized.len() - 4_usize)
-    }
-    while ends_with(normalized, "/") {
-        normalized = normalized.slice(0_usize, normalized.len() - 1_usize)
-    }
-    if count_character(normalized, "/") != 1_usize || contains(normalized, "..") || contains(normalized, " ") {
-        ret ""
-    }
-    ret normalized
-}
-
-#attr(test)
-fn publish_repository_normalization_contract() -> bool {
-    ret repository_slug("https://github.com/encore-ecosystem/example.git") == "encore-ecosystem/example"
-    && repository_slug("git@github.com:encore-ecosystem/example.git") == "encore-ecosystem/example"
-    && repository_slug("https://example.com/encore-ecosystem/example") == ""
-}
-
 #attr(test)
 fn publish_glob_contract() -> bool {
     ret glob_matches("src/**", "src/net/mod.enq")
@@ -1143,103 +492,6 @@ fn lines(value: str) -> Vec[str] {
     ret out
 }
 
-fn first_line(value: str) -> str {
-    let values = lines(value)
-    match values.get(0_usize) {
-        Some(line) => {
-            ret line
-        }
-        None => {
-            ret ""
-        }
-    }
-}
-
-fn first_column(value: str) -> str {
-    let line = first_line(value)
-    let mut index = 0_usize
-    while index < line.len() && line.slice(index, 1_usize) != " " && line.slice(index, 1_usize) != "\t" {
-        index += 1_usize
-    }
-    ret line.slice(0_usize, index)
-}
-
-fn verify_package(root: Path, repository_root: Path) -> bool {
-    let lock = root.join("encore.lock")
-    let had_lock = file_exists(lock.as_str())
-    let verified = run_package_verification(root)
-    if !had_lock {
-        remove_file(lock.as_str())
-    }
-    if !verified {
-        ret false
-    }
-    let status = capture(
-        root.join("target").join("publish"),
-        "post-verify-status.txt",
-        "git",
-        publish_status_args(repository_root, relative_path(repository_root, root)),
-    )
-    if status != "" {
-        publish_error("verification changed tracked files or the lockfile") ret false
-    }
-    ret true
-}
-
-fn run_package_verification(root: Path) -> bool {
-    let compiler = match argv(0_usize) {
-        Some(value) => value None => "encore"
-    }
-    let mut format_args = Vec[str]::new()
-    format_args.push("format")
-    format_args.push("--check")
-    if run_args(compiler, format_args) != 0_i32 {
-        publish_error("format verification failed") ret false
-    }
-    let commands = package_verification_commands()
-    for command in commands {
-        let mut args = Vec[str]::new()
-        args.push(command)
-        if run_args(compiler, args) != 0_i32 {
-            publish_error(command + " verification failed") ret false
-        }
-    }
-    if file_exists(root.join("src").join("main.enq").as_str()) {
-        let mut build_args = Vec[str]::new()
-        build_args.push("build")
-        if run_args(compiler, build_args) != 0_i32 {
-            publish_error("build verification failed") ret false
-        }
-    }
-    ret true
-}
-
-fn publish_status_args(repository_root: Path, source_subdir: str) -> Vec[str] {
-    let target_path = if source_subdir == "" {
-        "target"
-    } else {
-        source_subdir + "/target"
-    }
-    let mut out = Vec[str]::new()
-    out.push("-C")
-    out.push(repository_root.as_str())
-    out.push("status")
-    out.push("--porcelain")
-    out.push("--")
-    out.push(".")
-    out.push(":(exclude)" + target_path)
-    ret out
-}
-
-fn package_verification_commands() -> Vec[str] {
-    let mut out = Vec[str]::new()
-    out.push("sync")
-    out.push("check")
-    out.push("lint")
-    out.push("test")
-    ret out
-}
-
 fn trim(value: str) -> str {
     let mut start = 0_usize
     let mut end = value.len()
@@ -1268,18 +520,6 @@ fn normalize_path(value: str) -> str {
         out = out.slice(0_usize, out.len() - 1_usize)
     }
     ret out
-}
-
-fn count_character(value: str, needle: str) -> usize {
-    let mut count = 0_usize
-    let mut index = 0_usize
-    while index < value.len() {
-        if value.slice(index, 1_usize) == needle {
-            count += 1_usize
-        }
-        index += 1_usize
-    }
-    ret count
 }
 
 fn json_string(value: Json, key: str) -> str {
@@ -1361,28 +601,12 @@ fn publish_release_name_contract() -> bool {
     && !valid_release_name("bad_name") && !valid_release_name("-edge")
 }
 
-fn empty_context(root: Path) -> PublishContext {
-    ret PublishContext {
-        root, root, "", "", "", "", "", "", "", "", "", root, "", ""
-    }
-}
-
-fn single_arg(a: str) -> Vec[str] {
-    let mut out = Vec[str]::new() out.push(a) ret out
-}
-fn args3(a: str, b: str, c: str) -> Vec[str] {
-    let mut out = Vec[str]::new() out.push(a) out.push(b) out.push(c) ret out
-}
 fn args4(a: str, b: str, c: str, d: str) -> Vec[str] {
     let mut out = Vec[str]::new() out.push(a) out.push(b) out.push(c) out.push(d) ret out
 }
 fn args5(a: str, b: str, c: str, d: str, e: str) -> Vec[str] {
     let mut out = Vec[str]::new() out.push(a) out.push(b) out.push(c) out.push(d) out.push(e) ret out
 }
-fn args6(a: str, b: str, c: str, d: str, e: str, f: str) -> Vec[str] {
-    let mut out = Vec[str]::new() out.push(a) out.push(b) out.push(c) out.push(d) out.push(e) out.push(f) ret out
-}
-
 fn publish_error(message: str) ->() {
     eprintln("error[publish]: " + message) ret()
 }

@@ -1,0 +1,389 @@
+//! Checked package-owned frontend work, with verified metadata-only dependencies.
+
+import core::option::Option
+import core::result::Result
+import std::os::{file_exists, file_sha256, read_file}
+import std::path::Path
+import std::vec::Vec
+import ehirlib::{parse_module_bundle_text, module_bundle_to_string}
+import ehirlib::core::{Module, make_module_bundle}
+import ehir_llvm_backend::codegen::{incremental_codegen_context_bundle, prepare_unit_codegen,
+    unit_codegen_context, unit_codegen_owned, unit_codegen_requirements, PreparedUnitCodegen}
+import refrain::cache_identity::compiler_content_digest
+import refrain::diagnostics::render_diagnostic
+import refrain::frontend::{FrontendDocument, FrontendSymbol, FrontendCallable}
+import refrain::frontend::analysis::analyze_source
+import refrain::frontend::analysis_database::function_declaration_position
+import refrain::frontend::parser::Statement
+import refrain::frontend::safety::FunctionSafety
+import refrain::frontend::translator::{TranslationModule, filter_ast_for_target,
+    translate_compilation_unit_to_ehir_chunks, assemble_ehir_module_bundle}
+import refrain::project::workspace::{ProjectWorkspace, CompiledWorkspaceModule, try_load_compilation_unit}
+import refrain::project::failure::ProjectFailure
+import refrain::target::{TargetSpec, parse_target}
+import mod::build_metadata::{RefrainMetadata, MetadataModule, MetadataDependency}
+import mod::build_request::{BuildUnitRequest, UnitMetadataInput, graph_package, unit_source_digest}
+import mod::build_requirements::UnitRequirements
+import mod::build_artifacts::{UnitReady, read_unit_ready}
+import mod::build_fingerprint::unit_fingerprint
+import mod::build_prepared_cache::read_prepared_unit
+import mod::build_frontend_cache::{read_frontend_unit, publish_frontend_unit}
+
+/// The frontend publishes declarations and compact EHIR templates separately
+/// from ordinary bodies. Dependency sources and archives are not in this value.
+pub struct PreparedCompilationUnit {
+    metadata: RefrainMetadata
+    templates: str
+    lowered_text: str
+    dependency_templates: Vec[str]
+}
+
+/// Checked declarations/templates can be atomically published before emitting
+/// this worker's ordinary LLVM objects. All mutable lowering state stays local.
+pub struct PreparedPackageWorker {
+    prepared: PreparedUnitCodegen
+    metadata_text: str
+    templates_text: str
+    requirements_text: str
+    interface_digest: str
+    template_digest: str
+    metadata_dependencies: Vec[MetadataDependency]
+}
+
+pub fn package_owned_checkpoint(request: BuildUnitRequest, worker: frozen PreparedPackageWorker) -> Result[str, str] {
+    let owner = graph_package(request.graph, request.context.unit)?
+    let entry = owner.name + if owner.target_is_binary { "@main.enq" } else { "@lib.enq" }
+    ret Result[str, str]::Ok(module_bundle_to_string(unit_codegen_owned(worker.prepared, entry)))
+}
+
+/// Completes owned backend preparation before announcing metadata readiness.
+/// In particular, dependencies see normalized generated coroutine layouts,
+/// never the frontend's preliminary template projection.
+pub fn prepare_package_worker(request: BuildUnitRequest, jobs: usize) -> Result[PreparedPackageWorker, str] {
+    if jobs == 0 { ret Result[PreparedPackageWorker, str]::Err("package worker needs a CPU lease") }
+    if file_exists(request.output.join("unit.backend").as_str()) { ret restore_prepared_worker(request) }
+    let frontend = if file_exists(request.output.join("unit.frontend").as_str()) {
+        restore_frontend_worker(request)?
+    } else { prepare_compilation_unit(request)? }
+    publish_frontend_unit(request.output, package_frontend_fingerprint(request)?, frontend.metadata, frontend.lowered_text)?
+    let mut modules = Vec[Module]::new()
+    for text in frontend.dependency_templates {
+        let dependency = parse_module_bundle_text("", text)
+        modules.extend(dependency.modules)
+    }
+    let entry = request.context.unit + if graph_package(request.graph, request.context.unit)?.target_is_binary {
+        "@main.enq"
+    } else { "@lib.enq" }
+    let target = parse_target(request.context.target)
+    let prepared = prepare_unit_codegen(parse_module_bundle_text(entry, frontend.lowered_text),
+        make_module_bundle("", modules), target.triple, target.pointer_width, jobs)
+    let templates = module_bundle_to_string(unit_codegen_context(prepared, entry))
+    let template_digest = compiler_content_digest(templates)
+    let mut metadata = frontend.metadata
+    metadata.template_digest = template_digest
+    let interface_digest = metadata.interface_digest()?
+    let metadata_text = metadata.encode()?
+    let requirements = UnitRequirements{request.context, unit_codegen_requirements(prepared)}
+    let requirements_text = requirements.encode()?
+    ret Result[PreparedPackageWorker, str]::Ok(PreparedPackageWorker{prepared, metadata_text, templates,
+        requirements_text, interface_digest, template_digest, metadata.dependencies})
+}
+
+/// The fingerprint only consumes verified ready-record identities. Actual
+/// dependency payload validation is performed by preparation/restoration.
+pub fn package_backend_fingerprint(request: BuildUnitRequest) -> Result[str, str] {
+    ret package_phase_fingerprint(request, false)
+}
+
+pub fn package_frontend_fingerprint(request: BuildUnitRequest) -> Result[str, str] {
+    ret package_phase_fingerprint(request, true)
+}
+
+fn package_phase_fingerprint(request: BuildUnitRequest, frontend: bool) -> Result[str, str] {
+    let mut dependencies = Vec[MetadataDependency]::new()
+    for input in request.inputs {
+        let ready = UnitReady::decode(read_file(input.directory.join("unit.ready").as_str()), input.context)?
+        if ready.metadata_digest != input.metadata_digest || ready.template_digest != input.template_digest {
+            ret Result[str, str]::Err("dependency changed while identifying prepared package")
+        }
+        dependencies.push(MetadataDependency{input.context.unit, ready.interface_digest, ready.template_digest})
+    }
+    let keys = unit_fingerprint(request.context, dependencies, compiler_content_digest("unused-native-phase"))?
+    ret Result[str, str]::Ok(if frontend { keys.frontend } else { keys.backend })
+}
+
+fn restore_frontend_worker(request: BuildUnitRequest) -> Result[PreparedCompilationUnit, str] {
+    let verified = load_unit_dependencies(request)?
+    let owner = graph_package(request.graph, request.context.unit)?
+    if unit_source_digest(owner)? != request.context.input_digest { ret Result[PreparedCompilationUnit, str]::Err("frontend checkpoint sources changed") }
+    let mut dependencies = Vec[MetadataDependency]::new()
+    let mut templates = Vec[str]::new()
+    for dependency in verified {
+        if contains_name(owner.dependency_names, dependency.metadata.context.unit) {
+            dependencies.push(MetadataDependency{dependency.metadata.context.unit, dependency.metadata.interface_digest()?, dependency.metadata.template_digest})
+        }
+        templates.push(dependency.templates)
+    }
+    let checkpoint = read_frontend_unit(request.output, package_frontend_fingerprint(request)?, request.context, dependencies)?
+    let entry = owner.name + if owner.target_is_binary { "@main.enq" } else { "@lib.enq" }
+    let bundle = parse_module_bundle_text(entry, checkpoint.lowered)
+    for module in bundle.modules {
+        if module.name.byte_len() <= owner.name.byte_len() || module.name.slice_bytes(0, owner.name.byte_len() + 1) != owner.name + "@" {
+            ret Result[PreparedCompilationUnit, str]::Err("foreign module in frontend checkpoint")
+        }
+    }
+    ret Result[PreparedCompilationUnit, str]::Ok(PreparedCompilationUnit{checkpoint.metadata, "", checkpoint.lowered, templates})
+}
+
+fn restore_prepared_worker(request: BuildUnitRequest) -> Result[PreparedPackageWorker, str] {
+    let verified = load_unit_dependencies(request)?
+    let owner = graph_package(request.graph, request.context.unit)?
+    if unit_source_digest(owner)? != request.context.input_digest { ret Result[PreparedPackageWorker, str]::Err("prepared package sources changed") }
+    let mut dependencies = Vec[MetadataDependency]::new()
+    let mut contexts = Vec[Module]::new()
+    for dependency in verified {
+        if contains_name(owner.dependency_names, dependency.metadata.context.unit) {
+            dependencies.push(MetadataDependency{dependency.metadata.context.unit, dependency.metadata.interface_digest()?, dependency.metadata.template_digest})
+        }
+        contexts.extend(parse_module_bundle_text("", dependency.templates).modules)
+    }
+    let ready = read_unit_ready(request.output, request.context, dependencies)?
+    let owned_text = read_prepared_unit(request.output, ready, package_backend_fingerprint(request)?)?
+    let entry = owner.name + if owner.target_is_binary { "@main.enq" } else { "@lib.enq" }
+    let owned = parse_module_bundle_text(entry, owned_text)
+    for module in owned.modules {
+        if module.name.byte_len() <= owner.name.byte_len() || module.name.slice_bytes(0, owner.name.byte_len() + 1) != owner.name + "@" {
+            ret Result[PreparedPackageWorker, str]::Err("foreign module in prepared package")
+        }
+    }
+    let templates = read_file(request.output.join("unit.ertemplate").as_str())
+    contexts.extend(parse_module_bundle_text(entry, templates).modules)
+    let metadata_text = read_file(request.output.join("unit.ermeta").as_str())
+    let requirements_text = read_file(request.output.join("unit.errequirements").as_str())
+    let requirements = UnitRequirements::decode(requirements_text, request.context)?
+    ret Result[PreparedPackageWorker, str]::Ok(PreparedPackageWorker{PreparedUnitCodegen{owned.modules, contexts, requirements.requirements},
+        metadata_text, templates, requirements_text, ready.interface_digest, ready.template_digest, dependencies})
+}
+
+fn contains_name(values: Vec[str], name: str) -> bool {
+    for value in values { if value == name { ret true } }
+    ret false
+}
+
+/// Checks every expected dependency before opening this package's source files.
+/// Missing/corrupt artifacts never trigger a source or registry fallback.
+pub fn prepare_compilation_unit(request: BuildUnitRequest) -> Result[PreparedCompilationUnit, str] {
+    let _validated = request.encode()?
+    let verified = load_unit_dependencies(request)?
+    let mut compiled = Vec[CompiledWorkspaceModule]::new()
+    let mut dependency_templates = Vec[str]::new()
+    for dependency in verified {
+        compiled.extend(dependency.metadata.compiled_modules()?)
+        dependency_templates.push(dependency.templates)
+    }
+    let owner = graph_package(request.graph, request.context.unit)?
+    if unit_source_digest(owner)? != request.context.input_digest {
+        ret Result[PreparedCompilationUnit, str]::Err("package sources changed before compilation: " + owner.name)
+    }
+    let mut workspace = match try_load_compilation_unit(request.graph, owner.name, compiled) {
+        Ok(value) => value
+        Err(failure) => { ret Result[PreparedCompilationUnit, str]::Err(failure.message) }
+    }
+    let target = parse_target(request.context.target)
+    for module in workspace.modules {
+        workspace.analysis.configure_safety(module.analysis_id.key(), target, module.enabled_features)
+    }
+    check_own_modules(workspace, target)?
+    let effects = workspace.analysis.function_safety_effects()
+    let mut translations = Vec[TranslationModule]::new()
+    let mut selected = Vec[usize]::new()
+    let mut declarations = Vec[MetadataModule]::new()
+    let mut index = 0_usize
+    for module in workspace.modules {
+        let ast = filter_ast_for_target(module.ast, target, module.enabled_features)
+        translations.push(TranslationModule {module.module_id, module.module_path.as_str(),
+            module.source, module.documentation, module.resolved_imports, ast, module.enabled_features,
+            module.source.byte_len()})
+        if module.owner_name == owner.name {
+            selected.push(index)
+            let mut own_effects = Vec[FunctionSafety]::new()
+            for effect in effects {
+                if effect.module_name == module.analysis_id.key() { own_effects.push(effect) }
+            }
+            let document = target_document(module.analysis, ast)
+            // The loader already guarantees this module ID belongs to the unit.
+            let relative = module.module_id.slice_bytes(owner.name.byte_len() + 1,
+                module.module_id.byte_len() - owner.name.byte_len() - 1)
+            declarations.push(MetadataModule::from_document(module.module_id, relative, document,
+                module.resolved_imports, own_effects))
+        }
+        index += 1
+    }
+    // Complete lowering-time validation is still required before metadata can
+    // become ready. Only the owned bodies are lowered; dependency declarations
+    // have neither ordinary bodies, tokens nor source text.
+    let chunks = translate_compilation_unit_to_ehir_chunks(translations, target, selected)
+    let entry = owner.name + if owner.target_is_binary { "@main.enq" } else { "@lib.enq" }
+    let lowered_text = assemble_ehir_module_bundle(chunks, translations.len(), entry)
+    let templates = module_bundle_to_string(incremental_codegen_context_bundle(
+        parse_module_bundle_text(entry, lowered_text)))
+    if unit_source_digest(owner)? != request.context.input_digest {
+        ret Result[PreparedCompilationUnit, str]::Err("package sources changed during compilation: " + owner.name)
+    }
+    let mut dependencies = Vec[MetadataDependency]::new()
+    for name in owner.dependency_names {
+        for dependency in verified {
+            if dependency.metadata.context.unit == name {
+                dependencies.push(MetadataDependency{name, dependency.metadata.interface_digest()?,
+                    dependency.metadata.template_digest})
+            }
+        }
+    }
+    let metadata = RefrainMetadata{request.context, dependencies, declarations, compiler_content_digest(templates)}
+    let _validated_metadata = metadata.encode()?
+    ret Result[PreparedCompilationUnit, str]::Ok(PreparedCompilationUnit{metadata, templates, lowered_text, dependency_templates})
+}
+
+struct VerifiedDependency {
+    metadata: RefrainMetadata
+    templates: str
+}
+
+fn load_unit_dependencies(request: BuildUnitRequest) -> Result[Vec[VerifiedDependency], str] {
+    let mut verified = Vec[VerifiedDependency]::new()
+    while verified.len() < request.inputs.len() {
+        let before = verified.len()
+        for input in request.inputs {
+            let mut installed = false
+            for existing in verified {
+                if existing.metadata.context.unit == input.context.unit { installed = true }
+            }
+            if installed { continue }
+            let owner = graph_package(request.graph, input.context.unit)?
+            let mut ready = true
+            let mut dependencies = Vec[MetadataDependency]::new()
+            for name in owner.dependency_names {
+                let mut found = false
+                for existing in verified {
+                    if existing.metadata.context.unit == name {
+                        dependencies.push(MetadataDependency{name, existing.metadata.interface_digest()?,
+                            existing.metadata.template_digest})
+                        found = true
+                    }
+                }
+                if !found { ready = false }
+            }
+            if !ready { continue }
+            let text = verified_input(input.directory.join("unit.ermeta"), input.metadata_digest)?
+            let templates = verified_input(input.directory.join("unit.ertemplate"), input.template_digest)?
+            let metadata = RefrainMetadata::decode(text, input.context, dependencies)?
+            if metadata.template_digest != input.template_digest {
+                ret Result[Vec[VerifiedDependency], str]::Err("dependency template identity mismatch: " + owner.name)
+            }
+            verified.push(VerifiedDependency{metadata, templates})
+        }
+        if before == verified.len() {
+            ret Result[Vec[VerifiedDependency], str]::Err("dependency metadata graph cannot become ready")
+        }
+    }
+    ret Result[Vec[VerifiedDependency], str]::Ok(verified)
+}
+
+fn verified_input(path: Path, expected: str) -> Result[str, str] {
+    if !file_exists(path.as_str()) || file_sha256(path.as_str()) != expected {
+        ret Result[str, str]::Err("missing or corrupt dependency artifact: " + path.as_str())
+    }
+    let contents = read_file(path.as_str())
+    if compiler_content_digest(contents) != expected {
+        ret Result[str, str]::Err("dependency artifact changed while reading: " + path.as_str())
+    }
+    ret Result[str, str]::Ok(contents)
+}
+
+fn check_own_modules(workspace: mut ProjectWorkspace, target: TargetSpec) -> Result[bool, str] {
+    for module in workspace.modules {
+        if module.owner_name != workspace.compilation_unit { continue }
+        if module.diagnostics.len() != 0 {
+            for diagnostic in module.diagnostics {
+                ret Result[bool, str]::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
+            }
+        }
+        for diagnostic in workspace.analysis.module_semantic_diagnostics_for_target(
+            module.analysis_id.key(), target, module.enabled_features) {
+            ret Result[bool, str]::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
+        }
+    }
+    ret Result[bool, str]::Ok(true)
+}
+
+// Function cfg filters must also apply to token-derived callable facts. The
+// ordinary document keeps source spans, but inactive APIs cannot enter metadata.
+fn target_document(document: FrontendDocument, ast: Vec[Statement]) -> FrontendDocument {
+    let mut symbols = Vec[FrontendSymbol]::new()
+    let mut callables = Vec[FrontendCallable]::new()
+    for symbol in document.symbols {
+        if symbol.kind != 12 || active_function_at(document, ast, symbol.line, symbol.column, symbol.name) { symbols.push(symbol) }
+    }
+    for callable in document.callables {
+        if active_function_at(document, ast, callable.line, callable.column, callable.name) { callables.push(callable) }
+    }
+    ret FrontendDocument{document.tokens, ast, document.module_documentation, document.diagnostics,
+        symbols, callables, document.dependencies, document.parsed}
+}
+
+fn active_function_at(document: FrontendDocument, ast: Vec[Statement], line: usize, column: usize, name: str) -> bool {
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => {
+                if item.name == name {
+                    let site = function_declaration_position(document, item)
+                    if site.0 == line && site.1 == column { ret true }
+                }
+            }
+            Statement::Impl(item) => {
+                for method in item.methods {
+                    if method.name == name {
+                        let site = function_declaration_position(document, method)
+                        if site.0 == line && site.1 == column { ret true }
+                    }
+                }
+            }
+            Statement::Trait(item) => {
+                for method in item.methods {
+                    if method.name == name {
+                        let site = function_declaration_position(document, method)
+                        if site.0 == line && site.1 == column { ret true }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ret false
+}
+
+#attr(test)
+fn metadata_unit_split_function_name_contract() -> bool {
+    let document = analyze_source("pub fn\nanswer() -> u32 { ret 42 }\n")
+    let filtered = target_document(document, document.ast)
+    ret document.parsed && filtered.callables.len() == 1 && filtered.symbols.len() == 1
+}
+
+#attr(test)
+fn metadata_unit_split_async_signature_contract() -> bool {
+    let document = analyze_source("pub async\nfn\nanswer() -> u32 { ret 42 }\n")
+    let filtered = target_document(document, document.ast)
+    ret document.parsed && filtered.callables.len() == 1 && filtered.symbols.len() == 1
+}
+
+#attr(test)
+fn metadata_unit_same_line_cfg_methods_contract() -> bool {
+    let document = analyze_source("struct A {} struct B {}\n" +
+        "impl for A { #cfg(windows) fn read(self: Self) -> u32 { ret 1 } } " +
+        "impl for B { fn read(self: Self) -> u32 { ret 2 } }\n")
+    let ast = filter_ast_for_target(document.ast, parse_target("x86_64-unknown-linux-gnu"), Vec[str]::new())
+    let filtered = target_document(document, ast)
+    let mut count = 0_usize
+    for symbol in filtered.symbols { if symbol.kind == 12 { count += 1 } }
+    ret document.parsed && document.callables.len() == 2 && filtered.callables.len() == 1 && count == 1
+}

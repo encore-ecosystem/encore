@@ -21,8 +21,9 @@ def main():
         indexes = []
         for label in ("first", "second"):
             index = root / label
+            (index / "api/v1/packages").mkdir(parents=True)
+            (index / "config.json").write_text(json.dumps({"schema": 1, "api": "/api/v1"}))
             for package in ("probe", "leaf"):
-                (index / package[:2]).mkdir(parents=True, exist_ok=True)
                 archive = index / (package + ".tar.gz")
                 dependencies = '["index@leaf"]' if package == "probe" else '[]'
                 with tarfile.open(archive, "w:gz") as tar:
@@ -35,7 +36,7 @@ def main():
                         entry = tarfile.TarInfo(name)
                         entry.size = len(data)
                         tar.addfile(entry, io.BytesIO(data))
-                (index / package[:2] / (package + ".json")).write_text(json.dumps({"name": package, "versions": [{
+                (index / "api/v1/packages" / package).write_text(json.dumps({"name": package, "versions": [{
                     "version": "1.0.0", "archive": archive.as_uri(),
                     "checksum": hashlib.sha256(archive.read_bytes()).hexdigest(), "yanked": False,
                 }]}))

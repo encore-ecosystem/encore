@@ -11,6 +11,7 @@ import std::process::{run_args, run_args_capture}
 import refrain::version::compiler_version
 import mod::manifest::{project_manifest_name, project_manifest_version, project_manifest_registry_index, try_read_project_manifest, ProjectManifest}
 import mod::failure::ProjectFailure
+import mod::registry_service::registry_service_metadata
 
 /// Performs the `normalize_dependency_reference` operation.
 pub fn normalize_dependency_reference(raw: str) -> str {
@@ -72,7 +73,7 @@ pub fn dependency_with_features(reference: str, features: Vec[str]) -> str {
 /// Performs the `resolve_index_dependency` operation.
 pub fn resolve_index_dependency(reference: str, project_root: Path, update: bool) -> str {
     let source = registry_index_url(project_root)
-    if source == "" || (!update && !registry_lock_source_matches(project_root, source)) { ret "" }
+    if source != "" && !update && !registry_lock_source_matches(project_root, source) { ret "" }
     let base_reference = dependency_base_reference(reference)
     if !starts_with(base_reference, "index@") { ret "" }
     let spec = base_reference.slice(6_usize, base_reference.len() - 6_usize)
@@ -93,6 +94,9 @@ pub fn resolve_index_dependency(reference: str, project_root: Path, update: bool
         if locked != "" { ret locked }
     }
 
+    if source == "" {
+        registry_error("No registry configured; set ENCORE_DEFAULT_INDEX or [registry].index") ret ""
+    }
     let metadata = registry_metadata(name, update, source)
     if metadata == "" { ret "" }
     let version = latest_version(metadata, name, requirement, source)
@@ -179,7 +183,7 @@ pub fn registry_install_candidate(name: str, candidate: RegistryCandidate) -> st
 pub fn registry_candidates(reference: str, project_root: Path, update: bool) -> Vec[RegistryCandidate] {
     let mut out = Vec[RegistryCandidate]::new()
     let source = registry_index_url(project_root)
-    if source == "" || (!update && !registry_lock_source_matches(project_root, source)) { ret out }
+    if source != "" && !update && !registry_lock_source_matches(project_root, source) { ret out }
     let base_reference = dependency_base_reference(reference)
     if !starts_with(base_reference, "index@") { ret out }
     let spec = base_reference.slice(6_usize, base_reference.len() - 6_usize)
@@ -196,6 +200,9 @@ pub fn registry_candidates(reference: str, project_root: Path, update: bool) -> 
         }
     }
 
+    if source == "" {
+        registry_error("No registry configured; set ENCORE_DEFAULT_INDEX or [registry].index") ret out
+    }
     let metadata = registry_metadata(name, update, source)
     if metadata == "" { ret out }
     let mut unsorted = registry_candidates_from_source(metadata, name, requirement, source)
@@ -259,15 +266,11 @@ fn registry_candidates_from_source(source: str, expected_name: str, requirement:
 fn registry_metadata(name: str, require_fresh: bool, index_url: str) -> str {
     let metadata_dir = registry_root(index_url).join("metadata")
     let metadata_path = metadata_dir.join(name + ".json")
-    let pending_path = metadata_dir.join(name + ".json.pending")
     mkdir_all(metadata_dir.as_str())
     let cached = if file_exists(metadata_path.as_str()) { read_file(metadata_path.as_str()) } else { "" }
     let cached_valid = registry_candidates_from_source(cached, name, "", index_url).len() > 0_usize
-    let metadata_url = index_url + "/" + name.slice(0_usize, 2_usize) + "/" + name + ".json"
-    remove_file(pending_path.as_str())
-    if download(metadata_url, pending_path) == 0_i32 {
-        let refreshed = read_file(pending_path.as_str())
-        remove_file(pending_path.as_str())
+    match registry_service_metadata(index_url, name) {
+      Result::Ok(refreshed) => {
         if registry_candidates_from_source(refreshed, name, "", index_url).len() > 0_usize {
             if write_file(metadata_path.as_str(), refreshed) == 0_i32 { ret refreshed }
             if !require_fresh && cached_valid { ret cached }
@@ -277,10 +280,13 @@ fn registry_metadata(name: str, require_fresh: bool, index_url: str) -> str {
         if !require_fresh && cached_valid { ret cached }
         registry_error("Invalid registry metadata for package '" + name + "' from " + index_url)
         ret ""
+      }
+      Result::Err(error) => {
+        if !require_fresh && cached_valid { ret cached }
+        registry_error("Unable to refresh registry metadata for package '" + name + "' from " + index_url + ": " + error)
+        ret ""
+      }
     }
-    remove_file(pending_path.as_str())
-    if !require_fresh && cached_valid { ret cached }
-    registry_error("Unable to refresh registry metadata for package '" + name + "' from " + index_url)
     ret ""
 }
 
@@ -684,7 +690,7 @@ pub fn resolve_cached_index_dependency(reference: str, project_root: Path) -> st
 
 fn locked_package_root(project_root: Path, reference: str, allow_install: bool) -> str {
     let index_url = registry_index_url(project_root)
-    if index_url == "" || !registry_lock_source_matches(project_root, index_url) { ret "" }
+    if index_url != "" && !registry_lock_source_matches(project_root, index_url) { ret "" }
     let lock = project_root.join("encore.lock")
     if !file_exists(lock.as_str()) { ret "" }
     let source = read_file(lock.as_str())
@@ -804,10 +810,11 @@ pub fn registry_index_url(project_root: Path) -> str {
         None => if configured != "" { configured } else {
             match env("ENCORE_DEFAULT_INDEX") {
                 Some(default_url) => default_url
-                None => "https://raw.githubusercontent.com/encore-ecosystem/encore-index/refs/heads/main"
+                None => ""
             }
         }
     }
+    if value == "" { ret "" }
     let normalized = normalize_registry_url(value)
     if normalized == "" { registry_error("Invalid registry index URL; use HTTPS, loopback HTTP or an absolute file URL without credentials, query or fragment") }
     ret normalized

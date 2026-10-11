@@ -1,0 +1,356 @@
+//! Drives separate package processes through metadata-ready and archive-ready.
+
+import core::option::Option
+import core::result::Result
+import core::fmt::Debug
+import std::os::{file_exists, is_directory, executable_path, file_sha256, mkdir_all, read_file, write_file}
+import std::path::Path
+import std::time::{sleep_ms, perf_counter_ms}
+import json::{Json, stringify, parse}
+import std::vec::Vec
+import refrain::project::workspace::ResolvedPackageGraph
+import refrain::project::build_graph::validate_build_graph
+import mod::build_scheduler::{BuildScheduler, BuildUnit}
+import mod::build_metadata::{MetadataContext, MetadataDependency}
+import mod::build_request::{BuildUnitRequest, UnitMetadataInput, unit_source_digest, unit_dependencies}
+import mod::build_artifacts::{UnitReady, read_unit_ready, read_unit_complete}
+import mod::build_archive::UnitNativePlan
+import mod::build_cache::{UnitCacheLock, try_unit_cache_lock, close_unit_cache_lock, restore_unit_cache, commit_unit_cache}
+import mod::build_fingerprint::unit_fingerprint
+import mod::build_prepared_cache::{restore_prepared_cache, commit_prepared_cache}
+import mod::build_frontend_cache::{restore_frontend_cache, commit_frontend_cache}
+import mod::build_resources::{UnitResourceEstimate, estimate_unit_resources, record_unit_resources, resource_positive}
+
+extern fn encore_compiler_jobserver_create(path: str, jobs: usize, memory: u64) -> usize
+extern fn encore_compiler_jobserver_cancel(server: usize) -> ()
+extern fn encore_compiler_jobserver_close(server: usize) -> ()
+extern fn encore_compiler_process_id() -> u64
+extern fn encore_compiler_worker_spawn_parts(program: str, arguments: usize, count: usize,
+    directory: str, stdout_path: str, stderr_path: str) -> usize
+extern fn encore_compiler_worker_poll(child: usize) -> i32
+extern fn encore_compiler_worker_cancel(child: usize) -> i32
+extern fn encore_compiler_worker_close(child: usize) -> ()
+extern fn encore_compiler_worker_interrupted() -> i32
+extern fn encore_compiler_worker_peak_rss(child: usize) -> u64
+
+/// A verified package result; caller still owns final support/native linking.
+pub struct CompiledPackage {
+    directory: Path
+    ready: UnitReady
+    archive_digest: str
+}
+
+struct PackageTask {
+    context: MetadataContext
+    directory: Path
+    child: usize
+    started: bool
+    ready: Option[UnitReady]
+    archive_digest: str
+    cache_lock: Option[UnitCacheLock]
+}
+
+/// The graph was resolved once from manifests. Staging must be fresh: this
+/// execution layer never silently treats another build's partial output as a
+/// cache hit. A later cache layer supplies independently verified completions.
+#attr(safe)
+pub fn compile_package_graph(graph: ResolvedPackageGraph, target: str, profile: str,
+    jobs: usize, memory_budget: u64, staging: Path, native: UnitNativePlan) -> Result[Vec[CompiledPackage], str] {
+    ret compile_cached_package_graph(graph, target, profile, jobs, memory_budget, staging, native, Option[Path]::None)
+}
+
+/// A content cache is optional only for isolated verification. Normal builds
+/// pass the shared compiler cache; worker requests always refer to private files.
+#attr(safe)
+pub fn compile_cached_package_graph(graph: ResolvedPackageGraph, target: str, profile: str,
+    jobs: usize, memory_budget: u64, staging: Path, native: UnitNativePlan, cache: Option[Path]) -> Result[Vec[CompiledPackage], str] {
+    validate_build_graph(graph)?
+    if !staging.is_absolute() || file_exists(staging.as_str()) || is_directory(staging.as_str()) {
+        ret Result[Vec[CompiledPackage], str]::Err("package graph needs a fresh absolute staging directory")
+    }
+    let compiler = executable_path()
+    let digest = file_sha256(compiler)
+    if compiler == "" || digest.byte_len() != 64 { ret Result[Vec[CompiledPackage], str]::Err("cannot identify package compiler") }
+    let native_text = native.encode()?
+    let native_digest = native.identity()?
+    let mut units = Vec[BuildUnit]::new()
+    let mut tasks = Vec[PackageTask]::new()
+    let mut index = 0_usize
+    for package in graph.refrains {
+        let context = MetadataContext{package.name, digest, target, profile, unit_source_digest(package)?, package.enabled_features}
+        let estimate = estimate_unit_resources(context, cache)
+        units.push(BuildUnit::new(package.name, package.dependency_names, estimate.weight_ms, estimate.memory_bytes))
+        tasks.push(PackageTask{context, staging.join("unit-" + Debug::fmt(index)),
+            0, false, Option[UnitReady]::None, "", Option[UnitCacheLock]::None})
+        index += 1
+    }
+    let mut scheduler = BuildScheduler::new(units, jobs, memory_budget)?
+    if mkdir_all(staging.as_str()) != 0 { ret Result[Vec[CompiledPackage], str]::Err("cannot create graph staging") }
+    let native_path = staging.join("native.json")
+    if write_file(native_path.as_str(), native_text) != 0 {
+        ret Result[Vec[CompiledPackage], str]::Err("cannot snapshot package native plan")
+    }
+    let server_path = staging.join("jobserver")
+    let server = unsafe { encore_compiler_jobserver_create(server_path.as_str(), jobs, memory_budget) }
+    if server == 0 { ret Result[Vec[CompiledPackage], str]::Err("cannot create package graph budget") }
+    let result = drive_packages(graph, compiler, native_path, native_digest, server_path, tasks, scheduler, cache)
+    if result.is_err() { unsafe { encore_compiler_jobserver_cancel(server) } }
+    // On every error reap all processes before closing their budget mapping.
+    for task in tasks {
+        if task.child != 0 {
+            let _cancelled = unsafe { encore_compiler_worker_cancel(task.child) }
+            unsafe { encore_compiler_worker_close(task.child) }
+        }
+        match task.cache_lock { Some(lock) => { close_unit_cache_lock(lock) } None => {} }
+    }
+    unsafe { encore_compiler_jobserver_close(server) }
+    result?
+    let mut outputs = Vec[CompiledPackage]::new()
+    for task in tasks {
+        let ready = match task.ready {
+            Some(value) => value
+            None => { ret Result[Vec[CompiledPackage], str]::Err("completed package has no metadata") }
+        }
+        outputs.push(CompiledPackage{task.directory, ready, task.archive_digest})
+    }
+    ret Result[Vec[CompiledPackage], str]::Ok(outputs)
+}
+
+#attr(safe)
+fn drive_packages(graph: ResolvedPackageGraph, compiler: str, native_path: Path, native_digest: str,
+    server_path: Path, tasks: mut Vec[PackageTask], scheduler: mut BuildScheduler, cache: Option[Path]) -> Result[(), str] {
+    let parent = unsafe { encore_compiler_process_id() }
+    let running = -2147483647_i32 - 1_i32
+    let mut completed = 0_usize
+    let started = perf_counter_ms()
+    while completed < tasks.len() {
+        if unsafe { encore_compiler_worker_interrupted() } != 0 {
+            ret Result[(), str]::Err("package graph cancelled")
+        }
+        let mut busy_keys = Vec[usize]::new()
+        let mut waiting_for_lock = false
+        loop {
+            let candidate = if cache.is_some() { scheduler.next_cache_candidate(busy_keys) } else { scheduler.next_ready_excluding(busy_keys) }
+            if candidate.is_none() { break }
+            let next = candidate.unwrap_or(0)
+            let task = match tasks.get(next) { Some(value) => value None => { ret Result[(), str]::Err("invalid scheduled package") } }
+            let mut inputs = Vec[UnitMetadataInput]::new()
+            let mut fingerprint_dependencies = Vec[MetadataDependency]::new()
+            for name in unit_dependencies(graph, task.context.unit)? {
+                let dependency = task_by_name(tasks, name)?
+                let ready = match dependency.ready { Some(value) => value None => { ret Result[(), str]::Err("scheduled dependency is not ready") } }
+                inputs.push(UnitMetadataInput{dependency.context, dependency.directory, ready.metadata_digest, ready.template_digest})
+                fingerprint_dependencies.push(MetadataDependency{name, ready.interface_digest, ready.template_digest})
+            }
+            let mut cache_lock = Option[UnitCacheLock]::None
+            match cache {
+                Some(root) => {
+                    let key = unit_fingerprint(task.context, fingerprint_dependencies, native_digest)?.native
+                    cache_lock = try_unit_cache_lock(root, key)?
+                    if cache_lock.is_none() { waiting_for_lock = true busy_keys.push(next) continue }
+                    // Record ownership before any fallible hydration operation.
+                    tasks.set(next, PackageTask{task.context, task.directory, 0, false, task.ready, "", cache_lock})
+                    let lock = match cache_lock { Some(value) => value None => { ret Result[(), str]::Err("missing cache lock") } }
+                    let dependencies = expected_dependencies(graph, tasks, task.context.unit)?
+                    match restore_unit_cache(lock, task.context, dependencies, native_digest, task.directory)? {
+                        Some(ready) => {
+                            let digest = read_unit_complete(task.directory, ready, native_digest)?
+                            if !scheduler.cached_complete(next) { ret Result[(), str]::Err("invalid cached package transition") }
+                            close_unit_cache_lock(lock)
+                            tasks.set(next, PackageTask{task.context, task.directory, 0, true, Option[UnitReady]::Some(ready), digest, Option[UnitCacheLock]::None})
+                            completed += 1
+                            write_package_timing(task.directory, task.context.unit, true, perf_counter_ms() - started, 0)?
+                            continue
+                        }
+                        None => {}
+                    }
+                    let backend_key = unit_fingerprint(task.context, fingerprint_dependencies, native_digest)?.backend
+                    let backend_lock = try_unit_cache_lock(root, backend_key)?
+                    match backend_lock {
+                        Some(prepared_lock) => {
+                            let restored = restore_prepared_cache(prepared_lock, task.context, dependencies, backend_key, task.directory)
+                            close_unit_cache_lock(prepared_lock)
+                            let backend_restored = restored?
+                            if !backend_restored {
+                                let frontend_key = unit_fingerprint(task.context, fingerprint_dependencies, native_digest)?.frontend
+                                match try_unit_cache_lock(root, frontend_key)? {
+                                    Some(frontend_lock) => {
+                                        let restored_frontend = restore_frontend_cache(frontend_lock, frontend_key, task.context, dependencies, task.directory)
+                                        close_unit_cache_lock(frontend_lock)
+                                        let _restored_frontend = restored_frontend?
+                                    }
+                                    None => {
+                                        close_unit_cache_lock(lock)
+                                        tasks.set(next, PackageTask{task.context, task.directory, 0, false, task.ready, "", Option[UnitCacheLock]::None})
+                                        waiting_for_lock = true busy_keys.push(next) continue
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            close_unit_cache_lock(lock)
+                            tasks.set(next, PackageTask{task.context, task.directory, 0, false, task.ready, "", Option[UnitCacheLock]::None})
+                            waiting_for_lock = true busy_keys.push(next) continue
+                        }
+                    }
+                }
+                None => {}
+            }
+            if !scheduler.can_start(next) {
+                match cache_lock { Some(lock) => { close_unit_cache_lock(lock) } None => {} }
+                tasks.set(next, PackageTask{task.context, task.directory, 0, false, task.ready, "", Option[UnitCacheLock]::None})
+                busy_keys.push(next)
+                continue
+            }
+            let request = BuildUnitRequest{graph, task.context, inputs, task.directory}
+            if mkdir_all(task.directory.as_str()) != 0 || write_file(task.directory.join("queued-ms").as_str(), Debug::fmt(perf_counter_ms() - started)) != 0 {
+                ret Result[(), str]::Err("cannot record package queue time")
+            }
+            let request_path = server_path.parent().unwrap_or(Path::new("")).join("request-" + Debug::fmt(next) + ".json")
+            if write_file(request_path.as_str(), request.encode()?) != 0 || !scheduler.start(next) {
+                ret Result[(), str]::Err("cannot admit package worker")
+            }
+            let mut arguments = Vec[str]::new()
+            arguments.push("__compile-unit") arguments.push(request_path.as_str())
+            arguments.push(native_path.as_str()) arguments.push(server_path.as_str())
+            arguments.push(Debug::fmt(parent)) arguments.push(Debug::fmt(scheduler.memory_reservation(next)))
+            let directory = server_path.parent().unwrap_or(Path::new(""))
+            let child = unsafe { encore_compiler_worker_spawn_parts(compiler, arguments.as_ptr() as usize,
+                arguments.len(), directory.as_str(), directory.join("worker-" + Debug::fmt(next) + ".stdout").as_str(),
+                directory.join("worker-" + Debug::fmt(next) + ".stderr").as_str()) }
+            if child == 0 { ret Result[(), str]::Err("cannot launch package compiler: " + task.context.unit) }
+            if write_file(directory.join("worker-" + Debug::fmt(next) + ".started").as_str(), Debug::fmt(perf_counter_ms())) != 0 {
+                // Register the child before propagating an I/O error.
+                tasks.set(next, PackageTask{task.context, task.directory, child, true, task.ready, task.archive_digest, cache_lock})
+                ret Result[(), str]::Err("cannot record package start")
+            }
+            tasks.set(next, PackageTask{task.context, task.directory, child, true, task.ready, task.archive_digest, cache_lock})
+        }
+        let mut live = 0_usize
+        let mut index = 0_usize
+        while index < tasks.len() {
+            let task = match tasks.get(index) { Some(value) => value None => { ret Result[(), str]::Err("invalid package state") } }
+            if task.child == 0 { index += 1 continue }
+            live += 1
+            let newly_ready = task.ready.is_none() && file_exists(task.directory.join("unit.ready").as_str())
+            let ready = if newly_ready {
+                let dependencies = expected_dependencies(graph, tasks, task.context.unit)?
+                Option[UnitReady]::Some(read_unit_ready(task.directory, task.context, dependencies)?)
+            } else { task.ready }
+            if newly_ready {
+                if !scheduler.metadata_ready(index) { ret Result[(), str]::Err("invalid package metadata transition") }
+                tasks.set(index, PackageTask{task.context, task.directory, task.child, true, ready, "", task.cache_lock})
+                match cache {
+                    Some(root) => {
+                        let mut all_dependencies = Vec[MetadataDependency]::new()
+                        for name in unit_dependencies(graph, task.context.unit)? {
+                            let dependency = task_by_name(tasks, name)?
+                            let dependency_ready = match dependency.ready { Some(value) => value None => { ret Result[(), str]::Err("prepared dependency missing") } }
+                            all_dependencies.push(MetadataDependency{name, dependency_ready.interface_digest, dependency_ready.template_digest})
+                        }
+                        let fingerprints = unit_fingerprint(task.context, all_dependencies, native_digest)?
+                        let key = fingerprints.backend
+                        match try_unit_cache_lock(root, key)? {
+                            Some(lock) => {
+                                let committed = commit_prepared_cache(lock, task.context, expected_dependencies(graph, tasks, task.context.unit)?, key, task.directory)
+                                close_unit_cache_lock(lock)
+                                committed?
+                            }
+                            // Another build's identical prepared snapshot can
+                            // finish first. Missing this optional warm-up is safe.
+                            None => {}
+                        }
+                        // Backend-cache hits have no raw frontend checkpoint in
+                        // their private output. Keep any existing frontend entry.
+                        if file_exists(task.directory.join("unit.frontend").as_str()) {
+                            match try_unit_cache_lock(root, fingerprints.frontend)? {
+                                Some(lock) => {
+                                    let committed = commit_frontend_cache(lock, fingerprints.frontend, task.context,
+                                        expected_dependencies(graph, tasks, task.context.unit)?, task.directory)
+                                    close_unit_cache_lock(lock)
+                                    committed?
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+            let status = unsafe { encore_compiler_worker_poll(task.child) }
+            if status != running {
+                if status != 0 {
+                    let directory = server_path.parent().unwrap_or(Path::new(""))
+                    ret Result[(), str]::Err("package failed: " + task.context.unit + "\n" +
+                        read_file(directory.join("worker-" + Debug::fmt(index) + ".stderr").as_str()))
+                }
+                let record = match ready { Some(value) => value None => { ret Result[(), str]::Err("package exited without metadata") } }
+                let digest = read_unit_complete(task.directory, record, native_digest)?
+                let peak = unsafe { encore_compiler_worker_peak_rss(task.child) }
+                write_package_timing(task.directory, task.context.unit, false, perf_counter_ms() - started, peak)?
+                match cache {
+                    Some(root) => {
+                        let phases = parse(read_file(task.directory.join("phases.json").as_str())).unwrap_or(Json::Null)
+                        let native_peak = resource_positive(phases.get("native_peak_bound_bytes").unwrap_or(Json::Null).as_number().unwrap_or(""))
+                        let preparation = resource_positive(phases.get("prepare_ms").unwrap_or(Json::Null).as_number().unwrap_or(""))
+                        let native_ms = resource_positive(phases.get("native_ms").unwrap_or(Json::Null).as_number().unwrap_or(""))
+                        if peak <= 18446744073709551615_u64 - native_peak {
+                            let _recorded = record_unit_resources(task.context, root, peak + native_peak, preparation + native_ms)
+                        }
+                    }
+                    None => {}
+                }
+                match task.cache_lock {
+                    Some(lock) => {
+                        commit_unit_cache(lock, task.directory, task.context, expected_dependencies(graph, tasks, task.context.unit)?, native_digest)?
+                        close_unit_cache_lock(lock)
+                        tasks.set(index, PackageTask{task.context, task.directory, task.child, true, ready, digest, Option[UnitCacheLock]::None})
+                    }
+                    None => {}
+                }
+                if !scheduler.complete(index) { ret Result[(), str]::Err("invalid package completion transition") }
+                unsafe { encore_compiler_worker_close(task.child) }
+                tasks.set(index, PackageTask{task.context, task.directory, 0, true, ready, digest, Option[UnitCacheLock]::None})
+                completed += 1
+            }
+            index += 1
+        }
+        if completed < tasks.len() && live == 0 && !waiting_for_lock && scheduler.next_ready().is_none() {
+            ret Result[(), str]::Err("no package can fit the build resource budget")
+        }
+        if completed < tasks.len() { let _sleep = sleep_ms(5) }
+    }
+    ret Result[(), str]::Ok(())
+}
+
+fn write_package_timing(directory: Path, name: str, hit: bool, elapsed: u64, peak: u64) -> Result[(), str] {
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(("unit", Json::String(name)))
+    fields.push(("cache_hit", Json::Bool(hit)))
+    fields.push(("completed_ms", Json::Number(Debug::fmt(elapsed))))
+    fields.push(("peak_rss_bytes", Json::Number(Debug::fmt(peak))))
+    fields.push(("queue_ms", Json::Number(if hit { Debug::fmt(elapsed) } else { read_file(directory.join("queued-ms").as_str()) })))
+    fields.push(("phases", if hit { Json::Null } else { parse(read_file(directory.join("phases.json").as_str())).unwrap_or(Json::Null) }))
+    if write_file(directory.join("timing.json").as_str(), stringify(Json::Object(fields))) != 0 {
+        ret Result[(), str]::Err("cannot record package timing")
+    }
+    ret Result[(), str]::Ok(())
+}
+
+fn task_by_name(tasks: Vec[PackageTask], name: str) -> Result[PackageTask, str] {
+    for task in tasks { if task.context.unit == name { ret Result[PackageTask, str]::Ok(task) } }
+    ret Result[PackageTask, str]::Err("unknown package task: " + name)
+}
+
+fn expected_dependencies(graph: ResolvedPackageGraph, tasks: Vec[PackageTask], unit: str) -> Result[Vec[MetadataDependency], str] {
+    let mut dependencies = Vec[MetadataDependency]::new()
+    for package in graph.refrains {
+        if package.name != unit { continue }
+        for name in package.dependency_names {
+            let task = task_by_name(tasks, name)?
+            let ready = match task.ready { Some(value) => value None => { ret Result[Vec[MetadataDependency], str]::Err("dependency metadata absent") } }
+            dependencies.push(MetadataDependency{name, ready.interface_digest, ready.template_digest})
+        }
+    }
+    ret Result[Vec[MetadataDependency], str]::Ok(dependencies)
+}

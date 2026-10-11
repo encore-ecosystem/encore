@@ -1155,14 +1155,14 @@ fn semantic_types_compatible(expected: str, actual: str) -> bool {
 
 fn semantic_root_type(typ: str) -> str {
     let mut value = typ
-    while value.len() > 0_usize &&(ends_with(value, "&") || ends_with(value, "*")) {
-        value = value.slice(0_usize, value.len() - 1_usize)
+    while value.byte_len() > 0_usize &&(value.byte_at(value.byte_len() - 1) == 38 || value.byte_at(value.byte_len() - 1) == 42) {
+        value = value.slice_bytes(0, value.byte_len() - 1)
     }
     let mut index = 0_usize
-    while index < value.len() {
-        let ch = value.slice(index, 1_usize)
-        if ch == "[" || ch == "<" {
-            ret value.slice(0_usize, index)
+    while index < value.byte_len() {
+        let byte = value.byte_at(index)
+        if byte == 91 || byte == 60 {
+            ret value.slice_bytes(0, index)
         }
         index += 1_usize
     }
@@ -1178,16 +1178,47 @@ fn type_contains_inference_hole(typ: str) -> bool {
 }
 
 fn compact_type(value: str) -> str {
+    // Canonical types are already compact. Do not allocate a one-character
+    // string and rebuild the whole type for every candidate member lookup.
     let mut out = ""
+    let mut start = 0_usize
     let mut index = 0_usize
-    while index < value.len() {
-        let ch = value.slice(index, 1_usize)
-        if ch != " " && ch != "\t" && ch != "\n" && ch != "\r" {
-            out += ch
+    while index < value.byte_len() {
+        let byte = value.byte_at(index)
+        if byte == 32 || byte == 9 || byte == 10 || byte == 13 {
+            if index > start {
+                out += value.slice_bytes(start, index - start)
+            }
+            start = index + 1
         }
         index += 1_usize
     }
+    if start == 0 {
+        ret value
+    }
+    if index > start {
+        out += value.slice_bytes(start, index - start)
+    }
     ret out
+}
+
+#attr(test)
+fn semantic_compact_type_preserves_unicode_contract() -> bool {
+    ret compact_type("Модуль::Тип[u32]") == "Модуль::Тип[u32]"
+    && compact_type(" \tМодуль::Тип [ u32,\r\n Vec[ str ] ] ") == "Модуль::Тип[u32,Vec[str]]"
+    && compact_type(" \t\r\n") == ""
+    && semantic_root_type("Модуль::Тип[u32]&") == "Модуль::Тип"
+    && semantic_root_type("Модуль::Тип*") == "Модуль::Тип"
+}
+
+#attr(test)
+fn semantic_receiver_substitution_identity_contract() -> bool {
+    let mut generics = Vec[str]::new()
+    generics.push("T")
+    ret semantic_receiver_matches("owner::Box[T]", "owner::Box[Vec[u32]]", generics)
+    && !semantic_receiver_matches("owner::Box[T]", "other::Box[u32]", generics)
+    && !semantic_receiver_matches("owner::Pair[T,T]", "owner::Pair[u32,str]", generics)
+    && semantic_receiver_matches("owner::Pair[ T, T ]", "owner::Pair[u32,u32]", generics)
 }
 
 fn generic_container_compatible(expected: str, actual: str) -> bool {
@@ -2341,7 +2372,7 @@ fn resolve_field_type(ctx: mut SemanticContext, owner: str, name: str) -> str {
         ret tuple_element_type(owner, name)
     }
     for field in ctx.fields {
-        if semantic_receiver_matches(field.owner_type, owner, field.generic_names) && field.name == name {
+        if field.name == name && semantic_receiver_matches(field.owner_type, owner, field.generic_names) {
             let mut recorded = false
             for dependency in ctx.dependencies {
                 if dependency.kind == SemanticDependencyKind::Field
@@ -2785,7 +2816,7 @@ fn resolve_method_call(
     let mut expected_arity = 0_usize
     let mut expected_params = Vec[str]::new()
     for method in ctx.methods {
-        if method.is_static {
+        if method.is_static || method.name != name {
             continue
         }
         if is_generic_receiver && semantic_type_name(method.receiver_type) != generic_receiver {
@@ -2850,6 +2881,15 @@ fn resolve_method_call(
         ret ""
     }
 
+    // Successful lookups never specialize unrelated method names. Only a
+    // missing name needs the broader receiver scan for the original diagnostic.
+    if !saw_receiver && !builtin_receiver_type(receiver) {
+        for method in ctx.methods {
+            if !method.is_static && semantic_receiver_matches(method.receiver_type, receiver, method.generic_names) {
+                saw_receiver = true break
+            }
+        }
+    }
     if receiver != "" && saw_receiver && !builtin_receiver_type(receiver) {
         let mut diagnostic = FrontendDiagnostic::new(
             1_usize,

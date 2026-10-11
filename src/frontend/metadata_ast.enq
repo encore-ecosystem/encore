@@ -1,0 +1,1904 @@
+//! Structured declaration metadata; decoding never lexes dependency source.
+//!
+//! Record layouts belong to the enclosing metadata schema. They preserve
+//! capabilities, generics, documentation and source spans, not display text.
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+import json::Json
+import refrain::frontend::parser::{Documentation, FunctionParam, DecoratorApplication, NamedField, TraitBound, GenericParam, ParsedEnumVariant, ImportStmt, StructStmt, EnumStmt, FunctionItem, TraitStmt, ImplStmt, MatchPattern, ExprNode, ParsedBlock, LetStmt, AssignmentStmt, IfBranch, IfStmt, ParsedMatchArm, MatchStmt, WhileStmt, LoopStmt, DoWhileStmt, ForStmt, EhirStmt, UnaryExpr, CastExpr, BinaryExpr, CallExpr, FieldExpr, MethodCallExpr, MatchExprArm, MatchExpr, StructInitExpr, TupleLiteralExpr, ArrayLiteralExpr, ArrayRepeatExpr, WithStmt, BlockExpr, IfExprBranch, IfExpr, IndexExpr, ClosureExpr, Statement, Expr, MatchArmBody}
+import std::vec::Vec
+
+struct MetadataEncoding {
+    source: str
+    locations: bool
+    documentation: bool
+}
+
+/// Serializes a selected declaration graph without exposing parser internals.
+pub fn encode_metadata_ast(ast: Vec[Statement]) -> Json {
+    let encoding = MetadataEncoding{"", true, true}
+    ret encode_vec_statement(ast, encoding)
+}
+
+/// Encodes source identities relative to the declaring module, never a build
+/// directory. Moving a cache entry cannot change its ABI identity or make it
+/// reference the machine where the package was first compiled.
+pub fn encode_metadata_ast_for_module(ast: Vec[Statement], module_id: str) -> Json {
+    ret encode_vec_statement(ast, MetadataEncoding{module_id, true, true})
+}
+
+/// Encodes the semantic declaration contract, excluding runtime bodies,
+/// documentation and source locations. A moved or edited function body must
+/// not change dependent frontend keys when its caller-visible contract stays
+/// the same. This projection is only a fingerprint, never loaded as metadata.
+pub fn encode_metadata_contract_ast(ast: Vec[Statement]) -> Json {
+    ret encode_vec_statement(metadata_interface_ast(ast), MetadataEncoding{"", false, false})
+}
+
+/// Restores a checked declaration graph without opening or parsing source.
+pub fn decode_metadata_ast(data: Json) -> Result[Vec[Statement], str] {
+    ret decode_vec_statement(data)
+}
+
+/// Removes ordinary and generic runtime bodies from declaration metadata.
+/// Generic machine templates travel as EHIR, not reparsed Encore source.
+/// Decorators are compile-time syntax transformations and retain structured
+/// syntax. An empty default-method marker records that a definition exists;
+/// the actual implementation is supplied by its package's EHIR/artifact.
+pub fn metadata_interface_ast(ast: Vec[Statement]) -> Vec[Statement] {
+    let mut out = Vec[Statement]::new()
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => {
+                out.push(Statement::Function(interface_function(item, false)))
+            }
+            Statement::Trait(item) => {
+                let mut methods = Vec[FunctionItem]::new()
+                for method in item.methods {
+                    methods.push(interface_function(method, true))
+                }
+                out.push(Statement::Trait(TraitStmt {
+                            item.is_public, item.name, item.documentation, item.generics,
+                            item.bases, methods, item.source_name, item.line, item.column
+                        }
+                        ,))
+            }
+            Statement::Impl(item) => {
+                let mut methods = Vec[FunctionItem]::new()
+                for method in item.methods {
+                    methods.push(interface_function(method, false))
+                }
+                out.push(Statement::Impl(ImplStmt {
+                            item.documentation, item.generics, item.trait_name, item.trait_args,
+                            item.target, methods, item.source_name, item.line, item.column
+                        }
+                        ,))
+            }
+            _ => {
+                out.push(statement)
+            }
+        }
+    }
+    ret out
+}
+
+fn interface_function(item: FunctionItem, default_method: bool) -> FunctionItem {
+    let mut decorator = false
+    for attr in item.attrs {
+        if attr == "decorator" || attr == "attr:decorator" {
+            decorator = true
+        }
+    }
+    let body = if decorator {
+        item.body
+    } elif default_method && item.body.is_some() {
+        Option[ParsedBlock]::Some(ParsedBlock::synthetic(Vec[Statement]::new()))
+    } else {
+        Option[ParsedBlock]::None
+    }
+    ret FunctionItem {
+        item.attrs, item.decorators, item.is_public, item.is_extern, item.is_async, item.name,
+        item.documentation, item.generics, item.params, item.ret_type, item.returns_sending, item.returns_frozen,
+        body, item.source_name, item.line, item.column
+    }
+}
+
+fn encode_str(value: str, _encoding: MetadataEncoding) -> Json {
+    ret Json::String(value)
+}
+fn encode_source(value: str, encoding: MetadataEncoding) -> Json {
+    ret Json::String(if !encoding.locations { "" } elif encoding.source == "" { value } else { encoding.source })
+}
+fn encode_bool(value: bool, _encoding: MetadataEncoding) -> Json {
+    ret Json::Bool(value)
+}
+fn encode_usize(value: usize, encoding: MetadataEncoding) -> Json {
+    ret Json::Number(if encoding.locations { Debug::fmt(value) } else { "0" })
+}
+
+fn decode_str(data: Json) -> Result[str, str] {
+    ret match data {
+        Json::String(value) => Result[str, str]::Ok(value)
+        _ => Result[str, str]::Err("metadata field must be a string")
+    }
+}
+fn decode_bool(data: Json) -> Result[bool, str] {
+    ret match data {
+        Json::Bool(value) => Result[bool, str]::Ok(value)
+        _ => Result[bool, str]::Err("metadata field must be a boolean")
+    }
+}
+/// Decodes a bounded portable source coordinate in the metadata schema.
+pub fn decode_metadata_position(data: Json) -> Result[usize, str] {
+    ret decode_usize(data)
+}
+
+fn decode_usize(data: Json) -> Result[usize, str] {
+    let text = match data {
+        Json::Number(value) => value
+        _ => {
+            ret Result[usize, str]::Err("metadata source position must be an integer")
+        }
+    }
+    if text == "" {
+        ret Result[usize, str]::Err("empty metadata position")
+    }
+    let mut value = 0_u64
+    let mut index = 0_usize
+    while index < text.byte_len() {
+        let byte = text.byte_at(index)
+        if byte < 48 || byte > 57 {
+            ret Result[usize, str]::Err("invalid metadata position")
+        }
+        value = value * 10 +(byte - 48) as u64
+        if value > 4294967295_u64 {
+            ret Result[usize, str]::Err("metadata position exceeds portable range")
+        }
+        index += 1
+    }
+    ret Result[usize, str]::Ok(value as usize)
+}
+fn record(data: Json, size: usize) -> Result[Vec[Json], str] {
+    match data {
+        Json::Array(values) => {
+            if values.len() != size {
+                ret Result[Vec[Json], str]::Err("invalid metadata record size")
+            }
+            ret Result[Vec[Json], str]::Ok(values)
+        }
+        _ => {
+            ret Result[Vec[Json], str]::Err("metadata record must be an array")
+        }
+    }
+    ret Result[Vec[Json], str]::Err("metadata record must be an array")
+}
+fn encode_expr_node_heap(value: ExprNode < H >, encoding: MetadataEncoding) -> Json {
+    ret encode_expr_node(ExprNode {
+            value.value, value.line, value.column, value.length, value.source_name
+        }
+        , encoding)
+}
+fn decode_expr_node_heap(data: Json) -> Result[ExprNode < H >, str] {
+    let value = decode_expr_node(data)?
+    ret Result[ExprNode < H >, str]::Ok(ExprNode < H > {
+            value.value, value.line, value.column, value.length, value.source_name
+        }
+        ,
+    )
+}
+
+fn encode_option_str(value: Option[str], encoding: MetadataEncoding) -> Json {
+    ret match value {
+        Some(item) => encode_str(item, encoding) None => Json::Null
+    }
+}
+fn decode_option_str(data: Json) -> Result[Option[str], str] {
+    if data.is_null() {
+        ret Result[Option[str], str]::Ok(Option[str]::None)
+    }
+    ret Result[Option[str], str]::Ok(Option[str]::Some(decode_str(data)?))
+}
+
+/// Encodes module documentation with its original source coordinate.
+pub fn encode_metadata_documentation(value: Option[Documentation]) -> Json {
+    let encoding = MetadataEncoding{"", true, true}
+    ret encode_option_documentation(value, encoding)
+}
+
+/// Restores module documentation without opening its dependency source file.
+pub fn decode_metadata_documentation(data: Json) -> Result[Option[Documentation], str] {
+    ret decode_option_documentation(data)
+}
+
+fn encode_option_documentation(value: Option[Documentation], encoding: MetadataEncoding) -> Json {
+    if !encoding.documentation { ret Json::Null }
+    ret match value {
+        Some(item) => encode_documentation(item, encoding) None => Json::Null
+    }
+}
+fn decode_option_documentation(data: Json) -> Result[Option[Documentation], str] {
+    if data.is_null() {
+        ret Result[Option[Documentation], str]::Ok(Option[Documentation]::None)
+    }
+    ret Result[Option[Documentation], str]::Ok(Option[Documentation]::Some(decode_documentation(data)?))
+}
+
+fn encode_vec_str(values: Vec[str], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_str(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_str(data: Json) -> Result[Vec[str], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[str], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[str]::new()
+    for value in values {
+        out.push(decode_str(value)?)
+    }
+    ret Result[Vec[str], str]::Ok(out)
+}
+
+fn encode_vec_trait_bound(values: Vec[TraitBound], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_trait_bound(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_trait_bound(data: Json) -> Result[Vec[TraitBound], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[TraitBound], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[TraitBound]::new()
+    for value in values {
+        out.push(decode_trait_bound(value)?)
+    }
+    ret Result[Vec[TraitBound], str]::Ok(out)
+}
+
+fn encode_vec_generic_param(values: Vec[GenericParam], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_generic_param(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_generic_param(data: Json) -> Result[Vec[GenericParam], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[GenericParam], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[GenericParam]::new()
+    for value in values {
+        out.push(decode_generic_param(value)?)
+    }
+    ret Result[Vec[GenericParam], str]::Ok(out)
+}
+
+fn encode_vec_named_field(values: Vec[NamedField], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_named_field(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_named_field(data: Json) -> Result[Vec[NamedField], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[NamedField], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[NamedField]::new()
+    for value in values {
+        out.push(decode_named_field(value)?)
+    }
+    ret Result[Vec[NamedField], str]::Ok(out)
+}
+
+fn encode_vec_parsed_enum_variant(values: Vec[ParsedEnumVariant], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_parsed_enum_variant(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_parsed_enum_variant(data: Json) -> Result[Vec[ParsedEnumVariant], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[ParsedEnumVariant], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[ParsedEnumVariant]::new()
+    for value in values {
+        out.push(decode_parsed_enum_variant(value)?)
+    }
+    ret Result[Vec[ParsedEnumVariant], str]::Ok(out)
+}
+
+fn encode_vec_decorator_application(values: Vec[DecoratorApplication], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_decorator_application(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_decorator_application(data: Json) -> Result[Vec[DecoratorApplication], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[DecoratorApplication], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[DecoratorApplication]::new()
+    for value in values {
+        out.push(decode_decorator_application(value)?)
+    }
+    ret Result[Vec[DecoratorApplication], str]::Ok(out)
+}
+
+fn encode_vec_function_param(values: Vec[FunctionParam], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_function_param(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_function_param(data: Json) -> Result[Vec[FunctionParam], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[FunctionParam], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[FunctionParam]::new()
+    for value in values {
+        out.push(decode_function_param(value)?)
+    }
+    ret Result[Vec[FunctionParam], str]::Ok(out)
+}
+
+fn encode_option_parsed_block(value: Option[ParsedBlock], encoding: MetadataEncoding) -> Json {
+    ret match value {
+        Some(item) => encode_parsed_block(item, encoding) None => Json::Null
+    }
+}
+fn decode_option_parsed_block(data: Json) -> Result[Option[ParsedBlock], str] {
+    if data.is_null() {
+        ret Result[Option[ParsedBlock], str]::Ok(Option[ParsedBlock]::None)
+    }
+    ret Result[Option[ParsedBlock], str]::Ok(Option[ParsedBlock]::Some(decode_parsed_block(data)?))
+}
+
+fn encode_vec_function_item(values: Vec[FunctionItem], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_function_item(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_function_item(data: Json) -> Result[Vec[FunctionItem], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[FunctionItem], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[FunctionItem]::new()
+    for value in values {
+        out.push(decode_function_item(value)?)
+    }
+    ret Result[Vec[FunctionItem], str]::Ok(out)
+}
+
+fn encode_vec_statement(values: Vec[Statement], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_statement(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_statement(data: Json) -> Result[Vec[Statement], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[Statement], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[Statement]::new()
+    for value in values {
+        out.push(decode_statement(value)?)
+    }
+    ret Result[Vec[Statement], str]::Ok(out)
+}
+
+fn encode_vec_if_branch(values: Vec[IfBranch], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_if_branch(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_if_branch(data: Json) -> Result[Vec[IfBranch], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[IfBranch], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[IfBranch]::new()
+    for value in values {
+        out.push(decode_if_branch(value)?)
+    }
+    ret Result[Vec[IfBranch], str]::Ok(out)
+}
+
+fn encode_vec_parsed_match_arm(values: Vec[ParsedMatchArm], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_parsed_match_arm(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_parsed_match_arm(data: Json) -> Result[Vec[ParsedMatchArm], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[ParsedMatchArm], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[ParsedMatchArm]::new()
+    for value in values {
+        out.push(decode_parsed_match_arm(value)?)
+    }
+    ret Result[Vec[ParsedMatchArm], str]::Ok(out)
+}
+
+fn encode_vec_expr_node(values: Vec[ExprNode], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_expr_node(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_expr_node(data: Json) -> Result[Vec[ExprNode], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[ExprNode], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[ExprNode]::new()
+    for value in values {
+        out.push(decode_expr_node(value)?)
+    }
+    ret Result[Vec[ExprNode], str]::Ok(out)
+}
+
+fn encode_vec_match_expr_arm(values: Vec[MatchExprArm], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_match_expr_arm(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_match_expr_arm(data: Json) -> Result[Vec[MatchExprArm], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[MatchExprArm], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[MatchExprArm]::new()
+    for value in values {
+        out.push(decode_match_expr_arm(value)?)
+    }
+    ret Result[Vec[MatchExprArm], str]::Ok(out)
+}
+
+fn encode_option_expr_node_heap(value: Option[ExprNode < H >], encoding: MetadataEncoding) -> Json {
+    ret match value {
+        Some(item) => encode_expr_node_heap(item, encoding) None => Json::Null
+    }
+}
+fn decode_option_expr_node_heap(data: Json) -> Result[Option[ExprNode < H >], str] {
+    if data.is_null() {
+        ret Result[Option[ExprNode < H >], str]::Ok(Option[ExprNode < H >]::None)
+    }
+    ret Result[Option[ExprNode < H >], str]::Ok(Option[ExprNode < H >]::Some(decode_expr_node_heap(data)?))
+}
+
+fn encode_vec_if_expr_branch(values: Vec[IfExprBranch], encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in values {
+        out.push(encode_if_expr_branch(value, encoding))
+    }
+    ret Json::Array(out)
+}
+fn decode_vec_if_expr_branch(data: Json) -> Result[Vec[IfExprBranch], str] {
+    let values = match data {
+        Json::Array(items) => items
+        _ => {
+            ret Result[Vec[IfExprBranch], str]::Err("metadata list must be an array")
+        }
+    }
+    let mut out = Vec[IfExprBranch]::new()
+    for value in values {
+        out.push(decode_if_expr_branch(value)?)
+    }
+    ret Result[Vec[IfExprBranch], str]::Ok(out)
+}
+
+fn encode_documentation(value: Documentation, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_str(value.text, encoding))
+    out.push(encode_usize(value.line, encoding))
+    out.push(encode_usize(value.column, encoding))
+    ret Json::Array(out)
+}
+fn decode_documentation(data: Json) -> Result[Documentation, str] {
+    let values = record(data, 3)?
+    let text = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let line = decode_usize(values.get(1).unwrap_or(Json::Null))?
+    let column = decode_usize(values.get(2).unwrap_or(Json::Null))?
+    ret Result[Documentation, str]::Ok(Documentation {
+            text, line, column
+        }
+        ,
+    )
+}
+
+fn encode_function_param(value: FunctionParam, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_str(value.name, encoding))
+    out.push(encode_option_str(value.typ, encoding))
+    out.push(encode_bool(value.is_sending, encoding))
+    out.push(encode_bool(value.is_frozen, encoding))
+    out.push(encode_usize(value.line, encoding))
+    out.push(encode_usize(value.column, encoding))
+    ret Json::Array(out)
+}
+fn decode_function_param(data: Json) -> Result[FunctionParam, str] {
+    let values = record(data, 6)?
+    let name = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let typ = decode_option_str(values.get(1).unwrap_or(Json::Null))?
+    let is_sending = decode_bool(values.get(2).unwrap_or(Json::Null))?
+    let is_frozen = decode_bool(values.get(3).unwrap_or(Json::Null))?
+    let line = decode_usize(values.get(4).unwrap_or(Json::Null))?
+    let column = decode_usize(values.get(5).unwrap_or(Json::Null))?
+    ret Result[FunctionParam, str]::Ok(FunctionParam {
+            name, typ, is_sending, is_frozen, line, column
+        }
+        ,
+    )
+}
+
+fn encode_decorator_application(value: DecoratorApplication, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node(value.expression, encoding))
+    ret Json::Array(out)
+}
+fn decode_decorator_application(data: Json) -> Result[DecoratorApplication, str] {
+    let values = record(data, 1)?
+    let expression = decode_expr_node(values.get(0).unwrap_or(Json::Null))?
+    ret Result[DecoratorApplication, str]::Ok(DecoratorApplication {
+            expression
+        }
+    )
+}
+
+fn encode_named_field(value: NamedField, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_str(value.name, encoding))
+    out.push(encode_str(value.typ, encoding))
+    out.push(encode_option_documentation(value.documentation, encoding))
+    out.push(encode_usize(value.line, encoding))
+    out.push(encode_usize(value.column, encoding))
+    ret Json::Array(out)
+}
+fn decode_named_field(data: Json) -> Result[NamedField, str] {
+    let values = record(data, 5)?
+    let name = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let typ = decode_str(values.get(1).unwrap_or(Json::Null))?
+    let documentation = decode_option_documentation(values.get(2).unwrap_or(Json::Null))?
+    let line = decode_usize(values.get(3).unwrap_or(Json::Null))?
+    let column = decode_usize(values.get(4).unwrap_or(Json::Null))?
+    ret Result[NamedField, str]::Ok(NamedField {
+            name, typ, documentation, line, column
+        }
+        ,
+    )
+}
+
+fn encode_trait_bound(value: TraitBound, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_str(value.path, encoding))
+    out.push(encode_vec_str(value.args, encoding))
+    ret Json::Array(out)
+}
+fn decode_trait_bound(data: Json) -> Result[TraitBound, str] {
+    let values = record(data, 2)?
+    let path = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let args = decode_vec_str(values.get(1).unwrap_or(Json::Null))?
+    ret Result[TraitBound, str]::Ok(TraitBound {
+            path, args
+        }
+        ,
+    )
+}
+
+fn encode_generic_param(value: GenericParam, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_str(value.name, encoding))
+    out.push(encode_vec_trait_bound(value.bounds, encoding))
+    ret Json::Array(out)
+}
+fn decode_generic_param(data: Json) -> Result[GenericParam, str] {
+    let values = record(data, 2)?
+    let name = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let bounds = decode_vec_trait_bound(values.get(1).unwrap_or(Json::Null))?
+    ret Result[GenericParam, str]::Ok(GenericParam {
+            name, bounds
+        }
+        ,
+    )
+}
+
+fn encode_parsed_enum_variant(value: ParsedEnumVariant, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_str(value.name, encoding))
+    out.push(encode_option_documentation(value.documentation, encoding))
+    out.push(encode_vec_generic_param(value.generics, encoding))
+    out.push(encode_vec_named_field(value.named_fields, encoding))
+    out.push(encode_vec_str(value.tuple_fields, encoding))
+    out.push(encode_bool(value.is_tuple, encoding))
+    out.push(encode_bool(value.is_unit, encoding))
+    out.push(encode_usize(value.line, encoding))
+    out.push(encode_usize(value.column, encoding))
+    ret Json::Array(out)
+}
+fn decode_parsed_enum_variant(data: Json) -> Result[ParsedEnumVariant, str] {
+    let values = record(data, 9)?
+    let name = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let documentation = decode_option_documentation(values.get(1).unwrap_or(Json::Null))?
+    let generics = decode_vec_generic_param(values.get(2).unwrap_or(Json::Null))?
+    let named_fields = decode_vec_named_field(values.get(3).unwrap_or(Json::Null))?
+    let tuple_fields = decode_vec_str(values.get(4).unwrap_or(Json::Null))?
+    let is_tuple = decode_bool(values.get(5).unwrap_or(Json::Null))?
+    let is_unit = decode_bool(values.get(6).unwrap_or(Json::Null))?
+    let line = decode_usize(values.get(7).unwrap_or(Json::Null))?
+    let column = decode_usize(values.get(8).unwrap_or(Json::Null))?
+    ret Result[ParsedEnumVariant, str]::Ok(ParsedEnumVariant {
+            name, documentation, generics, named_fields, tuple_fields, is_tuple, is_unit, line, column
+        }
+        ,
+    )
+}
+
+fn encode_import_stmt(value: ImportStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_bool(value.is_public, encoding))
+    out.push(encode_str(value.path, encoding))
+    out.push(encode_option_documentation(value.documentation, encoding))
+    ret Json::Array(out)
+}
+fn decode_import_stmt(data: Json) -> Result[ImportStmt, str] {
+    let values = record(data, 3)?
+    let is_public = decode_bool(values.get(0).unwrap_or(Json::Null))?
+    let path = decode_str(values.get(1).unwrap_or(Json::Null))?
+    let documentation = decode_option_documentation(values.get(2).unwrap_or(Json::Null))?
+    ret Result[ImportStmt, str]::Ok(ImportStmt {
+            is_public, path, documentation
+        }
+        ,
+    )
+}
+
+fn encode_struct_stmt(value: StructStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_bool(value.is_public, encoding))
+    out.push(encode_str(value.name, encoding))
+    out.push(encode_option_documentation(value.documentation, encoding))
+    out.push(encode_vec_generic_param(value.generics, encoding))
+    out.push(encode_vec_named_field(value.named_fields, encoding))
+    out.push(encode_vec_str(value.tuple_fields, encoding))
+    out.push(encode_bool(value.is_tuple, encoding))
+    out.push(encode_bool(value.is_unit, encoding))
+    ret Json::Array(out)
+}
+fn decode_struct_stmt(data: Json) -> Result[StructStmt, str] {
+    let values = record(data, 8)?
+    let is_public = decode_bool(values.get(0).unwrap_or(Json::Null))?
+    let name = decode_str(values.get(1).unwrap_or(Json::Null))?
+    let documentation = decode_option_documentation(values.get(2).unwrap_or(Json::Null))?
+    let generics = decode_vec_generic_param(values.get(3).unwrap_or(Json::Null))?
+    let named_fields = decode_vec_named_field(values.get(4).unwrap_or(Json::Null))?
+    let tuple_fields = decode_vec_str(values.get(5).unwrap_or(Json::Null))?
+    let is_tuple = decode_bool(values.get(6).unwrap_or(Json::Null))?
+    let is_unit = decode_bool(values.get(7).unwrap_or(Json::Null))?
+    ret Result[StructStmt, str]::Ok(StructStmt {
+            is_public, name, documentation, generics, named_fields, tuple_fields, is_tuple, is_unit
+        }
+        ,
+    )
+}
+
+fn encode_enum_stmt(value: EnumStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_bool(value.is_public, encoding))
+    out.push(encode_str(value.name, encoding))
+    out.push(encode_option_documentation(value.documentation, encoding))
+    out.push(encode_vec_generic_param(value.generics, encoding))
+    out.push(encode_vec_parsed_enum_variant(value.variants, encoding))
+    ret Json::Array(out)
+}
+fn decode_enum_stmt(data: Json) -> Result[EnumStmt, str] {
+    let values = record(data, 5)?
+    let is_public = decode_bool(values.get(0).unwrap_or(Json::Null))?
+    let name = decode_str(values.get(1).unwrap_or(Json::Null))?
+    let documentation = decode_option_documentation(values.get(2).unwrap_or(Json::Null))?
+    let generics = decode_vec_generic_param(values.get(3).unwrap_or(Json::Null))?
+    let variants = decode_vec_parsed_enum_variant(values.get(4).unwrap_or(Json::Null))?
+    ret Result[EnumStmt, str]::Ok(EnumStmt {
+            is_public, name, documentation, generics, variants
+        }
+        ,
+    )
+}
+
+fn encode_function_item(value: FunctionItem, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_vec_str(value.attrs, encoding))
+    out.push(encode_vec_decorator_application(value.decorators, encoding))
+    out.push(encode_bool(value.is_public, encoding))
+    out.push(encode_bool(value.is_extern, encoding))
+    out.push(encode_bool(value.is_async, encoding))
+    out.push(encode_str(value.name, encoding))
+    out.push(encode_option_documentation(value.documentation, encoding))
+    out.push(encode_vec_generic_param(value.generics, encoding))
+    out.push(encode_vec_function_param(value.params, encoding))
+    out.push(encode_option_str(value.ret_type, encoding))
+    out.push(encode_bool(value.returns_sending, encoding))
+    out.push(encode_bool(value.returns_frozen, encoding))
+    out.push(encode_option_parsed_block(value.body, encoding))
+    out.push(encode_source(value.source_name, encoding))
+    out.push(encode_usize(value.line, encoding))
+    out.push(encode_usize(value.column, encoding))
+    ret Json::Array(out)
+}
+fn decode_function_item(data: Json) -> Result[FunctionItem, str] {
+    let values = record(data, 16)?
+    let attrs = decode_vec_str(values.get(0).unwrap_or(Json::Null))?
+    let decorators = decode_vec_decorator_application(values.get(1).unwrap_or(Json::Null))?
+    let is_public = decode_bool(values.get(2).unwrap_or(Json::Null))?
+    let is_extern = decode_bool(values.get(3).unwrap_or(Json::Null))?
+    let is_async = decode_bool(values.get(4).unwrap_or(Json::Null))?
+    let name = decode_str(values.get(5).unwrap_or(Json::Null))?
+    let documentation = decode_option_documentation(values.get(6).unwrap_or(Json::Null))?
+    let generics = decode_vec_generic_param(values.get(7).unwrap_or(Json::Null))?
+    let params = decode_vec_function_param(values.get(8).unwrap_or(Json::Null))?
+    let ret_type = decode_option_str(values.get(9).unwrap_or(Json::Null))?
+    let returns_sending = decode_bool(values.get(10).unwrap_or(Json::Null))?
+    let returns_frozen = decode_bool(values.get(11).unwrap_or(Json::Null))?
+    let body = decode_option_parsed_block(values.get(12).unwrap_or(Json::Null))?
+    let source_name = decode_str(values.get(13).unwrap_or(Json::Null))?
+    let line = decode_usize(values.get(14).unwrap_or(Json::Null))?
+    let column = decode_usize(values.get(15).unwrap_or(Json::Null))?
+    ret Result[FunctionItem, str]::Ok(FunctionItem {
+            attrs, decorators, is_public, is_extern, is_async, name, documentation, generics, params, ret_type, returns_sending, returns_frozen, body, source_name, line, column
+        }
+        ,
+    )
+}
+
+fn encode_trait_stmt(value: TraitStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_bool(value.is_public, encoding))
+    out.push(encode_str(value.name, encoding))
+    out.push(encode_option_documentation(value.documentation, encoding))
+    out.push(encode_vec_generic_param(value.generics, encoding))
+    out.push(encode_vec_str(value.bases, encoding))
+    out.push(encode_vec_function_item(value.methods, encoding))
+    out.push(encode_source(value.source_name, encoding))
+    out.push(encode_usize(value.line, encoding))
+    out.push(encode_usize(value.column, encoding))
+    ret Json::Array(out)
+}
+fn decode_trait_stmt(data: Json) -> Result[TraitStmt, str] {
+    let values = record(data, 9)?
+    let is_public = decode_bool(values.get(0).unwrap_or(Json::Null))?
+    let name = decode_str(values.get(1).unwrap_or(Json::Null))?
+    let documentation = decode_option_documentation(values.get(2).unwrap_or(Json::Null))?
+    let generics = decode_vec_generic_param(values.get(3).unwrap_or(Json::Null))?
+    let bases = decode_vec_str(values.get(4).unwrap_or(Json::Null))?
+    let methods = decode_vec_function_item(values.get(5).unwrap_or(Json::Null))?
+    let source_name = decode_str(values.get(6).unwrap_or(Json::Null))?
+    let line = decode_usize(values.get(7).unwrap_or(Json::Null))?
+    let column = decode_usize(values.get(8).unwrap_or(Json::Null))?
+    ret Result[TraitStmt, str]::Ok(TraitStmt {
+            is_public, name, documentation, generics, bases, methods, source_name, line, column
+        }
+        ,
+    )
+}
+
+fn encode_impl_stmt(value: ImplStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_option_documentation(value.documentation, encoding))
+    out.push(encode_vec_generic_param(value.generics, encoding))
+    out.push(encode_option_str(value.trait_name, encoding))
+    out.push(encode_vec_str(value.trait_args, encoding))
+    out.push(encode_str(value.target, encoding))
+    out.push(encode_vec_function_item(value.methods, encoding))
+    out.push(encode_source(value.source_name, encoding))
+    out.push(encode_usize(value.line, encoding))
+    out.push(encode_usize(value.column, encoding))
+    ret Json::Array(out)
+}
+fn decode_impl_stmt(data: Json) -> Result[ImplStmt, str] {
+    let values = record(data, 9)?
+    let documentation = decode_option_documentation(values.get(0).unwrap_or(Json::Null))?
+    let generics = decode_vec_generic_param(values.get(1).unwrap_or(Json::Null))?
+    let trait_name = decode_option_str(values.get(2).unwrap_or(Json::Null))?
+    let trait_args = decode_vec_str(values.get(3).unwrap_or(Json::Null))?
+    let target = decode_str(values.get(4).unwrap_or(Json::Null))?
+    let methods = decode_vec_function_item(values.get(5).unwrap_or(Json::Null))?
+    let source_name = decode_str(values.get(6).unwrap_or(Json::Null))?
+    let line = decode_usize(values.get(7).unwrap_or(Json::Null))?
+    let column = decode_usize(values.get(8).unwrap_or(Json::Null))?
+    ret Result[ImplStmt, str]::Ok(ImplStmt {
+            documentation, generics, trait_name, trait_args, target, methods, source_name, line, column
+        }
+        ,
+    )
+}
+
+fn encode_match_pattern(value: MatchPattern, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_str(value.kind, encoding))
+    out.push(encode_option_str(value.value, encoding))
+    out.push(encode_option_str(value.binding, encoding))
+    ret Json::Array(out)
+}
+fn decode_match_pattern(data: Json) -> Result[MatchPattern, str] {
+    let values = record(data, 3)?
+    let kind = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let value = decode_option_str(values.get(1).unwrap_or(Json::Null))?
+    let binding = decode_option_str(values.get(2).unwrap_or(Json::Null))?
+    ret Result[MatchPattern, str]::Ok(MatchPattern {
+            kind, value, binding
+        }
+        ,
+    )
+}
+
+fn encode_expr_node(value: ExprNode, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr(value.value, encoding))
+    out.push(encode_usize(value.line, encoding))
+    out.push(encode_usize(value.column, encoding))
+    out.push(encode_usize(value.length, encoding))
+    out.push(encode_source(value.source_name, encoding))
+    ret Json::Array(out)
+}
+fn decode_expr_node(data: Json) -> Result[ExprNode, str] {
+    let values = record(data, 5)?
+    let value = decode_expr(values.get(0).unwrap_or(Json::Null))?
+    let line = decode_usize(values.get(1).unwrap_or(Json::Null))?
+    let column = decode_usize(values.get(2).unwrap_or(Json::Null))?
+    let length = decode_usize(values.get(3).unwrap_or(Json::Null))?
+    let source_name = decode_str(values.get(4).unwrap_or(Json::Null))?
+    ret Result[ExprNode, str]::Ok(ExprNode {
+            value, line, column, length, source_name
+        }
+        ,
+    )
+}
+
+fn encode_parsed_block(value: ParsedBlock, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_vec_statement(value.statements, encoding))
+    out.push(encode_usize(value.start_line, encoding))
+    out.push(encode_usize(value.start_column, encoding))
+    out.push(encode_usize(value.end_line, encoding))
+    out.push(encode_usize(value.end_column, encoding))
+    ret Json::Array(out)
+}
+fn decode_parsed_block(data: Json) -> Result[ParsedBlock, str] {
+    let values = record(data, 5)?
+    let statements = decode_vec_statement(values.get(0).unwrap_or(Json::Null))?
+    let start_line = decode_usize(values.get(1).unwrap_or(Json::Null))?
+    let start_column = decode_usize(values.get(2).unwrap_or(Json::Null))?
+    let end_line = decode_usize(values.get(3).unwrap_or(Json::Null))?
+    let end_column = decode_usize(values.get(4).unwrap_or(Json::Null))?
+    ret Result[ParsedBlock, str]::Ok(ParsedBlock {
+            statements, start_line, start_column, end_line, end_column
+        }
+        ,
+    )
+}
+
+fn encode_let_stmt(value: LetStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_str(value.name, encoding))
+    out.push(encode_option_str(value.typ, encoding))
+    out.push(encode_expr_node(value.expr, encoding))
+    out.push(encode_bool(value.is_mut, encoding))
+    out.push(encode_usize(value.line, encoding))
+    out.push(encode_usize(value.column, encoding))
+    out.push(encode_usize(value.visible_line, encoding))
+    out.push(encode_usize(value.visible_column, encoding))
+    ret Json::Array(out)
+}
+fn decode_let_stmt(data: Json) -> Result[LetStmt, str] {
+    let values = record(data, 8)?
+    let name = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let typ = decode_option_str(values.get(1).unwrap_or(Json::Null))?
+    let expr = decode_expr_node(values.get(2).unwrap_or(Json::Null))?
+    let is_mut = decode_bool(values.get(3).unwrap_or(Json::Null))?
+    let line = decode_usize(values.get(4).unwrap_or(Json::Null))?
+    let column = decode_usize(values.get(5).unwrap_or(Json::Null))?
+    let visible_line = decode_usize(values.get(6).unwrap_or(Json::Null))?
+    let visible_column = decode_usize(values.get(7).unwrap_or(Json::Null))?
+    ret Result[LetStmt, str]::Ok(LetStmt {
+            name, typ, expr, is_mut, line, column, visible_line, visible_column
+        }
+        ,
+    )
+}
+
+fn encode_assignment_stmt(value: AssignmentStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node(value.target, encoding))
+    out.push(encode_str(value.operator, encoding))
+    out.push(encode_expr_node(value.expr, encoding))
+    ret Json::Array(out)
+}
+fn decode_assignment_stmt(data: Json) -> Result[AssignmentStmt, str] {
+    let values = record(data, 3)?
+    let target = decode_expr_node(values.get(0).unwrap_or(Json::Null))?
+    let operator = decode_str(values.get(1).unwrap_or(Json::Null))?
+    let expr = decode_expr_node(values.get(2).unwrap_or(Json::Null))?
+    ret Result[AssignmentStmt, str]::Ok(AssignmentStmt {
+            target, operator, expr
+        }
+        ,
+    )
+}
+
+fn encode_if_branch(value: IfBranch, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node(value.condition, encoding))
+    out.push(encode_parsed_block(value.body, encoding))
+    ret Json::Array(out)
+}
+fn decode_if_branch(data: Json) -> Result[IfBranch, str] {
+    let values = record(data, 2)?
+    let condition = decode_expr_node(values.get(0).unwrap_or(Json::Null))?
+    let body = decode_parsed_block(values.get(1).unwrap_or(Json::Null))?
+    ret Result[IfBranch, str]::Ok(IfBranch {
+            condition, body
+        }
+        ,
+    )
+}
+
+fn encode_if_stmt(value: IfStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_vec_if_branch(value.branches, encoding))
+    out.push(encode_option_parsed_block(value.else_body, encoding))
+    ret Json::Array(out)
+}
+fn decode_if_stmt(data: Json) -> Result[IfStmt, str] {
+    let values = record(data, 2)?
+    let branches = decode_vec_if_branch(values.get(0).unwrap_or(Json::Null))?
+    let else_body = decode_option_parsed_block(values.get(1).unwrap_or(Json::Null))?
+    ret Result[IfStmt, str]::Ok(IfStmt {
+            branches, else_body
+        }
+        ,
+    )
+}
+
+fn encode_parsed_match_arm(value: ParsedMatchArm, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_match_pattern(value.pattern, encoding))
+    out.push(encode_match_arm_body(value.body, encoding))
+    ret Json::Array(out)
+}
+fn decode_parsed_match_arm(data: Json) -> Result[ParsedMatchArm, str] {
+    let values = record(data, 2)?
+    let pattern = decode_match_pattern(values.get(0).unwrap_or(Json::Null))?
+    let body = decode_match_arm_body(values.get(1).unwrap_or(Json::Null))?
+    ret Result[ParsedMatchArm, str]::Ok(ParsedMatchArm {
+            pattern, body
+        }
+        ,
+    )
+}
+
+fn encode_match_stmt(value: MatchStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node(value.expr, encoding))
+    out.push(encode_vec_parsed_match_arm(value.arms, encoding))
+    ret Json::Array(out)
+}
+fn decode_match_stmt(data: Json) -> Result[MatchStmt, str] {
+    let values = record(data, 2)?
+    let expr = decode_expr_node(values.get(0).unwrap_or(Json::Null))?
+    let arms = decode_vec_parsed_match_arm(values.get(1).unwrap_or(Json::Null))?
+    ret Result[MatchStmt, str]::Ok(MatchStmt {
+            expr, arms
+        }
+        ,
+    )
+}
+
+fn encode_while_stmt(value: WhileStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_option_str(value.label, encoding))
+    out.push(encode_expr_node(value.condition, encoding))
+    out.push(encode_parsed_block(value.body, encoding))
+    ret Json::Array(out)
+}
+fn decode_while_stmt(data: Json) -> Result[WhileStmt, str] {
+    let values = record(data, 3)?
+    let label = decode_option_str(values.get(0).unwrap_or(Json::Null))?
+    let condition = decode_expr_node(values.get(1).unwrap_or(Json::Null))?
+    let body = decode_parsed_block(values.get(2).unwrap_or(Json::Null))?
+    ret Result[WhileStmt, str]::Ok(WhileStmt {
+            label, condition, body
+        }
+        ,
+    )
+}
+
+fn encode_loop_stmt(value: LoopStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_option_str(value.label, encoding))
+    out.push(encode_parsed_block(value.body, encoding))
+    ret Json::Array(out)
+}
+fn decode_loop_stmt(data: Json) -> Result[LoopStmt, str] {
+    let values = record(data, 2)?
+    let label = decode_option_str(values.get(0).unwrap_or(Json::Null))?
+    let body = decode_parsed_block(values.get(1).unwrap_or(Json::Null))?
+    ret Result[LoopStmt, str]::Ok(LoopStmt {
+            label, body
+        }
+        ,
+    )
+}
+
+fn encode_do_while_stmt(value: DoWhileStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_parsed_block(value.body, encoding))
+    out.push(encode_expr_node(value.condition, encoding))
+    ret Json::Array(out)
+}
+fn decode_do_while_stmt(data: Json) -> Result[DoWhileStmt, str] {
+    let values = record(data, 2)?
+    let body = decode_parsed_block(values.get(0).unwrap_or(Json::Null))?
+    let condition = decode_expr_node(values.get(1).unwrap_or(Json::Null))?
+    ret Result[DoWhileStmt, str]::Ok(DoWhileStmt {
+            body, condition
+        }
+        ,
+    )
+}
+
+fn encode_for_stmt(value: ForStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_option_str(value.label, encoding))
+    out.push(encode_str(value.name, encoding))
+    out.push(encode_expr_node(value.iterable, encoding))
+    out.push(encode_parsed_block(value.body, encoding))
+    ret Json::Array(out)
+}
+fn decode_for_stmt(data: Json) -> Result[ForStmt, str] {
+    let values = record(data, 4)?
+    let label = decode_option_str(values.get(0).unwrap_or(Json::Null))?
+    let name = decode_str(values.get(1).unwrap_or(Json::Null))?
+    let iterable = decode_expr_node(values.get(2).unwrap_or(Json::Null))?
+    let body = decode_parsed_block(values.get(3).unwrap_or(Json::Null))?
+    ret Result[ForStmt, str]::Ok(ForStmt {
+            label, name, iterable, body
+        }
+        ,
+    )
+}
+
+fn encode_ehir_stmt(value: EhirStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_bool(value.is_unsafe, encoding))
+    out.push(encode_str(value.body, encoding))
+    ret Json::Array(out)
+}
+fn decode_ehir_stmt(data: Json) -> Result[EhirStmt, str] {
+    let values = record(data, 2)?
+    let is_unsafe = decode_bool(values.get(0).unwrap_or(Json::Null))?
+    let body = decode_str(values.get(1).unwrap_or(Json::Null))?
+    ret Result[EhirStmt, str]::Ok(EhirStmt {
+            is_unsafe, body
+        }
+        ,
+    )
+}
+
+fn encode_unary_expr(value: UnaryExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_str(value.operator, encoding))
+    out.push(encode_expr_node_heap(value.expr, encoding))
+    ret Json::Array(out)
+}
+fn decode_unary_expr(data: Json) -> Result[UnaryExpr, str] {
+    let values = record(data, 2)?
+    let operator = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let expr = decode_expr_node_heap(values.get(1).unwrap_or(Json::Null))?
+    ret Result[UnaryExpr, str]::Ok(UnaryExpr {
+            operator, expr
+        }
+        ,
+    )
+}
+
+fn encode_cast_expr(value: CastExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node_heap(value.expr, encoding))
+    out.push(encode_str(value.target, encoding))
+    ret Json::Array(out)
+}
+fn decode_cast_expr(data: Json) -> Result[CastExpr, str] {
+    let values = record(data, 2)?
+    let expr = decode_expr_node_heap(values.get(0).unwrap_or(Json::Null))?
+    let target = decode_str(values.get(1).unwrap_or(Json::Null))?
+    ret Result[CastExpr, str]::Ok(CastExpr {
+            expr, target
+        }
+        ,
+    )
+}
+
+fn encode_binary_expr(value: BinaryExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node_heap(value.lhs, encoding))
+    out.push(encode_str(value.operator, encoding))
+    out.push(encode_expr_node_heap(value.rhs, encoding))
+    ret Json::Array(out)
+}
+fn decode_binary_expr(data: Json) -> Result[BinaryExpr, str] {
+    let values = record(data, 3)?
+    let lhs = decode_expr_node_heap(values.get(0).unwrap_or(Json::Null))?
+    let operator = decode_str(values.get(1).unwrap_or(Json::Null))?
+    let rhs = decode_expr_node_heap(values.get(2).unwrap_or(Json::Null))?
+    ret Result[BinaryExpr, str]::Ok(BinaryExpr {
+            lhs, operator, rhs
+        }
+        ,
+    )
+}
+
+fn encode_call_expr(value: CallExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node_heap(value.callee, encoding))
+    out.push(encode_vec_str(value.generics, encoding))
+    out.push(encode_vec_expr_node(value.args, encoding))
+    ret Json::Array(out)
+}
+fn decode_call_expr(data: Json) -> Result[CallExpr, str] {
+    let values = record(data, 3)?
+    let callee = decode_expr_node_heap(values.get(0).unwrap_or(Json::Null))?
+    let generics = decode_vec_str(values.get(1).unwrap_or(Json::Null))?
+    let args = decode_vec_expr_node(values.get(2).unwrap_or(Json::Null))?
+    ret Result[CallExpr, str]::Ok(CallExpr {
+            callee, generics, args
+        }
+        ,
+    )
+}
+
+fn encode_field_expr(value: FieldExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node_heap(value.base, encoding))
+    out.push(encode_str(value.field, encoding))
+    ret Json::Array(out)
+}
+fn decode_field_expr(data: Json) -> Result[FieldExpr, str] {
+    let values = record(data, 2)?
+    let base = decode_expr_node_heap(values.get(0).unwrap_or(Json::Null))?
+    let field = decode_str(values.get(1).unwrap_or(Json::Null))?
+    ret Result[FieldExpr, str]::Ok(FieldExpr {
+            base, field
+        }
+        ,
+    )
+}
+
+fn encode_method_call_expr(value: MethodCallExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node_heap(value.receiver, encoding))
+    out.push(encode_str(value.method, encoding))
+    out.push(encode_vec_str(value.generics, encoding))
+    out.push(encode_vec_expr_node(value.args, encoding))
+    ret Json::Array(out)
+}
+fn decode_method_call_expr(data: Json) -> Result[MethodCallExpr, str] {
+    let values = record(data, 4)?
+    let receiver = decode_expr_node_heap(values.get(0).unwrap_or(Json::Null))?
+    let method = decode_str(values.get(1).unwrap_or(Json::Null))?
+    let generics = decode_vec_str(values.get(2).unwrap_or(Json::Null))?
+    let args = decode_vec_expr_node(values.get(3).unwrap_or(Json::Null))?
+    ret Result[MethodCallExpr, str]::Ok(MethodCallExpr {
+            receiver, method, generics, args
+        }
+        ,
+    )
+}
+
+fn encode_match_expr_arm(value: MatchExprArm, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_match_pattern(value.pattern, encoding))
+    out.push(encode_expr_node(value.expr, encoding))
+    ret Json::Array(out)
+}
+fn decode_match_expr_arm(data: Json) -> Result[MatchExprArm, str] {
+    let values = record(data, 2)?
+    let pattern = decode_match_pattern(values.get(0).unwrap_or(Json::Null))?
+    let expr = decode_expr_node(values.get(1).unwrap_or(Json::Null))?
+    ret Result[MatchExprArm, str]::Ok(MatchExprArm {
+            pattern, expr
+        }
+        ,
+    )
+}
+
+fn encode_match_expr(value: MatchExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node_heap(value.expr, encoding))
+    out.push(encode_vec_match_expr_arm(value.arms, encoding))
+    ret Json::Array(out)
+}
+fn decode_match_expr(data: Json) -> Result[MatchExpr, str] {
+    let values = record(data, 2)?
+    let expr = decode_expr_node_heap(values.get(0).unwrap_or(Json::Null))?
+    let arms = decode_vec_match_expr_arm(values.get(1).unwrap_or(Json::Null))?
+    ret Result[MatchExpr, str]::Ok(MatchExpr {
+            expr, arms
+        }
+        ,
+    )
+}
+
+fn encode_struct_init_expr(value: StructInitExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_str(value.path, encoding))
+    out.push(encode_vec_expr_node(value.values, encoding))
+    ret Json::Array(out)
+}
+fn decode_struct_init_expr(data: Json) -> Result[StructInitExpr, str] {
+    let values = record(data, 2)?
+    let path = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let values = decode_vec_expr_node(values.get(1).unwrap_or(Json::Null))?
+    ret Result[StructInitExpr, str]::Ok(StructInitExpr {
+            path, values
+        }
+        ,
+    )
+}
+
+fn encode_tuple_literal_expr(value: TupleLiteralExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_vec_expr_node(value.items, encoding))
+    ret Json::Array(out)
+}
+fn decode_tuple_literal_expr(data: Json) -> Result[TupleLiteralExpr, str] {
+    let values = record(data, 1)?
+    let items = decode_vec_expr_node(values.get(0).unwrap_or(Json::Null))?
+    ret Result[TupleLiteralExpr, str]::Ok(TupleLiteralExpr {
+            items
+        }
+    )
+}
+
+fn encode_array_literal_expr(value: ArrayLiteralExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_vec_expr_node(value.items, encoding))
+    ret Json::Array(out)
+}
+fn decode_array_literal_expr(data: Json) -> Result[ArrayLiteralExpr, str] {
+    let values = record(data, 1)?
+    let items = decode_vec_expr_node(values.get(0).unwrap_or(Json::Null))?
+    ret Result[ArrayLiteralExpr, str]::Ok(ArrayLiteralExpr {
+            items
+        }
+    )
+}
+
+fn encode_array_repeat_expr(value: ArrayRepeatExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node_heap(value.value, encoding))
+    out.push(encode_str(value.size, encoding))
+    ret Json::Array(out)
+}
+fn decode_array_repeat_expr(data: Json) -> Result[ArrayRepeatExpr, str] {
+    let values = record(data, 2)?
+    let value = decode_expr_node_heap(values.get(0).unwrap_or(Json::Null))?
+    let size = decode_str(values.get(1).unwrap_or(Json::Null))?
+    ret Result[ArrayRepeatExpr, str]::Ok(ArrayRepeatExpr {
+            value, size
+        }
+        ,
+    )
+}
+
+fn encode_with_stmt(value: WithStmt, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node(value.expr, encoding))
+    out.push(encode_str(value.name, encoding))
+    out.push(encode_parsed_block(value.body, encoding))
+    ret Json::Array(out)
+}
+fn decode_with_stmt(data: Json) -> Result[WithStmt, str] {
+    let values = record(data, 3)?
+    let expr = decode_expr_node(values.get(0).unwrap_or(Json::Null))?
+    let name = decode_str(values.get(1).unwrap_or(Json::Null))?
+    let body = decode_parsed_block(values.get(2).unwrap_or(Json::Null))?
+    ret Result[WithStmt, str]::Ok(WithStmt {
+            expr, name, body
+        }
+        ,
+    )
+}
+
+fn encode_block_expr(value: BlockExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_vec_statement(value.statements, encoding))
+    out.push(encode_option_expr_node_heap(value.tail, encoding))
+    out.push(encode_usize(value.start_line, encoding))
+    out.push(encode_usize(value.start_column, encoding))
+    out.push(encode_usize(value.end_line, encoding))
+    out.push(encode_usize(value.end_column, encoding))
+    ret Json::Array(out)
+}
+fn decode_block_expr(data: Json) -> Result[BlockExpr, str] {
+    let values = record(data, 6)?
+    let statements = decode_vec_statement(values.get(0).unwrap_or(Json::Null))?
+    let tail = decode_option_expr_node_heap(values.get(1).unwrap_or(Json::Null))?
+    let start_line = decode_usize(values.get(2).unwrap_or(Json::Null))?
+    let start_column = decode_usize(values.get(3).unwrap_or(Json::Null))?
+    let end_line = decode_usize(values.get(4).unwrap_or(Json::Null))?
+    let end_column = decode_usize(values.get(5).unwrap_or(Json::Null))?
+    ret Result[BlockExpr, str]::Ok(BlockExpr {
+            statements, tail, start_line, start_column, end_line, end_column
+        }
+        ,
+    )
+}
+
+fn encode_if_expr_branch(value: IfExprBranch, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node(value.condition, encoding))
+    out.push(encode_expr_node(value.body, encoding))
+    ret Json::Array(out)
+}
+fn decode_if_expr_branch(data: Json) -> Result[IfExprBranch, str] {
+    let values = record(data, 2)?
+    let condition = decode_expr_node(values.get(0).unwrap_or(Json::Null))?
+    let body = decode_expr_node(values.get(1).unwrap_or(Json::Null))?
+    ret Result[IfExprBranch, str]::Ok(IfExprBranch {
+            condition, body
+        }
+        ,
+    )
+}
+
+fn encode_if_expr(value: IfExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_vec_if_expr_branch(value.branches, encoding))
+    out.push(encode_expr_node_heap(value.else_body, encoding))
+    ret Json::Array(out)
+}
+fn decode_if_expr(data: Json) -> Result[IfExpr, str] {
+    let values = record(data, 2)?
+    let branches = decode_vec_if_expr_branch(values.get(0).unwrap_or(Json::Null))?
+    let else_body = decode_expr_node_heap(values.get(1).unwrap_or(Json::Null))?
+    ret Result[IfExpr, str]::Ok(IfExpr {
+            branches, else_body
+        }
+        ,
+    )
+}
+
+fn encode_index_expr(value: IndexExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_expr_node_heap(value.base, encoding))
+    out.push(encode_expr_node_heap(value.index, encoding))
+    ret Json::Array(out)
+}
+fn decode_index_expr(data: Json) -> Result[IndexExpr, str] {
+    let values = record(data, 2)?
+    let base = decode_expr_node_heap(values.get(0).unwrap_or(Json::Null))?
+    let index = decode_expr_node_heap(values.get(1).unwrap_or(Json::Null))?
+    ret Result[IndexExpr, str]::Ok(IndexExpr {
+            base, index
+        }
+        ,
+    )
+}
+
+fn encode_closure_expr(value: ClosureExpr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(encode_vec_function_param(value.params, encoding))
+    out.push(encode_expr_node_heap(value.body, encoding))
+    ret Json::Array(out)
+}
+fn decode_closure_expr(data: Json) -> Result[ClosureExpr, str] {
+    let values = record(data, 2)?
+    let params = decode_vec_function_param(values.get(0).unwrap_or(Json::Null))?
+    let body = decode_expr_node_heap(values.get(1).unwrap_or(Json::Null))?
+    ret Result[ClosureExpr, str]::Ok(ClosureExpr {
+            params, body
+        }
+        ,
+    )
+}
+
+fn encode_statement(value: Statement, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    match value {
+        Statement::Import(item) => {
+            out.push(Json::String("Import")) out.push(encode_import_stmt(item, encoding))
+        }
+        Statement::EnumItem(item) => {
+            out.push(Json::String("EnumItem")) out.push(encode_enum_stmt(item, encoding))
+        }
+        Statement::Struct(item) => {
+            out.push(Json::String("Struct")) out.push(encode_struct_stmt(item, encoding))
+        }
+        Statement::Trait(item) => {
+            out.push(Json::String("Trait")) out.push(encode_trait_stmt(item, encoding))
+        }
+        Statement::Impl(item) => {
+            out.push(Json::String("Impl")) out.push(encode_impl_stmt(item, encoding))
+        }
+        Statement::Function(item) => {
+            out.push(Json::String("Function")) out.push(encode_function_item(item, encoding))
+        }
+        Statement::Let(item) => {
+            out.push(Json::String("Let")) out.push(encode_let_stmt(item, encoding))
+        }
+        Statement::Ret(item) => {
+            out.push(Json::String("Ret")) out.push(encode_expr_node(item, encoding))
+        }
+        Statement::Expr(item) => {
+            out.push(Json::String("Expr")) out.push(encode_expr_node(item, encoding))
+        }
+        Statement::If(item) => {
+            out.push(Json::String("If")) out.push(encode_if_stmt(item, encoding))
+        }
+        Statement::Match(item) => {
+            out.push(Json::String("Match")) out.push(encode_match_stmt(item, encoding))
+        }
+        Statement::Assignment(item) => {
+            out.push(Json::String("Assignment")) out.push(encode_assignment_stmt(item, encoding))
+        }
+        Statement::While(item) => {
+            out.push(Json::String("While")) out.push(encode_while_stmt(item, encoding))
+        }
+        Statement::Loop(item) => {
+            out.push(Json::String("Loop")) out.push(encode_loop_stmt(item, encoding))
+        }
+        Statement::DoWhile(item) => {
+            out.push(Json::String("DoWhile")) out.push(encode_do_while_stmt(item, encoding))
+        }
+        Statement::For(item) => {
+            out.push(Json::String("For")) out.push(encode_for_stmt(item, encoding))
+        }
+        Statement::With(item) => {
+            out.push(Json::String("With")) out.push(encode_with_stmt(item, encoding))
+        }
+        Statement::Unsafe(item) => {
+            out.push(Json::String("Unsafe")) out.push(encode_parsed_block(item, encoding))
+        }
+        Statement::Ehir(item) => {
+            out.push(Json::String("Ehir")) out.push(encode_ehir_stmt(item, encoding))
+        }
+        Statement::Break(item) => {
+            out.push(Json::String("Break")) out.push(encode_option_str(item, encoding))
+        }
+        Statement::Continue(item) => {
+            out.push(Json::String("Continue")) out.push(encode_option_str(item, encoding))
+        }
+    }
+    ret Json::Array(out)
+}
+fn decode_statement(data: Json) -> Result[Statement, str] {
+    let values = record(data, 2)?
+    let tag = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let payload = values.get(1).unwrap_or(Json::Null)
+    ret match tag {
+        "Import" => Result[Statement, str]::Ok(Statement::Import(decode_import_stmt(payload)?))
+        "EnumItem" => Result[Statement, str]::Ok(Statement::EnumItem(decode_enum_stmt(payload)?))
+        "Struct" => Result[Statement, str]::Ok(Statement::Struct(decode_struct_stmt(payload)?))
+        "Trait" => Result[Statement, str]::Ok(Statement::Trait(decode_trait_stmt(payload)?))
+        "Impl" => Result[Statement, str]::Ok(Statement::Impl(decode_impl_stmt(payload)?))
+        "Function" => Result[Statement, str]::Ok(Statement::Function(decode_function_item(payload)?))
+        "Let" => Result[Statement, str]::Ok(Statement::Let(decode_let_stmt(payload)?))
+        "Ret" => Result[Statement, str]::Ok(Statement::Ret(decode_expr_node(payload)?))
+        "Expr" => Result[Statement, str]::Ok(Statement::Expr(decode_expr_node(payload)?))
+        "If" => Result[Statement, str]::Ok(Statement::If(decode_if_stmt(payload)?))
+        "Match" => Result[Statement, str]::Ok(Statement::Match(decode_match_stmt(payload)?))
+        "Assignment" => Result[Statement, str]::Ok(Statement::Assignment(decode_assignment_stmt(payload)?))
+        "While" => Result[Statement, str]::Ok(Statement::While(decode_while_stmt(payload)?))
+        "Loop" => Result[Statement, str]::Ok(Statement::Loop(decode_loop_stmt(payload)?))
+        "DoWhile" => Result[Statement, str]::Ok(Statement::DoWhile(decode_do_while_stmt(payload)?))
+        "For" => Result[Statement, str]::Ok(Statement::For(decode_for_stmt(payload)?))
+        "With" => Result[Statement, str]::Ok(Statement::With(decode_with_stmt(payload)?))
+        "Unsafe" => Result[Statement, str]::Ok(Statement::Unsafe(decode_parsed_block(payload)?))
+        "Ehir" => Result[Statement, str]::Ok(Statement::Ehir(decode_ehir_stmt(payload)?))
+        "Break" => Result[Statement, str]::Ok(Statement::Break(decode_option_str(payload)?))
+        "Continue" => Result[Statement, str]::Ok(Statement::Continue(decode_option_str(payload)?))
+        _ => Result[Statement, str]::Err("unknown metadata Statement tag: " + tag)
+    }
+}
+
+fn encode_expr(value: Expr, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    match value {
+        Expr::Path(item) => {
+            out.push(Json::String("Path")) out.push(encode_str(item, encoding))
+        }
+        Expr::VecLiteral(item) => {
+            out.push(Json::String("VecLiteral")) out.push(encode_array_literal_expr(item, encoding))
+        }
+        Expr::Boolean(item) => {
+            out.push(Json::String("Boolean")) out.push(encode_bool(item, encoding))
+        }
+        Expr::Integer(item) => {
+            out.push(Json::String("Integer")) out.push(encode_str(item, encoding))
+        }
+        Expr::Float(item) => {
+            out.push(Json::String("Float")) out.push(encode_str(item, encoding))
+        }
+        Expr::StringLiteral(item) => {
+            out.push(Json::String("StringLiteral")) out.push(encode_str(item, encoding))
+        }
+        Expr::Parenthesized(item) => {
+            out.push(Json::String("Parenthesized")) out.push(encode_expr_node_heap(item, encoding))
+        }
+        Expr::TupleLiteral(item) => {
+            out.push(Json::String("TupleLiteral")) out.push(encode_tuple_literal_expr(item, encoding))
+        }
+        Expr::ArrayLiteral(item) => {
+            out.push(Json::String("ArrayLiteral")) out.push(encode_array_literal_expr(item, encoding))
+        }
+        Expr::ArrayRepeat(item) => {
+            out.push(Json::String("ArrayRepeat")) out.push(encode_array_repeat_expr(item, encoding))
+        }
+        Expr::Block(item) => {
+            out.push(Json::String("Block")) out.push(encode_block_expr(item, encoding))
+        }
+        Expr::Unary(item) => {
+            out.push(Json::String("Unary")) out.push(encode_unary_expr(item, encoding))
+        }
+        Expr::Await(item) => {
+            out.push(Json::String("Await")) out.push(encode_expr_node_heap(item, encoding))
+        }
+        Expr::Spawn(item) => {
+            out.push(Json::String("Spawn")) out.push(encode_expr_node_heap(item, encoding))
+        }
+        Expr::Cast(item) => {
+            out.push(Json::String("Cast")) out.push(encode_cast_expr(item, encoding))
+        }
+        Expr::Binary(item) => {
+            out.push(Json::String("Binary")) out.push(encode_binary_expr(item, encoding))
+        }
+        Expr::Call(item) => {
+            out.push(Json::String("Call")) out.push(encode_call_expr(item, encoding))
+        }
+        Expr::Field(item) => {
+            out.push(Json::String("Field")) out.push(encode_field_expr(item, encoding))
+        }
+        Expr::MethodCall(item) => {
+            out.push(Json::String("MethodCall")) out.push(encode_method_call_expr(item, encoding))
+        }
+        Expr::Match(item) => {
+            out.push(Json::String("Match")) out.push(encode_match_expr(item, encoding))
+        }
+        Expr::If(item) => {
+            out.push(Json::String("If")) out.push(encode_if_expr(item, encoding))
+        }
+        Expr::StructInit(item) => {
+            out.push(Json::String("StructInit")) out.push(encode_struct_init_expr(item, encoding))
+        }
+        Expr::Index(item) => {
+            out.push(Json::String("Index")) out.push(encode_index_expr(item, encoding))
+        }
+        Expr::Closure(item) => {
+            out.push(Json::String("Closure")) out.push(encode_closure_expr(item, encoding))
+        }
+        Expr::Try(item) => {
+            out.push(Json::String("Try")) out.push(encode_expr_node_heap(item, encoding))
+        }
+        Expr::Unsafe(item) => {
+            out.push(Json::String("Unsafe")) out.push(encode_parsed_block(item, encoding))
+        }
+    }
+    ret Json::Array(out)
+}
+fn decode_expr(data: Json) -> Result[Expr, str] {
+    let values = record(data, 2)?
+    let tag = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let payload = values.get(1).unwrap_or(Json::Null)
+    ret match tag {
+        "Path" => Result[Expr, str]::Ok(Expr::Path(decode_str(payload)?))
+        "VecLiteral" => Result[Expr, str]::Ok(Expr::VecLiteral(decode_array_literal_expr(payload)?))
+        "Boolean" => Result[Expr, str]::Ok(Expr::Boolean(decode_bool(payload)?))
+        "Integer" => Result[Expr, str]::Ok(Expr::Integer(decode_str(payload)?))
+        "Float" => Result[Expr, str]::Ok(Expr::Float(decode_str(payload)?))
+        "StringLiteral" => Result[Expr, str]::Ok(Expr::StringLiteral(decode_str(payload)?))
+        "Parenthesized" => Result[Expr, str]::Ok(Expr::Parenthesized(decode_expr_node_heap(payload)?))
+        "TupleLiteral" => Result[Expr, str]::Ok(Expr::TupleLiteral(decode_tuple_literal_expr(payload)?))
+        "ArrayLiteral" => Result[Expr, str]::Ok(Expr::ArrayLiteral(decode_array_literal_expr(payload)?))
+        "ArrayRepeat" => Result[Expr, str]::Ok(Expr::ArrayRepeat(decode_array_repeat_expr(payload)?))
+        "Block" => Result[Expr, str]::Ok(Expr::Block(decode_block_expr(payload)?))
+        "Unary" => Result[Expr, str]::Ok(Expr::Unary(decode_unary_expr(payload)?))
+        "Await" => Result[Expr, str]::Ok(Expr::Await(decode_expr_node_heap(payload)?))
+        "Spawn" => Result[Expr, str]::Ok(Expr::Spawn(decode_expr_node_heap(payload)?))
+        "Cast" => Result[Expr, str]::Ok(Expr::Cast(decode_cast_expr(payload)?))
+        "Binary" => Result[Expr, str]::Ok(Expr::Binary(decode_binary_expr(payload)?))
+        "Call" => Result[Expr, str]::Ok(Expr::Call(decode_call_expr(payload)?))
+        "Field" => Result[Expr, str]::Ok(Expr::Field(decode_field_expr(payload)?))
+        "MethodCall" => Result[Expr, str]::Ok(Expr::MethodCall(decode_method_call_expr(payload)?))
+        "Match" => Result[Expr, str]::Ok(Expr::Match(decode_match_expr(payload)?))
+        "If" => Result[Expr, str]::Ok(Expr::If(decode_if_expr(payload)?))
+        "StructInit" => Result[Expr, str]::Ok(Expr::StructInit(decode_struct_init_expr(payload)?))
+        "Index" => Result[Expr, str]::Ok(Expr::Index(decode_index_expr(payload)?))
+        "Closure" => Result[Expr, str]::Ok(Expr::Closure(decode_closure_expr(payload)?))
+        "Try" => Result[Expr, str]::Ok(Expr::Try(decode_expr_node_heap(payload)?))
+        "Unsafe" => Result[Expr, str]::Ok(Expr::Unsafe(decode_parsed_block(payload)?))
+        _ => Result[Expr, str]::Err("unknown metadata Expr tag: " + tag)
+    }
+}
+
+fn encode_match_arm_body(value: MatchArmBody, encoding: MetadataEncoding) -> Json {
+    let mut out = Vec[Json]::new()
+    match value {
+        MatchArmBody::Block(item) => {
+            out.push(Json::String("Block")) out.push(encode_parsed_block(item, encoding))
+        }
+        MatchArmBody::Expr(item) => {
+            out.push(Json::String("Expr")) out.push(encode_expr_node(item, encoding))
+        }
+    }
+    ret Json::Array(out)
+}
+fn decode_match_arm_body(data: Json) -> Result[MatchArmBody, str] {
+    let values = record(data, 2)?
+    let tag = decode_str(values.get(0).unwrap_or(Json::Null))?
+    let payload = values.get(1).unwrap_or(Json::Null)
+    ret match tag {
+        "Block" => Result[MatchArmBody, str]::Ok(MatchArmBody::Block(decode_parsed_block(payload)?))
+        "Expr" => Result[MatchArmBody, str]::Ok(MatchArmBody::Expr(decode_expr_node(payload)?))
+        _ => Result[MatchArmBody, str]::Err("unknown metadata MatchArmBody tag: " + tag)
+    }
+}
+
+import json::stringify
+import refrain::frontend::lexer::Lexer
+import refrain::frontend::parser::Parser
+
+fn codec_round_trip(source: str) -> bool {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source("package@model.enq")
+    let ast = match parser.parse_result(lexer.tokenize(source)) {
+        Ok(value) => value Err(error) => {
+            ret false
+        }
+    }
+    if ast.len() == 0 {
+        ret false
+    }
+    let encoded = encode_metadata_ast(ast)
+    let restored = match decode_metadata_ast(encoded) {
+        Ok(value) => value Err(error) => {
+            ret false
+        }
+    }
+    ret stringify(encode_metadata_ast(restored)) == stringify(encoded)
+}
+
+#attr(test)
+fn metadata_codec_functions_contract() -> bool {
+    ret codec_round_trip("pub fn sample(value: u16) -> u32 { ret value as u32 }")
+}
+
+#attr(test)
+fn metadata_codec_generics_contract() -> bool {
+    ret codec_round_trip("pub fn identity[T](value: T) -> T { ret value }")
+}
+
+#attr(test)
+fn metadata_codec_documentation_contract() -> bool {
+    ret codec_round_trip("//! Module text\n/// Function text\npub fn sample() -> str { ret \"é 中文\" }")
+}
+
+#attr(test)
+fn metadata_codec_capabilities_contract() -> bool {
+    ret codec_round_trip("pub fn sample(value: sending str, input: frozen str) -> sending str { ret value }")
+}
+
+#attr(test)
+fn metadata_codec_structs_contract() -> bool {
+    ret codec_round_trip("pub struct Point[T] { x: T y: T }\npub struct Pair(u16, str)\npub struct Unit")
+}
+
+#attr(test)
+fn metadata_codec_enums_contract() -> bool {
+    ret codec_round_trip("pub enum Choice[T] { Empty Value(T) Named { value: T } }")
+}
+
+#attr(test)
+fn metadata_codec_traits_contract() -> bool {
+    ret codec_round_trip("pub trait Sample[T] { fn get(self: Self) -> T fn ready(self: Self) -> bool }")
+}
+
+#attr(test)
+fn metadata_codec_impls_contract() -> bool {
+    ret codec_round_trip("struct Point { x: u32 }\nimpl for Point { pub fn get(self: Self) -> u32 { ret self.x } }")
+}
+
+#attr(test)
+fn metadata_codec_imports_contract() -> bool {
+    ret codec_round_trip("pub import std::io::{println as output, print}\nimport mod::helpers::*")
+}
+
+#attr(test)
+fn metadata_codec_literals_contract() -> bool {
+    ret codec_round_trip("fn sample() { let x = (1_u16, true, \"text\") let y = [1_u16, 2_u16] let z = [3_u16; 4] }")
+}
+
+#attr(test)
+fn metadata_codec_operators_contract() -> bool {
+    ret codec_round_trip("fn sample(x: i32) -> i32 { let y = -x + 2_i32 * 3_i32 ret (y as i32) }")
+}
+
+#attr(test)
+fn metadata_codec_calls_contract() -> bool {
+    ret codec_round_trip("fn sample() { work[u32](1_u32) thing.run(2_u32) let field = thing.value let index = things[0] }")
+}
+
+#attr(test)
+fn metadata_codec_branches_contract() -> bool {
+    ret codec_round_trip("fn sample(value: bool) { if value { work() } elif false { other() } else { finish() } }")
+}
+
+#attr(test)
+fn metadata_codec_loops_contract() -> bool {
+    ret codec_round_trip("fn sample() { while ready() { continue } loop { break } for item in items { work(item) } do { work() } while ready() }")
+}
+
+#attr(test)
+fn metadata_codec_match_contract() -> bool {
+    ret codec_round_trip("fn sample() { match item { Choice::Value(value) => { work(value) } _ => finish() } }")
+}
+
+#attr(test)
+fn metadata_codec_async_contract() -> bool {
+    ret codec_round_trip("async fn sample() { let task = spawn work() let value = await work() ret value }")
+}
+
+#attr(test)
+fn metadata_codec_try_contract() -> bool {
+    ret codec_round_trip("fn sample() { let value = work()? }")
+}
+
+#attr(test)
+fn metadata_codec_closures_contract() -> bool {
+    ret codec_round_trip("fn sample() { let add = |x: u32| x + 1_u32 let value = if ready() { 1_u32 } else { 2_u32 } }")
+}
+
+#attr(test)
+fn metadata_codec_unsafe_contract() -> bool {
+    ret codec_round_trip("#attr(safe)\npub fn sample() -> u32 { unsafe { ret external() } }")
+}
+
+#attr(test)
+fn metadata_codec_format_contract() -> bool {
+    ret codec_round_trip("fn sample(x: u32) -> str { ret f\"value={x}\" }")
+}
+
+#attr(test)
+fn metadata_codec_rejects_bad_shapes_contract() -> bool {
+    let mut bad = Vec[Json]::new()
+    bad.push(Json::Null)
+    let mut tagged = Vec[Json]::new()
+    tagged.push(Json::String("UnknownDeclaration"))
+    tagged.push(Json::Null)
+    let mut unknown = Vec[Json]::new()
+    unknown.push(Json::Array(tagged))
+    ret decode_metadata_ast(Json::Null).is_err() && decode_metadata_ast(Json::Array(bad)).is_err()
+    && decode_metadata_ast(Json::Array(unknown)).is_err()
+    && decode_usize(Json::Number("-1")).is_err()
+    && decode_usize(Json::Number("4294967296")).is_err()
+    && decode_usize(Json::Number("1.5")).is_err()
+    && decode_bool(Json::Number("1")).is_err()
+    && decode_str(Json::Bool(true)).is_err()
+}
+
+#attr(test)
+fn metadata_codec_runtime_bodies_not_in_interface_contract() -> bool {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source("package@model.enq")
+    let ast = match parser.parse_result(lexer.tokenize(
+            "pub fn runtime(value: u32) -> u32 { ret value + 1_u32 }\npub fn template[T](value: T) -> T { ret value }")) {
+        Ok(value) => value Err(error) => {
+            ret false
+        }
+    }
+    let restored = match decode_metadata_ast(encode_metadata_ast(metadata_interface_ast(ast))) {
+        Ok(value) => value Err(error) => {
+            ret false
+        }
+    }
+    if restored.len() != 2 {
+        ret false
+    }
+    for statement in restored {
+        match statement {
+            Statement::Function(item) => {
+                if item.body.is_some() {
+                    ret false
+                }
+            }
+            _ => {
+                ret false
+            }
+        }
+    }
+    ret true
+}
+
+#attr(test)
+fn metadata_codec_portable_source_identity_contract() -> bool {
+    let source = "pub fn value() -> u32 { ret helper(42) }"
+    let mut lexer = Lexer::new()
+    let mut first = Parser::new_for_source("/old/project/src/model.enq")
+    let mut second = Parser::new_for_source("/new/project/src/model.enq")
+    let left = match first.parse_result(lexer.tokenize(source)) { Ok(value) => value Err(error) => { ret false } }
+    let right = match second.parse_result(lexer.tokenize(source)) { Ok(value) => value Err(error) => { ret false } }
+    ret stringify(encode_metadata_ast_for_module(left, "package@model.enq")) ==
+        stringify(encode_metadata_ast_for_module(right, "package@model.enq"))
+}
+
+#attr(test)
+fn metadata_codec_compile_time_decorator_preserved_contract() -> bool {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source("package@model.enq")
+    let ast = match parser.parse_result(lexer.tokenize(
+        "#attr(decorator)\npub fn wrap[Args](func: Callable[Args, u32], args: Args) -> u32 { ret func(args) }")) {
+        Ok(value) => value Err(error) => { ret false }
+    }
+    let restored = match decode_metadata_ast(encode_metadata_ast(metadata_interface_ast(ast))) {
+        Ok(value) => value Err(error) => { ret false }
+    }
+    if restored.len() != 1 { ret false }
+    for statement in restored {
+        match statement { Statement::Function(item) => { ret item.body.is_some() && item.attrs.len() > 0 }
+            _ => { ret false } }
+    }
+    ret false
+}

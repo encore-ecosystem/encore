@@ -1,260 +1,105 @@
 # Publishing Packages
 
-## Custom registry service
+Encore publishes packages through a registry API, independently of where their
+source repositories are hosted. Publication no longer creates GitHub releases
+or pull requests in a metadata repository. Direct Git dependencies remain
+available through `encore add git@https://github.com/owner/package`.
 
-Set `ENCORE_DEFAULT_INDEX` once in your environment to select a service for all
-projects. A project can override that default in its root manifest:
+## Select a registry
+
+Set a default once for all projects:
+
+```sh
+export ENCORE_DEFAULT_INDEX="http://127.0.0.1:8137/index"
+```
+
+A root manifest can override it:
 
 ```toml
 [registry]
 index = "https://packages.example.org/index"
 ```
 
-`encore publish` discovers its schema-1 API at `<index>/config.json`, uploads in
-64 KiB chunks and asks the service to commit the SHA-256-verified archive.
-Authenticated publication uses the native HTTP client, not curl. Requests stay
-on the index origin and never follow redirects. A failed custom service never
-falls back to GitHub. Plain HTTP is allowed only for `localhost`/`127.0.0.1`
-development services; `localhost` connects directly to IPv4 loopback without DNS.
+The priority is `ENCORE_INDEX_URL`, the root manifest's `[registry].index`, then
+`ENCORE_DEFAULT_INDEX`. Until the official API URL is configured, a new index
+dependency requires an explicit registry; Encore never falls back to GitHub.
+HTTPS is required except for loopback development servers. Absolute `file://`
+registries are read-only API fixtures, not publication destinations.
 
-For a service advertising device authentication:
+## Authentication
 
 ```sh
 encore login
-# Open the printed URL, sign in and approve the displayed device code.
 encore whoami
 encore publish
 encore logout
 ```
 
-`login`, `whoami` and `logout` accept `--registry <index-url>` outside a project.
-Otherwise they use `ENCORE_INDEX_URL`, the root manifest, or
-`ENCORE_DEFAULT_INDEX`, in that order. Login stores the
-credential in the OS keyring, keyed by the complete canonical index URL:
-libsecret on Linux, Keychain on macOS, Credential Manager on Windows. A missing,
-locked or denied keyring is an error; there is no plaintext-file fallback.
-Logout revokes remotely before removing the local credential. If revocation
-cannot be confirmed, the local credential is retained so you can retry.
+Login prints a browser URL and device code. Approve the request on the site.
+The resulting credential is stored in the OS keyring, keyed by the complete
+canonical index URL: libsecret on Linux, Keychain on macOS, Credential Manager
+on Windows. There is no plaintext-file fallback. Logout revokes the credential
+remotely before removing it locally.
 
-In CI, create a short-lived, package-scoped token in the registry account page.
-Inject it as `ENCORE_REGISTRY_TOKEN` through your CI secret manager and set
-`ENCORE_REGISTRY_TOKEN_INDEX=https://packages.example.org/index`. Both are
-required: a project's registry override must not receive a token intended for
-another index. Tokens never appear in command arguments or request files.
-Unset `ENCORE_REGISTRY_TOKEN` before interactive login. The default legacy
-GitHub index does not provide device authentication; it still uses `gh auth`.
+Authentication commands accept `--registry <index-url>` outside a project.
+For CI, inject a short-lived package-scoped `ENCORE_REGISTRY_TOKEN` and set
+`ENCORE_REGISTRY_TOKEN_INDEX` to the intended registry. Both are required;
+credentials must never be forwarded to another registry.
 
-The API path needs Git **locally** for tracked-file selection and deterministic
-archives, but no commit, remote, GitHub repository, clean worktree or push.
-Root path dependencies are rewritten in staging. `encore publish --dry-run`
-checks and creates the archive without HTTP requests, authentication or running
-tests; run `encore check` and `encore test` beforehand. The first service version
-accepts at most 4 MiB compressed. Same version + identical archive is idempotent;
-different bytes for an existing version are rejected. Retry the command after
-an interrupted transfer. `--release-only` is not supported by this API.
+## Prepare a package
 
-## Default GitHub index
-
-Without a custom registry, Encore uses GitHub as package storage and
-[`encore-ecosystem/encore-index`](https://github.com/encore-ecosystem/encore-index) as a sparse
-metadata catalog. Package source can live in any public GitHub repository. A
-published version is a maintainer-created `.tar.gz` asset attached to a GitHub
-Release; automatically generated source archives are not used.
-
-Encore automates the named release and reviewed index pull request:
-
-```sh
-encore publish --dry-run
-encore publish
-# Override the release nametag without changing the registry epoch.
-encore publish --release-name neumann
-```
-
-The dry run performs the same local verification and creates the exact archive
-without changing GitHub. Normal publication uses the current `gh auth`
-session. It is safe to resume when existing remote state matches exactly.
-
-## Package Requirements
-
-A publishable library contains at least:
-
-```text
-encore.toml
-src/lib.enq
-```
-
-The manifest must use a lowercase package name of at least two characters.
-Letters, digits, `-`, and `_` are accepted.
+A package needs tracked `encore.toml` and source files:
 
 ```toml
 [project]
 name = "example_math"
 version = "1.0.0"
-repository = "https://github.com/owner/example_math"
 encore = ">=0.0.0"
 description = "Math helpers for Encore"
-readme = "README.md"
 licence = "MIT"
-dependencies = [
-    "index@std",
-]
+dependencies = ["index@std"]
 
 [publish]
-include = []
 exclude = ["notes/**"]
 ```
 
-Before publishing, `encore publish` verifies the equivalent of:
+Run local verification before publication:
 
 ```sh
-encore sync
 encore format --check
 encore check
-encore lint
 encore test
-encore build
+encore publish --dry-run
+encore publish
 ```
 
-Published manifests must not contain `path@` dependencies. The publisher rewrites
-local dependencies to exact `index@name@version` references in the staged archive,
-without changing the source manifest. Those packages must be published before
-consumers can resolve the archive. A private refrain may use
-`workspace@name` when its complete package is included at `workspace/name` in
-the same release archive. Do not include `.git`, `target`, or machine-specific
-files.
+The dry run selects tracked files, validates and creates the exact archive,
+without authentication, network requests or remote changes. Git is required
+locally for tracked-file selection and portable deterministic archives, but a
+commit, remote, GitHub account and clean worktree are not required.
 
-## Create A Release Archive
+Root `path@` dependencies are rewritten in the staged manifest to exact
+`index@name@version` references. The original manifest is not changed. Publish
+those dependencies first. Private `workspace@` refrains remain bundled under
+`workspace/`. Git dependencies are still supported by the compiler; do not
+confuse Git source installation with registry publication.
 
-Create an archive whose root contains `encore.toml`, not an extra repository
-directory. On a GNU tar environment:
+## API and immutable versions
 
-```sh
-version=1.0.0
-package=example_math
+The client discovers schema-1 capabilities at `<index>/config.json`. Public
+package metadata is obtained from `/api/v1/packages/<name>` on the same origin.
+Publication uploads chunks of 64 KiB and commits the SHA-256-verified archive.
+Authenticated requests use the native HTTP client and never follow redirects.
+A failed or incompatible service is an error, not a reason to use GitHub.
 
-tar \
-  --sort=name \
-  --owner=0 \
-  --group=0 \
-  --numeric-owner \
-  --mtime='UTC 1970-01-01' \
-  -czf "$package-$version.tar.gz" \
-  encore.toml src workspace
-```
+The current publisher accepts archives up to 4 MiB. A repeated publication of
+the same version and identical archive is idempotent. Different bytes for an
+existing version are rejected. Increment `[project].version` for changes.
+`--release-name` selects the nametag; `--release-only` is no longer supported.
+Archives may contain only regular files and directories, with `encore.toml`
+at their root. Links, special files and path traversal are rejected.
 
-Include `README.md`, a license file, tests, examples, and native sources when
-they are part of the package. Omit `workspace` from the command when the
-distribution has no private refrains. Every listed path must exist; keep
-generated build output out of the archive. Archives may contain only regular
-files and directories; symbolic links, hard links, and special files are
-rejected.
-
-Inspect and hash the result:
-
-```sh
-tar -tzf example_math-1.0.0.tar.gz
-sha256sum example_math-1.0.0.tar.gz
-```
-
-The listing must contain `encore.toml` at the archive root and must not contain
-absolute paths or `..` components.
-
-Named package releases use a nametag while manifests keep a SemVer version.
-The registry epoch is a separate compatibility generation: it stays `neumann`
-across subsequent named releases until an explicit index reset. The compiler
-records that generation independently of its own release name. Publication
-checks the upstream `index.json` before submitting an index update and refuses
-an incompatible epoch. `--release-only` uploads the immutable package without
-an index PR; it is reserved for staging coordinated index cutovers.
-
-For example:
-
-```sh
-git tag -s example_math-v1.0.0-neumann -m "example_math 1.0.0-neumann"
-git push origin example_math-v1.0.0-neumann
-gh release create example_math-v1.0.0-neumann \
-  example_math-1.0.0.tar.gz \
-  --title "example_math 1.0.0"
-```
-
-Never replace an uploaded asset. If an archive is wrong, publish a new package
-version and a new URL.
-
-## Add The Index Entry
-
-Fork `encore-ecosystem/encore-index`. Metadata paths use the first two package-name
-characters:
-
-```text
-example_math -> ex/example_math.json
-```
-
-For a new package, create:
-
-```json
-{
-  "name": "example_math",
-  "versions": [
-    {
-      "version": "1.0.0",
-      "epoch": "neumann",
-      "nametag": "neumann",
-      "release": "1.0.0-neumann",
-      "archive": "https://github.com/author/example_math/releases/download/example_math-v1.0.0-neumann/example_math-1.0.0.tar.gz",
-      "checksum": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-      "yanked": false
-    }
-  ]
-}
-```
-
-For a new version, append an object to `versions`. Do not edit or reorder an
-already published entry. Open a pull request containing only the relevant
-metadata changes.
-
-Index CI validates the path, schema, package name, SemVer, duplicate versions,
-archive URL, SHA-256, archive paths, and manifest identity. Maintainers review
-the package source, dependency references, licensing, and test evidence before
-merging.
-
-## Test Before Opening A PR
-
-Push the metadata branch and point Encore to its immutable Git commit:
-
-```sh
-export ENCORE_INDEX_URL="https://raw.githubusercontent.com/<fork>/encore-index/<commit>"
-export ENCORE_REGISTRY_CACHE="$(mktemp -d)"
-
-mkdir package-smoke
-cd package-smoke
-encore init --name package_smoke
-encore add example_math
-encore build
-```
-
-Using a fresh cache proves that metadata, download URL, checksum, archive, and
-transitive dependencies work together.
-
-## Publish An Update
-
-1. Increase `[project].version`.
-2. Run package tests.
-3. Create and upload a new immutable archive.
-4. Append the new version to the metadata file.
-5. Open an index PR.
-
-After merge, new projects and `encore update` select the highest compatible
-SemVer version. Existing projects remain on the version recorded in
-`encore.lock` unless their manifest constraints can no longer be satisfied by
-that locked graph.
-
-## Yank A Version
-
-To prevent new selection of a broken release, open an index PR changing only:
-
-```json
-"yanked": true
-```
-
-Do not delete the metadata entry or release asset. Existing lockfiles must
-remain reproducible. Publish a corrected version separately.
+New consumers select the highest compatible, non-yanked SemVer version.
+Existing consumers stay on their lockfile until `encore update`. Yanking does
+not delete archives or invalidate existing locked builds. Changing registry
+requires an explicit update; caches are isolated by canonical registry URL.
