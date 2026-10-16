@@ -5,7 +5,7 @@ import refrain::ci_helpers::{Fixture, json, flag, number, text, modified_ns, rep
 import refrain::modes::build_output::{build_artifact_name, build_import_library_name}
 import refrain::target::host_target
 import std::io::eprintln
-import std::os::{file_exists, file_sha256, read_file, remove_file, remove_dir_all}
+import std::os::{env, file_exists, file_sha256, read_file, remove_file, remove_dir_all}
 import std::process::Command
 import std::string::String
 import std::vec::Vec
@@ -31,7 +31,7 @@ fn library_artifact_contract(kind: str) -> bool {
         ret fixture.finish(false)
     }
     let before = modified_ns(artifact)
-    if !fixture.command(vec!["build"]).success() || modified_ns(artifact) != before ||
+    if !fixture.succeeds(vec!["build"]) || modified_ns(artifact) != before ||
     !flag(json(fixture.read("target/dev/encore-timings.json")), "link_cache_hit") {
         ret fixture.finish(false)
     }
@@ -58,7 +58,7 @@ fn library_artifact_contract(kind: str) -> bool {
     if selected == "shared_lib" && target.os != "windows" {
         args.push("-Wl,-rpath," + fixture.root.join("target/dev").as_str())
     }
-    let linked = fixture.tool("clang", args)
+    let linked = fixture.tool(env("ENCORE_CC").unwrap_or("clang"), args)
     if !linked.success() || !Command::new(driver.as_str()).output().success() {
         eprintln(linked.text())
         ret fixture.finish(false)
@@ -72,11 +72,18 @@ fn library_artifact_contract(kind: str) -> bool {
             eprintln(output.text())
             ret fixture.finish(false)
         }
+        if emit == "llvm-ir" && !file_exists(fixture.root.join("target/dev/library_probe.ll").as_str()) {
+            ret fixture.finish(false)
+        }
+        if emit == "object" && !file_exists(fixture.root.join("target/dev/object/library_probe" +
+                if target.os == "windows" { ".obj" } else { ".o" }).as_str()) {
+            ret fixture.finish(false)
+        }
     }
     // Explicit kinds must still select lib.enq when a main also exists.
     if kind != "auto" {
         fixture.put("src/main.enq", "fn main() -> u32 { ret undefined_binary_only_name }\n")
-        if !fixture.command(vec!["build"]).success() {
+        if !fixture.succeeds(vec!["build"]) {
             ret fixture.finish(false)
         }
     }
@@ -96,6 +103,63 @@ fn integration_library_static_contract() -> bool {
 #attr(test)
 fn integration_library_shared_contract() -> bool {
     ret library_artifact_contract("shared_lib")
+}
+
+#attr(test)
+fn integration_issue92_qualified_reexport_contract() -> bool {
+    let fixture = Fixture::new("qualified-reexport")
+    fixture.manifest("qualified_probe", "[\"path@library\"]")
+    fixture.put("library/encore.toml", "[project]\nname=\"library\"\nversion=\"0.0.0\"\ndependencies=[]\n")
+    fixture.put("library/src/lib.enq", "pub import refrain::value::{Value, Value as PublicValue}\n")
+    fixture.put("library/src/value.enq", "pub struct Value {}\nimpl for Value { pub fn answer() -> u32 { ret 42 } }\n")
+    for call in vec!["library::Value::answer()", "library::PublicValue::answer()"] {
+        fixture.put("src/main.enq", "fn main() -> u32 { ret " + call + " - 42_u32 }\n")
+        for operation in vec!["check", "run", "run"] {
+            let output = fixture.command(vec![operation])
+            if !output.success() { eprintln(output.text()) ret fixture.finish(false) }
+        }
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_issue93_generic_import_scope_contract() -> bool {
+    let fixture = Fixture::new("generic-import-scope")
+    fixture.manifest("import_probe", "[\"path@a\",\"path@b\"]")
+    for package in vec!["a", "b"] {
+        fixture.put(package + "/encore.toml", "[project]\nname=\"" + package + "\"\nversion=\"0.0.0\"\ndependencies=[]\n")
+    }
+    fixture.put("a/src/lib.enq", "import core::result::Result\npub struct ParseError {}\nimpl for ParseError { pub fn row(self: Self) -> u32 { ret 7 } }\npub fn parse(text: str) -> Result[u32, ParseError] { let _text = text ret Result::Err(ParseError {}) }\n")
+    fixture.put("b/src/lib.enq", "import core::result::Result\npub struct ParseError {}\npub fn parse(text: str) -> Result[u32, ParseError] { let _text = text ret Result::Ok(1_u32) }\npub fn wrapped[T](value: T) -> u32 { let _value = value ret parse(\"b\").unwrap_or(0_u32) }\n")
+    for binding in vec!["parse", "parse as parse_a"] {
+        let name = if binding == "parse" { "parse" } else { "parse_a" }
+        fixture.put("src/main.enq", "import core::result::Result\nimport a::" + binding + "\nimport b::wrapped\nfn main() -> u32 { let number = match " + name + "(\"a\") { Result::Ok(value) => value Result::Err(error) => error.row() } ret number + wrapped(1_u32) - 8_u32 }\n")
+        for operation in vec!["check", "run", "run"] {
+            let output = fixture.command(vec![operation])
+            if !output.success() { eprintln(output.text()) ret fixture.finish(false) }
+        }
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_issue94_imported_parser_error_contract() -> bool {
+    let fixture = Fixture::new("imported-parser-error")
+    fixture.manifest("parser_probe", "[]")
+    let entry = "import refrain::catalog::alternatives\nfn main() -> u32 { let values = alternatives(\"a\") ret if values.len() == 1 { 0_u32 } else { 1_u32 } }\n"
+    fixture.put("src/main.enq", entry)
+    fixture.put("tests/imported_syntax.enq", entry)
+    fixture.put("src/catalog.enq", "import core::vec::Vec\npub fn alternatives(key: str) -> Vec[u32] { let _key = key ret vec![1_u32] }\n")
+    let initial = fixture.command(vec!["test", "--filter", "imported_syntax"])
+    if !initial.success() { eprintln(initial.text()) ret fixture.finish(false) }
+    fixture.put("src/catalog.enq", "import core::vec::Vec\npub fn alternatives(key: str) -> Vec[u32] { ret match key { \"a\" | \"b\" => vec![1_u32] _ => vec![2_u32] } }\n")
+    for operation in vec!["build", "test", "test"] {
+        let output = fixture.command(if operation == "test" { vec!["test", "--filter", "imported_syntax"] } else { vec![operation] })
+        if output.success() || !output.text().contains("parse-error") || !output.text().contains("catalog.enq") || output.text().contains("process exited with code 139") {
+            eprintln(output.text()) ret fixture.finish(false)
+        }
+    }
+    ret fixture.finish(true)
 }
 
 #attr(test)
@@ -130,7 +194,7 @@ fn integration_nominal_type_workspaces_contract() -> bool {
     }
     let source = "import refrain::left::left_run\nimport refrain::right::right_run\nfn main() -> u32 { ret if left_run() && right_run() { 0_u32 } else { 1_u32 } }\n"
     fixture.put("src/main.enq", source)
-    if !fixture.command(vec!["run"]).success() || !fixture.command(vec!["test", "--jobs", "2", "--report", "report.json"]).success() ||
+    if !fixture.succeeds(vec!["run"]) || !fixture.succeeds(vec!["test", "--jobs", "2", "--report", "report.json"]) ||
     number(json(fixture.read("report.json")).get("summary").unwrap_or(Json::Null), "passed") != "2" {
         ret fixture.finish(false)
     }
@@ -144,13 +208,14 @@ fn integration_nominal_type_workspaces_contract() -> bool {
         } else {
             project.put("src/main.enq", "import refrain::left::left_run\nfn main() -> u32 { ret if left_run() { 0_u32 } else { 1_u32 } }\n")
         }
-        if !project.command(vec!["run"]).success() {
+        if !project.succeeds(vec!["run"]) {
             ret fixture.finish(false)
         }
     }
     fixture.put("src/main.enq", "import refrain::left::accept\nimport refrain::right::{Connection, connection}\nimport core::vec::Vec\n" +
         "fn main() -> u32 { let mut values = Vec[Connection]::new() values.push(connection()) let wrong = accept(values) ret 0_u32 }\n",)
     let rejected = fixture.command(vec!["build"])
+    if rejected.success() || !rejected.text().contains("argument-mismatch") { eprintln(rejected.text()) }
     ret fixture.finish(!rejected.success() && String::from_str(rejected.text()).contains("argument-mismatch"))
 }
 

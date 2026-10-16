@@ -163,6 +163,15 @@ static encore_compiler_str encore_compiler_owned_string(char *data, size_t len) 
     object->data[len] = '\0'; free(data); out.object = object; return out;
 }
 
+encore_compiler_str encore_compiler_read_artifact(encore_compiler_str path) {
+    char *name = encore_compiler_cstr(path);
+    size_t length = 0;
+    char *data = encore_build_artifact_read(name, &length);
+    free(name);
+    if (data == NULL) return (encore_compiler_str){NULL};
+    return encore_compiler_owned_string(data, length);
+}
+
 static bool encore_compiler_identifier_byte(unsigned char value) {
     return (value >= '0' && value <= '9') ||
            (value >= 'A' && value <= 'Z') ||

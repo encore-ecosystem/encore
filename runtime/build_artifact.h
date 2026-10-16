@@ -156,4 +156,63 @@ static inline bool encore_build_artifact_write(const char *path, const void *dat
     return valid;
 }
 
+/* Read one committed snapshot. On Windows the CRT reader can lose a race
+ * with replacement or a transient scanner lock even after GetFileAttributes
+ * succeeded. Open the immutable receipt with delete sharing and retry only
+ * OS sharing errors; malformed bytes are never retried or accepted. */
+static inline char *encore_build_artifact_read(const char *path, size_t *length) {
+    *length = 0;
+    if (path == NULL) return NULL;
+#ifdef _WIN32
+    wchar_t *wide = encore_build_artifact_wide(path);
+    if (wide == NULL) return NULL;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (size_t attempt = 0; attempt < 100; ++attempt) {
+        file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        if (file != INVALID_HANDLE_VALUE) break;
+        DWORD error = GetLastError();
+        if (error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) break;
+        Sleep(10);
+    }
+    free(wide);
+    if (file == INVALID_HANDLE_VALUE) return NULL;
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 || (uint64_t)size.QuadPart >= SIZE_MAX) {
+        CloseHandle(file); return NULL;
+    }
+    size_t count = (size_t)size.QuadPart;
+    char *data = malloc(count + 1);
+    if (data == NULL) { CloseHandle(file); return NULL; }
+    size_t offset = 0;
+    while (offset < count) {
+        DWORD read_count = 0;
+        DWORD chunk = count - offset > 1048576 ? 1048576 : (DWORD)(count - offset);
+        if (!ReadFile(file, data + offset, chunk, &read_count, NULL) || read_count == 0) {
+            free(data); CloseHandle(file); return NULL;
+        }
+        offset += read_count;
+    }
+    CloseHandle(file);
+#else
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return NULL;
+    struct stat information;
+    if (fstat(fileno(file), &information) != 0 || !S_ISREG(information.st_mode) ||
+        information.st_size < 0 || (uintmax_t)information.st_size >= SIZE_MAX) {
+        fclose(file); return NULL;
+    }
+    size_t count = (size_t)information.st_size;
+    char *data = malloc(count + 1);
+    if (data == NULL) { fclose(file); return NULL; }
+    if (fread(data, 1, count, file) != count || ferror(file)) {
+        free(data); fclose(file); return NULL;
+    }
+    fclose(file);
+#endif
+    data[count] = '\0';
+    *length = count;
+    return data;
+}
+
 #endif

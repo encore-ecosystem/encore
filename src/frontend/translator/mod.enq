@@ -1642,8 +1642,9 @@ fn function_import_alias_key(source_name: str, alias: str) -> str {
 }
 
 fn index_function_import_aliases(ctx: mut TranslatorContext) ->() {
-    // Resolve aliases once to the original declaration's overload chain. An
-    // alias never creates a second function declaration or emitted definition.
+    // Bind every explicitly selected import, including its unaliased spelling,
+    // to the declaration's overload chain. A transitively imported generic
+    // template cannot displace this lexical binding with its private helper.
     for module in ctx.modules {
         for statement in module.ast {
             match statement {
@@ -1655,9 +1656,19 @@ fn index_function_import_aliases(ctx: mut TranslatorContext) ->() {
                             continue
                         }
                         for binding in import_binding_names(path, target) {
-                            if !binding.2 || binding.0 == "*" {
+                            if binding.0 == "*" {
                                 continue
                             }
+                            let mut local = false
+                            for declaration in module.ast {
+                                match declaration {
+                                    Statement::Function(function) => {
+                                        if function.name == binding.1 { local = true }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if local && !binding.2 { continue }
                             let mut encoded = unsafe {
                                 encore_strmap_get(ctx.function_heads, binding.0)
                             }
@@ -2362,6 +2373,19 @@ fn module_symbol_prefix(ctx: mut TranslatorContext, source_name: str) -> str {
 
 fn qualified_callable_name(ctx: mut TranslatorContext, source_name: str, name: str) -> str {
     let owner = function_owner_name(name)
+    let scope = last_scope_index(owner)
+    if scope < owner.byte_len() {
+        let requested_module = owner.slice_bytes(0, scope)
+        let requested_type = owner.slice_bytes(scope + 2, owner.byte_len() - scope - 2)
+        for module in ctx.modules {
+            if module_import_path(module.module_id) == requested_module {
+                let resolved = exported_type_identity(ctx, module, requested_type, 0)
+                if resolved != "" {
+                    ret resolved + name.slice_bytes(owner.byte_len(), name.byte_len() - owner.byte_len())
+                }
+            }
+        }
+    }
     if owner == "" || !contains_str(ctx.type_collisions, base_type_name(owner)) ||
     (!ctx.stable_abi && source_declares_trait(ctx, source_name, owner)) {
         ret name
@@ -2369,6 +2393,48 @@ fn qualified_callable_name(ctx: mut TranslatorContext, source_name: str, name: s
     let member_start = owner.byte_len() + 2_usize
     ret qualified_type_for_source(ctx, source_name, owner) + "::" +
     name.slice_bytes(member_start, name.byte_len() - member_start)
+}
+
+// Follow public re-exports to the declaration, including renamed exports.
+// A facade path is a lookup spelling, never the implementation's ABI name.
+fn exported_type_identity(ctx: mut TranslatorContext, module: TranslationModule,
+    name: str, depth: usize,) -> str {
+    if depth > ctx.modules.len() { ret "" }
+    for statement in module.ast {
+        let mut public_type = false
+        match statement {
+            Statement::Struct(item) => { public_type = item.is_public && item.name == name }
+            Statement::EnumItem(item) => { public_type = item.is_public && item.name == name }
+            Statement::Trait(item) => { public_type = item.is_public && item.name == name }
+            _ => {}
+        }
+        if public_type { ret qualified_type_for_source(ctx, module.source_name, name) }
+    }
+    let mut found = ""
+    for candidate in ctx.modules {
+        if !contains_str(module.imports, candidate.module_id) { continue }
+        let target = module_import_path(candidate.module_id)
+        for statement in module.ast {
+            match statement {
+                Statement::Import(item) => {
+                    let path = translation_import_target(module, item.path)
+                    if !item.is_public || !(path == target || starts_with(path, target + "::")) { continue }
+                    for binding in import_binding_names(path, target) {
+                        if binding.1 == name || binding.0 == "*" {
+                            let original = if binding.0 == "*" { name } else { binding.0 }
+                            let resolved = exported_type_identity(ctx, candidate, original, depth + 1)
+                            if resolved != "" {
+                                if found != "" && found != resolved { ret "" }
+                                found = resolved
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    ret found
 }
 
 fn ctx_next_emitted_name(ctx: mut TranslatorContext, source_name: str, raw_name: str) -> str {
@@ -13586,8 +13652,12 @@ fn borrowed_method_return_contract() -> bool {
     let mut lexer = Lexer::new()
     let mut parser = Parser::new()
     let output = translate_to_ehir(parser.parse(lexer.tokenize(source)))
-    ret output.contains("call Store::peek(")
-    && output.contains("retain entry_let_method_1: Item")
+    let call = find_char(output, ": Item = call Store::peek(", 0)
+    if call == output.len() { ret false }
+    let mut start = call
+    while start > 0 && output.slice(start - 1, 1) != "\n" { start -= 1 }
+    let result = trim_spaces(output.slice(start, call - start))
+    ret result != "" && output.contains("retain " + result + ": Item")
 }
 
 #attr(test)

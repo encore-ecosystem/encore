@@ -889,7 +889,9 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
     let support_native_ms = perf_counter_ms() - pipeline_started - packages_ms
     // Publish only a successfully linked binary, never truncate the executable
     // that another process is still running or retain a failed partial link.
-    let linked = staging.join(build_artifact_name(target, "linked", output_kind))
+    // PE import libraries embed the output DLL basename. Stage under its
+    // public name so consumers never acquire a dependency on "linked.dll".
+    let linked = staging.join(build_artifact_name(target, graph.root_name, output_kind))
     if output_kind == "static_lib" {
         merge_static_library(native.archiver, objects, archives, staging, linked)?
     } else {
@@ -2412,7 +2414,10 @@ fn write_llvm_artifact_text(ehir_text: str, llvm_path: Path, target: TargetSpec,
     // COFF GNU linkers require explicit COMDAT groups for the linkonce_odr
     // helpers emitted into separate modules. Keep Windows GNU as one module
     // until those groups are represented in the LLVM IR model.
-    let modular = normalize_emit(requested_value("--emit", "binary")) == "binary"
+    let worker_emit = if argv(1).unwrap_or("") == "__codegen" {
+        argv(8).unwrap_or("binary")
+    } else { normalize_emit(requested_value("--emit", if target.freestanding { "object" } else { "binary" })) }
+    let modular = worker_emit == "binary"
     && !(target.os == "windows" && target.environment == "gnu")
     if is_bundle && modular {
         let mut typed_bundle = Option[ModuleBundle]::None
@@ -2806,6 +2811,7 @@ fn exec_llvm_codegen_worker(ehir_path: Path, llvm_path: Path, target: TargetSpec
     args.push(native_path(fingerprint_path.as_str()))
     args.push(fingerprint)
     args.push(incremental_configuration)
+    args.push(normalize_emit(requested_value("--emit", if target.freestanding { "object" } else { "binary" })))
     // Unix replaces the memory-heavy frontend with the codegen worker and the
     // worker re-executes this build as its continuation. Windows has no true
     // exec: the parent waits for the worker and resumes the pipeline itself.
@@ -2840,6 +2846,7 @@ fn run_llvm_codegen_worker(ehir_path: Path, llvm_path: Path, target: TargetSpec,
     args.push(native_path(fingerprint_path.as_str()))
     args.push(fingerprint)
     args.push(incremental_configuration)
+    args.push(normalize_emit(requested_value("--emit", if target.freestanding { "object" } else { "binary" })))
     ret run_args_owned(executable, args) == 0_i32
 }
 
@@ -2975,7 +2982,7 @@ pub fn run_codegen_worker() -> u32 {
         Some(value) => value None => "encore"
     }
     let mut continuation = Vec[str]::new()
-    let mut index = 8_usize
+    let mut index = 9_usize
     while index < argc() {
         match argv(index) {
             Some(value) => {
@@ -3411,6 +3418,14 @@ pub fn compile_test_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
 #attr(safe)
 fn compile_entry_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str,
     build_script: bool,) -> u32 {
+    // Parser/import failures are fatal even on a worker binary cache hit.
+    // Lowering-time validation cannot recover diagnostics discarded by parsing.
+    for module in workspace.modules {
+        for diagnostic in module.diagnostics {
+            eprintln(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
+            ret 1_u32
+        }
+    }
     let target = host_target()
     let test_toolchain = requested_toolchain(root, target)
     let tests_dir = root.join("target").join("tests")

@@ -120,12 +120,13 @@ typedef struct { const char *path; unsigned char blobs[4][CI_BLOB_SIZE]; atomic_
 static void *ci_artifact_reader(void *raw) {
     ci_artifact_state *state = raw;
     do {
-        FILE *file = fopen(state->path, "rb"); assert(file != NULL);
-        unsigned char data[CI_BLOB_SIZE + 1];
-        assert(fread(data, 1, sizeof(data), file) == CI_BLOB_SIZE); fclose(file);
+        size_t length = 0;
+        char *data = encore_build_artifact_read(state->path, &length);
+        assert(data != NULL && length == CI_BLOB_SIZE);
         bool valid = false;
         for (size_t index = 0; index < 4; ++index) if (!memcmp(data, state->blobs[index], CI_BLOB_SIZE)) valid = true;
         assert(valid);
+        free(data);
     } while (atomic_load(&state->running));
     return NULL;
 }
