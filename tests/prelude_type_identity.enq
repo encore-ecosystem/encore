@@ -1,0 +1,72 @@
+//! Implicit prelude, explicit imports and re-exports share nominal identities.
+
+import refrain::frontend::analysis_database::{AnalysisDatabase, check_prepared_semantic_module}
+import refrain::frontend::type_scope::{TypeNameBinding, names_in_scope, scope_type}
+import refrain::target::host_target
+import std::io::eprintln
+import std::vec::Vec
+
+fn main() -> u32 {
+    let mut names = Vec[TypeNameBinding]::new()
+    // A fallback must not win merely because it appears first in the table.
+    names.push(TypeNameBinding { "", "Vec", "@1", "Vec", "Vec" })
+    names.push(TypeNameBinding { "consumer", "Vec", "@2", "Vec", "Vec" })
+    if scope_type("Vec[u32]", "consumer", names, Vec[str]::new()) != "@2[u32]" {
+        ret 1
+    }
+    if scope_type("Vec[u32]", "other", names, Vec[str]::new()) != "@1[u32]" {
+        ret 2
+    }
+    if scope_type("Vec", "consumer", names, vec!["Vec"]) != "Vec" {
+        ret 3
+    }
+    if names_in_scope(names, "other").len() != 1 {
+        ret 4
+    }
+
+    let mut database = AnalysisDatabase::new()
+    database.set_module("core::vec", "core/vec/mod.enq",
+        "pub struct Vec[T] { value: T }\n" +
+        "impl[T] for Vec[T] { pub fn len(self: Self) -> usize { ret 1 } }\n",)
+    database.set_module("std::vec", "std/vec/mod.enq", "pub import core::vec::Vec\n")
+    database.set_module("example::core::types", "example/core/types.enq", "pub struct Type { name: str }\n")
+    database.set_module("example::core::value", "example/core/value.enq",
+        "import std::vec::Vec\nimport example::core::types::Type\n" +
+        "pub struct Value { generics: Vec[Type] }\n",)
+    database.set_module("example::core", "example/core/mod.enq",
+        "pub import mod::types::*\npub import mod::value::*\n",)
+    database.set_module("example::text", "example/text/mod.enq",
+        "import example::core::*\nfn count(items: Vec[Type]) -> usize { ret items.len() }\n" +
+        "pub fn render(value: Value) -> usize { ret count(value.generics) }\n",)
+    database.set_module("example", "example/main.enq",
+        "import example::core::{Type, Value}\nimport example::text::render\n" +
+        "fn main() -> u32 { let value = Value{vec![Type{\"fixture\"}]} ret render(value) as u32 }\n",)
+    for module in vec!["example::text", "example"] {
+        let full = database.module_semantic_diagnostics_for_target(module, host_target(), Vec[str]::new())
+        let prepared = check_prepared_semantic_module(database.prepare_module_semantic_check_for_target(
+                module, host_target(), Vec[str]::new(),))
+        for diagnostic in full {
+            if diagnostic.severity == 1 {
+                eprintln(diagnostic.message) ret 5
+            }
+        }
+        for diagnostic in prepared {
+            if diagnostic.severity == 1 {
+                eprintln(diagnostic.message) ret 6
+            }
+        }
+    }
+
+    // A user declaration called Vec must remain distinct from the prelude.
+    database.set_module("example::text", "example/text/mod.enq",
+        "import example::core::*\nstruct Vec[T] { value: T }\n" +
+        "fn count(items: Vec[Type]) -> usize { ret 1 }\n" +
+        "pub fn render(value: Value) -> usize { ret count(value.generics) }\n",)
+    for diagnostic in database.module_semantic_diagnostics_for_target(
+        "example::text", host_target(), Vec[str]::new(),) {
+        if diagnostic.code == "argument-mismatch" {
+            ret 0
+        }
+    }
+    ret 7
+}

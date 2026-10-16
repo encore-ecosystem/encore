@@ -11,34 +11,40 @@ case "$CI_PROBE_CASE" in
       "$repository/.github/actions/stage3-context/action.yml" > restore.sh
     test -s restore.sh
     export CI_TARGET=x86_64-unknown-linux-gnu CI_EXECUTABLE=encore
-    export CI_SEED_TAG=v0.1.1-neumann CI_INDEX_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    export CI_SEED_TAG=v0.1.1-neumann
     export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-    for scenario in empty populated corrupt missing-sources; do
+    for scenario in valid corrupt missing-sources wrong-commit legacy-provenance; do
       workspace="$scratch/$scenario/encore"
       context="$workspace/target/test-context"
-      mkdir -p "$context/bin" "$context/system-index/packages/core"
+      mkdir -p "$context/bin" "$workspace/packages/core" "$workspace/packages/platform" "$workspace/lsp"
       cp "$repository/VERSION" "$workspace/VERSION"
       cp "$repository/tests/ci/mock-compiler.sh" "$context/bin/encore"
-      cp "$repository/../encore-index/packages/core/encore.toml" "$context/system-index/packages/core/"
+      cp "$repository/packages/core/encore.toml" "$workspace/packages/core/"
+      cp "$repository/packages/platform/encore.toml" "$workspace/packages/platform/"
+      cp "$repository/lsp/encore.toml" "$workspace/lsp/"
       digest=$(sha256sum "$context/bin/encore" | awk '{print $1}')
       release=$(tr -d '\r\n' < "$workspace/VERSION")
       jq -n --arg commit "$GITHUB_SHA" --arg release "$release" \
-        --arg target "$CI_TARGET" --arg seed "$CI_SEED_TAG" --arg index "$CI_INDEX_SHA" \
+        --arg target "$CI_TARGET" --arg seed "$CI_SEED_TAG" \
         --arg digest "$digest" \
-        '{schema:2, commit:$commit, release:$release, target:$target, seed:$seed,
-          index_commit:$index, converged:true, stage2_sha256:$digest,
-          stage3_sha256:$digest, compiler_sha256:$digest, dependencies_sha256:$digest}' \
+        '{schema:3, commit:$commit, release:$release, target:$target, seed:$seed,
+          converged:true, stage2_sha256:$digest,
+          stage3_sha256:$digest, compiler_sha256:$digest}' \
         > "$context/provenance.json"
       export GITHUB_ENV="$workspace/environment"
       case "$scenario" in
-        populated)
-          mkdir -p "$context/registry/packages"
-          printf 'cached package\n' > "$context/registry/packages/fixture"
-          ;;
         corrupt) printf 'corrupted\n' >> "$context/bin/encore" ;;
-        missing-sources) mv "$context/system-index" "$workspace/removed-sources" ;;
+        missing-sources) mv "$workspace/packages" "$workspace/removed-sources" ;;
+        wrong-commit)
+          jq '.commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' "$context/provenance.json" > "$workspace/invalid.json"
+          mv "$workspace/invalid.json" "$context/provenance.json"
+          ;;
+        legacy-provenance)
+          jq '.schema = 2' "$context/provenance.json" > "$workspace/invalid.json"
+          mv "$workspace/invalid.json" "$context/provenance.json"
+          ;;
       esac
-      if [[ "$scenario" == corrupt || "$scenario" == missing-sources ]]; then
+      if [[ "$scenario" != valid ]]; then
         if (cd "$workspace" && bash "$scratch/restore.sh"); then exit 1; fi
         test ! -e "$GITHUB_ENV"
       else
@@ -46,23 +52,18 @@ case "$CI_PROBE_CASE" in
         cmp "$context/bin/encore" "$workspace/target/stage3/encore"
         test -x "$workspace/target/stage3/encore"
         test -d "$workspace/target/registry"
-        cmp "$context/system-index/packages/core/encore.toml" "$workspace/../encore-index/packages/core/encore.toml"
+        test ! -e "$workspace/../encore-index"
         grep -qx 'ENCORE_INDEX_URL=http://127.0.0.1:9/index' "$GITHUB_ENV"
-        if [[ "$scenario" == populated ]]; then
-          cmp "$context/registry/packages/fixture" "$workspace/target/registry/packages/fixture"
-        else
-          test -z "$(ls -A "$workspace/target/registry")"
-        fi
+        test -z "$(ls -A "$workspace/target/registry")"
       fi
     done
     ;;
   bridge-x86|bridge-arm)
-    mkdir -p encore/target/dependency-download encore-index/packages/core seed
+    mkdir -p encore/packages/core seed
     cp "$repository/tests/ci/mock-compiler.sh" seed/encore
     chmod +x seed/encore
     cp "$repository/VERSION" encore/VERSION
-    cp "$repository/../encore-index/packages/core/encore.toml" encore-index/packages/core/
-    printf '%064d\n' 0 > encore/target/dependency-download/dependencies.tar.gz.sha256
+    cp "$repository/packages/core/encore.toml" encore/packages/core/
     export LLVM_MINGW_ROOT="$scratch/toolchain with spaces"
     export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     export CI_PROBE_TARGET=x86_64-w64-windows-gnu
@@ -73,20 +74,20 @@ case "$CI_PROBE_CASE" in
     destination="target/stage1-artifacts/$CI_PROBE_TARGET"
     checksum=$(sha256sum "$destination/encore.exe" | awk '{print $1}')
     jq -e --arg target "$CI_PROBE_TARGET" --arg checksum "$checksum" \
-      '.schema == 2 and .target == $target and .producer == "linux" and
+      '.schema == 3 and .target == $target and .producer == "linux" and
        .bootstrap == null and .seed == "v0.1.2-neumann" and
-       .executable == "encore.exe" and .executable_sha256 == $checksum' "$destination/manifest.json"
+       .executable == "encore.exe" and .executable_sha256 == $checksum and
+       (has("dependencies_sha256") | not)' "$destination/manifest.json"
     if bash "$repository/scripts/ci-produce-stage1.sh" "$scratch/seed/encore" v0.1.2-neumann aarch64-unknown-linux-gnu; then exit 1; fi
     test "$(tr '\n' ' ' < phases)" = 'producer cross '
     ;;
   bootstrap|mismatch|build-failure)
-    mkdir -p seed target/dependency-download
+    mkdir -p seed
     cp "$repository/tests/ci/mock-compiler.sh" seed/encore
     chmod +x seed/encore
     printf '0.1.4-neumann\n' > VERSION
-    printf '%064d\n' 0 > target/dependency-download/dependencies.tar.gz.sha256
     export SEED_COMPILER="$scratch/seed/encore" CI_TARGET=x86_64-unknown-linux-gnu CI_EXECUTABLE=encore
-    export CI_SEED_TAG=v0.1.1-neumann CI_INDEX_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    export CI_SEED_TAG=v0.1.1-neumann
     export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     unset CI_BUILD_JOBS
     if [[ "$CI_PROBE_CASE" == bootstrap ]]; then
@@ -94,7 +95,8 @@ case "$CI_PROBE_CASE" in
       test "$(tr '\n' ' ' < phases)" = 'seed stage1 stage2 '
       test -d target/bootstrap-cache-1 && test -d target/bootstrap-cache-2 && test -d target/bootstrap-cache-3
       cmp target/stage2/encore target/stage3/encore
-      jq -e '.converged and .stage2_sha256 == .stage3_sha256 and .compiler_sha256 == .stage3_sha256' target/convergence.json
+      jq -e '.schema == 3 and .converged and .stage2_sha256 == .stage3_sha256 and .compiler_sha256 == .stage3_sha256 and
+        (has("index_commit") | not) and (has("dependencies_sha256") | not)' target/convergence.json
     else
       if bash "$repository/scripts/ci-bootstrap.sh" > failed.log 2>&1; then exit 1; fi
       if [[ "$CI_PROBE_CASE" == mismatch ]]; then

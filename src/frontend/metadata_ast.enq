@@ -17,7 +17,7 @@ struct MetadataEncoding {
 
 /// Serializes a selected declaration graph without exposing parser internals.
 pub fn encode_metadata_ast(ast: Vec[Statement]) -> Json {
-    let encoding = MetadataEncoding{"", true, true}
+    let encoding = MetadataEncoding { "", true, true }
     ret encode_vec_statement(ast, encoding)
 }
 
@@ -25,7 +25,7 @@ pub fn encode_metadata_ast(ast: Vec[Statement]) -> Json {
 /// directory. Moving a cache entry cannot change its ABI identity or make it
 /// reference the machine where the package was first compiled.
 pub fn encode_metadata_ast_for_module(ast: Vec[Statement], module_id: str) -> Json {
-    ret encode_vec_statement(ast, MetadataEncoding{module_id, true, true})
+    ret encode_vec_statement(ast, MetadataEncoding { module_id, true, true })
 }
 
 /// Encodes the semantic declaration contract, excluding runtime bodies,
@@ -33,7 +33,63 @@ pub fn encode_metadata_ast_for_module(ast: Vec[Statement], module_id: str) -> Js
 /// not change dependent frontend keys when its caller-visible contract stays
 /// the same. This projection is only a fingerprint, never loaded as metadata.
 pub fn encode_metadata_contract_ast(ast: Vec[Statement]) -> Json {
-    ret encode_vec_statement(metadata_interface_ast(ast), MetadataEncoding{"", false, false})
+    ret encode_vec_statement(metadata_interface_ast(ast), MetadataEncoding { "", false, false })
+}
+
+/// Lowering-context identity, not dependency metadata. Generic, async,
+/// decorator and default-trait bodies remain inputs; ordinary explicitly
+/// typed function bodies do not. Callers additionally bind checked safety
+/// effects, target/features and imported templates into their cache key.
+pub fn encode_codegen_context_ast(ast: Vec[Statement]) -> Json {
+    let mut projected = Vec[Statement]::new()
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => {
+                projected.push(Statement::Function(codegen_context_function(item, false)))
+            }
+            Statement::Impl(item) => {
+                let mut methods = Vec[FunctionItem]::new()
+                for method in item.methods {
+                    methods.push(codegen_context_function(method, !item.generics.is_empty()))
+                }
+                projected.push(Statement::Impl(ImplStmt {
+                            item.documentation, item.generics, item.trait_name, item.trait_args,
+                            item.target, methods, item.source_name, item.line, item.column
+                        }
+                        ,))
+            }
+            _ => {
+                projected.push(statement)
+            }
+        }
+    }
+    ret encode_vec_statement(projected, MetadataEncoding { "", false, false })
+}
+
+/// A function fragment retains spans: generated closure identities currently
+/// include lexical positions. Relocation is allowed; moving a function is not
+/// yet a cache hit. Documentation is retained because it is emitted into EHIR.
+pub fn encode_lowered_function_input(item: FunctionItem, module_id: str) -> Json {
+    ret encode_function_item(item, MetadataEncoding { module_id, true, true })
+}
+
+fn codegen_context_function(item: FunctionItem, generic_owner: bool) -> FunctionItem {
+    let mut keep_body = generic_owner || !item.generics.is_empty() || item.is_async || item.ret_type.is_none()
+    for attr in item.attrs {
+        if attr == "decorator" || attr == "attr:decorator" {
+            keep_body = true
+        }
+    }
+    let body = if keep_body {
+        item.body
+    } else {
+        Option[ParsedBlock]::None
+    }
+    ret FunctionItem {
+        item.attrs, item.decorators, item.is_public, item.is_extern, item.is_async, item.name,
+        item.documentation, item.generics, item.params, item.ret_type, item.returns_sending,
+        item.returns_frozen, body, item.source_name, item.line, item.column
+    }
 }
 
 /// Restores a checked declaration graph without opening or parsing source.
@@ -108,13 +164,25 @@ fn encode_str(value: str, _encoding: MetadataEncoding) -> Json {
     ret Json::String(value)
 }
 fn encode_source(value: str, encoding: MetadataEncoding) -> Json {
-    ret Json::String(if !encoding.locations { "" } elif encoding.source == "" { value } else { encoding.source })
+    ret Json::String(if !encoding.locations {
+            ""
+        } elif encoding.source == "" {
+            value
+        } else {
+            encoding.source
+        }
+    )
 }
 fn encode_bool(value: bool, _encoding: MetadataEncoding) -> Json {
     ret Json::Bool(value)
 }
 fn encode_usize(value: usize, encoding: MetadataEncoding) -> Json {
-    ret Json::Number(if encoding.locations { Debug::fmt(value) } else { "0" })
+    ret Json::Number(if encoding.locations {
+            Debug::fmt(value)
+        } else {
+            "0"
+        }
+    )
 }
 
 fn decode_str(data: Json) -> Result[str, str] {
@@ -173,15 +241,15 @@ fn record(data: Json, size: usize) -> Result[Vec[Json], str] {
     }
     ret Result[Vec[Json], str]::Err("metadata record must be an array")
 }
-fn encode_expr_node_heap(value: ExprNode < H >, encoding: MetadataEncoding) -> Json {
+fn encode_expr_node_heap(value: ExprNode<H>, encoding: MetadataEncoding) -> Json {
     ret encode_expr_node(ExprNode {
             value.value, value.line, value.column, value.length, value.source_name
         }
-        , encoding)
+        , encoding,)
 }
-fn decode_expr_node_heap(data: Json) -> Result[ExprNode < H >, str] {
+fn decode_expr_node_heap(data: Json) -> Result[ExprNode<H>, str] {
     let value = decode_expr_node(data)?
-    ret Result[ExprNode < H >, str]::Ok(ExprNode < H > {
+    ret Result[ExprNode<H>, str]::Ok(ExprNode<H> {
             value.value, value.line, value.column, value.length, value.source_name
         }
         ,
@@ -202,7 +270,7 @@ fn decode_option_str(data: Json) -> Result[Option[str], str] {
 
 /// Encodes module documentation with its original source coordinate.
 pub fn encode_metadata_documentation(value: Option[Documentation]) -> Json {
-    let encoding = MetadataEncoding{"", true, true}
+    let encoding = MetadataEncoding { "", true, true }
     ret encode_option_documentation(value, encoding)
 }
 
@@ -212,7 +280,9 @@ pub fn decode_metadata_documentation(data: Json) -> Result[Option[Documentation]
 }
 
 fn encode_option_documentation(value: Option[Documentation], encoding: MetadataEncoding) -> Json {
-    if !encoding.documentation { ret Json::Null }
+    if !encoding.documentation {
+        ret Json::Null
+    }
     ret match value {
         Some(item) => encode_documentation(item, encoding) None => Json::Null
     }
@@ -509,16 +579,16 @@ fn decode_vec_match_expr_arm(data: Json) -> Result[Vec[MatchExprArm], str] {
     ret Result[Vec[MatchExprArm], str]::Ok(out)
 }
 
-fn encode_option_expr_node_heap(value: Option[ExprNode < H >], encoding: MetadataEncoding) -> Json {
+fn encode_option_expr_node_heap(value: Option[ExprNode<H>], encoding: MetadataEncoding) -> Json {
     ret match value {
         Some(item) => encode_expr_node_heap(item, encoding) None => Json::Null
     }
 }
-fn decode_option_expr_node_heap(data: Json) -> Result[Option[ExprNode < H >], str] {
+fn decode_option_expr_node_heap(data: Json) -> Result[Option[ExprNode<H>], str] {
     if data.is_null() {
-        ret Result[Option[ExprNode < H >], str]::Ok(Option[ExprNode < H >]::None)
+        ret Result[Option[ExprNode<H>], str]::Ok(Option[ExprNode<H>]::None)
     }
-    ret Result[Option[ExprNode < H >], str]::Ok(Option[ExprNode < H >]::Some(decode_expr_node_heap(data)?))
+    ret Result[Option[ExprNode<H>], str]::Ok(Option[ExprNode<H>]::Some(decode_expr_node_heap(data)?))
 }
 
 fn encode_vec_if_expr_branch(values: Vec[IfExprBranch], encoding: MetadataEncoding) -> Json {
@@ -1878,10 +1948,18 @@ fn metadata_codec_portable_source_identity_contract() -> bool {
     let mut lexer = Lexer::new()
     let mut first = Parser::new_for_source("/old/project/src/model.enq")
     let mut second = Parser::new_for_source("/new/project/src/model.enq")
-    let left = match first.parse_result(lexer.tokenize(source)) { Ok(value) => value Err(error) => { ret false } }
-    let right = match second.parse_result(lexer.tokenize(source)) { Ok(value) => value Err(error) => { ret false } }
+    let left = match first.parse_result(lexer.tokenize(source)) {
+        Ok(value) => value Err(error) => {
+            ret false
+        }
+    }
+    let right = match second.parse_result(lexer.tokenize(source)) {
+        Ok(value) => value Err(error) => {
+            ret false
+        }
+    }
     ret stringify(encode_metadata_ast_for_module(left, "package@model.enq")) ==
-        stringify(encode_metadata_ast_for_module(right, "package@model.enq"))
+    stringify(encode_metadata_ast_for_module(right, "package@model.enq"))
 }
 
 #attr(test)
@@ -1889,16 +1967,28 @@ fn metadata_codec_compile_time_decorator_preserved_contract() -> bool {
     let mut lexer = Lexer::new()
     let mut parser = Parser::new_for_source("package@model.enq")
     let ast = match parser.parse_result(lexer.tokenize(
-        "#attr(decorator)\npub fn wrap[Args](func: Callable[Args, u32], args: Args) -> u32 { ret func(args) }")) {
-        Ok(value) => value Err(error) => { ret false }
+            "#attr(decorator)\npub fn wrap[Args](func: Callable[Args, u32], args: Args) -> u32 { ret func(args) }")) {
+        Ok(value) => value Err(error) => {
+            ret false
+        }
     }
     let restored = match decode_metadata_ast(encode_metadata_ast(metadata_interface_ast(ast))) {
-        Ok(value) => value Err(error) => { ret false }
+        Ok(value) => value Err(error) => {
+            ret false
+        }
     }
-    if restored.len() != 1 { ret false }
+    if restored.len() != 1 {
+        ret false
+    }
     for statement in restored {
-        match statement { Statement::Function(item) => { ret item.body.is_some() && item.attrs.len() > 0 }
-            _ => { ret false } }
+        match statement {
+            Statement::Function(item) => {
+                ret item.body.is_some() && item.attrs.len() > 0
+            }
+            _ => {
+                ret false
+            }
+        }
     }
     ret false
 }

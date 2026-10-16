@@ -1,0 +1,73 @@
+//! Package lowering must not depend on unrelated modules, order or source path.
+
+import core::panic::panic
+import std::os::read_file
+import std::string::String
+import std::vec::Vec
+import refrain::ci_helpers::{Fixture, repository, std_dependencies}
+import refrain::frontend::lexer::Lexer
+import refrain::frontend::parser::{Parser, Statement}
+import refrain::frontend::translator::{TranslationModule, translate_compilation_unit_to_ehir_chunks, assemble_ehir_module_bundle}
+import refrain::target::host_target
+import ehirlib::parse_module_bundle_text
+import ehirlib::core::{make_module_bundle, Module}
+import ehir_llvm_backend::codegen::{prepare_unit_codegen, emit_unit_codegen}
+
+fn module(id: str, path: str, source: str) -> TranslationModule {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source(path)
+    let ast = parser.parse_result(lexer.tokenize(source)).unwrap_or(Vec[Statement]::new())
+    if ast.is_empty() { panic("invalid ABI fixture: " + source) }
+    ret TranslationModule::new(id, path, Vec[str]::new(), ast, Vec[str]::new())
+}
+
+fn render(source: str, path: str, extra: bool, reversed: bool) -> str {
+    let own = module("sample@lib.enq", path, source)
+    let unrelated = module("unrelated@lib.enq", "/unrelated/src/lib.enq", "pub struct Value { wider: u64 }\npub struct Other { n: u16 }\npub trait Score { fn unrelated(self: Self) -> u64 }\n")
+    let mut modules = Vec[TranslationModule]::new()
+    let mut selected = Vec[usize]::new()
+    if reversed && extra { modules.push(unrelated) }
+    modules.push(own)
+    selected.push(if reversed && extra { 1_usize } else { 0_usize })
+    if !reversed && extra { modules.push(unrelated) }
+    let chunks = translate_compilation_unit_to_ehir_chunks(modules, host_target(), selected)
+    ret assemble_ehir_module_bundle(chunks, modules.len(), "sample@lib.enq")
+}
+
+fn cases() -> Vec[(str, str)] {
+    ret vec![
+        ("embedded", "pub struct Value { n: u32 }\nfn main() -> u32 { let original = Value{7} unsafe { unsafe ehir { copied: Value = alias original: Value } ret if copied.n == 7 { 0 } else { 1 } } }\n"),
+        ("nominal", "pub struct Value { n: u32 }\nimpl for Value { pub fn read(self: Self) -> u32 { ret self.n } }\npub fn create(n: u32) -> Value { ret Value{n} }\nfn main() -> u32 { ret if create(7).read() == 7 { 0 } else { 1 } }\n"),
+        ("generic", "pub struct Value[T] { n: T }\nimpl[T] for Value[T] { pub fn read(self: Self) -> T { ret self.n } }\npub fn identity[T](value: T) -> T { ret value }\nfn main() -> u32 { let item = identity(Value[u32]{7}) ret if item.read() == 7 { 0 } else { 1 } }\n"),
+        ("generic_shadow", "pub struct T { n: u32 }\npub struct Value[T] { n: T }\nimpl[T] for Value[T] { pub fn read(self: Self) -> T { ret self.n } }\npub fn identity[T](value: T) -> T { ret value }\npub fn nominal(value: T) -> u32 { ret value.n }\nfn main() -> u32 { let item = identity(Value[u32]{7}) let original = T{7} let direct = nominal(original) ret if item.read() == 7 && direct == 7 { 0 } else { 1 } }\n"),
+        ("enum_member_shadow", "pub struct String { n: u32 }\npub enum Json { String(u32), Empty }\npub fn field(value: Json) -> u32 { ret match value { Json::String(n) => n Json::Empty => 0_u32 } }\nfn main() -> u32 { ret if field(Json::String(7_u32)) == 7_u32 { 0_u32 } else { 1_u32 } }\n"),
+        ("trait", "pub trait Score { fn read(self: Self) -> u32 }\npub struct Value { n: u32 }\nimpl Score for Value { fn read(self: Value) -> u32 { ret self.n } }\nfn use_trait(value: dyn Score) -> u32 { ret value.read() }\nfn main() -> u32 { let value = Value{7} as dyn Score ret if use_trait(value) == 7 { 0 } else { 1 } }\n"),
+        ("bound", "pub trait Score { fn read(self: Self) -> u32 }\npub struct Value { n: u32 }\nimpl Score for Value { fn read(self: Value) -> u32 { ret self.n } }\nfn use_bound[T: Score](value: T) -> u32 { ret value.read() }\nfn main() -> u32 { let value = Value{7} ret if use_bound(value) == 7 { 0 } else { 1 } }\n"),
+        ("closure", "pub trait Handler { fn handle(self: Self, value: u32) -> u32 }\npub fn capture(base: u32) -> dyn Handler { ret |value| base + value }\nfn main() -> u32 { let handler = capture(5) ret if handler.handle(2) == 7 { 0 } else { 1 } }\n"),
+        ("decorator", read_file(repository().join("tests/decorator_method_chain.enq").as_str()))
+    ]
+}
+
+#attr(test)
+fn integration_package_owned_abi_contract() -> bool {
+    let fixture = Fixture::new("package-abi")
+    for entry in cases() {
+        let source = entry.1
+        let first = render(source, "/one/src/lib.enq", false, false)
+        if first != render(source, "/two/src/lib.enq", true, false) || first != render(source, "/three/src/lib.enq", true, true) { ret fixture.finish(false) }
+        let target = host_target()
+        let prepared = prepare_unit_codegen(parse_module_bundle_text("sample", first), make_module_bundle("", Vec[Module]::new()), target.triple, target.pointer_width, 1)
+        let emitted = emit_unit_codegen(prepared, target.triple, target.pointer_width)
+        if emitted.len() != 1 { ret fixture.finish(false) }
+        for item in emitted {
+            for line in String::from_str(item.ir).split_char("\n") {
+                if line.starts_with("define") && (line.contains("@__drop_") || line.contains("@__retain_") || line.contains("@__add_edges_") || line.contains("@__remove_edges_")) { ret fixture.finish(false) }
+            }
+        }
+        let project = Fixture { fixture.root.join(entry.0), fixture.compiler }
+        project.manifest("abi_probe", std_dependencies())
+        project.put("src/main.enq", source)
+        if !project.command(vec!["run", "--jobs", "2"]).success() { ret fixture.finish(false) }
+    }
+    ret fixture.finish(true)
+}

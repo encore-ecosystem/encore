@@ -19,9 +19,6 @@ on:
       seed_tag:
         required: true
         type: string
-      index_sha:
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -35,6 +32,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/registry
       ENCORE_INDEX_URL: http://127.0.0.1:9/index
+      ENCORE_CORE_DIR: ${{ github.workspace }}/packages/core
     steps:
       - uses: actions/checkout@v6
         with:
@@ -52,34 +50,6 @@ jobs:
           grep -Fq "ret \"$version\"" src/version.enq
           grep -Fq "ret \"$release_name\"" src/version.enq
           grep -Fq "ret \"$release\"" src/version.enq
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: trusted-dependencies
-          path: target/dependency-download
-
-      - name: Activate verified offline dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          expected=$(awk 'NF {print tolower($1); exit}' target/dependency-download/dependencies.tar.gz.sha256)
-          if command -v sha256sum >/dev/null 2>&1; then
-            actual=$(sha256sum target/dependency-download/dependencies.tar.gz | awk '{print $1}')
-          else
-            actual=$(shasum -a 256 target/dependency-download/dependencies.tar.gz | awk '{print $1}')
-          fi
-          test "$actual" = "$expected"
-          tar -xzf target/dependency-download/dependencies.tar.gz -C target
-          rm -rf target/registry
-          mv target/dependencies/registry target/registry
-          cmp <(tr -d '\r' < encore.lock) target/dependencies/encore.lock
-          test "$(cat target/dependencies/index-commit)" = "${{ inputs.index_sha }}"
-          mv target/dependencies/system-index target/system-index
-          index_root="$PWD/../encore-index"
-          test ! -e "$index_root"
-          cp -R target/system-index "$index_root"
-          echo "ENCORE_CORE_DIR=$index_root/packages/core" >> "$GITHUB_ENV"
-          echo "ENCORE_INDEX_URL=http://127.0.0.1:9" >> "$GITHUB_ENV"
 
       - name: Download and verify native seed
         if: inputs.producer == ''
@@ -123,7 +93,7 @@ jobs:
           set -euo pipefail
           root="target/stage1-download/${{ inputs.triple }}"
           manifest="$root/manifest.json"
-          test "$(jq -r '.schema' "$manifest")" = 2
+          test "$(jq -r '.schema' "$manifest")" = 3
           test "$(jq -r '.commit' "$manifest")" = "$GITHUB_SHA"
           release=$(tr -d '\r\n' < VERSION)
           test "$(jq -r '.version' "$manifest")" = "${release%%-*}"
@@ -136,9 +106,6 @@ jobs:
           release_name=${release#*-}
           target_kit_abi=$(printf '%s\n' "$version" | awk -F. '{print $1 "." $2}')
           test "$(jq -r '.target_kit_abi' "$manifest")" = "$target_kit_abi"
-          expected_dependencies=$(awk 'NF {print tolower($1); exit}' \
-            target/dependency-download/dependencies.tar.gz.sha256)
-          test "$(jq -r '.dependencies_sha256' "$manifest")" = "$expected_dependencies"
           compiler="$PWD/$root/${{ inputs.executable }}"
           if command -v sha256sum >/dev/null 2>&1; then
             actual=$(sha256sum "$compiler" | awk '{print $1}')
@@ -160,7 +127,6 @@ jobs:
           CI_TARGET: ${{ inputs.triple }}
           CI_EXECUTABLE: ${{ inputs.executable }}
           CI_SEED_TAG: ${{ inputs.seed_tag }}
-          CI_INDEX_SHA: ${{ inputs.index_sha }}
         run: bash scripts/ci-bootstrap.sh "${STAGE1_COMPILER:-}"
 
       - name: Assemble stage3 context
@@ -171,7 +137,6 @@ jobs:
           mkdir -p "$context/bin"
           cp "target/stage3/${{ inputs.executable }}" "$context/bin/"
           cp target/convergence.json "$context/provenance.json"
-          cp -R target/registry target/system-index "$context/"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -195,7 +160,6 @@ jobs:
           triple: ${{ inputs.triple }}
           executable: ${{ inputs.executable }}
           seed_tag: ${{ inputs.seed_tag }}
-          index_sha: ${{ inputs.index_sha }}
       - name: Prepare native toolchain
         shell: bash
         run: bash scripts/ci-prepare-toolchain.sh "${{ inputs.triple }}"
@@ -205,7 +169,7 @@ jobs:
           set -euo pipefail
           compiler="$PWD/target/stage3/${{ inputs.executable }}"
           for package in core platform std; do
-            (cd "../encore-index/packages/$package" && "$compiler" test)
+            (cd "packages/$package" && "$compiler" test)
           done
 
       - name: Build examples
@@ -251,6 +215,10 @@ jobs:
             target/test-report.json
             target/tests/*.output.txt
             target/ci-tests/compiler/target/tests/*.output.txt
+            target/ci-tests/compiler/target/integration/**/target/tests/*.output.txt
+            target/ci-tests/compiler/target/integration/**/report.json
+            target/ci-tests/compiler/target/integration/**/filtered.json
+            target/ci-tests/compiler/target/integration/**/compile-error.json
           if-no-files-found: warn
           retention-days: 7
 
@@ -269,7 +237,6 @@ jobs:
           triple: ${{ inputs.triple }}
           executable: ${{ inputs.executable }}
           seed_tag: ${{ inputs.seed_tag }}
-          index_sha: ${{ inputs.index_sha }}
       - name: Prepare native toolchain
         shell: bash
         run: bash scripts/ci-prepare-toolchain.sh "${{ inputs.triple }}"
@@ -277,21 +244,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Keep the index at its source-relative sibling path while building
-          # the LSP: lsp/encore.toml intentionally resolves ../../encore back
-          # to this compiler checkout.
-          index_root="$PWD/../encore-index"
-          test -f "$index_root/lsp/encore.toml"
           compiler="$PWD/target/stage3/${{ inputs.executable }}"
-          (cd "$index_root/lsp" && ENCORE_CORE_DIR="$index_root/packages/core" \
-            "$compiler" build --profile release)
+          (cd lsp && "$compiler" build --profile release)
           source_name=lsp
           installed_name=encore-lsp
           if [[ "${{ inputs.triple }}" == *-windows-* ]]; then
             source_name=lsp.exe
             installed_name=encore-lsp.exe
           fi
-          cp "$index_root/lsp/target/release/$source_name" "target/stage3/$installed_name"
+          cp "lsp/target/release/$source_name" "target/stage3/$installed_name"
           chmod +x "target/stage3/$installed_name" 2>/dev/null || true
 
       - name: Assemble release candidate
@@ -311,13 +272,12 @@ jobs:
           [[ "${{ inputs.triple }}" == *-windows-* ]] && lsp_executable=encore-lsp.exe
           cp "target/stage3/$lsp_executable" "$root/bin/$lsp_executable"
           chmod +x "$root/bin/$lsp_executable" 2>/dev/null || true
-          for name in core platform std rich json log profile ehir toml colorterm llvm argparse secret-store; do
-            source_name=$name
-            test -f "$PWD/target/system-index/packages/$source_name/encore.toml"
-            cp -R "$PWD/target/system-index/packages/$source_name" "$root/lib/encore/index/$name"
+          for name in core platform std rich json log profile ehir ehir-llvm-backend toml colorterm llvm argparse secret-store; do
+            test -f "$PWD/packages/$name/encore.toml"
+            mkdir -p "$root/lib/encore/index/$name"
+            git archive HEAD "packages/$name" |
+              tar -xf - --strip-components=2 -C "$root/lib/encore/index/$name"
           done
-          cp -R "$PWD/target/system-index/packages/ehir-llvm-backend" \
-            "$root/lib/encore/index/ehir-llvm-backend"
           cp LICENSE README.md "$root/share/doc/encore/"
           printf '%s\n' "$release" > "$root/VERSION"
           hash_file() {

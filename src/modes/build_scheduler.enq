@@ -15,12 +15,11 @@ pub enum UnitState {
     Cancelled
 }
 
-/// A compilation unit and its resource reservation, owned by the coordinator.
+/// A compilation unit and its scheduling priority, owned by the coordinator.
 pub struct BuildUnit {
     id: str
     dependencies: Vec[str]
     weight_ms: u64
-    memory_bytes: u64
 }
 
 struct UnitProgress {
@@ -32,18 +31,31 @@ struct UnitProgress {
 #attr(test)
 fn metadata_cached_package_needs_no_reservation() -> bool {
     let mut units = Vec[BuildUnit]::new()
-    units.push(BuildUnit::new("cached", Vec[str]::new(), 0, 1610612736))
-    let mut scheduler = match BuildScheduler::new(units, 1, 1) { Ok(value) => value Err(_) => { ret false } }
+    units.push(BuildUnit::new("cached", Vec[str]::new(), 0))
+    units.push(BuildUnit::new("busy", Vec[str]::new(), 0))
+    let mut scheduler = match BuildScheduler::new(units, 1) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    if !scheduler.start(1) {
+        ret false
+    }
     ret scheduler.next_ready().is_none() && scheduler.next_cache_candidate(Vec[usize]::new()).unwrap_or(99) == 0 &&
-        scheduler.cached_complete(0) && scheduler.memory_reserved == 0 && scheduler.processes == 0 && scheduler.cpu_leases == 0
+    scheduler.cached_complete(0) && scheduler.processes == 1 && scheduler.cpu_leases == 1 &&
+    scheduler.metadata_ready(1) && scheduler.complete(1) && scheduler.processes == 0 && scheduler.cpu_leases == 0
 }
 
 #attr(test)
 fn metadata_busy_cache_key_does_not_block_other_units() -> bool {
     let mut units = Vec[BuildUnit]::new()
-    units.push(BuildUnit::new("first", Vec[str]::new(), 10, 1))
-    units.push(BuildUnit::new("second", Vec[str]::new(), 5, 1))
-    let scheduler = match BuildScheduler::new(units, 1, 2) { Ok(value) => value Err(_) => { ret false } }
+    units.push(BuildUnit::new("first", Vec[str]::new(), 10))
+    units.push(BuildUnit::new("second", Vec[str]::new(), 5))
+    let scheduler = match BuildScheduler::new(units, 1) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
     let mut excluded = Vec[usize]::new()
     excluded.push(0)
     ret scheduler.next_ready_excluding(excluded).unwrap_or(99) == 1 && scheduler.next_cache_candidate(excluded).unwrap_or(99) == 1
@@ -51,29 +63,26 @@ fn metadata_busy_cache_key_does_not_block_other_units() -> bool {
 
 impl for BuildUnit {
     /// Creates a pending unit. Dependency IDs, not input order, define the DAG.
-    pub fn new(id: str, dependencies: Vec[str], weight_ms: u64, memory_bytes: u64) -> Self {
+    pub fn new(id: str, dependencies: Vec[str], weight_ms: u64) -> Self {
         ret Self {
-            id, dependencies, weight_ms, memory_bytes
+            id, dependencies, weight_ms
         }
     }
 }
 
-/// One aggregate CPU/process/RAM budget, independent of the number of packages.
+/// One aggregate CPU/process budget, independent of the number of packages.
 pub struct BuildScheduler {
     units: Vec[BuildUnit]
     states: Vec[UnitProgress]
     jobs: usize
-    memory_budget: u64
     processes: usize
     cpu_leases: usize
-    memory_reserved: u64
     stopped: bool
 }
 
 impl for BuildScheduler {
-    /// Validates all edges and cycles before admitting any work. A zero RAM
-    /// budget means the host could not report available memory, not zero RAM.
-    pub fn new(units: Vec[BuildUnit], jobs: usize, memory_budget: u64) -> Result[Self, str] {
+    /// Validates all edges and cycles before admitting any work.
+    pub fn new(units: Vec[BuildUnit], jobs: usize) -> Result[Self, str] {
         if jobs == 0 {
             ret Result[Self, str]::Err("build job budget must be positive")
         }
@@ -90,7 +99,7 @@ impl for BuildScheduler {
             )
         }
         ret Result[Self, str]::Ok(Self {
-                units, states, jobs, memory_budget, 0, 0, 0, false
+                units, states, jobs, 0, 0, false
             }
             ,
         )
@@ -112,7 +121,7 @@ impl for BuildScheduler {
     }
 
     fn next_candidate(self: Self, excluded: Vec[usize], reserve: bool) -> Option[usize] {
-        if self.stopped || (reserve && (self.cpu_leases >= self.jobs || self.processes / 2 >= self.jobs)) {
+        if self.stopped ||(reserve &&(self.cpu_leases >= self.jobs || self.processes / 2 >= self.jobs)) {
             ret Option[usize]::None
         }
         let mut best = Option[usize]::None
@@ -127,9 +136,13 @@ impl for BuildScheduler {
                 ,
             )
             let mut skip = false
-            for omitted in excluded { if omitted == index { skip = true } }
+            for omitted in excluded {
+                if omitted == index {
+                    skip = true
+                }
+            }
             if !skip && is_waiting(progress.state) && dependencies_ready(self.units, self.states, unit.dependencies)
-            && (!reserve || self.memory_fits(unit.memory_bytes)) {
+            {
                 let unlocks = progress.unlocks
                 if best.is_none() || unlocks > best_unlocks ||
                 (unlocks == best_unlocks && unit.weight_ms > best_weight) ||
@@ -146,14 +159,20 @@ impl for BuildScheduler {
     }
 
     pub fn can_start(self: Self, index: usize) -> bool {
-        if self.stopped || self.cpu_leases >= self.jobs || self.processes / 2 >= self.jobs { ret false }
-        let unit = match self.units.get(index) { Some(value) => value None => { ret false } }
-        let progress = match self.states.get(index) { Some(value) => value None => { ret false } }
-        ret is_waiting(progress.state) && dependencies_ready(self.units, self.states, unit.dependencies) && self.memory_fits(unit.memory_bytes)
-    }
-
-    pub fn memory_reservation(self: Self, index: usize) -> u64 {
-        ret match self.units.get(index) { Some(unit) => unit.memory_bytes None => 0_u64 }
+        if self.stopped || self.cpu_leases >= self.jobs || self.processes / 2 >= self.jobs {
+            ret false
+        }
+        let unit = match self.units.get(index) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+        let progress = match self.states.get(index) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+        ret is_waiting(progress.state) && dependencies_ready(self.units, self.states, unit.dependencies)
     }
 
     /// Reserves resources only after the coordinator has a real ready unit.
@@ -169,7 +188,7 @@ impl for BuildScheduler {
                     ,
                 )
                 if !is_waiting(progress.state) || !dependencies_ready(self.units, self.states, unit.dependencies)
-                || !self.memory_fits(unit.memory_bytes) {
+                {
                     ret false
                 }
                 progress.state = UnitState::Running
@@ -177,7 +196,6 @@ impl for BuildScheduler {
                 self.states.set(index, progress)
                 self.processes += 1
                 self.cpu_leases += 1
-                self.memory_reserved += unit.memory_bytes
                 ret true
             }
             None => {
@@ -207,7 +225,7 @@ impl for BuildScheduler {
         }
     }
 
-    /// Waiting workers release CPU, but retain process and memory reservations.
+    /// Waiting workers release CPU, but retain their bounded process slot.
     pub fn release_cpu(self: mut Self, index: usize) -> bool {
         match self.states.get(index) {
             Some(progress) => {
@@ -263,13 +281,25 @@ impl for BuildScheduler {
         ret self.finish(index, UnitState::Complete)
     }
 
-    /// A verified cache result has no process, CPU lease or RAM reservation.
+    /// A verified cache result has no process or CPU lease.
     pub fn cached_complete(self: mut Self, index: usize) -> bool {
-        if self.stopped { ret false }
-        let unit = match self.units.get(index) { Some(value) => value None => { ret false } }
-        let progress = match self.states.get(index) { Some(value) => value None => { ret false } }
-        if !is_waiting(progress.state) || !dependencies_ready(self.units, self.states, unit.dependencies) { ret false }
-        self.states.set(index, UnitProgress{UnitState::Complete, false, progress.unlocks})
+        if self.stopped {
+            ret false
+        }
+        let unit = match self.units.get(index) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+        let progress = match self.states.get(index) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+        if !is_waiting(progress.state) || !dependencies_ready(self.units, self.states, unit.dependencies) {
+            ret false
+        }
+        self.states.set(index, UnitProgress { UnitState::Complete, false, progress.unlocks })
         ret true
     }
 
@@ -328,7 +358,7 @@ impl for BuildScheduler {
         }
     }
 
-    /// Acknowledges termination before releasing the cancelled worker's RAM.
+    /// Acknowledges termination before releasing the cancelled worker's slot.
     pub fn reap_cancelled(self: mut Self, index: usize) -> bool {
         if !self.stopped {
             ret false
@@ -347,12 +377,6 @@ impl for BuildScheduler {
                 next.cpu_lease = false
                 self.states.set(index, next)
                 self.processes -= 1
-                let memory_bytes = match self.units.get(index) {
-                    Some(unit) => unit.memory_bytes None => {
-                        ret false
-                    }
-                }
-                self.memory_reserved -= memory_bytes
                 if progress.cpu_lease {
                     self.cpu_leases -= 1
                 }
@@ -364,12 +388,6 @@ impl for BuildScheduler {
         }
     }
 
-    fn memory_fits(self: Self, bytes: u64) -> bool {
-        if self.memory_budget == 0 {
-            ret true
-        }
-        ret self.memory_reserved <= self.memory_budget && bytes <= self.memory_budget - self.memory_reserved
-    }
 }
 
 fn is_waiting(state: UnitState) -> bool {
@@ -502,22 +520,22 @@ fn id_before(left: str, right: str) -> bool {
     ret left.byte_len() < right.byte_len()
 }
 
-fn leaf(id: str, weight: u64, memory: u64) -> BuildUnit {
-    ret BuildUnit::new(id, Vec[str]::new(), weight, memory)
+fn leaf(id: str, weight: u64) -> BuildUnit {
+    ret BuildUnit::new(id, Vec[str]::new(), weight)
 }
 
 fn depends(id: str, parent: str) -> BuildUnit {
     let mut dependencies = Vec[str]::new()
     dependencies.push(parent)
-    ret BuildUnit::new(id, dependencies, 1, 10)
+    ret BuildUnit::new(id, dependencies, 1)
 }
 
 #attr(test)
 fn scheduler_metadata_pipelining_contract() -> bool {
     let mut units = Vec[BuildUnit]::new()
-    units.push(leaf("producer", 10, 10))
+    units.push(leaf("producer", 10))
     units.push(depends("consumer", "producer"))
-    let mut scheduler = match BuildScheduler::new(units, 2, 100) {
+    let mut scheduler = match BuildScheduler::new(units, 2) {
         Result[BuildScheduler, str]::Ok(value) => value
         Result[BuildScheduler, str]::Err(_) => {
             ret false
@@ -541,14 +559,14 @@ fn scheduler_metadata_pipelining_contract() -> bool {
 #attr(test)
 fn scheduler_diamond_contract() -> bool {
     let mut units = Vec[BuildUnit]::new()
-    units.push(leaf("base", 10, 10))
+    units.push(leaf("base", 10))
     units.push(depends("left", "base"))
     units.push(depends("right", "base"))
     let mut parents = Vec[str]::new()
     parents.push("left")
     parents.push("right")
-    units.push(BuildUnit::new("root", parents, 1, 10))
-    let mut scheduler = match BuildScheduler::new(units, 4, 100) {
+    units.push(BuildUnit::new("root", parents, 1))
+    let mut scheduler = match BuildScheduler::new(units, 4) {
         Result[BuildScheduler, str]::Ok(value) => value
         Result[BuildScheduler, str]::Err(_) => {
             ret false
@@ -569,10 +587,10 @@ fn scheduler_diamond_contract() -> bool {
 #attr(test)
 fn scheduler_dynamic_ready_queue_contract() -> bool {
     let mut units = Vec[BuildUnit]::new()
-    units.push(leaf("slow", 1000, 10))
-    units.push(leaf("fast", 100, 10))
-    units.push(leaf("next", 10, 10))
-    let mut scheduler = match BuildScheduler::new(units, 2, 100) {
+    units.push(leaf("slow", 1000))
+    units.push(leaf("fast", 100))
+    units.push(leaf("next", 10))
+    let mut scheduler = match BuildScheduler::new(units, 2) {
         Result[BuildScheduler, str]::Ok(value) => value
         Result[BuildScheduler, str]::Err(_) => {
             ret false
@@ -593,11 +611,11 @@ fn scheduler_dynamic_ready_queue_contract() -> bool {
 #attr(test)
 fn scheduler_priority_contract() -> bool {
     let mut units = Vec[BuildUnit]::new()
-    units.push(leaf("heavy", 1000, 10))
-    units.push(leaf("unlocking", 1, 10))
+    units.push(leaf("heavy", 1000))
+    units.push(leaf("unlocking", 1))
     units.push(depends("child", "unlocking"))
     units.push(depends("grandchild", "child"))
-    let scheduler = match BuildScheduler::new(units, 2, 100) {
+    let scheduler = match BuildScheduler::new(units, 2) {
         Result[BuildScheduler, str]::Ok(value) => value
         Result[BuildScheduler, str]::Err(_) => {
             ret false
@@ -607,9 +625,9 @@ fn scheduler_priority_contract() -> bool {
         ret false
     }
     let mut ties = Vec[BuildUnit]::new()
-    ties.push(leaf("z", 10, 10))
-    ties.push(leaf("a", 10, 10))
-    let tied = match BuildScheduler::new(ties, 1, 100) {
+    ties.push(leaf("z", 10))
+    ties.push(leaf("a", 10))
+    let tied = match BuildScheduler::new(ties, 1) {
         Result[BuildScheduler, str]::Ok(value) => value
         Result[BuildScheduler, str]::Err(_) => {
             ret false
@@ -621,10 +639,10 @@ fn scheduler_priority_contract() -> bool {
 #attr(test)
 fn scheduler_cpu_and_process_budget_contract() -> bool {
     let mut units = Vec[BuildUnit]::new()
-    units.push(leaf("a", 1, 10))
-    units.push(leaf("b", 1, 10))
-    units.push(leaf("c", 1, 10))
-    let mut scheduler = match BuildScheduler::new(units, 1, 100) {
+    units.push(leaf("a", 1))
+    units.push(leaf("b", 1))
+    units.push(leaf("c", 1))
+    let mut scheduler = match BuildScheduler::new(units, 1) {
         Result[BuildScheduler, str]::Ok(value) => value
         Result[BuildScheduler, str]::Err(_) => {
             ret false
@@ -647,30 +665,33 @@ fn scheduler_cpu_and_process_budget_contract() -> bool {
 }
 
 #attr(test)
-fn scheduler_ram_and_cancellation_contract() -> bool {
+fn scheduler_waiting_workers_and_cancellation_contract() -> bool {
     let mut units = Vec[BuildUnit]::new()
-    units.push(leaf("a", 1, 60))
-    units.push(leaf("b", 1, 60))
-    let mut scheduler = match BuildScheduler::new(units, 2, 100) {
+    units.push(leaf("a", 1))
+    units.push(leaf("b", 1))
+    units.push(leaf("c", 1))
+    let mut scheduler = match BuildScheduler::new(units, 2) {
         Result[BuildScheduler, str]::Ok(value) => value
         Result[BuildScheduler, str]::Err(_) => {
             ret false
         }
     }
-    if !scheduler.start(0) || scheduler.start(1) {
+    if !scheduler.start(0) || !scheduler.release_cpu(0) || !scheduler.start(1) ||
+    scheduler.next_ready().unwrap_or(99) != 2 || !scheduler.start(2) {
         ret false
     }
     scheduler.cancel()
-    if scheduler.memory_reserved != 60 || scheduler.cpu_leases != 1 || scheduler.next_ready().is_some() {
+    if scheduler.cpu_leases != 2 || scheduler.processes != 3 || scheduler.next_ready().is_some() {
         ret false
     }
-    if scheduler.metadata_ready(0) || scheduler.reap_cancelled(1) {
+    if scheduler.metadata_ready(0) || scheduler.start(2) {
         ret false
     }
     if !scheduler.reap_cancelled(0) || scheduler.reap_cancelled(0) {
         ret false
     }
-    ret scheduler.memory_reserved == 0 && scheduler.processes == 0 && scheduler.cpu_leases == 0
+    ret scheduler.reap_cancelled(1) && scheduler.reap_cancelled(2) &&
+    scheduler.processes == 0 && scheduler.cpu_leases == 0
 }
 
 #attr(test)
@@ -678,27 +699,27 @@ fn scheduler_invalid_graph_contract() -> bool {
     let mut cycle = Vec[BuildUnit]::new()
     cycle.push(depends("a", "b"))
     cycle.push(depends("b", "a"))
-    if BuildScheduler::new(cycle, 2, 100).is_ok() {
+    if BuildScheduler::new(cycle, 2).is_ok() {
         ret false
     }
     let mut missing = Vec[BuildUnit]::new()
     missing.push(depends("a", "absent"))
-    if BuildScheduler::new(missing, 2, 100).is_ok() {
+    if BuildScheduler::new(missing, 2).is_ok() {
         ret false
     }
     let mut duplicate = Vec[BuildUnit]::new()
-    duplicate.push(leaf("a", 1, 10))
-    duplicate.push(leaf("a", 1, 10))
-    ret BuildScheduler::new(duplicate, 2, 100).is_err()
+    duplicate.push(leaf("a", 1))
+    duplicate.push(leaf("a", 1))
+    ret BuildScheduler::new(duplicate, 2).is_err()
 }
 
 #attr(test)
 fn scheduler_failure_accounting_contract() -> bool {
     let mut units = Vec[BuildUnit]::new()
-    units.push(leaf("a", 1, 10))
-    units.push(leaf("b", 1, 10))
-    units.push(leaf("c", 1, 10))
-    let mut scheduler = match BuildScheduler::new(units, 2, 100) {
+    units.push(leaf("a", 1))
+    units.push(leaf("b", 1))
+    units.push(leaf("c", 1))
+    let mut scheduler = match BuildScheduler::new(units, 2) {
         Result[BuildScheduler, str]::Ok(value) => value
         Result[BuildScheduler, str]::Err(_) => {
             ret false
@@ -733,7 +754,7 @@ fn scheduler_eight_dependencies_all_budgets_contract() -> bool {
                     } else {
                         1_u64
                     }
-                    , 10,))
+                    ,))
             remaining.push(if index == 0 {
                     10_u64
                 } else {
@@ -742,9 +763,9 @@ fn scheduler_eight_dependencies_all_budgets_contract() -> bool {
             )
             index += 1
         }
-        units.push(BuildUnit::new("root", parents, 1, 10))
+        units.push(BuildUnit::new("root", parents, 1))
         remaining.push(1)
-        let mut scheduler = match BuildScheduler::new(units, jobs, 1000) {
+        let mut scheduler = match BuildScheduler::new(units, jobs) {
             Result[BuildScheduler, str]::Ok(value) => value
             Result[BuildScheduler, str]::Err(_) => {
                 ret false
@@ -789,7 +810,7 @@ fn scheduler_eight_dependencies_all_budgets_contract() -> bool {
             running = next_running
             ticks += 1
         }
-        if completed != 9 || scheduler.processes != 0 || scheduler.memory_reserved != 0 {
+        if completed != 9 || scheduler.processes != 0 || scheduler.cpu_leases != 0 {
             ret false
         }
         if !scheduler.dependency_artifacts_ready(8) {

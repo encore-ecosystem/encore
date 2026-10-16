@@ -5,7 +5,6 @@ set -euo pipefail
 triple=${CI_TARGET:?}
 executable=${CI_EXECUTABLE:?}
 seed_tag=${CI_SEED_TAG:?}
-index_sha=${CI_INDEX_SHA:?}
 stage1=${1:-}
 bootstrap=null
 build_args=(build --profile extreme)
@@ -49,12 +48,10 @@ release=$(tr -d '\r\n' < VERSION)
 version=${release%%-*}
 nametag=${release#*-}
 test "$("$PWD/target/stage3/$executable" --version)" = "encore $release"
-dependencies_sha=$(awk 'NF {print tolower($1); exit}' target/dependency-download/dependencies.tar.gz.sha256)
 jq -n --arg commit "${GITHUB_SHA:?}" --arg release "$release" --arg version "$version" \
   --arg nametag "$nametag" --arg target "$triple" --arg seed "$seed_tag" \
-  --arg index "$index_sha" --arg dependencies "$dependencies_sha" \
   --arg stage2 "$stage2_sha" --arg stage3 "$stage3_sha" --argjson bootstrap "$bootstrap" \
-  '{schema:2, commit:$commit, release:$release, version:$version, nametag:$nametag,
-    target:$target, seed:$seed, index_commit:$index, dependencies_sha256:$dependencies,
+  '{schema:3, commit:$commit, release:$release, version:$version, nametag:$nametag,
+    target:$target, seed:$seed,
     compiler_sha256:$stage3, stage2_sha256:$stage2, stage3_sha256:$stage3,
     converged:true, bootstrap:$bootstrap}' > target/convergence.json

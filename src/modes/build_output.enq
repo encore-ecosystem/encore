@@ -1,0 +1,165 @@
+//! Artifact naming and native packaging, independent of target architecture.
+import core::result::Result
+import mod::build_archive::run_program_tool
+import refrain::target::TargetSpec
+import std::os::write_file
+import std::path::Path
+import std::process::Command
+import std::string::String
+import std::vec::Vec
+
+pub fn build_artifact_name(target: TargetSpec, name: str, kind: str) -> str {
+    if kind == "static_lib" {
+        ret if target.os == "windows" && target.environment == "msvc" {
+            name + ".lib"
+        } else {
+            "lib" + name + ".a"
+        }
+    }
+    if kind == "shared_lib" {
+        ret match target.os {
+            "windows" => name + ".dll"
+            "macos" => "lib" + name + ".dylib"
+            _ => "lib" + name + ".so"
+        }
+    }
+    ret name + target.executable_suffix
+}
+
+pub fn build_artifact_label(kind: str) -> str {
+    ret match kind {
+        "static_lib" => "Static library"
+        "shared_lib" => "Shared library"
+        _ => "Binary"
+    }
+}
+
+pub fn build_import_library_name(target: TargetSpec, name: str, kind: str) -> str {
+    if target.os != "windows" || kind != "shared_lib" {
+        ret ""
+    }
+    ret if target.environment == "msvc" {
+        name + ".lib"
+    } else {
+        "lib" + name + ".dll.a"
+    }
+}
+
+/// Append rather than replace: different package archives intentionally use
+/// the same member names. L flattens archives, so this is a standalone ordinary
+/// archive, never an archive of archives or a thin reference into the cache.
+pub fn merge_static_library(archiver: str, objects: Vec[str], archives: Vec[str],
+    staging: Path, output: Path,) -> Result[(), str] {
+    let mut args = vec!["qcDsL", output.as_str()]
+    args.extend(objects)
+    args.extend(archives)
+    ret run_program_tool(archiver, args, staging, "library-archive")
+}
+
+pub fn append_package_archives(args: mut Vec[str], archives: Vec[str], target: TargetSpec,
+    shared: bool,) ->() {
+    if target.os == "linux" {
+        args.push(if shared {
+                "-Wl,--whole-archive"
+            } else {
+                "-Wl,--start-group"
+            }
+        )
+    } elif shared && target.os == "windows" && target.environment != "msvc" {
+        args.push("-Wl,--whole-archive")
+    }
+    for archive in archives {
+        if target.os == "macos" {
+            args.push("-Wl,-force_load," + archive)
+        } elif target.os == "windows" && target.environment == "msvc" {
+            args.push("-Wl,/wholearchive:" + archive)
+        } else {
+            args.push(archive)
+        }
+    }
+    if target.os == "linux" {
+        args.push(if shared {
+                "-Wl,--no-whole-archive"
+            } else {
+                "-Wl,--end-group"
+            }
+        )
+    } elif shared && target.os == "windows" && target.environment != "msvc" {
+        args.push("-Wl,--no-whole-archive")
+    }
+}
+
+pub fn append_shared_library_args(args: mut Vec[str], target: TargetSpec, name: str,
+    archives: Vec[str], staging: Path,) -> Result[(), str] {
+    if target.os == "macos" {
+        args.push("-dynamiclib")
+        args.push("-Wl,-install_name,@rpath/" + name)
+    } else {
+        args.push("-shared")
+    }
+    if target.os == "linux" {
+        args.push("-Wl,--no-undefined")
+        args.push("-Wl,-soname," + name)
+    } elif target.os == "windows" {
+        if target.environment == "msvc" {
+            args.push("-Wl,/implib:" + staging.join("import-library").as_str())
+            // Unlike MinGW, lld-link does not auto-export ordinary LLVM
+            // definitions. Inspect verified archives, not unavailable cached
+            // source/IR, and explicitly export their defined global symbols.
+            let mut command = Command::new("llvm-nm").arg("--defined-only").arg("--extern-only").arg("--format=posix")
+            for archive in archives {
+                command = command.arg(archive)
+            }
+            let output = command.output()
+            if !output.success() {
+                ret Result[(), str]::Err("cannot enumerate DLL exports: " + output.text())
+            }
+            let definition = shared_library_exports(output.text())
+            let path = staging.join("exports.def")
+            if write_file(path.as_str(), definition) != 0 {
+                ret Result[(), str]::Err("cannot write DLL exports")
+            }
+            args.push("-Wl,/def:" + path.as_str())
+        } else {
+            args.push("-Wl,--export-all-symbols")
+            args.push("-Wl,--out-implib," + staging.join("import-library").as_str())
+        }
+    }
+    ret Result[(), str]::Ok(())
+}
+
+pub fn shared_library_exports(symbols: str) -> str {
+    let mut definition = "EXPORTS\n"
+    let mut seen = Vec[str]::new()
+    for line in String::from_str(symbols).split_char("\n") {
+        let mut fields = Vec[str]::new()
+        for field in line.split_char(" ") {
+            if field.as_str() != "" {
+                fields.push(field.as_str())
+            }
+        }
+        if fields.len() < 2 {
+            continue
+        }
+        let name = fields.get(0).unwrap_or("")
+        let typ = fields.get(1).unwrap_or("")
+        let mut duplicate = false
+        for previous in seen {
+            if previous == name {
+                duplicate = true
+            }
+        }
+        if name == "" || name == "main" || duplicate {
+            continue
+        }
+        if typ == "T" || typ == "W" {
+            definition = definition + "  " + name + "\n"
+        } elif typ == "B" || typ == "D" || typ == "R" || typ == "V" || typ == "S" || typ == "C" {
+            definition = definition + "  " + name + " DATA\n"
+        } else {
+            continue
+        }
+        seen.push(name)
+    }
+    ret definition
+}

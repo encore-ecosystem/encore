@@ -4,7 +4,7 @@ import argparse::{process_arg, process_arg_count}
 import core::fmt::Debug
 import core::option::Option
 import core::result::Result
-import json::{Json, stringify}
+import json::{Json, stringify, parse}
 import mod::build_archive::{UnitNativePlan, emit_budgeted_package_archive}
 import mod::build_artifacts::{UnitReady, read_unit_ready, publish_unit_ready, publish_unit_complete}
 import mod::build_metadata::RefrainMetadata
@@ -20,7 +20,7 @@ import std::time::{sleep_ms, perf_counter_ms}
 import std::vec::Vec
 
 extern fn encore_compiler_worker_watch_parent(parent: u64) -> bool
-extern fn encore_compiler_jobserver_attach(path: str, memory: u64) -> usize
+extern fn encore_compiler_jobserver_attach(path: str) -> usize
 extern fn encore_compiler_jobserver_try_acquire(server: usize) -> i32
 extern fn encore_compiler_jobserver_release(server: usize) -> bool
 extern fn encore_compiler_jobserver_close(server: usize) ->()
@@ -29,13 +29,12 @@ extern fn encore_compiler_jobserver_close(server: usize) ->()
 /// independent job count, shell invocation or globally installed compiler here.
 #attr(safe)
 pub fn run_package_worker() -> u32 {
-    if process_arg_count() != 7 {
+    if process_arg_count() != 6 {
         eprintln("invalid package worker arguments") ret 2
     }
     let parent = positive_u64(process_arg(5).unwrap_or(""))
-    let memory = positive_u64(process_arg(6).unwrap_or(""))
-    if parent == 0 || memory == 0 {
-        eprintln("invalid package worker reservation") ret 2
+    if parent == 0 {
+        eprintln("invalid package worker parent") ret 2
     }
     let guarded = unsafe {
         encore_compiler_worker_watch_parent(parent)
@@ -44,7 +43,7 @@ pub fn run_package_worker() -> u32 {
         eprintln("cannot guard package worker parent") ret 1
     }
     let server = unsafe {
-        encore_compiler_jobserver_attach(process_arg(4).unwrap_or(""), memory)
+        encore_compiler_jobserver_attach(process_arg(4).unwrap_or(""))
     }
     if server == 0 {
         eprintln("cannot attach package worker budget") ret 1
@@ -124,14 +123,32 @@ fn execute_package(request_path: str, native_path: str, server: usize) -> Result
     }
     let prepared_ms = perf_counter_ms() - started
     let target = parse_target(request.context.target)
-    let _archive = emit_budgeted_package_archive(worker.prepared, request.output, target, native, server)?
+    let _archive = emit_budgeted_package_archive(worker.prepared, request.output, target, native, server, request.cache)?
     let native_ms = perf_counter_ms() - started - prepared_ms
     let mut timings = Vec[(str, Json)]::new()
     timings.push(("prepare_ms", Json::Number(Debug::fmt(prepared_ms))))
     timings.push(("native_ms", Json::Number(Debug::fmt(native_ms))))
     timings.push(("backend_cache_hit", Json::Bool(backend_hit)))
     timings.push(("frontend_cache_hit", Json::Bool(frontend_hit)))
-    timings.push(("native_peak_bound_bytes", Json::Number(Debug::fmt(positive_u64(read_file(request.output.join("native-peak").as_str()))))))
+    let object_counts = match parse(read_file(request.output.join("objects.json").as_str())) {
+        Ok(value) => value
+        Err(_) => Json::Null
+    }
+    timings.push(("objects_reused", object_counts.get("reused").unwrap_or(Json::Number("0"))))
+    timings.push(("objects_compiled", object_counts.get("compiled").unwrap_or(Json::Number("0"))))
+    let lowering_counts = match parse(read_file(request.output.join("lowering.json").as_str())) {
+        Ok(value) => value
+        Err(_) => Json::Null
+    }
+    for name in vec!["modules_reused", "modules_lowered", "functions_reused", "functions_lowered", "checking_ms", "lowering_ms"] {
+        timings.push((name, lowering_counts.get(name).unwrap_or(Json::Number("0"))))
+    }
+    let preparation = match parse(read_file(request.output.join("preparation.json").as_str())) {
+        Ok(value) => value
+        Err(_) => Json::Null
+    }
+    timings.push(("frontend_ms", preparation.get("frontend_ms").unwrap_or(Json::Number("0"))))
+    timings.push(("backend_prepare_ms", preparation.get("backend_prepare_ms").unwrap_or(Json::Number("0"))))
     if write_file(request.output.join("phases.json").as_str(), stringify(Json::Object(timings))) != 0 {
         ret Result[bool, str]::Err("cannot record worker phases")
     }

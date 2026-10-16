@@ -2,6 +2,9 @@
 
 import core::fmt::Debug
 import core::option::Option
+import json::stringify
+import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::metadata_ast::encode_lowered_function_input
 import rich::panel::Panel
 import rich::style::{accent, error_text, muted}
 import std::dict::Hashable
@@ -14,6 +17,7 @@ import std::vec::Vec
 
 import ehirlib::{EhirTextBuilder, ModuleBundle, parse_module_bundle_text, suppress_text_builder_output}
 import refrain::frontend::analysis_database::{normalized_import_target, import_binding_names}
+import refrain::frontend::control_flow::{block_terminates_flow, statement_terminates_flow, match_arm_terminates_flow, match_stmt_terminates_flow}
 import refrain::frontend::lexer::Lexer
 import refrain::frontend::parser::Parser
 import refrain::frontend::parser::statements::ArrayLiteralExpr
@@ -136,13 +140,13 @@ fn finish_call_owners(ctx: mut TranslatorContext, code: EhirTextBuilder,
         match owners.get(index) {
             Some(owner) => {
                 if owner.caller_owned || retain_inputs {
-                    if starts_with(owner.typ, "mut ") {
-                        let typ = value_type_name(owner.typ)
+                    if is_mutable_place_type(owner.typ) {
+                        let typ = capability_value_type(owner.typ)
                         let loaded = prefix + "_call_cleanup_" + Debug::fmt(index)
                         out = out.instr(loaded + ": " + typ + " = load " + owner.value)
                         out = out.instr("drop " + loaded + ": " + typ)
                     } else {
-                        out = out.instr("drop " + owner.value + ": " + owner.typ)
+                        out = out.instr("drop " + owner.value + ": " + capability_value_type(owner.typ))
                     }
                 }
                 untrack_call_owner(ctx, owner.name)
@@ -378,6 +382,22 @@ struct VariableRegion {
     region: usize
 }
 
+// Name lookup is lexical; ownership and region connectivity are separate
+// flow state. Preserve declarations overwritten by a block, without undoing
+// writes through an outer mutable slot or rewinding emitted-value identities.
+struct TranslationBindings {
+    vars: Vec[VarType]
+    variable_regions: Vec[VariableRegion]
+    owned_vars: Vec[VarType]
+    expression_hint: str
+    moved_count: usize
+}
+
+struct MatchScopeExit {
+    label: str
+    moves: Vec[str]
+}
+
 struct FunctionType {
     name: str
     emitted_name: str
@@ -511,6 +531,7 @@ struct StructFieldType {
     field: str
     typ: str
     index: str
+    generic_names: Vec[str]
 }
 
 struct EnumVariantType {
@@ -536,6 +557,11 @@ struct ClosureSignature {
 }
 
 struct TranslatorContext {
+    cached_functions: Vec[CachedFunctionChunk]
+    lowered_functions: Vec[CachedFunctionChunk]
+    record_function_cache: bool
+    functions_reused: usize
+    cached_function_index: usize
     vars: Vec[VarType]
     owned_vars: Vec[VarType]
     functions: Vec[FunctionType]
@@ -594,6 +620,8 @@ struct TranslatorContext {
     next_region: usize
     stable_abi: bool
     active_source_name: str
+    next_value_id: usize
+    moved_values: Vec[str]
 }
 
 /// Removes declarations disabled by target and feature configuration.
@@ -754,6 +782,58 @@ pub fn translate_selected_modules_to_ehir_chunks(modules: Vec[TranslationModule]
 pub fn translate_compilation_unit_to_ehir_chunks(modules: Vec[TranslationModule], target: TargetSpec,
     selected: Vec[usize],) -> Vec[TranslatedModuleChunk] {
     ret translate_selected_modules_with_abi(modules, target, selected, true)
+}
+
+/// Cache records contain the function and every generated closure declaration,
+/// never merely its displayed EHIR body. The caller validates their persistent
+/// identities against the complete checked lowering context before admission.
+pub struct CachedFunctionChunk {
+    key: str
+    text: str
+    declarations: Vec[str]
+}
+
+pub struct CachedCompilationChunks {
+    modules: Vec[TranslatedModuleChunk]
+    functions: Vec[CachedFunctionChunk]
+    functions_reused: usize
+}
+
+pub fn lowering_function_key(module_id: str, item: FunctionItem) -> str {
+    ret compiler_content_digest("encore-lowered-function-input-1\n" + module_id + "\n" +
+        stringify(encode_lowered_function_input(item, module_id)))
+}
+
+pub fn translate_cached_compilation_unit_to_ehir_chunks(modules: Vec[TranslationModule], target: TargetSpec,
+    selected: Vec[usize], cached: Vec[CachedFunctionChunk],) -> CachedCompilationChunks {
+    let mut ast = Vec[Statement]::new()
+    for module in modules {
+        ast.extend(module.ast)
+    }
+    let mut ctx = collect_context_with_abi(ast, modules, target, Vec[str]::new(), true)
+    ctx.cached_functions = cached
+    ctx.record_function_cache = true
+    ctx.cached_function_index = unsafe {
+        encore_strmap_new()
+    }
+    let mut cached_index = 0_usize
+    for function in cached {
+        unsafe {
+            encore_strmap_put(ctx.cached_function_index, function.key, cached_index + 1)
+        }
+        cached_index += 1
+    }
+    let mut chunks = Vec[TranslatedModuleChunk]::new()
+    let mut index = 0_usize
+    for module in modules {
+        if contains_module_index(selected, index) {
+            chunks.push(translate_module_chunk(ctx, module, target, index))
+        }
+        index += 1
+    }
+    let result = CachedCompilationChunks { chunks, ctx.lowered_functions, ctx.functions_reused }
+    free_translation_indexes(ctx)
+    ret result
 }
 
 fn translate_selected_modules_with_abi(modules: Vec[TranslationModule], target: TargetSpec,
@@ -1178,12 +1258,7 @@ fn exported_type_owner(ctx: mut TranslatorContext, module: TranslationModule,
                     if !item.is_public {
                         continue
                     }
-                    let mut path = item.path
-                    if starts_with(path, "mod::") {
-                        let root = module.module_id.slice(0_usize,
-                            find_char(module.module_id, "@", 0_usize),)
-                        path = root + path.slice(3_usize, path.len() - 3_usize)
-                    }
+                    let path = translation_import_target(module, item.path)
                     if import_path_allows(path, module_import_path(candidate.module_id), name) {
                         let found = exported_type_owner(ctx, candidate, name, depth + 1_usize)
                         if found != "" {
@@ -1243,6 +1318,11 @@ fn translate_ast_to_ehir(ast: Vec[Statement], modules: Vec[TranslationModule], t
 }
 
 fn free_translation_indexes(ctx: TranslatorContext) ->() {
+    if ctx.cached_function_index != 0 {
+        unsafe {
+            encore_strmap_free(ctx.cached_function_index)
+        }
+    }
     unsafe {
         encore_strmap_free(ctx.module_index)
         encore_strset_free(ctx.visibility_index)
@@ -1280,7 +1360,7 @@ fn translate_ast_with_context(ctx: mut TranslatorContext, ast: Vec[Statement], t
             Statement::Function(fn_item) => {
                 if function_is_active(fn_item, target, features) {
                     if !function_is_decorator_definition(fn_item) {
-                        builder = builder.append(translate_function(ctx, fn_item))
+                        builder = builder.append(translate_cached_function(ctx, fn_item))
                     }
                 }
             }
@@ -1372,6 +1452,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
     }
     let type_collisions = build_type_collision_names(modules, stable_abi)
     let mut ctx = TranslatorContext {
+        Vec[CachedFunctionChunk]::new(), Vec[CachedFunctionChunk]::new(), false, 0, 0,
         Vec[VarType]::new(), Vec[VarType]::new(), Vec[FunctionType]::new(), modules, module_visibility,
         module_index, module_prefixes, visibility_index, direct_import_index, unsafe {
             encore_strmap_new()
@@ -1397,7 +1478,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
         Vec[GenericParam]::new(), target, features, false, "", "", "", "", "", Vec[str]::new(),
         Vec[str]::new(), Vec[VariableRegion]::new(), Vec[usize]::new(), Vec[usize]::new(),
         Vec[usize]::new(), Vec[usize]::new(), Vec[str]::new(), Vec[str]::new(),
-        Vec[str]::new(), Vec[str]::new(), Vec[str]::new(), 1_usize, stable_abi, ""
+        Vec[str]::new(), Vec[str]::new(), Vec[str]::new(), 1_usize, stable_abi, "", 0, Vec[str]::new()
     }
     // Struct/enum syntax nodes intentionally carry no source path. In a
     // resolved workspace, collect them through their owning module so two
@@ -1561,23 +1642,33 @@ fn function_import_alias_key(source_name: str, alias: str) -> str {
 }
 
 fn index_function_import_aliases(ctx: mut TranslatorContext) ->() {
-    // Resolve aliases once to the original declaration's overload chain. An
-    // alias never creates a second function declaration or emitted definition.
+    // Bind every explicitly selected import, including its unaliased spelling,
+    // to the declaration's overload chain. A transitively imported generic
+    // template cannot displace this lexical binding with its private helper.
     for module in ctx.modules {
-        let owner = module_import_path(module.module_id)
         for statement in module.ast {
             match statement {
                 Statement::Import(item) => {
-                    let path = normalized_import_target(owner, item.path)
+                    let path = translation_import_target(module, item.path)
                     for target_id in module.imports {
                         let target = module_import_path(target_id)
                         if !starts_with(path, target + "::") {
                             continue
                         }
                         for binding in import_binding_names(path, target) {
-                            if !binding.2 || binding.0 == "*" {
+                            if binding.0 == "*" {
                                 continue
                             }
+                            let mut local = false
+                            for declaration in module.ast {
+                                match declaration {
+                                    Statement::Function(function) => {
+                                        if function.name == binding.1 { local = true }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if local && !binding.2 { continue }
                             let mut encoded = unsafe {
                                 encore_strmap_get(ctx.function_heads, binding.0)
                             }
@@ -2041,7 +2132,7 @@ fn collect_struct_fields(ctx: mut TranslatorContext, item: StructStmt, source_na
                         qualified_generic_type(ctx, source_name, typ, generic_param_names(item.generics))
                     }
                     ,
-                    Debug::fmt(index)
+                    Debug::fmt(index), generic_param_names(item.generics)
                 }
                 ,
             )
@@ -2060,7 +2151,7 @@ fn collect_struct_fields(ctx: mut TranslatorContext, item: StructStmt, source_na
                     qualified_generic_type(ctx, source_name, field.typ, generic_param_names(item.generics))
                 }
                 ,
-                Debug::fmt(index)
+                Debug::fmt(index), generic_param_names(item.generics)
             }
             ,
         )
@@ -2104,14 +2195,15 @@ fn remember_async_future_output(ctx: mut TranslatorContext, item: FunctionItem, 
     let owner = base_type_name(typ)
     remember_type(ctx, owner)
     ctx_add_field(ctx, StructFieldType {
-            owner, "state", "usize", "0"
+            owner, "state", "usize", "0", generic_param_names(item.generics)
         }
         ,
     )
     let mut index = 0_usize
     for param in item.params {
         ctx_add_field(ctx, StructFieldType {
-                owner, param.name, unwrap_type_or_usize(param.typ), Debug::fmt(index + 1_usize)
+                owner, param.name, unwrap_type_or_usize(param.typ), Debug::fmt(index + 1_usize),
+                generic_param_names(item.generics)
             }
             ,
         )
@@ -2281,6 +2373,19 @@ fn module_symbol_prefix(ctx: mut TranslatorContext, source_name: str) -> str {
 
 fn qualified_callable_name(ctx: mut TranslatorContext, source_name: str, name: str) -> str {
     let owner = function_owner_name(name)
+    let scope = last_scope_index(owner)
+    if scope < owner.byte_len() {
+        let requested_module = owner.slice_bytes(0, scope)
+        let requested_type = owner.slice_bytes(scope + 2, owner.byte_len() - scope - 2)
+        for module in ctx.modules {
+            if module_import_path(module.module_id) == requested_module {
+                let resolved = exported_type_identity(ctx, module, requested_type, 0)
+                if resolved != "" {
+                    ret resolved + name.slice_bytes(owner.byte_len(), name.byte_len() - owner.byte_len())
+                }
+            }
+        }
+    }
     if owner == "" || !contains_str(ctx.type_collisions, base_type_name(owner)) ||
     (!ctx.stable_abi && source_declares_trait(ctx, source_name, owner)) {
         ret name
@@ -2288,6 +2393,48 @@ fn qualified_callable_name(ctx: mut TranslatorContext, source_name: str, name: s
     let member_start = owner.byte_len() + 2_usize
     ret qualified_type_for_source(ctx, source_name, owner) + "::" +
     name.slice_bytes(member_start, name.byte_len() - member_start)
+}
+
+// Follow public re-exports to the declaration, including renamed exports.
+// A facade path is a lookup spelling, never the implementation's ABI name.
+fn exported_type_identity(ctx: mut TranslatorContext, module: TranslationModule,
+    name: str, depth: usize,) -> str {
+    if depth > ctx.modules.len() { ret "" }
+    for statement in module.ast {
+        let mut public_type = false
+        match statement {
+            Statement::Struct(item) => { public_type = item.is_public && item.name == name }
+            Statement::EnumItem(item) => { public_type = item.is_public && item.name == name }
+            Statement::Trait(item) => { public_type = item.is_public && item.name == name }
+            _ => {}
+        }
+        if public_type { ret qualified_type_for_source(ctx, module.source_name, name) }
+    }
+    let mut found = ""
+    for candidate in ctx.modules {
+        if !contains_str(module.imports, candidate.module_id) { continue }
+        let target = module_import_path(candidate.module_id)
+        for statement in module.ast {
+            match statement {
+                Statement::Import(item) => {
+                    let path = translation_import_target(module, item.path)
+                    if !item.is_public || !(path == target || starts_with(path, target + "::")) { continue }
+                    for binding in import_binding_names(path, target) {
+                        if binding.1 == name || binding.0 == "*" {
+                            let original = if binding.0 == "*" { name } else { binding.0 }
+                            let resolved = exported_type_identity(ctx, candidate, original, depth + 1)
+                            if resolved != "" {
+                                if found != "" && found != resolved { ret "" }
+                                found = resolved
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    ret found
 }
 
 fn ctx_next_emitted_name(ctx: mut TranslatorContext, source_name: str, raw_name: str) -> str {
@@ -2527,6 +2674,145 @@ fn ctx_add_var_emitted(ctx: mut TranslatorContext, name: str, emitted_name: str,
     )
     ctx_bind_fresh_region(ctx, name)
     ret()
+}
+
+fn save_translation_bindings(ctx: mut TranslatorContext) -> TranslationBindings {
+    let mut vars = Vec[VarType]::with_capacity(ctx.vars.len())
+    for variable in ctx.vars {
+        vars.push(variable)
+    }
+    let mut regions = Vec[VariableRegion]::with_capacity(ctx.variable_regions.len())
+    for binding in ctx.variable_regions {
+        regions.push(binding)
+    }
+    let mut owned = Vec[VarType]::with_capacity(ctx.owned_vars.len())
+    for owner in ctx.owned_vars { owned.push(owner) }
+    ret TranslationBindings { vars, regions, owned, ctx.expression_hint, ctx.moved_values.len() }
+}
+
+fn restore_translation_bindings(ctx: mut TranslatorContext, bindings: TranslationBindings) ->() {
+    ctx.vars = bindings.vars
+    ctx.variable_regions = bindings.variable_regions
+    ctx.owned_vars = bindings.owned_vars
+    ctx.expression_hint = bindings.expression_hint
+    while ctx.moved_values.len() > bindings.moved_count { ctx.moved_values.pop() }
+    ret()
+}
+
+// Restore lexical declarations without resurrecting owners transferred by
+// executed code. Stores through an outer slot remain in the emitted program.
+fn finish_translation_scope(ctx: mut TranslatorContext, bindings: TranslationBindings) ->() {
+    let mut moves = Vec[str]::new()
+    collect_translation_moves(ctx, bindings, moves)
+    restore_translation_bindings(ctx, bindings)
+    apply_translation_moves(ctx, moves)
+    ret()
+}
+
+fn finish_expression_scope(ctx: mut TranslatorContext, bindings: TranslationBindings,
+    lowered: LoweredExpr, borrowed: bool, prefix: str,) -> LoweredExpr {
+    let mut builder = lowered.code
+    if lowered.typ != "!" {
+        // A block's value outlives its local roots, including a shadowed local
+        // returned as the tail. Acquire that result before dropping the scope.
+        if borrowed && ctx_type_needs_ownership(ctx, lowered.typ) {
+            builder = builder.instr("retain " + lowered.value + ": " + lowered.typ)
+        }
+        builder = append_translation_scope_drops(ctx, builder, bindings, prefix)
+    }
+    finish_translation_scope(ctx, bindings)
+    ret LoweredExpr { builder, lowered.value, lowered.typ }
+}
+
+// Each arm starts from the same lexical/ownership environment. Only real
+// execution paths contribute consumed SSA identities to the join; discarded
+// type probes contribute none. Source names are insufficient under shadowing.
+fn collect_translation_moves(ctx: mut TranslatorContext, bindings: TranslationBindings,
+    moves: mut Vec[str],) ->() {
+    let mut index = bindings.moved_count
+    while index < ctx.moved_values.len() {
+        let value = ctx.moved_values.get(index).unwrap_or("")
+        if value != "" && !contains_str(moves, value) { moves.push(value) }
+        index += 1
+    }
+    ret()
+}
+
+fn apply_translation_moves(ctx: mut TranslatorContext, moves: Vec[str]) ->() {
+    if moves.len() == 0 { ret() }
+    for value in moves {
+        if !contains_str(ctx.moved_values, value) { ctx.moved_values.push(value) }
+    }
+    let mut owned = Vec[VarType]::new()
+    for owner in ctx.owned_vars {
+        if !moved_binding_owns(ctx, owner, moves) { owned.push(owner) }
+    }
+    ctx.owned_vars = owned
+    let mut vars = Vec[VarType]::new()
+    for variable in ctx.vars {
+        if !contains_str(moves, variable.emitted_name) { vars.push(variable) }
+    }
+    ctx.vars = vars
+    let mut regions = Vec[VariableRegion]::new()
+    for binding in ctx.variable_regions {
+        if ctx_lookup_var(ctx, binding.name).is_some() { regions.push(binding) }
+    }
+    ctx.variable_regions = regions
+    ret()
+}
+
+fn moved_binding_owns(ctx: mut TranslatorContext, owner: VarType, moves: Vec[str]) -> bool {
+    if !contains_str(moves, owner.emitted_name) { ret false }
+    for variable in ctx.vars {
+        if variable.name == owner.name && variable.emitted_name == owner.emitted_name { ret true }
+    }
+    // Temporary call operands can own another reference to the very same SSA
+    // value. Moving its source binding must not release those independent roots.
+    ret false
+}
+
+fn append_translation_scope_drops(ctx: mut TranslatorContext, builder: EhirTextBuilder,
+    bindings: TranslationBindings, prefix: str,) -> EhirTextBuilder {
+    // A move may remove an outer owner from the middle of the cleanup stack.
+    // In that case its old length is no longer a valid boundary for locals.
+    if ctx.moved_values.len() == bindings.moved_count {
+        ret append_owned_drops_from(ctx, builder, "", prefix, bindings.owned_vars.len())
+    }
+    let saved = ctx.owned_vars
+    let mut locals = Vec[VarType]::new()
+    for owner in saved {
+        let mut outer = false
+        for previous in bindings.owned_vars {
+            if owner.name == previous.name && owner.emitted_name == previous.emitted_name { outer = true break }
+        }
+        if !outer { locals.push(owner) }
+    }
+    ctx.owned_vars = locals
+    let output = append_owned_drops(ctx, builder, "", prefix)
+    ctx.owned_vars = saved
+    ret output
+}
+
+fn append_match_scope_exits(ctx: mut TranslatorContext, builder: EhirTextBuilder,
+    exits: Vec[MatchScopeExit], moves: Vec[str], end_label: str,) -> EhirTextBuilder {
+    let outer = ctx.owned_vars
+    let mut output = builder
+    for exit in exits {
+        let mut remaining = Vec[VarType]::new()
+        for owner in outer {
+            if moved_binding_owns(ctx, owner, moves) && !contains_str(exit.moves, owner.emitted_name) {
+                remaining.push(owner)
+            }
+        }
+        // A partially consumed binding is unavailable after the join. On a
+        // path which did not move it, release its owner before reaching that
+        // join rather than silently abandoning the live graph edge.
+        ctx.owned_vars = remaining
+        output = append_owned_drops(ctx, output.label(exit.label), "", exit.label)
+            .instr("br $" + end_label)
+    }
+    ctx.owned_vars = outer
+    ret output
 }
 
 fn ctx_type_needs_ownership(ctx: mut TranslatorContext, typ: str) -> bool {
@@ -2810,11 +3096,7 @@ fn ctx_add_owned_var(ctx: mut TranslatorContext, name: str, emitted_name: str, t
         )
         ret()
     }
-    let ownership_type = if starts_with(typ, "mut ") {
-        value_type_name(typ)
-    } else {
-        typ
-    }
+    let ownership_type = capability_value_type(typ)
     if !ctx_type_needs_ownership(ctx, ownership_type) {
         ret()
     }
@@ -2832,9 +3114,12 @@ fn ctx_move_owned_var(ctx: mut TranslatorContext, name: str) ->() {
     if name == "" {
         ret()
     }
+    let emitted = ctx_lookup_value_name(ctx, name)
+    let is_binding = ctx_lookup_var(ctx, name).is_some()
+    if is_binding && !contains_str(ctx.moved_values, emitted) { ctx.moved_values.push(emitted) }
     let mut kept = Vec[VarType]::new()
     for variable in ctx.owned_vars {
-        if variable.name != name {
+        if variable.name != name || (is_binding && variable.emitted_name != emitted) {
             kept.push(variable)
         }
     }
@@ -2864,13 +3149,13 @@ fn append_owned_drops_from(ctx: mut TranslatorContext, builder: EhirTextBuilder,
                         out = out.instr(handle + ": " + handle_type + " = pcast " +
                             bits + ": usize, " + handle_type,)
                         out = out.instr("drop " + handle + ": " + handle_type)
-                    } elif starts_with(item.typ, "mut ") {
-                        let value_type = value_type_name(item.typ)
+                    } elif is_mutable_place_type(item.typ) {
+                        let value_type = capability_value_type(item.typ)
                         let loaded = prefix + "_drop_load_" + Debug::fmt(index)
                         out = out.instr(loaded + ": " + value_type + " = load " + item.emitted_name)
                         out = out.instr("drop " + loaded + ": " + value_type)
                     } else {
-                        out = out.instr("drop " + item.emitted_name + ": " + item.typ)
+                        out = out.instr("drop " + item.emitted_name + ": " + capability_value_type(item.typ))
                     }
                 }
             }
@@ -2879,13 +3164,6 @@ fn append_owned_drops_from(ctx: mut TranslatorContext, builder: EhirTextBuilder,
         }
     }
     ret out
-}
-
-fn restore_owned_vars(ctx: mut TranslatorContext, size: usize) ->() {
-    while ctx.owned_vars.len() > size {
-        ctx.owned_vars.pop()
-    }
-    ret()
 }
 
 // A typed store creates a slot owner. Release a produced (not borrowed) input
@@ -2900,9 +3178,11 @@ fn store_transferred_value(ctx: mut TranslatorContext, builder: EhirTextBuilder,
 }
 
 fn move_var_out_of_context(ctx: mut TranslatorContext, name: str) ->() {
-    if name == "" {
+    if name == "" || ctx_lookup_var(ctx, name).is_none() {
         ret()
     }
+    let emitted = ctx_lookup_value_name(ctx, name)
+    if !contains_str(ctx.moved_values, emitted) { ctx.moved_values.push(emitted) }
     let mut remaining_vars = Vec[VarType]::new()
     for variable in ctx.vars {
         if variable.name != name {
@@ -2912,7 +3192,7 @@ fn move_var_out_of_context(ctx: mut TranslatorContext, name: str) ->() {
     ctx.vars = remaining_vars
     let mut remaining_owned = Vec[VarType]::new()
     for variable in ctx.owned_vars {
-        if variable.name != name {
+        if variable.name != name || variable.emitted_name != emitted {
             remaining_owned.push(variable)
         }
     }
@@ -3025,9 +3305,23 @@ fn function_name_candidates(ctx: mut TranslatorContext, name: str, base: str) ->
 }
 
 fn function_type_matches(template: str, actual: str, generics: Vec[str]) -> bool {
+    let qualified_expected = capability_value_type(template)
+    let qualified_actual = capability_value_type(actual)
+    for generic in generics {
+        if qualified_expected == generic {
+            ret true
+        }
+    }
+    if !call_placement_matches(qualified_expected, qualified_actual) {
+        ret false
+    }
     let expected = trim_spaces(canonical_type(value_type_name(template)))
     let found = trim_spaces(canonical_type(value_type_name(actual)))
     if expected == found {
+        ret true
+    }
+    // Match the EHIR type contract: bool and u1 are the same one-bit value.
+    if (expected == "bool" && found == "u1") ||(expected == "u1" && found == "bool") {
         ret true
     }
     for generic in generics {
@@ -3092,7 +3386,52 @@ fn function_matches_args(function: FunctionType, actual_types: Vec[str]) -> bool
         }
         index = index + 1_usize
     }
+    // Repeated occurrences bind one payload type, not independent wildcards.
+    for generic in function.generics {
+        let mut bound = ""
+        for position in 0..function.params.len() {
+            let candidate = infer_generic_from_types(function.params.get(position).unwrap_or(""),
+                actual_types.get(position).unwrap_or(""), generic,)
+            if candidate != "" {
+                if bound != "" && bound != candidate {
+                    ret false
+                }
+                bound = candidate
+            }
+        }
+        if bound != "" {
+            for position in 0..function.params.len() {
+                let specialized = specialize_named_type(function.params.get(position).unwrap_or(""),
+                    vec![generic], vec![bound],)
+                if !function_type_matches(specialized, actual_types.get(position).unwrap_or(""), function.generics) {
+                    ret false
+                }
+            }
+        }
+    }
     ret true
+}
+
+fn call_placement(typ: str) -> str {
+    if ends_with(typ, "<H>") {
+        ret "<H>"
+    }
+    if ends_with(typ, "<S>") {
+        ret "<S>"
+    }
+    if ends_with(typ, "&") {
+        ret "&"
+    }
+    if ends_with(typ, "*") {
+        ret "*"
+    }
+    ret ""
+}
+
+fn call_placement_matches(expected: str, actual: str) -> bool {
+    let wanted = call_placement(expected)
+    let found = call_placement(actual)
+    ret wanted == found ||(wanted == "&" &&(found == "<H>" || found == "<S>"))
 }
 
 fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, source_name: str, name: str, actual_types:
@@ -3340,11 +3679,12 @@ fn direct_import_allows(ctx: mut TranslatorContext, caller_source: str,
     // against the parsed import. This covers nested/aliased import spellings
     // without putting an AST walk on every function lookup.
     for module in ctx.modules {
-        if module.source_name == caller_source && contains_str(module.imports, target_module) {
+        if module.module_id == caller && contains_str(module.imports, target_module) {
             for statement in module.ast {
                 match statement {
                     Statement::Import(item) => {
-                        if import_path_allows(item.path, module_import_path(target_module), function_name)
+                        let path = translation_import_target(module, item.path)
+                        if import_path_allows(path, module_import_path(target_module), function_name)
                         {
                             let _allowed = unsafe {
                                 encore_strset_insert(ctx.direct_import_index, prefix + imported_name)
@@ -3379,7 +3719,8 @@ fn build_direct_import_index(modules: Vec[TranslationModule]) -> usize {
             for statement in module.ast {
                 match statement {
                     Statement::Import(item) => {
-                        remember_import_permissions(index, prefix, target_path, item.path)
+                        remember_import_permissions(index, prefix, target_path,
+                            translation_import_target(module, item.path),)
                     }
                     _ => {
                     }
@@ -3429,6 +3770,36 @@ fn remember_import_permissions(index: usize, prefix: str, target: str, raw: str)
     ret()
 }
 
+// Match workspace resolution: `mod` is relative to the source directory,
+// while `refrain`/`repo` start at the package root. A leaf foo.enq does not
+// introduce a directory named foo; foo/mod.enq does.
+fn translation_import_target(module: TranslationModule, raw: str) -> str {
+    let path = trim_spaces(raw)
+    let owner = module_import_path(module.module_id)
+    if starts_with(path, "mod::") {
+        let separator = find_char(module.module_id, "@", 0)
+        if separator < module.module_id.len() {
+            let relative = module.module_id.slice(separator + 1, module.module_id.len() - separator - 1)
+            if relative != "lib.enq" && relative != "main.enq" && relative != "mod.enq" &&
+            !ends_with(relative, "/mod.enq") && !ends_with(relative, "/lib.enq") &&
+            !ends_with(relative, "/main.enq") {
+                let mut parent_end = 0_usize
+                let mut index = 0_usize
+                while index + 1 < owner.len() {
+                    if owner.slice(index, 2) == "::" {
+                        parent_end = index
+                    }
+                    index += 1
+                }
+                if parent_end > 0 {
+                    ret normalized_import_target(owner.slice(0, parent_end), path)
+                }
+            }
+        }
+    }
+    ret normalized_import_target(owner, path)
+}
+
 fn module_import_path(module_id: str) -> str {
     let separator = find_char(module_id, "@", 0_usize)
     if separator >= module_id.len() {
@@ -3437,7 +3808,7 @@ fn module_import_path(module_id: str) -> str {
     let owner = module_id.slice(0_usize, separator)
     let mut relative = module_id.slice(separator + 1_usize,
         module_id.len() - separator - 1_usize,)
-    if relative == "lib.enq" || relative == "main.enq" {
+    if relative == "lib.enq" || relative == "main.enq" || relative == "mod.enq" {
         ret owner
     }
     if ends_with(relative, "/mod.enq") {
@@ -4053,10 +4424,7 @@ fn ctx_lookup_field(ctx: mut TranslatorContext, owner: str, field: str) -> Optio
         match ctx.fields.get(encoded - 1_usize) {
             Some(item) => {
                 let owner_generics = generic_args_from_path(owner)
-                if item.owner == owner_base && owner_generics.len() > 0_usize {
-                    ret Option[str]::Some(direct_generic_hint(item.typ, owner_generics))
-                }
-                ret Option[str]::Some(item.typ)
+                ret Option[str]::Some(specialize_named_type(item.typ, item.generic_names, owner_generics))
             }
             None => {
             }
@@ -4080,7 +4448,7 @@ fn ctx_lookup_field_at_position(ctx: mut TranslatorContext, owner: str, position
     if encoded > 0_usize {
         match ctx.fields.get(encoded - 1_usize) {
             Some(item) => {
-                ret Option[str]::Some(direct_generic_hint(item.typ, generic_args_from_path(owner)))
+                ret Option[str]::Some(specialize_named_type(item.typ, item.generic_names, generic_args_from_path(owner)))
             }
             None => {
             }
@@ -4141,6 +4509,34 @@ fn ctx_enum_variant_owner(ctx: mut TranslatorContext, source_name: str, path: st
     for item in ctx.enum_variants {
         if enum_variant_name(item.path) == requested_variant && item.owner == resolved_base {
             ret Option[str]::Some(resolved_owner)
+        }
+    }
+    ret Option[str]::None
+}
+
+fn enum_constructor_owner(ctx: mut TranslatorContext, source_name: str, path: str) -> str {
+    let owner = ctx_enum_variant_owner(ctx, source_name, path).unwrap_or("")
+    if owner != "" && generic_args_from_path(owner).len() == 0 && ctx.expression_hint != ""
+    && base_type_name(ctx.expression_hint) == base_type_name(owner) {
+        ret canonical_type(ctx.expression_hint)
+    }
+    ret owner
+}
+
+fn enum_constructor_payload(ctx: mut TranslatorContext, owner: str, variant: str) -> Option[str] {
+    for index in aggregate_member_candidates(ctx, base_type_name(owner), true) {
+        match ctx.enum_variants.get(index) {
+            Some(item) => {
+                if item.owner == base_type_name(owner) && enum_variant_name(item.path) == variant {
+                    let args = generic_args_from_path(owner)
+                    if item.generics.len() != args.len() {
+                        ret Option[str]::Some("")
+                    }
+                    ret Option[str]::Some(specialize_named_type(item.payload_type, item.generics, args))
+                }
+            }
+            None => {
+            }
         }
     }
     ret Option[str]::None
@@ -4210,6 +4606,20 @@ fn value_type_name(name: str) -> str {
 fn is_node_handle_type_text(name: str) -> bool {
     let value = canonical_type(name)
     ret ends_with(value, "<S>") || ends_with(value, "<H>") || ends_with(value, "&")
+}
+
+// Mutation is a source capability, not a storage representation. A mutable
+// owning node remains a value; only mutable inline parameters denote places.
+fn capability_value_type(name: str) -> str {
+    let value = canonical_type(name)
+    if starts_with(value, "mut ") {
+        ret canonical_type(value.slice(4, value.len() - 4))
+    }
+    ret value
+}
+
+fn is_mutable_place_type(name: str) -> bool {
+    ret starts_with(name, "mut ") && !is_node_handle_type_text(capability_value_type(name))
 }
 
 fn mutable_handle_slot_type(name: str) -> str {
@@ -4813,7 +5223,7 @@ fn translate_trait(ctx: mut TranslatorContext, item: TraitStmt) -> EhirTextBuild
     ret builder
 }
 
-fn inline_expr_node(node: ExprNode < H >) -> ExprNode {
+fn inline_expr_node(node: ExprNode<H>) -> ExprNode {
     ret ExprNode {
         node.value, node.line, node.column, node.length, node.source_name
     }
@@ -5153,6 +5563,53 @@ fn translate_decorated_function(ctx: mut TranslatorContext, item: FunctionItem,
     ret builder
 }
 
+fn translate_cached_function(ctx: mut TranslatorContext, item: FunctionItem) -> EhirTextBuilder {
+    if !ctx.record_function_cache || item.is_async || item.is_extern || !item.generics.is_empty() ||
+    !item.decorators.is_empty() {
+        ret translate_function(ctx, item)
+    }
+    let key = lowering_function_key(module_identity_for_source(ctx, item.source_name), item)
+    let encoded = unsafe {
+        encore_strmap_get(ctx.cached_function_index, key)
+    }
+    if encoded != 0 {
+        match ctx.cached_functions.get(encoded - 1) {
+            Some(cached) => {
+                for declaration in cached.declarations {
+                    let prefix = "__encore_generated_closure__struct "
+                    if starts_with(declaration, prefix) {
+                        let end = find_char(declaration, " ", prefix.len())
+                        let name = declaration.slice(prefix.len(), end - prefix.len())
+                        remember_type(ctx, name)
+                        let _owning = unsafe {
+                            encore_strset_insert(ctx.owning_type_index, name)
+                        }
+                    }
+                    ctx.extern_functions.push(declaration)
+                }
+                ctx.functions_reused += 1
+                ret EhirTextBuilder::new().append_str(cached.text)
+            }
+            None => {
+            }
+        }
+    }
+    let before = ctx.extern_functions.len()
+    let text = translate_function(ctx, item).finish()
+    let mut declarations = Vec[str]::new()
+    for index in before..ctx.extern_functions.len() {
+        match ctx.extern_functions.get(index) {
+            Some(value) => {
+                declarations.push(value)
+            }
+            None => {
+            }
+        }
+    }
+    ctx.lowered_functions.push(CachedFunctionChunk { key, text, declarations })
+    ret EhirTextBuilder::new().append_str(text)
+}
+
 fn translate_function(ctx: mut TranslatorContext, fn_item: FunctionItem) -> EhirTextBuilder {
     if fn_item.is_async && fn_item.is_extern {
         translation_error_at(fn_item.source_name, fn_item.line, fn_item.column, "async-extern", "extern functions cannot be async")
@@ -5184,6 +5641,8 @@ fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, e
     }
     ctx.vars = Vec[VarType]::new()
     ctx.owned_vars = Vec[VarType]::new()
+    ctx.next_value_id = 0
+    ctx.moved_values = Vec[str]::new()
     ctx.variable_regions = Vec[VariableRegion]::new()
     ctx.region_parents = Vec[usize]::new()
     ctx.region_parents.push(0_usize)
@@ -5269,7 +5728,7 @@ fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, e
         }
         // A local-place parameter aliases caller-owned storage. Every node
         // handle parameter, including `T&`, owns its incoming graph edge.
-        if (!starts_with(param_type, "mut ") || ends_with(canonical_type(param_type), "&")) &&
+        if !is_mutable_place_type(param_type) &&
         !(param.name == "self" &&
             function_has_attr(fn_item, "borrowed_self"))
         {
@@ -6377,6 +6836,13 @@ fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str
     if explicit_mut {
         typ = value_type_name(typ)
     }
+    // Unit denotes an effect-only result, not a first-class LLVM void value.
+    // Keep its source binding for aliases/returns but create no SSA register,
+    // mutable storage slot or ownership entry, even for a mutable unit local.
+    if typ == "void" || typ == "()" {
+        ctx_add_var_emitted(ctx, let_stmt.name, "void", "()")
+        ret builder
+    }
     if base_type_name(typ) == "JoinHandle" && source_path != "" {
         move_var_out_of_context(ctx, source_path)
     } elif borrowed_copy && !(let_stmt.is_mut || explicit_mut) && ctx_type_needs_ownership(ctx, typ)
@@ -6457,7 +6923,7 @@ fn expr_is_numeric_literal(expr: ExprNode) -> bool {
     ret false
 }
 
-fn expr_h_is_numeric_literal(expr: ExprNode < H >) -> bool {
+fn expr_h_is_numeric_literal(expr: ExprNode<H>) -> bool {
     match expr.value {
         Expr::Integer(_) => {
             ret true
@@ -6486,16 +6952,8 @@ fn expr_is_borrowed_copy(expr: ExprNode) -> bool {
         Expr::Index(index) => {
             ret expr_h_is_borrowed_copy(index.base)
         }
-        Expr::Block(block) => {
-            match block.tail {
-                Some(tail) => {
-                    ret expr_h_is_borrowed_copy(tail)
-                }
-                None => {
-                    ret false
-                }
-            }
-        }
+        // A block acquires its tail before releasing local owners.
+        Expr::Block(_) => { ret false }
         Expr::Parenthesized(inner) => {
             ret expr_h_is_borrowed_copy(inner)
         }
@@ -6506,7 +6964,7 @@ fn expr_is_borrowed_copy(expr: ExprNode) -> bool {
     ret false
 }
 
-fn expr_h_is_borrowed_copy(expr: ExprNode < H >) -> bool {
+fn expr_h_is_borrowed_copy(expr: ExprNode<H>) -> bool {
     match expr.value {
         Expr::Path(_) => {
             ret true
@@ -6517,16 +6975,7 @@ fn expr_h_is_borrowed_copy(expr: ExprNode < H >) -> bool {
         Expr::Index(index) => {
             ret expr_h_is_borrowed_copy(index.base)
         }
-        Expr::Block(block) => {
-            match block.tail {
-                Some(tail) => {
-                    ret expr_h_is_borrowed_copy(tail)
-                }
-                None => {
-                    ret false
-                }
-            }
-        }
+        Expr::Block(_) => { ret false }
         Expr::Parenthesized(inner) => {
             ret expr_h_is_borrowed_copy(inner)
         }
@@ -6541,187 +6990,6 @@ fn expr_h_is_borrowed_copy(expr: ExprNode < H >) -> bool {
 // return a view of the same live graph. Treat that result as borrowed at the
 // assignment boundary so the temporary is not released as an independent
 // owner after replacing the slot (`state = update_in_place(state)`).
-fn expr_mutably_aliases_path(ctx: mut TranslatorContext, expr: ExprNode,
-    target: str,) -> bool {
-    match expr.value {
-        Expr::Call(call) => {
-            let mut callee = expr_h_path_or_empty(call.callee)
-            if starts_with(callee, "Self::") && ctx.self_type != "" {
-                callee = method_owner_name(ctx.self_type) + "::" +
-                callee.slice(6_usize, callee.len() - 6_usize)
-            }
-            let generic_args = if call.generics.len() > 0_usize {
-                call.generics
-            } else {
-                generic_args_from_path(callee)
-            }
-            let mut index = 0_usize
-            for arg in call.args {
-                if expr_path_or_empty(arg) == target {
-                    match ctx_lookup_function_param_for_call(ctx,
-                        expr.source_name, base_type_name(callee), index,
-                        generic_args, call.args,) {
-                        Some(expected) => {
-                            if starts_with(expected, "mut ") {
-                                ret true
-                            }
-                        }
-                        None => {
-                        }
-                    }
-                }
-                index += 1_usize
-            }
-        }
-        Expr::MethodCall(call) => {
-            let receiver_path = expr_h_path_or_empty(call.receiver)
-            let receiver_type = match ctx_lookup_var(ctx, receiver_path) {
-                Some(found) => value_type_name(found)
-                None => ""
-            }
-            let owner = method_owner_name(receiver_type)
-            let name = owner + "::" + call.method
-            let mut generics = generic_args_from_path(receiver_type)
-            for generic in call.generics {
-                generics.push(canonical_type(generic))
-            }
-            if receiver_path == target {
-                match ctx_lookup_function_param(ctx, expr.source_name, name,
-                    0_usize, generics,) {
-                    Some(expected) => {
-                        if starts_with(expected, "mut ") {
-                            ret true
-                        }
-                    }
-                    None => {
-                    }
-                }
-            }
-            let mut index = 0_usize
-            for arg in call.args {
-                if expr_path_or_empty(arg) == target {
-                    match ctx_lookup_function_param(ctx, expr.source_name, name,
-                        index + 1_usize, generics,) {
-                        Some(expected) => {
-                            if starts_with(expected, "mut ") {
-                                ret true
-                            }
-                        }
-                        None => {
-                        }
-                    }
-                }
-                index += 1_usize
-            }
-        }
-        Expr::Parenthesized(inner) => {
-            ret expr_h_mutably_aliases_path(ctx, inner, target)
-        }
-        Expr::Block(block) => {
-            match block.tail {
-                Some(tail) => {
-                    ret expr_h_mutably_aliases_path(ctx, tail, target)
-                }
-                None => {
-                }
-            }
-        }
-        _ => {
-        }
-    }
-    ret false
-}
-
-fn expr_h_mutably_aliases_path(ctx: mut TranslatorContext,
-    expr: ExprNode < H >, target: str,) -> bool {
-    match expr.value {
-        Expr::Parenthesized(inner) => {
-            ret expr_h_mutably_aliases_path(ctx, inner, target)
-        }
-        Expr::Block(block) => {
-            match block.tail {
-                Some(tail) => {
-                    ret expr_h_mutably_aliases_path(ctx, tail, target)
-                }
-                None => {
-                }
-            }
-        }
-        Expr::Call(call) => {
-            let mut callee = expr_h_path_or_empty(call.callee)
-            if starts_with(callee, "Self::") && ctx.self_type != "" {
-                callee = method_owner_name(ctx.self_type) + "::" +
-                callee.slice(6_usize, callee.len() - 6_usize)
-            }
-            let generic_args = if call.generics.len() > 0_usize {
-                call.generics
-            } else {
-                generic_args_from_path(callee)
-            }
-            let mut index = 0_usize
-            for arg in call.args {
-                if expr_path_or_empty(arg) == target {
-                    match ctx_lookup_function_param_for_call(ctx,
-                        expr.source_name, base_type_name(callee), index,
-                        generic_args, call.args,) {
-                        Some(expected) => {
-                            if starts_with(expected, "mut ") {
-                                ret true
-                            }
-                        }
-                        None => {
-                        }
-                    }
-                }
-                index += 1_usize
-            }
-        }
-        Expr::MethodCall(call) => {
-            let receiver_path = expr_h_path_or_empty(call.receiver)
-            let receiver_type = match ctx_lookup_var(ctx, receiver_path) {
-                Some(found) => value_type_name(found)
-                None => ""
-            }
-            let owner = method_owner_name(receiver_type)
-            let name = owner + "::" + call.method
-            let mut generics = generic_args_from_path(receiver_type)
-            for generic in call.generics {
-                generics.push(canonical_type(generic))
-            }
-            if receiver_path == target {
-                match ctx_lookup_function_param(ctx, expr.source_name, name,
-                    0_usize, generics,) {
-                    Some(expected) => {
-                        if starts_with(expected, "mut ") {
-                            ret true
-                        }
-                    }
-                    None => {
-                    }
-                }
-            }
-            let mut index = 0_usize
-            for arg in call.args {
-                if expr_path_or_empty(arg) == target {
-                    match ctx_lookup_function_param(ctx, expr.source_name, name,
-                        index + 1_usize, generics,) {
-                        Some(expected) => {
-                            if starts_with(expected, "mut ") {
-                                ret true
-                            }
-                        }
-                        None => {
-                        }
-                    }
-                }
-                index += 1_usize
-            }
-        }
-        _ => {
-        }
-    }
-    ret false
-}
 
 fn translate_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: AssignmentStmt, prefix: str, idx:
     usize,) -> EhirTextBuilder {
@@ -6732,8 +7000,10 @@ fn translate_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assignment
     }
 
     if assign_stmt.operator == "=" {
-        let borrowed_rhs = expr_is_borrowed_copy(assign_stmt.expr) ||
-        expr_mutably_aliases_path(ctx, assign_stmt.expr, target)
+        // Aliasing a mutable argument does not make the call result borrowed.
+        // Ordinary calls return an owner even when they return that argument;
+        // balance that owner after the slot store just like any produced RHS.
+        let borrowed_rhs = expr_is_borrowed_copy(assign_stmt.expr)
         let mut lowered = lower_expr(ctx, assign_stmt.expr, prefix + "_assign", idx)
         builder = builder.append(lowered.code)
         if lowered.typ == "!" {
@@ -6748,6 +7018,13 @@ fn translate_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assignment
                 translation_error_at(assign_stmt.target.source_name, assign_stmt.target.line, assign_stmt.target.column,
                     "unknown-variable", "unknown variable '" + target + "'",)
             }
+        }
+        if target_type == "void" || target_type == "()" {
+            if lowered.typ != "void" && lowered.typ != "()" {
+                translation_error_at(assign_stmt.expr.source_name, assign_stmt.expr.line,
+                    assign_stmt.expr.column, "assignment-type-mismatch", "cannot assign a non-unit value to unit binding '" + target + "'",)
+            }
+            ret builder
         }
         if is_mutable_handle_slot(target_type) {
             let handle_type = mutable_handle_slot_type(target_type)
@@ -7006,14 +7283,21 @@ fn translate_unsafe_stmt(
     break_label: Option[str],
     continue_label: Option[str],
 ) -> EhirTextBuilder {
-    ret translate_statements_no_default(
+    let bindings = save_translation_bindings(ctx)
+    let scope = prefix + "_unsafe_" + Debug::fmt(idx)
+    let mut builder = translate_statements_no_default(
         ctx,
         block.statements,
         ret_type,
-        prefix + "_unsafe_" + Debug::fmt(idx),
+        scope,
         break_label,
         continue_label,
     )
+    if !block_terminates_flow(block) {
+        builder = append_translation_scope_drops(ctx, builder, bindings, scope + "_scope")
+    }
+    finish_translation_scope(ctx, bindings)
+    ret builder
 }
 
 fn translate_ehir_stmt(ctx: mut TranslatorContext, stmt: EhirStmt) -> EhirTextBuilder {
@@ -7103,7 +7387,7 @@ fn expr_frozen_root_path(expr: ExprNode) -> str {
     ret ""
 }
 
-fn expr_h_frozen_root_path(expr: ExprNode < H >) -> str {
+fn expr_h_frozen_root_path(expr: ExprNode<H>) -> str {
     match expr.value {
         Expr::Path(name) => {
             ret name
@@ -7174,27 +7458,10 @@ fn assignment_op_to_ehir(op: str) -> str {
 fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usize) -> LoweredExpr {
     match expr.value {
         Expr::Integer(v) => {
-            let name = prefix + "_int_" + Debug::fmt(idx)
-            let typ = integer_literal_type(v)
-            let mut code = EhirTextBuilder::new()
-            code = code.instr(name + ": " + typ + " = capprim " + with_numeric_suffix(v, typ))
-            ret LoweredExpr {
-                code, name, typ
-            }
+            ret lower_integer_literal(v, ctx.expression_hint, prefix, idx)
         }
         Expr::Float(v) => {
-            let name = prefix + "_float_" + Debug::fmt(idx)
-            let inferred = integer_literal_type(v)
-            let typ = if inferred == "usize" {
-                "f64"
-            } else {
-                inferred
-            }
-            let mut code = EhirTextBuilder::new()
-            code = code.instr(name + ": " + typ + " = capprim " + with_numeric_suffix(v, typ))
-            ret LoweredExpr {
-                code, name, typ
-            }
+            ret lower_float_literal(v, ctx.expression_hint, prefix, idx)
         }
         Expr::StringLiteral(v) => {
             let name = prefix + "_str_" + Debug::fmt(idx)
@@ -7504,31 +7771,14 @@ fn binary_result_type(op: str, lhs_type: str) -> str {
     ret lhs_type
 }
 
-fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode < H >, prefix: str, idx: usize) -> LoweredExpr
+fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx: usize) -> LoweredExpr
 {
     match expr.value {
         Expr::Integer(v) => {
-            let name = prefix + "_int_" + Debug::fmt(idx)
-            let typ = integer_literal_type(v)
-            let mut code = EhirTextBuilder::new()
-            code = code.instr(name + ": " + typ + " = capprim " + with_numeric_suffix(v, typ))
-            ret LoweredExpr {
-                code, name, typ
-            }
+            ret lower_integer_literal(v, ctx.expression_hint, prefix, idx)
         }
         Expr::Float(v) => {
-            let name = prefix + "_float_" + Debug::fmt(idx)
-            let inferred = integer_literal_type(v)
-            let typ = if inferred == "usize" {
-                "f64"
-            } else {
-                inferred
-            }
-            let mut code = EhirTextBuilder::new()
-            code = code.instr(name + ": " + typ + " = capprim " + with_numeric_suffix(v, typ))
-            ret LoweredExpr {
-                code, name, typ
-            }
+            ret lower_float_literal(v, ctx.expression_hint, prefix, idx)
         }
         Expr::StringLiteral(v) => {
             let name = prefix + "_str_" + Debug::fmt(idx)
@@ -7610,7 +7860,12 @@ fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode < H >, prefix: str, i
                 }
             }
             if starts_with(typ, "mut ") {
-                let value_type = value_type_name(typ)
+                let value_type = capability_value_type(typ)
+                if !is_mutable_place_type(typ) {
+                    ret LoweredExpr {
+                        EhirTextBuilder::new(), ctx_lookup_value_name(ctx, name), value_type
+                    }
+                }
                 let out_name = prefix + "_load_" + Debug::fmt(idx)
                 let mut code = EhirTextBuilder::new()
                 code = code.instr(out_name + ": " + value_type + " = load " + ctx_lookup_value_name(ctx,
@@ -7737,7 +7992,13 @@ fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode < H >, prefix: str, i
 
 fn lower_cast_expr(ctx: mut TranslatorContext, cast_expr: CastExpr, source_name: str, prefix: str, idx: usize) -> LoweredExpr
 {
+    // A cast consumes an independently typed source expression. The enclosing
+    // result context applies after conversion, not to a branch join inside the
+    // operand (for example, a u32 `if` cast to usize still needs a u32 slot).
+    let previous_hint = ctx.expression_hint
+    ctx.expression_hint = ""
     let source = lower_expr_h(ctx, cast_expr.expr, prefix + "_cast_src", idx + 1_usize)
+    ctx.expression_hint = previous_hint
     let out_name = prefix + "_cast_" + Debug::fmt(idx)
     let target = qualified_type_for_source(ctx, source_name, cast_expr.target)
     let mut code = source.code
@@ -7764,7 +8025,7 @@ fn lower_closure_expr(ctx: mut TranslatorContext, closure: ClosureExpr, source_n
         let expected_type = signature.params.get(parameter_index).unwrap_or("")
         match parameter.typ {
             Some(declared) => {
-                if canonical_type(declared) != canonical_type(expected_type) {
+                if qualified_type_for_source(ctx, source_name, declared) != canonical_type(expected_type) {
                     translation_error_at(source_name, line, column, "closure-parameter-type-mismatch",
                         "closure parameter '" + parameter.name + "' has type '" + declared +
                         "', but trait '" + signature.trait_name + "' requires '" + expected_type + "'",)
@@ -7785,18 +8046,40 @@ fn lower_closure_expr(ctx: mut TranslatorContext, closure: ClosureExpr, source_n
 
     let mut captures = Vec[VarType]::new()
     collect_closure_captures_h(ctx, closure.body, parameter_names, captures)
+    let mut capture_code = EhirTextBuilder::new()
+    let mut capture_index = 0_usize
     for capture in captures {
-        let capture_type = canonical_type(capture.typ)
-        if starts_with(capture.typ, "mut ") {
+        if is_mutable_place_type(capture.typ) {
             translation_error_at(source_name, line, column, "mutable-closure-capture",
                 "closure cannot capture mutable local '" + capture.name +
                 "' yet; capture an owning heap node such as Signal<H> instead",)
+        }
+        // Capture an owning value, never the implementation's scalar rebind
+        // slot. Like an ordinary value copy, the capture is a read-only view
+        // of the node at closure creation, with its own graph edge.
+        let capture_type = if is_mutable_handle_slot(capture.typ) {
+            mutable_handle_slot_type(capture.typ)
+        } else {
+            capability_value_type(capture.typ)
         }
         if ends_with(capture_type, "<S>") {
             translation_error_at(source_name, line, column, "stack-node-closure-escape",
                 "closure environment escapes, so it cannot capture stack node '" + capture.name +
                 "' of type '" + capture_type + "'; allocate it as <H>",)
         }
+        if is_mutable_handle_slot(capture.typ) || starts_with(capture.typ, "mut ") {
+            let expression = ExprNode {
+                Expr::Path(capture.name), line, column, capture.name.len(), source_name
+            }
+            let value = lower_expr(ctx, expression, prefix + "_capture_" + Debug::fmt(idx), capture_index)
+            capture_code = capture_code.append(value.code)
+            captures.set(capture_index, VarType {
+                    capture.name, value.value, capability_value_type(value.typ)
+                }
+                ,
+            )
+        }
+        capture_index += 1
     }
 
     let source_identity = if ctx.stable_abi {
@@ -7832,7 +8115,7 @@ fn lower_closure_expr(ctx: mut TranslatorContext, closure: ClosureExpr, source_n
     let concrete_name = prefix + "_closure_env_" + Debug::fmt(idx)
     let dyn_name = prefix + "_closure_" + Debug::fmt(idx)
     let mut values = Vec[str]::new()
-    let mut code = EhirTextBuilder::new()
+    let mut code = capture_code
     for capture in captures {
         let capture_type = canonical_type(capture.typ)
         if ctx_type_needs_ownership(ctx, capture_type) {
@@ -7873,12 +8156,14 @@ fn closure_signature(ctx: mut TranslatorContext, expected: str, source_name: str
                     let mut index = 0_usize
                     for parameter in method.params {
                         if index > 0_usize {
-                            params.push(canonical_type(unwrap_type_or_usize(parameter.typ)))
+                            params.push(qualified_generic_type(ctx, method.source_name,
+                                    unwrap_type_or_usize(parameter.typ), generic_param_names(method.generics),))
                         }
                         index += 1_usize
                     }
                     ret ClosureSignature {
-                        trait_name, method.name, params, canonical_type(function_ret_type(method))
+                        trait_name, method.name, params, qualified_generic_type(ctx, method.source_name,
+                            function_ret_type(method), generic_param_names(method.generics),)
                     }
                 }
                 None => {
@@ -7894,8 +8179,8 @@ fn closure_signature(ctx: mut TranslatorContext, expected: str, source_name: str
 }
 
 fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, closure_type: str,
-    signature: ClosureSignature, params: Vec[FunctionParam], captures: Vec[VarType], body: ExprNode <
-    H >,
+    signature: ClosureSignature, params: Vec[FunctionParam], captures: Vec[VarType], body: ExprNode<
+    H>,
     source_name: str, line: usize, column: usize,) -> str {
     let saved_vars = ctx.vars
     let saved_owned = ctx.owned_vars
@@ -7908,9 +8193,13 @@ fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, 
     let saved_generics = ctx.active_generics
     let saved_async = ctx.in_async_function
     let saved_future = ctx.async_poll_future_type
+    let saved_value_id = ctx.next_value_id
+    let saved_moved_values = ctx.moved_values
 
     ctx.vars = Vec[VarType]::new()
     ctx.owned_vars = Vec[VarType]::new()
+    ctx.next_value_id = 0
+    ctx.moved_values = Vec[str]::new()
     ctx.loop_targets = Vec[LoopTargetType]::new()
     ctx.with_cleanups = Vec[VarType]::new()
     ctx.self_type = closure_type
@@ -7926,7 +8215,9 @@ fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, 
     for parameter in params {
         let typ = canonical_type(unwrap_type_or_usize(parameter.typ))
         ctx_add_var(ctx, parameter.name, typ)
-        ctx_add_owned_var(ctx, parameter.name, parameter.name, typ)
+        if !is_mutable_place_type(typ) {
+            ctx_add_owned_var(ctx, parameter.name, parameter.name, abi_parameter_type(typ))
+        }
     }
 
     let mut method = EhirTextBuilder::new()
@@ -7974,7 +8265,7 @@ fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, 
     let mut signature_params = Vec[str]::new()
     signature_params.push("self: " + closure_type)
     for parameter in params {
-        signature_params.push(parameter.name + ": " + canonical_type(unwrap_type_or_usize(parameter.typ)))
+        signature_params.push(parameter.name + ": " + abi_parameter_type(unwrap_type_or_usize(parameter.typ)))
     }
     let mut declaration = struct_builder
     declaration = declaration.line("impl " + signature.trait_name + " for " + closure_type + " {")
@@ -7997,10 +8288,12 @@ fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, 
     ctx.active_generics = saved_generics
     ctx.in_async_function = saved_async
     ctx.async_poll_future_type = saved_future
+    ctx.next_value_id = saved_value_id
+    ctx.moved_values = saved_moved_values
     ret declaration.finish()
 }
 
-fn closure_body_always_returns(body: ExprNode < H >) -> bool {
+fn closure_body_always_returns(body: ExprNode<H>) -> bool {
     match body.value {
         Expr::Block(block) => {
             ret block_always_returns(ParsedBlock::synthetic(block.statements))
@@ -8011,7 +8304,7 @@ fn closure_body_always_returns(body: ExprNode < H >) -> bool {
     ret false
 }
 
-fn collect_closure_captures_h(ctx: mut TranslatorContext, expr: ExprNode < H >, bound: mut Vec[str],
+fn collect_closure_captures_h(ctx: mut TranslatorContext, expr: ExprNode<H>, bound: mut Vec[str],
     captures: mut Vec[VarType],) ->() {
     match expr.value {
         Expr::Path(name) => {
@@ -8347,7 +8640,7 @@ fn remember_closure_capture(ctx: mut TranslatorContext, name: str, bound: Vec[st
     ret()
 }
 
-fn lower_try_expr(ctx: mut TranslatorContext, inner: ExprNode < H >, source_name: str, line: usize, column:
+fn lower_try_expr(ctx: mut TranslatorContext, inner: ExprNode<H>, source_name: str, line: usize, column:
     usize, prefix: str, idx: usize,) -> LoweredExpr {
     let tried = lower_expr_h(ctx, inner, prefix + "_try_value", idx + 1_usize)
     let result_type = canonical_type(tried.typ)
@@ -8689,7 +8982,7 @@ fn lower_decorator_target_call(ctx: mut TranslatorContext, call: CallExpr, sourc
     // compiler call in the target module so cross-package decorators cannot
     // accidentally emit an unmangled, undefined symbol.
     let target_source_name = ctx.decorator_target_source_name
-    let target_path = ExprNode < H > {
+    let target_path = ExprNode<H> {
         Expr::Path(ctx.decorator_target_name), line, column,
         ctx.decorator_target_name.len(), target_source_name
     }
@@ -8716,6 +9009,12 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         generic_args = generic_args_from_path(callee)
     }
     let has_explicit_generic_args = generic_args.len() > 0_usize
+    let constructor_owner = enum_constructor_owner(ctx, source_name, callee)
+    let constructor_payload = if constructor_owner == "" {
+        ""
+    } else {
+        enum_constructor_payload(ctx, constructor_owner, enum_variant_name(callee)).unwrap_or("")
+    }
     let out_name = prefix + "_call_" + Debug::fmt(idx)
     let mut code = EhirTextBuilder::new()
     let mut arg_values = Vec[str]::new()
@@ -8740,6 +9039,10 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
             Option[str]::None => {
             }
         }
+        if constructor_owner != "" && i == 0 && constructor_payload != "void" {
+            expected = constructor_payload
+            hint = constructor_payload
+        }
         let callee_scope = last_scope_index(callee_base)
         if i == 0_usize && callee_scope < callee_base.len() && hint == callee_base.slice(0_usize, callee_scope)
         {
@@ -8755,6 +9058,9 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         let mut lowered = if expects_borrowed {
             lower_borrowed_call_argument(ctx, arg,
                 prefix + "_arg_borrow_" + Debug::fmt(idx), idx + i + 1_usize, !borrows_self,)
+        } elif starts_with(hint, "mut ") && is_node_handle_type_text(capability_value_type(hint)) {
+            lower_mutable_node_argument(ctx, arg,
+                prefix + "_arg_node_" + Debug::fmt(idx), idx + i + 1_usize,)
         } elif starts_with(hint, "mut ") {
             lower_mutable_call_argument(ctx, arg,
                 prefix + "_arg_mut_" + Debug::fmt(idx), idx + i + 1_usize,)
@@ -8796,7 +9102,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         } elif borrowed_arg && !ends_with(canonical_type(expected), "&")
         && !(i == 0_usize && !spawning && ctx_function_borrows_self(ctx, callee_base))
         && ctx_type_needs_ownership(ctx, lowered.typ) {
-            code = code.instr("retain " + lowered.value + ": " + lowered.typ)
+            code = code.instr("retain " + lowered.value + ": " + capability_value_type(lowered.typ))
         }
         arg_values.push(lowered.value)
         arg_types.push(lowered.typ)
@@ -8805,8 +9111,8 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         arg_is_frozen.push(argument_is_frozen_now)
         arg_borrowed.push(borrowed_arg)
         if (!borrows_self || !borrowed_arg) &&
-        (!starts_with(lowered.typ, "mut ") || expects_borrowed) {
-            track_call_owner(ctx, call_owners, lowered.value, lowered.typ,
+        (!is_mutable_place_type(lowered.typ) || expects_borrowed) {
+            track_call_owner(ctx, call_owners, lowered.value, abi_parameter_type(lowered.typ),
                 borrows_self,
                 prefix + "_" + Debug::fmt(idx),)
         }
@@ -8929,7 +9235,14 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         }
     }
     if generic_args.len() == 0_usize && ctx.expression_hint != "" {
-        generic_args = infer_call_generic_args_from_return(ctx, semantic_dispatch_base, ctx.expression_hint)
+        match direct_function {
+            Some(function) => {
+                generic_args = infer_function_generic_args_from_return(function, ctx.expression_hint)
+            }
+            None => {
+                generic_args = infer_call_generic_args_from_return(ctx, semantic_dispatch_base, ctx.expression_hint)
+            }
+        }
     }
     let mut resolved_generic_args = Vec[str]::new()
     for generic_arg in generic_args {
@@ -8947,7 +9260,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
 
     match ctx_enum_variant_owner(ctx, source_name, callee) {
         Option[str]::Some(owner) => {
-            let mut canonical_owner = resolve_async_future_aliases(ctx, source_name, owner)
+            let mut canonical_owner = resolve_async_future_aliases(ctx, source_name, constructor_owner)
             if generic_args_from_path(canonical_owner).len() == 0_usize && ctx.expression_hint != ""
             {
                 if base_type_name(ctx.expression_hint) == base_type_name(canonical_owner) {
@@ -8955,6 +9268,27 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
                 }
             }
             let variant = enum_variant_name(callee)
+            match enum_constructor_payload(ctx, canonical_owner, variant) {
+                Some(expected) => {
+                    let count = if expected == "void" {
+                        0_usize
+                    } else {
+                        1_usize
+                    }
+                    if arg_types.len() != count {
+                        translation_error_at(source_name, line, column, "argument-mismatch",
+                            "enum variant '" + callee + "' expects " + Debug::fmt(count) + " payload argument(s)",)
+                    }
+                    if count == 1 && expected != "" && !function_type_matches(expected,
+                        arg_types.get(0).unwrap_or(""), Vec[str]::new(),) {
+                        translation_error_at(source_name, line, column, "argument-mismatch",
+                            "enum variant '" + callee + "' requires payload '" + expected +
+                            "', got '" + arg_types.get(0).unwrap_or("") + "'",)
+                    }
+                }
+                None => {
+                }
+            }
             // Unit has no SSA register. Preserve its type for enum lowering
             // instead of emitting an untyped reference to a register named void.
             if arg_types.len() == 1_usize {
@@ -9224,7 +9558,7 @@ fn translator_dispatch_type(ctx: mut TranslatorContext, expr: ExprNode) -> str {
             ret "bool"
         }
         Expr::Path(name) => {
-            ret ctx_lookup_var(ctx, name).unwrap_or("")
+            ret dispatch_value_type(ctx_lookup_var(ctx, name).unwrap_or(""))
         }
         Expr::Parenthesized(inner) => {
             ret translator_dispatch_type_h(ctx, inner)
@@ -9235,7 +9569,7 @@ fn translator_dispatch_type(ctx: mut TranslatorContext, expr: ExprNode) -> str {
     ret ""
 }
 
-fn translator_dispatch_type_h(ctx: mut TranslatorContext, expr: ExprNode < H >) -> str {
+fn translator_dispatch_type_h(ctx: mut TranslatorContext, expr: ExprNode<H>) -> str {
     match expr.value {
         Expr::Integer(value) => {
             ret if contains_substring(value, "_") {
@@ -9258,7 +9592,7 @@ fn translator_dispatch_type_h(ctx: mut TranslatorContext, expr: ExprNode < H >) 
             ret "bool"
         }
         Expr::Path(name) => {
-            ret ctx_lookup_var(ctx, name).unwrap_or("")
+            ret dispatch_value_type(ctx_lookup_var(ctx, name).unwrap_or(""))
         }
         Expr::Field(field_expr) => {
             let owner = translator_dispatch_type_h(ctx, field_expr.base)
@@ -9288,6 +9622,17 @@ fn translator_dispatch_type_h(ctx: mut TranslatorContext, expr: ExprNode < H >) 
         }
     }
     ret ""
+}
+
+// Internal rebind storage is not a source type. Preserve its write capability
+// while matching signatures so one node argument cannot erase another
+// parameter's mutable-place ABI.
+fn dispatch_value_type(typ: str) -> str {
+    ret if is_mutable_handle_slot(typ) {
+        "mut " + mutable_handle_slot_type(typ)
+    } else {
+        typ
+    }
 }
 
 fn translator_integer_type(typ: str) -> bool {
@@ -9459,7 +9804,13 @@ fn infer_function_generic_args(function: FunctionType, actual_types: Vec[str]) -
                 Option[str]::Some(template) => {
                     match actual_types.get(index) {
                         Option[str]::Some(actual) => {
-                            found = infer_generic_from_types(template, actual, generic)
+                            let candidate = infer_generic_from_types(template, actual, generic)
+                            if candidate != "" {
+                                if found != "" && found != candidate {
+                                    ret Vec[str]::new()
+                                }
+                                found = candidate
+                            }
                         }
                         Option[str]::None => {
                         }
@@ -9484,15 +9835,7 @@ Vec[str] {
         match ctx.functions.get(function_index) {
             Some(function) => {
                 if function.name == name && function.generics.len() > 0_usize {
-                    let mut inferred = Vec[str]::new()
-                    for generic in function.generics {
-                        let found = infer_generic_from_types(function.ret_type, actual_return, generic)
-                        if found == "" {
-                            ret Vec[str]::new()
-                        }
-                        inferred.push(found)
-                    }
-                    ret inferred
+                    ret infer_function_generic_args_from_return(function, actual_return)
                 }
             }
             None => {
@@ -9502,11 +9845,31 @@ Vec[str] {
     ret Vec[str]::new()
 }
 
+fn infer_function_generic_args_from_return(function: FunctionType, actual_return: str) -> Vec[str] {
+    let mut inferred = Vec[str]::new()
+    for generic in function.generics {
+        let found = infer_generic_from_types(function.ret_type, actual_return, generic)
+        if found == "" {
+            ret Vec[str]::new()
+        }
+        inferred.push(found)
+    }
+    ret inferred
+}
+
 fn infer_generic_from_types(template: str, actual: str, generic: str) -> str {
-    let canonical_template = canonical_type(template)
-    let canonical_actual = canonical_type(actual)
+    let canonical_template = capability_value_type(template)
+    let canonical_actual = capability_value_type(actual)
     if canonical_template == generic {
         ret canonical_actual
+    }
+    if !call_placement_matches(canonical_template, canonical_actual) {
+        ret ""
+    }
+    let payload_template = canonical_type(value_type_name(canonical_template))
+    let payload_actual = canonical_type(value_type_name(canonical_actual))
+    if payload_template == generic {
+        ret payload_actual
     }
     if base_type_name(canonical_template) != base_type_name(canonical_actual) {
         ret ""
@@ -9540,7 +9903,10 @@ fn load_mutable_value(value: LoweredExpr, out_name: str) -> LoweredExpr {
     if !starts_with(value.typ, "mut ") {
         ret value
     }
-    let typ = value_type_name(value.typ)
+    let typ = capability_value_type(value.typ)
+    if !is_mutable_place_type(value.typ) {
+        ret LoweredExpr { value.code, value.value, typ }
+    }
     let code = value.code.instr(out_name + ": " + typ + " = load " + value.value)
     ret LoweredExpr {
         code, out_name, typ
@@ -9640,7 +10006,7 @@ fn lower_expr_with_hint(ctx: mut TranslatorContext, expr: ExprNode, hint: str, p
     ret lowered
 }
 
-fn lower_expr_h_with_hint(ctx: mut TranslatorContext, expr: ExprNode < H >, hint: str, prefix: str, idx:
+fn lower_expr_h_with_hint(ctx: mut TranslatorContext, expr: ExprNode<H>, hint: str, prefix: str, idx:
     usize,) -> LoweredExpr {
     if hint != "" {
         match expr.value {
@@ -9694,20 +10060,32 @@ fn lower_expr_h_with_hint(ctx: mut TranslatorContext, expr: ExprNode < H >, hint
 }
 
 fn lower_integer_literal(value: str, typ: str, prefix: str, idx: usize) -> LoweredExpr {
+    let literal_type = if contains_substring(value, "_") || !is_numeric_type(typ) {
+        integer_literal_type(value)
+    } else {
+        typ
+    }
     let name = prefix + "_int_" + Debug::fmt(idx)
     let mut code = EhirTextBuilder::new()
-    code = code.instr(name + ": " + typ + " = capprim " + with_numeric_suffix(value, typ))
+    code = code.instr(name + ": " + literal_type + " = capprim " + with_numeric_suffix(value, literal_type))
     ret LoweredExpr {
-        code, name, typ
+        code, name, literal_type
     }
 }
 
 fn lower_float_literal(value: str, typ: str, prefix: str, idx: usize) -> LoweredExpr {
+    let literal_type = if contains_substring(value, "_") {
+        integer_literal_type(value)
+    } elif typ == "f32" || typ == "f64" {
+        typ
+    } else {
+        "f64"
+    }
     let name = prefix + "_float_" + Debug::fmt(idx)
     let mut code = EhirTextBuilder::new()
-    code = code.instr(name + ": " + typ + " = capprim " + with_numeric_suffix(value, typ))
+    code = code.instr(name + ": " + literal_type + " = capprim " + with_numeric_suffix(value, literal_type))
     ret LoweredExpr {
-        code, name, typ
+        code, name, literal_type
     }
 }
 
@@ -9773,10 +10151,16 @@ fn lower_tuple_literal_expr(ctx: mut TranslatorContext, tuple_expr: TupleLiteral
     let mut code = EhirTextBuilder::new()
     let mut values = Vec[str]::new()
     let mut types = Vec[str]::new()
+    let expected = canonical_type(ctx.expression_hint)
+    let hints = if starts_with(expected, "__tuple_") {
+        generic_args_from_path(expected)
+    } else {
+        Vec[str]::new()
+    }
     let mut i = 0_usize
     for item in tuple_expr.items {
         let borrowed_item = expr_is_borrowed_copy(item)
-        let lowered = lower_expr(ctx, item, prefix + "_tuple_item", idx + i + 1_usize)
+        let lowered = lower_expr_with_hint(ctx, item, hints.get(i).unwrap_or(""), prefix + "_tuple_item", idx + i + 1_usize)
         code = code.append(lowered.code)
         if borrowed_item && ctx_type_needs_ownership(ctx, lowered.typ) {
             code = code.instr("retain " + lowered.value + ": " + lowered.typ)
@@ -9807,8 +10191,14 @@ fn lower_array_literal_expr(ctx: mut TranslatorContext, array_expr: ArrayLiteral
     let mut values = Vec[str]::new()
     let mut item_type = "void"
     let mut count = 0_usize
+    let expected = canonical_type(ctx.expression_hint)
+    let hint = if starts_with(expected, "__array_") {
+        first_generic_type(expected)
+    } else {
+        ""
+    }
     for item in array_expr.items {
-        let lowered = lower_expr(ctx, item, prefix + "_array_item", idx + count + 1_usize)
+        let lowered = lower_expr_with_hint(ctx, item, hint, prefix + "_array_item", idx + count + 1_usize)
         code = code.append(lowered.code)
         if expr_is_borrowed_copy(item) && ctx_type_needs_ownership(ctx, lowered.typ) {
             code = code.instr("retain " + lowered.value + ": " + lowered.typ)
@@ -9839,8 +10229,13 @@ fn lower_vec_literal_expr(ctx: mut TranslatorContext, vec_expr: ArrayLiteralExpr
     let mut values = Vec[str]::new()
     let mut item_type = "void"
     let mut item_index = 0_usize
+    let hint = if leaf_type_name(base_type_name(ctx.expression_hint)) == "Vec" {
+        first_generic_type(ctx.expression_hint)
+    } else {
+        ""
+    }
     for item in vec_expr.items {
-        let lowered = lower_expr(ctx, item, prefix + "_vec_item", idx + item_index + 1_usize)
+        let lowered = lower_expr_with_hint(ctx, item, hint, prefix + "_vec_" + Debug::fmt(idx) + "_item", idx + item_index + 1_usize)
         code = code.append(lowered.code)
         // push consumes its value parameter, just like an ordinary call.
         // A literal element projected from existing storage needs a new owner.
@@ -9874,7 +10269,13 @@ fn lower_vec_literal_expr(ctx: mut TranslatorContext, vec_expr: ArrayLiteralExpr
 
 fn lower_array_repeat_expr(ctx: mut TranslatorContext, repeat_expr: ArrayRepeatExpr, prefix: str, idx:
     usize,) -> LoweredExpr {
-    let item = lower_expr_h(ctx, repeat_expr.value, prefix + "_array_repeat_item", idx + 1_usize)
+    let expected = canonical_type(ctx.expression_hint)
+    let hint = if starts_with(expected, "__array_") {
+        first_generic_type(expected)
+    } else {
+        ""
+    }
+    let item = lower_expr_h_with_hint(ctx, repeat_expr.value, hint, prefix + "_array_repeat_item", idx + 1_usize)
     let count = decimal_usize(numeric_literal_value(repeat_expr.size))
     let mut values = Vec[str]::new()
     let mut index = 0_usize
@@ -10003,7 +10404,11 @@ fn lower_index_expr(ctx: mut TranslatorContext, index_expr: IndexExpr, source_na
 }
 
 fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExpr, source_name: str,
-    line: usize, column: usize, prefix: str, idx: usize,) -> LoweredExpr {
+    line: usize, column: usize, parent_prefix: str, idx: usize,) -> LoweredExpr {
+    // Each invocation owns a disjoint namespace, including receiver lowering.
+    // Child expression indices overlap later statement indices by design.
+    let prefix = parent_prefix + "_invoke_" + Debug::fmt(ctx.next_value_id)
+    ctx.next_value_id += 1
     let receiver_path = expr_h_path_or_empty(method_call.receiver)
     let receiver_root = expr_h_frozen_root_path(method_call.receiver)
     let receiver = lower_method_receiver(ctx, method_call.receiver, prefix + "_recv", idx + 1_usize)
@@ -10051,8 +10456,9 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     }
     let borrowed_receiver = expr_h_is_borrowed_copy(method_call.receiver)
     let mut owner = method_owner_name(value_type_name(receiver.typ))
-    if starts_with(receiver.typ, "dyn ") {
-        owner = receiver.typ.slice(4_usize, receiver.typ.len() - 4_usize)
+    let receiver_value_type = capability_value_type(receiver.typ)
+    if starts_with(receiver_value_type, "dyn ") {
+        owner = method_owner_name(receiver_value_type.slice(4, receiver_value_type.len() - 4))
     }
     if owner == "Self" && ctx.self_type != "" {
         owner = method_owner_name(ctx.self_type)
@@ -10075,20 +10481,20 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
                     ret_type = canonical_type(found)
                 }
                 None => {
-                    if starts_with(receiver.typ, "dyn ") {
+                    if starts_with(receiver_value_type, "dyn ") {
                         match ctx_lookup_method_return(ctx, method_call.method) {
                             Some(found) => {
                                 ret_type = canonical_type(found)
                             }
                             None => {
-                                ret_type = canonical_type(method_return_type(receiver.typ, method_call.method,
+                                ret_type = canonical_type(method_return_type(receiver_value_type, method_call.method,
                                         source_name, line, column,))
                             }
                         }
                     } elif receiver.typ == "Iter" && method_call.method == "next" {
                         ret_type = "__tuple_2[Iter, Option[T]]"
                     } else {
-                        ret_type = canonical_type(method_return_type(receiver.typ, method_call.method,
+                        ret_type = canonical_type(method_return_type(receiver_value_type, method_call.method,
                                 source_name, line, column,))
                     }
                 }
@@ -10110,11 +10516,6 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     let mut receiver_uses_temporary_storage = false
     let mut receiver_expects_borrow = false
     let mut call_owners = Vec[CallOwner]::new()
-    let receiver_value_type = if starts_with(receiver.typ, "mut ") {
-        receiver.typ.slice(4_usize, receiver.typ.len() - 4_usize)
-    } else {
-        receiver.typ
-    }
     let mut receiver_param = ctx_lookup_function_param(ctx, source_name, fn_name, 0_usize, concrete_generics)
     match receiver_param {
         None => {
@@ -10139,8 +10540,7 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
                         base_type_name(concrete_receiver_type) + "<S>' or '" +
                         base_type_name(concrete_receiver_type) + "<H>' explicitly",)
                 }
-                if starts_with(receiver.typ, "mut ") &&
-                !ends_with(canonical_type(receiver.typ), "&") {
+                if is_mutable_place_type(receiver.typ) {
                     let loaded_receiver = prefix + "_recv_node_load_" + Debug::fmt(idx)
                     code = code.instr(loaded_receiver + ": " + concrete_receiver_type +
                         " = load " + receiver.value)
@@ -10157,9 +10557,9 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
                         receiver_value + ": " + concrete_receiver_type + ", " + erased_type,)
                     receiver_value = erased_receiver
                 }
-            } elif starts_with(receiver.typ, "mut ") && !starts_with(expected_self, "mut ") {
+            } elif is_mutable_place_type(receiver.typ) && !starts_with(expected_self, "mut ") {
                 let loaded_name = prefix + "_recv_load_" + Debug::fmt(idx)
-                code = code.instr(loaded_name + ": " + expected_self + " = load " + receiver.value)
+                code = code.instr(loaded_name + ": " + receiver_value_type + " = load " + receiver.value)
                 receiver_value = loaded_name
                 receiver_was_loaded = true
             } elif starts_with(expected_self, "mut ") && !starts_with(receiver.typ, "mut ") {
@@ -10186,9 +10586,9 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
             // have a source-level function signature in the context. A field
             // reached through a mutable aggregate is still a pointer and
             // must be loaded before calling a value method.
-            if starts_with(receiver.typ, "mut ") {
+            if is_mutable_place_type(receiver.typ) {
                 let loaded_name = prefix + "_recv_load_" + Debug::fmt(idx)
-                code = code.instr(loaded_name + ": " + value_type_name(receiver.typ) + " = load " + receiver.value)
+                code = code.instr(loaded_name + ": " + receiver_value_type + " = load " + receiver.value)
                 receiver_value = loaded_name
                 receiver_was_loaded = true
             }
@@ -10196,7 +10596,7 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     }
     if borrowed_receiver && !receiver_expects_borrow &&
     !ctx_function_borrows_self(ctx, fn_name) && !receiver_uses_temporary_storage
-    &&(receiver_was_loaded || !starts_with(receiver.typ, "mut ")) && ctx_type_needs_ownership(ctx, receiver_value_type)
+    &&(receiver_was_loaded || !is_mutable_place_type(receiver.typ)) && ctx_type_needs_ownership(ctx, receiver_value_type)
     {
         code = code.instr("retain " + receiver_value + ": " + receiver_value_type)
     }
@@ -10212,7 +10612,7 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         track_call_owner(ctx, call_owners, receiver_value, "mut " + receiver_value_type,
             true, prefix + "_" + Debug::fmt(idx),)
     } elif (!borrows_self || !borrowed_receiver) &&
-    (receiver_was_loaded || !starts_with(receiver.typ, "mut ") || receiver_expects_borrow) {
+    (receiver_was_loaded || !is_mutable_place_type(receiver.typ) || receiver_expects_borrow) {
         let cleanup_type = if receiver_expects_borrow {
             value_type_name(receiver.typ) + "&"
         } else {
@@ -10238,6 +10638,9 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         let lowered = if ends_with(canonical_type(expected), "&") {
             lower_borrowed_call_argument(ctx, arg,
                 prefix + "_method_arg_borrow_" + Debug::fmt(idx), idx + i + 2_usize, true,)
+        } elif starts_with(expected, "mut ") && is_node_handle_type_text(capability_value_type(expected)) {
+            lower_mutable_node_argument(ctx, arg,
+                prefix + "_method_arg_node_" + Debug::fmt(idx), idx + i + 2_usize,)
         } elif starts_with(expected, "mut ") {
             lower_mutable_call_argument(ctx, arg,
                 prefix + "_method_arg_mut_" + Debug::fmt(idx), idx + i + 2_usize,)
@@ -10271,10 +10674,10 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
             )
         }
         code = code.append(lowered.code)
-        if borrowed_arg && !starts_with(lowered.typ, "mut ") &&
+        if borrowed_arg && !is_mutable_place_type(lowered.typ) &&
         !ends_with(canonical_type(expected), "&") && ctx_type_needs_ownership(ctx, lowered.typ)
         {
-            code = code.instr("retain " + lowered.value + ": " + lowered.typ)
+            code = code.instr("retain " + lowered.value + ": " + capability_value_type(lowered.typ))
         }
         args.push(lowered.value)
         capability_types.push(lowered.typ)
@@ -10282,8 +10685,8 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         capability_roots.push(frozen_root)
         capability_frozen.push(argument_is_frozen_now)
         capability_borrowed.push(borrowed_arg)
-        if !starts_with(lowered.typ, "mut ") || ends_with(canonical_type(expected), "&") {
-            track_call_owner(ctx, call_owners, lowered.value, lowered.typ,
+        if !is_mutable_place_type(lowered.typ) || ends_with(canonical_type(expected), "&") {
+            track_call_owner(ctx, call_owners, lowered.value, abi_parameter_type(lowered.typ),
                 false, prefix + "_" + Debug::fmt(idx),)
         }
         i = i + 1_usize
@@ -10522,6 +10925,27 @@ fn validate_generic_call_bounds(ctx: mut TranslatorContext, name: str, args: Vec
     ret()
 }
 
+// A node argument copies an owning edge, not the caller's rebind storage.
+// Preserve its capability for validation while retaining the node's value ABI.
+fn lower_mutable_node_argument(ctx: mut TranslatorContext, expr: ExprNode,
+    prefix: str, idx: usize,) -> LoweredExpr {
+    let root = expr_frozen_root_path(expr)
+    if root != "" && !ctx_path_is_mutable(ctx, root) && !ctx_path_is_frozen(ctx, root) {
+        translation_error_at(expr.source_name, expr.line, expr.column,
+            "mutable-argument-required", "node argument requires a mutable path: '" + root + "'",)
+    }
+    let value = lower_expr(ctx, expr, prefix, idx)
+    if value.typ == "!" {
+        ret value
+    }
+    let typ = capability_value_type(value.typ)
+    if !is_node_handle_type_text(typ) {
+        translation_error_at(expr.source_name, expr.line, expr.column,
+            "node-handle-required", "mutable node parameter requires an owning node handle",)
+    }
+    ret LoweredExpr { value.code, value.value, "mut " + typ }
+}
+
 fn lower_mutable_call_argument(ctx: mut TranslatorContext, expr: ExprNode,
     prefix: str, idx: usize,) -> LoweredExpr {
     match expr.value {
@@ -10608,7 +11032,7 @@ fn lower_borrowed_call_argument(ctx: mut TranslatorContext, expr: ExprNode,
     }
 }
 
-fn lower_method_receiver(ctx: mut TranslatorContext, expr: ExprNode < H >, prefix: str, idx: usize) ->
+fn lower_method_receiver(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx: usize) ->
 LoweredExpr {
     match expr.value {
         Expr::Path(name) => {
@@ -10652,7 +11076,7 @@ LoweredExpr {
 // A call result is a value, even when its receiver is a mutable local. Only
 // projections that never cross a call preserve the original mutable place.
 // Frozen provenance has different rules and must not decide addressability.
-fn expr_h_is_mutable_place(ctx: mut TranslatorContext, expr: ExprNode < H >) -> bool {
+fn expr_h_is_mutable_place(ctx: mut TranslatorContext, expr: ExprNode<H>) -> bool {
     match expr.value {
         Expr::Path(name) => {
             ret ctx_path_is_mutable(ctx, name)
@@ -10674,7 +11098,7 @@ fn expr_h_is_mutable_place(ctx: mut TranslatorContext, expr: ExprNode < H >) -> 
 /// Every nested field remains a place, so a call such as
 /// `state.inner.values.push(value)` updates the original graph rather than a
 /// temporary copy.
-fn lower_mutable_place_h(ctx: mut TranslatorContext, expr: ExprNode < H >,
+fn lower_mutable_place_h(ctx: mut TranslatorContext, expr: ExprNode<H>,
     prefix: str, idx: usize,) -> LoweredExpr {
     match expr.value {
         Expr::Path(name) => {
@@ -10745,6 +11169,41 @@ fn lower_mutable_field_place(ctx: mut TranslatorContext, field_expr: FieldExpr,
     }
 }
 
+// Branch joins own exactly one selected value. EHIR cannot spell an address
+// to an owning handle (T<H>* would discard the handle's type constructor), so
+// spill its bits into scalar storage and transfer, rather than copy, that owner.
+fn branch_result_slot(builder: EhirTextBuilder, slot: str, typ: str) -> EhirTextBuilder {
+    let storage = if is_node_handle_type_text(typ) {
+        "usize"
+    } else {
+        typ
+    }
+    ret builder.instr(slot + ": " + storage + "* = salloc " + storage)
+}
+
+fn branch_result_store(ctx: mut TranslatorContext, builder: EhirTextBuilder,
+    slot: str, typ: str, value: LoweredExpr, prefix: str,) -> EhirTextBuilder {
+    if is_node_handle_type_text(typ) {
+        let bits = slot + "_from_" + prefix + "_result_bits"
+        ret builder.instr(bits + ": usize = pcast " + value.value + ": " + value.typ + ", usize")
+        .instr("store " + bits + ": usize, " + slot)
+    }
+    let mut out = builder.instr("store " + value.value + ", " + slot)
+    if ctx_type_needs_ownership(ctx, typ) {
+        out = out.instr("drop " + value.value + ": " + typ)
+    }
+    ret out
+}
+
+fn branch_result_load(builder: EhirTextBuilder, slot: str, name: str, typ: str) -> EhirTextBuilder {
+    if is_node_handle_type_text(typ) {
+        let bits = name + "_bits"
+        ret builder.instr(bits + ": usize = load " + slot)
+        .instr(name + ": " + typ + " = pcast " + bits + ": usize, " + typ)
+    }
+    ret builder.instr(name + ": " + typ + " = load " + slot)
+}
+
 fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, source_name: str, line: usize,
     column: usize, prefix: str, idx: usize,) -> LoweredExpr {
     let cond_borrowed = expr_h_is_borrowed_copy(match_expr.expr)
@@ -10757,11 +11216,12 @@ fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, source_na
     if cond_borrowed && ctx_type_needs_ownership(ctx, cond.typ) {
         builder = builder.instr("retain " + cond.value + ": " + cond.typ)
     }
-    builder = builder.instr(result_slot + ": " + result_type + "* = salloc " + result_type)
+    builder = branch_result_slot(builder, result_slot, result_type)
     let mut arm_idx = 0_usize
-    let outer_owned = ctx.owned_vars.len()
-
+    let mut moved = Vec[str]::new()
+    let mut exits = Vec[MatchScopeExit]::new()
     for arm in match_expr.arms {
+        let outer_bindings = save_translation_bindings(ctx)
         let body_label = prefix + "_match_expr_body_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx)
         let fail_label = prefix + "_match_expr_next_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx +
             1_usize)
@@ -10782,29 +11242,32 @@ fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, source_na
         let borrowed_result = expr_is_borrowed_copy(arm.expr)
         let lowered = lower_expr(ctx, arm.expr, prefix + "_match_expr_arm_" + Debug::fmt(idx) + "_" +
             Debug::fmt(arm_idx), idx + arm_idx + 1_usize,)
+        let mut arm_moves = Vec[str]::new()
+        collect_translation_moves(ctx, outer_bindings, arm_moves)
         builder = builder.append(lowered.code)
         if lowered.typ != "!" {
             if borrowed_result && ctx_type_needs_ownership(ctx, lowered.typ) {
                 builder = builder.instr("retain " + lowered.value + ": " + lowered.typ)
             }
-            builder = builder.instr("store " + lowered.value + ", " + result_slot)
-            if ctx_type_needs_ownership(ctx, result_type) {
-                builder = builder.instr("drop " + lowered.value + ": " + result_type)
-            }
-            builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", outer_owned)
-            builder = builder.instr("br $" + end_label)
+            builder = branch_result_store(ctx, builder, result_slot, result_type, lowered, body_label)
+            builder = append_translation_scope_drops(ctx, builder, outer_bindings, body_label + "_scope")
+            let exit_label = body_label + "_exit"
+            builder = builder.instr("br $" + exit_label)
+            exits.push(MatchScopeExit { exit_label, arm_moves })
         }
-        restore_owned_vars(ctx, outer_owned)
+        collect_translation_moves(ctx, outer_bindings, moved)
+        restore_translation_bindings(ctx, outer_bindings)
         builder = builder.label(fail_label)
         arm_idx = arm_idx + 1_usize
     }
-
     if ctx_type_needs_ownership(ctx, cond.typ) {
         builder = builder.instr("drop " + cond.value + ": " + cond.typ)
     }
     builder = builder.instr("br $" + end_label)
+    builder = append_match_scope_exits(ctx, builder, exits, moved, end_label)
+    apply_translation_moves(ctx, moved)
     builder = builder.label(end_label)
-    builder = builder.instr(result_name + ": " + result_type + " = load " + result_slot)
+    builder = branch_result_load(builder, result_slot, result_name, result_type)
     ret LoweredExpr {
         builder, result_name, result_type
     }
@@ -10817,78 +11280,154 @@ fn lower_if_expr(ctx: mut TranslatorContext, if_expr: IfExpr, prefix: str, idx: 
     let end_label = prefix + "_if_expr_end_" + Debug::fmt(idx)
     let result_type = infer_if_expr_result_type(ctx, if_expr)
     let mut builder = EhirTextBuilder::new()
-    builder = builder.instr(result_slot + ": " + result_type + "* = salloc " + result_type)
+    if result_type != "!" {
+        builder = branch_result_slot(builder, result_slot, result_type)
+    }
 
     let mut branch_idx = 0_usize
-    let outer_owned = ctx.owned_vars.len()
+    let mut moved = Vec[str]::new()
+    let mut exits = Vec[MatchScopeExit]::new()
     for branch in if_expr.branches {
         let then_label = prefix + "_if_expr_then_" + Debug::fmt(idx) + "_" + Debug::fmt(branch_idx)
         let next_label = prefix + "_if_expr_next_" + Debug::fmt(idx) + "_" + Debug::fmt(branch_idx)
         let cond_name = prefix + "_if_expr_cond_" + Debug::fmt(idx) + "_" + Debug::fmt(branch_idx)
         builder = builder.append(lower_cond(ctx, branch.condition, cond_name))
+        let bindings = save_translation_bindings(ctx)
         builder = builder.instr("cbr " + cond_name + ", $" + then_label + ", $" + next_label)
         builder = builder.label(then_label)
         let borrowed_result = expr_is_borrowed_copy(branch.body)
-        let lowered = lower_expr(ctx, branch.body, prefix + "_if_expr_body_" + Debug::fmt(branch_idx),
+        let lowered = lower_expr_with_hint(ctx, branch.body, result_type, prefix + "_if_expr_body_" + Debug::fmt(idx) + "_" + Debug::fmt(branch_idx),
             idx + branch_idx + 1_usize,)
         builder = builder.append(lowered.code)
         if canonical_type(lowered.typ) != "!" {
             if borrowed_result && ctx_type_needs_ownership(ctx, lowered.typ) {
                 builder = builder.instr("retain " + lowered.value + ": " + lowered.typ)
             }
-            builder = builder.instr("store " + lowered.value + ", " + result_slot)
-            if ctx_type_needs_ownership(ctx, result_type) {
-                builder = builder.instr("drop " + lowered.value + ": " + result_type)
-            }
-            builder = append_owned_drops_from(ctx, builder, "", then_label + "_scope", outer_owned)
-            builder = builder.instr("br $" + end_label)
+            builder = branch_result_store(ctx, builder, result_slot, result_type, lowered, then_label)
+            builder = append_translation_scope_drops(ctx, builder, bindings, then_label + "_scope")
+            let mut moves = Vec[str]::new()
+            collect_translation_moves(ctx, bindings, moves)
+            let exit_label = then_label + "_exit"
+            exits.push(MatchScopeExit { exit_label, moves })
+            builder = builder.instr("br $" + exit_label)
         }
-        restore_owned_vars(ctx, outer_owned)
+        collect_translation_moves(ctx, bindings, moved)
+        restore_translation_bindings(ctx, bindings)
         builder = builder.label(next_label)
         branch_idx = branch_idx + 1_usize
     }
 
+    let bindings = save_translation_bindings(ctx)
     let borrowed_else = expr_h_is_borrowed_copy(if_expr.else_body)
-    let else_lowered = lower_expr_h(ctx, if_expr.else_body, prefix + "_if_expr_else", idx + branch_idx
+    let else_lowered = lower_expr_h_with_hint(ctx, if_expr.else_body, result_type, prefix + "_if_expr_else_" + Debug::fmt(idx), idx + branch_idx
         + 1_usize,)
     builder = builder.append(else_lowered.code)
     if canonical_type(else_lowered.typ) != "!" {
         if borrowed_else && ctx_type_needs_ownership(ctx, else_lowered.typ) {
             builder = builder.instr("retain " + else_lowered.value + ": " + else_lowered.typ)
         }
-        builder = builder.instr("store " + else_lowered.value + ", " + result_slot)
-        if ctx_type_needs_ownership(ctx, result_type) {
-            builder = builder.instr("drop " + else_lowered.value + ": " + result_type)
-        }
-        builder = append_owned_drops_from(ctx, builder, "", prefix + "_if_expr_else_scope", outer_owned)
-        builder = builder.instr("br $" + end_label)
+        builder = branch_result_store(ctx, builder, result_slot, result_type, else_lowered,
+            prefix + "_if_expr_else",)
+        builder = append_translation_scope_drops(ctx, builder, bindings, prefix + "_if_expr_else_scope")
+        let mut moves = Vec[str]::new()
+        collect_translation_moves(ctx, bindings, moves)
+        let exit_label = prefix + "_if_expr_else_exit_" + Debug::fmt(idx)
+        exits.push(MatchScopeExit { exit_label, moves })
+        builder = builder.instr("br $" + exit_label)
     }
-    restore_owned_vars(ctx, outer_owned)
+    collect_translation_moves(ctx, bindings, moved)
+    restore_translation_bindings(ctx, bindings)
+    builder = append_match_scope_exits(ctx, builder, exits, moved, end_label)
+    apply_translation_moves(ctx, moved)
+    if exits.len() == 0 {
+        // Every branch returned, broke or continued. There is no incoming
+        // control-flow edge (or value) for a join, even with a numeric hint.
+        ret LoweredExpr { builder, "", "!" }
+    }
     builder = builder.label(end_label)
-    builder = builder.instr(result_name + ": " + result_type + " = load " + result_slot)
+    builder = branch_result_load(builder, result_slot, result_name, result_type)
     ret LoweredExpr {
         builder, result_name, result_type
     }
 }
 
 fn infer_if_expr_result_type(ctx: mut TranslatorContext, if_expr: IfExpr) -> str {
-    let owned_size = ctx.owned_vars.len()
+    if is_numeric_type(ctx.expression_hint) {
+        ret canonical_type(ctx.expression_hint)
+    }
+    let mut fallback = ""
     for branch in if_expr.branches {
+        let bindings = save_translation_bindings(ctx)
         let lowered = lower_expr(ctx, branch.body, "_if_type_probe", 0_usize)
         let typ = canonical_type(lowered.typ)
-        restore_owned_vars(ctx, owned_size)
+        restore_translation_bindings(ctx, bindings)
         if typ != "!" {
-            ret typ
+            if !branch_result_needs_numeric_context(branch.body.value) {
+                ret typ
+            }
+            if fallback == "" {
+                fallback = typ
+            }
         }
     }
+    let bindings = save_translation_bindings(ctx)
     let lowered_else = lower_expr_h(ctx, if_expr.else_body, "_if_type_probe_else", 0_usize)
     let typ = lowered_else.typ
-    restore_owned_vars(ctx, owned_size)
-    ret typ
+    restore_translation_bindings(ctx, bindings)
+    if typ != "!" && !branch_result_needs_numeric_context(if_expr.else_body.value) {
+        ret typ
+    }
+    ret if fallback != "" {
+        fallback
+    } else {
+        typ
+    }
+}
+
+// Unsuffixed literals must not fix a join type before a concrete sibling
+// branch is seen. Look through value-producing blocks and parentheses too.
+fn branch_result_needs_numeric_context(expr: Expr) -> bool {
+    match expr {
+        Expr::Integer(value) => {
+            ret !contains_substring(value, "_")
+        }
+        Expr::Float(value) => {
+            ret !contains_substring(value, "_")
+        }
+        Expr::Parenthesized(inner) => {
+            ret branch_result_needs_numeric_context(inner.value)
+        }
+        Expr::Unary(item) => {
+            ret(item.operator == "-" || item.operator == "+") &&
+            branch_result_needs_numeric_context(item.expr.value)
+        }
+        Expr::Block(block) => {
+            match block.tail {
+                Some(tail) => {
+                    ret branch_result_needs_numeric_context(tail.value)
+                }
+                None => {
+                    ret false
+                }
+            }
+        }
+        Expr::If(item) => {
+            for branch in item.branches {
+                if !branch_result_needs_numeric_context(branch.body.value) {
+                    ret false
+                }
+            }
+            ret branch_result_needs_numeric_context(item.else_body.value)
+        }
+        _ => {
+            ret false
+        }
+    }
 }
 
 fn lower_block_expr(ctx: mut TranslatorContext, block_expr: BlockExpr, prefix: str, idx: usize) -> LoweredExpr
 {
+    let bindings = save_translation_bindings(ctx)
     let mut builder = translate_statements_no_default(
         ctx,
         block_expr.statements,
@@ -10899,20 +11438,21 @@ fn lower_block_expr(ctx: mut TranslatorContext, block_expr: BlockExpr, prefix: s
     )
     for statement in block_expr.statements {
         if statement_terminates_flow(statement) {
+            finish_translation_scope(ctx, bindings)
             ret LoweredExpr {
                 builder, "", "!"
             }
         }
     }
     match block_expr.tail {
-        Option[ExprNode < H >]::Some(tail_expr) => {
+        Option[ExprNode<H>]::Some(tail_expr) => {
             let tail = lower_expr_h(ctx, tail_expr, prefix + "_block_tail", idx + 1_usize)
             builder = builder.append(tail.code)
-            ret LoweredExpr {
-                builder, tail.value, tail.typ
-            }
+            ret finish_expression_scope(ctx, bindings, LoweredExpr { builder, tail.value, tail.typ },
+                expr_h_is_borrowed_copy(tail_expr), prefix + "_block_scope")
         }
-        Option[ExprNode < H >]::None => {
+        Option[ExprNode<H>]::None => {
+            finish_translation_scope(ctx, bindings)
             ret LoweredExpr {
                 builder, "", "!"
             }
@@ -10922,23 +11462,40 @@ fn lower_block_expr(ctx: mut TranslatorContext, block_expr: BlockExpr, prefix: s
 
 fn lower_unsafe_expr(ctx: mut TranslatorContext, block: ParsedBlock, prefix: str, idx: usize) -> LoweredExpr
 {
+    let bindings = save_translation_bindings(ctx)
+    let lowered = lower_unsafe_expr_body(ctx, block, prefix, idx)
+    let mut borrowed = false
+    if block.statements.len() > 0 {
+        match block.statements.get(block.statements.len() - 1) {
+            Some(statement) => {
+                match statement {
+                    Statement::Expr(expr) => { borrowed = expr_is_borrowed_copy(expr) }
+                    _ => {}
+                }
+            }
+            None => {}
+        }
+    }
+    ret finish_expression_scope(ctx, bindings, lowered, borrowed, prefix + "_unsafe_scope")
+}
+
+fn lower_unsafe_expr_body(ctx: mut TranslatorContext, block: ParsedBlock, prefix: str, idx: usize) -> LoweredExpr
+{
     let mut builder = EhirTextBuilder::new()
     let mut stmt_index = 0_usize
     loop {
         match block.statements.get(stmt_index) {
             Option[Statement]::Some(stmt) => {
+                if statement_terminates_flow(stmt) {
+                    builder = builder.append(translate_statements_no_default(ctx, single_statement(stmt),
+                            ctx.return_type, prefix + "_unsafe_exit_" + Debug::fmt(stmt_index),
+                            Option[str]::None, Option[str]::None,))
+                    ret LoweredExpr { builder, "", "!" }
+                }
                 if stmt_index + 1_usize >= block.statements.len() {
                     match stmt {
                         Statement::Expr(expr_stmt) => {
                             let tail = lower_expr(ctx, expr_stmt, prefix + "_unsafe_tail", idx + stmt_index
-                                + 1_usize,)
-                            builder = builder.append(tail.code)
-                            ret LoweredExpr {
-                                builder, tail.value, tail.typ
-                            }
-                        }
-                        Statement::Ret(expr_stmt) => {
-                            let tail = lower_expr(ctx, expr_stmt, prefix + "_unsafe_ret", idx + stmt_index
                                 + 1_usize,)
                             builder = builder.append(tail.code)
                             ret LoweredExpr {
@@ -10952,7 +11509,7 @@ fn lower_unsafe_expr(ctx: mut TranslatorContext, block: ParsedBlock, prefix: str
                 builder = builder.append(translate_statements_no_default(
                         ctx,
                         single_statement(stmt),
-                        "void",
+                        ctx.return_type,
                         prefix + "_unsafe_stmt_" + Debug::fmt(stmt_index),
                         Option[str]::None,
                         Option[str]::None,
@@ -10977,13 +11534,13 @@ fn single_statement(stmt: Statement) -> Vec[Statement] {
 
 fn infer_match_expr_result_type(ctx: mut TranslatorContext, match_expr: MatchExpr, scrutinee_type: str,
     source_name: str, line: usize, column: usize,) -> str {
-    let owned_size = ctx.owned_vars.len()
     for arm in match_expr.arms {
+        let outer_bindings = save_translation_bindings(ctx)
         let _bindings = bind_match_payload(ctx, arm.pattern, "_match_type_probe_subject", scrutinee_type,
             source_name, line, column, "_match_type_probe_binding",)
         let lowered = lower_expr(ctx, arm.expr, "_match_type_probe", 0_usize)
         let typ = canonical_type(lowered.typ)
-        restore_owned_vars(ctx, owned_size)
+        restore_translation_bindings(ctx, outer_bindings)
         if typ != "!" {
             ret typ
         }
@@ -11134,7 +11691,7 @@ fn is_result_err_pattern(value: str) -> bool {
     ret false
 }
 
-fn expr_h_path_or_empty(expr: ExprNode < H >) -> str {
+fn expr_h_path_or_empty(expr: ExprNode<H>) -> str {
     match expr.value {
         Expr::Path(name) => {
             ret name
@@ -11182,9 +11739,11 @@ fn translate_match_stmt(
             "non-exhaustive-match", "non-exhaustive match for enum '" + base_type_name(cond.typ) + "'",)
     }
     let all_arms_terminate = match_stmt_terminates_flow(match_stmt)
-    let outer_owned = ctx.owned_vars.len()
     let mut arm_idx = 0_usize
+    let mut moved = Vec[str]::new()
+    let mut exits = Vec[MatchScopeExit]::new()
     for arm in match_stmt.arms {
+        let outer_bindings = save_translation_bindings(ctx)
         let body_label = prefix + "_match_body_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx)
         let fail_label = prefix + "_match_next_" + Debug::fmt(idx) + "_" + Debug::fmt(arm_idx + 1_usize)
         let is_last_arm = arm_idx + 1_usize == match_stmt.arms.len()
@@ -11218,18 +11777,22 @@ fn translate_match_stmt(
                 break_label,
                 continue_label,
             ))
+        let mut arm_moves = Vec[str]::new()
+        collect_translation_moves(ctx, outer_bindings, arm_moves)
         if !arm_returns && !arm_terminates {
-            builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", outer_owned)
-            builder = builder.instr("br $" + end_label)
+            builder = append_translation_scope_drops(ctx, builder, outer_bindings, body_label + "_scope")
+            let exit_label = body_label + "_exit"
+            builder = builder.instr("br $" + exit_label)
+            exits.push(MatchScopeExit { exit_label, arm_moves })
         }
-        restore_owned_vars(ctx, outer_owned)
+        collect_translation_moves(ctx, outer_bindings, moved)
+        restore_translation_bindings(ctx, outer_bindings)
         next_label = fail_label
         if !(is_exhaustive && is_last_arm) {
             builder = builder.label(next_label)
         }
         arm_idx = arm_idx + 1_usize
     }
-
     if !is_exhaustive {
         builder = builder.instr("; no pattern matched")
         if ctx_type_needs_ownership(ctx, cond.typ) {
@@ -11237,6 +11800,8 @@ fn translate_match_stmt(
         }
         builder = builder.instr("br $" + end_label)
     }
+    builder = append_match_scope_exits(ctx, builder, exits, moved, end_label)
+    apply_translation_moves(ctx, moved)
     if !(is_exhaustive && all_arms_terminate) {
         builder = builder.label(end_label)
     }
@@ -11276,124 +11841,10 @@ fn match_arm_always_returns(arm: ParsedMatchArm) -> bool {
     ret false
 }
 
-fn match_arm_terminates_flow(arm: ParsedMatchArm) -> bool {
-    match arm.body {
-        MatchArmBody::Block(block) => {
-            ret block_terminates_flow(block)
-        }
-        MatchArmBody::Expr(_) => {
-        }
-    }
-    ret false
-}
-
 fn block_always_returns(block: ParsedBlock) -> bool {
     for stmt in block.statements {
         if statement_terminates_flow(stmt) {
             ret statement_always_returns(stmt)
-        }
-    }
-    ret false
-}
-
-fn block_terminates_flow(block: ParsedBlock) -> bool {
-    for stmt in block.statements {
-        if statement_terminates_flow(stmt) {
-            ret true
-        }
-    }
-    ret false
-}
-
-fn statement_terminates_flow(stmt: Statement) -> bool {
-    match stmt {
-        Statement::Expr(expr) => {
-            ret expression_terminates_flow(expr.value)
-        }
-        Statement::Let(binding) => {
-            ret expression_terminates_flow(binding.expr.value)
-        }
-        Statement::Assignment(assignment) => {
-            ret expression_terminates_flow(assignment.expr.value)
-        }
-        Statement::Ret(_) => {
-            ret true
-        }
-        Statement::Break(_) => {
-            ret true
-        }
-        Statement::Continue(_) => {
-            ret true
-        }
-        Statement::Match(match_stmt) => {
-            ret match_stmt_terminates_flow(match_stmt)
-        }
-        Statement::If(if_stmt) => {
-            for branch in if_stmt.branches {
-                if !block_terminates_flow(branch.body) {
-                    ret false
-                }
-            }
-            match if_stmt.else_body {
-                Some(block) => {
-                    ret block_terminates_flow(block)
-                }
-                None => {
-                }
-            }
-        }
-        Statement::With(with_stmt) => {
-            ret block_terminates_flow(with_stmt.body)
-        }
-        Statement::Unsafe(block) => {
-            ret block_terminates_flow(block)
-        }
-        _ => {
-        }
-    }
-    ret false
-}
-
-// A call cannot complete when evaluating an operand leaves the enclosing
-// flow. In particular, do not synthesize a default return after an operand's
-// explicit return, or append dead stores after its cleanup edge.
-fn expression_terminates_flow(value: Expr) -> bool {
-    match value {
-        Expr::Call(call) => {
-            for argument in call.args {
-                if expression_terminates_flow(argument.value) {
-                    ret true
-                }
-            }
-        }
-        Expr::MethodCall(call) => {
-            if expression_terminates_flow(call.receiver.value) {
-                ret true
-            }
-            for argument in call.args {
-                if expression_terminates_flow(argument.value) {
-                    ret true
-                }
-            }
-        }
-        Expr::Block(block) => {
-            for statement in block.statements {
-                if statement_terminates_flow(statement) {
-                    ret true
-                }
-            }
-            match block.tail {
-                Some(tail) => {
-                    ret expression_terminates_flow(tail.value)
-                }
-                None => {
-                }
-            }
-        }
-        Expr::Parenthesized(inner) => {
-            ret expression_terminates_flow(inner.value)
-        }
-        _ => {
         }
     }
     ret false
@@ -11420,18 +11871,6 @@ fn statement_always_returns(stmt: Statement) -> bool {
         }
     }
     ret false
-}
-
-fn match_stmt_terminates_flow(match_stmt: MatchStmt) -> bool {
-    if match_stmt.arms.len() == 0_usize {
-        ret false
-    }
-    for arm in match_stmt.arms {
-        if !match_arm_terminates_flow(arm) {
-            ret false
-        }
-    }
-    ret true
 }
 
 fn match_stmt_always_returns(match_stmt: MatchStmt) -> bool {
@@ -11721,7 +12160,8 @@ fn translate_if_stmt(
 ) -> EhirTextBuilder {
     let else_label = prefix + "_if_else_" + Debug::fmt(idx)
     let end_label = prefix + "_if_end_" + Debug::fmt(idx)
-    let outer_owned = ctx.owned_vars.len()
+    let mut moved = Vec[str]::new()
+    let mut exits = Vec[MatchScopeExit]::new()
     let mut all_paths_terminate = false
     match if_stmt.else_body {
         Some(_) => {
@@ -11746,6 +12186,7 @@ fn translate_if_stmt(
                 }
                 let cond_name = prefix + "_if_cond_" + branch_suffix
                 builder = builder.append(lower_cond(ctx, branch.condition, cond_name))
+                let bindings = save_translation_bindings(ctx)
                 builder = builder.instr("cbr " + cond_name + ", $" + then_label + ", $" + next_label)
                 builder = builder.label(then_label)
                 let then_returns = block_always_returns(branch.body)
@@ -11762,12 +12203,17 @@ fn translate_if_stmt(
                         continue_label,
                     ))
                 if !then_returns && !then_terminates {
-                    builder = append_owned_drops_from(ctx, builder, "", then_label + "_scope", outer_owned)
+                    builder = append_translation_scope_drops(ctx, builder, bindings, then_label + "_scope")
                 }
                 if !then_terminates {
-                    builder = builder.instr("br $" + end_label)
+                    let mut moves = Vec[str]::new()
+                    collect_translation_moves(ctx, bindings, moves)
+                    let exit_label = then_label + "_exit"
+                    exits.push(MatchScopeExit { exit_label, moves })
+                    builder = builder.instr("br $" + exit_label)
                 }
-                restore_owned_vars(ctx, outer_owned)
+                collect_translation_moves(ctx, bindings, moved)
+                restore_translation_bindings(ctx, bindings)
                 builder = builder.label(next_label)
             }
             Option[IfBranch]::None => {
@@ -11781,6 +12227,7 @@ fn translate_if_stmt(
     }
     match if_stmt.else_body {
         Option[ParsedBlock]::Some(else_block) => {
+            let bindings = save_translation_bindings(ctx)
             let else_returns = block_always_returns(else_block)
             let else_terminates = block_terminates_flow(else_block)
             if !else_terminates {
@@ -11795,17 +12242,26 @@ fn translate_if_stmt(
                     continue_label,
                 ))
             if !else_returns && !else_terminates {
-                builder = append_owned_drops_from(ctx, builder, "", else_label + "_scope", outer_owned)
+                builder = append_translation_scope_drops(ctx, builder, bindings, else_label + "_scope")
             }
             if !else_terminates {
-                builder = builder.instr("br $" + end_label)
+                let mut moves = Vec[str]::new()
+                collect_translation_moves(ctx, bindings, moves)
+                let exit_label = else_label + "_exit"
+                exits.push(MatchScopeExit { exit_label, moves })
+                builder = builder.instr("br $" + exit_label)
             }
-            restore_owned_vars(ctx, outer_owned)
+            collect_translation_moves(ctx, bindings, moved)
+            restore_translation_bindings(ctx, bindings)
         }
         Option[ParsedBlock]::None => {
-            builder = builder.instr("br $" + end_label)
+            let exit_label = else_label + "_exit"
+            exits.push(MatchScopeExit { exit_label, Vec[str]::new() })
+            builder = builder.instr("br $" + exit_label)
         }
     }
+    builder = append_match_scope_exits(ctx, builder, exits, moved, end_label)
+    apply_translation_moves(ctx, moved)
     builder = builder.label(end_label)
     if all_paths_terminate {
         builder = builder.instr("unreachable")
@@ -11825,6 +12281,7 @@ fn translate_while_stmt(ctx: mut TranslatorContext, while_stmt: WhileStmt, ret_t
     builder = builder.instr("br $" + cond_label)
     builder = builder.label(cond_label)
     builder = builder.append(lower_cond(ctx, while_stmt.condition, cond_name))
+    let bindings = save_translation_bindings(ctx)
     builder = builder.instr("cbr " + cond_name + ", $" + body_label + ", $" + end_label)
     builder = builder.label(body_label)
     let loop_target_count = ctx.loop_targets.len()
@@ -11846,9 +12303,9 @@ fn translate_while_stmt(ctx: mut TranslatorContext, while_stmt: WhileStmt, ret_t
     }
     let body_terminates = block_terminates_flow(while_stmt.body)
     if !block_always_returns(while_stmt.body) && !body_terminates {
-        builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", outer_owned)
+        builder = append_translation_scope_drops(ctx, builder, bindings, body_label + "_scope")
     }
-    restore_owned_vars(ctx, outer_owned)
+    finish_translation_scope(ctx, bindings)
     if !body_terminates {
         builder = builder.instr("br $" + cond_label)
     }
@@ -11861,6 +12318,7 @@ fn translate_loop_stmt(ctx: mut TranslatorContext, loop_stmt: LoopStmt, ret_type
     let body_label = prefix + "_loop_body_" + Debug::fmt(idx)
     let end_label = prefix + "_loop_end_" + Debug::fmt(idx)
     let outer_owned = ctx.owned_vars.len()
+    let bindings = save_translation_bindings(ctx)
     let mut builder = EhirTextBuilder::new()
     builder = builder.instr("br $" + body_label)
     builder = builder.label(body_label)
@@ -11883,9 +12341,9 @@ fn translate_loop_stmt(ctx: mut TranslatorContext, loop_stmt: LoopStmt, ret_type
     }
     let body_terminates = block_terminates_flow(loop_stmt.body)
     if !block_always_returns(loop_stmt.body) && !body_terminates {
-        builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", outer_owned)
+        builder = append_translation_scope_drops(ctx, builder, bindings, body_label + "_scope")
     }
-    restore_owned_vars(ctx, outer_owned)
+    finish_translation_scope(ctx, bindings)
     if !body_terminates {
         builder = builder.instr("br $" + body_label)
     }
@@ -11900,6 +12358,7 @@ fn translate_do_while_stmt(ctx: mut TranslatorContext, do_stmt: DoWhileStmt, ret
     let end_label = prefix + "_do_end_" + Debug::fmt(idx)
     let cond_name = prefix + "_do_condv_" + Debug::fmt(idx)
     let outer_owned = ctx.owned_vars.len()
+    let bindings = save_translation_bindings(ctx)
     let mut builder = EhirTextBuilder::new()
     builder = builder.instr("br $" + body_label)
     builder = builder.label(body_label)
@@ -11922,9 +12381,9 @@ fn translate_do_while_stmt(ctx: mut TranslatorContext, do_stmt: DoWhileStmt, ret
     }
     let body_terminates = block_terminates_flow(do_stmt.body)
     if !block_always_returns(do_stmt.body) && !body_terminates {
-        builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", outer_owned)
+        builder = append_translation_scope_drops(ctx, builder, bindings, body_label + "_scope")
     }
-    restore_owned_vars(ctx, outer_owned)
+    finish_translation_scope(ctx, bindings)
     if !body_terminates {
         builder = builder.instr("br $" + cond_label)
     }
@@ -11971,6 +12430,7 @@ fn translate_with_stmt(ctx: mut TranslatorContext, with_stmt: WithStmt, ret_type
     }
     builder = builder.instr(resource_name + ": " + resource_type + " = call " + method_owner_name(resource_type)
         + "::with_enter(" + source.value + ")")
+    let bindings = save_translation_bindings(ctx)
     ctx_add_var_emitted(ctx, with_stmt.name, resource_name, resource_type)
     let cleanup_count = ctx.with_cleanups.len()
     ctx.with_cleanups.push(VarType {
@@ -11983,10 +12443,12 @@ fn translate_with_stmt(ctx: mut TranslatorContext, with_stmt: WithStmt, ret_type
     if !block_terminates_flow(with_stmt.body) {
         builder = builder.instr(prefix + "_with_exit_" + Debug::fmt(idx) + ": bool = call " + method_owner_name(resource_type)
             + "::with_exit(" + resource_name + ")")
+        builder = append_translation_scope_drops(ctx, builder, bindings, resource_name + "_scope")
     }
     while ctx.with_cleanups.len() > cleanup_count {
         ctx.with_cleanups.pop()
     }
+    finish_translation_scope(ctx, bindings)
     ret builder
 }
 
@@ -12002,7 +12464,7 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     let next_iter_name = iter_prefix + "_next_iter"
     let option_name = iter_prefix + "_option"
     let item_name = iter_prefix + "_item_" + for_stmt.name
-    let outer_owned = ctx.owned_vars.len()
+    let outer_bindings = save_translation_bindings(ctx)
 
     let borrowed_iterable = expr_is_borrowed_copy(for_stmt.iterable)
     let iterable = load_mutable_value(lower_expr(ctx, for_stmt.iterable, iter_prefix + "_source", idx),
@@ -12050,6 +12512,7 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
         ctx_add_owned_var(ctx, iter_prefix + "_iterator", iter_slot, "mut " + iter_type)
     }
     let body_owned = ctx.owned_vars.len()
+    let body_bindings = save_translation_bindings(ctx)
     builder = builder.instr("br $" + body_label)
     builder = builder.label(body_label)
     builder = builder.instr(iter_value_name + "_current: " + iter_type + " = load " + iter_slot)
@@ -12091,9 +12554,9 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     }
     let body_terminates = block_terminates_flow(for_stmt.body)
     if !block_always_returns(for_stmt.body) && !body_terminates {
-        builder = append_owned_drops_from(ctx, builder, "", body_label + "_scope", body_owned)
+        builder = append_translation_scope_drops(ctx, builder, body_bindings, body_label + "_scope")
     }
-    restore_owned_vars(ctx, body_owned)
+    finish_translation_scope(ctx, body_bindings)
     if !body_terminates {
         builder = builder.instr("br $" + body_label)
     }
@@ -12106,7 +12569,7 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     if ctx_type_needs_ownership(ctx, iter_type) {
         builder = builder.instr("drop " + final_iter_name + ": " + iter_type)
     }
-    restore_owned_vars(ctx, outer_owned)
+    finish_translation_scope(ctx, outer_bindings)
     ret builder
 }
 
@@ -12230,8 +12693,8 @@ fn translate_params_in_context(ctx: mut TranslatorContext, fn_item: FunctionItem
 
 fn abi_parameter_type(typ: str) -> str {
     let value = canonical_type(typ)
-    if starts_with(value, "mut ") && ends_with(value, "&") {
-        ret value.slice(4_usize, value.len() - 4_usize)
+    if starts_with(value, "mut ") && is_node_handle_type_text(capability_value_type(value)) {
+        ret capability_value_type(value)
     }
     ret value
 }
@@ -13056,7 +13519,7 @@ fn translator_aggregate_index_matches_reverse_scan_contract() -> bool {
             "struct Beta[T] { value: T }\nenum Choice[T] { First(T), Empty }\n"))
     let mut ctx = collect_context(ast, Vec[TranslationModule]::new(), host_target(), Vec[str]::new())
     ctx_add_field(ctx, StructFieldType {
-            "other::Alpha", "z", "u32*", "0"
+            "other::Alpha", "z", "u32*", "0", Vec[str]::new()
         }
         ,
     )
@@ -13189,6 +13652,43 @@ fn borrowed_method_return_contract() -> bool {
     let mut lexer = Lexer::new()
     let mut parser = Parser::new()
     let output = translate_to_ehir(parser.parse(lexer.tokenize(source)))
-    ret output.contains("call Store::peek(")
-    && output.contains("retain entry_let_method_1: Item")
+    let marker = ": Item = call Store::peek("
+    let mut call = 0_usize
+    while call + marker.byte_len() <= output.byte_len() &&
+    output.slice_bytes(call, marker.byte_len()) != marker {
+        call += 1
+    }
+    if call + marker.byte_len() > output.byte_len() {
+        eprintln(output) ret false
+    }
+    let mut start = call
+    while start > 0 && output.slice(start - 1, 1) != "\n" { start -= 1 }
+    let result = trim_spaces(output.slice(start, call - start))
+    ret result != "" && output.contains("retain " + result + ": Item")
+}
+
+#attr(test)
+fn translator_closure_declaration_scope_contract() -> bool {
+    let mut lexer = Lexer::new()
+    let mut library_parser = Parser::new_for_source("library@lib.enq")
+    let library = library_parser.parse(lexer.tokenize(
+            "pub struct Context { value: u32 }\npub trait Reader { fn evaluate(self: Self, context: mut Context&) -> Context<H> }"))
+    let mut consumer_parser = Parser::new_for_source("consumer@main.enq")
+    let consumer = consumer_parser.parse(lexer.tokenize("struct Context { value: str }"))
+    let mut modules = Vec[TranslationModule]::new()
+    modules.push(TranslationModule::new("library@lib.enq", "library@lib.enq", Vec[str]::new(), library, Vec[str]::new()))
+    modules.push(TranslationModule::new("consumer@main.enq", "consumer@main.enq", Vec[str]::new(), consumer, Vec[str]::new()))
+    let mut ast = Vec[Statement]::new()
+    for module in modules {
+        for statement in module.ast {
+            ast.push(statement)
+        }
+    }
+    let mut ctx = collect_context_with_abi(ast, modules, host_target(), Vec[str]::new(), true)
+    let owner = trait_identity_for_source(ctx, "library@lib.enq", "Reader")
+    let signature = closure_signature(ctx, "dyn " + owner, "consumer@main.enq", 1, 1)
+    let parameter = qualified_type_for_source(ctx, "library@lib.enq", "mut Context&")
+    let result = qualified_type_for_source(ctx, "library@lib.enq", "Context<H>")
+    ret signature.params.get(0).unwrap_or("") == parameter && signature.ret_type == result &&
+    parameter != qualified_type_for_source(ctx, "consumer@main.enq", "mut Context&")
 }

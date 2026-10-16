@@ -1,0 +1,180 @@
+//! Syntactic fallthrough analysis shared by type checking and EHIR lowering.
+//! Loop bodies and closure bodies are separate control-flow boundaries.
+import core::vec::Vec
+import refrain::frontend::parser::{Expr, MatchArmBody, MatchStmt, ParsedBlock, ParsedMatchArm, Statement}
+
+pub fn statements_terminate_flow(statements: Vec[Statement]) -> bool {
+    for statement in statements {
+        if statement_terminates_flow(statement) {
+            ret true
+        }
+    }
+    ret false
+}
+
+pub fn block_terminates_flow(block: ParsedBlock) -> bool {
+    ret statements_terminate_flow(block.statements)
+}
+
+pub fn statement_terminates_flow(statement: Statement) -> bool {
+    match statement {
+        Statement::Ret(_) => {
+            ret true
+        }
+        Statement::Break(_) => {
+            ret true
+        }
+        Statement::Continue(_) => {
+            ret true
+        }
+        Statement::Expr(value) => {
+            ret expression_terminates_flow(value.value)
+        }
+        Statement::Let(binding) => {
+            ret expression_terminates_flow(binding.expr.value)
+        }
+        Statement::Assignment(assignment) => {
+            ret expression_terminates_flow(assignment.expr.value)
+        }
+        Statement::Match(item) => {
+            ret match_stmt_terminates_flow(item)
+        }
+        Statement::If(item) => {
+            for branch in item.branches {
+                if !block_terminates_flow(branch.body) {
+                    ret false
+                }
+            }
+            match item.else_body {
+                Some(body) => {
+                    ret block_terminates_flow(body)
+                }
+                None => {
+                }
+            }
+        }
+        Statement::With(item) => {
+            ret expression_terminates_flow(item.expr.value) || block_terminates_flow(item.body)
+        }
+        Statement::Unsafe(body) => {
+            ret block_terminates_flow(body)
+        }
+        // A break/continue inside an inner loop does not leave this block.
+        // Likewise, declaring a function does not execute its body.
+        _ => {
+        }
+    }
+    ret false
+}
+
+pub fn match_arm_terminates_flow(arm: ParsedMatchArm) -> bool {
+    ret match arm.body {
+        MatchArmBody::Block(body) => block_terminates_flow(body)
+        MatchArmBody::Expr(value) => expression_terminates_flow(value.value)
+    }
+}
+
+pub fn match_stmt_terminates_flow(item: MatchStmt) -> bool {
+    if expression_terminates_flow(item.expr.value) {
+        ret true
+    }
+    if item.arms.len() == 0 {
+        ret false
+    }
+    for arm in item.arms {
+        if !match_arm_terminates_flow(arm) {
+            ret false
+        }
+    }
+    ret true
+}
+
+/// True only if evaluation cannot reach the expression's continuation.
+/// Short-circuit right operands and deferred closure/task bodies are not
+/// unconditionally evaluated and must not terminate their enclosing flow.
+pub fn expression_terminates_flow(value: Expr) -> bool {
+    match value {
+        Expr::Block(block) => {
+            if statements_terminate_flow(block.statements) {
+                ret true
+            }
+            match block.tail {
+                Some(tail) => {
+                    ret expression_terminates_flow(tail.value)
+                }
+                None => {
+                }
+            }
+        }
+        Expr::Parenthesized(inner) => {
+            ret expression_terminates_flow(inner.value)
+        }
+        Expr::Unsafe(body) => {
+            ret block_terminates_flow(body)
+        }
+        Expr::If(item) => {
+            for branch in item.branches {
+                if !expression_terminates_flow(branch.body.value) {
+                    ret false
+                }
+            }
+            ret expression_terminates_flow(item.else_body.value)
+        }
+        Expr::Match(item) => {
+            if expression_terminates_flow(item.expr.value) {
+                ret true
+            }
+            if item.arms.len() == 0 {
+                ret false
+            }
+            for arm in item.arms {
+                if !expression_terminates_flow(arm.expr.value) {
+                    ret false
+                }
+            }
+            ret true
+        }
+        Expr::Call(call) => {
+            for argument in call.args {
+                if expression_terminates_flow(argument.value) {
+                    ret true
+                }
+            }
+        }
+        Expr::MethodCall(call) => {
+            if expression_terminates_flow(call.receiver.value) {
+                ret true
+            }
+            for argument in call.args {
+                if expression_terminates_flow(argument.value) {
+                    ret true
+                }
+            }
+        }
+        Expr::Unary(item) => {
+            ret expression_terminates_flow(item.expr.value)
+        }
+        Expr::Cast(item) => {
+            ret expression_terminates_flow(item.expr.value)
+        }
+        Expr::Field(item) => {
+            ret expression_terminates_flow(item.base.value)
+        }
+        Expr::Index(item) => {
+            ret expression_terminates_flow(item.base.value) || expression_terminates_flow(item.index.value)
+        }
+        Expr::Binary(item) => {
+            ret expression_terminates_flow(item.lhs.value) ||
+            (item.operator != "&&" && item.operator != "||" && expression_terminates_flow(item.rhs.value))
+        }
+        Expr::Await(inner) => {
+            ret expression_terminates_flow(inner.value)
+        }
+        Expr::Try(inner) => {
+            ret expression_terminates_flow(inner.value)
+        }
+        _ => {
+        }
+    }
+    ret false
+}

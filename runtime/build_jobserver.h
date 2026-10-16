@@ -25,13 +25,12 @@
 #include <unistd.h>
 #endif
 
-#define ENCORE_JOBSERVER_MAGIC UINT64_C(0x454e434a4f425331)
+#define ENCORE_JOBSERVER_MAGIC UINT64_C(0x454e434a4f425332)
 #define ENCORE_JOBSERVER_MAX_JOBS 65536
 
 typedef struct encore_jobserver_slot {
     uint64_t pid;
     uint64_t leases;
-    uint64_t memory_bytes;
 } encore_jobserver_slot;
 
 typedef struct encore_jobserver_shared {
@@ -39,8 +38,6 @@ typedef struct encore_jobserver_shared {
     uint64_t coordinator_pid;
     uint64_t jobs;
     uint64_t slot_count;
-    uint64_t memory_budget;
-    uint64_t memory_reserved;
     uint64_t used;
     uint64_t cancelled;
     encore_jobserver_slot slots[];
@@ -111,23 +108,21 @@ static inline void encore_jobserver_unlock(encore_build_jobserver *server) {
 
 static inline void encore_jobserver_reclaim_dead(encore_jobserver_shared *shared) {
     /* A coordinator that died also invalidates admission, even if its numeric
-     * token count happened to be zero. Reaping a crashed worker releases every
-     * token and its RAM reservation together. */
+     * token count happened to be zero. Reaping a crashed worker releases all
+     * its tokens automatically. */
     if (!encore_jobserver_alive(shared->coordinator_pid)) shared->cancelled = 1;
-    uint64_t used = 0, memory_reserved = 0;
+    uint64_t used = 0;
     for (size_t index = 0; index < shared->slot_count; ++index) {
         encore_jobserver_slot *slot = &shared->slots[index];
         if (slot->pid == 0 || !encore_jobserver_alive(slot->pid)) {
             memset(slot, 0, sizeof(*slot));
         } else {
             used += slot->leases;
-            memory_reserved += slot->memory_bytes;
         }
     }
     /* Derive totals from live owners. A crash between two stores in a lease
-     * transaction cannot permanently strand a token or corrupt RAM totals. */
+     * transaction cannot permanently strand a token. */
     shared->used = used;
-    shared->memory_reserved = memory_reserved;
 }
 
 static inline void encore_jobserver_dispose(encore_build_jobserver *server) {
@@ -237,25 +232,21 @@ static inline encore_build_jobserver *encore_jobserver_open(const char *path, si
         valid = shared->magic == ENCORE_JOBSERVER_MAGIC && shared->jobs > 0
             && shared->jobs <= ENCORE_JOBSERVER_MAX_JOBS && shared->slot_count == 2 * shared->jobs + 1
             && server->map_size == sizeof(*shared) + shared->slot_count * sizeof(encore_jobserver_slot)
-            && shared->used <= shared->jobs && (shared->memory_budget == 0 ||
-                shared->memory_reserved <= shared->memory_budget);
+            && shared->used <= shared->jobs;
     }
     encore_jobserver_unlock(server);
     if (!valid) { encore_jobserver_dispose(server); return NULL; }
     return server;
 }
 
-static inline size_t encore_build_jobserver_create_path(const char *path, size_t jobs, uint64_t memory_budget) {
+static inline size_t encore_build_jobserver_create_path(const char *path, size_t jobs) {
     if (jobs == 0) return 0;
     encore_build_jobserver *server = encore_jobserver_open(path, jobs);
     if (server == NULL) return 0;
-    if (!encore_jobserver_lock(server)) { encore_jobserver_dispose(server); return 0; }
-    server->shared->memory_budget = memory_budget;
-    encore_jobserver_unlock(server);
     return (size_t)server;
 }
 
-static inline size_t encore_build_jobserver_attach_path(const char *path, uint64_t memory_bytes) {
+static inline size_t encore_build_jobserver_attach_path(const char *path) {
     encore_build_jobserver *server = encore_jobserver_open(path, 0);
     if (server == NULL) return 0;
     if (!encore_jobserver_lock(server)) { encore_jobserver_dispose(server); return 0; }
@@ -265,13 +256,10 @@ static inline size_t encore_build_jobserver_attach_path(const char *path, uint64
     for (size_t index = 0; index < shared->slot_count; ++index) {
         if (shared->slots[index].pid == encore_jobserver_pid()) already_attached = true;
     }
-    if (!already_attached && !shared->cancelled && memory_bytes <= UINT64_MAX - shared->memory_reserved && (shared->memory_budget == 0 ||
-        (shared->memory_reserved <= shared->memory_budget && memory_bytes <= shared->memory_budget - shared->memory_reserved))) {
+    if (!already_attached && !shared->cancelled) {
         for (size_t index = 1; index < shared->slot_count; ++index) {
             if (shared->slots[index].pid == 0) {
                 shared->slots[index].pid = encore_jobserver_pid();
-                shared->slots[index].memory_bytes = memory_bytes;
-                shared->memory_reserved += memory_bytes;
                 server->slot = index;
                 break;
             }
@@ -334,7 +322,6 @@ static inline void encore_build_jobserver_close(size_t raw_server) {
         encore_jobserver_slot *slot = &server->shared->slots[server->slot];
         if (slot->pid == encore_jobserver_pid()) {
             server->shared->used -= slot->leases;
-            server->shared->memory_reserved -= slot->memory_bytes;
             memset(slot, 0, sizeof(*slot));
         }
         if (server->coordinator) server->shared->cancelled = 1;

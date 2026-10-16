@@ -15,14 +15,14 @@ static int ci_read_response(int fd) {
 }
 
 typedef struct { pid_t pid; int command, response; } ci_child;
-static ci_child ci_job_child(const char *path, uint64_t memory, bool crash) {
+static ci_child ci_job_child(const char *path, bool crash) {
     int commands[2], responses[2];
     assert(pipe(commands) == 0 && pipe(responses) == 0);
     pid_t pid = fork();
     assert(pid >= 0);
     if (pid == 0) {
         close(commands[1]); close(responses[0]);
-        size_t handle = encore_build_jobserver_attach_path(path, memory);
+        size_t handle = encore_build_jobserver_attach_path(path);
         int response = handle == 0 ? -99 : encore_build_jobserver_try_acquire(handle);
         assert(write(responses[1], &response, sizeof(response)) == sizeof(response));
         if (crash) _exit(17);
@@ -54,16 +54,16 @@ int32_t encore_ci_jobserver(encore_compiler_str directory) {
     for (size_t index = 0; index < 4; ++index) {
         size_t jobs = budgets[index];
         snprintf(path, sizeof(path), "%s/jobs-%zu", root, jobs);
-        size_t server = encore_build_jobserver_create_path(path, jobs, 1000);
-        assert(server != 0 && !encore_build_jobserver_create_path(path, jobs, 1000));
+        size_t server = encore_build_jobserver_create_path(path, jobs);
+        assert(server != 0 && !encore_build_jobserver_create_path(path, jobs));
         assert(!encore_build_jobserver_release(server));
         ci_child workers[8];
         for (size_t worker = 0; worker < jobs; ++worker) {
-            workers[worker] = ci_job_child(path, 10, false);
+            workers[worker] = ci_job_child(path, false);
             assert(ci_read_response(workers[worker].response) == 1);
         }
         assert(encore_build_jobserver_used(server) == jobs);
-        ci_child extra = ci_job_child(path, 10, false);
+        ci_child extra = ci_job_child(path, false);
         assert(ci_read_response(extra.response) == 0);
         ci_finish(workers[jobs - 1], 'd', 0);
         assert(encore_build_jobserver_used(server) == jobs - 1);
@@ -72,7 +72,7 @@ int32_t encore_ci_jobserver(encore_compiler_str directory) {
         ci_finish(extra, 0, 0);
         for (size_t worker = 0; worker + 1 < jobs; ++worker) ci_finish(workers[worker], 'd', 0);
         assert(encore_build_jobserver_used(server) == 0);
-        ci_child crashed = ci_job_child(path, 10, true);
+        ci_child crashed = ci_job_child(path, true);
         assert(ci_read_response(crashed.response) == 1);
         ci_finish(crashed, 0, 17);
         assert(encore_build_jobserver_used(server) == 0);
@@ -82,48 +82,36 @@ int32_t encore_ci_jobserver(encore_compiler_str directory) {
         assert(!encore_build_jobserver_release(server));
         encore_build_jobserver_cancel(server);
         assert(encore_build_jobserver_try_acquire(server) == -1);
-        ci_child rejected = ci_job_child(path, 10, false);
+        ci_child rejected = ci_job_child(path, false);
         assert(ci_read_response(rejected.response) == -99);
         ci_finish(rejected, 'd', 0);
         encore_build_jobserver_close(server);
     }
-    snprintf(path, sizeof(path), "%s/ram", root);
-    size_t server = encore_build_jobserver_create_path(path, 2, 15);
-    ci_child first = ci_job_child(path, 10, false);
+    snprintf(path, sizeof(path), "%s/coordinator-close", root);
+    size_t server = encore_build_jobserver_create_path(path, 2);
+    ci_child first = ci_job_child(path, false);
     assert(ci_read_response(first.response) == 1);
-    ci_child refused = ci_job_child(path, 10, false);
-    assert(ci_read_response(refused.response) == -99);
-    ci_finish(refused, 'd', 0); ci_finish(first, 'd', 0);
-    ci_child recovered = ci_job_child(path, 10, false);
-    assert(ci_read_response(recovered.response) == 1);
+    ci_child second = ci_job_child(path, false);
+    assert(ci_read_response(second.response) == 1);
+    assert(encore_build_jobserver_used(server) == 2);
     encore_build_jobserver_close(server);
-    assert(write(recovered.command, "a", 1) == 1 && ci_read_response(recovered.response) == -1);
-    ci_finish(recovered, 0, 0);
+    assert(write(first.command, "a", 1) == 1 && ci_read_response(first.response) == -1);
+    ci_finish(first, 0, 0); ci_finish(second, 'd', 0);
     snprintf(path, sizeof(path), "%s/processes", root);
-    server = encore_build_jobserver_create_path(path, 1, 0);
-    first = ci_job_child(path, 10, false);
+    server = encore_build_jobserver_create_path(path, 1);
+    first = ci_job_child(path, false);
     assert(ci_read_response(first.response) == 1);
-    ci_child second = ci_job_child(path, 10, false);
+    second = ci_job_child(path, false);
     assert(ci_read_response(second.response) == 0);
-    refused = ci_job_child(path, 10, false);
+    ci_child refused = ci_job_child(path, false);
     assert(ci_read_response(refused.response) == -99);
     ci_finish(refused, 'd', 0); ci_finish(first, 'd', 0); ci_finish(second, 'd', 0);
     encore_build_jobserver_close(server);
-    snprintf(path, sizeof(path), "%s/overflow", root);
-    server = encore_build_jobserver_create_path(path, 2, 0);
-    first = ci_job_child(path, UINT64_MAX, false);
-    assert(ci_read_response(first.response) == 1);
-    refused = ci_job_child(path, 1, false);
-    assert(ci_read_response(refused.response) == -99);
-    ci_finish(refused, 'd', 0); ci_finish(first, 'd', 0);
-    recovered = ci_job_child(path, 1, false);
-    assert(ci_read_response(recovered.response) == 1); ci_finish(recovered, 'd', 0);
-    encore_build_jobserver_close(server);
     snprintf(path, sizeof(path), "%s/malformed", root);
     assert(encore_build_artifact_write(path, "bad", 3));
-    assert(!encore_build_jobserver_attach_path(path, 0));
+    assert(!encore_build_jobserver_attach_path(path));
     snprintf(path, sizeof(path), "%s/zero", root);
-    assert(!encore_build_jobserver_create_path(path, 0, 0));
+    assert(!encore_build_jobserver_create_path(path, 0));
     free(root); return 0;
 }
 
@@ -132,12 +120,13 @@ typedef struct { const char *path; unsigned char blobs[4][CI_BLOB_SIZE]; atomic_
 static void *ci_artifact_reader(void *raw) {
     ci_artifact_state *state = raw;
     do {
-        FILE *file = fopen(state->path, "rb"); assert(file != NULL);
-        unsigned char data[CI_BLOB_SIZE + 1];
-        assert(fread(data, 1, sizeof(data), file) == CI_BLOB_SIZE); fclose(file);
+        size_t length = 0;
+        char *data = encore_build_artifact_read(state->path, &length);
+        assert(data != NULL && length == CI_BLOB_SIZE);
         bool valid = false;
         for (size_t index = 0; index < 4; ++index) if (!memcmp(data, state->blobs[index], CI_BLOB_SIZE)) valid = true;
         assert(valid);
+        free(data);
     } while (atomic_load(&state->running));
     return NULL;
 }

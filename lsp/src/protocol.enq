@@ -1,0 +1,395 @@
+//! Implements JSON-RPC framing and reusable LSP response builders.
+
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+import core::vec::Vec
+
+import json::Json
+import json::ParseError
+import json::field
+import json::parse
+import json::stringify
+import mod::text::parse_usize
+import std::io::{stdin_fd, wait_readable}
+
+extern fn encore_io_read(fd: i32, max_bytes: usize) -> str
+extern fn encore_io_write(fd: i32, value: str) -> i32
+
+/// Incremental framing: a partial stdin header or body never blocks workers.
+pub struct LspInput {
+    buffer: str
+    content_length: Option[usize]
+    closed: bool
+}
+
+impl for LspInput {
+    pub fn new() -> Self {
+        ret Self {
+            "", Option[usize]::None, false
+        }
+    }
+
+    pub fn is_closed(self: Self) -> bool {
+        ret self.closed
+    }
+
+    pub fn next_message(self: mut Self, timeout_ms: usize) -> Option[Json] {
+        let mut reads = 0
+        loop {
+            if self.closed {
+                ret Option[Json]::None
+            }
+            if self.content_length.is_none() {
+                let mut end = 0
+                let mut index = 0
+                while index < self.buffer.byte_len() {
+                    if self.buffer.byte_at(index) == 10 {
+                        if index > 0 && self.buffer.byte_at(index - 1) == 10 {
+                            end = index + 1 break
+                        }
+                        if index > 2 && self.buffer.byte_at(index - 1) == 13
+                        && self.buffer.byte_at(index - 2) == 10 && self.buffer.byte_at(index - 3) == 13 {
+                            end = index + 1 break
+                        }
+                    }
+                    index += 1
+                }
+                if end > 16384 ||(end == 0 && self.buffer.byte_len() > 16384) {
+                    self.fail("LSP header exceeds 16 KiB") ret Option[Json]::None
+                }
+                if end > 0 {
+                    match frame_content_length(self.buffer.slice_bytes(0, end)) {
+                        Some(length) => {
+                            self.content_length = Option[usize]::Some(length)
+                            self.buffer = self.buffer.slice_bytes(end, self.buffer.byte_len() - end)
+                        }
+                        None => {
+                            self.fail("Invalid or missing Content-Length") ret Option[Json]::None
+                        }
+                    }
+                }
+            }
+            match self.content_length {
+                Some(length) => {
+                    if self.buffer.byte_len() >= length {
+                        let body = self.buffer.slice_bytes(0, length)
+                        self.buffer = self.buffer.slice_bytes(length, self.buffer.byte_len() - length)
+                        self.content_length = Option[usize]::None
+                        match parse(body) {
+                            Ok(message) => {
+                                ret Option[Json]::Some(message)
+                            }
+                            Err(error) => {
+                                send_protocol_error("-32700", "Parse error at "
+                                    + Debug::fmt(error.position()) + ": " + error.message(),)
+                            }
+                        }
+                        continue
+                    }
+                }
+                None => {
+                }
+            }
+            // Bound each turn even when a client floods stdin with partial data.
+            if reads >= 64 || !wait_readable(stdin_fd(), if reads == 0 {
+                    timeout_ms
+                } else {
+                    0
+                }
+                ,
+            ) {
+                ret Option[Json]::None
+            }
+            let chunk = read_stdin(65536)
+            if chunk.byte_len() == 0 {
+                self.closed = true ret Option[Json]::None
+            }
+            self.buffer += chunk
+            reads += 1
+        }
+        ret Option[Json]::None
+    }
+
+    fn fail(self: mut Self, message: str) ->() {
+        send_protocol_error("-32600", message)
+        self.buffer = ""
+        self.closed = true
+        ret()
+    }
+}
+
+fn frame_content_length(headers: str) -> Option[usize] {
+    let mut result = Option[usize]::None
+    let mut start = 0
+    let mut index = 0
+    while index < headers.byte_len() {
+        if headers.byte_at(index) == 10 {
+            let mut end = index
+            if end > start && headers.byte_at(end - 1) == 13 {
+                end -= 1
+            }
+            let line = headers.slice_bytes(start, end - start)
+            if line.range_eq_ignore_ascii_case(0, 15, "content-length:") {
+                if result.is_some() {
+                    ret Option[usize]::None
+                }
+                let mut cursor = 15
+                while cursor < line.byte_len() &&(line.byte_at(cursor) == 32 || line.byte_at(cursor) == 9) {
+                    cursor += 1
+                }
+                let mut value = 0
+                let mut digits = 0
+                while cursor < line.byte_len() && line.byte_at(cursor) >= 48 && line.byte_at(cursor) <= 57 {
+                    value = value * 10 +(line.byte_at(cursor) - 48) as usize
+                    if value > 16777216 {
+                        ret Option[usize]::None
+                    }
+                    digits += 1 cursor += 1
+                }
+                while cursor < line.byte_len() &&(line.byte_at(cursor) == 32 || line.byte_at(cursor) == 9) {
+                    cursor += 1
+                }
+                if digits == 0 || cursor != line.byte_len() {
+                    ret Option[usize]::None
+                }
+                result = Option[usize]::Some(value)
+            }
+            start = index + 1
+        }
+        index += 1
+    }
+    ret result
+}
+
+pub fn send_response(id: Json, result: Json) ->() {
+    if id.is_null() {
+        ret()
+    }
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("jsonrpc", Json::String("2.0")))
+    fields.push(field("id", id))
+    fields.push(field("result", result))
+    write_lsp_payload(Json::Object(fields))
+    ret()
+}
+
+pub fn send_error(id: Json, code: str, message: str) ->() {
+    if id.is_null() {
+        ret()
+    }
+    let mut error_fields = Vec[(str, Json)]::new()
+    error_fields.push(field("code", Json::Number(code)))
+    error_fields.push(field("message", Json::String(message)))
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("jsonrpc", Json::String("2.0")))
+    fields.push(field("id", id))
+    fields.push(field("error", Json::Object(error_fields)))
+    write_lsp_payload(Json::Object(fields))
+    ret()
+}
+
+fn send_protocol_error(code: str, message: str) ->() {
+    let mut error_fields = Vec[(str, Json)]::new()
+    error_fields.push(field("code", Json::Number(code)))
+    error_fields.push(field("message", Json::String(message)))
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("jsonrpc", Json::String("2.0")))
+    fields.push(field("id", Json::Null))
+    fields.push(field("error", Json::Object(error_fields)))
+    write_lsp_payload(Json::Object(fields))
+    ret()
+}
+
+pub fn send_notification(method: str, params: Json) ->() {
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("jsonrpc", Json::String("2.0")))
+    fields.push(field("method", Json::String(method)))
+    fields.push(field("params", params))
+    write_lsp_payload(Json::Object(fields))
+    ret()
+}
+
+pub fn send_request(id: str, method: str, params: Json) ->() {
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("jsonrpc", Json::String("2.0")))
+    fields.push(field("id", Json::String(id)))
+    fields.push(field("method", Json::String(method)))
+    fields.push(field("params", params))
+    write_lsp_payload(Json::Object(fields))
+    ret()
+}
+
+pub fn log_message(message: str) ->() {
+    let mut params = Vec[(str, Json)]::new()
+    params.push(field("type", Json::Number("1")))
+    params.push(field("message", Json::String(message)))
+    send_notification("window/logMessage", Json::Object(params))
+    ret()
+}
+
+pub fn json_get(value: Json, key: str) -> Json {
+    match value.get(key) {
+        Option[Json]::Some(found) => {
+            ret found
+        }
+        Option[Json]::None => {
+            ret Json::Null
+        }
+    }
+}
+
+pub fn json_get_str(value: Json, key: str, default: str) -> str {
+    match json_get(value, key).as_str() {
+        Option[str]::Some(text) => {
+            ret text
+        }
+        Option[str]::None => {
+            ret default
+        }
+    }
+}
+
+pub fn json_usize(value: usize) -> Json {
+    ret Json::Number(Debug::fmt(value))
+}
+
+pub fn json_number_usize(value: Json, default: usize) -> usize {
+    match value.as_number() {
+        Option[str]::Some(raw) => {
+            ret parse_usize(raw)
+        }
+        Option[str]::None => {
+            ret default
+        }
+    }
+}
+
+pub fn json_array_3(a: str, b: str, c: str) -> Json {
+    let mut values = Vec[Json]::new()
+    values.push(Json::String(a))
+    values.push(Json::String(b))
+    values.push(Json::String(c))
+    ret Json::Array(values)
+}
+
+pub fn json_array_4(a: str, b: str, c: str, d: str) -> Json {
+    let mut values = Vec[Json]::new()
+    values.push(Json::String(a))
+    values.push(Json::String(b))
+    values.push(Json::String(c))
+    values.push(Json::String(d))
+    ret Json::Array(values)
+}
+
+pub fn make_range(line: usize, column: usize, length: usize) -> Json {
+    ret range_between(line, column, line, column + length)
+}
+
+pub fn range_between(start_line: usize, start_character: usize, end_line: usize, end_character: usize)
+-> Json {
+    let mut start = Vec[(str, Json)]::new()
+    start.push(field("line", json_usize(start_line)))
+    start.push(field("character", json_usize(start_character)))
+
+    let mut end = Vec[(str, Json)]::new()
+    end.push(field("line", json_usize(end_line)))
+    end.push(field("character", json_usize(end_character)))
+
+    let mut range = Vec[(str, Json)]::new()
+    range.push(field("start", Json::Object(start)))
+    range.push(field("end", Json::Object(end)))
+    ret Json::Object(range)
+}
+
+pub fn location_json(uri: str, range: Json) -> Json {
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("uri", Json::String(uri)))
+    fields.push(field("range", range))
+    ret Json::Object(fields)
+}
+
+pub fn text_edit(range: Json, new_text: str) -> Json {
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("range", range))
+    fields.push(field("newText", Json::String(new_text)))
+    ret Json::Object(fields)
+}
+
+pub fn semantic_tokens_provider() -> Json {
+    let mut legend = Vec[(str, Json)]::new()
+    legend.push(field("tokenTypes", semantic_token_types()))
+    legend.push(field("tokenModifiers", semantic_token_modifiers()))
+
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("legend", Json::Object(legend)))
+    fields.push(field("full", Json::Bool(true)))
+    ret Json::Object(fields)
+}
+
+pub fn bool_provider(resolve_provider: bool) -> Json {
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("resolveProvider", Json::Bool(resolve_provider)))
+    ret Json::Object(fields)
+}
+
+pub fn rename_provider() -> Json {
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("prepareProvider", Json::Bool(true)))
+    ret Json::Object(fields)
+}
+
+pub fn signature_help_provider() -> Json {
+    let mut triggers = Vec[Json]::new()
+    triggers.push(Json::String("("))
+    triggers.push(Json::String(","))
+
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(field("triggerCharacters", Json::Array(triggers)))
+    ret Json::Object(fields)
+}
+
+fn write_lsp_payload(payload: Json) ->() {
+    let body = stringify(payload)
+    write_stdout("Content-Length: " + Debug::fmt(body.byte_len()) + "\r\n\r\n" + body)
+    ret()
+}
+
+fn read_stdin(max_bytes: usize) -> str {
+    unsafe {
+        ret encore_io_read(0_i32, max_bytes)
+    }
+}
+
+fn write_stdout(value: str) -> i32 {
+    unsafe {
+        ret encore_io_write(1_i32, value)
+    }
+}
+
+fn semantic_token_types() -> Json {
+    let mut values = Vec[Json]::new()
+    values.push(Json::String("keyword"))
+    values.push(Json::String("function"))
+    values.push(Json::String("type"))
+    values.push(Json::String("struct"))
+    values.push(Json::String("enum"))
+    values.push(Json::String("interface"))
+    values.push(Json::String("variable"))
+    values.push(Json::String("number"))
+    values.push(Json::String("string"))
+    values.push(Json::String("operator"))
+    values.push(Json::String("comment"))
+    values.push(Json::String("namespace"))
+    values.push(Json::String("parameter"))
+    values.push(Json::String("property"))
+    values.push(Json::String("method"))
+    ret Json::Array(values)
+}
+
+fn semantic_token_modifiers() -> Json {
+    let mut values = Vec[Json]::new()
+    values.push(Json::String("declaration"))
+    values.push(Json::String("definition"))
+    ret Json::Array(values)
+}

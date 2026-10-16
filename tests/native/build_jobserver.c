@@ -6,11 +6,11 @@
 #define EXPORT
 #endif
 
-EXPORT size_t test_jobserver_create(const char *path, size_t jobs, uint64_t memory) {
-    return encore_build_jobserver_create_path(path, jobs, memory);
+EXPORT size_t test_jobserver_create(const char *path, size_t jobs) {
+    return encore_build_jobserver_create_path(path, jobs);
 }
-EXPORT size_t test_jobserver_attach(const char *path, uint64_t memory) {
-    return encore_build_jobserver_attach_path(path, memory);
+EXPORT size_t test_jobserver_attach(const char *path) {
+    return encore_build_jobserver_attach_path(path);
 }
 EXPORT int test_jobserver_acquire(size_t server) {
     return encore_build_jobserver_try_acquire(server);

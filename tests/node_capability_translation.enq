@@ -1,0 +1,115 @@
+//! Node capabilities must not change value storage or ownership ABI.
+
+import ehirlib::{parse_module_text, prepare_module, PreparationOutcome}
+import refrain::frontend::lexer::Lexer
+import refrain::frontend::parser::Parser
+import refrain::frontend::translator::translate_to_ehir
+import std::io::eprintln
+
+fn valid_translation(name: str, source: str) -> bool {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source(name)
+    let output = translate_to_ehir(parser.parse(lexer.tokenize(source)))
+    match prepare_module(parse_module_text(name, output)) {
+        PreparationOutcome::Ready(_) => {
+            ret true
+        }
+        PreparationOutcome::Error(message) => {
+            eprintln(name + ": " + message)
+            ret false
+        }
+    }
+}
+
+fn main() -> u32 {
+    // #60: projected mutable dyn storage must load the actual dyn value,
+    // rather than treating the mutation capability as part of its trait name.
+    if !valid_translation("mutable-dyn-field",
+        "trait Value { fn evaluate(self: Self) -> u32 }\n" +
+        "struct Holder { value: u32 binding: dyn Value }\n" +
+        "impl for Holder { fn refresh(self: mut Self&) -> u32 {\n" +
+        "self.value = self.binding.evaluate() ret self.value } }\n" +
+        "struct Number {}\n" +
+        "impl Value for Number { fn evaluate(self: Self) -> u32 { ret 42 } }\n" +
+        "fn main() -> u32 { let mut holder = Holder<H>{0, Number{} as dyn Value}\n" +
+        "ret holder.refresh() }\n",) {
+        ret 1
+    }
+
+    // #61: a concrete mutable node parameter is an owning handle, not a
+    // pointer to a mutable inline parameter's storage.
+    if !valid_translation("mutable-node-parameter",
+        "struct Counter { value: u32 }\n" +
+        "fn read(counter: mut Counter<H>) -> u32 { ret counter.value }\n" +
+        "fn main() -> u32 { let mut counter = Counter<H>{42} ret read(counter) }\n",) {
+        ret 2
+    }
+
+    // #62: temporaries from consecutive and nested receiver conversions must
+    // have distinct names, even when their child-expression indices overlap.
+    if !valid_translation("chained-node-receivers",
+        "struct Boxed { value: u32 }\n" +
+        "impl for Boxed { fn read(self: Self&) -> u32 { ret self.value } }\n" +
+        "struct Leaf { boxed: Boxed<H> }\n" +
+        "impl for Leaf { fn boxed(self: Self&) -> Boxed<H> { ret self.boxed } }\n" +
+        "struct Holder[T] { leaf: Leaf<H> value: T }\n" +
+        "impl[T] for Holder[T] { fn read(self: mut Self&) -> u32 {\n" +
+        "let boxed = self.leaf.boxed() let value = boxed.read()\n" +
+        "ret value + self.leaf.boxed().read() } }\n" +
+        "fn main() -> u32 { let leaf = Leaf<H>{Boxed<H>{21}}\n" +
+        "let mut holder = Holder[u32]<H>{leaf, 0} ret holder.read() }\n",) {
+        ret 3
+    }
+
+    // #63: synthesized closure methods obey the same parameter and cleanup
+    // ABI as named methods, including an owning mutable erased node.
+    if !valid_translation("closure-mutable-node-parameter",
+        "struct Counter { value: u32 }\n" +
+        "trait Reader { fn read(self: Self, counter: mut Counter&) -> u32 }\n" +
+        "fn main() -> u32 { let mut counter = Counter<H>{42}\n" +
+        "let reader: dyn Reader = |value| value.value ret reader.read(counter) }\n",) {
+        ret 4
+    }
+
+    // #64: capture the owning node value, never the local scalar rebind slot.
+    // Rebinding the outer variable must not replace the captured graph edge.
+    if !valid_translation("closure-mutable-node-capture",
+        "struct Counter { value: u32 }\n" +
+        "trait Reader { fn read(self: Self, ignored: u32) -> u32 }\n" +
+        "fn main() -> u32 { let mut counter = Counter<H>{42}\n" +
+        "let reader: dyn Reader = |ignored| counter.value\n" +
+        "counter = Counter<H>{99} ret reader.read(0) }\n",) {
+        ret 5
+    }
+
+    if !valid_translation("closure-concrete-node-parameter",
+        "struct Counter { value: u32 }\n" +
+        "trait Reader { fn read(self: Self, counter: mut Counter<H>) -> u32 }\n" +
+        "fn main() -> u32 { let mut counter = Counter<H>{41}\n" +
+        "let reader: dyn Reader = |value| { value.value += 1 ret value.value }\n" +
+        "ret reader.read(counter) }\n",) {
+        ret 6
+    }
+
+    if !valid_translation("mutable-generic-dyn-field",
+        "trait Value[T] { fn evaluate(self: Self) -> T }\n" +
+        "struct Holder[T] { value: T binding: dyn Value[T] }\n" +
+        "impl[T] for Holder[T] { fn refresh(self: mut Self&) -> T {\n" +
+        "self.value = self.binding.evaluate() ret self.value } }\n" +
+        "struct Number {}\n" +
+        "impl Value[u32] for Number { fn evaluate(self: Self) -> u32 { ret 42 } }\n" +
+        "fn main() -> u32 { let mut holder = Holder[u32]<H>{0, Number{} as dyn Value[u32]}\n" +
+        "ret holder.refresh() }\n",) {
+        ret 7
+    }
+    if !valid_translation("copied-generic-dyn-field",
+        "trait Value[T] { fn evaluate(self: Self) -> T }\n" +
+        "struct Text { value: str }\n" +
+        "impl Value[str] for Text { fn evaluate(self: Self) -> str { ret self.value } }\n" +
+        "struct Holder[T] { binding: dyn Value[T] }\n" +
+        "fn main() -> u32 { let holder = Holder[str]{Text{\"example\"} as dyn Value[str]}\n" +
+        "let copy = holder.binding if copy.evaluate() != \"example\" { ret 1 } ret 0 }\n",) {
+        ret 8
+    }
+    ret 0
+}

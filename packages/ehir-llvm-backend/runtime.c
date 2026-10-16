@@ -1,0 +1,56 @@
+#include <stddef.h>
+#if defined(__linux__)
+#include <stdio.h>
+#include <unistd.h>
+#endif
+
+/* Every emission worker sets its target before touching layout or ABI code.
+ * A process-wide value races even when two otherwise independent modules are
+ * emitted for the same target: a host-width default must not leak into a
+ * worker, and concurrent cross-target compilations must remain isolated. */
+#if defined(_MSC_VER)
+#define ENCORE_CODEGEN_THREAD_LOCAL __declspec(thread)
+#else
+#define ENCORE_CODEGEN_THREAD_LOCAL _Thread_local
+#endif
+
+static ENCORE_CODEGEN_THREAD_LOCAL size_t encore_target_pointer_width = sizeof(void *) * 8u;
+static ENCORE_CODEGEN_THREAD_LOCAL size_t encore_windows_target = 0u;
+
+void encore_llvm_set_target_pointer_width(size_t bits) {
+    encore_target_pointer_width = bits == 32u ? 32u : 64u;
+}
+
+void encore_llvm_set_windows_target(size_t enabled) {
+    encore_windows_target = enabled != 0u;
+}
+
+size_t encore_llvm_is_windows_target(void) {
+    return encore_windows_target;
+}
+
+size_t encore_llvm_is_windows_host(void) {
+#if defined(_WIN32)
+    return 1u;
+#else
+    return 0u;
+#endif
+}
+
+size_t encore_llvm_target_pointer_width(void) {
+    return encore_target_pointer_width;
+}
+
+size_t encore_codegen_rss_kb(void) {
+#if defined(__linux__)
+    FILE *file = fopen("/proc/self/statm", "r");
+    unsigned long pages = 0;
+    unsigned long resident = 0;
+    if (file == NULL) return 0;
+    if (fscanf(file, "%lu %lu", &pages, &resident) != 2) resident = 0;
+    fclose(file);
+    return (size_t)(resident * (unsigned long)sysconf(_SC_PAGESIZE) / 1024ul);
+#else
+    return 0;
+#endif
+}

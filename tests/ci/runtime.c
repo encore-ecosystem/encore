@@ -58,11 +58,51 @@ uint64_t encore_ci_modified_ns(encore_compiler_str path) {
     free(name); return value;
 }
 
+#ifdef _WIN32
+static DWORD WINAPI ci_release_snapshot_lock(void *raw) {
+    Sleep(50);
+    CloseHandle((HANDLE)raw);
+    return 0;
+}
+#endif
+
+int32_t encore_ci_artifact_snapshot(encore_compiler_str directory) {
+    char *root = encore_compiler_cstr(directory);
+    if (root == NULL) return 1;
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/snapshot.ready", root);
+    free(root);
+    const char bytes[] = "{\"ready\":true}\0binary";
+    if (!encore_build_artifact_write(path, bytes, sizeof(bytes))) return 2;
+#ifdef _WIN32
+    wchar_t *wide = encore_build_artifact_wide(path);
+    HANDLE lock = CreateFileW(wide, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+    free(wide);
+    if (lock == INVALID_HANDLE_VALUE) return 3;
+    HANDLE thread = CreateThread(NULL, 0, ci_release_snapshot_lock, lock, 0, NULL);
+    if (thread == NULL) { CloseHandle(lock); return 4; }
+#endif
+    size_t length = 0;
+    char *snapshot = encore_build_artifact_read(path, &length);
+    bool valid = snapshot != NULL && length == sizeof(bytes) && memcmp(snapshot, bytes, sizeof(bytes)) == 0;
+    free(snapshot);
+#ifdef _WIN32
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+#endif
+    if (!valid) return 5;
+    if (!encore_build_artifact_write(path, NULL, 0)) return 6;
+    snapshot = encore_build_artifact_read(path, &length);
+    valid = snapshot != NULL && length == 0;
+    free(snapshot);
+    return valid ? 0 : 7;
+}
+
 #ifdef __linux__
 #include "../../../tests/native/build_contracts.c"
 #include "../../../tests/native/registry_server.c"
 #define main encore_ci_heap_main
-#include "../../../../encore-index/packages/core/tests/heap_capacity.c"
+#include "../../../packages/core/tests/heap_capacity.c"
 #undef main
 
 int32_t encore_ci_heap_capacity(int32_t mode) {
@@ -94,15 +134,12 @@ int32_t encore_ci_heap_capacity(int32_t mode) {
 }
 
 #define main encore_ci_environment_threads
-#include "../../../../encore-index/packages/platform/tests/environment_threads.c"
+#include "../../../packages/platform/tests/environment_threads.c"
 #undef main
 #define main encore_ci_build_queue
 #include "../../../tests/native/build_runtime.c"
 #undef main
 #define main encore_ci_build_identity
 #include "../../../tests/native/build_identity.c"
-#undef main
-#define main encore_ci_build_resources
-#include "../../../tests/native/build_resources.c"
 #undef main
 #endif

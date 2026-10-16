@@ -16,6 +16,7 @@ import std::time::perf_counter_ms
 import std::vec::Vec
 
 import mod::build::compile_test_ast
+import refrain::cache_identity::compiler_content_digest
 import refrain::diagnostics::render_diagnostic
 import refrain::frontend::parser::statements::FunctionItem
 import refrain::frontend::{Lexer, Parser, Statement}
@@ -80,7 +81,8 @@ pub fn native_test() -> u32 {
                 ret 1_u32
             }
         }
-        let failure = compile_and_run_result(root, worker_workspace, worker_workspace.flat_ast, "worker:" + path.as_str())
+        let failure = compile_and_run_result(root, worker_workspace, worker_workspace.flat_ast,
+            unit_test_relative_path(root.as_str(), path.as_str()),)
         if failure == "" {
             ret 0_u32
         }
@@ -637,7 +639,7 @@ fn prepare_unit_test_harness(root: Path) -> str {
 
 fn run_unit_test_isolated(root: Path, job: UnitTestJob) -> str {
     let display = job.display
-    let output_path = root.join("target").join("tests").join(sanitize(display) + ".output.txt")
+    let output_path = root.join("target").join("tests").join(test_artifact_key(display) + ".output.txt")
     mkdir_all(root.join("target").join("tests").as_str())
     let executable = root.join("target").join("tests").join("bin").join(
         target_executable_name(host_target(), "__encore_unit_harness")).as_str()
@@ -731,7 +733,7 @@ fn run_unit_test_batch(root: frozen Path, jobs: frozen Vec[UnitTestJob], harness
 
 fn run_standalone_test(root: Path, path: Path, display: str) -> str {
     let expected = expected_compile_error(read_file(path.as_str()))
-    let output_path = root.join("target").join("tests").join(sanitize(display) + ".output.txt")
+    let output_path = root.join("target").join("tests").join(test_artifact_key(display) + ".output.txt")
     mkdir_all(root.join("target").join("tests").as_str())
     let executable = arg_or(0_usize, "encore")
     let mut args = Vec[str]::new()
@@ -878,7 +880,7 @@ fn format_test_duration(milliseconds: u64) -> str {
 }
 
 fn compile_and_run_result(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], display: str) -> str {
-    let name = sanitize(display)
+    let name = test_artifact_key(display)
     if compile_test_ast(root, workspace, ast, name) != 0_u32 {
         ret "compile failed"
     }
@@ -888,6 +890,24 @@ fn compile_and_run_result(root: Path, workspace: ProjectWorkspace, ast: Vec[Stat
         ret ""
     }
     ret "process exited with code " + Debug::fmt(code)
+}
+
+// A source path is a test identity, not a safe native filename. In particular,
+// repeating an absolute Windows path under target/tests exceeded MAX_PATH in
+// nested projects. Hash the normalized relative identity without truncating it:
+// punctuation, case and equal basenames in different directories stay distinct.
+fn test_artifact_key(display: str) -> str {
+    ret "test-" + compiler_content_digest(unit_test_path_separators(display))
+}
+
+#attr(test)
+fn test_artifact_key_contract() -> bool {
+    let first = test_artifact_key("tests/one/native.enq")
+    ret first.len() == 69 && first == test_artifact_key("tests\\one\\native.enq") &&
+    first != test_artifact_key("tests/two/native.enq") &&
+    first != test_artifact_key("tests/one/Native.enq") &&
+    test_artifact_key("tests/a-b.enq") != test_artifact_key("tests/a_b.enq") &&
+    test_artifact_key("tests/a/very/long/nested/path/that/must/not/appear/in/the/native/filename.enq").len() == 69
 }
 
 fn dependency_ast(workspace: ProjectWorkspace) -> Vec[Statement] {
@@ -1016,7 +1036,8 @@ fn summarize_output(value: str) -> str {
         let mut marker_index = 0_usize
         let mut error_index = value.len()
         while marker_index + marker.len() <= value.len() {
-            if value.slice(marker_index, marker.len()) == marker {
+            if value.slice(marker_index, marker.len()) == marker ||
+            value.slice(marker_index, marker.len()) == "error[" {
                 error_index = marker_index
             }
             marker_index = marker_index + 1_usize
@@ -1070,27 +1091,18 @@ fn summarize_output(value: str) -> str {
     ret out
 }
 
-fn sanitize(value: str) -> str {
-    let mut out = ""
-    let mut index = 0_usize
-    while index < value.len() {
-        let ch = value.slice(index, 1_usize)
-        if is_alnum(ch) {
-            out = out + ch
-        } else {
-            out = out + "_"
-        }
-        index = index + 1_usize
+#attr(test)
+fn test_summary_preserves_structured_diagnostic_contract() -> bool {
+    let mut path = ""
+    while path.len() < 180 {
+        path += "long-workspace-directory/"
     }
-    ret out
+    let output = path + "catalog.enq:2:65: error[parse-error]: expected FAT_ARROW, found |\n" +
+    "source excerpt and labels\ncompile failed\n"
+    let summary = summarize_output(output)
+    ret summary.contains("error[parse-error]") && summary.contains("expected FAT_ARROW")
 }
-fn is_alnum(ch: str) -> bool {
-    if ch.len() == 0_usize {
-        ret false
-    }
-    let value = ch.byte_at(0_usize)
-    ret(value >= 97_u8 && value <= 122_u8) ||(value >= 65_u8 && value <= 90_u8) ||(value >= 48_u8 && value <= 57_u8)
-}
+
 fn contains(value: str, needle: str) -> bool {
     let mut index = 0_usize
     while index + needle.len() <= value.len() {

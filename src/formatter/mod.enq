@@ -2,9 +2,8 @@
 
 import std::vec::Vec
 
-import refrain::frontend::analysis::analyze_named_editor_module
-import refrain::frontend::parser::Statement
-import refrain::frontend::{FrontendDiagnostic, SyntaxDocument, Token, TokenType, analyze_source_lightweight}
+import refrain::frontend::parser::{Parser, SourceLayoutRole, SourceLayoutToken}
+import refrain::frontend::{FrontendDiagnostic, Lexer, SyntaxDocument, Token, TokenType, analyze_source_lightweight}
 
 /// Controls deterministic Encore source formatting.
 pub struct FormatConfig {
@@ -292,6 +291,11 @@ pub fn format_syntax(syntax: SyntaxDocument, diagnostics: Vec[FrontendDiagnostic
     let working_syntax = SyntaxDocument::parse(working_source)
     let mut layout_tokens = normalize_trailing_commas(working_syntax.lossless_tokens(), effective)
     let mut formatted = format_tokens(layout_tokens, effective, working_source)
+    // Validate each render before lexing its output as the next pass's input.
+    // Otherwise stabilization can replace the baseline and hide a token merge.
+    if !same_significant_tokens(layout_tokens, SyntaxDocument::parse(formatted).lossless_tokens()) {
+        ret formatter_invariant_result(source)
+    }
     // A multiline grouped import becomes one logical line above. Reorder once
     // more on that canonical representation so the first formatter pass is
     // already a fixed point.
@@ -301,6 +305,9 @@ pub fn format_syntax(syntax: SyntaxDocument, diagnostics: Vec[FrontendDiagnostic
             let canonical_syntax = SyntaxDocument::parse(canonical_imports)
             layout_tokens = normalize_trailing_commas(canonical_syntax.lossless_tokens(), effective)
             formatted = format_tokens(layout_tokens, effective, canonical_imports)
+            if !same_significant_tokens(layout_tokens, SyntaxDocument::parse(formatted).lossless_tokens()) {
+                ret formatter_invariant_result(source)
+            }
         }
     }
     // Rendering may introduce a line break at the configured width, turning a
@@ -316,16 +323,17 @@ pub fn format_syntax(syntax: SyntaxDocument, diagnostics: Vec[FrontendDiagnostic
     }
     let formatted_syntax = SyntaxDocument::parse(formatted)
     if !same_significant_tokens(layout_tokens, formatted_syntax.lossless_tokens()) {
-        let mut invariant = Vec[FrontendDiagnostic]::new()
-        invariant.push(FrontendDiagnostic::new(1_usize, "formatter-invariant", "formatting changed the significant token stream",
-                0_usize, 0_usize, 1_usize,))
-        ret FormatResult {
-            source, false, invariant
-        }
+        ret formatter_invariant_result(source)
     }
     ret FormatResult {
         formatted, formatted != source, Vec[FrontendDiagnostic]::new()
     }
+}
+
+fn formatter_invariant_result(source: str) -> FormatResult {
+    let mut diagnostics = Vec[FrontendDiagnostic]::new()
+    diagnostics.push(FrontendDiagnostic::new(1, "formatter-invariant", "formatting changed the significant token stream", 0, 0, 1))
+    ret FormatResult { source, false, diagnostics }
 }
 
 fn formatter_syntax_diagnostics(diagnostics: Vec[FrontendDiagnostic]) -> Vec[FrontendDiagnostic] {
@@ -342,19 +350,65 @@ fn formatter_syntax_diagnostics(diagnostics: Vec[FrontendDiagnostic]) -> Vec[Fro
 fn format_tokens(tokens: Vec[Token], config: FormatConfig, source: str) -> str {
     let mut state = FormatState::new()
     let mut source_breaks = 0_usize
-    let fields = struct_field_positions(tokens, source)
-    let mut field_index = 0_usize
+    let layout = source_layout_tokens(source)
+    let mut layout_index = 0_usize
+    let mut token_index = 0_usize
+    let mut previous_role = SourceLayoutRole::Ordinary
+    let mut placement_is_generic = false
+    let mut inline_braces = Vec[bool]::new()
 
     for token in tokens {
-        match fields.get(field_index) {
-            Some(position) => {
-                if token.line == position.0 && token.column == position.1 {
-                    state.request_break(1)
-                    field_index += 1
+        let current_index = token_index
+        token_index += 1
+        let mut role = SourceLayoutRole::Ordinary
+        while layout_index < layout.len() {
+            match layout.get(layout_index) {
+                Some(position) => {
+                    if position.line > token.line ||(position.line == token.line && position.column > token.column) {
+                        break
+                    }
+                    layout_index += 1
+                    if token.line == position.line && token.column == position.column {
+                        role = position.role
+                        break
+                    }
+                }
+                None => {
+                    break
                 }
             }
-            None => {
+        }
+        if role == SourceLayoutRole::FieldStart || role == SourceLayoutRole::EnumVariantStart {
+            state.request_break(1)
+        } elif role == SourceLayoutRole::ImplStart {
+            state.request_break(2)
+        }
+        let preceding_role = previous_role
+        if !trivia(token.type) {
+            previous_role = role
+        }
+        if role == SourceLayoutRole::PlacementOpen || role == SourceLayoutRole::PlacementName
+        || role == SourceLayoutRole::PlacementClose || role == SourceLayoutRole::TypeSuffix {
+            if role == SourceLayoutRole::PlacementOpen {
+                placement_is_generic = state.has_previous && state.previous == TokenType::RIGHT_BRACKET
             }
+            if token.type == TokenType::ASTERISK && state.has_previous && state.previous == TokenType::ASTERISK {
+                // Two pointer suffix tokens must not become the power operator.
+                state.request_space()
+            } else {
+                state.trim_space()
+            }
+            state.write(token.value, config)
+            state.remember(token.type)
+            continue
+        }
+        if role == SourceLayoutRole::TypePrefix {
+            state.write(token.value, config)
+            state.remember(token.type)
+            continue
+        }
+        if preceding_role == SourceLayoutRole::TypePrefix && !trivia(token.type) {
+            state.trim_space()
         }
         // EOF carries a cursor position, not printable source. Flushing pending
         // line breaks for its empty value would grow trailing blank lines.
@@ -412,12 +466,21 @@ fn format_tokens(tokens: Vec[Token], config: FormatConfig, source: str) -> str {
                 state.grouped_import_depth += 1_usize
                 state.remember(token.type)
                 continue
+            }
+            let inline = role == SourceLayoutRole::ConstructorOpen && inline_constructor(tokens, current_index, config)
+            inline_braces.push(inline)
+            if inline && preceding_role == SourceLayoutRole::PlacementClose && !placement_is_generic {
+                state.trim_space()
             } else {
                 state.request_space()
             }
             state.write("{", config)
-            state.depth += 1_usize
-            state.request_break(1_usize)
+            if inline {
+                state.request_space()
+            } else {
+                state.depth += 1_usize
+                state.request_break(1_usize)
+            }
             state.remember(token.type)
             continue
         }
@@ -426,6 +489,16 @@ fn format_tokens(tokens: Vec[Token], config: FormatConfig, source: str) -> str {
                 state.trim_space()
                 state.write("}", config)
                 state.grouped_import_depth -= 1_usize
+                state.remember(token.type)
+                continue
+            }
+            if inline_braces.pop().unwrap_or(false) {
+                if state.previous == TokenType::LEFT_BRACE {
+                    state.trim_space()
+                } else {
+                    state.request_space()
+                }
+                state.write("}", config)
                 state.remember(token.type)
                 continue
             }
@@ -515,32 +588,38 @@ fn format_tokens(tokens: Vec[Token], config: FormatConfig, source: str) -> str {
     ret state.finish(config)
 }
 
-// Field boundaries come from the shared parser, not guesses about type syntax.
-// Positions stay ordered, so applying them to the lossless stream is linear.
-fn struct_field_positions(tokens: Vec[Token], source: str) -> Vec[(usize, usize)] {
-    let mut positions = Vec[(usize, usize)]::new()
-    let mut has_struct = false
-    for token in tokens {
-        if token.type == TokenType::KW_STRUCT {
-            has_struct = true break
-        }
-    }
-    if !has_struct {
-        ret positions
-    }
-    let document = analyze_named_editor_module("formatter", "formatter", source)
-    for statement in document.ast {
-        match statement {
-            Statement::Struct(item) => {
-                for field in item.named_fields {
-                    positions.push((field.line, field.column))
+// The compiler parser classifies punctuation: names and whitespace cannot tell
+// type placement from comparison or a node handle from a bitwise operation.
+fn source_layout_tokens(source: str) -> Vec[SourceLayoutToken] {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new().with_source_layout()
+    let _report = parser.parse_recovering(lexer.tokenize(source))
+    ret parser.source_layout_tokens()
+}
+
+// Keep short, single-line positional constructors inline. Nested braces,
+// comments, or explicit newlines retain vertical layout instead of collapsing
+// a block or detaching a comment. Each scan stops at the first nested brace.
+fn inline_constructor(tokens: Vec[Token], opening: usize, config: FormatConfig) -> bool {
+    let mut index = opening + 1
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Some(token) => {
+                if token.type == TokenType::RIGHT_BRACE {
+                    ret token.column + 1 <= config.line_width
+                }
+                if token.type == TokenType::LEFT_BRACE || token.type == TokenType::NEWLINE
+                || comment_token(token.type) || token.type == TokenType::EOF {
+                    ret false
                 }
             }
-            _ => {
+            None => {
+                ret false
             }
         }
+        index += 1
     }
-    ret positions
+    ret false
 }
 
 fn normalize_trailing_commas(tokens: Vec[Token], config: FormatConfig) -> Vec[Token] {
@@ -718,7 +797,29 @@ fn import_line(line: str) -> bool {
     // Import reordering is a module-level operation. Indented text can be a
     // token inside a multiline grouped import (or a function body) and must
     // never be lifted or sorted as an independent declaration.
-    ret starts_with(line, "import ") || starts_with(line, "pub import ")
+    if !starts_with(line, "import ") && !starts_with(line, "pub import ") {
+        ret false
+    }
+    // The sorter moves complete records, never opening lines of grouped
+    // imports. Layout compacts those groups first; the stabilization pass can
+    // then sort their complete single-line declarations safely. Comments and
+    // quoted fragments are barriers rather than guessed structural braces.
+    if line.contains("//") || line.contains("/*") || line.contains("\"") || line.contains("'") {
+        ret false
+    }
+    let mut depth = 0_usize
+    for index in 0..line.len() {
+        let character = line.slice(index, 1)
+        if character == "{" {
+            depth += 1
+        } elif character == "}" {
+            if depth == 0 {
+                ret false
+            }
+            depth -= 1
+        }
+    }
+    ret depth == 0
 }
 
 fn trim_left(value: str) -> str {
@@ -833,7 +934,7 @@ fn needs_implicit_space(state: FormatState, current: TokenType) -> bool {
 
 fn word_token(typ: TokenType) -> bool {
     ret typ == TokenType::IDENTIFIER || typ == TokenType::INTEGER || typ == TokenType::FLOAT || typ ==
-    TokenType::BOOLEAN || typ == TokenType::STRING
+    TokenType::BOOLEAN || typ == TokenType::STRING || typ == TokenType::RIGHT_BRACE
     || keyword(typ) || typ == TokenType::RIGHT_PAREN || typ == TokenType::RIGHT_BRACKET
 }
 
