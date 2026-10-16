@@ -6,6 +6,7 @@ import std::dict::Hashable
 import std::vec::Vec
 
 import refrain::frontend::analysis::DiagnosticLabelKind
+import refrain::frontend::analysis::FrontendDiagnostic
 import refrain::frontend::analysis::FrontendDocument
 import refrain::frontend::analysis::FrontendSymbol
 import refrain::frontend::analysis::analyze_named_editor_module
@@ -23,7 +24,8 @@ import refrain::frontend::semantic::check_function_body_with_type_scope
 import refrain::frontend::semantic::specialize_method_type_with_self
 import refrain::frontend::semantic::{SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticField, SemanticMethod, check_function_body, check_module_bodies, check_module_declarations}
 import refrain::frontend::semantic::{SemanticMember, SemanticDependencyKind, semantic_members, semantic_named_members, semantic_associated_members, append_bound_methods}
-import refrain::frontend::semantic::{check_function_body_with_types, check_function_body_with_scope, check_module_bodies_with_types}
+import refrain::frontend::semantic::{SemanticVariant, check_function_body_with_variants, check_module_bodies_with_variants}
+import refrain::frontend::semantic::{check_function_body_with_types, check_function_body_with_scope, check_module_bodies_with_types, check_module_bodies_with_type_scope}
 import refrain::frontend::syntax::SyntaxDocument
 import refrain::frontend::type_scope::{TypeNameBinding, scope_type, display_type, names_in_scope}
 import refrain::target::{TargetSpec, host_target, cfg_active_with_features}
@@ -138,6 +140,7 @@ struct ScopedEnvironmentCache {
     methods: Vec[SemanticMethod]
     aggregates: Vec[str]
     constructors: Vec[str]
+    variants: Vec[SemanticVariant]
 }
 
 // Graph queries must not iterate AnalysisSource: copying an entry also retains
@@ -198,6 +201,8 @@ pub struct PreparedSemanticModule {
     methods: Vec[SemanticMethod]
     resolution_diagnostics: Vec[FrontendDiagnostic]
     aggregate_names: Vec[str]
+    type_names: Vec[TypeNameBinding]
+    variants: Vec[SemanticVariant]
 }
 
 /// Immutable module input used to assemble an isolated semantic workspace.
@@ -312,7 +317,8 @@ pub fn check_prepared_semantic_module(prepared: PreparedSemanticModule) -> Vec[F
     let document = analyze_named_module(prepared.module_name, prepared.source_name, prepared.source)
     let mut diagnostics = check_module_declarations(document.ast, prepared.target, prepared.features)
     diagnostics.extend(prepared.resolution_diagnostics)
-    diagnostics.extend(check_module_bodies_with_types(document.ast, prepared.callables, prepared.fields, prepared.methods, prepared.aggregate_names))
+    diagnostics.extend(check_module_bodies_with_variants(document.ast, prepared.callables, prepared.fields,
+            prepared.methods, prepared.aggregate_names, prepared.module_name, prepared.type_names, prepared.variants,))
     ret diagnostics
 }
 
@@ -1711,9 +1717,8 @@ impl for AnalysisDatabase {
     /// target and enabled feature set.
     pub fn module_semantic_diagnostics_for_target(self: mut Self, module_name: str, target: TargetSpec,
         features: Vec[str],) -> Vec[FrontendDiagnostic] {
-        let callables = self.visible_semantic_callables(module_name)
-        let fields = self.visible_semantic_fields(module_name)
-        let methods = self.visible_semantic_methods(module_name)
+        let environment = self.scoped_environment(module_name)
+        let names = self.semantic_type_names(module_name)
         let document = match self.stored_full_document(module_name) {
             Option[FrontendDocument]::Some(value) => value
             Option[FrontendDocument]::None => {
@@ -1727,7 +1732,8 @@ impl for AnalysisDatabase {
         }
         let mut diagnostics = check_module_declarations(document.ast, target, features)
         diagnostics.extend(self.module_resolution_diagnostics(module_name, document))
-        diagnostics.extend(check_module_bodies_with_types(document.ast, callables, fields, methods, self.visible_semantic_aggregates(module_name)))
+        diagnostics.extend(check_module_bodies_with_variants(document.ast, environment.callables, environment.fields,
+                environment.methods, environment.aggregates, module_name, names, environment.variants,))
         ret diagnostics
     }
 
@@ -1735,9 +1741,8 @@ impl for AnalysisDatabase {
     /// worker thread. The returned value contains no AST graph handles.
     pub fn prepare_module_semantic_check_for_target(self: mut Self, module_name: str, target: TargetSpec,
         features: Vec[str],) -> PreparedSemanticModule {
-        let callables = self.visible_semantic_callables(module_name)
-        let fields = self.visible_semantic_fields(module_name)
-        let methods = self.visible_semantic_methods(module_name)
+        let environment = self.scoped_environment(module_name)
+        let names = self.semantic_type_names(module_name)
         let document = match self.stored_full_document(module_name) {
             Option[FrontendDocument]::Some(value) => value
             Option[FrontendDocument]::None => {
@@ -1759,11 +1764,13 @@ impl for AnalysisDatabase {
             source,
             target,
             features,
-            callables,
-            fields,
-            methods,
+            environment.callables,
+            environment.fields,
+            environment.methods,
             resolution_diagnostics,
-            self.visible_semantic_aggregates(module_name)
+            environment.aggregates,
+            names,
+            environment.variants
         }
     }
 
@@ -2184,6 +2191,33 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        // Resolution already exposes core declarations as a language prelude.
+        // Body checking must use those same declarations' nominal identities,
+        // rather than leaving unimported Vec/Option/etc. as bare spellings.
+        // One fallback namespace avoids copying the prelude into every scope.
+        for source in self.sources {
+            if source.module_name != "core" && !starts_with(source.module_name, "core::") {
+                continue
+            }
+            match self.module_def_map(source.module_name) {
+                Some(map) => {
+                    let mut definitions = map.namespace_definitions(DefinitionNamespace::Type)
+                    definitions.extend(map.namespace_definitions(DefinitionNamespace::Trait))
+                    for definition in definitions {
+                        if definition.kind() == DefinitionKind::Import || definition.owner() != "" {
+                            continue
+                        }
+                        names.push(TypeNameBinding {
+                                "", definition.name(), self.intern_nominal_type(definition.typ()),
+                                definition.typ().display_name(), definition.typ().display_name()
+                            }
+                            ,)
+                    }
+                }
+                None => {
+                }
+            }
+        }
         let cached = TypeScopeCache {
             module_name, self.revision, names
         }
@@ -2227,6 +2261,43 @@ impl for AnalysisDatabase {
         let methods = self.scoped_methods(self.visible_semantic_methods(module_name), names)
         let mut aggregates = Vec[str]::new()
         let mut constructors = Vec[str]::new()
+        let mut variants = Vec[SemanticVariant]::new()
+        for visible in self.reachable_semantic_modules(module_name) {
+            let document = self.document(visible).unwrap_or(FrontendDocument::empty())
+            let selected = names_in_scope(names, visible)
+            for statement in document.ast {
+                match statement {
+                    Statement::EnumItem(item) => {
+                        let generics = declaration_generic_names(item.generics)
+                        let owner = scope_type(item.name, visible, selected, generics)
+                        for variant in item.variants {
+                            let mut payload = "void"
+                            match variant.tuple_fields.get(0) {
+                                Some(typ) => {
+                                    payload = typ
+                                }
+                                None => {
+                                }
+                            }
+                            match variant.named_fields.get(0) {
+                                Some(field) => {
+                                    payload = field.typ
+                                }
+                                None => {
+                                }
+                            }
+                            variants.push(SemanticVariant {
+                                    owner, variant.name, scope_type(payload, visible, selected, generics), generics
+                                }
+                                ,
+                            )
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
         for binding in names {
             if !contains_string(aggregates, binding.identity) {
                 aggregates.push(binding.identity)
@@ -2238,7 +2309,7 @@ impl for AnalysisDatabase {
             }
         }
         let cached = ScopedEnvironmentCache {
-            module_name, self.revision, callables, fields, methods, aggregates, constructors
+            module_name, self.revision, callables, fields, methods, aggregates, constructors, variants
         }
         if slot < self.scoped_environments.len() {
             self.scoped_environments.set(slot, cached)
@@ -2299,9 +2370,9 @@ impl for AnalysisDatabase {
         let names = self.semantic_type_names(indexed.module_name)
         let none = Vec[str]::new()
         let environment = self.scoped_environment(indexed.module_name)
-        let mut body = check_function_body_with_type_scope(item, environment.callables, environment.fields,
+        let mut body = check_function_body_with_variants(item, environment.callables, environment.fields,
             environment.methods, scope_type(semantic_owner_type(indexed.symbol.scope), indexed.module_name, names, none),
-            function_owner_generics(document.ast, item), environment.aggregates, indexed.module_name, names,)
+            function_owner_generics(document.ast, item), environment.aggregates, indexed.module_name, names, environment.variants,)
         // Signature text alone cannot detect an alias redirected in its declaring
         // module. Track type namespaces read by this body and its used signatures.
         let mut scopes = Vec[str]::new()

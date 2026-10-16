@@ -8,7 +8,10 @@ import std::vec::Vec
 
 /// Selects whether a rule is disabled, emits a warning, or emits an error.
 pub enum RuleLevel {
-    Allow Warn Deny Forbid
+    Allow
+    Warn
+    Deny
+    Forbid
 }
 
 struct RuleSetting {
@@ -629,6 +632,9 @@ fn emit_unused_imports(path: str, document: FrontendDocument, usage_tokens: Vec[
     for statement in document.ast {
         match statement {
             Statement::Import(item) => {
+                if item.is_public {
+                    continue
+                }
                 for name in imported_names(item.path) {
                     if identifier_occurrences(usage_tokens, name) <= 1_usize {
                         let location = named_location(document.tokens, name, TokenType::KW_IMPORT)
@@ -776,10 +782,12 @@ fn emit_unused_mut(path: str, document: FrontendDocument, config: AnalyzerConfig
 
 fn emit_unused_mut_in_statements(path: str, statements: Vec[Statement], tokens: Vec[Token], level: RuleLevel,
     out: mut Vec[AnalyzerDiagnostic],) ->() {
+    let mut index = 0_usize
     for statement in statements {
+        index += 1
         match statement {
             Statement::Let(item) => {
-                if item.is_mut && !statements_require_mutable_name(statements, item.name) {
+                if item.is_mut && !statements_require_mutable_name_from(statements, index, item.name) {
                     let location = named_location(tokens, item.name, TokenType::KW_LET)
                     out.push(AnalyzerDiagnostic {
                             path, level, "unused-mut", "variable '" + item.name + "' does not need to be mutable",
@@ -827,42 +835,51 @@ fn emit_unused_mut_in_statements(path: str, statements: Vec[Statement], tokens: 
 }
 
 fn statements_require_mutable_name(statements: Vec[Statement], name: str) -> bool {
+    ret statements_require_mutable_name_from(statements, 0, name)
+}
+
+fn statements_require_mutable_name_from(statements: Vec[Statement], start: usize, name: str) -> bool {
+    let mut index = 0_usize
     for statement in statements {
+        index += 1
+        if index <= start {
+            continue
+        }
         match statement {
+            Statement::Let(item) => {
+                if expression_requires_mutable_name(item.expr.value, name) {
+                    ret true
+                }
+                // The initializer still sees the old binding, but subsequent
+                // uses belong to this new binding rather than its namesake.
+                if item.name == name {
+                    ret false
+                }
+            }
             Statement::Assignment(item) => {
-                match item.target.value {
-                    Expr::Path(target) => {
-                        if target == name {
-                            ret true
-                        }
-                    }
-                    _ => {
-                    }
+                if mutable_place_is_named(item.target.value, name) ||
+                expression_requires_mutable_name(item.target.value, name) ||
+                expression_requires_mutable_name(item.expr.value, name) {
+                    ret true
                 }
             }
             // Method receiver mutability is resolved during lowering. At lint
             // time it is safer to retain `mut` for a receiver call than to
             // offer a machine-applicable change which may stop compiling.
             Statement::Expr(expr) => {
-                match expr.value {
-                    Expr::MethodCall(call) => {
-                        match call.receiver.value {
-                            Expr::Path(receiver) => {
-                                if receiver == name {
-                                    ret true
-                                }
-                            }
-                            _ => {
-                            }
-                        }
-                    }
-                    _ => {
-                    }
+                if expression_requires_mutable_name(expr.value, name) {
+                    ret true
+                }
+            }
+            Statement::Ret(expr) => {
+                if expression_requires_mutable_name(expr.value, name) {
+                    ret true
                 }
             }
             Statement::If(item) => {
                 for branch in item.branches {
-                    if statements_require_mutable_name(branch.body.statements, name) {
+                    if expression_requires_mutable_name(branch.condition.value, name) ||
+                    statements_require_mutable_name(branch.body.statements, name) {
                         ret true
                     }
                 }
@@ -877,7 +894,8 @@ fn statements_require_mutable_name(statements: Vec[Statement], name: str) -> boo
                 }
             }
             Statement::While(item) => {
-                if statements_require_mutable_name(item.body.statements, name) {
+                if expression_requires_mutable_name(item.condition.value, name) ||
+                statements_require_mutable_name(item.body.statements, name) {
                     ret true
                 }
             }
@@ -887,18 +905,40 @@ fn statements_require_mutable_name(statements: Vec[Statement], name: str) -> boo
                 }
             }
             Statement::DoWhile(item) => {
-                if statements_require_mutable_name(item.body.statements, name) {
+                if expression_requires_mutable_name(item.condition.value, name) ||
+                statements_require_mutable_name(item.body.statements, name) {
                     ret true
                 }
             }
             Statement::For(item) => {
-                if statements_require_mutable_name(item.body.statements, name) {
+                if expression_requires_mutable_name(item.iterable.value, name) ||
+                (item.name != name && statements_require_mutable_name(item.body.statements, name)) {
                     ret true
                 }
             }
             Statement::With(item) => {
-                if statements_require_mutable_name(item.body.statements, name) {
+                if expression_requires_mutable_name(item.expr.value, name) ||
+                (item.name != name && statements_require_mutable_name(item.body.statements, name)) {
                     ret true
+                }
+            }
+            Statement::Match(item) => {
+                if expression_requires_mutable_name(item.expr.value, name) {
+                    ret true
+                }
+                for arm in item.arms {
+                    match arm.body {
+                        MatchArmBody::Block(body) => {
+                            if statements_require_mutable_name(body.statements, name) {
+                                ret true
+                            }
+                        }
+                        MatchArmBody::Expr(expr) => {
+                            if expression_requires_mutable_name(expr.value, name) {
+                                ret true
+                            }
+                        }
+                    }
                 }
             }
             Statement::Unsafe(body) => {
@@ -908,6 +948,161 @@ fn statements_require_mutable_name(statements: Vec[Statement], name: str) -> boo
             }
             _ => {
             }
+        }
+    }
+    ret false
+}
+
+// Receiver mutability is checked semantically during lowering. Until that
+// information is available to lint, retain mut conservatively for any receiver
+// call, at every expression depth, not just standalone expression statements.
+fn mutable_place_is_named(value: Expr, name: str) -> bool {
+    ret match value {
+        Expr::Path(path) => path == name
+        Expr::Parenthesized(inner) => mutable_place_is_named(inner.value, name)
+        Expr::Field(item) => mutable_place_is_named(item.base.value, name)
+        Expr::Index(item) => mutable_place_is_named(item.base.value, name)
+        _ => false
+    }
+}
+
+fn expression_requires_mutable_name(value: Expr, name: str) -> bool {
+    match value {
+        Expr::MethodCall(call) => {
+            if mutable_place_is_named(call.receiver.value, name) ||
+            expression_requires_mutable_name(call.receiver.value, name) {
+                ret true
+            }
+            for argument in call.args {
+                if expression_requires_mutable_name(argument.value, name) {
+                    ret true
+                }
+            }
+        }
+        Expr::Call(call) => {
+            if expression_requires_mutable_name(call.callee.value, name) {
+                ret true
+            }
+            for argument in call.args {
+                if expression_requires_mutable_name(argument.value, name) {
+                    ret true
+                }
+            }
+        }
+        Expr::Binary(item) => {
+            ret expression_requires_mutable_name(item.lhs.value, name) ||
+            expression_requires_mutable_name(item.rhs.value, name)
+        }
+        Expr::Unary(item) => {
+            ret expression_requires_mutable_name(item.expr.value, name)
+        }
+        Expr::Cast(item) => {
+            ret expression_requires_mutable_name(item.expr.value, name)
+        }
+        Expr::Field(item) => {
+            ret expression_requires_mutable_name(item.base.value, name)
+        }
+        Expr::Index(item) => {
+            ret expression_requires_mutable_name(item.base.value, name) ||
+            expression_requires_mutable_name(item.index.value, name)
+        }
+        Expr::Parenthesized(inner) => {
+            ret expression_requires_mutable_name(inner.value, name)
+        }
+        Expr::Await(inner) => {
+            ret expression_requires_mutable_name(inner.value, name)
+        }
+        Expr::Spawn(inner) => {
+            ret expression_requires_mutable_name(inner.value, name)
+        }
+        Expr::Try(inner) => {
+            ret expression_requires_mutable_name(inner.value, name)
+        }
+        Expr::TupleLiteral(item) => {
+            for element in item.items {
+                if expression_requires_mutable_name(element.value, name) {
+                    ret true
+                }
+            }
+        }
+        Expr::ArrayLiteral(item) => {
+            for element in item.items {
+                if expression_requires_mutable_name(element.value, name) {
+                    ret true
+                }
+            }
+        }
+        Expr::VecLiteral(item) => {
+            for element in item.items {
+                if expression_requires_mutable_name(element.value, name) {
+                    ret true
+                }
+            }
+        }
+        Expr::ArrayRepeat(item) => {
+            ret expression_requires_mutable_name(item.value.value, name)
+        }
+        Expr::StructInit(item) => {
+            for element in item.values {
+                if expression_requires_mutable_name(element.value, name) {
+                    ret true
+                }
+            }
+        }
+        Expr::Block(block) => {
+            if statements_require_mutable_name(block.statements, name) {
+                ret true
+            }
+            for statement in block.statements {
+                match statement {
+                    Statement::Let(item) => {
+                        if item.name == name {
+                            ret false
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            match block.tail {
+                Some(tail) => {
+                    ret expression_requires_mutable_name(tail.value, name)
+                }
+                None => {
+                }
+            }
+        }
+        Expr::Unsafe(body) => {
+            ret statements_require_mutable_name(body.statements, name)
+        }
+        Expr::If(item) => {
+            for branch in item.branches {
+                if expression_requires_mutable_name(branch.condition.value, name) ||
+                expression_requires_mutable_name(branch.body.value, name) {
+                    ret true
+                }
+            }
+            ret expression_requires_mutable_name(item.else_body.value, name)
+        }
+        Expr::Match(item) => {
+            if expression_requires_mutable_name(item.expr.value, name) {
+                ret true
+            }
+            for arm in item.arms {
+                if expression_requires_mutable_name(arm.expr.value, name) {
+                    ret true
+                }
+            }
+        }
+        Expr::Closure(item) => {
+            for parameter in item.params {
+                if parameter.name == name {
+                    ret false
+                }
+            }
+            ret expression_requires_mutable_name(item.body.value, name)
+        }
+        _ => {
         }
     }
     ret false

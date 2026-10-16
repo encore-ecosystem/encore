@@ -15,12 +15,13 @@ import std::os::mkdir_all
 import std::os::read_file
 import std::os::remove_file
 import std::os::write_file
-import std::os::{copy_file, set_executable}
+import std::os::{copy_file, set_executable, executable_path}
 import std::path::Path
 import std::path::clone_path
 import std::process::exit
 import std::process::run_args
 import std::process::run_args_owned
+import std::process::Command
 import std::thread::JoinHandle
 import std::thread::available_parallelism
 import std::time::{perf_counter_ms, perf_counter_ns}
@@ -34,11 +35,13 @@ import ehir_llvm_backend::codegen::{CodegenRequirements, emit_program_support}
 import ehirlib::Module
 import ehirlib::core::make_module_bundle
 import mod::build_archive::{UnitNativePlan, run_program_tool, stable_module_ir}
+import mod::build_output::{build_artifact_name, build_import_library_name, build_artifact_label, merge_static_library, append_package_archives, append_shared_library_args}
 import mod::build_artifacts::UnitReady
 import mod::build_cache::{UnitCacheLock, try_unit_cache_lock, close_unit_cache_lock}
 import mod::build_coordinator::{CompiledPackage, compile_cached_package_graph}
 import mod::build_metadata::{MetadataContext, metadata_name_before}
 import mod::build_native_inputs::{native_source_identity, native_source_identities}
+import mod::build_scripts::{NativeBuildMetadata, parse_native_build_metadata}
 import mod::build_requirements::UnitRequirements
 import refrain::cache_identity::{compiler_binary_identity, compiler_content_digest}
 import refrain::diagnostics::render_diagnostic
@@ -49,8 +52,9 @@ import refrain::project::ProjectWorkspace
 import refrain::project::WorkspaceModule
 import refrain::project::WorkspaceRefrain
 import refrain::project::load_binary_workspace
-import refrain::project::manifest::{project_manifest_name, project_manifest_target, project_target_toolchain, read_project_manifest}
-import refrain::project::workspace::{ResolvedPackageGraph, try_resolve_package_graph}
+import refrain::project::load_library_workspace
+import refrain::project::manifest::{project_manifest_name, project_manifest_target, project_target_toolchain, read_project_manifest, project_build_kind}
+import refrain::project::workspace::{ResolvedPackageGraph, try_resolve_package_graph, try_load_entry_workspace}
 import refrain::project::{system_core_root, system_platform_root, workspace_release_modules, workspace_root_refrain}
 import refrain::target::kits::{target_kit_installed, target_kit_toolchain, target_platform_root}
 import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host, target_is_supported, toolchain_driver_is_supported}
@@ -66,7 +70,6 @@ extern fn encore_build_queue_next(queue: usize) -> usize
 extern fn encore_build_queue_cancel(queue: usize) ->()
 extern fn encore_build_queue_free(queue: usize) ->()
 extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
-extern fn encore_compiler_memory_budget() -> u64
 extern fn encore_compiler_process_id() -> u64
 extern fn encore_compiler_worker_interrupted() -> i32
 
@@ -142,6 +145,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         ret 1_u32
     }
     let manifest = read_project_manifest(root)
+    let output_kind = project_build_kind(root, manifest)
     let manifest_target = project_manifest_target(manifest)
     let target_request = requested_value("--target", manifest_target)
     let target = if target_request == "" {
@@ -164,7 +168,10 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         eprintln("Error: --emit must be one of: ehir, llvm-ir, object, binary")
         ret 1_u32
     }
-    let toolchain = requested_toolchain(root, target)
+    let mut toolchain = requested_toolchain(root, target)
+    if output_kind != "executable" && target.os != "windows" {
+        toolchain.compile_args.push("-fPIC")
+    }
     match validate_toolchain(root, target, toolchain, emit) {
         Option[str]::Some(message) => {
             eprintln("Error: " + message) ret 1_u32
@@ -183,7 +190,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         eprintln("Error: failed to create target directory " + profile_dir.as_str())
         ret 1_u32
     }
-    let binary_path = profile_dir.join(target_executable_name(target, project_name))
+    let binary_path = profile_dir.join(build_artifact_name(target, project_name, output_kind))
     let fingerprint_path = profile_dir.join(".encore-fingerprint")
     let input_snapshot_path = profile_dir.join(".encore-input-snapshot")
     let input_configuration = build_input_configuration(root, target, toolchain, profile, emit)
@@ -195,7 +202,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         match compile_package_binary(root, target, toolchain, profile, profile_dir, binary_path) {
             Ok(_) => {
                 progress.finish_stage("package archives and final support")
-                finish_pipeline_artifact(progress, profile, "Binary", binary_path.as_str(), pipeline_started_ms)
+                finish_pipeline_artifact(progress, profile, build_artifact_label(output_kind), binary_path.as_str(), pipeline_started_ms)
                 ret 0
             }
             Err(error) => {
@@ -211,7 +218,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     }
 
     progress.start_stage("Workspace", "workspace")
-    let mut workspace = load_binary_workspace(root)
+    let mut workspace = if output_kind == "executable" { load_binary_workspace(root) } else { load_library_workspace(root) }
     let module_count = workspace.modules.len()
     let ast_count = workspace_ast_count(workspace.modules)
 
@@ -326,7 +333,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             progress.start_stage("Lower", project_name)
             progress.update(project_name, "EHIR", 1_usize, 1_usize)
             fresh_ehir_text = write_ehir_artifact(translation_modules, incremental_modules, target,
-                project_name + "@main.enq", out_path, profile_dir.join("ehir-cache"),
+                project_name + if output_kind == "executable" { "@main.enq" } else { "@lib.enq" }, out_path, profile_dir.join("ehir-cache"),
                 incremental_cache_configuration(root, target, "ehir-module-v3"),)
             if fresh_ehir_text == "" {
                 progress.fail_stage("failed to write translated EHIR")
@@ -372,7 +379,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             module_llvm_paths = read_nonempty_lines(llvm_modules_manifest_path(llvm_path))
         } elif incremental_worker {
             // Keep the already-resolved build plan in the parent.  The compact
-            // worker is memory-bounded, so a child process can update the CGU
+            // worker owns only the affected CGU, so a child can update it
             // and return without forcing a second frontend/workspace pass.
             if !run_llvm_codegen_worker(out_path, llvm_path, target,
                 llvm_fingerprint_path, llvm_fingerprint,
@@ -730,7 +737,10 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
 pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolchain,
     profile: str, profile_dir: Path, binary: Path,) -> Result[(), str] {
     let pipeline_started = perf_counter_ms()
-    let graph = match try_resolve_package_graph(root, true, true) {
+    let output_kind = project_build_kind(root, read_project_manifest(root))
+    let import_name = build_import_library_name(target, project_manifest_name(read_project_manifest(root)), output_kind)
+    let import_library = profile_dir.join(import_name)
+    let graph = match try_resolve_package_graph(root, output_kind == "executable", true) {
         Ok(value) => value
         Err(failure) => {
             ret Result[(), str]::Err(failure.message)
@@ -741,24 +751,30 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
             }
         ) +
         "-" + Debug::fmt(perf_counter_ns())).resolve()
+    if mkdir_all(staging.as_str()) != 0 { ret Result[(), str]::Err("cannot create package build staging") }
+    let metadata = run_native_build_scripts(graph.refrains, "", target, profile, staging)?
     let native = UnitNativePlan {
         resolve_native_program(toolchain.compiler)?,
         resolve_native_program(toolchain.archiver)?, compiler_args(profile, target, toolchain)
     }
     let cache = env("ENCORE_BUILD_CACHE").unwrap_or(home_dir() + "/.cache/encore/units-v1")
     let packages = compile_cached_package_graph(graph, target.triple, profile, requested_jobs(),
-        unsafe {
-            encore_compiler_memory_budget()
-        }
-        , staging, native, Option[Path]::Some(Path::new(cache).expanduser().resolve()),)?
+        staging.join("graph"), native, Option[Path]::Some(Path::new(cache).expanduser().resolve()),)?
     let packages_ms = perf_counter_ms() - pipeline_started
-    let sources = package_native_sources(root, graph, target, toolchain)
-    if sources.len() == 0 {
+    let mut sources = package_native_sources(root, graph, target, toolchain)
+    for source in metadata.sources {
+        let mut present = false
+        for previous in sources { if previous.as_str() == source.as_str() { present = true } }
+        if !present { sources.push(source) }
+    }
+    if sources.len() == 0 && output_kind == "executable" {
         ret Result[(), str]::Err("binary output requires builtin-runtime or target.runtime-sources")
     }
     let native_keys = native_source_identities(sources, native, staging, requested_jobs())?
     let mut link_inputs = Vec[Json]::new()
     link_inputs.push(Json::String("encore-package-link-1"))
+    link_inputs.push(Json::String(output_kind))
+    link_inputs.push(Json::String(binary.as_str()))
     link_inputs.push(Json::String(native.identity()?))
     link_inputs.push(Json::String(file_sha256(resolve_native_program(toolchain.linker)?)))
     for argument in target_tool_args(target, toolchain) {
@@ -767,6 +783,8 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
     for argument in toolchain.link_args {
         link_inputs.push(Json::String(argument))
     }
+    for argument in metadata.link_arguments(target) { link_inputs.push(Json::String(argument)) }
+    for identity in metadata.identities() { link_inputs.push(Json::String(identity)) }
     if toolchain.linker_script != "" {
         link_inputs.push(Json::String(file_sha256(resolve_project_path(root, toolchain.linker_script).as_str())))
     }
@@ -790,7 +808,8 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
     }
     if previous.get("key").unwrap_or(Json::Null).as_str().unwrap_or("") == link_key &&
     previous.get("binary").unwrap_or(Json::Null).as_str().unwrap_or("") == file_sha256(binary.as_str()) &&
-    file_exists(binary.as_str()) {
+    file_exists(binary.as_str()) && (import_name == "" ||
+        (file_exists(import_library.as_str()) && previous.get("import-library").unwrap_or(Json::Null).as_str().unwrap_or("") == file_sha256(import_library.as_str()))) {
         write_package_pipeline_timing(profile_dir, packages, packages_ms, 0, 0, perf_counter_ms() - pipeline_started, true)?
         ret Result[(), str]::Ok(())
     }
@@ -827,7 +846,7 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
             archives.push(package.directory.join("unit.erlib").as_str())
         }
     }
-    let entry = graph.root_name + "@main.enq"
+    let entry = graph.root_name + if output_kind == "executable" { "@main.enq" } else { "@lib.enq" }
     let support = emit_program_support(make_module_bundle(entry, contexts), requirements, target.triple, target.pointer_width)
     let support_path = staging.join("support.ll")
     if !write_verified_artifact(support_path, stable_module_ir(support.ir, graph.root_name + "@__program_support")) {
@@ -857,21 +876,7 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
     for object in objects {
         link_args.push(object)
     }
-    if target.os == "linux" {
-        link_args.push("-Wl,--start-group")
-    }
-    for archive in archives {
-        if target.os == "macos" {
-            link_args.push("-Wl,-force_load," + archive)
-        } elif target.os == "windows" && target.environment == "msvc" {
-            link_args.push("-Wl,/wholearchive:" + archive)
-        } else {
-            link_args.push(archive)
-        }
-    }
-    if target.os == "linux" {
-        link_args.push("-Wl,--end-group")
-    }
+    append_package_archives(link_args, archives, target, output_kind == "shared_lib")
     append_profile_link_args(link_args, profile, target)
     append_thinlto_cache_args(link_args, profile, target, profile_dir)?
     if toolchain.linker_script != "" {
@@ -880,24 +885,117 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
     for argument in toolchain.link_args {
         link_args.push(argument)
     }
+    link_args.extend(metadata.link_arguments(target))
     let support_native_ms = perf_counter_ms() - pipeline_started - packages_ms
     // Publish only a successfully linked binary, never truncate the executable
     // that another process is still running or retain a failed partial link.
-    let linked = staging.join("linked" + target.executable_suffix)
-    link_args.push("-o") link_args.push(linked.as_str())
-    run_program_tool(resolve_native_program(toolchain.linker)?, link_args, staging, "link")?
-    if copy_file(linked.as_str(), binary.as_str()) != 0 || set_executable(binary.as_str()) != 0 {
+    let linked = staging.join(build_artifact_name(target, "linked", output_kind))
+    if output_kind == "static_lib" {
+        merge_static_library(native.archiver, objects, archives, staging, linked)?
+    } else {
+        if output_kind == "shared_lib" {
+            append_shared_library_args(link_args, target, build_artifact_name(target, graph.root_name, output_kind), archives, staging)?
+        }
+        link_args.push("-o") link_args.push(linked.as_str())
+        run_program_tool(resolve_native_program(toolchain.linker)?, link_args, staging, "link")?
+    }
+    if copy_file(linked.as_str(), binary.as_str()) != 0 ||
+        (output_kind == "executable" && set_executable(binary.as_str()) != 0) {
         ret Result[(), str]::Err("cannot install linked binary")
+    }
+    if import_name != "" && copy_file(staging.join("import-library").as_str(), import_library.as_str()) != 0 {
+        ret Result[(), str]::Err("cannot install DLL import library")
     }
     let mut committed = Vec[(str, Json)]::new()
     committed.push(("key", Json::String(link_key)))
     committed.push(("binary", Json::String(file_sha256(binary.as_str()))))
+    if import_name != "" { committed.push(("import-library", Json::String(file_sha256(import_library.as_str())))) }
     if !write_verified_artifact(link_record, stringify(Json::Object(committed))) {
         ret Result[(), str]::Err("cannot commit final binary identity")
     }
     write_package_pipeline_timing(profile_dir, packages, packages_ms, support_native_ms,
         perf_counter_ms() - pipeline_started - packages_ms - support_native_ms, perf_counter_ms() - pipeline_started, false,)?
     ret Result[(), str]::Ok(())
+}
+
+// A script is a host program, whereas its JSON is selected for the requested
+// target. Each invocation has isolated output; a failed script can never reuse
+// an older metadata file. Dependencies run before their consumers.
+fn run_native_build_scripts(packages: Vec[WorkspaceRefrain], skip: str, target: TargetSpec,
+    profile: str, staging: Path,) -> Result[NativeBuildMetadata, str] {
+    let mut plans = Vec[NativeBuildMetadata]::new()
+    let mut index = 0_usize
+    for package in packages {
+        if package.name == skip { continue }
+        match package.manifest.build {
+            Some(script) => {
+                let script = resolve_project_path(package.root, script)
+                if !file_exists(script.as_str()) { ret Result[NativeBuildMetadata, str]::Err("build script not found: " + script.as_str()) }
+                let directory = staging.join("build-script-" + Debug::fmt(index)).resolve()
+                if mkdir_all(directory.as_str()) != 0 { ret Result[NativeBuildMetadata, str]::Err("cannot create build-script directory") }
+                let metadata = directory.join("native.json")
+                let args = vec!["__run-build-script", package.root.as_str(), script.as_str(), metadata.as_str(), target.triple, profile]
+                run_program_tool(executable_path(), args, directory, "build-script")?
+                if !file_exists(metadata.as_str()) { ret Result[NativeBuildMetadata, str]::Err("build script did not write metadata: " + script.as_str()) }
+                plans.push(parse_native_build_metadata(read_file(metadata.as_str()), package.root, target, package.enabled_features)?)
+                index += 1
+            }
+            None => {}
+        }
+    }
+    // Static native libraries must precede the libraries they depend upon.
+    let mut merged = NativeBuildMetadata::empty()
+    let mut index = plans.len()
+    while index > 0 {
+        index -= 1
+        match plans.get(index) { Some(plan) => { merged.append(plan) } None => {} }
+    }
+    ret Result[NativeBuildMetadata, str]::Ok(merged)
+}
+
+/// Private host worker; no registry, target or cwd state is changed in the
+/// parent compiler. Cached host script compilation is serialized per script.
+#attr(safe)
+pub fn run_build_script_worker() -> u32 {
+    if argc() < 7 { eprintln("invalid build-script worker arguments") ret 2 }
+    let root = Path::new(argv(2).unwrap_or("")).resolve()
+    let script = Path::new(argv(3).unwrap_or("")).resolve()
+    let output = Path::new(argv(4).unwrap_or("")).resolve()
+    let key = compiler_content_digest(script.as_str())
+    let locks = root.join("target/build-scripts/locks")
+    let mut acquired = Option[UnitCacheLock]::None
+    while acquired.is_none() {
+        if unsafe { encore_compiler_worker_interrupted() } != 0 { ret 1 }
+        acquired = match try_unit_cache_lock(locks, key) {
+            Ok(lock) => lock Err(error) => { eprintln(error) ret 1 }
+        }
+        if acquired.is_none() { let _sleep = sleep_ms(5) }
+    }
+    let lock = match acquired { Some(lock) => lock None => { ret 1 } }
+    let status = run_locked_build_script(root, script, output, key)
+    close_unit_cache_lock(lock)
+    ret status
+}
+
+fn run_locked_build_script(root: Path, script: Path, output: Path, key: str) -> u32 {
+    let workspace = match try_load_entry_workspace(root, script) {
+        Ok(workspace) => workspace Err(failure) => { eprintln(failure.message) ret 1 }
+    }
+    for module in workspace.modules {
+        for diagnostic in module.diagnostics {
+            eprintln(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
+            ret 1
+        }
+    }
+    let name = "build-script-" + key
+    if compile_entry_ast(root, workspace, workspace.flat_ast, name, true) != 0 { ret 1 }
+    let binary = root.join("target/tests/bin").join(target_executable_name(host_target(), name))
+    // A script sees its own package cwd. Arguments 2/3 describe the requested
+    // target/profile; argument 1 remains the documented metadata destination.
+    let result = Command::new(binary.as_str()).cwd(root.as_str())
+        .arg(output.as_str()).arg(argv(5).unwrap_or("")).arg(argv(6).unwrap_or("dev")).output()
+    if !result.success() { eprintln("build script failed: " + script.as_str() + "\n" + result.text()) ret 1 }
+    ret 0
 }
 
 fn append_thinlto_cache_args(args: mut Vec[str], profile: str, target: TargetSpec,
@@ -2134,30 +2232,7 @@ fn requested_jobs() -> usize {
     ret min_usize(requested, available)
 }
 
-fn parse_mem_available_kb(value: str) -> usize {
-    let marker = "MemAvailable:"
-    let mut index = 0_usize
-    while index + marker.len() <= value.len() {
-        if value.slice_bytes(index, marker.len()) == marker {
-            let mut cursor = index + marker.len()
-            while cursor < value.len() &&(value.byte_at(cursor) == 32_u8 || value.byte_at(cursor) == 9_u8) {
-                cursor += 1_usize
-            }
-            let start = cursor
-            while cursor < value.len() && value.byte_at(cursor) >= 48_u8 && value.byte_at(cursor) <= 57_u8 {
-                cursor += 1_usize
-            }
-            if cursor > start {
-                ret parse_positive_usize(value.slice_bytes(start, cursor - start))
-            }
-            ret 0_usize
-        }
-        index += 1_usize
-    }
-    ret 0_usize
-}
-
-fn adaptive_codegen_jobs(requested: usize, count: usize) -> usize {
+fn configured_codegen_jobs(requested: usize, count: usize) -> usize {
     let requested_limit = min_usize(requested, count)
     if requested_limit <= 1_usize {
         ret requested_limit
@@ -2172,25 +2247,7 @@ fn adaptive_codegen_jobs(requested: usize, count: usize) -> usize {
         None => {
         }
     }
-    let available_kb = parse_mem_available_kb(read_file("/proc/meminfo"))
-    // A full prepared module graph is deliberately budgeted at roughly 1.5
-    // GiB. This replaces the old fixed four-worker ceiling while remaining
-    // conservative on workstations where the editor and browser already use
-    // most of RAM. Keep a conservative safety margin for diagnostics and
-    // source maps while allowing more than the former fixed four-worker cap.
-    let per_worker_kb = 1536000_usize
-    let memory_jobs = if available_kb == 0_usize {
-        4_usize
-    } else {
-        available_kb / per_worker_kb
-    }
-    let floor = 1_usize
-    let memory_limit = if memory_jobs < floor {
-        floor
-    } else {
-        memory_jobs
-    }
-    ret min_usize(requested_limit, memory_limit)
+    ret requested_limit
 }
 
 fn clone_string_vec(values: frozen Vec[str]) -> Vec[str] {
@@ -2364,13 +2421,10 @@ fn write_llvm_artifact_text(ehir_text: str, llvm_path: Path, target: TargetSpec,
             module_sources = split_module_bundle_text(ehir_text)
         }
         let global_bundle_key = Debug::fmt(ehir_text.hash())
-        // Bundle codegen keeps each worker's prepared module graph alive until
-        // cross-module generic analysis completes. Large workspaces therefore
-        // become memory-bound well before native compilation becomes CPU-bound
-        // (Graphene/Encore could be OOM-killed with 16 workers). Keep this
-        // phase within a conservative memory budget; object compilation below
-        // still uses the complete requested job count.
-        let codegen_jobs = adaptive_codegen_jobs(requested_jobs(), module_sources.len())
+        // The requested CPU budget governs codegen as well as native tools.
+        // ENCORE_CODEGEN_JOBS may explicitly lower this phase's worker count;
+        // neither available RAM nor historical peaks affect admission.
+        let codegen_jobs = configured_codegen_jobs(requested_jobs(), module_sources.len())
         let module_dir = match llvm_path.parent() {
             Some(parent) => parent.join("modules")
             None => Path::new("modules")
@@ -3344,6 +3398,12 @@ fn normalize_profile(profile: str) -> str {
 
 /// Performs the `compile_test_ast` operation.
 pub fn compile_test_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str) -> u32 {
+    ret compile_entry_ast(root, workspace, ast, binary_name, false)
+}
+
+#attr(safe)
+fn compile_entry_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str,
+    build_script: bool,) -> u32 {
     let target = host_target()
     let test_toolchain = requested_toolchain(root, target)
     let tests_dir = root.join("target").join("tests")
@@ -3357,6 +3417,11 @@ pub fn compile_test_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
     let ehir_path = tests_dir.join(binary_name + ".ehir")
     let llvm_path = tests_dir.join(binary_name + ".ll")
     let binary_path = binary_dir.join(target_executable_name(host_target(), binary_name))
+    let staging = tests_dir.join("native-" + binary_name + "-" + Debug::fmt(unsafe { encore_compiler_process_id() }))
+    if mkdir_all(staging.as_str()) != 0 { ret 1 }
+    let native_metadata = match run_native_build_scripts(workspace.refrains, if build_script { workspace.root_name } else { "" }, target, "dev", staging) {
+        Ok(metadata) => metadata Err(error) => { eprintln(error) ret 1 }
+    }
     let test_fingerprint_path = Path::new(binary_path.as_str() + ".fingerprint")
     // When testing the core package itself, its workspace runtime replaces
     // the installed bootstrap runtime. Linking both translation units defines
@@ -3399,7 +3464,7 @@ pub fn compile_test_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
             }
         }
     }
-    let mut test_fingerprint = "encore-test-binary-cache-v8\ncompiler=encore-" + compiler_release_version() + "\n"
+    let mut test_fingerprint = "encore-test-binary-cache-v9\ncompiler=encore-" + compiler_release_version() + "\n"
     + target.triple + "\n" + binary_name
     for module in workspace.modules {
         test_fingerprint = fingerprint_mix(test_fingerprint, module.owner_name)
@@ -3430,35 +3495,13 @@ pub fn compile_test_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
     for link_arg in test_toolchain.link_args {
         test_fingerprint = fingerprint_mix(test_fingerprint, link_arg)
     }
+    for source in native_metadata.sources { test_fingerprint = fingerprint_native_file(test_fingerprint, source, 0) }
+    for identity in native_metadata.identities() { test_fingerprint = fingerprint_mix(test_fingerprint, identity) }
+    for argument in native_metadata.link_arguments(target) { test_fingerprint = fingerprint_mix(test_fingerprint, argument) }
     // A test cache hit must be decidable before translation and LLVM emission.
-    // Fingerprinting the running compiler invalidates generated code after any
-    // frontend/backend implementation change without doing that expensive work
-    // merely to discover that an identical test binary already exists.
-    match argv(0_usize) {
-        Some(executable) => {
-            let compiler_path = Path::new(executable).resolve()
-            test_fingerprint = fingerprint_mix(test_fingerprint, compiler_path.as_str())
-            if file_exists(native_path(compiler_path.as_str())) {
-                let mut compiler_identity = ""
-                match compiler_path.parent() {
-                    Some(parent) => {
-                        let build_fingerprint = parent.join(".encore-fingerprint")
-                        if file_exists(native_path(build_fingerprint.as_str())) {
-                            compiler_identity = read_file(native_path(build_fingerprint.as_str()))
-                        }
-                    }
-                    None => {
-                    }
-                }
-                if compiler_identity == "" {
-                    compiler_identity = file_sha256(native_path(compiler_path.as_str()))
-                }
-                test_fingerprint = fingerprint_mix(test_fingerprint, compiler_identity)
-            }
-        }
-        None => {
-        }
-    }
+    // Never trust a nearby legacy build marker as executable identity: native
+    // package builds need not refresh it when replacing the compiler binary.
+    test_fingerprint = fingerprint_mix(test_fingerprint, running_compiler_identity(root))
     test_fingerprint = Debug::fmt(test_fingerprint.hash())
     if file_exists(native_path(binary_path.as_str())) &&
     file_exists(native_path(test_fingerprint_path.as_str())) &&
@@ -3501,6 +3544,13 @@ pub fn compile_test_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
     for link_arg in test_toolchain.link_args {
         args.push(link_arg)
     }
+    for source in native_metadata.sources {
+        let path = native_path(source.as_str())
+        let mut present = false
+        for argument in args { if argument == path { present = true } }
+        if !present { args.push(path) }
+    }
+    args.extend(native_metadata.link_arguments(target))
     append_tls_link_args(args, host_target())
     args.push("-o")
     args.push(native_path(binary_path.as_str()))

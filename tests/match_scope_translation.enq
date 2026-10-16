@@ -1,0 +1,67 @@
+//! Lowering and EHIR validation must agree on lexical names in each match arm.
+import ehirlib::{parse_module_text, prepare_module, PreparationOutcome}
+import refrain::frontend::lexer::Lexer
+import refrain::frontend::parser::Parser
+import refrain::frontend::translator::translate_to_ehir
+import std::io::eprintln
+
+fn valid(name: str, source: str) -> bool {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source(name)
+    let output = translate_to_ehir(parser.parse(lexer.tokenize(source)))
+    if output.contains("_match_type_probe_subject") {
+        ret false
+    }
+    match prepare_module(parse_module_text(name, output)) {
+        PreparationOutcome::Ready(_) => {
+            ret true
+        }
+        PreparationOutcome::Error(message) => {
+            eprintln(name + ": " + message) ret false
+        }
+    }
+    ret false
+}
+
+fn main() -> u32 {
+    let declarations = "enum Choice { Number(usize) Text(str) Empty }\n"
+    if !valid("expression-scope", declarations +
+        "fn count(value: str, item: Choice) -> usize {\n" +
+        "let count = match item { Choice::Number(value) => value Choice::Text(value) => value.byte_len() Choice::Empty => value.byte_len() }\n" +
+        "ret value.byte_len() + count\n}\n",) {
+        ret 1
+    }
+    if !valid("statement-scope", declarations +
+        "fn count(value: str, item: Choice) -> usize {\nlet mut count = 0_usize\n" +
+        "match item { Choice::Number(value) => { count = value } Choice::Text(value) => { count = value.byte_len() } Choice::Empty => { count = value.byte_len() } }\n" +
+        "ret value.byte_len() + count\n}\n",) {
+        ret 2
+    }
+    if !valid("probe-local-scope", declarations +
+        "fn count(value: str, item: Choice) -> usize {\n" +
+        "let count = match item { Choice::Number(number) => { let value = number + 1 value } Choice::Text(text) => text.byte_len() Choice::Empty => value.byte_len() }\n" +
+        "ret value.byte_len() + count\n}\n",) {
+        ret 3
+    }
+    let partial_source = "struct Entry { value: str }\nfn consume(value: sending Entry<H>) -> u32 { ret 1 }\n" +
+    "fn partial(first: bool) -> u32 { let value = Entry<H>{\"owned\"} ret match first { true => consume(value) false => 0_u32 } }\n"
+    if !valid("partial-move-scope", partial_source) {
+        ret 4
+    }
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source("partial-cleanup")
+    let partial = translate_to_ehir(parser.parse(lexer.tokenize(partial_source)))
+    if !partial.contains("drop entry_letvar_value_0: Entry<H>") {
+        eprintln(partial)
+        ret 5
+    }
+    if !valid("nested-diverging-if", "enum Result[T, E] { Ok(T) Err(E) }\n" +
+        "fn read() -> Result[str, str] { ret Result[str, str]::Err(\"disconnected\") }\n" +
+        "fn main() -> u32 { let mut attempt = 0_u32 loop { let text = match read() { Result::Ok(value) => value Result::Err(error) => { let _error = error if attempt == 2 { ret 0 } else { attempt += 1 continue } } } let _text = text ret 1 } }\n",) {
+        ret 6
+    }
+    if !valid("hinted-diverging-if", "fn main() -> u32 { let mut attempt = 0_u32 loop { let value: u32 = if attempt == 2 { break } else { attempt += 1 continue } ret value } ret attempt }\n") {
+        ret 7
+    }
+    ret 0
+}

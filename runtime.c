@@ -19,7 +19,6 @@
 #include "runtime/build_jobserver.h"
 #include "runtime/build_process.h"
 #include "runtime/build_artifact.h"
-#include "runtime/build_resources.h"
 #include "runtime/build_identity.h"
 #include "runtime/build_target.h"
 #if defined(__GLIBC__)
@@ -52,16 +51,16 @@ static char *encore_compiler_cstr(encore_compiler_str value) {
     return out;
 }
 
-size_t encore_compiler_jobserver_create(encore_compiler_str path, size_t jobs, uint64_t memory_budget) {
+size_t encore_compiler_jobserver_create(encore_compiler_str path, size_t jobs) {
     char *name = encore_compiler_cstr(path);
-    size_t server = encore_build_jobserver_create_path(name, jobs, memory_budget);
+    size_t server = encore_build_jobserver_create_path(name, jobs);
     free(name);
     return server;
 }
 
-size_t encore_compiler_jobserver_attach(encore_compiler_str path, uint64_t memory_bytes) {
+size_t encore_compiler_jobserver_attach(encore_compiler_str path) {
     char *name = encore_compiler_cstr(path);
-    size_t server = encore_build_jobserver_attach_path(name, memory_bytes);
+    size_t server = encore_build_jobserver_attach_path(name);
     free(name);
     return server;
 }
@@ -113,9 +112,6 @@ void encore_compiler_worker_close(size_t child) { encore_build_process_close(chi
 int encore_compiler_worker_interrupted(void) { return encore_build_process_interrupted(); }
 bool encore_compiler_worker_watch_parent(uint64_t parent) { return encore_build_worker_watch_parent(parent); }
 uint64_t encore_compiler_process_id(void) { return encore_build_process_pid(); }
-uint64_t encore_compiler_memory_budget(void) {
-    return encore_build_effective_memory_budget();
-}
 
 bool encore_compiler_write_atomic(encore_compiler_str path, encore_compiler_str contents) {
     char *name = encore_compiler_cstr(path);

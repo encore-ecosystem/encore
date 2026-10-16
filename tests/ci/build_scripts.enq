@@ -1,0 +1,81 @@
+//! Exercise actual host script compilation, cwd, native linking and invalidation.
+import core::vec::Vec
+import json::{Json, stringify}
+import refrain::ci_helpers::{Fixture, std_dependencies}
+import std::os::{file_exists, file_sha256}
+
+fn script(metadata: str, fail: bool) -> str {
+    ret "import std::os::{argv, write_file}\nfn main() -> u32 {\n" +
+    "let path = argv(1_usize).unwrap_or(\"\")\n" +
+    "if write_file(\"script-executed\", \"yes\") != 0 { ret 2 }\n" +
+    "if " +(if fail {
+            "true"
+        } else {
+            "false"
+        }
+    ) + " { ret 3 }\n" +
+    "ret if write_file(path, " + stringify(Json::String(metadata)) + ") == 0 { 0 } else { 1 }\n}\n"
+}
+fn metadata(path: str) -> str {
+    ret "{\"native\":{\"libraries\":[{\"name\":\"answer\",\"path\":" + stringify(Json::String(path)) + "}]}}"
+}
+
+#attr(test)
+fn integration_native_build_scripts_contract() -> bool {
+    let fixture = Fixture::new("native-build-scripts")
+    let project = Fixture { fixture.root.join("package with spaces"), fixture.compiler }
+    project.put("encore.toml", "[project]\nname=\"script_probe\"\nversion=\"0.0.0\"\nbuild=\"scripts/build.enq\"\ndependencies=" + std_dependencies() + "\n")
+    project.put("src/main.enq", "extern fn native_answer() -> u32\nfn main() -> u32 { ret unsafe { native_answer() } - 42_u32 }\n")
+    project.put("scripts/build.enq", script(metadata("native code/answer.c"), false))
+    project.put("native code/answer.c", "#include <stdint.h>\nuint32_t native_answer(void) { return 42; }\n")
+    if !project.command(vec!["check"]).success() || file_exists(project.root.join("script-executed").as_str()) {
+        ret fixture.finish(false)
+    }
+    if !project.command(vec!["run"]).success() || !file_exists(project.root.join("script-executed").as_str()) {
+        ret fixture.finish(false)
+    }
+    if !project.command(vec!["build", "--timings"]).success() || !project.read("target/dev/encore-timings.json").contains("\"link_cache_hit\":true") {
+        ret fixture.finish(false)
+    }
+    project.put("native code/answer.c", "#include <stdint.h>\nuint32_t native_answer(void) { return 43; }\n")
+    if !project.command(vec!["build"]).success() || project.tool(project.binary("script_probe", "dev").as_str(), Vec[str]::new()).code() != 1 {
+        ret fixture.finish(false)
+    }
+    project.put("answer2.c", "#include <stdint.h>\nuint32_t native_answer(void) { return 42; }\n")
+    project.put("scripts/build.enq", script(metadata("answer2.c"), false))
+    if !project.command(vec!["run"]).success() {
+        ret fixture.finish(false)
+    }
+    project.put("tests/native.enq", "extern fn native_answer() -> u32\nfn main() -> u32 { ret unsafe { native_answer() } - 42_u32 }\n")
+    if !project.command(vec!["test", "--filter", "tests/native.enq"]).success() {
+        ret fixture.finish(false)
+    }
+    let previous = file_sha256(project.binary("script_probe", "dev").as_str())
+    project.put("scripts/build.enq", script(metadata("answer2.c"), true))
+    if project.command(vec!["build"]).success() || file_sha256(project.binary("script_probe", "dev").as_str()) != previous {
+        ret fixture.finish(false)
+    }
+    project.put("scripts/build.enq", script("{}", false))
+    if project.command(vec!["build"]).success() {
+        ret fixture.finish(false)
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_dependency_build_script_contract() -> bool {
+    let fixture = Fixture::new("dependency-build-script")
+    let dependency = Fixture { fixture.root.join("native provider"), fixture.compiler }
+    dependency.put("encore.toml", "[project]\nname=\"native_provider\"\nversion=\"0.0.0\"\nbuild=\"build.enq\"\ndependencies=" + std_dependencies() + "\n")
+    dependency.put("src/lib.enq", "extern fn native_answer() -> u32\n#attr(safe)\npub fn answer() -> u32 { ret native_answer() }\n")
+    dependency.put("runtime.c", "#include <stdint.h>\nuint32_t native_answer(void) { return 42; }\n")
+    // Advertising an automatic runtime source must not link it twice.
+    dependency.put("build.enq", script(metadata("runtime.c"), false))
+    let project = Fixture { fixture.root.join("consumer"), fixture.compiler }
+    project.manifest("script_consumer", "[\"path@../native provider\"]")
+    project.put("src/main.enq", "import native_provider::answer\nfn main() -> u32 { ret answer() - 42_u32 }\n")
+    if !project.command(vec!["run"]).success() {
+        ret fixture.finish(false)
+    }
+    ret fixture.finish(true)
+}

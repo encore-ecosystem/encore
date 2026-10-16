@@ -102,7 +102,4 @@ int32_t encore_ci_heap_capacity(int32_t mode) {
 #define main encore_ci_build_identity
 #include "../../../tests/native/build_identity.c"
 #undef main
-#define main encore_ci_build_resources
-#include "../../../tests/native/build_resources.c"
-#undef main
 #endif

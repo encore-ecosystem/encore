@@ -27,6 +27,28 @@ pub struct ParseReport {
     failures: Vec[ParseFailure]
 }
 
+/// Grammar roles used by source layout without duplicating type parsing.
+pub enum SourceLayoutRole {
+    Ordinary
+    TypeSuffix
+    TypePrefix
+    PlacementOpen
+    PlacementName
+    PlacementClose
+    FieldStart
+    ConstructorOpen
+    ConstructorClose
+    ImplStart
+    EnumVariantStart
+}
+
+/// Associates a physical source token with its parsed grammar role.
+pub struct SourceLayoutToken {
+    line: usize
+    column: usize
+    role: SourceLayoutRole
+}
+
 struct MacroArgument {
     tokens: Vec[Token]
 }
@@ -287,6 +309,8 @@ pub struct Parser {
     macros: Vec[BootstrapMacro]
     recovering: bool
     failures: Vec[ParseFailure]
+    capture_source_layout: bool
+    source_layout: Vec[SourceLayoutToken]
 }
 
 impl for Parser {
@@ -322,8 +346,62 @@ impl for Parser {
             false,
             Vec[BootstrapMacro]::new(),
             false,
-            Vec[ParseFailure]::new()
+            Vec[ParseFailure]::new(),
+            false,
+            Vec[SourceLayoutToken]::new()
         }
+    }
+
+    /// Enables optional grammar annotations for formatting source tokens.
+    pub fn with_source_layout(self: mut Self) -> Self {
+        self.capture_source_layout = true
+        ret self
+    }
+
+    /// Returns annotations in source order after parsing.
+    pub fn source_layout_tokens(self: Self) -> Vec[SourceLayoutToken] {
+        ret self.source_layout
+    }
+
+    fn record_source_layout(mut self, token: Token, role: SourceLayoutRole) ->() {
+        if !self.capture_source_layout {
+            ret()
+        }
+        // Normal parsing appends in O(1). Recovery and macro expansion may
+        // revisit earlier physical tokens; keep their annotations ordered and
+        // unique as well so a layout cursor never skips later valid source.
+        let mut index = self.source_layout.len()
+        while index > 0 {
+            match self.source_layout.get(index - 1) {
+                Some(previous) => {
+                    if previous.line < token.line ||(previous.line == token.line && previous.column < token.column) {
+                        break
+                    }
+                    if previous.line == token.line && previous.column == token.column {
+                        ret()
+                    }
+                }
+                None => {
+                    break
+                }
+            }
+            index -= 1
+        }
+        let value = SourceLayoutToken { token.line, token.column, role }
+        self.source_layout.push(value)
+        let mut cursor = self.source_layout.len() - 1
+        while cursor > index {
+            match self.source_layout.get(cursor - 1) {
+                Some(previous) => {
+                    self.source_layout.set(cursor, previous)
+                }
+                None => {
+                }
+            }
+            cursor -= 1
+        }
+        self.source_layout.set(index, value)
+        ret()
     }
 
     fn error_at(mut self, message: str, token: Token) -> Result[bool, ParseFailure] {
@@ -347,6 +425,7 @@ impl for Parser {
     fn prepare_tokens(mut self, tokens: Vec[Token]) -> Result[bool, ParseFailure] {
         self.macros = Vec[BootstrapMacro]::new()
         self.failures = Vec[ParseFailure]::new()
+        self.source_layout = Vec[SourceLayoutToken]::new()
         self.tokens = self.expand_macro_program(tokens)?
         self.consumed = 0_usize
         self.ast = Vec[Statement]::new()
@@ -527,8 +606,8 @@ impl for Parser {
         }
     }
 
-    fn box_expr(mut self, node: ExprNode) -> ExprNode < H > {
-        ret ExprNode < H > {
+    fn box_expr(mut self, node: ExprNode) -> ExprNode<H> {
+        ret ExprNode<H> {
             node.value, node.line, node.column, node.length, node.source_name
         }
     }
@@ -537,6 +616,7 @@ impl for Parser {
         while self.peek_curr_type() == TokenType::MODULE_DOC_COMMENT {
             self.consume()
         }
+        let item_start = self.peek_curr()
         let mut documentation = self.parse_documentation()
         let mut attrs = self.parse_function_attrs()?
         let decorators = self.parse_decorator_applications()?
@@ -573,6 +653,7 @@ impl for Parser {
                 ret Result[Statement, ParseFailure]::Ok(self.parse_trait(is_public, documentation)?)
             }
             TokenType::KW_IMPL => {
+                self.record_source_layout(item_start, SourceLayoutRole::ImplStart)
                 ret Result[Statement, ParseFailure]::Ok(self.parse_impl(documentation)?)
             }
             TokenType::KW_FN => {
@@ -687,6 +768,7 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                 break
             }
+            self.record_source_layout(self.peek_curr(), SourceLayoutRole::EnumVariantStart)
             let variant_documentation = self.parse_documentation()
             variants.push(self.parse_structure_shape(variant_documentation)?)
             let curr_type = self.peek_curr_type()
@@ -1055,6 +1137,7 @@ impl for Parser {
                 if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                     break
                 }
+                self.record_source_layout(self.peek_curr(), SourceLayoutRole::FieldStart)
                 let field_documentation = self.parse_documentation()
                 let field_token = self.safe_consume(TokenType::IDENTIFIER)?
                 let field_name = field_token.value
@@ -1918,6 +2001,19 @@ impl for Parser {
         ret Result[ExprNode, ParseFailure]::Ok(self.mk_expr_at(Expr::Float(value), token))
     }
 
+    // Header ambiguity applies only at the header's own delimiter level.
+    // Always restore both flags, including on failure and nested headers.
+    fn parse_delimited_expression(mut self) -> Result[ExprNode, ParseFailure] {
+        let control = self.parsing_control_flow_header
+        let matched = self.parsing_match_header
+        self.parsing_control_flow_header = false
+        self.parsing_match_header = false
+        let result = self.parse_expression()
+        self.parsing_control_flow_header = control
+        self.parsing_match_header = matched
+        ret result
+    }
+
     fn parse_parenthesized_or_tuple(mut self) -> Result[ExprNode, ParseFailure] {
         self.safe_consume(TokenType::LEFT_PAREN)?
         if self.peek_curr_type() == TokenType::RIGHT_PAREN {
@@ -1928,7 +2024,7 @@ impl for Parser {
                     )))
         }
 
-        let first = self.parse_expression()?
+        let first = self.parse_delimited_expression()?
         if self.peek_curr_type() != TokenType::COMMA {
             self.safe_consume(TokenType::RIGHT_PAREN)?
             ret Result[ExprNode, ParseFailure]::Ok(self.mk_expr(Expr::Parenthesized(self.box_expr(first))))
@@ -1944,7 +2040,7 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::RIGHT_PAREN {
                 break
             }
-            items.push(self.parse_expression()?)
+            items.push(self.parse_delimited_expression()?)
         }
         self.safe_consume(TokenType::RIGHT_PAREN)?
         ret Result[ExprNode, ParseFailure]::Ok(self.mk_expr(Expr::TupleLiteral(TupleLiteralExpr {
@@ -1963,7 +2059,7 @@ impl for Parser {
                     )))
         }
 
-        let first = self.parse_expression()?
+        let first = self.parse_delimited_expression()?
         if self.peek_curr_type() == TokenType::SEMICOLON {
             self.consume()
             let size = self.safe_consume_value(TokenType::INTEGER)?
@@ -1985,7 +2081,7 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::RIGHT_BRACKET {
                 break
             }
-            items.push(self.parse_expression()?)
+            items.push(self.parse_delimited_expression()?)
         }
         self.safe_consume(TokenType::RIGHT_BRACKET)?
         ret Result[ExprNode, ParseFailure]::Ok(self.mk_expr(Expr::ArrayLiteral(ArrayLiteralExpr {
@@ -1998,15 +2094,24 @@ impl for Parser {
         let opening = self.peek_curr()
         self.safe_consume(TokenType::LEFT_BRACE)?
         let mut statements = Vec[Statement]::new()
+        let mut tail = Option[ExprNode<H>]::None
         loop {
-            if !self.starts_expression_block_statement() {
+            if self.peek_curr_type() == TokenType::RIGHT_BRACE || self.peek_curr_type() == TokenType::EOF {
                 break
             }
-            statements.push(self.parse_inner_level()?)
-        }
-        let mut tail = Option[ExprNode < H >]::None
-        if self.peek_curr_type() != TokenType::RIGHT_BRACE {
-            tail = Option[ExprNode < H >]::Some(self.box_expr(self.parse_expression()?))
+            if self.starts_expression_block_statement() {
+                statements.push(self.parse_inner_level()?)
+                continue
+            }
+            let expression = self.parse_expression()?
+            if self.peek_curr_type() == TokenType::RIGHT_BRACE {
+                tail = Option[ExprNode<H>]::Some(self.box_expr(expression))
+                break
+            }
+            statements.push(Statement::Expr(expression))
+            if self.peek_curr_type() == TokenType::SEMICOLON {
+                self.consume()
+            }
         }
         let closing = self.peek_curr()
         self.safe_consume(TokenType::RIGHT_BRACE)?
@@ -2024,6 +2129,7 @@ impl for Parser {
         || token_type == TokenType::KW_WHILE
         || token_type == TokenType::KW_LOOP
         || token_type == TokenType::KW_DO
+        || token_type == TokenType::KW_FOR
         || token_type == TokenType::KW_EHIR
         || token_type == TokenType::KW_BREAK
         || token_type == TokenType::KW_CONTINUE {
@@ -2104,7 +2210,8 @@ impl for Parser {
     }
 
     fn parse_struct_initialization(mut self, path: str) -> Result[ExprNode, ParseFailure] {
-        self.safe_consume(TokenType::LEFT_BRACE)?
+        let opening = self.safe_consume(TokenType::LEFT_BRACE)?
+        self.record_source_layout(opening, SourceLayoutRole::ConstructorOpen)
         let mut values = Vec[ExprNode]::new()
         if self.peek_curr_type() != TokenType::RIGHT_BRACE {
             values.push(self.parse_expression()?)
@@ -2119,7 +2226,8 @@ impl for Parser {
                 values.push(self.parse_expression()?)
             }
         }
-        self.safe_consume(TokenType::RIGHT_BRACE)?
+        let closing = self.safe_consume(TokenType::RIGHT_BRACE)?
+        self.record_source_layout(closing, SourceLayoutRole::ConstructorClose)
         ret Result[ExprNode, ParseFailure]::Ok(self.mk_expr(Expr::StructInit(StructInitExpr {
                         path, values
                     }
@@ -2150,7 +2258,7 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::RIGHT_PAREN {
                 break
             }
-            match self.parse_expression() {
+            match self.parse_delimited_expression() {
                 Result[ExprNode, ParseFailure]::Ok(argument) => {
                     args.push(argument)
                 }
@@ -2279,12 +2387,7 @@ impl for Parser {
             out = out + "]"
         }
         if self.is_smart_pointer_suffix() {
-            self.safe_consume(TokenType::LESS)?
-            let pointer = self.safe_consume_value(TokenType::IDENTIFIER)?
-            self.safe_consume(TokenType::GREATER)?
-            out = out + "<"
-            out = out + pointer
-            out = out + ">"
+            out += self.parse_placement_suffix()?
         }
         ret Result[str, ParseFailure]::Ok(out)
     }
@@ -2408,12 +2511,12 @@ impl for Parser {
         // block semantics.
         let parsed = self.parse_block()?
         let mut statements = parsed.statements
-        let mut tail = Option[ExprNode < H >]::None
+        let mut tail = Option[ExprNode<H>]::None
         match statements.pop() {
             Option[Statement]::Some(statement) => {
                 match statement {
                     Statement::Expr(expr) => {
-                        tail = Option[ExprNode < H >]::Some(self.box_expr(expr))
+                        tail = Option[ExprNode<H>]::Some(self.box_expr(expr))
                     }
                     _ => {
                         statements.push(statement)
@@ -2434,13 +2537,13 @@ impl for Parser {
         self.safe_consume(TokenType::LEFT_BRACKET)?
         let mut items = Vec[ExprNode]::new()
         if self.peek_curr_type() != TokenType::RIGHT_BRACKET {
-            items.push(self.parse_expression()?)
+            items.push(self.parse_delimited_expression()?)
             while self.peek_curr_type() == TokenType::COMMA {
                 self.consume()
                 if self.peek_curr_type() == TokenType::RIGHT_BRACKET {
                     break
                 }
-                items.push(self.parse_expression()?)
+                items.push(self.parse_delimited_expression()?)
             }
         }
         self.safe_consume(TokenType::RIGHT_BRACKET)?
@@ -2704,7 +2807,8 @@ impl for Parser {
 
         let mut leading_reference = false
         if self.peek_curr_type() == TokenType::AMPERSAND {
-            self.consume()
+            let token = self.consume()
+            self.record_source_layout(token, SourceLayoutRole::TypePrefix)
             leading_reference = true
         }
 
@@ -2714,25 +2818,32 @@ impl for Parser {
             if self.peek_curr_type() != TokenType::ASTERISK {
                 break
             }
-            self.consume()
+            let token = self.consume()
+            self.record_source_layout(token, SourceLayoutRole::TypeSuffix)
             out = out + "*"
         }
 
         if self.is_smart_pointer_suffix() {
-            self.safe_consume(TokenType::LESS)?
-            let pointer = self.safe_consume_value(TokenType::IDENTIFIER)?
-            self.safe_consume(TokenType::GREATER)?
-            out = out + "<"
-            out = out + pointer
-            out = out + ">"
+            out += self.parse_placement_suffix()?
         } elif self.peek_curr_type() == TokenType::AMPERSAND {
-            self.consume()
+            let token = self.consume()
+            self.record_source_layout(token, SourceLayoutRole::TypeSuffix)
             out = out + "&"
         } elif leading_reference {
             out = out + "&"
         }
 
         ret Result[str, ParseFailure]::Ok(out)
+    }
+
+    fn parse_placement_suffix(mut self) -> Result[str, ParseFailure] {
+        let opening = self.safe_consume(TokenType::LESS)?
+        self.record_source_layout(opening, SourceLayoutRole::PlacementOpen)
+        let pointer = self.safe_consume(TokenType::IDENTIFIER)?
+        self.record_source_layout(pointer, SourceLayoutRole::PlacementName)
+        let closing = self.safe_consume(TokenType::GREATER)?
+        self.record_source_layout(closing, SourceLayoutRole::PlacementClose)
+        ret Result[str, ParseFailure]::Ok("<" + pointer.value + ">")
     }
 
     fn parse_type_base(mut self) -> Result[str, ParseFailure] {

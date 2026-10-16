@@ -20,7 +20,7 @@ dependencies = [
 | Field | Meaning |
 | --- | --- |
 | `name` | package name |
-| `target` | `auto`, `executable`, `static_lib` or `shared_lib` |
+| `target` | output kind: `auto`, `executable`, `static_lib` or `shared_lib`; legacy target triples are also accepted |
 | `version` | package version string |
 | `description` | package description |
 | `readme` | readme path |
@@ -30,6 +30,18 @@ dependencies = [
 
 `core` is a system dependency injected by the compiler. Do not add `sys@core`
 manually.
+
+With `auto`, a package with `src/main.enq` builds an executable; a library-only
+package with `src/lib.enq` builds a static library. When both exist, direct builds
+use `main.enq`, while consumers always use the library entrypoint. An explicit
+`static_lib` or `shared_lib` selects `lib.enq` even if `main.enq` also exists.
+Use `encore build --target <triple>` to select the architecture independently.
+
+Library artifacts are `lib<name>.a` (MSVC: `<name>.lib`) or `lib<name>.so`
+(macOS: `lib<name>.dylib`, Windows: `<name>.dll`). Static archives include their
+dependency objects and runtime support; shared libraries export linked symbols.
+`--emit object`, `--emit llvm-ir`, and `--emit ehir` also accept library packages.
+`encore run` and executable installation require an executable project.
 
 ## Package Compilation And Cache
 
@@ -347,6 +359,18 @@ dependencies = []
 
 Native library entries can name a system library or a file path. Optional `cfg`
 fields let metadata apply only to matching compile-time configurations.
+
+Scripts are compiled for the host and executed with their package as the working
+directory. Their optional second and third arguments contain the requested target
+triple and profile. Paths in metadata are relative to the declaring package, not
+the consumer or the metadata output directory. Source files are compiled once;
+archives/objects are linked as files, and name-only entries select system libraries.
+
+The compiled host script is cached, but executes on each build so changes to its
+inputs are observed. Its selected sources, included headers, native files and link
+arguments participate in native/link cache identities. A failed script, missing
+output or malformed metadata stops the build rather than reusing stale metadata.
+`encore test` also applies build scripts; `encore check` does not execute them.
 
 ## Validation Commands
 
