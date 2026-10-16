@@ -59,11 +59,14 @@ Language, package and cross-compilation documentation is in
 
 ## Development
 
-An existing native compiler can build and test this repository:
+This checkout contains the compiler, system libraries and backends (`packages/`),
+and language server (`lsp/`). No separate package-index checkout is required.
+An installed Encore compiler can bootstrap it:
 
 ```sh
-./target/extreme/encore build --profile extreme
+encore build --profile extreme
 ./target/extreme/encore test
+(cd lsp && ../target/extreme/encore build --profile release)
 ```
 
 The final two bootstrap compilers must be byte-identical.

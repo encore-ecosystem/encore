@@ -19,11 +19,8 @@ version=${release%%-*}
 release_name=${release#*-}
 test "$release" = "$version-$release_name"
 target_kit_abi=$(printf '%s\n' "$version" | awk -F. '{print $1 "." $2}')
-dependencies_checksum=$(awk 'NF {print tolower($1); exit}' \
-  target/dependency-download/dependencies.tar.gz.sha256)
-index_root="$PWD/../encore-index"
-test -f "$index_root/packages/core/encore.toml"
-export ENCORE_CORE_DIR="$index_root/packages/core"
+test -f packages/core/encore.toml
+export ENCORE_CORE_DIR="$PWD/packages/core"
 
 mkdir -p target/stage1-builder
 "$seed_compiler" build --profile extreme
@@ -44,8 +41,8 @@ executable_checksum=$(sha256sum "$destination/encore.exe" | awk '{print $1}')
 jq -n --arg commit "${GITHUB_SHA:?}" --arg version "$version" \
   --arg nametag "$release_name" --arg release "$release" --arg seed "$seed_tag" \
   --arg target "$target" --arg target_kit_abi "$target_kit_abi" \
-  --arg dependencies "$dependencies_checksum" --arg sha256 "$executable_checksum" \
-  '{schema:2, commit:$commit, version:$version, nametag:$nametag,
+  --arg sha256 "$executable_checksum" \
+  '{schema:3, commit:$commit, version:$version, nametag:$nametag,
     release:$release, seed:$seed, bootstrap:null, producer:"linux", target:$target,
-    target_kit_abi:$target_kit_abi, dependencies_sha256:$dependencies,
+    target_kit_abi:$target_kit_abi,
     executable:"encore.exe", executable_sha256:$sha256}' > "$destination/manifest.json"

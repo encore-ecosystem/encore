@@ -1,5 +1,5 @@
 name: Restore verified stage3
-description: Shared immutable compiler and dependency context for checks and packaging
+description: Restore the verified compiler for this self-contained source checkout
 inputs:
   triple:
     required: true
@@ -10,9 +10,6 @@ inputs:
   seed_tag:
     required: true
     description: Selected published seed
-  index_sha:
-    required: true
-    description: Immutable system-library revision
 runs:
   using: composite
   steps:
@@ -25,18 +22,17 @@ runs:
         CI_TARGET: ${{ inputs.triple }}
         CI_EXECUTABLE: ${{ inputs.executable }}
         CI_SEED_TAG: ${{ inputs.seed_tag }}
-        CI_INDEX_SHA: ${{ inputs.index_sha }}
       run: |
         set -euo pipefail
         context=target/test-context
         release=$(tr -d '\r\n' < VERSION)
         jq -e --arg commit "$GITHUB_SHA" --arg release "$release" \
-          --arg target "$CI_TARGET" --arg seed "$CI_SEED_TAG" --arg index "$CI_INDEX_SHA" '
-          .schema == 2 and .commit == $commit and .release == $release and
-          .target == $target and .seed == $seed and .index_commit == $index and
+          --arg target "$CI_TARGET" --arg seed "$CI_SEED_TAG" '
+          .schema == 3 and .commit == $commit and .release == $release and
+          .target == $target and .seed == $seed and
           .converged == true and .stage2_sha256 == .stage3_sha256 and
           .compiler_sha256 == .stage3_sha256 and
-          ([.compiler_sha256, .dependencies_sha256] |
+          ([.compiler_sha256, .stage2_sha256, .stage3_sha256] |
             all(.[]; type == "string" and test("^[0-9a-f]{64}$")))
           ' "$context/provenance.json" >/dev/null
         compiler="$context/bin/$CI_EXECUTABLE"
@@ -46,19 +42,16 @@ runs:
           actual=$(shasum -a 256 "$compiler" | awk '{print $1}')
         fi
         test "$actual" = "$(jq -r '.compiler_sha256' "$context/provenance.json")"
+        # Compiler, libraries and LSP belong to the same checked-out commit.
+        test -f packages/core/encore.toml
+        test -f packages/platform/encore.toml
+        test -f lsp/encore.toml
         mkdir -p target/stage3
         cp "$compiler" "target/stage3/$CI_EXECUTABLE"
         chmod +x "target/stage3/$CI_EXECUTABLE"
         cp "$context/provenance.json" target/convergence.json
-        # Artifact uploads omit empty directories. Registry is an optional cache,
-        # unlike the pinned system sources required for every downstream job.
         mkdir -p target/registry
-        if test -d "$context/registry"; then
-          cp -R "$context/registry/." target/registry/
-        fi
-        cp -R "$context/system-index" target/
-        index_root="$PWD/../encore-index"
-        test ! -e "$index_root"
-        cp -R target/system-index "$index_root"
-        printf 'ENCORE_CORE_DIR=%s\n' "$index_root/packages/core" >> "$GITHUB_ENV"
+        core="$PWD/packages/core"
+        if command -v cygpath >/dev/null 2>&1; then core=$(cygpath -m "$core"); fi
+        printf 'ENCORE_CORE_DIR=%s\n' "$core" >> "$GITHUB_ENV"
         printf 'ENCORE_INDEX_URL=http://127.0.0.1:9/index\n' >> "$GITHUB_ENV"

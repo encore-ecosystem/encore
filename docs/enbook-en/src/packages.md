@@ -331,7 +331,7 @@ encore test --cfg feature=my_feature
 ## Native Build Scripts
 
 Build scripts let packages publish native link metadata. The official `core`
-package in `encore-ecosystem/encore-index` is the reference pattern. A build
+package under `packages/core` in the compiler repository is the reference pattern. A build
 script writes JSON to the path passed as argv `1`:
 
 ```json

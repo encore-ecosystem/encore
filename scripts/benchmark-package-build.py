@@ -45,7 +45,7 @@ def main():
                 '[project]\nname="build_benchmark"\nversion="0.0.0"\ndependencies=' + json.dumps(dependencies) + '\n')
             (root / "src/main.enq").write_text('\n'.join(imports) + '\nfn main() -> u32 { let total = ' +
                 ' + '.join(calls) + '\nret if total == 36_u64 { 0 } else { 1 } }\n')
-            environment = {**os.environ, "ENCORE_CORE_DIR": str(repository.parent / "encore-index/packages/core"),
+            environment = {**os.environ, "ENCORE_CORE_DIR": str(repository / "packages/core"),
                            "ENCORE_BUILD_CACHE": str(root / "cache")}
 
             def measure(name):

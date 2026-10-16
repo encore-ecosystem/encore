@@ -102,7 +102,7 @@ int32_t encore_ci_artifact_snapshot(encore_compiler_str directory) {
 #include "../../../tests/native/build_contracts.c"
 #include "../../../tests/native/registry_server.c"
 #define main encore_ci_heap_main
-#include "../../../../encore-index/packages/core/tests/heap_capacity.c"
+#include "../../../packages/core/tests/heap_capacity.c"
 #undef main
 
 int32_t encore_ci_heap_capacity(int32_t mode) {
@@ -134,7 +134,7 @@ int32_t encore_ci_heap_capacity(int32_t mode) {
 }
 
 #define main encore_ci_environment_threads
-#include "../../../../encore-index/packages/platform/tests/environment_threads.c"
+#include "../../../packages/platform/tests/environment_threads.c"
 #undef main
 #define main encore_ci_build_queue
 #include "../../../tests/native/build_runtime.c"
