@@ -152,6 +152,11 @@ case "$CI_PROBE_CASE" in
       printf '%s\n' "$release" > "$root/VERSION"
       cp "$repository/tests/ci/mock-compiler.sh" "$root/bin/encore$extension"
       cp "$root/bin/encore$extension" "$root/bin/encore-lsp$extension"
+      for package in core platform std rich serialize json binary log profile ehir ehir-llvm-backend toml colorterm llvm argparse secret-store; do
+        mkdir -p "$root/lib/encore/index/$package/src"
+        cp "$repository/packages/$package/encore.toml" "$root/lib/encore/index/$package/"
+        cp "$repository/packages/$package/src/lib.enq" "$root/lib/encore/index/$package/src/"
+      done
       digest=$(sha256sum "$root/bin/encore$extension" | awk '{print $1}')
       jq -n --arg sha "$digest" '{compiler_sha256:$sha, lsp_sha256:$sha}' > provenance.json
       if [[ -n "$extension" ]]; then zip -qr "$asset" "$root"; else tar -czf "$asset" "$root"; fi
@@ -159,6 +164,12 @@ case "$CI_PROBE_CASE" in
       if bash "$repository/scripts/verify-release-archive.sh" "$triple" wrong "$asset" provenance.json; then exit 1; fi
       jq '.lsp_sha256 = "wrong"' provenance.json > invalid.json
       if bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$asset" invalid.json; then exit 1; fi
+      mv "$root/lib/encore/index/serialize" missing-serialize
+      if [[ -n "$extension" ]]; then zip -qr incomplete.zip "$root"; else tar -czf incomplete.tar.gz "$root"; fi
+      incomplete=incomplete.tar.gz
+      [[ -z "$extension" ]] || incomplete=incomplete.zip
+      if bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$incomplete" provenance.json; then exit 1; fi
+      mv missing-serialize "$root/lib/encore/index/serialize"
       if [[ -z "$extension" ]]; then
         tar -cf duplicate.tar "$root"
         tar -rf duplicate.tar "$root/VERSION"

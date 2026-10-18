@@ -7,6 +7,10 @@ provenance=${4:?provenance required}
 root="encore-$release-$triple"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
 extension=
 case "$triple" in
   *-windows-*) extension=.exe; unzip -Z1 "$archive" > "$scratch/members" ;;
@@ -29,5 +33,13 @@ for binary in encore encore-lsp; do
   read_member "bin/$binary$extension" > "$scratch/binary"
   key=compiler_sha256
   [[ "$binary" != encore-lsp ]] || key=lsp_sha256
-  test "$(sha256sum "$scratch/binary" | awk '{print $1}')" = "$(jq -r --arg key "$key" '.[$key]' "$provenance")"
+  test "$(hash_file "$scratch/binary")" = "$(jq -r --arg key "$key" '.[$key]' "$provenance")"
+done
+# Bundled path dependencies must be present alongside their consumers. In
+# particular, JSON now requires serialize even in a fresh offline install.
+for package in core platform std rich serialize json binary log profile ehir ehir-llvm-backend toml colorterm llvm argparse secret-store; do
+  read_member "lib/encore/index/$package/encore.toml" > "$scratch/manifest"
+  test -s "$scratch/manifest"
+  read_member "lib/encore/index/$package/src/lib.enq" > "$scratch/source"
+  test -s "$scratch/source"
 done
