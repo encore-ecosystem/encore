@@ -578,6 +578,9 @@ struct TranslatorContext {
     type_index: usize
     types: Vec[str]
     type_collisions: Vec[str]
+    type_identity_scope_size: usize
+    type_identity_cache: usize
+    type_identity_values: Vec[str]
     traits: Vec[TraitType]
     trait_impls: Vec[TraitImplType]
     generic_callables: Vec[GenericCallable]
@@ -626,6 +629,16 @@ struct TranslatorContext {
     reflection_specializations: Vec[ReflectionSpecialization]
     reflection_emitted: usize
     reflection_templates: Vec[ReflectionSpecialization]
+    reflection_shapes: Vec[ReflectionShapeCache]
+}
+
+struct ReflectionShapeCache {
+    source: str
+    scope: str
+    type_count: usize
+    field_count: usize
+    variant_count: usize
+    shapes: Vec[ReflectionShape]
 }
 
 struct ReflectionSpecialization {
@@ -1094,7 +1107,38 @@ fn qualify_module_type_collisions(ctx: mut TranslatorContext, module: Translatio
     ret out
 }
 
+// Module declarations/imports and ABI policy are immutable for this context.
+// Keep this cache context-local: identical spellings in another module, or a
+// later translation, must resolve independently. Zero denotes a cache miss;
+// an empty/ambiguous resolution is cached as an ordinary vector entry.
 fn resolved_type_collision(ctx: mut TranslatorContext,
+    module: TranslationModule, name: str,) -> str {
+    // Generic binders can temporarily hide nominal collision candidates.
+    // Preserve the existing lexical resolution in those scopes rather than
+    // reusing an identity computed outside the binder.
+    if ctx.type_collisions.len() != ctx.type_identity_scope_size {
+        ret resolve_type_collision_uncached(ctx, module, name)
+    }
+    for parameter in ctx.active_generics {
+        if contains_str(ctx.type_collisions, parameter.name) {
+            ret resolve_type_collision_uncached(ctx, module, name)
+        }
+    }
+    let key = module.module_id + "\n" + name
+    let cached = unsafe {
+        encore_strmap_get(ctx.type_identity_cache, key)
+    }
+    if cached != 0 {
+        ret ctx.type_identity_values.get_unchecked_borrowed(cached - 1)
+    }
+    let identity = resolve_type_collision_uncached(ctx, module, name)
+    ctx.type_identity_values.push(identity)
+    unsafe {
+        encore_strmap_put(ctx.type_identity_cache, key, ctx.type_identity_values.len())
+    }
+    ret identity
+}
+fn resolve_type_collision_uncached(ctx: mut TranslatorContext,
     module: TranslationModule, name: str,) -> str {
     // A local import spelling is not a declaration name. Resolve it through
     // the selected export before asking which module declares the nominal type.
@@ -1151,7 +1195,7 @@ fn resolved_type_collision(ctx: mut TranslatorContext,
 fn intrinsic_type_owner(module: str, name: str) -> bool {
     // Ready is an ordinary generic wrapper with no compiler/runtime ABI.
     // Preserve its nominal identity when a consumer declares its own Ready.
-    ret (starts_with(module, "core@") && name != "Ready") ||
+    ret(starts_with(module, "core@") && name != "Ready") ||
     ((module == "std@thread/mod.enq" || module == "platform@thread/mod.enq") && name == "JoinHandle")
 }
 
@@ -1403,6 +1447,7 @@ fn free_translation_indexes(ctx: TranslatorContext) ->() {
         encore_strmap_free(ctx.function_heads)
         encore_strmap_free(ctx.function_overload_counts)
         encore_strmap_free(ctx.type_index)
+        encore_strmap_free(ctx.type_identity_cache)
         encore_strmap_free(ctx.field_index)
         encore_strset_free(ctx.owning_type_index)
     }
@@ -1450,18 +1495,22 @@ fn translate_ast_with_context(ctx: mut TranslatorContext, ast: Vec[Statement], t
                 let old_self = ctx.self_type
                 ctx.self_type = ""
                 let mut lowered = translate_function_named(ctx, specialization.item,
-                    specialization.name, function_ret_type(specialization.item), Vec[GenericParam]::new()).finish()
+                    specialization.name, function_ret_type(specialization.item), Vec[GenericParam]::new(),).finish()
                 let owner_index = lookup_module_source_alias(ctx.module_index, specialization.item.source_name)
                 if owner_index > 0 {
                     match ctx.modules.get(owner_index - 1) {
-                        Some(owner) => { lowered = qualify_module_type_collisions(ctx, owner, lowered) }
-                        None => {}
+                        Some(owner) => {
+                            lowered = qualify_module_type_collisions(ctx, owner, lowered)
+                        }
+                        None => {
+                        }
                     }
                 }
                 builder = builder.append_str(lowered)
                 ctx.self_type = old_self
             }
-            None => {}
+            None => {
+            }
         }
     }
     for declaration in ctx.extern_functions {
@@ -1560,7 +1609,10 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
             encore_strmap_new()
         }
         ,
-        Vec[str]::new(), type_collisions, Vec[TraitType]::new(),
+        Vec[str]::new(), type_collisions, type_collisions.len(), unsafe {
+            encore_strmap_new()
+        }
+        , Vec[str]::new(), Vec[TraitType]::new(),
         Vec[TraitImplType]::new(), Vec[GenericCallable]::new(), Vec[DecoratorType]::new(),
         Vec[StructFieldType]::new(),
         unsafe {
@@ -1575,7 +1627,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
         Vec[str]::new(), Vec[VariableRegion]::new(), Vec[usize]::new(), Vec[usize]::new(),
         Vec[usize]::new(), Vec[usize]::new(), Vec[str]::new(), Vec[str]::new(),
         Vec[str]::new(), Vec[str]::new(), Vec[str]::new(), 1_usize, stable_abi, "", 0, Vec[str]::new(),
-        Vec[ReflectionSpecialization]::new(), 0, Vec[ReflectionSpecialization]::new()
+        Vec[ReflectionSpecialization]::new(), 0, Vec[ReflectionSpecialization]::new(), Vec[ReflectionShapeCache]::new()
     }
     // Struct/enum syntax nodes intentionally carry no source path. In a
     // resolved workspace, collect them through their owning module so two
@@ -2378,26 +2430,18 @@ fn ctx_add_function(ctx: mut TranslatorContext, source_name: str, name: str, ret
         encore_strmap_get(ctx.function_heads, name)
     }
     ctx.function_next.push(previous_head)
+    // Resolve nominal types in the declaration module, while keeping the
+    // trait's Self placeholder available for implementation substitution.
     let owner = function_owner_name(name)
-    let trait_contract = owner != "" && source_declares_trait(ctx, source_name, owner)
-    let resolved_ret_type = if trait_contract && !ctx.stable_abi {
-        canonical_type(ret_type)
-    } else {
-        qualified_generic_type(ctx, source_name, ret_type, generics)
+    let mut signature_generics = copy_str_vec(generics)
+    if owner != "" && source_declares_trait(ctx, source_name, owner) {
+        signature_generics.push(owner)
     }
-    let resolved_output_type = if trait_contract && !ctx.stable_abi {
-        canonical_type(output_type)
-    } else {
-        qualified_generic_type(ctx, source_name, output_type, generics)
-    }
+    let resolved_ret_type = qualified_generic_type(ctx, source_name, ret_type, signature_generics)
+    let resolved_output_type = qualified_generic_type(ctx, source_name, output_type, signature_generics)
     let mut resolved_params = Vec[str]::new()
     for param in params {
-        resolved_params.push(if trait_contract && !ctx.stable_abi {
-                canonical_type(param)
-            } else {
-                qualified_generic_type(ctx, source_name, param, generics)
-            }
-        )
+        resolved_params.push(qualified_generic_type(ctx, source_name, param, signature_generics))
     }
     ctx.functions.push(FunctionType {
             name, emitted_name, source_name, resolved_ret_type, resolved_params, sending_params, frozen_params, readonly_self,
@@ -5752,11 +5796,17 @@ fn translate_decorated_function(ctx: mut TranslatorContext, item: FunctionItem,
 }
 
 fn translate_cached_function(ctx: mut TranslatorContext, item: FunctionItem) -> EhirTextBuilder {
-    if function_uses_reflection(item) { ret translate_function(ctx, item) }
+    if function_uses_reflection(item) {
+        ret translate_function(ctx, item)
+    }
     if !ctx.reflection_templates.is_empty() {
         let mut names = Vec[str]::new()
-        for template in ctx.reflection_templates { names.push(template.item.name) }
-        if calls_reflection_templates(item, names) { ret translate_function(ctx, item) }
+        for template in ctx.reflection_templates {
+            names.push(template.item.name)
+        }
+        if calls_reflection_templates(item, names) {
+            ret translate_function(ctx, item)
+        }
     }
     if !ctx.record_function_cache || item.is_async || item.is_extern || !item.generics.is_empty() ||
     !item.decorators.is_empty() {
@@ -5830,7 +5880,7 @@ EhirTextBuilder {
 fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, emitted_name: str, ret_type:
     str, scope_generics: Vec[GenericParam],) -> EhirTextBuilder {
     if (!fn_item.generics.is_empty() || !scope_generics.is_empty()) &&
-        is_translation_reflection_template(ctx, fn_item) {
+    is_translation_reflection_template(ctx, fn_item) {
         ret EhirTextBuilder::new()
     }
     let fn_item = expand_translation_reflection(ctx, fn_item, scope_generics)
@@ -5975,69 +6025,146 @@ fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, e
 }
 
 fn expand_translation_reflection(ctx: mut TranslatorContext, item: FunctionItem,
-    scope_generics: Vec[GenericParam]) -> FunctionItem {
+    scope_generics: Vec[GenericParam],) -> FunctionItem {
     if !item.generics.is_empty() || !scope_generics.is_empty() || !function_uses_reflection(item) {
         ret item
     }
-    let mut shapes = Vec[ReflectionShape]::new()
-    for owner in ctx.types {
-        let mut fields = Vec[(str, str)]::new()
-        let mut parameters = Vec[str]::new()
-        for field in ctx.fields {
-            if field.owner == owner {
-                fields.push((field.field, field.typ))
-                parameters = field.generic_names
-            }
-        }
-        let mut kind = "Struct"
-        for variant in ctx.enum_variants {
-            if variant.owner == owner {
-                kind = "Enum"
-                parameters = variant.generics
-                fields.push((last_type_path_segment(variant.path), variant.payload_type))
-            }
-        }
-        let mut attributes = Vec[(str, str, str)]::new()
-        for module in ctx.modules {
-            for declaration in module.ast {
-                match declaration {
-                    Statement::Struct(item) => {
-                        if qualified_type_for_source(ctx, module.source_name, item.name) == owner {
-                            for field in item.named_fields {
-                                for attribute in field.attributes { attributes.push((field.name, attribute.0, attribute.1)) }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        shapes.push(ReflectionShape { owner, owner, kind, parameters, fields, attributes })
-        for module in ctx.modules {
-            for declaration in module.ast {
-                let name = match declaration {
-                    Statement::Struct(value) => value.name
-                    Statement::EnumItem(value) => value.name
-                    _ => ""
-                }
-                if name != "" && qualified_type_for_source(ctx, module.source_name, name) == owner {
-                    shapes.push(ReflectionShape { module_import_path(module.module_id) + "::" + name,
-                        owner, kind, parameters, fields, attributes })
-                    if qualified_type_for_source(ctx, item.source_name, name) == owner {
-                        shapes.push(ReflectionShape { name, owner, kind, parameters, fields, attributes })
-                    }
-                }
-            }
-        }
-    }
+    let shapes = translation_reflection_shapes(ctx, item.source_name)
     match expand_reflection_function(item, shapes) {
-        Ok(expanded) => { ret expanded }
+        Ok(expanded) => {
+            ret expanded
+        }
         Err(message) => {
             translation_error_at(item.source_name, item.line, item.column,
-                "invalid-reflection", message)
+                "invalid-reflection", message,)
         }
     }
     ret item
+}
+
+// Registry entries are append-only. Cache by source scope and registry sizes;
+// source-local aliases must not leak into another function's module.
+fn translation_reflection_shapes(ctx: mut TranslatorContext, source: str) -> Vec[ReflectionShape] {
+    let scope = join_strs(generic_param_names(ctx.active_generics), ",") + ":" + ctx.type_collisions.len().fmt()
+    for cached in ctx.reflection_shapes {
+        if cached.source == source && cached.scope == scope && cached.type_count == ctx.types.len() &&
+        cached.field_count == ctx.fields.len() && cached.variant_count == ctx.enum_variants.len() {
+            ret cached.shapes
+        }
+    }
+    let mut bases = Vec[ReflectionShape]::with_capacity(ctx.types.len())
+    let mut aliases = Vec[Vec[ReflectionShape]]::with_capacity(ctx.types.len())
+    for owner in ctx.types {
+        bases.push(ReflectionShape {
+                owner, owner, "Struct", Vec[str]::new(), Vec[(str, str)]::new(), Vec[(str, str, str)]::new()
+            }
+            ,
+        )
+        aliases.push(Vec[ReflectionShape]::new())
+    }
+    // type_index and types use the same one-based declaration order. Group
+    // fields/variants once instead of rescanning every registry for every type.
+    for field in ctx.fields {
+        let encoded = unsafe {
+            encore_strmap_get(ctx.type_index, field.owner)
+        }
+        if encoded == 0 {
+            continue
+        }
+        let shape = bases.get_unchecked_borrowed(encoded - 1)
+        let mut fields = shape.fields
+        fields.push((field.field, field.typ))
+        bases.set(encoded - 1, ReflectionShape {
+                shape.name, shape.identity, shape.kind, field.generic_names, fields, shape.attributes
+            }
+            ,
+        )
+    }
+    for variant in ctx.enum_variants {
+        let encoded = unsafe {
+            encore_strmap_get(ctx.type_index, variant.owner)
+        }
+        if encoded == 0 {
+            continue
+        }
+        let shape = bases.get_unchecked_borrowed(encoded - 1)
+        let mut fields = shape.fields
+        fields.push((last_type_path_segment(variant.path), variant.payload_type))
+        bases.set(encoded - 1, ReflectionShape {
+                shape.name, shape.identity, "Enum", variant.generics, fields, shape.attributes
+            }
+            ,
+        )
+    }
+    for module in ctx.modules {
+        for declaration in module.ast {
+            match declaration {
+                Statement::Struct(item) => {
+                    let owner = qualified_type_for_source(ctx, module.source_name, item.name)
+                    let encoded = unsafe {
+                        encore_strmap_get(ctx.type_index, owner)
+                    }
+                    if encoded == 0 {
+                        continue
+                    }
+                    let shape = bases.get_unchecked_borrowed(encoded - 1)
+                    let mut attributes = shape.attributes
+                    for field in item.named_fields {
+                        for attribute in field.attributes {
+                            attributes.push((field.name, attribute.0, attribute.1))
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    for module in ctx.modules {
+        for declaration in module.ast {
+            let name = match declaration {
+                Statement::Struct(value) => value.name Statement::EnumItem(value) => value.name _ => ""
+            }
+            if name == "" {
+                continue
+            }
+            let owner = qualified_type_for_source(ctx, module.source_name, name)
+            let encoded = unsafe {
+                encore_strmap_get(ctx.type_index, owner)
+            }
+            if encoded == 0 {
+                continue
+            }
+            let shape = bases.get_unchecked_borrowed(encoded - 1)
+            let mut names = aliases.get_unchecked_borrowed(encoded - 1)
+            names.push(ReflectionShape {
+                    module_import_path(module.module_id) + "::" + name, owner,
+                    shape.kind, shape.parameters, shape.fields, shape.attributes
+                }
+                ,)
+            if qualified_type_for_source(ctx, source, name) == owner {
+                names.push(ReflectionShape {
+                        name, owner, shape.kind, shape.parameters, shape.fields, shape.attributes
+                    }
+                    ,
+                )
+            }
+        }
+    }
+    // Preserve the original canonical/qualified/local alias precedence.
+    let mut shapes = Vec[ReflectionShape]::new()
+    for index in 0..bases.len() {
+        shapes.push(bases.get_unchecked_borrowed(index))
+        for alias in aliases.get_unchecked_borrowed(index) {
+            shapes.push(alias)
+        }
+    }
+    ctx.reflection_shapes.push(ReflectionShapeCache {
+            source, scope, ctx.types.len(), ctx.fields.len(), ctx.enum_variants.len(), shapes
+        }
+        ,
+    )
+    ret shapes
 }
 
 fn register_reflection_templates(ctx: mut TranslatorContext, ast: Vec[Statement]) ->() {
@@ -6047,26 +6174,30 @@ fn register_reflection_templates(ctx: mut TranslatorContext, ast: Vec[Statement]
             Statement::Function(item) => {
                 if !item.generics.is_empty() && function_uses_reflection(item) {
                     ctx.reflection_templates.push(ReflectionSpecialization {
-                        qualified_callable_name(ctx, item.source_name, item.name), item
-                    })
+                            qualified_callable_name(ctx, item.source_name, item.name), item
+                        }
+                        ,)
                 }
             }
             Statement::Impl(implementation) => {
                 for method in implementation.methods {
                     let generics = combined_generic_params(implementation.generics, method.generics)
-                    if generics.is_empty() || !function_uses_reflection(method) { continue }
+                    if generics.is_empty() || !function_uses_reflection(method) {
+                        continue
+                    }
                     let mut params = Vec[FunctionParam]::new()
                     let mut index = 0_usize
                     let types = function_param_types_for_owner(method, implementation.target)
                     for param in method.params {
                         params.push(FunctionParam {
-                            param.name, Option[str]::Some(types.get(index).unwrap_or("void")),
-                            param.is_sending, param.is_frozen, param.line, param.column
-                        })
+                                param.name, Option[str]::Some(types.get(index).unwrap_or("void")),
+                                param.is_sending, param.is_frozen, param.line, param.column
+                            }
+                            ,)
                         index += 1
                     }
                     let name = qualified_callable_name(ctx, method.source_name,
-                        base_type_name(implementation.target) + "::" + method.name)
+                        base_type_name(implementation.target) + "::" + method.name,)
                     let item = FunctionItem {
                         method.attrs, method.decorators, method.is_public, method.is_extern,
                         method.is_async, method.name, method.documentation, generics, params,
@@ -6077,41 +6208,58 @@ fn register_reflection_templates(ctx: mut TranslatorContext, ast: Vec[Statement]
                     ctx.reflection_templates.push(ReflectionSpecialization { name, item })
                 }
             }
-            _ => {}
+            _ => {
+            }
         }
     }
     ret()
 }
 
 fn is_translation_reflection_template(ctx: TranslatorContext, item: FunctionItem) -> bool {
-    if function_uses_reflection(item) { ret true }
+    if function_uses_reflection(item) {
+        ret true
+    }
     for template in ctx.reflection_templates {
         if template.item.source_name == item.source_name && template.item.line == item.line &&
-            template.item.column == item.column { ret true }
+        template.item.column == item.column {
+            ret true
+        }
     }
     ret false
 }
 
 fn specialize_reflection_call(ctx: mut TranslatorContext, source_name: str, definition_source: str, name: str,
-    arguments: Vec[str]) -> str {
-    if arguments.is_empty() { ret "" }
+    arguments: Vec[str],) -> str {
+    if arguments.is_empty() {
+        ret ""
+    }
     for argument in arguments {
         for generic in ctx.active_generics {
-            if replace_type_token(argument, generic.name, "__unresolved_reflection_generic") != argument { ret "" }
+            if replace_type_token(argument, generic.name, "__unresolved_reflection_generic") != argument {
+                ret ""
+            }
         }
     }
     for template in ctx.reflection_templates {
         if template.name != name || !function_visible_from(ctx, source_name,
-            template.item.source_name, template.name) { continue }
+            template.item.source_name, template.name,) {
+            continue
+        }
         if definition_source != "" && module_identity_for_source(ctx, template.item.source_name) !=
-            module_identity_for_source(ctx, definition_source) { continue }
+        module_identity_for_source(ctx, definition_source) {
+            continue
+        }
         let parameters = generic_param_names(template.item.generics)
-        if parameters.len() != arguments.len() { continue }
+        if parameters.len() != arguments.len() {
+            continue
+        }
         let key = module_identity_for_source(ctx, template.item.source_name) + "\n" + name + "\n" +
-            Debug::fmt(template.item.line) + ":" + Debug::fmt(template.item.column) + "\n" + join_strs(arguments, "\n")
+        Debug::fmt(template.item.line) + ":" + Debug::fmt(template.item.column) + "\n" + join_strs(arguments, "\n")
         let emitted = "__encore_reflect_" + compiler_content_digest(key)
         for existing in ctx.reflection_specializations {
-            if existing.name == emitted { ret emitted }
+            if existing.name == emitted {
+                ret emitted
+            }
         }
         match specialize_reflection_function(template.item, parameters, arguments) {
             Ok(item) => {
@@ -6120,7 +6268,7 @@ fn specialize_reflection_call(ctx: mut TranslatorContext, source_name: str, defi
             }
             Err(message) => {
                 translation_error_at(template.item.source_name, template.item.line,
-                    template.item.column, "reflection-specialization", message)
+                    template.item.column, "reflection-specialization", message,)
             }
         }
     }
@@ -9476,8 +9624,11 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
             code = code.instr("retain " + lowered.value + ": " + capability_value_type(lowered.typ))
         }
         arg_values.push(if lowered.typ == "()" || lowered.typ == "void" {
-            "void: ()"
-        } else { lowered.value })
+                "void: ()"
+            } else {
+                lowered.value
+            }
+        )
         arg_types.push(lowered.typ)
         arg_paths.push(arg_path)
         arg_frozen_roots.push(frozen_root)
@@ -9744,9 +9895,13 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         generic_args,)
 
     reject_runtime_reflection(ctx, semantic_dispatch_base, source_name, line, column)
-    let reflected_source = match direct_function { Some(function) => function.source_name None => "" }
+    let reflected_source = match direct_function {
+        Some(function) => function.source_name None => ""
+    }
     let reflected_target = specialize_reflection_call(ctx, source_name, reflected_source, semantic_dispatch_base, generic_args)
-    if reflected_target != "" { emitted_callee = reflected_target }
+    if reflected_target != "" {
+        emitted_callee = reflected_target
+    }
 
     if spawning {
         if ctx_function_is_extern(ctx, dispatch_base) {
@@ -11052,8 +11207,11 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
             code = code.instr("retain " + lowered.value + ": " + capability_value_type(lowered.typ))
         }
         args.push(if lowered.typ == "()" || lowered.typ == "void" {
-            "void: ()"
-        } else { lowered.value })
+                "void: ()"
+            } else {
+                lowered.value
+            }
+        )
         capability_types.push(lowered.typ)
         capability_paths.push(arg_path)
         capability_roots.push(frozen_root)
@@ -11201,7 +11359,9 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         emitted_name = emitted_name + "[" + join_strs(concrete_generics, ", ") + "]"
     }
     let reflected_target = specialize_reflection_call(ctx, source_name, reflected_source, fn_name, concrete_generics)
-    if reflected_target != "" { emitted_name = reflected_target }
+    if reflected_target != "" {
+        emitted_name = reflected_target
+    }
     code = protect_call_result_inputs(ctx, code, call_owners, fn_name)
     code = code.instr(out_name + ": " + ret_type + " = call " + emitted_name + "(" + join_strs(args,
             ", ",) + ")")
@@ -14141,21 +14301,25 @@ fn last_type_path_segment(value: str) -> str {
     let mut first = 0_usize
     let mut index = 0_usize
     while index + 1 < value.byte_len() {
-        if value.byte_at(index) == 58_u8 && value.byte_at(index + 1) == 58_u8 { first = index + 2 }
+        if value.byte_at(index) == 58_u8 && value.byte_at(index + 1) == 58_u8 {
+            first = index + 2
+        }
         index += 1
     }
     ret value.slice_bytes(first, value.byte_len() - first)
 }
 
 fn reject_runtime_reflection(ctx: mut TranslatorContext, name: str, source_name: str,
-    line: usize, column: usize) -> () {
+    line: usize, column: usize,) ->() {
     if !contains_substring(name, "TypeInfo::") && !contains_substring(name, "FieldInfo::") &&
-        !contains_substring(name, "VariantInfo::") && !contains_substring(name, "Builder::") &&
-        !ends_with(name, "type_info") { ret () }
+    !contains_substring(name, "VariantInfo::") && !contains_substring(name, "Builder::") &&
+    !ends_with(name, "type_info") {
+        ret()
+    }
     for function in ctx.functions {
         if function.name == name && module_identity_for_source(ctx, function.source_name) == "core@reflect/mod.enq" {
             translation_error_at(source_name, line, column, "reflection-metadata-escape",
-                "this reflection operation needs compile-time metadata; use core::reflect::type_info[T]() or a typed reflection helper")
+                "this reflection operation needs compile-time metadata; use core::reflect::type_info[T]() or a typed reflection helper",)
         }
     }
 }

@@ -1172,6 +1172,9 @@ encore_str encore_fmt_f64(double value) {
 /* Locale-independent codec primitives. Wire layout is defined by Encore codecs,
  * never by these helpers or by a native aggregate's memory representation. */
 #include <locale.h>
+#if defined(__APPLE__)
+#include <xlocale.h>
+#endif
 #include <math.h>
 
 #ifdef _WIN32
