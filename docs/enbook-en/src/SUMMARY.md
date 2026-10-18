@@ -54,6 +54,7 @@
   - [`core::ops`](library/core/ops.md)
   - [`core::option`](library/core/option.md)
   - [`core::panic`](library/core/panic.md)
+  - [`core::reflect`](library/core/reflect.md)
   - [`core::result`](library/core/result.md)
   - [`core::testing`](library/core/testing.md)
   - [`core::vec`](library/core/vec.md)

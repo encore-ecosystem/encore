@@ -1,0 +1,1000 @@
+//! Portable value serialization: EBS1, little endian, typed length-delimited blocks.
+import core::fmt::Debug
+import core::ops::Eq
+import core::option::Option
+import core::reflect
+import core::reflect::{TypeInfo, Kind}
+import core::result::Result
+import core::vec::Vec
+import serialize::{Serializer, Deserializer, Error, ErrorKind, Limits}
+import std::dict::{Dict, Hashable}
+
+extern fn encore_codec_f64_bits(value: f64) -> u64
+extern fn encore_codec_f32_bits(value: f32) -> u32
+extern fn encore_codec_f64_from_bits(value: u64) -> f64
+extern fn encore_codec_f32_from_bits(value: u32) -> f32
+extern fn encore_codec_utf8_valid(value: u8*, len: usize) -> bool
+extern fn encore_codec_string(value: u8*, len: usize) -> str
+
+pub struct EncodeOptions {
+    limits: Limits
+}
+pub struct DecodeOptions {
+    limits: Limits
+}
+pub struct BinarySerializer[Value] {
+    value: Value
+    options: EncodeOptions
+}
+pub struct BinaryDeserializer[Value] {
+    source: Vec[u8]
+    options: DecodeOptions
+}
+struct Writer {
+    bytes: Vec[u8]
+    limits: Limits
+    allocated: usize
+}
+struct Reader {
+    bytes: Vec[u8]
+    position: usize
+    end: usize
+    limits: Limits
+    allocated: usize
+}
+
+impl for EncodeOptions {
+    pub fn new() -> Self {
+        ret Self { Limits::new() }
+    }
+    pub fn with_limits(self: Self, limits: Limits) -> Self {
+        ret Self { limits }
+    }
+}
+
+impl for DecodeOptions {
+    pub fn new() -> Self {
+        ret Self { Limits::new() }
+    }
+    pub fn with_limits(self: Self, limits: Limits) -> Self {
+        ret Self { limits }
+    }
+}
+
+impl[Value] for BinarySerializer[Value] {
+    pub fn new(value: Value) -> Self {
+        ret Self { value, EncodeOptions::new() }
+    }
+    pub fn with_options(self: Self, options: EncodeOptions) -> Self {
+        ret Self {
+            self.value, options
+        }
+    }
+}
+
+impl[Value] for BinaryDeserializer[Value] {
+    pub fn new(source: Vec[u8]) -> Self {
+        ret Self { source, DecodeOptions::new() }
+    }
+    pub fn with_options(self: Self, options: DecodeOptions) -> Self {
+        ret Self {
+            self.source, options
+        }
+    }
+}
+
+impl[Value] Serializer[Vec[u8]] for BinarySerializer[Value] {
+    pub fn serialize(self: Self) -> Result[Vec[u8], Error] {
+        ret encode_with(self.value, self.options)
+    }
+}
+
+impl[Value] Deserializer[Value] for BinaryDeserializer[Value] {
+    pub fn deserialize(self: Self) -> Result[Value, Error] {
+        ret decode_with[Value](self.source, self.options)
+    }
+}
+pub fn encode[Value](value: Value) -> Result[Vec[u8], Error] {
+    ret encode_with(value, EncodeOptions::new())
+}
+pub fn decode[Value](source: Vec[u8]) -> Result[Value, Error] {
+    ret decode_with[Value](source, DecodeOptions::new())
+}
+pub fn encode_with[Value](value: Value, options: EncodeOptions) -> Result[Vec[u8], Error] {
+    let mut writer = Writer { Vec[u8]::new(), options.limits, 0 }
+    put(writer, 0x31534245_u64, 4)? put(writer, 1_u64, 2)? put(writer, 0_u64, 2)?
+    write_value(value, writer, 0)?
+    ret Result::Ok(writer.bytes)
+}
+pub fn decode_with[Value](source: Vec[u8], options: DecodeOptions) -> Result[Value, Error] {
+    if source.len() > options.limits.max_input_bytes() {
+        ret Result::Err(limit())
+    }
+    let mut reader = Reader { source, 0, source.len(), options.limits, 0 }
+    if take(reader, 4)? != 0x31534245_u64 {
+        ret Result::Err(invalid("invalid binary magic"))
+    }
+    if take(reader, 2)? != 1_u64 {
+        ret Result::Err(Error::new(ErrorKind::UnsupportedVersion, "unsupported binary version"))
+    }
+    if take(reader, 2)? != 0_u64 {
+        ret Result::Err(invalid("unsupported binary flags"))
+    }
+    let value = read_value(reflect::type_info[Value](), reader, 0)?
+    if reader.position != reader.end {
+        ret Result::Err(invalid("trailing binary bytes").with_offset(reader.position))
+    }
+    ret Result::Ok(value)
+}
+fn invalid(message: str) -> Error {
+    ret Error::new(ErrorKind::InvalidData, message)
+}
+fn limit() -> Error {
+    ret Error::new(ErrorKind::LimitExceeded, "binary resource limit exceeded")
+}
+fn put(writer: mut Writer, value: u64, width: usize) -> Result[(), Error] {
+    reserve_output(writer, width)?
+    let mut index = 0_usize
+    while index < width {
+        writer.bytes.push(((value >>(index * 8)) & 255_u64) as u8) index += 1
+    }
+    ret Result::Ok(())
+}
+fn begin(writer: mut Writer, tag: u64) -> Result[usize, Error] {
+    put(writer, tag, 1)?
+    let position = writer.bytes.len()
+    put(writer, 0_u64, 8)?
+    ret Result::Ok(position)
+}
+fn finish(writer: mut Writer, position: usize) -> Result[(), Error] {
+    let len =(writer.bytes.len() - position - 8) as u64
+    let mut index = 0_usize
+    while index < 8 {
+        writer.bytes.set(position + index,((len >>(index * 8)) & 255_u64) as u8) index += 1
+    }
+    ret Result::Ok(())
+}
+fn take(reader: mut Reader, width: usize) -> Result[u64, Error] {
+    if width > 8 || width > reader.end - reader.position {
+        ret Result::Err(invalid("truncated binary value").with_offset(reader.position))
+    }
+    let mut result = 0_u64
+    let mut index = 0_usize
+    while index < width {
+        result = result |((reader.bytes.get(reader.position).unwrap_or(0) as u64) <<(index * 8))
+        reader.position += 1 index += 1
+    }
+    ret Result::Ok(result)
+}
+fn length(reader: mut Reader) -> Result[usize, Error] {
+    let value = take(reader, 8)?
+    if value >(reader.end - reader.position) as u64 {
+        ret Result::Err(invalid("binary length exceeds remaining input").with_offset(reader.position - 8))
+    }
+    ret Result::Ok(value as usize)
+}
+fn count(reader: mut Reader) -> Result[usize, Error] {
+    let value = take(reader, 8)?
+    if value > reader.limits.max_collection_items() as u64 {
+        ret Result::Err(limit().with_offset(reader.position - 8))
+    }
+    ret Result::Ok(value as usize)
+}
+fn charge(reader: mut Reader, items: usize, width: usize) -> Result[(), Error] {
+    if width != 0 && items >(reader.limits.max_allocation_bytes() - reader.allocated) / width {
+        ret Result::Err(limit().with_offset(reader.position))
+    }
+    reader.allocated += items * width
+    ret Result::Ok(())
+}
+fn skip_value(reader: mut Reader) -> Result[(), Error] {
+    take(reader, 1)? let bytes = length(reader)? reader.position += bytes
+    ret Result::Ok(())
+}
+/// Stable FNV-1a 64-bit identifier of a UTF-8 serialized name.
+pub fn field_id(name: str) -> u64 {
+    let mut result = 14695981039346656037_u64
+    let mut index = 0_usize
+    while index < name.byte_len() {
+        result =(result ^ name.byte_at(index) as u64) * 1099511628211_u64 index += 1
+    }
+    ret result
+}
+fn contains(values: Vec[u64], id: u64) -> bool {
+    for value in values {
+        if value == id {
+            ret true
+        }
+    }
+    ret false
+}
+fn schema[Value](info: TypeInfo[Value]) -> Result[(), Error] {
+    let mut ids = Vec[u64]::new()
+    match info.kind() {
+        Kind::Struct => {
+            for field in info.fields() {
+                let id = field_id(field.attribute("serialize.rename").unwrap_or(field.name()))
+                if contains(ids, id) {
+                    ret Result::Err(Error::new(ErrorKind::InvalidSchema, "colliding binary field identifiers"))
+                }
+                ids.push(id)
+            }
+        }
+        Kind::Enum => {
+            for variant in info.variants() {
+                let id = field_id(variant.name())
+                if contains(ids, id) {
+                    ret Result::Err(Error::new(ErrorKind::InvalidSchema, "colliding binary variant identifiers"))
+                }
+                ids.push(id)
+            }
+        }
+        _ => {
+        }
+    }
+    ret Result::Ok(())
+}
+fn nested(result: Result[(), Error], name: str) -> Result[(), Error] {
+    ret match result {
+        Ok(_) => Result::Ok(()) Err(error) => Result::Err(error.at(name))
+    }
+}
+
+fn write_value[Value](value: Value, writer: mut Writer, depth: usize) -> Result[(), Error] {
+    let info = reflect::type_info[Value]()
+    if depth > writer.limits.max_depth() {
+        ret Result::Err(limit())
+    }
+    if info.is_template[Vec]() {
+        ret write_vec(value, writer, depth)
+    }
+    if info.is_template[Option]() {
+        let position = begin(writer, 19)?
+        match value {
+            Some(item) => {
+                put(writer, 1, 1)? write_value(item, writer, depth + 1)?
+            }
+            None => {
+                put(writer, 0, 1)?
+            }
+        }
+        ret finish(writer, position)
+    }
+    if info.is_template[Dict]() {
+        if value.len() > writer.limits.max_collection_items() {
+            ret Result::Err(limit())
+        }
+        let position = begin(writer, 20)? put(writer, value.len() as u64, 8)?
+        for entry in value.items() {
+            write_value(entry.0, writer, depth + 1)? write_value(entry.1, writer, depth + 1)?
+        }
+        ret finish(writer, position)
+    }
+    match info.kind() {
+        Kind::Unit => {
+            let position = begin(writer, 0)? ret finish(writer, position)
+        }
+        Kind::Bool => {
+            let position = begin(writer, 1)? put(writer, if value {
+                    1
+                } else {
+                    0
+                }
+                , 1,)? ret finish(writer, position)
+        }
+        Kind::U8 => {
+            let position = begin(writer, 2)? put(writer, value as u64, 1)? ret finish(writer, position)
+        }
+        Kind::U16 => {
+            let position = begin(writer, 3)? put(writer, value as u64, 2)? ret finish(writer, position)
+        }
+        Kind::U32 => {
+            let position = begin(writer, 4)? put(writer, value as u64, 4)? ret finish(writer, position)
+        }
+        Kind::U64 => {
+            let position = begin(writer, 5)? put(writer, value as u64, 8)? ret finish(writer, position)
+        }
+        Kind::Usize => {
+            let position = begin(writer, 6)? put(writer, value as u64, 8)? ret finish(writer, position)
+        }
+        Kind::I8 => {
+            let position = begin(writer, 7)? put(writer, value as u64, 1)? ret finish(writer, position)
+        }
+        Kind::I16 => {
+            let position = begin(writer, 8)? put(writer, value as u64, 2)? ret finish(writer, position)
+        }
+        Kind::I32 => {
+            let position = begin(writer, 9)? put(writer, value as u64, 4)? ret finish(writer, position)
+        }
+        Kind::I64 => {
+            let position = begin(writer, 10)? put(writer, value as u64, 8)? ret finish(writer, position)
+        }
+        Kind::Isize => {
+            let position = begin(writer, 11)? put(writer, value as u64, 8)? ret finish(writer, position)
+        }
+        Kind::F32 => {
+            let position = begin(writer, 12)? put(writer, unsafe {
+                    encore_codec_f32_bits(value)
+                }
+                as u64, 4,)? ret finish(writer, position)
+        }
+        Kind::F64 => {
+            let position = begin(writer, 13)? put(writer, unsafe {
+                    encore_codec_f64_bits(value)
+                }
+                as u64, 8,)? ret finish(writer, position)
+        }
+        Kind::String => {
+            let position = begin(writer, 14)?
+            reserve_output(writer, value.byte_len())?
+            let mut index = 0_usize
+            while index < value.byte_len() {
+                writer.bytes.push(value.byte_at(index)) index += 1
+            }
+            ret finish(writer, position)
+        }
+        Kind::Struct => {
+            schema(info)?
+            let position = begin(writer, 15)?
+            let mut fields = 0_u64
+            for field in info.fields() {
+                fields += 1
+            }
+            if fields > writer.limits.max_collection_items() as u64 {
+                ret Result::Err(limit())
+            }
+            put(writer, fields, 8)?
+            for field in info.fields() {
+                put(writer, field_id(field.attribute("serialize.rename").unwrap_or(field.name())), 8)?
+                nested(write_value(field.get(value), writer, depth + 1), field.attribute("serialize.rename").unwrap_or(field.name()))?
+            }
+            ret finish(writer, position)
+        }
+        Kind::Tuple => {
+            let position = begin(writer, 16)?
+            let mut fields = 0_u64
+            for field in info.fields() {
+                fields += 1
+            }
+            put(writer, fields, 8)?
+            for field in info.fields() {
+                nested(write_value(field.get(value), writer, depth + 1), field.attribute("serialize.rename").unwrap_or(field.name()))?
+            }
+            ret finish(writer, position)
+        }
+        Kind::Enum => {
+            schema(info)?
+            let position = begin(writer, 17)?
+            for variant in info.variants() {
+                if variant.is_active(value) {
+                    put(writer, field_id(variant.name()), 8)?
+                    if variant.has_payload() {
+                        match variant.get(value) {
+                            Some(payload) => {
+                                nested(write_value(payload, writer, depth + 1), variant.name())?
+                            }
+                            None => {
+                                ret Result::Err(invalid("unavailable enum payload"))
+                            }
+                        }
+                    } else {
+                        let unit = begin(writer, 0)? finish(writer, unit)?
+                    }
+                    ret finish(writer, position)
+                }
+            }
+            ret Result::Err(Error::new(ErrorKind::UnknownVariant, "invalid enum discriminant"))
+        }
+        _ => {
+            ret Result::Err(Error::new(ErrorKind::UnsupportedType, "cannot encode " + info.name()))
+        }
+    }
+}
+fn write_vec[Item](value: Vec[Item], writer: mut Writer, depth: usize) -> Result[(), Error] {
+    let info = reflect::type_info[Item]()
+    if value.len() > writer.limits.max_collection_items() {
+        ret Result::Err(limit())
+    }
+    if value.len() > 0 && depth >= writer.limits.max_depth() {
+        ret Result::Err(limit())
+    }
+    match info.kind() {
+        Kind::U8 => {
+            let position = begin(writer, 21)? put(writer, 2, 1)? put(writer, value.len() as u64, 8)?
+            for item in value {
+                put(writer, item as u64, 1)?
+            }
+            ret finish(writer, position)
+        }
+        Kind::U16 => {
+            let position = begin(writer, 21)? put(writer, 3, 1)? put(writer, value.len() as u64, 8)?
+            for item in value {
+                put(writer, item as u64, 2)?
+            }
+            ret finish(writer, position)
+        }
+        Kind::U32 => {
+            let position = begin(writer, 21)? put(writer, 4, 1)? put(writer, value.len() as u64, 8)?
+            for item in value {
+                put(writer, item as u64, 4)?
+            }
+            ret finish(writer, position)
+        }
+        Kind::U64 => {
+            let position = begin(writer, 21)? put(writer, 5, 1)? put(writer, value.len() as u64, 8)?
+            for item in value {
+                put(writer, item as u64, 8)?
+            }
+            ret finish(writer, position)
+        }
+        Kind::Usize => {
+            let position = begin(writer, 21)? put(writer, 6, 1)? put(writer, value.len() as u64, 8)?
+            for item in value {
+                put(writer, item as u64, 8)?
+            }
+            ret finish(writer, position)
+        }
+        Kind::I8 => {
+            let position = begin(writer, 21)? put(writer, 7, 1)? put(writer, value.len() as u64, 8)?
+            for item in value {
+                put(writer, item as u64, 1)?
+            }
+            ret finish(writer, position)
+        }
+        Kind::I16 => {
+            let position = begin(writer, 21)? put(writer, 8, 1)? put(writer, value.len() as u64, 8)?
+            for item in value {
+                put(writer, item as u64, 2)?
+            }
+            ret finish(writer, position)
+        }
+        Kind::I32 => {
+            let position = begin(writer, 21)? put(writer, 9, 1)? put(writer, value.len() as u64, 8)?
+            for item in value {
+                put(writer, item as u64, 4)?
+            }
+            ret finish(writer, position)
+        }
+        Kind::I64 => {
+            let position = begin(writer, 21)? put(writer, 10, 1)? put(writer, value.len() as u64, 8)?
+            for item in value {
+                put(writer, item as u64, 8)?
+            }
+            ret finish(writer, position)
+        }
+        Kind::Isize => {
+            let position = begin(writer, 21)? put(writer, 11, 1)? put(writer, value.len() as u64, 8)?
+            for item in value {
+                put(writer, item as u64, 8)?
+            }
+            ret finish(writer, position)
+        }
+        Kind::F32 => {
+            let position = begin(writer, 21)? put(writer, 12, 1)? put(writer, value.len() as u64, 8)?
+            for item in value {
+                put(writer, unsafe {
+                        encore_codec_f32_bits(item)
+                    }
+                    as u64, 4,)?
+            }
+            ret finish(writer, position)
+        }
+        Kind::F64 => {
+            let position = begin(writer, 21)? put(writer, 13, 1)? put(writer, value.len() as u64, 8)?
+            for item in value {
+                put(writer, unsafe {
+                        encore_codec_f64_bits(item)
+                    }
+                    as u64, 8,)?
+            }
+            ret finish(writer, position)
+        }
+        _ => {
+            let position = begin(writer, 18)? put(writer, value.len() as u64, 8)?
+            let mut index = 0_usize
+            for item in value {
+                nested(write_value(item, writer, depth + 1), Debug::fmt(index))? index += 1
+            }
+            ret finish(writer, position)
+        }
+    }
+}
+
+fn read_value[Value](info: TypeInfo[Value], reader: mut Reader, depth: usize) -> Result[Value, Error] {
+    if depth > reader.limits.max_depth() {
+        ret Result::Err(limit().with_offset(reader.position))
+    }
+    let tag = take(reader, 1)?
+    let size = length(reader)?
+    let parent_end = reader.end
+    reader.end = reader.position + size
+    let result = read_payload(info, reader, depth, tag)
+    let complete = reader.position == reader.end
+    reader.end = parent_end
+    match result {
+        Ok(value) => {
+            if !complete {
+                ret Result::Err(invalid("unexpected binary payload size").with_offset(reader.position))
+            }
+            ret Result::Ok(value)
+        }
+        Err(error) => {
+            ret Result::Err(error)
+        }
+    }
+}
+fn expect(tag: u64, wanted: u64, reader: Reader) -> Result[(), Error] {
+    if tag != wanted {
+        ret Result::Err(invalid("binary value type mismatch").with_offset(reader.position))
+    }
+    ret Result::Ok(())
+}
+fn read_payload[Value](info: TypeInfo[Value], reader: mut Reader, depth: usize, tag: u64) -> Result[Value, Error] {
+    if info.is_template[Vec]() {
+        ret read_vec(info.argument(0), reader, depth, tag)
+    }
+    if info.is_template[Option]() {
+        ret read_option(info.argument(0), reader, depth, tag)
+    }
+    if info.is_template[Dict]() {
+        ret read_dict(info.argument(0), info.argument(1), reader, depth, tag)
+    }
+    match info.kind() {
+        Kind::Unit => {
+            expect(tag, 0, reader)? ret Result::Ok(())
+        }
+        Kind::Bool => {
+            expect(tag, 1, reader)? let value = take(reader, 1)?
+            if value > 1 {
+                ret Result::Err(invalid("invalid boolean byte").with_offset(reader.position - 1))
+            }
+            ret Result::Ok(value == 1)
+        }
+        Kind::U8 => {
+            expect(tag, 2, reader)? ret Result::Ok(take(reader, 1)? as u8)
+        }
+        Kind::U16 => {
+            expect(tag, 3, reader)? ret Result::Ok(take(reader, 2)? as u16)
+        }
+        Kind::U32 => {
+            expect(tag, 4, reader)? ret Result::Ok(take(reader, 4)? as u32)
+        }
+        Kind::U64 => {
+            expect(tag, 5, reader)? ret Result::Ok(take(reader, 8)? as u64)
+        }
+        Kind::Usize => {
+            expect(tag, 6, reader)? ret checked_usize(reader)
+        }
+        Kind::I8 => {
+            expect(tag, 7, reader)? ret Result::Ok(take(reader, 1)? as i8)
+        }
+        Kind::I16 => {
+            expect(tag, 8, reader)? ret Result::Ok(take(reader, 2)? as i16)
+        }
+        Kind::I32 => {
+            expect(tag, 9, reader)? ret Result::Ok(take(reader, 4)? as i32)
+        }
+        Kind::I64 => {
+            expect(tag, 10, reader)? ret Result::Ok(take(reader, 8)? as i64)
+        }
+        Kind::Isize => {
+            expect(tag, 11, reader)? ret checked_isize(reader)
+        }
+        Kind::F32 => {
+            expect(tag, 12, reader)? ret Result::Ok(unsafe {
+                    encore_codec_f32_from_bits(take(reader, 4)? as u32)
+                }
+            )
+        }
+        Kind::F64 => {
+            expect(tag, 13, reader)? ret Result::Ok(unsafe {
+                    encore_codec_f64_from_bits(take(reader, 8)? as u64)
+                }
+            )
+        }
+        Kind::String => {
+            expect(tag, 14, reader)?
+            let len = reader.end - reader.position
+            charge(reader, len, 1)?
+            let pointer = unsafe {
+                bytes_at(reader.bytes, reader.position)
+            }
+            if !unsafe {
+                encore_codec_utf8_valid(pointer, len)
+            }
+            {
+                ret Result::Err(invalid("invalid UTF-8 string").with_offset(reader.position))
+            }
+            let value = unsafe {
+                encore_codec_string(pointer, len)
+            }
+            reader.position = reader.end
+            ret Result::Ok(value)
+        }
+        Kind::Struct => {
+            expect(tag, 15, reader)? schema(info)? charge_record(info, reader)?
+            let fields = count(reader)?
+            if fields >(reader.end - reader.position) / 17 {
+                ret Result::Err(invalid("impossible binary field count"))
+            }
+            charge(reader, fields, 8)?
+            let mut seen = Vec[u64]::with_capacity(fields)
+            let mut builder = reflect::Builder[Value]::new()
+            let mut index = 0_usize
+            while index < fields {
+                let id = take(reader, 8)?
+                let start = reader.position
+                for field in info.fields() {
+                    if id == field_id(field.attribute("serialize.rename").unwrap_or(field.name())) {
+                        if contains(seen, id) {
+                            ret Result::Err(Error::new(ErrorKind::DuplicateField, "duplicate field").at(field.attribute("serialize.rename").unwrap_or(field.name())).with_offset(reader.position))
+                        }
+                        match read_value(field.type(), reader, depth + 1) {
+                            Ok(value) => {
+                                builder.set(field, value)
+                            }
+                            Err(error) => {
+                                ret Result::Err(error.at(field.attribute("serialize.rename").unwrap_or(field.name())))
+                            }
+                        }
+                        seen.push(id)
+                    }
+                }
+                if reader.position == start {
+                    skip_value(reader)?
+                }
+                index += 1
+            }
+            for field in info.fields() {
+                if !contains(seen, field_id(field.attribute("serialize.rename").unwrap_or(field.name()))) {
+                    if field.type().is_template[Option]() {
+                        builder.set(field, Option::None)
+                    } else {
+                        ret Result::Err(Error::new(ErrorKind::MissingField, "missing required field").at(field.attribute("serialize.rename").unwrap_or(field.name())))
+                    }
+                }
+            }
+            match builder.finish() {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(invalid("incomplete object"))
+                }
+            }
+        }
+        Kind::Tuple => {
+            expect(tag, 16, reader)? charge_record(info, reader)? let fields = count(reader)?
+            let mut builder = reflect::Builder[Value]::new()
+            let mut index = 0_usize
+            for field in info.fields() {
+                if index >= fields {
+                    ret Result::Err(invalid("tuple is too short"))
+                }
+                match read_value(field.type(), reader, depth + 1) {
+                    Ok(value) => {
+                        builder.set(field, value)
+                    }
+                    Err(error) => {
+                        ret Result::Err(error.at(field.attribute("serialize.rename").unwrap_or(field.name())))
+                    }
+                }
+                index += 1
+            }
+            if index != fields {
+                ret Result::Err(invalid("tuple is too long"))
+            }
+            match builder.finish() {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(invalid("incomplete tuple"))
+                }
+            }
+        }
+        Kind::Enum => {
+            expect(tag, 17, reader)? schema(info)? let id = take(reader, 8)?
+            for variant in info.variants() {
+                if id == field_id(variant.name()) {
+                    if variant.has_payload() {
+                        match read_value(variant.type(), reader, depth + 1) {
+                            Ok(value) => {
+                                ret Result::Ok(variant.construct(value))
+                            }
+                            Err(error) => {
+                                ret Result::Err(error.at(variant.name()))
+                            }
+                        }
+                    } else {
+                        read_value(reflect::type_info[()](), reader, depth + 1)?
+                        ret Result::Ok(variant.construct(()))
+                    }
+                }
+            }
+            ret Result::Err(Error::new(ErrorKind::UnknownVariant, "unknown binary enum variant"))
+        }
+        _ => {
+            ret Result::Err(Error::new(ErrorKind::UnsupportedType, "cannot decode " + info.name()))
+        }
+    }
+}
+fn read_vec[Item](info: TypeInfo[Item], reader: mut Reader, depth: usize, tag: u64) -> Result[Vec[Item], Error] {
+    if tag != 18 && tag != 21 {
+        ret Result::Err(invalid("expected binary vector"))
+    }
+    let element = if tag == 21 {
+        take(reader, 1)?
+    } else {
+        0_u64
+    }
+    let items = count(reader)?
+    if items > 0 && depth >= reader.limits.max_depth() {
+        ret Result::Err(limit())
+    }
+    charge(reader, items, info.size_bound())?
+    if tag == 21 {
+        match info.kind() {
+            Kind::U8 => {
+                expect(element, 2, reader)?
+                if items !=(reader.end - reader.position) / 1 ||(reader.end - reader.position) % 1 != 0 {
+                    ret Result::Err(invalid("packed vector length mismatch"))
+                }
+                let mut result = Vec[Item]::with_capacity(items)
+                let mut index = 0_usize
+                while index < items {
+                    result.push(take(reader, 1)? as u8) index += 1
+                }
+                ret Result::Ok(result)
+            }
+            Kind::U16 => {
+                expect(element, 3, reader)?
+                if items !=(reader.end - reader.position) / 2 ||(reader.end - reader.position) % 2 != 0 {
+                    ret Result::Err(invalid("packed vector length mismatch"))
+                }
+                let mut result = Vec[Item]::with_capacity(items)
+                let mut index = 0_usize
+                while index < items {
+                    result.push(take(reader, 2)? as u16) index += 1
+                }
+                ret Result::Ok(result)
+            }
+            Kind::U32 => {
+                expect(element, 4, reader)?
+                if items !=(reader.end - reader.position) / 4 ||(reader.end - reader.position) % 4 != 0 {
+                    ret Result::Err(invalid("packed vector length mismatch"))
+                }
+                let mut result = Vec[Item]::with_capacity(items)
+                let mut index = 0_usize
+                while index < items {
+                    result.push(take(reader, 4)? as u32) index += 1
+                }
+                ret Result::Ok(result)
+            }
+            Kind::U64 => {
+                expect(element, 5, reader)?
+                if items !=(reader.end - reader.position) / 8 ||(reader.end - reader.position) % 8 != 0 {
+                    ret Result::Err(invalid("packed vector length mismatch"))
+                }
+                let mut result = Vec[Item]::with_capacity(items)
+                let mut index = 0_usize
+                while index < items {
+                    result.push(take(reader, 8)? as u64) index += 1
+                }
+                ret Result::Ok(result)
+            }
+            Kind::Usize => {
+                expect(element, 6, reader)?
+                if items !=(reader.end - reader.position) / 8 ||(reader.end - reader.position) % 8 != 0 {
+                    ret Result::Err(invalid("packed vector length mismatch"))
+                }
+                let mut result = Vec[Item]::with_capacity(items)
+                let mut index = 0_usize
+                while index < items {
+                    result.push(checked_usize(reader)?) index += 1
+                }
+                ret Result::Ok(result)
+            }
+            Kind::I8 => {
+                expect(element, 7, reader)?
+                if items !=(reader.end - reader.position) / 1 ||(reader.end - reader.position) % 1 != 0 {
+                    ret Result::Err(invalid("packed vector length mismatch"))
+                }
+                let mut result = Vec[Item]::with_capacity(items)
+                let mut index = 0_usize
+                while index < items {
+                    result.push(take(reader, 1)? as i8) index += 1
+                }
+                ret Result::Ok(result)
+            }
+            Kind::I16 => {
+                expect(element, 8, reader)?
+                if items !=(reader.end - reader.position) / 2 ||(reader.end - reader.position) % 2 != 0 {
+                    ret Result::Err(invalid("packed vector length mismatch"))
+                }
+                let mut result = Vec[Item]::with_capacity(items)
+                let mut index = 0_usize
+                while index < items {
+                    result.push(take(reader, 2)? as i16) index += 1
+                }
+                ret Result::Ok(result)
+            }
+            Kind::I32 => {
+                expect(element, 9, reader)?
+                if items !=(reader.end - reader.position) / 4 ||(reader.end - reader.position) % 4 != 0 {
+                    ret Result::Err(invalid("packed vector length mismatch"))
+                }
+                let mut result = Vec[Item]::with_capacity(items)
+                let mut index = 0_usize
+                while index < items {
+                    result.push(take(reader, 4)? as i32) index += 1
+                }
+                ret Result::Ok(result)
+            }
+            Kind::I64 => {
+                expect(element, 10, reader)?
+                if items !=(reader.end - reader.position) / 8 ||(reader.end - reader.position) % 8 != 0 {
+                    ret Result::Err(invalid("packed vector length mismatch"))
+                }
+                let mut result = Vec[Item]::with_capacity(items)
+                let mut index = 0_usize
+                while index < items {
+                    result.push(take(reader, 8)? as i64) index += 1
+                }
+                ret Result::Ok(result)
+            }
+            Kind::Isize => {
+                expect(element, 11, reader)?
+                if items !=(reader.end - reader.position) / 8 ||(reader.end - reader.position) % 8 != 0 {
+                    ret Result::Err(invalid("packed vector length mismatch"))
+                }
+                let mut result = Vec[Item]::with_capacity(items)
+                let mut index = 0_usize
+                while index < items {
+                    result.push(checked_isize(reader)?) index += 1
+                }
+                ret Result::Ok(result)
+            }
+            Kind::F32 => {
+                expect(element, 12, reader)?
+                if items !=(reader.end - reader.position) / 4 ||(reader.end - reader.position) % 4 != 0 {
+                    ret Result::Err(invalid("packed vector length mismatch"))
+                }
+                let mut result = Vec[Item]::with_capacity(items)
+                let mut index = 0_usize
+                while index < items {
+                    result.push(unsafe {
+                            encore_codec_f32_from_bits(take(reader, 4)? as u32)
+                        }
+                    ) index += 1
+                }
+                ret Result::Ok(result)
+            }
+            Kind::F64 => {
+                expect(element, 13, reader)?
+                if items !=(reader.end - reader.position) / 8 ||(reader.end - reader.position) % 8 != 0 {
+                    ret Result::Err(invalid("packed vector length mismatch"))
+                }
+                let mut result = Vec[Item]::with_capacity(items)
+                let mut index = 0_usize
+                while index < items {
+                    result.push(unsafe {
+                            encore_codec_f64_from_bits(take(reader, 8)? as u64)
+                        }
+                    ) index += 1
+                }
+                ret Result::Ok(result)
+            }
+            _ => {
+                ret Result::Err(invalid("packed vector element type mismatch"))
+            }
+        }
+    }
+    if items >(reader.end - reader.position) / 9 {
+        ret Result::Err(invalid("impossible binary item count"))
+    }
+    let mut result = Vec[Item]::with_capacity(items)
+    let mut index = 0_usize
+    while index < items {
+        match read_value(info, reader, depth + 1) {
+            Ok(value) => {
+                result.push(value)
+            }
+            Err(error) => {
+                ret Result::Err(error.at(Debug::fmt(index)))
+            }
+        }
+        index += 1
+    }
+    ret Result::Ok(result)
+}
+fn read_option[Item](info: TypeInfo[Item], reader: mut Reader, depth: usize, tag: u64) -> Result[Option[Item], Error] {
+    expect(tag, 19, reader)?
+    let present = take(reader, 1)?
+    if present == 0 {
+        ret Result::Ok(Option[Item]::None)
+    }
+    if present != 1 {
+        ret Result::Err(invalid("invalid option byte"))
+    }
+    ret Result::Ok(Option[Item]::Some(read_value(info, reader, depth + 1)?))
+}
+fn read_dict[Key: Hashable + Eq, Item](key: TypeInfo[Key], item: TypeInfo[Item], reader: mut Reader, depth: usize, tag: u64) -> Result[Dict[Key, Item], Error] {
+    expect(tag, 20, reader)? let items = count(reader)?
+    if items >(reader.end - reader.position) / 18 {
+        ret Result::Err(invalid("impossible binary map count"))
+    }
+    charge(reader, items, key.size_bound() + item.size_bound() + 16)?
+    let mut result = Dict[Key, Item]::with_capacity(items)
+    let mut index = 0_usize
+    while index < items {
+        let name = read_value(key, reader, depth + 1)?
+        if result.contains_key(name) {
+            ret Result::Err(Error::new(ErrorKind::DuplicateField, "duplicate dictionary key"))
+        }
+        result.insert(name, read_value(item, reader, depth + 1)?)
+        index += 1
+    }
+    ret Result::Ok(result)
+}
+
+fn reserve_output(writer: mut Writer, bytes: usize) -> Result[(), Error] {
+    if bytes > writer.limits.max_allocation_bytes() - writer.bytes.len() {
+        ret Result::Err(limit())
+    }
+    let required = writer.bytes.len() + bytes
+    if required <= writer.bytes.capacity() {
+        ret Result::Ok(())
+    }
+    let mut capacity = writer.bytes.capacity()
+    if capacity == 0 {
+        capacity = 4
+    }
+    while capacity < required {
+        if capacity > writer.limits.max_allocation_bytes() / 2 {
+            ret Result::Err(limit())
+        }
+        capacity *= 2
+    }
+    if capacity > writer.limits.max_allocation_bytes() - writer.allocated {
+        ret Result::Err(limit())
+    }
+    writer.allocated += capacity
+    writer.bytes.reserve(bytes)
+    ret Result::Ok(())
+}
+
+fn checked_usize(reader: mut Reader) -> Result[usize, Error] {
+    let raw = take(reader, 8)?
+    let value = raw as usize
+    if value as u64 != raw {
+        ret Result::Err(Error::new(ErrorKind::OutOfRange, "usize exceeds target width"))
+    }
+    ret Result::Ok(value)
+}
+fn checked_isize(reader: mut Reader) -> Result[isize, Error] {
+    let raw = take(reader, 8)? as i64
+    let value = raw as isize
+    if value as i64 != raw {
+        ret Result::Err(Error::new(ErrorKind::OutOfRange, "isize exceeds target width"))
+    }
+    ret Result::Ok(value)
+}
+
+fn charge_record[Value](info: TypeInfo[Value], reader: mut Reader) -> Result[(), Error] {
+    charge(reader, 1, 256)?
+    for field in info.fields() {
+        charge(reader, 1, field.type().size_bound() + 16)?
+    }
+    ret Result::Ok(())
+}
+
+fn bytes_at(bytes: Vec[u8], offset: usize) -> u8* {
+    let base = bytes.as_ptr()
+    unsafe {
+        unsafe ehir {
+            pointer: u8 * = gep base: u8 *, offset: usize
+        }
+        ret pointer
+    }
+}

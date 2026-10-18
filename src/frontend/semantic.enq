@@ -10,6 +10,7 @@ import refrain::frontend::control_flow::statements_terminate_flow
 import refrain::frontend::parser::BlockExpr
 import refrain::frontend::parser::ParsedBlock
 import refrain::frontend::parser::{Expr, ExprNode, FunctionItem, FunctionParam, GenericParam, IfExprBranch, ImplStmt, MatchArmBody, MatchPattern, Statement, TraitStmt}
+import refrain::frontend::reflection::{ReflectionBinding, reflection_binding_sites, ReflectionShape, function_uses_reflection, expand_reflection_function}
 import refrain::frontend::type_scope::{TypeNameBinding, scope_type, display_type, declaration_type_name}
 import refrain::target::{TargetSpec, cfg_active_with_features}
 
@@ -57,6 +58,17 @@ pub struct SemanticCallable {
     lookup_module: str
     binding_identity: u64
     generic_names: Vec[str]
+}
+
+/// Call sites receive a future, while the body still returns its declared output.
+/// Keep the output intact through bindings and generic substitution before await.
+pub fn semantic_call_return_type(item: FunctionItem) -> str {
+    let output = item.ret_type.unwrap_or("void")
+    ret if item.is_async {
+        "__encore_async_future[" + output + "]"
+    } else {
+        output
+    }
 }
 
 /// Describes one field available through a resolved aggregate type.
@@ -503,6 +515,65 @@ pub fn check_function_body_with_variants(item: FunctionItem, callables: Vec[Sema
     fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
     scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str,
     type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant],) -> SemanticBody {
+    let reflection_sites = if function_uses_reflection(item) {
+        reflection_binding_sites(item)
+    } else {
+        Vec[ReflectionBinding]::new()
+    }
+    if function_uses_reflection(item) {
+        if !item.generics.is_empty() || !scope_generics.is_empty() {
+            let mut result = SemanticBody::empty()
+            result.return_type = item.ret_type.unwrap_or("void")
+            result.type_names = type_names
+            match item.body {
+                Some(block) => {
+                    for parameter in item.params {
+                        let declared = parameter.typ.unwrap_or("void")
+                        let typ = if declared == "Self" {
+                            self_type
+                        } else {
+                            declared
+                        }
+                        let binding = SemanticBinding {
+                            parameter.name, typ, parameter.line, parameter.column
+                        }
+                        result.bindings.push(binding)
+                        result.scoped_bindings.push(ScopedSemanticBinding {
+                                binding,
+                                (block.start_line, block.start_column, block.end_line, block.end_column),
+                                block.start_line, block.start_column
+                            }
+                            ,)
+                    }
+                }
+                None => {
+                }
+            }
+            for site in reflection_sites {
+                let binding = SemanticBinding { site.name, site.typ, site.line, site.column }
+                result.bindings.push(binding)
+                result.scoped_bindings.push(ScopedSemanticBinding {
+                        binding, site.scope, site.visible_line, site.visible_column
+                    }
+                    ,
+                )
+            }
+            ret result
+        }
+    }
+    let item = if function_uses_reflection(item) {
+        match prepare_semantic_reflection(item, fields, aggregate_names, type_names, type_scope, variants) {
+            Ok(expanded) => expanded
+            Err(message) => {
+                let mut result = SemanticBody::empty()
+                result.diagnostics.push(FrontendDiagnostic::new(1, "invalid-reflection", message,
+                        item.line, item.column, item.name.char_len(),))
+                ret result
+            }
+        }
+    } else {
+        item
+    }
     if semantic_function_has_attr(item, "decorator") {
         ret SemanticBody {
             Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(),
@@ -601,6 +672,15 @@ pub fn check_function_body_with_variants(item: FunctionItem, callables: Vec[Sema
             }
             ,)
     }
+    for site in reflection_sites {
+        let binding = SemanticBinding { site.name, site.typ, site.line, site.column }
+        public_bindings.push(binding)
+        public_scoped.push(ScopedSemanticBinding {
+                binding, site.scope, site.visible_line, site.visible_column
+            }
+            ,
+        )
+    }
     let mut public_diagnostics = Vec[FrontendDiagnostic]::new()
     for diagnostic in ctx.diagnostics {
         public_diagnostics.push(present_diagnostic(diagnostic, type_names))
@@ -609,6 +689,44 @@ pub fn check_function_body_with_variants(item: FunctionItem, callables: Vec[Sema
         public_bindings, public_diagnostics, ctx.dependencies, display_type(return_type, type_names), public_scoped,
         ctx.member_receivers, bound_methods, type_names, ctx.implicit_receivers
     }
+}
+
+fn prepare_semantic_reflection(item: FunctionItem, fields: Vec[SemanticField],
+    aggregates: Vec[str], names: Vec[TypeNameBinding], scope: str, variants: Vec[SemanticVariant],) -> Result[FunctionItem, str] {
+    let mut shapes = Vec[ReflectionShape]::new()
+    for owner in aggregates {
+        let mut members = Vec[(str, str)]::new()
+        let mut parameters = Vec[str]::new()
+        for field in fields {
+            if semantic_root_type(field.owner_type) == semantic_root_type(owner) {
+                members.push((field.name, field.typ))
+                parameters = field.generic_names
+            }
+        }
+        let mut kind = "Struct"
+        for variant in variants {
+            if variant.owner_type == owner {
+                kind = "Enum"
+                parameters = variant.generic_names
+                members.push((variant.name, variant.payload_type))
+            }
+        }
+        shapes.push(ReflectionShape {
+                owner, owner, kind, parameters, members, Vec[(str, str, str)]::new()
+            }
+            ,
+        )
+        for name in names {
+            if name.identity == owner &&(name.scope == scope || name.scope == "") {
+                shapes.push(ReflectionShape {
+                        name.name, owner, kind, parameters, members, Vec[(str, str, str)]::new()
+                    }
+                    ,
+                )
+            }
+        }
+    }
+    ret expand_reflection_function(item, shapes)
 }
 
 fn present_diagnostic(diagnostic: FrontendDiagnostic, names: Vec[TypeNameBinding]) -> FrontendDiagnostic {
@@ -1703,21 +1821,11 @@ fn infer_expression(
                 ctx.implicit_receivers.push((line, column, "binary", lhs))
             }
             check_binary_operands(ctx, operator, lhs, rhs, source_name, line, column, length)
-            if operator == "==" || operator == "!=" || operator == "<" || operator == "<=" || operator
-            == ">" || operator == ">=" || operator == "&&" || operator == "||" {
-                ret "bool"
-            }
-            if lhs != "" {
-                ret lhs
-            }
-            ret rhs
+            ret binary_expression_type(operator, lhs, rhs, binary.rhs.value)
         }
         Expr::Unary(unary) => {
             let inner = infer_expression_h(ctx, unary.expr)
-            if unary.operator == "!" {
-                ret "bool"
-            }
-            ret inner
+            ret unary_result_type(unary.operator, inner, unary.expr)
         }
         Expr::TupleLiteral(tuple) => {
             ret tuple_type(ctx, tuple.items)
@@ -1865,21 +1973,11 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode<H>) -> str {
                 ctx.implicit_receivers.push((line, column, "binary", lhs))
             }
             check_binary_operands(ctx, operator, lhs, rhs, source_name, line, column, length)
-            if operator == "==" || operator == "!=" || operator == "<" || operator == "<=" || operator
-            == ">" || operator == ">=" || operator == "&&" || operator == "||" {
-                ret "bool"
-            }
-            if lhs != "" {
-                ret lhs
-            }
-            ret rhs
+            ret binary_expression_type(operator, lhs, rhs, binary.rhs.value)
         }
         Expr::Unary(unary) => {
             let inner = infer_expression_h(ctx, unary.expr)
-            if unary.operator == "!" {
-                ret "bool"
-            }
-            ret inner
+            ret unary_result_type(unary.operator, inner, unary.expr)
         }
         Expr::TupleLiteral(tuple) => {
             ret tuple_type(ctx, tuple.items)
@@ -2145,6 +2243,29 @@ fn numeric_semantic_type(typ: str) -> bool {
     ret typ == "u8" || typ == "u16" || typ == "u32" || typ == "u64" || typ == "u128" || typ == "usize"
     || typ == "i8" || typ == "i16" || typ == "i32" || typ == "i64" || typ == "i128" || typ == "isize"
     || typ == "f32" || typ == "f64"
+}
+
+/// Mirrors binary lowering: an unsuffixed right operand uses the left type;
+/// otherwise floating-point arithmetic promotes both operands to one type.
+fn binary_expression_type(operator: str, lhs: str, rhs: str, right: Expr) -> str {
+    if operator == "==" || operator == "!=" || operator == "<" || operator == "<=" ||
+    operator == ">" || operator == ">=" || operator == "&&" || operator == "||" {
+        ret "bool"
+    }
+    if operator != "**" && numeric_semantic_type(lhs) && numeric_semantic_type(rhs) &&
+    !contextual_numeric_value_matches(right, lhs) {
+        if lhs == "f64" || rhs == "f64" {
+            ret "f64"
+        }
+        if lhs == "f32" || rhs == "f32" {
+            ret "f32"
+        }
+    }
+    ret if lhs != "" {
+        lhs
+    } else {
+        rhs
+    }
 }
 
 fn last_path_segment(path: str) -> str {
@@ -2880,8 +3001,8 @@ fn resolve_method_call(
                 let concrete_params = specialize_method_types(method.params, method.receiver_type, receiver, method.generic_names)
                 expected_arity = concrete_params.len()
                 expected_params = concrete_params
-                if concrete_params.len() == argument_types.len() && parameter_types_match(concrete_params,
-                    argument_types,) {
+                if concrete_params.len() == argument_types.len() && parameter_types_match_contextual(concrete_params,
+                    argument_types, args,) {
                     remember_method_dependency(ctx, method)
                     let specialized_return = specialize_method_type(method.ret_type, method.receiver_type,
                         receiver, method.generic_names,)
@@ -2914,6 +3035,9 @@ fn resolve_method_call(
                 .with_label(source_name, line, column, length, DiagnosticLabelKind::Primary, "wrong number of method arguments")
                 .with_help("supply exactly " + Debug::fmt(expected_arity) + " argument(s)")
             )
+        } elif contextual_integer_out_of_range(expected_params, args) {
+            ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "integer-literal-out-of-range",
+                    "integer literal is outside the range of the expected method parameter type", line, column, length,))
         } else {
             ctx.diagnostics.push(
                 FrontendDiagnostic::new(
@@ -3326,22 +3450,84 @@ fn parameter_types_match_contextual(params: Vec[str], arguments: Vec[str],
                 ret false
             }
         }
-        if !semantic_types_compatible(param, argument) {
-            match expression.value {
-                Expr::Integer(value) => {
-                    if contains(value, "_") || !integer_semantic_type(param) ||
-                    !integer_literal_fits(value, param) {
-                        ret false
-                    }
-                }
-                _ => {
-                    ret false
-                }
-            }
+        let expected = compact_type(semantic_type_name(param))
+        let actual = compact_type(semantic_type_name(argument))
+        let compatible = if numeric_semantic_type(expected) && numeric_semantic_type(actual) {
+            expected == actual
+        } else {
+            semantic_types_compatible(param, argument)
+        }
+        if !compatible && !contextual_numeric_literal_matches(expression, expected) {
+            ret false
         }
         index += 1_usize
     }
     ret true
+}
+
+fn contextual_numeric_literal_matches(expression: ExprNode, expected: str) -> bool {
+    ret contextual_numeric_value_matches(expression.value, expected)
+}
+
+fn contextual_numeric_value_matches(expression: Expr, expected: str) -> bool {
+    let floating = expected == "f32" || expected == "f64"
+    match expression {
+        Expr::Integer(value) => {
+            ret !contains(value, "_") &&(floating ||(integer_semantic_type(expected) && integer_literal_fits(value, expected)))
+        }
+        Expr::Float(value) => {
+            ret !contains(value, "_") && floating
+        }
+        Expr::Parenthesized(inner) => {
+            ret contextual_numeric_value_matches(inner.value, expected)
+        }
+        Expr::Binary(binary) => {
+            if binary.operator == "+" || binary.operator == "-" || binary.operator == "*" ||
+            binary.operator == "/" || binary.operator == "%" {
+                ret contextual_numeric_value_matches(binary.lhs.value, expected) &&
+                contextual_numeric_value_matches(binary.rhs.value, expected)
+            }
+        }
+        Expr::Unary(unary) => {
+            if unary.operator != "-" && unary.operator != "+" {
+                ret false
+            }
+            match unary.expr.value {
+                Expr::Integer(value) => {
+                    ret !contains(value, "_") &&(floating ||(integer_semantic_type(expected) &&
+                            (if unary.operator == "-" {
+                                    negative_integer_literal_fits(value, expected)
+                                } else {
+                                    integer_literal_fits(value, expected)
+                                }
+                            )))
+                }
+                Expr::Float(value) => {
+                    ret !contains(value, "_") && floating
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    ret false
+}
+
+fn negative_integer_literal_fits(value: str, typ: str) -> bool {
+    if starts_with(typ, "u") {
+        ret false
+    }
+    if integer_literal_fits(value, typ) {
+        ret true
+    }
+    let minimum_magnitude = match typ {
+        "i8" => "128" "i16" => "32768" "i32" => "2147483648"
+        "i64" => "9223372036854775808" "isize" => "9223372036854775808"
+        "i128" => "170141183460469231731687303715884105728" _ => ""
+    }
+    ret minimum_magnitude != "" && trim_leading_numeric_zeroes(semantic_numeric_literal_value(value)) == minimum_magnitude
 }
 
 fn contextual_integer_out_of_range(params: Vec[str], expressions: Vec[ExprNode]) -> bool {
@@ -3355,6 +3541,19 @@ fn contextual_integer_out_of_range(params: Vec[str], expressions: Vec[ExprNode])
                         if !contains(value, "_") && integer_semantic_type(param) &&
                         !integer_literal_fits(value, param) {
                             ret true
+                        }
+                    }
+                    Expr::Unary(unary) => {
+                        if unary.operator == "-" {
+                            match unary.expr.value {
+                                Expr::Integer(value) => {
+                                    if !contains(value, "_") && integer_semantic_type(param) && !negative_integer_literal_fits(value, param) {
+                                        ret true
+                                    }
+                                }
+                                _ => {
+                                }
+                            }
                         }
                     }
                     _ => {
@@ -3598,6 +3797,24 @@ fn remember_dependency(ctx: mut SemanticContext, callable: SemanticCallable) ->(
     ret()
 }
 
+fn unary_result_type(operator: str, inner: str, operand: ExprNode<H>) -> str {
+    if operator == "!" {
+        ret "bool"
+    }
+    if operator == "-" {
+        match operand.value {
+            Expr::Integer(value) => {
+                if !contains(value, "_") {
+                    ret "isize"
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret inner
+}
+
 fn integer_type(value: str) -> str {
     if ends_with(value, "_f32") {
         ret "f32"
@@ -3641,7 +3858,7 @@ fn integer_type(value: str) -> str {
     if ends_with(value, "_isize") {
         ret "isize"
     }
-    ret "i32"
+    ret "usize"
 }
 
 fn float_type(value: str) -> str {

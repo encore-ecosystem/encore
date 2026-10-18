@@ -5,13 +5,22 @@ import core::result::Result
 import core::vec::Vec
 import json::{Json, ParseError, parse}
 import std::io::eprintln
-import std::os::{env, file_exists, file_sha256, home_dir, mkdir_all, read_file, remove_file, write_file}
+import std::os::{env, file_exists, file_sha256, home_dir, mkdir_all, read_file, remove_file, remove_dir_all}
 import std::path::Path
 import std::process::{run_args, run_args_capture}
+import std::time::sleep_ms
 import refrain::version::compiler_version
 import mod::manifest::{project_manifest_name, project_manifest_version, project_manifest_registry_index, try_read_project_manifest, ProjectManifest}
 import mod::failure::ProjectFailure
 import mod::registry_service::registry_service_metadata
+
+extern fn encore_compiler_cache_lock_open(path: str) -> usize
+extern fn encore_compiler_cache_lock_try(lock: usize) -> i32
+extern fn encore_compiler_cache_lock_close(lock: usize) ->()
+extern fn encore_compiler_worker_interrupted() -> i32
+extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
+extern fn encore_compiler_publish_directory(source: str, destination: str) -> bool
+
 
 /// Performs the `normalize_dependency_reference` operation.
 pub fn normalize_dependency_reference(raw: str) -> str {
@@ -263,29 +272,45 @@ fn registry_candidates_from_source(source: str, expected_name: str, requirement:
     ret out
 }
 
+#attr(safe)
 fn registry_metadata(name: str, require_fresh: bool, index_url: str) -> str {
     let metadata_dir = registry_root(index_url).join("metadata")
     let metadata_path = metadata_dir.join(name + ".json")
     mkdir_all(metadata_dir.as_str())
-    let cached = if file_exists(metadata_path.as_str()) { read_file(metadata_path.as_str()) } else { "" }
+    let cached = if file_exists(metadata_path.as_str()) {
+        read_file(metadata_path.as_str())
+    } else {
+        ""
+    }
     let cached_valid = registry_candidates_from_source(cached, name, "", index_url).len() > 0_usize
     match registry_service_metadata(index_url, name) {
-      Result::Ok(refreshed) => {
-        if registry_candidates_from_source(refreshed, name, "", index_url).len() > 0_usize {
-            if write_file(metadata_path.as_str(), refreshed) == 0_i32 { ret refreshed }
-            if !require_fresh && cached_valid { ret cached }
-            registry_error("Unable to cache registry metadata for package '" + name + "'")
+        Result::Ok(refreshed) => {
+            if registry_candidates_from_source(refreshed, name, "", index_url).len() > 0_usize {
+                if unsafe {
+                    encore_compiler_write_atomic(metadata_path.as_str(), refreshed)
+                }
+                {
+                    ret refreshed
+                }
+                if !require_fresh && cached_valid {
+                    ret cached
+                }
+                registry_error("Unable to cache registry metadata for package '" + name + "'")
+                ret ""
+            }
+            if !require_fresh && cached_valid {
+                ret cached
+            }
+            registry_error("Invalid registry metadata for package '" + name + "' from " + index_url)
             ret ""
         }
-        if !require_fresh && cached_valid { ret cached }
-        registry_error("Invalid registry metadata for package '" + name + "' from " + index_url)
-        ret ""
-      }
-      Result::Err(error) => {
-        if !require_fresh && cached_valid { ret cached }
-        registry_error("Unable to refresh registry metadata for package '" + name + "' from " + index_url + ": " + error)
-        ret ""
-      }
+        Result::Err(error) => {
+            if !require_fresh && cached_valid {
+                ret cached
+            }
+            registry_error("Unable to refresh registry metadata for package '" + name + "' from " + index_url + ": " + error)
+            ret ""
+        }
     }
     ret ""
 }
@@ -690,28 +715,48 @@ pub fn resolve_cached_index_dependency(reference: str, project_root: Path) -> st
 
 fn locked_package_root(project_root: Path, reference: str, allow_install: bool) -> str {
     let index_url = registry_index_url(project_root)
-    if index_url != "" && !registry_lock_source_matches(project_root, index_url) { ret "" }
+    if index_url != "" && !registry_lock_source_matches(project_root, index_url) {
+        ret ""
+    }
     let lock = project_root.join("encore.lock")
-    if !file_exists(lock.as_str()) { ret "" }
+    if !file_exists(lock.as_str()) {
+        ret ""
+    }
     let source = read_file(lock.as_str())
     let mut block = lock_package_block(source, reference)
-    if block == "" { block = compatible_lock_package_block(source, reference) }
-    if block == "" { ret "" }
+    if block == "" {
+        block = compatible_lock_package_block(source, reference)
+    }
+    if block == "" {
+        ret ""
+    }
     let name = lock_value(block, "name")
     let version = lock_value(block, "version")
     let checksum = lock_value(block, "checksum")
     let archive = lock_value(block, "archive")
-    if name == "" || version == "" || archive == "" || !valid_checksum(checksum) { ret "" }
+    if name == "" || version == "" || archive == "" || !valid_checksum(checksum) {
+        ret ""
+    }
     let spec = dependency_base_reference(reference).slice(6_usize, dependency_base_reference(reference).len() - 6_usize)
     let requirement_start = find_from(spec, "@", 0_usize)
     let expected_name = spec.slice(0_usize, requirement_start)
-    let requirement = if requirement_start < spec.len() { spec.slice(requirement_start + 1_usize, spec.len() - requirement_start - 1_usize) } else { "" }
-    if name != expected_name || !registry_version_matches(version, requirement) { ret "" }
+    let requirement = if requirement_start < spec.len() {
+        spec.slice(requirement_start + 1_usize, spec.len() - requirement_start - 1_usize)
+    } else {
+        ""
+    }
+    if name != expected_name || !registry_version_matches(version, requirement) {
+        ret ""
+    }
     let origin = lock_value(block, "registry")
     let root = package_cache_root(name, version, checksum, origin)
-    if file_exists(root.join("encore.toml").as_str()) { ret root.as_str() }
-    if !allow_install { ret "" }
-    ret install_package(name, RegistryVersion{version, archive, checksum, origin})
+    if registry_package_complete(root, checksum) {
+        ret root.as_str()
+    }
+    if !allow_install {
+        ret ""
+    }
+    ret install_package(name, RegistryVersion { version, archive, checksum, origin })
 }
 
 fn compatible_lock_package_block(source: str, reference: str) -> str {
@@ -733,13 +778,68 @@ fn compatible_lock_package_block(source: str, reference: str) -> str {
     ret ""
 }
 
+fn registry_package_complete(root: Path, checksum: str) -> bool {
+    ret file_exists(root.join("encore.toml").as_str()) && registry_package_checksum(root) == checksum
+}
+
+// Serialize the shared archive and validation paths for one registry. OS locks
+// are released on process death; no stale PID file can strand an installation.
+#attr(safe)
 fn install_package(name: str, version: RegistryVersion) -> str {
     let cache = registry_root(version.source)
+    if mkdir_all(cache.as_str()) != 0_i32 {
+        registry_error("Unable to create registry cache") ret ""
+    }
+    let lock = unsafe {
+        encore_compiler_cache_lock_open(cache.join("install.lock").as_str())
+    }
+    if lock == 0_usize {
+        registry_error("Unable to open registry installation lock") ret ""
+    }
+    loop {
+        let status = unsafe {
+            encore_compiler_cache_lock_try(lock)
+        }
+        if status == 1_i32 {
+            break
+        }
+        if status < 0_i32 || unsafe {
+            encore_compiler_worker_interrupted()
+        }
+        != 0_i32 {
+            unsafe {
+                encore_compiler_cache_lock_close(lock)
+            }
+            registry_error("Unable to acquire registry installation lock") ret ""
+        }
+        let _sleep = sleep_ms(5_u64)
+    }
+    let result = install_package_locked(name, version, cache)
+    unsafe {
+        encore_compiler_cache_lock_close(lock)
+    }
+    ret result
+}
+
+#attr(safe)
+fn install_package_locked(name: str, version: RegistryVersion, cache: Path) -> str {
     let package_root = package_cache_root(name, version.version, version.checksum, version.source)
-    if file_exists(package_root.join("encore.toml").as_str()) { ret package_root.as_str() }
-    mkdir_all(package_root.as_str())
+    if registry_package_complete(package_root, version.checksum) {
+        ret package_root.as_str()
+    }
+    let staging = Path::new(package_root.as_str() + ".staging")
+    if file_exists(staging.as_str()) && remove_dir_all(staging.as_str()) != 0_i32 {
+        registry_error("Unable to reset registry staging directory") ret ""
+    }
+    if mkdir_all(staging.as_str()) != 0_i32 {
+        registry_error("Unable to create registry staging directory") ret ""
+    }
     let archive = cache.join("archives").join(name + "-" + version.version + "-" + version.checksum + ".tar.gz")
     mkdir_all(cache.join("archives").as_str())
+    // A killed download may have left a partial archive. Never reuse it.
+    if file_exists(archive.as_str()) && file_sha256(archive.as_str()) != version.checksum {
+        remove_file(archive.as_str())
+    }
     if !file_exists(archive.as_str()) && download(version.archive, archive) != 0_i32 {
         registry_error("Unable to download " + name + " " + version.version)
         ret ""
@@ -773,18 +873,38 @@ fn install_package(name: str, version: RegistryVersion) -> str {
     extract_args.push("-xzf")
     extract_args.push(portable_tool_path(archive.as_str()))
     extract_args.push("-C")
-    extract_args.push(portable_tool_path(package_root.as_str()))
-    if run_args("tar", extract_args) != 0_i32 || !file_exists(package_root.join("encore.toml").as_str()) {
+    extract_args.push(portable_tool_path(staging.as_str()))
+    if run_args("tar", extract_args) != 0_i32 || !file_exists(staging.join("encore.toml").as_str()) {
         registry_error("Invalid package archive for " + name + " " + version.version + ": encore.toml must be at the archive root")
         ret ""
     }
-    if !registry_manifest_matches(package_root, name, version.version) {
+    if !registry_manifest_matches(staging, name, version.version) {
         registry_error("Package manifest does not match registry entry for " + name + " " + version.version)
         ret ""
     }
     let marker = "archive = \"" + version.archive + "\"\nchecksum = \"" + version.checksum + "\"\n"
-        + if version.source == "" { "" } else { "registry = \"" + version.source + "\"\n" }
-    write_file(package_root.join(".encore-registry").as_str(), marker)
+    + if version.source == "" {
+        ""
+    } else {
+        "registry = \"" + version.source + "\"\n"
+    }
+    if !unsafe {
+        encore_compiler_write_atomic(staging.join(".encore-registry").as_str(), marker)
+    }
+    {
+        registry_error("Unable to write registry package receipt") ret ""
+    }
+    // Readers require this receipt, and only see the directory after rename.
+    // An incomplete entry from a prior compiler/crash is safe to replace.
+    if file_exists(package_root.as_str()) && remove_dir_all(package_root.as_str()) != 0_i32 {
+        registry_error("Unable to replace incomplete registry package") ret ""
+    }
+    if !unsafe {
+        encore_compiler_publish_directory(staging.as_str(), package_root.as_str())
+    }
+    {
+        registry_error("Unable to publish registry package") ret ""
+    }
     ret package_root.as_str()
 }
 

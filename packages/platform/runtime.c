@@ -1,3 +1,6 @@
+#if defined(__linux__) && !defined(__ANDROID__)
+#define _GNU_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE
@@ -88,6 +91,8 @@ typedef struct {
 #endif
     bool signaled;
 } encore_async_event;
+
+#include "async_waker_hooks.h"
 
 typedef void (*encore_thread_entry)(void *);
 typedef void (*encore_thread_cleanup)(void *);
@@ -272,6 +277,7 @@ void encore_async_waker_wait(size_t token) {
 void encore_async_waker_drop(size_t token) {
     encore_async_event *event = (encore_async_event *)(uintptr_t)token;
     if (event == NULL) return;
+    encore_async_cleanup_waker(token);
 #ifdef _WIN32
     DeleteCriticalSection(&event->lock);
 #else
@@ -280,6 +286,9 @@ void encore_async_waker_drop(size_t token) {
 #endif
     free(event);
 }
+
+#define ENCORE_HTTP_ASYNC_IN_PLATFORM
+#include "http_async.h"
 
 void *__ehir_pcast(size_t value) {
     return (void *)(uintptr_t)value;

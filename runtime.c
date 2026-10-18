@@ -130,6 +130,24 @@ size_t encore_compiler_cache_lock_open(encore_compiler_str path) {
 int encore_compiler_cache_lock_try(size_t lock) { return encore_build_cache_lock_try(lock); }
 void encore_compiler_cache_lock_close(size_t lock) { encore_build_cache_lock_close(lock); }
 
+/* Both paths are siblings in the registry cache. Publish only a fully checked
+ * directory, under its registry installation lock. No external mv is needed. */
+bool encore_compiler_publish_directory(encore_compiler_str source, encore_compiler_str destination) {
+    char *from = encore_compiler_cstr(source), *to = encore_compiler_cstr(destination);
+    bool moved = false;
+    if (from != NULL && to != NULL) {
+#ifdef _WIN32
+        wchar_t *wide_from = encore_build_artifact_wide(from), *wide_to = encore_build_artifact_wide(to);
+        moved = wide_from != NULL && wide_to != NULL && MoveFileExW(wide_from, wide_to, MOVEFILE_WRITE_THROUGH);
+        free(wide_from); free(wide_to);
+#else
+        moved = rename(from, to) == 0;
+#endif
+    }
+    free(from); free(to);
+    return moved;
+}
+
 void encore_compiler_release_heap(void) {
 #if defined(__GLIBC__)
     malloc_trim(0);

@@ -5,6 +5,16 @@ test "$1" = build
 test "$2" = --profile
 test "$3" = extreme
 case "$CI_PROBE_CASE" in
+  seed-compat)
+    test "$(cat packages/json/src/lib.enq)" = seed-json
+    test "$(cat src/frontend/analysis_database.enq)" = configured-analysis
+    test "$(cat src/modes/build.enq)" = seed-build
+    test "$(cat src/target/mod.enq)" = current-target
+    test ! -e packages/core/src/reflect/mod.enq
+    mkdir -p target/extreme
+    cp "$0" target/extreme/encore
+    exit 0
+    ;;
   bridge-x86|bridge-arm)
     if [[ $# == 3 ]]; then
       mkdir -p target/extreme

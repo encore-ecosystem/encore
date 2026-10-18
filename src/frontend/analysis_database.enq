@@ -21,6 +21,7 @@ import refrain::frontend::parser::{FunctionItem, Statement, GenericParam}
 import refrain::frontend::safety::{FunctionSafety, SafetyFunction, infer_safety_with_known, safety_dependencies}
 import refrain::frontend::semantic::ScopedSemanticBinding
 import refrain::frontend::semantic::check_function_body_with_type_scope
+import refrain::frontend::semantic::semantic_call_return_type
 import refrain::frontend::semantic::specialize_method_type_with_self
 import refrain::frontend::semantic::{SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticField, SemanticMethod, check_function_body, check_module_bodies, check_module_declarations}
 import refrain::frontend::semantic::{SemanticMember, SemanticDependencyKind, semantic_members, semantic_named_members, semantic_associated_members, append_bound_methods}
@@ -3103,7 +3104,7 @@ impl for AnalysisDatabase {
                     index += 1_usize
                 }
                 ret Option[u64]::Some(SemanticMethod::new(module_name, owner, method.name,
-                        params, method.ret_type.unwrap_or("void"),).with_generics(generics).with_static(is_static).signature)
+                        params, semantic_call_return_type(method),).with_generics(generics).with_static(is_static).signature)
             }
         }
         ret Option[u64]::None
@@ -3354,7 +3355,7 @@ impl for AnalysisDatabase {
                                 }
                                 index += 1_usize
                             }
-                            out.push(SemanticMethod::new(visible, item.target, method.name, params, method.ret_type.unwrap_or("void")).with_generics(declaration_generic_names(item.generics)).with_static(is_static))
+                            out.push(SemanticMethod::new(visible, item.target, method.name, params, semantic_call_return_type(method)).with_generics(declaration_generic_names(item.generics)).with_static(is_static))
                         }
                     }
                     Statement::Trait(item) => {
@@ -3372,7 +3373,7 @@ impl for AnalysisDatabase {
                                 index += 1_usize
                             }
                             out.push(SemanticMethod::new(visible, trait_receiver_type(item.name, item.generics), method.name, params,
-                                    method.ret_type.unwrap_or("void"),).with_generics(declaration_generic_names(item.generics)).with_static(is_static))
+                                    semantic_call_return_type(method),).with_generics(declaration_generic_names(item.generics)).with_static(is_static))
                         }
                     }
                     _ => {
@@ -3667,12 +3668,69 @@ fn callable_from_function(module_name: str, item: FunctionItem) -> SemanticCalla
     for param in item.params {
         params.push(param.typ.unwrap_or(""))
     }
-    ret SemanticCallable::new(module_name, item.name, params, item.ret_type.unwrap_or("void"))
+    ret SemanticCallable::new(module_name, item.name, params, semantic_call_return_type(item))
     .with_generics(declaration_generic_names(item.generics))
 }
 
+fn issue111_body(database: mut AnalysisDatabase, module_name: str, name: str) -> SemanticBody {
+    ret database.semantic_body(database.symbol_id(module_name, name).unwrap_or(SymbolId::invalid())).unwrap_or(SemanticBody::empty())
+}
+
+#attr(test)
+fn semantic_issue111_async_result_contract() -> bool {
+    let mut database = AnalysisDatabase::new()
+    database.set_module_full("app", "app.enq",
+        "enum Result[T,E] { Ok(T) Err(E) }\n" +
+        "async fn value() -> Result[bool, str] { ret Result[bool, str]::Ok(true) }\n" +
+        "async fn generic[T](value:T) -> Result[T, str] { ret Result[T,str]::Ok(value) }\n" +
+        "struct Worker {}\nimpl for Worker { async fn get(self:Self) -> Result[bool,str] { ret await value() } async fn create() -> Result[bool,str] { ret await value() } }\n" +
+        "async fn direct() -> Result[bool,str] { ret await value() }\n" +
+        "async fn saved() -> Result[bool,str] { let future = value() let output: Result[bool, str] = await future ret output }\n" +
+        "async fn inferred() -> Result[bool,str] { let output = await value() ret output }\n" +
+        "async fn specialized() -> Result[u32,str] { ret await generic(7_u32) }\n" +
+        "async fn method(worker:Worker) -> Result[bool,str] { ret await worker.get() }\n" +
+        "async fn associated() -> Result[bool,str] { ret await Worker::create() }\n" +
+        "async fn wrong() -> bool { ret await value() }\n" +
+        "fn unawaited() -> Result[bool,str] { ret value() }\n",)
+    for name in vec!["direct", "saved", "inferred", "specialized", "method", "associated"] {
+        let body = issue111_body(database, "app", name)
+        if body.diagnostics.len() != 0_usize {
+            ret false
+        }
+    }
+    let saved = issue111_body(database, "app", "saved")
+    if saved.binding_type("future").unwrap_or("") != "Future[Result[bool, str]]" || saved.binding_type("output").unwrap_or("") != "Result[bool, str]" {
+        ret false
+    }
+    ret issue111_body(database, "app", "wrong").diagnostics.len() > 0_usize &&
+    issue111_body(database, "app", "unawaited").diagnostics.len() > 0_usize
+}
+
+#attr(test)
+fn semantic_issue111_async_import_cache_contract() -> bool {
+    let mut database = AnalysisDatabase::new()
+    let prefix = "pub enum Result[T,E] { Ok(T) Err(E) }\n"
+    let asynchronous = prefix + "pub async fn value() -> Result[bool,str] { ret Result[bool,str]::Ok(true) }\n"
+    let synchronous = prefix + "pub fn value() -> Result[bool,str] { ret Result[bool,str]::Ok(true) }\n"
+    database.set_module_full("dependency", "dependency.enq", asynchronous)
+    database.set_module_full("consumer", "consumer.enq", "import dependency::{Result, value as imported}\nasync fn consumer() -> Result[bool,str] { ret await imported() }\n")
+    if issue111_body(database, "consumer", "consumer").diagnostics.len() != 0_usize {
+        ret false
+    }
+    database.set_module_full("dependency", "dependency.enq", synchronous)
+    if issue111_body(database, "consumer", "consumer").diagnostics.len() == 0_usize {
+        ret false
+    }
+    database.set_module_full("dependency", "dependency.enq", asynchronous)
+    ret issue111_body(database, "consumer", "consumer").diagnostics.len() == 0_usize
+}
+
 fn function_type_key(item: FunctionItem) -> str {
-    let mut out = "fn("
+    let mut out = if item.is_async {
+        "async fn("
+    } else {
+        "fn("
+    }
     for param in item.params {
         out += param.typ.unwrap_or("_") + ","
     }

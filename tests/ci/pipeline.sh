@@ -6,6 +6,40 @@ scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 cd "$scratch"
 case "$CI_PROBE_CASE" in
+  seed-compat)
+    mkdir -p source/src/frontend source/src/modes source/runtime \
+      source/packages/{core,platform,std,json}/src seed
+    for package in core platform std json; do
+      printf 'seed-%s\n' "$package" > "source/packages/$package/src/lib.enq"
+    done
+    printf 'seed-analysis\n' > source/src/frontend/analysis_database.enq
+    printf 'seed-build\n' > source/src/modes/build.enq
+    touch source/runtime.c source/encore.toml source/README.md
+    printf '0.1.6-neumann\n' > source/VERSION
+    git -C source init -q
+    git -C source add .
+    git -C source -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm seed
+    git -C source tag v0.1.5-neumann
+    mkdir -p source/packages/core/src/reflect
+    printf 'reflection\n' > source/packages/core/src/reflect/mod.enq
+    printf 'typed-json\n' > source/packages/json/src/lib.enq
+    printf 'configured-analysis\n' > source/src/frontend/analysis_database.enq
+    mkdir -p source/src/target
+    printf 'current-target\n' > source/src/target/mod.enq
+    cp "$repository/tests/ci/mock-compiler.sh" seed/encore
+    chmod +x seed/encore
+    cd source
+    ENCORE_BUILD_CACHE="$PWD/target/cache" bash "$repository/scripts/ci-seed-build.sh" \
+      "$scratch/seed/encore" v0.1.5-neumann build --profile extreme
+    test -s target/extreme/encore
+    test "$(cat packages/json/src/lib.enq)" = typed-json
+    test "$(cat src/frontend/analysis_database.enq)" = configured-analysis
+    test -f packages/core/src/reflect/mod.enq
+    test "$(cat target/seed-source/packages/json/src/lib.enq)" = seed-json
+    test "$(cat target/seed-source/src/frontend/analysis_database.enq)" = configured-analysis
+    test "$(cat target/seed-source/src/target/mod.enq)" = current-target
+    test ! -e target/seed-source/packages/core/src/reflect/mod.enq
+    ;;
   restore-context)
     awk '/^      run: \|$/ { body=1; next } body { sub(/^        /, ""); print }' \
       "$repository/.github/actions/stage3-context/action.yml" > restore.sh

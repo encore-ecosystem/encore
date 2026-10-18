@@ -536,3 +536,74 @@ fn integration_standalone_artifact_names_contract() -> bool {
     }
     ret fixture.finish(true)
 }
+
+// Imported explicit method generics must resolve exactly like free calls.
+#attr(test)
+fn integration_imported_type_alias_contract() -> bool {
+    let fixture = Fixture::new("imported-type-alias")
+    fixture.manifest("consumer", "[]")
+    fixture.put("src/models/mod.enq", "pub struct Payload { value:u32 }\n")
+    fixture.put("src/main.enq", "import mod::models::Payload as Alias\nfn make()->Alias {ret Alias{42_u32}}\nfn main()->u32 {ret if make().value==42_u32 {0_u32}else{1_u32}}\n")
+    if !fixture.succeeds(vec!["check"]) || !fixture.succeeds(vec!["run"]) {
+        ret fixture.finish(false)
+    }
+    // Exercise stable package metadata, renamed re-exports, nested generic
+    // return types and two unrelated declarations with the same original name.
+    fixture.manifest("consumer", "[\"path@provider\"]")
+    fixture.put("provider/encore.toml", "[project]\nname=\"provider\"\nversion=\"1.0.0\"\ndependencies=[]\n")
+    fixture.put("provider/src/lib.enq", "pub import mod::models::Payload as Exported\npub import mod::other::Payload as Other\n")
+    fixture.put("provider/src/models/mod.enq", "pub struct Payload {value:u32}\nimpl for Payload {pub fn new(value:u32)->Self {ret Self{value}}}\n")
+    fixture.put("provider/src/other/mod.enq", "pub struct Payload {value:u32}\n")
+    let source = "import provider::Exported as Alias\nimport provider::Other\nimport core::option::Option as Maybe\nfn make()->Alias {ret Alias::new(42_u32)}\nfn copy(value:Alias)->Alias {ret value}\nfn nested()->Maybe[Alias] {ret Maybe[Alias]::Some(make())}\nfn generic[Alias](value:Alias)->Alias {ret value}\nfn main()->u32 {let value=nested().unwrap_or(make())\nlet other=Other{7_u32}\nret if copy(value).value==42_u32 && other.value==7_u32 && generic[u32](3_u32)==3_u32 {0_u32}else{1_u32}}\n"
+    fixture.put("src/main.enq", source)
+    if !fixture.succeeds(vec!["check"]) || !fixture.succeeds(vec!["run"]) || !fixture.succeeds(vec!["run"]) {
+        ret fixture.finish(false)
+    }
+    fixture.put("src/main.enq", replace(source, "ret Alias::new(42_u32)", "ret Other{42_u32}"))
+    ret fixture.finish(!fixture.command(vec!["check"]).success())
+}
+
+#attr(test)
+fn integration_imported_future_method_bound() -> bool {
+    let fixture = Fixture::new("imported-future-method-bound")
+    fixture.manifest("consumer", "[\"path@provider\",\"path@runner\"]")
+    fixture.put("provider/encore.toml", "[project]\nname=\"provider\"\nversion=\"0.1.0\"\ndependencies=[]\n")
+    fixture.put("provider/src/lib.enq", "import core::future::{Future,Poll,Context,context as core_context}\nimport core::result::Result\npub import mod::models::*\npub struct Number { value:u32 }\nimpl Future[Result[Payload,Failure]] for Number {\n fn poll(self:Self, context:Context)->Poll[Self,Result[Payload,Failure]] { ret Poll::Ready(Result::Ok(Payload{self.value})) }\n}\npub fn number()->Number { ret Number { 42_u32 } }\n\n")
+    fixture.put("provider/src/models/mod.enq", "pub struct Payload { value:u32 }\npub struct Failure { code:u32 }\n")
+    fixture.put("runner/encore.toml", "[project]\nname=\"runner\"\nversion=\"0.1.0\"\ndependencies=[]\n")
+    fixture.put("runner/src/lib.enq", "import core::future::{Future, Poll, context as core_context}\npub struct Runner { dummy:u32 }\nimpl for Runner {\npub fn read[T,F:Future[T]](self:Self, future:F)->T {\n let mut current=future\n loop { match current.poll(core_context(0_usize)) { Poll::Ready(value)=>{ret value} Poll::Pending(next)=>{current=next} } }\n}\n\n}\n")
+    let source = "import core::future::{Future,Poll,context}\nimport core::result::Result\nimport provider::{Number,number,Payload,Failure}\nimport runner::Runner\nfn main()->u32 {let runner=Runner{0_u32}\nret if runner.read[Result[Payload,Failure],Number](number()).unwrap_or(Payload{0_u32}).value==42_u32 {0_u32}else{1_u32}}\n"
+    fixture.put("src/main.enq", source)
+    if !fixture.succeeds(vec!["check"]) || !fixture.succeeds(vec!["run"]) {
+        ret fixture.finish(false)
+    }
+    fixture.put("src/main.enq", replace(source, "read[Result[Payload,Failure],Number](number())", "read[Result[Payload,Failure],str](\"text\")"))
+    let rejected = fixture.command(vec!["check"])
+    ret fixture.finish(!rejected.success() && rejected.text().contains("error[generic-bound-not-satisfied]"))
+}
+
+// Unresolved branch enum types must fail in source checking, before LLVM.
+#attr(test)
+fn integration_unresolved_match_enum_diagnostic() -> bool {
+    let fixture = Fixture::new("unresolved-match-enum")
+    fixture.manifest("option_repro", "[]")
+    let source = "pub struct Holder { value: Option[u32] }\nimport core::option::Option\npub fn choose(input: Option[u32]) -> Holder {\n let output = match input {\n  Option::Some(value) => { if value == 0_u32 { Option::None } else { Option::Some(value) } }\n  Option::None => Option::None\n }\n ret Holder { output }\n}\n"
+    fixture.put("src/lib.enq", source)
+    for command in vec!["check", "build"] {
+        let rejected = fixture.command(vec![command])
+        if rejected.success() || !rejected.text().contains("error[cannot-infer-enum-type]") || rejected.text().contains("Cannot allocate unsized type") {
+            eprintln(rejected.text())
+            ret fixture.finish(false)
+        }
+    }
+    fixture.put("src/lib.enq", replace(source, "let output =", "let output: Option[u32] ="))
+    ret fixture.finish(fixture.succeeds(vec!["check"]) && fixture.succeeds(vec!["build"]))
+}
+
+#attr(test)
+fn integration_issue78_match_literal_contract() -> bool {
+    let fixture = Fixture::new("issue78-match-literals")
+    fixture.manifest("match_literal_repro", "[]")
+    fixture.put("src/main.enq", "import core::option::Option\n\nfn payload_first(input: Option[i32]) -> i32 {\n    let result = match input {\n        Some(value) => value None => 1\n    }\n    ret result\n}\n\nfn literal_first(input: Option[i32]) -> i32 {\n    let result = match input {\n        None => {\n            ( - 1)\n        }\n        Some(value) => value\n    }\n    ret result\n}\n\nfn float_join(input: Option[f32]) -> f32 {\n    let result = match input {\n        None => {\n            let marker = 1_u32 0.25\n        }\n        Some(value) => value\n    }\n    ret result\n}\n\nfn byte_join(input: Option[u8]) -> u8 {\n    let result = match input {\n        None => 1 Some(value) => value\n    }\n    ret result\n}\n\nfn nested(input: Option[i32], other: Option[i32]) -> i32 {\n    let result = match input {\n        Some(value) => value\n        None => match other {\n            None =>( - 1) Some(value) => value\n        }\n    }\n    ret result\n}\n\nfn explicit_context(flag: bool) -> f32 {\n    let result: f32 = match flag {\n        true => {\n            let marker = 2_u32 0.25\n        }\n        false => {\n            let marker = 3_u32\n            0.5\n        }\n    }\n    ret result\n}\n\nfn nested_literals(flag: bool, value: u8) -> u8 {\n    let result = match flag {\n        true => match flag {\n            true => 1 false => 2\n        }\n        false => value\n    }\n    ret result\n}\n\nfn match_inside_if(flag: bool, value: u8) -> u8 {\n    let result = if flag {\n        match flag {\n            true => 1 false => 2\n        }\n    } else {\n        value\n    }\n    ret result\n}\n\nfn typed_match_in_condition(input: Option[i32]) -> u32 {\n    ret if (match input {\n            Some(value) => value None => 1_i32\n        }\n    ) == 1_i32 {\n        0\n    } else {\n        1\n    }\n}\n\nfn literal_match_in_condition(input: Option[i32]) -> u32 {\n    ret if (match input {\n            Some(value) => value None => 1\n        }\n    ) == 1_i32 {\n        0\n    } else {\n        1\n    }\n}\n\nfn match_scrutinee(input: Option[i32]) -> u32 {\n    let result: u32 = match (match input {\n            Some(value) => value None => 1_i32\n        }\n    ) {\n        1_i32 => 0_u32\n        _ => 1_u32\n    }\n    ret result\n}\n\nfn main() -> u32 {\n    if payload_first(Option[i32]::None) != 1_i32 {\n        ret 1\n    }\n    if payload_first(Option[i32]::Some(42_i32)) != 42_i32 {\n        ret 2\n    }\n    if literal_first(Option[i32]::None) != - 1_i32 {\n        ret 3\n    }\n    if literal_first(Option[i32]::Some(42_i32)) != 42_i32 {\n        ret 4\n    }\n    if float_join(Option[f32]::None) != 0.25_f32 {\n        ret 5\n    }\n    if float_join(Option[f32]::Some(1.5_f32)) != 1.5_f32 {\n        ret 6\n    }\n    if byte_join(Option[u8]::None) != 1_u8 {\n        ret 7\n    }\n    if byte_join(Option[u8]::Some(42_u8)) != 42_u8 {\n        ret 8\n    }\n    if nested(Option[i32]::None, Option[i32]::None) != - 1_i32 {\n        ret 9\n    }\n    if nested(Option[i32]::None, Option[i32]::Some(42_i32)) != 42_i32 {\n        ret 10\n    }\n    if explicit_context(true) != 0.25_f32 || explicit_context(false) != 0.5_f32 {\n        ret 11\n    }\n    if nested_literals(true, 42_u8) != 1_u8 || nested_literals(false, 42_u8) != 42_u8 {\n        ret 12\n    }\n    if match_inside_if(true, 42_u8) != 1_u8 || match_inside_if(false, 42_u8) != 42_u8 {\n        ret 13\n    }\n    if typed_match_in_condition(Option[i32]::None) != 0_u32 || typed_match_in_condition(Option[i32]::Some(2_i32)) != 1_u32 {\n        ret 14\n    }\n    if literal_match_in_condition(Option[i32]::None) != 0_u32 || literal_match_in_condition(Option[i32]::Some(2_i32)) != 1_u32 {\n        ret 15\n    }\n    if match_scrutinee(Option[i32]::None) != 0_u32 || match_scrutinee(Option[i32]::Some(2_i32)) != 1_u32 {\n        ret 16\n    }\n    ret 0\n}\n")
+    ret fixture.finish(fixture.succeeds(vec!["check"]) && fixture.succeeds(vec!["run"]))
+}

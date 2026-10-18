@@ -1,0 +1,1835 @@
+//! Compile-time reflection expansion. Operates on structured AST, never source text.
+
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+import core::vec::Vec
+import json::{Json, stringify}
+import refrain::frontend::metadata_ast::{encode_metadata_ast, decode_metadata_ast}
+import refrain::frontend::parser::{Statement, FunctionItem, ImplStmt, GenericParam, Expr, MatchArmBody}
+
+/// A declaration's logical shape, supplied by the resolved type environment.
+pub struct ReflectionShape {
+    name: str
+    identity: str
+    kind: str
+    parameters: Vec[str]
+    fields: Vec[(str, str)]
+    attributes: Vec[(str, str, str)]
+}
+
+struct Meta {
+    kind: str
+    owner: str
+    index: usize
+}
+
+struct Expansion {
+    shapes: Vec[ReflectionShape]
+    bindings: Vec[(str, Meta)]
+}
+
+/// Returns whether a function directly requests compile-time reflection.
+pub fn function_uses_reflection(item: FunctionItem) -> bool {
+    for attribute in item.attrs {
+        if attribute == "reflection" || attribute == "attr:reflection" {
+            ret false
+        }
+        if attribute == "reflection_template" || attribute == "attr:reflection_template" {
+            ret true
+        }
+    }
+    for parameter in item.params {
+        let typ = parameter.typ.unwrap_or("")
+        if typ.contains("TypeInfo[") || typ.contains("FieldInfo[") {
+            ret true
+        }
+    }
+    match item.body {
+        Some(body) => {
+            ret walk_statements(body.statements, Vec[str]::new(), true)
+        }
+        None => {
+            ret false
+        }
+    }
+}
+
+/// Finds the transitive compile-time template closure across available modules.
+pub fn reflection_template_names(ast: Vec[Statement]) -> Vec[str] {
+    let mut names = Vec[str]::new()
+    let functions = all_functions(ast)
+    let mut changed = true
+    while changed {
+        changed = false
+        for function in functions {
+            if function.generics.is_empty() {
+                continue
+            }
+            if contains_name(names, function.name) {
+                continue
+            }
+            if function_uses_reflection(function) || calls_reflection_templates(function, names) {
+                names.push(function.name)
+                changed = true
+            }
+        }
+    }
+    ret names
+}
+
+fn contains_name(names: Vec[str], value: str) -> bool {
+    for name in names {
+        if name == value {
+            ret true
+        }
+    }
+    ret false
+}
+
+fn calls_template(value: Json, names: Vec[str]) -> bool {
+    if text(at(value, 0)) == "Path" && contains_name(names, last_name(root_name(text(at(value, 1))))) {
+        ret true
+    }
+    if text(at(value, 0)) == "MethodCall" && contains_name(names, text(at(at(value, 1), 1))) {
+        ret true
+    }
+    for child in items(value) {
+        if calls_template(child, names) {
+            ret true
+        }
+    }
+    ret false
+}
+
+fn all_functions(ast: Vec[Statement]) -> Vec[FunctionItem] {
+    let mut out = Vec[FunctionItem]::new()
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => {
+                out.push(item)
+            }
+            Statement::Impl(item) => {
+                for method in item.methods {
+                    let mut generics = Vec[GenericParam]::new()
+                    for generic in item.generics {
+                        generics.push(generic)
+                    }
+                    for generic in method.generics {
+                        generics.push(generic)
+                    }
+                    out.push(FunctionItem {
+                            method.attrs, method.decorators, method.is_public, method.is_extern,
+                            method.is_async, method.name, method.documentation, generics, method.params,
+                            method.ret_type, method.returns_sending, method.returns_frozen,
+                            method.body, method.source_name, method.line, method.column
+                        }
+                        ,)
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret out
+}
+
+/// Marks the generic declarations whose structured bodies must survive packaging.
+pub fn mark_reflection_templates(ast: Vec[Statement], names: Vec[str]) -> Vec[Statement] {
+    let mut out = Vec[Statement]::new()
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => {
+                out.push(Statement::Function(mark_function(item, names, false)))
+            }
+            Statement::Impl(item) => {
+                let mut methods = Vec[FunctionItem]::new()
+                for method in item.methods {
+                    methods.push(mark_function(method, names, !item.generics.is_empty()))
+                }
+                out.push(Statement::Impl(ImplStmt {
+                            item.documentation, item.generics, item.trait_name, item.trait_args,
+                            item.target, methods, item.source_name, item.line, item.column
+                        }
+                        ,))
+            }
+            _ => {
+                out.push(statement)
+            }
+        }
+    }
+    ret out
+}
+
+fn mark_function(item: FunctionItem, names: Vec[str], generic_owner: bool) -> FunctionItem {
+    if (!generic_owner && item.generics.is_empty()) || !contains_name(names, item.name) {
+        ret item
+    }
+    let mut attributes = Vec[str]::new()
+    for attribute in item.attrs {
+        attributes.push(attribute)
+    }
+    attributes.push("reflection_template")
+    ret FunctionItem {
+        attributes, item.decorators, item.is_public, item.is_extern, item.is_async, item.name,
+        item.documentation, item.generics, item.params, item.ret_type, item.returns_sending,
+        item.returns_frozen, item.body, item.source_name, item.line, item.column
+    }
+}
+
+/// Substitutes type binders while leaving literal program strings untouched.
+pub fn specialize_reflection_function(item: FunctionItem, parameters: Vec[str], arguments: Vec[str])
+-> Result[FunctionItem, str] {
+    if parameters.len() != arguments.len() {
+        ret Result::Err("reflection template arity mismatch")
+    }
+    let mut input = Vec[Statement]::new()
+    input.push(Statement::Function(item))
+    let encoded = at(encode_metadata_ast(input), 0)
+    let payload = at(encoded, 1)
+    let mut specialized = substitute_function_payload(payload, parameters, arguments)
+    specialized = replace(specialized, 7, Json::Array(Vec[Json]::new()))
+    let mut output = Vec[Json]::new()
+    output.push(pair("Function", specialized))
+    let ast = decode_metadata_ast(Json::Array(output))?
+    match ast.get(0) {
+        Some(statement) => {
+            match statement {
+                Statement::Function(function) => {
+                    ret Result::Ok(function)
+                }
+                _ => {
+                }
+            }
+        }
+        None => {
+        }
+    }
+    ret Result::Err("reflection specialization did not produce a function")
+}
+
+fn substitute_type_json(value: Json, parameters: Vec[str], arguments: Vec[str]) -> Json {
+    match value {
+        Json::String(source) => {
+            let mut result = source
+            let mut index = 0_usize
+            for parameter in parameters {
+                result = substitute_type_token(result, parameter, arguments.get(index).unwrap_or(""))
+                index += 1
+            }
+            ret Json::String(result)
+        }
+        _ => {
+            ret value
+        }
+    }
+}
+fn substitute_parameters(values: Json, parameters: Vec[str], arguments: Vec[str]) -> Json {
+    let mut out = Vec[Json]::new()
+    for value in items(values) {
+        out.push(replace(value, 1, substitute_type_json(at(value, 1), parameters, arguments)))
+    }
+    ret Json::Array(out)
+}
+fn substitute_function_payload(value: Json, parameters: Vec[str], arguments: Vec[str]) -> Json {
+    let out = replace(value, 8, substitute_parameters(at(value, 8), parameters, arguments))
+    let out = replace(out, 9, substitute_type_json(at(value, 9), parameters, arguments))
+    ret replace(out, 12, substitute_json(at(value, 12), parameters, arguments))
+}
+fn substitute_path(source: str, parameters: Vec[str], arguments: Vec[str]) -> str {
+    let mut result = ""
+    let mut first = 0_usize
+    let mut index = 0_usize
+    let mut depth = 0_usize
+    while index < source.byte_len() {
+        let byte = source.byte_at(index)
+        if byte == 91_u8 {
+            if depth == 0 {
+                result = result + source.slice_bytes(first, index + 1 - first) first = index + 1
+            }
+            depth += 1
+        } elif byte == 93_u8 && depth > 0 {
+            depth -= 1
+            if depth == 0 {
+                let substituted = substitute_type_json(Json::String(source.slice_bytes(first, index - first)), parameters, arguments)
+                result = result + text(substituted) + "]"
+                first = index + 1
+            }
+        }
+        index += 1
+    }
+    result = result + source.slice_bytes(first, source.byte_len() - first)
+    let mut ordinal = 0_usize
+    for parameter in parameters {
+        let prefix = parameter + "::"
+        if result.byte_len() >= prefix.byte_len() && result.slice_bytes(0, prefix.byte_len()) == prefix {
+            result = arguments.get(ordinal).unwrap_or("") + result.slice_bytes(parameter.byte_len(), result.byte_len() - parameter.byte_len())
+        }
+        ordinal += 1
+    }
+    ret result
+}
+fn substitute_json(value: Json, parameters: Vec[str], arguments: Vec[str]) -> Json {
+    if items(value).len() == 3 && text(at(value, 0)) == "path" {
+        ret replace(value, 1, Json::String(substitute_path(text(at(value, 1)), parameters, arguments)))
+    }
+    if items(value).len() == 2 && at(value, 0).as_str().is_some() {
+        let tag = text(at(value, 0))
+        let payload = at(value, 1)
+        if tag == "StringLiteral" {
+            ret value
+        }
+        if tag == "Path" {
+            ret pair(tag, Json::String(substitute_path(text(payload), parameters, arguments)))
+        }
+        if tag == "Function" {
+            ret pair(tag, substitute_function_payload(payload, parameters, arguments))
+        }
+        if tag == "Let" {
+            let out = replace(payload, 1, substitute_type_json(at(payload, 1), parameters, arguments))
+            ret pair(tag, replace(out, 2, substitute_json(at(payload, 2), parameters, arguments)))
+        }
+        if tag == "StructInit" {
+            let out = replace(payload, 0, substitute_type_json(at(payload, 0), parameters, arguments))
+            ret pair(tag, replace(out, 1, substitute_json(at(payload, 1), parameters, arguments)))
+        }
+        if tag == "Cast" {
+            let out = replace(payload, 1, substitute_type_json(at(payload, 1), parameters, arguments))
+            ret pair(tag, replace(out, 0, substitute_json(at(payload, 0), parameters, arguments)))
+        }
+        if tag == "Closure" {
+            let out = replace(payload, 0, substitute_parameters(at(payload, 0), parameters, arguments))
+            ret pair(tag, replace(out, 1, substitute_json(at(payload, 1), parameters, arguments)))
+        }
+        if tag == "Call" || tag == "MethodCall" {
+            let position = if tag == "Call" {
+                1_usize
+            } else {
+                2_usize
+            }
+            let mut generics = Vec[Json]::new()
+            for generic in items(at(payload, position)) {
+                generics.push(substitute_type_json(generic, parameters, arguments))
+            }
+            let out = substitute_json(payload, parameters, arguments)
+            ret pair(tag, replace(out, position, Json::Array(generics)))
+        }
+    }
+    match value {
+        Json::Array(values) => {
+            let mut out = Vec[Json]::new()
+            for child in values {
+                out.push(substitute_json(child, parameters, arguments))
+            }
+            ret Json::Array(out)
+        }
+        _ => {
+            ret value
+        }
+    }
+}
+
+fn identifier_byte(byte: u8) -> bool {
+    ret(byte >= 48 && byte <= 57) ||(byte >= 65 && byte <= 90) ||
+    (byte >= 97 && byte <= 122) || byte == 95 || byte >= 128
+}
+
+fn substitute_type_token(source: str, parameter: str, replacement: str) -> str {
+    if parameter == "" {
+        ret source
+    }
+    let mut result = ""
+    let mut first = 0_usize
+    let mut index = 0_usize
+    while index + parameter.byte_len() <= source.byte_len() {
+        if source.slice_bytes(index, parameter.byte_len()) == parameter &&
+        (index == 0 || !identifier_byte(source.byte_at(index - 1))) &&
+        (index + parameter.byte_len() == source.byte_len() ||
+            !identifier_byte(source.byte_at(index + parameter.byte_len()))) {
+            result = result + source.slice_bytes(first, index - first) + replacement
+            index += parameter.byte_len()
+            first = index
+        } else {
+            index += 1
+        }
+    }
+    ret result + source.slice_bytes(first, source.byte_len() - first)
+}
+
+fn contains_reflection(value: Json) -> bool {
+    match value {
+        Json::Array(items) => {
+            if text(at(value, 0)) == "Path" {
+                let path = root_name(text(at(value, 1)))
+                if path == "reflect::type_info" || path == "core::reflect::type_info" ||
+                path == "reflect::Builder" || path == "core::reflect::Builder" {
+                    ret true
+                }
+            }
+            for item in items {
+                if contains_reflection(item) {
+                    ret true
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    ret false
+}
+
+/// Expands a non-generic or already specialized function, retaining source spans.
+pub fn expand_reflection_function(item: FunctionItem, shapes: Vec[ReflectionShape])
+-> Result[FunctionItem, str] {
+    let mut input = Vec[Statement]::new()
+    input.push(Statement::Function(item))
+    let encoded = at(encode_metadata_ast(input), 0)
+    let payload = at(encoded, 1)
+    let mut state = Expansion { shapes, Vec[(str, Meta)]::new() }
+    for parameter in item.params {
+        let typ = parameter.typ.unwrap_or("")
+        let marker = "TypeInfo["
+        let index = find_text(typ, marker)
+        if index < typ.byte_len() && typ.byte_len() > index + marker.byte_len() {
+            let owner = typ.slice_bytes(index + marker.byte_len(), typ.byte_len() - index - marker.byte_len() - 1)
+            state.bindings.push((parameter.name, Meta { "Type", owner, 0 }))
+        }
+    }
+    let body = at(payload, 12)
+    if body.is_null() {
+        ret Result::Ok(item)
+    }
+    let expanded = expand_block(state, body)?
+    let result = pair("Function", replace(payload, 12, expanded))
+    let mut output = Vec[Json]::new()
+    output.push(result)
+    let decoded = decode_metadata_ast(Json::Array(output))?
+    match decoded.get(0) {
+        Some(statement) => {
+            match statement {
+                Statement::Function(function) => {
+                    ret Result::Ok(function)
+                }
+                _ => {
+                }
+            }
+        }
+        None => {
+        }
+    }
+    ret Result::Err("reflection expansion did not produce a function")
+}
+
+fn at(value: Json, index: usize) -> Json {
+    ret value.index(index).unwrap_or(Json::Null)
+}
+fn text(value: Json) -> str {
+    ret value.as_str().unwrap_or("")
+}
+fn items(value: Json) -> Vec[Json] {
+    ret value.as_array().unwrap_or(Vec[Json]::new())
+}
+
+fn find_text(source: str, needle: str) -> usize {
+    let mut index = 0_usize
+    while index + needle.byte_len() <= source.byte_len() {
+        if source.slice_bytes(index, needle.byte_len()) == needle {
+            ret index
+        }
+        index += 1
+    }
+    ret source.byte_len()
+}
+
+fn pair(tag: str, value: Json) -> Json {
+    let mut out = Vec[Json]::new()
+    out.push(Json::String(tag)) out.push(value)
+    ret Json::Array(out)
+}
+
+fn replace(value: Json, position: usize, item: Json) -> Json {
+    let mut out = Vec[Json]::new()
+    let mut index = 0_usize
+    for old in items(value) {
+        out.push(if index == position {
+                item
+            } else {
+                old
+            }
+        )
+        index += 1
+    }
+    ret Json::Array(out)
+}
+
+fn node_like(source: Json, tag: str, payload: Json) -> Json {
+    ret replace(source, 0, pair(tag, payload))
+}
+
+fn path_node(source: Json, path: str) -> Json {
+    ret node_like(source, "Path", Json::String(path))
+}
+
+fn string_node(source: Json, value: str) -> Json {
+    ret node_like(source, "StringLiteral", Json::String(stringify(Json::String(value))))
+}
+
+fn copy_bindings(values: Vec[(str, Meta)]) -> Vec[(str, Meta)] {
+    let mut out = Vec[(str, Meta)]::new()
+    for value in values {
+        out.push(value)
+    }
+    ret out
+}
+
+fn bound(state: Expansion, name: str) -> Option[Meta] {
+    let mut index = state.bindings.len()
+    while index > 0 {
+        index -= 1
+        match state.bindings.get(index) {
+            Some(binding) => {
+                if binding.0 == name {
+                    ret Option::Some(binding.1)
+                }
+            }
+            None => {
+            }
+        }
+    }
+    ret Option::None
+}
+
+fn root_name(value: str) -> str {
+    let mut index = 0_usize
+    while index < value.byte_len() {
+        if value.byte_at(index) == 91_u8 || value.byte_at(index) == 60_u8 ||
+        value.byte_at(index) == 38_u8 || value.byte_at(index) == 42_u8 {
+            ret trim_type(value.slice_bytes(0, index))
+        }
+        index += 1
+    }
+    ret value
+}
+
+fn shape(state: Expansion, owner: str) -> Result[ReflectionShape, str] {
+    let name = root_name(owner)
+    if (owner.byte_len() > 1 && owner.byte_at(0) == 40_u8 && owner != "()") ||
+    (name.byte_len() > 8 && name.slice_bytes(0, 8) == "__tuple_") {
+        let source = if owner.byte_at(0) == 40_u8 {
+            "Tuple[" + owner.slice_bytes(1, owner.byte_len() - 2) + "]"
+        } else {
+            owner
+        }
+        let arguments = type_arguments(source)
+        let mut fields = Vec[(str, str)]::new()
+        let mut index = 0_usize
+        for argument in arguments {
+            fields.push((Debug::fmt(index), argument)) index += 1
+        }
+        ret Result::Ok(ReflectionShape {
+                owner, owner, "Tuple", Vec[str]::new(), fields, Vec[(str, str, str)]::new()
+            }
+            ,
+        )
+    }
+    for candidate in state.shapes {
+        if candidate.name == name {
+            let arguments = type_arguments(owner)
+            let mut fields = Vec[(str, str)]::new()
+            for field in candidate.fields {
+                let mut typ = field.1
+                let mut index = 0_usize
+                for parameter in candidate.parameters {
+                    match arguments.get(index) {
+                        Some(argument) => {
+                            typ = substitute_type_token(typ, parameter, argument)
+                        }
+                        None => {
+                        }
+                    }
+                    index += 1
+                }
+                fields.push((field.0, typ))
+            }
+            ret Result::Ok(ReflectionShape {
+                    candidate.name, candidate.identity, candidate.kind, candidate.parameters, fields, candidate.attributes
+                }
+                ,
+            )
+        }
+    }
+    ret Result::Err("no resolved reflection declaration for '" + owner + "'")
+}
+
+fn type_arguments(owner: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let start = find_text(owner, "[")
+    if start == owner.byte_len() {
+        ret out
+    }
+    let mut depth = 0_usize
+    let mut first = start + 1
+    let mut index = first
+    while index < owner.byte_len() {
+        let byte = owner.byte_at(index)
+        if byte == 91_u8 || byte == 40_u8 {
+            depth += 1
+        } elif byte == 93_u8 && depth == 0 {
+            if index > first {
+                out.push(trim_type(owner.slice_bytes(first, index - first)))
+            }
+            break
+        } elif byte == 93_u8 || byte == 41_u8 {
+            depth -= 1
+        } elif byte == 44_u8 && depth == 0 {
+            out.push(trim_type(owner.slice_bytes(first, index - first)))
+            first = index + 1
+        }
+        index += 1
+    }
+    ret out
+}
+
+fn trim_type(source: str) -> str {
+    let mut first = 0_usize
+    let mut end = source.byte_len()
+    while first < end && source.byte_at(first) == 32_u8 {
+        first += 1
+    }
+    while end > first && source.byte_at(end - 1) == 32_u8 {
+        end -= 1
+    }
+    ret source.slice_bytes(first, end - first)
+}
+
+fn type_kind(state: Expansion, owner: str) -> str {
+    if owner.byte_len() > 0 && owner.byte_at(owner.byte_len() - 1) == 42_u8 {
+        ret "Pointer"
+    }
+    match owner {
+        "bool" => {
+            ret "Bool"
+        }
+        "str" => {
+            ret "String"
+        }
+        "u8" => {
+            ret "U8"
+        }
+        "u16" => {
+            ret "U16"
+        }
+        "u32" => {
+            ret "U32"
+        }
+        "u64" => {
+            ret "U64"
+        }
+        "usize" => {
+            ret "Usize"
+        }
+        "i8" => {
+            ret "I8"
+        }
+        "i16" => {
+            ret "I16"
+        }
+        "i32" => {
+            ret "I32"
+        }
+        "i64" => {
+            ret "I64"
+        }
+        "isize" => {
+            ret "Isize"
+        }
+        "f32" => {
+            ret "F32"
+        }
+        "f64" => {
+            ret "F64"
+        }
+        "void" => {
+            ret "Unit"
+        }
+        "()" => {
+            ret "Unit"
+        }
+        _ => {
+        }
+    }
+    match shape(state, owner) {
+        Result::Ok(found) => {
+            ret found.kind
+        }
+        Result::Err(_) => {
+            ret "Unsupported"
+        }
+    }
+}
+
+fn evaluate(state: Expansion, node: Json) -> Option[Meta] {
+    let expression = at(node, 0)
+    let tag = text(at(expression, 0))
+    let payload = at(expression, 1)
+    if tag == "Binary" {
+        let left = evaluate(state, at(payload, 0))
+        let right = evaluate(state, at(payload, 2))
+        match left {
+            Some(lhs) => {
+                let mut other = right
+                if lhs.kind == "Kind" && other.is_none() {
+                    let candidate = at(at(payload, 2), 0)
+                    if text(at(candidate, 0)) == "Path" {
+                        other = Option[Meta]::Some(Meta {
+                                "Kind", last_name(text(at(candidate, 1))), 0
+                            }
+                            ,
+                        )
+                    }
+                }
+                match other {
+                    Some(rhs) => {
+                        let op = text(at(payload, 1))
+                        if lhs.kind == rhs.kind &&(op == "==" || op == "!=") {
+                            let same = lhs.owner == rhs.owner
+                            ret Option::Some(Meta {
+                                    "Bool", if same ==(op == "==") {
+                                        "true"
+                                    } else {
+                                        "false"
+                                    }
+                                    , 0
+                                }
+                                ,
+                            )
+                        }
+                        if lhs.kind == "Bool" && rhs.kind == "Bool" &&(op == "&&" || op == "||") {
+                            let result = if op == "&&" {
+                                lhs.owner == "true" && rhs.owner == "true"
+                            } else {
+                                lhs.owner == "true" || rhs.owner == "true"
+                            }
+                            ret Option::Some(Meta {
+                                    "Bool", if result {
+                                        "true"
+                                    } else {
+                                        "false"
+                                    }
+                                    , 0
+                                }
+                                ,
+                            )
+                        }
+                    }
+                    None => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
+    if tag == "Unary" && text(at(payload, 0)) == "!" {
+        match evaluate(state, at(payload, 1)) {
+            Some(meta) => {
+                if meta.kind == "Bool" {
+                    ret Option::Some(Meta {
+                            "Bool", if meta.owner == "true" {
+                                "false"
+                            } else {
+                                "true"
+                            }
+                            , 0
+                        }
+                        ,
+                    )
+                }
+            }
+            None => {
+            }
+        }
+    }
+    if tag == "Path" {
+        match bound(state, text(payload)) {
+            Some(meta) => {
+                if meta.kind != "Runtime" {
+                    ret Option::Some(meta)
+                }
+            }
+            None => {
+            }
+        }
+        ret Option::None
+    }
+    if tag == "Call" {
+        let callee = at(at(at(payload, 0), 0), 1)
+        let path = text(callee)
+        let name = root_name(path)
+        if (name == "reflect::Builder" || name == "core::reflect::Builder") &&
+        path.byte_len() > 7 && path.slice_bytes(path.byte_len() - 5, 5) == "::new" {
+            let arguments = type_arguments(path)
+            if arguments.len() == 1 {
+                ret Option::Some(Meta {
+                        "Builder", arguments.get(0).unwrap_or(""), 0
+                    }
+                    ,
+                )
+            }
+        }
+        if name == "reflect::type_info" || name == "core::reflect::type_info" {
+            let explicit = text(at(at(payload, 1), 0))
+            let owner = if explicit != "" {
+                explicit
+            } elif path.byte_len() > name.byte_len() + 2 {
+                path.slice_bytes(name.byte_len() + 1, path.byte_len() - name.byte_len() - 2)
+            } else {
+                ""
+            }
+            if owner != "" {
+                ret Option::Some(Meta { "Type", owner, 0 })
+            }
+        }
+    }
+    if tag == "MethodCall" {
+        match evaluate(state, at(payload, 0)) {
+            Some(receiver) => {
+                let method = text(at(payload, 1))
+                if receiver.kind == "Type" && method == "is_template" {
+                    let expected = text(at(at(payload, 2), 0))
+                    let same = template_identity(state, receiver.owner) == template_identity(state, expected)
+                    ret Option::Some(Meta {
+                            "Bool", if same {
+                                "true"
+                            } else {
+                                "false"
+                            }
+                            , 0
+                        }
+                        ,
+                    )
+                }
+                if receiver.kind == "Type" && method == "argument" {
+                    let arg = at(at(at(at(payload, 3), 0), 0), 1)
+                    let ordinal = text(arg)
+                    let arguments = type_arguments(receiver.owner)
+                    let mut index = 0_usize
+                    for argument in arguments {
+                        if ordinal == Debug::fmt(index) || ordinal == Debug::fmt(index) + "_usize" {
+                            ret Option::Some(Meta { "Type", argument, 0 })
+                        }
+                        index += 1
+                    }
+                }
+                if receiver.kind == "Type" && method == "variants" {
+                    ret Option::Some(Meta { "Variants", receiver.owner, 0 })
+                }
+                if receiver.kind == "Variant" && method == "has_payload" {
+                    match shape(state, receiver.owner) {
+                        Ok(found) => {
+                            let field = found.fields.get(receiver.index).unwrap_or(("", "void"))
+                            ret Option::Some(Meta {
+                                    "Bool", if field.1 == "void" || field.1 == "()" {
+                                        "false"
+                                    } else {
+                                        "true"
+                                    }
+                                    , 0
+                                }
+                                ,
+                            )
+                        }
+                        Err(_) => {
+                        }
+                    }
+                }
+                if receiver.kind == "Type" && method == "fields" {
+                    ret Option::Some(Meta { "Fields", receiver.owner, 0 })
+                }
+                if receiver.kind == "Type" && method == "kind" {
+                    ret Option::Some(Meta { "Kind", type_kind(state, receiver.owner), 0 })
+                }
+                if (receiver.kind == "Field" || receiver.kind == "Variant") && method == "type" {
+                    match shape(state, receiver.owner) {
+                        Result::Ok(found) => {
+                            match found.fields.get(receiver.index) {
+                                Some(field) => {
+                                    ret Option::Some(Meta {
+                                            "Type", if receiver.kind == "Variant" && field.1 == "void" {
+                                                "()"
+                                            } else {
+                                                field.1
+                                            }
+                                            , 0
+                                        }
+                                        ,
+                                    )
+                                }
+                                None => {
+                                }
+                            }
+                        }
+                        Result::Err(_) => {
+                        }
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
+    ret Option::None
+}
+
+fn expand_block(state: mut Expansion, block: Json) -> Result[Json, str] {
+    let saved = copy_bindings(state.bindings)
+    let mut out = Vec[Json]::new()
+    for statement in items(at(block, 0)) {
+        let expanded = expand_statement(state, statement)?
+        let mut terminated = false
+        for item in expanded {
+            out.push(item)
+            if text(at(item, 0)) == "Ret" {
+                terminated = true
+            }
+        }
+        if terminated {
+            break
+        }
+    }
+    state.bindings = saved
+    ret Result::Ok(replace(block, 0, Json::Array(out)))
+}
+
+fn singleton(value: Json) -> Vec[Json] {
+    let mut out = Vec[Json]::new()
+    out.push(value)
+    ret out
+}
+
+fn expand_statement(state: mut Expansion, statement: Json) -> Result[Vec[Json], str] {
+    let tag = text(at(statement, 0))
+    let payload = at(statement, 1)
+    if tag == "Let" {
+        match evaluate(state, at(payload, 2)) {
+            Some(meta) => {
+                if meta.kind == "Builder" {
+                    let name = text(at(payload, 0))
+                    state.bindings.push((name, Meta { "Builder:" + name, meta.owner, 0 }))
+                    let declaration = shape(state, meta.owner)?
+                    let mut out = Vec[Json]::new()
+                    let mut index = 0_usize
+                    for field in declaration.fields {
+                        let typ =(builtin_type(state, "core::option::Option", "Option") + "[") + field.1 + "]"
+                        let slot = replace(replace(replace(replace(payload, 0,
+                                        Json::String(builder_slot(name, index)),), 1, Json::String(typ)), 2,
+                                path_node(at(payload, 2), typ + "::None"),), 3, Json::Bool(true))
+                        out.push(pair("Let", slot))
+                        index += 1
+                    }
+                    ret Result::Ok(out)
+                }
+                if (meta.kind == "Bool" || meta.kind == "Kind") && at(payload, 3).as_bool().unwrap_or(false) {
+                    state.bindings.push((text(at(payload, 0)), Meta { "Runtime", "", 0 }))
+                    ret Result::Ok(singleton(pair(tag, expand_json(state, payload)?)))
+                }
+                state.bindings.push((text(at(payload, 0)), meta))
+                ret Result::Ok(Vec[Json]::new())
+            }
+            None => {
+                state.bindings.push((text(at(payload, 0)), Meta { "Runtime", "", 0 }))
+            }
+        }
+    }
+    if tag == "If" {
+        let mut remaining = Vec[Json]::new()
+        for branch in items(at(payload, 0)) {
+            match evaluate(state, at(branch, 0)) {
+                Some(meta) => {
+                    if meta.kind != "Bool" {
+                        ret Result::Err("reflection condition must be boolean")
+                    }
+                    if meta.owner == "false" {
+                        continue
+                    }
+                    let block = expand_block(state, at(branch, 1))?
+                    if remaining.is_empty() {
+                        ret Result::Ok(items(at(block, 0)))
+                    }
+                    ret Result::Ok(singleton(pair("If", replace(replace(payload, 0, Json::Array(remaining)), 1, block))))
+                }
+                None => {
+                    remaining.push(expand_json(state, branch)?)
+                }
+            }
+        }
+        let otherwise = at(payload, 1)
+        let expanded = if otherwise.is_null() {
+            otherwise
+        } else {
+            expand_block(state, otherwise)?
+        }
+        if remaining.is_empty() {
+            ret Result::Ok(items(at(expanded, 0)))
+        }
+        ret Result::Ok(singleton(pair("If", replace(replace(payload, 0, Json::Array(remaining)), 1, expanded))))
+    }
+    if tag == "For" {
+        match evaluate(state, at(payload, 2)) {
+            Some(meta) => {
+                if meta.kind != "Fields" && meta.kind != "Variants" {
+                    ret Result::Err("only reflection descriptor sequences are iterable")
+                }
+                let declaration = shape(state, meta.owner)?
+                let mut out = Vec[Json]::new()
+                let mut index = 0_usize
+                for _field in declaration.fields {
+                    let saved = copy_bindings(state.bindings)
+                    state.bindings.push((text(at(payload, 1)), Meta {
+                                if meta.kind == "Variants" {
+                                    "Variant"
+                                } else {
+                                    "Field"
+                                }
+                                , meta.owner, index
+                            }
+                            ,
+                        ))
+                    let body = expand_block(state, at(payload, 3))?
+                    // Each expansion gets its own lexical block and cleanup scope.
+                    let mut expression = Vec[Json]::new()
+                    expression.push(at(body, 0)) expression.push(Json::Null)
+                    expression.push(at(body, 1)) expression.push(at(body, 2))
+                    expression.push(at(body, 3)) expression.push(at(body, 4))
+                    let mut node = Vec[Json]::new()
+                    node.push(pair("Block", Json::Array(expression)))
+                    node.push(at(body, 1)) node.push(at(body, 2))
+                    node.push(Json::Number("1")) node.push(Json::String(""))
+                    out.push(pair("Expr", Json::Array(node)))
+                    state.bindings = saved
+                    index += 1
+                }
+                ret Result::Ok(out)
+            }
+            None => {
+            }
+        }
+    }
+    if tag == "Match" {
+        match evaluate(state, at(payload, 0)) {
+            Some(meta) => {
+                if meta.kind == "Kind" {
+                    for arm in items(at(payload, 1)) {
+                        let pattern = at(arm, 0)
+                        let name = text(at(pattern, 1))
+                        if text(at(pattern, 0)) == "wildcard" || name == "_" || last_name(name) == meta.owner {
+                            let body = at(arm, 1)
+                            if text(at(body, 0)) == "Block" {
+                                ret Result::Ok(items(at(expand_block(state, at(body, 1))?, 0)))
+                            }
+                            ret Result::Ok(singleton(pair("Expr", expand_json(state, at(body, 1))?)))
+                        }
+                    }
+                    ret Result::Err("reflection kind match has no matching arm")
+                }
+            }
+            None => {
+            }
+        }
+    }
+    ret Result::Ok(singleton(pair(tag, expand_json(state, payload)?)))
+}
+
+fn last_name(value: str) -> str {
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index + 1 < value.byte_len() {
+        if value.byte_at(index) == 58_u8 && value.byte_at(index + 1) == 58_u8 {
+            start = index + 2
+        }
+        index += 1
+    }
+    ret value.slice_bytes(start, value.byte_len() - start)
+}
+
+fn expand_json(state: mut Expansion, value: Json) -> Result[Json, str] {
+    if items(value).len() == 5 && at(value, 1).as_number().is_some() &&
+    at(value, 2).as_number().is_some() && at(value, 3).as_number().is_some() &&
+    at(value, 4).as_number().is_some() {
+        ret expand_block(state, value)
+    }
+    if let_array_node(value) {
+        let expression = at(value, 0)
+        let tag = text(at(expression, 0))
+        let payload = at(expression, 1)
+        if tag == "MethodCall" {
+            match evaluate(state, at(payload, 0)) {
+                Some(meta) => {
+                    let method = text(at(payload, 1))
+                    if meta.kind.byte_len() > 8 && meta.kind.slice_bytes(0, 8) == "Builder:" {
+                        let name = meta.kind.slice_bytes(8, meta.kind.byte_len() - 8)
+                        if method == "finish" {
+                            ret builder_finish(state, value, name, meta.owner)
+                        }
+                        if method == "set" {
+                            let arguments = items(at(payload, 3))
+                            if arguments.len() != 2 {
+                                ret Result::Err("Builder::set expects a field and its value")
+                            }
+                            match evaluate(state, arguments.get(0).unwrap_or(Json::Null)) {
+                                Some(field) => {
+                                    if field.kind != "Field" || field.owner != meta.owner {
+                                        ret Result::Err("Builder::set field belongs to a different type")
+                                    }
+                                    let declaration = shape(state, meta.owner)?
+                                    let member = declaration.fields.get(field.index).unwrap_or(("", ""))
+                                    let item = expand_json(state, arguments.get(1).unwrap_or(Json::Null))?
+                                    let mut assignment = Vec[Json]::new()
+                                    assignment.push(path_node(value, builder_slot(name, field.index)))
+                                    assignment.push(Json::String("="))
+                                    assignment.push(call_node(value,(builtin_type(state, "core::option::Option", "Option") + "[") + member.1 + "]::Some", singleton(item)))
+                                    ret Result::Ok(block_node(value, singleton(pair("Assignment", Json::Array(assignment))), Json::Null))
+                                }
+                                None => {
+                                    ret Result::Err("Builder::set requires a reflected field")
+                                }
+                            }
+                        }
+                    }
+                    if meta.kind == "Type" && method == "size_bound" {
+                        ret Result::Ok(node_like(value, "Integer", Json::String(Debug::fmt(storage_bound(state, meta.owner, 0)?) + "_usize")))
+                    }
+                    if meta.kind == "Type" && method == "name" {
+                        ret Result::Ok(string_node(value, display_type_name(meta.owner)))
+                    }
+                    if meta.kind == "Type" && method == "kind" {
+                        ret Result::Ok(path_node(value,(builtin_type(state, "core::reflect::Kind", "Kind") + "::") + type_kind(state, meta.owner)))
+                    }
+                    if meta.kind == "Variant" {
+                        let declaration = shape(state, meta.owner)?
+                        let variant = declaration.fields.get(meta.index).unwrap_or(("", "void"))
+                        let unit = variant.1 == "void" || variant.1 == "()"
+                        let path = meta.owner + "::" + variant.0
+                        let arguments = items(at(payload, 3))
+                        if method == "name" {
+                            ret Result::Ok(string_node(value, variant.0))
+                        }
+                        if method == "construct" {
+                            if arguments.len() != 1 {
+                                ret Result::Err("VariantInfo::construct expects one payload")
+                            }
+                            if unit {
+                                ret Result::Ok(path_node(value, path))
+                            }
+                            ret Result::Ok(call_node(value, path, singleton(expand_json(state, arguments.get(0).unwrap_or(Json::Null))?)))
+                        }
+                        if method == "get" || method == "is_active" {
+                            if arguments.len() != 1 {
+                                ret Result::Err("variant access expects one value")
+                            }
+                            let base = expand_json(state, arguments.get(0).unwrap_or(Json::Null))?
+                            let binding = "__encore_variant_payload_" + Debug::fmt(meta.index)
+                            let payload_type = if unit {
+                                "()"
+                            } else {
+                                variant.1
+                            }
+                            let option =(builtin_type(state, "core::option::Option", "Option") + "[") + payload_type + "]"
+                            let some = if method == "is_active" {
+                                node_like(value, "Boolean", Json::Bool(true))
+                            } else {
+                                call_node(value, option + "::Some", singleton(if unit {
+                                            node_like(value, "TupleLiteral", Json::Array(singleton(Json::Array(Vec[Json]::new()))))
+                                        } else {
+                                            path_node(value, binding)
+                                        }
+                                    ))
+                            }
+                            let none = if method == "is_active" {
+                                node_like(value, "Boolean", Json::Bool(false))
+                            } else {
+                                path_node(value, option + "::None")
+                            }
+                            ret Result::Ok(match_node(value, base, path, if unit {
+                                        ""
+                                    } else {
+                                        binding
+                                    }
+                                    , some, none,))
+                        }
+                    }
+                    if meta.kind == "Field" {
+                        let declaration = shape(state, meta.owner)?
+                        let field = declaration.fields.get(meta.index).unwrap_or(("", ""))
+                        if method == "attribute" {
+                            let argument = at(at(payload, 3), 0)
+                            if text(at(at(argument, 0), 0)) != "StringLiteral" {
+                                ret Result::Err("FieldInfo::attribute requires a constant string key")
+                            }
+                            let encoded = text(at(at(argument, 0), 1))
+                            let key = match json::parse(encoded) {
+                                Ok(value) => value.as_str().unwrap_or("") Err(_) => encoded
+                            }
+                            for attribute in declaration.attributes {
+                                if attribute.0 == field.0 && attribute.1 == key {
+                                    ret Result::Ok(call_node(value,(builtin_type(state, "core::option::Option", "Option") + "[str]::Some"), singleton(string_node(value, attribute.2))))
+                                }
+                            }
+                            ret Result::Ok(path_node(value,(builtin_type(state, "core::option::Option", "Option") + "[str]::None")))
+                        }
+                        if method == "name" {
+                            ret Result::Ok(string_node(value, field.0))
+                        }
+                        if method == "index" {
+                            ret Result::Ok(node_like(value, "Integer", Json::String(Debug::fmt(meta.index) + "_usize")))
+                        }
+                        if method == "get" {
+                            let arguments = items(at(payload, 3))
+                            if arguments.len() != 1 {
+                                ret Result::Err("FieldInfo::get expects one value")
+                            }
+                            let argument = expand_json(state, arguments.get(0).unwrap_or(Json::Null))?
+                            let name = "__encore_reflect_owner_" + Debug::fmt(meta.index)
+                            let mut binding = Vec[Json]::new()
+                            binding.push(Json::String(name)) binding.push(Json::String(meta.owner))
+                            binding.push(argument) binding.push(Json::Bool(false))
+                            binding.push(at(value, 1)) binding.push(at(value, 2))
+                            binding.push(at(value, 1)) binding.push(at(value, 2))
+                            let mut projection = Vec[Json]::new()
+                            projection.push(path_node(value, name)) projection.push(Json::String(field.0))
+                            ret Result::Ok(block_node(value, singleton(pair("Let", Json::Array(binding))),
+                                    node_like(value, "Field", Json::Array(projection)),))
+                        }
+                    }
+                }
+                None => {
+                }
+            }
+        }
+        match evaluate(state, value) {
+            Some(meta) => {
+                if meta.kind == "Bool" {
+                    ret Result::Ok(node_like(value, "Boolean", Json::Bool(meta.owner == "true")))
+                }
+                if meta.kind == "Type" {
+                    let mut constructor = Vec[Json]::new()
+                    constructor.push(Json::String((builtin_type(state, "core::reflect::TypeInfo", "TypeInfo") + "[") + meta.owner + "]"))
+                    constructor.push(Json::Array(Vec[Json]::new()))
+                    ret Result::Ok(node_like(value, "StructInit", Json::Array(constructor)))
+                }
+                ret Result::Err("reflection metadata '" + meta.kind + "' cannot escape into a runtime value")
+            }
+            None => {
+            }
+        }
+    }
+    match value {
+        Json::Array(values) => {
+            let mut out = Vec[Json]::new()
+            for item in values {
+                out.push(expand_json(state, item)?)
+            }
+            ret Result::Ok(Json::Array(out))
+        }
+        _ => {
+            ret Result::Ok(value)
+        }
+    }
+}
+
+fn let_array_node(value: Json) -> bool {
+    // Expression nodes have exactly five members; their first is a tagged expression.
+    ret items(value).len() == 5 && at(at(value, 0), 0).as_str().is_some()
+}
+
+fn builder_slot(name: str, index: usize) -> str {
+    ret "__encore_builder_" + name + "_" + Debug::fmt(index)
+}
+
+fn call_node(source: Json, path: str, arguments: Vec[Json]) -> Json {
+    let mut payload = Vec[Json]::new()
+    payload.push(path_node(source, path))
+    payload.push(Json::Array(Vec[Json]::new()))
+    payload.push(Json::Array(arguments))
+    ret node_like(source, "Call", Json::Array(payload))
+}
+
+fn block_node(source: Json, statements: Vec[Json], tail: Json) -> Json {
+    let mut payload = Vec[Json]::new()
+    payload.push(Json::Array(statements)) payload.push(tail)
+    payload.push(at(source, 1)) payload.push(at(source, 2))
+    payload.push(at(source, 1)) payload.push(at(source, 2))
+    ret node_like(source, "Block", Json::Array(payload))
+}
+
+fn builder_finish(state: Expansion, source: Json, name: str, owner: str) -> Result[Json, str] {
+    let declaration = shape(state, owner)?
+    let mut values = Vec[Json]::new()
+    let mut index = 0_usize
+    for _field in declaration.fields {
+        values.push(path_node(source, builder_slot(name, index) + "_value"))
+        index += 1
+    }
+    let constructor = if declaration.kind == "Tuple" {
+        node_like(source, "TupleLiteral", Json::Array(singleton(Json::Array(values))))
+    } else {
+        node_like(source, "StructInit", pair(owner, Json::Array(values)))
+    }
+    let result_type =(builtin_type(state, "core::result::Result", "Result") + "[") + owner +("," + builtin_type(state, "core::reflect::BuildError", "BuildError") + "]")
+    let mut result = call_node(source, result_type + "::Ok", singleton(constructor))
+    while index > 0 {
+        index -= 1
+        let field = declaration.fields.get(index).unwrap_or(("", ""))
+        let slot = builder_slot(name, index)
+        let mut some_pattern = Vec[Json]::new()
+        some_pattern.push(Json::String("path")) some_pattern.push(Json::String("Some"))
+        some_pattern.push(Json::String(slot + "_value"))
+        let mut some_arm = Vec[Json]::new()
+        some_arm.push(Json::Array(some_pattern)) some_arm.push(result)
+        let mut none_pattern = Vec[Json]::new()
+        none_pattern.push(Json::String("path")) none_pattern.push(Json::String("None"))
+        none_pattern.push(Json::Null)
+        let missing = call_node(source,(builtin_type(state, "core::reflect::BuildError", "BuildError") + "::MissingField"), singleton(string_node(source, field.0)))
+        let mut none_arm = Vec[Json]::new()
+        none_arm.push(Json::Array(none_pattern))
+        none_arm.push(call_node(source, result_type + "::Err", singleton(missing)))
+        let mut arms = Vec[Json]::new()
+        arms.push(Json::Array(some_arm)) arms.push(Json::Array(none_arm))
+        let mut payload = Vec[Json]::new()
+        payload.push(path_node(source, slot)) payload.push(Json::Array(arms))
+        result = node_like(source, "Match", Json::Array(payload))
+    }
+    ret Result::Ok(result)
+}
+
+fn match_node(source: Json, base: Json, path: str, binding: str, yes: Json, no: Json) -> Json {
+    let mut pattern = Vec[Json]::new()
+    pattern.push(Json::String("path")) pattern.push(Json::String(path))
+    pattern.push(if binding == "" {
+            Json::Null
+        } else {
+            Json::String(binding)
+        }
+    )
+    let mut wildcard = Vec[Json]::new()
+    wildcard.push(Json::String("wildcard")) wildcard.push(Json::Null) wildcard.push(Json::Null)
+    let mut yes_arm = Vec[Json]::new()
+    yes_arm.push(Json::Array(pattern)) yes_arm.push(yes)
+    let mut no_arm = Vec[Json]::new()
+    no_arm.push(Json::Array(wildcard)) no_arm.push(no)
+    let mut arms = Vec[Json]::new()
+    arms.push(Json::Array(yes_arm)) arms.push(Json::Array(no_arm))
+    let mut payload = Vec[Json]::new()
+    payload.push(base) payload.push(Json::Array(arms))
+    ret node_like(source, "Match", Json::Array(payload))
+}
+
+fn template_identity(state: Expansion, owner: str) -> str {
+    match shape(state, owner) {
+        Ok(found) => {
+            ret root_name(found.identity)
+        }
+        Err(_) => {
+            ret root_name(owner)
+        }
+    }
+}
+
+fn display_type_name(owner: str) -> str {
+    let mut result = ""
+    let mut index = 0_usize
+    while index < owner.byte_len() {
+        if owner.slice_bytes(index, 10) == "__encore_m" {
+            let mut end = index + 10
+            while end + 1 < owner.byte_len() {
+                if owner.byte_at(end) == 95_u8 && owner.byte_at(end + 1) == 95_u8 {
+                    break
+                }
+                end += 1
+            }
+            if end + 1 < owner.byte_len() {
+                index = end + 2 continue
+            }
+        }
+        result = result + owner.slice_bytes(index, 1)
+        index += 1
+    }
+    ret result
+}
+
+/// Returns whether lowering this caller can schedule concrete template bodies.
+pub fn calls_reflection_templates(item: FunctionItem, names: Vec[str]) -> bool {
+    if names.is_empty() {
+        ret false
+    }
+    match item.body {
+        Some(body) => {
+            ret walk_statements(body.statements, names, false)
+        }
+        None => {
+            ret false
+        }
+    }
+}
+
+fn storage_bound(state: Expansion, owner: str, depth: usize) -> Result[usize, str] {
+    if depth > 128 {
+        ret Result::Err("recursive inline reflection layout")
+    }
+    // Handles and pointers have a one-word ABI. Using eight is conservative
+    // for all currently supported target pointer widths.
+    if placement_index(owner) < owner.byte_len() {
+        ret Result::Ok(8)
+    }
+    match type_kind(state, owner) {
+        "Unit" => {
+            ret Result::Ok(0)
+        }
+        "Bool" => {
+            ret Result::Ok(1)
+        }
+        "U8" => {
+            ret Result::Ok(1)
+        }
+        "I8" => {
+            ret Result::Ok(1)
+        }
+        "U16" => {
+            ret Result::Ok(2)
+        }
+        "I16" => {
+            ret Result::Ok(2)
+        }
+        "U32" => {
+            ret Result::Ok(4)
+        }
+        "I32" => {
+            ret Result::Ok(4)
+        }
+        "F32" => {
+            ret Result::Ok(4)
+        }
+        "Struct" => {
+        }
+        "Tuple" => {
+        }
+        "Enum" => {
+        }
+        _ => {
+            ret Result::Ok(8)
+        }
+    }
+    let found = shape(state, owner)?
+    let mut bytes = 16_usize
+    for field in found.fields {
+        let child = storage_bound(state, field.1, depth + 1)?
+        if found.kind == "Enum" {
+            if child + 16 > bytes {
+                bytes = child + 16
+            }
+        } else {
+            if child > 1073741824 || bytes > 1073741824 - child {
+                ret Result::Err("reflection layout exceeds supported allocation bounds")
+            }
+            bytes += child + 16
+        }
+    }
+    ret Result::Ok(bytes)
+}
+
+fn walk_statements(statements: Vec[Statement], names: Vec[str], reflection: bool) -> bool {
+    for statement in statements {
+        match statement {
+            Statement::Let(item) => {
+                if walk_expression(item.expr.value, names, reflection) {
+                    ret true
+                }
+            }
+            Statement::Ret(item) => {
+                if walk_expression(item.value, names, reflection) {
+                    ret true
+                }
+            }
+            Statement::Expr(item) => {
+                if walk_expression(item.value, names, reflection) {
+                    ret true
+                }
+            }
+            Statement::Assignment(item) => {
+                if walk_expression(item.target.value, names, reflection) || walk_expression(item.expr.value, names, reflection) {
+                    ret true
+                }
+            }
+            Statement::If(item) => {
+                for branch in item.branches {
+                    if walk_expression(branch.condition.value, names, reflection) || walk_statements(branch.body.statements, names, reflection) {
+                        ret true
+                    }
+                }
+                match item.else_body {
+                    Some(body) => {
+                        if walk_statements(body.statements, names, reflection) {
+                            ret true
+                        }
+                    }
+                    None => {
+                    }
+                }
+            }
+            Statement::Match(item) => {
+                if walk_expression(item.expr.value, names, reflection) {
+                    ret true
+                }
+                for arm in item.arms {
+                    match arm.body {
+                        MatchArmBody::Block(body) => {
+                            if walk_statements(body.statements, names, reflection) {
+                                ret true
+                            }
+                        }
+                        MatchArmBody::Expr(expr) => {
+                            if walk_expression(expr.value, names, reflection) {
+                                ret true
+                            }
+                        }
+                    }
+                }
+            }
+            Statement::For(item) => {
+                if walk_expression(item.iterable.value, names, reflection) || walk_statements(item.body.statements, names, reflection) {
+                    ret true
+                }
+            }
+            Statement::While(item) => {
+                if walk_expression(item.condition.value, names, reflection) || walk_statements(item.body.statements, names, reflection) {
+                    ret true
+                }
+            }
+            Statement::Loop(item) => {
+                if walk_statements(item.body.statements, names, reflection) {
+                    ret true
+                }
+            }
+            Statement::DoWhile(item) => {
+                if walk_expression(item.condition.value, names, reflection) || walk_statements(item.body.statements, names, reflection) {
+                    ret true
+                }
+            }
+            Statement::With(item) => {
+                if walk_expression(item.expr.value, names, reflection) || walk_statements(item.body.statements, names, reflection) {
+                    ret true
+                }
+            }
+            Statement::Unsafe(item) => {
+                if walk_statements(item.statements, names, reflection) {
+                    ret true
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret false
+}
+fn walk_expression(value: Expr, names: Vec[str], reflection: bool) -> bool {
+    match value {
+        Expr::Path(path) => {
+            let name = root_name(path)
+            if reflection {
+                ret name == "reflect::type_info" || name == "core::reflect::type_info" ||
+                name == "reflect::Builder" || name == "core::reflect::Builder"
+            }
+            ret contains_name(names, last_name(name))
+        }
+        Expr::Parenthesized(item) => {
+            ret walk_expression(item.value, names, reflection)
+        }
+        Expr::Await(item) => {
+            ret walk_expression(item.value, names, reflection)
+        }
+        Expr::Spawn(item) => {
+            ret walk_expression(item.value, names, reflection)
+        }
+        Expr::Try(item) => {
+            ret walk_expression(item.value, names, reflection)
+        }
+        Expr::Unary(item) => {
+            ret walk_expression(item.expr.value, names, reflection)
+        }
+        Expr::Cast(item) => {
+            ret walk_expression(item.expr.value, names, reflection)
+        }
+        Expr::Binary(item) => {
+            ret walk_expression(item.lhs.value, names, reflection) || walk_expression(item.rhs.value, names, reflection)
+        }
+        Expr::Call(item) => {
+            if walk_expression(item.callee.value, names, reflection) {
+                ret true
+            }
+            for argument in item.args {
+                if walk_expression(argument.value, names, reflection) {
+                    ret true
+                }
+            }
+        }
+        Expr::MethodCall(item) => {
+            if !reflection && contains_name(names, item.method) {
+                ret true
+            }
+            if walk_expression(item.receiver.value, names, reflection) {
+                ret true
+            }
+            for argument in item.args {
+                if walk_expression(argument.value, names, reflection) {
+                    ret true
+                }
+            }
+        }
+        Expr::Field(item) => {
+            ret walk_expression(item.base.value, names, reflection)
+        }
+        Expr::Index(item) => {
+            ret walk_expression(item.base.value, names, reflection) || walk_expression(item.index.value, names, reflection)
+        }
+        Expr::StructInit(item) => {
+            for argument in item.values {
+                if walk_expression(argument.value, names, reflection) {
+                    ret true
+                }
+            }
+        }
+        Expr::ArrayLiteral(item) => {
+            for argument in item.items {
+                if walk_expression(argument.value, names, reflection) {
+                    ret true
+                }
+            }
+        }
+        Expr::VecLiteral(item) => {
+            for argument in item.items {
+                if walk_expression(argument.value, names, reflection) {
+                    ret true
+                }
+            }
+        }
+        Expr::TupleLiteral(item) => {
+            for argument in item.items {
+                if walk_expression(argument.value, names, reflection) {
+                    ret true
+                }
+            }
+        }
+        Expr::ArrayRepeat(item) => {
+            ret walk_expression(item.value.value, names, reflection)
+        }
+        Expr::Block(item) => {
+            if walk_statements(item.statements, names, reflection) {
+                ret true
+            }
+            match item.tail {
+                Some(tail) => {
+                    ret walk_expression(tail.value, names, reflection)
+                }
+                None => {
+                }
+            }
+        }
+        Expr::Unsafe(item) => {
+            ret walk_statements(item.statements, names, reflection)
+        }
+        Expr::Closure(item) => {
+            ret walk_expression(item.body.value, names, reflection)
+        }
+        Expr::If(item) => {
+            for branch in item.branches {
+                if walk_expression(branch.condition.value, names, reflection) || walk_expression(branch.body.value, names, reflection) {
+                    ret true
+                }
+            }
+            ret walk_expression(item.else_body.value, names, reflection)
+        }
+        Expr::Match(item) => {
+            if walk_expression(item.expr.value, names, reflection) {
+                ret true
+            }
+            for arm in item.arms {
+                if walk_expression(arm.expr.value, names, reflection) {
+                    ret true
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    ret false
+}
+
+fn builtin_type(state: Expansion, qualified: str, fallback: str) -> str {
+    for declaration in state.shapes {
+        if declaration.name == qualified {
+            ret declaration.identity
+        }
+    }
+    ret fallback
+}
+
+/// Source bindings retained for editor hover and completion after expansion.
+pub struct ReflectionBinding {
+    name: str
+    typ: str
+    line: usize
+    column: usize
+    scope:(usize, usize, usize, usize)
+    visible_line: usize
+    visible_column: usize
+}
+pub fn reflection_binding_sites(item: FunctionItem) -> Vec[ReflectionBinding] {
+    let mut input = Vec[Statement]::new()
+    input.push(Statement::Function(item))
+    let payload = at(at(encode_metadata_ast(input), 0), 1)
+    let mut state = Expansion { Vec[ReflectionShape]::new(), Vec[(str, Meta)]::new() }
+    let mut sites = Vec[ReflectionBinding]::new()
+    let block = at(payload, 12)
+    let scope =(source_position(at(block, 1)), source_position(at(block, 2)), source_position(at(block, 3)), source_position(at(block, 4)))
+    for parameter in item.params {
+        let typ = parameter.typ.unwrap_or("")
+        let marker = "TypeInfo["
+        let index = find_text(typ, marker)
+        if index < typ.byte_len() && typ.byte_len() > index + marker.byte_len() {
+            let owner = typ.slice_bytes(index + marker.byte_len(), typ.byte_len() - index - marker.byte_len() - 1)
+            let meta = Meta { "Type", owner, 0 }
+            state.bindings.push((parameter.name, meta))
+            sites.push(ReflectionBinding {
+                    parameter.name, binding_type(meta), parameter.line, parameter.column,
+                    scope, scope.0, scope.1
+                }
+                ,)
+        }
+    }
+    collect_binding_block(state, block, sites)
+    ret sites
+}
+fn source_position(value: Json) -> usize {
+    let source = value.as_number().unwrap_or("0")
+    let mut result = 0_usize
+    let mut index = 0_usize
+    while index < source.byte_len() {
+        let byte = source.byte_at(index)
+        if byte < 48_u8 || byte > 57_u8 {
+            ret 0
+        }
+        result = result * 10 +(byte - 48_u8) as usize
+        index += 1
+    }
+    ret result
+}
+fn binding_type(meta: Meta) -> str {
+    if meta.kind == "Kind" {
+        ret "core::reflect::Kind"
+    }
+    if meta.kind == "Bool" {
+        ret "bool"
+    }
+    if meta.kind == "Field" {
+        ret "core::reflect::FieldInfo[" + meta.owner + ", _]"
+    }
+    if meta.kind == "Variant" {
+        ret "core::reflect::VariantInfo[" + meta.owner + ", _]"
+    }
+    let name = if meta.kind == "Type" {
+        "TypeInfo"
+    } else {
+        meta.kind
+    }
+    ret "core::reflect::" + name + "[" + meta.owner + "]"
+}
+fn collect_binding_block(state: mut Expansion, block: Json, sites: mut Vec[ReflectionBinding]) ->() {
+    let saved = copy_bindings(state.bindings)
+    let scope =(source_position(at(block, 1)), source_position(at(block, 2)),
+        source_position(at(block, 3)), source_position(at(block, 4)),)
+    for statement in items(at(block, 0)) {
+        let tag = text(at(statement, 0))
+        let payload = at(statement, 1)
+        if tag == "Let" {
+            match evaluate(state, at(payload, 2)) {
+                Some(meta) => {
+                    let name = text(at(payload, 0))
+                    state.bindings.push((name, meta))
+                    sites.push(ReflectionBinding {
+                            name, binding_type(meta),
+                            source_position(at(payload, 4)), source_position(at(payload, 5)), scope,
+                            source_position(at(payload, 6)), source_position(at(payload, 7))
+                        }
+                        ,)
+                }
+                None => {
+                }
+            }
+        }
+        if tag == "For" {
+            match evaluate(state, at(payload, 2)) {
+                Some(meta) => {
+                    if meta.kind == "Fields" || meta.kind == "Variants" {
+                        let name = text(at(payload, 1))
+                        let body = at(payload, 3)
+                        let before = copy_bindings(state.bindings)
+                        let descriptor = Meta {
+                            if meta.kind == "Fields" {
+                                "Field"
+                            } else {
+                                "Variant"
+                            }
+                            , meta.owner, 0
+                        }
+                        state.bindings.push((name, descriptor))
+                        let first_line = source_position(at(body, 1))
+                        let first_column = source_position(at(body, 2))
+                        sites.push(ReflectionBinding {
+                                name, binding_type(descriptor), first_line, first_column,
+                                (first_line, first_column, source_position(at(body, 3)), source_position(at(body, 4))),
+                                first_line, first_column
+                            }
+                            ,)
+                        collect_binding_block(state, body, sites)
+                        state.bindings = before
+                    }
+                }
+                None => {
+                    collect_binding_children(state, payload, sites)
+                }
+            }
+        } else {
+            collect_binding_children(state, payload, sites)
+        }
+    }
+    state.bindings = saved
+}
+fn collect_binding_children(state: mut Expansion, value: Json, sites: mut Vec[ReflectionBinding]) ->() {
+    if items(value).len() == 5 && at(value, 1).as_number().is_some() &&
+    at(value, 2).as_number().is_some() && at(value, 3).as_number().is_some() && at(value, 4).as_number().is_some() {
+        collect_binding_block(state, value, sites)
+        ret()
+    }
+    for child in items(value) {
+        collect_binding_children(state, child, sites)
+    }
+}
+
+fn placement_index(owner: str) -> usize {
+    let mut depth = 0_usize
+    let mut index = 0_usize
+    while index < owner.byte_len() {
+        let byte = owner.byte_at(index)
+        if byte == 91_u8 || byte == 40_u8 {
+            depth += 1
+        } elif byte == 93_u8 || byte == 41_u8 {
+            if depth > 0 {
+                depth -= 1
+            }
+        } elif depth == 0 &&(byte == 60_u8 || byte == 38_u8) {
+            ret index
+        }
+        index += 1
+    }
+    ret owner.byte_len()
+}

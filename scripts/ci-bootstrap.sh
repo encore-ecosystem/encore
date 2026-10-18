@@ -21,7 +21,8 @@ else
   seed=${SEED_COMPILER:?}
   test ! -e target/extreme
   test ! -e target/bootstrap-cache-1
-  ENCORE_BUILD_CACHE="$PWD/target/bootstrap-cache-1" "$seed" "${build_args[@]}"
+  ENCORE_BUILD_CACHE="$PWD/target/bootstrap-cache-1" \
+    bash "$(dirname "$0")/ci-seed-build.sh" "$seed" "$seed_tag" "${build_args[@]}"
   mkdir -p target/stage1
   cp "target/extreme/$executable" "target/stage1/$executable"
   mv target/extreme target/stage1-output

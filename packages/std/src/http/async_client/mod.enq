@@ -1,0 +1,422 @@
+//! Nonblocking HTTP futures. The client owns one reactor; execute with await or block_on.
+import core::future::{Context, Future, Poll}
+import core::ops::ContextManager
+import core::option::Option
+import core::result::Result
+import core::vec::Vec
+import platform::net::http_async as native
+import std::http::codec::{Decoder, response}
+import std::http::errors::{HTTPError, HTTPErrorKind}
+import std::http::types::{HttpRequest, HttpResponse, HttpClientConfig, Url}
+import std::thread::JoinHandle
+import std::time::perf_counter_ms
+
+/// Cancels requests issued by its creating client. Cancellation is permanent.
+pub struct HTTPCancellationToken {
+    runtime: usize
+    handle: usize
+}
+
+impl for HTTPCancellationToken {
+    pub fn cancel(self: Self) ->() {
+        native::cancel(self.runtime, self.handle)
+    }
+}
+
+/// Copies share the reactor. Use a with-context or close the owning client.
+pub struct HTTPAsyncClient {
+    runtime: usize
+    worker: JoinHandle[u32]
+    config: HttpClientConfig
+}
+
+impl for HTTPAsyncClient {
+    pub fn new() -> Result[Self, HTTPError] {
+        ret Self::with_capacity(32_usize)
+    }
+    pub fn with_capacity(capacity: usize) -> Result[Self, HTTPError] {
+        if !native::supported() {
+            ret Result::Err(HTTPError {
+                    HTTPErrorKind::Configuration, "async HTTP is not supported on this target"
+                }
+                ,
+            )
+        }
+        let handle = native::create(capacity)
+        if handle == 0_usize {
+            ret Result::Err(HTTPError {
+                    HTTPErrorKind::Configuration, "cannot initialize HTTP reactor"
+                }
+                ,
+            )
+        }
+        let worker = spawn reactor(handle)
+        ret Result::Ok(Self { handle, worker, HttpClientConfig::default() })
+    }
+    pub fn with_config(self: Self, config: HttpClientConfig) -> Self {
+        ret Self { self.runtime, self.worker, config }
+    }
+    pub fn cancellation_token(self: Self) -> HTTPCancellationToken {
+        ret HTTPCancellationToken { self.runtime, native::token(self.runtime) }
+    }
+    /// Lazy: submitting a request starts when its future is first polled.
+    pub fn send(self: Self, request: HttpRequest) -> HTTPResponseFuture {
+        ret HTTPResponseFuture {
+            PendingRequest {
+                self, request, Option[HTTPCancellationToken]::None, Option[HTTPError]::None
+            }
+            , 0_usize
+        }
+    }
+    pub fn get(self: Self, value: str) -> HTTPResponseFuture {
+        match Url::parse(value) {
+            Result::Ok(url) => {
+                ret self.send(HttpRequest::get(url))
+            }
+            Result::Err(_) => {
+                ret HTTPResponseFuture {
+                    PendingRequest {
+                        self, HttpRequest::get(Url::empty()), Option[HTTPCancellationToken]::None,
+                        Option[HTTPError]::Some(HTTPError {
+                                HTTPErrorKind::Configuration, "invalid HTTP request URL"
+                            }
+                            ,
+                        )
+                    }
+                    , 0_usize
+                }
+            }
+        }
+    }
+    pub fn close(self: Self) -> bool {
+        if native::stopping(self.runtime) {
+            ret false
+        }
+        native::stop(self.runtime)
+        let _joined = self.worker.join()
+        native::destroy(self.runtime)
+        ret true
+    }
+}
+
+impl ContextManager for HTTPAsyncClient {
+    pub fn with_enter(self: Self) -> Self {
+        ret self
+    }
+    pub fn with_exit(self: Self) -> bool {
+        ret self.close()
+    }
+}
+
+struct PendingRequest {
+    client: HTTPAsyncClient
+    request: HttpRequest
+    cancellation: Option[HTTPCancellationToken]
+    failure: Option[HTTPError]
+}
+
+impl for PendingRequest {
+    fn start(self: Self) -> Result[usize, HTTPError] {
+        match self.failure {
+            Option::Some(error) => {
+                ret Result::Err(error)
+            }
+            Option::None => {
+            }
+        }
+        if native::stopping(self.client.runtime) {
+            ret Result::Err(HTTPError { HTTPErrorKind::Closed, "HTTP client is closed" })
+        }
+        let config = self.client.config
+        if config.timeout_ms == 0_usize || config.timeout_ms > 86400000_usize || config.connect_timeout_ms == 0_usize
+        || config.max_body_size > 1073741824_usize || config.max_header_size < 16_usize || config.max_header_size > 1048576_usize {
+            ret Result::Err(HTTPError {
+                    HTTPErrorKind::Configuration, "invalid HTTP limits or timeout"
+                }
+                ,
+            )
+        }
+        match self.request.validate() {
+            Result::Err(_) => {
+                ret Result::Err(HTTPError {
+                        HTTPErrorKind::Configuration, "invalid HTTP request"
+                    }
+                    ,
+                )
+            }
+            Result::Ok(_) => {
+            }
+        }
+        let wire = self.request.encode()
+        if wire.len() - self.request.body_value.len() > config.max_header_size || self.request.body_value.len() > config.max_body_size {
+            ret Result::Err(HTTPError {
+                    HTTPErrorKind::Limit, "HTTP request exceeds configured limit"
+                }
+                ,
+            )
+        }
+        let mut token = 0_usize
+        match self.cancellation {
+            Option::Some(value) => {
+                if value.runtime != self.client.runtime || value.handle == 0_usize {
+                    ret Result::Err(HTTPError {
+                            HTTPErrorKind::Configuration, "cancellation token belongs to another client"
+                        }
+                        ,
+                    )
+                }
+                token = value.handle
+            }
+            Option::None => {
+            }
+        }
+        let url = self.request.url
+        let handle = native::submit(self.client.runtime, url.host(), url.port() as i32, if url.scheme() == "https" {
+                1_i32
+            } else {
+                0_i32
+            }
+            , config.ca_file,
+            wire, token, config.max_body_size, config.max_header_size, config.connect_timeout_ms, config.timeout_ms,)
+        if handle == 0_usize {
+            ret Result::Err(HTTPError {
+                    HTTPErrorKind::Capacity, "HTTP request capacity exhausted"
+                }
+                ,
+            )
+        }
+        ret Result::Ok(handle)
+    }
+}
+
+/// A single-consumer future. Pending copies must not be polled concurrently.
+pub struct HTTPResponseFuture {
+    request: PendingRequest
+    handle: usize
+}
+
+impl for HTTPResponseFuture {
+    /// Set cancellation before the future is first polled.
+    pub fn with_cancellation(self: Self, token: HTTPCancellationToken) -> Self {
+        ret Self {
+            PendingRequest {
+                self.request.client, self.request.request, Option::Some(token), self.request.failure
+            }
+            , self.handle
+        }
+    }
+}
+
+impl Future[Result[HttpResponse, HTTPError]] for HTTPResponseFuture {
+    pub fn poll(self: Self, context: Context) -> Poll[Self, Result[HttpResponse, HTTPError]] {
+        let mut handle = self.handle
+        if handle == 0_usize {
+            handle = match self.request.start() {
+                Result::Ok(value) => value
+                Result::Err(error) => {
+                    ret Poll::Ready(Result::Err(error))
+                }
+            }
+        }
+        let status = native::status(handle, context.waker.token)
+        if status == 0_i32 {
+            ret Poll::Pending(Self { self.request, handle })
+        }
+        if status == 1_i32 {
+            let value = response(native::http_status(handle) as u16, native::headers(handle), native::result(handle))
+            native::release(handle)
+            ret Poll::Ready(Result::Ok(value))
+        }
+        let message = native::result(handle)
+        native::release(handle)
+        let kind = match status {
+            2_i32 => HTTPErrorKind::Cancelled
+            3_i32 => HTTPErrorKind::Timeout
+            5_i32 => HTTPErrorKind::Closed
+            6_i32 => HTTPErrorKind::Protocol
+            7_i32 => HTTPErrorKind::Limit
+            8_i32 => HTTPErrorKind::Dns
+            9_i32 => HTTPErrorKind::Connect
+            10_i32 => HTTPErrorKind::Tls
+            _ => HTTPErrorKind::Io
+        }
+        ret Poll::Ready(Result::Err(HTTPError {
+                    kind, if message == "" {
+                        "HTTP client is closed"
+                    } else {
+                        message
+                    }
+                }
+                ,
+            ))
+    }
+}
+
+struct Connection {
+    handle: usize
+    stage: u8
+    offset: usize
+    wire: str
+    started: u64
+    connect_ms: usize
+    total_ms: usize
+    decoder: Decoder
+    immediate: bool
+}
+
+impl for Connection {
+    fn new(handle: usize) -> Self {
+        let wire = if handle == 0_usize {
+            ""
+        } else {
+            native::wire(handle)
+        }
+        ret Self {
+            handle, 0_u8, 0_usize, wire, perf_counter_ms(), native::setting(handle, 2_i32), native::setting(handle, 3_i32), Decoder::new(native::setting(handle, 0_i32), native::setting(handle, 1_i32), wire.len() >= 5_usize && wire.slice(0_usize, 5_usize) == "HEAD "), false
+        }
+    }
+    fn fail(self: mut Self, code: i32, message: str) ->() {
+        native::complete(self.handle, code, 0_i32, "", message)
+        self.stage = 5_u8
+    }
+    fn step(self: mut Self) ->() {
+        self.immediate = false
+        if self.stage == 5_u8 {
+            ret()
+        }
+        if native::cancelled(self.handle) {
+            self.fail(2_i32, "request cancelled") ret()
+        }
+        let elapsed = perf_counter_ms() - self.started
+        if elapsed >= self.total_ms as u64 ||(self.stage < 3_u8 && elapsed >= self.connect_ms as u64) {
+            self.fail(3_i32, "request deadline exceeded") ret()
+        }
+        if self.stage == 0_u8 {
+            let result = native::dns(self.handle)
+            if result < 0_i32 {
+                self.fail(8_i32, "DNS resolution failed") ret()
+            }
+            if result == 0_i32 {
+                ret()
+            }
+            self.stage = 1_u8
+        }
+        if self.stage == 1_u8 {
+            let result = native::connect(self.handle)
+            if result < 0_i32 {
+                self.fail(9_i32, "TCP connection failed") ret()
+            }
+            if result == 0_i32 {
+                ret()
+            }
+            self.stage = 2_u8
+        }
+        if self.stage == 2_u8 {
+            let result = native::handshake(self.handle)
+            if result < 0_i32 {
+                self.fail(10_i32, "TLS handshake or certificate verification failed") ret()
+            }
+            if result == 0_i32 {
+                ret()
+            }
+            self.stage = 3_u8
+        }
+        if self.stage == 3_u8 {
+            for _attempt in 0_usize..16_usize {
+                if self.offset == self.wire.len() {
+                    self.stage = 4_u8 native::read_interest(self.handle) break
+                }
+                let count = native::write(self.handle, self.offset)
+                if count == - 2_i32 {
+                    ret()
+                }
+                if count <= 0_i32 {
+                    self.fail(4_i32, "HTTP request write failed") ret()
+                }
+                self.offset += count as usize
+            }
+            // If the fairness budget was exhausted, writable readiness wakes us.
+            if self.stage == 3_u8 {
+                self.immediate = true
+            }
+        }
+        if self.stage == 4_u8 {
+            for _attempt in 0_usize..16_usize {
+                let bytes = native::read(self.handle)
+                let state = native::read_status(self.handle)
+                if state == 0_i32 {
+                    ret()
+                }
+                if state < 0_i32 {
+                    self.fail(4_i32, "HTTP response read failed") ret()
+                }
+                match self.decoder.feed(bytes, state == 2_i32) {
+                    Result::Ok(done) => {
+                        if done {
+                            native::complete(self.handle, 1_i32, self.decoder.status as i32, self.decoder.headers, self.decoder.body())
+                            self.stage = 5_u8
+                            ret()
+                        }
+                    }
+                    Result::Err(error) => {
+                        let code = match error.kind {
+                            HTTPErrorKind::Limit => 7_i32 _ => 6_i32
+                        }
+                        self.fail(code, error.message)
+                        ret()
+                    }
+                }
+            }
+            self.immediate = true
+        }
+    }
+}
+
+fn reactor(runtime: usize) -> u32 {
+    native::reactor_enter()
+    let mut connections = Vec[Connection]::new()
+    for _i in 0_usize..32_usize {
+        connections.push(Connection::new(0_usize))
+    }
+    while !native::stopping(runtime) {
+        let mut wait_ms = 1000_usize
+        for slot in 0_usize..32_usize {
+            let handle = native::slot(runtime, slot)
+            let mut state = connections.get_unchecked_borrowed(slot)
+            if handle != state.handle {
+                state = Connection::new(handle)
+            }
+            if handle != 0_usize {
+                state.step()
+                if state.immediate {
+                    wait_ms = 0_usize
+                }
+                if state.stage < 5_u8 {
+                    let elapsed = perf_counter_ms() - state.started
+                    let limit = if state.stage < 3_u8 && state.connect_ms < state.total_ms {
+                        state.connect_ms
+                    } else {
+                        state.total_ms
+                    }
+                    let left = if elapsed < limit as u64 {
+                        limit - elapsed as usize
+                    } else {
+                        0_usize
+                    }
+                    if left < wait_ms {
+                        wait_ms = left
+                    }
+                    if state.stage == 0_u8 {
+                        let dns_wait = native::dns_timeout(handle) as usize
+                        if dns_wait < wait_ms {
+                            wait_ms = dns_wait
+                        }
+                    }
+                }
+            }
+            connections.set(slot, state)
+        }
+        native::wait(runtime, wait_ms as i32)
+    }
+    ret 0_u32
+}

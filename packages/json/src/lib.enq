@@ -1156,3 +1156,839 @@ impl Debug for Json {
         ret stringify(self)
     }
 }
+
+//! Typed JSON codecs. Traversal is specialized from core::reflect metadata.
+import core::reflect
+import core::reflect::{TypeInfo, Kind, BuildError}
+import serialize::{Serializer, Deserializer, Error, ErrorKind, Limits}
+import std::dict::Dict
+import std::num::parse as parse_integer
+
+extern fn encore_codec_text_builder_new(limit: usize) -> usize
+extern fn encore_codec_text_builder_ok(builder: usize) -> bool
+extern fn encore_codec_str_utf8_valid(value: str) -> bool
+extern fn encore_codec_parse_f64(value: str) -> f64
+extern fn encore_codec_parse_f32(value: str) -> f32
+extern fn encore_codec_format_f64(value: f64) -> str
+extern fn encore_codec_format_f32(value: f32) -> str
+
+pub struct EncodeOptions {
+    indentation: usize
+    limits: Limits
+}
+pub struct DecodeOptions {
+    limits: Limits
+}
+pub struct JsonSerializer[Value] {
+    value: Value
+    options: EncodeOptions
+}
+pub struct JsonDeserializer[Value] {
+    source: str
+    options: DecodeOptions
+}
+struct Writer {
+    handle: usize
+    options: EncodeOptions
+    bytes: usize
+}
+struct DecodeBudget {
+    limits: Limits
+    allocated: usize
+}
+
+impl for EncodeOptions {
+    pub fn new() -> Self {
+        ret Self { 0, Limits::new() }
+    }
+    pub fn pretty(self: Self, indentation: usize) -> Self {
+        ret Self { indentation, self.limits }
+    }
+    pub fn with_limits(self: Self, limits: Limits) -> Self {
+        ret Self { self.indentation, limits }
+    }
+}
+
+impl for DecodeOptions {
+    pub fn new() -> Self {
+        ret Self { Limits::new() }
+    }
+    pub fn with_limits(self: Self, limits: Limits) -> Self {
+        ret Self { limits }
+    }
+}
+
+impl[Value] for JsonSerializer[Value] {
+    pub fn new(value: Value) -> Self {
+        ret Self { value, EncodeOptions::new() }
+    }
+    pub fn with_options(self: Self, options: EncodeOptions) -> Self {
+        ret Self {
+            self.value, options
+        }
+    }
+}
+
+impl[Value] for JsonDeserializer[Value] {
+    pub fn new(source: str) -> Self {
+        ret Self { source, DecodeOptions::new() }
+    }
+    pub fn with_options(self: Self, options: DecodeOptions) -> Self {
+        ret Self {
+            self.source, options
+        }
+    }
+}
+
+impl[Value] Serializer[str] for JsonSerializer[Value] {
+    pub fn serialize(self: Self) -> Result[str, Error] {
+        ret encode_with(self.value, self.options)
+    }
+}
+
+impl[Value] Deserializer[Value] for JsonDeserializer[Value] {
+    pub fn deserialize(self: Self) -> Result[Value, Error] {
+        ret decode_with[Value](self.source, self.options)
+    }
+}
+pub fn encode[Value](value: Value) -> Result[str, Error] {
+    ret encode_with(value, EncodeOptions::new())
+}
+pub fn decode[Value](source: str) -> Result[Value, Error] {
+    ret decode_with[Value](source, DecodeOptions::new())
+}
+pub fn encode_with[Value](value: Value, options: EncodeOptions) -> Result[str, Error] {
+    let mut writer = Writer {
+        unsafe {
+            encore_codec_text_builder_new(options.limits.max_allocation_bytes())
+        }
+        , options, 0
+    }
+    match write_value(value, writer, 0) {
+        Ok(_) => {
+            ret Result::Ok(text_builder_finish(writer.handle))
+        }
+        Err(error) => {
+            text_builder_discard(writer.handle) ret Result::Err(error)
+        }
+    }
+}
+pub fn decode_with[Value](source: str, options: DecodeOptions) -> Result[Value, Error] {
+    let allocated = preflight(source, options.limits)?
+    let mut budget = DecodeBudget { options.limits, allocated }
+    let node = match parse(source) {
+        Ok(value) => value
+        Err(error) => {
+            ret Result::Err(Error::new(ErrorKind::InvalidData, error.message()).with_offset(error.position()))
+        }
+    }
+    ret read_value(reflect::type_info[Value](), node, budget, 0)
+}
+
+fn invalid(message: str) -> Error {
+    ret Error::new(ErrorKind::InvalidData, message)
+}
+fn limit() -> Error {
+    ret Error::new(ErrorKind::LimitExceeded, "JSON resource limit exceeded")
+}
+fn push(writer: mut Writer, text: str) -> Result[(), Error] {
+    if text.byte_len() > writer.options.limits.max_allocation_bytes() - writer.bytes {
+        ret Result::Err(limit())
+    }
+    writer.bytes += text.byte_len()
+    text_builder_append(writer.handle, text)
+    if !unsafe {
+        encore_codec_text_builder_ok(writer.handle)
+    }
+    {
+        ret Result::Err(limit())
+    }
+    ret Result::Ok(())
+}
+fn quoted(writer: mut Writer, text: str) -> Result[(), Error] {
+    // Escape expansion is at most six bytes per source byte.
+    let remaining = writer.options.limits.max_allocation_bytes() - writer.bytes
+    if remaining < 2 || text.byte_len() >(remaining - 2) / 6 {
+        ret Result::Err(limit())
+    }
+    if !unsafe {
+        encore_codec_str_utf8_valid(text)
+    }
+    {
+        ret Result::Err(invalid("invalid UTF-8 string"))
+    }
+    push(writer, "\"")?
+    append_escaped_string(writer.handle, text)
+    if !unsafe {
+        encore_codec_text_builder_ok(writer.handle)
+    }
+    {
+        ret Result::Err(limit())
+    }
+    writer.bytes += text.byte_len() * 6
+    ret push(writer, "\"")
+}
+fn newline(writer: mut Writer, depth: usize) -> Result[(), Error] {
+    if writer.options.indentation == 0 {
+        ret Result::Ok(())
+    }
+    push(writer, "\n")?
+    let mut level = 0_usize
+    while level < depth {
+        let mut space = 0_usize
+        while space < writer.options.indentation {
+            push(writer, " ")? space += 1
+        }
+        level += 1
+    }
+    ret Result::Ok(())
+}
+fn separator(writer: mut Writer, index: usize, depth: usize) -> Result[(), Error] {
+    if index != 0 {
+        push(writer, ",")?
+    }
+    ret newline(writer, depth)
+}
+fn nested_error(result: Result[(), Error], segment: str) -> Result[(), Error] {
+    ret match result {
+        Ok(_) => Result::Ok(()) Err(error) => Result::Err(error.at(segment))
+    }
+}
+
+fn write_value[Value](value: Value, writer: mut Writer, depth: usize) -> Result[(), Error] {
+    let info = reflect::type_info[Value]()
+    if depth > writer.options.limits.max_depth() {
+        ret Result::Err(limit())
+    }
+    if info.is_template[Vec]() {
+        if value.len() > writer.options.limits.max_collection_items() {
+            ret Result::Err(limit())
+        }
+        push(writer, "[")?
+        let mut index = 0_usize
+        for item in value {
+            separator(writer, index, depth + 1)?
+            nested_error(write_value(item, writer, depth + 1), Debug::fmt(index))?
+            index += 1
+        }
+        if index != 0 {
+            newline(writer, depth)?
+        }
+        ret push(writer, "]")
+    }
+    if info.is_template[Option]() {
+        match value {
+            Some(item) => {
+                ret write_value(item, writer, depth + 1)
+            }
+            None => {
+                ret push(writer, "null")
+            }
+        }
+    }
+    if info.is_template[Dict]() {
+        match info.argument(0).kind() {
+            Kind::String => {
+                if value.len() > writer.options.limits.max_collection_items() {
+                    ret Result::Err(limit())
+                }
+                push(writer, "{")?
+                let mut index = 0_usize
+                for item in value.items() {
+                    separator(writer, index, depth + 1)? quoted(writer, item.0)? push(writer, ":")?
+                    if writer.options.indentation != 0 {
+                        push(writer, " ")?
+                    }
+                    nested_error(write_value(item.1, writer, depth + 1), item.0)?
+                    index += 1
+                }
+                if index != 0 {
+                    newline(writer, depth)?
+                }
+                ret push(writer, "}")
+            }
+            _ => {
+                ret Result::Err(Error::new(ErrorKind::UnsupportedType, "JSON object keys must be strings"))
+            }
+        }
+    }
+    match info.kind() {
+        Kind::Unit => {
+            ret push(writer, "null")
+        }
+        Kind::Bool => {
+            ret push(writer, if value {
+                    "true"
+                } else {
+                    "false"
+                }
+                ,
+            )
+        }
+        Kind::String => {
+            ret quoted(writer, value)
+        }
+        Kind::U8 => {
+            ret push(writer, Debug::fmt(value))
+        }
+        Kind::U16 => {
+            ret push(writer, Debug::fmt(value))
+        }
+        Kind::U32 => {
+            ret push(writer, Debug::fmt(value))
+        }
+        Kind::U64 => {
+            ret push(writer, Debug::fmt(value))
+        }
+        Kind::Usize => {
+            ret push(writer, Debug::fmt(value))
+        }
+        Kind::I8 => {
+            ret push(writer, Debug::fmt(value))
+        }
+        Kind::I16 => {
+            ret push(writer, Debug::fmt(value))
+        }
+        Kind::I32 => {
+            ret push(writer, Debug::fmt(value))
+        }
+        Kind::I64 => {
+            ret push(writer, Debug::fmt(value))
+        }
+        Kind::Isize => {
+            ret push(writer, Debug::fmt(value))
+        }
+        Kind::F32 => {
+            if value - value != 0.0_f32 {
+                ret Result::Err(invalid("JSON does not represent NaN or infinity"))
+            }
+            ret push(writer, unsafe {
+                    encore_codec_format_f32(value)
+                }
+                ,
+            )
+        }
+        Kind::F64 => {
+            if value - value != 0.0_f64 {
+                ret Result::Err(invalid("JSON does not represent NaN or infinity"))
+            }
+            ret push(writer, unsafe {
+                    encore_codec_format_f64(value)
+                }
+                ,
+            )
+        }
+        Kind::Struct => {
+            record_schema(info)?
+            push(writer, "{")?
+            let mut index = 0_usize
+            for field in info.fields() {
+                separator(writer, index, depth + 1)? quoted(writer, field.attribute("serialize.rename").unwrap_or(field.name()))? push(writer, ":")?
+                if writer.options.indentation != 0 {
+                    push(writer, " ")?
+                }
+                nested_error(write_value(field.get(value), writer, depth + 1), field.attribute("serialize.rename").unwrap_or(field.name()))?
+                index += 1
+            }
+            if index != 0 {
+                newline(writer, depth)?
+            }
+            ret push(writer, "}")
+        }
+        Kind::Tuple => {
+            push(writer, "[")?
+            let mut index = 0_usize
+            for field in info.fields() {
+                separator(writer, index, depth + 1)?
+                nested_error(write_value(field.get(value), writer, depth + 1), field.attribute("serialize.rename").unwrap_or(field.name()))?
+                index += 1
+            }
+            if index != 0 {
+                newline(writer, depth)?
+            }
+            ret push(writer, "]")
+        }
+        Kind::Enum => {
+            for variant in info.variants() {
+                if variant.is_active(value) {
+                    if variant.has_payload() {
+                        push(writer, "{")? newline(writer, depth + 1)? quoted(writer, variant.name())? push(writer, ":")?
+                        if writer.options.indentation != 0 {
+                            push(writer, " ")?
+                        }
+                        match variant.get(value) {
+                            Some(payload) => {
+                                nested_error(write_value(payload, writer, depth + 1), variant.name())?
+                            }
+                            None => {
+                                ret Result::Err(invalid("enum payload is unavailable"))
+                            }
+                        }
+                        newline(writer, depth)? ret push(writer, "}")
+                    }
+                    ret quoted(writer, variant.name())
+                }
+            }
+            ret Result::Err(Error::new(ErrorKind::UnknownVariant, "invalid enum discriminant"))
+        }
+        _ => {
+            ret Result::Err(Error::new(ErrorKind::UnsupportedType, "cannot encode " + info.name()))
+        }
+    }
+}
+
+fn read_value[Value](info: TypeInfo[Value], node: Json, budget: mut DecodeBudget, depth: usize) -> Result[Value, Error] {
+    let limits = budget.limits
+    if depth > limits.max_depth() {
+        ret Result::Err(limit())
+    }
+    if info.is_template[Vec]() {
+        ret read_vec(info.argument(0), node, budget, depth)
+    }
+    if info.is_template[Option]() {
+        ret read_option(info.argument(0), node, budget, depth)
+    }
+    if info.is_template[Dict]() {
+        match info.argument(0).kind() {
+            Kind::String => {
+                ret read_dict(info.argument(1), node, budget, depth)
+            }
+            _ => {
+                ret Result::Err(Error::new(ErrorKind::UnsupportedType, "JSON object keys must be strings"))
+            }
+        }
+    }
+    match info.kind() {
+        Kind::Unit => {
+            if !node.is_null() {
+                ret Result::Err(invalid("expected null"))
+            }
+            ret Result::Ok(())
+        }
+        Kind::Bool => {
+            match node {
+                Json::Bool(value) => {
+                    ret Result::Ok(value)
+                }
+                _ => {
+                    ret Result::Err(invalid("expected boolean"))
+                }
+            }
+        }
+        Kind::String => {
+            match node {
+                Json::String(value) => {
+                    ret Result::Ok(value)
+                }
+                _ => {
+                    ret Result::Err(invalid("expected string"))
+                }
+            }
+        }
+        Kind::U8 => {
+            let text = read_number(node)?
+            match parse_integer[u8](text) {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(Error::new(ErrorKind::OutOfRange, "invalid u8 number"))
+                }
+            }
+        }
+        Kind::U16 => {
+            let text = read_number(node)?
+            match parse_integer[u16](text) {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(Error::new(ErrorKind::OutOfRange, "invalid u16 number"))
+                }
+            }
+        }
+        Kind::U32 => {
+            let text = read_number(node)?
+            match parse_integer[u32](text) {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(Error::new(ErrorKind::OutOfRange, "invalid u32 number"))
+                }
+            }
+        }
+        Kind::U64 => {
+            let text = read_number(node)?
+            match parse_integer[u64](text) {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(Error::new(ErrorKind::OutOfRange, "invalid u64 number"))
+                }
+            }
+        }
+        Kind::Usize => {
+            let text = read_number(node)?
+            match parse_integer[usize](text) {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(Error::new(ErrorKind::OutOfRange, "invalid usize number"))
+                }
+            }
+        }
+        Kind::I8 => {
+            let text = read_number(node)?
+            match parse_integer[i8](text) {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(Error::new(ErrorKind::OutOfRange, "invalid i8 number"))
+                }
+            }
+        }
+        Kind::I16 => {
+            let text = read_number(node)?
+            match parse_integer[i16](text) {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(Error::new(ErrorKind::OutOfRange, "invalid i16 number"))
+                }
+            }
+        }
+        Kind::I32 => {
+            let text = read_number(node)?
+            match parse_integer[i32](text) {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(Error::new(ErrorKind::OutOfRange, "invalid i32 number"))
+                }
+            }
+        }
+        Kind::I64 => {
+            let text = read_number(node)?
+            match parse_integer[i64](text) {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(Error::new(ErrorKind::OutOfRange, "invalid i64 number"))
+                }
+            }
+        }
+        Kind::Isize => {
+            let text = read_number(node)?
+            match parse_integer[isize](text) {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(Error::new(ErrorKind::OutOfRange, "invalid isize number"))
+                }
+            }
+        }
+        Kind::F32 => {
+            let value = unsafe {
+                encore_codec_parse_f32(read_number(node)?)
+            }
+            if value - value != 0.0_f32 {
+                ret Result::Err(Error::new(ErrorKind::OutOfRange, "number is outside f32 range"))
+            }
+            ret Result::Ok(value)
+        }
+        Kind::F64 => {
+            let value = unsafe {
+                encore_codec_parse_f64(read_number(node)?)
+            }
+            if value - value != 0.0_f64 {
+                ret Result::Err(Error::new(ErrorKind::OutOfRange, "number is outside f64 range"))
+            }
+            ret Result::Ok(value)
+        }
+        Kind::Struct => {
+            record_schema(info)?
+            charge_record(info, budget)?
+            let fields = match node {
+                Json::Object(fields) => fields _ => {
+                    ret Result::Err(invalid("expected object"))
+                }
+            }
+            let mut builder = reflect::Builder[Value]::new()
+            for field in info.fields() {
+                let mut found = Option[Json]::None
+                for entry in fields {
+                    if entry.0 == field.attribute("serialize.rename").unwrap_or(field.name()) {
+                        if found.is_some() {
+                            ret Result::Err(Error::new(ErrorKind::DuplicateField, "duplicate field").at(field.attribute("serialize.rename").unwrap_or(field.name())))
+                        }
+                        found = Option[Json]::Some(entry.1)
+                    }
+                }
+                match found {
+                    Some(child) => {
+                        match read_value(field.type(), child, budget, depth + 1) {
+                            Ok(value) => {
+                                builder.set(field, value)
+                            }
+                            Err(error) => {
+                                ret Result::Err(error.at(field.attribute("serialize.rename").unwrap_or(field.name())))
+                            }
+                        }
+                    }
+                    None => {
+                        if field.type().is_template[Option]() {
+                            builder.set(field, read_value(field.type(), Json::Null, budget, depth + 1)?)
+                        } else {
+                            ret Result::Err(Error::new(ErrorKind::MissingField, "missing required field").at(field.attribute("serialize.rename").unwrap_or(field.name())))
+                        }
+                    }
+                }
+            }
+            match builder.finish() {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(Error::new(ErrorKind::MissingField, "incomplete object"))
+                }
+            }
+        }
+        Kind::Tuple => {
+            charge_record(info, budget)?
+            let values = match node {
+                Json::Array(values) => values _ => {
+                    ret Result::Err(invalid("expected tuple array"))
+                }
+            }
+            let mut builder = reflect::Builder[Value]::new()
+            let mut count = 0_usize
+            for field in info.fields() {
+                let child = match values.get(field.index()) {
+                    Some(value) => value None => {
+                        ret Result::Err(invalid("tuple is too short"))
+                    }
+                }
+                match read_value(field.type(), child, budget, depth + 1) {
+                    Ok(value) => {
+                        builder.set(field, value)
+                    }
+                    Err(error) => {
+                        ret Result::Err(error.at(field.attribute("serialize.rename").unwrap_or(field.name())))
+                    }
+                }
+                count += 1
+            }
+            if count != values.len() {
+                ret Result::Err(invalid("tuple is too long"))
+            }
+            match builder.finish() {
+                Ok(value) => {
+                    ret Result::Ok(value)
+                }
+                Err(_) => {
+                    ret Result::Err(invalid("incomplete tuple"))
+                }
+            }
+        }
+        Kind::Enum => {
+            for variant in info.variants() {
+                if variant.has_payload() {
+                    match node {
+                        Json::Object(fields) => {
+                            if fields.len() != 1 {
+                                ret Result::Err(invalid("expected one externally tagged variant"))
+                            }
+                            let entry = fields.get(0).unwrap_or(("", Json::Null))
+                            if entry.0 == variant.name() {
+                                match read_value(variant.type(), entry.1, budget, depth + 1) {
+                                    Ok(value) => {
+                                        ret Result::Ok(variant.construct(value))
+                                    }
+                                    Err(error) => {
+                                        ret Result::Err(error.at(variant.name()))
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                } else {
+                    match node {
+                        Json::String(name) => {
+                            if name == variant.name() {
+                                ret Result::Ok(variant.construct(()))
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+            }
+            ret Result::Err(Error::new(ErrorKind::UnknownVariant, "unknown enum variant"))
+        }
+        _ => {
+            ret Result::Err(Error::new(ErrorKind::UnsupportedType, "cannot decode " + info.name()))
+        }
+    }
+}
+fn read_number(node: Json) -> Result[str, Error] {
+    ret match node {
+        Json::Number(value) => Result::Ok(value) _ => Result::Err(invalid("expected number"))
+    }
+}
+fn read_vec[Item](info: TypeInfo[Item], node: Json, budget: mut DecodeBudget, depth: usize) -> Result[Vec[Item], Error] {
+    let limits = budget.limits
+    let values = match node {
+        Json::Array(values) => values _ => {
+            ret Result::Err(invalid("expected array"))
+        }
+    }
+    if values.len() > limits.max_collection_items() {
+        ret Result::Err(limit())
+    }
+    charge_decode(budget, values.len(), info.size_bound())?
+    let mut result = Vec[Item]::with_capacity(values.len())
+    let mut index = 0_usize
+    for child in values {
+        match read_value(info, child, budget, depth + 1) {
+            Ok(value) => {
+                result.push(value)
+            }
+            Err(error) => {
+                ret Result::Err(error.at(Debug::fmt(index)))
+            }
+        }
+        index += 1
+    }
+    ret Result::Ok(result)
+}
+fn read_option[Item](info: TypeInfo[Item], node: Json, budget: mut DecodeBudget, depth: usize) -> Result[Option[Item], Error] {
+    let limits = budget.limits
+    if node.is_null() {
+        ret Result::Ok(Option[Item]::None)
+    }
+    ret Result::Ok(Option[Item]::Some(read_value(info, node, budget, depth + 1)?))
+}
+fn read_dict[Item](info: TypeInfo[Item], node: Json, budget: mut DecodeBudget, depth: usize) -> Result[Dict[str, Item], Error] {
+    let limits = budget.limits
+    let fields = match node {
+        Json::Object(fields) => fields _ => {
+            ret Result::Err(invalid("expected object"))
+        }
+    }
+    if fields.len() > limits.max_collection_items() {
+        ret Result::Err(limit())
+    }
+    charge_decode(budget, fields.len(), info.size_bound() + 24)?
+    let mut result = Dict[str, Item]::with_capacity(fields.len())
+    for entry in fields {
+        if result.contains_key(entry.0) {
+            ret Result::Err(Error::new(ErrorKind::DuplicateField, "duplicate dictionary key").at(entry.0))
+        }
+        match read_value(info, entry.1, budget, depth + 1) {
+            Ok(value) => {
+                result.insert(entry.0, value)
+            }
+            Err(error) => {
+                ret Result::Err(error.at(entry.0))
+            }
+        }
+    }
+    ret Result::Ok(result)
+}
+
+// Check limits before the recursive parser allocates its DOM. The allocation
+// budget conservatively charges source copies and each syntax node, not capacity
+// observed after an allocation has already happened.
+fn preflight(source: str, limits: Limits) -> Result[usize, Error] {
+    if source.byte_len() > limits.max_input_bytes() || source.byte_len() > limits.max_allocation_bytes() / 4 {
+        ret Result::Err(limit())
+    }
+    if !unsafe {
+        encore_codec_str_utf8_valid(source)
+    }
+    {
+        ret Result::Err(invalid("invalid UTF-8 document"))
+    }
+    let mut remaining = limits.max_allocation_bytes() - source.byte_len() * 4
+    let mut counts = Vec[usize]::new()
+    let mut string = false
+    let mut escape = false
+    let mut index = 0_usize
+    while index < source.byte_len() {
+        let byte = source.byte_at(index)
+        if string {
+            if escape {
+                escape = false
+            } elif byte == 92_u8 {
+                escape = true
+            } elif byte == 34_u8 {
+                string = false
+            }
+        } else {
+            if byte == 34_u8 {
+                string = true
+            } elif byte == 91_u8 || byte == 123_u8 {
+                if counts.len() > limits.max_depth() {
+                    ret Result::Err(limit().with_offset(index))
+                }
+                counts.push(0_usize)
+            } elif byte == 93_u8 || byte == 125_u8 {
+                counts.pop()
+            } elif byte == 44_u8 && !counts.is_empty() {
+                let position = counts.len() - 1
+                let count = counts.get(position).unwrap_or(0) + 1
+                if count >= limits.max_collection_items() {
+                    ret Result::Err(limit().with_offset(index))
+                }
+                counts.set(position, count)
+            }
+            if byte == 34_u8 || byte == 91_u8 || byte == 123_u8 || byte == 44_u8 || byte == 58_u8 {
+                if remaining < 128 {
+                    ret Result::Err(limit().with_offset(index))
+                }
+                remaining -= 128
+            }
+        }
+        index += 1
+    }
+    ret Result::Ok(limits.max_allocation_bytes() - remaining)
+}
+
+fn record_schema[Value](info: TypeInfo[Value]) -> Result[(), Error] {
+    let mut names = Vec[str]::new()
+    for field in info.fields() {
+        let name = field.attribute("serialize.rename").unwrap_or(field.name())
+        for previous in names {
+            if previous == name {
+                ret Result::Err(Error::new(ErrorKind::InvalidSchema, "duplicate serialized field name").at(name))
+            }
+        }
+        names.push(name)
+    }
+    ret Result::Ok(())
+}
+
+fn charge_decode(budget: mut DecodeBudget, items: usize, width: usize) -> Result[(), Error] {
+    if width != 0 && items >(budget.limits.max_allocation_bytes() - budget.allocated) / width {
+        ret Result::Err(limit())
+    }
+    budget.allocated += items * width
+    ret Result::Ok(())
+}
+fn charge_record[Value](info: TypeInfo[Value], budget: mut DecodeBudget) -> Result[(), Error] {
+    charge_decode(budget, 1, 256)?
+    for field in info.fields() {
+        charge_decode(budget, 1, field.type().size_bound() + 16)?
+    }
+    ret Result::Ok(())
+}

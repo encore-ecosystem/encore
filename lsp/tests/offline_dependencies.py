@@ -10,7 +10,7 @@ import tempfile
 from protocol_features import request, send
 
 
-def run_case(binary, root, dependency, *, transitive=False, cached=False, default_index=None):
+def run_case(binary, root, dependency, *, transitive=False, cached=False, incomplete=False, default_index=None):
     root.mkdir()
     (root / 'src').mkdir()
     registry = root / 'registry'
@@ -19,11 +19,16 @@ def run_case(binary, root, dependency, *, transitive=False, cached=False, defaul
     if default_index:
         cache_root = registry / 'sources' / (default_index.encode().hex() + '-index')
     package = cache_root / 'packages' / 'editor_fixture' / ('1.0.0-' + checksum)
-    if cached:
+    if cached or incomplete:
         (package / 'src').mkdir(parents=True)
         (package / 'encore.toml').write_text(
             '[project]\nname="editor_fixture"\nversion="1.0.0"\ndependencies=[]\n')
         (package / 'src/lib.enq').write_text('pub struct Value { item: u32 }\n')
+        if cached:
+            (package / '.encore-registry').write_text(
+                'archive = "https://invalid.example/editor_fixture.tar.gz"\n'
+                f'checksum = "{checksum}"\n'
+                + (f'registry = "{default_index}"\n' if default_index else ''))
     if dependency.startswith('index@'):
         (root / 'encore.lock').write_text(
             'version = 2\n[[packages]]\nname = "editor_fixture"\n'
@@ -82,7 +87,9 @@ def run_case(binary, root, dependency, *, transitive=False, cached=False, defaul
         assert not marker.exists(), 'LSP attempted a download or clone'
         for relative, contents in before.items():
             assert (root / relative).read_bytes() == contents, relative
-        if not cached:
+        if incomplete:
+            assert not (package / '.encore-registry').exists(), 'LSP completed a partial cache entry'
+        elif not cached:
             assert not registry.exists(), 'LSP created the dependency cache'
     finally:
         if process.poll() is None:
@@ -97,13 +104,15 @@ def main():
         run_case(binary, root / 'missing', 'index@editor_fixture')
         run_case(binary, root / 'transitive', 'index@editor_fixture', transitive=True)
         run_case(binary, root / 'git', 'git@https://invalid.example/encore-editor-fixture/not-installed.git')
+        run_case(binary, root / 'incomplete', 'index@editor_fixture', incomplete=True)
+        run_case(binary, root / 'incomplete-transitive', 'index@editor_fixture', transitive=True, incomplete=True)
         run_case(binary, root / 'installed', 'index@editor_fixture', cached=True)
         run_case(binary, root / 'installed-transitive', 'index@editor_fixture', transitive=True, cached=True)
         run_case(binary, root / 'default-index', 'index@editor_fixture', cached=True,
                  default_index='http://127.0.0.1:8137/index')
         run_case(binary, root / 'default-index-transitive', 'index@editor_fixture', cached=True,
                  transitive=True, default_index='http://127.0.0.1:8137/index')
-    print('offline dependency graphs: 7 scenarios passed')
+    print('offline dependency graphs: 9 scenarios passed')
 
 
 if __name__ == '__main__':
