@@ -27,7 +27,7 @@ import std::thread::available_parallelism
 import std::time::{perf_counter_ms, perf_counter_ns}
 import std::vec::Vec
 
-import ehir_llvm_backend::codegen::{EmittedIrModule, emit_ir, emit_ir_for_target, emit_ir_bundle_for_target_parallel, emit_ir_bundle_for_target_selected, emit_ir_bundle_for_target_selected_with_analysis, incremental_codegen_context_bundle}
+import ehir_llvm_backend::codegen::{EmittedIrModule, emit_ir_for_target, emit_ir_bundle_for_target_parallel, emit_ir_bundle_for_target_selected, emit_ir_bundle_for_target_selected_with_analysis, incremental_codegen_context_bundle}
 import ehirlib::parse_module_text
 import ehirlib::{EhirModuleSource, ModuleBundle, parse_module_bundle_artifact_parallel, parse_module_bundle_text, split_module_bundle_text, flatten_module_bundle, module_bundle_to_string}
 
@@ -72,6 +72,9 @@ extern fn encore_build_queue_free(queue: usize) ->()
 extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
 extern fn encore_compiler_process_id() -> u64
 extern fn encore_compiler_worker_interrupted() -> i32
+extern fn encore_strset_new() -> usize
+extern fn encore_strset_insert(set: usize, value: str) -> bool
+extern fn encore_strset_free(set: usize) ->()
 
 struct SemanticModuleJob {
     index: usize
@@ -1368,21 +1371,21 @@ fn write_build_input_snapshot(path: Path, configuration: str, root: Path,
         snapshot = append_snapshot_file(snapshot, refrain.root.join("encore.lock"))
         snapshot = append_snapshot_file(snapshot, refrain.root.join("build.enq"))
         snapshot = append_snapshot_native_file(snapshot,
-            refrain.root.join("runtime.c").resolve(), 0_u32,)
+            refrain.root.join("runtime.c").resolve(),)
         for feature in refrain.enabled_features {
             snapshot = append_snapshot_native_file(snapshot,
-                refrain.root.join("runtime." + feature + ".c").resolve(), 0_u32,)
+                refrain.root.join("runtime." + feature + ".c").resolve(),)
         }
     }
-    snapshot = append_snapshot_native_file(snapshot, resolved_core_runtime(root), 0_u32)
+    snapshot = append_snapshot_native_file(snapshot, resolved_core_runtime(root))
     let platform_runtime_override = configured_runtime_path("ENCORE_PLATFORM_RUNTIME")
     if platform_runtime_override != "" {
         snapshot = append_snapshot_native_file(snapshot,
-            Path::new(platform_runtime_override), 0_u32,)
+            Path::new(platform_runtime_override),)
     }
     for source in toolchain.runtime_sources {
         snapshot = append_snapshot_native_file(snapshot,
-            resolve_project_path(root, source), 0_u32,)
+            resolve_project_path(root, source),)
     }
     if toolchain.linker_script != "" {
         snapshot = append_snapshot_file(snapshot,
@@ -1406,26 +1409,50 @@ fn append_snapshot_file(snapshot: str, path: Path) -> str {
     ret snapshot + source + "\n" + digest + "\n"
 }
 
-fn append_snapshot_native_file(snapshot: str, path: Path, depth: u32) -> str {
-    if depth >= 32_u32 {
-        ret snapshot
-    }
-    let mut out = append_snapshot_file(snapshot, path)
-    if !file_exists(native_path(path.as_str())) {
-        ret out
-    }
-    let source = read_file(native_path(path.as_str()))
-    match path.parent() {
-        Some(parent) => {
-            for include in quoted_c_includes(source) {
-                out = append_snapshot_native_file(out,
-                    parent.join(include).resolve(), depth + 1_u32,)
-            }
-        }
-        None => {
-        }
+fn append_snapshot_native_file(snapshot: str, path: Path) -> str {
+    let mut out = snapshot
+    for dependency in native_dependency_paths(path) {
+        out = append_snapshot_file(out, dependency)
     }
     ret out
+}
+
+// Visit each resolved path once, including missing headers in snapshots.
+// Include guards and repeated diamond dependencies must not expand the walk.
+fn native_dependency_paths(root: Path) -> Vec[Path] {
+    let seen = unsafe {
+        encore_strset_new()
+    }
+    let mut pending = vec![root.resolve()]
+    let mut paths = Vec[Path]::new()
+    let mut index = 0_usize
+    while index < pending.len() {
+        let path = pending.get(index).unwrap_or(root).resolve()
+        index += 1_usize
+        if !unsafe {
+            encore_strset_insert(seen, path.as_str())
+        }
+        {
+            continue
+        }
+        paths.push(path)
+        if !file_exists(native_path(path.as_str())) {
+            continue
+        }
+        match path.parent() {
+            Some(parent) => {
+                for include in quoted_c_includes(read_file(native_path(path.as_str()))) {
+                    pending.push(parent.join(include).resolve())
+                }
+            }
+            None => {
+            }
+        }
+    }
+    unsafe {
+        encore_strset_free(seen)
+    }
+    ret paths
 }
 
 fn read_nonempty_text_lines(path: Path) -> Vec[str] {
@@ -1451,21 +1478,21 @@ fn read_nonempty_text_lines(path: Path) -> Vec[str] {
 fn workspace_build_fingerprint(root: Path, workspace: ProjectWorkspace, target: TargetSpec, toolchain: Toolchain, profile: str, emit: str) -> str {
     let mut value = workspace_codegen_fingerprint(root, workspace, target, toolchain, profile, emit)
     for source in toolchain.runtime_sources {
-        value = fingerprint_native_file(value, resolve_project_path(root, source), 0_u32)
+        value = fingerprint_native_file(value, resolve_project_path(root, source))
     }
     let core_runtime = resolved_core_runtime(root)
-    value = fingerprint_native_file(value, core_runtime, 0_u32)
+    value = fingerprint_native_file(value, core_runtime)
     let platform_runtime_override = configured_runtime_path("ENCORE_PLATFORM_RUNTIME")
     if platform_runtime_override != "" {
-        value = fingerprint_native_file(value, Path::new(platform_runtime_override), 0_u32)
+        value = fingerprint_native_file(value, Path::new(platform_runtime_override))
     }
     for refrain in workspace.refrains {
         if refrain.name != "core" {
-            value = fingerprint_native_file(value, refrain.root.join("runtime.c").resolve(), 0_u32)
+            value = fingerprint_native_file(value, refrain.root.join("runtime.c").resolve())
         }
         for feature in refrain.enabled_features {
             value = fingerprint_native_file(value,
-                refrain.root.join("runtime." + feature + ".c").resolve(), 0_u32,)
+                refrain.root.join("runtime." + feature + ".c").resolve(),)
         }
     }
     ret Debug::fmt(value.hash())
@@ -1615,20 +1642,12 @@ fn reuse_sibling_profile_llvm(profile_dir: Path, llvm_path: Path, manifest_name:
     ret false
 }
 
-fn fingerprint_native_file(current: str, path: Path, depth: u32) -> str {
-    if depth >= 32_u32 || !file_exists(native_path(path.as_str())) {
-        ret current
-    }
-    let source = read_file(native_path(path.as_str()))
-    let mut value = fingerprint_mix(current, path.as_str())
-    value = fingerprint_mix(value, source)
-    match path.parent() {
-        Option[Path]::Some(parent) => {
-            for include in quoted_c_includes(source) {
-                value = fingerprint_native_file(value, parent.join(include).resolve(), depth + 1_u32)
-            }
-        }
-        Option[Path]::None => {
+fn fingerprint_native_file(current: str, path: Path) -> str {
+    let mut value = current
+    for dependency in native_dependency_paths(path) {
+        if file_exists(native_path(dependency.as_str())) {
+            value = fingerprint_mix(value, dependency.as_str())
+            value = fingerprint_mix(value, read_file(native_path(dependency.as_str())))
         }
     }
     ret value
@@ -1646,45 +1665,161 @@ fn native_object_fingerprint(source: Path, target: TargetSpec, toolchain: Toolch
     for arg in compiler_args(profile, target, toolchain) {
         value = fingerprint_mix(value, arg)
     }
-    value = fingerprint_native_file(value, source, 0_u32)
+    value = fingerprint_native_file(value, source)
     ret Debug::fmt(value.hash())
+}
+
+fn c_line_splice(source: str, index: usize) -> usize {
+    if index + 1_usize < source.byte_len() && source.byte_at(index) == 92_u8 {
+        if source.byte_at(index + 1_usize) == 10_u8 {
+            ret 2_usize
+        }
+        if index + 2_usize < source.byte_len() && source.byte_at(index + 1_usize) == 13_u8 &&
+        source.byte_at(index + 2_usize) == 10_u8 {
+            ret 3_usize
+        }
+    }
+    ret 0_usize
+}
+
+fn c_directive_trivia(source: str, start: usize) -> usize {
+    let mut index = start
+    while index < source.byte_len() {
+        let splice = c_line_splice(source, index)
+        if splice != 0_usize {
+            index += splice continue
+        }
+        let byte = source.byte_at(index)
+        if byte == 32_u8 || byte == 9_u8 || byte == 13_u8 || byte == 12_u8 || byte == 11_u8 {
+            index += 1_usize continue
+        }
+        if byte == 47_u8 && index + 1_usize < source.byte_len() && source.byte_at(index + 1_usize) == 42_u8 {
+            index += 2_usize
+            while index + 1_usize < source.byte_len() &&
+            !(source.byte_at(index) == 42_u8 && source.byte_at(index + 1_usize) == 47_u8) {
+                index += 1_usize
+            }
+            if index + 1_usize >= source.byte_len() {
+                ret source.byte_len()
+            }
+            index += 2_usize continue
+        }
+        break
+    }
+    ret index
 }
 
 fn quoted_c_includes(source: str) -> Vec[str] {
     let mut includes = Vec[str]::new()
     let mut index = 0_usize
-    while index < source.len() {
-        if source.byte_at(index) != 35_u8 {
-            index = index + 1_usize continue
+    let mut line_start = true
+    let mut block_comment = false
+    let mut line_comment = false
+    let mut quote = 0_u8
+    while index < source.byte_len() {
+        let splice = c_line_splice(source, index)
+        if splice != 0_usize {
+            index += splice continue
         }
-        let mut token = index + 1_usize
-        while token < source.len() &&(source.byte_at(token) == 32_u8 || source.byte_at(token) == 9_u8) {
-            token = token + 1_usize
+        let byte = source.byte_at(index)
+        let next = if index + 1_usize < source.byte_len() {
+            source.byte_at(index + 1_usize)
+        } else {
+            0_u8
         }
-        // `token` is a byte offset. Character-based `slice` rescans UTF-8 from
-        // the beginning and makes this linear lexer quadratic on large native
-        // runtime sources.
-        if token + 7_usize > source.len() || source.slice_bytes(token, 7_usize) != "include" {
-            index = index + 1_usize continue
+        if block_comment {
+            if byte == 42_u8 && next == 47_u8 {
+                block_comment = false index += 2_usize continue
+            }
+            if byte == 10_u8 {
+                line_start = true
+            }
+            index += 1_usize continue
         }
-        token = token + 7_usize
-        while token < source.len() && source.byte_at(token) != 10_u8 && source.byte_at(token) != 34_u8 {
-            token = token + 1_usize
+        if line_comment {
+            if byte == 10_u8 {
+                line_comment = false line_start = true
+            }
+            index += 1_usize continue
         }
-        if token >= source.len() || source.byte_at(token) != 34_u8 {
+        if quote != 0_u8 {
+            if byte == 92_u8 {
+                index += 2_usize continue
+            }
+            if byte == quote {
+                quote = 0_u8
+            }
+            index += 1_usize continue
+        }
+        if byte == 47_u8 && next == 42_u8 {
+            block_comment = true index += 2_usize continue
+        }
+        if byte == 47_u8 && next == 47_u8 {
+            line_comment = true index += 2_usize continue
+        }
+        if byte == 10_u8 {
+            line_start = true index += 1_usize continue
+        }
+        if byte == 32_u8 || byte == 9_u8 || byte == 13_u8 || byte == 12_u8 || byte == 11_u8 {
+            index += 1_usize continue
+        }
+        if byte == 34_u8 || byte == 39_u8 {
+            quote = byte line_start = false index += 1_usize continue
+        }
+        if byte != 35_u8 || !line_start {
+            line_start = false index += 1_usize continue
+        }
+        line_start = false
+        let mut token = c_directive_trivia(source, index + 1_usize)
+        let keyword = "include"
+        let mut matched = 0_usize
+        while token < source.byte_len() && matched < keyword.byte_len() {
+            let continuation = c_line_splice(source, token)
+            if continuation != 0_usize {
+                token += continuation continue
+            }
+            if source.byte_at(token) != keyword.byte_at(matched) {
+                break
+            }
+            token += 1_usize matched += 1_usize
+        }
+        if matched != keyword.byte_len() {
             index = token continue
         }
-        let start = token + 1_usize
-        token = start
-        while token < source.len() && source.byte_at(token) != 10_u8 && source.byte_at(token) != 34_u8 {
-            token = token + 1_usize
+        token = c_directive_trivia(source, token)
+        if token >= source.byte_len() || source.byte_at(token) != 34_u8 {
+            index = token continue
         }
-        if token < source.len() && source.byte_at(token) == 34_u8 && token > start {
-            includes.push(source.slice_bytes(start, token - start))
+        token += 1_usize
+        let mut start = token
+        let mut include = ""
+        while token < source.byte_len() && source.byte_at(token) != 10_u8 && source.byte_at(token) != 34_u8 {
+            let continuation = c_line_splice(source, token)
+            if continuation != 0_usize {
+                include += source.slice_bytes(start, token - start)
+                token += continuation start = token
+            } else {
+                token += 1_usize
+            }
         }
-        index = token + 1_usize
+        if token < source.byte_len() && source.byte_at(token) == 34_u8 {
+            include += source.slice_bytes(start, token - start)
+            if include != "" {
+                includes.push(include)
+            }
+            token += 1_usize
+        }
+        index = token
     }
     ret includes
+}
+
+#attr(test)
+fn native_include_lexer_contract() -> bool {
+    let includes = quoted_c_includes("// #include \"comment.h\"\n/*\n#include \"block.h\"\n*/\nconst char *example = \"#include \\\"literal.h\\\"\";\nconst char *continued = \"a\\\n#include \\\"string.h\\\"\";\n// comment continuation \\\n#include \"continued-comment.h\"\nnot_a_directive #include \"middle.h\"\n#include_next \"next.h\"\n# include /* header */ \"real.h\"\n#inc\\\nlude \"continued.h\"\n#include \"utf8-рыба.h\"\n")
+    ret includes.len() == 3_usize && includes.get(0).unwrap_or("") == "real.h"
+    && includes.get(1).unwrap_or("") == "continued.h"
+    && includes.get(2).unwrap_or("") == "utf8-рыба.h"
 }
 
 fn fingerprint_mix(current: str, value: str) -> str {
@@ -3595,25 +3730,25 @@ fn compile_entry_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement
             test_fingerprint = fingerprint_mix(test_fingerprint, import_name)
         }
     }
-    test_fingerprint = fingerprint_native_file(test_fingerprint, runtime_path, 0_u32)
+    test_fingerprint = fingerprint_native_file(test_fingerprint, runtime_path)
     if file_exists(native_path(platform_runtime.as_str())) {
-        test_fingerprint = fingerprint_native_file(test_fingerprint, platform_runtime, 0_u32)
+        test_fingerprint = fingerprint_native_file(test_fingerprint, platform_runtime)
     }
     for refrain in workspace.refrains {
         if refrain.name != "core" {
             test_fingerprint = fingerprint_native_file(test_fingerprint,
-                refrain.root.join("runtime.c").resolve(), 0_u32,)
+                refrain.root.join("runtime.c").resolve(),)
         }
         for feature in refrain.enabled_features {
             test_fingerprint = fingerprint_native_file(test_fingerprint,
-                refrain.root.join("runtime." + feature + ".c").resolve(), 0_u32,)
+                refrain.root.join("runtime." + feature + ".c").resolve(),)
         }
     }
     for link_arg in test_toolchain.link_args {
         test_fingerprint = fingerprint_mix(test_fingerprint, link_arg)
     }
     for source in native_metadata.sources {
-        test_fingerprint = fingerprint_native_file(test_fingerprint, source, 0)
+        test_fingerprint = fingerprint_native_file(test_fingerprint, source)
     }
     for identity in native_metadata.identities() {
         test_fingerprint = fingerprint_mix(test_fingerprint, identity)
@@ -3634,7 +3769,8 @@ fn compile_entry_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement
     remove_file(native_path(test_fingerprint_path.as_str()))
     let translation_modules = test_translation_modules(workspace.modules, ast, target)
     let ehir_text = translate_modules_to_ehir(translation_modules, target)
-    let llvm_text = emit_ir(parse_module_text("encore_test", ehir_text))
+    let llvm_text = emit_ir_for_target(parse_module_text("encore_test", ehir_text),
+        target.triple, target.pointer_width,)
     if write_file(native_path(ehir_path.as_str()), ehir_text) != 0_i32 {
         ret test_artifact_error("write test EHIR", ehir_path)
     }

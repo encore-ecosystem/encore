@@ -7707,7 +7707,7 @@ fn translate_field_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assi
             let mut builder = base.code
             let mut rhs = lower_expr(ctx, assign_stmt.expr, prefix + "_assign_field_rhs", idx + 2_usize)
             builder = builder.append(rhs.code)
-            let expected_type = canonical_type(value_type_name(field_type))
+            let expected_type = capability_value_type(field_type)
             if is_numeric_type(expected_type) && is_numeric_type(rhs.typ) && expected_type != canonical_type(value_type_name(rhs.typ))
             {
                 let cast_name = prefix + "_assign_field_cast_" + Debug::fmt(idx)
@@ -7718,8 +7718,14 @@ fn translate_field_assignment_stmt(ctx: mut TranslatorContext, assign_stmt: Assi
                 }
             } elif !function_type_matches(expected_type, rhs.typ, Vec[str]::new()) {
                 translation_error_at(assign_stmt.expr.source_name, assign_stmt.expr.line, assign_stmt.expr.column,
-                    "assignment-type-mismatch", "cannot assign value of type '" + canonical_type(value_type_name(rhs.typ))
+                    "assignment-type-mismatch", "cannot assign value of type '" + canonical_type(rhs.typ)
                     + "' to field '" + field_expr.field + "' of type '" + expected_type + "'",)
+            }
+            if ends_with(expected_type, "&") && capability_value_type(rhs.typ) != expected_type {
+                let erased = prefix + "_assign_field_node_any_" + Debug::fmt(idx)
+                builder = builder.instr(erased + ": " + expected_type + " = pcast " +
+                    rhs.value + ": " + rhs.typ + ", " + expected_type)
+                rhs = LoweredExpr { EhirTextBuilder::new(), erased, expected_type }
             }
             if assign_stmt.operator == "=" {
                 let field_index = ctx_lookup_field_index(ctx, base.typ, field_expr.field)
@@ -9515,6 +9521,11 @@ fn lower_decorator_target_call(ctx: mut TranslatorContext, call: CallExpr, sourc
 fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name: str, line: usize, column:
     usize, prefix: str, idx: usize, spawning: bool,) -> LoweredExpr {
     let mut callee = expr_h_path_or_empty(call.callee)
+    let builtin_range = callee == "core::iter::range" || callee == "core::iter::range_inclusive"
+    if builtin_range && call.args.len() != 2_usize {
+        translation_error_at(source_name, line, column, "argument-mismatch",
+            "range requires two usize bounds",)
+    }
     if ctx.decorator_callable_name != "" && callee == ctx.decorator_callable_name {
         ret lower_decorator_target_call(ctx, call, source_name, line, column, prefix, idx, spawning)
     }
@@ -9561,6 +9572,10 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         if constructor_owner != "" && i == 0 && constructor_payload != "void" {
             expected = constructor_payload
             hint = constructor_payload
+        }
+        if builtin_range {
+            expected = "usize"
+            hint = "usize"
         }
         let callee_scope = last_scope_index(callee_base)
         if i == 0_usize && callee_scope < callee_base.len() && hint == callee_base.slice(0_usize, callee_scope)
@@ -9614,6 +9629,10 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         }
         if !starts_with(hint, "mut ") && !expects_borrowed {
             lowered = load_mutable_value(lowered, prefix + "_arg_load_" + Debug::fmt(idx + i))
+        }
+        if builtin_range && !function_type_matches("usize", lowered.typ, Vec[str]::new()) {
+            translation_error_at(arg.source_name, arg.line, arg.column, "argument-mismatch",
+                "range bound must have type 'usize', found '" + canonical_type(lowered.typ) + "'",)
         }
         code = code.append(lowered.code)
         if base_type_name(lowered.typ) == "JoinHandle" && arg_path != "" {
