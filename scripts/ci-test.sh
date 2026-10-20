@@ -23,11 +23,24 @@ cp tests/ci/runtime.c "$fixture/runtime.c"
 sed 's|path@packages/|path@../../../packages/|g' encore.toml > "$fixture/encore.toml"
 export ENCORE_TEST_COMPILER="$compiler"
 export ENCORE_TEST_REPOSITORY="$repository"
+if command -v cygpath >/dev/null 2>&1; then
+  export ENCORE_TEST_COMPILER="$(cygpath -m "$compiler")"
+  export ENCORE_TEST_REPOSITORY="$(cygpath -m "$repository")"
+fi
+if [[ "${CI_TEST_PREPARE_ONLY:-0}" == 1 ]]; then
+  mkdir -p "$fixture/target"
+  (cd "$fixture" && "$compiler" test --list --format json > target/test-inventory.json)
+  (cd "$fixture" && "$compiler" test --_worker-harness --jobs "${CI_TEST_PREPARE_JOBS:-2}")
+  python3 "$repository/scripts/ci-test-context.py" save "$compiler" "$fixture" \
+    "$repository/target/prepared-test-harness"
+  exit 0
+fi
+if [[ -n "${CI_TEST_HARNESS_CONTEXT:-}" ]]; then
+  python3 "$repository/scripts/ci-test-context.py" restore "$compiler" "$fixture" "$CI_TEST_HARNESS_CONTEXT"
+fi
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     # The Encore subprocess API takes native paths, not Git Bash mount paths.
-    export ENCORE_TEST_COMPILER="$(cygpath -m "$compiler")"
-    export ENCORE_TEST_REPOSITORY="$(cygpath -m "$repository")"
     args_json=$(jq -cn --args '$ARGS.positional' -- "${@:2}")
     supervisor=$(cygpath -m "$repository/scripts/ci-test-windows.ps1")
     report=$(cygpath -m "$repository/target/test-report.json")

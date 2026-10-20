@@ -25,6 +25,8 @@ import refrain::target::{cfg_active_with_features, host_target, target_executabl
 
 struct TestSelection {
     filter: str
+    shard_index: usize
+    shard_count: usize
 }
 
 struct TestRecord {
@@ -373,13 +375,80 @@ fn test_selected(id: str, selection: TestSelection) -> bool {
     if selection.filter != "" && !contains(id, selection.filter) {
         ret false
     }
-    ret true
+    if selection.shard_count == 1_usize {
+        ret true
+    }
+    let mut bucket = 0_usize
+    for index in 0_usize..id.byte_len() {
+        bucket =(bucket * 31_usize + id.byte_at(index) as usize) % selection.shard_count
+    }
+    ret bucket == selection.shard_index
 }
 
 fn test_selection() -> TestSelection {
-    ret TestSelection {
-        test_filter()
+    let shard = option_value("--shard")
+    if shard != "" {
+        let separator = shard.find_byte_from(47_u8, 0_usize)
+        ret TestSelection {
+            test_filter(), decimal_value(shard.slice_bytes(0_usize, separator)) - 1_usize,
+            decimal_value(shard.slice_bytes(separator + 1_usize, shard.byte_len() - separator - 1_usize))
+        }
     }
+    ret TestSelection {
+        test_filter(), 0_usize, 1_usize
+    }
+}
+
+/// Shards are one-based and bounded so bucket arithmetic cannot overflow.
+pub fn test_shard_valid(value: str) -> bool {
+    let separator = value.find_byte_from(47_u8, 0_usize)
+    if separator == 0_usize || separator >= value.byte_len() || separator > 4_usize {
+        ret false
+    }
+    let count_length = value.byte_len() - separator - 1_usize
+    if count_length == 0_usize || count_length > 4_usize {
+        ret false
+    }
+    for index in 0_usize..value.byte_len() {
+        if index != separator &&(value.byte_at(index) < 48_u8 || value.byte_at(index) > 57_u8) {
+            ret false
+        }
+    }
+    let selected = decimal_value(value.slice_bytes(0_usize, separator))
+    let count = decimal_value(value.slice_bytes(separator + 1_usize, count_length))
+    ret selected > 0_usize && selected <= count && count <= 1024_usize
+}
+
+#attr(test)
+fn test_shard_partition_contract() -> bool {
+    let ids = vec!["suite:src/alpha.enq::example", "suite:tests/beta.enq", "suite:tests/пример.enq"]
+    for id in ids {
+        let mut selected = 0_usize
+        for shard in 0_usize..4_usize {
+            if test_selected(id, TestSelection { "", shard, 4_usize }) {
+                selected += 1_usize
+            }
+        }
+        if selected != 1_usize || !test_selected(id, TestSelection { "", 0_usize, 1_usize }) {
+            ret false
+        }
+    }
+    ret !test_selected("suite:tests/beta.enq", TestSelection { "absent", 0_usize, 1_usize })
+}
+
+#attr(test)
+fn test_shard_validation_contract() -> bool {
+    for value in vec!["1/1", "1/4", "4/4", "1024/1024"] {
+        if !test_shard_valid(value) {
+            ret false
+        }
+    }
+    for value in vec!["", "0/4", "5/4", "1/0", "1/1025", "1", "/4", "1/", "1/2/3", "-1/4", "1/x", "999999999999999999999/4"] {
+        if test_shard_valid(value) {
+            ret false
+        }
+    }
+    ret true
 }
 
 fn decimal_value(value: str) -> usize {
@@ -450,7 +519,7 @@ fn unit_test_relative_path(root: str, source: str) -> str {
         }
     )
     if starts_with(module_path, prefix) {
-        module_path = module_path.slice(prefix.len(), module_path.len() - prefix.len())
+        module_path = module_path.slice_bytes(prefix.byte_len(), module_path.byte_len() - prefix.byte_len())
     }
     ret module_path
 }
@@ -1103,20 +1172,21 @@ fn test_summary_preserves_structured_diagnostic_contract() -> bool {
 }
 
 fn contains(value: str, needle: str) -> bool {
-    let mut index = 0_usize
-    while index + needle.len() <= value.len() {
-        if value.slice(index, needle.len()) == needle {
-            ret true
-        }
-        index = index + 1_usize
-    }
-    ret false
+    ret needle.byte_len() == 0_usize || value.find_from(needle, 0_usize) < value.byte_len()
 }
 fn starts_with(value: str, prefix: str) -> bool {
-    ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix
+    ret value.range_eq(0_usize, prefix.byte_len(), prefix)
 }
 fn ends_with(value: str, suffix: str) -> bool {
-    ret suffix.len() <= value.len() && value.slice(value.len() - suffix.len(), suffix.len()) == suffix
+    ret suffix.byte_len() <= value.byte_len() && value.range_eq(value.byte_len() - suffix.byte_len(), suffix.byte_len(), suffix)
+}
+
+#attr(test)
+fn test_utf8_discovery_and_filter_contract() -> bool {
+    ret ends_with("пример.enq", ".enq") && !ends_with("пример.txt", ".enq") &&
+    starts_with("путь/пример.enq", "путь/") && contains("путь/пример.enq", "пример") &&
+    !contains("путь/пример.enq", "другой") && contains("", "") &&
+    unit_test_relative_path("/work/проект", "/work/проект/src/lib.enq") == "src/lib.enq"
 }
 fn arg_or(index: usize, fallback: str) -> str {
     match argv(index) {

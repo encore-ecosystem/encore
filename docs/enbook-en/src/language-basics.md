@@ -171,6 +171,16 @@ fn vec_len_is_zero() -> bool {
 The compiler expects unit tests to return `bool`, take no parameters and avoid
 generic parameters. `true` means pass, `false` means fail.
 
+`encore test` compiles one shared executable for unit tests and runs each test
+in an isolated process. Standalone `tests/*.enq` programs are separate compiler
+inputs and have their own executable caches.
+
+For parallel CI jobs, `encore test --shard 1/4` selects one of four deterministic
+partitions. Indices are one-based, with at most 1024 partitions. Full portable
+test IDs determine membership, so filesystem discovery order does not affect
+the result. `--filter` applies before partition selection; `--list --format json`
+and `--report PATH` describe the same selected set.
+
 ## Structs And Methods
 
 Struct fields are listed by name and type:

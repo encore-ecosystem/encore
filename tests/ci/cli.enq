@@ -1,14 +1,67 @@
 //! Real CLI contracts, independent of the source-analysis library interface.
 
-import json::Json
-import refrain::ci_helpers::{Fixture, json, flag, number, text, modified_ns, replace, std_dependencies, set_env}
-import refrain::modes::build_output::{build_artifact_name, build_import_library_name}
-import refrain::target::host_target
 import std::io::eprintln
-import std::os::{env, file_exists, file_sha256, read_file, remove_file, remove_dir_all}
+import std::os::{env, file_exists, file_sha256, read_file, remove_dir_all, remove_file}
 import std::process::Command
 import std::string::String
 import std::vec::Vec
+
+import json::Json
+
+import refrain::ci_helpers::{Fixture, flag, json, modified_ns, number, replace, set_env, std_dependencies, text}
+import refrain::modes::build_output::{build_artifact_name, build_import_library_name}
+import refrain::target::host_target
+
+#attr(test)
+fn integration_test_partition_and_utf8_discovery_contract() -> bool {
+    let fixture = Fixture::new("test-partitions")
+    fixture.manifest("partition_probe", "[]")
+    fixture.put("src/lib.enq", "#attr(test)\nfn example() -> bool { ret true }\n")
+    for name in vec!["plain", "second", "пример"] {
+        fixture.put("tests/" + name + ".enq", "fn main() -> u32 { ret 0_u32 }\n")
+    }
+    let full = fixture.command(vec!["test", "--list", "--format", "json"])
+    let planned = json(full.text()).as_array().unwrap_or(Vec[Json]::new())
+    if !full.success() || planned.len() != 4_usize {
+        ret fixture.failure("all test files, including UTF-8 names, must be discovered")
+    }
+    let mut seen = Vec[str]::new()
+    for part in vec!["1/4", "2/4", "3/4", "4/4"] {
+        let output = fixture.command(vec!["test", "--list", "--format", "json", "--shard", part])
+        if !output.success() {
+            ret fixture.failure(output.text())
+        }
+        for item in json(output.text()).as_array().unwrap_or(Vec[Json]::new()) {
+            let id = item.as_str().unwrap_or("")
+            for previous in seen {
+                if previous == id {
+                    ret fixture.failure("a test belongs to multiple partitions")
+                }
+            }
+            seen.push(id)
+        }
+    }
+    if seen.len() != planned.len() {
+        ret fixture.failure("partition coverage is incomplete")
+    }
+    for item in planned {
+        let mut found = false
+        for id in seen {
+            if id == item.as_str().unwrap_or("") {
+                found = true
+            }
+        }
+        if !found {
+            ret fixture.failure("partition omitted a discovered test")
+        }
+    }
+    for part in vec!["0/4", "5/4", "1/0"] {
+        if fixture.command(vec!["test", "--list", "--shard", part]).code() != 2 {
+            ret fixture.failure("invalid partition must exit with usage status 2")
+        }
+    }
+    ret fixture.finish(true)
+}
 
 fn library_artifact_contract(kind: str) -> bool {
     let fixture = Fixture::new("library-" + kind)
@@ -251,20 +304,20 @@ fn integration_eight_dependency_workers_contract() -> bool {
     let mut calls = ""
     let mut index = 0_u32
     while index < 8 {
-        let name = f "queue_dep_{index}"
-        let directory = f "dependency-{index}"
+        let name = f"queue_dep_{index}"
+        let directory = f"dependency-{index}"
         fixture.put(directory + "/encore.toml", "[project]\nname=\"" + name + "\"\nversion=\"0.0.0\"\ndependencies=[]\n")
-        fixture.put(directory + "/src/lib.enq", "pub fn value() -> u32 { ret " + f "{index + 1}" + " }\n" +
+        fixture.put(directory + "/src/lib.enq", "pub fn value() -> u32 { ret " + f"{index + 1}" + " }\n" +
             "pub fn offset(value: u16) -> u32 { ret value as u32 }\nfn private_identity[T](value: T) -> T { ret value }\n" +
             "pub fn identity[T](value: T) -> T { ret private_identity(value) }\n",)
         dependencies = dependencies + ",\"path@" + directory + "\""
-        imports = imports + "import " + name + "::value as value_" + f "{index}" + "\n"
+        imports = imports + "import " + name + "::value as value_" + f"{index}" + "\n"
         calls = calls +(if index == 0 {
                 ""
             } else {
                 " + "
             }
-        ) + f "value_{index}()"
+        ) + f"value_{index}()"
         index += 1
     }
     fixture.manifest("queue_probe", dependencies + "]")
