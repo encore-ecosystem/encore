@@ -2382,20 +2382,28 @@ impl for AnalysisDatabase {
                 scope = method.module_name
                 selected = names_in_scope(names, scope)
             }
+            let mut binders = Vec[str]::new()
+            for name in method.generic_names {
+                binders.push(name)
+            }
+            for name in method.method_generic_names {
+                if !contains_string(binders, name) {
+                    binders.push(name)
+                }
+            }
             let mut params = Vec[str]::new()
             for param in method.params {
-                params.push(scope_type(param, scope, selected, method.generic_names))
+                params.push(scope_type(param, scope, selected, binders))
             }
             out.push(SemanticMethod {
                     method.module_name, scope_type(method.receiver_type, scope, selected, method.generic_names),
-                    method.name, params, scope_type(method.ret_type, scope, selected, method.generic_names),
-                    method.signature, method.declaration_receiver, method.generic_names, method.is_static, method.is_public
+                    method.name, params, scope_type(method.ret_type, scope, selected, binders),
+                    method.signature, method.declaration_receiver, method.generic_names, method.is_static, method.is_public, method.method_generic_names
                 }
                 ,)
         }
         ret out
     }
-
     fn scoped_callables(self: Self, callables: Vec[SemanticCallable], names: Vec[TypeNameBinding]) -> Vec[SemanticCallable] {
         let mut scoped_callables = Vec[SemanticCallable]::new()
         let mut scope = ""
@@ -2715,7 +2723,7 @@ impl for AnalysisDatabase {
                         methods.push(SemanticMethod {
                                 method.module_name, pattern, method.name,
                                 method.params, method.ret_type, method.signature, method.declaration_receiver,
-                                method.generic_names, method.is_static, method.is_public
+                                method.generic_names, method.is_static, method.is_public, method.method_generic_names
                             }
                             ,)
                     }
@@ -3476,7 +3484,6 @@ impl for AnalysisDatabase {
         }
         ret values
     }
-
     fn semantic_trait_owner(self: mut Self, scope: str, owner: str, names: Vec[TypeNameBinding], generics: Vec[str]) -> str {
         if contains_string_value(owner, "::") {
             match self.qualified_definition(scope, owner, DefinitionNamespace::Trait) {
@@ -3520,7 +3527,7 @@ impl for AnalysisDatabase {
                                 }
                                 index += 1_usize
                             }
-                            out.push(SemanticMethod::new(visible, item.target, method.name, params, semantic_call_return_type(method)).with_generics(declaration_generic_names(item.generics)).with_static(is_static)
+                            out.push(SemanticMethod::new(visible, item.target, method.name, params, semantic_call_return_type(method)).with_generics(declaration_generic_names(item.generics)).with_method_generics(declaration_generic_names(method.generics)).with_static(is_static)
                             )
                             let contract = match item.trait_name {
                                 Some(owner) => self.semantic_trait_owner(visible, owner, names, declaration_generic_names(item.generics))
@@ -3549,7 +3556,7 @@ impl for AnalysisDatabase {
                                 index += 1_usize
                             }
                             out.push(SemanticMethod::new(visible, trait_receiver_type(item.name, item.generics), method.name, params,
-                                    semantic_call_return_type(method),).with_generics(declaration_generic_names(item.generics)).with_static(is_static))
+                                    semantic_call_return_type(method),).with_generics(declaration_generic_names(item.generics)).with_method_generics(declaration_generic_names(method.generics)).with_static(is_static))
                         }
                     }
                     _ => {
@@ -3616,6 +3623,7 @@ impl for AnalysisDatabase {
             for edge in source.lightweight.dependencies.all() {
                 targets.push(edge.target)
             }
+            targets.extend(qualified_source_paths(source.lightweight.tokens))
             let mut aggregates = Vec[str]::new()
             for symbol in source.lightweight.symbols {
                 if symbol.kind == 23_usize && symbol.scope == "" {
@@ -3633,7 +3641,6 @@ impl for AnalysisDatabase {
         self.semantic_reachability = Vec[SemanticReachabilityCache]::new()
         ret()
     }
-
     pub fn reachable_semantic_modules(self: mut Self, module_name: str) -> Vec[str] {
         self.ensure_semantic_graph()
         for cached in self.semantic_reachability {
@@ -3869,7 +3876,7 @@ fn semantic_issue111_async_result_contract() -> bool {
         "enum Result[T,E] { Ok(T) Err(E) }\n" +
         "async fn value() -> Result[bool, str] { ret Result[bool, str]::Ok(true) }\n" +
         "async fn generic[T](value:T) -> Result[T, str] { ret Result[T,str]::Ok(value) }\n" +
-        "struct Worker {}\nimpl for Worker { async fn get(self:Self) -> Result[bool,str] { ret await value() } async fn create() -> Result[bool,str] { ret await value() } }\n" +
+        "struct Worker {}\nimpl for Worker { pub async fn get(self:Self) -> Result[bool,str] { ret await value() } pub async fn create() -> Result[bool,str] { ret await value() } }\n" +
         "async fn direct() -> Result[bool,str] { ret await value() }\n" +
         "async fn saved() -> Result[bool,str] { let future = value() let output: Result[bool, str] = await future ret output }\n" +
         "async fn inferred() -> Result[bool,str] { let output = await value() ret output }\n" +
@@ -5172,6 +5179,40 @@ fn semantic_hir_relative_module_import_contract() -> bool {
     }
     ret map.resolve("Token", DefinitionNamespace::Type).is_some()
     && map.resolve("TokenType", DefinitionNamespace::Type).is_some()
+}
+
+/// Collects qualified source references without adding names to import scope.
+/// The same paths drive workspace discovery and semantic reachability.
+pub fn qualified_source_paths(tokens: Vec[Token]) -> Vec[str] {
+    let mut paths = Vec[str]::new()
+    let mut index = 0_usize
+    while index + 2_usize < tokens.len() {
+        let token = tokens.get(index).unwrap_or(Token::new(TokenType::EOF, "", 0, 0))
+        let next = tokens.get(index + 1_usize).unwrap_or(Token::new(TokenType::EOF, "", 0, 0))
+        if token.type != TokenType::IDENTIFIER || next.type != TokenType::SCOPE {
+            index += 1_usize
+            continue
+        }
+        let mut path = token.value
+        index += 2_usize
+        while index < tokens.len() {
+            let part = tokens.get(index).unwrap_or(Token::new(TokenType::EOF, "", 0, 0))
+            if part.type != TokenType::IDENTIFIER {
+                break
+            }
+            path += "::" + part.value
+            index += 1_usize
+            let separator = tokens.get(index).unwrap_or(Token::new(TokenType::EOF, "", 0, 0))
+            if separator.type != TokenType::SCOPE {
+                break
+            }
+            index += 1_usize
+        }
+        if !contains_string(paths, path) {
+            paths.push(path)
+        }
+    }
+    ret paths
 }
 
 // Complete namespace paths in call position, including explicit generic calls.
