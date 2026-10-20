@@ -175,11 +175,10 @@ generic parameters. `true` means pass, `false` means fail.
 in an isolated process. Standalone `tests/*.enq` programs are separate compiler
 inputs and have their own executable caches.
 
-For parallel CI jobs, `encore test --shard 1/4` selects one of four deterministic
-partitions. Indices are one-based, with at most 1024 partitions. Full portable
-test IDs determine membership, so filesystem discovery order does not affect
-the result. `--filter` applies before partition selection; `--list --format json`
-and `--report PATH` describe the same selected set.
+`encore test --jobs N` limits the number of parallel test workers. By default,
+the runner uses the available processor count; an explicit limit cannot exceed
+that count. `--filter` selects tests by their full portable IDs, and
+`--list --format json` and `--report PATH` describe the selected set.
 
 ## Structs And Methods
 
