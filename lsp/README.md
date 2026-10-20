@@ -51,6 +51,10 @@ Current server capabilities:
   missing packages report a recoverable error asking the user to run `encore sync`.
   Documentation rules (`missing-module-docstring` and
   `missing-public-docstring`) are opt-in through `[lint.rules]`.
+  Lint diagnostics reuse the parsed AST from the shared analysis database,
+  including after restoring declaration metadata from the editor cache.
+  Unused imports, bindings and enabled dead-code findings carry the LSP
+  `Unnecessary` tag so editors can dim their ranges.
 - `textDocument/prepareCallHierarchy`, `callHierarchy/outgoingCalls`, `callHierarchy/incomingCalls` for callable symbols.
 - Dynamic watching of `encore.toml` and `encore.lock`; package changes refresh
   workspace indexing and diagnostics without restarting the server.
