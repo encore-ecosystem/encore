@@ -17,7 +17,7 @@ import std::time::perf_counter_ms
 import std::vec::Vec
 
 import ehirlib::{EhirTextBuilder, ModuleBundle, parse_module_bundle_text, suppress_text_builder_output}
-import refrain::frontend::analysis_database::{normalized_import_target, import_binding_names}
+import refrain::frontend::analysis_database::{normalized_import_target, import_binding_names, import_namespace_target}
 import refrain::frontend::control_flow::{block_terminates_flow, statement_terminates_flow, match_arm_terminates_flow, match_stmt_terminates_flow}
 import refrain::frontend::lexer::Lexer
 import refrain::frontend::parser::Parser
@@ -408,6 +408,7 @@ struct FunctionType {
     sending_params: Vec[bool]
     frozen_params: Vec[bool]
     readonly_self: bool
+    has_receiver: bool
     generics: Vec[str]
     is_extern: bool
     is_async: bool
@@ -1663,7 +1664,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                         output_type
                     }
                     ctx_add_function(ctx, fn_item.source_name, fn_item.name, callable_type, function_param_types(fn_item),
-                        function_param_sending(fn_item), function_param_frozen(fn_item), false,
+                        function_param_sending(fn_item), function_param_frozen(fn_item), false, false,
                         generic_param_names(fn_item.generics), fn_item.is_extern,
                         fn_item.is_async, output_type, fn_item.returns_sending, fn_item.returns_frozen,)
                     if fn_item.is_async {
@@ -1714,7 +1715,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                     }
                     ctx_add_function(ctx, method.source_name, callable_name, callable_type,
                         function_param_types_for_owner(method, trait_owner), function_param_sending(method),
-                        function_param_frozen(method), function_receiver_is_readonly(method),
+                        function_param_frozen(method), function_receiver_is_readonly(method), function_has_receiver(method),
                         method_generics, false, method.is_async, output_type,
                         method.returns_sending, method.returns_frozen,)
                     if method.is_async {
@@ -1738,13 +1739,9 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                         }
                         let mut method_name = method.name
                         match impl_item.trait_name {
-                            Some(trait_name) => {
-                                if trait_name == "Pow" && method.name == "op" {
-                                    method_name = "pow"
-                                }
-                                if trait_name == "Div" && method.name == "op" {
-                                    method_name = "div"
-                                }
+                            Some(raw_trait_name) => {
+                                let trait_name = trait_identity_for_source(ctx, impl_item.source_name, raw_trait_name)
+                                method_name = trait_implementation_method(trait_name, method.name)
                             }
                             None => {
                             }
@@ -1770,7 +1767,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                         }
                         ctx_add_function(ctx, method.source_name, callable_name, callable_type, function_param_types_for_owner(method,
                                 impl_item.target,), function_param_sending(method), function_param_frozen(method),
-                            function_receiver_is_readonly(method), method_generics, false, method.is_async, output_type,
+                            function_receiver_is_readonly(method), function_has_receiver(method), method_generics, false, method.is_async, output_type,
                             method.returns_sending, method.returns_frozen,)
                         if method.is_async {
                             remember_async_future_output(ctx, method, callable_type, output_type)
@@ -1860,6 +1857,34 @@ fn index_function_import_aliases(ctx: mut TranslatorContext) ->() {
                                 }
                                 encoded = ctx.function_next.get(index).unwrap_or(0)
                             }
+                            if best == 0_usize {
+                                for target_module in ctx.modules {
+                                    if target_module.module_id != target_id {
+                                        continue
+                                    }
+                                    match exported_function_binding(ctx, target_module, binding.0, 0_usize) {
+                                        Some(bound) => {
+                                            let mut candidate = unsafe {
+                                                encore_strmap_get(ctx.function_heads, bound.name)
+                                            }
+                                            while candidate > 0_usize {
+                                                match ctx.functions.get(candidate - 1_usize) {
+                                                    Some(function) => {
+                                                        if function.source_name == bound.source_name && function.name == bound.name {
+                                                            best = candidate break
+                                                        }
+                                                    }
+                                                    None => {
+                                                    }
+                                                }
+                                                candidate = ctx.function_next.get(candidate - 1_usize).unwrap_or(0_usize)
+                                            }
+                                        }
+                                        None => {
+                                        }
+                                    }
+                                }
+                            }
                             if best > 0 {
                                 unsafe {
                                     encore_strmap_put(ctx.function_heads,
@@ -1877,18 +1902,110 @@ fn index_function_import_aliases(ctx: mut TranslatorContext) ->() {
         }
     }
 }
-
-fn function_import_alias(ctx: mut TranslatorContext, source_name: str, name: str) -> Option[FunctionType] {
-    let encoded = unsafe {
-        encore_strmap_get(ctx.function_heads,
-            function_import_alias_key(source_name, base_type_name(name)),)
-    }
-    if encoded == 0 {
+// Resolve public module exports to a declaration before choosing its overload.
+// Lookup spelling and defining ABI identity remain distinct across facades.
+fn exported_function_binding(ctx: mut TranslatorContext, module: TranslationModule,
+    name: str, depth: usize,) -> Option[FunctionType] {
+    if depth > ctx.modules.len() {
         ret Option[FunctionType]::None
     }
-    ret ctx.functions.get(encoded - 1)
+    for statement in module.ast {
+        match statement {
+            Statement::Function(item) => {
+                if item.name != name {
+                    continue
+                }
+                if !item.is_public {
+                    ret Option[FunctionType]::None
+                }
+                let mut encoded = unsafe {
+                    encore_strmap_get(ctx.function_heads, name)
+                }
+                while encoded > 0_usize {
+                    let function = ctx.functions.get(encoded - 1_usize)
+                    match function {
+                        Some(value) => {
+                            if value.name == name && value.source_name == module.source_name {
+                                ret Option[FunctionType]::Some(value)
+                            }
+                        }
+                        None => {
+                        }
+                    }
+                    encoded = ctx.function_next.get(encoded - 1_usize).unwrap_or(0_usize)
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    let mut found = Option[FunctionType]::None
+    for target in ctx.modules {
+        if !contains_str(module.imports, target.module_id) {
+            continue
+        }
+        let target_path = module_import_path(target.module_id)
+        for statement in module.ast {
+            match statement {
+                Statement::Import(item) => {
+                    let path = translation_import_target(module, item.path)
+                    if !item.is_public || !starts_with(path, target_path + "::") {
+                        continue
+                    }
+                    for binding in import_binding_names(path, target_path) {
+                        if binding.1 != name && binding.0 != "*" {
+                            continue
+                        }
+                        let original = if binding.0 == "*" {
+                            name
+                        } else {
+                            binding.0
+                        }
+                        match exported_function_binding(ctx, target, original, depth + 1_usize) {
+                            Some(value) => {
+                                match found {
+                                    Some(previous) => {
+                                        if previous.source_name != value.source_name || previous.name != value.name {
+                                            ret Option[FunctionType]::None
+                                        }
+                                    }
+                                    None => {
+                                    }
+                                }
+                                found = Option[FunctionType]::Some(value)
+                            }
+                            None => {
+                            }
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    ret found
 }
-
+fn function_import_alias(ctx: mut TranslatorContext, source_name: str, name: str) -> Option[FunctionType] {
+    let base = base_type_name(name)
+    let encoded = unsafe {
+        encore_strmap_get(ctx.function_heads, function_import_alias_key(source_name, base))
+    }
+    if encoded > 0_usize {
+        ret ctx.functions.get(encoded - 1_usize)
+    }
+    let scope = last_scope_index(base)
+    if scope < base.len() {
+        let owner = imported_namespace_path(ctx, source_name, base.slice(0_usize, scope))
+        let member = base.slice(scope + 2_usize, base.len() - scope - 2_usize)
+        for module in ctx.modules {
+            if module_import_path(module.module_id) == owner {
+                ret exported_function_binding(ctx, module, member, 0_usize)
+            }
+        }
+    }
+    ret Option[FunctionType]::None
+}
 fn canonical_source_identity(value: str) -> str {
     let mut out = ""
     let mut index = 0_usize
@@ -2071,13 +2188,44 @@ fn remember_trait(ctx: mut TranslatorContext, name: str, generics: Vec[GenericPa
     ret()
 }
 
-// Trait contracts and dynamic values must resolve to the same declaration-owned
-// identity as nominal data. Keep the pre-unit translator's ABI unchanged.
+// Trait contracts and dynamic values use the same declaration-owned identity
+// as nominal data in both complete validation and per-unit lowering.
 fn trait_identity_for_source(ctx: mut TranslatorContext, source_name: str, name: str) -> str {
-    ret if ctx.stable_abi {
+    let separator = last_scope_index(name)
+    if separator < name.len() {
+        let namespace = imported_namespace_path(ctx, source_name, name.slice(0_usize, separator))
+        let leaf = name.slice(separator + 2_usize, name.len() - separator - 2_usize)
+        for module in ctx.modules {
+            if module_import_path(module.module_id) == namespace {
+                let identity = exported_type_identity(ctx, module, leaf, 0_usize)
+                if identity != "" {
+                    ret identity
+                }
+            }
+        }
+    }
+    ret if ctx.modules.len() > 0_usize {
         qualified_type_for_source(ctx, source_name, name)
     } else {
         name
+    }
+}
+
+// Source traits share `op`, but their implementations need distinct call identities.
+fn trait_implementation_method(trait_name: str, method: str) -> str {
+    if method != "op" {
+        ret method
+    }
+    ret match trait_name {
+        "Pow" => "pow"
+        "Div" => "div"
+        "Eq" => "__encore_op_eq"
+        "Ne" => "__encore_op_ne"
+        "Lt" => "__encore_op_lt"
+        "Le" => "__encore_op_le"
+        "Gt" => "__encore_op_gt"
+        "Ge" => "__encore_op_ge"
+        _ => method
     }
 }
 
@@ -2370,7 +2518,8 @@ fn remember_async_future_output(ctx: mut TranslatorContext, item: FunctionItem, 
         index = index + 1_usize
     }
     let mut trait_args = Vec[str]::new()
-    trait_args.push(output_type)
+    trait_args.push(qualified_generic_type(ctx, item.source_name, output_type,
+        generic_param_names(item.generics)))
     ctx.trait_impls.push(TraitImplType {
             "Future", trait_args, typ, item.generics
         }
@@ -2402,8 +2551,17 @@ fn future_output_type(ctx: mut TranslatorContext, future_type: str, source_name:
     ret "void"
 }
 
+fn function_has_receiver(item: FunctionItem) -> bool {
+    for parameter in item.params {
+        if parameter.name == "self" {
+            ret true
+        }
+    }
+    ret false
+}
+
 fn ctx_add_function(ctx: mut TranslatorContext, source_name: str, name: str, ret_type: str, params: Vec[str],
-    sending_params: Vec[bool], frozen_params: Vec[bool], readonly_self: bool,
+    sending_params: Vec[bool], frozen_params: Vec[bool], readonly_self: bool, has_receiver: bool,
     generics: Vec[str], is_extern: bool, is_async: bool, output_type: str,
     returns_sending: bool, returns_frozen: bool,) ->() {
     let overload_key = source_name + "\n" + name
@@ -2444,7 +2602,7 @@ fn ctx_add_function(ctx: mut TranslatorContext, source_name: str, name: str, ret
         resolved_params.push(qualified_generic_type(ctx, source_name, param, signature_generics))
     }
     ctx.functions.push(FunctionType {
-            name, emitted_name, source_name, resolved_ret_type, resolved_params, sending_params, frozen_params, readonly_self,
+            name, emitted_name, source_name, resolved_ret_type, resolved_params, sending_params, frozen_params, readonly_self, has_receiver,
             generics, is_extern, is_async, resolved_output_type, returns_sending, returns_frozen
         }
         ,
@@ -2531,13 +2689,19 @@ fn qualified_callable_name(ctx: mut TranslatorContext, source_name: str, name: s
     let owner = function_owner_name(name)
     let scope = last_scope_index(owner)
     if scope < owner.byte_len() {
-        let requested_module = owner.slice_bytes(0, scope)
+        let requested_module = imported_namespace_path(ctx, source_name, owner.slice_bytes(0, scope))
         let requested_type = owner.slice_bytes(scope + 2, owner.byte_len() - scope - 2)
         for module in ctx.modules {
             if module_import_path(module.module_id) == requested_module {
-                let resolved = exported_type_identity(ctx, module, requested_type, 0)
+                let resolved = exported_type_identity(ctx, module, base_type_name(requested_type), 0)
                 if resolved != "" {
-                    ret resolved + name.slice_bytes(owner.byte_len(), name.byte_len() - owner.byte_len())
+                    let args = generic_args_from_path(requested_type)
+                    let concrete = if args.is_empty() {
+                        resolved
+                    } else {
+                        resolved + "[" + join_strs(args, ", ") + "]"
+                    }
+                    ret concrete + name.slice_bytes(owner.byte_len(), name.byte_len() - owner.byte_len())
                 }
             }
         }
@@ -2550,7 +2714,6 @@ fn qualified_callable_name(ctx: mut TranslatorContext, source_name: str, name: s
     ret qualified_type_for_source(ctx, source_name, owner) + "::" +
     name.slice_bytes(member_start, name.byte_len() - member_start)
 }
-
 // Follow public re-exports to the declaration, including renamed exports.
 // A facade path is a lookup spelling, never the implementation's ABI name.
 fn exported_type_identity(ctx: mut TranslatorContext, module: TranslationModule,
@@ -3480,7 +3643,23 @@ fn ctx_lookup_function(ctx: mut TranslatorContext, name: str) -> Option[str] {
 
 /// Merge exact/base overload chains in reverse declaration order, just like
 /// the original reverse scan, without retaining every unrelated signature.
+fn function_owner_is_generic(ctx: mut TranslatorContext, name: str) -> bool {
+    if ctx.active_generics.is_empty() {
+        ret false
+    }
+    let owner = function_owner_name(name)
+    for generic in ctx.active_generics {
+        if generic.name == owner {
+            ret true
+        }
+    }
+    ret false
+}
+
 fn function_name_candidates(ctx: mut TranslatorContext, name: str, base: str) -> Vec[usize] {
+    if function_owner_is_generic(ctx, name) {
+        ret Vec[usize]::new()
+    }
     let mut exact = unsafe {
         encore_strmap_get(ctx.function_heads, name)
     }
@@ -3640,8 +3819,39 @@ fn call_placement_matches(expected: str, actual: str) -> bool {
     ret wanted == found ||(wanted == "&" &&(found == "<H>" || found == "<S>"))
 }
 
+// Resolve imported module namespaces for functions and traits, including
+// explicit aliases. A visible sibling declaration is not that namespace.
+fn imported_namespace_path(ctx: mut TranslatorContext, source_name: str, requested: str) -> str {
+    let encoded = lookup_module_source_alias(ctx.module_index, source_name)
+    if encoded == 0 {
+        ret requested
+    }
+    let caller = match ctx.modules.get(encoded - 1) {
+        Some(module) => module
+        None => {
+            ret requested
+        }
+    }
+    let requested = translation_import_target(caller, requested)
+    for statement in caller.ast {
+        match statement {
+            Statement::Import(item) => {
+                let path = translation_import_target(caller, item.path)
+                for target in caller.imports {
+                    let target_path = module_import_path(target)
+                    let expanded = import_namespace_target(path, target_path, requested)
+                    if expanded != "" { ret expanded }
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret requested
+}
 fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, source_name: str, name: str, actual_types:
     Vec[str],) -> Option[FunctionType] {
+    if function_owner_is_generic(ctx, name) { ret Option[FunctionType]::None }
     match function_import_alias(ctx, source_name, name) {
         Some(bound) => {
             let mut encoded = unsafe {
@@ -3670,7 +3880,7 @@ fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, source_name: str, na
     let member = enum_variant_name(base)
     let scope = last_scope_index(base)
     if scope < base.len() {
-        let requested_module = base.slice(0_usize, scope)
+        let requested_module = imported_namespace_path(ctx, source_name, base.slice(0_usize, scope))
         let mut qualified = unsafe {
             encore_strmap_get(ctx.function_heads, member)
         }
@@ -3798,7 +4008,30 @@ fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, source_name: str, na
             }
         }
     }
-    ret Option[FunctionType]::None
+    ret comparison_method_alias(ctx, source_name, name, actual_types)
+}
+
+fn comparison_method_alias(ctx: mut TranslatorContext, source_name: str, name: str,
+    actual_types: Vec[str],) -> Option[FunctionType] {
+    if !ends_with(name, "::op") {
+        ret Option[FunctionType]::None
+    }
+    let prefix = name.slice(0_usize, name.len() - 2_usize) + "__encore_op_"
+    let mut found = Option[FunctionType]::None
+    for function in ctx.functions {
+        if starts_with(function.name, prefix) &&(actual_types.is_empty() || function_matches_args(function, actual_types))
+        && function_visible_from(ctx, source_name, function.source_name, function.name) {
+            match found {
+                Some(_) => {
+                    ret Option[FunctionType]::None
+                }
+                None => {
+                    found = Option[FunctionType]::Some(function)
+                }
+            }
+        }
+    }
+    ret found
 }
 
 fn function_visible_from(ctx: mut TranslatorContext, caller_source: str,
@@ -4225,6 +4458,7 @@ fn ctx_emitted_declaration_name(ctx: mut TranslatorContext, source_name: str, na
 
 fn ctx_lookup_function_param(ctx: mut TranslatorContext, source_name: str, name: str, index: usize, generic_args:
     Vec[str],) -> Option[str] {
+    if function_owner_is_generic(ctx, name) { ret Option[str]::None }
     let base_name = base_type_name(name)
     let mut encoded = unsafe {
         encore_strmap_get(ctx.function_heads, base_name)
@@ -5699,7 +5933,7 @@ fn register_decorator_layer(ctx: mut TranslatorContext, item: FunctionItem, logi
         output_type
     }
     ctx_add_function(ctx, item.source_name, logical_name, callable_type, function_param_types(item),
-        function_param_sending(item), function_param_frozen(item), false,
+        function_param_sending(item), function_param_frozen(item), false, false,
         generic_param_names(item.generics), false, item.is_async,
         output_type, item.returns_sending, item.returns_frozen,)
     if item.is_async {
@@ -6364,7 +6598,7 @@ fn translate_impl(ctx: mut TranslatorContext, item: ImplStmt) -> EhirTextBuilder
     }
     match item.trait_name {
         Option[str]::Some(trait_name) => {
-            let mut trait_ref = trait_name
+            let mut trait_ref = trait_identity_for_source(ctx, item.source_name, trait_name)
             if item.trait_args.len() > 0_usize {
                 let mut args = Vec[str]::new()
                 for arg in item.trait_args {
@@ -6395,15 +6629,21 @@ fn translate_impl(ctx: mut TranslatorContext, item: ImplStmt) -> EhirTextBuilder
             let ret_type = function_ret_type_for_owner(method, item.target)
             let mut emitted_method_name = method.name
             match item.trait_name {
-                Some(trait_name) => {
-                    if trait_name == "Pow" && method.name == "op" {
-                        emitted_method_name = "pow"
-                    }
-                    if trait_name == "Div" && method.name == "op" {
-                        emitted_method_name = "div"
-                    }
+                Some(raw_trait_name) => {
+                    let trait_name = trait_identity_for_source(ctx, item.source_name, raw_trait_name)
+                    emitted_method_name = trait_implementation_method(trait_name, method.name)
                 }
                 None => {
+                }
+            }
+            if starts_with(emitted_method_name, "__encore_op_") {
+                let declaration = ctx_emitted_declaration_name(ctx, method.source_name,
+                    base_type_name(item.target) + "::" + emitted_method_name,
+                    function_param_types_for_owner(method, item.target),
+                    combined_generic_params(item.generics, method.generics),)
+                let scope = last_scope_index(declaration)
+                if scope < declaration.len() {
+                    emitted_method_name = declaration.slice(scope + 2_usize, declaration.len() - scope - 2_usize)
                 }
             }
             if method.decorators.len() > 0_usize {
@@ -6432,7 +6672,7 @@ fn register_decorator_method_layer(ctx: mut TranslatorContext, item: FunctionIte
     }
     ctx_add_function(ctx, item.source_name, logical_name, callable_type,
         function_param_types_for_owner(item, owner), function_param_sending(item),
-        function_param_frozen(item), function_receiver_is_readonly(item),
+        function_param_frozen(item), function_receiver_is_readonly(item), function_has_receiver(item),
         generic_param_names(all_generics), false, item.is_async, output_type,
         item.returns_sending, item.returns_frozen,)
     if item.is_async {
@@ -9318,8 +9558,65 @@ fn lower_binary_expr(ctx: mut TranslatorContext, bin: BinaryExpr, source_name: s
     let mut rhs = load_mutable_value(lower_expr_h_with_hint(ctx, bin.rhs, rhs_hint, prefix + "_rhs",
             idx + 2_usize,), prefix + "_rhs_load_" + Debug::fmt(idx))
 
+    let ordering_trait = if bin.operator == "<" {
+        "Lt"
+    } elif bin.operator == "<=" {
+        "Le"
+    } elif bin.operator == ">" {
+        "Gt"
+    } elif bin.operator == ">=" {
+        "Ge"
+    } else {
+        ""
+    }
+    if ordering_trait != "" && !is_numeric_type(lhs.typ) && lhs.typ != "bool" && lhs.typ != "str"
+    && !ends_with(lhs.typ, "*") && !type_satisfies_trait_bound(ctx, ctx.active_generics, lhs.typ, ordering_trait) {
+        translation_error_at(source_name, line, column, "missing-operator-implementation",
+            "operator '" + bin.operator + "' requires core::ops::" + ordering_trait + "[" + rhs.typ
+            + "] for '" + lhs.typ + "'",)
+    }
+
     code = code.append(lhs.code)
     code = code.append(rhs.code)
+    let comparison_trait = if bin.operator == "==" {
+        "Eq"
+    } elif bin.operator == "!=" {
+        "Ne"
+    } else {
+        ordering_trait
+    }
+    if comparison_trait != "" && !is_numeric_type(lhs.typ) && lhs.typ != "bool" && lhs.typ != "str"
+    && !ends_with(lhs.typ, "*") && type_satisfies_trait_bound(ctx, ctx.active_generics, lhs.typ, comparison_trait) {
+        let method = method_owner_name(lhs.typ) + "::" + trait_implementation_method(comparison_trait, "op")
+        let types = vec![lhs.typ, rhs.typ]
+        let mut callee = method
+        if !function_owner_is_generic(ctx, method) {
+            match ctx_lookup_function_for_args(ctx, source_name, method, types) {
+                Some(function) => {
+                    let arguments = infer_function_generic_args(function, types)
+                    callee = function.emitted_name + if arguments.is_empty() {
+                        ""
+                    } else {
+                        "[" + join_strs(arguments, ", ") + "]"
+                    }
+                }
+                None => {
+                    translation_error_at(source_name, line, column, "missing-operator-implementation",
+                        "operator '" + bin.operator + "' has no matching " + comparison_trait + " implementation for '"
+                        + lhs.typ + "' and '" + rhs.typ + "'",)
+                }
+            }
+        }
+        if lhs_borrowed && ctx_type_needs_ownership(ctx, lhs.typ) {
+            code = code.instr("retain " + lhs.value + ": " + lhs.typ)
+        }
+        if rhs_borrowed && ctx_type_needs_ownership(ctx, rhs.typ) {
+            code = code.instr("retain " + rhs.value + ": " + rhs.typ)
+        }
+        code = code.instr(out_name + ": bool = call " + callee + "(" + lhs.value + ", " + rhs.value + ")")
+        ret LoweredExpr { code, out_name, "bool" }
+    }
+
     if bin.operator == "**" {
         code = code.instr(out_name + ": " + lhs.typ + " = call " + method_owner_name(lhs.typ) + "::pow("
             + lhs.value + ", " + rhs.value + ")")
@@ -9529,7 +9826,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
     if ctx.decorator_callable_name != "" && callee == ctx.decorator_callable_name {
         ret lower_decorator_target_call(ctx, call, source_name, line, column, prefix, idx, spawning)
     }
-    if starts_with(callee, "Self::") && ctx.self_type != "" {
+    if (starts_with(callee, "Self::") || starts_with(callee, "self::")) && ctx.self_type != "" {
         callee = method_owner_name(ctx.self_type) + "::" + callee.slice(6_usize, callee.len() - 6_usize)
     }
     callee = qualified_callable_name(ctx, source_name, callee)
@@ -10305,7 +10602,8 @@ fn resolve_static_trait_call(ctx: mut TranslatorContext, callee: str, arg_types:
     if scope >= callee.len() || arg_types.len() == 0_usize {
         ret callee
     }
-    let method = callee.slice(scope + 2_usize, callee.len() - scope - 2_usize)
+    let method = trait_implementation_method(callee.slice(0_usize, scope),
+        callee.slice(scope + 2_usize, callee.len() - scope - 2_usize),)
     match arg_types.get(0_usize) {
         Option[str]::Some(first_type) => {
             let candidate = base_type_name(canonical_type(first_type)) + "::" + method
@@ -11009,7 +11307,39 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     }
     let receiver_is_frozen = ctx_path_is_frozen(ctx, receiver_root) ||
     ctx_value_is_frozen(ctx, receiver.value)
-    let fn_name = owner + "::" + method_call.method
+    let mut fn_name = owner + "::" + method_call.method
+    if method_call.method == "op" && ctx_lookup_function(ctx, fn_name).is_none() {
+        match comparison_method_alias(ctx, source_name, fn_name, Vec[str]::new()) {
+            Some(function) => { fn_name = function.name }
+            None => {}
+        }
+    }
+    if !starts_with(receiver_value_type, "dyn ") {
+        for candidate in function_name_candidates(ctx, fn_name, base_type_name(fn_name)) {
+            match ctx.functions.get(candidate) {
+                Some(function) => {
+                    if !function.has_receiver {
+                        let path = ExprNode<H> {
+                            Expr::Path(fn_name), line, column, fn_name.len(), source_name
+                        }
+                        let mut generics = generic_args_from_path(receiver.typ)
+                        for generic in method_call.generics {
+                            generics.push(generic)
+                        }
+                        let call = CallExpr { path, generics, method_call.args }
+                        let lowered = lower_call_expr(ctx, call, source_name, line, column, prefix + "_static", idx)
+                        let mut code = receiver.code.append(lowered.code)
+                        if !expr_h_is_borrowed_copy(method_call.receiver) && ctx_type_needs_ownership(ctx, receiver.typ) {
+                            code = code.instr("drop " + receiver.value + ": " + receiver.typ)
+                        }
+                        ret LoweredExpr { code, lowered.value, lowered.typ }
+                    }
+                }
+                None => {
+                }
+            }
+        }
+    }
     reject_runtime_reflection(ctx, fn_name, source_name, line, column)
     let mut concrete_generics = generic_args_from_path(receiver.typ)
     for generic in method_call.generics {
@@ -11017,12 +11347,13 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
                 resolve_async_future_aliases(ctx, source_name, generic),))
     }
     let mut ret_type = "void"
-    match ctx_lookup_function(ctx, fn_name) {
-        Option[str]::Some(found) => {
+    let bound_return = generic_bound_method_return(ctx, owner, method_call.method)
+    match bound_return {
+        Some(found) => {
             ret_type = canonical_type(found)
         }
-        Option[str]::None => {
-            match generic_bound_method_return(ctx, owner, method_call.method) {
+        None => {
+            match ctx_lookup_function(ctx, fn_name) {
                 Some(found) => {
                     ret_type = canonical_type(found)
                 }
@@ -11047,8 +11378,10 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
             }
         }
     }
-    ret_type = direct_generic_hint(specialize_function_return(ctx, fn_name, concrete_generics, ret_type),
-        concrete_generics,)
+    if bound_return.is_none() {
+        ret_type = direct_generic_hint(specialize_function_return(ctx, fn_name, concrete_generics, ret_type),
+            concrete_generics,)
+    }
     let out_name = prefix + "_method_" + Debug::fmt(idx)
     let mut code = receiver.code
     let mut args = Vec[str]::new()

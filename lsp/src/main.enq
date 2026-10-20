@@ -253,7 +253,7 @@ struct SemanticTokenCache {
 }
 
 impl for Document {
-    fn new(uri: str, text: str) -> Self {
+    pub fn new(uri: str, text: str) -> Self {
         ret Self {
             uri, text, FrontendDocument::outline("document", text)
         }
@@ -261,7 +261,7 @@ impl for Document {
 }
 
 impl for ServerState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         ret Self {
             false,
             false,
@@ -298,7 +298,7 @@ impl for ServerState {
         }
     }
 
-    fn upsert_pending_document(self: mut Self, uri: str, text: str) ->() {
+    pub fn upsert_pending_document(self: mut Self, uri: str, text: str) ->() {
         invalidate_navigation_parents(self, uri)
         let outline = FrontendDocument::outline(analysis_module_name(self, uri), text)
         let mut index = 0_usize
@@ -327,7 +327,7 @@ impl for ServerState {
         ret()
     }
 
-    fn remove_document(self: mut Self, uri: str) ->() {
+    pub fn remove_document(self: mut Self, uri: str) ->() {
         self.analysis.remove_module(analysis_module_name(self, uri))
         let mut next = Vec[Document]::new()
         let mut index = 0_usize
@@ -347,7 +347,7 @@ impl for ServerState {
         ret()
     }
 
-    fn document(self: Self, uri: str) -> Option[Document] {
+    pub fn document(self: Self, uri: str) -> Option[Document] {
         let mut index = 0_usize
         while index < self.documents.len() {
             match self.documents.get(index) {
@@ -377,7 +377,7 @@ impl for ServerState {
         ret Option[Document]::None
     }
 
-    fn add_workspace_root(self: mut Self, root: str) ->() {
+    pub fn add_workspace_root(self: mut Self, root: str) ->() {
         if root == "" {
             ret()
         }
@@ -398,7 +398,7 @@ impl for ServerState {
         ret()
     }
 
-    fn upsert_ready_document(self: mut Self, uri: str, text: str, analyzed: FrontendDocument) ->() {
+    pub fn upsert_ready_document(self: mut Self, uri: str, text: str, analyzed: FrontendDocument) ->() {
         let editor = analyzed.editor_view()
         let mut index = 0_usize
         while index < self.documents.len() {
@@ -421,7 +421,7 @@ impl for ServerState {
         ret()
     }
 
-    fn upsert_ready_workspace_document(self: mut Self, uri: str, text: str, analyzed: FrontendDocument) ->() {
+    pub fn upsert_ready_workspace_document(self: mut Self, uri: str, text: str, analyzed: FrontendDocument) ->() {
         let editor = analyzed.editor_view()
         let mut index = 0_usize
         while index < self.workspace_documents.len() {
@@ -2647,7 +2647,7 @@ fn completion_result(state: mut ServerState, params: Json) -> Json {
                     let query_owner = associated_query_owner(state, doc, context.0)
                     match state.analysis.associated_owner_type(doc.uri, query_owner) {
                         Some(receiver) => {
-                            let members = state.analysis.associated_members_for_type(doc.uri, query_owner)
+                            let members = state.analysis.associated_members_for_type_at(doc.uri, query_owner, line, column)
                             let mut items = semantic_member_completion_items(members, context.1)
                             for variant in state.analysis.enum_variant_definitions(doc.uri, query_owner) {
                                 if starts_with(variant.name(), context.1) && !completion_item_exists(items, variant.name()) {
@@ -5426,6 +5426,10 @@ fn module_ref_for_uri(state: ServerState, uri: str) -> Option[ModuleRef] {
 fn analysis_module_name(state: ServerState, uri: str) -> str {
     match module_ref_for_uri(state, uri) {
         Option[ModuleRef]::Some(module) => {
+            if module.path == join_path(module.source_dir, "main.enq") &&
+            file_exists(join_path(module.source_dir, "lib.enq")) {
+                ret module.project_name + "::@main"
+            }
             if module.module_name == "" {
                 ret module.project_name
             }
@@ -6064,7 +6068,7 @@ fn resolved_symbol_in_index(state: mut ServerState, doc: Document, token: Token)
     if owner != "" {
         match state.analysis.associated_owner_type(doc.uri, owner) {
             Some(receiver) => {
-                match state.analysis.associated_member_details(doc.uri, owner, token.value) {
+                match state.analysis.associated_member_details_at(doc.uri, owner, token.value, token.line, token.column) {
                     Some(details) => {
                         ret Option[ResolvedReference]::Some(member_definition_reference(state, details))
                     }
@@ -7703,17 +7707,10 @@ fn document_diagnostics_json(state: mut ServerState, doc: Document,
             // package index above. The semantic database only contains source
             // modules loaded into this LSP process and can therefore be stale
             // immediately after `encore add`.
-            let mut resolved_external_call = false
-            if diagnostic.code == "unresolved-call" {
-                match identifier_at(doc, diagnostic.line, diagnostic.column) {
-                    Some(token) => {
-                        resolved_external_call = imported_symbol_resolves(state, doc, token.value)
-                    }
-                    None => {
-                    }
-                }
-            }
-            if diagnostic.code != "unresolved-import" && !resolved_external_call {
+            // The worker owns a complete project source snapshot. Function
+            // diagnostics are authoritative; completion items from unrelated
+            // imports must not override declaration-based resolution.
+            if diagnostic.code != "unresolved-import" {
                 typed_without_imports.push(diagnostic)
             }
         }
@@ -7721,28 +7718,6 @@ fn document_diagnostics_json(state: mut ServerState, doc: Document,
     }
     ret items
 }
-
-fn imported_symbol_resolves(state: mut ServerState, doc: Document, name: str) -> bool {
-    for edge in doc.analysis.dependencies.all() {
-        let mut target = edge.target
-        if ends_with(target, "::*") {
-            target = target.slice(0_usize, target.len() - 3_usize)
-        } else {
-            let parts = split_scope_path(target)
-            if parts.len() < 2_usize || parts.get(parts.len() - 1_usize).unwrap_or("") != name {
-                continue
-            }
-            target = join_scope_parts(parts, parts.len() - 1_usize)
-        }
-        let mut items = Vec[Json]::new()
-        push_import_symbol_items(state, doc, items, target, name)
-        if completion_item_exists(items, name) {
-            ret true
-        }
-    }
-    ret false
-}
-
 fn tolerant_import_diagnostics(state: mut ServerState, doc: Document) -> Vec[FrontendDiagnostic] {
     let mut diagnostics = Vec[FrontendDiagnostic]::new()
     for edge in doc.analysis.dependencies.all() {

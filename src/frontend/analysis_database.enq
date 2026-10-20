@@ -24,7 +24,7 @@ import refrain::frontend::semantic::check_function_body_with_type_scope
 import refrain::frontend::semantic::semantic_call_return_type
 import refrain::frontend::semantic::specialize_method_type_with_self
 import refrain::frontend::semantic::{SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticField, SemanticMethod, check_function_body, check_module_bodies, check_module_declarations}
-import refrain::frontend::semantic::{SemanticMember, SemanticDependencyKind, semantic_members, semantic_named_members, semantic_associated_members, append_bound_methods}
+import refrain::frontend::semantic::{SemanticMember, SemanticDependencyKind, semantic_members, semantic_named_members, semantic_associated_members, append_bound_methods, semantic_accessible_methods, semantic_same_owner}
 import refrain::frontend::semantic::{SemanticVariant, check_function_body_with_variants, check_module_bodies_with_variants}
 import refrain::frontend::semantic::{check_function_body_with_types, check_function_body_with_scope, check_module_bodies_with_types, check_module_bodies_with_type_scope}
 import refrain::frontend::syntax::SyntaxDocument
@@ -1317,7 +1317,24 @@ impl for AnalysisDatabase {
         if owner_name == "" {
             ret()
         }
-        let requested = import_binding_names(normalized, owner_name)
+        // A bare module path binds a namespace, not all of its declarations.
+        // Only an explicit `::*` import brings those names into local scope.
+        // Otherwise an earlier module import can shadow a selected same-named
+        // type and give semantic checking the wrong nominal identity.
+        let mut requested = import_binding_names(normalized, owner_name)
+        if normalized == owner_name {
+            // A leaf module may export a same-named declaration (core::block
+            // exports block). Select that declaration without importing every
+            // unrelated name from the namespace.
+            let mut leaf = 0_usize
+            let mut index = 0_usize
+            while index + 1_usize < owner_name.len() {
+                if owner_name.slice(index, 2_usize) == "::" { leaf = index + 2_usize }
+                index += 1_usize
+            }
+            let name = owner_name.slice(leaf, owner_name.len() - leaf)
+            requested = vec![(name, name, false)]
+        }
         let mut exported = self.module_exports(owner_name)
         // A directory module is the public namespace of its source fragments.
         // This mirrors normal Encore resolution where
@@ -1800,6 +1817,24 @@ impl for AnalysisDatabase {
         }
 
         let generics = module_generic_names(document.ast)
+        // Resolve namespace calls through the same declaration map as imports.
+        // Type and trait owners are checked by associated-call resolution.
+        for site in qualified_call_sites(document.tokens) {
+            let owner = parent_module_name(site.0)
+            if owner == "Self" || owner == "self" || contains_string(generics, owner)
+            || self.qualified_definition(module_name, owner, DefinitionNamespace::Type).is_some()
+            || self.qualified_definition(module_name, owner, DefinitionNamespace::Trait).is_some() {
+                continue
+            }
+            if self.qualified_definition(module_name, site.0, DefinitionNamespace::Value).is_none() {
+                diagnostics.push(FrontendDiagnostic::new(1_usize, "unresolved-call",
+                        "cannot find function `" + site.0 + "` in this scope",
+                        site.1.line, site.1.column, site.1.value.len(),)
+                    .with_label("", site.1.line, site.1.column, site.1.value.len(),
+                        DiagnosticLabelKind::Primary, "not found in this namespace",))
+            }
+        }
+
         let decorator_callables = module_decorator_callable_names(document.ast)
         let mut known_types = Vec[str]::new()
         let mut known_callables = Vec[str]::new()
@@ -1880,11 +1915,20 @@ impl for AnalysisDatabase {
         }
         let mut index = 0_usize
         let mut previous_type = TokenType::UNKNOWN
+        let mut in_import = false
         let mut in_attribute = false
         let mut attribute_depth = 0_i32
         while index < document.tokens.len() {
             match document.tokens.get(index) {
                 Option[Token]::Some(token) => {
+                    if token.type == TokenType::KW_IMPORT {
+                        in_import = true
+                    } elif token.type != TokenType::IDENTIFIER && token.type != TokenType::SCOPE
+                    && token.type != TokenType::KW_AS && token.type != TokenType::LEFT_BRACE
+                    && token.type != TokenType::RIGHT_BRACE && token.type != TokenType::COMMA
+                    && token.type != TokenType::ASTERISK {
+                        in_import = false
+                    }
                     if token.type == TokenType::HASH {
                         in_attribute = true
                         attribute_depth = 0_i32
@@ -1898,8 +1942,10 @@ impl for AnalysisDatabase {
                     }
                     let type_position = previous_type == TokenType::COLON || previous_type == TokenType::ARROW
                     || previous_type == TokenType::KW_AS || previous_type == TokenType::KW_IMPL
-                    if token.type == TokenType::IDENTIFIER && type_position {
-                        if starts_with_uppercase(token.value) && !builtin_type_name(token.value) && !unsafe
+                    // An import alias is a binding, not the target of an `as` cast.
+                    if token.type == TokenType::IDENTIFIER && type_position && !in_import {
+                        let namespace = document.tokens.get(index + 1_usize).unwrap_or(token).type == TokenType::SCOPE
+                        if !namespace && starts_with_uppercase(token.value) && !builtin_type_name(token.value) && !unsafe
                         {
                             encore_strset_contains(generic_set, token.value)
                         }
@@ -1964,7 +2010,6 @@ impl for AnalysisDatabase {
         let _ignored = module_name
         ret diagnostics
     }
-
     fn unresolved_import_message(self: Self, path: str) -> str {
         let platform = starts_with(path, "core::io") || starts_with(path, "core::os")
         || starts_with(path, "core::process") || starts_with(path, "core::thread")
@@ -1979,7 +2024,7 @@ impl for AnalysisDatabase {
     }
 
     fn import_target_resolves(self: Self, module_name: str, target: str) -> bool {
-        let cleaned = strip_import_alias(self.resolved_import_target(module_name, target))
+        let cleaned = self.resolved_import_target(module_name, strip_import_alias(target))
         for source in self.sources {
             if cleaned == source.module_name {
                 ret true
@@ -2095,6 +2140,26 @@ impl for AnalysisDatabase {
         }
         match selected {
             Some(indexed) => {
+                let document = self.document(module_name).unwrap_or(FrontendDocument::empty())
+                match find_function(document.ast, indexed.symbol.name, indexed.symbol.line, indexed.symbol.column) {
+                    Some(item) => {
+                        match item.body {
+                            Some(block) => {
+                                if line < block.start_line || line > block.end_line ||
+                                (line == block.start_line && column < block.start_column) ||
+                                (line == block.end_line && column > block.end_column) {
+                                    ret Option[SemanticBody]::None
+                                }
+                            }
+                            None => {
+                                ret Option[SemanticBody]::None
+                            }
+                        }
+                    }
+                    None => {
+                        ret Option[SemanticBody]::None
+                    }
+                }
                 match self.cached_semantic_body(indexed) {
                     Some(body) => {
                         ret Option[SemanticBody]::Some(body)
@@ -2123,7 +2188,7 @@ impl for AnalysisDatabase {
             Some(body) => {
                 let receiver = body.canonical_member_receiver_at(line, column)
                 let environment = self.scoped_environment(module_name)
-                let methods = append_bound_methods(environment.methods, body.bound_methods)
+                let methods = semantic_accessible_methods(append_bound_methods(environment.methods, body.bound_methods), body.access_owner)
                 let fields = environment.fields
                 let mut out = Vec[SemanticMember]::new()
                 for member in semantic_named_members(receiver, name, fields, methods) {
@@ -2336,7 +2401,7 @@ impl for AnalysisDatabase {
             out.push(SemanticMethod {
                     method.module_name, scope_type(method.receiver_type, scope, selected, method.generic_names),
                     method.name, params, scope_type(method.ret_type, scope, selected, method.generic_names),
-                    method.signature, method.declaration_receiver, method.generic_names, method.is_static
+                    method.signature, method.declaration_receiver, method.generic_names, method.is_static, method.is_public
                 }
                 ,)
         }
@@ -2369,10 +2434,10 @@ impl for AnalysisDatabase {
     fn check_scoped_body(self: mut Self, indexed: AnalysisSymbol, item: FunctionItem, document: FrontendDocument,
         _callables: Vec[SemanticCallable], _fields: Vec[SemanticField], _methods: Vec[SemanticMethod],) -> SemanticBody {
         let names = self.semantic_type_names(indexed.module_name)
-        let none = Vec[str]::new()
         let environment = self.scoped_environment(indexed.module_name)
         let mut body = check_function_body_with_variants(item, environment.callables, environment.fields,
-            environment.methods, scope_type(semantic_owner_type(indexed.symbol.scope), indexed.module_name, names, none),
+            environment.methods, scope_type(safety_owner(document.ast, item), indexed.module_name, names,
+                declaration_generic_names(function_owner_generics(document.ast, item)),),
             function_owner_generics(document.ast, item), environment.aggregates, indexed.module_name, names, environment.variants,)
         // Signature text alone cannot detect an alias redirected in its declaring
         // module. Track type namespaces read by this body and its used signatures.
@@ -2395,7 +2460,8 @@ impl for AnalysisDatabase {
 
     /// Lists members through the same visibility and specialization queries as checking.
     pub fn members_for_type(self: mut Self, module_name: str, receiver: str) -> Vec[SemanticMember] {
-        ret semantic_members(receiver, self.visible_semantic_fields(module_name), self.visible_semantic_methods(module_name))
+        ret semantic_members(receiver, self.visible_semantic_fields(module_name),
+            semantic_accessible_methods(self.visible_semantic_methods(module_name), ""),)
     }
 
     /// Resolves a member use through the receiver query, preserving the original
@@ -2436,16 +2502,66 @@ impl for AnalysisDatabase {
 
     /// Resolves a type path in its importing scope, preserving declaration ID.
     pub fn qualified_type_definition(self: mut Self, module_name: str, name: str) -> Option[HirDefinition] {
+        ret self.qualified_definition(module_name, name, DefinitionNamespace::Type)
+    }
+
+    fn imported_namespace(self: mut Self, scope: str, requested: str) -> str {
+        self.ensure_semantic_graph()
+        let document = self.document(scope).unwrap_or(FrontendDocument::empty())
+        for statement in document.ast {
+            match statement {
+                Statement::Import(item) => {
+                    let path = normalized_import_target(scope, item.path)
+                    for resolution in self.import_resolutions {
+                        if resolution.owner != scope {
+                            continue
+                        }
+                        for edge in resolution.targets {
+                            let expanded = import_namespace_target(item.path, edge.target, requested)
+                            if expanded != "" {
+                                ret self.resolved_import_target(scope, expanded)
+                            }
+                        }
+                    }
+                    for source in self.semantic_graph {
+                        let expanded = import_namespace_target(path, source.module_name, requested)
+                        if expanded != "" {
+                            ret self.resolved_import_target(scope, expanded)
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        ret requested
+    }
+
+    fn qualified_definition(self: mut Self, module_name: str, name: str, namespace: DefinitionNamespace) -> Option[HirDefinition] {
         if !contains_string_value(name, "::") {
-            ret self.module_definition(module_name, name, DefinitionNamespace::Type)
+            ret self.module_definition(module_name, name, namespace)
         }
         let normalized = self.resolved_import_target(module_name, name)
-        let owner = parent_module_name(normalized)
-        if owner == "" {
+        let original_owner = parent_module_name(normalized)
+        if original_owner == "" {
             ret Option[HirDefinition]::None
         }
-        let leaf = normalized.slice(owner.len() + 2_usize, normalized.len() - owner.len() - 2_usize)
-        match self.module_definition(owner, leaf, DefinitionNamespace::Type) {
+        let leaf = normalized.slice(original_owner.len() + 2_usize, normalized.len() - original_owner.len() - 2_usize)
+        match self.module_definition(original_owner, leaf, namespace) {
+            Some(definition) => {
+                if original_owner == module_name || definition.is_public() {
+                    ret Option[HirDefinition]::Some(definition)
+                }
+                ret Option[HirDefinition]::None
+            }
+            None => {
+            }
+        }
+        let owner = self.imported_namespace(module_name, original_owner)
+        if owner == original_owner {
+            ret Option[HirDefinition]::None
+        }
+        match self.module_definition(owner, leaf, namespace) {
             Some(definition) => {
                 if owner == module_name || definition.is_public() {
                     ret Option[HirDefinition]::Some(definition)
@@ -2549,7 +2665,7 @@ impl for AnalysisDatabase {
         ret TypeId::named(key, spelling)
     }
 
-    fn associated_members(self: mut Self, module_name: str, owner: str, name: str) -> Vec[SemanticMember] {
+    fn associated_members(self: mut Self, module_name: str, owner: str, name: str, access_owner: str) -> Vec[SemanticMember] {
         let mut end = 0_usize
         while end < owner.len() && owner.slice(end, 1_usize) != "[" {
             end += 1_usize
@@ -2578,9 +2694,7 @@ impl for AnalysisDatabase {
                     Some(map) => {
                         match map.definition(id) {
                             Some(declaration) => {
-                                if declaration.is_public() || declaration.source_name() == self.module_source_name(module_name) {
-                                    available.push(method)
-                                }
+                                available.push(method)
                             }
                             None => {
                             }
@@ -2592,6 +2706,7 @@ impl for AnalysisDatabase {
             }
         }
         let mut methods = Vec[SemanticMethod]::new()
+        let names = self.semantic_type_names(module_name)
         for method in available {
             if !method.is_static ||(name != "" && method.name != name) {
                 continue
@@ -2601,6 +2716,10 @@ impl for AnalysisDatabase {
                 base_end += 1_usize
             }
             let base = method.receiver_type.slice(0_usize, base_end)
+            if !method.is_public && !semantic_same_owner(
+                scope_type(method.receiver_type, method.module_name, names, method.generic_names), access_owner,) {
+                continue
+            }
             match self.qualified_type_definition(method.module_name, base) {
                 Some(target) => {
                     if target.typ().key() == identity {
@@ -2608,7 +2727,7 @@ impl for AnalysisDatabase {
                         methods.push(SemanticMethod {
                                 method.module_name, pattern, method.name,
                                 method.params, method.ret_type, method.signature, method.declaration_receiver,
-                                method.generic_names, method.is_static
+                                method.generic_names, method.is_static, method.is_public
                             }
                             ,)
                     }
@@ -2621,6 +2740,17 @@ impl for AnalysisDatabase {
     }
 
     pub fn associated_member_details(self: mut Self, module_name: str, receiver: str, name: str) -> Option[MemberDetails] {
+        ret self.associated_member_details_in_scope(module_name, receiver, name, "")
+    }
+
+    pub fn associated_member_details_at(self: mut Self, module_name: str, receiver: str, name: str,
+        line: usize, column: usize,) -> Option[MemberDetails] {
+        let owner = self.member_access_owner_at(module_name, line, column)
+        ret self.associated_member_details_in_scope(module_name, receiver, name, owner)
+    }
+
+    fn associated_member_details_in_scope(self: mut Self, module_name: str, receiver: str,
+        name: str, access_owner: str,) -> Option[MemberDetails] {
         match self.enum_variant_definition(module_name, receiver, name) {
             Some(definition) => {
                 let document = self.document(definition.module_name()).unwrap_or(FrontendDocument::empty())
@@ -2629,7 +2759,7 @@ impl for AnalysisDatabase {
             None => {
             }
         }
-        let members = self.associated_members(module_name, receiver, name)
+        let members = self.associated_members(module_name, receiver, name, access_owner)
         match self.resolve_member_definitions(members, name) {
             Some(resolved) => {
                 let document = self.document(resolved.0.module_name()).unwrap_or(FrontendDocument::empty())
@@ -2643,7 +2773,24 @@ impl for AnalysisDatabase {
 
     /// Lists specialized static members for an associated completion query.
     pub fn associated_members_for_type(self: mut Self, module_name: str, receiver: str) -> Vec[SemanticMember] {
-        ret self.associated_members(module_name, receiver, "")
+        ret self.associated_members(module_name, receiver, "", "")
+    }
+
+    pub fn associated_members_for_type_at(self: mut Self, module_name: str, receiver: str,
+        line: usize, column: usize,) -> Vec[SemanticMember] {
+        let owner = self.member_access_owner_at(module_name, line, column)
+        ret self.associated_members(module_name, receiver, "", owner)
+    }
+
+    fn member_access_owner_at(self: mut Self, module_name: str, line: usize, column: usize) -> str {
+        match self.semantic_body_at(module_name, line, column) {
+            Some(body) => {
+                ret body.access_owner
+            }
+            None => {
+                ret ""
+            }
+        }
     }
 
     /// Identity-only associated query for references and highlights.
@@ -2655,7 +2802,7 @@ impl for AnalysisDatabase {
             None => {
             }
         }
-        let members = self.associated_members(module_name, receiver, name)
+        let members = self.associated_members(module_name, receiver, name, "")
         match self.resolve_member_definitions(members, name) {
             Some(resolved) => {
                 ret Option[HirDefinition]::Some(resolved.0)
@@ -2962,7 +3109,7 @@ impl for AnalysisDatabase {
                 continue
             }
             if dependency.kind == SemanticDependencyKind::FunctionBinding {
-                match self.module_definition(dependency.module_name, dependency.name, DefinitionNamespace::Value) {
+                match self.qualified_definition(dependency.module_name, dependency.name, DefinitionNamespace::Value) {
                     Some(definition) => {
                         if definition.id().value() != dependency.signature {
                             ret false
@@ -3023,7 +3170,6 @@ impl for AnalysisDatabase {
         }
         ret true
     }
-
     fn lookup_scope_fingerprint(self: mut Self, module_name: str) -> u64 {
         let mut identity = ""
         for visible in self.reachable_semantic_modules(module_name) {
@@ -3074,37 +3220,9 @@ impl for AnalysisDatabase {
     }
 
     fn semantic_method_signature(self: mut Self, module_name: str, name: str) -> Option[u64] {
-        let document = self.document(module_name).unwrap_or(FrontendDocument::empty())
-        for statement in document.ast {
-            let mut owner = ""
-            let mut methods = Vec[FunctionItem]::new()
-            let mut generics = Vec[str]::new()
-            match statement {
-                Statement::Impl(item) => {
-                    owner = item.target methods = item.methods generics = declaration_generic_names(item.generics)
-                }
-                Statement::Trait(item) => {
-                    owner = trait_receiver_type(item.name, item.generics) methods = item.methods generics = declaration_generic_names(item.generics)
-                }
-                _ => {
-                    continue
-                }
-            }
-            for method in methods {
-                if owner + "." + method.name != name {
-                    continue
-                }
-                let is_static = !function_has_receiver(method)
-                let mut params = Vec[str]::new()
-                let mut index = 0_usize
-                for param in method.params {
-                    if is_static || index > 0_usize {
-                        params.push(param.typ.unwrap_or(""))
-                    }
-                    index += 1_usize
-                }
-                ret Option[u64]::Some(SemanticMethod::new(module_name, owner, method.name,
-                        params, semantic_call_return_type(method),).with_generics(generics).with_static(is_static).signature)
+        for method in self.visible_semantic_methods(module_name) {
+            if method.module_name == module_name && method.declaration_receiver + "." + method.name == name {
+                ret Option[u64]::Some(method.signature)
             }
         }
         ret Option[u64]::None
@@ -3200,14 +3318,59 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        // Qualified names keep their source spelling while retaining the actual
+        // declaration identity, including aliases and public re-exports.
+        let caller = self.document(module_name).unwrap_or(FrontendDocument::empty())
+        let mut qualified_names = Vec[str]::new()
+        for site in qualified_call_sites(caller.tokens) {
+            if contains_string(qualified_names, site.0) {
+                continue
+            }
+            qualified_names.push(site.0)
+            match self.qualified_definition(module_name, site.0, DefinitionNamespace::Value) {
+                Some(definition) => {
+                    let origin = self.document(definition.module_name()).unwrap_or(FrontendDocument::empty())
+                    let ordinals = encore_strmap_new()
+                    let mut declared_name = ""
+                    for statement in origin.ast {
+                        match statement {
+                            Statement::Function(item) => {
+                                let ordinal = encore_strmap_get(ordinals, item.name)
+                                encore_strmap_put(ordinals, item.name, ordinal + 1_usize)
+                                if definition_id(definition.module_name(), "", "function", item.name, ordinal).key()
+                                == definition.id().key() {
+                                    declared_name = item.name
+                                }
+                            }
+                            _ => {
+                            }
+                        }
+                    }
+                    encore_strmap_free(ordinals)
+                    for statement in origin.ast {
+                        match statement {
+                            Statement::Function(item) => {
+                                if item.name == declared_name {
+                                    out.push(callable_from_function(definition.module_name(), item)
+                                        .in_scope(site.0, module_name, definition.id().value()))
+                                }
+                            }
+                            _ => {
+                            }
+                        }
+                    }
+                }
+                None => {
+                }
+            }
+        }
         encore_strset_free(origins)
         encore_strset_free(local_names)
         encore_strmap_free(selected)
         encore_strmap_free(callable_ids)
         ret out
     }
-
-    fn visible_semantic_aggregates(self: mut Self, module_name: str) -> Vec[str] {
+    pub fn visible_semantic_aggregates(self: mut Self, module_name: str) -> Vec[str] {
         let mut names = Vec[str]::new()
         for visible in self.reachable_semantic_modules(module_name) {
             for entry in self.semantic_graph {
@@ -3326,9 +3489,26 @@ impl for AnalysisDatabase {
         ret values
     }
 
+    fn semantic_trait_owner(self: mut Self, scope: str, owner: str, names: Vec[TypeNameBinding], generics: Vec[str]) -> str {
+        if contains_string_value(owner, "::") {
+            match self.qualified_definition(scope, owner, DefinitionNamespace::Trait) {
+                Some(definition) => {
+                    ret self.intern_nominal_type(definition.typ())
+                }
+                None => {
+                }
+            }
+        }
+        ret scope_type(owner, scope, names, generics)
+    }
+
     fn collect_semantic_methods(self: mut Self, module_name: str) -> Vec[SemanticMethod] {
         let mut out = Vec[SemanticMethod]::new()
         let mut trait_edges = Vec[(str, str, Vec[str])]::new()
+        let mut contracts = Vec[(str, str)]::new()
+        let mut contract_edges = Vec[(str, str)]::new()
+        let mut visibility = Vec[(usize, bool, str)]::new()
+        let names = self.semantic_type_names(module_name)
         // Inherent methods belong to their receiver type, not to the lexical
         // import scope of the call site. Once a type is reachable, its impl
         // methods must remain discoverable even when the type flowed through
@@ -3343,9 +3523,6 @@ impl for AnalysisDatabase {
                 match statement {
                     Statement::Impl(item) => {
                         for method in item.methods {
-                            if visible != module_name && !method.is_public {
-                                continue
-                            }
                             let is_static = !function_has_receiver(method)
                             let mut params = Vec[str]::new()
                             let mut index = 0_usize
@@ -3355,11 +3532,22 @@ impl for AnalysisDatabase {
                                 }
                                 index += 1_usize
                             }
-                            out.push(SemanticMethod::new(visible, item.target, method.name, params, semantic_call_return_type(method)).with_generics(declaration_generic_names(item.generics)).with_static(is_static))
+                            out.push(SemanticMethod::new(visible, item.target, method.name, params, semantic_call_return_type(method)).with_generics(declaration_generic_names(item.generics)).with_static(is_static)
+                            )
+                            let contract = match item.trait_name {
+                                Some(owner) => self.semantic_trait_owner(visible, owner, names, declaration_generic_names(item.generics))
+                                None => ""
+                            }
+                            visibility.push((out.len() - 1_usize, method.is_public, contract))
                         }
                     }
                     Statement::Trait(item) => {
+                        let owner = scope_type(item.name, visible, names, declaration_generic_names(item.generics))
+                        for method in item.methods {
+                            contracts.push((owner, method.name))
+                        }
                         for base in item.bases {
+                            contract_edges.push((owner, scope_type(base, visible, names, declaration_generic_names(item.generics))))
                             trait_edges.push((trait_receiver_type(item.name, item.generics), "dyn " + base, declaration_generic_names(item.generics)))
                         }
                         for method in item.methods {
@@ -3378,6 +3566,16 @@ impl for AnalysisDatabase {
                     }
                     _ => {
                     }
+                }
+            }
+        }
+        for entry in visibility {
+            match out.get(entry.0) {
+                Some(method) => {
+                    let is_public = entry.1 || trait_contract_has_member(contracts, contract_edges, entry.2, method.name)
+                    out.set(entry.0, method.with_visibility(is_public))
+                }
+                None => {
                 }
             }
         }
@@ -3448,7 +3646,7 @@ impl for AnalysisDatabase {
         ret()
     }
 
-    fn reachable_semantic_modules(self: mut Self, module_name: str) -> Vec[str] {
+    pub fn reachable_semantic_modules(self: mut Self, module_name: str) -> Vec[str] {
         self.ensure_semantic_graph()
         for cached in self.semantic_reachability {
             if cached.module_name == module_name && cached.revision == self.revision {
@@ -3482,7 +3680,7 @@ impl for AnalysisDatabase {
         for source in self.semantic_graph {
             if source.module_name == module_name {
                 for target in source.targets {
-                    let normalized = self.resolved_import_target(module_name, target)
+                    let normalized = self.resolved_import_target(module_name, strip_import_alias(target))
                     for candidate in self.semantic_graph {
                         if normalized == candidate.module_name || starts_with(normalized, candidate.module_name
                             + "::",) {
@@ -3769,6 +3967,38 @@ fn trait_receiver_type(name: str, generics: Vec[GenericParam]) -> str {
     ret receiver + "]"
 }
 
+fn trait_contract_has_member(contracts: Vec[(str, str)], edges: Vec[(str, str)], owner: str, name: str) -> bool {
+    if owner == "" {
+        ret false
+    }
+    let mut pending = vec![owner]
+    let mut index = 0_usize
+    while index < pending.len() {
+        let wanted = "" + pending.get(index).unwrap_or("")
+        for contract in contracts {
+            if contract.1 == name && semantic_same_owner(contract.0, wanted) {
+                ret true
+            }
+        }
+        for edge in edges {
+            if !semantic_same_owner(edge.0, wanted) {
+                continue
+            }
+            let mut seen = false
+            for previous in pending {
+                if semantic_same_owner(previous, edge.1) {
+                    seen = true break
+                }
+            }
+            if !seen {
+                pending.push(edge.1)
+            }
+        }
+        index += 1_usize
+    }
+    ret false
+}
+
 fn function_owner_generics(ast: Vec[Statement], selected: FunctionItem) -> Vec[GenericParam] {
     for statement in ast {
         let mut methods = Vec[FunctionItem]::new()
@@ -3817,38 +4047,6 @@ fn safety_owner(ast: Vec[Statement], selected: FunctionItem) -> str {
     ret ""
 }
 
-fn semantic_owner_type(scope: str) -> str {
-    let mut owner_scope = scope
-    let mut separator = 0_usize
-    let mut index = 0_usize
-    while index + 1_usize < owner_scope.len() {
-        if owner_scope.slice(index, 2_usize) == "::" {
-            separator = index + 2_usize
-        }
-        index += 1_usize
-    }
-    if separator > 0_usize {
-        owner_scope = owner_scope.slice(separator, owner_scope.len() - separator)
-    }
-    if !starts_with(owner_scope, "impl") {
-        ret ""
-    }
-    let mut for_index = 0_usize
-    index = 4_usize
-    while index + 3_usize <= owner_scope.len() {
-        if owner_scope.slice(index, 3_usize) == "for" {
-            for_index = index + 3_usize
-        }
-        index += 1_usize
-    }
-    if for_index > 0_usize && for_index < owner_scope.len() {
-        ret owner_scope.slice(for_index, owner_scope.len() - for_index)
-    }
-    if owner_scope.len() > 4_usize {
-        ret owner_scope.slice(4_usize, owner_scope.len() - 4_usize)
-    }
-    ret ""
-}
 
 fn find_function(ast: Vec[Statement], name: str, line: usize, column: usize) -> Option[FunctionItem]
 {
@@ -4283,6 +4481,51 @@ fn parent_module_name(module_name: str) -> str {
     ret ""
 }
 
+/// Expands a module namespace bound by a bare or aliased import.
+/// Empty means this import binds no matching namespace.
+pub fn import_namespace_target(path: str, target: str, requested: str) -> str {
+    let mut end = target.len()
+    let mut separator = target.len()
+    while end >= 2_usize {
+        if target.slice(end - 2_usize, 2_usize) == "::" {
+            separator = end - 2_usize break
+        }
+        end -= 1_usize
+    }
+    let target_leaf = if separator < target.len() {
+        target.slice(separator + 2_usize, target.len() - separator - 2_usize)
+    } else {
+        target
+    }
+    let mut leaf = if path == target {
+        target_leaf
+    } else {
+        ""
+    }
+    let alias = import_binding(path)
+    if alias.2 && alias.0 == target {
+        leaf = alias.1
+    }
+    if separator < target.len() {
+        let parent = target.slice(0_usize, separator)
+        if starts_with(path, parent + "::") {
+            for binding in import_binding_names(path, parent) {
+                if binding.0 == target_leaf {
+                    leaf = binding.1
+                }
+            }
+        }
+    }
+    if leaf != "" {
+        if requested == leaf {
+            ret target
+        }
+        if starts_with(requested, leaf + "::") {
+            ret target + requested.slice(leaf.len(), requested.len() - leaf.len())
+        }
+    }
+    ret ""
+}
 /// Returns selected declarations, local names, and explicit-alias flags.
 /// Shared by semantic scope construction and compiler call lowering.
 pub fn import_binding_names(path: str, owner: str) -> Vec[(str, str, bool)] {
@@ -4942,4 +5185,49 @@ fn semantic_hir_relative_module_import_contract() -> bool {
     }
     ret map.resolve("Token", DefinitionNamespace::Type).is_some()
     && map.resolve("TokenType", DefinitionNamespace::Type).is_some()
+}
+
+// Complete namespace paths in call position, including explicit generic calls.
+// The terminal token provides the diagnostic span rather than a later binding.
+fn qualified_call_sites(tokens: Vec[Token]) -> Vec[(str, Token)] {
+    let mut out = Vec[(str, Token)]::new()
+    let fallback = Token::new(TokenType::EOF, "", 0_usize, 0_usize)
+    let mut index = 0_usize
+    while index < tokens.len() {
+        let first = tokens.get(index).unwrap_or(fallback)
+        let previous = if index == 0_usize {
+            fallback
+        } else {
+            tokens.get(index - 1_usize).unwrap_or(fallback)
+        }
+        if first.type != TokenType::IDENTIFIER || previous.type == TokenType::SCOPE || previous.type == TokenType::DOT {
+            index += 1_usize continue
+        }
+        let mut end = index
+        let mut path = first.value
+        while tokens.get(end + 1_usize).unwrap_or(fallback).type == TokenType::SCOPE
+        && tokens.get(end + 2_usize).unwrap_or(fallback).type == TokenType::IDENTIFIER {
+            end += 2_usize
+            path += "::" + tokens.get(end).unwrap_or(fallback).value
+        }
+        let mut after = end + 1_usize
+        if tokens.get(after).unwrap_or(fallback).type == TokenType::LEFT_BRACKET {
+            let mut depth = 1_usize
+            after += 1_usize
+            while after < tokens.len() && depth > 0_usize {
+                let kind = tokens.get(after).unwrap_or(fallback).type
+                if kind == TokenType::LEFT_BRACKET {
+                    depth += 1_usize
+                } elif kind == TokenType::RIGHT_BRACKET {
+                    depth -= 1_usize
+                }
+                after += 1_usize
+            }
+        }
+        if end > index && tokens.get(after).unwrap_or(fallback).type == TokenType::LEFT_PAREN {
+            out.push((path, tokens.get(end).unwrap_or(fallback)))
+        }
+        index = end + 1_usize
+    }
+    ret out
 }

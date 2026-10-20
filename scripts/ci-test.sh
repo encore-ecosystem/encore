@@ -28,6 +28,13 @@ case "$(uname -s)" in
     # The Encore subprocess API takes native paths, not Git Bash mount paths.
     export ENCORE_TEST_COMPILER="$(cygpath -m "$compiler")"
     export ENCORE_TEST_REPOSITORY="$(cygpath -m "$repository")"
+    args_json=$(jq -cn --args '$ARGS.positional' -- "${@:2}")
+    supervisor=$(cygpath -m "$repository/scripts/ci-test-windows.ps1")
+    report=$(cygpath -m "$repository/target/test-report.json")
+    (cd "$fixture" && MSYS2_ARG_CONV_EXCL='*' pwsh -NoProfile -NonInteractive \
+      -File "$supervisor" -Compiler "$ENCORE_TEST_COMPILER" \
+      -Report "$report" -ArgumentsJson "$args_json")
+    exit $?
     ;;
 esac
 (cd "$fixture" && "$compiler" test --report "$repository/target/test-report.json" "${@:2}")

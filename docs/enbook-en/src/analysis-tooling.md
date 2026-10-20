@@ -214,6 +214,15 @@ reorder-imports = true
 format-docstrings = true
 ```
 
+With `reorder-imports = true` (the default), imports are grouped as `core`,
+`std`, external packages, then local `mod`/`refrain` modules, with one blank line
+between groups. Paths and selected names are sorted lexicographically. Imports
+from the same immediate parent are merged into `{...}`; aliases and duplicates
+are retained. Glob imports stay separate, and `import` is never merged with
+`pub import`. Comments and attributes are barriers: attached declarations are
+not moved. Setting `reorder-imports = false` disables these transformations.
+CLI formatting and LSP formatting use this same policy.
+
 Unknown keys, rule names, and values are errors. Command-line lint levels
 override manifest defaults. LSP and direct IDE clients receive the normalized
 configuration from the project layer rather than parsing TOML themselves.

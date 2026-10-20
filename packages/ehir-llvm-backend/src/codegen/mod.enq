@@ -388,12 +388,42 @@ pub fn emit_program_support(context: frozen ModuleBundle, requirements: frozen V
     let support = build_support_ir(directives, expanded, concrete, equality)
     let mut support_directives = Vec[Directive]::new()
     for directive in directives {
-        support_directives.push(clone_codegen_directive(directive))
+        support_directives.push(support_codegen_declaration(directive))
     }
     let module = make_module("__encore_program_support", support_directives)
     let lowered = lower_with_precomputed_analysis(module, concrete, support, true)
     let ir = "target triple = \"" + triple + "\"\n\n" + lowered.ir
     ret EmittedIrModule { "__encore_program_support", ir, ir.byte_len() }
+}
+
+// Templates retain concrete impl bodies for specialization, but ordinary
+// definitions still belong to their package CGU. Support emits declarations
+// for those originals and defines only the requested specialized symbols.
+fn support_codegen_declaration(directive: frozen Directive) -> Directive {
+    match directive {
+        Directive::Function(function) => {
+            if function.generics.len() == 0_usize {
+                ret Directive::Function(extern_fn_item("" + function.name, clone_codegen_types(function.generics),
+                        clone_codegen_params(function.params), clone_type(function.ret_type),))
+            }
+        }
+        Directive::Impl(item) => {
+            let mut methods = Vec[FnDirective]::new()
+            for method in item.methods {
+                if item.generics.len() == 0_usize && method.generics.len() == 0_usize {
+                    methods.push(extern_fn_item("" + method.name, clone_codegen_types(method.generics),
+                            clone_codegen_params(method.params), clone_type(method.ret_type),))
+                } else {
+                    methods.push(clone_codegen_function(method))
+                }
+            }
+            ret impl_directive(clone_codegen_types(item.generics), "" + item.trait_name,
+                clone_codegen_types(item.trait_args), clone_type(item.for_type), methods,)
+        }
+        _ => {
+        }
+    }
+    ret clone_codegen_directive(directive)
 }
 
 fn install_codegen_target(triple: str, pointer_width: usize) ->() {
@@ -428,20 +458,27 @@ fn unit_support_declarations(directives: frozen Vec[Directive], calls: frozen Ve
                 for item in calls {
                     if generic_function_name_matches(function.name, item.name)
                     && function.generics.len() == item.args.len() {
-                        emitted = unit_generic_declaration(builder, seen, emitted, function, function.generics, item)
+                        emitted = unit_generic_declaration(builder, seen, emitted, function, function.generics, item.args, item)
                     }
                 }
             }
             Directive::Impl(item) => {
                 for method in item.methods {
                     let params = combined_impl_method_generics(item.generics, method.generics)
-                    if params.len() == 0 {
+                    if params.len() == 0 && item.for_type.generics.len() == 0 {
                         continue
                     }
                     let name = item.for_type.name + "::" + method.name
                     for site in calls {
-                        if site.name == name && site.args.len() == params.len() {
-                            emitted = unit_generic_declaration(builder, seen, emitted, method, params, site)
+                        if site.name == name {
+                            match bind_impl_method(item.for_type, item.generics, method.generics, site.args) {
+                                Some(binding) => {
+                                    emitted = unit_generic_declaration(builder, seen, emitted, method,
+                                        binding.params, binding.args, site,)
+                                }
+                                None => {
+                                }
+                            }
                         }
                     }
                 }
@@ -525,13 +562,13 @@ fn unit_support_declarations(directives: frozen Vec[Directive], calls: frozen Ve
 }
 
 fn unit_generic_declaration(builder: usize, seen: usize, emitted: bool, function: frozen FnDirective,
-    params: frozen Vec[Type], site: frozen GenericCall,) -> bool {
+    params: frozen Vec[Type], args: frozen Vec[Type], site: frozen GenericCall,) -> bool {
     let mut arguments = Vec[Parameter]::new()
     for parameter in function.params {
-        arguments.push(param(parameter.name, substitute_generic_type(parameter.typ, params, site.args)))
+        arguments.push(param(parameter.name, substitute_generic_type(parameter.typ, params, args)))
     }
     let declaration = llvm_declare_fn(generic_symbol(site.name, site.args),
-        lower_type(substitute_generic_type(function.ret_type, params, site.args)),
+        lower_type(substitute_generic_type(function.ret_type, params, args)),
         lower_params(arguments), Vec[LLVMBasicBlock]::new(),)
     ret append_unique_functions(builder, vec_singleton(declaration), seen, emitted, 0)
 }
@@ -2417,18 +2454,13 @@ fn expand_generic_call_in_directive(out: mut Vec[GenericCall], seen: usize,
                 match item.methods.get(method_index) {
                     Some(method) => {
                         let full_name = item.for_type.name + "::" + method.name
-                        if method.generics.len() == 0_usize {
-                            if full_name == name && item.generics.len() == args.len() {
-                                collect_nested_generic_calls(out, seen, method, item.generics, args)
-                            }
-                        } elif item.generics.len() == 0_usize {
-                            if full_name == name && method.generics.len() == args.len() {
-                                collect_nested_generic_calls(out, seen, method, method.generics, args)
-                            }
-                        } else {
-                            let params = combined_impl_method_generics(item.generics, method.generics)
-                            if full_name == name && params.len() == args.len() {
-                                collect_nested_generic_calls(out, seen, method, params, args)
+                        if full_name == name {
+                            match bind_impl_method(item.for_type, item.generics, method.generics, args) {
+                                Some(binding) => {
+                                    collect_nested_generic_calls(out, seen, method, binding.params, binding.args)
+                                }
+                                None => {
+                                }
                             }
                         }
                     }
@@ -2566,32 +2598,18 @@ fn append_lowered_generic_functions(builder: usize, directives: frozen Vec[Direc
             Directive::Impl(item) => {
                 for method in item.methods {
                     let full_name = item.for_type.name + "::" + method.name
-                    if method.generics.len() == 0_usize && item.generics.len() > 0_usize {
-                        for call_data in calls {
-                            if call_data.name == full_name && call_data.args.len() == item.generics.len() {
-                                let specialized = specialize_function_with_params(method,
-                                    item.generics, call_data.args, full_name,)
-                                any = append_specialized_generic_function(builder,
-                                    declaration_builder, seen, any, specialized,)
-                            }
-                        }
-                    } elif item.generics.len() == 0_usize && method.generics.len() > 0_usize {
-                        for call_data in calls {
-                            if call_data.name == full_name && call_data.args.len() == method.generics.len() {
-                                let specialized = specialize_function_with_params(method,
-                                    method.generics, call_data.args, full_name,)
-                                any = append_specialized_generic_function(builder,
-                                    declaration_builder, seen, any, specialized,)
-                            }
-                        }
-                    } elif item.generics.len() > 0_usize && method.generics.len() > 0_usize {
-                        let params = combined_impl_method_generics(item.generics, method.generics)
-                        for call_data in calls {
-                            if call_data.name == full_name && call_data.args.len() == params.len() {
-                                let specialized = specialize_function_with_params(method,
-                                    params, call_data.args, full_name,)
-                                any = append_specialized_generic_function(builder,
-                                    declaration_builder, seen, any, specialized,)
+                    if item.generics.len() == 0 && item.for_type.generics.len() == 0 && method.generics.len() == 0 {
+                        continue
+                    }
+                    for call_data in calls {
+                        if call_data.name == full_name {
+                            match specialize_impl_method(method, item.for_type, item.generics, call_data.args) {
+                                Some(specialized) => {
+                                    any = append_specialized_generic_function(builder,
+                                        declaration_builder, seen, any, specialized,)
+                                }
+                                None => {
+                                }
                             }
                         }
                     }
@@ -2682,6 +2700,157 @@ fn combined_impl_method_generics(impl_generics: frozen Vec[Type],
         out.push(clone_type(generic))
     }
     ret out
+}
+
+struct ImplMethodBinding {
+    params: Vec[Type]
+    args: Vec[Type]
+}
+
+// Call-site arguments follow the receiver's type arguments, then the method's.
+// Impl binders can be reordered, repeated or nested in that receiver pattern.
+// Keep the call-site order for symbols, but infer the substitution by name.
+fn bind_impl_method(target: frozen Type, impl_params: frozen Vec[Type],
+    method_params: frozen Vec[Type], call_args: frozen Vec[Type],) -> Option[ImplMethodBinding] {
+    let receiver_arity = target.generics.len()
+    if call_args.len() != receiver_arity + method_params.len() {
+        ret Option[ImplMethodBinding]::None
+    }
+    let mut args = Vec[Type]::new()
+    for parameter in impl_params {
+        let mut inferred = Option[Type]::None
+        let mut index = 0_usize
+        for pattern in target.generics {
+            match call_args.get(index) {
+                Some(actual) => {
+                    match infer_impl_argument(pattern, actual, parameter.name) {
+                        Some(value) => {
+                            inferred = Option[Type]::Some(value)
+                        }
+                        None => {
+                        }
+                    }
+                }
+                None => {
+                }
+            }
+            index += 1_usize
+        }
+        match inferred {
+            Some(value) => {
+                args.push(value)
+            }
+            None => {
+                ret Option[ImplMethodBinding]::None
+            }
+        }
+    }
+    let mut method_index = receiver_arity
+    while method_index < call_args.len() {
+        match call_args.get(method_index) {
+            Some(actual) => {
+                args.push(clone_type(actual))
+            }
+            None => {
+                ret Option[ImplMethodBinding]::None
+            }
+        }
+        method_index += 1_usize
+    }
+    let mut index = 0_usize
+    for pattern in target.generics {
+        match call_args.get(index) {
+            Some(actual) => {
+                if !impl_argument_matches(substitute_generic_type(pattern, impl_params, args), actual) {
+                    ret Option[ImplMethodBinding]::None
+                }
+            }
+            None => {
+                ret Option[ImplMethodBinding]::None
+            }
+        }
+        index += 1_usize
+    }
+    ret Option[ImplMethodBinding]::Some(ImplMethodBinding {
+            combined_impl_method_generics(impl_params, method_params), args
+        }
+        ,
+    )
+}
+
+fn infer_impl_argument(pattern: frozen Type, actual: frozen Type, name: str) -> Option[Type] {
+    if pattern.name == name && pattern.generics.len() == 0 {
+        let representation = if pattern.representation == RepresentationKind::Inline {
+            actual.representation
+        } else {
+            RepresentationKind::Inline
+        }
+        let mut generics = Vec[Type]::new()
+        for generic in actual.generics {
+            generics.push(clone_type(generic))
+        }
+        ret Option[Type]::Some(Type { actual.name, generics, representation })
+    }
+    if pattern.name != actual.name || pattern.generics.len() != actual.generics.len() {
+        ret Option[Type]::None
+    }
+    let mut index = 0_usize
+    for nested in pattern.generics {
+        match actual.generics.get(index) {
+            Some(value) => {
+                match infer_impl_argument(nested, value, name) {
+                    Some(inferred) => {
+                        ret Option[Type]::Some(inferred)
+                    }
+                    None => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        index += 1_usize
+    }
+    ret Option[Type]::None
+}
+
+fn impl_argument_matches(pattern: frozen Type, actual: frozen Type) -> bool {
+    if pattern.name != actual.name || pattern.generics.len() != actual.generics.len() {
+        ret false
+    }
+    if pattern.representation != actual.representation &&
+    !(pattern.representation == RepresentationKind::NodeAny && is_node_handle_type(actual)) {
+        ret false
+    }
+    let mut index = 0_usize
+    for nested in pattern.generics {
+        match actual.generics.get(index) {
+            Some(value) => {
+                if !impl_argument_matches(nested, value) {
+                    ret false
+                }
+            }
+            None => {
+                ret false
+            }
+        }
+        index += 1_usize
+    }
+    ret true
+}
+
+fn specialize_impl_method(method: frozen FnDirective, target: frozen Type,
+    impl_params: frozen Vec[Type], call_args: frozen Vec[Type],) -> Option[FnDirective] {
+    match bind_impl_method(target, impl_params, method.generics, call_args) {
+        Some(binding) => {
+            let name = target.name + "::" + method.name
+            let specialized = specialize_function_with_params(method, binding.params, binding.args, name)
+            ret Option[FnDirective]::Some(generic_function_template_for_call(specialized, generic_symbol(name, call_args)))
+        }
+        None => {
+            ret Option[FnDirective]::None
+        }
+    }
 }
 
 fn specialize_function(function: frozen FnDirective, args: frozen Vec[Type]) -> FnDirective {
@@ -3634,6 +3803,8 @@ fn append_module_codegen_directives(out: mut Vec[Directive], source: frozen Vec[
             Directive::Impl(item) => {
                 let mut methods = Vec[FnDirective]::new()
                 for method in item.methods {
+                    // Concrete receiver templates stay in contexts for support
+                    // specialization; foreign ordinary bodies have one owner.
                     if local || item.generics.len() > 0_usize || method.generics.len() > 0_usize {
                         methods.push(method)
                     } else {
@@ -3675,7 +3846,7 @@ fn module_codegen_context(module: Module) -> Module {
             Directive::Impl(item) => {
                 let mut methods = Vec[FnDirective]::new()
                 for method in item.methods {
-                    if item.generics.len() > 0_usize || method.generics.len() > 0_usize {
+                    if item.generics.len() > 0_usize || item.for_type.generics.len() > 0_usize || method.generics.len() > 0_usize {
                         methods.push(method)
                     } else {
                         methods.push(extern_fn_item(method.name, method.generics,
@@ -4074,11 +4245,15 @@ fn collect_equality_types(owned: frozen Vec[Directive], directives: frozen Vec[D
                 }
                 Directive::Impl(item) => {
                     for method in item.methods {
-                        let params = combined_impl_method_generics(item.generics, method.generics)
                         let name = item.for_type.name + "::" + method.name
-                        if params.len() > 0 && name == site.name && params.len() == site.args.len() {
-                            collect_function_equality(out, seen, specialize_function_with_params(method,
-                                    params, site.args, name,))
+                        if (item.generics.len() > 0 || item.for_type.generics.len() > 0 || method.generics.len() > 0) && name == site.name {
+                            match specialize_impl_method(method, item.for_type, item.generics, site.args) {
+                                Some(specialized) => {
+                                    collect_function_equality(out, seen, specialized)
+                                }
+                                None => {
+                                }
+                            }
                         }
                     }
                 }
@@ -4173,34 +4348,14 @@ fn collect_concrete_types(directives: frozen Vec[Directive], calls: frozen Vec[G
                     }
                 }
                 Directive::Impl(item) => {
-                    if item.generics.len() == call_data.args.len() {
-                        for method in item.methods {
-                            if method.generics.len() == 0_usize {
-                                let full_name = item.for_type.name + "::" + method.name
-                                if full_name == call_data.name {
-                                    collect_function_types(out, seen,
-                                        specialize_function_with_params(method, item.generics,
-                                            call_data.args, full_name,),)
+                    for method in item.methods {
+                        let full_name = item.for_type.name + "::" + method.name
+                        if (item.generics.len() > 0 || item.for_type.generics.len() > 0 || method.generics.len() > 0) && full_name == call_data.name {
+                            match specialize_impl_method(method, item.for_type, item.generics, call_data.args) {
+                                Some(specialized) => {
+                                    collect_function_types(out, seen, specialized)
                                 }
-                            }
-                        }
-                    }
-                    if impl_has_generic_methods(item.methods) {
-                        for method in item.methods {
-                            if method.generics.len() == 0_usize {
-                                continue
-                            }
-                            let full_name = item.for_type.name + "::" + method.name
-                            if item.generics.len() == 0_usize && full_name == call_data.name && method.generics.len() == call_data.args.len() {
-                                collect_function_types(out, seen,
-                                    specialize_function_with_params(method, method.generics,
-                                        call_data.args, full_name,),)
-                            } elif item.generics.len() > 0_usize {
-                                let params = combined_impl_method_generics(item.generics, method.generics)
-                                if full_name == call_data.name && params.len() == call_data.args.len() {
-                                    collect_function_types(out, seen,
-                                        specialize_function_with_params(method, params,
-                                            call_data.args, full_name,),)
+                                None => {
                                 }
                             }
                         }
@@ -4776,7 +4931,9 @@ fn is_pure_scalar_type(typ: frozen Type) -> bool {
 fn lower_params(params: frozen Vec[Parameter]) -> Vec[LLVMParam] {
     let mut acc = Vec[LLVMParam]::new()
     for current in params {
-        if is_unit_value_type(current.typ) { continue }
+        if is_unit_value_type(current.typ) {
+            continue
+        }
         let name = sanitize_symbol(current.name)
         let typ = lower_type(current.typ)
         acc.push(llvm_make_param(name, typ))
@@ -5814,7 +5971,9 @@ fn block_symbol(name: str) -> str {
 fn lower_variables(variables: frozen Vec[Variable]) -> Vec[LLVMValue] {
     let mut acc = Vec[LLVMValue]::new()
     for current in variables {
-        if is_unit_value_type(required_variable_type(current)) { continue }
+        if is_unit_value_type(required_variable_type(current)) {
+            continue
+        }
         acc.push(lower_variable(current))
     }
     ret acc
@@ -6325,5 +6484,5 @@ fn is_digit(ch: u8) -> bool {
 
 // Unit participates in Encore type checking but has no LLVM argument value.
 fn is_unit_value_type(typ: frozen Type) -> bool {
-    ret typ.representation == RepresentationKind::Inline && (typ.name == "void" || typ.name == "()")
+    ret typ.representation == RepresentationKind::Inline &&(typ.name == "void" || typ.name == "()")
 }

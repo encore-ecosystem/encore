@@ -101,6 +101,28 @@ pub struct SemanticMethod {
     declaration_receiver: str
     generic_names: Vec[str]
     is_static: bool
+    is_public: bool
+}
+
+/// Private inherent members are accessible only from an impl of their type.
+/// Inputs use declaration identities, so aliases cannot grant extra access.
+pub fn semantic_same_owner(left: str, right: str) -> bool {
+    ret left != "" && right != "" &&
+    semantic_root_type(semantic_type_name(left)) == semantic_root_type(semantic_type_name(right))
+}
+
+pub fn semantic_method_accessible(method: SemanticMethod, access_owner: str) -> bool {
+    ret method.is_public || semantic_same_owner(method.receiver_type, access_owner)
+}
+
+pub fn semantic_accessible_methods(methods: Vec[SemanticMethod], access_owner: str) -> Vec[SemanticMethod] {
+    let mut out = Vec[SemanticMethod]::new()
+    for method in methods {
+        if semantic_method_accessible(method, access_owner) {
+            out.push(method)
+        }
+    }
+    ret out
 }
 
 /// One field or method offered for a concrete receiver type.
@@ -165,7 +187,7 @@ fn semantic_access_members(receiver: str, name_filter: str, fields: Vec[Semantic
         }
     }
     for method in methods {
-        if method.is_static != is_static {
+        if (is_static && !method.is_static) ||(!is_static && method.is_static && starts_with(method.receiver_type, "dyn ")) {
             continue
         }
         if name_filter != "" && method.name != name_filter {
@@ -201,6 +223,7 @@ pub struct SemanticBody {
     bound_methods: Vec[SemanticMethod]
     type_names: Vec[TypeNameBinding]
     implicit_receivers: Vec[(usize, usize, str, str)]
+    access_owner: str
 }
 
 struct SemanticContext {
@@ -231,7 +254,7 @@ impl for SemanticBody {
     pub fn empty() -> Self {
         ret Self {
             Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(),
-            "", Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), Vec[TypeNameBinding]::new(), Vec[(usize, usize, str, str)]::new()
+            "", Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), Vec[TypeNameBinding]::new(), Vec[(usize, usize, str, str)]::new(), ""
         }
     }
 
@@ -425,14 +448,14 @@ impl for SemanticMethod {
         }
         key += ")->" + ret_type
         ret Self {
-            module_name, receiver_type, name, params, ret_type, nonzero_hash(key), receiver_type, Vec[str]::new(), false
+            module_name, receiver_type, name, params, ret_type, nonzero_hash(key), receiver_type, Vec[str]::new(), false, true
         }
     }
 
     pub fn with_generics(self: Self, names: Vec[str]) -> Self {
         ret Self {
             self.module_name, self.receiver_type, self.name, self.params, self.ret_type,
-            generic_signature(self.signature, names), self.declaration_receiver, names, self.is_static
+            generic_signature(self.signature, names), self.declaration_receiver, names, self.is_static, self.is_public
         }
     }
 
@@ -444,7 +467,20 @@ impl for SemanticMethod {
         }
         ret Self {
             self.module_name, self.receiver_type, self.name, self.params, self.ret_type,
-            signature, self.declaration_receiver, self.generic_names, is_static
+            signature, self.declaration_receiver, self.generic_names, is_static, self.is_public
+        }
+    }
+
+    pub fn with_visibility(self: Self, is_public: bool) -> Self {
+        ret Self {
+            self.module_name, self.receiver_type, self.name, self.params, self.ret_type,
+            if is_public {
+                self.signature
+            } else {
+                nonzero_hash(Debug::fmt(self.signature) + "#private")
+            }
+            ,
+            self.declaration_receiver, self.generic_names, self.is_static, is_public
         }
     }
 
@@ -460,7 +496,7 @@ impl for SemanticMethod {
         let result = specialize_method_type_with_self(self.ret_type, self.receiver_type, parent, "Self", self.generic_names)
         ret Option[SemanticMethod]::Some(Self {
                 self.module_name, receiver, self.name, params, result,
-                self.signature, self.declaration_receiver, generics, self.is_static
+                self.signature, self.declaration_receiver, generics, self.is_static, self.is_public
             }
             ,)
     }
@@ -484,7 +520,7 @@ pub fn check_function_body_with_types(item: FunctionItem, callables: Vec[Semanti
     if semantic_function_has_attr(item, "decorator") {
         ret SemanticBody {
             Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(),
-            item.ret_type.unwrap_or("void"), Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), Vec[TypeNameBinding]::new(), Vec[(usize, usize, str, str)]::new()
+            item.ret_type.unwrap_or("void"), Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), Vec[TypeNameBinding]::new(), Vec[(usize, usize, str, str)]::new(), self_type
         }
     }
     ret check_function_body_with_scope(item, callables, fields, methods, self_type, Vec[GenericParam]::new(), aggregate_names)
@@ -525,6 +561,7 @@ pub fn check_function_body_with_variants(item: FunctionItem, callables: Vec[Sema
             let mut result = SemanticBody::empty()
             result.return_type = item.ret_type.unwrap_or("void")
             result.type_names = type_names
+            result.access_owner = self_type
             match item.body {
                 Some(block) => {
                     for parameter in item.params {
@@ -577,7 +614,7 @@ pub fn check_function_body_with_variants(item: FunctionItem, callables: Vec[Sema
     if semantic_function_has_attr(item, "decorator") {
         ret SemanticBody {
             Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(),
-            item.ret_type.unwrap_or("void"), Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), type_names, Vec[(usize, usize, str, str)]::new()
+            item.ret_type.unwrap_or("void"), Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), type_names, Vec[(usize, usize, str, str)]::new(), self_type
         }
     }
     let mut generic_names = Vec[str]::new()
@@ -687,7 +724,7 @@ pub fn check_function_body_with_variants(item: FunctionItem, callables: Vec[Sema
     }
     ret SemanticBody {
         public_bindings, public_diagnostics, ctx.dependencies, display_type(return_type, type_names), public_scoped,
-        ctx.member_receivers, bound_methods, type_names, ctx.implicit_receivers
+        ctx.member_receivers, bound_methods, type_names, ctx.implicit_receivers, self_type
     }
 }
 
@@ -1025,6 +1062,9 @@ fn methods_for_generic_bounds(generics: Vec[GenericParam], methods: Vec[Semantic
             }
             receiver = scope_type(receiver, type_scope, type_names, generic_param_names(generics))
             for method in methods {
+                if method.is_static {
+                    continue
+                }
                 if semantic_root_type(semantic_type_name(method.receiver_type)) != semantic_root_type(semantic_type_name(receiver)) {
                     continue
                 }
@@ -1035,7 +1075,7 @@ fn methods_for_generic_bounds(generics: Vec[GenericParam], methods: Vec[Semantic
                 let result = specialize_method_type_with_self(method.ret_type, method.receiver_type, receiver, generic.name, method.generic_names)
                 out.push(SemanticMethod {
                         method.module_name, generic.name, method.name, params,
-                        result, method.signature, method.declaration_receiver, Vec[str]::new(), method.is_static
+                        result, method.signature, method.declaration_receiver, Vec[str]::new(), method.is_static, method.is_public
                     }
                     ,)
             }
@@ -1619,6 +1659,10 @@ fn check_statements(
             Statement::For(item) => {
                 let iterable = infer_expression(ctx, item.iterable)
                 ctx.implicit_receivers.push((item.iterable.line, item.iterable.column, "for", iterable))
+                check_implicit_method_access(ctx, iterable, "into_iter", item.iterable.line, item.iterable.column, item.iterable.length)
+                let converted = iterable_method_return(ctx, iterable, "into_iter")
+                check_implicit_method_access(ctx, if converted == "" { iterable } else { converted },
+                    "next", item.iterable.line, item.iterable.column, item.iterable.length)
                 let outer_bindings = ctx.bindings.len()
                 let outer_scope = ctx.scope
                 replace_scope(ctx, block_scope(item.body))
@@ -1634,6 +1678,8 @@ fn check_statements(
             Statement::With(item) => {
                 let resource = infer_expression(ctx, item.expr)
                 ctx.implicit_receivers.push((item.expr.line, item.expr.column, "with", resource))
+                check_implicit_method_access(ctx, resource, "with_enter", item.expr.line, item.expr.column, item.expr.length)
+                check_implicit_method_access(ctx, resource, "with_exit", item.expr.line, item.expr.column, item.expr.length)
                 let outer_bindings = ctx.bindings.len()
                 let outer_scope = ctx.scope
                 replace_scope(ctx, block_scope(item.body))
@@ -1796,11 +1842,7 @@ fn infer_expression(
             ret float_type(value)
         }
         Expr::Path(name) => {
-            let resolved = infer_path_type(ctx.bindings, name)
-            if resolved == "" {
-                report_unknown_value(ctx, name, source_name, line, column, length)
-            }
-            ret local_type(ctx, resolved)
+            ret infer_value_path(ctx, name, source_name, line, column, length)
         }
         Expr::Parenthesized(inner) => {
             ret infer_expression_h(ctx, inner)
@@ -1948,11 +1990,7 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode<H>) -> str {
             ret float_type(value)
         }
         Expr::Path(name) => {
-            let resolved = infer_path_type(ctx.bindings, name)
-            if resolved == "" {
-                report_unknown_value(ctx, name, source_name, line, column, length)
-            }
-            ret local_type(ctx, resolved)
+            ret infer_value_path(ctx, name, source_name, line, column, length)
         }
         Expr::Parenthesized(inner) => {
             ret infer_expression_h(ctx, inner)
@@ -2098,6 +2136,55 @@ fn binding_type(bindings: Vec[SemanticBinding], name: str) -> str {
     ret ""
 }
 
+fn infer_value_path(ctx: mut SemanticContext, name: str, source_name: str,
+    line: usize, column: usize, length: usize,) -> str {
+    let resolved = infer_path_type(ctx.bindings, name)
+    if resolved == "" {
+        report_unknown_value(ctx, name, source_name, line, column, length)
+    }
+    let result = if resolved == "Self" && ctx.self_type != "" {
+        ctx.self_type
+    } else {
+        local_type(ctx, resolved)
+    }
+    let mut end = name.len()
+    while end >= 2_usize {
+        if name.slice(end - 2_usize, 2_usize) == "::" {
+            let spelling = name.slice(0_usize, end - 2_usize)
+            let owner = if spelling == "Self" || spelling == "self" {
+                ctx.self_type
+            } else {
+                local_type(ctx, spelling)
+            }
+            let member = name.slice(end, name.len() - end)
+            for variant in ctx.variants {
+                if variant.name == member && semantic_same_owner(variant.owner_type, owner) {
+                    ret result
+                }
+            }
+            let mut denied = false
+            let mut allowed = false
+            for method in ctx.methods {
+                if method.name == member && semantic_receiver_matches(method.receiver_type, owner, method.generic_names) {
+                    if semantic_method_accessible(method, ctx.self_type) {
+                        allowed = true
+                    } else {
+                        denied = true
+                        remember_method_dependency(ctx, method)
+                    }
+                }
+            }
+            if denied && !allowed {
+                report_private_method(ctx, owner, member, line, column, length)
+                ret ""
+            }
+            break
+        }
+        end -= 1_usize
+    }
+    ret result
+}
+
 fn infer_path_type(bindings: Vec[SemanticBinding], name: str) -> str {
     let bound = binding_type(bindings, name)
     if bound != "" {
@@ -2207,6 +2294,22 @@ fn check_binary_operands(
     if lhs == "" || rhs == "" || lhs == "never" || rhs == "never" {
         ret()
     }
+    let method = if operator == "**" {
+        "pow"
+    } elif lhs != "str" && !numeric_semantic_type(lhs) {
+        if operator == "+" {
+            "op"
+        } elif operator == "/" {
+            "div"
+        } else {
+            ""
+        }
+    } else {
+        ""
+    }
+    if method != "" {
+        check_implicit_method_access(ctx, lhs, method, line, column, length)
+    }
     if !builtin_receiver_type(lhs) || !builtin_receiver_type(rhs) {
         ret()
     }
@@ -2238,7 +2341,6 @@ fn check_binary_operands(
     )
     ret()
 }
-
 fn numeric_semantic_type(typ: str) -> bool {
     ret typ == "u8" || typ == "u16" || typ == "u32" || typ == "u64" || typ == "u128" || typ == "usize"
     || typ == "i8" || typ == "i16" || typ == "i32" || typ == "i64" || typ == "i128" || typ == "isize"
@@ -2367,7 +2469,7 @@ fn resolve_associated_call(ctx: mut SemanticContext, path: str, args: Vec[ExprNo
         ret Option[str]::None
     }
     let mut receiver = local_type(ctx, path.slice(0_usize, separator))
-    if receiver == "Self" {
+    if receiver == "Self" || receiver == "self" {
         receiver = ctx.self_type
     }
     let name = path.slice(separator + 2_usize, path.len() - separator - 2_usize)
@@ -2375,6 +2477,9 @@ fn resolve_associated_call(ctx: mut SemanticContext, path: str, args: Vec[ExprNo
     let mut found = false
     for method in ctx.methods {
         if !method.is_static || method.name != name {
+            continue
+        }
+        if !semantic_method_accessible(method, ctx.self_type) {
             continue
         }
         if !semantic_receiver_matches(method.receiver_type, receiver, method.generic_names) {
@@ -2391,6 +2496,43 @@ fn resolve_associated_call(ctx: mut SemanticContext, path: str, args: Vec[ExprNo
         ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "argument-mismatch",
                 "arguments to associated function '" + path + "' do not match " + type_list(expected),
                 line, column, length,))
+    }
+    if !found && known_nominal_receiver(ctx, receiver) {
+        // Type::method(receiver, ...) can name an ordinary receiver method.
+        // Keep that accessible declaration available to UFCS call checking.
+        let mut accessible_member = false
+        let mut private_member = false
+        for method in ctx.methods {
+            let declared = if starts_with(method.receiver_type, "dyn ") {
+                method.receiver_type.slice(4_usize, method.receiver_type.len() - 4_usize)
+            } else {
+                method.receiver_type
+            }
+            if method.name == name && semantic_root_type(declared) == semantic_root_type(receiver) {
+                if semantic_method_accessible(method, ctx.self_type) {
+                    accessible_member = true
+                } else {
+                    private_member = true
+                    remember_method_dependency(ctx, method)
+                }
+            }
+        }
+        let mut constructor = false
+        for variant in ctx.variants {
+            if variant.name == name && semantic_root_type(variant.owner_type) == semantic_root_type(receiver) {
+                constructor = true
+            }
+        }
+        if !constructor && !accessible_member {
+            if private_member {
+                report_private_method(ctx, receiver, name, line, column, length)
+                ret Option[str]::Some("")
+            }
+            remember_failed_lookup(ctx)
+            ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "unknown-associated-function",
+                    "no accessible associated function '" + name + "' found for type '" + receiver + "'",
+                    line, column, length,))
+        }
     }
     ret Option[str]::None
 }
@@ -2779,9 +2921,29 @@ fn indexed_type(ctx: SemanticContext, typ: str) -> str {
     ret ""
 }
 
+// Syntax-driven calls obey the same declaring-type boundary as explicit calls.
+fn check_implicit_method_access(ctx: mut SemanticContext, receiver: str, name: str,
+    line: usize, column: usize, length: usize,) ->() {
+    let mut denied = false
+    let mut allowed = false
+    for method in ctx.methods {
+        if method.name == name && semantic_receiver_matches(method.receiver_type, receiver, method.generic_names) {
+            remember_method_dependency(ctx, method)
+            if semantic_method_accessible(method, ctx.self_type) {
+                allowed = true
+            } else {
+                denied = true
+            }
+        }
+    }
+    if denied && !allowed {
+        report_private_method(ctx, receiver, name, line, column, length)
+    }
+}
 fn iterable_method_return(ctx: mut SemanticContext, receiver: str, name: str) -> str {
     for method in ctx.methods {
         if !method.is_static && method.name == name &&
+        semantic_method_accessible(method, ctx.self_type) &&
         semantic_receiver_matches(method.receiver_type, receiver, method.generic_names) {
             remember_method_dependency(ctx, method)
             ret specialize_method_type(method.ret_type, method.receiver_type, receiver, method.generic_names)
@@ -2971,6 +3133,19 @@ fn trim_type_text(value: str) -> str {
     ret value.slice(start, end - start)
 }
 
+fn known_nominal_receiver(ctx: mut SemanticContext, receiver: str) -> bool {
+    ret contains_name(ctx.aggregate_names, semantic_root_type(semantic_type_name(receiver)))
+}
+
+fn report_private_method(ctx: mut SemanticContext, receiver: str, name: str,
+    line: usize, column: usize, length: usize,) ->() {
+    remember_failed_lookup(ctx)
+    ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "private-method",
+            "method '" + name + "' on type '" + receiver + "' is private to its declaring type",
+            line, column, length,).with_help("call it from an impl of that type or declare the method pub"))
+    ret()
+}
+
 fn resolve_method_call(
     ctx: mut SemanticContext,
     receiver: str,
@@ -2999,16 +3174,22 @@ fn resolve_method_call(
     }
     let mut saw_receiver = false
     let mut saw_name = false
+    let mut private_member = false
     let mut expected_arity = 0_usize
     let mut expected_params = Vec[str]::new()
     for method in ctx.methods {
-        if method.is_static || method.name != name {
+        if method.name != name ||(method.is_static &&(is_generic_receiver || starts_with(receiver, "dyn "))) {
             continue
         }
         if is_generic_receiver && semantic_type_name(method.receiver_type) != generic_receiver {
             continue
         }
         if semantic_receiver_matches(method.receiver_type, receiver, method.generic_names) {
+            if !semantic_method_accessible(method, ctx.self_type) {
+                private_member = true
+                remember_method_dependency(ctx, method)
+                continue
+            }
             saw_receiver = true
             if method.name == name {
                 saw_name = true
@@ -3031,6 +3212,10 @@ fn resolve_method_call(
     }
 
     remember_failed_lookup(ctx)
+    if private_member && !saw_name {
+        report_private_method(ctx, receiver, name, line, column, length)
+        ret ""
+    }
     if is_generic_receiver && !saw_name {
         ret ""
     }
@@ -3079,7 +3264,7 @@ fn resolve_method_call(
             }
         }
     }
-    if receiver != "" && saw_receiver && !builtin_receiver_type(receiver) {
+    if receiver != "" &&(saw_receiver || known_nominal_receiver(ctx, receiver)) && !builtin_receiver_type(receiver) {
         let mut diagnostic = FrontendDiagnostic::new(
             1_usize,
             "unknown-method",
@@ -3088,7 +3273,7 @@ fn resolve_method_call(
             column,
             length,
         ).with_label(source_name, line, column, length, DiagnosticLabelKind::Primary, "unknown method")
-        let nearest = nearest_method(ctx.methods, receiver, name)
+        let nearest = nearest_method(semantic_accessible_methods(ctx.methods, ctx.self_type), receiver, name)
         if nearest != "" {
             diagnostic = diagnostic.with_help("did you mean `" + nearest + "`?")
             diagnostic = diagnostic.with_suggestion(

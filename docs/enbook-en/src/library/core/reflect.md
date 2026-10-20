@@ -36,6 +36,29 @@ as `field.attribute("serialize.rename")`.
 `is_active(owner)`, `get(owner)` and `construct(payload)`. `get` returns an
 `Option[Value]`; variants without a payload use `()`.
 
+For an enum value, `variant_name(value)` returns the active variant's declared
+name and `variant_index(value)` returns its zero-based declaration index:
+
+```encore
+import core::reflect::{variant_name, variant_index}
+
+enum Level { DEBUG INFO WARN }
+
+fn describe(value: Level) -> str {
+    ret variant_name(value)
+}
+
+fn ordinal(value: Level) -> usize {
+    ret variant_index(value)
+}
+```
+
+The type argument is inferred from the value. Both helpers support variants
+with payloads and expand through the normal typed reflection machinery. They
+panic if called with a non-enum type. Reordering or inserting variants changes
+their indices; use explicit IDs when a value must remain stable in storage or
+on the wire.
+
 Decoders use a `Builder[T]` to collect fields. `set(field, value)` checks the
 field's concrete value type. `finish()` returns `Result[T, BuildError]`, with
 `BuildError::MissingField(name)` if a field was never supplied. A partially
