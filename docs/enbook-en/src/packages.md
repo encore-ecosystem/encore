@@ -31,6 +31,10 @@ dependencies = [
 `core` is a system dependency injected by the compiler. Do not add `sys@core`
 manually.
 
+When Encore writes dependencies, nonempty arrays use one reference per line,
+with four-space indentation and trailing commas. Dependency order is preserved;
+an empty array remains `[]`.
+
 With `auto`, a package with `src/main.enq` builds an executable; a library-only
 package with `src/lib.enq` builds a static library. When both exist, direct builds
 use `main.enq`, while consumers always use the library entrypoint. An explicit
