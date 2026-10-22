@@ -85,6 +85,41 @@ directory, including queue time, package cache hits and total pipeline time.
 These internal artifact formats are compiler-specific, not a public ABI or a
 replacement for the dependency lockfile.
 
+### Cache limits and build workspaces
+
+`encore cache status` reports compiled-cache usage. Add `--json` for machine-readable
+output or `--project PATH` to inspect another project's managed workspaces and
+other target artifacts. Registry downloads and installed SDKs/toolchains are
+separate from the compiled-cache budget.
+
+The shared compiled cache defaults to **20 GiB**, including package, lowering and
+native-object entries. Set `ENCORE_BUILD_CACHE_MAX_SIZE` to a nonnegative integer
+with an optional `B`, `MiB` or `GiB` suffix to change it. After a build, automatic
+maintenance runs at most once per minute. When usage exceeds the limit, it evicts
+least recently used entries down to 90% of the limit. This is a soft limit:
+concurrent builds and locked entries can temporarily keep usage above it.
+
+```sh
+encore cache prune --dry-run
+encore cache prune --max-size 20GiB
+encore cache prune --all
+```
+
+Explicit pruning runs immediately. `--max-size` applies to that invocation;
+`--all` removes all available compiled entries. Dry runs do not modify files.
+Per-entry OS locks protect readers/writers, and lock files survive eviction.
+Unrecognized directories and symlinks are not removed.
+
+Build, run and test commands normally remove their private staging directories.
+Coordinator and worker processes hold shared OS leases; cleanup requires an
+exclusive lease, including after an interrupted build. Failed builds save bounded
+text diagnostics under `target/diagnostics/`: at most ten reports and 128 MiB in
+total. Use `--keep-build-artifacts` (or `ENCORE_KEEP_TEMPS=1`) to retain full
+intermediates. Explicit pruning also respects this retention flag recorded on a
+workspace. Final binaries, native/ThinLTO caches and unregistered legacy build
+directories are preserved. Historical snapshots require a separately reviewed
+cleanup; they are never inferred to be disposable from their names alone.
+
 ## Dependency References
 
 Supported dependency references:

@@ -19,6 +19,7 @@
 #include "runtime/build_jobserver.h"
 #include "runtime/build_process.h"
 #include "runtime/build_artifact.h"
+#include "runtime/cache_fs.h"
 #include "runtime/build_identity.h"
 #include "runtime/build_target.h"
 #if defined(__GLIBC__)
@@ -129,6 +130,14 @@ size_t encore_compiler_cache_lock_open(encore_compiler_str path) {
 }
 int encore_compiler_cache_lock_try(size_t lock) { return encore_build_cache_lock_try(lock); }
 void encore_compiler_cache_lock_close(size_t lock) { encore_build_cache_lock_close(lock); }
+
+uint64_t encore_compiler_cache_file_fact(encore_compiler_str path, uint32_t field) {
+    char *name = encore_compiler_cstr(path);
+    uint64_t result = encore_cache_file_fact(name, field);
+    free(name);
+    return result;
+}
+int encore_compiler_cache_lock_shared(size_t lock) { return encore_cache_lock_shared(lock); }
 
 /* Both paths are siblings in the registry cache. Publish only a fully checked
  * directory, under its registry installation lock. No external mv is needed. */

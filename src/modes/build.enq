@@ -1,3 +1,4 @@
+import mod::cache_policy::{BuildWorkspace, keep_build_artifacts, sweep_project}
 //! Provides the `build` module.
 
 import core::fmt::Debug
@@ -726,6 +727,25 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
 #attr(safe)
 pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolchain,
     profile: str, profile_dir: Path, binary: Path,) -> Result[(), str] {
+    let _swept = sweep_project(root, false)
+    let workspace = BuildWorkspace::new(profile_dir, "packages")?
+    with workspace as scope {
+        let result = compile_package_binary_in(root, target, toolchain, profile, profile_dir, binary, scope.directory)
+        match result {
+            Ok(_) => {
+                scope.complete(true, "")
+            }
+            Err(error) => {
+                scope.complete(false, error)
+            }
+        }
+        ret result
+    }
+}
+
+#attr(safe)
+fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchain,
+    profile: str, profile_dir: Path, binary: Path, staging: Path,) -> Result[(), str] {
     let pipeline_started = perf_counter_ms()
     let output_kind = project_build_kind(root, read_project_manifest(root))
     let import_name = build_import_library_name(target, project_manifest_name(read_project_manifest(root)), output_kind)
@@ -735,14 +755,6 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
         Err(failure) => {
             ret Result[(), str]::Err(failure.message)
         }
-    }
-    let staging = profile_dir.join("packages-" + Debug::fmt(unsafe {
-                encore_compiler_process_id()
-            }
-        ) +
-        "-" + Debug::fmt(perf_counter_ns())).resolve()
-    if mkdir_all(staging.as_str()) != 0 {
-        ret Result[(), str]::Err("cannot create package build staging")
     }
     let metadata = run_native_build_scripts(graph.refrains, "", target, profile, staging)?
     let native = UnitNativePlan {
@@ -3614,6 +3626,30 @@ pub fn compile_test_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
 #attr(safe)
 fn compile_entry_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str,
     build_script: bool,) -> u32 {
+    let managed = match BuildWorkspace::new(root / "target" / "tests", "native-" + binary_name) {
+        Ok(value) => {
+            value
+        }
+        Err(error) => {
+            eprintln(error) ret 1_u32
+        }
+    }
+    with managed as scope {
+        let code = compile_entry_ast_in(root, workspace, ast, binary_name, build_script, scope.directory)
+        scope.complete(code == 0_u32, if code == 0_u32 {
+                ""
+            } else {
+                "test compilation failed"
+            }
+            ,
+        )
+        ret code
+    }
+}
+
+#attr(safe)
+fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str,
+    build_script: bool, staging: Path,) -> u32 {
     // Parser/import failures are fatal even on a worker binary cache hit.
     // Lowering-time validation cannot recover diagnostics discarded by parsing.
     for module in workspace.modules {
@@ -3632,16 +3668,16 @@ fn compile_entry_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement
     if mkdir_all(native_path(binary_dir.as_str())) != 0_i32 {
         ret test_artifact_error("create test binary directory", binary_dir)
     }
-    let ehir_path = tests_dir.join(binary_name + ".ehir")
-    let llvm_path = tests_dir.join(binary_name + ".ll")
-    let binary_path = binary_dir.join(target_executable_name(host_target(), binary_name))
-    let staging = tests_dir.join("native-" + binary_name + "-" + Debug::fmt(unsafe {
-                encore_compiler_process_id()
-            }
-        ))
-    if mkdir_all(staging.as_str()) != 0 {
-        ret test_artifact_error("create native staging directory", staging)
+    // Keep legacy inspection paths only when full intermediates were requested.
+    // Otherwise a cancelled test worker leaves IR inside its leased workspace.
+    let intermediate_dir = if keep_temporary_artifacts() {
+        tests_dir
+    } else {
+        staging
     }
+    let ehir_path = intermediate_dir.join(binary_name + ".ehir")
+    let llvm_path = intermediate_dir.join(binary_name + ".ll")
+    let binary_path = binary_dir.join(target_executable_name(host_target(), binary_name))
     let native_metadata = match run_native_build_scripts(workspace.refrains, if build_script {
             workspace.root_name
         } else {
@@ -3820,14 +3856,7 @@ fn test_artifact_error(operation: str, path: Path) -> u32 {
 }
 
 fn keep_temporary_artifacts() -> bool {
-    match env("ENCORE_KEEP_TEMPS") {
-        Option[str]::Some(value) => {
-            ret value == "1" || value == "true"
-        }
-        Option[str]::None => {
-            ret false
-        }
-    }
+    ret keep_build_artifacts()
 }
 
 fn native_path(value: str) -> str {

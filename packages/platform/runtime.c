@@ -1785,13 +1785,77 @@ encore_str encore_os_arch(void) {
 #endif
 }
 
+bool encore_os_hasenv(encore_str name) {
+    char *name_c = encore_to_cstr(name);
+    if (name_c == NULL) return false;
+#ifdef _WIN32
+    wchar_t *name_w = encore_process_utf16(name_c);
+    free(name_c);
+    if (name_w == NULL) return false;
+    SetLastError(ERROR_SUCCESS);
+    DWORD required = GetEnvironmentVariableW(name_w, NULL, 0);
+    DWORD error = GetLastError();
+    free(name_w);
+    return required != 0 || error == ERROR_SUCCESS;
+#else
+    bool present = getenv(name_c) != NULL;
+    free(name_c);
+    return present;
+#endif
+}
+
 encore_str encore_os_getenv(encore_str name) {
     char *name_c = encore_to_cstr(name);
     if (name_c == NULL) return encore_empty_str();
+#ifdef _WIN32
+    wchar_t *name_w = encore_process_utf16(name_c);
+    free(name_c);
+    if (name_w == NULL) return encore_empty_str();
+    DWORD capacity = GetEnvironmentVariableW(name_w, NULL, 0);
+    if (capacity == 0) { free(name_w); return encore_empty_str(); }
+    wchar_t *wide = malloc((size_t)capacity * sizeof(wchar_t));
+    if (wide == NULL) { free(name_w); return encore_empty_str(); }
+    DWORD length = GetEnvironmentVariableW(name_w, wide, capacity);
+    free(name_w);
+    if (length == 0 || length >= capacity) { free(wide); return encore_empty_str(); }
+    int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, (int)length, NULL, 0, NULL, NULL);
+    if (bytes <= 0) { free(wide); return encore_empty_str(); }
+    char *buffer = malloc((size_t)bytes + 1);
+    if (buffer == NULL) { free(wide); return encore_empty_str(); }
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, (int)length, buffer, bytes, NULL, NULL) != bytes) {
+        free(wide); free(buffer); return encore_empty_str();
+    }
+    free(wide);
+    buffer[bytes] = '\0';
+    return encore_from_owned_buffer(buffer, (size_t)bytes);
+#else
     const char *value = getenv(name_c);
     free(name_c);
     if (value == NULL || value[0] == '\0') return encore_empty_str();
     return encore_from_cstr_copy(value);
+#endif
+}
+
+bool encore_os_setenv(encore_str name, encore_str value) {
+    size_t name_len = encore_str_size(name), value_len = encore_str_size(value);
+    if (name_len == 0 || memchr(encore_str_data(name), '=', name_len) != NULL ||
+        memchr(encore_str_data(name), '\0', name_len) != NULL ||
+        memchr(encore_str_data(value), '\0', value_len) != NULL) return false;
+    char *name_c = encore_to_cstr(name), *value_c = encore_to_cstr(value);
+    if (name_c == NULL || value_c == NULL) { free(name_c); free(value_c); return false; }
+#ifdef _WIN32
+    wchar_t *name_w = encore_process_utf16(name_c), *value_w = encore_process_utf16(value_c);
+    bool success = name_w != NULL && value_w != NULL;
+    // Keep the CRT in sync for native libraries. The CRT removes empty values;
+    // restore their presence in the OS environment used by env() and children.
+    if (success) success = _wputenv_s(name_w, value_w) == 0;
+    if (success) success = SetEnvironmentVariableW(name_w, value_w) != 0;
+    free(name_w); free(value_w);
+#else
+    bool success = setenv(name_c, value_c, 1) == 0;
+#endif
+    free(name_c); free(value_c);
+    return success;
 }
 
 encore_str encore_os_executable_path(void) {
