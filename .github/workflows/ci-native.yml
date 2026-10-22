@@ -19,6 +19,13 @@ on:
       seed_tag:
         required: true
         type: string
+      performance_baseline_tag:
+        description: Optional published stable release tag for parallel performance comparison
+        type: string
+        default: ''
+      performance_jobs:
+        type: string
+        default: auto
 
 permissions:
   contents: read
@@ -171,7 +178,7 @@ jobs:
         run: |
           set -euo pipefail
           compiler="$PWD/target/stage3/${{ inputs.executable }}"
-          for package in core platform std serialize json binary ehir-llvm-backend; do
+          for package in core platform std serialize json binary ehir ehir-llvm-backend; do
             (cd "packages/$package" && "$compiler" test --report target/test-report.json)
           done
 
@@ -185,6 +192,12 @@ jobs:
           python3 tests/fixtures/reflection_scaling/check.py --compiler "$compiler"
           clang -std=c11 -O2 tests/codec_native.c -o target/codec-native -lm
           target/codec-native
+          clang -std=c11 -O2 tests/string_native.c -o target/string-native -lm
+          target/string-native
+
+      - name: Test parallel benchmark contracts
+        shell: bash
+        run: python3 scripts/test-compiler-benchmarks.py
 
       - name: Test compiler cache lifecycle
         shell: bash
@@ -372,5 +385,101 @@ jobs:
         with:
           name: release-candidate-${{ inputs.triple }}
           path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  performance:
+    name: Parallel compiler performance ${{ inputs.triple }}
+    if: inputs.performance_baseline_tag != ''
+    needs: converge
+    runs-on: ${{ inputs.runner }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: ./.github/actions/stage3-context
+        with:
+          triple: ${{ inputs.triple }}
+          executable: ${{ inputs.executable }}
+          seed_tag: ${{ inputs.seed_tag }}
+      - name: Prepare native toolchain
+        shell: bash
+        run: bash scripts/ci-prepare-toolchain.sh "${{ inputs.triple }}"
+      - name: Verify published baseline and exact compiler provenance
+        id: baseline
+        shell: bash
+        env:
+          BASELINE_TAG: ${{ inputs.performance_baseline_tag }}
+          BENCHMARK_TARGET: ${{ inputs.triple }}
+          BENCHMARK_EXECUTABLE: ${{ inputs.executable }}
+        run: |
+          set -euo pipefail
+          [[ "$BASELINE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[a-z][a-z0-9-]*$ ]]
+          baseline_sha=$(git rev-parse "$BASELINE_TAG^{commit}")
+          git merge-base --is-ancestor "$baseline_sha" "$GITHUB_SHA"
+          baseline_tree=$(git rev-parse "$baseline_sha^{tree}")
+          mkdir -p target/performance-baseline
+          gh release view "$BASELINE_TAG" --json isDraft,isPrerelease > target/performance-baseline/release.json
+          jq -e '.isDraft == false and .isPrerelease == false' target/performance-baseline/release.json
+          extension=tar.gz
+          [[ "$BENCHMARK_TARGET" == *-windows-* ]] && extension=zip
+          asset="encore-$BENCHMARK_TARGET.$extension"
+          gh release download "$BASELINE_TAG" --dir target/performance-baseline \
+            --pattern "$asset" --pattern "$asset.sha256" \
+            --pattern "provenance-$BENCHMARK_TARGET.json" --pattern adoption.json
+          BASELINE_SHA="$baseline_sha" BASELINE_TREE="$baseline_tree" BASELINE_ASSET="$asset" python3 - <<'PYCODE'
+          import hashlib, json, os, tarfile, zipfile
+          from pathlib import Path
+          root = Path('target/performance-baseline')
+          asset = root / os.environ['BASELINE_ASSET']
+          assert hashlib.sha256(asset.read_bytes()).hexdigest() == Path(str(asset) + '.sha256').read_text().split()[0].lower()
+          adoption = json.loads((root / 'adoption.json').read_text())
+          assert adoption['release_commit'] == os.environ['BASELINE_SHA']
+          assert adoption['source_tree'] == os.environ['BASELINE_TREE']
+          receipt = json.loads((root / ('provenance-' + os.environ['BENCHMARK_TARGET'] + '.json')).read_text())
+          assert receipt['schema'] == 3 and receipt['commit'] == adoption['source_commit']
+          assert receipt['target'] == os.environ['BENCHMARK_TARGET'] and receipt['converged'] is True
+          unpacked = root / 'unpacked'
+          if asset.suffix == '.zip':
+              with zipfile.ZipFile(asset) as archive:
+                  for member in archive.namelist():
+                      assert (unpacked / member).resolve().is_relative_to(unpacked.resolve())
+                  archive.extractall(unpacked)
+          else:
+              with tarfile.open(asset) as archive:
+                  archive.extractall(unpacked, filter='data')
+          compilers = list(unpacked.glob('*/bin/' + os.environ['BENCHMARK_EXECUTABLE']))
+          assert len(compilers) == 1
+          compiler = compilers[0]
+          digest = hashlib.sha256(compiler.read_bytes()).hexdigest()
+          assert digest == receipt['compiler_sha256'] == receipt['stage2_sha256'] == receipt['stage3_sha256']
+          compiler.chmod(compiler.stat().st_mode | 0o111)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('compiler=' + compiler.as_posix() + '\n')
+          PYCODE
+          echo "sha=$baseline_sha" >> "$GITHUB_OUTPUT"
+      - name: Measure paired parallel builds and complete test suites
+        shell: bash
+        env:
+          BENCHMARK_EXECUTABLE: ${{ inputs.executable }}
+          BASELINE_COMPILER: ${{ steps.baseline.outputs.compiler }}
+          BASELINE_SHA: ${{ steps.baseline.outputs.sha }}
+          BENCHMARK_JOBS: ${{ inputs.performance_jobs }}
+        run: |
+          set -euo pipefail
+          python3 scripts/benchmark-compiler-tests.py "target/stage3/$BENCHMARK_EXECUTABLE" \
+            --baseline-compiler "$BASELINE_COMPILER" --baseline-ref "$BASELINE_SHA" \
+            --scenario all --jobs "$BENCHMARK_JOBS" --warm \
+            --output target/performance/results.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: compiler-performance-${{ inputs.triple }}
+          path: target/performance
           if-no-files-found: error
           retention-days: 30

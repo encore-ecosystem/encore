@@ -2267,6 +2267,82 @@ fn collect_direct_generic_call(out: mut Vec[GenericCall], seen: usize, instructi
     ret()
 }
 
+// Declaration-order chains preserve the scan's overload and discovery order.
+struct GenericTemplateIndex {
+    heads: usize
+    entries: Vec[(usize, usize)]
+}
+
+fn index_generic_template(index: mut GenericTemplateIndex, name: str, directive: usize) ->() {
+    let previous = unsafe {
+        encore_strmap_get(index.heads, name)
+    }
+    if previous != 0 {
+        let entry = index.entries.get(previous - 1).unwrap_or((0, 0))
+        if entry.0 == directive {
+            ret()
+        }
+    }
+    index.entries.push((directive, previous))
+    unsafe {
+        encore_strmap_put(index.heads, name, index.entries.len())
+    }
+}
+
+fn generic_template_index(directives: frozen Vec[Directive]) -> GenericTemplateIndex {
+    let mut index = GenericTemplateIndex {
+        unsafe {
+            encore_strmap_new()
+        }
+        , Vec[(usize, usize)]::new()
+    }
+    let mut position = 0_usize
+    for directive in directives {
+        match directive {
+            Directive::Function(function) => {
+                index_generic_template(index, function.name, position)
+                let mut separator = function.name.find_from("__", 0)
+                while separator < function.name.byte_len() {
+                    let suffix = function.name.slice_bytes(separator + 2, function.name.byte_len() - separator - 2)
+                    // Qualified calls only match the exact declaration name.
+                    if suffix.find_from("::", 0) == suffix.byte_len() {
+                        index_generic_template(index, suffix, position)
+                    }
+                    separator = function.name.find_from("__", separator + 1)
+                }
+            }
+            Directive::Impl(item) => {
+                for method in item.methods {
+                    index_generic_template(index, item.for_type.name + "::" + method.name, position)
+                }
+            }
+            _ => {
+            }
+        }
+        position += 1
+    }
+    ret index
+}
+
+fn generic_template_positions(index: frozen GenericTemplateIndex, name: str) -> Vec[usize] {
+    let mut reversed = Vec[usize]::new()
+    let mut encoded = unsafe {
+        encore_strmap_get(index.heads, name)
+    }
+    while encoded != 0 {
+        let entry = index.entries.get(encoded - 1).unwrap_or((0, 0))
+        reversed.push(entry.0)
+        encoded = entry.1
+    }
+    let mut out = Vec[usize]::new()
+    let mut remaining = reversed.len()
+    while remaining > 0 {
+        remaining -= 1
+        out.push(reversed.get(remaining).unwrap_or(0))
+    }
+    ret out
+}
+
 fn expand_generic_calls(directives: frozen Vec[Directive], calls: sending Vec[GenericCall]) -> Vec[GenericCall] {
     let mut expanded = Vec[GenericCall]::new()
     for call_data in calls {
@@ -2280,6 +2356,7 @@ fn expand_generic_calls(directives: frozen Vec[Directive], calls: sending Vec[Ge
             encore_strset_insert(seen, call_data.key)
         }
     }
+    let templates = generic_template_index(directives)
     let mut index = 0_usize
     while index < expanded.len() {
         match expanded.get(index) {
@@ -2291,17 +2368,15 @@ fn expand_generic_calls(directives: frozen Vec[Directive], calls: sending Vec[Ge
                 for arg in current.args {
                     current_args.push(arg)
                 }
-                let mut directive_index = 0_usize
-                while directive_index < directives.len() {
-                    match directives.get(directive_index) {
+                for template_position in generic_template_positions(templates, current_name) {
+                    match directives.get(template_position) {
                         Some(directive) => {
-                            expand_generic_call_in_directive(expanded, seen, directive,
-                                current_name, current_args,)
+                            expand_generic_call_in_directive(expanded, seen, directive, current_name, current_args)
+
                         }
                         None => {
                         }
                     }
-                    directive_index = directive_index + 1_usize
                 }
             }
             Option[GenericCall]::None => {
@@ -2310,6 +2385,7 @@ fn expand_generic_calls(directives: frozen Vec[Directive], calls: sending Vec[Ge
         index = index + 1_usize
     }
     unsafe {
+        encore_strmap_free(templates.heads)
         encore_strset_free(seen)
     }
     ret expanded
@@ -2453,19 +2529,68 @@ fn remember_generic_call(out: mut Vec[GenericCall], seen: usize, name: str,
     ret()
 }
 
+// Index call sites as well, so emission retains declaration/method/call order
+// without comparing every template with every specialization in the program.
+fn generic_call_index(calls: frozen Vec[GenericCall]) -> GenericTemplateIndex {
+    let mut index = GenericTemplateIndex {
+        unsafe {
+            encore_strmap_new()
+        }
+        , Vec[(usize, usize)]::new()
+    }
+    let mut position = 0_usize
+    for call in calls {
+        index_generic_template(index, call.name, position)
+        position += 1
+    }
+    ret index
+}
+
+fn function_call_positions(index: frozen GenericTemplateIndex, name: str) -> Vec[usize] {
+    let mut out = generic_template_positions(index, name)
+    let mut separator = name.find_from("__", 0)
+    while separator < name.byte_len() {
+        let suffix = name.slice_bytes(separator + 2, name.byte_len() - separator - 2)
+        if suffix.find_from("::", 0) == suffix.byte_len() {
+            out.extend(generic_template_positions(index, suffix))
+        }
+        separator = name.find_from("__", separator + 1)
+    }
+    let mut position = 1_usize
+    while position < out.len() {
+        let mut current = position
+        while current > 0 && out.get(current - 1).unwrap_or(0) > out.get(current).unwrap_or(0) {
+            let previous = out.get(current - 1).unwrap_or(0)
+            out.set(current - 1, out.get(current).unwrap_or(0))
+            out.set(current, previous)
+            current -= 1
+        }
+        position += 1
+    }
+    ret out
+}
+
 fn append_lowered_generic_functions(builder: usize, directives: frozen Vec[Directive], calls: frozen Vec[GenericCall],
     seen: usize, emitted: bool, declaration_builder: usize,) -> bool {
+    let sites = generic_call_index(calls)
     let mut any = emitted
     for directive in directives {
         match directive {
             Directive::Function(function) => {
                 if function.generics.len() > 0_usize {
-                    for call_data in calls {
-                        if generic_function_name_matches(function.name, call_data.name) && call_data.args.len() == function.generics.len() {
-                            let specialized = specialize_function_with_params(function,
-                                function.generics, call_data.args, "" + call_data.name,)
-                            any = append_specialized_generic_function(builder, declaration_builder,
-                                seen, any, specialized,)
+                    for call_position in function_call_positions(sites, function.name) {
+                        match calls.get(call_position) {
+                            Some(call_data) => {
+                                if generic_function_name_matches(function.name, call_data.name) && call_data.args.len() == function.generics.len() {
+                                    let specialized = specialize_function_with_params(function,
+                                        function.generics, call_data.args, "" + call_data.name,)
+                                    any = append_specialized_generic_function(builder, declaration_builder,
+                                        seen, any, specialized,)
+                                }
+
+                            }
+                            None => {
+                            }
                         }
                     }
                 }
@@ -2476,15 +2601,22 @@ fn append_lowered_generic_functions(builder: usize, directives: frozen Vec[Direc
                     if item.generics.len() == 0 && item.for_type.generics.len() == 0 && method.generics.len() == 0 {
                         continue
                     }
-                    for call_data in calls {
-                        if call_data.name == full_name {
-                            match specialize_impl_method(method, item.for_type, item.generics, call_data.args) {
-                                Some(specialized) => {
-                                    any = append_specialized_generic_function(builder,
-                                        declaration_builder, seen, any, specialized,)
+                    for call_position in generic_template_positions(sites, full_name) {
+                        match calls.get(call_position) {
+                            Some(call_data) => {
+                                if call_data.name == full_name {
+                                    match specialize_impl_method(method, item.for_type, item.generics, call_data.args) {
+                                        Some(specialized) => {
+                                            any = append_specialized_generic_function(builder,
+                                                declaration_builder, seen, any, specialized,)
+                                        }
+                                        None => {
+                                        }
+                                    }
                                 }
-                                None => {
-                                }
+
+                            }
+                            None => {
                             }
                         }
                     }
@@ -2493,6 +2625,9 @@ fn append_lowered_generic_functions(builder: usize, directives: frozen Vec[Direc
             _ => {
             }
         }
+    }
+    unsafe {
+        encore_strmap_free(sites.heads)
     }
     ret any
 }
@@ -2549,7 +2684,7 @@ fn generic_function_name_matches(template_name: str, call_name: str) -> bool {
     if template_name == call_name {
         ret true
     }
-    if call_name.contains("::") {
+    if call_name.find_from("::", 0) < call_name.byte_len() {
         ret false
     }
     ret str_ends_with(template_name, "__" + call_name)
@@ -4108,37 +4243,46 @@ fn collect_equality_types(owned: frozen Vec[Directive], directives: frozen Vec[D
             }
         }
     }
+    let templates = generic_template_index(directives)
     for site in calls {
-        for directive in directives {
-            match directive {
-                Directive::Function(function) => {
-                    if function.generics.len() > 0 && generic_function_name_matches(function.name, site.name)
-                    && function.generics.len() == site.args.len() {
-                        collect_function_equality(out, seen, specialize_function_with_params(function,
-                                function.generics, site.args, site.name,))
-                    }
-                }
-                Directive::Impl(item) => {
-                    for method in item.methods {
-                        let name = item.for_type.name + "::" + method.name
-                        if (item.generics.len() > 0 || item.for_type.generics.len() > 0 || method.generics.len() > 0) && name == site.name {
-                            match specialize_impl_method(method, item.for_type, item.generics, site.args) {
-                                Some(specialized) => {
-                                    collect_function_equality(out, seen, specialized)
-                                }
-                                None => {
+        for template_position in generic_template_positions(templates, site.name) {
+            match directives.get(template_position) {
+                Some(directive) => {
+                    match directive {
+                        Directive::Function(function) => {
+                            if function.generics.len() > 0 && generic_function_name_matches(function.name, site.name)
+                            && function.generics.len() == site.args.len() {
+                                collect_function_equality(out, seen, specialize_function_with_params(function,
+                                        function.generics, site.args, site.name,))
+                            }
+                        }
+                        Directive::Impl(item) => {
+                            for method in item.methods {
+                                let name = item.for_type.name + "::" + method.name
+                                if (item.generics.len() > 0 || item.for_type.generics.len() > 0 || method.generics.len() > 0) && name == site.name {
+                                    match specialize_impl_method(method, item.for_type, item.generics, site.args) {
+                                        Some(specialized) => {
+                                            collect_function_equality(out, seen, specialized)
+                                        }
+                                        None => {
+                                        }
+                                    }
                                 }
                             }
                         }
+                        _ => {
+                        }
                     }
+
                 }
-                _ => {
+                None => {
                 }
             }
         }
     }
     collect_required_type_closure(out, seen, directives, true)
     unsafe {
+        encore_strmap_free(templates.heads)
         encore_strset_free(seen)
     }
     ret out
@@ -4213,36 +4357,45 @@ fn collect_concrete_types(directives: frozen Vec[Directive], calls: frozen Vec[G
             }
         }
     }
+    let templates = generic_template_index(directives)
     for call_data in calls {
-        for directive in directives {
-            match directive {
-                Directive::Function(function) => {
-                    if generic_function_name_matches(function.name, call_data.name) && function.generics.len() == call_data.args.len() {
-                        collect_function_types(out, seen, specialize_function_with_params(function,
-                                function.generics, call_data.args, "" + call_data.name,))
-                    }
-                }
-                Directive::Impl(item) => {
-                    for method in item.methods {
-                        let full_name = item.for_type.name + "::" + method.name
-                        if (item.generics.len() > 0 || item.for_type.generics.len() > 0 || method.generics.len() > 0) && full_name == call_data.name {
-                            match specialize_impl_method(method, item.for_type, item.generics, call_data.args) {
-                                Some(specialized) => {
-                                    collect_function_types(out, seen, specialized)
-                                }
-                                None => {
+        for template_position in generic_template_positions(templates, call_data.name) {
+            match directives.get(template_position) {
+                Some(directive) => {
+                    match directive {
+                        Directive::Function(function) => {
+                            if generic_function_name_matches(function.name, call_data.name) && function.generics.len() == call_data.args.len() {
+                                collect_function_types(out, seen, specialize_function_with_params(function,
+                                        function.generics, call_data.args, "" + call_data.name,))
+                            }
+                        }
+                        Directive::Impl(item) => {
+                            for method in item.methods {
+                                let full_name = item.for_type.name + "::" + method.name
+                                if (item.generics.len() > 0 || item.for_type.generics.len() > 0 || method.generics.len() > 0) && full_name == call_data.name {
+                                    match specialize_impl_method(method, item.for_type, item.generics, call_data.args) {
+                                        Some(specialized) => {
+                                            collect_function_types(out, seen, specialized)
+                                        }
+                                        None => {
+                                        }
+                                    }
                                 }
                             }
                         }
+                        _ => {
+                        }
                     }
+
                 }
-                _ => {
+                None => {
                 }
             }
         }
     }
     collect_declaration_type_closure(out, seen, directives)
     unsafe {
+        encore_strmap_free(templates.heads)
         encore_strset_free(seen)
     }
     ret out
@@ -5562,7 +5715,7 @@ fn str_ends_with(value: str, suffix: str) -> bool {
     if suffix.len() > value.len() {
         ret false
     }
-    ret value.slice(value.len() - suffix.len(), suffix.len()) == suffix
+    ret value.range_eq(value.byte_len() - suffix.byte_len(), suffix.byte_len(), suffix)
 }
 
 fn numeric_literal_text(value: str) -> str {

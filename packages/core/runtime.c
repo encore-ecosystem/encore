@@ -1115,6 +1115,36 @@ encore_str encore_str_slice_chars(encore_str value, size_t start, size_t char_le
     return encore_str_copy_range(value, start_byte, end_byte - start_byte);
 }
 
+/* Same character boundaries as slice_chars, without allocating a substring at
+ * every position or rescanning the prefix. Keep the boundary check for raw,
+ * malformed UTF-8 as well: a byte match inside a character is not a match. */
+bool encore_str_contains(encore_str value, encore_str needle) {
+    size_t length = encore_str_size(value);
+    size_t wanted = encore_str_size(needle);
+    if (wanted == 0) return true;
+    if (wanted > length) return false;
+    const unsigned char *bytes = (const unsigned char *)encore_str_data(value);
+    const unsigned char *pattern = (const unsigned char *)encore_str_data(needle);
+    size_t characters = encore_str_char_len(needle);
+    for (size_t cursor = 0; cursor <= length - wanted;) {
+        if (bytes[cursor] == pattern[0] && memcmp(bytes + cursor, pattern, wanted) == 0) {
+            size_t end = cursor;
+            size_t taken = 0;
+            while (taken < characters && end < length) {
+                size_t width = encore_utf8_char_width(bytes[end]);
+                if (width > length - end) width = 1;
+                end += width;
+                ++taken;
+            }
+            if (taken == characters && end == cursor + wanted) return true;
+        }
+        size_t width = encore_utf8_char_width(bytes[cursor]);
+        if (width > length - cursor) width = 1;
+        cursor += width;
+    }
+    return false;
+}
+
 encore_str encore_str_slice(encore_str value, size_t start, size_t slice_len) {
     return encore_str_copy_range(value, start, slice_len);
 }

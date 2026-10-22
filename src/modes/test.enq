@@ -5,7 +5,7 @@ import core::fmt::Debug
 import core::option::Option
 
 import std::io::{eprintln, println}
-import std::os::{file_exists, mkdir_all, read_dir, read_file, remove_file, write_file}
+import std::os::{env, file_exists, mkdir_all, read_dir, read_file, remove_file, write_file}
 import std::path::{Path, clone_path}
 import std::process::{run_args, run_args_capture}
 import std::thread::{JoinHandle, available_parallelism}
@@ -57,9 +57,13 @@ struct UnitTestJob {
 }
 
 extern fn encore_compiler_keep_build_artifacts() -> bool
+extern fn encore_build_queue_new(count: usize) -> usize
+extern fn encore_build_queue_next(queue: usize) -> usize
+extern fn encore_build_queue_free(queue: usize) ->()
 
 /// Performs the `native_test` operation.
 pub fn native_test() -> u32 {
+    let suite_started = perf_counter_ms()
     if has_flag("--keep-build-artifacts") {
         let retained = unsafe {
             encore_compiler_keep_build_artifacts()
@@ -81,6 +85,7 @@ pub fn native_test() -> u32 {
     if worker_path != "" {
         let path = Path::new(worker_path).resolve()
         let mut worker_workspace = load_entry_workspace(root, path)
+        profile_test_duration("worker-load", suite_started)
         // Negative tests need the early semantic diagnostic they assert on.
         // Positive tests can go straight to the cached compile path; a cache
         // miss still runs the complete lowering-time validator.
@@ -109,13 +114,14 @@ pub fn native_test() -> u32 {
     } else {
         load_entry_workspace(root, root.join("src").join("main.enq"))
     }
+    profile_test_duration("discovery", suite_started)
     let selection = test_selection()
     if has_switch("--list") {
         ret list_selected_tests(root, workspace, selection)
     }
     let total = count_selected_tests(root, workspace, selection)
     if total == 0_usize {
-        if !write_test_report_if_requested(selection, Vec[TestRecord]::new(), 0_usize, 0_usize) {
+        if !write_test_report_if_requested(selection, Vec[TestRecord]::new(), 0_usize, 0_usize, perf_counter_ms() - suite_started, 0) {
             ret 1_u32
         }
         println("No tests found.")
@@ -165,6 +171,7 @@ pub fn native_test() -> u32 {
         }
         module_index = module_index + 1_usize
     }
+    let mut harness_duration_ms = 0_u64
     let mut harness_failure = ""
     let mut needs_harness = false
     for job in unit_jobs {
@@ -175,23 +182,34 @@ pub fn native_test() -> u32 {
     if needs_harness {
         let started = perf_counter_ms()
         harness_failure = prepare_unit_test_harness(root)
+        harness_duration_ms = perf_counter_ms() - started
         if harness_failure == "" {
             eprintln("Prepared unit test harness in " + format_test_duration(perf_counter_ms() - started))
         }
     }
     let scheduled_unit_jobs = schedule_unit_test_jobs(unit_jobs)
     let unit_worker_count = min_test_jobs(requested_test_jobs(), scheduled_unit_jobs.len())
+    let unit_queue = unsafe {
+        encore_build_queue_new(scheduled_unit_jobs.len())
+    }
+    if unit_queue == 0_usize {
+        eprintln("cannot allocate unit test work queue")
+        ret 1_u32
+    }
     let unit_root = Path::new("" + root.as_str())
     let mut unit_pending = Vec[JoinHandle[Vec[StandaloneTestResult]]]::new()
     let mut unit_worker = 0_usize
     while unit_worker < unit_worker_count {
         unit_pending.push(spawn run_unit_test_batch(unit_root, scheduled_unit_jobs,
-                harness_failure, unit_worker, unit_worker_count,))
+                harness_failure, unit_queue,))
         unit_worker += 1_usize
     }
     let mut unit_results = Vec[StandaloneTestResult]::new()
     for handle in unit_pending {
         unit_results.extend(handle.join())
+    }
+    unsafe {
+        encore_build_queue_free(unit_queue)
     }
     let mut unit_result_index = 0_usize
     while unit_result_index < unit_jobs.len() {
@@ -246,16 +264,26 @@ pub fn native_test() -> u32 {
     }
     let scheduled_jobs = schedule_standalone_test_jobs(standalone_jobs)
     let worker_count = min_test_jobs(requested_test_jobs(), scheduled_jobs.len())
+    let queue = unsafe {
+        encore_build_queue_new(scheduled_jobs.len())
+    }
+    if queue == 0_usize {
+        eprintln("cannot allocate standalone test work queue")
+        ret 1_u32
+    }
     let standalone_root = Path::new("" + root.as_str())
     let mut pending = Vec[JoinHandle[Vec[StandaloneTestResult]]]::new()
     let mut worker = 0_usize
     while worker < worker_count {
-        pending.push(spawn run_standalone_test_batch(standalone_root, scheduled_jobs, worker, worker_count))
+        pending.push(spawn run_standalone_test_batch(standalone_root, scheduled_jobs, queue))
         worker += 1_usize
     }
     let mut standalone_results = Vec[StandaloneTestResult]::new()
     for handle in pending {
         standalone_results.extend(handle.join())
+    }
+    unsafe {
+        encore_build_queue_free(queue)
     }
     let mut result_index = 0_usize
     while result_index < standalone_jobs.len() {
@@ -283,7 +311,7 @@ pub fn native_test() -> u32 {
     }
 
     progress.finish(passed, failed)
-    if !write_test_report_if_requested(selection, records, passed, failed) {
+    if !write_test_report_if_requested(selection, records, passed, failed, perf_counter_ms() - suite_started, harness_duration_ms) {
         ret 1_u32
     }
     if failed == 0_usize {
@@ -403,6 +431,8 @@ fn write_test_report_if_requested(
     records: Vec[TestRecord],
     passed: usize,
     failed: usize,
+    wall_duration_ms: u64,
+    harness_duration_ms: u64,
 ) -> bool {
     let report_path = option_value("--report")
     if report_path == "" {
@@ -423,7 +453,10 @@ fn write_test_report_if_requested(
     summary.push(field("selected", Json::Number(Debug::fmt(passed + failed))))
     summary.push(field("passed", Json::Number(Debug::fmt(passed))))
     summary.push(field("failed", Json::Number(Debug::fmt(failed))))
+    summary.push(field("jobs", Json::Number(Debug::fmt(requested_test_jobs()))))
     summary.push(field("duration_ms", Json::Number(Debug::fmt(total_duration))))
+    summary.push(field("wall_duration_ms", Json::Number(Debug::fmt(wall_duration_ms))))
+    summary.push(field("harness_duration_ms", Json::Number(Debug::fmt(harness_duration_ms))))
     let mut root = Vec[(str, Json)]::new()
     root.push(field("schema", Json::Number("1")))
     root.push(field("summary", Json::Object(summary)))
@@ -704,12 +737,17 @@ fn schedule_unit_test_jobs(jobs: mut Vec[UnitTestJob]) -> Vec[UnitTestJob] {
     ret jobs
 }
 
-fn run_unit_test_batch(root: frozen Path, jobs: frozen Vec[UnitTestJob], harness_failure: frozen str, worker_index: usize,
-    worker_count: usize,) -> sending Vec[StandaloneTestResult] {
+fn run_unit_test_batch(root: frozen Path, jobs: frozen Vec[UnitTestJob], harness_failure: frozen str,
+    queue: usize,) -> sending Vec[StandaloneTestResult] {
     let root = clone_path(root)
     let mut out = Vec[StandaloneTestResult]::new()
-    let mut index = worker_index
-    while index < jobs.len() {
+    loop {
+        let index = unsafe {
+            encore_build_queue_next(queue)
+        }
+        if index >= jobs.len() {
+            break
+        }
         match jobs.get(index) {
             Some(job) => {
                 let started = perf_counter_ms()
@@ -730,7 +768,6 @@ fn run_unit_test_batch(root: frozen Path, jobs: frozen Vec[UnitTestJob], harness
             None => {
             }
         }
-        index += worker_count
     }
     ret out
 }
@@ -748,6 +785,9 @@ fn run_standalone_test(root: Path, path: Path, display: str) -> str {
     args.push("1")
     let code = run_args_capture(executable, args, output_path.as_str())
     let output = read_file(output_path.as_str())
+    if env("ENCORE_CODEGEN_PROFILE").is_some() {
+        eprintln(output)
+    }
     if expected != "" {
         if code != 0_i32 {
             if contains(output, expected) {
@@ -836,12 +876,17 @@ fn schedule_standalone_test_jobs(jobs: mut Vec[StandaloneTestJob]) -> Vec[Standa
     ret jobs
 }
 
-fn run_standalone_test_batch(root: frozen Path, jobs: frozen Vec[StandaloneTestJob], worker_index: usize,
-    worker_count: usize,) -> sending Vec[StandaloneTestResult] {
+fn run_standalone_test_batch(root: frozen Path, jobs: frozen Vec[StandaloneTestJob],
+    queue: usize,) -> sending Vec[StandaloneTestResult] {
     let root = clone_path(root)
     let mut out = Vec[StandaloneTestResult]::new()
-    let mut index = worker_index
-    while index < jobs.len() {
+    loop {
+        let index = unsafe {
+            encore_build_queue_next(queue)
+        }
+        if index >= jobs.len() {
+            break
+        }
         match jobs.get(index) {
             Some(job) => {
                 let started = perf_counter_ms()
@@ -856,7 +901,6 @@ fn run_standalone_test_batch(root: frozen Path, jobs: frozen Vec[StandaloneTestJ
             None => {
             }
         }
-        index += worker_count
     }
     ret out
 }
@@ -890,7 +934,9 @@ fn compile_and_run_result(root: Path, workspace: ProjectWorkspace, ast: Vec[Stat
         ret "compile failed"
     }
     let binary_name = target_executable_name(host_target(), name)
+    let run_started = perf_counter_ms()
     let code = run_args(root.join("target").join("tests").join("bin").join(binary_name).as_str(), Vec[str]::new())
+    profile_test_duration("run", run_started)
     if code == 0_i32 {
         ret ""
     }
@@ -1155,4 +1201,10 @@ fn argc() -> usize {
 }
 fn argv(index: usize) -> Option[str] {
     ret process_arg(index)
+}
+
+fn profile_test_duration(stage: str, started: u64) ->() {
+    if env("ENCORE_CODEGEN_PROFILE").is_some() {
+        eprintln("test-time " + stage + ": " + Debug::fmt(perf_counter_ms() - started) + " ms")
+    }
 }

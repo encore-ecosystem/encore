@@ -1,5 +1,7 @@
 //! Real CLI contracts, independent of the source-analysis library interface.
 
+import core::fmt::Debug
+
 import std::io::eprintln
 import std::os::{env, file_exists, file_sha256, read_dir, read_file, remove_dir_all, remove_file}
 import std::process::Command
@@ -11,6 +13,69 @@ import json::Json
 import refrain::ci_helpers::{Fixture, flag, json, modified_ns, number, replace, set_env, std_dependencies, text}
 import refrain::modes::build_output::{build_artifact_name, build_import_library_name}
 import refrain::target::host_target
+
+#attr(test)
+fn integration_parallel_test_queue_contract() -> bool {
+    let fixture = Fixture::new("parallel-test-queue")
+    fixture.manifest("queue_probe", "[]")
+    // Exclusive marker creation detects a duplicate execution across processes.
+    fixture.put("runtime.c", "#include <stdio.h>\n#include <stdint.h>\n#include <stdbool.h>\n" +
+        "bool queue_once(uint32_t id) { char path[64]; snprintf(path, sizeof(path), \"once/%u\", id); " +
+        "FILE *file = fopen(path, \"wx\"); if (!file) return false; return fclose(file) == 0; }\n",)
+    let mut source = "extern fn queue_once(id: u32) -> bool\n"
+    for index in 0..20 {
+        source += "#attr(test)\nfn unit_" + Debug::fmt(index) +
+        "() -> bool { unsafe { ret queue_once(" + Debug::fmt(index) + "_u32) } }\n"
+    }
+    fixture.put("src/lib.enq", source)
+    for index in 20..28 {
+        fixture.put("tests/case_" + Debug::fmt(index) + ".enq",
+            "extern fn queue_once(id: u32) -> bool\nfn main() -> u32 { unsafe { " +
+            "ret if queue_once(" + Debug::fmt(index) + "_u32) { 0_u32 } else { 1_u32 } } }\n",)
+    }
+    fixture.put("tests/negative.enq",
+        "// @expect.compile_error=unknown\nfn main() -> u32 { let value: Missing = 1_u32 ret 0_u32 }\n",)
+    let mut reference = ""
+    for jobs in vec!["1", "2", "4", "8", "auto"] {
+        remove_dir_all(fixture.root.join("once").as_str())
+        fixture.put("once/.keep", "")
+        let args = if jobs == "auto" {
+            vec!["test", "--report", "report.json"]
+        } else {
+            vec!["test", "--jobs", jobs, "--report", "report.json"]
+        }
+        if !fixture.command(args).success() {
+            ret fixture.failure("parallel test run failed")
+        }
+        let report = json(fixture.read("report.json"))
+        let summary = report.get("summary").unwrap_or(Json::Null)
+        if number(summary, "selected") != "29" || number(summary, "passed") != "29" ||
+        number(summary, "failed") != "0" || read_dir(fixture.root.join("once").as_str()).len() != 29 {
+            ret fixture.failure("every selected test must run exactly once")
+        }
+        let mut ids = ""
+        for record in report.get("tests").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new()) {
+            ids += text(record, "id") + "\n"
+        }
+        if reference != "" && ids != reference {
+            ret fixture.failure("worker count changed test IDs or report order")
+        }
+        reference = ids
+    }
+    remove_dir_all(fixture.root.join("once").as_str())
+    fixture.put("once/.keep", "")
+    fixture.put("src/lib.enq", source + "#attr(test)\nfn deliberate_failure() -> bool { ret false }\n")
+    if fixture.command(vec!["test", "--jobs", "4", "--report", "failed.json"]).code() != 1 ||
+    number(json(fixture.read("failed.json")).get("summary").unwrap_or(Json::Null), "selected") != "30" ||
+    number(json(fixture.read("failed.json")).get("summary").unwrap_or(Json::Null), "passed") != "29" {
+        ret fixture.failure("one failing test must not drop independent queued tests")
+    }
+    if !fixture.command(vec!["test", "--filter", "nothing-selected", "--jobs", "4", "--report", "empty.json"]).success() ||
+    number(json(fixture.read("empty.json")).get("summary").unwrap_or(Json::Null), "selected") != "0" {
+        ret fixture.failure("empty selection must succeed")
+    }
+    ret fixture.finish(true)
+}
 
 #attr(test)
 fn integration_test_utf8_discovery_contract() -> bool {
