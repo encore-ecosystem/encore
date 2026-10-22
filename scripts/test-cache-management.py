@@ -12,9 +12,24 @@ compiler = Path(sys.argv[1]).resolve()
 checks = []
 
 
-def snapshot(root):
+def snapshot(root, open_files=()):
+    streams = {Path(stream.name): stream for stream in open_files}
+
+    def contents(path):
+        stream = streams.get(path)
+        if stream is None:
+            return path.read_bytes()
+        # Windows byte-range locks also deny reads through a second handle
+        # in this process. Inspect the lease through the handle owning its lock.
+        position = stream.tell()
+        try:
+            stream.seek(0)
+            return stream.read()
+        finally:
+            stream.seek(position)
+
     return sorted((str(p.relative_to(root)), p.stat().st_size, p.stat().st_mtime_ns,
-                   hashlib.sha256(p.read_bytes()).hexdigest())
+                   hashlib.sha256(contents(p)).hexdigest())
                   for p in root.rglob('*') if p.is_file() and not p.is_symlink())
 
 
@@ -125,14 +140,14 @@ with tempfile.TemporaryDirectory(prefix='encore-cache-policy-') as temporary:
     (legacy / 'user-file').write_text('unregistered workspace')
     binary = project / 'target/dev/fixture'
     binary.write_text('final binary')
-    with lock(lease):
+    with lock(lease) as held_lease:
         status = invoke('status', '--json')
         states = {Path(item['path']).name: item['state'] for item in status['workspaces']}
         assert states['packages-active'] == 'active'
         assert states['packages-retained'] == 'retained'
-        before = snapshot(project)
+        before = snapshot(project, (held_lease,))
         invoke('prune', '--dry-run', '--json')
-        assert snapshot(project) == before
+        assert snapshot(project, (held_lease,)) == before
         invoke('prune', '--json')
         assert active.exists() and retained.exists() and not stale.exists() and not failed.exists()
     invoke('prune', '--json')
