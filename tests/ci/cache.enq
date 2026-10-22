@@ -1,0 +1,515 @@
+//! Public build/cache contracts: inspect receipts and execute real artifacts.
+
+import core::panic::panic
+import json::Json
+import refrain::ci_helpers::{Fixture, repository, json, text, flag, number, modified_ns, set_env}
+import std::os::{read_dir, read_file, write_file, file_exists, file_sha256, remove_dir_all, remove_file}
+import std::path::Path
+import std::process::Command
+import std::vec::Vec
+
+fn prepare(fixture: Fixture) ->() {
+    fixture.manifest("cache_application", "[\"path@dependency\"]")
+    fixture.put("dependency/encore.toml", "[project]\nname=\"cache_dependency\"\nversion=\"0.0.0\"\ndependencies=[]\n")
+    fixture.put("dependency/src/lib.enq", "pub fn cached_value() -> u32 { ret 41 }\n")
+    fixture.put("src/main.enq", "import core::option::Option as Opt\nimport cache_dependency::cached_value\n" +
+        "fn main() -> u32 { let value = Opt[u64]::Some(cached_value() as u64) ret if value.unwrap_or(0) == 41 { 0 } else { 1 } }\n",)
+}
+
+fn build(fixture: Fixture, jobs: str, profile: str) -> Json {
+    let output = fixture.command(vec!["build", "--jobs", jobs, "--profile", profile, "--timings"])
+    if !output.success() {
+        panic("build failed in " + fixture.root.as_str() + "\n" + output.text())
+    }
+    let report = json(fixture.read("target/" + profile + "/encore-timings.json"))
+    if number(report, "schema") != "1" {
+        panic("missing build timings")
+    }
+    ret report
+}
+
+fn unit(report: Json, name: str) -> Json {
+    for value in report.get("units").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new()) {
+        if text(value, "unit") == name {
+            ret value
+        }
+    }
+    panic("missing package in build report: " + name)
+    ret Json::Null
+}
+
+fn all_cached(report: Json) -> bool {
+    let units = report.get("units").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new())
+    if units.is_empty() {
+        ret false
+    }
+    for value in units {
+        if !flag(value, "cache_hit") {
+            ret false
+        }
+    }
+    ret true
+}
+
+fn executes(fixture: Fixture, profile: str) -> bool {
+    ret Command::new(fixture.binary("cache_application", profile).as_str()).output().success()
+}
+
+#attr(test)
+fn integration_module_namespace_dispatch_contract() -> bool {
+    let fixture = Fixture::new("module-namespace")
+    fixture.manifest("module_namespace", "[]")
+    fixture.put("src/left.enq", "pub fn value()->u32 {ret 11_u32} pub fn identity[T](value:T)->T {ret value}\n")
+    fixture.put("src/nested/mod.enq", "pub import mod::other\n")
+    fixture.put("src/nested/other.enq", "pub fn value()->u32 {ret 22_u32} pub fn identity[T](value:T)->T {ret value}\n")
+    let source = "import mod::left\nimport mod::nested\nfn main()->u32 {ret if left::value()==11_u32 && nested::other::value()==22_u32 && left::identity[u32](73_u32)==73_u32 {0_u32} else {1_u32}}\n"
+    fixture.put("src/main.enq", source)
+    fixture.put("tests/namespaces.enq", "import refrain::left\nimport refrain::nested\nfn main()->u32 {ret if left::value()==11_u32 && nested::other::value()==22_u32 {0_u32} else {1_u32}}\n")
+    for profile in vec!["dev", "release"] {
+        if !fixture.succeeds(vec!["build", "--profile", profile]) ||
+        !Command::new(fixture.binary("module_namespace", profile).as_str()).output().success() {
+            ret fixture.finish(false)
+        }
+    }
+    ret fixture.finish(fixture.succeeds(vec!["test", "--jobs", "1"]))
+}
+
+#attr(test)
+fn integration_async_nominal_output_contract() -> bool {
+    let fixture = Fixture::new("async-nominal-output")
+    fixture.manifest("async_nominal", "[\"path@" + repository().join("packages/std").as_str() + "\"]")
+    fixture.put("src/main.enq", "import mod::remote::make as remote_make\n" +
+        read_file(repository().join("tests/async_nominal_output.enq").as_str()) +
+        "\nasync fn remote_output() -> u32 { let result=await remote_make() ret result.value }\n",)
+    fixture.put("src/remote.enq", "pub struct Payload { value: u32 } pub async fn make() -> Payload { ret Payload{19_u32} }\n")
+    if !fixture.succeeds(vec!["check"]) {
+        ret fixture.finish(false)
+    }
+    for profile in vec!["dev", "release"] {
+        if !fixture.succeeds(vec!["build", "--profile", profile]) ||
+        !Command::new(fixture.binary("async_nominal", profile).as_str()).output().success() {
+            ret fixture.finish(false)
+        }
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_issue78_branch_literal_contract() -> bool {
+    let fixture = Fixture::new("issue78")
+    fixture.manifest("issue78", "[]")
+    fixture.put("src/main.enq", "struct Gesture { value: f32 step: f32 enabled: bool }\n" +
+        "impl for Gesture { pub fn limit(self: mut Self, start: f32) -> () { " +
+        "let minimum = if start < 0.1 { start } else { 0.1 } let lower = minimum - start " +
+        "if self.value < lower { self.value = if self.enabled { ((lower / self.step) as i64 as f32) * self.step } else { lower } } } }\n" +
+        "fn mixed(start: f32) -> f32 { let value = if start < 0.1 { (0.1) } elif start > 1 { -0.2 } else { start } ret value }\n" +
+        "fn narrow(start: u8) -> u8 { let value = if start == 0 { 7 } else { start } ret value }\n" +
+        "fn main() -> u32 { let mut gesture = Gesture { -1.0, 0.1, true } gesture.limit(0.17) " +
+        "let branch: f32 = if false { 0.3 } elif true { 0.2 } else { 0.1 } " +
+        "ret if gesture.value == 0.0_f32 && branch == 0.2_f32 && mixed(0.2) == 0.2_f32 && mixed(0.01) == 0.1_f32 && narrow(0) == 7_u8 { 0 } else { 1 } }\n",)
+    let output = fixture.command(vec!["build"])
+    ret fixture.finish(output.success() && Command::new(fixture.binary("issue78", "dev").as_str()).output().success())
+}
+
+#attr(test)
+fn integration_issue79_module_generic_contract() -> bool {
+    let fixture = Fixture::new("issue79")
+    fixture.manifest("issue79", "[]")
+    fixture.put("src/generic.enq", "pub fn clamp[T](value: T, low: T, high: T) -> T { ret value } pub fn marker() -> u32 { ret 0 }\n")
+    fixture.put("src/guide.enq", "fn clamp(value: f32, low: f32, high: f32) -> f32 { ret if value < low { low } elif value > high { high } else { value } } pub fn calculate(value: f32) -> f32 { ret clamp(value, 0, 1) }\n")
+    fixture.put("src/main.enq", "import mod::generic::marker\nimport mod::guide::calculate\nimport mod::generic::clamp as generic_clamp\nfn main() -> u32 { let value = calculate(2.0_f32) let other = generic_clamp(7_u32, 0_u32, 10_u32) ret if value == 1.0_f32 && other == 7 { marker() } else { 1 } }\n")
+    let output = fixture.command(vec!["build"])
+    ret fixture.finish(output.success() && Command::new(fixture.binary("issue79", "dev").as_str()).output().success())
+}
+
+#attr(test)
+fn integration_issue80_vector_temporaries_contract() -> bool {
+    let fixture = Fixture::new("issue80")
+    fixture.manifest("issue80", "[]")
+    fixture.put("src/main.enq", "import core::vec::Vec\nfn roots(selection: Vec[u32], parents: Vec[u32]) -> Vec[u32] { ret selection }\n" +
+        "fn main() -> u32 { let first = roots(vec![1_u32, 2_u32], vec![0_u32, 1_u32]) " +
+        "let selection = vec![3_u32, 4_u32] let parents = vec![0_u32, 1_u32] let second = roots(selection, parents) " +
+        "let nested = vec![vec![5_u32, 6_u32], vec![7_u32, 8_u32]] " +
+        "let inner = nested.get(1).unwrap_or(Vec[u32]::new()) " +
+        "ret if first.len() == 2 && first.get(1).unwrap_or(0) == 2 && second.get(0).unwrap_or(0) == 3 && inner.get(0).unwrap_or(0) == 7 { 0 } else { 1 } }\n",)
+    let output = fixture.command(vec!["build"])
+    ret fixture.finish(output.success() && Command::new(fixture.binary("issue80", "dev").as_str()).output().success())
+}
+
+#attr(test)
+fn integration_issue110_tuple_temporaries_contract() -> bool {
+    let fixture = Fixture::new("issue110")
+    fixture.manifest("issue110", "[]")
+    fixture.put("src/main.enq", read_file(repository().join("tests/tuple_temporaries.enq").as_str()))
+    if !fixture.succeeds(vec!["check"]) {
+        ret fixture.finish(false)
+    }
+    for profile in vec!["dev", "release"] {
+        if !fixture.succeeds(vec!["build", "--profile", profile]) ||
+        !Command::new(fixture.binary("issue110", profile).as_str()).output().success() {
+            ret fixture.finish(false)
+        }
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_issue111_async_result_contract() -> bool {
+    let fixture = Fixture::new("issue111")
+    fixture.manifest("issue111", "[\"path@" + repository().join("packages/std").as_str() + "\"]")
+    fixture.put("src/main.enq", read_file(repository().join("tests/async_result_await.enq").as_str()))
+    fixture.put("src/imported.enq", "import core::result::Result\npub async fn imported() -> Result[bool,str] { ret Result[bool,str]::Ok(true) }\n")
+    fixture.put("src/main.enq", "import mod::imported::imported as aliased\n" + fixture.read("src/main.enq") + "\nasync fn imported_result() -> Result[bool,str] { ret await aliased() }\n")
+    if !fixture.succeeds(vec!["check"]) {
+        ret fixture.finish(false)
+    }
+    for profile in vec!["dev", "release"] {
+        if !fixture.succeeds(vec!["build", "--profile", profile]) || !Command::new(fixture.binary("issue111", profile).as_str()).output().success() {
+            ret fixture.finish(false)
+        }
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_issue112_generic_await_contract() -> bool {
+    let fixture = Fixture::new("issue112")
+    fixture.manifest("issue112", "[\"path@" + repository().join("packages/std").as_str() + "\"]")
+    fixture.put("src/imported.enq", "pub async fn imported[T](value: T) -> T { ret value }\n")
+    fixture.put("src/main.enq", "import mod::imported::imported as aliased\n" +
+        read_file(repository().join("tests/async_generic_await.enq").as_str()) +
+        "\nasync fn imported_generic() -> u32 { ret await aliased[u32](42_u32) }\n",)
+    if !fixture.succeeds(vec!["check"]) {
+        ret fixture.finish(false)
+    }
+    for profile in vec!["dev", "release"] {
+        if !fixture.succeeds(vec!["build", "--profile", profile]) ||
+        !Command::new(fixture.binary("issue112", profile).as_str()).output().success() {
+            ret fixture.finish(false)
+        }
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_issue113_ready_collision_contract() -> bool {
+    let fixture = Fixture::new("issue113")
+    fixture.manifest("issue113", "[]")
+    let source = read_file(repository().join("tests/future_ready_collision.enq").as_str())
+    fixture.put("src/main.enq", source)
+    fixture.put("tests/ready.enq", source)
+    if !fixture.succeeds(vec!["check"]) || !fixture.succeeds(vec!["test", "--jobs", "1"]) {
+        ret fixture.finish(false)
+    }
+    for profile in vec!["dev", "release"] {
+        if !fixture.succeeds(vec!["build", "--profile", profile]) ||
+        !Command::new(fixture.binary("issue113", profile).as_str()).output().success() {
+            ret fixture.finish(false)
+        }
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_issue81_package_role_contract() -> bool {
+    let fixture = Fixture::new("issue81")
+    let library = Fixture { fixture.root.join("library"), fixture.compiler }
+    library.manifest("entry_library", "[]")
+    library.put("src/lib.enq", "pub fn identity() -> u32 { ret 7 }\n")
+    library.put("src/main.enq", "fn main() -> u32 { ret 42 }\n")
+    let consumer = Fixture { fixture.root.join("consumer"), fixture.compiler }
+    consumer.manifest("entry_consumer", "[\"path@../library\"]")
+    consumer.put("src/main.enq", "import entry_library::identity\nfn main() -> u32 { ret if identity() == 7 { 0 } else { 1 } }\n")
+    for order in vec!["binary-first", "dependency-first"] {
+        set_env("ENCORE_BUILD_CACHE", fixture.root.join(order).as_str())
+        let first = if order == "binary-first" {
+            library
+        } else {
+            consumer
+        }
+        let second = if order == "binary-first" {
+            consumer
+        } else {
+            library
+        }
+        if !first.command(vec!["build", "--profile", "release"]).success() ||
+        !second.command(vec!["build", "--profile", "release"]).success() {
+            ret fixture.finish(false)
+        }
+        if !Command::new(consumer.binary("entry_consumer", "release").as_str()).output().success() ||
+        Command::new(library.binary("entry_library", "release").as_str()).output().status != 42 {
+            ret fixture.finish(false)
+        }
+    }
+    ret fixture.finish(true)
+}
+
+fn committed(fixture: Fixture) -> Vec[Path] {
+    let mut entries = Vec[Path]::new()
+    for name in read_dir(fixture.root.join("cache").as_str()) {
+        let entry = fixture.root.join("cache").join(name)
+        if file_exists(entry.join("unit.complete").as_str()) {
+            let ready = json(read_file(entry.join("unit.ready").as_str()))
+            if text(ready.get("context").unwrap_or(Json::Null), "unit") == "cache_application" {
+                entries.push(entry)
+            }
+        }
+    }
+    ret entries
+}
+
+#attr(test)
+fn integration_unit_binding_contract() -> bool {
+    let fixture = Fixture::new("unit-bindings")
+    fixture.manifest("cache_application", "[]")
+    fixture.put("src/main.enq", "struct Counter { value: u32 }\n" +
+        "fn touch(counter: mut Counter<H>) -> () { counter.value += 1 }\n" +
+        "fn relay(counter: mut Counter<H>) -> () { let value = unsafe { touch(counter) } let alias: () = value ret alias }\n" +
+        "fn main() -> u32 { let mut counter = Counter<H>{0} let mut value: () = touch(counter) " +
+        "value = unsafe { touch(counter) } let copied = value relay(counter) ret if counter.value == 3 { 0 } else { 1 } }\n",)
+    build(fixture, "2", "dev")
+    ret fixture.finish(executes(fixture, "dev"))
+}
+
+#attr(test)
+fn integration_native_object_reuse_contract() -> bool {
+    let fixture = Fixture::new("native-object-reuse")
+    fixture.manifest("cache_application", "[]")
+    fixture.put("src/stable.enq", "pub fn unchanged() -> u32 { ret 41 }\n")
+    let prefix = "import mod::stable::unchanged\n" +
+    "fn same[T](value: T) -> T { ret value }\n" +
+    "trait Handler { fn handle(self: Self, value: u32) -> u32 }\n" +
+    "fn kept(base: u32) -> u32 { let handler: dyn Handler = | value | base + value ret handler.handle(2_u32) }\n"
+    fixture.put("src/main.enq", prefix + "fn main() -> u32 { ret unchanged() + kept(39_u32) - 82 }\n")
+    build(fixture, "2", "dev")
+    if !executes(fixture, "dev") {
+        ret fixture.finish(false)
+    }
+    let main_body = "fn main() -> u32 { let expected = 41_u32 ret unchanged() + kept(39_u32) - expected * 2 }\n"
+    fixture.put("src/main.enq", prefix + main_body)
+    let changed = unit(build(fixture, "2", "dev"), "cache_application")
+    let phases = changed.get("phases").unwrap_or(Json::Null)
+    let reused = number(phases, "objects_reused")
+    let compiled = number(phases, "objects_compiled")
+    if reused == "" || reused == "0" || compiled == "" || compiled == "0" || !executes(fixture, "dev") {
+        ret fixture.finish(false)
+    }
+    if number(phases, "modules_reused") == "" || number(phases, "modules_reused") == "0" ||
+    number(phases, "functions_reused") == "" || number(phases, "functions_reused") == "0" {
+        ret fixture.finish(false)
+    }
+    let generic_prefix = "import mod::stable::unchanged\n" +
+    "fn same[T](value: T) -> T { let copied = value ret copied }\n" +
+    "trait Handler { fn handle(self: Self, value: u32) -> u32 }\n" +
+    "fn kept(base: u32) -> u32 { let handler: dyn Handler = | value | base + value ret handler.handle(2_u32) }\n"
+    fixture.put("src/main.enq", generic_prefix + main_body)
+    let generic_changed = unit(build(fixture, "2", "dev"), "cache_application").get("phases").unwrap_or(Json::Null)
+    if number(generic_changed, "functions_reused") != "0" || !executes(fixture, "dev") {
+        ret fixture.finish(false)
+    }
+    fixture.put("src/stable.enq", "pub fn unchanged() -> bool { ret true }\n")
+    if fixture.command(vec!["build", "--profile", "dev"]).success() {
+        ret fixture.finish(false)
+    }
+    fixture.put("src/stable.enq", "pub fn unchanged() -> u32 { ret 41 }\n")
+    build(fixture, "2", "dev")
+    let expected = file_sha256(fixture.binary("cache_application", "dev").as_str())
+    for name in read_dir(fixture.root.join("cache/objects-v1").as_str()) {
+        let object = fixture.root.join("cache/objects-v1").join(name).join("object.o")
+        if file_exists(object.as_str()) {
+            write_file(object.as_str(), "corrupt object")
+        }
+    }
+    remove_dir_all(fixture.root.join("target").as_str())
+    for name in read_dir(fixture.root.join("cache").as_str()) {
+        let entry = fixture.root.join("cache").join(name)
+        if file_exists(entry.join("unit.complete").as_str()) {
+            remove_file(entry.join("unit.complete").as_str())
+        }
+    }
+    build(fixture, "2", "dev")
+    if !executes(fixture, "dev") || file_sha256(fixture.binary("cache_application", "dev").as_str()) != expected {
+        ret fixture.finish(false)
+    }
+    remove_dir_all(fixture.root.join("target").as_str())
+    remove_dir_all(fixture.root.join("cache").as_str())
+    build(fixture, "2", "dev")
+    ret fixture.finish(executes(fixture, "dev") && file_sha256(fixture.binary("cache_application", "dev").as_str()) == expected)
+}
+
+#attr(test)
+fn integration_incremental_cache_contract() -> bool {
+    let fixture = Fixture::new("cache")
+    prepare(fixture)
+    let first = build(fixture, "2", "dev")
+    if flag(unit(first, "cache_application"), "cache_hit") || !executes(fixture, "dev") {
+        ret fixture.finish(false)
+    }
+    let binary = fixture.binary("cache_application", "dev")
+    let initial = file_sha256(binary.as_str())
+    let modified = modified_ns(binary)
+    let second = build(fixture, "2", "dev")
+    if !all_cached(second) || !flag(second, "link_cache_hit") || file_sha256(binary.as_str()) != initial || modified_ns(binary) != modified {
+        ret fixture.finish(false)
+    }
+    let original_manifest = fixture.read("encore.toml")
+    let mut revision = 0_u32
+    for jobs in vec!["1", "4", "1", "4", "4", "1", "4", "4"] {
+        fixture.put("encore.toml", original_manifest + f "\n[target]\ncompile-args=[\"-DREADY_REVISION={revision}\"]\n")
+        let report = build(fixture, jobs, "dev")
+        for name in vec!["core", "cache_dependency"] {
+            let value = unit(report, name)
+            if flag(value, "cache_hit") || !flag(value.get("phases").unwrap_or(Json::Null), "backend_cache_hit") {
+                ret fixture.finish(false)
+            }
+        }
+        if !executes(fixture, "dev") {
+            ret fixture.finish(false)
+        }
+        revision += 1
+    }
+    fixture.put("encore.toml", original_manifest)
+    build(fixture, "2", "dev")
+    fixture.put("dependency/src/lib.enq", "pub fn cached_value() -> u32 { let base = 40 ret base + 1 }\n")
+    let body = build(fixture, "2", "dev")
+    if !flag(unit(body, "cache_application"), "cache_hit") || flag(unit(body, "cache_dependency"), "cache_hit") || !executes(fixture, "dev") {
+        ret fixture.finish(false)
+    }
+    fixture.put("dependency/src/lib.enq", "pub fn cached_value() -> u64 { ret 41 }\n")
+    let interface = build(fixture, "2", "dev")
+    if flag(unit(interface, "cache_application"), "cache_hit") || !executes(fixture, "dev") {
+        ret fixture.finish(false)
+    }
+    let expected = file_sha256(binary.as_str())
+    remove_dir_all(fixture.root.join("target").as_str())
+    if !all_cached(build(fixture, "2", "dev")) || file_sha256(binary.as_str()) != expected {
+        ret fixture.finish(false)
+    }
+    for payload in vec!["unit.ermeta", "unit.ertemplate", "unit.errequirements", "unit.erlib", "unit.ready", "unit.complete"] {
+        let entries = committed(fixture)
+        if entries.is_empty() {
+            ret fixture.finish(false)
+        }
+        for entry in entries {
+            write_file(entry.join(payload).as_str(), "corrupt package cache payload\n")
+        }
+        if flag(unit(build(fixture, "2", "dev"), "cache_application"), "cache_hit") || !executes(fixture, "dev") || file_sha256(binary.as_str()) != expected {
+            ret fixture.finish(false)
+        }
+    }
+    for name in read_dir(fixture.root.join("cache").as_str()) {
+        let entry = fixture.root.join("cache").join(name)
+        if file_exists(entry.join("unit.backend").as_str()) {
+            let metadata = json(read_file(entry.join("unit.ermeta").as_str()))
+            if text(metadata.get("context").unwrap_or(Json::Null), "unit") == "cache_application" {
+                write_file(entry.join("unit.erowned").as_str(), "invalid EHIR")
+            }
+        }
+    }
+    for entry in committed(fixture) {
+        write_file(entry.join("unit.erlib").as_str(), "invalid archive")
+    }
+    if flag(unit(build(fixture, "2", "dev"), "cache_application"), "cache_hit") || !executes(fixture, "dev") {
+        ret fixture.finish(false)
+    }
+    let runtime = "#include \"fixture.h\"\n#if __has_include(\"optional.h\")\n#include \"optional.h\"\n#else\n#define OPTIONAL_VALUE 0\n#endif\nint cache_marker(void) { return CACHE_VALUE + OPTIONAL_VALUE; }\n"
+    fixture.put("runtime.c", runtime)
+    fixture.put("fixture.h", "#define CACHE_VALUE 1\n")
+    build(fixture, "1", "dev")
+    let native_before = file_sha256(binary.as_str())
+    fixture.put("fixture.h", "#define CACHE_VALUE 2\n")
+    let headers = build(fixture, "4", "dev")
+    if !all_cached(headers) || flag(headers, "link_cache_hit") || file_sha256(binary.as_str()) == native_before {
+        ret fixture.finish(false)
+    }
+    let without_optional = file_sha256(binary.as_str())
+    fixture.put("optional.h", "#define OPTIONAL_VALUE 7\n")
+    let optional = build(fixture, "4", "dev")
+    if !all_cached(optional) || flag(optional, "link_cache_hit") || file_sha256(binary.as_str()) == without_optional {
+        ret fixture.finish(false)
+    }
+    remove_file(fixture.root.join("optional.h").as_str())
+    build(fixture, "1", "dev")
+    if file_sha256(binary.as_str()) != without_optional {
+        ret fixture.finish(false)
+    }
+    fixture.put("runtime.c", "#include \"missing-required-header.h\"\n")
+    let failed = fixture.command(vec!["build", "--jobs", "4"])
+    if failed.success() || file_sha256(binary.as_str()) != without_optional || !executes(fixture, "dev") {
+        ret fixture.finish(false)
+    }
+    fixture.put("runtime.c", runtime)
+    build(fixture, "4", "dev")
+    let clean = Fixture { fixture.root.join("clean"), fixture.compiler }
+    prepare(clean)
+    clean.put("dependency/src/lib.enq", fixture.read("dependency/src/lib.enq"))
+    clean.put("runtime.c", runtime)
+    clean.put("fixture.h", fixture.read("fixture.h"))
+    set_env("ENCORE_BUILD_CACHE", fixture.root.join("empty-cache").as_str())
+    build(clean, "2", "dev")
+    ret fixture.finish(executes(clean, "dev") && file_sha256(clean.binary("cache_application", "dev").as_str()) == file_sha256(binary.as_str()))
+}
+
+#cfg(target_os = "linux")
+#attr(test)
+fn integration_thinlto_paths_and_jobs_contract() -> bool {
+    let fixture = Fixture::new("thinlto")
+    let mut snapshots = Vec[str]::new()
+    for jobs in vec!["1", "4"] {
+        let project = Fixture { fixture.root.join("different path " + jobs), fixture.compiler }
+        prepare(project)
+        set_env("ENCORE_BUILD_CACHE", project.root.join("cache").as_str())
+        build(project, jobs, "extreme")
+        if !executes(project, "extreme") || read_dir(project.root.join("target/extreme/thinlto-cache").as_str()).is_empty() {
+            ret fixture.finish(false)
+        }
+        let binary = project.binary("cache_application", "extreme")
+        let mut snapshot = file_sha256(binary.as_str())
+        for name in vec!["core", "cache_dependency", "cache_application"] {
+            let mut archive_hash = ""
+            for directory in read_dir(project.root.join("cache").as_str()) {
+                let entry = project.root.join("cache").join(directory)
+                if file_exists(entry.join("unit.complete").as_str()) {
+                    let ready = json(read_file(entry.join("unit.ready").as_str()))
+                    if text(ready.get("context").unwrap_or(Json::Null), "unit") == name {
+                        archive_hash = file_sha256(entry.join("unit.erlib").as_str())
+                    }
+                }
+            }
+            if archive_hash == "" {
+                ret fixture.finish(false)
+            }
+            snapshot = snapshot + ":" + archive_hash
+        }
+        snapshots.push(snapshot)
+        let before = modified_ns(binary)
+        if !flag(build(project, jobs, "extreme"), "link_cache_hit") || modified_ns(binary) != before {
+            ret fixture.finish(false)
+        }
+        project.put("dependency/src/lib.enq", "pub fn cached_value() -> u32 { let base = 40 ret base + 1 }\n")
+        let body = build(project, jobs, "extreme")
+        if !flag(unit(body, "cache_application"), "cache_hit") || flag(unit(body, "cache_dependency"), "cache_hit") || !executes(project, "extreme") {
+            ret fixture.finish(false)
+        }
+    }
+    ret fixture.finish(snapshots.get(0).unwrap_or("") != "" && snapshots.get(0).unwrap_or("") == snapshots.get(1).unwrap_or(""))
+}
+
+#cfg(target_os = "linux")
+#attr(test)
+fn integration_module_namespace_type_scope_contract() -> bool {
+    let fixture = Fixture::new("module-type-scope")
+    fixture.put("encore.toml", "[project]\nname = \"namespace_types\"\nversion = \"0.0.0\"\n")
+    fixture.put("src/left.enq", "pub struct Config { channels: str }\n")
+    fixture.put("src/right.enq", "pub struct Config { token: str }\n")
+    fixture.put("src/main.enq", "import mod::right\nimport mod::right::Config as OtherConfig\nimport mod::left::Config\nfn read(config: Config, other: OtherConfig) -> str { ret config.channels + other.token }\nfn main() -> u32 { ret if read(Config { \"left\" }, OtherConfig { \"right\" }) == \"leftright\" { 0_u32 } else { 1_u32 } }\n")
+    if !fixture.command(vec!["check"]).success() {
+        ret fixture.finish(false)
+    }
+    for profile in vec!["dev", "release"] {
+        if !fixture.command(vec!["build", "--profile", profile]).success() || !fixture.tool(fixture.binary("namespace_types", profile).as_str(), Vec[str]::new()).success() {
+            ret fixture.finish(false)
+        }
+    }
+    ret fixture.finish(true)
+}

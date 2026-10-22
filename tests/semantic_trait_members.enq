@@ -1,0 +1,54 @@
+//! Transitive trait methods preserve declaration dependencies and cache reuse.
+
+import core::testing::assert
+import refrain::frontend::{AnalysisDatabase, SemanticBody, SymbolId}
+
+fn main() -> u32 {
+    let mut database = AnalysisDatabase::new()
+    let tail = "\ntrait Middle < Root {}\ntrait Leaf < Middle {}\nfn sample(value: dyn Leaf) { let result = value.read() }\n"
+    database.set_module("traits", "traits.enq",
+        "trait Root { fn read(self: Self) -> u32 fn construct() -> u32 }" + tail)
+    let members = database.members_for_type("traits", "dyn Leaf")
+    if !assert(members.len() == 1_usize) { ret 1_u32 }
+    for member in members {
+        if !assert(member.name == "read" && member.typ == "u32") { ret 2_u32 }
+    }
+    let id = database.symbol_id("traits", "sample").unwrap_or(SymbolId::invalid())
+    let first = database.semantic_body(id).unwrap_or(SemanticBody::empty())
+    if !assert(first.binding_type("result").unwrap_or("") == "u32") { ret 3_u32 }
+    let second = database.semantic_body(id).unwrap_or(SemanticBody::empty())
+    if !assert(second.binding_type("result").unwrap_or("") == "u32") { ret 4_u32 }
+    if !assert(database.semantic_body_count(id) == 1_usize) { ret 5_u32 }
+    database.set_module("traits", "traits.enq",
+        "trait Root { fn read(self: Self) -> str fn construct() -> u32 }" + tail)
+    let updated = database.semantic_body(id).unwrap_or(SemanticBody::empty())
+    if !assert(updated.binding_type("result").unwrap_or("") == "str") { ret 6_u32 }
+    if !assert(database.semantic_body_count(id) == 2_usize) { ret 7_u32 }
+    database.set_module("traits", "traits.enq",
+        "trait Root { fn read(self: Self) -> str }\ntrait Middle < Root {}\ntrait Leaf {}\nfn sample(value: dyn Leaf) { let result = value.read() }\n")
+    if !assert(database.members_for_type("traits", "dyn Leaf").len() == 0_usize) { ret 8_u32 }
+    let removed = database.semantic_body(id).unwrap_or(SemanticBody::empty())
+    if !assert(removed.binding_type("result").unwrap_or("") == "") { ret 9_u32 }
+    if !assert(database.semantic_body_count(id) == 3_usize) { ret 10_u32 }
+    // Malformed cyclic inheritance must not hang editor queries.
+    database.set_module("cycle", "cycle.enq",
+        "trait A < B { fn first(self: Self) -> u32 }\ntrait B < A { fn second(self: Self) -> str }\n")
+    if !assert(database.members_for_type("cycle", "dyn A").len() == 2_usize) { ret 11_u32 }
+    let parent = "struct Inner { label: str }\ntrait Parent[A, B] { fn left(self: Self) -> A fn right(self: Self) -> B fn again(self: Self) -> Self }\n"
+    let caller = "trait Final[X] < Swap[u32, X] {}\nfn sample(value: dyn Final[Inner]) { let result = value.left() }\n"
+    database.set_module("parameters", "parameters.enq", parent + "trait Swap[A, B] < Parent[B, A] {}\n" + caller)
+    let parameter_members = database.members_for_type("parameters", "dyn Final[Inner]")
+    if !assert(parameter_members.len() == 3_usize) { ret 12_u32 }
+    for member in parameter_members {
+        if member.name == "left" && !assert(member.typ == "Inner") { ret 13_u32 }
+        if member.name == "right" && !assert(member.typ == "u32") { ret 14_u32 }
+        if member.name == "again" && !assert(member.typ == "dyn Final[Inner]") { ret 15_u32 }
+    }
+    let parameter_id = database.symbol_id("parameters", "sample").unwrap_or(SymbolId::invalid())
+    let parameter_body = database.semantic_body(parameter_id).unwrap_or(SemanticBody::empty())
+    if !assert(parameter_body.binding_type("result").unwrap_or("") == "Inner") { ret 16_u32 }
+    database.set_module("parameters", "parameters.enq", parent + "trait Swap[A, B] < Parent[A, B] {}\n" + caller)
+    let parameter_updated = database.semantic_body(parameter_id).unwrap_or(SemanticBody::empty())
+    if !assert(parameter_updated.binding_type("result").unwrap_or("") == "u32") { ret 17_u32 }
+    ret 0_u32
+}

@@ -1,0 +1,196 @@
+//! Disposable projects and CLI execution shared by integration contracts.
+
+import core::panic::panic
+import json::{Json, parse}
+import refrain::cache_identity::compiler_content_digest
+import std::io::eprintln
+import std::os::{env, file_exists, mkdir_all, read_file, write_file, remove_dir_all, os_name}
+import std::path::Path
+import std::process::{Command, Output}
+import std::vec::Vec
+
+extern fn encore_ci_process_id() -> usize
+extern fn encore_ci_set_env(name: str, value: str) -> bool
+extern fn encore_ci_unset_env(name: str) -> bool
+extern fn encore_ci_modified_ns(path: str) -> u64
+
+#attr(safe)
+pub fn set_env(name: str, value: str) ->() {
+    if !unsafe {
+        encore_ci_set_env(name, value)
+    }
+    {
+        panic("cannot set fixture environment")
+    }
+}
+
+#attr(safe)
+pub fn unset_env(name: str) ->() {
+    if !unsafe {
+        encore_ci_unset_env(name)
+    }
+    {
+        panic("cannot clear fixture environment")
+    }
+}
+
+#attr(safe)
+pub fn modified_ns(path: Path) -> u64 {
+    ret unsafe {
+        encore_ci_modified_ns(path.as_str())
+    }
+}
+
+pub fn repository() -> Path {
+    ret Path::new(env("ENCORE_TEST_REPOSITORY").unwrap_or(".")).resolve()
+}
+
+pub struct Fixture {
+    root: Path
+    compiler: str
+}
+
+impl for Fixture {
+    #attr(safe)
+    pub fn new(label: str) -> Self {
+        let pid = unsafe {
+            encore_ci_process_id()
+        }
+        let root = Path::new(f "target/integration/{label}-{pid}").resolve()
+        if file_exists(root.as_str()) {
+            panic("fixture path already exists")
+        }
+        if mkdir_all(root.join("src").as_str()) != 0 {
+            panic("cannot create fixture")
+        }
+        let compiler = env("ENCORE_TEST_COMPILER").unwrap_or("")
+        if compiler == "" {
+            panic("ENCORE_TEST_COMPILER must identify the compiler under test")
+        }
+        set_env("ENCORE_REGISTRY_CACHE", root.join("registry").as_str())
+        set_env("ENCORE_BUILD_CACHE", root.join("cache").as_str())
+        set_env("ENCORE_CORE_DIR", repository().join("packages/core").as_str())
+        unset_env("ENCORE_DEFAULT_INDEX")
+        unset_env("ENCORE_INDEX_URL")
+        ret Self { root, compiler }
+    }
+
+    pub fn put(self: Self, relative: str, contents: str) ->() {
+        let path = self.root.join(relative)
+        if mkdir_all(path.parent().unwrap_or(self.root).as_str()) != 0 || write_file(path.as_str(), contents) != 0 {
+            panic("cannot write fixture: " + path.as_str())
+        }
+    }
+
+    pub fn read(self: Self, relative: str) -> str {
+        ret read_file(self.root.join(relative).as_str())
+    }
+
+    pub fn test_log(self: Self, id: str) -> Path {
+        ret self.root.join("target/tests/test-" + compiler_content_digest(id) + ".output.txt")
+    }
+
+    pub fn manifest(self: Self, name: str, dependencies: str) ->() {
+        self.put("encore.toml", "[project]\nname=\"" + name + "\"\nversion=\"0.0.0\"\ndependencies=" + dependencies + "\n")
+    }
+
+    pub fn command(self: Self, arguments: Vec[str]) -> Output {
+        let mut command = Command::new(self.compiler).cwd(self.root.as_str())
+        for argument in arguments {
+            command = command.arg(argument)
+        }
+        ret command.output()
+    }
+
+    pub fn succeeds(self: Self, arguments: Vec[str]) -> bool {
+        let output = self.command(arguments)
+        if !output.success() {
+            eprintln(output.text())
+        }
+        ret output.success()
+    }
+
+    pub fn tool(self: Self, program: str, arguments: Vec[str]) -> Output {
+        let mut command = Command::new(program).cwd(self.root.as_str())
+        for argument in arguments {
+            command = command.arg(argument)
+        }
+        ret command.output()
+    }
+
+    pub fn binary(self: Self, name: str, profile: str) -> Path {
+        let suffix = if os_name() == "windows" {
+            ".exe"
+        } else {
+            ""
+        }
+        ret self.root.join("target/" + profile + "/" + name + suffix)
+    }
+
+    pub fn finish(self: Self, passed: bool) -> bool {
+        if passed {
+            remove_dir_all(self.root.as_str())
+        } else {
+            eprintln("Integration evidence: " + self.root.as_str())
+        }
+        ret passed
+    }
+
+    pub fn failure(self: Self, reason: str) -> bool {
+        eprintln("Fixture assertion failed: " + reason)
+        for name in vec!["report.json", "filtered.json", "compile-error.json"] {
+            let path = self.root.join(name)
+            if file_exists(path.as_str()) {
+                eprintln(name + ": " + read_file(path.as_str()))
+            }
+        }
+        ret self.finish(false)
+    }
+}
+
+pub fn json(text: str) -> Json {
+    ret parse(text).unwrap_or(Json::Null)
+}
+pub fn number(value: Json, name: str) -> str {
+    ret value.get(name).unwrap_or(Json::Null).as_number().unwrap_or("")
+}
+pub fn flag(value: Json, name: str) -> bool {
+    ret value.get(name).unwrap_or(Json::Null).as_bool().unwrap_or(false)
+}
+pub fn text(value: Json, name: str) -> str {
+    ret value.get(name).unwrap_or(Json::Null).as_str().unwrap_or("")
+}
+
+pub fn replace(source: str, needle: str, replacement: str) -> str {
+    if needle == "" {
+        ret source
+    }
+    let mut result = ""
+    let mut index = 0_usize
+    while index < source.byte_len() {
+        if index + needle.byte_len() <= source.byte_len() && source.slice_bytes(index, needle.byte_len()) == needle {
+            result = result + replacement
+            index += needle.byte_len()
+        } else {
+            result = result + source.slice_bytes(index, 1)
+            index += 1
+        }
+    }
+    ret result
+}
+
+pub fn find(source: str, needle: str) -> usize {
+    let mut index = 0_usize
+    while index + needle.byte_len() <= source.byte_len() {
+        if source.slice_bytes(index, needle.byte_len()) == needle {
+            ret index
+        }
+        index += 1
+    }
+    panic("missing fixture source boundary: " + needle)
+    ret source.byte_len()
+}
+
+pub fn std_dependencies() -> str {
+    ret "[\"path@" + repository().join("packages/std").as_str() + "\"]"
+}

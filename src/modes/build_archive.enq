@@ -1,0 +1,532 @@
+//! Ordinary package objects and deterministic archives, without program support.
+
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+
+import std::io::eprintln
+import std::os::{executable_path, file_exists, file_sha256, mkdir_all, read_file, remove_file, write_file}
+import std::path::Path
+import std::time::sleep_ms
+import std::vec::Vec
+
+import argparse::{process_arg, process_arg_count}
+import ehir_llvm_backend::codegen::{PreparedUnitCodegen, emit_unit_codegen}
+import json::{Json, parse, stringify}
+
+import mod::build_object_cache::{commit_native_object, native_object_key, restore_native_object}
+import refrain::cache_identity::compiler_content_digest
+import refrain::target::TargetSpec
+
+extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
+extern fn encore_compiler_worker_spawn_parts(program: str, arguments: usize, count: usize,
+    directory: str, stdout_path: str, stderr_path: str,) -> usize
+extern fn encore_compiler_worker_poll(child: usize) -> i32
+extern fn encore_compiler_worker_cancel(child: usize) -> i32
+extern fn encore_compiler_worker_close(child: usize) ->()
+extern fn encore_compiler_worker_interrupted() -> i32
+extern fn encore_compiler_worker_watch_parent(parent: u64) -> bool
+extern fn encore_compiler_process_id() -> u64
+extern fn encore_compiler_jobserver_try_acquire(server: usize) -> i32
+extern fn encore_compiler_jobserver_release(server: usize) -> bool
+
+struct NativeObjectTask {
+    name: str
+    object: Path
+    arguments: Vec[str]
+    child: usize
+    extra_lease: bool
+    complete: bool
+}
+
+/// Fully resolved executable paths and exact flags, selected by the coordinator.
+/// The caller owns one CPU lease throughout LLVM/native work. Additional tools
+/// borrow available leases nonblockingly and cannot deadlock a jobs=1 build.
+pub struct UnitNativePlan {
+    compiler: str
+    archiver: str
+    args: Vec[str]
+}
+
+impl for UnitNativePlan {
+    pub fn encode(self: Self) -> Result[str, str] {
+        let mut flags = Vec[Json]::new()
+        for argument in self.args {
+            flags.push(Json::String(argument))
+        }
+        let mut fields = Vec[(str, Json)]::new()
+        fields.push(("schema", Json::Number("1")))
+        fields.push(("compiler", Json::String(self.compiler)))
+        fields.push(("archiver", Json::String(self.archiver)))
+        fields.push(("args", Json::Array(flags)))
+        fields.push(("identity", Json::String(self.identity()?)))
+        ret Result[str, str]::Ok(stringify(Json::Object(fields)))
+    }
+
+    pub fn decode(text: str) -> Result[Self, str] {
+        let data = match parse(text) {
+            Ok(value) => value
+            Err(_) => {
+                ret Result[Self, str]::Err("invalid package native plan JSON")
+            }
+        }
+        if data.get("schema").unwrap_or(Json::Null).as_number().unwrap_or("") != "1" {
+            ret Result[Self, str]::Err("unsupported package native plan schema")
+        }
+        let mut args = Vec[str]::new()
+        let values = match data.get("args").unwrap_or(Json::Null) {
+            Json::Array(values) => values
+            _ => {
+                ret Result[Self, str]::Err("invalid package native flags")
+            }
+        }
+        for value in values {
+            match value {
+                Json::String(argument) => {
+                    args.push(argument)
+                }
+                _ => {
+                    ret Result[Self, str]::Err("invalid package native flag")
+                }
+            }
+        }
+        let plan = Self {
+            native_string(data, "compiler")?, native_string(data, "archiver")?, args
+        }
+        if plan.identity()? != native_string(data, "identity")? {
+            ret Result[Self, str]::Err("package native toolchain identity mismatch")
+        }
+        ret Result[Self, str]::Ok(plan)
+    }
+    /// Native artifacts follow executable contents and flags, not tool names.
+    pub fn identity(self: Self) -> Result[str, str] {
+        let compiler = Path::new(self.compiler)
+        let archiver = Path::new(self.archiver)
+        if !compiler.is_absolute() || !archiver.is_absolute() ||
+        !file_exists(self.compiler) || !file_exists(self.archiver) {
+            ret Result[str, str]::Err("package native tools must be resolved absolute executables")
+        }
+        let compiler_digest = file_sha256(self.compiler)
+        let archiver_digest = file_sha256(self.archiver)
+        if compiler_digest.byte_len() != 64 || archiver_digest.byte_len() != 64 {
+            ret Result[str, str]::Err("cannot hash package native toolchain")
+        }
+        let mut flags = Vec[Json]::new()
+        for argument in self.args {
+            flags.push(Json::String(argument))
+        }
+        let mut fields = Vec[(str, Json)]::new()
+        fields.push(("schema", Json::String("encore-unit-native-1")))
+        fields.push(("compiler", Json::String(compiler_digest)))
+        fields.push(("archiver", Json::String(archiver_digest)))
+        fields.push(("flags", Json::Array(flags)))
+        ret Result[str, str]::Ok(compiler_content_digest(stringify(Json::Object(fields))))
+    }
+}
+
+fn native_string(data: Json, key: str) -> Result[str, str] {
+    ret match data.get(key).unwrap_or(Json::Null) {
+        Json::String(value) => Result[str, str]::Ok(value)
+        _ => Result[str, str]::Err("missing native plan field: " + key)
+    }
+}
+
+/// Owns a private staging directory. Its completion marker is published by
+/// the caller only after this returns. No generic/ownership support is emitted.
+pub fn emit_package_archive(unit: frozen PreparedUnitCodegen, directory: Path,
+    target: TargetSpec, plan: UnitNativePlan,) -> Result[str, str] {
+    ret emit_budgeted_package_archive(unit, directory, target, plan, 0, Option[Path]::None)
+}
+
+/// Native tools can borrow unused leases from this package's shared jobserver.
+/// The worker's existing lease covers one tool; extra leases are nonblocking.
+/// Process supervision remains on one thread, so handles are never raced.
+pub fn emit_budgeted_package_archive(unit: frozen PreparedUnitCodegen, directory: Path,
+    target: TargetSpec, plan: UnitNativePlan, server: usize, cache: Option[Path],) -> Result[str, str] {
+    if !directory.is_absolute() {
+        ret Result[str, str]::Err("relative package archive directory")
+    }
+    let identity = plan.identity()?
+    if mkdir_all(directory.as_str()) != 0 {
+        ret Result[str, str]::Err("cannot create package archive directory")
+    }
+    let completion = directory.join("unit.complete")
+    if file_exists(completion.as_str()) && remove_file(completion.as_str()) != 0 {
+        ret Result[str, str]::Err("cannot invalidate staged archive completion")
+    }
+    let mut archive_args = Vec[str]::new()
+    archive_args.push("rcsD")
+    let archive = directory.join("unit.erlib")
+    // rcs updates an existing archive; never retain a stale removed member.
+    if file_exists(archive.as_str()) && remove_file(archive.as_str()) != 0 {
+        ret Result[str, str]::Err("cannot invalidate staged package archive")
+    }
+    archive_args.push(archive.as_str())
+    let mut index = 0_usize
+    let mut objects = Vec[NativeObjectTask]::new()
+    let object_cache = match cache {
+        Some(root) => Option[Path]::Some(root.join("objects-v1")) None => Option[Path]::None
+    }
+    let mut object_keys = Vec[str]::new()
+    let mut compiled_objects = Vec[Path]::new()
+    for emitted in emit_unit_codegen(unit, target.triple, target.pointer_width) {
+        let stem = "module-" + Debug::fmt(index)
+        let ir = directory.join(stem + ".ll")
+        let object = directory.join(stem + ".o")
+        let stable_ir = stable_module_ir(emitted.ir, emitted.module_id)
+        write_ir(ir, stable_ir)?
+        let key = native_object_key(stable_ir, target.triple, identity)
+        let reused = match object_cache {
+            Some(root) => restore_native_object(root, key, object)? None => false
+        }
+        if reused {
+            archive_args.push(object.as_str())
+            index += 1
+            continue
+        }
+        object_keys.push(key)
+        compiled_objects.push(object)
+        let mut arguments = Vec[str]::new()
+        for argument in plan.args {
+            arguments.push(argument)
+        }
+        arguments.push("--target=" + target.triple)
+        arguments.push("-c")
+        arguments.push(ir.as_str())
+        arguments.push("-o")
+        arguments.push(object.as_str())
+        objects.push(NativeObjectTask {
+                stem, object, arguments, 0, false, false
+            }
+            ,
+        )
+        archive_args.push(object.as_str())
+        index += 1
+    }
+    compile_native_objects(objects, plan.compiler, directory, server)?
+    if plan.identity()? != identity {
+        ret Result[str, str]::Err("native toolchain changed during object compilation")
+    }
+    let mut compiled_index = 0_usize
+    for object in compiled_objects {
+        match object_cache {
+            Some(root) => {
+                commit_native_object(root, object_keys.get(compiled_index).unwrap_or(""), object)?
+            }
+            None => {
+            }
+        }
+        compiled_index += 1
+    }
+    let mut object_counts = Vec[(str, Json)]::new()
+    object_counts.push(("reused", Json::Number(Debug::fmt(index - compiled_index))))
+    object_counts.push(("compiled", Json::Number(Debug::fmt(compiled_index))))
+    if write_file(directory.join("objects.json").as_str(), stringify(Json::Object(object_counts))) != 0 {
+        ret Result[str, str]::Err("cannot record native object reuse")
+    }
+    run_unit_tool(plan.archiver, archive_args, directory, "archive")?
+    if !file_exists(archive.as_str()) {
+        ret Result[str, str]::Err("archiver did not produce package archive")
+    }
+    if plan.identity()? != identity {
+        ret Result[str, str]::Err("native toolchain changed during package compilation")
+    }
+    ret Result[str, str]::Ok(file_sha256(archive.as_str()))
+}
+
+/// ThinLTO hashes the source filename when promoting local symbols. Staging
+/// paths must never become part of a package's object or executable identity.
+pub fn stable_module_ir(ir: str, module_id: str) -> str {
+    let identity = compiler_content_digest("encore-llvm-source-1\n" + module_id)
+    ret "source_filename = \"encore-" + identity + ".ll\"\n" + ir
+}
+
+#attr(test)
+fn metadata_native_llvm_source_identity_contract() -> bool {
+    let ir = "target triple = \"x86_64-unknown-linux-gnu\"\n"
+    let first = stable_module_ir(ir, "package@lib.enq")
+    ret first == stable_module_ir(ir, "package@lib.enq")
+    && first != stable_module_ir(ir, "other@lib.enq")
+    && first.contains("source_filename = \"encore-")
+    && first.contains(ir)
+}
+
+#attr(safe)
+fn compile_native_objects(tasks: mut Vec[NativeObjectTask], compiler: str, directory: Path, server: usize) -> Result[(), str] {
+    let result = drive_native_objects(tasks, compiler, directory, server)
+    // Capture Result before cleanup, including cancellation, failed spawn and
+    // nonzero tool exits. Release leases only after their child is reaped.
+    for task in tasks {
+        if task.child != 0 {
+            let _cancelled = unsafe {
+                encore_compiler_worker_cancel(task.child)
+            }
+            unsafe {
+                encore_compiler_worker_close(task.child)
+            }
+            if task.extra_lease {
+                let _released = unsafe {
+                    encore_compiler_jobserver_release(server)
+                }
+            }
+        }
+    }
+    ret result
+}
+
+#attr(safe)
+fn drive_native_objects(tasks: mut Vec[NativeObjectTask], compiler: str, directory: Path, server: usize) -> Result[(), str] {
+    let running = - 2147483647_i32 - 1_i32
+    let mut completed = 0_usize
+    let mut base_busy = false
+    while completed < tasks.len() {
+        if unsafe {
+            encore_compiler_worker_interrupted()
+        }
+        != 0 {
+            ret Result[(), str]::Err("native object queue cancelled")
+        }
+        let mut index = 0_usize
+        while index < tasks.len() {
+            let task = match tasks.get(index) {
+                Some(value) => value None => {
+                    ret Result[(), str]::Err("invalid native object state")
+                }
+            }
+            if task.complete || task.child != 0 {
+                index += 1 continue
+            }
+            let extra = base_busy
+            if extra {
+                if server == 0 {
+                    break
+                }
+                let lease = unsafe {
+                    encore_compiler_jobserver_try_acquire(server)
+                }
+                if lease < 0 {
+                    ret Result[(), str]::Err("native object budget cancelled")
+                }
+                if lease == 0 {
+                    break
+                }
+            }
+            let child = unsafe {
+                encore_compiler_worker_spawn_parts(compiler, task.arguments.as_ptr() as usize,
+                    task.arguments.len(), directory.as_str(), directory.join(task.name + ".stdout").as_str(),
+                    directory.join(task.name + ".stderr").as_str(),)
+            }
+            if child == 0 {
+                if extra {
+                    let _released = unsafe {
+                        encore_compiler_jobserver_release(server)
+                    }
+                }
+                ret Result[(), str]::Err("cannot start native object compiler")
+            }
+            if !extra {
+                base_busy = true
+            }
+            tasks.set(index, NativeObjectTask {
+                    task.name, task.object, task.arguments, child, extra, false
+                }
+                ,
+            )
+            index += 1
+        }
+        index = 0
+        while index < tasks.len() {
+            let task = match tasks.get(index) {
+                Some(value) => value None => {
+                    ret Result[(), str]::Err("invalid native object state")
+                }
+            }
+            if task.child == 0 {
+                index += 1 continue
+            }
+            let status = unsafe {
+                encore_compiler_worker_poll(task.child)
+            }
+            if status != running {
+                if status != 0 {
+                    ret Result[(), str]::Err("native compiler failed: " + read_file(directory.join(task.name + ".stderr").as_str()))
+                }
+                if !file_exists(task.object.as_str()) {
+                    ret Result[(), str]::Err("native compiler produced no object")
+                }
+                unsafe {
+                    encore_compiler_worker_close(task.child)
+                }
+                if task.extra_lease {
+                    let _released = unsafe {
+                        encore_compiler_jobserver_release(server)
+                    }
+                } else {
+                    base_busy = false
+                }
+                tasks.set(index, NativeObjectTask {
+                        task.name, task.object, task.arguments, 0, false, true
+                    }
+                    ,
+                )
+                completed += 1
+            }
+            index += 1
+        }
+        if completed < tasks.len() {
+            let _sleep = sleep_ms(5)
+        }
+    }
+    ret Result[(), str]::Ok(())
+}
+
+#attr(safe)
+fn write_ir(path: Path, ir: str) -> Result[(), str] {
+    let written = unsafe {
+        encore_compiler_write_atomic(path.as_str(), ir)
+    }
+    if !written || file_sha256(path.as_str()) != compiler_content_digest(ir) {
+        ret Result[(), str]::Err("cannot publish package LLVM output")
+    }
+    ret Result[(), str]::Ok(())
+}
+
+/// Exact argv, isolated logs, cancellation and reaping; never a shell command.
+/// This runs on a worker's supervisor thread, not on LLVM emission threads.
+#attr(safe)
+pub fn run_unit_tool(program: str, arguments: Vec[str], directory: Path, name: str) -> Result[(), str] {
+    let child = start_unit_tool(program, arguments, directory, name)?
+    ret finish_unit_tool(child, program, directory, name)
+}
+
+/// Handles remain exclusively on the supervisor thread. A bounded phase may
+/// start several tools before waiting, without racing the process registry.
+#attr(safe)
+fn start_unit_tool(program: str, arguments: Vec[str], directory: Path, name: str) -> Result[usize, str] {
+    let output = directory.join(name + ".stdout")
+    let error = directory.join(name + ".stderr")
+    let child = unsafe {
+        encore_compiler_worker_spawn_parts(program, arguments.as_ptr() as usize,
+            arguments.len(), directory.as_str(), output.as_str(), error.as_str(),)
+    }
+    if child == 0 {
+        ret Result[usize, str]::Err("cannot start package tool: " + program)
+    }
+    ret Result[usize, str]::Ok(child)
+}
+
+#attr(safe)
+pub fn finish_unit_tool(child: usize, program: str, directory: Path, name: str) -> Result[(), str] {
+    let error = directory.join(name + ".stderr")
+    let running = - 2147483647_i32 - 1_i32
+    let mut status = running
+    while status == running {
+        if unsafe {
+            encore_compiler_worker_interrupted()
+        }
+        != 0 {
+            let _cancelled = unsafe {
+                encore_compiler_worker_cancel(child)
+            }
+            unsafe {
+                encore_compiler_worker_close(child)
+            }
+            ret Result[(), str]::Err("package tool cancelled: " + program)
+        }
+        status = unsafe {
+            encore_compiler_worker_poll(child)
+        }
+        if status == running {
+            let _sleep = sleep_ms(5)
+        }
+    }
+    // close also reaps a child after a polling error; never leak a live handle.
+    unsafe {
+        encore_compiler_worker_close(child)
+    }
+    if status != 0 {
+        ret Result[(), str]::Err("package tool failed (" + Debug::fmt(status) + "): " + program +
+            "\n" + read_file(error.as_str()))
+    }
+    ret Result[(), str]::Ok(())
+}
+
+/// Final-link/header tools run through the same parent-death guard as package
+/// workers. Foreign tools cannot install Encore's guard themselves; the small
+/// guarded supervisor owns their process group until the tool is reaped.
+#attr(safe)
+pub fn run_program_tool(program: str, arguments: Vec[str], directory: Path, name: str) -> Result[(), str] {
+    let child = start_program_tool(program, arguments, directory, name)?
+    ret finish_unit_tool(child, program, directory, name)
+}
+
+#attr(safe)
+pub fn start_program_tool(program: str, arguments: Vec[str], directory: Path, name: str) -> Result[usize, str] {
+    let mut guarded = Vec[str]::new()
+    guarded.push("__run-tool")
+    guarded.push(Debug::fmt(unsafe {
+                encore_compiler_process_id()
+            }
+        ))
+    guarded.push(program)
+    for argument in arguments {
+        guarded.push(argument)
+    }
+    ret start_unit_tool(executable_path(), guarded, directory, name)
+}
+
+/// Also cancels live descendants. Safe on an already closed/stale handle.
+#attr(safe)
+pub fn close_program_tool(child: usize) ->() {
+    unsafe {
+        encore_compiler_worker_close(child)
+    }
+}
+
+#attr(safe)
+pub fn run_tool_worker() -> u32 {
+    if process_arg_count() < 4 {
+        eprintln("invalid guarded tool arguments") ret 2
+    }
+    let text = process_arg(2).unwrap_or("")
+    let mut parent = 0_u64
+    let mut cursor = 0_usize
+    while cursor < text.byte_len() {
+        let byte = text.byte_at(cursor)
+        if byte < 48 || byte > 57 {
+            ret 2
+        }
+        let digit =(byte - 48) as u64
+        if parent >(18446744073709551615_u64 - digit) / 10 {
+            ret 2
+        }
+        parent = parent * 10 + digit
+        cursor += 1
+    }
+    if parent == 0 || !unsafe {
+        encore_compiler_worker_watch_parent(parent)
+    }
+    {
+        ret 2
+    }
+    let mut arguments = Vec[str]::new()
+    cursor = 4
+    while cursor < process_arg_count() {
+        arguments.push(process_arg(cursor).unwrap_or("")) cursor += 1
+    }
+    // Parallel supervisors share a working directory, but must never open
+    // each other's logs. Windows excludes concurrent writers; POSIX would
+    // silently truncate/interleave them and corrupt failure diagnostics.
+    let log_name = "guarded-tool-" + Debug::fmt(unsafe {
+            encore_compiler_process_id()
+        }
+    )
+    match run_unit_tool(process_arg(3).unwrap_or(""), arguments, Path::new(".").resolve(), log_name) {
+        Ok(_) => {
+            ret 0
+        }
+        Err(error) => {
+            eprintln(error) ret 1
+        }
+    }
+}

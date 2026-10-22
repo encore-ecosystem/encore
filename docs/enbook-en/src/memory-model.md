@@ -1,5 +1,10 @@
 # Memory Model
 
+This is the advanced model and implementation contract. Start with
+[Values, Sharing, and Mutation](values-and-sharing.md) for the practical
+introduction. A stated runtime invariant is not a claim that every compiler
+revision is free of bugs; use the validation guidance below for regressions.
+
 EHIR is a state machine over graph memory. Encore is a source-language layer
 which lowers imports, loops, pattern matching and other compound constructs to
 that machine; it does not define a second ownership model.
@@ -65,34 +70,31 @@ let second = first
 `first` and `second` are independent `Pair` payloads, but their `target` fields
 are two owning handles to the same node.
 
-One local-binding rule is intentionally different. If `a` is already a
-mutable local path, `let mut b = a` gives `b` another name for the same local
-cell. It does not copy the value and does not create another graph edge.
-Aliases are resolved before canonical SSA EHIR:
+An immutable binding is a read-only capability. `mut` may be introduced for a
+fresh expression, but cannot be recovered from an immutable path. This closes
+the alias-laundering hole where a new binding could manufacture a writer from
+a reader:
 
 ```enq
-let mut a = Pair{1_u32, Target<H>{10_u32}}
-let mut b = a
-b.left = 2_u32
-// a.left is now 2 because a and b name the same local cell.
+let a = Pair{1_u32, Target<H>{10_u32}}
+// let mut b = a  // error: mutable-alias-from-readonly
 ```
 
-An immutable binding, an expression, or a non-mutable source is copied rather
-than aliased.
+A mutable capability can instead be passed directly to a `mut` parameter or
+receiver. Ordinary value copies remain ordinary read-only bindings.
 
 ### Mutation
 
-`mut` applies to a local cell, not to a pointer kind. It permits rebinding or
-updating that local inline value. It is removed by the local-to-SSA pass and
-must never be represented as `T<S>`.
+`mut` is a deep path capability, not a pointer kind. It permits rebinding and
+mutation through every field or element projected from that path. It is
+removed by the local-to-SSA pass and must never be represented as `T<S>`.
 
-Inline `mut T` function parameters and receivers are not supported. A function
-which mutates an object accepts `T<S>`, `T<H>` or, normally, `T&`. Every owning
-handle may mutate its node payload; `mut` on the handle binding is needed only
-to replace the handle itself.
+Function parameters and receivers opt into mutation explicitly with `mut T`.
+An ordinary parameter, including ordinary `self`, is read-only. Owning a node
+handle does not implicitly grant write access to its payload.
 
 ```enq
-fn increment(counter: Counter&) -> () {
+fn increment(counter: mut Counter&) -> () {
     counter.value += 1_u32
 }
 ```
@@ -309,20 +311,21 @@ reference-counted buffers. For example, the public vector API uses
 contained recursively in every initialized element.
 
 ```enq
-let values = Vec[Target<H>]::new()
+let mut values = Vec[Target<H>]::new()
 values.push(Target<H>{1_u32})
 let same = values
-same.push(Target<H>{2_u32})
-// values and same refer to the same vector node.
+// values and same refer to the same vector node; same is read-only.
 ```
 
 `values.clone()` is the library operation for an independent vector.
 
 ## Concurrency
 
-Public node handles `T<S>`, `T<H>` and `T&` are not `Send`. `spawn` accepts an
-inline value only when its complete structure is `Send`; a nested node handle,
-raw pointer or mutable local alias rejects the transfer.
+Ordinary spawn arguments must have a recursively transfer-safe inline shape.
+Public node handles cannot cross that boundary merely because they are owned.
+Exclusive graph regions can instead cross through `sending`; recursively
+read-only shared regions use `frozen`. These are compiler-checked capabilities,
+not an opt-in nominal `Send` trait. See [Concurrency](concurrency.md).
 
 Runtime-internal immutable nodes, such as string storage, may cross threads.
 The common graph lock and atomic publication rules keep their ownership

@@ -1,0 +1,822 @@
+//! Dependency-aware admission for independent refrain compilation workers.
+
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+
+import std::vec::Vec
+
+/// Readiness of a package; metadata can be consumed before its archive exists.
+pub enum UnitState {
+    Waiting
+    Running
+    MetadataReady
+    Complete
+    Failed
+    Cancelled
+}
+
+/// A compilation unit and its scheduling priority, owned by the coordinator.
+pub struct BuildUnit {
+    id: str
+    dependencies: Vec[str]
+    weight_ms: u64
+}
+
+struct UnitProgress {
+    state: UnitState
+    cpu_lease: bool
+    unlocks: usize
+}
+
+#attr(test)
+fn metadata_cached_package_needs_no_reservation() -> bool {
+    let mut units = Vec[BuildUnit]::new()
+    units.push(BuildUnit::new("cached", Vec[str]::new(), 0))
+    units.push(BuildUnit::new("busy", Vec[str]::new(), 0))
+    let mut scheduler = match BuildScheduler::new(units, 1) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    if !scheduler.start(1) {
+        ret false
+    }
+    ret scheduler.next_ready().is_none() && scheduler.next_cache_candidate(Vec[usize]::new()).unwrap_or(99) == 0 &&
+    scheduler.cached_complete(0) && scheduler.processes == 1 && scheduler.cpu_leases == 1 &&
+    scheduler.metadata_ready(1) && scheduler.complete(1) && scheduler.processes == 0 && scheduler.cpu_leases == 0
+}
+
+#attr(test)
+fn metadata_busy_cache_key_does_not_block_other_units() -> bool {
+    let mut units = Vec[BuildUnit]::new()
+    units.push(BuildUnit::new("first", Vec[str]::new(), 10))
+    units.push(BuildUnit::new("second", Vec[str]::new(), 5))
+    let scheduler = match BuildScheduler::new(units, 1) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let mut excluded = Vec[usize]::new()
+    excluded.push(0)
+    ret scheduler.next_ready_excluding(excluded).unwrap_or(99) == 1 && scheduler.next_cache_candidate(excluded).unwrap_or(99) == 1
+}
+
+impl for BuildUnit {
+    /// Creates a pending unit. Dependency IDs, not input order, define the DAG.
+    pub fn new(id: str, dependencies: Vec[str], weight_ms: u64) -> Self {
+        ret Self {
+            id, dependencies, weight_ms
+        }
+    }
+}
+
+/// One aggregate CPU/process budget, independent of the number of packages.
+pub struct BuildScheduler {
+    units: Vec[BuildUnit]
+    states: Vec[UnitProgress]
+    jobs: usize
+    processes: usize
+    cpu_leases: usize
+    stopped: bool
+}
+
+impl for BuildScheduler {
+    /// Validates all edges and cycles before admitting any work.
+    pub fn new(units: Vec[BuildUnit], jobs: usize) -> Result[Self, str] {
+        if jobs == 0 {
+            ret Result[Self, str]::Err("build job budget must be positive")
+        }
+        let validation = validate_units(units)
+        if validation != "" {
+            ret Result[Self, str]::Err(validation)
+        }
+        let mut states = Vec[UnitProgress]::new()
+        for unit in units {
+            states.push(UnitProgress {
+                    UnitState::Waiting, false, downstream_count(units, unit.id)
+                }
+                ,
+            )
+        }
+        ret Result[Self, str]::Ok(Self {
+                units, states, jobs, 0, 0, false
+            }
+            ,
+        )
+    }
+
+    /// Prioritizes downstream dependants, then estimated duration, then ID.
+    pub fn next_ready(self: Self) -> Option[usize] {
+        ret self.next_ready_excluding(Vec[usize]::new())
+    }
+
+    /// Busy cache keys do not prevent other independent packages from starting.
+    pub fn next_ready_excluding(self: Self, excluded: Vec[usize]) -> Option[usize] {
+        ret self.next_candidate(excluded, true)
+    }
+
+    /// Cache verification itself never needs a worker resource reservation.
+    pub fn next_cache_candidate(self: Self, excluded: Vec[usize]) -> Option[usize] {
+        ret self.next_candidate(excluded, false)
+    }
+
+    fn next_candidate(self: Self, excluded: Vec[usize], reserve: bool) -> Option[usize] {
+        if self.stopped ||(reserve &&(self.cpu_leases >= self.jobs || self.processes / 2 >= self.jobs)) {
+            ret Option[usize]::None
+        }
+        let mut best = Option[usize]::None
+        let mut best_unlocks = 0_usize
+        let mut best_weight = 0_u64
+        let mut best_id = ""
+        let mut index = 0_usize
+        for unit in self.units {
+            let progress = self.states.get(index).unwrap_or(UnitProgress {
+                    UnitState::Cancelled, false, 0
+                }
+                ,
+            )
+            let mut skip = false
+            for omitted in excluded {
+                if omitted == index {
+                    skip = true
+                }
+            }
+            if !skip && is_waiting(progress.state) && dependencies_ready(self.units, self.states, unit.dependencies)
+            {
+                let unlocks = progress.unlocks
+                if best.is_none() || unlocks > best_unlocks ||
+                (unlocks == best_unlocks && unit.weight_ms > best_weight) ||
+                (unlocks == best_unlocks && unit.weight_ms == best_weight && id_before(unit.id, best_id)) {
+                    best = Option[usize]::Some(index)
+                    best_unlocks = unlocks
+                    best_weight = unit.weight_ms
+                    best_id = unit.id
+                }
+            }
+            index += 1
+        }
+        ret best
+    }
+
+    pub fn can_start(self: Self, index: usize) -> bool {
+        if self.stopped || self.cpu_leases >= self.jobs || self.processes / 2 >= self.jobs {
+            ret false
+        }
+        let unit = match self.units.get(index) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+        let progress = match self.states.get(index) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+        ret is_waiting(progress.state) && dependencies_ready(self.units, self.states, unit.dependencies)
+    }
+
+    /// Reserves resources only after the coordinator has a real ready unit.
+    pub fn start(self: mut Self, index: usize) -> bool {
+        if self.stopped || self.cpu_leases >= self.jobs || self.processes / 2 >= self.jobs {
+            ret false
+        }
+        match self.units.get(index) {
+            Some(unit) => {
+                let mut progress = self.states.get(index).unwrap_or(UnitProgress {
+                        UnitState::Cancelled, false, 0
+                    }
+                    ,
+                )
+                if !is_waiting(progress.state) || !dependencies_ready(self.units, self.states, unit.dependencies)
+                {
+                    ret false
+                }
+                progress.state = UnitState::Running
+                progress.cpu_lease = true
+                self.states.set(index, progress)
+                self.processes += 1
+                self.cpu_leases += 1
+                ret true
+            }
+            None => {
+                ret false
+            }
+        }
+    }
+
+    /// Publishes checked metadata without pretending the native archive exists.
+    pub fn metadata_ready(self: mut Self, index: usize) -> bool {
+        if self.stopped {
+            ret false
+        }
+        match self.states.get(index) {
+            Some(progress) => {
+                if !is_running(progress.state) {
+                    ret false
+                }
+                let mut next = progress
+                next.state = UnitState::MetadataReady
+                self.states.set(index, next)
+                ret true
+            }
+            None => {
+                ret false
+            }
+        }
+    }
+
+    /// Waiting workers release CPU, but retain their bounded process slot.
+    pub fn release_cpu(self: mut Self, index: usize) -> bool {
+        match self.states.get(index) {
+            Some(progress) => {
+                if !is_live(progress.state) || !progress.cpu_lease {
+                    ret false
+                }
+                let mut next = progress
+                next.cpu_lease = false
+                self.states.set(index, next)
+                self.cpu_leases -= 1
+                ret true
+            }
+            None => {
+                ret false
+            }
+        }
+    }
+
+    /// Restores a worker's lease within the same aggregate budget.
+    pub fn acquire_cpu(self: mut Self, index: usize) -> bool {
+        if self.stopped || self.cpu_leases >= self.jobs {
+            ret false
+        }
+        match self.states.get(index) {
+            Some(progress) => {
+                if !is_live(progress.state) || progress.cpu_lease {
+                    ret false
+                }
+                let mut next = progress
+                next.cpu_lease = true
+                self.states.set(index, next)
+                self.cpu_leases += 1
+                ret true
+            }
+            None => {
+                ret false
+            }
+        }
+    }
+
+    /// Completes a reaped worker after metadata and the native archive exist.
+    pub fn complete(self: mut Self, index: usize) -> bool {
+        match self.states.get(index) {
+            Some(progress) => {
+                if !is_metadata_ready(progress.state) {
+                    ret false
+                }
+            }
+            None => {
+                ret false
+            }
+        }
+        ret self.finish(index, UnitState::Complete)
+    }
+
+    /// A verified cache result has no process or CPU lease.
+    pub fn cached_complete(self: mut Self, index: usize) -> bool {
+        if self.stopped {
+            ret false
+        }
+        let unit = match self.units.get(index) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+        let progress = match self.states.get(index) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+        if !is_waiting(progress.state) || !dependencies_ready(self.units, self.states, unit.dependencies) {
+            ret false
+        }
+        self.states.set(index, UnitProgress { UnitState::Complete, false, progress.unlocks })
+        ret true
+    }
+
+    /// A final link needs dependency archives, not merely checked metadata.
+    pub fn dependency_artifacts_ready(self: Self, index: usize) -> bool {
+        match self.units.get(index) {
+            Some(unit) => {
+                for dependency in unit.dependencies {
+                    match self.states.get(unit_index(self.units, dependency)) {
+                        Some(progress) => {
+                            match progress.state {
+                                UnitState::Complete => {
+                                }
+                                _ => {
+                                    ret false
+                                }
+                            }
+                        }
+                        None => {
+                            ret false
+                        }
+                    }
+                }
+                ret true
+            }
+            None => {
+                ret false
+            }
+        }
+    }
+
+    /// Stops admission on failure and accounts for the failed, reaped worker.
+    pub fn fail(self: mut Self, index: usize) -> bool {
+        self.cancel()
+        ret self.finish(index, UnitState::Failed)
+    }
+
+    /// Queued units are cancelled immediately. Live reservations remain until
+    /// the process supervisor confirms termination; cancellation is not exit.
+    pub fn cancel(self: mut Self) ->() {
+        self.stopped = true
+        let mut index = 0_usize
+        while index < self.units.len() {
+            match self.states.get(index) {
+                Some(progress) => {
+                    if is_waiting(progress.state) {
+                        let mut next = progress
+                        next.state = UnitState::Cancelled
+                        self.states.set(index, next)
+                    }
+                }
+                None => {
+                }
+            }
+            index += 1
+        }
+    }
+
+    /// Acknowledges termination before releasing the cancelled worker's slot.
+    pub fn reap_cancelled(self: mut Self, index: usize) -> bool {
+        if !self.stopped {
+            ret false
+        }
+        ret self.finish(index, UnitState::Cancelled)
+    }
+
+    fn finish(self: mut Self, index: usize, state: UnitState) -> bool {
+        match self.states.get(index) {
+            Some(progress) => {
+                if !is_live(progress.state) {
+                    ret false
+                }
+                let mut next = progress
+                next.state = state
+                next.cpu_lease = false
+                self.states.set(index, next)
+                self.processes -= 1
+                if progress.cpu_lease {
+                    self.cpu_leases -= 1
+                }
+                ret true
+            }
+            None => {
+                ret false
+            }
+        }
+    }
+
+}
+
+fn is_waiting(state: UnitState) -> bool {
+    ret match state {
+        UnitState::Waiting => true _ => false
+    }
+}
+
+fn is_running(state: UnitState) -> bool {
+    ret match state {
+        UnitState::Running => true _ => false
+    }
+}
+
+fn is_metadata_ready(state: UnitState) -> bool {
+    ret match state {
+        UnitState::MetadataReady => true UnitState::Complete => true _ => false
+    }
+}
+
+fn is_live(state: UnitState) -> bool {
+    ret match state {
+        UnitState::Running => true UnitState::MetadataReady => true _ => false
+    }
+}
+
+fn unit_index(units: Vec[BuildUnit], id: str) -> usize {
+    let mut index = 0_usize
+    for unit in units {
+        if unit.id == id {
+            ret index
+        }
+        index += 1
+    }
+    ret units.len()
+}
+
+fn dependencies_ready(units: Vec[BuildUnit], states: Vec[UnitProgress], dependencies: Vec[str]) -> bool {
+    for dependency in dependencies {
+        match states.get(unit_index(units, dependency)) {
+            Some(progress) => {
+                if !is_metadata_ready(progress.state) {
+                    ret false
+                }
+            }
+            None => {
+                ret false
+            }
+        }
+    }
+    ret true
+}
+
+fn contains_id(ids: Vec[str], id: str) -> bool {
+    for value in ids {
+        if value == id {
+            ret true
+        }
+    }
+    ret false
+}
+
+fn downstream_count(units: Vec[BuildUnit], id: str) -> usize {
+    let mut reached = Vec[str]::new()
+    reached.push(id)
+    let mut cursor = 0_usize
+    while cursor < reached.len() {
+        let current = reached.get(cursor).unwrap_or("")
+        for unit in units {
+            if contains_id(unit.dependencies, current) && !contains_id(reached, unit.id) {
+                reached.push(unit.id)
+            }
+        }
+        cursor += 1
+    }
+    ret reached.len() - 1
+}
+
+fn validate_units(units: Vec[BuildUnit]) -> str {
+    let mut ids = Vec[str]::new()
+    for unit in units {
+        if unit.id == "" || contains_id(ids, unit.id) {
+            ret "duplicate or empty build unit ID"
+        }
+        ids.push(unit.id)
+    }
+    for unit in units {
+        let mut seen = Vec[str]::new()
+        for dependency in unit.dependencies {
+            if !contains_id(ids, dependency) {
+                ret "missing build dependency: " + dependency
+            }
+            if contains_id(seen, dependency) {
+                ret "duplicate build dependency: " + dependency
+            }
+            seen.push(dependency)
+        }
+    }
+    let mut sorted = Vec[str]::new()
+    while sorted.len() < units.len() {
+        let before = sorted.len()
+        for unit in units {
+            if !contains_id(sorted, unit.id) {
+                let mut ready = true
+                for dependency in unit.dependencies {
+                    if !contains_id(sorted, dependency) {
+                        ready = false
+                    }
+                }
+                if ready {
+                    sorted.push(unit.id)
+                }
+            }
+        }
+        if sorted.len() == before {
+            ret "dependency cycle in build units"
+        }
+    }
+    ret ""
+}
+
+fn id_before(left: str, right: str) -> bool {
+    let mut index = 0_usize
+    while index < left.byte_len() && index < right.byte_len() {
+        if left.byte_at(index) != right.byte_at(index) {
+            ret left.byte_at(index) < right.byte_at(index)
+        }
+        index += 1
+    }
+    ret left.byte_len() < right.byte_len()
+}
+
+fn leaf(id: str, weight: u64) -> BuildUnit {
+    ret BuildUnit::new(id, Vec[str]::new(), weight)
+}
+
+fn depends(id: str, parent: str) -> BuildUnit {
+    let mut dependencies = Vec[str]::new()
+    dependencies.push(parent)
+    ret BuildUnit::new(id, dependencies, 1)
+}
+
+#attr(test)
+fn scheduler_metadata_pipelining_contract() -> bool {
+    let mut units = Vec[BuildUnit]::new()
+    units.push(leaf("producer", 10))
+    units.push(depends("consumer", "producer"))
+    let mut scheduler = match BuildScheduler::new(units, 2) {
+        Result[BuildScheduler, str]::Ok(value) => value
+        Result[BuildScheduler, str]::Err(_) => {
+            ret false
+        }
+    }
+    if !scheduler.start(0) || scheduler.start(1) || scheduler.complete(0) {
+        ret false
+    }
+    if !scheduler.metadata_ready(0) || scheduler.metadata_ready(0) {
+        ret false
+    }
+    if !scheduler.start(1) || scheduler.processes != 2 {
+        ret false
+    }
+    if !scheduler.metadata_ready(1) || !scheduler.complete(1) {
+        ret false
+    }
+    ret scheduler.complete(0) && scheduler.processes == 0 && scheduler.cpu_leases == 0
+}
+
+#attr(test)
+fn scheduler_diamond_contract() -> bool {
+    let mut units = Vec[BuildUnit]::new()
+    units.push(leaf("base", 10))
+    units.push(depends("left", "base"))
+    units.push(depends("right", "base"))
+    let mut parents = Vec[str]::new()
+    parents.push("left")
+    parents.push("right")
+    units.push(BuildUnit::new("root", parents, 1))
+    let mut scheduler = match BuildScheduler::new(units, 4) {
+        Result[BuildScheduler, str]::Ok(value) => value
+        Result[BuildScheduler, str]::Err(_) => {
+            ret false
+        }
+    }
+    if !scheduler.start(0) || !scheduler.metadata_ready(0) {
+        ret false
+    }
+    if !scheduler.start(1) || !scheduler.start(2) {
+        ret false
+    }
+    if scheduler.start(3) || !scheduler.metadata_ready(1) || scheduler.start(3) {
+        ret false
+    }
+    ret scheduler.metadata_ready(2) && scheduler.start(3)
+}
+
+#attr(test)
+fn scheduler_dynamic_ready_queue_contract() -> bool {
+    let mut units = Vec[BuildUnit]::new()
+    units.push(leaf("slow", 1000))
+    units.push(leaf("fast", 100))
+    units.push(leaf("next", 10))
+    let mut scheduler = match BuildScheduler::new(units, 2) {
+        Result[BuildScheduler, str]::Ok(value) => value
+        Result[BuildScheduler, str]::Err(_) => {
+            ret false
+        }
+    }
+    if scheduler.next_ready().unwrap_or(99) != 0 || !scheduler.start(0) {
+        ret false
+    }
+    if scheduler.next_ready().unwrap_or(99) != 1 || !scheduler.start(1) {
+        ret false
+    }
+    if scheduler.next_ready().is_some() || !scheduler.metadata_ready(1) || !scheduler.complete(1) {
+        ret false
+    }
+    ret scheduler.next_ready().unwrap_or(99) == 2 && scheduler.start(2)
+}
+
+#attr(test)
+fn scheduler_priority_contract() -> bool {
+    let mut units = Vec[BuildUnit]::new()
+    units.push(leaf("heavy", 1000))
+    units.push(leaf("unlocking", 1))
+    units.push(depends("child", "unlocking"))
+    units.push(depends("grandchild", "child"))
+    let scheduler = match BuildScheduler::new(units, 2) {
+        Result[BuildScheduler, str]::Ok(value) => value
+        Result[BuildScheduler, str]::Err(_) => {
+            ret false
+        }
+    }
+    if scheduler.next_ready().unwrap_or(99) != 1 {
+        ret false
+    }
+    let mut ties = Vec[BuildUnit]::new()
+    ties.push(leaf("z", 10))
+    ties.push(leaf("a", 10))
+    let tied = match BuildScheduler::new(ties, 1) {
+        Result[BuildScheduler, str]::Ok(value) => value
+        Result[BuildScheduler, str]::Err(_) => {
+            ret false
+        }
+    }
+    ret tied.next_ready().unwrap_or(99) == 1
+}
+
+#attr(test)
+fn scheduler_cpu_and_process_budget_contract() -> bool {
+    let mut units = Vec[BuildUnit]::new()
+    units.push(leaf("a", 1))
+    units.push(leaf("b", 1))
+    units.push(leaf("c", 1))
+    let mut scheduler = match BuildScheduler::new(units, 1) {
+        Result[BuildScheduler, str]::Ok(value) => value
+        Result[BuildScheduler, str]::Err(_) => {
+            ret false
+        }
+    }
+    if !scheduler.start(0) || scheduler.start(1) || !scheduler.release_cpu(0) {
+        ret false
+    }
+    if !scheduler.start(1) || scheduler.acquire_cpu(0) || !scheduler.release_cpu(1) {
+        ret false
+    }
+    // Two waiting processes already exhaust the 2 * jobs live-process limit.
+    if scheduler.start(2) || !scheduler.acquire_cpu(0) || scheduler.release_cpu(2) {
+        ret false
+    }
+    if !scheduler.metadata_ready(0) || !scheduler.complete(0) {
+        ret false
+    }
+    ret scheduler.start(2) && scheduler.cpu_leases == 1 && scheduler.processes == 2
+}
+
+#attr(test)
+fn scheduler_waiting_workers_and_cancellation_contract() -> bool {
+    let mut units = Vec[BuildUnit]::new()
+    units.push(leaf("a", 1))
+    units.push(leaf("b", 1))
+    units.push(leaf("c", 1))
+    let mut scheduler = match BuildScheduler::new(units, 2) {
+        Result[BuildScheduler, str]::Ok(value) => value
+        Result[BuildScheduler, str]::Err(_) => {
+            ret false
+        }
+    }
+    if !scheduler.start(0) || !scheduler.release_cpu(0) || !scheduler.start(1) ||
+    scheduler.next_ready().unwrap_or(99) != 2 || !scheduler.start(2) {
+        ret false
+    }
+    scheduler.cancel()
+    if scheduler.cpu_leases != 2 || scheduler.processes != 3 || scheduler.next_ready().is_some() {
+        ret false
+    }
+    if scheduler.metadata_ready(0) || scheduler.start(2) {
+        ret false
+    }
+    if !scheduler.reap_cancelled(0) || scheduler.reap_cancelled(0) {
+        ret false
+    }
+    ret scheduler.reap_cancelled(1) && scheduler.reap_cancelled(2) &&
+    scheduler.processes == 0 && scheduler.cpu_leases == 0
+}
+
+#attr(test)
+fn scheduler_invalid_graph_contract() -> bool {
+    let mut cycle = Vec[BuildUnit]::new()
+    cycle.push(depends("a", "b"))
+    cycle.push(depends("b", "a"))
+    if BuildScheduler::new(cycle, 2).is_ok() {
+        ret false
+    }
+    let mut missing = Vec[BuildUnit]::new()
+    missing.push(depends("a", "absent"))
+    if BuildScheduler::new(missing, 2).is_ok() {
+        ret false
+    }
+    let mut duplicate = Vec[BuildUnit]::new()
+    duplicate.push(leaf("a", 1))
+    duplicate.push(leaf("a", 1))
+    ret BuildScheduler::new(duplicate, 2).is_err()
+}
+
+#attr(test)
+fn scheduler_failure_accounting_contract() -> bool {
+    let mut units = Vec[BuildUnit]::new()
+    units.push(leaf("a", 1))
+    units.push(leaf("b", 1))
+    units.push(leaf("c", 1))
+    let mut scheduler = match BuildScheduler::new(units, 2) {
+        Result[BuildScheduler, str]::Ok(value) => value
+        Result[BuildScheduler, str]::Err(_) => {
+            ret false
+        }
+    }
+    if !scheduler.start(0) || !scheduler.start(1) || !scheduler.fail(0) {
+        ret false
+    }
+    if scheduler.start(2) || scheduler.cpu_leases != 1 || scheduler.processes != 1 {
+        ret false
+    }
+    ret scheduler.reap_cancelled(1) && scheduler.cpu_leases == 0 && !scheduler.fail(0)
+}
+
+#attr(test)
+fn scheduler_eight_dependencies_all_budgets_contract() -> bool {
+    let mut budgets = Vec[usize]::new()
+    budgets.push(1)
+    budgets.push(2)
+    budgets.push(4)
+    budgets.push(8)
+    for jobs in budgets {
+        let mut units = Vec[BuildUnit]::new()
+        let mut parents = Vec[str]::new()
+        let mut remaining = Vec[u64]::new()
+        let mut index = 0_usize
+        while index < 8 {
+            let id = "dependency-" + Debug::fmt(index)
+            parents.push(id)
+            units.push(leaf(id, if index == 0 {
+                        10_u64
+                    } else {
+                        1_u64
+                    }
+                    ,))
+            remaining.push(if index == 0 {
+                    10_u64
+                } else {
+                    1_u64
+                }
+            )
+            index += 1
+        }
+        units.push(BuildUnit::new("root", parents, 1))
+        remaining.push(1)
+        let mut scheduler = match BuildScheduler::new(units, jobs) {
+            Result[BuildScheduler, str]::Ok(value) => value
+            Result[BuildScheduler, str]::Err(_) => {
+                ret false
+            }
+        }
+        let mut running = Vec[usize]::new()
+        let mut completed = 0_usize
+        let mut ticks = 0_usize
+        while completed < 9 && ticks < 50 {
+            loop {
+                match scheduler.next_ready() {
+                    Some(next) => {
+                        if !scheduler.start(next) || !scheduler.metadata_ready(next) {
+                            ret false
+                        }
+                        running.push(next)
+                    }
+                    None => {
+                        break
+                    }
+                }
+            }
+            if scheduler.cpu_leases > jobs || scheduler.processes > 2 * jobs {
+                ret false
+            }
+            let mut next_running = Vec[usize]::new()
+            for active in running {
+                let rest = remaining.get(active).unwrap_or(0)
+                if rest == 0 {
+                    ret false
+                }
+                remaining.set(active, rest - 1)
+                if rest == 1 {
+                    if !scheduler.complete(active) {
+                        ret false
+                    }
+                    completed += 1
+                } else {
+                    next_running.push(active)
+                }
+            }
+            running = next_running
+            ticks += 1
+        }
+        if completed != 9 || scheduler.processes != 0 || scheduler.cpu_leases != 0 {
+            ret false
+        }
+        if !scheduler.dependency_artifacts_ready(8) {
+            ret false
+        }
+    }
+    ret true
+}

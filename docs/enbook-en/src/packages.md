@@ -20,7 +20,7 @@ dependencies = [
 | Field | Meaning |
 | --- | --- |
 | `name` | package name |
-| `target` | `auto`, `executable`, `static_lib` or `shared_lib` |
+| `target` | output kind: `auto`, `executable`, `static_lib` or `shared_lib`; legacy target triples are also accepted |
 | `version` | package version string |
 | `description` | package description |
 | `readme` | readme path |
@@ -30,6 +30,95 @@ dependencies = [
 
 `core` is a system dependency injected by the compiler. Do not add `sys@core`
 manually.
+
+When Encore writes dependencies, nonempty arrays use one reference per line,
+with four-space indentation and trailing commas. Dependency order is preserved;
+an empty array remains `[]`.
+
+With `auto`, a package with `src/main.enq` builds an executable; a library-only
+package with `src/lib.enq` builds a static library. When both exist, direct builds
+use `main.enq`, while consumers always use the library entrypoint. An explicit
+`static_lib` or `shared_lib` selects `lib.enq` even if `main.enq` also exists.
+Use `encore build --target <triple>` to select the architecture independently.
+
+Library artifacts are `lib<name>.a` (MSVC: `<name>.lib`) or `lib<name>.so`
+(macOS: `lib<name>.dylib`, Windows: `<name>.dll`). Static archives include their
+dependency objects and runtime support; shared libraries export linked symbols.
+`--emit object`, `--emit llvm-ir`, and `--emit ehir` also accept library packages.
+`encore run` and executable installation require an executable project.
+
+## Package Compilation And Cache
+
+For binary builds, Encore resolves a dependency graph from manifests first.
+Each package is checked and compiled in its own compiler process. Workers read
+their own sources; dependencies arrive as verified declarations (`.ermeta`),
+generic templates (`.ertemplate`) and ordinary native archives (`.erlib`).
+Generic specializations and ownership helpers are collected into one final
+support unit before linking the executable.
+
+`encore build --jobs 4` sets one shared CPU budget, not four workers per package.
+Ready packages are scheduled dynamically. A dependent can start when checked
+metadata is ready, without waiting for every dependency archive to finish.
+Native compilation can borrow unused CPU leases. Admission also reserves RAM,
+keeps 20% headroom and observes Linux container memory limits. Resource history
+can raise a package's initial conservative reservation on later builds.
+
+The content-addressed cache distinguishes three stages:
+
+- Frontend: own sources, compiler, target, profile, features and dependency
+  interfaces. An ordinary dependency-body edit does not recheck a consumer.
+- Backend: frontend identity plus reachable generic-template identities. A
+  template-body edit redoes backend preparation, not frontend checking.
+- Native: backend identity plus selected native executables and flags. Native
+  flag changes reuse the prepared package instead of rechecking its sources.
+
+Final linking also follows dependency archives and active native-source/header
+contents. A changed dependency archive is linked even when consumer code is
+cached. Cache payloads are checksummed, copied into private build snapshots and
+published with atomic receipts under per-key process locks. Missing or corrupt
+entries are rebuilt; they do not trigger dependency-source fallback.
+
+Package entries default to `~/.cache/encore/units-v1`; `ENCORE_BUILD_CACHE`
+overrides that location. Private staging and native objects are under `target/`.
+`encore build --timings` writes `encore-timings.json` in the profile output
+directory, including queue time, package cache hits and total pipeline time.
+These internal artifact formats are compiler-specific, not a public ABI or a
+replacement for the dependency lockfile.
+
+### Cache limits and build workspaces
+
+`encore cache status` reports compiled-cache usage. Add `--json` for machine-readable
+output or `--project PATH` to inspect another project's managed workspaces and
+other target artifacts. Registry downloads and installed SDKs/toolchains are
+separate from the compiled-cache budget.
+
+The shared compiled cache defaults to **20 GiB**, including package, lowering and
+native-object entries. Set `ENCORE_BUILD_CACHE_MAX_SIZE` to a nonnegative integer
+with an optional `B`, `MiB` or `GiB` suffix to change it. After a build, automatic
+maintenance runs at most once per minute. When usage exceeds the limit, it evicts
+least recently used entries down to 90% of the limit. This is a soft limit:
+concurrent builds and locked entries can temporarily keep usage above it.
+
+```sh
+encore cache prune --dry-run
+encore cache prune --max-size 20GiB
+encore cache prune --all
+```
+
+Explicit pruning runs immediately. `--max-size` applies to that invocation;
+`--all` removes all available compiled entries. Dry runs do not modify files.
+Per-entry OS locks protect readers/writers, and lock files survive eviction.
+Unrecognized directories and symlinks are not removed.
+
+Build, run and test commands normally remove their private staging directories.
+Coordinator and worker processes hold shared OS leases; cleanup requires an
+exclusive lease, including after an interrupted build. Failed builds save bounded
+text diagnostics under `target/diagnostics/`: at most ten reports and 128 MiB in
+total. Use `--keep-build-artifacts` (or `ENCORE_KEEP_TEMPS=1`) to retain full
+intermediates. Explicit pruning also respects this retention flag recorded on a
+workspace. Final binaries, native/ThinLTO caches and unregistered legacy build
+directories are preserved. Historical snapshots require a separately reviewed
+cleanup; they are never inferred to be disposable from their names alone.
 
 ## Dependency References
 
@@ -114,11 +203,49 @@ archive and verifies the recorded checksum.
 
 ## Official Package Index
 
-The default sparse index is
-`https://raw.githubusercontent.com/encore-ecosystem/encore-index/refs/heads/main`. Package
-`json` is described by `js/json.json`; only that metadata file is downloaded.
-Set `ENCORE_INDEX_URL` to use a mirror and `ENCORE_REGISTRY_CACHE` to override
+Registry metadata is obtained through a discovered API, not a GitHub metadata
+repository. Package `json` is described by `/api/v1/packages/json` on the
+registry origin. Set `ENCORE_DEFAULT_INDEX` to choose your default index without adding a registry
+section to every project, and `ENCORE_REGISTRY_CACHE` to override
 the default cache under `~/.cache/encore/registry`.
+
+The root project can instead select one index in `encore.toml`:
+
+```toml
+[registry]
+index = "https://packages.example.org/index"
+```
+
+Selection priority is `ENCORE_INDEX_URL`, the root manifest's `[registry].index`,
+`ENCORE_DEFAULT_INDEX`. No built-in GitHub fallback is used. Until an official
+API URL is configured, new index dependencies require an explicit registry.
+Direct `git@`, `path@` and `workspace@` dependencies do not require a registry.
+For local development:
+
+```sh
+export ENCORE_DEFAULT_INDEX="http://127.0.0.1:8137/index"
+```
+
+The same selection applies to resolution, publication and authentication.
+Empty environment variables are treated as unset. A nonempty invalid selected
+URL is an error, not a reason to try another index.
+Dependencies cannot override the
+root's selection, and resolution never falls back to another index. HTTPS is
+required except for loopback HTTP development servers and absolute `file://`
+API fixture indexes. Credentials, queries and fragments are not accepted in index
+URLs. Tokens must not be stored in this field.
+
+Newly resolved packages record `registry` in `encore.lock` and use separate cache
+namespaces for each normalized index URL. After changing the index, run
+`encore update` explicitly; ordinary builds and sync refuse to replace a pinned
+source. Old lockfiles without `registry` retain their exact archive URLs and
+checksums until an explicit update.
+
+Resolution and publication use the selected API service. `encore publish`
+discovers `/config.json` below the index URL and uploads through its same-origin
+API with a keyring credential or an origin-bound CI token. A missing or
+incompatible service is an error, never a fallback to GitHub.
+See [registry authentication](publishing-packages.md#authentication).
 
 An index entry contains immutable release archives in publication order:
 
@@ -140,7 +267,7 @@ Each release archive must contain `encore.toml` at its root. Its project name
 and version must match the index entry. A package may include private refrains
 under `workspace/` and reference them with `workspace@`; they are part of the
 same immutable archive and are not separate public index entries. Old versions
-remain in the file; withdrawn versions are marked `yanked` instead of being
+remain in the registry; withdrawn versions are marked `yanked` instead of being
 removed or modified.
 
 The v1 resolver orders entries by SemVer rather than JSON array position.
@@ -156,11 +283,13 @@ The default registry layout is:
 
 ```text
 ~/.cache/encore/registry/
-├── metadata/
-├── archives/
-└── packages/
-    └── json/
-        └── 1.0.0-<sha256>/
+└── sources/
+    └── <registry-identity>/
+        ├── metadata/
+        ├── archives/
+        └── packages/
+            └── json/
+                └── 1.0.0-<sha256>/
 ```
 
 Metadata is needed only while adding or updating a package. A normal build
@@ -169,11 +298,12 @@ directory is missing but the archive remains cached, Encore verifies and
 extracts it again. If both are missing, `encore sync` downloads the immutable
 archive URL from the lockfile without consulting the latest index entry.
 
-Registry resolution requires `curl`, `tar`, and either `sha256sum` or `shasum`.
+API discovery and metadata use the native HTTP client. Archive restoration
+requires `curl` and `tar`.
 A checksum mismatch, unsafe archive path, archive link or special file, missing
 root `encore.toml`, or manifest name/version mismatch aborts resolution.
 
-See [Publishing Packages](publishing-packages.md) for archive and index PR
+See [Publishing Packages](publishing-packages.md) for archive and API publication
 requirements.
 
 ## Package Layout
@@ -240,7 +370,7 @@ encore test --cfg feature=my_feature
 ## Native Build Scripts
 
 Build scripts let packages publish native link metadata. The official `core`
-package in `encore-ecosystem/encore-index` is the reference pattern. A build
+package under `packages/core` in the compiler repository is the reference pattern. A build
 script writes JSON to the path passed as argv `1`:
 
 ```json
@@ -268,6 +398,18 @@ dependencies = []
 
 Native library entries can name a system library or a file path. Optional `cfg`
 fields let metadata apply only to matching compile-time configurations.
+
+Scripts are compiled for the host and executed with their package as the working
+directory. Their optional second and third arguments contain the requested target
+triple and profile. Paths in metadata are relative to the declaring package, not
+the consumer or the metadata output directory. Source files are compiled once;
+archives/objects are linked as files, and name-only entries select system libraries.
+
+The compiled host script is cached, but executes on each build so changes to its
+inputs are observed. Its selected sources, included headers, native files and link
+arguments participate in native/link cache identities. A failed script, missing
+output or malformed metadata stops the build rather than reusing stale metadata.
+`encore test` also applies build scripts; `encore check` does not execute them.
 
 ## Validation Commands
 

@@ -23,7 +23,8 @@ fi
   libc6-dev-arm64-cross \
   linux-libc-dev-arm64-cross \
   libgcc-13-dev-arm64-cross \
-  libssl-dev:arm64
+  libssl-dev:arm64 \
+  libc-ares-dev:arm64
 
 mkdir -p \
   "$output" \
@@ -37,6 +38,7 @@ cp -RL /usr/aarch64-linux-gnu/. "$output/"
 # LLD interprets it inside --sysroot, so preserve the canonical directory too.
 cp -RL /usr/aarch64-linux-gnu/. "$output/usr/aarch64-linux-gnu/"
 cp -RL /usr/include/openssl "$output/usr/include/"
+cp -L /usr/include/ares*.h "$output/usr/include/"
 if [[ -d /usr/include/aarch64-linux-gnu ]]; then
   mkdir -p "$output/usr/include/aarch64-linux-gnu"
   cp -RL /usr/include/aarch64-linux-gnu/. "$output/usr/include/aarch64-linux-gnu/"
@@ -51,3 +53,4 @@ find "$output/usr/lib/gcc/aarch64-linux-gnu" -mindepth 2 -maxdepth 2 \
   -name crtbeginS.o -type f | grep -q .
 test -e "$output/usr/lib/aarch64-linux-gnu/libssl.so"
 test -e "$output/usr/lib/aarch64-linux-gnu/libcrypto.so"
+test -e "$output/usr/lib/aarch64-linux-gnu/libcares.so"

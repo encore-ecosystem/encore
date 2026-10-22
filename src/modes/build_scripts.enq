@@ -1,0 +1,187 @@
+//! Native build metadata is target-filtered data, never shell fragments.
+import core::option::Option
+import core::result::Result
+
+import std::os::{file_exists, file_sha256}
+import std::path::Path
+import std::vec::Vec
+
+import json::{Json, parse}
+
+import refrain::target::{TargetSpec, cfg_active_with_features}
+
+pub struct NativeBuildMetadata {
+    sources: Vec[Path]
+    files: Vec[Path]
+    libraries: Vec[str]
+    search_paths: Vec[Path]
+    frameworks: Vec[str]
+    link_args: Vec[str]
+}
+
+impl for NativeBuildMetadata {
+    pub fn empty() -> Self {
+        ret Self {
+            Vec[Path]::new(), Vec[Path]::new(), Vec[str]::new(), Vec[Path]::new(), Vec[str]::new(), Vec[str]::new()
+        }
+    }
+    pub fn append(self: mut Self, other: Self) ->() {
+        self.sources.extend(other.sources) self.files.extend(other.files)
+        self.libraries.extend(other.libraries) self.search_paths.extend(other.search_paths)
+        self.frameworks.extend(other.frameworks) self.link_args.extend(other.link_args)
+    }
+    pub fn link_arguments(self: Self, target: TargetSpec) -> Vec[str] {
+        let mut args = Vec[str]::new()
+        for path in self.search_paths {
+            args.push("-L" + path.as_str())
+        }
+        for path in self.files {
+            args.push(path.as_str())
+        }
+        for name in self.libraries {
+            args.push("-l" + name)
+        }
+        if target.os == "macos" {
+            for name in self.frameworks {
+                args.push("-framework") args.push(name)
+            }
+        }
+        args.extend(self.link_args)
+        ret args
+    }
+    pub fn identities(self: Self) -> Vec[str] {
+        let mut values = Vec[str]::new()
+        for file in self.files {
+            values.push(file.as_str()) values.push(file_sha256(file.as_str()))
+        }
+        ret values
+    }
+}
+
+fn array(data: Json, name: str) -> Result[Vec[Json], str] {
+    match data.get(name) {
+        None => {
+            ret Result[Vec[Json], str]::Ok(Vec[Json]::new())
+        }
+        Some(value) => {
+            match value {
+                Array(items) => {
+                    ret Result[Vec[Json], str]::Ok(items)
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    ret Result[Vec[Json], str]::Err("native metadata '" + name + "' must be an array")
+}
+fn text(data: Json, name: str) -> Result[str, str] {
+    match data.get(name) {
+        None => {
+            ret Result[str, str]::Ok("")
+        }
+        Some(value) => {
+            match value {
+                String(value) => {
+                    ret Result[str, str]::Ok(value)
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    ret Result[str, str]::Err("native metadata '" + name + "' must be a string")
+}
+fn value_text(value: Json) -> Result[str, str] {
+    match value {
+        String(value) => {
+            if value != "" {
+                ret Result[str, str]::Ok(value)
+            }
+        }
+        _ => {
+        }
+    }
+    ret Result[str, str]::Err("native metadata requires nonempty strings")
+}
+fn local_path(root: Path, value: str) -> Path {
+    let path = Path::new(value)
+    ret if path.is_absolute() {
+        path.resolve()
+    } else {
+        root.join(value).resolve()
+    }
+}
+fn source_path(value: str) -> bool {
+    for suffix in vec![".c", ".cc", ".cpp", ".cxx", ".m", ".mm", ".s", ".S"] {
+        if value.byte_len() >= suffix.byte_len() && value.slice(value.byte_len() - suffix.byte_len(), suffix.byte_len()) == suffix {
+            ret true
+        }
+    }
+    ret false
+}
+
+/// Relative file/search paths always belong to the declaring package, even
+/// when metadata was generated in a private target/ staging directory.
+pub fn parse_native_build_metadata(source: str, root: Path, target: TargetSpec,
+    features: Vec[str],) -> Result[NativeBuildMetadata, str] {
+    let data = match parse(source) {
+        Ok(data) => data Err(_) => {
+            ret Result[NativeBuildMetadata, str]::Err("invalid native build metadata JSON")
+        }
+    }
+    let native = match data.get("native") {
+        Some(value) => value
+        None => {
+            ret Result[NativeBuildMetadata, str]::Err("build script did not write a native metadata object")
+        }
+    }
+    match native {
+        Object(_) => {
+        }
+        _ => {
+            ret Result[NativeBuildMetadata, str]::Err("native metadata must be an object")
+        }
+    }
+    let mut out = NativeBuildMetadata::empty()
+    for library in array(native, "libraries")? {
+        match library {
+            Object(_) => {
+            }
+            _ => {
+                ret Result[NativeBuildMetadata, str]::Err("native library metadata must be an object")
+            }
+        }
+        let condition = text(library, "cfg")?
+        if condition != "" && !cfg_active_with_features(target, condition, features) {
+            continue
+        }
+        let path = text(library, "path")?
+        let name = text(library, "name")?
+        if path != "" {
+            let resolved = local_path(root, path)
+            if !file_exists(resolved.as_str()) {
+                ret Result[NativeBuildMetadata, str]::Err("native build input does not exist: " + resolved.as_str())
+            }
+            if source_path(path) {
+                out.sources.push(resolved)
+            } else {
+                out.files.push(resolved)
+            }
+        } elif name != "" {
+            out.libraries.push(name)
+        } else {
+            ret Result[NativeBuildMetadata, str]::Err("native library requires a name or path")
+        }
+    }
+    for path in array(native, "search_paths")? {
+        out.search_paths.push(local_path(root, value_text(path)?))
+    }
+    for name in array(native, "frameworks")? {
+        out.frameworks.push(value_text(name)?)
+    }
+    for argument in array(native, "link_args")? {
+        out.link_args.push(value_text(argument)?)
+    }
+    ret Result[NativeBuildMetadata, str]::Ok(out)
+}

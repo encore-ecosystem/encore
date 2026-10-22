@@ -1,0 +1,51 @@
+//! Field reads participate in incremental dependency validation.
+
+import core::option::Option
+import core::testing::assert
+import refrain::frontend::{AnalysisDatabase, SemanticBody, SymbolId}
+
+fn main() -> u32 {
+    let mut database = AnalysisDatabase::new()
+    database.set_module("library", "library.enq", "pub struct Data { field: u32 }")
+    database.set_module("app", "app.enq", "import library::Data\nfn sample(data: Data) { let value = data.field\n value\n}")
+    let id = database.symbol_id("app", "sample").unwrap_or(SymbolId::invalid())
+    let first = database.semantic_body(id).unwrap_or(SemanticBody::empty())
+    if !assert(first.binding_type("value").unwrap_or("") == "u32") { ret 1_u32 }
+    database.semantic_body(id)
+    if !assert(database.semantic_body_count(id) == 1_usize) { ret 2_u32 }
+    database.set_module("library", "library.enq", "pub struct Data { field: str }")
+    let changed = database.semantic_body(id).unwrap_or(SemanticBody::empty())
+    if !assert(changed.binding_type("value").unwrap_or("") == "str") { ret 3_u32 }
+    if !assert(database.semantic_body_count(id) == 2_usize) { ret 4_u32 }
+    database.set_module("library", "library.enq", "pub struct Data {}")
+    let removed = database.semantic_body(id).unwrap_or(SemanticBody::empty())
+    if !assert(removed.binding_type("value").unwrap_or("") != "str") { ret 5_u32 }
+    if !assert(database.semantic_body_count(id) == 3_usize) { ret 6_u32 }
+    let mut unknown = false
+    for diagnostic in removed.diagnostics {
+        if diagnostic.code == "unknown-field" { unknown = true }
+    }
+    if !assert(unknown) { ret 8_u32 }
+    // A removed module must not survive in the visible-member environment.
+    database.remove_module("library")
+    let absent = database.semantic_body(id).unwrap_or(SemanticBody::empty())
+    if !assert(absent.binding_type("value").unwrap_or("") != "str") { ret 10_u32 }
+    database.set_module("library", "library.enq", "pub struct Data { field: bool }")
+    let restored = database.semantic_body(id).unwrap_or(SemanticBody::empty())
+    if !assert(restored.binding_type("value").unwrap_or("") == "bool") { ret 11_u32 }
+    database.semantic_body(id)
+    if !assert(database.semantic_body_count(id) == 5_usize) { ret 12_u32 }
+    let mut generic = AnalysisDatabase::new()
+    generic.set_module("generic", "generic.enq", "struct Box[T] { value: T }\nfn sample(data: Box[u32]) { let result = data.value\n result\n}")
+    let generic_id = generic.symbol_id("generic", "sample").unwrap_or(SymbolId::invalid())
+    let specialized = generic.semantic_body(generic_id).unwrap_or(SemanticBody::empty())
+    if !assert(specialized.binding_type("result").unwrap_or("") == "u32") { ret 7_u32 }
+    let mut unloaded = AnalysisDatabase::new()
+    unloaded.set_module("pending", "pending.enq", "fn sample(data: NotLoaded) { let value = data.field }")
+    let pending_id = unloaded.symbol_id("pending", "sample").unwrap_or(SymbolId::invalid())
+    let pending = unloaded.semantic_body(pending_id).unwrap_or(SemanticBody::empty())
+    for diagnostic in pending.diagnostics {
+        if !assert(diagnostic.code != "unknown-field") { ret 9_u32 }
+    }
+    ret 0_u32
+}

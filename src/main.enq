@@ -1,13 +1,15 @@
 //! Provides the `main` module.
 
-import std::io::print
-import std::io::println
 import core::option::Option
+
+import std::io::{print, println}
 import std::string::String
-import argparse::{CommandSpec, OptionSpec, ParseOutcome, parse, process_arg_count, process_arg, process_args}
-import refrain::modes
-import refrain::version::compiler_version
+
+import argparse::{CommandSpec, OptionSpec, ParseOutcome, parse, process_arg, process_arg_count, process_args}
 import rich::Console
+
+import refrain::modes
+import refrain::version::compiler_release_version
 
 fn main() -> u32 {
     let console = Console::new()
@@ -27,29 +29,54 @@ fn main() -> u32 {
         print_global_help()
         ret 0_u32
     }
-    if mode == "__codegen" { ret modes::run_codegen_worker() }
-    if mode == "__self_update_apply" { ret modes::run_self_update_apply() }
+    if mode == "__codegen" {
+        ret modes::run_codegen_worker()
+    }
+    if mode == "__compile-unit" {
+        ret modes::run_package_worker()
+    }
+    if mode == "__run-build-script" {
+        ret modes::run_build_script_worker()
+    }
+    if mode == "__run-tool" {
+        ret modes::run_tool_worker()
+    }
+    if mode == "__self_update_apply" {
+        ret modes::run_self_update_apply()
+    }
     if mode == "help" {
         match argv(2_usize) {
-            Option::Some(command) => { ret print_command_help(command, console) }
-            Option::None => { print_global_help() ret 0_u32 }
+            Option::Some(command) => {
+                ret print_command_help(command, console)
+            }
+            Option::None => {
+                print_global_help() ret 0_u32
+            }
         }
     }
     if mode == "--version" || mode == "-V" {
-        console.println("encore " + compiler_version())
+        console.println("encore " + compiler_release_version())
         ret 0_u32
     }
     match argv(2_usize) {
         Option::Some(arg) => {
-            if arg == "--help" || arg == "-h" { ret print_command_help(mode, console) }
+            if arg == "--help" || arg == "-h" {
+                ret print_command_help(mode, console)
+            }
         }
-        Option::None => {}
+        Option::None => {
+        }
     }
-    if !validate_command_args(mode, console) { ret 2_u32 }
+    if !validate_command_args(mode, console) {
+        ret 2_u32
+    }
 
     match mode {
         "run" => {
             ret modes::run_run()
+        }
+        "cache" => {
+            ret modes::run_cache()
         }
         "build" => {
             ret modes::run_build()
@@ -87,6 +114,15 @@ fn main() -> u32 {
         "publish" => {
             ret modes::run_publish()
         }
+        "login" => {
+            ret modes::run_registry_auth("login")
+        }
+        "whoami" => {
+            ret modes::run_registry_auth("whoami")
+        }
+        "logout" => {
+            ret modes::run_registry_auth("logout")
+        }
         "target" => {
             ret modes::run_target()
         }
@@ -101,7 +137,7 @@ fn main() -> u32 {
     ret 1
 }
 
-fn print_global_help() -> () {
+fn print_global_help() ->() {
     println("Encore native compiler")
     println("")
     println("Usage: encore <command> [options]")
@@ -119,18 +155,35 @@ fn print_global_help() -> () {
     println("  sync       Resolve project dependencies")
     println("  update     Update project dependencies")
     println("  install    Build and install a binary")
-    println("  publish    Publish a package through the reviewed index")
+    println("  publish    Publish a package through the registry API")
+    println("  login      Sign in to a registry using a device code")
+    println("  whoami     Show the current registry account")
+    println("  logout     Revoke the current registry credential")
     println("  target     Inspect compilation targets")
+    println("  cache      Inspect and prune compiler artifacts")
     println("  self       Manage the Encore compiler installation")
     println("  help       Show command help")
     println("")
     println("Options:")
     println("  -h, --help       Show help")
     println("  -V, --version    Show compiler version")
-    ret ()
+    ret()
 }
 
 fn print_command_help(command: str, console: Console) -> u32 {
+    if command == "login" || command == "whoami" || command == "logout" {
+        println("Usage: encore " + command + " [--registry <index-url>]")
+        println("Defaults to ENCORE_INDEX_URL, the project's [registry].index, or ENCORE_DEFAULT_INDEX.")
+        println("Interactive credentials use the OS keyring; no plaintext fallback.")
+        println("CI: bind ENCORE_REGISTRY_TOKEN to ENCORE_REGISTRY_TOKEN_INDEX.")
+        ret 0_u32
+    }
+    if command == "cache" {
+        println("Usage: encore cache <status|prune> [--json] [--project PATH]")
+        println("Prune options: --dry-run, --all, --max-size <bytes|MiB|GiB>")
+        println("Default shared cache limit: 20 GiB; ENCORE_BUILD_CACHE_MAX_SIZE overrides it.")
+        ret 0_u32
+    }
     match command {
         "build" => {
             println("Compile the current project")
@@ -155,6 +208,7 @@ fn print_command_help(command: str, console: Console) -> u32 {
             println("      --jobs <count>     Maximum parallel test jobs")
             println("      --format <kind>    Listing format: full or json")
             println("      --report <path>    Write a machine-readable JSON test report")
+            println("      --keep-build-artifacts    Retain temporary build workspaces")
             println("  -h, --help             Show help")
         }
         "analyze" => {
@@ -178,6 +232,7 @@ fn print_command_help(command: str, console: Console) -> u32 {
             println("Usage: encore check [options] [path]")
             println("")
             println("Options:")
+            println("      --safety          Report inferred callable safety contracts")
             println("      --format <kind>   full or json")
             println("  -h, --help            Show help")
         }
@@ -246,12 +301,13 @@ fn print_command_help(command: str, console: Console) -> u32 {
             println("  -h, --help              Show help")
         }
         "publish" => {
-            println("Publish the current package through GitHub and the reviewed index")
+            println("Publish the current package through the selected registry API")
             println("")
-            println("Usage: encore publish [--dry-run]")
+            println("Usage: encore publish [--dry-run] [--release-name <name>]")
             println("")
             println("Options:")
             println("      --dry-run    Validate and create the exact archive without remote changes")
+            println("      --release-name <name>  Set the release nametag (defaults to the compiler name)")
             println("  -h, --help       Show help")
         }
         "target" => {
@@ -285,7 +341,7 @@ fn print_command_help(command: str, console: Console) -> u32 {
     ret 0_u32
 }
 
-fn print_build_options() -> () {
+fn print_build_options() ->() {
     println("")
     println("Options:")
     println("      --profile <name>          dev (fast O0), debug, release, or extreme (ThinLTO)")
@@ -293,34 +349,72 @@ fn print_build_options() -> () {
     println("      --target <triple>         Select an LLVM target")
     println("      --emit <kind>             ehir, llvm-ir, object, or binary")
     println("      --jobs <count>            Maximum parallel compilation jobs")
+    println("      --keep-build-artifacts    Retain the full temporary build workspace")
     println("  -h, --help                    Show help")
-    ret ()
+    ret()
 }
 
 fn validate_command_args(command: str, console: Console) -> bool {
-    if command == "build" { ret validate_build_args(command, false, console) }
-    if command == "run" { ret validate_build_args(command, true, console) }
-    if command == "test" { ret validate_test_args(console) }
-    if command == "check" { ret validate_check_args(console) }
-    if command == "lint" { ret validate_rule_args("lint", true, console) }
-    if command == "format" { ret validate_format_args(console) }
-    if command == "analyze" { ret validate_rule_args("analyze", false, console) }
-    if command == "init" { ret validate_value_only_args(command, "--name", console) }
-    if command == "add" { ret validate_add_args(console) }
-    if command == "sync" { ret validate_switch_only_args(command, "--update", console) }
-    if command == "update" { ret validate_positional_args(command, 0_usize, 0_usize, console) }
-    if command == "install" { ret validate_install_args(console) }
-    if command == "publish" { ret validate_switch_only_args(command, "--dry-run", console) }
-    if command == "target" { ret validate_target_args(console) }
-    if command == "self" { ret validate_self_args(console) }
+    if command == "login" || command == "whoami" || command == "logout" {
+        ret validate_value_only_args(command, "--registry", console)
+    }
+    if command == "build" {
+        ret validate_build_args(command, false, console)
+    }
+    if command == "run" {
+        ret validate_build_args(command, true, console)
+    }
+    if command == "test" {
+        ret validate_test_args(console)
+    }
+    if command == "check" {
+        ret validate_check_args(console)
+    }
+    if command == "lint" {
+        ret validate_rule_args("lint", true, console)
+    }
+    if command == "format" {
+        ret validate_format_args(console)
+    }
+    if command == "analyze" {
+        ret validate_rule_args("analyze", false, console)
+    }
+    if command == "init" {
+        ret validate_value_only_args(command, "--name", console)
+    }
+    if command == "add" {
+        ret validate_add_args(console)
+    }
+    if command == "sync" {
+        ret validate_switch_only_args(command, "--update", console)
+    }
+    if command == "update" {
+        ret validate_positional_args(command, 0_usize, 0_usize, console)
+    }
+    if command == "install" {
+        ret validate_install_args(console)
+    }
+    if command == "publish" {
+        ret validate_publish_args(console)
+    }
+    if command == "target" {
+        ret validate_target_args(console)
+    }
+    if command == "self" {
+        ret validate_self_args(console)
+    }
     ret true
 }
 
 fn validate_self_args(console: Console) -> bool {
-    if argc() < 3_usize { ret argument_error("self", "missing required command", console) }
+    if argc() < 3_usize {
+        ret argument_error("self", "missing required command", console)
+    }
     let action = argument(2_usize)
     if action == "channel" {
-        if argc() > 4_usize { ret argument_error("self", "unexpected argument '" + argument(4_usize) + "'", console) }
+        if argc() > 4_usize {
+            ret argument_error("self", "unexpected argument '" + argument(4_usize) + "'", console)
+        }
         if argc() == 4_usize {
             let channel = argument(3_usize)
             if channel != "stable" && channel != "beta" && channel != "nightly" {
@@ -330,11 +424,17 @@ fn validate_self_args(console: Console) -> bool {
         ret true
     }
     if action == "install" {
-        if argc() < 4_usize { ret argument_error("self", "missing required version", console) }
-        if starts_with(argument(3_usize), "-") { ret argument_error("self", "missing required version", console) }
+        if argc() < 4_usize {
+            ret argument_error("self", "missing required version", console)
+        }
+        if starts_with(argument(3_usize), "-") {
+            ret argument_error("self", "missing required version", console)
+        }
         let mut index = 4_usize
         while index < argc() {
-            if argument(index) != "--force" { ret unknown_argument("self", argument(index), console) }
+            if argument(index) != "--force" {
+                ret unknown_argument("self", argument(index), console)
+            }
             index += 1_usize
         }
         ret true
@@ -345,7 +445,9 @@ fn validate_self_args(console: Console) -> bool {
             let arg = argument(index)
             if arg == "--check" || arg == "--force" {
             } elif arg == "--channel" || arg == "--version" {
-                if index + 1_usize >= argc() { ret argument_error("self", "option '" + arg + "' requires a value", console) }
+                if index + 1_usize >= argc() {
+                    ret argument_error("self", "option '" + arg + "' requires a value", console)
+                }
                 index += 1_usize
                 if arg == "--channel" {
                     let channel = argument(index)
@@ -353,7 +455,9 @@ fn validate_self_args(console: Console) -> bool {
                         ret argument_error("self", "channel must be stable, beta, or nightly", console)
                     }
                 }
-            } else { ret unknown_argument("self", arg, console) }
+            } else {
+                ret unknown_argument("self", arg, console)
+            }
             index += 1_usize
         }
         ret true
@@ -367,29 +471,49 @@ fn validate_add_args(console: Console) -> bool {
     while index < argc() {
         let arg = argument(index)
         if arg == "--features" {
-            if index + 1_usize >= argc() { ret argument_error("add", "option '--features' requires a value", console) }
+            if index + 1_usize >= argc() {
+                ret argument_error("add", "option '--features' requires a value", console)
+            }
             index = index + 1_usize
-        } elif starts_with(arg, "-") { ret unknown_argument("add", arg, console) }
-        else { positional = positional + 1_usize }
+        } elif starts_with(arg, "-") {
+            ret unknown_argument("add", arg, console)
+        } else {
+            positional = positional + 1_usize
+        }
         index = index + 1_usize
     }
-    if positional == 0_usize { ret argument_error("add", "missing required argument", console) }
-    if positional > 1_usize { ret argument_error("add", "unexpected argument", console) }
+    if positional == 0_usize {
+        ret argument_error("add", "missing required argument", console)
+    }
+    if positional > 1_usize {
+        ret argument_error("add", "unexpected argument", console)
+    }
     ret true
 }
 
 fn validate_target_args(console: Console) -> bool {
-    let count = if argc() > 2_usize { argc() - 2_usize } else { 0_usize }
-    if count <= 1_usize { ret true }
-    if count == 2_usize && (argument(2_usize) == "show" || argument(2_usize) == "install") { ret true }
+    let count = if argc() > 2_usize {
+        argc() - 2_usize
+    } else {
+        0_usize
+    }
+    if count <= 1_usize {
+        ret true
+    }
+    if count == 2_usize &&(argument(2_usize) == "show" || argument(2_usize) == "install") {
+        ret true
+    }
     ret argument_error("target", "unexpected argument '" + argument(3_usize) + "'", console)
 }
 
 fn validate_build_args(command: str, allow_program_args: bool, console: Console) -> bool {
     let spec = build_command_spec(command, allow_program_args)
     match parse(spec, process_args(2_usize)) {
-        ParseOutcome::Ok(_) => {}
-        ParseOutcome::Err(error) => { ret argument_error(command, error, console) }
+        ParseOutcome::Ok(_) => {
+        }
+        ParseOutcome::Err(error) => {
+            ret argument_error(command, error, console)
+        }
     }
     let jobs = requested_argument_value("--jobs")
     if jobs != "" && !is_positive_decimal(jobs) {
@@ -400,14 +524,18 @@ fn validate_build_args(command: str, allow_program_args: bool, console: Console)
 
 fn build_command_spec(command: str, allow_program_args: bool) -> CommandSpec {
     let mut spec = CommandSpec::new(command)
-        .option(OptionSpec::value("--profile", "", "name", "optimization profile"))
-        .option(OptionSpec::value("--manifest-path", "", "path", "project manifest"))
-        .option(OptionSpec::value("--target", "", "triple", "target triple"))
-        .option(OptionSpec::value("--emit", "", "kind", "output kind"))
-        .option(OptionSpec::value("--jobs", "", "count", "parallel jobs"))
-        .option(OptionSpec::value("--_pipeline-start-ms", "", "timestamp", "internal continuation").hidden())
-        .positionals(0_usize, 0_usize)
-    if allow_program_args { spec = spec.rest(true) }
+    .option(OptionSpec::value("--profile", "", "name", "optimization profile"))
+    .option(OptionSpec::value("--manifest-path", "", "path", "project manifest"))
+    .option(OptionSpec::value("--target", "", "triple", "target triple"))
+    .option(OptionSpec::value("--emit", "", "kind", "output kind"))
+    .option(OptionSpec::value("--jobs", "", "count", "parallel jobs"))
+    .option(OptionSpec::flag("--timings", "", "write package pipeline timings"))
+    .option(OptionSpec::flag("--keep-build-artifacts", "", "retain temporary build workspaces"))
+    .option(OptionSpec::value("--_pipeline-start-ms", "", "timestamp", "internal continuation").hidden())
+    .positionals(0_usize, 0_usize)
+    if allow_program_args {
+        spec = spec.rest(true)
+    }
     ret spec
 }
 
@@ -418,12 +546,16 @@ fn requested_argument_value(name: str) -> str {
             Some(arg) => {
                 if arg == name {
                     match argv(index + 1_usize) {
-                        Some(value) => { ret value }
-                        None => {}
+                        Some(value) => {
+                            ret value
+                        }
+                        None => {
+                        }
                     }
                 }
             }
-            None => {}
+            None => {
+            }
         }
         index += 1_usize
     }
@@ -431,13 +563,19 @@ fn requested_argument_value(name: str) -> str {
 }
 
 fn is_positive_decimal(value: str) -> bool {
-    if value.len() == 0_usize { ret false }
+    if value.len() == 0_usize {
+        ret false
+    }
     let mut nonzero = false
     let mut index = 0_usize
     while index < value.len() {
         let byte = value.byte_at(index)
-        if byte < 48_u8 || byte > 57_u8 { ret false }
-        if byte != 48_u8 { nonzero = true }
+        if byte < 48_u8 || byte > 57_u8 {
+            ret false
+        }
+        if byte != 48_u8 {
+            nonzero = true
+        }
         index = index + 1_usize
     }
     ret nonzero
@@ -445,17 +583,21 @@ fn is_positive_decimal(value: str) -> bool {
 
 fn validate_test_args(console: Console) -> bool {
     let spec = CommandSpec::new("test")
-        .option(OptionSpec::value("--filter", "", "text", "test name filter"))
-        .option(OptionSpec::flag("--list", "", "list tests"))
-        .option(OptionSpec::value("--jobs", "", "count", "parallel jobs"))
-        .option(OptionSpec::value("--format", "", "kind", "output format"))
-        .option(OptionSpec::value("--report", "", "path", "report path"))
-        .option(OptionSpec::value("--_worker-standalone", "", "path", "internal worker").hidden())
-        .option(OptionSpec::value("--_worker-unit", "", "path", "internal worker").hidden())
-        .positionals(0_usize, 0_usize)
+    .option(OptionSpec::value("--filter", "", "text", "test name filter"))
+    .option(OptionSpec::flag("--list", "", "list tests"))
+    .option(OptionSpec::value("--jobs", "", "count", "parallel jobs"))
+    .option(OptionSpec::value("--format", "", "kind", "output format"))
+    .option(OptionSpec::value("--report", "", "path", "report path"))
+    .option(OptionSpec::value("--_worker-standalone", "", "path", "internal worker").hidden())
+    .option(OptionSpec::flag("--_worker-harness", "", "internal harness compiler").hidden())
+    .option(OptionSpec::flag("--keep-build-artifacts", "", "retain temporary build workspaces"))
+    .positionals(0_usize, 0_usize)
     match parse(spec, process_args(2_usize)) {
-        ParseOutcome::Ok(_) => {}
-        ParseOutcome::Err(error) => { ret argument_error("test", error, console) }
+        ParseOutcome::Ok(_) => {
+        }
+        ParseOutcome::Err(error) => {
+            ret argument_error("test", error, console)
+        }
     }
     let jobs = requested_argument_value("--jobs")
     if jobs != "" && !is_positive_decimal(jobs) {
@@ -475,8 +617,13 @@ fn has_argument(name: str) -> bool {
     let mut index = 2_usize
     while index < argc() {
         match argv(index) {
-            Some(value) => { if value == name { ret true } }
-            None => {}
+            Some(value) => {
+                if value == name {
+                    ret true
+                }
+            }
+            None => {
+            }
         }
         index += 1_usize
     }
@@ -489,13 +636,18 @@ fn validate_rule_args(command: str, allow_fix: bool, console: Console) -> bool {
     while index < argc() {
         let arg = argument(index)
         if arg == "--allow" || arg == "--warn" || arg == "--deny" || arg == "--forbid" || arg == "--format" {
-            if index + 1_usize >= argc() { ret argument_error(command, "option '" + arg + "' requires a value", console) }
+            if index + 1_usize >= argc() {
+                ret argument_error(command, "option '" + arg + "' requires a value", console)
+            }
             index += 1_usize
         } elif allow_fix && arg == "--fix" {
-        } elif starts_with(arg, "-") { ret unknown_argument(command, arg, console) }
-        else {
+        } elif starts_with(arg, "-") {
+            ret unknown_argument(command, arg, console)
+        } else {
             positional += 1_usize
-            if positional > 1_usize { ret argument_error(command, "unexpected argument '" + arg + "'", console) }
+            if positional > 1_usize {
+                ret argument_error(command, "unexpected argument '" + arg + "'", console)
+            }
         }
         index += 1_usize
     }
@@ -507,15 +659,26 @@ fn validate_check_args(console: Console) -> bool {
     let mut index = 2_usize
     while index < argc() {
         let arg = argument(index)
-        if arg == "--format" {
-            if index + 1_usize >= argc() { ret argument_error("check", "option '--format' requires a value", console) }
-            let value = argument(index + 1_usize)
-            if value != "full" && value != "json" { ret argument_error("check", "--format must be full or json", console) }
+        if arg == "--safety" {
             index += 1_usize
-        } elif starts_with(arg, "-") { ret unknown_argument("check", arg, console) }
-        else {
+            continue
+        }
+        if arg == "--format" {
+            if index + 1_usize >= argc() {
+                ret argument_error("check", "option '--format' requires a value", console)
+            }
+            let value = argument(index + 1_usize)
+            if value != "full" && value != "json" {
+                ret argument_error("check", "--format must be full or json", console)
+            }
+            index += 1_usize
+        } elif starts_with(arg, "-") {
+            ret unknown_argument("check", arg, console)
+        } else {
             positional += 1_usize
-            if positional > 1_usize { ret argument_error("check", "unexpected argument '" + arg + "'", console) }
+            if positional > 1_usize {
+                ret argument_error("check", "unexpected argument '" + arg + "'", console)
+            }
         }
         index += 1_usize
     }
@@ -528,10 +691,13 @@ fn validate_format_args(console: Console) -> bool {
     while index < argc() {
         let arg = argument(index)
         if arg == "--check" {
-        } elif starts_with(arg, "-") { ret unknown_argument("format", arg, console) }
-        else {
+        } elif starts_with(arg, "-") {
+            ret unknown_argument("format", arg, console)
+        } else {
             positional += 1_usize
-            if positional > 1_usize { ret argument_error("format", "unexpected argument '" + arg + "'", console) }
+            if positional > 1_usize {
+                ret argument_error("format", "unexpected argument '" + arg + "'", console)
+            }
         }
         index += 1_usize
     }
@@ -542,8 +708,12 @@ fn validate_value_only_args(command: str, option: str, console: Console) -> bool
     let mut index = 2_usize
     while index < argc() {
         let arg = argument(index)
-        if arg != option { ret unknown_argument(command, arg, console) }
-        if index + 1_usize >= argc() { ret argument_error(command, "option '" + arg + "' requires a value", console) }
+        if arg != option {
+            ret unknown_argument(command, arg, console)
+        }
+        if index + 1_usize >= argc() {
+            ret argument_error(command, "option '" + arg + "' requires a value", console)
+        }
         index = index + 2_usize
     }
     ret true
@@ -553,17 +723,47 @@ fn validate_switch_only_args(command: str, option: str, console: Console) -> boo
     let mut index = 2_usize
     while index < argc() {
         let arg = argument(index)
-        if arg != option { ret unknown_argument(command, arg, console) }
+        if arg != option {
+            ret unknown_argument(command, arg, console)
+        }
         index = index + 1_usize
     }
     ret true
 }
 
+fn validate_publish_args(console: Console) -> bool {
+    let mut index = 2_usize
+    while index < argc() {
+        let arg = argument(index)
+        if arg == "--dry-run" {
+            index += 1_usize
+        } elif arg == "--release-name" {
+            if index + 1_usize >= argc() {
+                ret argument_error("publish", "option '--release-name' requires a value", console)
+            }
+            index += 2_usize
+        } else {
+            ret unknown_argument("publish", arg, console)
+        }
+    }
+    ret true
+}
+
 fn validate_positional_args(command: str, minimum: usize, maximum: usize, console: Console) -> bool {
-    let count = if argc() > 2_usize { argc() - 2_usize } else { 0_usize }
-    if count < minimum { ret argument_error(command, "missing required argument", console) }
-    if count > maximum { ret argument_error(command, "unexpected argument '" + argument(2_usize + maximum) + "'", console) }
-    if count > 0_usize && starts_with(argument(2_usize), "-") { ret unknown_argument(command, argument(2_usize), console) }
+    let count = if argc() > 2_usize {
+        argc() - 2_usize
+    } else {
+        0_usize
+    }
+    if count < minimum {
+        ret argument_error(command, "missing required argument", console)
+    }
+    if count > maximum {
+        ret argument_error(command, "unexpected argument '" + argument(2_usize + maximum) + "'", console)
+    }
+    if count > 0_usize && starts_with(argument(2_usize), "-") {
+        ret unknown_argument(command, argument(2_usize), console)
+    }
     ret true
 }
 
@@ -573,15 +773,18 @@ fn validate_install_args(console: Console) -> bool {
     while index < argc() {
         let arg = argument(index)
         if arg == "--force" || arg == "--update" {
-        }
-        elif arg == "--path" || arg == "--root" || arg == "--bin-dir" || arg == "--name" || arg == "--profile" || arg == "--_pipeline-start-ms" {
-            if index + 1_usize >= argc() { ret argument_error("install", "option '" + arg + "' requires a value", console) }
+        } elif arg == "--path" || arg == "--root" || arg == "--bin-dir" || arg == "--name" || arg == "--profile" || arg == "--_pipeline-start-ms" {
+            if index + 1_usize >= argc() {
+                ret argument_error("install", "option '" + arg + "' requires a value", console)
+            }
             index = index + 1_usize
-        }
-        elif starts_with(arg, "-") { ret unknown_argument("install", arg, console) }
-        else {
+        } elif starts_with(arg, "-") {
+            ret unknown_argument("install", arg, console)
+        } else {
             positional = positional + 1_usize
-            if positional > 1_usize { ret argument_error("install", "unexpected argument '" + arg + "'", console) }
+            if positional > 1_usize {
+                ret argument_error("install", "unexpected argument '" + arg + "'", console)
+            }
         }
         index = index + 1_usize
     }
@@ -589,7 +792,11 @@ fn validate_install_args(console: Console) -> bool {
 }
 
 fn unknown_argument(command: str, arg: str, console: Console) -> bool {
-    let kind = if starts_with(arg, "-") { "option" } else { "argument" }
+    let kind = if starts_with(arg, "-") {
+        "option"
+    } else {
+        "argument"
+    }
     ret argument_error(command, "unknown " + kind + " '" + arg + "'", console)
 }
 
@@ -601,8 +808,12 @@ fn argument_error(command: str, message: str, console: Console) -> bool {
 
 fn argument(index: usize) -> str {
     match argv(index) {
-        Option::Some(value) => { ret value }
-        Option::None => { ret "" }
+        Option::Some(value) => {
+            ret value
+        }
+        Option::None => {
+            ret ""
+        }
     }
 }
 

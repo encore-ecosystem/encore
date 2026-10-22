@@ -5,11 +5,14 @@ on:
     tags:
       - "v[0-9]*.[0-9]*.[0-9]*"
       - "v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*"
+      - "v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*.[0-9]*"
       - "v[0-9]*.[0-9]*.[0-9]*-nightly.[0-9]*"
+      - "v[0-9]*.[0-9]*.[0-9]*-[a-z]*"
 
 permissions:
   actions: read
   contents: write
+  pull-requests: read
 
 jobs:
   promote:
@@ -21,41 +24,37 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify tag and exact green trunk candidate
+      - name: Verify tag and exact green source-tree candidate
         id: candidate
         shell: bash
         run: |
           set -euo pipefail
-          version=${GITHUB_REF_NAME#v}
-          test "$(tr -d '\r\n' < VERSION)" = "$version"
+          release=$(tr -d '\r\n' < VERSION)
+          version=${release%%-*}
+          release_name=${release#*-}
+          test "${GITHUB_REF_NAME#v}" = "$release"
           test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' encore.toml | head -n 1)" = "$version"
-          test "$(sed -n 's/.*ret "\([^"]*\)".*/\1/p' src/version.enq)" = "$version"
-          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}$ ]]; then
+          test "$release" = "$version-$release_name"
+          grep -Fq "ret \"$version\"" src/version.enq
+          grep -Fq "ret \"$release_name\"" src/version.enq
+          grep -Fq "ret \"$release\"" src/version.enq
+          if [[ "$release" =~ ^[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}$ ]]; then
             channel=nightly
-          elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
+          elif [[ "$release" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+(\.[0-9]+)?$ ]]; then
             channel=beta
-          elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          elif [[ "$release_name" =~ ^[a-z][a-z0-9-]*$ ]] && test "$release" = "$version-$release_name"; then
             channel=stable
           else
-            echo "::error::Unsupported release version $version"
+            echo "::error::Unsupported release version $release"
             exit 1
           fi
           git fetch origin trunk
           git merge-base --is-ancestor "$GITHUB_SHA" origin/trunk
-          run_id=$(gh run list \
-            --workflow ci.yml \
-            --branch trunk \
-            --commit "$GITHUB_SHA" \
-            --status success \
-            --limit 20 \
-            --json databaseId,headSha,conclusion,event \
-            --jq 'map(select(.headSha == env.GITHUB_SHA and .conclusion == "success" and (.event == "push" or .event == "workflow_dispatch"))) | first | .databaseId')
-          test -n "$run_id" && test "$run_id" != null || {
-            echo "::error::No successful trunk CI run exists for exact commit $GITHUB_SHA"
-            exit 1
-          }
-          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          bash scripts/select-ci-candidate.sh --required
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "display_name=${release_name^}" >> "$GITHUB_OUTPUT"
 
       - name: Download exact tested artifacts
         shell: bash
@@ -65,7 +64,6 @@ jobs:
           for triple in \
             x86_64-unknown-linux-gnu \
             aarch64-unknown-linux-gnu \
-            x86_64-apple-darwin \
             aarch64-apple-darwin \
             x86_64-pc-windows-msvc \
             x86_64-w64-windows-gnu \
@@ -93,21 +91,34 @@ jobs:
           CHANNEL: ${{ steps.candidate.outputs.channel }}
         run: |
           set -euo pipefail
-          version=${GITHUB_REF_NAME#v}
+          release=$(tr -d '\r\n' < VERSION)
+          version=${release%%-*}
+          release_name=${release#*-}
           assets=
+          # All targets must originate from the same resolved build inputs.
+          jq -se '
+            length == 6 and
+            ([.[] | [.seed, .commit]] | unique | length) == 1
+          ' dist/provenance-*.json >/dev/null
           : > dist/SHA256SUMS
           for triple in \
             x86_64-unknown-linux-gnu \
             aarch64-unknown-linux-gnu \
-            x86_64-apple-darwin \
             aarch64-apple-darwin \
             x86_64-pc-windows-msvc \
             x86_64-w64-windows-gnu \
             aarch64-w64-windows-gnu
           do
-            grep -Fq "\"commit\":\"$GITHUB_SHA\"" "dist/provenance-$triple.json"
-            grep -Fq "\"version\":\"$version\"" "dist/provenance-$triple.json"
-            grep -Fq "\"target\":\"$triple\"" "dist/provenance-$triple.json"
+            jq -e --arg commit "${{ steps.candidate.outputs.source_commit }}" --arg version "$version" \
+              --arg nametag "$release_name" --arg release "$release" --arg target "$triple" '
+              .schema == 3 and .commit == $commit and .version == $version and
+              .nametag == $nametag and .release == $release and .target == $target and
+              .converged == true and
+              (.seed | type == "string" and length > 0) and
+              ([.compiler_sha256, .lsp_sha256, .stage2_sha256, .stage3_sha256] |
+                all(.[]; type == "string" and test("^[0-9a-f]{64}$"))) and
+              .stage2_sha256 == .stage3_sha256 and .stage3_sha256 == .compiler_sha256
+              ' "dist/provenance-$triple.json" >/dev/null
             extension=tar.gz
             format=tar.gz
             case "$triple" in *-windows-*) extension=zip; format=zip ;; esac
@@ -115,6 +126,8 @@ jobs:
             expected=$(awk 'NF {print tolower($1); exit}' "dist/$asset.sha256")
             actual=$(sha256sum "dist/$asset" | awk '{print $1}')
             test "$actual" = "$expected"
+            bash scripts/verify-release-archive.sh "$triple" "$release" \
+              "dist/$asset" "dist/provenance-$triple.json"
             printf '%s  %s\n' "$actual" "$asset" >> dist/SHA256SUMS
             entry="{\"triple\":\"$triple\",\"url\":\"https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$asset\",\"sha256\":\"$actual\",\"format\":\"$format\"}"
             if test -n "$assets"; then assets="$assets,$entry"; else assets=$entry; fi
@@ -130,20 +143,50 @@ jobs:
             printf '%s  %s\n' "$expected" "$archive" >> dist/SHA256SUMS
           done
           LC_ALL=C sort -o dist/SHA256SUMS dist/SHA256SUMS
-          printf '{"schema":1,"channel":"%s","version":"%s","tag":"%s","commit":"%s","candidate_run":%s,"assets":[%s]}\n' \
-            "$CHANNEL" "$version" "$GITHUB_REF_NAME" "$GITHUB_SHA" \
-            "${{ steps.candidate.outputs.run_id }}" "$assets" > dist/channel.json
+          # Keep original build provenance unchanged; record adoption separately.
+          jq -n --arg release_commit "$GITHUB_SHA" \
+            --arg source_commit "${{ steps.candidate.outputs.source_commit }}" \
+            --arg tree "$(git rev-parse HEAD^{tree})" \
+            --arg run_id "${{ steps.candidate.outputs.run_id }}" \
+            '{schema:1, release_commit:$release_commit, source_commit:$source_commit,
+              source_tree:$tree, verified_run_id:$run_id}' > dist/adoption.json
+          jq -n --arg channel "$CHANNEL" --arg version "$version" \
+            --arg nametag "$release_name" --arg release "$release" \
+            --arg tag "$GITHUB_REF_NAME" --arg commit "$GITHUB_SHA" \
+            --argjson assets "[$assets]" '
+            {schema:2, channel:$channel, version:$version, nametag:$nametag,
+              release:$release, tag:$tag, commit:$commit,
+              verification:{converged:true, targets:($assets | length)}, assets:$assets}
+          ' > dist/channel.json
 
       - uses: softprops/action-gh-release@v3
         with:
+          # Immutable releases must receive every asset while they are still a
+          # draft. Publishing a prerelease first makes all subsequent uploads
+          # fail, leaving behind an empty release.
+          draft: true
           files: |
             dist/encore-*
             dist/target-kit-*
             dist/SHA256SUMS
             dist/channel.json
             dist/provenance-*
+            dist/adoption.json
           generate_release_notes: true
+          name: Encore ${{ steps.candidate.outputs.version }} — ${{ steps.candidate.outputs.display_name }}
           prerelease: ${{ steps.candidate.outputs.channel != 'stable' }}
+
+      - name: Publish immutable release
+        shell: bash
+        env:
+          CHANNEL: ${{ steps.candidate.outputs.channel }}
+        run: |
+          set -euo pipefail
+          if test "$CHANNEL" = stable; then
+            gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          else
+            gh release edit "$GITHUB_REF_NAME" --draft=false --latest=false
+          fi
 
       - name: Publish atomic channel pointer
         shell: bash
@@ -151,15 +194,22 @@ jobs:
           CHANNEL: ${{ steps.candidate.outputs.channel }}
         run: |
           set -euo pipefail
-          pointer="channel-$CHANNEL"
-          if gh release view "$pointer" >/dev/null 2>&1; then
-            gh release upload "$pointer" dist/channel.json --clobber
-            gh release edit "$pointer" --target "$GITHUB_SHA" \
-              --notes "Current $CHANNEL compiler: Encore ${GITHUB_REF_NAME#v}"
-          else
-            gh release create "$pointer" dist/channel.json \
-              --target "$GITHUB_SHA" \
-              --title "Encore $CHANNEL channel" \
-              --notes "Current $CHANNEL compiler: Encore ${GITHUB_REF_NAME#v}" \
-              --prerelease
+          pointer_branch="release-channel-$CHANNEL"
+          pointer_index=$(mktemp)
+          trap 'rm -f "$pointer_index"' EXIT
+          export GIT_INDEX_FILE=$pointer_index
+          parent_args=()
+          git read-tree --empty
+          if git fetch origin "refs/heads/$pointer_branch"; then
+            git read-tree FETCH_HEAD
+            parent_args=(-p FETCH_HEAD)
           fi
+          blob=$(git hash-object -w dist/channel.json)
+          git update-index --add --cacheinfo 100644 "$blob" channel.json
+          tree=$(git write-tree)
+          export GIT_AUTHOR_NAME=github-actions GIT_COMMITTER_NAME=github-actions
+          export GIT_AUTHOR_EMAIL=41898282+github-actions[bot]@users.noreply.github.com
+          export GIT_COMMITTER_EMAIL=$GIT_AUTHOR_EMAIL
+          commit=$(printf 'Update %s release channel to %s\n' "$CHANNEL" "$GITHUB_REF_NAME" | \
+            git commit-tree "$tree" "${parent_args[@]}")
+          git push origin "$commit:refs/heads/$pointer_branch"

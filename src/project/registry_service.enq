@@ -1,0 +1,70 @@
+//! Discovers and reads the origin-pinned registry API, independent of hosting.
+import core::result::Result
+import std::http::{HttpClient, HttpClientConfig, HttpRequest, Url}
+import std::os::read_file
+
+import json::{Json, parse, stringify}
+
+fn starts_with(value: str, prefix: str) -> bool {
+    ret value.len() >= prefix.len() && value.slice(0, prefix.len()) == prefix
+}
+
+/// Reads public registry documents without credentials or redirect fallback.
+pub fn registry_service_read(url: str) -> Result[str, str] {
+    if starts_with(url, "file://") {
+        let source = read_file(url.slice(7, url.len() - 7))
+        if source == "" {
+            ret Result::Err("Unable to read registry fixture " + url)
+        }
+        ret Result::Ok(source)
+    }
+    let parsed = Url::parse(url)?
+    let response = HttpClient::with_config(HttpClientConfig::default().with_max_redirects(0)
+        .with_max_body_size(1048576).with_timeout_ms(10000))
+    .send(HttpRequest::get(parsed).with_header("Accept", "application/json"))?
+    if response.status() == 404 {
+        ret Result::Err("Registry resource not found: " + url)
+    }
+    if response.status() != 200 {
+        ret Result::Err("Registry API request failed: " + url)
+    }
+    ret Result::Ok(response.body())
+}
+
+/// Validates the shared discovery contract for resolution, publication and login.
+pub fn registry_service_config(index: str) -> Result[Json, str] {
+    if index == "" {
+        ret Result::Err("No registry configured; set ENCORE_DEFAULT_INDEX or [registry].index")
+    }
+    let source = registry_service_read(index + "/config.json")?
+    let config = parse(source).unwrap_or(Json::Null)
+    if stringify(config.get("schema").unwrap_or(Json::Null)) != "1"
+    || config.get("api").unwrap_or(Json::Null).as_str().unwrap_or("") != "/api/v1" {
+        ret Result::Err("Unsupported registry API discovery at " + index)
+    }
+    ret Result::Ok(config)
+}
+
+/// Resolves a supported API on the same origin as the selected registry.
+pub fn registry_service_api(index: str) -> Result[str, str] {
+    let _config = registry_service_config(index)?
+    if starts_with(index, "file://") {
+        ret Result::Ok(index + "/api/v1")
+    }
+    let parsed = Url::parse(index)?
+    let mut end: usize = if parsed.scheme() == "https" {
+        8
+    } else {
+        7
+    }
+    while end < index.len() && index.slice(end, 1) != "/" {
+        end += 1
+    }
+    ret Result::Ok(index.slice(0, end) + "/api/v1")
+}
+
+/// Fetches package versions from the advertised registry, never another index.
+pub fn registry_service_metadata(index: str, name: str) -> Result[str, str] {
+    let api = registry_service_api(index)?
+    ret registry_service_read(api + "/packages/" + name)
+}

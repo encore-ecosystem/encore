@@ -1,0 +1,57 @@
+name: Restore verified stage3
+description: Restore the verified compiler for this self-contained source checkout
+inputs:
+  triple:
+    required: true
+    description: Target triple
+  executable:
+    required: true
+    description: Compiler filename
+  seed_tag:
+    required: true
+    description: Selected published seed
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v8
+      with:
+        name: test-context-${{ inputs.triple }}
+        path: target/test-context
+    - shell: bash
+      env:
+        CI_TARGET: ${{ inputs.triple }}
+        CI_EXECUTABLE: ${{ inputs.executable }}
+        CI_SEED_TAG: ${{ inputs.seed_tag }}
+      run: |
+        set -euo pipefail
+        context=target/test-context
+        release=$(tr -d '\r\n' < VERSION)
+        jq -e --arg commit "$GITHUB_SHA" --arg release "$release" \
+          --arg target "$CI_TARGET" --arg seed "$CI_SEED_TAG" '
+          .schema == 3 and .commit == $commit and .release == $release and
+          .target == $target and .seed == $seed and
+          .converged == true and .stage2_sha256 == .stage3_sha256 and
+          .compiler_sha256 == .stage3_sha256 and
+          ([.compiler_sha256, .stage2_sha256, .stage3_sha256] |
+            all(.[]; type == "string" and test("^[0-9a-f]{64}$")))
+          ' "$context/provenance.json" >/dev/null
+        compiler="$context/bin/$CI_EXECUTABLE"
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual=$(sha256sum "$compiler" | awk '{print $1}')
+        else
+          actual=$(shasum -a 256 "$compiler" | awk '{print $1}')
+        fi
+        test "$actual" = "$(jq -r '.compiler_sha256' "$context/provenance.json")"
+        # Compiler, libraries and LSP belong to the same checked-out commit.
+        test -f packages/core/encore.toml
+        test -f packages/platform/encore.toml
+        test -f lsp/encore.toml
+        mkdir -p target/stage3
+        cp "$compiler" "target/stage3/$CI_EXECUTABLE"
+        chmod +x "target/stage3/$CI_EXECUTABLE"
+        cp "$context/provenance.json" target/convergence.json
+        mkdir -p target/registry
+        core="$PWD/packages/core"
+        if command -v cygpath >/dev/null 2>&1; then core=$(cygpath -m "$core"); fi
+        printf 'ENCORE_CORE_DIR=%s\n' "$core" >> "$GITHUB_ENV"
+        printf 'ENCORE_INDEX_URL=http://127.0.0.1:9/index\n' >> "$GITHUB_ENV"

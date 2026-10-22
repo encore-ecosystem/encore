@@ -6,27 +6,38 @@
 
 import core::fmt::Debug
 import core::option::Option
+
 import std::dict::Hashable
 import std::vec::Vec
 
+extern fn encore_strmap_new() -> usize
+extern fn encore_strmap_put(map: usize, key: str, value: usize) ->()
+extern fn encore_strmap_get(map: usize, key: str) -> usize
+extern fn encore_strmap_free(map: usize) ->()
+
 /// Stable identity of a declaration across database revisions.
 pub struct DefinitionId {
-    raw: u64 key: str
+    raw: u64
+    key: str
 }
 
 /// Stable identity of a function or method body.
 pub struct BodyId {
-    raw: u64 key: str
+    raw: u64
+    key: str
 }
 
 /// Stable identity of an expression inside a body.
 pub struct ExpressionId {
-    raw: u64 key: str
+    raw: u64
+    key: str
 }
 
 /// Interned semantic type identity. Display text is presentation-only.
 pub struct TypeId {
-    raw: u64 key: str display: str
+    raw: u64
+    key: str
+    display: str
 }
 
 /// Namespace occupied by a definition.
@@ -65,6 +76,7 @@ pub struct HirDefinition {
     column: usize
     length: usize
     typ: TypeId
+    rename_binding: str
 }
 
 /// One imported or locally declared name in a module namespace.
@@ -96,18 +108,39 @@ impl for HirDefinition {
         typ: TypeId,
     ) -> Self {
         ret Self {
-            id, module_name, name, kind, namespace, is_public, source_name, line, column, length, typ
+            id, module_name, name, kind, namespace, is_public, source_name, line, column, length, typ, ""
         }
     }
 
     pub fn id(self: Self) -> DefinitionId {
         ret self.id
     }
+    /// Physical declaration identity shared by logical and URI module views.
+    /// Owner, kind, name and ordinal remain stable when preceding lines change.
+    pub fn source_identity(self: Self) -> DefinitionId {
+        if self.source_name == "" {
+            ret self.id
+        }
+        let key = self.source_name + self.id.key.slice(self.module_name.len(), self.id.key.len() - self.module_name.len())
+        ret DefinitionId {
+            nonzero_hash(key), key
+        }
+    }
     pub fn module_name(self: Self) -> str {
         ret self.module_name
     }
     pub fn name(self: Self) -> str {
         ret self.name
+    }
+    /// Returns the owner recorded in this declaration's semantic identity.
+    pub fn owner(self: Self) -> str {
+        let start = self.module_name.byte_len() + 1
+        let key = self.id.key
+        let mut end = start
+        while end < key.byte_len() && key.byte_at(end) != 35 {
+            end += 1
+        }
+        ret key.slice_bytes(start, end - start)
     }
     pub fn kind(self: Self) -> DefinitionKind {
         ret self.kind
@@ -132,6 +165,18 @@ impl for HirDefinition {
     }
     pub fn typ(self: Self) -> TypeId {
         ret self.typ
+    }
+    /// An explicit import alias has an independent rename identity, but keeps
+    /// the original declaration ID and span for navigation and type analysis.
+    pub fn rename_binding(self: Self) -> str {
+        ret self.rename_binding
+    }
+    pub fn with_rename_binding(self: Self, binding: str) -> Self {
+        ret Self {
+            self.id, self.module_name, self.name, self.kind, self.namespace,
+            self.is_public, self.source_name, self.line, self.column, self.length,
+            self.typ, binding
+        }
     }
 }
 
@@ -178,6 +223,17 @@ impl for ExpressionId {
 }
 
 impl for TypeId {
+    /// Gives a nominal type its physical declaration identity, independently
+    /// of imports, aliases, and logical module views of the same source.
+    pub fn declared(id: DefinitionId, module_name: str, source_name: str, display: str) -> Self {
+        let identity = if source_name == "" {
+            id.key()
+        } else {
+            source_name + id.key().slice(module_name.len(), id.key().len() - module_name.len())
+        }
+        ret Self::named("declaration:" + identity, display)
+    }
+
     pub fn unknown() -> Self {
         ret Self {
             0_u64, "", ""
@@ -221,22 +277,59 @@ impl for ModuleDefMap {
     }
 
     pub fn insert(self: mut Self, definition: HirDefinition) ->() {
-        self.scope.push(ScopeEntry {
-                definition.name, definition.namespace, definition.id
-            }
-            ,
-        )
+        // Receiver members have an owner scope, not the module namespace.
+        let module_scoped = match definition.kind {
+            DefinitionKind::Method => false
+            DefinitionKind::Field => false
+            DefinitionKind::Variant => false
+            DefinitionKind::Parameter => false
+            DefinitionKind::GenericParameter => false
+            _ => true
+        }
+        if module_scoped {
+            self.scope.push(ScopeEntry {
+                    definition.name, definition.namespace, definition.id
+                }
+                ,)
+        }
         self.definitions.push(definition)
         ret()
     }
 
     pub fn resolve(self: Self, name: str, namespace: DefinitionNamespace) -> Option[DefinitionId] {
-        for entry in self.scope {
-            if entry.name == name && same_namespace(entry.namespace, namespace) {
-                ret Option[DefinitionId]::Some(entry.definition)
+        match self.named_definition(name, namespace) {
+            Some(definition) => {
+                ret Option[DefinitionId]::Some(definition.id)
+            }
+            None => {
+                ret Option[DefinitionId]::None
             }
         }
-        ret Option[DefinitionId]::None
+    }
+
+    /// Resolve the scope entry itself: several aliases can share a declaration ID.
+    pub fn named_definition(self: Self, name: str, namespace: DefinitionNamespace) -> Option[HirDefinition] {
+        let mut imported = Option[HirDefinition]::None
+        for entry in self.scope {
+            if entry.name == name && same_namespace(entry.namespace, namespace) {
+                for definition in self.definitions {
+                    if definition.name == name && same_namespace(definition.namespace, namespace)
+                    && definition.id.key == entry.definition.key {
+                        match definition.kind {
+                            DefinitionKind::Import => {
+                                if imported.is_none() {
+                                    imported = Option[HirDefinition]::Some(definition)
+                                }
+                            }
+                            _ => {
+                                ret Option[HirDefinition]::Some(definition)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ret imported
     }
 
     pub fn definition(self: Self, id: DefinitionId) -> Option[HirDefinition] {
@@ -250,6 +343,54 @@ impl for ModuleDefMap {
 
     pub fn all_definitions(self: Self) -> Vec[HirDefinition] {
         ret self.definitions
+    }
+
+    /// Resolves a complete module namespace in one pass. Local declarations
+    /// override imports exactly as in `named_definition`; members stay scoped.
+    pub fn namespace_definitions(self: Self, namespace: DefinitionNamespace) -> Vec[HirDefinition] {
+        let mut selected = Vec[HirDefinition]::new()
+        let slots = encore_strmap_new()
+        for definition in self.definitions {
+            if !same_namespace(definition.namespace, namespace) {
+                continue
+            }
+            match definition.kind {
+                DefinitionKind::Method => {
+                    continue
+                }
+                DefinitionKind::Field => {
+                    continue
+                }
+                DefinitionKind::Variant => {
+                    continue
+                }
+                DefinitionKind::Parameter => {
+                    continue
+                }
+                DefinitionKind::GenericParameter => {
+                    continue
+                }
+                _ => {
+                }
+            }
+            let slot = encore_strmap_get(slots, definition.name)
+            if slot == 0 {
+                selected.push(definition)
+                encore_strmap_put(slots, definition.name, selected.len())
+            } else {
+                match selected.get(slot - 1) {
+                    Some(previous) => {
+                        if previous.kind == DefinitionKind::Import && definition.kind != DefinitionKind::Import {
+                            selected.set(slot - 1, definition)
+                        }
+                    }
+                    None => {
+                    }
+                }
+            }
+        }
+        encore_strmap_free(slots)
+        ret selected
     }
 }
 
@@ -277,6 +418,36 @@ fn same_namespace(left: DefinitionNamespace, right: DefinitionNamespace) -> bool
             ret right == DefinitionNamespace::Module
         }
     }
+}
+
+#attr(test)
+fn semantic_hir_namespace_batch_contract() -> bool {
+    let mut map = ModuleDefMap::new("scope")
+    map.insert(HirDefinition::new(definition_id("imported", "", "struct", "Item", 0),
+            "imported", "Item", DefinitionKind::Import, DefinitionNamespace::Type, true,
+            "/imported.enq", 0, 0, 4, TypeId::named("imported", "Item"),))
+    map.insert(HirDefinition::new(definition_id("scope", "", "struct", "Item", 0),
+            "scope", "Item", DefinitionKind::Struct, DefinitionNamespace::Type, true,
+            "/scope.enq", 1, 0, 4, TypeId::named("local", "Item"),))
+    map.insert(HirDefinition::new(definition_id("scope", "Item", "field", "hidden", 0),
+            "scope", "hidden", DefinitionKind::Field, DefinitionNamespace::Value, true,
+            "/scope.enq", 1, 6, 6, TypeId::named("u32", "u32"),))
+    let values = map.namespace_definitions(DefinitionNamespace::Type)
+    if values.len() != 1 || map.namespace_definitions(DefinitionNamespace::Value).len() != 0 {
+        ret false
+    }
+    let actual = match values.get(0) {
+        Some(value) => value None => {
+            ret false
+        }
+    }
+    let expected = match map.named_definition("Item", DefinitionNamespace::Type) {
+        Some(value) => value None => {
+            ret false
+        }
+    }
+    ret actual.typ().key() == "local"
+    && actual.id().key() == expected.id().key()
 }
 
 fn nonzero_hash(value: str) -> u64 {

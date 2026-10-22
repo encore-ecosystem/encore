@@ -1,10 +1,19 @@
 # Getting Started
 
+First complete [Installation and Editor Setup](installation.md). This chapter
+is a command reference for your first project; next build the
+[text-report tutorial](text-report.md).
+
 Create a package in an empty directory:
 
 ```sh
+mkdir hello
+cd hello
 encore init --name hello
 ```
+
+`init` initializes the current directory; `--name` sets the package name,
+not the name of a subdirectory to create.
 
 `encore init` creates:
 
@@ -13,7 +22,14 @@ encore.toml
 src/main.enq
 README.md
 .gitignore
+.agents/AGENTS.md
 ```
+
+The generated `.gitignore` excludes `target/` and the local LSP cache
+`.encore_cache/`. An existing `.gitignore` is preserved.
+The generated `.agents/AGENTS.md` contains basic Encore project guidance;
+an existing instructions file is preserved. New Git repositories start on
+`main`. Existing repositories retain their current branch.
 
 A minimal executable is:
 
@@ -38,9 +54,8 @@ manifest:
 ```toml
 [project]
 name = "hello"
-target = "auto"
 version = "0.0.0"
-description = ""
+description = "TODO"
 readme = "README.md"
 licence = "MIT"
 dependencies = [
@@ -85,7 +100,7 @@ encore self channel
 encore self channel beta
 encore self update --check
 encore self update
-encore self install 0.2.1
+encore self install 0.0.0-neumann
 ```
 
 `stable` is the default compiler channel. `beta` receives numbered preview
@@ -109,7 +124,8 @@ encore build --profile release
 encore build --target aarch64-unknown-linux-gnu
 ```
 
-`debug` builds use `-O0` with debug information and frame pointers. `release`
+The default `dev` profile uses `-O0` without debug information. `debug` adds
+debug information and frame pointers. `release`
 uses portable `-O2`. `extreme` enables `-O3`, ThinLTO through LLVM `lld`, and
 32-byte hot-loop alignment; for a host build it also targets the native CPU
 unless `target-cpu` is configured.
@@ -120,8 +136,9 @@ unless `target-cpu` is configured.
 ## Tests
 
 Unit tests are ordinary functions marked with `#attr(test)`. `encore test`
-discovers them across loaded refrains, compiles each test with a small harness,
-and treats the test as passed when it returns `true`.
+discovers them in the current package, compiles one shared harness, and treats
+each test as passed when it returns `true`. Every test runs in a fresh process,
+so a panic or process-local state cannot affect other tests.
 
 ```enq
 #attr(test)
@@ -135,10 +152,12 @@ Test functions should:
 - return `bool`;
 - take no parameters;
 - be non-generic;
+- be synchronous;
 - use `true` for pass and `false` for fail.
 
-The test harness wraps the function in a generated executable `main`, so the
-rest of the program can stay unchanged.
+The harness replaces the application entry point with a generated dispatcher,
+so the rest of the program can stay unchanged. Changing `--filter` reuses the
+same cached harness; standalone programs in `tests/` still compile separately.
 
 CI and large projects can list the test set and let the bounded worker pool run
 it in parallel:

@@ -1,0 +1,91 @@
+//! Reflection preserves heterogeneous field types and lexical expansion scopes.
+import core::vec::Vec
+import json::stringify
+import refrain::frontend::lexer::Lexer
+import refrain::frontend::metadata_ast::encode_metadata_ast
+import refrain::frontend::parser::{Parser, Statement}
+import refrain::frontend::reflection::{ReflectionShape, expand_reflection_function, function_uses_reflection}
+import refrain::frontend::translator::translate_to_ehir
+
+fn main() -> u32 {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source("reflection.enq")
+    let source = "struct Pair { a: u32 b: u32 }\nfn total(value: Pair) -> u32 { let info = reflect::type_info[Pair]() let mut sum = 0_u32 for field in info.fields() { sum = sum + field.get(value) } ret sum }\n"
+    let ast = parser.parse(lexer.tokenize(source))
+    let mut fields = Vec[(str, str)]::new()
+    fields.push(("a", "u32")) fields.push(("b", "u32"))
+    let mut shapes = Vec[ReflectionShape]::new()
+    shapes.push(ReflectionShape {
+            "Pair", "Pair", "Struct", Vec[str]::new(), fields, Vec[(str, str, str)]::new()
+        }
+        ,
+    )
+    let mut output = Vec[Statement]::new()
+    for statement in ast {
+        match statement {
+            Statement::Function(function) => {
+                if !function_uses_reflection(function) {
+                    ret 1
+                }
+                match expand_reflection_function(function, shapes) {
+                    Ok(expanded) => {
+                        if function_uses_reflection(expanded) {
+                            ret 2
+                        }
+                        output.push(Statement::Function(expanded))
+                    }
+                    Err(_) => {
+                        ret 3
+                    }
+                }
+            }
+            _ => {
+                output.push(statement)
+            }
+        }
+    }
+    let text = translate_to_ehir(output)
+    if !text.contains("getfield") || text.contains("type_info") || text.contains("FieldInfo") {
+        ret 4
+    }
+    let mut generic_parser = Parser::new_for_source("generic-reflection.enq")
+    let generic_ast = generic_parser.parse(lexer.tokenize(
+            "struct Pair { a: u32 b: u32 }\n" +
+            "fn total[T](value: T) -> u32 { let info = reflect::type_info[T]() let mut sum = 0_u32 for field in info.fields() { sum = sum + field.get(value) } ret sum }\n" +
+            "fn wrapped[T](value: T) -> u32 { ret total[T](value) }\n" +
+            "fn main() -> u32 { ret wrapped[Pair](Pair { 10_u32, 20_u32 }) }\n"))
+    let generic_text = translate_to_ehir(generic_ast)
+    if !generic_text.contains("__encore_reflect_") || generic_text.contains("type_info") ||
+    generic_text.contains("fn total[") || generic_text.contains("fn wrapped[") {
+        ret 5
+    }
+    let mut builder_parser = Parser::new_for_source("builder-reflection.enq")
+    let builder_ast = builder_parser.parse(lexer.tokenize(
+            "fn read() -> Result[Pair, BuildError] { " +
+            "let info = reflect::type_info[Pair]() let mut builder = reflect::Builder[Pair]::new() " +
+            "for field in info.fields() { builder.set(field, 42_u32) } ret builder.finish() }"))
+    for statement in builder_ast {
+        match statement {
+            Statement::Function(function) => {
+                match expand_reflection_function(function, shapes) {
+                    Ok(expanded) => {
+                        let mut result = Vec[Statement]::new()
+                        result.push(Statement::Function(expanded))
+                        let encoded = stringify(encode_metadata_ast(result))
+                        if encoded.contains("Builder[Pair]") || !encoded.contains("MissingField") ||
+                        !encoded.contains("__encore_builder_") {
+                            ret 6
+                        }
+                    }
+                    Err(_) => {
+                        ret 7
+                    }
+                }
+            }
+            _ => {
+                ret 8
+            }
+        }
+    }
+    ret 0
+}

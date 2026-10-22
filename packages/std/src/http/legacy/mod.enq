@@ -1,0 +1,183 @@
+//! Compatibility HttpClient API, including its existing redirect behavior.
+import core::fmt::Debug
+import core::result::Result
+import platform::net::loopback::LoopbackStream
+import std::http::codec
+import std::http::types::{HttpClientConfig, HttpRequest, HttpResponse, Url, ascii_lower, index_of, starts_with, contains}
+import std::tls::{TlsClientConfig, TlsStream}
+
+pub struct HttpClient {
+    config: HttpClientConfig
+}
+
+impl for HttpClient {
+    pub fn new() -> Self {
+        ret Self {
+            HttpClientConfig::default()
+        }
+    }
+    pub fn with_config(config: HttpClientConfig) -> Self {
+        ret Self {
+            config
+        }
+    }
+    pub fn get(self: Self, value: str) -> Result[HttpResponse, str] {
+        ret self.get_redirected(value, 0_usize)
+    }
+
+    fn get_redirected(self: Self, value: str, redirects: usize) -> Result[HttpResponse, str] {
+        let url = match Url::parse(value) {
+            Result::Ok(parsed) => parsed
+            Result::Err(error) => {
+                ret Result::Err(error)
+            }
+        }
+        let response = match self.send(HttpRequest::get(url)) {
+            Result::Ok(value) => value
+            Result::Err(error) => {
+                ret Result::Err(error)
+            }
+        }
+        if response.status_value == 301_u16 || response.status_value == 302_u16 || response.status_value == 303_u16 || response.status_value == 307_u16 || response.status_value == 308_u16 {
+            if redirects >= self.config.max_redirects {
+                ret Result::Err("HTTP redirect limit exceeded")
+            }
+            let location = response.header("location").unwrap_or("")
+            if location == "" {
+                ret Result::Err("HTTP redirect is missing Location")
+            }
+            let next = if starts_with(location, "https://") {
+                location
+            } elif starts_with(location, "/") && !starts_with(location, "//") {
+                url.scheme_value + "://" + url.host_value + ":" + Debug::fmt(url.port_value) + location
+            } else {
+                ret Result::Err("relative HTTP redirect is not supported")
+            }
+            ret self.get_redirected(next, redirects + 1_usize)
+        }
+        ret Result::Ok(response)
+    }
+
+    /// Sends exactly one request. Never follows redirects or retries credentials.
+    /// Owns the transport for this invocation and closes it after the last I/O.
+    #attr(safe)
+    pub fn send(self: Self, request: HttpRequest) -> Result[HttpResponse, str] {
+        match request.validate() {
+            Result::Err(error) => {
+                ret Result::Err(error)
+            }
+            Result::Ok(_) => {
+            }
+        }
+        if self.config.max_body_size > 1073741824_usize || self.config.timeout_ms == 0_usize {
+            ret Result::Err("invalid HTTP client limits")
+        }
+        let url = request.url
+        let tls_config = TlsClientConfig::system().with_ca_file(self.config.ca_file).with_timeout_ms(self.config.timeout_ms)
+        let stream = match open_transport(url, tls_config, self.config.timeout_ms) {
+            Result::Ok(value) => value
+            Result::Err(error) => {
+                ret Result::Err(error)
+            }
+        }
+        match stream.write_all(request.encode()) {
+            Result::Err(error) => {
+                let _closed = stream.close() ret Result::Err(error)
+            }
+            Result::Ok(written) => {
+                let _ignored = written
+            }
+        }
+        let mut raw = ""
+        let raw_limit = self.config.max_body_size + 65536_usize
+        while raw.len() <= raw_limit {
+            match stream.read(16384_usize) {
+                Result::Err(error) => {
+                    let _closed = stream.close() ret Result::Err(error)
+                }
+                Result::Ok(chunk) => {
+                    if chunk == "" {
+                        break
+                    }
+                    raw += chunk
+                    if explicitly_framed_response_complete(raw, self.config.max_body_size) {
+                        break
+                    }
+                }
+            }
+        }
+        let _closed = stream.close()
+        if raw.len() > raw_limit {
+            ret Result::Err("HTTP response exceeds configured limit")
+        }
+        let response = match parse_http_response(raw, self.config.max_body_size) {
+            Result::Ok(value) => value
+            Result::Err(error) => {
+                ret Result::Err(error)
+            }
+        }
+        ret Result::Ok(response)
+    }
+}
+
+enum HttpTransport {
+    Secure(TlsStream),
+    Local(LoopbackStream)
+}
+fn open_transport(url: Url, config: TlsClientConfig, timeout: usize) -> Result[HttpTransport, str] {
+    if url.scheme_value == "http" {
+        ret match LoopbackStream::connect(url.port_value, timeout) {
+            Result::Ok(stream) => Result::Ok(HttpTransport::Local(stream))
+            Result::Err(error) => Result::Err(error)
+        }
+    }
+    ret match TlsStream::connect(url.host_value, url.port_value, config) {
+        Result::Ok(stream) => Result::Ok(HttpTransport::Secure(stream))
+        Result::Err(error) => Result::Err(error)
+    }
+}
+
+impl for HttpTransport {
+    pub fn read(self: Self, max: usize) -> Result[str, str] {
+        ret match self {
+            Self::Secure(stream) => stream.read(max)
+            Self::Local(stream) => stream.read(max)
+        }
+    }
+    pub fn write_all(self: Self, data: str) -> Result[usize, str] {
+        ret match self {
+            Self::Secure(stream) => stream.write_all(data)
+            Self::Local(stream) => stream.write_all(data)
+        }
+    }
+    pub fn close(self: Self) -> Result[bool, str] {
+        ret match self {
+            Self::Secure(stream) => stream.close()
+            Self::Local(stream) => stream.close()
+        }
+    }
+}
+
+/// Decodes one complete HTTP/1.1 response buffer.
+pub fn parse_http_response(raw: str, max_body_size: usize) -> Result[HttpResponse, str] {
+    match codec::decode(raw, max_body_size, 65536_usize, false) {
+        Result::Ok(response) => {
+            ret Result::Ok(response)
+        }
+        Result::Err(error) => {
+            ret Result::Err(error.message)
+        }
+    }
+}
+
+fn explicitly_framed_response_complete(raw: str, max_body_size: usize) -> bool {
+    let header_end = index_of(raw, "\r\n\r\n", 0_usize)
+    if header_end == raw.len() {
+        ret false
+    }
+    let header_block = ascii_lower(raw.slice(0_usize, header_end))
+    if !contains(header_block, "\r\ncontent-length:") && !contains(header_block, "\r\ntransfer-encoding:") {
+        ret false
+    }
+    ret parse_http_response(raw, max_body_size).is_ok()
+}

@@ -1,0 +1,105 @@
+//! Nested scopes must not leak names or shadowing into their parent.
+
+import core::option::Option
+import core::testing::assert
+import core::vec::Vec
+import refrain::frontend::{AnalysisDatabase, SemanticBody}
+
+fn main() -> u32 {
+    let mut leaking = Vec[str]::new()
+    leaking.push("if true { let hidden = 1_u32 }")
+    leaking.push("while false { let hidden = 1_u32 }")
+    leaking.push("loop { let hidden = 1_u32 break }")
+    leaking.push("unsafe { let hidden = 1_u32 }")
+    leaking.push("let result = { let hidden = 1_u32 hidden }")
+    let mut database = AnalysisDatabase::new()
+    let mut case_number = 10_u32
+    for statement in leaking {
+        case_number += 1_u32
+        database.set_module("scopes", "scopes.enq", "fn sample() -> u32 { " + statement + " ret hidden }")
+        match database.symbol_id("scopes", "sample") {
+            Some(id) => {
+                let body = database.semantic_body(id).unwrap_or(SemanticBody::empty())
+                let mut missing = false
+                for diagnostic in body.diagnostics {
+                    if diagnostic.code == "unknown-variable" { missing = true }
+                }
+                if !assert(missing) { ret case_number }
+            }
+            None => { ret 2_u32 }
+        }
+    }
+    database.set_module("scopes", "scopes.enq",
+        "fn sample() -> u32 { let value = 1_u32 if true { let value = \"inner\" } ret value }")
+    match database.symbol_id("scopes", "sample") {
+        Some(id) => {
+            let body = database.semantic_body(id).unwrap_or(SemanticBody::empty())
+            if !assert(body.diagnostics.len() == 0_usize) { ret 3_u32 }
+        }
+        None => { ret 4_u32 }
+    }
+    database.set_module("scopes", "scopes.enq",
+        "fn sample(arg: u32) -> u32 {\n let value = 1_u32\n if true {\n  let value = \"inner\"\n  value\n }\n value\n ret arg\n}")
+    match database.symbol_id("scopes", "sample") {
+        Some(id) => {
+            let body = database.semantic_body(id).unwrap_or(SemanticBody::empty())
+            match body.binding_at("value", 4_usize, 3_usize) {
+                Some(binding) => { if !assert(binding.typ == "str") { ret 20_u32 } }
+                None => { ret 21_u32 }
+            }
+            match body.binding_at("value", 6_usize, 2_usize) {
+                Some(binding) => { if !assert(binding.typ == "u32") { ret 22_u32 } }
+                None => { ret 23_u32 }
+            }
+            if !assert(body.binding_at("value", 1_usize, 2_usize).is_none()) { ret 24_u32 }
+            if !assert(body.binding_at("arg", 7_usize, 6_usize).is_some()) { ret 25_u32 }
+            if !assert(body.binding_at("arg", 9_usize, 0_usize).is_none()) { ret 26_u32 }
+        }
+        None => { ret 27_u32 }
+    }
+    database.set_module("scopes", "scopes.enq", "fn sample() -> u32 {\n let moved = 1_u32\n ret moved\n}")
+    if !assert(database.semantic_binding_at("scopes", "moved", 2_usize, 6_usize).is_some()) { ret 28_u32 }
+    database.set_module("scopes", "scopes.enq", "\n\nfn sample() -> u32 {\n let moved = 1_u32\n ret moved\n}")
+    match database.semantic_binding_at("scopes", "moved", 4_usize, 6_usize) {
+        Some(binding) => { if !assert(binding.line == 3_usize && binding.column == 5_usize) { ret 29_u32 } }
+        None => { ret 30_u32 }
+    }
+    database.set_module("scopes", "scopes.enq", "struct Box[T] { value: T }\nfn sample(value: Box[u32]) {\n value.")
+    if !assert(database.semantic_binding_at("scopes", "value", 2_usize, 7_usize).is_some()) { ret 31_u32 }
+    database.set_module("scopes", "scopes.enq",
+        "struct Inner { label: str }\nstruct Box[T] { value: T }\nfn sample(value: Box[u32]) {\n if true {\n let value = Inner { \"x\" }\n value.\n }\n}")
+    match database.semantic_binding_at("scopes", "value", 5_usize, 7_usize) {
+        Some(binding) => { if !assert(binding.typ == "Inner") { ret 32_u32 } }
+        None => { ret 33_u32 }
+    }
+    let bindings = database.semantic_bindings_at("scopes", 5_usize, 7_usize)
+    if !assert(bindings.len() == 1_usize) { ret 34_u32 }
+    for binding in bindings {
+        if !assert(binding.name == "value" && binding.typ == "Inner") { ret 35_u32 }
+    }
+    if !assert(database.semantic_bindings_at("scopes", 9_usize, 0_usize).len() == 0_usize) { ret 36_u32 }
+    database.set_module("rename", "rename.enq",
+        "fn sample(first: u32, second: u32) -> u32 {\n let local = first\n ret second + local\n}\n")
+    let first = database.semantic_binding_at("rename", "first", 1_usize, 13_usize)
+    match first {
+        Some(binding) => {
+            if !assert(!database.local_rename_preserves_binding("rename", "first", 1_usize, 13_usize,
+                binding.line, binding.column, "second")) { ret 37_u32 }
+            if !assert(database.local_rename_preserves_binding("rename", "first", 1_usize, 13_usize,
+                binding.line, binding.column, "fresh")) { ret 38_u32 }
+        }
+        None => { ret 39_u32 }
+    }
+    database.set_module("capture", "capture.enq",
+        "fn sample() {\n let local = 1_u32\n global()\n}\n")
+    match database.semantic_binding_at("capture", "local", 1_usize, 5_usize) {
+        Some(binding) => {
+            if !assert(!database.local_rename_preserves_binding("capture", "global", 2_usize, 1_usize,
+                binding.line, binding.column, "global")) { ret 40_u32 }
+            if !assert(database.local_rename_preserves_binding("capture", "global", 2_usize, 1_usize,
+                binding.line, binding.column, "fresh")) { ret 41_u32 }
+        }
+        None => { ret 42_u32 }
+    }
+    ret 0_u32
+}

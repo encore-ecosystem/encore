@@ -1,0 +1,435 @@
+//! Atomic phase records for package workers; readiness is not process exit.
+
+import core::option::Option
+import core::result::Result
+
+import std::os::{file_exists, file_sha256, mkdir_all, read_file, remove_dir_all, remove_file, write_file}
+import std::path::Path
+import std::time::perf_counter_ns
+import std::vec::Vec
+
+import ehir_llvm_backend::codegen::{CodegenRequirements, GenericRequirement}
+import ehirlib::Type
+import json::{Json, parse, stringify}
+
+import mod::build_metadata::{MetadataContext, MetadataDependency, MetadataModule, RefrainMetadata}
+import mod::build_requirements::UnitRequirements
+import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::analysis::analyze_source
+import refrain::frontend::safety::FunctionSafety
+
+extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
+extern fn encore_compiler_read_artifact(path: str) -> str
+
+/// Hashes of all files required by a dependent's frontend, published last.
+pub struct UnitReady {
+    context: MetadataContext
+    metadata_digest: str
+    template_digest: str
+    requirements_digest: str
+    interface_digest: str
+}
+
+impl for UnitReady {
+    pub fn encode(self: Self) -> Result[str, str] {
+        let mut fields = Vec[(str, Json)]::new()
+        fields.push(("schema", Json::Number("1")))
+        fields.push(("context", self.context.encode()?))
+        fields.push(("metadata", Json::String(checked_digest(self.metadata_digest)?)))
+        fields.push(("templates", Json::String(checked_digest(self.template_digest)?)))
+        fields.push(("requirements", Json::String(checked_digest(self.requirements_digest)?)))
+        fields.push(("interface", Json::String(checked_digest(self.interface_digest)?)))
+        ret Result[str, str]::Ok(stringify(Json::Object(fields)))
+    }
+
+    pub fn decode(text: str, expected: MetadataContext) -> Result[Self, str] {
+        let data = match parse(text) {
+            Ok(value) => value
+            Err(_) => {
+                ret Result[Self, str]::Err("invalid package readiness JSON")
+            }
+        }
+        if data.get("schema").unwrap_or(Json::Null).as_number().unwrap_or("") != "1" {
+            ret Result[Self, str]::Err("unsupported package readiness schema")
+        }
+        let context = MetadataContext::decode(data.get("context").unwrap_or(Json::Null))?
+        if stringify(context.encode()?) != stringify(expected.encode()?) {
+            ret Result[Self, str]::Err("package readiness context mismatch")
+        }
+        ret Result[Self, str]::Ok(Self {
+                context, checked_digest(string_field(data, "metadata")?)?,
+                checked_digest(string_field(data, "templates")?)?, checked_digest(string_field(data, "requirements")?)?,
+                checked_digest(string_field(data, "interface")?)?
+            }
+            ,)
+    }
+}
+
+/// Owns a fresh staging directory, not a shared cache slot. A marker from an
+/// earlier attempt is invalidated before any payload changes. The coordinator
+/// moves a verified complete staging directory into its locked cache slot.
+pub fn publish_unit_ready(directory: Path, metadata: RefrainMetadata, templates: str,
+    requirements: str,) -> Result[UnitReady, str] {
+    if !directory.is_absolute() {
+        ret Result[UnitReady, str]::Err("relative package staging directory")
+    }
+    let record = UnitReady {
+        metadata.context, compiler_content_digest(metadata.encode()?),
+        compiler_content_digest(templates), compiler_content_digest(requirements), metadata.interface_digest()?
+    }
+    if metadata.template_digest != record.template_digest {
+        ret Result[UnitReady, str]::Err("prepared package template mismatch")
+    }
+    let _checked_requirements = UnitRequirements::decode(requirements, metadata.context)?
+    if mkdir_all(directory.as_str()) != 0 {
+        ret Result[UnitReady, str]::Err("cannot create package staging directory")
+    }
+    // Complete implies Ready. Remove both commit records before rewriting.
+    invalidate_marker(directory.join("unit.complete"))?
+    invalidate_marker(directory.join("unit.ready"))?
+    atomic_payload(directory.join("unit.ermeta"), metadata.encode()?, record.metadata_digest)?
+    atomic_payload(directory.join("unit.ertemplate"), templates, record.template_digest)?
+    atomic_payload(directory.join("unit.errequirements"), requirements, record.requirements_digest)?
+    atomic_payload(directory.join("unit.ready"), record.encode()?, compiler_content_digest(record.encode()?))?
+    ret Result[UnitReady, str]::Ok(record)
+}
+
+/// Verifies all payloads and semantic identities before unlocking dependants.
+/// Merely finding unit.ready on disk is never sufficient.
+pub fn read_unit_ready(directory: Path, expected: MetadataContext,
+    dependencies: Vec[MetadataDependency],) -> Result[UnitReady, str] {
+    let path = directory.join("unit.ready")
+    if !file_exists(path.as_str()) {
+        ret Result[UnitReady, str]::Err("package metadata is not ready")
+    }
+    let snapshot = unsafe {
+        encore_compiler_read_artifact(path.as_str())
+    }
+    if snapshot == "" {
+        ret Result[UnitReady, str]::Err("cannot read package readiness snapshot: " + path.as_str())
+    }
+    let record = match UnitReady::decode(snapshot, expected) {
+        Ok(value) => value
+        Err(error) => {
+            ret Result[UnitReady, str]::Err(error + ": " + path.as_str())
+        }
+    }
+    let text = verified_text(directory.join("unit.ermeta"), record.metadata_digest)?
+    let templates = verified_text(directory.join("unit.ertemplate"), record.template_digest)?
+    let requirements = verified_text(directory.join("unit.errequirements"), record.requirements_digest)?
+    let metadata = RefrainMetadata::decode(text, expected, dependencies)?
+    let _checked_requirements = UnitRequirements::decode(requirements, expected)?
+    if metadata.template_digest != compiler_content_digest(templates) ||
+    metadata.interface_digest()? != record.interface_digest {
+        ret Result[UnitReady, str]::Err("package readiness semantic identity mismatch")
+    }
+    ret Result[UnitReady, str]::Ok(record)
+}
+
+/// Checks an identity-preserving copy of an already semantically validated
+/// snapshot. Equal payload bytes preserve its AST and dependency validation;
+/// no second JSON/AST reconstruction is needed inside the same transaction.
+pub fn verify_validated_unit_copy(directory: Path, validated: UnitReady) -> Result[(), str] {
+    let mut files = Vec[(str, str)]::new()
+    files.push(("unit.ready", compiler_content_digest(validated.encode()?)))
+    files.push(("unit.ermeta", validated.metadata_digest))
+    files.push(("unit.ertemplate", validated.template_digest))
+    files.push(("unit.errequirements", validated.requirements_digest))
+    for file in files {
+        let path = directory.join(file.0)
+        if !file_exists(path.as_str()) || file_sha256(path.as_str()) != file.1 {
+            ret Result[(), str]::Err("validated package changed during copy: " + file.0)
+        }
+    }
+    ret Result[(), str]::Ok(())
+}
+
+/// Commits an already closed archive, bound to the exact ready record and the
+/// complete native toolchain/input identity (not merely a compiler path).
+pub fn publish_unit_complete(directory: Path, ready: UnitReady, native_digest: str) -> Result[str, str] {
+    let _native_checked = checked_digest(native_digest)?
+    let path = directory.join("unit.erlib")
+    let archive_digest = checked_digest(file_sha256(path.as_str()))?
+    if !file_exists(path.as_str()) {
+        ret Result[str, str]::Err("package archive does not exist")
+    }
+    let ready_digest = compiler_content_digest(ready.encode()?)
+    if compiler_content_digest(read_file(directory.join("unit.ready").as_str())) != ready_digest {
+        ret Result[str, str]::Err("package readiness changed before archive completion")
+    }
+    let text = encode_unit_complete(ready, native_digest, archive_digest)?
+    atomic_payload(directory.join("unit.complete"), text, compiler_content_digest(text))?
+    ret Result[str, str]::Ok(archive_digest)
+}
+
+/// Canonical receipt for an archive whose bytes and ready record were checked.
+pub fn encode_unit_complete(ready: UnitReady, native_digest: str, archive_digest: str) -> Result[str, str] {
+    let ready_digest = compiler_content_digest(ready.encode()?)
+    let _native_checked = checked_digest(native_digest)?
+    let _archive_checked = checked_digest(archive_digest)?
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(("schema", Json::Number("1")))
+    fields.push(("ready", Json::String(ready_digest)))
+    fields.push(("native", Json::String(native_digest)))
+    fields.push(("archive", Json::String(archive_digest)))
+    ret Result[str, str]::Ok(stringify(Json::Object(fields)))
+}
+
+#attr(test)
+fn metadata_artifacts_completion_encoding_checks_digests() -> bool {
+    let metadata = artifact_fixture()
+    let ready = UnitReady {
+        metadata.context, compiler_content_digest("metadata"),
+        compiler_content_digest("templates"), compiler_content_digest("requirements"), compiler_content_digest("interface")
+    }
+    let native = compiler_content_digest("native")
+    let archive = compiler_content_digest("archive")
+    let encoded = match encode_unit_complete(ready, native, archive) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let record = parse(encoded).unwrap_or(Json::Null)
+    ret record.get("ready").unwrap_or(Json::Null).as_str().unwrap_or("") == compiler_content_digest(ready.encode().unwrap_or("")) &&
+    record.get("archive").unwrap_or(Json::Null).as_str().unwrap_or("") == archive &&
+    record.get("native").unwrap_or(Json::Null).as_str().unwrap_or("") == native &&
+    encode_unit_complete(ready, "invalid", archive).is_err() &&
+    encode_unit_complete(ready, native, "invalid").is_err()
+}
+
+/// A complete cache hit requires the archive and its exact production identity.
+pub fn read_unit_complete(directory: Path, ready: UnitReady, native_digest: str) -> Result[str, str] {
+    let path = directory.join("unit.complete")
+    if !file_exists(path.as_str()) {
+        ret Result[str, str]::Err("package archive is not complete")
+    }
+    let data = match parse(read_file(path.as_str())) {
+        Ok(value) => value
+        Err(_) => {
+            ret Result[str, str]::Err("invalid package completion JSON")
+        }
+    }
+    if data.get("schema").unwrap_or(Json::Null).as_number().unwrap_or("") != "1" ||
+    string_field(data, "ready")? != compiler_content_digest(ready.encode()?) ||
+    string_field(data, "native")? != checked_digest(native_digest)? {
+        ret Result[str, str]::Err("package completion identity mismatch")
+    }
+    let digest = checked_digest(string_field(data, "archive")?)?
+    let archive = directory.join("unit.erlib")
+    if !file_exists(archive.as_str()) || file_sha256(archive.as_str()) != digest {
+        ret Result[str, str]::Err("missing or corrupt package archive")
+    }
+    ret Result[str, str]::Ok(digest)
+}
+
+fn verified_text(path: Path, expected: str) -> Result[str, str] {
+    if !file_exists(path.as_str()) || file_sha256(path.as_str()) != expected {
+        ret Result[str, str]::Err("missing or corrupt package payload: " + path.as_str())
+    }
+    let text = read_file(path.as_str())
+    if compiler_content_digest(text) != expected {
+        ret Result[str, str]::Err("package payload changed while reading: " + path.as_str())
+    }
+    ret Result[str, str]::Ok(text)
+}
+
+#attr(safe)
+fn atomic_payload(path: Path, text: str, digest: str) -> Result[(), str] {
+    let written = unsafe {
+        encore_compiler_write_atomic(path.as_str(), text)
+    }
+    if !written || file_sha256(path.as_str()) != digest {
+        ret Result[(), str]::Err("cannot commit package payload: " + path.as_str())
+    }
+    ret Result[(), str]::Ok(())
+}
+
+fn invalidate_marker(path: Path) -> Result[(), str] {
+    if file_exists(path.as_str()) {
+        if remove_file(path.as_str()) != 0 {
+            ret Result[(), str]::Err("cannot invalidate package marker")
+        }
+    }
+    ret Result[(), str]::Ok(())
+}
+
+fn checked_digest(value: str) -> Result[str, str] {
+    if value.byte_len() != 64 {
+        ret Result[str, str]::Err("invalid package artifact digest")
+    }
+    let mut index = 0_usize
+    while index < value.byte_len() {
+        let byte = value.byte_at(index)
+        if !((byte >= 48 && byte <= 57) ||(byte >= 97 && byte <= 102)) {
+            ret Result[str, str]::Err("invalid package artifact digest")
+        }
+        index += 1
+    }
+    ret Result[str, str]::Ok(value)
+}
+
+fn string_field(data: Json, key: str) -> Result[str, str] {
+    ret match data.get(key).unwrap_or(Json::Null) {
+        Json::String(value) => Result[str, str]::Ok(value)
+        _ => Result[str, str]::Err("missing package artifact field: " + key)
+    }
+}
+
+fn artifact_fixture() -> RefrainMetadata {
+    let digest = compiler_content_digest("fixture")
+    let context = MetadataContext {
+        "sample", digest, "x86_64-unknown-linux-gnu", "dev", digest, Vec[str]::new()
+    }
+    let mut modules = Vec[MetadataModule]::new()
+    modules.push(MetadataModule::from_document("sample@lib.enq", "lib.enq",
+            analyze_source("pub fn value() -> u32 { ret 42 }"), Vec[str]::new(), Vec[FunctionSafety]::new(),))
+    ret RefrainMetadata {
+        context, Vec[MetadataDependency]::new(), modules, compiler_content_digest("templates")
+    }
+}
+
+fn artifact_fixture_requirements(context: MetadataContext) -> str {
+    ret UnitRequirements {
+        context, CodegenRequirements {
+            Vec[GenericRequirement]::new(), Vec[Type]::new(), Vec[Type]::new()
+        }
+    }
+    .encode().unwrap_or("")
+}
+
+fn artifact_fixture_directory() -> Path {
+    ret Path::new(f"target/artifact-fixture-{perf_counter_ns()}").resolve()
+}
+
+fn artifact_ready_roundtrip() -> Result[bool, str] {
+    let directory = artifact_fixture_directory()
+    let metadata = artifact_fixture()
+    let ready = publish_unit_ready(directory, metadata, "templates", artifact_fixture_requirements(metadata.context))?
+    let restored = read_unit_ready(directory, metadata.context, Vec[MetadataDependency]::new())?
+    let result = ready.encode()? == restored.encode()? &&
+    read_unit_complete(directory, ready, compiler_content_digest("native")).is_err()
+    remove_dir_all(directory.as_str())
+    ret Result[bool, str]::Ok(result)
+}
+
+#attr(test)
+fn metadata_artifacts_ready_does_not_require_archive() -> bool {
+    ret artifact_ready_roundtrip().unwrap_or(false)
+}
+
+fn artifact_validated_copy() -> Result[bool, str] {
+    let directory = artifact_fixture_directory()
+    let metadata = artifact_fixture()
+    let mut files = Vec[str]::new()
+    files.push("unit.ready") files.push("unit.ermeta")
+    files.push("unit.ertemplate") files.push("unit.errequirements")
+    let mut valid = true
+    for name in files {
+        let _published = publish_unit_ready(directory, metadata, "templates", artifact_fixture_requirements(metadata.context))?
+        let ready = read_unit_ready(directory, metadata.context, Vec[MetadataDependency]::new())?
+        verify_validated_unit_copy(directory, ready)?
+        write_file(directory.join(name).as_str(), "changed bytes")
+        if verify_validated_unit_copy(directory, ready).is_ok() {
+            valid = false
+        }
+    }
+    remove_dir_all(directory.as_str())
+    ret Result[bool, str]::Ok(valid)
+}
+
+#attr(test)
+fn metadata_artifacts_validated_copy_checks_every_payload() -> bool {
+    ret artifact_validated_copy().unwrap_or(false)
+}
+
+fn artifact_corrupt_payload() -> Result[bool, str] {
+    let directory = artifact_fixture_directory()
+    let metadata = artifact_fixture()
+    let _ready = publish_unit_ready(directory, metadata, "templates", artifact_fixture_requirements(metadata.context))?
+    write_file(directory.join("unit.ertemplate").as_str(), "corrupted")
+    let result = read_unit_ready(directory, metadata.context, Vec[MetadataDependency]::new()).is_err()
+    remove_dir_all(directory.as_str())
+    ret Result[bool, str]::Ok(result)
+}
+
+#attr(test)
+fn metadata_artifacts_corrupt_payload_is_not_ready() -> bool {
+    ret artifact_corrupt_payload().unwrap_or(false)
+}
+
+fn artifact_complete_roundtrip() -> Result[bool, str] {
+    let directory = artifact_fixture_directory()
+    let metadata = artifact_fixture()
+    let ready = publish_unit_ready(directory, metadata, "templates", artifact_fixture_requirements(metadata.context))?
+    let native = compiler_content_digest("native")
+    if publish_unit_complete(directory, ready, native).is_ok() {
+        ret Result[bool, str]::Ok(false)
+    }
+    write_file(directory.join("unit.erlib").as_str(), "!<arch>\n")
+    let digest = publish_unit_complete(directory, ready, native)?
+    let restored = read_unit_complete(directory, ready, native)?
+    let wrong_toolchain = read_unit_complete(directory, ready, compiler_content_digest("different native")).is_err()
+    write_file(directory.join("unit.erlib").as_str(), "corrupt")
+    let corrupt = read_unit_complete(directory, ready, native).is_err()
+    remove_dir_all(directory.as_str())
+    ret Result[bool, str]::Ok(digest == restored && wrong_toolchain && corrupt)
+}
+
+#attr(test)
+fn metadata_artifacts_archive_and_native_identity_are_verified() -> bool {
+    ret artifact_complete_roundtrip().unwrap_or(false)
+}
+
+fn artifact_rewrite_invalidates_complete() -> Result[bool, str] {
+    let directory = artifact_fixture_directory()
+    let metadata = artifact_fixture()
+    let requirements = artifact_fixture_requirements(metadata.context)
+    let ready = publish_unit_ready(directory, metadata, "templates", requirements)?
+    write_file(directory.join("unit.erlib").as_str(), "!<arch>\n")
+    let native = compiler_content_digest("native")
+    let _complete = publish_unit_complete(directory, ready, native)?
+    let _rewritten = publish_unit_ready(directory, metadata, "templates", requirements)?
+    let result = !file_exists(directory.join("unit.complete").as_str()) &&
+    read_unit_complete(directory, ready, native).is_err()
+    remove_dir_all(directory.as_str())
+    ret Result[bool, str]::Ok(result)
+}
+
+#attr(test)
+fn metadata_artifacts_rewrite_invalidates_prior_completion() -> bool {
+    ret artifact_rewrite_invalidates_complete().unwrap_or(false)
+}
+
+#attr(test)
+fn metadata_artifacts_wrong_context_or_schema_is_rejected() -> bool {
+    let metadata = artifact_fixture()
+    let digest = compiler_content_digest("fixture")
+    let record = UnitReady {
+        metadata.context, digest, digest, digest, digest
+    }
+    let wrong = MetadataContext {
+        "other", digest, metadata.context.target, "dev", digest, Vec[str]::new()
+    }
+    ret UnitReady::decode(record.encode().unwrap_or(""), wrong).is_err() &&
+    UnitReady::decode("{\"schema\":2}", metadata.context).is_err()
+}
+
+fn artifact_wrong_interface() -> Result[bool, str] {
+    let directory = artifact_fixture_directory()
+    let metadata = artifact_fixture()
+    let ready = publish_unit_ready(directory, metadata, "templates", artifact_fixture_requirements(metadata.context))?
+    let wrong = UnitReady {
+        ready.context, ready.metadata_digest, ready.template_digest,
+        ready.requirements_digest, compiler_content_digest("wrong interface")
+    }
+    let text = wrong.encode()?
+    atomic_payload(directory.join("unit.ready"), text, compiler_content_digest(text))?
+    let result = read_unit_ready(directory, metadata.context, Vec[MetadataDependency]::new()).is_err()
+    remove_dir_all(directory.as_str())
+    ret Result[bool, str]::Ok(result)
+}
+
+#attr(test)
+fn metadata_artifacts_interface_is_recomputed_not_trusted() -> bool {
+    ret artifact_wrong_interface().unwrap_or(false)
+}

@@ -1,0 +1,665 @@
+//! Real CLI contracts, independent of the source-analysis library interface.
+
+import std::io::eprintln
+import std::os::{env, file_exists, file_sha256, read_dir, read_file, remove_dir_all, remove_file}
+import std::process::Command
+import std::string::String
+import std::vec::Vec
+
+import json::Json
+
+import refrain::ci_helpers::{Fixture, flag, json, modified_ns, number, replace, set_env, std_dependencies, text}
+import refrain::modes::build_output::{build_artifact_name, build_import_library_name}
+import refrain::target::host_target
+
+#attr(test)
+fn integration_test_utf8_discovery_contract() -> bool {
+    let fixture = Fixture::new("test-utf8-discovery")
+    fixture.manifest("utf8_probe", "[]")
+    fixture.put("src/lib.enq", "#attr(test)\nfn example() -> bool { ret true }\n")
+    for name in vec!["plain", "second", "пример", "日本語", "emoji-🦊"] {
+        fixture.put("tests/" + name + ".enq", "fn main() -> u32 { ret 0_u32 }\n")
+    }
+    let full = fixture.command(vec!["test", "--list", "--format", "json"])
+    let planned = json(full.text()).as_array().unwrap_or(Vec[Json]::new())
+    if !full.success() || planned.len() != 6_usize {
+        ret fixture.failure("all test files, including UTF-8 names, must be discovered")
+    }
+    for name in vec!["пример", "日本語", "emoji-🦊"] {
+        let filtered = fixture.command(vec!["test", "--list", "--format", "json", "--filter", name])
+        let selected = json(filtered.text()).as_array().unwrap_or(Vec[Json]::new())
+        if !filtered.success() || selected.len() != 1_usize ||
+        selected.get(0_usize).unwrap_or(Json::Null).as_str().unwrap_or("") != "utf8_probe:tests/" + name + ".enq" {
+            ret fixture.failure("UTF-8 filters must select the matching test file")
+        }
+    }
+    if !fixture.succeeds(vec!["test", "--filter", "пример", "--report", "unicode-report.json"]) ||
+    number(json(fixture.read("unicode-report.json")).get("summary").unwrap_or(Json::Null), "passed") != "1" {
+        ret fixture.failure("UTF-8 selection must execute the matching test")
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_test_build_artifact_retention_contract() -> bool {
+    let fixture = Fixture::new("test-retention")
+    fixture.manifest("retention_probe", "[]")
+    fixture.put("src/main.enq", "fn main() -> u32 { ret 0 }\n")
+    fixture.put("tests/example.enq", "fn main() -> u32 { ret 0 }\n")
+    if !fixture.succeeds(vec!["test"]) {
+        ret fixture.finish(false)
+    }
+    let directory = fixture.root.join("target/tests")
+    for name in read_dir(directory.as_str()) {
+        if name.contains("native-") {
+            ret fixture.failure("ordinary test workers must remove their staging workspace")
+        }
+    }
+    if !fixture.succeeds(vec!["test", "--keep-build-artifacts"]) {
+        ret fixture.finish(false)
+    }
+    for name in read_dir(directory.as_str()) {
+        if name.contains("native-") && flag(json(fixture.read("target/tests/" + name + "/.encore-workspace.json")), "retained") {
+            ret fixture.finish(true)
+        }
+    }
+    ret fixture.failure("test retention flag must reach native compiler workers")
+}
+
+fn library_artifact_contract(kind: str) -> bool {
+    let fixture = Fixture::new("library-" + kind)
+    let target = host_target()
+    fixture.put("encore.toml", "[project]\nname=\"library_probe\"\nversion=\"0.0.0\"\ntarget=\"" + kind + "\"\ndependencies=[\"path@dependency\"]\n")
+    fixture.put("src/lib.enq", "pub import refrain::value::answer\n")
+    fixture.put("src/value.enq", "import core::vec::Vec\nimport library_dependency::offset\npub fn answer() -> u32 { let mut values = Vec[u32]::new() values.push(offset()) ret values.get(0).unwrap_or(0) + 1 }\n")
+    fixture.put("src/extra.enq", "pub fn additional() -> u32 { ret 7 }\n")
+    fixture.put("dependency/encore.toml", "[project]\nname=\"library_dependency\"\nversion=\"0.0.0\"\ndependencies=[]\n")
+    fixture.put("dependency/src/lib.enq", "pub fn offset() -> u32 { ret 41 }\n")
+    let selected = if kind == "auto" {
+        "static_lib"
+    } else {
+        kind
+    }
+    let artifact = fixture.root.join("target/dev").join(build_artifact_name(target, "library_probe", selected))
+    let build = fixture.command(vec!["build"])
+    if !build.success() || !file_exists(artifact.as_str()) {
+        eprintln(build.text())
+        ret fixture.finish(false)
+    }
+    let before = modified_ns(artifact)
+    if !fixture.succeeds(vec!["build"]) || modified_ns(artifact) != before ||
+    !flag(json(fixture.read("target/dev/encore-timings.json")), "link_cache_hit") {
+        ret fixture.finish(false)
+    }
+    // Link a real native consumer against the produced artifact. A successful
+    // build alone would not catch nested archives, discarded public functions,
+    // missing generic support or an unusable DLL export/import library.
+    let symbol = "__encore_m6c6962726172795f70726f62654076616c75652e656e71__answer"
+    fixture.put("consumer.c", "extern unsigned " + symbol + "(void);\nint main(void) { return " + symbol + "() != 42; }\n")
+    let driver = fixture.root.join("target/dev/consumer" + target.executable_suffix)
+    let import_name = build_import_library_name(target, "library_probe", selected)
+    let linked_library = if import_name == "" {
+        artifact.as_str()
+    } else {
+        fixture.root.join("target/dev").join(import_name).as_str()
+    }
+    let mut args = vec!["--target=" + target.triple, "consumer.c", linked_library, "-o", driver.as_str()]
+    if target.os == "linux" {
+        args.extend(vec!["-lm", "-pthread", "-ldl", "-lssl", "-lcrypto", "-lcares"])
+    } elif target.os == "macos" {
+        args.extend(vec!["-framework", "Security", "-framework", "CoreFoundation", "-framework", "Network"])
+    } elif target.os == "windows" {
+        args.extend(vec!["-lws2_32", "-lsecur32", "-lcrypt32"])
+    }
+    if selected == "shared_lib" && target.os != "windows" {
+        args.push("-Wl,-rpath," + fixture.root.join("target/dev").as_str())
+    }
+    let linked = fixture.tool(env("ENCORE_CC").unwrap_or("clang"), args)
+    if !linked.success() || !Command::new(driver.as_str()).output().success() {
+        eprintln(linked.text())
+        ret fixture.finish(false)
+    }
+    if fixture.command(vec!["run"]).success() || fixture.command(vec!["install", "--bin-dir", fixture.root.join("bin").as_str()]).success() {
+        ret fixture.finish(false)
+    }
+    for emit in vec!["ehir", "llvm-ir", "object"] {
+        let output = fixture.command(vec!["build", "--emit", emit])
+        if !output.success() {
+            eprintln(output.text())
+            ret fixture.finish(false)
+        }
+        if emit == "llvm-ir" && !file_exists(fixture.root.join("target/dev/library_probe.ll").as_str()) {
+            ret fixture.finish(false)
+        }
+        if emit == "object" && !file_exists(fixture.root.join("target/dev/object/library_probe" +
+                if target.os == "windows" {
+                    ".obj"
+                } else {
+                    ".o"
+                }
+            ).as_str()) {
+            ret fixture.finish(false)
+        }
+    }
+    // Explicit kinds must still select lib.enq when a main also exists.
+    if kind != "auto" {
+        fixture.put("src/main.enq", "fn main() -> u32 { ret undefined_binary_only_name }\n")
+        if !fixture.succeeds(vec!["build"]) {
+            ret fixture.finish(false)
+        }
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_library_auto_contract() -> bool {
+    ret library_artifact_contract("auto")
+}
+
+#attr(test)
+fn integration_library_static_contract() -> bool {
+    ret library_artifact_contract("static_lib")
+}
+
+#attr(test)
+fn integration_library_shared_contract() -> bool {
+    ret library_artifact_contract("shared_lib")
+}
+
+#attr(test)
+fn integration_issue92_qualified_reexport_contract() -> bool {
+    let fixture = Fixture::new("qualified-reexport")
+    fixture.manifest("qualified_probe", "[\"path@library\"]")
+    fixture.put("library/encore.toml", "[project]\nname=\"library\"\nversion=\"0.0.0\"\ndependencies=[]\n")
+    fixture.put("library/src/lib.enq", "pub import refrain::value::{Value, Value as PublicValue}\n")
+    fixture.put("library/src/value.enq", "pub struct Value {}\nimpl for Value { pub fn answer() -> u32 { ret 42 } }\n")
+    for call in vec!["library::Value::answer()", "library::PublicValue::answer()"] {
+        fixture.put("src/main.enq", "fn main() -> u32 { ret " + call + " - 42_u32 }\n")
+        for operation in vec!["check", "run", "run"] {
+            let output = fixture.command(vec![operation])
+            if !output.success() {
+                eprintln(output.text()) ret fixture.finish(false)
+            }
+        }
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_issue93_generic_import_scope_contract() -> bool {
+    let fixture = Fixture::new("generic-import-scope")
+    fixture.manifest("import_probe", "[\"path@a\",\"path@b\"]")
+    for package in vec!["a", "b"] {
+        fixture.put(package + "/encore.toml", "[project]\nname=\"" + package + "\"\nversion=\"0.0.0\"\ndependencies=[]\n")
+    }
+    fixture.put("a/src/lib.enq", "import core::result::Result\npub struct ParseError {}\nimpl for ParseError { pub fn row(self: Self) -> u32 { ret 7 } }\npub fn parse(text: str) -> Result[u32, ParseError] { let _text = text ret Result::Err(ParseError {}) }\n")
+    fixture.put("b/src/lib.enq", "import core::result::Result\npub struct ParseError {}\npub fn parse(text: str) -> Result[u32, ParseError] { let _text = text ret Result::Ok(1_u32) }\npub fn wrapped[T](value: T) -> u32 { let _value = value ret parse(\"b\").unwrap_or(0_u32) }\n")
+    for binding in vec!["parse", "parse as parse_a"] {
+        let name = if binding == "parse" {
+            "parse"
+        } else {
+            "parse_a"
+        }
+        fixture.put("src/main.enq", "import core::result::Result\nimport a::" + binding + "\nimport b::wrapped\nfn main() -> u32 { let number = match " + name + "(\"a\") { Result::Ok(value) => value Result::Err(error) => error.row() } ret number + wrapped(1_u32) - 8_u32 }\n")
+        for operation in vec!["check", "run", "run"] {
+            let output = fixture.command(vec![operation])
+            if !output.success() {
+                eprintln(output.text()) ret fixture.finish(false)
+            }
+        }
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_issue94_imported_parser_error_contract() -> bool {
+    let fixture = Fixture::new("imported-parser-error")
+    fixture.manifest("parser_probe", "[]")
+    let entry = "import refrain::catalog::alternatives\nfn main() -> u32 { let values = alternatives(\"a\") ret if values.len() == 1 { 0_u32 } else { 1_u32 } }\n"
+    fixture.put("src/main.enq", entry)
+    fixture.put("tests/imported_syntax.enq", entry)
+    fixture.put("src/catalog.enq", "import core::vec::Vec\npub fn alternatives(key: str) -> Vec[u32] { let _key = key ret vec![1_u32] }\n")
+    let initial = fixture.command(vec!["test", "--filter", "imported_syntax"])
+    if !initial.success() {
+        eprintln(initial.text()) ret fixture.finish(false)
+    }
+    fixture.put("src/catalog.enq", "import core::vec::Vec\npub fn alternatives(key: str) -> Vec[u32] { ret match key { \"a\" | \"b\" => vec![1_u32] _ => vec![2_u32] } }\n")
+    for operation in vec!["build", "test", "test"] {
+        let output = fixture.command(if operation == "test" {
+                vec!["test", "--filter", "imported_syntax"]
+            } else {
+                vec![operation]
+            }
+            ,
+        )
+        if output.success() || !output.text().contains("parse-error") || !output.text().contains("catalog.enq") || output.text().contains("process exited with code 139") {
+            eprintln(output.text()) ret fixture.finish(false)
+        }
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_nominal_type_workspaces_contract() -> bool {
+    let fixture = Fixture::new("nominal-types")
+    fixture.manifest("identity_probe", "[]")
+    for name in vec!["left", "right"] {
+        let typ = if name == "left" {
+            "u32"
+        } else {
+            "str"
+        }
+        let value = if name == "left" {
+            "7_u32"
+        } else {
+            "\"ok\""
+        }
+        let constructor = if name == "left" {
+            "new()"
+        } else {
+            "with_capacity(2_usize)"
+        }
+        fixture.put("src/" + name + ".enq", "import core::ops::ContextManager\nimport core::vec::Vec\n" +
+            "pub struct Connection { value: " + typ + " }\nimpl for Connection {\n" +
+            "pub fn new() -> Self { ret Self { " + value + " } }\npub fn again() -> Self { ret Self::new() }\n" +
+            "pub fn value(self: Self) -> " + typ + " { ret self.value }\n}\n" +
+            "impl ContextManager for Connection { pub fn with_enter(self: Self) -> Self { ret self } pub fn with_exit(self: Self) -> bool { ret true } }\n" +
+            "pub fn accept(values: Vec[Connection]) -> bool { ret values.len() == 1_usize }\npub fn connection() -> Connection { ret Connection::again() }\n" +
+            "pub fn " + name + "_run() -> bool { with Connection::again() as item { if item.value() != " + value +
+            " { ret false } let mut values = Vec[Connection]::" + constructor + " values.push(item) ret accept(values) } }\n" +
+            "#attr(test)\nfn same_named_test() -> bool { ret " + name + "_run() }\n",)
+    }
+    let source = "import refrain::left::left_run\nimport refrain::right::right_run\nfn main() -> u32 { ret if left_run() && right_run() { 0_u32 } else { 1_u32 } }\n"
+    fixture.put("src/main.enq", source)
+    if !fixture.succeeds(vec!["run"]) || !fixture.succeeds(vec!["test", "--jobs", "2", "--report", "report.json"]) ||
+    number(json(fixture.read("report.json")).get("summary").unwrap_or(Json::Null), "passed") != "2" {
+        ret fixture.finish(false)
+    }
+    for label in vec!["single-first", "collision", "single-again"] {
+        let project = Fixture { fixture.root.join(label), fixture.compiler }
+        project.manifest("identity_probe", "[]")
+        project.put("src/left.enq", fixture.read("src/left.enq"))
+        if label == "collision" {
+            project.put("src/right.enq", fixture.read("src/right.enq"))
+            project.put("src/main.enq", source)
+        } else {
+            project.put("src/main.enq", "import refrain::left::left_run\nfn main() -> u32 { ret if left_run() { 0_u32 } else { 1_u32 } }\n")
+        }
+        if !project.succeeds(vec!["run"]) {
+            ret fixture.finish(false)
+        }
+    }
+    fixture.put("src/main.enq", "import refrain::left::accept\nimport refrain::right::{Connection, connection}\nimport core::vec::Vec\n" +
+        "fn main() -> u32 { let mut values = Vec[Connection]::new() values.push(connection()) let wrong = accept(values) ret 0_u32 }\n",)
+    let rejected = fixture.command(vec!["build"])
+    if rejected.success() || !rejected.text().contains("argument-mismatch") {
+        eprintln(rejected.text())
+    }
+    ret fixture.finish(!rejected.success() && String::from_str(rejected.text()).contains("argument-mismatch"))
+}
+
+#attr(test)
+fn integration_eight_dependency_workers_contract() -> bool {
+    let fixture = Fixture::new("object-queue")
+    let mut dependencies = std_dependencies()
+    dependencies = dependencies.slice_bytes(0, dependencies.byte_len() - 1)
+    let mut imports = ""
+    let mut calls = ""
+    let mut index = 0_u32
+    while index < 8 {
+        let name = f"queue_dep_{index}"
+        let directory = f"dependency-{index}"
+        fixture.put(directory + "/encore.toml", "[project]\nname=\"" + name + "\"\nversion=\"0.0.0\"\ndependencies=[]\n")
+        fixture.put(directory + "/src/lib.enq", "pub fn value() -> u32 { ret " + f"{index + 1}" + " }\n" +
+            "pub fn offset(value: u16) -> u32 { ret value as u32 }\nfn private_identity[T](value: T) -> T { ret value }\n" +
+            "pub fn identity[T](value: T) -> T { ret private_identity(value) }\n",)
+        dependencies = dependencies + ",\"path@" + directory + "\""
+        imports = imports + "import " + name + "::value as value_" + f"{index}" + "\n"
+        calls = calls +(if index == 0 {
+                ""
+            } else {
+                " + "
+            }
+        ) + f"value_{index}()"
+        index += 1
+    }
+    fixture.manifest("queue_probe", dependencies + "]")
+    fixture.put("src/main.enq", imports + "import std::io::println\nimport std::thread::JoinHandle\n" +
+        "import queue_dep_0::{offset as shifted, identity as echoed}\nfn work() -> u32 { ret 7 }\nfn main() -> u32 {\n" +
+        "let handle = spawn work() if handle.join() != 7 { ret 3 }\nif shifted(5000) != 5000_u32 || echoed(1_u32) != 1_u32 { ret 2 }\n" +
+        "let total = " + calls + "\nprintln(f\"sum={total}\") ret if total == 36 { 0_u32 } else { 1_u32 }\n}\n",)
+    let valid_runtime = "int queue_fixture_marker(void) { return 1; }\n"
+    fixture.put("runtime.c", valid_runtime)
+    let binary = fixture.binary("queue_probe", "dev")
+    let mut reference = ""
+    for jobs in vec!["1", "2", "4", "8"] {
+        set_env("ENCORE_BUILD_CACHE", fixture.root.join("cache-" + jobs).as_str())
+        let built = fixture.command(vec!["build", "--jobs", jobs, "--timings"])
+        if !built.success() {
+            ret fixture.finish(false)
+        }
+        let output = Command::new(binary.as_str()).output()
+        if !output.success() || String::from_str(output.text()).trim().as_str() != "sum=36" {
+            ret fixture.finish(false)
+        }
+        let hash = file_sha256(binary.as_str())
+        if reference != "" && hash != reference {
+            ret fixture.finish(false)
+        }
+        reference = hash
+        let before = modified_ns(binary)
+        if !fixture.command(vec!["build", "--jobs", jobs, "--timings"]).success() || modified_ns(binary) != before {
+            ret fixture.finish(false)
+        }
+        let report = json(fixture.read("target/dev/encore-timings.json"))
+        let units = report.get("units").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new())
+        if !flag(report, "link_cache_hit") || units.len() != 12 {
+            ret fixture.finish(false)
+        }
+        for value in units {
+            if !flag(value, "cache_hit") {
+                ret fixture.finish(false)
+            }
+        }
+        if jobs != "8" {
+            remove_dir_all(fixture.root.join("target").as_str())
+        }
+    }
+    let before_failure = file_sha256(binary.as_str())
+    fixture.put("runtime.c", "this is deliberately invalid C!\n")
+    if fixture.command(vec!["build", "--jobs", "4"]).success() || file_sha256(binary.as_str()) != before_failure {
+        ret fixture.finish(false)
+    }
+    fixture.put("runtime.c", valid_runtime)
+    ret fixture.finish(fixture.command(vec!["build", "--jobs", "4"]).success() && Command::new(binary.as_str()).output().success())
+}
+
+#attr(test)
+fn integration_init_preserves_ignore_contract() -> bool {
+    let fixture = Fixture::new("init")
+    if !fixture.command(vec!["init", "--name", "init_probe"]).success() {
+        ret fixture.finish(false)
+    }
+    if fixture.read(".gitignore") != "target/\n.encore_cache/\n" {
+        ret fixture.finish(false)
+    }
+    for path in vec!["target/output", ".encore_cache/lsp/index"] {
+        if !fixture.tool("git", vec!["check-ignore", path]).success() {
+            ret fixture.finish(false)
+        }
+    }
+    if fixture.tool("git", vec!["check-ignore", "src/main.enq"]).code() != 1 {
+        ret fixture.finish(false)
+    }
+    if !fixture.command(vec!["init", "--name", "init_probe"]).success() ||
+    fixture.read(".gitignore") != "target/\n.encore_cache/\n" {
+        ret fixture.finish(false)
+    }
+    fixture.put(".gitignore", "custom/\n")
+    ret fixture.finish(fixture.command(vec!["init", "--name", "init_probe"]).success() && fixture.read(".gitignore") == "custom/\n")
+}
+
+#attr(test)
+fn integration_safety_cli_contract() -> bool {
+    let fixture = Fixture::new("safety")
+    fixture.put("main.enq", "fn raw() -> u32 { unsafe { ret 42_u32 } }\nfn transit() -> u32 { ret raw() }\n" +
+        "#attr(safe)\nfn trusted() -> u32 { ret raw() }\ntrait Handler { fn call(self: Self) -> u32 }\n" +
+        "fn factory() -> dyn Handler { ret || unsafe { 42_u32 } }\nfn create() { let f = factory() }\n" +
+        "fn invoke() -> u32 { let f = factory() ret f.call() }\nfn main() -> u32 { ret trusted() }\n",)
+    let output = fixture.command(vec!["check", "--safety", "--format", "json", fixture.root.join("main.enq").as_str()])
+    if !output.success() {
+        ret fixture.finish(false)
+    }
+    let mut count = 0
+    for line in String::from_str(output.text()).split_char("\n") {
+        let record = json(line.as_str())
+        if text(record, "kind") != "function-safety" {
+            continue
+        }
+        count += 1
+        let name = text(record, "name")
+        let expected = match name {
+            "raw" => true "transit" => true "invoke" => true "call" => true
+            "trusted" => false "main" => false "factory" => false "create" => false
+            _ => {
+                ret fixture.finish(false)
+            }
+        }
+        if flag(record, "unsafe") != expected {
+            ret fixture.finish(false)
+        }
+        if name == "trusted" &&(!flag(record, "asserted_safe") || !flag(record, "body_unsafe")) {
+            ret fixture.finish(false)
+        }
+    }
+    let ordinary = fixture.command(vec!["check", fixture.root.join("main.enq").as_str()])
+    ret fixture.finish(count == 8 && ordinary.success() && !String::from_str(ordinary.text()).contains("Safety:"))
+}
+
+#attr(test)
+fn integration_shared_harness_contract() -> bool {
+    let fixture = Fixture::new("harness")
+    fixture.manifest("harness_probe", "[\"path@dependency\"]")
+    fixture.put("dependency/encore.toml", "[project]\nname=\"harness_dependency\"\nversion=\"0.0.0\"\ndependencies=[]\n")
+    fixture.put("dependency/src/lib.enq", "pub fn answer() -> u32 { ret 42_u32 }\n#attr(test)\nfn dependency_test_is_not_run() -> bool { ret false }\n")
+    fixture.put("runtime.c", "#include <stdint.h>\nstatic uint32_t calls;\nuint32_t harness_tick(void) { return ++calls; }\n")
+    let source = "import refrain::left::marker\nimport refrain::right::other_marker\nimport harness_dependency::answer\n" +
+    "import core::panic::panic\nextern fn harness_tick() -> u32\nfn __encore_unit_test_0() -> bool { ret false }\n" +
+    "#attr(test)\nfn isolated_one() -> bool { unsafe { ret harness_tick() == 1_u32 } }\n" +
+    "#attr(test)\nfn isolated_two() -> bool { unsafe { ret harness_tick() == 1_u32 } }\n" +
+    "#attr(test)\nfn passes() -> bool { ret marker() && other_marker() && answer() == 42_u32 }\n" +
+    "#attr(test)\nfn fails() -> bool { ret false }\n#attr(test)\nfn panics() -> bool { panic(\"harness panic evidence\") ret true }\n" +
+    "#attr(test)\nfn invalid_parameter(value: bool) -> bool { ret value }\n#attr(test)\nfn invalid_return() -> u32 { ret 0_u32 }\n" +
+    "#attr(test)\nfn invalid_generic[T]() -> bool { ret true }\n#attr(test)\n#cfg(target_os = \"harness-impossible-os\")\n" +
+    "fn disabled_test() -> bool { ret missing_disabled_symbol() }\n#attr(test)\nasync fn invalid_async() -> bool { ret true }\n"
+    fixture.put("src/lib.enq", source)
+    fixture.put("src/left.enq", "pub fn marker() -> bool { ret true }\nfn private_helper() -> bool { ret true }\n#attr(test)\nfn same_name() -> bool { ret private_helper() }\n")
+    fixture.put("src/right.enq", "pub fn other_marker() -> bool { ret true }\nfn private_helper() -> bool { ret true }\n#attr(test)\nfn same_name() -> bool { ret private_helper() }\n")
+    fixture.put("tests/standalone.enq", "fn main() -> u32 { ret 0_u32 }\n")
+    fixture.put("tests/negative.enq", "// @expect.compile_error=unknown\nfn main() -> u32 { let value: MissingType = 1_u32 ret 0_u32 }\n")
+    let listing = fixture.command(vec!["test", "--list", "--format", "json"])
+    let planned = json(listing.text()).as_array().unwrap_or(Vec[Json]::new())
+    if !listing.success() || planned.len() != 13 || file_exists(fixture.root.join("target/tests/bin").as_str()) ||
+    String::from_str(listing.text()).contains("dependency_test") || String::from_str(listing.text()).contains("disabled_test") {
+        eprintln(listing.text())
+        ret fixture.failure("test discovery must list 13 root tests without compiling or including disabled/dependency tests")
+    }
+    for value in planned {
+        let id = value.as_str().unwrap_or("")
+        if String::from_str(id).contains(fixture.root.as_str()) || String::from_str(id).contains("\\") {
+            ret fixture.failure("test IDs must be relative and use forward slashes: " + id)
+        }
+    }
+    if fixture.command(vec!["test", "--jobs", "2", "--report", "report.json"]).code() != 1 {
+        ret fixture.failure("the mixed passing/failing suite must exit with status 1")
+    }
+    let report = json(fixture.read("report.json"))
+    let summary = report.get("summary").unwrap_or(Json::Null)
+    if number(summary, "passed") != "7" || number(summary, "failed") != "6" {
+        ret fixture.failure("expected 7 passed and 6 failed tests")
+    }
+    let mut duplicates = 0
+    for record in report.get("tests").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new()) {
+        let id = text(record, "id")
+        if String::from_str(id).ends_with("::same_name") {
+            duplicates += 1 if text(record, "status") != "passed" {
+                ret fixture.failure("same-name tests from distinct modules must both pass")
+            }
+        }
+        if String::from_str(id).ends_with("::panics") && !String::from_str(text(record, "message")).contains("harness panic evidence") {
+            ret fixture.failure("panic evidence must survive in the test report")
+        }
+        if String::from_str(id).contains("::invalid_") && !String::from_str(text(record, "message")).contains("test must be fn() -> bool") {
+            ret fixture.failure("invalid test signatures must report the signature contract")
+        }
+    }
+    if duplicates != 2 {
+        ret fixture.failure("expected two independently selected same-name tests")
+    }
+    if file_exists(fixture.root.join("target/tests/__encore_unit_harness.output.txt").as_str()) {
+        ret fixture.failure("successful harness compilation must remove its capture log")
+    }
+    let panic_log = fixture.test_log("harness_probe:src/lib.enq::panics")
+    if !file_exists(panic_log.as_str()) ||
+    !String::from_str(read_file(panic_log.as_str())).contains("harness panic evidence") {
+        ret fixture.failure("failed tests must retain their complete panic log")
+    }
+    if file_exists(fixture.test_log("harness_probe:src/lib.enq::passes").as_str()) {
+        ret fixture.failure("successful tests must remove their capture logs even when other workers are running")
+    }
+    let binary = fixture.binary("__encore_unit_harness", "tests/bin")
+    let before = modified_ns(binary)
+    for selected in vec!["passes", "same_name", "no_matching_test", "isolated_"] {
+        if !fixture.command(vec!["test", "--filter", selected, "--jobs", "2", "--report", "filtered.json"]).success() || modified_ns(binary) != before {
+            ret fixture.failure("filtered runs must pass without rebuilding the harness: " + selected)
+        }
+        let filtered = json(fixture.read("filtered.json")).get("tests").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new())
+        if selected == "passes" && filtered.len() != 1 {
+            ret fixture.failure("passes filter must select exactly one test")
+        }
+        if selected == "no_matching_test" && filtered.len() != 0 {
+            ret fixture.failure("unmatched filter must produce an empty report")
+        }
+    }
+    if !fixture.command(vec!["test", "--filter", "isolated_", "--jobs", "1"]).success() || modified_ns(binary) != before {
+        ret fixture.failure("single-worker execution must preserve process isolation and cached harness")
+    }
+    if Command::new(binary.as_str()).arg("harness_probe:src/lib.enq::passes").output().code() != 0 {
+        ret fixture.failure("direct harness selection must run the named test")
+    }
+    if fixture.command(vec!["test", "--filter", "invalid_parameter"]).code() != 1 || modified_ns(binary) != before {
+        ret fixture.failure("invalid-signature selection must fail without rebuilding the harness")
+    }
+    if Command::new(binary.as_str()).arg("unknown").output().code() != 2 ||
+    Command::new(binary.as_str()).arg("0").output().code() != 2 || Command::new(binary.as_str()).output().code() != 2 {
+        ret fixture.failure("unknown, numeric and missing harness selectors must exit with status 2")
+    }
+    fixture.put("src/lib.enq", replace(source, "ret marker()", "ret false && marker()"))
+    if fixture.command(vec!["test", "--filter", "passes"]).code() != 1 || modified_ns(binary) == before {
+        ret fixture.failure("editing a test body must invalidate the harness cache")
+    }
+    fixture.put("src/main.enq", source + "\nfn main() -> u32 { panic(\"application main must not run\") ret 1_u32 }\n")
+    remove_file(fixture.root.join("src/lib.enq").as_str())
+    if !fixture.command(vec!["test", "--filter", "isolated_", "--jobs", "2"]).success() {
+        ret fixture.failure("binary projects must support isolated unit tests without running application main")
+    }
+    fixture.put("encore.toml", replace(fixture.read("encore.toml"), "harness_probe", "harness-probe"))
+    if !fixture.command(vec!["test", "--filter", "isolated_", "--jobs", "2"]).success() {
+        ret fixture.failure("hyphenated package names must support isolated unit tests")
+    }
+    fixture.put("src/main.enq", replace(source, "ret marker()", "ret missing_harness_function() && marker()") + "\nfn main() -> u32 { ret 1_u32 }\n")
+    if fixture.command(vec!["test", "--report", "compile-error.json"]).code() != 1 {
+        ret fixture.failure("a broken harness must exit with status 1 and produce a report")
+    }
+    let broken = json(fixture.read("compile-error.json")).get("summary").unwrap_or(Json::Null)
+    if number(broken, "passed") != "2" || number(broken, "failed") != "11" ||
+    !file_exists(fixture.root.join("target/tests/__encore_unit_harness.output.txt").as_str()) {
+        ret fixture.failure("broken harness must preserve its compiler log while standalone tests still run")
+    }
+    ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_standalone_artifact_names_contract() -> bool {
+    let fixture = Fixture::new("standalone-artifacts")
+    let project = Fixture { fixture.root.join("package with spaces"), fixture.compiler }
+    project.manifest("standalone_probe", "[]")
+    project.put("src/main.enq", "fn main() -> u32 { ret 0 }\n")
+    // The old sanitization made punctuation variants identical. Run two such
+    // pairs concurrently to exercise artifact isolation as well as path length.
+    project.put("tests/a-b.enq", "fn main() -> u32 { ret 0 }\n")
+    project.put("tests/a_b.enq", "fn main() -> u32 { ret 1 }\n")
+    project.put("tests/b-c.enq", "fn main() -> u32 { ret 0 }\n")
+    project.put("tests/b_c.enq", "fn main() -> u32 { ret 1 }\n")
+    let output = project.command(vec!["test", "--jobs", "2", "--report", "report.json"])
+    if output.code() != 1 {
+        eprintln(output.text()) ret project.failure("mixed standalone suite must fail with status 1")
+    }
+    let report = json(project.read("report.json"))
+    let summary = report.get("summary").unwrap_or(Json::Null)
+    if number(summary, "passed") != "2" || number(summary, "failed") != "2" {
+        ret project.failure("standalone programs must keep distinct native artifacts in a nested project")
+    }
+    for record in report.get("tests").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new()) {
+        let id = text(record, "id")
+        let should_pass = id == "standalone_probe:tests/a-b.enq" || id == "standalone_probe:tests/b-c.enq"
+        if (text(record, "status") == "passed") != should_pass {
+            ret project.failure("standalone test ran the wrong program: " + id)
+        }
+        if file_exists(project.test_log(id).as_str()) == should_pass {
+            ret project.failure("standalone capture logs must be isolated and retained only on failure: " + id)
+        }
+    }
+    ret fixture.finish(true)
+}
+
+// Imported explicit method generics must resolve exactly like free calls.
+#attr(test)
+fn integration_imported_type_alias_contract() -> bool {
+    let fixture = Fixture::new("imported-type-alias")
+    fixture.manifest("consumer", "[]")
+    fixture.put("src/models/mod.enq", "pub struct Payload { value:u32 }\n")
+    fixture.put("src/main.enq", "import mod::models::Payload as Alias\nfn make()->Alias {ret Alias{42_u32}}\nfn main()->u32 {ret if make().value==42_u32 {0_u32}else{1_u32}}\n")
+    if !fixture.succeeds(vec!["check"]) || !fixture.succeeds(vec!["run"]) {
+        ret fixture.finish(false)
+    }
+    // Exercise stable package metadata, renamed re-exports, nested generic
+    // return types and two unrelated declarations with the same original name.
+    fixture.manifest("consumer", "[\"path@provider\"]")
+    fixture.put("provider/encore.toml", "[project]\nname=\"provider\"\nversion=\"1.0.0\"\ndependencies=[]\n")
+    fixture.put("provider/src/lib.enq", "pub import mod::models::Payload as Exported\npub import mod::other::Payload as Other\n")
+    fixture.put("provider/src/models/mod.enq", "pub struct Payload {value:u32}\nimpl for Payload {pub fn new(value:u32)->Self {ret Self{value}}}\n")
+    fixture.put("provider/src/other/mod.enq", "pub struct Payload {value:u32}\n")
+    let source = "import provider::Exported as Alias\nimport provider::Other\nimport core::option::Option as Maybe\nfn make()->Alias {ret Alias::new(42_u32)}\nfn copy(value:Alias)->Alias {ret value}\nfn nested()->Maybe[Alias] {ret Maybe[Alias]::Some(make())}\nfn generic[Alias](value:Alias)->Alias {ret value}\nfn main()->u32 {let value=nested().unwrap_or(make())\nlet other=Other{7_u32}\nret if copy(value).value==42_u32 && other.value==7_u32 && generic[u32](3_u32)==3_u32 {0_u32}else{1_u32}}\n"
+    fixture.put("src/main.enq", source)
+    if !fixture.succeeds(vec!["check"]) || !fixture.succeeds(vec!["run"]) || !fixture.succeeds(vec!["run"]) {
+        ret fixture.finish(false)
+    }
+    fixture.put("src/main.enq", replace(source, "ret Alias::new(42_u32)", "ret Other{42_u32}"))
+    ret fixture.finish(!fixture.command(vec!["check"]).success())
+}
+
+#attr(test)
+fn integration_imported_future_method_bound() -> bool {
+    let fixture = Fixture::new("imported-future-method-bound")
+    fixture.manifest("consumer", "[\"path@provider\",\"path@runner\"]")
+    fixture.put("provider/encore.toml", "[project]\nname=\"provider\"\nversion=\"0.1.0\"\ndependencies=[]\n")
+    fixture.put("provider/src/lib.enq", "import core::future::{Future,Poll,Context,context as core_context}\nimport core::result::Result\npub import mod::models::*\npub struct Number { value:u32 }\nimpl Future[Result[Payload,Failure]] for Number {\n fn poll(self:Self, context:Context)->Poll[Self,Result[Payload,Failure]] { ret Poll::Ready(Result::Ok(Payload{self.value})) }\n}\npub fn number()->Number { ret Number { 42_u32 } }\n\n")
+    fixture.put("provider/src/models/mod.enq", "pub struct Payload { value:u32 }\npub struct Failure { code:u32 }\n")
+    fixture.put("runner/encore.toml", "[project]\nname=\"runner\"\nversion=\"0.1.0\"\ndependencies=[]\n")
+    fixture.put("runner/src/lib.enq", "import core::future::{Future, Poll, context as core_context}\npub struct Runner { dummy:u32 }\nimpl for Runner {\npub fn read[T,F:Future[T]](self:Self, future:F)->T {\n let mut current=future\n loop { match current.poll(core_context(0_usize)) { Poll::Ready(value)=>{ret value} Poll::Pending(next)=>{current=next} } }\n}\n\n}\n")
+    let source = "import core::future::{Future,Poll,context}\nimport core::result::Result\nimport provider::{Number,number,Payload,Failure}\nimport runner::Runner\nfn main()->u32 {let runner=Runner{0_u32}\nret if runner.read[Result[Payload,Failure],Number](number()).unwrap_or(Payload{0_u32}).value==42_u32 {0_u32}else{1_u32}}\n"
+    fixture.put("src/main.enq", source)
+    if !fixture.succeeds(vec!["check"]) || !fixture.succeeds(vec!["run"]) {
+        ret fixture.finish(false)
+    }
+    fixture.put("src/main.enq", replace(source, "read[Result[Payload,Failure],Number](number())", "read[Result[Payload,Failure],str](\"text\")"))
+    let rejected = fixture.command(vec!["check"])
+    ret fixture.finish(!rejected.success() && rejected.text().contains("error[generic-bound-not-satisfied]"))
+}
+
+// Unresolved branch enum types must fail in source checking, before LLVM.
+#attr(test)
+fn integration_unresolved_match_enum_diagnostic() -> bool {
+    let fixture = Fixture::new("unresolved-match-enum")
+    fixture.manifest("option_repro", "[]")
+    let source = "pub struct Holder { value: Option[u32] }\nimport core::option::Option\npub fn choose(input: Option[u32]) -> Holder {\n let output = match input {\n  Option::Some(value) => { if value == 0_u32 { Option::None } else { Option::Some(value) } }\n  Option::None => Option::None\n }\n ret Holder { output }\n}\n"
+    fixture.put("src/lib.enq", source)
+    for command in vec!["check", "build"] {
+        let rejected = fixture.command(vec![command])
+        if rejected.success() || !rejected.text().contains("error[cannot-infer-enum-type]") || rejected.text().contains("Cannot allocate unsized type") {
+            eprintln(rejected.text())
+            ret fixture.finish(false)
+        }
+    }
+    fixture.put("src/lib.enq", replace(source, "let output =", "let output: Option[u32] ="))
+    ret fixture.finish(fixture.succeeds(vec!["check"]) && fixture.succeeds(vec!["build"]))
+}
+
+#attr(test)
+fn integration_issue78_match_literal_contract() -> bool {
+    let fixture = Fixture::new("issue78-match-literals")
+    fixture.manifest("match_literal_repro", "[]")
+    fixture.put("src/main.enq", "import core::option::Option\n\nfn payload_first(input: Option[i32]) -> i32 {\n    let result = match input {\n        Some(value) => value None => 1\n    }\n    ret result\n}\n\nfn literal_first(input: Option[i32]) -> i32 {\n    let result = match input {\n        None => {\n            ( - 1)\n        }\n        Some(value) => value\n    }\n    ret result\n}\n\nfn float_join(input: Option[f32]) -> f32 {\n    let result = match input {\n        None => {\n            let marker = 1_u32 0.25\n        }\n        Some(value) => value\n    }\n    ret result\n}\n\nfn byte_join(input: Option[u8]) -> u8 {\n    let result = match input {\n        None => 1 Some(value) => value\n    }\n    ret result\n}\n\nfn nested(input: Option[i32], other: Option[i32]) -> i32 {\n    let result = match input {\n        Some(value) => value\n        None => match other {\n            None =>( - 1) Some(value) => value\n        }\n    }\n    ret result\n}\n\nfn explicit_context(flag: bool) -> f32 {\n    let result: f32 = match flag {\n        true => {\n            let marker = 2_u32 0.25\n        }\n        false => {\n            let marker = 3_u32\n            0.5\n        }\n    }\n    ret result\n}\n\nfn nested_literals(flag: bool, value: u8) -> u8 {\n    let result = match flag {\n        true => match flag {\n            true => 1 false => 2\n        }\n        false => value\n    }\n    ret result\n}\n\nfn match_inside_if(flag: bool, value: u8) -> u8 {\n    let result = if flag {\n        match flag {\n            true => 1 false => 2\n        }\n    } else {\n        value\n    }\n    ret result\n}\n\nfn typed_match_in_condition(input: Option[i32]) -> u32 {\n    ret if (match input {\n            Some(value) => value None => 1_i32\n        }\n    ) == 1_i32 {\n        0\n    } else {\n        1\n    }\n}\n\nfn literal_match_in_condition(input: Option[i32]) -> u32 {\n    ret if (match input {\n            Some(value) => value None => 1\n        }\n    ) == 1_i32 {\n        0\n    } else {\n        1\n    }\n}\n\nfn match_scrutinee(input: Option[i32]) -> u32 {\n    let result: u32 = match (match input {\n            Some(value) => value None => 1_i32\n        }\n    ) {\n        1_i32 => 0_u32\n        _ => 1_u32\n    }\n    ret result\n}\n\nfn main() -> u32 {\n    if payload_first(Option[i32]::None) != 1_i32 {\n        ret 1\n    }\n    if payload_first(Option[i32]::Some(42_i32)) != 42_i32 {\n        ret 2\n    }\n    if literal_first(Option[i32]::None) != - 1_i32 {\n        ret 3\n    }\n    if literal_first(Option[i32]::Some(42_i32)) != 42_i32 {\n        ret 4\n    }\n    if float_join(Option[f32]::None) != 0.25_f32 {\n        ret 5\n    }\n    if float_join(Option[f32]::Some(1.5_f32)) != 1.5_f32 {\n        ret 6\n    }\n    if byte_join(Option[u8]::None) != 1_u8 {\n        ret 7\n    }\n    if byte_join(Option[u8]::Some(42_u8)) != 42_u8 {\n        ret 8\n    }\n    if nested(Option[i32]::None, Option[i32]::None) != - 1_i32 {\n        ret 9\n    }\n    if nested(Option[i32]::None, Option[i32]::Some(42_i32)) != 42_i32 {\n        ret 10\n    }\n    if explicit_context(true) != 0.25_f32 || explicit_context(false) != 0.5_f32 {\n        ret 11\n    }\n    if nested_literals(true, 42_u8) != 1_u8 || nested_literals(false, 42_u8) != 42_u8 {\n        ret 12\n    }\n    if match_inside_if(true, 42_u8) != 1_u8 || match_inside_if(false, 42_u8) != 42_u8 {\n        ret 13\n    }\n    if typed_match_in_condition(Option[i32]::None) != 0_u32 || typed_match_in_condition(Option[i32]::Some(2_i32)) != 1_u32 {\n        ret 14\n    }\n    if literal_match_in_condition(Option[i32]::None) != 0_u32 || literal_match_in_condition(Option[i32]::Some(2_i32)) != 1_u32 {\n        ret 15\n    }\n    if match_scrutinee(Option[i32]::None) != 0_u32 || match_scrutinee(Option[i32]::Some(2_i32)) != 1_u32 {\n        ret 16\n    }\n    ret 0\n}\n")
+    ret fixture.finish(fixture.succeeds(vec!["check"]) && fixture.succeeds(vec!["run"]))
+}

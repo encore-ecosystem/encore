@@ -1,0 +1,303 @@
+//! Phase-specific package cache identities; paths and job counts are not inputs.
+
+import core::option::Option
+import core::result::Result
+
+import std::vec::Vec
+
+import json::{Json, stringify}
+
+import mod::build_metadata::{MetadataContext, MetadataDependency, metadata_name_before}
+import refrain::cache_identity::compiler_content_digest
+
+/// Frontend checks consume interfaces. Backend preparation also consumes every
+/// reachable generic template. Native emission additionally follows the exact
+/// toolchain identity. Dependency archives and ordinary bodies are deliberately
+/// absent: a dependent links their new archives without recompiling its code.
+pub struct UnitFingerprint {
+    frontend: str
+    backend: str
+    native: str
+}
+
+/// `dependencies` contains the complete reachable dependency closure, not only
+/// direct edges: a generic in a direct dependency may call another package's
+/// private generic helper. Sorting removes manifest/graph traversal ordering.
+pub fn unit_fingerprint(context: MetadataContext, dependencies: Vec[MetadataDependency],
+    native_digest: str,) -> Result[UnitFingerprint, str] {
+    let encoded_context = context.encode()?
+    if !valid_digest(native_digest) {
+        ret Result[UnitFingerprint, str]::Err("invalid package native fingerprint")
+    }
+    let mut names = Vec[str]::new()
+    for dependency in dependencies {
+        if dependency.unit == "" || dependency.unit == context.unit || contains(names, dependency.unit)
+        || !valid_digest(dependency.interface_digest) || !valid_digest(dependency.template_digest) {
+            ret Result[UnitFingerprint, str]::Err("invalid package fingerprint dependency")
+        }
+        names.push(dependency.unit)
+    }
+    sort(names)
+    let mut interfaces = Vec[Json]::new()
+    let mut templates = Vec[Json]::new()
+    for name in names {
+        for dependency in dependencies {
+            if dependency.unit != name {
+                continue
+            }
+            let mut interface = Vec[Json]::new()
+            interface.push(Json::String(name))
+            interface.push(Json::String(dependency.interface_digest))
+            interfaces.push(Json::Array(interface))
+            let mut template = Vec[Json]::new()
+            template.push(Json::String(name))
+            template.push(Json::String(dependency.template_digest))
+            templates.push(Json::Array(template))
+        }
+    }
+    let mut frontend_fields = Vec[Json]::new()
+    frontend_fields.push(encoded_context)
+    frontend_fields.push(Json::Array(interfaces))
+    let frontend = phase_digest("frontend", frontend_fields)
+    let mut backend_fields = Vec[Json]::new()
+    backend_fields.push(Json::String(frontend))
+    backend_fields.push(Json::Array(templates))
+    let backend = phase_digest("backend", backend_fields)
+    let mut native_fields = Vec[Json]::new()
+    native_fields.push(Json::String(backend))
+    native_fields.push(Json::String(native_digest))
+    ret Result[UnitFingerprint, str]::Ok(UnitFingerprint {
+            frontend, backend, phase_digest("native", native_fields)
+        }
+        ,
+    )
+}
+
+fn phase_digest(phase: str, fields: Vec[Json]) -> str {
+    ret compiler_content_digest("encore-unit-cache-1\nencore-refrain-1\n" + phase + "\n" + stringify(Json::Array(fields)))
+}
+
+fn valid_digest(value: str) -> bool {
+    if value.byte_len() != 64 {
+        ret false
+    }
+    let mut index = 0_usize
+    while index < value.byte_len() {
+        let byte = value.byte_at(index)
+        if !(byte >= 48 && byte <= 57) && !(byte >= 97 && byte <= 102) {
+            ret false
+        }
+        index += 1
+    }
+    ret true
+}
+
+fn contains(values: Vec[str], name: str) -> bool {
+    for value in values {
+        if value == name {
+            ret true
+        }
+    }
+    ret false
+}
+
+fn sort(values: mut Vec[str]) ->() {
+    let mut index = 1_usize
+    while index < values.len() {
+        let mut cursor = index
+        while cursor > 0 {
+            let previous = values.get(cursor - 1).unwrap_or("")
+            let current = values.get(cursor).unwrap_or("")
+            if !metadata_name_before(current, previous) {
+                break
+            }
+            values.set(cursor - 1, current) values.set(cursor, previous)
+            cursor -= 1
+        }
+        index += 1
+    }
+}
+
+fn fingerprint_context() -> MetadataContext {
+    ret MetadataContext {
+        "consumer", compiler_content_digest("compiler"), "x86_64-unknown-linux-gnu",
+        "dev", compiler_content_digest("own sources"), Vec[str]::new()
+    }
+}
+
+fn fingerprint_dependencies() -> Vec[MetadataDependency] {
+    let mut dependencies = Vec[MetadataDependency]::new()
+    dependencies.push(MetadataDependency {
+            "producer", compiler_content_digest("interface"), compiler_content_digest("template")
+        }
+        ,
+    )
+    dependencies.push(MetadataDependency {
+            "transitive", compiler_content_digest("helper interface"), compiler_content_digest("helper template")
+        }
+        ,
+    )
+    ret dependencies
+}
+
+#attr(test)
+fn metadata_fingerprint_dependency_order_contract() -> bool {
+    let first = match unit_fingerprint(fingerprint_context(), fingerprint_dependencies(), compiler_content_digest("native")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let original = fingerprint_dependencies()
+    let mut reordered = Vec[MetadataDependency]::new()
+    reordered.push(match original.get(1) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+    )
+    reordered.push(match original.get(0) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+    )
+    let second = match unit_fingerprint(fingerprint_context(), reordered, compiler_content_digest("native")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    ret first.frontend == second.frontend && first.backend == second.backend && first.native == second.native
+}
+
+#attr(test)
+fn metadata_fingerprint_transitive_template_contract() -> bool {
+    let first = match unit_fingerprint(fingerprint_context(), fingerprint_dependencies(), compiler_content_digest("native")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let mut changed = fingerprint_dependencies()
+    let old = match changed.get(1) {
+        Some(value) => value None => {
+            ret false
+        }
+    }
+    changed.set(1, MetadataDependency {
+            old.unit, old.interface_digest, compiler_content_digest("new helper body")
+        }
+        ,
+    )
+    let second = match unit_fingerprint(fingerprint_context(), changed, compiler_content_digest("native")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    ret first.frontend == second.frontend && first.backend != second.backend && first.native != second.native
+}
+
+#attr(test)
+fn metadata_fingerprint_interface_contract() -> bool {
+    let first = match unit_fingerprint(fingerprint_context(), fingerprint_dependencies(), compiler_content_digest("native")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let mut changed = fingerprint_dependencies()
+    let old = match changed.get(0) {
+        Some(value) => value None => {
+            ret false
+        }
+    }
+    changed.set(0, MetadataDependency {
+            old.unit, compiler_content_digest("new API"), old.template_digest
+        }
+        ,
+    )
+    let second = match unit_fingerprint(fingerprint_context(), changed, compiler_content_digest("native")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    ret first.frontend != second.frontend && first.backend != second.backend && first.native != second.native
+}
+
+#attr(test)
+fn metadata_fingerprint_native_toolchain_contract() -> bool {
+    let first = match unit_fingerprint(fingerprint_context(), fingerprint_dependencies(), compiler_content_digest("native")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let second = match unit_fingerprint(fingerprint_context(), fingerprint_dependencies(), compiler_content_digest("new native")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    ret first.frontend == second.frontend && first.backend == second.backend && first.native != second.native
+}
+
+#attr(test)
+fn metadata_fingerprint_own_source_contract() -> bool {
+    let first = match unit_fingerprint(fingerprint_context(), fingerprint_dependencies(), compiler_content_digest("native")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let mut changed = fingerprint_context()
+    changed.input_digest = compiler_content_digest("new own body")
+    let second = match unit_fingerprint(changed, fingerprint_dependencies(), compiler_content_digest("native")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    ret first.frontend != second.frontend && first.backend != second.backend && first.native != second.native
+}
+
+#attr(test)
+fn metadata_fingerprint_features_order_contract() -> bool {
+    let mut context = fingerprint_context()
+    let mut features = Vec[str]::new()
+    features.push("alpha") features.push("beta")
+    context.features = features
+    let first = match unit_fingerprint(context, fingerprint_dependencies(), compiler_content_digest("native")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let mut reordered = fingerprint_context()
+    let mut other = Vec[str]::new()
+    other.push("beta") other.push("alpha")
+    reordered.features = other
+    let second = match unit_fingerprint(reordered, fingerprint_dependencies(), compiler_content_digest("native")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    ret first.frontend == second.frontend && first.backend == second.backend && first.native == second.native
+}
+
+#attr(test)
+fn metadata_fingerprint_invalid_dependency_contract() -> bool {
+    let mut duplicate = fingerprint_dependencies()
+    let first = match duplicate.get(0) {
+        Some(value) => value None => {
+            ret false
+        }
+    }
+    duplicate.push(first)
+    if unit_fingerprint(fingerprint_context(), duplicate, compiler_content_digest("native")).is_ok() {
+        ret false
+    }
+    let mut invalid = fingerprint_dependencies()
+    invalid.set(0, MetadataDependency { "producer", "short", compiler_content_digest("template") })
+    if unit_fingerprint(fingerprint_context(), invalid, compiler_content_digest("native")).is_ok() {
+        ret false
+    }
+    let mut own = Vec[MetadataDependency]::new()
+    own.push(MetadataDependency {
+            "consumer", compiler_content_digest("interface"), compiler_content_digest("template")
+        }
+        ,
+    )
+    ret unit_fingerprint(fingerprint_context(), own, compiler_content_digest("native")).is_err()
+}

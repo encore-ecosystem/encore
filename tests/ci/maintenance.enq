@@ -1,0 +1,92 @@
+//! Execute the actual workflow gates and channel generator, not copied logic.
+
+import std::os::{read_file, env, file_exists}
+import std::string::String
+import std::vec::Vec
+import json::Json
+import refrain::ci_helpers::{Fixture, repository, find, set_env, json, text, number, flag}
+
+#cfg(target_os = "linux")
+#attr(test)
+fn ci_completion_gate_contract() -> bool {
+    let fixture = Fixture::new("completion-gate")
+    let source = read_file(repository().join(".github/workflows/ci.yml").as_str())
+    let start = find(source, "if test \"$REUSED\" = true; then")
+    fixture.put("gate.sh", "set -euo pipefail\n" + source.slice_bytes(start, source.byte_len() - start))
+    for reused in vec!["false", "true"] {
+        set_env("REUSED", reused)
+        set_env("RESULTS", "{\"candidate\":{\"result\":\"success\"},\"native\":{\"result\":\"success\"}}")
+        if !fixture.tool("bash", vec!["gate.sh"]).success() { ret fixture.finish(false) }
+        for status in vec!["failure", "cancelled", "skipped"] {
+            set_env("RESULTS", "{\"candidate\":{\"result\":\"success\"},\"native\":{\"result\":\"" + status + "\"}}")
+            let expected = reused == "true" && status == "skipped"
+            if fixture.tool("bash", vec!["gate.sh"]).success() != expected { ret fixture.finish(false) }
+        }
+        set_env("RESULTS", "{\"candidate\":{\"result\":\"failure\"},\"native\":{\"result\":\"skipped\"}}")
+        if fixture.tool("bash", vec!["gate.sh"]).success() { ret fixture.finish(false) }
+    }
+    ret fixture.finish(true)
+}
+
+#cfg(target_os = "linux")
+#attr(test)
+fn ci_channel_metadata_contract() -> bool {
+    let fixture = Fixture::new("channel-metadata")
+    let source = read_file(repository().join(".github/workflows/release.yml").as_str())
+    let start = find(source, "jq -n --arg channel")
+    let tail = source.slice_bytes(start, source.byte_len() - start)
+    let ending = "' > dist/channel.json"
+    let length = find(tail, ending) + ending.byte_len()
+    fixture.put("dist/placeholder", "")
+    fixture.put("channel.sh", "set -euo pipefail\n" + tail.slice_bytes(0, length))
+    set_env("CHANNEL", "stable") set_env("version", "0.1.4") set_env("release_name", "neumann")
+    set_env("release", "0.1.4-neumann") set_env("GITHUB_REF_NAME", "v0.1.4-neumann")
+    set_env("GITHUB_SHA", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    for count in vec![1_usize, 6_usize, 7_usize] {
+        let mut assets = ""
+        let mut index = 0_usize
+        while index < count {
+            if index != 0 { assets = assets + "," }
+            assets = assets + "{\"triple\":\"target-" + f"{index}" + "\",\"url\":\"https://example.org/a\\\"b\",\"sha256\":\"digest\",\"format\":\"tar.gz\"}"
+            index += 1
+        }
+        set_env("assets", assets)
+        if !fixture.tool("bash", vec!["channel.sh"]).success() { ret fixture.finish(false) }
+        let record = json(fixture.read("dist/channel.json"))
+        if number(record, "schema") != "2" || text(record, "release") != "0.1.4-neumann" ||
+            text(record, "tag") != "v0.1.4-neumann" || text(record, "channel") != "stable" { ret fixture.finish(false) }
+        let verification = record.get("verification").unwrap_or(Json::Null)
+        let actual = record.get("assets").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new())
+        if number(verification, "targets") != f"{count}" || !flag(verification, "converged") || actual.len() != count ||
+            text(actual.get(0).unwrap_or(Json::Null), "url") != "https://example.org/a\"b" { ret fixture.finish(false) }
+    }
+    ret fixture.finish(true)
+}
+
+#cfg(target_os = "linux")
+#attr(test)
+fn ci_explicit_archiver_contract() -> bool {
+    let fixture = Fixture::new("archiver")
+    fixture.put("tool with spaces", "#!/bin/sh\n[ \"$1\" = --version ] || exit 90\nprintf 'LLVM fixture\\n'\n")
+    if !fixture.tool("chmod", vec!["+x", "tool with spaces"]).success() { ret fixture.finish(false) }
+    let archiver = fixture.root.join("tool with spaces").as_str()
+    set_env("ENCORE_AR", archiver)
+    set_env("GITHUB_ENV", fixture.root.join("environment").as_str())
+    if !fixture.tool("bash", vec![repository().join("scripts/ci-prepare-toolchain.sh").as_str()]).success() ||
+        fixture.read("environment") != "ENCORE_AR=" + archiver + "\n" { ret fixture.finish(false) }
+    let before = fixture.read("environment")
+    set_env("ENCORE_AR", fixture.root.join("missing").as_str())
+    ret fixture.finish(!fixture.tool("bash", vec![repository().join("scripts/ci-prepare-toolchain.sh").as_str()]).success() && fixture.read("environment") == before)
+}
+
+#cfg(target_os = "linux")
+#attr(test)
+fn ci_installer_rejects_intel_mac_contract() -> bool {
+    let fixture = Fixture::new("intel-mac")
+    fixture.put("bin/uname", "#!/bin/sh\ncase \"$1\" in -s) echo Darwin;; -m) echo x86_64;; *) exit 90;; esac\n")
+    fixture.put("bin/curl", "#!/bin/sh\ntouch unexpected-download\nexit 90\n")
+    if !fixture.tool("chmod", vec!["+x", "bin/uname", "bin/curl"]).success() { ret fixture.finish(false) }
+    set_env("PATH", fixture.root.join("bin").as_str() + ":" + env("PATH").unwrap_or(""))
+    let output = fixture.tool("sh", vec![repository().join("install.sh").as_str(), "--install-dir", fixture.root.join("installed").as_str()])
+    ret fixture.finish(!output.success() && String::from_str(output.text()).contains("Apple Silicon") && !file_exists(fixture.root.join("unexpected-download").as_str()))
+}

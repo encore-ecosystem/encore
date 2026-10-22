@@ -1,0 +1,113 @@
+import mod::cache_policy::touch_cache
+//! Checked/lowered frontend checkpoints, independent of dependency templates.
+
+import core::option::Option
+import core::result::Result
+
+import std::os::{file_exists, file_sha256, mkdir_all, read_file, remove_file}
+import std::path::Path
+import std::vec::Vec
+
+import json::{Json, parse, stringify}
+
+import mod::build_cache::UnitCacheLock
+import mod::build_metadata::{MetadataContext, MetadataDependency, RefrainMetadata}
+import refrain::cache_identity::compiler_content_digest
+
+extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
+
+pub struct FrontendCheckpoint {
+    metadata: RefrainMetadata
+    lowered: str
+}
+
+/// Write the receipt last. Ordinary bodies stay private to the owning worker.
+pub fn publish_frontend_unit(directory: Path, key: str, metadata: RefrainMetadata,
+    lowered: str,) -> Result[(), str] {
+    if mkdir_all(directory.as_str()) != 0 {
+        ret Result[(), str]::Err("cannot stage frontend checkpoint")
+    }
+    let text = metadata.encode()?
+    atomic(directory.join("unit.frontend-meta"), text)?
+    atomic(directory.join("unit.frontend-owned"), lowered)?
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(("schema", Json::Number("1"))) fields.push(("key", Json::String(key)))
+    fields.push(("metadata", Json::String(compiler_content_digest(text))))
+    fields.push(("owned", Json::String(compiler_content_digest(lowered))))
+    atomic(directory.join("unit.frontend"), stringify(Json::Object(fields)))?
+    ret Result[(), str]::Ok(())
+}
+
+pub fn read_frontend_unit(directory: Path, key: str, context: MetadataContext,
+    dependencies: Vec[MetadataDependency],) -> Result[FrontendCheckpoint, str] {
+    let receipt = parse(read_file(directory.join("unit.frontend").as_str())).unwrap_or(Json::Null)
+    if receipt.get("schema").unwrap_or(Json::Null).as_number().unwrap_or("") != "1" ||
+    receipt.get("key").unwrap_or(Json::Null).as_str().unwrap_or("") != key {
+        ret Result[FrontendCheckpoint, str]::Err("frontend checkpoint identity mismatch")
+    }
+    let text = payload(directory.join("unit.frontend-meta"), receipt.get("metadata").unwrap_or(Json::Null).as_str().unwrap_or(""))?
+    let lowered = payload(directory.join("unit.frontend-owned"), receipt.get("owned").unwrap_or(Json::Null).as_str().unwrap_or(""))?
+    ret Result[FrontendCheckpoint, str]::Ok(FrontendCheckpoint {
+            RefrainMetadata::decode_frontend(text, context, dependencies)?, lowered
+        }
+        ,
+    )
+}
+
+pub fn restore_frontend_cache(lock: UnitCacheLock, key: str, context: MetadataContext,
+    dependencies: Vec[MetadataDependency], destination: Path,) -> Result[bool, str] {
+    if read_frontend_unit(lock.directory, key, context, dependencies).is_err() {
+        ret Result[bool, str]::Ok(false)
+    }
+    copy_frontend(lock.directory, destination)?
+    let _verified = read_frontend_unit(destination, key, context, dependencies)?
+    touch_cache(lock.directory)
+    ret Result[bool, str]::Ok(true)
+}
+
+pub fn commit_frontend_cache(lock: UnitCacheLock, key: str, context: MetadataContext,
+    dependencies: Vec[MetadataDependency], source: Path,) -> Result[(), str] {
+    let _verified = read_frontend_unit(source, key, context, dependencies)?
+    copy_frontend(source, lock.directory)?
+    let _copied = read_frontend_unit(lock.directory, key, context, dependencies)?
+    touch_cache(lock.directory)
+    ret Result[(), str]::Ok(())
+}
+
+fn copy_frontend(source: Path, destination: Path) -> Result[(), str] {
+    if source.as_str() == destination.as_str() || !destination.is_absolute() || mkdir_all(destination.as_str()) != 0 {
+        ret Result[(), str]::Err("invalid frontend checkpoint transaction")
+    }
+    let marker = destination.join("unit.frontend")
+    if file_exists(marker.as_str()) && remove_file(marker.as_str()) != 0 {
+        ret Result[(), str]::Err("cannot invalidate frontend receipt")
+    }
+    let mut names = Vec[str]::new()
+    names.push("unit.frontend-meta") names.push("unit.frontend-owned") names.push("unit.frontend")
+    for name in names {
+        let path = source.join(name)
+        let contents = payload(path, file_sha256(path.as_str()))?
+        atomic(destination.join(name), contents)?
+    }
+    ret Result[(), str]::Ok(())
+}
+
+fn payload(path: Path, expected: str) -> Result[str, str] {
+    let text = read_file(path.as_str())
+    if expected.byte_len() != 64 || !file_exists(path.as_str()) || file_sha256(path.as_str()) != expected ||
+    compiler_content_digest(text) != expected {
+        ret Result[str, str]::Err("missing or corrupt frontend checkpoint")
+    }
+    ret Result[str, str]::Ok(text)
+}
+
+#attr(safe)
+fn atomic(path: Path, contents: str) -> Result[(), str] {
+    if !unsafe {
+        encore_compiler_write_atomic(path.as_str(), contents)
+    }
+    || file_sha256(path.as_str()) != compiler_content_digest(contents) {
+        ret Result[(), str]::Err("cannot commit frontend checkpoint")
+    }
+    ret Result[(), str]::Ok(())
+}

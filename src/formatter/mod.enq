@@ -2,7 +2,8 @@
 
 import std::vec::Vec
 
-import refrain::frontend::{FrontendDiagnostic, SyntaxDocument, Token, TokenType, analyze_source_lightweight}
+import refrain::frontend::{FrontendDiagnostic, Lexer, SyntaxDocument, Token, TokenType, analyze_source_lightweight}
+import refrain::frontend::parser::{Parser, SourceLayoutRole, SourceLayoutToken, Statement}
 
 /// Controls deterministic Encore source formatting.
 pub struct FormatConfig {
@@ -115,21 +116,21 @@ impl for FormatResult {
 }
 
 impl for FormatState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         ret Self {
             FormatDocument::new(), false, 0_usize, false, 0_usize, false, TokenType::UNKNOWN, false,
             0_usize
         }
     }
 
-    fn request_space(self: mut Self) ->() {
+    pub fn request_space(self: mut Self) ->() {
         if self.line_has_content && self.pending_breaks == 0_usize {
             self.pending_space = true
         }
         ret()
     }
 
-    fn request_break(self: mut Self, count: usize) ->() {
+    pub fn request_break(self: mut Self, count: usize) ->() {
         let requested = if count > 2_usize {
             2_usize
         } else {
@@ -165,25 +166,25 @@ impl for FormatState {
         ret()
     }
 
-    fn write(self: mut Self, value: str, config: FormatConfig) ->() {
+    pub fn write(self: mut Self, value: str, config: FormatConfig) ->() {
         self.flush_prefix(config)
         self.document.push_text(value)
         self.has_output = true
         ret()
     }
 
-    fn trim_space(self: mut Self) ->() {
+    pub fn trim_space(self: mut Self) ->() {
         self.pending_space = false
         ret()
     }
 
-    fn remember(self: mut Self, typ: TokenType) ->() {
+    pub fn remember(self: mut Self, typ: TokenType) ->() {
         self.previous = typ
         self.has_previous = true
         ret()
     }
 
-    fn finish(self: mut Self, config: FormatConfig) -> str {
+    pub fn finish(self: mut Self, config: FormatConfig) -> str {
         self.pending_space = false
         self.pending_breaks = 0_usize
         if !self.has_output {
@@ -195,29 +196,29 @@ impl for FormatState {
 }
 
 impl for FormatDocument {
-    fn new() -> Self {
+    pub fn new() -> Self {
         ret Self {
             Vec[FormatElement]::new()
         }
     }
 
-    fn push_text(self: mut Self, value: str) ->() {
+    pub fn push_text(self: mut Self, value: str) ->() {
         self.elements.push(FormatElement::Text(value)) ret()
     }
-    fn push_space(self: mut Self) ->() {
+    pub fn push_space(self: mut Self) ->() {
         self.elements.push(FormatElement::Space) ret()
     }
-    fn push_line(self: mut Self, count: usize) ->() {
+    pub fn push_line(self: mut Self, count: usize) ->() {
         self.elements.push(FormatElement::Line(count)) ret()
     }
-    fn push_indent(self: mut Self, width: usize) ->() {
+    pub fn push_indent(self: mut Self, width: usize) ->() {
         if width > 0_usize {
             self.elements.push(FormatElement::Indent(width))
         }
         ret()
     }
 
-    fn render(self: Self, config: FormatConfig) -> str {
+    pub fn render(self: Self, config: FormatConfig) -> str {
         let mut out = ""
         let newline = if config.newline_style == "crlf" {
             "\r\n"
@@ -289,7 +290,12 @@ pub fn format_syntax(syntax: SyntaxDocument, diagnostics: Vec[FrontendDiagnostic
     }
     let working_syntax = SyntaxDocument::parse(working_source)
     let mut layout_tokens = normalize_trailing_commas(working_syntax.lossless_tokens(), effective)
-    let mut formatted = format_tokens(layout_tokens, effective)
+    let mut formatted = format_tokens(layout_tokens, effective, working_source)
+    // Validate each render before lexing its output as the next pass's input.
+    // Otherwise stabilization can replace the baseline and hide a token merge.
+    if !same_significant_tokens(layout_tokens, SyntaxDocument::parse(formatted).lossless_tokens()) {
+        ret formatter_invariant_result(source)
+    }
     // A multiline grouped import becomes one logical line above. Reorder once
     // more on that canonical representation so the first formatter pass is
     // already a fixed point.
@@ -298,7 +304,10 @@ pub fn format_syntax(syntax: SyntaxDocument, diagnostics: Vec[FrontendDiagnostic
         if canonical_imports != formatted {
             let canonical_syntax = SyntaxDocument::parse(canonical_imports)
             layout_tokens = normalize_trailing_commas(canonical_syntax.lossless_tokens(), effective)
-            formatted = format_tokens(layout_tokens, effective)
+            formatted = format_tokens(layout_tokens, effective, canonical_imports)
+            if !same_significant_tokens(layout_tokens, SyntaxDocument::parse(formatted).lossless_tokens()) {
+                ret formatter_invariant_result(source)
+            }
         }
     }
     // Rendering may introduce a line break at the configured width, turning a
@@ -307,23 +316,24 @@ pub fn format_syntax(syntax: SyntaxDocument, diagnostics: Vec[FrontendDiagnostic
     // pass already reaches the same fixed point as the next pass.
     let stabilized_syntax = SyntaxDocument::parse(formatted)
     let stabilized_tokens = normalize_trailing_commas(stabilized_syntax.lossless_tokens(), effective)
-    let stabilized = format_tokens(stabilized_tokens, effective)
+    let stabilized = format_tokens(stabilized_tokens, effective, formatted)
     if stabilized != formatted {
         layout_tokens = stabilized_tokens
         formatted = stabilized
     }
     let formatted_syntax = SyntaxDocument::parse(formatted)
     if !same_significant_tokens(layout_tokens, formatted_syntax.lossless_tokens()) {
-        let mut invariant = Vec[FrontendDiagnostic]::new()
-        invariant.push(FrontendDiagnostic::new(1_usize, "formatter-invariant", "formatting changed the significant token stream",
-                0_usize, 0_usize, 1_usize,))
-        ret FormatResult {
-            source, false, invariant
-        }
+        ret formatter_invariant_result(source)
     }
     ret FormatResult {
         formatted, formatted != source, Vec[FrontendDiagnostic]::new()
     }
+}
+
+fn formatter_invariant_result(source: str) -> FormatResult {
+    let mut diagnostics = Vec[FrontendDiagnostic]::new()
+    diagnostics.push(FrontendDiagnostic::new(1, "formatter-invariant", "formatting changed the significant token stream", 0, 0, 1))
+    ret FormatResult { source, false, diagnostics }
 }
 
 fn formatter_syntax_diagnostics(diagnostics: Vec[FrontendDiagnostic]) -> Vec[FrontendDiagnostic] {
@@ -337,11 +347,82 @@ fn formatter_syntax_diagnostics(diagnostics: Vec[FrontendDiagnostic]) -> Vec[Fro
     ret out
 }
 
-fn format_tokens(tokens: Vec[Token], config: FormatConfig) -> str {
+fn format_tokens(tokens: Vec[Token], config: FormatConfig, source: str) -> str {
     let mut state = FormatState::new()
     let mut source_breaks = 0_usize
+    let layout = source_layout_tokens(source)
+    let mut layout_index = 0_usize
+    let mut token_index = 0_usize
+    let mut previous_role = SourceLayoutRole::Ordinary
+    let mut placement_is_generic = false
+    let mut inline_braces = Vec[bool]::new()
+    let mut interpolation_prefix = false
 
     for token in tokens {
+        let current_index = token_index
+        token_index += 1
+        // The parser recognizes an identifier `f` followed by a string as one
+        // interpolated expression. Keep the literal adjacent to its prefix,
+        // including when repairing whitespace introduced by older formatters.
+        let interpolation_literal = interpolation_prefix && token.type == TokenType::STRING
+        if token.type != TokenType::WHITESPACE && token.type != TokenType::NEWLINE {
+            interpolation_prefix = token.type == TokenType::IDENTIFIER && token.value == "f"
+        }
+        let mut role = SourceLayoutRole::Ordinary
+        while layout_index < layout.len() {
+            match layout.get(layout_index) {
+                Some(position) => {
+                    if position.line > token.line ||(position.line == token.line && position.column > token.column) {
+                        break
+                    }
+                    layout_index += 1
+                    if token.line == position.line && token.column == position.column {
+                        role = position.role
+                        break
+                    }
+                }
+                None => {
+                    break
+                }
+            }
+        }
+        if role == SourceLayoutRole::FieldStart || role == SourceLayoutRole::EnumVariantStart {
+            state.request_break(1)
+        } elif role == SourceLayoutRole::ImplStart {
+            state.request_break(2)
+        }
+        let preceding_role = previous_role
+        if !trivia(token.type) {
+            previous_role = role
+        }
+        if role == SourceLayoutRole::PlacementOpen || role == SourceLayoutRole::PlacementName
+        || role == SourceLayoutRole::PlacementClose || role == SourceLayoutRole::TypeSuffix {
+            if role == SourceLayoutRole::PlacementOpen {
+                placement_is_generic = state.has_previous && state.previous == TokenType::RIGHT_BRACKET
+            }
+            if token.type == TokenType::ASTERISK && state.has_previous && state.previous == TokenType::ASTERISK {
+                // Two pointer suffix tokens must not become the power operator.
+                state.request_space()
+            } else {
+                state.trim_space()
+            }
+            state.write(token.value, config)
+            state.remember(token.type)
+            continue
+        }
+        if role == SourceLayoutRole::TypePrefix {
+            state.write(token.value, config)
+            state.remember(token.type)
+            continue
+        }
+        if preceding_role == SourceLayoutRole::TypePrefix && !trivia(token.type) {
+            state.trim_space()
+        }
+        // EOF carries a cursor position, not printable source. Flushing pending
+        // line breaks for its empty value would grow trailing blank lines.
+        if token.type == TokenType::EOF {
+            break
+        }
         if token.type == TokenType::WHITESPACE {
             if state.grouped_import_depth == 0_usize || !state.has_previous
             || state.previous != TokenType::LEFT_BRACE {
@@ -393,12 +474,21 @@ fn format_tokens(tokens: Vec[Token], config: FormatConfig) -> str {
                 state.grouped_import_depth += 1_usize
                 state.remember(token.type)
                 continue
+            }
+            let inline = role == SourceLayoutRole::ConstructorOpen && inline_constructor(tokens, current_index, config)
+            inline_braces.push(inline)
+            if inline && preceding_role == SourceLayoutRole::PlacementClose && !placement_is_generic {
+                state.trim_space()
             } else {
                 state.request_space()
             }
             state.write("{", config)
-            state.depth += 1_usize
-            state.request_break(1_usize)
+            if inline {
+                state.request_space()
+            } else {
+                state.depth += 1_usize
+                state.request_break(1_usize)
+            }
             state.remember(token.type)
             continue
         }
@@ -407,6 +497,16 @@ fn format_tokens(tokens: Vec[Token], config: FormatConfig) -> str {
                 state.trim_space()
                 state.write("}", config)
                 state.grouped_import_depth -= 1_usize
+                state.remember(token.type)
+                continue
+            }
+            if inline_braces.pop().unwrap_or(false) {
+                if state.previous == TokenType::LEFT_BRACE {
+                    state.trim_space()
+                } else {
+                    state.request_space()
+                }
+                state.write("}", config)
                 state.remember(token.type)
                 continue
             }
@@ -466,6 +566,12 @@ fn format_tokens(tokens: Vec[Token], config: FormatConfig) -> str {
             state.remember(token.type)
             continue
         }
+        if token.type == TokenType::ASTERISK && state.has_previous && state.previous == TokenType::SCOPE {
+            state.trim_space()
+            state.write(token.value, config)
+            state.remember(token.type)
+            continue
+        }
         if binary_operator(token.type) || token.type == TokenType::ARROW || token.type == TokenType::FAT_ARROW
         || token.type == TokenType::ASSIGN {
             state.request_space()
@@ -481,13 +587,50 @@ fn format_tokens(tokens: Vec[Token], config: FormatConfig) -> str {
                 state.request_space()
             }
         }
-        if needs_implicit_space(state, token.type) {
+        if interpolation_literal {
+            state.pending_breaks = 0_usize
+            state.trim_space()
+        } elif needs_implicit_space(state, token.type) {
             state.request_space()
         }
         state.write(token.value, config)
         state.remember(token.type)
     }
     ret state.finish(config)
+}
+
+// The compiler parser classifies punctuation: names and whitespace cannot tell
+// type placement from comparison or a node handle from a bitwise operation.
+fn source_layout_tokens(source: str) -> Vec[SourceLayoutToken] {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new().with_source_layout()
+    let _report = parser.parse_recovering(lexer.tokenize(source))
+    ret parser.source_layout_tokens()
+}
+
+// Keep short, single-line positional constructors inline. Nested braces,
+// comments, or explicit newlines retain vertical layout instead of collapsing
+// a block or detaching a comment. Each scan stops at the first nested brace.
+fn inline_constructor(tokens: Vec[Token], opening: usize, config: FormatConfig) -> bool {
+    let mut index = opening + 1
+    while index < tokens.len() {
+        match tokens.get(index) {
+            Some(token) => {
+                if token.type == TokenType::RIGHT_BRACE {
+                    ret token.column + 1 <= config.line_width
+                }
+                if token.type == TokenType::LEFT_BRACE || token.type == TokenType::NEWLINE
+                || comment_token(token.type) || token.type == TokenType::EOF {
+                    ret false
+                }
+            }
+            None => {
+                ret false
+            }
+        }
+        index += 1
+    }
+    ret false
 }
 
 fn normalize_trailing_commas(tokens: Vec[Token], config: FormatConfig) -> Vec[Token] {
@@ -595,49 +738,256 @@ fn format_comment(value: str, typ: TokenType, config: FormatConfig) -> str {
     ret marker + " " + body
 }
 
-fn reorder_import_source(source: str) -> str {
-    let mut lines = split_source_lines(source)
-    let mut index = 0_usize
-    while index < lines.len() {
-        if !import_line(lines.get(index).unwrap_or("")) {
-            index += 1_usize continue
+struct FormatImport {
+    parent: str
+    members: Vec[str]
+    is_public: bool
+}
+
+fn sort_import_text(values: mut Vec[str]) ->() {
+    let mut index = 1_usize
+    while index < values.len() {
+        let value = values.get(index).unwrap_or("")
+        let mut at = index
+        while at > 0_usize && text_less(value, values.get(at - 1_usize).unwrap_or("")) {
+            values.set(at, values.get(at - 1_usize).unwrap_or(""))
+            at -= 1_usize
         }
-        let start = index
-        while index < lines.len() && import_line(lines.get(index).unwrap_or("")) {
-            index += 1_usize
-        }
-        let end = index
-        let mut left = start + 1_usize
-        while left < end {
-            let value = lines.get(left).unwrap_or("")
-            let mut cursor = left
-            while cursor > start {
-                let previous = lines.get(cursor - 1_usize).unwrap_or("")
-                if !text_less(value, previous) {
-                    break
-                }
-                lines.set(cursor, previous)
-                cursor -= 1_usize
-            }
-            lines.set(cursor, value)
-            left += 1_usize
-        }
-    }
-    let mut out = ""
-    index = 0_usize
-    while index < lines.len() {
-        if index > 0_usize {
-            out += "\n"
-        }
-        out += lines.get(index).unwrap_or("")
+        values.set(at, value)
         index += 1_usize
     }
-    if source.len() > 0_usize &&(source.slice(source.len() - 1_usize, 1_usize) == "\n") {
-        out += "\n"
+}
+// Flatten only syntax, retaining every original path, alias and duplicate.
+fn append_import_paths(path: str, paths: mut Vec[str]) ->() {
+    let opening = path.find_from("::{", 0_usize)
+    if opening == path.byte_len() {
+        paths.push(path) ret()
+    }
+    let parent = path.slice_bytes(0_usize, opening)
+    let mut start = opening + 3_usize
+    let mut index = start
+    let mut depth = 0_usize
+    while index < path.byte_len() {
+        let ch = path.slice_bytes(index, 1_usize)
+        if (ch == "," || ch == "}") && depth == 0_usize {
+            let item = trim_import_text(path.slice_bytes(start, index - start))
+            if item != "" {
+                append_import_paths(parent + "::" + item, paths)
+            }
+            start = index + 1_usize
+            if ch == "}" {
+                break
+            }
+        } elif ch == "{" {
+            depth += 1_usize
+        } elif ch == "}" {
+            depth -= 1_usize
+        }
+        index += 1_usize
+    }
+}
+fn trim_import_text(value: str) -> str {
+    let trimmed = trim_left(value)
+    let mut end = trimmed.char_len()
+    while end > 0_usize &&(trimmed.slice(end - 1_usize, 1_usize) == " "
+        || trimmed.slice(end - 1_usize, 1_usize) == "\t") {
+        end -= 1_usize
+    }
+    ret trimmed.slice(0_usize, end)
+}
+fn import_group(path: str) -> usize {
+    let scope = path.find_from("::", 0_usize)
+    let alias = path.find_from(" as ", 0_usize)
+    let end = if scope < alias {
+        scope
+    } else {
+        alias
+    }
+    let root = path.slice_bytes(0_usize, end)
+    if root == "core" {
+        ret 0_usize
+    }
+    if root == "std" {
+        ret 1_usize
+    }
+    if root == "mod" || root == "refrain" {
+        ret 3_usize
+    }
+    ret 2_usize
+}
+fn import_text(record: FormatImport) -> str {
+    let prefix = if record.is_public {
+        "pub import "
+    } else {
+        "import "
+    }
+    let parent = if record.parent == "" {
+        ""
+    } else {
+        record.parent + "::"
+    }
+    if record.members.len() == 1_usize {
+        ret prefix + parent + record.members.get(0_usize).unwrap_or("")
+    }
+    let mut text = prefix + parent + "{"
+    let mut index = 0_usize
+    for member in record.members {
+        if index > 0_usize {
+            text += ", "
+        }
+        text += member
+        index += 1_usize
+    }
+    ret text + "}"
+}
+fn import_key(record: FormatImport) -> str {
+    let parent = if record.parent == "" {
+        ""
+    } else {
+        record.parent + "::"
+    }
+    ret parent + record.members.get(0_usize).unwrap_or("")
+}
+fn organize_import_block(lines: Vec[str]) -> Vec[str] {
+    let mut records = Vec[FormatImport]::new()
+    for line in lines {
+        let mut lexer = Lexer::new()
+        let mut parser = Parser::new()
+        let parsed = parser.parse_recovering(lexer.tokenize(line))
+        if parsed.failures.len() > 0_usize {
+            ret lines
+        }
+        for statement in parsed.statements {
+            match statement {
+                Statement::Import(item) => {
+                    // Group-wide aliases and empty groups cannot be flattened
+                    // into independent selections without changing syntax.
+                    if item.path.contains("} as ") || item.path.contains("{}") {
+                        ret lines
+                    }
+
+                    let mut paths = Vec[str]::new()
+                    append_import_paths(item.path, paths)
+                    for path in paths {
+                        let mut separator = path.byte_len()
+                        let mut index = 0_usize
+                        // Alias identifiers never contain a scope separator.
+                        while index + 1_usize < path.byte_len() {
+                            if path.slice_bytes(index, 2_usize) == "::" {
+                                separator = index
+                            }
+                            index += 1_usize
+                        }
+                        let parent = if separator == path.byte_len() {
+                            ""
+                        } else {
+                            path.slice_bytes(0_usize, separator)
+                        }
+                        let member = if parent == "" {
+                            path
+                        } else {
+                            path.slice_bytes(separator + 2_usize, path.byte_len() - separator - 2_usize)
+                        }
+                        let mut merged = false
+                        if parent != "" && member != "*" {
+                            for record in records {
+                                if record.parent == parent && record.is_public == item.is_public
+                                && record.members.get(0_usize).unwrap_or("") != "*" {
+                                    let mut members = record.members
+                                    members.push(member)
+                                    merged = true break
+                                }
+                            }
+                        }
+                        if !merged {
+                            let mut members = Vec[str]::new()
+                            members.push(member)
+                            records.push(FormatImport { parent, members, item.is_public })
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    for record in records {
+        let mut members = record.members
+        sort_import_text(members)
+    }
+    let mut index = 1_usize
+    while index < records.len() {
+        let record = records.get(index).unwrap_or(FormatImport { "", Vec[str]::new(), false })
+        let group = import_group(import_key(record))
+        let mut at = index
+        while at > 0_usize {
+            let previous = records.get(at - 1_usize).unwrap_or(record)
+            let previous_group = import_group(import_key(previous))
+            if group > previous_group ||(group == previous_group && !text_less(import_key(record), import_key(previous))) {
+                break
+            }
+            records.set(at, previous)
+            at -= 1_usize
+        }
+        records.set(at, record)
+        index += 1_usize
+    }
+    let mut out = Vec[str]::new()
+    let mut previous_group = 4_usize
+    for record in records {
+        let group = import_group(import_key(record))
+        if previous_group != 4_usize && group != previous_group {
+            out.push("")
+        }
+        out.push(import_text(record))
+        previous_group = group
     }
     ret out
 }
-
+fn import_attachment(line: str) -> bool {
+    let text = trim_left(line)
+    ret starts_with(text, "//") || starts_with(text, "/*") || starts_with(text, "*")
+    || starts_with(text, "#")
+}
+fn reorder_import_source(source: str) -> str {
+    let lines = split_source_lines(source)
+    let mut out = Vec[str]::new()
+    let mut index = 0_usize
+    while index < lines.len() {
+        let line = lines.get(index).unwrap_or("")
+        let attached = index > 0_usize && import_attachment(lines.get(index - 1_usize).unwrap_or(""))
+        if !import_line(line) || attached {
+            out.push(line) index += 1_usize continue
+        }
+        let mut block = Vec[str]::new()
+        loop {
+            block.push(lines.get(index).unwrap_or(""))
+            index += 1_usize
+            let mut next = index
+            while next < lines.len() && trim_import_text(lines.get(next).unwrap_or("")) == "" {
+                next += 1_usize
+            }
+            if next == lines.len() || !import_line(lines.get(next).unwrap_or("")) {
+                break
+            }
+            index = next
+        }
+        out.extend(organize_import_block(block))
+    }
+    let mut text = ""
+    index = 0_usize
+    for line in out {
+        if index > 0_usize {
+            text += "\n"
+        }
+        text += line
+        index += 1_usize
+    }
+    if source.byte_len() > 0_usize && source.slice_bytes(source.byte_len() - 1_usize, 1_usize) == "\n" {
+        text += "\n"
+    }
+    ret text
+}
 fn split_source_lines(source: str) -> Vec[str] {
     let mut out = Vec[str]::new()
     let mut current = ""
@@ -665,7 +1015,29 @@ fn import_line(line: str) -> bool {
     // Import reordering is a module-level operation. Indented text can be a
     // token inside a multiline grouped import (or a function body) and must
     // never be lifted or sorted as an independent declaration.
-    ret starts_with(line, "import ") || starts_with(line, "pub import ")
+    if !starts_with(line, "import ") && !starts_with(line, "pub import ") {
+        ret false
+    }
+    // The sorter moves complete records, never opening lines of grouped
+    // imports. Layout compacts those groups first; the stabilization pass can
+    // then sort their complete single-line declarations safely. Comments and
+    // quoted fragments are barriers rather than guessed structural braces.
+    if line.contains("//") || line.contains("/*") || line.contains("\"") || line.contains("'") {
+        ret false
+    }
+    let mut depth = 0_usize
+    for index in 0..line.len() {
+        let character = line.slice(index, 1)
+        if character == "{" {
+            depth += 1
+        } elif character == "}" {
+            if depth == 0 {
+                ret false
+            }
+            depth -= 1
+        }
+    }
+    ret depth == 0
 }
 
 fn trim_left(value: str) -> str {
@@ -780,7 +1152,7 @@ fn needs_implicit_space(state: FormatState, current: TokenType) -> bool {
 
 fn word_token(typ: TokenType) -> bool {
     ret typ == TokenType::IDENTIFIER || typ == TokenType::INTEGER || typ == TokenType::FLOAT || typ ==
-    TokenType::BOOLEAN || typ == TokenType::STRING
+    TokenType::BOOLEAN || typ == TokenType::STRING || typ == TokenType::RIGHT_BRACE
     || keyword(typ) || typ == TokenType::RIGHT_PAREN || typ == TokenType::RIGHT_BRACKET
 }
 

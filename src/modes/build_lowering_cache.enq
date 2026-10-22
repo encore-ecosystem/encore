@@ -1,0 +1,148 @@
+import mod::cache_policy::touch_cache
+//! Verified lowered module fragments with independent content identities.
+import core::option::Option
+import core::result::Result
+
+import std::os::{file_exists, file_sha256, mkdir_all, read_file, remove_file}
+import std::path::Path
+import std::vec::Vec
+
+import json::{Json, parse, stringify}
+
+import mod::build_cache::{UnitCacheLock, close_unit_cache_lock, try_unit_cache_lock}
+import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::translator::CachedFunctionChunk
+
+extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
+
+pub fn restore_lowered_module(cache: Option[Path], key: str) -> Result[Option[str], str] {
+    let root = match cache {
+        Some(value) => value.join("lowering-v1") None => {
+            ret Result[Option[str], str]::Ok(Option[str]::None)
+        }
+    }
+    let lock = match try_unit_cache_lock(root, key)? {
+        Some(value) => value
+        None => {
+            ret Result[Option[str], str]::Ok(Option[str]::None)
+        }
+    }
+    let expected = read_file(lock.directory.join("commit").as_str())
+    let path = lock.directory.join("payload")
+    let text = read_file(path.as_str())
+    let valid = !text.is_empty() && expected.byte_len() == 64 &&
+    file_sha256(path.as_str()) == expected && compiler_content_digest(text) == expected
+    if valid {
+        touch_cache(lock.directory)
+    }
+    close_unit_cache_lock(lock)
+    ret Result[Option[str], str]::Ok(if valid {
+            Option[str]::Some(text)
+        } else {
+            Option[str]::None
+        }
+    )
+}
+
+pub fn commit_lowered_module(cache: Option[Path], key: str, text: str) -> Result[(), str] {
+    let root = match cache {
+        Some(value) => value.join("lowering-v1") None => {
+            ret Result[(), str]::Ok(())
+        }
+    }
+    let lock = match try_unit_cache_lock(root, key)? {
+        Some(value) => value
+        None => {
+            ret Result[(), str]::Ok(())
+        }
+    }
+    let result = publish_lowered_module(lock, text)
+    if result.is_ok() {
+        touch_cache(lock.directory)
+    }
+    close_unit_cache_lock(lock)
+    ret result
+}
+
+#attr(safe)
+fn publish_lowered_module(lock: UnitCacheLock, text: str) -> Result[(), str] {
+    if text.is_empty() || mkdir_all(lock.directory.as_str()) != 0 {
+        ret Result[(), str]::Err("cannot create lowering cache entry")
+    }
+    let marker = lock.directory.join("commit")
+    if file_exists(marker.as_str()) && remove_file(marker.as_str()) != 0 {
+        ret Result[(), str]::Err("cannot invalidate lowering cache entry")
+    }
+    let payload = lock.directory.join("payload")
+    let digest = compiler_content_digest(text)
+    if !unsafe {
+        encore_compiler_write_atomic(payload.as_str(), text)
+    }
+    ||
+    file_sha256(payload.as_str()) != digest ||
+    !unsafe {
+        encore_compiler_write_atomic(marker.as_str(), digest)
+    }
+    {
+        ret Result[(), str]::Err("cannot commit lowering cache entry")
+    }
+    ret Result[(), str]::Ok(())
+}
+
+pub fn restore_lowered_function(cache: Option[Path], context: str, key: str) -> Result[Option[CachedFunctionChunk], str] {
+    let identity = compiler_content_digest("encore-lowered-function-1\n" + context + "\n" + key)
+    let payload = match restore_lowered_module(cache, identity)? {
+        Some(value) => value
+        None => {
+            ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::None)
+        }
+    }
+    let record = match parse(payload) {
+        Ok(value) => value
+        Err(_) => {
+            ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::None)
+        }
+    }
+    if record.get("key").unwrap_or(Json::Null).as_str().unwrap_or("") != key {
+        ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::None)
+    }
+    let body = record.get("body").unwrap_or(Json::Null).as_str().unwrap_or("")
+    if body.is_empty() {
+        ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::None)
+    }
+    let helpers = match record.get("helpers").unwrap_or(Json::Null).as_array() {
+        Some(value) => value
+        None => {
+            ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::None)
+        }
+    }
+    let mut declarations = Vec[str]::new()
+    for helper in helpers {
+        match helper.as_str() {
+            Some(value) => {
+                declarations.push(value)
+            }
+            None => {
+                ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::None)
+            }
+        }
+    }
+    ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::Some(CachedFunctionChunk {
+                key, body, declarations
+            }
+            ,
+        ))
+}
+
+pub fn commit_lowered_function(cache: Option[Path], context: str, function: CachedFunctionChunk) -> Result[(), str] {
+    let mut helpers = Vec[Json]::new()
+    for declaration in function.declarations {
+        helpers.push(Json::String(declaration))
+    }
+    let mut record = Vec[(str, Json)]::new()
+    record.push(("key", Json::String(function.key)))
+    record.push(("body", Json::String(function.text)))
+    record.push(("helpers", Json::Array(helpers)))
+    ret commit_lowered_module(cache, compiler_content_digest("encore-lowered-function-1\n" + context + "\n" + function.key),
+        stringify(Json::Object(record)),)
+}

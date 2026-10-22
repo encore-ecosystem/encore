@@ -1,0 +1,740 @@
+//! Bounded shared caches and leased, disposable compiler workspaces.
+import core::fmt::Debug
+import core::ops::ContextManager
+import core::option::Option
+import core::panic::panic
+import core::result::Result
+
+import std::fs::File
+import std::io::eprintln
+import std::os::{env, home_dir, mkdir_all, read_dir, read_file, remove_dir_all, write_file}
+import std::path::Path
+import std::time::{perf_counter_ns, time_ms}
+import std::vec::Vec
+
+import argparse::{process_arg, process_arg_count}
+import json::{Json, parse, stringify}
+
+extern fn encore_compiler_cache_file_fact(path: str, field: u32) -> u64
+extern fn encore_compiler_cache_lock_open(path: str) -> usize
+extern fn encore_compiler_cache_lock_try(handle: usize) -> i32
+extern fn encore_compiler_cache_lock_shared(handle: usize) -> i32
+extern fn encore_compiler_cache_lock_close(handle: usize) ->()
+extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
+extern fn encore_compiler_process_id() -> u64
+
+pub struct CacheEntry {
+    directory: str
+    bytes: u64
+    used: u64
+    category: str
+}
+pub struct CacheUsage {
+    entries: Vec[CacheEntry]
+    bytes: u64
+}
+pub struct PruneResult {
+    before: u64
+    after: u64
+    removed: u64
+    busy: u64
+}
+
+pub fn cache_root() -> Path {
+    ret Path::new(env("ENCORE_BUILD_CACHE").unwrap_or(home_dir() + "/.cache/encore/units-v1")).expanduser().resolve()
+}
+
+/// Integers with optional B, MiB or GiB suffix; overflow is an error.
+pub fn parse_cache_size(text: str) -> Result[u64, str] {
+    let mut digits = text
+    let mut factor = 1_u64
+    for suffix in vec!["GiB", "MiB", "B"] {
+        if text.char_len() >= suffix.char_len() && text.slice(text.char_len() - suffix.char_len(), suffix.char_len()) == suffix {
+            digits = text.slice(0_usize, text.char_len() - suffix.char_len())
+            factor = if suffix == "GiB" {
+                1073741824_u64
+            } elif suffix == "MiB" {
+                1048576_u64
+            } else {
+                1_u64
+            }
+            break
+        }
+    }
+    let number = decimal(digits)?
+    if number > 18446744073709551615_u64 / factor {
+        ret Result::Err("cache size overflows u64")
+    }
+    ret Result::Ok(number * factor)
+}
+
+fn decimal(text: str) -> Result[u64, str] {
+    if text == "" {
+        ret Result::Err("cache size requires a nonnegative integer and optional B, MiB or GiB")
+    }
+    let mut value = 0_u64
+    for index in 0_usize..text.byte_len() {
+        let byte = text.byte_at(index)
+        if byte < 48_u8 || byte > 57_u8 {
+            ret Result::Err("invalid cache size")
+        }
+        let digit =(byte - 48_u8) as u64
+        if value >(18446744073709551615_u64 - digit) / 10_u64 {
+            ret Result::Err("cache size overflows u64")
+        }
+        value = value * 10_u64 + digit
+    }
+    ret Result::Ok(value)
+}
+
+pub fn cache_limit(override_size: str) -> Result[u64, str] {
+    ret parse_cache_size(if override_size != "" {
+            override_size
+        } else {
+            env("ENCORE_BUILD_CACHE_MAX_SIZE").unwrap_or("20GiB")
+        }
+    )
+}
+
+#attr(safe)
+pub fn file_fact(path: Path, field: u32) -> u64 {
+    ret file_fact_raw(path.as_str(), field)
+}
+
+#attr(safe)
+fn file_fact_raw(path: str, field: u32) -> u64 {
+    unsafe {
+        ret encore_compiler_cache_file_fact(path, field)
+    }
+}
+
+#attr(safe)
+pub fn atomic(path: Path, value: str) -> bool {
+    unsafe {
+        ret encore_compiler_write_atomic(path.as_str(), value)
+    }
+}
+
+#attr(safe)
+pub fn open_lock(path: Path, shared: bool) -> usize {
+    ret open_lock_raw(path.as_str(), shared)
+}
+
+#attr(safe)
+fn open_lock_raw(path: str, shared: bool) -> usize {
+    let handle = unsafe {
+        encore_compiler_cache_lock_open(path)
+    }
+    if handle == 0_usize {
+        ret 0_usize
+    }
+    let result = if shared {
+        unsafe {
+            encore_compiler_cache_lock_shared(handle)
+        }
+    } else {
+        unsafe {
+            encore_compiler_cache_lock_try(handle)
+        }
+    }
+    if result != 1_i32 {
+        close_lock(handle) ret 0_usize
+    }
+    ret handle
+}
+
+#attr(safe)
+pub fn close_lock(handle: usize) ->() {
+    if handle != 0_usize {
+        unsafe {
+            encore_compiler_cache_lock_close(handle)
+        }
+    }
+}
+
+/// Call while the cache entry's existing exclusive lock is held.
+pub fn touch_cache(directory: Path) ->() {
+    if file_fact(directory, 0_u32) == 2_u64 {
+        let _written = write_file((directory / ".last-used").as_str(), Debug::fmt(time_ms()))
+    }
+}
+
+pub fn measure_tree(directory: Path) -> u64 {
+    ret measure_tree_raw(directory.as_str())
+}
+
+fn measure_tree_raw(directory: str) -> u64 {
+    let kind = file_fact_raw(directory, 0_u32)
+    if kind == 1_u64 {
+        ret file_fact_raw(directory, 1_u32)
+    }
+    if kind != 2_u64 {
+        ret 0_u64
+    }
+    let mut bytes = 0_u64
+    for name in read_dir(directory) {
+        if name != "." && name != ".." {
+            bytes += measure_tree_raw(directory + "/" + name)
+        }
+    }
+    ret bytes
+}
+
+fn key_name(name: str) -> bool {
+    if name.byte_len() != 64_usize {
+        ret false
+    }
+    for i in 0_usize..64_usize {
+        let byte = name.byte_at(i)
+        if !(byte >= 48_u8 && byte <= 57_u8) && !(byte >= 97_u8 && byte <= 102_u8) {
+            ret false
+        }
+    }
+    ret true
+}
+
+fn entry_category(directory: str, category: str) -> str {
+    if category != "units" {
+        if file_fact_raw(directory + "/commit", 0_u32) == 1_u64 {
+            ret category
+        }
+        ret ""
+    }
+    if file_fact_raw(directory + "/unit.complete", 0_u32) == 1_u64 {
+        ret "native"
+    }
+    if file_fact_raw(directory + "/unit.backend", 0_u32) == 1_u64 {
+        ret "prepared"
+    }
+    if file_fact_raw(directory + "/unit.frontend", 0_u32) == 1_u64 {
+        ret "frontend"
+    }
+    ret ""
+}
+
+pub fn cache_usage(root: Path) -> CacheUsage {
+    let root = root.as_str()
+    let mut entries = Vec[CacheEntry]::new()
+    let mut bytes = 0_u64
+    if file_fact_raw(root, 0_u32) != 2_u64 {
+        ret CacheUsage { entries, bytes }
+    }
+    for category in vec!["units", "lowering-v1", "objects-v1"] {
+        let base = if category == "units" {
+            root
+        } else {
+            root + "/" + category
+        }
+        if file_fact_raw(base, 0_u32) != 2_u64 {
+            continue
+        }
+        for name in read_dir(base) {
+            if !key_name(name) {
+                continue
+            }
+            let directory = base + "/" + name
+            if file_fact_raw(directory, 0_u32) != 2_u64 {
+                continue
+            }
+            let kind = entry_category(directory, category)
+            if kind == "" {
+                continue
+            }
+            let mut used = decimal(read_file(directory + "/.last-used")).unwrap_or(0_u64)
+            let size = measure_tree_raw(directory)
+            if used == 0_u64 {
+                used = file_fact_raw(directory, 2_u32)
+                for receipt in vec!["unit.complete", "unit.ready", "unit.frontend", "commit"] {
+                    let stamp = file_fact_raw(directory + "/" + receipt, 2_u32)
+                    if stamp > used {
+                        used = stamp
+                    }
+                }
+            }
+            entries.push(CacheEntry { directory, size, used, kind })
+            bytes += size
+        }
+    }
+    ret CacheUsage { entries, bytes }
+}
+
+fn entry_at(entries: Vec[CacheEntry], index: usize) -> CacheEntry {
+    match entries.get(index) {
+        Some(value) => {
+            ret value
+        }
+        None => {
+            panic("invalid cache entry index") loop {
+            }
+        }
+    }
+}
+
+fn oldest_first(entries: Vec[CacheEntry]) -> Vec[CacheEntry] {
+    if entries.len() < 2_usize {
+        ret entries
+    }
+    let mut left = Vec[CacheEntry]::new()
+    let mut right = Vec[CacheEntry]::new()
+    let middle = entries.len() / 2_usize
+    for i in 0_usize..entries.len() {
+        if i < middle {
+            left.push(entry_at(entries, i))
+        } else {
+            right.push(entry_at(entries, i))
+        }
+    }
+    let a = oldest_first(left)
+    let b = oldest_first(right)
+    let mut out = Vec[CacheEntry]::new()
+    let mut i = 0_usize
+    let mut j = 0_usize
+    while i < a.len() || j < b.len() {
+        if j >= b.len() ||(i < a.len() && entry_at(a, i).used <= entry_at(b, j).used) {
+            out.push(entry_at(a, i)) i += 1_usize
+        } else {
+            out.push(entry_at(b, j)) j += 1_usize
+        }
+    }
+    ret out
+}
+
+/// Lock files live outside payload directories and must never be unlinked:
+/// another process may already hold or wait on that exact inode.
+pub fn prune_cache(root: Path, limit: u64, all: bool, dry: bool) -> PruneResult {
+    if file_fact(root, 0_u32) != 2_u64 {
+        ret PruneResult { 0_u64, 0_u64, 0_u64, 0_u64 }
+    }
+    let collector = if dry {
+        0_usize
+    } else {
+        open_lock(root / ".gc.lock", false)
+    }
+    if !dry && collector == 0_usize {
+        ret PruneResult { 0_u64, 0_u64, 0_u64, 1_u64 }
+    }
+    let usage = cache_usage(root)
+    let mut after = usage.bytes
+    let mut removed = 0_u64
+    let mut busy = 0_u64
+    let target = if all {
+        0_u64
+    } elif usage.bytes > limit {
+        limit - limit / 10_u64
+    } else {
+        limit
+    }
+    if !all && usage.bytes <= limit {
+        close_lock(collector) ret PruneResult {
+            usage.bytes, after, removed, busy
+        }
+    }
+    for entry in oldest_first(usage.entries) {
+        if after <= target {
+            break
+        }
+        let lock_path = entry.directory + ".lock"
+        // Read-only dry runs never create lock files or remove payloads.
+        if dry {
+            let probe = if file_fact_raw(lock_path, 0_u32) == 1_u64 {
+                open_lock_raw(lock_path, false)
+            } else {
+                0_usize
+            }
+            if file_fact_raw(lock_path, 0_u32) == 1_u64 && probe == 0_usize {
+                busy += 1_u64 continue
+            }
+            close_lock(probe)
+            after -= entry.bytes removed += entry.bytes continue
+        }
+        let handle = open_lock_raw(lock_path, false)
+        if handle == 0_usize {
+            busy += 1_u64 continue
+        }
+        // A writer may have refreshed the slot since the inventory was taken.
+        let used = decimal(read_file(entry.directory + "/.last-used")).unwrap_or(0_u64)
+        if used > entry.used {
+            close_lock(handle) continue
+        }
+        if file_fact_raw(entry.directory, 0_u32) == 2_u64 && remove_dir_all(entry.directory) == 0_i32 {
+            after -= entry.bytes removed += entry.bytes
+        }
+        close_lock(handle)
+    }
+    close_lock(collector)
+    ret PruneResult { usage.bytes, after, removed, busy }
+}
+
+pub fn keep_build_artifacts() -> bool {
+    if has_flag("--keep-build-artifacts") {
+        ret true
+    }
+    let legacy = env("ENCORE_KEEP_TEMPS").unwrap_or("")
+    ret legacy == "1" || legacy == "true"
+}
+
+pub fn has_flag(flag: str) -> bool {
+    for i in 2_usize..process_arg_count() {
+        let arg = process_arg(i).unwrap_or("")
+        if arg == "--" {
+            break
+        }
+        if arg == flag {
+            ret true
+        }
+    }
+    ret false
+}
+
+fn lease_path(directory: Path) -> Path {
+    ret directory.parent().unwrap_or(directory) / ".encore-leases" /(directory.name().unwrap_or("workspace") + ".lock")
+}
+
+/// The coordinator and workers hold shared leases. Collection requires an
+/// exclusive lease; PID reuse can never turn an active build into stale data.
+pub struct WorkspaceLease {
+    handle: usize
+}
+
+impl ContextManager for WorkspaceLease {
+    pub fn with_enter(self: Self) -> Self {
+        ret self
+    }
+    pub fn with_exit(self: Self) -> bool {
+        close_lock(self.handle) ret true
+    }
+}
+
+pub fn worker_workspace_lease(request: Path) -> Result[WorkspaceLease, str] {
+    let directory = request.parent().unwrap_or(request).parent().unwrap_or(request)
+    if file_fact(directory / ".encore-workspace.json", 0_u32) != 1_u64 {
+        ret Result::Ok(WorkspaceLease { 0_usize })
+    }
+    let handle = open_lock(lease_path(directory), true)
+    if handle == 0_usize {
+        ret Result::Err("build workspace is being collected")
+    }
+    ret Result::Ok(WorkspaceLease { handle })
+}
+
+pub struct BuildWorkspace {
+    directory: Path
+    handle: usize
+}
+
+impl for BuildWorkspace {
+    #attr(safe)
+    pub fn new(parent: Path, prefix: str) -> Result[Self, str] {
+        let _limit = cache_limit("")?
+        let id = prefix + "-" + Debug::fmt(unsafe {
+                encore_compiler_process_id()
+            }
+        ) + "-" + Debug::fmt(perf_counter_ns())
+        let directory = parent / id
+        if mkdir_all((parent / ".encore-leases").as_str()) != 0_i32 {
+            ret Result::Err("cannot create workspace lease directory")
+        }
+        let handle = open_lock(lease_path(directory), true)
+        if handle == 0_usize {
+            ret Result::Err("cannot acquire build workspace lease")
+        }
+        if mkdir_all(directory.as_str()) != 0_i32 {
+            close_lock(handle) ret Result::Err("cannot create build workspace")
+        }
+        let mut fields = Vec[(str, Json)]::new()
+        fields.push(("schema", Json::String("encore-build-workspace-1")))
+        fields.push(("path", Json::String(directory.as_str())))
+        fields.push(("retained", Json::Bool(keep_build_artifacts())))
+        if !atomic(directory / ".encore-workspace.json", stringify(Json::Object(fields))) {
+            close_lock(handle) ret Result::Err("cannot record build workspace ownership")
+        }
+        ret Result::Ok(Self { directory, handle })
+    }
+    pub fn complete(self: Self, success: bool, message: str) ->() {
+        let _saved = atomic(self.directory / ".outcome", if success {
+                "success"
+            } else {
+                "failure\n" + message
+            }
+            ,
+        )
+    }
+}
+
+impl ContextManager for BuildWorkspace {
+    pub fn with_enter(self: Self) -> Self {
+        ret self
+    }
+    pub fn with_exit(self: Self) -> bool {
+        close_lock(self.handle)
+        let _removed = collect_workspace(self.directory, false)
+        maintain_cache()
+        ret true
+    }
+}
+
+/// Throttle automatic inventory across all test workers and projects. Two GiB
+/// of hysteresis absorbs ordinary writes between checks; manual prune is immediate.
+pub fn maintain_cache() ->() {
+    let root = cache_root()
+    if file_fact(root, 0_u32) != 2_u64 {
+        ret()
+    }
+    let stamp = decimal(read_file((root / ".maintenance-last").as_str())).unwrap_or(0_u64)
+    let now = time_ms()
+    if now >= stamp && now - stamp < 60000_u64 {
+        ret()
+    }
+    let handle = open_lock(root / ".maintenance.lock", false)
+    if handle == 0_usize {
+        ret()
+    }
+    let updated = decimal(read_file((root / ".maintenance-last").as_str())).unwrap_or(0_u64)
+    if now >= updated && now - updated < 60000_u64 {
+        close_lock(handle) ret()
+    }
+    let _marked = write_file((root / ".maintenance-last").as_str(), Debug::fmt(now))
+    let limit = cache_limit("").unwrap_or(21474836480_u64)
+    let result = prune_cache(root, limit, false, false)
+    if result.after > limit {
+        eprintln("Cache remains above its limit; busy entries will be retried after another build.")
+    }
+    close_lock(handle)
+}
+
+fn workspace_record(directory: Path) -> Json {
+    if file_fact(directory, 0_u32) != 2_u64 {
+        ret Json::Null
+    }
+    let record = parse(read_file((directory / ".encore-workspace.json").as_str())).unwrap_or(Json::Null)
+    if record.get("schema").unwrap_or(Json::Null).as_str().unwrap_or("") != "encore-build-workspace-1" ||
+    record.get("path").unwrap_or(Json::Null).as_str().unwrap_or("") != directory.as_str() {
+        ret Json::Null
+    }
+    ret record
+}
+
+pub fn collect_workspace(directory: Path, dry: bool) -> u64 {
+    let record = workspace_record(directory)
+    if record.is_null() || record.get("retained").unwrap_or(Json::Bool(true)).as_bool().unwrap_or(true) {
+        ret 0_u64
+    }
+    if file_fact(lease_path(directory), 0_u32) != 1_u64 {
+        ret 0_u64
+    }
+    let handle = open_lock(lease_path(directory), false)
+    if handle == 0_usize {
+        ret 0_u64
+    }
+    let size = measure_tree(directory)
+    if dry {
+        close_lock(handle) ret size
+    }
+    if read_file((directory / ".outcome").as_str()) != "success" && !preserve_diagnostics(directory) {
+        eprintln("Cannot save build diagnostics; retained workspace: " + directory.as_str())
+        close_lock(handle) ret 0_u64
+    }
+    let removed = if remove_dir_all(directory.as_str()) == 0_i32 {
+        size
+    } else {
+        0_u64
+    }
+    close_lock(handle)
+    ret removed
+}
+
+pub fn project_root(start: Path) -> Option[Path] {
+    let mut path = Path::new(start.as_str())
+    loop {
+        if file_fact(path / "encore.toml", 0_u32) == 1_u64 {
+            ret Option::Some(path)
+        }
+        match path.parent() {
+            Some(parent) => {
+                if parent.as_str() == path.as_str() {
+                    break
+                }
+                path = parent
+            }
+            None => {
+                break
+            }
+        }
+    }
+    ret Option::None
+}
+
+/// Walk only compiler profile directories, never arbitrary nested snapshots.
+pub fn project_workspaces(project: Path) -> Vec[Path] {
+    let mut out = Vec[Path]::new()
+    let target = project / "target"
+    if file_fact(target, 0_u32) != 2_u64 {
+        ret out
+    }
+    for name in read_dir(target.as_str()) {
+        let path = target / name
+        if name == "dev" || name == "debug" || name == "release" || name == "extreme" || name == "tests" {
+            append_workspaces(path, out)
+        } elif name.contains("-") && file_fact(path, 0_u32) == 2_u64 {
+            for profile in vec!["dev", "debug", "release", "extreme"] {
+                append_workspaces(path / profile, out)
+            }
+        }
+    }
+    ret out
+}
+
+fn append_workspaces(parent: Path, out: mut Vec[Path]) ->() {
+    if file_fact(parent, 0_u32) != 2_u64 {
+        ret()
+    }
+    for name in read_dir(parent.as_str()) {
+        let path = parent / name
+        if !workspace_record(path).is_null() {
+            out.push(path)
+        }
+    }
+}
+
+pub fn sweep_project(project: Path, dry: bool) -> u64 {
+    let mut removed = 0_u64
+    for directory in project_workspaces(project) {
+        removed += collect_workspace(directory, dry)
+    }
+    ret removed
+}
+
+fn preserve_diagnostics(directory: Path) -> bool {
+    match project_root(directory) {
+        Some(project) => {
+            let base = project / "target" / "diagnostics"
+            let destination = base / directory.name().unwrap_or("build")
+            if mkdir_all(destination.as_str()) != 0_i32 {
+                ret false
+            }
+            let mut budget = vec![0_u64]
+            if !save_logs(directory, destination, "", budget) {
+                ret false
+            }
+            if !atomic(destination / ".encore-diagnostics", Debug::fmt(time_ms())) {
+                ret false
+            }
+            let mut entries = Vec[CacheEntry]::new()
+            let mut total = 0_u64
+            for name in read_dir(base.as_str()) {
+                let path = base / name
+                if file_fact(path / ".encore-diagnostics", 0_u32) != 1_u64 {
+                    continue
+                }
+                let size = measure_tree(path)
+                total += size
+                entries.push(CacheEntry {
+                        path.as_str(), size, decimal(read_file((path / ".encore-diagnostics").as_str())).unwrap_or(0_u64), "diagnostics"
+                    }
+                    ,
+                )
+            }
+            let mut count = entries.len()
+            for entry in oldest_first(entries) {
+                if entry.directory == destination.as_str() {
+                    continue
+                }
+                if count <= 10_usize && total <= 134217728_u64 {
+                    break
+                }
+                if remove_dir_all(entry.directory) == 0_i32 {
+                    count -= 1_usize total -= entry.bytes
+                }
+            }
+        }
+        None => {
+            ret false
+        }
+    }
+    ret true
+}
+
+fn save_logs(source: Path, destination: Path, prefix: str, budget: mut Vec[u64]) -> bool {
+    for name in read_dir(source.as_str()) {
+        let path = source / name
+        let kind = file_fact(path, 0_u32)
+        if kind == 2_u64 {
+            if !save_logs(path, destination, prefix + name + "_", budget) {
+                ret false
+            }
+        } elif kind == 1_u64 &&(name.contains(".stderr") || name.contains(".stdout") || name == ".outcome" ||
+            name == "timing.json" || name == "phases.json" || name == "preparation.json" || name == "lowering.json") {
+            // Bounded text only; never copy IR, sources, archives or objects.
+            let used = budget.get(0_usize).unwrap_or(0_u64)
+            if used >= 67108864_u64 {
+                ret atomic(destination / ".truncated", "Additional logs omitted; use --keep-build-artifacts for full output.\n")
+            }
+            let text = match diagnostic_text(path) {
+                Ok(value) => {
+                    value
+                }
+                Err(_) => {
+                    ret false
+                }
+            }
+            budget.set(0_usize, used + text.byte_len() as u64)
+            if !atomic(destination /(prefix + name), text) {
+                ret false
+            }
+        }
+    }
+    ret true
+}
+
+fn diagnostic_text(path: Path) -> Result[str, str] {
+    let file = match File::open(path.as_str()) {
+        Ok(value) => {
+            value
+        }
+        Err(_) => {
+            ret Result::Err("cannot open build log")
+        }
+    }
+    with file as stream {
+        let text = match stream.read(1048576_usize) {
+            Ok(value) => {
+                value
+            }
+            Err(_) => {
+                ret Result::Err("cannot read build log")
+            }
+        }
+        match stream.close() {
+            Ok(_) => {
+            }
+            Err(_) => {
+                ret Result::Err("cannot close build log")
+            }
+        }
+        ret Result::Ok(text + if file_fact(path, 1_u32) > 1048576_u64 {
+                "\n[truncated; use --keep-build-artifacts for full output]\n"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+pub fn workspace_state(directory: Path) -> str {
+    let record = workspace_record(directory)
+    if record.is_null() {
+        ret "unknown"
+    }
+    if record.get("retained").unwrap_or(Json::Bool(true)).as_bool().unwrap_or(true) {
+        ret "retained"
+    }
+    if file_fact(lease_path(directory), 0_u32) != 1_u64 {
+        ret "unavailable"
+    }
+    let handle = open_lock(lease_path(directory), false)
+    if handle == 0_usize {
+        ret "active"
+    }
+    close_lock(handle)
+    ret "stale"
+}

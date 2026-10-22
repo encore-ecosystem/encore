@@ -1,0 +1,611 @@
+//! Incremental, bounded HTTP/1.1 response framing. All byte interpretation is Encore.
+import core::result::Result
+import core::vec::Vec
+import std::http::errors::{HTTPError, HTTPErrorKind}
+import std::http::types::{HttpResponse, HttpHeader}
+
+extern fn encore_text_builder_new() -> usize
+extern fn encore_text_builder_append(builder: usize, value: str) ->()
+extern fn encore_text_builder_finish(builder: usize) -> str
+
+pub fn find(text: str, needle: str) -> usize {
+    let mut i = 0_usize
+    while i + needle.len() <= text.len() {
+        if text.slice(i, needle.len()) == needle {
+            ret i
+        }
+        i += 1_usize
+    }
+    ret text.len()
+}
+
+pub fn lower(text: str) -> str {
+    let upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    let lower = "abcdefghijklmnopqrstuvwxyz"
+    let mut out = ""
+    for i in 0_usize..text.len() {
+        let ch = text.slice(i, 1_usize)
+        let at = find(upper, ch)
+        out += if at < upper.len() {
+            lower.slice(at, 1_usize)
+        } else {
+            ch
+        }
+    }
+    ret out
+}
+
+pub fn trim(text: str) -> str {
+    let mut start = 0_usize
+    let mut end = text.len()
+    while start < end &&(text.byte_at(start) == 32_u8 || text.byte_at(start) == 9_u8) {
+        start += 1_usize
+    }
+    while end > start &&(text.byte_at(end - 1_usize) == 32_u8 || text.byte_at(end - 1_usize) == 9_u8) {
+        end -= 1_usize
+    }
+    ret text.slice(start, end - start)
+}
+
+fn protocol(message: str) -> HTTPError {
+    ret HTTPError { HTTPErrorKind::Protocol, message }
+}
+
+/// A body is stored in chunks and joined once, avoiding repeated whole-body copies.
+pub struct Decoder {
+    status: u16
+    headers: str
+    mode: u8
+    buffer: str
+    chunks: Vec[str]
+    body_size: usize
+    remaining: usize
+    crlf: usize
+    header_size: usize
+    max_body: usize
+    max_headers: usize
+    head: bool
+    informational: u8
+}
+
+impl for Decoder {
+    pub fn new(max_body: usize, max_headers: usize, head: bool) -> Self {
+        ret Self {
+            0_u16, "", 0_u8, "", Vec[str]::new(), 0_usize, 0_usize, 0_usize, 0_usize, max_body, max_headers, head, 0_u8
+        }
+    }
+
+    fn parse_headers(self: mut Self, raw: str) -> Result[bool, HTTPError] {
+        let end = find(raw, "\r\n")
+        let line = raw.slice(0_usize, end)
+        if line.len() < 12_usize ||(line.slice(0_usize, 9_usize) != "HTTP/1.1 " && line.slice(0_usize, 9_usize) != "HTTP/1.0 ") {
+            ret Result::Err(protocol("invalid HTTP status line"))
+        }
+        if line.len() > 12_usize && line.byte_at(12_usize) != 32_u8 {
+            ret Result::Err(protocol("invalid HTTP status line"))
+        }
+        let status = decimal(line.slice(9_usize, 3_usize))? as u16
+        if status < 100_u16 || status > 599_u16 {
+            ret Result::Err(protocol("invalid HTTP status"))
+        }
+        let mut length = 0_usize
+        let mut has_length = false
+        let mut chunked = false
+        let mut offset = end + 2_usize
+        while offset + 2_usize < raw.len() {
+            let rest = raw.slice(offset, raw.len() - offset)
+            let end = find(rest, "\r\n")
+            if end == 0_usize {
+                break
+            }
+            let line = rest.slice(0_usize, end)
+            let colon = find(line, ":")
+            if colon == 0_usize || colon == line.len() || !header_name(line.slice(0_usize, colon)) {
+                ret Result::Err(protocol("invalid HTTP header"))
+            }
+            let name = lower(line.slice(0_usize, colon))
+            let value = trim(line.slice(colon + 1_usize, line.len() - colon - 1_usize))
+            if !header_value(value) {
+                ret Result::Err(protocol("invalid HTTP header value"))
+            }
+            if name == "content-length" {
+                if has_length {
+                    ret Result::Err(protocol("duplicate Content-Length"))
+                }
+                has_length = true
+                length = decimal(value)?
+            }
+            if name == "transfer-encoding" {
+                if chunked || lower(value) != "chunked" {
+                    ret Result::Err(protocol("unsupported Transfer-Encoding"))
+                }
+                chunked = true
+            }
+            if name == "content-encoding" && lower(value) != "identity" {
+                ret Result::Err(protocol("unsupported Content-Encoding"))
+            }
+            offset += end + 2_usize
+        }
+        if chunked && has_length {
+            ret Result::Err(protocol("ambiguous response framing"))
+        }
+        if status < 200_u16 {
+            if status == 101_u16 || self.informational >= 8_u8 {
+                ret Result::Err(protocol("unsupported HTTP upgrade or too many interim responses"))
+            }
+            self.informational += 1_u8
+            self.mode = 0_u8
+            ret Result::Ok(true)
+        }
+        self.status = status
+        self.headers = raw
+        self.remaining = length
+        if self.head || status == 204_u16 || status == 304_u16 {
+            self.mode = 7_u8
+        } elif chunked {
+            self.mode = 3_u8
+        } elif has_length {
+            if length > self.max_body {
+                ret Result::Err(HTTPError {
+                        HTTPErrorKind::Limit, "response body exceeds limit"
+                    }
+                    ,
+                )
+            }
+            self.mode = if length == 0_usize {
+                7_u8
+            } else {
+                1_u8
+            }
+        } else {
+            self.mode = 2_u8
+        }
+        ret Result::Ok(true)
+    }
+
+    fn append(self: mut Self, data: str) -> Result[bool, HTTPError] {
+        if data.len() > self.max_body - self.body_size {
+            ret Result::Err(HTTPError {
+                    HTTPErrorKind::Limit, "response body exceeds limit"
+                }
+                ,
+            )
+        }
+        if data.len() > 0_usize {
+            self.chunks.push(data)
+        }
+        self.body_size += data.len()
+        ret Result::Ok(true)
+    }
+
+    /// Returns true once the complete response has been consumed.
+    pub fn feed(self: mut Self, input: str, eof: bool) -> Result[bool, HTTPError] {
+        let mut data = input
+        loop {
+            if self.mode == 7_u8 {
+                if data.len() != 0_usize {
+                    ret Result::Err(protocol("unexpected bytes after HTTP response"))
+                }
+                ret Result::Ok(true)
+            }
+            if data.len() == 0_usize {
+                break
+            }
+            if self.mode == 0_u8 {
+                self.buffer += data
+                let end = find(self.buffer, "\r\n\r\n")
+                if end == self.buffer.len() {
+                    if self.buffer.len() > self.max_headers - self.header_size {
+                        ret Result::Err(HTTPError {
+                                HTTPErrorKind::Limit, "HTTP headers exceed configured limit"
+                            }
+                            ,
+                        )
+                    }
+                    break
+                }
+                if end + 4_usize > self.max_headers - self.header_size {
+                    ret Result::Err(HTTPError {
+                            HTTPErrorKind::Limit, "HTTP headers exceed configured limit"
+                        }
+                        ,
+                    )
+                }
+                self.header_size += end + 4_usize
+                let raw = self.buffer.slice(0_usize, end + 4_usize)
+                data = self.buffer.slice(end + 4_usize, self.buffer.len() - end - 4_usize)
+                self.buffer = ""
+                let _parsed = self.parse_headers(raw)?
+                continue
+            }
+            if self.mode == 1_u8 || self.mode == 4_u8 {
+                let count = if data.len() < self.remaining {
+                    data.len()
+                } else {
+                    self.remaining
+                }
+                let _appended = self.append(data.slice(0_usize, count))?
+                data = data.slice(count, data.len() - count)
+                self.remaining -= count
+                if self.remaining == 0_usize {
+                    if self.mode == 1_u8 {
+                        self.mode = 7_u8
+                    } else {
+                        self.mode = 5_u8 self.crlf = 0_usize
+                    }
+                }
+                continue
+            }
+            if self.mode == 2_u8 {
+                let _appended = self.append(data)?
+                data = ""
+                break
+            }
+            if self.mode == 5_u8 {
+                let expected = if self.crlf == 0_usize {
+                    13_u8
+                } else {
+                    10_u8
+                }
+                if data.byte_at(0_usize) != expected {
+                    ret Result::Err(protocol("invalid chunk terminator"))
+                }
+                self.crlf += 1_usize
+                data = data.slice(1_usize, data.len() - 1_usize)
+                if self.crlf == 2_usize {
+                    self.mode = 3_u8
+                }
+                continue
+            }
+            self.buffer += data
+            let end = find(self.buffer, "\r\n")
+            if end == self.buffer.len() {
+                if self.buffer.len() > self.max_headers - self.header_size {
+                    ret Result::Err(HTTPError {
+                            HTTPErrorKind::Limit, "chunk metadata exceeds configured limit"
+                        }
+                        ,
+                    )
+                }
+                break
+            }
+            if end + 2_usize > self.max_headers - self.header_size {
+                ret Result::Err(HTTPError {
+                        HTTPErrorKind::Limit, "chunk metadata exceeds configured limit"
+                    }
+                    ,
+                )
+            }
+            self.header_size += end + 2_usize
+            let line = self.buffer.slice(0_usize, end)
+            data = self.buffer.slice(end + 2_usize, self.buffer.len() - end - 2_usize)
+            self.buffer = ""
+            if self.mode == 6_u8 {
+                if line == "" {
+                    self.mode = 7_u8
+                } else {
+                    let colon = find(line, ":")
+                    if colon == 0_usize || colon == line.len() || !header_name(line.slice(0_usize, colon)) {
+                        ret Result::Err(protocol("invalid HTTP trailer"))
+                    }
+                    if !header_value(line.slice(colon + 1_usize, line.len() - colon - 1_usize)) {
+                        ret Result::Err(protocol("invalid HTTP trailer value"))
+                    }
+                    let name = lower(line.slice(0_usize, colon))
+                    if name == "content-length" || name == "transfer-encoding" {
+                        ret Result::Err(protocol("framing field in HTTP trailer"))
+                    }
+                }
+            } else {
+                let semicolon = find(line, ";")
+                let size = line.slice(0_usize, semicolon)
+                if size == "" {
+                    ret Result::Err(protocol("empty chunk size"))
+                }
+                for i in 0_usize..size.len() {
+                    if find("0123456789abcdefABCDEF", size.slice(i, 1_usize)) == 22_usize {
+                        ret Result::Err(protocol("invalid chunk size"))
+                    }
+                }
+                self.remaining = integer(size, 16_usize)?
+                if self.remaining > self.max_body - self.body_size {
+                    ret Result::Err(HTTPError {
+                            HTTPErrorKind::Limit, "response body exceeds limit"
+                        }
+                        ,
+                    )
+                }
+                self.mode = if self.remaining == 0_usize {
+                    6_u8
+                } else {
+                    4_u8
+                }
+            }
+        }
+        if eof {
+            if self.mode == 2_u8 {
+                self.mode = 7_u8
+            }
+            if self.mode != 7_u8 {
+                ret Result::Err(protocol("premature EOF in HTTP response"))
+            }
+        }
+        ret Result::Ok(self.mode == 7_u8)
+    }
+
+    #attr(safe)
+    pub fn body(self: Self) -> str {
+        let builder = encore_text_builder_new()
+        for chunk in self.chunks {
+            encore_text_builder_append(builder, chunk)
+        }
+        ret encore_text_builder_finish(builder)
+    }
+}
+
+pub fn header_name(text: str) -> bool {
+    if text.len() == 0_usize {
+        ret false
+    }
+    let allowed = "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for i in 0_usize..text.len() {
+        if find(allowed, text.slice(i, 1_usize)) == allowed.len() {
+            ret false
+        }
+    }
+    ret true
+}
+
+pub fn header_value(text: str) -> bool {
+    for i in 0_usize..text.len() {
+        let b = text.byte_at(i)
+        if (b < 32_u8 && b != 9_u8) || b == 127_u8 {
+            ret false
+        }
+    }
+    ret true
+}
+
+pub fn decimal(text: str) -> Result[usize, HTTPError] {
+    if text == "" {
+        ret Result::Err(protocol("empty Content-Length"))
+    }
+    for i in 0_usize..text.len() {
+        let b = text.byte_at(i)
+        if b < 48_u8 || b > 57_u8 {
+            ret Result::Err(protocol("invalid Content-Length"))
+        }
+    }
+    ret integer(text, 10_usize)
+}
+
+pub fn integer(text: str, base: usize) -> Result[usize, HTTPError] {
+    if text == "" {
+        ret Result::Err(protocol("empty integer"))
+    }
+    let digits = "0123456789abcdef"
+    let text = lower(text)
+    let mut value = 0_usize
+    for i in 0_usize..text.len() {
+        let digit = find(digits, text.slice(i, 1_usize))
+        if digit >= base || value >(18446744073709551615_usize - digit) / base {
+            ret Result::Err(protocol("invalid or overflowing integer"))
+        }
+        value = value * base + digit
+    }
+    ret Result::Ok(value)
+}
+
+pub struct Endpoint {
+    host: str
+    port: i32
+    tls: i32
+    target: str
+    authority: str
+}
+pub fn endpoint(url: str) -> Result[Endpoint, HTTPError] {
+    let secure = url.len() >= 8_usize && url.slice(0_usize, 8_usize) == "https://"
+    let local = url.len() >= 7_usize && url.slice(0_usize, 7_usize) == "http://"
+    if !secure && !local {
+        ret Result::Err(HTTPError {
+                HTTPErrorKind::Configuration, "HTTP URL requires https or loopback http"
+            }
+            ,
+        )
+    }
+    for i in 0_usize..url.len() {
+        let b = url.byte_at(i)
+        if b <= 32_u8 || b >= 127_u8 || b == 92_u8 || b == 35_u8 || b == 64_u8 {
+            ret Result::Err(HTTPError {
+                    HTTPErrorKind::Configuration, "invalid HTTP URL"
+                }
+                ,
+            )
+        }
+    }
+    let prefix = if secure {
+        8_usize
+    } else {
+        7_usize
+    }
+    let rest = url.slice(prefix, url.len() - prefix)
+    let mut split = find(rest, "/")
+    let query = find(rest, "?")
+    if query < split {
+        split = query
+    }
+    let authority = rest.slice(0_usize, split)
+    let colon = find(authority, ":")
+    let host = authority.slice(0_usize, colon)
+    if host == "" {
+        ret Result::Err(HTTPError { HTTPErrorKind::Configuration, "empty HTTP host" })
+    }
+    for i in 0_usize..host.len() {
+        if find("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-", host.slice(i, 1_usize)) == 64_usize {
+            ret Result::Err(HTTPError {
+                    HTTPErrorKind::Configuration, "invalid HTTP host"
+                }
+                ,
+            )
+        }
+    }
+    if local && host != "127.0.0.1" && host != "localhost" {
+        ret Result::Err(HTTPError {
+                HTTPErrorKind::Configuration, "plaintext HTTP requires loopback"
+            }
+            ,
+        )
+    }
+    let mut port = if secure {
+        443_usize
+    } else {
+        80_usize
+    }
+    if colon < authority.len() {
+        port = decimal(authority.slice(colon + 1_usize, authority.len() - colon - 1_usize))?
+    }
+    if port == 0_usize || port > 65535_usize {
+        ret Result::Err(HTTPError {
+                HTTPErrorKind::Configuration, "invalid HTTP port"
+            }
+            ,
+        )
+    }
+    let target = if split == rest.len() {
+        "/"
+    } else {
+        let path = rest.slice(split, rest.len() - split)
+        if path.byte_at(0_usize) == 63_u8 {
+            "/" + path
+        } else {
+            path
+        }
+    }
+    ret Result::Ok(Endpoint {
+            host, port as i32, if secure {
+                1_i32
+            } else {
+                0_i32
+            }
+            , target, authority
+        }
+        ,
+    )
+}
+
+#attr(test)
+fn fragmented_chunked_body() -> bool {
+    let mut decoder = Decoder::new(16_usize, 1024_usize, false)
+    if decoder.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r", false).is_err() {
+        ret false
+    }
+    if decoder.feed("\n3\r\na_b\r", false).is_err() {
+        ret false
+    }
+    if decoder.feed("\n0\r\nX-End: yes\r\n\r", false).is_err() {
+        ret false
+    }
+    ret decoder.feed("\n", false).unwrap_or(false) && decoder.body() == "a_b"
+}
+
+#attr(test)
+fn response_framing_rejections() -> bool {
+    let bad = vec![
+        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZ\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabc",
+        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nxx"
+    ]
+    for input in bad {
+        let mut decoder = Decoder::new(100_usize, 1024_usize, false)
+        if decoder.feed(input, true).is_ok() {
+            ret false
+        }
+    }
+    ret true
+}
+
+#attr(test)
+fn head_interim_and_close_framing() -> bool {
+    let mut head = Decoder::new(1_usize, 1024_usize, true)
+    if !head.feed("HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n", false).unwrap_or(false) {
+        ret false
+    }
+    let mut interim = Decoder::new(8_usize, 1024_usize, false)
+    if !interim.feed("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", false).unwrap_or(false) {
+        ret false
+    }
+    let mut close = Decoder::new(8_usize, 1024_usize, false)
+    if close.feed("HTTP/1.0 200 OK\r\n\r\nbody", false).unwrap_or(true) {
+        ret false
+    }
+    ret close.feed("", true).unwrap_or(false) && close.body() == "body" && interim.body() == "ok"
+}
+
+#attr(test)
+fn bounded_headers_and_body() -> bool {
+    let mut body = Decoder::new(2_usize, 1024_usize, false)
+    if body.feed("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n", false).is_ok() {
+        ret false
+    }
+    let mut headers = Decoder::new(8_usize, 16_usize, false)
+    ret headers.feed("HTTP/1.1 200 OK\r\nLong: abcdefghijklmnop", false).is_err()
+}
+
+#attr(test)
+fn urls_and_integer_overflow() -> bool {
+    if endpoint("http://localhost.evil.invalid/test").is_ok() || endpoint("https://user@host/test").is_ok() || endpoint("https://example.com/\r\nInjected").is_ok() {
+        ret false
+    }
+    if decimal("18446744073709551616").is_ok() || decimal("+1").is_ok() {
+        ret false
+    }
+    let url = match endpoint("http://localhost:8080?x=1") {
+        Result::Ok(value) => value Result::Err(_) => {
+            ret false
+        }
+    }
+    ret url.port == 8080_i32 && url.target == "/?x=1"
+}
+
+/// Constructs a shared response from validated incremental decoder output.
+pub fn response(status: u16, raw: str, body: str) -> HttpResponse {
+    let end = find(raw, "\r\n")
+    let line = raw.slice(0_usize, end)
+    let reason = if line.len() > 13_usize {
+        line.slice(13_usize, line.len() - 13_usize)
+    } else {
+        ""
+    }
+    let mut headers = Vec[HttpHeader]::new()
+    let mut offset = end + 2_usize
+    while offset < raw.len() {
+        let rest = raw.slice(offset, raw.len() - offset)
+        let end = find(rest, "\r\n")
+        if end == 0_usize {
+            break
+        }
+        let field = rest.slice(0_usize, end)
+        let colon = find(field, ":")
+        if colon >= field.len() {
+            break
+        }
+        headers.push(HttpHeader {
+                field.slice(0_usize, colon), trim(field.slice(colon + 1_usize, field.len() - colon - 1_usize))
+            }
+            ,
+        )
+        offset += end + 2_usize
+    }
+    ret HttpResponse { status, reason, headers, body }
+}
+
+pub fn decode(raw: str, max_body: usize, max_headers: usize, head: bool) -> Result[HttpResponse, HTTPError] {
+    let mut decoder = Decoder::new(max_body, max_headers, head)
+    let complete = decoder.feed(raw, true)?
+    if !complete {
+        ret Result::Err(protocol("incomplete HTTP response"))
+    }
+    ret Result::Ok(response(decoder.status, decoder.headers, decoder.body()))
+}

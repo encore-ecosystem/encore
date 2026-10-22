@@ -2,6 +2,11 @@
 
 Encore is a self-hosted native programming language built on EHIR and LLVM
 
+This local working tree includes standard HTTP runtime integration. Linux
+builds require OpenSSL and c-ares >=1.34 development headers and libraries;
+cross-build sysroots need those libraries too. This change is not an official
+compiler release.
+
 ## Install
 
 Linux and macOS require `curl`, `tar`, `clang`, and either `sha256sum` or
@@ -20,7 +25,7 @@ SHA-256 checksum and replaces an existing installation transactionally.
 # Install an exact release.
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/encore-ecosystem/encore/trunk/install.sh |
-  sh -s -- --version 0.2.1
+  sh -s -- --version 0.0.0-neumann
 
 ~/.encore/bin/encore --version
 
@@ -31,7 +36,7 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 ```
 
 Use `--install-dir <path>` for another location. The installer supports Linux
-and macOS on x86-64 and AArch64.
+on x86-64 and AArch64, and macOS on Apple Silicon (M1 or newer).
 
 ## Quick Start
 
@@ -59,15 +64,24 @@ Language, package and cross-compilation documentation is in
 
 ## Development
 
-An existing native compiler can build and test this repository:
+This checkout contains the compiler, system libraries and backends (`packages/`),
+and language server (`lsp/`). No separate package-index checkout is required.
+An installed Encore compiler can bootstrap it:
 
 ```sh
-./target/extreme/encore build --profile extreme
+encore build --profile extreme
 ./target/extreme/encore test
+(cd lsp && ../target/extreme/encore build --profile release)
 ```
 
-The final two bootstrap compilers must be byte-identical. See
-[`RELEASE.md`](RELEASE.md) for the release pipeline.
+The final two bootstrap compilers must be byte-identical.
+
+For the published `v0.1.5-neumann` seed, first fetch that Git tag and run
+`bash scripts/ci-seed-build.sh /path/to/0.1.5/bin/encore v0.1.5-neumann build --profile extreme`.
+The script builds a temporary compiler from the tagged sources with `Div`
+support, then builds the current compiler against the seed's library versions.
+Current compiler sources retain `Path / component` syntax. Subsequent stages
+use the current checkout's libraries and independent compiled-package caches.
 
 ## License
 

@@ -1,0 +1,89 @@
+//! Selected imports must not expose unrelated transitive type declarations (#86).
+
+import refrain::frontend::lexer::Lexer
+import refrain::frontend::parser::Parser
+import refrain::frontend::translator::{TranslationModule, translate_modules_to_ehir_bundle, translate_compilation_unit_to_ehir_chunks}
+import refrain::target::host_target
+
+fn module(id: str, imports: Vec[str], source: str) -> TranslationModule {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source(id)
+    let ast = parser.parse(lexer.tokenize(source))
+    ret TranslationModule::new(id, id, imports, ast, Vec[str]::new())
+}
+
+fn verify(prefix: str, grouped: bool, reversed: bool) -> bool {
+    let foreign = module("probe@foreign.enq", Vec[str]::new(),
+        "pub struct Window { foreign: u64 }\n" +
+        "pub fn wait_any(timeout: i32) -> bool { ret false }\n",)
+    let application = module("probe@application.enq", vec!["probe@foreign.enq"],
+        (if grouped {
+                "import mod::foreign::wait_any as native_wait\n"
+            } else {
+                "import mod::foreign::wait_any\n"
+            }
+        ) +
+        "pub struct Window { width: u32 }\n" +
+        "impl for Window { pub fn new() -> Window { ret Window{1} } " +
+        "pub fn width(self: Self) -> u32 { ret self.width } }\n" +
+        "pub fn poll() -> bool { ret " +(if grouped {
+                "native_wait"
+            } else {
+                "wait_any"
+            }
+        ) + "(0) }\n",)
+    // Both source-directory-relative imports in a leaf and package-relative
+    // imports must resolve the explicitly selected declaration, not foreign::Window.
+    let font = module("probe@font.enq", vec!["probe@application.enq"],
+        "import " + prefix + "application::" +(if grouped {
+                "{Window}"
+            } else {
+                "Window"
+            }
+        ) + "\n" +
+        "pub fn measure(window: Window) -> u32 { ret window.width() }\n",)
+    // mod:: in a directory module is relative to that directory, not its parent.
+    let facade = module("probe@api/mod.enq", vec!["probe@api/types.enq", "probe@foreign.enq"],
+        "pub import mod::types::*\nimport refrain::foreign::wait_any\n",)
+    let types = module("probe@api/types.enq", vec!["probe@application.enq"],
+        "pub import refrain::application::{Window}\n",)
+    let user = module("probe@main.enq", vec!["probe@api/mod.enq", "probe@font.enq"],
+        "import mod::api::Window\nimport mod::font::measure\n" +
+        "fn main() -> u32 { ret measure(Window::new()) }\n",)
+    let mut modules = Vec[TranslationModule]::new()
+    if reversed {
+        modules.extend(vec![user, types, facade, font, application, foreign])
+    } else {
+        modules.extend(vec![foreign, application, font, facade, types, user])
+    }
+    let expected = "window: __encore_t70726f6265406170706c69636174696f6e2e656e71__Window"
+    let output = translate_modules_to_ehir_bundle(modules, host_target(), "probe@main.enq")
+    if !output.contains(expected) {
+        ret false
+    }
+    let mut selected = Vec[usize]::new()
+    let mut index = 0_usize
+    while index < modules.len() {
+        selected.push(index) index += 1
+    }
+    let chunks = translate_compilation_unit_to_ehir_chunks(modules, host_target(), selected)
+    for chunk in chunks {
+        if chunk.text.contains(expected) {
+            ret true
+        }
+    }
+    ret false
+}
+
+fn main() -> u32 {
+    for prefix in vec!["mod::", "refrain::", "repo::", "probe::"] {
+        for grouped in vec![false, true] {
+            for reversed in vec![false, true] {
+                if !verify(prefix, grouped, reversed) {
+                    ret 1
+                }
+            }
+        }
+    }
+    ret 0
+}

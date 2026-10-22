@@ -1,0 +1,80 @@
+name: Target kit
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        required: true
+        type: string
+      kind:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    name: Target kit ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download verified Linux llvm-mingw
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=20260616
+          archive="llvm-mingw-$version-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          mkdir -p target
+          curl -fsSL --retry 2 \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive" \
+            -o "target/$archive"
+          test "$(sha256sum "target/$archive" | awk '{print $1}')" = \
+            "534b92e067b22a6b4441f48ae9240a3341b17825d04d577eab0cf85c44b4deda"
+          mkdir -p target/llvm-mingw
+          tar -xJf "target/$archive" -C target/llvm-mingw --strip-components=1
+      - name: Assemble Linux AArch64 sysroot
+        if: inputs.kind == 'linux-aarch64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/build-linux-aarch64-sysroot.sh target/llvm-mingw/sysroot
+
+      - name: Check Windows credential runtime before bootstrapping
+        if: inputs.kind == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/llvm-mingw/bin/clang --target="${{ inputs.target }}" \
+            -Wall -Wextra -Werror -c packages/secret-store/runtime.c \
+            -o target/secret-store.obj
+      - name: Build reproducible target kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          release=$(tr -d '\r\n' < VERSION)
+          version=${release%%-*}
+          release_name=${release#*-}
+          test "$release" = "$version-$release_name"
+          args=(
+            --host x86_64-unknown-linux-gnu \
+            --target "${{ inputs.target }}" \
+            --toolchain target/llvm-mingw \
+            --platform packages/platform \
+            --out target/target-kits \
+            --compiler bin/clang \
+            --linker bin/clang \
+            --archiver bin/llvm-ar \
+            --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/v$release"
+          )
+          if [[ "${{ inputs.kind }}" == linux-aarch64 ]]; then
+            args+=(--sysroot sysroot --link-arg "-fuse-ld=lld")
+          fi
+          scripts/build-target-kit.sh "${args[@]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-target-kit-${{ inputs.target }}
+          path: target/target-kits
+          if-no-files-found: error
+          retention-days: 30

@@ -2,7 +2,18 @@
 
 [Introduction](introduction.md)
 
+# Learn Encore
+
+- [Installation and Editor Setup](installation.md)
 - [Getting Started](getting-started.md)
+- [Project: A Text Report](text-report.md)
+- [Values, Sharing, and Mutation](values-and-sharing.md)
+- [Designing APIs and Handling Errors](designing-programs.md)
+- [Project: Parallel Work](parallel-project.md)
+- [Development and Performance](development.md)
+
+# Language Reference
+
 - [Language Guide](language-basics.md)
   - [Comments and Documentation](features/comments-and-docs.md)
   - [Imports and Visibility](features/imports-and-visibility.md)
@@ -28,9 +39,8 @@
   - [Spawn and Join](features/spawn-and-join.md)
   - [Declarative Macros](features/macros.md)
   - [Unsafe Code and Embedded EHIR](features/unsafe-and-ehir.md)
-- [Memory Model](memory-model.md)
+- [Language Construct Examples](language-construct-examples.md)
 - [Concurrency](concurrency.md)
-- [Compiler Logic](compiler-logic.md)
 - [Analysis and Tooling](analysis-tooling.md)
 - [Packages and Build Scripts](packages.md)
   - [Publishing Packages](publishing-packages.md)
@@ -44,6 +54,7 @@
   - [`core::ops`](library/core/ops.md)
   - [`core::option`](library/core/option.md)
   - [`core::panic`](library/core/panic.md)
+  - [`core::reflect`](library/core/reflect.md)
   - [`core::result`](library/core/result.md)
   - [`core::testing`](library/core/testing.md)
   - [`core::vec`](library/core/vec.md)
@@ -58,6 +69,7 @@
   - [`std::io`](library/std/io.md)
   - [`std::math`](library/std/math.md)
   - [`std::net`](library/std/net.md)
+  - [`std::num`](library/std/num.md)
   - [`std::ops`](library/std/ops.md)
   - [`std::option`](library/std/option.md)
   - [`std::os`](library/std/os.md)
@@ -65,10 +77,19 @@
   - [`std::process`](library/std/process.md)
   - [`std::random`](library/std/random.md)
   - [`std::result`](library/std/result.md)
+  - [`std::set`](library/std/set.md)
   - [`std::string`](library/std/string.md)
   - [`std::thread`](library/std/thread.md)
   - [`std::time`](library/std/time.md)
   - [`std::tls`](library/std/tls.md)
   - [`std::vec`](library/std/vec.md)
-- [Native UI](native-ui.md)
-- [Beta Notes](beta-notes.md)
+
+# Advanced Topics and Appendices
+
+- [Memory Model and ERN](memory-model.md)
+- [Compiler Logic](compiler-logic.md)
+- [Syntax Quick Reference](syntax-reference.md)
+- [Troubleshooting](troubleshooting.md)
+- [Coming from Another Language](coming-from.md)
+- [Glossary](glossary.md)
+- [Coverage and Current Limitations](beta-notes.md)

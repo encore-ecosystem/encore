@@ -1,0 +1,80 @@
+import mod::cache_policy::touch_cache
+//! Content-addressed native objects, independent of package staging paths.
+
+import core::option::Option
+import core::result::Result
+
+import std::os::{copy_file, file_exists, file_sha256, mkdir_all, read_file, remove_file}
+import std::path::Path
+
+import mod::build_cache::{UnitCacheLock, close_unit_cache_lock, try_unit_cache_lock}
+import refrain::cache_identity::compiler_content_digest
+
+extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
+
+pub fn native_object_key(ir: str, target: str, native: str) -> str {
+    ret compiler_content_digest("encore-native-object-1\n" + target + "\n" + native + "\n" + ir)
+}
+
+/// Contention and corrupt records are misses. Readers copy while holding the
+/// same lock as writers, then verify their private copy before using it.
+pub fn restore_native_object(root: Path, key: str, destination: Path) -> Result[bool, str] {
+    let lock = match try_unit_cache_lock(root, key)? {
+        Option::Some(value) => value
+        Option::None => {
+            ret Result[bool, str]::Ok(false)
+        }
+    }
+    let object = lock.directory.join("object.o")
+    let expected = read_file(lock.directory.join("commit").as_str())
+    let valid = expected.byte_len() == 64 && file_exists(object.as_str()) &&
+    file_sha256(object.as_str()) == expected
+    let restored = valid && copy_file(object.as_str(), destination.as_str()) == 0 &&
+    file_sha256(destination.as_str()) == expected
+    if restored {
+        touch_cache(lock.directory)
+    }
+    close_unit_cache_lock(lock)
+    ret Result[bool, str]::Ok(restored)
+}
+
+pub fn commit_native_object(root: Path, key: str, source: Path) -> Result[(), str] {
+    let lock = match try_unit_cache_lock(root, key)? {
+        Option::Some(value) => value
+        Option::None => {
+            ret Result[(), str]::Ok(())
+        }
+    }
+    let result = publish_native_object(lock, source)
+    if result.is_ok() {
+        touch_cache(lock.directory)
+    }
+    close_unit_cache_lock(lock)
+    ret result
+}
+
+#attr(safe)
+fn publish_native_object(lock: UnitCacheLock, source: Path) -> Result[(), str] {
+    let expected = file_sha256(source.as_str())
+    if expected.byte_len() != 64 || !file_exists(source.as_str()) {
+        ret Result[(), str]::Err("missing native object cache input")
+    }
+    if mkdir_all(lock.directory.as_str()) != 0 {
+        ret Result[(), str]::Err("cannot create native object cache entry")
+    }
+    let marker = lock.directory.join("commit")
+    if file_exists(marker.as_str()) && remove_file(marker.as_str()) != 0 {
+        ret Result[(), str]::Err("cannot invalidate native object cache entry")
+    }
+    let object = lock.directory.join("object.o")
+    if copy_file(source.as_str(), object.as_str()) != 0 || file_sha256(object.as_str()) != expected {
+        ret Result[(), str]::Err("cannot publish native object cache payload")
+    }
+    if !unsafe {
+        encore_compiler_write_atomic(marker.as_str(), expected)
+    }
+    {
+        ret Result[(), str]::Err("cannot commit native object cache entry")
+    }
+    ret Result[(), str]::Ok(())
+}

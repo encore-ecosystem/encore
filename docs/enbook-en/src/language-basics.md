@@ -1,5 +1,9 @@
 # Language Basics
 
+This is a compact reference. Unless labelled as a complete executable, snippets
+are fragments requiring the indicated types/imports and a surrounding function.
+For a sequential, runnable lesson start with [A Text Report](text-report.md).
+
 Encore source files use the `.enq` extension. Executable packages start from:
 
 ```enq
@@ -166,6 +170,15 @@ fn vec_len_is_zero() -> bool {
 
 The compiler expects unit tests to return `bool`, take no parameters and avoid
 generic parameters. `true` means pass, `false` means fail.
+
+`encore test` compiles one shared executable for unit tests and runs each test
+in an isolated process. Standalone `tests/*.enq` programs are separate compiler
+inputs and have their own executable caches.
+
+`encore test --jobs N` limits the number of parallel test workers. By default,
+the runner uses the available processor count; an explicit limit cannot exceed
+that count. `--filter` selects tests by their full portable IDs, and
+`--list --format json` and `--report PATH` describe the selected set.
 
 ## Structs And Methods
 
