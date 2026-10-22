@@ -76,6 +76,13 @@ encore build --profile extreme
 
 The final two bootstrap compilers must be byte-identical.
 
+For the published `v0.1.5-neumann` seed, first fetch that Git tag and run
+`bash scripts/ci-seed-build.sh /path/to/0.1.5/bin/encore v0.1.5-neumann build --profile extreme`.
+The script builds a temporary compiler from the tagged sources with `Div`
+support, then builds the current compiler against the seed's library versions.
+Current compiler sources retain `Path / component` syntax. Subsequent stages
+use the current checkout's libraries and independent compiled-package caches.
+
 ## License
 
 [MIT](LICENSE)

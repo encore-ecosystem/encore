@@ -52,6 +52,17 @@ static char *encore_compiler_cstr(encore_compiler_str value) {
     return out;
 }
 
+/* Bootstrap seeds use a std version from before the public set_env API. This
+   fixed internal flag must also reach compiler workers spawned by `test`. */
+bool encore_compiler_keep_build_artifacts(void) {
+#ifdef _WIN32
+    return _putenv_s("ENCORE_KEEP_TEMPS", "1") == 0 &&
+        SetEnvironmentVariableW(L"ENCORE_KEEP_TEMPS", L"1") != 0;
+#else
+    return setenv("ENCORE_KEEP_TEMPS", "1", 1) == 0;
+#endif
+}
+
 size_t encore_compiler_jobserver_create(encore_compiler_str path, size_t jobs) {
     char *name = encore_compiler_cstr(path);
     size_t server = encore_build_jobserver_create_path(name, jobs);

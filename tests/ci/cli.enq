@@ -1,7 +1,7 @@
 //! Real CLI contracts, independent of the source-analysis library interface.
 
 import std::io::eprintln
-import std::os::{env, file_exists, file_sha256, read_file, remove_dir_all, remove_file}
+import std::os::{env, file_exists, file_sha256, read_dir, read_file, remove_dir_all, remove_file}
 import std::process::Command
 import std::string::String
 import std::vec::Vec
@@ -17,21 +17,53 @@ fn integration_test_utf8_discovery_contract() -> bool {
     let fixture = Fixture::new("test-utf8-discovery")
     fixture.manifest("utf8_probe", "[]")
     fixture.put("src/lib.enq", "#attr(test)\nfn example() -> bool { ret true }\n")
-    for name in vec!["plain", "second", "пример"] {
+    for name in vec!["plain", "second", "пример", "日本語", "emoji-🦊"] {
         fixture.put("tests/" + name + ".enq", "fn main() -> u32 { ret 0_u32 }\n")
     }
     let full = fixture.command(vec!["test", "--list", "--format", "json"])
     let planned = json(full.text()).as_array().unwrap_or(Vec[Json]::new())
-    if !full.success() || planned.len() != 4_usize {
+    if !full.success() || planned.len() != 6_usize {
         ret fixture.failure("all test files, including UTF-8 names, must be discovered")
     }
-    let filtered = fixture.command(vec!["test", "--list", "--format", "json", "--filter", "пример"])
-    let selected = json(filtered.text()).as_array().unwrap_or(Vec[Json]::new())
-    if !filtered.success() || selected.len() != 1_usize ||
-    selected.get(0_usize).unwrap_or(Json::Null).as_str().unwrap_or("") != "utf8_probe:tests/пример.enq" {
-        ret fixture.failure("UTF-8 filters must select the matching test file")
+    for name in vec!["пример", "日本語", "emoji-🦊"] {
+        let filtered = fixture.command(vec!["test", "--list", "--format", "json", "--filter", name])
+        let selected = json(filtered.text()).as_array().unwrap_or(Vec[Json]::new())
+        if !filtered.success() || selected.len() != 1_usize ||
+        selected.get(0_usize).unwrap_or(Json::Null).as_str().unwrap_or("") != "utf8_probe:tests/" + name + ".enq" {
+            ret fixture.failure("UTF-8 filters must select the matching test file")
+        }
+    }
+    if !fixture.succeeds(vec!["test", "--filter", "пример", "--report", "unicode-report.json"]) ||
+    number(json(fixture.read("unicode-report.json")).get("summary").unwrap_or(Json::Null), "passed") != "1" {
+        ret fixture.failure("UTF-8 selection must execute the matching test")
     }
     ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_test_build_artifact_retention_contract() -> bool {
+    let fixture = Fixture::new("test-retention")
+    fixture.manifest("retention_probe", "[]")
+    fixture.put("src/main.enq", "fn main() -> u32 { ret 0 }\n")
+    fixture.put("tests/example.enq", "fn main() -> u32 { ret 0 }\n")
+    if !fixture.succeeds(vec!["test"]) {
+        ret fixture.finish(false)
+    }
+    let directory = fixture.root.join("target/tests")
+    for name in read_dir(directory.as_str()) {
+        if name.contains("native-") {
+            ret fixture.failure("ordinary test workers must remove their staging workspace")
+        }
+    }
+    if !fixture.succeeds(vec!["test", "--keep-build-artifacts"]) {
+        ret fixture.finish(false)
+    }
+    for name in read_dir(directory.as_str()) {
+        if name.contains("native-") && flag(json(fixture.read("target/tests/" + name + "/.encore-workspace.json")), "retained") {
+            ret fixture.finish(true)
+        }
+    }
+    ret fixture.failure("test retention flag must reach native compiler workers")
 }
 
 fn library_artifact_contract(kind: str) -> bool {
