@@ -19,6 +19,7 @@
 #include "runtime/build_jobserver.h"
 #include "runtime/build_process.h"
 #include "runtime/build_artifact.h"
+#include "runtime/cache_fs.h"
 #include "runtime/build_identity.h"
 #include "runtime/build_target.h"
 #if defined(__GLIBC__)
@@ -49,6 +50,17 @@ static char *encore_compiler_cstr(encore_compiler_str value) {
     if (len > 0) memcpy(out, value.object->data, len);
     out[len] = '\0';
     return out;
+}
+
+/* Bootstrap seeds use a std version from before the public set_env API. This
+   fixed internal flag must also reach compiler workers spawned by `test`. */
+bool encore_compiler_keep_build_artifacts(void) {
+#ifdef _WIN32
+    return _putenv_s("ENCORE_KEEP_TEMPS", "1") == 0 &&
+        SetEnvironmentVariableW(L"ENCORE_KEEP_TEMPS", L"1") != 0;
+#else
+    return setenv("ENCORE_KEEP_TEMPS", "1", 1) == 0;
+#endif
 }
 
 size_t encore_compiler_jobserver_create(encore_compiler_str path, size_t jobs) {
@@ -129,6 +141,32 @@ size_t encore_compiler_cache_lock_open(encore_compiler_str path) {
 }
 int encore_compiler_cache_lock_try(size_t lock) { return encore_build_cache_lock_try(lock); }
 void encore_compiler_cache_lock_close(size_t lock) { encore_build_cache_lock_close(lock); }
+
+uint64_t encore_compiler_cache_file_fact(encore_compiler_str path, uint32_t field) {
+    char *name = encore_compiler_cstr(path);
+    uint64_t result = encore_cache_file_fact(name, field);
+    free(name);
+    return result;
+}
+int encore_compiler_cache_lock_shared(size_t lock) { return encore_cache_lock_shared(lock); }
+
+/* Both paths are siblings in the registry cache. Publish only a fully checked
+ * directory, under its registry installation lock. No external mv is needed. */
+bool encore_compiler_publish_directory(encore_compiler_str source, encore_compiler_str destination) {
+    char *from = encore_compiler_cstr(source), *to = encore_compiler_cstr(destination);
+    bool moved = false;
+    if (from != NULL && to != NULL) {
+#ifdef _WIN32
+        wchar_t *wide_from = encore_build_artifact_wide(from), *wide_to = encore_build_artifact_wide(to);
+        moved = wide_from != NULL && wide_to != NULL && MoveFileExW(wide_from, wide_to, MOVEFILE_WRITE_THROUGH);
+        free(wide_from); free(wide_to);
+#else
+        moved = rename(from, to) == 0;
+#endif
+    }
+    free(from); free(to);
+    return moved;
+}
 
 void encore_compiler_release_heap(void) {
 #if defined(__GLIBC__)

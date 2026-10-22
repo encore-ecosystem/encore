@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE
@@ -448,6 +451,9 @@ typedef struct {
     size_t cap;
     encore_str_object *object;
     bool failed;
+    bool bounded;
+    size_t allocation_limit;
+    size_t allocated;
 } encore_text_builder;
 
 static _Thread_local bool encore_text_builder_suppressed = false;
@@ -481,12 +487,14 @@ static bool encore_text_builder_reserve(encore_text_builder *builder, size_t add
         builder->failed = true;
         return false;
     }
-    encore_str_object *next = realloc(builder->object,
-        sizeof(encore_str_object) + next_cap + 1);
+    size_t allocation = sizeof(encore_str_object) + next_cap + 1;
+    if (builder->bounded && allocation > builder->allocation_limit - builder->allocated) return false;
+    encore_str_object *next = realloc(builder->object, allocation);
     if (next == NULL) return false;
     if (builder->object == NULL) atomic_init(&next->ref_count, 1);
     builder->object = next;
     builder->cap = next_cap;
+    if (builder->bounded) builder->allocated += allocation;
     return true;
 }
 
@@ -1159,4 +1167,124 @@ encore_str encore_fmt_i64(int64_t value) {
 
 encore_str encore_fmt_f64(double value) {
     return encore_format("%.17g", value);
+}
+
+/* Locale-independent codec primitives. Wire layout is defined by Encore codecs,
+ * never by these helpers or by a native aggregate's memory representation. */
+#include <locale.h>
+#if defined(__APPLE__)
+#include <xlocale.h>
+#endif
+#include <math.h>
+
+#ifdef _WIN32
+static _locale_t encore_codec_c_locale(void) {
+    static _Thread_local _locale_t locale;
+    if (locale == NULL) locale = _create_locale(LC_NUMERIC, "C");
+    return locale;
+}
+#else
+static locale_t encore_codec_c_locale(void) {
+    static _Thread_local locale_t locale;
+    if (locale == (locale_t)0) locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+    return locale;
+}
+#endif
+
+double encore_codec_parse_f64(encore_str source) {
+    size_t len = encore_str_size(source);
+    if (len == SIZE_MAX) return NAN;
+    char *text = malloc(len + 1);
+    if (text == NULL) return NAN;
+    memcpy(text, encore_str_data(source), len); text[len] = 0;
+    char *end = NULL;
+#ifdef _WIN32
+    double value = _strtod_l(text, &end, encore_codec_c_locale());
+#else
+    double value = strtod_l(text, &end, encore_codec_c_locale());
+#endif
+    if (end != text + len) value = NAN;
+    free(text);
+    return value;
+}
+float encore_codec_parse_f32(encore_str source) {
+    size_t len = encore_str_size(source);
+    if (len == SIZE_MAX) return NAN;
+    char *text = malloc(len + 1);
+    if (text == NULL) return NAN;
+    memcpy(text, encore_str_data(source), len); text[len] = 0;
+    char *end = NULL;
+#ifdef _WIN32
+    float value = _strtof_l(text, &end, encore_codec_c_locale());
+#else
+    float value = strtof_l(text, &end, encore_codec_c_locale());
+#endif
+    if (end != text + len) value = NAN;
+    free(text);
+    return value;
+}
+encore_str encore_codec_format_f64(double value) {
+    char buffer[64];
+#ifdef _WIN32
+    int len = _snprintf_l(buffer, sizeof(buffer), "%.17g", encore_codec_c_locale(), value);
+#else
+    locale_t previous = uselocale(encore_codec_c_locale());
+    int len = snprintf(buffer, sizeof(buffer), "%.17g", value);
+    uselocale(previous);
+#endif
+    if (len < 0 || (size_t)len >= sizeof(buffer)) return encore_empty_str();
+    return encore_str_from_buffer(buffer, (size_t)len);
+}
+encore_str encore_codec_format_f32(float value) {
+    char buffer[64];
+#ifdef _WIN32
+    int len = _snprintf_l(buffer, sizeof(buffer), "%.9g", encore_codec_c_locale(), (double)value);
+#else
+    locale_t previous = uselocale(encore_codec_c_locale());
+    int len = snprintf(buffer, sizeof(buffer), "%.9g", (double)value);
+    uselocale(previous);
+#endif
+    if (len < 0 || (size_t)len >= sizeof(buffer)) return encore_empty_str();
+    return encore_str_from_buffer(buffer, (size_t)len);
+}
+uint64_t encore_codec_f64_bits(double value) { uint64_t bits; memcpy(&bits, &value, 8); return bits; }
+uint32_t encore_codec_f32_bits(float value) { uint32_t bits; memcpy(&bits, &value, 4); return bits; }
+double encore_codec_f64_from_bits(uint64_t bits) { double value; memcpy(&value, &bits, 8); return value; }
+float encore_codec_f32_from_bits(uint32_t bits) { float value; memcpy(&value, &bits, 4); return value; }
+
+bool encore_codec_utf8_valid(const uint8_t *bytes, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        uint32_t value = bytes[i++];
+        if (value < 0x80) continue;
+        size_t extra;
+        uint32_t minimum;
+        if (value >= 0xc2 && value <= 0xdf) { extra = 1; minimum = 0x80; value &= 0x1f; }
+        else if (value >= 0xe0 && value <= 0xef) { extra = 2; minimum = 0x800; value &= 0x0f; }
+        else if (value >= 0xf0 && value <= 0xf4) { extra = 3; minimum = 0x10000; value &= 7; }
+        else return false;
+        if (extra > len - i) return false;
+        while (extra--) { uint8_t byte = bytes[i++]; if ((byte & 0xc0) != 0x80) return false; value = (value << 6) | (byte & 0x3f); }
+        if (value < minimum || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) return false;
+    }
+    return true;
+}
+encore_str encore_codec_string(const uint8_t *bytes, size_t len) { return encore_str_from_buffer((const char *)bytes, len); }
+
+bool encore_codec_str_utf8_valid(encore_str value) {
+    return encore_codec_utf8_valid((const uint8_t *)encore_str_data(value), encore_str_size(value));
+}
+
+void *encore_codec_text_builder_new(size_t limit) {
+    if (limit < sizeof(encore_text_builder)) return NULL;
+    encore_text_builder *builder = calloc(1, sizeof(encore_text_builder));
+    if (builder == NULL) return NULL;
+    builder->bounded = true;
+    builder->allocation_limit = limit;
+    builder->allocated = sizeof(encore_text_builder);
+    return builder;
+}
+bool encore_codec_text_builder_ok(void *raw) {
+    encore_text_builder *builder = raw;
+    return builder != NULL && !builder->failed;
 }

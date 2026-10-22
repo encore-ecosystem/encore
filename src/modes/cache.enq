@@ -1,0 +1,166 @@
+//! Inspect and reclaim compiler-owned caches without touching installed packages.
+import core::fmt::Debug
+import core::option::Option
+
+import std::io::{eprintln, println}
+import std::path::Path
+import std::vec::Vec
+
+import argparse::{process_arg, process_arg_count}
+import json::{Json, stringify}
+
+import mod::cache_policy::{cache_limit, cache_root, cache_usage, measure_tree, project_root, project_workspaces, prune_cache, sweep_project, workspace_state}
+
+pub fn run_cache() -> u32 {
+    let action = process_arg(2_usize).unwrap_or("")
+    if action != "status" && action != "prune" {
+        eprintln("Usage: encore cache <status|prune> [--json] [--project PATH] [--dry-run] [--all] [--max-size SIZE]")
+        ret 2_u32
+    }
+    let mut project = project_root(Path::cwd())
+    let mut size = ""
+    let mut dry = false
+    let mut all = false
+    let mut as_json = false
+    let mut i = 3_usize
+    while i < process_arg_count() {
+        let arg = process_arg(i).unwrap_or("")
+        if arg == "--help" || arg == "-h" {
+            println("Usage: encore cache <status|prune> [--json] [--project PATH]")
+            println("Prune options: --dry-run, --all, --max-size <bytes|MiB|GiB>")
+            ret 0_u32
+        }
+        if arg == "--json" {
+            as_json = true
+        } elif action == "prune" && arg == "--dry-run" {
+            dry = true
+        } elif action == "prune" && arg == "--all" {
+            all = true
+        } elif arg == "--project" ||(action == "prune" && arg == "--max-size") {
+            if i + 1_usize >= process_arg_count() {
+                eprintln("Missing value for " + arg) ret 2_u32
+            }
+            i += 1_usize
+            let value = process_arg(i).unwrap_or("")
+            if value == "" {
+                eprintln("Missing value for " + arg) ret 2_u32
+            }
+            if arg == "--max-size" {
+                size = value
+            } else {
+                project = project_root(Path::new(value).expanduser().resolve())
+                if project.is_none() {
+                    eprintln("No Encore project at " + value) ret 2_u32
+                }
+            }
+        } else {
+            eprintln("Unknown cache option: " + arg) ret 2_u32
+        }
+        i += 1_usize
+    }
+    let limit = match cache_limit(size) {
+        Ok(value) => {
+            value
+        }
+        Err(error) => {
+            eprintln(error) ret 2_u32
+        }
+    }
+    let root = cache_root()
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(("root", Json::String(root.as_str())))
+    fields.push(("limit_bytes", Json::Number(Debug::fmt(limit))))
+    if action == "prune" {
+        let result = prune_cache(root, limit, all, dry)
+        let mut workspaces = 0_u64
+        match project {
+            Some(path) => {
+                workspaces = sweep_project(path, dry)
+            }
+            None => {
+            }
+        }
+        fields.push(("dry_run", Json::Bool(dry)))
+        fields.push(("before_bytes", Json::Number(Debug::fmt(result.before))))
+        fields.push(("after_bytes", Json::Number(Debug::fmt(result.after))))
+        fields.push(("cache_reclaimed_bytes", Json::Number(Debug::fmt(result.removed))))
+        fields.push(("workspace_reclaimed_bytes", Json::Number(Debug::fmt(workspaces))))
+        fields.push(("busy_entries", Json::Number(Debug::fmt(result.busy))))
+        if !as_json {
+            println(if dry {
+                    "Estimated reclaimable: "
+                } else {
+                    "Reclaimed: "
+                }
+                + readable(result.removed + workspaces))
+            println("Shared cache: " + readable(result.after) + " / " + readable(limit))
+            println("Busy entries skipped: " + Debug::fmt(result.busy))
+        }
+    } else {
+        let usage = cache_usage(root)
+        fields.push(("bytes", Json::Number(Debug::fmt(usage.bytes))))
+        fields.push(("entries", Json::Number(Debug::fmt(usage.entries.len()))))
+        let mut categories = Vec[(str, Json)]::new()
+        for category in vec!["frontend", "prepared", "native", "lowering-v1", "objects-v1"] {
+            let mut bytes = 0_u64
+            for entry in usage.entries {
+                if entry.category == category {
+                    bytes += entry.bytes
+                }
+            }
+            categories.push((category, Json::Number(Debug::fmt(bytes))))
+            if !as_json {
+                println(category + ": " + readable(bytes))
+            }
+        }
+        fields.push(("categories", Json::Object(categories)))
+        if !as_json {
+            println("Shared cache: " + readable(usage.bytes) + " / " + readable(limit))
+        }
+        match project {
+            Some(path) => {
+                let mut owned = 0_u64
+                let mut reports = Vec[Json]::new()
+                for directory in project_workspaces(path) {
+                    let bytes = measure_tree(directory)
+                    owned += bytes
+                    let mut record = Vec[(str, Json)]::new()
+                    record.push(("path", Json::String(directory.as_str())))
+                    record.push(("bytes", Json::Number(Debug::fmt(bytes))))
+                    record.push(("state", Json::String(workspace_state(directory))))
+                    reports.push(Json::Object(record))
+                }
+                let target_bytes = measure_tree(path / "target")
+                fields.push(("project", Json::String(path.as_str())))
+                fields.push(("target_bytes", Json::Number(Debug::fmt(target_bytes))))
+                fields.push(("managed_workspaces_bytes", Json::Number(Debug::fmt(owned))))
+                fields.push(("other_target_bytes", Json::Number(Debug::fmt(if target_bytes >= owned {
+                                    target_bytes - owned
+                                } else {
+                                    0_u64
+                                }
+                            ))))
+                fields.push(("workspaces", Json::Array(reports)))
+                if !as_json {
+                    println("Managed workspaces: " + readable(owned))
+                    println("Other target artifacts (outputs, diagnostics, native/ThinLTO caches and snapshots): " + readable(if target_bytes >= owned {
+                                target_bytes - owned
+                            } else {
+                                0_u64
+                            }
+                        ))
+                }
+            }
+            None => {
+            }
+        }
+    }
+    if as_json {
+        println(stringify(Json::Object(fields)))
+    }
+    ret 0_u32
+}
+
+fn readable(bytes: u64) -> str {
+    ret Debug::fmt(bytes / 1073741824_u64) + "." + Debug::fmt((bytes % 1073741824_u64) * 10_u64 / 1073741824_u64) + " GiB"
+}

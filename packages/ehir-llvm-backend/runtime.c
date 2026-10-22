@@ -15,7 +15,11 @@
 #endif
 
 static ENCORE_CODEGEN_THREAD_LOCAL size_t encore_target_pointer_width = sizeof(void *) * 8u;
+#if defined(_WIN32)
+static ENCORE_CODEGEN_THREAD_LOCAL size_t encore_windows_target = 1u;
+#else
 static ENCORE_CODEGEN_THREAD_LOCAL size_t encore_windows_target = 0u;
+#endif
 
 void encore_llvm_set_target_pointer_width(size_t bits) {
     encore_target_pointer_width = bits == 32u ? 32u : 64u;
@@ -27,14 +31,6 @@ void encore_llvm_set_windows_target(size_t enabled) {
 
 size_t encore_llvm_is_windows_target(void) {
     return encore_windows_target;
-}
-
-size_t encore_llvm_is_windows_host(void) {
-#if defined(_WIN32)
-    return 1u;
-#else
-    return 0u;
-#endif
 }
 
 size_t encore_llvm_target_pointer_width(void) {

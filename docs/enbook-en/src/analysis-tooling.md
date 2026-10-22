@@ -185,6 +185,13 @@ secondary labelled spans, notes, help, and zero or more source suggestions.
 Suggestions carry an applicability classification so only
 `machine-applicable` edits may be applied automatically.
 
+Unused import diagnostics provide a quick fix for the selected binding. The LSP
+also advertises `source.organizeImports` as “Remove all unused imports”, using
+one edit per declaration so grouped removals never overlap. Aliases and nested
+selections retain used members; public re-exports and glob imports are preserved.
+Comments inside a modified declaration prevent an automatic edit. Edits use the
+current document version and UTF-16 ranges, including multiline selections.
+
 Terminal, JSON, LSP, and IDE output are projections of this same structured
 value. No consumer reconstructs labels or fixes by parsing human-readable
 messages.
@@ -213,6 +220,18 @@ trailing-comma = "vertical"
 reorder-imports = true
 format-docstrings = true
 ```
+
+Single-member groups are written as direct imports: `import mod::{shutdown}`
+becomes `import mod::shutdown`; aliases are retained.
+
+With `reorder-imports = true` (the default), imports are grouped as `core`,
+`std`, external packages, then local `mod`/`refrain` modules, with one blank line
+between groups. Paths and selected names are sorted lexicographically. Imports
+from the same immediate parent are merged into `{...}`; aliases and duplicates
+are retained. Glob imports stay separate, and `import` is never merged with
+`pub import`. Comments and attributes are barriers: attached declarations are
+not moved. Setting `reorder-imports = false` disables these transformations.
+CLI formatting and LSP formatting use this same policy.
 
 Unknown keys, rule names, and values are errors. Command-line lint levels
 override manifest defaults. LSP and direct IDE clients receive the normalized

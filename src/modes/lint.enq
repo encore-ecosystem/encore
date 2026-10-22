@@ -2,17 +2,18 @@
 
 import core::fmt::Debug
 import core::option::Option
-import std::io::eprintln
-import std::io::println
+
+import std::io::{eprintln, println}
 import std::os::{file_exists, read_file, write_file}
-import argparse::{process_arg_count, process_arg}
 import std::path::Path
 import std::vec::Vec
 
+import argparse::{process_arg, process_arg_count}
 import json::{Json, field, stringify}
-import refrain::analyzer::{AnalyzerConfig, AnalyzerDiagnostic, RuleLevel, analyzer_diagnostic_to_frontend, lint_source_document, fix_source, rule_is_known}
+
+import refrain::analyzer::{AnalyzerConfig, AnalyzerDiagnostic, RuleLevel, analyzer_source_diagnostic_to_frontend, fix_source, lint_source_document, rule_is_known}
 import refrain::diagnostics::{applicability_name, render_diagnostic}
-import refrain::frontend::{AnalysisDatabase, FrontendDocument}
+import refrain::frontend::{AnalysisDatabase, FrontendDiagnostic, FrontendDocument, Lexer, Token}
 import refrain::project::{ProjectToolingConfig, ProjectWorkspace, load_binary_workspace, load_library_workspace, read_project_tooling_config}
 
 /// Runs the shared analyzer over a project or selected source file.
@@ -25,15 +26,21 @@ pub fn native_analyze() -> u32 {
 pub fn native_lint() -> u32 {
     let mut root = Path::new(".").resolve()
     let selected = analyze_path()
-    if selected != "" && !ends_with(selected, ".enq") { root = Path::new(selected).resolve() }
+    if selected != "" && !ends_with(selected, ".enq") {
+        root = Path::new(selected).resolve()
+    }
 
     let mut config = AnalyzerConfig::new()
     if file_exists(root.join("encore.toml").as_str()) {
         let tooling = read_project_tooling_config(root)
-        if !tooling.is_valid() { eprintln("error[manifest]: " + tooling.error_message()) ret 2_u32 }
+        if !tooling.is_valid() {
+            eprintln("error[manifest]: " + tooling.error_message()) ret 2_u32
+        }
         config = tooling.lint_config()
     }
-    if !apply_cli_levels(config) { ret 2_u32 }
+    if !apply_cli_levels(config) {
+        ret 2_u32
+    }
     let format = option_value("--format")
     if format != "" && format != "full" && format != "json" {
         eprintln("Error: unsupported analyzer format '" + format + "'")
@@ -46,12 +53,16 @@ pub fn native_lint() -> u32 {
     let apply_fixes = has_option("--fix")
     if selected != "" && ends_with(selected, ".enq") {
         let path = Path::new(selected).resolve()
-        if !file_exists(path.as_str()) { eprintln("Error: analyzer path does not exist: " + selected) ret 2_u32 }
+        if !file_exists(path.as_str()) {
+            eprintln("Error: analyzer path does not exist: " + selected) ret 2_u32
+        }
         let mut source = read_file(path.as_str())
         if apply_fixes {
             let fixed = fix_source(source, config)
             if fixed != source {
-                if write_file(path.as_str(), fixed) != 0_i32 { eprintln("Error: unable to write " + path.as_str()) ret 2_u32 }
+                if write_file(path.as_str(), fixed) != 0_i32 {
+                    eprintln("Error: unable to write " + path.as_str()) ret 2_u32
+                }
                 source = fixed
                 fixed_count += 1_usize
             }
@@ -65,19 +76,25 @@ pub fn native_lint() -> u32 {
         diagnostics.extend(lint_source_document(path.as_str(), source, document, config))
         module_count = 1_usize
     } else {
-        if !file_exists(root.join("encore.toml").as_str()) { eprintln("error[manifest]: Unable to find encore.toml at " + root.join("encore.toml").as_str()) ret 1_u32 }
+        if !file_exists(root.join("encore.toml").as_str()) {
+            eprintln("error[manifest]: Unable to find encore.toml at " + root.join("encore.toml").as_str()) ret 1_u32
+        }
         let mut workspace = load_analysis_workspace(root)
         if apply_fixes {
             for module in workspace.modules {
                 if module.owner_name == workspace.root_name {
                     let fixed = fix_source(module.source, config)
                     if fixed != module.source {
-                        if write_file(module.path(), fixed) != 0_i32 { eprintln("Error: unable to write " + module.path()) ret 2_u32 }
+                        if write_file(module.path(), fixed) != 0_i32 {
+                            eprintln("Error: unable to write " + module.path()) ret 2_u32
+                        }
                         fixed_count += 1_usize
                     }
                 }
             }
-            if fixed_count > 0_usize { workspace = load_analysis_workspace(root) }
+            if fixed_count > 0_usize {
+                workspace = load_analysis_workspace(root)
+            }
         }
         for module in workspace.modules {
             if module.owner_name == workspace.root_name {
@@ -91,25 +108,55 @@ pub fn native_lint() -> u32 {
     }
 
     let mut denied = false
+    let mut current_path = ""
+    let mut source = ""
+    let mut tokens = Vec[Token]::new()
     for diagnostic in diagnostics {
-        if diagnostic.severity == RuleLevel::Deny || diagnostic.severity == RuleLevel::Forbid { denied = true }
-        if format == "json" { println(diagnostic_json(diagnostic)) }
-        else { print_diagnostic(diagnostic) }
+        if current_path != diagnostic.path {
+            current_path = diagnostic.path
+            source = read_file(current_path)
+            let mut lexer = Lexer::new()
+            tokens = lexer.tokenize(source)
+        }
+        let structured = analyzer_source_diagnostic_to_frontend(diagnostic, source, tokens)
+        if diagnostic.severity == RuleLevel::Deny || diagnostic.severity == RuleLevel::Forbid {
+            denied = true
+        }
+        if format == "json" {
+            println(diagnostic_json(diagnostic, structured))
+        } else {
+            print_diagnostic(diagnostic, structured, source)
+        }
     }
     if format != "json" {
         if apply_fixes {
-            let fixed_suffix = if fixed_count == 1_usize { "" } else { "s" }
+            let fixed_suffix = if fixed_count == 1_usize {
+                ""
+            } else {
+                "s"
+            }
             println("Fixed " + Debug::fmt(fixed_count) + " file" + fixed_suffix)
         }
-        let suffix = if module_count == 1_usize { "" } else { "s" }
+        let suffix = if module_count == 1_usize {
+            ""
+        } else {
+            "s"
+        }
         println("Linted " + Debug::fmt(module_count) + " module" + suffix)
     }
-    if denied { ret 1_u32 }
+    if denied {
+        ret 1_u32
+    }
     ret 0_u32
 }
 
 fn load_analysis_workspace(root: Path) -> ProjectWorkspace {
-    if file_exists(root.join("src").join("lib.enq").as_str()) { ret load_library_workspace(root) }
+    if file_exists(root.join("src/main.enq").as_str()) {
+        ret load_binary_workspace(root)
+    }
+    if file_exists(root.join("src").join("lib.enq").as_str()) {
+        ret load_library_workspace(root)
+    }
     ret load_binary_workspace(root)
 }
 
@@ -118,37 +165,58 @@ fn apply_cli_levels(config: mut AnalyzerConfig) -> bool {
     while index < argc() {
         let arg = argument(index)
         if arg == "--allow" || arg == "--warn" || arg == "--deny" || arg == "--forbid" {
-            if index + 1_usize >= argc() { ret false }
-            if !rule_is_known(argument(index + 1_usize)) { eprintln("Error: unknown lint rule '" + argument(index + 1_usize) + "'") ret false }
-            let level = if arg == "--allow" { RuleLevel::Allow } elif arg == "--warn" { RuleLevel::Warn } elif arg == "--deny" { RuleLevel::Deny } else { RuleLevel::Forbid }
+            if index + 1_usize >= argc() {
+                ret false
+            }
+            if !rule_is_known(argument(index + 1_usize)) {
+                eprintln("Error: unknown lint rule '" + argument(index + 1_usize) + "'") ret false
+            }
+            let level = if arg == "--allow" {
+                RuleLevel::Allow
+            } elif arg == "--warn" {
+                RuleLevel::Warn
+            } elif arg == "--deny" {
+                RuleLevel::Deny
+            } else {
+                RuleLevel::Forbid
+            }
             config.set_level(argument(index + 1_usize), level)
             index += 1_usize
-        } elif arg == "--format" { index += 1_usize }
+        } elif arg == "--format" {
+            index += 1_usize
+        }
         index += 1_usize
     }
     ret true
 }
 
-fn print_diagnostic(diagnostic: AnalyzerDiagnostic) -> () {
-    let source = if file_exists(diagnostic.path) { read_file(diagnostic.path) } else { "" }
-    eprintln(render_diagnostic(diagnostic.path, source, analyzer_diagnostic_to_frontend(diagnostic)))
-    ret ()
+fn print_diagnostic(diagnostic: AnalyzerDiagnostic, structured: FrontendDiagnostic, source: str) ->() {
+    eprintln(render_diagnostic(diagnostic.path, source, structured))
+    ret()
 }
 
-fn diagnostic_json(diagnostic: AnalyzerDiagnostic) -> str {
+fn diagnostic_json(diagnostic: AnalyzerDiagnostic, structured: FrontendDiagnostic) -> str {
     let mut fields = Vec[(str, Json)]::new()
     fields.push(field("path", Json::String(diagnostic.path)))
     fields.push(field("line", Json::Number(Debug::fmt(diagnostic.line + 1_usize))))
     fields.push(field("column", Json::Number(Debug::fmt(diagnostic.column + 1_usize))))
-    fields.push(field("severity", Json::String(if diagnostic.severity == RuleLevel::Deny || diagnostic.severity == RuleLevel::Forbid { "error" } else { "warning" })))
+    fields.push(field("severity", Json::String(if diagnostic.severity == RuleLevel::Deny || diagnostic.severity == RuleLevel::Forbid {
+                    "error"
+                } else {
+                    "warning"
+                }
+            )))
     fields.push(field("code", Json::String(diagnostic.code)))
     fields.push(field("message", Json::String(diagnostic.message)))
-    let structured = analyzer_diagnostic_to_frontend(diagnostic)
     let mut notes = Vec[Json]::new()
-    for note in structured.notes { notes.push(Json::String(note)) }
+    for note in structured.notes {
+        notes.push(Json::String(note))
+    }
     fields.push(field("notes", Json::Array(notes)))
     let mut helps = Vec[Json]::new()
-    for help in structured.helps { helps.push(Json::String(help)) }
+    for help in structured.helps {
+        helps.push(Json::String(help))
+    }
     fields.push(field("helps", Json::Array(helps)))
     let mut suggestions = Vec[Json]::new()
     for suggestion in structured.suggestions {
@@ -169,9 +237,12 @@ fn analyze_path() -> str {
     let mut index = 2_usize
     while index < argc() {
         let arg = argument(index)
-        if arg == "--allow" || arg == "--warn" || arg == "--deny" || arg == "--forbid" || arg == "--format" { index += 1_usize }
-        elif arg == "--fix" {}
-        elif !starts_with(arg, "-") { ret arg }
+        if arg == "--allow" || arg == "--warn" || arg == "--deny" || arg == "--forbid" || arg == "--format" {
+            index += 1_usize
+        } elif arg == "--fix" {
+        } elif !starts_with(arg, "-") {
+            ret arg
+        }
         index += 1_usize
     }
     ret ""
@@ -180,7 +251,9 @@ fn analyze_path() -> str {
 fn has_option(name: str) -> bool {
     let mut index = 2_usize
     while index < argc() {
-        if argument(index) == name { ret true }
+        if argument(index) == name {
+            ret true
+        }
         index += 1_usize
     }
     ret false
@@ -189,18 +262,35 @@ fn has_option(name: str) -> bool {
 fn option_value(name: str) -> str {
     let mut index = 2_usize
     while index + 1_usize < argc() {
-        if argument(index) == name { ret argument(index + 1_usize) }
+        if argument(index) == name {
+            ret argument(index + 1_usize)
+        }
         index += 1_usize
     }
     ret ""
 }
 
 fn argument(index: usize) -> str {
-    match argv(index) { Option[str]::Some(value) => { ret value } Option[str]::None => { ret "" } }
+    match argv(index) {
+        Option[str]::Some(value) => {
+            ret value
+        }
+        Option[str]::None => {
+            ret ""
+        }
+    }
 }
 
-fn starts_with(value: str, prefix: str) -> bool { ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix }
-fn ends_with(value: str, suffix: str) -> bool { ret suffix.len() <= value.len() && value.slice(value.len() - suffix.len(), suffix.len()) == suffix }
+fn starts_with(value: str, prefix: str) -> bool {
+    ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix
+}
+fn ends_with(value: str, suffix: str) -> bool {
+    ret suffix.len() <= value.len() && value.slice(value.len() - suffix.len(), suffix.len()) == suffix
+}
 
-fn argc() -> usize { ret process_arg_count() }
-fn argv(index: usize) -> Option[str] { ret process_arg(index) }
+fn argc() -> usize {
+    ret process_arg_count()
+}
+fn argv(index: usize) -> Option[str] {
+    ret process_arg(index)
+}

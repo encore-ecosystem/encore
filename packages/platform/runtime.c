@@ -1,3 +1,6 @@
+#if defined(__linux__) && !defined(__ANDROID__)
+#define _GNU_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE
@@ -88,6 +91,8 @@ typedef struct {
 #endif
     bool signaled;
 } encore_async_event;
+
+#include "async_waker_hooks.h"
 
 typedef void (*encore_thread_entry)(void *);
 typedef void (*encore_thread_cleanup)(void *);
@@ -272,6 +277,7 @@ void encore_async_waker_wait(size_t token) {
 void encore_async_waker_drop(size_t token) {
     encore_async_event *event = (encore_async_event *)(uintptr_t)token;
     if (event == NULL) return;
+    encore_async_cleanup_waker(token);
 #ifdef _WIN32
     DeleteCriticalSection(&event->lock);
 #else
@@ -280,6 +286,9 @@ void encore_async_waker_drop(size_t token) {
 #endif
     free(event);
 }
+
+#define ENCORE_HTTP_ASYNC_IN_PLATFORM
+#include "http_async.h"
 
 void *__ehir_pcast(size_t value) {
     return (void *)(uintptr_t)value;
@@ -1543,31 +1552,39 @@ static void encore_init_args_once(void) {
     atexit(encore_free_args);
 
 #ifdef _WIN32
-#ifdef __MINGW32__
-    int argc = __argc;
-    char **argv = __argv;
-#else
-    int argc = *__p___argc();
-    char **argv = *__p___argv();
-#endif
+    /* Narrow CRT argv is encoded in the active ANSI code page. Read the
+       original Unicode command line so CLI filters and paths retain UTF-8.
+       Resolve Shell32 at runtime: published bootstrap seeds need no new
+       linker flags to compile this platform runtime. */
+    HMODULE shell = LoadLibraryExW(L"shell32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (shell == NULL) return;
+    typedef LPWSTR *(WINAPI *command_line_args_fn)(LPCWSTR, int *);
+    command_line_args_fn parse_args = (command_line_args_fn)GetProcAddress(shell, "CommandLineToArgvW");
+    int argc = 0;
+    LPWSTR *argv = parse_args == NULL ? NULL : parse_args(GetCommandLineW(), &argc);
     if (argc <= 0 || argv == NULL) {
+        if (argv != NULL) LocalFree(argv);
+        FreeLibrary(shell);
         return;
     }
     g_argc = (size_t)argc;
     g_argv = calloc(g_argc, sizeof(char *));
     if (g_argv == NULL) {
         g_argc = 0;
+        LocalFree(argv);
+        FreeLibrary(shell);
         return;
     }
     for (size_t i = 0; i < g_argc; ++i) {
-        if (argv[i] != NULL) {
-            size_t len = strlen(argv[i]);
-            g_argv[i] = malloc(len + 1);
-            if (g_argv[i] != NULL) {
-                memcpy(g_argv[i], argv[i], len + 1);
-            }
+        int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argv[i], -1, NULL, 0, NULL, NULL);
+        if (bytes <= 0 || (g_argv[i] = malloc((size_t)bytes)) == NULL ||
+            WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argv[i], -1, g_argv[i], bytes, NULL, NULL) != bytes) {
+            encore_free_args();
+            break;
         }
     }
+    LocalFree(argv);
+    FreeLibrary(shell);
     return;
 #endif
 
@@ -1776,13 +1793,77 @@ encore_str encore_os_arch(void) {
 #endif
 }
 
+bool encore_os_hasenv(encore_str name) {
+    char *name_c = encore_to_cstr(name);
+    if (name_c == NULL) return false;
+#ifdef _WIN32
+    wchar_t *name_w = encore_process_utf16(name_c);
+    free(name_c);
+    if (name_w == NULL) return false;
+    SetLastError(ERROR_SUCCESS);
+    DWORD required = GetEnvironmentVariableW(name_w, NULL, 0);
+    DWORD error = GetLastError();
+    free(name_w);
+    return required != 0 || error == ERROR_SUCCESS;
+#else
+    bool present = getenv(name_c) != NULL;
+    free(name_c);
+    return present;
+#endif
+}
+
 encore_str encore_os_getenv(encore_str name) {
     char *name_c = encore_to_cstr(name);
     if (name_c == NULL) return encore_empty_str();
+#ifdef _WIN32
+    wchar_t *name_w = encore_process_utf16(name_c);
+    free(name_c);
+    if (name_w == NULL) return encore_empty_str();
+    DWORD capacity = GetEnvironmentVariableW(name_w, NULL, 0);
+    if (capacity == 0) { free(name_w); return encore_empty_str(); }
+    wchar_t *wide = malloc((size_t)capacity * sizeof(wchar_t));
+    if (wide == NULL) { free(name_w); return encore_empty_str(); }
+    DWORD length = GetEnvironmentVariableW(name_w, wide, capacity);
+    free(name_w);
+    if (length == 0 || length >= capacity) { free(wide); return encore_empty_str(); }
+    int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, (int)length, NULL, 0, NULL, NULL);
+    if (bytes <= 0) { free(wide); return encore_empty_str(); }
+    char *buffer = malloc((size_t)bytes + 1);
+    if (buffer == NULL) { free(wide); return encore_empty_str(); }
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, (int)length, buffer, bytes, NULL, NULL) != bytes) {
+        free(wide); free(buffer); return encore_empty_str();
+    }
+    free(wide);
+    buffer[bytes] = '\0';
+    return encore_from_owned_buffer(buffer, (size_t)bytes);
+#else
     const char *value = getenv(name_c);
     free(name_c);
     if (value == NULL || value[0] == '\0') return encore_empty_str();
     return encore_from_cstr_copy(value);
+#endif
+}
+
+bool encore_os_setenv(encore_str name, encore_str value) {
+    size_t name_len = encore_str_size(name), value_len = encore_str_size(value);
+    if (name_len == 0 || memchr(encore_str_data(name), '=', name_len) != NULL ||
+        memchr(encore_str_data(name), '\0', name_len) != NULL ||
+        memchr(encore_str_data(value), '\0', value_len) != NULL) return false;
+    char *name_c = encore_to_cstr(name), *value_c = encore_to_cstr(value);
+    if (name_c == NULL || value_c == NULL) { free(name_c); free(value_c); return false; }
+#ifdef _WIN32
+    wchar_t *name_w = encore_process_utf16(name_c), *value_w = encore_process_utf16(value_c);
+    bool success = name_w != NULL && value_w != NULL;
+    // Keep the CRT in sync for native libraries. The CRT removes empty values;
+    // restore their presence in the OS environment used by env() and children.
+    if (success) success = _wputenv_s(name_w, value_w) == 0;
+    if (success) success = SetEnvironmentVariableW(name_w, value_w) != 0;
+    free(name_w); free(value_w);
+#else
+    bool success = setenv(name_c, value_c, 1) == 0;
+#endif
+    free(name_c); free(value_c);
+    return success;
 }
 
 encore_str encore_os_executable_path(void) {

@@ -4,6 +4,9 @@ Use `for value in start..end` for an exclusive range and `..=` for an
 inclusive one. `while`, `do ... while`, and `loop` cover condition-driven and
 unbounded iteration. Labels let `break` and `continue` target an outer loop.
 
+Range bounds have type `usize`. Convert narrower integer values explicitly,
+for example `0..(items.count() as usize)` when `count()` returns `u32`.
+
 ```encore
 {{#include ../../examples/guide/src/features/mod.enq:loops}}
 ```

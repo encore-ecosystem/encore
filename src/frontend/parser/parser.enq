@@ -1,17 +1,15 @@
 //! Parses Encore tokens into the compiler syntax tree.
 
-import refrain::frontend::lexer::Lexer
-import refrain::frontend::lexer::Token
-import refrain::frontend::lexer::TokenType
-
-import mod::statements::*
-
 import core::fmt::Debug
 import core::option::Option
 import core::result::Result
+
 import std::io::eprintln
 import std::process::exit
 import std::vec::Vec
+
+import mod::statements::*
+import refrain::frontend::lexer::{Lexer, Token, TokenType}
 
 /// A parser failure which library consumers can handle without exiting.
 pub struct ParseFailure {
@@ -848,7 +846,7 @@ impl for Parser {
         let mut trait_name = Option[str]::None
         let mut trait_args = Vec[str]::new()
         if self.peek_curr_type() != TokenType::KW_FOR {
-            trait_name = Option[str]::Some(self.safe_consume_value(TokenType::IDENTIFIER)?)
+            trait_name = Option[str]::Some(self.parse_bound_path()?)
             trait_args = self.parse_possible_generics()?
         }
 
@@ -1125,6 +1123,40 @@ impl for Parser {
         ret Result[str, ParseFailure]::Ok(out)
     }
 
+    fn parse_field_attributes(mut self) -> Result[Vec[(str, str)], ParseFailure] {
+        let mut attributes = Vec[(str, str)]::new()
+        while self.peek_curr_type() == TokenType::HASH {
+            let token = self.consume()
+            let mut namespace = self.metadata_directive(token.value)
+            if self.peek_curr_type() == TokenType::IDENTIFIER {
+                namespace = self.consume_value()
+            }
+            if namespace == "" {
+                self.unexpected_token("field attribute name", self.peek_curr())?
+            }
+            self.safe_consume(TokenType::LEFT_PAREN)?
+            while self.peek_curr_type() != TokenType::RIGHT_PAREN {
+                let key = self.safe_consume_value(TokenType::IDENTIFIER)?
+                self.safe_consume(TokenType::ASSIGN)?
+                let raw = self.safe_consume(TokenType::STRING)?
+                let value = decode_field_attribute(raw.value)
+                let name = namespace + "." + key
+                for previous in attributes {
+                    if previous.0 == name {
+                        self.error_at("duplicate field attribute", raw)?
+                    }
+                }
+                attributes.push((name, value))
+                if self.peek_curr_type() != TokenType::COMMA {
+                    break
+                }
+                self.consume()
+            }
+            self.safe_consume(TokenType::RIGHT_PAREN)?
+        }
+        ret Result::Ok(attributes)
+    }
+
     fn parse_structure_shape(mut self, documentation: Option[Documentation]) -> Result[ParsedEnumVariant, ParseFailure] {
         let name_token = self.safe_consume(TokenType::IDENTIFIER)?
         let name = name_token.value
@@ -1139,12 +1171,13 @@ impl for Parser {
                 }
                 self.record_source_layout(self.peek_curr(), SourceLayoutRole::FieldStart)
                 let field_documentation = self.parse_documentation()
+                let field_attributes = self.parse_field_attributes()?
                 let field_token = self.safe_consume(TokenType::IDENTIFIER)?
                 let field_name = field_token.value
                 self.safe_consume(TokenType::COLON)?
                 let field_type = self.parse_type()?
                 named_fields.push(NamedField {
-                        field_name, field_type, field_documentation, field_token.line, field_token.column
+                        field_attributes, field_name, field_type, field_documentation, field_token.line, field_token.column
                     }
                     ,
                 )
@@ -3255,5 +3288,15 @@ impl for Parser {
 
     fn is_at_end(mut self) -> bool {
         ret self.peek_curr_type() == TokenType::EOF
+    }
+}
+
+extern fn encore_unescape_string_literal(value: str) -> str
+fn decode_field_attribute(raw: str) -> str {
+    if raw.byte_len() < 2 {
+        ret ""
+    }
+    ret unsafe {
+        encore_unescape_string_literal(raw.slice_bytes(1, raw.byte_len() - 2))
     }
 }

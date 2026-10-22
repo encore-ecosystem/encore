@@ -1,0 +1,267 @@
+import core::future::{Future, Poll, Context}
+import core::option::Option
+import core::result::Result
+import std::fs::read_dir
+import std::future::block_on
+import std::http::{HTTPAsyncClient, HttpClientConfig, HttpResponse, HTTPError, HTTPErrorKind, HTTPResponseFuture, HTTPCancellationToken}
+import std::io::println
+import std::os::env
+import std::time::perf_counter_ms
+
+struct RaceFast {
+    slow: Option[HTTPResponseFuture]
+    fast: HTTPResponseFuture
+    started: u64
+}
+
+impl Future[Result[HttpResponse, HTTPError]] for RaceFast {
+    fn poll(self: Self, context: Context) -> Poll[Self, Result[HttpResponse, HTTPError]] {
+        let mut slow = self.slow
+        match slow {
+            Option::Some(request) => {
+                match request.poll(context) {
+                    Poll::Pending(next) => {
+                        slow = Option[HTTPResponseFuture]::Some(next)
+                    }
+                    Poll::Ready(_) => {
+                        slow = Option[HTTPResponseFuture]::None
+                    }
+                }
+            }
+            Option::None => {
+            }
+        }
+        match self.fast.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { slow, next, self.started })
+            }
+            Poll::Ready(result) => {
+                if perf_counter_ms() - self.started > 1500_u64 {
+                    ret Poll::Ready(Result::Err(HTTPError {
+                                HTTPErrorKind::Timeout, "fast request blocked behind long polling"
+                            }
+                            ,
+                        ))
+                }
+                ret Poll::Ready(result)
+            }
+        }
+    }
+}
+struct CancelRequest {
+    request: HTTPResponseFuture
+    token: HTTPCancellationToken
+}
+
+impl Future[Result[HttpResponse, HTTPError]] for CancelRequest {
+    fn poll(self: Self, context: Context) -> Poll[Self, Result[HttpResponse, HTTPError]] {
+        match self.request.poll(context) {
+            Poll::Pending(next) => {
+                self.token.cancel() ret Poll::Pending(Self { next, self.token })
+            }
+            Poll::Ready(result) => {
+                ret Poll::Ready(result)
+            }
+        }
+    }
+}
+
+fn thread_count() -> usize {
+    ret read_dir("/proc/self/task").len()
+}
+struct CapacityProbe {
+    first: HTTPResponseFuture
+    second: HTTPResponseFuture
+}
+
+impl Future[bool] for CapacityProbe {
+    fn poll(self: Self, context: Context) -> Poll[Self, bool] {
+        let first = match self.first.poll(context) {
+            Poll::Pending(next) => next Poll::Ready(_) => {
+                ret Poll::Ready(false)
+            }
+        }
+        match self.second.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { first, next })
+            }
+            Poll::Ready(outcome) => {
+                match outcome {
+                    Result::Ok(_) => {
+                        ret Poll::Ready(false)
+                    }
+                    Result::Err(error) => {
+                        ret Poll::Ready(match error.kind {
+                                HTTPErrorKind::Capacity => true _ => false
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+struct ShutdownProbe {
+    request: HTTPResponseFuture
+    runtime: HTTPAsyncClient
+}
+
+impl Future[bool] for ShutdownProbe {
+    fn poll(self: Self, context: Context) -> Poll[Self, bool] {
+        match self.request.poll(context) {
+            Poll::Ready(_) => {
+                ret Poll::Ready(false)
+            }
+            Poll::Pending(_) => {
+                ret Poll::Ready(self.runtime.close())
+            }
+        }
+    }
+}
+
+fn main() -> u32 {
+    let url = env("JEV_TEST_URL").unwrap_or("")
+    if url == "" {
+        ret 0_u32
+    }
+    let initial_threads = thread_count()
+    let limited = match HTTPAsyncClient::with_capacity(1_usize) {
+        Result::Ok(value) => value Result::Err(_) => {
+            ret 20_u32
+        }
+    }
+    with limited as limited {
+        let client = limited.with_config(HttpClientConfig::default().with_ca_file(env("JEV_TEST_CA").unwrap_or("")))
+        if !block_on[bool, CapacityProbe](CapacityProbe {
+                client.get(url + "/slow"), client.get(url + "/binary")
+            }
+            ,) {
+            ret 21_u32
+        }
+    }
+    let runtime = match HTTPAsyncClient::new() {
+        Result::Ok(value) => value
+        Result::Err(error) => {
+            println(error.message) ret 1_u32
+        }
+    }
+    with runtime as runtime {
+        let client = runtime.with_config(HttpClientConfig::default().with_ca_file(env("JEV_TEST_CA").unwrap_or("")))
+        match block_on[Result[HttpResponse, HTTPError], HTTPResponseFuture](client.get(url + "/binary")) {
+            Result::Ok(response) => {
+                if response.status() != 200_u16 || response.body().len() != 4_usize || response.body().byte_at(1_usize) != 0_u8 || response.body().byte_at(2_usize) != 255_u8 {
+                    ret 2_u32
+                }
+            }
+            Result::Err(error) => {
+                println(error.message) ret 3_u32
+            }
+        }
+        let race = RaceFast {
+            Option::Some(client.get(url + "/slow")), client.get(url + "/binary"), perf_counter_ms()
+        }
+        match block_on[Result[HttpResponse, HTTPError], RaceFast](race) {
+            Result::Ok(_) => {
+            }
+            Result::Err(error) => {
+                println(error.message) ret 4_u32
+            }
+        }
+        if initial_threads == 0_usize || thread_count() != initial_threads + 1_usize {
+            ret 22_u32
+        }
+        let chunked = match block_on[Result[HttpResponse, HTTPError], HTTPResponseFuture](client.get(url + "/chunked")) {
+            Result::Ok(value) => value Result::Err(error) => {
+                println(error.message) ret 5_u32
+            }
+        }
+        if chunked.body().len() != 4_usize || chunked.body().byte_at(1_usize) != 0_u8 {
+            ret 6_u32
+        }
+        let large = match block_on[Result[HttpResponse, HTTPError], HTTPResponseFuture](client.get(url + "/large")) {
+            Result::Ok(value) => value Result::Err(error) => {
+                println(error.message) ret 7_u32
+            }
+        }
+        if large.body().len() != 1000000_usize {
+            ret 8_u32
+        }
+        for path in vec!["/truncated", "/ambiguous"] {
+            if block_on[Result[HttpResponse, HTTPError], HTTPResponseFuture](client.get(url + path)).is_ok() {
+                ret 9_u32
+            }
+        }
+        let small = client.with_config(HttpClientConfig::default().with_ca_file(env("JEV_TEST_CA").unwrap_or("")).with_max_body_size(2_usize))
+        if block_on[Result[HttpResponse, HTTPError], HTTPResponseFuture](small.get(url + "/binary")).is_ok() {
+            ret 10_u32
+        }
+        let short = client.with_config(HttpClientConfig::default().with_ca_file(env("JEV_TEST_CA").unwrap_or("")).with_timeout_ms(100_usize))
+        match block_on[Result[HttpResponse, HTTPError], HTTPResponseFuture](short.get(url + "/slow")) {
+            Result::Ok(_) => {
+                ret 11_u32
+            }
+            Result::Err(error) => {
+                match error.kind {
+                    HTTPErrorKind::Timeout => {
+                    }
+                    _ => {
+                        ret 12_u32
+                    }
+                }
+            }
+        }
+        let token = runtime.cancellation_token()
+        let pending = CancelRequest {
+            client.get(url + "/slow").with_cancellation(token), token
+        }
+        match block_on[Result[HttpResponse, HTTPError], CancelRequest](pending) {
+            Result::Ok(_) => {
+                ret 13_u32
+            }
+            Result::Err(error) => {
+                match error.kind {
+                    HTTPErrorKind::Cancelled => {
+                    }
+                    _ => {
+                        ret 14_u32
+                    }
+                }
+            }
+        }
+        if env("JEV_TEST_CA").unwrap_or("") != "" {
+            if block_on[Result[HttpResponse, HTTPError], HTTPResponseFuture](runtime.get(url + "/binary")).is_ok() {
+                ret 15_u32
+            }
+            let mismatch = env("JEV_TEST_BAD_HOST").unwrap_or("")
+            if block_on[Result[HttpResponse, HTTPError], HTTPResponseFuture](client.get(mismatch + "/binary")).is_ok() {
+                ret 16_u32
+            }
+        }
+    }
+    let closing = match HTTPAsyncClient::new() {
+        Result::Ok(value) => value Result::Err(_) => {
+            ret 23_u32
+        }
+    }
+    with closing as closing {
+        let client = closing
+        if !block_on[bool, ShutdownProbe](ShutdownProbe { client.get(url + "/slow"), closing }) {
+            ret 24_u32
+        }
+        match block_on[Result[HttpResponse, HTTPError], HTTPResponseFuture](client.get(url + "/binary")) {
+            Result::Ok(_) => {
+                ret 25_u32
+            }
+            Result::Err(error) => {
+                match error.kind {
+                    HTTPErrorKind::Closed => {
+                    }
+                    _ => {
+                        ret 26_u32
+                    }
+                }
+            }
+        }
+    }
+    ret 0_u32
+}

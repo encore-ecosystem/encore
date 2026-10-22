@@ -11,11 +11,35 @@ Add it to a package with:
 name = "my_app"
 target = "auto"
 dependencies = [
-    "index@std@1.0.0",
+    "index@std@^0.0.5",
 ]
 ```
 
-Applications normally resolve this package as `index@std@1.0.0`.
+Applications resolve this package through the configured Encore registry.
+
+## HTTP
+
+The patched local Encore 0.1.6 build provides `std::http::HTTPSyncClient` and `HTTPAsyncClient`.
+Both use `HttpRequest`, `HttpResponse`, `HttpClientConfig`, `HTTPError` and
+`HTTPErrorKind`. `send` performs one request without redirects or retries.
+The compatibility `HttpClient` API, including its redirecting `get`, remains.
+
+`HTTPSyncClient::new().get(url)` blocks and returns a result.
+`HTTPAsyncClient::new()` returns a result containing a client that owns one
+reactor thread. Use a with-context or explicitly close the client. Its `get`
+and `send` return lazy `HTTPResponseFuture` values for ordinary `await` or
+`std::future::block_on`; there is no HTTP-specific executor function.
+
+Closing a client stops and joins its reactor. Waker teardown cancels abandoned
+requests across clients before the executor event is freed. A pending future
+has one consumer and must not be polled concurrently or moved between executors.
+Clients are thread-affine; copies share the same close state.
+
+The initial async backend supports Linux with OpenSSL and c-ares >=1.34
+development packages. Other targets return a configuration error on async
+client creation; the sync client uses the existing platform TLS transport.
+HTTP/1.1 framing, binary bodies, DNS, TLS verification, cancellation, timeouts
+and bounded request capacity are supported. Plain HTTP is restricted to loopback.
 
 ## Imports
 
@@ -200,18 +224,26 @@ fn config_path() -> str {
 
 ### `std::fs`
 
+`import std::fs::File` provides checked file operations: `open`, `create`,
+`read`, `read_all`, `read_line`, `write_all`, `flush`, `close`, and `lines`.
+Use `with file as stream` with `core::ops::ContextManager` for cleanup on early
+exit. `File` is also available through `std::io`.
+
 String-path filesystem helpers:
 
 - `exists(path) -> bool`
 - `read_to_string(path) -> String`
 - `read_to_str(path) -> str`
-- `write(path, contents) -> i32`
+- `read(path) -> Result[str, IoError]`
+- `write(path, contents) -> Result[(), IoError]`
+- `fs_write(path, contents) -> i32`
 - `remove_file(path) -> i32`
 - `create_dir(path) -> i32`
 - `read_dir(path) -> Vec[str]`
 
-Return codes are native-style integer codes for this beta. `0_i32` means
-success for write/remove/create operations.
+Checked reads and writes report open, transfer and close failures. The legacy
+`fs_write`, remove and create operations return native status codes; zero means
+success.
 
 ## OS, Process And Time
 
@@ -306,9 +338,10 @@ with `with` when the program should close them at block exit.
 
 `std::tls` exposes the verified blocking TLS client implemented by the
 target-selected `platform` refrain.
-`std::http` builds a synchronous HTTPS-only HTTP/1.1 client on that stream:
+`std::http` provides the synchronous and asynchronous clients described above,
+as well as the compatibility client on that stream:
 
-- `Url::parse(value)` parses absolute `https://` URLs;
+- `Url::parse(value)` parses absolute HTTPS URLs and loopback HTTP URLs;
 - `HttpRequest::get(url)` and `encode()` create HTTP/1.1 requests;
 - `HttpClient::new().get(url)` follows HTTPS redirects and returns `HttpResponse`;
 - `HttpClientConfig` configures a private CA file, redirect limit, response-body
@@ -327,10 +360,10 @@ fn fetch() -> str {
 }
 ```
 
-The initial client is blocking and supports HTTP/1.0 and HTTP/1.1 responses,
+The compatibility client is blocking and supports HTTP/1.0 and HTTP/1.1 responses,
 `Content-Length`, connection-close framing, chunked transfer encoding and
-absolute or root-relative HTTPS redirects. Async networking, HTTP/2, connection
-pooling and server-side TLS remain separate follow-up work.
+absolute or root-relative HTTPS redirects. HTTP/2, connection pooling and
+server-side TLS remain follow-up work.
 
 ## Math And Random
 

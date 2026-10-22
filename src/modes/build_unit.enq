@@ -3,34 +3,38 @@
 import core::fmt::Debug
 import core::option::Option
 import core::result::Result
-import ehir_llvm_backend::codegen::{incremental_codegen_context_bundle, prepare_unit_codegen, unit_codegen_context, unit_codegen_owned, unit_codegen_requirements, PreparedUnitCodegen}
+
+import std::os::{file_exists, file_sha256, read_file, write_file}
+import std::path::Path
+import std::time::perf_counter_ms
+import std::vec::Vec
+
+import ehir_llvm_backend::codegen::{PreparedUnitCodegen, incremental_codegen_context_bundle, prepare_unit_codegen, unit_codegen_context, unit_codegen_owned, unit_codegen_requirements}
 import ehirlib::core::{Module, make_module_bundle}
-import ehirlib::{parse_module_bundle_text, module_bundle_to_string}
+import ehirlib::{module_bundle_to_string, parse_module_bundle_text}
 import json::{Json, stringify}
+
 import mod::build_artifacts::{UnitReady, read_unit_ready}
 import mod::build_fingerprint::unit_fingerprint
-import mod::build_frontend_cache::{read_frontend_unit, publish_frontend_unit}
-import mod::build_lowering_cache::{restore_lowered_module, commit_lowered_module, restore_lowered_function, commit_lowered_function}
-import mod::build_metadata::{RefrainMetadata, MetadataModule, MetadataDependency}
+import mod::build_frontend_cache::{publish_frontend_unit, read_frontend_unit}
+import mod::build_lowering_cache::{commit_lowered_function, commit_lowered_module, restore_lowered_function, restore_lowered_module}
+import mod::build_metadata::{MetadataDependency, MetadataModule, RefrainMetadata}
 import mod::build_prepared_cache::read_prepared_unit
 import mod::build_request::{BuildUnitRequest, UnitMetadataInput, graph_package, unit_source_digest}
 import mod::build_requirements::UnitRequirements
 import refrain::cache_identity::compiler_content_digest
 import refrain::diagnostics::render_diagnostic
+import refrain::frontend::{FrontendCallable, FrontendDocument, FrontendSymbol}
 import refrain::frontend::analysis::analyze_source
 import refrain::frontend::analysis_database::function_declaration_position
 import refrain::frontend::metadata_ast::encode_codegen_context_ast
 import refrain::frontend::parser::Statement
+import refrain::frontend::reflection::{mark_reflection_templates, reflection_template_names}
 import refrain::frontend::safety::FunctionSafety
-import refrain::frontend::translator::{TranslationModule, filter_ast_for_target, translate_cached_compilation_unit_to_ehir_chunks, assemble_ehir_module_bundle, TranslatedModuleChunk, CachedFunctionChunk, CachedCompilationChunks, lowering_function_key, translate_compilation_unit_to_ehir_chunks}
-import refrain::frontend::{FrontendDocument, FrontendSymbol, FrontendCallable}
+import refrain::frontend::translator::{CachedCompilationChunks, CachedFunctionChunk, TranslatedModuleChunk, TranslationModule, assemble_ehir_module_bundle, filter_ast_for_target, lowering_function_key, translate_cached_compilation_unit_to_ehir_chunks, translate_compilation_unit_to_ehir_chunks}
 import refrain::project::failure::ProjectFailure
-import refrain::project::workspace::{ProjectWorkspace, CompiledWorkspaceModule, try_load_compilation_unit}
+import refrain::project::workspace::{CompiledWorkspaceModule, ProjectWorkspace, try_load_compilation_unit}
 import refrain::target::{TargetSpec, parse_target}
-import std::os::{file_exists, file_sha256, read_file, write_file}
-import std::path::Path
-import std::time::perf_counter_ms
-import std::vec::Vec
 
 /// The frontend publishes declarations and compact EHIR templates separately
 /// from ordinary bodies. Dependency sources and archives are not in this value.
@@ -271,9 +275,15 @@ pub fn prepare_compilation_unit(request: BuildUnitRequest) -> Result[PreparedCom
     let mut translations = Vec[TranslationModule]::new()
     let mut selected = Vec[usize]::new()
     let mut declarations = Vec[MetadataModule]::new()
+    let mut reflection_ast = Vec[Statement]::new()
+    for module in workspace.modules {
+        reflection_ast.extend(module.ast)
+    }
+    let reflection_names = reflection_template_names(reflection_ast)
     let mut index = 0_usize
     for module in workspace.modules {
-        let ast = filter_ast_for_target(module.ast, target, module.enabled_features)
+        let ast = mark_reflection_templates(
+            filter_ast_for_target(module.ast, target, module.enabled_features), reflection_names,)
         translations.push(TranslationModule {
                 module.module_id, module.module_path.as_str(),
                 module.source, module.documentation, module.resolved_imports, ast, module.enabled_features,

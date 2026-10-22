@@ -22,10 +22,14 @@ encore.toml
 src/main.enq
 README.md
 .gitignore
+.agents/AGENTS.md
 ```
 
 The generated `.gitignore` excludes `target/` and the local LSP cache
 `.encore_cache/`. An existing `.gitignore` is preserved.
+The generated `.agents/AGENTS.md` contains basic Encore project guidance;
+an existing instructions file is preserved. New Git repositories start on
+`main`. Existing repositories retain their current branch.
 
 A minimal executable is:
 
@@ -50,9 +54,8 @@ manifest:
 ```toml
 [project]
 name = "hello"
-target = "auto"
 version = "0.0.0"
-description = ""
+description = "TODO"
 readme = "README.md"
 licence = "MIT"
 dependencies = [

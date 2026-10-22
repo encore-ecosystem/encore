@@ -23,7 +23,7 @@ test -f packages/core/encore.toml
 export ENCORE_CORE_DIR="$PWD/packages/core"
 
 mkdir -p target/stage1-builder
-"$seed_compiler" build --profile extreme
+bash "$(dirname "$0")/ci-seed-build.sh" "$seed_compiler" "$seed_tag" build --profile extreme
 cp target/extreme/encore target/stage1-builder/encore
 builder="$PWD/target/stage1-builder/encore"
 chmod +x "$builder"

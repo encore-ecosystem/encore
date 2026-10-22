@@ -51,6 +51,10 @@ Current server capabilities:
   missing packages report a recoverable error asking the user to run `encore sync`.
   Documentation rules (`missing-module-docstring` and
   `missing-public-docstring`) are opt-in through `[lint.rules]`.
+  Lint diagnostics reuse the parsed AST from the shared analysis database,
+  including after restoring declaration metadata from the editor cache.
+  Unused imports, bindings and enabled dead-code findings carry the LSP
+  `Unnecessary` tag so editors can dim their ranges.
 - `textDocument/prepareCallHierarchy`, `callHierarchy/outgoingCalls`, `callHierarchy/incomingCalls` for callable symbols.
 - Dynamic watching of `encore.toml` and `encore.lock`; package changes refresh
   workspace indexing and diagnostics without restarting the server.
@@ -113,6 +117,16 @@ Install the editor-facing binary with the stable launcher name:
 encore install --path . --name encore-lsp --force --profile release
 ```
 
+The compiler and language server are separate executables. Installing a new
+`encore` binary does not replace `encore-lsp`. After frontend changes, rebuild
+and install the language server too, then restart it in the editor. Compare
+`encore --version` and `encore-lsp --version` when investigating CLI/editor
+disagreements. An already running server keeps its previous executable image.
+
+The Zed extension prefers a configured server or one found on PATH over a
+managed download, so an old system `encore-lsp` can remain selected until it is
+updated.
+
 The server communicates over stdio. Configure an editor client with the
 absolute path to `target/release/lsp`; no Python runtime or wrapper process is
 required. LSP positions and ranges use UTF-16 as required by the protocol, and
@@ -125,6 +139,7 @@ python3 tests/docstrings.py target/dev/lsp
 python3 tests/scheduler.py target/dev/lsp
 python3 tests/protocol_features.py target/dev/lsp
 python3 tests/workspace_graph.py target/dev/lsp
+python3 tests/async_imports.py target/dev/lsp
 python3 tests/autoimports.py target/release/lsp
 python3 tests/offline_dependencies.py target/release/lsp
 python3 tests/member_completion.py target/release/lsp

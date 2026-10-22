@@ -1,28 +1,28 @@
+import mod::cache_policy::has_flag
 //! Provides the `test` module.
 
-import argparse::{process_arg_count, process_arg}
 import core::fmt::Debug
 import core::option::Option
-import json::{Json, field, stringify}
-import std::io::eprintln
-import std::io::println
-import std::os::mkdir_all
-import std::os::{file_exists, read_dir, read_file, remove_file, write_file}
-import std::path::Path
-import std::path::clone_path
+
+import std::io::{eprintln, println}
+import std::os::{file_exists, mkdir_all, read_dir, read_file, remove_file, write_file}
+import std::path::{Path, clone_path}
 import std::process::{run_args, run_args_capture}
 import std::thread::{JoinHandle, available_parallelism}
 import std::time::perf_counter_ms
 import std::vec::Vec
 
+import argparse::{process_arg, process_arg_count}
+import json::{Json, field, stringify}
+import rich::TestProgress
+
 import mod::build::compile_test_ast
 import refrain::cache_identity::compiler_content_digest
 import refrain::diagnostics::render_diagnostic
-import refrain::frontend::parser::statements::FunctionItem
 import refrain::frontend::{Lexer, Parser, Statement}
-import refrain::project::{ProjectWorkspace, WorkspaceModule, load_library_workspace, load_entry_workspace}
+import refrain::frontend::parser::statements::FunctionItem
+import refrain::project::{ProjectWorkspace, WorkspaceModule, load_entry_workspace, load_library_workspace}
 import refrain::target::{cfg_active_with_features, host_target, target_executable_name}
-import rich::TestProgress
 
 struct TestSelection {
     filter: str
@@ -56,8 +56,18 @@ struct UnitTestJob {
     failure: str
 }
 
+extern fn encore_compiler_keep_build_artifacts() -> bool
+
 /// Performs the `native_test` operation.
 pub fn native_test() -> u32 {
+    if has_flag("--keep-build-artifacts") {
+        let retained = unsafe {
+            encore_compiler_keep_build_artifacts()
+        }
+        if !retained {
+            eprintln("cannot retain test build artifacts") ret 1_u32
+        }
+    }
     let root = Path::new(".").resolve()
     if has_switch("--_worker-harness") {
         let workspace = if file_exists(root.join("src").join("lib.enq").as_str()) {
@@ -203,7 +213,6 @@ pub fn native_test() -> u32 {
                         ,
                     )
                 }
-                print_parallel_test_result(result)
             }
         }
         unit_result_index += 1_usize
@@ -268,7 +277,6 @@ pub fn native_test() -> u32 {
                         ,
                     )
                 }
-                print_parallel_test_result(result)
             }
         }
         result_index += 1_usize
@@ -373,16 +381,11 @@ fn list_selected_tests(root: Path, workspace: ProjectWorkspace, selection: TestS
 }
 
 fn test_selected(id: str, selection: TestSelection) -> bool {
-    if selection.filter != "" && !contains(id, selection.filter) {
-        ret false
-    }
-    ret true
+    ret selection.filter == "" || contains(id, selection.filter)
 }
 
 fn test_selection() -> TestSelection {
-    ret TestSelection {
-        test_filter()
-    }
+    ret TestSelection { test_filter() }
 }
 
 fn decimal_value(value: str) -> usize {
@@ -453,7 +456,7 @@ fn unit_test_relative_path(root: str, source: str) -> str {
         }
     )
     if starts_with(module_path, prefix) {
-        module_path = module_path.slice(prefix.len(), module_path.len() - prefix.len())
+        module_path = module_path.slice_bytes(prefix.byte_len(), module_path.byte_len() - prefix.byte_len())
     }
     ret module_path
 }
@@ -718,10 +721,11 @@ fn run_unit_test_batch(root: frozen Path, jobs: frozen Vec[UnitTestJob], harness
                 } else {
                     run_unit_test_isolated(root, job)
                 }
-                out.push(StandaloneTestResult {
-                        job.index, display, perf_counter_ms() - started, failure
-                    }
-                    ,)
+                let result = StandaloneTestResult {
+                    job.index, display, perf_counter_ms() - started, failure
+                }
+                print_parallel_test_result(result)
+                out.push(result)
             }
             None => {
             }
@@ -843,10 +847,11 @@ fn run_standalone_test_batch(root: frozen Path, jobs: frozen Vec[StandaloneTestJ
                 let started = perf_counter_ms()
                 let display = "" + job.display
                 let failure = run_standalone_test(root, Path::new("" + job.path), display)
-                out.push(StandaloneTestResult {
-                        job.index, display, perf_counter_ms() - started, failure
-                    }
-                    ,)
+                let result = StandaloneTestResult {
+                    job.index, display, perf_counter_ms() - started, failure
+                }
+                print_parallel_test_result(result)
+                out.push(result)
             }
             None => {
             }
@@ -1104,20 +1109,21 @@ fn test_summary_preserves_structured_diagnostic_contract() -> bool {
 }
 
 fn contains(value: str, needle: str) -> bool {
-    let mut index = 0_usize
-    while index + needle.len() <= value.len() {
-        if value.slice(index, needle.len()) == needle {
-            ret true
-        }
-        index = index + 1_usize
-    }
-    ret false
+    ret needle.byte_len() == 0_usize || value.find_from(needle, 0_usize) < value.byte_len()
 }
 fn starts_with(value: str, prefix: str) -> bool {
-    ret prefix.len() <= value.len() && value.slice(0_usize, prefix.len()) == prefix
+    ret value.range_eq(0_usize, prefix.byte_len(), prefix)
 }
 fn ends_with(value: str, suffix: str) -> bool {
-    ret suffix.len() <= value.len() && value.slice(value.len() - suffix.len(), suffix.len()) == suffix
+    ret suffix.byte_len() <= value.byte_len() && value.range_eq(value.byte_len() - suffix.byte_len(), suffix.byte_len(), suffix)
+}
+
+#attr(test)
+fn test_utf8_discovery_and_filter_contract() -> bool {
+    ret ends_with("пример.enq", ".enq") && !ends_with("пример.txt", ".enq") &&
+    starts_with("путь/пример.enq", "путь/") && contains("путь/пример.enq", "пример") &&
+    !contains("путь/пример.enq", "другой") && contains("", "") &&
+    unit_test_relative_path("/work/проект", "/work/проект/src/lib.enq") == "src/lib.enq"
 }
 fn arg_or(index: usize, fallback: str) -> str {
     match argv(index) {

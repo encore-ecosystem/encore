@@ -1,0 +1,214 @@
+//! Source-preserving boundaries for unused import fixes, shared by CLI and LSP.
+
+import core::vec::Vec
+
+import refrain::frontend::{DiagnosticSuggestion, SuggestionApplicability, Token, TokenType}
+
+fn at(tokens: Vec[Token], index: usize) -> Token {
+    ret tokens.get(index).unwrap_or(Token::new(TokenType::EOF, "", 0_usize, 0_usize))
+}
+
+fn selected(token: Token, removals: Vec[Token]) -> bool {
+    for removal in removals {
+        if token.line == removal.line && token.column == removal.column {
+            ret true
+        }
+    }
+    ret false
+}
+
+// Walk only the import path grammar. Positions remain those of the original
+// tokens; no name lookup or diagnostic-message parsing takes place here.
+fn rewrite_path(tokens: Vec[Token], start: usize, removals: Vec[Token], bindings: mut Vec[Token]) ->(usize, str) {
+    let first = at(tokens, start)
+    if first.type != TokenType::IDENTIFIER {
+        ret(start, "")
+    }
+    let mut index = start + 1_usize
+    let mut text = first.value
+    let mut name = first
+    let mut group = false
+    while at(tokens, index).type == TokenType::SCOPE {
+        index += 1_usize
+        let part = at(tokens, index)
+        if part.type == TokenType::LEFT_BRACE {
+            group = true
+            index += 1_usize
+            let mut members = ""
+            let mut kept = 0_usize
+            while at(tokens, index).type != TokenType::RIGHT_BRACE {
+                let child = rewrite_path(tokens, index, removals, bindings)
+                if child.0 == index {
+                    ret(start, "")
+                }
+                index = child.0
+                if child.1 != "" {
+                    if members != "" {
+                        members += ", "
+                    }
+                    members += child.1
+                    kept += 1_usize
+                }
+                if at(tokens, index).type != TokenType::COMMA {
+                    break
+                }
+                index += 1_usize
+            }
+            if at(tokens, index).type != TokenType::RIGHT_BRACE {
+                ret(start, "")
+            }
+            index += 1_usize
+            text = if members == "" {
+                ""
+            } elif kept == 1_usize {
+                text + "::" + members
+            } else {
+                text + "::{" + members + "}"
+            }
+            break
+        }
+        if part.type != TokenType::IDENTIFIER && part.type != TokenType::ASTERISK {
+            ret(start, "")
+        }
+        text += "::" + part.value
+        name = part
+        index += 1_usize
+        if part.type == TokenType::ASTERISK {
+            break
+        }
+    }
+    if at(tokens, index).type == TokenType::KW_AS {
+        name = at(tokens, index + 1_usize)
+        if name.type != TokenType::IDENTIFIER || group {
+            ret(start, "")
+        }
+        text += " as " + name.value
+        index += 2_usize
+    }
+    if !group && name.type != TokenType::ASTERISK {
+        bindings.push(name)
+        if selected(name, removals) {
+            text = ""
+        }
+    }
+    ret(index, text)
+}
+
+/// Returns exact local binding tokens for non-public, top-level imports.
+pub fn import_bindings(tokens: Vec[Token]) -> Vec[Token] {
+    let mut bindings = Vec[Token]::new()
+    let mut index = 0_usize
+    let mut depth = 0_usize
+    while index < tokens.len() {
+        let token = at(tokens, index)
+        if token.type == TokenType::KW_IMPORT && depth == 0_usize {
+            let mut names = Vec[Token]::new()
+            let parsed = rewrite_path(tokens, index + 1_usize, Vec[Token]::new(), names)
+            if parsed.0 > index + 1_usize {
+                if index == 0_usize || at(tokens, index - 1_usize).type != TokenType::KW_PUB {
+                    bindings.extend(names)
+                }
+                index = parsed.0
+                continue
+            }
+        }
+        if token.type == TokenType::LEFT_BRACE {
+            depth += 1_usize
+        }
+        if token.type == TokenType::RIGHT_BRACE && depth > 0_usize {
+            depth -= 1_usize
+        }
+        index += 1_usize
+    }
+    ret bindings
+}
+
+fn source_offset(source: str, token: Token) -> usize {
+    let mut line = 0_usize
+    let mut index = 0_usize
+    while index < source.char_len() && line < token.line {
+        if source.get(index).unwrap_or("") == "\n" {
+            line += 1_usize
+        }
+        index += 1_usize
+    }
+    ret index + token.column
+}
+
+/// Produces one non-overlapping edit per import, including nested selections.
+/// Comments inside a modified group are retained by declining that edit.
+pub fn import_removal_edits(path: str, source: str, tokens: Vec[Token], removals: Vec[Token]) -> Vec[DiagnosticSuggestion] {
+    let mut edits = Vec[DiagnosticSuggestion]::new()
+    let mut index = 0_usize
+    let mut depth = 0_usize
+    while index < tokens.len() {
+        let token = at(tokens, index)
+        if token.type == TokenType::KW_IMPORT && depth == 0_usize {
+            let mut bindings = Vec[Token]::new()
+            let parsed = rewrite_path(tokens, index + 1_usize, removals, bindings)
+            if parsed.0 > index + 1_usize {
+                let mut changed = false
+                for binding in bindings {
+                    if selected(binding, removals) {
+                        changed = true
+                    }
+                }
+                let is_public = index > 0_usize && at(tokens, index - 1_usize).type == TokenType::KW_PUB
+                if changed && !is_public {
+                    let last = at(tokens, parsed.0 - 1_usize)
+                    let start = source_offset(source, token)
+                    let mut end = source_offset(source, last) + last.value.char_len()
+                    let original = source.slice(start, end - start)
+                    // Comments are not encoded in compact tokens. Never remove
+                    // them, or a semicolon/statement following the import.
+                    if !has_comment(original) {
+                        let replacement = if parsed.1 == "" {
+                            ""
+                        } else {
+                            "import " + parsed.1
+                        }
+                        if replacement == "" && token.column == 0_usize {
+                            let mut after = end
+                            while source.get(after).unwrap_or("") == " " || source.get(after).unwrap_or("") == "\t" {
+                                after += 1_usize
+                            }
+                            if source.get(after).unwrap_or("") == "\r" {
+                                after += 1_usize
+                            }
+                            if source.get(after).unwrap_or("") == "\n" {
+                                end = after + 1_usize
+                            }
+                        }
+                        edits.push(DiagnosticSuggestion {
+                                path, token.line, token.column, end - start, replacement, "Remove unused imports", SuggestionApplicability::MachineApplicable
+                            }
+                            ,
+                        )
+                    }
+                }
+                index = parsed.0
+                continue
+            }
+        }
+        if token.type == TokenType::LEFT_BRACE {
+            depth += 1_usize
+        }
+        if token.type == TokenType::RIGHT_BRACE && depth > 0_usize {
+            depth -= 1_usize
+        }
+        index += 1_usize
+    }
+    ret edits
+}
+
+fn has_comment(text: str) -> bool {
+    let mut index = 0_usize
+    while index + 1_usize < text.char_len() {
+        let pair = text.slice(index, 2_usize)
+        if pair == "//" || pair == "/*" {
+            ret true
+        }
+        index += 1_usize
+    }
+    ret false
+}

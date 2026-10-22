@@ -3,6 +3,10 @@ set -euo pipefail
 
 [[ $# -le 1 ]] || { echo 'usage: ci-prepare-toolchain.sh [TARGET_TRIPLE]' >&2; exit 2; }
 triple=${1:-}
+if [[ "$triple" == *-linux-gnu ]]; then
+  sudo apt-get update
+  sudo apt-get install -y libssl-dev libc-ares-dev
+fi
 if [[ "$triple" == *-w64-windows-gnu ]]; then
   version=20260616
   case "$triple" in

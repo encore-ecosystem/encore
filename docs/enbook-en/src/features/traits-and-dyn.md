@@ -23,6 +23,22 @@ shape, and async/capability contracts. A read-only method cannot be implemented
 by a mutating receiver. Sending/frozen contracts must also be preserved.
 Changing an implementation cannot silently weaken caller guarantees.
 
+An `impl` header accepts a qualified trait path, including a namespace alias:
+
+```encore
+import core::ops as Operators
+
+struct Value { number: u32 }
+impl Operators::Add[Value] for Value {
+    fn op(self: Self, other: Self) -> Self {
+        ret Self { self.number + other.number }
+    }
+}
+```
+
+Qualification resolves the original trait declaration. Its member names and
+signatures remain unchanged; operator traits such as `Add` declare `op`.
+
 When a dynamic conversion fails, check the declaration's object safety and
 the implementation signature, not only the method name. Start with a small
 trait; keep operations needing a concrete type outside its dynamic interface.

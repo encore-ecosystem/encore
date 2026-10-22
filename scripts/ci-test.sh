@@ -23,11 +23,12 @@ cp tests/ci/runtime.c "$fixture/runtime.c"
 sed 's|path@packages/|path@../../../packages/|g' encore.toml > "$fixture/encore.toml"
 export ENCORE_TEST_COMPILER="$compiler"
 export ENCORE_TEST_REPOSITORY="$repository"
-case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*)
-    # The Encore subprocess API takes native paths, not Git Bash mount paths.
-    export ENCORE_TEST_COMPILER="$(cygpath -m "$compiler")"
-    export ENCORE_TEST_REPOSITORY="$(cygpath -m "$repository")"
-    ;;
-esac
-(cd "$fixture" && "$compiler" test --report "$repository/target/test-report.json" "${@:2}")
+report="$repository/target/test-report.json"
+if command -v cygpath >/dev/null 2>&1; then
+  export ENCORE_TEST_COMPILER="$(cygpath -m "$compiler")"
+  export ENCORE_TEST_REPOSITORY="$(cygpath -m "$repository")"
+  report=$(cygpath -m "$report")
+  # Preserve test selectors and native paths when invoking the Windows binary.
+  export MSYS2_ARG_CONV_EXCL='*'
+fi
+(cd "$fixture" && "$compiler" test --report "$report" "${@:2}")
