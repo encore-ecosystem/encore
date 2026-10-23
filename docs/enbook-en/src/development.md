@@ -58,6 +58,13 @@ out or failing invocations are failures, not successful timing samples. Test
 IDs must be unique and match across worker counts and cold/warm repetitions
 for each compiler/source variant.
 
+After an interruption, add `--resume` to the same command. Completed cold/warm
+pairs are retained; an incomplete pair restarts with empty caches. Resuming
+requires identical compiler hashes, source snapshots, benchmark code, machine
+and toolchain settings. The report marks completion explicitly and preserves
+the interrupted pair's logs. Stop the original process before resuming.
+Native Windows uses Git Bash beside Git; `--bash` selects an explicit executable.
+
 Test JSON reports retain `summary.duration_ms` as the sum of test durations.
 `summary.wall_duration_ms` records elapsed suite time,
 `summary.harness_duration_ms` records shared harness preparation, and
@@ -70,6 +77,11 @@ To collect paired native CI measurements, dispatch Native CI with
 `performance_baseline_tag=v0.1.6-neumann` and `performance_jobs=auto` (or an
 explicit comma-separated matrix). Each target verifies the published baseline
 archive and adoption provenance before running both compilers on one runner.
+The three CI repetitions run in separate jobs to stay within GitHub's six-hour
+job limit. Each baseline/candidate pair shares one runner, and the aggregate
+reports the median of within-runner speedup ratios. It retains each repetition's
+environment and elapsed-time distribution, and requires all three complete
+pairs with matching compiler/source identities and selected tests.
 Performance jobs are opt-in and do not impose a single-test time threshold.
 
 Use `release` for a portable optimization baseline; use `extreme` when its

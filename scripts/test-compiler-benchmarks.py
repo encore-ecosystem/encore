@@ -10,10 +10,15 @@ import tarfile
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
+import copy
 
 spec = importlib.util.spec_from_file_location("benchmark", Path(__file__).with_name("benchmark-compiler-tests.py"))
 benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
+aggregate_spec = importlib.util.spec_from_file_location("aggregate", Path(__file__).with_name("aggregate-compiler-benchmarks.py"))
+aggregate = importlib.util.module_from_spec(aggregate_spec)
+aggregate_spec.loader.exec_module(aggregate)
 
 
 class BenchmarkContracts(unittest.TestCase):
@@ -32,6 +37,8 @@ class BenchmarkContracts(unittest.TestCase):
                 args=sys.argv[1:]
                 if args==['--version']:
                     print('encore benchmark-fixture');sys.exit(0)
+                with open(os.environ['BENCHMARK_FIXTURE_TRACE'],'a') as trace:
+                    trace.write(args[0]+'\\n')
                 assert 'ENCORE_CODEGEN_PROFILE' not in os.environ
                 assert args[args.index('--jobs')+1]=='1'
                 subprocess.run(['git','rev-parse','--is-inside-work-tree'],check=True,stdout=subprocess.DEVNULL)
@@ -62,14 +69,16 @@ class BenchmarkContracts(unittest.TestCase):
             subprocess.run([*git, "tag", "-am", "baseline", "v0.1.6-neumann"], check=True)
             commit = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
             output = base / "results.json"
-            environment = {**os.environ, "ENCORE_CODEGEN_PROFILE": "1"}
-            result = subprocess.run([
+            trace = base / "trace"
+            environment = {**os.environ, "ENCORE_CODEGEN_PROFILE": "1", "BENCHMARK_FIXTURE_TRACE": str(trace)}
+            command = [
                 sys.executable, str(Path(benchmark.__file__)), str(compiler),
                 "--source", str(repo), "--baseline-compiler", str(compiler),
                 "--baseline-ref", "v0.1.6-neumann", "--scenario", "all",
                 "--jobs", "1", "--repetitions", "1", "--warm", "--scratch-dir", str(scratch),
                 "--output", str(output),
-            ], env=environment, text=True, capture_output=True, timeout=30)
+            ]
+            result = subprocess.run(command, env=environment, text=True, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             report = json.loads(output.read_text())
             self.assertEqual(report["failed"], [])
@@ -84,6 +93,103 @@ class BenchmarkContracts(unittest.TestCase):
                     self.assertEqual(sample["warm"]["test_summary"]["selected"], 2)
             self.assertEqual(list(scratch.iterdir()), [])
             self.assertTrue(output.with_suffix(".md").exists())
+            self.assertTrue(report["completed"])
+            self.assertEqual(len(trace.read_text().splitlines()), 8)
+            # A reboot loses the private caches. Retry the entire incomplete
+            # cold/warm pair, while retaining the other three completed pairs.
+            report["samples"][-1].pop("warm")
+            report["completed"] = False
+            output.write_text(json.dumps(report))
+            resumed = subprocess.run([*command, "--resume"], env=environment, text=True,
+                                     capture_output=True, timeout=30)
+            self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+            report = json.loads(output.read_text())
+            self.assertTrue(report["completed"])
+            self.assertEqual(len(report["samples"]), 4)
+            self.assertEqual(len(report["interrupted_samples"]), 1)
+            self.assertEqual(len(trace.read_text().splitlines()), 10)
+            self.assertTrue((output.with_suffix(".logs") / "interrupted-1").is_dir())
+            already_done = subprocess.run([*command, "--resume"], env=environment, capture_output=True, timeout=30)
+            self.assertEqual(already_done.returncode, 0, already_done.stderr)
+            self.assertEqual(len(trace.read_text().splitlines()), 10)
+            ci = base / "ci"
+            (ci / "r1").mkdir(parents=True)
+            (ci / "r1/results.json").write_text(output.read_text())
+            for repetition in (2, 3):
+                paired = list(command)
+                paired[paired.index("--output") + 1] = str(ci / f"r{repetition}/results.json")
+                pair = subprocess.run([*paired, "--first-repetition", str(repetition)], env=environment,
+                                      text=True, capture_output=True, timeout=30)
+                self.assertEqual(pair.returncode, 0, pair.stdout + pair.stderr)
+                data = json.loads((ci / f"r{repetition}/results.json").read_text())
+                self.assertEqual({sample["repetition"] for sample in data["samples"]}, {repetition})
+                self.assertEqual(data["samples"][0]["variant"], "candidate" if repetition == 2 else "baseline")
+            combined = base / "combined.json"
+            aggregation = subprocess.run([sys.executable, aggregate.__file__, str(ci),
+                                          "--output", str(combined)], text=True, capture_output=True, timeout=30)
+            self.assertEqual(aggregation.returncode, 0, aggregation.stdout + aggregation.stderr)
+            combined_report = json.loads(combined.read_text())
+            self.assertTrue(combined_report["completed"])
+            self.assertTrue(all(row["repetitions"] == 3 for row in combined_report["summary"]))
+            self.assertEqual(len(trace.read_text().splitlines()), 26)
+            (repo / "changed.enq").write_text("changed input")
+            changed = subprocess.run([*command, "--resume"], env=environment, text=True,
+                                     capture_output=True, timeout=30)
+            self.assertNotEqual(changed.returncode, 0)
+            self.assertIn("resume input changed", changed.stderr)
+            self.assertEqual(len(trace.read_text().splitlines()), 26)
+
+    def test_windows_shell_selection_uses_git_bash_instead_of_the_wsl_shim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git, bash, wsl = root / "Git/cmd/git.exe", root / "Git/bin/bash.exe", root / "Windows/System32/bash.exe"
+            for path in (git, bash, wsl):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            with mock.patch.object(benchmark.shutil, "which", side_effect=lambda name: str(git if name == "git" else wsl)):
+                self.assertEqual(benchmark.find_bash(windows=True), str(bash))
+                bash.unlink()
+                with self.assertRaises(FileNotFoundError):
+                    benchmark.find_bash(windows=True)
+
+    def test_ci_aggregation_uses_within_runner_ratios_and_rejects_incomplete_reports(self):
+        documents = []
+        for repetition, before, after in ((1, 10, 5), (2, 1000, 500), (3, 30, 20)):
+            document = {
+                "schema": 2, "completed": True, "first_repetition": repetition, "repetitions": 1,
+                "benchmark_script_sha256": "same benchmark protocol",
+                "profile": "extreme", "scenario": "suite", "warm": True,
+                "environment": {"architecture": "test", "logical_cpus": 4, "runner_name": str(repetition)},
+                "jobs": [{"effective_jobs": 4, "jobs": "auto", "aliases": ["auto"]}],
+                "variants": {name: {"compiler_sha256": name, "compiler_version": name,
+                                    "source_commit": name, "source_snapshot_sha256": name}
+                             for name in ("baseline", "candidate")},
+                "test_catalogs": {"baseline/suite": ["a"], "candidate/suite": ["a", "b"]},
+                "samples": [], "failed": [],
+            }
+            for variant, seconds in (("baseline", before), ("candidate", after)):
+                document["samples"].append({
+                    "variant": variant, "case": "suite", "repetition": repetition, "effective_jobs": 4,
+                    "cold": {"exit_code": 0, "wall_seconds": seconds},
+                    "warm": {"exit_code": 0, "wall_seconds": seconds / 10},
+                })
+            documents.append(document)
+        result = aggregate.aggregate(documents, 3)
+        row = next(row for row in result["summary"] if row["variant"] == "candidate" and row["cache"] == "cold")
+        self.assertEqual(row["speedup_vs_baseline"], 2)
+        self.assertEqual(row["ratio_of_time_medians"], 1.5)
+        self.assertEqual(len(result["environments"]), 3)
+        for damage in ("completed", "source", "catalog", "missing", "duplicate", "repetition", "workers"):
+            broken = copy.deepcopy(documents)
+            if damage == "completed": broken[1]["completed"] = False
+            elif damage == "source": broken[1]["variants"]["candidate"]["source_snapshot_sha256"] = "changed"
+            elif damage == "catalog": broken[1]["test_catalogs"]["candidate/suite"] = ["a"]
+            elif damage == "missing": broken[1]["samples"].pop()
+            elif damage == "duplicate": broken[1]["samples"].append(copy.deepcopy(broken[1]["samples"][0]))
+            elif damage == "repetition": broken[1]["first_repetition"] = 1
+            elif damage == "workers": broken[1]["environment"]["logical_cpus"] = 2
+            with self.subTest(damage=damage), self.assertRaises(ValueError):
+                aggregate.aggregate(broken, 3)
 
     def test_matrix_runs_automatic_mode_and_coalesces_clipped_requests(self):
         matrix = benchmark.job_matrix("1,2,4,8,16,auto", 4)

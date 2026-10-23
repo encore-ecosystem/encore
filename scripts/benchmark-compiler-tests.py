@@ -29,6 +29,30 @@ CASES = ("owned_shadowing_lifetime", "lexer_lifetime", "parser_lifetime", "trans
 PROFILE_ENV = ("ENCORE_CODEGEN_PROFILE", "ENCORE_FRONTEND_PROFILE", "ENCORE_KEEP_TEMPS")
 
 
+def find_bash(explicit=None, windows=None):
+    """Native Windows fixtures require Git Bash, not the System32 WSL shim."""
+    if explicit:
+        candidate = shutil.which(str(explicit)) or str(explicit)
+        if Path(candidate).is_file():
+            return str(Path(candidate).resolve())
+        raise FileNotFoundError("Bash executable does not exist: " + str(explicit))
+    if windows is None:
+        windows = os.name == "nt"
+    if windows:
+        git = shutil.which("git")
+        if git:
+            for root in Path(git).resolve().parents:
+                for relative in ("bin/bash.exe", "usr/bin/bash.exe"):
+                    candidate = root / relative
+                    if candidate.is_file():
+                        return str(candidate)
+        raise FileNotFoundError("Git Bash was not found; specify --bash with its native executable path")
+    candidate = shutil.which("bash")
+    if candidate:
+        return candidate
+    raise FileNotFoundError("Bash was not found; specify --bash")
+
+
 def digest_file(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -119,6 +143,16 @@ def machine_info():
     except (OSError, StopIteration, ValueError):
         pass
     tools = {}
+    cpu_model = platform.processor()
+    try:
+        if sys.platform.startswith("linux"):
+            cpu_model = next(line.split(":", 1)[1].strip() for line in
+                             Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name"))
+        elif sys.platform == "darwin":
+            cpu_model = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                                text=True, timeout=5).strip()
+    except (OSError, StopIteration, subprocess.SubprocessError):
+        pass
     for name in ("clang", "ld.lld"):
         executable = shutil.which(name)
         if executable:
@@ -130,6 +164,9 @@ def machine_info():
                 pass
     return {
         "platform": platform.platform(), "architecture": platform.machine(),
+        "processor": platform.processor(), "runner_name": os.environ.get("RUNNER_NAME"),
+        "cpu_model": cpu_model,
+        "runner_image": {key: os.environ.get(key) for key in ("ImageOS", "ImageVersion")},
         "logical_cpus": cpu_count, "affinity_cpus": affinity,
         "cpu_quota": min(quotas, default=None), "available_cpus": limit,
         "memory_bytes": memory, "cgroup_memory_limit_bytes": min(memory_limits, default=None),
@@ -284,6 +321,39 @@ def summarize(samples):
     return rows
 
 
+def sample_key(sample):
+    return sample["repetition"], sample["effective_jobs"], sample["case"], sample["variant"]
+
+
+def sample_complete(sample, warm):
+    return all(kind in sample and sample[kind].get("exit_code") == 0 and
+               not sample[kind].get("error") and not sample[kind].get("timed_out")
+               for kind in (("cold", "warm") if warm else ("cold",)))
+
+
+def expected_sample_keys(report):
+    scenario = report["scenario"]
+    cases = ["build", "suite"] if scenario == "all" else (list(CASES) if scenario == "standalone" else [scenario])
+    first = report["first_repetition"]
+    return {(repetition, jobs["effective_jobs"], case, variant)
+            for repetition in range(first, first + report["repetitions"])
+            for jobs in report["jobs"] for case in cases for variant in report["variants"]}
+
+
+def validate_resume(previous, requested):
+    for key in ("schema", "benchmark_script_sha256", "profile", "repetitions", "first_repetition", "jobs", "scenario", "warm"):
+        if previous.get(key) != requested[key]:
+            raise ValueError("resume configuration changed: " + key)
+    if previous.get("failed"):
+        raise ValueError("cannot resume a failed benchmark; use a new output after fixing the failure")
+    for key in ("platform", "architecture", "cpu_model", "logical_cpus", "affinity_cpus", "cpu_quota", "toolchains"):
+        if previous["environment"].get(key) != requested["environment"].get(key):
+            raise ValueError("resume machine/toolchain changed: " + key)
+    keys = [sample_key(sample) for sample in previous["samples"]]
+    if len(keys) != len(set(keys)) or set(keys) - expected_sample_keys(previous):
+        raise ValueError("resume report has duplicate or unrequested samples")
+
+
 def markdown_report(report):
     lines = [
         "# Parallel compiler benchmarks", "",
@@ -316,16 +386,25 @@ def main():
     parser.add_argument("--jobs", default="1,2,4,8,16,auto")
     parser.add_argument("--profile", choices=("dev", "release", "extreme"), default="extreme")
     parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--first-repetition", type=int, default=1,
+                        help="First repetition ID; preserves alternating pair order in separate CI jobs")
+    parser.add_argument("--bash", default=os.environ.get("ENCORE_BENCHMARK_BASH"),
+                        help="Native Git Bash executable on Windows; auto-detected beside Git otherwise")
+    parser.add_argument("--resume", action="store_true", help="Resume complete pairs after interruption; retry partial pairs cold")
     parser.add_argument("--warm", action="store_true")
     parser.add_argument("--timeout", type=float, default=7200)
     parser.add_argument("--scratch-dir", type=Path,
                         default=Path(os.environ["RUNNER_TEMP"]) if os.environ.get("RUNNER_TEMP") else None,
                         help="Parent for disposable inputs; CI defaults to RUNNER_TEMP to keep Windows paths short")
     args = parser.parse_args()
-    if args.repetitions < 1 or args.timeout <= 0:
-        parser.error("repetitions and timeout must be positive")
+    if args.repetitions < 1 or args.first_repetition < 1 or args.timeout <= 0:
+        parser.error("repetitions, first repetition and timeout must be positive")
     if (args.baseline_source or args.baseline_ref) and not args.baseline_compiler:
         parser.error("baseline source/ref requires --baseline-compiler")
+    try:
+        bash = find_bash(args.bash) if args.scenario in ("all", "suite") else None
+    except FileNotFoundError as error:
+        parser.error(str(error))
     machine = machine_info()
     try:
         # Encore's available_parallelism currently uses online logical CPUs,
@@ -337,15 +416,26 @@ def main():
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     logs = output.with_suffix(".logs")
-    if output.exists() or logs.exists():
+    if not args.resume and (output.exists() or logs.exists()):
         parser.error("output/logs already exist; choose a new --output path")
-    logs.mkdir(exist_ok=False)
+    if args.resume and output.exists() != logs.exists():
+        parser.error("resume requires both the report and its raw-log directory")
+    previous = json.loads(output.read_text(encoding="utf-8")) if args.resume and output.exists() else None
+    logs.mkdir(exist_ok=args.resume)
     report = {
         "schema": 2, "environment": machine, "profile": args.profile,
-        "repetitions": args.repetitions, "jobs": matrix, "variants": {},
+        "benchmark_script_sha256": digest_file(Path(__file__)),
+        "repetitions": args.repetitions, "first_repetition": args.first_repetition,
+        "scenario": args.scenario, "warm": args.warm, "completed": False,
+        "jobs": matrix, "variants": {},
         "cache_policy": "isolated empty output/compiled/registry caches per cold sample; OS buffers retained",
         "samples": [], "summary": [], "test_catalogs": {}, "failed": [],
     }
+    if previous is not None:
+        try:
+            validate_resume(previous, report)
+        except ValueError as error:
+            parser.error(str(error))
 
     def save():
         report["summary"] = summarize(report["samples"])
@@ -380,20 +470,46 @@ def main():
             prepare_snapshot_repository(snapshot)
             revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", (ref or "HEAD") + "^{commit}"],
                                                text=True).strip()
-            report["variants"][variant] = {
+            metadata = {
                 "compiler": str(compiler), "compiler_sha256": digest_file(compiler),
                 "compiler_version": subprocess.check_output([str(compiler), "--version"], text=True).strip(),
                 "source_commit": revision, "source_snapshot_sha256": source_digest,
             }
             archive_path = logs / (variant + "-source.tar.gz")
-            archive_snapshot(snapshot, archive_path)
-            report["variants"][variant].update(source_archive=str(archive_path),
-                                               source_archive_sha256=digest_file(archive_path))
+            if previous is not None:
+                old = previous["variants"].get(variant, {})
+                for key in ("compiler_sha256", "compiler_version", "source_commit", "source_snapshot_sha256"):
+                    if metadata[key] != old.get(key):
+                        parser.error("resume input changed: " + variant + "/" + key)
+                if not archive_path.is_file() or digest_file(archive_path) != old.get("source_archive_sha256"):
+                    parser.error("resume source archive is missing or changed: " + variant)
+            else:
+                archive_snapshot(snapshot, archive_path)
+            metadata.update(source_archive=str(archive_path), source_archive_sha256=digest_file(archive_path))
+            report["variants"][variant] = metadata
             frozen[variant] = snapshot
+        if previous is not None:
+            if set(previous["variants"]) != set(report["variants"]):
+                parser.error("resume compiler variants changed")
+            report.update(samples=[], test_catalogs=previous["test_catalogs"],
+                          interrupted_samples=previous.get("interrupted_samples", []),
+                          resume_count=previous.get("resume_count", 0) + 1)
+            for sample in previous["samples"]:
+                if sample_complete(sample, args.warm):
+                    report["samples"].append(sample)
+                else:
+                    report["interrupted_samples"].append(sample)
+                    prefix = f"{sample['variant']}-{sample['case']}-j{sample['jobs']}-r{sample['repetition']}-"
+                    interrupted = logs / ("interrupted-" + str(report["resume_count"]))
+                    for path in logs.glob(prefix + "*"):
+                        if path.is_file():
+                            interrupted.mkdir(exist_ok=True)
+                            shutil.move(str(path), interrupted / path.name)
+        completed = {sample_key(sample) for sample in report["samples"]}
         workloads = ["build", "suite"] if args.scenario == "all" else (
             list(CASES) if args.scenario == "standalone" else [args.scenario])
         save()
-        for repetition in range(1, args.repetitions + 1):
+        for repetition in range(args.first_repetition, args.first_repetition + args.repetitions):
             # Alternate pair order to reduce systematic thermal/order bias.
             order = variants if repetition % 2 else list(reversed(variants))
             for configuration in matrix:
@@ -401,7 +517,10 @@ def main():
                     for variant, compiler, _, _ in order:
                         sample = {"variant": variant, "case": case, "repetition": repetition,
                                   **configuration}
+                        if sample_key(sample) in completed:
+                            continue
                         report["samples"].append(sample)
+                        save()
                         with tempfile.TemporaryDirectory(prefix="ecb-", dir=args.scratch_dir) as sample_dir:
                             private = Path(sample_dir)
                             root = private / "r"
@@ -427,14 +546,14 @@ def main():
                                 # its fixture, but do not run a compiler or
                                 # populate a compiled cache before cold timing.
                                 noop = private / "prepare.sh"
-                                # Bash must receive LF even from native Windows
-                                # Python, whose text writer defaults to CRLF.
-                                noop.write_bytes(b"#!/usr/bin/env bash\nexit 0\n")
+                                # MSYS must receive LF and an absolute POSIX
+                                # interpreter, without another native Bash lookup.
+                                noop.write_bytes(b"#!/bin/sh\nexit 0\n")
                                 noop.chmod(0o755)
                                 preparation = logs / f"{variant}-suite-j{configuration['jobs']}-r{repetition}-prepare.log"
                                 try:
                                     with preparation.open("wb") as capture:
-                                        subprocess.run(["bash", "scripts/ci-test.sh", noop.as_posix()],
+                                        subprocess.run([bash, "scripts/ci-test.sh", noop.as_posix()],
                                                        cwd=root, env=environment, stdout=capture,
                                                        stderr=subprocess.STDOUT, check=True, timeout=60)
                                 except (OSError, subprocess.SubprocessError) as error:
@@ -484,6 +603,7 @@ def main():
                                     save()
                                     return 1
                                 save()
+    report["completed"] = True
     save()
     print(markdown_report(report))
     return bool(report["failed"])
