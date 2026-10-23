@@ -3652,6 +3652,7 @@ fn compile_entry_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement
 #attr(safe)
 fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str,
     build_script: bool, staging: Path,) -> u32 {
+    let input_started = perf_counter_ms()
     // Parser/import failures are fatal even on a worker binary cache hit.
     // Lowering-time validation cannot recover diagnostics discarded by parsing.
     for module in workspace.modules {
@@ -3788,10 +3789,17 @@ fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
         ret 0_u32
     }
     remove_file(native_path(test_fingerprint_path.as_str()))
+    profile_test_compilation("inputs", input_started)
+    let frontend_started = perf_counter_ms()
     let translation_modules = test_translation_modules(workspace.modules, ast, target)
     let ehir_text = translate_modules_to_ehir(translation_modules, target)
-    let llvm_text = emit_ir_for_target(parse_module_text("encore_test", ehir_text),
-        target.triple, target.pointer_width,)
+    profile_test_compilation("frontend", frontend_started)
+    let parse_started = perf_counter_ms()
+    let ehir_module = parse_module_text("encore_test", ehir_text)
+    profile_test_compilation("parse-ehir", parse_started)
+    let codegen_started = perf_counter_ms()
+    let llvm_text = emit_ir_for_target(ehir_module, target.triple, target.pointer_width)
+    profile_test_compilation("codegen", codegen_started)
     if write_file(native_path(ehir_path.as_str()), ehir_text) != 0_i32 {
         ret test_artifact_error("write test EHIR", ehir_path)
     }
@@ -3843,7 +3851,9 @@ fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
     // Respect the resolved host toolchain. This is essential for packaged
     // Windows GNU compilers, whose workers must be linked by LLVM-MinGW rather
     // than an unrelated clang/MSVC installation from PATH.
+    let native_started = perf_counter_ms()
     let clang_code = run_args_owned(test_toolchain.compiler, args)
+    profile_test_compilation("native", native_started)
     if !keep_temporary_artifacts() {
         remove_file(native_path(ehir_path.as_str()))
         remove_file(native_path(llvm_path.as_str()))
@@ -3855,6 +3865,12 @@ fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
         ret test_artifact_error("write test fingerprint", test_fingerprint_path)
     }
     ret 0_u32
+}
+
+fn profile_test_compilation(stage: str, started: u64) ->() {
+    if env("ENCORE_CODEGEN_PROFILE").is_some() {
+        eprintln("test-time " + stage + ": " + Debug::fmt(perf_counter_ms() - started) + " ms")
+    }
 }
 
 fn test_artifact_error(operation: str, path: Path) -> u32 {

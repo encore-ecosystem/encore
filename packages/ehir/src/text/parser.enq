@@ -1,8 +1,11 @@
 import core::fmt::Debug
 import core::option::Option
 import core::panic::panic
+
 import std::thread::JoinHandle
 import std::vec::Vec
+
+import refrain::string_index::{StringIndex, string_index_get, string_index_set, string_index_with_capacity}
 
 extern fn encore_str_slice_bytes(value: str, start: usize, byte_len: usize) -> str
 extern fn encore_text_builder_new() -> usize
@@ -47,100 +50,7 @@ fn join_line_range(lines: Vec[str], start: usize, end: usize) -> str {
     }
 }
 
-import refrain::core::Block
-import refrain::core::Directive
-import refrain::core::EhirDocumentation
-import refrain::core::EhirImport
-import refrain::core::EnumVariant
-import refrain::core::FnDirective
-import refrain::core::Instruction
-import refrain::core::MatchArm
-import refrain::core::Module
-import refrain::core::ModuleBundle
-import refrain::core::Parameter
-import refrain::core::PhiPair
-import refrain::core::RepresentationKind
-import refrain::core::SwitchCase
-import refrain::core::Terminator
-import refrain::core::TraitMethod
-import refrain::core::Type
-import refrain::core::Variable
-import refrain::core::add
-import refrain::core::add_edge
-import refrain::core::alias
-import refrain::core::and_op
-import refrain::core::async_fn_directive
-import refrain::core::await_value
-import refrain::core::binary
-import refrain::core::block
-import refrain::core::br_term
-import refrain::core::call
-import refrain::core::cbr_term
-import refrain::core::cfree
-import refrain::core::comment
-import refrain::core::div
-import refrain::core::drop_value
-import refrain::core::ehir_documentation
-import refrain::core::ehir_import
-import refrain::core::enum_directive
-import refrain::core::enum_value
-import refrain::core::enum_variant
-import refrain::core::extern_fn_directive
-import refrain::core::fn_directive
-import refrain::core::fn_item
-import refrain::core::gep
-import refrain::core::geq
-import refrain::core::getfield
-import refrain::core::getfieldptr
-import refrain::core::getptr
-import refrain::core::grt
-import refrain::core::halloc
-import refrain::core::hfree
-import refrain::core::hrealloc
-import refrain::core::ieq
-import refrain::core::impl_directive
-import refrain::core::lceos
-import refrain::core::lcpos
-import refrain::core::lcsos
-import refrain::core::leq
-import refrain::core::les
-import refrain::core::load
-import refrain::core::make_module
-import refrain::core::make_module_bundle
-import refrain::core::make_module_with_imports
-import refrain::core::make_module_with_metadata
-import refrain::core::make_type
-import refrain::core::match_arm
-import refrain::core::match_term
-import refrain::core::mod_op
-import refrain::core::mul
-import refrain::core::neq
-import refrain::core::or_op
-import refrain::core::param
-import refrain::core::pcast
-import refrain::core::phi
-import refrain::core::phi_pair
-import refrain::core::plain_type
-import refrain::core::remove_edge
-import refrain::core::ret_term
-import refrain::core::retain_value
-import refrain::core::salloc
-import refrain::core::setfield
-import refrain::core::sgetfield
-import refrain::core::sgetfieldptr
-import refrain::core::shl
-import refrain::core::shr
-import refrain::core::store
-import refrain::core::struct_directive
-import refrain::core::sub
-import refrain::core::switch_case
-import refrain::core::switch_term
-import refrain::core::trait_directive
-import refrain::core::trait_method
-import refrain::core::unreachable_term
-import refrain::core::untyped_var
-import refrain::core::var
-import refrain::core::xor_op
+import refrain::core::{Block, Directive, EhirDocumentation, EhirImport, EnumVariant, FnDirective, Instruction, MatchArm, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, Variable, add, add_edge, alias, and_op, async_fn_directive, await_value, binary, block, br_term, call, cbr_term, cfree, comment, div, drop_value, ehir_documentation, ehir_import, enum_directive, enum_value, enum_variant, extern_fn_directive, fn_directive, fn_item, gep, geq, getfield, getfieldptr, getptr, grt, halloc, hfree, hrealloc, ieq, impl_directive, lceos, lcpos, lcsos, leq, les, load, make_module, make_module_bundle, make_module_with_imports, make_module_with_metadata, make_type, match_arm, match_term, mod_op, mul, neq, or_op, param, pcast, phi, phi_pair, plain_type, remove_edge, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, shl, shr, store, struct_directive, sub, switch_case, switch_term, trait_directive, trait_method, unreachable_term, untyped_var, var, xor_op}
 
 /// A parsed EHIR bundle together with the exact per-module textual sources
 /// from which it was built. Compiler drivers use this typed boundary to feed a
@@ -627,10 +537,16 @@ fn parse_switch_terminator_text(value: str) -> Terminator {
 
 pub fn parse_function_text(source: str) -> FnDirective {
     let lines = split_lines_text(source)
-    if lines.len() == 0_usize {
+    ret parse_function_lines(lines, 0_usize, lines.len())
+}
+
+// A module has already split its source into lines. Parse that original range
+// directly rather than allocating, joining and splitting each body again.
+fn parse_function_lines(lines: Vec[str], start: usize, end: usize) -> FnDirective {
+    if start >= end || end > lines.len() {
         panic("EHIR function must not be empty")
     }
-    let header = trim_text(required_part(lines, 0_usize))
+    let header = trim_text(required_part(lines, start))
     let is_extern = starts_with_text(header, "extern fn ")
     let is_async = starts_with_text(header, "async fn ")
     let mut prefix_len = 3_usize
@@ -691,15 +607,17 @@ pub fn parse_function_text(source: str) -> FnDirective {
     }
 
     let mut blocks = Vec[Block]::new()
-    let mut known_variables = Vec[Parameter]::new()
+    let mut known_variables = KnownVariables {
+        Vec[Parameter]::new(), string_index_with_capacity(end - start + params.len())
+    }
     for parameter in params {
-        known_variables.push(parameter)
+        remember_parameter(known_variables, parameter)
     }
     let mut block_name = ""
     let mut instructions = Vec[Instruction]::new()
     let mut terminator = Option[Terminator]::None
-    let mut index = 1_usize
-    while index < lines.len() {
+    let mut index = start + 1_usize
+    while index < end {
         let line = trim_text(required_part(lines, index))
         index = index + 1_usize
         if line.len() == 0_usize || line == "}" {
@@ -716,7 +634,7 @@ pub fn parse_function_text(source: str) -> FnDirective {
         }
         if starts_with_text(line, "match ") || starts_with_text(line, "switch ") {
             let mut terminator_text = line
-            while index < lines.len() {
+            while index < end {
                 let terminator_line = trim_text(required_part(lines, index))
                 index = index + 1_usize
                 terminator_text = terminator_text + "\n" + terminator_line
@@ -756,7 +674,17 @@ pub fn parse_function_text(source: str) -> FnDirective {
     ret fn_item("", Vec[Type]::new(), Vec[Parameter]::new(), plain_type("void", Vec[Type]::new()), Vec[Block]::new())
 }
 
-fn resolve_variable_type(value: Variable, known: Vec[Parameter]) -> Variable {
+struct KnownVariables {
+    values: Vec[Parameter]
+    positions: StringIndex
+}
+
+fn remember_parameter(known: mut KnownVariables, value: Parameter) ->() {
+    string_index_set(known.positions, value.name, known.values.len())
+    known.values.push(value)
+}
+
+fn resolve_variable_type(value: Variable, known: mut KnownVariables) -> Variable {
     match value.typ {
         Option[Type]::Some(_) => {
             ret value
@@ -764,23 +692,15 @@ fn resolve_variable_type(value: Variable, known: Vec[Parameter]) -> Variable {
         Option[Type]::None => {
         }
     }
-    let mut index = known.len()
-    while index > 0_usize {
-        index = index - 1_usize
-        match known.get(index) {
-            Option[Parameter]::Some(item) => {
-                if item.name == value.name {
-                    ret var(value.name, item.typ)
-                }
-            }
-            Option[Parameter]::None => {
-            }
-        }
+    let position = string_index_get(known.positions, value.name)
+    if position != 0_usize {
+        let item = known.values.get_unchecked_borrowed(position - 1_usize)
+        ret var(value.name, item.typ)
     }
     ret value
 }
 
-fn resolve_variables(values: Vec[Variable], known: Vec[Parameter]) -> Vec[Variable] {
+fn resolve_variables(values: Vec[Variable], known: mut KnownVariables) -> Vec[Variable] {
     let mut out = Vec[Variable]::new()
     for value in values {
         out.push(resolve_variable_type(value, known))
@@ -788,7 +708,7 @@ fn resolve_variables(values: Vec[Variable], known: Vec[Parameter]) -> Vec[Variab
     ret out
 }
 
-fn resolve_instruction_types(instruction: Instruction, known: Vec[Parameter]) -> Instruction {
+fn resolve_instruction_types(instruction: Instruction, known: mut KnownVariables) -> Instruction {
     match instruction {
         Instruction::Alias(data) => {
             ret alias(resolve_variable_type(data.out, known), resolve_variable_type(data.src, known))
@@ -881,7 +801,7 @@ fn resolve_instruction_types(instruction: Instruction, known: Vec[Parameter]) ->
     }
 }
 
-fn remember_instruction_output(known: mut Vec[Parameter], instruction: Instruction) ->() {
+fn remember_instruction_output(known: mut KnownVariables, instruction: Instruction) ->() {
     match instruction {
         Instruction::Lcpos(data) => {
             remember_variable(known, data.out)
@@ -946,10 +866,10 @@ fn remember_instruction_output(known: mut Vec[Parameter], instruction: Instructi
     ret()
 }
 
-fn remember_variable(known: mut Vec[Parameter], value: Variable) ->() {
+fn remember_variable(known: mut KnownVariables, value: Variable) ->() {
     match value.typ {
         Option[Type]::Some(typ) => {
-            known.push(param(value.name, typ))
+            remember_parameter(known, param(value.name, typ))
         }
         Option[Type]::None => {
         }
@@ -957,7 +877,7 @@ fn remember_variable(known: mut Vec[Parameter], value: Variable) ->() {
     ret()
 }
 
-fn resolve_terminator_types(terminator: Terminator, known: Vec[Parameter]) -> Terminator {
+fn resolve_terminator_types(terminator: Terminator, known: mut KnownVariables) -> Terminator {
     match terminator {
         Terminator::Ret(data) => {
             ret ret_term(resolve_variable_type(data.value, known))
@@ -1011,7 +931,7 @@ pub fn parse_module_text(name: str, source: str) -> Module {
             continue
         }
         if starts_with_text(line, "extern fn ") {
-            let directive = Directive::Function(parse_function_text(line))
+            let directive = Directive::Function(parse_function_lines(lines, index, index + 1_usize))
             push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
             pending_documentation = Option[str]::None
             index = index + 1_usize
@@ -1026,7 +946,7 @@ pub fn parse_module_text(name: str, source: str) -> Module {
                 depth = depth + brace_delta(body_line)
                 index = index + 1_usize
             }
-            let directive = Directive::Function(parse_function_text(join_line_range(lines, start, index)))
+            let directive = Directive::Function(parse_function_lines(lines, start, index))
             push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
             pending_documentation = Option[str]::None
             continue
@@ -1570,16 +1490,13 @@ fn is_terminator_text(value: str) -> bool {
 fn split_lines_text(value: str) -> Vec[str] {
     let mut out = Vec[str]::new()
     let mut start = 0_usize
-    let mut index = 0_usize
-    while index < value.len() {
-        if byte_slice(value, index, 1_usize) == "\n" {
-            out.push(byte_slice(value, start, index - start))
-            start = index + 1_usize
+    while start < value.byte_len() {
+        let end = value.find_byte_from(10_u8, start)
+        out.push(byte_slice(value, start, end - start))
+        if end == value.byte_len() {
+            break
         }
-        index = index + 1_usize
-    }
-    if start < value.len() {
-        out.push(byte_slice(value, start, value.len() - start))
+        start = end + 1
     }
     ret out
 }
@@ -1590,21 +1507,21 @@ fn brace_delta(value: str) -> isize {
     let mut in_string = false
     let mut escaped = false
     while index < value.len() {
-        let ch = byte_slice(value, index, 1_usize)
+        let ch = value.byte_at(index)
         if in_string {
             if escaped {
                 escaped = false
-            } elif ch == "\\" {
+            } elif ch == 92_u8 {
                 escaped = true
-            } elif ch == "\"" {
+            } elif ch == 34_u8 {
                 in_string = false
             }
         } else {
-            if ch == "\"" {
+            if ch == 34_u8 {
                 in_string = true
-            } elif ch == "{" {
+            } elif ch == 123_u8 {
                 depth = depth + 1_isize
-            } elif ch == "}" {
+            } elif ch == 125_u8 {
                 depth = depth - 1_isize
             }
         }
@@ -1634,6 +1551,8 @@ fn strip_label(value: str) -> str {
 }
 
 pub fn split_top_level_text(source: str, separator: str) -> Vec[str] {
+    let separator_byte = separator.byte_at(0)
+    let single_separator = separator.byte_len() == 1
     let mut out = Vec[str]::new()
     let mut square_depth = 0_usize
     let mut paren_depth = 0_usize
@@ -1642,32 +1561,32 @@ pub fn split_top_level_text(source: str, separator: str) -> Vec[str] {
     let mut in_string = false
     let mut escaped = false
     while index < source.len() {
-        let ch = byte_slice(source, index, 1_usize)
+        let ch = source.byte_at(index)
         if in_string {
             if escaped {
                 escaped = false
-            } elif ch == "\\" {
+            } elif ch == 92_u8 {
                 escaped = true
-            } elif ch == "\"" {
+            } elif ch == 34_u8 {
                 in_string = false
             }
-        } elif ch == "\"" {
+        } elif ch == 34_u8 {
             in_string = true
-        } elif ch == "[" {
+        } elif ch == 91_u8 {
             square_depth = square_depth + 1_usize
-        } elif ch == "]" {
+        } elif ch == 93_u8 {
             if square_depth == 0_usize {
                 panic("Unexpected ']' in EHIR text: " + source)
             }
             square_depth = square_depth - 1_usize
-        } elif ch == "(" {
+        } elif ch == 40_u8 {
             paren_depth = paren_depth + 1_usize
-        } elif ch == ")" {
+        } elif ch == 41_u8 {
             if paren_depth == 0_usize {
                 panic("Unexpected ')' in EHIR text: " + source)
             }
             paren_depth = paren_depth - 1_usize
-        } elif ch == separator && square_depth == 0_usize && paren_depth == 0_usize {
+        } elif single_separator && ch == separator_byte && square_depth == 0_usize && paren_depth == 0_usize {
             out.push(trim_text(byte_slice(source, start, index - start)))
             start = index + 1_usize
         }
@@ -1683,39 +1602,41 @@ pub fn split_top_level_text(source: str, separator: str) -> Vec[str] {
 }
 
 fn find_top_level_char(value: str, target: str) -> usize {
+    let target_byte = target.byte_at(0)
+    let single_target = target.byte_len() == 1
     let mut square_depth = 0_usize
     let mut paren_depth = 0_usize
     let mut index = 0_usize
     let mut in_string = false
     let mut escaped = false
     while index < value.len() {
-        let ch = byte_slice(value, index, 1_usize)
+        let ch = value.byte_at(index)
         if in_string {
             if escaped {
                 escaped = false
-            } elif ch == "\\" {
+            } elif ch == 92_u8 {
                 escaped = true
-            } elif ch == "\"" {
+            } elif ch == 34_u8 {
                 in_string = false
             }
             index = index + 1_usize
             continue
         }
-        if ch == "\"" {
+        if ch == 34_u8 {
             in_string = true
             index = index + 1_usize
             continue
         }
-        if ch == target && square_depth == 0_usize && paren_depth == 0_usize {
+        if single_target && ch == target_byte && square_depth == 0_usize && paren_depth == 0_usize {
             ret index
         }
-        if ch == "[" {
+        if ch == 91_u8 {
             square_depth = square_depth + 1_usize
-        } elif ch == "]" && square_depth > 0_usize {
+        } elif ch == 93_u8 && square_depth > 0_usize {
             square_depth = square_depth - 1_usize
-        } elif ch == "(" {
+        } elif ch == 40_u8 {
             paren_depth = paren_depth + 1_usize
-        } elif ch == ")" && paren_depth > 0_usize {
+        } elif ch == 41_u8 && paren_depth > 0_usize {
             paren_depth = paren_depth - 1_usize
         }
         index = index + 1_usize
@@ -1725,49 +1646,39 @@ fn find_top_level_char(value: str, target: str) -> usize {
 
 fn trim_text(value: str) -> str {
     let mut start = 0_usize
-    while start < value.len() && is_space(byte_slice(value, start, 1_usize)) {
+    while start < value.len() && is_space_byte(value.byte_at(start)) {
         start = start + 1_usize
     }
     let mut end = value.len()
-    while end > start && is_space(byte_slice(value, end - 1_usize, 1_usize)) {
+    while end > start && is_space_byte(value.byte_at(end - 1_usize)) {
         end = end - 1_usize
+    }
+    if start == 0 && end == value.byte_len() {
+        ret value
     }
     ret byte_slice(value, start, end - start)
 }
 
-fn is_space(value: str) -> bool {
-    ret value == " " || value == "\t" || value == "\n" || value == "\r"
+fn is_space_byte(value: u8) -> bool {
+    ret value == 32_u8 || value == 9_u8 || value == 10_u8 || value == 13_u8
 }
 
 fn ends_with_text(value: str, suffix: str) -> bool {
     if suffix.len() > value.len() {
         ret false
     }
-    ret byte_slice(value, value.len() - suffix.len(), suffix.len()) == suffix
+    ret value.range_eq(value.len() - suffix.len(), suffix.len(), suffix)
 }
 
 fn starts_with_text(value: str, prefix: str) -> bool {
     if prefix.len() > value.len() {
         ret false
     }
-    ret byte_slice(value, 0_usize, prefix.len()) == prefix
+    ret value.range_eq(0, prefix.len(), prefix)
 }
 
 fn find_text(value: str, needle: str) -> usize {
-    if needle.len() == 0_usize {
-        ret 0_usize
-    }
-    if needle.len() > value.len() {
-        ret value.len()
-    }
-    let mut index = 0_usize
-    while index + needle.len() <= value.len() {
-        if byte_slice(value, index, needle.len()) == needle {
-            ret index
-        }
-        index = index + 1_usize
-    }
-    ret value.len()
+    ret value.find_from(needle, 0)
 }
 
 fn find_last_scope(value: str) -> usize {
@@ -1776,7 +1687,7 @@ fn find_last_scope(value: str) -> usize {
     }
     let mut index = value.len() - 1_usize
     while index > 0_usize {
-        if byte_slice(value, index - 1_usize, 2_usize) == "::" {
+        if value.range_eq(index - 1_usize, 2_usize, "::") {
             ret index - 1_usize
         }
         index = index - 1_usize

@@ -9,6 +9,7 @@ import std::vec::Vec
 import refrain::frontend::analysis::{DiagnosticLabelKind, FrontendDiagnostic, FrontendDocument, FrontendSymbol, analyze_named_editor_module, analyze_named_module, analyze_named_tokens}
 import refrain::frontend::dependency_graph::DependencyGraph
 import refrain::frontend::hir::{DefinitionId, DefinitionKind, DefinitionNamespace, HirDefinition, ModuleDefMap, TypeId, definition_id}
+import refrain::frontend::import_paths
 import refrain::frontend::lexer::{Lexer, Token, TokenType}
 import refrain::frontend::parser::{FunctionItem, GenericParam, Statement}
 import refrain::frontend::safety::{FunctionSafety, SafetyFunction, infer_safety_with_known, safety_dependencies}
@@ -4436,34 +4437,6 @@ fn strip_import_alias(value: str) -> str {
     ret value
 }
 
-fn module_root_name(module_name: str) -> str {
-    let mut index = 0_usize
-    while index + 2_usize <= module_name.len() {
-        if module_name.slice(index, 2_usize) == "::" {
-            ret module_name.slice(0_usize, index)
-        }
-        index += 1_usize
-    }
-    ret module_name
-}
-
-/// Expands package-relative import prefixes into the analysis namespace.
-pub fn normalized_import_target(module_name: str, target: str) -> str {
-    let mut cleaned = target
-    if starts_with(cleaned, "mod::") {
-        ret module_name + "::" + cleaned.slice(5_usize, cleaned.len() - 5_usize)
-    }
-    if starts_with(cleaned, "refrain::") || starts_with(cleaned, "repo::") {
-        let prefix_len = if starts_with(cleaned, "refrain::") {
-            9_usize
-        } else {
-            6_usize
-        }
-        ret module_root_name(module_name) + "::" + cleaned.slice(prefix_len, cleaned.len() - prefix_len)
-    }
-    ret cleaned
-}
-
 fn parent_module_name(module_name: str) -> str {
     let mut index = module_name.len()
     while index >= 2_usize {
@@ -4475,116 +4448,19 @@ fn parent_module_name(module_name: str) -> str {
     ret ""
 }
 
-/// Expands a module namespace bound by a bare or aliased import.
-/// Empty means this import binds no matching namespace.
+/// Expands package-relative import prefixes into the analysis namespace.
+pub fn normalized_import_target(module_name: str, target: str) -> str {
+    ret import_paths::normalized_import_target(module_name, target)
+}
+
+/// Expands a bare or aliased namespace import.
 pub fn import_namespace_target(path: str, target: str, requested: str) -> str {
-    let mut end = target.len()
-    let mut separator = target.len()
-    while end >= 2_usize {
-        if target.slice(end - 2_usize, 2_usize) == "::" {
-            separator = end - 2_usize break
-        }
-        end -= 1_usize
-    }
-    let target_leaf = if separator < target.len() {
-        target.slice(separator + 2_usize, target.len() - separator - 2_usize)
-    } else {
-        target
-    }
-    let mut leaf = if path == target {
-        target_leaf
-    } else {
-        ""
-    }
-    let alias = import_binding(path)
-    if alias.2 && alias.0 == target {
-        leaf = alias.1
-    }
-    if separator < target.len() {
-        let parent = target.slice(0_usize, separator)
-        if starts_with(path, parent + "::") {
-            for binding in import_binding_names(path, parent) {
-                if binding.0 == target_leaf {
-                    leaf = binding.1
-                }
-            }
-        }
-    }
-    if leaf != "" {
-        if requested == leaf {
-            ret target
-        }
-        if starts_with(requested, leaf + "::") {
-            ret target + requested.slice(leaf.len(), requested.len() - leaf.len())
-        }
-    }
-    ret ""
+    ret import_paths::import_namespace_target(path, target, requested)
 }
+
 /// Returns selected declarations, local names, and explicit-alias flags.
-/// Shared by semantic scope construction and compiler call lowering.
 pub fn import_binding_names(path: str, owner: str) -> Vec[(str, str, bool)] {
-    let mut out = Vec[(str, str, bool)]::new()
-    if path.byte_len() <= owner.byte_len() + 2_usize {
-        out.push(("*", "*", false)) ret out
-    }
-    let suffix = path.slice_bytes(owner.byte_len() + 2_usize, path.byte_len() - owner.byte_len() - 2_usize)
-    if starts_with(suffix, "{") {
-        let mut inner = suffix.slice_bytes(1_usize, suffix.byte_len() - 1_usize)
-        if inner.byte_len() > 0_usize && inner.slice_bytes(inner.byte_len() - 1_usize, 1_usize) == "}" {
-            inner = inner.slice_bytes(0_usize, inner.byte_len() - 1_usize)
-        }
-        for item in split_import_items(inner) {
-            out.push(import_binding(item))
-        }
-        ret out
-    }
-    out.push(import_binding(suffix))
-    ret out
-}
-
-fn split_import_items(value: str) -> Vec[str] {
-    let mut out = Vec[str]::new()
-    let mut start = 0_usize
-    let mut index = 0_usize
-    // Import separators are ASCII. Keep identifier/alias contents as UTF-8
-    // slices instead of rescanning characters and concatenating every byte.
-    while index <= value.byte_len() {
-        if index == value.byte_len() || value.byte_at(index) == 44_u8 {
-            let item = trim_analysis_text(value.slice_bytes(start, index - start))
-            if item != "" {
-                out.push(item)
-            }
-            start = index + 1
-        }
-        index += 1
-    }
-    ret out
-}
-
-fn import_binding(value: str) ->(str, str, bool) {
-    let trimmed = trim_analysis_text(value)
-    let mut index = 0_usize
-    while index + 4_usize <= trimmed.byte_len() {
-        if trimmed.slice_bytes(index, 4_usize) == " as " {
-            ret(trim_analysis_text(trimmed.slice_bytes(0_usize, index)), trim_analysis_text(trimmed.slice_bytes(index
-                        + 4_usize, trimmed.byte_len() - index - 4_usize,)), true)
-        }
-        index += 1_usize
-    }
-    ret(trimmed, trimmed, false)
-}
-
-fn trim_analysis_text(value: str) -> str {
-    let mut start = 0_usize
-    let mut end = value.byte_len()
-    while start < end &&(value.slice_bytes(start, 1_usize) == " " || value.slice_bytes(start, 1_usize) == "\t") {
-        start += 1_usize
-    }
-    while end > start &&(value.slice_bytes(end - 1_usize, 1_usize) == " " || value.slice_bytes(end - 1_usize, 1_usize)
-        == "\t") {
-        end -= 1_usize
-    }
-    ret value.slice_bytes(start, end - start)
+    ret import_paths::import_binding_names(path, owner)
 }
 
 fn declaration_generic_names(generics: Vec[GenericParam]) -> Vec[str] {

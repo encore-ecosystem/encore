@@ -17,8 +17,8 @@ import rich::panel::Panel
 import rich::style::{accent, error_text, muted}
 
 import refrain::cache_identity::compiler_content_digest
-import refrain::frontend::analysis_database::{import_binding_names, import_namespace_target, normalized_import_target}
 import refrain::frontend::control_flow::{block_terminates_flow, match_arm_terminates_flow, match_stmt_terminates_flow, statement_terminates_flow}
+import refrain::frontend::import_paths::{import_binding_names, import_namespace_target, normalized_import_target}
 import refrain::frontend::lexer::Lexer
 import refrain::frontend::metadata_ast::encode_lowered_function_input
 import refrain::frontend::parser::Parser
@@ -513,6 +513,14 @@ struct ClosureSignature {
     ret_type: str
 }
 
+// Memoizes immutable import syntax, not type-dependent overload decisions.
+// Alias entries additionally bind the declaration generation.
+struct TranslationImportCache {
+    index: usize
+    texts: Vec[str]
+    bindings: Vec[Option[FunctionType]]
+}
+
 struct TranslatorContext {
     cached_functions: Vec[CachedFunctionChunk]
     lowered_functions: Vec[CachedFunctionChunk]
@@ -586,6 +594,8 @@ struct TranslatorContext {
     reflection_emitted: usize
     reflection_templates: Vec[ReflectionSpecialization]
     reflection_shapes: Vec[ReflectionShapeCache]
+    imports: TranslationImportCache
+    async_functions: Vec[usize]
 }
 
 struct ReflectionShapeCache {
@@ -1099,13 +1109,13 @@ fn resolve_type_collision_uncached(ctx: mut TranslatorContext,
     // A local import spelling is not a declaration name. Resolve it through
     // the selected export before asking which module declares the nominal type.
     // This also follows public aliases through facade modules.
-    if !module_declares_type(module, name) {
+    if !cached_module_declares_type(ctx, module, name) {
         let mut imported = ""
         for candidate in ctx.modules {
             if !contains_str(module.imports, candidate.module_id) {
                 continue
             }
-            let target = module_import_path(candidate.module_id)
+            let target = cached_module_import_path(ctx, candidate.module_id)
             for statement in module.ast {
                 match statement {
                     Statement::Import(item) => {
@@ -1172,6 +1182,27 @@ fn declaration_type_name(statement: Statement) -> str {
     ret ""
 }
 
+fn cached_module_declares_type(ctx: mut TranslatorContext, module: TranslationModule, name: str) -> bool {
+    let key = "declares-type\n" + module.module_id + "\n" + name
+    let encoded = unsafe {
+        encore_strmap_get(ctx.imports.index, key)
+    }
+    if encoded != 0 {
+        ret encoded == 1
+    }
+    let result = module_declares_type(module, name)
+    unsafe {
+        encore_strmap_put(ctx.imports.index, key, if result {
+                1
+            } else {
+                2
+            }
+            ,
+        )
+    }
+    ret result
+}
+
 fn module_declares_type(module: TranslationModule, name: str) -> bool {
     for statement in module.ast {
         if declaration_type_name(statement) == name {
@@ -1181,34 +1212,50 @@ fn module_declares_type(module: TranslationModule, name: str) -> bool {
     ret false
 }
 
-fn declaration_type_count(modules: Vec[TranslationModule], name: str) -> usize {
-    let mut count = 0_usize
-    for module in modules {
-        if module_declares_type(module, name) {
-            count += 1_usize
-        }
-    }
-    ret count
-}
-
 fn build_type_collision_names(modules: Vec[TranslationModule], stable_abi: bool) -> Vec[str] {
     let mut collisions = Vec[str]::new()
+    let mut names = Vec[str]::new()
+    let counts = unsafe {
+        encore_strmap_new()
+    }
     let seen = unsafe {
         encore_strset_new()
     }
+    // Count modules, not declarations: the type and trait namespaces may use
+    // the same spelling within one module.
     for module in modules {
+        let local = unsafe {
+            encore_strset_new()
+        }
         for statement in module.ast {
             let name = declaration_type_name(statement)
-            if name != "" && !unsafe {
-                encore_strset_contains(seen, name)
+            if name != "" && unsafe {
+                encore_strset_insert(local, name)
             }
             {
-                let _inserted = unsafe {
-                    encore_strset_insert(seen, name)
+                let count = unsafe {
+                    encore_strmap_get(counts, name)
                 }
-                if stable_abi || declaration_type_count(modules, name) > 1_usize {
-                    collisions.push(name)
+                if count == 0 {
+                    names.push(name)
                 }
+                unsafe {
+                    encore_strmap_put(counts, name, count + 1)
+                }
+            }
+        }
+        unsafe {
+            encore_strset_free(local)
+        }
+    }
+    for name in names {
+        if stable_abi || unsafe {
+            encore_strmap_get(counts, name)
+        }
+        > 1 {
+            collisions.push(name)
+            unsafe {
+                encore_strset_insert(seen, name)
             }
         }
     }
@@ -1226,8 +1273,14 @@ fn build_type_collision_names(modules: Vec[TranslationModule], stable_abi: bool)
                             continue
                         }
                         for binding in import_binding_names(path, target) {
-                            if binding.2 && !contains_str(collisions, binding.1) {
+                            if binding.2 && !unsafe {
+                                encore_strset_contains(seen, binding.1)
+                            }
+                            {
                                 collisions.push(binding.1)
+                                unsafe {
+                                    encore_strset_insert(seen, binding.1)
+                                }
                             }
                         }
                     }
@@ -1238,6 +1291,7 @@ fn build_type_collision_names(modules: Vec[TranslationModule], stable_abi: bool)
         }
     }
     unsafe {
+        encore_strmap_free(counts)
         encore_strset_free(seen)
     }
     ret collisions
@@ -1245,7 +1299,7 @@ fn build_type_collision_names(modules: Vec[TranslationModule], stable_abi: bool)
 
 fn resolve_type_declaration_module(ctx: mut TranslatorContext, current: TranslationModule, name: str)
 -> str {
-    if module_declares_type(current, name) {
+    if cached_module_declares_type(ctx, current, name) {
         ret current.module_id
     }
 
@@ -1277,7 +1331,7 @@ fn resolve_type_declaration_module(ctx: mut TranslatorContext, current: Translat
 
     let mut visible = ""
     for candidate in ctx.modules {
-        if candidate.module_id != current.module_id && module_declares_type(candidate, name) &&
+        if candidate.module_id != current.module_id && cached_module_declares_type(ctx, candidate, name) &&
         unsafe {
             encore_strset_contains(ctx.visibility_index,
                 current.module_id + "\n" + candidate.module_id,)
@@ -1332,7 +1386,7 @@ fn exported_type_owner(ctx: mut TranslatorContext, module: TranslationModule,
                         continue
                     }
                     let path = translation_import_target(module, item.path)
-                    if import_path_allows(path, module_import_path(candidate.module_id), name) {
+                    if import_path_allows(path, cached_module_import_path(ctx, candidate.module_id), name) {
                         let found = exported_type_owner(ctx, candidate, name, depth + 1_usize)
                         if found != "" {
                             if owner != "" && owner != found {
@@ -1397,6 +1451,7 @@ fn free_translation_indexes(ctx: TranslatorContext) ->() {
         }
     }
     unsafe {
+        encore_strmap_free(ctx.imports.index)
         encore_strmap_free(ctx.module_index)
         encore_strset_free(ctx.visibility_index)
         encore_strset_free(ctx.direct_import_index)
@@ -1583,7 +1638,14 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
         Vec[str]::new(), Vec[VariableRegion]::new(), Vec[usize]::new(), Vec[usize]::new(),
         Vec[usize]::new(), Vec[usize]::new(), Vec[str]::new(), Vec[str]::new(),
         Vec[str]::new(), Vec[str]::new(), Vec[str]::new(), 1_usize, stable_abi, "", 0, Vec[str]::new(),
-        Vec[ReflectionSpecialization]::new(), 0, Vec[ReflectionSpecialization]::new(), Vec[ReflectionShapeCache]::new()
+        Vec[ReflectionSpecialization]::new(), 0, Vec[ReflectionSpecialization]::new(), Vec[ReflectionShapeCache]::new(),
+        TranslationImportCache {
+            unsafe {
+                encore_strmap_new()
+            }
+            , Vec[str]::new(), Vec[Option[FunctionType]]::new()
+        }
+        , Vec[usize]::new()
     }
     // Struct/enum syntax nodes intentionally carry no source path. In a
     // resolved workspace, collect them through their owning module so two
@@ -1756,7 +1818,7 @@ fn index_function_import_aliases(ctx: mut TranslatorContext) ->() {
                 Statement::Import(item) => {
                     let path = translation_import_target(module, item.path)
                     for target_id in module.imports {
-                        let target = module_import_path(target_id)
+                        let target = cached_module_import_path(ctx, target_id)
                         if !starts_with(path, target + "::") {
                             continue
                         }
@@ -1899,7 +1961,7 @@ fn exported_function_binding(ctx: mut TranslatorContext, module: TranslationModu
         if !contains_str(module.imports, target.module_id) {
             continue
         }
-        let target_path = module_import_path(target.module_id)
+        let target_path = cached_module_import_path(ctx, target.module_id)
         for statement in module.ast {
             match statement {
                 Statement::Import(item) => {
@@ -1942,6 +2004,22 @@ fn exported_function_binding(ctx: mut TranslatorContext, module: TranslationModu
     ret found
 }
 fn function_import_alias(ctx: mut TranslatorContext, source_name: str, name: str) -> Option[FunctionType] {
+    let key = "alias\n" + Debug::fmt(ctx.functions.len()) + "\n" + source_name + "\n" + name
+    let encoded = unsafe {
+        encore_strmap_get(ctx.imports.index, key)
+    }
+    if encoded != 0 {
+        ret ctx.imports.bindings.get(encoded - 1).unwrap_or(Option[FunctionType]::None)
+    }
+    let result = resolve_function_import_alias(ctx, source_name, name)
+    ctx.imports.bindings.push(result)
+    unsafe {
+        encore_strmap_put(ctx.imports.index, key, ctx.imports.bindings.len())
+    }
+    ret result
+}
+
+fn resolve_function_import_alias(ctx: mut TranslatorContext, source_name: str, name: str) -> Option[FunctionType] {
     let base = base_type_name(name)
     let encoded = unsafe {
         encore_strmap_get(ctx.function_heads, function_import_alias_key(source_name, base))
@@ -1954,7 +2032,7 @@ fn function_import_alias(ctx: mut TranslatorContext, source_name: str, name: str
         let owner = imported_namespace_path(ctx, source_name, base.slice(0_usize, scope))
         let member = base.slice(scope + 2_usize, base.len() - scope - 2_usize)
         for module in ctx.modules {
-            if module_import_path(module.module_id) == owner {
+            if cached_module_import_path(ctx, module.module_id) == owner {
                 ret exported_function_binding(ctx, module, member, 0_usize)
             }
         }
@@ -1962,28 +2040,35 @@ fn function_import_alias(ctx: mut TranslatorContext, source_name: str, name: str
     ret Option[FunctionType]::None
 }
 fn canonical_source_identity(value: str) -> str {
-    let mut out = ""
-    let mut index = 0_usize
-    while index < value.len() {
-        let ch = value.slice(index, 1_usize)
-        if ch == "\\" {
-            out = out + "/"
-        } else {
-            out = out + ch
-        }
-        index += 1_usize
+    if value.find_byte_from(92_u8, 0) == value.byte_len() {
+        ret value
     }
-    ret out
+    let mut builder = EhirTextBuilder::new()
+    let mut start = 0_usize
+    let mut separator = value.find_byte_from(92_u8, start)
+    while separator < value.byte_len() {
+        builder = builder.append_str(value.slice_bytes(start, separator - start)).append_str("/")
+        start = separator + 1
+        separator = value.find_byte_from(92_u8, start)
+    }
+    ret builder.append_str(value.slice_bytes(start, value.byte_len() - start)).finish()
 }
 
 fn index_module_source_alias(index: usize, source_name: str, module_position: usize) ->() {
     unsafe {
+        encore_strmap_put(index, source_name, module_position + 1_usize)
         encore_strmap_put(index, canonical_source_identity(source_name), module_position + 1_usize)
     }
     ret()
 }
 
 fn lookup_module_source_alias(index: usize, source_name: str) -> usize {
+    let raw = unsafe {
+        encore_strmap_get(index, source_name)
+    }
+    if raw != 0 {
+        ret raw
+    }
     ret unsafe {
         encore_strmap_get(index, canonical_source_identity(source_name))
     }
@@ -2151,7 +2236,7 @@ fn trait_identity_for_source(ctx: mut TranslatorContext, source_name: str, name:
         let namespace = imported_namespace_path(ctx, source_name, name.slice(0_usize, separator))
         let leaf = name.slice(separator + 2_usize, name.len() - separator - 2_usize)
         for module in ctx.modules {
-            if module_import_path(module.module_id) == namespace {
+            if cached_module_import_path(ctx, module.module_id) == namespace {
                 let identity = exported_type_identity(ctx, module, leaf, 0_usize)
                 if identity != "" {
                     ret identity
@@ -2562,6 +2647,9 @@ fn ctx_add_function(ctx: mut TranslatorContext, source_name: str, name: str, ret
         }
         ,
     )
+    if is_async {
+        ctx.async_functions.push(ctx.functions.len() - 1)
+    }
     unsafe {
         encore_strmap_put(ctx.function_heads, name, ctx.functions.len())
     }
@@ -2647,7 +2735,7 @@ fn qualified_callable_name(ctx: mut TranslatorContext, source_name: str, name: s
         let requested_module = imported_namespace_path(ctx, source_name, owner.slice_bytes(0, scope))
         let requested_type = owner.slice_bytes(scope + 2, owner.byte_len() - scope - 2)
         for module in ctx.modules {
-            if module_import_path(module.module_id) == requested_module {
+            if cached_module_import_path(ctx, module.module_id) == requested_module {
                 let resolved = exported_type_identity(ctx, module, base_type_name(requested_type), 0)
                 if resolved != "" {
                     let args = generic_args_from_path(requested_type)
@@ -2700,7 +2788,7 @@ fn exported_type_identity(ctx: mut TranslatorContext, module: TranslationModule,
         if !contains_str(module.imports, candidate.module_id) {
             continue
         }
-        let target = module_import_path(candidate.module_id)
+        let target = cached_module_import_path(ctx, candidate.module_id)
         for statement in module.ast {
             match statement {
                 Statement::Import(item) => {
@@ -2758,10 +2846,16 @@ fn ctx_next_emitted_name(ctx: mut TranslatorContext, source_name: str, raw_name:
 
 fn resolve_async_future_aliases(ctx: mut TranslatorContext, source_name: str, typ: str) -> str {
     let mut value = canonical_type(typ)
-    for function in ctx.functions {
-        if function.is_async && function.source_name == source_name {
-            let alias = async_future_base_name(function.name)
-            value = replace_type_token(value, alias, base_type_name(function.ret_type))
+    for position in ctx.async_functions {
+        match ctx.functions.get(position) {
+            Some(function) => {
+                if function.source_name == source_name {
+                    let alias = async_future_base_name(function.name)
+                    value = replace_type_token(value, alias, base_type_name(function.ret_type))
+                }
+            }
+            None => {
+            }
         }
     }
     ret canonical_type(value)
@@ -3777,6 +3871,22 @@ fn call_placement_matches(expected: str, actual: str) -> bool {
 // Resolve imported module namespaces for functions and traits, including
 // explicit aliases. A visible sibling declaration is not that namespace.
 fn imported_namespace_path(ctx: mut TranslatorContext, source_name: str, requested: str) -> str {
+    let key = "namespace\n" + source_name + "\n" + requested
+    let encoded = unsafe {
+        encore_strmap_get(ctx.imports.index, key)
+    }
+    if encoded != 0 {
+        ret ctx.imports.texts.get(encoded - 1).unwrap_or(requested)
+    }
+    let result = resolve_imported_namespace_path(ctx, source_name, requested)
+    ctx.imports.texts.push(result)
+    unsafe {
+        encore_strmap_put(ctx.imports.index, key, ctx.imports.texts.len())
+    }
+    ret result
+}
+
+fn resolve_imported_namespace_path(ctx: mut TranslatorContext, source_name: str, requested: str) -> str {
     let encoded = lookup_module_source_alias(ctx.module_index, source_name)
     if encoded == 0 {
         ret requested
@@ -3793,7 +3903,7 @@ fn imported_namespace_path(ctx: mut TranslatorContext, source_name: str, request
             Statement::Import(item) => {
                 let path = translation_import_target(caller, item.path)
                 for target in caller.imports {
-                    let target_path = module_import_path(target)
+                    let target_path = cached_module_import_path(ctx, target)
                     let expanded = import_namespace_target(path, target_path, requested)
                     if expanded != "" {
                         ret expanded
@@ -3847,7 +3957,7 @@ fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, source_name: str, na
             let index = qualified - 1_usize
             match ctx.functions.get(index) {
                 Option[FunctionType]::Some(function) => {
-                    let function_module = module_import_path(module_identity_for_source(ctx, function.source_name))
+                    let function_module = cached_module_import_path(ctx, module_identity_for_source(ctx, function.source_name))
                     if function.name == member && function_module == requested_module &&
                     function_matches_args(function, actual_types) {
                         ret Option[FunctionType]::Some(function)
@@ -4082,7 +4192,7 @@ fn direct_import_allows(ctx: mut TranslatorContext, caller_source: str,
                 match statement {
                     Statement::Import(item) => {
                         let path = translation_import_target(module, item.path)
-                        if import_path_allows(path, module_import_path(target_module), function_name)
+                        if import_path_allows(path, cached_module_import_path(ctx, target_module), function_name)
                         {
                             let _allowed = unsafe {
                                 encore_strset_insert(ctx.direct_import_index, prefix + imported_name)
@@ -4196,6 +4306,22 @@ fn translation_import_target(module: TranslationModule, raw: str) -> str {
         }
     }
     ret normalized_import_target(owner, path)
+}
+
+fn cached_module_import_path(ctx: mut TranslatorContext, module_id: str) -> str {
+    let key = "module-path\n" + module_id
+    let encoded = unsafe {
+        encore_strmap_get(ctx.imports.index, key)
+    }
+    if encoded != 0 {
+        ret ctx.imports.texts.get(encoded - 1).unwrap_or(module_id)
+    }
+    let result = module_import_path(module_id)
+    ctx.imports.texts.push(result)
+    unsafe {
+        encore_strmap_put(ctx.imports.index, key, ctx.imports.texts.len())
+    }
+    ret result
 }
 
 fn module_import_path(module_id: str) -> str {
@@ -5014,20 +5140,26 @@ fn base_type_name(name: str) -> str {
 }
 
 fn value_type_name(name: str) -> str {
-    let mut value = name
-    if starts_with(value, "mut ") {
-        value = value.slice(4_usize, value.len() - 4_usize)
+    let length = name.byte_len()
+    let start = if name.range_eq(0_usize, 4_usize, "mut ") {
+        4_usize
+    } else {
+        0_usize
     }
-    if ends_with(value, "<H>") || ends_with(value, "<S>") {
-        ret value.slice(0_usize, value.len() - 3_usize)
+    let mut end = length
+    if end > start {
+        let last = name.byte_at(end - 1_usize)
+        if last == 62_u8 && end - start >= 3_usize && name.byte_at(end - 3_usize) == 60_u8 &&
+        (name.byte_at(end - 2_usize) == 72_u8 || name.byte_at(end - 2_usize) == 83_u8) {
+            end -= 3_usize
+        } elif last == 38_u8 || last == 42_u8 {
+            end -= 1_usize
+        }
     }
-    if ends_with(value, "&") {
-        ret value.slice(0_usize, value.len() - 1_usize)
+    if start == 0_usize && end == length {
+        ret name
     }
-    if ends_with(value, "*") {
-        ret value.slice(0_usize, value.len() - 1_usize)
-    }
-    ret value
+    ret name.slice_bytes(start, end - start)
 }
 
 fn is_node_handle_type_text(name: str) -> bool {
@@ -5547,6 +5679,17 @@ fn is_enum_variant_path(name: str) -> bool {
 }
 
 fn last_scope_index(value: str) -> usize {
+    if value.byte_len() == value.char_len() {
+        let mut end = value.byte_len()
+        while end >= 2 {
+            if value.range_eq(end - 2, 2, "::") {
+                ret end - 2
+            }
+            end -= 1
+        }
+        ret value.byte_len()
+    }
+
     if value.len() < 2_usize {
         ret value.len()
     }
@@ -6111,7 +6254,6 @@ fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, e
     }
     ctx.in_async_function = fn_item.is_async
     ctx.async_poll_future_type = ""
-    ctx.active_generics = resolved_generic_bounds(ctx, fn_item.source_name, combined_generic_params(scope_generics, fn_item.generics))
     let mut signature_generics = generic_param_names(ctx.active_generics)
     for generic in generic_args_from_path(ctx.self_type) {
         if !contains_str(signature_generics, generic) {
@@ -6333,7 +6475,7 @@ fn translation_reflection_shapes(ctx: mut TranslatorContext, source: str) -> Vec
             let shape = bases.get_unchecked_borrowed(encoded - 1)
             let mut names = aliases.get_unchecked_borrowed(encoded - 1)
             names.push(ReflectionShape {
-                    module_import_path(module.module_id) + "::" + name, owner,
+                    cached_module_import_path(ctx, module.module_id) + "::" + name, owner,
                     shape.kind, shape.parameters, shape.fields, shape.attributes
                 }
                 ,)
@@ -14234,7 +14376,7 @@ fn starts_with(value: str, prefix: str) -> bool {
     if prefix.len() > value.len() {
         ret false
     }
-    ret value.slice(0_usize, prefix.len()) == prefix
+    ret value.range_eq(0, prefix.byte_len(), prefix)
 }
 
 fn append_ehir_documentation(builder: EhirTextBuilder, documentation: Option[Documentation], prefix:
@@ -14317,19 +14459,19 @@ fn ends_with(value: str, suffix: str) -> bool {
         ret false
     }
     let start = value.len() - suffix.len()
-    ret value.slice(start, suffix.len()) == suffix
+    ret value.range_eq(start, suffix.byte_len(), suffix)
 }
 
 fn trim_spaces(value: str) -> str {
     let mut start = 0_usize
-    while start < value.len() && value.slice(start, 1_usize) == " " {
-        start = start + 1_usize
+    while start < value.byte_len() && value.byte_at(start) == 32_u8 {
+        start += 1
     }
-    let mut end = value.len()
-    while end > start && value.slice(end - 1_usize, 1_usize) == " " {
-        end = end - 1_usize
+    let mut end = value.byte_len()
+    while end > start && value.byte_at(end - 1) == 32_u8 {
+        end -= 1
     }
-    ret value.slice(start, end - start)
+    ret value.slice_bytes(start, end - start)
 }
 
 fn escape_str(value: str) -> str {

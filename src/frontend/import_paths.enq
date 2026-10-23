@@ -1,0 +1,137 @@
+//! Pure import spelling and alias expansion shared by lowering and analysis.
+
+import std::vec::Vec
+
+fn module_root_name(module_name: str) -> str {
+    let separator = module_name.find_from("::", 0)
+    ret module_name.slice_bytes(0, separator)
+}
+
+/// Expands package-relative import prefixes into the analysis namespace.
+pub fn normalized_import_target(module_name: str, target: str) -> str {
+    let mut cleaned = target
+    if starts_with(cleaned, "mod::") {
+        ret module_name + "::" + cleaned.slice_bytes(5_usize, cleaned.len() - 5_usize)
+    }
+    if starts_with(cleaned, "refrain::") || starts_with(cleaned, "repo::") {
+        let prefix_len = if starts_with(cleaned, "refrain::") {
+            9_usize
+        } else {
+            6_usize
+        }
+        ret module_root_name(module_name) + "::" + cleaned.slice_bytes(prefix_len, cleaned.len() - prefix_len)
+    }
+    ret cleaned
+}
+
+/// Expands a module namespace bound by a bare or aliased import.
+/// Empty means this import binds no matching namespace.
+pub fn import_namespace_target(path: str, target: str, requested: str) -> str {
+    let mut end = target.len()
+    let mut separator = target.len()
+    while end >= 2_usize {
+        if target.range_eq(end - 2_usize, 2_usize, "::") {
+            separator = end - 2_usize break
+        }
+        end -= 1_usize
+    }
+    let target_leaf = if separator < target.len() {
+        target.slice_bytes(separator + 2_usize, target.len() - separator - 2_usize)
+    } else {
+        target
+    }
+    let mut leaf = if path == target {
+        target_leaf
+    } else {
+        ""
+    }
+    let alias = import_binding(path)
+    if alias.2 && alias.0 == target {
+        leaf = alias.1
+    }
+    if separator < target.len() {
+        let parent = target.slice_bytes(0_usize, separator)
+        if starts_with(path, parent + "::") {
+            for binding in import_binding_names(path, parent) {
+                if binding.0 == target_leaf {
+                    leaf = binding.1
+                }
+            }
+        }
+    }
+    if leaf != "" {
+        if requested == leaf {
+            ret target
+        }
+        if starts_with(requested, leaf + "::") {
+            ret target + requested.slice_bytes(leaf.len(), requested.len() - leaf.len())
+        }
+    }
+    ret ""
+}
+/// Returns selected declarations, local names, and explicit-alias flags.
+/// Shared by semantic scope construction and compiler call lowering.
+pub fn import_binding_names(path: str, owner: str) -> Vec[(str, str, bool)] {
+    let mut out = Vec[(str, str, bool)]::new()
+    if path.byte_len() <= owner.byte_len() + 2_usize {
+        out.push(("*", "*", false)) ret out
+    }
+    let suffix = path.slice_bytes(owner.byte_len() + 2_usize, path.byte_len() - owner.byte_len() - 2_usize)
+    if starts_with(suffix, "{") {
+        let mut inner = suffix.slice_bytes(1_usize, suffix.byte_len() - 1_usize)
+        if inner.byte_len() > 0_usize && inner.slice_bytes(inner.byte_len() - 1_usize, 1_usize) == "}" {
+            inner = inner.slice_bytes(0_usize, inner.byte_len() - 1_usize)
+        }
+        for item in split_import_items(inner) {
+            out.push(import_binding(item))
+        }
+        ret out
+    }
+    out.push(import_binding(suffix))
+    ret out
+}
+
+fn split_import_items(value: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut start = 0_usize
+    let mut index = 0_usize
+    // Import separators are ASCII. Keep identifier/alias contents as UTF-8
+    // slices instead of rescanning characters and concatenating every byte.
+    while index <= value.byte_len() {
+        if index == value.byte_len() || value.byte_at(index) == 44_u8 {
+            let item = trim_import_text(value.slice_bytes(start, index - start))
+            if item != "" {
+                out.push(item)
+            }
+            start = index + 1
+        }
+        index += 1
+    }
+    ret out
+}
+
+fn import_binding(value: str) ->(str, str, bool) {
+    let trimmed = trim_import_text(value)
+    let index = trimmed.find_from(" as ", 0)
+    if index < trimmed.byte_len() {
+        ret(trim_import_text(trimmed.slice_bytes(0, index)),
+            trim_import_text(trimmed.slice_bytes(index + 4, trimmed.byte_len() - index - 4)), true,)
+    }
+    ret(trimmed, trimmed, false)
+}
+
+fn trim_import_text(value: str) -> str {
+    let mut start = 0_usize
+    let mut end = value.byte_len()
+    while start < end &&(value.byte_at(start) == 32_u8 || value.byte_at(start) == 9_u8) {
+        start += 1_usize
+    }
+    while end > start &&(value.byte_at(end - 1_usize) == 32_u8 || value.byte_at(end - 1_usize) == 9_u8) {
+        end -= 1_usize
+    }
+    ret value.slice_bytes(start, end - start)
+}
+
+fn starts_with(value: str, prefix: str) -> bool {
+    ret value.byte_len() >= prefix.byte_len() && value.range_eq(0, prefix.byte_len(), prefix)
+}

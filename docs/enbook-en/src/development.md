@@ -22,6 +22,68 @@ and steady-state execution. Comparing a cached build with a clean build says
 nothing about the optimizer's speed. Record the compiler release, target,
 profile, input size, repetitions, elapsed time, and memory when relevant.
 
+Compiler contributors can compare complete builds and the CI test suite across
+worker counts without enabling a profiler:
+
+```sh
+python3 scripts/benchmark-compiler-tests.py /path/to/candidate-encore \
+  --baseline-compiler /path/to/released-encore \
+  --baseline-ref v0.1.6-neumann --scenario all \
+  --jobs 1,2,4,8,16,auto --repetitions 3 --warm \
+  --output target/performance/results.json
+```
+
+The default build profile is `extreme`; `--profile` also accepts `dev` and
+`release`. `--scenario build` measures compiler builds, `suite` runs the complete
+compiler CI test fixture, and `standalone` retains the four small language,
+lexer, parser, and translator programs for latency comparisons. One selected
+test offers little parallel work, so use `suite` to assess test throughput.
+
+Every cold sample has an independent frozen source tree, private Git metadata,
+empty project output, and private compiled-package/registry caches. A warm
+sample immediately follows it with those same caches. Source copying and
+baseline downloads are outside the timed interval; native toolchains and OS
+filesystem buffers are retained. User caches are never cleared. Requests above
+the online CPU count are coalesced (matching current compiler discovery); `auto` exercises the compiler's actual
+default without an explicit `--jobs` argument. Baseline and candidate execute
+sequentially on the same machine, alternating their order between repetitions.
+
+The JSON report and adjacent Markdown table contain medians, minimum/maximum,
+standard deviations, speedups, CPU time and CPU-equivalent utilization where
+supported, compiler hashes, source digests, and machine/CPU/memory limits.
+`max_process_rss_kib` is the largest individual process RSS reported by `wait4`,
+not the simultaneous memory of all workers. Missing platform metrics remain
+null. Raw logs and native test reports are retained next to the result; timed
+out or failing invocations are failures, not successful timing samples. Test
+IDs must be unique and match across worker counts and cold/warm repetitions
+for each compiler/source variant.
+
+After an interruption, add `--resume` to the same command. Completed cold/warm
+pairs are retained; an incomplete pair restarts with empty caches. Resuming
+requires identical compiler hashes, source snapshots, benchmark code, machine
+and toolchain settings. The report marks completion explicitly and preserves
+the interrupted pair's logs. Stop the original process before resuming.
+Native Windows uses Git Bash beside Git; `--bash` selects an explicit executable.
+
+Test JSON reports retain `summary.duration_ms` as the sum of test durations.
+`summary.wall_duration_ms` records elapsed suite time,
+`summary.harness_duration_ms` records shared harness preparation, and
+`summary.jobs` records the resolved worker limit. Parallel summed durations can
+exceed elapsed time. Test workers take the next heaviest available job from a
+shared queue, while each test still runs in its own process and final report
+order remains stable.
+
+To collect paired native CI measurements, dispatch Native CI with
+`performance_baseline_tag=v0.1.6-neumann` and `performance_jobs=auto` (or an
+explicit comma-separated matrix). Each target verifies the published baseline
+archive and adoption provenance before running both compilers on one runner.
+The three CI repetitions run in separate jobs to stay within GitHub's six-hour
+job limit. Each baseline/candidate pair shares one runner, and the aggregate
+reports the median of within-runner speedup ratios. It retains each repetition's
+environment and elapsed-time distribution, and requires all three complete
+pairs with matching compiler/source identities and selected tests.
+Performance jobs are opt-in and do not impose a single-test time threshold.
+
 Use `release` for a portable optimization baseline; use `extreme` when its
 native toolchain requirements and CPU tuning are appropriate. Do not distribute
 a host-tuned binary to unknown CPUs without configuring a suitable baseline.
