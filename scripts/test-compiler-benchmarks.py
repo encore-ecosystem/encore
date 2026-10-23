@@ -146,8 +146,15 @@ class BenchmarkContracts(unittest.TestCase):
             for path in (git, bash, wsl):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.touch()
+            # macOS temporary directories and Windows short names can resolve
+            # to another spelling of the same file. Exercise a directory alias
+            # on POSIX too, rather than relying on the runner's temp layout.
+            if os.name != "nt":
+                alias = root / "Git-alias"
+                alias.symlink_to(root / "Git", target_is_directory=True)
+                git = alias / "cmd/git.exe"
             with mock.patch.object(benchmark.shutil, "which", side_effect=lambda name: str(git if name == "git" else wsl)):
-                self.assertEqual(benchmark.find_bash(windows=True), str(bash))
+                self.assertTrue(os.path.samefile(benchmark.find_bash(windows=True), bash))
                 bash.unlink()
                 with self.assertRaises(FileNotFoundError):
                     benchmark.find_bash(windows=True)
