@@ -9,7 +9,7 @@ import std::time::perf_counter_ms
 import std::vec::{Vec, vec_singleton}
 
 import ehirlib::{PreparationOutcome, enum_value, prepare_module}
-import ehirlib::core::{BinaryOpKind, Block, CallInstruction, Directive, EdgeInstruction, EhirDocumentation, EhirImport, EnumVariant, FnDirective, Instruction, MatchArm, MatchInstruction, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, Variable, add_edge, alias, async_fn_item, await_value, binary, block, br_term, call, cbr_term, cfree, drop_value, ehir_documentation, ehir_import, enum_directive, enum_variant, extern_fn_item, fn_item, gep, getfield, getfieldptr, getptr, halloc, hfree, hrealloc, impl_directive, lceos, lcpos, lcsos, load, make_module, make_module_bundle, make_module_with_metadata, mangle_plain_type_name, mangle_type_name, match_arm, match_term, param, pcast, phi, phi_pair, put, remove_edge, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, store, struct_directive, switch_case, switch_term, trait_directive, trait_method, unreachable_term}
+import ehirlib::core::{BinaryOpKind, Block, CallInstruction, Directive, EdgeInstruction, EhirDocumentation, EhirImport, EnumVariant, FnDirective, Instruction, MatchArm, MatchInstruction, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, Variable, add_edge, alias, async_fn_item, await_value, binary, block, br_term, call, cbr_term, cfree, drop_value, ehir_documentation, ehir_import, enum_directive, enum_variant, extern_fn_item, fn_item, gep, getfield, getfieldptr, getptr, halloc, hfree, hrealloc, impl_directive, lceos, lcpos, lcsos, load, local_place_type, make_module, make_module_bundle, make_module_with_metadata, mangle_plain_type_name, mangle_type_name, match_arm, match_term, memory_value_type, param, pcast, phi, phi_pair, put, raw_type, remove_edge, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, store, struct_directive, switch_case, switch_term, trait_directive, trait_method, unreachable_term}
 
 fn concat_instructions(left: Vec[LLVMInstruction], right: Vec[LLVMInstruction]) -> Vec[LLVMInstruction] {
     let mut out = Vec[LLVMInstruction]::new()
@@ -4183,6 +4183,22 @@ fn clone_type(typ: frozen Type) -> Type {
 }
 
 fn substitute_generic_type(typ: frozen Type, params: frozen Vec[Type], args: frozen Vec[Type]) -> Type {
+    let name = typ.name
+    let length = name.char_len()
+    if length > 0 &&(name.slice(length - 1, 1) == "*" || name.slice(length - 1, 1) == "&" ||
+        (length >= 3 &&(name.slice(length - 3, 3) == "<H>" || name.slice(length - 3, 3) == "<S>"))) {
+        let inner = substitute_generic_type(memory_value_type(clone_type(typ)), params, args)
+        if typ.representation == RepresentationKind::Inline {
+            ret inner
+        }
+        if typ.representation == RepresentationKind::Raw {
+            ret raw_type(inner)
+        }
+        if typ.representation == RepresentationKind::LocalPlace {
+            ret local_place_type(inner)
+        }
+        ret Type { inner.name, inner.generics, typ.representation }
+    }
     let mut index = 0_usize
     while index < params.len() {
         match params.get(index) {
@@ -4190,12 +4206,18 @@ fn substitute_generic_type(typ: frozen Type, params: frozen Vec[Type], args: fro
                 if typ.name == param_type.name && typ.generics.len() == 0_usize {
                     match args.get(index) {
                         Option[Type]::Some(arg_type) => {
+                            let cloned = clone_type(arg_type)
+                            if typ.representation == RepresentationKind::Raw {
+                                ret raw_type(cloned)
+                            }
+                            if typ.representation == RepresentationKind::LocalPlace {
+                                ret local_place_type(cloned)
+                            }
                             let pointer = if typ.representation == RepresentationKind::Inline {
                                 arg_type.representation
                             } else {
                                 typ.representation
                             }
-                            let cloned = clone_type(arg_type)
                             ret Type {
                                 cloned.name, cloned.generics, pointer
                             }
@@ -4648,6 +4670,10 @@ fn remember_variable_type(out: mut Vec[Type], seen: usize, value: Variable) ->()
 }
 
 fn remember_concrete_type(out: mut Vec[Type], seen: usize, typ: frozen Type) ->() {
+    if typ.representation == RepresentationKind::Raw || typ.representation == RepresentationKind::LocalPlace {
+        remember_concrete_type(out, seen, memory_value_type(clone_type(typ)))
+        ret()
+    }
     for generic in typ.generics {
         remember_concrete_type(out, seen, generic)
     }
@@ -6059,7 +6085,12 @@ fn required_generic_type(value: frozen Type, index: usize) -> Type {
 
 fn lower_type(typ: frozen Type) -> LLVMType {
     let raw_name = "" + typ.name
-    let base = if has_prefix(raw_name, "__array_") && typ.generics.len() == 1_usize {
+    let base = if raw_name.len() > 0 &&(raw_name.slice(raw_name.len() - 1, 1) == "*" ||
+        raw_name.slice(raw_name.len() - 1, 1) == "&" ||
+        (raw_name.len() >= 3 &&(raw_name.slice(raw_name.len() - 3, 3) == "<H>" ||
+                raw_name.slice(raw_name.len() - 3, 3) == "<S>"))) {
+        lower_type(memory_value_type(clone_type(typ)))
+    } elif has_prefix(raw_name, "__array_") && typ.generics.len() == 1_usize {
         let length = raw_name.slice(8_usize, raw_name.len() - 8_usize)
         match typ.generics.get(0_usize) {
             Option[Type]::Some(element) => {
@@ -6275,6 +6306,10 @@ fn lower_plain_type(type_name: str) -> LLVMType {
 
 fn is_aggregate_ehir_type(typ: frozen Type) -> bool {
     let name = typ.name
+    if name.len() > 0 &&(name.slice(name.len() - 1, 1) == "*" || name.slice(name.len() - 1, 1) == "&" ||
+        (name.len() >= 3 &&(name.slice(name.len() - 3, 3) == "<H>" || name.slice(name.len() - 3, 3) == "<S>"))) {
+        ret false
+    }
     if name == "bool" || name == "u1" || name == "str" || name == "void" || name == "()" {
         ret false
     }

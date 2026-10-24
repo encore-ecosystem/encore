@@ -456,6 +456,8 @@ typedef struct {
     size_t allocated;
 } encore_text_builder;
 
+#include "static_runtime.h"
+
 static _Thread_local bool encore_text_builder_suppressed = false;
 static _Thread_local bool encore_translation_diagnostic_json = false;
 
