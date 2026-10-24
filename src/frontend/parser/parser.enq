@@ -11,6 +11,38 @@ import std::vec::Vec
 import mod::statements::*
 import refrain::frontend::lexer::{Lexer, Token, TokenType}
 
+// An if in a value block may be an intermediate statement or its tail value.
+// Parse the branches once; the presence of else determines the syntax kind.
+enum ExpressionBlockItem {
+    Expression(ExprNode)
+    Statement(Statement)
+}
+
+fn expression_as_statement_block(body: ExprNode) -> ParsedBlock {
+    match body.value {
+        Expr::Block(data) => {
+            let mut statements = Vec[Statement]::new()
+            statements.extend(data.statements)
+            match data.tail {
+                Some(value) => {
+                    statements.push(Statement::Expr(ExprNode {
+                                value.value, value.line, value.column, value.length, value.source_name
+                            }
+                        ))
+                }
+                None => {
+                }
+            }
+            ret ParsedBlock {
+                statements, data.start_line, data.start_column, data.end_line, data.end_column
+            }
+        }
+        _ => {
+            ret ParsedBlock::synthetic(vec![Statement::Expr(body)])
+        }
+    }
+}
+
 /// A parser failure which library consumers can handle without exiting.
 pub struct ParseFailure {
     source_name: str
@@ -718,6 +750,7 @@ impl for Parser {
         }
         self.safe_consume(TokenType::ASSIGN)?
         let expression = self.parse_expression()?
+        let inferred_type = typ.is_none()
         match typ {
             None => {
                 typ = inferred_static_initializer_type(expression)
@@ -734,6 +767,9 @@ impl for Parser {
         }
         let mut static_attrs = attrs
         static_attrs.push("static")
+        if inferred_type {
+            static_attrs.push("static_inferred")
+        }
         let mut statements = Vec[Statement]::new()
         statements.push(Statement::Ret(expression))
         ret Result[Statement, ParseFailure]::Ok(Statement::Function(FunctionItem {
@@ -1497,6 +1533,18 @@ impl for Parser {
     }
 
     fn parse_if_expression(mut self) -> Result[ExprNode, ParseFailure] {
+        match self.parse_if_block_item(false)? {
+            ExpressionBlockItem::Expression(value) => {
+                ret Result[ExprNode, ParseFailure]::Ok(value)
+            }
+            ExpressionBlockItem::Statement(_) => {
+                self.error_at("expected an if expression", self.peek_curr())?
+            }
+        }
+        ret Result[ExprNode, ParseFailure]::Ok(self.mk_expr(Expr::Path("")))
+    }
+
+    fn parse_if_block_item(mut self, allow_statement: bool) -> Result[ExpressionBlockItem, ParseFailure] {
         self.safe_consume(TokenType::KW_IF)?
         self.parsing_control_flow_header = true
         let first_condition = self.parse_expression()?
@@ -1525,16 +1573,26 @@ impl for Parser {
         }
 
         if self.peek_curr_type() != TokenType::KW_ELSE {
+            if allow_statement {
+                let mut statements = Vec[IfBranch]::new()
+                for branch in branches {
+                    statements.push(IfBranch {
+                            branch.condition, expression_as_statement_block(branch.body)
+                        }
+                    )
+                }
+                ret Result[ExpressionBlockItem, ParseFailure]::Ok(ExpressionBlockItem::Statement(
+                        Statement::If(IfStmt { statements, Option[ParsedBlock]::None })))
+            }
             self.error_at("If expression must have else branch", self.peek_curr())?
-            ret Result[ExprNode, ParseFailure]::Ok(self.mk_expr(Expr::Path("")))
         }
         self.consume()
         let else_body = self.parse_expression_block()?
-        ret Result[ExprNode, ParseFailure]::Ok(self.mk_expr(Expr::If(IfExpr {
-                        branches, self.box_expr(else_body)
-                    }
-                    ,
-                )))
+        ret Result[ExpressionBlockItem, ParseFailure]::Ok(ExpressionBlockItem::Expression(self.mk_expr(Expr::If(IfExpr {
+                            branches, self.box_expr(else_body)
+                        }
+                        ,
+                    ))))
     }
 
     fn parse_unsafe_statement(mut self) -> Result[Statement, ParseFailure] {
@@ -2136,7 +2194,22 @@ impl for Parser {
                 statements.push(self.parse_inner_level()?)
                 continue
             }
-            let expression = self.parse_expression()?
+            let mut conditional = Option[ExprNode]::None
+            if self.peek_curr_type() == TokenType::KW_IF {
+                match self.parse_if_block_item(true)? {
+                    ExpressionBlockItem::Statement(value) => {
+                        statements.push(value)
+                        continue
+                    }
+                    ExpressionBlockItem::Expression(value) => {
+                        conditional = Option[ExprNode]::Some(value)
+                    }
+                }
+            }
+            let expression = match conditional {
+                Some(value) => value
+                None => self.parse_expression()?
+            }
             if self.peek_curr_type() == TokenType::RIGHT_BRACE {
                 tail = Option[ExprNode<H>]::Some(self.box_expr(expression))
                 break

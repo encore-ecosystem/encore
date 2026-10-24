@@ -1286,7 +1286,14 @@ impl for AnalysisDatabase {
         ret Option[ModuleDefMap]::Some(map)
     }
 
-    fn insert_import_definitions(
+    fn insert_import_definitions(self: mut Self, module_name: str, path: str,
+        is_public: bool, map: mut ModuleDefMap,) ->() {
+        for expanded in import_paths::expanded_import_paths(path) {
+            self.insert_flat_import_definitions(module_name, expanded, is_public, map)
+        }
+    }
+
+    fn insert_flat_import_definitions(
         self: mut Self,
         module_name: str,
         path: str,
@@ -1494,6 +1501,39 @@ impl for AnalysisDatabase {
         for indexed in self.all_symbols() {
             if indexed.symbol.name == name {
                 out.push(indexed)
+            }
+        }
+        ret out
+    }
+
+    /// Resolves exported inferred values before runtime bodies are removed.
+    /// Metadata consumers must receive the same signature as local callers.
+    pub fn resolved_static_declarations(self: mut Self, module_name: str, ast: Vec[Statement]) -> Vec[Statement] {
+        let mut out = Vec[Statement]::new()
+        for statement in ast {
+            match statement {
+                Statement::Function(item) => {
+                    let mut typ = item.ret_type
+                    if analysis_function_has_attr(item, "static_inferred") {
+                        let environment = self.scoped_environment(module_name)
+                        let names = names_in_scope(self.semantic_type_names(module_name), module_name)
+                        for callable in environment.callables {
+                            if callable.is_static && callable.module_name == module_name && callable.declaration_name == item.name {
+                                typ = Option[str]::Some(display_type(callable.ret_type, names))
+                                break
+                            }
+                        }
+                    }
+                    out.push(Statement::Function(FunctionItem {
+                                item.attrs, item.decorators, item.is_public, item.is_extern, item.is_async,
+                                item.name, item.documentation, item.generics, item.params, typ,
+                                item.returns_sending, item.returns_frozen, item.body, item.source_name, item.line, item.column
+                            }
+                        ))
+                }
+                _ => {
+                    out.push(statement)
+                }
             }
         }
         ret out
@@ -2311,7 +2351,7 @@ impl for AnalysisDatabase {
             slot += 1_usize
         }
         let names = self.semantic_type_names(module_name)
-        let callables = self.scoped_callables(self.visible_semantic_callables(module_name), names)
+        let mut callables = self.scoped_callables(self.visible_semantic_callables(module_name), names)
         let fields = self.scoped_fields(self.visible_semantic_fields(module_name), names)
         let methods = self.scoped_methods(self.visible_semantic_methods(module_name), names)
         let mut aggregates = Vec[str]::new()
@@ -2360,6 +2400,30 @@ impl for AnalysisDatabase {
             if binding.scope == module_name {
                 for variant in self.enum_variant_definitions(module_name, binding.name) {
                     constructors.push(binding.identity + "::" + variant.name())
+                }
+            }
+        }
+        // Resolve inferred static values in their declaration's type scope.
+        // Constructor return types may differ from the parser's owner hint.
+        for index in 0_usize..callables.len() {
+            let callable = callables.get_unchecked_borrowed(index)
+            if !callable.is_static {
+                continue
+            }
+            let document = self.document(callable.module_name).unwrap_or(FrontendDocument::empty())
+            for statement in document.ast {
+                match statement {
+                    Statement::Function(item) => {
+                        if item.name == callable.declaration_name && analysis_function_has_attr(item, "static_inferred") {
+                            let body = check_function_body_with_variants(item, callables, fields, methods, "",
+                                Vec[GenericParam]::new(), aggregates, callable.module_name, names, variants,)
+                            let typ = scope_type(body.return_type, callable.module_name,
+                                names_in_scope(names, callable.module_name), Vec[str]::new(),)
+                            callables.set(index, callable.with_return_type(typ))
+                        }
+                    }
+                    _ => {
+                    }
                 }
             }
         }
@@ -2421,7 +2485,7 @@ impl for AnalysisDatabase {
             scoped_callables.push(SemanticCallable {
                     callable.module_name, callable.name, params,
                     scope_type(callable.ret_type, scope, selected, callable.generic_names), callable.signature,
-                    callable.declaration_name, callable.lookup_module, callable.binding_identity, callable.generic_names
+                    callable.declaration_name, callable.lookup_module, callable.binding_identity, callable.generic_names, callable.is_static
                 }
                 ,)
         }
@@ -3236,6 +3300,13 @@ impl for AnalysisDatabase {
             match statement {
                 Statement::Function(item) => {
                     if item.name == name {
+                        if analysis_function_has_attr(item, "static_inferred") {
+                            for callable in self.scoped_environment(module_name).callables {
+                                if callable.module_name == module_name && callable.declaration_name == name {
+                                    ret Option[SemanticCallable]::Some(callable)
+                                }
+                            }
+                        }
                         ret Option[SemanticCallable]::Some(callable_from_function(module_name, item))
                     }
                 }
@@ -3864,6 +3935,7 @@ fn callable_from_function(module_name: str, item: FunctionItem) -> SemanticCalla
     }
     ret SemanticCallable::new(module_name, item.name, params, semantic_call_return_type(item))
     .with_generics(declaration_generic_names(item.generics))
+    .with_static(analysis_function_has_attr(item, "static"))
 }
 
 fn issue111_body(database: mut AnalysisDatabase, module_name: str, name: str) -> SemanticBody {

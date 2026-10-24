@@ -57,6 +57,7 @@ pub struct SemanticCallable {
     lookup_module: str
     binding_identity: u64
     generic_names: Vec[str]
+    is_static: bool
 }
 
 /// Call sites receive a future, while the body still returns its declared output.
@@ -243,6 +244,7 @@ struct SemanticContext {
     type_scope: str
     implicit_receivers: Vec[(usize, usize, str, str)]
     variants: Vec[SemanticVariant]
+    is_async: bool
 }
 
 impl for SemanticBody {
@@ -394,7 +396,7 @@ impl for SemanticCallable {
         }
         key += ")->" + ret_type
         ret Self {
-            module_name, name, params, ret_type, nonzero_hash(key), name, "", 0_u64, Vec[str]::new()
+            module_name, name, params, ret_type, nonzero_hash(key), name, "", 0_u64, Vec[str]::new(), false
         }
     }
 
@@ -402,7 +404,7 @@ impl for SemanticCallable {
     pub fn in_scope(self: Self, name: str, module_name: str, identity: u64) -> Self {
         ret Self {
             self.module_name, name, self.params, self.ret_type, self.signature,
-            self.declaration_name, module_name, identity, self.generic_names
+            self.declaration_name, module_name, identity, self.generic_names, self.is_static
         }
     }
 
@@ -410,7 +412,32 @@ impl for SemanticCallable {
         ret Self {
             self.module_name, self.name, self.params, self.ret_type,
             generic_signature(self.signature, names), self.declaration_name, self.lookup_module,
-            self.binding_identity, names
+            self.binding_identity, names, self.is_static
+        }
+    }
+
+    /// Static reads use the declaration's value type and dependency identity.
+    pub fn with_static(self: Self, is_static: bool) -> Self {
+        let signature = if is_static {
+            nonzero_hash(Debug::fmt(self.signature) + "#static")
+        } else {
+            self.signature
+        }
+        ret Self {
+            self.module_name, self.name, self.params, self.ret_type, signature,
+            self.declaration_name, self.lookup_module, self.binding_identity, self.generic_names, is_static
+        }
+    }
+
+    /// An inferred static's value type participates in dependency invalidation.
+    pub fn with_return_type(self: Self, typ: str) -> Self {
+        if typ == self.ret_type {
+            ret self
+        }
+        ret Self {
+            self.module_name, self.name, self.params, typ,
+            nonzero_hash(Debug::fmt(self.signature) + "#return:" + typ),
+            self.declaration_name, self.lookup_module, self.binding_identity, self.generic_names, self.is_static
         }
     }
 }
@@ -645,7 +672,7 @@ pub fn check_function_body_with_variants(item: FunctionItem, callables: Vec[Sema
         callables, fields, scoped_methods, self_type, generic_names, Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(),
         Vec[SemanticDependency]::new(),
         (0_usize, 0_usize, 0_usize, 0_usize), Vec[ScopedSemanticBinding]::new(), aggregate_names,
-        Vec[(usize, usize, str)]::new(), type_names, type_scope, Vec[(usize, usize, str, str)]::new(), variants
+        Vec[(usize, usize, str)]::new(), type_names, type_scope, Vec[(usize, usize, str, str)]::new(), variants, item.is_async
     }
     for generic in generics {
         if generic.bounds.len() > 0_usize {
@@ -685,6 +712,30 @@ pub fn check_function_body_with_variants(item: FunctionItem, callables: Vec[Sema
         return_type = replace_type_name(semantic_type_name(return_type), "Self", self_type)
     }
     return_type = local_type(ctx, return_type)
+    if semantic_function_has_attr(item, "static_inferred") {
+        match item.body {
+            Some(body) => {
+                match body.statements.get(0_usize) {
+                    Some(statement) => {
+                        match statement {
+                            Statement::Ret(expression) => {
+                                let inferred = infer_expression(ctx, expression)
+                                if inferred != "" {
+                                    return_type = inferred
+                                }
+                            }
+                            _ => {
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
     match item.body {
         Option::Some(body) => {
             check_statements(ctx, body.statements, return_type)
@@ -1350,6 +1401,14 @@ fn semantic_types_compatible(expected: str, actual: str) -> bool {
     if numeric_semantic_type(normalized_expected) && numeric_semantic_type(normalized_actual) {
         ret true
     }
+    // Numeric values and raw addresses never share a source type. In
+    // particular `as f32 *` is a pointer cast, not a scalar cast.
+    let expected_pointer = ends_with(normalized_expected, "*")
+    let actual_pointer = ends_with(normalized_actual, "*")
+    if expected_pointer != actual_pointer && !generic_placeholder(normalized_expected) &&
+    !generic_placeholder(normalized_actual) {
+        ret false
+    }
     if semantic_root_type(normalized_expected) == semantic_root_type(normalized_actual) {
         ret true
     }
@@ -1934,7 +1993,8 @@ fn infer_expression(
             ret indexed_type(ctx, base)
         }
         Expr::Await(inner) => {
-            ret first_type_argument(infer_expression_h(ctx, inner))
+            let future = infer_expression_h(ctx, inner)
+            ret checked_awaited_type(ctx, future, expr.source_name, expr.line, expr.column, expr.length)
         }
         Expr::Try(inner) => {
             ret first_type_argument(infer_expression_h(ctx, inner))
@@ -2081,7 +2141,8 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode<H>) -> str {
             ret indexed_type(ctx, base)
         }
         Expr::Await(inner) => {
-            ret first_type_argument(infer_expression_h(ctx, inner))
+            let future = infer_expression_h(ctx, inner)
+            ret checked_awaited_type(ctx, future, expr.source_name, expr.line, expr.column, expr.length)
         }
         Expr::Try(inner) => {
             ret first_type_argument(infer_expression_h(ctx, inner))
@@ -2152,7 +2213,16 @@ fn binding_type(bindings: Vec[SemanticBinding], name: str) -> str {
 
 fn infer_value_path(ctx: mut SemanticContext, name: str, source_name: str,
     line: usize, column: usize, length: usize,) -> str {
-    let resolved = infer_path_type(ctx.bindings, name)
+    let mut resolved = infer_path_type(ctx.bindings, name)
+    if !binding_exists(ctx.bindings, name) {
+        for callable in ctx.callables {
+            if callable.is_static && callable.name == name {
+                remember_dependency(ctx, callable)
+                resolved = callable.ret_type
+                break
+            }
+        }
+    }
     if resolved == "" {
         report_unknown_value(ctx, name, source_name, line, column, length)
     }
@@ -2997,6 +3067,41 @@ fn iterable_item_type(ctx: mut SemanticContext, typ: str) -> str {
     if declaration_type_name(typ, ctx.type_names) == "Range" {
         ret "usize"
     }
+    ret ""
+}
+
+// A custom Future's generic arguments describe its state, not its output.
+// The resolved poll contract carries the output in Poll[State, Output].
+fn checked_awaited_type(ctx: mut SemanticContext, future: str, source: str,
+    line: usize, column: usize, length: usize,) -> str {
+    let output = awaited_type(ctx, future)
+    if !ctx.is_async {
+        ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "await-outside-async",
+                "'await' can only be used inside an async function", line, column, length,)
+            .with_label(source, line, column, length, DiagnosticLabelKind::Primary,
+                "this function is synchronous",))
+        ret output
+    }
+    let root = semantic_root_type(future)
+    if output == "" && future != "" && !type_contains_inference_hole(future) &&
+    !contains_name(ctx.generic_names, root) && !generic_placeholder(root) && root != "Self" {
+        ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "invalid-await-operand",
+                "await expects a Future, got '" + future + "'", line, column, length,)
+            .with_label(source, line, column, length, DiagnosticLabelKind::Primary,
+                "this value does not provide a Future poll contract",))
+    }
+    ret output
+}
+
+fn awaited_type(ctx: mut SemanticContext, future: str) -> str {
+    if semantic_root_type(future) == "__encore_async_future" {
+        ret first_type_argument(future)
+    }
+    let step = iterable_method_return(ctx, future, "poll")
+    if declaration_type_name(semantic_root_type(step), ctx.type_names) == "Poll" {
+        ret nth_type_argument(step, 1_usize)
+    }
+    // Leave an unresolved operand to the complete Future contract validator.
     ret ""
 }
 
