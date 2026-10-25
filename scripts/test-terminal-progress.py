@@ -124,7 +124,10 @@ def native_tests(cc, temporary):
             output = b""
             while True:
                 try:
-                    output += os.read(master, 65536)
+                    chunk = os.read(master, 65536)
+                    if not chunk:
+                        break
+                    output += chunk
                 except OSError as error:
                     if error.errno != 5:
                         raise
@@ -160,9 +163,11 @@ def cli_tests(compiler, temporary):
         '[project]\nname = "terminal_probe"\nversion = "0.0.0"\n'
         f'dependencies = ["path@{dependency}"]\n')
     (root / "src/main.enq").write_text(
-        'import std::io::println\nimport std::time::sleep_ms\n\n'
+        'import std::io::println\nimport std::os::file_exists\nimport std::time::sleep_ms\n\n'
         'fn main() -> u32 {\n    println("USER PROGRAM")\n'
-        '    let _wait = sleep_ms(400_u64)\n    ret 0_u32\n}\n')
+        '    while !file_exists("release-user") {\n'
+        '        let _wait = sleep_ms(10_u64)\n    }\n    ret 0_u32\n}\n')
+    (root / "release-user").touch()
     environment = dict(os.environ, ENCORE_CORE_DIR=str(ROOT / "packages/core"),
                        ENCORE_BUILD_CACHE=str(temporary / "cache"),
                        ENCORE_INDEX_URL="http://127.0.0.1:9/index")
@@ -258,17 +263,23 @@ def cli_terminal_tests(compiler, root, environment):
                 process.wait()
             os.close(master)
 
-    # After build, the child program owns the terminal while it sleeps.
+    # A file barrier keeps the child alive until the terminal handoff has been
+    # checked, regardless of runner speed or scheduling delays.
+    release = root / "release-user"
+    release.unlink()
     process, master = launch(["run"])
     try:
         assert select.select([process.stdout], [], [], 120)[0]
         assert process.stdout.readline() == b"USER PROGRAM\n"
         while select.select([master], [], [], 0.05)[0]:
             os.read(master, 65536)
+        assert process.poll() is None
         assert not select.select([master], [], [], 0.2)[0], "animation survived user program handoff"
+        release.touch()
         stdout, _ = process.communicate(timeout=10)
         assert process.returncode == 0 and stdout == b"", stdout
     finally:
+        release.touch()
         if process.poll() is None:
             process.kill()
             process.wait()
