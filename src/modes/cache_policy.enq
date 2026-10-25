@@ -7,7 +7,7 @@ import core::result::Result
 
 import std::fs::File
 import std::io::eprintln
-import std::os::{env, home_dir, mkdir_all, read_dir, read_file, remove_dir_all, write_file}
+import std::os::{env, home_dir, mkdir_all, read_dir, read_file, remove_dir_all, remove_file, write_file}
 import std::path::Path
 import std::time::{perf_counter_ns, time_ms}
 import std::vec::Vec
@@ -15,6 +15,8 @@ import std::vec::Vec
 import argparse::{process_arg, process_arg_count}
 import json::{Json, parse, stringify}
 
+extern fn encore_compiler_cache_touch(path: str) ->()
+extern fn encore_compiler_cache_logical_size(path: str) -> u64
 extern fn encore_compiler_cache_file_fact(path: str, field: u32) -> u64
 extern fn encore_compiler_cache_lock_open(path: str) -> usize
 extern fn encore_compiler_cache_lock_try(handle: usize) -> i32
@@ -28,10 +30,88 @@ pub struct CacheEntry {
     bytes: u64
     used: u64
     category: str
+    lock_path: str
 }
 pub struct CacheUsage {
     entries: Vec[CacheEntry]
     bytes: u64
+    logical_bytes: u64
+    files: u64
+}
+
+pub struct PayloadUsage {
+    bytes: u64
+    logical: u64
+    files: u64
+}
+
+#attr(safe)
+pub fn payload_usage(path: Path) -> PayloadUsage {
+    let kind = file_fact(path, 0_u32)
+    if kind == 1_u64 {
+        ret PayloadUsage {
+            file_fact(path, 1_u32), unsafe {
+                encore_compiler_cache_logical_size(path.as_str())
+            }
+            , 1_u64
+        }
+    }
+    if kind != 2_u64 {
+        ret PayloadUsage { 0_u64, 0_u64, 0_u64 }
+    }
+    let mut bytes = 0_u64
+    let mut logical = 0_u64
+    let mut files = 0_u64
+    for name in read_dir(path.as_str()) {
+        if name == "." || name == ".." || name == ".cache-usage" {
+            continue
+        }
+        let child = payload_usage(path / name)
+        bytes += child.bytes logical += child.logical files += child.files
+    }
+    ret PayloadUsage { bytes, logical, files }
+}
+
+/// Advisory accounting is published after a complete entry, under its lock.
+/// A missing/torn record falls back to measurement, never to a guessed zero.
+pub fn record_cache_usage(path: Path) ->() {
+    let usage = payload_usage(path)
+    let mut fields = Vec[(str, Json)]::new()
+    fields.push(("schema", Json::Number("1")))
+    fields.push(("bytes", Json::Number(Debug::fmt(usage.bytes))))
+    fields.push(("logical", Json::Number(Debug::fmt(usage.logical))))
+    fields.push(("files", Json::Number(Debug::fmt(usage.files))))
+    let _written = write_file((path / ".cache-usage").as_str(), stringify(Json::Object(fields)))
+}
+
+fn recorded_usage(path: Path, detailed: bool) -> PayloadUsage {
+    let receipt = path / ".cache-usage"
+    let data = parse(read_file(receipt.as_str())).unwrap_or(Json::Null)
+    if data.get("schema").unwrap_or(Json::Null).as_number().unwrap_or("") == "1" {
+        let bytes = decimal(data.get("bytes").unwrap_or(Json::Null).as_number().unwrap_or("")).unwrap_or(18446744073709551615_u64)
+        let logical = decimal(data.get("logical").unwrap_or(Json::Null).as_number().unwrap_or("")).unwrap_or(18446744073709551615_u64)
+        let files = decimal(data.get("files").unwrap_or(Json::Null).as_number().unwrap_or("")).unwrap_or(18446744073709551615_u64)
+        let extra = file_fact(receipt, 1_u32)
+        if bytes < 18446744073709551615_u64 - extra && logical < 18446744073709551615_u64 - extra && files < 18446744073709551615_u64 {
+            ret PayloadUsage { bytes + extra, logical + extra, files + 1_u64 }
+        }
+    }
+    if !detailed {
+        ret PayloadUsage { measure_tree(path), 0_u64, 0_u64 }
+    }
+    let usage = payload_usage(path)
+    let extra = if file_fact(receipt, 0_u32) == 1_u64 {
+        file_fact(receipt, 1_u32)
+    } else {
+        0_u64
+    }
+    ret PayloadUsage {
+        usage.bytes + extra, usage.logical + extra, usage.files + if extra > 0_u64 {
+            1_u64
+        } else {
+            0_u64
+        }
+    }
 }
 pub struct PruneResult {
     before: u64
@@ -159,6 +239,18 @@ pub fn touch_cache(directory: Path) ->() {
     }
 }
 
+/// Rate limit advisory recency updates; no payload rewrite or extra LRU file.
+#attr(safe)
+pub fn touch_file(path: Path) ->() {
+    let now = time_ms()
+    let used = file_fact(path, 2_u32)
+    if now >= used && now - used >= 60000_u64 {
+        unsafe {
+            encore_compiler_cache_touch(path.as_str())
+        }
+    }
+}
+
 pub fn measure_tree(directory: Path) -> u64 {
     ret measure_tree_raw(directory.as_str())
 }
@@ -213,11 +305,17 @@ fn entry_category(directory: str, category: str) -> str {
 }
 
 pub fn cache_usage(root: Path) -> CacheUsage {
+    ret cache_inventory(root, true)
+}
+
+fn cache_inventory(root: Path, detailed: bool) -> CacheUsage {
     let root = root.as_str()
     let mut entries = Vec[CacheEntry]::new()
     let mut bytes = 0_u64
+    let mut logical_bytes = 0_u64
+    let mut files = 0_u64
     if file_fact_raw(root, 0_u32) != 2_u64 {
-        ret CacheUsage { entries, bytes }
+        ret CacheUsage { entries, bytes, logical_bytes, files }
     }
     for category in vec!["units", "lowering-v1", "objects-v1"] {
         let base = if category == "units" {
@@ -241,7 +339,9 @@ pub fn cache_usage(root: Path) -> CacheUsage {
                 continue
             }
             let mut used = decimal(read_file(directory + "/.last-used")).unwrap_or(0_u64)
-            let size = measure_tree_raw(directory)
+            let usage = recorded_usage(Path::new(directory), detailed)
+            let size = usage.bytes
+            logical_bytes += usage.logical files += usage.files
             if used == 0_u64 {
                 used = file_fact_raw(directory, 2_u32)
                 for receipt in vec!["unit.complete", "unit.ready", "unit.frontend", "commit"] {
@@ -251,11 +351,47 @@ pub fn cache_usage(root: Path) -> CacheUsage {
                     }
                 }
             }
-            entries.push(CacheEntry { directory, size, used, kind })
+            entries.push(CacheEntry { directory, size, used, kind, directory + ".lock" })
             bytes += size
         }
     }
-    ret CacheUsage { entries, bytes }
+    let packed = root + "/lowering-v2"
+    if file_fact_raw(packed, 0_u32) == 2_u64 {
+        for shard in read_dir(packed) {
+            let base = packed + "/" + shard
+            if shard.byte_len() != 2_usize || file_fact_raw(base, 0_u32) != 2_u64 {
+                continue
+            }
+            for name in read_dir(base) {
+                if name.byte_len() != 70_usize {
+                    continue
+                }
+                let key = name.slice(0_usize, 64_usize)
+                if !key_name(key) || name.slice(64_usize, 6_usize) != ".entry" || key.slice(0_usize, 2_usize) != shard {
+                    continue
+                }
+                let directory = base + "/" + name
+                if file_fact_raw(directory, 0_u32) != 1_u64 {
+                    continue
+                }
+                let size = file_fact_raw(directory, 1_u32)
+                let usage = if detailed {
+                    payload_usage(Path::new(directory))
+                } else {
+                    PayloadUsage {
+                        size, 0_u64, 1_u64
+                    }
+                }
+                logical_bytes += usage.logical files += usage.files
+                entries.push(CacheEntry {
+                        directory, size, file_fact_raw(directory, 2_u32), "lowering-v2", root + "/lowering-v1/" + key + ".lock"
+                    }
+                )
+                bytes += size
+            }
+        }
+    }
+    ret CacheUsage { entries, bytes, logical_bytes, files }
 }
 
 fn entry_at(entries: Vec[CacheEntry], index: usize) -> CacheEntry {
@@ -313,7 +449,7 @@ pub fn prune_cache(root: Path, limit: u64, all: bool, dry: bool) -> PruneResult 
     if !dry && collector == 0_usize {
         ret PruneResult { 0_u64, 0_u64, 0_u64, 1_u64 }
     }
-    let usage = cache_usage(root)
+    let usage = cache_inventory(root, false)
     let mut after = usage.bytes
     let mut removed = 0_u64
     let mut busy = 0_u64
@@ -333,7 +469,7 @@ pub fn prune_cache(root: Path, limit: u64, all: bool, dry: bool) -> PruneResult 
         if after <= target {
             break
         }
-        let lock_path = entry.directory + ".lock"
+        let lock_path = entry.lock_path
         // Read-only dry runs never create lock files or remove payloads.
         if dry {
             let probe = if file_fact_raw(lock_path, 0_u32) == 1_u64 {
@@ -352,11 +488,20 @@ pub fn prune_cache(root: Path, limit: u64, all: bool, dry: bool) -> PruneResult 
             busy += 1_u64 continue
         }
         // A writer may have refreshed the slot since the inventory was taken.
-        let used = decimal(read_file(entry.directory + "/.last-used")).unwrap_or(0_u64)
+        let used = if entry.category == "lowering-v2" {
+            file_fact_raw(entry.directory, 2_u32)
+        } else {
+            decimal(read_file(entry.directory + "/.last-used")).unwrap_or(0_u64)
+        }
         if used > entry.used {
             close_lock(handle) continue
         }
-        if file_fact_raw(entry.directory, 0_u32) == 2_u64 && remove_dir_all(entry.directory) == 0_i32 {
+        let removed_entry = if entry.category == "lowering-v2" {
+            file_fact_raw(entry.directory, 0_u32) == 1_u64 && remove_file(entry.directory) == 0_i32
+        } else {
+            file_fact_raw(entry.directory, 0_u32) == 2_u64 && remove_dir_all(entry.directory) == 0_i32
+        }
+        if removed_entry {
             after -= entry.bytes removed += entry.bytes
         }
         close_lock(handle)
@@ -629,7 +774,7 @@ fn preserve_diagnostics(directory: Path) -> bool {
                 let size = measure_tree(path)
                 total += size
                 entries.push(CacheEntry {
-                        path.as_str(), size, decimal(read_file((path / ".encore-diagnostics").as_str())).unwrap_or(0_u64), "diagnostics"
+                        path.as_str(), size, decimal(read_file((path / ".encore-diagnostics").as_str())).unwrap_or(0_u64), "diagnostics", ""
                     }
                     ,
                 )

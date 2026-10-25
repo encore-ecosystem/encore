@@ -1,6 +1,7 @@
 /* Only the disposable test package includes these bridges. Production runtime
  * and probe implementations remain unchanged and are compiled by Encore. */
 #include "../../../runtime.c"
+#include "../../../tests/native/cache_payload.c"
 #include <sys/stat.h>
 
 size_t encore_ci_process_id(void) {

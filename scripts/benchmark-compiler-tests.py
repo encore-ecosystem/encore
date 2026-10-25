@@ -274,6 +274,24 @@ def read_test_report(path, expected_count=None):
     return summary, names
 
 
+def disk_usage(root):
+    """Measure outside timing; count allocated blocks separately from file bytes."""
+    logical = allocated = files = 0
+    for directory, _, names in os.walk(root, followlinks=False):
+        for name in names:
+            path = Path(directory) / name
+            if path.is_symlink():
+                continue
+            try:
+                info = path.stat()
+            except FileNotFoundError:
+                continue
+            logical += info.st_size
+            allocated += getattr(info, "st_blocks", (info.st_size + 511) // 512) * 512
+            files += 1
+    return {"bytes": logical, "allocated_bytes": allocated, "files": files}
+
+
 def preserve_failure_artifacts(root, destination):
     """Keep bounded worker diagnostics before the disposable workspace is removed."""
     remaining = 32 * 1024 * 1024
@@ -571,6 +589,8 @@ def main():
                                 # A failed invocation must never accidentally reuse a stale report.
                                 native_report.unlink(missing_ok=True)
                                 result = measure(arguments, cwd, environment, logs / (label + ".log"), args.timeout)
+                                result["cache_disk"] = disk_usage(private / "c")
+                                result["target_disk"] = disk_usage(root / "target")
                                 sample[kind] = result
                                 print(f"{label}: {result['wall_seconds']:.3f}s exit={result['exit_code']}", flush=True)
                                 try:

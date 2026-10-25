@@ -87,6 +87,18 @@ replacement for the dependency lockfile.
 
 ### Cache limits and build workspaces
 
+Large text checkpoints are stored with an embedded LZ4 codec when compression
+saves at least 12.5%; snapshots smaller than 64 KiB and native objects/archives
+remain uncompressed. Existing raw checkpoints remain readable. Lowering entries
+use one checksummed record per key, sharded by key prefix, and retain their
+original per-key lock files. Legacy lowering records migrate on a verified hit.
+
+The JSON cache status adds `logical_bytes` (decoded payload bytes), `files`
+(managed payload files, excluding persistent locks), and `additional_roots`
+(existing Encore cache directories outside the selected budget). Those additional
+directories are informational and are not removed by prune. `bytes` remains the
+stored size of managed entries. The budget remains 20 GiB.
+
 `encore cache status` reports compiled-cache usage. Add `--json` for machine-readable
 output or `--project PATH` to inspect another project's managed workspaces and
 other target artifacts. Registry downloads and installed SDKs/toolchains are

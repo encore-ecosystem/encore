@@ -1,92 +1,81 @@
-import mod::cache_policy::touch_cache
+import mod::cache_payload::{read_packed_payload, write_payload}
+import mod::cache_policy::touch_file
 //! Verified lowered module fragments with independent content identities.
 import core::option::Option
 import core::result::Result
 
-import std::os::{file_exists, file_sha256, mkdir_all, read_file, remove_file}
+import std::os::{mkdir_all, read_file, remove_dir_all}
 import std::path::Path
 import std::vec::Vec
 
 import json::{Json, parse, stringify}
 
-import mod::build_cache::{UnitCacheLock, close_unit_cache_lock, try_unit_cache_lock}
+import mod::build_cache::{close_unit_cache_lock, try_unit_cache_lock}
 import refrain::cache_identity::compiler_content_digest
 import refrain::frontend::translator::CachedFunctionChunk
 
-extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
+fn packed_path(root: Path, key: str) -> Path {
+    ret root / "lowering-v2" / key.slice(0_usize, 2_usize) /(key + ".entry")
+}
 
+/// Both representations use the original stable per-key lock inode.
 pub fn restore_lowered_module(cache: Option[Path], key: str) -> Result[Option[str], str] {
     let root = match cache {
-        Some(value) => value.join("lowering-v1") None => {
-            ret Result[Option[str], str]::Ok(Option[str]::None)
+        Some(value) => value None => {
+            ret Result::Ok(Option::None)
         }
     }
-    let lock = match try_unit_cache_lock(root, key)? {
-        Some(value) => value
-        None => {
-            ret Result[Option[str], str]::Ok(Option[str]::None)
+    let lock = match try_unit_cache_lock(root / "lowering-v1", key)? {
+        Some(value) => value None => {
+            ret Result::Ok(Option::None)
         }
     }
-    let expected = read_file(lock.directory.join("commit").as_str())
-    let path = lock.directory.join("payload")
-    let text = read_file(path.as_str())
-    let valid = !text.is_empty() && expected.byte_len() == 64 &&
-    file_sha256(path.as_str()) == expected && compiler_content_digest(text) == expected
-    if valid {
-        touch_cache(lock.directory)
+    let path = packed_path(root, key)
+    let mut text = read_packed_payload(path)
+    if !text.is_empty() {
+        touch_file(path)
+    } else {
+        let expected = read_file((lock.directory / "commit").as_str())
+        let legacy = read_file((lock.directory / "payload").as_str())
+        if !legacy.is_empty() && expected.byte_len() == 64_usize && compiler_content_digest(legacy) == expected {
+            text = legacy
+            // Migration is optional: failure must not invalidate a good hit.
+            if publish_packed(root, key, text).is_ok() {
+                let _removed = remove_dir_all(lock.directory.as_str())
+            }
+        }
     }
     close_unit_cache_lock(lock)
-    ret Result[Option[str], str]::Ok(if valid {
-            Option[str]::Some(text)
+    ret Result::Ok(if text.is_empty() {
+            Option::None
         } else {
-            Option[str]::None
+            Option::Some(text)
         }
     )
 }
 
 pub fn commit_lowered_module(cache: Option[Path], key: str, text: str) -> Result[(), str] {
     let root = match cache {
-        Some(value) => value.join("lowering-v1") None => {
-            ret Result[(), str]::Ok(())
+        Some(value) => value None => {
+            ret Result::Ok(())
         }
     }
-    let lock = match try_unit_cache_lock(root, key)? {
-        Some(value) => value
-        None => {
-            ret Result[(), str]::Ok(())
+    let lock = match try_unit_cache_lock(root / "lowering-v1", key)? {
+        Some(value) => value None => {
+            ret Result::Ok(())
         }
     }
-    let result = publish_lowered_module(lock, text)
-    if result.is_ok() {
-        touch_cache(lock.directory)
-    }
+    let result = publish_packed(root, key, text)
     close_unit_cache_lock(lock)
     ret result
 }
 
-#attr(safe)
-fn publish_lowered_module(lock: UnitCacheLock, text: str) -> Result[(), str] {
-    if text.is_empty() || mkdir_all(lock.directory.as_str()) != 0 {
-        ret Result[(), str]::Err("cannot create lowering cache entry")
+fn publish_packed(root: Path, key: str, text: str) -> Result[(), str] {
+    let path = packed_path(root, key)
+    if text.is_empty() || mkdir_all(path.parent().unwrap_or(root).as_str()) != 0_i32 || !write_payload(path, text, true) {
+        ret Result::Err("cannot commit lowering cache entry")
     }
-    let marker = lock.directory.join("commit")
-    if file_exists(marker.as_str()) && remove_file(marker.as_str()) != 0 {
-        ret Result[(), str]::Err("cannot invalidate lowering cache entry")
-    }
-    let payload = lock.directory.join("payload")
-    let digest = compiler_content_digest(text)
-    if !unsafe {
-        encore_compiler_write_atomic(payload.as_str(), text)
-    }
-    ||
-    file_sha256(payload.as_str()) != digest ||
-    !unsafe {
-        encore_compiler_write_atomic(marker.as_str(), digest)
-    }
-    {
-        ret Result[(), str]::Err("cannot commit lowering cache entry")
-    }
-    ret Result[(), str]::Ok(())
+    ret Result::Ok(())
 }
 
 pub fn restore_lowered_function(cache: Option[Path], context: str, key: str) -> Result[Option[CachedFunctionChunk], str] {
