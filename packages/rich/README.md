@@ -432,3 +432,19 @@ fn main() -> u32 {
     ret 0_u32
 }
 ```
+
+## Live terminal progress
+
+`LiveProgress::auto(label)` owns an animated stderr display inside a `with`
+scope. `ProgressReporter::current()` returns a thread-safe reporter for the
+active session. Use `stage(label, total)` to begin a phase (`total = 0` means
+unknown), `task(id, label, stage)` to report running work, and `complete(id,
+label)` to finish it. Completion is counted once per task ID within a phase.
+Join worker threads before leaving the owner's scope.
+
+The renderer refreshes independently of worker activity and shows up to six
+task rows, adapting to terminal dimensions. Ordinary `std::io` output is
+serialized with redraws. Redirected stderr and unsupported terminals disable
+the renderer; reporters then do nothing. Older platform runtimes without the
+output observer also fall back to plain output. Existing `BuildProgress` and
+`TestProgress` methods continue to work inside a live session.

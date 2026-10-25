@@ -215,6 +215,10 @@ static void write_frame(size_t index) {
     fwrite(start, 1, end == NULL ? strlen(start) : (size_t)(end - start), stderr);
 }
 
+#include "live_progress.h"
+
+bool encore_rich_progress_available(void) { return live_terminal_supported(); }
+
 #ifdef _WIN32
 static DWORD WINAPI spinner_main(LPVOID unused) {
     (void)unused;
@@ -225,10 +229,16 @@ static void *spinner_main(void *unused) {
     size_t tick = 0;
     while (atomic_load(&g_running)) {
         lock_spinner();
-        fputs("\r\x1b[2K\x1b[0;36m", stderr);
-        write_frame(tick++);
-        fprintf(stderr, "\x1b[0m %s", g_message == NULL ? "" : g_message);
-        fflush(stderr);
+        if (atomic_load(&g_running)) {
+            if (atomic_load(&g_live_session) != 0) {
+                live_render_locked(tick++);
+            } else {
+                fputs("\r\x1b[2K\x1b[0;36m", stderr);
+                write_frame(tick++);
+                fprintf(stderr, "\x1b[0m %s", g_message == NULL ? "" : g_message);
+                fflush(stderr);
+            }
+        }
         unlock_spinner();
         wait_for_frame();
     }
@@ -240,10 +250,12 @@ static void *spinner_main(void *unused) {
 }
 
 void encore_rich_terminal_spinner_stop(void);
+static void stop_spinner_thread(void);
 
-bool encore_rich_terminal_spinner_start(encore_str message, encore_str frames, size_t interval_ms) {
+static bool start_spinner_thread(encore_str message, encore_str frames, size_t interval_ms) {
     if (!encore_rich_is_terminal(2)) return false;
-    encore_rich_terminal_spinner_stop();
+    stop_spinner_thread();
+    if (!live_enable_terminal()) return false;
     set_message(message);
     g_frames = copy_string(frames);
     g_frame_count = count_frames(g_frames);
@@ -256,6 +268,7 @@ bool encore_rich_terminal_spinner_start(encore_str message, encore_str frames, s
     g_started = pthread_create(&g_thread, NULL, spinner_main, NULL) == 0;
 #endif
     if (!g_started) {
+        live_restore_terminal();
         atomic_store(&g_running, false);
         free(g_message);
         free(g_frames);
@@ -266,13 +279,21 @@ bool encore_rich_terminal_spinner_start(encore_str message, encore_str frames, s
     return g_started;
 }
 
+bool encore_rich_terminal_spinner_start(encore_str message, encore_str frames, size_t interval_ms) {
+    if (atomic_load(&g_live_session) != 0) {
+        set_message(message);
+        return true;
+    }
+    return live_terminal_supported() && start_spinner_thread(message, frames, interval_ms);
+}
+
 bool encore_rich_terminal_spinner_update(encore_str message) {
     if (!g_started) return false;
     set_message(message);
     return true;
 }
 
-void encore_rich_terminal_spinner_stop(void) {
+static void stop_spinner_thread(void) {
     if (!g_started) return;
     atomic_store(&g_running, false);
     wake_thread();
@@ -284,13 +305,54 @@ void encore_rich_terminal_spinner_stop(void) {
     pthread_join(g_thread, NULL);
 #endif
     g_started = false;
+    lock_spinner();
+    if (atomic_load(&g_live_session) != 0) live_clear_locked();
+    else fputs("\r\x1b[2K", stderr);
     free(g_message);
     free(g_frames);
     g_message = NULL;
     g_frames = NULL;
     g_frame_count = 0;
-    fputs("\r\x1b[2K", stderr);
     fflush(stderr);
+    unlock_spinner();
+    live_restore_terminal();
+}
+
+void encore_rich_terminal_spinner_stop(void) {
+    /* Legacy stage suspension must not turn off the command-owned renderer. */
+    if (atomic_load(&g_live_session) == 0) stop_spinner_thread();
+}
+
+void encore_rich_live_stop(size_t session) {
+    if (session == 0 || session != atomic_load(&g_live_session)) return;
+    stop_spinner_thread();
+    encore_io_set_write_observer(NULL);
+    lock_spinner();
+    atomic_store(&g_live_session, 0);
+    live_free_tasks_locked();
+    g_live_partial = false;
+    unlock_spinner();
+}
+
+static void live_exit(void) { encore_rich_live_stop(atomic_load(&g_live_session)); }
+
+size_t encore_rich_live_start(encore_str label, encore_str frames, size_t interval_ms) {
+    /* Nested callers obtain a reporter, never replace the command owner. */
+    if (atomic_load(&g_live_session) != 0 || !live_terminal_supported()) return 0;
+    g_live_started = live_clock_ms();
+    g_live_color = getenv("NO_COLOR") == NULL;
+    g_live_partial = false;
+    stop_spinner_thread();
+    if (++g_live_generation == 0) ++g_live_generation;
+    atomic_store(&g_live_session, g_live_generation);
+    if (!start_spinner_thread(label, frames, interval_ms)) {
+        atomic_store(&g_live_session, 0);
+        return 0;
+    }
+    encore_io_set_write_observer(live_observe_write);
+    static bool exit_registered;
+    if (!exit_registered) { atexit(live_exit); exit_registered = true; }
+    return g_live_generation;
 }
 
 #undef RICH_SPINNER_FRAMES

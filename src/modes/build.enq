@@ -6,10 +6,10 @@ import core::option::Option
 import core::result::Result
 
 import std::dict::Hashable
-import std::io::eprintln
+import std::io::{eprint, eprintln}
 import std::os::{copy_file, env, executable_path, file_exists, file_sha256, home_dir, mkdir_all, read_file, remove_file, set_executable, write_file}
 import std::path::{Path, clone_path}
-import std::process::{Command, exit, run_args, run_args_owned}
+import std::process::{Command, exit, run_args_owned}
 import std::thread::{JoinHandle, available_parallelism}
 import std::time::{perf_counter_ms, perf_counter_ns, sleep_ms}
 import std::vec::Vec
@@ -180,7 +180,6 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     progress.start_build(path_name_or(root, "project"), profile)
     if emit == "binary" {
         progress.start_stage("Packages", "dependency graph")
-        progress.suspend()
         match compile_package_binary(root, target, toolchain, profile, profile_dir, binary_path) {
             Ok(_) => {
                 progress.finish_stage("package archives and final support")
@@ -471,7 +470,6 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             }
         }
     }
-    progress.suspend()
     if mkdir_all(native_path(object_dir.as_str())) != 0_i32 {
         progress.fail_stage("failed to create object directory")
         ret 1_u32
@@ -678,7 +676,6 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         " of " + Debug::fmt(native_sources.len() + llvm_object_count) + " objects")
 
     progress.start_stage("Link", project_name)
-    progress.suspend()
     if native_sources.len() == 0_usize {
         progress.fail_stage("binary output requires builtin-runtime or target.runtime-sources")
         ret 1_u32
@@ -708,7 +705,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     for arg in link_args {
         owned_link_args.push("" + arg)
     }
-    let link_code = run_args_owned(toolchain.linker, owned_link_args)
+    let link_code = run_visible_tool(toolchain.linker, owned_link_args)
     if link_code != 0_i32 {
         progress.fail_stage("native link failed for target " + target.triple)
         ret 1_u32
@@ -2332,7 +2329,7 @@ fn write_ehir_artifact(modules: Vec[TranslationModule], original_states: Vec[Inc
 }
 
 fn compile_object_job(compiler: str, args: frozen Vec[str], fingerprint_path: str, fingerprint: str) -> i32 {
-    let code = run_args(compiler, args)
+    let code = run_visible_tool(compiler, clone_string_vec(args))
     if code != 0_i32 {
         ret code
     }
@@ -2340,6 +2337,23 @@ fn compile_object_job(compiler: str, args: frozen Vec[str], fingerprint_path: st
         ret 1_i32
     }
     ret 0_i32
+}
+
+// Captured tools cannot draw a second spinner or overwrite the parent's live
+// block. Keep the existing direct execution path when output is redirected.
+fn run_visible_tool(program: str, args: Vec[str]) -> i32 {
+    if !rich::ProgressReporter::current().is_active() {
+        ret run_args_owned(program, args)
+    }
+    let mut command = Command::new(program)
+    for arg in args {
+        command = command.arg(arg)
+    }
+    let output = command.output()
+    if output.text() != "" {
+        eprint(output.text())
+    }
+    ret output.code()
 }
 
 fn compile_object_batch(jobs: frozen Vec[ObjectCompileJob], queue: usize) -> i32 {
@@ -2543,7 +2557,7 @@ fn compile_module_object_batch(compiler: str, base_args: frozen Vec[str], paths:
                 args.push(native_path(module_llvm.as_str()))
                 args.push("-o")
                 args.push(native_path(object.as_str()))
-                let code = run_args_owned(compiler, args)
+                let code = run_visible_tool(compiler, args)
                 if code != 0_i32 {
                     unsafe {
                         encore_build_queue_cancel(queue)
@@ -2980,6 +2994,7 @@ fn module_ir_artifacts_verified(paths: Vec[Path]) -> bool {
 }
 
 fn exec_compiler(executable: str, args: Vec[str]) -> bool {
+    rich::ProgressReporter::current().finish()
     let len = args.len()
     let data = if len == 0_usize {
         0_usize
@@ -3055,7 +3070,7 @@ fn run_llvm_codegen_worker(ehir_path: Path, llvm_path: Path, target: TargetSpec,
                 }
                 ,
             )))
-    ret run_args_owned(executable, args) == 0_i32
+    ret run_visible_tool(executable, args) == 0_i32
 }
 
 fn llvm_codegen_is_incremental_update(ehir_path: Path, llvm_path: Path,
