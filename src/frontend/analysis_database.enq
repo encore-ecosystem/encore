@@ -6,12 +6,13 @@ import core::option::Option
 import std::dict::Hashable
 import std::vec::Vec
 
-import refrain::frontend::analysis::{DiagnosticLabelKind, FrontendDiagnostic, FrontendDocument, FrontendSymbol, analyze_named_editor_module, analyze_named_module, analyze_named_tokens}
+import refrain::frontend::analysis::{DiagnosticLabelKind, FrontendDiagnostic, FrontendDocument, FrontendSymbol, analyze_named_editor_module_with_project, analyze_named_module_with_project, analyze_named_tokens_with_project}
 import refrain::frontend::dependency_graph::DependencyGraph
 import refrain::frontend::hir::{DefinitionId, DefinitionKind, DefinitionNamespace, HirDefinition, ModuleDefMap, TypeId, definition_id}
 import refrain::frontend::import_paths
 import refrain::frontend::lexer::{Lexer, Token, TokenType}
 import refrain::frontend::parser::{FunctionItem, GenericParam, Statement}
+import refrain::frontend::project_constants::ProjectConstants
 import refrain::frontend::safety::{FunctionSafety, SafetyFunction, infer_safety_with_known, safety_dependencies}
 import refrain::frontend::semantic::{ScopedSemanticBinding, SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticDependencyKind, SemanticField, SemanticMember, SemanticMethod, SemanticVariant, append_bound_methods, check_function_body, check_function_body_with_scope, check_function_body_with_type_scope, check_function_body_with_types, check_function_body_with_variants, check_module_bodies, check_module_bodies_with_type_scope, check_module_bodies_with_types, check_module_bodies_with_variants, check_module_declarations, semantic_accessible_methods, semantic_associated_members, semantic_call_return_type, semantic_members, semantic_named_members, semantic_same_owner, specialize_method_type_with_self}
 import refrain::frontend::syntax::SyntaxDocument
@@ -166,6 +167,7 @@ pub struct AnalysisDatabase {
     semantic_graph_revision: usize
     semantic_graph: Vec[SemanticModuleGraph]
     semantic_reachability: Vec[SemanticReachabilityCache]
+    module_projects: Vec[(str, ProjectConstants)]
 }
 
 /// Associates a stable identity and declaring module with a frontend symbol.
@@ -182,6 +184,7 @@ pub struct PreparedSemanticModule {
     module_name: str
     source_name: str
     source: str
+    project: ProjectConstants
     target: TargetSpec
     features: Vec[str]
     callables: Vec[SemanticCallable]
@@ -198,6 +201,7 @@ pub struct AnalysisSourceSnapshot {
     module_name: str
     source_name: str
     source: str
+    project: ProjectConstants
 }
 
 /// Declaration documentation and the signature specialized for one receiver.
@@ -234,8 +238,14 @@ impl for AnalysisSourceSnapshot {
     /// Creates one canonical source entry for a tooling semantic snapshot.
     pub fn new(module_name: str, source_name: str, source: str) -> Self {
         ret Self {
-            module_name, source_name, source
+            module_name, source_name, source, ProjectConstants::empty()
         }
+    }
+
+    /// Keeps semantic worker input bound to the defining package.
+    pub fn with_project(self: mut Self, project: ProjectConstants) -> Self {
+        self.project = project
+        ret self
     }
 }
 
@@ -253,6 +263,7 @@ pub struct PreparedLightweightModule {
     module_name: str
     source_name: str
     source: str
+    project: ProjectConstants
     source_fingerprint: u64
     interface_fingerprint: u64
     document: FrontendDocument
@@ -261,13 +272,20 @@ pub struct PreparedLightweightModule {
 /// Computes the complete tolerant per-module query without accessing an
 /// analysis database or filesystem.
 pub fn prepare_lightweight_module(module_name: str, source_name: str, source: str) -> sending PreparedLightweightModule {
-    let document = analyze_named_editor_module(module_name, source_name, source)
+    ret prepare_lightweight_module_with_project(module_name, source_name, source, ProjectConstants::empty())
+}
+
+/// Prepares one editor query with a frozen package context.
+pub fn prepare_lightweight_module_with_project(module_name: str, source_name: str, source: str,
+    project: ProjectConstants,) -> sending PreparedLightweightModule {
+    let document = analyze_named_editor_module_with_project(module_name, source_name, source, project)
     ret PreparedLightweightModule {
         module_name,
         source_name,
         source,
-        source.hash(),
-        module_interface_fingerprint(document.tokens),
+        project,
+        project.fingerprint(source),
+        project.fingerprint(Debug::fmt(module_interface_fingerprint(document.tokens))),
         document
     }
 }
@@ -275,12 +293,19 @@ pub fn prepare_lightweight_module(module_name: str, source_name: str, source: st
 /// Wraps a validated editor cache entry for installation in an analysis database.
 pub fn prepare_cached_lightweight_module(module_name: str, source_name: str, source: str,
     document: sending FrontendDocument,) -> sending PreparedLightweightModule {
+    ret prepare_cached_lightweight_module_with_project(module_name, source_name, source, document, ProjectConstants::empty())
+}
+
+/// Restores an editor cache entry under its validated package identity.
+pub fn prepare_cached_lightweight_module_with_project(module_name: str, source_name: str, source: str,
+    document: sending FrontendDocument, project: ProjectConstants,) -> sending PreparedLightweightModule {
     ret PreparedLightweightModule {
         module_name,
         source_name,
         source,
-        source.hash(),
-        module_interface_fingerprint(document.tokens),
+        project,
+        project.fingerprint(source),
+        project.fingerprint(Debug::fmt(module_interface_fingerprint(document.tokens))),
         document
     }
 }
@@ -289,7 +314,7 @@ impl for PreparedLightweightModule {
     /// Reuses one worker parse under a transport-specific module identity.
     pub fn with_module_name(self: Self, module_name: str) -> sending Self {
         ret Self {
-            module_name, self.source_name, self.source, self.source_fingerprint,
+            module_name, self.source_name, self.source, self.project, self.source_fingerprint,
             self.interface_fingerprint, self.document
         }
     }
@@ -302,7 +327,7 @@ impl for PreparedLightweightModule {
 
 /// Checks one prepared module without reading or mutating an analysis database.
 pub fn check_prepared_semantic_module(prepared: PreparedSemanticModule) -> Vec[FrontendDiagnostic] {
-    let document = analyze_named_module(prepared.module_name, prepared.source_name, prepared.source)
+    let document = analyze_named_module_with_project(prepared.module_name, prepared.source_name, prepared.source, prepared.project)
     let mut diagnostics = check_module_declarations(document.ast, prepared.target, prepared.features)
     diagnostics.extend(prepared.resolution_diagnostics)
     diagnostics.extend(check_module_bodies_with_variants(document.ast, prepared.callables, prepared.fields,
@@ -314,6 +339,7 @@ pub fn check_prepared_semantic_module(prepared: PreparedSemanticModule) -> Vec[F
 pub fn check_prepared_semantic_workspace(prepared: sending PreparedSemanticWorkspace) -> sending Vec[FrontendDiagnostic] {
     let mut database = AnalysisDatabase::new()
     for source in prepared.sources {
+        database.configure_project(source.module_name, source.project)
         database.set_module(source.module_name, source.source_name, source.source)
     }
     ret database.module_semantic_diagnostics(prepared.module_name)
@@ -365,7 +391,47 @@ impl for AnalysisDatabase {
             Vec[ModuleImportResolution]::new(), Vec[FieldEnvironmentCache]::new(), Vec[MethodEnvironmentCache]::new(),
             Vec[TypeId]::new(), Vec[TypeScopeCache]::new(), Vec[ScopedEnvironmentCache]::new(),
             0_usize, Vec[FunctionSafety]::new(), Vec[SafetyConfiguration]::new(), Vec[FunctionSafety]::new(),
-            0_usize, Vec[SemanticModuleGraph]::new(), Vec[SemanticReachabilityCache]::new()
+            0_usize, Vec[SemanticModuleGraph]::new(), Vec[SemanticReachabilityCache]::new(),
+            Vec[(str, ProjectConstants)]::new()
+        }
+    }
+
+    /// Returns immutable metadata for one canonical or editor module identity.
+    pub fn project_constants(self: Self, module_name: str) -> ProjectConstants {
+        for entry in self.module_projects {
+            if entry.0 == module_name {
+                ret entry.1
+            }
+        }
+        ret ProjectConstants::empty()
+    }
+
+    fn store_project(self: mut Self, module_name: str, project: ProjectConstants) -> bool {
+        let mut index = 0_usize
+        for entry in self.module_projects {
+            if entry.0 == module_name {
+                if entry.1.key() == project.key() {
+                    ret false
+                }
+                self.module_projects.set(index,(module_name, project))
+                ret true
+            }
+            index += 1_usize
+        }
+        self.module_projects.push((module_name, project))
+        ret true
+    }
+
+    /// Invalidates unchanged source when its owning manifest metadata changes.
+    pub fn configure_project(self: mut Self, module_name: str, project: ProjectConstants) ->() {
+        if !self.store_project(module_name, project) {
+            ret()
+        }
+        for entry in self.sources {
+            if entry.module_name == module_name {
+                self.set_module(module_name, entry.source_name, entry.source)
+                ret()
+            }
         }
     }
 
@@ -571,7 +637,7 @@ impl for AnalysisDatabase {
         let mut sources = Vec[AnalysisSourceSnapshot]::new()
         for source in self.sources {
             sources.push(AnalysisSourceSnapshot {
-                    source.module_name, source.source_name, source.source
+                    source.module_name, source.source_name, source.source, self.project_constants(source.module_name)
                 }
                 ,)
         }
@@ -597,9 +663,12 @@ impl for AnalysisDatabase {
     /// `document` only parses again when a metadata-only cache supplied no AST.
     pub fn set_module(self: mut Self, module_name: str, source_name: str, source: str) ->() {
         self.remove_metadata_safety(module_name)
+        let project = self.project_constants(module_name)
+        let source_fingerprint = project.fingerprint(source)
         // Do not lex and parse an unchanged dependency on every cursor query.
         for entry in self.sources {
-            if entry.module_name == module_name && entry.source_name == source_name && entry.source == source {
+            if entry.module_name == module_name && entry.source_name == source_name && entry.source == source
+            && entry.source_fingerprint == source_fingerprint {
                 ret()
             }
         }
@@ -608,7 +677,8 @@ impl for AnalysisDatabase {
         // The exact source/path comparison also keeps unsaved overlays separate.
         for entry in self.sources {
             if source_name != "" && entry.source_name == source_name && entry.source == source
-            && entry.lightweight.ast.len() > 0 {
+            && entry.source_fingerprint == source_fingerprint && entry.lightweight.ast.len() > 0
+            && self.project_constants(entry.module_name).key() == project.key() {
                 let original = entry.lightweight
                 let mut dependencies = DependencyGraph::new()
                 for edge in original.dependencies.all() {
@@ -619,14 +689,14 @@ impl for AnalysisDatabase {
                     original.diagnostics, original.symbols, original.callables, dependencies, original.parsed
                 }
                 self.install_prepared_lightweight(PreparedLightweightModule {
-                        module_name, source_name, source, entry.source_fingerprint,
+                        module_name, source_name, source, project, entry.source_fingerprint,
                         entry.interface_fingerprint, document
                     }
                     ,)
                 ret()
             }
         }
-        self.apply_prepared_lightweight(prepare_lightweight_module(module_name, source_name, source))
+        self.apply_prepared_lightweight(prepare_lightweight_module_with_project(module_name, source_name, source, project))
         ret()
     }
 
@@ -637,6 +707,7 @@ impl for AnalysisDatabase {
     }
 
     fn install_prepared_lightweight(self: mut Self, prepared: PreparedLightweightModule) ->() {
+        self.store_project(prepared.module_name, prepared.project)
         let module_name = prepared.module_name
         let source_name = prepared.source_name
         let source = prepared.source
@@ -723,7 +794,8 @@ impl for AnalysisDatabase {
     /// on a single lex/parse pass while sharing the same database and indexes.
     pub fn set_module_full(self: mut Self, module_name: str, source_name: str, source: str) ->() {
         self.remove_metadata_safety(module_name)
-        let source_fingerprint = source.hash()
+        let project = self.project_constants(module_name)
+        let source_fingerprint = project.fingerprint(source)
         let mut index = 0_usize
         while index < self.sources.len() {
             match self.sources.get(index) {
@@ -734,8 +806,8 @@ impl for AnalysisDatabase {
                             ret()
                         }
                         self.revision += 1_usize
-                        let document = analyze_named_module(module_name, source_name, source)
-                        let interface_fingerprint = module_interface_fingerprint(document.tokens)
+                        let document = analyze_named_module_with_project(module_name, source_name, source, project)
+                        let interface_fingerprint = project.fingerprint(Debug::fmt(module_interface_fingerprint(document.tokens)))
                         let interface_changed = interface_fingerprint != entry.interface_fingerprint
                         let interface_revision = if interface_changed {
                             self.revision
@@ -777,8 +849,8 @@ impl for AnalysisDatabase {
 
         self.revision += 1_usize
         let id = module_identity(module_name)
-        let document = analyze_named_module(module_name, source_name, source)
-        let interface_fingerprint = module_interface_fingerprint(document.tokens)
+        let document = analyze_named_module_with_project(module_name, source_name, source, project)
+        let interface_fingerprint = project.fingerprint(Debug::fmt(module_interface_fingerprint(document.tokens)))
         self.sources.push(AnalysisSource {
                 id,
                 module_name,
@@ -919,7 +991,7 @@ impl for AnalysisDatabase {
                         let document = if entry.lightweight.ast.len() > 0_usize {
                             entry.lightweight
                         } else {
-                            analyze_named_tokens(entry.module_name, entry.source_name, entry.lightweight.tokens)
+                            analyze_named_tokens_with_project(entry.module_name, entry.source_name, entry.lightweight.tokens, self.project_constants(entry.module_name))
                         }
                         self.sources.set(index, AnalysisSource {
                                 entry.id,
@@ -1809,6 +1881,7 @@ impl for AnalysisDatabase {
             module_name,
             source_name,
             source,
+            self.project_constants(module_name),
             target,
             features,
             environment.callables,

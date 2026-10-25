@@ -1,6 +1,8 @@
 import core::option::Option
 import core::vec::Vec
 
+extern fn encore_str_from_codepoint(value: usize) -> str
+
 pub enum TomlValue {
     String(str)
     Integer(i32)
@@ -31,9 +33,9 @@ pub fn toml_parse_document(source: str) -> TomlDocument {
     let mut current_section_entries: Vec[TomlEntry] = Vec[TomlEntry]::new()
     let mut in_section: bool = false
 
-    while index < source.len() {
+    while index < source.byte_len() {
         let line_end = toml_find_line_end(source, index)
-        let raw_line = source.slice(index, line_end - index)
+        let raw_line = source.slice_bytes(index, line_end - index)
         let line = toml_trim(raw_line)
         index = toml_next_line_index(source, line_end)
 
@@ -50,28 +52,28 @@ pub fn toml_parse_document(source: str) -> TomlDocument {
                 )
             }
 
-            current_section_name = toml_trim(line.slice(1_usize, line.len() - 2_usize))
+            current_section_name = toml_trim(line.slice_bytes(1_usize, line.byte_len() - 2_usize))
             current_section_entries = Vec[TomlEntry]::new()
             in_section = true
             continue
         }
 
         let eq = toml_find_char(line, 61_u8, 0_usize)
-        if eq >= line.len() {
+        if eq >= line.byte_len() {
             continue
         }
 
-        let key = toml_trim(line.slice(0_usize, eq))
-        let mut raw_value = toml_trim(line.slice(eq + 1_usize, line.len() - eq - 1_usize))
+        let key = toml_trim(line.slice_bytes(0_usize, eq))
+        let mut raw_value = toml_trim(line.slice_bytes(eq + 1_usize, line.byte_len() - eq - 1_usize))
 
         if toml_starts_with_char(raw_value, 91_u8) {
-            while index < source.len() {
+            while index < source.byte_len() {
                 if toml_ends_with_char(raw_value, 93_u8) {
                     break
                 }
 
                 let item_end = toml_find_line_end(source, index)
-                let item_raw = source.slice(index, item_end - index)
+                let item_raw = source.slice_bytes(index, item_end - index)
                 let item_line = toml_trim(item_raw)
                 index = toml_next_line_index(source, item_end)
 
@@ -210,7 +212,7 @@ fn toml_find_entry_value_step(entries: Vec[TomlEntry], key: str, index: usize, e
 }
 
 fn toml_parse_value(raw: str) -> TomlValue {
-    if toml_starts_with_char(raw, 34_u8) {
+    if toml_starts_with_char(raw, 34_u8) || toml_starts_with_char(raw, 39_u8) {
         ret TomlValue::String(toml_parse_string_literal(raw))
     }
 
@@ -229,18 +231,124 @@ fn toml_parse_value(raw: str) -> TomlValue {
     ret TomlValue::Integer(toml_parse_integer(raw))
 }
 
+// Finds the closing quote without treating an escaped quote as a delimiter.
+fn toml_string_end(raw: str, start: usize) -> usize {
+    let quote = raw.byte_at(start)
+    let mut index = start + 1_usize
+    while index < raw.byte_len() {
+        let byte = raw.byte_at(index)
+        if byte == quote {
+            ret index
+        }
+        if quote == 34_u8 && byte == 92_u8 {
+            index += 1_usize
+        }
+        index += 1_usize
+    }
+    ret raw.byte_len()
+}
+
+fn toml_hex_digit(byte: u8) -> usize {
+    if byte >= 48_u8 && byte <= 57_u8 {
+        ret(byte as usize) - 48_usize
+    }
+    if byte >= 65_u8 && byte <= 70_u8 {
+        ret(byte as usize) - 65_usize + 10_usize
+    }
+    if byte >= 97_u8 && byte <= 102_u8 {
+        ret(byte as usize) - 97_usize + 10_usize
+    }
+    ret 16_usize
+}
+
+fn toml_unicode_escape(raw: str, start: usize, count: usize) -> Option[str] {
+    if start + count > raw.byte_len() {
+        ret Option[str]::None
+    }
+    let mut code = 0_usize
+    let mut offset = 0_usize
+    while offset < count {
+        let digit = toml_hex_digit(raw.byte_at(start + offset))
+        if digit == 16_usize {
+            ret Option[str]::None
+        }
+        code = code * 16_usize + digit
+        offset += 1_usize
+    }
+    if code > 1114111_usize ||(code >= 55296_usize && code <= 57343_usize) {
+        ret Option[str]::None
+    }
+    ret Option[str]::Some(unsafe {
+            encore_str_from_codepoint(code)
+        }
+    )
+}
+
 fn toml_parse_string_literal(raw: str) -> str {
-    if raw.len() < 2_usize {
+    if raw.byte_len() < 2_usize {
         ret ""
     }
-
-    ret raw.slice(1_usize, raw.len() - 2_usize)
+    let end = toml_string_end(raw, 0_usize)
+    if raw.byte_at(0_usize) == 39_u8 {
+        ret raw.slice_bytes(1_usize, end - 1_usize)
+    }
+    let mut result = ""
+    let mut index = 1_usize
+    let mut segment = index
+    while index < end {
+        if raw.byte_at(index) != 92_u8 || index + 1_usize >= end {
+            index += 1_usize
+            continue
+        }
+        result += raw.slice_bytes(segment, index - segment)
+        let escaped = raw.byte_at(index + 1_usize)
+        if escaped == 34_u8 {
+            result += "\""
+        } elif escaped == 92_u8 {
+            result += "\\"
+        } elif escaped == 98_u8 {
+            result += unsafe {
+                encore_str_from_codepoint(8_usize)
+            }
+        } elif escaped == 102_u8 {
+            result += unsafe {
+                encore_str_from_codepoint(12_usize)
+            }
+        } elif escaped == 110_u8 {
+            result += "\n"
+        } elif escaped == 114_u8 {
+            result += "\r"
+        } elif escaped == 116_u8 {
+            result += "\t"
+        } elif escaped == 117_u8 || escaped == 85_u8 {
+            let digits = if escaped == 117_u8 {
+                4_usize
+            } else {
+                8_usize
+            }
+            match toml_unicode_escape(raw.slice_bytes(0_usize, end), index + 2_usize, digits) {
+                Some(value) => {
+                    result += value
+                    index += digits
+                }
+                None => {
+                    result += raw.slice_bytes(index, 2_usize)
+                }
+            }
+        } else {
+            // Keep the parser's tolerant behavior for unsupported/invalid escapes.
+            result += raw.slice_bytes(index, 2_usize)
+        }
+        index += 2_usize
+        segment = index
+    }
+    ret result + raw.slice_bytes(segment, end - segment)
 }
 
 fn toml_parse_string_array(raw: str) -> Vec[str] {
     let mut result: Vec[str] = Vec[str]::new()
     let mut index: usize = 1_usize
-    let limit = raw.len() - 1_usize
+    let limit = raw.byte_len() - 1_usize
 
     while index < limit {
         index = toml_skip_array_separators(raw, index, limit)
@@ -248,9 +356,9 @@ fn toml_parse_string_array(raw: str) -> Vec[str] {
             break
         }
 
-        if raw.byte_at(index) == 34_u8 {
-            let end = toml_find_char(raw, 34_u8, index + 1_usize)
-            let item = raw.slice(index + 1_usize, end - index - 1_usize)
+        if raw.byte_at(index) == 34_u8 || raw.byte_at(index) == 39_u8 {
+            let end = toml_string_end(raw, index)
+            let item = toml_parse_string_literal(raw.slice_bytes(index, end - index + 1_usize))
             result.push(item)
             index = end + 1_usize
             continue
@@ -271,7 +379,7 @@ fn toml_parse_integer(raw: str) -> i32 {
     }
 
     let mut value: i32 = 0_i32
-    while index < raw.len() {
+    while index < raw.byte_len() {
         let digit = raw.byte_at(index) - 48_u8
         value = value * 10_i32 + toml_digit_to_i32(digit)
         index = index + 1_usize
@@ -285,8 +393,8 @@ fn toml_parse_integer(raw: str) -> i32 {
 }
 
 fn toml_find_line_end(source: str, index: usize) -> usize {
-    if index >= source.len() {
-        ret source.len()
+    if index >= source.byte_len() {
+        ret source.byte_len()
     }
 
     if source.byte_at(index) == 10_u8 {
@@ -301,13 +409,13 @@ fn toml_find_line_end(source: str, index: usize) -> usize {
 }
 
 fn toml_next_line_index(source: str, line_end: usize) -> usize {
-    if line_end >= source.len() {
+    if line_end >= source.byte_len() {
         ret line_end
     }
 
     if source.byte_at(line_end) == 13_u8 {
         let next = line_end + 1_usize
-        if next < source.len() {
+        if next < source.byte_len() {
             if source.byte_at(next) == 10_u8 {
                 ret next + 1_usize
             }
@@ -324,20 +432,20 @@ fn toml_next_line_index(source: str, line_end: usize) -> usize {
 
 fn toml_trim(value: str) -> str {
     let start = toml_trim_start_index(value, 0_usize)
-    if start >= value.len() {
+    if start >= value.byte_len() {
         ret ""
     }
 
-    let end = toml_trim_end_index(value, value.len())
+    let end = toml_trim_end_index(value, value.byte_len())
     if end <= start {
         ret ""
     }
 
-    ret value.slice(start, end - start)
+    ret value.slice_bytes(start, end - start)
 }
 
 fn toml_trim_start_index(value: str, index: usize) -> usize {
-    if index >= value.len() {
+    if index >= value.byte_len() {
         ret index
     }
 
@@ -362,8 +470,8 @@ fn toml_trim_end_index(value: str, end: usize) -> usize {
 }
 
 fn toml_find_char(value: str, target: u8, index: usize) -> usize {
-    if index >= value.len() {
-        ret value.len()
+    if index >= value.byte_len() {
+        ret value.byte_len()
     }
 
     if value.byte_at(index) == target {
@@ -374,7 +482,7 @@ fn toml_find_char(value: str, target: u8, index: usize) -> usize {
 }
 
 fn toml_starts_with_char(value: str, target: u8) -> bool {
-    if value.len() == 0_usize {
+    if value.byte_len() == 0_usize {
         ret false
     }
 
@@ -382,15 +490,15 @@ fn toml_starts_with_char(value: str, target: u8) -> bool {
 }
 
 fn toml_ends_with_char(value: str, target: u8) -> bool {
-    if value.len() == 0_usize {
+    if value.byte_len() == 0_usize {
         ret false
     }
 
-    ret value.byte_at(value.len() - 1_usize) == target
+    ret value.byte_at(value.byte_len() - 1_usize) == target
 }
 
 fn toml_is_section_header(line: str) -> bool {
-    if line.len() < 2_usize {
+    if line.byte_len() < 2_usize {
         ret false
     }
     if !toml_starts_with_char(line, 91_u8) {
@@ -400,7 +508,7 @@ fn toml_is_section_header(line: str) -> bool {
 }
 
 fn toml_is_blank_or_comment(line: str) -> bool {
-    if line.len() == 0_usize {
+    if line.byte_len() == 0_usize {
         ret true
     }
 

@@ -47,6 +47,33 @@ dependency objects and runtime support; shared libraries export linked symbols.
 `--emit object`, `--emit llvm-ir`, and `--emit ehir` also accept library packages.
 `encore run` and executable installation require an executable project.
 
+## Project Constants
+
+Two compiler-provided expressions expose metadata from `[project]`:
+
+| Constant | Type | Value |
+| --- | --- | --- |
+| `__version__` | `str` | `version`, or `"0.0.0"` when omitted |
+| `__project_name__` | `str` | the required `name` |
+
+```encore
+import std::io::println
+
+fn main() {
+    println(__project_name__ + " " + __version__)
+}
+```
+
+The values belong to the package defining the source. A dependency's functions,
+including generic functions instantiated by a consumer, retain that dependency's
+metadata. The compiler embeds string values, so the executable does not need an
+`encore.toml` at runtime. Manifest changes invalidate the affected cached code.
+
+The bare names cannot be rebound, imported as bindings, or assigned to. Strings,
+comments, member names such as `value.__version__`, qualified paths and other
+names such as `__custom__` keep their ordinary meaning. Formatting preserves the
+constant names; editor hover and completion show their type and package values.
+
 ## Package Compilation And Cache
 
 For binary builds, Encore resolves a dependency graph from manifests first.
