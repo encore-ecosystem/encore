@@ -17,6 +17,36 @@ ROOT = Path(__file__).resolve().parents[1]
 FRAMES = tuple(frame.encode() for frame in "⠋⠙⠹⠸")
 
 
+def wait_for_stdout_line(process, master, timeout=120):
+    import select
+
+    stdout = b""
+    terminal = b""
+    readers = [master, process.stdout]
+    deadline = time.monotonic() + timeout
+    while b"\n" not in stdout:
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, ("waiting for program stdout", stdout, terminal[-2000:])
+        ready = select.select(readers, [], [], min(0.2, remaining))[0]
+        # A live renderer can fill the PTY before the child starts. Keep
+        # draining it while waiting for stdout, just as collect() does.
+        if master in ready:
+            try:
+                chunk = os.read(master, 65536)
+            except OSError as error:
+                if error.errno != 5:
+                    raise
+                chunk = b""
+            terminal += chunk
+            if not chunk:
+                readers.remove(master)
+        if process.stdout in ready:
+            chunk = os.read(process.stdout.fileno(), 65536)
+            assert chunk, ("program stdout closed", process.poll(), stdout, terminal[-2000:])
+            stdout += chunk
+    return stdout, terminal
+
+
 def native_tests(cc, temporary):
     if os.name != "posix":
         print("PTY renderer checks require a POSIX terminal")
@@ -51,6 +81,27 @@ def native_tests(cc, temporary):
         "-pthread", "-o", str(legacy_driver),
     ], check=True)
     environment = dict(os.environ, TERM="xterm-256color", NO_COLOR="1")
+    # Exercise backpressure independently of runner speed and PTY capacity.
+    # Waiting only for stdout deadlocks because this child fills stderr first.
+    master, slave = pty.openpty()
+    process = subprocess.Popen([
+        sys.executable, "-c",
+        'import os; os.write(2, b"x" * 262144); os.write(1, b"READY\\n"); input()',
+    ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=slave)
+    os.close(slave)
+    try:
+        stdout, terminal = wait_for_stdout_line(process, master, timeout=10)
+        while select.select([master], [], [], 0)[0]:
+            terminal += os.read(master, 65536)
+        assert stdout == b"READY\n" and terminal == b"x" * 262144
+        process.communicate(input=b"\n", timeout=10)
+        assert process.returncode == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master)
+
     plain = subprocess.run([str(driver)], input=b"nnnnn", capture_output=True, env=environment, timeout=10)
     assert plain.returncode == 0, plain
     assert plain.stdout == b"READY\nUSER PROGRAM\n", plain.stdout
@@ -269,8 +320,8 @@ def cli_terminal_tests(compiler, root, environment):
     release.unlink()
     process, master = launch(["run"])
     try:
-        assert select.select([process.stdout], [], [], 120)[0]
-        assert process.stdout.readline() == b"USER PROGRAM\n"
+        stdout, _ = wait_for_stdout_line(process, master)
+        assert stdout == b"USER PROGRAM\n", stdout
         while select.select([master], [], [], 0.05)[0]:
             os.read(master, 65536)
         assert process.poll() is None
