@@ -67,9 +67,9 @@ int32_t encore_ci_cache_payload(encore_compiler_str directory) {
     /* Small packed entries carry a checksum even without compression. */
     raw.object->len = 31;
     free(digest.object); digest = encore_text_sha256(raw);
-    encore_compiler_str small = encore_compiler_cache_encode(raw, digest, true);
-    assert(small.object != NULL && small.object->len == 31 + ENCORE_CACHE_HEADER && small.object->data[8] == 0);
-    assert(encore_compiler_write_atomic(name, small));
+    encore_compiler_str short_payload = encore_compiler_cache_encode(raw, digest, true);
+    assert(short_payload.object != NULL && short_payload.object->len == 31 + ENCORE_CACHE_HEADER && short_payload.object->data[8] == 0);
+    assert(encore_compiler_write_atomic(name, short_payload));
     restored = encore_compiler_cache_read(name, true, (encore_compiler_str){NULL});
     assert(restored.object != NULL && restored.object->len == 31); free(restored.object);
 #ifndef _WIN32
@@ -120,6 +120,6 @@ int32_t encore_ci_cache_payload(encore_compiler_str directory) {
     restored = encore_compiler_cache_read(name, false, digest);
     assert(restored.object != NULL && restored.object->len == 14 && !memcmp(restored.object->data, raw.object->data, 14));
     free(restored.object); free(reserved.object);
-    free(small.object); free(raw.object); free(digest.object); free(encoded.object); free(name.object); free(root);
+    free(short_payload.object); free(raw.object); free(digest.object); free(encoded.object); free(name.object); free(root);
     return 0;
 }
