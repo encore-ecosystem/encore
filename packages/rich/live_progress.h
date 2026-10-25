@@ -24,6 +24,27 @@ static bool live_io_available(void) {
     void (*volatile setter)(rich_write_observer) = encore_io_set_write_observer;
     return setter != encore_rich_no_write_observer;
 }
+#elif defined(__APPLE__)
+/* Mach-O requires an actual definition when an optional symbol is absent.
+   A strong platform definition overrides this weak stub. Probe once, before
+   installing our observer, so a capability check never pauses a live session. */
+static _Atomic bool g_live_missing_observer;
+__attribute__((weak)) void encore_io_set_write_observer(rich_write_observer observer) {
+    (void)observer;
+    atomic_store(&g_live_missing_observer, true);
+}
+static bool live_io_available(void) {
+    static int available = -1;
+    lock_spinner();
+    if (available < 0) {
+        atomic_store(&g_live_missing_observer, false);
+        encore_io_set_write_observer(NULL);
+        available = atomic_load(&g_live_missing_observer) ? 0 : 1;
+    }
+    bool result = available == 1;
+    unlock_spinner();
+    return result;
+}
 #else
 extern void encore_io_set_write_observer(rich_write_observer observer) __attribute__((weak));
 static bool live_io_available(void) { return encore_io_set_write_observer != NULL; }

@@ -161,12 +161,12 @@ def cli_tests(compiler, temporary):
     dependency = (ROOT / "packages/std").as_posix()
     (root / "encore.toml").write_text(
         '[project]\nname = "terminal_probe"\nversion = "0.0.0"\n'
-        f'dependencies = ["path@{dependency}"]\n')
+        f'dependencies = ["path@{dependency}"]\n', newline="\n")
     (root / "src/main.enq").write_text(
         'import std::io::println\nimport std::os::file_exists\nimport std::time::sleep_ms\n\n'
         'fn main() -> u32 {\n    println("USER PROGRAM")\n'
         '    while !file_exists("release-user") {\n'
-        '        let _wait = sleep_ms(10_u64)\n    }\n    ret 0_u32\n}\n')
+        '        let _wait = sleep_ms(10_u64)\n    }\n    ret 0_u32\n}\n', newline="\n")
     (root / "release-user").touch()
     environment = dict(os.environ, ENCORE_CORE_DIR=str(ROOT / "packages/core"),
                        ENCORE_BUILD_CACHE=str(temporary / "cache"),
@@ -190,14 +190,14 @@ def cli_terminal_tests(compiler, root, environment):
     import struct
     import termios
 
-    with (root / "src/main.enq").open("a") as source:
+    with (root / "src/main.enq").open("a", newline="\n") as source:
         source.write('\n#attr(test)\nfn progress_unit() -> bool {\n'
                      '    let _wait = sleep_ms(400_u64)\n    ret true\n}\n')
     (root / "tests").mkdir()
     for name in ("progress_a", "progress_b"):
         (root / "tests" / (name + ".enq")).write_text(
             'import std::time::sleep_ms\n\nfn main() -> u32 {\n'
-            '    let _wait = sleep_ms(400_u64)\n    ret 0_u32\n}\n')
+            '    let _wait = sleep_ms(400_u64)\n    ret 0_u32\n}\n', newline="\n")
 
     def launch(arguments):
         master, slave = pty.openpty()
