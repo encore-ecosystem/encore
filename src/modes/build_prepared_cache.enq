@@ -1,7 +1,7 @@
-import mod::cache_policy::touch_cache
+import mod::cache_payload::{read_payload, verified_payload, write_payload}
+import mod::cache_policy::{record_cache_usage, touch_cache}
 //! Backend checkpoints reuse checked/lowered bodies when native flags change.
 
-import core::option::Option
 import core::result::Result
 
 import std::os::{file_exists, file_sha256, mkdir_all, read_file, remove_file}
@@ -42,12 +42,7 @@ pub fn read_prepared_unit(directory: Path, ready: UnitReady, key: str) -> Result
     }
     let expected = record.get("owned").unwrap_or(Json::Null).as_str().unwrap_or("")
     let path = directory.join("unit.erowned")
-    let owned = read_file(path.as_str())
-    if expected.byte_len() != 64 || !file_exists(path.as_str()) || file_sha256(path.as_str()) != expected ||
-    compiler_content_digest(owned) != expected {
-        ret Result[str, str]::Err("missing or corrupt prepared package body")
-    }
-    ret Result[str, str]::Ok(owned)
+    ret verified_payload(path, expected)
 }
 
 pub fn restore_prepared_cache(lock: UnitCacheLock, context: MetadataContext, dependencies: Vec[MetadataDependency],
@@ -57,10 +52,12 @@ pub fn restore_prepared_cache(lock: UnitCacheLock, context: MetadataContext, dep
             ret Result[bool, str]::Ok(false)
         }
     }
-    if read_prepared_unit(lock.directory, ready, key).is_err() {
-        ret Result[bool, str]::Ok(false)
+    let owned = match read_prepared_unit(lock.directory, ready, key) {
+        Ok(value) => value Err(_) => {
+            ret Result::Ok(false)
+        }
     }
-    copy_prepared(lock.directory, destination)?
+    copy_prepared(lock.directory, destination, false, owned)?
     verify_validated_unit_copy(destination, ready)?
     let _owned = read_prepared_unit(destination, ready, key)?
     touch_cache(lock.directory)
@@ -70,14 +67,16 @@ pub fn restore_prepared_cache(lock: UnitCacheLock, context: MetadataContext, dep
 pub fn commit_prepared_cache(lock: UnitCacheLock, context: MetadataContext, dependencies: Vec[MetadataDependency],
     key: str, source: Path,) -> Result[(), str] {
     let ready = read_unit_ready(source, context, dependencies)?
-    let _owned = read_prepared_unit(source, ready, key)?
-    copy_prepared(source, lock.directory)?
+    let owned = read_prepared_unit(source, ready, key)?
+    copy_prepared(source, lock.directory, true, owned)?
     verify_validated_unit_copy(lock.directory, ready)?
     let _copied_owned = read_prepared_unit(lock.directory, ready, key)?
+    touch_cache(lock.directory)
+    record_cache_usage(lock.directory)
     ret Result[(), str]::Ok(())
 }
 
-fn copy_prepared(source: Path, destination: Path) -> Result[(), str] {
+fn copy_prepared(source: Path, destination: Path, durable: bool, owned: str) -> Result[(), str] {
     if source.as_str() == destination.as_str() || !destination.is_absolute() || mkdir_all(destination.as_str()) != 0 {
         ret Result[(), str]::Err("invalid prepared cache transaction")
     }
@@ -90,11 +89,21 @@ fn copy_prepared(source: Path, destination: Path) -> Result[(), str] {
     files.push("unit.erowned") files.push("unit.backend") files.push("unit.ready")
     for name in files {
         let input = source.join(name)
-        let contents = read_file(input.as_str())
-        if !file_exists(input.as_str()) || file_sha256(input.as_str()) != compiler_content_digest(contents) {
+        let contents = if name == "unit.erowned" {
+            owned
+        } else {
+            read_payload(input)
+        }
+        if !file_exists(input.as_str()) || contents.is_empty() {
             ret Result[(), str]::Err("prepared package changed during cache copy")
         }
-        atomic_copy_text(destination.join(name), contents)?
+        if durable && name != "unit.ready" && name != "unit.backend" {
+            if !write_payload(destination / name, contents, false) {
+                ret Result::Err("cannot store prepared checkpoint")
+            }
+        } else {
+            atomic_copy_text(destination / name, contents)?
+        }
     }
     ret Result[(), str]::Ok(())
 }

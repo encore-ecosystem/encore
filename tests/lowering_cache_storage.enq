@@ -1,0 +1,94 @@
+//! Flat records preserve legacy hits and reject corruption without poisoning builds.
+import core::option::Option
+import core::result::Result
+
+import std::os::{cwd, file_exists, mkdir_all, read_file, remove_dir_all, write_file}
+import std::path::Path
+import std::time::perf_counter_ns
+
+import refrain::cache_identity::compiler_content_digest
+import refrain::modes::build_lowering_cache::{commit_lowered_module, restore_lowered_module}
+import refrain::modes::cache_payload::{read_packed_payload, verified_payload, write_payload, write_verified_payload}
+import refrain::modes::cache_policy::{cache_usage, measure_tree, record_cache_usage}
+
+fn exercise(root: Path) -> Result[bool, str] {
+    let cache = Option[Path]::Some(root)
+    let key = compiler_content_digest("legacy-module")
+    let legacy = root / "lowering-v1" / key
+    mkdir_all(legacy.as_str())
+    write_file((legacy / "payload").as_str(), "legacy body")
+    write_file((legacy / "commit").as_str(), compiler_content_digest("legacy body"))
+    if restore_lowered_module(cache, key)?.unwrap_or("") != "legacy body" {
+        ret Result::Ok(false)
+    }
+    let packed = root / "lowering-v2" / key.slice(0_usize, 2_usize) /(key + ".entry")
+    if !file_exists(packed.as_str()) || file_exists((legacy / "commit").as_str()) {
+        ret Result::Ok(false)
+    }
+    if !file_exists((root / "lowering-v1" /(key + ".lock")).as_str()) {
+        ret Result::Ok(false)
+    }
+    write_file(packed.as_str(), "unverified raw replacement")
+    if restore_lowered_module(cache, key)?.is_some() {
+        ret Result::Ok(false)
+    }
+    let mut text = "Unicode: привет 世界\n"
+    for _index in 0_usize..13_usize {
+        text = text + text
+    }
+    commit_lowered_module(cache, key, text)?
+    if restore_lowered_module(cache, key)?.unwrap_or("") != text {
+        ret Result::Ok(false)
+    }
+    if read_file(packed.as_str()).byte_len() >= text.byte_len() / 2_usize {
+        ret Result::Ok(false)
+    }
+    // Packed raw records are verified too; tiny payloads need no codec work.
+    if !write_payload(packed, "small", true) || read_packed_payload(packed) != "small" {
+        ret Result::Ok(false)
+    }
+    if !write_payload(packed, "", true) || verified_payload(packed, compiler_content_digest("")).unwrap_or("bad") != "" {
+        ret Result::Ok(false)
+    }
+    if !write_payload(packed, "", false) || verified_payload(packed, compiler_content_digest("")).unwrap_or("bad") != "" {
+        ret Result::Ok(false)
+    }
+    if write_verified_payload(packed, "", "invalid-digest", false) || verified_payload(packed, compiler_content_digest("")).is_err() {
+        ret Result::Ok(false)
+    }
+    write_file(packed.as_str(), "not empty")
+    if verified_payload(packed, compiler_content_digest("")).is_ok() {
+        ret Result::Ok(false)
+    }
+    let entry = root / compiler_content_digest("usage-accounting")
+    mkdir_all(entry.as_str())
+    write_file((entry / "unit.complete").as_str(), "{}")
+    if !write_payload(entry / "unit.erowned", text, false) {
+        ret Result::Ok(false)
+    }
+    record_cache_usage(entry)
+    let usage = cache_usage(root)
+    if usage.logical_bytes <= usage.bytes || usage.files == 0_u64 {
+        ret Result::Ok(false)
+    }
+    // A torn advisory record must fall back to actual filesystem accounting.
+    write_file((entry / ".cache-usage").as_str(), "{")
+    if cache_usage(root).bytes != measure_tree(root) {
+        ret Result::Ok(false)
+    }
+    ret Result::Ok(true)
+}
+
+fn main() -> u32 {
+    let root = Path::new(cwd()) / "target" / f"lowering-storage-{perf_counter_ns()}"
+    if mkdir_all(root.as_str()) != 0_i32 {
+        ret 1_u32
+    }
+    let passed = exercise(root).unwrap_or(false)
+    let cleaned = remove_dir_all(root.as_str()) == 0_i32
+    ret if passed && cleaned {
+        0_u32
+    } else {
+        1_u32
+    }
+}

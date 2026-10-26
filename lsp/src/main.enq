@@ -14,7 +14,7 @@ import std::time::perf_counter_ms
 import encore::analyzer::{AnalyzerConfig, analyze_source_document, analyzer_source_diagnostic_to_frontend, unused_import_fixes}
 import encore::diagnostics::applicability_name
 import encore::formatter::{FormatConfig, format_syntax}
-import encore::frontend::{AnalysisDatabase, AnalysisSourceSnapshot, DefinitionKind, DefinitionNamespace, DependencyEdge, DiagnosticLabelKind, FrontendCallable, FrontendDiagnostic, FrontendDocument, FrontendSymbol, HirDefinition, Lexer, MemberCompletionContext, ModuleImportTarget, PreparedLightweightModule, PreparedSemanticWorkspace, SemanticBinding, SemanticMember, SyntaxDocument, Token, TokenType, check_prepared_semantic_workspace, cursor_expects_type, cursor_member_context, cursor_symbol_path, plan_import_insertion, prepare_cached_lightweight_module, prepare_lightweight_module, prepare_semantic_workspace_from_sources}
+import encore::frontend::{AnalysisDatabase, AnalysisSourceSnapshot, DefinitionKind, DefinitionNamespace, DependencyEdge, DiagnosticLabelKind, FrontendCallable, FrontendDiagnostic, FrontendDocument, FrontendSymbol, HirDefinition, Lexer, MemberCompletionContext, ModuleImportTarget, PreparedLightweightModule, PreparedSemanticWorkspace, ProjectConstants, SemanticBinding, SemanticMember, SyntaxDocument, Token, TokenType, check_prepared_semantic_workspace, cursor_expects_type, cursor_member_context, cursor_symbol_path, is_project_constant, plan_import_insertion, prepare_cached_lightweight_module_with_project, prepare_lightweight_module_with_project, prepare_semantic_workspace_from_sources}
 import encore::frontend::analysis_database::{EditorBindingSite, MemberDetails}
 import encore::frontend::editor_queries::{cursor_associated_context, cursor_associated_owner, cursor_call_context}
 import encore::project::{ProjectFailure, ProjectWorkspace, project_manifest_dependencies, read_project_tooling_config_at, try_cached_project_dependency_root, try_load_cached_entry_workspace_source, try_read_project_manifest}
@@ -60,6 +60,7 @@ struct AnalysisJob {
     workspace: bool
     ready_at_ms: u64
     cache_path: str
+    project: ProjectConstants
 }
 
 struct AnalysisTask {
@@ -101,6 +102,7 @@ struct ProjectGraphSource {
     module_name: str
     source_name: str
     source: str
+    project: ProjectConstants
 }
 
 struct PreparedProjectGraph {
@@ -210,6 +212,7 @@ struct ServerState {
 struct DependencyProjects {
     root: str
     projects: Vec[ProjectRoot]
+    project: ProjectConstants
 }
 
 struct NavigationIndex {
@@ -502,15 +505,16 @@ fn analysis_cache_path(state: ServerState, uri: str) -> str {
     ret join_path(root, Debug::fmt(uri_to_path(uri).hash()) + ".json")
 }
 
-fn prepare_analysis_job(module_name: str, source_name: str, source: str, cache_path: str, identity: str) -> sending PreparedLightweightModule {
+fn prepare_analysis_job(module_name: str, source_name: str, source: str, cache_path: str, identity: str, project: ProjectConstants) -> sending PreparedLightweightModule {
+    let identity = identity + ":project:" + project.key()
     match load(cache_path, module_name, source, identity) {
         Some(document) => {
-            ret prepare_cached_lightweight_module(module_name, source_name, source, document)
+            ret prepare_cached_lightweight_module_with_project(module_name, source_name, source, document, project)
         }
         None => {
         }
     }
-    let prepared = prepare_lightweight_module(module_name, source_name, source)
+    let prepared = prepare_lightweight_module_with_project(module_name, source_name, source, project)
     save(cache_path, module_name, source, prepared.document(), identity)
     ret prepared
 }
@@ -545,11 +549,11 @@ fn prepare_loaded_project_graph(workspace: ProjectWorkspace) -> sending Prepared
     let mut prepared = Vec[PreparedLightweightModule]::new()
     for module in workspace.loaded_modules() {
         sources.push(ProjectGraphSource {
-                module.analysis_name(), module.path(), module.source_text()
+                module.analysis_name(), module.path(), module.source_text(), workspace.module_project_constants(module.analysis_name())
             }
             ,
         )
-        prepared.push(prepare_lightweight_module(module.analysis_name(), module.path(), module.source_text()))
+        prepared.push(prepare_lightweight_module_with_project(module.analysis_name(), module.path(), module.source_text(), workspace.module_project_constants(module.analysis_name())))
     }
     ret PreparedProjectGraph {
         sources, prepared, diagnostics
@@ -850,7 +854,7 @@ fn project_semantic_workspace(state: ServerState, uri: str, module_name: str,
             let mut replaced = false
             for graph_source in graph.sources {
                 if graph_source.module_name == module_name {
-                    sources.push(AnalysisSourceSnapshot::new(module_name, entry, source))
+                    sources.push(AnalysisSourceSnapshot::new(module_name, entry, source).with_project(graph_source.project))
                     replaced = true
                 } else {
                     let mut text = graph_source.source
@@ -860,11 +864,11 @@ fn project_semantic_workspace(state: ServerState, uri: str, module_name: str,
                         }
                     }
                     sources.push(AnalysisSourceSnapshot::new(graph_source.module_name, graph_source.source_name,
-                            text,))
+                            text,).with_project(graph_source.project))
                 }
             }
             if !replaced {
-                sources.push(AnalysisSourceSnapshot::new(module_name, entry, source))
+                sources.push(AnalysisSourceSnapshot::new(module_name, entry, source).with_project(state.analysis.project_constants(module_name)))
             }
             ret Option[PreparedSemanticWorkspace]::Some(prepare_semantic_workspace_from_sources(module_name,
                     sources,))
@@ -927,6 +931,8 @@ fn queue_open_analysis(state: mut ServerState, uri: str, text: str, cache_allowe
             } else {
                 ""
             }
+            ,
+            project_constants_for_path(state, uri_to_path(uri))
         }
         ,)
     ret()
@@ -955,7 +961,8 @@ fn queue_workspace_analysis(state: mut ServerState, uri: str, text: str) ->() {
             generation,
             true,
             perf_counter_ms(),
-            analysis_cache_path(state, uri)
+            analysis_cache_path(state, uri),
+            project_constants_for_path(state, uri_to_path(uri))
         }
         ,)
     ret()
@@ -976,7 +983,7 @@ fn start_analysis_tasks(state: mut ServerState, include_workspace: bool) ->() {
                 } else {
                     let mut spawned = Option[JoinHandle[PreparedLightweightModule]]::None
                     spawned = Option[JoinHandle[PreparedLightweightModule]]::Some(spawn prepare_analysis_job(job.module_name,
-                            job.source_name, job.text, job.cache_path, state.cache_identity,))
+                            job.source_name, job.text, job.cache_path, state.cache_identity, job.project,))
                     match spawned {
                         Some(handle) => {
                             state.analysis_tasks.push(AnalysisTask {
@@ -2711,6 +2718,11 @@ fn completion_result(state: mut ServerState, params: Json) -> Json {
         }
     }
     let mut items = keyword_completion_items()
+    let project = project_constants_for_path(state, uri_to_path(uri))
+    if project.name != "" {
+        items.push(completion_item("__version__", 21_usize, "str = " + project.version))
+        items.push(completion_item("__project_name__", 21_usize, "str = " + project.name))
+    }
     let seen = encore_strset_new()
     for item in items {
         encore_strset_insert(seen, json_get_str(item, "label", ""))
@@ -3735,6 +3747,23 @@ fn implementation_result(state: mut ServerState, params: Json) -> Json {
     ret Json::Array(Vec[Json]::new())
 }
 
+fn bare_project_constant(doc: Document, token: Token) -> bool {
+    if !is_project_constant(token.value) {
+        ret false
+    }
+    let mut previous = TokenType::UNKNOWN
+    for item in doc.analysis.tokens {
+        if item.line == token.line && item.column == token.column {
+            ret previous != TokenType::DOT && previous != TokenType::SCOPE
+        }
+        if item.type != TokenType::ONE_LINE_COMMENT && item.type != TokenType::MULTI_LINE_COMMENT &&
+        item.type != TokenType::DOC_COMMENT && item.type != TokenType::MODULE_DOC_COMMENT {
+            previous = item.type
+        }
+    }
+    ret false
+}
+
 fn hover_result(state: mut ServerState, params: Json) -> Json {
     let uri = request_uri(params)
     match state.document(uri) {
@@ -3742,6 +3771,23 @@ fn hover_result(state: mut ServerState, params: Json) -> Json {
             match identifier_at_request(doc, params) {
                 Option[Token]::Some(token) => {
                     let mut value = token.value
+                    if bare_project_constant(doc, token)
+                    && !cursor_expects_type(doc.analysis.tokens, token.line, token.column)
+                    && resolved_symbol_at(state, doc, token).is_none() {
+                        match project_constants_for_path(state, uri_to_path(doc.uri)).value(token.value) {
+                            Some(text) => {
+                                let mut contents = Vec[(str, Json)]::new()
+                                contents.push(field("kind", Json::String("markdown")))
+                                contents.push(field("value", Json::String("```encore\n" + token.value + ": str\n```\n\n" + stringify(Json::String(text)))))
+                                let mut result = Vec[(str, Json)]::new()
+                                result.push(field("contents", Json::Object(contents)))
+                                result.push(field("range", token_range(doc, token)))
+                                ret Json::Object(result)
+                            }
+                            None => {
+                            }
+                        }
+                    }
                     match import_module_hover(state, doc, token) {
                         Option[str]::Some(module_hover) => {
                             value = module_hover
@@ -5783,6 +5829,33 @@ fn path_dependency_projects(state: ServerState, project_root: str) -> Vec[Projec
     ret read_dependency_projects(project_root)
 }
 
+fn read_project_constants(root: str) -> ProjectConstants {
+    match try_read_project_manifest(Path::new(root)) {
+        Ok(manifest) => {
+            ret ProjectConstants { manifest.name, manifest.version }
+        }
+        Err(_) => {
+            ret ProjectConstants::empty()
+        }
+    }
+}
+
+fn project_constants_for_path(state: mut ServerState, path: str) -> ProjectConstants {
+    match project_root_for_path(path) {
+        Some(root) => {
+            cache_dependency_projects(state, root)
+            for cached in state.dependency_projects {
+                if cached.root == root {
+                    ret cached.project
+                }
+            }
+        }
+        None => {
+        }
+    }
+    ret ProjectConstants::empty()
+}
+
 fn cache_dependency_projects(state: mut ServerState, root: str) ->() {
     for cached in state.dependency_projects {
         if cached.root == root {
@@ -5793,7 +5866,7 @@ fn cache_dependency_projects(state: mut ServerState, root: str) ->() {
         state.dependency_projects = Vec[DependencyProjects]::new()
     }
     state.dependency_projects.push(DependencyProjects {
-            root, read_dependency_projects(root)
+            root, read_dependency_projects(root), read_project_constants(root)
         }
         ,
     )
@@ -6000,6 +6073,7 @@ fn index_query_module(state: mut ServerState, doc: Document, visited: usize, inc
     if !encore_strset_insert(visited, doc.uri) {
         ret()
     }
+    state.analysis.configure_project(doc.uri, project_constants_for_path(state, uri_to_path(doc.uri)))
     state.analysis.set_module(doc.uri, uri_to_path(doc.uri), doc.text)
     match project_root_for_path(uri_to_path(doc.uri)) {
         Some(root) => cache_dependency_projects(state, root)

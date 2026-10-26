@@ -47,6 +47,33 @@ dependency objects and runtime support; shared libraries export linked symbols.
 `--emit object`, `--emit llvm-ir`, and `--emit ehir` also accept library packages.
 `encore run` and executable installation require an executable project.
 
+## Project Constants
+
+Two compiler-provided expressions expose metadata from `[project]`:
+
+| Constant | Type | Value |
+| --- | --- | --- |
+| `__version__` | `str` | `version`, or `"0.0.0"` when omitted |
+| `__project_name__` | `str` | the required `name` |
+
+```encore
+import std::io::println
+
+fn main() {
+    println(__project_name__ + " " + __version__)
+}
+```
+
+The values belong to the package defining the source. A dependency's functions,
+including generic functions instantiated by a consumer, retain that dependency's
+metadata. The compiler embeds string values, so the executable does not need an
+`encore.toml` at runtime. Manifest changes invalidate the affected cached code.
+
+The bare names cannot be rebound, imported as bindings, or assigned to. Strings,
+comments, member names such as `value.__version__`, qualified paths and other
+names such as `__custom__` keep their ordinary meaning. Formatting preserves the
+constant names; editor hover and completion show their type and package values.
+
 ## Package Compilation And Cache
 
 For binary builds, Encore resolves a dependency graph from manifests first.
@@ -86,6 +113,18 @@ These internal artifact formats are compiler-specific, not a public ABI or a
 replacement for the dependency lockfile.
 
 ### Cache limits and build workspaces
+
+Large text checkpoints are stored with an embedded LZ4 codec when compression
+saves at least 12.5%; snapshots smaller than 64 KiB and native objects/archives
+remain uncompressed. Existing raw checkpoints remain readable. Lowering entries
+use one checksummed record per key, sharded by key prefix, and retain their
+original per-key lock files. Legacy lowering records migrate on a verified hit.
+
+The JSON cache status adds `logical_bytes` (decoded payload bytes), `files`
+(managed payload files, excluding persistent locks), and `additional_roots`
+(existing Encore cache directories outside the selected budget). Those additional
+directories are informational and are not removed by prune. `bytes` remains the
+stored size of managed entries. The budget remains 20 GiB.
 
 `encore cache status` reports compiled-cache usage. Add `--json` for machine-readable
 output or `--project PATH` to inspect another project's managed workspaces and

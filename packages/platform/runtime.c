@@ -511,7 +511,16 @@ bool encore_io_wait_readable(int32_t fd, size_t timeout_ms) {
 #endif
 }
 
-int32_t encore_io_write(int32_t fd, encore_str value) {
+/* Optional terminal presentation hook. The observer brackets the entire write,
+   including error paths, so a live display can serialize ordinary diagnostics. */
+typedef void (*encore_io_write_observer)(int32_t, const char *, size_t, bool);
+static _Atomic(encore_io_write_observer) g_io_write_observer = NULL;
+
+void encore_io_set_write_observer(encore_io_write_observer observer) {
+    atomic_store(&g_io_write_observer, observer);
+}
+
+static int32_t encore_io_write_raw(int32_t fd, encore_str value) {
     if (fd < 0) {
         return -1;
     }
@@ -555,6 +564,16 @@ int32_t encore_io_write(int32_t fd, encore_str value) {
         fflush(stderr);
     }
     return 0;
+}
+
+int32_t encore_io_write(int32_t fd, encore_str value) {
+    encore_io_write_observer observer = atomic_load(&g_io_write_observer);
+    const char *data = encore_str_data(value);
+    size_t len = encore_str_size(value);
+    if (observer != NULL && (fd == 1 || fd == 2)) observer(fd, data, len, true);
+    int32_t result = encore_io_write_raw(fd, value);
+    if (observer != NULL && (fd == 1 || fd == 2)) observer(fd, data, len, false);
+    return result;
 }
 
 #if defined(_WIN32) && defined(_MSC_VER)

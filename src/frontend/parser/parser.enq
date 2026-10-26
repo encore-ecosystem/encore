@@ -10,6 +10,14 @@ import std::vec::Vec
 
 import mod::statements::*
 import refrain::frontend::lexer::{Lexer, Token, TokenType}
+import refrain::frontend::project_constants::{ProjectConstants, is_project_constant, project_constant_literal}
+
+fn project_constant_import(path: str) -> bool {
+    let version = "::__version__"
+    let name = "::__project_name__"
+    ret(path.len() >= version.len() && path.slice(path.len() - version.len(), version.len()) == version)
+    ||(path.len() >= name.len() && path.slice(path.len() - name.len(), name.len()) == name)
+}
 
 // An if in a value block may be an intermediate statement or its tail value.
 // Parse the branches once; the presence of else determines the syntax kind.
@@ -339,6 +347,7 @@ pub struct Parser {
     macros: Vec[BootstrapMacro]
     recovering: bool
     failures: Vec[ParseFailure]
+    project_constants: ProjectConstants
     capture_source_layout: bool
     source_layout: Vec[SourceLayoutToken]
 }
@@ -377,9 +386,27 @@ impl for Parser {
             Vec[BootstrapMacro]::new(),
             false,
             Vec[ParseFailure]::new(),
+            ProjectConstants::empty(),
             false,
             Vec[SourceLayoutToken]::new()
         }
+    }
+
+    /// Binds expression constants to the package owning this source module.
+    pub fn with_project_constants(self: mut Self, project: ProjectConstants) -> Self {
+        self.project_constants = project
+        ret self
+    }
+
+    fn reject_project_binding(self: Self, token: Token) -> Result[bool, ParseFailure] {
+        if is_project_constant(token.value) {
+            ret Result::Err(ParseFailure {
+                    self.source_name, token.line, token.column,
+                    "cannot redefine compiler constant '" + token.value + "'"
+                }
+            )
+        }
+        ret Result::Ok(true)
     }
 
     /// Enables optional grammar annotations for formatting source tokens.
@@ -742,6 +769,7 @@ impl for Parser {
         documentation: Option[Documentation],) -> Result[Statement, ParseFailure] {
         let declaration = self.peek_curr()
         self.safe_consume(TokenType::KW_STATIC)?
+        self.reject_project_binding(self.peek_curr())?
         let name = self.safe_consume_value(TokenType::IDENTIFIER)?
         let mut typ = Option[str]::None
         if self.peek_curr_type() == TokenType::COLON {
@@ -862,7 +890,7 @@ impl for Parser {
                 Option[Documentation]::Some(_) => {
                 }
             }
-            methods.push(self.parse_function_signature(false, attrs, decorators, method_documentation)?)
+            methods.push(self.parse_function_signature(false, attrs, decorators, method_documentation, true)?)
         }
         self.safe_consume(TokenType::RIGHT_BRACE)?
 
@@ -912,7 +940,7 @@ impl for Parser {
                 is_public = true
             }
 
-            let header = self.parse_function_signature(is_public, attrs, decorators, method_documentation)?
+            let header = self.parse_function_signature(is_public, attrs, decorators, method_documentation, true)?
             let body = self.parse_block()?
             methods.push(
                 FunctionItem {
@@ -949,7 +977,7 @@ impl for Parser {
     fn parse_fn(mut self, is_public: bool, attrs: Vec[str], decorators: Vec[DecoratorApplication], documentation:
         Option[Documentation],) ->
     Result[Statement, ParseFailure] {
-        let header = self.parse_function_signature(is_public, attrs, decorators, documentation)?
+        let header = self.parse_function_signature(is_public, attrs, decorators, documentation, false)?
         if header.is_extern {
             ret Result[Statement, ParseFailure]::Ok(Statement::Function(header))
         }
@@ -980,11 +1008,11 @@ impl for Parser {
     fn parse_extern(mut self, is_public: bool, attrs: Vec[str], decorators: Vec[DecoratorApplication],
         documentation: Option[Documentation],)
     -> Result[Statement, ParseFailure] {
-        ret Result[Statement, ParseFailure]::Ok(Statement::Function(self.parse_function_signature(is_public, attrs, decorators, documentation)?))
+        ret Result[Statement, ParseFailure]::Ok(Statement::Function(self.parse_function_signature(is_public, attrs, decorators, documentation, false)?))
     }
 
     fn parse_function_signature(mut self, is_public: bool, attrs: Vec[str], decorators: Vec[DecoratorApplication],
-        documentation: Option[Documentation],)
+        documentation: Option[Documentation], member: bool,)
     -> Result[FunctionItem, ParseFailure] {
         let signature_token = self.peek_curr()
         let mut is_async = false
@@ -999,6 +1027,9 @@ impl for Parser {
         }
 
         self.safe_consume(TokenType::KW_FN)?
+        if !member {
+            self.reject_project_binding(self.peek_curr())?
+        }
         let name = self.safe_consume_value(TokenType::IDENTIFIER)?
         let generics = self.parse_possible_generic_params()?
 
@@ -1371,6 +1402,7 @@ impl for Parser {
             is_mut = true
         }
         let declaration = self.peek_curr()
+        self.reject_project_binding(declaration)?
         let name = self.safe_consume_value(TokenType::IDENTIFIER)?
         let mut typ = Option[str]::None
         if self.peek_curr_type() == TokenType::COLON {
@@ -1440,6 +1472,7 @@ impl for Parser {
     fn parse_for(mut self) -> Result[Statement, ParseFailure] {
         self.safe_consume(TokenType::KW_FOR)?
         let label = self.parse_maybe_label()?
+        self.reject_project_binding(self.peek_curr())?
         let name = self.safe_consume_value(TokenType::IDENTIFIER)?
         let in_token = self.safe_consume(TokenType::IDENTIFIER)?
         let in_kw = in_token.value
@@ -1482,6 +1515,7 @@ impl for Parser {
         let expr = self.parse_expression()?
         self.parsing_with_binding_expr = false
         self.safe_consume(TokenType::KW_AS)?
+        self.reject_project_binding(self.peek_curr())?
         let name = self.safe_consume_value(TokenType::IDENTIFIER)?
         let body = self.parse_block()?
         ret Result[Statement, ParseFailure]::Ok(Statement::With(WithStmt {
@@ -1768,6 +1802,7 @@ impl for Parser {
         let mut binding = Option[str]::None
         if self.peek_curr_type() == TokenType::LEFT_PAREN {
             self.consume()
+            self.reject_project_binding(self.peek_curr())?
             let payload_name = self.safe_consume_value(TokenType::IDENTIFIER)?
             if payload_name != "_" {
                 binding = Option[str]::Some(payload_name)
@@ -2547,6 +2582,15 @@ impl for Parser {
                     ret Result[ExprNode, ParseFailure]::Ok(self.parse_fstring(literal)?)
                 }
                 let path = self.parse_path()?
+                match self.project_constants.value(path) {
+                    Some(value) => {
+                        let mut node = self.mk_expr_at(Expr::StringLiteral(project_constant_literal(value)), curr_token)
+                        node.length = path.len()
+                        ret Result[ExprNode, ParseFailure]::Ok(node)
+                    }
+                    None => {
+                    }
+                }
                 if path == "format" && self.peek_curr_type() == TokenType::BANG {
                     self.consume()
                     ret Result[ExprNode, ParseFailure]::Ok(self.parse_format_macro()?)
@@ -2580,6 +2624,7 @@ impl for Parser {
             self.safe_consume(TokenType::PIPE)?
             loop {
                 let name_token = self.safe_consume(TokenType::IDENTIFIER)?
+                self.reject_project_binding(name_token)?
                 let name = name_token.value
                 let mut typ = Option[str]::None
                 if self.peek_curr_type() == TokenType::COLON {
@@ -2681,7 +2726,7 @@ impl for Parser {
     fn parse_inline_expression(mut self, source: str, line: usize, column: usize) -> Result[ExprNode, ParseFailure] {
         let mut lexer = Lexer::new()
         let tokens = lexer.tokenize_at(source, line, column)
-        let mut nested = Parser::new_for_source(self.source_name)
+        let mut nested = Parser::new_for_source(self.source_name).with_project_constants(self.project_constants)
         ret Result[ExprNode, ParseFailure]::Ok(nested.parse_inline_tokens(tokens)?)
     }
 
@@ -2788,6 +2833,21 @@ impl for Parser {
     }
 
     fn parse_assignment(mut self, target: ExprNode) -> Result[Statement, ParseFailure] {
+        let previous = self.tokens.get(self.consumed - 1_usize).unwrap_or(self.peek_curr())
+        match target.value {
+            Expr::StringLiteral(_) => {
+                if is_project_constant(previous.value) {
+                    self.error_at("cannot assign to compiler constant '" + previous.value + "'", previous)?
+                }
+            }
+            Expr::Path(name) => {
+                if is_project_constant(name) {
+                    self.error_at("cannot assign to compiler constant '" + name + "'", previous)?
+                }
+            }
+            _ => {
+            }
+        }
         let operator = self.consume_value()
         let expr = self.parse_expression()?
         ret Result[Statement, ParseFailure]::Ok(Statement::Assignment(AssignmentStmt {
@@ -3061,6 +3121,7 @@ impl for Parser {
         }
 
         let name_token = self.safe_consume(TokenType::IDENTIFIER)?
+        self.reject_project_binding(name_token)?
         let name = name_token.value
         self.safe_consume(TokenType::COLON)?
         let mut is_sending = false
@@ -3145,11 +3206,16 @@ impl for Parser {
 
         if self.peek_curr_type() == TokenType::KW_AS {
             self.consume()
+            self.reject_project_binding(self.peek_curr())?
             let alias = self.safe_consume_value(TokenType::IDENTIFIER)?
             out = out + " as "
             out = out + alias
         }
 
+        if out == "__version__" || out == "__project_name__" ||
+        project_constant_import(out) {
+            self.error_at("cannot import a compiler constant as a binding", self.tokens.get(self.consumed - 1_usize).unwrap_or(self.peek_curr()))?
+        }
         ret Result[str, ParseFailure]::Ok(out)
     }
 

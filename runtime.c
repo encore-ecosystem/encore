@@ -20,6 +20,7 @@
 #include "runtime/build_process.h"
 #include "runtime/build_artifact.h"
 #include "runtime/cache_fs.h"
+#include "runtime/cache_payload.h"
 #include "runtime/build_identity.h"
 #include "runtime/build_target.h"
 #if defined(__GLIBC__)
@@ -149,6 +150,59 @@ uint64_t encore_compiler_cache_file_fact(encore_compiler_str path, uint32_t fiel
     return result;
 }
 int encore_compiler_cache_lock_shared(size_t lock) { return encore_cache_lock_shared(lock); }
+void encore_compiler_cache_touch(encore_compiler_str path) {
+    char *name = encore_compiler_cstr(path);
+    if (name != NULL) encore_cache_touch(name);
+    free(name);
+}
+
+#ifdef _WIN32
+/* Inventory must not transiently deny deletion of a committed cache payload:
+ * atomic publication replaces this path while status may read its header. */
+static uint64_t encore_cache_windows_logical_size(const char *name, uint64_t stored) {
+    wchar_t *wide = encore_build_artifact_wide(name);
+    if (wide == NULL) return stored;
+    HANDLE file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    free(wide);
+    if (file == INVALID_HANDLE_VALUE) return stored;
+    unsigned char header[ENCORE_CACHE_HEADER];
+    DWORD count = 0;
+    bool complete = ReadFile(file, header, sizeof(header), &count, NULL) && count == sizeof(header);
+    CloseHandle(file);
+    if (complete && memcmp(header, encore_cache_magic, 8) == 0 && header[8] <= 1 &&
+        stored >= ENCORE_CACHE_HEADER && encore_cache_u64(header + 24) == stored - ENCORE_CACHE_HEADER) {
+        uint64_t logical = encore_cache_u64(header + 16), payload = stored - ENCORE_CACHE_HEADER;
+        if ((header[8] == 0 && logical == payload) ||
+            (header[8] == 1 && logical <= LZ4_MAX_INPUT_SIZE && payload <= INT_MAX &&
+             logical <= payload * UINT64_C(255) + 65536)) return logical;
+    }
+    return stored;
+}
+#endif
+
+uint64_t encore_compiler_cache_logical_size(encore_compiler_str path) {
+    char *name = encore_compiler_cstr(path);
+    uint64_t stored = encore_cache_file_fact(name, 1);
+#ifdef _WIN32
+    stored = encore_cache_windows_logical_size(name, stored);
+#else
+    unsigned char header[ENCORE_CACHE_HEADER];
+    FILE *file = name == NULL ? NULL : fopen(name, "rb");
+    if (file != NULL) {
+        if (fread(header, 1, sizeof(header), file) == sizeof(header) &&
+            memcmp(header, encore_cache_magic, 8) == 0 && header[8] <= 1 &&
+            stored >= ENCORE_CACHE_HEADER && encore_cache_u64(header + 24) == stored - ENCORE_CACHE_HEADER) {
+            uint64_t logical = encore_cache_u64(header + 16), payload = stored - ENCORE_CACHE_HEADER;
+            if ((header[8] == 0 && logical == payload) ||
+                (header[8] == 1 && logical <= LZ4_MAX_INPUT_SIZE && payload <= INT_MAX &&
+                 logical <= payload * UINT64_C(255) + 65536)) stored = logical;
+        }
+        fclose(file);
+    }
+#endif
+    free(name); return stored;
+}
 
 /* Both paths are siblings in the registry cache. Publish only a fully checked
  * directory, under its registry installation lock. No external mv is needed. */
@@ -209,6 +263,49 @@ encore_compiler_str encore_compiler_read_artifact(encore_compiler_str path) {
     if (data == NULL) return (encore_compiler_str){NULL};
     return encore_compiler_owned_string(data, length);
 }
+
+extern encore_compiler_str encore_text_sha256(encore_compiler_str contents);
+
+encore_compiler_str encore_compiler_cache_encode(encore_compiler_str contents,
+    encore_compiler_str digest, bool packed) {
+    size_t length = 0;
+    char *data = encore_cache_encode(contents.object == NULL ? "" : contents.object->data,
+        contents.object == NULL ? 0 : contents.object->len,
+        digest.object == NULL ? "" : digest.object->data,
+        digest.object == NULL ? 0 : digest.object->len, packed, &length);
+    return data == NULL ? (encore_compiler_str){NULL} : encore_compiler_owned_string(data, length);
+}
+
+encore_compiler_str encore_compiler_cache_read(encore_compiler_str path, bool packed,
+    encore_compiler_str expected_digest) {
+    char *name = encore_compiler_cstr(path);
+    size_t length = 0;
+    char *data = encore_build_artifact_read(name, &length);
+    free(name);
+    if (data == NULL) return (encore_compiler_str){NULL};
+    if (packed && (length < 8 || memcmp(data, encore_cache_magic, 8))) {
+        free(data); return (encore_compiler_str){NULL};
+    }
+    char expected[65];
+    data = encore_cache_decode(data, &length, expected);
+    if (data == NULL) return (encore_compiler_str){NULL};
+    encore_compiler_str value = encore_compiler_owned_string(data, length);
+    bool supplied = expected_digest.object != NULL && expected_digest.object->len != 0;
+    if (expected[0] || supplied) {
+        encore_compiler_str actual = encore_text_sha256(value);
+        bool valid = actual.object != NULL && actual.object->len == 64 &&
+            (!expected[0] || memcmp(actual.object->data, expected, 64) == 0) &&
+            (!supplied || (expected_digest.object->len == 64 &&
+                memcmp(actual.object->data, expected_digest.object->data, 64) == 0));
+        /* The platform SHA helper returns its immortal empty string if an
+         * allocation fails. Only the fresh owned digest may be freed. */
+        if (actual.object != NULL && actual.object->ref_count != 0) free(actual.object);
+        if (!valid) { free(value.object); return (encore_compiler_str){NULL}; }
+    }
+    return value;
+}
+
+bool encore_compiler_cache_read_valid(encore_compiler_str value) { return value.object != NULL; }
 
 static bool encore_compiler_identifier_byte(unsigned char value) {
     return (value >= '0' && value <= '9') ||

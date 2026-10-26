@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import shutil
+import struct
 import tempfile
 
 compiler = Path(sys.argv[1]).resolve()
@@ -106,6 +108,26 @@ with tempfile.TemporaryDirectory(prefix='encore-cache-policy-') as temporary:
     invoke('prune', '--all', '--json')
     assert not newest.exists() and held_path.exists()
     checks.append('active cache locks protect payloads and lock files survive eviction')
+    key = hashlib.sha256(b'flat-record').hexdigest()
+    flat = cache / 'lowering-v2' / key[:2] / (key + '.entry')
+    flat.parent.mkdir(parents=True)
+    content = b'flat payload'
+    envelope = b'ENQCP001' + bytes(8) + struct.pack('<QQ', len(content), len(content)) + hashlib.sha256(content).hexdigest().encode() + content
+    flat.write_bytes(envelope)
+    stable_lock = cache / 'lowering-v1' / (key + '.lock')
+    status = invoke('status', '--json')
+    assert status['categories']['lowering-v2'] == len(envelope)
+    assert status['logical_bytes'] == len(content) and status['files'] == 1
+    before = snapshot(cache)
+    invoke('prune', '--all', '--dry-run', '--json')
+    assert snapshot(cache) == before
+    with lock(stable_lock):
+        assert invoke('prune', '--all', '--json')['busy_entries'] == 1
+        assert flat.exists()
+    invoke('prune', '--all', '--json')
+    assert not flat.exists() and stable_lock.exists()
+    checks.append('flat records share legacy locks, report decoded size and survive read-only dry runs')
+
     victim = root / 'victim'
     victim.mkdir()
     (victim / 'unit.complete').write_text('{}')
@@ -170,5 +192,15 @@ with tempfile.TemporaryDirectory(prefix='encore-cache-policy-') as temporary:
     assert invoke('status', '--json')['limit_bytes'] == 20 * 1024 ** 3
     assert len(list(cache.glob('*.lock'))) >= 4000
     checks.append('large directories are scanned within the command timeout')
+    if sys.platform == 'linux':
+        native = Path(__file__).resolve().parents[1] / 'tests/native/cache_payload_allocation.c'
+        cc = os.environ.get('ENCORE_CC') or shutil.which('clang')
+        assert cc, 'Clang is required for the native allocation-failure contract'
+        probe = root / 'allocation-probe'
+        subprocess.run([cc, '-std=c11', '-O1', str(native), '-pthread', '-o', str(probe)],
+                       check=True, capture_output=True, text=True, timeout=60)
+        subprocess.run([str(probe), str(root / 'allocation-payload')], check=True, timeout=30)
+        checks.append('SHA allocation failure is a cache miss and never frees immortal strings')
+
 
 print(json.dumps({'passed': len(checks), 'checks': checks}, indent=2))

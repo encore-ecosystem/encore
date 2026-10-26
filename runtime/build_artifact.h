@@ -41,6 +41,19 @@ static inline wchar_t *encore_build_artifact_wide(const char *text) {
     }
     return wide;
 }
+
+/* Delete-sharing readers can leave a just-replaced destination temporarily
+ * delete-pending. Retry that OS state without exposing a partial new record;
+ * permanent failures remain bounded, just like receipt reads below. */
+static inline bool encore_build_artifact_replace(const wchar_t *from, const wchar_t *to) {
+    for (size_t attempt = 0; attempt < 100; ++attempt) {
+        if (MoveFileExW(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+        DWORD error = GetLastError();
+        if (error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION && error != ERROR_ACCESS_DENIED) return false;
+        if (attempt + 1 < 100) Sleep(10);
+    }
+    return false;
+}
 #endif
 
 static inline size_t encore_build_cache_lock_open(const char *path) {
@@ -126,7 +139,7 @@ static inline bool encore_build_artifact_write(const char *path, const void *dat
     }
     if (valid) valid = FlushFileBuffers(file);
     if (created && !CloseHandle(file)) valid = false;
-    if (valid) valid = MoveFileExW(wide_temp, wide_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (valid) valid = encore_build_artifact_replace(wide_temp, wide_path);
     if (!valid && created) DeleteFileW(wide_temp);
     free(wide_temp); free(wide_path);
 #else
