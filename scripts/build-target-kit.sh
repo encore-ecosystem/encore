@@ -40,7 +40,7 @@ test -n "$host" && test -n "$target" && test -d "$toolchain" &&
   test -d "$platform" && test -n "$out" && test -n "$compiler" &&
   test -n "$linker" && test -n "$archiver" || usage
 
-version=$(tr -d '\r\n' < "$(dirname "$0")/../VERSION")
+version=$(python3 "$(dirname "$0")/project-metadata.py" --field version)
 version=${version%%-*}
 abi=$(printf '%s\n' "$version" | awk -F. '{print $1 "." $2}')
 work=$(mktemp -d)

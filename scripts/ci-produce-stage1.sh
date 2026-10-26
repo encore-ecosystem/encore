@@ -14,7 +14,7 @@ case "$target" in
 esac
 : "${LLVM_MINGW_ROOT:?LLVM_MINGW_ROOT is required for Windows GNU stage1}"
 
-release=$(tr -d '\r\n' < VERSION)
+release=$(python3 "$(dirname "$0")/project-metadata.py" --root "$PWD" --field release)
 version=${release%%-*}
 release_name=${release#*-}
 test "$release" = "$version-$release_name"

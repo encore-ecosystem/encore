@@ -45,7 +45,7 @@ cp "target/extreme/$executable" "target/stage3/$executable"
 cmp "target/stage2/$executable" "target/stage3/$executable"
 stage2_sha=$(hash_file "target/stage2/$executable")
 stage3_sha=$(hash_file "target/stage3/$executable")
-release=$(tr -d '\r\n' < VERSION)
+release=$(python3 "$(dirname "$0")/project-metadata.py" --root "$PWD" --field release)
 version=${release%%-*}
 nametag=${release#*-}
 test "$("$PWD/target/stage3/$executable" --version)" = "encore $release"

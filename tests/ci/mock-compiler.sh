@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "$*" == --version ]]; then echo 'encore 0.1.4-neumann'; exit 0; fi
+if [[ "$*" == --version ]]; then echo "encore ${CI_PROBE_RELEASE:-0.1.4-neumann}"; exit 0; fi
 test "$1" = build
 test "$2" = --profile
 test "$3" = extreme
