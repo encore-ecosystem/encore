@@ -115,9 +115,10 @@ fn main() -> u32 {
             initialized = response_for(process, 1)
             if "error" in initialized:
                 raise RuntimeError(f"initialize failed: {initialized}")
-            expected_release = (
-                Path(__file__).resolve().parents[2] / "VERSION"
-            ).read_text().strip()
+            expected_release = subprocess.check_output(
+                [sys.executable, str(Path(__file__).resolve().parents[2] / "scripts/project-metadata.py"),
+                 "--field", "release"], text=True,
+            ).strip()
             assert initialized["result"]["serverInfo"]["version"] == expected_release, initialized
             assert "diagnosticProvider" not in initialized["result"]["capabilities"], initialized
             assert initialized["result"]["capabilities"]["textDocumentSync"]["change"] == 2, initialized

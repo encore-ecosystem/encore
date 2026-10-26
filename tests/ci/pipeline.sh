@@ -51,13 +51,16 @@ case "$CI_PROBE_CASE" in
       workspace="$scratch/$scenario/encore"
       context="$workspace/target/test-context"
       mkdir -p "$context/bin" "$workspace/packages/core" "$workspace/packages/platform" "$workspace/lsp"
-      cp "$repository/VERSION" "$workspace/VERSION"
+      mkdir -p "$workspace/scripts" "$workspace/src"
+      cp "$repository/scripts/project-metadata.py" "$workspace/scripts/"
+      cp "$repository/src/version.enq" "$workspace/src/"
+      cp "$repository/encore.toml" "$workspace/"
       cp "$repository/tests/ci/mock-compiler.sh" "$context/bin/encore"
       cp "$repository/packages/core/encore.toml" "$workspace/packages/core/"
       cp "$repository/packages/platform/encore.toml" "$workspace/packages/platform/"
       cp "$repository/lsp/encore.toml" "$workspace/lsp/"
       digest=$(sha256sum "$context/bin/encore" | awk '{print $1}')
-      release=$(tr -d '\r\n' < "$workspace/VERSION")
+      release=$(python3 "$workspace/scripts/project-metadata.py" --field release)
       jq -n --arg commit "$GITHUB_SHA" --arg release "$release" \
         --arg target "$CI_TARGET" --arg seed "$CI_SEED_TAG" \
         --arg digest "$digest" \
@@ -96,7 +99,9 @@ case "$CI_PROBE_CASE" in
     mkdir -p encore/packages/core seed
     cp "$repository/tests/ci/mock-compiler.sh" seed/encore
     chmod +x seed/encore
-    cp "$repository/VERSION" encore/VERSION
+    mkdir -p encore/src
+    cp "$repository/encore.toml" encore/
+    cp "$repository/src/version.enq" encore/src/
     cp "$repository/packages/core/encore.toml" encore/packages/core/
     export LLVM_MINGW_ROOT="$scratch/toolchain with spaces"
     export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -119,7 +124,11 @@ case "$CI_PROBE_CASE" in
     mkdir -p seed
     cp "$repository/tests/ci/mock-compiler.sh" seed/encore
     chmod +x seed/encore
-    printf '0.1.4-neumann\n' > VERSION
+    mkdir -p src
+    cp "$repository/encore.toml" .
+    cp "$repository/src/version.enq" src/
+    export CI_PROBE_RELEASE
+    CI_PROBE_RELEASE=$(python3 "$repository/scripts/project-metadata.py" --field release)
     export SEED_COMPILER="$scratch/seed/encore" CI_TARGET=x86_64-unknown-linux-gnu CI_EXECUTABLE=encore
     export CI_SEED_TAG=v0.1.1-neumann
     export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

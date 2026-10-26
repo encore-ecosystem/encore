@@ -49,6 +49,11 @@ dependency objects and runtime support; shared libraries export linked symbols.
 
 ## Project Constants
 
+Project constants require Encore 0.1.9 or newer. The compiler itself uses them
+starting with 0.1.10 and requires published 0.1.9 or newer for bootstrapping.
+The compiler compatibility version is read from `encore.toml`; release archives
+still include a generated `VERSION` file for installation and updates.
+
 Two compiler-provided expressions expose metadata from `[project]`:
 
 | Constant | Type | Value |

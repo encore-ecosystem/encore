@@ -75,7 +75,7 @@ test ! -e target/extreme
 git rev-parse --verify "$seed_tag^{commit}" >/dev/null
 mkdir -p "$source_root"
 tar -cf - --exclude='packages/*/target' --exclude=.git \
-  src packages runtime runtime.c encore.toml VERSION README.md |
+  src packages runtime runtime.c encore.toml README.md |
   tar -xf - -C "$source_root"
 for package in core platform std json; do
   rm -rf "$source_root/packages/$package"

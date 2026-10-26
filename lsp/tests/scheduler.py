@@ -288,7 +288,10 @@ def main() -> None:
         # named release must rebuild the cached document.
         cache_file = next(cache.glob("*.json"))
         cached = json.loads(cache_file.read_text())
-        release = (Path(__file__).resolve().parents[2] / "VERSION").read_text().strip()
+        release = subprocess.check_output(
+                [sys.executable, str(Path(__file__).resolve().parents[2] / "scripts/project-metadata.py"),
+                 "--field", "release"], text=True,
+            ).strip()
         assert cached["compiler"] == release
         cached["compiler"] = "0.0.0-other-release"
         cache_file.write_text(json.dumps(cached))
