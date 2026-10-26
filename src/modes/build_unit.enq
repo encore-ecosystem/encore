@@ -10,8 +10,8 @@ import std::time::perf_counter_ms
 import std::vec::Vec
 
 import ehir_llvm_backend::codegen::{PreparedUnitCodegen, incremental_codegen_context_bundle, prepare_unit_codegen, unit_codegen_context, unit_codegen_owned, unit_codegen_requirements}
+import ehirlib::{ModuleBundle, module_bundle_to_string, parse_module_bundle_text}
 import ehirlib::core::{Module, make_module_bundle}
-import ehirlib::{module_bundle_to_string, parse_module_bundle_text}
 import json::{Json, stringify}
 
 import mod::build_artifacts::{UnitReady, read_unit_ready}
@@ -30,8 +30,8 @@ import refrain::frontend::analysis_database::function_declaration_position
 import refrain::frontend::metadata_ast::encode_codegen_context_ast
 import refrain::frontend::parser::Statement
 import refrain::frontend::reflection::{mark_reflection_templates, reflection_template_names}
-import refrain::frontend::safety::FunctionSafety
-import refrain::frontend::translator::{CachedCompilationChunks, CachedFunctionChunk, TranslatedModuleChunk, TranslationModule, assemble_ehir_module_bundle, filter_ast_for_target, lowering_function_key, translate_cached_compilation_unit_to_ehir_chunks, translate_compilation_unit_to_ehir_chunks}
+import refrain::frontend::safety::{FunctionSafety, SafetyFunction}
+import refrain::frontend::translator::{CachedCompilationChunks, CachedFunctionChunk, TranslatedModuleChunk, TranslationModule, assemble_ehir_module_bundle, filter_ast_for_target, lowering_function_key, lowering_function_site, translate_compilation_unit_to_ehir_chunks, translate_keyed_compilation_unit_to_ehir_chunks}
 import refrain::project::failure::ProjectFailure
 import refrain::project::workspace::{CompiledWorkspaceModule, ProjectWorkspace, try_load_compilation_unit}
 import refrain::target::{TargetSpec, parse_target}
@@ -40,9 +40,10 @@ import refrain::target::{TargetSpec, parse_target}
 /// from ordinary bodies. Dependency sources and archives are not in this value.
 pub struct PreparedCompilationUnit {
     metadata: RefrainMetadata
-    templates: str
+    owned: ModuleBundle
     lowered_text: str
     dependency_templates: Vec[str]
+    timings: Vec[(str, Json)]
 }
 
 /// Checked declarations/templates can be atomically published before emitting
@@ -70,7 +71,7 @@ pub fn package_owned_checkpoint(request: BuildUnitRequest, worker: frozen Prepar
 /// Completes owned backend preparation before announcing metadata readiness.
 /// In particular, dependencies see normalized generated coroutine layouts,
 /// never the frontend's preliminary template projection.
-pub fn prepare_package_worker(request: BuildUnitRequest, jobs: usize) -> Result[PreparedPackageWorker, str] {
+pub fn prepare_package_worker(request: BuildUnitRequest, jobs: usize, detailed_timings: bool) -> Result[PreparedPackageWorker, str] {
     if jobs == 0 {
         ret Result[PreparedPackageWorker, str]::Err("package worker needs a CPU lease")
     }
@@ -81,9 +82,11 @@ pub fn prepare_package_worker(request: BuildUnitRequest, jobs: usize) -> Result[
     let frontend = if file_exists(request.output.join("unit.frontend").as_str()) {
         restore_frontend_worker(request)?
     } else {
-        prepare_compilation_unit(request)?
+        prepare_compilation_unit_with_timings(request, detailed_timings)?
     }
+    let checkpoint_started = perf_counter_ms()
     publish_frontend_unit(request.output, package_frontend_fingerprint(request)?, frontend.metadata, frontend.lowered_text)?
+    let checkpoint_ms = perf_counter_ms() - checkpoint_started
     let frontend_ms = perf_counter_ms() - preparation_started
     let mut modules = Vec[Module]::new()
     for text in frontend.dependency_templates {
@@ -96,8 +99,10 @@ pub fn prepare_package_worker(request: BuildUnitRequest, jobs: usize) -> Result[
         "@lib.enq"
     }
     let target = parse_target(request.context.target)
-    let prepared = prepare_unit_codegen(parse_module_bundle_text(entry, frontend.lowered_text),
+    let normalize_started = perf_counter_ms()
+    let prepared = prepare_unit_codegen(frontend.owned,
         make_module_bundle("", modules), target.triple, target.pointer_width, jobs,)
+    let normalize_ms = perf_counter_ms() - normalize_started
     let templates = module_bundle_to_string(unit_codegen_context(prepared, entry))
     let template_digest = compiler_content_digest(templates)
     let mut metadata = frontend.metadata
@@ -109,6 +114,11 @@ pub fn prepare_package_worker(request: BuildUnitRequest, jobs: usize) -> Result[
     let mut preparation = Vec[(str, Json)]::new()
     preparation.push(("frontend_ms", Json::Number(Debug::fmt(frontend_ms))))
     preparation.push(("backend_prepare_ms", Json::Number(Debug::fmt(perf_counter_ms() - preparation_started - frontend_ms))))
+    if detailed_timings {
+        preparation.extend(frontend.timings)
+        preparation.push(("frontend_checkpoint_ms", Json::Number(Debug::fmt(checkpoint_ms))))
+        preparation.push(("backend_normalize_ms", Json::Number(Debug::fmt(normalize_ms))))
+    }
     if write_file(request.output.join("preparation.json").as_str(), stringify(Json::Object(preparation))) != 0 {
         ret Result[PreparedPackageWorker, str]::Err("cannot record package preparation")
     }
@@ -182,7 +192,7 @@ fn restore_frontend_worker(request: BuildUnitRequest) -> Result[PreparedCompilat
         }
     }
     ret Result[PreparedCompilationUnit, str]::Ok(PreparedCompilationUnit {
-            checkpoint.metadata, "", checkpoint.lowered, templates
+            checkpoint.metadata, bundle, checkpoint.lowered, templates, Vec[(str, Json)]::new()
         }
         ,
     )
@@ -246,6 +256,10 @@ fn contains_name(values: Vec[str], name: str) -> bool {
 /// Checks every expected dependency before opening this package's source files.
 /// Missing/corrupt artifacts never trigger a source or registry fallback.
 pub fn prepare_compilation_unit(request: BuildUnitRequest) -> Result[PreparedCompilationUnit, str] {
+    ret prepare_compilation_unit_with_timings(request, false)
+}
+
+fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_timings: bool) -> Result[PreparedCompilationUnit, str] {
     let frontend_started = perf_counter_ms()
     let _validated = request.encode()?
     let verified = load_unit_dependencies(request)?
@@ -255,6 +269,7 @@ pub fn prepare_compilation_unit(request: BuildUnitRequest) -> Result[PreparedCom
         compiled.extend(dependency.metadata.compiled_modules()?)
         dependency_templates.push(dependency.templates)
     }
+    let dependencies_loaded = perf_counter_ms()
     let owner = graph_package(request.graph, request.context.unit)?
     if unit_source_digest(owner)? != request.context.input_digest {
         ret Result[PreparedCompilationUnit, str]::Err("package sources changed before compilation: " + owner.name)
@@ -269,9 +284,12 @@ pub fn prepare_compilation_unit(request: BuildUnitRequest) -> Result[PreparedCom
     for module in workspace.modules {
         workspace.analysis.configure_safety(module.analysis_id.key(), target, module.enabled_features)
     }
-    check_own_modules(workspace, target)?
+    let workspace_loaded = perf_counter_ms()
+    let checked = check_own_modules(workspace, target)?
+    let checking_finished = perf_counter_ms()
     let checking_ms = perf_counter_ms() - frontend_started
-    let effects = workspace.analysis.function_safety_effects()
+    let effects = workspace.analysis.function_safety_effects_with_prechecked(checked)
+    let safety_finished = perf_counter_ms()
     let mut translations = Vec[TranslationModule]::new()
     let mut selected = Vec[usize]::new()
     let mut declarations = Vec[MetadataModule]::new()
@@ -345,6 +363,7 @@ pub fn prepare_compilation_unit(request: BuildUnitRequest) -> Result[PreparedCom
     // A version edit can change expanded literals while raw source is unchanged.
     // Invalidate module records, retaining replay of unchanged function bodies.
     let project_version = compiler_content_digest(owner.manifest.version)
+    let cache_read_started = perf_counter_ms()
     let mut chunks = Vec[TranslatedModuleChunk]::new()
     let mut missing = Vec[usize]::new()
     let mut keys = Vec[str]::new()
@@ -371,14 +390,19 @@ pub fn prepare_compilation_unit(request: BuildUnitRequest) -> Result[PreparedCom
         }
     }
     let mut cached_functions = Vec[CachedFunctionChunk]::new()
+    let mut function_keys = Vec[(str, str)]::new()
     if request.cache.is_some() {
         for index in missing {
             match translations.get(index) {
                 Some(module) => {
+                    let mut ordinal = 0_usize
                     for statement in module.ast {
                         match statement {
                             Statement::Function(item) => {
-                                match restore_lowered_function(request.cache, lowering_context, lowering_function_key(module.module_id, item))? {
+                                let key = lowering_function_key(module.module_id, item)
+                                function_keys.push((lowering_function_site(module.module_id, ordinal), key))
+                                ordinal += 1
+                                match restore_lowered_function(request.cache, lowering_context, key)? {
                                     Some(function) => {
                                         cached_functions.push(function)
                                     }
@@ -396,13 +420,15 @@ pub fn prepare_compilation_unit(request: BuildUnitRequest) -> Result[PreparedCom
             }
         }
     }
+    let cache_read_finished = perf_counter_ms()
     let fresh = if request.cache.is_some() {
-        translate_cached_compilation_unit_to_ehir_chunks(translations, target, missing, cached_functions)
+        translate_keyed_compilation_unit_to_ehir_chunks(translations, target, missing, cached_functions, function_keys)
     } else {
         CachedCompilationChunks {
             translate_compilation_unit_to_ehir_chunks(translations, target, missing), Vec[CachedFunctionChunk]::new(), 0
         }
     }
+    let translation_finished = perf_counter_ms()
     for function in fresh.functions {
         commit_lowered_function(request.cache, lowering_context, function)?
     }
@@ -410,6 +436,7 @@ pub fn prepare_compilation_unit(request: BuildUnitRequest) -> Result[PreparedCom
         commit_lowered_module(request.cache, keys.get(chunk.module_index()).unwrap_or(""), chunk.as_text())?
         chunks.push(chunk)
     }
+    let cache_write_finished = perf_counter_ms()
     let mut counts = Vec[(str, Json)]::new()
     counts.push(("modules_reused", Json::Number(Debug::fmt(selected.len() - missing.len()))))
     counts.push(("modules_lowered", Json::Number(Debug::fmt(missing.len()))))
@@ -426,8 +453,10 @@ pub fn prepare_compilation_unit(request: BuildUnitRequest) -> Result[PreparedCom
         "@lib.enq"
     }
     let lowered_text = assemble_ehir_module_bundle(chunks, translations.len(), entry)
-    let templates = module_bundle_to_string(incremental_codegen_context_bundle(
-            parse_module_bundle_text(entry, lowered_text)))
+    let parse_started = perf_counter_ms()
+    let owned = parse_module_bundle_text(entry, lowered_text)
+    let parse_ms = perf_counter_ms() - parse_started
+    let templates = module_bundle_to_string(incremental_codegen_context_bundle(owned))
     if unit_source_digest(owner)? != request.context.input_digest {
         ret Result[PreparedCompilationUnit, str]::Err("package sources changed during compilation: " + owner.name)
     }
@@ -435,8 +464,20 @@ pub fn prepare_compilation_unit(request: BuildUnitRequest) -> Result[PreparedCom
         request.context, dependencies, declarations, compiler_content_digest(templates)
     }
     let _validated_metadata = metadata.encode()?
+    let mut timings = Vec[(str, Json)]::new()
+    if detailed_timings {
+        timings.push(("dependency_metadata_ms", Json::Number(Debug::fmt(dependencies_loaded - frontend_started))))
+        timings.push(("workspace_load_ms", Json::Number(Debug::fmt(workspace_loaded - dependencies_loaded))))
+        timings.push(("semantic_check_ms", Json::Number(Debug::fmt(checking_finished - workspace_loaded))))
+        timings.push(("safety_effects_ms", Json::Number(Debug::fmt(safety_finished - checking_finished))))
+        timings.push(("lowering_context_ms", Json::Number(Debug::fmt(cache_read_started - safety_finished))))
+        timings.push(("lowering_cache_read_ms", Json::Number(Debug::fmt(cache_read_finished - cache_read_started))))
+        timings.push(("lowering_translate_ms", Json::Number(Debug::fmt(translation_finished - cache_read_finished))))
+        timings.push(("lowering_cache_write_ms", Json::Number(Debug::fmt(cache_write_finished - translation_finished))))
+        timings.push(("ehir_parse_ms", Json::Number(Debug::fmt(parse_ms))))
+    }
     ret Result[PreparedCompilationUnit, str]::Ok(PreparedCompilationUnit {
-            metadata, templates, lowered_text, dependency_templates
+            metadata, owned, lowered_text, dependency_templates, timings
         }
         ,
     )
@@ -509,22 +550,24 @@ fn verified_input(path: Path, expected: str) -> Result[str, str] {
     ret Result[str, str]::Ok(contents)
 }
 
-fn check_own_modules(workspace: mut ProjectWorkspace, target: TargetSpec) -> Result[bool, str] {
+fn check_own_modules(workspace: mut ProjectWorkspace, target: TargetSpec) -> Result[Vec[SafetyFunction], str] {
+    let mut checked = Vec[SafetyFunction]::new()
     for module in workspace.modules {
         if module.owner_name != workspace.compilation_unit {
             continue
         }
         if module.diagnostics.len() != 0 {
             for diagnostic in module.diagnostics {
-                ret Result[bool, str]::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
+                ret Result[Vec[SafetyFunction], str]::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
             }
         }
-        for diagnostic in workspace.analysis.module_semantic_diagnostics_for_target(
-            module.analysis_id.key(), target, module.enabled_features,) {
-            ret Result[bool, str]::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
+        let prepared = workspace.analysis.prepare_module_safety_for_target(module.analysis_id.key(), target, module.enabled_features)
+        for diagnostic in prepared.diagnostics {
+            ret Result[Vec[SafetyFunction], str]::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
         }
+        checked.extend(prepared.functions)
     }
-    ret Result[bool, str]::Ok(true)
+    ret Result[Vec[SafetyFunction], str]::Ok(checked)
 }
 
 // Function cfg filters must also apply to token-derived callable facts. The

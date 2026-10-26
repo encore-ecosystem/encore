@@ -14,10 +14,21 @@ import refrain::frontend::lexer::{Lexer, Token, TokenType}
 import refrain::frontend::parser::{FunctionItem, GenericParam, Statement}
 import refrain::frontend::project_constants::ProjectConstants
 import refrain::frontend::safety::{FunctionSafety, SafetyFunction, infer_safety_with_known, safety_dependencies}
-import refrain::frontend::semantic::{ScopedSemanticBinding, SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticDependencyKind, SemanticField, SemanticMember, SemanticMethod, SemanticVariant, append_bound_methods, check_function_body, check_function_body_with_scope, check_function_body_with_type_scope, check_function_body_with_types, check_function_body_with_variants, check_module_bodies, check_module_bodies_with_type_scope, check_module_bodies_with_types, check_module_bodies_with_variants, check_module_declarations, semantic_accessible_methods, semantic_associated_members, semantic_call_return_type, semantic_members, semantic_named_members, semantic_same_owner, specialize_method_type_with_self}
+import refrain::frontend::semantic::{ScopedSemanticBinding, SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticDependencyKind, SemanticField, SemanticMember, SemanticMethod, SemanticVariant, append_bound_methods, check_function_body, check_function_body_with_scope, check_function_body_with_type_scope, check_function_body_with_types, check_function_body_with_variants, check_module_bodies, check_module_bodies_with_type_scope, check_module_bodies_with_types, check_module_bodies_with_variants, check_module_declarations, prepare_module_bodies_with_variants, semantic_accessible_methods, semantic_associated_members, semantic_call_return_type, semantic_members, semantic_named_members, semantic_same_owner, specialize_method_type_with_self}
 import refrain::frontend::syntax::SyntaxDocument
 import refrain::frontend::type_scope::{TypeNameBinding, display_type, names_in_scope, scope_type}
 import refrain::target::{TargetSpec, cfg_active_with_features, host_target}
+
+/// Checked facts live only until this package's safety inference completes.
+/// They are never installed as a persistent or editor query cache.
+pub struct PreparedModuleSafety {
+    diagnostics: Vec[FrontendDiagnostic]
+    functions: Vec[SafetyFunction]
+}
+
+fn safety_site_key(module_name: str, line: usize, column: usize) -> str {
+    ret module_name + "\n" + Debug::fmt(line) + ":" + Debug::fmt(column)
+}
 
 struct SafetyConfiguration {
     module_name: str
@@ -602,6 +613,22 @@ impl for AnalysisDatabase {
 
     /// Bulk query for compiler metadata; editor queries use function_safety instead.
     pub fn function_safety_effects(self: mut Self) -> Vec[FunctionSafety] {
+        ret self.function_safety_effects_with_prechecked(Vec[SafetyFunction]::new())
+    }
+
+    /// Reuses this worker's semantic results without crossing revision or
+    /// process boundaries. Missing/metadata-only declarations use the usual path.
+    pub fn function_safety_effects_with_prechecked(self: mut Self, checked: Vec[SafetyFunction]) -> Vec[FunctionSafety] {
+        let index = unsafe {
+            encore_strmap_new()
+        }
+        let mut position = 0_usize
+        for function in checked {
+            unsafe {
+                encore_strmap_put(index, safety_site_key(function.module_name, function.symbol_line, function.symbol_column), position + 1)
+            }
+            position += 1
+        }
         let mut functions = Vec[SafetyFunction]::new()
         for indexed in self.all_symbols() {
             if indexed.symbol.kind != 12_usize {
@@ -615,6 +642,18 @@ impl for AnalysisDatabase {
                 }
             }
             if !installed {
+                let prepared = unsafe {
+                    encore_strmap_get(index, safety_site_key(indexed.module_name, indexed.symbol.line, indexed.symbol.column))
+                }
+                if prepared != 0 {
+                    match checked.get(prepared - 1) {
+                        Some(function) => {
+                            functions.push(function) continue
+                        }
+                        None => {
+                        }
+                    }
+                }
                 match self.safety_function_input(indexed) {
                     Some(function) => {
                         functions.push(function)
@@ -623,6 +662,9 @@ impl for AnalysisDatabase {
                     }
                 }
             }
+        }
+        unsafe {
+            encore_strmap_free(index)
         }
         // Compile-time callers need the complete graph, not a separate lazy
         // dependency-discovery walk for each root. Installed metadata remains
@@ -1854,6 +1896,42 @@ impl for AnalysisDatabase {
         diagnostics.extend(check_module_bodies_with_variants(document.ast, environment.callables, environment.fields,
                 environment.methods, environment.aggregates, module_name, names, environment.variants,))
         ret diagnostics
+    }
+
+    /// Package compilation checks each owned body once and passes those exact
+    /// resolved facts to safety inference. Declaration diagnostics keep their
+    /// original order, including local trait-implementation validation.
+    pub fn prepare_module_safety_for_target(self: mut Self, module_name: str, target: TargetSpec,
+        features: Vec[str],) -> PreparedModuleSafety {
+        let environment = self.scoped_environment(module_name)
+        let names = self.semantic_type_names(module_name)
+        let document = match self.stored_full_document(module_name) {
+            Some(value) => value
+            None => self.document(module_name).unwrap_or(FrontendDocument::empty())
+        }
+        let mut diagnostics = check_module_declarations(document.ast, target, features)
+        diagnostics.extend(self.module_resolution_diagnostics(module_name, document))
+        let checked = prepare_module_bodies_with_variants(document.ast, environment.callables, environment.fields,
+            environment.methods, environment.aggregates, module_name, names, environment.variants,)
+        diagnostics.extend(checked.diagnostics)
+        let mut functions = Vec[SafetyFunction]::new()
+        for entry in checked.functions {
+            let mut active = true
+            for attr in entry.item.attrs {
+                if starts_with(attr, "cfg:") && !cfg_active_with_features(target, attr.slice(4_usize, attr.len() - 4_usize), features) {
+                    active = false break
+                }
+            }
+            if active {
+                let site = function_declaration_position(document, entry.item)
+                functions.push(SafetyFunction {
+                        module_name, entry.owner, entry.item, entry.body, environment.callables,
+                        append_bound_methods(environment.methods, entry.body.bound_methods), site.0, site.1, environment.constructors
+                    }
+                )
+            }
+        }
+        ret PreparedModuleSafety { diagnostics, functions }
     }
 
     /// Freezes all workspace-dependent facts needed to check one module on a

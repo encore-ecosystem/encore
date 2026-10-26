@@ -1,8 +1,64 @@
 //! Safety effects propagate through resolved calls, not spelling or declaration order.
 import core::testing::assert
-import refrain::frontend::{AnalysisDatabase, SymbolId}
-import refrain::target::parse_target
 import std::vec::Vec
+
+import refrain::frontend::{AnalysisDatabase, SymbolId}
+import refrain::frontend::safety::SafetyFunction
+import refrain::target::parse_target
+
+fn prechecked_parity(db: mut AnalysisDatabase) -> bool {
+    let target = parse_target("x86_64-unknown-linux-gnu")
+    let modules = vec!["native", "facade", "app", "methods", "values", "contracts", "conditional", "unrelated", "implicit", "trusted_factory", "variants", "variant_use", "invalid_trait"]
+    for name in modules {
+        db.configure_safety(name, target, Vec[str]::new())
+    }
+    let expected = db.function_safety_effects()
+    let mut checked = Vec[SafetyFunction]::new()
+    for name in modules {
+        let diagnostics = db.module_semantic_diagnostics_for_target(name, target, Vec[str]::new())
+        let prepared = db.prepare_module_safety_for_target(name, target, Vec[str]::new())
+        if diagnostics.len() != prepared.diagnostics.len() {
+            ret false
+        }
+        let mut index = 0_usize
+        for diagnostic in diagnostics {
+            match prepared.diagnostics.get(index) {
+                Some(actual) => {
+                    if actual.code != diagnostic.code || actual.message != diagnostic.message ||
+                    actual.line != diagnostic.line || actual.column != diagnostic.column {
+                        ret false
+                    }
+                }
+                None => {
+                    ret false
+                }
+            }
+            index += 1
+        }
+        checked.extend(prepared.functions)
+    }
+    let actual = db.function_safety_effects_with_prechecked(checked)
+    if expected.len() != actual.len() {
+        ret false
+    }
+    let mut index = 0_usize
+    for effect in expected {
+        match actual.get(index) {
+            Some(found) => {
+                if effect.module_name != found.module_name || effect.owner != found.owner || effect.name != found.name ||
+                effect.line != found.line || effect.column != found.column || effect.body_unsafe != found.body_unsafe ||
+                effect.asserted_safe != found.asserted_safe || effect.returns_unsafe_callable != found.returns_unsafe_callable {
+                    ret false
+                }
+            }
+            None => {
+                ret false
+            }
+        }
+        index += 1
+    }
+    ret true
+}
 
 fn main() -> u32 {
     let mut db = AnalysisDatabase::new()
@@ -120,6 +176,14 @@ fn main() -> u32 {
     db.set_module("variant_use", "variant_use.enq", "import variants::Maybe as Value\nfn make() -> Value[u32] { ret Value[u32]::Some(1_u32) }")
     if !assert(!db.function_is_unsafe(db.symbol_id("variant_use", "make").unwrap_or(SymbolId::invalid()))) {
         ret 32_u32
+    }
+    db.set_module("invalid_trait", "invalid_trait.enq", "trait Required { fn run(self: Self) -> u32 } struct Missing {} impl Required for Missing {}")
+    if !assert(prechecked_parity(db)) {
+        ret 33_u32
+    }
+    db.set_module("native", "native.enq", "pub extern fn raw() -> u32\npub fn leaf() -> u32 { unsafe { ret raw() } }\npub fn boundary() -> u32 { ret leaf() }")
+    if !assert(prechecked_parity(db)) {
+        ret 34_u32
     }
     ret 0_u32
 }

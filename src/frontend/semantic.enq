@@ -214,6 +214,18 @@ fn method_declaration_owner(receiver: str) -> str {
 }
 
 /// Contains the reusable semantic facts and diagnostics of one function body.
+/// Function facts retained by the package worker for safety inference.
+pub struct CheckedFunctionBody {
+    item: FunctionItem
+    owner: str
+    body: SemanticBody
+}
+
+pub struct CheckedModuleBodies {
+    diagnostics: Vec[FrontendDiagnostic]
+    functions: Vec[CheckedFunctionBody]
+}
+
 pub struct SemanticBody {
     bindings: Vec[SemanticBinding]
     diagnostics: Vec[FrontendDiagnostic]
@@ -1050,29 +1062,62 @@ pub fn check_module_bodies_with_type_scope(ast: Vec[Statement], callables: Vec[S
 pub fn check_module_bodies_with_variants(ast: Vec[Statement], callables: Vec[SemanticCallable],
     fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
     type_scope: str, type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant],) -> Vec[FrontendDiagnostic] {
+    ret check_module_bodies_impl(ast, callables, fields, methods, aggregate_names, type_scope, type_names, variants, false).diagnostics
+}
+
+/// Validates the same bodies and trait implementations, retaining resolved
+/// facts only for callers that will immediately infer package safety effects.
+pub fn prepare_module_bodies_with_variants(ast: Vec[Statement], callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
+    type_scope: str, type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant],) -> CheckedModuleBodies {
+    ret check_module_bodies_impl(ast, callables, fields, methods, aggregate_names, type_scope, type_names, variants, true)
+}
+
+fn check_module_bodies_impl(ast: Vec[Statement], callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
+    type_scope: str, type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant], retain_bodies: bool,) -> CheckedModuleBodies {
     let mut out = Vec[FrontendDiagnostic]::new()
+    let mut functions = Vec[CheckedFunctionBody]::new()
     let mut traits = Vec[TraitStmt]::new()
     for statement in ast {
         match statement {
             Statement::Function(item) => {
-                out.extend(check_function_body_with_variants(item, callables, fields, methods, "",
-                        Vec[GenericParam]::new(), aggregate_names, type_scope, type_names, variants,).diagnostics)
+                let checked = check_function_body_with_variants(item, callables, fields, methods, "",
+                    Vec[GenericParam]::new(), aggregate_names, type_scope, type_names, variants,)
+                out.extend(checked.diagnostics)
+                if retain_bodies {
+                    functions.push(CheckedFunctionBody { item, "", checked })
+                }
             }
             Statement::Trait(item) => {
                 let scope_generics = item.generics
                 for method in item.methods {
-                    out.extend(check_function_body_with_variants(method, callables, fields, methods,
-                            scope_type(item.name, type_scope, type_names, generic_param_names(scope_generics)),
-                            scope_generics, aggregate_names, type_scope, type_names, variants,).diagnostics)
+                    let checked = check_function_body_with_variants(method, callables, fields, methods,
+                        scope_type(item.name, type_scope, type_names, generic_param_names(scope_generics)),
+                        scope_generics, aggregate_names, type_scope, type_names, variants,)
+                    out.extend(checked.diagnostics)
+                    if retain_bodies {
+                        functions.push(CheckedFunctionBody {
+                                method, item.name, checked
+                            }
+                        )
+                    }
                 }
                 traits.push(item)
             }
             Statement::Impl(item) => {
                 let scope_generics = item.generics
                 for method in item.methods {
-                    out.extend(check_function_body_with_variants(method, callables, fields, methods,
-                            scope_type(item.target, type_scope, type_names, generic_param_names(scope_generics)),
-                            scope_generics, aggregate_names, type_scope, type_names, variants,).diagnostics)
+                    let checked = check_function_body_with_variants(method, callables, fields, methods,
+                        scope_type(item.target, type_scope, type_names, generic_param_names(scope_generics)),
+                        scope_generics, aggregate_names, type_scope, type_names, variants,)
+                    out.extend(checked.diagnostics)
+                    if retain_bodies {
+                        functions.push(CheckedFunctionBody {
+                                method, item.target, checked
+                            }
+                        )
+                    }
                 }
             }
             _ => {
@@ -1088,7 +1133,7 @@ pub fn check_module_bodies_with_variants(ast: Vec[Statement], callables: Vec[Sem
             }
         }
     }
-    ret out
+    ret CheckedModuleBodies { out, functions }
 }
 
 pub fn append_bound_methods(methods: Vec[SemanticMethod], bound_methods: Vec[SemanticMethod]) -> Vec[SemanticMethod] {

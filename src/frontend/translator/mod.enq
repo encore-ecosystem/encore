@@ -529,6 +529,8 @@ struct TranslatorContext {
     record_function_cache: bool
     functions_reused: usize
     cached_function_index: usize
+    function_key_index: usize
+    function_keys: Vec[str]
     vars: Vec[VarType]
     owned_vars: Vec[VarType]
     functions: Vec[FunctionType]
@@ -796,6 +798,19 @@ pub fn lowering_function_key(module_id: str, item: FunctionItem) -> str {
 
 pub fn translate_cached_compilation_unit_to_ehir_chunks(modules: Vec[TranslationModule], target: TargetSpec,
     selected: Vec[usize], cached: Vec[CachedFunctionChunk],) -> CachedCompilationChunks {
+    ret translate_keyed_compilation_unit_to_ehir_chunks(modules, target, selected, cached, Vec[(str, str)]::new())
+}
+
+/// Identifies a declaration in the immutable, checked lowering input. The
+/// persistent key still hashes its complete body, documentation and spans.
+pub fn lowering_function_site(module_id: str, ordinal: usize) -> str {
+    ret module_id + "\n" + Debug::fmt(ordinal)
+}
+
+/// The package worker can reuse keys it calculated while probing the cache.
+/// Other callers retain the ordinary entrypoint and calculate keys on demand.
+pub fn translate_keyed_compilation_unit_to_ehir_chunks(modules: Vec[TranslationModule], target: TargetSpec,
+    selected: Vec[usize], cached: Vec[CachedFunctionChunk], keys: Vec[(str, str)],) -> CachedCompilationChunks {
     let mut ast = Vec[Statement]::new()
     for module in modules {
         ast.extend(module.ast)
@@ -812,6 +827,15 @@ pub fn translate_cached_compilation_unit_to_ehir_chunks(modules: Vec[Translation
             encore_strmap_put(ctx.cached_function_index, function.key, cached_index + 1)
         }
         cached_index += 1
+    }
+    ctx.function_key_index = unsafe {
+        encore_strmap_new()
+    }
+    for pair in keys {
+        ctx.function_keys.push(pair.1)
+        unsafe {
+            encore_strmap_put(ctx.function_key_index, pair.0, ctx.function_keys.len())
+        }
     }
     let mut chunks = Vec[TranslatedModuleChunk]::new()
     let mut index = 0_usize
@@ -1452,6 +1476,11 @@ fn free_translation_indexes(ctx: TranslatorContext) ->() {
             encore_strmap_free(ctx.cached_function_index)
         }
     }
+    if ctx.function_key_index != 0 {
+        unsafe {
+            encore_strmap_free(ctx.function_key_index)
+        }
+    }
     unsafe {
         encore_strmap_free(ctx.imports.index)
         encore_strmap_free(ctx.module_index)
@@ -1483,6 +1512,7 @@ fn translate_ast_with_context(ctx: mut TranslatorContext, ast: Vec[Statement], t
             }
         }
     }
+    let mut function_ordinal = 0_usize
     for stmt in ast {
         match stmt {
             Statement::Import(imp_item) => {
@@ -1501,9 +1531,11 @@ fn translate_ast_with_context(ctx: mut TranslatorContext, ast: Vec[Statement], t
                 builder = builder.append(translate_impl(ctx, impl_item))
             }
             Statement::Function(fn_item) => {
+                let ordinal = function_ordinal
+                function_ordinal += 1
                 if function_is_active(fn_item, target, features) {
                     if !function_is_decorator_definition(fn_item) {
-                        builder = builder.append(translate_cached_function(ctx, fn_item))
+                        builder = builder.append(translate_cached_function(ctx, fn_item, ordinal))
                     }
                 }
             }
@@ -1658,7 +1690,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
     }
     let type_collisions = build_type_collision_names(normalized_modules, stable_abi)
     let mut ctx = TranslatorContext {
-        Vec[CachedFunctionChunk]::new(), Vec[CachedFunctionChunk]::new(), false, 0, 0,
+        Vec[CachedFunctionChunk]::new(), Vec[CachedFunctionChunk]::new(), false, 0, 0, 0, Vec[str]::new(),
         Vec[VarType]::new(), Vec[VarType]::new(), Vec[FunctionType]::new(), normalized_modules, module_visibility,
         module_index, module_prefixes, visibility_index, direct_import_index, unsafe {
             encore_strmap_new()
@@ -6408,7 +6440,7 @@ fn translate_decorated_function(ctx: mut TranslatorContext, item: FunctionItem,
     ret builder
 }
 
-fn translate_cached_function(ctx: mut TranslatorContext, item: FunctionItem) -> EhirTextBuilder {
+fn translate_cached_function(ctx: mut TranslatorContext, item: FunctionItem, ordinal: usize) -> EhirTextBuilder {
     if function_uses_reflection(item) {
         ret translate_function(ctx, item)
     }
@@ -6425,7 +6457,19 @@ fn translate_cached_function(ctx: mut TranslatorContext, item: FunctionItem) -> 
     !item.decorators.is_empty() {
         ret translate_function(ctx, item)
     }
-    let key = lowering_function_key(module_identity_for_source(ctx, item.source_name), item)
+    let owner = module_identity_for_source(ctx, item.source_name)
+    let precomputed = if ctx.function_key_index == 0 {
+        0_usize
+    } else {
+        unsafe {
+            encore_strmap_get(ctx.function_key_index, lowering_function_site(owner, ordinal))
+        }
+    }
+    let key = if precomputed == 0 {
+        lowering_function_key(owner, item)
+    } else {
+        ctx.function_keys.get(precomputed - 1).unwrap_or("")
+    }
     let encoded = unsafe {
         encore_strmap_get(ctx.cached_function_index, key)
     }
