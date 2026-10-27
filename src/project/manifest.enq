@@ -21,6 +21,16 @@ pub struct ProjectFeature {
     members: Vec[str]
 }
 
+/// A typed service exported by a native plugin library.
+pub struct ProjectPluginExport {
+    name: str
+    interface: str
+    factory: str
+    stateless: bool
+    save_state: str
+    restore_state: str
+}
+
 /// Contains normalized project metadata loaded from `encore.toml`.
 pub struct ProjectManifest {
     name: str
@@ -36,6 +46,7 @@ pub struct ProjectManifest {
     publish_include: Vec[str]
     publish_exclude: Vec[str]
     features: Vec[ProjectFeature]
+    plugin_exports: Vec[ProjectPluginExport]
     original_source: str
 }
 
@@ -68,6 +79,7 @@ pub fn try_parse_project_manifest(source: str, manifest_path: Path) -> Result[Pr
     let compiler_requirement = project_string_or(doc, "encore", "")
     let build = toml_get_string(doc, "project", "build")
     let target = project_string_or(doc, "target", "auto")
+    let plugin_exports = try_parse_plugin_exports(doc, target, manifest_path)?
     let publish_include = target_array_setting(doc, "publish", "include", Vec[str]::new())
     let publish_exclude = target_array_setting(doc, "publish", "exclude", Vec[str]::new())
     let mut features = Vec[ProjectFeature]::new()
@@ -109,9 +121,90 @@ pub fn try_parse_project_manifest(source: str, manifest_path: Path) -> Result[Pr
             publish_include,
             publish_exclude,
             features,
+            plugin_exports,
             source
         }
         ,)
+}
+
+fn try_plugin_string(doc: TomlDocument, section: str, key: str) -> Result[str, ProjectFailure] {
+    match toml_get_string(doc, section, key) {
+        Some(value) => {
+            if value != "" {
+                ret Result::Ok(value)
+            }
+        }
+        None => {
+        }
+    }
+    ret Result::Err(ProjectFailure {
+            "manifest-plugin", "[" + section + "]." + key + " must be a nonempty string"
+        }
+    )
+}
+
+fn try_parse_plugin_exports(doc: TomlDocument, target: str, manifest_path: Path) -> Result[Vec[ProjectPluginExport], ProjectFailure] {
+    let mut exports = Vec[ProjectPluginExport]::new()
+    let prefix = "plugin.exports."
+    for section in doc.sections {
+        if section.name.byte_len() < prefix.byte_len() || section.name.slice_bytes(0, prefix.byte_len()) != prefix {
+            if section.name == "plugin.exports" {
+                ret Result::Err(ProjectFailure {
+                        "manifest-plugin", "Use [plugin.exports.<name>] tables in " + manifest_path.as_str()
+                    }
+                )
+            }
+            continue
+        }
+        if target != "shared_lib" {
+            ret Result::Err(ProjectFailure {
+                    "manifest-plugin", "Plugin exports require project.target = \"shared_lib\""
+                }
+            )
+        }
+        let name = section.name.slice_bytes(prefix.byte_len(), section.name.byte_len() - prefix.byte_len())
+        if name == "" || name.byte_len() > 128 || exports.len() >= 1024 {
+            ret Result::Err(ProjectFailure { "manifest-plugin", "Invalid plugin export name" })
+        }
+        for previous in exports {
+            if previous.name == name {
+                ret Result::Err(ProjectFailure {
+                        "manifest-plugin", "Duplicate plugin export: " + name
+                    }
+                )
+            }
+        }
+        for entry in section.entries {
+            if entry.key != "interface" && entry.key != "factory" && entry.key != "stateless" && entry.key != "save-state" && entry.key != "restore-state" {
+                ret Result::Err(ProjectFailure {
+                        "manifest-plugin", "Unknown plugin export setting: " + entry.key
+                    }
+                )
+            }
+            if entry.key == "save-state" || entry.key == "restore-state" {
+                let _hook = try_plugin_string(doc, section.name, entry.key)?
+            }
+            if entry.key == "stateless" && toml_get_bool(doc, section.name, "stateless").is_none() {
+                ret Result::Err(ProjectFailure {
+                        "manifest-plugin", "Plugin stateless must be a boolean"
+                    }
+                )
+            }
+        }
+        let interface = try_plugin_string(doc, section.name, "interface")?
+        let factory = try_plugin_string(doc, section.name, "factory")?
+        let stateless = target_bool_setting(doc, section.name, "stateless", false)
+        let save = toml_get_string(doc, section.name, "save-state").unwrap_or("")
+        let restore = toml_get_string(doc, section.name, "restore-state").unwrap_or("")
+        if (stateless &&(save != "" || restore != "")) ||(!stateless &&(save == "" || restore == "")) {
+            ret Result::Err(ProjectFailure {
+                    "manifest-plugin", "Plugin export must declare stateless = true or both save-state and restore-state"
+                }
+            )
+        }
+        exports.push(ProjectPluginExport { name, interface, factory, stateless, save, restore })
+    }
+    ret Result::Ok(exports)
 }
 
 /// Returns the project package name.
@@ -730,4 +823,24 @@ fn required_project_string(doc: TomlDocument, key: str, manifest_path: Path) -> 
             }
         }
     }
+}
+
+#attr(test)
+fn plugin_manifest_exports_and_state_policy_contract() -> bool {
+    let base = "[project]\nname=\"plugin\"\ntarget=\"shared_lib\"\n[plugin.exports.formatter]\ninterface=\"api::Formatter\"\nfactory=\"create\"\n"
+    let parsed = match try_parse_project_manifest(base + "stateless=true\n", Path::new("encore.toml")) {
+        Ok(value) => value
+        Err(_) => {
+            ret false
+        }
+    }
+    if parsed.plugin_exports.len() != 1 {
+        ret false
+    }
+    for suffix in vec!["", "stateless=\"yes\"\n", "stateless=true\nsave-state=\"save\"\n", "save-state=\"save\"\n", "stateless=true\nunknown=1\n", "stateless=true\nsave-state=123\n", "stateless=true\nrestore-state=\"\"\n"] {
+        if try_parse_project_manifest(base + suffix, Path::new("encore.toml")).is_ok() {
+            ret false
+        }
+    }
+    ret try_parse_project_manifest(base + "save-state=\"save\"\nrestore-state=\"restore\"\n", Path::new("encore.toml")).is_ok()
 }

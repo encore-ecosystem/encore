@@ -1,0 +1,158 @@
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+import core::vec::Vec
+
+import std::io::{eprintln, println}
+import std::os::env
+import std::plugin::{Plugin, PluginError}
+import std::time::Instant
+
+import dto_api::{Echo, Envelope, Marker, Status}
+
+extern fn encore_plugin_benchmark_peak_rss() -> u64
+
+fn require(condition: bool, message: str) -> Result[(), PluginError] {
+    if !condition {
+        ret Result::Err(PluginError { 7_u32, message })
+    }
+    ret Result::Ok(())
+}
+fn exercise() -> Result[(), PluginError] {
+    let mut plugin = unsafe {
+        Plugin::load(env("DTO_PLUGIN").unwrap_or(""))
+    }
+    ?
+    let mut saved = ""
+    {
+        let echo = plugin.bind[dyn Echo[Envelope]]("echo")?
+        match plugin.bind[dyn Marker[str]]("marker") {
+            Ok(_) => {
+                ret Result::Err(PluginError {
+                        7_u32, "phantom generic interface mismatch accepted"
+                    }
+                )
+            }
+            Err(error) => {
+                require(error.code == 2_u32, "generic interface arguments participate in the fingerprint")?
+            }
+        }
+        let marker = plugin.bind[dyn Marker[u32]]("marker")?
+        require(marker.marker()? == 42_u64, "matching phantom generic interface")?
+        if env("PLUGIN_BENCHMARK").unwrap_or("") == "1" {
+            let iterations = 50000_u64
+            let mut checksum = 0_u64
+            let started = Instant::now()
+            let mut index = 0_u64
+            while index < iterations {
+                checksum += marker.marker()?
+                index += 1_u64
+            }
+            let elapsed = started.elapsed().as_nanos().unwrap_or(0_u64)
+            require(checksum == iterations * 42_u64, "scalar benchmark checksum")?
+            println("{\"case\":\"sdk-scalar-u64\",\"iterations\":" + Debug::fmt(iterations) + ",\"total_ns\":" + Debug::fmt(elapsed) + "}")
+        }
+        echo.ping()?
+        saved = echo.label()?
+        match echo.fail()? {
+            Ok(_) => {
+                ret Result::Err(PluginError { 7_u32, "application error lost" })
+            }
+            Err(message) => {
+                require(message == "application failure", "nested Result error")?
+            }
+        }
+        let sizes = vec![0_usize, 4096_usize, 1048576_usize]
+        for count in sizes {
+            let mut bytes = Vec[u8]::with_capacity(count)
+            let mut index = 0_usize
+            while index < count {
+                bytes.push((index % 251_usize) as u8) index += 1_usize
+            }
+            let input = Envelope {
+                "данные" + " 📦", bytes, vec![0_u64, 18446744073709551615_u64],
+                [7_u32, 11_u32, 13_u32],( - 17_i64, true), Option[str]::Some("owned" + " option"),
+                Status::Text("owned" + " enum"), - 1.25_f64, 0.5_f32
+            }
+            if env("PLUGIN_BENCHMARK").unwrap_or("") == "1" {
+                let iterations = if count == 1048576_usize {
+                    16_u64
+                } else {
+                    128_u64
+                }
+                let mut checksum = 0_usize
+                let mut repetition = 0_u64
+                let started = Instant::now()
+                while repetition < iterations {
+                    let result = match echo.echo(input)? {
+                        Ok(value) => value
+                        Err(message) => {
+                            ret Result::Err(PluginError { 7_u32, message })
+                        }
+                    }
+                    checksum += result.bytes.len()
+                    repetition += 1_u64
+                }
+                let elapsed = started.elapsed().as_nanos().unwrap_or(0_u64)
+                require(checksum == count * iterations as usize, "DTO benchmark checksum")?
+                println("{\"case\":\"sdk-dto\",\"bytes\":" + Debug::fmt(count) + ",\"iterations\":" + Debug::fmt(iterations) + ",\"total_ns\":" + Debug::fmt(elapsed) + "}")
+            }
+            let output = match echo.echo(input)? {
+                Ok(value) => value
+                Err(message) => {
+                    ret Result::Err(PluginError { 7_u32, message })
+                }
+            }
+            require(output.name == "данные 📦" && output.bytes.len() == count, "string and compact byte buffer")?
+            index = 0_usize
+            while index < count {
+                require(output.bytes.get(index).unwrap_or(255_u8) ==(index % 251_usize) as u8, "byte payload contents")?
+                index += 1_usize
+            }
+            require(output.numbers.get(1_usize).unwrap_or(0_u64) == 18446744073709551615_u64, "u64 range")?
+            require(output.fixed[2_u32] == 13_u32 && output.pair.0 == - 17_i64 && output.pair.1, "array and tuple DTO")?
+            require(output.optional.unwrap_or("") == "owned option", "Option DTO")?
+            match output.status {
+                Status::Text(value) => {
+                    require(value == "owned enum", "enum payload")?
+                }
+                _ => {
+                    ret Result::Err(PluginError { 7_u32, "enum discriminant" })
+                }
+            }
+            require(output.fraction == - 1.25_f64 && output.small == 0.5_f32, "floating point DTO")?
+        }
+        if env("PLUGIN_BENCHMARK").unwrap_or("") == "1" {
+            let started = Instant::now()
+            unsafe {
+                plugin.reload(env("DTO_PLUGIN").unwrap_or(""))?
+            }
+            let elapsed = started.elapsed().as_nanos().unwrap_or(0_u64)
+            println("{\"case\":\"sdk-stateless-reload\",\"total_ns\":" + Debug::fmt(elapsed) + "}")
+        }
+        echo.ping()?
+        require(marker.marker()? == 42_u64, "bindings survive benchmark reload")?
+    }
+    plugin.close()?
+    if env("PLUGIN_BENCHMARK").unwrap_or("") == "1" {
+        let peak = unsafe {
+            encore_plugin_benchmark_peak_rss()
+        }
+        if peak > 0_u64 {
+            println("{\"case\":\"sdk-memory\",\"peak_rss_bytes\":" + Debug::fmt(peak) + "}")
+        }
+    }
+    require(saved == "provider static", "copied static string survives library unload")?
+    println("generic interface, DTOs, 4 KiB and 1 MiB buffers passed")
+    ret Result::Ok(())
+}
+fn main() -> i32 {
+    match exercise() {
+        Ok(_) => {
+            ret 0_i32
+        }
+        Err(error) => {
+            eprintln(error.message) ret 1_i32
+        }
+    }
+}

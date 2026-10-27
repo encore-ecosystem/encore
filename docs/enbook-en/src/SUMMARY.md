@@ -31,6 +31,7 @@
   - [Methods and Receivers](features/methods.md)
   - [Enums and Pattern Matching](features/enums-and-match.md)
   - [Traits and Dynamic Dispatch](features/traits-and-dyn.md)
+  - [Native Plugins](features/native-plugins.md)
   - [Conditional Control Flow](features/conditionals.md)
   - [Loops, Ranges, and Labels](features/loops-and-ranges.md)
   - [Context Managers](features/context-managers.md)

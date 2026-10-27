@@ -15,6 +15,7 @@ import argparse::{process_arg, process_arg_count}
 
 import mod::failure::ProjectFailure
 import mod::manifest::{ProjectManifest, project_manifest_dependencies, project_manifest_feature_dependencies, project_manifest_name, project_manifest_resolve_features, read_project_manifest, try_project_manifest_resolve_features, try_read_project_manifest}
+import mod::plugin_codegen::{PluginSourceModule, plugin_adapter_sources}
 import mod::registry::{dependency_base_reference, dependency_requested_features, registry_package_checksum, resolve_cached_index_dependency, resolve_index_dependency, valid_dependency_name}
 import refrain::frontend::{AnalysisDatabase, DependencyEdge, DependencyGraph, Documentation, FrontendDiagnostic, FrontendDocument, Lexer, ModuleId, Parser, ProjectConstants, Statement, Token, qualified_source_paths}
 import refrain::frontend::safety::FunctionSafety
@@ -572,6 +573,24 @@ fn try_build_modules_for_refrain(workspace: mut ProjectWorkspace, refrain: Works
         }
     }
     try_visit_module(workspace, refrain, entrypoint, visited_paths, result)?
+    // Generated adapters depend on the SDK even when user code only imports
+    // its contract package. Source-only check/emit paths must load it too.
+    if refrain.manifest.plugin_exports.len() != 0 {
+        match find_refrain_by_name(workspace, "platform") {
+            Some(sdk) => {
+                try_visit_module(workspace, sdk, sdk.root.join("src/plugin/mod.enq"), visited_paths, result)?
+            }
+            None => {
+                unsafe {
+                    encore_strset_free(visited_paths)
+                }
+                ret Result[Vec[WorkspaceModule], ProjectFailure]::Err(ProjectFailure {
+                        "plugin-sdk", "native plugins require the platform::plugin SDK dependency (provided by std)"
+                    }
+                )
+            }
+        }
+    }
     // Encore modules are addressable by their file path without an explicit
     // `mod` declaration in lib.enq. A downstream import may reach a module
     // the entrypoint never re-exports (platform::io::checked is one example).
@@ -581,6 +600,56 @@ fn try_build_modules_for_refrain(workspace: mut ProjectWorkspace, refrain: Works
     }
     unsafe {
         encore_strset_free(visited_paths)
+    }
+    let mut plugin_modules = Vec[PluginSourceModule]::new()
+    if refrain.manifest.plugin_exports.len() != 0 {
+        for module in result {
+            plugin_modules.push(PluginSourceModule {
+                    module.owner_name, module.module_id, module.ast, module.resolved_imports
+                }
+            )
+        }
+    }
+    let suffixes = plugin_adapter_sources(plugin_modules, refrain.manifest)?
+    if suffixes.len() != 0 {
+        let mut generated = Vec[WorkspaceModule]::new()
+        for module in result {
+            let mut source = module.source
+            for suffix in suffixes {
+                if suffix.0 == module.module_id {
+                    source += suffix.1
+                }
+            }
+            if source == module.source {
+                generated.push(module) continue
+            }
+            let name = module.analysis_id.key()
+            workspace.analysis.set_module_full(name, module.module_path.as_str(), source)
+            let document = workspace.analysis.document(name).unwrap_or(FrontendDocument::empty())
+            let mut resolved = Vec[str]::new() resolved.extend(module.resolved_imports)
+            if !contains_string(resolved, "platform@plugin/mod.enq") {
+                resolved.push("platform@plugin/mod.enq")
+            }
+            for path in qualified_source_paths(document.tokens) {
+                match resolve_import_module(workspace, refrain, module.module_path, path) {
+                    Some(target) => {
+                        let id = workspace_module_id(target.owner, target.module_path)
+                        if !contains_string(resolved, id) {
+                            resolved.push(id)
+                        }
+                    }
+                    None => {
+                    }
+                }
+            }
+            generated.push(WorkspaceModule {
+                    module.owner_name, module.owner_root, module.module_id,
+                    module.analysis_id, module.module_path, source, document, document.ast,
+                    document.module_documentation, module.imports, resolved, document.diagnostics, module.enabled_features
+                }
+            )
+        }
+        ret Result::Ok(generated)
     }
     ret Result[Vec[WorkspaceModule], ProjectFailure]::Ok(result)
 }
@@ -715,7 +784,7 @@ fn workspace_module_id(owner: WorkspaceRefrain, module_path: Path) -> str {
     let source_root = owner.root.resolve().join("src").as_str()
     let full = module_path.resolve().as_str()
     let relative = if full.len() > source_root.len() {
-        full.slice(source_root.len() + 1_usize, full.len() - source_root.len() - 1_usize)
+        full.slice_bytes(source_root.byte_len() + 1_usize, full.byte_len() - source_root.byte_len() - 1_usize)
     } else {
         "lib.enq"
     }
@@ -728,7 +797,7 @@ fn workspace_analysis_module_name(owner: WorkspaceRefrain, module_path: Path) ->
     let source_root = owner.root.resolve().join("src").as_str()
     let full = module_path.resolve().as_str()
     let relative = if full.len() > source_root.len() {
-        full.slice(source_root.len() + 1_usize, full.len() - source_root.len() - 1_usize)
+        full.slice_bytes(source_root.byte_len() + 1_usize, full.byte_len() - source_root.byte_len() - 1_usize)
     } else {
         "lib.enq"
     }

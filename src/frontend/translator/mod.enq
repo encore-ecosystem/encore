@@ -27,6 +27,7 @@ import refrain::frontend::parser::statements::{ArrayLiteralExpr, ArrayRepeatExpr
 import refrain::frontend::reflection::{ReflectionShape, calls_reflection_templates, expand_reflection_function, function_uses_reflection, mark_reflection_templates, reflection_template_names, specialize_reflection_function}
 import refrain::target::{TargetSpec, cfg_active_with_features, host_target}
 
+extern fn encore_text_sha256(value: str) -> str
 extern fn encore_strset_new() -> usize
 extern fn encore_strset_insert(set: usize, value: str) -> bool
 extern fn encore_strset_contains(set: usize, value: str) -> bool
@@ -452,6 +453,7 @@ struct TranslationSourceModule {
 }
 
 struct TraitType {
+    plugin_interface: bool
     name: str
     generics: Vec[GenericParam]
     bases: Vec[str]
@@ -498,6 +500,7 @@ struct EnumVariantType {
     owner: str
     payload_type: str
     generics: Vec[str]
+    payload_arity: usize
 }
 
 struct LoopTargetType {
@@ -598,6 +601,7 @@ struct TranslatorContext {
     reflection_shapes: Vec[ReflectionShapeCache]
     imports: TranslationImportCache
     async_functions: Vec[usize]
+    current_module: str
 }
 
 struct ReflectionShapeCache {
@@ -648,7 +652,7 @@ pub fn filter_ast_for_target(ast: Vec[Statement], target: TargetSpec, features: 
                 }
                 out.push(Statement::Trait(TraitStmt {
                             item.is_public, item.name, item.documentation, item.generics, item.bases,
-                            methods, item.source_name, item.line, item.column
+                            methods, item.source_name, item.line, item.column, item.attrs
                         }
                         ,
                     ))
@@ -708,7 +712,7 @@ pub fn translate_modules_to_ehir(modules: Vec[TranslationModule], target: Target
     let mut builder = EhirTextBuilder::new()
     for module in modules {
         ctx.features = module.features
-        let body = translate_ast_with_context(ctx, module.ast, target, module.features).finish()
+        let body = translate_ast_with_context(ctx, module.ast, target, module.features, module.module_id).finish()
         builder = builder.append_str(qualify_module_type_collisions(ctx, module, body))
     }
     let text = builder.finish()
@@ -1042,7 +1046,7 @@ fn translate_module_chunk(ctx: mut TranslatorContext, module: TranslationModule,
     if module.imports.len() > 0_usize {
         builder = builder.empty_line()
     }
-    let body = translate_ast_with_context(ctx, module.ast, target, module.features).finish()
+    let body = translate_ast_with_context(ctx, module.ast, target, module.features, module.module_id).finish()
     builder = builder.append_str(qualify_module_type_collisions(ctx, module, body))
     builder = builder.line("}")
     builder = builder.empty_line()
@@ -1441,7 +1445,7 @@ pub fn validate_ast_for_target(ast: Vec[Statement], target: TargetSpec) ->() {
 fn translate_ast_to_ehir(ast: Vec[Statement], modules: Vec[TranslationModule], target: TargetSpec, features:
     Vec[str],) -> str {
     let mut ctx = collect_context(ast, modules, target, features)
-    let text = translate_ast_with_context(ctx, ast, target, features).finish()
+    let text = translate_ast_with_context(ctx, ast, target, features, "").finish()
     free_translation_indexes(ctx)
     ret text
 }
@@ -1468,7 +1472,8 @@ fn free_translation_indexes(ctx: TranslatorContext) ->() {
 }
 
 fn translate_ast_with_context(ctx: mut TranslatorContext, ast: Vec[Statement], target: TargetSpec, features:
-    Vec[str],) -> EhirTextBuilder {
+    Vec[str], module_id: str,) -> EhirTextBuilder {
+    ctx.current_module = module_id
     reset_generated_closure_declarations(ctx)
     let mut builder = EhirTextBuilder::new()
     for statement in ast {
@@ -1489,7 +1494,7 @@ fn translate_ast_with_context(ctx: mut TranslatorContext, ast: Vec[Statement], t
                 let _ignored = imp_item
             }
             Statement::Struct(struct_item) => {
-                builder = builder.append(translate_struct(struct_item))
+                builder = builder.append(translate_struct(struct_item, module_id))
             }
             Statement::EnumItem(enum_item) => {
                 builder = builder.append(translate_enum(enum_item))
@@ -1695,7 +1700,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
             }
             , Vec[str]::new(), Vec[Option[FunctionType]]::new()
         }
-        , Vec[usize]::new()
+        , Vec[usize]::new(), ""
     }
     // Struct/enum syntax nodes intentionally carry no source path. In a
     // resolved workspace, collect them through their owning module so two
@@ -1759,7 +1764,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                 }
                 remember_type(ctx, trait_owner)
                 remember_trait(ctx, trait_owner, resolved_generic_bounds(ctx, trait_item.source_name, trait_item.generics), bases, trait_item.methods,
-                    trait_item.source_name, trait_item.line, trait_item.column,)
+                    trait_item.source_name, trait_item.line, trait_item.column, contains_str(trait_item.attrs, "plugin_interface"),)
                 let trait_generics = generic_param_names(trait_item.generics)
                 for method in trait_item.methods {
                     let mut method_generics = copy_str_vec(trait_generics)
@@ -2140,7 +2145,7 @@ fn exported_function_binding(ctx: mut TranslatorContext, module: TranslationModu
                     let function = ctx.functions.get(encoded - 1_usize)
                     match function {
                         Some(value) => {
-                            if value.name == name && value.source_name == module.source_name {
+                            if value.name == name && module_identity_for_source(ctx, value.source_name) == module.module_id {
                                 ret Option[FunctionType]::Some(value)
                             }
                         }
@@ -2323,7 +2328,8 @@ fn collect_enum_declaration(ctx: mut TranslatorContext, item: EnumStmt, source_n
         }
         let previous = aggregate_member_head(ctx, owner, true)
         ctx.enum_variants.push(EnumVariantType {
-                owner + "::" + variant.name, owner, payload_type, generic_param_names(item.generics)
+                owner + "::" + variant.name, owner, payload_type, generic_param_names(item.generics),
+                variant.tuple_fields.len() + variant.named_fields.len()
             }
             ,)
         index_aggregate_member(ctx, owner, true, ctx.enum_variants.len(), previous)
@@ -2353,29 +2359,34 @@ fn remember_type(ctx: mut TranslatorContext, name: str) ->() {
 // metadata, so a consumer can simultaneously hold values returned by two
 // modules that both define (for example) `Output`.
 fn qualified_type_for_source(ctx: mut TranslatorContext, source_name: str, typ: str) -> str {
+    let normalized = if contains_substring(typ, "::") {
+        resolved_plugin_type_paths(ctx, source_name, typ)
+    } else {
+        typ
+    }
     // Do not materialize a module (and its AST ownership graph) for primitive
     // and non-colliding types. This also keeps generic constructor lookup cheap.
     let mut collision_candidate = false
     for name in ctx.type_collisions {
-        if contains_substring(typ, name) {
+        if contains_substring(normalized, name) {
             collision_candidate = true
             break
         }
     }
     if !collision_candidate {
-        ret canonical_type(typ)
+        ret canonical_type(normalized)
     }
     let encoded = lookup_module_source_alias(ctx.module_index, source_name)
     if encoded == 0_usize {
-        ret canonical_type(typ)
+        ret canonical_type(normalized)
     }
     let current = match ctx.modules.get(encoded - 1_usize) {
         Some(module) => module
         None => {
-            ret canonical_type(typ)
+            ret canonical_type(normalized)
         }
     }
-    let mut out = canonical_type(typ)
+    let mut out = canonical_type(normalized)
     for name in ctx.type_collisions {
         if contains_str(generic_param_names(ctx.active_generics), name) {
             continue
@@ -2412,14 +2423,14 @@ fn qualified_generic_type(ctx: mut TranslatorContext, source: str, typ: str, nam
 }
 
 fn remember_trait(ctx: mut TranslatorContext, name: str, generics: Vec[GenericParam], bases: Vec[str],
-    methods: Vec[FunctionItem], source_name: str, line: usize, column: usize,) ->() {
+    methods: Vec[FunctionItem], source_name: str, line: usize, column: usize, plugin_interface: bool,) ->() {
     for known in ctx.traits {
         if known.name == name && known.source_name == source_name {
             ret()
         }
     }
     ctx.traits.push(TraitType {
-            name, generics, bases, methods, source_name, line, column
+            plugin_interface, name, generics, bases, methods, source_name, line, column
         }
         ,
     )
@@ -2881,7 +2892,7 @@ fn ctx_add_function(ctx: mut TranslatorContext, source_name: str, name: str, ret
         name + "__overload_" + Debug::fmt(overload_index)
     }
     let is_member = last_scope_index(name) < name.len()
-    let emitted_name = if is_extern || name == "main" || is_member {
+    let emitted_name = if is_extern || name == "main" || name == "encore_plugin_entry_v1" || is_member {
         local_name
     } else {
         module_symbol_prefix(ctx, source_name) + local_name
@@ -3099,7 +3110,7 @@ fn ctx_next_emitted_name(ctx: mut TranslatorContext, source_name: str, raw_name:
         name + "__overload_" + Debug::fmt(overload_index)
     }
     let is_member = last_scope_index(name) < name.len()
-    ret if name == "main" || is_member {
+    ret if name == "main" || name == "encore_plugin_entry_v1" || is_member {
         local_name
     } else {
         module_symbol_prefix(ctx, source_name) + local_name
@@ -3674,7 +3685,7 @@ fn thread_type_is_transferable_region_inner(ctx: mut TranslatorContext, typ: str
         ret true
     }
     let owner = base_type_name(raw)
-    if owner == "Vec" {
+    if owner == "Vec" || starts_with(owner, "__tuple_") || starts_with(owner, "__array_") {
         for generic in generic_args_from_path(raw) {
             if !thread_type_is_transferable_region_inner(ctx, generic, seen) {
                 ret false
@@ -4025,6 +4036,9 @@ fn function_type_matches(template: str, actual: str, generics: Vec[str]) -> bool
     let expected = trim_spaces(canonical_type(value_type_name(template)))
     let found = trim_spaces(canonical_type(value_type_name(actual)))
     if expected == found {
+        ret true
+    }
+    if (expected == "()" || expected == "void") &&(found == "()" || found == "void") {
         ret true
     }
     // Match the EHIR type contract: bool and u1 are the same one-bit value.
@@ -5148,6 +5162,15 @@ fn replace_type_token(value: str, token: str, replacement: str) -> str {
     ret out
 }
 
+// Trait signatures encode Self as the owning trait. Explicit dyn owners remain
+// interface types, including inside nested generic arguments.
+fn substitute_trait_self(value: str, owner: str, target: str) -> str {
+    let preserved = "__encore_preserved_dyn_trait__"
+    let protected = replace_type_token(value, "dyn " + owner, preserved)
+    let specialized = replace_type_token(protected, owner, target)
+    ret replace_type_token(specialized, preserved, "dyn " + owner)
+}
+
 fn is_type_name_char(value: u8) -> bool {
     if value >= 48_u8 && value <= 57_u8 {
         ret true
@@ -5978,7 +6001,7 @@ fn last_scope_index(value: str) -> usize {
     ret value.len()
 }
 
-fn translate_struct(item: StructStmt) -> EhirTextBuilder {
+fn translate_struct(item: StructStmt, module_id: str) -> EhirTextBuilder {
     let mut builder = EhirTextBuilder::new()
     builder = append_ehir_documentation(builder, item.documentation, "///")
     let mut header = "struct " + item.name
@@ -5986,6 +6009,10 @@ fn translate_struct(item: StructStmt) -> EhirTextBuilder {
         header = header + "[" + translate_generic_params(item.generics) + "]"
     }
     builder = builder.line(header + " {")
+    if module_id == "platform@plugin/mod.enq" && item.name == "__EncorePluginLease" {
+        builder = builder.line("  // @retain encore_plugin_handle_retain")
+        builder = builder.line("  // @release encore_plugin_handle_release")
+    }
     if item.is_tuple {
         let mut i = 0_usize
         for field_t in item.tuple_fields {
@@ -6905,7 +6932,12 @@ fn specialize_reflection_call(ctx: mut TranslatorContext, source_name: str, defi
             continue
         }
         let key = module_identity_for_source(ctx, template.item.source_name) + "\n" + name + "\n" +
-        Debug::fmt(template.item.line) + ":" + Debug::fmt(template.item.column) + "\n" + join_strs(arguments, "\n")
+        Debug::fmt(template.item.line) + ":" + Debug::fmt(template.item.column) + "\n" + join_strs(arguments, "\n") +
+        if function_has_attr(template.item, "plugin_resource_constructor") {
+            "\n" + ctx.current_module
+        } else {
+            ""
+        }
         let emitted = "__encore_reflect_" + compiler_content_digest(key)
         for existing in ctx.reflection_specializations {
             if existing.name == emitted {
@@ -7660,7 +7692,7 @@ fn validate_trait_method_types(expected: FunctionType, actual_params: Vec[str], 
             Some(raw_expected) => {
                 match actual_params.get(index) {
                     Some(actual) => {
-                        let specialized = replace_type_token(specialize_named_type(raw_expected, expected.generics,
+                        let specialized = substitute_trait_self(specialize_named_type(raw_expected, expected.generics,
                                 specialization_args,), contract_owner, canonical_type(target))
                         if canonical_type(specialized) != canonical_type(actual) {
                             translation_error_at(method.source_name, method.line, method.column, "trait-method-signature-mismatch",
@@ -7678,7 +7710,7 @@ fn validate_trait_method_types(expected: FunctionType, actual_params: Vec[str], 
         }
         index = index + 1_usize
     }
-    let expected_ret = replace_type_token(specialize_named_type(expected.output_type, expected.generics,
+    let expected_ret = substitute_trait_self(specialize_named_type(expected.output_type, expected.generics,
             specialization_args,), contract_owner, canonical_type(target))
     if canonical_type(expected_ret) != canonical_type(actual_ret) {
         translation_error_at(method.source_name, method.line, method.column, "trait-method-signature-mismatch",
@@ -10243,9 +10275,25 @@ fn lower_decorator_target_call(ctx: mut TranslatorContext, call: CallExpr, sourc
         spawning,)
 }
 
+fn plugin_sdk_call(ctx: mut TranslatorContext, source: str, name: str, arity: usize) -> bool {
+    let mut arguments = Vec[str]::new()
+    let mut index = 0_usize
+    while index < arity {
+        arguments.push("usize") index += 1_usize
+    }
+    match ctx_lookup_function_for_args(ctx, source, name, arguments) {
+        Some(function) => {
+            ret module_identity_for_source(ctx, function.source_name) == "platform@plugin/mod.enq"
+        }
+        None => {
+            ret false
+        }
+    }
+}
+
 fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name: str, line: usize, column:
     usize, prefix: str, idx: usize, spawning: bool,) -> LoweredExpr {
-    let mut callee = expr_h_path_or_empty(call.callee)
+    let mut callee = self_context_type(ctx, expr_h_path_or_empty(call.callee))
     let builtin_range = callee == "core::iter::range" || callee == "core::iter::range_inclusive"
     if builtin_range && call.args.len() != 2_usize {
         translation_error_at(source_name, line, column, "argument-mismatch",
@@ -10259,9 +10307,89 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
     }
     callee = qualified_callable_name(ctx, source_name, callee)
     let callee_base = base_type_name(callee)
+    if last_type_path_segment(callee_base) == "__function_address" && call.args.len() == 1 &&
+    plugin_sdk_call(ctx, source_name, callee, 1_usize) {
+        for helper in ctx.functions {
+            if helper.name == "__function_address" && module_identity_for_source(ctx, helper.source_name) == "platform@plugin/mod.enq" {
+                let argument = call.args.get(0).unwrap_or(ExprNode {
+                        Expr::Path(""), line, column, 0, source_name
+                    }
+                )
+                let target = expr_path_or_empty(argument)
+                for function in ctx.functions {
+                    if function.name == target && function.source_name == source_name && function.generics.len() == 0 {
+                        let mut signature = Vec[str]::new()
+                        signature.push(function.ret_type)
+                        for parameter in function.params {
+                            signature.push(parameter)
+                        }
+                        let out = prefix + "_native_function_" + Debug::fmt(idx)
+                        ret LoweredExpr {
+                            EhirTextBuilder::new().instr(out + ": usize = call __ehir_function_address__" +
+                                function.emitted_name + "[" + join_strs(signature, ", ") + "]()"), out, "usize"
+                        }
+                    }
+                }
+                translation_error_at(source_name, line, column, "plugin-adapter-address", "native adapter address requires a concrete function in this module")
+            }
+        }
+    }
     let mut generic_args = call.generics
     if generic_args.len() == 0_usize {
         generic_args = generic_args_from_path(callee)
+    }
+    if last_type_path_segment(callee_base) == "__interface_fingerprint" && generic_args.len() == 1_usize {
+        match ctx_lookup_function_for_args(ctx, source_name, callee, Vec[str]::new()) {
+            Some(function) => {
+                if module_identity_for_source(ctx, function.source_name) == "platform@plugin/mod.enq" {
+                    let interface = generic_args.get(0).unwrap_or("")
+                    let fingerprint = plugin_interface_fingerprint(ctx, interface, source_name)
+                    let name = prefix + "_plugin_contract_" + Debug::fmt(idx)
+                    ret LoweredExpr {
+                        EhirTextBuilder::new().instr(name + ": str = capprim \"" + fingerprint + "\"_str"), name, "str"
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
+    if last_type_path_segment(callee_base) == "__validate_implementation" &&
+    plugin_sdk_call(ctx, source_name, callee, 0_usize) {
+        if generic_args.len() != 2 || call.args.len() != 0 {
+            translation_error_at(source_name, line, column, "plugin-implementation", "implementation validation requires an interface and concrete type")
+        }
+        let interface = plugin_interface_type(ctx, generic_args.get(0).unwrap_or(""), source_name)
+        let value = qualified_type_for_source(ctx, source_name, generic_args.get(1).unwrap_or(""))
+        if !plugin_resource_implements(ctx, interface, value) {
+            translation_error_at(source_name, line, column, "plugin-implementation", "type '" + value + "' does not implement '" + interface + "'")
+        }
+        ret LoweredExpr { EhirTextBuilder::new(), "()", "void" }
+    }
+    if last_type_path_segment(callee_base) == "__resource_create" &&
+    plugin_sdk_call(ctx, source_name, callee, 1_usize) {
+        for helper in ctx.functions {
+            if helper.name == "__resource_create" && module_identity_for_source(ctx, helper.source_name) == "platform@plugin/mod.enq" {
+                if generic_args.len() != 2 || call.args.len() != 1 {
+                    translation_error_at(source_name, line, column, "plugin-resource-constructor", "invalid resource constructor specialization")
+                }
+                let interface = generic_args.get(0).unwrap_or("")
+                let value = qualified_type_for_source(ctx, source_name, generic_args.get(1).unwrap_or(""))
+                let key = plugin_interface_fingerprint(ctx, interface, source_name) + "|" + value
+                let init = plugin_resource_adapters(ctx, interface, value, source_name, key)
+                let argument = call.args.get(0).unwrap_or(ExprNode {
+                        Expr::Path(""), line, column, 0, source_name
+                    }
+                )
+                let payload = lower_expr(ctx, argument, prefix + "_resource_payload", idx)
+                let key_value = prefix + "_resource_key" let pointer = prefix + "_resource_initializer" let output = prefix + "_resource"
+                let mut code = payload.code.instr(key_value + ": str = capprim \"" + escape_str(key) + "\"_str")
+                code = code.instr(pointer + ": usize = call __ehir_function_address__" + init + "[usize,usize]()")
+                code = code.instr(output + ": usize = call encore_plugin_native_resource_registered(" + payload.value + "," + key_value + "," + pointer + ")")
+                code = code.instr("drop " + key_value + ": str")
+                ret LoweredExpr { code, output, "usize" }
+            }
+        }
     }
     let has_explicit_generic_args = generic_args.len() > 0_usize
     let constructor_owner = enum_constructor_owner(ctx, source_name, callee)
@@ -10482,6 +10610,23 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         }
     }
 
+    // Associated calls can specify their owner's arguments while leaving the
+    // method's own type parameters to inference: Wrapper[T]::new(value).
+    if call.generics.is_empty() && !generic_args.is_empty() &&
+    find_char(function_owner_name(callee), "[", 0_usize) < function_owner_name(callee).len() {
+        match direct_function {
+            Some(function) => {
+                if generic_args.len() < function.generics.len() {
+                    let inferred = infer_function_generic_args_with_prefix(function, arg_types, generic_args)
+                    if !inferred.is_empty() {
+                        generic_args = inferred
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
     if generic_args.len() == 0_usize {
         match direct_function {
             Option[FunctionType]::Some(function) => {
@@ -11089,9 +11234,13 @@ fn infer_call_generic_args(ctx: mut TranslatorContext, name: str, actual_types: 
 }
 
 fn infer_function_generic_args(function: FunctionType, actual_types: Vec[str]) -> Vec[str] {
+    ret infer_function_generic_args_with_prefix(function, actual_types, Vec[str]::new())
+}
+
+fn infer_function_generic_args_with_prefix(function: FunctionType, actual_types: Vec[str], prefix: Vec[str]) -> Vec[str] {
     let mut inferred = Vec[str]::new()
     for generic in function.generics {
-        let mut found = ""
+        let mut found = prefix.get(inferred.len()).unwrap_or("")
         let mut index = 0_usize
         while index < function.params.len() && index < actual_types.len() {
             match function.params.get(index) {
@@ -11387,6 +11536,7 @@ fn lower_struct_init_expr(ctx: mut TranslatorContext, init_expr: StructInitExpr,
     let out_name = prefix + "_struct_" + Debug::fmt(idx)
     let struct_type = qualified_type_for_source(ctx, source_name,
         self_context_type(ctx, canonical_type(init_expr.path)),)
+    validate_plugin_handle_access(ctx, struct_type, source_name, 0_usize, 0_usize)
     let mut code = EhirTextBuilder::new()
     let mut values = Vec[str]::new()
     let mut i = 0_usize
@@ -11583,6 +11733,23 @@ fn lower_array_repeat_expr(ctx: mut TranslatorContext, repeat_expr: ArrayRepeatE
     }
 }
 
+fn validate_plugin_handle_access(ctx: mut TranslatorContext, typ: str, source: str, line: usize, column: usize) ->() {
+    let owner = base_type_name(canonical_type(typ))
+    if !ends_with(owner, "Plugin") && !ends_with(owner, "Binding") &&
+    !ends_with(owner, "Resource") && !ends_with(owner, "__EncorePluginLease") {
+        ret()
+    }
+    let sdk = plugin_sdk_source(ctx)
+    if sdk == "" || module_identity_for_source(ctx, source) == "platform@plugin/mod.enq" {
+        ret()
+    }
+    for handle in vec!["Plugin", "Binding", "Resource", "__EncorePluginLease"] {
+        if owner == qualified_type_for_source(ctx, sdk, handle) {
+            translation_error_at(source, line, column, "plugin-opaque-handle", "plugin handle storage is opaque outside its SDK")
+        }
+    }
+}
+
 fn lower_field_expr(ctx: mut TranslatorContext, field_expr: FieldExpr, source_name: str, line: usize,
     column: usize, prefix: str, idx: usize,) -> LoweredExpr {
     let base_path = expr_h_path_or_empty(field_expr.base)
@@ -11606,6 +11773,7 @@ fn lower_field_expr(ctx: mut TranslatorContext, field_expr: FieldExpr, source_na
     } else {
         lower_expr_h(ctx, field_expr.base, prefix + "_field_base", idx + 1_usize)
     }
+    validate_plugin_handle_access(ctx, base.typ, source_name, line, column)
     let base_is_frozen = ctx_path_is_frozen(ctx, base_path) || ctx_value_is_frozen(ctx, base.value)
     let mut field_type = "void"
     match ctx_lookup_field(ctx, base.typ, field_expr.field) {
@@ -11727,6 +11895,9 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         ret LoweredExpr {
             code, out_name, "bool"
         }
+    }
+    if plugin_proxy_type(ctx, receiver.typ) {
+        ret lower_plugin_method(ctx, method_call, receiver, source_name, line, column, prefix, idx)
     }
     let borrowed_receiver = expr_h_is_borrowed_copy(method_call.receiver)
     let mut owner = method_owner_name(value_type_name(receiver.typ))
@@ -12179,7 +12350,7 @@ fn generic_bound_method_return(ctx: mut TranslatorContext, owner: str, method: s
                 let trait_name = base_type_name(bound.path)
                 match trait_method_contract(ctx, trait_name, method) {
                     Some(function) => {
-                        let mut specialized = replace_type_token(function.ret_type, trait_name, owner)
+                        let mut specialized = substitute_trait_self(function.ret_type, trait_name, owner)
                         match lookup_trait(ctx, trait_name) {
                             Some(contract) => {
                                 specialized = specialize_named_type(specialized, generic_param_names(contract.generics),
@@ -12209,7 +12380,7 @@ fn generic_bound_method_param(ctx: mut TranslatorContext, owner: str, method: st
                     Some(function) => {
                         match function.params.get(index) {
                             Some(param) => {
-                                let mut specialized = replace_type_token(param, trait_name, owner)
+                                let mut specialized = substitute_trait_self(param, trait_name, owner)
                                 match lookup_trait(ctx, trait_name) {
                                     Some(contract) => {
                                         specialized = specialize_named_type(specialized, generic_param_names(contract.generics),
@@ -12492,6 +12663,7 @@ fn lower_mutable_field_place(ctx: mut TranslatorContext, field_expr: FieldExpr,
     source_name: str, line: usize, column: usize, prefix: str, idx: usize,) -> LoweredExpr {
     let base = lower_mutable_place_h(ctx, field_expr.base, prefix + "_base", idx + 1_usize)
     let owner_type = canonical_type(value_type_name(base.typ))
+    validate_plugin_handle_access(ctx, owner_type, source_name, line, column)
     let mut field_type = "void"
     match ctx_lookup_field(ctx, owner_type, field_expr.field) {
         Option[str]::Some(found) => {
@@ -12528,6 +12700,9 @@ fn lower_mutable_field_place(ctx: mut TranslatorContext, field_expr: FieldExpr,
 // to an owning handle (T<H>* would discard the handle's type constructor), so
 // spill its bits into scalar storage and transfer, rather than copy, that owner.
 fn branch_result_slot(builder: EhirTextBuilder, slot: str, typ: str) -> EhirTextBuilder {
+    if typ == "()" || typ == "void" {
+        ret builder
+    }
     let storage = if is_node_handle_type_text(typ) {
         "usize"
     } else {
@@ -12538,6 +12713,9 @@ fn branch_result_slot(builder: EhirTextBuilder, slot: str, typ: str) -> EhirText
 
 fn branch_result_store(ctx: mut TranslatorContext, builder: EhirTextBuilder,
     slot: str, typ: str, value: LoweredExpr, prefix: str,) -> EhirTextBuilder {
+    if typ == "()" || typ == "void" {
+        ret builder
+    }
     if is_node_handle_type_text(typ) {
         let bits = slot + "_from_" + prefix + "_result_bits"
         ret builder.instr(bits + ": usize = pcast " + value.value + ": " + value.typ + ", usize")
@@ -12551,6 +12729,9 @@ fn branch_result_store(ctx: mut TranslatorContext, builder: EhirTextBuilder,
 }
 
 fn branch_result_load(builder: EhirTextBuilder, slot: str, name: str, typ: str) -> EhirTextBuilder {
+    if typ == "()" || typ == "void" {
+        ret builder
+    }
     if is_node_handle_type_text(typ) {
         let bits = name + "_bits"
         ret builder.instr(bits + ": usize = load " + slot)
@@ -12565,7 +12746,12 @@ fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, source_na
     let cond = lower_expr_h(ctx, match_expr.expr, prefix + "_match_expr", idx)
     let result_name = prefix + "_match_result_" + Debug::fmt(idx)
     let result_slot = result_name + "_slot"
-    let result_type = infer_match_expr_result_type(ctx, match_expr, cond.typ, source_name, line, column)
+    let inferred_type = infer_match_expr_result_type(ctx, match_expr, cond.typ, source_name, line, column)
+    let result_type = if inferred_type == "void" {
+        "()"
+    } else {
+        inferred_type
+    }
     let end_label = prefix + "_match_expr_end_" + Debug::fmt(idx)
     let mut builder = cond.code
     if cond_borrowed && ctx_type_needs_ownership(ctx, cond.typ) {
@@ -12624,7 +12810,12 @@ fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, source_na
     builder = builder.label(end_label)
     builder = branch_result_load(builder, result_slot, result_name, result_type)
     ret LoweredExpr {
-        builder, result_name, result_type
+        builder, if result_type == "()" {
+            "void"
+        } else {
+            result_name
+        }
+        , result_type
     }
 }
 
@@ -12633,7 +12824,12 @@ fn lower_if_expr(ctx: mut TranslatorContext, if_expr: IfExpr, prefix: str, idx: 
     let result_name = prefix + "_if_result_" + Debug::fmt(idx)
     let result_slot = result_name + "_slot"
     let end_label = prefix + "_if_expr_end_" + Debug::fmt(idx)
-    let result_type = infer_if_expr_result_type(ctx, if_expr)
+    let inferred_type = infer_if_expr_result_type(ctx, if_expr)
+    let result_type = if inferred_type == "void" {
+        "()"
+    } else {
+        inferred_type
+    }
     let mut builder = EhirTextBuilder::new()
     if result_type != "!" {
         builder = branch_result_slot(builder, result_slot, result_type)
@@ -12702,7 +12898,12 @@ fn lower_if_expr(ctx: mut TranslatorContext, if_expr: IfExpr, prefix: str, idx: 
     builder = builder.label(end_label)
     builder = branch_result_load(builder, result_slot, result_name, result_type)
     ret LoweredExpr {
-        builder, result_name, result_type
+        builder, if result_type == "()" {
+            "void"
+        } else {
+            result_name
+        }
+        , result_type
     }
 }
 
@@ -12813,13 +13014,11 @@ fn lower_block_expr(ctx: mut TranslatorContext, block_expr: BlockExpr, prefix: s
                 prefix + "_block_tail", idx + 1_usize,)
             builder = builder.append(tail.code)
             ret finish_expression_scope(ctx, bindings, LoweredExpr { builder, tail.value, tail.typ },
-                expr_h_is_borrowed_copy(tail_expr), prefix + "_block_scope",)
+                expr_h_is_borrowed_copy(tail_expr), prefix + "_block_scope_" + Debug::fmt(idx),)
         }
         Option[ExprNode<H>]::None => {
-            finish_translation_scope(ctx, bindings)
-            ret LoweredExpr {
-                builder, "", "!"
-            }
+            ret finish_expression_scope(ctx, bindings, LoweredExpr { builder, "void", "()" },
+                false, prefix + "_block_scope_" + Debug::fmt(idx),)
         }
     }
 }
@@ -14126,7 +14325,7 @@ fn canonical_type(typ: str) -> str {
     }
     let open = find_char(typ, "[", 0_usize)
     if open < typ.len() && ends_with(typ, "]") {
-        let owner = typ.slice(0_usize, open)
+        let owner = trim_spaces(typ.slice(0_usize, open))
         let inner = typ.slice(open + 1_usize, typ.len() - open - 2_usize)
         ret owner + "[" + canonical_type_list(inner) + "]"
     }
@@ -14160,7 +14359,10 @@ fn canonical_type_list(value: str) -> str {
         index = index + 1_usize
     }
     if start < value.len() {
-        parts.push(canonical_type(trim_spaces(value.slice(start, value.len() - start))))
+        let last = trim_spaces(value.slice(start, value.len() - start))
+        if last != "" {
+            parts.push(canonical_type(last))
+        }
     }
     ret join_strs(parts, ", ")
 }
@@ -15118,4 +15320,479 @@ fn reject_runtime_reflection(ctx: mut TranslatorContext, name: str, source_name:
                 "this reflection operation needs compile-time metadata; use core::reflect::type_info[T]() or a typed reflection helper",)
         }
     }
+}
+
+// Native proxies use a separate stable ABI, leaving ordinary dyn dispatch intact.
+fn plugin_sdk_source(ctx: mut TranslatorContext) -> str {
+    for module in ctx.modules {
+        if module.module_id == "platform@plugin/mod.enq" {
+            ret module.source_name
+        }
+    }
+    ret ""
+}
+fn plugin_proxy_type(ctx: mut TranslatorContext, typ: str) -> bool {
+    let source = plugin_sdk_source(ctx)
+    if source == "" {
+        ret false
+    }
+    let owner = base_type_name(capability_value_type(typ))
+    ret owner == qualified_type_for_source(ctx, source, "Binding") || owner == qualified_type_for_source(ctx, source, "Resource")
+}
+fn plugin_interface_type(ctx: mut TranslatorContext, typ: str, source: str) -> str {
+    let concrete = canonical_type(typ)
+    if !starts_with(concrete, "dyn ") {
+        ret ""
+    }
+    let inner = concrete.slice(4, concrete.len() - 4)
+    let identity = trait_identity_for_source(ctx, source, base_type_name(inner))
+    let mut args = Vec[str]::new()
+    for argument in generic_args_from_path(inner) {
+        args.push(qualified_type_for_source(ctx, source, argument))
+    }
+    ret identity + if args.len() == 0 {
+        ""
+    } else {
+        "[" + join_strs(args, ", ") + "]"
+    }
+}
+fn plugin_interface_schema(ctx: mut TranslatorContext, typ: str, source: str, seen: Vec[str]) -> str {
+    let interface = plugin_interface_type(ctx, typ, source)
+    for item in ctx.traits {
+        if base_type_name(interface) != item.name {
+            continue
+        }
+        if !item.plugin_interface {
+            translation_error_at(source, 0, 0, "plugin-interface", "native bindings require #attr(plugin_interface)")
+        }
+        if contains_str(seen, interface) {
+            ret "ref(" + interface + ")"
+        }
+        let mut visited = copy_str_vec(seen) visited.push(interface)
+        let arguments = generic_args_from_path(interface)
+        if arguments.len() != item.generics.len() {
+            translation_error_at(source, 0, 0, "plugin-interface", "plugin interface type arguments must be concrete")
+        }
+        let mut schema = "interface(" + module_identity_for_source(ctx, item.source_name) + "::" + interface + "){"
+        if item.bases.len() != 0 {
+            translation_error_at(source, 0, 0, "plugin-interface", "plugin v1 interfaces cannot have base traits")
+        }
+        for method in item.methods {
+            if method.is_async || method.generics.len() != 0 || method.params.len() == 0 {
+                translation_error_at(source, method.line, method.column, "plugin-interface", "plugin methods must be synchronous, non-generic instance methods")
+            }
+            if method.returns_sending || method.returns_frozen {
+                translation_error_at(source, method.line, method.column, "plugin-interface", "plugin methods use owned DTO values without sending/frozen capabilities")
+            }
+            schema += method.name + "("
+            let mut index = 0_usize
+            for parameter in method.params {
+                if parameter.is_sending || parameter.is_frozen {
+                    translation_error_at(source, method.line, method.column, "plugin-interface", "plugin methods use owned DTO values without sending/frozen capabilities")
+                }
+                if index > 0 {
+                    let t = specialize_named_type(parameter.typ.unwrap_or(""), generic_param_names(item.generics), arguments)
+                    schema += plugin_data_schema(ctx, t, item.source_name, visited) + ";"
+                } else {
+                    if parameter.name != "self" {
+                        translation_error_at(source, method.line, method.column, "plugin-interface", "plugin methods require self as their first parameter")
+                    }
+                    schema += parameter.typ.unwrap_or("Self") + ";"
+                }
+                index += 1
+            }
+            let output = specialize_named_type(function_ret_type(method), generic_param_names(item.generics), arguments)
+            schema += ")->" + plugin_data_schema(ctx, output, item.source_name, visited) + ";"
+        }
+        ret schema + "}"
+    }
+    translation_error_at(source, 0, 0, "plugin-interface", "expected a marked plugin interface, got '" + typ + "' (resolved '" + interface + "')")
+    ret ""
+}
+fn plugin_data_schema(ctx: mut TranslatorContext, typ: str, source: str, seen: Vec[str]) -> str {
+    if seen.len() > 128 {
+        translation_error_at(source, 0, 0, "plugin-contract-depth", "plugin schema is too deeply nested")
+    }
+    let concrete = qualified_type_for_source(ctx, source, typ)
+    match concrete {
+        "()" => {
+            ret "unit"
+        }
+        "void" => {
+            ret "unit"
+        }
+        "bool" => {
+            ret concrete
+        }
+        "u8" => {
+            ret concrete
+        }
+        "u16" => {
+            ret concrete
+        }
+        "u32" => {
+            ret concrete
+        }
+        "u64" => {
+            ret concrete
+        }
+        "i8" => {
+            ret concrete
+        }
+        "i16" => {
+            ret concrete
+        }
+        "i32" => {
+            ret concrete
+        }
+        "i64" => {
+            ret concrete
+        }
+        "usize" => {
+            ret concrete
+        }
+        "isize" => {
+            ret concrete
+        }
+        "f32" => {
+            ret concrete
+        }
+        "f64" => {
+            ret concrete
+        }
+        "str" => {
+            ret concrete
+        }
+        _ => {
+        }
+    }
+    if starts_with(concrete, "dyn ") || contains_substring(concrete, "*") || contains_substring(concrete, "<") || contains_substring(concrete, "&") || starts_with(concrete, "mut ") || starts_with(concrete, "frozen ") {
+        translation_error_at(source, 0, 0, "plugin-data-type", "plugin values cannot contain pointers, nodes, capabilities or unwrapped dyn objects")
+    }
+    let owner = base_type_name(concrete)
+    let sdk = plugin_sdk_source(ctx)
+    let args = generic_args_from_path(concrete)
+    if sdk != "" && owner == qualified_type_for_source(ctx, sdk, "Resource") && args.len() == 1 {
+        ret "resource(" + plugin_interface_schema(ctx, args.get(0).unwrap_or(""), source, seen) + ")"
+    }
+    if sdk != "" {
+        for handle in vec!["Plugin", "Binding", "__EncorePluginLease"] {
+            if owner == qualified_type_for_source(ctx, sdk, handle) {
+                translation_error_at(source, 0, 0, "plugin-data-type", "plugin module handles cannot cross the data boundary; use Resource[dyn Interface]")
+            }
+        }
+    }
+    if contains_str(seen, concrete) {
+        ret "ref(" + concrete + ")"
+    }
+    let mut visited = copy_str_vec(seen) visited.push(concrete)
+    if owner == "Vec" || starts_with(owner, "__tuple_") || starts_with(owner, "__array_") {
+        let mut schema = owner + "["
+        for argument in args {
+            schema += plugin_data_schema(ctx, argument, source, visited) + ";"
+        }
+        ret schema + "]"
+    }
+    let mut schema = concrete + "{"
+    let mut found = false
+    for field in ctx.fields {
+        if field.owner == owner {
+            found = true
+            let t = specialize_named_type(field.typ, field.generic_names, args)
+            schema += field.field + ":" + plugin_data_schema(ctx, t, source, visited) + ";"
+        }
+    }
+    for variant in ctx.enum_variants {
+        if variant.owner == owner {
+            if variant.payload_arity > 1_usize {
+                translation_error_at(source, 0, 0, "plugin-data-type", "plugin enum variants accept one DTO payload; group multiple fields into a struct or tuple")
+            }
+            found = true
+            let t = specialize_named_type(variant.payload_type, variant.generics, args)
+            schema += variant.path + ":" + plugin_data_schema(ctx, t, source, visited) + ";"
+        }
+    }
+    if !found && !contains_str(ctx.types, owner) {
+        translation_error_at(source, 0, 0, "plugin-data-type", "unsupported or non-concrete plugin type: " + concrete)
+    }
+    ret schema + "}"
+}
+fn plugin_interface_fingerprint(ctx: mut TranslatorContext, typ: str, source: str) -> str {
+    let schema = "encore-plugin-abi-v1;" + plugin_interface_schema(ctx, typ, source, Vec[str]::new())
+    unsafe {
+        ret encore_text_sha256(schema)
+    }
+}
+fn lower_plugin_method(ctx: mut TranslatorContext, call: MethodCallExpr, receiver: LoweredExpr,
+    source: str, line: usize, column: usize, prefix: str, idx: usize,) -> LoweredExpr {
+    let interface = first_generic_type(capability_value_type(receiver.typ))
+    let _fingerprint = plugin_interface_fingerprint(ctx, interface, source)
+    let target = plugin_interface_type(ctx, interface, source)
+    let name = base_type_name(target)
+    for item in ctx.traits {
+        if item.name != name {
+            continue
+        }
+        let mut method_index = 0_usize
+        for method in item.methods {
+            if method.name != call.method {
+                method_index += 1 continue
+            }
+            if call.args.len() + 1 != method.params.len() || call.generics.len() != 0 {
+                translation_error_at(source, line, column, "plugin-call-arity", "plugin method arguments do not match its interface")
+            }
+            let mut code = receiver.code
+            let receiver_type = capability_value_type(receiver.typ)
+            let receiver_value = prefix + "_plugin_receiver"
+            if starts_with(receiver.typ, "mut ") {
+                code = code.instr(receiver_value + ": " + receiver_type + " = load " + receiver.value)
+            } else {
+                code = code.instr(receiver_value + ": " + receiver_type + " = alias " + receiver.value)
+            }
+            let borrowed = expr_h_is_borrowed_copy(call.receiver) || starts_with(receiver.typ, "mut ")
+            if borrowed {
+                code = code.instr("retain " + receiver_value + ": " + receiver_type)
+            }
+            let mut owners = Vec[CallOwner]::new()
+            track_call_owner(ctx, owners, receiver_value, receiver_type, true, prefix)
+            let sdk = plugin_sdk_source(ctx)
+            let lease_type = qualified_type_for_source(ctx, sdk, "__EncorePluginLease")
+            let lease = prefix + "_plugin_lease" let token = prefix + "_plugin_token"
+            code = code.instr(lease + ": " + lease_type + " = getfield " + receiver_value + " > 0")
+            code = code.instr(token + ": usize = getfield " + lease + " > 0")
+            let mut hints = Vec[str]::new()
+            let generics = generic_args_from_path(target)
+            let mut index = 0_usize
+            for param in method.params {
+                if index > 0 {
+                    hints.push(qualified_type_for_source(ctx, item.source_name,
+                            specialize_named_type(param.typ.unwrap_or(""), generic_param_names(item.generics), generics),))
+                }
+                index += 1
+            }
+            let saved_hint = ctx.expression_hint
+            ctx.expression_hint = "__tuple_" + Debug::fmt(hints.len()) + "[" + join_strs(hints, ", ") + "]"
+            let tuple = lower_tuple_literal_expr(ctx, TupleLiteralExpr { call.args }, prefix + "_plugin_args", idx)
+            ctx.expression_hint = saved_hint
+            if tuple.typ == "!" {
+                abandon_call_owners(ctx, owners) ret LoweredExpr {
+                    code.append(tuple.code), "", "!"
+                }
+            }
+            code = code.append(tuple.code)
+            let declared_output = qualified_type_for_source(ctx, item.source_name,
+                specialize_named_type(function_ret_type(method), generic_param_names(item.generics), generics),)
+            let output = if declared_output == "void" {
+                "()"
+            } else {
+                declared_output
+            }
+            let mut arguments = Vec[str]::new() arguments.push(tuple.typ) arguments.push(output)
+            let emitted = specialize_reflection_call(ctx, source, sdk, "__invoke", arguments)
+            if emitted == "" {
+                translation_error_at(source, line, column, "plugin-sdk", "plugin SDK invocation template is unavailable")
+            }
+            let method_value = prefix + "_plugin_method"
+            code = code.instr(method_value + ": usize = lcpos " + Debug::fmt(method_index) + "_usize")
+            let out = prefix + "_plugin_result"
+            let result = "Result[" + output + ", " + qualified_type_for_source(ctx, sdk, "PluginError") + "]"
+            let tuple_argument = if tuple.typ == "()" || tuple.typ == "void" {
+                "void: ()"
+            } else {
+                tuple.value
+            }
+            code = code.instr(out + ": " + result + " = call " + emitted + "(" + token + ", " + method_value + ", " + tuple_argument + ")")
+            code = finish_call_owners(ctx, code, owners, prefix, false)
+            ret LoweredExpr { code, out, result }
+        }
+    }
+    translation_error_at(source, line, column, "plugin-method", "method is not declared by the plugin interface")
+    ret LoweredExpr { receiver.code, "", "!" }
+}
+
+// Fully qualified type paths are declaration names, not prefixes to retain
+// when replacing a colliding leaf type with its module-owned ABI identity.
+fn resolved_plugin_type_paths(ctx: mut TranslatorContext, source: str, typ: str) -> str {
+    let mut out = "" let mut index = 0_usize
+    while index < typ.byte_len() {
+        let byte = typ.byte_at(index)
+        let identifier =(byte >= 65_u8 && byte <= 90_u8) ||(byte >= 97_u8 && byte <= 122_u8) || byte == 95_u8
+        if !identifier {
+            out += typ.slice_bytes(index, 1) index += 1 continue
+        }
+        let start = index
+        while index < typ.byte_len() {
+            let next = typ.byte_at(index)
+            if !((next >= 65_u8 && next <= 90_u8) ||(next >= 97_u8 && next <= 122_u8) ||(next >= 48_u8 && next <= 57_u8) || next == 95_u8 || next == 58_u8) {
+                break
+            }
+            index += 1
+        }
+        let word = typ.slice_bytes(start, index - start)
+        let scope = last_scope_index(word)
+        let mut resolved = word
+        if scope < word.byte_len() {
+            let namespace = imported_namespace_path(ctx, source, word.slice_bytes(0, scope))
+            let leaf = word.slice_bytes(scope + 2, word.byte_len() - scope - 2)
+            if starts_with(leaf, "__encore_t") {
+                resolved = leaf
+            } else {
+                for module in ctx.modules {
+                    if cached_module_import_path(ctx, module.module_id) == namespace {
+                        let identity = exported_type_identity(ctx, module, leaf, 0_usize)
+                        if identity != "" {
+                            resolved = identity break
+                        }
+                    }
+                }
+            }
+        }
+        out += resolved
+    }
+    ret out
+}
+
+#attr(test)
+fn plugin_interface_fingerprint_lowering_contract() -> bool {
+    let mut lexer = Lexer::new()
+    let mut api_parser = Parser::new_for_source("api.enq")
+    let api = api_parser.parse(lexer.tokenize("#attr(plugin_interface) pub trait Counter { fn value(self: Self) -> u64 }"))
+    let mut sdk_parser = Parser::new_for_source("sdk.enq")
+    let sdk = sdk_parser.parse(lexer.tokenize("pub fn __interface_fingerprint[Interface]() -> str { ret \"\" }"))
+    let mut host_parser = Parser::new_for_source("host.enq")
+    let host = host_parser.parse(lexer.tokenize("import api::Counter\nimport platform::plugin::__interface_fingerprint\nfn fingerprint() -> str { ret __interface_fingerprint[dyn api::Counter]() }"))
+    let mut modules = Vec[TranslationModule]::new()
+    modules.push(TranslationModule::new("api@lib.enq", "api.enq", Vec[str]::new(), api, Vec[str]::new()))
+    modules.push(TranslationModule::new("platform@plugin/mod.enq", "sdk.enq", Vec[str]::new(), sdk, Vec[str]::new()))
+    modules.push(TranslationModule::new("host@lib.enq", "host.enq", vec!["api@lib.enq", "platform@plugin/mod.enq"], host, Vec[str]::new()))
+    let text = translate_modules_to_ehir_bundle(modules, host_target(), "host@lib.enq")
+    let bundle = parse_module_bundle_text("host@lib.enq", text)
+    ret bundle.modules.len() == 3 && text.contains(": str = capprim \"")
+}
+
+fn plugin_resource_implements(ctx: mut TranslatorContext, interface: str, value: str) -> bool {
+    let arguments = generic_args_from_path(interface)
+    for implementation in ctx.trait_impls {
+        if implementation.trait_name != base_type_name(interface) || !trait_impl_target_matches(ctx, implementation, value) {
+            continue
+        }
+        let names = generic_param_names(implementation.generics)
+        let mut values = Vec[str]::new()
+        for name in names {
+            values.push(infer_generic_from_types(implementation.target, value, name))
+        }
+        if implementation.trait_args.len() != arguments.len() {
+            continue
+        }
+        let mut index = 0_usize let mut matches = true
+        for argument in implementation.trait_args {
+            if canonical_type(specialize_named_type(argument, names, values)) != canonical_type(arguments.get(index).unwrap_or("")) {
+                matches = false
+            }
+            index += 1
+        }
+        if matches {
+            ret true
+        }
+    }
+    ret false
+}
+fn plugin_queue_adapter(ctx: mut TranslatorContext, name: str, source: str, diagnostic_source: str) ->() {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source(diagnostic_source)
+    let ast = parser.parse(lexer.tokenize(source))
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => {
+                ctx.reflection_specializations.push(ReflectionSpecialization {
+                        name, item
+                    }
+                ) ret()
+            }
+            _ => {
+            }
+        }
+    }
+    translation_invariant_error("resource adapter did not produce a function")
+}
+fn plugin_resource_adapters(ctx: mut TranslatorContext, requested: str, value: str, source: str, key: str) -> str {
+    let interface = plugin_interface_type(ctx, requested, source)
+    if !plugin_resource_implements(ctx, interface, value) {
+        translation_error_at(source, 0, 0, "plugin-resource-implementation", "resource type '" + value + "' does not implement '" + requested + "'")
+    }
+    let fingerprint = plugin_interface_fingerprint(ctx, requested, source)
+    let name = "__encore_plugin_resource_" + compiler_content_digest(ctx.current_module + "|" + key)
+    for existing in ctx.reflection_specializations {
+        if existing.name == name + "_drop" {
+            ret name + "_init"
+        }
+    }
+    let diagnostic_source = "encore-plugin-adapter:" + name
+    let drop_source = "fn adapter(payload:usize) { unsafe { platform::plugin::__payload_drop[" + value + "](payload) } }"
+    plugin_queue_adapter(ctx, name + "_drop", drop_source, diagnostic_source)
+    let arguments = generic_args_from_path(interface)
+    for trait_item in ctx.traits {
+        if trait_item.name != base_type_name(interface) {
+            continue
+        }
+        let mut init = "extern fn encore_plugin_descriptor_resource(token:usize,key:str,name:str,fingerprint:str,count:usize,drop:usize) -> usize\n" +
+        "extern fn encore_plugin_descriptor_resource_method(token:usize,index:usize,name:str,fingerprint:str,function:usize) -> bool\n" +
+        "extern fn encore_plugin_descriptor_resource_ready(token:usize) -> bool\n" +
+        "extern fn encore_plugin_generated_error(destination:usize,code:u32,message:str) -> u32\n" +
+        "fn " + name + "_init(descriptor:usize) -> usize {\n$entry:\n" +
+        "key:str = capprim \"" + escape_str(key) + "\"_str\n" +
+        "contract:str = capprim \"" + fingerprint + "\"_str\n" +
+        "count:usize = capprim " + Debug::fmt(trait_item.methods.len()) + "_usize\n" +
+        "destructor:usize = call __ehir_function_address__" + name + "_drop[void,usize]()\n" +
+        "resource:usize = call encore_plugin_descriptor_resource(descriptor,key,contract,contract,count,destructor)\n" +
+        "drop key:str\nzero:usize = capprim 0_usize\nallocated:bool = neq resource:usize,zero:usize\ncbr allocated,$method_0,$failed\n"
+        let mut index = 0_usize
+        for method in trait_item.methods {
+            let mut types = Vec[str]::new() let mut values = Vec[str]::new() let mut position = 0_usize
+            for param in method.params {
+                if position > 0 {
+                    types.push(qualified_type_for_source(ctx, trait_item.source_name,
+                            specialize_named_type(param.typ.unwrap_or(""), generic_param_names(trait_item.generics), arguments),))
+                    values.push("arguments." + Debug::fmt(position - 1))
+                }
+                position += 1
+            }
+            let tuple = if types.len() == 0 {
+                "()"
+            } else {
+                "__tuple_" + Debug::fmt(types.len()) + "[" + join_strs(types, ",") + "]"
+            }
+            let adapter = "fn adapter(payload:usize,args:usize,count:usize,arena:usize,output:usize,error:usize) -> u32 { unsafe {\n" +
+            "match platform::plugin::__decode_arguments[" + tuple + "](args,count,arena) {\n" +
+            "Ok(arguments) => { " +
+            (if ends_with(value, "<H>") {
+                    "unsafe ehir { cell: usize* = pcast payload:usize, usize*\nnode: usize = load cell:usize*\n" +
+                    "instance: mut " + value.slice_bytes(0, value.byte_len() - 3) + " = pcast node:usize, mut " + value.slice_bytes(0, value.byte_len() - 3) + " }\n"
+                } else {
+                    "unsafe ehir { instance: mut " + value + " = pcast payload:usize, mut " + value + " }\n"
+                }
+            ) +
+            (if function_ret_type(method) == "void" {
+                    "instance." + method.name + "(" + join_strs(values, ",") + ") ret platform::plugin::__encode_output((),arena,output,error) }\n"
+                } else {
+                    "let result = instance." + method.name + "(" + join_strs(values, ",") + ") ret platform::plugin::__encode_output(result,arena,output,error) }\n"
+                }
+            ) +
+            "Err(detail) => { ret encore_plugin_generated_error(error,detail.code,detail.message) } } } }"
+            plugin_queue_adapter(ctx, name + "_method_" + Debug::fmt(index), adapter, diagnostic_source)
+            let suffix = Debug::fmt(index)
+            init += "$method_" + suffix + ":\nmethod_" + suffix + ":str = capprim \"" + escape_str(method.name) + "\"_str\n" +
+            "pointer_" + suffix + ":usize = call __ehir_function_address__" + name + "_method_" + suffix + "[u32,usize,usize,usize,usize,usize,usize]()\n" +
+            "index_" + suffix + ":usize = capprim " + suffix + "_usize\n" +
+            "registered_" + suffix + ":bool = call encore_plugin_descriptor_resource_method(resource,index_" + suffix + ",method_" + suffix + ",contract,pointer_" + suffix + ")\n" +
+            "drop method_" + suffix + ":str\ncbr registered_" + suffix + ",$method_" + Debug::fmt(index + 1) + ",$failed\n"
+            index += 1
+        }
+        init += "$method_" + Debug::fmt(index) + ":\nready:bool = call encore_plugin_descriptor_resource_ready(resource)\ncbr ready,$done,$failed\n" +
+        "$done:\ndrop contract:str\nret resource:usize\n$failed:\ndrop contract:str\nret zero:usize\n}\n"
+        ctx.extern_functions.push("__encore_generated_reflection_bridge__" + init)
+        ret name + "_init"
+    }
+    translation_invariant_error("resource interface disappeared after validation")
+    ret ""
 }

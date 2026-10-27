@@ -3553,21 +3553,9 @@ impl for AnalysisDatabase {
 
     fn collect_semantic_fields(self: mut Self, module_name: str) -> Vec[SemanticField] {
         let mut out = Vec[SemanticField]::new()
-        let mut owners = self.visible_semantic_modules(module_name)
-        let direct = self.visible_semantic_modules(module_name)
-        for visible in direct {
-            for definition in self.module_exports(visible) {
-                match definition.namespace() {
-                    DefinitionNamespace::Type => {
-                        if !contains_string(owners, definition.module_name()) {
-                            owners.push(definition.module_name())
-                        }
-                    }
-                    _ => {
-                    }
-                }
-            }
-        }
+        // Public signatures can expose fields of privately imported types.
+        // Keep declaration identities while following the reachable module graph.
+        let owners = self.reachable_semantic_modules(module_name)
         for visible in owners {
             let document = match self.stored_full_document(visible) {
                 Option[FrontendDocument]::Some(value) => value
@@ -3702,6 +3690,30 @@ impl for AnalysisDatabase {
                             }
                             out.push(SemanticMethod::new(visible, trait_receiver_type(item.name, item.generics), method.name, params,
                                     semantic_call_return_type(method),).with_generics(declaration_generic_names(item.generics)).with_method_generics(declaration_generic_names(method.generics)).with_static(is_static))
+                            if !is_static && contains_string(item.attrs, "plugin_interface") {
+                                let mut error_type = ""
+                                for binding in names {
+                                    if binding.scope == "platform::plugin" && binding.name == "PluginError" {
+                                        error_type = binding.identity
+                                    }
+                                }
+                                if error_type != "" {
+                                    let binders = declaration_generic_names(item.generics)
+                                    let interface = scope_type(trait_receiver_type(item.name, item.generics), visible, names_in_scope(names, visible), binders)
+                                    let result = scope_type(semantic_call_return_type(method), visible, names_in_scope(names, visible), binders)
+                                    for binding in names {
+                                        if binding.scope == "platform::plugin" &&(binding.name == "Binding" || binding.name == "Resource") {
+                                            let proxy = SemanticMethod::new(visible, binding.identity + "[" + interface + "]", method.name,
+                                                params, "Result[" + result + "," + error_type + "]",).with_generics(binders)
+                                            out.push(SemanticMethod {
+                                                    proxy.module_name, proxy.receiver_type, proxy.name, proxy.params,
+                                                    proxy.ret_type, proxy.signature, item.name, proxy.generic_names, false, true, Vec[str]::new()
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     _ => {
@@ -3766,7 +3778,7 @@ impl for AnalysisDatabase {
         for source in self.sources {
             let mut targets = Vec[str]::new()
             for edge in source.lightweight.dependencies.all() {
-                targets.push(edge.target)
+                targets.extend(import_paths::expanded_import_paths(edge.target))
             }
             targets.extend(qualified_source_paths(source.lightweight.tokens))
             let mut aggregates = Vec[str]::new()

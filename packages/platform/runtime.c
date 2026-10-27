@@ -81,6 +81,7 @@ extern char *encore_str_data(encore_str value);
 extern size_t encore_str_size(encore_str value);
 extern char *encore_to_cstr(encore_str value);
 #include "checked_io.h"
+#include "plugin_sdk.h"
 typedef struct {
 #ifdef _WIN32
     CRITICAL_SECTION lock;
