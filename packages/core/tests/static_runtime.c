@@ -36,6 +36,19 @@ enum { READERS = 24 };
 static atomic_uint arrived;
 static atomic_uint initializations;
 static unsigned payload;
+static unsigned dropped;
+static void release_static(size_t value) {
+    /* Dependencies publish before their owners; owners must drop first. */
+    assert(value == 2u - dropped);
+    ++dropped;
+}
+static uintptr_t release_address(void) {
+    void (*function)(size_t) = release_static;
+    uintptr_t address;
+    memcpy(&address, &function, sizeof(address));
+    return address;
+}
+
 
 static TEST_RESULT reader(void *unused) {
     (void)unused;
@@ -96,6 +109,18 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < READERS; ++i) readers[i] = test_start(reader, NULL);
     for (unsigned i = 0; i < READERS; ++i) test_join(readers[i]);
     assert(atomic_load(&initializations) == 1);
+    key = encore_from_cstr_copy("owned-dependency");
+    void *dependency = encore_static_cell_get(key); encore_str_drop(key);
+    assert(encore_static_begin(dependency));
+    encore_static_publish_owned(dependency, 1, release_address());
+    key = encore_from_cstr_copy("owned-parent");
+    void *parent = encore_static_cell_get(key); encore_str_drop(key);
+    assert(encore_static_begin(parent));
+    encore_static_publish_owned(parent, 2, release_address());
+    encore_static_shutdown();
+    assert(dropped == 2 && encore_static_cells == NULL && encore_static_created == NULL && encore_static_published == NULL);
+    encore_static_shutdown();
+    assert(dropped == 2);
     puts("static runtime passed");
     return 0;
 }

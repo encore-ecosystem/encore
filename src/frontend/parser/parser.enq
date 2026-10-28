@@ -693,7 +693,8 @@ impl for Parser {
         let curr_token = self.peek_curr()
         if (attrs.len() > 0_usize || decorators.len() > 0_usize) && curr_token.type != TokenType::KW_FN
         && curr_token.type != TokenType::KW_ASYNC
-        && curr_token.type != TokenType::KW_EXTERN && curr_token.type != TokenType::KW_STATIC {
+        && curr_token.type != TokenType::KW_EXTERN && curr_token.type != TokenType::KW_STATIC
+        && curr_token.type != TokenType::KW_TRAIT {
             self.unexpected_token("function after attributes or decorators", curr_token)?
         }
         match curr_token.type {
@@ -707,7 +708,7 @@ impl for Parser {
                 ret Result[Statement, ParseFailure]::Ok(self.parse_struct(is_public, documentation)?)
             }
             TokenType::KW_TRAIT => {
-                ret Result[Statement, ParseFailure]::Ok(self.parse_trait(is_public, documentation)?)
+                ret Result[Statement, ParseFailure]::Ok(self.parse_trait(is_public, documentation, attrs)?)
             }
             TokenType::KW_IMPL => {
                 self.record_source_layout(item_start, SourceLayoutRole::ImplStart)
@@ -867,8 +868,11 @@ impl for Parser {
             ))
     }
 
-    fn parse_trait(mut self, is_public: bool, documentation: Option[Documentation]) -> Result[Statement, ParseFailure] {
+    fn parse_trait(mut self, is_public: bool, documentation: Option[Documentation], attrs: Vec[str]) -> Result[Statement, ParseFailure] {
         let declaration_token = self.peek_curr()
+        if attrs.len() > 1 ||(attrs.len() == 1 && attrs.get(0).unwrap_or("") != "plugin_interface") {
+            self.error_at("Only #attr(plugin_interface) is supported on a trait", declaration_token)?
+        }
         self.safe_consume(TokenType::KW_TRAIT)?
         let name = self.safe_consume_value(TokenType::IDENTIFIER)?
         let generics = self.parse_possible_generic_params()?
@@ -890,13 +894,29 @@ impl for Parser {
                 Option[Documentation]::Some(_) => {
                 }
             }
-            methods.push(self.parse_function_signature(false, attrs, decorators, method_documentation, true)?)
+            let method = self.parse_function_signature(false, attrs, decorators, method_documentation, true)?
+            methods.push(method)
         }
         self.safe_consume(TokenType::RIGHT_BRACE)?
+        if attrs.len() != 0 {
+            for method in methods {
+                if method.is_async || method.generics.len() != 0 {
+                    self.error_at("Plugin interface methods must be synchronous and non-generic", declaration_token)?
+                }
+                if method.returns_sending || method.returns_frozen {
+                    self.error_at("Plugin interface methods use owned DTO values; sending/frozen capabilities are unsupported", declaration_token)?
+                }
+                for parameter in method.params {
+                    if parameter.is_sending || parameter.is_frozen {
+                        self.error_at("Plugin interface methods use owned DTO values; sending/frozen capabilities are unsupported", declaration_token)?
+                    }
+                }
+            }
+        }
 
         ret Result[Statement, ParseFailure]::Ok(Statement::Trait(TraitStmt {
                     is_public, name, documentation, generics, bases, methods, self.source_name, declaration_token.line,
-                    declaration_token.column
+                    declaration_token.column, attrs
                 }
                 ,
             ))
@@ -2460,7 +2480,11 @@ impl for Parser {
         }
         let member_token = self.consume()
         let member = member_token.value
-        let member_generics = self.parse_possible_generics()?
+        let member_generics = if self.should_parse_bracketed_generics(true) {
+            self.parse_generics_args()?
+        } else {
+            Vec[str]::new()
+        }
 
         if self.peek_curr_type() == TokenType::LEFT_PAREN {
             let args = self.parse_call_args()?
@@ -3056,7 +3080,7 @@ impl for Parser {
             ret Result[str, ParseFailure]::Ok(out)
         }
 
-        let name = self.safe_consume_value(TokenType::IDENTIFIER)?
+        let name = self.parse_bound_path()?
         let generics = self.parse_possible_generics()?
         let mut out = name
         if generics.len() > 0_usize {
@@ -3231,6 +3255,10 @@ impl for Parser {
     }
 
     fn should_parse_expression_path_generics(mut self) -> bool {
+        ret self.should_parse_bracketed_generics(false)
+    }
+
+    fn should_parse_bracketed_generics(mut self, method_call: bool) -> bool {
         if self.peek_curr_type() != TokenType::LEFT_BRACKET {
             ret false
         }
@@ -3248,6 +3276,9 @@ impl for Parser {
                 depth = depth - 1_usize
                 if depth == 0_usize {
                     let after = self.peek_nth_type(index + 1_usize)
+                    if method_call {
+                        ret after == TokenType::LEFT_PAREN
+                    }
                     ret after == TokenType::SCOPE
                     || after == TokenType::LEFT_PAREN
                     || after == TokenType::LEFT_BRACE
@@ -3438,4 +3469,69 @@ fn decode_field_attribute(raw: str) -> str {
     ret unsafe {
         encore_unescape_string_literal(raw.slice_bytes(1, raw.byte_len() - 2))
     }
+}
+
+#attr(test)
+fn plugin_interface_attribute_parser_contract() -> bool {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source("plugin-api.enq")
+    let report = parser.parse_recovering(lexer.tokenize("#attr(plugin_interface) pub trait Formatter { fn format(self: Self, text: str) -> str }"))
+    if report.failures.len() != 0 || report.statements.len() != 1 {
+        ret false
+    }
+    match report.statements.get(0) {
+        Some(statement) => {
+            match statement {
+                Statement::Trait(item) => {
+                    if item.attrs.len() != 1 || item.attrs.get(0).unwrap_or("") != "plugin_interface" {
+                        ret false
+                    }
+                }
+                _ => {
+                    ret false
+                }
+            }
+        }
+        _ => {
+            ret false
+        }
+    }
+    for source in vec!["#attr(other) trait Bad {}", "#attr(plugin_interface) trait Bad { fn run[T](self: Self, x: T) -> T }"] {
+        let mut lexer = Lexer::new()
+        let mut parser = Parser::new_for_source("invalid-plugin-api.enq")
+        if parser.parse_recovering(lexer.tokenize(source)).failures.len() == 0 {
+            ret false
+        }
+    }
+    ret true
+}
+
+#attr(test)
+fn plugin_qualified_type_parser_contract() -> bool {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source("qualified.enq")
+    let source = "fn sample(value: platform::plugin::Resource[dyn api::Counter]) -> api::Report { loop {} }"
+    let report = parser.parse_recovering(lexer.tokenize(source))
+    if report.failures.len() != 0 || report.statements.len() != 1 {
+        ret false
+    }
+    match report.statements.get(0) {
+        Some(statement) => {
+            match statement {
+                Statement::Function(item) => {
+                    ret item.ret_type.unwrap_or("") == "api::Report" && item.params.get(0).unwrap_or(FunctionParam {
+                            "", Option[str]::None, false, false, 0, 0
+                        }
+                    ).typ.unwrap_or("") == "platform::plugin::Resource[dyn api::Counter]"
+                }
+                _ => {
+                    ret false
+                }
+            }
+        }
+        _ => {
+            ret false
+        }
+    }
+    ret false
 }

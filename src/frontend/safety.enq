@@ -7,7 +7,7 @@ import std::vec::Vec
 
 import refrain::frontend::analysis::analyze_named_module
 import refrain::frontend::parser::{Expr, ExprNode, FunctionItem, MatchArmBody, Statement}
-import refrain::frontend::semantic::{SemanticBody, SemanticCallable, SemanticField, SemanticMethod, check_function_body_with_types, semantic_associated_members, semantic_named_members}
+import refrain::frontend::semantic::{SemanticBody, SemanticCallable, SemanticField, SemanticMethod, check_function_body_with_types, semantic_associated_members, semantic_named_members, semantic_same_owner}
 import refrain::frontend::type_scope::scope_type
 
 extern fn encore_strmap_new() -> usize
@@ -412,6 +412,23 @@ fn without_type_arguments(name: str) -> str {
     }
     ret out
 }
+// Binding/Resource instance calls lower through the checked native proxy ABI.
+// Resolve the SDK declaration identity so user types with these names keep
+// their own safety effects. Loading/reloading a Plugin stays unsafe.
+fn plugin_proxy_receiver(ctx: SafetyContext, receiver: str) -> bool {
+    // Nominal identities are interned (@N); ordinary receivers need no scan.
+    if !receiver.contains("[dyn ") {
+        ret false
+    }
+    for binding in ctx.function.body.type_names {
+        if binding.scope == "platform::plugin" &&
+        (binding.name == "Binding" || binding.name == "Resource") &&
+        semantic_same_owner(receiver, binding.identity) {
+            ret true
+        }
+    }
+    ret false
+}
 fn declaration(ctx: mut SafetyContext, module_name: str, owner: str, name: str) -> CallableValue {
     let dependency =(module_name, owner, name)
     let mut recorded = false
@@ -545,8 +562,10 @@ fn protocol_call(ctx: mut SafetyContext, receiver: str, name: str) -> str {
     for member in members {
         if member.is_method {
             found = true
-            let value = declaration(ctx, member.declaration_module, member.declaration_owner, name)
-            ctx.executed = ctx.executed || value.unsafe_call
+            if !plugin_proxy_receiver(ctx, receiver) {
+                let value = declaration(ctx, member.declaration_module, member.declaration_owner, name)
+                ctx.executed = ctx.executed || value.unsafe_call
+            }
             result = member.typ
         }
     }
@@ -729,10 +748,13 @@ fn expression(ctx: mut SafetyContext, expr: Expr, line: usize, column: usize) ->
             let members = semantic_named_members(receiver, call.method, Vec[SemanticField]::new(), ctx.function.methods)
             let mut value = plain_value()
             let mut found = false
+            let checked_proxy = plugin_proxy_receiver(ctx, receiver)
             for member in members {
                 if member.is_method {
                     found = true
-                    value = join_value(value, declaration(ctx, member.declaration_module, member.declaration_owner, call.method))
+                    if !checked_proxy {
+                        value = join_value(value, declaration(ctx, member.declaration_module, member.declaration_owner, call.method))
+                    }
                 }
             }
             if !found {

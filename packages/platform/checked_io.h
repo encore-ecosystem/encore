@@ -60,7 +60,7 @@ uint64_t encore_file_open(encore_str path, bool writing) {
     if (memchr(encore_str_data(path), 0, length)) { encore_file_error = EINVAL; return 0; }
     char *name = encore_to_cstr(path);
     if (!name) { encore_file_error = ENOMEM; return 0; }
-    FILE *stream = fopen(name, writing ? "wb" : "rb");
+    FILE *stream = encore_path_fopen(name, writing ? "wb" : "rb");
     int error = errno;
     free(name);
     if (!stream) { encore_file_error = error; return 0; }

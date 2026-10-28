@@ -541,33 +541,33 @@ void encore_http_async_wait(size_t runtime, int32_t timeout) {
 
 int32_t encore_http_async_supported(void) { return 1; }
 #else
-size_t encore_http_async_runtime_new(size_t capacity) { return 0; }
+size_t encore_http_async_runtime_new(size_t capacity) { (void)capacity; return 0; }
 void encore_http_async_reactor_enter(void) {  }
-int32_t encore_http_async_runtime_stopping(size_t runtime) { return 0; }
-void encore_http_async_runtime_stop(size_t runtime) {  }
-void encore_http_async_runtime_destroy(size_t runtime) {  }
-size_t encore_http_async_submit(size_t runtime, encore_str host, int32_t port, int32_t tls, encore_str ca, encore_str wire, size_t token, size_t body_limit, size_t header_limit, size_t connect_ms, size_t total_ms) { return 0; }
-size_t encore_http_async_slot(size_t runtime, size_t slot) { return 0; }
-encore_str encore_http_async_wire(size_t request) { return encore_empty_str(); }
-int32_t encore_http_async_status(size_t request, size_t waker) { return 0; }
-encore_str encore_http_async_result(size_t request) { return encore_empty_str(); }
-encore_str encore_http_async_headers(size_t request) { return encore_empty_str(); }
-int32_t encore_http_async_http_status(size_t request) { return 0; }
-size_t encore_http_async_setting(size_t request, int32_t key) { return 0; }
-void encore_http_async_release(size_t request) {  }
-void encore_http_async_complete(size_t request, int32_t status, int32_t http_status, encore_str headers, encore_str result) {  }
-int32_t encore_http_async_cancelled(size_t request) { return 0; }
-void encore_http_async_detach(size_t runtime, size_t waker) {  }
-size_t encore_http_async_token_new(size_t runtime) { return 0; }
-void encore_http_async_token_cancel(size_t runtime, size_t token) {  }
-int32_t encore_http_async_dns_step(size_t request) { return 0; }
-int32_t encore_http_async_dns_timeout(size_t request) { return 0; }
-int32_t encore_http_async_connect_step(size_t request) { return 0; }
-int32_t encore_http_async_tls_step(size_t request) { return 0; }
-int32_t encore_http_async_write(size_t request, size_t offset) { return 0; }
-void encore_http_async_read_interest(size_t request) {  }
-encore_str encore_http_async_read(size_t request) { return encore_empty_str(); }
-int32_t encore_http_async_read_status(size_t request) { return 0; }
-void encore_http_async_wait(size_t runtime, int32_t timeout) {  }
+int32_t encore_http_async_runtime_stopping(size_t runtime) { (void)runtime; return 0; }
+void encore_http_async_runtime_stop(size_t runtime) { (void)runtime; }
+void encore_http_async_runtime_destroy(size_t runtime) { (void)runtime; }
+size_t encore_http_async_submit(size_t runtime, encore_str host, int32_t port, int32_t tls, encore_str ca, encore_str wire, size_t token, size_t body_limit, size_t header_limit, size_t connect_ms, size_t total_ms) { (void)runtime; (void)host; (void)port; (void)tls; (void)ca; (void)wire; (void)token; (void)body_limit; (void)header_limit; (void)connect_ms; (void)total_ms; return 0; }
+size_t encore_http_async_slot(size_t runtime, size_t slot) { (void)runtime; (void)slot; return 0; }
+encore_str encore_http_async_wire(size_t request) { (void)request; return encore_empty_str(); }
+int32_t encore_http_async_status(size_t request, size_t waker) { (void)request; (void)waker; return 0; }
+encore_str encore_http_async_result(size_t request) { (void)request; return encore_empty_str(); }
+encore_str encore_http_async_headers(size_t request) { (void)request; return encore_empty_str(); }
+int32_t encore_http_async_http_status(size_t request) { (void)request; return 0; }
+size_t encore_http_async_setting(size_t request, int32_t key) { (void)request; (void)key; return 0; }
+void encore_http_async_release(size_t request) { (void)request; }
+void encore_http_async_complete(size_t request, int32_t status, int32_t http_status, encore_str headers, encore_str result) { (void)request; (void)status; (void)http_status; (void)headers; (void)result; }
+int32_t encore_http_async_cancelled(size_t request) { (void)request; return 0; }
+void encore_http_async_detach(size_t runtime, size_t waker) { (void)runtime; (void)waker; }
+size_t encore_http_async_token_new(size_t runtime) { (void)runtime; return 0; }
+void encore_http_async_token_cancel(size_t runtime, size_t token) { (void)runtime; (void)token; }
+int32_t encore_http_async_dns_step(size_t request) { (void)request; return 0; }
+int32_t encore_http_async_dns_timeout(size_t request) { (void)request; return 0; }
+int32_t encore_http_async_connect_step(size_t request) { (void)request; return 0; }
+int32_t encore_http_async_tls_step(size_t request) { (void)request; return 0; }
+int32_t encore_http_async_write(size_t request, size_t offset) { (void)request; (void)offset; return 0; }
+void encore_http_async_read_interest(size_t request) { (void)request; }
+encore_str encore_http_async_read(size_t request) { (void)request; return encore_empty_str(); }
+int32_t encore_http_async_read_status(size_t request) { (void)request; return 0; }
+void encore_http_async_wait(size_t runtime, int32_t timeout) { (void)runtime; (void)timeout; }
 int32_t encore_http_async_supported(void) { return 0; }
 #endif

@@ -80,7 +80,9 @@ extern encore_str encore_from_cstr_copy(const char *value);
 extern char *encore_str_data(encore_str value);
 extern size_t encore_str_size(encore_str value);
 extern char *encore_to_cstr(encore_str value);
+#include "utf8_paths.h"
 #include "checked_io.h"
+#include "plugin_sdk.h"
 typedef struct {
 #ifdef _WIN32
     CRITICAL_SECTION lock;
@@ -1127,7 +1129,7 @@ static bool encore_windows_validate_certificate(CtxtHandle *context, const wchar
     HCERTSTORE store = NULL;
     PCCERT_CONTEXT root = NULL;
     if (ca_file[0] != '\0') {
-        FILE *file = fopen(ca_file, "rb");
+        FILE *file = encore_path_fopen(ca_file, "rb");
         if (file == NULL) { CertFreeCertificateContext(certificate); return false; }
         fseek(file, 0, SEEK_END); long file_size = ftell(file); rewind(file);
         char *encoded = file_size > 0 ? malloc((size_t)file_size + 1) : NULL;
@@ -1376,7 +1378,7 @@ static int32_t encore_proc_run_args_impl(encore_str program, size_t raw_args, si
     if (output_path == NULL) {
         result = encore_windows_run(argv, "", INVALID_HANDLE_VALUE);
     } else {
-        wchar_t *path = encore_process_utf16(output_path);
+        wchar_t *path = encore_windows_utf16(output_path);
         HANDLE output = path == NULL ? INVALID_HANDLE_VALUE : CreateFileW(path,
             GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1627,7 +1629,7 @@ static void encore_init_args_once(void) {
     return;
 #endif
 
-    FILE *file = fopen("/proc/self/cmdline", "rb");
+    FILE *file = encore_path_fopen("/proc/self/cmdline", "rb");
     if (file == NULL) {
         return;
     }
@@ -1734,6 +1736,17 @@ encore_str encore_os_argv(size_t index) {
 }
 
 encore_str encore_os_cwd(void) {
+#ifdef _WIN32
+    DWORD capacity = GetCurrentDirectoryW(0, NULL);
+    if (capacity == 0) return encore_empty_str();
+    wchar_t *wide = malloc((size_t)capacity * sizeof(*wide));
+    if (wide == NULL) return encore_empty_str();
+    DWORD length = GetCurrentDirectoryW(capacity, wide);
+    char *text = length > 0 && length < capacity ? encore_windows_utf8(wide) : NULL;
+    free(wide);
+    if (text == NULL) return encore_empty_str();
+    return encore_from_owned_buffer(text, strlen(text));
+#else
     size_t size = 256;
 
     for (;;) {
@@ -1743,11 +1756,7 @@ encore_str encore_os_cwd(void) {
         }
 
         char *cwd_result =
-#ifdef _WIN32
-            _getcwd(buffer, (int)size);
-#else
             getcwd(buffer, size);
-#endif
         if (cwd_result != NULL) {
             size_t len = strlen(buffer);
             return encore_from_owned_buffer(buffer, len);
@@ -1763,6 +1772,7 @@ encore_str encore_os_cwd(void) {
         }
         size *= 2;
     }
+#endif
 }
 
 encore_str encore_os_home_dir(void) {
@@ -1816,7 +1826,7 @@ bool encore_os_hasenv(encore_str name) {
     char *name_c = encore_to_cstr(name);
     if (name_c == NULL) return false;
 #ifdef _WIN32
-    wchar_t *name_w = encore_process_utf16(name_c);
+    wchar_t *name_w = encore_windows_utf16(name_c);
     free(name_c);
     if (name_w == NULL) return false;
     SetLastError(ERROR_SUCCESS);
@@ -1835,7 +1845,7 @@ encore_str encore_os_getenv(encore_str name) {
     char *name_c = encore_to_cstr(name);
     if (name_c == NULL) return encore_empty_str();
 #ifdef _WIN32
-    wchar_t *name_w = encore_process_utf16(name_c);
+    wchar_t *name_w = encore_windows_utf16(name_c);
     free(name_c);
     if (name_w == NULL) return encore_empty_str();
     DWORD capacity = GetEnvironmentVariableW(name_w, NULL, 0);
@@ -1871,7 +1881,7 @@ bool encore_os_setenv(encore_str name, encore_str value) {
     char *name_c = encore_to_cstr(name), *value_c = encore_to_cstr(value);
     if (name_c == NULL || value_c == NULL) { free(name_c); free(value_c); return false; }
 #ifdef _WIN32
-    wchar_t *name_w = encore_process_utf16(name_c), *value_w = encore_process_utf16(value_c);
+    wchar_t *name_w = encore_windows_utf16(name_c), *value_w = encore_windows_utf16(value_c);
     bool success = name_w != NULL && value_w != NULL;
     // Keep the CRT in sync for native libraries. The CRT removes empty values;
     // restore their presence in the OS environment used by env() and children.
@@ -1888,9 +1898,17 @@ bool encore_os_setenv(encore_str name, encore_str value) {
 encore_str encore_os_executable_path(void) {
     char executable[PATH_MAX];
 #ifdef _WIN32
-    DWORD written = GetModuleFileNameA(NULL, executable, (DWORD)sizeof(executable));
-    if (written == 0 || written >= sizeof(executable)) return encore_empty_str();
-    return encore_from_cstr_copy(executable);
+    (void)executable;
+    for (DWORD capacity = 256; capacity <= 32768; capacity *= 2) {
+        wchar_t *wide = malloc((size_t)capacity * sizeof(*wide));
+        if (wide == NULL) return encore_empty_str();
+        DWORD written = GetModuleFileNameW(NULL, wide, capacity);
+        char *text = written > 0 && written < capacity ? encore_windows_utf8(wide) : NULL;
+        free(wide);
+        if (text != NULL) return encore_from_owned_buffer(text, strlen(text));
+        if (written == 0) break;
+    }
+    return encore_empty_str();
 #elif defined(__APPLE__)
     uint32_t capacity = (uint32_t)sizeof(executable);
     if (_NSGetExecutablePath(executable, &capacity) != 0) return encore_empty_str();
@@ -1911,7 +1929,7 @@ encore_str encore_fs_read_file(encore_str path) {
         return encore_empty_str();
     }
 
-    FILE *file = fopen(path_c, "rb");
+    FILE *file = encore_path_fopen(path_c, "rb");
     free(path_c);
     if (file == NULL) {
         return encore_empty_str();
@@ -1945,7 +1963,7 @@ int32_t encore_fs_write_file(encore_str path, encore_str contents) {
         return -1;
     }
 
-    FILE *file = fopen(path_c, "wb");
+    FILE *file = encore_path_fopen(path_c, "wb");
     free(path_c);
     if (file == NULL) {
         return -1;
@@ -1971,8 +1989,7 @@ int32_t encore_fs_write_file_atomic(encore_str path, encore_str contents) {
     unsigned long process_id = GetCurrentProcessId();
     for (unsigned int attempt = 0; attempt < 100 && temporary_fd < 0; ++attempt) {
         snprintf(temporary_c + path_len, 32, ".tmp.%lu.%u", process_id, attempt);
-        temporary_fd = _open(temporary_c, _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY,
-                             _S_IREAD | _S_IWRITE);
+        temporary_fd = encore_windows_open_exclusive(temporary_c);
     }
     FILE *file = temporary_fd < 0 ? NULL : _fdopen(temporary_fd, "wb");
 #else
@@ -1987,7 +2004,7 @@ int32_t encore_fs_write_file_atomic(encore_str path, encore_str contents) {
 #else
             close(temporary_fd);
 #endif
-            remove(temporary_c);
+            encore_path_remove(temporary_c);
         }
         free(temporary_c);
         free(path_c);
@@ -2000,13 +2017,13 @@ int32_t encore_fs_write_file_atomic(encore_str path, encore_str contents) {
     int32_t status = written == contents_len && close_status == 0 ? 0 : -1;
     if (status == 0) {
 #ifdef _WIN32
-        if (!MoveFileExA(temporary_c, path_c,
-                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) status = -1;
+        if (encore_windows_move(temporary_c, path_c,
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) status = -1;
 #else
         if (rename(temporary_c, path_c) != 0) status = -1;
 #endif
     }
-    if (status != 0) remove(temporary_c);
+    if (status != 0) encore_path_remove(temporary_c);
     free(temporary_c);
     free(path_c);
     return status;
@@ -2133,7 +2150,7 @@ encore_str encore_text_sha256(encore_str contents) {
 encore_str encore_fs_sha256(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) return encore_empty_str();
-    FILE *file = fopen(path_c, "rb");
+    FILE *file = encore_path_fopen(path_c, "rb");
     free(path_c);
     if (file == NULL) return encore_empty_str();
     encore_sha256_context context;
@@ -2156,8 +2173,12 @@ int32_t encore_fs_status(encore_str path) {
         return -1;
     }
 
+#ifdef _WIN32
+    int32_t result = encore_windows_attributes(path_c) != INVALID_FILE_ATTRIBUTES ? 0 : -1;
+#else
     struct stat st;
     int32_t result = stat(path_c, &st) == 0 ? 0 : -1;
+#endif
     free(path_c);
     return result;
 }
@@ -2165,15 +2186,13 @@ int32_t encore_fs_status(encore_str path) {
 bool encore_fs_is_directory(encore_str path) {
     char *path_c = encore_to_cstr(path);
     if (path_c == NULL) return false;
-    struct stat st;
-    bool result = false;
-    if (stat(path_c, &st) == 0) {
 #ifdef _WIN32
-        result = (st.st_mode & _S_IFDIR) != 0;
+    DWORD attributes = encore_windows_attributes(path_c);
+    bool result = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 #else
-        result = S_ISDIR(st.st_mode);
+    struct stat st;
+    bool result = stat(path_c, &st) == 0 && S_ISDIR(st.st_mode);
 #endif
-    }
     free(path_c);
     return result;
 }
@@ -2184,7 +2203,7 @@ int32_t encore_fs_remove_file(encore_str path) {
         return -1;
     }
 
-    int result = remove(path_c);
+    int result = encore_path_remove(path_c);
     free(path_c);
     return result == 0 ? 0 : -1;
 }
@@ -2193,7 +2212,7 @@ int32_t encore_fs_copy_file(encore_str source, encore_str destination) {
     char *source_c = encore_to_cstr(source);
     char *destination_c = encore_to_cstr(destination);
     if (source_c == NULL || destination_c == NULL) { free(source_c); free(destination_c); return -1; }
-    FILE *input = fopen(source_c, "rb");
+    FILE *input = encore_path_fopen(source_c, "rb");
     free(source_c);
     if (input == NULL) { free(destination_c); return -1; }
 
@@ -2207,8 +2226,7 @@ int32_t encore_fs_copy_file(encore_str source, encore_str destination) {
     unsigned long process_id = GetCurrentProcessId();
     for (unsigned int attempt = 0; attempt < 100 && temporary_fd < 0; ++attempt) {
         snprintf(temporary_c + destination_len, 32, ".tmp.%lu.%u", process_id, attempt);
-        temporary_fd = _open(temporary_c, _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY,
-                             _S_IREAD | _S_IWRITE);
+        temporary_fd = encore_windows_open_exclusive(temporary_c);
     }
 #else
     memcpy(temporary_c + destination_len, ".tmp.XXXXXX", 12);
@@ -2228,7 +2246,7 @@ int32_t encore_fs_copy_file(encore_str source, encore_str destination) {
 #endif
         }
         fclose(input);
-        remove(temporary_c);
+        encore_path_remove(temporary_c);
         free(temporary_c);
         free(destination_c);
         return -1;
@@ -2243,13 +2261,13 @@ int32_t encore_fs_copy_file(encore_str source, encore_str destination) {
     if (fclose(input) != 0 || fclose(output) != 0) status = -1;
     if (status == 0) {
 #ifdef _WIN32
-        if (!MoveFileExA(temporary_c, destination_c,
-                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) status = -1;
+        if (encore_windows_move(temporary_c, destination_c,
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) status = -1;
 #else
         if (rename(temporary_c, destination_c) != 0) status = -1;
 #endif
     }
-    if (status != 0) remove(temporary_c);
+    if (status != 0) encore_path_remove(temporary_c);
     free(temporary_c);
     free(destination_c);
     return status;
@@ -2277,7 +2295,7 @@ int32_t encore_fs_mkdir(encore_str path) {
 
     int rc =
 #ifdef _WIN32
-        _mkdir(path_c);
+        encore_windows_mkdir(path_c);
 #else
         mkdirat(AT_FDCWD, path_c, 0755);
 #endif
@@ -2301,7 +2319,7 @@ int32_t encore_fs_mkdir_all(encore_str path) {
         if (path_c[0] != '\0') {
             int rc =
 #ifdef _WIN32
-                _mkdir(path_c);
+                encore_windows_mkdir(path_c);
 #else
                 mkdirat(AT_FDCWD, path_c, 0755);
 #endif
@@ -2360,8 +2378,10 @@ encore_str encore_fs_read_dir(encore_str path) {
     strcat(pattern, suffix);
     free(path_c);
 
-    WIN32_FIND_DATAA data;
-    HANDLE handle = FindFirstFileA(pattern, &data);
+    wchar_t *wide_pattern = encore_windows_utf16(pattern);
+    WIN32_FIND_DATAW data;
+    HANDLE handle = wide_pattern == NULL ? INVALID_HANDLE_VALUE : FindFirstFileW(wide_pattern, &data);
+    free(wide_pattern);
     free(pattern);
     if (handle == INVALID_HANDLE_VALUE) {
         return encore_empty_str();
@@ -2388,12 +2408,15 @@ encore_str encore_fs_read_dir(encore_str path) {
 
 #ifdef _WIN32
     do {
-        if (!encore_append_dir_entry(&buffer, &cap, &len, data.cFileName)) {
+        char *name = encore_windows_utf8(data.cFileName);
+        bool appended = name != NULL && encore_append_dir_entry(&buffer, &cap, &len, name);
+        free(name);
+        if (!appended) {
             free(buffer);
             FindClose(handle);
             return encore_empty_str();
         }
-    } while (FindNextFileA(handle, &data));
+    } while (FindNextFileW(handle, &data));
     FindClose(handle);
 #else
     struct dirent *entry = NULL;
@@ -2413,41 +2436,53 @@ encore_str encore_fs_read_dir(encore_str path) {
     return encore_from_owned_buffer(buffer, len);
 }
 
-static int encore_remove_tree_c(const char *path) {
 #ifdef _WIN32
-    DWORD attributes = GetFileAttributesA(path);
-    if (attributes == INVALID_FILE_ATTRIBUTES) return GetLastError() == ERROR_FILE_NOT_FOUND ? 0 : -1;
-    if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-        SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
-        return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? (RemoveDirectoryA(path) ? 0 : -1)
-                                                           : (DeleteFileA(path) ? 0 : -1);
+static int encore_remove_tree_w(const wchar_t *path) {
+    DWORD attributes = GetFileAttributesW(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? 0 : -1;
     }
-    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-        SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
-        return DeleteFileA(path) ? 0 : -1;
+    if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+        return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? (RemoveDirectoryW(path) ? 0 : -1)
+                                                           : (DeleteFileW(path) ? 0 : -1);
     }
-    size_t length = strlen(path);
-    char *pattern = malloc(length + 3);
+    size_t length = wcslen(path);
+    wchar_t *pattern = malloc((length + 3) * sizeof(*pattern));
     if (pattern == NULL) return -1;
-    snprintf(pattern, length + 3, "%s\\*", path);
-    WIN32_FIND_DATAA data;
-    HANDLE search = FindFirstFileA(pattern, &data);
+    swprintf(pattern, length + 3, L"%ls\\*", path);
+    WIN32_FIND_DATAW data;
+    HANDLE search = FindFirstFileW(pattern, &data);
     free(pattern);
     if (search != INVALID_HANDLE_VALUE) {
+        int status = 0;
         do {
-            if (strcmp(data.cFileName, ".") == 0 || strcmp(data.cFileName, "..") == 0) continue;
-            size_t child_length = length + strlen(data.cFileName) + 2;
-            char *child = malloc(child_length);
-            if (child == NULL) { FindClose(search); return -1; }
-            snprintf(child, child_length, "%s\\%s", path, data.cFileName);
-            int status = encore_remove_tree_c(child);
+            if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) continue;
+            size_t capacity = length + wcslen(data.cFileName) + 2;
+            wchar_t *child = malloc(capacity * sizeof(*child));
+            if (child == NULL) { status = -1; break; }
+            swprintf(child, capacity, L"%ls\\%ls", path, data.cFileName);
+            status = encore_remove_tree_w(child);
             free(child);
-            if (status != 0) { FindClose(search); return -1; }
-        } while (FindNextFileA(search, &data));
+            if (status != 0) break;
+        } while (FindNextFileW(search, &data));
+        if (status == 0 && GetLastError() != ERROR_NO_MORE_FILES) status = -1;
         FindClose(search);
-    }
-    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
-    return RemoveDirectoryA(path) ? 0 : -1;
+        if (status != 0) return -1;
+    } else if (GetLastError() != ERROR_FILE_NOT_FOUND) return -1;
+    SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+    return RemoveDirectoryW(path) ? 0 : -1;
+}
+#endif
+
+static int encore_remove_tree_c(const char *path) {
+#ifdef _WIN32
+    wchar_t *wide = encore_windows_utf16(path);
+    if (wide == NULL) return -1;
+    int status = encore_remove_tree_w(wide);
+    free(wide);
+    return status;
 #else
     struct stat info;
     if (lstat(path, &info) != 0) return errno == ENOENT ? 0 : -1;
@@ -2482,7 +2517,7 @@ int32_t encore_fs_remove_dir_all(encore_str path) {
 
 static int encore_move_path_c(const char *source, const char *destination) {
 #ifdef _WIN32
-    return MoveFileExA(source, destination, MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+    return encore_windows_move(source, destination, MOVEFILE_WRITE_THROUGH);
 #else
     return rename(source, destination) == 0 ? 0 : -1;
 #endif

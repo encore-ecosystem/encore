@@ -1,0 +1,493 @@
+//! Deterministic native adapters appended to owned modules before analysis.
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+import core::vec::Vec
+
+import std::string::String
+
+import json::{Json, stringify}
+
+import mod::failure::ProjectFailure
+import mod::manifest::ProjectManifest
+import refrain::frontend::parser::{FunctionItem, Statement, TraitStmt}
+
+pub struct PluginSourceModule {
+    owner_name: str
+    module_id: str
+    ast: Vec[Statement]
+    resolved_imports: Vec[str]
+}
+fn starts(value: str, prefix: str) -> bool {
+    ret value.byte_len() >= prefix.byte_len() && value.slice_bytes(0, prefix.byte_len()) == prefix
+}
+fn ends(value: str, suffix: str) -> bool {
+    ret value.byte_len() >= suffix.byte_len() && value.slice_bytes(value.byte_len() - suffix.byte_len(), suffix.byte_len()) == suffix
+}
+fn quoted(value: str) -> str {
+    ret stringify(Json::String(value))
+}
+fn failure(message: str) -> ProjectFailure {
+    ret ProjectFailure { "plugin-codegen", message }
+}
+fn leaf(value: str) -> str {
+    let mut start = 0_usize
+    let mut index = 0_usize
+    while index + 1 < value.byte_len() {
+        if value.slice_bytes(index, 2) == "::" {
+            start = index + 2
+        }
+        index += 1
+    }
+    ret value.slice_bytes(start, value.byte_len() - start)
+}
+pub fn plugin_module_path(id: str) -> str {
+    let at = id.find_byte_from(64_u8, 0_usize)
+    if at == id.byte_len() {
+        ret id
+    }
+    let owner = id.slice_bytes(0, at)
+    let file = id.slice_bytes(at + 1, id.byte_len() - at - 1)
+    if file == "lib.enq" || file == "main.enq" {
+        ret owner
+    }
+    let end = if ends(file, "/mod.enq") {
+        file.byte_len() - 8
+    } else {
+        file.byte_len() - 4
+    }
+    let mut result = owner + "::"
+    let mut index = 0_usize
+    while index < end {
+        if file.byte_at(index) == 47_u8 {
+            result += "::"
+        } else {
+            result += file.slice_bytes(index, 1)
+        }
+        index += 1
+    }
+    ret result
+}
+fn lookup_module(modules: Vec[PluginSourceModule], path: str, root: str) -> Option[PluginSourceModule] {
+    let prefix = if starts(path, "refrain::") {
+        root + path.slice_bytes(7, path.byte_len() - 7)
+    } else {
+        path
+    }
+    for module in modules {
+        if plugin_module_path(module.module_id) == prefix {
+            ret Option[PluginSourceModule]::Some(module)
+        }
+    }
+    ret Option[PluginSourceModule]::None
+}
+fn argument(value: str) -> str {
+    let open = value.find_byte_from(91_u8, 0_usize)
+    if open == value.byte_len() {
+        ret ""
+    }
+    let mut depth = 0_usize let mut index = open + 1
+    while index < value.byte_len() {
+        let byte = value.byte_at(index)
+        if depth == 0 &&(byte == 44_u8 || byte == 93_u8) {
+            ret value.slice_bytes(open + 1, index - open - 1)
+        }
+        if byte == 91_u8 || byte == 40_u8 {
+            depth += 1
+        }
+        if byte == 93_u8 || byte == 41_u8 {
+            depth -= 1
+        }
+        index += 1
+    }
+    ret ""
+}
+fn interface_base(value: str) -> str {
+    ret value.slice_bytes(0, value.find_byte_from(91_u8, 0_usize))
+}
+fn interface_arguments(value: str) -> Result[Vec[str], ProjectFailure] {
+    let mut out = Vec[str]::new()
+    let open = value.find_byte_from(91_u8, 0_usize)
+    if open == value.byte_len() {
+        ret Result::Ok(out)
+    }
+    if !ends(value, "]") {
+        ret Result::Err(failure("invalid plugin interface arguments"))
+    }
+    let mut start = open + 1_usize
+    let mut index = start
+    let mut depth = 0_usize
+    while index < value.byte_len() - 1_usize {
+        let byte = value.byte_at(index)
+        if byte == 91_u8 || byte == 40_u8 {
+            depth += 1_usize
+        } elif byte == 93_u8 || byte == 41_u8 {
+            if depth == 0_usize {
+                ret Result::Err(failure("invalid plugin interface arguments"))
+            }
+            depth -= 1_usize
+        } elif byte == 44_u8 && depth == 0_usize {
+            let arg = String::from_str(value.slice_bytes(start, index - start)).trim().as_str()
+            if arg == "" {
+                ret Result::Err(failure("plugin interface arguments must be concrete types"))
+            }
+            out.push(arg)
+            start = index + 1_usize
+        }
+        index += 1_usize
+    }
+    let arg = String::from_str(value.slice_bytes(start, index - start)).trim().as_str()
+    if depth != 0_usize || arg == "" {
+        ret Result::Err(failure("invalid plugin interface arguments"))
+    }
+    out.push(arg)
+    ret Result::Ok(out)
+}
+fn specialized_method_type(modules: Vec[PluginSourceModule], module: PluginSourceModule,
+    typ: str, item: TraitStmt, arguments: Vec[str],) -> str {
+    // Qualify names in the declaration's scope before substituting arguments,
+    // whose fully qualified names are supplied by the plugin manifest.
+    let mut qualified = method_type(modules, module, typ)
+    let mut index = 0_usize
+    for generic in item.generics {
+        let argument = arguments.get(index).unwrap_or("")
+        let mut out = ""
+        let mut cursor = 0_usize
+        while cursor < qualified.byte_len() {
+            let byte = qualified.byte_at(cursor)
+            if (byte >= 65_u8 && byte <= 90_u8) ||(byte >= 97_u8 && byte <= 122_u8) || byte == 95_u8 {
+                let start = cursor
+                while cursor < qualified.byte_len() {
+                    let next = qualified.byte_at(cursor)
+                    if !((next >= 65_u8 && next <= 90_u8) ||(next >= 97_u8 && next <= 122_u8) ||(next >= 48_u8 && next <= 57_u8) || next == 95_u8 || next == 58_u8) {
+                        break
+                    }
+                    cursor += 1_usize
+                }
+                let name = qualified.slice_bytes(start, cursor - start)
+                out += if name == generic.name {
+                    argument
+                } else {
+                    name
+                }
+            } else {
+                out += qualified.slice_bytes(cursor, 1_usize) cursor += 1_usize
+            }
+        }
+        qualified = out
+        index += 1_usize
+    }
+    ret qualified
+}
+fn has_type(module: PluginSourceModule, name: str) -> bool {
+    for statement in module.ast {
+        match statement {
+            Statement::Struct(item) => {
+                if item.name == name {
+                    ret true
+                }
+            }
+            Statement::EnumItem(item) => {
+                if item.name == name {
+                    ret true
+                }
+            }
+            Statement::Trait(item) => {
+                if item.name == name {
+                    ret true
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret false
+}
+fn type_path(modules: Vec[PluginSourceModule], module: PluginSourceModule, name: str) -> str {
+    if has_type(module, name) {
+        ret plugin_module_path(module.module_id) + "::" + name
+    }
+    for id in module.resolved_imports {
+        for dependency in modules {
+            if dependency.module_id == id && has_type(dependency, name) {
+                ret plugin_module_path(id) + "::" + name
+            }
+        }
+    }
+    ret name
+}
+fn method_type(modules: Vec[PluginSourceModule], module: PluginSourceModule, typ: str) -> str {
+    let mut out = "" let mut index = 0_usize
+    while index < typ.byte_len() {
+        let byte = typ.byte_at(index)
+        if (byte >= 65_u8 && byte <= 90_u8) ||(byte >= 97_u8 && byte <= 122_u8) || byte == 95_u8 {
+            let start = index
+            while index < typ.byte_len() {
+                let next = typ.byte_at(index)
+                if !((next >= 65_u8 && next <= 90_u8) ||(next >= 97_u8 && next <= 122_u8) ||(next >= 48_u8 && next <= 57_u8) || next == 95_u8 || next == 58_u8) {
+                    break
+                }
+                index += 1
+            }
+            let name = typ.slice_bytes(start, index - start)
+            if name == "Resource" {
+                out += "platform::plugin::Resource"
+            } elif name == "Vec" {
+                out += "core::vec::Vec"
+            } elif name == "Option" {
+                out += "core::option::Option"
+            } elif name == "Result" {
+                out += "core::result::Result"
+            } else {
+                out += type_path(modules, module, name)
+            }
+        } else {
+            out += typ.slice_bytes(index, 1) index += 1
+        }
+    }
+    ret out
+}
+fn descriptor_declarations() -> str {
+    ret "\nextern fn encore_plugin_descriptor_cached() -> usize\n" +
+    "extern fn encore_plugin_descriptor_new(name:str, version:str, count:usize) -> usize\n" +
+    "extern fn encore_plugin_descriptor_export(token:usize,index:usize,name:str,interface_name:str,fingerprint:str,count:usize,create:usize,drop:usize,save:usize,restore:usize) -> bool\n" +
+    "extern fn encore_plugin_descriptor_method(token:usize,export_index:usize,index:usize,name:str,fingerprint:str,function:usize) -> bool\n" +
+    "extern fn encore_plugin_descriptor_commit(token:usize) -> usize\n" +
+    "extern fn encore_plugin_descriptor_abort(token:usize)\n" +
+    "extern fn encore_plugin_generated_error(destination:usize,code:u32,message:str) -> u32\n"
+}
+/// Returns in-memory source suffixes; no user source or dependency is rewritten.
+pub fn plugin_adapter_sources(modules: Vec[PluginSourceModule], manifest: ProjectManifest) -> Result[Vec[(str, str)], ProjectFailure] {
+    let mut out = Vec[(str, str)]::new()
+    if manifest.plugin_exports.len() == 0 {
+        ret Result[Vec[(str, str)], ProjectFailure]::Ok(out)
+    }
+    let mut entry = "\npub fn encore_plugin_entry_v1() -> usize { unsafe {\n" +
+    "let cached = encore_plugin_descriptor_cached() if cached != 0 { ret cached }\n" +
+    "let descriptor = encore_plugin_descriptor_new(" + quoted(manifest.name) + "," + quoted(manifest.version) + "," + Debug::fmt(manifest.plugin_exports.len()) + "_usize)\n" +
+    "if descriptor == 0 { ret 0_usize }\n"
+    let mut export_index = 0_usize
+    for export in manifest.plugin_exports {
+        let concrete_interface = interface_base(export.interface)
+        let interface_args = interface_arguments(export.interface)?
+        let interface_name = leaf(concrete_interface)
+        if interface_name == concrete_interface {
+            ret Result[Vec[(str, str)], ProjectFailure]::Err(failure("plugin interface must use its package-qualified path"))
+        }
+        let interface_path = concrete_interface.slice_bytes(0, concrete_interface.byte_len() - interface_name.byte_len() - 2)
+        let api = match lookup_module(modules, interface_path, manifest.name) {
+            Option::Some(value) => value None => {
+                ret Result[Vec[(str, str)], ProjectFailure]::Err(failure("plugin interface module not found: " + interface_path))
+            }
+        }
+        let mut selected = Option[TraitStmt]::None
+        for statement in api.ast {
+            match statement {
+                Statement::Trait(item) => {
+                    if item.name == interface_name {
+                        selected = Option[TraitStmt]::Some(item)
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        let trait_item = match selected {
+            Option::Some(value) => value None => {
+                ret Result[Vec[(str, str)], ProjectFailure]::Err(failure("plugin interface trait not found: " + export.interface))
+            }
+        }
+        let mut marked = false for attr in trait_item.attrs {
+            if attr == "plugin_interface" {
+                marked = true
+            }
+        }
+        if !marked || trait_item.generics.len() != interface_args.len() || trait_item.bases.len() != 0 {
+            ret Result[Vec[(str, str)], ProjectFailure]::Err(failure("plugin export requires a concrete marked interface without base traits"))
+        }
+        let factory_name = leaf(export.factory)
+        let factory_path = if factory_name == export.factory {
+            manifest.name
+        } else {
+            export.factory.slice_bytes(0, export.factory.byte_len() - factory_name.byte_len() - 2)
+        }
+        let owner = match lookup_module(modules, factory_path, manifest.name) {
+            Option::Some(value) => value None => {
+                ret Result[Vec[(str, str)], ProjectFailure]::Err(failure("plugin factory module not found: " + factory_path))
+            }
+        }
+        if owner.owner_name != manifest.name {
+            ret Result[Vec[(str, str)], ProjectFailure]::Err(failure("plugin factories must belong to the plugin package"))
+        }
+        let mut factory = Option[FunctionItem]::None
+        for statement in owner.ast {
+            match statement {
+                Statement::Function(item) => {
+                    if item.name == factory_name {
+                        factory = Option[FunctionItem]::Some(item)
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        let function = match factory {
+            Option::Some(value) => value None => {
+                ret Result[Vec[(str, str)], ProjectFailure]::Err(failure("plugin factory not found: " + export.factory))
+            }
+        }
+        if function.params.len() != 0 || function.generics.len() != 0 || function.is_async {
+            ret Result[Vec[(str, str)], ProjectFailure]::Err(failure("plugin factory must be a synchronous non-generic function without arguments"))
+        }
+        let ret_type = function.ret_type.unwrap_or("")
+        if !starts(ret_type, "Result[") || !ends(ret_type, "str]") {
+            ret Result[Vec[(str, str)], ProjectFailure]::Err(failure("plugin factory must return Result[Implementation, str]"))
+        }
+        let implementation = argument(ret_type)
+        if implementation == "" {
+            ret Result[Vec[(str, str)], ProjectFailure]::Err(failure("plugin factory result needs a concrete implementation"))
+        }
+        let prefix = "__encore_plugin_generated_" + Debug::fmt(export_index)
+        let mut declared = false
+        for previous in out {
+            if previous.0 == owner.module_id {
+                declared = true
+            }
+        }
+        let mut code = if declared {
+            ""
+        } else {
+            descriptor_declarations()
+        }
+        code += "\npub fn " + prefix + "_drop(payload:usize) { unsafe { platform::plugin::__payload_drop[" + implementation + "](payload) } }\n"
+        code += "pub fn " + prefix + "_create(output:usize,error:usize) -> u32 { unsafe { platform::plugin::__validate_implementation[dyn " + export.interface + "," + implementation + "]() ret platform::plugin::__factory_output(" + factory_name + "(),output,error) } }\n"
+        let mut save_address = "0_usize" let mut restore_address = "0_usize"
+        if !export.stateless {
+            code += "pub fn " + prefix + "_save(payload:usize,arena:usize,snapshot:usize,error:usize) -> u32 { unsafe { ret platform::plugin::__snapshot_output(" + export.save_state + "(platform::plugin::__payload_copy[" + implementation + "](payload)),arena,snapshot,error) } }\n"
+            code += "pub fn " + prefix + "_restore(snapshot:usize,output:usize,error:usize) -> u32 { unsafe { ret platform::plugin::__factory_output(" + export.restore_state + "(platform::plugin::__snapshot_input(snapshot)),output,error) } }\n"
+            save_address = "platform::plugin::__function_address(" + prefix + "_save)"
+            restore_address = "platform::plugin::__function_address(" + prefix + "_restore)"
+        }
+        let mut registrations = ""
+        let mut method_index = 0_usize
+        for method in trait_item.methods {
+            let mut tuple = "(" let mut values = "" let mut index = 0_usize
+            if method.params.len() == 0 {
+                ret Result[Vec[(str, str)], ProjectFailure]::Err(failure("plugin method requires self"))
+            }
+            for param in method.params {
+                if index > 0 {
+                    tuple += specialized_method_type(modules, api, param.typ.unwrap_or(""), trait_item, interface_args) + ","
+                    if index > 1 {
+                        values += ","
+                    }
+                    values += "arguments." + Debug::fmt(index - 1)
+                }
+                index += 1
+            }
+            tuple += ")"
+            let wrapper = prefix + "_method_" + Debug::fmt(method_index)
+            code += "pub fn " + wrapper + "(payload:usize,args:usize,count:usize,arena:usize,output:usize,error:usize) -> u32 { unsafe {\n" +
+            "match platform::plugin::__decode_arguments[" + tuple + "](args,count,arena) {\n" +
+            "Ok(arguments) => { " +
+            (if ends(implementation, "<H>") {
+                    "unsafe ehir { cell: usize* = pcast payload:usize, usize*\nnode: usize = load cell:usize*\n" +
+                    "instance: mut " + implementation.slice_bytes(0, implementation.byte_len() - 3) + " = pcast node:usize, mut " + implementation.slice_bytes(0, implementation.byte_len() - 3) + " }\n"
+                } else {
+                    "unsafe ehir { instance: mut " + implementation + " = pcast payload: usize, mut " + implementation + " }\n"
+                }
+            ) +
+            (if method.ret_type.is_none() || method.ret_type.unwrap_or("") == "void" {
+                    "instance." + method.name + "(" + values + ") ret platform::plugin::__encode_output((),arena,output,error) }\n"
+                } else {
+                    "let result = instance." + method.name + "(" + values + ") ret platform::plugin::__encode_output(result,arena,output,error) }\n"
+                }
+            ) +
+            "Err(detail) => { ret encore_plugin_generated_error(error,detail.code,detail.message) } } } }\n"
+            registrations += "if !encore_plugin_descriptor_method(descriptor,index," + Debug::fmt(method_index) + "_usize," + quoted(method.name) + ",fingerprint,platform::plugin::__function_address(" + wrapper + ")) { ret false }\n"
+            method_index += 1
+        }
+        code += "pub fn " + prefix + "_register(descriptor:usize,index:usize) -> bool { unsafe {\n" +
+        "let fingerprint = platform::plugin::__interface_fingerprint[dyn " + export.interface + "]()\n" +
+        "if !encore_plugin_descriptor_export(descriptor,index," + quoted(export.name) + "," + quoted(export.interface) + ",fingerprint," + Debug::fmt(method_index) + "_usize,platform::plugin::__function_address(" + prefix + "_create),platform::plugin::__function_address(" + prefix + "_drop)," + save_address + "," + restore_address + ") { ret false }\n" +
+        registrations + "ret true } }\n"
+        out.push((owner.module_id, code))
+        entry += "if !" + plugin_module_path(owner.module_id) + "::" + prefix + "_register(descriptor," + Debug::fmt(export_index) + "_usize) { encore_plugin_descriptor_abort(descriptor) ret 0_usize }\n"
+        export_index += 1
+    }
+    entry += "ret encore_plugin_descriptor_commit(descriptor) } }\n"
+    let mut declared = false
+    for previous in out {
+        if previous.0 == manifest.name + "@lib.enq" {
+            declared = true
+        }
+    }
+    if !declared {
+        entry = descriptor_declarations() + entry
+    }
+    out.push((manifest.name + "@lib.enq", entry))
+    ret Result[Vec[(str, str)], ProjectFailure]::Ok(out)
+}
+
+#attr(test)
+fn plugin_adapter_source_parser_contract() -> bool {
+    let api_source = "#attr(plugin_interface) pub trait Formatter { fn format(self: Self, value: str) -> str }"
+    let implementation = "import formatter_api::Formatter\nstruct FormatterImpl {}\nimpl Formatter for FormatterImpl { pub fn format(self: Self, value: str) -> str { ret value } }\nfn create() -> Result[FormatterImpl, str] { ret Result::Ok(FormatterImpl {}) }"
+    let api = refrain::frontend::analysis::analyze_source(api_source)
+    let body = refrain::frontend::analysis::analyze_source(implementation)
+    let manifest = match mod::manifest::try_parse_project_manifest("[project]\nname=\"example\"\ntarget=\"shared_lib\"\n[plugin.exports.formatter]\ninterface=\"formatter_api::Formatter\"\nfactory=\"create\"\nstateless=true\n", std::path::Path::new("encore.toml")) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let modules = vec![PluginSourceModule {
+            "formatter_api", "formatter_api@lib.enq", api.ast, Vec[str]::new()
+        }
+        ,
+        PluginSourceModule { "example", "example@lib.enq", body.ast, vec!["formatter_api@lib.enq"] }]
+    let suffixes = match plugin_adapter_sources(modules, manifest) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    if suffixes.len() != 2 {
+        ret false
+    }
+    let mut generated = implementation
+    for suffix in suffixes {
+        generated += suffix.1
+    }
+    ret refrain::frontend::analysis::analyze_source(generated).diagnostics.len() == 0
+}
+
+#attr(test)
+fn plugin_concrete_generic_interface_contract() -> bool {
+    let api = refrain::frontend::analysis::analyze_source(
+        "#attr(plugin_interface) pub trait Echo[Item] { fn echo(self: Self, value: Item) -> Item }")
+    let implementation = "import echo_api::Echo\nstruct EchoImpl {}\nimpl Echo[str] for EchoImpl { pub fn echo(self: Self, value: str) -> str { ret value } }\nfn create() -> Result[EchoImpl, str] { ret Result::Ok(EchoImpl {}) }"
+    let body = refrain::frontend::analysis::analyze_source(implementation)
+    let manifest = match mod::manifest::try_parse_project_manifest(
+        "[project]\nname=\"example\"\ntarget=\"shared_lib\"\n[plugin.exports.echo]\ninterface=\"echo_api::Echo[str]\"\nfactory=\"create\"\nstateless=true\n", std::path::Path::new("encore.toml"),) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let modules = vec![PluginSourceModule {
+            "echo_api", "echo_api@lib.enq", api.ast, Vec[str]::new()
+        }
+        ,
+        PluginSourceModule { "example", "example@lib.enq", body.ast, vec!["echo_api@lib.enq"] }]
+    let suffixes = match plugin_adapter_sources(modules, manifest) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let mut generated = implementation
+    for suffix in suffixes {
+        generated += suffix.1
+    }
+    if !generated.contains("__decode_arguments[(str,)]") || !generated.contains("__validate_implementation[dyn echo_api::Echo[str],EchoImpl]") {
+        ret false
+    }
+    ret refrain::frontend::analysis::analyze_source(generated).diagnostics.len() == 0
+}

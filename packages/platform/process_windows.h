@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <wchar.h>
+#include "windows_unicode.h"
 
 /* CREATE_NEW reserves the name atomically; DELETE_ON_CLOSE also covers errors
    and abnormal process termination. Unlike CRT tmpfile[_s], this uses the
@@ -34,16 +35,6 @@ static FILE *encore_windows_capture_file(void) {
     FILE *stream = _fdopen(descriptor, "w+b");
     if (stream == NULL) _close(descriptor);
     return stream;
-}
-
-static wchar_t *encore_process_utf16(const char *text) {
-    int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, NULL, 0);
-    if (size <= 0) return NULL;
-    wchar_t *wide = malloc((size_t)size * sizeof(wchar_t));
-    if (wide != NULL && !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide, size)) {
-        free(wide); return NULL;
-    }
-    return wide;
 }
 
 static HANDLE encore_process_child_handle(HANDLE source, DWORD access) {
@@ -88,8 +79,8 @@ static int32_t encore_windows_run(char *const *argv, const char *cwd, HANDLE cap
         quoted[used++] = '"';
     }
     quoted[used] = '\0';
-    wchar_t *command = encore_process_utf16(quoted);
-    wchar_t *directory = cwd[0] == '\0' ? NULL : encore_process_utf16(cwd);
+    wchar_t *command = encore_windows_utf16(quoted);
+    wchar_t *directory = cwd[0] == '\0' ? NULL : encore_windows_utf16(cwd);
     free(quoted);
     int32_t result = -1;
     HANDLE output = INVALID_HANDLE_VALUE, input = INVALID_HANDLE_VALUE, error = INVALID_HANDLE_VALUE;
