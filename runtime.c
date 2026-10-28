@@ -22,6 +22,7 @@
 #include "runtime/cache_fs.h"
 #include "runtime/cache_payload.h"
 #include "runtime/build_identity.h"
+#include "runtime/build_identity_index.h"
 #include "runtime/build_target.h"
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -327,6 +328,38 @@ bool encore_compiler_str_contains(encore_compiler_str value,
     return false;
 }
 
+/* The filter owns its candidate keys and remains local to one module rewrite.
+   Allocation failure conservatively restores the original full-scan path. */
+size_t encore_compiler_identity_index_new(encore_compiler_str text, size_t raw_names, size_t count) {
+    if (count == 0 || raw_names == 0 || count > SIZE_MAX / sizeof(encore_identity_name)) return 0;
+    const encore_compiler_str *names = (const encore_compiler_str *)(uintptr_t)raw_names;
+    encore_identity_name *keys = malloc(count * sizeof(*keys));
+    if (keys == NULL) return 0;
+    for (size_t i = 0; i < count; ++i) {
+        keys[i] = (encore_identity_name){names[i].object == NULL ? "" : names[i].object->data,
+            names[i].object == NULL ? 0 : names[i].object->len};
+    }
+    encore_identity_index *index = encore_identity_index_new(text.object == NULL ? "" : text.object->data,
+        text.object == NULL ? 0 : text.object->len, keys, count);
+    free(keys);
+    return (size_t)(uintptr_t)index;
+}
+
+bool encore_compiler_identity_index_contains(size_t raw, encore_compiler_str name) {
+    return encore_identity_index_contains((encore_identity_index *)(uintptr_t)raw,
+        name.object == NULL ? "" : name.object->data, name.object == NULL ? 0 : name.object->len);
+}
+
+void encore_compiler_identity_index_note(size_t raw, encore_compiler_str replacement) {
+    encore_identity_index_note((encore_identity_index *)(uintptr_t)raw,
+        replacement.object == NULL ? "" : replacement.object->data,
+        replacement.object == NULL ? 0 : replacement.object->len);
+}
+
+void encore_compiler_identity_index_free(size_t raw) {
+    encore_identity_index_free((encore_identity_index *)(uintptr_t)raw);
+}
+
 static encore_compiler_str encore_compiler_replace_ehir_identifier_impl(
     encore_compiler_str value, encore_compiler_str token,
     encore_compiler_str replacement, bool scoped) {
@@ -358,11 +391,11 @@ static encore_compiler_str encore_compiler_replace_ehir_identifier_impl(
             comment = true; index += 2; continue;
         }
         if ((generic_mask == NULL || !generic_mask[index]) && index + match_len <= source_len &&
-            (!scoped || !encore_build_member_identifier(source, source_len, index, match_len)) &&
             memcmp(source + index, match, match_len) == 0 &&
             (index == 0 || !encore_compiler_identifier_byte((unsigned char)source[index - 1])) &&
             (index + match_len == source_len ||
-             !encore_compiler_identifier_byte((unsigned char)source[index + match_len]))) {
+             !encore_compiler_identifier_byte((unsigned char)source[index + match_len])) &&
+            (!scoped || !encore_build_member_identifier(source, source_len, index, match_len))) {
             ++count; index += match_len; continue;
         }
         ++index;
@@ -383,11 +416,11 @@ static encore_compiler_str encore_compiler_replace_ehir_identifier_impl(
         bool replace = false;
         if (!comment && !quoted && match_len > 0 && (generic_mask == NULL || !generic_mask[index]) &&
             index + match_len <= source_len &&
-            (!scoped || !encore_build_member_identifier(source, source_len, index, match_len)) &&
             memcmp(source + index, match, match_len) == 0 &&
             (index == 0 || !encore_compiler_identifier_byte((unsigned char)source[index - 1])) &&
             (index + match_len == source_len ||
-             !encore_compiler_identifier_byte((unsigned char)source[index + match_len]))) {
+             !encore_compiler_identifier_byte((unsigned char)source[index + match_len])) &&
+            (!scoped || !encore_build_member_identifier(source, source_len, index, match_len))) {
             replace = true;
         }
         if (replace) {

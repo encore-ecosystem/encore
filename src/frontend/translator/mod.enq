@@ -35,6 +35,10 @@ extern fn encore_strmap_new() -> usize
 extern fn encore_strmap_put(map: usize, key: str, value: usize) ->()
 extern fn encore_strmap_get(map: usize, key: str) -> usize
 extern fn encore_strmap_free(map: usize) ->()
+extern fn encore_compiler_identity_index_new(text: str, names: usize, count: usize) -> usize
+extern fn encore_compiler_identity_index_contains(index: usize, name: str) -> bool
+extern fn encore_compiler_identity_index_note(index: usize, replacement: str) ->()
+extern fn encore_compiler_identity_index_free(index: usize) ->()
 extern fn encore_compiler_str_contains(value: str, needle: str) -> bool
 extern fn encore_compiler_replace_ehir_identifier(value: str, token: str,
     replacement: str,) -> str
@@ -549,6 +553,10 @@ struct TranslatorContext {
     type_identity_scope_size: usize
     type_identity_cache: usize
     type_identity_values: Vec[str]
+    qualified_type_cache: usize
+    qualified_type_values: Vec[str]
+    qualified_type_hits: usize
+    qualified_type_misses: usize
     traits: Vec[TraitType]
     trait_impls: Vec[TraitImplType]
     generic_callables: Vec[GenericCallable]
@@ -815,7 +823,11 @@ pub fn translate_keyed_compilation_unit_to_ehir_chunks(modules: Vec[TranslationM
     for module in modules {
         ast.extend(module.ast)
     }
+    let context_started = perf_counter_ms()
     let mut ctx = collect_context_with_abi(ast, modules, target, Vec[str]::new(), true)
+    if env("ENCORE_FRONTEND_PROFILE").is_some() {
+        eprintln("frontend-context " + Debug::fmt(perf_counter_ms() - context_started) + " ms")
+    }
     ctx.cached_functions = cached
     ctx.record_function_cache = true
     ctx.cached_function_index = unsafe {
@@ -1066,8 +1078,15 @@ fn translate_module_chunk(ctx: mut TranslatorContext, module: TranslationModule,
     if module.imports.len() > 0_usize {
         builder = builder.empty_line()
     }
+    let body_started = perf_counter_ms()
     let body = translate_ast_with_context(ctx, module.ast, target, module.features).finish()
+    let body_ms = perf_counter_ms() - body_started
+    let qualify_started = perf_counter_ms()
     builder = builder.append_str(qualify_module_type_collisions(ctx, module, body))
+    if env("ENCORE_FRONTEND_PROFILE").is_some() {
+        eprintln("frontend-lower " + module.module_id + " body=" + Debug::fmt(body_ms) +
+            " qualify=" + Debug::fmt(perf_counter_ms() - qualify_started) + " ms")
+    }
     builder = builder.line("}")
     builder = builder.empty_line()
     ret TranslatedModuleChunk {
@@ -1084,8 +1103,14 @@ fn translate_module_chunk(ctx: mut TranslatorContext, module: TranslationModule,
 fn qualify_module_type_collisions(ctx: mut TranslatorContext, module: TranslationModule, text: str)
 -> str {
     let mut out = text
+    let index = unsafe {
+        encore_compiler_identity_index_new(text, ctx.type_collisions.as_ptr() as usize, ctx.type_collisions.len())
+    }
     for name in ctx.type_collisions {
-        if contains_substring(out, name) {
+        if unsafe {
+            encore_compiler_identity_index_contains(index, name)
+        }
+        && contains_substring(out, name) {
             let replacement = resolved_type_collision(ctx, module, name)
             if replacement != "" {
                 // Enum tags, field names and generic binders are not nominal
@@ -1093,8 +1118,17 @@ fn qualify_module_type_collisions(ctx: mut TranslatorContext, module: Translatio
                 out = unsafe {
                     encore_compiler_replace_scoped_ehir_identifier(out, name, replacement)
                 }
+                // Retain candidates from newly introduced spellings as well:
+                // even a user declaration matching a generated identity must
+                // preserve the original sequential replacement order.
+                unsafe {
+                    encore_compiler_identity_index_note(index, replacement)
+                }
             }
         }
+    }
+    unsafe {
+        encore_compiler_identity_index_free(index)
     }
     ret out
 }
@@ -1471,6 +1505,10 @@ fn translate_ast_to_ehir(ast: Vec[Statement], modules: Vec[TranslationModule], t
 }
 
 fn free_translation_indexes(ctx: TranslatorContext) ->() {
+    if env("ENCORE_FRONTEND_PROFILE").is_some() {
+        eprintln("frontend-qualified-types hits=" + Debug::fmt(ctx.qualified_type_hits) +
+            " misses=" + Debug::fmt(ctx.qualified_type_misses) + " entries=" + Debug::fmt(ctx.qualified_type_values.len()))
+    }
     if ctx.cached_function_index != 0 {
         unsafe {
             encore_strmap_free(ctx.cached_function_index)
@@ -1490,6 +1528,7 @@ fn free_translation_indexes(ctx: TranslatorContext) ->() {
         encore_strmap_free(ctx.function_overload_counts)
         encore_strmap_free(ctx.type_index)
         encore_strmap_free(ctx.type_identity_cache)
+        encore_strmap_free(ctx.qualified_type_cache)
         encore_strmap_free(ctx.field_index)
         encore_strset_free(ctx.owning_type_index)
     }
@@ -1705,7 +1744,10 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
         Vec[str]::new(), type_collisions, type_collisions.len(), unsafe {
             encore_strmap_new()
         }
-        , Vec[str]::new(), Vec[TraitType]::new(),
+        , Vec[str]::new(), unsafe {
+            encore_strmap_new()
+        }
+        , Vec[str]::new(), 0, 0, Vec[TraitType]::new(),
         Vec[TraitImplType]::new(), Vec[GenericCallable]::new(), Vec[DecoratorType]::new(),
         Vec[StructFieldType]::new(),
         unsafe {
@@ -2384,7 +2426,42 @@ fn remember_type(ctx: mut TranslatorContext, name: str) ->() {
 // The qualified spelling is propagated through inferred values and field
 // metadata, so a consumer can simultaneously hold values returned by two
 // modules that both define (for example) `Output`.
+// The complete raw spelling and generic binder participate in this key. The
+// declaration graph is immutable, but qualified_generic_type can temporarily
+// hide collision candidates; those scopes use the original resolver directly.
 fn qualified_type_for_source(ctx: mut TranslatorContext, source_name: str, typ: str) -> str {
+    if ctx.type_collisions.len() != ctx.type_identity_scope_size || typ.byte_len() > 512 {
+        ret qualified_type_for_source_uncached(ctx, source_name, typ)
+    }
+    let module = lookup_module_source_alias(ctx.module_index, source_name)
+    if module == 0 {
+        ret qualified_type_for_source_uncached(ctx, source_name, typ)
+    }
+    let key = Debug::fmt(module) + ":" + typ + "\n" + join_strs(generic_param_names(ctx.active_generics), ",")
+    if key.byte_len() > 1024 {
+        ret qualified_type_for_source_uncached(ctx, source_name, typ)
+    }
+    let cached = unsafe {
+        encore_strmap_get(ctx.qualified_type_cache, key)
+    }
+    if cached != 0 {
+        ctx.qualified_type_hits += 1
+        ret ctx.qualified_type_values.get_unchecked_borrowed(cached - 1)
+    }
+    ctx.qualified_type_misses += 1
+    let resolved = qualified_type_for_source_uncached(ctx, source_name, typ)
+    // Bound both key count and string sizes. Stop admitting new spellings at
+    // capacity while retaining hits; this cache never survives translation.
+    if ctx.qualified_type_values.len() < 4096 && resolved.byte_len() <= 2048 {
+        ctx.qualified_type_values.push(resolved)
+        unsafe {
+            encore_strmap_put(ctx.qualified_type_cache, key, ctx.qualified_type_values.len())
+        }
+    }
+    ret resolved
+}
+
+fn qualified_type_for_source_uncached(ctx: mut TranslatorContext, source_name: str, typ: str) -> str {
     // Do not materialize a module (and its AST ownership graph) for primitive
     // and non-colliding types. This also keeps generic constructor lookup cheap.
     let mut collision_candidate = false
@@ -5158,26 +5235,32 @@ fn specialize_named_type(typ: str, params: Vec[str], args: Vec[str]) -> str {
 }
 
 fn replace_type_token(value: str, token: str, replacement: str) -> str {
-    if token.len() == 0_usize {
+    if token.len() == 0_usize || value == "" {
         ret value
     }
     let mut out = ""
     let mut index = 0_usize
+    let mut copied = 0_usize
+    let mut changed = false
     while index < value.len() {
         if index + token.len() <= value.len() && value.slice(index, token.len()) == token {
             let left_ok = index == 0_usize || !is_type_name_char(value.byte_at(index - 1_usize))
             let right_index = index + token.len()
             let right_ok = right_index >= value.len() || !is_type_name_char(value.byte_at(right_index))
             if left_ok && right_ok {
-                out = out + replacement
+                out = out + value.slice(copied, index - copied) + replacement
                 index = right_index
+                copied = index
+                changed = true
                 continue
             }
         }
-        out = out + value.slice(index, 1_usize)
-        index = index + 1_usize
+        index += 1_usize
     }
-    ret out
+    if !changed {
+        ret value
+    }
+    ret out + value.slice(copied, value.len() - copied)
 }
 
 fn is_type_name_char(value: u8) -> bool {
@@ -15162,4 +15245,170 @@ fn reject_runtime_reflection(ctx: mut TranslatorContext, name: str, source_name:
                 "this reflection operation needs compile-time metadata; use core::reflect::type_info[T]() or a typed reflection helper",)
         }
     }
+}
+
+fn replace_type_token_reference(value: str, token: str, replacement: str) -> str {
+    if token.len() == 0_usize {
+        ret value
+    }
+    let mut out = ""
+    let mut index = 0_usize
+    while index < value.len() {
+        if index + token.len() <= value.len() && value.slice(index, token.len()) == token {
+            let left_ok = index == 0_usize || !is_type_name_char(value.byte_at(index - 1_usize))
+            let right_index = index + token.len()
+            let right_ok = right_index >= value.len() || !is_type_name_char(value.byte_at(right_index))
+            if left_ok && right_ok {
+                out = out + replacement
+                index = right_index
+                continue
+            }
+        }
+        out = out + value.slice(index, 1_usize)
+        index = index + 1_usize
+    }
+    ret out
+}
+
+#attr(test)
+fn translator_type_token_replacement_matches_reference() -> bool {
+    let values = vec!["", "Self", "Selfish Self_S Self::Item", "Vec[Self]", "(Self, Self&)",
+        "mut Self<S>", "Self Self Self", "αaSelf Self", "Self\nSelf", "\"Self\" // Self", "[Self; 4]"]
+    let tokens = vec!["", "Self", "S", "Vec", "α", "__absent"]
+    let replacements = vec!["", "Other", "Vec[Other]", "SelfSelf", "é"]
+    for value in values {
+        for token in tokens {
+            for replacement in replacements {
+                if replace_type_token(value, token, replacement) != replace_type_token_reference(value, token, replacement) {
+                    eprintln("type token replacement differs: " + value + " / " + token)
+                    ret false
+                }
+            }
+        }
+    }
+    ret true
+}
+
+#attr(test)
+fn translator_qualified_type_cache_matches_uncached_scopes() -> bool {
+    let mut modules = Vec[TranslationModule]::new()
+    let sources = vec!["pub struct Value { n: u32 } pub struct Box[T] { n: T }",
+        "pub struct Value { n: str }", "import left::Value as Alias fn bind[Value](n: Value) -> Value { ret n }"]
+    let names = vec!["left", "right", "consumer"]
+    let mut ast = Vec[Statement]::new()
+    let mut binders = Vec[GenericParam]::new()
+    for index in 0..sources.len() {
+        let source = names.get(index).unwrap_or("")
+        let mut lexer = Lexer::new()
+        let mut parser = Parser::new_for_source(source)
+        let body = parser.parse(lexer.tokenize(sources.get(index).unwrap_or("")))
+        for statement in body {
+            match statement {
+                Statement::Function(item) => {
+                    binders = item.generics
+                }
+                _ => {
+                }
+            }
+        }
+        ast.extend(body)
+        modules.push(TranslationModule::new(source, source, if source == "consumer" {
+                    vec!["left"]
+                } else {
+                    Vec[str]::new()
+                }
+                , body, Vec[str]::new(),))
+    }
+    let mut correct = true
+    for stable in vec![false, true] {
+        let mut ctx = collect_context_with_abi(ast, modules, host_target(), Vec[str]::new(), stable)
+        let queries = vec!["u32", "Value", "Alias", "Box[Value]", "mut Value&", "[Value; 4]", "(Value, Alias)", "dyn Value", "Unknown"]
+        for generics in vec![Vec[GenericParam]::new(), binders, Vec[GenericParam]::new()] {
+            ctx.active_generics = generics
+            for source in vec!["left", "right", "consumer", "unknown-source"] {
+                for typ in queries {
+                    let expected = qualified_type_for_source_uncached(ctx, source, typ)
+                    if qualified_type_for_source(ctx, source, typ) != expected || qualified_type_for_source(ctx, source, typ) != expected {
+                        correct = false
+                    }
+                }
+            }
+        }
+        let saved = ctx.type_collisions
+        ctx.type_collisions = Vec[str]::new()
+        if qualified_type_for_source(ctx, "left", "Value") != "Value" {
+            correct = false
+        }
+        ctx.type_collisions = saved
+        if qualified_type_for_source(ctx, "left", "Value") != qualified_type_for_source_uncached(ctx, "left", "Value") {
+            correct = false
+        }
+        for index in 0..4100_usize {
+            let typ = "Unknown_" + Debug::fmt(index)
+            if qualified_type_for_source(ctx, "left", typ) != typ {
+                correct = false
+            }
+        }
+        if ctx.qualified_type_values.len() != 4096 || ctx.qualified_type_hits == 0 {
+            correct = false
+        }
+        if qualified_type_for_source(ctx, "left", "Value") != qualified_type_for_source_uncached(ctx, "left", "Value") {
+            correct = false
+        }
+        free_translation_indexes(ctx)
+    }
+    suppress_text_builder_output(true)
+    let replaced = replace_type_token("Vec[Self]", "Self", "Item")
+    suppress_text_builder_output(false)
+    ret correct && replaced == "Vec[Item]"
+}
+
+// Exact sequential implementation retained as an oracle for the admission filter.
+fn qualify_module_type_collisions_reference(ctx: mut TranslatorContext, module: TranslationModule, text: str) -> str {
+    let mut out = text
+    for name in ctx.type_collisions {
+        if contains_substring(out, name) {
+            let replacement = resolved_type_collision(ctx, module, name)
+            if replacement != "" {
+                out = unsafe {
+                    encore_compiler_replace_scoped_ehir_identifier(out, name, replacement)
+                }
+            }
+        }
+    }
+    ret out
+}
+
+#attr(test)
+fn translator_nominal_admission_matches_sequential_rewriter() -> bool {
+    let mut modules = Vec[TranslationModule]::new()
+    let mut ast = Vec[Statement]::new()
+    for source in vec!["left", "right"] {
+        let mut lexer = Lexer::new()
+        let mut parser = Parser::new_for_source(source)
+        let body = parser.parse(lexer.tokenize("pub struct Value { n: u32 } pub struct __encore_t6c656674__Value { n: u32 }"))
+        ast.extend(body)
+        modules.push(TranslationModule::new(source, source, Vec[str]::new(), body, Vec[str]::new()))
+    }
+    let samples = vec!["", "struct Value {\n Value: Value\n}\n", "enum Kind {\n Value(Value)\n}\n",
+        "fn f[Value](x: Value) -> Value {\n ret x: Value\n}\nfn g(x: Value) -> Value\n",
+        "v = getfield obj > Value\nv = ieq n, Value\nv = ieq n: Value, other\n",
+        "// Value\nstr = \"Value\"\nValue::read\n", "ValueSuffix _Value Value_ __encore_t6c656674__Value", "Value"]
+    let mut correct = true
+    for stable in vec![false, true] {
+        let mut ctx = collect_context_with_abi(ast, modules, host_target(), Vec[str]::new(), stable)
+        // Exercise a replacement that introduces a later candidate spelling.
+        ctx.type_collisions = vec!["Value", "__encore_t6c656674__Value"]
+        for module in modules {
+            for text in samples {
+                let expected = qualify_module_type_collisions_reference(ctx, module, text)
+                if qualify_module_type_collisions(ctx, module, text) != expected {
+                    eprintln("nominal admission differs: " + module.source_name + " / " + text)
+                    correct = false
+                }
+            }
+        }
+        free_translation_indexes(ctx)
+    }
+    ret correct
 }
