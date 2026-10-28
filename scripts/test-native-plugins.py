@@ -90,10 +90,15 @@ def main():
             run("manager", [str(program), *libraries])
             sdk = out / ("sdk.exe" if windows else "sdk")
             strip = "-Wl,-dead_strip" if darwin else "-Wl,--gc-sections"
-            sdk_flags = flags + ([] if windows else ["-lm"])
+            sdk_flags = flags + (["-lws2_32", "-lsecur32", "-lcrypt32"] if windows else
+                ["-lm"] + (["-framework", "CoreFoundation", "-framework", "Security"] if darwin else []))
             run("build-sdk", cc + ["-ffunction-sections", "-fdata-sections", strip,
                 "packages/platform/tests/plugins/sdk.c", "packages/core/runtime.c", "-o", str(sdk)] + sdk_flags)
             run("sdk", [str(sdk)])
+            paths = out / ("unicode-paths.exe" if windows else "unicode-paths")
+            run("build-unicode-paths", cc + ["-ffunction-sections", "-fdata-sections", strip,
+                "packages/platform/tests/unicode_paths.c", "packages/core/runtime.c", "-o", str(paths)] + sdk_flags)
+            run("unicode-paths", [str(paths)], cwd=out)
             if args.benchmark:
                 benchmark = out / ("benchmark.exe" if windows else "benchmark")
                 bench_flags = flags + (["-lpsapi"] if windows else [])

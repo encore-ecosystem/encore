@@ -5,7 +5,7 @@ set -euo pipefail
 triple=${1:-}
 if [[ "$triple" == *-linux-gnu ]]; then
   sudo apt-get update
-  sudo apt-get install -y libssl-dev libc-ares-dev
+  sudo apt-get install -y libssl-dev libc-ares-dev lld
 fi
 if [[ "$triple" == *-w64-windows-gnu ]]; then
   version=20260616
