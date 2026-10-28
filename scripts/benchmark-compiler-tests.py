@@ -26,6 +26,37 @@ import time
 
 
 CASES = ("owned_shadowing_lifetime", "lexer_lifetime", "parser_lifetime", "translator_lifetime")
+PROJECT_CASES = ("app-std", "eight-deps")
+SUBSET_CASES = (*CASES, "compiler_cache_identity", "function_lowering_cache", "native_object_cache", "lowering_cache_storage")
+
+
+def workload_cases(scenario):
+    return {"all": ["build", "suite"], "standalone": list(CASES),
+            "projects": list(PROJECT_CASES)}.get(scenario, [scenario])
+
+
+def prepare_project(root, source, case):
+    """Prepare deterministic executable inputs without invoking a compiler."""
+    (root / "src").mkdir(parents=True)
+    dependencies = ["path@" + (source / "packages/std").as_posix()]
+    imports = ["import std::io::println"]
+    calls = []
+    if case == "eight-deps":
+        for index in range(8):
+            package = root / f"dep-{index}"
+            (package / "src").mkdir(parents=True)
+            (package / "encore.toml").write_text(
+                f'[project]\nname="bench_dep_{index}"\nversion="0.0.0"\ndependencies=[]\n')
+            (package / "src/lib.enq").write_text(f'pub fn value() -> u32 {{ ret {index + 1}_u32 }}\n')
+            dependencies.append(f"path@dep-{index}")
+            imports.append(f"import bench_dep_{index}::value as value_{index}")
+            calls.append(f"value_{index}()")
+    total = " + ".join(calls) or "36_u32"
+    (root / "encore.toml").write_text('[project]\nname="cold_benchmark"\nversion="1.2.3"\ndependencies=' + json.dumps(dependencies) + '\n')
+    (root / "src/main.enq").write_text('\n'.join(imports) + '\nfn main() -> u32 { println(__project_name__ + "=" + __version__) '
+        + 'ret if ' + total + ' == 36_u32 { 0_u32 } else { 1_u32 } }\n')
+
+
 PROFILE_ENV = ("ENCORE_CODEGEN_PROFILE", "ENCORE_FRONTEND_PROFILE", "ENCORE_KEEP_TEMPS")
 
 
@@ -351,7 +382,7 @@ def sample_complete(sample, warm):
 
 def expected_sample_keys(report):
     scenario = report["scenario"]
-    cases = ["build", "suite"] if scenario == "all" else (list(CASES) if scenario == "standalone" else [scenario])
+    cases = workload_cases(scenario)
     first = report["first_repetition"]
     return {(repetition, jobs["effective_jobs"], case, variant)
             for repetition in range(first, first + report["repetitions"])
@@ -400,7 +431,7 @@ def main():
     parser.add_argument("--baseline-source", type=Path)
     parser.add_argument("--baseline-ref", help="Freeze baseline sources with git archive, e.g. v0.1.6-neumann")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--scenario", choices=("all", "build", "suite", "standalone"), default="all")
+    parser.add_argument("--scenario", choices=("all", "build", "suite", "standalone", "projects", "subset"), default="all")
     parser.add_argument("--jobs", default="1,2,4,8,16,auto")
     parser.add_argument("--profile", choices=("dev", "release", "extreme"), default="extreme")
     parser.add_argument("--repetitions", type=int, default=3)
@@ -420,7 +451,7 @@ def main():
     if (args.baseline_source or args.baseline_ref) and not args.baseline_compiler:
         parser.error("baseline source/ref requires --baseline-compiler")
     try:
-        bash = find_bash(args.bash) if args.scenario in ("all", "suite") else None
+        bash = find_bash(args.bash) if args.scenario in ("all", "suite", "subset") else None
     except FileNotFoundError as error:
         parser.error(str(error))
     machine = machine_info()
@@ -524,8 +555,7 @@ def main():
                             interrupted.mkdir(exist_ok=True)
                             shutil.move(str(path), interrupted / path.name)
         completed = {sample_key(sample) for sample in report["samples"]}
-        workloads = ["build", "suite"] if args.scenario == "all" else (
-            list(CASES) if args.scenario == "standalone" else [args.scenario])
+        workloads = workload_cases(args.scenario)
         save()
         for repetition in range(args.first_repetition, args.first_repetition + args.repetitions):
             # Alternate pair order to reduce systematic thermal/order bias.
@@ -552,14 +582,18 @@ def main():
                             })
                             if os.name == "nt":
                                 environment["MSYS2_ARG_CONV_EXCL"] = "*"
-                            if case == "suite":
+                            if case in ("suite", "subset"):
                                 environment.update(ENCORE_TEST_COMPILER=str(compiler),
                                                    ENCORE_TEST_REPOSITORY=str(root), CI_TEST_RUN_ID="compiler")
                             jobs = [] if configuration["jobs"] == "auto" else ["--jobs", configuration["jobs"]]
                             native_report = root / "target/test-report.json"
-                            if case == "build":
+                            project = root
+                            if case in PROJECT_CASES:
+                                project = private / "project"
+                                prepare_project(project, root, case)
+                            if case == "build" or case in PROJECT_CASES:
                                 arguments = [str(compiler), "build", "--profile", args.profile, "--timings", *jobs]
-                            elif case == "suite":
+                            elif case in ("suite", "subset"):
                                 # Use the variant's actual CI helper to prepare
                                 # its fixture, but do not run a compiler or
                                 # populate a compiled cache before cold timing.
@@ -580,17 +614,22 @@ def main():
                                     save()
                                     return 1
                                 arguments = [str(compiler), "test", "--report", str(native_report), *jobs]
+                                if case == "subset":
+                                    fixture = root / "target/ci-tests/compiler/tests"
+                                    for selected in SUBSET_CASES:
+                                        shutil.copy2(root / "tests" / (selected + ".enq"), fixture / ("benchmark_" + selected + ".enq"))
+                                    arguments.extend(["--filter", "tests/benchmark_"])
                             else:
                                 arguments = [str(compiler), "test", "--filter", f"tests/{case}.enq",
                                              "--report", str(native_report), *jobs]
                             for kind in ("cold", "warm") if args.warm else ("cold",):
                                 label = f"{variant}-{case}-j{configuration['jobs']}-r{repetition}-{kind}"
-                                cwd = root / "target/ci-tests/compiler" if case == "suite" else root
+                                cwd = root / "target/ci-tests/compiler" if case in ("suite", "subset") else project
                                 # A failed invocation must never accidentally reuse a stale report.
                                 native_report.unlink(missing_ok=True)
                                 result = measure(arguments, cwd, environment, logs / (label + ".log"), args.timeout)
                                 result["cache_disk"] = disk_usage(private / "c")
-                                result["target_disk"] = disk_usage(root / "target")
+                                result["target_disk"] = disk_usage((project if case in PROJECT_CASES else root) / "target")
                                 sample[kind] = result
                                 print(f"{label}: {result['wall_seconds']:.3f}s exit={result['exit_code']}", flush=True)
                                 try:
@@ -598,8 +637,8 @@ def main():
                                         shutil.copy2(native_report, logs / (label + ".json"))
                                     if result["exit_code"] != 0 or result["timed_out"]:
                                         raise ValueError("command failed or timed out; see raw log")
-                                    if case != "build":
-                                        summary, names = read_test_report(native_report, None if case == "suite" else 1)
+                                    if case != "build" and case not in PROJECT_CASES:
+                                        summary, names = read_test_report(native_report, None if case == "suite" else (len(SUBSET_CASES) if case == "subset" else 1))
                                         result["test_summary"] = summary
                                         result["resolved_test_jobs"] = summary.get("jobs")
                                         key = variant + "/" + case
@@ -607,15 +646,21 @@ def main():
                                         if names != previous:
                                             raise ValueError("test selection changed across jobs/repetitions/cache modes")
                                     else:
-                                        timing_path = root / "target" / args.profile / "encore-timings.json"
+                                        timing_path = project / "target" / args.profile / "encore-timings.json"
                                         if timing_path.exists():
                                             result["build_timings"] = json.loads(timing_path.read_text(encoding="utf-8"))
-                                        binary = root / "target" / args.profile / ("encore.exe" if os.name == "nt" else "encore")
+                                        name = "cold_benchmark" if case in PROJECT_CASES else "encore"
+                                        binary = project / "target" / args.profile / (name + (".exe" if os.name == "nt" else ""))
                                         if not binary.is_file():
                                             raise ValueError("compiler build produced no executable")
-                                        result["built_compiler_sha256"] = digest_file(binary)
-                                        subprocess.run([str(binary), "--version"], check=True, stdout=subprocess.DEVNULL,
-                                                       stderr=subprocess.DEVNULL, timeout=30)
+                                        result["built_artifact_sha256" if case in PROJECT_CASES else "built_compiler_sha256"] = digest_file(binary)
+                                        if case in PROJECT_CASES:
+                                            actual = subprocess.check_output([str(binary)], text=True, timeout=30).strip()
+                                            if actual != "cold_benchmark=1.2.3":
+                                                raise ValueError("project executable produced incorrect output: " + actual)
+                                        else:
+                                            subprocess.run([str(binary), "--version"], check=True, stdout=subprocess.DEVNULL,
+                                                           stderr=subprocess.DEVNULL, timeout=30)
                                 except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
                                     result["error"] = str(error)
                                     report["failed"].append(label + ": " + str(error))

@@ -35,20 +35,24 @@ class BenchmarkContracts(unittest.TestCase):
                 #!/usr/bin/env python3
                 import json,os,pathlib,shutil,subprocess,sys
                 args=sys.argv[1:]
+                if not args:
+                    print('cold_benchmark=1.2.3');sys.exit(0)
                 if args==['--version']:
                     print('encore benchmark-fixture');sys.exit(0)
                 with open(os.environ['BENCHMARK_FIXTURE_TRACE'],'a') as trace:
                     trace.write(args[0]+'\\n')
                 assert 'ENCORE_CODEGEN_PROFILE' not in os.environ
                 assert args[args.index('--jobs')+1]=='1'
-                subprocess.run(['git','rev-parse','--is-inside-work-tree'],check=True,stdout=subprocess.DEVNULL)
+                if not pathlib.Path('encore.toml').exists():
+                    subprocess.run(['git','rev-parse','--is-inside-work-tree'],check=True,stdout=subprocess.DEVNULL)
                 cache=pathlib.Path(os.environ['ENCORE_BUILD_CACHE']);cache.mkdir(exist_ok=True)
                 marker=cache/args[0];count=int(marker.read_text()) if marker.exists() else 0
                 assert count in (0,1)
                 marker.write_text(str(count+1))
                 if args[0]=='build':
                     out=pathlib.Path('target/extreme');out.mkdir(parents=True,exist_ok=True)
-                    shutil.copy2(__file__,out/'encore')
+                    name='cold_benchmark' if pathlib.Path('encore.toml').exists() else 'encore'
+                    shutil.copy2(__file__,out/name)
                     (out/'encore-timings.json').write_text(json.dumps({'cache_hit':bool(count)}))
                 else:
                     assert os.environ['ENCORE_TEST_COMPILER']
@@ -138,6 +142,20 @@ class BenchmarkContracts(unittest.TestCase):
             self.assertNotEqual(changed.returncode, 0)
             self.assertIn("resume input changed", changed.stderr)
             self.assertEqual(len(trace.read_text().splitlines()), 26)
+            projects = list(command)
+            projects[projects.index("--scenario") + 1] = "projects"
+            projects[projects.index("--output") + 1] = str(base / "projects.json")
+            result = subprocess.run(projects, env=environment, text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            project_report = json.loads((base / "projects.json").read_text())
+            self.assertTrue(project_report["completed"])
+            self.assertEqual({sample["case"] for sample in project_report["samples"]}, set(benchmark.PROJECT_CASES))
+            for sample in project_report["samples"]:
+                self.assertFalse(sample["cold"]["build_timings"]["cache_hit"])
+                self.assertTrue(sample["warm"]["build_timings"]["cache_hit"])
+            self.assertEqual({benchmark.sample_key(sample) for sample in project_report["samples"]},
+                             benchmark.expected_sample_keys(project_report))
+            self.assertEqual(list(scratch.iterdir()), [])
 
     def test_windows_shell_selection_uses_git_bash_instead_of_the_wsl_shim(self):
         with tempfile.TemporaryDirectory() as directory:

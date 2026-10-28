@@ -39,6 +39,30 @@ compiler CI test fixture, and `standalone` retains the four small language,
 lexer, parser, and translator programs for latency comparisons. One selected
 test offers little parallel work, so use `suite` to assess test throughput.
 
+Use `--scenario projects --profile dev` for a small executable using `std` and
+an executable with eight independent dependencies. Both execute the built
+program and verify its result outside the measured interval. `--scenario subset`
+runs the fixed eight lexer, parser, translator and cache regression programs;
+it is a latency sample, not a substitute for the complete suite. Pair five
+project repetitions and three compiler-build repetitions at `--jobs 1,2`
+when working within a two-CPU memory-limited container.
+
+`build --timings` adds package phase details for dependency metadata, workspace
+loading, semantic checks, safety inference, lowering context/cache/translation, EHIR parsing,
+frontend checkpoint publication, backend normalization and ready-record
+publication. These fields supplement the existing timings and do not require
+a profiler. Concurrent phase durations are not an additive wall-time breakdown.
+Package workers reuse their checked body facts during safety inference; this
+reuse stays inside the same compilation and does not create another disk cache.
+
+Nominal type resolution also keeps a translation-local cache, limited to 4,096
+entries, 1,024-byte keys and 2,048-byte values. Generic shadowing scopes and
+oversized types use the ordinary resolver. An identifier index scans each EHIR
+module once to reject impossible nominal rewrites; the scoped rewriter still
+handles binders, members, strings and comments. Replacements update the index
+so later names retain the same sequential rewrite behavior. These indices are
+released with the translation context and add no persistent cache format.
+
 Every cold sample has an independent frozen source tree, private Git metadata,
 empty project output, and private compiled-package/registry caches. A warm
 sample immediately follows it with those same caches. Source copying and
