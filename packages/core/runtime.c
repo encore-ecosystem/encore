@@ -70,10 +70,12 @@ static void encore_ensure_main_stack_capacity(void) {
 #include <security.h>
 #include <schannel.h>
 #include <wincrypt.h>
+#ifdef _MSC_VER
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Secur32.lib")
 #pragma comment(lib, "Crypt32.lib")
 #pragma comment(linker, "/STACK:8388608")
+#endif
 #else
 #include <pthread.h>
 #include <spawn.h>

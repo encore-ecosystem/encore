@@ -1,0 +1,834 @@
+//! Typed bindings to trusted native plugins. Loading native code is unsafe.
+import core::result::Result
+import core::panic::panic
+import core::reflect
+import core::reflect::{Builder, Kind, TypeInfo}
+import core::vec::Vec
+
+struct __EncorePluginLease {
+    token: usize
+}
+
+pub struct PluginOptions {
+    max_transfer_bytes: usize
+    max_value_depth: u32
+    max_retired_generations: u32
+    quiesce_timeout_ms: u32
+}
+pub struct PluginError {
+    code: u32
+    message: str
+}
+pub struct StateSnapshot {
+    version: u32
+    data: Vec[u8]
+}
+pub struct Plugin {
+    lease: __EncorePluginLease
+}
+pub struct Binding[Interface] {
+    lease: __EncorePluginLease
+}
+pub struct Resource[Interface] {
+    lease: __EncorePluginLease
+}
+struct CallStorage {
+    bytes:[u64;
+        256]
+}
+extern fn encore_plugin_handle_retain(token: usize)
+extern fn encore_plugin_handle_release(token: usize)
+extern fn encore_plugin_native_load(path: str, bytes: usize, depth: u32, retired: u32, wait_ms: u32) -> usize
+extern fn encore_plugin_native_bind(token: usize, name: str, fingerprint: str) -> usize
+extern fn encore_plugin_native_reload(token: usize, path: str) -> u32
+extern fn encore_plugin_native_close(token: usize) -> u32
+extern fn encore_plugin_native_error_code() -> u32
+extern fn encore_plugin_native_error_message() -> str
+extern fn encore_plugin_frame_begin(storage: usize, bytes: usize, token: usize) -> usize
+extern fn encore_plugin_frame_arena(frame: usize) -> usize
+extern fn encore_plugin_frame_output(frame: usize) -> usize
+extern fn encore_plugin_frame_dispatch(frame: usize, method: usize, args: usize) -> u32
+extern fn encore_plugin_frame_clear(frame: usize)
+
+impl for PluginOptions {
+    pub fn new() -> Self {
+        ret Self { 67108864_usize, 128_u32, 2_u32, 5000_u32 }
+    }
+}
+
+impl for Plugin {
+    /// # Safety
+    /// The library and all its dependencies must be trusted native code.
+    pub fn load(path: str) -> Result[Self, PluginError] {
+        unsafe {
+            ret Self::load_with(path, PluginOptions::new())
+        }
+    }
+    /// # Safety
+    /// Same native-code trust requirements as load.
+    pub fn load_with(path: str, options: PluginOptions) -> Result[Self, PluginError] {
+        let token = unsafe {
+            encore_plugin_native_load(path, options.max_transfer_bytes,
+                options.max_value_depth, options.max_retired_generations, options.quiesce_timeout_ms,)
+        }
+        if token == 0 {
+            ret Result::Err(__last_error())
+        }
+        ret Result::Ok(Self {
+                __EncorePluginLease { token }
+            }
+        )
+    }
+    #attr(safe)
+    #attr(reflection_template)
+    pub fn bind[Interface](self: Self, name: str) -> Result[Binding[Interface], PluginError] {
+        let fingerprint = __interface_fingerprint[Interface]()
+        if fingerprint == "" {
+            ret Result::Err(PluginError {
+                    2_u32, "compiler does not support typed plugin interfaces"
+                }
+            )
+        }
+        let token = unsafe {
+            encore_plugin_native_bind(self.lease.token, name, fingerprint)
+        }
+        if token == 0 {
+            ret Result::Err(__last_error())
+        }
+        ret Result::Ok(Binding[Interface] {
+                __EncorePluginLease { token }
+            }
+        )
+    }
+    /// # Safety
+    /// The replacement is trusted and starts no untracked background threads.
+    pub fn reload(mut self: Self, path: str) -> Result[(), PluginError] {
+        if unsafe {
+            encore_plugin_native_reload(self.lease.token, path)
+        }
+        != 0_u32 {
+            ret Result::Err(__last_error())
+        }
+        ret Result::Ok(())
+    }
+    /// Returns Busy while bindings, resources or calls still keep code alive.
+    #attr(safe)
+    pub fn close(mut self: Self) -> Result[(), PluginError] {
+        if unsafe {
+            encore_plugin_native_close(self.lease.token)
+        }
+        != 0_u32 {
+            ret Result::Err(__last_error())
+        }
+        ret Result::Ok(())
+    }
+}
+
+impl for CallStorage {
+    pub fn address(mut self: Self) -> usize {
+        unsafe {
+            unsafe ehir {
+                address: usize = pcast self: mut CallStorage, usize
+            }
+            ret address
+        }
+    }
+}
+#attr(safe)
+pub fn __last_error() -> PluginError {
+    unsafe {
+        ret PluginError {
+            encore_plugin_native_error_code(), encore_plugin_native_error_message()
+        }
+    }
+}
+#attr(plugin_interface_fingerprint)
+#attr(safe)
+pub fn __interface_fingerprint[Interface]() -> str {
+    ret ""
+}
+// Validates the exact nominal implementation, including concrete trait arguments.
+#attr(safe)
+pub fn __validate_implementation[Interface, Value]() {
+}
+// The compiler calls this template after resolving the declared trait method.
+pub fn __invoke[Args, Out](token: usize, method: usize, args: Args) -> Result[Out, PluginError] {
+    let mut storage = CallStorage {
+        [0_u64;
+            256]
+    }
+    let frame = unsafe {
+        encore_plugin_frame_begin(storage.address(), 2048_usize, token)
+    }
+    if frame == 0 {
+        ret Result::Err(__last_error())
+    }
+    let arena = unsafe {
+        encore_plugin_frame_arena(frame)
+    }
+    let encoded = __wire_encode(args, arena, 0_usize)
+    let result = match encoded {
+        Ok(value) => {
+            if unsafe {
+                encore_plugin_frame_dispatch(frame, method, value)
+            }
+            == 0_u32 {
+                __wire_decode[Out](unsafe {
+                        encore_plugin_frame_output(frame)
+                    }
+                    , frame, 0_usize,)
+            } else {
+                Result[Out, PluginError]::Err(__last_error())
+            }
+        }
+        Err(error) => {
+            Result[Out, PluginError]::Err(error)
+        }
+    }
+    unsafe {
+        encore_plugin_frame_clear(frame)
+    }
+    ret result
+}
+
+extern fn encore_plugin_wire_new(arena: usize, kind: u32, tag: u32, count: usize) -> usize
+extern fn encore_plugin_wire_child(value: usize, index: usize) -> usize
+extern fn encore_plugin_wire_assign(destination: usize, source: usize)
+extern fn encore_plugin_wire_kind(value: usize) -> u32
+extern fn encore_plugin_wire_tag(value: usize) -> u32
+extern fn encore_plugin_wire_count(value: usize) -> usize
+extern fn encore_plugin_wire_bits(value: usize) -> u64
+extern fn encore_plugin_wire_set_bits(value: usize, bits: u64)
+extern fn encore_plugin_wire_f64_bits(value: f64) -> u64
+extern fn encore_plugin_wire_f64(bits: u64) -> f64
+extern fn encore_plugin_wire_string(value: usize, arena: usize, text: str) -> bool
+extern fn encore_plugin_wire_read_string(value: usize) -> str
+extern fn encore_plugin_wire_resource(token: usize, value: usize, arena: usize) -> u32
+extern fn encore_plugin_wire_take_resource(frame: usize, value: usize, fingerprint: str) -> usize
+
+fn __wire_invalid() -> PluginError {
+    ret PluginError {
+        7_u32, "invalid plugin value or unsupported type"
+    }
+}
+fn __wire_limit() -> PluginError {
+    ret PluginError { 10_u32, "plugin transfer limit exceeded" }
+}
+fn __wire_node(arena: usize, kind: u32, tag: u32, count: usize) -> Result[usize, PluginError] {
+    let value = unsafe {
+        encore_plugin_wire_new(arena, kind, tag, count)
+    }
+    if value == 0 {
+        ret Result::Err(__wire_limit())
+    }
+    ret Result::Ok(value)
+}
+fn __wire_scalar(arena: usize, kind: u32, bits: u64) -> Result[usize, PluginError] {
+    let value = __wire_node(arena, kind, 0_u32, 0_usize)?
+    unsafe {
+        encore_plugin_wire_set_bits(value, bits)
+    }
+    ret Result::Ok(value)
+}
+fn __wire_encode[Value](value: Value, arena: usize, depth: usize) -> Result[usize, PluginError] {
+    if depth > unsafe {
+        encore_plugin_wire_max_depth(arena)
+    }
+    as usize {
+        ret Result::Err(__wire_limit())
+    }
+    let info = reflect::type_info[Value]()
+    if info.is_template[Resource]() {
+        let out = __wire_node(arena, 10_u32, 0_u32, 0_usize)?
+        if unsafe {
+            encore_plugin_wire_resource(value.lease.token, out, arena)
+        }
+        != 0_u32 {
+            ret Result::Err(__wire_invalid())
+        }
+        ret Result::Ok(out)
+    }
+    if info.is_template[Vec]() {
+        ret __wire_encode_vec(value, arena, depth)
+    }
+    match info.kind() {
+        Kind::Unit => {
+            ret __wire_scalar(arena, 0_u32, 0_u64)
+        }
+        Kind::Bool => {
+            ret __wire_scalar(arena, 1_u32, if value {
+                    1_u64
+                } else {
+                    0_u64
+                }
+                ,
+            )
+        }
+        Kind::U8 => {
+            ret __wire_scalar(arena, 2_u32, value as u64)
+        }
+        Kind::U16 => {
+            ret __wire_scalar(arena, 2_u32, value as u64)
+        }
+        Kind::U32 => {
+            ret __wire_scalar(arena, 2_u32, value as u64)
+        }
+        Kind::U64 => {
+            ret __wire_scalar(arena, 2_u32, value)
+        }
+        Kind::Usize => {
+            ret __wire_scalar(arena, 2_u32, value as u64)
+        }
+        Kind::I8 => {
+            ret __wire_scalar(arena, 3_u32, value as i64 as u64)
+        }
+        Kind::I16 => {
+            ret __wire_scalar(arena, 3_u32, value as i64 as u64)
+        }
+        Kind::I32 => {
+            ret __wire_scalar(arena, 3_u32, value as i64 as u64)
+        }
+        Kind::I64 => {
+            ret __wire_scalar(arena, 3_u32, value as u64)
+        }
+        Kind::Isize => {
+            ret __wire_scalar(arena, 3_u32, value as i64 as u64)
+        }
+        Kind::F32 => {
+            ret __wire_scalar(arena, 4_u32, unsafe {
+                    encore_plugin_wire_f64_bits(value as f64)
+                }
+                ,
+            )
+        }
+        Kind::F64 => {
+            ret __wire_scalar(arena, 4_u32, unsafe {
+                    encore_plugin_wire_f64_bits(value)
+                }
+                ,
+            )
+        }
+        Kind::String => {
+            let out = __wire_node(arena, 5_u32, 0_u32, 0_usize)?
+            if !unsafe {
+                encore_plugin_wire_string(out, arena, value)
+            }
+            {
+                ret Result::Err(__wire_limit())
+            }
+            ret Result::Ok(out)
+        }
+        Kind::Struct => {
+            ret __wire_encode_record(value, arena, depth)
+        }
+        Kind::Tuple => {
+            ret __wire_encode_record(value, arena, depth)
+        }
+        Kind::Array => {
+            ret __wire_encode_record(value, arena, depth)
+        }
+        Kind::Enum => {
+            let mut index = 0_u32
+            for variant in info.variants() {
+                if variant.is_active(value) {
+                    if variant.has_payload() {
+                        let out = __wire_node(arena, 9_u32, index, 1_usize)?
+                        match variant.get(value) {
+                            Some(payload) => {
+                                let encoded = __wire_encode(payload, arena, depth + 1_usize)?
+                                unsafe {
+                                    encore_plugin_wire_assign(encore_plugin_wire_child(out, 0_usize), encoded)
+                                }
+                                ret Result::Ok(out)
+                            }
+                            None => {
+                                ret Result::Err(__wire_invalid())
+                            }
+                        }
+                    } else {
+                        ret __wire_node(arena, 9_u32, index, 0_usize)
+                    }
+                }
+                index += 1_u32
+            }
+            ret Result::Err(__wire_invalid())
+        }
+        _ => {
+            ret Result::Err(__wire_invalid())
+        }
+    }
+}
+fn __wire_encode_record[Value](value: Value, arena: usize, depth: usize) -> Result[usize, PluginError] {
+    let info = reflect::type_info[Value]()
+    let mut count = 0_usize
+    for field in info.fields() {
+        count += 1_usize
+    }
+    let out = __wire_node(arena, 8_u32, 0_u32, count)?
+    for field in info.fields() {
+        let encoded = __wire_encode(field.get(value), arena, depth + 1_usize)?
+        unsafe {
+            encore_plugin_wire_assign(encore_plugin_wire_child(out, field.index()), encoded)
+        }
+    }
+    ret Result::Ok(out)
+}
+fn __wire_encode_vec[Item](value: Vec[Item], arena: usize, depth: usize) -> Result[usize, PluginError] {
+    let info = reflect::type_info[Item]()
+    match info.kind() {
+        Kind::U8 => {
+            let out = __wire_node(arena, 6_u32, 0_u32, 0_usize)?
+            if !unsafe {
+                encore_plugin_wire_bytes(out, arena, value.as_ptr(), value.len())
+            }
+            {
+                ret Result::Err(__wire_limit())
+            }
+            ret Result::Ok(out)
+        }
+        _ => {
+        }
+    }
+    let out = __wire_node(arena, 7_u32, 0_u32, value.len())?
+    let mut index = 0_usize
+    for item in value {
+        let encoded = __wire_encode(item, arena, depth + 1_usize)?
+        unsafe {
+            encore_plugin_wire_assign(encore_plugin_wire_child(out, index), encoded)
+        }
+        index += 1_usize
+    }
+    ret Result::Ok(out)
+}
+fn __wire_decode[Value](value: usize, frame: usize, depth: usize) -> Result[Value, PluginError] {
+    ret __wire_read(reflect::type_info[Value](), value, frame, depth)
+}
+fn __wire_read[Value](info: TypeInfo[Value], value: usize, frame: usize, depth: usize) -> Result[Value, PluginError] {
+    if value == 0 || depth > 256_usize {
+        ret Result::Err(__wire_invalid())
+    }
+    let kind = unsafe {
+        encore_plugin_wire_kind(value)
+    }
+    let bits = unsafe {
+        encore_plugin_wire_bits(value)
+    }
+    if info.is_template[Resource]() {
+        ret __wire_read_resource(info.argument(0_usize), value, frame)
+    }
+    if info.is_template[Vec]() {
+        ret __wire_read_vec(info.argument(0_usize), value, frame, depth)
+    }
+    match info.kind() {
+        Kind::Unit => {
+            if kind != 0_u32 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(())
+        }
+        Kind::Bool => {
+            if kind != 1_u32 || bits > 1_u64 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(bits == 1_u64)
+        }
+        Kind::U8 => {
+            if kind != 2_u32 || bits > 255_u64 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(bits as u8)
+        }
+        Kind::U16 => {
+            if kind != 2_u32 || bits > 65535_u64 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(bits as u16)
+        }
+        Kind::U32 => {
+            if kind != 2_u32 || bits > 4294967295_u64 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(bits as u32)
+        }
+        Kind::U64 => {
+            if kind != 2_u32 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(bits)
+        }
+        Kind::Usize => {
+            if kind != 2_u32 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(bits as usize)
+        }
+        Kind::I8 => {
+            if kind != 3_u32 ||(bits as i64) < - 128_i64 ||(bits as i64) > 127_i64 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(bits as i8)
+        }
+        Kind::I16 => {
+            if kind != 3_u32 ||(bits as i64) < - 32768_i64 ||(bits as i64) > 32767_i64 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(bits as i16)
+        }
+        Kind::I32 => {
+            if kind != 3_u32 ||(bits as i64) < - 2147483648_i64 ||(bits as i64) > 2147483647_i64 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(bits as i32)
+        }
+        Kind::I64 => {
+            if kind != 3_u32 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(bits as i64)
+        }
+        Kind::Isize => {
+            if kind != 3_u32 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(bits as isize)
+        }
+        Kind::F32 => {
+            if kind != 4_u32 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(unsafe {
+                    encore_plugin_wire_f64(bits)
+                }
+                as f32)
+        }
+        Kind::F64 => {
+            if kind != 4_u32 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(unsafe {
+                    encore_plugin_wire_f64(bits)
+                }
+            )
+        }
+        Kind::String => {
+            if kind != 5_u32 {
+                ret Result::Err(__wire_invalid())
+            }
+            ret Result::Ok(unsafe {
+                    encore_plugin_wire_read_string(value)
+                }
+            )
+        }
+        Kind::Struct => {
+            ret __wire_read_record(info, value, frame, depth)
+        }
+        Kind::Tuple => {
+            ret __wire_read_record(info, value, frame, depth)
+        }
+        Kind::Array => {
+            ret __wire_read_record(info, value, frame, depth)
+        }
+        Kind::Enum => {
+            if kind != 9_u32 {
+                ret Result::Err(__wire_invalid())
+            }
+            let tag = unsafe {
+                encore_plugin_wire_tag(value)
+            }
+            let count = unsafe {
+                encore_plugin_wire_count(value)
+            }
+            let mut index = 0_u32
+            for variant in info.variants() {
+                if tag == index {
+                    if variant.has_payload() {
+                        if count != 1_usize {
+                            ret Result::Err(__wire_invalid())
+                        }
+                        let payload = __wire_read(variant.type(), unsafe {
+                                encore_plugin_wire_child(value, 0_usize)
+                            }
+                            , frame, depth + 1_usize,)?
+                        ret Result::Ok(variant.construct(payload))
+                    } else {
+                        if count != 0_usize {
+                            ret Result::Err(__wire_invalid())
+                        }
+                        ret Result::Ok(variant.construct(()))
+                    }
+                }
+                index += 1_u32
+            }
+            ret Result::Err(__wire_invalid())
+        }
+        _ => {
+            ret Result::Err(__wire_invalid())
+        }
+    }
+}
+fn __wire_read_record[Value](info: TypeInfo[Value], value: usize, frame: usize, depth: usize) -> Result[Value, PluginError] {
+    if unsafe {
+        encore_plugin_wire_kind(value)
+    }
+    != 8_u32 {
+        ret Result::Err(__wire_invalid())
+    }
+    let mut count = 0_usize
+    for field in info.fields() {
+        count += 1_usize
+    }
+    if count != unsafe {
+        encore_plugin_wire_count(value)
+    }
+    {
+        ret Result::Err(__wire_invalid())
+    }
+    let mut builder = reflect::Builder[Value]::new()
+    for field in info.fields() {
+        let item = __wire_read(field.type(), unsafe {
+                encore_plugin_wire_child(value, field.index())
+            }
+            , frame, depth + 1_usize,)?
+        builder.set(field, item)
+    }
+    match builder.finish() {
+        Ok(result) => {
+            ret Result::Ok(result)
+        }
+        Err(_) => {
+            ret Result::Err(__wire_invalid())
+        }
+    }
+}
+fn __wire_read_vec[Item](info: TypeInfo[Item], value: usize, frame: usize, depth: usize) -> Result[Vec[Item], PluginError] {
+    match info.kind() {
+        Kind::U8 => {
+            if unsafe {
+                encore_plugin_wire_kind(value)
+            }
+            != 6_u32 {
+                ret Result::Err(__wire_invalid())
+            }
+            let count = unsafe {
+                encore_plugin_wire_count(value)
+            }
+            let mut out = Vec[u8]::with_capacity(count)
+            if !unsafe {
+                encore_plugin_wire_read_bytes(value, out.as_ptr(), count)
+            }
+            {
+                ret Result::Err(__wire_invalid())
+            }
+            unsafe {
+                out.set_len(count)
+            }
+            ret Result::Ok(out)
+        }
+        _ => {
+        }
+    }
+    if unsafe {
+        encore_plugin_wire_kind(value)
+    }
+    != 7_u32 {
+        ret Result::Err(__wire_invalid())
+    }
+    let count = unsafe {
+        encore_plugin_wire_count(value)
+    }
+    let mut out = Vec[Item]::new()
+    let mut index = 0_usize
+    while index < count {
+        out.push(__wire_read(info, unsafe {
+                    encore_plugin_wire_child(value, index)
+                }
+                , frame, depth + 1_usize,)?)
+        index += 1_usize
+    }
+    ret Result::Ok(out)
+}
+fn __wire_read_resource[Interface](info: TypeInfo[Interface], value: usize, frame: usize) -> Result[Resource[Interface], PluginError] {
+    let token = unsafe {
+        encore_plugin_wire_take_resource(frame, value, __interface_fingerprint[Interface]())
+    }
+    if token == 0 {
+        ret Result::Err(__last_error())
+    }
+    ret Result::Ok(Resource[Interface] {
+            __EncorePluginLease { token }
+        }
+    )
+}
+
+// Compiler-generated callee adapters. These accept module-local raw addresses
+// and are intentionally unsafe to call from ordinary Encore code.
+#attr(plugin_function_address)
+pub fn __function_address[Function](function: Function) -> usize {
+    ret 0_usize
+}
+
+pub fn __payload_new[Value](value: Value) -> usize {
+    unsafe {
+        unsafe ehir {
+            zero: usize = lcpos 0_usize
+            one: usize = lcpos 1_usize
+            empty: Value * = pcast zero: usize, Value *
+            pointer: Value * = hrealloc empty: Value *, one: usize
+            store value: Value, pointer: Value *
+            token: usize = pcast pointer: Value *, usize
+        }
+        ret token
+    }
+}
+pub fn __payload_drop[Value](token: usize) {
+    unsafe {
+        unsafe ehir {
+            pointer: Value * = pcast token: usize, Value *
+            item: Value = load pointer: Value *
+            drop item: Value
+            hfree pointer: Value *
+        }
+    }
+}
+#attr(borrowed_return)
+pub fn __payload_copy[Value](token: usize) -> Value {
+    unsafe {
+        unsafe ehir {
+            pointer: Value * = pcast token: usize, Value *
+            item: Value = load pointer: Value *
+        }
+        ret item
+    }
+}
+extern fn encore_plugin_generated_error(destination: usize, code: u32, message: str) -> u32
+extern fn encore_plugin_generated_payload(destination: usize, payload: usize)
+extern fn encore_plugin_generated_arguments(args: usize, count: usize, arena: usize) -> usize
+extern fn encore_plugin_snapshot_allocate(snapshot: usize, arena: usize, version: u32, bytes: usize) -> usize
+extern fn encore_plugin_snapshot_set(data: usize, index: usize, value: u8)
+extern fn encore_plugin_snapshot_version(snapshot: usize) -> u32
+extern fn encore_plugin_snapshot_size(snapshot: usize) -> usize
+extern fn encore_plugin_snapshot_byte(snapshot: usize, index: usize) -> u8
+pub fn __factory_output[Value](result: Result[Value, str], output: usize, error: usize) -> u32 {
+    match result {
+        Ok(value) => {
+            unsafe {
+                encore_plugin_generated_payload(output, __payload_new(value))
+            }
+            ret 0_u32
+        }
+        Err(message) => {
+            unsafe {
+                ret encore_plugin_generated_error(error, 8_u32, message)
+            }
+        }
+    }
+}
+pub fn __decode_arguments[Args](args: usize, count: usize, arena: usize) -> Result[Args, PluginError] {
+    ret __wire_decode[Args](unsafe {
+            encore_plugin_generated_arguments(args, count, arena)
+        }
+        , 0_usize, 0_usize,)
+}
+pub fn __encode_output[Value](value: Value, arena: usize, output: usize, error: usize) -> u32 {
+    match __wire_encode(value, arena, 0_usize) {
+        Ok(encoded) => {
+            unsafe {
+                encore_plugin_wire_assign(output, encoded)
+            }
+            ret 0_u32
+        }
+        Err(detail) => {
+            unsafe {
+                ret encore_plugin_generated_error(error, detail.code, detail.message)
+            }
+        }
+    }
+}
+pub fn __snapshot_output(result: Result[StateSnapshot, str], arena: usize, snapshot: usize, error: usize) -> u32 {
+    match result {
+        Ok(value) => {
+            let data = unsafe {
+                encore_plugin_snapshot_allocate(snapshot, arena, value.version, value.data.len())
+            }
+            if data == 0 && value.data.len() != 0 {
+                unsafe {
+                    ret encore_plugin_generated_error(error, 10_u32, "snapshot limit exceeded")
+                }
+            }
+            let mut index = 0_usize
+            for byte in value.data {
+                unsafe {
+                    encore_plugin_snapshot_set(data, index, byte)
+                }
+                index += 1_usize
+            }
+            ret 0_u32
+        }
+        Err(message) => {
+            unsafe {
+                ret encore_plugin_generated_error(error, 9_u32, message)
+            }
+        }
+    }
+}
+pub fn __snapshot_input(snapshot: usize) -> StateSnapshot {
+    let count = unsafe {
+        encore_plugin_snapshot_size(snapshot)
+    }
+    let mut data = Vec[u8]::new()
+    let mut index = 0_usize
+    while index < count {
+        data.push(unsafe {
+                encore_plugin_snapshot_byte(snapshot, index)
+            }
+        ) index += 1_usize
+    }
+    ret StateSnapshot {
+        unsafe {
+            encore_plugin_snapshot_version(snapshot)
+        }
+        , data
+    }
+}
+
+extern fn encore_plugin_native_resource(payload: usize, key: str) -> usize
+
+impl[Interface] for Resource[Interface] {
+    /// Creates a provider-owned resource. The compiler registers the concrete
+    /// implementation's adapters in the plugin descriptor.
+    #attr(safe)
+    #attr(reflection_template)
+    #attr(plugin_resource_constructor)
+    pub fn new[Value](value: Value) -> Self {
+        let payload = unsafe {
+            __payload_new(value)
+        }
+        let token = unsafe {
+            __resource_create[Interface, Value](payload)
+        }
+        if token == 0 {
+            unsafe {
+                __payload_drop[Value](payload)
+            }
+            panic(__last_error().message)
+            loop {
+            }
+        }
+        ret Self {
+            __EncorePluginLease { token }
+        }
+    }
+}
+
+extern fn encore_plugin_wire_bytes(value: usize, arena: usize, bytes: u8*, length: usize) -> bool
+extern fn encore_plugin_wire_read_bytes(value: usize, bytes: u8*, length: usize) -> bool
+
+#attr(plugin_resource_create)
+pub fn __resource_create[Interface, Value](payload: usize) -> usize {
+    unsafe {
+        ret 0_usize
+    }
+}
+extern fn encore_plugin_native_resource_registered(payload: usize, key: str, initialize: usize) -> usize
+
+extern fn encore_plugin_wire_max_depth(arena: usize) -> u32

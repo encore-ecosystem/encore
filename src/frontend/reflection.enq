@@ -7,6 +7,7 @@ import core::vec::Vec
 
 import json::{Json, stringify}
 
+import refrain::frontend::import_paths::import_binding_names
 import refrain::frontend::metadata_ast::{decode_metadata_ast, encode_metadata_ast}
 import refrain::frontend::parser::{Expr, FunctionItem, GenericParam, ImplStmt, MatchArmBody, Statement}
 
@@ -64,6 +65,29 @@ pub fn reflection_template_names(ast: Vec[Statement]) -> Vec[str] {
     let mut changed = true
     while changed {
         changed = false
+        // Resource constructors keep their scoped name so unrelated new()
+        // methods remain ordinary generics. Follow explicit SDK import aliases.
+        if contains_name(names, "Resource::new") {
+            for statement in ast {
+                match statement {
+                    Statement::Import(item) => {
+                        for owner in vec!["platform::plugin", "std::plugin"] {
+                            for binding in import_binding_names(item.path, owner) {
+                                if binding.0 == "Resource" && binding.1 != "Resource" {
+                                    let alias = binding.1 + "::new"
+                                    if !contains_name(names, alias) {
+                                        names.push(alias)
+                                        changed = true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
         for function in functions {
             if function.generics.is_empty() {
                 continue
@@ -89,8 +113,48 @@ fn contains_name(names: Vec[str], value: str) -> bool {
     ret false
 }
 
+// Preserve the associated member after generic arguments; root_name is a
+// type helper and deliberately stops at the first opening bracket.
+fn template_path_matches(path: str, names: Vec[str]) -> bool {
+    let mut plain = ""
+    let mut depth = 0_usize
+    let mut index = 0_usize
+    while index < path.byte_len() {
+        let byte = path.byte_at(index)
+        if byte == 91_u8 {
+            depth += 1_usize
+        } elif byte == 93_u8 && depth > 0_usize {
+            depth -= 1_usize
+        } elif depth == 0_usize {
+            plain += path.slice_bytes(index, 1_usize)
+        }
+        index += 1_usize
+    }
+    for name in names {
+        if plain == name || last_name(plain) == name {
+            ret true
+        }
+        if plain.byte_len() > name.byte_len() + 2_usize {
+            let start = plain.byte_len() - name.byte_len()
+            if plain.slice_bytes(start - 2_usize, 2_usize) == "::" &&
+            plain.slice_bytes(start, name.byte_len()) == name {
+                ret true
+            }
+        }
+    }
+    ret false
+}
+fn scoped_template_name(owner: str, method: FunctionItem) -> str {
+    for attribute in method.attrs {
+        if attribute == "plugin_resource_constructor" || attribute == "attr:plugin_resource_constructor" {
+            ret root_name(owner) + "::" + method.name
+        }
+    }
+    ret method.name
+}
+
 fn calls_template(value: Json, names: Vec[str]) -> bool {
-    if text(at(value, 0)) == "Path" && contains_name(names, last_name(root_name(text(at(value, 1))))) {
+    if text(at(value, 0)) == "Path" && template_path_matches(text(at(value, 1)), names) {
         ret true
     }
     if text(at(value, 0)) == "MethodCall" && contains_name(names, text(at(at(value, 1), 1))) {
@@ -122,7 +186,7 @@ fn all_functions(ast: Vec[Statement]) -> Vec[FunctionItem] {
                     }
                     out.push(FunctionItem {
                             method.attrs, method.decorators, method.is_public, method.is_extern,
-                            method.is_async, method.name, method.documentation, generics, method.params,
+                            method.is_async, scoped_template_name(item.target, method), method.documentation, generics, method.params,
                             method.ret_type, method.returns_sending, method.returns_frozen,
                             method.body, method.source_name, method.line, method.column
                         }
@@ -515,6 +579,48 @@ fn root_name(value: str) -> str {
 
 fn shape(state: Expansion, owner: str) -> Result[ReflectionShape, str] {
     let name = root_name(owner)
+    if (name.byte_len() > 8 && name.slice_bytes(0, 8) == "__array_") ||
+    (owner.byte_len() > 2 && owner.byte_at(0) == 91_u8 && find_text(owner, ";") < owner.byte_len()) {
+        let raw = owner.byte_at(0) == 91_u8
+        let separator = if raw {
+            find_text(owner, ";")
+        } else {
+            0_usize
+        }
+        let element = if raw {
+            trim_type(owner.slice_bytes(1, separator - 1))
+        } else {
+            type_arguments(owner).get(0).unwrap_or("")
+        }
+        let length = if raw {
+            trim_type(owner.slice_bytes(separator + 1, owner.byte_len() - separator - 2))
+        } else {
+            name.slice_bytes(8, name.byte_len() - 8)
+        }
+        let mut count = 0_usize
+        let mut digit = 0_usize
+        while digit < length.byte_len() {
+            let byte = length.byte_at(digit) digit += 1
+            if byte == 95_u8 {
+                break
+            }
+            if byte < 48_u8 || byte > 57_u8 {
+                ret Result::Err("array reflection requires a concrete length")
+            }
+            count = count * 10 +(byte - 48_u8) as usize
+            if count > 65536 {
+                ret Result::Err("reflected array exceeds 65536 elements")
+            }
+        }
+        let mut fields = Vec[(str, str)]::new() let mut index = 0_usize
+        while index < count {
+            fields.push((Debug::fmt(index), element)) index += 1
+        }
+        ret Result::Ok(ReflectionShape {
+                owner, owner, "Array", Vec[str]::new(), fields, Vec[(str, str, str)]::new()
+            }
+        )
+    }
     if (owner.byte_len() > 1 && owner.byte_at(0) == 40_u8 && owner != "()") ||
     (name.byte_len() > 8 && name.slice_bytes(0, 8) == "__tuple_") {
         let source = if owner.byte_at(0) == 40_u8 {
@@ -1274,6 +1380,8 @@ fn builder_finish(state: Expansion, source: Json, name: str, owner: str) -> Resu
     }
     let constructor = if declaration.kind == "Tuple" {
         node_like(source, "TupleLiteral", Json::Array(singleton(Json::Array(values))))
+    } elif declaration.kind == "Array" {
+        node_like(source, "ArrayLiteral", Json::Array(singleton(Json::Array(values))))
     } else {
         node_like(source, "StructInit", pair(owner, Json::Array(values)))
     }
@@ -1541,7 +1649,7 @@ fn walk_expression(value: Expr, names: Vec[str], reflection: bool) -> bool {
                 ret name == "reflect::type_info" || name == "core::reflect::type_info" ||
                 name == "reflect::Builder" || name == "core::reflect::Builder"
             }
-            ret contains_name(names, last_name(name))
+            ret template_path_matches(path, names)
         }
         Expr::Parenthesized(item) => {
             ret walk_expression(item.value, names, reflection)

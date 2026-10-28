@@ -1,0 +1,49 @@
+//! Compile and execute indirect calls and external-resource ownership hooks.
+import ehirlib::parse_module_text
+import std::io::eprintln
+import std::os::{mkdir_all, write_file}
+import std::process::Command
+
+import refrain::codegen::emit_ir_for_target
+
+#cfg(target_os = "windows")
+fn executable() -> str {
+    ret "target/plugin-primitives.exe"
+}
+#cfg(not(target_os = "windows"))
+fn executable() -> str {
+    ret "target/plugin-primitives"
+}
+#cfg(target_os = "windows")
+fn target() -> str {
+    ret "x86_64-w64-windows-gnu"
+}
+#cfg(not(target_os = "windows"))
+fn target() -> str {
+    ret "x86_64-unknown-linux-gnu"
+}
+
+fn main() -> u32 {
+    let source = "struct Storage[T] {\n item:T\n}\nstruct UnusedDto {\n small:Storage[u8]\n large:Storage[u64]\n}\n" +
+    "struct NativeToken {\n  // @retain track_retain\n  // @release track_release\n  token: usize\n}\n" +
+    "extern fn track_retain(token: usize) -> ()\nextern fn track_release(token: usize) -> ()\n" +
+    "extern fn address() -> usize\nextern fn references() -> u32\nextern fn increment(value:u32) -> u32\n" +
+    "fn main() -> u32 {\n $entry:\n token: usize = lcpos 1_usize\n value: NativeToken = lcsos NativeToken(token: usize)\n" +
+    " retain value: NativeToken\n drop value: NativeToken\n drop value: NativeToken\n" +
+    " remaining: u32 = call references()\n pointer: usize = call address()\n argument: u32 = lcpos 41_u32\n" +
+    " answer: u32 = icall pointer: usize(argument: u32)\n" +
+    " typed_pointer: usize = call __ehir_function_address__increment[u32,u32]()\n typed_answer: u32 = icall typed_pointer: usize(answer:u32)\n expected: u32 = lcpos 43_u32\n" +
+    " difference: u32 = sub typed_answer: u32, expected: u32\n result: u32 = add difference: u32, remaining: u32\n ret result: u32\n}\n"
+    let ir = emit_ir_for_target(parse_module_text("plugin_primitives", source), target(), 64)
+    let native = "#include <stdint.h>\n#include <stddef.h>\nstatic uint32_t refs=1;\n" +
+    "void track_retain(size_t token){refs+=(uint32_t)token;}\nvoid track_release(size_t token){refs-=(uint32_t)token;}\n" +
+    "uint32_t references(void){return refs;}\nuint32_t increment(uint32_t n){return n+1;}\nuintptr_t address(void){return (uintptr_t)&increment;}\n"
+    if mkdir_all("target") != 0 || write_file("target/plugin-primitives.ll", ir) != 0 || write_file("target/plugin-primitives.c", native) != 0 {
+        ret 1
+    }
+    let compiled = Command::new("clang").arg("target/plugin-primitives.ll").arg("target/plugin-primitives.c").arg("../core/node_runtime.c").arg("-o").arg(executable()).output()
+    if !compiled.success() {
+        eprintln(compiled.text()) ret 2
+    }
+    ret Command::new(executable()).output().code() as u32
+}

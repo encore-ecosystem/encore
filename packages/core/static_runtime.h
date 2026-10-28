@@ -11,6 +11,8 @@ typedef struct encore_static_thread {
 struct encore_static_cell {
     unsigned state; /* 0 empty, 1 initializing, 2 published */
     size_t value;
+    void (*drop)(size_t);
+    encore_static_cell *next_created, *next_published;
     encore_static_thread *owner;
 #ifdef _WIN32
     CONDITION_VARIABLE ready;
@@ -20,6 +22,7 @@ struct encore_static_cell {
 };
 
 static void *encore_static_cells;
+static encore_static_cell *encore_static_created, *encore_static_published;
 static _Thread_local encore_static_thread encore_static_current_thread;
 #ifdef _WIN32
 static SRWLOCK encore_static_lock = SRWLOCK_INIT;
@@ -50,6 +53,7 @@ void *encore_static_cell_get(encore_str key) {
 #else
         if (pthread_cond_init(&cell->ready, NULL)) encore_static_fail("cannot initialize static cell");
 #endif
+        cell->next_created = encore_static_created; encore_static_created = cell;
         encore_strmap_put(encore_static_cells, key, (size_t)cell);
         if (encore_strmap_get(encore_static_cells, key) != (size_t)cell)
             encore_static_fail("cannot register static cell");
@@ -86,12 +90,15 @@ bool encore_static_begin(void *raw) {
     return initialize;
 }
 
-void encore_static_publish(void *raw, size_t value) {
+void encore_static_publish_owned(void *raw, size_t value, uintptr_t drop_address) {
     encore_static_cell *cell = raw;
     encore_static_lock_enter();
     if (cell == NULL || cell->state != 1 || cell->owner != &encore_static_current_thread)
         encore_static_fail("invalid static publication");
     cell->value = value;
+    _Static_assert(sizeof(cell->drop) == sizeof(drop_address), "static destructor pointer size");
+    memcpy(&cell->drop, &drop_address, sizeof(cell->drop));
+    cell->next_published = encore_static_published; encore_static_published = cell;
     cell->owner = NULL;
     cell->state = 2;
 #ifdef _WIN32
@@ -102,6 +109,8 @@ void encore_static_publish(void *raw, size_t value) {
     encore_static_lock_leave();
 }
 
+void encore_static_publish(void *raw, size_t value) { encore_static_publish_owned(raw, value, 0); }
+
 size_t encore_static_value(void *raw) {
     encore_static_cell *cell = raw;
     encore_static_lock_enter();
@@ -109,5 +118,29 @@ size_t encore_static_value(void *raw) {
     size_t value = cell->value;
     encore_static_lock_leave();
     return value;
+}
+/* Called only after a plugin generation has drained all users. Destructors run
+ * in reverse publication order, before any generated code is unloaded. Normal
+ * executables retain their process-lifetime static behavior. */
+void encore_static_shutdown(void) {
+    encore_static_lock_enter();
+    encore_static_cell *published = encore_static_published;
+    encore_static_cell *created = encore_static_created;
+    void *registry = encore_static_cells;
+    encore_static_published = encore_static_created = NULL;
+    encore_static_cells = NULL;
+    for (encore_static_cell *cell = created; cell; cell = cell->next_created)
+        if (cell->state == 1) encore_static_fail("static shutdown during initialization");
+    encore_static_lock_leave();
+    for (encore_static_cell *cell = published; cell; cell = cell->next_published)
+        if (cell->drop) cell->drop(cell->value);
+    while (created) {
+        encore_static_cell *next = created->next_created;
+#ifndef _WIN32
+        if (pthread_cond_destroy(&created->ready)) abort();
+#endif
+        free(created); created = next;
+    }
+    encore_strmap_free(registry);
 }
 #endif

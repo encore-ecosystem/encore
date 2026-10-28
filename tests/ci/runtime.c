@@ -16,7 +16,10 @@ bool encore_ci_set_env(encore_compiler_str name, encore_compiler_str value) {
     char *key = encore_compiler_cstr(name), *text = encore_compiler_cstr(value);
     if (key == NULL || text == NULL) { free(key); free(text); return false; }
 #ifdef _WIN32
-    bool result = _putenv_s(key, text) == 0;
+    wchar_t *wide_key = encore_build_artifact_wide(key), *wide_text = encore_build_artifact_wide(text);
+    bool result = wide_key != NULL && wide_text != NULL && _wputenv_s(wide_key, wide_text) == 0 &&
+        SetEnvironmentVariableW(wide_key, wide_text) != 0;
+    free(wide_key); free(wide_text);
 #else
     bool result = setenv(key, text, 1) == 0;
 #endif
@@ -27,7 +30,10 @@ bool encore_ci_unset_env(encore_compiler_str name) {
     char *key = encore_compiler_cstr(name);
     if (key == NULL) return false;
 #ifdef _WIN32
-    bool result = _putenv_s(key, "") == 0;
+    wchar_t *wide_key = encore_build_artifact_wide(key);
+    bool result = wide_key != NULL && _wputenv_s(wide_key, L"") == 0 &&
+        SetEnvironmentVariableW(wide_key, NULL) != 0;
+    free(wide_key);
 #else
     bool result = unsetenv(key) == 0;
 #endif

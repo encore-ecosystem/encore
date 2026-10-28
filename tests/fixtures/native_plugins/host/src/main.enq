@@ -1,0 +1,91 @@
+import core::result::Result
+
+import std::io::{eprintln, println}
+import std::os::env
+import std::plugin::{Plugin, PluginError}
+
+import counter_api::Counter
+
+fn require(condition: bool, message: str) -> Result[(), PluginError] {
+    if !condition {
+        ret Result::Err(PluginError { 7_u32, message })
+    }
+    ret Result::Ok(())
+}
+fn exercise() -> Result[(), PluginError] {
+    let mut plugin = unsafe {
+        Plugin::load(env("COUNTER_V1").unwrap_or(""))
+    }
+    ?
+    let mut saved = ""
+    {
+        let counter = plugin.bind[dyn Counter]("counter")?
+        require(counter.add(5_u64)? == 5_u64, "initial counter")?
+        require(counter.label()? == "root v1", "owning string in implementation")?
+        {
+            let child = counter.fork()?
+            require(child.label()? == "leaf v1", "generic concrete resource")?
+            require(counter.use_child(child, 2_u64)? == 7_u64, "resource argument")?
+            require(child.add(1_u64)? == 8_u64, "resource aliases preserve state")?
+            let grandchild = child.fork()?
+            require(grandchild.add(4_u64)? == 12_u64, "resource returned by a generic resource method")?
+            require(counter.use_child(counter.fork()?, 3_u64)? == 8_u64, "temporary resource argument lifetime")?
+            match unsafe {
+                plugin.reload(env("COUNTER_BAD_STATE").unwrap_or(""))
+            }
+            {
+                Ok(_) => {
+                    ret Result::Err(PluginError { 7_u32, "bad state replacement accepted" })
+                }
+                Err(error) => {
+                    require(error.code == 9_u32, "restore error kind")?
+                }
+            }
+            require(counter.label()? == "root v1", "failed reload preserves original root")?
+            require(counter.add(1_u64)? == 6_u64, "failed reload preserves root state")?
+            unsafe {
+                plugin.reload(env("COUNTER_V2").unwrap_or(""))
+            }
+            ?
+            require(counter.add(1_u64)? == 107_u64, "restored state and replacement implementation")?
+            require(counter.label()? == "root v2", "replacement root identity")?
+            require(child.add(1_u64)? == 9_u64, "resource pins previous generation")?
+            require(child.label()? == "leaf v1", "resource retains previous code")?
+            require(grandchild.add(1_u64)? == 13_u64, "nested resource retains previous generation")?
+            match counter.use_child(child, 1_u64) {
+                Ok(_) => {
+                    ret Result::Err(PluginError {
+                            7_u32, "wrong-generation resource accepted"
+                        }
+                    )
+                }
+                Err(error) => {
+                    require(error.code == 6_u32, "wrong-generation error kind")?
+                }
+            }
+            match plugin.close() {
+                Ok(_) => {
+                    ret Result::Err(PluginError { 7_u32, "closed with live bindings" })
+                }
+                Err(error) => {
+                    require(error.code == 5_u32, "busy close error kind")?
+                }
+            }
+        }
+        saved = counter.label()?
+    }
+    plugin.close()?
+    require(saved == "root v2", "returned strings survive provider unload")?
+    println("stateful reload, generic resources, rollback and cleanup passed")
+    ret Result::Ok(())
+}
+fn main() -> i32 {
+    match exercise() {
+        Ok(_) => {
+            ret 0_i32
+        }
+        Err(error) => {
+            eprintln(error.message) ret 1_i32
+        }
+    }
+}
