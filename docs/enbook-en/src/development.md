@@ -55,6 +55,14 @@ a profiler. Concurrent phase durations are not an additive wall-time breakdown.
 Package workers reuse their checked body facts during safety inference; this
 reuse stays inside the same compilation and does not create another disk cache.
 
+Nominal type resolution also keeps a translation-local cache, limited to 4,096
+entries, 1,024-byte keys and 2,048-byte values. Generic shadowing scopes and
+oversized types use the ordinary resolver. An identifier index scans each EHIR
+module once to reject impossible nominal rewrites; the scoped rewriter still
+handles binders, members, strings and comments. Replacements update the index
+so later names retain the same sequential rewrite behavior. These indices are
+released with the translation context and add no persistent cache format.
+
 Every cold sample has an independent frozen source tree, private Git metadata,
 empty project output, and private compiled-package/registry caches. A warm
 sample immediately follows it with those same caches. Source copying and
