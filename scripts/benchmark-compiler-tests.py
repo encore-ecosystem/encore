@@ -431,10 +431,15 @@ def main():
     parser.add_argument("--baseline-source", type=Path)
     parser.add_argument("--baseline-ref", help="Freeze baseline sources with git archive, e.g. v0.1.6-neumann")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--scenario", choices=("all", "build", "suite", "standalone", "projects", "subset"), default="all")
-    parser.add_argument("--jobs", default="1,2,4,8,16,auto")
-    parser.add_argument("--profile", choices=("dev", "release", "extreme"), default="extreme")
-    parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--scenario", choices=("all", "build", "suite", "standalone", "projects", "subset", "incremental"), default="all")
+    parser.add_argument("--project-root", type=Path, help="Graphene source root for an incremental edit/build session")
+    parser.add_argument("--registry-seed", type=Path, default=Path.home()/".cache/encore/registry",
+                        help="Installed registry snapshot copied into private incremental caches")
+    parser.add_argument("--baseline-cache-seed", type=Path,
+                        help="Copy an existing baseline warm cache before incremental warm-up; use fresh edit IDs")
+    parser.add_argument("--jobs")
+    parser.add_argument("--profile", choices=("dev", "release", "extreme"))
+    parser.add_argument("--repetitions", type=int)
     parser.add_argument("--first-repetition", type=int, default=1,
                         help="First repetition ID; preserves alternating pair order in separate CI jobs")
     parser.add_argument("--bash", default=os.environ.get("ENCORE_BENCHMARK_BASH"),
@@ -446,10 +451,19 @@ def main():
                         default=Path(os.environ["RUNNER_TEMP"]) if os.environ.get("RUNNER_TEMP") else None,
                         help="Parent for disposable inputs; CI defaults to RUNNER_TEMP to keep Windows paths short")
     args = parser.parse_args()
+    args.jobs = args.jobs or ("auto" if args.scenario == "incremental" else "1,2,4,8,16,auto")
+    args.profile = args.profile or ("dev" if args.scenario == "incremental" else "extreme")
+    args.repetitions = args.repetitions if args.repetitions is not None else (5 if args.scenario == "incremental" else 3)
     if args.repetitions < 1 or args.first_repetition < 1 or args.timeout <= 0:
         parser.error("repetitions, first repetition and timeout must be positive")
-    if (args.baseline_source or args.baseline_ref) and not args.baseline_compiler:
+    if (args.baseline_source or args.baseline_ref or args.baseline_cache_seed) and not args.baseline_compiler:
         parser.error("baseline source/ref requires --baseline-compiler")
+    if args.scenario == "incremental":
+        from compiler_incremental_benchmark import run
+        try:
+            return run(sys.modules[__name__], args)
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            parser.exit(1, "incremental benchmark failed: " + str(error) + "\n")
     try:
         bash = find_bash(args.bash) if args.scenario in ("all", "suite", "subset") else None
     except FileNotFoundError as error:
