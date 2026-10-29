@@ -1,0 +1,101 @@
+//! Direct compiler API shared by Encore and the standalone driver.
+import core::result::Result
+import std::vec::Vec
+
+import ehir_core::{Backend, BackendOutput, CompileOptions, CompilerDiagnostic, Module, ModuleBundle, PreparationOutcome, PreparedProgram, freeze_program, make_module_bundle, prepare_module}
+import ehir_llvm_backend::driver::LLVMBackend
+
+pub fn parse_text(entry: str, source: str) -> Result[ModuleBundle, CompilerDiagnostic] {
+    let mut start = 0_usize
+    while start < source.byte_len() {
+        let byte = source.byte_at(start)
+        if byte != 32_u8 && byte != 9_u8 && byte != 10_u8 && byte != 13_u8 {
+            break
+        }
+        start += 1_usize
+    }
+    if start == source.byte_len() {
+        ret Result::Err(CompilerDiagnostic { "parse", "empty EHIR input" })
+    }
+    let begins_bundle =(source.byte_len() - start >= 7_usize && source.slice_bytes(start, 7_usize) == "module ") ||
+    (source.byte_len() - start >= 6_usize && source.slice_bytes(start, 6_usize) == "entry ")
+    let text = if begins_bundle {
+        source
+    } else {
+        "module " + entry + " {\n" + source + "\n}\n"
+    }
+    match ehir_core::try_parse_module_bundle_text(entry, text) {
+        Ok(bundle) => {
+            ret Result::Ok(bundle)
+        }
+        Err(message) => {
+            ret Result::Err(CompilerDiagnostic { "parse", message })
+        }
+    }
+}
+
+pub fn prepare(bundle: ModuleBundle) -> Result[PreparedProgram, CompilerDiagnostic] {
+    let mut modules = Vec[Module]::new()
+    for module in bundle.modules {
+        match prepare_module(module) {
+            PreparationOutcome::Ready(value) => modules.push(value)
+            PreparationOutcome::Error(message) => {
+                ret Result::Err(CompilerDiagnostic { "prepare", message })
+            }
+        }
+    }
+    match freeze_program(make_module_bundle(bundle.entry_module, modules)) {
+        Ok(program) => {
+            ret Result::Ok(PreparedProgram { program })
+        }
+        Err(message) => {
+            ret Result::Err(CompilerDiagnostic { "typed", message })
+        }
+    }
+    ret Result::Err(CompilerDiagnostic { "typed", "cannot prepare EHIR" })
+}
+
+pub fn compile(bundle: ModuleBundle, options: CompileOptions) -> Result[BackendOutput, CompilerDiagnostic] {
+    ret compile_with_backend(bundle, options, LLVMBackend {})
+}
+
+pub fn compile_with_backend[B: Backend](bundle: ModuleBundle, options: CompileOptions,
+    backend: B,) -> Result[BackendOutput, CompilerDiagnostic] {
+    if options.jobs == 0_usize || options.pointer_width == 0_usize {
+        ret Result::Err(CompilerDiagnostic { "options", "invalid worker count or pointer width" })
+    }
+    if options.profile != "dev" && options.profile != "debug" && options.profile != "release" && options.profile != "extreme" {
+        ret Result::Err(CompilerDiagnostic { "options", "unknown optimization profile" })
+    }
+    if !backend.supports(options) {
+        ret Result::Err(CompilerDiagnostic { "backend", "unsupported target: " + options.target })
+    }
+    ret backend.generate(prepare(bundle)?, options)
+}
+
+pub fn default_backend() -> str {
+    ret "llvm"
+}
+
+pub fn available_backends() -> Vec[str] {
+    ret vec!["llvm"]
+}
+
+/// Emits a previously prepared graph; normalization is not repeated.
+pub fn compile_prepared(program: PreparedProgram, options: CompileOptions) -> Result[BackendOutput, CompilerDiagnostic] {
+    ret compile_prepared_with_backend(program, options, LLVMBackend {})
+}
+
+pub fn compile_prepared_with_backend[B: Backend](program: PreparedProgram, options: CompileOptions,
+    backend: B,) -> Result[BackendOutput, CompilerDiagnostic] {
+    if options.jobs == 0_usize || options.pointer_width == 0_usize {
+        ret Result::Err(CompilerDiagnostic { "options", "invalid worker count or pointer width" })
+    }
+    if options.profile != "dev" && options.profile != "debug" && options.profile != "release" && options.profile != "extreme" {
+        ret Result::Err(CompilerDiagnostic { "options", "unknown optimization profile" })
+    }
+    if !backend.supports(options) {
+        ret Result::Err(CompilerDiagnostic { "backend", "unsupported target: " + options.target })
+    }
+    ret backend.generate(program, options)
+}

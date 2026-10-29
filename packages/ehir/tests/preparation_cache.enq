@@ -1,0 +1,119 @@
+//! Persisted preparation skips untouched functions and repairs corrupt records.
+import core::option::Option
+import core::result::Result
+import core::testing::assert
+
+import std::os::{file_exists, mkdir_all, read_file, remove_dir_all, write_file_atomic}
+import std::path::Path
+import std::vec::Vec
+
+import ehirlib::{FunctionPreparationKey, PreparedFunctionStore, module_bundle_to_string, parse_text, prepare, prepare_with_store, prepared_bytes_payload, prepared_payload_bytes, thaw_program}
+struct Store {
+    root: Path
+}
+
+impl PreparedFunctionStore for Store {
+    pub fn read(self: Self, key: str) -> Result[Option[Vec[u8]], str] {
+        let path = self.root / key
+        ret Result::Ok(if file_exists(path.as_str()) {
+                Option[Vec[u8]]::Some(prepared_payload_bytes(read_file(path.as_str())))
+            } else {
+                Option[Vec[u8]]::None
+            }
+        )
+    }
+    pub fn write(self: Self, key: str, bytes: Vec[u8]) -> Result[(), str] {
+        if write_file_atomic((self.root / key).as_str(), prepared_bytes_payload(bytes)) != 0_i32 {
+            ret Result::Err("cannot write test record")
+        }
+        ret Result::Ok(())
+    }
+}
+fn main() -> u32 {
+    let root = Path::new("target/prepared-function-contract")
+    let _removed = remove_dir_all(root.as_str())
+    if mkdir_all(root.as_str()) != 0_i32 {
+        ret 1_u32
+    }
+    let store = Store { root }
+    let source = "fn first() -> u32 {\n$entry:\nvalue: u32 = capprim 1_u32\nret value: u32\n}\n" +
+    "fn second() -> u32 {\n$entry:\nvalue: u32 = capprim 2_u32\nret value: u32\n}\n"
+    let bundle = match parse_text("test", source) {
+        Ok(value) => value Err(_) => {
+            ret 2_u32
+        }
+    }
+    let keys = vec![FunctionPreparationKey { "test", 0_usize, 0_usize, "first-v1" }, FunctionPreparationKey {
+            "test", 1_usize, 0_usize, "second-v1"
+        }
+    ]
+    let cold = match prepare_with_store(bundle, keys, store) {
+        Ok(value) => value Err(_) => {
+            ret 3_u32
+        }
+    }
+    if !assert(cold.functions_prepared == 2_usize && cold.functions_reused == 0_usize) {
+        ret 4_u32
+    }
+    let warm = match prepare_with_store(bundle, keys, store) {
+        Ok(value) => value Err(_) => {
+            ret 5_u32
+        }
+    }
+    if !assert(warm.functions_prepared == 0_usize && warm.functions_reused == 2_usize) {
+        ret 6_u32
+    }
+    let plain = match prepare(bundle) {
+        Ok(value) => value Err(_) => {
+            ret 7_u32
+        }
+    }
+    let warm_raw = match thaw_program(warm.program.program) {
+        Ok(value) => value Err(_) => {
+            ret 8_u32
+        }
+    }
+    let plain_raw = match thaw_program(plain.program) {
+        Ok(value) => value Err(_) => {
+            ret 9_u32
+        }
+    }
+    if !assert(module_bundle_to_string(warm_raw) == module_bundle_to_string(plain_raw)) {
+        ret 10_u32
+    }
+    if write_file_atomic((root / "second-v1").as_str(), "corrupt") != 0_i32 {
+        ret 11_u32
+    }
+    let repaired = match prepare_with_store(bundle, keys, store) {
+        Ok(value) => value Err(_) => {
+            ret 12_u32
+        }
+    }
+    if !assert(repaired.functions_prepared == 1_usize && repaired.functions_reused == 1_usize) {
+        ret 13_u32
+    }
+    let restored = match prepare_with_store(bundle, keys, store) {
+        Ok(value) => value Err(_) => {
+            ret 14_u32
+        }
+    }
+    if !assert(restored.functions_prepared == 0_usize && restored.functions_reused == 2_usize) {
+        ret 15_u32
+    }
+    let async_source = "async fn answer() -> u32 {\n$entry:\nvalue: u32 = capprim 42_u32\nret value: u32\n}\n"
+    let async_bundle = match parse_text("async_test", async_source) {
+        Ok(value) => value Err(_) => {
+            ret 16_u32
+        }
+    }
+    let asynchronous = match prepare_with_store(async_bundle, Vec[FunctionPreparationKey]::new(), store) {
+        Ok(value) => value Err(_) => {
+            ret 17_u32
+        }
+    }
+    if !assert(asynchronous.modules_fallback == 1_usize) {
+        ret 18_u32
+    }
+    let _cleanup = remove_dir_all(root.as_str())
+    ret 0_u32
+}

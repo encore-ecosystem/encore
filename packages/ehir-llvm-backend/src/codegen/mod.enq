@@ -3,13 +3,12 @@ import core::option::Option
 
 import std::io::eprintln
 import std::os::env
-import std::process::exit
 import std::thread::JoinHandle
 import std::time::perf_counter_ms
 import std::vec::{Vec, vec_singleton}
 
-import ehirlib::{PreparationOutcome, enum_value, prepare_module}
-import ehirlib::core::{BinaryOpKind, Block, CallInstruction, Directive, EdgeInstruction, EhirDocumentation, EhirImport, EnumVariant, FnDirective, Instruction, MatchArm, MatchInstruction, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, Variable, add_edge, alias, async_fn_item, await_value, binary, block, br_term, call, cbr_term, cfree, drop_value, ehir_documentation, ehir_import, enum_directive, enum_variant, extern_fn_item, fn_item, gep, getfield, getfieldptr, getptr, halloc, hfree, hrealloc, impl_directive, lceos, lcpos, lcsos, load, local_place_type, make_module, make_module_bundle, make_module_with_metadata, mangle_plain_type_name, mangle_type_name, match_arm, match_term, memory_value_type, param, pcast, phi, phi_pair, put, raw_type, remove_edge, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, store, struct_directive, switch_case, switch_term, trait_directive, trait_method, unreachable_term}
+import ehir_core::{PreparationOutcome, enum_value, prepare_module}
+import ehir_core::core::{BinaryOpKind, Block, CallInstruction, Directive, EdgeInstruction, EhirDocumentation, EhirImport, EnumVariant, FnDirective, Instruction, MatchArm, MatchInstruction, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, Variable, add_edge, alias, async_fn_item, await_value, binary, block, br_term, call, cbr_term, cfree, drop_value, ehir_documentation, ehir_import, enum_directive, enum_variant, extern_fn_item, fn_item, gep, getfield, getfieldptr, getptr, halloc, hfree, hrealloc, impl_directive, lceos, lcpos, lcsos, load, local_place_type, make_module, make_module_bundle, make_module_with_metadata, mangle_plain_type_name, mangle_type_name, match_arm, match_term, memory_value_type, param, pcast, phi, phi_pair, put, raw_type, remove_edge, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, store, struct_directive, switch_case, switch_term, trait_directive, trait_method, unreachable_term}
 
 fn concat_instructions(left: Vec[LLVMInstruction], right: Vec[LLVMInstruction]) -> Vec[LLVMInstruction] {
     let mut out = Vec[LLVMInstruction]::new()
@@ -29,6 +28,21 @@ import llvm::core::{LLVMBasicBlock, LLVMFunction, LLVMInstruction, LLVMParam, LL
 import llvm::ir::{append_builder_line, append_function_to_builder}
 import llvm::types::{LLVMType, LLVMTypeKind, array_type, f16_type, f32_type, f64_type, i16_type, i1_type, i32_type, i64_type, i8_type, llvm_raw_type, named_struct_type, ptr_type, type_text, void_type}
 import llvm::value::{LLVMValue, const_i32, const_text, reg, value_type}
+
+extern fn ehir_codegen_clear_error() ->()
+extern fn ehir_codegen_record_error(message: str) ->()
+extern fn ehir_codegen_take_error() -> str
+
+pub fn clear_codegen_error() ->() {
+    unsafe {
+        ehir_codegen_clear_error()
+    }
+}
+pub fn take_codegen_error() -> str {
+    ret unsafe {
+        ehir_codegen_take_error()
+    }
+}
 
 extern fn encore_llvm_set_target_pointer_width(bits: usize) ->()
 extern fn encore_llvm_target_pointer_width() -> usize
@@ -51,6 +65,7 @@ pub struct EmittedIrModule {
     module_id: str
     ir: str
     weight: usize
+    diagnostic: str
 }
 
 struct EmittedIrChunk {
@@ -109,6 +124,14 @@ pub fn prepare_unit_codegen(owned: ModuleBundle, dependencies: ModuleBundle,
     triple: str, pointer_width: usize, jobs: usize,) -> PreparedUnitCodegen {
     install_codegen_target(triple, pointer_width)
     let prepared = prepare_modules_for_codegen_parallel(owned.modules, jobs, triple, pointer_width)
+    ret prepare_normalized_unit_codegen(make_module_bundle(owned.entry_module, prepared), dependencies, triple, pointer_width)
+}
+
+/// Already-prepared ordinary bodies come from the shared EHIR compiler/cache.
+pub fn prepare_normalized_unit_codegen(owned: ModuleBundle, dependencies: ModuleBundle,
+    triple: str, pointer_width: usize,) -> PreparedUnitCodegen {
+    install_codegen_target(triple, pointer_width)
+    let prepared = owned.modules
     let mut contexts = Vec[Module]::new()
     contexts.extend(dependencies.modules)
     contexts.extend(module_codegen_context_modules(prepared))
@@ -237,6 +260,10 @@ pub fn emit_unit_codegen_selected_parallel(unit: frozen PreparedUnitCodegen, tri
     let support = SupportIr {
         "", unit_support_declarations(directives, expanded, unit.requirements.concrete_types, unit.requirements.equality_types)
     }
+    let preparation_error = take_codegen_error()
+    if !preparation_error.is_empty() {
+        ret vec![EmittedIrModule { "", "", 0_usize, preparation_error }]
+    }
     let count = min_codegen_jobs(jobs, selected.len())
     let scheduled = schedule_selected_codegen_modules(unit.owned, selected)
     let mut chunks = Vec[EmittedIrChunk]::new()
@@ -271,11 +298,14 @@ fn emit_package_ir_batch(unit: frozen PreparedUnitCodegen, selected: frozen Vec[
         let index = selected.get(cursor).unwrap_or(unit.owned.len())
         match unit.owned.get(index) {
             Some(module) => {
+                clear_codegen_error()
                 let view = module_codegen_view(module, unit.contexts)
                 let lowered = lower_with_precomputed_analysis(view, unit.requirements.concrete_types, support, false)
                 let ir = "target triple = \"" + triple + "\"\n\n" + lowered.ir
                 out.push(EmittedIrChunk {
-                        index, EmittedIrModule { module.name, ir, ir.byte_len() }
+                        index, EmittedIrModule {
+                            module.name, ir, ir.byte_len(), take_codegen_error()
+                        }
                     }
                 )
             }
@@ -291,6 +321,7 @@ fn emit_package_ir_batch(unit: frozen PreparedUnitCodegen, selected: frozen Vec[
 /// ordinary bodies. The coordinator supplies contexts in canonical unit order.
 pub fn emit_program_support(context: frozen ModuleBundle, requirements: frozen Vec[CodegenRequirements],
     triple: str, pointer_width: usize,) -> EmittedIrModule {
+    clear_codegen_error()
     install_codegen_target(triple, pointer_width)
     let directives = module_bundle_directives(context.modules)
     let mut calls = Vec[GenericCall]::new()
@@ -336,7 +367,7 @@ pub fn emit_program_support(context: frozen ModuleBundle, requirements: frozen V
     let module = make_module("__encore_program_support", support_directives)
     let lowered = lower_with_precomputed_analysis(module, concrete, support, true)
     let ir = "target triple = \"" + triple + "\"\n\n" + lowered.ir
-    ret EmittedIrModule { "__encore_program_support", ir, ir.byte_len() }
+    ret EmittedIrModule { "__encore_program_support", ir, ir.byte_len(), take_codegen_error() }
 }
 
 // Templates retain concrete impl bodies for specialization, but ordinary
@@ -1096,8 +1127,7 @@ fn thread_result_type(out: frozen Variable) -> Type {
             ret clone_type(result)
         }
         None => {
-            eprintln("internal compiler error: thread handle '" + handle.name + "' has no result type")
-            exit(1_i32)
+            backend_invariant_error("internal compiler error: thread handle '" + handle.name + "' has no result type")
             ret Type {
                 "usize", Vec[Type]::new(), RepresentationKind::Inline
             }
@@ -3325,8 +3355,7 @@ fn prepare_module_for_codegen(module: Module) -> Module {
     let validation_started = perf_counter_ms()
     match prepare_module(module) {
         PreparationOutcome::Error(message) => {
-            eprintln("error[ehir-validation]: " + message)
-            exit(1_i32)
+            backend_invariant_error("error[ehir-validation]: " + message)
         }
         PreparationOutcome::Ready(prepared) => {
             profile_codegen_duration("module-prepared", validation_started)
@@ -3386,7 +3415,18 @@ pub fn emit_ir_bundle_for_target_selected(bundle: frozen ModuleBundle, triple: s
     requested_jobs: usize, selected: Vec[usize],) -> Vec[EmittedIrModule] {
     let analysis_directives = module_bundle_directives(bundle.modules)
     ret emit_ir_bundle_for_target_selected_impl(bundle, triple, pointer_width, requested_jobs,
-        selected, analysis_directives, false,)
+        selected, analysis_directives, false, false,)
+}
+
+/// Consumes the common compiler's prepared graph without repeating normalization.
+pub fn emit_prepared_ir_bundle_for_target(bundle: frozen ModuleBundle, triple: str,
+    pointer_width: usize, jobs: usize,) -> Vec[EmittedIrModule] {
+    let mut selected = Vec[usize]::new()
+    for index in 0_usize..bundle.modules.len() {
+        selected.push(index)
+    }
+    ret emit_ir_bundle_for_target_selected_impl(bundle, triple, pointer_width, jobs,
+        selected, Vec[Directive]::new(), false, true,)
 }
 
 /// Emits selected CGUs from a compact bundle while analysing generic and
@@ -3398,12 +3438,12 @@ pub fn emit_ir_bundle_for_target_selected_with_analysis(bundle: frozen ModuleBun
     requested_jobs: usize, selected: Vec[usize],) -> Vec[EmittedIrModule] {
     let analysis_directives = module_bundle_directives(analysis_bundle.modules)
     ret emit_ir_bundle_for_target_selected_impl(bundle, triple, pointer_width, requested_jobs,
-        selected, analysis_directives, true,)
+        selected, analysis_directives, true, false,)
 }
 
 fn emit_ir_bundle_for_target_selected_impl(bundle: frozen ModuleBundle, triple: str, pointer_width: usize,
     requested_jobs: usize, selected: Vec[usize], supplied_analysis: frozen Vec[Directive],
-    use_supplied_analysis: bool,)
+    use_supplied_analysis: bool, already_prepared: bool,)
 -> Vec[EmittedIrModule] {
     unsafe {
         encore_llvm_set_target_pointer_width(pointer_width)
@@ -3430,7 +3470,7 @@ fn emit_ir_bundle_for_target_selected_impl(bundle: frozen ModuleBundle, triple: 
     // non-local ordinary bodies become extern declarations before expensive
     // coroutine/ownership preparation; only selected bodies and globally
     // visible generic templates are normalized.
-    let prepared = if prepare_selected_view {
+    let prepared = if prepare_selected_view || already_prepared {
         source_modules
     } else {
         prepare_modules_for_codegen_parallel(source_modules, requested_jobs, triple, pointer_width)
@@ -3460,6 +3500,10 @@ fn emit_ir_bundle_for_target_selected_impl(bundle: frozen ModuleBundle, triple: 
     let concrete_types = collect_concrete_types(analysis_directives, expanded_calls)
     let support = build_support_ir(analysis_directives, expanded_calls, concrete_types,
         collect_equality_types(analysis_directives, analysis_directives, expanded_calls),)
+    let analysis_error = take_codegen_error()
+    if !analysis_error.is_empty() {
+        ret vec![EmittedIrModule { "", "", 0_usize, analysis_error }]
+    }
     profile_codegen_duration("bundle-analysis", analysis_started)
     profile_codegen_memory("bundle-modules-prepared")
     // Long compiler/editor modules can outweigh dozens of leaf modules. Feed
@@ -3730,6 +3774,7 @@ fn emit_ir_module_batch(prepared: frozen Vec[Module], contexts: frozen Vec[Modul
             Some(index) => {
                 match prepared.get(index) {
                     Some(module) => {
+                        clear_codegen_error()
                         let view = if prepare_selected_view {
                             module_codegen_view(prepare_module_for_codegen(clone_module_for_codegen(module)), contexts)
                         } else {
@@ -3747,7 +3792,7 @@ fn emit_ir_module_batch(prepared: frozen Vec[Module], contexts: frozen Vec[Modul
                         }
                         out.push(EmittedIrChunk {
                                 index, EmittedIrModule {
-                                    module.name, ir, ir.len()
+                                    module.name, ir, ir.len(), take_codegen_error()
                                 }
                             }
                             ,
@@ -5275,8 +5320,7 @@ fn lower_instruction(instruction: frozen Instruction, instruction_scope: str, lo
             ret vec_singleton(lowered)
         }
         Await(await_data) => {
-            eprintln("internal compiler error: unlowered EHIR await for '" + await_data.out.name + "' reached LLVM codegen")
-            exit(1_i32)
+            backend_invariant_error("internal compiler error: unlowered EHIR await for '" + await_data.out.name + "' reached LLVM codegen")
             ret Vec[LLVMInstruction]::new()
         }
         Store(store_data) => {
@@ -5777,8 +5821,7 @@ fn lower_thread_join(data: frozen CallInstruction) -> Vec[LLVMInstruction] {
             ret instructions
         }
         None => {
-            eprintln("internal compiler error: thread join has no handle")
-            exit(1_i32)
+            backend_invariant_error("internal compiler error: thread join has no handle")
             ret Vec[LLVMInstruction]::new()
         }
     }
@@ -5790,8 +5833,9 @@ fn unsupported_instruction(name: str) -> Vec[LLVMInstruction] {
 }
 
 fn backend_invariant_error(message: str) ->() {
-    eprintln("error[backend-invariant]: " + message)
-    exit(1_i32)
+    unsafe {
+        ehir_codegen_record_error(message)
+    }
     ret()
 }
 
@@ -5873,14 +5917,14 @@ fn numeric_literal_text(value: str) -> str {
 
 fn lower_indirect_call(data: frozen CallInstruction) -> Vec[LLVMInstruction] {
     if data.args.len() == 0 || data.generics.len() != 0 {
-        eprintln("invalid EHIR indirect call") exit(1_i32)
+        backend_invariant_error("invalid EHIR indirect call")
     }
     let source = match data.args.get(0) {
         Some(value) => value None => data.out
     }
     let source_type = required_variable_type(source)
     if source_type.name != "usize" && source_type.representation != RepresentationKind::Raw {
-        eprintln("EHIR indirect callee must be usize or a raw pointer") exit(1_i32)
+        backend_invariant_error("EHIR indirect callee must be usize or a raw pointer")
     }
     let result_type = lower_type(required_variable_type(data.out))
     let mut arguments = Vec[LLVMValue]::new()
@@ -6713,7 +6757,7 @@ fn is_unit_value_type(typ: frozen Type) -> bool {
 
 fn lower_function_address(data: frozen CallInstruction) -> Vec[LLVMInstruction] {
     if data.generics.len() == 0 || data.args.len() != 0 {
-        eprintln("invalid EHIR function address") exit(1_i32)
+        backend_invariant_error("invalid EHIR function address")
     }
     let result = match data.generics.get(0) {
         Some(value) => lower_type(value) None => void_type()

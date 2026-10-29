@@ -1,0 +1,85 @@
+//! Artifact publication shared by the library and CLI. No shell is involved.
+import core::fmt::Debug
+import core::result::Result
+
+import std::os::{file_exists, mkdir_all, read_file, remove_dir_all, write_file_atomic}
+import std::path::Path
+import std::process::Command
+import std::time::perf_counter_ms
+
+import ehir_core::{BackendOutput, CompileOptions, CompilerDiagnostic, EmitKind}
+extern fn ehir_compiler_process_id() -> usize
+extern fn ehir_compiler_next_stage_id() -> usize
+
+pub fn write_output(output: BackendOutput, options: CompileOptions, kind: EmitKind,
+    destination: Path, native_compiler: str,) -> Result[(), CompilerDiagnostic] {
+    if output.modules.len() != 1_usize {
+        ret Result::Err(CompilerDiagnostic {
+                "output", "one output file requires a single generated module"
+            }
+        )
+    }
+    let text = output.modules.get_unchecked_borrowed(0_usize).text
+    if kind == EmitKind::BackendIr || output.format == "object" {
+        if write_file_atomic(destination.as_str(), text) != 0_i32 {
+            ret Result::Err(CompilerDiagnostic { "output", "cannot write " + destination.as_str() })
+        }
+        ret Result::Ok(())
+    }
+    if output.format != "llvm-ir" && output.format != "c" {
+        ret Result::Err(CompilerDiagnostic {
+                "output", "cannot assemble backend format: " + output.format
+            }
+        )
+    }
+    let token = unsafe {
+        ehir_compiler_process_id()
+    }
+    let serial = unsafe {
+        ehir_compiler_next_stage_id()
+    }
+    let staging = Path::new(destination.as_str() + ".ehir-" + Debug::fmt(token) + "-" + Debug::fmt(serial) + "-" + Debug::fmt(perf_counter_ms()))
+    if mkdir_all(staging.as_str()) != 0_i32 {
+        ret Result::Err(CompilerDiagnostic { "output", "cannot create output staging directory" })
+    }
+    let result = write_object(text, output.format, options, destination, native_compiler, staging)
+    let _removed = remove_dir_all(staging.as_str())
+    ret result
+}
+
+fn write_object(text: str, format: str, options: CompileOptions, destination: Path, compiler: str,
+    staging: Path,) -> Result[(), CompilerDiagnostic] {
+    let source = staging / "module.ll"
+    let object = staging / "module.o"
+    if write_file_atomic(source.as_str(), text) != 0_i32 {
+        ret Result::Err(CompilerDiagnostic { "output", "cannot stage LLVM IR" })
+    }
+    let optimization = if options.profile == "release" {
+        "-O2"
+    } elif options.profile == "extreme" {
+        "-O3"
+    } else {
+        "-O0"
+    }
+    let command = Command::new(compiler).arg("--target=" + options.target).arg("-x").arg(if format == "llvm-ir" {
+            "ir"
+        } else {
+            "c"
+        }
+    )
+    let command = if options.target.contains("linux") {
+        command.arg("-fstack-clash-protection")
+    } else {
+        command
+    }
+    let result = command
+    .arg("-c").arg(optimization).arg("-fdebug-compilation-dir=.")
+    .arg(source.as_str()).arg("-o").arg(object.as_str()).output()
+    if !result.success() || !file_exists(object.as_str()) {
+        ret Result::Err(CompilerDiagnostic { "native", "native compiler failed: " + result.text() })
+    }
+    if write_file_atomic(destination.as_str(), read_file(object.as_str())) != 0_i32 {
+        ret Result::Err(CompilerDiagnostic { "output", "cannot publish object file" })
+    }
+    ret Result::Ok(())
+}

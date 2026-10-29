@@ -1,0 +1,203 @@
+//! Function preparation shared by the CLI/API and Encore's verified cache adapter.
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+
+import std::vec::Vec
+
+import ehir_core::{CompilerDiagnostic, Directive, FnDirective, FunctionPreparationKey, ImplDirective, Module, ModuleBundle, PreparationOutcome, PreparedFunctionStore, PreparedProgram, TypedDirective, TypedFunction, TypedImpl, TypedModule, TypedProgram, decode_prepared_function, encode_prepared_function, freeze_function, freeze_program, make_module, prepare_module}
+import ehir_core::string_index::{StringIndex, string_index_get, string_index_set, string_index_with_capacity}
+
+pub struct CachedPreparation {
+    program: PreparedProgram
+    functions_prepared: usize
+    functions_reused: usize
+    modules_fallback: usize
+}
+struct PreparationCounts {
+    prepared: usize,
+    reused: usize
+}
+
+fn key_site(module: str, directive: usize, method: usize) -> str {
+    ret module + "\n" + Debug::fmt(directive) + "\n" + Debug::fmt(method)
+}
+fn cache_key(index: mut StringIndex, keys: Vec[FunctionPreparationKey], module: str,
+    directive: usize, method: usize,) -> str {
+    let position = string_index_get(index, key_site(module, directive, method))
+    if position == 0_usize {
+        ret ""
+    }
+    ret keys.get_unchecked_borrowed(position - 1_usize).key
+}
+
+pub fn prepare_with_store[S: PreparedFunctionStore](bundle: ModuleBundle,
+    keys: Vec[FunctionPreparationKey], store: S,) -> Result[CachedPreparation, CompilerDiagnostic] {
+    let mut index = string_index_with_capacity(keys.len())
+    let mut cursor = 0_usize
+    for key in keys {
+        string_index_set(index, key_site(key.module_name, key.directive, key.method), cursor)
+        cursor += 1_usize
+    }
+    let mut modules = Vec[TypedModule]::new()
+    let mut counts = PreparationCounts { 0_usize, 0_usize }
+    let mut fallback = 0_usize
+    for module in bundle.modules {
+        if has_async(module) {
+            let prepared = match prepare_module(module) {
+                PreparationOutcome::Ready(value) => value
+                PreparationOutcome::Error(message) => {
+                    ret Result::Err(CompilerDiagnostic {
+                            "prepare", message
+                        }
+                    )
+                }
+            }
+            let typed = match freeze_program(ModuleBundle { bundle.entry_module, vec![prepared] }) {
+                Ok(value) => value
+                Err(message) => {
+                    ret Result::Err(CompilerDiagnostic { "typed", message })
+                }
+            }
+            modules.extend(typed.modules)
+            fallback += 1_usize
+            continue
+        }
+        let mut directives = Vec[TypedDirective]::new()
+        let mut directive_index = 0_usize
+        for directive in module.directives {
+            match directive {
+                Directive::Struct(item) => directives.push(TypedDirective::Struct(item))
+                Directive::Enum(item) => directives.push(TypedDirective::Enum(item))
+                Directive::Trait(item) => directives.push(TypedDirective::Trait(item))
+                Directive::Function(item) => {
+                    let key = cache_key(index, keys, module.name, directive_index, 0_usize)
+                    directives.push(TypedDirective::Function(prepare_cached_function(item, key, store, counts)?))
+                }
+                Directive::Impl(item) => {
+                    let mut methods = Vec[TypedFunction]::new()
+                    let mut method_index = 0_usize
+                    for method in item.methods {
+                        let key = cache_key(index, keys, module.name, directive_index, method_index)
+                        methods.push(prepare_cached_function(method, key, store, counts)?)
+                        method_index += 1_usize
+                    }
+                    // Coroutine lowering drops empty impl blocks too.
+                    if !methods.is_empty() {
+                        let declaration = ImplDirective {
+                            item.trait_name, item.trait_args, item.for_type, item.generics, Vec[FnDirective]::new()
+                        }
+                        directives.push(TypedDirective::Impl(TypedImpl { declaration, methods }))
+                    }
+                }
+            }
+            directive_index += 1_usize
+        }
+        let header = Module {
+            module.name, module.imports, module.documentation, module.symbol_documentation, Vec[Directive]::new()
+        }
+        modules.push(TypedModule { header, directives })
+    }
+    ret Result::Ok(CachedPreparation {
+            PreparedProgram {
+                TypedProgram {
+                    bundle.entry_module, modules
+                }
+            }
+            , counts.prepared, counts.reused, fallback
+        }
+    )
+}
+
+fn prepare_cached_function[S: PreparedFunctionStore](function: FnDirective, key: str,
+    store: S, counts: mut PreparationCounts,) -> Result[TypedFunction, CompilerDiagnostic] {
+    if !key.is_empty() {
+        let cached = match store.read(key) {
+            Ok(value) => value
+            Err(message) => {
+                ret Result::Err(CompilerDiagnostic { "cache", message })
+            }
+        }
+        match cached {
+            Some(bytes) => {
+                match decode_prepared_function(bytes, key) {
+                    Ok(value) => {
+                        counts.reused += 1_usize ret Result::Ok(value)
+                    }
+                    Err(_) => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
+    let module = make_module("function", vec![Directive::Function(function)])
+    let prepared = match prepare_module(module) {
+        PreparationOutcome::Ready(value) => value
+        PreparationOutcome::Error(message) => {
+            ret Result::Err(CompilerDiagnostic {
+                    "prepare", message
+                }
+            )
+        }
+    }
+    for directive in prepared.directives {
+        match directive {
+            Directive::Function(value) => {
+                let typed = match freeze_function(value) {
+                    Ok(value) => value
+                    Err(message) => {
+                        ret Result::Err(CompilerDiagnostic { "typed", message })
+                    }
+                }
+                counts.prepared += 1_usize
+                if !key.is_empty() {
+                    match encode_prepared_function(typed, key) {
+                        Ok(bytes) => {
+                            match store.write(key, bytes) {
+                                Ok(_) => {
+                                }
+                                Err(message) => {
+                                    ret Result::Err(CompilerDiagnostic {
+                                            "cache", message
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                        // A codec resource limit only disables caching this function.
+                        Err(_) => {
+                        }
+                    }
+                }
+                ret Result::Ok(typed)
+            }
+            _ => {
+            }
+        }
+    }
+    ret Result::Err(CompilerDiagnostic { "prepare", "function preparation produced no function" })
+}
+
+fn has_async(module: Module) -> bool {
+    for directive in module.directives {
+        match directive {
+            Directive::Function(function) => {
+                if function.is_async {
+                    ret true
+                }
+            }
+            Directive::Impl(item) => {
+                for method in item.methods {
+                    if method.is_async {
+                        ret true
+                    }
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret false
+}

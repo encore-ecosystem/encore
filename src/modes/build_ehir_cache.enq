@@ -1,0 +1,199 @@
+//! Adapter from reusable EHIR preparation to Encore's locked, verified CAS.
+import core::option::Option
+import core::result::Result
+
+import std::path::Path
+import std::thread::JoinHandle
+import std::vec::Vec
+
+import ehirlib::{Directive, FnDirective, FunctionPreparationKey, Module, ModuleBundle, PreparedFunctionStore, fn_to_string, make_module_bundle, prepare_with_store, prepared_bytes_payload, prepared_payload_bytes, thaw_program, type_to_string}
+
+import mod::build_lowering_cache::{commit_lowered_module, restore_lowered_module}
+import refrain::cache_identity::compiler_content_digest
+
+pub struct PreparedEhirUnit {
+    bundle: ModuleBundle
+    prepared: usize
+    reused: usize
+    fallback: usize
+}
+struct EhirPreparationStore {
+    root: Option[Path]
+}
+
+impl PreparedFunctionStore for EhirPreparationStore {
+    pub fn read(self: Self, key: str) -> Result[Option[Vec[u8]], str] {
+        match restore_lowered_module(self.root, key)? {
+            Some(payload) => {
+                ret Result::Ok(Option[Vec[u8]]::Some(prepared_payload_bytes(payload)))
+            }
+            None => {
+                ret Result::Ok(Option[Vec[u8]]::None)
+            }
+        }
+        ret Result::Ok(Option[Vec[u8]]::None)
+    }
+    pub fn write(self: Self, key: str, bytes: Vec[u8]) -> Result[(), str] {
+        ret commit_lowered_module(self.root, key, prepared_bytes_payload(bytes))
+    }
+}
+
+pub fn prepare_ehir_unit(bundle: ModuleBundle, context: str, cache: Option[Path], jobs: usize) -> Result[PreparedEhirUnit, str] {
+    if jobs == 0_usize {
+        ret Result::Err("EHIR preparation needs at least one CPU lease")
+    }
+    let mut pending = Vec[JoinHandle[Result[PreparedEhirUnit, str]]]::new()
+    let mut results = Vec[Result[PreparedEhirUnit, str]]::new()
+    let cache_path = match cache {
+        Some(path) => path.as_str() None => ""
+    }
+    let cache_enabled = cache.is_some()
+    for module in bundle.modules {
+        if jobs == 1_usize {
+            results.push(prepare_ehir_module(module, context, cache_path, cache_enabled))
+        } else {
+            pending.push(spawn prepare_ehir_module(module, context, cache_path, cache_enabled))
+            if pending.len() == jobs {
+                for handle in pending {
+                    results.push(handle.join())
+                }
+                pending = Vec[JoinHandle[Result[PreparedEhirUnit, str]]]::new()
+            }
+        }
+    }
+    // Complete every worker before propagating errors and releasing CPU leases.
+    for handle in pending {
+        results.push(handle.join())
+    }
+    let mut modules = Vec[Module]::new()
+    let mut prepared = 0_usize
+    let mut reused = 0_usize
+    let mut fallback = 0_usize
+    for result in results {
+        let value = result?
+        modules.extend(value.bundle.modules)
+        prepared += value.prepared
+        reused += value.reused
+        fallback += value.fallback
+    }
+    ret Result::Ok(PreparedEhirUnit {
+            make_module_bundle(bundle.entry_module, modules), prepared, reused, fallback
+        }
+    )
+}
+
+fn prepare_ehir_module(module: sending Module, context: str, cache_path: str, cache_enabled: bool) -> sending Result[PreparedEhirUnit, str] {
+    let cache = if cache_enabled {
+        Option[Path]::Some(Path::new(cache_path))
+    } else {
+        Option[Path]::None
+    }
+    let bundle = make_module_bundle(module.name, vec![module])
+    let mut keys = Vec[FunctionPreparationKey]::new()
+    for module in bundle.modules {
+        // Empty keys disable serialization as well as storage when no cache
+        // was requested. Fresh preparation still performs all validation.
+        if !cache_enabled {
+            continue
+        }
+        let mut directive_index = 0_usize
+        for directive in module.directives {
+            match directive {
+                Directive::Function(function) => {
+                    keys.push(preparation_key(module.name, "", directive_index, 0_usize, function, context))
+                }
+                Directive::Impl(item) => {
+                    let owner = type_to_string(item.for_type) + "\n" + item.trait_name
+                    let mut method_index = 0_usize
+                    for method in item.methods {
+                        keys.push(preparation_key(module.name, owner, directive_index, method_index, method, context))
+                        method_index += 1_usize
+                    }
+                }
+                _ => {
+                }
+            }
+            directive_index += 1_usize
+        }
+    }
+    let prepared = match prepare_with_store(bundle, keys, EhirPreparationStore { cache }) {
+        Ok(value) => value
+        Err(error) => {
+            ret Result::Err("EHIR " + error.stage + ": " + error.message)
+        }
+    }
+    ret Result::Ok(PreparedEhirUnit {
+            thaw_program(prepared.program.program)?, prepared.functions_prepared, prepared.functions_reused, prepared.modules_fallback
+        }
+    )
+}
+
+fn preparation_key(module: str, owner: str, directive: usize, method: usize,
+    function: FnDirective, context: str,) -> FunctionPreparationKey {
+    let key = compiler_content_digest("encore-prepared-ehir-function-2\ncommon:1\n" + context + "\n" + module + "\n" + owner + "\n" + fn_to_string(function))
+    ret FunctionPreparationKey { module, directive, method, key }
+}
+
+#attr(test)
+fn ehir_preparation_parallel_cache_contract() -> bool {
+    let root = Path::new("target/ehir-preparation-contract").resolve()
+    let _removed = std::os::remove_dir_all(root.as_str())
+    if std::os::mkdir_all(root.as_str()) != 0_i32 {
+        ret false
+    }
+    let source = "entry first\nmodule first {\nfn first() -> u32 {\n$entry:\nv: u32 = capprim 1_u32\nret v: u32\n}\n}\n" +
+    "module second {\nfn second() -> u32 {\n$entry:\nv: u32 = capprim 2_u32\nret v: u32\n}\n}\n" +
+    "module async_module {\nasync fn third() -> u32 {\n$entry:\nv: u32 = capprim 3_u32\nret v: u32\n}\n}\n"
+    let bundle = match ehirlib::parse_text("first", source) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let serial = match prepare_ehir_unit(bundle, "test", Option[Path]::None, 1_usize) {
+        Ok(value) => value Err(message) => {
+            std::io::eprintln("serial: " + message)
+            ret false
+        }
+    }
+    let parallel = match prepare_ehir_unit(bundle, "test", Option[Path]::Some(root), 3_usize) {
+        Ok(value) => value Err(message) => {
+            std::io::eprintln("parallel: " + message)
+            ret false
+        }
+    }
+    if parallel.prepared != 2_usize || parallel.reused != 0_usize || parallel.fallback != 1_usize {
+        std::io::eprintln("unexpected cold preparation counts")
+        ret false
+    }
+    let warm = match prepare_ehir_unit(bundle, "test", Option[Path]::Some(root), 2_usize) {
+        Ok(value) => value Err(message) => {
+            std::io::eprintln("warm: " + message)
+            ret false
+        }
+    }
+    if warm.prepared != 0_usize || warm.reused != 2_usize || warm.fallback != 1_usize {
+        std::io::eprintln("unexpected warm preparation counts")
+        ret false
+    }
+    let expected = ehirlib::module_bundle_to_string(serial.bundle)
+    if ehirlib::module_bundle_to_string(parallel.bundle) != expected || ehirlib::module_bundle_to_string(warm.bundle) != expected {
+        std::io::eprintln("parallel EHIR differs from serial output")
+        ret false
+    }
+    if prepare_ehir_unit(bundle, "test", Option[Path]::None, 0_usize).is_ok() {
+        ret false
+    }
+    let invalid = match ehirlib::parse_text("bad", "entry bad\nmodule bad {\nfn bad() -> u32 {\n$entry:\nret unknown: u32\n}\n}\n" + source) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    if prepare_ehir_unit(invalid, "test", Option[Path]::None, 3_usize).is_ok() {
+        ret false
+    }
+    if prepare_ehir_unit(bundle, "test", Option[Path]::Some(root), 3_usize).is_err() {
+        ret false
+    }
+    let _cleanup = std::os::remove_dir_all(root.as_str())
+    ret true
+}

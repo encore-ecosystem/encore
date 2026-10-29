@@ -1,0 +1,153 @@
+//! Standalone command-line adapter for the reusable EHIR compiler.
+import core::option::Option
+import std::io::{eprintln, println}
+import std::os::{arch_name, argc, argv, env, file_exists, os_name, read_file}
+import std::path::Path
+import std::thread::available_parallelism
+
+import refrain::{CompileOptions, EmitKind, available_backends, compile, flatten_module_bundle, make_module_bundle, parse_text, write_output}
+
+fn usage() ->() {
+    println("Usage: ehir <input.ehir> [-o output] [--backend llvm] [--emit obj|llvm-ir]")
+    println("            [--target triple] [--profile dev|debug|release|extreme] [--jobs count] [--cc clang]")
+    println("       ehir --list-backends | --version | --help")
+}
+
+fn host_target() -> str {
+    let raw_arch = arch_name()
+    let arch = if raw_arch == "x86" {
+        "i686"
+    } else {
+        raw_arch
+    }
+    ret arch + match os_name() {
+        "windows" => "-pc-windows-msvc"
+        "macos" => "-apple-darwin"
+        _ => "-unknown-linux-gnu"
+    }
+}
+
+fn positive_number(text: str) -> usize {
+    let mut value = 0_usize
+    if text.is_empty() {
+        ret 0_usize
+    }
+    for index in 0_usize..text.byte_len() {
+        let digit = text.byte_at(index)
+        if digit < 48_u8 || digit > 57_u8 || value > 100000_usize {
+            ret 0_usize
+        }
+        value = value * 10_usize +(digit - 48_u8) as usize
+    }
+    ret value
+}
+
+fn main() -> u32 {
+    let mut input = ""
+    let mut output = ""
+    let mut backend = "llvm"
+    let mut emit = "obj"
+    let mut target = host_target()
+    let mut profile = "dev"
+    let mut jobs = available_parallelism()
+    let mut compiler = env("CC").unwrap_or("clang")
+    let mut index = 1_usize
+    while index < argc() {
+        let argument = argv(index).unwrap_or("")
+        if argument == "--help" || argument == "-h" {
+            usage() ret 0_u32
+        }
+        if argument == "--version" || argument == "-V" {
+            println("ehir " + __version__) ret 0_u32
+        }
+        if argument == "--list-backends" {
+            for name in available_backends() {
+                println(name)
+            }
+            ret 0_u32
+        }
+        if argument == "-o" || argument == "--backend" || argument == "--emit" || argument == "--target" ||
+        argument == "--profile" || argument == "--jobs" || argument == "--cc" {
+            index += 1_usize
+            let value = argv(index).unwrap_or("")
+            if value.is_empty() {
+                eprintln("ehir: missing value for " + argument) ret 2_u32
+            }
+            if argument == "-o" {
+                output = value
+            } elif argument == "--backend" {
+                backend = value
+            } elif argument == "--emit" {
+                emit = value
+            } elif argument == "--target" {
+                target = value
+            } elif argument == "--profile" {
+                profile = value
+            } elif argument == "--jobs" {
+                jobs = positive_number(value)
+            } else {
+                compiler = value
+            }
+        } elif argument.byte_len() > 0_usize && argument.byte_at(0_usize) == 45_u8 {
+            eprintln("ehir: unknown option " + argument) ret 2_u32
+        } elif input.is_empty() {
+            input = argument
+        } else {
+            eprintln("ehir: expected one input file") ret 2_u32
+        }
+        index += 1_usize
+    }
+    if input.is_empty() {
+        usage() ret 2_u32
+    }
+    if backend != "llvm" {
+        eprintln("ehir: unknown backend " + backend + "; available: llvm") ret 2_u32
+    }
+    if emit != "obj" && emit != "llvm-ir" {
+        eprintln("ehir: --emit must be obj or llvm-ir") ret 2_u32
+    }
+    if !file_exists(input) {
+        eprintln("ehir: input not found: " + input) ret 1_u32
+    }
+    if output.is_empty() {
+        output = input + if emit == "obj" {
+            ".o"
+        } else {
+            ".ll"
+        }
+    }
+    let width = if target.contains("wasm32-") || target.contains("i686-") {
+        32_usize
+    } else {
+        64_usize
+    }
+    let options = CompileOptions { target, width, profile, jobs }
+    let bundle = match parse_text("input", read_file(input)) {
+        Ok(value) => value
+        Err(error) => {
+            eprintln("ehir[" + error.stage + "]: " + error.message) ret 1_u32
+        }
+    }
+    let module = flatten_module_bundle("input", bundle)
+    match compile(make_module_bundle("input", vec![module]), options) {
+        Ok(generated) => {
+            let kind = if emit == "obj" {
+                EmitKind::Object
+            } else {
+                EmitKind::BackendIr
+            }
+            match write_output(generated, options, kind, Path::new(output).resolve(), compiler) {
+                Ok(_) => {
+                    ret 0_u32
+                }
+                Err(error) => {
+                    eprintln("ehir[" + error.stage + "]: " + error.message) ret 1_u32
+                }
+            }
+        }
+        Err(error) => {
+            eprintln("ehir[" + error.stage + "]: " + error.message) ret 1_u32
+        }
+    }
+    ret 1_u32
+}

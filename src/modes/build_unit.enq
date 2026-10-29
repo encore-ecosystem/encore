@@ -11,13 +11,14 @@ import std::thread::JoinHandle
 import std::time::perf_counter_ms
 import std::vec::Vec
 
-import ehir_llvm_backend::codegen::{PreparedUnitCodegen, incremental_codegen_context_bundle, prepare_unit_codegen, unit_codegen_context, unit_codegen_owned, unit_codegen_requirements}
 import ehirlib::{ModuleBundle, module_bundle_to_string, parse_module_bundle_text}
+import ehirlib::codegen::{PreparedUnitCodegen, clear_codegen_error, incremental_codegen_context_bundle, prepare_normalized_unit_codegen, take_codegen_error, unit_codegen_context, unit_codegen_owned, unit_codegen_requirements}
 import ehirlib::core::{Module, make_module_bundle}
 import json::{Json, parse, stringify}
 
 import mod::build_archive::{borrow_package_jobs, return_package_jobs}
 import mod::build_artifacts::{UnitReady, read_unit_ready}
+import mod::build_ehir_cache::prepare_ehir_unit
 import mod::build_fingerprint::unit_fingerprint
 import mod::build_frontend_cache::{publish_frontend_unit, read_frontend_unit}
 import mod::build_lowering_cache::{commit_lowered_function, commit_lowered_module, restore_lowered_function, restore_lowered_module}
@@ -107,15 +108,31 @@ pub fn prepare_package_worker_with_server(request: BuildUnitRequest, jobs: usize
     }
     let target = parse_target(request.context.target)
     let normalize_started = perf_counter_ms()
+    // Common preparation reads the fully typed function alone. Declaration
+    // layouts/templates belong to subsequent LLVM analysis and object keys.
+    let mut context = request.context.compiler_digest + "\n" + request.context.target + "\n" + request.context.profile
+    for feature in request.context.features {
+        context += "\nfeature:" + feature
+    }
     let normalization_jobs = if server == 0_usize {
         jobs
     } else {
         borrow_package_jobs(server, frontend.owned.modules.len())?
     }
-    let prepared = prepare_unit_codegen(frontend.owned,
-        make_module_bundle("", modules), target.triple, target.pointer_width, normalization_jobs,)
+    let normalized = prepare_ehir_unit(frontend.owned, compiler_content_digest(context), request.cache, normalization_jobs)
+    if normalized.is_err() && server != 0_usize {
+        return_package_jobs(server, normalization_jobs)
+    }
+    let normalized = normalized?
+    clear_codegen_error()
+    let prepared = prepare_normalized_unit_codegen(normalized.bundle,
+        make_module_bundle("", modules), target.triple, target.pointer_width,)
     if server != 0_usize {
         return_package_jobs(server, normalization_jobs)
+    }
+    let backend_error = take_codegen_error()
+    if !backend_error.is_empty() {
+        ret Result::Err("LLVM preparation: " + backend_error)
     }
     let normalize_ms = perf_counter_ms() - normalize_started
     let templates = module_bundle_to_string(unit_codegen_context(prepared, entry))
@@ -129,6 +146,9 @@ pub fn prepare_package_worker_with_server(request: BuildUnitRequest, jobs: usize
     let mut preparation = Vec[(str, Json)]::new()
     preparation.push(("frontend_ms", Json::Number(Debug::fmt(frontend_ms))))
     preparation.push(("backend_prepare_ms", Json::Number(Debug::fmt(perf_counter_ms() - preparation_started - frontend_ms))))
+    preparation.push(("prepared_functions_checked", Json::Number(Debug::fmt(normalized.prepared))))
+    preparation.push(("prepared_functions_reused", Json::Number(Debug::fmt(normalized.reused))))
+    preparation.push(("prepared_modules_fallback", Json::Number(Debug::fmt(normalized.fallback))))
     if detailed_timings {
         preparation.extend(frontend.timings)
         preparation.push(("frontend_checkpoint_ms", Json::Number(Debug::fmt(checkpoint_ms))))
