@@ -1,0 +1,78 @@
+//! Cached effects match a fresh fixed point, including decreasing effects.
+import core::testing::assert
+import std::vec::Vec
+
+import json::{Json, stringify}
+
+import refrain::frontend::{AnalysisDatabase, FunctionSafety, SafetyFunction}
+
+fn equal_effects(actual: Vec[FunctionSafety], expected: Vec[FunctionSafety]) -> bool {
+    if actual.len() != expected.len() {
+        ret false
+    }
+    let mut index = 0_usize
+    for effect in expected {
+        let observed = actual.get(index).unwrap_or(effect)
+        if observed.name != effect.name || observed.body_unsafe != effect.body_unsafe ||
+        observed.asserted_safe != effect.asserted_safe || observed.returns_unsafe_callable != effect.returns_unsafe_callable {
+            ret false
+        }
+        index += 1_usize
+    }
+    ret true
+}
+
+fn main() -> u32 {
+    let mut previous = Json::Null
+    let prefix = "extern fn raw() -> u32\nfn parent() -> u32 { ret leaf() }\n" +
+    "fn independent() -> u32 { ret 7_u32 }\n"
+    let mut revision = 0_usize
+    for body in vec!["ret 1_u32", "ret 1_u32", "ret 2_u32", "ret raw()", "ret 2_u32", "ret 2_u32"] {
+        let source = prefix + "fn leaf() -> u32 { " + body + " }\n" +
+        "fn recursive_a() -> u32 { ret recursive_b() }\n" +
+        "fn recursive_b() -> u32 { if true { ret leaf() } ret recursive_a() }\n"
+        let mut cached = AnalysisDatabase::new()
+        cached.set_module("app", "app.enq", source)
+        let restored = cached.function_safety_effects_with_replay(Vec[SafetyFunction]::new(), previous)
+        let mut fresh = AnalysisDatabase::new()
+        fresh.set_module("app", "app.enq", source)
+        let expected = fresh.function_safety_effects()
+        if !assert(restored.effects.len() == expected.len()) {
+            ret 1_u32
+        }
+        let mut index = 0_usize
+        for effect in expected {
+            let observed = restored.effects.get(index).unwrap_or(effect)
+            if !assert(observed.name == effect.name && observed.body_unsafe == effect.body_unsafe &&
+                observed.asserted_safe == effect.asserted_safe && observed.returns_unsafe_callable == effect.returns_unsafe_callable) {
+                ret 2_u32
+            }
+            index += 1_usize
+        }
+        if stringify(previous) == stringify(restored.replay) && !assert(restored.checked == 0_usize) {
+            ret 3_u32
+        }
+        if revision == 2_usize && !assert(restored.checked == 1_usize) {
+            ret 4_u32
+        }
+        revision += 1_usize
+        previous = restored.replay
+    }
+    let mut cyclic_previous = Json::Null
+    for bodies in vec![("ret b()", "if true { ret raw() } ret a()"),
+        ("ret b()", "ret a()"),("ret b()", "ret 1_u32"),("ret raw()", "ret 1_u32"),
+        ("ret b()", "ret a()"),("ret b()", "if true { ret raw() } ret a()"),("ret 1_u32", "ret a()")] {
+        let source = "extern fn raw() -> u32\nfn caller() -> u32 { ret a() }\n" +
+        "fn a() -> u32 { " + bodies.0 + " }\nfn b() -> u32 { " + bodies.1 + " }\n"
+        let mut cached = AnalysisDatabase::new()
+        cached.set_module("cycle", "cycle.enq", source)
+        let replayed = cached.function_safety_effects_with_replay(Vec[SafetyFunction]::new(), cyclic_previous)
+        let mut fresh = AnalysisDatabase::new()
+        fresh.set_module("cycle", "cycle.enq", source)
+        if !assert(equal_effects(replayed.effects, fresh.function_safety_effects())) {
+            ret 5_u32
+        }
+        cyclic_previous = replayed.replay
+    }
+    ret 0_u32
+}

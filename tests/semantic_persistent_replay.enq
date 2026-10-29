@@ -1,0 +1,105 @@
+//! Body facts survive a new analysis database and source relocation.
+import core::option::Option
+import core::testing::assert
+
+import std::vec::Vec
+
+import json::Json
+
+import refrain::frontend::{AnalysisDatabase, PreparedModuleSafety}
+import refrain::target::host_target
+
+fn prepare(source: str, previous: Json) -> PreparedModuleSafety {
+    let mut database = AnalysisDatabase::new()
+    database.set_module("app", "app.enq", source)
+    ret database.prepare_module_safety_with_replay("app", host_target(), Vec[str]::new(), previous, source)
+}
+
+fn main() -> u32 {
+    let source = "fn first(value: u32) -> u32 { let answer = value + 1_u32 ret answer }\n" +
+    "fn second(value: u64) -> u64 { let kept = value ret kept }\n"
+    let cold = prepare(source, Json::Null)
+    if !assert(cold.diagnostics.is_empty() && cold.checked == 2_usize && cold.reused == 0_usize) {
+        ret 1_u32
+    }
+    let warm = prepare(source, cold.replay)
+    if !assert(warm.diagnostics.is_empty() && warm.checked == 0_usize && warm.reused == 2_usize && warm.environment_reused && warm.module_checks_reused) {
+        ret 2_u32
+    }
+    let moved = prepare("\n\n\n" + source, warm.replay)
+    if !assert(moved.diagnostics.is_empty() && moved.checked == 0_usize && moved.reused == 2_usize) {
+        ret 3_u32
+    }
+    match moved.functions.get(0_usize) {
+        Some(function) => {
+            if !assert(function.body.binding_type("answer").unwrap_or("") == "u32") {
+                ret 4_u32
+            }
+            match function.body.scoped_bindings.get(0_usize) {
+                Some(binding) => {
+                    if !assert(binding.visible_line == 3_usize) {
+                        ret 5_u32
+                    }
+                }
+                None => {
+                    ret 6_u32
+                }
+            }
+        }
+        None => {
+            ret 7_u32
+        }
+    }
+    let changed = "fn first(value: u32) -> u32 { let answer = value + 2_u32 ret answer }\n" +
+    "fn second(value: u64) -> u64 { let kept = value ret kept }\n"
+    let edited = prepare(changed, moved.replay)
+    if !assert(edited.checked == 1_usize && edited.reused == 1_usize && edited.diagnostics.is_empty() && edited.environment_reused) {
+        ret 8_u32
+    }
+    let corrupt = prepare(source, Json::Object(vec![("broken", Json::Bool(true))]))
+    if !assert(corrupt.checked == 2_usize && corrupt.reused == 0_usize) {
+        ret 9_u32
+    }
+    let before = "fn produce() -> u32 { ret 1_u32 }\n" +
+    "fn consume() -> u32 { let value = produce() ret 0_u32 }\n" +
+    "fn independent() -> u32 { ret 7_u32 }\n"
+    let baseline = prepare(before, Json::Null)
+    let after = "fn produce() -> u64 { ret 1_u64 }\n" +
+    "fn consume() -> u32 { let value = produce() ret 0_u32 }\n" +
+    "fn independent() -> u32 { ret 7_u32 }\n"
+    let signature = prepare(after, baseline.replay)
+    if !assert(signature.diagnostics.is_empty() && signature.checked == 2_usize && signature.reused == 1_usize && !signature.environment_reused) {
+        ret 10_u32
+    }
+    match signature.functions.get(1_usize) {
+        Some(function) => {
+            if !assert(function.body.binding_type("value").unwrap_or("") == "u64") {
+                ret 11_u32
+            }
+        }
+        None => {
+            ret 12_u32
+        }
+    }
+    let added = prepare(before + "fn unrelated() -> u32 { ret 19_u32 }\n", baseline.replay)
+    if !assert(added.checked == 1_usize && added.reused == 3_usize && added.diagnostics.is_empty()) {
+        ret 13_u32
+    }
+    let members = "struct Data { field: u32 }\n" +
+    "impl for Data { pub fn read(self: Self) -> u32 { ret self.field } }\n" +
+    "fn sample(value: Data) -> u32 { let seen = value.read() ret seen }\n"
+    let members_cold = prepare(members, Json::Null)
+    let members_warm = prepare(members, members_cold.replay)
+    if !assert(members_warm.diagnostics.is_empty() && members_warm.checked == 0_usize &&
+        members_warm.reused == 2_usize && members_warm.environment_reused) {
+        ret 14_u32
+    }
+    let invalid_source = "import absent::missing\nfn sample() -> u32 { ret 1_u32 }\n"
+    let invalid = prepare(invalid_source, Json::Null)
+    let repeated_invalid = prepare(invalid_source, invalid.replay)
+    if !assert(!invalid.diagnostics.is_empty() && invalid.diagnostics.len() == repeated_invalid.diagnostics.len() &&
+        !repeated_invalid.module_checks_reused) {
+        ret 15_u32
+    }
+    ret 0_u32
+}

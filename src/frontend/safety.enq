@@ -5,7 +5,11 @@ import core::option::Option
 import std::io::eprintln
 import std::vec::Vec
 
+import json::{Json, stringify}
+
+import refrain::cache_identity::compiler_content_digest
 import refrain::frontend::analysis::analyze_named_module
+import refrain::frontend::metadata_ast::encode_lowered_function_input
 import refrain::frontend::parser::{Expr, ExprNode, FunctionItem, MatchArmBody, Statement}
 import refrain::frontend::semantic::{SemanticBody, SemanticCallable, SemanticField, SemanticMethod, check_function_body_with_types, semantic_associated_members, semantic_named_members, semantic_same_owner}
 import refrain::frontend::type_scope::scope_type
@@ -138,6 +142,330 @@ pub fn infer_safety_with_known(functions: Vec[SafetyFunction], known: Vec[Functi
         encore_strmap_free(lookup.heads)
     }
     ret result
+}
+
+pub struct SafetyReplayResult {
+    effects: Vec[FunctionSafety]
+    replay: Json
+    checked: usize
+    reused: usize
+}
+
+struct SafetyReplayNode {
+    slot: str
+    input: str
+    dependencies: Vec[(str, str, str)]
+    effect: FunctionSafety
+    valid: bool
+}
+
+fn safety_effect_site(effect: FunctionSafety) -> str {
+    ret effect.module_name + "\n" + effect.owner + "\n" + effect.name + "\n" + Debug::fmt(effect.line) + ":" + Debug::fmt(effect.column)
+}
+
+fn safety_effect_record(effect: FunctionSafety) -> Json {
+    ret Json::Array(vec![Json::String(effect.module_name), Json::String(effect.owner), Json::String(effect.name),
+            Json::Bool(effect.body_unsafe), Json::Bool(effect.asserted_safe), Json::Bool(effect.returns_unsafe_callable)])
+}
+
+/// Reuses closed effects only outside the reverse dependency closure of a
+/// changed input. Recomputed recursive components start at lattice bottom,
+/// never at their previous unsafe value, so unsafe-to-safe edits converge too.
+pub fn infer_safety_with_replay(functions: Vec[SafetyFunction], known: Vec[FunctionSafety],
+    contexts: Vec[(str, str)], previous: Json,) -> SafetyReplayResult {
+    let mut external = Vec[Json]::new()
+    for effect in known {
+        external.push(safety_effect_record(effect))
+    }
+    let external_key = compiler_content_digest(stringify(Json::Array(external)))
+    let ordinals = unsafe {
+        encore_strmap_new()
+    }
+    let mut nodes = Vec[SafetyReplayNode]::new()
+    let mut initial = Vec[FunctionSafety]::new()
+    for function in functions {
+        let family = effect_key(function.module_name, function.owner, function.item.name)
+        let ordinal = unsafe {
+            encore_strmap_get(ordinals, family)
+        }
+        unsafe {
+            encore_strmap_put(ordinals, family, ordinal + 1_usize)
+        }
+        let slot = family + "\n" + Debug::fmt(ordinal)
+        let mut context = ""
+        for entry in contexts {
+            if entry.0 == function.module_name {
+                context = entry.1 break
+            }
+        }
+        let input = compiler_content_digest("encore-safety-function-1\n" + context + "\n" + external_key + "\n" +
+            function.owner + "\n" + stringify(encode_lowered_function_input(function.item, function.module_name)))
+        let saved = previous.get(slot).unwrap_or(Json::Null)
+        let mut valid = !context.is_empty() && saved.get("input").unwrap_or(Json::Null).as_str().unwrap_or("") == input
+        let mut dependencies = Vec[(str, str, str)]::new()
+        match saved.get("dependencies").unwrap_or(Json::Null) {
+            Json::Array(rows) => {
+                for row in rows {
+                    let values = row.as_array().unwrap_or(Vec[Json]::new())
+                    let module = values.get(0).unwrap_or(Json::Null).as_str()
+                    let owner = values.get(1).unwrap_or(Json::Null).as_str()
+                    let name = values.get(2).unwrap_or(Json::Null).as_str()
+                    if values.len() != 3_usize || module.is_none() || owner.is_none() || name.is_none() {
+                        valid = false break
+                    }
+                    dependencies.push((module.unwrap_or(""), owner.unwrap_or(""), name.unwrap_or("")))
+                }
+            }
+            _ => {
+                valid = false
+            }
+        }
+        let body = saved.get("body_unsafe").unwrap_or(Json::Null).as_bool()
+        let asserted = saved.get("asserted_safe").unwrap_or(Json::Null).as_bool()
+        let returned = saved.get("returns_unsafe_callable").unwrap_or(Json::Null).as_bool()
+        valid = valid && body.is_some() && asserted.is_some() && returned.is_some()
+        if !valid {
+            dependencies = safety_dependencies(function)
+        }
+        let effect = FunctionSafety {
+            function.module_name, function.owner, function.item.name, function.symbol_line,
+            function.symbol_column, body.unwrap_or(false), asserted.unwrap_or(false), returned.unwrap_or(false)
+        }
+        initial.push(effect)
+        nodes.push(SafetyReplayNode { slot, input, dependencies, effect, valid })
+    }
+    unsafe {
+        encore_strmap_free(ordinals)
+    }
+    initial.extend(known)
+    let lookup = effect_lookup(initial)
+    let mut dependents = Vec[Vec[usize]]::new()
+    let mut queue = Vec[usize]::new()
+    for index in 0_usize..nodes.len() {
+        dependents.push(Vec[usize]::new())
+        let invalid = !nodes.get_unchecked_borrowed(index).valid
+        if invalid {
+            queue.push(index)
+        }
+    }
+    for consumer in 0_usize..nodes.len() {
+        for dependency in nodes.get_unchecked_borrowed(consumer).dependencies {
+            let mut encoded = unsafe {
+                encore_strmap_get(lookup.heads, effect_key(dependency.0, dependency.1, dependency.2))
+            }
+            while encoded != 0_usize {
+                let source = encoded - 1_usize
+                if source < nodes.len() {
+                    let mut values = dependents.get(source).unwrap_or(Vec[usize]::new())
+                    values.push(consumer)
+                    dependents.set(source, values)
+                }
+                encoded = lookup.next.get(source).unwrap_or(0_usize)
+            }
+        }
+    }
+    unsafe {
+        encore_strmap_free(lookup.heads)
+    }
+    let resolved = if queue.len() == functions.len() {
+        (infer_safety_with_known(functions, known), functions.len())
+    } else {
+        infer_safety_components(functions, known, nodes, dependents)
+    }
+    let computed = resolved.0
+    let checked = resolved.1
+    let positions = unsafe {
+        encore_strmap_new()
+    }
+    let mut index = 0_usize
+    for effect in computed {
+        unsafe {
+            encore_strmap_put(positions, safety_effect_site(effect), index + 1_usize)
+        }
+        index += 1_usize
+    }
+    let mut effects = Vec[FunctionSafety]::new()
+    let mut records = Vec[(str, Json)]::new()
+    for node in nodes {
+        let position = unsafe {
+            encore_strmap_get(positions, safety_effect_site(node.effect))
+        }
+        if position == 0_usize {
+            unsafe {
+                encore_strmap_free(positions)
+            }
+            ret SafetyReplayResult {
+                infer_safety_with_known(functions, known), Json::Null, functions.len(), 0_usize
+            }
+        }
+        let effect = computed.get(position - 1_usize).unwrap_or(node.effect)
+        effects.push(effect)
+        let mut dependencies = Vec[Json]::new()
+        for dependency in node.dependencies {
+            dependencies.push(Json::Array(vec![Json::String(dependency.0), Json::String(dependency.1), Json::String(dependency.2)]))
+        }
+        records.push((node.slot, Json::Object(vec![("input", Json::String(node.input)),("dependencies", Json::Array(dependencies)),
+                        ("body_unsafe", Json::Bool(effect.body_unsafe)),("asserted_safe", Json::Bool(effect.asserted_safe)),
+                        ("returns_unsafe_callable", Json::Bool(effect.returns_unsafe_callable))])))
+    }
+    unsafe {
+        encore_strmap_free(positions)
+    }
+    effects.extend(known)
+    ret SafetyReplayResult { effects, Json::Object(records), checked, functions.len() - checked }
+}
+
+/// Iterative Kosaraju traversal avoids native stack growth on long call chains.
+fn safety_graph_components(graph: Vec[Vec[usize]]) -> Vec[Vec[usize]] {
+    let mut transpose = Vec[Vec[usize]]::new()
+    let mut visited = Vec[bool]::new()
+    for _index in 0_usize..graph.len() {
+        transpose.push(Vec[usize]::new()) visited.push(false)
+    }
+    for source in 0_usize..graph.len() {
+        for target in graph.get_unchecked_borrowed(source) {
+            let mut reverse = Vec[usize]::new()
+            reverse.extend(transpose.get(target).unwrap_or(Vec[usize]::new()))
+            reverse.push(source)
+            transpose.set(target, reverse)
+        }
+    }
+    let mut order = Vec[usize]::new()
+    for root in 0_usize..graph.len() {
+        if visited.get(root).unwrap_or(true) {
+            continue
+        }
+        let mut stack = Vec[(usize, usize)]::new()
+        stack.push((root, 0_usize)) visited.set(root, true)
+        while !stack.is_empty() {
+            let cursor = stack.len() - 1_usize
+            let frame = stack.get(cursor).unwrap_or((root, 0_usize))
+            let edges = graph.get(frame.0).unwrap_or(Vec[usize]::new())
+            if frame.1 < edges.len() {
+                let child = edges.get(frame.1).unwrap_or(root)
+                stack.set(cursor,(frame.0, frame.1 + 1_usize))
+                if !visited.get(child).unwrap_or(true) {
+                    visited.set(child, true) stack.push((child, 0_usize))
+                }
+            } else {
+                order.push(frame.0) let _removed = stack.pop()
+            }
+        }
+    }
+    for index in 0_usize..visited.len() {
+        visited.set(index, false)
+    }
+    let mut components = Vec[Vec[usize]]::new()
+    while !order.is_empty() {
+        let root = order.pop().unwrap_or(0_usize)
+        if visited.get(root).unwrap_or(true) {
+            continue
+        }
+        let mut pending = Vec[usize]::new()
+        let mut members = Vec[usize]::new()
+        pending.push(root) visited.set(root, true)
+        while !pending.is_empty() {
+            let node = pending.pop().unwrap_or(root)
+            members.push(node)
+            for child in transpose.get(node).unwrap_or(Vec[usize]::new()) {
+                if !visited.get(child).unwrap_or(true) {
+                    visited.set(child, true) pending.push(child)
+                }
+            }
+        }
+        components.push(members)
+    }
+    ret components
+}
+
+/// Components are processed callee-first. Only a changed caller-visible effect
+/// schedules a clean dependent component; a numerical body edit stays local.
+fn infer_safety_components(functions: Vec[SafetyFunction], known: Vec[FunctionSafety],
+    nodes: Vec[SafetyReplayNode], dependents: Vec[Vec[usize]],) ->(Vec[FunctionSafety], usize) {
+    let components = safety_graph_components(dependents)
+    let mut membership = Vec[usize]::new()
+    let mut effects = Vec[FunctionSafety]::new()
+    for node in nodes {
+        membership.push(0_usize) effects.push(node.effect)
+    }
+    let mut remaining = Vec[usize]::new()
+    let mut dirty = Vec[bool]::new()
+    for component in 0_usize..components.len() {
+        remaining.push(0_usize)
+        let mut changed = false
+        for node in components.get_unchecked_borrowed(component) {
+            membership.set(node, component)
+            changed = changed || !nodes.get_unchecked_borrowed(node).valid
+        }
+        dirty.push(changed)
+    }
+    for source in 0_usize..nodes.len() {
+        let owner = membership.get(source).unwrap_or(0_usize)
+        for consumer in dependents.get_unchecked_borrowed(source) {
+            let target = membership.get(consumer).unwrap_or(0_usize)
+            if target != owner {
+                remaining.set(target, remaining.get(target).unwrap_or(0_usize) + 1_usize)
+            }
+        }
+    }
+    let mut ready = Vec[usize]::new()
+    for component in 0_usize..components.len() {
+        if remaining.get(component).unwrap_or(1_usize) == 0_usize {
+            ready.push(component)
+        }
+    }
+    let mut cursor = 0_usize
+    let mut checked = 0_usize
+    while cursor < ready.len() {
+        let component = ready.get(cursor).unwrap_or(0_usize)
+        cursor += 1_usize
+        if dirty.get(component).unwrap_or(true) {
+            let mut pending = Vec[SafetyFunction]::new()
+            let mut installed = Vec[FunctionSafety]::new()
+            installed.extend(known)
+            for index in 0_usize..nodes.len() {
+                if membership.get(index).unwrap_or(0_usize) == component {
+                    pending.push(functions.get_unchecked_borrowed(index))
+                } else {
+                    installed.push(effects.get_unchecked_borrowed(index))
+                }
+            }
+            checked += pending.len()
+            let computed = infer_safety_with_known(pending, installed)
+            for index in components.get_unchecked_borrowed(component) {
+                let before = effects.get(index).unwrap_or(nodes.get_unchecked_borrowed(index).effect)
+                for effect in computed {
+                    if safety_effect_site(effect) == safety_effect_site(before) {
+                        effects.set(index, effect)
+                        if before.is_unsafe() != effect.is_unsafe() || before.returns_unsafe_callable != effect.returns_unsafe_callable {
+                            for consumer in dependents.get_unchecked_borrowed(index) {
+                                let target = membership.get(consumer).unwrap_or(component)
+                                if target != component {
+                                    dirty.set(target, true)
+                                }
+                            }
+                        }
+                        break
+                    }
+                }
+            }
+        }
+        for index in components.get_unchecked_borrowed(component) {
+            for consumer in dependents.get_unchecked_borrowed(index) {
+                let target = membership.get(consumer).unwrap_or(component)
+                if target == component {
+                    continue
+                }
+                let count = remaining.get(target).unwrap_or(1_usize) - 1_usize
+                remaining.set(target, count)
+                if count == 0_usize {
+                    ready.push(target)
+                }
+            }
+        }
+    }
+    effects.extend(known)
+    ret(effects, checked)
 }
 
 fn infer_indexed_safety(functions: Vec[SafetyFunction], effects: mut Vec[FunctionSafety], lookup: EffectLookup) -> Vec[FunctionSafety] {

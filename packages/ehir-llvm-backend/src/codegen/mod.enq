@@ -172,6 +172,16 @@ pub fn unit_codegen_owned(unit: frozen PreparedUnitCodegen, entry: str) -> Modul
     ret make_module_bundle(entry, modules)
 }
 
+/// Exact declaration/template inputs to ordinary LLVM emission, including
+/// dependencies. Ordinary owned bodies are fingerprinted separately.
+pub fn unit_codegen_input_context(unit: frozen PreparedUnitCodegen) -> ModuleBundle {
+    let mut modules = Vec[Module]::new()
+    for context in unit.contexts {
+        modules.push(clone_module_for_codegen(context))
+    }
+    ret make_module_bundle("", modules)
+}
+
 /// Copies only compact requirements across the immutable preparation boundary.
 pub fn unit_codegen_requirements(unit: frozen PreparedUnitCodegen) -> CodegenRequirements {
     let mut calls = Vec[GenericRequirement]::new()
@@ -192,6 +202,27 @@ pub fn unit_codegen_requirements(unit: frozen PreparedUnitCodegen) -> CodegenReq
 /// external declarations and are defined once by emit_program_support.
 pub fn emit_unit_codegen(unit: frozen PreparedUnitCodegen, triple: str,
     pointer_width: usize,) -> Vec[EmittedIrModule] {
+    let mut selected = Vec[usize]::new()
+    let mut index = 0_usize
+    for _module in unit.owned {
+        selected.push(index)
+        index += 1_usize
+    }
+    ret emit_unit_codegen_selected(unit, triple, pointer_width, selected)
+}
+
+/// Emits only cache misses. Selection uses the canonical owned-module order;
+/// unlike program CGUs, package CGU zero never owns global helper definitions.
+pub fn emit_unit_codegen_selected(unit: frozen PreparedUnitCodegen, triple: str,
+    pointer_width: usize, selected: Vec[usize],) -> Vec[EmittedIrModule] {
+    ret emit_unit_codegen_selected_parallel(unit, triple, pointer_width, selected, 1_usize)
+}
+
+pub fn emit_unit_codegen_selected_parallel(unit: frozen PreparedUnitCodegen, triple: str,
+    pointer_width: usize, selected: Vec[usize], jobs: usize,) -> Vec[EmittedIrModule] {
+    if selected.is_empty() {
+        ret Vec[EmittedIrModule]::new()
+    }
     install_codegen_target(triple, pointer_width)
     let directives = module_bundle_directives(unit.contexts)
     let mut calls = Vec[GenericCall]::new()
@@ -206,12 +237,52 @@ pub fn emit_unit_codegen(unit: frozen PreparedUnitCodegen, triple: str,
     let support = SupportIr {
         "", unit_support_declarations(directives, expanded, unit.requirements.concrete_types, unit.requirements.equality_types)
     }
+    let count = min_codegen_jobs(jobs, selected.len())
+    let scheduled = schedule_selected_codegen_modules(unit.owned, selected)
+    let mut chunks = Vec[EmittedIrChunk]::new()
+    if count == 1_usize {
+        chunks = emit_package_ir_batch(unit, scheduled, triple, pointer_width, support, 0_usize, 1_usize)
+    } else {
+        let mut handles = Vec[JoinHandle[Vec[EmittedIrChunk]]]::new()
+        for worker in 0_usize..count {
+            handles.push(spawn emit_package_ir_batch(unit, scheduled, triple, pointer_width, support, worker, count))
+        }
+        for handle in handles {
+            chunks.extend(handle.join())
+        }
+    }
     let mut out = Vec[EmittedIrModule]::new()
-    for module in unit.owned {
-        let view = module_codegen_view(module, unit.contexts)
-        let lowered = lower_with_precomputed_analysis(view, unit.requirements.concrete_types, support, false)
-        let ir = "target triple = \"" + triple + "\"\n\n" + lowered.ir
-        out.push(EmittedIrModule { module.name, ir, ir.byte_len() })
+    for index in selected {
+        for chunk in chunks {
+            if chunk.index == index {
+                out.push(chunk.module) break
+            }
+        }
+    }
+    ret out
+}
+
+fn emit_package_ir_batch(unit: frozen PreparedUnitCodegen, selected: frozen Vec[usize], triple: str,
+    pointer_width: usize, support: frozen SupportIr, worker: usize, workers: usize,) -> sending Vec[EmittedIrChunk] {
+    install_codegen_target(triple, pointer_width)
+    let mut out = Vec[EmittedIrChunk]::new()
+    let mut cursor = worker
+    while cursor < selected.len() {
+        let index = selected.get(cursor).unwrap_or(unit.owned.len())
+        match unit.owned.get(index) {
+            Some(module) => {
+                let view = module_codegen_view(module, unit.contexts)
+                let lowered = lower_with_precomputed_analysis(view, unit.requirements.concrete_types, support, false)
+                let ir = "target triple = \"" + triple + "\"\n\n" + lowered.ir
+                out.push(EmittedIrChunk {
+                        index, EmittedIrModule { module.name, ir, ir.byte_len() }
+                    }
+                )
+            }
+            None => {
+            }
+        }
+        cursor += workers
     }
     ret out
 }
