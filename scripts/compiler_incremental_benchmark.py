@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -132,7 +133,8 @@ def verify_binary(project, profile, coefficient, message):
     binary = project / "target" / profile / ("graphene.exe" if os.name == "nt" else "graphene")
     result = subprocess.run([str(binary), "__encore_bench_camera"], cwd=project,
                             capture_output=True, text=True, timeout=30)
-    if result.returncode or abs(float(result.stdout.strip()) - (1.5707963 - 100 * coefficient)) > 0.00001:
+    actual = float(result.stdout.strip())
+    if result.returncode or not math.isfinite(actual) or abs(actual - (1.5707963 - 100 * coefficient)) > 0.00001:
         raise ValueError("stale or incorrect camera code: " + result.stdout + result.stderr)
     result = subprocess.run([str(binary), "cook"], cwd=project,
                             capture_output=True, text=True, timeout=30)

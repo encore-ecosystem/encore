@@ -43,6 +43,16 @@ def workload(root):
 
 
 class IncrementalContracts(unittest.TestCase):
+    @unittest.skipIf(os.name=='nt','fixture executable uses a POSIX shebang')
+    def test_nan_camera_output_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binary=root/'target/dev/graphene'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('#!/usr/bin/env python3\nprint("NaN")\n')
+            binary.chmod(0o755)
+            with self.assertRaisesRegex(ValueError,'stale or incorrect camera code'):
+                incremental.verify_binary(root,'dev',.006,'unused')
+
     def test_plain_package_under_another_git_repository_preserves_sources_only(self):
         with tempfile.TemporaryDirectory() as directory:
             outer=Path(directory)
