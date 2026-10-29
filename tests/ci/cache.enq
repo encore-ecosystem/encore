@@ -9,7 +9,8 @@ import std::vec::Vec
 
 import json::Json
 
-import refrain::ci_helpers::{Fixture, flag, json, modified_ns, number, repository, set_env, text}
+import refrain::ci_helpers::{Fixture, flag, json, modified_ns, number, repository, set_env, text, replace}
+import refrain::cache_identity::compiler_content_digest
 
 fn prepare(fixture: Fixture) ->() {
     fixture.manifest("cache_application", "[\"path@dependency\"]")
@@ -282,7 +283,8 @@ fn integration_native_object_reuse_contract() -> bool {
     let prefix = "import mod::stable::unchanged\n" +
     "fn same[T](value: T) -> T { ret value }\n" +
     "trait Handler { fn handle(self: Self, value: u32) -> u32 }\n" +
-    "fn kept(base: u32) -> u32 { let handler: dyn Handler = | value | base + value ret handler.handle(2_u32) }\n"
+    "fn kept(base: u32) -> u32 { let handler: dyn Handler = | value | { " +
+    "let nested: dyn Handler = | inner | base + inner ret nested.handle(value) } ret handler.handle(2_u32) }\n"
     fixture.put("src/main.enq", prefix + "fn main() -> u32 { ret unchanged() + kept(39_u32) - 82 }\n")
     build(fixture, "2", "dev")
     if !executes(fixture, "dev") {
@@ -301,10 +303,18 @@ fn integration_native_object_reuse_contract() -> bool {
     number(phases, "functions_reused") == "" || number(phases, "functions_reused") == "0" {
         ret fixture.finish(false)
     }
+    // Moving source coordinates must preserve closure symbols and replayed
+    // fragments. Execute the result and compare it with a later clean build.
+    fixture.put("src/main.enq", "\n\n\n" + prefix + main_body)
+    let moved = unit(build(fixture, "2", "dev"), "cache_application").get("phases").unwrap_or(Json::Null)
+    if number(moved, "functions_reused") == "0" || !executes(fixture, "dev") {
+        ret fixture.finish(false)
+    }
     let generic_prefix = "import mod::stable::unchanged\n" +
     "fn same[T](value: T) -> T { let copied = value ret copied }\n" +
     "trait Handler { fn handle(self: Self, value: u32) -> u32 }\n" +
-    "fn kept(base: u32) -> u32 { let handler: dyn Handler = | value | base + value ret handler.handle(2_u32) }\n"
+    "fn kept(base: u32) -> u32 { let handler: dyn Handler = | value | { " +
+    "let nested: dyn Handler = | inner | base + inner ret nested.handle(value) } ret handler.handle(2_u32) }\n"
     fixture.put("src/main.enq", generic_prefix + main_body)
     let generic_changed = unit(build(fixture, "2", "dev"), "cache_application").get("phases").unwrap_or(Json::Null)
     if number(generic_changed, "functions_reused") != "0" || !executes(fixture, "dev") {
@@ -338,6 +348,39 @@ fn integration_native_object_reuse_contract() -> bool {
     remove_dir_all(fixture.root.join("cache").as_str())
     build(fixture, "2", "dev")
     ret fixture.finish(executes(fixture, "dev") && file_sha256(fixture.binary("cache_application", "dev").as_str()) == expected)
+}
+
+fn concurrent_cached_build(directory: str, compiler: str, jobs: str) -> bool {
+    ret Command::new(compiler).cwd(directory).arg("build").arg("--jobs").arg(jobs).output().success()
+}
+
+#attr(test)
+fn integration_parallel_cache_restore_contract() -> bool {
+    let first = Fixture::new("parallel-cache-first")
+    let second = Fixture::new("parallel-cache-second")
+    for fixture in vec![first, second] {
+        fixture.manifest("cache_application", "[\"path@left\", \"path@right\"]")
+        fixture.put("left/encore.toml", "[project]\nname=\"left\"\nversion=\"0.0.0\"\ndependencies=[]\n")
+        fixture.put("right/encore.toml", "[project]\nname=\"right\"\nversion=\"0.0.0\"\ndependencies=[]\n")
+        fixture.put("left/src/lib.enq", "pub fn value() -> u32 { ret 20 }\n")
+        fixture.put("right/src/lib.enq", "pub fn value() -> u32 { ret 22 }\n")
+        fixture.put("src/main.enq", "import left::value as left_value\nimport right::value as right_value\n" +
+            "fn main() -> u32 { ret left_value() + right_value() - 42 }\n",)
+    }
+    set_env("ENCORE_BUILD_CACHE", first.root.join("cache").as_str())
+    build(first, "2", "dev")
+    // Separate outputs share CAS locks. The serial and parallel consumers
+    // race for identical keys without acquiring another build's CPU leases.
+    remove_dir_all(first.root.join("target").as_str())
+    let one = spawn concurrent_cached_build(first.root.as_str(), first.compiler, "1")
+    let two = spawn concurrent_cached_build(second.root.as_str(), second.compiler, "4")
+    let ok = one.join() && two.join()
+    let identical = file_sha256(first.binary("cache_application", "dev").as_str()) ==
+    file_sha256(second.binary("cache_application", "dev").as_str())
+    let valid = ok && identical && executes(first, "dev") && executes(second, "dev") &&
+    all_cached(build(first, "2", "dev")) && all_cached(build(second, "4", "dev"))
+    let cleaned = second.finish(valid)
+    ret first.finish(cleaned)
 }
 
 #attr(test)
@@ -405,6 +448,21 @@ fn integration_incremental_cache_contract() -> bool {
         if flag(unit(build(fixture, "2", "dev"), "cache_application"), "cache_hit") || !executes(fixture, "dev") || file_sha256(binary.as_str()) != expected {
             ret fixture.finish(false)
         }
+    }
+    // Forge a self-consistent scheduling hint while leaving the metadata's
+    // semantic interface unchanged. A worker must reject it as a cache hit.
+    for entry in committed(fixture) {
+        let original = read_file(entry.join("unit.ready").as_str())
+        let interface = text(json(original), "interface")
+        let forged = replace(original, interface, compiler_content_digest("forged interface"))
+        let receipt = read_file(entry.join("unit.complete").as_str())
+        write_file(entry.join("unit.ready").as_str(), forged)
+        write_file(entry.join("unit.complete").as_str(),
+            replace(receipt, compiler_content_digest(original), compiler_content_digest(forged)))
+    }
+    if flag(unit(build(fixture, "4", "dev"), "cache_application"), "cache_hit") ||
+    !executes(fixture, "dev") || file_sha256(binary.as_str()) != expected {
+        ret fixture.failure("unvalidated cache hint was admitted")
     }
     for name in read_dir(fixture.root.join("cache").as_str()) {
         let entry = fixture.root.join("cache").join(name)

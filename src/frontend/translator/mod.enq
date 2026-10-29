@@ -612,6 +612,8 @@ struct TranslatorContext {
     imports: TranslationImportCache
     async_functions: Vec[usize]
     current_module: str
+    function_identity: str
+    next_closure_ordinal: usize
 }
 
 struct ReflectionShapeCache {
@@ -804,7 +806,7 @@ pub struct CachedCompilationChunks {
 }
 
 pub fn lowering_function_key(module_id: str, item: FunctionItem) -> str {
-    ret compiler_content_digest("encore-lowered-function-input-1\n" + module_id + "\n" +
+    ret compiler_content_digest("encore-lowered-function-input-2\n" + module_id + "\n" +
         stringify(encode_lowered_function_input(item, module_id)))
 }
 
@@ -1542,6 +1544,7 @@ fn free_translation_indexes(ctx: TranslatorContext) ->() {
 fn translate_ast_with_context(ctx: mut TranslatorContext, ast: Vec[Statement], target: TargetSpec, features:
     Vec[str], module_id: str,) -> EhirTextBuilder {
     ctx.current_module = module_id
+    reset_qualified_type_cache(ctx)
     reset_generated_closure_declarations(ctx)
     let mut builder = EhirTextBuilder::new()
     for statement in ast {
@@ -1774,7 +1777,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
             }
             , Vec[str]::new(), Vec[Option[FunctionType]]::new()
         }
-        , Vec[usize]::new(), ""
+        , Vec[usize]::new(), "", "", 0
     }
     // Struct/enum syntax nodes intentionally carry no source path. In a
     // resolved workspace, collect them through their owning module so two
@@ -2456,15 +2459,27 @@ fn qualified_type_for_source(ctx: mut TranslatorContext, source_name: str, typ: 
     }
     ctx.qualified_type_misses += 1
     let resolved = qualified_type_for_source_uncached(ctx, source_name, typ)
-    // Bound both key count and string sizes. Stop admitting new spellings at
-    // capacity while retaining hits; this cache never survives translation.
-    if ctx.qualified_type_values.len() < 4096 && resolved.byte_len() <= 2048 {
+    // Keep the current working set rather than permanently pinning the first
+    // 4096 context-collection queries. Rotation bounds memory while allowing
+    // later modules and large functions to benefit from memoization too.
+    if resolved.byte_len() <= 2048 {
+        if ctx.qualified_type_values.len() >= 4096 {
+            reset_qualified_type_cache(ctx)
+        }
         ctx.qualified_type_values.push(resolved)
         unsafe {
             encore_strmap_put(ctx.qualified_type_cache, key, ctx.qualified_type_values.len())
         }
     }
     ret resolved
+}
+
+fn reset_qualified_type_cache(ctx: mut TranslatorContext) ->() {
+    unsafe {
+        encore_strmap_free(ctx.qualified_type_cache)
+        ctx.qualified_type_cache = encore_strmap_new()
+    }
+    ctx.qualified_type_values = Vec[str]::new()
 }
 
 fn qualified_type_for_source_uncached(ctx: mut TranslatorContext, source_name: str, typ: str) -> str {
@@ -6680,6 +6695,12 @@ fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, e
     }
     let fn_item = expand_translation_reflection(ctx, fn_item, scope_generics)
     ctx.active_source_name = fn_item.source_name
+    ctx.function_identity = if ctx.stable_abi {
+        compiler_content_digest(module_identity_for_source(ctx, fn_item.source_name) + "\n" + emitted_name)
+    } else {
+        ""
+    }
+    ctx.next_closure_ordinal = 0
     if fn_item.is_async && fn_item.is_extern {
         translation_error_at(fn_item.source_name, fn_item.line, fn_item.column, "async-extern", "extern functions cannot be async")
     }
@@ -9426,10 +9447,22 @@ fn lower_closure_expr(ctx: mut TranslatorContext, closure: ClosureExpr, source_n
     } else {
         source_name
     }
-    let closure_prefix = "__encore_closure_" + encode_module_identity(source_identity) + "_" +
-    Debug::fmt(line) + "_" + Debug::fmt(column) + "_"
+    let structural_site = ctx.stable_abi && ctx.function_identity != ""
+    let closure_prefix = if structural_site {
+        let ordinal = ctx.next_closure_ordinal
+        ctx.next_closure_ordinal += 1
+        "__encore_closure_" + encode_module_identity(source_identity) + "_f" +
+        ctx.function_identity + "_" + Debug::fmt(ordinal) + "_"
+    } else {
+        "__encore_closure_" + encode_module_identity(source_identity) + "_" +
+        Debug::fmt(line) + "_" + Debug::fmt(column) + "_"
+    }
     let mut closure_id = 0_usize
-    if ctx.stable_abi {
+    if structural_site {
+        // A function-local preorder ordinal is unique without scanning every
+        // previously generated closure. Moving surrounding source preserves it.
+        closure_id = 0
+    } elif ctx.stable_abi {
         // Repeated expansion at one lexical site needs a local ordinal, not a
         // graph-wide count affected by closures in unrelated modules.
         for declaration in ctx.extern_functions {
@@ -16027,7 +16060,20 @@ fn translator_qualified_type_cache_matches_uncached_scopes() -> bool {
                 correct = false
             }
         }
-        if ctx.qualified_type_values.len() != 4096 || ctx.qualified_type_hits == 0 {
+        if ctx.qualified_type_values.len() > 4096 || ctx.qualified_type_hits == 0 {
+            correct = false
+        }
+        // A spelling first seen after saturation must become a hit. Returning
+        // a value borrowed from the old vector must also survive rotation.
+        let retained = qualified_type_for_source(ctx, "left", "Value")
+        reset_qualified_type_cache(ctx)
+        if retained != qualified_type_for_source_uncached(ctx, "left", "Value") {
+            correct = false
+        }
+        let _first = qualified_type_for_source(ctx, "left", "Unknown_4099")
+        let hits = ctx.qualified_type_hits
+        let _again = qualified_type_for_source(ctx, "left", "Unknown_4099")
+        if ctx.qualified_type_hits != hits + 1 {
             correct = false
         }
         if qualified_type_for_source(ctx, "left", "Value") != qualified_type_for_source_uncached(ctx, "left", "Value") {

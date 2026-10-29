@@ -16,7 +16,7 @@ import refrain::frontend::project_constants::ProjectConstants
 import refrain::frontend::safety::{FunctionSafety, SafetyFunction, infer_safety_with_known, safety_dependencies}
 import refrain::frontend::semantic::{ScopedSemanticBinding, SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticDependencyKind, SemanticField, SemanticMember, SemanticMethod, SemanticVariant, append_bound_methods, check_function_body, check_function_body_with_scope, check_function_body_with_type_scope, check_function_body_with_types, check_function_body_with_variants, check_module_bodies, check_module_bodies_with_type_scope, check_module_bodies_with_types, check_module_bodies_with_variants, check_module_declarations, prepare_module_bodies_with_variants, semantic_accessible_methods, semantic_associated_members, semantic_call_return_type, semantic_members, semantic_named_members, semantic_same_owner, specialize_method_type_with_self}
 import refrain::frontend::syntax::SyntaxDocument
-import refrain::frontend::type_scope::{TypeNameBinding, display_type, names_in_scope, scope_type}
+import refrain::frontend::type_scope::{TypeNameBinding, TypeScopeIndex, display_type, names_in_scope, scope_type, scope_type_indexed, type_scope_index}
 import refrain::target::{TargetSpec, cfg_active_with_features, host_target}
 
 /// Checked facts live only until this package's safety inference completes.
@@ -2475,17 +2475,15 @@ impl for AnalysisDatabase {
         ret names
     }
 
-    fn scoped_fields(self: Self, fields: Vec[SemanticField], names: Vec[TypeNameBinding]) -> Vec[SemanticField] {
+    fn scoped_fields(self: Self, fields: Vec[SemanticField], index: TypeScopeIndex) -> Vec[SemanticField] {
         let mut out = Vec[SemanticField]::new()
         let mut scope = ""
-        let mut selected = Vec[TypeNameBinding]::new()
         for field in fields {
             if scope != field.module_name || scope == "" {
                 scope = field.module_name
-                selected = names_in_scope(names, scope)
             }
-            out.push(field.in_receiver_scope(scope_type(field.owner_type, scope, selected, field.generic_names),
-                    scope_type(field.typ, scope, selected, field.generic_names),))
+            out.push(field.in_receiver_scope(scope_type_indexed(field.owner_type, scope, index, field.generic_names),
+                    scope_type_indexed(field.typ, scope, index, field.generic_names),))
         }
         ret out
     }
@@ -2502,20 +2500,20 @@ impl for AnalysisDatabase {
             slot += 1_usize
         }
         let names = self.semantic_type_names(module_name)
-        let mut callables = self.scoped_callables(self.visible_semantic_callables(module_name), names)
-        let fields = self.scoped_fields(self.visible_semantic_fields(module_name), names)
-        let methods = self.scoped_methods(self.visible_semantic_methods(module_name), names)
+        let type_index = type_scope_index(names)
+        let mut callables = self.scoped_callables(self.visible_semantic_callables(module_name), type_index)
+        let fields = self.scoped_fields(self.visible_semantic_fields(module_name), type_index)
+        let methods = self.scoped_methods(self.visible_semantic_methods(module_name), type_index)
         let mut aggregates = Vec[str]::new()
         let mut constructors = Vec[str]::new()
         let mut variants = Vec[SemanticVariant]::new()
         for visible in self.reachable_semantic_modules(module_name) {
             let document = self.document(visible).unwrap_or(FrontendDocument::empty())
-            let selected = names_in_scope(names, visible)
             for statement in document.ast {
                 match statement {
                     Statement::EnumItem(item) => {
                         let generics = declaration_generic_names(item.generics)
-                        let owner = scope_type(item.name, visible, selected, generics)
+                        let owner = scope_type_indexed(item.name, visible, type_index, generics)
                         for variant in item.variants {
                             let mut payload = "void"
                             match variant.tuple_fields.get(0) {
@@ -2533,7 +2531,7 @@ impl for AnalysisDatabase {
                                 }
                             }
                             variants.push(SemanticVariant {
-                                    owner, variant.name, scope_type(payload, visible, selected, generics), generics
+                                    owner, variant.name, scope_type_indexed(payload, visible, type_index, generics), generics
                                 }
                                 ,
                             )
@@ -2568,8 +2566,8 @@ impl for AnalysisDatabase {
                         if item.name == callable.declaration_name && analysis_function_has_attr(item, "static_inferred") {
                             let body = check_function_body_with_variants(item, callables, fields, methods, "",
                                 Vec[GenericParam]::new(), aggregates, callable.module_name, names, variants,)
-                            let typ = scope_type(body.return_type, callable.module_name,
-                                names_in_scope(names, callable.module_name), Vec[str]::new(),)
+                            let typ = scope_type_indexed(body.return_type, callable.module_name,
+                                type_index, Vec[str]::new(),)
                             callables.set(index, callable.with_return_type(typ))
                         }
                     }
@@ -2589,14 +2587,12 @@ impl for AnalysisDatabase {
         ret cached
     }
 
-    fn scoped_methods(self: Self, methods: Vec[SemanticMethod], names: Vec[TypeNameBinding]) -> Vec[SemanticMethod] {
+    fn scoped_methods(self: Self, methods: Vec[SemanticMethod], index: TypeScopeIndex) -> Vec[SemanticMethod] {
         let mut out = Vec[SemanticMethod]::new()
         let mut scope = ""
-        let mut selected = Vec[TypeNameBinding]::new()
         for method in methods {
             if scope != method.module_name || scope == "" {
                 scope = method.module_name
-                selected = names_in_scope(names, scope)
             }
             let mut binders = Vec[str]::new()
             for name in method.generic_names {
@@ -2609,33 +2605,31 @@ impl for AnalysisDatabase {
             }
             let mut params = Vec[str]::new()
             for param in method.params {
-                params.push(scope_type(param, scope, selected, binders))
+                params.push(scope_type_indexed(param, scope, index, binders))
             }
             out.push(SemanticMethod {
-                    method.module_name, scope_type(method.receiver_type, scope, selected, method.generic_names),
-                    method.name, params, scope_type(method.ret_type, scope, selected, binders),
+                    method.module_name, scope_type_indexed(method.receiver_type, scope, index, method.generic_names),
+                    method.name, params, scope_type_indexed(method.ret_type, scope, index, binders),
                     method.signature, method.declaration_receiver, method.generic_names, method.is_static, method.is_public, method.method_generic_names
                 }
                 ,)
         }
         ret out
     }
-    fn scoped_callables(self: Self, callables: Vec[SemanticCallable], names: Vec[TypeNameBinding]) -> Vec[SemanticCallable] {
+    fn scoped_callables(self: Self, callables: Vec[SemanticCallable], index: TypeScopeIndex) -> Vec[SemanticCallable] {
         let mut scoped_callables = Vec[SemanticCallable]::new()
         let mut scope = ""
-        let mut selected = Vec[TypeNameBinding]::new()
         for callable in callables {
             if scope != callable.module_name || scope == "" {
                 scope = callable.module_name
-                selected = names_in_scope(names, scope)
             }
             let mut params = Vec[str]::new()
             for param in callable.params {
-                params.push(scope_type(param, scope, selected, callable.generic_names))
+                params.push(scope_type_indexed(param, scope, index, callable.generic_names))
             }
             scoped_callables.push(SemanticCallable {
                     callable.module_name, callable.name, params,
-                    scope_type(callable.ret_type, scope, selected, callable.generic_names), callable.signature,
+                    scope_type_indexed(callable.ret_type, scope, index, callable.generic_names), callable.signature,
                     callable.declaration_name, callable.lookup_module, callable.binding_identity, callable.generic_names, callable.is_static
                 }
                 ,)

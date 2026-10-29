@@ -10,7 +10,7 @@ import refrain::frontend::analysis::{DiagnosticLabel, DiagnosticLabelKind, Diagn
 import refrain::frontend::control_flow::statements_terminate_flow
 import refrain::frontend::parser::{BlockExpr, Expr, ExprNode, FunctionItem, FunctionParam, GenericParam, IfExprBranch, ImplStmt, MatchArmBody, MatchPattern, ParsedBlock, Statement, TraitStmt}
 import refrain::frontend::reflection::{ReflectionBinding, ReflectionShape, expand_reflection_function, function_uses_reflection, reflection_binding_sites}
-import refrain::frontend::type_scope::{TypeNameBinding, declaration_type_name, display_type, scope_type}
+import refrain::frontend::type_scope::{TypeNameBinding, TypeScopeIndex, declaration_type_name, display_type, scope_type, scope_type_indexed, type_scope_index}
 import refrain::target::{TargetSpec, cfg_active_with_features}
 
 /// Records the inferred type of a local binding.
@@ -257,6 +257,7 @@ struct SemanticContext {
     implicit_receivers: Vec[(usize, usize, str, str)]
     variants: Vec[SemanticVariant]
     is_async: bool
+    type_index: TypeScopeIndex
 }
 
 impl for SemanticBody {
@@ -602,6 +603,14 @@ pub fn check_function_body_with_variants(item: FunctionItem, callables: Vec[Sema
     fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
     scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str,
     type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant],) -> SemanticBody {
+    ret check_function_body_indexed(item, callables, fields, methods, self_type, scope_generics,
+        aggregate_names, type_scope, type_names, variants, type_scope_index(type_names))
+}
+
+fn check_function_body_indexed(item: FunctionItem, callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
+    scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str,
+    type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant], type_index: TypeScopeIndex,) -> SemanticBody {
     let reflection_sites = if function_uses_reflection(item) {
         reflection_binding_sites(item)
     } else {
@@ -678,13 +687,13 @@ pub fn check_function_body_with_variants(item: FunctionItem, callables: Vec[Sema
         generic_names.push(generic.name)
         generics.push(generic)
     }
-    let bound_methods = methods_for_generic_bounds(generics, methods, type_scope, type_names)
+    let bound_methods = methods_for_generic_bounds(generics, methods, type_scope, type_names, type_index)
     let scoped_methods = append_bound_methods(methods, bound_methods)
     let mut ctx = SemanticContext {
         callables, fields, scoped_methods, self_type, generic_names, Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(),
         Vec[SemanticDependency]::new(),
         (0_usize, 0_usize, 0_usize, 0_usize), Vec[ScopedSemanticBinding]::new(), aggregate_names,
-        Vec[(usize, usize, str)]::new(), type_names, type_scope, Vec[(usize, usize, str, str)]::new(), variants, item.is_async
+        Vec[(usize, usize, str)]::new(), type_names, type_scope, Vec[(usize, usize, str, str)]::new(), variants, item.is_async, type_index
     }
     for generic in generics {
         if generic.bounds.len() > 0_usize {
@@ -880,7 +889,7 @@ fn present_binding(binding: SemanticBinding, names: Vec[TypeNameBinding]) -> Sem
 }
 
 fn local_type(ctx: SemanticContext, typ: str) -> str {
-    ret scope_type(typ, ctx.type_scope, ctx.type_names, ctx.generic_names)
+    ret scope_type_indexed(typ, ctx.type_scope, ctx.type_index, ctx.generic_names)
 }
 
 fn statements_definitely_return(statements: Vec[Statement]) -> bool {
@@ -1076,14 +1085,15 @@ pub fn prepare_module_bodies_with_variants(ast: Vec[Statement], callables: Vec[S
 fn check_module_bodies_impl(ast: Vec[Statement], callables: Vec[SemanticCallable],
     fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
     type_scope: str, type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant], retain_bodies: bool,) -> CheckedModuleBodies {
+    let type_index = type_scope_index(type_names)
     let mut out = Vec[FrontendDiagnostic]::new()
     let mut functions = Vec[CheckedFunctionBody]::new()
     let mut traits = Vec[TraitStmt]::new()
     for statement in ast {
         match statement {
             Statement::Function(item) => {
-                let checked = check_function_body_with_variants(item, callables, fields, methods, "",
-                    Vec[GenericParam]::new(), aggregate_names, type_scope, type_names, variants,)
+                let checked = check_function_body_indexed(item, callables, fields, methods, "",
+                    Vec[GenericParam]::new(), aggregate_names, type_scope, type_names, variants, type_index,)
                 out.extend(checked.diagnostics)
                 if retain_bodies {
                     functions.push(CheckedFunctionBody { item, "", checked })
@@ -1092,9 +1102,9 @@ fn check_module_bodies_impl(ast: Vec[Statement], callables: Vec[SemanticCallable
             Statement::Trait(item) => {
                 let scope_generics = item.generics
                 for method in item.methods {
-                    let checked = check_function_body_with_variants(method, callables, fields, methods,
-                        scope_type(item.name, type_scope, type_names, generic_param_names(scope_generics)),
-                        scope_generics, aggregate_names, type_scope, type_names, variants,)
+                    let checked = check_function_body_indexed(method, callables, fields, methods,
+                        scope_type_indexed(item.name, type_scope, type_index, generic_param_names(scope_generics)),
+                        scope_generics, aggregate_names, type_scope, type_names, variants, type_index,)
                     out.extend(checked.diagnostics)
                     if retain_bodies {
                         functions.push(CheckedFunctionBody {
@@ -1108,9 +1118,9 @@ fn check_module_bodies_impl(ast: Vec[Statement], callables: Vec[SemanticCallable
             Statement::Impl(item) => {
                 let scope_generics = item.generics
                 for method in item.methods {
-                    let checked = check_function_body_with_variants(method, callables, fields, methods,
-                        scope_type(item.target, type_scope, type_names, generic_param_names(scope_generics)),
-                        scope_generics, aggregate_names, type_scope, type_names, variants,)
+                    let checked = check_function_body_indexed(method, callables, fields, methods,
+                        scope_type_indexed(item.target, type_scope, type_index, generic_param_names(scope_generics)),
+                        scope_generics, aggregate_names, type_scope, type_names, variants, type_index,)
                     out.extend(checked.diagnostics)
                     if retain_bodies {
                         functions.push(CheckedFunctionBody {
@@ -1150,7 +1160,7 @@ pub fn append_bound_methods(methods: Vec[SemanticMethod], bound_methods: Vec[Sem
     ret out
 }
 fn methods_for_generic_bounds(generics: Vec[GenericParam], methods: Vec[SemanticMethod], type_scope: str,
-    type_names: Vec[TypeNameBinding],) -> Vec[SemanticMethod] {
+    type_names: Vec[TypeNameBinding], type_index: TypeScopeIndex,) -> Vec[SemanticMethod] {
     let mut out = Vec[SemanticMethod]::new()
     for generic in generics {
         for bound in generic.bounds {
@@ -1167,7 +1177,7 @@ fn methods_for_generic_bounds(generics: Vec[GenericParam], methods: Vec[Semantic
                 }
                 receiver += "]"
             }
-            receiver = scope_type(receiver, type_scope, type_names, generic_param_names(generics))
+            receiver = scope_type_indexed(receiver, type_scope, type_index, generic_param_names(generics))
             for method in methods {
                 if method.is_static {
                     continue

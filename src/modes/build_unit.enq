@@ -4,7 +4,8 @@ import core::fmt::Debug
 import core::option::Option
 import core::result::Result
 
-import std::os::{file_exists, file_sha256, read_file, write_file}
+import std::io::eprintln
+import std::os::{env, file_exists, file_sha256, read_file, write_file}
 import std::path::Path
 import std::time::perf_counter_ms
 import std::vec::Vec
@@ -270,6 +271,7 @@ fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_tim
         dependency_templates.push(dependency.templates)
     }
     let dependencies_loaded = perf_counter_ms()
+    profile_frontend("dependency-metadata", frontend_started)
     let owner = graph_package(request.graph, request.context.unit)?
     if unit_source_digest(owner)? != request.context.input_digest {
         ret Result[PreparedCompilationUnit, str]::Err("package sources changed before compilation: " + owner.name)
@@ -285,11 +287,14 @@ fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_tim
         workspace.analysis.configure_safety(module.analysis_id.key(), target, module.enabled_features)
     }
     let workspace_loaded = perf_counter_ms()
+    profile_frontend("workspace", dependencies_loaded)
     let checked = check_own_modules(workspace, target)?
     let checking_finished = perf_counter_ms()
+    profile_frontend("semantic", workspace_loaded)
     let checking_ms = perf_counter_ms() - frontend_started
     let effects = workspace.analysis.function_safety_effects_with_prechecked(checked)
     let safety_finished = perf_counter_ms()
+    profile_frontend("safety", checking_finished)
     let mut translations = Vec[TranslationModule]::new()
     let mut selected = Vec[usize]::new()
     let mut declarations = Vec[MetadataModule]::new()
@@ -377,7 +382,7 @@ fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_tim
                 ret Result[PreparedCompilationUnit, str]::Err("invalid lowering module index")
             }
         }
-        let key = compiler_content_digest("encore-lowered-module-2\n" + lowering_context + "\n" +
+        let key = compiler_content_digest("encore-lowered-module-3\n" + lowering_context + "\n" +
             module.module_id + "\n" + compiler_content_digest(module.source) + "\n" + project_version)
         keys.set(index, key)
         match restore_lowered_module(request.cache, key)? {
@@ -421,6 +426,7 @@ fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_tim
         }
     }
     let cache_read_finished = perf_counter_ms()
+    profile_frontend("lowering-context-and-cache", safety_finished)
     let fresh = if request.cache.is_some() {
         translate_keyed_compilation_unit_to_ehir_chunks(translations, target, missing, cached_functions, function_keys)
     } else {
@@ -429,6 +435,7 @@ fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_tim
         }
     }
     let translation_finished = perf_counter_ms()
+    profile_frontend("translate", cache_read_finished)
     for function in fresh.functions {
         commit_lowered_function(request.cache, lowering_context, function)?
     }
@@ -561,13 +568,24 @@ fn check_own_modules(workspace: mut ProjectWorkspace, target: TargetSpec) -> Res
                 ret Result[Vec[SafetyFunction], str]::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
             }
         }
+        let started = perf_counter_ms()
+        if env("ENCORE_FRONTEND_PROFILE").is_some() {
+            eprintln("frontend-check-start " + module.analysis_id.key())
+        }
         let prepared = workspace.analysis.prepare_module_safety_for_target(module.analysis_id.key(), target, module.enabled_features)
+        profile_frontend("check " + module.analysis_id.key(), started)
         for diagnostic in prepared.diagnostics {
             ret Result[Vec[SafetyFunction], str]::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
         }
         checked.extend(prepared.functions)
     }
     ret Result[Vec[SafetyFunction], str]::Ok(checked)
+}
+
+fn profile_frontend(phase: str, started: u64) ->() {
+    if env("ENCORE_FRONTEND_PROFILE").is_some() {
+        eprintln("frontend-" + phase + " " + Debug::fmt(perf_counter_ms() - started) + " ms")
+    }
 }
 
 // Function cfg filters must also apply to token-derived callable facts. The

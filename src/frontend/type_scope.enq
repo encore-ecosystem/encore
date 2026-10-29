@@ -1,6 +1,9 @@
 //! Separates module-scoped type names from internal nominal identities.
 
+import core::option::Option
 import core::vec::Vec
+
+import std::dict::Hashable
 
 pub struct TypeNameBinding {
     scope: str
@@ -8,6 +11,126 @@ pub struct TypeNameBinding {
     identity: str
     display: str
     declaration: str
+}
+
+/// An immutable, collision-checked index for one exact set of type bindings.
+/// Slots contain checked vector ordinals, never native pointers or persisted
+/// process-local handles. Duplicate bindings keep the original first winner.
+pub struct TypeScopeIndex {
+    names: Vec[TypeNameBinding]
+    slots: Vec[usize]
+}
+
+pub fn type_scope_index(names: Vec[TypeNameBinding]) -> TypeScopeIndex {
+    let mut slots = Vec[usize]::new()
+    if names.is_empty() || names.len() > 1000000_usize {
+        ret TypeScopeIndex { names, slots }
+    }
+    let mut capacity = 16_usize
+    while capacity < names.len() * 2_usize {
+        capacity *= 2_usize
+    }
+    for _index in 0_usize..capacity {
+        slots.push(0_usize)
+    }
+    for ordinal in 0_usize..names.len() {
+        let binding = names.get_unchecked_borrowed(ordinal)
+        let mut slot = binding_hash(binding.scope, binding.name) as usize % capacity
+        loop {
+            let previous = slots.get(slot).unwrap_or(0_usize)
+            if previous == 0_usize {
+                slots.set(slot, ordinal + 1_usize)
+                break
+            }
+            let existing = names.get_unchecked_borrowed(previous - 1_usize)
+            if existing.scope == binding.scope && existing.name == binding.name {
+                break
+            }
+            slot =(slot + 1_usize) % capacity
+        }
+    }
+    ret TypeScopeIndex { names, slots }
+}
+
+fn binding_hash(scope: str, name: str) -> u64 {
+    ret scope.hash() ^(name.hash() * 1099511628211_u64)
+}
+
+fn indexed_binding(index: TypeScopeIndex, scope: str, name: str) -> usize {
+    if index.slots.is_empty() {
+        ret 0_usize
+    }
+    let capacity = index.slots.len()
+    let mut slot = binding_hash(scope, name) as usize % capacity
+    for _probe in 0_usize..capacity {
+        let ordinal = index.slots.get(slot).unwrap_or(0_usize)
+        if ordinal == 0_usize {
+            ret 0_usize
+        }
+        match index.names.get(ordinal - 1_usize) {
+            Some(binding) => {
+                if binding.scope == scope && binding.name == name {
+                    ret ordinal
+                }
+            }
+            None => {
+                ret 0_usize
+            }
+        }
+        slot =(slot + 1_usize) % capacity
+    }
+    ret 0_usize
+}
+
+/// Same lookup and generic/prelude precedence as scope_type, amortizing the
+/// environment scan over every signature in the module's checked snapshot.
+pub fn scope_type_indexed(typ: str, scope: str, index: TypeScopeIndex, generics: Vec[str]) -> str {
+    if index.slots.is_empty() {
+        ret scope_type(typ, scope, index.names, generics)
+    }
+    let mut out = ""
+    let mut offset = 0_usize
+    while offset < typ.byte_len() {
+        if !identifier(typ.byte_at(offset)) {
+            let start = offset
+            while offset < typ.byte_len() && !identifier(typ.byte_at(offset)) {
+                offset += 1_usize
+            }
+            out += typ.slice_bytes(start, offset - start)
+            continue
+        }
+        let start = offset
+        while offset < typ.byte_len() && identifier(typ.byte_at(offset)) {
+            offset += 1_usize
+        }
+        while offset + 2_usize < typ.byte_len() && typ.slice_bytes(offset, 2_usize) == "::"
+        && identifier(typ.byte_at(offset + 2_usize)) {
+            offset += 2_usize
+            while offset < typ.byte_len() && identifier(typ.byte_at(offset)) {
+                offset += 1_usize
+            }
+        }
+        let word = typ.slice_bytes(start, offset - start)
+        let mut generic = false
+        for name in generics {
+            if name == word {
+                generic = true break
+            }
+        }
+        let mut ordinal = 0_usize
+        if !generic {
+            ordinal = indexed_binding(index, scope, word)
+            if ordinal == 0_usize {
+                ordinal = indexed_binding(index, "", word)
+            }
+        }
+        out += if ordinal == 0_usize {
+            word
+        } else {
+            index.names.get_unchecked_borrowed(ordinal - 1_usize).identity
+        }
+    }
+    ret out
 }
 
 /// Selects a declaration's namespace once before normalizing its signatures.

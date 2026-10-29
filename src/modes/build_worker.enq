@@ -16,9 +16,11 @@ import json::{Json, parse, stringify}
 
 import mod::build_archive::{UnitNativePlan, emit_budgeted_package_archive}
 import mod::build_artifacts::{UnitReady, publish_unit_complete, publish_unit_ready, read_unit_ready}
-import mod::build_metadata::RefrainMetadata
+import mod::build_cache::restore_unit_cache_directory
+import mod::build_fingerprint::unit_fingerprint
+import mod::build_metadata::{MetadataDependency, RefrainMetadata}
 import mod::build_prepared_cache::publish_prepared_unit
-import mod::build_request::BuildUnitRequest
+import mod::build_request::{BuildUnitRequest, graph_package}
 import mod::build_unit::{package_backend_fingerprint, package_owned_checkpoint, prepare_package_worker}
 import refrain::cache_identity::compiler_content_digest
 import refrain::target::parse_target
@@ -117,6 +119,52 @@ fn execute_package(request_path: str, native_path: str, server: usize) -> Result
     // One admitted CPU lease covers preparation, LLVM and the serial Clang/ar
     // children. Their parent sleeps, instead of spending a second CPU token.
     let started = perf_counter_ms()
+    match request.cache {
+        Some(root) => {
+            let mut all = Vec[MetadataDependency]::new()
+            let mut direct = Vec[MetadataDependency]::new()
+            let owner = graph_package(request.graph, request.context.unit)?
+            for input in request.inputs {
+                let ready = UnitReady::decode(read_file(input.directory.join("unit.ready").as_str()), input.context)?
+                if ready.metadata_digest != input.metadata_digest || ready.template_digest != input.template_digest {
+                    ret Result[bool, str]::Err("package dependency handoff mismatch")
+                }
+                let dependency = MetadataDependency {
+                    input.context.unit, ready.interface_digest, ready.template_digest
+                }
+                all.push(dependency)
+                for name in owner.dependency_names {
+                    if name == dependency.unit {
+                        direct.push(dependency)
+                    }
+                }
+            }
+            let key = unit_fingerprint(request.context, all, native_digest)?.native
+            match restore_unit_cache_directory(root.join(key), request.context, direct, native_digest, request.output)? {
+                Some(restored) => {
+                    let ready = restored.ready
+                    let mut phases = Vec[(str, Json)]::new()
+                    phases.push(("cache_restore_ms", Json::Number(Debug::fmt(perf_counter_ms() - started))))
+                    phases.push(("cache_validate_ms", Json::Number(Debug::fmt(restored.validation_ms))))
+                    phases.push(("cache_archive_read_ms", Json::Number(Debug::fmt(restored.archive_ms))))
+                    phases.push(("cache_copy_ms", Json::Number(Debug::fmt(restored.copy_ms))))
+                    if write_file(request.output.join("phases.json").as_str(), stringify(Json::Object(phases))) != 0 {
+                        ret Result[bool, str]::Err("cannot record cache restore phases")
+                    }
+                    // The parent retains the CAS lock and validates this exact
+                    // private copy before admitting any dependent metadata.
+                    if write_file(request.output.join("unit.cache-hit").as_str(), compiler_content_digest(ready.encode()?)) != 0 {
+                        ret Result[bool, str]::Err("cannot publish package cache handoff")
+                    }
+                    ret Result[bool, str]::Ok(true)
+                }
+                None => {
+                }
+            }
+        }
+        None => {
+        }
+    }
     let backend_hit = file_exists(request.output.join("unit.backend").as_str())
     let frontend_hit = backend_hit || file_exists(request.output.join("unit.frontend").as_str())
     let detailed_timings = process_arg(6).unwrap_or("") == "--timings"
