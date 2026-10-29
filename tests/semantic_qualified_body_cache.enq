@@ -1,0 +1,49 @@
+//! Body edits must refresh qualified callable bindings in the same module graph.
+import core::option::Option
+import core::testing::assert
+import std::vec::Vec
+import json::Json
+import refrain::frontend::AnalysisDatabase
+import refrain::frontend::analysis_database::check_prepared_safety_module
+import refrain::frontend::semantic_index::PackageSemanticIndex
+import refrain::target::host_target
+
+fn database(source: str) -> AnalysisDatabase {
+    let mut db = AnalysisDatabase::new()
+    db.set_module("api", "api.enq", "pub struct Marker {}\npub fn first() -> u32 { ret 41_u32 }\npub fn second() -> str { ret \"value\" }\n")
+    db.set_module("app", "app.enq", source)
+    for module in vec!["api", "app"] { db.configure_safety(module, host_target(), Vec[str]::new()) }
+    ret db
+}
+fn main() -> u32 {
+    let before = "import api::Marker\nfn sample() -> u32 { let result = api::first() ret 0_u32 }\n"
+    let after = "import api::Marker\nfn sample() -> u32 { let result = api::second() ret 0_u32 }\n"
+    let modules = vec!["api", "app"]
+    let mut cold = database(before)
+    let identity = cold.semantic_package_identity(modules)
+    cold.prepare_package_semantics(modules, identity, Option[PackageSemanticIndex]::None)
+    let checked = check_prepared_safety_module(cold.prepare_module_safety_job("app", host_target(), Vec[str]::new(), Json::Null, true))
+    if !assert(checked.diagnostics.is_empty()) { ret 1_u32 }
+    let replay = cold.finalize_semantic_replay("app", checked.replay)
+    let snapshot = cold.package_semantic_index().unwrap_or(PackageSemanticIndex::empty())
+    let mut edited = database(after)
+    let new_identity = edited.semantic_package_identity(modules)
+    if !assert(new_identity != identity) { ret 5_u32 }
+    edited.prepare_package_semantics(modules, new_identity, Option[PackageSemanticIndex]::Some(snapshot))
+    let result = check_prepared_safety_module(edited.prepare_module_safety_job("app", host_target(), Vec[str]::new(), replay, true))
+    if !assert(result.diagnostics.is_empty() && result.checked == 1_usize) { ret 2_u32 }
+    match result.functions.get(0_usize) {
+        Some(function) => { if !assert(function.body.binding_type("result").unwrap_or("") == "str") { ret 3_u32 } }
+        None => { ret 4_u32 }
+    }
+    let snapshot_after = edited.package_semantic_index().unwrap_or(PackageSemanticIndex::empty())
+    let mut repeated = database("\n\n\nimport api::Marker\nfn sample() -> u32 { let result = api::second() let extra = api::second() ret 0_u32 }\n")
+    let repeated_identity = repeated.semantic_package_identity(modules)
+    if !assert(repeated_identity == new_identity && repeated.prepare_package_semantics(modules, repeated_identity, Option[PackageSemanticIndex]::Some(snapshot_after))) { ret 6_u32 }
+    let repeated_check = check_prepared_safety_module(repeated.prepare_module_safety_job("app", host_target(), Vec[str]::new(), Json::Null, true))
+    match repeated_check.functions.get(0_usize) {
+        Some(function) => { if !assert(function.body.binding_type("extra").unwrap_or("") == "str") { ret 7_u32 } }
+        None => { ret 8_u32 }
+    }
+    ret 0_u32
+}

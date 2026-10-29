@@ -1,4 +1,5 @@
 //! Defines reusable, incremental semantic results for function-body queries.
+import refrain::frontend::semantic_slice::SemanticSlice
 
 import core::fmt::Debug
 import core::option::Option
@@ -15,7 +16,7 @@ import refrain::frontend::control_flow::statements_terminate_flow
 import refrain::frontend::metadata_ast::encode_lowered_function_input
 import refrain::frontend::parser::{BlockExpr, Expr, ExprNode, FunctionItem, FunctionParam, GenericParam, IfExprBranch, ImplStmt, MatchArmBody, MatchPattern, ParsedBlock, Statement, TraitStmt}
 import refrain::frontend::reflection::{ReflectionBinding, ReflectionShape, expand_reflection_function, function_uses_reflection, reflection_binding_sites}
-import refrain::frontend::type_scope::{TypeNameBinding, TypeScopeIndex, declaration_type_name, display_type, scope_type, scope_type_indexed, type_scope_index}
+import refrain::frontend::type_scope::{TypeNameBinding, TypeScopeIndex, declaration_type_name_view, display_type_view, scope_type_view, scope_type_indexed, type_scope_index_view}
 import refrain::target::{TargetSpec, cfg_active_with_features}
 
 /// Records the inferred type of a local binding.
@@ -121,7 +122,7 @@ pub fn semantic_method_accessible(method: SemanticMethod, access_owner: str) -> 
     ret method.is_public || semantic_same_owner(method.receiver_type, access_owner)
 }
 
-pub fn semantic_accessible_methods(methods: Vec[SemanticMethod], access_owner: str) -> Vec[SemanticMethod] {
+pub fn semantic_accessible_methods_view(methods: SemanticSlice[SemanticMethod], access_owner: str) -> Vec[SemanticMethod] {
     let mut out = Vec[SemanticMethod]::new()
     for method in methods {
         if semantic_method_accessible(method, access_owner) {
@@ -142,22 +143,22 @@ pub struct SemanticMember {
 }
 
 /// Uses the same receiver matching and generic substitution as body checking.
-pub fn semantic_members(receiver: str, fields: Vec[SemanticField], methods: Vec[SemanticMethod]) -> Vec[SemanticMember] {
-    ret semantic_named_members(receiver, "", fields, methods)
+pub fn semantic_members_view(receiver: str, fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod]) -> Vec[SemanticMember] {
+    ret semantic_named_members_view(receiver, "", fields, methods)
 }
 
 /// Resolves one member name without specializing unrelated fields and methods.
 /// An empty name requests the complete completion environment.
-pub fn semantic_named_members(receiver: str, name_filter: str, fields: Vec[SemanticField], methods: Vec[SemanticMethod]) -> Vec[SemanticMember] {
+pub fn semantic_named_members_view(receiver: str, name_filter: str, fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod]) -> Vec[SemanticMember] {
     ret semantic_access_members(receiver, name_filter, fields, methods, false)
 }
 
 /// Specializes static members with the same receiver rules as associated calls.
-pub fn semantic_associated_members(receiver: str, name: str, methods: Vec[SemanticMethod]) -> Vec[SemanticMember] {
-    ret semantic_access_members(receiver, name, Vec[SemanticField]::new(), methods, true)
+pub fn semantic_associated_members_view(receiver: str, name: str, methods: SemanticSlice[SemanticMethod]) -> Vec[SemanticMember] {
+    ret semantic_access_members(receiver, name, SemanticSlice[SemanticField]::from_vec(Vec[SemanticField]::new()), methods, true)
 }
 
-fn semantic_access_members(receiver: str, name_filter: str, fields: Vec[SemanticField], methods: Vec[SemanticMethod], is_static: bool) -> Vec[SemanticMember] {
+fn semantic_access_members(receiver: str, name_filter: str, fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], is_static: bool) -> Vec[SemanticMember] {
     let mut out = Vec[SemanticMember]::new()
     if receiver == "" {
         ret out
@@ -234,6 +235,16 @@ pub struct CheckedModuleBodies {
     reused: usize
 }
 
+struct ReplayedSemanticBody {
+    body: SemanticBody
+    record: Json
+}
+
+enum SemanticBodyPlan {
+    ReplayFacts(ReplayedSemanticBody)
+    CheckSource
+}
+
 struct SemanticReplay {
     previous: Json
     lines: Vec[str]
@@ -241,6 +252,8 @@ struct SemanticReplay {
     checked: usize
     reused: usize
     enabled: bool
+    type_index: TypeScopeIndex
+    type_index_ready: bool
 }
 
 fn semantic_source_lines(source: str) -> Vec[str] {
@@ -264,15 +277,15 @@ pub struct SemanticBody {
     scoped_bindings: Vec[ScopedSemanticBinding]
     member_receivers: Vec[(usize, usize, str)]
     bound_methods: Vec[SemanticMethod]
-    type_names: Vec[TypeNameBinding]
+    type_names: SemanticSlice[TypeNameBinding]
     implicit_receivers: Vec[(usize, usize, str, str)]
     access_owner: str
 }
 
 struct SemanticContext {
-    callables: Vec[SemanticCallable]
-    fields: Vec[SemanticField]
-    methods: Vec[SemanticMethod]
+    callables: SemanticSlice[SemanticCallable]
+    fields: SemanticSlice[SemanticField]
+    methods: SemanticSlice[SemanticMethod]
     self_type: str
     generic_names: Vec[str]
     bindings: Vec[SemanticBinding]
@@ -282,10 +295,10 @@ struct SemanticContext {
     scoped_bindings: Vec[ScopedSemanticBinding]
     aggregate_names: Vec[str]
     member_receivers: Vec[(usize, usize, str)]
-    type_names: Vec[TypeNameBinding]
+    type_names: SemanticSlice[TypeNameBinding]
     type_scope: str
     implicit_receivers: Vec[(usize, usize, str, str)]
-    variants: Vec[SemanticVariant]
+    variants: SemanticSlice[SemanticVariant]
     is_async: bool
     type_index: TypeScopeIndex
 }
@@ -299,13 +312,13 @@ impl for SemanticBody {
     pub fn empty() -> Self {
         ret Self {
             Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(),
-            "", Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), Vec[TypeNameBinding]::new(), Vec[(usize, usize, str, str)]::new(), ""
+            "", Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), SemanticSlice[TypeNameBinding]::from_vec(Vec[TypeNameBinding]::new()), Vec[(usize, usize, str, str)]::new(), ""
         }
     }
 
     /// Returns the inferred receiver at a field or method token, including a missing member.
     pub fn member_receiver_at(self: Self, line: usize, column: usize) -> str {
-        ret display_type(self.canonical_member_receiver_at(line, column), self.type_names)
+        ret display_type_view(self.canonical_member_receiver_at(line, column), self.type_names)
     }
 
     /// Internal receiver identity for semantic matching, not user-facing text.
@@ -585,62 +598,37 @@ impl for SemanticMethod {
 }
 
 /// Checks one function body without performing EHIR lowering.
-pub fn check_function_body(
-    item: FunctionItem,
-    callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField],
-    methods: Vec[SemanticMethod],
-    self_type: str,
-) -> SemanticBody {
-    ret check_function_body_with_types(item, callables, fields, methods, self_type, Vec[str]::new())
+pub fn check_function_body_view(item: FunctionItem, callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], self_type: str) -> SemanticBody {
+    ret check_function_body_with_types_view(item, callables, fields, methods, self_type, Vec[str]::new())
 }
 
 /// Checks with explicit known aggregate names, including types with no fields.
-pub fn check_function_body_with_types(item: FunctionItem, callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
-    aggregate_names: Vec[str],) -> SemanticBody {
+pub fn check_function_body_with_types_view(item: FunctionItem, callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], self_type: str, aggregate_names: Vec[str]) -> SemanticBody {
     if semantic_function_has_attr(item, "decorator") {
         ret SemanticBody {
             Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(), Vec[SemanticDependency]::new(),
-            item.ret_type.unwrap_or("void"), Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), Vec[TypeNameBinding]::new(), Vec[(usize, usize, str, str)]::new(), self_type
+            item.ret_type.unwrap_or("void"), Vec[ScopedSemanticBinding]::new(), Vec[(usize, usize, str)]::new(), Vec[SemanticMethod]::new(), SemanticSlice[TypeNameBinding]::from_vec(Vec[TypeNameBinding]::new()), Vec[(usize, usize, str, str)]::new(), self_type
         }
     }
-    ret check_function_body_with_scope(item, callables, fields, methods, self_type, Vec[GenericParam]::new(), aggregate_names)
+    ret check_function_body_with_scope_view(item, callables, fields, methods, self_type, Vec[GenericParam]::new(), aggregate_names)
 }
 
-pub fn check_function_body_with_scope(
-    item: FunctionItem,
-    callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField],
-    methods: Vec[SemanticMethod],
-    self_type: str,
-    scope_generics: Vec[GenericParam],
-    aggregate_names: Vec[str],
-) -> SemanticBody {
-    ret check_function_body_with_type_scope(item, callables, fields, methods, self_type,
-        scope_generics, aggregate_names, "", Vec[TypeNameBinding]::new(),)
+pub fn check_function_body_with_scope_view(item: FunctionItem, callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], self_type: str, scope_generics: Vec[GenericParam], aggregate_names: Vec[str]) -> SemanticBody {
+    ret check_function_body_with_type_scope_view(item, callables, fields, methods, self_type,
+        scope_generics, aggregate_names, "", SemanticSlice[TypeNameBinding]::from_vec(Vec[TypeNameBinding]::new()),)
 }
 
-pub fn check_function_body_with_type_scope(item: FunctionItem, callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
-    scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str,
-    type_names: Vec[TypeNameBinding],) -> SemanticBody {
-    ret check_function_body_with_variants(item, callables, fields, methods, self_type, scope_generics,
-        aggregate_names, type_scope, type_names, Vec[SemanticVariant]::new(),)
+pub fn check_function_body_with_type_scope_view(item: FunctionItem, callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], self_type: str, scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding]) -> SemanticBody {
+    ret check_function_body_with_variants_view(item, callables, fields, methods, self_type, scope_generics,
+        aggregate_names, type_scope, type_names, SemanticSlice[SemanticVariant]::from_vec(Vec[SemanticVariant]::new()),)
 }
 
-pub fn check_function_body_with_variants(item: FunctionItem, callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
-    scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str,
-    type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant],) -> SemanticBody {
+pub fn check_function_body_with_variants_view(item: FunctionItem, callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], self_type: str, scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding], variants: SemanticSlice[SemanticVariant]) -> SemanticBody {
     ret check_function_body_indexed(item, callables, fields, methods, self_type, scope_generics,
-        aggregate_names, type_scope, type_names, variants, type_scope_index(type_names),)
+        aggregate_names, type_scope, type_names, variants, type_scope_index_view(type_names),)
 }
 
-fn check_function_body_indexed(item: FunctionItem, callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
-    scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str,
-    type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant], type_index: TypeScopeIndex,) -> SemanticBody {
+fn check_function_body_indexed(item: FunctionItem, callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], self_type: str, scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding], variants: SemanticSlice[SemanticVariant], type_index: TypeScopeIndex) -> SemanticBody {
     let reflection_sites = if function_uses_reflection(item) {
         reflection_binding_sites(item)
     } else {
@@ -718,7 +706,7 @@ fn check_function_body_indexed(item: FunctionItem, callables: Vec[SemanticCallab
         generics.push(generic)
     }
     let bound_methods = methods_for_generic_bounds(generics, methods, type_scope, type_names, type_index)
-    let scoped_methods = append_bound_methods(methods, bound_methods)
+    let scoped_methods = append_bound_methods_view(methods, bound_methods)
     let mut ctx = SemanticContext {
         callables, fields, scoped_methods, self_type, generic_names, Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(),
         Vec[SemanticDependency]::new(),
@@ -837,13 +825,12 @@ fn check_function_body_indexed(item: FunctionItem, callables: Vec[SemanticCallab
         public_diagnostics.push(present_diagnostic(diagnostic, type_names))
     }
     ret SemanticBody {
-        public_bindings, public_diagnostics, ctx.dependencies, display_type(return_type, type_names), public_scoped,
+        public_bindings, public_diagnostics, ctx.dependencies, display_type_view(return_type, type_names), public_scoped,
         ctx.member_receivers, bound_methods, type_names, ctx.implicit_receivers, self_type
     }
 }
 
-fn prepare_semantic_reflection(item: FunctionItem, fields: Vec[SemanticField],
-    aggregates: Vec[str], names: Vec[TypeNameBinding], scope: str, variants: Vec[SemanticVariant],) -> Result[FunctionItem, str] {
+fn prepare_semantic_reflection(item: FunctionItem, fields: SemanticSlice[SemanticField], aggregates: Vec[str], names: SemanticSlice[TypeNameBinding], scope: str, variants: SemanticSlice[SemanticVariant]) -> Result[FunctionItem, str] {
     let mut shapes = Vec[ReflectionShape]::new()
     for owner in aggregates {
         let mut members = Vec[(str, str)]::new()
@@ -880,41 +867,41 @@ fn prepare_semantic_reflection(item: FunctionItem, fields: Vec[SemanticField],
     ret expand_reflection_function(item, shapes)
 }
 
-fn present_diagnostic(diagnostic: FrontendDiagnostic, names: Vec[TypeNameBinding]) -> FrontendDiagnostic {
+fn present_diagnostic(diagnostic: FrontendDiagnostic, names: SemanticSlice[TypeNameBinding]) -> FrontendDiagnostic {
     let mut labels = Vec[DiagnosticLabel]::new()
     for label in diagnostic.labels {
         labels.push(DiagnosticLabel {
                 label.source_name, label.line, label.column, label.length, label.kind,
-                display_type(label.message, names)
+                display_type_view(label.message, names)
             }
             ,)
     }
     let mut notes = Vec[str]::new()
     for note in diagnostic.notes {
-        notes.push(display_type(note, names))
+        notes.push(display_type_view(note, names))
     }
     let mut helps = Vec[str]::new()
     for help in diagnostic.helps {
-        helps.push(display_type(help, names))
+        helps.push(display_type_view(help, names))
     }
     let mut suggestions = Vec[DiagnosticSuggestion]::new()
     for suggestion in diagnostic.suggestions {
         suggestions.push(DiagnosticSuggestion {
                 suggestion.source_name, suggestion.line, suggestion.column,
-                suggestion.length, display_type(suggestion.replacement, names), display_type(suggestion.message, names),
+                suggestion.length, display_type_view(suggestion.replacement, names), display_type_view(suggestion.message, names),
                 suggestion.applicability
             }
             ,)
     }
     ret FrontendDiagnostic {
-        diagnostic.severity, diagnostic.code, display_type(diagnostic.message, names),
+        diagnostic.severity, diagnostic.code, display_type_view(diagnostic.message, names),
         diagnostic.line, diagnostic.column, diagnostic.length, labels, notes, helps, suggestions
     }
 }
 
-fn present_binding(binding: SemanticBinding, names: Vec[TypeNameBinding]) -> SemanticBinding {
+fn present_binding(binding: SemanticBinding, names: SemanticSlice[TypeNameBinding]) -> SemanticBinding {
     ret SemanticBinding {
-        binding.name, display_type(binding.typ, names), binding.line, binding.column
+        binding.name, display_type_view(binding.typ, names), binding.line, binding.column
     }
 }
 
@@ -1061,13 +1048,8 @@ fn statements_break_current_loop(statements: Vec[Statement]) -> bool {
 /// Checks every function body in a parsed module in one AST traversal.
 /// This is the cold compiler path; individual editor queries remain cached by
 /// stable symbol identity in the analysis database.
-pub fn check_module_bodies(
-    ast: Vec[Statement],
-    callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField],
-    methods: Vec[SemanticMethod],
-) -> Vec[FrontendDiagnostic] {
-    ret check_module_bodies_with_types(ast, callables, fields, methods, semantic_aggregate_names(ast))
+pub fn check_module_bodies_view(ast: Vec[Statement], callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod]) -> Vec[FrontendDiagnostic] {
+    ret check_module_bodies_with_types_view(ast, callables, fields, methods, semantic_aggregate_names(ast))
 }
 
 pub fn semantic_aggregate_names(ast: Vec[Statement]) -> Vec[str] {
@@ -1084,46 +1066,53 @@ pub fn semantic_aggregate_names(ast: Vec[Statement]) -> Vec[str] {
     ret names
 }
 
-pub fn check_module_bodies_with_types(ast: Vec[Statement], callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],) -> Vec[FrontendDiagnostic] {
-    ret check_module_bodies_with_type_scope(ast, callables, fields, methods, aggregate_names,
-        "", Vec[TypeNameBinding]::new(),)
+pub fn check_module_bodies_with_types_view(ast: Vec[Statement], callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], aggregate_names: Vec[str]) -> Vec[FrontendDiagnostic] {
+    ret check_module_bodies_with_type_scope_view(ast, callables, fields, methods, aggregate_names,
+        "", SemanticSlice[TypeNameBinding]::from_vec(Vec[TypeNameBinding]::new()),)
 }
 
 /// Checks all bodies using nominal identities from their declaring namespace.
-pub fn check_module_bodies_with_type_scope(ast: Vec[Statement], callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
-    type_scope: str, type_names: Vec[TypeNameBinding],) -> Vec[FrontendDiagnostic] {
-    ret check_module_bodies_with_variants(ast, callables, fields, methods, aggregate_names,
-        type_scope, type_names, Vec[SemanticVariant]::new(),)
+pub fn check_module_bodies_with_type_scope_view(ast: Vec[Statement], callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding]) -> Vec[FrontendDiagnostic] {
+    ret check_module_bodies_with_variants_view(ast, callables, fields, methods, aggregate_names,
+        type_scope, type_names, SemanticSlice[SemanticVariant]::from_vec(Vec[SemanticVariant]::new()),)
 }
 
-pub fn check_module_bodies_with_variants(ast: Vec[Statement], callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
-    type_scope: str, type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant],) -> Vec[FrontendDiagnostic] {
+pub fn check_module_bodies_with_variants_view(ast: Vec[Statement], callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding], variants: SemanticSlice[SemanticVariant]) -> Vec[FrontendDiagnostic] {
     ret check_module_bodies_impl(ast, callables, fields, methods, aggregate_names, type_scope, type_names, variants, false, Json::Null, "").diagnostics
 }
 
 /// Validates the same bodies and trait implementations, retaining resolved
 /// facts only for callers that will immediately infer package safety effects.
-pub fn prepare_module_bodies_with_variants(ast: Vec[Statement], callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
-    type_scope: str, type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant],) -> CheckedModuleBodies {
+pub fn prepare_module_bodies_with_variants_view(ast: Vec[Statement], callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding], variants: SemanticSlice[SemanticVariant]) -> CheckedModuleBodies {
     ret check_module_bodies_impl(ast, callables, fields, methods, aggregate_names, type_scope, type_names, variants, true, Json::Null, "")
 }
 
-pub fn prepare_module_bodies_with_replay(ast: Vec[Statement], callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
-    type_scope: str, type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant],
-    previous: Json, source: str,) -> CheckedModuleBodies {
+pub fn prepare_module_bodies_with_replay_view(ast: Vec[Statement], callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding], variants: SemanticSlice[SemanticVariant], previous: Json, source: str) -> CheckedModuleBodies {
     ret check_module_bodies_impl(ast, callables, fields, methods, aggregate_names, type_scope, type_names, variants, true, previous, source)
 }
 
-fn check_function_body_replayed(item: FunctionItem, callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
-    scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str,
-    type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant], type_index: TypeScopeIndex,
-    replay: mut SemanticReplay,) -> SemanticBody {
+fn semantic_body_plan(item: FunctionItem, names: SemanticSlice[TypeNameBinding], key: str, previous: Json) -> SemanticBodyPlan {
+    if !key.is_empty() {
+        match previous.get(key) {
+            Some(saved) => {
+                match decode_semantic_checkpoint_view(saved, names, item.line, item.column) {
+                    Ok(body) => {
+                        let original = saved.as_array().unwrap_or(Vec[Json]::new())
+                        let unchanged = checkpoint_position(original.get(1_usize).unwrap_or(Json::Null)).unwrap_or(item.line + 1_usize) == item.line &&
+                            checkpoint_position(original.get(2_usize).unwrap_or(Json::Null)).unwrap_or(item.column + 1_usize) == item.column
+                        let record = if unchanged { saved } else { encode_semantic_checkpoint(body, item.line, item.column) }
+                        ret SemanticBodyPlan::ReplayFacts(ReplayedSemanticBody { body, record })
+                    }
+                    Err(_) => {}
+                }
+            }
+            None => {}
+        }
+    }
+    ret SemanticBodyPlan::CheckSource
+}
+
+fn check_function_body_replayed(item: FunctionItem, callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], self_type: str, scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding], variants: SemanticSlice[SemanticVariant], replay: mut SemanticReplay) -> SemanticBody {
     let mut source = ""
     if replay.enabled {
         match item.body {
@@ -1145,47 +1134,32 @@ fn check_function_body_replayed(item: FunctionItem, callables: Vec[SemanticCalla
     } else {
         ""
     }
-    if eligible {
-        match replay.previous.get(key) {
-            Some(saved) => {
-                match decode_semantic_checkpoint(saved, type_names, item.line, item.column) {
-                    Ok(body) => {
-                        let original = saved.as_array().unwrap_or(Vec[Json]::new())
-                        let unchanged = checkpoint_position(original.get(1_usize).unwrap_or(Json::Null)).unwrap_or(item.line + 1_usize) == item.line &&
-                        checkpoint_position(original.get(2_usize).unwrap_or(Json::Null)).unwrap_or(item.column + 1_usize) == item.column
-                        let record = if unchanged {
-                            saved
-                        } else {
-                            encode_semantic_checkpoint(body, item.line, item.column)
-                        }
-                        replay.records.push(Json::Array(vec![Json::String(key), record]))
-                        replay.reused += 1_usize
-                        ret body
-                    }
-                    Err(_) => {
-                    }
-                }
-            }
-            None => {
-            }
+    match semantic_body_plan(item, type_names, key, replay.previous) {
+        SemanticBodyPlan::ReplayFacts(facts) => {
+            replay.records.push(Json::Array(vec![Json::String(key), facts.record]))
+            replay.reused += 1_usize
+            ret facts.body
         }
+        SemanticBodyPlan::CheckSource => {}
     }
+    if !replay.type_index_ready {
+        replay.type_index = type_scope_index_view(type_names)
+        replay.type_index_ready = true
+    }
+    let self_type = scope_type_indexed(self_type, type_scope, replay.type_index, generic_param_names(scope_generics))
     replay.checked += 1_usize
     let body = check_function_body_indexed(item, callables, fields, methods, self_type, scope_generics,
-        aggregate_names, type_scope, type_names, variants, type_index,)
+        aggregate_names, type_scope, type_names, variants, replay.type_index,)
     if eligible && body.diagnostics.is_empty() {
         replay.records.push(Json::Array(vec![Json::String(key), encode_semantic_checkpoint(body, item.line, item.column)]))
     }
     ret body
 }
 
-fn check_module_bodies_impl(ast: Vec[Statement], callables: Vec[SemanticCallable],
-    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
-    type_scope: str, type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant], retain_bodies: bool,
-    previous: Json, source: str,) -> CheckedModuleBodies {
-    let type_index = type_scope_index(type_names)
+fn check_module_bodies_impl(ast: Vec[Statement], callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding], variants: SemanticSlice[SemanticVariant], retain_bodies: bool, previous: Json, source: str) -> CheckedModuleBodies {
     let mut replay = SemanticReplay {
-        previous, semantic_source_lines(source), Vec[Json]::new(), 0_usize, 0_usize, !source.is_empty()
+        previous, semantic_source_lines(source), Vec[Json]::new(), 0_usize, 0_usize, !source.is_empty(),
+        TypeScopeIndex { type_names, Vec[usize]::new() }, false
     }
     let mut out = Vec[FrontendDiagnostic]::new()
     let mut functions = Vec[CheckedFunctionBody]::new()
@@ -1194,7 +1168,7 @@ fn check_module_bodies_impl(ast: Vec[Statement], callables: Vec[SemanticCallable
         match statement {
             Statement::Function(item) => {
                 let checked = check_function_body_replayed(item, callables, fields, methods, "",
-                    Vec[GenericParam]::new(), aggregate_names, type_scope, type_names, variants, type_index, replay,)
+                    Vec[GenericParam]::new(), aggregate_names, type_scope, type_names, variants, replay,)
                 out.extend(checked.diagnostics)
                 if retain_bodies {
                     functions.push(CheckedFunctionBody { item, "", checked })
@@ -1204,8 +1178,8 @@ fn check_module_bodies_impl(ast: Vec[Statement], callables: Vec[SemanticCallable
                 let scope_generics = item.generics
                 for method in item.methods {
                     let checked = check_function_body_replayed(method, callables, fields, methods,
-                        scope_type_indexed(item.name, type_scope, type_index, generic_param_names(scope_generics)),
-                        scope_generics, aggregate_names, type_scope, type_names, variants, type_index, replay,)
+                        item.name,
+                        scope_generics, aggregate_names, type_scope, type_names, variants, replay,)
                     out.extend(checked.diagnostics)
                     if retain_bodies {
                         functions.push(CheckedFunctionBody {
@@ -1220,8 +1194,8 @@ fn check_module_bodies_impl(ast: Vec[Statement], callables: Vec[SemanticCallable
                 let scope_generics = item.generics
                 for method in item.methods {
                     let checked = check_function_body_replayed(method, callables, fields, methods,
-                        scope_type_indexed(item.target, type_scope, type_index, generic_param_names(scope_generics)),
-                        scope_generics, aggregate_names, type_scope, type_names, variants, type_index, replay,)
+                        item.target,
+                        scope_generics, aggregate_names, type_scope, type_names, variants, replay,)
                     out.extend(checked.diagnostics)
                     if retain_bodies {
                         functions.push(CheckedFunctionBody {
@@ -1252,21 +1226,10 @@ fn check_module_bodies_impl(ast: Vec[Statement], callables: Vec[SemanticCallable
     ret CheckedModuleBodies { out, functions, Json::Object(records), replay.checked, replay.reused }
 }
 
-pub fn append_bound_methods(methods: Vec[SemanticMethod], bound_methods: Vec[SemanticMethod]) -> Vec[SemanticMethod] {
-    if bound_methods.len() == 0_usize {
-        ret methods
-    }
-    let mut out = Vec[SemanticMethod]::new()
-    for method in methods {
-        out.push(method)
-    }
-    for method in bound_methods {
-        out.push(method)
-    }
-    ret out
+pub fn append_bound_methods_view(methods: SemanticSlice[SemanticMethod], bound_methods: Vec[SemanticMethod]) -> SemanticSlice[SemanticMethod] {
+    ret methods.with_overlay(bound_methods)
 }
-fn methods_for_generic_bounds(generics: Vec[GenericParam], methods: Vec[SemanticMethod], type_scope: str,
-    type_names: Vec[TypeNameBinding], type_index: TypeScopeIndex,) -> Vec[SemanticMethod] {
+fn methods_for_generic_bounds(generics: Vec[GenericParam], methods: SemanticSlice[SemanticMethod], type_scope: str, type_names: SemanticSlice[TypeNameBinding], type_index: TypeScopeIndex) -> Vec[SemanticMethod] {
     let mut out = Vec[SemanticMethod]::new()
     for generic in generics {
         for bound in generic.bounds {
@@ -3164,7 +3127,7 @@ fn merge_expression_type_at(
 }
 
 fn indexed_type(ctx: SemanticContext, typ: str) -> str {
-    let root = declaration_type_name(semantic_root_type(typ), ctx.type_names)
+    let root = declaration_type_name_view(semantic_root_type(typ), ctx.type_names)
     if root == "Vec" || root == "Option" || root == "Result" {
         ret first_type_argument(typ)
     }
@@ -3221,7 +3184,7 @@ fn iterable_item_type(ctx: mut SemanticContext, typ: str) -> str {
     let step = iterable_method_return(ctx, iterator, "next")
     if step != "" {
         let option = tuple_element_type(step, "1")
-        if declaration_type_name(semantic_root_type(option), ctx.type_names) == "Option" {
+        if declaration_type_name_view(semantic_root_type(option), ctx.type_names) == "Option" {
             ret first_type_argument(option)
         }
     }
@@ -3230,7 +3193,7 @@ fn iterable_item_type(ctx: mut SemanticContext, typ: str) -> str {
         ret item
     }
     // Range iterators in the prelude yield `usize`.
-    if declaration_type_name(typ, ctx.type_names) == "Range" {
+    if declaration_type_name_view(typ, ctx.type_names) == "Range" {
         ret "usize"
     }
     ret ""
@@ -3264,7 +3227,7 @@ fn awaited_type(ctx: mut SemanticContext, future: str) -> str {
         ret first_type_argument(future)
     }
     let step = iterable_method_return(ctx, future, "poll")
-    if declaration_type_name(semantic_root_type(step), ctx.type_names) == "Poll" {
+    if declaration_type_name_view(semantic_root_type(step), ctx.type_names) == "Poll" {
         ret nth_type_argument(step, 1_usize)
     }
     // Leave an unresolved operand to the complete Future contract validator.
@@ -3320,7 +3283,7 @@ fn nth_type_argument(typ: str, wanted: usize) -> str {
 }
 
 fn match_pattern_binding_type(ctx: mut SemanticContext, matched: str, pattern: MatchPattern) -> str {
-    let root = declaration_type_name(semantic_root_type(matched), ctx.type_names)
+    let root = declaration_type_name_view(semantic_root_type(matched), ctx.type_names)
     match pattern.value {
         Option[str]::Some(value) => {
             let variant = semantic_variant_name(value)
@@ -3454,7 +3417,7 @@ fn resolve_method_call(
     if receiver == "" {
         ret ""
     }
-    let receiver_name = declaration_type_name(semantic_root_type(receiver), ctx.type_names)
+    let receiver_name = declaration_type_name_view(semantic_root_type(receiver), ctx.type_names)
     if (receiver_name == "Task" || receiver_name == "JoinHandle") && name == "join" {
         if args.len() == 0_usize {
             ret first_type_argument(receiver)
@@ -3578,7 +3541,7 @@ fn resolve_method_call(
             column,
             length,
         ).with_label(source_name, line, column, length, DiagnosticLabelKind::Primary, "unknown method")
-        let nearest = nearest_method(semantic_accessible_methods(ctx.methods, ctx.self_type), receiver, name)
+        let nearest = nearest_method(SemanticSlice::from_vec(semantic_accessible_methods_view(ctx.methods, ctx.self_type)), receiver, name)
         if nearest != "" {
             diagnostic = diagnostic.with_help("did you mean `" + nearest + "`?")
             diagnostic = diagnostic.with_suggestion(
@@ -3747,7 +3710,7 @@ fn remember_method_dependency(ctx: mut SemanticContext, method: SemanticMethod) 
     ret()
 }
 
-fn nearest_method(methods: Vec[SemanticMethod], receiver: str, name: str) -> str {
+fn nearest_method(methods: SemanticSlice[SemanticMethod], receiver: str, name: str) -> str {
     let mut nearest = ""
     let mut best = 4_usize
     for method in methods {
@@ -4580,7 +4543,7 @@ pub fn encode_semantic_checkpoint(body: SemanticBody, line: usize, column: usize
             Json::Array(scoped), Json::Array(receivers), Json::Array(implicit), Json::Array(methods), Json::Array(dependencies), Json::String(body.return_type), Json::String(body.access_owner)])
 }
 
-pub fn decode_semantic_checkpoint(value: Json, names: Vec[TypeNameBinding], line: usize, column: usize) -> Result[SemanticBody, str] {
+pub fn decode_semantic_checkpoint_view(value: Json, names: SemanticSlice[TypeNameBinding], line: usize, column: usize) -> Result[SemanticBody, str] {
     let row = checkpoint_record(value, 11_usize)?
     if checkpoint_string(row.get(0).unwrap_or(Json::Null))? != "semantic-body-1" {
         ret Result::Err("unknown semantic schema")
@@ -4631,4 +4594,110 @@ pub fn decode_semantic_checkpoint(value: Json, names: Vec[TypeNameBinding], line
             bindings, Vec[FrontendDiagnostic]::new(), dependencies, checkpoint_string(row.get(9).unwrap_or(Json::Null))?, scoped, receivers, methods, names, implicit, checkpoint_string(row.get(10).unwrap_or(Json::Null))?
         }
     )
+}
+
+// Source-compatible vector adapters for analysis and editor callers.
+pub fn semantic_accessible_methods(methods: Vec[SemanticMethod], access_owner: str) -> Vec[SemanticMethod] {
+    ret semantic_accessible_methods_view(SemanticSlice::from_vec(methods), access_owner)
+}
+
+pub fn semantic_members(receiver: str, fields: Vec[SemanticField], methods: Vec[SemanticMethod]) -> Vec[SemanticMember] {
+    ret semantic_members_view(receiver, SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods))
+}
+
+pub fn semantic_named_members(receiver: str, name_filter: str, fields: Vec[SemanticField], methods: Vec[SemanticMethod]) -> Vec[SemanticMember] {
+    ret semantic_named_members_view(receiver, name_filter, SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods))
+}
+
+pub fn semantic_associated_members(receiver: str, name: str, methods: Vec[SemanticMethod]) -> Vec[SemanticMember] {
+    ret semantic_associated_members_view(receiver, name, SemanticSlice::from_vec(methods))
+}
+
+pub fn check_function_body(
+    item: FunctionItem,
+    callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField],
+    methods: Vec[SemanticMethod],
+    self_type: str,
+) -> SemanticBody {
+    ret check_function_body_view(item, SemanticSlice::from_vec(callables), SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods), self_type)
+}
+
+pub fn check_function_body_with_types(item: FunctionItem, callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
+    aggregate_names: Vec[str],) -> SemanticBody {
+    ret check_function_body_with_types_view(item, SemanticSlice::from_vec(callables), SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods), self_type, aggregate_names)
+}
+
+pub fn check_function_body_with_scope(
+    item: FunctionItem,
+    callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField],
+    methods: Vec[SemanticMethod],
+    self_type: str,
+    scope_generics: Vec[GenericParam],
+    aggregate_names: Vec[str],
+) -> SemanticBody {
+    ret check_function_body_with_scope_view(item, SemanticSlice::from_vec(callables), SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods), self_type, scope_generics, aggregate_names)
+}
+
+pub fn check_function_body_with_type_scope(item: FunctionItem, callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
+    scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str,
+    type_names: Vec[TypeNameBinding],) -> SemanticBody {
+    ret check_function_body_with_type_scope_view(item, SemanticSlice::from_vec(callables), SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods), self_type, scope_generics, aggregate_names, type_scope, SemanticSlice::from_vec(type_names))
+}
+
+pub fn check_function_body_with_variants(item: FunctionItem, callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], self_type: str,
+    scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str,
+    type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant],) -> SemanticBody {
+    ret check_function_body_with_variants_view(item, SemanticSlice::from_vec(callables), SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods), self_type, scope_generics, aggregate_names, type_scope, SemanticSlice::from_vec(type_names), SemanticSlice::from_vec(variants))
+}
+
+pub fn check_module_bodies(
+    ast: Vec[Statement],
+    callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField],
+    methods: Vec[SemanticMethod],
+) -> Vec[FrontendDiagnostic] {
+    ret check_module_bodies_view(ast, SemanticSlice::from_vec(callables), SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods))
+}
+
+pub fn check_module_bodies_with_types(ast: Vec[Statement], callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],) -> Vec[FrontendDiagnostic] {
+    ret check_module_bodies_with_types_view(ast, SemanticSlice::from_vec(callables), SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods), aggregate_names)
+}
+
+pub fn check_module_bodies_with_type_scope(ast: Vec[Statement], callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
+    type_scope: str, type_names: Vec[TypeNameBinding],) -> Vec[FrontendDiagnostic] {
+    ret check_module_bodies_with_type_scope_view(ast, SemanticSlice::from_vec(callables), SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods), aggregate_names, type_scope, SemanticSlice::from_vec(type_names))
+}
+
+pub fn check_module_bodies_with_variants(ast: Vec[Statement], callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
+    type_scope: str, type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant],) -> Vec[FrontendDiagnostic] {
+    ret check_module_bodies_with_variants_view(ast, SemanticSlice::from_vec(callables), SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods), aggregate_names, type_scope, SemanticSlice::from_vec(type_names), SemanticSlice::from_vec(variants))
+}
+
+pub fn prepare_module_bodies_with_variants(ast: Vec[Statement], callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
+    type_scope: str, type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant],) -> CheckedModuleBodies {
+    ret prepare_module_bodies_with_variants_view(ast, SemanticSlice::from_vec(callables), SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods), aggregate_names, type_scope, SemanticSlice::from_vec(type_names), SemanticSlice::from_vec(variants))
+}
+
+pub fn prepare_module_bodies_with_replay(ast: Vec[Statement], callables: Vec[SemanticCallable],
+    fields: Vec[SemanticField], methods: Vec[SemanticMethod], aggregate_names: Vec[str],
+    type_scope: str, type_names: Vec[TypeNameBinding], variants: Vec[SemanticVariant],
+    previous: Json, source: str,) -> CheckedModuleBodies {
+    ret prepare_module_bodies_with_replay_view(ast, SemanticSlice::from_vec(callables), SemanticSlice::from_vec(fields), SemanticSlice::from_vec(methods), aggregate_names, type_scope, SemanticSlice::from_vec(type_names), SemanticSlice::from_vec(variants), previous, source)
+}
+
+pub fn append_bound_methods(methods: Vec[SemanticMethod], bound_methods: Vec[SemanticMethod]) -> Vec[SemanticMethod] {
+    ret append_bound_methods_view(SemanticSlice::from_vec(methods), bound_methods).materialize()
+}
+
+pub fn decode_semantic_checkpoint(value: Json, names: Vec[TypeNameBinding], line: usize, column: usize) -> Result[SemanticBody, str] {
+    ret decode_semantic_checkpoint_view(value, SemanticSlice::from_vec(names), line, column)
 }

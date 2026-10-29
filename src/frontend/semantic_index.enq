@@ -1,0 +1,254 @@
+//! Package-wide immutable declarations and ordered module selections.
+import refrain::frontend::semantic_rebind::{valid_semantic_type,rebind_semantic_callable, rebind_semantic_field, rebind_semantic_method, rebind_semantic_variant, rebind_semantic_name, rebind_semantic_strings}
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+import std::vec::Vec
+import binary
+import json::{Json, stringify}
+import ehirlib::{prepared_bytes_payload, prepared_payload_bytes}
+import refrain::frontend::hir::TypeId
+import refrain::frontend::semantic::{SemanticCallable, SemanticField, SemanticMethod, SemanticVariant}
+import refrain::frontend::semantic_environment::{StoredSemanticEnvironment, encode_callable, encode_field, encode_method, encode_variant}
+import refrain::frontend::semantic_slice::{SemanticSlice, SemanticKeyIndex}
+import refrain::frontend::type_scope::TypeNameBinding
+
+pub struct ModuleSemanticView {
+    module_name: str
+    context: str
+    callables: Vec[usize]
+    fields: Vec[usize]
+    methods: Vec[usize]
+    variants: Vec[usize]
+    names: Vec[usize]
+    aggregates: Vec[str]
+    constructors: Vec[str]
+}
+struct CallableBinding {
+    declaration: usize
+    name: str
+    lookup_module: str
+    identity: u64
+}
+struct SemanticIndexArtifact {
+    schema: u32
+    identity: str
+    types: Vec[TypeId]
+    declarations: Vec[SemanticCallable]
+    bindings: Vec[CallableBinding]
+    fields: Vec[SemanticField]
+    methods: Vec[SemanticMethod]
+    variants: Vec[SemanticVariant]
+    names: Vec[TypeNameBinding]
+    modules: Vec[ModuleSemanticView]
+}
+pub struct PackageSemanticIndex {
+    identity: str
+    types: Vec[TypeId]
+    declarations: Vec[SemanticCallable]
+    bindings: Vec[CallableBinding]
+    callables: Vec[SemanticCallable]
+    fields: Vec[SemanticField]
+    methods: Vec[SemanticMethod]
+    variants: Vec[SemanticVariant]
+    names: Vec[TypeNameBinding]
+    modules: Vec[ModuleSemanticView]
+    module_positions: SemanticKeyIndex
+}
+pub struct SemanticIndexBuilder {
+    index: PackageSemanticIndex
+    declarations: SemanticKeyIndex
+    bindings: SemanticKeyIndex
+    fields: SemanticKeyIndex
+    methods: SemanticKeyIndex
+    variants: SemanticKeyIndex
+    names: SemanticKeyIndex
+}
+
+fn valid_selection(values: Vec[usize], length: usize) -> bool {
+    for value in values { if value >= length { ret false } }
+    ret true
+}
+
+impl for PackageSemanticIndex {
+    pub fn empty() -> Self {
+        ret Self { "", Vec[TypeId]::new(), Vec[SemanticCallable]::new(), Vec[CallableBinding]::new(), Vec[SemanticCallable]::new(),
+            Vec[SemanticField]::new(), Vec[SemanticMethod]::new(), Vec[SemanticVariant]::new(), Vec[TypeNameBinding]::new(),
+            Vec[ModuleSemanticView]::new(), SemanticKeyIndex::new(0_usize) }
+    }
+    pub fn module(self: Self, module_name: str) -> Option[ModuleSemanticView] {
+        let position = self.module_positions.get(module_name)
+        if position == 0_usize { ret Option::None }
+        ret self.modules.get(position - 1_usize)
+    }
+    pub fn callables_for(self: Self, view: ModuleSemanticView) -> SemanticSlice[SemanticCallable] { ret SemanticSlice::project(self.callables, view.callables) }
+    pub fn fields_for(self: Self, view: ModuleSemanticView) -> SemanticSlice[SemanticField] { ret SemanticSlice::project(self.fields, view.fields) }
+    pub fn methods_for(self: Self, view: ModuleSemanticView) -> SemanticSlice[SemanticMethod] { ret SemanticSlice::project(self.methods, view.methods) }
+    pub fn variants_for(self: Self, view: ModuleSemanticView) -> SemanticSlice[SemanticVariant] { ret SemanticSlice::project(self.variants, view.variants) }
+    pub fn names_for(self: Self, view: ModuleSemanticView) -> SemanticSlice[TypeNameBinding] { ret SemanticSlice::project(self.names, view.names) }
+    pub fn rebind(self: Self, identities: Vec[str], types: Vec[TypeId]) -> Result[Self, str] {
+        let mut declarations = Vec[SemanticCallable]::with_capacity(self.declarations.len())
+        for value in self.declarations { declarations.push(rebind_semantic_callable(value, identities)?) }
+        let mut callables = Vec[SemanticCallable]::with_capacity(self.bindings.len())
+        for binding in self.bindings { callables.push(declarations.get_unchecked_borrowed(binding.declaration).in_scope(binding.name, binding.lookup_module, binding.identity)) }
+        let mut fields = Vec[SemanticField]::with_capacity(self.fields.len())
+        for value in self.fields { fields.push(rebind_semantic_field(value, identities)?) }
+        let mut methods = Vec[SemanticMethod]::with_capacity(self.methods.len())
+        for value in self.methods { methods.push(rebind_semantic_method(value, identities)?) }
+        let mut variants = Vec[SemanticVariant]::with_capacity(self.variants.len())
+        for value in self.variants { variants.push(rebind_semantic_variant(value, identities)?) }
+        let mut names = Vec[TypeNameBinding]::with_capacity(self.names.len())
+        for value in self.names { names.push(rebind_semantic_name(value, identities)?) }
+        let mut modules = Vec[ModuleSemanticView]::with_capacity(self.modules.len())
+        for value in self.modules { modules.push(ModuleSemanticView { value.module_name, value.context, value.callables,
+            value.fields, value.methods, value.variants, value.names, rebind_semantic_strings(value.aggregates, identities)?,
+            rebind_semantic_strings(value.constructors, identities)? }) }
+        ret Result::Ok(Self { self.identity, types, declarations, self.bindings, callables, fields, methods, variants, names, modules, self.module_positions })
+    }
+    pub fn encode(self: Self) -> Result[str, str] {
+        match binary::encode(SemanticIndexArtifact { 1_u32, self.identity, self.types, self.declarations, self.bindings,
+            self.fields, self.methods, self.variants, self.names, self.modules }) {
+            Ok(bytes) => { ret Result::Ok(prepared_bytes_payload(bytes)) }
+            Err(error) => { ret Result::Err(error.message()) }
+        }
+        ret Result::Err("cannot encode semantic index")
+    }
+    pub fn decode(payload: str, identity: str) -> Result[Self, str] {
+        let value = match binary::decode[SemanticIndexArtifact](prepared_payload_bytes(payload)) {
+            Ok(value) => value Err(error) => { ret Result::Err(error.message()) }
+        }
+        if value.schema != 1_u32 || (!identity.is_empty() && value.identity != identity) { ret Result::Err("semantic index identity or schema mismatch") }
+        let mut type_keys = SemanticKeyIndex::new(value.types.len())
+        for position in 0_usize..value.types.len() {
+            let key = value.types.get_unchecked_borrowed(position).key()
+            if key.is_empty() || type_keys.get(key) != 0_usize { ret Result::Err("invalid semantic type table") }
+            type_keys.set(key, position)
+        }
+        let type_count = value.types.len()
+        for declaration in value.declarations {
+            if !valid_semantic_type(declaration.ret_type, type_count) { ret Result::Err("invalid callable type") }
+            for param in declaration.params { if !valid_semantic_type(param, type_count) { ret Result::Err("invalid parameter type") } }
+        }
+        for field in value.fields {
+            if !valid_semantic_type(field.owner_type, type_count) || !valid_semantic_type(field.typ, type_count) { ret Result::Err("invalid field type") }
+        }
+        for method in value.methods {
+            if !valid_semantic_type(method.receiver_type, type_count) || !valid_semantic_type(method.ret_type, type_count) { ret Result::Err("invalid method type") }
+            for param in method.params { if !valid_semantic_type(param, type_count) { ret Result::Err("invalid method parameter type") } }
+        }
+        for variant in value.variants {
+            if !valid_semantic_type(variant.owner_type, type_count) || !valid_semantic_type(variant.payload_type, type_count) { ret Result::Err("invalid variant type") }
+        }
+        for name in value.names {
+            if !valid_semantic_type(name.identity, type_count) { ret Result::Err("invalid binding type") }
+        }
+        let mut callables = Vec[SemanticCallable]::with_capacity(value.bindings.len())
+        for binding in value.bindings {
+            let declaration = match value.declarations.get(binding.declaration) {
+                Some(value) => value None => { ret Result::Err("invalid semantic callable ordinal") }
+            }
+            callables.push(declaration.in_scope(binding.name, binding.lookup_module, binding.identity))
+        }
+        let mut positions = SemanticKeyIndex::new(value.modules.len())
+        for position in 0_usize..value.modules.len() {
+            let view = value.modules.get_unchecked_borrowed(position)
+            if positions.get(view.module_name) != 0_usize || !valid_selection(view.callables, callables.len()) ||
+                !valid_selection(view.fields, value.fields.len()) || !valid_selection(view.methods, value.methods.len()) ||
+                !valid_selection(view.variants, value.variants.len()) || !valid_selection(view.names, value.names.len()) {
+                ret Result::Err("invalid semantic module selection")
+            }
+            for typ in view.aggregates { if !valid_semantic_type(typ, type_count) { ret Result::Err("invalid aggregate type") } }
+            for typ in view.constructors { if !valid_semantic_type(typ, type_count) { ret Result::Err("invalid constructor type") } }
+            positions.set(view.module_name, position)
+        }
+        ret Result::Ok(Self { value.identity, value.types, value.declarations, value.bindings, callables, value.fields,
+            value.methods, value.variants, value.names, value.modules, positions })
+    }
+}
+
+impl for SemanticIndexBuilder {
+    pub fn new(identity: str) -> Self {
+        let mut index = PackageSemanticIndex::empty()
+        index.identity = identity
+        ret Self { index, SemanticKeyIndex::new(64_usize), SemanticKeyIndex::new(64_usize), SemanticKeyIndex::new(64_usize),
+            SemanticKeyIndex::new(64_usize), SemanticKeyIndex::new(64_usize), SemanticKeyIndex::new(64_usize) }
+    }
+    pub fn include(self: mut Self, module_name: str, context: str, environment: StoredSemanticEnvironment) -> () {
+        let mut callables = Vec[usize]::with_capacity(environment.callables.len())
+        for value in environment.callables {
+            let declaration = value.in_scope(value.declaration_name, value.module_name, 0_u64)
+            let key = stringify(encode_callable(declaration))
+            let mut ordinal = self.declarations.get(key)
+            if ordinal == 0_usize {
+                ordinal = self.index.declarations.len() + 1_usize
+                self.declarations.set(key, ordinal - 1_usize)
+                self.index.declarations.push(declaration)
+            }
+            let binding_key = stringify(Json::Array(vec![Json::String(Debug::fmt(ordinal)), Json::String(value.name),
+                Json::String(value.lookup_module), Json::String(Debug::fmt(value.binding_identity))]))
+            let mut binding = self.bindings.get(binding_key)
+            if binding == 0_usize {
+                binding = self.index.bindings.len() + 1_usize
+                self.bindings.set(binding_key, binding - 1_usize)
+                self.index.bindings.push(CallableBinding { ordinal - 1_usize, value.name, value.lookup_module, value.binding_identity })
+                self.index.callables.push(self.index.declarations.get_unchecked_borrowed(ordinal - 1_usize).in_scope(value.name, value.lookup_module, value.binding_identity))
+            }
+            callables.push(binding - 1_usize)
+        }
+        let mut fields = Vec[usize]::with_capacity(environment.fields.len())
+        for value in environment.fields {
+            let key = stringify(encode_field(value))
+            let mut ordinal = self.fields.get(key)
+            if ordinal == 0_usize { ordinal = self.index.fields.len() + 1_usize self.fields.set(key, ordinal - 1_usize) self.index.fields.push(value) }
+            fields.push(ordinal - 1_usize)
+        }
+        let mut methods = Vec[usize]::with_capacity(environment.methods.len())
+        for value in environment.methods {
+            let key = stringify(encode_method(value))
+            let mut ordinal = self.methods.get(key)
+            if ordinal == 0_usize { ordinal = self.index.methods.len() + 1_usize self.methods.set(key, ordinal - 1_usize) self.index.methods.push(value) }
+            methods.push(ordinal - 1_usize)
+        }
+        let mut variants = Vec[usize]::with_capacity(environment.variants.len())
+        for value in environment.variants {
+            let key = stringify(encode_variant(value))
+            let mut ordinal = self.variants.get(key)
+            if ordinal == 0_usize { ordinal = self.index.variants.len() + 1_usize self.variants.set(key, ordinal - 1_usize) self.index.variants.push(value) }
+            variants.push(ordinal - 1_usize)
+        }
+        let mut names = Vec[usize]::with_capacity(environment.names.len())
+        for value in environment.names {
+            let key = stringify(Json::Array(vec![Json::String(value.scope), Json::String(value.name), Json::String(value.identity), Json::String(value.display), Json::String(value.declaration)]))
+            let mut ordinal = self.names.get(key)
+            if ordinal == 0_usize { ordinal = self.index.names.len() + 1_usize self.names.set(key, ordinal - 1_usize) self.index.names.push(value) }
+            names.push(ordinal - 1_usize)
+        }
+        self.index.module_positions.set(module_name, self.index.modules.len())
+        self.index.modules.push(ModuleSemanticView { module_name, context, callables, fields, methods, variants, names, environment.aggregates, environment.constructors })
+    }
+    pub fn finish(self: Self, types: Vec[TypeId]) -> PackageSemanticIndex {
+        let mut index = self.index
+        index.types = types
+        ret index
+    }
+}
+
+pub struct SemanticModuleRecord {
+    schema: u32
+    index: str
+    replay: Json
+}
+pub fn encode_semantic_module(index: str, replay: Json) -> Result[str, str] {
+    match binary::encode(SemanticModuleRecord { 1_u32, index, replay }) {
+        Ok(bytes) => { ret Result::Ok(prepared_bytes_payload(bytes)) }
+        Err(error) => { ret Result::Err(error.message()) }
+    }
+    ret Result::Err("cannot encode semantic module")
+}
+pub fn decode_semantic_module(payload: str) -> Result[SemanticModuleRecord, str] {
+    let record = match binary::decode[SemanticModuleRecord](prepared_payload_bytes(payload)) {
+        Ok(value) => value Err(error) => { ret Result::Err(error.message()) }
+    }
+    if record.schema != 1_u32 || record.index.is_empty() { ret Result::Err("invalid semantic module schema") }
+    ret Result::Ok(record)
+}

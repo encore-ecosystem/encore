@@ -1,3 +1,6 @@
+import refrain::frontend::semantic_index::{PackageSemanticIndex, encode_semantic_module, decode_semantic_module}
+import refrain::frontend::semantic_rebind::rebind_semantic_replay
+import mod::build_cache::valid_key
 //! Checked package-owned frontend work, with verified metadata-only dependencies.
 
 import core::fmt::Debug
@@ -632,6 +635,41 @@ fn check_semantic_safety_job(job: sending SemanticSafetyJob) -> sending Semantic
 
 fn check_own_modules(workspace: mut ProjectWorkspace, target: TargetSpec, request: BuildUnitRequest, server: usize) -> Result[Vec[SafetyFunction], str] {
     let preparation_started = perf_counter_ms()
+    let mut cache_read_ms = 0_u64
+    let mut semantic_modules = Vec[str]::new()
+    for module in workspace.modules {
+        if module.owner_name == workspace.compilation_unit && module.diagnostics.is_empty() { semantic_modules.push(module.analysis_id.key()) }
+    }
+    let identity = workspace.analysis.semantic_package_identity(semantic_modules)
+    let index_slot = compiler_content_digest("encore-semantic-index-1\n" + request.context.compiler_digest + "\n" +
+        request.context.target + "\n" + request.context.profile + "\n" + identity)
+    let cache_started = perf_counter_ms()
+    let mut snapshot_key = restore_lowered_module(request.cache, index_slot)?.unwrap_or("")
+    let mut previous_index = Option[PackageSemanticIndex]::None
+    if valid_key(snapshot_key) {
+        match restore_lowered_module(request.cache, snapshot_key)? {
+            Some(payload) => {
+                match PackageSemanticIndex::decode(payload, identity) { Ok(index) => { previous_index = Option[PackageSemanticIndex]::Some(index) } Err(_) => {} }
+            }
+            None => {}
+        }
+    }
+    cache_read_ms += perf_counter_ms() - cache_started
+    let index_reused = workspace.analysis.prepare_package_semantics(semantic_modules, identity, previous_index)
+    let index_prepared = perf_counter_ms()
+    if !index_reused && request.cache.is_some() {
+        match workspace.analysis.package_semantic_index() {
+            Some(index) => {
+                let payload = index.encode()?
+                snapshot_key = compiler_content_digest(payload)
+                commit_lowered_module(request.cache, snapshot_key, payload)?
+                commit_lowered_module(request.cache, index_slot, snapshot_key)?
+            }
+            None => {}
+        }
+    }
+    let snapshot_write_ms = perf_counter_ms() - index_prepared
+    let mut historical_types = Vec[(str, Vec[str])]::new()
     let mut checked = Vec[SafetyFunction]::new()
     let mut bodies_checked = 0_usize
     let mut bodies_reused = 0_usize
@@ -656,15 +694,49 @@ fn check_own_modules(workspace: mut ProjectWorkspace, target: TargetSpec, reques
         for feature in module.enabled_features {
             features.push(Json::String(feature))
         }
-        let slot = compiler_content_digest("encore-semantic-module-2\n" + request.context.compiler_digest + "\n" +
+        let slot = compiler_content_digest("encore-semantic-module-3\n" + request.context.compiler_digest + "\n" +
             request.context.target + "\n" + request.context.profile + "\n" + module.module_id + "\n" + stringify(Json::Array(features)))
-        let previous = match restore_lowered_module(request.cache, slot)? {
-            Some(text) => parse(text).unwrap_or(Json::Null)
-            None => Json::Null
+        let cache_started = perf_counter_ms()
+        let mut previous = Json::Null
+        let mut same_snapshot = false
+        match restore_lowered_module(request.cache, slot)? {
+            Some(payload) => {
+                match decode_semantic_module(payload) {
+                    Ok(record) => {
+                        same_snapshot = record.index == snapshot_key
+                        if same_snapshot { previous = record.replay }
+                        elif valid_key(record.index) {
+                            let mut identities = Option[Vec[str]]::None
+                            for entry in historical_types { if entry.0 == record.index { identities = Option[Vec[str]]::Some(entry.1) break } }
+                            if identities.is_none() {
+                                match restore_lowered_module(request.cache, record.index)? {
+                                    Some(old_payload) => {
+                                        match PackageSemanticIndex::decode(old_payload, "") {
+                                            Ok(index) => {
+                                                let mapping = workspace.analysis.semantic_existing_type_rebinding(index.types)
+                                                historical_types.push((record.index, mapping)) identities = Option[Vec[str]]::Some(mapping)
+                                            }
+                                            Err(_) => {}
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                            match identities {
+                                Some(mapping) => { previous = rebind_semantic_replay(record.replay, mapping) }
+                                None => {}
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            None => {}
         }
+        cache_read_ms += perf_counter_ms() - cache_started
         let prepared = workspace.analysis.prepare_module_safety_job(module.analysis_id.key(), target, module.enabled_features,
             previous, request.cache.is_some(),)
-        let replay_unchanged = previous.get("source").unwrap_or(Json::Null).as_str().unwrap_or("") == compiler_content_digest(module.source) &&
+        let replay_unchanged = same_snapshot && previous.get("source").unwrap_or(Json::Null).as_str().unwrap_or("") == compiler_content_digest(module.source) &&
         previous.get("context").unwrap_or(Json::Null).as_str().unwrap_or("") == prepared.context
         tasks.push(SemanticSafetyJob {
                 index, module.source.byte_len(), slot, prepared, replay_unchanged
@@ -745,19 +817,27 @@ fn check_own_modules(workspace: mut ProjectWorkspace, target: TargetSpec, reques
             for diagnostic in prepared.diagnostics {
                 ret Result[Vec[SafetyFunction], str]::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
             }
-            if !chunk.replay_unchanged || !prepared.environment_reused || prepared.checked != 0_usize {
+            if request.cache.is_some() && (!chunk.replay_unchanged || !prepared.environment_reused || prepared.checked != 0_usize) {
                 let replay = if request.cache.is_some() {
                     workspace.analysis.finalize_semantic_replay(module.analysis_id.key(), prepared.replay)
                 } else {
                     prepared.replay
                 }
-                commit_lowered_module(request.cache, chunk.slot, stringify(replay))?
+                commit_lowered_module(request.cache, chunk.slot, encode_semantic_module(snapshot_key, replay)?)?
             }
             checked.extend(prepared.functions)
             break
         }
     }
-    let counts = Json::Object(vec![("bodies_checked", Json::Number(Debug::fmt(bodies_checked))),
+    let timings = workspace.analysis.semantic_preparation_timings()
+    let counts = Json::Object(vec![("semantic_index_reused", Json::Bool(index_reused)),
+            ("semantic_index_write_ms", Json::Number(Debug::fmt(snapshot_write_ms))),
+            ("semantic_cache_read_ms", Json::Number(Debug::fmt(cache_read_ms))),
+            ("semantic_context_ms", Json::Number(Debug::fmt(timings.context_ms))),
+            ("semantic_replay_ms", Json::Number(Debug::fmt(timings.replay_ms))),
+            ("semantic_environment_ms", Json::Number(Debug::fmt(timings.environment_ms))),
+            ("semantic_input_ms", Json::Number(Debug::fmt(timings.input_ms))),
+            ("bodies_checked", Json::Number(Debug::fmt(bodies_checked))),
             ("bodies_reused", Json::Number(Debug::fmt(bodies_reused))),("environments_reused", Json::Number(Debug::fmt(environments_reused))),
             ("module_checks_reused", Json::Number(Debug::fmt(module_checks_reused))),
             ("semantic_jobs", Json::Number(Debug::fmt(jobs))),("semantic_prepare_ms", Json::Number(Debug::fmt(inputs_prepared - preparation_started))),

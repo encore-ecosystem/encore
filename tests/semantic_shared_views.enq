@@ -1,0 +1,109 @@
+//! Reference-query parity, persisted type rebinding and fresh source positions.
+import core::option::Option
+import core::testing::assert
+import std::vec::Vec
+import json::Json
+import refrain::frontend::AnalysisDatabase
+import refrain::frontend::analysis_database::check_prepared_safety_module
+import refrain::frontend::hir::TypeId
+import refrain::frontend::semantic_index::PackageSemanticIndex
+import refrain::frontend::semantic_rebind::rebind_semantic_replay
+import refrain::frontend::type_scope::display_type_view
+import refrain::target::host_target
+
+fn verify(declarations: str, source: str, valid: bool) -> bool {
+    let mut reference = AnalysisDatabase::new()
+    let mut indexed = AnalysisDatabase::new()
+    reference.set_module("api", "api.enq", declarations)
+    reference.set_module("facade", "facade.enq", "pub import api::produce as chosen\n")
+    reference.set_module("app", "app.enq", source)
+    indexed.set_module("api", "api.enq", declarations)
+    indexed.set_module("facade", "facade.enq", "pub import api::produce as chosen\n")
+    indexed.set_module("app", "app.enq", source)
+    let target = host_target()
+    for module in vec!["api", "facade", "app"] {
+        reference.configure_safety(module, target, Vec[str]::new())
+        indexed.configure_safety(module, target, Vec[str]::new())
+    }
+    let expected = reference.prepare_module_safety_with_replay("app", target, Vec[str]::new(), Json::Null, source)
+    let modules = vec!["api", "facade", "app"]
+    let identity = indexed.semantic_package_identity(modules)
+    indexed.prepare_package_semantics(modules, identity, Option[PackageSemanticIndex]::None)
+    let cold = check_prepared_safety_module(indexed.prepare_module_safety_job("app", target, Vec[str]::new(), Json::Null, true))
+    if cold.diagnostics.is_empty() != valid || cold.diagnostics.len() != expected.diagnostics.len() || cold.functions.len() != expected.functions.len() { ret false }
+    for position in 0_usize..expected.diagnostics.len() {
+        let wanted = expected.diagnostics.get_unchecked_borrowed(position)
+        let actual = cold.diagnostics.get_unchecked_borrowed(position)
+        if wanted.code != actual.code || wanted.message != actual.message || wanted.line != actual.line { ret false }
+    }
+    if !valid { ret true }
+    let replay = indexed.finalize_semantic_replay("app", cold.replay)
+    let snapshot = indexed.package_semantic_index().unwrap_or(PackageSemanticIndex::empty())
+    let restored = match PackageSemanticIndex::decode(snapshot.encode().unwrap_or(""), identity) { Ok(value) => value Err(_) => { ret false } }
+    let mut warm = AnalysisDatabase::new()
+    // Different module load order, and a new nominal type ahead of all saved
+    // ordinals. Neither can attach old facts to a different declaration.
+    warm.set_module("app", "app.enq", "\n\n\n" + source)
+    warm.set_module("facade", "facade.enq", "pub import api::produce as chosen\n")
+    warm.set_module("api", "api.enq", declarations)
+    for module in modules { warm.configure_safety(module, target, Vec[str]::new()) }
+    warm.semantic_type_rebinding(vec![TypeId::named("unrelated:before-existing", "Unrelated")])
+    let warm_identity = warm.semantic_package_identity(modules)
+    if warm_identity != identity { ret false }
+    warm.prepare_package_semantics(modules, warm_identity, Option[PackageSemanticIndex]::Some(restored))
+    let mapping = warm.semantic_type_rebinding(snapshot.types)
+    let rebound_replay = rebind_semantic_replay(replay, mapping)
+    let observed = check_prepared_safety_module(warm.prepare_module_safety_job("app", target, Vec[str]::new(), rebound_replay, true))
+    if !observed.diagnostics.is_empty() || observed.checked != 0_usize || observed.reused != cold.checked { ret false }
+    for position in 0_usize..expected.functions.len() {
+        let wanted = expected.functions.get_unchecked_borrowed(position).body
+        let actual = observed.functions.get_unchecked_borrowed(position).body
+        if display_type_view(wanted.return_type, wanted.type_names) != display_type_view(actual.return_type, actual.type_names) || wanted.bindings.len() != actual.bindings.len() { ret false }
+        if wanted.member_receivers.len() != actual.member_receivers.len() || wanted.implicit_receivers.len() != actual.implicit_receivers.len() || wanted.bound_methods.len() != actual.bound_methods.len() { ret false }
+        for offset in 0_usize..wanted.member_receivers.len() {
+            let before = wanted.member_receivers.get_unchecked_borrowed(offset)
+            let after = actual.member_receivers.get_unchecked_borrowed(offset)
+            if display_type_view(before.2, wanted.type_names) != display_type_view(after.2, actual.type_names) || after.0 != before.0 + 3_usize { ret false }
+        }
+        for offset in 0_usize..wanted.implicit_receivers.len() {
+            let before = wanted.implicit_receivers.get_unchecked_borrowed(offset)
+            let after = actual.implicit_receivers.get_unchecked_borrowed(offset)
+            if before.2 != after.2 || display_type_view(before.3, wanted.type_names) != display_type_view(after.3, actual.type_names) || after.0 != before.0 + 3_usize { ret false }
+        }
+        for offset in 0_usize..wanted.bound_methods.len() {
+            let before = wanted.bound_methods.get_unchecked_borrowed(offset)
+            let after = actual.bound_methods.get_unchecked_borrowed(offset)
+            if display_type_view(before.receiver_type, wanted.type_names) != display_type_view(after.receiver_type, actual.type_names) || display_type_view(before.ret_type, wanted.type_names) != display_type_view(after.ret_type, actual.type_names) || before.params.len() != after.params.len() { ret false }
+            for param in 0_usize..before.params.len() {
+                if display_type_view(before.params.get_unchecked_borrowed(param), wanted.type_names) != display_type_view(after.params.get_unchecked_borrowed(param), actual.type_names) { ret false }
+            }
+        }
+        for offset in 0_usize..wanted.bindings.len() {
+            let before = wanted.bindings.get_unchecked_borrowed(offset)
+            let after = actual.bindings.get_unchecked_borrowed(offset)
+            if before.name != after.name || display_type_view(before.typ, wanted.type_names) != display_type_view(after.typ, actual.type_names) || after.line != before.line + 3_usize { ret false }
+        }
+    }
+    ret true
+}
+fn main() -> u32 {
+    let api = "pub struct Data { value: u32 }\n" +
+        "impl for Data { pub fn read(self: Self) -> u32 { ret self.value } fn secret(self: Self) -> u32 { ret self.value } }\n" +
+        "pub fn produce() -> Data { ret Data { 42_u32 } }\n"
+    if !assert(verify(api, "import facade::chosen as create\nfn sample() -> u32 { let item = create() ret item.read() }\n", true)) { ret 1_u32 }
+    if !assert(verify(api, "import facade::chosen as create\nfn sample() -> u32 { let item = create() ret item.secret() }\n", false)) { ret 2_u32 }
+    let generic_api = "pub struct Box[T] { value: T }\nimpl[T] for Box[T] { pub fn read(self: Self) -> T { ret self.value } }\n" +
+        "pub fn produce() -> Box[u32] { ret Box[u32] { 42_u32 } }\n"
+    if !assert(verify(generic_api, "import facade::chosen\nfn sample() -> u32 { let item = chosen() ret item.read() }\n", true)) { ret 3_u32 }
+    let trait_api = "pub trait Parent { fn read(self: Self) -> u32 }\npub trait Child: Parent {}\n" +
+        "pub fn produce(value: dyn Child) -> dyn Child { ret value }\n"
+    if !assert(verify(trait_api, "import api::Child\nfn sample(value: dyn Child) -> u32 { ret value.read() }\n", true)) { ret 4_u32 }
+    let iterator_api = "pub struct Cursor[T] {}\nimpl[T] for Cursor[T] { pub fn next(self: Self) -> (Self, Option[T]) { ret (self, Option[T]::None) } }\n" +
+        "pub struct Rows[T] {}\nimpl[T] for Rows[T] { pub fn into_iter(self: Self) -> Cursor[T] { ret Cursor[T] {} } }\n" +
+        "pub fn produce() -> u32 { ret 0_u32 }\n"
+    if !assert(verify(iterator_api, "import api::Rows\nfn sample(rows: Rows[u32]) -> u32 { let mut total = 0_u32 for value in rows { total += value } ret total }\n", true)) { ret 5_u32 }
+    let bound_api = "pub struct Data { value: u32 }\npub trait Transform { fn apply(self: Self, value: Data) -> Data }\n" +
+        "pub fn produce() -> u32 { ret 0_u32 }\n"
+    if !assert(verify(bound_api, "import api::{Data, Transform}\nfn sample[T: Transform](source: T, value: Data) -> Data { ret source.apply(value) }\n", true)) { ret 6_u32 }
+    ret 0_u32
+}
