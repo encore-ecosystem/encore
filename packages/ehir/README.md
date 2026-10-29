@@ -47,10 +47,11 @@ transformations. `compile` combines these steps with the default backend.
 Functions return `Result` with a diagnostic stage and message; they do not exit
 the caller on invalid input.
 
-Canonical backend inputs use indexed SSA values with mandatory `TypeId`s.
-Selectors for fields and enum variants are separate from SSA values. LLVM's
-compatibility adapter materializes its internal instruction representation from
-these typed records, without recovering missing value types from text.
+Canonical backend inputs use SSA values with mandatory `Type`s. Field selectors
+are metadata, and enum tags are typed literals. Preparation and LLVM consume
+this graph directly, with no freeze/thaw conversion or type recovery pass.
+Textual EHIR binds omitted reference annotations to existing typed definitions;
+results and standalone operands require explicit types.
 
 `prepare_with_store` reuses versioned binary function records through a host's
 `PreparedFunctionStore`. The host supplies keys binding the fully typed body,

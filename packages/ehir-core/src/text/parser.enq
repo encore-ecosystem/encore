@@ -64,7 +64,7 @@ fn join_line_range(lines: Vec[str], start: usize, end: usize) -> str {
     ret ""
 }
 
-import refrain::core::{Block, Directive, EhirDocumentation, EhirImport, EnumVariant, FnDirective, Instruction, MatchArm, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, Variable, add, add_edge, alias, and_op, async_fn_directive, await_value, binary, block, br_term, call, cbr_term, cfree, comment, div, drop_value, ehir_documentation, ehir_import, enum_directive, enum_value, enum_variant, extern_fn_directive, fn_directive, fn_item, gep, geq, getfield, getfieldptr, getptr, grt, halloc, hfree, hrealloc, ieq, impl_directive, indirect_call, lceos, lcpos, lcsos, leq, les, load, make_module, make_module_bundle, make_module_with_imports, make_module_with_metadata, make_type, match_arm, match_term, mod_op, mul, neq, or_op, param, pcast, phi, phi_pair, plain_type, remove_edge, represented_type_name, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, shl, shr, store, struct_directive, sub, switch_case, switch_term, trait_directive, trait_method, unreachable_term, untyped_var, var, xor_op}
+import refrain::core::{Block, Directive, EhirDocumentation, EhirImport, EnumVariant, FieldSelector, FnDirective, Instruction, MatchArm, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, Variable, add, add_edge, alias, and_op, annotated_field, async_fn_directive, await_value, binary, block, br_term, call, cbr_term, cfree, comment, div, drop_value, ehir_documentation, ehir_import, enum_directive, enum_tag, enum_value, enum_variant, extern_fn_directive, field, fn_directive, fn_item, gep, geq, getfield, getfieldptr, getptr, grt, halloc, hfree, hrealloc, ieq, impl_directive, indirect_call, lceos, lcpos, lcsos, leq, les, load, make_module, make_module_bundle, make_module_with_imports, make_module_with_metadata, make_type, match_arm, match_term, mod_op, mul, neq, or_op, param, pcast, phi, phi_pair, plain_type, remove_edge, represented_type_name, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, shl, shr, store, struct_directive, sub, switch_case, switch_term, trait_directive, trait_method, unreachable_term, var, xor_op}
 
 /// A parsed EHIR bundle together with the exact per-module textual sources
 /// from which it was built. Compiler drivers use this typed boundary to feed a
@@ -193,13 +193,12 @@ pub fn parse_parameter_text(source: str) -> Parameter {
 pub fn try_parse_variable_text(source: str) -> Result[Variable, str] {
     let separator = find_variable_type_separator(source)
     if separator >= source.len() {
-        let name = trim_text(source)
-        if name.is_empty() || name.contains(" ") || name.contains("\t") || name.contains("\n") {
-            ret Result::Err("Malformed EHIR operand: " + source)
-        }
-        ret Result::Ok(untyped_var(name))
+        ret Result::Err("EHIR value requires an explicit type: " + source)
     }
     let name = trim_text(source.slice(0_usize, separator))
+    if name.is_empty() {
+        ret Result::Err("EHIR value name must not be empty")
+    }
     let typ = try_parse_type_text(source.slice(separator + 1_usize, source.len() - separator - 1_usize))?
     ret Result::Ok(var(name, typ))
 }
@@ -213,7 +212,7 @@ pub fn parse_variable_text(source: str) -> Variable {
             panic(message)
         }
     }
-    ret untyped_var("")
+    ret var("", plain_type("void", Vec[Type]::new()))
 }
 
 fn find_variable_type_separator(source: str) -> usize {
@@ -232,13 +231,18 @@ fn find_variable_type_separator(source: str) -> usize {
 }
 
 pub fn try_parse_instruction_text(source: str) -> Result[Instruction, str] {
+    let mut known = new_ssa_bindings(0_usize)
+    ret try_parse_instruction_in_scope(source, known)
+}
+
+pub fn try_parse_instruction_in_scope(source: str, known: mut SsaBindings) -> Result[Instruction, str] {
     let value = trim_text(source)
     if starts_with_text(value, ";") {
         ret Result::Ok(comment(trim_text(value.slice(1_usize, value.len() - 1_usize))))
     }
     if starts_with_text(value, "store ") {
         let operands = try_split_top_level_text(value.slice(6_usize, value.len() - 6_usize), ",")?
-        ret Result::Ok(store(try_parse_variable_text(try_required_part(operands, 0_usize)?)?, try_parse_variable_text(try_required_part(operands, 1_usize)?)?))
+        ret Result::Ok(store(try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?, try_parse_ssa_reference(try_required_part(operands, 1_usize)?, known)?))
     }
     if starts_with_text(value, "setfield ") {
         let body = value.slice(9_usize, value.len() - 9_usize)
@@ -246,37 +250,37 @@ pub fn try_parse_instruction_text(source: str) -> Result[Instruction, str] {
         if field_separator >= body.len() {
             ret Result::Err("Malformed EHIR setfield: " + source)
         }
-        let src = try_parse_variable_text(body.slice(0_usize, field_separator))?
+        let src = try_parse_ssa_reference(body.slice(0_usize, field_separator), known)?
         let remainder = body.slice(field_separator + 3_usize, body.len() - field_separator - 3_usize)
         let operands = try_split_top_level_text(remainder, ",")?
-        ret Result::Ok(setfield(src, try_parse_variable_text(try_required_part(operands, 0_usize)?)?, try_parse_variable_text(try_required_part(operands, 1_usize)?)?))
+        ret Result::Ok(setfield(src, try_parse_field_selector(try_required_part(operands, 0_usize)?)?, try_parse_ssa_reference(try_required_part(operands, 1_usize)?, known)?))
     }
     if starts_with_text(value, "hfree ") {
-        ret Result::Ok(hfree(try_parse_variable_text(trim_text(value.slice(6_usize, value.len() - 6_usize)))?))
+        ret Result::Ok(hfree(try_parse_ssa_reference(trim_text(value.slice(6_usize, value.len() - 6_usize)), known)?))
     }
     if starts_with_text(value, "cfree ") {
-        ret Result::Ok(cfree(try_parse_variable_text(trim_text(value.slice(6_usize, value.len() - 6_usize)))?))
+        ret Result::Ok(cfree(try_parse_ssa_reference(trim_text(value.slice(6_usize, value.len() - 6_usize)), known)?))
     }
     if starts_with_text(value, "addedge ") {
         let operands = try_split_top_level_text(value.slice(8_usize, value.len() - 8_usize), ",")?
-        ret Result::Ok(add_edge(try_parse_variable_text(try_required_part(operands, 0_usize)?)?, try_parse_variable_text(try_required_part(operands, 1_usize)?)?))
+        ret Result::Ok(add_edge(try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?, try_parse_ssa_reference(try_required_part(operands, 1_usize)?, known)?))
     }
     if starts_with_text(value, "removeedge ") {
         let operands = try_split_top_level_text(value.slice(11_usize, value.len() - 11_usize), ",")?
-        ret Result::Ok(remove_edge(try_parse_variable_text(try_required_part(operands, 0_usize)?)?, try_parse_variable_text(try_required_part(operands, 1_usize)?)?))
+        ret Result::Ok(remove_edge(try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?, try_parse_ssa_reference(try_required_part(operands, 1_usize)?, known)?))
     }
     if starts_with_text(value, "drop ") {
-        ret Result::Ok(drop_value(try_parse_variable_text(trim_text(value.slice(5_usize, value.len() - 5_usize)))?))
+        ret Result::Ok(drop_value(try_parse_ssa_reference(trim_text(value.slice(5_usize, value.len() - 5_usize)), known)?))
     }
     if starts_with_text(value, "retain ") {
-        ret Result::Ok(retain_value(try_parse_variable_text(trim_text(value.slice(7_usize, value.len() - 7_usize)))?))
+        ret Result::Ok(retain_value(try_parse_ssa_reference(trim_text(value.slice(7_usize, value.len() - 7_usize)), known)?))
     }
 
     let assignment = find_text(value, " = ")
     if assignment >= value.len() {
         ret Result::Err("Unsupported EHIR instruction: " + source)
     }
-    let mut out = try_parse_variable_text(value.slice(0_usize, assignment))?
+    let out = try_parse_variable_text(value.slice(0_usize, assignment))?
     let rhs = value.slice(assignment + 3_usize, value.len() - assignment - 3_usize)
     let opcode_end = find_text(rhs, " ")
     let opcode = if opcode_end < rhs.len() {
@@ -292,39 +296,29 @@ pub fn try_parse_instruction_text(source: str) -> Result[Instruction, str] {
 
     // A bare identifier is an alias even when it spells an opcode.
     if operands_text == "" {
-        ret Result::Ok(alias(out, try_parse_variable_text(rhs)?))
-    }
-
-    match out.typ {
-        Option[Type]::Some(_) => {
-        }
-        Option[Type]::None => {
-            if opcode == "ieq" || opcode == "neq" || opcode == "les" || opcode == "leq" || opcode == "grt" || opcode == "geq" || opcode == "and" || opcode == "or" {
-                out = var(out.name, plain_type("bool", Vec[Type]::new()))
-            }
-        }
+        ret Result::Ok(alias(out, try_parse_ssa_reference(rhs, known)?))
     }
 
     if opcode == "lcpos" || opcode == "capprim" {
         ret Result::Ok(lcpos(out, operands_text))
     }
     if opcode == "alias" {
-        ret Result::Ok(alias(out, try_parse_variable_text(operands_text)?))
+        ret Result::Ok(alias(out, try_parse_ssa_reference(operands_text, known)?))
     }
     if opcode == "await" {
-        ret Result::Ok(await_value(out, try_parse_variable_text(operands_text)?))
+        ret Result::Ok(await_value(out, try_parse_ssa_reference(operands_text, known)?))
     }
     if opcode == "icall" {
         let open = find_top_level_char(operands_text, "(")
         if open >= operands_text.len() || !ends_with_text(operands_text, ")") {
             ret Result::Err("Malformed EHIR indirect call")
         }
-        let callee = try_parse_variable_text(trim_text(operands_text.slice(0, open)))?
+        let callee = try_parse_ssa_reference(trim_text(operands_text.slice(0, open)), known)?
         let argument_text = operands_text.slice(open + 1, operands_text.len() - open - 2)
         let mut arguments = Vec[Variable]::new()
         if trim_text(argument_text) != "" {
             for argument in try_split_top_level_text(argument_text, ",")? {
-                arguments.push(try_parse_variable_text(argument)?)
+                arguments.push(try_parse_ssa_reference(argument, known)?)
             }
         }
         ret Result::Ok(indirect_call(out, callee, arguments))
@@ -344,7 +338,7 @@ pub fn try_parse_instruction_text(source: str) -> Result[Instruction, str] {
         let mut args = Vec[Variable]::new()
         if trim_text(args_text).len() > 0_usize {
             for arg in try_split_top_level_text(args_text, ",")? {
-                args.push(try_parse_variable_text(arg)?)
+                args.push(try_parse_ssa_reference(arg, known)?)
             }
         }
         ret Result::Ok(call(out, callee_decl.name, callee_decl.generics, args, opcode == "unsafe"))
@@ -359,7 +353,7 @@ pub fn try_parse_instruction_text(source: str) -> Result[Instruction, str] {
         let mut args = Vec[Variable]::new()
         if trim_text(args_text).len() > 0_usize {
             for arg in try_split_top_level_text(args_text, ",")? {
-                args.push(try_parse_variable_text(arg)?)
+                args.push(try_parse_ssa_reference(arg, known)?)
             }
         }
         ret Result::Ok(lcsos(out, typ, args))
@@ -389,15 +383,15 @@ pub fn try_parse_instruction_text(source: str) -> Result[Instruction, str] {
         let payload = if payload_text.len() == 0_usize {
             Option[Variable]::None
         } else {
-            Option[Variable]::Some(try_parse_variable_text(payload_text)?)
+            Option[Variable]::Some(try_parse_ssa_reference(payload_text, known)?)
         }
         ret Result::Ok(lceos(out, enum_value(declaration.name, declaration.generics, variant, payload)))
     }
     if opcode == "load" {
-        ret Result::Ok(load(out, try_parse_variable_text(operands_text)?))
+        ret Result::Ok(load(out, try_parse_ssa_reference(operands_text, known)?))
     }
     if opcode == "getptr" {
-        ret Result::Ok(getptr(out, try_parse_variable_text(operands_text)?))
+        ret Result::Ok(getptr(out, try_parse_ssa_reference(operands_text, known)?))
     }
     if opcode == "salloc" {
         ret Result::Ok(salloc(out, try_parse_type_text(operands_text)?))
@@ -407,11 +401,11 @@ pub fn try_parse_instruction_text(source: str) -> Result[Instruction, str] {
     }
     if opcode == "hrealloc" {
         let operands = try_split_top_level_text(operands_text, ",")?
-        ret Result::Ok(hrealloc(out, try_parse_variable_text(try_required_part(operands, 0_usize)?)?, try_parse_variable_text(try_required_part(operands, 1_usize)?)?))
+        ret Result::Ok(hrealloc(out, try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?, try_parse_ssa_reference(try_required_part(operands, 1_usize)?, known)?))
     }
     if opcode == "pcast" {
         let operands = try_split_top_level_text(operands_text, ",")?
-        ret Result::Ok(pcast(out, try_parse_variable_text(try_required_part(operands, 0_usize)?)?, try_parse_type_text(try_required_part(operands, 1_usize)?)?))
+        ret Result::Ok(pcast(out, try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?, try_parse_type_text(try_required_part(operands, 1_usize)?)?))
     }
     if opcode == "getfield" || opcode == "getfieldptr" || opcode == "sgetfield" || opcode == "sgetfieldptr" {
         let separator = find_text(operands_text, " > ")
@@ -429,8 +423,8 @@ pub fn try_parse_instruction_text(source: str) -> Result[Instruction, str] {
             src_text = try_required_part(operands, 0_usize)?
             field_text = try_required_part(operands, 1_usize)?
         }
-        let src = try_parse_variable_text(src_text)?
-        let field = try_parse_variable_text(field_text)?
+        let src = try_parse_ssa_reference(src_text, known)?
+        let field = try_parse_field_selector(field_text)?
         if opcode == "getfield" {
             ret Result::Ok(getfield(out, src, field))
         }
@@ -444,7 +438,7 @@ pub fn try_parse_instruction_text(source: str) -> Result[Instruction, str] {
     }
     if opcode == "gep" {
         let operands = try_split_top_level_text(operands_text, ",")?
-        ret Result::Ok(gep(out, try_parse_variable_text(try_required_part(operands, 0_usize)?)?, try_parse_variable_text(try_required_part(operands, 1_usize)?)?))
+        ret Result::Ok(gep(out, try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?, try_parse_ssa_reference(try_required_part(operands, 1_usize)?, known)?))
     }
     if opcode == "phi" {
         let mut pairs = Vec[PhiPair]::new()
@@ -454,17 +448,17 @@ pub fn try_parse_instruction_text(source: str) -> Result[Instruction, str] {
                 ret Result::Err("Malformed EHIR phi pair: " + operand)
             }
             let label = trim_text(operand.slice(separator + 2_usize, operand.len() - separator - 2_usize))
-            pairs.push(phi_pair(try_parse_variable_text(trim_text(operand.slice(0_usize, separator)))?, label))
+            pairs.push(phi_pair(try_parse_ssa_reference(trim_text(operand.slice(0_usize, separator)), known)?, label))
         }
         ret Result::Ok(phi(out, pairs))
     }
 
     let operands = try_split_top_level_text(operands_text, ",")?
     if operands.len() < 2_usize {
-        ret Result::Ok(alias(out, try_parse_variable_text(rhs)?))
+        ret Result::Ok(alias(out, try_parse_ssa_reference(rhs, known)?))
     }
-    let lhs = try_parse_variable_text(try_required_part(operands, 0_usize)?)?
-    let rhs_var = try_parse_variable_text(try_required_part(operands, 1_usize)?)?
+    let lhs = try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?
+    let rhs_var = try_parse_comparison_operand(try_required_part(operands, 1_usize)?, known, opcode)?
     if opcode == "add" {
         ret Result::Ok(add(out, lhs, rhs_var))
     }
@@ -530,12 +524,17 @@ pub fn parse_instruction_text(source: str) -> Instruction {
 }
 
 pub fn try_parse_terminator_text(source: str) -> Result[Terminator, str] {
+    let mut known = new_ssa_bindings(0_usize)
+    ret try_parse_terminator_in_scope(source, known)
+}
+
+pub fn try_parse_terminator_in_scope(source: str, known: mut SsaBindings) -> Result[Terminator, str] {
     let value = trim_text(source)
     if value == "unreachable" {
         ret Result::Ok(unreachable_term())
     }
     if starts_with_text(value, "ret ") {
-        ret Result::Ok(ret_term(try_parse_variable_text(value.slice(4_usize, value.len() - 4_usize))?))
+        ret Result::Ok(ret_term(try_parse_ssa_reference(value.slice(4_usize, value.len() - 4_usize), known)?))
     }
     if starts_with_text(value, "br $") {
         ret Result::Ok(br_term(trim_text(value.slice(4_usize, value.len() - 4_usize))))
@@ -543,16 +542,16 @@ pub fn try_parse_terminator_text(source: str) -> Result[Terminator, str] {
     if starts_with_text(value, "cbr ") {
         let operands = try_split_top_level_text(value.slice(4_usize, value.len() - 4_usize), ",")?
         ret Result::Ok(cbr_term(
-                try_parse_variable_text(try_required_part(operands, 0_usize)?)?,
+                try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?,
                 strip_label(try_required_part(operands, 1_usize)?),
                 strip_label(try_required_part(operands, 2_usize)?),
             ))
     }
     if starts_with_text(value, "match ") {
-        ret Result::Ok(try_parse_match_terminator_text(value)?)
+        ret Result::Ok(try_parse_match_terminator_in_scope(value, known)?)
     }
     if starts_with_text(value, "switch ") {
-        ret Result::Ok(try_parse_switch_terminator_text(value)?)
+        ret Result::Ok(try_parse_switch_terminator_in_scope(value, known)?)
     }
     ret Result::Err("Unsupported EHIR terminator: " + source)
     ret Result::Ok(br_term(""))
@@ -571,6 +570,11 @@ pub fn parse_terminator_text(source: str) -> Terminator {
 }
 
 fn try_parse_match_terminator_text(value: str) -> Result[Terminator, str] {
+    let mut known = new_ssa_bindings(0_usize)
+    ret try_parse_match_terminator_in_scope(value, known)
+}
+
+fn try_parse_match_terminator_in_scope(value: str, known: mut SsaBindings) -> Result[Terminator, str] {
     let lines = split_lines_text(value)
     let header = trim_text(try_required_part(lines, 0_usize)?)
     let comma = find_text(header, ", $")
@@ -578,7 +582,7 @@ fn try_parse_match_terminator_text(value: str) -> Result[Terminator, str] {
     if comma >= header.len() || open >= header.len() || open <= comma + 3_usize {
         ret Result::Err("Malformed EHIR match terminator: " + value)
     }
-    let scrutinee = try_parse_variable_text(header.slice(6_usize, comma - 6_usize))?
+    let scrutinee = try_parse_ssa_reference(header.slice(6_usize, comma - 6_usize), known)?
     let default_label = header.slice(comma + 3_usize, open - comma - 3_usize)
     let mut arms = Vec[MatchArm]::new()
     let mut index = 1_usize
@@ -622,6 +626,11 @@ fn parse_match_terminator_text(value: str) -> Terminator {
 }
 
 fn try_parse_switch_terminator_text(value: str) -> Result[Terminator, str] {
+    let mut known = new_ssa_bindings(0_usize)
+    ret try_parse_switch_terminator_in_scope(value, known)
+}
+
+fn try_parse_switch_terminator_in_scope(value: str, known: mut SsaBindings) -> Result[Terminator, str] {
     let lines = split_lines_text(value)
     let header = trim_text(try_required_part(lines, 0_usize)?)
     let comma = find_text(header, ", $")
@@ -629,7 +638,7 @@ fn try_parse_switch_terminator_text(value: str) -> Result[Terminator, str] {
     if comma >= header.len() || open >= header.len() || open <= comma + 3_usize {
         ret Result::Err("Malformed EHIR switch terminator: " + value)
     }
-    let scrutinee = try_parse_variable_text(header.slice(7_usize, comma - 7_usize))?
+    let scrutinee = try_parse_ssa_reference(header.slice(7_usize, comma - 7_usize), known)?
     let default_label = header.slice(comma + 3_usize, open - comma - 3_usize)
     let mut cases = Vec[SwitchCase]::new()
     let mut index = 1_usize
@@ -749,7 +758,7 @@ fn try_parse_function_lines(lines: Vec[str], start: usize, end: usize) -> Result
     }
 
     let mut blocks = Vec[Block]::new()
-    let mut known_variables = KnownVariables {
+    let mut known_variables = SsaBindings {
         Vec[Parameter]::new(), string_index_with_capacity(end - start + params.len())
     }
     for parameter in params {
@@ -784,14 +793,26 @@ fn try_parse_function_lines(lines: Vec[str], start: usize, end: usize) -> Result
                     break
                 }
             }
-            terminator = Option[Terminator]::Some(resolve_terminator_types(
-                    try_parse_terminator_text(terminator_text)?, known_variables,))
+            let parsed = try_parse_terminator_in_scope(terminator_text, known_variables)?
+            match parsed {
+                Terminator::Match(item) => {
+                    for arm in item.arms {
+                        match arm.payload_var {
+                            Some(value) => bind_ssa_value(known_variables, value) None => {
+                            }
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            terminator = Option[Terminator]::Some(parsed)
             continue
         }
         if is_terminator_text(line) {
-            terminator = Option[Terminator]::Some(resolve_terminator_types(try_parse_terminator_text(line)?, known_variables))
+            terminator = Option[Terminator]::Some(try_parse_terminator_in_scope(line, known_variables)?)
         } else {
-            let instruction = resolve_instruction_types(try_parse_instruction_text(line)?, known_variables)
+            let instruction = try_parse_instruction_in_scope(line, known_variables)?
             remember_instruction_output(known_variables, instruction)
             instructions.push(instruction)
         }
@@ -813,7 +834,6 @@ fn try_parse_function_lines(lines: Vec[str], start: usize, end: usize) -> Result
         }
     }
     ret Result::Err("Unable to parse EHIR function")
-    ret Result::Ok(fn_item("", Vec[Type]::new(), Vec[Parameter]::new(), plain_type("void", Vec[Type]::new()), Vec[Block]::new()))
 }
 
 fn parse_function_lines(lines: Vec[str], start: usize, end: usize) -> FnDirective {
@@ -828,191 +848,115 @@ fn parse_function_lines(lines: Vec[str], start: usize, end: usize) -> FnDirectiv
     ret fn_item("", Vec[Type]::new(), Vec[Parameter]::new(), plain_type("void", Vec[Type]::new()), Vec[Block]::new())
 }
 
-struct KnownVariables {
+pub struct SsaBindings {
     values: Vec[Parameter]
     positions: StringIndex
 }
 
-fn remember_parameter(known: mut KnownVariables, value: Parameter) ->() {
+pub fn remember_parameter(known: mut SsaBindings, value: Parameter) ->() {
     string_index_set(known.positions, value.name, known.values.len())
     known.values.push(value)
 }
 
-fn resolve_variable_type(value: Variable, known: mut KnownVariables) -> Variable {
-    match value.typ {
-        Option[Type]::Some(_) => {
-            ret value
-        }
-        Option[Type]::None => {
-        }
+/// A spelling is bound to its typed definition while the instruction is parsed.
+/// Canonical IR never contains an unresolved value or needs a repair pass.
+pub fn try_parse_ssa_reference(source: str, known: mut SsaBindings) -> Result[Variable, str] {
+    if find_variable_type_separator(source) < source.len() {
+        ret try_parse_variable_text(source)
     }
-    let position = string_index_get(known.positions, value.name)
+    let name = trim_text(source)
+    let position = string_index_get(known.positions, name)
     if position != 0_usize {
         let item = known.values.get_unchecked_borrowed(position - 1_usize)
-        ret var(value.name, item.typ)
+        ret Result::Ok(var(name, item.typ))
     }
-    ret value
+    if name == "void" {
+        ret Result::Ok(var("void", plain_type("()", Vec[Type]::new())))
+    }
+    ret Result::Err("unknown typed SSA reference: " + name)
 }
 
-fn resolve_variables(values: Vec[Variable], known: mut KnownVariables) -> Vec[Variable] {
-    let mut out = Vec[Variable]::new()
-    for value in values {
-        out.push(resolve_variable_type(value, known))
+fn try_parse_comparison_operand(source: str, known: mut SsaBindings, opcode: str) -> Result[Variable, str] {
+    let name = trim_text(source)
+    if (opcode == "ieq" || opcode == "neq") && find_variable_type_separator(name) >= name.len() &&
+    string_index_get(known.positions, name) == 0_usize && !name.is_empty() &&
+    name.byte_at(0_usize) >= 65_u8 && name.byte_at(0_usize) <= 90_u8 {
+        ret Result::Ok(enum_tag(name))
     }
-    ret out
+    ret try_parse_ssa_reference(name, known)
 }
 
-fn resolve_instruction_types(instruction: Instruction, known: mut KnownVariables) -> Instruction {
-    match instruction {
-        Instruction::Alias(data) => {
-            ret alias(resolve_variable_type(data.out, known), resolve_variable_type(data.src, known))
+pub fn try_parse_field_selector(source: str) -> Result[FieldSelector, str] {
+    let separator = find_variable_type_separator(source)
+    if separator >= source.len() {
+        let name = trim_text(source)
+        if name.is_empty() {
+            ret Result::Err("EHIR field selector must not be empty")
         }
-        Instruction::Await(data) => {
-            ret await_value(data.out, resolve_variable_type(data.future, known))
-        }
-        Instruction::Call(data) => {
-            ret call(data.out, data.name, data.generics, resolve_variables(data.args, known), data.is_unsafe)
-        }
-        Instruction::Lcsos(data) => {
-            ret lcsos(data.out, data.typ, resolve_variables(data.args, known))
-        }
-        Instruction::Store(data) => {
-            ret store(resolve_variable_type(data.src, known), resolve_variable_type(data.dst, known))
-        }
-        Instruction::Load(data) => {
-            ret load(data.out, resolve_variable_type(data.src, known))
-        }
-        Instruction::GetPtr(data) => {
-            ret getptr(data.out, resolve_variable_type(data.src, known))
-        }
-        Instruction::PtrCast(data) => {
-            ret pcast(data.out, resolve_variable_type(data.src, known), data.target_type)
-        }
-        Instruction::GetField(data) => {
-            ret getfield(data.out, resolve_variable_type(data.src, known), data.field)
-        }
-        Instruction::SetField(data) => {
-            ret setfield(resolve_variable_type(data.src, known), data.field, resolve_variable_type(data.value, known))
-        }
-        Instruction::GetFieldPtr(data) => {
-            ret getfieldptr(data.out, resolve_variable_type(data.src, known), data.field)
-        }
-        Instruction::SGetField(data) => {
-            ret sgetfield(data.out, resolve_variable_type(data.src, known), data.field)
-        }
-        Instruction::SGetFieldPtr(data) => {
-            ret sgetfieldptr(data.out, resolve_variable_type(data.src, known), data.field)
-        }
-        Instruction::Gep(data) => {
-            ret gep(data.out, resolve_variable_type(data.src, known), resolve_variable_type(data.offset, known))
-        }
-        Instruction::Binary(data) => {
-            ret binary(data.out, resolve_variable_type(data.lhs, known), resolve_variable_type(data.rhs, known), data.op)
-        }
-        Instruction::Phi(data) => {
-            let mut pairs = Vec[PhiPair]::new()
-            for pair in data.pairs {
-                pairs.push(phi_pair(resolve_variable_type(pair.value, known), pair.label))
-            }
-            ret phi(data.out, pairs)
-        }
-        Instruction::Lceos(data) => {
-            let value = data.value
-            let payload = match value.payload {
-                Option[Variable]::Some(item) => {
-                    Option[Variable]::Some(resolve_variable_type(item, known))
-                }
-                Option[Variable]::None => {
-                    Option[Variable]::None
-                }
-            }
-            ret lceos(data.out, enum_value(value.name, value.generics, value.variant, payload))
-        }
-        Instruction::HeapRealloc(data) => {
-            ret hrealloc(data.out, resolve_variable_type(data.src, known), resolve_variable_type(data.count, known))
-        }
-        Instruction::HeapFree(data) => {
-            ret hfree(resolve_variable_type(data.src, known))
-        }
-        Instruction::Cfree(data) => {
-            ret cfree(resolve_variable_type(data.value, known))
-        }
-        Instruction::AddEdge(data) => {
-            ret add_edge(resolve_variable_type(data.owner, known), resolve_variable_type(data.value, known))
-        }
-        Instruction::RemoveEdge(data) => {
-            ret remove_edge(resolve_variable_type(data.owner, known), resolve_variable_type(data.value, known))
-        }
-        Instruction::Drop(data) => {
-            ret drop_value(resolve_variable_type(data.value, known))
-        }
-        Instruction::Retain(data) => {
-            ret retain_value(resolve_variable_type(data.value, known))
-        }
-        _ => {
-            ret instruction
-        }
+        ret Result::Ok(field(name))
     }
+    ret Result::Ok(annotated_field(trim_text(source.slice(0_usize, separator)),
+            try_parse_type_text(source.slice(separator + 1_usize, source.len() - separator - 1_usize))?,))
 }
 
-fn remember_instruction_output(known: mut KnownVariables, instruction: Instruction) ->() {
+pub fn remember_instruction_output(known: mut SsaBindings, instruction: Instruction) ->() {
     match instruction {
         Instruction::Lcpos(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::Alias(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::Lcsos(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::Lceos(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::Call(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::Await(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::Load(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::GetPtr(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::PtrCast(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::GetField(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::GetFieldPtr(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::SGetField(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::SGetFieldPtr(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::Gep(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::HeapAlloc(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::HeapRealloc(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::StackAlloc(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::Binary(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         Instruction::Phi(data) => {
-            remember_variable(known, data.out)
+            bind_ssa_value(known, data.out)
         }
         _ => {
         }
@@ -1020,35 +964,8 @@ fn remember_instruction_output(known: mut KnownVariables, instruction: Instructi
     ret()
 }
 
-fn remember_variable(known: mut KnownVariables, value: Variable) ->() {
-    match value.typ {
-        Option[Type]::Some(typ) => {
-            remember_parameter(known, param(value.name, typ))
-        }
-        Option[Type]::None => {
-        }
-    }
-    ret()
-}
-
-fn resolve_terminator_types(terminator: Terminator, known: mut KnownVariables) -> Terminator {
-    match terminator {
-        Terminator::Ret(data) => {
-            ret ret_term(resolve_variable_type(data.value, known))
-        }
-        Terminator::Cbr(data) => {
-            ret cbr_term(resolve_variable_type(data.cond, known), data.true_label, data.false_label)
-        }
-        Terminator::Match(data) => {
-            ret match_term(resolve_variable_type(data.scrutinee, known), data.default_label, data.arms)
-        }
-        Terminator::Switch(data) => {
-            ret switch_term(resolve_variable_type(data.scrutinee, known), data.default_label, data.cases)
-        }
-        _ => {
-            ret terminator
-        }
-    }
+pub fn bind_ssa_value(known: mut SsaBindings, value: Variable) ->() {
+    remember_parameter(known, param(value.name, value.typ))
 }
 
 pub fn try_parse_module_text(name: str, source: str) -> Result[Module, str] {
@@ -2098,4 +2015,9 @@ fn find_last_scope(value: str) -> usize {
         index = index - 1_usize
     }
     ret value.len()
+}
+
+/// One mutable name table per function, populated only by definitions.
+pub fn new_ssa_bindings(expected: usize) -> SsaBindings {
+    ret SsaBindings { Vec[Parameter]::new(), string_index_with_capacity(expected) }
 }

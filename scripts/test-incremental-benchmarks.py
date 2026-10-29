@@ -22,7 +22,11 @@ def workload(root):
     (root/"styles").mkdir()
     (root/"encore.toml").write_text('[project]\nname="graphene"\nversion="1.0.0"\ndependencies=[]\n')
     (root/"encore.lock").write_text('version=2\n[[packages]]\nname="std"\nregistry="http://127.0.0.1:9/index"\n')
-    (root/"src/main.enq").write_text('''fn main() -> u32 {
+    (root/"src/main.enq").write_text('''fn camera_speed_value(mode: str) -> f32 {
+    if mode == "4" { ret 4.0_f32 }
+    ret 1.0_f32
+}
+fn main() -> u32 {
     match argv(1) {
         Option::Some(command) => {
             if command == "import-character" { ret 1 }
@@ -53,6 +57,17 @@ class IncrementalContracts(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'stale or incorrect camera code'):
                 incremental.verify_binary(root,'dev',.006,'unused')
 
+    @unittest.skipIf(os.name=='nt','fixture executable uses a POSIX shebang')
+    def test_stale_function_output_is_rejected_even_when_camera_is_current(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binary=root/'target/dev/graphene'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('#!/usr/bin/env python3\nimport sys\n'
+                              'print(0.9707963 if sys.argv[1]=="__encore_bench_camera" else 4.0)\n')
+            binary.chmod(0o755)
+            with self.assertRaisesRegex(ValueError,'stale or incorrect function code'):
+                incremental.verify_binary(root,'dev',.006,'unused',4.0001)
+
     def test_plain_package_under_another_git_repository_preserves_sources_only(self):
         with tempfile.TemporaryDirectory() as directory:
             outer=Path(directory)
@@ -80,7 +95,10 @@ class IncrementalContracts(unittest.TestCase):
             main.write_text(main.read_text()+'\nfn template() -> str { ret "fn main() -> u32 {\\nret 0\\n}" }\n')
             before=(root/'src/main.enq').read_text()
             incremental.edit(root,'relocate',1)
-            self.assertEqual((root/'src/main.enq').read_text(),'\n\n\n'+before)
+            self.assertEqual((root/'src/main.enq').read_text(),before.replace('\nfn main()', '\n\n\n\nfn main()'))
+            incremental.edit(root,'function-body',1)
+            self.assertIn('ret 4.0001_f32',main.read_text())
+            self.assertIn('fn camera_speed_value(mode: str) -> f32',main.read_text())
             incremental.edit(root,'interface',1)
             self.assertNotIn('camera.look(', (root/'src/main.enq').read_text())
             self.assertEqual((root/'src/main.enq').read_text().count('camera.look_bench_1('),2)
@@ -124,10 +142,11 @@ class IncrementalContracts(unittest.TestCase):
                     stream.write(json.dumps({'variant':cache.parent.name,'count':n,'timings':'--timings' in sys.argv})+'\\n')
                 camera=(project/'src/editor_camera.enq').read_text();main=(project/'src/main.enq').read_text()
                 coef=float(re.search(r'delta_x \\* ([0-9.]+)_f32',camera)[1])
+                speed=float(re.search(r'if mode == "4" \\{ ret ([0-9.]+)_f32',main)[1])
                 message=re.search(r'Usage: graphene cook <project directory>[^"\\n]*',main)[0]
                 out=project/'target/dev';out.mkdir(parents=True,exist_ok=True);binary=out/'graphene'
                 if not os.environ.get('INCREMENTAL_STALE') or not binary.exists():
-                    binary.write_text('#!/usr/bin/env python3\\nimport sys\\nif sys.argv[1]=="__encore_bench_camera":\\n print('+repr(1.5707963-100*coef)+')\\nelse:\\n print('+repr(message)+')\\n sys.exit(1)\\n')
+                    binary.write_text('#!/usr/bin/env python3\\nimport sys\\nif sys.argv[1]=="__encore_bench_camera":\\n print('+repr(1.5707963-100*coef)+')\\nelif sys.argv[1]=="__encore_bench_function":\\n print('+repr(speed)+')\\nelse:\\n print('+repr(message)+')\\n sys.exit(1)\\n')
                     binary.chmod(0o755)
                 if '--timings' in sys.argv:
                     (out/'encore-timings.json').write_text(json.dumps({'total_ms':1,'units':[]}))
@@ -149,13 +168,13 @@ class IncrementalContracts(unittest.TestCase):
             self.assertEqual(report['profile'],'dev')
             self.assertEqual(incremental.tree_digest(project),before)
             measurements=[s for s in report['samples'] if s['role']=='measurement']
-            self.assertEqual(len(measurements),24)
+            self.assertEqual(len(measurements),28)
             self.assertEqual(measurements[0]['variant'],'baseline')
-            self.assertEqual(measurements[12]['variant'],'candidate')
+            self.assertEqual(measurements[14]['variant'],'candidate')
             for variant in ('baseline','candidate'):
                 rows=[json.loads(line) for line in trace.read_text().splitlines() if json.loads(line)['variant']==variant]
-                self.assertEqual([r['count'] for r in rows],list(range(19))+([0] if variant=='candidate' else []))
-                self.assertEqual(sum(r['timings'] for r in rows),8 if variant=='candidate' else 7)
+                self.assertEqual([r['count'] for r in rows],list(range(22))+([0] if variant=='candidate' else []))
+                self.assertEqual(sum(r['timings'] for r in rows),9 if variant=='candidate' else 8)
             seed=root/'baseline-cache';seed.mkdir();(seed/'counter').write_text('9')
             seeded=root/'seeded.json'
             seeded_command=command.copy();seeded_command[seeded_command.index('--output')+1]=str(seeded)
@@ -169,8 +188,20 @@ class IncrementalContracts(unittest.TestCase):
             self.assertIn('cache_seed_sha256',seeded_report['variants']['baseline'])
             self.assertIn('cache_seed_sha256',seeded_report['variants']['candidate'])
             self.assertEqual((seed/'counter').read_text(),'9')
-            self.assertEqual((seeded.with_suffix('.logs')/'baseline/cache/counter').read_text(),'22')
-            self.assertEqual((seeded.with_suffix('.logs')/'candidate/cache/counter').read_text(),'22')
+            self.assertEqual((seeded.with_suffix('.logs')/'baseline/cache/counter').read_text(),'24')
+            self.assertEqual((seeded.with_suffix('.logs')/'candidate/cache/counter').read_text(),'24')
+            focused=root/'focused.json'
+            focused_command=command.copy()
+            focused_command[focused_command.index('--output')+1]=str(focused)
+            focused_command[focused_command.index('--repetitions')+1]='1'
+            focused_command += ['--incremental-cases','unchanged,function-body']
+            result=subprocess.run(focused_command,env=environment,text=True,capture_output=True,timeout=60)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            focused_report=json.loads(focused.read_text())
+            self.assertTrue(focused_report['completed'])
+            self.assertEqual(focused_report['cases'],['unchanged','function-body'])
+            self.assertEqual({row['case'] for row in focused_report['summary']},
+                             {'unchanged','function-body'})
             broken=root/'stale.json';command[command.index('--output')+1]=str(broken)
             result=subprocess.run(command,env={**environment,'INCREMENTAL_STALE':'1'},
                                   text=True,capture_output=True,timeout=60)

@@ -12,12 +12,16 @@ import subprocess
 import tomllib
 
 
-CASES = ("unchanged", "method-body", "main-body", "relocate", "interface", "css")
+CASES = ("unchanged", "method-body", "function-body", "main-body", "relocate", "interface", "css")
 IGNORED = {".git", "target", "__pycache__", "node_modules", ".encore_cache", "artifacts", "bundles"}
 PROBE = '''            if command == "__encore_bench_camera" {
                 let mut camera = EditorCameraState::new("front", false)
                 camera.look(100.0_f32, 0.0_f32, false)
                 println(camera.yaw.fmt())
+                ret 0_u32
+            }
+            if command == "__encore_bench_function" {
+                println(camera_speed_value("4").fmt())
                 ret 0_u32
             }
 '''
@@ -85,6 +89,13 @@ def ensure_probe(project):
         if text.count(anchor) != 1:
             raise ValueError("Graphene CLI anchor changed; refusing to patch an unknown workload")
         main.write_text(text.replace(anchor, PROBE + anchor))
+    elif 'command == "__encore_bench_function"' not in text:
+        anchor = '            if command == "__encore_bench_camera" {'
+        main.write_text(text.replace(anchor, '''            if command == "__encore_bench_function" {
+                println(camera_speed_value("4").fmt())
+                ret 0_u32
+            }
+''' + anchor))
 
 
 def edit(project, case, revision):
@@ -99,6 +110,13 @@ def edit(project, case, revision):
         if count != 1:
             raise ValueError("Graphene camera coefficient anchor changed")
         camera.write_text(text)
+    elif case == "function-body":
+        text, count = re.subn(
+            r'(fn camera_speed_value\(mode: str\) -> f32 \{.*?if mode == "4" \{\s*ret )\d+\.\d+(_f32)',
+            lambda m: m[1] + f"4.{revision:04d}" + m[2], main.read_text(), flags=re.S)
+        if count != 1:
+            raise ValueError("Graphene camera speed function anchor changed")
+        main.write_text(text)
     elif case == "main-body":
         text, count = re.subn(r'Usage: graphene cook <project directory>(?: \[encore-bench-[^"\n]+\])?',
                              f"Usage: graphene cook <project directory> [encore-bench-{revision}]", main.read_text())
@@ -129,13 +147,18 @@ def edit(project, case, revision):
         raise ValueError("unknown incremental case: " + case)
 
 
-def verify_binary(project, profile, coefficient, message):
+def verify_binary(project, profile, coefficient, message, function_value=4.0):
     binary = project / "target" / profile / ("graphene.exe" if os.name == "nt" else "graphene")
     result = subprocess.run([str(binary), "__encore_bench_camera"], cwd=project,
                             capture_output=True, text=True, timeout=30)
     actual = float(result.stdout.strip())
     if result.returncode or not math.isfinite(actual) or abs(actual - (1.5707963 - 100 * coefficient)) > 0.00001:
         raise ValueError("stale or incorrect camera code: " + result.stdout + result.stderr)
+    result = subprocess.run([str(binary), "__encore_bench_function"], cwd=project,
+                            capture_output=True, text=True, timeout=30)
+    actual = float(result.stdout.strip())
+    if result.returncode or not math.isfinite(actual) or abs(actual - function_value) > 0.00001:
+        raise ValueError("stale or incorrect function code: " + result.stdout + result.stderr)
     result = subprocess.run([str(binary), "cook"], cwd=project,
                             capture_output=True, text=True, timeout=30)
     if result.returncode != 1 or result.stdout.strip() != message:
@@ -182,6 +205,9 @@ def markdown(report):
 def run(bench, args):
     if not args.project_root or args.resume:
         raise ValueError("incremental needs --project-root; interrupted sessions need a new --output")
+    cases = tuple(args.incremental_cases.split(",")) if args.incremental_cases else CASES
+    if not cases or len(set(cases)) != len(cases) or set(cases) - set(CASES):
+        raise ValueError("incremental cases must be unique names from: " + ", ".join(CASES))
     project = args.project_root.resolve()
     output = args.output.resolve()
     logs = output.with_suffix(".logs")
@@ -212,7 +238,7 @@ def run(bench, args):
     configuration = matrix[0]
     report = dict(schema=1, scenario="incremental", completed=False, profile=args.profile,
                   environment=machine, jobs=configuration, repetitions=args.repetitions,
-                  first_repetition=args.first_repetition, workload=workload,
+                  first_repetition=args.first_repetition, cases=cases, workload=workload,
                   benchmark_script_sha256=bench.digest_file(Path(__file__)),
                   driver_script_sha256=bench.digest_file(Path(bench.__file__)),
                   registry_seed_sha256=tree_digest(registry), registry_url=registry_url,
@@ -243,7 +269,8 @@ def run(bench, args):
                            ENCORE_REGISTRY_CACHE=str(private_registry),
                            ENCORE_CORE_DIR=str(compiler_source/"packages/core"), ENCORE_INDEX_URL=registry_url)
         sessions[name] = dict(compiler=compiler, project=workspace/relative_project, env=environment,
-                              coefficient=0.006, message="Usage: graphene cook <project directory>")
+                              coefficient=0.006, function_value=4.0,
+                              message="Usage: graphene cook <project directory>")
         report["variants"][name] = dict(compiler_sha256=bench.digest_file(compiler),
                                         compiler_version=subprocess.check_output([str(compiler),"--version"],text=True).strip(),
                                         source_snapshot_sha256=digest)
@@ -276,7 +303,7 @@ def run(bench, args):
             raise ValueError("build failed: " + str(logs/(label+".log")))
         if role != "warmup" and source_digest != tree_digest(root):
             raise ValueError("compiler changed workload inputs during measurement")
-        verify_binary(root,args.profile,session["coefficient"],session["message"])
+        verify_binary(root,args.profile,session["coefficient"],session["message"],session["function_value"])
         sample["built_artifact_sha256"] = bench.digest_file(root/"target"/args.profile/("graphene.exe" if os.name=="nt" else "graphene"))
         if detailed:
             sample["timings"] = json.loads(timing.read_text())
@@ -294,10 +321,12 @@ def run(bench, args):
             order = variants if repetition % 2 else list(reversed(variants))
             for name,_,_,_ in order:
                 session = sessions[name]
-                for case in CASES:
+                for case in cases:
                     edit(session["project"],case,repetition)
                     if case == "method-body":
                         session["coefficient"] = float(f"0.{600+repetition:05d}")
+                    elif case == "function-body":
+                        session["function_value"] = float(f"4.{repetition:04d}")
                     elif case == "main-body":
                         session["message"] = f"Usage: graphene cook <project directory> [encore-bench-{repetition}]"
                     build(name,role,case,repetition,diagnostic)

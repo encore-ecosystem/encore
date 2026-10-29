@@ -433,6 +433,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scenario", choices=("all", "build", "suite", "standalone", "projects", "subset", "incremental"), default="all")
     parser.add_argument("--project-root", type=Path, help="Graphene source root for an incremental edit/build session")
+    parser.add_argument("--incremental-cases",
+                        help="Comma-separated incremental cases; default: all edit scenarios")
     parser.add_argument("--registry-seed", type=Path, default=Path.home()/".cache/encore/registry",
                         help="Installed registry snapshot copied into private incremental caches")
     parser.add_argument("--baseline-cache-seed", type=Path,

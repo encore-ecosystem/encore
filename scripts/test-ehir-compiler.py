@@ -60,7 +60,13 @@ def main():
     run("missing-option", [ehir, "--target"], expected=2)
     run("invalid-jobs", [ehir, source, "--jobs", "0"], expected=1)
     bad = work / "bad.ehir"
-    for index, text in enumerate(["not a module", "fn broken() -> u32 {\n$entry:\nx: u32 = invalid\nret x: u32\n}\n"]):
+    for index, text in enumerate([
+        "not a module",
+        "fn broken() -> u32 {\n$entry:\nx: u32 = invalid\nret x: u32\n}\n",
+        "fn broken(a: u32) -> bool {\n$entry:\nsame = ieq a, a\nret same\n}\n",
+        "fn broken(a: u32) -> u64 {\n$entry:\nret a: u64\n}\n",
+        "fn broken() -> u32 {\n$entry:\nret absent: u32\n}\n",
+    ]):
         bad.write_text(text)
         result = run(f"parse-error-{index}", [ehir, bad], expected=1)
         assert "panic:" not in result.stderr and "ehir[" in result.stderr

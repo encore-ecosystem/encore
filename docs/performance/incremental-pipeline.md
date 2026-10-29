@@ -60,8 +60,9 @@ Modules with async functions use complete module preparation so coroutine
 declarations remain consistent. Preparation workers use existing CPU leases and
 preserve module order, including on the error path.
 
-The LLVM adapter currently materializes its internal representation from the
-typed graph. The frontend still emits and parses EHIR text for package assembly;
+Preparation and LLVM consume the same mandatory typed graph directly, without
+freeze/thaw conversion or a type recovery pass. The frontend still emits and
+parses EHIR text for package assembly;
 the package split alone does not eliminate that cost or establish the Graphene
 latency targets.
 

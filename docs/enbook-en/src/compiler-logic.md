@@ -1,8 +1,8 @@
 # Compiler Logic
 
-This chapter describes the current shape of the EHIR resolver. It focuses on
-type resolution inside EHIR functions, because that stage feeds later lowering,
-retain/drop insertion and backend validation.
+This chapter describes the frontend analysis database and the mandatory typed
+EHIR boundary used by preparation and code generation. Type inference belongs
+to the Encore frontend; EHIR never contains values awaiting type propagation.
 
 ## Incremental Frontend Database
 
@@ -60,68 +60,33 @@ arity, return types and body diagnostics are emitted through the same query.
 Additional language forms must extend this result rather than introduce a
 second type model in the compiler or language server.
 
-## STIV Model
+## Mandatory EHIR Types
 
-The resolver uses a three-layer model:
+Every canonical `Variable` carries a required `Type`, including its generic
+arguments and value/node representation. Instruction constructors cannot accept
+an absent value type. `FieldSelector` is separate metadata, while enum tags and
+the unit literal have explicit value kinds.
 
-- `ST` - Symbol Table. Built once per module and treated as the global source of
-  truth.
-- `I` - Instructions. Each instruction is a local constraint node.
-- `V` - Variables. Each function has a local `var -> inferred type` table.
+The text parser requires a type on instruction results. It may bind an operand
+without an annotation to an existing typed definition in the function's SSA
+scope. Standalone instruction parsing requires operand annotations. Explicitly
+typed forward references, such as a loop phi input, are checked against all
+function definitions during validation. No instruction-rewriting type recovery
+pass follows parsing.
 
-`ST` contains functions, extern functions, structs, enums, traits and impls.
-Resolver code does not rebuild or mutate that table while resolving functions.
+Validation checks SSA definition uniqueness, undefined references and exact
+type agreement with their definitions, along with operation and control-flow
+constraints. A decoded prepared-function artifact goes through the same SSA
+validation before reuse.
 
-## Event-Driven Resolution
-
-Resolver does not repeatedly scan the whole function until "nothing changed".
-Instead, it runs an event-driven work queue:
-
-1. create function-local `V` state from parameters;
-2. register each instruction once;
-3. record instruction dependencies on variables;
-4. enqueue instructions once for initial processing;
-5. when a variable becomes more specific, wake only instructions that depend on
-   that variable.
-
-This keeps the cost close to the number of real type refinements instead of the
-number of full-function rescans.
-
-## Instruction Dependencies
-
-Each instruction participates as a producer or constraint node.
-
-Examples:
-
-- `capprim` seeds a concrete primitive type immediately;
-- `add`, `sub`, `mul` and similar operations constrain both operands and the
-  output to a compatible numeric type;
-- `load` and `store` propagate pointer element types in both directions;
-- `capstruct` and `capenum` use declarations from `ST` and argument types from
-  `V` to specialize generics;
-- `call` and `callvoid` resolve a callable signature from `ST`, then constrain
-  arguments and result variables;
-- `match` reads the enum type of the condition and assigns payload types to arm
-  bindings.
-
-## Variable Refinement
-
-The core operation is monotonic refinement of a variable type.
-
-When resolver learns a new type fact for a variable, it:
-
-1. resolves aliases and built-in names;
-2. compares the new fact with the current variable type;
-3. stores the more specific type when the fact refines the current state;
-4. raises a compile error on incompatible types;
-5. wakes dependent instructions only if the variable was refined.
-
-This means variable knowledge only becomes more precise over time. Resolver does
-not rely on toggling between alternative states.
+`PreparedProgram` holds the canonical `ModuleBundle` directly. Preparation,
+function caching and LLVM share this graph rather than freezing it into indexed
+records and thawing it again. Indexed `TypedProgram` conversion remains an
+optional export API; it is outside the main compilation pipeline.
 
 ## Value And Node Representations
 
-The resolver preserves the representation of every type. For payload `T`, the
+EHIR preserves the representation of every type. For payload `T`, the
 forms `T`, `T<S>`, `T<H>`, `T&` and `T*` are different types:
 
 - `T` is an inline value;
@@ -141,7 +106,7 @@ and promotes those cells to SSA values and phi nodes.
 EHIR functions begin as graph-transforming state machines with one entry and
 possibly several normal returns. Compilation uses this fixed pass order:
 
-1. resolve declarations, generics and all instruction operand types;
+1. receive typed declarations and instructions from the frontend;
 2. monomorphize concrete functions and lifecycle descriptions;
 3. convert local cells and mutable aliases to SSA;
 4. normalize every normal return into one typed exit phi and one `ret`;
@@ -204,7 +169,6 @@ EHIR cache must preserve the same location metadata.
 
 ## Why This Matters
 
-The event-driven STIV resolver establishes types, but type resolution alone is
-not memory safety. SSA, region validation, ownership lowering and ERN runtime
+Mandatory EHIR types do not by themselves establish memory safety. SSA, region validation, ownership lowering and ERN runtime
 semantics are separate required proofs. A source program passing `encore check`
 cannot bypass any of them when it is built.

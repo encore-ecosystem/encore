@@ -3,8 +3,9 @@ import core::result::Result
 
 import std::vec::Vec
 
-import refrain::core::{BinaryOpKind, Block, Directive, EdgeInstruction, FnDirective, Instruction, Module, RepresentationKind, Terminator, Type, Variable, memory_value_type}
+import refrain::core::{BinaryOpKind, Block, Directive, EdgeInstruction, FnDirective, Instruction, Module, RepresentationKind, Terminator, Type, ValueKind, Variable, instruction_inputs, instruction_result, memory_value_type, var}
 import refrain::coroutine::validate_coroutine_moves
+import refrain::string_index::{StringIndex, string_index_get, string_index_set, string_index_with_capacity}
 import refrain::string_set::{StringSet, string_set_contains, string_set_contains_or_insert, string_set_with_capacity}
 
 pub fn validate_module(module: Module) -> Result[Module, str] {
@@ -78,31 +79,87 @@ fn validate_function(function: FnDirective) -> Option[str] {
         }
     }
 
-    let mut definitions = string_set_with_capacity(function_value_count(function))
+    let mut definitions = ValueDefinitions {
+        string_index_with_capacity(function_value_count(function)), Vec[Variable]::new()
+    }
     for parameter in function.params {
-        if parameter.name == "" {
-            ret invalid(function.name, "parameter name must not be empty")
-        }
-        if string_set_contains_or_insert(definitions, parameter.name) {
-            ret invalid(function.name, "duplicate value '" + parameter.name + "'")
+        match add_definition(definitions, var(parameter.name, parameter.typ), function.name) {
+            Some(message) => {
+                ret Option[str]::Some(message)
+            }
+            None => {
+            }
         }
     }
-
     for block_item in function.blocks {
         for instruction in block_item.instructions {
-            match instruction_output(instruction) {
-                Some(name) => {
-                    if name == "" {
-                        ret invalid(function.name, "instruction output name must not be empty")
-                    }
-                    if string_set_contains_or_insert(definitions, name) {
-                        ret invalid(function.name, "duplicate value '" + name + "'")
+            match instruction_result(instruction) {
+                Some(value) => {
+                    match add_definition(definitions, value, function.name) {
+                        Some(message) => {
+                            ret Option[str]::Some(message)
+                        }
+                        None => {
+                        }
                     }
                 }
                 None => {
                 }
             }
+        }
+        match block_item.terminator {
+            Terminator::Match(item) => {
+                for arm in item.arms {
+                    match arm.payload_var {
+                        Some(value) => {
+                            match add_definition(definitions, value, function.name) {
+                                Some(message) => {
+                                    ret Option[str]::Some(message)
+                                }
+                                None => {
+                                }
+                            }
+                        }
+                        None => {
+                        }
+                    }
+                }
+            }
+            _ => {
+            }
+        }
+    }
+
+    for block_item in function.blocks {
+        for instruction in block_item.instructions {
+            for value in instruction_inputs(instruction) {
+                match validate_use(definitions, value, function.name) {
+                    Some(message) => {
+                        ret Option[str]::Some(message)
+                    }
+                    None => {
+                    }
+                }
+            }
             match validate_instruction(function.name, function.is_async, instruction) {
+                Some(message) => {
+                    ret Option[str]::Some(message)
+                }
+                None => {
+                }
+            }
+        }
+        let mut uses = Vec[Variable]::new()
+        match block_item.terminator {
+            Terminator::Ret(item) => uses.push(item.value)
+            Terminator::Cbr(item) => uses.push(item.cond)
+            Terminator::Match(item) => uses.push(item.scrutinee)
+            Terminator::Switch(item) => uses.push(item.scrutinee)
+            _ => {
+            }
+        }
+        for value in uses {
+            match validate_use(definitions, value, function.name) {
                 Some(message) => {
                     ret Option[str]::Some(message)
                 }
@@ -132,100 +189,44 @@ fn function_value_count(function: FnDirective) -> usize {
 fn validate_instruction(function_name: str, is_async: bool, instruction: Instruction) -> Option[str] {
     match instruction {
         Instruction::Store(item) => {
-            match required_type(function_name, item.src) {
-                None => {
-                    ret missing_type(function_name, item.src.name)
-                }
-                Some(_) => {
-                }
+            let dst_type = item.dst.typ
+            if !is_memory_place(dst_type) {
+                ret invalid(function_name, "store destination '" + item.dst.name + "' is not a raw address or local place")
             }
-            match required_type(function_name, item.dst) {
-                None => {
-                    ret missing_type(function_name, item.dst.name)
-                }
-                Some(dst_type) => {
-                    if !is_memory_place(dst_type) {
-                        ret invalid(function_name, "store destination '" + item.dst.name + "' is not a raw address or local place")
-                    }
-                    match required_type(function_name, item.src) {
-                        Some(src_type) => {
-                            if !same_type(src_type, memory_value_type(dst_type)) {
-                                ret invalid(function_name, "store source and destination types do not match")
-                            }
-                        }
-                        None => {
-                        }
-                    }
-                }
+            let src_type = item.src.typ
+            if !same_type(src_type, memory_value_type(dst_type)) {
+                ret invalid(function_name, "store source and destination types do not match")
             }
         }
         Instruction::Load(item) => {
-            match required_type(function_name, item.src) {
-                None => {
-                    ret missing_type(function_name, item.src.name)
-                }
-                Some(src_type) => {
-                    if !is_memory_place(src_type) {
-                        ret invalid(function_name, "load source '" + item.src.name + "' is not a raw address or local place")
-                    }
-                    match required_type(function_name, item.out) {
-                        Some(out_type) => {
-                            if !same_type(out_type, memory_value_type(src_type)) {
-                                ret invalid(function_name, "load result and source types do not match")
-                            }
-                        }
-                        None => {
-                            ret missing_type(function_name, item.out.name)
-                        }
-                    }
-                }
+            let src_type = item.src.typ
+            if !is_memory_place(src_type) {
+                ret invalid(function_name, "load source '" + item.src.name + "' is not a raw address or local place")
+            }
+            let out_type = item.out.typ
+            if !same_type(out_type, memory_value_type(src_type)) {
+                ret invalid(function_name, "load result and source types do not match")
             }
         }
         Instruction::SetField(item) => {
-            match required_type(function_name, item.src) {
-                None => {
-                    ret missing_type(function_name, item.src.name)
-                }
-                Some(src_type) => {
-                    if !is_field_place(src_type) {
-                        ret invalid(function_name, "setfield target '" + item.src.name + "' is neither a node handle nor an addressable place")
-                    }
-                }
-            }
-            if !has_type(item.value) {
-                ret missing_type(function_name, item.value.name)
+            let src_type = item.src.typ
+            if !is_field_place(src_type) {
+                ret invalid(function_name, "setfield target '" + item.src.name + "' is neither a node handle nor an addressable place")
             }
         }
         Instruction::Lcsos(item) => {
-            match required_type(function_name, item.out) {
-                None => {
-                    ret missing_type(function_name, item.out.name)
-                }
-                Some(out_type) => {
-                    if !same_type(out_type, item.typ) {
-                        ret invalid(function_name, "lcsos result type does not match its construction type")
-                    }
-                    if !is_constructible_value_or_node(item.typ) {
-                        ret invalid(function_name, "lcsos requires inline, <S>, or <H> placement; '&' is placement-erased and cannot be constructed")
-                    }
-                }
+            let out_type = item.out.typ
+            if !same_type(out_type, item.typ) {
+                ret invalid(function_name, "lcsos result type does not match its construction type")
             }
-            for argument in item.args {
-                if !has_type(argument) {
-                    ret missing_type(function_name, argument.name)
-                }
+            if !is_constructible_value_or_node(item.typ) {
+                ret invalid(function_name, "lcsos requires inline, <S>, or <H> placement; '&' is placement-erased and cannot be constructed")
             }
         }
         Instruction::StackAlloc(item) => {
-            match required_type(function_name, item.out) {
-                Some(out_type) => {
-                    if !is_raw_address(out_type) {
-                        ret invalid(function_name, "salloc result must be a raw address")
-                    }
-                }
-                None => {
-                    ret missing_type(function_name, item.out.name)
-                }
+            let out_type = item.out.typ
+            if !is_raw_address(out_type) {
+                ret invalid(function_name, "salloc result must be a raw address")
             }
             // salloc reserves storage *for a value*.  The stored value may be
             // an inline aggregate, a node handle, a raw address, or the
@@ -235,73 +236,36 @@ fn validate_instruction(function_name: str, is_async: bool, instruction: Instruc
             // spill slots and conflates two independent concepts.
         }
         Instruction::HeapAlloc(item) => {
-            match required_type(function_name, item.out) {
-                Some(out_type) => {
-                    if !is_raw_address(out_type) {
-                        ret invalid(function_name, "halloc result must be a raw address")
-                    }
-                }
-                None => {
-                    ret missing_type(function_name, item.out.name)
-                }
+            let out_type = item.out.typ
+            if !is_raw_address(out_type) {
+                ret invalid(function_name, "halloc result must be a raw address")
             }
             // Like salloc, halloc allocates untyped storage for one value; a
             // handle stored there keeps its own node placement semantics.
         }
         Instruction::HeapRealloc(item) => {
-            match required_type(function_name, item.out) {
-                Some(out_type) => {
-                    if !is_raw_address(out_type) {
-                        ret invalid(function_name, "hrealloc result must be a raw address")
-                    }
-                }
-                None => {
-                    ret missing_type(function_name, item.out.name)
-                }
+            let out_type = item.out.typ
+            if !is_raw_address(out_type) {
+                ret invalid(function_name, "hrealloc result must be a raw address")
             }
-            match required_type(function_name, item.src) {
-                Some(src_type) => {
-                    if !is_raw_address(src_type) {
-                        ret invalid(function_name, "hrealloc source must be a raw address")
-                    }
-                }
-                None => {
-                    ret missing_type(function_name, item.src.name)
-                }
-            }
-            if !has_type(item.count) {
-                ret missing_type(function_name, item.count.name)
+            let src_type = item.src.typ
+            if !is_raw_address(src_type) {
+                ret invalid(function_name, "hrealloc source must be a raw address")
             }
         }
         Instruction::Binary(item) => {
-            match required_type(function_name, item.lhs) {
-                None => {
-                    ret missing_type(function_name, item.lhs.name)
+            let lhs_type = item.lhs.typ
+            let rhs_type = item.rhs.typ
+            if item.rhs.kind == ValueKind::EnumTag {
+                if !is_equality(item.op) {
+                    ret invalid(function_name, "enum tags require an equality comparison")
                 }
-                Some(lhs_type) => {
-                    match required_type(function_name, item.rhs) {
-                        None => {
-                            if !is_equality(item.op) {
-                                ret missing_type(function_name, item.rhs.name)
-                            }
-                        }
-                        Some(rhs_type) => {
-                            if !same_type(lhs_type, rhs_type) {
-                                ret invalid(function_name, "binary operand types do not match")
-                            }
-                        }
-                    }
-                }
+            } elif !same_type(lhs_type, rhs_type) {
+                ret invalid(function_name, "binary operand types do not match")
             }
-            match required_type(function_name, item.out) {
-                None => {
-                    ret missing_type(function_name, item.out.name)
-                }
-                Some(out_type) => {
-                    if is_comparison(item.op) && !is_plain_named(out_type, "bool") {
-                        ret invalid(function_name, "comparison result must have type 'bool'")
-                    }
-                }
+            let out_type = item.out.typ
+            if is_comparison(item.op) && !is_plain_named(out_type, "bool") {
+                ret invalid(function_name, "comparison result must have type 'bool'")
             }
         }
         Instruction::Alias(item) => {
@@ -311,35 +275,17 @@ fn validate_instruction(function_name: str, is_async: bool, instruction: Instruc
             if !is_async {
                 ret invalid(function_name, "await instruction requires an async function")
             }
-            if !has_type(item.out) {
-                ret missing_type(function_name, item.out.name)
-            }
-            if !has_type(item.future) {
-                ret missing_type(function_name, item.future.name)
-            }
         }
         Instruction::HeapFree(item) => {
-            match required_type(function_name, item.src) {
-                Some(src_type) => {
-                    if !is_raw_address(src_type) {
-                        ret invalid(function_name, "hfree operand is not a raw address")
-                    }
-                }
-                None => {
-                    ret missing_type(function_name, item.src.name)
-                }
+            let src_type = item.src.typ
+            if !is_raw_address(src_type) {
+                ret invalid(function_name, "hfree operand is not a raw address")
             }
         }
         Instruction::Cfree(item) => {
-            match required_type(function_name, item.value) {
-                Some(value_type) => {
-                    if !is_node_handle(value_type) {
-                        ret invalid(function_name, "cfree requires an owning node handle")
-                    }
-                }
-                None => {
-                    ret missing_type(function_name, item.value.name)
-                }
+            let value_type = item.value.typ
+            if !is_node_handle(value_type) {
+                ret invalid(function_name, "cfree requires an owning node handle")
             }
         }
         Instruction::AddEdge(item) => {
@@ -349,27 +295,15 @@ fn validate_instruction(function_name: str, is_async: bool, instruction: Instruc
             ret validate_edge_instruction(function_name, item)
         }
         Instruction::Drop(item) => {
-            match required_type(function_name, item.value) {
-                Some(value_type) => {
-                    if is_memory_place(value_type) {
-                        ret invalid(function_name, "drop cannot consume a raw address or local place")
-                    }
-                }
-                None => {
-                    ret missing_type(function_name, item.value.name)
-                }
+            let value_type = item.value.typ
+            if is_memory_place(value_type) {
+                ret invalid(function_name, "drop cannot consume a raw address or local place")
             }
         }
         Instruction::Retain(item) => {
-            match required_type(function_name, item.value) {
-                Some(value_type) => {
-                    if is_memory_place(value_type) {
-                        ret invalid(function_name, "retain cannot copy a raw address or local place")
-                    }
-                }
-                None => {
-                    ret missing_type(function_name, item.value.name)
-                }
+            let value_type = item.value.typ
+            if is_memory_place(value_type) {
+                ret invalid(function_name, "retain cannot copy a raw address or local place")
             }
         }
         _ => {
@@ -377,20 +311,10 @@ fn validate_instruction(function_name: str, is_async: bool, instruction: Instruc
     }
     ret Option[str]::None
 }
-
 fn validate_edge_instruction(function_name: str, item: EdgeInstruction) -> Option[str] {
-    match required_type(function_name, item.owner) {
-        Some(owner_type) => {
-            if !is_node_handle(owner_type) {
-                ret invalid(function_name, "graph edge owner must be an owning node handle")
-            }
-        }
-        None => {
-            ret missing_type(function_name, item.owner.name)
-        }
-    }
-    if !has_type(item.value) {
-        ret missing_type(function_name, item.value.name)
+    let owner_type = item.owner.typ
+    if !is_node_handle(owner_type) {
+        ret invalid(function_name, "graph edge owner must be an owning node handle")
     }
     ret Option[str]::None
 }
@@ -414,17 +338,7 @@ fn validate_phi_nodes(function: FnDirective) -> Option[str] {
                     if item.pairs.len() != predecessors.len() {
                         ret invalid(function.name, "phi in block '" + block_item.name + "' must have one value for every predecessor")
                     }
-                    let mut out_type = Type {
-                        "usize", Vec[Type]::new(), RepresentationKind::Inline
-                    }
-                    match required_type(function.name, item.out) {
-                        Some(typ) => {
-                            out_type = typ
-                        }
-                        None => {
-                            ret missing_type(function.name, item.out.name)
-                        }
-                    }
+                    let out_type = item.out.typ
                     let mut seen = Vec[str]::new()
                     for pair in item.pairs {
                         if !contains(predecessors, pair.label) {
@@ -434,16 +348,13 @@ fn validate_phi_nodes(function: FnDirective) -> Option[str] {
                             ret invalid(function.name, "phi contains duplicate predecessor '" + pair.label + "'")
                         }
                         seen.push(pair.label)
-                        match required_type(function.name, pair.value) {
-                            Some(value_type) => {
-                                if !same_type(out_type, value_type) {
-                                    ret invalid(function.name, "phi input and output types do not match")
-                                }
-                            }
-                            None => {
-                                ret missing_type(function.name, pair.value.name)
-                            }
+
+                        let value_type = pair.value.typ
+
+                        if !same_type(out_type, value_type) {
+                            ret invalid(function.name, "phi input and output types do not match")
                         }
+
                     }
                 }
                 _ => {
@@ -515,16 +426,13 @@ fn terminator_targets(terminator: Terminator, target: str) -> bool {
 fn validate_terminator(function: FnDirective, block_item: Block, labels: mut StringSet) -> Option[str] {
     match block_item.terminator {
         Terminator::Ret(item) => {
-            match required_type(function.name, item.value) {
-                None => {
-                    ret missing_type(function.name, item.value.name)
-                }
-                Some(value_type) => {
-                    if !same_type(value_type, function.ret_type) {
-                        ret invalid(function.name, "return type does not match function result type")
-                    }
-                }
+
+            let value_type = item.value.typ
+
+            if !same_type(value_type, function.ret_type) {
+                ret invalid(function.name, "return type does not match function result type")
             }
+
         }
         Terminator::Br(item) => {
             if !string_set_contains(labels, item.label) {
@@ -532,16 +440,13 @@ fn validate_terminator(function: FnDirective, block_item: Block, labels: mut Str
             }
         }
         Terminator::Cbr(item) => {
-            match required_type(function.name, item.cond) {
-                Some(cond_type) => {
-                    if !is_plain_named(cond_type, "bool") {
-                        ret invalid(function.name, "conditional branch condition must have type 'bool'")
-                    }
-                }
-                None => {
-                    ret missing_type(function.name, item.cond.name)
-                }
+
+            let cond_type = item.cond.typ
+
+            if !is_plain_named(cond_type, "bool") {
+                ret invalid(function.name, "conditional branch condition must have type 'bool'")
             }
+
             if !string_set_contains(labels, item.true_label) {
                 ret invalid(function.name, "branch targets unknown block '" + item.true_label + "'")
             }
@@ -550,9 +455,7 @@ fn validate_terminator(function: FnDirective, block_item: Block, labels: mut Str
             }
         }
         Terminator::Match(item) => {
-            if !has_type(item.scrutinee) {
-                ret missing_type(function.name, item.scrutinee.name)
-            }
+
             if !string_set_contains(labels, item.default_label) {
                 ret invalid(function.name, "match targets unknown block '" + item.default_label + "'")
             }
@@ -563,9 +466,7 @@ fn validate_terminator(function: FnDirective, block_item: Block, labels: mut Str
             }
         }
         Terminator::Switch(item) => {
-            if !has_type(item.scrutinee) {
-                ret missing_type(function.name, item.scrutinee.name)
-            }
+
             if !string_set_contains(labels, item.default_label) {
                 ret invalid(function.name, "switch targets unknown block '" + item.default_label + "'")
             }
@@ -581,114 +482,17 @@ fn validate_terminator(function: FnDirective, block_item: Block, labels: mut Str
     ret Option[str]::None
 }
 
-fn instruction_output(instruction: Instruction) -> Option[str] {
-    match instruction {
-        Instruction::Lcpos(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::Alias(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::Lcsos(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::Lceos(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::Call(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::Await(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::Load(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::GetField(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::GetFieldPtr(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::SGetField(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::SGetFieldPtr(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::GetPtr(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::Gep(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::PtrCast(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::StackAlloc(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::HeapAlloc(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::HeapRealloc(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::Binary(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        Instruction::Phi(item) => {
-            ret Option[str]::Some(item.out.name)
-        }
-        _ => {
-            ret Option[str]::None
-        }
-    }
-    ret Option[str]::None
-}
-
 fn validate_same_variables(function_name: str, lhs: Variable, rhs: Variable, operation: str) -> Option[str] {
-    match required_type(function_name, lhs) {
-        None => {
-            ret missing_type(function_name, lhs.name)
-        }
-        Some(lhs_type) => {
-            match required_type(function_name, rhs) {
-                None => {
-                    ret missing_type(function_name, rhs.name)
-                }
-                Some(rhs_type) => {
-                    if !same_type(lhs_type, rhs_type) {
-                        ret invalid(function_name, operation + " operand types do not match")
-                    }
-                }
-            }
-        }
+
+    let lhs_type = lhs.typ
+
+    let rhs_type = rhs.typ
+
+    if !same_type(lhs_type, rhs_type) {
+        ret invalid(function_name, operation + " operand types do not match")
     }
+
     ret Option[str]::None
-}
-
-fn required_type(function_name: str, value: Variable) -> Option[Type] {
-    match value.typ {
-        Some(typ) => {
-            ret Option[Type]::Some(typ)
-        }
-        None => {
-        }
-    }
-    ret Option[Type]::None
-}
-
-fn has_type(value: Variable) -> bool {
-    match value.typ {
-        Some(_) => {
-            ret true
-        }
-        None => {
-            ret false
-        }
-    }
-    ret false
 }
 
 fn same_value_type(lhs: Type, rhs: Type) -> bool {
@@ -895,10 +699,59 @@ fn contains(values: Vec[str], expected: str) -> bool {
     ret false
 }
 
-fn missing_type(function_name: str, value_name: str) -> Option[str] {
-    ret invalid(function_name, "value '" + value_name + "' has no resolved type")
-}
-
 fn invalid(function_name: str, message: str) -> Option[str] {
     ret Option[str]::Some("function '" + function_name + "': " + message)
+}
+
+struct ValueDefinitions {
+    index: StringIndex
+    values: Vec[Variable]
+}
+fn add_definition(table: mut ValueDefinitions, value: Variable, owner: str) -> Option[str] {
+    if value.name.is_empty() {
+        ret invalid(owner, "SSA definition name must not be empty")
+    }
+    if string_index_get(table.index, value.name) != 0_usize {
+        ret invalid(owner, "duplicate value '" + value.name + "'")
+    }
+    if value.kind != ValueKind::Ssa {
+        ret invalid(owner, "a literal cannot be an SSA definition")
+    }
+    string_index_set(table.index, value.name, table.values.len())
+    table.values.push(value)
+    ret Option[str]::None
+}
+fn validate_use(table: mut ValueDefinitions, value: Variable, owner: str) -> Option[str] {
+    if value.kind == ValueKind::Unit {
+        if value.name != "void" || !value.typ.generics.is_empty() ||
+        (!is_plain_named(value.typ, "void") && !is_plain_named(value.typ, "()")) {
+            ret invalid(owner, "invalid unit literal")
+        }
+        ret Option[str]::None
+    }
+    if value.kind == ValueKind::EnumTag {
+        if value.name.is_empty() || !is_plain_named(value.typ, "u32") {
+            ret invalid(owner, "invalid enum tag literal")
+        }
+        ret Option[str]::None
+    }
+    let position = string_index_get(table.index, value.name)
+    if position == 0_usize {
+        ret invalid(owner, "undefined SSA value: " + value.name)
+    }
+    if !same_declared_type(table.values.get_unchecked_borrowed(position - 1_usize).typ, value.typ) {
+        ret invalid(owner, "inconsistent type for SSA value: " + value.name)
+    }
+    ret Option[str]::None
+}
+fn same_declared_type(left: Type, right: Type) -> bool {
+    if left.name != right.name || left.representation != right.representation || left.generics.len() != right.generics.len() {
+        ret false
+    }
+    for index in 0_usize..left.generics.len() {
+        if !same_declared_type(left.generics.get_unchecked_borrowed(index), right.generics.get_unchecked_borrowed(index)) {
+            ret false
+        }
+    }
+    ret true
 }

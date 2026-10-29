@@ -18,6 +18,7 @@ order between sessions. Each session applies these edits cumulatively:
 |---|---|---|
 | unchanged | Build the previous state again | Previous camera result and CLI message |
 | method-body | Change the camera's yaw coefficient | Headless camera probe returns the new value |
+| function-body | Change the ordinary camera speed helper body | Headless function probe returns the new speed |
 | main-body | Change the cook usage message inside the large main function | CLI prints the new message |
 | relocate | Insert three lines before main | Both probes still return their expected results |
 | interface | Rename the camera method and update its callers | Both probes still pass |
@@ -48,6 +49,10 @@ python3 scripts/benchmark-compiler-tests.py /path/to/candidate \
   --output target/performance/graphene-incremental.json
 ```
 
+For a focused iteration, select scenarios with
+`--incremental-cases unchanged,method-body,function-body,relocate`. The report
+records the selected cases; omitted scenarios have no measured result.
+
 Already prepared caches can be copied with
 `--baseline-cache-seed /path/to/cache` and `--candidate-cache-seed /path/to/cache`.
 This saves excluded cold warm-ups.
@@ -57,7 +62,7 @@ caches. Resume is deliberately unsupported: interrupted sessions require a new
 output path and fresh edit IDs.
 
 `--verify-clean` saves the incremental output, rebuilds the candidate with an
-empty cache and target directory, executes both probes, and requires the final
+empty cache and target directory, executes all probes, and requires the final
 executable to be byte-identical. This extra build is excluded from the medians.
 
 Before interpreting performance, run the relevant type-scope, safety,
