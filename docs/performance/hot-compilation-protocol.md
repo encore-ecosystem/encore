@@ -44,16 +44,21 @@ python3 scripts/benchmark-compiler-tests.py /path/to/candidate \
   --source "$PWD" --baseline-compiler /path/to/encore-0.1.11 \
   --baseline-ref v0.1.11-neumann --scenario incremental \
   --project-root /path/to/Graphene --registry-seed /path/to/frozen-registry \
-  --profile dev --jobs auto --repetitions 5 \
+  --profile dev --jobs auto --repetitions 5 --verify-clean \
   --output target/performance/graphene-incremental.json
 ```
 
-An already prepared baseline cache can be copied with
-`--baseline-cache-seed /path/to/cache`. This saves an excluded cold warm-up.
+Already prepared caches can be copied with
+`--baseline-cache-seed /path/to/cache` and `--candidate-cache-seed /path/to/cache`.
+This saves excluded cold warm-ups.
 Use `--first-repetition` to choose edit IDs absent from that seed's history;
 the seed digest is recorded in the report. The default uses empty private
 caches. Resume is deliberately unsupported: interrupted sessions require a new
 output path and fresh edit IDs.
+
+`--verify-clean` saves the incremental output, rebuilds the candidate with an
+empty cache and target directory, executes both probes, and requires the final
+executable to be byte-identical. This extra build is excluded from the medians.
 
 Before interpreting performance, run the relevant type-scope, safety,
 function/closure replay, package-cache corruption, namespace and concurrency

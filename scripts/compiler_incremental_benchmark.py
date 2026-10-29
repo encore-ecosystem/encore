@@ -107,10 +107,10 @@ def edit(project, case, revision):
         main.write_text(text)
     elif case == "relocate":
         text = main.read_text()
-        anchor = "fn main() -> u32 {"
-        if text.count(anchor) != 1:
+        text, count = re.subn(r"(?m)^fn main\(\) -> u32 \{", "\n\n\nfn main() -> u32 {", text)
+        if count != 1:
             raise ValueError("Graphene main function anchor changed")
-        main.write_text(text.replace(anchor, "\n\n\n" + anchor))
+        main.write_text(text)
     elif case == "interface":
         text = camera.read_text()
         match = re.search(r"pub fn (look(?:_bench_\d+)?)\(self: mut Self,", text)
@@ -247,8 +247,9 @@ def run(bench, args):
         report["variants"][name] = dict(compiler_sha256=bench.digest_file(compiler),
                                         compiler_version=subprocess.check_output([str(compiler),"--version"],text=True).strip(),
                                         source_snapshot_sha256=digest)
-        if name == "baseline" and args.baseline_cache_seed:
-            seed = args.baseline_cache_seed.expanduser().resolve()
+        seed = args.baseline_cache_seed if name == "baseline" else args.candidate_cache_seed
+        if seed:
+            seed = seed.expanduser().resolve()
             shutil.copytree(seed, logs/name/"cache")
             report["variants"][name]["cache_seed_sha256"] = tree_digest(logs/name/"cache")
     save()
@@ -279,7 +280,7 @@ def run(bench, args):
         sample["built_artifact_sha256"] = bench.digest_file(root/"target"/args.profile/("graphene.exe" if os.name=="nt" else "graphene"))
         if detailed:
             sample["timings"] = json.loads(timing.read_text())
-        sample["cache_disk"] = bench.disk_usage(logs/name/"cache")
+        sample["cache_disk"] = bench.disk_usage(Path(session["env"]["ENCORE_BUILD_CACHE"]))
         sample["target_disk"] = bench.disk_usage(root/"target")
         save()
 
@@ -300,6 +301,19 @@ def run(bench, args):
                     elif case == "main-body":
                         session["message"] = f"Usage: graphene cook <project directory> [encore-bench-{repetition}]"
                     build(name,role,case,repetition,diagnostic)
+        if args.verify_clean:
+            session = sessions["candidate"]
+            root = session["project"]
+            binary = root/"target"/args.profile/("graphene.exe" if os.name=="nt" else "graphene")
+            expected = bench.digest_file(binary)
+            shutil.move(root/"target", logs/"candidate/incremental-target")
+            session["env"]["ENCORE_BUILD_CACHE"] = str(logs/"candidate/clean-cache")
+            build("candidate", "verification", "clean", repetition, True)
+            actual = bench.digest_file(binary)
+            if actual != expected:
+                raise ValueError("clean and incremental Graphene binaries differ")
+            report["clean_equivalence"] = dict(incremental_sha256=expected, clean_sha256=actual,
+                                                byte_identical=True)
     except (ValueError,OSError,subprocess.SubprocessError) as error:
         report["failed"].append(str(error));save();raise
     report["completed"] = True

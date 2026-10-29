@@ -437,6 +437,10 @@ def main():
                         help="Installed registry snapshot copied into private incremental caches")
     parser.add_argument("--baseline-cache-seed", type=Path,
                         help="Copy an existing baseline warm cache before incremental warm-up; use fresh edit IDs")
+    parser.add_argument("--candidate-cache-seed", type=Path,
+                        help="Copy an existing candidate warm cache before incremental warm-up; use fresh edit IDs")
+    parser.add_argument("--verify-clean", action="store_true",
+                        help="After incremental samples, compare the candidate with an excluded clean build")
     parser.add_argument("--jobs")
     parser.add_argument("--profile", choices=("dev", "release", "extreme"))
     parser.add_argument("--repetitions", type=int)
@@ -458,6 +462,8 @@ def main():
         parser.error("repetitions, first repetition and timeout must be positive")
     if (args.baseline_source or args.baseline_ref or args.baseline_cache_seed) and not args.baseline_compiler:
         parser.error("baseline source/ref requires --baseline-compiler")
+    if args.verify_clean and args.scenario != "incremental":
+        parser.error("--verify-clean requires --scenario incremental")
     if args.scenario == "incremental":
         from compiler_incremental_benchmark import run
         try:

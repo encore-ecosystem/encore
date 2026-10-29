@@ -75,6 +75,9 @@ class IncrementalContracts(unittest.TestCase):
             incremental.edit(root,'method-body',1)
             self.assertIn('0.00601_f32',(root/'src/editor_camera.enq').read_text())
             self.assertIn('pub fn look(',(root/'src/editor_camera.enq').read_text())
+            main=root/'src/main.enq'
+            # Graphene embeds this exact declaration in its new-script template.
+            main.write_text(main.read_text()+'\nfn template() -> str { ret "fn main() -> u32 {\\nret 0\\n}" }\n')
             before=(root/'src/main.enq').read_text()
             incremental.edit(root,'relocate',1)
             self.assertEqual((root/'src/main.enq').read_text(),'\n\n\n'+before)
@@ -135,13 +138,14 @@ class IncrementalContracts(unittest.TestCase):
             command=[sys.executable,str(SCRIPTS/'benchmark-compiler-tests.py'),str(compiler),
                      '--source',str(source),'--baseline-compiler',str(compiler),'--scenario','incremental',
                      '--project-root',str(project),'--registry-seed',str(registry),
-                     '--repetitions','2','--output',str(output)]
+                     '--repetitions','2','--verify-clean','--output',str(output)]
             environment={**os.environ,'INCREMENTAL_TRACE':str(trace)}
             before=incremental.tree_digest(project)
             result=subprocess.run(command,env=environment,text=True,capture_output=True,timeout=60)
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)
             report=json.loads(output.read_text())
             self.assertTrue(report['completed']);self.assertFalse(report['failed'])
+            self.assertTrue(report['clean_equivalence']['byte_identical'])
             self.assertEqual(report['profile'],'dev')
             self.assertEqual(incremental.tree_digest(project),before)
             measurements=[s for s in report['samples'] if s['role']=='measurement']
@@ -150,20 +154,23 @@ class IncrementalContracts(unittest.TestCase):
             self.assertEqual(measurements[12]['variant'],'candidate')
             for variant in ('baseline','candidate'):
                 rows=[json.loads(line) for line in trace.read_text().splitlines() if json.loads(line)['variant']==variant]
-                self.assertEqual([r['count'] for r in rows],list(range(19)))
-                self.assertEqual(sum(r['timings'] for r in rows),7)
+                self.assertEqual([r['count'] for r in rows],list(range(19))+([0] if variant=='candidate' else []))
+                self.assertEqual(sum(r['timings'] for r in rows),8 if variant=='candidate' else 7)
             seed=root/'baseline-cache';seed.mkdir();(seed/'counter').write_text('9')
             seeded=root/'seeded.json'
             seeded_command=command.copy();seeded_command[seeded_command.index('--output')+1]=str(seeded)
             seeded_command[seeded_command.index('--repetitions')+1]='1'
-            seeded_command += ['--baseline-cache-seed',str(seed),'--first-repetition','10']
+            seeded_command += ['--baseline-cache-seed',str(seed),'--candidate-cache-seed',str(seed),
+                               '--first-repetition','10']
             result=subprocess.run(seeded_command,env=environment,text=True,capture_output=True,timeout=60)
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)
             seeded_report=json.loads(seeded.read_text())
             self.assertTrue(seeded_report['completed'])
             self.assertIn('cache_seed_sha256',seeded_report['variants']['baseline'])
+            self.assertIn('cache_seed_sha256',seeded_report['variants']['candidate'])
             self.assertEqual((seed/'counter').read_text(),'9')
             self.assertEqual((seeded.with_suffix('.logs')/'baseline/cache/counter').read_text(),'22')
+            self.assertEqual((seeded.with_suffix('.logs')/'candidate/cache/counter').read_text(),'22')
             broken=root/'stale.json';command[command.index('--output')+1]=str(broken)
             result=subprocess.run(command,env={**environment,'INCREMENTAL_STALE':'1'},
                                   text=True,capture_output=True,timeout=60)
