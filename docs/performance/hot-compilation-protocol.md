@@ -56,6 +56,10 @@ records the selected cases; omitted scenarios have no measured result.
 Already prepared caches can be copied with
 `--baseline-cache-seed /path/to/cache` and `--candidate-cache-seed /path/to/cache`.
 This saves excluded cold warm-ups.
+With a seeded cache, the harness also performs an excluded fresh method edit:
+restoring an archive at a new workspace path does not establish that its
+fine-grained semantic records are warm. Both variants receive this priming edit
+so they start measurements with identical inputs.
 Use `--first-repetition` to choose edit IDs absent from that seed's history;
 the seed digest is recorded in the report. The default uses empty private
 caches. Resume is deliberately unsupported: interrupted sessions require a new

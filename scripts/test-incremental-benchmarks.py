@@ -188,8 +188,12 @@ class IncrementalContracts(unittest.TestCase):
             self.assertIn('cache_seed_sha256',seeded_report['variants']['baseline'])
             self.assertIn('cache_seed_sha256',seeded_report['variants']['candidate'])
             self.assertEqual((seed/'counter').read_text(),'9')
-            self.assertEqual((seeded.with_suffix('.logs')/'baseline/cache/counter').read_text(),'24')
-            self.assertEqual((seeded.with_suffix('.logs')/'candidate/cache/counter').read_text(),'24')
+            self.assertEqual((seeded.with_suffix('.logs')/'baseline/cache/counter').read_text(),'25')
+            self.assertEqual((seeded.with_suffix('.logs')/'candidate/cache/counter').read_text(),'25')
+            priming=[s for s in seeded_report['samples'] if s['role']=='priming']
+            self.assertEqual(len(priming),2)
+            self.assertTrue(all(s['repetition']==12 for s in priming))
+            self.assertEqual(len([s for s in seeded_report['samples'] if s['role']=='measurement']),14)
             focused=root/'focused.json'
             focused_command=command.copy()
             focused_command[focused_command.index('--output')+1]=str(focused)

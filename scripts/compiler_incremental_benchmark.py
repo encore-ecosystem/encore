@@ -314,6 +314,16 @@ def run(bench, args):
     try:
         for name,_,_,_ in variants:
             build(name,"warmup","initial",0,True)
+        if args.baseline_cache_seed or args.candidate_cache_seed:
+            # An archive hit after relocating a cache does not prove that its
+            # finer-grained semantic contexts are warm at their new paths.
+            # Exercise a fresh body edit before starting the measured session.
+            priming_revision = args.first_repetition + args.repetitions + 1
+            for name,_,_,_ in variants:
+                session = sessions[name]
+                edit(session["project"], "method-body", priming_revision)
+                session["coefficient"] = float(f"0.{600+priming_revision:05d}")
+                build(name, "priming", "method-body", priming_revision, True)
         for offset in range(args.repetitions+1):
             repetition = args.first_repetition + offset
             diagnostic = offset == args.repetitions
