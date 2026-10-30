@@ -1,8 +1,10 @@
 //! Borrowed results acquire ownership before a call-scoped receiver is dropped.
+import ehirlib::{Directive, Instruction, FnDirective, parse_module_text}
+import std::io::eprintln
+
 import refrain::frontend::lexer::Lexer
 import refrain::frontend::parser::Parser
 import refrain::frontend::translator::translate_to_ehir
-import std::io::eprintln
 
 fn main() -> u32 {
     let source = "struct Owner { text: str }\n" +
@@ -14,17 +16,65 @@ fn main() -> u32 {
     let mut lexer = Lexer::new()
     let mut parser = Parser::new()
     let output = translate_to_ehir(parser.parse(lexer.tokenize(source)))
-    if !output.contains("call Owner::peek(entry_ret_0_expr_invoke_0_recv_call_1)\n    retain entry_ret_0_expr_invoke_0_method_0: str\n    drop entry_ret_0_expr_invoke_0_recv_call_1: Owner") {
-        eprintln(output)
-        ret 1_u32
+    let module = parse_module_text("call-owner", output)
+    let mut dotted = false
+    let mut qualified = false
+    for declaration in module.directives {
+        match declaration {
+            Directive::Function(function) => {
+                if function.name == "dotted" || function.name.contains("__dotted") {
+                    dotted = owned_borrowed_result(function)
+                }
+                if function.name == "qualified" || function.name.contains("__qualified") {
+                    qualified = owned_borrowed_result(function)
+                }
+            }
+            _ => {
+            }
+        }
     }
-    if !output.contains("call Owner::peek(entry_ret_0_expr_arg_0_call_1)\n    retain entry_ret_0_expr_call_0: str\n    drop entry_ret_0_expr_arg_0_call_1: Owner") {
-        eprintln(output)
-        ret 2_u32
+    if !dotted || !qualified {
+        eprintln(output) ret 1_u32
     }
     // The borrowed-return definition itself must not create an extra owner.
     if output.contains("retain entry_ret_0_expr_field_0: str") {
         ret 3_u32
     }
     ret 0_u32
+}
+
+// The result needs its own retain before the temporary receiver is dropped.
+fn owned_borrowed_result(function: FnDirective) -> bool {
+    for block in function.blocks {
+        for index in 0_usize..block.instructions.len() {
+            match block.instructions.get_unchecked_borrowed(index) {
+                Instruction::Call(call) => {
+                    if call.name != "Owner::peek" || call.args.len() != 1_usize || index + 2_usize >= block.instructions.len() {
+                        continue
+                    }
+                    let receiver = call.args.get_unchecked_borrowed(0_usize)
+                    let mut retained = false
+                    let mut dropped = false
+                    match block.instructions.get_unchecked_borrowed(index + 1_usize) {
+                        Instruction::Retain(value) => {
+                            retained = value.value.name == call.out.name && value.value.typ.name == "str"
+                        }
+                        _ => {
+                        }
+                    }
+                    match block.instructions.get_unchecked_borrowed(index + 2_usize) {
+                        Instruction::Drop(value) => {
+                            dropped = value.value.name == receiver.name && value.value.typ.name == "Owner"
+                        }
+                        _ => {
+                        }
+                    }
+                    ret retained && dropped
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    ret false
 }
