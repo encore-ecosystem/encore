@@ -1,0 +1,75 @@
+//! Shared declaration signatures retain aliases, overload order and invalidation.
+import core::option::Option
+import core::testing::assert
+import std::vec::Vec
+import refrain::frontend::AnalysisDatabase
+import refrain::frontend::hir::{DefinitionKind, DefinitionNamespace, ModuleDefMap}
+import refrain::frontend::semantic_index::PackageSemanticIndex
+
+fn prepare(database: mut AnalysisDatabase, modules: Vec[str]) -> PackageSemanticIndex {
+    let identity = database.semantic_package_identity(modules)
+    database.prepare_package_semantics(modules, identity, Option[PackageSemanticIndex]::None)
+    ret database.package_semantic_index().unwrap_or(PackageSemanticIndex::empty())
+}
+fn main() -> u32 {
+    let mut database = AnalysisDatabase::new()
+    database.set_module("origin", "origin.enq", "pub struct Data {}\npub fn convert(value:u32) -> u32 { ret value }\npub fn convert(value:str) -> str { ret value }\n")
+    database.set_module("facade", "facade.enq", "pub import origin::convert as exposed\n")
+    database.set_module("left", "left.enq", "import origin::convert as chosen\nfn sample() { let number = chosen(1_u32) }\n")
+    database.set_module("right", "right.enq", "import origin::convert as chosen\nimport facade::exposed\nfn chosen(value:bool) -> bool { ret value }\nfn sample() { let local = chosen(true) let text = facade::exposed(\"ok\") }\n")
+    let modules = vec!["left", "right"]
+    let snapshot = prepare(database, modules)
+    let original_type_count = snapshot.types.len()
+    let mut original_type_keys = Vec[str]::new()
+    for typ in snapshot.types { original_type_keys.push(typ.key()) }
+    let left = match snapshot.module("left") { Some(value) => value None => { ret 1_u32 } }
+    let right = match snapshot.module("right") { Some(value) => value None => { ret 2_u32 } }
+    let mut imported = false
+    for callable in snapshot.callables_for(left) {
+        if callable.name == "chosen" {
+            imported = callable.module_name == "origin" && callable.lookup_module == "left" &&
+                callable.declaration_name == "convert" && callable.ret_type == "u32"
+        }
+    }
+    if !assert(imported) { ret 3_u32 }
+    let mut local = false
+    let mut overloads = Vec[str]::new()
+    for callable in snapshot.callables_for(right) {
+        if callable.name == "chosen" { local = callable.module_name == "right" && callable.ret_type == "bool" }
+        if callable.name == "facade::exposed" { overloads.push(callable.ret_type) }
+    }
+    if !assert(local && overloads.len() == 2_usize && overloads.get(0_usize).unwrap_or("") == "u32" &&
+        overloads.get(1_usize).unwrap_or("") == "str") { ret 4_u32 }
+    database.set_module("origin", "origin.enq", "pub struct Data {}\npub fn convert(value:u64) -> u64 { ret value }\npub fn convert(value:bool) -> bool { ret value }\n")
+    let changed = prepare(database, modules)
+    let changed_left = match changed.module("left") { Some(value) => value None => { ret 5_u32 } }
+    let mut refreshed = false
+    for callable in changed.callables_for(changed_left) { if callable.name == "chosen" { refreshed = callable.ret_type == "u64" } }
+    if !assert(refreshed) { ret 6_u32 }
+    let retained = database.module_def_map("origin").unwrap_or(ModuleDefMap::new("missing"))
+    database.remove_module("origin")
+    database.set_module("origin", "origin.enq", "pub fn replacement() -> bool { ret true }\n")
+    database.module_def_map("origin")
+    let retained_functions = retained.namespace_definitions(DefinitionNamespace::Value)
+    let mut retained_overloads = 0_usize
+    for definition in retained.all_definitions() {
+        if definition.kind() == DefinitionKind::Function && definition.name() == "convert" { retained_overloads += 1_usize }
+    }
+    if !assert(retained_functions.len() == 1_usize && retained_functions.get_unchecked_borrowed(0_usize).name() == "convert" && retained_overloads == 2_usize) { ret 10_u32 }
+    // A restored ordinal table must seed the lookup index before new types are
+    // interned. Existing ordinals and physical identities remain unchanged.
+    let mut restored = AnalysisDatabase::new()
+    restored.set_module("origin", "origin.enq", "pub struct Data {}\npub fn convert(value:u32) -> u32 { ret value }\npub fn convert(value:str) -> str { ret value }\n")
+    restored.set_module("facade", "facade.enq", "pub import origin::convert as exposed\n")
+    restored.set_module("left", "left.enq", "import origin::convert as chosen\nfn sample() { let number = chosen(1_u32) }\n")
+    restored.set_module("right", "right.enq", "import origin::convert as chosen\nimport facade::exposed\nfn chosen(value:bool) -> bool { ret value }\nfn sample() { let local = chosen(true) let text = facade::exposed(\"ok\") }\n")
+    let identity = restored.semantic_package_identity(modules)
+    if !assert(restored.prepare_package_semantics(modules, identity, Option[PackageSemanticIndex]::Some(snapshot))) { ret 7_u32 }
+    restored.set_module("extra", "extra.enq", "pub struct Data {}\n")
+    let extended = prepare(restored, vec!["left", "right", "extra"])
+    if !assert(extended.types.len() == original_type_count + 1_usize) { ret 8_u32 }
+    for index in 0_usize..original_type_count {
+        if !assert(extended.types.get_unchecked_borrowed(index).key() == original_type_keys.get_unchecked_borrowed(index)) { ret 9_u32 }
+    }
+    ret 0_u32
+}

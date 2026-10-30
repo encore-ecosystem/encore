@@ -185,6 +185,16 @@ pub struct SemanticPreparationTimings {
     replay_ms: u64
     environment_ms: u64
     input_ms: u64
+    environment_names_ms: u64
+    environment_callables_ms: u64
+    environment_fields_ms: u64
+    environment_methods_ms: u64
+    environment_variants_ms: u64
+    environment_constructors_ms: u64
+    environment_statics_ms: u64
+    environment_index_ms: u64
+    environment_type_index_ms: u64
+    environment_callable_scope_ms: u64
 }
 
 pub struct AnalysisDatabase {
@@ -196,6 +206,11 @@ pub struct AnalysisDatabase {
     field_environments: Vec[FieldEnvironmentCache]
     method_environments: Vec[MethodEnvironmentCache]
     nominal_types: Vec[TypeId]
+    nominal_type_positions: SemanticKeyIndex
+    nominal_types_indexed: usize
+    namespace_resolutions: Vec[str]
+    namespace_resolution_index: SemanticKeyIndex
+    namespace_resolution_revision: usize
     type_scopes: Vec[TypeScopeCache]
     scoped_environments: Vec[ScopedEnvironmentCache]
     safety_revision: usize
@@ -526,12 +541,16 @@ impl for AnalysisDatabase {
         ret Self {
             Vec[AnalysisSource]::new(), Vec[SemanticBodyCache]::new(), Vec[DefMapCache]::new(), 0_usize,
             Vec[ModuleImportResolution]::new(), Vec[FieldEnvironmentCache]::new(), Vec[MethodEnvironmentCache]::new(),
-            Vec[TypeId]::new(), Vec[TypeScopeCache]::new(), Vec[ScopedEnvironmentCache]::new(),
+            Vec[TypeId]::new(), SemanticKeyIndex::new(0_usize), 0_usize,
+            Vec[str]::new(), SemanticKeyIndex::new(0_usize), 0_usize,
+            Vec[TypeScopeCache]::new(), Vec[ScopedEnvironmentCache]::new(),
             0_usize, Vec[FunctionSafety]::new(), Vec[SafetyConfiguration]::new(), Vec[FunctionSafety]::new(),
             0_usize, Vec[SemanticModuleGraph]::new(), SemanticKeyIndex::new(0_usize), Vec[Vec[usize]]::new(), Vec[SemanticReachabilityCache]::new(),
             Vec[(str, ProjectConstants)]::new(), Vec[(str, usize, str)]::new(), SemanticKeyIndex::new(0_usize),
             Vec[(str, str)]::new(), SemanticKeyIndex::new(0_usize), 0_usize, Vec[(str, str)]::new(), SemanticKeyIndex::new(0_usize), Vec[str]::new(),
-            SemanticPreparationTimings { 0_u64, 0_u64, 0_u64, 0_u64 }, PackageSemanticIndex::empty(), 0_usize, false
+            SemanticPreparationTimings { 0_u64, 0_u64, 0_u64, 0_u64,
+                0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64,
+                0_u64, 0_u64 }, PackageSemanticIndex::empty(), 0_usize, false
         }
     }
 
@@ -1412,15 +1431,9 @@ impl for AnalysisDatabase {
         let interface_fingerprint = self.module_interface_fingerprint_value(module_name)
         let mut cache_index = 0_usize
         while cache_index < self.def_maps.len() {
-            match self.def_maps.get(cache_index) {
-                Option[DefMapCache]::Some(cached) => {
-                    if cached.valid && cached.module_name == module_name && cached.interface_fingerprint == interface_fingerprint
-                    {
-                        ret Option[ModuleDefMap]::Some(cached.result)
-                    }
-                }
-                Option[DefMapCache]::None => {
-                }
+            let cached = self.def_maps.get_unchecked_borrowed(cache_index)
+            if cached.valid && cached.module_name == module_name && cached.interface_fingerprint == interface_fingerprint {
+                ret Option[ModuleDefMap]::Some(cached.result)
             }
             cache_index += 1_usize
         }
@@ -1700,20 +1713,14 @@ impl for AnalysisDatabase {
     }
 
     fn module_interface_fingerprint_value(self: Self, module_name: str) -> u64 {
-        for source in self.sources {
-            if source.module_name == module_name {
-                ret source.interface_fingerprint
-            }
-        }
+        let position = self.source_position(module_name)
+        if position < self.sources.len() { ret self.sources.get_unchecked_borrowed(position).interface_fingerprint }
         ret 0_u64
     }
 
     fn module_source_name(self: Self, module_name: str) -> str {
-        for source in self.sources {
-            if source.module_name == module_name {
-                ret source.source_name
-            }
-        }
+        let position = self.source_position(module_name)
+        if position < self.sources.len() { ret self.sources.get_unchecked_borrowed(position).source_name }
         ret ""
     }
 
@@ -2465,6 +2472,7 @@ impl for AnalysisDatabase {
                 if self.semantic_snapshot_matches(snapshot, modules, identity) {
                     if self.nominal_types.is_empty() {
                         self.nominal_types = snapshot.types
+                        self.nominal_types_indexed = 0_usize
                         self.package_semantics = snapshot
                         self.package_semantics_revision = self.revision
                         self.package_semantics_reused = true
@@ -2490,8 +2498,10 @@ impl for AnalysisDatabase {
         for module_name in modules {
             let context = self.semantic_replay_context(module_name)
             let environment = self.scoped_environment(module_name)
+            let index_started = perf_counter_ms()
             builder.include(module_name, context, StoredSemanticEnvironment { environment.callables, environment.fields,
                 environment.methods, environment.aggregates, environment.constructors, environment.variants, self.semantic_type_names(module_name) })
+            self.preparation_timings.environment_index_ms += perf_counter_ms() - index_started
         }
         self.package_semantics = builder.finish(self.nominal_types)
         self.package_semantics_revision = self.revision
@@ -3119,14 +3129,22 @@ impl for AnalysisDatabase {
     }
 
     fn intern_nominal_type(self: mut Self, typ: TypeId) -> str {
-        let mut index = 0_usize
-        for existing in self.nominal_types {
-            if existing.key() == typ.key() {
-                ret "@" + Debug::fmt(index)
+        // Snapshots and replay can install/append an ordinal table directly.
+        // Rebuild only when that table has changed; preserve its exact order.
+        if self.nominal_types_indexed != self.nominal_types.len() {
+            let mut positions = SemanticKeyIndex::new(self.nominal_types.len())
+            for index in 0_usize..self.nominal_types.len() {
+                positions.set(self.nominal_types.get_unchecked_borrowed(index).key(), index)
             }
-            index += 1_usize
+            self.nominal_type_positions = positions
+            self.nominal_types_indexed = self.nominal_types.len()
         }
+        let position = self.nominal_type_positions.get(typ.key())
+        if position != 0_usize { ret "@" + Debug::fmt(position - 1_usize) }
+        let index = self.nominal_types.len()
         self.nominal_types.push(typ)
+        self.nominal_type_positions.set(typ.key(), index)
+        self.nominal_types_indexed = self.nominal_types.len()
         ret "@" + Debug::fmt(index)
     }
 
@@ -3169,11 +3187,13 @@ impl for AnalysisDatabase {
         // Body checking must use those same declarations' nominal identities,
         // rather than leaving unimported Vec/Option/etc. as bare spellings.
         // One fallback namespace avoids copying the prelude into every scope.
-        for source in self.sources {
-            if source.module_name != "core" && !starts_with(source.module_name, "core::") {
-                continue
-            }
-            match self.module_def_map(source.module_name) {
+        let mut prelude_modules = Vec[str]::new()
+        for position in 0_usize..self.sources.len() {
+            let name = self.sources.get_unchecked_borrowed(position).module_name
+            if name == "core" || starts_with(name, "core::") { prelude_modules.push(name) }
+        }
+        for name in prelude_modules {
+            match self.module_def_map(name) {
                 Some(map) => {
                     let mut definitions = map.namespace_definitions(DefinitionNamespace::Type)
                     definitions.extend(map.namespace_definitions(DefinitionNamespace::Trait))
@@ -3227,11 +3247,19 @@ impl for AnalysisDatabase {
             }
             slot += 1_usize
         }
+        let names_started = perf_counter_ms()
         let names = self.semantic_type_names(module_name)
+        let type_index_started = perf_counter_ms()
         let type_index = type_scope_index(names)
-        let mut callables = self.scoped_callables(self.visible_semantic_callables(module_name), type_index)
+        let callables_started = perf_counter_ms()
+        let visible_callables = self.visible_semantic_callables(module_name)
+        let callable_scope_started = perf_counter_ms()
+        let mut callables = self.scoped_callables(visible_callables, type_index)
+        let fields_started = perf_counter_ms()
         let fields = self.scoped_fields(self.visible_semantic_fields(module_name), type_index)
+        let methods_started = perf_counter_ms()
         let methods = self.scoped_methods(self.visible_semantic_methods(module_name), type_index)
+        let variants_started = perf_counter_ms()
         let mut aggregates = Vec[str]::new()
         let mut constructors = Vec[str]::new()
         let mut variants = Vec[SemanticVariant]::new()
@@ -3270,6 +3298,7 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        let constructors_started = perf_counter_ms()
         for binding in names {
             if !contains_string(aggregates, binding.identity) {
                 aggregates.push(binding.identity)
@@ -3280,6 +3309,7 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        let statics_started = perf_counter_ms()
         // Resolve inferred static values in their declaration's type scope.
         // Constructor return types may differ from the parser's owner hint.
         for index in 0_usize..callables.len() {
@@ -3304,6 +3334,15 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        self.preparation_timings.environment_names_ms += callables_started - names_started
+        self.preparation_timings.environment_callables_ms += fields_started - callables_started
+        self.preparation_timings.environment_fields_ms += methods_started - fields_started
+        self.preparation_timings.environment_methods_ms += variants_started - methods_started
+        self.preparation_timings.environment_variants_ms += constructors_started - variants_started
+        self.preparation_timings.environment_constructors_ms += statics_started - constructors_started
+        self.preparation_timings.environment_statics_ms += perf_counter_ms() - statics_started
+        self.preparation_timings.environment_type_index_ms += callables_started - type_index_started
+        self.preparation_timings.environment_callable_scope_ms += fields_started - callable_scope_started
         let cached = ScopedEnvironmentCache {
             module_name, self.revision, callables, fields, methods, aggregates, constructors, variants
         }
@@ -3440,6 +3479,24 @@ impl for AnalysisDatabase {
     }
 
     fn imported_namespace(self: mut Self, scope: str, requested: str) -> str {
+        if self.namespace_resolution_revision != self.revision {
+            self.namespace_resolutions = Vec[str]::new()
+            self.namespace_resolution_index = SemanticKeyIndex::new(0_usize)
+            self.namespace_resolution_revision = self.revision
+        }
+        // Associated calls such as Vec::new and Vec::with_capacity repeatedly
+        // ask about the same missing module namespace. Cache misses as well as
+        // aliases, scoped by caller and by the complete database revision.
+        let key = Debug::fmt(scope.byte_len()) + ":" + scope + requested
+        let position = self.namespace_resolution_index.get(key)
+        if position != 0_usize { ret self.namespace_resolutions.get_unchecked_borrowed(position - 1_usize) }
+        let resolved = self.resolve_imported_namespace(scope, requested)
+        self.namespace_resolution_index.set(key, self.namespace_resolutions.len())
+        self.namespace_resolutions.push(resolved)
+        ret resolved
+    }
+
+    fn resolve_imported_namespace(self: mut Self, scope: str, requested: str) -> str {
         self.ensure_semantic_graph()
         let document = self.document(scope).unwrap_or(FrontendDocument::empty())
         for statement in document.ast {

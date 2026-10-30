@@ -1,0 +1,57 @@
+import core::fmt::Debug
+import core::option::Option
+import std::io::println
+import std::os::env
+import std::path::Path
+import std::time::perf_counter_ms
+import std::vec::Vec
+import json::{Json, stringify}
+import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::semantic_index::PackageSemanticIndex
+import refrain::project::workspace::load_library_workspace
+import refrain::target::host_target
+
+fn main() -> u32 {
+    let root = env("ENCORE_ENV_BENCH_PROJECT").unwrap_or("")
+    if root.is_empty() { ret 0_u32 }
+    let started = perf_counter_ms()
+    let mut workspace = load_library_workspace(Path::new(root))
+    let loaded = perf_counter_ms()
+    let all = env("ENCORE_ENV_BENCH_ALL").unwrap_or("") == "1"
+    let mut selected = Vec[str]::new()
+    let mut ordinal = 0_usize
+    for module in workspace.modules {
+        if module.owner_name != workspace.root_name { continue }
+        let take = all || (ordinal % 8_usize == 0_usize && selected.len() < 32_usize)
+        ordinal += 1_usize
+        if take {
+            selected.push(module.analysis_id.key())
+            workspace.analysis.configure_safety(module.analysis_id.key(), host_target(), module.enabled_features)
+        }
+    }
+    if selected.is_empty() { println("benchmark selected no root modules") ret 2_u32 }
+    let identity = workspace.analysis.semantic_package_identity(selected)
+    let preparation_started = perf_counter_ms()
+    workspace.analysis.prepare_package_semantics(selected, identity, Option[PackageSemanticIndex]::None)
+    let preparation_finished = perf_counter_ms()
+    let timings = workspace.analysis.semantic_preparation_timings()
+    let snapshot = workspace.analysis.package_semantic_index().unwrap_or(PackageSemanticIndex::empty())
+    let encoded = match snapshot.encode() { Ok(value) => value Err(error) => { println(error) ret 1_u32 } }
+    println(stringify(Json::Object(vec![
+        ("workspace_ms", Json::Number(Debug::fmt(loaded - started))),
+        ("prepare_ms", Json::Number(Debug::fmt(preparation_finished - preparation_started))),
+        ("modules", Json::Number(Debug::fmt(selected.len()))),
+        ("types", Json::Number(Debug::fmt(snapshot.types.len()))),
+        ("environment_ms", Json::Number(Debug::fmt(timings.environment_ms))),
+        ("names_ms", Json::Number(Debug::fmt(timings.environment_names_ms))),
+        ("callables_ms", Json::Number(Debug::fmt(timings.environment_callables_ms))),
+        ("fields_ms", Json::Number(Debug::fmt(timings.environment_fields_ms))),
+        ("methods_ms", Json::Number(Debug::fmt(timings.environment_methods_ms))),
+        ("variants_ms", Json::Number(Debug::fmt(timings.environment_variants_ms))),
+        ("constructors_ms", Json::Number(Debug::fmt(timings.environment_constructors_ms))),
+        ("statics_ms", Json::Number(Debug::fmt(timings.environment_statics_ms))),
+        ("index_ms", Json::Number(Debug::fmt(timings.environment_index_ms))),
+        ("snapshot_sha256", Json::String(compiler_content_digest(encoded)))
+    ])))
+    ret 0_u32
+}
