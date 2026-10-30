@@ -1,16 +1,16 @@
 //! Package-wide immutable declarations and ordered module selections.
 import refrain::frontend::semantic_rebind::{valid_semantic_type,rebind_semantic_callable, rebind_semantic_field, rebind_semantic_method, rebind_semantic_variant, rebind_semantic_name, rebind_semantic_strings}
-import core::fmt::Debug
 import core::option::Option
 import core::result::Result
 import std::vec::Vec
 import binary
-import json::{Json, stringify}
+import json::Json
 import ehirlib::{prepared_bytes_payload, prepared_payload_bytes}
 import refrain::frontend::hir::TypeId
 import refrain::frontend::semantic::{SemanticCallable, SemanticField, SemanticMethod, SemanticVariant}
-import refrain::frontend::semantic_environment::{StoredSemanticEnvironment, encode_callable, encode_field, encode_method, encode_variant}
+import refrain::frontend::semantic_environment::{StoredSemanticEnvironment}
 import refrain::frontend::semantic_slice::{SemanticSlice, SemanticKeyIndex}
+import refrain::frontend::semantic_record_index::{SemanticRecord, SemanticRecordIndex, RecordHash, same_record_strings}
 import refrain::frontend::type_scope::TypeNameBinding
 
 pub struct ModuleSemanticView {
@@ -57,12 +57,12 @@ pub struct PackageSemanticIndex {
 }
 pub struct SemanticIndexBuilder {
     index: PackageSemanticIndex
-    declarations: SemanticKeyIndex
-    bindings: SemanticKeyIndex
-    fields: SemanticKeyIndex
-    methods: SemanticKeyIndex
-    variants: SemanticKeyIndex
-    names: SemanticKeyIndex
+    declarations: SemanticRecordIndex[SemanticCallable]
+    bindings: SemanticRecordIndex[CallableBinding]
+    fields: SemanticRecordIndex[SemanticField]
+    methods: SemanticRecordIndex[SemanticMethod]
+    variants: SemanticRecordIndex[SemanticVariant]
+    names: SemanticRecordIndex[TypeNameBinding]
 }
 
 fn valid_selection(values: Vec[usize], length: usize) -> bool {
@@ -170,65 +170,43 @@ impl for SemanticIndexBuilder {
     pub fn new(identity: str) -> Self {
         let mut index = PackageSemanticIndex::empty()
         index.identity = identity
-        ret Self { index, SemanticKeyIndex::new(64_usize), SemanticKeyIndex::new(64_usize), SemanticKeyIndex::new(64_usize),
-            SemanticKeyIndex::new(64_usize), SemanticKeyIndex::new(64_usize), SemanticKeyIndex::new(64_usize) }
+        ret Self { index, SemanticRecordIndex[SemanticCallable]::new(), SemanticRecordIndex[CallableBinding]::new(),
+            SemanticRecordIndex[SemanticField]::new(), SemanticRecordIndex[SemanticMethod]::new(),
+            SemanticRecordIndex[SemanticVariant]::new(), SemanticRecordIndex[TypeNameBinding]::new() }
     }
     pub fn include(self: mut Self, module_name: str, context: str, environment: StoredSemanticEnvironment) -> () {
         let mut callables = Vec[usize]::with_capacity(environment.callables.len())
         for value in environment.callables {
             let declaration = value.in_scope(value.declaration_name, value.module_name, 0_u64)
-            let key = stringify(encode_callable(declaration))
-            let mut ordinal = self.declarations.get(key)
-            if ordinal == 0_usize {
-                ordinal = self.index.declarations.len() + 1_usize
-                self.declarations.set(key, ordinal - 1_usize)
-                self.index.declarations.push(declaration)
+            let ordinal = self.declarations.intern(declaration)
+            let before = self.bindings.len()
+            let binding = self.bindings.intern(CallableBinding { ordinal, value.name, value.lookup_module, value.binding_identity })
+            if binding == before {
+                let canonical = self.declarations.get_unchecked_borrowed(ordinal)
+                self.index.callables.push(canonical.in_scope(value.name, value.lookup_module, value.binding_identity))
             }
-            let binding_key = stringify(Json::Array(vec![Json::String(Debug::fmt(ordinal)), Json::String(value.name),
-                Json::String(value.lookup_module), Json::String(Debug::fmt(value.binding_identity))]))
-            let mut binding = self.bindings.get(binding_key)
-            if binding == 0_usize {
-                binding = self.index.bindings.len() + 1_usize
-                self.bindings.set(binding_key, binding - 1_usize)
-                self.index.bindings.push(CallableBinding { ordinal - 1_usize, value.name, value.lookup_module, value.binding_identity })
-                self.index.callables.push(self.index.declarations.get_unchecked_borrowed(ordinal - 1_usize).in_scope(value.name, value.lookup_module, value.binding_identity))
-            }
-            callables.push(binding - 1_usize)
+            callables.push(binding)
         }
         let mut fields = Vec[usize]::with_capacity(environment.fields.len())
-        for value in environment.fields {
-            let key = stringify(encode_field(value))
-            let mut ordinal = self.fields.get(key)
-            if ordinal == 0_usize { ordinal = self.index.fields.len() + 1_usize self.fields.set(key, ordinal - 1_usize) self.index.fields.push(value) }
-            fields.push(ordinal - 1_usize)
-        }
+        for value in environment.fields { fields.push(self.fields.intern(value)) }
         let mut methods = Vec[usize]::with_capacity(environment.methods.len())
-        for value in environment.methods {
-            let key = stringify(encode_method(value))
-            let mut ordinal = self.methods.get(key)
-            if ordinal == 0_usize { ordinal = self.index.methods.len() + 1_usize self.methods.set(key, ordinal - 1_usize) self.index.methods.push(value) }
-            methods.push(ordinal - 1_usize)
-        }
+        for value in environment.methods { methods.push(self.methods.intern(value)) }
         let mut variants = Vec[usize]::with_capacity(environment.variants.len())
-        for value in environment.variants {
-            let key = stringify(encode_variant(value))
-            let mut ordinal = self.variants.get(key)
-            if ordinal == 0_usize { ordinal = self.index.variants.len() + 1_usize self.variants.set(key, ordinal - 1_usize) self.index.variants.push(value) }
-            variants.push(ordinal - 1_usize)
-        }
+        for value in environment.variants { variants.push(self.variants.intern(value)) }
         let mut names = Vec[usize]::with_capacity(environment.names.len())
-        for value in environment.names {
-            let key = stringify(Json::Array(vec![Json::String(value.scope), Json::String(value.name), Json::String(value.identity), Json::String(value.display), Json::String(value.declaration)]))
-            let mut ordinal = self.names.get(key)
-            if ordinal == 0_usize { ordinal = self.index.names.len() + 1_usize self.names.set(key, ordinal - 1_usize) self.index.names.push(value) }
-            names.push(ordinal - 1_usize)
-        }
+        for value in environment.names { names.push(self.names.intern(value)) }
         self.index.module_positions.set(module_name, self.index.modules.len())
         self.index.modules.push(ModuleSemanticView { module_name, context, callables, fields, methods, variants, names, environment.aggregates, environment.constructors })
     }
     pub fn finish(self: Self, types: Vec[TypeId]) -> PackageSemanticIndex {
         let mut index = self.index
         index.types = types
+        index.declarations = self.declarations.values()
+        index.bindings = self.bindings.values()
+        index.fields = self.fields.values()
+        index.methods = self.methods.values()
+        index.variants = self.variants.values()
+        index.names = self.names.values()
         ret index
     }
 }
@@ -251,4 +229,137 @@ pub fn decode_semantic_module(payload: str) -> Result[SemanticModuleRecord, str]
     }
     if record.schema != 1_u32 || record.index.is_empty() { ret Result::Err("invalid semantic module schema") }
     ret Result::Ok(record)
+}
+
+// Match every field of the former JSON keys; signatures and hashes alone are
+// never sufficient to merge records. These helpers are construction-only.
+impl SemanticRecord for SemanticCallable {
+    pub fn record_hash(self: Self) -> u64 {
+        let mut hash = RecordHash::new()
+        hash.text(self.module_name)
+        hash.text(self.name)
+        hash.strings(self.params)
+        hash.text(self.ret_type)
+        hash.integer(self.signature)
+        hash.text(self.declaration_name)
+        hash.text(self.lookup_module)
+        hash.integer(self.binding_identity)
+        hash.strings(self.generic_names)
+        hash.flag(self.is_static)
+        ret hash.finish()
+    }
+    pub fn same_record(self: Self, other: Self) -> bool {
+        ret self.module_name == other.module_name &&
+            self.name == other.name &&
+            same_record_strings(self.params, other.params) &&
+            self.ret_type == other.ret_type &&
+            self.signature == other.signature &&
+            self.declaration_name == other.declaration_name &&
+            self.lookup_module == other.lookup_module &&
+            self.binding_identity == other.binding_identity &&
+            same_record_strings(self.generic_names, other.generic_names) &&
+            self.is_static == other.is_static
+    }
+}
+impl SemanticRecord for CallableBinding {
+    pub fn record_hash(self: Self) -> u64 {
+        let mut hash = RecordHash::new()
+        hash.integer(self.declaration as u64)
+        hash.text(self.name)
+        hash.text(self.lookup_module)
+        hash.integer(self.identity)
+        ret hash.finish()
+    }
+    pub fn same_record(self: Self, other: Self) -> bool {
+        ret self.declaration == other.declaration &&
+            self.name == other.name &&
+            self.lookup_module == other.lookup_module &&
+            self.identity == other.identity
+    }
+}
+impl SemanticRecord for SemanticField {
+    pub fn record_hash(self: Self) -> u64 {
+        let mut hash = RecordHash::new()
+        hash.text(self.module_name)
+        hash.text(self.owner_type)
+        hash.text(self.name)
+        hash.text(self.typ)
+        hash.integer(self.signature)
+        hash.strings(self.generic_names)
+        hash.text(self.declaration_owner)
+        ret hash.finish()
+    }
+    pub fn same_record(self: Self, other: Self) -> bool {
+        ret self.module_name == other.module_name &&
+            self.owner_type == other.owner_type &&
+            self.name == other.name &&
+            self.typ == other.typ &&
+            self.signature == other.signature &&
+            same_record_strings(self.generic_names, other.generic_names) &&
+            self.declaration_owner == other.declaration_owner
+    }
+}
+impl SemanticRecord for SemanticMethod {
+    pub fn record_hash(self: Self) -> u64 {
+        let mut hash = RecordHash::new()
+        hash.text(self.module_name)
+        hash.text(self.receiver_type)
+        hash.text(self.name)
+        hash.strings(self.params)
+        hash.text(self.ret_type)
+        hash.integer(self.signature)
+        hash.text(self.declaration_receiver)
+        hash.strings(self.generic_names)
+        hash.flag(self.is_static)
+        hash.flag(self.is_public)
+        hash.strings(self.method_generic_names)
+        ret hash.finish()
+    }
+    pub fn same_record(self: Self, other: Self) -> bool {
+        ret self.module_name == other.module_name &&
+            self.receiver_type == other.receiver_type &&
+            self.name == other.name &&
+            same_record_strings(self.params, other.params) &&
+            self.ret_type == other.ret_type &&
+            self.signature == other.signature &&
+            self.declaration_receiver == other.declaration_receiver &&
+            same_record_strings(self.generic_names, other.generic_names) &&
+            self.is_static == other.is_static &&
+            self.is_public == other.is_public &&
+            same_record_strings(self.method_generic_names, other.method_generic_names)
+    }
+}
+impl SemanticRecord for SemanticVariant {
+    pub fn record_hash(self: Self) -> u64 {
+        let mut hash = RecordHash::new()
+        hash.text(self.owner_type)
+        hash.text(self.name)
+        hash.text(self.payload_type)
+        hash.strings(self.generic_names)
+        ret hash.finish()
+    }
+    pub fn same_record(self: Self, other: Self) -> bool {
+        ret self.owner_type == other.owner_type &&
+            self.name == other.name &&
+            self.payload_type == other.payload_type &&
+            same_record_strings(self.generic_names, other.generic_names)
+    }
+}
+impl SemanticRecord for TypeNameBinding {
+    pub fn record_hash(self: Self) -> u64 {
+        let mut hash = RecordHash::new()
+        hash.text(self.scope)
+        hash.text(self.name)
+        hash.text(self.identity)
+        hash.text(self.display)
+        hash.text(self.declaration)
+        ret hash.finish()
+    }
+    pub fn same_record(self: Self, other: Self) -> bool {
+        ret self.scope == other.scope &&
+            self.name == other.name &&
+            self.identity == other.identity &&
+            self.display == other.display &&
+            self.declaration == other.declaration
+    }
 }

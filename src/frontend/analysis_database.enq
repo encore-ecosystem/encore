@@ -195,6 +195,14 @@ pub struct SemanticPreparationTimings {
     environment_index_ms: u64
     environment_type_index_ms: u64
     environment_callable_scope_ms: u64
+    callable_defmap_ms: u64
+    callable_collect_ms: u64
+    callable_bind_ms: u64
+    callable_qualified_ms: u64
+    method_collect_ms: u64
+    method_visibility_ms: u64
+    method_inheritance_ms: u64
+    method_scope_ms: u64
 }
 
 pub struct AnalysisDatabase {
@@ -550,7 +558,8 @@ impl for AnalysisDatabase {
             Vec[(str, str)]::new(), SemanticKeyIndex::new(0_usize), 0_usize, Vec[(str, str)]::new(), SemanticKeyIndex::new(0_usize), Vec[str]::new(),
             SemanticPreparationTimings { 0_u64, 0_u64, 0_u64, 0_u64,
                 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64,
-                0_u64, 0_u64 }, PackageSemanticIndex::empty(), 0_usize, false
+                0_u64, 0_u64,
+                0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64 }, PackageSemanticIndex::empty(), 0_usize, false
         }
     }
 
@@ -3258,8 +3267,11 @@ impl for AnalysisDatabase {
         let fields_started = perf_counter_ms()
         let fields = self.scoped_fields(self.visible_semantic_fields(module_name), type_index)
         let methods_started = perf_counter_ms()
-        let methods = self.scoped_methods(self.visible_semantic_methods(module_name), type_index)
+        let visible_methods = self.visible_semantic_methods(module_name)
+        let method_scope_started = perf_counter_ms()
+        let methods = self.scoped_methods(visible_methods, type_index)
         let variants_started = perf_counter_ms()
+        self.preparation_timings.method_scope_ms += variants_started - method_scope_started
         let mut aggregates = Vec[str]::new()
         let mut constructors = Vec[str]::new()
         let mut variants = Vec[SemanticVariant]::new()
@@ -3514,8 +3526,32 @@ impl for AnalysisDatabase {
                             }
                         }
                     }
-                    for source in self.semantic_graph {
-                        let expanded = import_namespace_target(path, source.module_name, requested)
+                    let mut candidates = Vec[usize]::new()
+                    match import_paths::namespace_import_candidates(path) {
+                        Some(targets) => {
+                            for target in targets {
+                                let position = self.semantic_graph_index.get(target)
+                                if position != 0_usize { candidates.push(position - 1_usize) }
+                            }
+                        }
+                        None => {
+                            for position in 0_usize..self.semantic_graph.len() { candidates.push(position) }
+                        }
+                    }
+                    // Preserve graph order, including duplicate aliases in a
+                    // grouped import: candidate spelling order is not priority.
+                    for index in 1_usize..candidates.len() {
+                        let mut cursor = index
+                        while cursor > 0_usize && candidates.get_unchecked_borrowed(cursor) < candidates.get_unchecked_borrowed(cursor - 1_usize) {
+                            let previous = candidates.get_unchecked_borrowed(cursor - 1_usize)
+                            candidates.set(cursor - 1_usize, candidates.get_unchecked_borrowed(cursor))
+                            candidates.set(cursor, previous)
+                            cursor -= 1_usize
+                        }
+                    }
+                    for position in candidates {
+                        let target = self.semantic_graph.get_unchecked_borrowed(position).module_name
+                        let expanded = import_namespace_target(path, target, requested)
                         if expanded != "" {
                             ret self.resolved_import_target(scope, expanded)
                         }
@@ -4248,6 +4284,7 @@ impl for AnalysisDatabase {
     }
 
     fn visible_semantic_callables(self: mut Self, module_name: str) -> Vec[SemanticCallable] {
+        let started = perf_counter_ms()
         let mut out = Vec[SemanticCallable]::new()
         let map = match self.module_def_map(module_name) {
             Some(value) => value
@@ -4255,6 +4292,7 @@ impl for AnalysisDatabase {
                 ret out
             }
         }
+        let collect_started = perf_counter_ms()
         let definitions = map.all_definitions()
         let origins = encore_strset_new()
         let selected = encore_strmap_new()
@@ -4298,6 +4336,7 @@ impl for AnalysisDatabase {
             }
             encore_strmap_free(ordinals)
         }
+        let bind_started = perf_counter_ms()
         index = 0_usize
         for definition in definitions {
             index += 1_usize
@@ -4316,6 +4355,7 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        let qualified_started = perf_counter_ms()
         // Qualified names keep their source spelling while retaining the actual
         // declaration identity, including aliases and public re-exports.
         let caller = self.document(module_name).unwrap_or(FrontendDocument::empty())
@@ -4362,6 +4402,10 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        self.preparation_timings.callable_defmap_ms += collect_started - started
+        self.preparation_timings.callable_collect_ms += bind_started - collect_started
+        self.preparation_timings.callable_bind_ms += qualified_started - bind_started
+        self.preparation_timings.callable_qualified_ms += perf_counter_ms() - qualified_started
         encore_strset_free(origins)
         encore_strset_free(local_names)
         encore_strmap_free(selected)
@@ -4474,7 +4518,7 @@ impl for AnalysisDatabase {
         }
         ret values
     }
-    fn semantic_trait_owner(self: mut Self, scope: str, owner: str, names: Vec[TypeNameBinding], generics: Vec[str]) -> str {
+    fn semantic_trait_owner(self: mut Self, scope: str, owner: str, index: TypeScopeIndex, generics: Vec[str]) -> str {
         if contains_string_value(owner, "::") {
             match self.qualified_definition(scope, owner, DefinitionNamespace::Trait) {
                 Some(definition) => {
@@ -4484,16 +4528,18 @@ impl for AnalysisDatabase {
                 }
             }
         }
-        ret scope_type(owner, scope, names, generics)
+        ret scope_type_indexed(owner, scope, index, generics)
     }
 
     fn collect_semantic_methods(self: mut Self, module_name: str) -> Vec[SemanticMethod] {
+        let started = perf_counter_ms()
         let mut out = Vec[SemanticMethod]::new()
         let mut trait_edges = Vec[(str, str, Vec[str])]::new()
         let mut contracts = Vec[(str, str)]::new()
         let mut contract_edges = Vec[(str, str)]::new()
         let mut visibility = Vec[(usize, bool, str)]::new()
         let names = self.semantic_type_names(module_name)
+        let type_index = type_scope_index(names)
         // Inherent methods belong to their receiver type, not to the lexical
         // import scope of the call site. Once a type is reachable, its impl
         // methods must remain discoverable even when the type flowed through
@@ -4507,6 +4553,13 @@ impl for AnalysisDatabase {
             for statement in document.ast {
                 match statement {
                     Statement::Impl(item) => {
+                        let generics = declaration_generic_names(item.generics)
+                        let contract = if item.methods.is_empty() { "" } else {
+                            match item.trait_name {
+                                Some(owner) => self.semantic_trait_owner(visible, owner, type_index, generics)
+                                None => ""
+                            }
+                        }
                         for method in item.methods {
                             let is_static = !function_has_receiver(method)
                             let mut params = Vec[str]::new()
@@ -4519,20 +4572,16 @@ impl for AnalysisDatabase {
                             }
                             out.push(SemanticMethod::new(visible, item.target, method.name, params, semantic_call_return_type(method)).with_generics(declaration_generic_names(item.generics)).with_method_generics(declaration_generic_names(method.generics)).with_static(is_static)
                             )
-                            let contract = match item.trait_name {
-                                Some(owner) => self.semantic_trait_owner(visible, owner, names, declaration_generic_names(item.generics))
-                                None => ""
-                            }
                             visibility.push((out.len() - 1_usize, method.is_public, contract))
                         }
                     }
                     Statement::Trait(item) => {
-                        let owner = scope_type(item.name, visible, names, declaration_generic_names(item.generics))
+                        let owner = scope_type_indexed(item.name, visible, type_index, declaration_generic_names(item.generics))
                         for method in item.methods {
                             contracts.push((owner, method.name))
                         }
                         for base in item.bases {
-                            contract_edges.push((owner, scope_type(base, visible, names, declaration_generic_names(item.generics))))
+                            contract_edges.push((owner, scope_type_indexed(base, visible, type_index, declaration_generic_names(item.generics))))
                             trait_edges.push((trait_receiver_type(item.name, item.generics), "dyn " + base, declaration_generic_names(item.generics)))
                         }
                         for method in item.methods {
@@ -4556,8 +4605,8 @@ impl for AnalysisDatabase {
                                 }
                                 if error_type != "" {
                                     let binders = declaration_generic_names(item.generics)
-                                    let interface = scope_type(trait_receiver_type(item.name, item.generics), visible, names_in_scope(names, visible), binders)
-                                    let result = scope_type(semantic_call_return_type(method), visible, names_in_scope(names, visible), binders)
+                                    let interface = scope_type_indexed(trait_receiver_type(item.name, item.generics), visible, type_index, binders)
+                                    let result = scope_type_indexed(semantic_call_return_type(method), visible, type_index, binders)
                                     for binding in names {
                                         if binding.scope == "platform::plugin" &&(binding.name == "Binding" || binding.name == "Resource") {
                                             let proxy = SemanticMethod::new(visible, binding.identity + "[" + interface + "]", method.name,
@@ -4578,16 +4627,20 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        let visibility_started = perf_counter_ms()
         for entry in visibility {
             match out.get(entry.0) {
                 Some(method) => {
                     let is_public = entry.1 || trait_contract_has_member(contracts, contract_edges, entry.2, method.name)
-                    out.set(entry.0, method.with_visibility(is_public))
+                    // Most methods are already public. Replacing an identical
+                    // record still rewrites all graph edges in the vector.
+                    if !is_public || !method.is_public { out.set(entry.0, method.with_visibility(is_public)) }
                 }
                 None => {
                 }
             }
         }
+        let inheritance_started = perf_counter_ms()
         // Close the reachable inheritance graph without reparsing every pair
         // of modules. Existing child declarations win; cycles reach a fixed point.
         let mut changed = true
@@ -4623,6 +4676,9 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        self.preparation_timings.method_collect_ms += visibility_started - started
+        self.preparation_timings.method_visibility_ms += inheritance_started - visibility_started
+        self.preparation_timings.method_inheritance_ms += perf_counter_ms() - inheritance_started
         encore_strset_free(inherited_names)
         ret out
     }
