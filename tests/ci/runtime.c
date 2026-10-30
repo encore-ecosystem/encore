@@ -29,6 +29,7 @@ static void encore_ci_native_crash(int signal_number, siginfo_t *info,
                                     void *raw_context) {
     ucontext_t *context = raw_context;
     encore_ci_write_address("CI native signal: ", 18, (uintptr_t)signal_number);
+    encore_ci_write_address("fault code: ", 12, (uintptr_t)info->si_code);
     encore_ci_write_address("fault address: ", 15, (uintptr_t)info->si_addr);
     encore_ci_write_address("pc: ", 4, (uintptr_t)context->uc_mcontext->__ss.__pc);
     encore_ci_write_address("lr: ", 4, (uintptr_t)context->uc_mcontext->__ss.__lr);
