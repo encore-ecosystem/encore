@@ -537,6 +537,29 @@ struct TranslationImportCache {
     index: usize
     texts: Vec[str]
     bindings: Vec[Option[FunctionType]]
+    exports: Vec[TranslationExportSyntax]
+    export_bindings: Vec[usize]
+    module_ids: Vec[str]
+    module_sources: Vec[str]
+}
+
+// Export lookup never needs function bodies. Retaining only syntax summaries
+// also avoids repeatedly creating owning roots into the entire module AST.
+struct TranslationExportSyntax {
+    module_id: str
+    functions: Vec[(str, bool)]
+    edges: Vec[TranslationExportEdge]
+    source_name: str
+    types: Vec[(str, bool)]
+    traits: Vec[str]
+    paths: Vec[(str, bool)]
+    targets: Vec[usize]
+    imports: Vec[str]
+}
+
+struct TranslationExportEdge {
+    target: usize
+    bindings: Vec[(str, str, bool)]
 }
 
 struct TranslatorContext {
@@ -1120,6 +1143,7 @@ fn translate_module_chunk(ctx: mut TranslatorContext, module: TranslationModule,
 fn qualify_module_type_collisions(ctx: mut TranslatorContext, module: TranslationModule, text: str)
 -> str {
     let mut out = text
+    let module_position = translation_module_position(ctx, module)
     let index = unsafe {
         encore_compiler_identity_index_new(text, ctx.type_collisions.as_ptr() as usize, ctx.type_collisions.len())
     }
@@ -1128,7 +1152,7 @@ fn qualify_module_type_collisions(ctx: mut TranslatorContext, module: Translatio
             encore_compiler_identity_index_contains(index, name)
         }
         && contains_substring(out, name) {
-            let replacement = resolved_type_collision(ctx, module, name)
+            let replacement = resolved_type_collision(ctx, module_position, name)
             if replacement != "" {
                 // Enum tags, field names and generic binders are not nominal
                 // type references, including in flattened standalone tests.
@@ -1154,83 +1178,57 @@ fn qualify_module_type_collisions(ctx: mut TranslatorContext, module: Translatio
 // Keep this cache context-local: identical spellings in another module, or a
 // later translation, must resolve independently. Zero denotes a cache miss;
 // an empty/ambiguous resolution is cached as an ordinary vector entry.
-fn resolved_type_collision(ctx: mut TranslatorContext,
-    module: TranslationModule, name: str,) -> str {
-    // Generic binders can temporarily hide nominal collision candidates.
-    // Preserve the existing lexical resolution in those scopes rather than
-    // reusing an identity computed outside the binder.
-    if ctx.type_collisions.len() != ctx.type_identity_scope_size {
-        ret resolve_type_collision_uncached(ctx, module, name)
-    }
+fn translation_module_position(ctx: mut TranslatorContext, module: TranslationModule) -> usize {
+    let position = lookup_module_source_alias(ctx.module_index, module.source_name)
+    if position != 0_usize { ret position - 1_usize }
+    let position = lookup_module_source_alias(ctx.module_index, module.module_id)
+    if position != 0_usize { ret position - 1_usize }
+    translation_invariant_error("nominal lookup module is absent from the translation context")
+    ret 0_usize
+}
+
+fn nominal_lookup_cache_enabled(ctx: mut TranslatorContext) -> bool {
+    if ctx.type_collisions.len() != ctx.type_identity_scope_size { ret false }
     for parameter in ctx.active_generics {
-        if contains_str(ctx.type_collisions, parameter.name) {
-            ret resolve_type_collision_uncached(ctx, module, name)
-        }
+        if contains_str(ctx.type_collisions, parameter.name) { ret false }
     }
-    let key = module.module_id + "\n" + name
-    let cached = unsafe {
-        encore_strmap_get(ctx.type_identity_cache, key)
-    }
-    if cached != 0 {
-        ret ctx.type_identity_values.get_unchecked_borrowed(cached - 1)
-    }
+    ret true
+}
+
+fn resolved_type_collision(ctx: mut TranslatorContext, module: usize, name: str) -> str {
+    if !nominal_lookup_cache_enabled(ctx) { ret resolve_type_collision_uncached(ctx, module, name) }
+    let key = Debug::fmt(module) + ":" + name
+    let cached = unsafe { encore_strmap_get(ctx.type_identity_cache, key) }
+    if cached != 0_usize { ret ctx.type_identity_values.get_unchecked_borrowed(cached - 1_usize) }
     let identity = resolve_type_collision_uncached(ctx, module, name)
     ctx.type_identity_values.push(identity)
-    unsafe {
-        encore_strmap_put(ctx.type_identity_cache, key, ctx.type_identity_values.len())
-    }
+    unsafe { encore_strmap_put(ctx.type_identity_cache, key, ctx.type_identity_values.len()) }
     ret identity
 }
-fn resolve_type_collision_uncached(ctx: mut TranslatorContext,
-    module: TranslationModule, name: str,) -> str {
-    // A local import spelling is not a declaration name. Resolve it through
-    // the selected export before asking which module declares the nominal type.
-    // This also follows public aliases through facade modules.
+fn resolve_type_collision_uncached(ctx: mut TranslatorContext, module: usize, name: str) -> str {
+    let syntax = cached_export_syntax(ctx, module)
     if !cached_module_declares_type(ctx, module, name) {
         let mut imported = ""
-        for candidate in ctx.modules {
-            if !contains_str(module.imports, candidate.module_id) {
-                continue
-            }
-            let target = cached_module_import_path(ctx, candidate.module_id)
-            for statement in module.ast {
-                match statement {
-                    Statement::Import(item) => {
-                        let path = translation_import_target(module, item.path)
-                        if !starts_with(path, target + "::") {
-                            continue
-                        }
-                        for binding in import_binding_names(path, target) {
-                            if binding.1 != name {
-                                continue
-                            }
-                            let identity = exported_type_identity(ctx, candidate, binding.0, 0_usize)
-                            if identity != "" {
-                                if imported != "" && imported != identity {
-                                    ret ""
-                                }
-                                imported = identity
-                            }
-                        }
-                    }
-                    _ => {
+        for target_position in syntax.targets {
+            let target_id = module_id_at(ctx, target_position)
+            let target = cached_module_import_path(ctx, target_id)
+            for path in syntax.paths {
+                if !starts_with(path.0, target + "::") { continue }
+                for binding in import_binding_names(path.0, target) {
+                    if binding.1 != name { continue }
+                    let identity = exported_type_identity(ctx, target_position, binding.0, 0_usize)
+                    if identity != "" {
+                        if imported != "" && imported != identity { ret "" }
+                        imported = identity
                     }
                 }
             }
         }
-        if imported != "" {
-            ret imported
-        }
+        if imported != "" { ret imported }
     }
     let owner = resolve_type_declaration_module(ctx, module, name)
-    if ctx.stable_abi && intrinsic_type_owner(owner, name) {
-        ret name
-    }
-    ret if owner == "" {
-        ""
-    } else {
-        "__encore_t" + encode_module_identity(owner) + "__" + name
-    }
+    if ctx.stable_abi && intrinsic_type_owner(owner, name) { ret name }
+    ret if owner == "" { "" } else { "__encore_t" + encode_module_identity(owner) + "__" + name }
 }
 
 // These declarations have a compiler/runtime ABI rather than a package-local
@@ -1259,25 +1257,17 @@ fn declaration_type_name(statement: Statement) -> str {
     ret ""
 }
 
-fn cached_module_declares_type(ctx: mut TranslatorContext, module: TranslationModule, name: str) -> bool {
-    let key = "declares-type\n" + module.module_id + "\n" + name
-    let encoded = unsafe {
-        encore_strmap_get(ctx.imports.index, key)
+fn cached_module_declares_type(ctx: mut TranslatorContext, module: usize, name: str) -> bool {
+    let key = "declares-type:" + Debug::fmt(module) + ":" + name
+    let encoded = unsafe { encore_strmap_get(ctx.imports.index, key) }
+    if encoded != 0_usize { ret encoded == 1_usize }
+    let syntax = cached_export_syntax(ctx, module)
+    let mut found = false
+    for declaration in syntax.types {
+        if declaration.0 == name { found = true break }
     }
-    if encoded != 0 {
-        ret encoded == 1
-    }
-    let result = module_declares_type(module, name)
-    unsafe {
-        encore_strmap_put(ctx.imports.index, key, if result {
-                1
-            } else {
-                2
-            }
-            ,
-        )
-    }
-    ret result
+    unsafe { encore_strmap_put(ctx.imports.index, key, if found { 1_usize } else { 2_usize }) }
+    ret found
 }
 
 fn module_declares_type(module: TranslationModule, name: str) -> bool {
@@ -1374,50 +1364,32 @@ fn build_type_collision_names(modules: Vec[TranslationModule], stable_abi: bool)
     ret collisions
 }
 
-fn resolve_type_declaration_module(ctx: mut TranslatorContext, current: TranslationModule, name: str)
--> str {
-    if cached_module_declares_type(ctx, current, name) {
-        ret current.module_id
-    }
-
+fn resolve_type_declaration_module(ctx: mut TranslatorContext, current: usize, name: str) -> str {
+    let syntax = cached_export_syntax(ctx, current)
+    if cached_module_declares_type(ctx, current, name) { ret syntax.module_id }
     let mut direct = ""
-    for candidate in ctx.modules {
-        if candidate.module_id != current.module_id &&
-        contains_str(current.imports, candidate.module_id) {
-            match direct_import_allows(ctx, current.source_name, candidate.module_id, name) {
-                Some(allowed) => {
-                    if allowed {
-                        let owner = exported_type_owner(ctx, candidate, name, 0_usize)
-                        if owner == "" {
-                            continue
-                        }
-                        if direct != "" && direct != owner {
-                            ret ""
-                        }
-                        direct = owner
-                    }
-                }
-                _ => {
+    for candidate in syntax.targets {
+        if module_id_at(ctx, candidate) == syntax.module_id { continue }
+        match direct_import_allows(ctx, syntax.source_name, module_id_at(ctx, candidate), name) {
+            Some(allowed) => {
+                if allowed {
+                    let owner = exported_type_owner(ctx, candidate, name, 0_usize)
+                    if owner == "" { continue }
+                    if direct != "" && direct != owner { ret "" }
+                    direct = owner
                 }
             }
+            _ => {}
         }
     }
-    if direct != "" {
-        ret direct
-    }
-
+    if direct != "" { ret direct }
     let mut visible = ""
-    for candidate in ctx.modules {
-        if candidate.module_id != current.module_id && cached_module_declares_type(ctx, candidate, name) &&
-        unsafe {
-            encore_strset_contains(ctx.visibility_index,
-                current.module_id + "\n" + candidate.module_id,)
-        }
-        {
-            if visible != "" && visible != candidate.module_id {
-                ret ""
-            }
-            visible = candidate.module_id
+    for candidate in 0_usize..ctx.modules.len() {
+        let candidate_id = module_id_at(ctx, candidate)
+        if candidate_id != syntax.module_id && cached_module_declares_type(ctx, candidate, name) &&
+            unsafe { encore_strset_contains(ctx.visibility_index, syntax.module_id + "\n" + candidate_id) } {
+            if visible != "" && visible != candidate_id { ret "" }
+            visible = candidate_id
         }
     }
     ret visible
@@ -1425,55 +1397,31 @@ fn resolve_type_declaration_module(ctx: mut TranslatorContext, current: Translat
 
 // A selected import from a facade belongs to its public declaration, not to
 // every same-named type reachable through the facade's private dependencies.
-fn exported_type_owner(ctx: mut TranslatorContext, module: TranslationModule,
-    name: str, depth: usize,) -> str {
-    if depth > ctx.modules.len() {
-        ret ""
-    }
-    for statement in module.ast {
-        match statement {
-            Statement::Struct(item) => {
-                if item.name == name && item.is_public {
-                    ret module.module_id
-                }
-            }
-            Statement::EnumItem(item) => {
-                if item.name == name && item.is_public {
-                    ret module.module_id
-                }
-            }
-            Statement::Trait(item) => {
-                if item.name == name && item.is_public {
-                    ret module.module_id
-                }
-            }
-            _ => {
-            }
-        }
+fn exported_type_owner(ctx: mut TranslatorContext, module: usize, name: str, depth: usize) -> str {
+    if depth > ctx.modules.len() { ret "" }
+    let key = "export-type-owner:" + Debug::fmt(module) + ":" + Debug::fmt(depth) + ":" + name
+    let encoded = unsafe { encore_strmap_get(ctx.imports.index, key) }
+    if encoded != 0_usize { ret ctx.imports.texts.get_unchecked_borrowed(encoded - 1_usize) }
+    let result = resolve_exported_type_owner(ctx, module, name, depth)
+    ctx.imports.texts.push(result)
+    unsafe { encore_strmap_put(ctx.imports.index, key, ctx.imports.texts.len()) }
+    ret result
+}
+
+fn resolve_exported_type_owner(ctx: mut TranslatorContext, module: usize, name: str, depth: usize) -> str {
+    let syntax = cached_export_syntax(ctx, module)
+    for declaration in syntax.types {
+        if declaration.0 == name && declaration.1 { ret syntax.module_id }
     }
     let mut owner = ""
-    for candidate in ctx.modules {
-        if !contains_str(module.imports, candidate.module_id) {
-            continue
-        }
-        for statement in module.ast {
-            match statement {
-                Statement::Import(item) => {
-                    if !item.is_public {
-                        continue
-                    }
-                    let path = translation_import_target(module, item.path)
-                    if import_path_allows(path, cached_module_import_path(ctx, candidate.module_id), name) {
-                        let found = exported_type_owner(ctx, candidate, name, depth + 1_usize)
-                        if found != "" {
-                            if owner != "" && owner != found {
-                                ret ""
-                            }
-                            owner = found
-                        }
-                    }
-                }
-                _ => {
+    for candidate in syntax.targets {
+        let target = cached_module_import_path(ctx, module_id_at(ctx, candidate))
+        for path in syntax.paths {
+            if path.1 && import_path_allows(path.0, target, name) {
+                let found = exported_type_owner(ctx, candidate, name, depth + 1_usize)
+                if found != "" {
+                    if owner != "" && owner != found { ret "" }
+                    owner = found
                 }
             }
         }
@@ -1784,7 +1732,8 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
             unsafe {
                 encore_strmap_new()
             }
-            , Vec[str]::new(), Vec[Option[FunctionType]]::new()
+            , Vec[str]::new(), Vec[Option[FunctionType]]::new(),
+            Vec[TranslationExportSyntax]::new(), Vec[usize]::new(), Vec[str]::new(), Vec[str]::new()
         }
         , Vec[usize]::new(), "", "", 0, LoweringScope::new(Vec[Parameter]::new()), Vec[GeneratedDeclaration]::new()
     }
@@ -2101,108 +2050,95 @@ fn index_function_import_aliases(ctx: mut TranslatorContext) ->() {
     // Bind every explicitly selected import, including its unaliased spelling,
     // to the declaration's overload chain. A transitively imported generic
     // template cannot displace this lexical binding with its private helper.
-    for module in ctx.modules {
-        for statement in module.ast {
-            match statement {
-                Statement::Import(item) => {
-                    let path = translation_import_target(module, item.path)
-                    for target_id in module.imports {
-                        let target = cached_module_import_path(ctx, target_id)
-                        if !starts_with(path, target + "::") {
-                            continue
+    for module_position in 0_usize..ctx.modules.len() {
+        let module = cached_export_syntax(ctx, module_position)
+        for import_path in module.paths {
+            let path = import_path.0
+            for target_id in module.imports {
+                let target = cached_module_import_path(ctx, target_id)
+                if !starts_with(path, target + "::") {
+                    continue
+                }
+                for binding in import_binding_names(path, target) {
+                    if binding.0 == "*" {
+                        continue
+                    }
+                    let mut local = false
+                    for function in module.functions {
+                        if function.0 == binding.1 { local = true }
+                    }
+                    if local && !binding.2 {
+                        continue
+                    }
+                    let mut encoded = unsafe {
+                        encore_strmap_get(ctx.function_heads, binding.0)
+                    }
+                    let mut best = 0_usize
+                    let mut best_priority = 0_usize
+                    while encoded > 0 {
+                        let index = encoded - 1
+                        match ctx.functions.get(index) {
+                            Some(function) => {
+                                let actual_owner = module_identity_for_source(ctx, function.source_name)
+                                let mut priority = if actual_owner == target_id {
+                                    2_usize
+                                } else {
+                                    0_usize
+                                }
+                                if priority == 0 {
+                                    for target_position in 0_usize..ctx.modules.len() {
+                                        if module_id_at(ctx, target_position) == target_id && function_visible_from(ctx,
+                                            module_source_at(ctx, target_position), function.source_name, function.name,) {
+                                            priority = 1
+                                        }
+                                    }
+                                }
+                                if function.name == binding.0 && priority > best_priority {
+                                    best = encoded
+                                    best_priority = priority
+                                }
+                            }
+                            None => {
+                            }
                         }
-                        for binding in import_binding_names(path, target) {
-                            if binding.0 == "*" {
+                        encoded = ctx.function_next.get(index).unwrap_or(0)
+                    }
+                    if best == 0_usize {
+                        for target_position in 0_usize..ctx.modules.len() {
+                            if module_id_at(ctx, target_position) != target_id {
                                 continue
                             }
-                            let mut local = false
-                            for declaration in module.ast {
-                                match declaration {
-                                    Statement::Function(function) => {
-                                        if function.name == binding.1 {
-                                            local = true
-                                        }
+                            match exported_function_binding(ctx, target_position, binding.0, 0_usize) {
+                                Some(bound) => {
+                                    let mut candidate = unsafe {
+                                        encore_strmap_get(ctx.function_heads, bound.name)
                                     }
-                                    _ => {
-                                    }
-                                }
-                            }
-                            if local && !binding.2 {
-                                continue
-                            }
-                            let mut encoded = unsafe {
-                                encore_strmap_get(ctx.function_heads, binding.0)
-                            }
-                            let mut best = 0_usize
-                            let mut best_priority = 0_usize
-                            while encoded > 0 {
-                                let index = encoded - 1
-                                match ctx.functions.get(index) {
-                                    Some(function) => {
-                                        let actual_owner = module_identity_for_source(ctx, function.source_name)
-                                        let mut priority = if actual_owner == target_id {
-                                            2_usize
-                                        } else {
-                                            0_usize
-                                        }
-                                        if priority == 0 {
-                                            for target_module in ctx.modules {
-                                                if target_module.module_id == target_id && function_visible_from(ctx,
-                                                    target_module.source_name, function.source_name, function.name,) {
-                                                    priority = 1
+                                    while candidate > 0_usize {
+                                        match ctx.functions.get(candidate - 1_usize) {
+                                            Some(function) => {
+                                                if function.source_name == bound.source_name && function.name == bound.name {
+                                                    best = candidate break
                                                 }
                                             }
-                                        }
-                                        if function.name == binding.0 && priority > best_priority {
-                                            best = encoded
-                                            best_priority = priority
-                                        }
-                                    }
-                                    None => {
-                                    }
-                                }
-                                encoded = ctx.function_next.get(index).unwrap_or(0)
-                            }
-                            if best == 0_usize {
-                                for target_module in ctx.modules {
-                                    if target_module.module_id != target_id {
-                                        continue
-                                    }
-                                    match exported_function_binding(ctx, target_module, binding.0, 0_usize) {
-                                        Some(bound) => {
-                                            let mut candidate = unsafe {
-                                                encore_strmap_get(ctx.function_heads, bound.name)
-                                            }
-                                            while candidate > 0_usize {
-                                                match ctx.functions.get(candidate - 1_usize) {
-                                                    Some(function) => {
-                                                        if function.source_name == bound.source_name && function.name == bound.name {
-                                                            best = candidate break
-                                                        }
-                                                    }
-                                                    None => {
-                                                    }
-                                                }
-                                                candidate = ctx.function_next.get(candidate - 1_usize).unwrap_or(0_usize)
+                                            None => {
                                             }
                                         }
-                                        None => {
-                                        }
+                                        candidate = ctx.function_next.get(candidate - 1_usize).unwrap_or(0_usize)
                                     }
                                 }
-                            }
-                            if best > 0 {
-                                unsafe {
-                                    encore_strmap_put(ctx.function_heads,
-                                        function_import_alias_key(module.source_name, binding.1), best,)
-                                    encore_strmap_put(ctx.function_heads,
-                                        function_import_alias_key(module.module_id, binding.1), best,)
+                                None => {
                                 }
                             }
                         }
                     }
-                }
-                _ => {
+                    if best > 0 {
+                        unsafe {
+                            encore_strmap_put(ctx.function_heads,
+                                function_import_alias_key(module.source_name, binding.1), best,)
+                            encore_strmap_put(ctx.function_heads,
+                                function_import_alias_key(module.module_id, binding.1), best,)
+                        }
+                    }
                 }
             }
         }
@@ -2210,84 +2146,101 @@ fn index_function_import_aliases(ctx: mut TranslatorContext) ->() {
 }
 // Resolve public module exports to a declaration before choosing its overload.
 // Lookup spelling and defining ABI identity remain distinct across facades.
-fn exported_function_binding(ctx: mut TranslatorContext, module: TranslationModule,
-    name: str, depth: usize,) -> Option[FunctionType] {
-    if depth > ctx.modules.len() {
-        ret Option[FunctionType]::None
+fn cached_export_syntax(ctx: mut TranslatorContext, module_position: usize) -> TranslationExportSyntax {
+    let key = "export-syntax:" + Debug::fmt(module_position)
+    let position = unsafe { encore_strmap_get(ctx.imports.index, key) }
+    if position != 0_usize {
+        ret ctx.imports.exports.get_unchecked_borrowed(position - 1_usize)
     }
+    let module = ctx.modules.get_unchecked_borrowed(module_position)
+    let mut functions = Vec[(str, bool)]::new()
+    let mut types = Vec[(str, bool)]::new()
+    let mut traits = Vec[str]::new()
+    let mut paths = Vec[(str, bool)]::new()
     for statement in module.ast {
         match statement {
-            Statement::Function(item) => {
-                if item.name != name {
-                    continue
-                }
-                if !item.is_public {
-                    ret Option[FunctionType]::None
-                }
-                let mut encoded = unsafe {
-                    encore_strmap_get(ctx.function_heads, name)
-                }
-                while encoded > 0_usize {
-                    let function = ctx.functions.get(encoded - 1_usize)
-                    match function {
-                        Some(value) => {
-                            if value.name == name && module_identity_for_source(ctx, value.source_name) == module.module_id {
-                                ret Option[FunctionType]::Some(value)
-                            }
-                        }
-                        None => {
-                        }
-                    }
-                    encoded = ctx.function_next.get(encoded - 1_usize).unwrap_or(0_usize)
-                }
-            }
-            _ => {
+            Statement::Function(item) => { functions.push((item.name, item.is_public)) }
+            Statement::Struct(item) => { types.push((item.name, item.is_public)) }
+            Statement::EnumItem(item) => { types.push((item.name, item.is_public)) }
+            Statement::Trait(item) => { types.push((item.name, item.is_public)) traits.push(item.name) }
+            Statement::Import(item) => { paths.push((translation_import_target(module, item.path), item.is_public)) }
+            _ => {}
+        }
+    }
+    let mut edges = Vec[TranslationExportEdge]::new()
+    let mut targets = Vec[usize]::new()
+    // Preserve module and import order, including duplicate module identities.
+    for target in 0_usize..ctx.modules.len() {
+        let target_id = module_id_at(ctx, target)
+        if !contains_str(module.imports, target_id) { continue }
+        targets.push(target)
+        let target_path = cached_module_import_path(ctx, target_id)
+        for path in paths {
+            if path.1 && starts_with(path.0, target_path + "::") {
+                edges.push(TranslationExportEdge { target, import_binding_names(path.0, target_path) })
             }
         }
     }
-    let mut found = Option[FunctionType]::None
-    for target in ctx.modules {
-        if !contains_str(module.imports, target.module_id) {
-            continue
-        }
-        let target_path = cached_module_import_path(ctx, target.module_id)
-        for statement in module.ast {
-            match statement {
-                Statement::Import(item) => {
-                    let path = translation_import_target(module, item.path)
-                    if !item.is_public || !starts_with(path, target_path + "::") {
-                        continue
-                    }
-                    for binding in import_binding_names(path, target_path) {
-                        if binding.1 != name && binding.0 != "*" {
-                            continue
-                        }
-                        let original = if binding.0 == "*" {
-                            name
-                        } else {
-                            binding.0
-                        }
-                        match exported_function_binding(ctx, target, original, depth + 1_usize) {
-                            Some(value) => {
-                                match found {
-                                    Some(previous) => {
-                                        if previous.source_name != value.source_name || previous.name != value.name {
-                                            ret Option[FunctionType]::None
-                                        }
-                                    }
-                                    None => {
-                                    }
-                                }
-                                found = Option[FunctionType]::Some(value)
-                            }
-                            None => {
-                            }
-                        }
-                    }
-                }
-                _ => {
-                }
+    let result = TranslationExportSyntax { module.module_id, functions, edges,
+        module.source_name, types, traits, paths, targets, module.imports }
+    ctx.imports.exports.push(result)
+    unsafe { encore_strmap_put(ctx.imports.index, key, ctx.imports.exports.len()) }
+    ret result
+}
+
+fn exported_function_binding(ctx: mut TranslatorContext, module_position: usize,
+    name: str, depth: usize,) -> Option[FunctionType] {
+    let encoded = exported_function_ordinal(ctx, module_position, name, depth)
+    if encoded == 0_usize { ret Option[FunctionType]::None }
+    // Store ordinals rather than snapshots: static return-type inference may
+    // update an existing declaration without growing the function table.
+    ret ctx.functions.get(encoded - 1_usize)
+}
+
+fn exported_function_ordinal(ctx: mut TranslatorContext, module_position: usize,
+    name: str, depth: usize,) -> usize {
+    if depth > ctx.modules.len() { ret 0_usize }
+    // A facade can be reached through many wildcard paths, including cycles.
+    // Depth is part of the key to preserve the bounded resolver's ambiguity
+    // semantics. Function growth invalidates both positive and negative hits.
+    let key = "export-binding:" + Debug::fmt(ctx.functions.len()) + ":" + Debug::fmt(depth) + ":" +
+        Debug::fmt(module_position) + ":" + name
+    let position = unsafe { encore_strmap_get(ctx.imports.index, key) }
+    if position != 0_usize { ret ctx.imports.export_bindings.get_unchecked_borrowed(position - 1_usize) }
+    let result = resolve_exported_function_ordinal(ctx, module_position, name, depth)
+    ctx.imports.export_bindings.push(result)
+    unsafe { encore_strmap_put(ctx.imports.index, key, ctx.imports.export_bindings.len()) }
+    ret result
+}
+
+fn resolve_exported_function_ordinal(ctx: mut TranslatorContext, module_position: usize,
+    name: str, depth: usize,) -> usize {
+    let syntax = cached_export_syntax(ctx, module_position)
+    for declaration in syntax.functions {
+        if declaration.0 != name { continue }
+        if !declaration.1 { ret 0_usize }
+        let mut encoded = unsafe { encore_strmap_get(ctx.function_heads, name) }
+        while encoded > 0_usize {
+            let value = ctx.functions.get_unchecked_borrowed(encoded - 1_usize)
+            if value.name == name && module_identity_for_source(ctx, value.source_name) == syntax.module_id {
+                ret encoded
             }
+            encoded = ctx.function_next.get(encoded - 1_usize).unwrap_or(0_usize)
+        }
+    }
+    let mut found = 0_usize
+    for edge in syntax.edges {
+        for binding in edge.bindings {
+            if binding.1 != name && binding.0 != "*" { continue }
+            let original = if binding.0 == "*" { name } else { binding.0 }
+            let candidate = exported_function_ordinal(ctx, edge.target, original, depth + 1_usize)
+            if candidate == 0_usize { continue }
+            if found != 0_usize {
+                let previous = ctx.functions.get_unchecked_borrowed(found - 1_usize)
+                let value = ctx.functions.get_unchecked_borrowed(candidate - 1_usize)
+                if previous.source_name != value.source_name || previous.name != value.name { ret 0_usize }
+            }
+            found = candidate
         }
     }
     ret found
@@ -2320,9 +2273,10 @@ fn resolve_function_import_alias(ctx: mut TranslatorContext, source_name: str, n
     if scope < base.len() {
         let owner = imported_namespace_path(ctx, source_name, base.slice(0_usize, scope))
         let member = base.slice(scope + 2_usize, base.len() - scope - 2_usize)
-        for module in ctx.modules {
-            if cached_module_import_path(ctx, module.module_id) == owner {
-                ret exported_function_binding(ctx, module, member, 0_usize)
+        for module_position in 0_usize..ctx.modules.len() {
+            let module_id = module_id_at(ctx, module_position)
+            if cached_module_import_path(ctx, module_id) == owner {
+                ret exported_function_binding(ctx, module_position, member, 0_usize)
             }
         }
     }
@@ -2513,12 +2467,7 @@ fn qualified_type_for_source_uncached(ctx: mut TranslatorContext, source_name: s
     if encoded == 0_usize {
         ret canonical_type(normalized)
     }
-    let current = match ctx.modules.get(encoded - 1_usize) {
-        Some(module) => module
-        None => {
-            ret canonical_type(normalized)
-        }
-    }
+    let current = encoded - 1_usize
     let mut out = canonical_type(normalized)
     for name in ctx.type_collisions {
         if contains_str(generic_param_names(ctx.active_generics), name) {
@@ -2577,8 +2526,9 @@ fn trait_identity_for_source(ctx: mut TranslatorContext, source_name: str, name:
     if separator < name.len() {
         let namespace = imported_namespace_path(ctx, source_name, name.slice(0_usize, separator))
         let leaf = name.slice(separator + 2_usize, name.len() - separator - 2_usize)
-        for module in ctx.modules {
-            if cached_module_import_path(ctx, module.module_id) == namespace {
+        for module in 0_usize..ctx.modules.len() {
+            let module_id = module_id_at(ctx, module)
+            if cached_module_import_path(ctx, module_id) == namespace {
                 let identity = exported_type_identity(ctx, module, leaf, 0_usize)
                 if identity != "" {
                     ret identity
@@ -3080,40 +3030,34 @@ fn ctx_add_function(ctx: mut TranslatorContext, source_name: str, name: str, ret
 
 fn source_declares_trait(ctx: mut TranslatorContext, source_name: str, name: str) -> bool {
     let encoded = lookup_module_source_alias(ctx.module_index, source_name)
-    if encoded == 0_usize {
-        ret false
-    }
-    match ctx.modules.get(encoded - 1_usize) {
-        Some(module) => {
-            for statement in module.ast {
-                match statement {
-                    Statement::Trait(item) => {
-                        if trait_identity_for_source(ctx, source_name, item.name) == name {
-                            ret true
-                        }
-                    }
-                    _ => {
-                    }
-                }
-            }
-        }
-        None => {
-        }
+    if encoded == 0_usize { ret false }
+    let syntax = cached_export_syntax(ctx, encoded - 1_usize)
+    for trait_name in syntax.traits {
+        if trait_identity_for_source(ctx, source_name, trait_name) == name { ret true }
     }
     ret false
 }
 
+fn prepare_module_labels(ctx: mut TranslatorContext) ->() {
+    if ctx.imports.module_ids.len() == ctx.modules.len() { ret() }
+    let mut ids = Vec[str]::with_capacity(ctx.modules.len())
+    let mut sources = Vec[str]::with_capacity(ctx.modules.len())
+    for module in ctx.modules { ids.push(module.module_id) sources.push(module.source_name) }
+    ctx.imports.module_ids = ids
+    ctx.imports.module_sources = sources
+}
+fn module_id_at(ctx: mut TranslatorContext, position: usize) -> str {
+    prepare_module_labels(ctx)
+    ret ctx.imports.module_ids.get_unchecked_borrowed(position)
+}
+fn module_source_at(ctx: mut TranslatorContext, position: usize) -> str {
+    prepare_module_labels(ctx)
+    ret ctx.imports.module_sources.get_unchecked_borrowed(position)
+}
+
 fn module_identity_for_source(ctx: mut TranslatorContext, source_name: str) -> str {
     let encoded = lookup_module_source_alias(ctx.module_index, source_name)
-    if encoded > 0_usize {
-        match ctx.modules.get(encoded - 1_usize) {
-            Some(module) => {
-                ret module.module_id
-            }
-            None => {
-            }
-        }
-    }
+    if encoded > 0_usize { ret module_id_at(ctx, encoded - 1_usize) }
     ret canonical_source_identity(source_name)
 }
 
@@ -3153,8 +3097,9 @@ fn qualified_callable_name(ctx: mut TranslatorContext, source_name: str, name: s
     if scope < owner.byte_len() {
         let requested_module = imported_namespace_path(ctx, source_name, owner.slice_bytes(0, scope))
         let requested_type = owner.slice_bytes(scope + 2, owner.byte_len() - scope - 2)
-        for module in ctx.modules {
-            if cached_module_import_path(ctx, module.module_id) == requested_module {
+        for module in 0_usize..ctx.modules.len() {
+            let module_id = module_id_at(ctx, module)
+            if cached_module_import_path(ctx, module_id) == requested_module {
                 let resolved = exported_type_identity(ctx, module, base_type_name(requested_type), 0)
                 if resolved != "" {
                     let args = generic_args_from_path(requested_type)
@@ -3178,61 +3123,36 @@ fn qualified_callable_name(ctx: mut TranslatorContext, source_name: str, name: s
 }
 // Follow public re-exports to the declaration, including renamed exports.
 // A facade path is a lookup spelling, never the implementation's ABI name.
-fn exported_type_identity(ctx: mut TranslatorContext, module: TranslationModule,
-    name: str, depth: usize,) -> str {
-    if depth > ctx.modules.len() {
-        ret ""
-    }
-    for statement in module.ast {
-        let mut public_type = false
-        match statement {
-            Statement::Struct(item) => {
-                public_type = item.is_public && item.name == name
-            }
-            Statement::EnumItem(item) => {
-                public_type = item.is_public && item.name == name
-            }
-            Statement::Trait(item) => {
-                public_type = item.is_public && item.name == name
-            }
-            _ => {
-            }
-        }
-        if public_type {
-            ret qualified_type_for_source(ctx, module.source_name, name)
-        }
+fn exported_type_identity(ctx: mut TranslatorContext, module: usize, name: str, depth: usize) -> str {
+    if depth > ctx.modules.len() { ret "" }
+    if !nominal_lookup_cache_enabled(ctx) { ret resolve_exported_type_identity(ctx, module, name, depth) }
+    let key = "export-type-identity:" + Debug::fmt(module) + ":" + Debug::fmt(depth) + ":" + name
+    let encoded = unsafe { encore_strmap_get(ctx.imports.index, key) }
+    if encoded != 0_usize { ret ctx.imports.texts.get_unchecked_borrowed(encoded - 1_usize) }
+    let result = resolve_exported_type_identity(ctx, module, name, depth)
+    ctx.imports.texts.push(result)
+    unsafe { encore_strmap_put(ctx.imports.index, key, ctx.imports.texts.len()) }
+    ret result
+}
+
+fn resolve_exported_type_identity(ctx: mut TranslatorContext, module: usize, name: str, depth: usize) -> str {
+    let syntax = cached_export_syntax(ctx, module)
+    for declaration in syntax.types {
+        if declaration.0 == name && declaration.1 { ret qualified_type_for_source(ctx, syntax.source_name, name) }
     }
     let mut found = ""
-    for candidate in ctx.modules {
-        if !contains_str(module.imports, candidate.module_id) {
-            continue
-        }
-        let target = cached_module_import_path(ctx, candidate.module_id)
-        for statement in module.ast {
-            match statement {
-                Statement::Import(item) => {
-                    let path = translation_import_target(module, item.path)
-                    if !item.is_public || !(path == target || starts_with(path, target + "::")) {
-                        continue
+    for candidate in syntax.targets {
+        let target = cached_module_import_path(ctx, module_id_at(ctx, candidate))
+        for path in syntax.paths {
+            if !path.1 || !(path.0 == target || starts_with(path.0, target + "::")) { continue }
+            for binding in import_binding_names(path.0, target) {
+                if binding.1 == name || binding.0 == "*" {
+                    let original = if binding.0 == "*" { name } else { binding.0 }
+                    let resolved = exported_type_identity(ctx, candidate, original, depth + 1_usize)
+                    if resolved != "" {
+                        if found != "" && found != resolved { ret "" }
+                        found = resolved
                     }
-                    for binding in import_binding_names(path, target) {
-                        if binding.1 == name || binding.0 == "*" {
-                            let original = if binding.0 == "*" {
-                                name
-                            } else {
-                                binding.0
-                            }
-                            let resolved = exported_type_identity(ctx, candidate, original, depth + 1)
-                            if resolved != "" {
-                                if found != "" && found != resolved {
-                                    ret ""
-                                }
-                                found = resolved
-                            }
-                        }
-                    }
-                }
-                _ => {
                 }
             }
         }
@@ -4320,30 +4240,14 @@ fn imported_namespace_path(ctx: mut TranslatorContext, source_name: str, request
 
 fn resolve_imported_namespace_path(ctx: mut TranslatorContext, source_name: str, requested: str) -> str {
     let encoded = lookup_module_source_alias(ctx.module_index, source_name)
-    if encoded == 0 {
-        ret requested
-    }
-    let caller = match ctx.modules.get(encoded - 1) {
-        Some(module) => module
-        None => {
-            ret requested
-        }
-    }
-    let requested = translation_import_target(caller, requested)
-    for statement in caller.ast {
-        match statement {
-            Statement::Import(item) => {
-                let path = translation_import_target(caller, item.path)
-                for target in caller.imports {
-                    let target_path = cached_module_import_path(ctx, target)
-                    let expanded = import_namespace_target(path, target_path, requested)
-                    if expanded != "" {
-                        ret expanded
-                    }
-                }
-            }
-            _ => {
-            }
+    if encoded == 0_usize { ret requested }
+    let caller = cached_export_syntax(ctx, encoded - 1_usize)
+    let requested = module_import_target(caller.module_id, requested)
+    for path in caller.paths {
+        for target in caller.imports {
+            let target_path = cached_module_import_path(ctx, target)
+            let expanded = import_namespace_target(path.0, target_path, requested)
+            if expanded != "" { ret expanded }
         }
     }
     ret requested
@@ -4618,22 +4522,14 @@ fn direct_import_allows(ctx: mut TranslatorContext, caller_source: str,
     // Keep the precomputed index as the fast path, but validate a cache miss
     // against the parsed import. This covers nested/aliased import spellings
     // without putting an AST walk on every function lookup.
-    for module in ctx.modules {
-        if module.module_id == caller && contains_str(module.imports, target_module) {
-            for statement in module.ast {
-                match statement {
-                    Statement::Import(item) => {
-                        let path = translation_import_target(module, item.path)
-                        if import_path_allows(path, cached_module_import_path(ctx, target_module), function_name)
-                        {
-                            let _allowed = unsafe {
-                                encore_strset_insert(ctx.direct_import_index, prefix + imported_name)
-                            }
-                            ret Option[bool]::Some(true)
-                        }
-                    }
-                    _ => {
-                    }
+    for position in 0_usize..ctx.modules.len() {
+        if module_id_at(ctx, position) != caller { continue }
+        let module = cached_export_syntax(ctx, position)
+        if contains_str(module.imports, target_module) {
+            for path in module.paths {
+                if import_path_allows(path.0, cached_module_import_path(ctx, target_module), function_name) {
+                    let _allowed = unsafe { encore_strset_insert(ctx.direct_import_index, prefix + imported_name) }
+                    ret Option[bool]::Some(true)
                 }
             }
             let _denied = unsafe {
@@ -4714,12 +4610,16 @@ fn remember_import_permissions(index: usize, prefix: str, target: str, raw: str)
 // while `refrain`/`repo` start at the package root. A leaf foo.enq does not
 // introduce a directory named foo; foo/mod.enq does.
 fn translation_import_target(module: TranslationModule, raw: str) -> str {
+    ret module_import_target(module.module_id, raw)
+}
+
+fn module_import_target(module_id: str, raw: str) -> str {
     let path = trim_spaces(raw)
-    let owner = module_import_path(module.module_id)
+    let owner = module_import_path(module_id)
     if starts_with(path, "mod::") {
-        let separator = find_char(module.module_id, "@", 0)
-        if separator < module.module_id.len() {
-            let relative = module.module_id.slice(separator + 1, module.module_id.len() - separator - 1)
+        let separator = find_char(module_id, "@", 0)
+        if separator < module_id.len() {
+            let relative = module_id.slice(separator + 1, module_id.len() - separator - 1)
             if relative != "lib.enq" && relative != "main.enq" && relative != "mod.enq" &&
             !ends_with(relative, "/mod.enq") && !ends_with(relative, "/lib.enq") &&
             !ends_with(relative, "/main.enq") {
@@ -6728,6 +6628,18 @@ LoweringBuilder {
 }
 
 fn translate_function_named(ctx: mut TranslatorContext, fn_item: FunctionItem, emitted_name: str, ret_type:
+    str, scope_generics: Vec[GenericParam],) -> LoweringBuilder {
+    let profiling = env("ENCORE_FRONTEND_PROFILE").is_some()
+    let started = if profiling { perf_counter_ms() } else { 0_u64 }
+    let result = translate_function_named_inner(ctx, fn_item, emitted_name, ret_type, scope_generics)
+    if profiling && perf_counter_ms() - started >= 250_u64 {
+        eprintln("frontend-function " + fn_item.source_name + "::" + emitted_name + " " +
+            Debug::fmt(perf_counter_ms() - started) + " ms")
+    }
+    ret result
+}
+
+fn translate_function_named_inner(ctx: mut TranslatorContext, fn_item: FunctionItem, emitted_name: str, ret_type:
     str, scope_generics: Vec[GenericParam],) -> LoweringBuilder {
     if (!fn_item.generics.is_empty() || !scope_generics.is_empty()) &&
     is_translation_reflection_template(ctx, fn_item) {
@@ -12920,6 +12832,9 @@ fn lower_match_expr(ctx: mut TranslatorContext, match_expr: MatchExpr, source_na
     } else {
         inferred_type
     }
+    if ctx.ir_scope.is_type_probe() {
+        ret branch_type_probe_value(ctx, result_name, result_type)
+    }
     let end_label = prefix + "_match_expr_end_" + Debug::fmt(idx)
     let mut builder = cond.code
     if cond_borrowed && ctx_type_needs_ownership(ctx, cond.typ) {
@@ -12998,6 +12913,11 @@ fn lower_if_expr(ctx: mut TranslatorContext, if_expr: IfExpr, prefix: str, idx: 
     } else {
         inferred_type
     }
+    // Numeric hints bypass inference, so those branches still need their
+    // ordinary lowering to distinguish a value from an all-diverging join.
+    if ctx.ir_scope.is_type_probe() && !is_numeric_type(ctx.expression_hint) {
+        ret branch_type_probe_value(ctx, result_name, result_type)
+    }
     let mut builder = LoweringBuilder::new(ctx.ir_scope)
     if result_type != "!" {
         builder = branch_result_slot(builder, result_slot, result_type)
@@ -13073,6 +12993,16 @@ fn lower_if_expr(ctx: mut TranslatorContext, if_expr: IfExpr, prefix: str, idx: 
         }
         , result_type
     }
+}
+
+// An enclosing type probe discards all generated instructions. Nested joins
+// only need their result type; emitting their arms here and again during real
+// lowering makes a chain of nested matches take exponential time. Probe state
+// belongs to the IR scope so separately generated functions retain real scopes.
+fn branch_type_probe_value(ctx: mut TranslatorContext, name: str, typ: str) -> LoweredExpr {
+    if typ != "()" && typ != "!" { let _ = ctx.ir_scope.output(name, typ) }
+    ret LoweredExpr { LoweringBuilder::new(ctx.ir_scope),
+        if typ == "()" { "void" } elif typ == "!" { "" } else { name }, typ }
 }
 
 fn infer_if_expr_result_type(ctx: mut TranslatorContext, if_expr: IfExpr) -> str {
@@ -15464,12 +15394,18 @@ fn reject_runtime_reflection(ctx: mut TranslatorContext, name: str, source_name:
 
 // Native proxies use a separate stable ABI, leaving ordinary dyn dispatch intact.
 fn plugin_sdk_source(ctx: mut TranslatorContext) -> str {
-    for module in ctx.modules {
-        if module.module_id == "platform@plugin/mod.enq" {
-            ret module.source_name
+    let key = "plugin-sdk-source"
+    let encoded = unsafe { encore_strmap_get(ctx.imports.index, key) }
+    if encoded != 0_usize { ret ctx.imports.texts.get_unchecked_borrowed(encoded - 1_usize) }
+    let mut source = ""
+    for position in 0_usize..ctx.modules.len() {
+        if module_id_at(ctx, position) == "platform@plugin/mod.enq" {
+            source = module_source_at(ctx, position) break
         }
     }
-    ret ""
+    ctx.imports.texts.push(source)
+    unsafe { encore_strmap_put(ctx.imports.index, key, ctx.imports.texts.len()) }
+    ret source
 }
 fn plugin_proxy_type(ctx: mut TranslatorContext, typ: str) -> bool {
     let source = plugin_sdk_source(ctx)
@@ -15777,8 +15713,9 @@ fn resolved_plugin_type_paths(ctx: mut TranslatorContext, source: str, typ: str)
             if starts_with(leaf, "__encore_t") {
                 resolved = leaf
             } else {
-                for module in ctx.modules {
-                    if cached_module_import_path(ctx, module.module_id) == namespace {
+                for module in 0_usize..ctx.modules.len() {
+                    let module_id = module_id_at(ctx, module)
+                    if cached_module_import_path(ctx, module_id) == namespace {
                         let identity = exported_type_identity(ctx, module, leaf, 0_usize)
                         if identity != "" {
                             resolved = identity break
@@ -16083,10 +16020,11 @@ fn translator_qualified_type_cache_matches_uncached_scopes() -> bool {
 
 // Exact sequential implementation retained as an oracle for the admission filter.
 fn qualify_module_type_collisions_reference(ctx: mut TranslatorContext, module: TranslationModule, text: str) -> str {
+    let module_position = translation_module_position(ctx, module)
     let mut out = text
     for name in ctx.type_collisions {
         if contains_substring(out, name) {
-            let replacement = resolved_type_collision(ctx, module, name)
+            let replacement = resolved_type_collision(ctx, module_position, name)
             if replacement != "" {
                 out = unsafe {
                     encore_compiler_replace_scoped_ehir_identifier(out, name, replacement)
@@ -16154,14 +16092,22 @@ fn typed_params_in_context(ctx: mut TranslatorContext, item: FunctionItem) -> Ve
 }
 
 fn qualify_typed_module_collisions(ctx: mut TranslatorContext, module: TranslationModule, value: Module) -> Module {
+    let started = perf_counter_ms()
+    let module_position = translation_module_position(ctx, module)
     let mut replacements = Vec[(str, str)]::new()
     for name in ctx.type_collisions {
-        let resolved = resolved_type_collision(ctx, module, name)
+        let resolved = resolved_type_collision(ctx, module_position, name)
         if !resolved.is_empty() && resolved != name {
             replacements.push((name, resolved))
         }
     }
-    ret rename_module_types(value, replacements)
+    let resolved = perf_counter_ms()
+    let result = rename_module_types(value, replacements)
+    if env("ENCORE_FRONTEND_PROFILE").is_some() {
+        eprintln("frontend-nominal " + module.module_id + " resolve=" + Debug::fmt(resolved - started) +
+            " rewrite=" + Debug::fmt(perf_counter_ms() - resolved) + " ms")
+    }
+    ret result
 }
 fn qualify_typed_items_collisions(ctx: mut TranslatorContext, owner: TranslationModule, items: Vec[IrItem]) -> Vec[IrItem] {
     let module = match module_from_ir_items(owner.module_id, Vec[EhirImport]::new(), Option[str]::None, items) {
@@ -16186,4 +16132,483 @@ fn native_ir_declaration(name: str, fields: Vec[(str, str)], result: str) -> Dir
             name, Vec[Type]::new(), parameters, parse_type_text(result), Vec[Block]::new(), true, false
         }
     )
+}
+
+// Independent bounded AST resolver for the export-cache regression contract.
+fn reference_exported_function_binding(ctx: mut TranslatorContext, module: TranslationModule,
+    name: str, depth: usize,) -> Option[FunctionType] {
+    if depth > ctx.modules.len() { ret Option[FunctionType]::None }
+    for statement in module.ast {
+        match statement {
+            Statement::Function(item) => {
+                if item.name != name {
+                    continue
+                }
+                if !item.is_public {
+                    ret Option[FunctionType]::None
+                }
+                let mut encoded = unsafe {
+                    encore_strmap_get(ctx.function_heads, name)
+                }
+                while encoded > 0_usize {
+                    let function = ctx.functions.get(encoded - 1_usize)
+                    match function {
+                        Some(value) => {
+                            if value.name == name && module_identity_for_source(ctx, value.source_name) == module.module_id {
+                                ret Option[FunctionType]::Some(value)
+                            }
+                        }
+                        None => {
+                        }
+                    }
+                    encoded = ctx.function_next.get(encoded - 1_usize).unwrap_or(0_usize)
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    let mut found = Option[FunctionType]::None
+    for target in ctx.modules {
+        if !contains_str(module.imports, target.module_id) {
+            continue
+        }
+        let target_path = cached_module_import_path(ctx, target.module_id)
+        for statement in module.ast {
+            match statement {
+                Statement::Import(item) => {
+                    let path = translation_import_target(module, item.path)
+                    if !item.is_public || !starts_with(path, target_path + "::") {
+                        continue
+                    }
+                    for binding in import_binding_names(path, target_path) {
+                        if binding.1 != name && binding.0 != "*" {
+                            continue
+                        }
+                        let original = if binding.0 == "*" {
+                            name
+                        } else {
+                            binding.0
+                        }
+                        match reference_exported_function_binding(ctx, target, original, depth + 1_usize) {
+                            Some(value) => {
+                                match found {
+                                    Some(previous) => {
+                                        if previous.source_name != value.source_name || previous.name != value.name {
+                                            ret Option[FunctionType]::None
+                                        }
+                                    }
+                                    None => {
+                                    }
+                                }
+                                found = Option[FunctionType]::Some(value)
+                            }
+                            None => {
+                            }
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    ret found
+}
+
+fn export_contract_module(id: str, imports: Vec[str], source: str) -> TranslationModule {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source(id)
+    ret TranslationModule::new(id, id, imports, parser.parse(lexer.tokenize(source)), Vec[str]::new())
+}
+
+#attr(test)
+fn translator_export_cache_matches_bounded_reference() -> bool {
+    let mut modules = Vec[TranslationModule]::new()
+    modules.push(export_contract_module("origin", Vec[str]::new(),
+        "pub fn value() -> u32 { ret 1_u32 }\nfn secret() {}\npub struct MissingType {}"))
+    modules.push(export_contract_module("other", Vec[str]::new(), "pub fn value() -> bool { ret true }"))
+    modules.push(export_contract_module("left", vec!["origin", "right"],
+        "pub import origin::*\npub import right::*"))
+    modules.push(export_contract_module("right", vec!["origin", "left"],
+        "pub import origin::*\npub import left::*"))
+    modules.push(export_contract_module("facade", vec!["left", "right"],
+        "pub import left::value as selected\npub import right::value"))
+    modules.push(export_contract_module("ambiguous", vec!["origin", "other"],
+        "pub import origin::*\npub import other::*"))
+    modules.push(export_contract_module("hidden", vec!["origin"],
+        "fn value() {}\npub import origin::*"))
+    modules.push(export_contract_module("consumer", vec!["facade", "left"],
+        "import facade::selected\nimport left::MissingType\nfn sample() -> u32 { ret selected() }"))
+    let mut ast = Vec[Statement]::new()
+    for module in modules { ast.extend(module.ast) }
+    let mut ctx = collect_context(ast, modules, host_target(), Vec[str]::new())
+    let mut correct = true
+    for position in 0_usize..ctx.modules.len() {
+        for name in vec!["value", "selected", "secret", "MissingType", "absent"] {
+            for depth in 0_usize..ctx.modules.len() + 2_usize {
+                let expected = reference_exported_function_binding(ctx,
+                    ctx.modules.get_unchecked_borrowed(position), name, depth)
+                let actual = exported_function_binding(ctx, position, name, depth)
+                let identity = match actual { Some(value) => value.source_name + ":" + value.name None => "" }
+                let reference = match expected { Some(value) => value.source_name + ":" + value.name None => "" }
+                correct = correct && identity == reference
+            }
+        }
+    }
+    let entries = ctx.imports.export_bindings.len()
+    let _ = exported_function_binding(ctx, 2_usize, "MissingType", 0_usize)
+    let _ = exported_function_binding(ctx, 2_usize, "value", 0_usize)
+    correct = correct && ctx.imports.export_bindings.len() == entries
+    correct = correct && exported_function_binding(ctx, 5_usize, "value", 0_usize).is_none()
+    correct = correct && exported_function_binding(ctx, 6_usize, "value", 0_usize).is_none()
+    // A cached selection must be reconsidered after a new overload is indexed.
+    unsafe { encore_strmap_put(ctx.function_heads, "value", 0_usize) }
+    let before = ctx.imports.export_bindings.len()
+    ctx_add_function(ctx, "origin", "value", "str", Vec[str]::new(), Vec[bool]::new(), Vec[bool]::new(),
+        false, false, Vec[str]::new(), false, false, "str", false, false, false)
+    let refreshed = exported_function_binding(ctx, 0_usize, "value", 0_usize)
+    correct = correct && match refreshed { Some(value) => value.ret_type == "str" None => false }
+    correct = correct && ctx.imports.export_bindings.len() > before
+    free_translation_indexes(ctx)
+    // Parsed syntax can precede registration of a lazily generated function.
+    let pending = export_contract_module("pending", Vec[str]::new(), "pub fn later() -> bool { ret true }")
+    let mut delayed = collect_context(Vec[Statement]::new(), vec![pending], host_target(), Vec[str]::new())
+    correct = correct && exported_function_binding(delayed, 0_usize, "later", 0_usize).is_none()
+    ctx_add_function(delayed, "pending", "later", "bool", Vec[str]::new(), Vec[bool]::new(), Vec[bool]::new(),
+        false, false, Vec[str]::new(), false, false, "bool", false, false, false)
+    correct = correct && match exported_function_binding(delayed, 0_usize, "later", 0_usize) {
+        Some(value) => value.ret_type == "bool" None => false
+    }
+    free_translation_indexes(delayed)
+    ret correct
+}
+
+#attr(test)
+fn translator_nested_branch_type_probe_contract() -> bool {
+    // Build the source at runtime: the host compiler must not encounter the
+    // very nested input whose lowering complexity this regression exercises.
+    let mut value = "leaf"
+    for depth in 0_usize..24_usize {
+        value = if depth % 2_usize == 0_usize {
+            "match flag { true => " + value + " false => leaf }"
+        } else {
+            "if flag { " + value + " } else { leaf }"
+        }
+    }
+    let source = "fn nested(flag:bool, leaf:str) -> str { let value = " + value + " ret value }"
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new()
+    let output = translate_to_ehir(parser.parse(lexer.tokenize(source)))
+    ret output.contains("_match_result_") && output.contains("_if_result_") &&
+        output.byte_len() < 250000_usize && !output.contains("_type_probe")
+}
+
+// Independent AST resolvers retained for compact nominal-index regression checks.
+fn reference_resolve_type_collision_uncached(ctx: mut TranslatorContext,
+    module: TranslationModule, name: str,) -> str {
+    // A local import spelling is not a declaration name. Resolve it through
+    // the selected export before asking which module declares the nominal type.
+    // This also follows public aliases through facade modules.
+    if !module_declares_type(module, name) {
+        let mut imported = ""
+        for candidate in ctx.modules {
+            if !contains_str(module.imports, candidate.module_id) {
+                continue
+            }
+            let target = cached_module_import_path(ctx, candidate.module_id)
+            for statement in module.ast {
+                match statement {
+                    Statement::Import(item) => {
+                        let path = translation_import_target(module, item.path)
+                        if !starts_with(path, target + "::") {
+                            continue
+                        }
+                        for binding in import_binding_names(path, target) {
+                            if binding.1 != name {
+                                continue
+                            }
+                            let identity = reference_exported_type_identity(ctx, candidate, binding.0, 0_usize)
+                            if identity != "" {
+                                if imported != "" && imported != identity {
+                                    ret ""
+                                }
+                                imported = identity
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        if imported != "" {
+            ret imported
+        }
+    }
+    let owner = reference_resolve_type_declaration_module(ctx, module, name)
+    if ctx.stable_abi && intrinsic_type_owner(owner, name) {
+        ret name
+    }
+    ret if owner == "" {
+        ""
+    } else {
+        "__encore_t" + encode_module_identity(owner) + "__" + name
+    }
+}
+
+fn reference_resolve_type_declaration_module(ctx: mut TranslatorContext, current: TranslationModule, name: str)
+-> str {
+    if module_declares_type(current, name) {
+        ret current.module_id
+    }
+
+    let mut direct = ""
+    for candidate in ctx.modules {
+        if candidate.module_id != current.module_id &&
+        contains_str(current.imports, candidate.module_id) {
+            match direct_import_allows(ctx, current.source_name, candidate.module_id, name) {
+                Some(allowed) => {
+                    if allowed {
+                        let owner = reference_exported_type_owner(ctx, candidate, name, 0_usize)
+                        if owner == "" {
+                            continue
+                        }
+                        if direct != "" && direct != owner {
+                            ret ""
+                        }
+                        direct = owner
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    if direct != "" {
+        ret direct
+    }
+
+    let mut visible = ""
+    for candidate in ctx.modules {
+        if candidate.module_id != current.module_id && module_declares_type(candidate, name) &&
+        unsafe {
+            encore_strset_contains(ctx.visibility_index,
+                current.module_id + "\n" + candidate.module_id,)
+        }
+        {
+            if visible != "" && visible != candidate.module_id {
+                ret ""
+            }
+            visible = candidate.module_id
+        }
+    }
+    ret visible
+}
+
+fn reference_exported_type_owner(ctx: mut TranslatorContext, module: TranslationModule,
+    name: str, depth: usize,) -> str {
+    if depth > ctx.modules.len() {
+        ret ""
+    }
+    for statement in module.ast {
+        match statement {
+            Statement::Struct(item) => {
+                if item.name == name && item.is_public {
+                    ret module.module_id
+                }
+            }
+            Statement::EnumItem(item) => {
+                if item.name == name && item.is_public {
+                    ret module.module_id
+                }
+            }
+            Statement::Trait(item) => {
+                if item.name == name && item.is_public {
+                    ret module.module_id
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    let mut owner = ""
+    for candidate in ctx.modules {
+        if !contains_str(module.imports, candidate.module_id) {
+            continue
+        }
+        for statement in module.ast {
+            match statement {
+                Statement::Import(item) => {
+                    if !item.is_public {
+                        continue
+                    }
+                    let path = translation_import_target(module, item.path)
+                    if import_path_allows(path, cached_module_import_path(ctx, candidate.module_id), name) {
+                        let found = reference_exported_type_owner(ctx, candidate, name, depth + 1_usize)
+                        if found != "" {
+                            if owner != "" && owner != found {
+                                ret ""
+                            }
+                            owner = found
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    ret owner
+}
+
+fn reference_exported_type_identity(ctx: mut TranslatorContext, module: TranslationModule,
+    name: str, depth: usize,) -> str {
+    if depth > ctx.modules.len() {
+        ret ""
+    }
+    for statement in module.ast {
+        let mut public_type = false
+        match statement {
+            Statement::Struct(item) => {
+                public_type = item.is_public && item.name == name
+            }
+            Statement::EnumItem(item) => {
+                public_type = item.is_public && item.name == name
+            }
+            Statement::Trait(item) => {
+                public_type = item.is_public && item.name == name
+            }
+            _ => {
+            }
+        }
+        if public_type {
+            ret qualified_type_for_source(ctx, module.source_name, name)
+        }
+    }
+    let mut found = ""
+    for candidate in ctx.modules {
+        if !contains_str(module.imports, candidate.module_id) {
+            continue
+        }
+        let target = cached_module_import_path(ctx, candidate.module_id)
+        for statement in module.ast {
+            match statement {
+                Statement::Import(item) => {
+                    let path = translation_import_target(module, item.path)
+                    if !item.is_public || !(path == target || starts_with(path, target + "::")) {
+                        continue
+                    }
+                    for binding in import_binding_names(path, target) {
+                        if binding.1 == name || binding.0 == "*" {
+                            let original = if binding.0 == "*" {
+                                name
+                            } else {
+                                binding.0
+                            }
+                            let resolved = reference_exported_type_identity(ctx, candidate, original, depth + 1)
+                            if resolved != "" {
+                                if found != "" && found != resolved {
+                                    ret ""
+                                }
+                                found = resolved
+                            }
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    ret found
+}
+
+#attr(test)
+fn translator_nominal_index_matches_ast_reference() -> bool {
+    let mut modules = Vec[TranslationModule]::new()
+    modules.push(export_contract_module("core@probe.enq", Vec[str]::new(),
+        "pub struct Shared { n:u32 }\npub enum Maybe { Empty }\npub trait Show {}\nstruct Hidden {}\npub struct Data {}"))
+    modules.push(export_contract_module("other@lib.enq", Vec[str]::new(), "pub struct Shared { n:str }"))
+    modules.push(export_contract_module("facade@lib.enq", vec!["core@probe.enq", "other@lib.enq"],
+        "pub import core::probe::{Shared as Alias,Maybe as Choice,Show as Contract}\nimport other::Shared as PrivateAlias"))
+    modules.push(export_contract_module("left@lib.enq", vec!["core@probe.enq", "right@lib.enq"],
+        "pub import core::probe::*\npub import right::*"))
+    modules.push(export_contract_module("right@lib.enq", vec!["core@probe.enq", "left@lib.enq"],
+        "pub import core::probe::*\npub import left::*"))
+    modules.push(export_contract_module("ambiguous@lib.enq", vec!["core@probe.enq", "other@lib.enq"],
+        "pub import core::probe::*\npub import other::*"))
+    modules.push(export_contract_module("local@lib.enq", vec!["core@probe.enq"],
+        "struct Shared {}\npub import core::probe::*"))
+    modules.push(export_contract_module("consumer@lib.enq", vec!["facade@lib.enq", "left@lib.enq", "ambiguous@lib.enq"],
+        "import facade::{Alias as Selected,Choice,Contract,PrivateAlias}\nimport left::*\nfn bind[Shared](value:Shared) -> Shared { ret value }"))
+    let mut ast = Vec[Statement]::new()
+    let mut binders = Vec[GenericParam]::new()
+    for module in modules {
+        ast.extend(module.ast)
+        for statement in module.ast {
+            match statement { Statement::Function(item) => { binders = item.generics } _ => {} }
+        }
+    }
+    let mut correct = true
+    for stable in vec![false, true] {
+        let mut ctx = collect_context_with_abi(ast, modules, host_target(), Vec[str]::new(), stable)
+        for position in 0_usize..ctx.modules.len() {
+            let module = ctx.modules.get_unchecked_borrowed(position)
+            correct = correct && module_id_at(ctx, position) == module.module_id &&
+                module_source_at(ctx, position) == module.source_name &&
+                module_identity_for_source(ctx, module.source_name) == module.module_id
+        }
+        let absent = plugin_sdk_source(ctx)
+        let text_count = ctx.imports.texts.len()
+        correct = correct && absent == "" && plugin_sdk_source(ctx) == "" && ctx.imports.texts.len() == text_count
+        for generics in vec![Vec[GenericParam]::new(), binders, Vec[GenericParam]::new()] {
+            ctx.active_generics = generics
+            for position in 0_usize..ctx.modules.len() {
+                let module = ctx.modules.get_unchecked_borrowed(position)
+                for name in vec!["Shared", "Alias", "Selected", "Choice", "Contract", "PrivateAlias", "Hidden", "Missing", "Data", "Данные"] {
+                    if cached_module_declares_type(ctx, position, name) != module_declares_type(module, name) ||
+                        resolve_type_declaration_module(ctx, position, name) != reference_resolve_type_declaration_module(ctx, module, name) ||
+                        resolve_type_collision_uncached(ctx, position, name) != reference_resolve_type_collision_uncached(ctx, module, name) {
+                        eprintln("nominal index differs: " + module.module_id + " / " + name)
+                        correct = false
+                    }
+                    for depth in 0_usize..ctx.modules.len() + 2_usize {
+                        if exported_type_owner(ctx, position, name, depth) != reference_exported_type_owner(ctx, module, name, depth) ||
+                            exported_type_identity(ctx, position, name, depth) != reference_exported_type_identity(ctx, module, name, depth) {
+                            eprintln("nominal export differs: " + module.module_id + " / " + name + " / " + Debug::fmt(depth))
+                            correct = false
+                        }
+                    }
+                }
+            }
+        }
+        let saved = ctx.type_collisions
+        ctx.type_collisions = Vec[str]::new()
+        for position in 0_usize..ctx.modules.len() {
+            let module = ctx.modules.get_unchecked_borrowed(position)
+            if exported_type_identity(ctx, position, "Shared", 0_usize) != reference_exported_type_identity(ctx, module, "Shared", 0_usize) {
+                correct = false
+            }
+        }
+        ctx.type_collisions = saved
+        free_translation_indexes(ctx)
+    }
+    ret correct
+}
+
+#attr(test)
+fn translator_compact_module_labels_find_sdk() -> bool {
+    let modules = vec![export_contract_module("first@lib.enq", Vec[str]::new(), "pub struct Value {}"),
+        export_contract_module("platform@plugin/mod.enq", Vec[str]::new(), "pub struct Binding {}")]
+    let mut ast = Vec[Statement]::new()
+    for module in modules { ast.extend(module.ast) }
+    let mut ctx = collect_context(ast, modules, host_target(), Vec[str]::new())
+    let found = plugin_sdk_source(ctx)
+    let count = ctx.imports.texts.len()
+    let correct = found == "platform@plugin/mod.enq" && plugin_sdk_source(ctx) == found &&
+        ctx.imports.texts.len() == count && module_id_at(ctx, 0_usize) == "first@lib.enq" &&
+        module_source_at(ctx, 1_usize) == "platform@plugin/mod.enq"
+    free_translation_indexes(ctx)
+    ret correct
 }

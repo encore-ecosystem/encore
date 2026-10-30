@@ -1,0 +1,72 @@
+//! Planned cold effects retain the legacy dependency order and replay schema.
+import core::fmt::Debug
+import core::testing::assert
+import std::vec::Vec
+import json::{Json, stringify}
+import refrain::frontend::AnalysisDatabase
+import refrain::frontend::safety::{FunctionSafety, infer_safety_with_known, infer_safety_with_replay, safety_dependencies}
+import refrain::target::host_target
+
+fn main() -> u32 {
+    let mut database = AnalysisDatabase::new()
+    database.set_module("foreign", "foreign.enq", "pub extern fn raw() -> u32\npub fn clean() -> u32 { ret 1_u32 }\n#attr(safe)\npub fn factory() { ret || unsafe { 1_u32 } }\npub fn overloaded(value:u32) -> u32 { ret value }\n")
+    database.set_module("app", "app.enq", "import foreign::{raw,clean,factory,overloaded}\n" +
+        "fn alias() { let f = raw let ignored = f() }\nfn capture() { let f = raw let g = || f() let ignored = g() }\n" +
+        "fn create() { let f = factory() }\nfn invoke() { let f = factory() let ignored = f() }\n" +
+        "fn local_factory() { ret || unsafe { 1_u32 } }\nfn invoke_local() { let f = local_factory() let ignored = f() }\n" +
+        "fn scope() { let f = raw { let f = clean let ignored = f() } }\n" +
+        "fn overload_use() { let ignored = overloaded(1_u32) }\n" +
+        "struct Value { value:u32 }\nimpl for Value { pub fn op(self:Self,other:Self) -> Self { unsafe { ret self } } pub fn with_enter(self:Self) -> Self { ret self } pub fn with_exit(self:Self) -> bool { unsafe { ret true } } }\n" +
+        "fn add(a:Value,b:Value) -> Value { ret a+b }\nfn resource(a:Value) { with a as value {} }\n")
+    let prepared = database.prepare_module_safety_for_target("app", host_target(), Vec[str]::new())
+    // The module's lexical name probe does not resolve local callback names.
+    // Safety's independent binding analysis must still handle those calls.
+    for diagnostic in prepared.diagnostics { if !assert(diagnostic.code == "unresolved-call") { ret 1_u32 } }
+    if !assert(prepared.functions.len() >= 13_usize) { ret 1_u32 }
+    let functions = prepared.functions
+    let known = vec![FunctionSafety { "foreign", "", "raw", 0_usize, 0_usize, true, false, true },
+        FunctionSafety { "foreign", "", "clean", 0_usize, 0_usize, false, false, false },
+        FunctionSafety { "foreign", "", "factory", 0_usize, 0_usize, true, true, true },
+        FunctionSafety { "foreign", "", "overloaded", 1_usize, 0_usize, false, false, false },
+        FunctionSafety { "foreign", "", "overloaded", 2_usize, 0_usize, true, false, true }]
+    let contexts = vec![("app", "complete-contract")]
+    let cold = infer_safety_with_replay(functions, known, contexts, Json::Null)
+    if !assert(cold.checked == functions.len() && cold.reused == 0_usize) { ret 2_u32 }
+    // The previous dependency walker remains independent of plan compilation.
+    // Check duplicate names/overloads, nested captures and implicit operations.
+    let mut previous = Vec[(str, usize)]::new()
+    for function in functions {
+        let family = function.module_name + "\n" + function.owner + "\n" + function.item.name
+        let mut ordinal = 0_usize
+        for entry in previous { if entry.0 == family { ordinal += 1_usize } }
+        previous.push((family, ordinal))
+        let slot = family + "\n" + Debug::fmt(ordinal)
+        let mut expected = Vec[Json]::new()
+        for dependency in safety_dependencies(function) {
+            expected.push(Json::Array(vec![Json::String(dependency.0), Json::String(dependency.1), Json::String(dependency.2)]))
+        }
+        let actual = cold.replay.get(slot).unwrap_or(Json::Null).get("dependencies").unwrap_or(Json::Null)
+        if !assert(stringify(actual) == stringify(Json::Array(expected))) { ret 3_u32 }
+    }
+    for effect in cold.effects {
+        if effect.module_name != "app" { continue }
+        if effect.name == "create" || effect.name == "scope" {
+            if !assert(!effect.is_unsafe()) { ret 4_u32 }
+        }
+        if effect.name == "alias" || effect.name == "capture" || effect.name == "invoke" ||
+            effect.name == "invoke_local" || effect.name == "overload_use" || effect.name == "add" || effect.name == "resource" {
+            if !assert(effect.is_unsafe()) { ret 5_u32 }
+        }
+    }
+    let warm = infer_safety_with_replay(functions, known, contexts, cold.replay)
+    if !assert(warm.checked == 0_usize && warm.reused == functions.len() && stringify(warm.replay) == stringify(cold.replay)) { ret 6_u32 }
+    let fresh = infer_safety_with_known(functions, known)
+    if !assert(warm.effects.len() == fresh.len()) { ret 7_u32 }
+    for position in 0_usize..fresh.len() {
+        let actual = warm.effects.get_unchecked_borrowed(position)
+        let expected = fresh.get_unchecked_borrowed(position)
+        if !assert(actual.body_unsafe == expected.body_unsafe && actual.asserted_safe == expected.asserted_safe &&
+            actual.returns_unsafe_callable == expected.returns_unsafe_callable) { ret 8_u32 }
+    }
+    ret 0_u32
+}

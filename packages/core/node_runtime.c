@@ -513,31 +513,38 @@ static void encore_node_index_map_free(encore_node_index_map *map) {
  * algorithm, so cycles and rootless components keep their existing behavior.
  */
 static bool encore_node_has_external_ancestor(encore_node_header *root) {
-    /* Almost every field-read release reaches a live root through a short
-     * owner chain. Do that exact search without allocating a queue and two
-     * hash-table arrays for each temporary value. Wide/deep graphs still use
-     * the complete search below; exhausting scratch space is not a verdict. */
+    /* Follow one owner chain before expanding its siblings. Shared EHIR types
+     * can have thousands of incoming owners, while the first owner reaches a
+     * live scope in just two hops. Breadth-first expansion allocated a large
+     * fallback queue on every temporary release even for that shallow graph.
+     * The visited set is still exact; an exhausted budget falls back to the
+     * complete search rather than deciding liveness. */
     encore_node_header *local[32] = {root};
-    size_t local_len = 1;
-    for (size_t cursor = 0; cursor < local_len; ++cursor) {
+    size_t next_owner[32] = {0};
+    size_t stack[32] = {0};
+    size_t local_len = 1, depth = 1;
+    while (depth != 0) {
+        size_t cursor = stack[depth - 1];
         encore_node_header *node = local[cursor];
-        if (node->state != ENCORE_NODE_ALIVE) continue;
-        for (size_t index = 0; index < node->incoming_owner_count; ++index) {
-            encore_node_header *owner = node->incoming_owners[index];
-            if (owner == NULL || owner->state != ENCORE_NODE_ALIVE) continue;
-            if (owner != root &&
-                atomic_load_explicit(&owner->refs, memory_order_relaxed) >
-                atomic_load_explicit(&owner->incoming_edges, memory_order_relaxed)) {
-                return true;
-            }
-            size_t seen_index = 0;
-            while (seen_index < local_len && local[seen_index] != owner) {
-                seen_index++;
-            }
-            if (seen_index != local_len) continue;
-            if (local_len == sizeof(local) / sizeof(local[0])) goto full_search;
-            local[local_len++] = owner;
+        if (node->state != ENCORE_NODE_ALIVE ||
+            next_owner[cursor] == node->incoming_owner_count) {
+            depth--;
+            continue;
         }
+        encore_node_header *owner =
+            node->incoming_owners[next_owner[cursor]++];
+        if (owner == NULL || owner->state != ENCORE_NODE_ALIVE) continue;
+        if (owner != root &&
+            atomic_load_explicit(&owner->refs, memory_order_relaxed) >
+            atomic_load_explicit(&owner->incoming_edges, memory_order_relaxed)) {
+            return true;
+        }
+        size_t seen_index = 0;
+        while (seen_index < local_len && local[seen_index] != owner) seen_index++;
+        if (seen_index != local_len) continue;
+        if (local_len == sizeof(local) / sizeof(local[0])) goto full_search;
+        local[local_len] = owner;
+        stack[depth++] = local_len++;
     }
     return false;
 

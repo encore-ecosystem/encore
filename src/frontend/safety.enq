@@ -1,5 +1,7 @@
 //! Backend-independent callable safety effects. An explicit safe contract is a trust boundary.
 import refrain::frontend::semantic_slice::SemanticSlice
+import refrain::frontend::safety_plan::{SafetyEffectPlan, SafetyPlanBuilder}
+import refrain::frontend::safety_lookup::SafetyNameLookup
 import core::fmt::Debug
 import core::option::Option
 
@@ -95,6 +97,39 @@ struct SafetyContext {
     lookup: EffectLookup
 }
 
+// Formula IDs 0 and 1 are false and true. Other IDs refer to immutable
+// expressions in the current function's arena, shared across nested closures.
+struct PlannedCallableValue { unsafe_call: usize, unsafe_result: usize }
+struct PlannedSafetyContext {
+    function: SafetyFunction
+    effects: Vec[FunctionSafety]
+    bindings: Vec[(str, PlannedCallableValue)]
+    executed: usize
+    returned: usize
+    dependencies: Vec[(str, str, str)]
+    lookup: EffectLookup
+    names: SafetyNameLookup
+}
+fn plan_unknown_value() -> PlannedCallableValue { ret PlannedCallableValue { 1_usize, 1_usize } }
+fn plan_plain_value() -> PlannedCallableValue { ret PlannedCallableValue { 0_usize, 0_usize } }
+fn plan_join_value(arena: mut SafetyPlanBuilder, left: PlannedCallableValue, right: PlannedCallableValue) -> PlannedCallableValue {
+    ret PlannedCallableValue { arena.join(left.unsafe_call, right.unsafe_call), arena.join(left.unsafe_result, right.unsafe_result) }
+}
+fn prepare_safety_plan(function: SafetyFunction, effects: Vec[FunctionSafety], lookup: EffectLookup) -> SafetyEffectPlan {
+    let mut arena = SafetyPlanBuilder::new()
+    if function.item.body.is_none() { ret arena.finish(0_usize, 0_usize, Vec[(str, str, str)]::new()) }
+    let names = SafetyNameLookup::new(function.callables, function.methods)
+    let mut ctx = PlannedSafetyContext { function, effects, Vec[(str, PlannedCallableValue)]::new(),
+        0_usize, 0_usize, Vec[(str, str, str)]::new(), lookup, names }
+    for param in function.item.params { ctx.bindings.push((param.name, plan_unknown_value())) }
+    match function.item.body {
+        Some(body) => plan_statements(ctx, arena, body.statements)
+        None => {}
+    }
+    names.close()
+    ret arena.finish(ctx.executed, ctx.returned, ctx.dependencies)
+}
+
 /// Collects resolved declarations without recursively asking for their effects.
 pub fn safety_dependencies(function: SafetyFunction) -> Vec[(str, str, str)] {
     let mut ctx = SafetyContext {
@@ -121,6 +156,16 @@ pub fn infer_safety(functions: Vec[SafetyFunction]) -> Vec[FunctionSafety] {
 
 /// Reuses already closed dependency subgraphs from the same source revision.
 pub fn infer_safety_with_known(functions: Vec[SafetyFunction], known: Vec[FunctionSafety]) -> Vec[FunctionSafety] {
+    let mut effects = initial_safety_effects(functions, known)
+    let lookup = effect_lookup(effects)
+    let mut plans = Vec[SafetyEffectPlan]::with_capacity(functions.len())
+    for function in functions { plans.push(prepare_safety_plan(function, effects, lookup)) }
+    let dependents = safety_plan_dependents(plans, lookup)
+    unsafe { encore_strmap_free(lookup.heads) }
+    ret infer_planned_safety(effects, plans, dependents)
+}
+
+fn initial_safety_effects(functions: Vec[SafetyFunction], known: Vec[FunctionSafety]) -> Vec[FunctionSafety] {
     let mut effects = Vec[FunctionSafety]::new()
     for function in functions {
         let mut safe = false
@@ -137,12 +182,7 @@ pub fn infer_safety_with_known(functions: Vec[SafetyFunction], known: Vec[Functi
             ,)
     }
     effects.extend(known)
-    let lookup = effect_lookup(effects)
-    let result = infer_indexed_safety(functions, effects, lookup)
-    unsafe {
-        encore_strmap_free(lookup.heads)
-    }
-    ret result
+    ret effects
 }
 
 pub struct SafetyReplayResult {
@@ -225,9 +265,6 @@ pub fn infer_safety_with_replay(functions: Vec[SafetyFunction], known: Vec[Funct
         let asserted = saved.get("asserted_safe").unwrap_or(Json::Null).as_bool()
         let returned = saved.get("returns_unsafe_callable").unwrap_or(Json::Null).as_bool()
         valid = valid && body.is_some() && asserted.is_some() && returned.is_some()
-        if !valid {
-            dependencies = safety_dependencies(function)
-        }
         let effect = FunctionSafety {
             function.module_name, function.owner, function.item.name, function.symbol_line,
             function.symbol_column, body.unwrap_or(false), asserted.unwrap_or(false), returned.unwrap_or(false)
@@ -238,17 +275,25 @@ pub fn infer_safety_with_replay(functions: Vec[SafetyFunction], known: Vec[Funct
     unsafe {
         encore_strmap_free(ordinals)
     }
-    initial.extend(known)
+    let mut all_dirty = true
+    for node in nodes { if node.valid { all_dirty = false break } }
+    if all_dirty { initial = initial_safety_effects(functions, known) }
+    else { initial.extend(known) }
     let lookup = effect_lookup(initial)
-    let mut dependents = Vec[Vec[usize]]::new()
-    let mut queue = Vec[usize]::new()
-    for index in 0_usize..nodes.len() {
-        dependents.push(Vec[usize]::new())
-        let invalid = !nodes.get_unchecked_borrowed(index).valid
-        if invalid {
-            queue.push(index)
+    let mut plans = Vec[SafetyEffectPlan]::new()
+    for position in 0_usize..nodes.len() {
+        let node = nodes.get_unchecked_borrowed(position)
+        if all_dirty {
+            let plan = prepare_safety_plan(functions.get_unchecked_borrowed(position), initial, lookup)
+            nodes.set(position, SafetyReplayNode { node.slot, node.input, plan.dependencies, node.effect, node.valid })
+            plans.push(plan)
+        } elif !node.valid {
+            let dependencies = safety_dependencies(functions.get_unchecked_borrowed(position))
+            nodes.set(position, SafetyReplayNode { node.slot, node.input, dependencies, node.effect, false })
         }
     }
+    let mut dependents = Vec[Vec[usize]]::new()
+    for _index in 0_usize..nodes.len() { dependents.push(Vec[usize]::new()) }
     for consumer in 0_usize..nodes.len() {
         for dependency in nodes.get_unchecked_borrowed(consumer).dependencies {
             let mut encoded = unsafe {
@@ -268,8 +313,8 @@ pub fn infer_safety_with_replay(functions: Vec[SafetyFunction], known: Vec[Funct
     unsafe {
         encore_strmap_free(lookup.heads)
     }
-    let resolved = if queue.len() == functions.len() {
-        (infer_safety_with_known(functions, known), functions.len())
+    let resolved = if all_dirty {
+        (infer_planned_safety(initial, plans, dependents), functions.len())
     } else {
         infer_safety_components(functions, known, nodes, dependents)
     }
@@ -469,88 +514,56 @@ fn infer_safety_components(functions: Vec[SafetyFunction], known: Vec[FunctionSa
     ret(effects, checked)
 }
 
-fn infer_indexed_safety(functions: Vec[SafetyFunction], effects: mut Vec[FunctionSafety], lookup: EffectLookup) -> Vec[FunctionSafety] {
-    // Declaration resolution is independent of inferred effects. Build the
-    // reverse graph once rather than walking every AST on every fixed-point
-    // round. Keep all overloads: a call joins their effects conservatively.
-    let mut dependents = Vec[Vec[usize]]::new()
-    let mut pending = Vec[usize]::new()
-    let mut queued = Vec[bool]::new()
-    let mut index = 0_usize
-    for function in functions {
-        dependents.push(Vec[usize]::new())
-        pending.push(index)
-        queued.push(true)
-        index += 1
-    }
-    index = 0_usize
-    for function in functions {
-        for dependency in safety_dependencies(function) {
-            let mut encoded = unsafe {
-                encore_strmap_get(lookup.heads, effect_key(dependency.0, dependency.1, dependency.2))
-            }
-            while encoded != 0 {
-                let source = encoded - 1
-                // Known dependency effects are immutable and never scheduled.
-                if source < functions.len() {
-                    let mut consumers = dependents.get(source).unwrap_or(Vec[usize]::new())
-                    let mut present = false
-                    for consumer in consumers {
-                        if consumer == index {
-                            present = true break
-                        }
-                    }
-                    if !present {
-                        consumers.push(index) dependents.set(source, consumers)
-                    }
+fn safety_plan_dependents(plans: Vec[SafetyEffectPlan], lookup: EffectLookup) -> Vec[Vec[usize]] {
+    let mut dependents = Vec[Vec[usize]]::with_capacity(plans.len())
+    for _index in 0_usize..plans.len() { dependents.push(Vec[usize]::new()) }
+    for consumer in 0_usize..plans.len() {
+        for dependency in plans.get_unchecked_borrowed(consumer).dependencies {
+            let mut encoded = unsafe { encore_strmap_get(lookup.heads, effect_key(dependency.0, dependency.1, dependency.2)) }
+            while encoded != 0_usize {
+                let source = encoded - 1_usize
+                if source < plans.len() {
+                    let mut values = dependents.get_unchecked_borrowed(source)
+                    values.push(consumer)
+                    dependents.set(source, values)
                 }
-                encoded = lookup.next.get(source).unwrap_or(0)
+                encoded = lookup.next.get_unchecked_borrowed(source)
             }
         }
-        index += 1
     }
+    ret dependents
+}
+
+fn safety_plan_value(always: bool, sources: Vec[usize], effects: Vec[FunctionSafety]) -> bool {
+    if always { ret true }
+    for source in sources {
+        let position = source / 2_usize
+        if position >= effects.len() { ret true }
+        let value = effects.get_unchecked_borrowed(position)
+        if (source % 2_usize == 0_usize && value.body_unsafe) ||
+            (source % 2_usize == 1_usize && value.returns_unsafe_callable) { ret true }
+    }
+    ret false
+}
+
+fn infer_planned_safety(effects: mut Vec[FunctionSafety], plans: Vec[SafetyEffectPlan], dependents: Vec[Vec[usize]]) -> Vec[FunctionSafety] {
+    let mut pending = Vec[usize]::with_capacity(plans.len())
+    let mut queued = Vec[bool]::with_capacity(plans.len())
+    for position in 0_usize..plans.len() { pending.push(position) queued.push(true) }
     let mut cursor = 0_usize
     while cursor < pending.len() {
-        let index = pending.get(cursor).unwrap_or(functions.len())
-        cursor += 1
-        queued.set(index, false)
-        match functions.get(index) {
-            Some(function) => {
-                let before = match effects.get(index) {
-                    Some(value) => value None => {
-                        ret effects
-                    }
-                }
-                let mut ctx = SafetyContext {
-                    function, effects, Vec[(str, CallableValue)]::new(), before.body_unsafe, before.returns_unsafe_callable, Vec[(str, str, str)]::new(), lookup
-                }
-                for param in function.item.params {
-                    ctx.bindings.push((param.name, unknown_value()))
-                }
-                match function.item.body {
-                    Some(body) => {
-                        statements(ctx, body.statements)
-                    }
-                    None => {
-                    }
-                }
-                if ctx.executed != before.body_unsafe || ctx.returned != before.returns_unsafe_callable {
-                    effects.set(index, FunctionSafety {
-                            before.module_name, before.owner, before.name,
-                            before.line, before.column, ctx.executed, before.asserted_safe, ctx.returned
-                        }
-                        ,)
-                    for consumer in dependents.get(index).unwrap_or(Vec[usize]::new()) {
-                        if !queued.get(consumer).unwrap_or(true) {
-                            queued.set(consumer, true)
-                            pending.push(consumer)
-                        }
-                    }
-                }
-            }
-            None => {
-                ret effects
-            }
+        let position = pending.get_unchecked_borrowed(cursor)
+        cursor += 1_usize
+        queued.set(position, false)
+        let before = effects.get_unchecked_borrowed(position)
+        let plan = plans.get_unchecked_borrowed(position)
+        let executed = before.body_unsafe || safety_plan_value(plan.body_true, plan.body_sources, effects)
+        let returned = before.returns_unsafe_callable || safety_plan_value(plan.returned_true, plan.returned_sources, effects)
+        if executed == before.body_unsafe && returned == before.returns_unsafe_callable { continue }
+        effects.set(position, FunctionSafety { before.module_name, before.owner, before.name, before.line, before.column,
+            executed, before.asserted_safe, returned })
+        for consumer in dependents.get_unchecked_borrowed(position) {
+            if !queued.get_unchecked_borrowed(consumer) { pending.push(consumer) queued.set(consumer, true) }
         }
     }
     ret effects
@@ -1203,6 +1216,433 @@ fn expression(ctx: mut SafetyContext, expr: Expr, line: usize, column: usize) ->
         }
         _ => {
             ret plain_value()
+        }
+    }
+}
+
+// Compile the same conservative lexical transfer rules once, before solving.
+fn plan_plugin_proxy_receiver(ctx: PlannedSafetyContext, receiver: str) -> bool {
+    // Nominal identities are interned (@N); ordinary receivers need no scan.
+    if !receiver.contains("[dyn ") {
+        ret false
+    }
+    for binding in ctx.function.body.type_names {
+        if binding.scope == "platform::plugin" &&
+        (binding.name == "Binding" || binding.name == "Resource") &&
+        semantic_same_owner(receiver, binding.identity) {
+            ret true
+        }
+    }
+    ret false
+}
+fn plan_declaration(ctx: mut PlannedSafetyContext, arena: mut SafetyPlanBuilder, module_name: str, owner: str, name: str) -> PlannedCallableValue {
+    let mut recorded = false
+    for existing in ctx.dependencies {
+        if existing.0 == module_name && existing.1 == owner && existing.2 == name { recorded = true break }
+    }
+    if !recorded { ctx.dependencies.push((module_name, owner, name)) }
+    let mut encoded = unsafe { encore_strmap_get(ctx.lookup.heads, effect_key(module_name, owner, name)) }
+    if encoded == 0_usize { ret plan_unknown_value() }
+    let mut out = plan_plain_value()
+    while encoded != 0_usize {
+        let position = encoded - 1_usize
+        let effect = ctx.effects.get_unchecked_borrowed(position)
+        let value = PlannedCallableValue { if effect.asserted_safe { 0_usize } else { arena.source(position * 2_usize) },
+            arena.source(position * 2_usize + 1_usize) }
+        out = plan_join_value(arena, out, value)
+        encoded = ctx.lookup.next.get_unchecked_borrowed(position)
+    }
+    ret out
+}
+
+fn plan_path_value(ctx: mut PlannedSafetyContext, arena: mut SafetyPlanBuilder, name: str) -> PlannedCallableValue {
+    let mut index = ctx.bindings.len()
+    while index > 0_usize {
+        index -= 1_usize
+        let binding = match ctx.bindings.get(index) {
+            Some(value) => value None => {
+                ret plan_unknown_value()
+            }
+        }
+        if binding.0 == name {
+            ret binding.1
+        }
+    }
+    let callable_name = without_type_arguments(name)
+    let position = ctx.names.callable(callable_name)
+    if position != 0_usize {
+        let callable = ctx.function.callables.get_unchecked_borrowed(position - 1_usize)
+        ret plan_declaration(ctx, arena, callable.module_name, "", callable.declaration_name)
+    }
+    let mut separator = name.len()
+    let mut cursor = 0_usize
+    let mut depth = 0_usize
+    while cursor + 1_usize < name.len() {
+        let part = name.slice(cursor, 1_usize)
+        if part == "[" {
+            depth += 1_usize
+        } elif part == "]" && depth > 0_usize {
+            depth -= 1_usize
+        }
+        if depth == 0_usize && name.slice(cursor, 2_usize) == "::" {
+            separator = cursor
+        }
+        cursor += 1_usize
+    }
+    if separator < name.len() {
+        let owner_name = name.slice(0_usize, separator)
+        let owner = if owner_name == "Self" {
+            scope_type_view(ctx.function.owner, ctx.function.module_name, ctx.function.body.type_names, Vec[str]::new())
+        } else {
+            scope_type_view(owner_name, ctx.function.module_name, ctx.function.body.type_names, Vec[str]::new())
+        }
+        let method_name = without_type_arguments(name.slice(separator + 2_usize, name.len() - separator - 2_usize))
+        let mut out = plan_plain_value()
+        let mut found = false
+        for member in semantic_associated_members_view(owner, method_name, ctx.names.methods_named(method_name)) {
+            found = true
+            out = plan_join_value(arena, out, plan_declaration(ctx, arena, member.declaration_module, member.declaration_owner, method_name))
+        }
+        if found {
+            ret out
+        }
+        let constructor = without_type_arguments(owner) + "::" + method_name
+        for known in ctx.function.constructors {
+            if known == constructor {
+                ret plan_plain_value()
+            }
+        }
+    }
+    ret plan_unknown_value()
+}
+fn plan_scoped(ctx: mut PlannedSafetyContext, arena: mut SafetyPlanBuilder, body: Vec[Statement]) ->() {
+    let size = ctx.bindings.len()
+    plan_statements(ctx, arena, body)
+    while ctx.bindings.len() > size {
+        let _ = ctx.bindings.pop()
+    }
+}
+// Includes calls inserted by lowering; these are not visible as Call AST nodes.
+fn plan_protocol_call(ctx: mut PlannedSafetyContext, arena: mut SafetyPlanBuilder, receiver: str, name: str) -> str {
+    let mut result = ""
+    let mut found = false
+    let mut members = semantic_named_members_view(receiver, name, SemanticSlice[SemanticField]::from_vec(Vec[SemanticField]::new()), ctx.names.methods_named(name))
+    members.extend(semantic_associated_members_view(receiver, name, ctx.names.methods_named(name)))
+    for member in members {
+        if member.is_method {
+            found = true
+            if !plan_plugin_proxy_receiver(ctx, receiver) {
+                let value = plan_declaration(ctx, arena, member.declaration_module, member.declaration_owner, name)
+                ctx.executed = arena.join(ctx.executed, value.unsafe_call)
+            }
+            result = member.typ
+        }
+    }
+    if !found {
+        ctx.executed = 1_usize
+    }
+    ret result
+}
+fn plan_implicit_calls(ctx: mut PlannedSafetyContext, arena: mut SafetyPlanBuilder, line: usize, column: usize, operation: str) ->() {
+    for site in ctx.function.body.implicit_receivers {
+        if site.0 != line || site.1 != column || site.2 != operation {
+            continue
+        }
+        if operation == "binary" {
+            let _ = plan_protocol_call(ctx, arena, site.3, "op")
+        }
+        if operation == "for" {
+            let conversions = semantic_named_members_view(site.3, "into_iter", SemanticSlice[SemanticField]::from_vec(Vec[SemanticField]::new()), ctx.names.methods_named("into_iter"))
+            let mut iterator = site.3
+            if conversions.len() > 0_usize {
+                iterator = plan_protocol_call(ctx, arena, site.3, "into_iter")
+            }
+            let _ = plan_protocol_call(ctx, arena, iterator, "next")
+        }
+        if operation == "with" {
+            let _ = plan_protocol_call(ctx, arena, site.3, "with_enter")
+            let _ = plan_protocol_call(ctx, arena, site.3, "with_exit")
+        }
+    }
+}
+fn plan_statements(ctx: mut PlannedSafetyContext, arena: mut SafetyPlanBuilder, body: Vec[Statement]) ->() {
+    for statement in body {
+        match statement {
+            Statement::Let(item) => {
+                let value = plan_expression(ctx, arena, item.expr.value, item.expr.line, item.expr.column)
+                ctx.bindings.push((item.name, if item.is_mut {
+                            plan_unknown_value()
+                        } else {
+                            value
+                        }
+                        ,
+                    ))
+            }
+            Statement::Ret(item) => {
+                let value = plan_expression(ctx, arena, item.value, item.line, item.column)
+                ctx.returned = arena.join(ctx.returned, value.unsafe_call)
+            }
+            Statement::Expr(item) => {
+                let _ = plan_expression(ctx, arena, item.value, item.line, item.column)
+            }
+            Statement::Unsafe(block) => {
+                ctx.executed = 1_usize plan_scoped(ctx, arena, block.statements)
+            }
+            // Opaque EHIR can contain raw calls even without an unsafe block.
+            Statement::Ehir(item) => {
+                ctx.executed = 1_usize
+            }
+            Statement::Function(item) => {
+                ctx.bindings.push((item.name, plan_unknown_value()))
+            }
+            Statement::Assignment(item) => {
+                let value = plan_expression(ctx, arena, item.expr.value, item.expr.line, item.expr.column)
+                let _ = plan_expression(ctx, arena, item.target.value, item.target.line, item.target.column)
+                match item.target.value {
+                    Expr::Path(name) => {
+                        let mut index = ctx.bindings.len()
+                        while index > 0_usize {
+                            index -= 1_usize
+                            let previous = ctx.bindings.get(index).unwrap_or((name, plan_unknown_value()))
+                            if previous.0 == name {
+                                ctx.bindings.set(index,(name, plan_join_value(arena, previous.1, value)))
+                                break
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            Statement::If(item) => {
+                for branch in item.branches {
+                    let _ = plan_expression(ctx, arena, branch.condition.value, branch.condition.line, branch.condition.column)
+                    plan_scoped(ctx, arena, branch.body.statements)
+                }
+                match item.else_body {
+                    Some(body) => {
+                        plan_scoped(ctx, arena, body.statements)
+                    }
+                    None => {
+                    }
+                }
+            }
+            Statement::Match(item) => {
+                let _ = plan_expression(ctx, arena, item.expr.value, item.expr.line, item.expr.column)
+                for arm in item.arms {
+                    let size = ctx.bindings.len()
+                    match arm.pattern.binding {
+                        Some(name) => {
+                            ctx.bindings.push((name, plan_unknown_value()))
+                        }
+                        None => {
+                        }
+                    }
+                    match arm.body {
+                        MatchArmBody::Block(body) => {
+                            plan_scoped(ctx, arena, body.statements)
+                        }
+                        MatchArmBody::Expr(expr) => {
+                            let _ = plan_expression(ctx, arena, expr.value, expr.line, expr.column)
+                        }
+                    }
+                    while ctx.bindings.len() > size {
+                        let _ = ctx.bindings.pop()
+                    }
+                }
+            }
+            Statement::While(item) => {
+                let _ = plan_expression(ctx, arena, item.condition.value, item.condition.line, item.condition.column)
+                plan_scoped(ctx, arena, item.body.statements)
+            }
+            Statement::DoWhile(item) => {
+                plan_scoped(ctx, arena, item.body.statements)
+                let _ = plan_expression(ctx, arena, item.condition.value, item.condition.line, item.condition.column)
+            }
+            Statement::Loop(item) => {
+                plan_scoped(ctx, arena, item.body.statements)
+            }
+            Statement::For(item) => {
+                let _ = plan_expression(ctx, arena, item.iterable.value, item.iterable.line, item.iterable.column)
+                plan_implicit_calls(ctx, arena, item.iterable.line, item.iterable.column, "for")
+                let size = ctx.bindings.len()
+                ctx.bindings.push((item.name, plan_unknown_value()))
+                plan_scoped(ctx, arena, item.body.statements)
+                while ctx.bindings.len() > size {
+                    let _ = ctx.bindings.pop()
+                }
+            }
+            Statement::With(item) => {
+                let _ = plan_expression(ctx, arena, item.expr.value, item.expr.line, item.expr.column)
+                plan_implicit_calls(ctx, arena, item.expr.line, item.expr.column, "with")
+                let size = ctx.bindings.len()
+                ctx.bindings.push((item.name, plan_unknown_value()))
+                plan_scoped(ctx, arena, item.body.statements)
+                while ctx.bindings.len() > size {
+                    let _ = ctx.bindings.pop()
+                }
+            }
+            _ => {
+            }
+        }
+    }
+}
+fn plan_expressions(ctx: mut PlannedSafetyContext, arena: mut SafetyPlanBuilder, items: Vec[ExprNode]) -> PlannedCallableValue {
+    let mut out = plan_plain_value()
+    for item in items {
+        out = plan_join_value(arena, out, plan_expression(ctx, arena, item.value, item.line, item.column))
+    }
+    ret out
+}
+fn plan_expression(ctx: mut PlannedSafetyContext, arena: mut SafetyPlanBuilder, expr: Expr, line: usize, column: usize) -> PlannedCallableValue {
+    match expr {
+        Expr::Path(name) => {
+            ret plan_path_value(ctx, arena, name)
+        }
+        Expr::Unsafe(body) => {
+            ctx.executed = 1_usize plan_scoped(ctx, arena, body.statements) ret plan_unknown_value()
+        }
+        Expr::Call(call) => {
+            let callee = plan_expression(ctx, arena, call.callee.value, call.callee.line, call.callee.column)
+            let _ = plan_expressions(ctx, arena, call.args)
+            ctx.executed = arena.join(ctx.executed, callee.unsafe_call)
+            ret PlannedCallableValue {
+                callee.unsafe_result, 1_usize
+            }
+        }
+        Expr::MethodCall(call) => {
+            let receiver_value = plan_expression(ctx, arena, call.receiver.value, call.receiver.line, call.receiver.column)
+            let _ = plan_expressions(ctx, arena, call.args)
+            let receiver = ctx.function.body.canonical_member_receiver_at(line, column)
+            let members = semantic_named_members_view(receiver, call.method, SemanticSlice[SemanticField]::from_vec(Vec[SemanticField]::new()), ctx.names.methods_named(call.method))
+            let mut value = plan_plain_value()
+            let mut found = false
+            let checked_proxy = plan_plugin_proxy_receiver(ctx, receiver)
+            for member in members {
+                if member.is_method {
+                    found = true
+                    if !checked_proxy {
+                        value = plan_join_value(arena, value, plan_declaration(ctx, arena, member.declaration_module, member.declaration_owner, call.method))
+                    }
+                }
+            }
+            if !found {
+                value = if call.method == "call" {
+                    receiver_value
+                } else {
+                    plan_unknown_value()
+                }
+            }
+            ctx.executed = arena.join(ctx.executed, value.unsafe_call)
+            ret PlannedCallableValue {
+                value.unsafe_result, 1_usize
+            }
+        }
+        Expr::Closure(closure) => {
+            let mut bindings = Vec[(str, PlannedCallableValue)]::new()
+            for binding in ctx.bindings {
+                bindings.push(binding)
+            }
+            for param in closure.params {
+                bindings.push((param.name, plan_unknown_value()))
+            }
+            let mut nested = PlannedSafetyContext {
+                ctx.function, ctx.effects, bindings, 0_usize, 0_usize, Vec[(str, str, str)]::new(), ctx.lookup, ctx.names
+            }
+            let value = plan_expression(nested, arena, closure.body.value, closure.body.line, closure.body.column)
+            ctx.dependencies.extend(nested.dependencies)
+            ret PlannedCallableValue {
+                nested.executed, arena.join(nested.returned, value.unsafe_call)
+            }
+        }
+        Expr::Parenthesized(inner) => {
+            ret plan_expression(ctx, arena, inner.value, inner.line, inner.column)
+        }
+        Expr::Await(inner) => {
+            ret plan_expression(ctx, arena, inner.value, inner.line, inner.column)
+        }
+        Expr::Spawn(inner) => {
+            ret plan_expression(ctx, arena, inner.value, inner.line, inner.column)
+        }
+        Expr::Try(inner) => {
+            ret plan_expression(ctx, arena, inner.value, inner.line, inner.column)
+        }
+        Expr::Unary(item) => {
+            ret plan_expression(ctx, arena, item.expr.value, item.expr.line, item.expr.column)
+        }
+        Expr::Cast(item) => {
+            ret plan_expression(ctx, arena, item.expr.value, item.expr.line, item.expr.column)
+        }
+        Expr::Binary(item) => {
+            let left = plan_expression(ctx, arena, item.lhs.value, item.lhs.line, item.lhs.column)
+            plan_implicit_calls(ctx, arena, line, column, "binary")
+            ret plan_join_value(arena, left, plan_expression(ctx, arena, item.rhs.value, item.rhs.line, item.rhs.column))
+        }
+        Expr::Field(item) => {
+            let _ = plan_expression(ctx, arena, item.base.value, item.base.line, item.base.column)
+            ret plan_unknown_value()
+        }
+        Expr::Index(item) => {
+            let _ = plan_expression(ctx, arena, item.base.value, item.base.line, item.base.column)
+            let _ = plan_expression(ctx, arena, item.index.value, item.index.line, item.index.column)
+            ret plan_unknown_value()
+        }
+        Expr::StructInit(item) => {
+            let _ = plan_expressions(ctx, arena, item.values) ret plan_plain_value()
+        }
+        Expr::VecLiteral(item) => {
+            ret plan_expressions(ctx, arena, item.items)
+        }
+        Expr::ArrayLiteral(item) => {
+            ret plan_expressions(ctx, arena, item.items)
+        }
+        Expr::TupleLiteral(item) => {
+            ret plan_expressions(ctx, arena, item.items)
+        }
+        Expr::ArrayRepeat(item) => {
+            ret plan_expression(ctx, arena, item.value.value, item.value.line, item.value.column)
+        }
+        Expr::Block(block) => {
+            let size = ctx.bindings.len()
+            plan_statements(ctx, arena, block.statements)
+            let value = match block.tail {
+                Some(tail) => plan_expression(ctx, arena, tail.value, tail.line, tail.column)
+                None => plan_plain_value()
+            }
+            while ctx.bindings.len() > size {
+                let _ = ctx.bindings.pop()
+            }
+            ret value
+        }
+        Expr::If(item) => {
+            let mut value = plan_plain_value()
+            for branch in item.branches {
+                let _ = plan_expression(ctx, arena, branch.condition.value, branch.condition.line, branch.condition.column)
+                value = plan_join_value(arena, value, plan_expression(ctx, arena, branch.body.value, branch.body.line, branch.body.column))
+            }
+            ret plan_join_value(arena, value, plan_expression(ctx, arena, item.else_body.value, item.else_body.line, item.else_body.column))
+        }
+        Expr::Match(item) => {
+            let _ = plan_expression(ctx, arena, item.expr.value, item.expr.line, item.expr.column)
+            let mut value = plan_plain_value()
+            for arm in item.arms {
+                let size = ctx.bindings.len()
+                match arm.pattern.binding {
+                    Some(name) => {
+                        ctx.bindings.push((name, plan_unknown_value()))
+                    }
+                    None => {
+                    }
+                }
+                value = plan_join_value(arena, value, plan_expression(ctx, arena, arm.expr.value, arm.expr.line, arm.expr.column))
+                while ctx.bindings.len() > size {
+                    let _ = ctx.bindings.pop()
+                }
+            }
+            ret value
+        }
+        _ => {
+            ret plan_plain_value()
         }
     }
 }
