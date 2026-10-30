@@ -1,4 +1,14 @@
 #include <stddef.h>
+
+#if defined(_MSC_VER)
+#define EHIR_PARSE_THREAD_LOCAL __declspec(thread)
+#else
+#define EHIR_PARSE_THREAD_LOCAL _Thread_local
+#endif
+static EHIR_PARSE_THREAD_LOCAL size_t ehir_bundle_parse_count = 0;
+void ehir_note_bundle_parse(void) { ++ehir_bundle_parse_count; }
+size_t ehir_debug_bundle_parse_count(void) { return ehir_bundle_parse_count; }
+void ehir_debug_reset_bundle_parse_count(void) { ehir_bundle_parse_count = 0; }
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>

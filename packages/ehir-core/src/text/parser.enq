@@ -7,11 +7,13 @@ import std::thread::JoinHandle
 import std::vec::Vec
 
 import refrain::string_index::{StringIndex, string_index_get, string_index_set, string_index_with_capacity}
+import refrain::structured::IrItem
 
 extern fn encore_str_slice_bytes(value: str, start: usize, byte_len: usize) -> str
 extern fn encore_text_builder_new() -> usize
 extern fn encore_text_builder_append(builder: usize, value: str) ->()
 extern fn encore_text_builder_finish(builder: usize) -> str
+extern fn ehir_note_bundle_parse() ->()
 
 /// Stable textual input for one virtual EHIR module in a bundle.
 pub struct EhirModuleSource {
@@ -1133,6 +1135,9 @@ fn directive_name(directive: Directive) -> str {
 /// Parses a bundle once and returns both its typed graph and stable module
 /// source records. This is the preferred compiler/backend process boundary.
 pub fn try_parse_module_bundle_artifact(entry_module: str, source: str) -> Result[ParsedModuleBundle, str] {
+    unsafe {
+        ehir_note_bundle_parse()
+    }
     let scanned = try_scan_module_bundle_text(entry_module, source)?
     let mut modules = Vec[Module]::new()
     for module_source in scanned.module_sources {
@@ -2020,4 +2025,55 @@ fn find_last_scope(value: str) -> usize {
 /// One mutable name table per function, populated only by definitions.
 pub fn new_ssa_bindings(expected: usize) -> SsaBindings {
     ret SsaBindings { Vec[Parameter]::new(), string_index_with_capacity(expected) }
+}
+
+/// The source language explicitly embeds textual EHIR in an `ehir` block.
+/// This entrypoint parses that source only; ordinary lowering never calls it.
+pub fn try_parse_inline_ir_items(source: str, known: mut SsaBindings) -> Result[Vec[IrItem], str] {
+    let lines = split_lines_text(source)
+    let mut items = Vec[IrItem]::new()
+    let mut index = 0_usize
+    while index < lines.len() {
+        let line = trim_text(lines.get_unchecked_borrowed(index))
+        index += 1_usize
+        if line.is_empty() {
+            continue
+        }
+        if starts_with_text(line, "$") && ends_with_text(line, ":") {
+            items.push(IrItem::Label(line.slice(1_usize, line.len() - 2_usize)))
+            continue
+        }
+        if starts_with_text(line, "match ") || starts_with_text(line, "switch ") {
+            let mut text = line
+            while index < lines.len() {
+                let next = trim_text(lines.get_unchecked_borrowed(index))
+                index += 1_usize
+                text += "\n" + next
+                if next == "}" {
+                    break
+                }
+            }
+            let terminator = try_parse_terminator_in_scope(text, known)?
+            match terminator {
+                Terminator::Match(value) => {
+                    for arm in value.arms {
+                        match arm.payload_var {
+                            Some(value) => bind_ssa_value(known, value) None => {
+                            }
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            items.push(IrItem::Terminator(terminator))
+        } elif line == "unreachable" || starts_with_text(line, "ret ") || starts_with_text(line, "br $") || starts_with_text(line, "cbr ") {
+            items.push(IrItem::Terminator(try_parse_terminator_in_scope(line, known)?))
+        } else {
+            let instruction = try_parse_instruction_in_scope(line, known)?
+            remember_instruction_output(known, instruction)
+            items.push(IrItem::Instruction(instruction))
+        }
+    }
+    ret Result::Ok(items)
 }

@@ -1,66 +1,82 @@
 //! Typed process-lifetime storage behind a source-level static accessor.
-import ehirlib::EhirTextBuilder
+import core::option::Option
+import std::vec::Vec
 
-pub fn static_runtime_declarations() -> EhirTextBuilder {
-    ret EhirTextBuilder::new()
-    .line("extern fn encore_static_cell_get(key: str) -> u8*")
-    .line("extern fn encore_static_begin(cell: u8*) -> bool")
-    .line("extern fn encore_static_publish(cell: u8*, value: usize) -> ()")
-    .line("extern fn encore_static_publish_owned(cell: u8*, value: usize, drop: usize) -> ()")
-    .line("extern fn encore_static_value(cell: u8*) -> usize")
-    .empty_line()
+import ehirlib::*
+
+import mod::ir::{LoweringBuilder, LoweringScope, Operand, annotated, reference}
+
+fn external(name: str, parameters: Vec[Parameter], result: str) -> Directive {
+    ret Directive::Function(FnDirective {
+            name, Vec[Type]::new(), parameters, parse_type_text(result), Vec[Block]::new(), true, false
+        }
+    )
 }
-
-pub fn static_accessor(name: str, initializer: str, typ: str, owns_value: bool) -> EhirTextBuilder {
+fn parameter(name: str, typ: str) -> Parameter {
+    ret param(name, parse_type_text(typ))
+}
+fn signature(name: str, parameters: Vec[Parameter], result: str) -> FnDirective {
+    ret FnDirective {
+        name, Vec[Type]::new(), parameters, parse_type_text(result), Vec[Block]::new(), false, false
+    }
+}
+pub fn static_runtime_declarations() -> LoweringBuilder {
+    ret LoweringBuilder::new(LoweringScope::new(Vec[Parameter]::new()))
+    .declaration(external("encore_static_cell_get", vec![parameter("key", "str")], "u8*"))
+    .declaration(external("encore_static_begin", vec![parameter("cell", "u8*")], "bool"))
+    .declaration(external("encore_static_publish", vec![parameter("cell", "u8*"), parameter("value", "usize")], "()"))
+    .declaration(external("encore_static_publish_owned", vec![parameter("cell", "u8*"), parameter("value", "usize"), parameter("drop", "usize")], "()"))
+    .declaration(external("encore_static_value", vec![parameter("cell", "u8*")], "usize"))
+}
+pub fn static_accessor(name: str, initializer: str, typ: str, owns_value: bool) -> LoweringBuilder {
     let unit = typ == "()" || typ == "void"
-    let mut code = EhirTextBuilder::new()
-    .line("fn " + name + "() -> " + typ + " {")
-    .label("entry")
-    .instr("static_key: str = capprim \"encore-static-1:" + name + "\"_str")
-    .instr("static_cell: u8* = call encore_static_cell_get(static_key: str)")
-    .instr("drop static_key: str")
-    .instr("static_initialize: bool = call encore_static_begin(static_cell: u8*)")
-    .instr("cbr static_initialize: bool, $initialize, $ready")
-    .label("initialize")
-    .instr("static_initial: " + typ + " = call " + initializer + "()")
-    .instr("static_zero: usize = capprim 0_usize")
+    let mut code = LoweringBuilder::new(LoweringScope::new(Vec[Parameter]::new()))
+    .function_start(signature(name, Vec[Parameter]::new(), typ)).label("entry")
+    .primitive("static_key", "str", "\"encore-static-1:" + name + "\"_str")
+    .call("static_cell", "u8*", "encore_static_cell_get", vec![reference("static_key")], false)
+    .drop_value(reference("static_key"))
+    .call("static_initialize", "bool", "encore_static_begin", vec![reference("static_cell")], false)
+    .conditional(reference("static_initialize"), "initialize", "ready").label("initialize")
+    .call("static_initial", typ, initializer, Vec[Operand]::new(), false)
+    .primitive("static_zero", "usize", "0_usize")
     if unit {
-        code = code.instr("static_published: () = call encore_static_publish(static_cell: u8*, static_zero: usize)")
+        code = code.call("static_published", "()", "encore_static_publish", vec![reference("static_cell"), reference("static_zero")], false)
     } else {
         let address_type = typ + "*"
-        code = code.instr("static_null: " + address_type + " = pcast static_zero: usize, " + address_type)
-        .instr("static_one: usize = capprim 1_usize")
-        .instr("static_storage: " + address_type + " = hrealloc static_null: " + address_type + ", static_one: usize")
-        .instr("store static_initial: " + typ + ", static_storage: " + address_type)
+        code = code.cast("static_null", address_type, reference("static_zero"), address_type)
+        .primitive("static_one", "usize", "1_usize")
+        .heap_realloc("static_storage", address_type, reference("static_null"), reference("static_one"))
+        .store(reference("static_initial"), reference("static_storage"))
         if owns_value {
-            code = code.instr("drop static_initial: " + typ)
+            code = code.drop_value(reference("static_initial"))
         }
-        code = code.instr("static_address: usize = pcast static_storage: " + address_type + ", usize")
-        .instr("static_drop: usize = call __ehir_function_address__" + name + "_static_drop[void,usize]()")
-        .instr("static_published: () = call encore_static_publish_owned(static_cell: u8*, static_address: usize, static_drop: usize)")
+        code = code.cast("static_address", "usize", reference("static_storage"), "usize")
+        .call("static_drop", "usize", "__ehir_function_address__" + name + "_static_drop[void,usize]", Vec[Operand]::new(), false)
+        .call("static_published", "()", "encore_static_publish_owned", vec![reference("static_cell"), reference("static_address"), reference("static_drop")], false)
     }
-    code = code.instr("br $ready").label("ready")
+    code = code.branch("ready").label("ready")
     if unit {
-        code = code.instr("ret void: ()")
+        code = code.return_value(annotated("void", "()"))
     } else {
-        code = code.instr("static_address_ready: usize = call encore_static_value(static_cell: u8*)")
-        .instr("static_storage_ready: " + typ + "* = pcast static_address_ready: usize, " + typ + "*")
-        .instr("static_result: " + typ + " = load static_storage_ready: " + typ + "*")
+        code = code.call("static_address_ready", "usize", "encore_static_value", vec![reference("static_cell")], false)
+        .cast("static_storage_ready", typ + "*", reference("static_address_ready"), typ + "*")
+        .load("static_result", typ, reference("static_storage_ready"))
         if owns_value {
-            code = code.instr("retain static_result: " + typ)
+            code = code.retain(reference("static_result"))
         }
-        code = code.instr("ret static_result: " + typ)
+        code = code.return_value(reference("static_result"))
     }
-    code = code.line("}").empty_line()
+    code = code.function_end()
     if !unit {
-        code = code.line("fn " + name + "_static_drop(address: usize) -> () {")
-        .label("entry")
-        .instr("storage: " + typ + "* = pcast address: usize, " + typ + "*")
+        let parameters = vec![parameter("address", "usize")]
+        let mut destructor = LoweringBuilder::new(LoweringScope::new(parameters))
+        .function_start(signature(name + "_static_drop", parameters, "()")).label("entry")
+        .cast("storage", typ + "*", reference("address"), typ + "*")
         if owns_value {
-            code = code.instr("value: " + typ + " = load storage: " + typ + "*")
-            .instr("drop value: " + typ)
+            destructor = destructor.load("value", typ, reference("storage")).drop_value(reference("value"))
         }
-        code = code.instr("hfree storage: " + typ + "*").instr("ret void: ()").line("}").empty_line()
+        destructor = destructor.heap_free(reference("storage")).return_value(annotated("void", "()")).function_end()
+        code = code.append(destructor)
     }
     ret code
 }

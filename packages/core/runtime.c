@@ -463,6 +463,8 @@ typedef struct {
 static _Thread_local bool encore_text_builder_suppressed = false;
 static _Thread_local bool encore_translation_diagnostic_json = false;
 
+bool encore_text_builder_is_suppressed(void) { return encore_text_builder_suppressed; }
+
 void encore_text_builder_set_suppressed(bool suppressed) {
     encore_text_builder_suppressed = suppressed;
 }

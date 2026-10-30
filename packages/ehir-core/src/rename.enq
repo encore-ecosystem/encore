@@ -1,0 +1,147 @@
+//! Rename nominal declarations and type references in one structural walk.
+import core::option::Option
+import std::vec::Vec
+import mod::core::*
+import mod::string_index::{StringIndex, string_index_get, string_index_set, string_index_with_capacity}
+
+struct Names { positions: StringIndex, replacements: Vec[str], blocked: Vec[str] }
+fn nested(names: Names, generics: Vec[Type]) -> Names {
+    let mut blocked = Vec[str]::new()
+    blocked.extend(names.blocked)
+    for generic in generics { blocked.push(generic.name) }
+    ret Names { names.positions, names.replacements, blocked }
+}
+fn spelling(value: str, names: Names) -> str {
+    if value.byte_len() >= 4_usize && value.slice_bytes(0_usize, 4_usize) == "dyn " { ret "dyn " + spelling(value.slice_bytes(4_usize, value.byte_len() - 4_usize), names) }
+    let mut end = 0_usize
+    while end < value.byte_len() {
+        let byte = value.byte_at(end)
+        if byte == 42_u8 || byte == 38_u8 || byte == 60_u8 || byte == 58_u8 { break }
+        end += 1_usize
+    }
+    let mut base = value.slice_bytes(0_usize, end)
+    for bound in names.blocked { if base == bound { ret value } }
+    let suffix = value.slice_bytes(end, value.byte_len() - end)
+    let mut previous = 0_usize
+    loop {
+        for bound in names.blocked { if base == bound { ret base + suffix } }
+        let position = string_index_get(names.positions, base)
+        if position == 0_usize || position <= previous { break }
+        previous = position
+        base = names.replacements.get_unchecked_borrowed(position - 1_usize)
+    }
+    ret base + suffix
+}
+fn typ(value: Type, names: Names) -> Type { ret Type { spelling(value.name, names), types(value.generics, names), value.representation } }
+fn types(values: Vec[Type], names: Names) -> Vec[Type] { let mut out = Vec[Type]::with_capacity(values.len()) for value in values { out.push(typ(value, names)) } ret out }
+fn variable(value: Variable, names: Names) -> Variable { ret Variable { value.name, typ(value.typ, names), value.kind } }
+fn variables(values: Vec[Variable], names: Names) -> Vec[Variable] { let mut out = Vec[Variable]::with_capacity(values.len()) for value in values { out.push(variable(value, names)) } ret out }
+fn maybe_type(value: Option[Type], names: Names) -> Option[Type] { match value { Some(value) => { ret Option[Type]::Some(typ(value, names)) } None => {} } ret Option[Type]::None }
+fn maybe_variable(value: Option[Variable], names: Names) -> Option[Variable] { match value { Some(value) => { ret Option[Variable]::Some(variable(value, names)) } None => {} } ret Option[Variable]::None }
+fn parameters(values: Vec[Parameter], names: Names) -> Vec[Parameter] { let mut out = Vec[Parameter]::new() for value in values { out.push(Parameter { value.name, typ(value.typ, names) }) } ret out }
+fn selector(value: FieldSelector, names: Names) -> FieldSelector { ret FieldSelector { value.name, maybe_type(value.annotation, names) } }
+fn enumeration(value: EnumValue, names: Names) -> EnumValue { ret EnumValue { spelling(value.name, names), types(value.generics, names), value.variant, maybe_variable(value.payload, names) } }
+fn pairs(values: Vec[PhiPair], names: Names) -> Vec[PhiPair] { let mut out = Vec[PhiPair]::new() for value in values { out.push(PhiPair { variable(value.value, names), value.label }) } ret out }
+fn arms(values: Vec[MatchArm], names: Names) -> Vec[MatchArm] { let mut out = Vec[MatchArm]::new() for value in values { out.push(MatchArm { value.variant, maybe_variable(value.payload_var, names), value.label }) } ret out }
+fn callable(value: str, names: Names) -> str {
+    // A bare value-namespace function is independent of a same-named type.
+    if !value.contains("::") { ret value }
+    ret spelling(value, names)
+}
+fn instruction(item: Instruction, names: Names) -> Instruction {
+    match item {
+        Instruction::Comment(value) => { ret Instruction::Comment(CommentInstruction { value.text }) }
+        Instruction::Lcpos(value) => { ret Instruction::Lcpos(LcposInstruction { variable(value.out, names), value.value }) }
+        Instruction::Alias(value) => { ret Instruction::Alias(AliasInstruction { variable(value.out, names), variable(value.src, names) }) }
+        Instruction::Lcsos(value) => { ret Instruction::Lcsos(LcsosInstruction { variable(value.out, names), typ(value.typ, names), variables(value.args, names) }) }
+        Instruction::Lceos(value) => { ret Instruction::Lceos(LceosInstruction { variable(value.out, names), enumeration(value.value, names) }) }
+        Instruction::Call(value) => { ret Instruction::Call(CallInstruction { variable(value.out, names), callable(value.name, names), types(value.generics, names), variables(value.args, names), value.is_unsafe }) }
+        Instruction::Await(value) => { ret Instruction::Await(AwaitInstruction { variable(value.out, names), variable(value.future, names) }) }
+        Instruction::Store(value) => { ret Instruction::Store(StoreInstruction { variable(value.src, names), variable(value.dst, names) }) }
+        Instruction::Load(value) => { ret Instruction::Load(LoadInstruction { variable(value.out, names), variable(value.src, names) }) }
+        Instruction::GetField(value) => { ret Instruction::GetField(GetFieldInstruction { variable(value.out, names), variable(value.src, names), selector(value.field, names) }) }
+        Instruction::SetField(value) => { ret Instruction::SetField(SetFieldInstruction { variable(value.src, names), selector(value.field, names), variable(value.value, names) }) }
+        Instruction::GetFieldPtr(value) => { ret Instruction::GetFieldPtr(GetFieldPtrInstruction { variable(value.out, names), variable(value.src, names), selector(value.field, names) }) }
+        Instruction::SGetField(value) => { ret Instruction::SGetField(SGetFieldInstruction { variable(value.out, names), variable(value.src, names), selector(value.field, names) }) }
+        Instruction::SGetFieldPtr(value) => { ret Instruction::SGetFieldPtr(SGetFieldPtrInstruction { variable(value.out, names), variable(value.src, names), selector(value.field, names) }) }
+        Instruction::GetPtr(value) => { ret Instruction::GetPtr(GetPtrInstruction { variable(value.out, names), variable(value.src, names) }) }
+        Instruction::Gep(value) => { ret Instruction::Gep(GepInstruction { variable(value.out, names), variable(value.src, names), variable(value.offset, names) }) }
+        Instruction::PtrCast(value) => { ret Instruction::PtrCast(PtrCastInstruction { variable(value.out, names), variable(value.src, names), typ(value.target_type, names) }) }
+        Instruction::StackAlloc(value) => { ret Instruction::StackAlloc(StackAllocInstruction { variable(value.out, names), typ(value.typ, names) }) }
+        Instruction::HeapAlloc(value) => { ret Instruction::HeapAlloc(HeapAllocInstruction { variable(value.out, names), typ(value.typ, names) }) }
+        Instruction::HeapRealloc(value) => { ret Instruction::HeapRealloc(HeapReallocInstruction { variable(value.out, names), variable(value.src, names), variable(value.count, names) }) }
+        Instruction::HeapFree(value) => { ret Instruction::HeapFree(HeapFreeInstruction { variable(value.src, names) }) }
+        Instruction::Put(value) => { ret Instruction::Put(PutInstruction { value.primitive, variable(value.dst, names) }) }
+        Instruction::Binary(value) => { ret Instruction::Binary(BinaryInstruction { variable(value.out, names), variable(value.lhs, names), variable(value.rhs, names), value.op }) }
+        Instruction::Phi(value) => { ret Instruction::Phi(PhiInstruction { variable(value.out, names), pairs(value.pairs, names) }) }
+        Instruction::AddEdge(value) => { ret Instruction::AddEdge(EdgeInstruction { variable(value.owner, names), variable(value.value, names) }) }
+        Instruction::RemoveEdge(value) => { ret Instruction::RemoveEdge(EdgeInstruction { variable(value.owner, names), variable(value.value, names) }) }
+        Instruction::Cfree(value) => { ret Instruction::Cfree(CfreeInstruction { variable(value.value, names) }) }
+        Instruction::Drop(value) => { ret Instruction::Drop(DropInstruction { variable(value.value, names) }) }
+        Instruction::Retain(value) => { ret Instruction::Retain(RetainInstruction { variable(value.value, names) }) }
+    }
+}
+
+fn terminator(item: Terminator, names: Names) -> Terminator {
+    match item {
+        Terminator::Unreachable => { ret Terminator::Unreachable }
+        Terminator::Ret(value) => { ret Terminator::Ret(ReturnInstruction { variable(value.value, names) }) }
+        Terminator::Br(value) => { ret Terminator::Br(BranchInstruction { value.label }) }
+        Terminator::Cbr(value) => { ret Terminator::Cbr(ConditionalBranchInstruction { variable(value.cond, names), value.true_label, value.false_label }) }
+        Terminator::Match(value) => { ret Terminator::Match(MatchInstruction { variable(value.scrutinee, names), value.default_label, arms(value.arms, names) }) }
+        Terminator::Switch(value) => { ret Terminator::Switch(SwitchInstruction { variable(value.scrutinee, names), value.default_label, value.cases }) }
+    }
+}
+
+fn function(value: FnDirective, outer: Names) -> FnDirective {
+    let names = nested(outer, value.generics)
+    let mut blocks = Vec[Block]::new()
+    for block in value.blocks {
+        let mut instructions = Vec[Instruction]::with_capacity(block.instructions.len())
+        for item in block.instructions { instructions.push(instruction(item, names)) }
+        blocks.push(Block { block.name, instructions, terminator(block.terminator, names) })
+    }
+    ret FnDirective { callable(value.name, names), value.generics, parameters(value.params, names), typ(value.ret_type, names), blocks, value.is_extern, value.is_async }
+}
+fn directive(item: Directive, outer: Names) -> Directive {
+    match item {
+        Directive::Struct(value) => { let names = nested(outer, value.generics) ret Directive::Struct(StructDirective { spelling(value.name, outer), value.generics, parameters(value.fields, names), value.resource_retain, value.resource_release }) }
+        Directive::Enum(value) => {
+            let names = nested(outer, value.generics)
+            let mut variants = Vec[EnumVariant]::new()
+            for variant in value.variants { variants.push(EnumVariant { variant.name, maybe_type(variant.payload_type, names) }) }
+            ret Directive::Enum(EnumDirective { spelling(value.name, outer), value.generics, variants })
+        }
+        Directive::Function(value) => { ret Directive::Function(function(value, outer)) }
+        Directive::Trait(value) => {
+            let names = nested(outer, value.generics)
+            let mut methods = Vec[TraitMethod]::new()
+            for method in value.methods { let scope = nested(names, method.generics) methods.push(TraitMethod { method.name, method.generics, parameters(method.params, scope), typ(method.ret_type, scope) }) }
+            ret Directive::Trait(TraitDirective { spelling(value.name, outer), value.generics, methods })
+        }
+        Directive::Impl(value) => {
+            let names = nested(outer, value.generics)
+            let mut methods = Vec[FnDirective]::new()
+            for method in value.methods { methods.push(function(method, names)) }
+            ret Directive::Impl(ImplDirective { spelling(value.trait_name, names), types(value.trait_args, names), typ(value.for_type, names), value.generics, methods })
+        }
+    }
+}
+
+pub fn rename_module_types(module: Module, replacements: Vec[(str, str)]) -> Module {
+    if replacements.is_empty() { ret module }
+    let mut positions = string_index_with_capacity(replacements.len())
+    let mut values = Vec[str]::with_capacity(replacements.len())
+    for pair in replacements { string_index_set(positions, pair.0, values.len()) values.push(pair.1) }
+    let names = Names { positions, values, Vec[str]::new() }
+    let mut declarations = Vec[Directive]::with_capacity(module.directives.len())
+    for item in module.directives { declarations.push(directive(item, names)) }
+    let mut documentation = Vec[EhirDocumentation]::new()
+    for item in module.symbol_documentation { documentation.push(EhirDocumentation { documentation_target(item.target, names), item.text }) }
+    ret Module { module.name, module.imports, module.documentation, documentation, declarations }
+}
+
+fn documentation_target(target: str, names: Names) -> str {
+    if target.byte_len() >= 5_usize && target.slice_bytes(0_usize, 5_usize) == "impl " { ret "impl " + spelling(target.slice_bytes(5_usize, target.byte_len() - 5_usize), names) }
+    ret spelling(target, names)
+}
