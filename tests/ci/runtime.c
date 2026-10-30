@@ -4,6 +4,59 @@
 #include "../../../tests/native/cache_payload.c"
 #include <sys/stat.h>
 
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <execinfo.h>
+#include <signal.h>
+#include <sys/ucontext.h>
+#include <unistd.h>
+
+static unsigned char encore_ci_signal_stack[64 * 1024]
+    __attribute__((aligned(16)));
+
+static void encore_ci_write_address(const char *label, size_t length,
+                                    uintptr_t address) {
+    static const char digits[] = "0123456789abcdef";
+    char value[2 + sizeof(address) * 2 + 1];
+    value[0] = '0'; value[1] = 'x';
+    for (size_t i = 0; i < sizeof(address) * 2; ++i)
+        value[2 + i] = digits[(address >> ((sizeof(address) * 2 - i - 1) * 4)) & 15];
+    value[sizeof(value) - 1] = '\n';
+    (void)write(STDERR_FILENO, label, length);
+    (void)write(STDERR_FILENO, value, sizeof(value));
+}
+
+static void encore_ci_native_crash(int signal_number, siginfo_t *info,
+                                    void *raw_context) {
+    ucontext_t *context = raw_context;
+    encore_ci_write_address("CI native signal: ", 18, (uintptr_t)signal_number);
+    encore_ci_write_address("fault address: ", 15, (uintptr_t)info->si_addr);
+    encore_ci_write_address("pc: ", 4, (uintptr_t)context->uc_mcontext->__ss.__pc);
+    encore_ci_write_address("lr: ", 4, (uintptr_t)context->uc_mcontext->__ss.__lr);
+    encore_ci_write_address("sp: ", 4, (uintptr_t)context->uc_mcontext->__ss.__sp);
+    encore_ci_write_address("fp: ", 4, (uintptr_t)context->uc_mcontext->__ss.__fp);
+    void *frames[32];
+    int count = backtrace(frames, 32);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    _exit(128 + signal_number);
+}
+
+__attribute__((constructor))
+static void encore_ci_enable_native_crash_diagnostics(void) {
+    const char *enabled = getenv("ENCORE_CI_CRASH_DIAGNOSTICS");
+    if (enabled == NULL || strcmp(enabled, "1") != 0) return;
+    stack_t alternate = {0};
+    alternate.ss_sp = encore_ci_signal_stack;
+    alternate.ss_size = sizeof(encore_ci_signal_stack);
+    if (sigaltstack(&alternate, NULL) != 0) abort();
+    struct sigaction action = {0};
+    action.sa_sigaction = encore_ci_native_crash;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGBUS, &action, NULL) != 0 ||
+        sigaction(SIGSEGV, &action, NULL) != 0) abort();
+}
+#endif
+
 size_t encore_ci_process_id(void) {
 #ifdef _WIN32
     return (size_t)GetCurrentProcessId();
