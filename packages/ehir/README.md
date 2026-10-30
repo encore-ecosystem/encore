@@ -24,6 +24,12 @@ registered implementations with `--list-backends`; the current CLI registers
 LLVM only. The separate inspection backend in the integration fixtures verifies
 that extension packages need neither the compiler facade nor LLVM dependencies.
 
+Native LLVM emission explicitly selects SelectionDAG with
+`-fno-experimental-isel`. This keeps nested aggregate calls consistent when
+older GlobalISel implementations fall back for individual functions on Darwin
+ARM64. Encore builds, standalone tests and the EHIR native API use this policy.
+When compiling exported LLVM IR with Clang directly, pass this flag as well.
+
 ## CLI
 
 ```sh
