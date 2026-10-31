@@ -557,10 +557,20 @@ struct TranslationExportSyntax {
     paths: Vec[(str, bool)]
     targets: Vec[usize]
     imports: Vec[str]
+    nominal_imports: Vec[TranslationNominalImport]
 }
 
 struct TranslationExportEdge {
     target: usize
+    bindings: Vec[(str, str, bool)]
+}
+
+// Import leaves are syntax facts. Decode them once, retaining target/path
+// order and the distinction between a selected import and a bare namespace.
+struct TranslationNominalImport {
+    target: usize
+    is_public: bool
+    is_selected: bool
     bindings: Vec[(str, str, bool)]
 }
 
@@ -1227,18 +1237,13 @@ fn resolve_type_collision_uncached(ctx: mut TranslatorContext, module: usize, na
     let syntax = cached_export_syntax(ctx, module)
     if !cached_module_declares_type(ctx, module, name) {
         let mut imported = ""
-        for target_position in syntax.targets {
-            let target_id = module_id_at(ctx, target_position)
-            let target = cached_module_import_path(ctx, target_id)
-            for path in syntax.paths {
-                if !starts_with(path.0, target + "::") {
-                    continue
-                }
-                for binding in import_binding_names(path.0, target) {
+        for imported_path in syntax.nominal_imports {
+            if imported_path.is_selected {
+                for binding in imported_path.bindings {
                     if binding.1 != name {
                         continue
                     }
-                    let identity = exported_type_identity(ctx, target_position, binding.0, 0_usize)
+                    let identity = exported_type_identity(ctx, imported_path.target, binding.0, 0_usize)
                     if identity != "" {
                         if imported != "" && imported != identity {
                             ret ""
@@ -2270,6 +2275,7 @@ fn cached_export_syntax(ctx: mut TranslatorContext, module_position: usize) -> T
         }
     }
     let mut edges = Vec[TranslationExportEdge]::new()
+    let mut nominal_imports = Vec[TranslationNominalImport]::new()
     let mut targets = Vec[usize]::new()
     // Preserve module and import order, including duplicate module identities.
     for target in 0_usize..ctx.modules.len() {
@@ -2280,17 +2286,22 @@ fn cached_export_syntax(ctx: mut TranslatorContext, module_position: usize) -> T
         targets.push(target)
         let target_path = cached_module_import_path(ctx, target_id)
         for path in paths {
-            if path.1 && starts_with(path.0, target_path + "::") {
-                edges.push(TranslationExportEdge {
-                        target, import_binding_names(path.0, target_path)
+            let selected = starts_with(path.0, target_path + "::")
+            if selected || path.0 == target_path {
+                let bindings = import_binding_names(path.0, target_path)
+                nominal_imports.push(TranslationNominalImport {
+                        target, path.1, selected, bindings
                     }
                 )
+                if path.1 && selected {
+                    edges.push(TranslationExportEdge { target, bindings })
+                }
             }
         }
     }
     let result = TranslationExportSyntax {
         module.module_id, functions, edges,
-        module.source_name, types, traits, paths, targets, module.imports
+        module.source_name, types, traits, paths, targets, module.imports, nominal_imports
     }
     ctx.imports.exports.push(result)
     unsafe {
@@ -3300,20 +3311,16 @@ fn resolve_exported_type_identity(ctx: mut TranslatorContext, module: usize, nam
         }
     }
     let mut found = ""
-    for candidate in syntax.targets {
-        let target = cached_module_import_path(ctx, module_id_at(ctx, candidate))
-        for path in syntax.paths {
-            if !path.1 || !(path.0 == target || starts_with(path.0, target + "::")) {
-                continue
-            }
-            for binding in import_binding_names(path.0, target) {
+    for imported_path in syntax.nominal_imports {
+        if imported_path.is_public {
+            for binding in imported_path.bindings {
                 if binding.1 == name || binding.0 == "*" {
                     let original = if binding.0 == "*" {
                         name
                     } else {
                         binding.0
                     }
-                    let resolved = exported_type_identity(ctx, candidate, original, depth + 1_usize)
+                    let resolved = exported_type_identity(ctx, imported_path.target, original, depth + 1_usize)
                     if resolved != "" {
                         if found != "" && found != resolved {
                             ret ""
@@ -16312,12 +16319,34 @@ fn typed_params_in_context(ctx: mut TranslatorContext, item: FunctionItem) -> Ve
 fn qualify_typed_module_collisions(ctx: mut TranslatorContext, module: TranslationModule, value: Module) -> Module {
     let started = perf_counter_ms()
     let module_position = translation_module_position(ctx, module)
+    let referenced = unsafe {
+        encore_strset_new()
+    }
+    for name in module_nominal_type_names(value) {
+        let _ = unsafe {
+            encore_strset_insert(referenced, name)
+        }
+    }
     let mut replacements = Vec[(str, str)]::new()
     for name in ctx.type_collisions {
+        if !unsafe {
+            encore_strset_contains(referenced, name)
+        }
+        {
+            continue
+        }
         let resolved = resolved_type_collision(ctx, module_position, name)
         if !resolved.is_empty() && resolved != name {
             replacements.push((name, resolved))
+            // Preserve sequential substitutions when a replacement introduces
+            // a later candidate, including generated-looking user type names.
+            let _ = unsafe {
+                encore_strset_insert(referenced, resolved)
+            }
         }
+    }
+    unsafe {
+        encore_strset_free(referenced)
     }
     let resolved = perf_counter_ms()
     let result = rename_module_types(value, replacements)
@@ -16327,6 +16356,66 @@ fn qualify_typed_module_collisions(ctx: mut TranslatorContext, module: Translati
     }
     ret result
 }
+
+#attr(test)
+fn translator_nominal_typed_demand_matches_full_resolution() -> bool {
+    let modules = vec![
+        export_contract_module("left", Vec[str]::new(), "pub struct Value {} pub struct __encore_t6c656674__Value {}"),
+        export_contract_module("right", Vec[str]::new(), "pub struct Value {} pub struct __encore_t6c656674__Value {}")
+    ]
+    let mut ast = Vec[Statement]::new()
+    for module in modules {
+        ast.extend(module.ast)
+    }
+    let value = plain_type("Value", Vec[Type]::new())
+    let scalar = plain_type("u32", Vec[Type]::new())
+    let generic = FnDirective {
+        "identity", vec![value], vec![param("Value", value)], value,
+        vec![block("entry", Vec[Instruction]::new(), ret_term(var("Value", value)))], false, false
+    }
+    let method = FnDirective {
+        "sample", Vec[Type]::new(), Vec[Parameter]::new(), scalar,
+        vec![block("entry", vec![call(var("result", scalar), "Value::read", Vec[Type]::new(), Vec[Variable]::new(), false)],
+                ret_term(var("result", scalar)),)], false, false
+    }
+    let samples = vec![
+        make_module("empty", Vec[Directive]::new()),
+        make_module("declaration", vec![struct_directive("Value", Vec[Type]::new(), vec![param("Value", value)])]),
+        make_module("generic", vec![Directive::Function(generic)]),
+        make_module("method", vec![Directive::Function(method)]),
+        make_module_with_metadata("docs", Vec[EhirImport]::new(), Option[str]::None,
+            vec![ehir_documentation("impl Value", "Value is a literal here")], Vec[Directive]::new(),)
+    ]
+    let mut correct = true
+    for stable in vec![false, true] {
+        let mut ctx = collect_context_with_abi(ast, modules, host_target(), Vec[str]::new(), stable)
+        ctx.type_collisions = vec!["Value", "__encore_t6c656674__Value"]
+        ctx.type_identity_scope_size = ctx.type_collisions.len()
+        for position in 0_usize..modules.len() {
+            let owner = modules.get_unchecked_borrowed(position)
+            for sample in samples {
+                let before = ctx.type_identity_values.len()
+                let actual = qualify_typed_module_collisions(ctx, owner, sample)
+                if sample.name == "empty" && ctx.type_identity_values.len() != before {
+                    correct = false
+                }
+                let mut replacements = Vec[(str, str)]::new()
+                for name in ctx.type_collisions {
+                    let resolved = reference_resolve_type_collision_uncached(ctx, owner, name)
+                    if !resolved.is_empty() && resolved != name {
+                        replacements.push((name, resolved))
+                    }
+                }
+                if module_to_string(actual) != module_to_string(rename_module_types(sample, replacements)) {
+                    correct = false
+                }
+            }
+        }
+        free_translation_indexes(ctx)
+    }
+    ret correct
+}
+
 fn qualify_typed_items_collisions(ctx: mut TranslatorContext, owner: TranslationModule, items: Vec[IrItem]) -> Vec[IrItem] {
     let module = match module_from_ir_items(owner.module_id, Vec[EhirImport]::new(), Option[str]::None, items) {
         Ok(value) => value Err(message) => {
@@ -16828,6 +16917,51 @@ fn translator_nominal_index_matches_ast_reference() -> bool {
             }
         }
         ctx.type_collisions = saved
+        free_translation_indexes(ctx)
+    }
+    ret correct
+}
+
+#attr(test)
+fn translator_nominal_import_plan_matches_ast_reference() -> bool {
+    let modules = vec![
+        export_contract_module("model@types/mod.enq", Vec[str]::new(),
+            "pub struct Shared {} pub struct Item {} pub enum Choice { Empty } struct Hidden {} pub struct Data {}",),
+        export_contract_module("other@lib.enq", Vec[str]::new(), "pub struct Shared {} pub struct Item {}"),
+        export_contract_module("facade@lib.enq", vec!["model@types/mod.enq", "other@lib.enq"],
+            "pub import model::types::{Shared as Alias,Choice,Data}\nimport other::Item as Private\npub import model::types::{Shared as Again}",),
+        export_contract_module("bare@lib.enq", vec!["model@types/mod.enq"], "pub import model::types"),
+        export_contract_module("left@lib.enq", vec!["model@types/mod.enq", "right@lib.enq"],
+            "pub import model::types::*\npub import right::*",),
+        export_contract_module("right@lib.enq", vec!["left@lib.enq", "other@lib.enq"],
+            "pub import left::*\npub import other::{Shared as Alias}",),
+        export_contract_module("consumer@lib.enq", vec!["facade@lib.enq", "bare@lib.enq", "left@lib.enq", "other@lib.enq"],
+            "import facade::{Alias as Selected,Again,Choice,Data,Private}\nimport bare::*\nimport left::*\nimport other::{Shared as Alias}\nstruct Item {}",)
+    ]
+    let mut ast = Vec[Statement]::new()
+    for module in modules {
+        ast.extend(module.ast)
+    }
+    let mut correct = true
+    for stable in vec![false, true] {
+        let mut ctx = collect_context_with_abi(ast, modules, host_target(), Vec[str]::new(), stable)
+        for _ in 0_usize..2_usize {
+            for position in 0_usize..modules.len() {
+                let module = modules.get_unchecked_borrowed(position)
+                for name in vec!["Shared", "Alias", "Selected", "Again", "Item", "Choice", "Hidden", "Data", "Private", "Missing"] {
+                    if resolve_type_collision_uncached(ctx, position, name) !=
+                    reference_resolve_type_collision_uncached(ctx, module, name) {
+                        correct = false
+                    }
+                    for depth in 0_usize..modules.len() + 2_usize {
+                        if exported_type_identity(ctx, position, name, depth) !=
+                        reference_exported_type_identity(ctx, module, name, depth) {
+                            correct = false
+                        }
+                    }
+                }
+            }
+        }
         free_translation_indexes(ctx)
     }
     ret correct

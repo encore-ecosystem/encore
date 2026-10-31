@@ -1,0 +1,75 @@
+//! Typed lowering preserves facade identities, cycles and lexical binders.
+import core::testing::assert
+import std::vec::Vec
+
+import refrain::frontend::lexer::Lexer
+import refrain::frontend::parser::Parser
+import refrain::frontend::translator::{TranslatedModuleChunk, TranslationModule, translate_compilation_unit_to_ehir_chunks}
+import refrain::target::host_target
+
+extern fn ehir_debug_bundle_parse_count() -> usize
+extern fn ehir_debug_reset_bundle_parse_count() ->()
+
+fn module(id: str, imports: Vec[str], source: str) -> TranslationModule {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source(id)
+    ret TranslationModule::new(id, id, imports, parser.parse(lexer.tokenize(source)), Vec[str]::new())
+}
+
+fn text_at(chunks: Vec[TranslatedModuleChunk], index: usize) -> str {
+    for chunk in chunks {
+        if chunk.index == index {
+            ret chunk.as_text()
+        }
+    }
+    ret ""
+}
+
+fn main() -> u32 {
+    let mut modules = vec![
+        module("origin@lib.enq", Vec[str]::new(), "pub struct Data { value: u32 }"),
+        module("other@lib.enq", Vec[str]::new(), "pub struct Data { value: bool }"),
+        module("facade@lib.enq", vec!["origin@lib.enq"], "pub import origin::{Data as Shared}"),
+        module("left@lib.enq", vec!["origin@lib.enq", "right@lib.enq"], "pub import origin::*\npub import right::*"),
+        module("right@lib.enq", vec!["origin@lib.enq", "left@lib.enq"], "pub import origin::*\npub import left::*"),
+        module("bare@lib.enq", vec!["origin@lib.enq"], "pub import origin"),
+        module("user@lib.enq", vec!["facade@lib.enq", "left@lib.enq", "bare@lib.enq"],
+            "import facade::{Shared as Input}\nimport left::{Data as Cyclic}\nimport bare::*\n" +
+            "fn identity(value: Input) -> Input { ret value }\n" +
+            "fn cycle(value: Cyclic) -> Cyclic { ret value }\n" +
+            "fn generic[Input](value: Input) -> Input { ret value }\n" +
+            "fn literal() -> str { ret \"Input\" }\n",)
+    ]
+    unsafe {
+        ehir_debug_reset_bundle_parse_count()
+    }
+    let chunks = translate_compilation_unit_to_ehir_chunks(modules, host_target(), vec![2_usize, 5_usize, 6_usize])
+    let user = text_at(chunks, 6_usize)
+    let canonical = "__encore_t6f726967696e406c69622e656e71__Data"
+    if !assert(user.contains("identity(value: " + canonical + ") -> " + canonical)) {
+        ret 1_u32
+    }
+    if !assert(user.contains("cycle(value: " + canonical + ") -> " + canonical)) {
+        ret 2_u32
+    }
+    if !assert(user.contains("generic[Input](value: Input) -> Input") && user.contains("\"Input\"_str")) {
+        ret 3_u32
+    }
+    if !assert(!text_at(chunks, 2_usize).contains("struct ") && !text_at(chunks, 5_usize).contains("struct ")) {
+        ret 4_u32
+    }
+    // An unrelated declaration must neither change output nor create a text
+    // round trip while demand is collected from the typed graph.
+    modules.push(module("unused@lib.enq", Vec[str]::new(), "pub struct Input {} pub struct Cyclic {} pub struct Hidden {}"))
+    let extended = translate_compilation_unit_to_ehir_chunks(modules, host_target(), vec![6_usize])
+    if !assert(text_at(extended, 6_usize) == user) {
+        ret 5_u32
+    }
+    if !assert(unsafe {
+            ehir_debug_bundle_parse_count()
+        }
+        == 0_usize) {
+        ret 6_u32
+    }
+    ret 0_u32
+}
