@@ -21,12 +21,13 @@ import rich::style::{accent, error_text, muted}
 import mod::ir::{LoweringBuilder, LoweringScope, Operand, annotated, legacy_ir_text, reference, references}
 import refrain::cache_identity::compiler_content_digest
 import refrain::frontend::control_flow::{block_terminates_flow, match_arm_terminates_flow, match_stmt_terminates_flow, statement_terminates_flow}
-import refrain::frontend::import_paths::{expanded_import_paths, import_binding_names, import_namespace_target, normalized_import_target}
+import refrain::frontend::import_paths::{expanded_import_paths, import_binding_names, import_namespace_target, namespace_import_candidates, normalized_import_target}
 import refrain::frontend::lexer::Lexer
 import refrain::frontend::metadata_ast::encode_lowered_function_input
 import refrain::frontend::parser::Parser
 import refrain::frontend::parser::statements::{ArrayLiteralExpr, ArrayRepeatExpr, AssignmentStmt, BinaryExpr, BlockExpr, CallExpr, CastExpr, ClosureExpr, DecoratorApplication, DoWhileStmt, Documentation, EhirStmt, EnumStmt, Expr, ExprNode, FieldExpr, ForStmt, FunctionItem, FunctionParam, GenericParam, IfBranch, IfExpr, IfExprBranch, IfStmt, ImplStmt, ImportStmt, IndexExpr, LetStmt, LoopStmt, MatchArmBody, MatchExpr, MatchExprArm, MatchPattern, MatchStmt, MethodCallExpr, NamedField, ParsedBlock, ParsedEnumVariant, ParsedMatchArm, Statement, StructInitExpr, StructStmt, TraitBound, TraitStmt, TupleLiteralExpr, UnaryExpr, WhileStmt, WithStmt}
 import refrain::frontend::reflection::{ReflectionShape, calls_reflection_templates, expand_reflection_function, function_uses_reflection, mark_reflection_templates, reflection_template_names, specialize_reflection_function}
+import refrain::frontend::semantic_slice::SemanticKeyIndex
 import refrain::target::{TargetSpec, cfg_active_with_features, host_target}
 
 extern fn encore_text_sha256(value: str) -> str
@@ -555,6 +556,7 @@ struct TranslationExportSyntax {
     types: Vec[(str, bool)]
     traits: Vec[str]
     paths: Vec[(str, bool)]
+    namespace_imports: Vec[(str, Vec[str])]
     targets: Vec[usize]
     imports: Vec[str]
     nominal_imports: Vec[TranslationNominalImport]
@@ -2299,9 +2301,14 @@ fn cached_export_syntax(ctx: mut TranslatorContext, module_position: usize) -> T
             }
         }
     }
+    let mut namespace_targets = Vec[str]::with_capacity(module.imports.len())
+    for target in module.imports {
+        namespace_targets.push(cached_module_import_path(ctx, target))
+    }
+    let namespace_imports = prepare_namespace_imports(paths, namespace_targets)
     let result = TranslationExportSyntax {
         module.module_id, functions, edges,
-        module.source_name, types, traits, paths, targets, module.imports, nominal_imports
+        module.source_name, types, traits, paths, namespace_imports, targets, module.imports, nominal_imports
     }
     ctx.imports.exports.push(result)
     unsafe {
@@ -4419,10 +4426,60 @@ fn resolve_imported_namespace_path(ctx: mut TranslatorContext, source_name: str,
     }
     let caller = cached_export_syntax(ctx, encoded - 1_usize)
     let requested = module_import_target(caller.module_id, requested)
-    for path in caller.paths {
-        for target in caller.imports {
-            let target_path = cached_module_import_path(ctx, target)
-            let expanded = import_namespace_target(path.0, target_path, requested)
+    ret resolve_namespace_imports(caller.namespace_imports, requested)
+}
+
+// Decode candidate module paths once per immutable export summary. Keep path
+// order and the caller's import order; candidate spelling order is not priority.
+fn prepare_namespace_imports(paths: Vec[(str, bool)], targets: Vec[str]) -> Vec[(str, Vec[str])] {
+    let mut positions = SemanticKeyIndex::new(targets.len())
+    for ordinal in 0_usize..targets.len() {
+        let target = targets.get_unchecked_borrowed(ordinal)
+        if positions.get(target) == 0_usize {
+            positions.set(target, ordinal)
+        }
+    }
+    let mut imports = Vec[(str, Vec[str])]::new()
+    for path in paths {
+        let mut selected = Vec[str]::new()
+        match namespace_import_candidates(path.0) {
+            Some(candidates) => {
+                let mut ordinals = Vec[usize]::new()
+                for candidate in candidates {
+                    let ordinal = positions.get(candidate)
+                    if ordinal != 0_usize {
+                        ordinals.push(ordinal - 1_usize)
+                    }
+                }
+                for index in 1_usize..ordinals.len() {
+                    let mut cursor = index
+                    while cursor > 0_usize && ordinals.get_unchecked_borrowed(cursor) < ordinals.get_unchecked_borrowed(cursor - 1_usize) {
+                        let previous = ordinals.get_unchecked_borrowed(cursor - 1_usize)
+                        ordinals.set(cursor - 1_usize, ordinals.get_unchecked_borrowed(cursor))
+                        ordinals.set(cursor, previous)
+                        cursor -= 1_usize
+                    }
+                }
+                for ordinal in ordinals {
+                    selected.push(targets.get_unchecked_borrowed(ordinal))
+                }
+            }
+            None => {
+                // Incomplete/editor import text retains the tolerant scan.
+                selected = targets
+            }
+        }
+        if !selected.is_empty() {
+            imports.push((path.0, selected))
+        }
+    }
+    ret imports
+}
+
+fn resolve_namespace_imports(imports: Vec[(str, Vec[str])], requested: str) -> str {
+    for entry in imports {
+        for target in entry.1 {
+            let expanded = import_namespace_target(entry.0, target, requested)
             if expanded != "" {
                 ret expanded
             }
@@ -4430,6 +4487,58 @@ fn resolve_imported_namespace_path(ctx: mut TranslatorContext, source_name: str,
     }
     ret requested
 }
+
+#attr(test)
+fn translator_namespace_candidates_match_ordered_scan() -> bool {
+    let modules = vec!["a::c", "a::b", "a", "a::nested::d", "pkg::mod", "mod", "core::vec",
+        "a::*", "refrain::child", "пример::модуль", "a::b as chosen", "a as z::b", "a::as chosen", "a::b"]
+    let paths = vec!["a", "a::b", "a::b as chosen", "a::{b,c}", "a::{b as chosen,c as chosen}",
+        "a::{nested::{d as deep},b}", "a::*", "a::{*,b as chosen}", "pkg::mod", "pkg::mod as picked",
+        " core::vec as list ", "refrain::child as local", "пример::{модуль as имя}", "missing", "",
+        "a::{b,c", "a:: b as chosen", "a::\tb as chosen", "a as z::b as chosen", "a as z::b",
+        "a::{b as chosen,c", "a::", "a:: as chosen"]
+    let requests = vec!["a", "b", "c", "chosen", "chosen::inner", "deep", "mod", "picked::nested",
+        "list", "local", "имя", "unknown", "b as chosen", "*", "as chosen", ""]
+    let mut reversed = Vec[str]::new()
+    let mut position = modules.len()
+    while position > 0_usize {
+        position -= 1_usize
+        reversed.push(modules.get_unchecked_borrowed(position))
+    }
+    let mut combinations = Vec[Vec[(str, bool)]]::new()
+    for path in paths {
+        combinations.push(vec![(path, false)])
+    }
+    combinations.push(vec![("a::b as chosen", false),("a::c as chosen", true)])
+    combinations.push(vec![("a::c as chosen", true),("a::b as chosen", false)])
+    for targets in vec![modules, reversed, Vec[str]::new()] {
+        for imports in combinations {
+            let candidates = prepare_namespace_imports(imports, targets)
+            for requested in requests {
+                let mut reference = requested
+                let mut found = false
+                for path in imports {
+                    for target in targets {
+                        let expanded = import_namespace_target(path.0, target, requested)
+                        if !expanded.is_empty() {
+                            reference = expanded
+                            found = true
+                            break
+                        }
+                    }
+                    if found {
+                        break
+                    }
+                }
+                if resolve_namespace_imports(candidates, requested) != reference {
+                    ret false
+                }
+            }
+        }
+    }
+    ret true
+}
+
 fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, source_name: str, name: str, actual_types:
     Vec[str],) -> Option[FunctionType] {
     if function_owner_is_generic(ctx, name) {
