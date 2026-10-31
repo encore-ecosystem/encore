@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +49,50 @@ def main():
     assert b"define i32 @answer" in original
     run("llvm-explicit", [ehir, source, "--backend", "llvm", "--emit", "llvm-ir", "-o", llvm])
     assert llvm.read_bytes() == original
+
+    # Validate the allocated object layout, independently of the host backend's
+    # rounding of SP. Darwin's native prober can subtract the ABI size directly.
+    node_source = work / "stack nodes.ehir"
+    node_text = []
+    for name, scalar, count in [("Four", "u32", 1), ("Eight", "u64", 1),
+                                ("Twelve", "u32", 3), ("TwentyFour", "u64", 3)]:
+        fields = "\n".join(f"  field{i}: {scalar}" for i in range(count))
+        parameters = ", ".join(f"value{i}: {scalar}" for i in range(count))
+        node_text.append(f"struct {name} {{\n{fields}\n}}\n"
+                         f"fn build_{name}({parameters}) -> () {{\n$entry:\n  br $allocate\n"
+                         f"$allocate:\n  node: {name}<S> = lcsos {name}<S>({parameters})\n"
+                         f"  drop node: {name}<S>\n  ret void: ()\n}}\n")
+    node_source.write_text("\n".join(node_text))
+    node_llvm = work / "stack-nodes.ll"
+    run("stack-node-llvm", [ehir, node_source, "--emit", "llvm-ir", "-o", node_llvm])
+    node_ir = node_llvm.read_text()
+    storage_types = re.findall(r"^\s*%\S+_stack_storage = alloca (.+)$", node_ir, re.MULTILINE)
+    assert len(storage_types) == 4, storage_types
+    queries = []
+    for index, typ in enumerate(storage_types):
+        # Field 1 must retain the runtime's 64-byte payload offset.
+        payload = re.search(r",\s*(%[^,{}]+)\s*}$", typ)
+        assert payload, typ
+        queries.extend([
+            f"@node_size_{index} = constant i64 ptrtoint ({typ}* getelementptr ({typ}, {typ}* null, i32 1) to i64)",
+            f"@node_payload_{index} = constant i64 ptrtoint ({payload[1]}* "
+            f"getelementptr ({typ}, {typ}* null, i32 0, i32 1) to i64)",
+            f"@node_alignment_{index} = constant i64 ptrtoint ({typ}* "
+            f"getelementptr ({{ i8, {typ} }}, {{ i8, {typ} }}* null, i32 0, i32 1) to i64)",
+        ])
+    layout_input = work / "stack-layout.ll"
+    layout_input.write_text(node_ir + "\n" + "\n".join(queries) + "\n")
+    for target in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu",
+                   "x86_64-pc-windows-msvc", "x86_64-w64-windows-gnu", "aarch64-w64-windows-gnu"]:
+        layout_output = work / ("stack-layout-" + target + ".ll")
+        run("stack-layout-" + target, ["clang", "--target=" + target, "-Wno-override-module",
+                                      "-S", "-emit-llvm", "-O1", layout_input, "-o", layout_output])
+        layout = layout_output.read_text()
+        for index in range(4):
+            values = {kind: int(re.search(rf"@node_{kind}_{index} = .*constant i64 (\d+)", layout)[1])
+                      for kind in ["size", "payload", "alignment"]}
+            assert values["size"] % 16 == 0 and values["alignment"] >= 16, (target, index, values)
+            assert values["payload"] == 64, (target, index, values)
     obj = work / "answer object.o"
     run("object", [ehir, source, "-o", obj])
     assert obj.read_bytes().startswith(b"\x7fELF"), "expected a real native ELF object"
