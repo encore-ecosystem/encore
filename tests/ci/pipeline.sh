@@ -47,7 +47,7 @@ case "$CI_PROBE_CASE" in
     export CI_TARGET=x86_64-unknown-linux-gnu CI_EXECUTABLE=encore
     export CI_SEED_TAG=v0.1.1-neumann
     export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-    for scenario in valid corrupt missing-sources wrong-commit legacy-provenance; do
+    for scenario in valid corrupt missing-sources wrong-commit legacy-provenance wrong-profile missing-profile; do
       workspace="$scratch/$scenario/encore"
       context="$workspace/target/test-context"
       mkdir -p "$context/bin" "$workspace/packages/core" "$workspace/packages/platform" "$workspace/lsp"
@@ -65,7 +65,7 @@ case "$CI_PROBE_CASE" in
         --arg target "$CI_TARGET" --arg seed "$CI_SEED_TAG" \
         --arg digest "$digest" \
         '{schema:3, commit:$commit, release:$release, target:$target, seed:$seed,
-          converged:true, stage2_sha256:$digest,
+          profile:"extreme", converged:true, stage2_sha256:$digest,
           stage3_sha256:$digest, compiler_sha256:$digest}' \
         > "$context/provenance.json"
       export GITHUB_ENV="$workspace/environment"
@@ -74,6 +74,14 @@ case "$CI_PROBE_CASE" in
         missing-sources) mv "$workspace/packages" "$workspace/removed-sources" ;;
         wrong-commit)
           jq '.commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' "$context/provenance.json" > "$workspace/invalid.json"
+          mv "$workspace/invalid.json" "$context/provenance.json"
+          ;;
+        wrong-profile)
+          jq '.profile = "release"' "$context/provenance.json" > "$workspace/invalid.json"
+          mv "$workspace/invalid.json" "$context/provenance.json"
+          ;;
+        missing-profile)
+          jq 'del(.profile)' "$context/provenance.json" > "$workspace/invalid.json"
           mv "$workspace/invalid.json" "$context/provenance.json"
           ;;
         legacy-provenance)
@@ -95,32 +103,7 @@ case "$CI_PROBE_CASE" in
       fi
     done
     ;;
-  bridge-x86|bridge-arm)
-    mkdir -p encore/packages/core seed
-    cp "$repository/tests/ci/mock-compiler.sh" seed/encore
-    chmod +x seed/encore
-    mkdir -p encore/src
-    cp "$repository/encore.toml" encore/
-    cp "$repository/src/version.enq" encore/src/
-    cp "$repository/packages/core/encore.toml" encore/packages/core/
-    export LLVM_MINGW_ROOT="$scratch/toolchain with spaces"
-    export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-    export CI_PROBE_TARGET=x86_64-w64-windows-gnu
-    [[ "$CI_PROBE_CASE" != bridge-arm ]] || CI_PROBE_TARGET=aarch64-w64-windows-gnu
-    cd encore
-    bash "$repository/scripts/ci-produce-stage1.sh" "$scratch/seed/encore" v0.1.2-neumann "$CI_PROBE_TARGET"
-    test "$(tr '\n' ' ' < phases)" = 'producer cross '
-    destination="target/stage1-artifacts/$CI_PROBE_TARGET"
-    checksum=$(sha256sum "$destination/encore.exe" | awk '{print $1}')
-    jq -e --arg target "$CI_PROBE_TARGET" --arg checksum "$checksum" \
-      '.schema == 3 and .target == $target and .producer == "linux" and
-       .bootstrap == null and .seed == "v0.1.2-neumann" and
-       .executable == "encore.exe" and .executable_sha256 == $checksum and
-       (has("dependencies_sha256") | not)' "$destination/manifest.json"
-    if bash "$repository/scripts/ci-produce-stage1.sh" "$scratch/seed/encore" v0.1.2-neumann aarch64-unknown-linux-gnu; then exit 1; fi
-    test "$(tr '\n' ' ' < phases)" = 'producer cross '
-    ;;
-  bootstrap|mismatch|build-failure)
+  bootstrap|mismatch|build-failure|native-windows-x86|native-windows-arm)
     mkdir -p seed
     cp "$repository/tests/ci/mock-compiler.sh" seed/encore
     chmod +x seed/encore
@@ -133,12 +116,21 @@ case "$CI_PROBE_CASE" in
     export CI_SEED_TAG=v0.1.1-neumann
     export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     unset CI_BUILD_JOBS
-    if [[ "$CI_PROBE_CASE" == bootstrap ]]; then
+    if [[ "$CI_PROBE_CASE" == native-windows-* ]]; then
+      CI_TARGET=x86_64-w64-windows-gnu
+      [[ "$CI_PROBE_CASE" != native-windows-arm ]] || CI_TARGET=aarch64-w64-windows-gnu
+      CI_EXECUTABLE=encore.exe
+      CI_SEED_TAG=v0.1.12-neumann
+      export CI_BUILD_JOBS=2
+      cp "$SEED_COMPILER" "$scratch/seed/encore.exe"
+      SEED_COMPILER="$scratch/seed/encore.exe"
+    fi
+    if [[ "$CI_PROBE_CASE" == bootstrap || "$CI_PROBE_CASE" == native-windows-* ]]; then
       bash "$repository/scripts/ci-bootstrap.sh"
       test "$(tr '\n' ' ' < phases)" = 'seed stage1 stage2 '
       test -d target/bootstrap-cache-1 && test -d target/bootstrap-cache-2 && test -d target/bootstrap-cache-3
-      cmp target/stage2/encore target/stage3/encore
-      jq -e '.schema == 3 and .converged and .stage2_sha256 == .stage3_sha256 and .compiler_sha256 == .stage3_sha256 and
+      cmp "target/stage2/$CI_EXECUTABLE" "target/stage3/$CI_EXECUTABLE"
+      jq -e '.schema == 3 and .profile == "extreme" and .converged and .stage2_sha256 == .stage3_sha256 and .compiler_sha256 == .stage3_sha256 and
         (has("index_commit") | not) and (has("dependencies_sha256") | not)' target/convergence.json
     else
       if bash "$repository/scripts/ci-bootstrap.sh" > failed.log 2>&1; then exit 1; fi
@@ -167,12 +159,18 @@ case "$CI_PROBE_CASE" in
         cp "$repository/packages/$package/src/lib.enq" "$root/lib/encore/index/$package/src/"
       done
       digest=$(sha256sum "$root/bin/encore$extension" | awk '{print $1}')
-      jq -n --arg sha "$digest" '{compiler_sha256:$sha, lsp_sha256:$sha}' > provenance.json
+      jq -n --arg sha "$digest" '{compiler_sha256:$sha, lsp_sha256:$sha, profile:"extreme", lsp_profile:"extreme"}' > provenance.json
       if [[ -n "$extension" ]]; then zip -qr "$asset" "$root"; else tar -czf "$asset" "$root"; fi
       bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$asset" provenance.json
       if bash "$repository/scripts/verify-release-archive.sh" "$triple" wrong "$asset" provenance.json; then exit 1; fi
       jq '.lsp_sha256 = "wrong"' provenance.json > invalid.json
       if bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$asset" invalid.json; then exit 1; fi
+      for field in profile lsp_profile; do
+        jq --arg field "$field" '.[$field] = "release"' provenance.json > invalid-profile.json
+        if bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$asset" invalid-profile.json; then exit 1; fi
+        jq --arg field "$field" 'del(.[$field])' provenance.json > missing-profile.json
+        if bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$asset" missing-profile.json; then exit 1; fi
+      done
       mv "$root/lib/encore/index/serialize" missing-serialize
       if [[ -n "$extension" ]]; then zip -qr incomplete.zip "$root"; else tar -czf incomplete.tar.gz "$root"; fi
       incomplete=incomplete.tar.gz
