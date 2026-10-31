@@ -1,5 +1,73 @@
-import std::os::write_file
+//! Host-native tool execution for the legacy file API. Never write IR as .o.
+import core::fmt::Debug
+import std::os::{env, file_exists, mkdir_all, read_file, remove_dir_all, set_executable, write_file_atomic}
+import std::path::Path
+import std::process::Command
+import std::time::perf_counter_ms
+
+import refrain::types::{BackendOptProfile, BackendTarget}
+extern fn ehir_llvm_process_id() -> usize
+extern fn ehir_llvm_next_stage_id() -> usize
 
 pub fn assemble(ir: str, output_path: str) -> i32 {
-    ret write_file(output_path, ir)
+    ret emit_native_payload(ir, output_path, BackendTarget::OBJECT, BackendOptProfile::DEBUG)
+}
+
+pub fn emit_native_payload(ir: str, output_path: str, target: BackendTarget, profile: BackendOptProfile) -> i32 {
+    let process = unsafe {
+        ehir_llvm_process_id()
+    }
+    let serial = unsafe {
+        ehir_llvm_next_stage_id()
+    }
+    let directory = Path::new(output_path + ".ehir-" + Debug::fmt(process) + "-" + Debug::fmt(serial) + "-" + Debug::fmt(perf_counter_ms())).resolve()
+    if mkdir_all(directory.as_str()) != 0_i32 {
+        ret 1_i32
+    }
+    let result = emit_staged(ir, Path::new(output_path).resolve(), directory, target, profile)
+    let _removed = remove_dir_all(directory.as_str())
+    ret result
+}
+
+fn emit_staged(ir: str, output: Path, directory: Path, target: BackendTarget, profile: BackendOptProfile) -> i32 {
+    let source = directory / "input.ll"
+    let object = directory / "output.o"
+    let artifact = directory / "artifact"
+    if write_file_atomic(source.as_str(), ir) != 0_i32 {
+        ret 1_i32
+    }
+    let optimization = match profile {
+        BackendOptProfile::DEBUG => "-O0" BackendOptProfile::RELEASE => "-O2" BackendOptProfile::EXTREME => "-O3"
+    }
+    let compiler = env("CC").unwrap_or("clang")
+    // Keep nested aggregate calls on the same instruction selector, including
+    // functions that GlobalISel would otherwise hand to SelectionDAG.
+    let command = Command::new(compiler).arg("-x").arg("ir").arg(optimization).arg("-fno-experimental-isel").arg("-fdebug-compilation-dir=.").arg(source.as_str())
+    let command = if target == BackendTarget::EXECUTABLE {
+        command.arg("-o").arg(artifact.as_str())
+    } else {
+        command.arg("-c").arg("-o").arg(object.as_str())
+    }
+    let result = command.output()
+    if !result.success() {
+        ret result.code()
+    }
+    let produced = if target == BackendTarget::STATIC_LIB {
+        let archived = Command::new(env("AR").unwrap_or("llvm-ar")).arg("rcsD").arg(artifact.as_str()).arg(object.as_str()).output()
+        if !archived.success() {
+            ret archived.code()
+        }
+        artifact
+    } elif target == BackendTarget::EXECUTABLE {
+        artifact
+    } else {
+        object
+    }
+    if !file_exists(produced.as_str()) || write_file_atomic(output.as_str(), read_file(produced.as_str())) != 0_i32 {
+        ret 1_i32
+    }
+    if target == BackendTarget::EXECUTABLE && set_executable(output.as_str()) != 0_i32 {
+        ret 1_i32
+    }
+    ret 0_i32
 }

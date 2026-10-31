@@ -1,0 +1,2086 @@
+import core::fmt::Debug
+import core::option::Option
+import core::panic::panic
+import core::result::Result
+
+import std::thread::JoinHandle
+import std::vec::Vec
+
+import refrain::string_index::{StringIndex, string_index_get, string_index_set, string_index_with_capacity}
+import refrain::structured::IrItem
+
+extern fn encore_str_slice_bytes(value: str, start: usize, byte_len: usize) -> str
+extern fn encore_text_builder_new() -> usize
+extern fn encore_text_builder_append(builder: usize, value: str) ->()
+extern fn encore_text_builder_finish(builder: usize) -> str
+extern fn ehir_note_bundle_parse() ->()
+
+/// Stable textual input for one virtual EHIR module in a bundle.
+pub struct EhirModuleSource {
+    module_id: str
+    text: str
+}
+
+impl for EhirModuleSource {
+    pub fn id(self: Self) -> str {
+        ret self.module_id
+    }
+    pub fn source(self: Self) -> str {
+        ret self.text
+    }
+}
+
+fn byte_slice(value: str, start: usize, byte_len: usize) -> str {
+    ret unsafe {
+        encore_str_slice_bytes(value, start, byte_len)
+    }
+}
+
+fn try_join_line_range(lines: Vec[str], start: usize, end: usize) -> Result[str, str] {
+    let builder = unsafe {
+        encore_text_builder_new()
+    }
+    let mut index = start
+    while index < end && index < lines.len() {
+        unsafe {
+            encore_text_builder_append(builder, try_required_part(lines, index)?)
+            encore_text_builder_append(builder, "\n")
+        }
+        index = index + 1_usize
+    }
+    ret Result::Ok(unsafe {
+            encore_text_builder_finish(builder)
+        }
+    )
+}
+
+fn join_line_range(lines: Vec[str], start: usize, end: usize) -> str {
+    match try_join_line_range(lines, start, end) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret ""
+}
+
+import refrain::core::{Block, Directive, EhirDocumentation, EhirImport, EnumVariant, FieldSelector, FnDirective, Instruction, MatchArm, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, Variable, add, add_edge, alias, and_op, annotated_field, async_fn_directive, await_value, binary, block, br_term, call, cbr_term, cfree, comment, div, drop_value, ehir_documentation, ehir_import, enum_directive, enum_tag, enum_value, enum_variant, extern_fn_directive, field, fn_directive, fn_item, gep, geq, getfield, getfieldptr, getptr, grt, halloc, hfree, hrealloc, ieq, impl_directive, indirect_call, lceos, lcpos, lcsos, leq, les, load, make_module, make_module_bundle, make_module_with_imports, make_module_with_metadata, make_type, match_arm, match_term, mod_op, mul, neq, or_op, param, pcast, phi, phi_pair, plain_type, remove_edge, represented_type_name, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, shl, shr, store, struct_directive, sub, switch_case, switch_term, trait_directive, trait_method, unreachable_term, var, xor_op}
+
+/// A parsed EHIR bundle together with the exact per-module textual sources
+/// from which it was built. Compiler drivers use this typed boundary to feed a
+/// backend without scanning and parsing the complete bundle a second time,
+/// while the source slices remain available for persistent cache identities.
+pub struct ParsedModuleBundle {
+    typed_bundle: ModuleBundle
+    module_sources: Vec[EhirModuleSource]
+}
+
+struct ScannedModuleBundle {
+    entry_module: str
+    module_sources: Vec[EhirModuleSource]
+}
+
+struct ParsedModuleChunk {
+    index: usize
+    module: Module
+}
+
+impl for ParsedModuleBundle {
+    pub fn bundle(self: Self) -> ModuleBundle {
+        ret self.typed_bundle
+    }
+    pub fn sources(self: Self) -> Vec[EhirModuleSource] {
+        ret self.module_sources
+    }
+}
+
+pub fn try_parse_type_text(source: str) -> Result[Type, str] {
+    let mut value = trim_text(source)
+    let mut representation = RepresentationKind::Inline
+    if starts_with_text(value, "mut ") {
+        // Transitional pre-SSA spelling emitted by the Encore frontend.
+        // It denotes an addressable local place, never a stack object node.
+        // The local-to-SSA pass removes it before canonical EHIR.
+        representation = RepresentationKind::LocalPlace
+        value = trim_text(value.slice(4_usize, value.len() - 4_usize))
+    } elif ends_with_text(value, "<H>") {
+        representation = RepresentationKind::NodeHeap
+        value = trim_text(value.slice(0_usize, value.len() - 3_usize))
+    } elif ends_with_text(value, "<S>") {
+        representation = RepresentationKind::NodeStack
+        value = trim_text(value.slice(0_usize, value.len() - 3_usize))
+    } elif ends_with_text(value, "*") {
+        representation = RepresentationKind::Raw
+        value = trim_text(value.slice(0_usize, value.len() - 1_usize))
+    } elif ends_with_text(value, "&") {
+        representation = RepresentationKind::NodeAny
+        value = trim_text(value.slice(0_usize, value.len() - 1_usize))
+    }
+
+    // The outer representation stores one pointer layer. Keep additional
+    // layers on the base name while preserving generic arguments separately.
+    if ends_with_text(value, "*") || ends_with_text(value, "&") ||
+    ends_with_text(value, "<H>") || ends_with_text(value, "<S>") {
+        let inner = try_parse_type_text(value)?
+        ret Result::Ok(make_type(represented_type_name(inner), inner.generics, representation))
+    }
+
+    if starts_with_text(value, "(") && ends_with_text(value, ")") {
+        let inner = value.slice(1_usize, value.len() - 2_usize)
+        let mut items = Vec[Type]::new()
+        for part in try_split_top_level_text(inner, ",")? {
+            items.push(try_parse_type_text(part)?)
+        }
+        if items.len() > 1_usize {
+            ret Result::Ok(make_type("__tuple_" + Debug::fmt(items.len()), items, representation))
+        }
+    }
+
+    let open = find_top_level_char(value, "[")
+    if open >= value.len() {
+        if value.len() == 0_usize {
+            ret Result::Err("EHIR type must not be empty")
+        }
+        ret Result::Ok(make_type(value, Vec[Type]::new(), representation))
+    }
+    if !ends_with_text(value, "]") {
+        ret Result::Err("Unclosed EHIR generic type: " + source)
+    }
+
+    let name = trim_text(value.slice(0_usize, open))
+    let inner = value.slice(open + 1_usize, value.len() - open - 2_usize)
+    let mut generics = Vec[Type]::new()
+    for part in try_split_top_level_text(inner, ",")? {
+        generics.push(try_parse_type_text(part)?)
+    }
+    ret Result::Ok(make_type(name, generics, representation))
+}
+
+pub fn parse_type_text(source: str) -> Type {
+    match try_parse_type_text(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret plain_type("void", Vec[Type]::new())
+}
+
+pub fn try_parse_parameter_text(source: str) -> Result[Parameter, str] {
+    let separator = find_top_level_char(source, ":")
+    if separator >= source.len() {
+        ret Result::Err("EHIR parameter requires a type: " + source)
+    }
+    let name = trim_text(source.slice(0_usize, separator))
+    let typ = try_parse_type_text(source.slice(separator + 1_usize, source.len() - separator - 1_usize))?
+    ret Result::Ok(param(name, typ))
+}
+
+pub fn parse_parameter_text(source: str) -> Parameter {
+    match try_parse_parameter_text(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret param("", plain_type("void", Vec[Type]::new()))
+}
+
+pub fn try_parse_variable_text(source: str) -> Result[Variable, str] {
+    let separator = find_variable_type_separator(source)
+    if separator >= source.len() {
+        ret Result::Err("EHIR value requires an explicit type: " + source)
+    }
+    let name = trim_text(source.slice(0_usize, separator))
+    if name.is_empty() {
+        ret Result::Err("EHIR value name must not be empty")
+    }
+    let typ = try_parse_type_text(source.slice(separator + 1_usize, source.len() - separator - 1_usize))?
+    ret Result::Ok(var(name, typ))
+}
+
+pub fn parse_variable_text(source: str) -> Variable {
+    match try_parse_variable_text(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret var("", plain_type("void", Vec[Type]::new()))
+}
+
+fn find_variable_type_separator(source: str) -> usize {
+    let mut index = 0_usize
+    while index < source.len() {
+        if source.byte_at(index) == 58_u8 {
+            let previous_is_colon = index > 0_usize && source.byte_at(index - 1_usize) == 58_u8
+            let next_is_colon = index + 1_usize < source.len() && source.byte_at(index + 1_usize) == 58_u8
+            if !previous_is_colon && !next_is_colon {
+                ret index
+            }
+        }
+        index = index + 1_usize
+    }
+    ret source.len()
+}
+
+pub fn try_parse_instruction_text(source: str) -> Result[Instruction, str] {
+    let mut known = new_ssa_bindings(0_usize)
+    ret try_parse_instruction_in_scope(source, known)
+}
+
+pub fn try_parse_instruction_in_scope(source: str, known: mut SsaBindings) -> Result[Instruction, str] {
+    let value = trim_text(source)
+    if starts_with_text(value, ";") {
+        ret Result::Ok(comment(trim_text(value.slice(1_usize, value.len() - 1_usize))))
+    }
+    if starts_with_text(value, "store ") {
+        let operands = try_split_top_level_text(value.slice(6_usize, value.len() - 6_usize), ",")?
+        ret Result::Ok(store(try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?, try_parse_ssa_reference(try_required_part(operands, 1_usize)?, known)?))
+    }
+    if starts_with_text(value, "setfield ") {
+        let body = value.slice(9_usize, value.len() - 9_usize)
+        let field_separator = find_text(body, " > ")
+        if field_separator >= body.len() {
+            ret Result::Err("Malformed EHIR setfield: " + source)
+        }
+        let src = try_parse_ssa_reference(body.slice(0_usize, field_separator), known)?
+        let remainder = body.slice(field_separator + 3_usize, body.len() - field_separator - 3_usize)
+        let operands = try_split_top_level_text(remainder, ",")?
+        ret Result::Ok(setfield(src, try_parse_field_selector(try_required_part(operands, 0_usize)?)?, try_parse_ssa_reference(try_required_part(operands, 1_usize)?, known)?))
+    }
+    if starts_with_text(value, "hfree ") {
+        ret Result::Ok(hfree(try_parse_ssa_reference(trim_text(value.slice(6_usize, value.len() - 6_usize)), known)?))
+    }
+    if starts_with_text(value, "cfree ") {
+        ret Result::Ok(cfree(try_parse_ssa_reference(trim_text(value.slice(6_usize, value.len() - 6_usize)), known)?))
+    }
+    if starts_with_text(value, "addedge ") {
+        let operands = try_split_top_level_text(value.slice(8_usize, value.len() - 8_usize), ",")?
+        ret Result::Ok(add_edge(try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?, try_parse_ssa_reference(try_required_part(operands, 1_usize)?, known)?))
+    }
+    if starts_with_text(value, "removeedge ") {
+        let operands = try_split_top_level_text(value.slice(11_usize, value.len() - 11_usize), ",")?
+        ret Result::Ok(remove_edge(try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?, try_parse_ssa_reference(try_required_part(operands, 1_usize)?, known)?))
+    }
+    if starts_with_text(value, "drop ") {
+        ret Result::Ok(drop_value(try_parse_ssa_reference(trim_text(value.slice(5_usize, value.len() - 5_usize)), known)?))
+    }
+    if starts_with_text(value, "retain ") {
+        ret Result::Ok(retain_value(try_parse_ssa_reference(trim_text(value.slice(7_usize, value.len() - 7_usize)), known)?))
+    }
+
+    let assignment = find_text(value, " = ")
+    if assignment >= value.len() {
+        ret Result::Err("Unsupported EHIR instruction: " + source)
+    }
+    let out = try_parse_variable_text(value.slice(0_usize, assignment))?
+    let rhs = value.slice(assignment + 3_usize, value.len() - assignment - 3_usize)
+    let opcode_end = find_text(rhs, " ")
+    let opcode = if opcode_end < rhs.len() {
+        rhs.slice(0_usize, opcode_end)
+    } else {
+        rhs
+    }
+    let operands_text = if opcode_end < rhs.len() {
+        rhs.slice(opcode_end + 1_usize, rhs.len() - opcode_end - 1_usize)
+    } else {
+        ""
+    }
+
+    // A bare identifier is an alias even when it spells an opcode.
+    if operands_text == "" {
+        ret Result::Ok(alias(out, try_parse_ssa_reference(rhs, known)?))
+    }
+
+    if opcode == "lcpos" || opcode == "capprim" {
+        ret Result::Ok(lcpos(out, operands_text))
+    }
+    if opcode == "alias" {
+        ret Result::Ok(alias(out, try_parse_ssa_reference(operands_text, known)?))
+    }
+    if opcode == "await" {
+        ret Result::Ok(await_value(out, try_parse_ssa_reference(operands_text, known)?))
+    }
+    if opcode == "icall" {
+        let open = find_top_level_char(operands_text, "(")
+        if open >= operands_text.len() || !ends_with_text(operands_text, ")") {
+            ret Result::Err("Malformed EHIR indirect call")
+        }
+        let callee = try_parse_ssa_reference(trim_text(operands_text.slice(0, open)), known)?
+        let argument_text = operands_text.slice(open + 1, operands_text.len() - open - 2)
+        let mut arguments = Vec[Variable]::new()
+        if trim_text(argument_text) != "" {
+            for argument in try_split_top_level_text(argument_text, ",")? {
+                arguments.push(try_parse_ssa_reference(argument, known)?)
+            }
+        }
+        ret Result::Ok(indirect_call(out, callee, arguments))
+    }
+    if opcode == "call" || opcode == "unsafe" {
+        let call_text = if opcode == "unsafe" {
+            trim_text(operands_text.slice(5_usize, operands_text.len() - 5_usize))
+        } else {
+            operands_text
+        }
+        let open = find_top_level_char(call_text, "(")
+        if open >= call_text.len() || !ends_with_text(call_text, ")") {
+            ret Result::Err("Malformed EHIR call: " + source)
+        }
+        let callee_decl = try_parse_callable_generics(call_text.slice(0_usize, open))?
+        let args_text = call_text.slice(open + 1_usize, call_text.len() - open - 2_usize)
+        let mut args = Vec[Variable]::new()
+        if trim_text(args_text).len() > 0_usize {
+            for arg in try_split_top_level_text(args_text, ",")? {
+                args.push(try_parse_ssa_reference(arg, known)?)
+            }
+        }
+        ret Result::Ok(call(out, callee_decl.name, callee_decl.generics, args, opcode == "unsafe"))
+    }
+    if opcode == "capstruct" || opcode == "lcsos" {
+        let open = find_top_level_char(operands_text, "(")
+        if open >= operands_text.len() || !ends_with_text(operands_text, ")") {
+            ret Result::Err("Malformed EHIR struct value: " + source)
+        }
+        let typ = try_parse_type_text(operands_text.slice(0_usize, open))?
+        let args_text = operands_text.slice(open + 1_usize, operands_text.len() - open - 2_usize)
+        let mut args = Vec[Variable]::new()
+        if trim_text(args_text).len() > 0_usize {
+            for arg in try_split_top_level_text(args_text, ",")? {
+                args.push(try_parse_ssa_reference(arg, known)?)
+            }
+        }
+        ret Result::Ok(lcsos(out, typ, args))
+    }
+    if opcode == "capenum" || opcode == "lceos" {
+        let open = find_top_level_char(operands_text, "(")
+        let has_payload_list = open < operands_text.len()
+        if has_payload_list && !ends_with_text(operands_text, ")") {
+            ret Result::Err("Malformed EHIR enum value: " + source)
+        }
+        let enum_path = if has_payload_list {
+            operands_text.slice(0_usize, open)
+        } else {
+            operands_text
+        }
+        let scope = find_last_scope(enum_path)
+        if scope >= enum_path.len() {
+            ret Result::Err("Malformed EHIR enum variant: " + source)
+        }
+        let declaration = try_parse_named_generics(enum_path.slice(0_usize, scope))?
+        let variant = enum_path.slice(scope + 2_usize, enum_path.len() - scope - 2_usize)
+        let payload_text = if has_payload_list {
+            trim_text(operands_text.slice(open + 1_usize, operands_text.len() - open - 2_usize))
+        } else {
+            ""
+        }
+        let payload = if payload_text.len() == 0_usize {
+            Option[Variable]::None
+        } else {
+            Option[Variable]::Some(try_parse_ssa_reference(payload_text, known)?)
+        }
+        ret Result::Ok(lceos(out, enum_value(declaration.name, declaration.generics, variant, payload)))
+    }
+    if opcode == "load" {
+        ret Result::Ok(load(out, try_parse_ssa_reference(operands_text, known)?))
+    }
+    if opcode == "getptr" {
+        ret Result::Ok(getptr(out, try_parse_ssa_reference(operands_text, known)?))
+    }
+    if opcode == "salloc" {
+        ret Result::Ok(salloc(out, try_parse_type_text(operands_text)?))
+    }
+    if opcode == "halloc" {
+        ret Result::Ok(halloc(out, try_parse_type_text(operands_text)?))
+    }
+    if opcode == "hrealloc" {
+        let operands = try_split_top_level_text(operands_text, ",")?
+        ret Result::Ok(hrealloc(out, try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?, try_parse_ssa_reference(try_required_part(operands, 1_usize)?, known)?))
+    }
+    if opcode == "pcast" {
+        let operands = try_split_top_level_text(operands_text, ",")?
+        ret Result::Ok(pcast(out, try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?, try_parse_type_text(try_required_part(operands, 1_usize)?)?))
+    }
+    if opcode == "getfield" || opcode == "getfieldptr" || opcode == "sgetfield" || opcode == "sgetfieldptr" {
+        let separator = find_text(operands_text, " > ")
+        let mut src_text = ""
+        let mut field_text = ""
+        if separator < operands_text.len() {
+            src_text = trim_text(operands_text.slice(0_usize, separator))
+            field_text = trim_text(operands_text.slice(separator + 3_usize,
+                    operands_text.len() - separator - 3_usize,))
+        } else {
+            let operands = try_split_top_level_text(operands_text, ",")?
+            if operands.len() != 2_usize {
+                ret Result::Err("Malformed EHIR field instruction: " + source)
+            }
+            src_text = try_required_part(operands, 0_usize)?
+            field_text = try_required_part(operands, 1_usize)?
+        }
+        let src = try_parse_ssa_reference(src_text, known)?
+        let field = try_parse_field_selector(field_text)?
+        if opcode == "getfield" {
+            ret Result::Ok(getfield(out, src, field))
+        }
+        if opcode == "getfieldptr" {
+            ret Result::Ok(getfieldptr(out, src, field))
+        }
+        if opcode == "sgetfield" {
+            ret Result::Ok(sgetfield(out, src, field))
+        }
+        ret Result::Ok(sgetfieldptr(out, src, field))
+    }
+    if opcode == "gep" {
+        let operands = try_split_top_level_text(operands_text, ",")?
+        ret Result::Ok(gep(out, try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?, try_parse_ssa_reference(try_required_part(operands, 1_usize)?, known)?))
+    }
+    if opcode == "phi" {
+        let mut pairs = Vec[PhiPair]::new()
+        for operand in try_split_top_level_text(operands_text, ",")? {
+            let separator = find_text(operand, " $")
+            if separator >= operand.len() {
+                ret Result::Err("Malformed EHIR phi pair: " + operand)
+            }
+            let label = trim_text(operand.slice(separator + 2_usize, operand.len() - separator - 2_usize))
+            pairs.push(phi_pair(try_parse_ssa_reference(trim_text(operand.slice(0_usize, separator)), known)?, label))
+        }
+        ret Result::Ok(phi(out, pairs))
+    }
+
+    let operands = try_split_top_level_text(operands_text, ",")?
+    if operands.len() < 2_usize {
+        ret Result::Ok(alias(out, try_parse_ssa_reference(rhs, known)?))
+    }
+    let lhs = try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?
+    let rhs_var = try_parse_comparison_operand(try_required_part(operands, 1_usize)?, known, opcode)?
+    if opcode == "add" {
+        ret Result::Ok(add(out, lhs, rhs_var))
+    }
+    if opcode == "sub" {
+        ret Result::Ok(sub(out, lhs, rhs_var))
+    }
+    if opcode == "mul" {
+        ret Result::Ok(mul(out, lhs, rhs_var))
+    }
+    if opcode == "div" {
+        ret Result::Ok(div(out, lhs, rhs_var))
+    }
+    if opcode == "mod" {
+        ret Result::Ok(mod_op(out, lhs, rhs_var))
+    }
+    if opcode == "shl" {
+        ret Result::Ok(shl(out, lhs, rhs_var))
+    }
+    if opcode == "shr" {
+        ret Result::Ok(shr(out, lhs, rhs_var))
+    }
+    if opcode == "les" {
+        ret Result::Ok(les(out, lhs, rhs_var))
+    }
+    if opcode == "leq" {
+        ret Result::Ok(leq(out, lhs, rhs_var))
+    }
+    if opcode == "grt" {
+        ret Result::Ok(grt(out, lhs, rhs_var))
+    }
+    if opcode == "geq" {
+        ret Result::Ok(geq(out, lhs, rhs_var))
+    }
+    if opcode == "ieq" {
+        ret Result::Ok(ieq(out, lhs, rhs_var))
+    }
+    if opcode == "neq" {
+        ret Result::Ok(neq(out, lhs, rhs_var))
+    }
+    if opcode == "and" {
+        ret Result::Ok(and_op(out, lhs, rhs_var))
+    }
+    if opcode == "or" {
+        ret Result::Ok(or_op(out, lhs, rhs_var))
+    }
+    if opcode == "xor" {
+        ret Result::Ok(xor_op(out, lhs, rhs_var))
+    }
+    ret Result::Err("Unsupported EHIR opcode: " + opcode)
+    ret Result::Ok(lcpos(out, ""))
+}
+
+pub fn parse_instruction_text(source: str) -> Instruction {
+    match try_parse_instruction_text(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret comment("")
+}
+
+pub fn try_parse_terminator_text(source: str) -> Result[Terminator, str] {
+    let mut known = new_ssa_bindings(0_usize)
+    ret try_parse_terminator_in_scope(source, known)
+}
+
+pub fn try_parse_terminator_in_scope(source: str, known: mut SsaBindings) -> Result[Terminator, str] {
+    let value = trim_text(source)
+    if value == "unreachable" {
+        ret Result::Ok(unreachable_term())
+    }
+    if starts_with_text(value, "ret ") {
+        ret Result::Ok(ret_term(try_parse_ssa_reference(value.slice(4_usize, value.len() - 4_usize), known)?))
+    }
+    if starts_with_text(value, "br $") {
+        ret Result::Ok(br_term(trim_text(value.slice(4_usize, value.len() - 4_usize))))
+    }
+    if starts_with_text(value, "cbr ") {
+        let operands = try_split_top_level_text(value.slice(4_usize, value.len() - 4_usize), ",")?
+        ret Result::Ok(cbr_term(
+                try_parse_ssa_reference(try_required_part(operands, 0_usize)?, known)?,
+                strip_label(try_required_part(operands, 1_usize)?),
+                strip_label(try_required_part(operands, 2_usize)?),
+            ))
+    }
+    if starts_with_text(value, "match ") {
+        ret Result::Ok(try_parse_match_terminator_in_scope(value, known)?)
+    }
+    if starts_with_text(value, "switch ") {
+        ret Result::Ok(try_parse_switch_terminator_in_scope(value, known)?)
+    }
+    ret Result::Err("Unsupported EHIR terminator: " + source)
+    ret Result::Ok(br_term(""))
+}
+
+pub fn parse_terminator_text(source: str) -> Terminator {
+    match try_parse_terminator_text(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret unreachable_term()
+}
+
+fn try_parse_match_terminator_text(value: str) -> Result[Terminator, str] {
+    let mut known = new_ssa_bindings(0_usize)
+    ret try_parse_match_terminator_in_scope(value, known)
+}
+
+fn try_parse_match_terminator_in_scope(value: str, known: mut SsaBindings) -> Result[Terminator, str] {
+    let lines = split_lines_text(value)
+    let header = trim_text(try_required_part(lines, 0_usize)?)
+    let comma = find_text(header, ", $")
+    let open = find_text(header, " {")
+    if comma >= header.len() || open >= header.len() || open <= comma + 3_usize {
+        ret Result::Err("Malformed EHIR match terminator: " + value)
+    }
+    let scrutinee = try_parse_ssa_reference(header.slice(6_usize, comma - 6_usize), known)?
+    let default_label = header.slice(comma + 3_usize, open - comma - 3_usize)
+    let mut arms = Vec[MatchArm]::new()
+    let mut index = 1_usize
+    while index < lines.len() {
+        let line = trim_text(try_required_part(lines, index)?)
+        index = index + 1_usize
+        if line == "}" || line.len() == 0_usize {
+            continue
+        }
+        let mut arrow = find_text(line, " => $")
+        if arrow >= line.len() {
+            arrow = find_text(line, " -> $")
+        }
+        if arrow >= line.len() {
+            ret Result::Err("Malformed EHIR match arm: " + line)
+        }
+        let pattern = trim_text(line.slice(0_usize, arrow))
+        let label = trim_text(line.slice(arrow + 5_usize, line.len() - arrow - 5_usize))
+        let payload_open = find_top_level_char(pattern, "(")
+        if payload_open < pattern.len() && ends_with_text(pattern, ")") {
+            let variant = trim_text(pattern.slice(0_usize, payload_open))
+            let payload_text = pattern.slice(payload_open + 1_usize, pattern.len() - payload_open - 2_usize)
+            arms.push(match_arm(variant, Option[Variable]::Some(try_parse_variable_text(payload_text)?), label))
+        } else {
+            arms.push(match_arm(pattern, Option[Variable]::None, label))
+        }
+    }
+    ret Result::Ok(match_term(scrutinee, default_label, arms))
+}
+
+fn parse_match_terminator_text(value: str) -> Terminator {
+    match try_parse_match_terminator_text(value) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret unreachable_term()
+}
+
+fn try_parse_switch_terminator_text(value: str) -> Result[Terminator, str] {
+    let mut known = new_ssa_bindings(0_usize)
+    ret try_parse_switch_terminator_in_scope(value, known)
+}
+
+fn try_parse_switch_terminator_in_scope(value: str, known: mut SsaBindings) -> Result[Terminator, str] {
+    let lines = split_lines_text(value)
+    let header = trim_text(try_required_part(lines, 0_usize)?)
+    let comma = find_text(header, ", $")
+    let open = find_text(header, " {")
+    if comma >= header.len() || open >= header.len() || open <= comma + 3_usize {
+        ret Result::Err("Malformed EHIR switch terminator: " + value)
+    }
+    let scrutinee = try_parse_ssa_reference(header.slice(7_usize, comma - 7_usize), known)?
+    let default_label = header.slice(comma + 3_usize, open - comma - 3_usize)
+    let mut cases = Vec[SwitchCase]::new()
+    let mut index = 1_usize
+    while index < lines.len() {
+        let line = trim_text(try_required_part(lines, index)?)
+        index = index + 1_usize
+        if line == "}" || line.len() == 0_usize {
+            continue
+        }
+        let mut arrow = find_text(line, " => $")
+        if arrow >= line.len() {
+            arrow = find_text(line, " -> $")
+        }
+        if arrow >= line.len() {
+            ret Result::Err("Malformed EHIR switch case: " + line)
+        }
+        let case_value = trim_text(line.slice(0_usize, arrow))
+        let label = trim_text(line.slice(arrow + 5_usize, line.len() - arrow - 5_usize))
+        cases.push(switch_case(case_value, label))
+    }
+    ret Result::Ok(switch_term(scrutinee, default_label, cases))
+}
+
+fn parse_switch_terminator_text(value: str) -> Terminator {
+    match try_parse_switch_terminator_text(value) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret unreachable_term()
+}
+
+pub fn try_parse_function_text(source: str) -> Result[FnDirective, str] {
+    let lines = split_lines_text(source)
+    ret Result::Ok(try_parse_function_lines(lines, 0_usize, lines.len())?)
+}
+
+pub fn parse_function_text(source: str) -> FnDirective {
+    match try_parse_function_text(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret fn_item("", Vec[Type]::new(), Vec[Parameter]::new(), plain_type("void", Vec[Type]::new()), Vec[Block]::new())
+}
+
+// A module has already split its source into lines. Parse that original range
+// directly rather than allocating, joining and splitting each body again.
+fn try_parse_function_lines(lines: Vec[str], start: usize, end: usize) -> Result[FnDirective, str] {
+    if start >= end || end > lines.len() {
+        ret Result::Err("EHIR function must not be empty")
+    }
+    let header = trim_text(try_required_part(lines, start)?)
+    let is_extern = starts_with_text(header, "extern fn ")
+    let is_async = starts_with_text(header, "async fn ")
+    let mut prefix_len = 3_usize
+    if is_extern {
+        prefix_len = 10_usize
+    } else {
+        if is_async {
+            prefix_len = 9_usize
+        }
+    }
+    if !is_extern && !is_async && !starts_with_text(header, "fn ") {
+        ret Result::Err("Expected EHIR function header: " + header)
+    }
+
+    let signature = trim_text(header.slice(prefix_len, header.len() - prefix_len))
+    let open_paren = find_top_level_char(signature, "(")
+    let arrow = find_text(signature, ") -> ")
+    if open_paren >= signature.len() || arrow >= signature.len() {
+        ret Result::Err("Malformed EHIR function signature: " + header)
+    }
+    let name_and_generics = trim_text(signature.slice(0_usize, open_paren))
+    let params_text = signature.slice(open_paren + 1_usize, arrow - open_paren - 1_usize)
+    let mut ret_text = trim_text(signature.slice(arrow + 5_usize, signature.len() - arrow - 5_usize))
+    if ends_with_text(ret_text, "{") {
+        ret_text = trim_text(ret_text.slice(0_usize, ret_text.len() - 1_usize))
+    }
+
+    let generic_open = find_top_level_char(name_and_generics, "[")
+    let mut name = name_and_generics
+    let mut generics = Vec[Type]::new()
+    if generic_open < name_and_generics.len() {
+        if !ends_with_text(name_and_generics, "]") {
+            ret Result::Err("Malformed EHIR function generics: " + header)
+        }
+        name = trim_text(name_and_generics.slice(0_usize, generic_open))
+        let generic_text = name_and_generics.slice(generic_open + 1_usize, name_and_generics.len() - generic_open - 2_usize)
+        for generic in try_split_top_level_text(generic_text, ",")? {
+            generics.push(try_parse_type_text(generic)?)
+        }
+    }
+
+    let mut params = Vec[Parameter]::new()
+    if trim_text(params_text).len() > 0_usize {
+        for parameter in try_split_top_level_text(params_text, ",")? {
+            params.push(try_parse_parameter_text(parameter)?)
+        }
+    }
+    let ret_type = try_parse_type_text(ret_text)?
+    if is_extern {
+        match extern_fn_directive(name, generics, params, ret_type) {
+            Directive::Function(function) => {
+                ret Result::Ok(function)
+            }
+            _ => {
+                ret Result::Err("Internal EHIR extern function construction error")
+            }
+        }
+    }
+
+    let mut blocks = Vec[Block]::new()
+    let mut known_variables = SsaBindings {
+        Vec[Parameter]::new(), string_index_with_capacity(end - start + params.len())
+    }
+    for parameter in params {
+        remember_parameter(known_variables, parameter)
+    }
+    let mut block_name = ""
+    let mut instructions = Vec[Instruction]::new()
+    let mut terminator = Option[Terminator]::None
+    let mut index = start + 1_usize
+    while index < end {
+        let line = trim_text(try_required_part(lines, index)?)
+        index = index + 1_usize
+        if line.len() == 0_usize || line == "}" {
+            continue
+        }
+        if starts_with_text(line, "$") && ends_with_text(line, ":") {
+            if block_name.len() > 0_usize {
+                blocks.push(try_finish_parsed_block(block_name, instructions, terminator)?)
+                instructions = Vec[Instruction]::new()
+                terminator = Option[Terminator]::None
+            }
+            block_name = line.slice(1_usize, line.len() - 2_usize)
+            continue
+        }
+        if starts_with_text(line, "match ") || starts_with_text(line, "switch ") {
+            let mut terminator_text = line
+            while index < end {
+                let terminator_line = trim_text(try_required_part(lines, index)?)
+                index = index + 1_usize
+                terminator_text = terminator_text + "\n" + terminator_line
+                if terminator_line == "}" {
+                    break
+                }
+            }
+            let parsed = try_parse_terminator_in_scope(terminator_text, known_variables)?
+            match parsed {
+                Terminator::Match(item) => {
+                    for arm in item.arms {
+                        match arm.payload_var {
+                            Some(value) => bind_ssa_value(known_variables, value) None => {
+                            }
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            terminator = Option[Terminator]::Some(parsed)
+            continue
+        }
+        if is_terminator_text(line) {
+            terminator = Option[Terminator]::Some(try_parse_terminator_in_scope(line, known_variables)?)
+        } else {
+            let instruction = try_parse_instruction_in_scope(line, known_variables)?
+            remember_instruction_output(known_variables, instruction)
+            instructions.push(instruction)
+        }
+    }
+    if block_name.len() > 0_usize {
+        blocks.push(try_finish_parsed_block(block_name, instructions, terminator)?)
+    }
+    let directive = if is_async {
+        async_fn_directive(name, generics, params, ret_type, blocks)
+    } else {
+        fn_directive(name, generics, params, ret_type, blocks)
+    }
+    match directive {
+        Directive::Function(function) => {
+            ret Result::Ok(function)
+        }
+        _ => {
+            ret Result::Err("Internal EHIR function construction error")
+        }
+    }
+    ret Result::Err("Unable to parse EHIR function")
+}
+
+fn parse_function_lines(lines: Vec[str], start: usize, end: usize) -> FnDirective {
+    match try_parse_function_lines(lines, start, end) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret fn_item("", Vec[Type]::new(), Vec[Parameter]::new(), plain_type("void", Vec[Type]::new()), Vec[Block]::new())
+}
+
+pub struct SsaBindings {
+    values: Vec[Parameter]
+    positions: StringIndex
+}
+
+pub fn remember_parameter(known: mut SsaBindings, value: Parameter) ->() {
+    string_index_set(known.positions, value.name, known.values.len())
+    known.values.push(value)
+}
+
+/// A spelling is bound to its typed definition while the instruction is parsed.
+/// Canonical IR never contains an unresolved value or needs a repair pass.
+pub fn try_parse_ssa_reference(source: str, known: mut SsaBindings) -> Result[Variable, str] {
+    if find_variable_type_separator(source) < source.len() {
+        ret try_parse_variable_text(source)
+    }
+    let name = trim_text(source)
+    let position = string_index_get(known.positions, name)
+    if position != 0_usize {
+        let item = known.values.get_unchecked_borrowed(position - 1_usize)
+        ret Result::Ok(var(name, item.typ))
+    }
+    if name == "void" {
+        ret Result::Ok(var("void", plain_type("()", Vec[Type]::new())))
+    }
+    ret Result::Err("unknown typed SSA reference: " + name)
+}
+
+fn try_parse_comparison_operand(source: str, known: mut SsaBindings, opcode: str) -> Result[Variable, str] {
+    let name = trim_text(source)
+    if (opcode == "ieq" || opcode == "neq") && find_variable_type_separator(name) >= name.len() &&
+    string_index_get(known.positions, name) == 0_usize && !name.is_empty() &&
+    name.byte_at(0_usize) >= 65_u8 && name.byte_at(0_usize) <= 90_u8 {
+        ret Result::Ok(enum_tag(name))
+    }
+    ret try_parse_ssa_reference(name, known)
+}
+
+pub fn try_parse_field_selector(source: str) -> Result[FieldSelector, str] {
+    let separator = find_variable_type_separator(source)
+    if separator >= source.len() {
+        let name = trim_text(source)
+        if name.is_empty() {
+            ret Result::Err("EHIR field selector must not be empty")
+        }
+        ret Result::Ok(field(name))
+    }
+    ret Result::Ok(annotated_field(trim_text(source.slice(0_usize, separator)),
+            try_parse_type_text(source.slice(separator + 1_usize, source.len() - separator - 1_usize))?,))
+}
+
+pub fn remember_instruction_output(known: mut SsaBindings, instruction: Instruction) ->() {
+    match instruction {
+        Instruction::Lcpos(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::Alias(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::Lcsos(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::Lceos(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::Call(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::Await(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::Load(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::GetPtr(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::PtrCast(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::GetField(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::GetFieldPtr(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::SGetField(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::SGetFieldPtr(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::Gep(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::HeapAlloc(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::HeapRealloc(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::StackAlloc(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::Binary(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        Instruction::Phi(data) => {
+            bind_ssa_value(known, data.out)
+        }
+        _ => {
+        }
+    }
+    ret()
+}
+
+pub fn bind_ssa_value(known: mut SsaBindings, value: Variable) ->() {
+    remember_parameter(known, param(value.name, value.typ))
+}
+
+pub fn try_parse_module_text(name: str, source: str) -> Result[Module, str] {
+    let lines = split_lines_text(source)
+    let mut imports = Vec[EhirImport]::new()
+    let mut documentation = Option[str]::None
+    let mut symbol_documentation = Vec[EhirDocumentation]::new()
+    let mut pending_documentation = Option[str]::None
+    let mut directives = Vec[Directive]::new()
+    let mut index = 0_usize
+    while index < lines.len() {
+        let line = trim_text(try_required_part(lines, index)?)
+        if line.len() == 0_usize {
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "//!") {
+            documentation = Option[str]::Some(append_documentation_line(documentation, documentation_comment_text(line)))
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "///") {
+            pending_documentation = Option[str]::Some(append_documentation_line(pending_documentation, documentation_comment_text(line)))
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "import ") {
+            let module_id = trim_text(line.slice(7_usize, line.len() - 7_usize))
+            if module_id == "" {
+                ret Result::Err("Malformed EHIR import: " + line)
+            }
+            imports.push(ehir_import(module_id))
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "extern fn ") {
+            let directive = Directive::Function(try_parse_function_lines(lines, index, index + 1_usize)?)
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "fn ") || starts_with_text(line, "async fn ") {
+            let start = index
+            let mut depth = brace_delta(line)
+            index = index + 1_usize
+            while index < lines.len() && depth > 0_isize {
+                let body_line = try_required_part(lines, index)?
+                depth = depth + brace_delta(body_line)
+                index = index + 1_usize
+            }
+            let directive = Directive::Function(try_parse_function_lines(lines, start, index)?)
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
+            continue
+        }
+        if starts_with_text(line, "struct ") {
+            let chunk = try_collect_braced_text(lines, index)?
+            let directive = try_parse_struct_text(chunk.text)?
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
+            index = chunk.next_index
+            continue
+        }
+        if starts_with_text(line, "enum ") {
+            let chunk = try_collect_braced_text(lines, index)?
+            let directive = try_parse_enum_text(chunk.text)?
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
+            index = chunk.next_index
+            continue
+        }
+        if starts_with_text(line, "trait ") {
+            let chunk = try_collect_braced_text(lines, index)?
+            let directive = try_parse_trait_text(chunk.text)?
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
+            index = chunk.next_index
+            continue
+        }
+        if starts_with_text(line, "impl") {
+            let chunk = try_collect_braced_text(lines, index)?
+            let directive = try_parse_impl_text(chunk.text)?
+            push_documented_directive(directives, symbol_documentation, directive, pending_documentation)
+            pending_documentation = Option[str]::None
+            index = chunk.next_index
+            continue
+        }
+        ret Result::Err("Unsupported top-level EHIR directive: " + line)
+    }
+    ret Result::Ok(make_module_with_metadata(name, imports, documentation, symbol_documentation, directives))
+}
+
+pub fn parse_module_text(name: str, source: str) -> Module {
+    match try_parse_module_text(name, source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret make_module("", Vec[Directive]::new())
+}
+
+fn documentation_comment_text(line: str) -> str {
+    if line.len() <= 3_usize {
+        ret ""
+    }
+    let mut text = line.slice(3_usize, line.len() - 3_usize)
+    if starts_with_text(text, " ") {
+        text = text.slice(1_usize, text.len() - 1_usize)
+    }
+    ret text
+}
+
+fn append_documentation_line(current: Option[str], line: str) -> str {
+    match current {
+        Option[str]::Some(text) => {
+            ret text + "\n" + line
+        }
+        Option[str]::None => {
+            ret line
+        }
+    }
+}
+
+fn push_documented_directive(
+    directives: mut Vec[Directive],
+    documentation: mut Vec[EhirDocumentation],
+    directive: Directive,
+    pending: Option[str],
+) ->() {
+    match pending {
+        Option[str]::Some(text) => {
+            documentation.push(ehir_documentation(directive_name(directive), text))
+        }
+        Option[str]::None => {
+        }
+    }
+    directives.push(directive)
+    ret()
+}
+
+fn directive_name(directive: Directive) -> str {
+    match directive {
+        Directive::Struct(item) => {
+            ret item.name
+        }
+        Directive::Enum(item) => {
+            ret item.name
+        }
+        Directive::Function(item) => {
+            ret item.name
+        }
+        Directive::Trait(item) => {
+            ret item.name
+        }
+        Directive::Impl(item) => {
+            ret "impl " + item.for_type.name
+        }
+    }
+}
+
+/// Parses a bundle once and returns both its typed graph and stable module
+/// source records. This is the preferred compiler/backend process boundary.
+pub fn try_parse_module_bundle_artifact(entry_module: str, source: str) -> Result[ParsedModuleBundle, str] {
+    unsafe {
+        ehir_note_bundle_parse()
+    }
+    let scanned = try_scan_module_bundle_text(entry_module, source)?
+    let mut modules = Vec[Module]::new()
+    for module_source in scanned.module_sources {
+        modules.push(try_parse_module_source_record(module_source)?)
+    }
+    ret Result::Ok(ParsedModuleBundle {
+            make_module_bundle(scanned.entry_module, modules), scanned.module_sources
+        }
+    )
+}
+
+pub fn parse_module_bundle_artifact(entry_module: str, source: str) -> ParsedModuleBundle {
+    match try_parse_module_bundle_artifact(entry_module, source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret ParsedModuleBundle {
+        make_module_bundle("", Vec[Module]::new()), Vec[EhirModuleSource]::new()
+    }
+}
+
+/// Parses independent module bodies concurrently while preserving their
+/// source order in the returned bundle. The parser uses the caller's complete
+/// `--jobs` budget, capped only by the number of independent modules.
+pub fn parse_module_bundle_artifact_parallel(entry_module: str, source: str,
+    requested_jobs: usize,) -> ParsedModuleBundle {
+    let scanned = scan_module_bundle_text(entry_module, source)
+    let worker_count = module_parse_jobs(requested_jobs, scanned.module_sources.len())
+    if worker_count <= 1_usize {
+        let mut modules = Vec[Module]::new()
+        for module_source in scanned.module_sources {
+            modules.push(parse_module_source_record(module_source))
+        }
+        ret ParsedModuleBundle {
+            make_module_bundle(scanned.entry_module, modules), scanned.module_sources
+        }
+    }
+    let mut pending = Vec[JoinHandle[Vec[ParsedModuleChunk]]]::new()
+    let mut worker = 0_usize
+    while worker < worker_count {
+        pending.push(spawn parse_module_source_batch(
+                scanned.module_sources, worker, worker_count,))
+        worker += 1_usize
+    }
+    let mut chunks = Vec[ParsedModuleChunk]::new()
+    for handle in pending {
+        chunks.extend(handle.join())
+    }
+    let mut modules = Vec[Module]::new()
+    let mut index = 0_usize
+    while index < scanned.module_sources.len() {
+        for chunk in chunks {
+            if chunk.index == index {
+                modules.push(chunk.module)
+            }
+        }
+        index += 1_usize
+    }
+    ret ParsedModuleBundle {
+        make_module_bundle("" + scanned.entry_module, modules), scanned.module_sources
+    }
+}
+
+fn try_scan_module_bundle_text(entry_module: str, source: str) -> Result[ScannedModuleBundle, str] {
+    let lines = split_lines_text(source)
+    let mut entry = entry_module
+    let mut sources = Vec[EhirModuleSource]::new()
+    let mut index = 0_usize
+    while index < lines.len() {
+        let line = trim_text(try_required_part(lines, index)?)
+        if line == "" {
+            index = index + 1_usize continue
+        }
+        if starts_with_text(line, "entry ") {
+            entry = trim_text(byte_slice(line, 6_usize, line.byte_len() - 6_usize))
+            if entry == "" {
+                ret Result::Err("EHIR bundle entry must not be empty")
+            }
+            index = index + 1_usize
+            continue
+        }
+        if !starts_with_text(line, "module ") || !ends_with_text(line, " {") {
+            ret Result::Err("Malformed EHIR module header: " + line)
+        }
+        let module_start = index
+        let module_id = trim_text(byte_slice(line, 7_usize, line.byte_len() - 9_usize))
+        if module_id == "" {
+            ret Result::Err("EHIR module id must not be empty")
+        }
+        let mut depth = brace_delta(line)
+        index += 1_usize
+        while index < lines.len() && depth > 0_isize {
+            depth = depth + brace_delta(try_required_part(lines, index)?)
+            index = index + 1_usize
+        }
+        if depth != 0_isize {
+            ret Result::Err("Unclosed EHIR module: " + module_id)
+        }
+        sources.push(EhirModuleSource {
+                module_id, try_join_line_range(lines, module_start, index)?
+            }
+            ,
+        )
+    }
+    ret Result::Ok(ScannedModuleBundle {
+            entry, sources
+        }
+    )
+}
+
+fn scan_module_bundle_text(entry_module: str, source: str) -> ScannedModuleBundle {
+    match try_scan_module_bundle_text(entry_module, source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret ScannedModuleBundle { "", Vec[EhirModuleSource]::new() }
+}
+
+fn try_parse_module_source_record(source: EhirModuleSource) -> Result[Module, str] {
+    let lines = split_lines_text(source.text)
+    if lines.len() < 2_usize {
+        ret Result::Err("Malformed EHIR module: " + source.module_id)
+    }
+    ret Result::Ok(try_parse_module_text(source.module_id, try_join_line_range(lines, 1_usize, lines.len() - 1_usize)?)?)
+}
+
+fn parse_module_source_record(source: EhirModuleSource) -> Module {
+    match try_parse_module_source_record(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret make_module("", Vec[Directive]::new())
+}
+
+fn parse_module_source_batch(sources: frozen Vec[EhirModuleSource], worker_index: usize,
+    worker_count: usize,) -> sending Vec[ParsedModuleChunk] {
+    let mut out = Vec[ParsedModuleChunk]::new()
+    let mut index = worker_index
+    while index < sources.len() {
+        match sources.get(index) {
+            Some(source) => {
+                let copied = EhirModuleSource {
+                    "" + source.module_id, "" + source.text
+                }
+                out.push(ParsedModuleChunk {
+                        index, parse_module_source_record(copied)
+                    }
+                    ,
+                )
+            }
+            None => {
+            }
+        }
+        index += worker_count
+    }
+    ret out
+}
+
+fn module_parse_jobs(requested: usize, module_count: usize) -> usize {
+    if module_count == 0_usize {
+        ret 1_usize
+    }
+    let mut jobs = if requested == 0_usize {
+        1_usize
+    } else {
+        requested
+    }
+    if jobs > module_count {
+        jobs = module_count
+    }
+    ret jobs
+}
+
+pub fn try_parse_module_bundle_text(entry_module: str, source: str) -> Result[ModuleBundle, str] {
+    ret Result::Ok(try_parse_module_bundle_artifact(entry_module, source)?.bundle())
+}
+
+pub fn parse_module_bundle_text(entry_module: str, source: str) -> ModuleBundle {
+    match try_parse_module_bundle_text(entry_module, source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret make_module_bundle("", Vec[Module]::new())
+}
+
+/// Splits a bundle with the same brace-aware scanner as the parser. This lets
+/// incremental backends fingerprint individual module inputs without
+/// serializing the parsed graph back to text.
+pub fn try_split_module_bundle_text(source: str) -> Result[Vec[EhirModuleSource], str] {
+    ret Result::Ok(try_scan_module_bundle_text("", source)?.module_sources)
+}
+
+pub fn split_module_bundle_text(source: str) -> Vec[EhirModuleSource] {
+    match try_split_module_bundle_text(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret Vec[EhirModuleSource]::new()
+}
+
+pub fn try_parse_trait_text(source: str) -> Result[Directive, str] {
+    let lines = split_lines_text(source)
+    let header = trim_text(try_required_part(lines, 0_usize)?)
+    if !starts_with_text(header, "trait ") || !ends_with_text(header, "{") {
+        ret Result::Err("Malformed EHIR trait header: " + header)
+    }
+    let raw_name = trim_text(header.slice(6_usize, header.len() - 7_usize))
+    let declaration = try_parse_named_generics(raw_name)?
+    let mut methods = Vec[TraitMethod]::new()
+    let mut index = 1_usize
+    while index < lines.len() {
+        let line = trim_text(try_required_part(lines, index)?)
+        index = index + 1_usize
+        if line.len() == 0_usize || line == "}" {
+            continue
+        }
+        if starts_with_text(line, "///") {
+            continue
+        }
+        methods.push(try_parse_trait_method_text(line)?)
+    }
+    ret Result::Ok(trait_directive(declaration.name, declaration.generics, methods))
+}
+
+pub fn parse_trait_text(source: str) -> Directive {
+    match try_parse_trait_text(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret struct_directive("", Vec[Type]::new(), Vec[Parameter]::new())
+}
+
+fn try_parse_trait_method_text(source: str) -> Result[TraitMethod, str] {
+    if !starts_with_text(source, "fn ") {
+        ret Result::Err("Malformed EHIR trait method: " + source)
+    }
+    let signature = trim_text(source.slice(3_usize, source.len() - 3_usize))
+    let open = find_top_level_char(signature, "(")
+    let arrow = find_text(signature, ") -> ")
+    if open >= signature.len() || arrow >= signature.len() {
+        ret Result::Err("Malformed EHIR trait method: " + source)
+    }
+    let declaration = try_parse_named_generics(trim_text(signature.slice(0_usize, open)))?
+    let params_text = signature.slice(open + 1_usize, arrow - open - 1_usize)
+    let mut params = Vec[Parameter]::new()
+    if trim_text(params_text).len() > 0_usize {
+        for item in try_split_top_level_text(params_text, ",")? {
+            params.push(try_parse_parameter_text(item)?)
+        }
+    }
+    let ret_type = try_parse_type_text(signature.slice(arrow + 5_usize, signature.len() - arrow - 5_usize))?
+    ret Result::Ok(trait_method(declaration.name, declaration.generics, params, ret_type))
+}
+
+fn parse_trait_method_text(source: str) -> TraitMethod {
+    match try_parse_trait_method_text(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret trait_method("", Vec[Type]::new(), Vec[Parameter]::new(), plain_type("void", Vec[Type]::new()))
+}
+
+pub fn try_parse_impl_text(source: str) -> Result[Directive, str] {
+    let lines = split_lines_text(source)
+    let header = trim_text(try_required_part(lines, 0_usize)?)
+    if !starts_with_text(header, "impl") || !ends_with_text(header, "{") {
+        ret Result::Err("Malformed EHIR impl header: " + header)
+    }
+    let body_header = trim_text(header.slice(4_usize, header.len() - 5_usize))
+    let mut generics = Vec[Type]::new()
+    let mut target_text = body_header
+    if starts_with_text(body_header, "[") {
+        let close = try_find_matching_square(body_header)?
+        let generic_text = body_header.slice(1_usize, close - 1_usize)
+        for item in try_split_top_level_text(generic_text, ",")? {
+            generics.push(try_parse_type_text(item)?)
+        }
+        target_text = trim_text(body_header.slice(close + 1_usize, body_header.len() - close - 1_usize))
+    }
+    let mut methods = Vec[FnDirective]::new()
+    let mut index = 1_usize
+    while index < lines.len() {
+        let line = trim_text(try_required_part(lines, index)?)
+        if line.len() == 0_usize || line == "}" {
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "///") {
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "extern fn ") {
+            methods.push(try_parse_function_text(line)?)
+            index = index + 1_usize
+            continue
+        }
+        if starts_with_text(line, "fn ") || starts_with_text(line, "async fn ") {
+            let chunk = try_collect_braced_text(lines, index)?
+            methods.push(try_parse_function_text(chunk.text)?)
+            index = chunk.next_index
+            continue
+        }
+        ret Result::Err("Unsupported EHIR impl item: " + line)
+    }
+    let for_separator = find_text(target_text, " for ")
+    if for_separator < target_text.len() {
+        let trait_ref = try_parse_type_text(target_text.slice(0_usize, for_separator))?
+        let for_type = try_parse_type_text(target_text.slice(for_separator + 5_usize, target_text.len() - for_separator - 5_usize))?
+        ret Result::Ok(impl_directive(generics, trait_ref.name, trait_ref.generics, for_type, methods))
+    }
+    ret Result::Ok(impl_directive(generics, "", Vec[Type]::new(), try_parse_type_text(target_text)?, methods))
+}
+
+pub fn parse_impl_text(source: str) -> Directive {
+    match try_parse_impl_text(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret struct_directive("", Vec[Type]::new(), Vec[Parameter]::new())
+}
+
+fn try_find_matching_square(value: str) -> Result[usize, str] {
+    let mut depth = 0_usize
+    let mut index = 0_usize
+    let mut in_string = false
+    let mut escaped = false
+    while index < value.len() {
+        let ch = byte_slice(value, index, 1_usize)
+        if in_string {
+            if escaped {
+                escaped = false
+            } elif ch == "\\" {
+                escaped = true
+            } elif ch == "\"" {
+                in_string = false
+            }
+        } else {
+            if ch == "\"" {
+                in_string = true
+            } elif ch == "[" {
+                depth = depth + 1_usize
+            } elif ch == "]" {
+                depth = depth - 1_usize
+                if depth == 0_usize {
+                    ret Result::Ok(index)
+                }
+            }
+        }
+        index = index + 1_usize
+    }
+    ret Result::Err("Unclosed generic list: " + value)
+    ret Result::Ok(value.len())
+}
+
+fn find_matching_square(value: str) -> usize {
+    match try_find_matching_square(value) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret 0_usize
+}
+
+struct BracedText {
+    text: str
+    next_index: usize
+}
+
+fn try_collect_braced_text(lines: Vec[str], start: usize) -> Result[BracedText, str] {
+    let mut index = start
+    let mut depth = 0_isize
+    loop {
+        if index >= lines.len() {
+            break
+        }
+        let line = try_required_part(lines, index)?
+        depth = depth + brace_delta(line)
+        index = index + 1_usize
+        if depth == 0_isize {
+            break
+        }
+    }
+    ret Result::Ok(BracedText {
+            try_join_line_range(lines, start, index)?, index
+        }
+    )
+}
+
+fn collect_braced_text(lines: Vec[str], start: usize) -> BracedText {
+    match try_collect_braced_text(lines, start) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret BracedText { "", 0_usize }
+}
+
+pub fn try_parse_struct_text(source: str) -> Result[Directive, str] {
+    let lines = split_lines_text(source)
+    if lines.len() == 0_usize {
+        ret Result::Err("EHIR struct must not be empty")
+    }
+    let header = trim_text(try_required_part(lines, 0_usize)?)
+    if !starts_with_text(header, "struct ") || !ends_with_text(header, "{") {
+        ret Result::Err("Malformed EHIR struct header: " + header)
+    }
+    let name_text = trim_text(header.slice(7_usize, header.len() - 8_usize))
+    let declaration = try_parse_named_generics(name_text)?
+    let mut fields = Vec[Parameter]::new()
+    let mut retain = ""
+    let mut release = ""
+    let mut index = 1_usize
+    while index < lines.len() {
+        let line = trim_text(try_required_part(lines, index)?)
+        index = index + 1_usize
+        if line.len() == 0_usize || line == "}" {
+            continue
+        }
+        if starts_with_text(line, "// @retain ") {
+            if retain != "" {
+                ret Result::Err("Duplicate resource retain callback")
+            }
+            retain = trim_text(line.slice(11, line.len() - 11))
+            continue
+        }
+        if starts_with_text(line, "// @release ") {
+            if release != "" {
+                ret Result::Err("Duplicate resource release callback")
+            }
+            release = trim_text(line.slice(12, line.len() - 12))
+            continue
+        }
+        fields.push(try_parse_parameter_text(line)?)
+    }
+    if retain != "" || release != "" {
+        if retain == "" || release == "" || fields.len() == 0 {
+            ret Result::Err("Resource structs need a token and both ownership callbacks")
+        }
+        let token = fields.get(0).unwrap_or(param("", plain_type("void", Vec[Type]::new())))
+        if token.typ.name != "usize" || token.typ.representation != RepresentationKind::Inline {
+            ret Result::Err("Resource token must be an inline usize")
+        }
+        ret Result::Ok(resource_struct_directive(declaration.name, declaration.generics, fields, retain, release))
+    }
+    ret Result::Ok(struct_directive(declaration.name, declaration.generics, fields))
+}
+
+pub fn parse_struct_text(source: str) -> Directive {
+    match try_parse_struct_text(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret struct_directive("", Vec[Type]::new(), Vec[Parameter]::new())
+}
+
+pub fn try_parse_enum_text(source: str) -> Result[Directive, str] {
+    let lines = split_lines_text(source)
+    if lines.len() == 0_usize {
+        ret Result::Err("EHIR enum must not be empty")
+    }
+    let header = trim_text(try_required_part(lines, 0_usize)?)
+    if !starts_with_text(header, "enum ") || !ends_with_text(header, "{") {
+        ret Result::Err("Malformed EHIR enum header: " + header)
+    }
+    let name_text = trim_text(header.slice(5_usize, header.len() - 6_usize))
+    let declaration = try_parse_named_generics(name_text)?
+    let mut variants = Vec[EnumVariant]::new()
+    let mut index = 1_usize
+    while index < lines.len() {
+        let line = trim_text(try_required_part(lines, index)?)
+        index = index + 1_usize
+        if line.len() == 0_usize || line == "}" {
+            continue
+        }
+        let open = find_top_level_char(line, "(")
+        if open >= line.len() {
+            variants.push(enum_variant(line, Option[Type]::None))
+            continue
+        }
+        if !ends_with_text(line, ")") {
+            ret Result::Err("Malformed EHIR enum variant: " + line)
+        }
+        let variant_name = trim_text(line.slice(0_usize, open))
+        let payload_text = line.slice(open + 1_usize, line.len() - open - 2_usize)
+        let payloads = try_split_top_level_text(payload_text, ",")?
+        if payloads.len() != 1_usize {
+            ret Result::Err("Self-hosted EHIR model currently requires one payload per enum variant: " + line)
+        }
+        variants.push(enum_variant(variant_name, Option[Type]::Some(try_parse_type_text(try_required_part(payloads, 0_usize)?)?)))
+    }
+    ret Result::Ok(enum_directive(declaration.name, declaration.generics, variants))
+}
+
+pub fn parse_enum_text(source: str) -> Directive {
+    match try_parse_enum_text(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret struct_directive("", Vec[Type]::new(), Vec[Parameter]::new())
+}
+
+struct NamedGenerics {
+    name: str
+    generics: Vec[Type]
+}
+
+fn try_parse_callable_generics(source: str) -> Result[NamedGenerics, str] {
+    let open = find_top_level_char(source, "[")
+    if open >= source.len() {
+        ret Result::Ok(NamedGenerics {
+                trim_text(source), Vec[Type]::new()
+            }
+        )
+    }
+    let close = try_find_matching_square(source.slice(open, source.len() - open))? + open
+    if close >= source.len() {
+        ret Result::Err("Malformed generic callable: " + source)
+    }
+    let inner = source.slice(open + 1_usize, close - open - 1_usize)
+    let mut generics = Vec[Type]::new()
+    for generic in try_split_top_level_text(inner, ",")? {
+        generics.push(try_parse_type_text(generic)?)
+    }
+    let name = source.slice(0_usize, open) + source.slice(close + 1_usize, source.len() - close - 1_usize)
+    ret Result::Ok(NamedGenerics {
+            trim_text(name), generics
+        }
+    )
+}
+
+fn parse_callable_generics(source: str) -> NamedGenerics {
+    match try_parse_callable_generics(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret NamedGenerics { "", Vec[Type]::new() }
+}
+
+/// Decode callable spellings, whose generic list may precede `::method`.
+/// A callable is not a value type: `Vec[T]::new` names `Vec::new[T]`.
+pub fn parse_callable_text(source: str) ->(str, Vec[Type]) {
+    let callable = parse_callable_generics(source)
+    ret(callable.name, callable.generics)
+}
+
+fn try_parse_named_generics(source: str) -> Result[NamedGenerics, str] {
+    let open = find_top_level_char(source, "[")
+    if open >= source.len() {
+        ret Result::Ok(NamedGenerics {
+                trim_text(source), Vec[Type]::new()
+            }
+        )
+    }
+    if !ends_with_text(source, "]") {
+        ret Result::Err("Malformed generic declaration: " + source)
+    }
+    let name = trim_text(source.slice(0_usize, open))
+    let inner = source.slice(open + 1_usize, source.len() - open - 2_usize)
+    let mut generics = Vec[Type]::new()
+    for generic in try_split_top_level_text(inner, ",")? {
+        generics.push(try_parse_type_text(generic)?)
+    }
+    ret Result::Ok(NamedGenerics {
+            name, generics
+        }
+    )
+}
+
+fn parse_named_generics(source: str) -> NamedGenerics {
+    match try_parse_named_generics(source) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret NamedGenerics { "", Vec[Type]::new() }
+}
+
+fn try_finish_parsed_block(name: str, instructions: Vec[Instruction], terminator: Option[Terminator]) -> Result[Block, str] {
+    match terminator {
+        Option[Terminator]::Some(value) => {
+            ret Result::Ok(block(name, instructions, value))
+        }
+        Option[Terminator]::None => {
+            ret Result::Err("EHIR block '" + name + "' has no terminator")
+        }
+    }
+    ret Result::Err("Unable to finish EHIR block")
+    ret Result::Ok(block("", Vec[Instruction]::new(), br_term("")))
+}
+
+fn finish_parsed_block(name: str, instructions: Vec[Instruction], terminator: Option[Terminator]) -> Block {
+    match try_finish_parsed_block(name, instructions, terminator) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret block("", Vec[Instruction]::new(), unreachable_term())
+}
+
+fn is_terminator_text(value: str) -> bool {
+    ret value == "unreachable" || starts_with_text(value, "ret ") || starts_with_text(value, "br $") || starts_with_text(value, "cbr ") || starts_with_text(value, "match ") || starts_with_text(value, "switch ")
+}
+
+fn split_lines_text(value: str) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    let mut start = 0_usize
+    while start < value.byte_len() {
+        let end = value.find_byte_from(10_u8, start)
+        out.push(byte_slice(value, start, end - start))
+        if end == value.byte_len() {
+            break
+        }
+        start = end + 1
+    }
+    ret out
+}
+
+fn brace_delta(value: str) -> isize {
+    let mut depth = 0_isize
+    let mut index = 0_usize
+    let mut in_string = false
+    let mut escaped = false
+    while index < value.len() {
+        let ch = value.byte_at(index)
+        if in_string {
+            if escaped {
+                escaped = false
+            } elif ch == 92_u8 {
+                escaped = true
+            } elif ch == 34_u8 {
+                in_string = false
+            }
+        } else {
+            if ch == 34_u8 {
+                in_string = true
+            } elif ch == 123_u8 {
+                depth = depth + 1_isize
+            } elif ch == 125_u8 {
+                depth = depth - 1_isize
+            }
+        }
+        index = index + 1_usize
+    }
+    ret depth
+}
+
+fn try_required_part(parts: Vec[str], index: usize) -> Result[str, str] {
+    match parts.get(index) {
+        Option[str]::Some(value) => {
+            ret Result::Ok(value)
+        }
+        Option[str]::None => {
+            ret Result::Err("Missing EHIR operand")
+        }
+    }
+    ret Result::Ok("")
+}
+
+fn required_part(parts: Vec[str], index: usize) -> str {
+    match try_required_part(parts, index) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret ""
+}
+
+fn strip_label(value: str) -> str {
+    let trimmed = trim_text(value)
+    if starts_with_text(trimmed, "$") {
+        ret trimmed.slice(1_usize, trimmed.len() - 1_usize)
+    }
+    ret trimmed
+}
+
+pub fn try_split_top_level_text(source: str, separator: str) -> Result[Vec[str], str] {
+    let separator_byte = separator.byte_at(0)
+    let single_separator = separator.byte_len() == 1
+    let mut out = Vec[str]::new()
+    let mut square_depth = 0_usize
+    let mut paren_depth = 0_usize
+    let mut start = 0_usize
+    let mut index = 0_usize
+    let mut in_string = false
+    let mut escaped = false
+    while index < source.len() {
+        let ch = source.byte_at(index)
+        if in_string {
+            if escaped {
+                escaped = false
+            } elif ch == 92_u8 {
+                escaped = true
+            } elif ch == 34_u8 {
+                in_string = false
+            }
+        } elif ch == 34_u8 {
+            in_string = true
+        } elif ch == 91_u8 {
+            square_depth = square_depth + 1_usize
+        } elif ch == 93_u8 {
+            if square_depth == 0_usize {
+                ret Result::Err("Unexpected ']' in EHIR text: " + source)
+            }
+            square_depth = square_depth - 1_usize
+        } elif ch == 40_u8 {
+            paren_depth = paren_depth + 1_usize
+        } elif ch == 41_u8 {
+            if paren_depth == 0_usize {
+                ret Result::Err("Unexpected ')' in EHIR text: " + source)
+            }
+            paren_depth = paren_depth - 1_usize
+        } elif single_separator && ch == separator_byte && square_depth == 0_usize && paren_depth == 0_usize {
+            out.push(trim_text(byte_slice(source, start, index - start)))
+            start = index + 1_usize
+        }
+        index = index + 1_usize
+    }
+    if square_depth != 0_usize || paren_depth != 0_usize {
+        ret Result::Err("Unclosed delimiter in EHIR text: " + source)
+    }
+    if start < source.len() {
+        out.push(trim_text(byte_slice(source, start, source.len() - start)))
+    }
+    ret Result::Ok(out)
+}
+
+pub fn split_top_level_text(source: str, separator: str) -> Vec[str] {
+    match try_split_top_level_text(source, separator) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            panic(message)
+        }
+    }
+    ret Vec[str]::new()
+}
+
+fn find_top_level_char(value: str, target: str) -> usize {
+    let target_byte = target.byte_at(0)
+    let single_target = target.byte_len() == 1
+    let mut square_depth = 0_usize
+    let mut paren_depth = 0_usize
+    let mut index = 0_usize
+    let mut in_string = false
+    let mut escaped = false
+    while index < value.len() {
+        let ch = value.byte_at(index)
+        if in_string {
+            if escaped {
+                escaped = false
+            } elif ch == 92_u8 {
+                escaped = true
+            } elif ch == 34_u8 {
+                in_string = false
+            }
+            index = index + 1_usize
+            continue
+        }
+        if ch == 34_u8 {
+            in_string = true
+            index = index + 1_usize
+            continue
+        }
+        if single_target && ch == target_byte && square_depth == 0_usize && paren_depth == 0_usize {
+            ret index
+        }
+        if ch == 91_u8 {
+            square_depth = square_depth + 1_usize
+        } elif ch == 93_u8 && square_depth > 0_usize {
+            square_depth = square_depth - 1_usize
+        } elif ch == 40_u8 {
+            paren_depth = paren_depth + 1_usize
+        } elif ch == 41_u8 && paren_depth > 0_usize {
+            paren_depth = paren_depth - 1_usize
+        }
+        index = index + 1_usize
+    }
+    ret value.len()
+}
+
+fn trim_text(value: str) -> str {
+    let mut start = 0_usize
+    while start < value.len() && is_space_byte(value.byte_at(start)) {
+        start = start + 1_usize
+    }
+    let mut end = value.len()
+    while end > start && is_space_byte(value.byte_at(end - 1_usize)) {
+        end = end - 1_usize
+    }
+    if start == 0 && end == value.byte_len() {
+        ret value
+    }
+    ret byte_slice(value, start, end - start)
+}
+
+fn is_space_byte(value: u8) -> bool {
+    ret value == 32_u8 || value == 9_u8 || value == 10_u8 || value == 13_u8
+}
+
+fn ends_with_text(value: str, suffix: str) -> bool {
+    if suffix.len() > value.len() {
+        ret false
+    }
+    ret value.range_eq(value.len() - suffix.len(), suffix.len(), suffix)
+}
+
+fn starts_with_text(value: str, prefix: str) -> bool {
+    if prefix.len() > value.len() {
+        ret false
+    }
+    ret value.range_eq(0, prefix.len(), prefix)
+}
+
+fn find_text(value: str, needle: str) -> usize {
+    ret value.find_from(needle, 0)
+}
+
+fn find_last_scope(value: str) -> usize {
+    if value.len() < 2_usize {
+        ret value.len()
+    }
+    let mut index = value.len() - 1_usize
+    while index > 0_usize {
+        if value.range_eq(index - 1_usize, 2_usize, "::") {
+            ret index - 1_usize
+        }
+        index = index - 1_usize
+    }
+    ret value.len()
+}
+
+/// One mutable name table per function, populated only by definitions.
+pub fn new_ssa_bindings(expected: usize) -> SsaBindings {
+    ret SsaBindings { Vec[Parameter]::new(), string_index_with_capacity(expected) }
+}
+
+/// The source language explicitly embeds textual EHIR in an `ehir` block.
+/// This entrypoint parses that source only; ordinary lowering never calls it.
+pub fn try_parse_inline_ir_items(source: str, known: mut SsaBindings) -> Result[Vec[IrItem], str] {
+    let lines = split_lines_text(source)
+    let mut items = Vec[IrItem]::new()
+    let mut index = 0_usize
+    while index < lines.len() {
+        let line = trim_text(lines.get_unchecked_borrowed(index))
+        index += 1_usize
+        if line.is_empty() {
+            continue
+        }
+        if starts_with_text(line, "$") && ends_with_text(line, ":") {
+            items.push(IrItem::Label(line.slice(1_usize, line.len() - 2_usize)))
+            continue
+        }
+        if starts_with_text(line, "match ") || starts_with_text(line, "switch ") {
+            let mut text = line
+            while index < lines.len() {
+                let next = trim_text(lines.get_unchecked_borrowed(index))
+                index += 1_usize
+                text += "\n" + next
+                if next == "}" {
+                    break
+                }
+            }
+            let terminator = try_parse_terminator_in_scope(text, known)?
+            match terminator {
+                Terminator::Match(value) => {
+                    for arm in value.arms {
+                        match arm.payload_var {
+                            Some(value) => bind_ssa_value(known, value) None => {
+                            }
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            items.push(IrItem::Terminator(terminator))
+        } elif line == "unreachable" || starts_with_text(line, "ret ") || starts_with_text(line, "br $") || starts_with_text(line, "cbr ") {
+            items.push(IrItem::Terminator(try_parse_terminator_in_scope(line, known)?))
+        } else {
+            let instruction = try_parse_instruction_in_scope(line, known)?
+            remember_instruction_output(known, instruction)
+            items.push(IrItem::Instruction(instruction))
+        }
+    }
+    ret Result::Ok(items)
+}

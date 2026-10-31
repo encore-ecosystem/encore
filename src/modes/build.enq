@@ -15,8 +15,8 @@ import std::time::{perf_counter_ms, perf_counter_ns, sleep_ms}
 import std::vec::Vec
 
 import argparse::{process_arg, process_arg_count}
-import ehir_llvm_backend::codegen::{CodegenRequirements, EmittedIrModule, emit_ir_bundle_for_target_parallel, emit_ir_bundle_for_target_selected, emit_ir_bundle_for_target_selected_with_analysis, emit_ir_for_target, emit_program_support, incremental_codegen_context_bundle}
-import ehirlib::{EhirModuleSource, Module, ModuleBundle, flatten_module_bundle, module_bundle_to_string, parse_module_bundle_artifact_parallel, parse_module_bundle_text, parse_module_text, split_module_bundle_text}
+import ehirlib::{EhirModuleSource, Module, ModuleBundle, flatten_module_bundle, module_bundle_to_string, module_to_string, parse_module_bundle_artifact_parallel, parse_module_bundle_text, parse_module_text, split_module_bundle_text}
+import ehirlib::codegen::{CodegenRequirements, EmittedIrModule, clear_codegen_error, emit_ir_bundle_for_target_parallel, emit_ir_bundle_for_target_selected, emit_ir_bundle_for_target_selected_with_analysis, emit_ir_for_target, emit_program_support, incremental_codegen_context_bundle, take_codegen_error}
 import ehirlib::core::make_module_bundle
 import json::{Json, parse, stringify}
 import rich::BuildProgress
@@ -34,9 +34,9 @@ import refrain::cache_identity::{compiler_binary_identity, compiler_content_dige
 import refrain::diagnostics::render_diagnostic
 import refrain::frontend::{FrontendDiagnostic, PreparedSemanticModule, check_prepared_semantic_module}
 import refrain::frontend::parser::statements::Statement
-import refrain::frontend::translator::{TranslatedModuleChunk, TranslationModule, assemble_ehir_module_bundle, filter_ast_for_target, translate_ast_with_modules_to_ehir, translate_modules_to_ehir, translate_modules_to_ehir_bundle, translate_modules_to_ehir_bundle_parallel, translate_selected_modules_to_ehir_chunks, translate_to_ehir, translate_to_ehir_for_target, translate_to_ehir_for_target_and_features}
+import refrain::frontend::translator::{TranslatedModuleChunk, TranslationModule, assemble_ehir_module_bundle, filter_ast_for_target, translate_ast_with_modules_to_ehir, translate_modules_to_ehir, translate_modules_to_ehir_bundle, translate_modules_to_ehir_bundle_parallel, translate_modules_to_ehir_bundle_typed, translate_selected_modules_to_ehir_chunks, translate_to_ehir, translate_to_ehir_for_target, translate_to_ehir_for_target_and_features}
 import refrain::project::{ProjectWorkspace, WorkspaceModule, WorkspaceRefrain, load_binary_workspace, load_library_workspace, system_core_root, system_platform_root, workspace_release_modules, workspace_root_refrain}
-import refrain::project::manifest::{project_build_kind, project_manifest_name, project_manifest_target, project_target_toolchain, read_project_manifest}
+import refrain::project::manifest::{project_build_kind, project_manifest_binary_name, project_manifest_name, project_manifest_target, project_target_toolchain, read_project_manifest}
 import refrain::project::workspace::{ResolvedPackageGraph, try_load_entry_workspace, try_resolve_package_graph}
 import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host, target_is_supported, toolchain_driver_is_supported}
 import refrain::target::kits::{target_kit_installed, target_kit_toolchain, target_platform_root}
@@ -172,7 +172,12 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
         eprintln("Error: failed to create target directory " + profile_dir.as_str())
         ret 1_u32
     }
-    let binary_path = profile_dir.join(build_artifact_name(target, project_name, output_kind))
+    let binary_path = profile_dir.join(build_artifact_name(target, if output_kind == "executable" {
+                project_manifest_binary_name(manifest)
+            } else {
+                project_name
+            }
+            , output_kind,))
     let fingerprint_path = profile_dir.join(".encore-fingerprint")
     let input_snapshot_path = profile_dir.join(".encore-input-snapshot")
     let input_configuration = build_input_configuration(root, target, toolchain, profile, emit)
@@ -863,6 +868,9 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
         "@lib.enq"
     }
     let support = emit_program_support(make_module_bundle(entry, contexts), requirements, target.triple, target.pointer_width)
+    if !support.diagnostic.is_empty() {
+        ret Result::Err("LLVM support: " + support.diagnostic)
+    }
     let support_path = staging.join("support.ll")
     if !write_verified_artifact(support_path, stable_module_ir(support.ir, graph.root_name + "@__program_support")) {
         ret Result[(), str]::Err("cannot commit final support code")
@@ -906,7 +914,12 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     // that another process is still running or retain a failed partial link.
     // PE import libraries embed the output DLL basename. Stage under its
     // public name so consumers never acquire a dependency on "linked.dll".
-    let linked = staging.join(build_artifact_name(target, graph.root_name, output_kind))
+    let linked = staging.join(build_artifact_name(target, if output_kind == "executable" {
+                project_manifest_binary_name(read_project_manifest(root))
+            } else {
+                graph.root_name
+            }
+            , output_kind,))
     if output_kind == "static_lib" {
         merge_static_library(native.archiver, objects, archives, staging, linked)?
     } else {
@@ -2741,6 +2754,11 @@ fn write_llvm_artifact_text(ehir_text: str, llvm_path: Path, target: TargetSpec,
                     target.pointer_width, codegen_jobs, selected,)
             }
         }
+        for emitted in modules {
+            if !emitted.diagnostic.is_empty() {
+                eprintln("LLVM: " + emitted.diagnostic) ret false
+            }
+        }
         let mut manifest = ""
         let mut state = "encore-llvm-cgu-state-v2\n" + incremental_configuration + "\n"
         let mut index = 0_usize
@@ -2789,7 +2807,13 @@ fn write_llvm_artifact_text(ehir_text: str, llvm_path: Path, target: TargetSpec,
     } else {
         parse_module_text("encore_bootstrap", ehir_text)
     }
+    clear_codegen_error()
     let llvm_text = emit_ir_for_target(module, target.triple, target.pointer_width)
+    let diagnostic = take_codegen_error()
+    if !diagnostic.is_empty() {
+        eprintln(diagnostic)
+        ret false
+    }
     ret write_verified_artifact(llvm_path, llvm_text)
 }
 
@@ -3362,6 +3386,10 @@ fn compiler_args(profile: str, target: TargetSpec, toolchain: Toolchain) -> Vec[
     // compile units. A PID-scoped staging cwd changes module hashes, promoted
     // local symbol names and PE build IDs across otherwise identical links.
     args.push("-fdebug-compilation-dir=.")
+    // GlobalISel and its per-function SelectionDAG fallback disagree on
+    // mixed-width aggregate stack arguments on Darwin ARM64. Our LLVM ABI
+    // carries nested values directly, so select one lowering consistently.
+    args.push("-fno-experimental-isel")
     if target.os == "macos" {
         args.push("-fblocks")
     }
@@ -3807,15 +3835,19 @@ fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
     profile_test_compilation("inputs", input_started)
     let frontend_started = perf_counter_ms()
     let translation_modules = test_translation_modules(workspace.modules, ast, target)
-    let ehir_text = translate_modules_to_ehir(translation_modules, target)
+    let ehir_bundle = translate_modules_to_ehir_bundle_typed(translation_modules, target, "encore_test")
     profile_test_compilation("frontend", frontend_started)
-    let parse_started = perf_counter_ms()
-    let ehir_module = parse_module_text("encore_test", ehir_text)
-    profile_test_compilation("parse-ehir", parse_started)
+    let ehir_module = flatten_module_bundle("encore_test", ehir_bundle)
     let codegen_started = perf_counter_ms()
+    clear_codegen_error()
     let llvm_text = emit_ir_for_target(ehir_module, target.triple, target.pointer_width)
+    let diagnostic = take_codegen_error()
+    if !diagnostic.is_empty() {
+        eprintln(diagnostic)
+        ret 1_u32
+    }
     profile_test_compilation("codegen", codegen_started)
-    if write_file(native_path(ehir_path.as_str()), ehir_text) != 0_i32 {
+    if keep_temporary_artifacts() && write_file(native_path(ehir_path.as_str()), module_to_string(ehir_module)) != 0_i32 {
         ret test_artifact_error("write test EHIR", ehir_path)
     }
     if write_file(native_path(llvm_path.as_str()), llvm_text) != 0_i32 {
@@ -3824,6 +3856,7 @@ fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
     let mut args = Vec[str]::new()
     args.push("-O0")
     args.push("-g")
+    args.push("-fno-experimental-isel")
     args.push("-Wno-override-module")
     args.push(native_path(llvm_path.as_str()))
     args.push(native_path(runtime_path.as_str()))

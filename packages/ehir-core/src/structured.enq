@@ -1,0 +1,203 @@
+//! Typed construction fragments shared by frontends; no text parsing.
+import core::option::Option
+import core::result::Result
+import std::vec::Vec
+import refrain::core::*
+
+pub enum IrItem {
+    Instruction(Instruction)
+    Terminator(Terminator)
+    Label(str)
+    FunctionStart(FnDirective)
+    FunctionEnd
+    ImplStart(ImplDirective)
+    ImplEnd
+    Declaration(Directive)
+    Documentation(str)
+}
+/// Construction buffers are thread confined. The raw marker prevents implicit
+/// freezing/sending; graph-managed storage owns every typed item and its lifetime.
+struct BufferStorage { items: Vec[IrItem], suppressed: bool, exclusive: u8* }
+pub struct IrBuilder { storage: BufferStorage<H> }
+extern fn encore_text_builder_is_suppressed() -> bool
+#attr(safe)
+fn exclusive_marker() -> u8* {
+    unsafe { unsafe ehir { zero: usize = capprim 0_usize
+        pointer: u8* = pcast zero: usize, u8* }
+        ret pointer
+    }
+}
+impl for IrBuilder {
+    pub fn new() -> Self {
+        ret Self { BufferStorage<H> { Vec[IrItem]::new(), unsafe { encore_text_builder_is_suppressed() }, exclusive_marker() } }
+    }
+    pub fn from_items(items: Vec[IrItem]) -> Self {
+        let mut copy = Vec[IrItem]::with_capacity(items.len())
+        copy.extend(items)
+        ret Self { BufferStorage<H> { copy, false, exclusive_marker() } }
+    }
+    #attr(safe)
+    pub fn push(self: Self, item: IrItem) -> Self {
+        if !self.storage.suppressed {
+            let storage = self.storage
+            unsafe { unsafe ehir {
+                address: Vec[IrItem]* = getfieldptr storage > items
+                values: mut Vec[IrItem] = pcast address: Vec[IrItem]*, mut Vec[IrItem]
+            } values.push(item) }
+        }
+        ret self
+    }
+    pub fn emit(self: Self, item: Instruction) -> Self { ret self.push(IrItem::Instruction(item)) }
+    pub fn terminate(self: Self, item: Terminator) -> Self { ret self.push(IrItem::Terminator(item)) }
+    pub fn label(self: Self, name: str) -> Self { ret self.push(IrItem::Label(name)) }
+    pub fn function_start(self: Self, item: FnDirective) -> Self { ret self.push(IrItem::FunctionStart(item)) }
+    pub fn function_end(self: Self) -> Self { ret self.push(IrItem::FunctionEnd) }
+    pub fn impl_start(self: Self, item: ImplDirective) -> Self { ret self.push(IrItem::ImplStart(item)) }
+    pub fn impl_end(self: Self) -> Self { ret self.push(IrItem::ImplEnd) }
+    pub fn declaration(self: Self, item: Directive) -> Self { ret self.push(IrItem::Declaration(item)) }
+    pub fn documentation(self: Self, text: str) -> Self { ret self.push(IrItem::Documentation(text)) }
+    pub fn empty_line(self: Self) -> Self { ret self }
+    pub fn finish_items(self: Self) -> Vec[IrItem] {
+        let mut snapshot = Vec[IrItem]::with_capacity(self.storage.items.len())
+        snapshot.extend(self.storage.items)
+        ret snapshot
+    }
+    #attr(safe)
+    pub fn append(self: Self, other: Self) -> Self {
+        if !self.storage.suppressed {
+            // Snapshot first, including when the same buffer is appended to itself.
+            let mut incoming = Vec[IrItem]::with_capacity(other.storage.items.len())
+            incoming.extend(other.storage.items)
+            let storage = self.storage
+            unsafe { unsafe ehir {
+                address: Vec[IrItem]* = getfieldptr storage > items
+                values: mut Vec[IrItem] = pcast address: Vec[IrItem]*, mut Vec[IrItem]
+            } values.extend(incoming) }
+        }
+        ret self
+    }
+}
+
+struct Assembly {
+    declarations: Vec[Directive]
+    documentation: Vec[EhirDocumentation]
+    pending_documentation: Option[str]
+    function_documentation: Option[str]
+    impl_documentation: Option[str]
+    function: Option[FnDirective]
+    implementation: Option[ImplDirective]
+    blocks: Vec[Block]
+    methods: Vec[FnDirective]
+    label: str
+    instructions: Vec[Instruction]
+    terminator: Option[Terminator]
+}
+fn flush_block(state: mut Assembly) -> Result[(), str] {
+    if state.label.is_empty() {
+        if !state.instructions.is_empty() || state.terminator.is_some() { ret Result::Err("IR item outside a block") }
+        ret Result::Ok(())
+    }
+    let term = match state.terminator {
+        Some(value) => value None => { ret Result::Err("unterminated IR block: " + state.label) }
+    }
+    if state.function.is_none() { ret Result::Err("IR block outside a function") }
+    state.blocks.push(block(state.label, state.instructions, term))
+    state.label = ""
+    state.instructions = Vec[Instruction]::new()
+    state.terminator = Option[Terminator]::None
+    ret Result::Ok(())
+}
+fn append_declaration(state: mut Assembly, directive: Directive) -> () {
+    match state.pending_documentation {
+        Some(text) => {
+            let target = match directive {
+                Directive::Struct(value) => value.name
+                Directive::Enum(value) => value.name
+                Directive::Trait(value) => value.name
+                Directive::Function(value) => value.name
+                Directive::Impl(value) => "impl " + value.for_type.name
+            }
+            state.documentation.push(ehir_documentation(target, text))
+        }
+        None => {}
+    }
+    state.pending_documentation = Option[str]::None
+    state.declarations.push(directive)
+}
+
+/// Materializes typed fragments; it performs no parsing or type propagation.
+pub fn module_from_ir_items(name: str, imports: Vec[EhirImport], documentation: Option[str],
+    items: Vec[IrItem]) -> Result[Module, str] {
+    let mut state = Assembly { Vec[Directive]::new(), Vec[EhirDocumentation]::new(), Option[str]::None,
+        Option[str]::None, Option[str]::None, Option[FnDirective]::None, Option[ImplDirective]::None, Vec[Block]::new(), Vec[FnDirective]::new(), "", Vec[Instruction]::new(), Option[Terminator]::None }
+    for item in items {
+        match item {
+            IrItem::Documentation(text) => { state.pending_documentation = Option[str]::Some(text) }
+            IrItem::Declaration(value) => {
+                if state.function.is_some() { ret Result::Err("declaration inside IR function") }
+                match value {
+                    Directive::Function(function) => {
+                        if state.implementation.is_some() { state.methods.push(function) state.pending_documentation = Option[str]::None }
+                        else { append_declaration(state, Directive::Function(function)) }
+                    }
+                    _ => { if state.implementation.is_some() { ret Result::Err("invalid declaration inside IR impl") } append_declaration(state, value) }
+                }
+            }
+            IrItem::FunctionStart(value) => {
+                if state.function.is_some() || !value.blocks.is_empty() { ret Result::Err("invalid IR function start") }
+                state.function_documentation = state.pending_documentation
+                state.pending_documentation = Option[str]::None
+                state.function = Option[FnDirective]::Some(value)
+            }
+            IrItem::FunctionEnd => {
+                flush_block(state)?
+                let signature = match state.function {
+                    Some(value) => value None => { ret Result::Err("IR function end without start") }
+                }
+                let function = FnDirective { signature.name, signature.generics, signature.params,
+                    signature.ret_type, state.blocks, signature.is_extern, signature.is_async }
+                state.blocks = Vec[Block]::new()
+                match state.implementation {
+                    Some(_) => { state.methods.push(function) }
+                    None => { state.pending_documentation = state.function_documentation append_declaration(state, Directive::Function(function)) }
+                }
+                state.function_documentation = Option[str]::None
+                state.function = Option[FnDirective]::None
+            }
+            IrItem::ImplStart(value) => {
+                if state.implementation.is_some() || state.function.is_some() || !value.methods.is_empty() { ret Result::Err("invalid IR impl start") }
+                state.impl_documentation = state.pending_documentation
+                state.pending_documentation = Option[str]::None
+                state.implementation = Option[ImplDirective]::Some(value)
+            }
+            IrItem::ImplEnd => {
+                if state.function.is_some() { ret Result::Err("IR impl ended within a function") }
+                match state.implementation {
+                    Some(value) => { state.pending_documentation = state.impl_documentation append_declaration(state, Directive::Impl(ImplDirective {
+                        value.trait_name, value.trait_args, value.for_type, value.generics, state.methods
+                    })) state.methods = Vec[FnDirective]::new() }
+                    None => { ret Result::Err("IR impl end without start") }
+                }
+                state.impl_documentation = Option[str]::None
+                state.implementation = Option[ImplDirective]::None
+            }
+            IrItem::Label(label) => { flush_block(state)? state.label = label }
+            IrItem::Instruction(value) => {
+                if state.function.is_none() || state.label.is_empty() { ret Result::Err("instruction outside IR function/block") }
+                state.instructions.push(value)
+            }
+            IrItem::Terminator(value) => {
+                if state.function.is_none() || state.label.is_empty() { ret Result::Err("terminator outside IR function/block") }
+                state.terminator = Option[Terminator]::Some(value)
+            }
+        }
+    }
+    if state.function.is_some() || state.implementation.is_some() { ret Result::Err("unclosed IR declaration") }
+    ret Result::Ok(make_module_with_metadata(name, imports, documentation, state.documentation, state.declarations))
+}
+
+pub fn ir_items_from_declarations(declarations: Vec[Directive]) -> IrBuilder {
+    let mut result = IrBuilder::new()
+    for declaration in declarations { result = result.declaration(declaration) }
+    ret result
+}

@@ -14,14 +14,15 @@ import json::{Json, parse, stringify}
 import rich::ProgressReporter
 
 import mod::build_archive::UnitNativePlan
-import mod::build_artifacts::{UnitReady, read_unit_complete, read_unit_ready}
-import mod::build_cache::{UnitCacheLock, close_unit_cache_lock, commit_unit_cache, restore_unit_cache, try_unit_cache_lock}
+import mod::build_artifacts::{UnitReady, read_unit_complete, read_unit_ready, verify_validated_unit_copy}
+import mod::build_cache::{UnitCacheLock, close_unit_cache_lock, commit_unit_cache, try_unit_cache_lock, unit_cache_candidate}
 import mod::build_fingerprint::unit_fingerprint
 import mod::build_frontend_cache::{commit_frontend_cache, restore_frontend_cache}
 import mod::build_metadata::{MetadataContext, MetadataDependency}
 import mod::build_prepared_cache::{commit_prepared_cache, restore_prepared_cache}
 import mod::build_request::{BuildUnitRequest, UnitMetadataInput, unit_dependencies, unit_source_digest}
 import mod::build_scheduler::{BuildScheduler, BuildUnit}
+import refrain::cache_identity::compiler_content_digest
 import refrain::project::build_graph::validate_build_graph
 import refrain::project::workspace::ResolvedPackageGraph
 
@@ -52,6 +53,7 @@ struct PackageTask {
     ready: Option[UnitReady]
     archive_digest: str
     cache_lock: Option[UnitCacheLock]
+    cache_candidate: Option[UnitReady]
 }
 
 /// The graph was resolved once from manifests. Staging must be fresh: this
@@ -89,7 +91,7 @@ pub fn compile_cached_package_graph(graph: ResolvedPackageGraph, target: str, pr
         units.push(BuildUnit::new(package.name, package.dependency_names, 0))
         tasks.push(PackageTask {
                 context, staging.join("unit-" + Debug::fmt(index)),
-                0, false, Option[UnitReady]::None, "", Option[UnitCacheLock]::None
+                0, false, Option[UnitReady]::None, "", Option[UnitCacheLock]::None, Option[UnitReady]::None
             }
             ,)
         index += 1
@@ -205,6 +207,7 @@ fn drive_packages(graph: ResolvedPackageGraph, compiler: str, native_path: Path,
                     ,
                 )
             }
+            let mut cache_candidate = Option[UnitReady]::None
             let mut cache_lock = Option[UnitCacheLock]::None
             match cache {
                 Some(root) => {
@@ -216,7 +219,7 @@ fn drive_packages(graph: ResolvedPackageGraph, compiler: str, native_path: Path,
                     }
                     // Record ownership before any fallible hydration operation.
                     tasks.set(next, PackageTask {
-                            task.context, task.directory, 0, false, task.ready, "", cache_lock
+                            task.context, task.directory, 0, false, task.ready, "", cache_lock, Option[UnitReady]::None
                         }
                         ,
                     )
@@ -226,61 +229,46 @@ fn drive_packages(graph: ResolvedPackageGraph, compiler: str, native_path: Path,
                         }
                     }
                     let dependencies = expected_dependencies(graph, tasks, task.context.unit)?
-                    match restore_unit_cache(lock, task.context, dependencies, native_digest, task.directory)? {
-                        Some(ready) => {
-                            let digest = read_unit_complete(task.directory, ready, native_digest)?
-                            if !scheduler.cached_complete(next) {
-                                ret Result[(), str]::Err("invalid cached package transition")
-                            }
-                            close_unit_cache_lock(lock)
-                            tasks.set(next, PackageTask {
-                                    task.context, task.directory, 0, true, Option[UnitReady]::Some(ready), digest, Option[UnitCacheLock]::None
-                                }
-                                ,
-                            )
-                            completed += 1
-                            progress.complete(next, task.context.unit)
-                            write_package_timing(task.directory, task.context.unit, true, perf_counter_ms() - started, 0)?
-                            continue
-                        }
-                        None => {
-                        }
-                    }
-                    let backend_key = unit_fingerprint(task.context, fingerprint_dependencies, native_digest)?.backend
-                    let backend_lock = try_unit_cache_lock(root, backend_key)?
-                    match backend_lock {
-                        Some(prepared_lock) => {
-                            let restored = restore_prepared_cache(prepared_lock, task.context, dependencies, backend_key, task.directory)
-                            close_unit_cache_lock(prepared_lock)
-                            let backend_restored = restored?
-                            if !backend_restored {
-                                let frontend_key = unit_fingerprint(task.context, fingerprint_dependencies, native_digest)?.frontend
-                                match try_unit_cache_lock(root, frontend_key)? {
-                                    Some(frontend_lock) => {
-                                        let restored_frontend = restore_frontend_cache(frontend_lock, frontend_key, task.context, dependencies, task.directory)
-                                        close_unit_cache_lock(frontend_lock)
-                                        let _restored_frontend = restored_frontend?
-                                    }
-                                    None => {
-                                        close_unit_cache_lock(lock)
-                                        tasks.set(next, PackageTask {
-                                                task.context, task.directory, 0, false, task.ready, "", Option[UnitCacheLock]::None
-                                            }
-                                            ,
-                                        )
-                                        waiting_for_lock = true busy_keys.push(next) continue
+                    // Header-only hint: full AST/payload validation and hydration
+                    // run in budgeted workers, concurrently for independent units.
+                    cache_candidate = unit_cache_candidate(lock.directory, task.context, native_digest)
+                    if cache_candidate.is_none() {
+                        let backend_key = unit_fingerprint(task.context, fingerprint_dependencies, native_digest)?.backend
+                        let backend_lock = try_unit_cache_lock(root, backend_key)?
+                        match backend_lock {
+                            Some(prepared_lock) => {
+                                let restored = restore_prepared_cache(prepared_lock, task.context, dependencies, backend_key, task.directory)
+                                close_unit_cache_lock(prepared_lock)
+                                let backend_restored = restored?
+                                if !backend_restored {
+                                    let frontend_key = unit_fingerprint(task.context, fingerprint_dependencies, native_digest)?.frontend
+                                    match try_unit_cache_lock(root, frontend_key)? {
+                                        Some(frontend_lock) => {
+                                            let restored_frontend = restore_frontend_cache(frontend_lock, frontend_key, task.context, dependencies, task.directory)
+                                            close_unit_cache_lock(frontend_lock)
+                                            let _restored_frontend = restored_frontend?
+                                        }
+                                        None => {
+                                            close_unit_cache_lock(lock)
+                                            tasks.set(next, PackageTask {
+                                                    task.context, task.directory, 0, false, task.ready, "", Option[UnitCacheLock]::None, Option[UnitReady]::None
+                                                }
+                                                ,
+                                            )
+                                            waiting_for_lock = true busy_keys.push(next) continue
+                                        }
                                     }
                                 }
                             }
-                        }
-                        None => {
-                            close_unit_cache_lock(lock)
-                            tasks.set(next, PackageTask {
-                                    task.context, task.directory, 0, false, task.ready, "", Option[UnitCacheLock]::None
-                                }
-                                ,
-                            )
-                            waiting_for_lock = true busy_keys.push(next) continue
+                            None => {
+                                close_unit_cache_lock(lock)
+                                tasks.set(next, PackageTask {
+                                        task.context, task.directory, 0, false, task.ready, "", Option[UnitCacheLock]::None, Option[UnitReady]::None
+                                    }
+                                    ,
+                                )
+                                waiting_for_lock = true busy_keys.push(next) continue
+                            }
                         }
                     }
                 }
@@ -296,7 +284,7 @@ fn drive_packages(graph: ResolvedPackageGraph, compiler: str, native_path: Path,
                     }
                 }
                 tasks.set(next, PackageTask {
-                        task.context, task.directory, 0, false, task.ready, "", Option[UnitCacheLock]::None
+                        task.context, task.directory, 0, false, task.ready, "", Option[UnitCacheLock]::None, Option[UnitReady]::None
                     }
                     ,
                 )
@@ -332,14 +320,14 @@ fn drive_packages(graph: ResolvedPackageGraph, compiler: str, native_path: Path,
             if write_file(directory.join("worker-" + Debug::fmt(next) + ".started").as_str(), Debug::fmt(perf_counter_ms())) != 0 {
                 // Register the child before propagating an I/O error.
                 tasks.set(next, PackageTask {
-                        task.context, task.directory, child, true, task.ready, task.archive_digest, cache_lock
+                        task.context, task.directory, child, true, task.ready, task.archive_digest, cache_lock, cache_candidate
                     }
                     ,
                 )
                 ret Result[(), str]::Err("cannot record package start")
             }
             tasks.set(next, PackageTask {
-                    task.context, task.directory, child, true, task.ready, task.archive_digest, cache_lock
+                    task.context, task.directory, child, true, task.ready, task.archive_digest, cache_lock, cache_candidate
                 }
                 ,
             )
@@ -357,10 +345,31 @@ fn drive_packages(graph: ResolvedPackageGraph, compiler: str, native_path: Path,
                 index += 1 continue
             }
             live += 1
-            let newly_ready = task.ready.is_none() && file_exists(task.directory.join("unit.ready").as_str())
+            let status = unsafe {
+                encore_compiler_worker_poll(task.child)
+            }
+            let cache_hit = task.cache_candidate.is_some() && status == 0 &&
+            file_exists(task.directory.join("unit.cache-hit").as_str())
+            let newly_ready = task.ready.is_none() && file_exists(task.directory.join("unit.ready").as_str()) &&
+            (task.cache_candidate.is_none() || status != running)
             let ready = if newly_ready {
-                let dependencies = expected_dependencies(graph, tasks, task.context.unit)?
-                Option[UnitReady]::Some(read_unit_ready(task.directory, task.context, dependencies)?)
+                if cache_hit {
+                    let validated = match task.cache_candidate {
+                        Some(value) => value None => {
+                            ret Result[(), str]::Err("missing cache candidate")
+                        }
+                    }
+                    if read_file(task.directory.join("unit.cache-hit").as_str()) != compiler_content_digest(validated.encode()?) {
+                        ret Result[(), str]::Err("package cache handoff mismatch")
+                    }
+                    // The worker checked semantic identity once. The parent
+                    // accepts only its fresh private copy with identical bytes.
+                    verify_validated_unit_copy(task.directory, validated)?
+                    Option[UnitReady]::Some(validated)
+                } else {
+                    let dependencies = expected_dependencies(graph, tasks, task.context.unit)?
+                    Option[UnitReady]::Some(read_unit_ready(task.directory, task.context, dependencies)?)
+                }
             } else {
                 task.ready
             }
@@ -370,60 +379,59 @@ fn drive_packages(graph: ResolvedPackageGraph, compiler: str, native_path: Path,
                     ret Result[(), str]::Err("invalid package metadata transition")
                 }
                 tasks.set(index, PackageTask {
-                        task.context, task.directory, task.child, true, ready, "", task.cache_lock
+                        task.context, task.directory, task.child, true, ready, "", task.cache_lock, task.cache_candidate
                     }
                     ,
                 )
-                match cache {
-                    Some(root) => {
-                        let mut all_dependencies = Vec[MetadataDependency]::new()
-                        for name in unit_dependencies(graph, task.context.unit)? {
-                            let dependency = task_by_name(tasks, name)?
-                            let dependency_ready = match dependency.ready {
-                                Some(value) => value None => {
-                                    ret Result[(), str]::Err("prepared dependency missing")
+                if !cache_hit {
+                    match cache {
+                        Some(root) => {
+                            let mut all_dependencies = Vec[MetadataDependency]::new()
+                            for name in unit_dependencies(graph, task.context.unit)? {
+                                let dependency = task_by_name(tasks, name)?
+                                let dependency_ready = match dependency.ready {
+                                    Some(value) => value None => {
+                                        ret Result[(), str]::Err("prepared dependency missing")
+                                    }
                                 }
+                                all_dependencies.push(MetadataDependency {
+                                        name, dependency_ready.interface_digest, dependency_ready.template_digest
+                                    }
+                                    ,
+                                )
                             }
-                            all_dependencies.push(MetadataDependency {
-                                    name, dependency_ready.interface_digest, dependency_ready.template_digest
-                                }
-                                ,
-                            )
-                        }
-                        let fingerprints = unit_fingerprint(task.context, all_dependencies, native_digest)?
-                        let key = fingerprints.backend
-                        match try_unit_cache_lock(root, key)? {
-                            Some(lock) => {
-                                let committed = commit_prepared_cache(lock, task.context, expected_dependencies(graph, tasks, task.context.unit)?, key, task.directory)
-                                close_unit_cache_lock(lock)
-                                committed?
-                            }
-                            // Another build's identical prepared snapshot can
-                            // finish first. Missing this optional warm-up is safe.
-                            None => {
-                            }
-                        }
-                        // Backend-cache hits have no raw frontend checkpoint in
-                        // their private output. Keep any existing frontend entry.
-                        if file_exists(task.directory.join("unit.frontend").as_str()) {
-                            match try_unit_cache_lock(root, fingerprints.frontend)? {
+                            let fingerprints = unit_fingerprint(task.context, all_dependencies, native_digest)?
+                            let key = fingerprints.backend
+                            match try_unit_cache_lock(root, key)? {
                                 Some(lock) => {
-                                    let committed = commit_frontend_cache(lock, fingerprints.frontend, task.context,
-                                        expected_dependencies(graph, tasks, task.context.unit)?, task.directory,)
+                                    let committed = commit_prepared_cache(lock, task.context, expected_dependencies(graph, tasks, task.context.unit)?, key, task.directory)
                                     close_unit_cache_lock(lock)
                                     committed?
                                 }
+                                // Another build's identical prepared snapshot can
+                                // finish first. Missing this optional warm-up is safe.
                                 None => {
                                 }
                             }
+                            // Backend-cache hits have no raw frontend checkpoint in
+                            // their private output. Keep any existing frontend entry.
+                            if file_exists(task.directory.join("unit.frontend").as_str()) {
+                                match try_unit_cache_lock(root, fingerprints.frontend)? {
+                                    Some(lock) => {
+                                        let committed = commit_frontend_cache(lock, fingerprints.frontend, task.context,
+                                            expected_dependencies(graph, tasks, task.context.unit)?, task.directory,)
+                                        close_unit_cache_lock(lock)
+                                        committed?
+                                    }
+                                    None => {
+                                    }
+                                }
+                            }
+                        }
+                        None => {
                         }
                     }
-                    None => {
-                    }
                 }
-            }
-            let status = unsafe {
-                encore_compiler_worker_poll(task.child)
             }
             if status != running {
                 if status != 0 {
@@ -440,13 +448,15 @@ fn drive_packages(graph: ResolvedPackageGraph, compiler: str, native_path: Path,
                 let peak = unsafe {
                     encore_compiler_worker_peak_rss(task.child)
                 }
-                write_package_timing(task.directory, task.context.unit, false, perf_counter_ms() - started, peak)?
+                write_package_timing(task.directory, task.context.unit, cache_hit, perf_counter_ms() - started, peak)?
                 match task.cache_lock {
                     Some(lock) => {
-                        commit_unit_cache(lock, task.directory, task.context, expected_dependencies(graph, tasks, task.context.unit)?, native_digest)?
+                        if !cache_hit {
+                            commit_unit_cache(lock, task.directory, task.context, expected_dependencies(graph, tasks, task.context.unit)?, native_digest)?
+                        }
                         close_unit_cache_lock(lock)
                         tasks.set(index, PackageTask {
-                                task.context, task.directory, task.child, true, ready, digest, Option[UnitCacheLock]::None
+                                task.context, task.directory, task.child, true, ready, digest, Option[UnitCacheLock]::None, task.cache_candidate
                             }
                             ,
                         )
@@ -461,7 +471,7 @@ fn drive_packages(graph: ResolvedPackageGraph, compiler: str, native_path: Path,
                     encore_compiler_worker_close(task.child)
                 }
                 tasks.set(index, PackageTask {
-                        task.context, task.directory, 0, true, ready, digest, Option[UnitCacheLock]::None
+                        task.context, task.directory, 0, true, ready, digest, Option[UnitCacheLock]::None, Option[UnitReady]::None
                     }
                     ,
                 )
@@ -486,19 +496,8 @@ fn write_package_timing(directory: Path, name: str, hit: bool, elapsed: u64, pea
     fields.push(("cache_hit", Json::Bool(hit)))
     fields.push(("completed_ms", Json::Number(Debug::fmt(elapsed))))
     fields.push(("peak_rss_bytes", Json::Number(Debug::fmt(peak))))
-    fields.push(("queue_ms", Json::Number(if hit {
-                    Debug::fmt(elapsed)
-                } else {
-                    read_file(directory.join("queued-ms").as_str())
-                }
-            )))
-    fields.push(("phases", if hit {
-                Json::Null
-            } else {
-                parse(read_file(directory.join("phases.json").as_str())).unwrap_or(Json::Null)
-            }
-            ,
-        ))
+    fields.push(("queue_ms", Json::Number(read_file(directory.join("queued-ms").as_str()))))
+    fields.push(("phases", parse(read_file(directory.join("phases.json").as_str())).unwrap_or(Json::Null)))
     if write_file(directory.join("timing.json").as_str(), stringify(Json::Object(fields))) != 0 {
         ret Result[(), str]::Err("cannot record package timing")
     }

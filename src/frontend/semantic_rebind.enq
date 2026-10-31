@@ -1,0 +1,224 @@
+//! Rebind persisted dense type references through stable declaration keys.
+import core::result::Result
+import std::vec::Vec
+
+import json::Json
+
+import refrain::frontend::semantic::{SemanticCallable, SemanticField, SemanticMethod, SemanticVariant}
+import refrain::frontend::type_scope::TypeNameBinding
+
+pub fn rebind_semantic_type(value: str, identities: Vec[str]) -> Result[str, str] {
+    if !value.contains("@") {
+        ret Result::Ok(value)
+    }
+    let mut out = ""
+    let mut cursor = 0_usize
+    let mut start = 0_usize
+    while cursor < value.byte_len() {
+        if value.byte_at(cursor) != 64_u8 {
+            cursor += 1_usize continue
+        }
+        let at = cursor
+        cursor += 1_usize
+        let digits = cursor
+        let mut ordinal = 0_usize
+        while cursor < value.byte_len() {
+            let byte = value.byte_at(cursor)
+            if byte < 48_u8 || byte > 57_u8 {
+                break
+            }
+            let digit =(byte - 48_u8) as usize
+            if ordinal >(18446744073709551615_usize - digit) / 10_usize {
+                ret Result::Err("invalid nominal type ordinal")
+            }
+            ordinal = ordinal * 10_usize + digit cursor += 1_usize
+        }
+        if digits == cursor {
+            continue
+        }
+        let identity = match identities.get(ordinal) {
+            Some(value) => value None => {
+                ret Result::Err("unknown nominal type ordinal")
+            }
+        }
+        if identity.is_empty() {
+            ret Result::Err("nominal declaration no longer exists")
+        }
+        out += value.slice_bytes(start, at - start) + identity
+        start = cursor
+    }
+    ret Result::Ok(out + value.slice_bytes(start, value.byte_len() - start))
+}
+pub fn rebind_semantic_strings(values: Vec[str], identities: Vec[str]) -> Result[Vec[str], str] {
+    let mut out = Vec[str]::with_capacity(values.len())
+    for value in values {
+        out.push(rebind_semantic_type(value, identities)?)
+    }
+    ret Result::Ok(out)
+}
+pub fn rebind_semantic_callable(value: SemanticCallable, identities: Vec[str]) -> Result[SemanticCallable, str] {
+    ret Result::Ok(SemanticCallable {
+            value.module_name, value.name, rebind_semantic_strings(value.params, identities)?,
+            rebind_semantic_type(value.ret_type, identities)?, value.signature, value.declaration_name, value.lookup_module,
+            value.binding_identity, value.generic_names, value.is_static
+        }
+    )
+}
+pub fn rebind_semantic_field(value: SemanticField, identities: Vec[str]) -> Result[SemanticField, str] {
+    ret Result::Ok(SemanticField {
+            value.module_name, rebind_semantic_type(value.owner_type, identities)?, value.name,
+            rebind_semantic_type(value.typ, identities)?, value.signature, value.generic_names, value.declaration_owner
+        }
+    )
+}
+pub fn rebind_semantic_method(value: SemanticMethod, identities: Vec[str]) -> Result[SemanticMethod, str] {
+    ret Result::Ok(SemanticMethod {
+            value.module_name, rebind_semantic_type(value.receiver_type, identities)?, value.name,
+            rebind_semantic_strings(value.params, identities)?, rebind_semantic_type(value.ret_type, identities)?, value.signature,
+            value.declaration_receiver, value.generic_names, value.is_static, value.is_public, value.method_generic_names
+        }
+    )
+}
+pub fn rebind_semantic_variant(value: SemanticVariant, identities: Vec[str]) -> Result[SemanticVariant, str] {
+    ret Result::Ok(SemanticVariant {
+            rebind_semantic_type(value.owner_type, identities)?, value.name,
+            rebind_semantic_type(value.payload_type, identities)?, value.generic_names
+        }
+    )
+}
+pub fn rebind_semantic_name(value: TypeNameBinding, identities: Vec[str]) -> Result[TypeNameBinding, str] {
+    ret Result::Ok(TypeNameBinding {
+            value.scope, value.name, rebind_semantic_type(value.identity, identities)?, value.display, value.declaration
+        }
+    )
+}
+
+fn row(value: Json, count: usize) -> Result[Vec[Json], str] {
+    let values = match value {
+        Json::Array(values) => values _ => {
+            ret Result::Err("invalid semantic checkpoint row")
+        }
+    }
+    if values.len() != count {
+        ret Result::Err("invalid semantic checkpoint arity")
+    }
+    // Vec is graph managed; a fresh row prevents changing the stored checkpoint.
+    let mut copy = Vec[Json]::with_capacity(count)
+    copy.extend(values)
+    ret Result::Ok(copy)
+}
+fn typ(value: Json, identities: Vec[str]) -> Result[Json, str] {
+    match value {
+        Json::String(value) => {
+            ret Result::Ok(Json::String(rebind_semantic_type(value, identities)?))
+        }
+        _ => {
+            ret Result::Err("invalid semantic checkpoint type")
+        }
+    }
+    ret Result::Err("invalid semantic checkpoint type")
+}
+fn binding(value: Json, identities: Vec[str]) -> Result[Json, str] {
+    let mut values = row(value, 4_usize)?
+    values.set(1_usize, typ(values.get_unchecked_borrowed(1_usize), identities)?)
+    ret Result::Ok(Json::Array(values))
+}
+fn array(value: Json) -> Result[Vec[Json], str] {
+    match value {
+        Json::Array(values) => {
+            ret Result::Ok(values)
+        }
+        _ => {
+            ret Result::Err("invalid semantic checkpoint array")
+        }
+    }
+    ret Result::Err("invalid semantic checkpoint array")
+}
+pub fn rebind_semantic_checkpoint(value: Json, identities: Vec[str]) -> Result[Json, str] {
+    let mut values = row(value, 11_usize)?
+    let mut bindings = Vec[Json]::new()
+    for value in array(values.get_unchecked_borrowed(3_usize))? {
+        bindings.push(binding(value, identities)?)
+    }
+    values.set(3_usize, Json::Array(bindings))
+    let mut scoped = Vec[Json]::new()
+    for value in array(values.get_unchecked_borrowed(4_usize))? {
+        let mut entry = row(value, 7_usize)?
+        entry.set(0_usize, binding(entry.get_unchecked_borrowed(0_usize), identities)?) scoped.push(Json::Array(entry))
+    }
+    values.set(4_usize, Json::Array(scoped))
+    let mut receivers = Vec[Json]::new()
+    for value in array(values.get_unchecked_borrowed(5_usize))? {
+        let mut entry = row(value, 3_usize)?
+        entry.set(2_usize, typ(entry.get_unchecked_borrowed(2_usize), identities)?) receivers.push(Json::Array(entry))
+    }
+    values.set(5_usize, Json::Array(receivers))
+    let mut implicit = Vec[Json]::new()
+    for value in array(values.get_unchecked_borrowed(6_usize))? {
+        let mut entry = row(value, 4_usize)?
+        entry.set(3_usize, typ(entry.get_unchecked_borrowed(3_usize), identities)?) implicit.push(Json::Array(entry))
+    }
+    values.set(6_usize, Json::Array(implicit))
+    let mut methods = Vec[Json]::new()
+    for value in array(values.get_unchecked_borrowed(7_usize))? {
+        let mut entry = row(value, 11_usize)?
+        entry.set(1_usize, typ(entry.get_unchecked_borrowed(1_usize), identities)?)
+        entry.set(4_usize, typ(entry.get_unchecked_borrowed(4_usize), identities)?)
+        let mut params = Vec[Json]::new()
+        for param in array(entry.get_unchecked_borrowed(3_usize))? {
+            params.push(typ(param, identities)?)
+        }
+        entry.set(3_usize, Json::Array(params)) methods.push(Json::Array(entry))
+    }
+    values.set(7_usize, Json::Array(methods))
+    values.set(9_usize, typ(values.get_unchecked_borrowed(9_usize), identities)?)
+    values.set(10_usize, typ(values.get_unchecked_borrowed(10_usize), identities)?)
+    ret Result::Ok(Json::Array(values))
+}
+pub fn rebind_semantic_replay(value: Json, identities: Vec[str]) -> Json {
+    let mut bodies = Vec[(str, Json)]::new()
+    for entry in value.get("bodies").unwrap_or(Json::Null).as_object().unwrap_or(Vec[(str, Json)]::new()) {
+        match rebind_semantic_checkpoint(entry.1, identities) {
+            Ok(body) => bodies.push((entry.0, body)) Err(_) => {
+            }
+        }
+    }
+    let mut fields = Vec[(str, Json)]::new()
+    for entry in value.as_object().unwrap_or(Vec[(str, Json)]::new()) {
+        fields.push(if entry.0 == "bodies" {
+                (entry.0, Json::Object(bodies))
+            } else {
+                entry
+            }
+        )
+    }
+    ret Json::Object(fields)
+}
+
+/// Validate without constructing another copy of the package's type strings.
+pub fn valid_semantic_type(value: str, count: usize) -> bool {
+    let mut cursor = 0_usize
+    while cursor < value.byte_len() {
+        if value.byte_at(cursor) != 64_u8 {
+            cursor += 1_usize continue
+        }
+        cursor += 1_usize
+        let mut ordinal = 0_usize
+        while cursor < value.byte_len() {
+            let byte = value.byte_at(cursor)
+            if byte < 48_u8 || byte > 57_u8 {
+                break
+            }
+            let digit =(byte - 48_u8) as usize
+            if ordinal > count / 10_usize {
+                ret false
+            }
+            ordinal = ordinal * 10_usize + digit
+            if ordinal >= count {
+                ret false
+            }
+            cursor += 1_usize
+        }
+    }
+    ret true
+}

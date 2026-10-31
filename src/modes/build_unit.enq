@@ -1,20 +1,27 @@
+import mod::build_cache::valid_key
+import refrain::frontend::semantic_index::{PackageSemanticIndex, decode_semantic_module, encode_semantic_module}
+import refrain::frontend::semantic_rebind::rebind_semantic_replay
 //! Checked package-owned frontend work, with verified metadata-only dependencies.
 
 import core::fmt::Debug
 import core::option::Option
 import core::result::Result
 
-import std::os::{file_exists, file_sha256, read_file, write_file}
+import std::io::eprintln
+import std::os::{env, file_exists, file_sha256, read_file, write_file}
 import std::path::Path
+import std::thread::JoinHandle
 import std::time::perf_counter_ms
 import std::vec::Vec
 
-import ehir_llvm_backend::codegen::{PreparedUnitCodegen, incremental_codegen_context_bundle, prepare_unit_codegen, unit_codegen_context, unit_codegen_owned, unit_codegen_requirements}
 import ehirlib::{ModuleBundle, module_bundle_to_string, parse_module_bundle_text}
+import ehirlib::codegen::{PreparedUnitCodegen, clear_codegen_error, incremental_codegen_context_bundle, prepare_normalized_unit_codegen, take_codegen_error, unit_codegen_context, unit_codegen_owned, unit_codegen_requirements}
 import ehirlib::core::{Module, make_module_bundle}
-import json::{Json, stringify}
+import json::{Json, parse, stringify}
 
+import mod::build_archive::{borrow_package_jobs, return_package_jobs}
 import mod::build_artifacts::{UnitReady, read_unit_ready}
+import mod::build_ehir_cache::prepare_ehir_unit
 import mod::build_fingerprint::unit_fingerprint
 import mod::build_frontend_cache::{publish_frontend_unit, read_frontend_unit}
 import mod::build_lowering_cache::{commit_lowered_function, commit_lowered_module, restore_lowered_function, restore_lowered_module}
@@ -26,12 +33,12 @@ import refrain::cache_identity::compiler_content_digest
 import refrain::diagnostics::render_diagnostic
 import refrain::frontend::{FrontendCallable, FrontendDocument, FrontendSymbol}
 import refrain::frontend::analysis::analyze_source
-import refrain::frontend::analysis_database::function_declaration_position
+import refrain::frontend::analysis_database::{PreparedModuleSafety, PreparedSafetyModule, check_prepared_safety_module, function_declaration_position}
 import refrain::frontend::metadata_ast::encode_codegen_context_ast
 import refrain::frontend::parser::Statement
 import refrain::frontend::reflection::{mark_reflection_templates, reflection_template_names}
 import refrain::frontend::safety::{FunctionSafety, SafetyFunction}
-import refrain::frontend::translator::{CachedCompilationChunks, CachedFunctionChunk, TranslatedModuleChunk, TranslationModule, assemble_ehir_module_bundle, filter_ast_for_target, lowering_function_key, lowering_function_site, translate_compilation_unit_to_ehir_chunks, translate_keyed_compilation_unit_to_ehir_chunks}
+import refrain::frontend::translator::{CachedCompilationChunks, CachedFunctionChunk, TranslatedModuleChunk, TranslationModule, assemble_typed_ehir_module_bundle, filter_ast_for_target, lowering_function_key, lowering_function_site, translate_compilation_unit_to_ehir_chunks, translate_keyed_compilation_unit_to_ehir_chunks}
 import refrain::project::failure::ProjectFailure
 import refrain::project::workspace::{CompiledWorkspaceModule, ProjectWorkspace, try_load_compilation_unit}
 import refrain::target::{TargetSpec, parse_target}
@@ -72,6 +79,10 @@ pub fn package_owned_checkpoint(request: BuildUnitRequest, worker: frozen Prepar
 /// In particular, dependencies see normalized generated coroutine layouts,
 /// never the frontend's preliminary template projection.
 pub fn prepare_package_worker(request: BuildUnitRequest, jobs: usize, detailed_timings: bool) -> Result[PreparedPackageWorker, str] {
+    ret prepare_package_worker_with_server(request, jobs, detailed_timings, 0_usize)
+}
+
+pub fn prepare_package_worker_with_server(request: BuildUnitRequest, jobs: usize, detailed_timings: bool, server: usize) -> Result[PreparedPackageWorker, str] {
     if jobs == 0 {
         ret Result[PreparedPackageWorker, str]::Err("package worker needs a CPU lease")
     }
@@ -82,7 +93,7 @@ pub fn prepare_package_worker(request: BuildUnitRequest, jobs: usize, detailed_t
     let frontend = if file_exists(request.output.join("unit.frontend").as_str()) {
         restore_frontend_worker(request)?
     } else {
-        prepare_compilation_unit_with_timings(request, detailed_timings)?
+        prepare_compilation_unit_with_timings(request, detailed_timings, server)?
     }
     let checkpoint_started = perf_counter_ms()
     publish_frontend_unit(request.output, package_frontend_fingerprint(request)?, frontend.metadata, frontend.lowered_text)?
@@ -100,8 +111,32 @@ pub fn prepare_package_worker(request: BuildUnitRequest, jobs: usize, detailed_t
     }
     let target = parse_target(request.context.target)
     let normalize_started = perf_counter_ms()
-    let prepared = prepare_unit_codegen(frontend.owned,
-        make_module_bundle("", modules), target.triple, target.pointer_width, jobs,)
+    // Common preparation reads the fully typed function alone. Declaration
+    // layouts/templates belong to subsequent LLVM analysis and object keys.
+    let mut context = request.context.compiler_digest + "\n" + request.context.target + "\n" + request.context.profile
+    for feature in request.context.features {
+        context += "\nfeature:" + feature
+    }
+    let normalization_jobs = if server == 0_usize {
+        jobs
+    } else {
+        borrow_package_jobs(server, frontend.owned.modules.len())?
+    }
+    let normalized = prepare_ehir_unit(frontend.owned, compiler_content_digest(context), request.cache, normalization_jobs)
+    if normalized.is_err() && server != 0_usize {
+        return_package_jobs(server, normalization_jobs)
+    }
+    let normalized = normalized?
+    clear_codegen_error()
+    let prepared = prepare_normalized_unit_codegen(normalized.bundle,
+        make_module_bundle("", modules), target.triple, target.pointer_width,)
+    if server != 0_usize {
+        return_package_jobs(server, normalization_jobs)
+    }
+    let backend_error = take_codegen_error()
+    if !backend_error.is_empty() {
+        ret Result::Err("LLVM preparation: " + backend_error)
+    }
     let normalize_ms = perf_counter_ms() - normalize_started
     let templates = module_bundle_to_string(unit_codegen_context(prepared, entry))
     let template_digest = compiler_content_digest(templates)
@@ -114,6 +149,9 @@ pub fn prepare_package_worker(request: BuildUnitRequest, jobs: usize, detailed_t
     let mut preparation = Vec[(str, Json)]::new()
     preparation.push(("frontend_ms", Json::Number(Debug::fmt(frontend_ms))))
     preparation.push(("backend_prepare_ms", Json::Number(Debug::fmt(perf_counter_ms() - preparation_started - frontend_ms))))
+    preparation.push(("prepared_functions_checked", Json::Number(Debug::fmt(normalized.prepared))))
+    preparation.push(("prepared_functions_reused", Json::Number(Debug::fmt(normalized.reused))))
+    preparation.push(("prepared_modules_fallback", Json::Number(Debug::fmt(normalized.fallback))))
     if detailed_timings {
         preparation.extend(frontend.timings)
         preparation.push(("frontend_checkpoint_ms", Json::Number(Debug::fmt(checkpoint_ms))))
@@ -256,10 +294,10 @@ fn contains_name(values: Vec[str], name: str) -> bool {
 /// Checks every expected dependency before opening this package's source files.
 /// Missing/corrupt artifacts never trigger a source or registry fallback.
 pub fn prepare_compilation_unit(request: BuildUnitRequest) -> Result[PreparedCompilationUnit, str] {
-    ret prepare_compilation_unit_with_timings(request, false)
+    ret prepare_compilation_unit_with_timings(request, false, 0_usize)
 }
 
-fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_timings: bool) -> Result[PreparedCompilationUnit, str] {
+fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_timings: bool, server: usize) -> Result[PreparedCompilationUnit, str] {
     let frontend_started = perf_counter_ms()
     let _validated = request.encode()?
     let verified = load_unit_dependencies(request)?
@@ -270,6 +308,7 @@ fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_tim
         dependency_templates.push(dependency.templates)
     }
     let dependencies_loaded = perf_counter_ms()
+    profile_frontend("dependency-metadata", frontend_started)
     let owner = graph_package(request.graph, request.context.unit)?
     if unit_source_digest(owner)? != request.context.input_digest {
         ret Result[PreparedCompilationUnit, str]::Err("package sources changed before compilation: " + owner.name)
@@ -285,11 +324,32 @@ fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_tim
         workspace.analysis.configure_safety(module.analysis_id.key(), target, module.enabled_features)
     }
     let workspace_loaded = perf_counter_ms()
-    let checked = check_own_modules(workspace, target)?
+    profile_frontend("workspace", dependencies_loaded)
+    let checked = check_own_modules(workspace, target, request, server)?
     let checking_finished = perf_counter_ms()
+    profile_frontend("semantic", workspace_loaded)
     let checking_ms = perf_counter_ms() - frontend_started
-    let effects = workspace.analysis.function_safety_effects_with_prechecked(checked)
+    let effects = if request.cache.is_some() {
+        let slot = compiler_content_digest("encore-safety-package-1\n" + request.context.compiler_digest + "\n" +
+            request.context.unit + "\n" + request.context.target + "\n" + request.context.profile)
+        let previous = match restore_lowered_module(request.cache, slot)? {
+            Some(text) => parse(text).unwrap_or(Json::Null)
+            None => Json::Null
+        }
+        let result = workspace.analysis.function_safety_effects_with_replay(checked, previous)
+        commit_lowered_module(request.cache, slot, stringify(result.replay))?
+        let mut counts = parse(read_file((request.output / "semantic.json").as_str())).unwrap_or(Json::Null).as_object().unwrap_or(Vec[(str, Json)]::new())
+        counts.push(("effects_checked", Json::Number(Debug::fmt(result.checked))))
+        counts.push(("effects_reused", Json::Number(Debug::fmt(result.reused))))
+        if write_file((request.output / "semantic.json").as_str(), stringify(Json::Object(counts))) != 0 {
+            ret Result::Err("cannot record safety reuse")
+        }
+        result.effects
+    } else {
+        workspace.analysis.function_safety_effects_with_prechecked(checked)
+    }
     let safety_finished = perf_counter_ms()
+    profile_frontend("safety", checking_finished)
     let mut translations = Vec[TranslationModule]::new()
     let mut selected = Vec[usize]::new()
     let mut declarations = Vec[MetadataModule]::new()
@@ -377,7 +437,7 @@ fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_tim
                 ret Result[PreparedCompilationUnit, str]::Err("invalid lowering module index")
             }
         }
-        let key = compiler_content_digest("encore-lowered-module-2\n" + lowering_context + "\n" +
+        let key = compiler_content_digest("encore-lowered-module-3\n" + lowering_context + "\n" +
             module.module_id + "\n" + compiler_content_digest(module.source) + "\n" + project_version)
         keys.set(index, key)
         match restore_lowered_module(request.cache, key)? {
@@ -421,6 +481,7 @@ fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_tim
         }
     }
     let cache_read_finished = perf_counter_ms()
+    profile_frontend("lowering-context-and-cache", safety_finished)
     let fresh = if request.cache.is_some() {
         translate_keyed_compilation_unit_to_ehir_chunks(translations, target, missing, cached_functions, function_keys)
     } else {
@@ -429,6 +490,7 @@ fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_tim
         }
     }
     let translation_finished = perf_counter_ms()
+    profile_frontend("translate", cache_read_finished)
     for function in fresh.functions {
         commit_lowered_function(request.cache, lowering_context, function)?
     }
@@ -452,11 +514,13 @@ fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_tim
     } else {
         "@lib.enq"
     }
-    let lowered_text = assemble_ehir_module_bundle(chunks, translations.len(), entry)
-    let parse_started = perf_counter_ms()
-    let owned = parse_module_bundle_text(entry, lowered_text)
-    let parse_ms = perf_counter_ms() - parse_started
+    let assemble_started = perf_counter_ms()
+    let owned = assemble_typed_ehir_module_bundle(chunks, translations.len(), entry)
+    let assemble_ms = perf_counter_ms() - assemble_started
+    let serialize_started = perf_counter_ms()
+    let lowered_text = module_bundle_to_string(owned)
     let templates = module_bundle_to_string(incremental_codegen_context_bundle(owned))
+    let serialize_ms = perf_counter_ms() - serialize_started
     if unit_source_digest(owner)? != request.context.input_digest {
         ret Result[PreparedCompilationUnit, str]::Err("package sources changed during compilation: " + owner.name)
     }
@@ -474,7 +538,9 @@ fn prepare_compilation_unit_with_timings(request: BuildUnitRequest, detailed_tim
         timings.push(("lowering_cache_read_ms", Json::Number(Debug::fmt(cache_read_finished - cache_read_started))))
         timings.push(("lowering_translate_ms", Json::Number(Debug::fmt(translation_finished - cache_read_finished))))
         timings.push(("lowering_cache_write_ms", Json::Number(Debug::fmt(cache_write_finished - translation_finished))))
-        timings.push(("ehir_parse_ms", Json::Number(Debug::fmt(parse_ms))))
+        timings.push(("ehir_parse_ms", Json::Number("0")))
+        timings.push(("ehir_assemble_ms", Json::Number(Debug::fmt(assemble_ms))))
+        timings.push(("ehir_serialize_ms", Json::Number(Debug::fmt(serialize_ms))))
     }
     ret Result[PreparedCompilationUnit, str]::Ok(PreparedCompilationUnit {
             metadata, owned, lowered_text, dependency_templates, timings
@@ -550,24 +616,295 @@ fn verified_input(path: Path, expected: str) -> Result[str, str] {
     ret Result[str, str]::Ok(contents)
 }
 
-fn check_own_modules(workspace: mut ProjectWorkspace, target: TargetSpec) -> Result[Vec[SafetyFunction], str] {
-    let mut checked = Vec[SafetyFunction]::new()
+struct SemanticSafetyJob {
+    index: usize
+    weight: usize
+    slot: str
+    prepared: PreparedSafetyModule
+    replay_unchanged: bool
+}
+
+struct SemanticSafetyChunk {
+    index: usize
+    slot: str
+    prepared: PreparedModuleSafety
+    replay_unchanged: bool
+}
+
+fn check_semantic_safety_job(job: sending SemanticSafetyJob) -> sending SemanticSafetyChunk {
+    ret SemanticSafetyChunk {
+        job.index, job.slot, check_prepared_safety_module(job.prepared), job.replay_unchanged
+    }
+}
+
+fn check_own_modules(workspace: mut ProjectWorkspace, target: TargetSpec, request: BuildUnitRequest, server: usize) -> Result[Vec[SafetyFunction], str] {
+    let preparation_started = perf_counter_ms()
+    let mut cache_read_ms = 0_u64
+    let mut semantic_modules = Vec[str]::new()
     for module in workspace.modules {
+        if module.owner_name == workspace.compilation_unit && module.diagnostics.is_empty() {
+            semantic_modules.push(module.analysis_id.key())
+        }
+    }
+    let identity = workspace.analysis.semantic_package_identity(semantic_modules)
+    let index_slot = compiler_content_digest("encore-semantic-index-1\n" + request.context.compiler_digest + "\n" +
+        request.context.target + "\n" + request.context.profile + "\n" + identity)
+    let cache_started = perf_counter_ms()
+    let mut snapshot_key = restore_lowered_module(request.cache, index_slot)?.unwrap_or("")
+    let mut previous_index = Option[PackageSemanticIndex]::None
+    if valid_key(snapshot_key) {
+        match restore_lowered_module(request.cache, snapshot_key)? {
+            Some(payload) => {
+                match PackageSemanticIndex::decode(payload, identity) {
+                    Ok(index) => {
+                        previous_index = Option[PackageSemanticIndex]::Some(index)
+                    }
+                    Err(_) => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
+    cache_read_ms += perf_counter_ms() - cache_started
+    let index_reused = workspace.analysis.prepare_package_semantics(semantic_modules, identity, previous_index)
+    let index_prepared = perf_counter_ms()
+    if !index_reused && request.cache.is_some() {
+        match workspace.analysis.package_semantic_index() {
+            Some(index) => {
+                let payload = index.encode()?
+                snapshot_key = compiler_content_digest(payload)
+                commit_lowered_module(request.cache, snapshot_key, payload)?
+                commit_lowered_module(request.cache, index_slot, snapshot_key)?
+            }
+            None => {
+            }
+        }
+    }
+    let snapshot_write_ms = perf_counter_ms() - index_prepared
+    let mut historical_types = Vec[(str, Vec[str])]::new()
+    let mut checked = Vec[SafetyFunction]::new()
+    let mut bodies_checked = 0_usize
+    let mut bodies_reused = 0_usize
+    let mut environments_reused = 0_usize
+    let mut module_checks_reused = 0_usize
+    let mut tasks = Vec[SemanticSafetyJob]::new()
+    let mut module_index = 0_usize
+    for module in workspace.modules {
+        let index = module_index
+        module_index += 1_usize
         if module.owner_name != workspace.compilation_unit {
             continue
         }
-        if module.diagnostics.len() != 0 {
-            for diagnostic in module.diagnostics {
-                ret Result[Vec[SafetyFunction], str]::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
+        if !module.diagnostics.is_empty() {
+            continue
+        }
+        let started = perf_counter_ms()
+        if env("ENCORE_FRONTEND_PROFILE").is_some() {
+            eprintln("frontend-check-start " + module.analysis_id.key())
+        }
+        let mut features = Vec[Json]::new()
+        for feature in module.enabled_features {
+            features.push(Json::String(feature))
+        }
+        let slot = compiler_content_digest("encore-semantic-module-3\n" + request.context.compiler_digest + "\n" +
+            request.context.target + "\n" + request.context.profile + "\n" + module.module_id + "\n" + stringify(Json::Array(features)))
+        let cache_started = perf_counter_ms()
+        let mut previous = Json::Null
+        let mut same_snapshot = false
+        match restore_lowered_module(request.cache, slot)? {
+            Some(payload) => {
+                match decode_semantic_module(payload) {
+                    Ok(record) => {
+                        same_snapshot = record.index == snapshot_key
+                        if same_snapshot {
+                            previous = record.replay
+                        } elif valid_key(record.index) {
+                            let mut identities = Option[Vec[str]]::None
+                            for entry in historical_types {
+                                if entry.0 == record.index {
+                                    identities = Option[Vec[str]]::Some(entry.1) break
+                                }
+                            }
+                            if identities.is_none() {
+                                match restore_lowered_module(request.cache, record.index)? {
+                                    Some(old_payload) => {
+                                        match PackageSemanticIndex::decode(old_payload, "") {
+                                            Ok(index) => {
+                                                let mapping = workspace.analysis.semantic_existing_type_rebinding(index.types)
+                                                historical_types.push((record.index, mapping)) identities = Option[Vec[str]]::Some(mapping)
+                                            }
+                                            Err(_) => {
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                    }
+                                }
+                            }
+                            match identities {
+                                Some(mapping) => {
+                                    previous = rebind_semantic_replay(record.replay, mapping)
+                                }
+                                None => {
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                    }
+                }
+            }
+            None => {
             }
         }
-        let prepared = workspace.analysis.prepare_module_safety_for_target(module.analysis_id.key(), target, module.enabled_features)
-        for diagnostic in prepared.diagnostics {
-            ret Result[Vec[SafetyFunction], str]::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
+        cache_read_ms += perf_counter_ms() - cache_started
+        let prepared = workspace.analysis.prepare_module_safety_job(module.analysis_id.key(), target, module.enabled_features,
+            previous, request.cache.is_some(),)
+        let replay_unchanged = same_snapshot && previous.get("source").unwrap_or(Json::Null).as_str().unwrap_or("") == compiler_content_digest(module.source) &&
+        previous.get("context").unwrap_or(Json::Null).as_str().unwrap_or("") == prepared.context
+        tasks.push(SemanticSafetyJob {
+                index, module.source.byte_len(), slot, prepared, replay_unchanged
+            }
+        )
+        profile_frontend("prepare-check " + module.analysis_id.key(), started)
+    }
+    // Long source modules run first; publication and diagnostics below retain
+    // source order. No worker reads or mutates the owner's analysis database.
+    let mut cursor = 1_usize
+    while cursor < tasks.len() {
+        let mut position = cursor
+        while position > 0_usize {
+            let left = match tasks.get(position - 1_usize) {
+                Some(value) => value None => {
+                    break
+                }
+            }
+            let right = match tasks.get(position) {
+                Some(value) => value None => {
+                    break
+                }
+            }
+            if left.weight >= right.weight {
+                break
+            }
+            tasks.set(position - 1_usize, right)
+            tasks.set(position, left)
+            position -= 1_usize
         }
-        checked.extend(prepared.functions)
+        cursor += 1_usize
+    }
+    let inputs_prepared = perf_counter_ms()
+    let jobs = borrow_package_jobs(server, tasks.len())?
+    let mut chunks = Vec[SemanticSafetyChunk]::new()
+    let mut handles = Vec[JoinHandle[SemanticSafetyChunk]]::new()
+    for task in tasks {
+        if jobs == 1_usize {
+            chunks.push(check_semantic_safety_job(task))
+        } else {
+            handles.push(spawn check_semantic_safety_job(task))
+            if handles.len() == jobs {
+                for handle in handles {
+                    chunks.push(handle.join())
+                }
+                handles = Vec[JoinHandle[SemanticSafetyChunk]]::new()
+            }
+        }
+    }
+    for handle in handles {
+        chunks.push(handle.join())
+    }
+    return_package_jobs(server, jobs)
+    let bodies_finished = perf_counter_ms()
+    module_index = 0_usize
+    for module in workspace.modules {
+        let index = module_index
+        module_index += 1_usize
+        if module.owner_name != workspace.compilation_unit {
+            continue
+        }
+        for diagnostic in module.diagnostics {
+            ret Result::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
+        }
+        for chunk in chunks {
+            if chunk.index != index {
+                continue
+            }
+            let prepared = chunk.prepared
+            bodies_checked += prepared.checked
+            bodies_reused += prepared.reused
+            if prepared.environment_reused {
+                environments_reused += 1_usize
+            }
+            if prepared.module_checks_reused {
+                module_checks_reused += 1_usize
+            }
+            for diagnostic in prepared.diagnostics {
+                ret Result[Vec[SafetyFunction], str]::Err(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
+            }
+            if request.cache.is_some() &&(!chunk.replay_unchanged || !prepared.environment_reused || prepared.checked != 0_usize) {
+                let replay = if request.cache.is_some() {
+                    workspace.analysis.finalize_semantic_replay(module.analysis_id.key(), prepared.replay)
+                } else {
+                    prepared.replay
+                }
+                commit_lowered_module(request.cache, chunk.slot, encode_semantic_module(snapshot_key, replay)?)?
+            }
+            checked.extend(prepared.functions)
+            break
+        }
+    }
+    let timings = workspace.analysis.semantic_preparation_timings()
+    let counts = Json::Object(vec![("semantic_index_reused", Json::Bool(index_reused)),
+            ("semantic_index_write_ms", Json::Number(Debug::fmt(snapshot_write_ms))),
+            ("semantic_cache_read_ms", Json::Number(Debug::fmt(cache_read_ms))),
+            ("semantic_context_ms", Json::Number(Debug::fmt(timings.context_ms))),
+            ("semantic_replay_ms", Json::Number(Debug::fmt(timings.replay_ms))),
+            ("semantic_environment_ms", Json::Number(Debug::fmt(timings.environment_ms))),
+            ("semantic_environment_names_ms", Json::Number(Debug::fmt(timings.environment_names_ms))),
+            ("semantic_environment_callables_ms", Json::Number(Debug::fmt(timings.environment_callables_ms))),
+            ("semantic_environment_fields_ms", Json::Number(Debug::fmt(timings.environment_fields_ms))),
+            ("semantic_environment_methods_ms", Json::Number(Debug::fmt(timings.environment_methods_ms))),
+            ("semantic_environment_variants_ms", Json::Number(Debug::fmt(timings.environment_variants_ms))),
+            ("semantic_environment_constructors_ms", Json::Number(Debug::fmt(timings.environment_constructors_ms))),
+            ("semantic_environment_statics_ms", Json::Number(Debug::fmt(timings.environment_statics_ms))),
+            ("semantic_environment_index_ms", Json::Number(Debug::fmt(timings.environment_index_ms))),
+            ("semantic_environment_type_index_ms", Json::Number(Debug::fmt(timings.environment_type_index_ms))),
+            ("semantic_environment_callable_scope_ms", Json::Number(Debug::fmt(timings.environment_callable_scope_ms))),
+            ("semantic_callable_defmap_ms", Json::Number(Debug::fmt(timings.callable_defmap_ms))),
+            ("semantic_callable_collect_ms", Json::Number(Debug::fmt(timings.callable_collect_ms))),
+            ("semantic_callable_bind_ms", Json::Number(Debug::fmt(timings.callable_bind_ms))),
+            ("semantic_callable_qualified_ms", Json::Number(Debug::fmt(timings.callable_qualified_ms))),
+            ("semantic_method_collect_ms", Json::Number(Debug::fmt(timings.method_collect_ms))),
+            ("semantic_method_visibility_ms", Json::Number(Debug::fmt(timings.method_visibility_ms))),
+            ("semantic_method_inheritance_ms", Json::Number(Debug::fmt(timings.method_inheritance_ms))),
+            ("semantic_method_scope_ms", Json::Number(Debug::fmt(timings.method_scope_ms))),
+            ("semantic_environment_context_ms", Json::Number(Debug::fmt(timings.environment_context_ms))),
+            ("semantic_environment_scopes_ms", Json::Number(Debug::fmt(timings.environment_scopes_ms))),
+            ("semantic_environment_lookup_ms", Json::Number(Debug::fmt(timings.environment_lookup_ms))),
+            ("semantic_environment_store_ms", Json::Number(Debug::fmt(timings.environment_store_ms))),
+            ("semantic_environment_finish_ms", Json::Number(Debug::fmt(timings.environment_finish_ms))),
+            ("semantic_environment_release_ms", Json::Number(Debug::fmt(timings.environment_release_ms))),
+            ("semantic_constructors_aggregate_ms", Json::Number(Debug::fmt(timings.constructors_aggregate_ms))),
+            ("semantic_constructors_lookup_ms", Json::Number(Debug::fmt(timings.constructors_lookup_ms))),
+            ("semantic_input_ms", Json::Number(Debug::fmt(timings.input_ms))),
+            ("bodies_checked", Json::Number(Debug::fmt(bodies_checked))),
+            ("bodies_reused", Json::Number(Debug::fmt(bodies_reused))),("environments_reused", Json::Number(Debug::fmt(environments_reused))),
+            ("module_checks_reused", Json::Number(Debug::fmt(module_checks_reused))),
+            ("semantic_jobs", Json::Number(Debug::fmt(jobs))),("semantic_prepare_ms", Json::Number(Debug::fmt(inputs_prepared - preparation_started))),
+            ("semantic_bodies_ms", Json::Number(Debug::fmt(bodies_finished - inputs_prepared))),
+            ("semantic_publish_ms", Json::Number(Debug::fmt(perf_counter_ms() - bodies_finished)))])
+    if write_file((request.output / "semantic.json").as_str(), stringify(counts)) != 0 {
+        ret Result::Err("cannot record semantic reuse")
     }
     ret Result[Vec[SafetyFunction], str]::Ok(checked)
+}
+
+fn profile_frontend(phase: str, started: u64) ->() {
+    if env("ENCORE_FRONTEND_PROFILE").is_some() {
+        eprintln("frontend-" + phase + " " + Debug::fmt(perf_counter_ms() - started) + " ms")
+    }
 }
 
 // Function cfg filters must also apply to token-derived callable facts. The

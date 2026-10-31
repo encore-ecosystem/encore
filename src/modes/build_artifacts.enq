@@ -8,8 +8,8 @@ import std::path::Path
 import std::time::perf_counter_ns
 import std::vec::Vec
 
-import ehir_llvm_backend::codegen::{CodegenRequirements, GenericRequirement}
 import ehirlib::Type
+import ehirlib::codegen::{CodegenRequirements, GenericRequirement}
 import json::{Json, parse, stringify}
 
 import mod::build_metadata::{MetadataContext, MetadataDependency, MetadataModule, RefrainMetadata}
@@ -94,24 +94,38 @@ pub fn publish_unit_ready(directory: Path, metadata: RefrainMetadata, templates:
     ret Result[UnitReady, str]::Ok(record)
 }
 
+/// A transaction owns these verified bytes until its private copy is checked.
+/// Keeping them avoids reopening and decoding mutable source payloads twice.
+pub struct ValidatedUnitSnapshot {
+    ready: UnitReady
+    metadata: str
+    templates: str
+    requirements: str
+}
+
 /// Verifies all payloads and semantic identities before unlocking dependants.
 /// Merely finding unit.ready on disk is never sufficient.
 pub fn read_unit_ready(directory: Path, expected: MetadataContext,
     dependencies: Vec[MetadataDependency],) -> Result[UnitReady, str] {
+    ret Result[UnitReady, str]::Ok(read_unit_snapshot(directory, expected, dependencies)?.ready)
+}
+
+pub fn read_unit_snapshot(directory: Path, expected: MetadataContext,
+    dependencies: Vec[MetadataDependency],) -> Result[ValidatedUnitSnapshot, str] {
     let path = directory.join("unit.ready")
     if !file_exists(path.as_str()) {
-        ret Result[UnitReady, str]::Err("package metadata is not ready")
+        ret Result[ValidatedUnitSnapshot, str]::Err("package metadata is not ready")
     }
     let snapshot = unsafe {
         encore_compiler_read_artifact(path.as_str())
     }
     if snapshot == "" {
-        ret Result[UnitReady, str]::Err("cannot read package readiness snapshot: " + path.as_str())
+        ret Result[ValidatedUnitSnapshot, str]::Err("cannot read package readiness snapshot: " + path.as_str())
     }
     let record = match UnitReady::decode(snapshot, expected) {
         Ok(value) => value
         Err(error) => {
-            ret Result[UnitReady, str]::Err(error + ": " + path.as_str())
+            ret Result[ValidatedUnitSnapshot, str]::Err(error + ": " + path.as_str())
         }
     }
     let text = verified_text(directory.join("unit.ermeta"), record.metadata_digest)?
@@ -121,9 +135,12 @@ pub fn read_unit_ready(directory: Path, expected: MetadataContext,
     let _checked_requirements = UnitRequirements::decode(requirements, expected)?
     if metadata.template_digest != compiler_content_digest(templates) ||
     metadata.interface_digest()? != record.interface_digest {
-        ret Result[UnitReady, str]::Err("package readiness semantic identity mismatch")
+        ret Result[ValidatedUnitSnapshot, str]::Err("package readiness semantic identity mismatch")
     }
-    ret Result[UnitReady, str]::Ok(record)
+    ret Result[ValidatedUnitSnapshot, str]::Ok(ValidatedUnitSnapshot {
+            record, text, templates, requirements
+        }
+    )
 }
 
 /// Checks an identity-preserving copy of an already semantically validated
@@ -197,6 +214,17 @@ fn metadata_artifacts_completion_encoding_checks_digests() -> bool {
 
 /// A complete cache hit requires the archive and its exact production identity.
 pub fn read_unit_complete(directory: Path, ready: UnitReady, native_digest: str) -> Result[str, str] {
+    let digest = read_unit_completion_receipt(directory, ready, native_digest)?
+    let archive = directory.join("unit.erlib")
+    if !file_exists(archive.as_str()) || file_sha256(archive.as_str()) != digest {
+        ret Result[str, str]::Err("missing or corrupt package archive")
+    }
+    ret Result[str, str]::Ok(digest)
+}
+
+/// A scheduling hint only: callers must verify payloads and archive bytes
+/// before admitting metadata or reporting a cache hit.
+pub fn read_unit_completion_receipt(directory: Path, ready: UnitReady, native_digest: str) -> Result[str, str] {
     let path = directory.join("unit.complete")
     if !file_exists(path.as_str()) {
         ret Result[str, str]::Err("package archive is not complete")
@@ -213,10 +241,6 @@ pub fn read_unit_complete(directory: Path, ready: UnitReady, native_digest: str)
         ret Result[str, str]::Err("package completion identity mismatch")
     }
     let digest = checked_digest(string_field(data, "archive")?)?
-    let archive = directory.join("unit.erlib")
-    if !file_exists(archive.as_str()) || file_sha256(archive.as_str()) != digest {
-        ret Result[str, str]::Err("missing or corrupt package archive")
-    }
     ret Result[str, str]::Ok(digest)
 }
 

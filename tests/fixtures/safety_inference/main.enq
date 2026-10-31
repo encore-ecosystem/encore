@@ -1,0 +1,86 @@
+import core::fmt::Debug
+import core::option::Option
+import std::io::println
+import std::os::env
+import std::path::Path
+import std::thread::JoinHandle
+import std::time::perf_counter_ms
+import std::vec::Vec
+import json::{Json, stringify}
+import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::analysis_database::{PreparedModuleSafety, PreparedSafetyModule, check_prepared_safety_module}
+import refrain::frontend::safety::{FunctionSafety, SafetyFunction, infer_safety_with_replay}
+import refrain::frontend::semantic_index::PackageSemanticIndex
+import refrain::project::workspace::load_library_workspace
+import refrain::target::host_target
+
+fn main() -> u32 {
+    let root = env("ENCORE_ENV_BENCH_PROJECT").unwrap_or("")
+    if root.is_empty() { ret 0_u32 }
+    let started = perf_counter_ms()
+    let mut workspace = load_library_workspace(Path::new(root))
+    let all = env("ENCORE_ENV_BENCH_ALL").unwrap_or("") == "1"
+    let mut selected = Vec[str]::new()
+    let mut ordinal = 0_usize
+    for module in workspace.modules {
+        if module.owner_name != workspace.root_name { continue }
+        let take = all || ordinal % 8_usize == 0_usize
+        ordinal += 1_usize
+        if take {
+            selected.push(module.analysis_id.key())
+            workspace.analysis.configure_safety(module.analysis_id.key(), host_target(), module.enabled_features)
+        }
+    }
+    let identity = workspace.analysis.semantic_package_identity(selected)
+    workspace.analysis.prepare_package_semantics(selected, identity, Option[PackageSemanticIndex]::None)
+    let mut inputs = Vec[PreparedSafetyModule]::new()
+    let mut contexts = Vec[(str, str)]::new()
+    for name in selected {
+        contexts.push((name, workspace.analysis.semantic_replay_context(name)))
+        inputs.push(workspace.analysis.prepare_module_safety_job(name, host_target(), Vec[str]::new(), Json::Null, false))
+    }
+    println("prepared safety inputs")
+    let checking_started = perf_counter_ms()
+    let mut handles = Vec[JoinHandle[PreparedModuleSafety]]::new()
+    let mut functions = Vec[SafetyFunction]::new()
+    let mut diagnostics = 0_usize
+    for input in inputs {
+        handles.push(spawn check_prepared_safety_module(input))
+        if handles.len() >= 8_usize {
+            for handle in handles {
+                let result = handle.join()
+                functions.extend(result.functions)
+                diagnostics += result.diagnostics.len()
+            }
+            handles = Vec[JoinHandle[PreparedModuleSafety]]::new()
+        }
+    }
+    for handle in handles {
+        let result = handle.join()
+        functions.extend(result.functions)
+        diagnostics += result.diagnostics.len()
+    }
+    let checking_finished = perf_counter_ms()
+    println("checked bodies: " + Debug::fmt(functions.len()))
+    let inferred = infer_safety_with_replay(functions, Vec[FunctionSafety]::new(), contexts, Json::Null)
+    let inference_finished = perf_counter_ms()
+    let mut records = Vec[Json]::new()
+    for value in inferred.effects {
+        records.push(Json::Array(vec![Json::String(value.module_name), Json::String(value.owner), Json::String(value.name),
+            Json::Number(Debug::fmt(value.line)), Json::Number(Debug::fmt(value.column)), Json::Bool(value.body_unsafe),
+            Json::Bool(value.asserted_safe), Json::Bool(value.returns_unsafe_callable)]))
+    }
+    println(stringify(Json::Object(vec![
+        ("modules", Json::Number(Debug::fmt(selected.len()))),
+        ("functions", Json::Number(Debug::fmt(functions.len()))),
+        ("diagnostics", Json::Number(Debug::fmt(diagnostics))),
+        ("setup_ms", Json::Number(Debug::fmt(checking_started - started))),
+        ("bodies_ms", Json::Number(Debug::fmt(checking_finished - checking_started))),
+        ("safety_ms", Json::Number(Debug::fmt(inference_finished - checking_finished))),
+        ("checked", Json::Number(Debug::fmt(inferred.checked))),
+        ("reused", Json::Number(Debug::fmt(inferred.reused))),
+        ("effects_sha256", Json::String(compiler_content_digest(stringify(Json::Array(records))))),
+        ("replay_sha256", Json::String(compiler_content_digest(stringify(inferred.replay))))
+    ])))
+    ret 0_u32
+}

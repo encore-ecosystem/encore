@@ -7,14 +7,18 @@ import core::result::Result
 import std::io::eprintln
 import std::os::{executable_path, file_exists, file_sha256, mkdir_all, read_file, remove_file, write_file}
 import std::path::Path
-import std::time::sleep_ms
+import std::time::{perf_counter_ms, sleep_ms}
 import std::vec::Vec
 
 import argparse::{process_arg, process_arg_count}
-import ehir_llvm_backend::codegen::{PreparedUnitCodegen, emit_unit_codegen}
+import ehirlib::codegen::{PreparedUnitCodegen, emit_unit_codegen_selected_parallel, unit_codegen_input_context, unit_codegen_owned, unit_codegen_requirements}
+import ehirlib::core::{Module, make_module_bundle}
+import ehirlib::module_bundle_to_string
 import json::{Json, parse, stringify}
 
-import mod::build_object_cache::{commit_native_object, native_object_key, restore_native_object}
+import mod::build_metadata::MetadataContext
+import mod::build_object_cache::{commit_native_object, commit_prepared_object, native_object_key, prepared_object_key, restore_native_object, restore_prepared_object}
+import mod::build_requirements::UnitRequirements
 import refrain::cache_identity::compiler_content_digest
 import refrain::target::TargetSpec
 
@@ -46,6 +50,37 @@ pub struct UnitNativePlan {
     compiler: str
     archiver: str
     args: Vec[str]
+}
+
+/// The package already owns one lease. Extra CPU leases are borrowed without
+/// waiting and returned only after all phase threads have joined.
+pub fn borrow_package_jobs(server: usize, count: usize) -> Result[usize, str] {
+    let mut jobs = 1_usize
+    if server == 0_usize {
+        ret Result::Ok(jobs)
+    }
+    while jobs < count {
+        let admitted = unsafe {
+            encore_compiler_jobserver_try_acquire(server)
+        }
+        if admitted < 0_i32 {
+            return_package_jobs(server, jobs)
+            ret Result::Err("package phase cancelled")
+        }
+        if admitted == 0_i32 {
+            break
+        }
+        jobs += 1_usize
+    }
+    ret Result::Ok(jobs)
+}
+
+pub fn return_package_jobs(server: usize, jobs: usize) ->() {
+    for _job in 1_usize..jobs {
+        let _released = unsafe {
+            encore_compiler_jobserver_release(server)
+        }
+    }
 }
 
 impl for UnitNativePlan {
@@ -169,19 +204,61 @@ pub fn emit_budgeted_package_archive(unit: frozen PreparedUnitCodegen, directory
     }
     let mut object_keys = Vec[str]::new()
     let mut compiled_objects = Vec[Path]::new()
-    for emitted in emit_unit_codegen(unit, target.triple, target.pointer_width) {
-        let stem = "module-" + Debug::fmt(index)
+    let probe_started = perf_counter_ms()
+    let compiler = file_sha256(executable_path())
+    let requirements = UnitRequirements {
+        MetadataContext {
+            "codegen", compiler, target.triple, "dev", compiler_content_digest(""), Vec[str]::new()
+        }
+        ,
+        unit_codegen_requirements(unit)
+    }
+    .encode()?
+    let context = compiler_content_digest("encore-prepared-codegen-1\n" + compiler + "\n" + identity + "\n" +
+        Debug::fmt(target.pointer_width) + "\n" + requirements + "\n" +
+        module_bundle_to_string(unit_codegen_input_context(unit)))
+    let mut prepared_keys = Vec[str]::new()
+    let mut missing = Vec[usize]::new()
+    for module in unit_codegen_owned(unit, "").modules {
+        let mut singleton = Vec[Module]::new()
+        singleton.push(module)
+        let key = prepared_object_key(module_bundle_to_string(make_module_bundle(module.name, singleton)), context)
+        prepared_keys.push(key)
+        let object = directory /("module-" + Debug::fmt(index) + ".o")
+        let restored = match cache {
+            Some(root) => restore_prepared_object(root, key, object)?
+            None => false
+        }
+        if !restored {
+            missing.push(index)
+        }
+        archive_args.push(object.as_str())
+        index += 1_usize
+    }
+    let mut aliases = Vec[(str, str)]::new()
+    let mut emitted_index = 0_usize
+    let jobs = borrow_package_jobs(server, missing.len())?
+    let emission_started = perf_counter_ms()
+    let generated = emit_unit_codegen_selected_parallel(unit, target.triple, target.pointer_width, missing, jobs)
+    return_package_jobs(server, jobs)
+    let emission_finished = perf_counter_ms()
+    for emitted in generated {
+        if !emitted.diagnostic.is_empty() {
+            ret Result::Err("LLVM: " + emitted.diagnostic)
+        }
+        let module_index = missing.get(emitted_index).unwrap_or(index)
+        emitted_index += 1_usize
+        let stem = "module-" + Debug::fmt(module_index)
         let ir = directory.join(stem + ".ll")
         let object = directory.join(stem + ".o")
         let stable_ir = stable_module_ir(emitted.ir, emitted.module_id)
         write_ir(ir, stable_ir)?
         let key = native_object_key(stable_ir, target.triple, identity)
+        aliases.push((prepared_keys.get(module_index).unwrap_or(""), key))
         let reused = match object_cache {
             Some(root) => restore_native_object(root, key, object)? None => false
         }
         if reused {
-            archive_args.push(object.as_str())
-            index += 1
             continue
         }
         object_keys.push(key)
@@ -200,8 +277,6 @@ pub fn emit_budgeted_package_archive(unit: frozen PreparedUnitCodegen, directory
             }
             ,
         )
-        archive_args.push(object.as_str())
-        index += 1
     }
     compile_native_objects(objects, plan.compiler, directory, server)?
     if plan.identity()? != identity {
@@ -218,9 +293,23 @@ pub fn emit_budgeted_package_archive(unit: frozen PreparedUnitCodegen, directory
         }
         compiled_index += 1
     }
+    for alias in aliases {
+        match cache {
+            Some(root) => {
+                commit_prepared_object(root, alias.0, alias.1)?
+            }
+            None => {
+            }
+        }
+    }
     let mut object_counts = Vec[(str, Json)]::new()
     object_counts.push(("reused", Json::Number(Debug::fmt(index - compiled_index))))
     object_counts.push(("compiled", Json::Number(Debug::fmt(compiled_index))))
+    object_counts.push(("ir_generated", Json::Number(Debug::fmt(missing.len()))))
+    object_counts.push(("ir_skipped", Json::Number(Debug::fmt(index - missing.len()))))
+    object_counts.push(("ir_jobs", Json::Number(Debug::fmt(jobs))))
+    object_counts.push(("object_probe_ms", Json::Number(Debug::fmt(emission_started - probe_started))))
+    object_counts.push(("ir_emit_ms", Json::Number(Debug::fmt(emission_finished - emission_started))))
     if write_file(directory.join("objects.json").as_str(), stringify(Json::Object(object_counts))) != 0 {
         ret Result[str, str]::Err("cannot record native object reuse")
     }

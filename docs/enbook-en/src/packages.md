@@ -20,6 +20,7 @@ dependencies = [
 | Field | Meaning |
 | --- | --- |
 | `name` | package name |
+| `binary-name` | optional executable filename stem; defaults to `name` and does not change imports |
 | `target` | output kind: `auto`, `executable`, `static_lib` or `shared_lib`; legacy target triples are also accepted |
 | `version` | package version string |
 | `description` | package description |

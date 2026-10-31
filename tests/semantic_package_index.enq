@@ -1,0 +1,76 @@
+//! Shared views preserve lookup order and bind dense types by stable HIR keys.
+import core::fmt::Debug
+import core::option::Option
+import core::testing::assert
+import std::vec::Vec
+import json::Json
+import refrain::frontend::semantic::{SemanticBody, encode_semantic_checkpoint}
+import refrain::frontend::hir::TypeId
+import refrain::frontend::AnalysisDatabase
+import refrain::frontend::analysis_database::check_prepared_safety_module
+import refrain::frontend::semantic_index::PackageSemanticIndex
+import refrain::frontend::semantic_rebind::{rebind_semantic_type, rebind_semantic_checkpoint}
+import refrain::frontend::semantic_slice::SemanticKeyIndex
+import refrain::target::host_target
+
+fn main() -> u32 {
+    let mut positions = SemanticKeyIndex::new(0_usize)
+    for value in 0_usize..2048_usize { positions.set("key-" + Debug::fmt(value), value) }
+    for value in 0_usize..2048_usize {
+        if !assert(positions.get("key-" + Debug::fmt(value)) == value + 1_usize) { ret 1_u32 }
+    }
+    positions.set("key-44", 9000_usize)
+    if !assert(positions.get("key-44") == 9001_usize && positions.get("absent") == 0_usize) { ret 2_u32 }
+    if !assert(rebind_semantic_type("Result[@1,Vec[@0]]", vec!["@8", "@3"]).unwrap_or("") == "Result[@3,Vec[@8]]" &&
+        rebind_semantic_type("@2", vec!["@8", "@3"]).is_err()) { ret 3_u32 }
+    if !assert(rebind_semantic_type("Результат[Т,@1,Vec[@0]]", vec!["@8", "@3"]).unwrap_or("") == "Результат[Т,@3,Vec[@8]]") { ret 15_u32 }
+    let source = "struct Data { value: u32 }\nimpl for Data { pub fn read(self: Self) -> u32 { ret self.value } }\n" +
+        "fn compute(value: Data) -> u32 { let answer = value.read() ret answer }\n"
+    let mut cold = AnalysisDatabase::new()
+    cold.set_module("app", "app.enq", source)
+    cold.configure_safety("app", host_target(), Vec[str]::new())
+    let identity = cold.semantic_package_identity(vec!["app"])
+    if !assert(!cold.prepare_package_semantics(vec!["app"], identity, Option[PackageSemanticIndex]::None)) { ret 4_u32 }
+    let snapshot = cold.package_semantic_index().unwrap_or(PackageSemanticIndex::empty())
+    let payload = snapshot.encode().unwrap_or("")
+    let restored = match PackageSemanticIndex::decode(payload, identity) { Ok(value) => value Err(_) => { ret 5_u32 } }
+    if !assert(PackageSemanticIndex::decode(payload, "wrong").is_err() && PackageSemanticIndex::decode("broken", identity).is_err()) { ret 6_u32 }
+    let view = match restored.module("app") { Some(value) => value None => { ret 7_u32 } }
+    if !assert(restored.methods_for(view).len() == 1_usize && restored.fields_for(view).len() == 1_usize) { ret 7_u32 }
+    let checked = check_prepared_safety_module(cold.prepare_module_safety_job("app", host_target(), Vec[str]::new(), Json::Null, true))
+    if !assert(checked.diagnostics.is_empty() && checked.checked == 2_usize) { ret 8_u32 }
+    let replay = cold.finalize_semantic_replay("app", checked.replay)
+    let mut warm = AnalysisDatabase::new()
+    warm.set_module("app", "app.enq", "\n\n\n" + source)
+    warm.configure_safety("app", host_target(), Vec[str]::new())
+    let moved_identity = warm.semantic_package_identity(vec!["app"])
+    if !assert(moved_identity == identity && warm.prepare_package_semantics(vec!["app"], moved_identity, Option[PackageSemanticIndex]::Some(restored))) { ret 9_u32 }
+    let moved = check_prepared_safety_module(warm.prepare_module_safety_job("app", host_target(), Vec[str]::new(), replay, true))
+    if !assert(moved.diagnostics.is_empty() && moved.checked == 0_usize && moved.reused == 2_usize) { ret 10_u32 }
+    // Reversing an already-populated ordinal table must rewrite every typed
+    // record while preserving signatures, visibility and declaration names.
+    let identities = vec!["@11"]
+    let mut target_types = Vec[TypeId]::new()
+    for position in 0_usize..11_usize { target_types.push(TypeId::named("inserted:" + Debug::fmt(position), "Other")) }
+    target_types.extend(snapshot.types)
+    let rebound = match snapshot.rebind(identities, target_types) { Ok(value) => value Err(_) => { ret 11_u32 } }
+    let rebound_view = match rebound.module("app") { Some(value) => value None => { ret 12_u32 } }
+    match rebound.fields_for(rebound_view).get(0_usize) { Some(value) => { if !assert(value.owner_type == "@11") { ret 12_u32 } } None => { ret 12_u32 } }
+    // A correctly packed but malformed ordinal table is still a cache miss.
+    let mut invalid_view = match restored.module("app") { Some(value) => value None => { ret 13_u32 } }
+    invalid_view.fields.set(0_usize, restored.fields.len())
+    if !assert(PackageSemanticIndex::decode(restored.encode().unwrap_or(""), identity).is_err()) { ret 13_u32 }
+    if !assert(PackageSemanticIndex::decode(payload.slice_bytes(0_usize, payload.byte_len() - 1_usize), identity).is_err()) { ret 14_u32 }
+    let mut facts = SemanticBody::empty()
+    facts.implicit_receivers = vec![(0_usize, 0_usize, "for", "@0"), (0_usize, 0_usize, "with", "@1"), (0_usize, 0_usize, "binary", "@0")]
+    let checkpoint = rebind_semantic_checkpoint(encode_semantic_checkpoint(facts, 0_usize, 0_usize), vec!["@8", "@3"]).unwrap_or(Json::Null)
+    let implicit = checkpoint.as_array().unwrap_or(Vec[Json]::new()).get(6_usize).unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new())
+    if !assert(implicit.len() == 3_usize) { ret 16_u32 }
+    for position in 0_usize..implicit.len() {
+        let row = implicit.get_unchecked_borrowed(position).as_array().unwrap_or(Vec[Json]::new())
+        let expected = if position == 1_usize { "@3" } else { "@8" }
+        let kind = if position == 0_usize { "for" } elif position == 1_usize { "with" } else { "binary" }
+        if !assert(row.get(2_usize).unwrap_or(Json::Null).as_str().unwrap_or("") == kind && row.get(3_usize).unwrap_or(Json::Null).as_str().unwrap_or("") == expected) { ret 17_u32 }
+    }
+    ret 0_u32
+}

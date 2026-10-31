@@ -5,11 +5,12 @@ import mod::cache_policy::{record_cache_usage, touch_cache}
 import core::option::Option
 import core::result::Result
 
-import std::os::{file_exists, mkdir_all, remove_file, write_file}
+import std::os::{file_exists, mkdir_all, read_file, remove_file, write_file}
 import std::path::Path
+import std::time::perf_counter_ms
 import std::vec::Vec
 
-import mod::build_artifacts::{UnitReady, encode_unit_complete, read_unit_complete, read_unit_ready, verify_validated_unit_copy}
+import mod::build_artifacts::{UnitReady, ValidatedUnitSnapshot, encode_unit_complete, read_unit_complete, read_unit_completion_receipt, read_unit_snapshot, verify_validated_unit_copy}
 import mod::build_metadata::{MetadataContext, MetadataDependency}
 import refrain::cache_identity::compiler_content_digest
 
@@ -71,23 +72,68 @@ pub fn close_unit_cache_lock(lock: UnitCacheLock) ->() {
 /// private build snapshot while locked so later users cannot alter link inputs.
 pub fn restore_unit_cache(lock: UnitCacheLock, context: MetadataContext,
     dependencies: Vec[MetadataDependency], native: str, destination: Path,) -> Result[Option[UnitReady], str] {
-    let ready = match read_unit_ready(lock.directory, context, dependencies) {
-        Ok(value) => value
-        Err(_) => {
-            ret Result[Option[UnitReady], str]::Ok(Option[UnitReady]::None)
+    let restored = restore_unit_cache_directory(lock.directory, context, dependencies, native, destination)?
+    ret Result[Option[UnitReady], str]::Ok(match restored {
+            Some(value) => Option[UnitReady]::Some(value.ready)
+            None => Option[UnitReady]::None
+        }
+    )
+
+}
+
+/// The coordinator owns the slot's OS lock until this worker is reaped.
+/// A hint is never a verified dependency: restore performs full validation.
+pub fn unit_cache_candidate(directory: Path, context: MetadataContext, native: str) -> Option[UnitReady] {
+    let ready = match UnitReady::decode(read_file(directory.join("unit.ready").as_str()), context) {
+        Ok(value) => value Err(_) => {
+            ret Option[UnitReady]::None
         }
     }
-    let archive = match read_unit_complete(lock.directory, ready, native) {
-        Ok(value) => value
-        Err(_) => {
-            ret Result[Option[UnitReady], str]::Ok(Option[UnitReady]::None)
+    if read_unit_completion_receipt(directory, ready, native).is_err() {
+        ret Option[UnitReady]::None
+    }
+    ret Option[UnitReady]::Some(ready)
+}
+
+pub struct RestoredUnit {
+    ready: UnitReady
+    validation_ms: u64
+    archive_ms: u64
+    copy_ms: u64
+}
+
+pub fn restore_unit_cache_directory(directory: Path, context: MetadataContext,
+    dependencies: Vec[MetadataDependency], native: str, destination: Path,) -> Result[Option[RestoredUnit], str] {
+    if directory.as_str() == destination.as_str() {
+        ret Result[Option[RestoredUnit], str]::Err("invalid package cache transaction")
+    }
+    let started = perf_counter_ms()
+    let snapshot = match read_unit_snapshot(directory, context, dependencies) {
+        Ok(value) => value Err(_) => {
+            ret Result[Option[RestoredUnit], str]::Ok(Option[RestoredUnit]::None)
         }
     }
-    copy_committed_unit(lock.directory, destination, ready, archive, native, false)?
+    let ready = snapshot.ready
+    let archive = match read_unit_completion_receipt(directory, ready, native) {
+        Ok(value) => value Err(_) => {
+            ret Result[Option[RestoredUnit], str]::Ok(Option[RestoredUnit]::None)
+        }
+    }
+    let validated = perf_counter_ms()
+    let archive_bytes = match verified_payload(directory.join("unit.erlib"), archive) {
+        Ok(value) => value Err(_) => {
+            ret Result[Option[RestoredUnit], str]::Ok(Option[RestoredUnit]::None)
+        }
+    }
+    let archived = perf_counter_ms()
+    copy_committed_unit(destination, snapshot, archive, archive_bytes, native, false)?
     verify_validated_unit_copy(destination, ready)?
     let _archive = read_unit_complete(destination, ready, native)?
-    touch_cache(lock.directory)
-    ret Result[Option[UnitReady], str]::Ok(Option[UnitReady]::Some(ready))
+    touch_cache(directory)
+    ret Result[Option[RestoredUnit], str]::Ok(Option[RestoredUnit]::Some(RestoredUnit {
+                ready, validated - started, archived - validated, perf_counter_ms() - archived
+            }
+        ))
 }
 
 /// Validate the producer before touching the shared slot. Invalidate its old
@@ -95,9 +141,14 @@ pub fn restore_unit_cache(lock: UnitCacheLock, context: MetadataContext,
 /// at any intermediate point leaves a miss, not a partially usable entry.
 pub fn commit_unit_cache(lock: UnitCacheLock, source: Path, context: MetadataContext,
     dependencies: Vec[MetadataDependency], native: str,) -> Result[(), str] {
-    let ready = read_unit_ready(source, context, dependencies)?
-    let archive = read_unit_complete(source, ready, native)?
-    copy_committed_unit(source, lock.directory, ready, archive, native, true)?
+    if source.as_str() == lock.directory.as_str() {
+        ret Result[(), str]::Err("invalid package cache transaction")
+    }
+    let snapshot = read_unit_snapshot(source, context, dependencies)?
+    let ready = snapshot.ready
+    let archive = read_unit_completion_receipt(source, ready, native)?
+    let archive_bytes = verified_payload(source.join("unit.erlib"), archive)?
+    copy_committed_unit(lock.directory, snapshot, archive, archive_bytes, native, true)?
     verify_validated_unit_copy(lock.directory, ready)?
     let _copied_archive = read_unit_complete(lock.directory, ready, native)?
     touch_cache(lock.directory)
@@ -106,9 +157,10 @@ pub fn commit_unit_cache(lock: UnitCacheLock, source: Path, context: MetadataCon
 }
 
 #attr(safe)
-fn copy_committed_unit(source: Path, destination: Path, ready: UnitReady, archive: str, native: str,
-    durable: bool,) -> Result[(), str] {
-    if !destination.is_absolute() || source.as_str() == destination.as_str() || mkdir_all(destination.as_str()) != 0 {
+fn copy_committed_unit(destination: Path, snapshot: ValidatedUnitSnapshot, archive: str, archive_bytes: str,
+    native: str, durable: bool,) -> Result[(), str] {
+    let ready = snapshot.ready
+    if !destination.is_absolute() || mkdir_all(destination.as_str()) != 0 {
         ret Result[(), str]::Err("invalid package cache transaction")
     }
     let marker = destination.join("unit.complete")
@@ -122,9 +174,14 @@ fn copy_committed_unit(source: Path, destination: Path, ready: UnitReady, archiv
     files.push(("unit.erlib", archive))
     files.push(("unit.ready", compiler_content_digest(ready.encode()?)))
     for file in files {
-        let input = source.join(file.0)
         let output = destination.join(file.0)
-        let contents = verified_payload(input, file.1)?
+        let contents = match file.0 {
+            "unit.ermeta" => snapshot.metadata
+            "unit.ertemplate" => snapshot.templates
+            "unit.errequirements" => snapshot.requirements
+            "unit.erlib" => archive_bytes
+            _ => ready.encode()?
+        }
         // Shared CAS publication is durable. Hydration owns an unpublished,
         // fresh private snapshot: only its readiness/completion receipts need
         // atomic publication, not a separate fsync for every copied payload.

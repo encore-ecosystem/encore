@@ -1,0 +1,61 @@
+//! Package sharing must match independently prepared editor environments.
+import core::option::Option
+import core::testing::assert
+import std::vec::Vec
+import refrain::frontend::AnalysisDatabase
+import refrain::frontend::semantic_index::PackageSemanticIndex
+import refrain::target::host_target
+
+fn model(changed: bool) -> str {
+    let value = if changed { "str" } else { "T" }
+    ret "pub struct Peer { label:str }\n" +
+        "pub struct Data[T] { value:" + value + " peer:Peer }\n" +
+        "pub enum Choice[T] { Empty, Value(T) }\n" +
+        "pub trait Read[T] { fn read(self:Self) -> " + value + " }\n" +
+        "impl[T] Read[T] for Data[T] { fn read(self:Self) -> " + value + " { ret self.value } pub fn marker(self:Self) -> Builtin { ret Builtin { flag:true } } }\n"
+}
+fn setup() -> AnalysisDatabase {
+    let mut database = AnalysisDatabase::new()
+    database.set_module("core::marker", "marker.enq", "pub struct Builtin { flag:bool }\n")
+    database.set_module("models", "models.enq", model(false))
+    database.set_module("facade", "facade.enq", "pub import models::{Data as Exported,Choice as Selected}\n")
+    database.set_module("left", "left.enq", "import facade::{Exported as Box,Selected as Pick}\npub struct Peer { local:bool }\npub struct Builtin { local:bool }\nfn sample(value:Box[u32]) { let result = value.read() }\n")
+    database.set_module("right", "right.enq", "import models::{Data as Wrapped,Choice as Pick}\npub struct Peer { local:u64 }\nfn sample(value:Wrapped[str]) { let result = value.read() }\n")
+    ret database
+}
+fn snapshot(database: mut AnalysisDatabase, modules: Vec[str], editor_first: bool) -> str {
+    // This path prepares each full environment without package sharing. The
+    // subsequent package build consumes those existing cached environments.
+    if editor_first {
+        for module_name in modules {
+            database.prepare_module_semantic_check_for_target(module_name, host_target(), Vec[str]::new())
+        }
+    }
+    let identity = database.semantic_package_identity(modules)
+    database.prepare_package_semantics(modules, identity, Option[PackageSemanticIndex]::None)
+    ret database.package_semantic_index().unwrap_or(PackageSemanticIndex::empty()).encode().unwrap_or("")
+}
+fn equivalent(shared: mut AnalysisDatabase, reference: mut AnalysisDatabase, modules: Vec[str]) -> bool {
+    let actual = snapshot(shared, modules, false)
+    let expected = snapshot(reference, modules, true)
+    ret !actual.is_empty() && actual == expected
+}
+fn main() -> u32 {
+    let mut shared = setup()
+    let mut reference = setup()
+    let modules = vec!["left", "right"]
+    if !assert(equivalent(shared, reference, modules)) { ret 1_u32 }
+    // Repeating preparation and changing selection order must not retain an
+    // active module, a previous nominal scope, or stale normalized signatures.
+    if !assert(equivalent(shared, reference, vec!["right", "left"])) { ret 2_u32 }
+    shared.set_module("models", "models.enq", model(true))
+    reference.set_module("models", "models.enq", model(true))
+    if !assert(equivalent(shared, reference, modules)) { ret 3_u32 }
+    shared.remove_module("models")
+    reference.remove_module("models")
+    if !assert(equivalent(shared, reference, modules)) { ret 4_u32 }
+    shared.set_module("models", "models.enq", model(false))
+    reference.set_module("models", "models.enq", model(false))
+    if !assert(equivalent(shared, reference, modules)) { ret 5_u32 }
+    ret 0_u32
+}

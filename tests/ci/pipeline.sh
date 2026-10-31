@@ -161,7 +161,7 @@ case "$CI_PROBE_CASE" in
       printf '%s\n' "$release" > "$root/VERSION"
       cp "$repository/tests/ci/mock-compiler.sh" "$root/bin/encore$extension"
       cp "$root/bin/encore$extension" "$root/bin/encore-lsp$extension"
-      for package in core platform std rich serialize json binary log profile ehir ehir-llvm-backend toml colorterm llvm argparse secret-store; do
+      for package in core platform std rich serialize json binary log profile ehir-core ehir ehir-llvm-backend toml colorterm llvm argparse secret-store; do
         mkdir -p "$root/lib/encore/index/$package/src"
         cp "$repository/packages/$package/encore.toml" "$root/lib/encore/index/$package/"
         cp "$repository/packages/$package/src/lib.enq" "$root/lib/encore/index/$package/src/"
@@ -179,6 +179,12 @@ case "$CI_PROBE_CASE" in
       [[ -z "$extension" ]] || incomplete=incomplete.zip
       if bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$incomplete" provenance.json; then exit 1; fi
       mv missing-serialize "$root/lib/encore/index/serialize"
+      mv "$root/lib/encore/index/ehir-core" missing-ehir-core
+      if [[ -n "$extension" ]]; then zip -qr missing-ehir-core.zip "$root"; else tar -czf missing-ehir-core.tar.gz "$root"; fi
+      incomplete=missing-ehir-core.tar.gz
+      [[ -z "$extension" ]] || incomplete=missing-ehir-core.zip
+      if bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$incomplete" provenance.json; then exit 1; fi
+      mv missing-ehir-core "$root/lib/encore/index/ehir-core"
       if [[ -z "$extension" ]]; then
         tar -cf duplicate.tar "$root"
         tar -rf duplicate.tar "$root/VERSION"

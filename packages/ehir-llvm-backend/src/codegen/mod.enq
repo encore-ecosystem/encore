@@ -3,13 +3,12 @@ import core::option::Option
 
 import std::io::eprintln
 import std::os::env
-import std::process::exit
 import std::thread::JoinHandle
 import std::time::perf_counter_ms
 import std::vec::{Vec, vec_singleton}
 
-import ehirlib::{PreparationOutcome, enum_value, prepare_module}
-import ehirlib::core::{BinaryOpKind, Block, CallInstruction, Directive, EdgeInstruction, EhirDocumentation, EhirImport, EnumVariant, FnDirective, Instruction, MatchArm, MatchInstruction, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, Variable, add_edge, alias, async_fn_item, await_value, binary, block, br_term, call, cbr_term, cfree, drop_value, ehir_documentation, ehir_import, enum_directive, enum_variant, extern_fn_item, fn_item, gep, getfield, getfieldptr, getptr, halloc, hfree, hrealloc, impl_directive, lceos, lcpos, lcsos, load, local_place_type, make_module, make_module_bundle, make_module_with_metadata, mangle_plain_type_name, mangle_type_name, match_arm, match_term, memory_value_type, param, pcast, phi, phi_pair, put, raw_type, remove_edge, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, store, struct_directive, switch_case, switch_term, trait_directive, trait_method, unreachable_term}
+import ehir_core::{PreparationOutcome, enum_value, prepare_module}
+import ehir_core::core::{BinaryOpKind, Block, CallInstruction, Directive, EdgeInstruction, EhirDocumentation, EhirImport, EnumVariant, FieldSelector, FnDirective, Instruction, MatchArm, MatchInstruction, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, ValueKind, Variable, add_edge, alias, async_fn_item, await_value, binary, block, br_term, call, cbr_term, cfree, drop_value, ehir_documentation, ehir_import, enum_directive, enum_variant, extern_fn_item, fn_item, gep, getfield, getfieldptr, getptr, halloc, hfree, hrealloc, impl_directive, lceos, lcpos, lcsos, load, local_place_type, make_module, make_module_bundle, make_module_with_metadata, mangle_plain_type_name, mangle_type_name, match_arm, match_term, memory_value_type, param, pcast, phi, phi_pair, put, raw_type, remove_edge, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, store, struct_directive, switch_case, switch_term, trait_directive, trait_method, unreachable_term}
 
 fn concat_instructions(left: Vec[LLVMInstruction], right: Vec[LLVMInstruction]) -> Vec[LLVMInstruction] {
     let mut out = Vec[LLVMInstruction]::new()
@@ -29,6 +28,21 @@ import llvm::core::{LLVMBasicBlock, LLVMFunction, LLVMInstruction, LLVMParam, LL
 import llvm::ir::{append_builder_line, append_function_to_builder}
 import llvm::types::{LLVMType, LLVMTypeKind, array_type, f16_type, f32_type, f64_type, i16_type, i1_type, i32_type, i64_type, i8_type, llvm_raw_type, named_struct_type, ptr_type, type_text, void_type}
 import llvm::value::{LLVMValue, const_i32, const_text, reg, value_type}
+
+extern fn ehir_codegen_clear_error() ->()
+extern fn ehir_codegen_record_error(message: str) ->()
+extern fn ehir_codegen_take_error() -> str
+
+pub fn clear_codegen_error() ->() {
+    unsafe {
+        ehir_codegen_clear_error()
+    }
+}
+pub fn take_codegen_error() -> str {
+    ret unsafe {
+        ehir_codegen_take_error()
+    }
+}
 
 extern fn encore_llvm_set_target_pointer_width(bits: usize) ->()
 extern fn encore_llvm_target_pointer_width() -> usize
@@ -51,6 +65,7 @@ pub struct EmittedIrModule {
     module_id: str
     ir: str
     weight: usize
+    diagnostic: str
 }
 
 struct EmittedIrChunk {
@@ -109,6 +124,14 @@ pub fn prepare_unit_codegen(owned: ModuleBundle, dependencies: ModuleBundle,
     triple: str, pointer_width: usize, jobs: usize,) -> PreparedUnitCodegen {
     install_codegen_target(triple, pointer_width)
     let prepared = prepare_modules_for_codegen_parallel(owned.modules, jobs, triple, pointer_width)
+    ret prepare_normalized_unit_codegen(make_module_bundle(owned.entry_module, prepared), dependencies, triple, pointer_width)
+}
+
+/// Already-prepared ordinary bodies come from the shared EHIR compiler/cache.
+pub fn prepare_normalized_unit_codegen(owned: ModuleBundle, dependencies: ModuleBundle,
+    triple: str, pointer_width: usize,) -> PreparedUnitCodegen {
+    install_codegen_target(triple, pointer_width)
+    let prepared = owned.modules
     let mut contexts = Vec[Module]::new()
     contexts.extend(dependencies.modules)
     contexts.extend(module_codegen_context_modules(prepared))
@@ -172,6 +195,16 @@ pub fn unit_codegen_owned(unit: frozen PreparedUnitCodegen, entry: str) -> Modul
     ret make_module_bundle(entry, modules)
 }
 
+/// Exact declaration/template inputs to ordinary LLVM emission, including
+/// dependencies. Ordinary owned bodies are fingerprinted separately.
+pub fn unit_codegen_input_context(unit: frozen PreparedUnitCodegen) -> ModuleBundle {
+    let mut modules = Vec[Module]::new()
+    for context in unit.contexts {
+        modules.push(clone_module_for_codegen(context))
+    }
+    ret make_module_bundle("", modules)
+}
+
 /// Copies only compact requirements across the immutable preparation boundary.
 pub fn unit_codegen_requirements(unit: frozen PreparedUnitCodegen) -> CodegenRequirements {
     let mut calls = Vec[GenericRequirement]::new()
@@ -192,6 +225,27 @@ pub fn unit_codegen_requirements(unit: frozen PreparedUnitCodegen) -> CodegenReq
 /// external declarations and are defined once by emit_program_support.
 pub fn emit_unit_codegen(unit: frozen PreparedUnitCodegen, triple: str,
     pointer_width: usize,) -> Vec[EmittedIrModule] {
+    let mut selected = Vec[usize]::new()
+    let mut index = 0_usize
+    for _module in unit.owned {
+        selected.push(index)
+        index += 1_usize
+    }
+    ret emit_unit_codegen_selected(unit, triple, pointer_width, selected)
+}
+
+/// Emits only cache misses. Selection uses the canonical owned-module order;
+/// unlike program CGUs, package CGU zero never owns global helper definitions.
+pub fn emit_unit_codegen_selected(unit: frozen PreparedUnitCodegen, triple: str,
+    pointer_width: usize, selected: Vec[usize],) -> Vec[EmittedIrModule] {
+    ret emit_unit_codegen_selected_parallel(unit, triple, pointer_width, selected, 1_usize)
+}
+
+pub fn emit_unit_codegen_selected_parallel(unit: frozen PreparedUnitCodegen, triple: str,
+    pointer_width: usize, selected: Vec[usize], jobs: usize,) -> Vec[EmittedIrModule] {
+    if selected.is_empty() {
+        ret Vec[EmittedIrModule]::new()
+    }
     install_codegen_target(triple, pointer_width)
     let directives = module_bundle_directives(unit.contexts)
     let mut calls = Vec[GenericCall]::new()
@@ -206,12 +260,59 @@ pub fn emit_unit_codegen(unit: frozen PreparedUnitCodegen, triple: str,
     let support = SupportIr {
         "", unit_support_declarations(directives, expanded, unit.requirements.concrete_types, unit.requirements.equality_types)
     }
+    let preparation_error = take_codegen_error()
+    if !preparation_error.is_empty() {
+        ret vec![EmittedIrModule { "", "", 0_usize, preparation_error }]
+    }
+    let count = min_codegen_jobs(jobs, selected.len())
+    let scheduled = schedule_selected_codegen_modules(unit.owned, selected)
+    let mut chunks = Vec[EmittedIrChunk]::new()
+    if count == 1_usize {
+        chunks = emit_package_ir_batch(unit, scheduled, triple, pointer_width, support, 0_usize, 1_usize)
+    } else {
+        let mut handles = Vec[JoinHandle[Vec[EmittedIrChunk]]]::new()
+        for worker in 0_usize..count {
+            handles.push(spawn emit_package_ir_batch(unit, scheduled, triple, pointer_width, support, worker, count))
+        }
+        for handle in handles {
+            chunks.extend(handle.join())
+        }
+    }
     let mut out = Vec[EmittedIrModule]::new()
-    for module in unit.owned {
-        let view = module_codegen_view(module, unit.contexts)
-        let lowered = lower_with_precomputed_analysis(view, unit.requirements.concrete_types, support, false)
-        let ir = "target triple = \"" + triple + "\"\n\n" + lowered.ir
-        out.push(EmittedIrModule { module.name, ir, ir.byte_len() })
+    for index in selected {
+        for chunk in chunks {
+            if chunk.index == index {
+                out.push(chunk.module) break
+            }
+        }
+    }
+    ret out
+}
+
+fn emit_package_ir_batch(unit: frozen PreparedUnitCodegen, selected: frozen Vec[usize], triple: str,
+    pointer_width: usize, support: frozen SupportIr, worker: usize, workers: usize,) -> sending Vec[EmittedIrChunk] {
+    install_codegen_target(triple, pointer_width)
+    let mut out = Vec[EmittedIrChunk]::new()
+    let mut cursor = worker
+    while cursor < selected.len() {
+        let index = selected.get(cursor).unwrap_or(unit.owned.len())
+        match unit.owned.get(index) {
+            Some(module) => {
+                clear_codegen_error()
+                let view = module_codegen_view(module, unit.contexts)
+                let lowered = lower_with_precomputed_analysis(view, unit.requirements.concrete_types, support, false)
+                let ir = "target triple = \"" + triple + "\"\n\n" + lowered.ir
+                out.push(EmittedIrChunk {
+                        index, EmittedIrModule {
+                            module.name, ir, ir.byte_len(), take_codegen_error()
+                        }
+                    }
+                )
+            }
+            None => {
+            }
+        }
+        cursor += workers
     }
     ret out
 }
@@ -220,6 +321,7 @@ pub fn emit_unit_codegen(unit: frozen PreparedUnitCodegen, triple: str,
 /// ordinary bodies. The coordinator supplies contexts in canonical unit order.
 pub fn emit_program_support(context: frozen ModuleBundle, requirements: frozen Vec[CodegenRequirements],
     triple: str, pointer_width: usize,) -> EmittedIrModule {
+    clear_codegen_error()
     install_codegen_target(triple, pointer_width)
     let directives = module_bundle_directives(context.modules)
     let mut calls = Vec[GenericCall]::new()
@@ -265,7 +367,7 @@ pub fn emit_program_support(context: frozen ModuleBundle, requirements: frozen V
     let module = make_module("__encore_program_support", support_directives)
     let lowered = lower_with_precomputed_analysis(module, concrete, support, true)
     let ir = "target triple = \"" + triple + "\"\n\n" + lowered.ir
-    ret EmittedIrModule { "__encore_program_support", ir, ir.byte_len() }
+    ret EmittedIrModule { "__encore_program_support", ir, ir.byte_len(), take_codegen_error() }
 }
 
 // Templates retain concrete impl bodies for specialization, but ordinary
@@ -1025,8 +1127,7 @@ fn thread_result_type(out: frozen Variable) -> Type {
             ret clone_type(result)
         }
         None => {
-            eprintln("internal compiler error: thread handle '" + handle.name + "' has no result type")
-            exit(1_i32)
+            backend_invariant_error("internal compiler error: thread handle '" + handle.name + "' has no result type")
             ret Type {
                 "usize", Vec[Type]::new(), RepresentationKind::Inline
             }
@@ -2981,12 +3082,11 @@ fn specialize_instruction(instruction: frozen Instruction, params: frozen Vec[Ty
             if call_name == "Debug::fmt" {
                 match values.get(0_usize) {
                     Some(value) => {
-                        match value.typ {
-                            Some(typ) => {
-                                call_name = typ.name + "::fmt"
-                            }
-                            None => {
-                            }
+                        {
+                            let typ = value.typ
+
+                            call_name = typ.name + "::fmt"
+
                         }
                     }
                     None => {
@@ -2996,12 +3096,11 @@ fn specialize_instruction(instruction: frozen Instruction, params: frozen Vec[Ty
             if call_name.len() == 5_usize && call_name.slice(1_usize, 4_usize) == "::op" {
                 match values.get(0_usize) {
                     Some(value) => {
-                        match value.typ {
-                            Some(typ) => {
-                                call_name = typ.name + "::op"
-                            }
-                            None => {
-                            }
+                        {
+                            let typ = value.typ
+
+                            call_name = typ.name + "::op"
+
                         }
                     }
                     None => {
@@ -3011,12 +3110,11 @@ fn specialize_instruction(instruction: frozen Instruction, params: frozen Vec[Ty
             if call_name.len() == 6_usize && call_name.slice(1_usize, 5_usize) == "::pow" {
                 match values.get(0_usize) {
                     Some(value) => {
-                        match value.typ {
-                            Some(typ) => {
-                                call_name = typ.name + "::pow"
-                            }
-                            None => {
-                            }
+                        {
+                            let typ = value.typ
+
+                            call_name = typ.name + "::pow"
+
                         }
                     }
                     None => {
@@ -3026,20 +3124,19 @@ fn specialize_instruction(instruction: frozen Instruction, params: frozen Vec[Ty
             if raw_call_name.len() == 5_usize && raw_call_name.slice(1_usize, 4_usize) == "::op" && values.len() == 2_usize {
                 match values.get(0_usize) {
                     Some(first) => {
-                        match first.typ {
-                            Some(first_type) => {
-                                if is_numeric_ehir_type(first_type) {
-                                    match values.get(1_usize) {
-                                        Some(second) => {
-                                            ret binary(specialize_variable(data.out, params, args), first, second, BinaryOpKind::ADD)
-                                        }
-                                        None => {
-                                        }
+                        {
+                            let first_type = first.typ
+
+                            if is_numeric_ehir_type(first_type) {
+                                match values.get(1_usize) {
+                                    Some(second) => {
+                                        ret binary(specialize_variable(data.out, params, args), first, second, BinaryOpKind::ADD)
+                                    }
+                                    None => {
                                     }
                                 }
                             }
-                            None => {
-                            }
+
                         }
                     }
                     None => {
@@ -3078,13 +3175,13 @@ fn specialize_instruction(instruction: frozen Instruction, params: frozen Vec[Ty
             ret getfield(
                 specialize_variable(data.out, params, args),
                 specialize_variable(data.src, params, args),
-                specialize_variable(data.field, params, args),
+                specialize_field(data.field, params, args),
             )
         }
         Instruction::SetField(data) => {
             ret setfield(
                 specialize_variable(data.src, params, args),
-                specialize_variable(data.field, params, args),
+                specialize_field(data.field, params, args),
                 specialize_variable(data.value, params, args),
             )
         }
@@ -3092,21 +3189,21 @@ fn specialize_instruction(instruction: frozen Instruction, params: frozen Vec[Ty
             ret getfieldptr(
                 specialize_variable(data.out, params, args),
                 specialize_variable(data.src, params, args),
-                specialize_variable(data.field, params, args),
+                specialize_field(data.field, params, args),
             )
         }
         Instruction::SGetField(data) => {
             ret sgetfield(
                 specialize_variable(data.out, params, args),
                 specialize_variable(data.src, params, args),
-                specialize_variable(data.field, params, args),
+                specialize_field(data.field, params, args),
             )
         }
         Instruction::SGetFieldPtr(data) => {
             ret sgetfieldptr(
                 specialize_variable(data.out, params, args),
                 specialize_variable(data.src, params, args),
-                specialize_variable(data.field, params, args),
+                specialize_field(data.field, params, args),
             )
         }
         Instruction::GetPtr(data) => {
@@ -3205,18 +3302,15 @@ fn specialize_terminator(terminator: frozen Terminator, params: frozen Vec[Type]
 }
 
 fn specialize_variable(value: frozen Variable, params: frozen Vec[Type], args: frozen Vec[Type]) -> Variable {
-    match value.typ {
-        Option[Type]::Some(typ) => {
-            ret Variable {
-                "" + value.name, Option[Type]::Some(substitute_generic_type(typ, params, args))
-            }
-        }
-        Option[Type]::None => {
-            ret Variable {
-                "" + value.name, Option[Type]::None
-            }
-        }
+    ret Variable { "" + value.name, substitute_generic_type(value.typ, params, args), value.kind }
+}
+
+fn specialize_field(value: frozen FieldSelector, params: frozen Vec[Type], args: frozen Vec[Type]) -> FieldSelector {
+    let annotation = match value.annotation {
+        Some(typ) => Option[Type]::Some(substitute_generic_type(typ, params, args))
+        None => Option[Type]::None
     }
+    ret FieldSelector { "" + value.name, annotation }
 }
 
 fn generic_symbol(name: str, args: frozen Vec[Type]) -> str {
@@ -3254,8 +3348,7 @@ fn prepare_module_for_codegen(module: Module) -> Module {
     let validation_started = perf_counter_ms()
     match prepare_module(module) {
         PreparationOutcome::Error(message) => {
-            eprintln("error[ehir-validation]: " + message)
-            exit(1_i32)
+            backend_invariant_error("error[ehir-validation]: " + message)
         }
         PreparationOutcome::Ready(prepared) => {
             profile_codegen_duration("module-prepared", validation_started)
@@ -3315,7 +3408,18 @@ pub fn emit_ir_bundle_for_target_selected(bundle: frozen ModuleBundle, triple: s
     requested_jobs: usize, selected: Vec[usize],) -> Vec[EmittedIrModule] {
     let analysis_directives = module_bundle_directives(bundle.modules)
     ret emit_ir_bundle_for_target_selected_impl(bundle, triple, pointer_width, requested_jobs,
-        selected, analysis_directives, false,)
+        selected, analysis_directives, false, false,)
+}
+
+/// Consumes the common compiler's prepared graph without repeating normalization.
+pub fn emit_prepared_ir_bundle_for_target(bundle: frozen ModuleBundle, triple: str,
+    pointer_width: usize, jobs: usize,) -> Vec[EmittedIrModule] {
+    let mut selected = Vec[usize]::new()
+    for index in 0_usize..bundle.modules.len() {
+        selected.push(index)
+    }
+    ret emit_ir_bundle_for_target_selected_impl(bundle, triple, pointer_width, jobs,
+        selected, Vec[Directive]::new(), false, true,)
 }
 
 /// Emits selected CGUs from a compact bundle while analysing generic and
@@ -3327,12 +3431,12 @@ pub fn emit_ir_bundle_for_target_selected_with_analysis(bundle: frozen ModuleBun
     requested_jobs: usize, selected: Vec[usize],) -> Vec[EmittedIrModule] {
     let analysis_directives = module_bundle_directives(analysis_bundle.modules)
     ret emit_ir_bundle_for_target_selected_impl(bundle, triple, pointer_width, requested_jobs,
-        selected, analysis_directives, true,)
+        selected, analysis_directives, true, false,)
 }
 
 fn emit_ir_bundle_for_target_selected_impl(bundle: frozen ModuleBundle, triple: str, pointer_width: usize,
     requested_jobs: usize, selected: Vec[usize], supplied_analysis: frozen Vec[Directive],
-    use_supplied_analysis: bool,)
+    use_supplied_analysis: bool, already_prepared: bool,)
 -> Vec[EmittedIrModule] {
     unsafe {
         encore_llvm_set_target_pointer_width(pointer_width)
@@ -3359,7 +3463,7 @@ fn emit_ir_bundle_for_target_selected_impl(bundle: frozen ModuleBundle, triple: 
     // non-local ordinary bodies become extern declarations before expensive
     // coroutine/ownership preparation; only selected bodies and globally
     // visible generic templates are normalized.
-    let prepared = if prepare_selected_view {
+    let prepared = if prepare_selected_view || already_prepared {
         source_modules
     } else {
         prepare_modules_for_codegen_parallel(source_modules, requested_jobs, triple, pointer_width)
@@ -3389,6 +3493,10 @@ fn emit_ir_bundle_for_target_selected_impl(bundle: frozen ModuleBundle, triple: 
     let concrete_types = collect_concrete_types(analysis_directives, expanded_calls)
     let support = build_support_ir(analysis_directives, expanded_calls, concrete_types,
         collect_equality_types(analysis_directives, analysis_directives, expanded_calls),)
+    let analysis_error = take_codegen_error()
+    if !analysis_error.is_empty() {
+        ret vec![EmittedIrModule { "", "", 0_usize, analysis_error }]
+    }
     profile_codegen_duration("bundle-analysis", analysis_started)
     profile_codegen_memory("bundle-modules-prepared")
     // Long compiler/editor modules can outweigh dozens of leaf modules. Feed
@@ -3659,6 +3767,7 @@ fn emit_ir_module_batch(prepared: frozen Vec[Module], contexts: frozen Vec[Modul
             Some(index) => {
                 match prepared.get(index) {
                     Some(module) => {
+                        clear_codegen_error()
                         let view = if prepare_selected_view {
                             module_codegen_view(prepare_module_for_codegen(clone_module_for_codegen(module)), contexts)
                         } else {
@@ -3676,7 +3785,7 @@ fn emit_ir_module_batch(prepared: frozen Vec[Module], contexts: frozen Vec[Modul
                         }
                         out.push(EmittedIrChunk {
                                 index, EmittedIrModule {
-                                    module.name, ir, ir.len()
+                                    module.name, ir, ir.len(), take_codegen_error()
                                 }
                             }
                             ,
@@ -4330,12 +4439,11 @@ fn collect_function_equality(out: mut Vec[Type], seen: usize, function: frozen F
                 Instruction::Binary(data) => {
                     if (data.op == BinaryOpKind::IEQ || data.op == BinaryOpKind::NEQ)
                     && !is_enum_tag_operand(data.rhs) {
-                        match data.lhs.typ {
-                            Some(typ) => {
-                                remember_equality_type(out, seen, typ)
-                            }
-                            None => {
-                            }
+                        {
+                            let typ = data.lhs.typ
+
+                            remember_equality_type(out, seen, typ)
+
                         }
                     }
                 }
@@ -4691,12 +4799,11 @@ fn collect_instruction_types(out: mut Vec[Type], seen: usize, instruction_handle
 }
 
 fn remember_variable_type(out: mut Vec[Type], seen: usize, value: Variable) ->() {
-    match value.typ {
-        Option[Type]::Some(typ) => {
-            remember_concrete_type(out, seen, typ)
-        }
-        Option[Type]::None => {
-        }
+    {
+        let typ = value.typ
+
+        remember_concrete_type(out, seen, typ)
+
     }
     ret()
 }
@@ -5138,7 +5245,7 @@ fn lower_instruction(instruction: frozen Instruction, instruction_scope: str, lo
         }
         Alias(alias_data) => {
             let out = lower_variable(alias_data.out)
-            let src = lower_variable_with_fallback(alias_data.src, required_variable_type(alias_data.out))
+            let src = lower_variable(alias_data.src)
             ret vec_singleton(llvm_inst_bitcast(out, src))
         }
         Lceos(enum_data) => {
@@ -5204,8 +5311,7 @@ fn lower_instruction(instruction: frozen Instruction, instruction_scope: str, lo
             ret vec_singleton(lowered)
         }
         Await(await_data) => {
-            eprintln("internal compiler error: unlowered EHIR await for '" + await_data.out.name + "' reached LLVM codegen")
-            exit(1_i32)
+            backend_invariant_error("internal compiler error: unlowered EHIR await for '" + await_data.out.name + "' reached LLVM codegen")
             ret Vec[LLVMInstruction]::new()
         }
         Store(store_data) => {
@@ -5213,26 +5319,25 @@ fn lower_instruction(instruction: frozen Instruction, instruction_scope: str, lo
             let dst_var: Variable = store_data.dst
             let value: LLVMValue = lower_variable(src_var)
             let ptr: LLVMValue = lower_variable(dst_var)
-            match dst_var.typ {
-                Option[Type]::Some(dst_type) => {
-                    if dst_type.representation == RepresentationKind::Raw ||
-                    dst_type.representation == RepresentationKind::LocalPlace {
-                        // Slot spelling must not change ownership. Keep the
-                        // same retaining store semantics as EHIR promotion;
-                        // producers express transfers with an explicit drop.
-                        let mut instructions = lower_retain_value(value, required_variable_type(src_var))
-                        if unsafe {
-                            encore_strmap_get(local_slots, dst_var.name)
-                        }
-                        == 0 {
-                            instructions.extend(lower_place_edges(ptr, value, required_variable_type(src_var)))
-                        }
-                        instructions.push(llvm_inst_store(value, ptr))
-                        ret instructions
+            {
+                let dst_type = dst_var.typ
+
+                if dst_type.representation == RepresentationKind::Raw ||
+                dst_type.representation == RepresentationKind::LocalPlace {
+                    // Slot spelling must not change ownership. Keep the
+                    // same retaining store semantics as EHIR promotion;
+                    // producers express transfers with an explicit drop.
+                    let mut instructions = lower_retain_value(value, required_variable_type(src_var))
+                    if unsafe {
+                        encore_strmap_get(local_slots, dst_var.name)
                     }
+                    == 0 {
+                        instructions.extend(lower_place_edges(ptr, value, required_variable_type(src_var)))
+                    }
+                    instructions.push(llvm_inst_store(value, ptr))
+                    ret instructions
                 }
-                Option[Type]::None => {
-                }
+
             }
             ret vec_singleton(llvm_inst_store(value, ptr))
         }
@@ -5246,7 +5351,7 @@ fn lower_instruction(instruction: frozen Instruction, instruction_scope: str, lo
         GetField(getfield_data) => {
             let out_var: Variable = getfield_data.out
             let src_var: Variable = getfield_data.src
-            let field_var: Variable = getfield_data.field
+            let field_var: FieldSelector = getfield_data.field
             let out_name: str = out_var.name
             let out_type: Type = required_variable_type(out_var)
 
@@ -5334,7 +5439,7 @@ fn lower_instruction(instruction: frozen Instruction, instruction_scope: str, lo
         GetFieldPtr(getfieldptr_data) => {
             let out_var: Variable = getfieldptr_data.out
             let src_var: Variable = getfieldptr_data.src
-            let field_var: Variable = getfieldptr_data.field
+            let field_var: FieldSelector = getfieldptr_data.field
             let lowered: LLVMInstruction = lower_getfieldptr(out_var, src_var, field_var)
             ret vec_singleton(lowered)
         }
@@ -5368,7 +5473,10 @@ fn lower_instruction(instruction: frozen Instruction, instruction_scope: str, lo
                     instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw), ptr_type(i8_type()), "encore_node_alloc_heap", vec_singleton(size)))
                     instructions.push(llvm_inst_cast("bitcast", out, raw))
                 } elif construct_data.typ.representation == RepresentationKind::NodeStack {
-                    let storage_type = llvm_raw_type(LLVMTypeKind::STRUCT, "{ [8 x i64], " + type_text(aggregate_type) + " }")
+                    // Reserve the same 64-byte prefix with 16-byte ABI alignment.
+                    // The complete allocation size must also be a multiple of 16:
+                    // Darwin's dynamic stack probes subtract that size directly.
+                    let storage_type = llvm_raw_type(LLVMTypeKind::STRUCT, "{ [4 x <2 x i64>], " + type_text(aggregate_type) + " }")
                     let storage = reg(safe_name + "_stack_storage", ptr_type(storage_type))
                     instructions.push(llvm_inst_alloca(storage, storage_type))
                     instructions.push(llvm_inst_gep(out, storage_type, storage, field_indices("1"), true))
@@ -5546,60 +5654,57 @@ fn lower_instruction(instruction: frozen Instruction, instruction_scope: str, lo
             let rhs_var: Variable = binary_data.rhs
             let op: BinaryOpKind = binary_data.op
             if (op == BinaryOpKind::IEQ || op == BinaryOpKind::NEQ) && is_enum_tag_operand(rhs_var) {
-                match lhs_var.typ {
-                    Option[Type]::Some(lhs_type) => {
-                        if lhs_type.representation == RepresentationKind::Inline && is_aggregate_ehir_type(lhs_type) {
-                            let tag_out = reg(sanitize_symbol(out_var.name) + "_tag", i32_type())
-                            let extract = llvm_inst_extractvalue(tag_out, lower_variable(lhs_var), "0")
-                            let tag = const_i32(enum_variant_tag(enum_variant_symbol_name(rhs_var.name)))
-                            let predicate = if op == BinaryOpKind::IEQ {
-                                "icmp eq"
-                            } else {
-                                "icmp ne"
-                            }
-                            let compare = llvm_inst_binary(predicate, lower_variable(out_var), tag_out, tag)
-                            ret concat_instructions(vec_singleton(extract), vec_singleton(compare))
+                {
+                    let lhs_type = lhs_var.typ
+
+                    if lhs_type.representation == RepresentationKind::Inline && is_aggregate_ehir_type(lhs_type) {
+                        let tag_out = reg(sanitize_symbol(out_var.name) + "_tag", i32_type())
+                        let extract = llvm_inst_extractvalue(tag_out, lower_variable(lhs_var), "0")
+                        let tag = const_i32(enum_variant_tag(enum_variant_symbol_name(rhs_var.name)))
+                        let predicate = if op == BinaryOpKind::IEQ {
+                            "icmp eq"
+                        } else {
+                            "icmp ne"
                         }
+                        let compare = llvm_inst_binary(predicate, lower_variable(out_var), tag_out, tag)
+                        ret concat_instructions(vec_singleton(extract), vec_singleton(compare))
                     }
-                    Option[Type]::None => {
-                    }
+
                 }
             }
             if op == BinaryOpKind::IEQ || op == BinaryOpKind::NEQ {
-                match lhs_var.typ {
-                    Option[Type]::Some(lhs_type) => {
-                        if lhs_type.name == "str" && lhs_type.representation == RepresentationKind::Inline {
-                            let args = concat_values(vec_singleton(lower_variable(lhs_var)), vec_singleton(lower_variable(rhs_var)))
-                            if op == BinaryOpKind::IEQ {
-                                ret vec_singleton(llvm_inst_call(Option[LLVMValue]::Some(lower_variable(out_var)), i1_type(), "encore_str_eq", args))
+                {
+                    let lhs_type = lhs_var.typ
+
+                    if lhs_type.name == "str" && lhs_type.representation == RepresentationKind::Inline {
+                        let args = concat_values(vec_singleton(lower_variable(lhs_var)), vec_singleton(lower_variable(rhs_var)))
+                        if op == BinaryOpKind::IEQ {
+                            ret vec_singleton(llvm_inst_call(Option[LLVMValue]::Some(lower_variable(out_var)), i1_type(), "encore_str_eq", args))
+                        }
+                        let equal = reg(sanitize_symbol(out_var.name) + "_str_equal", i1_type())
+                        let mut instructions = vec_singleton(llvm_inst_call(Option[LLVMValue]::Some(equal), i1_type(), "encore_str_eq", args))
+                        instructions.push(llvm_inst_binary("xor", lower_variable(out_var), equal, const_text("1", i1_type())))
+                        ret instructions
+                    }
+                    {
+                        let rhs_type = rhs_var.typ
+
+                        if lhs_type.representation == RepresentationKind::Inline && is_aggregate_ehir_type(lhs_type)
+                        && mangle_type_name(lhs_type) == mangle_type_name(rhs_type) {
+                            let equal = if op == BinaryOpKind::IEQ {
+                                lower_variable(out_var)
+                            } else {
+                                reg(sanitize_symbol(out_var.name) + "_aggregate_equal", i1_type())
                             }
-                            let equal = reg(sanitize_symbol(out_var.name) + "_str_equal", i1_type())
-                            let mut instructions = vec_singleton(llvm_inst_call(Option[LLVMValue]::Some(equal), i1_type(), "encore_str_eq", args))
-                            instructions.push(llvm_inst_binary("xor", lower_variable(out_var), equal, const_text("1", i1_type())))
+                            let mut instructions = lower_equality_value(lower_variable(lhs_var), lower_variable(rhs_var), lhs_type, equal)
+                            if op == BinaryOpKind::NEQ {
+                                instructions.push(llvm_inst_binary("xor", lower_variable(out_var), equal, const_text("1", i1_type())))
+                            }
                             ret instructions
                         }
-                        match rhs_var.typ {
-                            Option[Type]::Some(rhs_type) => {
-                                if lhs_type.representation == RepresentationKind::Inline && is_aggregate_ehir_type(lhs_type)
-                                && mangle_type_name(lhs_type) == mangle_type_name(rhs_type) {
-                                    let equal = if op == BinaryOpKind::IEQ {
-                                        lower_variable(out_var)
-                                    } else {
-                                        reg(sanitize_symbol(out_var.name) + "_aggregate_equal", i1_type())
-                                    }
-                                    let mut instructions = lower_equality_value(lower_variable(lhs_var), lower_variable(rhs_var), lhs_type, equal)
-                                    if op == BinaryOpKind::NEQ {
-                                        instructions.push(llvm_inst_binary("xor", lower_variable(out_var), equal, const_text("1", i1_type())))
-                                    }
-                                    ret instructions
-                                }
-                            }
-                            Option[Type]::None => {
-                            }
-                        }
+
                     }
-                    Option[Type]::None => {
-                    }
+
                 }
             }
             ret vec_singleton(lower_binary(out_var, lhs_var, rhs_var, op))
@@ -5706,8 +5811,7 @@ fn lower_thread_join(data: frozen CallInstruction) -> Vec[LLVMInstruction] {
             ret instructions
         }
         None => {
-            eprintln("internal compiler error: thread join has no handle")
-            exit(1_i32)
+            backend_invariant_error("internal compiler error: thread join has no handle")
             ret Vec[LLVMInstruction]::new()
         }
     }
@@ -5719,8 +5823,9 @@ fn unsupported_instruction(name: str) -> Vec[LLVMInstruction] {
 }
 
 fn backend_invariant_error(message: str) ->() {
-    eprintln("error[backend-invariant]: " + message)
-    exit(1_i32)
+    unsafe {
+        ehir_codegen_record_error(message)
+    }
     ret()
 }
 
@@ -5802,14 +5907,14 @@ fn numeric_literal_text(value: str) -> str {
 
 fn lower_indirect_call(data: frozen CallInstruction) -> Vec[LLVMInstruction] {
     if data.args.len() == 0 || data.generics.len() != 0 {
-        eprintln("invalid EHIR indirect call") exit(1_i32)
+        backend_invariant_error("invalid EHIR indirect call")
     }
     let source = match data.args.get(0) {
         Some(value) => value None => data.out
     }
     let source_type = required_variable_type(source)
     if source_type.name != "usize" && source_type.representation != RepresentationKind::Raw {
-        eprintln("EHIR indirect callee must be usize or a raw pointer") exit(1_i32)
+        backend_invariant_error("EHIR indirect callee must be usize or a raw pointer")
     }
     let result_type = lower_type(required_variable_type(data.out))
     let mut arguments = Vec[LLVMValue]::new()
@@ -5871,13 +5976,13 @@ fn function_symbol(name: str) -> str {
 }
 
 fn lower_getfieldptr(out_var: frozen Variable, src_var: frozen Variable,
-    field_var: frozen Variable,) -> LLVMInstruction {
+    field_var: frozen FieldSelector,) -> LLVMInstruction {
     let out_ptr = lower_variable(out_var)
     ret lower_getfieldptr_with(out_ptr, src_var, field_var)
 }
 
 fn lower_getfieldptr_with(out_ptr: LLVMValue, src_var: frozen Variable,
-    field_var: frozen Variable,) -> LLVMInstruction {
+    field_var: frozen FieldSelector,) -> LLVMInstruction {
     let src_value = lower_variable(src_var)
     let src_type = required_variable_type(src_var)
     let field_name = field_var.name
@@ -5889,15 +5994,15 @@ fn lower_getfieldptr_with(out_ptr: LLVMValue, src_var: frozen Variable,
 fn lower_binary(out_var: frozen Variable, lhs_var: frozen Variable,
     rhs_var: frozen Variable, op: BinaryOpKind,) -> LLVMInstruction {
     let out = lower_variable(out_var)
-    let fallback_type = binary_operand_type(lhs_var, rhs_var, out_var)
-    let lhs = lower_binary_operand(lhs_var, fallback_type)
-    let rhs = lower_binary_operand(rhs_var, fallback_type)
-    let is_float = is_float_ehir_type(fallback_type)
+    let operand_type = required_variable_type(lhs_var)
+    let lhs = lower_variable(lhs_var)
+    let rhs = lower_variable(rhs_var)
+    let is_float = is_float_ehir_type(operand_type)
 
     match op {
         ADD => {
-            if fallback_type.name == "str" {
-                ret llvm_inst_call(Option[LLVMValue]::Some(out), lower_type(fallback_type), "encore_str_concat", concat_values(vec_singleton(lhs), vec_singleton(rhs)))
+            if operand_type.name == "str" {
+                ret llvm_inst_call(Option[LLVMValue]::Some(out), lower_type(operand_type), "encore_str_concat", concat_values(vec_singleton(lhs), vec_singleton(rhs)))
             }
             if is_float {
                 ret llvm_inst_binary("fadd", out, lhs, rhs)
@@ -5921,7 +6026,7 @@ fn lower_binary(out_var: frozen Variable, lhs_var: frozen Variable,
         DIV => {
             ret llvm_inst_binary(if is_float {
                     "fdiv"
-                } elif is_signed_ehir_type(fallback_type) {
+                } elif is_signed_ehir_type(operand_type) {
                     "sdiv"
                 } else {
                     "udiv"
@@ -5931,7 +6036,7 @@ fn lower_binary(out_var: frozen Variable, lhs_var: frozen Variable,
         MOD => {
             ret llvm_inst_binary(if is_float {
                     "frem"
-                } elif is_signed_ehir_type(fallback_type) {
+                } elif is_signed_ehir_type(operand_type) {
                     "srem"
                 } else {
                     "urem"
@@ -5942,7 +6047,7 @@ fn lower_binary(out_var: frozen Variable, lhs_var: frozen Variable,
             ret llvm_inst_binary("shl", out, lhs, rhs)
         }
         SHR => {
-            ret llvm_inst_binary(if is_signed_ehir_type(fallback_type) {
+            ret llvm_inst_binary(if is_signed_ehir_type(operand_type) {
                     "ashr"
                 } else {
                     "lshr"
@@ -5977,7 +6082,7 @@ fn lower_binary(out_var: frozen Variable, lhs_var: frozen Variable,
         LES => {
             ret llvm_inst_binary(if is_float {
                     "fcmp olt"
-                } elif is_signed_ehir_type(fallback_type) {
+                } elif is_signed_ehir_type(operand_type) {
                     "icmp slt"
                 } else {
                     "icmp ult"
@@ -5987,7 +6092,7 @@ fn lower_binary(out_var: frozen Variable, lhs_var: frozen Variable,
         LEQ => {
             ret llvm_inst_binary(if is_float {
                     "fcmp ole"
-                } elif is_signed_ehir_type(fallback_type) {
+                } elif is_signed_ehir_type(operand_type) {
                     "icmp sle"
                 } else {
                     "icmp ule"
@@ -5997,7 +6102,7 @@ fn lower_binary(out_var: frozen Variable, lhs_var: frozen Variable,
         GRT => {
             ret llvm_inst_binary(if is_float {
                     "fcmp ogt"
-                } elif is_signed_ehir_type(fallback_type) {
+                } elif is_signed_ehir_type(operand_type) {
                     "icmp sgt"
                 } else {
                     "icmp ugt"
@@ -6007,7 +6112,7 @@ fn lower_binary(out_var: frozen Variable, lhs_var: frozen Variable,
         GEQ => {
             ret llvm_inst_binary(if is_float {
                     "fcmp oge"
-                } elif is_signed_ehir_type(fallback_type) {
+                } elif is_signed_ehir_type(operand_type) {
                     "icmp sge"
                 } else {
                     "icmp uge"
@@ -6019,39 +6124,6 @@ fn lower_binary(out_var: frozen Variable, lhs_var: frozen Variable,
 
 fn is_float_ehir_type(typ: frozen Type) -> bool {
     ret typ.representation == RepresentationKind::Inline &&(typ.name == "f16" || typ.name == "f32" || typ.name == "f64")
-}
-
-fn binary_operand_type(lhs: frozen Variable, rhs: frozen Variable,
-    out: frozen Variable,) -> Type {
-    match lhs.typ {
-        Option[Type]::Some(typ) => {
-            ret clone_type(typ)
-        }
-        Option[Type]::None => {
-        }
-    }
-    match rhs.typ {
-        Option[Type]::Some(typ) => {
-            ret clone_type(typ)
-        }
-        Option[Type]::None => {
-        }
-    }
-    ret required_variable_type(out)
-}
-
-fn lower_binary_operand(value: frozen Variable, fallback: frozen Type) -> LLVMValue {
-    match value.typ {
-        Option[Type]::Some(_) => {
-            ret lower_variable(value)
-        }
-        Option[Type]::None => {
-            if is_variant_symbol(value.name) {
-                ret const_text(enum_variant_tag(value.name), lower_type(fallback))
-            }
-        }
-    }
-    ret lower_variable_with_fallback(value, fallback)
 }
 
 fn lower_phi_values(pairs: Vec[PhiPair]) -> Vec[LLVMValue] {
@@ -6086,11 +6158,7 @@ fn lower_terminator(terminator: Terminator) -> LLVMTerminator {
             let cond_var: Variable = cbr_data.cond
             let true_label_raw: str = cbr_data.true_label
             let false_label_raw: str = cbr_data.false_label
-            let cond: LLVMValue = lower_variable_with_fallback(cond_var, Type {
-                    "bool", Vec[Type]::new(), RepresentationKind::Inline
-                }
-                ,
-            )
+            let cond: LLVMValue = lower_variable(cond_var)
             let true_label: str = block_symbol(true_label_raw)
             let false_label: str = block_symbol(false_label_raw)
             ret llvm_term_cbr(cond, true_label, false_label)
@@ -6124,6 +6192,9 @@ fn lower_variables(variables: frozen Vec[Variable]) -> Vec[LLVMValue] {
 }
 
 fn lower_variable(var_data: frozen Variable) -> LLVMValue {
+    if var_data.kind == ValueKind::EnumTag {
+        ret const_i32(enum_variant_tag(enum_variant_symbol_name(var_data.name)))
+    }
     let var_name = var_data.name
     let var_type = required_variable_type(var_data)
     let name = sanitize_symbol(var_name)
@@ -6131,30 +6202,8 @@ fn lower_variable(var_data: frozen Variable) -> LLVMValue {
     ret reg(name, typ)
 }
 
-fn lower_variable_with_fallback(var_data: frozen Variable, fallback: frozen Type) -> LLVMValue {
-    match var_data.typ {
-        Option[Type]::Some(_) => {
-            ret lower_variable(var_data)
-        }
-        Option[Type]::None => {
-            ret reg(sanitize_symbol(var_data.name), lower_type(fallback))
-        }
-    }
-    ret reg("_", lower_type(fallback))
-}
-
 fn required_variable_type(value: frozen Variable) -> Type {
-    match value.typ {
-        Option[Type]::Some(typ) => {
-            ret clone_type(typ)
-        }
-        Option[Type]::None => {
-            backend_invariant_error("LLVM lowering requires a type for variable '" + value.name + "'")
-        }
-    }
-    ret Type {
-        "void", Vec[Type]::new(), RepresentationKind::Inline
-    }
+    ret clone_type(value.typ)
 }
 
 fn required_generic_type(value: frozen Type, index: usize) -> Type {
@@ -6494,9 +6543,7 @@ fn is_variant_symbol(value: str) -> bool {
 }
 
 fn is_enum_tag_operand(value: frozen Variable) -> bool {
-    // Defined operands have a concrete type even when their identifier starts
-    // with a capital letter. Only unresolved variant literals denote tags.
-    ret value.typ.is_none() && is_variant_symbol(value.name)
+    ret value.kind == ValueKind::EnumTag
 }
 
 fn enum_variant_symbol_name(value: str) -> str {
@@ -6642,7 +6689,7 @@ fn is_unit_value_type(typ: frozen Type) -> bool {
 
 fn lower_function_address(data: frozen CallInstruction) -> Vec[LLVMInstruction] {
     if data.generics.len() == 0 || data.args.len() != 0 {
-        eprintln("invalid EHIR function address") exit(1_i32)
+        backend_invariant_error("invalid EHIR function address")
     }
     let result = match data.generics.get(0) {
         Some(value) => lower_type(value) None => void_type()

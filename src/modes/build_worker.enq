@@ -16,10 +16,12 @@ import json::{Json, parse, stringify}
 
 import mod::build_archive::{UnitNativePlan, emit_budgeted_package_archive}
 import mod::build_artifacts::{UnitReady, publish_unit_complete, publish_unit_ready, read_unit_ready}
-import mod::build_metadata::RefrainMetadata
+import mod::build_cache::restore_unit_cache_directory
+import mod::build_fingerprint::unit_fingerprint
+import mod::build_metadata::{MetadataDependency, RefrainMetadata}
 import mod::build_prepared_cache::publish_prepared_unit
-import mod::build_request::BuildUnitRequest
-import mod::build_unit::{package_backend_fingerprint, package_owned_checkpoint, prepare_package_worker}
+import mod::build_request::{BuildUnitRequest, graph_package}
+import mod::build_unit::{package_backend_fingerprint, package_owned_checkpoint, prepare_package_worker_with_server}
 import refrain::cache_identity::compiler_content_digest
 import refrain::target::parse_target
 
@@ -117,10 +119,56 @@ fn execute_package(request_path: str, native_path: str, server: usize) -> Result
     // One admitted CPU lease covers preparation, LLVM and the serial Clang/ar
     // children. Their parent sleeps, instead of spending a second CPU token.
     let started = perf_counter_ms()
+    match request.cache {
+        Some(root) => {
+            let mut all = Vec[MetadataDependency]::new()
+            let mut direct = Vec[MetadataDependency]::new()
+            let owner = graph_package(request.graph, request.context.unit)?
+            for input in request.inputs {
+                let ready = UnitReady::decode(read_file(input.directory.join("unit.ready").as_str()), input.context)?
+                if ready.metadata_digest != input.metadata_digest || ready.template_digest != input.template_digest {
+                    ret Result[bool, str]::Err("package dependency handoff mismatch")
+                }
+                let dependency = MetadataDependency {
+                    input.context.unit, ready.interface_digest, ready.template_digest
+                }
+                all.push(dependency)
+                for name in owner.dependency_names {
+                    if name == dependency.unit {
+                        direct.push(dependency)
+                    }
+                }
+            }
+            let key = unit_fingerprint(request.context, all, native_digest)?.native
+            match restore_unit_cache_directory(root.join(key), request.context, direct, native_digest, request.output)? {
+                Some(restored) => {
+                    let ready = restored.ready
+                    let mut phases = Vec[(str, Json)]::new()
+                    phases.push(("cache_restore_ms", Json::Number(Debug::fmt(perf_counter_ms() - started))))
+                    phases.push(("cache_validate_ms", Json::Number(Debug::fmt(restored.validation_ms))))
+                    phases.push(("cache_archive_read_ms", Json::Number(Debug::fmt(restored.archive_ms))))
+                    phases.push(("cache_copy_ms", Json::Number(Debug::fmt(restored.copy_ms))))
+                    if write_file(request.output.join("phases.json").as_str(), stringify(Json::Object(phases))) != 0 {
+                        ret Result[bool, str]::Err("cannot record cache restore phases")
+                    }
+                    // The parent retains the CAS lock and validates this exact
+                    // private copy before admitting any dependent metadata.
+                    if write_file(request.output.join("unit.cache-hit").as_str(), compiler_content_digest(ready.encode()?)) != 0 {
+                        ret Result[bool, str]::Err("cannot publish package cache handoff")
+                    }
+                    ret Result[bool, str]::Ok(true)
+                }
+                None => {
+                }
+            }
+        }
+        None => {
+        }
+    }
     let backend_hit = file_exists(request.output.join("unit.backend").as_str())
     let frontend_hit = backend_hit || file_exists(request.output.join("unit.frontend").as_str())
     let detailed_timings = process_arg(6).unwrap_or("") == "--timings"
-    let worker = prepare_package_worker(request, 1, detailed_timings)?
+    let worker = prepare_package_worker_with_server(request, 1, detailed_timings, server)?
     let publication_started = perf_counter_ms()
     let metadata = RefrainMetadata::decode(worker.metadata_text, request.context, worker.metadata_dependencies)?
     let prospective = UnitReady {
@@ -158,7 +206,17 @@ fn execute_package(request_path: str, native_path: str, server: usize) -> Result
         Err(_) => Json::Null
     }
     timings.push(("objects_reused", object_counts.get("reused").unwrap_or(Json::Number("0"))))
+    timings.push(("ir_generated", object_counts.get("ir_generated").unwrap_or(Json::Number("0"))))
+    timings.push(("ir_skipped", object_counts.get("ir_skipped").unwrap_or(Json::Number("0"))))
+    for name in vec!["ir_jobs", "object_probe_ms", "ir_emit_ms"] {
+        timings.push((name, object_counts.get(name).unwrap_or(Json::Number("0"))))
+    }
     timings.push(("objects_compiled", object_counts.get("compiled").unwrap_or(Json::Number("0"))))
+    let semantic_counts = parse(read_file((request.output / "semantic.json").as_str())).unwrap_or(Json::Null)
+    for name in vec!["bodies_checked", "bodies_reused", "effects_checked", "effects_reused", "environments_reused", "module_checks_reused", "semantic_jobs", "semantic_prepare_ms", "semantic_bodies_ms", "semantic_publish_ms", "semantic_cache_read_ms", "semantic_context_ms", "semantic_replay_ms", "semantic_environment_ms", "semantic_input_ms", "semantic_index_write_ms"] {
+        timings.push((name, semantic_counts.get(name).unwrap_or(Json::Number("0"))))
+    }
+    timings.push(("semantic_index_reused", semantic_counts.get("semantic_index_reused").unwrap_or(Json::Bool(false))))
     let lowering_counts = match parse(read_file(request.output.join("lowering.json").as_str())) {
         Ok(value) => value
         Err(_) => Json::Null
@@ -172,6 +230,9 @@ fn execute_package(request_path: str, native_path: str, server: usize) -> Result
     }
     timings.push(("frontend_ms", preparation.get("frontend_ms").unwrap_or(Json::Number("0"))))
     timings.push(("backend_prepare_ms", preparation.get("backend_prepare_ms").unwrap_or(Json::Number("0"))))
+    for name in vec!["prepared_functions_checked", "prepared_functions_reused", "prepared_modules_fallback"] {
+        timings.push((name, preparation.get(name).unwrap_or(Json::Number("0"))))
+    }
     if detailed_timings {
         timings.push(("cache_publish_ms", Json::Number(Debug::fmt(publication_ms))))
         for name in vec!["dependency_metadata_ms", "workspace_load_ms", "semantic_check_ms", "safety_effects_ms", "lowering_context_ms", "lowering_cache_read_ms", "lowering_translate_ms", "lowering_cache_write_ms", "ehir_parse_ms", "frontend_checkpoint_ms", "backend_normalize_ms"] {

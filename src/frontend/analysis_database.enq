@@ -1,22 +1,31 @@
 //! Maintains typed incremental analysis state for Encore modules.
-
+import refrain::frontend::semantic_rebind::rebind_semantic_type
 import core::fmt::Debug
 import core::option::Option
 
 import std::dict::Hashable
+import std::time::perf_counter_ms
 import std::vec::Vec
 
+import json::{Json, stringify}
+
+import refrain::cache_identity::compiler_content_digest
 import refrain::frontend::analysis::{DiagnosticLabelKind, FrontendDiagnostic, FrontendDocument, FrontendSymbol, analyze_named_editor_module_with_project, analyze_named_module_with_project, analyze_named_tokens_with_project}
+import refrain::frontend::declaration_cache::{DeclarationPreparationCache, MethodDeclarationGroup}
 import refrain::frontend::dependency_graph::DependencyGraph
 import refrain::frontend::hir::{DefinitionId, DefinitionKind, DefinitionNamespace, HirDefinition, ModuleDefMap, TypeId, definition_id}
 import refrain::frontend::import_paths
 import refrain::frontend::lexer::{Lexer, Token, TokenType}
+import refrain::frontend::metadata_ast::{encode_codegen_context_ast, encode_lowered_function_input}
 import refrain::frontend::parser::{FunctionItem, GenericParam, Statement}
 import refrain::frontend::project_constants::ProjectConstants
-import refrain::frontend::safety::{FunctionSafety, SafetyFunction, infer_safety_with_known, safety_dependencies}
-import refrain::frontend::semantic::{ScopedSemanticBinding, SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticDependencyKind, SemanticField, SemanticMember, SemanticMethod, SemanticVariant, append_bound_methods, check_function_body, check_function_body_with_scope, check_function_body_with_type_scope, check_function_body_with_types, check_function_body_with_variants, check_module_bodies, check_module_bodies_with_type_scope, check_module_bodies_with_types, check_module_bodies_with_variants, check_module_declarations, prepare_module_bodies_with_variants, semantic_accessible_methods, semantic_associated_members, semantic_call_return_type, semantic_members, semantic_named_members, semantic_same_owner, specialize_method_type_with_self}
+import refrain::frontend::safety::{FunctionSafety, SafetyFunction, SafetyReplayResult, infer_safety_with_known, infer_safety_with_replay, safety_dependencies}
+import refrain::frontend::semantic::{ScopedSemanticBinding, SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticDependencyKind, SemanticField, SemanticMember, SemanticMethod, SemanticVariant, append_bound_methods, append_bound_methods_view, check_function_body, check_function_body_with_scope, check_function_body_with_type_scope, check_function_body_with_types, check_function_body_with_variants, check_module_bodies, check_module_bodies_with_type_scope, check_module_bodies_with_types, check_module_bodies_with_variants, check_module_bodies_with_variants_view, check_module_declarations, prepare_module_bodies_with_replay, prepare_module_bodies_with_replay_view, prepare_module_bodies_with_variants, semantic_accessible_methods, semantic_associated_members, semantic_call_return_type, semantic_checkpoint_dependencies, semantic_members, semantic_named_members, semantic_same_owner, specialize_method_type_with_self}
+import refrain::frontend::semantic_environment::{StoredSemanticEnvironment, decode_semantic_environment, encode_semantic_environment}
+import refrain::frontend::semantic_index::{ModuleSemanticView, PackageSemanticIndex, SemanticIndexBuilder}
+import refrain::frontend::semantic_slice::{SemanticKeyIndex, SemanticSlice}
 import refrain::frontend::syntax::SyntaxDocument
-import refrain::frontend::type_scope::{TypeNameBinding, display_type, names_in_scope, scope_type}
+import refrain::frontend::type_scope::{TypeNameBinding, TypeScopeIndex, display_type, display_type_view, names_in_scope, scope_type, scope_type_indexed, type_scope_index}
 import refrain::target::{TargetSpec, cfg_active_with_features, host_target}
 
 /// Checked facts live only until this package's safety inference completes.
@@ -24,6 +33,11 @@ import refrain::target::{TargetSpec, cfg_active_with_features, host_target}
 pub struct PreparedModuleSafety {
     diagnostics: Vec[FrontendDiagnostic]
     functions: Vec[SafetyFunction]
+    replay: Json
+    checked: usize
+    reused: usize
+    environment_reused: bool
+    module_checks_reused: bool
 }
 
 fn safety_site_key(module_name: str, line: usize, column: usize) -> str {
@@ -143,6 +157,12 @@ struct ScopedEnvironmentCache {
     variants: Vec[SemanticVariant]
 }
 
+struct ScopedEnvironmentReplay {
+    value: ScopedEnvironmentCache
+    record: Json
+    reused: bool
+}
+
 // Graph queries must not iterate AnalysisSource: copying an entry also retains
 // and releases its complete AST. Keep only the facts needed by reachability.
 struct SemanticModuleGraph {
@@ -160,7 +180,41 @@ struct SemanticReachabilityCache {
 
 /// Caches analysis queries and invalidates dependants only when a module's
 /// declaration interface changes.
+pub struct SemanticPreparationTimings {
+    context_ms: u64
+    replay_ms: u64
+    environment_ms: u64
+    input_ms: u64
+    environment_names_ms: u64
+    environment_callables_ms: u64
+    environment_fields_ms: u64
+    environment_methods_ms: u64
+    environment_variants_ms: u64
+    environment_constructors_ms: u64
+    environment_statics_ms: u64
+    environment_index_ms: u64
+    environment_type_index_ms: u64
+    environment_callable_scope_ms: u64
+    callable_defmap_ms: u64
+    callable_collect_ms: u64
+    callable_bind_ms: u64
+    callable_qualified_ms: u64
+    method_collect_ms: u64
+    method_visibility_ms: u64
+    method_inheritance_ms: u64
+    method_scope_ms: u64
+    environment_context_ms: u64
+    environment_scopes_ms: u64
+    environment_lookup_ms: u64
+    environment_store_ms: u64
+    environment_finish_ms: u64
+    environment_release_ms: u64
+    constructors_aggregate_ms: u64
+    constructors_lookup_ms: u64
+}
+
 pub struct AnalysisDatabase {
+    declaration_preparation: DeclarationPreparationCache
     sources: Vec[AnalysisSource]
     semantic_bodies: Vec[SemanticBodyCache]
     def_maps: Vec[DefMapCache]
@@ -169,6 +223,11 @@ pub struct AnalysisDatabase {
     field_environments: Vec[FieldEnvironmentCache]
     method_environments: Vec[MethodEnvironmentCache]
     nominal_types: Vec[TypeId]
+    nominal_type_positions: SemanticKeyIndex
+    nominal_types_indexed: usize
+    namespace_resolutions: Vec[str]
+    namespace_resolution_index: SemanticKeyIndex
+    namespace_resolution_revision: usize
     type_scopes: Vec[TypeScopeCache]
     scoped_environments: Vec[ScopedEnvironmentCache]
     safety_revision: usize
@@ -177,8 +236,22 @@ pub struct AnalysisDatabase {
     metadata_safety_effects: Vec[FunctionSafety]
     semantic_graph_revision: usize
     semantic_graph: Vec[SemanticModuleGraph]
+    semantic_graph_index: SemanticKeyIndex
+    semantic_edges: Vec[Vec[usize]]
     semantic_reachability: Vec[SemanticReachabilityCache]
     module_projects: Vec[(str, ProjectConstants)]
+    replay_contracts: Vec[(str, usize, str)]
+    replay_contract_index: SemanticKeyIndex
+    replay_contexts: Vec[(str, str)]
+    replay_context_index: SemanticKeyIndex
+    replay_cache_revision: usize
+    replay_guards: Vec[(str, str)]
+    replay_guard_index: SemanticKeyIndex
+    canonical_types: Vec[str]
+    preparation_timings: SemanticPreparationTimings
+    package_semantics: PackageSemanticIndex
+    package_semantics_revision: usize
+    package_semantics_reused: bool
 }
 
 /// Associates a stable identity and declaring module with a frontend symbol.
@@ -187,6 +260,17 @@ pub struct AnalysisSymbol {
     module_id: ModuleId
     module_name: str
     symbol: FrontendSymbol
+}
+
+/// Immutable syntax values from the already completed source query. These
+/// contain no parser cursor, database entry or mutable analysis cache handle.
+pub struct PreparedSemanticSyntax {
+    ast: Vec[Statement]
+    tokens: Vec[Token]
+    symbols: Vec[FrontendSymbol]
+}
+fn prepared_semantic_syntax(document: FrontendDocument) -> PreparedSemanticSyntax {
+    ret PreparedSemanticSyntax { document.ast, document.tokens, document.symbols }
 }
 
 /// Immutable, thread-safe input for checking one module outside the mutable
@@ -198,13 +282,87 @@ pub struct PreparedSemanticModule {
     project: ProjectConstants
     target: TargetSpec
     features: Vec[str]
-    callables: Vec[SemanticCallable]
-    fields: Vec[SemanticField]
-    methods: Vec[SemanticMethod]
+    callables: SemanticSlice[SemanticCallable]
+    fields: SemanticSlice[SemanticField]
+    methods: SemanticSlice[SemanticMethod]
     resolution_diagnostics: Vec[FrontendDiagnostic]
     aggregate_names: Vec[str]
-    type_names: Vec[TypeNameBinding]
-    variants: Vec[SemanticVariant]
+    type_names: SemanticSlice[TypeNameBinding]
+    variants: SemanticSlice[SemanticVariant]
+    syntax: PreparedSemanticSyntax
+}
+
+/// Immutable syntax facts and shared declaration views. No parser state or
+/// mutable database is sent to a worker. Sending freezes the retained values;
+/// the owner waits for all workers before publishing or changing its queries.
+pub struct PreparedSafetyModule {
+    semantic: PreparedSemanticModule
+    constructors: Vec[str]
+    previous: Json
+    context: str
+    enabled: bool
+    guards: Json
+    environment: Json
+    environment_hit: bool
+    skip_module_checks: bool
+}
+
+fn accepted_semantic_guards(previous: Json, bodies: Json) -> Json {
+    let old = previous.get("guards").unwrap_or(Json::Null)
+    let mut guards = Vec[(str, Json)]::new()
+    for entry in bodies.as_object().unwrap_or(Vec[(str, Json)]::new()) {
+        match old.get(entry.0) {
+            Some(guard) => {
+                guards.push((entry.0, guard))
+            }
+            None => {
+            }
+        }
+    }
+    ret Json::Object(guards)
+}
+
+pub fn check_prepared_safety_module(prepared: sending PreparedSafetyModule) -> sending PreparedModuleSafety {
+    let input = prepared.semantic
+    let syntax = input.syntax
+    let mut diagnostics = if prepared.skip_module_checks {
+        Vec[FrontendDiagnostic]::new()
+    } else {
+        check_module_declarations(syntax.ast, input.target, input.features)
+    }
+    diagnostics.extend(input.resolution_diagnostics)
+    let checked = prepare_module_bodies_with_replay_view(syntax.ast, input.callables, input.fields, input.methods,
+        input.aggregate_names, input.module_name, input.type_names, input.variants, prepared.previous,
+        if prepared.enabled {
+            input.source
+        } else {
+            ""
+        }
+        ,)
+    diagnostics.extend(checked.diagnostics)
+    let mut functions = Vec[SafetyFunction]::new()
+    for entry in checked.functions {
+        let mut active = true
+        for attr in entry.item.attrs {
+            if starts_with(attr, "cfg:") && !cfg_active_with_features(input.target, attr.slice(4_usize, attr.len() - 4_usize), input.features) {
+                active = false break
+            }
+        }
+        if active {
+            let site = semantic_function_position(syntax.tokens, syntax.symbols, entry.item)
+            functions.push(SafetyFunction {
+                    input.module_name, entry.owner, entry.item, entry.body, input.callables,
+                    append_bound_methods_view(input.methods, entry.body.bound_methods), site.0, site.1, prepared.constructors
+                }
+            )
+        }
+    }
+    let valid = diagnostics.is_empty()
+    ret PreparedModuleSafety {
+        diagnostics, functions,
+        Json::Object(vec![("context", Json::String(prepared.context)),("bodies", checked.replay),("guards", prepared.guards),
+                ("environment", prepared.environment),("valid", Json::Bool(valid))]), checked.checked, checked.reused, prepared.environment_hit, prepared.skip_module_checks
+    }
 }
 
 /// Immutable module input used to assemble an isolated semantic workspace.
@@ -338,10 +496,10 @@ impl for PreparedLightweightModule {
 
 /// Checks one prepared module without reading or mutating an analysis database.
 pub fn check_prepared_semantic_module(prepared: PreparedSemanticModule) -> Vec[FrontendDiagnostic] {
-    let document = analyze_named_module_with_project(prepared.module_name, prepared.source_name, prepared.source, prepared.project)
-    let mut diagnostics = check_module_declarations(document.ast, prepared.target, prepared.features)
+    let syntax = prepared.syntax
+    let mut diagnostics = check_module_declarations(syntax.ast, prepared.target, prepared.features)
     diagnostics.extend(prepared.resolution_diagnostics)
-    diagnostics.extend(check_module_bodies_with_variants(document.ast, prepared.callables, prepared.fields,
+    diagnostics.extend(check_module_bodies_with_variants_view(syntax.ast, prepared.callables, prepared.fields,
             prepared.methods, prepared.aggregate_names, prepared.module_name, prepared.type_names, prepared.variants,))
     ret diagnostics
 }
@@ -398,12 +556,24 @@ impl for AnalysisDatabase {
     /// Creates an empty analysis database at revision zero.
     pub fn new() -> Self {
         ret Self {
+            DeclarationPreparationCache::new(false),
             Vec[AnalysisSource]::new(), Vec[SemanticBodyCache]::new(), Vec[DefMapCache]::new(), 0_usize,
             Vec[ModuleImportResolution]::new(), Vec[FieldEnvironmentCache]::new(), Vec[MethodEnvironmentCache]::new(),
-            Vec[TypeId]::new(), Vec[TypeScopeCache]::new(), Vec[ScopedEnvironmentCache]::new(),
+            Vec[TypeId]::new(), SemanticKeyIndex::new(0_usize), 0_usize,
+            Vec[str]::new(), SemanticKeyIndex::new(0_usize), 0_usize,
+            Vec[TypeScopeCache]::new(), Vec[ScopedEnvironmentCache]::new(),
             0_usize, Vec[FunctionSafety]::new(), Vec[SafetyConfiguration]::new(), Vec[FunctionSafety]::new(),
-            0_usize, Vec[SemanticModuleGraph]::new(), Vec[SemanticReachabilityCache]::new(),
-            Vec[(str, ProjectConstants)]::new()
+            0_usize, Vec[SemanticModuleGraph]::new(), SemanticKeyIndex::new(0_usize), Vec[Vec[usize]]::new(), Vec[SemanticReachabilityCache]::new(),
+            Vec[(str, ProjectConstants)]::new(), Vec[(str, usize, str)]::new(), SemanticKeyIndex::new(0_usize),
+            Vec[(str, str)]::new(), SemanticKeyIndex::new(0_usize), 0_usize, Vec[(str, str)]::new(), SemanticKeyIndex::new(0_usize), Vec[str]::new(),
+            SemanticPreparationTimings {
+                0_u64, 0_u64, 0_u64, 0_u64,
+                0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64,
+                0_u64, 0_u64,
+                0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64,
+                0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64
+            }
+            , PackageSemanticIndex::empty(), 0_usize, false
         }
     }
 
@@ -606,7 +776,7 @@ impl for AnalysisDatabase {
         let body = self.check_scoped_body(indexed, item, document, environment.callables, environment.fields, environment.methods)
         ret Option[SafetyFunction]::Some(SafetyFunction {
                 name, safety_owner(document.ast, item), item, body,
-                environment.callables, append_bound_methods(environment.methods, body.bound_methods), indexed.symbol.line, indexed.symbol.column, environment.constructors
+                SemanticSlice::from_vec(environment.callables), append_bound_methods_view(SemanticSlice::from_vec(environment.methods), body.bound_methods), indexed.symbol.line, indexed.symbol.column, environment.constructors
             }
             ,)
     }
@@ -619,6 +789,29 @@ impl for AnalysisDatabase {
     /// Reuses this worker's semantic results without crossing revision or
     /// process boundaries. Missing/metadata-only declarations use the usual path.
     pub fn function_safety_effects_with_prechecked(self: mut Self, checked: Vec[SafetyFunction]) -> Vec[FunctionSafety] {
+        let functions = self.prechecked_safety_functions(checked)
+        self.safety_effects = infer_safety_with_known(functions, self.metadata_safety_effects)
+        self.safety_revision = self.revision
+        ret self.safety_effects
+    }
+
+    pub fn function_safety_effects_with_replay(self: mut Self, checked: Vec[SafetyFunction], previous: Json) -> SafetyReplayResult {
+        let functions = self.prechecked_safety_functions(checked)
+        let mut names = Vec[str]::new()
+        let mut contexts = Vec[(str, str)]::new()
+        for function in functions {
+            if !contains_string(names, function.module_name) {
+                names.push(function.module_name)
+                contexts.push((function.module_name, self.semantic_replay_context(function.module_name)))
+            }
+        }
+        let result = infer_safety_with_replay(functions, self.metadata_safety_effects, contexts, previous)
+        self.safety_effects = result.effects
+        self.safety_revision = self.revision
+        ret result
+    }
+
+    fn prechecked_safety_functions(self: mut Self, checked: Vec[SafetyFunction]) -> Vec[SafetyFunction] {
         let index = unsafe {
             encore_strmap_new()
         }
@@ -666,12 +859,7 @@ impl for AnalysisDatabase {
         unsafe {
             encore_strmap_free(index)
         }
-        // Compile-time callers need the complete graph, not a separate lazy
-        // dependency-discovery walk for each root. Installed metadata remains
-        // an immutable boundary and recursive effects still reach a fixed point.
-        self.safety_effects = infer_safety_with_known(functions, self.metadata_safety_effects)
-        self.safety_revision = self.revision
-        ret self.safety_effects
+        ret functions
     }
 
     /// Copies immutable source inputs for an isolated worker-side semantic check.
@@ -960,6 +1148,12 @@ impl for AnalysisDatabase {
     }
 
     fn reset_safety_effects(self: mut Self) ->() {
+        self.package_semantics_revision = 0_usize
+        self.replay_cache_revision = 0_usize
+        self.replay_contracts = Vec[(str, usize, str)]::new()
+        self.replay_contract_index = SemanticKeyIndex::new(0_usize)
+        self.replay_contexts = Vec[(str, str)]::new()
+        self.replay_context_index = SemanticKeyIndex::new(0_usize)
         self.safety_effects = Vec[FunctionSafety]::new()
         self.safety_effects.extend(self.metadata_safety_effects)
     }
@@ -1017,51 +1211,65 @@ impl for AnalysisDatabase {
         ret()
     }
 
+    fn source_position(self: Self, module_name: str) -> usize {
+        if self.semantic_graph_revision == self.revision && self.semantic_graph.len() == self.sources.len() {
+            let position = self.semantic_graph_index.get(module_name)
+            ret if position == 0_usize {
+                self.sources.len()
+            } else {
+                position - 1_usize
+            }
+        }
+        for position in 0_usize..self.sources.len() {
+            if self.sources.get_unchecked_borrowed(position).module_name == module_name {
+                ret position
+            }
+        }
+        ret self.sources.len()
+    }
+
     /// Returns a fully parsed document, computing only this query when dirty.
     pub fn document(self: mut Self, module_name: str) -> Option[FrontendDocument] {
-        let mut index = 0_usize
-        while index < self.sources.len() {
-            match self.sources.get(index) {
-                Option[AnalysisSource]::Some(entry) => {
-                    if entry.module_name == module_name {
-                        if !entry.full_dirty {
-                            ret Option[FrontendDocument]::Some(entry.full)
-                        }
-                        // Worker validation already constructed this AST. Persistent
-                        // declaration caches and structurally incomplete input may
-                        // have no AST, so those still need the recovering query.
-                        let document = if entry.lightweight.ast.len() > 0_usize {
-                            entry.lightweight
-                        } else {
-                            analyze_named_tokens_with_project(entry.module_name, entry.source_name, entry.lightweight.tokens, self.project_constants(entry.module_name))
-                        }
-                        self.sources.set(index, AnalysisSource {
-                                entry.id,
-                                entry.module_name,
-                                entry.source_name,
-                                entry.source,
-                                entry.source_fingerprint,
-                                entry.interface_fingerprint,
-                                entry.interface_revision,
-                                entry.lightweight,
-                                document,
-                                false,
-                                self.revision,
-                                entry.lightweight_count,
-                                entry.parse_count + 1_usize,
-                                entry.syntax,
-                                entry.syntax_dirty,
-                                entry.syntax_count,
-                                entry.source_revision
-                            }
-                            ,)
-                        ret Option[FrontendDocument]::Some(document)
+        let index = self.source_position(module_name)
+        match self.sources.get(index) {
+            Option[AnalysisSource]::Some(entry) => {
+                if entry.module_name == module_name {
+                    if !entry.full_dirty {
+                        ret Option[FrontendDocument]::Some(entry.full)
                     }
-                }
-                Option[AnalysisSource]::None => {
+                    // Worker validation already constructed this AST. Persistent
+                    // declaration caches and structurally incomplete input may
+                    // have no AST, so those still need the recovering query.
+                    let document = if entry.lightweight.ast.len() > 0_usize {
+                        entry.lightweight
+                    } else {
+                        analyze_named_tokens_with_project(entry.module_name, entry.source_name, entry.lightweight.tokens, self.project_constants(entry.module_name))
+                    }
+                    self.sources.set(index, AnalysisSource {
+                            entry.id,
+                            entry.module_name,
+                            entry.source_name,
+                            entry.source,
+                            entry.source_fingerprint,
+                            entry.interface_fingerprint,
+                            entry.interface_revision,
+                            entry.lightweight,
+                            document,
+                            false,
+                            self.revision,
+                            entry.lightweight_count,
+                            entry.parse_count + 1_usize,
+                            entry.syntax,
+                            entry.syntax_dirty,
+                            entry.syntax_count,
+                            entry.source_revision
+                        }
+                        ,)
+                    ret Option[FrontendDocument]::Some(document)
                 }
             }
-            index += 1_usize
+            Option[AnalysisSource]::None => {
+            }
         }
         ret Option[FrontendDocument]::None
     }
@@ -1078,7 +1286,9 @@ impl for AnalysisDatabase {
 
     /// Returns the exact source registered for a module.
     pub fn source_text(self: Self, module_name: str) -> Option[str] {
-        for entry in self.sources {
+        let position = self.source_position(module_name)
+        if position < self.sources.len() {
+            let entry = self.sources.get_unchecked_borrowed(position)
             if entry.module_name == module_name {
                 ret Option[str]::Some(entry.source)
             }
@@ -1252,15 +1462,9 @@ impl for AnalysisDatabase {
         let interface_fingerprint = self.module_interface_fingerprint_value(module_name)
         let mut cache_index = 0_usize
         while cache_index < self.def_maps.len() {
-            match self.def_maps.get(cache_index) {
-                Option[DefMapCache]::Some(cached) => {
-                    if cached.valid && cached.module_name == module_name && cached.interface_fingerprint == interface_fingerprint
-                    {
-                        ret Option[ModuleDefMap]::Some(cached.result)
-                    }
-                }
-                Option[DefMapCache]::None => {
-                }
+            let cached = self.def_maps.get_unchecked_borrowed(cache_index)
+            if cached.valid && cached.module_name == module_name && cached.interface_fingerprint == interface_fingerprint {
+                ret Option[ModuleDefMap]::Some(cached.result)
             }
             cache_index += 1_usize
         }
@@ -1540,19 +1744,17 @@ impl for AnalysisDatabase {
     }
 
     fn module_interface_fingerprint_value(self: Self, module_name: str) -> u64 {
-        for source in self.sources {
-            if source.module_name == module_name {
-                ret source.interface_fingerprint
-            }
+        let position = self.source_position(module_name)
+        if position < self.sources.len() {
+            ret self.sources.get_unchecked_borrowed(position).interface_fingerprint
         }
         ret 0_u64
     }
 
     fn module_source_name(self: Self, module_name: str) -> str {
-        for source in self.sources {
-            if source.module_name == module_name {
-                ret source.source_name
-            }
+        let position = self.source_position(module_name)
+        if position < self.sources.len() {
+            ret self.sources.get_unchecked_borrowed(position).source_name
         }
         ret ""
     }
@@ -1903,16 +2105,355 @@ impl for AnalysisDatabase {
     /// original order, including local trait-implementation validation.
     pub fn prepare_module_safety_for_target(self: mut Self, module_name: str, target: TargetSpec,
         features: Vec[str],) -> PreparedModuleSafety {
+        ret self.prepare_module_safety_with_replay(module_name, target, features, Json::Null, "")
+    }
+
+    /// Canonical source context, with ordinary bodies and positions omitted.
+    /// These records also guard candidate-set changes and inferred/template
+    /// bodies that cannot safely be represented by a callable signature alone.
+    fn semantic_replay_source_key(self: Self, module_name: str) -> Json {
+        let mut values = Vec[Json]::new()
+        for index in 0_usize..self.sources.len() {
+            let source = self.sources.get_unchecked_borrowed(index)
+            if source.module_name == module_name {
+                values.push(Json::String(source.source_name))
+                // Qualified callable selections depend on body lookup names,
+                // even when the reachable declaration modules are unchanged.
+                let mut bindings = Vec[Json]::new()
+                let mut seen = SemanticKeyIndex::new(16_usize)
+                for site in qualified_call_sites(source.lightweight.tokens) {
+                    if seen.get(site.0) == 0_usize {
+                        seen.set(site.0, bindings.len())
+                        bindings.push(Json::String(site.0))
+                    }
+                }
+                values.push(Json::Array(bindings))
+                break
+            }
+        }
+        for configuration in self.safety_configurations {
+            if configuration.module_name == module_name {
+                values.push(Json::String(configuration.key)) break
+            }
+        }
+        ret Json::Array(values)
+    }
+
+    pub fn semantic_replay_context(self: mut Self, module_name: str) -> str {
+        self.ensure_replay_contract_cache()
+        let context_label = "context\n" + module_name
+        let cached_context = self.replay_context_index.get(context_label)
+        if cached_context != 0_usize {
+            ret self.replay_contexts.get_unchecked_borrowed(cached_context - 1_usize).1
+        }
+        let mut records = Vec[Json]::new()
+        for visible in self.reachable_semantic_modules(module_name) {
+            let mut digest = ""
+            let label = "contract\n" + visible
+            let found = self.replay_contract_index.get(label)
+            if found != 0_usize {
+                digest = self.replay_contracts.get_unchecked_borrowed(found - 1_usize).2
+            }
+            if digest.is_empty() {
+                let document = self.document(visible).unwrap_or(FrontendDocument::empty())
+                let mut expansions = Vec[Json]::new()
+                for statement in document.ast {
+                    match statement {
+                        Statement::Function(item) => {
+                            for attr in item.attrs {
+                                if attr.contains("reflection") || attr.contains("static") {
+                                    expansions.push(encode_lowered_function_input(item, visible)) break
+                                }
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                digest = compiler_content_digest(stringify(encode_codegen_context_ast(document.ast)) + "\n" + stringify(Json::Array(expansions)) + "\n" +
+                    self.project_constants(visible).key() + "\n" + stringify(self.semantic_replay_source_key(visible)))
+                self.replay_contract_index.set(label, self.replay_contracts.len())
+                self.replay_contracts.push((label, self.revision, digest))
+            }
+            records.push(Json::Array(vec![Json::String(visible), Json::String(digest)]))
+        }
+        let context = compiler_content_digest(stringify(Json::Array(records)))
+        self.replay_context_index.set(context_label, self.replay_contexts.len())
+        self.replay_contexts.push((context_label, context))
+        ret context
+    }
+
+    fn ensure_replay_contract_cache(self: mut Self) ->() {
+        if self.replay_cache_revision != self.revision {
+            self.replay_contracts = Vec[(str, usize, str)]::new()
+            self.replay_contract_index = SemanticKeyIndex::new(self.sources.len() * 2_usize)
+            self.replay_contexts = Vec[(str, str)]::new()
+            self.replay_context_index = SemanticKeyIndex::new(self.sources.len())
+            self.replay_cache_revision = self.revision
+        }
+    }
+
+    /// Changes to layouts, traits, inferred/reflective bodies and namespace
+    /// reachability remain conservative barriers. Ordinary callable signatures
+    /// are checked by their recorded lookup family rather than this barrier.
+    fn semantic_replay_structure(self: mut Self, module_name: str) -> str {
+        self.ensure_replay_contract_cache()
+        let context_label = "structure\n" + module_name
+        let cached_context = self.replay_context_index.get(context_label)
+        if cached_context != 0_usize {
+            ret self.replay_contexts.get_unchecked_borrowed(cached_context - 1_usize).1
+        }
+        let mut records = Vec[Json]::new()
+        for visible in self.reachable_semantic_modules(module_name) {
+            let label = "structure\n" + visible
+            let mut digest = ""
+            let found = self.replay_contract_index.get(label)
+            if found != 0_usize {
+                digest = self.replay_contracts.get_unchecked_borrowed(found - 1_usize).2
+            }
+            if digest.is_empty() {
+                let document = self.document(visible).unwrap_or(FrontendDocument::empty())
+                let mut structural = Vec[Statement]::new()
+                let mut expansions = Vec[Json]::new()
+                for statement in document.ast {
+                    match statement {
+                        Statement::Function(item) => {
+                            let mut keep = !item.generics.is_empty() || item.is_async || item.ret_type.is_none() || !item.decorators.is_empty()
+                            for attr in item.attrs {
+                                if attr.contains("decorator") || attr.contains("reflection_template") || attr.contains("static") {
+                                    keep = true
+                                }
+                            }
+                            if keep {
+                                structural.push(statement) expansions.push(encode_lowered_function_input(item, visible))
+                            }
+                        }
+                        Statement::Import(_) => {
+                            structural.push(statement)
+                        }
+                        _ => {
+                            structural.push(statement)
+                        }
+                    }
+                }
+                digest = compiler_content_digest(stringify(encode_codegen_context_ast(structural)) + "\n" + stringify(Json::Array(expansions)) + "\n" + self.project_constants(visible).key() + "\n" + stringify(self.semantic_replay_source_key(visible)))
+                self.replay_contract_index.set(label, self.replay_contracts.len())
+                self.replay_contracts.push((label, self.revision, digest))
+            }
+            records.push(Json::Array(vec![Json::String(visible), Json::String(digest)]))
+        }
+        let context = compiler_content_digest(stringify(Json::Array(records)))
+        self.replay_context_index.set(context_label, self.replay_contexts.len())
+        self.replay_contexts.push((context_label, context))
+        ret context
+    }
+
+    fn semantic_guard_type(self: mut Self, typ: str) -> str {
+        let first = self.canonical_types.len()
+        let count = self.nominal_types.len()
+        for position in first..count {
+            let key = self.nominal_types.get_unchecked_borrowed(position).key()
+            self.canonical_types.push("nominal{" + Debug::fmt(key.byte_len()) + ":" + key + "}")
+        }
+        ret rebind_semantic_type(typ, self.canonical_types).unwrap_or(typ)
+    }
+
+    fn semantic_replay_dependency_guard(self: mut Self, dependencies: Vec[SemanticDependency], context: str) -> str {
+        if self.replay_guards.len() > 16384_usize {
+            self.replay_guards = Vec[(str, str)]::new()
+            self.replay_guard_index = SemanticKeyIndex::new(0_usize)
+        }
+        let mut records = Vec[Json]::new()
+        for dependency in dependencies {
+            let kind = match dependency.kind {
+                SemanticDependencyKind::Function => "function"
+                SemanticDependencyKind::FunctionBinding => "binding"
+                SemanticDependencyKind::Method => "method"
+                SemanticDependencyKind::Field => "field"
+                SemanticDependencyKind::TypeScope => "types"
+                SemanticDependencyKind::LookupScope => "lookup"
+            }
+            let key = Debug::fmt(self.revision) + "\n" + kind + "\n" + dependency.module_name + "\n" + dependency.name + "\n" + context
+            let mut digest = ""
+            let cached_guard = self.replay_guard_index.get(key)
+            if cached_guard != 0_usize {
+                digest = self.replay_guards.get_unchecked_borrowed(cached_guard - 1_usize).1
+            }
+            if digest.is_empty() {
+                let mut values = Vec[Json]::new()
+                if dependency.kind == SemanticDependencyKind::Function {
+                    for callable in self.semantic_declarations_view(dependency.module_name) {
+                        if callable.module_name == dependency.module_name && callable.declaration_name == dependency.name {
+                            values.push(Json::String(callable.declaration_name + "\n" + self.semantic_guard_type(callable.ret_type) + "\n" + Debug::fmt(callable.signature)))
+                            for param in callable.params {
+                                values.push(Json::String(self.semantic_guard_type(param)))
+                            }
+                            for generic in callable.generic_names {
+                                values.push(Json::String(generic))
+                            }
+                        }
+                    }
+                } elif dependency.kind == SemanticDependencyKind::FunctionBinding {
+                    // Alias binding identity and the complete overload family
+                    // are already resolved in this immutable environment.
+                    // Asking the definition map again for every binding makes
+                    // checkpoint publication quadratic in large source files.
+                    for callable in self.semantic_callables_view(dependency.module_name) {
+                        if callable.name == dependency.name && callable.lookup_module == dependency.module_name {
+                            values.push(Json::Array(vec![Json::String(callable.module_name), Json::String(callable.declaration_name),
+                                        Json::String(self.semantic_guard_type(callable.ret_type)), Json::String(Debug::fmt(callable.binding_identity)), Json::Bool(callable.is_static)]))
+                            for param in callable.params {
+                                values.push(Json::String(self.semantic_guard_type(param)))
+                            }
+                            for generic in callable.generic_names {
+                                values.push(Json::String(generic))
+                            }
+                        }
+                    }
+                } elif dependency.kind == SemanticDependencyKind::Method {
+                    for method in self.semantic_methods_view(dependency.module_name) {
+                        if method.module_name == dependency.module_name && method.declaration_receiver + "." + method.name == dependency.name {
+                            values.push(Json::String(self.semantic_guard_type(method.receiver_type) + "\n" + self.semantic_guard_type(method.ret_type) + "\n" + Debug::fmt(method.signature)))
+                            for param in method.params {
+                                values.push(Json::String(self.semantic_guard_type(param)))
+                            }
+                            for generic in method.generic_names {
+                                values.push(Json::String(generic))
+                            }
+                            for generic in method.method_generic_names {
+                                values.push(Json::String(generic))
+                            }
+                            values.push(Json::Bool(method.is_static)) values.push(Json::Bool(method.is_public))
+                        }
+                    }
+                } elif dependency.kind == SemanticDependencyKind::Field {
+                    for field in self.semantic_fields_view(dependency.module_name) {
+                        if field.module_name == dependency.module_name && field.declaration_owner + "." + field.name == dependency.name {
+                            values.push(Json::String(self.semantic_guard_type(field.owner_type) + "\n" + self.semantic_guard_type(field.typ) + "\n" + Debug::fmt(field.signature)))
+                        }
+                    }
+                } elif dependency.kind == SemanticDependencyKind::TypeScope {
+                    for name in self.semantic_names_view(dependency.module_name) {
+                        values.push(Json::String(name.scope + "\n" + name.name + "\n" + self.semantic_guard_type(name.identity) + "\n" + name.declaration))
+                    }
+                } else {
+                    values.push(Json::String(context))
+                }
+                if values.is_empty() {
+                    values.push(Json::String(context))
+                }
+                digest = compiler_content_digest(stringify(Json::Array(values)))
+                self.replay_guard_index.set(key, self.replay_guards.len())
+                self.replay_guards.push((key, digest))
+            }
+            records.push(Json::String(kind + "\n" + dependency.module_name + "\n" + dependency.name + "\n" + digest))
+        }
+        ret compiler_content_digest(stringify(Json::Array(records)))
+    }
+
+    fn validate_semantic_replay(self: mut Self, module_name: str, previous: Json, context: str) -> Json {
+        if previous.get("context").unwrap_or(Json::Null).as_str().unwrap_or("") == context {
+            ret previous.get("bodies").unwrap_or(Json::Null)
+        }
+        if previous.get("structure").unwrap_or(Json::Null).as_str().unwrap_or("") != self.semantic_replay_structure(module_name) {
+            ret Json::Null
+        }
+        let guards = previous.get("guards").unwrap_or(Json::Null)
+        let mut accepted = Vec[(str, Json)]::new()
+        for entry in previous.get("bodies").unwrap_or(Json::Null).as_object().unwrap_or(Vec[(str, Json)]::new()) {
+            match semantic_checkpoint_dependencies(entry.1) {
+                Ok(dependencies) => {
+                    if guards.get(entry.0).unwrap_or(Json::Null).as_str().unwrap_or("") == self.semantic_replay_dependency_guard(dependencies, context) {
+                        accepted.push(entry)
+                    }
+                }
+                Err(_) => {
+                }
+            }
+        }
+        ret Json::Object(accepted)
+    }
+
+    pub fn finalize_semantic_replay(self: mut Self, module_name: str, replay: Json) -> Json {
+        let context = replay.get("context").unwrap_or(Json::Null).as_str().unwrap_or("")
+        let existing = replay.get("guards").unwrap_or(Json::Null)
+        let mut guards = Vec[(str, Json)]::new()
+        for entry in replay.get("bodies").unwrap_or(Json::Null).as_object().unwrap_or(Vec[(str, Json)]::new()) {
+            let saved = existing.get(entry.0).unwrap_or(Json::Null).as_str().unwrap_or("")
+            let guard = if saved.is_empty() {
+                match semantic_checkpoint_dependencies(entry.1) {
+                    Ok(dependencies) => self.semantic_replay_dependency_guard(dependencies, context)
+                    Err(_) => ""
+                }
+            } else {
+                saved
+            }
+            guards.push((entry.0, Json::String(guard)))
+        }
+        ret Json::Object(vec![("context", Json::String(context)),("structure", Json::String(self.semantic_replay_structure(module_name))),
+                ("guards", Json::Object(guards)),("bodies", replay.get("bodies").unwrap_or(Json::Null)),
+                ("source", Json::String(compiler_content_digest(self.source_text(module_name).unwrap_or("")))),
+                ("valid", replay.get("valid").unwrap_or(Json::Bool(false))),
+                ("environment", replay.get("environment").unwrap_or(Json::Null))])
+    }
+
+    fn scoped_environment_with_replay(self: mut Self, module_name: str, previous: Json, context: str) -> ScopedEnvironmentReplay {
+        if !context.is_empty() && previous.get("context").unwrap_or(Json::Null).as_str().unwrap_or("") == context {
+            let saved = previous.get("environment").unwrap_or(Json::Null)
+            match decode_semantic_environment(saved) {
+                Ok(value) => {
+                    let environment = ScopedEnvironmentCache {
+                        module_name, self.revision, value.callables, value.fields,
+                        value.methods, value.aggregates, value.constructors, value.variants
+                    }
+                    self.type_scopes.push(TypeScopeCache { module_name, self.revision, value.names })
+                    self.scoped_environments.push(environment)
+                    ret ScopedEnvironmentReplay { environment, saved, true }
+                }
+                Err(_) => {
+                }
+            }
+        }
         let environment = self.scoped_environment(module_name)
+        let record = if context.is_empty() {
+            Json::Null
+        } else {
+            encode_semantic_environment(StoredSemanticEnvironment {
+                    environment.callables, environment.fields, environment.methods,
+                    environment.aggregates, environment.constructors, environment.variants, self.semantic_type_names(module_name)
+                }
+            )
+        }
+        ret ScopedEnvironmentReplay { environment, record, false }
+    }
+
+    pub fn prepare_module_safety_with_replay(self: mut Self, module_name: str, target: TargetSpec,
+        features: Vec[str], previous: Json, source: str,) -> PreparedModuleSafety {
+        let mut configured_features = Vec[Json]::new()
+        for feature in features {
+            configured_features.push(Json::String(feature))
+        }
+        let context = if source.is_empty() {
+            ""
+        } else {
+            compiler_content_digest(self.semantic_replay_context(module_name) + "\n" + target.triple + "\n" + stringify(Json::Array(configured_features)))
+        }
+        let validated = self.validate_semantic_replay(module_name, previous, context)
+        let snapshot = self.scoped_environment_with_replay(module_name, previous, context)
+        let environment = snapshot.value
+        let skip_module_checks = self.replay_module_checks_current(module_name, previous, context)
         let names = self.semantic_type_names(module_name)
         let document = match self.stored_full_document(module_name) {
             Some(value) => value
             None => self.document(module_name).unwrap_or(FrontendDocument::empty())
         }
-        let mut diagnostics = check_module_declarations(document.ast, target, features)
-        diagnostics.extend(self.module_resolution_diagnostics(module_name, document))
-        let checked = prepare_module_bodies_with_variants(document.ast, environment.callables, environment.fields,
-            environment.methods, environment.aggregates, module_name, names, environment.variants,)
+        let mut diagnostics = Vec[FrontendDiagnostic]::new()
+        if !skip_module_checks {
+            diagnostics.extend(check_module_declarations(document.ast, target, features))
+            diagnostics.extend(self.module_resolution_diagnostics(module_name, document))
+        }
+        let checked = prepare_module_bodies_with_replay(document.ast, environment.callables, environment.fields,
+            environment.methods, environment.aggregates, module_name, names, environment.variants, validated, source,)
         diagnostics.extend(checked.diagnostics)
         let mut functions = Vec[SafetyFunction]::new()
         for entry in checked.functions {
@@ -1925,19 +2466,315 @@ impl for AnalysisDatabase {
             if active {
                 let site = function_declaration_position(document, entry.item)
                 functions.push(SafetyFunction {
-                        module_name, entry.owner, entry.item, entry.body, environment.callables,
-                        append_bound_methods(environment.methods, entry.body.bound_methods), site.0, site.1, environment.constructors
+                        module_name, entry.owner, entry.item, entry.body, SemanticSlice::from_vec(environment.callables),
+                        append_bound_methods_view(SemanticSlice::from_vec(environment.methods), entry.body.bound_methods), site.0, site.1, environment.constructors
                     }
                 )
             }
         }
-        ret PreparedModuleSafety { diagnostics, functions }
+        let replay = Json::Object(vec![("context", Json::String(context)),("bodies", checked.replay),
+                ("guards", accepted_semantic_guards(previous, validated)),("environment", snapshot.record),("valid", Json::Bool(diagnostics.is_empty()))])
+        ret PreparedModuleSafety {
+            diagnostics, functions,
+            if source.is_empty() {
+                replay
+            } else {
+                self.finalize_semantic_replay(module_name, replay)
+            }
+            , checked.checked, checked.reused, snapshot.reused, skip_module_checks
+        }
+    }
+
+    /// Signature-only identity: ordinary edits and source relocation retain the
+    /// same package snapshot; cfg, manifest constants and lookup barriers do not.
+    pub fn semantic_package_identity(self: mut Self, modules: Vec[str]) -> str {
+        let started = perf_counter_ms()
+        let mut records = Vec[Json]::with_capacity(modules.len())
+        for module_name in modules {
+            records.push(Json::Array(vec![Json::String(module_name), Json::String(self.semantic_replay_context(module_name))]))
+        }
+        let identity = compiler_content_digest(stringify(Json::Array(records)))
+        self.preparation_timings.context_ms += perf_counter_ms() - started
+        ret identity
+    }
+
+    fn semantic_snapshot_matches(self: mut Self, snapshot: PackageSemanticIndex, modules: Vec[str], identity: str) -> bool {
+        if snapshot.identity != identity || snapshot.modules.len() != modules.len() {
+            ret false
+        }
+        for module_name in modules {
+            match snapshot.module(module_name) {
+                Some(view) => {
+                    if view.context != self.semantic_replay_context(module_name) {
+                        ret false
+                    }
+                }
+                None => {
+                    ret false
+                }
+            }
+        }
+        ret true
+    }
+
+    pub fn prepare_package_semantics(self: mut Self, modules: Vec[str], identity: str, previous: Option[PackageSemanticIndex]) -> bool {
+        let started = perf_counter_ms()
+        self.package_semantics_reused = false
+        match previous {
+            Option[PackageSemanticIndex]::Some(snapshot) => {
+                if self.semantic_snapshot_matches(snapshot, modules, identity) {
+                    if self.nominal_types.is_empty() {
+                        self.nominal_types = snapshot.types
+                        self.nominal_types_indexed = 0_usize
+                        self.package_semantics = snapshot
+                        self.package_semantics_revision = self.revision
+                        self.package_semantics_reused = true
+                        self.preparation_timings.environment_ms += perf_counter_ms() - started
+                        ret true
+                    }
+                    let identities = self.semantic_type_rebinding(snapshot.types)
+                    match snapshot.rebind(identities, self.nominal_types) {
+                        Ok(rebound) => {
+                            self.package_semantics = rebound
+                            self.package_semantics_revision = self.revision
+                            self.package_semantics_reused = true
+                            self.preparation_timings.environment_ms += perf_counter_ms() - started
+                            ret false
+                        }
+                        Err(_) => {
+                        }
+                    }
+                }
+            }
+            Option[PackageSemanticIndex]::None => {
+            }
+        }
+        self.declaration_preparation = DeclarationPreparationCache::new(true)
+        let mut builder = SemanticIndexBuilder::new(identity)
+        for module_name in modules {
+            let context_started = perf_counter_ms()
+            let context = self.semantic_replay_context(module_name)
+            let scopes_started = perf_counter_ms()
+            let environment = self.scoped_environment(module_name)
+            let index_started = perf_counter_ms()
+            self.preparation_timings.environment_context_ms += scopes_started - context_started
+            self.preparation_timings.environment_scopes_ms += index_started - scopes_started
+            builder.include(module_name, context, StoredSemanticEnvironment {
+                    environment.callables, environment.fields,
+                    environment.methods, environment.aggregates, environment.constructors, environment.variants, self.semantic_type_names(module_name)
+                }
+                ,
+            )
+            self.preparation_timings.environment_index_ms += perf_counter_ms() - index_started
+        }
+        let finish_started = perf_counter_ms()
+        self.package_semantics = builder.finish(self.nominal_types)
+        self.package_semantics_revision = self.revision
+        let release_started = perf_counter_ms()
+        self.preparation_timings.environment_finish_ms += release_started - finish_started
+        // Workers retain only shared records and thin views. The compatibility
+        // query caches are no longer owners of duplicated package environments.
+        self.scoped_environments = Vec[ScopedEnvironmentCache]::new()
+        self.type_scopes = Vec[TypeScopeCache]::new()
+        self.field_environments = Vec[FieldEnvironmentCache]::new()
+        self.method_environments = Vec[MethodEnvironmentCache]::new()
+        self.declaration_preparation = DeclarationPreparationCache::new(false)
+        self.preparation_timings.environment_release_ms += perf_counter_ms() - release_started
+        self.preparation_timings.environment_ms += perf_counter_ms() - started
+        ret false
+    }
+
+    /// Import old ordinals by their canonical HIR key, never by load order.
+    pub fn semantic_type_rebinding(self: mut Self, types: Vec[TypeId]) -> Vec[str] {
+        ret self.semantic_type_bindings(types, true)
+    }
+    pub fn semantic_existing_type_rebinding(self: mut Self, types: Vec[TypeId]) -> Vec[str] {
+        ret self.semantic_type_bindings(types, false)
+    }
+    fn semantic_type_bindings(self: mut Self, types: Vec[TypeId], import_missing: bool) -> Vec[str] {
+        let mut positions = SemanticKeyIndex::new(self.nominal_types.len() + types.len())
+        for index in 0_usize..self.nominal_types.len() {
+            positions.set(self.nominal_types.get_unchecked_borrowed(index).key(), index)
+        }
+        let mut identities = Vec[str]::with_capacity(types.len())
+        for typ in types {
+            let mut position = positions.get(typ.key())
+            if position == 0_usize && !import_missing {
+                identities.push("") continue
+            }
+            if position == 0_usize {
+                position = self.nominal_types.len() + 1_usize
+                positions.set(typ.key(), position - 1_usize) self.nominal_types.push(typ)
+            }
+            identities.push("@" + Debug::fmt(position - 1_usize))
+        }
+        ret identities
+    }
+
+    pub fn package_semantic_index(self: Self) -> Option[PackageSemanticIndex] {
+        if self.package_semantics.identity.is_empty() {
+            ret Option[PackageSemanticIndex]::None
+        }
+        ret Option[PackageSemanticIndex]::Some(self.package_semantics)
+    }
+
+    fn package_semantic_view(self: Self, module_name: str) -> Option[ModuleSemanticView] {
+        if self.package_semantics_revision != self.revision {
+            ret Option::None
+        }
+        ret self.package_semantics.module(module_name)
+    }
+
+    fn semantic_declarations_view(self: mut Self, module_name: str) -> SemanticSlice[SemanticCallable] {
+        if self.package_semantics_revision == self.revision && !self.package_semantics.identity.is_empty() {
+            ret SemanticSlice::from_vec(self.package_semantics.declarations)
+        }
+        ret SemanticSlice::from_vec(self.scoped_environment(module_name).callables)
+    }
+
+    fn semantic_callables_view(self: mut Self, module_name: str) -> SemanticSlice[SemanticCallable] {
+        match self.package_semantic_view(module_name) {
+            Some(view) => {
+                ret self.package_semantics.callables_for(view)
+            }
+            None => {
+                if self.package_semantics_revision == self.revision && !self.package_semantics.identity.is_empty() {
+                    ret SemanticSlice::from_vec(self.package_semantics.callables)
+                }
+                ret SemanticSlice::from_vec(self.scoped_environment(module_name).callables)
+            }
+        }
+    }
+    fn semantic_fields_view(self: mut Self, module_name: str) -> SemanticSlice[SemanticField] {
+        match self.package_semantic_view(module_name) {
+            Some(view) => {
+                ret self.package_semantics.fields_for(view)
+            }
+            None => {
+                if self.package_semantics_revision == self.revision && !self.package_semantics.identity.is_empty() {
+                    ret SemanticSlice::from_vec(self.package_semantics.fields)
+                }
+                ret SemanticSlice::from_vec(self.scoped_environment(module_name).fields)
+            }
+        }
+    }
+    fn semantic_methods_view(self: mut Self, module_name: str) -> SemanticSlice[SemanticMethod] {
+        match self.package_semantic_view(module_name) {
+            Some(view) => {
+                ret self.package_semantics.methods_for(view)
+            }
+            None => {
+                if self.package_semantics_revision == self.revision && !self.package_semantics.identity.is_empty() {
+                    ret SemanticSlice::from_vec(self.package_semantics.methods)
+                }
+                ret SemanticSlice::from_vec(self.scoped_environment(module_name).methods)
+            }
+        }
+    }
+    fn semantic_names_view(self: mut Self, module_name: str) -> SemanticSlice[TypeNameBinding] {
+        match self.package_semantic_view(module_name) {
+            Some(view) => {
+                ret self.package_semantics.names_for(view)
+            }
+            None => {
+                if self.package_semantics_revision == self.revision && !self.package_semantics.identity.is_empty() {
+                    ret SemanticSlice::from_vec(self.package_semantics.names)
+                }
+                ret SemanticSlice::from_vec(self.semantic_type_names(module_name))
+            }
+        }
+    }
+
+    pub fn prepare_module_safety_job(self: mut Self, module_name: str, target: TargetSpec,
+        features: Vec[str], previous: Json, enabled: bool,) -> sending PreparedSafetyModule {
+        let started = perf_counter_ms()
+        let mut configured_features = Vec[Json]::new()
+        for feature in features {
+            configured_features.push(Json::String(feature))
+        }
+        let context = if enabled {
+            compiler_content_digest(self.semantic_replay_context(module_name) + "\n" + target.triple + "\n" + stringify(Json::Array(configured_features)))
+        } else {
+            ""
+        }
+        let context_finished = perf_counter_ms()
+        let validated = self.validate_semantic_replay(module_name, previous, context)
+        let replay_finished = perf_counter_ms()
+        match self.package_semantic_view(module_name) {
+            Some(view) => {
+                let index = self.package_semantics
+                let skip_module_checks = self.replay_module_checks_current(module_name, previous, context)
+                let input = self.prepare_module_semantic_check_input(module_name, target, features, skip_module_checks)
+                self.preparation_timings.context_ms += context_finished - started
+                self.preparation_timings.replay_ms += replay_finished - context_finished
+                self.preparation_timings.input_ms += perf_counter_ms() - replay_finished
+                ret PreparedSafetyModule {
+                    input, view.constructors, validated, context, enabled,
+                    accepted_semantic_guards(previous, validated), Json::String(index.identity), self.package_semantics_reused, skip_module_checks
+                }
+            }
+            None => {
+            }
+        }
+        let snapshot = self.scoped_environment_with_replay(module_name, previous, context)
+        let environment_finished = perf_counter_ms()
+        let skip_module_checks = self.replay_module_checks_current(module_name, previous, context)
+        let input = self.prepare_module_semantic_check_input(module_name, target, features, skip_module_checks)
+        self.preparation_timings.context_ms += context_finished - started
+        self.preparation_timings.replay_ms += replay_finished - context_finished
+        self.preparation_timings.environment_ms += environment_finished - replay_finished
+        self.preparation_timings.input_ms += perf_counter_ms() - environment_finished
+        ret PreparedSafetyModule {
+            input,
+            snapshot.value.constructors, validated, context, enabled, accepted_semantic_guards(previous, validated), snapshot.record, snapshot.reused, skip_module_checks
+        }
+    }
+
+    pub fn semantic_preparation_timings(self: Self) -> SemanticPreparationTimings {
+        ret self.preparation_timings
+    }
+
+    fn replay_module_checks_current(self: Self, module_name: str, previous: Json, context: str) -> bool {
+        ret !context.is_empty() && previous.get("valid").unwrap_or(Json::Null).as_bool().unwrap_or(false) &&
+        previous.get("context").unwrap_or(Json::Null).as_str().unwrap_or("") == context &&
+        previous.get("source").unwrap_or(Json::Null).as_str().unwrap_or("") == compiler_content_digest(self.source_text(module_name).unwrap_or(""))
     }
 
     /// Freezes all workspace-dependent facts needed to check one module on a
-    /// worker thread. The returned value contains no AST graph handles.
+    /// worker thread. Syntax values are immutable; parser/database handles are
+    /// never included.
     pub fn prepare_module_semantic_check_for_target(self: mut Self, module_name: str, target: TargetSpec,
         features: Vec[str],) -> PreparedSemanticModule {
+        ret self.prepare_module_semantic_check_input(module_name, target, features, false)
+    }
+
+    fn prepare_module_semantic_check_input(self: mut Self, module_name: str, target: TargetSpec,
+        features: Vec[str], skip_module_checks: bool,) -> PreparedSemanticModule {
+        match self.package_semantic_view(module_name) {
+            Some(view) => {
+                let index = self.package_semantics
+                let position = self.semantic_graph_index.get(module_name)
+                let mut source_name = ""
+                let mut source = ""
+                if position != 0_usize {
+                    let entry = self.sources.get_unchecked_borrowed(position - 1_usize)
+                    source_name = entry.source_name source = entry.source
+                }
+                let document = self.document(module_name).unwrap_or(FrontendDocument::empty())
+                let diagnostics = if skip_module_checks {
+                    Vec[FrontendDiagnostic]::new()
+                } else {
+                    self.module_resolution_diagnostics(module_name, document)
+                }
+                ret PreparedSemanticModule {
+                    module_name, source_name, source, self.project_constants(module_name), target, features,
+                    index.callables_for(view), index.fields_for(view), index.methods_for(view), diagnostics,
+                    view.aggregates, index.names_for(view), index.variants_for(view), prepared_semantic_syntax(document)
+                }
+            }
+            None => {
+            }
+        }
         let environment = self.scoped_environment(module_name)
         let names = self.semantic_type_names(module_name)
         let document = match self.stored_full_document(module_name) {
@@ -1954,7 +2791,11 @@ impl for AnalysisDatabase {
                 source = entry.source
             }
         }
-        let resolution_diagnostics = self.module_resolution_diagnostics(module_name, document)
+        let resolution_diagnostics = if skip_module_checks {
+            Vec[FrontendDiagnostic]::new()
+        } else {
+            self.module_resolution_diagnostics(module_name, document)
+        }
         ret PreparedSemanticModule {
             module_name,
             source_name,
@@ -1962,13 +2803,14 @@ impl for AnalysisDatabase {
             self.project_constants(module_name),
             target,
             features,
-            environment.callables,
-            environment.fields,
-            environment.methods,
+            SemanticSlice::from_vec(environment.callables),
+            SemanticSlice::from_vec(environment.fields),
+            SemanticSlice::from_vec(environment.methods),
             resolution_diagnostics,
             environment.aggregates,
-            names,
-            environment.variants
+            SemanticSlice::from_vec(names),
+            SemanticSlice::from_vec(environment.variants),
+            prepared_semantic_syntax(document)
         }
     }
 
@@ -2374,10 +3216,10 @@ impl for AnalysisDatabase {
                 for member in semantic_named_members(receiver, name, fields, methods) {
                     let mut params = Vec[str]::new()
                     for param in member.params {
-                        params.push(display_type(param, body.type_names))
+                        params.push(display_type_view(param, body.type_names))
                     }
                     out.push(SemanticMember {
-                            member.name, display_type(member.typ, body.type_names), params,
+                            member.name, display_type_view(member.typ, body.type_names), params,
                             member.is_method, member.declaration_module, member.declaration_owner
                         }
                         ,)
@@ -2391,23 +3233,36 @@ impl for AnalysisDatabase {
     }
 
     fn intern_nominal_type(self: mut Self, typ: TypeId) -> str {
-        let mut index = 0_usize
-        for existing in self.nominal_types {
-            if existing.key() == typ.key() {
-                ret "@" + Debug::fmt(index)
+        // Snapshots and replay can install/append an ordinal table directly.
+        // Rebuild only when that table has changed; preserve its exact order.
+        if self.nominal_types_indexed != self.nominal_types.len() {
+            let mut positions = SemanticKeyIndex::new(self.nominal_types.len())
+            for index in 0_usize..self.nominal_types.len() {
+                positions.set(self.nominal_types.get_unchecked_borrowed(index).key(), index)
             }
-            index += 1_usize
+            self.nominal_type_positions = positions
+            self.nominal_types_indexed = self.nominal_types.len()
         }
+        let position = self.nominal_type_positions.get(typ.key())
+        if position != 0_usize {
+            ret "@" + Debug::fmt(position - 1_usize)
+        }
+        let index = self.nominal_types.len()
         self.nominal_types.push(typ)
+        self.nominal_type_positions.set(typ.key(), index)
+        self.nominal_types_indexed = self.nominal_types.len()
         ret "@" + Debug::fmt(index)
     }
 
     fn semantic_type_names(self: mut Self, module_name: str) -> Vec[TypeNameBinding] {
+        if self.declaration_preparation.enabled && !module_name.is_empty() && self.declaration_preparation.active_module == module_name {
+            ret self.declaration_preparation.active_names
+        }
         let mut slot = 0_usize
-        for cached in self.type_scopes {
-            if cached.module_name == module_name {
-                if cached.revision == self.revision {
-                    ret cached.names
+        while slot < self.type_scopes.len() {
+            if self.type_scopes.get_unchecked_borrowed(slot).module_name == module_name {
+                if self.type_scopes.get_unchecked_borrowed(slot).revision == self.revision {
+                    ret self.type_scopes.get_unchecked_borrowed(slot).names
                 }
                 break
             }
@@ -2415,54 +3270,63 @@ impl for AnalysisDatabase {
         }
         let mut names = Vec[TypeNameBinding]::new()
         for scope in self.reachable_semantic_modules(module_name) {
-            match self.module_def_map(scope) {
-                Some(map) => {
-                    let mut definitions = map.namespace_definitions(DefinitionNamespace::Type)
-                    definitions.extend(map.namespace_definitions(DefinitionNamespace::Trait))
-                    for definition in definitions {
-                        names.push(TypeNameBinding {
-                                scope, definition.name(), self.intern_nominal_type(definition.typ()),
-                                if scope == module_name {
-                                    definition.name()
-                                } else {
-                                    definition.typ().display_name()
-                                }
-                                ,
-                                definition.typ().display_name()
-                            }
-                            ,)
-                    }
+            let declared = self.declared_type_names(scope)
+            if scope == module_name {
+                for binding in declared {
+                    names.push(TypeNameBinding {
+                            binding.scope, binding.name, binding.identity, binding.name, binding.declaration
+                        }
+                    )
                 }
-                None => {
-                }
+            } else {
+                names.extend(declared)
             }
         }
         // Resolution already exposes core declarations as a language prelude.
         // Body checking must use those same declarations' nominal identities,
         // rather than leaving unimported Vec/Option/etc. as bare spellings.
         // One fallback namespace avoids copying the prelude into every scope.
-        for source in self.sources {
-            if source.module_name != "core" && !starts_with(source.module_name, "core::") {
-                continue
+        if self.declaration_preparation.enabled && self.declaration_preparation.prelude_ready {
+            names.extend(self.declaration_preparation.prelude)
+        } else {
+            let mut prelude = Vec[TypeNameBinding]::new()
+            let mut prelude_modules = Vec[str]::new()
+            for position in 0_usize..self.sources.len() {
+                let name = self.sources.get_unchecked_borrowed(position).module_name
+                if name == "core" || starts_with(name, "core::") {
+                    prelude_modules.push(name)
+                }
             }
-            match self.module_def_map(source.module_name) {
-                Some(map) => {
-                    let mut definitions = map.namespace_definitions(DefinitionNamespace::Type)
-                    definitions.extend(map.namespace_definitions(DefinitionNamespace::Trait))
-                    for definition in definitions {
-                        if definition.kind() == DefinitionKind::Import || definition.owner() != "" {
-                            continue
-                        }
-                        names.push(TypeNameBinding {
-                                "", definition.name(), self.intern_nominal_type(definition.typ()),
-                                definition.typ().display_name(), definition.typ().display_name()
+            for name in prelude_modules {
+                match self.module_def_map(name) {
+                    Some(map) => {
+                        let mut definitions = map.namespace_definitions(DefinitionNamespace::Type)
+                        definitions.extend(map.namespace_definitions(DefinitionNamespace::Trait))
+                        for definition in definitions {
+                            if definition.kind() == DefinitionKind::Import || definition.owner() != "" {
+                                continue
                             }
-                            ,)
+                            prelude.push(TypeNameBinding {
+                                    "", definition.name(), self.intern_nominal_type(definition.typ()),
+                                    definition.typ().display_name(), definition.typ().display_name()
+                                }
+                                ,)
+                        }
+                    }
+                    None => {
                     }
                 }
-                None => {
-                }
             }
+            if self.declaration_preparation.enabled {
+                self.declaration_preparation.prelude = prelude
+                self.declaration_preparation.prelude_ready = true
+            }
+            names.extend(prelude)
+        }
+        if self.declaration_preparation.enabled {
+            self.declaration_preparation.active_module = module_name
+            self.declaration_preparation.active_names = names
+            ret names
         }
         let cached = TypeScopeCache {
             module_name, self.revision, names
@@ -2475,47 +3339,103 @@ impl for AnalysisDatabase {
         ret names
     }
 
-    fn scoped_fields(self: Self, fields: Vec[SemanticField], names: Vec[TypeNameBinding]) -> Vec[SemanticField] {
+    fn declared_type_names(self: mut Self, module_name: str) -> Vec[TypeNameBinding] {
+        if self.declaration_preparation.enabled {
+            let position = self.declaration_preparation.type_positions.get(module_name)
+            if position != 0_usize {
+                ret self.declaration_preparation.type_names.get_unchecked_borrowed(position - 1_usize)
+            }
+        }
+        let mut names = Vec[TypeNameBinding]::new()
+        match self.module_def_map(module_name) {
+            Some(map) => {
+                let mut definitions = map.namespace_definitions(DefinitionNamespace::Type)
+                definitions.extend(map.namespace_definitions(DefinitionNamespace::Trait))
+                for definition in definitions {
+                    names.push(TypeNameBinding {
+                            module_name, definition.name(), self.intern_nominal_type(definition.typ()),
+                            definition.typ().display_name(), definition.typ().display_name()
+                        }
+                    )
+                }
+            }
+            None => {
+            }
+        }
+        if self.declaration_preparation.enabled {
+            self.declaration_preparation.type_positions.set(module_name, self.declaration_preparation.type_names.len())
+            self.declaration_preparation.type_names.push(names)
+        }
+        ret names
+    }
+
+    // During one package pass a declaration's lexical bindings are invariant
+    // across consumer views. Sharing normalized records is safe only for this
+    // pass: the cache is discarded before edits, replay or nominal rebinding.
+    fn scoped_fields(self: mut Self, fields: Vec[SemanticField], index: TypeScopeIndex) -> Vec[SemanticField] {
         let mut out = Vec[SemanticField]::new()
         let mut scope = ""
-        let mut selected = Vec[TypeNameBinding]::new()
         for field in fields {
+            let mut ordinal = 0_usize
+            if self.declaration_preparation.enabled {
+                ordinal = self.declaration_preparation.field_inputs.intern(field)
+                if ordinal < self.declaration_preparation.scoped_fields.len() {
+                    out.push(self.declaration_preparation.scoped_fields.get_unchecked_borrowed(ordinal))
+                    continue
+                }
+            }
             if scope != field.module_name || scope == "" {
                 scope = field.module_name
-                selected = names_in_scope(names, scope)
             }
-            out.push(field.in_receiver_scope(scope_type(field.owner_type, scope, selected, field.generic_names),
-                    scope_type(field.typ, scope, selected, field.generic_names),))
+            let scoped = field.in_receiver_scope(scope_type_indexed(field.owner_type, scope, index, field.generic_names),
+                scope_type_indexed(field.typ, scope, index, field.generic_names),)
+            out.push(scoped)
+            if self.declaration_preparation.enabled {
+                self.declaration_preparation.scoped_fields.push(scoped)
+            }
         }
         ret out
     }
 
     fn scoped_environment(self: mut Self, module_name: str) -> ScopedEnvironmentCache {
+        let lookup_started = perf_counter_ms()
         let mut slot = 0_usize
-        for cached in self.scoped_environments {
-            if cached.module_name == module_name {
-                if cached.revision == self.revision {
-                    ret cached
+        while slot < self.scoped_environments.len() {
+            if self.scoped_environments.get_unchecked_borrowed(slot).module_name == module_name {
+                if self.scoped_environments.get_unchecked_borrowed(slot).revision == self.revision {
+                    ret self.scoped_environments.get_unchecked_borrowed(slot)
                 }
                 break
             }
             slot += 1_usize
         }
+        let names_started = perf_counter_ms()
+        self.preparation_timings.environment_lookup_ms += names_started - lookup_started
         let names = self.semantic_type_names(module_name)
-        let mut callables = self.scoped_callables(self.visible_semantic_callables(module_name), names)
-        let fields = self.scoped_fields(self.visible_semantic_fields(module_name), names)
-        let methods = self.scoped_methods(self.visible_semantic_methods(module_name), names)
+        let type_index_started = perf_counter_ms()
+        let type_index = type_scope_index(names)
+        let callables_started = perf_counter_ms()
+        let visible_callables = self.visible_semantic_callables(module_name)
+        let callable_scope_started = perf_counter_ms()
+        let mut callables = self.scoped_callables(visible_callables, type_index)
+        let fields_started = perf_counter_ms()
+        let fields = self.scoped_fields(self.visible_semantic_fields(module_name), type_index)
+        let methods_started = perf_counter_ms()
+        let visible_methods = self.visible_semantic_methods(module_name)
+        let method_scope_started = perf_counter_ms()
+        let methods = self.scoped_methods(visible_methods, type_index)
+        let variants_started = perf_counter_ms()
+        self.preparation_timings.method_scope_ms += variants_started - method_scope_started
         let mut aggregates = Vec[str]::new()
         let mut constructors = Vec[str]::new()
         let mut variants = Vec[SemanticVariant]::new()
         for visible in self.reachable_semantic_modules(module_name) {
             let document = self.document(visible).unwrap_or(FrontendDocument::empty())
-            let selected = names_in_scope(names, visible)
             for statement in document.ast {
                 match statement {
                     Statement::EnumItem(item) => {
                         let generics = declaration_generic_names(item.generics)
-                        let owner = scope_type(item.name, visible, selected, generics)
+                        let owner = scope_type_indexed(item.name, visible, type_index, generics)
                         for variant in item.variants {
                             let mut payload = "void"
                             match variant.tuple_fields.get(0) {
@@ -2533,7 +3453,7 @@ impl for AnalysisDatabase {
                                 }
                             }
                             variants.push(SemanticVariant {
-                                    owner, variant.name, scope_type(payload, visible, selected, generics), generics
+                                    owner, variant.name, scope_type_indexed(payload, visible, type_index, generics), generics
                                 }
                                 ,
                             )
@@ -2544,16 +3464,25 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        let constructors_started = perf_counter_ms()
+        let aggregate_set = encore_strset_new()
         for binding in names {
-            if !contains_string(aggregates, binding.identity) {
+            if encore_strset_insert(aggregate_set, binding.identity) {
                 aggregates.push(binding.identity)
             }
+        }
+        encore_strset_free(aggregate_set)
+        let constructor_lookup_started = perf_counter_ms()
+        for binding in names {
             if binding.scope == module_name {
                 for variant in self.enum_variant_definitions(module_name, binding.name) {
                     constructors.push(binding.identity + "::" + variant.name())
                 }
             }
         }
+        let statics_started = perf_counter_ms()
+        self.preparation_timings.constructors_aggregate_ms += constructor_lookup_started - constructors_started
+        self.preparation_timings.constructors_lookup_ms += statics_started - constructor_lookup_started
         // Resolve inferred static values in their declaration's type scope.
         // Constructor return types may differ from the parser's owner hint.
         for index in 0_usize..callables.len() {
@@ -2568,8 +3497,8 @@ impl for AnalysisDatabase {
                         if item.name == callable.declaration_name && analysis_function_has_attr(item, "static_inferred") {
                             let body = check_function_body_with_variants(item, callables, fields, methods, "",
                                 Vec[GenericParam]::new(), aggregates, callable.module_name, names, variants,)
-                            let typ = scope_type(body.return_type, callable.module_name,
-                                names_in_scope(names, callable.module_name), Vec[str]::new(),)
+                            let typ = scope_type_indexed(body.return_type, callable.module_name,
+                                type_index, Vec[str]::new(),)
                             callables.set(index, callable.with_return_type(typ))
                         }
                     }
@@ -2578,25 +3507,47 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        self.preparation_timings.environment_names_ms += callables_started - names_started
+        self.preparation_timings.environment_callables_ms += fields_started - callables_started
+        self.preparation_timings.environment_fields_ms += methods_started - fields_started
+        self.preparation_timings.environment_methods_ms += variants_started - methods_started
+        self.preparation_timings.environment_variants_ms += constructors_started - variants_started
+        self.preparation_timings.environment_constructors_ms += statics_started - constructors_started
+        self.preparation_timings.environment_statics_ms += perf_counter_ms() - statics_started
+        self.preparation_timings.environment_type_index_ms += callables_started - type_index_started
+        self.preparation_timings.environment_callable_scope_ms += fields_started - callable_scope_started
+        let store_started = perf_counter_ms()
         let cached = ScopedEnvironmentCache {
             module_name, self.revision, callables, fields, methods, aggregates, constructors, variants
+        }
+        // The package builder consumes this environment immediately. Retaining
+        // another full copy until the end repeats graph ownership and teardown.
+        if self.declaration_preparation.enabled {
+            ret cached
         }
         if slot < self.scoped_environments.len() {
             self.scoped_environments.set(slot, cached)
         } else {
             self.scoped_environments.push(cached)
         }
+        self.preparation_timings.environment_store_ms += perf_counter_ms() - store_started
         ret cached
     }
 
-    fn scoped_methods(self: Self, methods: Vec[SemanticMethod], names: Vec[TypeNameBinding]) -> Vec[SemanticMethod] {
+    fn scoped_methods(self: mut Self, methods: Vec[SemanticMethod], index: TypeScopeIndex) -> Vec[SemanticMethod] {
         let mut out = Vec[SemanticMethod]::new()
         let mut scope = ""
-        let mut selected = Vec[TypeNameBinding]::new()
         for method in methods {
+            let mut ordinal = 0_usize
+            if self.declaration_preparation.enabled {
+                ordinal = self.declaration_preparation.method_inputs.intern(method)
+                if ordinal < self.declaration_preparation.scoped_methods.len() {
+                    out.push(self.declaration_preparation.scoped_methods.get_unchecked_borrowed(ordinal))
+                    continue
+                }
+            }
             if scope != method.module_name || scope == "" {
                 scope = method.module_name
-                selected = names_in_scope(names, scope)
             }
             let mut binders = Vec[str]::new()
             for name in method.generic_names {
@@ -2609,33 +3560,34 @@ impl for AnalysisDatabase {
             }
             let mut params = Vec[str]::new()
             for param in method.params {
-                params.push(scope_type(param, scope, selected, binders))
+                params.push(scope_type_indexed(param, scope, index, binders))
             }
-            out.push(SemanticMethod {
-                    method.module_name, scope_type(method.receiver_type, scope, selected, method.generic_names),
-                    method.name, params, scope_type(method.ret_type, scope, selected, binders),
-                    method.signature, method.declaration_receiver, method.generic_names, method.is_static, method.is_public, method.method_generic_names
-                }
-                ,)
+            let scoped = SemanticMethod {
+                method.module_name, scope_type_indexed(method.receiver_type, scope, index, method.generic_names),
+                method.name, params, scope_type_indexed(method.ret_type, scope, index, binders),
+                method.signature, method.declaration_receiver, method.generic_names, method.is_static, method.is_public, method.method_generic_names
+            }
+            out.push(scoped)
+            if self.declaration_preparation.enabled {
+                self.declaration_preparation.scoped_methods.push(scoped)
+            }
         }
         ret out
     }
-    fn scoped_callables(self: Self, callables: Vec[SemanticCallable], names: Vec[TypeNameBinding]) -> Vec[SemanticCallable] {
+    fn scoped_callables(self: Self, callables: Vec[SemanticCallable], index: TypeScopeIndex) -> Vec[SemanticCallable] {
         let mut scoped_callables = Vec[SemanticCallable]::new()
         let mut scope = ""
-        let mut selected = Vec[TypeNameBinding]::new()
         for callable in callables {
             if scope != callable.module_name || scope == "" {
                 scope = callable.module_name
-                selected = names_in_scope(names, scope)
             }
             let mut params = Vec[str]::new()
             for param in callable.params {
-                params.push(scope_type(param, scope, selected, callable.generic_names))
+                params.push(scope_type_indexed(param, scope, index, callable.generic_names))
             }
             scoped_callables.push(SemanticCallable {
                     callable.module_name, callable.name, params,
-                    scope_type(callable.ret_type, scope, selected, callable.generic_names), callable.signature,
+                    scope_type_indexed(callable.ret_type, scope, index, callable.generic_names), callable.signature,
                     callable.declaration_name, callable.lookup_module, callable.binding_identity, callable.generic_names, callable.is_static
                 }
                 ,)
@@ -2718,6 +3670,26 @@ impl for AnalysisDatabase {
     }
 
     fn imported_namespace(self: mut Self, scope: str, requested: str) -> str {
+        if self.namespace_resolution_revision != self.revision {
+            self.namespace_resolutions = Vec[str]::new()
+            self.namespace_resolution_index = SemanticKeyIndex::new(0_usize)
+            self.namespace_resolution_revision = self.revision
+        }
+        // Associated calls such as Vec::new and Vec::with_capacity repeatedly
+        // ask about the same missing module namespace. Cache misses as well as
+        // aliases, scoped by caller and by the complete database revision.
+        let key = Debug::fmt(scope.byte_len()) + ":" + scope + requested
+        let position = self.namespace_resolution_index.get(key)
+        if position != 0_usize {
+            ret self.namespace_resolutions.get_unchecked_borrowed(position - 1_usize)
+        }
+        let resolved = self.resolve_imported_namespace(scope, requested)
+        self.namespace_resolution_index.set(key, self.namespace_resolutions.len())
+        self.namespace_resolutions.push(resolved)
+        ret resolved
+    }
+
+    fn resolve_imported_namespace(self: mut Self, scope: str, requested: str) -> str {
         self.ensure_semantic_graph()
         let document = self.document(scope).unwrap_or(FrontendDocument::empty())
         for statement in document.ast {
@@ -2735,8 +3707,36 @@ impl for AnalysisDatabase {
                             }
                         }
                     }
-                    for source in self.semantic_graph {
-                        let expanded = import_namespace_target(path, source.module_name, requested)
+                    let mut candidates = Vec[usize]::new()
+                    match import_paths::namespace_import_candidates(path) {
+                        Some(targets) => {
+                            for target in targets {
+                                let position = self.semantic_graph_index.get(target)
+                                if position != 0_usize {
+                                    candidates.push(position - 1_usize)
+                                }
+                            }
+                        }
+                        None => {
+                            for position in 0_usize..self.semantic_graph.len() {
+                                candidates.push(position)
+                            }
+                        }
+                    }
+                    // Preserve graph order, including duplicate aliases in a
+                    // grouped import: candidate spelling order is not priority.
+                    for index in 1_usize..candidates.len() {
+                        let mut cursor = index
+                        while cursor > 0_usize && candidates.get_unchecked_borrowed(cursor) < candidates.get_unchecked_borrowed(cursor - 1_usize) {
+                            let previous = candidates.get_unchecked_borrowed(cursor - 1_usize)
+                            candidates.set(cursor - 1_usize, candidates.get_unchecked_borrowed(cursor))
+                            candidates.set(cursor, previous)
+                            cursor -= 1_usize
+                        }
+                    }
+                    for position in candidates {
+                        let target = self.semantic_graph.get_unchecked_borrowed(position).module_name
+                        let expanded = import_namespace_target(path, target, requested)
                         if expanded != "" {
                             ret self.resolved_import_target(scope, expanded)
                         }
@@ -3294,18 +4294,22 @@ impl for AnalysisDatabase {
     }
 
     fn source_lightweight_document(self: Self, module_name: str) -> Option[FrontendDocument] {
-        for source in self.sources {
-            if source.module_name == module_name {
-                ret Option[FrontendDocument]::Some(source.lightweight)
+        let position = self.source_position(module_name)
+        if position < self.sources.len() {
+            let entry = self.sources.get_unchecked_borrowed(position)
+            if entry.module_name == module_name {
+                ret Option[FrontendDocument]::Some(entry.lightweight)
             }
         }
         ret Option[FrontendDocument]::None
     }
 
     fn stored_full_document(self: Self, module_name: str) -> Option[FrontendDocument] {
-        for source in self.sources {
-            if source.module_name == module_name && source.full.parsed && !source.full_dirty {
-                ret Option[FrontendDocument]::Some(source.full)
+        let position = self.source_position(module_name)
+        if position < self.sources.len() {
+            let entry = self.sources.get_unchecked_borrowed(position)
+            if entry.module_name == module_name && entry.full.parsed && !entry.full_dirty {
+                ret Option[FrontendDocument]::Some(entry.full)
             }
         }
         ret Option[FrontendDocument]::None
@@ -3469,6 +4473,7 @@ impl for AnalysisDatabase {
     }
 
     fn visible_semantic_callables(self: mut Self, module_name: str) -> Vec[SemanticCallable] {
+        let started = perf_counter_ms()
         let mut out = Vec[SemanticCallable]::new()
         let map = match self.module_def_map(module_name) {
             Some(value) => value
@@ -3476,6 +4481,7 @@ impl for AnalysisDatabase {
                 ret out
             }
         }
+        let collect_started = perf_counter_ms()
         let definitions = map.all_definitions()
         let origins = encore_strset_new()
         let selected = encore_strmap_new()
@@ -3519,6 +4525,7 @@ impl for AnalysisDatabase {
             }
             encore_strmap_free(ordinals)
         }
+        let bind_started = perf_counter_ms()
         index = 0_usize
         for definition in definitions {
             index += 1_usize
@@ -3537,6 +4544,7 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        let qualified_started = perf_counter_ms()
         // Qualified names keep their source spelling while retaining the actual
         // declaration identity, including aliases and public re-exports.
         let caller = self.document(module_name).unwrap_or(FrontendDocument::empty())
@@ -3583,6 +4591,10 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        self.preparation_timings.callable_defmap_ms += collect_started - started
+        self.preparation_timings.callable_collect_ms += bind_started - collect_started
+        self.preparation_timings.callable_bind_ms += qualified_started - bind_started
+        self.preparation_timings.callable_qualified_ms += perf_counter_ms() - qualified_started
         encore_strset_free(origins)
         encore_strset_free(local_names)
         encore_strmap_free(selected)
@@ -3608,16 +4620,19 @@ impl for AnalysisDatabase {
 
     fn visible_semantic_fields(self: mut Self, module_name: str) -> Vec[SemanticField] {
         let mut index = 0_usize
-        for cached in self.field_environments {
-            if cached.module_name == module_name {
-                if cached.revision == self.revision {
-                    ret cached.values
+        while index < self.field_environments.len() {
+            if self.field_environments.get_unchecked_borrowed(index).module_name == module_name {
+                if self.field_environments.get_unchecked_borrowed(index).revision == self.revision {
+                    ret self.field_environments.get_unchecked_borrowed(index).values
                 }
                 break
             }
             index += 1_usize
         }
         let values = self.collect_semantic_fields(module_name)
+        if self.declaration_preparation.enabled {
+            ret values
+        }
         let cached = FieldEnvironmentCache {
             module_name, self.revision, values
         }
@@ -3635,56 +4650,75 @@ impl for AnalysisDatabase {
         // Keep declaration identities while following the reachable module graph.
         let owners = self.reachable_semantic_modules(module_name)
         for visible in owners {
-            let document = match self.stored_full_document(visible) {
-                Option[FrontendDocument]::Some(value) => value
-                Option[FrontendDocument]::None => self.document(visible).unwrap_or(FrontendDocument::empty())
+            out.extend(self.declared_semantic_fields(visible))
+        }
+        ret out
+    }
+
+    fn declared_semantic_fields(self: mut Self, visible: str) -> Vec[SemanticField] {
+        if self.declaration_preparation.enabled {
+            let position = self.declaration_preparation.field_positions.get(visible)
+            if position != 0_usize {
+                ret self.declaration_preparation.field_declarations.get_unchecked_borrowed(position - 1_usize)
             }
-            for statement in document.ast {
-                match statement {
-                    Statement::Struct(item) => {
-                        let mut owner = item.name
-                        if item.generics.len() > 0_usize {
-                            owner += "["
-                            let mut first = true
-                            for generic in item.generics {
-                                if !first {
-                                    owner += ","
-                                }
-                                owner += generic.name
-                                first = false
+        }
+        let mut out = Vec[SemanticField]::new()
+        let document = match self.stored_full_document(visible) {
+            Option[FrontendDocument]::Some(value) => value
+            Option[FrontendDocument]::None => self.document(visible).unwrap_or(FrontendDocument::empty())
+        }
+        for statement in document.ast {
+            match statement {
+                Statement::Struct(item) => {
+                    let mut owner = item.name
+                    if item.generics.len() > 0_usize {
+                        owner += "["
+                        let mut first = true
+                        for generic in item.generics {
+                            if !first {
+                                owner += ","
                             }
-                            owner += "]"
+                            owner += generic.name
+                            first = false
                         }
-                        for field in item.named_fields {
-                            out.push(SemanticField::new(visible, owner, field.name, field.typ).with_generics(declaration_generic_names(item.generics)))
-                        }
-                        let mut field_index = 0_usize
-                        for field_type in item.tuple_fields {
-                            out.push(SemanticField::new(visible, owner, Debug::fmt(field_index),
-                                    field_type,).with_generics(declaration_generic_names(item.generics)))
-                            field_index += 1_usize
-                        }
+                        owner += "]"
                     }
-                    _ => {
+                    for field in item.named_fields {
+                        out.push(SemanticField::new(visible, owner, field.name, field.typ).with_generics(declaration_generic_names(item.generics)))
+                    }
+                    let mut field_index = 0_usize
+                    for field_type in item.tuple_fields {
+                        out.push(SemanticField::new(visible, owner, Debug::fmt(field_index),
+                                field_type,).with_generics(declaration_generic_names(item.generics)))
+                        field_index += 1_usize
                     }
                 }
+                _ => {
+                }
             }
+        }
+        if self.declaration_preparation.enabled {
+            self.declaration_preparation.field_positions.set(visible, self.declaration_preparation.field_declarations.len())
+            self.declaration_preparation.field_declarations.push(out)
         }
         ret out
     }
 
     fn visible_semantic_methods(self: mut Self, module_name: str) -> Vec[SemanticMethod] {
         let mut index = 0_usize
-        for cached in self.method_environments {
-            if cached.module_name == module_name {
-                if cached.revision == self.revision {
-                    ret cached.values
+        while index < self.method_environments.len() {
+            if self.method_environments.get_unchecked_borrowed(index).module_name == module_name {
+                if self.method_environments.get_unchecked_borrowed(index).revision == self.revision {
+                    ret self.method_environments.get_unchecked_borrowed(index).values
                 }
                 break
             }
             index += 1_usize
         }
         let values = self.collect_semantic_methods(module_name)
+        if self.declaration_preparation.enabled {
+            ret values
+        }
         let cached = MethodEnvironmentCache {
             module_name, self.revision, values
         }
@@ -3695,7 +4729,7 @@ impl for AnalysisDatabase {
         }
         ret values
     }
-    fn semantic_trait_owner(self: mut Self, scope: str, owner: str, names: Vec[TypeNameBinding], generics: Vec[str]) -> str {
+    fn semantic_trait_owner(self: mut Self, scope: str, owner: str, index: TypeScopeIndex, generics: Vec[str]) -> str {
         if contains_string_value(owner, "::") {
             match self.qualified_definition(scope, owner, DefinitionNamespace::Trait) {
                 Some(definition) => {
@@ -3705,110 +4739,141 @@ impl for AnalysisDatabase {
                 }
             }
         }
-        ret scope_type(owner, scope, names, generics)
+        ret scope_type_indexed(owner, scope, index, generics)
+    }
+
+    fn declared_semantic_methods(self: mut Self, module_name: str) -> Vec[MethodDeclarationGroup] {
+        if self.declaration_preparation.enabled {
+            let position = self.declaration_preparation.method_positions.get(module_name)
+            if position != 0_usize {
+                ret self.declaration_preparation.method_declarations.get_unchecked_borrowed(position - 1_usize)
+            }
+        }
+        let document = match self.stored_full_document(module_name) {
+            Some(value) => value
+            None => self.document(module_name).unwrap_or(FrontendDocument::empty())
+        }
+        let mut groups = Vec[MethodDeclarationGroup]::new()
+        for statement in document.ast {
+            match statement {
+                Statement::Impl(item) => {
+                    let generics = declaration_generic_names(item.generics)
+                    let mut methods = Vec[SemanticMethod]::with_capacity(item.methods.len())
+                    let mut visibility = Vec[bool]::with_capacity(item.methods.len())
+                    for method in item.methods {
+                        methods.push(declared_semantic_method(module_name, item.target, generics, method))
+                        visibility.push(method.is_public)
+                    }
+                    groups.push(MethodDeclarationGroup {
+                            false, item.trait_name.unwrap_or(""), item.target,
+                            generics, Vec[str]::new(), methods, visibility, false
+                        }
+                    )
+                }
+                Statement::Trait(item) => {
+                    let generics = declaration_generic_names(item.generics)
+                    let receiver = trait_receiver_type(item.name, item.generics)
+                    let mut methods = Vec[SemanticMethod]::with_capacity(item.methods.len())
+                    for method in item.methods {
+                        methods.push(declared_semantic_method(module_name, receiver, generics, method))
+                    }
+                    groups.push(MethodDeclarationGroup {
+                            true, item.name, receiver, generics, item.bases,
+                            methods, Vec[bool]::new(), contains_string(item.attrs, "plugin_interface")
+                        }
+                    )
+                }
+                _ => {
+                }
+            }
+        }
+        if self.declaration_preparation.enabled {
+            self.declaration_preparation.method_positions.set(module_name, self.declaration_preparation.method_declarations.len())
+            self.declaration_preparation.method_declarations.push(groups)
+        }
+        ret groups
     }
 
     fn collect_semantic_methods(self: mut Self, module_name: str) -> Vec[SemanticMethod] {
+        let started = perf_counter_ms()
         let mut out = Vec[SemanticMethod]::new()
         let mut trait_edges = Vec[(str, str, Vec[str])]::new()
         let mut contracts = Vec[(str, str)]::new()
         let mut contract_edges = Vec[(str, str)]::new()
         let mut visibility = Vec[(usize, bool, str)]::new()
         let names = self.semantic_type_names(module_name)
+        let type_index = type_scope_index(names)
         // Inherent methods belong to their receiver type, not to the lexical
         // import scope of the call site. Once a type is reachable, its impl
         // methods must remain discoverable even when the type flowed through
         // another public API (for example FrontendDocument.dependencies).
         let method_modules = self.reachable_semantic_modules(module_name)
         for visible in method_modules {
-            let document = match self.stored_full_document(visible) {
-                Option[FrontendDocument]::Some(value) => value
-                Option[FrontendDocument]::None => self.document(visible).unwrap_or(FrontendDocument::empty())
-            }
-            for statement in document.ast {
-                match statement {
-                    Statement::Impl(item) => {
-                        for method in item.methods {
-                            let is_static = !function_has_receiver(method)
-                            let mut params = Vec[str]::new()
-                            let mut index = 0_usize
-                            for param in method.params {
-                                if is_static || index > 0_usize {
-                                    params.push(param.typ.unwrap_or(""))
-                                }
-                                index += 1_usize
-                            }
-                            out.push(SemanticMethod::new(visible, item.target, method.name, params, semantic_call_return_type(method)).with_generics(declaration_generic_names(item.generics)).with_method_generics(declaration_generic_names(method.generics)).with_static(is_static)
-                            )
-                            let contract = match item.trait_name {
-                                Some(owner) => self.semantic_trait_owner(visible, owner, names, declaration_generic_names(item.generics))
-                                None => ""
-                            }
-                            visibility.push((out.len() - 1_usize, method.is_public, contract))
-                        }
+            for group in self.declared_semantic_methods(visible) {
+                if !group.is_trait {
+                    let contract = if group.methods.is_empty() || group.name.is_empty() {
+                        ""
+                    } else {
+                        self.semantic_trait_owner(visible, group.name, type_index, group.generic_names)
                     }
-                    Statement::Trait(item) => {
-                        let owner = scope_type(item.name, visible, names, declaration_generic_names(item.generics))
-                        for method in item.methods {
-                            contracts.push((owner, method.name))
-                        }
-                        for base in item.bases {
-                            contract_edges.push((owner, scope_type(base, visible, names, declaration_generic_names(item.generics))))
-                            trait_edges.push((trait_receiver_type(item.name, item.generics), "dyn " + base, declaration_generic_names(item.generics)))
-                        }
-                        for method in item.methods {
-                            let is_static = !function_has_receiver(method)
-                            let mut params = Vec[str]::new()
-                            let mut index = 0_usize
-                            for param in method.params {
-                                if is_static || index > 0_usize {
-                                    params.push(param.typ.unwrap_or(""))
-                                }
-                                index += 1_usize
+                    for position in 0_usize..group.methods.len() {
+                        out.push(group.methods.get_unchecked_borrowed(position))
+                        visibility.push((out.len() - 1_usize, group.visibility.get_unchecked_borrowed(position), contract))
+                    }
+                    continue
+                }
+                let owner = scope_type_indexed(group.name, visible, type_index, group.generic_names)
+                for method in group.methods {
+                    contracts.push((owner, method.name))
+                }
+                for base in group.bases {
+                    contract_edges.push((owner, scope_type_indexed(base, visible, type_index, group.generic_names)))
+                    trait_edges.push((group.receiver, "dyn " + base, group.generic_names))
+                }
+                for method in group.methods {
+                    out.push(method)
+                    if !method.is_static && group.plugin {
+                        let mut error_type = ""
+                        for binding in names {
+                            if binding.scope == "platform::plugin" && binding.name == "PluginError" {
+                                error_type = binding.identity
                             }
-                            out.push(SemanticMethod::new(visible, trait_receiver_type(item.name, item.generics), method.name, params,
-                                    semantic_call_return_type(method),).with_generics(declaration_generic_names(item.generics)).with_method_generics(declaration_generic_names(method.generics)).with_static(is_static))
-                            if !is_static && contains_string(item.attrs, "plugin_interface") {
-                                let mut error_type = ""
-                                for binding in names {
-                                    if binding.scope == "platform::plugin" && binding.name == "PluginError" {
-                                        error_type = binding.identity
-                                    }
-                                }
-                                if error_type != "" {
-                                    let binders = declaration_generic_names(item.generics)
-                                    let interface = scope_type(trait_receiver_type(item.name, item.generics), visible, names_in_scope(names, visible), binders)
-                                    let result = scope_type(semantic_call_return_type(method), visible, names_in_scope(names, visible), binders)
-                                    for binding in names {
-                                        if binding.scope == "platform::plugin" &&(binding.name == "Binding" || binding.name == "Resource") {
-                                            let proxy = SemanticMethod::new(visible, binding.identity + "[" + interface + "]", method.name,
-                                                params, "Result[" + result + "," + error_type + "]",).with_generics(binders)
-                                            out.push(SemanticMethod {
-                                                    proxy.module_name, proxy.receiver_type, proxy.name, proxy.params,
-                                                    proxy.ret_type, proxy.signature, item.name, proxy.generic_names, false, true, Vec[str]::new()
-                                                }
-                                            )
+                        }
+                        if error_type != "" {
+                            let interface = scope_type_indexed(group.receiver, visible, type_index, group.generic_names)
+                            let result = scope_type_indexed(method.ret_type, visible, type_index, group.generic_names)
+                            for binding in names {
+                                if binding.scope == "platform::plugin" &&(binding.name == "Binding" || binding.name == "Resource") {
+                                    let proxy = SemanticMethod::new(visible, binding.identity + "[" + interface + "]", method.name,
+                                        method.params, "Result[" + result + "," + error_type + "]",).with_generics(group.generic_names)
+                                    out.push(SemanticMethod {
+                                            proxy.module_name, proxy.receiver_type, proxy.name, proxy.params,
+                                            proxy.ret_type, proxy.signature, group.name, proxy.generic_names, false, true, Vec[str]::new()
                                         }
-                                    }
+                                    )
                                 }
                             }
                         }
-                    }
-                    _ => {
                     }
                 }
             }
         }
+        let visibility_started = perf_counter_ms()
         for entry in visibility {
             match out.get(entry.0) {
                 Some(method) => {
                     let is_public = entry.1 || trait_contract_has_member(contracts, contract_edges, entry.2, method.name)
-                    out.set(entry.0, method.with_visibility(is_public))
+                    // Most methods are already public. Replacing an identical
+                    // record still rewrites all graph edges in the vector.
+                    if !is_public || !method.is_public {
+                        out.set(entry.0, method.with_visibility(is_public))
+                    }
                 }
                 None => {
                 }
             }
         }
+        let inheritance_started = perf_counter_ms()
         // Close the reachable inheritance graph without reparsing every pair
         // of modules. Existing child declarations win; cycles reach a fixed point.
         let mut changed = true
@@ -3844,6 +4909,9 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        self.preparation_timings.method_collect_ms += visibility_started - started
+        self.preparation_timings.method_visibility_ms += inheritance_started - visibility_started
+        self.preparation_timings.method_inheritance_ms += perf_counter_ms() - inheritance_started
         encore_strset_free(inherited_names)
         ret out
     }
@@ -3873,6 +4941,33 @@ impl for AnalysisDatabase {
         }
         self.semantic_graph = graph
         self.semantic_graph_revision = self.revision
+        let mut positions = SemanticKeyIndex::new(graph.len())
+        for index in 0_usize..graph.len() {
+            positions.set(graph.get_unchecked_borrowed(index).module_name, index)
+        }
+        self.semantic_graph_index = positions
+        let mut edges = Vec[Vec[usize]]::with_capacity(graph.len())
+        for source in graph {
+            let mut visible = Vec[usize]::new()
+            let seen = encore_strset_new()
+            let own = positions.get(source.module_name)
+            if own != 0_usize {
+                visible.push(own - 1_usize)
+                let _ = encore_strset_insert(seen, source.module_name)
+            }
+            for target in source.targets {
+                let normalized = self.resolved_import_target(source.module_name, strip_import_alias(target))
+                for index in 0_usize..graph.len() {
+                    let candidate = graph.get_unchecked_borrowed(index).module_name
+                    if (normalized == candidate || starts_with(normalized, candidate + "::")) && encore_strset_insert(seen, candidate) {
+                        visible.push(index)
+                    }
+                }
+            }
+            encore_strset_free(seen)
+            edges.push(visible)
+        }
+        self.semantic_edges = edges
         self.semantic_reachability = Vec[SemanticReachabilityCache]::new()
         ret()
     }
@@ -3883,46 +4978,44 @@ impl for AnalysisDatabase {
                 ret cached.modules
             }
         }
-        let mut modules = Vec[str]::new()
-        modules.push(module_name)
-        let mut index = 0_usize
-        while index < modules.len() {
-            let current = modules.get(index).unwrap_or("")
-            for visible in self.visible_semantic_modules(current) {
-                if !contains_string(modules, visible) {
-                    modules.push(visible)
+        let mut modules = vec![module_name]
+        let mut pending = Vec[usize]::new()
+        let own = self.semantic_graph_index.get(module_name)
+        if own != 0_usize {
+            pending.push(own - 1_usize)
+        }
+        let seen = encore_strset_new()
+        let _ = encore_strset_insert(seen, module_name)
+        let mut position = 0_usize
+        while position < pending.len() {
+            let current = pending.get_unchecked_borrowed(position)
+            position += 1_usize
+            for edge in self.semantic_edges.get_unchecked_borrowed(current) {
+                let name = self.semantic_graph.get_unchecked_borrowed(edge).module_name
+                if encore_strset_insert(seen, name) {
+                    modules.push(name) pending.push(edge)
                 }
             }
-            index += 1_usize
         }
+        encore_strset_free(seen)
         self.semantic_reachability.push(SemanticReachabilityCache {
                 module_name, self.revision, modules
             }
-            ,
         )
         ret modules
     }
 
     fn visible_semantic_modules(self: mut Self, module_name: str) -> Vec[str] {
         self.ensure_semantic_graph()
-        let mut visible_modules = Vec[str]::new()
-        visible_modules.push(module_name)
-        for source in self.semantic_graph {
-            if source.module_name == module_name {
-                for target in source.targets {
-                    let normalized = self.resolved_import_target(module_name, strip_import_alias(target))
-                    for candidate in self.semantic_graph {
-                        if normalized == candidate.module_name || starts_with(normalized, candidate.module_name
-                            + "::",) {
-                            if !contains_string(visible_modules, candidate.module_name) {
-                                visible_modules.push(candidate.module_name)
-                            }
-                        }
-                    }
-                }
-            }
+        let mut modules = Vec[str]::new()
+        let index = self.semantic_graph_index.get(module_name)
+        if index == 0_usize {
+            ret vec![module_name]
         }
-        ret visible_modules
+        for edge in self.semantic_edges.get_unchecked_borrowed(index - 1_usize) {
+            modules.push(self.semantic_graph.get_unchecked_borrowed(edge).module_name)
+        }
+        ret modules
     }
 
     fn resolved_import_target(self: Self, module_name: str, target: str) -> str {
@@ -4179,6 +5272,20 @@ fn symbol_position(symbols: Vec[FrontendSymbol], name: str, kind: usize) ->(usiz
         }
         ,
     )
+}
+
+fn declared_semantic_method(module_name: str, receiver: str, generics: Vec[str], method: FunctionItem) -> SemanticMethod {
+    let is_static = !function_has_receiver(method)
+    let mut params = Vec[str]::with_capacity(method.params.len())
+    let mut position = 0_usize
+    for param in method.params {
+        if is_static || position > 0_usize {
+            params.push(param.typ.unwrap_or(""))
+        }
+        position += 1_usize
+    }
+    ret SemanticMethod::new(module_name, receiver, method.name, params, semantic_call_return_type(method))
+    .with_generics(generics).with_method_generics(declaration_generic_names(method.generics)).with_static(is_static)
 }
 
 fn trait_receiver_type(name: str, generics: Vec[GenericParam]) -> str {
@@ -4845,15 +5952,19 @@ fn member_details(document: FrontendDocument, definition: HirDefinition, types: 
 /// Finds the identifier span, including split signatures and metadata-only
 /// declarations. Consumers must not confuse the `fn` span with its name.
 pub fn function_declaration_position(document: FrontendDocument, item: FunctionItem) ->(usize, usize) {
-    if document.tokens.len() != 0 {
-        ret function_name_position(document.tokens, item)
+    ret semantic_function_position(document.tokens, document.symbols, item)
+}
+
+fn semantic_function_position(tokens: Vec[Token], symbols: Vec[FrontendSymbol], item: FunctionItem) ->(usize, usize) {
+    if tokens.len() != 0 {
+        ret function_name_position(tokens, item)
     }
     // Compiled package metadata already contains precise symbol sites; do not
     // manufacture a lexer input merely to find the identifier after `fn`.
     let mut line = item.line
     let mut column = item.column
     let mut found = false
-    for symbol in document.symbols {
+    for symbol in symbols {
         if symbol.kind != 12 || symbol.name != item.name || symbol.line < item.line
         ||(symbol.line == item.line && symbol.column < item.column) {
             continue

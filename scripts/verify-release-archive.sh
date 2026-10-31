@@ -37,7 +37,7 @@ for binary in encore encore-lsp; do
 done
 # Bundled path dependencies must be present alongside their consumers. In
 # particular, JSON now requires serialize even in a fresh offline install.
-for package in core platform std rich serialize json binary log profile ehir ehir-llvm-backend toml colorterm llvm argparse secret-store; do
+for package in core platform std rich serialize json binary log profile ehir-core ehir ehir-llvm-backend toml colorterm llvm argparse secret-store; do
   read_member "lib/encore/index/$package/encore.toml" > "$scratch/manifest"
   test -s "$scratch/manifest"
   read_member "lib/encore/index/$package/src/lib.enq" > "$scratch/source"

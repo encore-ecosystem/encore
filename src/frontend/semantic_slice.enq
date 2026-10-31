@@ -1,0 +1,202 @@
+//! Immutable selections over shared semantic records, with local overlays.
+import core::iter::{IntoIterator, Iterator}
+import core::option::Option
+
+import std::vec::Vec
+
+pub struct SemanticSlice[T] {
+    values: Vec[T]
+    ordinals: Vec[usize]
+    indirect: bool
+    overlay: Vec[T]
+}
+
+pub struct SemanticSliceIter[T] {
+    values: SemanticSlice[T]
+    position: usize
+}
+
+impl[T] for SemanticSlice[T] {
+    pub fn from_vec(values: Vec[T]) -> Self {
+        ret Self { values, Vec[usize]::new(), false, Vec[T]::new() }
+    }
+    pub fn project(values: Vec[T], ordinals: Vec[usize]) -> Self {
+        ret Self { values, ordinals, true, Vec[T]::new() }
+    }
+    #attr(borrowed_self)
+    pub fn len(self: Self) -> usize {
+        ret(if self.indirect {
+                self.ordinals.len()
+            } else {
+                self.values.len()
+            }
+        ) + self.overlay.len()
+    }
+    #attr(borrowed_self)
+    pub fn is_empty(self: Self) -> bool {
+        ret self.len() == 0_usize
+    }
+    /// Like get(position).is_some(), without loading or retaining the record.
+    #attr(borrowed_self)
+    pub fn contains_index(self: Self, position: usize) -> bool {
+        let base = if self.indirect {
+            self.ordinals.len()
+        } else {
+            self.values.len()
+        }
+        if position >= base {
+            ret position - base < self.overlay.len()
+        }
+        if self.indirect {
+            ret self.ordinals.get_unchecked_borrowed(position) < self.values.len()
+        }
+        ret true
+    }
+    #attr(borrowed_self)
+    pub fn get(self: Self, position: usize) -> Option[T] {
+        let base = if self.indirect {
+            self.ordinals.len()
+        } else {
+            self.values.len()
+        }
+        if position >= base {
+            ret self.overlay.get(position - base)
+        }
+        if self.indirect {
+            match self.ordinals.get(position) {
+                Some(index) => {
+                    ret self.values.get(index)
+                }
+                None => {
+                    ret Option[T]::None
+                }
+            }
+        }
+        ret self.values.get(position)
+    }
+    #attr(borrowed_return)
+    #attr(borrowed_self)
+    pub fn get_unchecked_borrowed(self: Self, position: usize) -> T {
+        let base = if self.indirect {
+            self.ordinals.len()
+        } else {
+            self.values.len()
+        }
+        if position >= base {
+            ret self.overlay.get_unchecked_borrowed(position - base)
+        }
+        let index = if self.indirect {
+            self.ordinals.get_unchecked_borrowed(position)
+        } else {
+            position
+        }
+        ret self.values.get_unchecked_borrowed(index)
+    }
+    pub fn with_overlay(self: Self, extra: Vec[T]) -> Self {
+        if extra.is_empty() {
+            ret self
+        }
+        let mut overlay = Vec[T]::with_capacity(self.overlay.len() + extra.len())
+        overlay.extend(self.overlay)
+        overlay.extend(extra)
+        ret Self { self.values, self.ordinals, self.indirect, overlay }
+    }
+    pub fn iter(self: Self) -> SemanticSliceIter[T] {
+        ret SemanticSliceIter[T] { self, 0_usize }
+    }
+    /// Compatibility only: production semantic preparation retains the view.
+    pub fn materialize(self: Self) -> Vec[T] {
+        if !self.indirect && self.overlay.is_empty() {
+            ret self.values
+        }
+        let mut values = Vec[T]::with_capacity(self.len())
+        for position in 0_usize..self.len() {
+            match self.get(position) {
+                Some(value) => values.push(value) None => {
+                }
+            }
+        }
+        ret values
+    }
+}
+
+impl[T] Iterator[T] for SemanticSliceIter[T] {
+    pub fn next(self: Self) ->(Self, Option[T]) {
+        let value = self.values.get(self.position)
+        ret(Self { self.values, self.position + 1_usize }, value)
+    }
+}
+
+impl[T] IntoIterator[T, SemanticSliceIter[T]] for SemanticSlice[T] {
+    pub fn into_iter(self: Self) -> SemanticSliceIter[T] {
+        ret self.iter()
+    }
+}
+
+/// Collision-checked string positions; zero means absent. Construction is local,
+/// while readers use immutable arrays and can share the index across workers.
+pub struct SemanticKeyIndex {
+    keys: Vec[str]
+    positions: Vec[usize]
+    count: usize
+}
+fn semantic_key_hash(key: str) -> usize {
+    let mut value = 1469598103934665603_u64
+    for offset in 0_usize..key.byte_len() {
+        value =(value ^ key.byte_at(offset) as u64) * 1099511628211_u64
+    }
+    ret value as usize
+}
+
+impl for SemanticKeyIndex {
+    pub fn new(expected: usize) -> Self {
+        let mut capacity = 16_usize
+        while capacity < expected * 2_usize + 1_usize {
+            capacity *= 2_usize
+        }
+        let mut keys = Vec[str]::with_capacity(capacity)
+        let mut positions = Vec[usize]::with_capacity(capacity)
+        for _ in 0_usize..capacity {
+            keys.push("") positions.push(0_usize)
+        }
+        ret Self { keys, positions, 0_usize }
+    }
+    #attr(borrowed_self)
+    pub fn get(self: Self, key: str) -> usize {
+        let mask = self.keys.len() - 1_usize
+        let mut slot = semantic_key_hash(key) & mask
+        for _ in 0_usize..self.keys.len() {
+            let value = self.positions.get_unchecked_borrowed(slot)
+            if value == 0_usize || self.keys.get_unchecked_borrowed(slot) == key {
+                ret value
+            }
+            slot =(slot + 1_usize) & mask
+        }
+        ret 0_usize
+    }
+    pub fn set(self: mut Self, key: str, position: usize) ->() {
+        if self.count >= self.keys.len() / 2_usize {
+            let mut grown = Self::new(self.keys.len())
+            for slot in 0_usize..self.keys.len() {
+                let stored = self.positions.get_unchecked_borrowed(slot)
+                if stored != 0_usize {
+                    grown.set(self.keys.get_unchecked_borrowed(slot), stored - 1_usize)
+                }
+            }
+            self.keys = grown.keys self.positions = grown.positions self.count = grown.count
+        }
+        let mask = self.keys.len() - 1_usize
+        let mut slot = semantic_key_hash(key) & mask
+        loop {
+            let stored = self.positions.get_unchecked_borrowed(slot)
+            if stored == 0_usize {
+                self.keys.set(slot, key) self.positions.set(slot, position + 1_usize)
+                self.count += 1_usize ret()
+            }
+            if self.keys.get_unchecked_borrowed(slot) == key {
+                self.positions.set(slot, position + 1_usize) ret()
+            }
+            slot =(slot + 1_usize) & mask
+        }
+    }
+}
