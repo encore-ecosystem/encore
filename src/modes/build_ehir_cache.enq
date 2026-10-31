@@ -6,7 +6,7 @@ import std::path::Path
 import std::thread::JoinHandle
 import std::vec::Vec
 
-import ehirlib::{Directive, FnDirective, FunctionPreparationKey, Module, ModuleBundle, PreparedFunctionStore, fn_to_string, make_module_bundle, prepare_with_store, prepared_bytes_payload, prepared_payload_bytes, type_to_string}
+import ehirlib::{Directive, FnDirective, FunctionPreparationKey, Module, ModuleBundle, PreparedFunctionStore, decode_typed_module, encode_typed_module, fn_to_string, make_module_bundle, prepare_with_store, prepared_bytes_payload, prepared_payload_bytes, type_to_string}
 
 import mod::build_lowering_cache::{commit_lowered_module, restore_lowered_module}
 import refrain::cache_identity::compiler_content_digest
@@ -39,6 +39,13 @@ impl PreparedFunctionStore for EhirPreparationStore {
 }
 
 pub fn prepare_ehir_unit(bundle: ModuleBundle, context: str, cache: Option[Path], jobs: usize) -> Result[PreparedEhirUnit, str] {
+    ret prepare_ehir_unit_with_keys(bundle, context, cache, jobs, Vec[(str, str)]::new())
+}
+
+/// Proven lowering identities let unchanged modules bypass per-function store
+/// lookups and normalization. Changed modules retain the function-level cache.
+pub fn prepare_ehir_unit_with_keys(bundle: ModuleBundle, context: str, cache: Option[Path], jobs: usize,
+    module_keys: Vec[(str, str)],) -> Result[PreparedEhirUnit, str] {
     if jobs == 0_usize {
         ret Result::Err("EHIR preparation needs at least one CPU lease")
     }
@@ -49,10 +56,16 @@ pub fn prepare_ehir_unit(bundle: ModuleBundle, context: str, cache: Option[Path]
     }
     let cache_enabled = cache.is_some()
     for module in bundle.modules {
+        let mut module_key = ""
+        for entry in module_keys {
+            if entry.0 == module.name {
+                module_key = entry.1 break
+            }
+        }
         if jobs == 1_usize {
-            results.push(prepare_ehir_module(module, context, cache_path, cache_enabled))
+            results.push(prepare_ehir_module(module, context, cache_path, cache_enabled, module_key))
         } else {
-            pending.push(spawn prepare_ehir_module(module, context, cache_path, cache_enabled))
+            pending.push(spawn prepare_ehir_module(module, context, cache_path, cache_enabled, module_key))
             if pending.len() == jobs {
                 for handle in pending {
                     results.push(handle.join())
@@ -82,11 +95,37 @@ pub fn prepare_ehir_unit(bundle: ModuleBundle, context: str, cache: Option[Path]
     )
 }
 
-fn prepare_ehir_module(module: sending Module, context: str, cache_path: str, cache_enabled: bool) -> sending Result[PreparedEhirUnit, str] {
+fn prepare_ehir_module(module: sending Module, context: str, cache_path: str, cache_enabled: bool, module_key: str) -> sending Result[PreparedEhirUnit, str] {
     let cache = if cache_enabled {
         Option[Path]::Some(Path::new(cache_path))
     } else {
         Option[Path]::None
+    }
+    let snapshot_key = if module_key.is_empty() {
+        ""
+    } else {
+        compiler_content_digest("encore-normalized-ehir-module-1\n" + context + "\n" + module_key)
+    }
+    if cache_enabled && !snapshot_key.is_empty() {
+        match restore_lowered_module(cache, snapshot_key)? {
+            Some(payload) => {
+                match decode_typed_module(payload, snapshot_key) {
+                    Ok(restored) => {
+                        if restored.name == module.name {
+                            ret Result::Ok(PreparedEhirUnit {
+                                    make_module_bundle(module.name, vec![restored]),
+                                    0_usize, module_function_count(module), 0_usize
+                                }
+                            )
+                        }
+                    }
+                    Err(_) => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
     }
     let bundle = make_module_bundle(module.name, vec![module])
     let mut keys = Vec[FunctionPreparationKey]::new()
@@ -122,15 +161,42 @@ fn prepare_ehir_module(module: sending Module, context: str, cache_path: str, ca
             ret Result::Err("EHIR " + error.stage + ": " + error.message)
         }
     }
+    if cache_enabled && !snapshot_key.is_empty() {
+        match prepared.program.program.modules.get(0_usize) {
+            Some(normalized) => {
+                commit_lowered_module(cache, snapshot_key, encode_typed_module(normalized, snapshot_key)?)?
+            }
+            None => {
+                ret Result::Err("normalization lost an owned module")
+            }
+        }
+    }
     ret Result::Ok(PreparedEhirUnit {
             prepared.program.program, prepared.functions_prepared, prepared.functions_reused, prepared.modules_fallback
         }
     )
 }
 
+fn module_function_count(module: Module) -> usize {
+    let mut count = 0_usize
+    for directive in module.directives {
+        match directive {
+            Directive::Function(_) => {
+                count += 1_usize
+            }
+            Directive::Impl(implementation) => {
+                count += implementation.methods.len()
+            }
+            _ => {
+            }
+        }
+    }
+    ret count
+}
+
 fn preparation_key(module: str, owner: str, directive: usize, method: usize,
     function: FnDirective, context: str,) -> FunctionPreparationKey {
-    let key = compiler_content_digest("encore-prepared-ehir-function-3\ncommon:1\n" + context + "\n" + module + "\n" + owner + "\n" + fn_to_string(function))
+    let key = compiler_content_digest("encore-prepared-ehir-function-4\ncommon:2\n" + context + "\n" + module + "\n" + owner + "\n" + fn_to_string(function))
     ret FunctionPreparationKey { module, directive, method, key }
 }
 
@@ -196,4 +262,56 @@ fn ehir_preparation_parallel_cache_contract() -> bool {
     }
     let _cleanup = std::os::remove_dir_all(root.as_str())
     ret true
+}
+
+#attr(test)
+fn ehir_preparation_module_identity_contract() -> bool {
+    let root = Path::new("target/ehir-module-snapshot-" + core::fmt::Debug::fmt(std::time::perf_counter_ns())).resolve()
+    let source = "entry first\nmodule first {\nfn first() -> u32 {\n$entry:\nv: u32 = capprim 1_u32\nret v: u32\n}\n}\n" +
+    "module second {\nfn second() -> u32 {\n$entry:\nv: u32 = capprim 2_u32\nret v: u32\n}\n}\n"
+    let bundle = match ehirlib::parse_text("first", source) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let cache = Option[Path]::Some(root)
+    let keys = vec![("first", compiler_content_digest("first version")),("second", compiler_content_digest("second version"))]
+    let cold = prepare_ehir_unit_with_keys(bundle, "test-context", cache, 2_usize, keys)
+    let warm = prepare_ehir_unit_with_keys(bundle, "test-context", cache, 1_usize, keys)
+    let mut ok = cold.is_ok() && warm.is_ok()
+    match warm {
+        Ok(value) => {
+            ok = ok && value.prepared == 0_usize && value.reused == 2_usize &&
+            ehirlib::module_bundle_to_string(value.bundle) == ehirlib::module_bundle_to_string(cold.unwrap_or(value).bundle)
+        }
+        Err(_) => {
+            ok = false
+        }
+    }
+    // A changed module falls back to its function records, while the other
+    // module retains its already normalized, typed snapshot.
+    let changed_source = "entry first\nmodule first {\nfn first() -> u32 {\n$entry:\nv: u32 = capprim 3_u32\nret v: u32\n}\n}\n" +
+    "module second {\nfn second() -> u32 {\n$entry:\nv: u32 = capprim 2_u32\nret v: u32\n}\n}\n"
+    match ehirlib::parse_text("first", changed_source) {
+        Ok(changed) => {
+            let changed_keys = vec![("first", compiler_content_digest("first changed")),("second", compiler_content_digest("second version"))]
+            match prepare_ehir_unit_with_keys(changed, "test-context", cache, 2_usize, changed_keys) {
+                Ok(value) => {
+                    ok = ok && value.prepared == 1_usize && value.reused == 1_usize
+                }
+                Err(_) => {
+                    ok = false
+                }
+            }
+        }
+        Err(_) => {
+            ok = false
+        }
+    }
+    let key = compiler_content_digest("encore-normalized-ehir-module-1\ntest-context\n" + compiler_content_digest("first version"))
+    let corrupt = commit_lowered_module(cache, key, "invalid typed module")
+    let repaired = prepare_ehir_unit_with_keys(bundle, "test-context", cache, 1_usize, keys)
+    ok = ok && corrupt.is_ok() && repaired.is_ok()
+    let _removed = std::os::remove_dir_all(root.as_str())
+    ret ok
 }

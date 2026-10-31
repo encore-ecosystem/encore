@@ -1,5 +1,6 @@
 import core::fmt::Debug
 import core::option::Option
+import core::result::Result
 
 import std::io::eprintln
 import std::os::env
@@ -8,7 +9,7 @@ import std::time::perf_counter_ms
 import std::vec::{Vec, vec_singleton}
 
 import ehir_core::{PreparationOutcome, enum_value, parse_module_bundle_text, prepare_module}
-import ehir_core::core::{BinaryOpKind, Block, CallInstruction, Directive, EdgeInstruction, EhirDocumentation, EhirImport, EnumVariant, FieldSelector, FnDirective, Instruction, MatchArm, MatchInstruction, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, ValueKind, Variable, add_edge, alias, async_fn_item, await_value, binary, block, br_term, call, cbr_term, cfree, drop_value, ehir_documentation, ehir_import, enum_directive, enum_variant, extern_fn_item, fn_item, gep, getfield, getfieldptr, getptr, halloc, hfree, hrealloc, impl_directive, lceos, lcpos, lcsos, load, local_place_type, make_module, make_module_bundle, make_module_with_metadata, mangle_plain_type_name, mangle_type_name, match_arm, match_term, memory_value_type, param, pcast, phi, phi_pair, put, raw_type, remove_edge, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, store, struct_directive, switch_case, switch_term, trait_directive, trait_method, unreachable_term}
+import ehir_core::core::{BinaryOpKind, Block, CallInstruction, Directive, EdgeInstruction, EhirDocumentation, EhirImport, EnumVariant, FieldSelector, FnDirective, Instruction, MatchArm, MatchInstruction, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, ValueKind, Variable, add_edge, alias, async_fn_item, await_value, binary, block, br_term, call, cbr_term, cfree, drop_value, ehir_documentation, ehir_import, enum_directive, enum_variant, extern_fn_item, fn_item, function_body_identity, gep, getfield, getfieldptr, getptr, halloc, hfree, hrealloc, impl_directive, lceos, lcpos, lcsos, load, local_place_type, make_module, make_module_bundle, make_module_with_metadata, mangle_plain_type_name, mangle_type_name, match_arm, match_term, memory_value_type, param, pcast, phi, phi_pair, put, raw_type, remove_edge, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, store, struct_directive, switch_case, switch_term, trait_directive, trait_method, unreachable_term}
 
 fn concat_instructions(left: Vec[LLVMInstruction], right: Vec[LLVMInstruction]) -> Vec[LLVMInstruction] {
     let mut out = Vec[LLVMInstruction]::new()
@@ -6871,4 +6872,396 @@ fn lower_function_address(data: frozen CallInstruction) -> Vec[LLVMInstruction] 
     let target = data.name.slice(25, data.name.len() - 25)
     let pointer = const_text("@" + function_symbol(target), llvm_raw_type(LLVMTypeKind::POINTER, signature))
     ret vec_singleton(llvm_inst_cast("ptrtoint", lower_variable(data.out), pointer))
+}
+
+extern fn ehir_llvm_declaration_index(declarations: str) -> usize
+extern fn ehir_llvm_declaration_index_free(index: usize) ->()
+extern fn ehir_llvm_compact_module(index: usize, body: str) -> str
+
+/// Dev CGUs need only the declarations referenced by their own lowered bodies.
+/// The immutable index is constructed once and shared by all emission threads.
+pub fn emit_compact_unit_codegen_selected_parallel(unit: frozen PreparedUnitCodegen, triple: str,
+    pointer_width: usize, selected: Vec[usize], jobs: usize,) -> Vec[EmittedIrModule] {
+    if selected.is_empty() {
+        ret Vec[EmittedIrModule]::new()
+    }
+    let declarations = match compact_unit_codegen_declarations(unit, triple, pointer_width) {
+        Ok(value) => value
+        Err(error) => {
+            ret vec![EmittedIrModule { "", "", 0_usize, error }]
+        }
+    }
+    ret emit_compact_unit_codegen_with_declarations(unit, triple, pointer_width, selected, jobs, declarations)
+}
+
+/// Portable LLVM declaration text is an immutable backend input. The caller
+/// may cache it under the complete declaration/requirements/toolchain identity.
+pub fn compact_unit_codegen_declarations(unit: frozen PreparedUnitCodegen, triple: str,
+    pointer_width: usize,) -> Result[str, str] {
+    install_codegen_target(triple, pointer_width)
+    let directives = module_bundle_directives(unit.contexts)
+    let mut calls = Vec[GenericCall]::new()
+    for requirement in unit.requirements.generic_calls {
+        calls.push(GenericCall {
+                requirement.name, clone_codegen_types(requirement.args), generic_symbol(requirement.name, requirement.args)
+            }
+        )
+    }
+    let expanded = expand_generic_calls(directives, calls)
+    let builder = unsafe {
+        encore_text_builder_new()
+    }
+    for declaration in lower_type_declarations(directives, unit.requirements.concrete_types) {
+        append_builder_line(builder, declaration)
+    }
+    for declaration in thread_context_declarations(directives) {
+        append_builder_line(builder, declaration)
+    }
+    for module in package_module_declarations(unit.contexts) {
+        for function in module.functions {
+            append_builder_line(builder, function.text)
+        }
+    }
+    append_builder_line(builder, unit_support_declarations(directives, expanded,
+            unit.requirements.concrete_types, unit.requirements.equality_types,))
+    for function in runtime_declarations() {
+        append_function_to_builder(builder, function)
+    }
+    let declarations = unsafe {
+        encore_text_builder_finish(builder)
+    }
+    let error = take_codegen_error()
+    if !error.is_empty() {
+        ret Result::Err(error)
+    }
+    ret Result::Ok(declarations)
+}
+
+/// Emits selected ordinary bodies against an already verified declaration
+/// snapshot. The native lookup index is rebuilt locally; no pointer persists.
+pub fn emit_compact_unit_codegen_with_declarations(unit: frozen PreparedUnitCodegen, triple: str,
+    pointer_width: usize, selected: Vec[usize], jobs: usize, declarations: str,) -> Vec[EmittedIrModule] {
+    if selected.is_empty() {
+        ret Vec[EmittedIrModule]::new()
+    }
+    install_codegen_target(triple, pointer_width)
+    let index = unsafe {
+        ehir_llvm_declaration_index(declarations)
+    }
+    let error = take_codegen_error()
+    if index == 0_usize || !error.is_empty() {
+        if index != 0_usize {
+            unsafe {
+                ehir_llvm_declaration_index_free(index)
+            }
+        }
+        ret vec![EmittedIrModule {
+                "", "", 0_usize, if error.is_empty() {
+                    "cannot index LLVM declarations"
+                } else {
+                    error
+                }
+            }
+        ]
+    }
+    let count = min_codegen_jobs(jobs, selected.len())
+    let scheduled = schedule_selected_codegen_modules(unit.owned, selected)
+    let mut chunks = Vec[EmittedIrChunk]::new()
+    if count == 1_usize {
+        chunks = emit_compact_package_batch(unit, scheduled, triple, pointer_width, index, 0_usize, 1_usize)
+    } else {
+        let mut handles = Vec[JoinHandle[Vec[EmittedIrChunk]]]::new()
+        for worker in 0_usize..count {
+            handles.push(spawn emit_compact_package_batch(unit, scheduled, triple, pointer_width, index, worker, count))
+        }
+        for handle in handles {
+            chunks.extend(handle.join())
+        }
+    }
+    unsafe {
+        ehir_llvm_declaration_index_free(index)
+    }
+    let mut ordered = Vec[Option[EmittedIrModule]]::with_capacity(unit.owned.len())
+    for _module in unit.owned {
+        ordered.push(Option[EmittedIrModule]::None)
+    }
+    for chunk in chunks {
+        ordered.set(chunk.index, Option[EmittedIrModule]::Some(chunk.module))
+    }
+    let mut out = Vec[EmittedIrModule]::new()
+    for wanted in selected {
+        match ordered.get(wanted).unwrap_or(Option[EmittedIrModule]::None) {
+            Some(value) => {
+                out.push(value)
+            }
+            None => {
+            }
+        }
+    }
+    ret out
+}
+
+fn emit_compact_package_batch(unit: frozen PreparedUnitCodegen, selected: frozen Vec[usize], triple: str,
+    width: usize, index: usize, worker: usize, workers: usize,) -> sending Vec[EmittedIrChunk] {
+    install_codegen_target(triple, width)
+    let mut out = Vec[EmittedIrChunk]::new()
+    let mut cursor = worker
+    while cursor < selected.len() {
+        let ordinal = selected.get(cursor).unwrap_or(unit.owned.len())
+        match unit.owned.get(ordinal) {
+            Some(module) => {
+                clear_codegen_error()
+                let builder = unsafe {
+                    encore_text_builder_new()
+                }
+                append_builder_line(builder, "; ModuleID = '" + sanitize_symbol(module.name) + "'")
+                for declaration in lower_string_globals(module.directives) {
+                    append_builder_line(builder, declaration)
+                }
+                for declaration in thread_context_declarations(module.directives) {
+                    append_builder_line(builder, declaration)
+                }
+                let seen = unsafe {
+                    encore_strset_new()
+                }
+                let emitted = append_lowered_directives(builder, module.directives, seen, false)
+                let _trampolines = append_unique_functions(builder, thread_trampolines(module.directives), seen, emitted, 0_usize)
+                unsafe {
+                    encore_strset_free(seen)
+                }
+                let body = unsafe {
+                    encore_text_builder_finish(builder)
+                }
+                let compact = unsafe {
+                    ehir_llvm_compact_module(index, body)
+                }
+                let diagnostic = if compact.is_empty() {
+                    "cannot close LLVM declaration dependencies"
+                } else {
+                    take_codegen_error()
+                }
+                let ir = "target triple = \"" + triple + "\"\n\n" + compact
+                out.push(EmittedIrChunk {
+                        ordinal, EmittedIrModule {
+                            module.name, ir, ir.byte_len(), diagnostic
+                        }
+                    }
+                )
+            }
+            None => {
+            }
+        }
+        cursor += workers
+    }
+    ret out
+}
+
+/// Function names already carry declaration-owned ABI identities, including
+/// overloads. Coordinates and their containing module's sibling bodies do not
+/// participate in a dev object's identity. Helpers retain ordinary definitions.
+pub fn function_codegen_units(unit: frozen PreparedUnitCodegen) -> PreparedUnitCodegen {
+    let mut owned = Vec[Module]::new()
+    for module in unit.owned {
+        let owners = unsafe {
+            encore_strmap_new()
+        }
+        let first = owned.len()
+        for directive in module.directives {
+            match directive {
+                Directive::Function(function) => {
+                    if function.generics.is_empty() && !function.is_extern {
+                        owned.push(make_module(module.name + "#function:" + function.name, vec![Directive::Function(clone_codegen_function(function))]))
+                        unsafe {
+                            encore_strmap_put(owners, function_body_identity(module.name, "", function.name), owned.len())
+                        }
+                    }
+                }
+                Directive::Impl(implementation) => {
+                    if !implementation.generics.is_empty() || !generated_closure_owner(implementation.for_type.name).is_empty() {
+                        continue
+                    }
+                    for method in implementation.methods {
+                        if method.generics.is_empty() && !method.is_extern {
+                            let item = impl_directive(clone_codegen_types(implementation.generics), "" + implementation.trait_name, clone_codegen_types(implementation.trait_args),
+                                clone_type(implementation.for_type), vec![clone_codegen_function(method)],)
+                            owned.push(make_module(module.name + "#method:" + mangle_type_name(implementation.for_type) + "::" + method.name,
+                                    vec![item],))
+                            unsafe {
+                                encore_strmap_put(owners, function_body_identity(module.name,
+                                        ehir_core::type_to_string(clone_type(implementation.for_type)), method.name,), owned.len())
+                            }
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        for directive in module.directives {
+            match directive {
+                Directive::Impl(implementation) => {
+                    let owner = generated_closure_owner(implementation.for_type.name)
+                    if owner.is_empty() {
+                        continue
+                    }
+                    let encoded = unsafe {
+                        encore_strmap_get(owners, owner)
+                    }
+                    if encoded > first && encoded <= owned.len() {
+                        let parent = owned.get_unchecked_borrowed(encoded - 1_usize)
+                        let mut declarations = parent.directives
+                        declarations.push(clone_codegen_directive(directive))
+                        owned.set(encoded - 1_usize, make_module(parent.name, declarations))
+                    } else {
+                        // Standalone EHIR and generic templates may have no
+                        // ordinary parent in this unit. Preserve their owners.
+                        for method in implementation.methods {
+                            if implementation.generics.is_empty() && method.generics.is_empty() && !method.is_extern {
+                                owned.push(make_module(module.name + "#method:" + mangle_type_name(implementation.for_type) + "::" + method.name,
+                                        vec![impl_directive(clone_codegen_types(implementation.generics), "" + implementation.trait_name,
+                                                clone_codegen_types(implementation.trait_args), clone_type(implementation.for_type), vec![clone_codegen_function(method)],)],))
+                            }
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        unsafe {
+            encore_strmap_free(owners)
+        }
+    }
+    ret PreparedUnitCodegen {
+        owned, unit_codegen_input_context(unit).modules, unit_codegen_requirements(unit)
+    }
+}
+
+fn generated_closure_owner(name: str) -> str {
+    let prefix = "__encore_closure_"
+    if name.byte_len() < prefix.byte_len() + 69_usize || name.slice_bytes(0_usize, prefix.byte_len()) != prefix {
+        ret ""
+    }
+    let mut cursor = prefix.byte_len()
+    while cursor < name.byte_len() {
+        let byte = name.byte_at(cursor)
+        if !((byte >= 48_u8 && byte <= 57_u8) ||(byte >= 97_u8 && byte <= 102_u8)) {
+            break
+        }
+        cursor += 1_usize
+    }
+    if cursor + 67_usize > name.byte_len() || name.slice_bytes(cursor, 2_usize) != "_f" {
+        ret ""
+    }
+    let key = name.slice_bytes(cursor + 2_usize, 64_usize)
+    for index in 0_usize..64_usize {
+        let byte = key.byte_at(index)
+        if !((byte >= 48_u8 && byte <= 57_u8) ||(byte >= 97_u8 && byte <= 102_u8)) {
+            ret ""
+        }
+    }
+    if name.byte_at(cursor + 66_usize) != 95_u8 {
+        ret ""
+    }
+    ret key
+}
+
+/// Ordinary impl bodies are not inputs to another ordinary function object.
+/// Generic implementations remain templates of the separately keyed support CGU.
+pub fn unit_codegen_declaration_context(unit: frozen PreparedUnitCodegen) -> ModuleBundle {
+    let mut modules = Vec[Module]::new()
+    for module in unit.contexts {
+        let mut directives = Vec[Directive]::new()
+        for directive in module.directives {
+            match directive {
+                Directive::Function(function) => {
+                    directives.push(Directive::Function(extern_fn_item("" + function.name, clone_codegen_types(function.generics), clone_codegen_params(function.params), clone_type(function.ret_type))))
+                }
+                Directive::Impl(implementation) => {
+                    let mut methods = Vec[FnDirective]::new()
+                    for method in implementation.methods {
+                        methods.push(extern_fn_item("" + method.name, clone_codegen_types(method.generics), clone_codegen_params(method.params), clone_type(method.ret_type)))
+                    }
+                    directives.push(impl_directive(clone_codegen_types(implementation.generics), "" + implementation.trait_name, clone_codegen_types(implementation.trait_args),
+                            clone_type(implementation.for_type), methods,))
+                }
+                _ => {
+                    directives.push(clone_codegen_directive(directive))
+                }
+            }
+        }
+        modules.push(make_module("" + module.name, directives))
+    }
+    ret make_module_bundle("", modules)
+}
+
+#attr(test)
+fn compact_package_codegen_closes_only_needed_declarations() -> bool {
+    let dependencies = parse_module_bundle_text("", "module dependency {\n" +
+        "struct Pair {\nvalue: u32\n}\nstruct Unused {\nvalue: f64\n}\n" +
+        "extern fn unused(value: Unused) -> u32\n" +
+        "impl Pair {\nfn read(self: Pair) -> u32 {\n$entry:\nv: u32 = capprim 7_u32\nret v: u32\n}\n}\n}\n",)
+    let source = "module owned {\nfn alpha(value: Pair) -> u32 {\n$entry:\n" +
+    "answer: u32 = call Pair::read(value: Pair)\nret answer: u32\n}\n" +
+    "fn beta(value: u32) -> u32 {\n$entry:\nret value: u32\n}\n}\n"
+    for target in vec![("x86_64-unknown-linux-gnu", 64_usize),("aarch64-apple-darwin", 64_usize),
+        ("x86_64-pc-windows-msvc", 64_usize),("i686-unknown-linux-gnu", 32_usize)] {
+        clear_codegen_error()
+        let unit = prepare_unit_codegen(parse_module_bundle_text("", source), dependencies, target.0, target.1, 1_usize)
+        let functions = function_codegen_units(unit)
+        if functions.owned.len() != 2_usize {
+            ret false
+        }
+        let serial = emit_compact_unit_codegen_selected_parallel(functions, target.0, target.1, vec![0_usize, 1_usize], 1_usize)
+        let parallel = emit_compact_unit_codegen_selected_parallel(functions, target.0, target.1, vec![0_usize, 1_usize], 2_usize)
+        let declarations = match compact_unit_codegen_declarations(functions, target.0, target.1) {
+            Ok(value) => value Err(_) => { ret false }
+        }
+        let cached = emit_compact_unit_codegen_with_declarations(functions, target.0, target.1, vec![0_usize, 1_usize], 2_usize, declarations)
+        if serial.len() != 2_usize || parallel.len() != 2_usize || cached.len() != 2_usize {
+            ret false
+        }
+        for index in 0_usize..2_usize {
+            let left = serial.get(index).unwrap_or(EmittedIrModule {
+                    "", "", 0_usize, "missing output"
+                }
+            )
+            let right = parallel.get(index).unwrap_or(EmittedIrModule {
+                    "", "", 0_usize, "missing output"
+                }
+            )
+            if !left.diagnostic.is_empty() || left.ir != right.ir || left.ir != cached.get_unchecked_borrowed(index).ir || left.ir.contains("Unused") || left.ir.contains("@unused") {
+                ret false
+            }
+        }
+        let alpha = serial.get(0_usize).unwrap_or(EmittedIrModule { "", "", 0_usize, "" }).ir
+        let beta = serial.get(1_usize).unwrap_or(EmittedIrModule { "", "", 0_usize, "" }).ir
+        if !alpha.contains("%Pair = type") || beta.contains("%Pair = type") ||
+        !alpha.contains("@Pair__read") || beta.contains("@Pair__read") || !take_codegen_error().is_empty() {
+            ret false
+        }
+    }
+    ret true
+}
+
+#attr(test)
+fn compact_package_codegen_keeps_owned_closures_with_function() -> bool {
+    let closure = "__encore_closure_6f776e6572_f" + function_body_identity("owner", "", "factory") + "_0_0"
+    let source = "module owner {\nstruct " + closure + " {\nvalue: u32\n}\n" +
+    "fn factory() -> u32 {\n$entry:\nvalue: u32 = capprim 1_u32\nret value: u32\n}\n" +
+    "impl " + closure + " {\nfn handle(self: " + closure + ") -> u32 {\n$entry:\nvalue: u32 = capprim 2_u32\nret value: u32\n}\n}\n}\n"
+    let original = prepare_unit_codegen(parse_module_bundle_text("owner", source), make_module_bundle("", Vec[Module]::new()),
+        "x86_64-unknown-linux-gnu", 64_usize, 1_usize,)
+    let unit = function_codegen_units(original)
+    if unit.owned.len() != 1_usize || unit.owned.get_unchecked_borrowed(0_usize).directives.len() != 2_usize {
+        ret false
+    }
+    let emitted = emit_compact_unit_codegen_selected_parallel(unit, "x86_64-unknown-linux-gnu", 64_usize, vec![0_usize], 2_usize)
+    let module = emitted.get(0_usize).unwrap_or(EmittedIrModule {
+            "", "", 0_usize, "missing output"
+        }
+    )
+    ret module.diagnostic.is_empty() && module.ir.contains("define i32 @factory") &&
+    module.ir.contains("define i32 @" + closure + "__handle") &&
+    function_body_identity("owner", "Left", "read") != function_body_identity("owner", "Right", "read")
 }

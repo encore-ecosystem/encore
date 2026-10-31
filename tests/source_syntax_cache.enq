@@ -1,0 +1,148 @@
+//! Restored strict syntax preserves imports, heap AST nodes, spans and constants.
+import core::option::Option
+import core::result::Result
+import core::testing::assert
+
+import std::io::eprintln
+import std::os::{mkdir_all, read_dir, remove_dir_all, write_file}
+import std::path::Path
+import std::time::perf_counter_ns
+import std::vec::Vec
+
+import ehirlib::{prepared_bytes_payload, prepared_payload_bytes}
+import json::stringify
+
+import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::metadata_ast::encode_metadata_ast
+import refrain::frontend::source_artifact::ParsedSourceArtifact
+import refrain::frontend::source_codec::{decode_snapshot_ParsedSourceArtifact, encode_snapshot_ParsedSourceArtifact}
+import refrain::modes::build_source_cache::{load_source_documents, publish_source_documents}
+import refrain::modes::cache_payload::{read_packed_payload, write_payload}
+import refrain::project::manifest::try_read_project_manifest
+import refrain::project::workspace::{CompiledWorkspaceModule, ProjectWorkspace, ResolvedPackageGraph, WorkspaceRefrain, try_load_compilation_unit, try_load_compilation_unit_with_sources}
+
+fn owner(root: Path) -> Result[WorkspaceRefrain, str] {
+    let manifest = match try_read_project_manifest(root) {
+        Ok(value) => value Err(failure) => {
+            ret Result::Err(failure.message)
+        }
+    }
+    ret Result::Ok(WorkspaceRefrain {
+            "syntax", root, root, "fixture", true, manifest, Vec[str]::new(), Vec[str]::new()
+        }
+    )
+}
+fn same(left: ProjectWorkspace, right: ProjectWorkspace) -> bool {
+    if left.modules.len() != right.modules.len() {
+        ret false
+    }
+    for index in 0_usize..left.modules.len() {
+        let a = left.modules.get_unchecked_borrowed(index)
+        let b = right.modules.get_unchecked_borrowed(index)
+        for position in 0_usize..a.resolved_imports.len() {
+            if a.resolved_imports.get(position) != b.resolved_imports.get(position) {
+                ret false
+            }
+        }
+        if a.module_id != b.module_id || a.source != b.source || a.resolved_imports.len() != b.resolved_imports.len() ||
+        stringify(encode_metadata_ast(a.ast)) != stringify(encode_metadata_ast(b.ast)) ||
+        prepared_bytes_payload(encode_snapshot_ParsedSourceArtifact(ParsedSourceArtifact {
+                    a.analysis_id.key(), a.analysis
+                }
+                , "comparison",).unwrap_or(Vec[u8]::new())) !=
+        prepared_bytes_payload(encode_snapshot_ParsedSourceArtifact(ParsedSourceArtifact {
+                    b.analysis_id.key(), b.analysis
+                }
+                , "comparison",).unwrap_or(Vec[u8]::new())) {
+            ret false
+        }
+    }
+    ret true
+}
+fn load(package: WorkspaceRefrain, cache: Path) -> Result[ProjectWorkspace, str] {
+    let graph = ResolvedPackageGraph { package.name, vec![package], Vec[str]::new() }
+    let sources = load_source_documents(package, "compiler identity", Option[Path]::Some(cache))?
+    let workspace = match try_load_compilation_unit_with_sources(graph, package.name, Vec[CompiledWorkspaceModule]::new(), sources) {
+        Ok(value) => value Err(failure) => {
+            ret Result::Err(failure.message)
+        }
+    }
+    ret Result::Ok(workspace)
+}
+fn contract(root: Path) -> Result[bool, str] {
+    mkdir_all(root.join("src").as_str())
+    let manifest = "[project]\nname=\"syntax\"\nversion=\"1.0.0\"\ndependencies=[]\n"
+    write_file(root.join("encore.toml").as_str(), manifest)
+    write_file(root.join("src/main.enq").as_str(), "//! main docs\nimport mod::other::Value\nfn main()->u32 { let item=Value{41_u32} ret item.read() }\nfn version()->str { ret __version__ }\n")
+    let original = "/// value docs\npub struct Value { #ui(label=\"number\", hint=\"счётчик\") number: u32 }\nimpl for Value { /// method docs\npub fn read(self: Self)->u32 { ret (self.number + 1_u32) } }\n"
+    write_file(root.join("src/other.enq").as_str(), original)
+    let package = owner(root)?
+    let cache = root.join("cache")
+    let cold = load(package, cache)?
+    publish_source_documents(cold, package, "compiler identity", Option[Path]::Some(cache))?
+    let warm = load(package, cache)?
+    if !assert(cold.syntax_reused == 0_usize && warm.syntax_reused == 2_usize && same(cold, warm)) {
+        ret Result::Err("cold/warm syntax differs: " + core::fmt::Debug::fmt(cold.syntax_reused) + "/" + core::fmt::Debug::fmt(warm.syntax_reused))
+    }
+    for module in warm.modules {
+        let identity = compiler_content_digest(module.source)
+        let bytes = encode_snapshot_ParsedSourceArtifact(ParsedSourceArtifact {
+                module.analysis_id.key(), module.analysis
+            }
+            , identity,)?
+        let payload = prepared_bytes_payload(bytes)
+        if !assert(decode_snapshot_ParsedSourceArtifact(bytes, "wrong identity").is_err() &&
+            decode_snapshot_ParsedSourceArtifact(prepared_payload_bytes(payload.slice_bytes(0_usize, payload.byte_len() - 1_usize)), identity).is_err()) {
+            ret Result::Ok(false)
+        }
+    }
+    write_file(root.join("src/other.enq").as_str(), "pub struct Value { #ui(label=\"number\", hint=\"счётчик\") number: u32 }\nimpl for Value { pub fn read(self: Self)->u32 { ret self.number * 2_u32 } }\n")
+    let changed = load(package, cache)?
+    let graph = ResolvedPackageGraph { package.name, vec![package], Vec[str]::new() }
+    let fresh = match try_load_compilation_unit(graph, package.name, Vec[CompiledWorkspaceModule]::new()) {
+        Ok(value) => value Err(failure) => {
+            ret Result::Err(failure.message)
+        }
+    }
+    if !assert(changed.syntax_reused == 1_usize && same(changed, fresh)) {
+        ret Result::Err("method body edit differs from fresh parse")
+    }
+    publish_source_documents(changed, package, "compiler identity", Option[Path]::Some(cache))?
+    let packed = cache / "lowering-v2"
+    let mut damaged = 0_usize
+    for shard in read_dir(packed.as_str()) {
+        for name in read_dir((packed / shard).as_str()) {
+            let entry = packed / shard / name
+            let payload = read_packed_payload(entry)
+            if payload.byte_len() >= 8_usize && payload.slice_bytes(0_usize, 8_usize) == "ENQSA001" {
+                if !write_payload(entry, "invalid source snapshot", true) {
+                    ret Result::Ok(false)
+                }
+                damaged += 1_usize
+            }
+        }
+    }
+    let repaired = load(package, cache)?
+    if !assert(damaged >= 2_usize && repaired.syntax_reused == 0_usize && same(repaired, fresh)) {
+        ret Result::Err("corrupt syntax did not fall back to fresh parse")
+    }
+    publish_source_documents(repaired, package, "compiler identity", Option[Path]::Some(cache))?
+    write_file(root.join("encore.toml").as_str(), "[project]\nname=\"syntax\"\nversion=\"2.0.0\"\ndependencies=[]\n")
+    let changed_project = load(owner(root)?, cache)?
+    ret Result::Ok(assert(changed_project.syntax_reused == 0_usize && !same(changed_project, fresh)))
+}
+fn main() -> u32 {
+    let root = Path::new("target/source-syntax-cache-" + core::fmt::Debug::fmt(perf_counter_ns())).resolve()
+    let result = match contract(root) {
+        Ok(value) => value
+        Err(error) => {
+            eprintln(error) false
+        }
+    }
+    remove_dir_all(root.as_str())
+    ret if result {
+        0_u32
+    } else {
+        1_u32
+    }
+}

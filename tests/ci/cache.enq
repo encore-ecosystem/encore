@@ -12,7 +12,7 @@ import json::{Json, stringify}
 
 import refrain::cache_identity::compiler_content_digest
 import refrain::ci_helpers::{Fixture, flag, json, modified_ns, number, replace, repository, set_env, text}
-import refrain::modes::cache_payload::{read_packed_payload, write_payload}
+import refrain::modes::cache_payload::{read_packed_payload, read_payload, write_payload}
 
 fn prepare(fixture: Fixture) ->() {
     fixture.manifest("cache_application", "[\"path@dependency\"]")
@@ -45,6 +45,9 @@ fn unit(report: Json, name: str) -> Json {
 }
 
 fn all_cached(report: Json) -> bool {
+    if flag(report, "input_cache_hit") {
+        ret true
+    }
     let units = report.get("units").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new())
     if units.is_empty() {
         ret false
@@ -308,8 +311,8 @@ fn integration_native_object_reuse_contract() -> bool {
     // Moving source coordinates must preserve closure symbols and replayed
     // fragments. Execute the result and compare it with a later clean build.
     fixture.put("src/main.enq", "\n\n\n" + prefix + main_body)
-    let moved = unit(build(fixture, "2", "dev"), "cache_application").get("phases").unwrap_or(Json::Null)
-    if number(moved, "functions_reused") == "0" || !executes(fixture, "dev") {
+    let moved = build(fixture, "2", "dev")
+    if !flag(moved, "input_cache_hit") || !executes(fixture, "dev") {
         ret fixture.finish(false)
     }
     let generic_prefix = "import mod::stable::unchanged\n" +
@@ -357,6 +360,145 @@ fn concurrent_cached_build(directory: str, compiler: str, jobs: str) -> bool {
 }
 
 #attr(test)
+fn integration_native_archive_references_contract() -> bool {
+    let fixture = Fixture::new("native-archive-references")
+    fixture.manifest("cache_application", "[]")
+    for item in vec![("41", 41_i32),("42", 42_i32),("43", 43_i32),("44", 44_i32)] {
+        fixture.put("src/main.enq", "fn main()->u32 {ret " + item.0 + "_u32}\n")
+        build(fixture, "4", "dev")
+        if Command::new(fixture.binary("cache_application", "dev").as_str()).output().code() != item.1 {
+            ret fixture.finish(false)
+        }
+    }
+    let mut count = 0_usize
+    let mut slot = ""
+    for directory in committed(fixture) {
+        let metadata = json(read_payload(directory.join("unit.ermeta")))
+        if text(metadata.get("context").unwrap_or(Json::Null), "unit") != "cache_application" {
+            continue
+        }
+        let reference = read_file(directory.join("unit.erlib").as_str())
+        if reference.byte_len() != 136_usize || reference.slice_bytes(0_usize, 8_usize) != "ENQAR001" {
+            ret fixture.failure("body revision retained another whole native archive")
+        }
+        let current = reference.slice_bytes(8_usize, 64_usize)
+        if !slot.is_empty() && slot != current {
+            ret fixture.failure("body edit changed native declaration context")
+        }
+        slot = current count += 1_usize
+    }
+    let native = fixture.root / "cache" / "objects-v1" / slot
+    let mut archives = 0_usize
+    for name in read_dir(native.as_str()) {
+        if Path::new(name).extension().unwrap_or("") == "erlib" {
+            archives += 1_usize
+        }
+    }
+    if count != 4_usize || archives != 2_usize {
+        ret fixture.failure("native revision retention is not bounded to two archives")
+    }
+    // Older complete receipts are valid hints after their shared blob was
+    // pruned. They must rebuild from typed checkpoints rather than fail.
+    fixture.put("src/main.enq", "fn main()->u32 {ret 41_u32}\n")
+    build(fixture, "4", "dev")
+    if Command::new(fixture.binary("cache_application", "dev").as_str()).output().code() != 41_i32 {
+        ret fixture.finish(false)
+    }
+    remove_dir_all(native.as_str())
+    remove_file(fixture.root.join("target/dev/.encore-successful-build").as_str())
+    build(fixture, "4", "dev")
+    ret fixture.finish(Command::new(fixture.binary("cache_application", "dev").as_str()).output().code() == 41_i32)
+}
+
+#attr(test)
+fn integration_indexed_checkpoint_missing_chunks_contract() -> bool {
+    let fixture = Fixture::new("indexed-checkpoint-chunks")
+    prepare(fixture)
+    build(fixture, "2", "dev")
+    let original_manifest = fixture.read("encore.toml")
+    let packed = fixture.root / "cache" / "lowering-v2"
+    let mut damaged = false
+    for name in read_dir((fixture.root / "cache").as_str()) {
+        let directory = fixture.root / "cache" / name
+        if !file_exists(directory.join("unit.backend").as_str()) {
+            continue
+        }
+        let metadata = json(read_payload(directory.join("unit.ermeta")))
+        if text(metadata.get("context").unwrap_or(Json::Null), "unit") != "cache_dependency" {
+            continue
+        }
+        let owned = read_payload(directory.join("unit.erowned"))
+        if owned.byte_len() < 9_usize || owned.slice_bytes(0_usize, 9_usize) != "ENQMI001\n" {
+            ret fixture.failure("prepared checkpoint still contains a full package body copy")
+        }
+        let index = json(owned.slice_bytes(9_usize, owned.byte_len() - 9_usize))
+        let modules = index.get("modules").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new())
+        let record = modules.get(0_usize).unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new())
+        let key = record.get(1_usize).unwrap_or(Json::Null).as_str().unwrap_or("")
+        if key.byte_len() != 64_usize || !write_payload(packed / key.slice_bytes(0_usize, 2_usize) /(key + ".entry"), "invalid typed chunk in a valid transport", true) {
+            ret fixture.finish(false)
+        }
+        damaged = true
+    }
+    fixture.put("encore.toml", original_manifest + "\n[target]\ncompile-args=[\"-DCHUNK_REVISION=1\"]\n")
+    let repaired = build(fixture, "4", "dev")
+    if !damaged || flag(unit(repaired, "cache_dependency").get("phases").unwrap_or(Json::Null), "backend_cache_hit") || !executes(fixture, "dev") {
+        ret fixture.failure("invalid referenced body did not rebuild under accepted metadata")
+    }
+    remove_dir_all(packed.as_str())
+    fixture.put("encore.toml", original_manifest + "\n[target]\ncompile-args=[\"-DCHUNK_REVISION=2\"]\n")
+    let missing = build(fixture, "4", "dev")
+    ret fixture.finish(!flag(unit(missing, "cache_dependency").get("phases").unwrap_or(Json::Null), "backend_cache_hit") && executes(fixture, "dev"))
+}
+
+#attr(test)
+fn integration_body_edit_syntax_cache_contract() -> bool {
+    let fixture = Fixture::new("body-edit-syntax")
+    fixture.manifest("cache_application", "[]")
+    let main_source = "import mod::leaf::Value\nfn extra()->u32 {ret 7_u32}\nfn main()->u32 {let item=Value{41_u32} ret item.read()+extra()}\n"
+    let leaf_source = "pub struct Value {number:u32}\nimpl for Value {pub fn read(self:Self)->u32 {ret self.number+1_u32}}\n"
+    fixture.put("src/main.enq", main_source)
+    fixture.put("src/leaf.enq", leaf_source)
+    build(fixture, "1", "dev")
+    fixture.put("src/leaf.enq", replace(leaf_source, "+1_u32", "+2_u32"))
+    let method = unit(build(fixture, "4", "dev"), "cache_application").get("phases").unwrap_or(Json::Null)
+    if number(method, "syntax_modules_reused") != "1" || number(method, "module_bodies_reused") != "1" || number(method, "ir_generated") != "1" || number(method, "object_hashes_reused") != "2" ||
+    Command::new(fixture.binary("cache_application", "dev").as_str()).output().code() != 50_i32 {
+        ret fixture.failure("method body edit did not reuse unchanged syntax and native functions")
+    }
+    fixture.put("src/main.enq", replace(main_source, "ret 7_u32", "ret 9_u32"))
+    let function = unit(build(fixture, "4", "dev"), "cache_application").get("phases").unwrap_or(Json::Null)
+    if number(function, "syntax_modules_reused") != "1" || number(function, "module_bodies_reused") != "1" || number(function, "ir_generated") != "1" || number(function, "object_hashes_reused") != "1" ||
+    Command::new(fixture.binary("cache_application", "dev").as_str()).output().code() != 52_i32 {
+        ret fixture.failure("function body edit did not reuse unchanged method module")
+    }
+    let accepted = file_sha256(fixture.binary("cache_application", "dev").as_str())
+    fixture.put("src/main.enq", replace(main_source, "ret 7_u32", "ret \"wrong type\""))
+    let invalid = fixture.command(vec!["build", "--jobs", "4"])
+    if invalid.success() || file_sha256(fixture.binary("cache_application", "dev").as_str()) != accepted {
+        ret fixture.failure("body syntax reuse skipped a type error or replaced the last good binary")
+    }
+    let packed = fixture.root / "cache" / "lowering-v2"
+    let mut damaged = 0_usize
+    for shard in read_dir(packed.as_str()) {
+        for name in read_dir((packed / shard).as_str()) {
+            let entry = packed / shard / name
+            let payload = read_packed_payload(entry)
+            if payload.byte_len() >= 8_usize && payload.slice_bytes(0_usize, 8_usize) == "ENQSA001" {
+                if !write_payload(entry, "invalid syntax snapshot", true) {
+                    ret fixture.finish(false)
+                }
+                damaged += 1_usize
+            }
+        }
+    }
+    fixture.put("src/main.enq", replace(main_source, "ret 7_u32", "ret 11_u32"))
+    let repaired = unit(build(fixture, "4", "dev"), "cache_application").get("phases").unwrap_or(Json::Null)
+    ret fixture.finish(damaged >= 2_usize && number(repaired, "syntax_modules_reused") == "0" &&
+        Command::new(fixture.binary("cache_application", "dev").as_str()).output().code() == 54_i32)
+}
+
+#attr(test)
 fn integration_semantic_body_and_early_object_cache_contract() -> bool {
     let fixture = Fixture::new("semantic-body-cache")
     fixture.manifest("cache_application", "[]")
@@ -369,29 +511,55 @@ fn integration_semantic_body_and_early_object_cache_contract() -> bool {
     fixture.put("src/leaf.enq", "pub fn value() -> u32 { ret 42_u32 }\n")
     let edited = unit(build(fixture, "4", "dev"), "cache_application").get("phases").unwrap_or(Json::Null)
     if number(edited, "bodies_checked") != "1" || number(edited, "bodies_reused") != "2" ||
-    number(edited, "environments_reused") != "2" || number(edited, "module_checks_reused") != "1" ||
-    number(edited, "ir_generated") != "1" || number(edited, "ir_skipped") != "1" ||
+    number(edited, "environments_reused") != "2" || number(edited, "module_checks_reused") != "2" ||
+    !flag(edited, "translation_environment_reused") ||
+    number(edited, "ir_generated") != "1" || number(edited, "ir_skipped") != "2" ||
     Command::new(fixture.binary("cache_application", "dev").as_str()).output().code() != 42_i32 {
         ret fixture.failure("body edit repeated unrelated semantic or LLVM work")
     }
     fixture.put("src/leaf.enq", "\n\n\npub fn value() -> u32 { ret 42_u32 }\n")
-    let moved = unit(build(fixture, "4", "dev"), "cache_application").get("phases").unwrap_or(Json::Null)
-    if number(moved, "bodies_checked") != "0" || number(moved, "effects_checked") != "0" ||
-    number(moved, "ir_generated") != "0" || Command::new(fixture.binary("cache_application", "dev").as_str()).output().code() != 42_i32 {
+    let moved = build(fixture, "4", "dev")
+    if !flag(moved, "input_cache_hit") || Command::new(fixture.binary("cache_application", "dev").as_str()).output().code() != 42_i32 {
         ret fixture.failure("source relocation invalidated position-independent work")
     }
     let packed = fixture.root / "cache" / "lowering-v2"
+    let mut environments = 0_usize
+    for shard in read_dir(packed.as_str()) {
+        for name in read_dir((packed / shard).as_str()) {
+            let entry = packed / shard / name
+            let payload = read_packed_payload(entry)
+            if payload.byte_len() >= 8_usize && payload.slice_bytes(0_usize, 8_usize) == "ENQTE002" {
+                if !write_payload(entry, "invalid lowering environment", true) {
+                    ret fixture.finish(false)
+                }
+                environments += 1_usize
+            }
+        }
+    }
+    if environments == 0_usize {
+        ret fixture.failure("no lowering environment snapshot exercised")
+    }
+    fixture.put("src/leaf.enq", "pub fn value() -> u32 { ret 45_u32 }\n")
+    let lowering = unit(build(fixture, "4", "dev"), "cache_application").get("phases").unwrap_or(Json::Null)
+    if flag(lowering, "translation_environment_reused") ||
+    Command::new(fixture.binary("cache_application", "dev").as_str()).output().code() != 45_i32 {
+        ret fixture.failure("corrupt lowering environment did not rebuild declaration indexes")
+    }
     let mut damaged = 0_usize
     for shard in read_dir(packed.as_str()) {
         for name in read_dir((packed / shard).as_str()) {
             let entry = packed / shard / name
             let record = match decode_semantic_module(read_packed_payload(entry)) {
-                Ok(value) => value Err(_) => { continue }
+                Ok(value) => value Err(_) => {
+                    continue
+                }
             }
             // A verified payload with an invalid binary snapshot must rebuild
             // declarations while independently retaining valid body facts.
-            let snapshot = packed / record.index.slice(0_usize, 2_usize) / (record.index + ".entry")
-            if !write_payload(snapshot, "invalid semantic snapshot", true) { ret fixture.finish(false) }
+            let snapshot = packed / record.index.slice(0_usize, 2_usize) /(record.index + ".entry")
+            if !write_payload(snapshot, "invalid semantic snapshot", true) {
+                ret fixture.finish(false)
+            }
             damaged += 1_usize
         }
     }
@@ -516,6 +684,7 @@ fn integration_incremental_cache_contract() -> bool {
         for entry in entries {
             write_file(entry.join(payload).as_str(), "corrupt package cache payload\n")
         }
+        remove_file(fixture.root.join("target/dev/.encore-successful-build").as_str())
         if flag(unit(build(fixture, "2", "dev"), "cache_application"), "cache_hit") || !executes(fixture, "dev") || file_sha256(binary.as_str()) != expected {
             ret fixture.finish(false)
         }
@@ -531,6 +700,7 @@ fn integration_incremental_cache_contract() -> bool {
         write_file(entry.join("unit.complete").as_str(),
             replace(receipt, compiler_content_digest(original), compiler_content_digest(forged)),)
     }
+    remove_file(fixture.root.join("target/dev/.encore-successful-build").as_str())
     if flag(unit(build(fixture, "4", "dev"), "cache_application"), "cache_hit") ||
     !executes(fixture, "dev") || file_sha256(binary.as_str()) != expected {
         ret fixture.failure("unvalidated cache hint was admitted")
@@ -547,6 +717,7 @@ fn integration_incremental_cache_contract() -> bool {
     for entry in committed(fixture) {
         write_file(entry.join("unit.erlib").as_str(), "invalid archive")
     }
+    remove_file(fixture.root.join("target/dev/.encore-successful-build").as_str())
     if flag(unit(build(fixture, "2", "dev"), "cache_application"), "cache_hit") || !executes(fixture, "dev") {
         ret fixture.finish(false)
     }
@@ -650,4 +821,61 @@ fn integration_module_namespace_type_scope_contract() -> bool {
         }
     }
     ret fixture.finish(true)
+}
+
+#attr(test)
+fn integration_method_closure_owner_cache_contract() -> bool {
+    let fixture = Fixture::new("method-closure-owners")
+    fixture.manifest("method_owner_application", "[]")
+    let source = read_file(repository().join("tests/method_closure_owner_identity.enq").as_str())
+    fixture.put("src/main.enq", source)
+    let cold = unit(build(fixture, "2", "dev"), "method_owner_application").get("phases").unwrap_or(Json::Null)
+    // Each method owns its closure implementation; main is the third CGU.
+    if number(cold, "ir_generated") != "3" || !executes_named(fixture, "method_owner_application") {
+        ret fixture.failure("closure implementations lost their owning method")
+    }
+    let changed = replace(replace(source, "self.value + value", "self.value + value + 1_u32"),
+        "left.read() != 42_u32", "left.read() != 43_u32",)
+    fixture.put("src/main.enq", changed)
+    let edited = unit(build(fixture, "2", "dev"), "method_owner_application").get("phases").unwrap_or(Json::Null)
+    if number(edited, "objects_compiled") != "2" || number(edited, "objects_reused") != "1" ||
+    !executes_named(fixture, "method_owner_application") {
+        ret fixture.failure("method edit repeated unrelated object work")
+    }
+    let binary = fixture.binary("method_owner_application", "dev")
+    let expected = file_sha256(binary.as_str())
+    let stamp = modified_ns(binary)
+    fixture.put("src/main.enq", "\n\n\n" + changed)
+    let moved = build(fixture, "2", "dev")
+    if !flag(moved, "input_cache_hit") || file_sha256(binary.as_str()) != expected || modified_ns(binary) != stamp {
+        ret fixture.failure("moving methods changed closure code identity")
+    }
+    // Force reconstruction from verified frontend/backend artifacts after a
+    // corrupt native member index. A finished executable remains trustworthy.
+    for name in read_dir(fixture.root.join("cache/objects-v1").as_str()) {
+        let index = fixture.root.join("cache/objects-v1").join(name).join("members.entry")
+        if file_exists(index.as_str()) {
+            write_file(index.as_str(), "corrupt native member index")
+            write_file(index.parent().unwrap_or(fixture.root).join("llvm-declarations.entry").as_str(), "corrupt LLVM declaration snapshot")
+        }
+    }
+    for name in read_dir(fixture.root.join("cache").as_str()) {
+        let complete = fixture.root.join("cache").join(name).join("unit.complete")
+        if file_exists(complete.as_str()) {
+            remove_file(complete.as_str())
+        }
+    }
+    remove_file(fixture.root.join("target/dev/.encore-successful-build").as_str())
+    build(fixture, "2", "dev")
+    if !executes_named(fixture, "method_owner_application") || file_sha256(binary.as_str()) != expected {
+        ret fixture.failure("corrupt native archive index changed the program")
+    }
+    remove_dir_all(fixture.root.join("target").as_str())
+    remove_dir_all(fixture.root.join("cache").as_str())
+    build(fixture, "1", "dev")
+    ret fixture.finish(executes_named(fixture, "method_owner_application") && file_sha256(binary.as_str()) == expected)
+}
+
+fn executes_named(fixture: Fixture, name: str) -> bool {
+    ret fixture.tool(fixture.binary(name, "dev").as_str(), Vec[str]::new()).success()
 }

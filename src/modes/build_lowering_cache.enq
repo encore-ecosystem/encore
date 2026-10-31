@@ -8,11 +8,11 @@ import std::os::{file_exists, mkdir_all, read_file, remove_dir_all}
 import std::path::Path
 import std::vec::Vec
 
-import json::{Json, parse, stringify}
+import ehirlib::{Directive, Module, decode_typed_bundle, encode_typed_bundle, make_module, make_module_bundle}
 
 import mod::build_cache::{close_unit_cache_lock, try_unit_cache_lock, valid_key}
 import refrain::cache_identity::compiler_content_digest
-import refrain::frontend::translator::CachedFunctionChunk
+import refrain::frontend::translator::{CachedFunctionChunk, CachedFunctionDeclaration}
 
 fn packed_path(root: Path, key: str) -> Path {
     ret root / "lowering-v2" / key.slice(0_usize, 2_usize) /(key + ".entry")
@@ -88,59 +88,47 @@ fn publish_packed(root: Path, key: str, text: str) -> Result[(), str] {
 }
 
 pub fn restore_lowered_function(cache: Option[Path], context: str, key: str) -> Result[Option[CachedFunctionChunk], str] {
-    let identity = compiler_content_digest("encore-lowered-function-1\n" + context + "\n" + key)
+    let identity = compiler_content_digest("encore-lowered-function-3\n" + context + "\n" + key)
     let payload = match restore_lowered_module(cache, identity)? {
-        Some(value) => value
-        None => {
-            ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::None)
+        Some(value) => value None => {
+            ret Result::Ok(Option::None)
         }
     }
-    let record = match parse(payload) {
-        Ok(value) => value
-        Err(_) => {
-            ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::None)
+    let bundle = match decode_typed_bundle(payload, identity) {
+        Ok(value) => value Err(_) => {
+            ret Result::Ok(Option::None)
         }
     }
-    if record.get("key").unwrap_or(Json::Null).as_str().unwrap_or("") != key {
-        ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::None)
+    if bundle.entry_module != key || bundle.modules.is_empty() {
+        ret Result::Ok(Option::None)
     }
-    let body = record.get("body").unwrap_or(Json::Null).as_str().unwrap_or("")
-    if body.is_empty() {
-        ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::None)
-    }
-    let helpers = match record.get("helpers").unwrap_or(Json::Null).as_array() {
-        Some(value) => value
-        None => {
-            ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::None)
+    let module = bundle.modules.get(0_usize).unwrap_or(make_module("", Vec[Directive]::new()))
+    let mut declarations = Vec[CachedFunctionDeclaration]::new()
+    for index in 1_usize..bundle.modules.len() {
+        let declaration = bundle.modules.get_unchecked_borrowed(index)
+        let generated = match declaration.documentation {
+            Some(_) => Option[Module]::Some(declaration) None => Option[Module]::None
         }
-    }
-    let mut declarations = Vec[str]::new()
-    for helper in helpers {
-        match helper.as_str() {
-            Some(value) => {
-                declarations.push(value)
+        declarations.push(CachedFunctionDeclaration {
+                declaration.name, declaration.documentation.unwrap_or(""), generated
             }
-            None => {
-                ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::None)
-            }
-        }
+        )
     }
-    ret Result[Option[CachedFunctionChunk], str]::Ok(Option[CachedFunctionChunk]::Some(CachedFunctionChunk {
-                key, body, declarations
-            }
-            ,
-        ))
+    ret Result::Ok(Option::Some(CachedFunctionChunk { key, module, declarations }))
 }
 
 pub fn commit_lowered_function(cache: Option[Path], context: str, function: CachedFunctionChunk) -> Result[(), str] {
-    let mut helpers = Vec[Json]::new()
+    let identity = compiler_content_digest("encore-lowered-function-3\n" + context + "\n" + function.key)
+    let mut modules = vec![function.module]
     for declaration in function.declarations {
-        helpers.push(Json::String(declaration))
+        let module = match declaration.module {
+            Some(value) => Module {
+                declaration.name, value.imports, Option[str]::Some(declaration.closure_name),
+                value.symbol_documentation, value.directives
+            }
+            None => make_module(declaration.name, Vec[Directive]::new())
+        }
+        modules.push(module)
     }
-    let mut record = Vec[(str, Json)]::new()
-    record.push(("key", Json::String(function.key)))
-    record.push(("body", Json::String(function.text)))
-    record.push(("helpers", Json::Array(helpers)))
-    ret commit_lowered_module(cache, compiler_content_digest("encore-lowered-function-1\n" + context + "\n" + function.key),
-        stringify(Json::Object(record)),)
+    ret commit_lowered_module(cache, identity, encode_typed_bundle(make_module_bundle(function.key, modules), identity)?)
 }

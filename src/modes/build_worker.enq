@@ -14,14 +14,14 @@ import std::vec::Vec
 import argparse::{process_arg, process_arg_count}
 import json::{Json, parse, stringify}
 
-import mod::build_archive::{UnitNativePlan, emit_budgeted_package_archive}
+import mod::build_archive::{UnitNativePlan, emit_profile_package_archive_with_sources}
 import mod::build_artifacts::{UnitReady, publish_unit_complete, publish_unit_ready, read_unit_ready}
 import mod::build_cache::restore_unit_cache_directory
 import mod::build_fingerprint::unit_fingerprint
 import mod::build_metadata::{MetadataDependency, RefrainMetadata}
 import mod::build_prepared_cache::publish_prepared_unit
 import mod::build_request::{BuildUnitRequest, graph_package}
-import mod::build_unit::{package_backend_fingerprint, package_owned_checkpoint, prepare_package_worker_with_server}
+import mod::build_unit::{package_backend_fingerprint, package_native_sources, package_owned_checkpoint, prepare_package_worker_with_server}
 import refrain::cache_identity::compiler_content_digest
 import refrain::target::parse_target
 
@@ -179,11 +179,15 @@ fn execute_package(request_path: str, native_path: str, server: usize) -> Result
     // The coordinator may have admitted consumers: never withdraw or rewrite
     // their immutable metadata while regenerating native objects.
     let cached_ready = if backend_hit {
-        Option[UnitReady]::Some(read_unit_ready(request.output, request.context, worker.metadata_dependencies)?)
+        let accepted = read_unit_ready(request.output, request.context, worker.metadata_dependencies)?
+        if accepted.encode()? != prospective.encode()? {
+            ret Result::Err("reconstructed checkpoint changed accepted package declarations")
+        }
+        Option[UnitReady]::Some(accepted)
     } else {
         Option[UnitReady]::None
     }
-    if !backend_hit {
+    if !worker.backend_restored {
         publish_prepared_unit(request.output, prospective, package_backend_fingerprint(request)?,
             package_owned_checkpoint(request, worker)?,)?
     }
@@ -194,12 +198,12 @@ fn execute_package(request_path: str, native_path: str, server: usize) -> Result
     let publication_ms = perf_counter_ms() - publication_started
     let prepared_ms = perf_counter_ms() - started
     let target = parse_target(request.context.target)
-    let _archive = emit_budgeted_package_archive(worker.prepared, request.output, target, native, server, request.cache)?
+    let _archive = emit_profile_package_archive_with_sources(worker.prepared, request.output, target, native, server, request.cache, request.context.profile, package_native_sources(worker))?
     let native_ms = perf_counter_ms() - started - prepared_ms
     let mut timings = Vec[(str, Json)]::new()
     timings.push(("prepare_ms", Json::Number(Debug::fmt(prepared_ms))))
     timings.push(("native_ms", Json::Number(Debug::fmt(native_ms))))
-    timings.push(("backend_cache_hit", Json::Bool(backend_hit)))
+    timings.push(("backend_cache_hit", Json::Bool(worker.backend_restored)))
     timings.push(("frontend_cache_hit", Json::Bool(frontend_hit)))
     let object_counts = match parse(read_file(request.output.join("objects.json").as_str())) {
         Ok(value) => value
@@ -208,12 +212,12 @@ fn execute_package(request_path: str, native_path: str, server: usize) -> Result
     timings.push(("objects_reused", object_counts.get("reused").unwrap_or(Json::Number("0"))))
     timings.push(("ir_generated", object_counts.get("ir_generated").unwrap_or(Json::Number("0"))))
     timings.push(("ir_skipped", object_counts.get("ir_skipped").unwrap_or(Json::Number("0"))))
-    for name in vec!["ir_jobs", "object_probe_ms", "ir_emit_ms"] {
+    for name in vec!["ir_jobs", "object_probe_ms", "ir_emit_ms", "object_hashes_reused", "object_hashes_computed"] {
         timings.push((name, object_counts.get(name).unwrap_or(Json::Number("0"))))
     }
     timings.push(("objects_compiled", object_counts.get("compiled").unwrap_or(Json::Number("0"))))
     let semantic_counts = parse(read_file((request.output / "semantic.json").as_str())).unwrap_or(Json::Null)
-    for name in vec!["bodies_checked", "bodies_reused", "effects_checked", "effects_reused", "environments_reused", "module_checks_reused", "semantic_jobs", "semantic_prepare_ms", "semantic_bodies_ms", "semantic_publish_ms", "semantic_cache_read_ms", "semantic_context_ms", "semantic_replay_ms", "semantic_environment_ms", "semantic_input_ms", "semantic_index_write_ms"] {
+    for name in vec!["syntax_modules_reused", "module_bodies_reused", "bodies_checked", "bodies_reused", "effects_checked", "effects_reused", "environments_reused", "module_checks_reused", "semantic_jobs", "semantic_prepare_ms", "semantic_bodies_ms", "semantic_publish_ms", "semantic_cache_read_ms", "semantic_context_ms", "semantic_replay_ms", "semantic_environment_ms", "semantic_input_ms", "semantic_index_write_ms"] {
         timings.push((name, semantic_counts.get(name).unwrap_or(Json::Number("0"))))
     }
     timings.push(("semantic_index_reused", semantic_counts.get("semantic_index_reused").unwrap_or(Json::Bool(false))))
@@ -221,6 +225,7 @@ fn execute_package(request_path: str, native_path: str, server: usize) -> Result
         Ok(value) => value
         Err(_) => Json::Null
     }
+    timings.push(("translation_environment_reused", lowering_counts.get("translation_environment_reused").unwrap_or(Json::Bool(false))))
     for name in vec!["modules_reused", "modules_lowered", "functions_reused", "functions_lowered", "checking_ms", "lowering_ms"] {
         timings.push((name, lowering_counts.get(name).unwrap_or(Json::Number("0"))))
     }
@@ -230,7 +235,7 @@ fn execute_package(request_path: str, native_path: str, server: usize) -> Result
     }
     timings.push(("frontend_ms", preparation.get("frontend_ms").unwrap_or(Json::Number("0"))))
     timings.push(("backend_prepare_ms", preparation.get("backend_prepare_ms").unwrap_or(Json::Number("0"))))
-    for name in vec!["prepared_functions_checked", "prepared_functions_reused", "prepared_modules_fallback"] {
+    for name in vec!["prepared_functions_checked", "prepared_functions_reused", "prepared_modules_fallback", "frontend_checkpoint_bytes", "backend_checkpoint_bytes"] {
         timings.push((name, preparation.get(name).unwrap_or(Json::Number("0"))))
     }
     if detailed_timings {

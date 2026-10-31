@@ -1,0 +1,76 @@
+//! Last verified module view in a declaration generation. Ordinary function
+//! deltas reuse its typed bodies; an absent/corrupt record is a regular miss.
+import core::option::Option
+import core::result::Result
+
+import std::path::Path
+import std::vec::Vec
+
+import ehirlib::decode_typed_module
+import json::{Json, parse, stringify}
+
+import mod::build_cache::valid_key
+import mod::build_lowering_cache::{commit_lowered_module, restore_lowered_module}
+import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::metadata_ast::{codegen_context_ast, encode_executable_ast}
+import refrain::frontend::translator::{FunctionLoweringDelta, TranslationModule, lowering_module_revisions}
+
+fn history_slot(module: TranslationModule, context: str, version: str) -> str {
+    // Retain documentation observable through reflection; physical positions
+    // and ordinary bodies do not belong to this declaration generation.
+    let shape = compiler_content_digest(stringify(encode_executable_ast(codegen_context_ast(module.ast))))
+    ret compiler_content_digest("encore-lowering-history-1\n" + context + "\n" + version + "\n" + module.module_id + "\n" + shape)
+}
+
+pub fn restore_module_delta(cache: Option[Path], context: str, version: str,
+    module: TranslationModule, index: usize,) -> Result[Option[FunctionLoweringDelta], str] {
+    let payload = match restore_lowered_module(cache, history_slot(module, context, version))? {
+        Some(payload) => payload None => {
+            ret Result::Ok(Option::None)
+        }
+    }
+    let saved = parse(payload).unwrap_or(Json::Null)
+    let key = saved.get("key").unwrap_or(Json::Null).as_str().unwrap_or("")
+    if !valid_key(key) || saved.get("schema").unwrap_or(Json::Null).as_number().unwrap_or("") != "1" {
+        ret Result::Ok(Option::None)
+    }
+    let rows = match saved.get("functions").unwrap_or(Json::Null) {
+        Json::Array(rows) => rows _ => {
+            ret Result::Ok(Option::None)
+        }
+    }
+    let mut revisions = Vec[str]::new()
+    for row in rows {
+        let key = row.as_str().unwrap_or("")
+        if !valid_key(key) {
+            ret Result::Ok(Option::None)
+        }
+        revisions.push(key)
+    }
+    let payload = match restore_lowered_module(cache, key)? {
+        Some(payload) => payload None => {
+            ret Result::Ok(Option::None)
+        }
+    }
+    let previous = match decode_typed_module(payload, key) {
+        Ok(module) => module Err(_) => {
+            ret Result::Ok(Option::None)
+        }
+    }
+    if previous.name != module.module_id {
+        ret Result::Ok(Option::None)
+    }
+    ret Result::Ok(Option::Some(FunctionLoweringDelta { index, previous, revisions }))
+}
+
+pub fn publish_module_history(cache: Option[Path], context: str, version: str, module: TranslationModule, key: str) -> Result[(), str] {
+    if cache.is_none() {
+        ret Result::Ok(())
+    }
+    let mut functions = Vec[Json]::new()
+    for revision in lowering_module_revisions(module) {
+        functions.push(Json::String(revision))
+    }
+    ret commit_lowered_module(cache, history_slot(module, context, version), stringify(Json::Object(vec![
+                    ("schema", Json::Number("1")),("key", Json::String(key)),("functions", Json::Array(functions))])))
+}

@@ -1,0 +1,121 @@
+//! Disk snapshots contain immutable declaration facts, never native indexes.
+//! Restoring them must preserve ABI names, overloads, generics and member types.
+import core::option::Option
+import core::testing::assert
+
+import std::os::{mkdir_all, remove_dir_all, write_file}
+import std::path::Path
+import std::time::perf_counter_ns
+import std::vec::Vec
+
+import ehirlib::{Directive, fn_to_string, module_to_string}
+
+import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::{Lexer, Parser}
+import refrain::frontend::translator::{CachedCompilationChunks, CachedFunctionChunk, FunctionLoweringDelta, TranslationModule, translate_compilation_unit_with_environment, translate_function_queries_from_environment}
+import refrain::modes::cache_payload::{read_packed_payload, write_payload}
+import refrain::target::host_target
+
+fn module(id: str, path: str, source: str, imports: Vec[str]) -> TranslationModule {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source(path)
+    ret TranslationModule::new(id, path, imports, parser.parse(lexer.tokenize(source)), Vec[str]::new())
+}
+fn translate(literal: str, identity: str, environment: Option[str]) -> CachedCompilationChunks {
+    let types = module("environment@types.enq", "types.enq",
+        "pub struct Value { number: u32 }\npub enum Choice { Number(u32) }\n" +
+        "pub trait Reading { fn read(self: Self) -> u32 }\n" +
+        "impl Reading for Value { pub fn read(self: Self) -> u32 { ret self.number } }\n" +
+        "pub fn identity[T](value: T) -> T { ret value }\n", Vec[str]::new(),)
+    let main = module("environment@main.enq", "main.enq",
+        "import mod::types::{Value, Reading, identity, Choice}\n" +
+        "fn value() -> u32 { let item = Value { " + literal + "_u32 } ret identity[u32](item.read()) }\n" +
+        "fn main() -> u32 { ret value() }\n", vec!["environment@types.enq"],)
+    ret translate_compilation_unit_with_environment(vec![types, main], host_target(), vec![0_usize, 1_usize],
+        Vec[CachedFunctionChunk]::new(), Vec[(str, str)]::new(), Vec[FunctionLoweringDelta]::new(), identity, environment,)
+}
+fn same(left: CachedCompilationChunks, right: CachedCompilationChunks) -> bool {
+    if left.modules.len() != right.modules.len() {
+        ret false
+    }
+    for index in 0_usize..left.modules.len() {
+        if module_to_string(left.modules.get_unchecked_borrowed(index).as_module()) !=
+        module_to_string(right.modules.get_unchecked_borrowed(index).as_module()) {
+            ret false
+        }
+    }
+    ret true
+}
+fn main() -> u32 {
+    let identity = compiler_content_digest("same checked declarations and source path mapping")
+    let cold = translate("41", identity, Option[str]::None)
+    let snapshot = cold.environment.unwrap_or("")
+    if !assert(!snapshot.is_empty() && !cold.environment_reused) {
+        ret 1_u32
+    }
+    let root = Path::new("target/lowering-environment-" + core::fmt::Debug::fmt(perf_counter_ns())).resolve()
+    mkdir_all(root.as_str())
+    let path = root.join("snapshot.entry")
+    if !assert(write_payload(path, snapshot, true)) {
+        ret 2_u32
+    }
+    let payload = read_packed_payload(path)
+    let warm = translate("42", identity, Option[str]::Some(payload))
+    let fresh = translate("42", identity, Option[str]::None)
+    if !assert(warm.environment_reused && warm.environment.is_none() && same(warm, fresh)) {
+        ret 3_u32
+    }
+    let changed = module("environment@main.enq", "main.enq",
+        "fn value() -> u32 { let item = Value { 42_u32 } ret identity[u32](item.read()) }\n", vec!["environment@types.enq"],)
+    let query = match translate_function_queries_from_environment(vec![changed], host_target(), identity, payload) {
+        Ok(query) => query Err(_) => {
+            ret 6_u32
+        }
+    }
+    if !assert(query.modules.len() == 1_usize && query.functions.len() == 1_usize &&
+        query.modules.get_unchecked_borrowed(0_usize).module_index() == 1_usize) {
+        ret 7_u32
+    }
+    let fragment = query.modules.get_unchecked_borrowed(0_usize).as_module()
+    if !assert(fragment.directives.len() == 1_usize) {
+        ret 8_u32
+    }
+    let selected = match fragment.directives.get_unchecked_borrowed(0_usize) {
+        Directive::Function(item) => item _ => {
+            ret 8_u32
+        }
+    }
+    let mut matching = false
+    for source in fresh.modules {
+        for directive in source.as_module().directives {
+            match directive {
+                Directive::Function(item) => {
+                    if item.name == selected.name && fn_to_string(item) == fn_to_string(selected) {
+                        matching = true
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    if !assert(matching) {
+        ret 9_u32
+    }
+    let changed_signature = module("environment@main.enq", "main.enq", "fn value() -> bool { ret true }", vec!["environment@types.enq"])
+    if !assert(translate_function_queries_from_environment(vec![changed_signature], host_target(), identity, payload).is_err() &&
+        translate_function_queries_from_environment(vec![changed], host_target(), identity, "broken").is_err()) {
+        ret 10_u32
+    }
+    let wrong = translate("42", compiler_content_digest("changed declarations"), Option[str]::Some(payload))
+    if !assert(!wrong.environment_reused && same(wrong, fresh)) {
+        ret 4_u32
+    }
+    write_file(path.as_str(), "corrupt snapshot")
+    let corrupt = translate("42", identity, Option[str]::Some(read_packed_payload(path)))
+    if !assert(!corrupt.environment_reused && same(corrupt, fresh)) {
+        ret 5_u32
+    }
+    remove_dir_all(root.as_str())
+    ret 0_u32
+}

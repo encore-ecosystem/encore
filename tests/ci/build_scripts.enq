@@ -1,9 +1,12 @@
 //! Exercise actual host script compilation, cwd, native linking and invalidation.
 import core::fmt::Debug
 import core::vec::Vec
+
+import std::os::{file_exists, file_sha256, read_dir, remove_file}
+
 import json::{Json, stringify}
-import refrain::ci_helpers::{Fixture, std_dependencies}
-import std::os::{file_exists, file_sha256}
+
+import refrain::ci_helpers::{Fixture, modified_ns, std_dependencies}
 
 fn script(metadata: str, fail: bool) -> str {
     ret "import std::os::{argv, write_file}\nfn main() -> u32 {\n" +
@@ -37,6 +40,25 @@ fn integration_native_build_scripts_contract() -> bool {
     }
     if !project.succeeds(vec!["build", "--timings"]) || !project.read("target/dev/encore-timings.json").contains("\"link_cache_hit\":true") {
         ret fixture.finish(false)
+    }
+    let mut script_binary = project.root.join("target/tests/bin")
+    let mut script_found = false
+    for name in read_dir(project.root.join("target/tests/bin").as_str()) {
+        if name.contains("build-script-") && !name.contains(".fingerprint") && !name.contains(".sha256") {
+            script_binary = project.root.join("target/tests/bin").join(name)
+            script_found = true break
+        }
+    }
+    if !script_found {
+        ret fixture.failure("missing compiled build script")
+    }
+    let script_digest = file_sha256(script_binary.as_str())
+    let script_stamp = modified_ns(script_binary)
+    remove_file(project.root.join("script-executed").as_str())
+    project.put("src/main.enq", "extern fn native_answer() -> u32\nfn main() -> u32 { ret unsafe { native_answer() } - 40_u32 - 2_u32 }\n")
+    if !project.succeeds(vec!["run"]) || !file_exists(project.root.join("script-executed").as_str()) ||
+    file_sha256(script_binary.as_str()) != script_digest || modified_ns(script_binary) != script_stamp {
+        ret fixture.failure("application edit recompiled or skipped its build script")
     }
     project.put("native code/answer.c", "#include <stdint.h>\nuint32_t native_answer(void) { return 43; }\n")
     if !project.succeeds(vec!["build"]) || project.tool(project.binary("script_probe", "dev").as_str(), Vec[str]::new()).code() != 1 {

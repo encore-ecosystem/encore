@@ -14,6 +14,7 @@ import refrain::cache_identity::compiler_content_digest
 import refrain::frontend::analysis::{DiagnosticLabel, DiagnosticLabelKind, DiagnosticSuggestion, FrontendDiagnostic, SuggestionApplicability}
 import refrain::frontend::control_flow::statements_terminate_flow
 import refrain::frontend::metadata_ast::encode_lowered_function_input
+import refrain::frontend::replay_index::ReplayIndex
 import refrain::frontend::parser::{BlockExpr, Expr, ExprNode, FunctionItem, FunctionParam, GenericParam, IfExprBranch, ImplStmt, MatchArmBody, MatchPattern, ParsedBlock, Statement, TraitStmt}
 import refrain::frontend::reflection::{ReflectionBinding, ReflectionShape, expand_reflection_function, function_uses_reflection, reflection_binding_sites}
 import refrain::frontend::type_scope::{TypeNameBinding, TypeScopeIndex, declaration_type_name_view, display_type_view, scope_type_indexed, scope_type_view, type_scope_index_view}
@@ -233,6 +234,7 @@ pub struct CheckedModuleBodies {
     replay: Json
     checked: usize
     reused: usize
+    complete: Json
 }
 
 struct ReplayedSemanticBody {
@@ -246,7 +248,7 @@ enum SemanticBodyPlan {
 }
 
 struct SemanticReplay {
-    previous: Json
+    previous: ReplayIndex
     lines: Vec[str]
     records: Vec[Json]
     checked: usize
@@ -256,6 +258,8 @@ struct SemanticReplay {
     type_index_ready: bool
     callable_candidates: SemanticNameIndex
     method_candidates: SemanticNameIndex
+    complete: Vec[Json]
+    retain_complete: bool
 }
 
 fn semantic_source_lines(source: str) -> Vec[str] {
@@ -1125,7 +1129,79 @@ pub fn prepare_module_bodies_with_replay_view(ast: Vec[Statement], callables: Se
     ret check_module_bodies_impl(ast, callables, fields, methods, aggregate_names, type_scope, type_names, variants, true, previous, source)
 }
 
-fn semantic_body_plan(item: FunctionItem, names: SemanticSlice[TypeNameBinding], key: str, previous: Json) -> SemanticBodyPlan {
+/// Caller verifies identical source, declaration context and nominal type pool.
+/// Each declaration and checkpoint is validated before accepting the module;
+/// malformed/incomplete records fall back to ordinary source body queries.
+pub fn restore_accepted_module_bodies(ast: Vec[Statement], names: SemanticSlice[TypeNameBinding], previous: Json,
+    complete: Json,) -> Option[CheckedModuleBodies] {
+    let result = decode_accepted_module_bodies(ast, names, previous, complete)
+    ret match result {
+        Ok(value) => Option::Some(value) Err(_) => Option::None
+    }
+}
+
+fn decode_accepted_module_bodies(ast: Vec[Statement], names: SemanticSlice[TypeNameBinding], previous: Json,
+    complete: Json,) -> Result[CheckedModuleBodies, str] {
+    let envelope = checkpoint_record(complete, 3_usize)?
+    if checkpoint_string(envelope.get_unchecked_borrowed(0_usize))? != "semantic-module-bodies-1" {
+        ret Result::Err("unknown complete body snapshot")
+    }
+    let rows = checkpoint_array(envelope.get_unchecked_borrowed(1_usize))?
+    if checkpoint_string(envelope.get_unchecked_borrowed(2_usize))? != compiler_content_digest(stringify(Json::Array(rows))) {
+        ret Result::Err("complete body snapshot digest mismatch")
+    }
+    let records = ReplayIndex::new(previous)
+    let mut functions = Vec[CheckedFunctionBody]::new()
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => {
+                restore_accepted_function(item, "", names, rows, records, functions)?
+            }
+            Statement::Trait(item) => {
+                for method in item.methods {
+                    restore_accepted_function(method, item.name, names, rows, records, functions)?
+                }
+            }
+            Statement::Impl(item) => {
+                for method in item.methods {
+                    restore_accepted_function(method, item.target, names, rows, records, functions)?
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    if functions.len() != rows.len() {
+        ret Result::Err("complete body declaration count changed")
+    }
+    ret Result::Ok(CheckedModuleBodies {
+            Vec[FrontendDiagnostic]::new(), functions, previous, 0_usize, functions.len(), complete
+        }
+    )
+}
+
+fn restore_accepted_function(item: FunctionItem, owner: str, names: SemanticSlice[TypeNameBinding], rows: Vec[Json],
+    records: ReplayIndex, functions: mut Vec[CheckedFunctionBody],) -> Result[(), str] {
+    let row = checkpoint_record(rows.get(functions.len()).unwrap_or(Json::Null), 3_usize)?
+    if checkpoint_string(row.get_unchecked_borrowed(0_usize))? != owner || checkpoint_string(row.get_unchecked_borrowed(1_usize))? != item.name {
+        ret Result::Err("complete body declaration changed")
+    }
+    let encoded = row.get_unchecked_borrowed(2_usize)
+    let record = match encoded {
+        Json::String(key) => records.get(key).unwrap_or(Json::Null)
+        _ => encoded
+    }
+    let positions = checkpoint_array(record)?
+    if checkpoint_position(positions.get(1_usize).unwrap_or(Json::Null))? != item.line ||
+    checkpoint_position(positions.get(2_usize).unwrap_or(Json::Null))? != item.column {
+        ret Result::Err("complete body source position changed")
+    }
+    let body = decode_semantic_checkpoint_exact_view(record, names, item.line, item.column)?
+    functions.push(CheckedFunctionBody { item, owner, body })
+    ret Result::Ok(())
+}
+
+fn semantic_body_plan(item: FunctionItem, names: SemanticSlice[TypeNameBinding], key: str, previous: ReplayIndex) -> SemanticBodyPlan {
     if !key.is_empty() {
         match previous.get(key) {
             Some(saved) => {
@@ -1178,6 +1254,9 @@ fn check_function_body_replayed(item: FunctionItem, callables: SemanticSlice[Sem
         SemanticBodyPlan::ReplayFacts(facts) => {
             replay.records.push(Json::Array(vec![Json::String(key), facts.record]))
             replay.reused += 1_usize
+            if replay.retain_complete {
+                replay.complete.push(Json::Array(vec![Json::String(self_type), Json::String(item.name), Json::String(key)]))
+            }
             ret facts.body
         }
         SemanticBodyPlan::CheckSource => {
@@ -1189,21 +1268,28 @@ fn check_function_body_replayed(item: FunctionItem, callables: SemanticSlice[Sem
         replay.method_candidates = method_name_index(methods)
         replay.type_index_ready = true
     }
+    let owner = self_type
     let self_type = scope_type_indexed(self_type, type_scope, replay.type_index, generic_param_names(scope_generics))
     replay.checked += 1_usize
     let body = check_function_body_indexed(item, callables, fields, methods, self_type, scope_generics,
         aggregate_names, type_scope, type_names, variants, replay.type_index, replay.callable_candidates, replay.method_candidates,)
-    if eligible && body.diagnostics.is_empty() {
-        replay.records.push(Json::Array(vec![Json::String(key), encode_semantic_checkpoint(body, item.line, item.column)]))
+    if body.diagnostics.is_empty() &&(eligible || replay.retain_complete) {
+        let record = encode_semantic_checkpoint(body, item.line, item.column)
+        if eligible {
+            replay.records.push(Json::Array(vec![Json::String(key), record]))
+        }
+        if replay.retain_complete {
+            replay.complete.push(Json::Array(vec![Json::String(owner), Json::String(item.name), if eligible { Json::String(key) } else { record }]))
+        }
     }
     ret body
 }
 
 fn check_module_bodies_impl(ast: Vec[Statement], callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding], variants: SemanticSlice[SemanticVariant], retain_bodies: bool, previous: Json, source: str) -> CheckedModuleBodies {
     let mut replay = SemanticReplay {
-        previous, semantic_source_lines(source), Vec[Json]::new(), 0_usize, 0_usize, !source.is_empty(),
+        ReplayIndex::new(previous), semantic_source_lines(source), Vec[Json]::new(), 0_usize, 0_usize, !source.is_empty(),
         TypeScopeIndex { type_names, Vec[usize]::new() }, false,
-        SemanticNameIndex::new(Vec[str]::new()), SemanticNameIndex::new(Vec[str]::new())
+        SemanticNameIndex::new(Vec[str]::new()), SemanticNameIndex::new(Vec[str]::new()), Vec[Json]::new(), retain_bodies && !source.is_empty()
     }
     let mut out = Vec[FrontendDiagnostic]::new()
     let mut functions = Vec[CheckedFunctionBody]::new()
@@ -1267,7 +1353,15 @@ fn check_module_bodies_impl(ast: Vec[Statement], callables: SemanticSlice[Semant
         let row = value.as_array().unwrap_or(Vec[Json]::new())
         records.push((row.get(0).unwrap_or(Json::Null).as_str().unwrap_or(""), row.get(1).unwrap_or(Json::Null)))
     }
-    ret CheckedModuleBodies { out, functions, Json::Object(records), replay.checked, replay.reused }
+    let complete = if replay.retain_complete && out.is_empty() {
+        Json::Array(vec![Json::String("semantic-module-bodies-1"), Json::Array(replay.complete),
+                Json::String(compiler_content_digest(stringify(Json::Array(replay.complete))))])
+    } else {
+        Json::Null
+    }
+    ret CheckedModuleBodies {
+        out, functions, Json::Object(records), replay.checked, replay.reused, complete
+    }
 }
 
 pub fn append_bound_methods_view(methods: SemanticSlice[SemanticMethod], bound_methods: Vec[SemanticMethod]) -> SemanticSlice[SemanticMethod] {
@@ -4549,10 +4643,17 @@ struct SemanticCheckpointRelocation {
     old_column: usize,
     line: usize,
     column: usize
+    exact: bool
 }
 fn checkpoint_site(line: Json, column: Json, relocation: SemanticCheckpointRelocation) -> Result[(usize, usize), str] {
     let old_line = checkpoint_position(line)?
     let old_column = checkpoint_position(column)?
+    // Extern declarations and generated semantic bindings legitimately have
+    // synthetic scopes before the function. No coordinates move when the
+    // enclosing source has been verified byte-for-byte.
+    if relocation.exact {
+        ret Result::Ok((old_line, old_column))
+    }
     if old_line < relocation.old_line {
         ret Result::Err("semantic position precedes owner")
     }
@@ -4567,6 +4668,7 @@ fn checkpoint_site(line: Json, column: Json, relocation: SemanticCheckpointReloc
     }
     ret Result::Ok((new_line, new_column))
 }
+
 fn checkpoint_read_binding(value: Json, relocation: SemanticCheckpointRelocation) -> Result[SemanticBinding, str] {
     let row = checkpoint_record(value, 4_usize)?
     let point = checkpoint_site(row.get(2).unwrap_or(Json::Null), row.get(3).unwrap_or(Json::Null), relocation)?
@@ -4624,12 +4726,25 @@ pub fn encode_semantic_checkpoint(body: SemanticBody, line: usize, column: usize
 }
 
 pub fn decode_semantic_checkpoint_view(value: Json, names: SemanticSlice[TypeNameBinding], line: usize, column: usize) -> Result[SemanticBody, str] {
+    ret decode_semantic_checkpoint_impl(value, names, line, column, false)
+}
+
+/// Only for a source/context-verified whole module, without any relocation.
+pub fn decode_semantic_checkpoint_exact_view(value: Json, names: SemanticSlice[TypeNameBinding], line: usize, column: usize) -> Result[SemanticBody, str] {
+    ret decode_semantic_checkpoint_impl(value, names, line, column, true)
+}
+
+fn decode_semantic_checkpoint_impl(value: Json, names: SemanticSlice[TypeNameBinding], line: usize, column: usize,
+    exact: bool,) -> Result[SemanticBody, str] {
     let row = checkpoint_record(value, 11_usize)?
     if checkpoint_string(row.get(0).unwrap_or(Json::Null))? != "semantic-body-1" {
         ret Result::Err("unknown semantic schema")
     }
     let relocation = SemanticCheckpointRelocation {
-        checkpoint_position(row.get(1).unwrap_or(Json::Null))?, checkpoint_position(row.get(2).unwrap_or(Json::Null))?, line, column
+        checkpoint_position(row.get(1).unwrap_or(Json::Null))?, checkpoint_position(row.get(2).unwrap_or(Json::Null))?, line, column, exact
+    }
+    if exact &&(relocation.old_line != line || relocation.old_column != column) {
+        ret Result::Err("exact semantic checkpoint position changed")
     }
     let mut bindings = Vec[SemanticBinding]::new()
     for value in checkpoint_array(row.get(3).unwrap_or(Json::Null))? {

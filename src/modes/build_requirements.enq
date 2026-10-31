@@ -10,6 +10,7 @@ import ehirlib::codegen::{CodegenRequirements, GenericRequirement}
 import json::{Json, parse, stringify}
 
 import mod::build_metadata::MetadataContext
+import refrain::cache_identity::compiler_content_digest
 
 /// Carries the same compiler/target/profile identity as its checked declarations.
 /// Its bytes are additionally hashed by the coordinator's completion record.
@@ -19,6 +20,13 @@ pub struct UnitRequirements {
 }
 
 impl for UnitRequirements {
+    /// Source receipts guard provenance, not the generated support program.
+    pub fn content_digest(self: Self) -> Result[str, str] {
+        let data = parse(self.encode()?).unwrap_or(Json::Null)
+        ret Result::Ok(compiler_content_digest("encore-support-requirements-1\n" +
+                stringify(Json::Array(vec![data.get("calls").unwrap_or(Json::Null),
+                            data.get("types").unwrap_or(Json::Null), data.get("equality").unwrap_or(Json::Null)]))))
+    }
     pub fn encode(self: Self) -> Result[str, str] {
         let mut fields = Vec[(str, Json)]::new()
         fields.push(("schema", Json::Number("2")))
@@ -70,6 +78,47 @@ impl for UnitRequirements {
             ,
         )
     }
+}
+
+/// Identifies an already verified worker payload without materializing several
+/// thousand Type records merely to serialize them again. Deep validation still
+/// happens before generating a new support object. A hit names exactly those
+/// semantic arrays for which a successful compilation already published code.
+pub fn requirements_content_digest(text: str, expected: MetadataContext) -> Result[str, str] {
+    let data = match parse(text) {
+        Ok(value) => value Err(_) => {
+            ret Result::Err("invalid requirements JSON")
+        }
+    }
+    if data.get("schema").unwrap_or(Json::Null).as_number().unwrap_or("") != "2" {
+        ret Result::Err("unsupported requirements schema")
+    }
+    let context = MetadataContext::decode(data.get("context").unwrap_or(Json::Null))?
+    if stringify(context.encode()?) != stringify(expected.encode()?) {
+        ret Result::Err("requirements compiler/target/profile/input mismatch")
+    }
+    let mut semantic = Vec[Json]::new()
+    for field in vec!["calls", "types", "equality"] {
+        semantic.push(Json::Array(array(data.get(field).unwrap_or(Json::Null))?))
+    }
+    ret Result::Ok(compiler_content_digest("encore-support-requirements-1\n" + stringify(Json::Array(semantic))))
+}
+
+#attr(test)
+fn metadata_requirements_content_ignores_source_receipts() -> bool {
+    let original = requirements_fixture()
+    let mut moved = requirements_fixture()
+    moved.context.input_digest = compiler_content_digest("another source revision")
+    let before = original.content_digest().unwrap_or("")
+    if before.is_empty() || before != moved.content_digest().unwrap_or("") {
+        ret false
+    }
+    if requirements_content_digest(original.encode().unwrap_or(""), original.context).unwrap_or("") != before ||
+    requirements_content_digest(original.encode().unwrap_or(""), moved.context).is_ok() {
+        ret false
+    }
+    moved.requirements.generic_calls.push(GenericRequirement { "new_support", Vec[Type]::new() })
+    ret before != moved.content_digest().unwrap_or("")
 }
 
 fn encode_types(types: Vec[Type], depth: usize) -> Result[Json, str] {
