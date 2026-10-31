@@ -1,5 +1,5 @@
 //! Defines reusable, incremental semantic results for function-body queries.
-import refrain::frontend::semantic_slice::SemanticSlice
+import refrain::frontend::semantic_slice::{SemanticNameIndex, SemanticSlice}
 
 import core::fmt::Debug
 import core::option::Option
@@ -254,6 +254,8 @@ struct SemanticReplay {
     enabled: bool
     type_index: TypeScopeIndex
     type_index_ready: bool
+    callable_candidates: SemanticNameIndex
+    method_candidates: SemanticNameIndex
 }
 
 fn semantic_source_lines(source: str) -> Vec[str] {
@@ -301,6 +303,32 @@ struct SemanticContext {
     variants: SemanticSlice[SemanticVariant]
     is_async: bool
     type_index: TypeScopeIndex
+    callable_candidates: SemanticNameIndex
+    method_candidates: SemanticNameIndex
+}
+
+// Build against the exact view, including indirect selections and overlays.
+// Name filtering preserves declaration order; receiver and visibility checks
+// continue to run on the original records selected by each candidate ordinal.
+fn callable_name_index(callables: SemanticSlice[SemanticCallable]) -> SemanticNameIndex {
+    let mut names = Vec[str]::with_capacity(callables.len())
+    for ordinal in 0_usize..callables.len() {
+        if !callables.contains_index(ordinal) {
+            break
+        }
+        names.push(callables.get_unchecked_borrowed(ordinal).name)
+    }
+    ret SemanticNameIndex::new(names)
+}
+fn method_name_index(methods: SemanticSlice[SemanticMethod]) -> SemanticNameIndex {
+    let mut names = Vec[str]::with_capacity(methods.len())
+    for ordinal in 0_usize..methods.len() {
+        if !methods.contains_index(ordinal) {
+            break
+        }
+        names.push(methods.get_unchecked_borrowed(ordinal).name)
+    }
+    ret SemanticNameIndex::new(names)
 }
 
 impl for SemanticBody {
@@ -625,10 +653,11 @@ pub fn check_function_body_with_type_scope_view(item: FunctionItem, callables: S
 
 pub fn check_function_body_with_variants_view(item: FunctionItem, callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], self_type: str, scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding], variants: SemanticSlice[SemanticVariant]) -> SemanticBody {
     ret check_function_body_indexed(item, callables, fields, methods, self_type, scope_generics,
-        aggregate_names, type_scope, type_names, variants, type_scope_index_view(type_names),)
+        aggregate_names, type_scope, type_names, variants, type_scope_index_view(type_names),
+        callable_name_index(callables), method_name_index(methods),)
 }
 
-fn check_function_body_indexed(item: FunctionItem, callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], self_type: str, scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding], variants: SemanticSlice[SemanticVariant], type_index: TypeScopeIndex) -> SemanticBody {
+fn check_function_body_indexed(item: FunctionItem, callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], self_type: str, scope_generics: Vec[GenericParam], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding], variants: SemanticSlice[SemanticVariant], type_index: TypeScopeIndex, callable_candidates: SemanticNameIndex, method_candidates: SemanticNameIndex) -> SemanticBody {
     let reflection_sites = if function_uses_reflection(item) {
         reflection_binding_sites(item)
     } else {
@@ -707,11 +736,16 @@ fn check_function_body_indexed(item: FunctionItem, callables: SemanticSlice[Sema
     }
     let bound_methods = methods_for_generic_bounds(generics, methods, type_scope, type_names, type_index)
     let scoped_methods = append_bound_methods_view(methods, bound_methods)
+    let method_candidates = if bound_methods.is_empty() {
+        method_candidates
+    } else {
+        method_name_index(scoped_methods)
+    }
     let mut ctx = SemanticContext {
         callables, fields, scoped_methods, self_type, generic_names, Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(),
         Vec[SemanticDependency]::new(),
         (0_usize, 0_usize, 0_usize, 0_usize), Vec[ScopedSemanticBinding]::new(), aggregate_names,
-        Vec[(usize, usize, str)]::new(), type_names, type_scope, Vec[(usize, usize, str, str)]::new(), variants, item.is_async, type_index
+        Vec[(usize, usize, str)]::new(), type_names, type_scope, Vec[(usize, usize, str, str)]::new(), variants, item.is_async, type_index, callable_candidates, method_candidates
     }
     for generic in generics {
         if generic.bounds.len() > 0_usize {
@@ -1151,12 +1185,14 @@ fn check_function_body_replayed(item: FunctionItem, callables: SemanticSlice[Sem
     }
     if !replay.type_index_ready {
         replay.type_index = type_scope_index_view(type_names)
+        replay.callable_candidates = callable_name_index(callables)
+        replay.method_candidates = method_name_index(methods)
         replay.type_index_ready = true
     }
     let self_type = scope_type_indexed(self_type, type_scope, replay.type_index, generic_param_names(scope_generics))
     replay.checked += 1_usize
     let body = check_function_body_indexed(item, callables, fields, methods, self_type, scope_generics,
-        aggregate_names, type_scope, type_names, variants, replay.type_index,)
+        aggregate_names, type_scope, type_names, variants, replay.type_index, replay.callable_candidates, replay.method_candidates,)
     if eligible && body.diagnostics.is_empty() {
         replay.records.push(Json::Array(vec![Json::String(key), encode_semantic_checkpoint(body, item.line, item.column)]))
     }
@@ -1166,7 +1202,8 @@ fn check_function_body_replayed(item: FunctionItem, callables: SemanticSlice[Sem
 fn check_module_bodies_impl(ast: Vec[Statement], callables: SemanticSlice[SemanticCallable], fields: SemanticSlice[SemanticField], methods: SemanticSlice[SemanticMethod], aggregate_names: Vec[str], type_scope: str, type_names: SemanticSlice[TypeNameBinding], variants: SemanticSlice[SemanticVariant], retain_bodies: bool, previous: Json, source: str) -> CheckedModuleBodies {
     let mut replay = SemanticReplay {
         previous, semantic_source_lines(source), Vec[Json]::new(), 0_usize, 0_usize, !source.is_empty(),
-        TypeScopeIndex { type_names, Vec[usize]::new() }, false
+        TypeScopeIndex { type_names, Vec[usize]::new() }, false,
+        SemanticNameIndex::new(Vec[str]::new()), SemanticNameIndex::new(Vec[str]::new())
     }
     let mut out = Vec[FrontendDiagnostic]::new()
     let mut functions = Vec[CheckedFunctionBody]::new()
@@ -2351,7 +2388,11 @@ fn infer_value_path(ctx: mut SemanticContext, name: str, source_name: str,
     line: usize, column: usize, length: usize,) -> str {
     let mut resolved = infer_path_type(ctx.bindings, name)
     if !binding_exists(ctx.bindings, name) {
-        for callable in ctx.callables {
+        let candidate_range = ctx.callable_candidates.range(name)
+        let candidate_start = candidate_range.0
+        let candidate_end = candidate_range.1
+        for candidate in candidate_start..candidate_end {
+            let callable = ctx.callables.get_unchecked_borrowed(ctx.callable_candidates.position(candidate))
             if callable.is_static && callable.name == name {
                 remember_dependency(ctx, callable)
                 resolved = callable.ret_type
@@ -2384,7 +2425,11 @@ fn infer_value_path(ctx: mut SemanticContext, name: str, source_name: str,
             }
             let mut denied = false
             let mut allowed = false
-            for method in ctx.methods {
+            let candidate_range = ctx.method_candidates.range(member)
+            let candidate_start = candidate_range.0
+            let candidate_end = candidate_range.1
+            for candidate in candidate_start..candidate_end {
+                let method = ctx.methods.get_unchecked_borrowed(ctx.method_candidates.position(candidate))
                 if method.name == member && semantic_receiver_matches(method.receiver_type, owner, method.generic_names) {
                     if semantic_method_accessible(method, ctx.self_type) {
                         allowed = true
@@ -2442,7 +2487,11 @@ fn report_unknown_value(
     if binding_exists(ctx.bindings, name) {
         ret()
     }
-    for callable in ctx.callables {
+    let candidate_range = ctx.callable_candidates.range(name)
+    let candidate_start = candidate_range.0
+    let candidate_end = candidate_range.1
+    for candidate in candidate_start..candidate_end {
+        let callable = ctx.callables.get_unchecked_borrowed(ctx.callable_candidates.position(candidate))
         if callable.name == name {
             ret()
         }
@@ -2695,7 +2744,11 @@ fn resolve_associated_call(ctx: mut SemanticContext, path: str, type_arguments: 
     let name = path.slice(separator + 2_usize, path.len() - separator - 2_usize)
     let mut expected = Vec[str]::new()
     let mut found = false
-    for method in ctx.methods {
+    let candidate_range = ctx.method_candidates.range(name)
+    let candidate_start = candidate_range.0
+    let candidate_end = candidate_range.1
+    for candidate in candidate_start..candidate_end {
+        let method = ctx.methods.get_unchecked_borrowed(ctx.method_candidates.position(candidate))
         if !method.is_static || method.name != name {
             continue
         }
@@ -2730,7 +2783,11 @@ fn resolve_associated_call(ctx: mut SemanticContext, path: str, type_arguments: 
         // Keep that accessible declaration available to UFCS call checking.
         let mut accessible_member = false
         let mut private_member = false
-        for method in ctx.methods {
+        let candidate_range = ctx.method_candidates.range(name)
+        let candidate_start = candidate_range.0
+        let candidate_end = candidate_range.1
+        for candidate in candidate_start..candidate_end {
+            let method = ctx.methods.get_unchecked_borrowed(ctx.method_candidates.position(candidate))
             let declared = if starts_with(method.receiver_type, "dyn ") {
                 method.receiver_type.slice(4_usize, method.receiver_type.len() - 4_usize)
             } else {
@@ -2798,7 +2855,11 @@ fn resolve_call(ctx: mut SemanticContext, name: str, type_arguments: Vec[str], a
     let mut expected_arity = 0_usize
     let mut expected_params = Vec[str]::new()
     let mut out_of_range = false
-    for callable in ctx.callables {
+    let candidate_range = ctx.callable_candidates.range(name)
+    let candidate_start = candidate_range.0
+    let candidate_end = candidate_range.1
+    for candidate in candidate_start..candidate_end {
+        let callable = ctx.callables.get_unchecked_borrowed(ctx.callable_candidates.position(candidate))
         if callable.name == name {
             saw_name = true
             expected_arity = callable.params.len()
@@ -3155,7 +3216,11 @@ fn check_implicit_method_access(ctx: mut SemanticContext, receiver: str, name: s
     line: usize, column: usize, length: usize,) ->() {
     let mut denied = false
     let mut allowed = false
-    for method in ctx.methods {
+    let candidate_range = ctx.method_candidates.range(name)
+    let candidate_start = candidate_range.0
+    let candidate_end = candidate_range.1
+    for candidate in candidate_start..candidate_end {
+        let method = ctx.methods.get_unchecked_borrowed(ctx.method_candidates.position(candidate))
         if method.name == name && semantic_receiver_matches(method.receiver_type, receiver, method.generic_names) {
             remember_method_dependency(ctx, method)
             if semantic_method_accessible(method, ctx.self_type) {
@@ -3170,7 +3235,11 @@ fn check_implicit_method_access(ctx: mut SemanticContext, receiver: str, name: s
     }
 }
 fn iterable_method_return(ctx: mut SemanticContext, receiver: str, name: str) -> str {
-    for method in ctx.methods {
+    let candidate_range = ctx.method_candidates.range(name)
+    let candidate_start = candidate_range.0
+    let candidate_end = candidate_range.1
+    for candidate in candidate_start..candidate_end {
+        let method = ctx.methods.get_unchecked_borrowed(ctx.method_candidates.position(candidate))
         if !method.is_static && method.name == name &&
         semantic_method_accessible(method, ctx.self_type) &&
         semantic_receiver_matches(method.receiver_type, receiver, method.generic_names) {
@@ -3442,7 +3511,11 @@ fn resolve_method_call(
     let mut private_member = false
     let mut expected_arity = 0_usize
     let mut expected_params = Vec[str]::new()
-    for method in ctx.methods {
+    let candidate_range = ctx.method_candidates.range(name)
+    let candidate_start = candidate_range.0
+    let candidate_end = candidate_range.1
+    for candidate in candidate_start..candidate_end {
+        let method = ctx.methods.get_unchecked_borrowed(ctx.method_candidates.position(candidate))
         if method.name != name ||(method.is_static &&(is_generic_receiver || starts_with(receiver, "dyn "))) {
             continue
         }

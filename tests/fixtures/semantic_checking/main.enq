@@ -1,0 +1,172 @@
+//! Isolates cold package semantic preparation, parallel checking and replay publication.
+import core::fmt::Debug
+import core::option::Option
+
+import std::io::{eprintln, println}
+import std::os::env
+import std::path::Path
+import std::thread::JoinHandle
+import std::time::perf_counter_ms
+import std::vec::Vec
+
+import json::{Json, stringify}
+
+import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::analysis_database::{PreparedModuleSafety, PreparedSafetyModule, check_prepared_safety_module}
+import refrain::frontend::semantic_index::{PackageSemanticIndex, encode_semantic_module}
+import refrain::project::workspace::load_binary_workspace
+import refrain::target::host_target
+
+struct Job {
+    index: usize
+    weight: usize
+    input: PreparedSafetyModule
+}
+struct Chunk {
+    index: usize
+    output: PreparedModuleSafety
+    duration_ms: u64
+}
+fn check(job: sending Job) -> sending Chunk {
+    let started = perf_counter_ms()
+    let output = check_prepared_safety_module(job.input)
+    ret Chunk { job.index, output, perf_counter_ms() - started }
+}
+fn main() -> u32 {
+    let root = env("ENCORE_SEMANTIC_BENCH_PROJECT").unwrap_or("")
+    if root.is_empty() {
+        ret 0_u32
+    }
+    let started = perf_counter_ms()
+    let mut workspace = load_binary_workspace(Path::new(root))
+    let target = host_target()
+    let mut selected = Vec[str]::new()
+    for module in workspace.modules {
+        if module.owner_name == workspace.root_name {
+            selected.push(module.analysis_id.key())
+            workspace.analysis.configure_safety(module.analysis_id.key(), target, module.enabled_features)
+        }
+    }
+    if selected.is_empty() {
+        ret 1_u32
+    }
+    let loaded = perf_counter_ms()
+    let identity = workspace.analysis.semantic_package_identity(selected)
+    workspace.analysis.prepare_package_semantics(selected, identity, Option[PackageSemanticIndex]::None)
+    let snapshot = workspace.analysis.package_semantic_index().unwrap_or(PackageSemanticIndex::empty())
+    let encoded = match snapshot.encode() {
+        Ok(value) => value Err(error) => {
+            eprintln(error) ret 2_u32
+        }
+    }
+    let snapshot_hash = compiler_content_digest(encoded)
+    let mut tasks = Vec[Job]::new()
+    let mut index = 0_usize
+    for module in workspace.modules {
+        if module.owner_name == workspace.root_name {
+            let input = workspace.analysis.prepare_module_safety_job(module.analysis_id.key(), target, module.enabled_features, Json::Null, true)
+            tasks.push(Job { index, module.source.byte_len(), input })
+        }
+        index += 1_usize
+    }
+    let mut cursor = 1_usize
+    while cursor < tasks.len() {
+        let mut position = cursor
+        while position > 0_usize {
+            let left = tasks.get_unchecked_borrowed(position - 1_usize)
+            let right = tasks.get_unchecked_borrowed(position)
+            if left.weight >= right.weight {
+                break
+            }
+            tasks.set(position - 1_usize, right)
+            tasks.set(position, left)
+            position -= 1_usize
+        }
+        cursor += 1_usize
+    }
+    let prepared = perf_counter_ms()
+    let mut chunks = Vec[Chunk]::new()
+    let mut handles = Vec[JoinHandle[Chunk]]::new()
+    for task in tasks {
+        handles.push(spawn check(task))
+        if handles.len() == 8_usize {
+            for handle in handles {
+                chunks.push(handle.join())
+            }
+            handles = Vec[JoinHandle[Chunk]]::new()
+        }
+    }
+    for handle in handles {
+        chunks.push(handle.join())
+    }
+    let checked = perf_counter_ms()
+    let mut hashes = Vec[Json]::new()
+    let mut durations = Vec[Json]::new()
+    let mut functions = 0_usize
+    let mut bodies = 0_usize
+    index = 0_usize
+    for module in workspace.modules {
+        for chunk in chunks {
+            if chunk.index != index {
+                continue
+            }
+            let output = chunk.output
+            if !output.diagnostics.is_empty() {
+                eprintln(module.module_id + ": " + output.diagnostics.get_unchecked_borrowed(0_usize).message)
+                ret 3_u32
+            }
+            functions += output.functions.len()
+            bodies += output.checked
+            let replay = workspace.analysis.finalize_semantic_replay(module.analysis_id.key(), output.replay)
+            let payload = match encode_semantic_module(snapshot_hash, replay) {
+                Ok(value) => value Err(error) => {
+                    eprintln(error) ret 4_u32
+                }
+            }
+            hashes.push(Json::String(compiler_content_digest(payload)))
+            durations.push(Json::Array(vec![Json::String(module.module_id), Json::Number(chunk.duration_ms.fmt())]))
+            break
+        }
+        index += 1_usize
+    }
+    let published = perf_counter_ms()
+    let timings = workspace.analysis.semantic_preparation_timings()
+    println(stringify(Json::Object(vec![
+                    ("workspace_ms", Json::Number((loaded - started).fmt())),
+                    ("prepare_ms", Json::Number((prepared - loaded).fmt())),
+                    ("bodies_ms", Json::Number((checked - prepared).fmt())),
+                    ("publish_ms", Json::Number((published - checked).fmt())),
+                    ("environment_ms", Json::Number(timings.environment_ms.fmt())),
+                    ("environment_names_ms", Json::Number(timings.environment_names_ms.fmt())),
+                    ("environment_callables_ms", Json::Number(timings.environment_callables_ms.fmt())),
+                    ("environment_fields_ms", Json::Number(timings.environment_fields_ms.fmt())),
+                    ("environment_methods_ms", Json::Number(timings.environment_methods_ms.fmt())),
+                    ("environment_variants_ms", Json::Number(timings.environment_variants_ms.fmt())),
+                    ("environment_constructors_ms", Json::Number(timings.environment_constructors_ms.fmt())),
+                    ("environment_statics_ms", Json::Number(timings.environment_statics_ms.fmt())),
+                    ("environment_index_ms", Json::Number(timings.environment_index_ms.fmt())),
+                    ("environment_type_index_ms", Json::Number(timings.environment_type_index_ms.fmt())),
+                    ("environment_callable_scope_ms", Json::Number(timings.environment_callable_scope_ms.fmt())),
+                    ("environment_context_ms", Json::Number(timings.environment_context_ms.fmt())),
+                    ("environment_scopes_ms", Json::Number(timings.environment_scopes_ms.fmt())),
+                    ("environment_lookup_ms", Json::Number(timings.environment_lookup_ms.fmt())),
+                    ("environment_store_ms", Json::Number(timings.environment_store_ms.fmt())),
+                    ("environment_finish_ms", Json::Number(timings.environment_finish_ms.fmt())),
+                    ("environment_release_ms", Json::Number(timings.environment_release_ms.fmt())),
+                    ("callable_defmap_ms", Json::Number(timings.callable_defmap_ms.fmt())),
+                    ("callable_collect_ms", Json::Number(timings.callable_collect_ms.fmt())),
+                    ("callable_bind_ms", Json::Number(timings.callable_bind_ms.fmt())),
+                    ("callable_qualified_ms", Json::Number(timings.callable_qualified_ms.fmt())),
+                    ("method_collect_ms", Json::Number(timings.method_collect_ms.fmt())),
+                    ("method_visibility_ms", Json::Number(timings.method_visibility_ms.fmt())),
+                    ("method_inheritance_ms", Json::Number(timings.method_inheritance_ms.fmt())),
+                    ("method_scope_ms", Json::Number(timings.method_scope_ms.fmt())),
+                    ("modules", Json::Number(selected.len().fmt())),
+                    ("functions", Json::Number(functions.fmt())),
+                    ("bodies_checked", Json::Number(bodies.fmt())),
+                    ("snapshot_sha256", Json::String(snapshot_hash)),
+                    ("replay_sha256", Json::Array(hashes)),
+                    ("module_check_ms", Json::Array(durations))
+                ])))
+    ret 0_u32
+}
