@@ -7,7 +7,7 @@ import std::thread::JoinHandle
 import std::time::perf_counter_ms
 import std::vec::{Vec, vec_singleton}
 
-import ehir_core::{PreparationOutcome, enum_value, prepare_module}
+import ehir_core::{PreparationOutcome, enum_value, parse_module_bundle_text, prepare_module}
 import ehir_core::core::{BinaryOpKind, Block, CallInstruction, Directive, EdgeInstruction, EhirDocumentation, EhirImport, EnumVariant, FieldSelector, FnDirective, Instruction, MatchArm, MatchInstruction, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, ValueKind, Variable, add_edge, alias, async_fn_item, await_value, binary, block, br_term, call, cbr_term, cfree, drop_value, ehir_documentation, ehir_import, enum_directive, enum_variant, extern_fn_item, fn_item, gep, getfield, getfieldptr, getptr, halloc, hfree, hrealloc, impl_directive, lceos, lcpos, lcsos, load, local_place_type, make_module, make_module_bundle, make_module_with_metadata, mangle_plain_type_name, mangle_type_name, match_arm, match_term, memory_value_type, param, pcast, phi, phi_pair, put, raw_type, remove_edge, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, store, struct_directive, switch_case, switch_term, trait_directive, trait_method, unreachable_term}
 
 fn concat_instructions(left: Vec[LLVMInstruction], right: Vec[LLVMInstruction]) -> Vec[LLVMInstruction] {
@@ -59,6 +59,16 @@ pub struct LoweredModule {
 struct SupportIr {
     definitions: str
     declarations: str
+}
+
+struct PackageFunctionDeclaration {
+    name: str
+    text: str
+}
+
+struct PackageModuleDeclarations {
+    module_id: str
+    functions: Vec[PackageFunctionDeclaration]
 }
 
 pub struct EmittedIrModule {
@@ -260,6 +270,7 @@ pub fn emit_unit_codegen_selected_parallel(unit: frozen PreparedUnitCodegen, tri
     let support = SupportIr {
         "", unit_support_declarations(directives, expanded, unit.requirements.concrete_types, unit.requirements.equality_types)
     }
+    let declarations = package_module_declarations(unit.contexts)
     let preparation_error = take_codegen_error()
     if !preparation_error.is_empty() {
         ret vec![EmittedIrModule { "", "", 0_usize, preparation_error }]
@@ -268,11 +279,11 @@ pub fn emit_unit_codegen_selected_parallel(unit: frozen PreparedUnitCodegen, tri
     let scheduled = schedule_selected_codegen_modules(unit.owned, selected)
     let mut chunks = Vec[EmittedIrChunk]::new()
     if count == 1_usize {
-        chunks = emit_package_ir_batch(unit, scheduled, triple, pointer_width, support, 0_usize, 1_usize)
+        chunks = emit_package_ir_batch(unit, scheduled, triple, pointer_width, support, declarations, 0_usize, 1_usize)
     } else {
         let mut handles = Vec[JoinHandle[Vec[EmittedIrChunk]]]::new()
         for worker in 0_usize..count {
-            handles.push(spawn emit_package_ir_batch(unit, scheduled, triple, pointer_width, support, worker, count))
+            handles.push(spawn emit_package_ir_batch(unit, scheduled, triple, pointer_width, support, declarations, worker, count))
         }
         for handle in handles {
             chunks.extend(handle.join())
@@ -290,7 +301,8 @@ pub fn emit_unit_codegen_selected_parallel(unit: frozen PreparedUnitCodegen, tri
 }
 
 fn emit_package_ir_batch(unit: frozen PreparedUnitCodegen, selected: frozen Vec[usize], triple: str,
-    pointer_width: usize, support: frozen SupportIr, worker: usize, workers: usize,) -> sending Vec[EmittedIrChunk] {
+    pointer_width: usize, support: frozen SupportIr, declarations: frozen Vec[PackageModuleDeclarations],
+    worker: usize, workers: usize,) -> sending Vec[EmittedIrChunk] {
     install_codegen_target(triple, pointer_width)
     let mut out = Vec[EmittedIrChunk]::new()
     let mut cursor = worker
@@ -300,7 +312,8 @@ fn emit_package_ir_batch(unit: frozen PreparedUnitCodegen, selected: frozen Vec[
             Some(module) => {
                 clear_codegen_error()
                 let view = module_codegen_view(module, unit.contexts)
-                let lowered = lower_with_precomputed_analysis(view, unit.requirements.concrete_types, support, false)
+                let lowered = lower_module_ir(view, unit.requirements.concrete_types, support, false,
+                    module, declarations, true,)
                 let ir = "target triple = \"" + triple + "\"\n\n" + lowered.ir
                 out.push(EmittedIrChunk {
                         index, EmittedIrModule {
@@ -645,6 +658,13 @@ fn lower_with_analysis(module: frozen Module,
 
 fn lower_with_precomputed_analysis(module: frozen Module, concrete_types: frozen Vec[Type], support: SupportIr,
     define_support: bool,) -> LoweredModule {
+    ret lower_module_ir(module, concrete_types, support, define_support,
+        module, Vec[PackageModuleDeclarations]::new(), false,)
+}
+
+fn lower_module_ir(module: frozen Module, concrete_types: frozen Vec[Type], support: SupportIr,
+    define_support: bool, owned: frozen Module, declarations: frozen Vec[PackageModuleDeclarations],
+    package: bool,) -> LoweredModule {
     let directives = module.directives
     let module_name = module.name
     let mut type_declarations = lower_type_declarations(directives, concrete_types)
@@ -663,7 +683,11 @@ fn lower_with_precomputed_analysis(module: frozen Module, concrete_types: frozen
         encore_strset_new()
     }
     let mut emitted = false
-    emitted = append_lowered_directives(builder, directives, seen, emitted)
+    emitted = if package {
+        append_package_directives(builder, owned, declarations, seen, emitted)
+    } else {
+        append_lowered_directives(builder, directives, seen, emitted)
+    }
     profile_codegen_memory("directives-lowered")
     let support_text = if define_support {
         support.definitions
@@ -735,6 +759,140 @@ fn append_lowered_directives(builder: usize, directives: frozen Vec[Directive], 
         any = append_unique_functions(builder, lower_directive(directive), seen, any, 0_usize)
     }
     ret any
+}
+
+// Render foreign signatures once for this invocation and target. Keep every
+// occurrence: each CGU's ordinary declaration-order deduplication must still
+// decide whether a local definition or an earlier foreign declaration wins.
+fn package_module_declarations(modules: frozen Vec[Module]) -> Vec[PackageModuleDeclarations] {
+    let mut out = Vec[PackageModuleDeclarations]::with_capacity(modules.len())
+    for module in modules {
+        let mut foreign = Vec[Directive]::new()
+        append_module_codegen_directives(foreign, module.directives, false)
+        let mut functions = Vec[PackageFunctionDeclaration]::new()
+        for directive in foreign {
+            for function in lower_directive(directive) {
+                let builder = unsafe {
+                    encore_text_builder_new()
+                }
+                append_function_to_builder(builder, function)
+                let text = unsafe {
+                    encore_text_builder_finish(builder)
+                }
+                // append_builder_line restores this final newline when reused.
+                functions.push(PackageFunctionDeclaration {
+                        "" + function.name, byte_slice(text, 0_usize, text.byte_len() - 1_usize)
+                    }
+                )
+            }
+        }
+        out.push(PackageModuleDeclarations { "" + module.name, functions })
+    }
+    ret out
+}
+
+fn append_package_directives(builder: usize, owned: frozen Module,
+    declarations: frozen Vec[PackageModuleDeclarations], seen: usize, emitted: bool,) -> bool {
+    let mut any = emitted
+    for module in declarations {
+        if module.module_id == owned.name {
+            any = append_lowered_directives(builder, owned.directives, seen, any)
+        } else {
+            for function in module.functions {
+                if unsafe {
+                    encore_strset_insert(seen, function.name)
+                }
+                {
+                    if any {
+                        append_builder_line(builder, "")
+                    }
+                    append_builder_line(builder, function.text)
+                    any = true
+                }
+            }
+        }
+    }
+    ret any
+}
+
+fn package_declarations_match_reference(unit: frozen PreparedUnitCodegen,
+    triple: str, width: usize, selected: Vec[usize], jobs: usize,) -> bool {
+    clear_codegen_error()
+    let actual = emit_unit_codegen_selected_parallel(unit, triple, width, selected, jobs)
+    if actual.len() != selected.len() || !take_codegen_error().is_empty() {
+        ret false
+    }
+    let directives = module_bundle_directives(unit.contexts)
+    let mut calls = Vec[GenericCall]::new()
+    for requirement in unit.requirements.generic_calls {
+        calls.push(GenericCall {
+                requirement.name, clone_codegen_types(requirement.args),
+                generic_symbol(requirement.name, requirement.args)
+            }
+        )
+    }
+    let support = SupportIr {
+        "", unit_support_declarations(directives, expand_generic_calls(directives, calls),
+            unit.requirements.concrete_types, unit.requirements.equality_types,)
+    }
+    let mut position = 0_usize
+    for index in selected {
+        match unit.owned.get(index) {
+            Some(module) => {
+                let view = module_codegen_view(module, unit.contexts)
+                // The ordinary emitter retains the uncached lowering and
+                // rendering path used before package declaration sharing.
+                let expected = "target triple = \"" + triple + "\"\n\n" +
+                lower_with_precomputed_analysis(view, unit.requirements.concrete_types, support, false).ir
+                match actual.get(position) {
+                    Some(output) => {
+                        if output.module_id != module.name || output.ir != expected || !output.diagnostic.is_empty() {
+                            ret false
+                        }
+                    }
+                    None => {
+                        ret false
+                    }
+                }
+            }
+            None => {
+                ret false
+            }
+        }
+        position += 1_usize
+    }
+    ret take_codegen_error().is_empty()
+}
+
+#attr(test)
+fn package_declarations_preserve_reference_ir() -> bool {
+    let dependencies = parse_module_bundle_text("", "module dependency {\n" +
+        "struct Pair {\nvalue: u32\n}\n" +
+        "extern fn ffi(flag: bool, unit: (), address: u8*) -> bool\n" +
+        "extern fn duplicate(value: u32) -> u32\n" +
+        "fn identity[T](value: T) -> T {\n$entry:\nret value: T\n}\n" +
+        "impl Pair {\nfn read(self: Pair) -> u32 {\n$entry:\nvalue: u32 = lcpos 7_u32\nret value: u32\n}\n}\n}\n",)
+    for flag_type in vec!["bool", "u32"] {
+        let source = "module alpha {\nfn alpha(flag: " + flag_type + ", unit: (), address: u8*) -> " + flag_type +
+        " {\n$entry:\nret flag: " + flag_type + "\n}\n}\n" +
+        "module beta {\nextern fn duplicate(value: u32) -> u32\n" +
+        "fn beta(value: u32) -> u32 {\n$entry:\nanswer: u32 = call identity[u32](value: u32)\nret answer: u32\n}\n}\n"
+        for target in vec![("x86_64-unknown-linux-gnu", 64_usize),
+            ("aarch64-apple-darwin", 64_usize),("x86_64-pc-windows-msvc", 64_usize),
+            ("x86_64-w64-windows-gnu", 64_usize),("aarch64-w64-windows-gnu", 64_usize),
+            ("aarch64-unknown-linux-gnu", 64_usize),("i686-unknown-linux-gnu", 32_usize)] {
+            let unit = prepare_unit_codegen(parse_module_bundle_text("", source), dependencies, target.0, target.1, 1_usize)
+            for jobs in vec![1_usize, 2_usize, 8_usize] {
+                for selected in vec![vec![0_usize, 1_usize], vec![1_usize],
+                    vec![1_usize, 0_usize, 1_usize], Vec[usize]::new()] {
+                    if !package_declarations_match_reference(unit, target.0, target.1, selected, jobs) {
+                        ret false
+                    }
+                }
+            }
+        }
+    }
+    ret true
 }
 
 fn build_support_ir(directives: frozen Vec[Directive], generic_calls: frozen Vec[GenericCall],
