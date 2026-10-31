@@ -795,6 +795,19 @@ fn package_module_declarations(modules: frozen Vec[Module]) -> Vec[PackageModule
 fn append_package_directives(builder: usize, owned: frozen Module,
     declarations: frozen Vec[PackageModuleDeclarations], seen: usize, emitted: bool,) -> bool {
     let mut any = emitted
+    let mut has_owner = false
+    for module in declarations {
+        if module.module_id == owned.name {
+            has_owner = true
+            break
+        }
+    }
+    // Function CGUs retain the original module's declaration context. Their
+    // synthetic ID has no matching context row, so emit the owned definitions
+    // before foreign declarations can claim the same symbols.
+    if !has_owner {
+        any = append_lowered_directives(builder, owned.directives, seen, any)
+    }
     for module in declarations {
         if module.module_id == owned.name {
             any = append_lowered_directives(builder, owned.directives, seen, any)
@@ -7056,13 +7069,38 @@ fn emit_compact_package_batch(unit: frozen PreparedUnitCodegen, selected: frozen
     ret out
 }
 
-/// Function names already carry declaration-owned ABI identities, including
-/// overloads. Coordinates and their containing module's sibling bodies do not
-/// participate in a dev object's identity. Helpers retain ordinary definitions.
+// A module already emits only the first definition of each LLVM symbol.
+// Keep colliding source declarations in the same CGU so splitting does not
+// create duplicate definitions or repeated archive member names.
+fn append_function_codegen_unit(owned: mut Vec[Module], groups: usize, symbol: str,
+    name: str, directive: Directive,) -> usize {
+    let previous = unsafe {
+        encore_strmap_get(groups, symbol)
+    }
+    if previous != 0_usize {
+        let existing = owned.get_unchecked_borrowed(previous - 1_usize)
+        let mut directives = existing.directives
+        directives.push(directive)
+        owned.set(previous - 1_usize, make_module(existing.name, directives))
+        ret previous
+    }
+    owned.push(make_module(name, vec![directive]))
+    unsafe {
+        encore_strmap_put(groups, symbol, owned.len())
+    }
+    ret owned.len()
+}
+
+/// Ordinary bodies use stable CGUs. Declarations with the same native symbol
+/// retain their original module's first-definition precedence within one CGU.
+/// Generated closure helpers remain attached to their ordinary body owner.
 pub fn function_codegen_units(unit: frozen PreparedUnitCodegen) -> PreparedUnitCodegen {
     let mut owned = Vec[Module]::new()
     for module in unit.owned {
         let owners = unsafe {
+            encore_strmap_new()
+        }
+        let groups = unsafe {
             encore_strmap_new()
         }
         let first = owned.len()
@@ -7070,9 +7108,10 @@ pub fn function_codegen_units(unit: frozen PreparedUnitCodegen) -> PreparedUnitC
             match directive {
                 Directive::Function(function) => {
                     if function.generics.is_empty() && !function.is_extern {
-                        owned.push(make_module(module.name + "#function:" + function.name, vec![Directive::Function(clone_codegen_function(function))]))
+                        let position = append_function_codegen_unit(owned, groups, function_symbol(function.name),
+                            module.name + "#function:" + function.name, Directive::Function(clone_codegen_function(function)),)
                         unsafe {
-                            encore_strmap_put(owners, function_body_identity(module.name, "", function.name), owned.len())
+                            encore_strmap_put(owners, function_body_identity(module.name, "", function.name), position)
                         }
                     }
                 }
@@ -7084,11 +7123,12 @@ pub fn function_codegen_units(unit: frozen PreparedUnitCodegen) -> PreparedUnitC
                         if method.generics.is_empty() && !method.is_extern {
                             let item = impl_directive(clone_codegen_types(implementation.generics), "" + implementation.trait_name, clone_codegen_types(implementation.trait_args),
                                 clone_type(implementation.for_type), vec![clone_codegen_function(method)],)
-                            owned.push(make_module(module.name + "#method:" + mangle_type_name(implementation.for_type) + "::" + method.name,
-                                    vec![item],))
+                            let position = append_function_codegen_unit(owned, groups,
+                                function_symbol(implementation.for_type.name + "::" + method.name),
+                                module.name + "#method:" + mangle_type_name(implementation.for_type) + "::" + method.name, item,)
                             unsafe {
                                 encore_strmap_put(owners, function_body_identity(module.name,
-                                        ehir_core::type_to_string(clone_type(implementation.for_type)), method.name,), owned.len())
+                                        ehir_core::type_to_string(clone_type(implementation.for_type)), method.name,), position)
                             }
                         }
                     }
@@ -7117,9 +7157,11 @@ pub fn function_codegen_units(unit: frozen PreparedUnitCodegen) -> PreparedUnitC
                         // ordinary parent in this unit. Preserve their owners.
                         for method in implementation.methods {
                             if implementation.generics.is_empty() && method.generics.is_empty() && !method.is_extern {
-                                owned.push(make_module(module.name + "#method:" + mangle_type_name(implementation.for_type) + "::" + method.name,
-                                        vec![impl_directive(clone_codegen_types(implementation.generics), "" + implementation.trait_name,
-                                                clone_codegen_types(implementation.trait_args), clone_type(implementation.for_type), vec![clone_codegen_function(method)],)],))
+                                let _position = append_function_codegen_unit(owned, groups,
+                                    function_symbol(implementation.for_type.name + "::" + method.name),
+                                    module.name + "#method:" + mangle_type_name(implementation.for_type) + "::" + method.name,
+                                    impl_directive(clone_codegen_types(implementation.generics), "" + implementation.trait_name,
+                                        clone_codegen_types(implementation.trait_args), clone_type(implementation.for_type), vec![clone_codegen_function(method)],),)
                             }
                         }
                     }
@@ -7130,6 +7172,7 @@ pub fn function_codegen_units(unit: frozen PreparedUnitCodegen) -> PreparedUnitC
         }
         unsafe {
             encore_strmap_free(owners)
+            encore_strmap_free(groups)
         }
     }
     ret PreparedUnitCodegen {
