@@ -1,0 +1,383 @@
+//! Successful local builds can bypass package artifact restoration entirely.
+//! Receipts bind content inventories, never timestamps or directory mtimes.
+import core::option::Option
+import core::result::Result
+
+import std::os::{file_exists, file_sha256, mkdir_all, read_file}
+import std::path::Path
+import std::vec::Vec
+
+import binary
+import ehirlib::{prepared_bytes_payload, prepared_payload_bytes}
+import json::{Json, stringify}
+
+import mod::build_request::unit_source_records
+import mod::cache_payload::{read_packed_payload, verified_payload, write_payload}
+import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::{Lexer, Parser, ProjectConstants}
+import refrain::frontend::metadata_ast::encode_executable_ast
+import refrain::project::manifest::project_manifest_version
+import refrain::project::workspace::{ResolvedPackageGraph, WorkspaceRefrain}
+
+struct InputFile {
+    unit: str
+    source: str
+    digest: str
+    watched: bool
+}
+
+pub struct BuildInputInventory {
+    files: Vec[InputFile]
+}
+
+struct SuccessfulBuildReceipt {
+    schema: u32
+    configuration: str
+    files: Vec[InputFile]
+    binary: str
+    import_library: str
+}
+
+pub fn build_input_inventory(graph: ResolvedPackageGraph) -> Result[BuildInputInventory, str] {
+    let mut files = Vec[InputFile]::new()
+    for package in graph.refrains {
+        for record in unit_source_records(package)? {
+            files.push(InputFile {
+                    package.name,
+                    record.get("source").unwrap_or(Json::Null).as_str().unwrap_or(""),
+                    record.get("sha256").unwrap_or(Json::Null).as_str().unwrap_or(""), true
+                }
+            )
+        }
+    }
+    ret Result::Ok(BuildInputInventory { files })
+}
+
+/// Source names still guard import resolution across the whole graph. A
+/// build-script binary depends on contents only of modules its loader visited;
+/// editing an unrelated application body must not recompile the build script.
+pub fn watched_build_inputs(inventory: BuildInputInventory, graph: ResolvedPackageGraph,
+    paths: Vec[Path],) -> BuildInputInventory {
+    let mut files = Vec[InputFile]::new()
+    for file in inventory.files {
+        let mut watched = false
+        match owner(graph, file.unit) {
+            Some(package) => {
+                let source = package.root.join("src").join(file.source).resolve().as_str()
+                for path in paths {
+                    if path.resolve().as_str() == source {
+                        watched = true break
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        files.push(InputFile { file.unit, file.source, file.digest, watched })
+    }
+    ret BuildInputInventory { files }
+}
+
+/// Call after build scripts and native dependency discovery. Corrupt receipts
+/// or source chunks are misses; they never permit execution of stale code.
+pub fn successful_build_matches(profile: Path, configuration: str, inventory: BuildInputInventory,
+    graph: ResolvedPackageGraph, binary: Path, import_library: Option[Path],) -> bool {
+    let payload = read_packed_payload(profile.join(".encore-successful-build"))
+    let previous = match binary::decode[SuccessfulBuildReceipt](prepared_payload_bytes(payload)) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    if previous.schema != 2_u32 || previous.configuration != configuration ||
+    previous.files.len() != inventory.files.len() || !file_exists(binary.as_str()) ||
+    previous.binary != file_sha256(binary.as_str()) {
+        ret false
+    }
+    match import_library {
+        Some(path) => {
+            if !file_exists(path.as_str()) || previous.import_library != file_sha256(path.as_str()) {
+                ret false
+            }
+        }
+        None => {
+            if previous.import_library != "" {
+                ret false
+            }
+        }
+    }
+    let mut changed = false
+    let mut accepted = Vec[InputFile]::new()
+    let mut index = 0_usize
+    for file in inventory.files {
+        let old = match previous.files.get(index) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+        index += 1
+        if old.unit != file.unit || old.source != file.source {
+            ret false
+        }
+        accepted.push(InputFile { file.unit, file.source, file.digest, old.watched })
+        if !old.watched || old.digest == file.digest {
+            continue
+        }
+        let package = match owner(graph, file.unit) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+        let before = match verified_payload(source_chunk(profile, old.digest), old.digest) {
+            Ok(value) => value Err(_) => {
+                ret false
+            }
+        }
+        let path = package.root.join("src").join(file.source)
+        let after = read_file(path.as_str())
+        if compiler_content_digest(after) != file.digest {
+            ret false
+        }
+        let constants = ProjectConstants {
+            package.name, project_manifest_version(package.manifest)
+        }
+        let left = executable_identity(before, constants)
+        let right = executable_identity(after, constants)
+        if left.is_none() || left != right {
+            ret false
+        }
+        changed = true
+    }
+    // Publish the new physical source view only after proving every changed
+    // file equivalent. Package artifacts still retain their original receipts.
+    if changed {
+        ret publish_successful_build(profile, configuration, BuildInputInventory { accepted }, graph, binary, import_library).is_ok()
+    }
+    ret true
+}
+
+pub fn publish_successful_build(profile: Path, configuration: str, inventory: BuildInputInventory,
+    graph: ResolvedPackageGraph, binary: Path, import_library: Option[Path],) -> Result[(), str] {
+    let directory = profile.join("input-cache-v1")
+    if mkdir_all(directory.as_str()) != 0 {
+        ret Result::Err("cannot create input snapshot directory")
+    }
+    for file in inventory.files {
+        if !file.watched {
+            continue
+        }
+        let package = match owner(graph, file.unit) {
+            Some(value) => value None => {
+                ret Result::Err("unknown input snapshot package")
+            }
+        }
+        let path = package.root.join("src").join(file.source)
+        let source = read_file(path.as_str())
+        if !file_exists(path.as_str()) || compiler_content_digest(source) != file.digest {
+            ret Result::Err("source changed during build: " + path.as_str())
+        }
+        let chunk = source_chunk(profile, file.digest)
+        if verified_payload(chunk, file.digest).is_err() && !write_payload(chunk, source, true) {
+            ret Result::Err("cannot publish source snapshot")
+        }
+    }
+    // A new file may have appeared while workers were running.
+    let current = build_input_inventory(graph)?
+    if !same_inventory(inventory, current) {
+        ret Result::Err("source inventory changed during build")
+    }
+    let import_digest = match import_library {
+        Some(path) => file_sha256(path.as_str()) None => ""
+    }
+    let receipt = SuccessfulBuildReceipt {
+        2_u32, configuration, inventory.files,
+        file_sha256(binary.as_str()), import_digest
+    }
+    let bytes = match binary::encode(receipt) {
+        Ok(value) => value Err(error) => {
+            ret Result::Err(error.message())
+        }
+    }
+    if !write_payload(profile.join(".encore-successful-build"), prepared_bytes_payload(bytes), true) {
+        ret Result::Err("cannot commit successful build receipt")
+    }
+    ret Result::Ok(())
+}
+
+fn same_inventory(left: BuildInputInventory, right: BuildInputInventory) -> bool {
+    if left.files.len() != right.files.len() {
+        ret false
+    }
+    let mut index = 0_usize
+    for file in left.files {
+        let other = match right.files.get(index) {
+            Some(value) => value None => {
+                ret false
+            }
+        }
+        if file.unit != other.unit || file.source != other.source ||(file.watched && file.digest != other.digest) {
+            ret false
+        }
+        index += 1
+    }
+    ret true
+}
+
+fn executable_identity(source: str, constants: ProjectConstants) -> Option[str] {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source("snapshot").with_project_constants(constants)
+    let report = parser.parse_recovering(lexer.tokenize(source))
+    if !report.failures.is_empty() {
+        ret Option[str]::None
+    }
+    ret Option[str]::Some(compiler_content_digest(stringify(encode_executable_ast(report.statements))))
+}
+
+fn source_chunk(profile: Path, digest: str) -> Path {
+    ret profile.join("input-cache-v1").join(digest)
+}
+fn owner(graph: ResolvedPackageGraph, name: str) -> Option[WorkspaceRefrain] {
+    for package in graph.refrains {
+        if package.name == name {
+            ret Option::Some(package)
+        }
+    }
+    ret Option::None
+}
+
+#attr(test)
+fn metadata_build_receipt_executable_identity_contract() -> bool {
+    let constants = ProjectConstants { "sample", "1.0.0" }
+    let source = "fn value() -> str { ret \"a b\" }"
+    let identity = executable_identity(source, constants)
+    ret identity.is_some() && identity == executable_identity("\n\n// moved\nfn value() -> str { ret \"a b\" }\n", constants) &&
+    identity != executable_identity("fn value() -> str { ret \"ab\" }", constants) &&
+    identity != executable_identity("fn value() -> str { ret \"different\" }", constants) &&
+    executable_identity("fn broken( {", constants).is_none()
+}
+
+fn receipt_fixture() -> Result[(Path, ResolvedPackageGraph), str] {
+    let root = Path::new("target/receipt-contract-" + core::fmt::Debug::fmt(std::time::perf_counter_ns())).resolve()
+    if mkdir_all(root.join("src").as_str()) != 0 {
+        ret Result::Err("cannot create receipt fixture")
+    }
+    let source = "[project]\nname=\"receipt\"\nversion=\"1.0.0\"\ndependencies=[]\n"
+    let manifest = match refrain::project::manifest::try_parse_project_manifest(source, root.join("encore.toml")) {
+        Ok(value) => value Err(failure) => {
+            ret Result::Err(failure.message)
+        }
+    }
+    if std::os::write_file(root.join("src/main.enq").as_str(), "fn main() -> u32 { ret 0 }\n") != 0 ||
+    std::os::write_file(root.join("program").as_str(), "verified binary contents") != 0 {
+        ret Result::Err("cannot write receipt fixture")
+    }
+    let package = WorkspaceRefrain {
+        "receipt", root, root, "fixture", true, manifest, Vec[str]::new(), Vec[str]::new()
+    }
+    ret Result::Ok((root, ResolvedPackageGraph { "receipt", vec![package], Vec[str]::new() }))
+}
+
+fn receipt_contract(root: Path, graph: ResolvedPackageGraph) -> Result[bool, str] {
+    let profile = root.join("profile")
+    let binary = root.join("program")
+    let configuration = "toolchain-graph-native-and-flags"
+    publish_successful_build(profile, configuration, build_input_inventory(graph)?, graph, binary, Option[Path]::None)?
+    if !successful_build_matches(profile, configuration, build_input_inventory(graph)?, graph, binary, Option[Path]::None) {
+        ret Result::Ok(false)
+    }
+    let original = file_sha256(binary.as_str())
+    let source = root.join("src/main.enq")
+    std::os::write_file(source.as_str(), "\n\n\n// moved\nfn main() -> u32 { ret 0 }\n")
+    if !successful_build_matches(profile, configuration, build_input_inventory(graph)?, graph, binary, Option[Path]::None) ||
+    file_sha256(binary.as_str()) != original {
+        ret Result::Ok(false)
+    }
+    // A successful fast entry updates its physical input receipt.
+    if !successful_build_matches(profile, configuration, build_input_inventory(graph)?, graph, binary, Option[Path]::None) {
+        ret Result::Ok(false)
+    }
+    if successful_build_matches(profile, "different flags", build_input_inventory(graph)?, graph, binary, Option[Path]::None) {
+        ret Result::Ok(false)
+    }
+    std::os::write_file(source.as_str(), "fn main() -> u32 { ret 1 }\n")
+    if successful_build_matches(profile, configuration, build_input_inventory(graph)?, graph, binary, Option[Path]::None) {
+        ret Result::Ok(false)
+    }
+    std::os::write_file(source.as_str(), "fn main() -> u32 { ret 0 }\n")
+    std::os::write_file(root.join("src/new.enq").as_str(), "pub fn newly_visible() -> u32 { ret 1 }")
+    if successful_build_matches(profile, configuration, build_input_inventory(graph)?, graph, binary, Option[Path]::None) {
+        ret Result::Ok(false)
+    }
+    std::os::remove_file(root.join("src/new.enq").as_str())
+    std::os::write_file(binary.as_str(), "corrupted binary")
+    if successful_build_matches(profile, configuration, build_input_inventory(graph)?, graph, binary, Option[Path]::None) {
+        ret Result::Ok(false)
+    }
+    std::os::write_file(binary.as_str(), "verified binary contents")
+    std::os::write_file(profile.join(".encore-successful-build").as_str(), "corrupt snapshot")
+    if successful_build_matches(profile, configuration, build_input_inventory(graph)?, graph, binary, Option[Path]::None) {
+        ret Result::Ok(false)
+    }
+    publish_successful_build(profile, configuration, build_input_inventory(graph)?, graph, binary, Option[Path]::None)?
+    // Corrupt only a lazily read source chunk, then ask for AST equivalence.
+    std::os::write_file(source_chunk(profile, file_sha256(source.as_str())).as_str(), "corrupt source chunk")
+    std::os::write_file(source.as_str(), "\nfn main() -> u32 { ret 0 }\n")
+    if successful_build_matches(profile, configuration, build_input_inventory(graph)?, graph, binary, Option[Path]::None) {
+        ret Result::Ok(false)
+    }
+    ret Result::Ok(true)
+}
+
+#attr(test)
+fn metadata_build_receipt_content_inventory_and_corruption_contract() -> bool {
+    let fixture = match receipt_fixture() {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let result = receipt_contract(fixture.0, fixture.1).unwrap_or(false)
+    let _removed = std::os::remove_dir_all(fixture.0.as_str())
+    ret result
+}
+
+fn watched_receipt_contract(root: Path, graph: ResolvedPackageGraph) -> Result[bool, str] {
+    let profile = root.join("script-profile")
+    let binary = root.join("program")
+    let watched = root.join("src/main.enq")
+    let ignored = root.join("src/unrelated.enq")
+    std::os::write_file(ignored.as_str(), "fn unrelated() -> u32 { ret 1 }")
+    let inventory = watched_build_inputs(build_input_inventory(graph)?, graph, vec![watched])
+    publish_successful_build(profile, "script-inputs", inventory, graph, binary, Option[Path]::None)?
+    std::os::write_file(ignored.as_str(), "fn unrelated() -> u32 { ret 2 }")
+    if !successful_build_matches(profile, "script-inputs", build_input_inventory(graph)?, graph, binary, Option[Path]::None) {
+        ret Result::Ok(false)
+    }
+    // Trivia refresh must preserve the watched set in its replacement receipt.
+    std::os::write_file(watched.as_str(), "\nfn main() -> u32 { ret 0 }\n")
+    if !successful_build_matches(profile, "script-inputs", build_input_inventory(graph)?, graph, binary, Option[Path]::None) {
+        ret Result::Ok(false)
+    }
+    std::os::write_file(ignored.as_str(), "fn unrelated() -> u32 { ret 3 }")
+    if !successful_build_matches(profile, "script-inputs", build_input_inventory(graph)?, graph, binary, Option[Path]::None) {
+        ret Result::Ok(false)
+    }
+    std::os::write_file(watched.as_str(), "fn main() -> u32 { ret 1 }\n")
+    if successful_build_matches(profile, "script-inputs", build_input_inventory(graph)?, graph, binary, Option[Path]::None) {
+        ret Result::Ok(false)
+    }
+    std::os::write_file(watched.as_str(), "fn main() -> u32 { ret 0 }\n")
+    // Even an unvisited new source can change namespace/import resolution.
+    std::os::write_file(root.join("src/new.enq").as_str(), "pub fn new_value() -> u32 { ret 1 }")
+    ret Result::Ok(!successful_build_matches(profile, "script-inputs", build_input_inventory(graph)?, graph, binary, Option[Path]::None))
+}
+
+#attr(test)
+fn metadata_build_receipt_watched_sources_contract() -> bool {
+    let fixture = match receipt_fixture() {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    let result = watched_receipt_contract(fixture.0, fixture.1).unwrap_or(false)
+    let _removed = std::os::remove_dir_all(fixture.0.as_str())
+    ret result
+}

@@ -5,11 +5,14 @@ import mod::cache_policy::{record_cache_usage, touch_cache}
 import core::option::Option
 import core::result::Result
 
-import std::os::{file_exists, mkdir_all, read_file, remove_file, write_file}
+import std::os::{file_exists, file_sha256, mkdir_all, read_file, remove_file, write_file}
 import std::path::Path
 import std::time::perf_counter_ms
 import std::vec::Vec
 
+import json::{Json, parse}
+
+import mod::build_archive_ref::{archive_reference, read_archive_payload}
 import mod::build_artifacts::{UnitReady, ValidatedUnitSnapshot, encode_unit_complete, read_unit_complete, read_unit_completion_receipt, read_unit_snapshot, verify_validated_unit_copy}
 import mod::build_metadata::{MetadataContext, MetadataDependency}
 import refrain::cache_identity::compiler_content_digest
@@ -120,7 +123,7 @@ pub fn restore_unit_cache_directory(directory: Path, context: MetadataContext,
         }
     }
     let validated = perf_counter_ms()
-    let archive_bytes = match verified_payload(directory.join("unit.erlib"), archive) {
+    let archive_bytes = match read_archive_payload(directory, archive) {
         Ok(value) => value Err(_) => {
             ret Result[Option[RestoredUnit], str]::Ok(Option[RestoredUnit]::None)
         }
@@ -147,8 +150,40 @@ pub fn commit_unit_cache(lock: UnitCacheLock, source: Path, context: MetadataCon
     let snapshot = read_unit_snapshot(source, context, dependencies)?
     let ready = snapshot.ready
     let archive = read_unit_completion_receipt(source, ready, native)?
-    let archive_bytes = verified_payload(source.join("unit.erlib"), archive)?
-    copy_committed_unit(lock.directory, snapshot, archive, archive_bytes, native, true)?
+    let archive_bytes = read_archive_payload(source, archive)?
+    let slot = parse(read_file(source.join("objects.json").as_str())).unwrap_or(Json::Null)
+    .get("archive_slot").unwrap_or(Json::Null).as_str().unwrap_or("")
+    let native_lock = if valid_key(slot) {
+        match try_unit_cache_lock(lock.directory.parent().unwrap_or(lock.directory).join("objects-v1"), slot) {
+            Ok(value) => value Err(_) => Option[UnitCacheLock]::None
+        }
+    } else {
+        Option[UnitCacheLock]::None
+    }
+    let storage = match native_lock {
+        Some(value) => {
+            if file_sha256(value.directory.join(archive + ".erlib").as_str()) == archive {
+                archive_reference(slot, archive)
+            } else {
+                archive_bytes
+            }
+        }
+        None => archive_bytes
+    }
+    // Keep the native slot alive until the reference and completion receipt
+    // have both been validated. Contention retains the self-contained format.
+    let result = commit_locked_unit_cache(lock, snapshot, archive, storage, native)
+    match native_lock {
+        Some(value) => close_unit_cache_lock(value) None => {
+        }
+    }
+    ret result
+}
+
+fn commit_locked_unit_cache(lock: UnitCacheLock, snapshot: ValidatedUnitSnapshot, archive: str,
+    storage: str, native: str,) -> Result[(), str] {
+    let ready = snapshot.ready
+    copy_committed_unit(lock.directory, snapshot, archive, storage, native, true)?
     verify_validated_unit_copy(lock.directory, ready)?
     let _copied_archive = read_unit_complete(lock.directory, ready, native)?
     touch_cache(lock.directory)

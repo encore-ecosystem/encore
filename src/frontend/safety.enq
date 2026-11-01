@@ -12,6 +12,7 @@ import refrain::cache_identity::compiler_content_digest
 import refrain::frontend::analysis::analyze_named_module
 import refrain::frontend::metadata_ast::encode_lowered_function_input
 import refrain::frontend::parser::{Expr, ExprNode, FunctionItem, MatchArmBody, Statement}
+import refrain::frontend::replay_index::ReplayIndex
 import refrain::frontend::safety_lookup::SafetyNameLookup
 import refrain::frontend::safety_plan::{SafetyEffectPlan, SafetyPlanBuilder}
 import refrain::frontend::semantic::{SemanticBody, SemanticCallable, SemanticField, SemanticMethod, check_function_body_with_types, semantic_associated_members_view, semantic_named_members_view, semantic_same_owner}
@@ -215,6 +216,7 @@ pub struct SafetyReplayResult {
 struct SafetyReplayNode {
     slot: str
     input: str
+    context: str
     dependencies: Vec[(str, str, str)]
     effect: FunctionSafety
     valid: bool
@@ -234,16 +236,35 @@ fn safety_effect_record(effect: FunctionSafety) -> Json {
 /// never at their previous unsafe value, so unsafe-to-safe edits converge too.
 pub fn infer_safety_with_replay(functions: Vec[SafetyFunction], known: Vec[FunctionSafety],
     contexts: Vec[(str, str)], previous: Json,) -> SafetyReplayResult {
+    ret infer_safety_with_verified_modules(functions, known, contexts, previous, Vec[str]::new())
+}
+
+/// A verified module has exactly the source content and semantic environment
+/// of its accepted body queries. Reuse its body identity without traversing
+/// its syntax again. Dependency effects still flow through the full graph.
+pub fn infer_safety_with_verified_modules(functions: Vec[SafetyFunction], known: Vec[FunctionSafety],
+    contexts: Vec[(str, str)], previous: Json, verified_modules: Vec[str],) -> SafetyReplayResult {
     let mut external = Vec[Json]::new()
     for effect in known {
         external.push(safety_effect_record(effect))
     }
     let external_key = compiler_content_digest(stringify(Json::Array(external)))
+    let mut declaration_order = Vec[Json]::new()
+    for function in functions {
+        declaration_order.push(Json::String(effect_key(function.module_name, function.owner, function.item.name)))
+    }
+    declaration_order.push(Json::String("dependency-effects"))
+    for effect in known {
+        declaration_order.push(Json::String(effect_key(effect.module_name, effect.owner, effect.name)))
+    }
+    let order = compiler_content_digest("encore-safety-plan-order-1\n" + stringify(Json::Array(declaration_order)))
+    let mut saved_plans = Vec[Option[SafetyEffectPlan]]::new()
     let ordinals = unsafe {
         encore_strmap_new()
     }
     let mut nodes = Vec[SafetyReplayNode]::new()
     let mut initial = Vec[FunctionSafety]::new()
+    let previous_index = ReplayIndex::new(previous)
     for function in functions {
         let family = effect_key(function.module_name, function.owner, function.item.name)
         let ordinal = unsafe {
@@ -259,9 +280,22 @@ pub fn infer_safety_with_replay(functions: Vec[SafetyFunction], known: Vec[Funct
                 context = entry.1 break
             }
         }
-        let input = compiler_content_digest("encore-safety-function-1\n" + context + "\n" + external_key + "\n" +
-            function.owner + "\n" + stringify(encode_lowered_function_input(function.item, function.module_name)))
-        let saved = previous.get(slot).unwrap_or(Json::Null)
+        let saved = previous_index.get(slot).unwrap_or(Json::Null)
+        let mut verified = false
+        for name in verified_modules {
+            if name == function.module_name {
+                verified = true break
+            }
+        }
+        let saved_input = saved.get("input").unwrap_or(Json::Null).as_str().unwrap_or("")
+        let input = if verified && !context.is_empty() && saved_input.byte_len() == 64_usize &&
+        saved.get("context").unwrap_or(Json::Null).as_str().unwrap_or("") == context &&
+        saved.get("external").unwrap_or(Json::Null).as_str().unwrap_or("") == external_key {
+            saved_input
+        } else {
+            compiler_content_digest("encore-safety-function-1\n" + context + "\n" + external_key + "\n" +
+                function.owner + "\n" + stringify(encode_lowered_function_input(function.item, function.module_name)))
+        }
         let mut valid = !context.is_empty() && saved.get("input").unwrap_or(Json::Null).as_str().unwrap_or("") == input
         let mut dependencies = Vec[(str, str, str)]::new()
         match saved.get("dependencies").unwrap_or(Json::Null) {
@@ -289,8 +323,15 @@ pub fn infer_safety_with_replay(functions: Vec[SafetyFunction], known: Vec[Funct
             function.module_name, function.owner, function.item.name, function.symbol_line,
             function.symbol_column, body.unwrap_or(false), asserted.unwrap_or(false), returned.unwrap_or(false)
         }
+        let plan = if valid && saved.get("order").unwrap_or(Json::Null).as_str().unwrap_or("") == order {
+            decode_safety_plan(saved.get("plan").unwrap_or(Json::Null), dependencies,(functions.len() + known.len()) * 2_usize)
+        } else {
+            Option[SafetyEffectPlan]::None
+        }
+        valid = valid && plan.is_some()
+        saved_plans.push(plan)
         initial.push(effect)
-        nodes.push(SafetyReplayNode { slot, input, dependencies, effect, valid })
+        nodes.push(SafetyReplayNode { slot, input, context, dependencies, effect, valid })
     }
     unsafe {
         encore_strmap_free(ordinals)
@@ -301,31 +342,25 @@ pub fn infer_safety_with_replay(functions: Vec[SafetyFunction], known: Vec[Funct
             all_dirty = false break
         }
     }
-    if all_dirty {
-        initial = initial_safety_effects(functions, known)
-    } else {
-        initial.extend(known)
-    }
+    // Cached formulas are independent of the previous truth values. Start
+    // every owned declaration at bottom so unsafe-to-safe recursive changes
+    // can remove effects, including callers whose source was not inspected.
+    initial = initial_safety_effects(functions, known)
     let lookup = effect_lookup(initial)
     let mut plans = Vec[SafetyEffectPlan]::new()
     for position in 0_usize..nodes.len() {
         let node = nodes.get_unchecked_borrowed(position)
-        if all_dirty {
-            let plan = prepare_safety_plan(functions.get_unchecked_borrowed(position), initial, lookup)
-            nodes.set(position, SafetyReplayNode {
-                    node.slot, node.input, plan.dependencies, node.effect, node.valid
-                }
-                ,
-            )
-            plans.push(plan)
-        } elif !node.valid {
-            let dependencies = safety_dependencies(functions.get_unchecked_borrowed(position))
-            nodes.set(position, SafetyReplayNode {
-                    node.slot, node.input, dependencies, node.effect, false
-                }
-                ,
-            )
+        let plan = match saved_plans.get_unchecked_borrowed(position) {
+            Some(plan) => plan
+            None => prepare_safety_plan(functions.get_unchecked_borrowed(position), initial, lookup)
         }
+        nodes.set(position, SafetyReplayNode {
+                node.slot, node.input, node.context,
+                plan.dependencies, node.effect, node.valid
+            }
+            ,
+        )
+        plans.push(plan)
     }
     let mut dependents = Vec[Vec[usize]]::new()
     for _index in 0_usize..nodes.len() {
@@ -350,13 +385,12 @@ pub fn infer_safety_with_replay(functions: Vec[SafetyFunction], known: Vec[Funct
     unsafe {
         encore_strmap_free(lookup.heads)
     }
-    let resolved = if all_dirty {
-        (infer_planned_safety(initial, plans, dependents), functions.len())
+    let computed = infer_planned_safety(initial, plans, dependents)
+    let checked = if all_dirty {
+        functions.len()
     } else {
-        infer_safety_components(functions, known, nodes, dependents)
+        checked_safety_components(nodes, dependents, computed)
     }
-    let computed = resolved.0
-    let checked = resolved.1
     let positions = unsafe {
         encore_strmap_new()
     }
@@ -369,7 +403,10 @@ pub fn infer_safety_with_replay(functions: Vec[SafetyFunction], known: Vec[Funct
     }
     let mut effects = Vec[FunctionSafety]::new()
     let mut records = Vec[(str, Json)]::new()
+    let mut plan_index = 0_usize
     for node in nodes {
+        let plan = plans.get_unchecked_borrowed(plan_index)
+        plan_index += 1_usize
         let position = unsafe {
             encore_strmap_get(positions, safety_effect_site(node.effect))
         }
@@ -387,7 +424,9 @@ pub fn infer_safety_with_replay(functions: Vec[SafetyFunction], known: Vec[Funct
         for dependency in node.dependencies {
             dependencies.push(Json::Array(vec![Json::String(dependency.0), Json::String(dependency.1), Json::String(dependency.2)]))
         }
-        records.push((node.slot, Json::Object(vec![("input", Json::String(node.input)),("dependencies", Json::Array(dependencies)),
+        records.push((node.slot, Json::Object(vec![("input", Json::String(node.input)),("context", Json::String(node.context)),
+                        ("external", Json::String(external_key)),("order", Json::String(order)),("plan", encode_safety_plan(plan)),
+                        ("dependencies", Json::Array(dependencies)),
                         ("body_unsafe", Json::Bool(effect.body_unsafe)),("asserted_safe", Json::Bool(effect.asserted_safe)),
                         ("returns_unsafe_callable", Json::Bool(effect.returns_unsafe_callable))])))
     }
@@ -463,13 +502,12 @@ fn safety_graph_components(graph: Vec[Vec[usize]]) -> Vec[Vec[usize]] {
 
 /// Components are processed callee-first. Only a changed caller-visible effect
 /// schedules a clean dependent component; a numerical body edit stays local.
-fn infer_safety_components(functions: Vec[SafetyFunction], known: Vec[FunctionSafety],
-    nodes: Vec[SafetyReplayNode], dependents: Vec[Vec[usize]],) ->(Vec[FunctionSafety], usize) {
+fn checked_safety_components(nodes: Vec[SafetyReplayNode], dependents: Vec[Vec[usize]],
+    computed: Vec[FunctionSafety],) -> usize {
     let components = safety_graph_components(dependents)
     let mut membership = Vec[usize]::new()
-    let mut effects = Vec[FunctionSafety]::new()
-    for node in nodes {
-        membership.push(0_usize) effects.push(node.effect)
+    for _node in nodes {
+        membership.push(0_usize)
     }
     let mut remaining = Vec[usize]::new()
     let mut dirty = Vec[bool]::new()
@@ -503,32 +541,16 @@ fn infer_safety_components(functions: Vec[SafetyFunction], known: Vec[FunctionSa
         let component = ready.get(cursor).unwrap_or(0_usize)
         cursor += 1_usize
         if dirty.get(component).unwrap_or(true) {
-            let mut pending = Vec[SafetyFunction]::new()
-            let mut installed = Vec[FunctionSafety]::new()
-            installed.extend(known)
-            for index in 0_usize..nodes.len() {
-                if membership.get(index).unwrap_or(0_usize) == component {
-                    pending.push(functions.get_unchecked_borrowed(index))
-                } else {
-                    installed.push(effects.get_unchecked_borrowed(index))
-                }
-            }
-            checked += pending.len()
-            let computed = infer_safety_with_known(pending, installed)
+            checked += components.get_unchecked_borrowed(component).len()
             for index in components.get_unchecked_borrowed(component) {
-                let before = effects.get(index).unwrap_or(nodes.get_unchecked_borrowed(index).effect)
-                for effect in computed {
-                    if safety_effect_site(effect) == safety_effect_site(before) {
-                        effects.set(index, effect)
-                        if before.is_unsafe() != effect.is_unsafe() || before.returns_unsafe_callable != effect.returns_unsafe_callable {
-                            for consumer in dependents.get_unchecked_borrowed(index) {
-                                let target = membership.get(consumer).unwrap_or(component)
-                                if target != component {
-                                    dirty.set(target, true)
-                                }
-                            }
+                let before = nodes.get_unchecked_borrowed(index).effect
+                let after = computed.get_unchecked_borrowed(index)
+                if before.is_unsafe() != after.is_unsafe() || before.returns_unsafe_callable != after.returns_unsafe_callable {
+                    for consumer in dependents.get_unchecked_borrowed(index) {
+                        let target = membership.get(consumer).unwrap_or(component)
+                        if target != component {
+                            dirty.set(target, true)
                         }
-                        break
                     }
                 }
             }
@@ -547,8 +569,7 @@ fn infer_safety_components(functions: Vec[SafetyFunction], known: Vec[FunctionSa
             }
         }
     }
-    effects.extend(known)
-    ret(effects, checked)
+    ret checked
 }
 
 fn safety_plan_dependents(plans: Vec[SafetyEffectPlan], lookup: EffectLookup) -> Vec[Vec[usize]] {
@@ -1717,4 +1738,68 @@ fn plan_expression(ctx: mut PlannedSafetyContext, arena: mut SafetyPlanBuilder, 
             ret plan_plain_value()
         }
     }
+}
+
+fn encode_safety_sources(values: Vec[usize]) -> Json {
+    let mut rows = Vec[Json]::with_capacity(values.len())
+    for value in values {
+        rows.push(Json::Number(Debug::fmt(value)))
+    }
+    ret Json::Array(rows)
+}
+fn decode_safety_sources(value: Json, limit: usize) -> Option[Vec[usize]] {
+    let rows = match value {
+        Json::Array(rows) => rows _ => {
+            ret Option::None
+        }
+    }
+    if rows.len() > 1048576_usize {
+        ret Option::None
+    }
+    let mut values = Vec[usize]::with_capacity(rows.len())
+    for row in rows {
+        let text = row.as_number().unwrap_or("")
+        if text.is_empty() || text.byte_len() > 20_usize {
+            ret Option::None
+        }
+        let mut value = 0_usize
+        for index in 0_usize..text.byte_len() {
+            let byte = text.byte_at(index)
+            if byte < 48_u8 || byte > 57_u8 {
+                ret Option::None
+            }
+            let digit =(byte - 48_u8) as usize
+            if limit == 0_usize || digit >= limit || value >(limit - 1_usize - digit) / 10_usize {
+                ret Option::None
+            }
+            value = value * 10_usize + digit
+        }
+        if value >= limit {
+            ret Option::None
+        }
+        values.push(value)
+    }
+    ret Option::Some(values)
+}
+fn encode_safety_plan(plan: SafetyEffectPlan) -> Json {
+    ret Json::Array(vec![Json::String("safety-plan-1"), Json::Bool(plan.body_true), encode_safety_sources(plan.body_sources),
+            Json::Bool(plan.returned_true), encode_safety_sources(plan.returned_sources)])
+}
+fn decode_safety_plan(value: Json, dependencies: Vec[(str, str, str)], limit: usize) -> Option[SafetyEffectPlan] {
+    let fields = value.as_array().unwrap_or(Vec[Json]::new())
+    if fields.len() != 5_usize || fields.get(0_usize).unwrap_or(Json::Null).as_str().unwrap_or("") != "safety-plan-1" {
+        ret Option::None
+    }
+    let body = fields.get(1_usize).unwrap_or(Json::Null).as_bool()
+    let returned = fields.get(3_usize).unwrap_or(Json::Null).as_bool()
+    let body_sources = decode_safety_sources(fields.get(2_usize).unwrap_or(Json::Null), limit)
+    let returned_sources = decode_safety_sources(fields.get(4_usize).unwrap_or(Json::Null), limit)
+    if body.is_none() || returned.is_none() || body_sources.is_none() || returned_sources.is_none() {
+        ret Option::None
+    }
+    ret Option::Some(SafetyEffectPlan {
+            body.unwrap_or(false), body_sources.unwrap_or(Vec[usize]::new()),
+            returned.unwrap_or(false), returned_sources.unwrap_or(Vec[usize]::new()), dependencies
+        }
+    )
 }

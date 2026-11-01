@@ -5,21 +5,25 @@ import core::option::Option
 import core::result::Result
 
 import std::io::eprintln
-import std::os::{executable_path, file_exists, file_sha256, mkdir_all, read_file, remove_file, write_file}
+import std::os::{copy_file, executable_path, file_exists, file_sha256, mkdir_all, read_dir, read_file, remove_file, write_file}
 import std::path::Path
 import std::time::{perf_counter_ms, sleep_ms}
 import std::vec::Vec
 
 import argparse::{process_arg, process_arg_count}
-import ehirlib::codegen::{PreparedUnitCodegen, emit_unit_codegen_selected_parallel, unit_codegen_input_context, unit_codegen_owned, unit_codegen_requirements}
+import ehirlib::codegen::{PreparedUnitCodegen, compact_unit_codegen_declarations, emit_compact_unit_codegen_selected_parallel, emit_compact_unit_codegen_with_declarations, emit_unit_codegen_selected_parallel, function_codegen_units, unit_codegen_declaration_context, unit_codegen_input_context, unit_codegen_owned, unit_codegen_requirements}
 import ehirlib::core::{Module, make_module_bundle}
 import ehirlib::module_bundle_to_string
 import json::{Json, parse, stringify}
 
+import mod::build_cache::{UnitCacheLock, close_unit_cache_lock, try_unit_cache_lock, valid_key}
 import mod::build_metadata::MetadataContext
 import mod::build_object_cache::{commit_native_object, commit_prepared_object, native_object_key, prepared_object_key, restore_native_object, restore_prepared_object}
 import mod::build_requirements::UnitRequirements
+import mod::cache_payload::{read_packed_payload, write_payload}
+import mod::cache_policy::{record_cache_usage, touch_cache}
 import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::semantic_slice::SemanticKeyIndex
 import refrain::target::TargetSpec
 
 extern fn encore_compiler_write_atomic(path: str, contents: str) -> bool
@@ -178,10 +182,72 @@ pub fn emit_package_archive(unit: frozen PreparedUnitCodegen, directory: Path,
 /// Process supervision remains on one thread, so handles are never raced.
 pub fn emit_budgeted_package_archive(unit: frozen PreparedUnitCodegen, directory: Path,
     target: TargetSpec, plan: UnitNativePlan, server: usize, cache: Option[Path],) -> Result[str, str] {
+    ret emit_profile_package_archive(unit, directory, target, plan, server, cache, "release")
+}
+
+pub fn emit_profile_package_archive(unit: frozen PreparedUnitCodegen, directory: Path,
+    target: TargetSpec, plan: UnitNativePlan, server: usize, cache: Option[Path], profile: str,) -> Result[str, str] {
+    ret emit_profile_package_archive_with_sources(unit, directory, target, plan, server, cache, profile, Vec[(str, str)]::new())
+}
+
+/// Accepted normalized module identities guard unchanged CGU body hashes.
+/// ABI/layout/requirements/native flags remain in the complete object context.
+pub fn emit_profile_package_archive_with_sources(unit: frozen PreparedUnitCodegen, directory: Path,
+    target: TargetSpec, plan: UnitNativePlan, server: usize, cache: Option[Path], profile: str,
+    sources: Vec[(str, str)],) -> Result[str, str] {
+    if profile == "dev" {
+        let functions = function_codegen_units(unit)
+        ret emit_layout_package_archive(functions, directory, target, plan, server, cache, true, sources)
+    }
+    ret emit_layout_package_archive(unit, directory, target, plan, server, cache, false, Vec[(str, str)]::new())
+}
+
+fn emit_layout_package_archive(unit: frozen PreparedUnitCodegen, directory: Path,
+    target: TargetSpec, plan: UnitNativePlan, server: usize, cache: Option[Path], compact: bool, sources: Vec[(str, str)],) -> Result[str, str] {
+    let probe_started = perf_counter_ms()
+    let identity = plan.identity()?
+    let compiler = file_sha256(executable_path())
+    let requirements = UnitRequirements {
+        MetadataContext {
+            "codegen", compiler, target.triple, "dev", compiler_content_digest(""), Vec[str]::new()
+        }
+        ,
+        unit_codegen_requirements(unit)
+    }
+    .encode()?
+    let context = compiler_content_digest("encore-prepared-codegen-2\n" + Debug::fmt(compact) + "\n" + compiler + "\n" + identity + "\n" +
+        Debug::fmt(target.pointer_width) + "\n" + requirements + "\n" +
+        module_bundle_to_string(if compact {
+                unit_codegen_declaration_context(unit)
+            } else {
+                unit_codegen_input_context(unit)
+            }
+        ))
+    let archive_lock = if compact {
+        match cache {
+            Some(root) => try_unit_cache_lock(root.join("objects-v1"), compiler_content_digest("encore-native-archive-1\n" + context))?
+            None => Option[UnitCacheLock]::None
+        }
+    } else {
+        Option[UnitCacheLock]::None
+    }
+    let result = emit_archive_members(unit, directory, target, plan, server, cache, compact, identity, context, archive_lock, probe_started, sources)
+    match archive_lock {
+        Some(lock) => {
+            close_unit_cache_lock(lock)
+        }
+        None => {
+        }
+    }
+    ret result
+}
+
+fn emit_archive_members(unit: frozen PreparedUnitCodegen, directory: Path, target: TargetSpec,
+    plan: UnitNativePlan, server: usize, cache: Option[Path], compact: bool, identity: str, context: str,
+    archive_lock: Option[UnitCacheLock], probe_started: u64, sources: Vec[(str, str)],) -> Result[str, str] {
     if !directory.is_absolute() {
         ret Result[str, str]::Err("relative package archive directory")
     }
-    let identity = plan.identity()?
     if mkdir_all(directory.as_str()) != 0 {
         ret Result[str, str]::Err("cannot create package archive directory")
     }
@@ -199,47 +265,122 @@ pub fn emit_budgeted_package_archive(unit: frozen PreparedUnitCodegen, directory
     archive_args.push(archive.as_str())
     let mut index = 0_usize
     let mut objects = Vec[NativeObjectTask]::new()
-    let object_cache = match cache {
+    let packed = archive_lock.is_some()
+    let object_cache = match if packed {
+        Option[Path]::None
+    } else {
+        cache
+    }
+    {
         Some(root) => Option[Path]::Some(root.join("objects-v1")) None => Option[Path]::None
     }
     let mut object_keys = Vec[str]::new()
     let mut compiled_objects = Vec[Path]::new()
-    let probe_started = perf_counter_ms()
-    let compiler = file_sha256(executable_path())
-    let requirements = UnitRequirements {
-        MetadataContext {
-            "codegen", compiler, target.triple, "dev", compiler_content_digest(""), Vec[str]::new()
+    let owned = unit_codegen_owned(unit, "").modules
+    let mut owned_names = SemanticKeyIndex::new(owned.len())
+    for ordinal in 0_usize..owned.len() {
+        let name = owned.get_unchecked_borrowed(ordinal).name
+        if owned_names.get(name) != 0_usize {
+            ret Result::Err("duplicate native codegen unit: " + name)
         }
-        ,
-        unit_codegen_requirements(unit)
+        owned_names.set(name, ordinal)
     }
-    .encode()?
-    let context = compiler_content_digest("encore-prepared-codegen-1\n" + compiler + "\n" + identity + "\n" +
-        Debug::fmt(target.pointer_width) + "\n" + requirements + "\n" +
-        module_bundle_to_string(unit_codegen_input_context(unit)))
+    let previous = match archive_lock {
+        Some(lock) => read_native_archive(lock.directory, context)
+        None => Option[NativeArchiveSnapshot]::None
+    }
+    let mut can_patch = false
+    let mut previous_members = Vec[(str, str)]::new()
+    let mut previous_sources = Vec[str]::new()
+    match previous {
+        Some(snapshot) => {
+            previous_members = snapshot.members
+            previous_sources = snapshot.sources
+            can_patch = previous_members.len() == owned.len()
+            let mut ordinal = 0_usize
+            for module in owned {
+                let member = native_member_stem(module.name)
+                if previous_members.get(ordinal).unwrap_or(("", "")).0 != member {
+                    can_patch = false
+                }
+                ordinal += 1_usize
+            }
+            if can_patch &&(copy_file(snapshot.archive.as_str(), archive.as_str()) != 0 ||
+                file_sha256(archive.as_str()) != snapshot.digest) {
+                can_patch = false
+            }
+        }
+        None => {
+        }
+    }
+    if !can_patch && file_exists(archive.as_str()) && remove_file(archive.as_str()) != 0 {
+        ret Result::Err("cannot invalidate previous archive layout")
+    }
+    let mut members = Vec[(str, str)]::new()
+    let mut object_stems = Vec[str]::new()
     let mut prepared_keys = Vec[str]::new()
     let mut missing = Vec[usize]::new()
-    for module in unit_codegen_owned(unit, "").modules {
-        let mut singleton = Vec[Module]::new()
-        singleton.push(module)
-        let key = prepared_object_key(module_bundle_to_string(make_module_bundle(module.name, singleton)), context)
+    let mut source_versions = Vec[str]::new()
+    let mut source_index = SemanticKeyIndex::new(sources.len())
+    for ordinal in 0_usize..sources.len() {
+        let source = sources.get_unchecked_borrowed(ordinal)
+        if valid_key(source.1) {
+            source_index.set(source.0, ordinal)
+        }
+    }
+    let mut hashes_reused = 0_usize
+    for module in owned {
+        let version = codegen_source_version(module.name, sources, source_index)
+        let reuse_hash = can_patch && !version.is_empty() && previous_sources.get(index).unwrap_or("") == version
+        let key = if reuse_hash {
+            hashes_reused += 1_usize
+            previous_members.get_unchecked_borrowed(index).1
+        } else {
+            prepared_object_key(module_bundle_to_string(make_module_bundle(module.name, vec![module])), context)
+        }
+        source_versions.push(version)
         prepared_keys.push(key)
-        let object = directory /("module-" + Debug::fmt(index) + ".o")
-        let restored = match cache {
-            Some(root) => restore_prepared_object(root, key, object)?
-            None => false
+        let stem = if compact {
+            native_member_stem(module.name)
+        } else {
+            "module-" + Debug::fmt(index)
+        }
+        object_stems.push(stem)
+        let object = directory /(stem + ".o")
+        members.push((stem, key))
+        let restored = if packed {
+            can_patch && previous_members.get(index).unwrap_or(("", "")).1 == key
+        } else {
+            match cache {
+                Some(root) => restore_prepared_object(root, key, object)? None => false
+            }
         }
         if !restored {
             missing.push(index)
         }
-        archive_args.push(object.as_str())
+        if !can_patch || !restored {
+            archive_args.push(object.as_str())
+        }
         index += 1_usize
     }
     let mut aliases = Vec[(str, str)]::new()
     let mut emitted_index = 0_usize
     let jobs = borrow_package_jobs(server, missing.len())?
     let emission_started = perf_counter_ms()
-    let generated = emit_unit_codegen_selected_parallel(unit, target.triple, target.pointer_width, missing, jobs)
+    let generated = if compact && !missing.is_empty() {
+        let cached = compact_declarations(unit, target, context, archive_lock)
+        match cached {
+            Ok(declarations) => emit_compact_unit_codegen_with_declarations(unit, target.triple, target.pointer_width, missing, jobs, declarations)
+            Err(error) => {
+                return_package_jobs(server, jobs)
+                ret Result::Err(error)
+            }
+        }
+    } elif compact {
+        Vec[ehirlib::codegen::EmittedIrModule]::new()
+    } else {
+        emit_unit_codegen_selected_parallel(unit, target.triple, target.pointer_width, missing, jobs)
+    }
     return_package_jobs(server, jobs)
     let emission_finished = perf_counter_ms()
     for emitted in generated {
@@ -248,13 +389,15 @@ pub fn emit_budgeted_package_archive(unit: frozen PreparedUnitCodegen, directory
         }
         let module_index = missing.get(emitted_index).unwrap_or(index)
         emitted_index += 1_usize
-        let stem = "module-" + Debug::fmt(module_index)
+        let stem = object_stems.get(module_index).unwrap_or("")
         let ir = directory.join(stem + ".ll")
         let object = directory.join(stem + ".o")
         let stable_ir = stable_module_ir(emitted.ir, emitted.module_id)
         write_ir(ir, stable_ir)?
         let key = native_object_key(stable_ir, target.triple, identity)
-        aliases.push((prepared_keys.get(module_index).unwrap_or(""), key))
+        if !packed {
+            aliases.push((prepared_keys.get(module_index).unwrap_or(""), key))
+        }
         let reused = match object_cache {
             Some(root) => restore_native_object(root, key, object)? None => false
         }
@@ -308,19 +451,237 @@ pub fn emit_budgeted_package_archive(unit: frozen PreparedUnitCodegen, directory
     object_counts.push(("ir_generated", Json::Number(Debug::fmt(missing.len()))))
     object_counts.push(("ir_skipped", Json::Number(Debug::fmt(index - missing.len()))))
     object_counts.push(("ir_jobs", Json::Number(Debug::fmt(jobs))))
+    object_counts.push(("object_hashes_reused", Json::Number(Debug::fmt(hashes_reused))))
+    object_counts.push(("object_hashes_computed", Json::Number(Debug::fmt(index - hashes_reused))))
+    object_counts.push(("archive_slot", Json::String(if packed {
+                    compiler_content_digest("encore-native-archive-1\n" + context)
+                } else {
+                    ""
+                }
+            )))
     object_counts.push(("object_probe_ms", Json::Number(Debug::fmt(emission_started - probe_started))))
     object_counts.push(("ir_emit_ms", Json::Number(Debug::fmt(emission_finished - emission_started))))
     if write_file(directory.join("objects.json").as_str(), stringify(Json::Object(object_counts))) != 0 {
         ret Result[str, str]::Err("cannot record native object reuse")
     }
-    run_unit_tool(plan.archiver, archive_args, directory, "archive")?
+    if !can_patch || !missing.is_empty() {
+        run_unit_tool(plan.archiver, archive_command_arguments(archive_args, directory)?, directory, "archive")?
+    }
     if !file_exists(archive.as_str()) {
         ret Result[str, str]::Err("archiver did not produce package archive")
     }
     if plan.identity()? != identity {
         ret Result[str, str]::Err("native toolchain changed during package compilation")
     }
-    ret Result[str, str]::Ok(file_sha256(archive.as_str()))
+    let digest = file_sha256(archive.as_str())
+    match archive_lock {
+        Some(lock) => {
+            publish_native_archive(lock.directory, context, archive, digest, members, source_versions, previous)?
+        }
+        None => {
+        }
+    }
+    ret Result[str, str]::Ok(digest)
+}
+
+struct NativeArchiveSnapshot {
+    archive: Path
+    digest: str
+    members: Vec[(str, str)]
+    sources: Vec[str]
+}
+
+fn codegen_source_version(name: str, sources: Vec[(str, str)], index: SemanticKeyIndex) -> str {
+    let mut cursor = name.byte_len()
+    while cursor > 0_usize {
+        cursor -= 1_usize
+        if name.byte_at(cursor) != 35_u8 {
+            continue
+        }
+        let tail = name.slice_bytes(cursor, name.byte_len() - cursor)
+        if (tail.byte_len() >= 10_usize && tail.slice_bytes(0_usize, 10_usize) == "#function:") ||
+        (tail.byte_len() >= 8_usize && tail.slice_bytes(0_usize, 8_usize) == "#method:") {
+            let ordinal = index.get(name.slice_bytes(0_usize, cursor))
+            if ordinal != 0_usize {
+                ret sources.get_unchecked_borrowed(ordinal - 1_usize).1
+            }
+            ret ""
+        }
+    }
+    ret ""
+}
+
+#attr(test)
+fn metadata_native_cgu_source_identity_preserves_filename_boundaries() -> bool {
+    let version = compiler_content_digest("normalized module")
+    let source = "package@path#function:part.enq"
+    let sources = vec![(source, version)]
+    let mut index = SemanticKeyIndex::new(1_usize)
+    index.set(source, 0_usize)
+    ret codegen_source_version(source + "#function:read", sources, index) == version &&
+    codegen_source_version(source + "#method:Owner::read", sources, index) == version &&
+    codegen_source_version("package@other.enq#function:read", sources, index).is_empty() &&
+    codegen_source_version(source, sources, index).is_empty() &&
+    codegen_source_version(source + "#fun", sources, index).is_empty()
+}
+
+fn compact_declarations(unit: frozen PreparedUnitCodegen, target: TargetSpec, context: str,
+    lock: Option[UnitCacheLock],) -> Result[str, str] {
+    let prefix = "encore-llvm-declarations-1\n" + context + "\n"
+    match lock {
+        Some(lock) => {
+            let payload = read_packed_payload(lock.directory.join("llvm-declarations.entry"))
+            if payload.byte_len() > prefix.byte_len() && payload.slice_bytes(0_usize, prefix.byte_len()) == prefix {
+                ret Result::Ok(payload.slice_bytes(prefix.byte_len(), payload.byte_len() - prefix.byte_len()))
+            }
+        }
+        None => {
+        }
+    }
+    let declarations = compact_unit_codegen_declarations(unit, target.triple, target.pointer_width)?
+    match lock {
+        Some(lock) => {
+            if mkdir_all(lock.directory.as_str()) != 0_i32 ||
+            !write_payload(lock.directory.join("llvm-declarations.entry"), prefix + declarations, true) {
+                ret Result::Err("cannot publish LLVM declaration snapshot")
+            }
+        }
+        None => {
+        }
+    }
+    ret Result::Ok(declarations)
+}
+
+fn native_member_stem(module: str) -> str {
+    ret "cgu-" + compiler_content_digest("encore-native-member-1\n" + module)
+}
+
+fn read_native_archive(directory: Path, context: str) -> Option[NativeArchiveSnapshot] {
+    let payload = read_packed_payload(directory.join("members.entry"))
+    if compiler_content_digest(payload) != read_file(directory.join("commit").as_str()) {
+        ret Option::None
+    }
+    let data = parse(payload).unwrap_or(Json::Null)
+    let digest = data.get("archive").unwrap_or(Json::Null).as_str().unwrap_or("")
+    let schema = data.get("schema").unwrap_or(Json::Null).as_number().unwrap_or("")
+    if (schema != "1" && schema != "2") ||
+    data.get("context").unwrap_or(Json::Null).as_str().unwrap_or("") != context || !valid_key(digest) {
+        ret Option::None
+    }
+    let archive = directory.join(digest + ".erlib")
+    if !file_exists(archive.as_str()) || file_sha256(archive.as_str()) != digest {
+        ret Option::None
+    }
+    let records = match data.get("members").unwrap_or(Json::Null).as_array() {
+        Some(value) => value None => {
+            ret Option::None
+        }
+    }
+    let mut members = Vec[(str, str)]::new()
+    let mut sources = Vec[str]::new()
+    for record in records {
+        let fields = record.as_array().unwrap_or(Vec[Json]::new())
+        let member = fields.get(0_usize).unwrap_or(Json::Null).as_str().unwrap_or("")
+        let key = fields.get(1_usize).unwrap_or(Json::Null).as_str().unwrap_or("")
+        let source = if schema == "2" {
+            fields.get(2_usize).unwrap_or(Json::Null).as_str().unwrap_or("")
+        } else {
+            ""
+        }
+        if fields.len() != if schema == "2" {
+            3_usize
+        } else {
+            2_usize
+        }
+        || member.is_empty() || !valid_key(key) ||
+        (!source.is_empty() && !valid_key(source)) {
+            ret Option::None
+        }
+        members.push((member, key))
+        sources.push(source)
+    }
+    ret Option::Some(NativeArchiveSnapshot { archive, digest, members, sources })
+}
+
+fn publish_native_archive(directory: Path, context: str, archive: Path, digest: str,
+    members: Vec[(str, str)], sources: Vec[str], previous: Option[NativeArchiveSnapshot],) -> Result[(), str] {
+    if !valid_key(digest) || mkdir_all(directory.as_str()) != 0 {
+        ret Result::Err("invalid native archive snapshot")
+    }
+    let stored = directory.join(digest + ".erlib")
+    if !file_exists(stored.as_str()) || file_sha256(stored.as_str()) != digest {
+        if copy_file(archive.as_str(), stored.as_str()) != 0 || file_sha256(stored.as_str()) != digest {
+            ret Result::Err("cannot commit native archive snapshot")
+        }
+    }
+    let mut records = Vec[Json]::new()
+    for ordinal in 0_usize..members.len() {
+        let member = members.get_unchecked_borrowed(ordinal)
+        records.push(Json::Array(vec![Json::String(member.0), Json::String(member.1), Json::String(sources.get(ordinal).unwrap_or(""))]))
+    }
+    let payload = stringify(Json::Object(vec![("schema", Json::Number("2")),("context", Json::String(context)),
+                ("archive", Json::String(digest)),("members", Json::Array(records))]))
+    if !write_payload(directory.join("members.entry"), payload, true) || !unsafe {
+        encore_compiler_write_atomic(directory.join("commit").as_str(), compiler_content_digest(payload))
+    }
+    {
+        ret Result::Err("cannot commit native archive index")
+    }
+    // Keep one previous distinct revision for ordinary undo. Unit-cache
+    // references to still older archives simply miss and rebuild from EHIR.
+    let previous_marker = directory.join("previous-archive")
+    let keep = match previous {
+        Some(value) => if value.digest != digest {
+            value.digest
+        } else {
+            read_file(previous_marker.as_str())
+        }
+        None => ""
+    }
+    if !unsafe {
+        encore_compiler_write_atomic(previous_marker.as_str(), keep)
+    }
+    {
+        ret Result::Err("cannot commit previous native archive identity")
+    }
+    for name in read_dir(directory.as_str()) {
+        if name.byte_len() == 70_usize && name.slice_bytes(64_usize, 6_usize) == ".erlib" {
+            let key = name.slice_bytes(0_usize, 64_usize)
+            if valid_key(key) && key != digest && key != keep {
+                let _removed = remove_file(directory.join(name).as_str())
+            }
+        }
+    }
+    touch_cache(directory) record_cache_usage(directory)
+    ret Result::Ok(())
+}
+
+/// LLVM/GNU archivers accept response files. Keep large function-CGU archives
+/// below host command-line limits, including Windows, without invoking a shell.
+fn archive_command_arguments(arguments: Vec[str], directory: Path) -> Result[Vec[str], str] {
+    if arguments.len() <= 128_usize {
+        ret Result::Ok(arguments)
+    }
+    let mut text = ""
+    for argument in arguments {
+        text += "\""
+        let mut start = 0_usize
+        let mut cursor = 0_usize
+        while cursor < argument.byte_len() {
+            let byte = argument.byte_at(cursor)
+            if byte == 34_u8 || byte == 92_u8 {
+                text += argument.slice_bytes(start, cursor - start) + "\\" + argument.slice_bytes(cursor, 1_usize)
+                start = cursor + 1_usize
+            }
+            cursor += 1_usize
+        }
+        text += argument.slice_bytes(start, argument.byte_len() - start) + "\"\n"
+    }
+    let path = directory.join("archive.rsp")
+    if write_file(path.as_str(), text) != 0 {
+        ret Result::Err("cannot write archive response file")
+    }
+    ret Result::Ok(vec!["@" + path.as_str()])
 }
 
 /// ThinLTO hashes the source filename when promoting local symbols. Staging
@@ -625,4 +986,43 @@ pub fn run_tool_worker() -> u32 {
             eprintln(error) ret 1
         }
     }
+}
+
+fn compact_declaration_snapshot_fixture(lock: UnitCacheLock, target: TargetSpec) -> Result[bool, str] {
+    let unit = ehirlib::codegen::prepare_unit_codegen(make_module_bundle("empty", Vec[Module]::new()),
+        make_module_bundle("", Vec[Module]::new()), target.triple, target.pointer_width, 1_usize,)
+    let context = compiler_content_digest("verified declaration generation")
+    let first = compact_declarations(unit, target, context, Option[UnitCacheLock]::Some(lock))?
+    let path = lock.directory.join("llvm-declarations.entry")
+    if first.is_empty() || !file_exists(path.as_str()) {
+        ret Result::Ok(false)
+    }
+    let second = compact_declarations(unit, target, context, Option[UnitCacheLock]::Some(lock))?
+    if first != second {
+        ret Result::Ok(false)
+    }
+    write_file(path.as_str(), "corrupt declaration snapshot")
+    let repaired = compact_declarations(unit, target, context, Option[UnitCacheLock]::Some(lock))?
+    ret Result::Ok(first == repaired && read_packed_payload(path).byte_len() > first.byte_len())
+}
+
+#attr(test)
+fn compact_declaration_snapshot_creates_parent_and_repairs_corruption() -> bool {
+    let root = Path::new("target/declaration-snapshot-" + Debug::fmt(std::time::perf_counter_ns())).resolve()
+    let lock = match try_unit_cache_lock(root, compiler_content_digest("snapshot fixture")) {
+        Ok(value) => match value {
+            Some(lock) => lock None => {
+                ret false
+            }
+        }
+        Err(_) => {
+            ret false
+        }
+    }
+    // A lock inode does not imply that its artifact directory exists.
+    let fresh = !file_exists(lock.directory.as_str())
+    let result = compact_declaration_snapshot_fixture(lock, refrain::target::host_target()).unwrap_or(false)
+    close_unit_cache_lock(lock)
+    let _removed = std::os::remove_dir_all(root.as_str())
+    ret fresh && result
 }

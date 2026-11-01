@@ -1,0 +1,124 @@
+//! Exact checked modules can replay facts without opening ordinary body syntax.
+import core::fmt::Debug
+import core::option::Option
+import core::testing::assert
+
+import std::vec::Vec
+
+import json::{Json, stringify}
+
+import refrain::frontend::{AnalysisDatabase, FrontendDocument, ProjectConstants}
+import refrain::frontend::analysis_database::{PreparedModuleSafety, check_prepared_safety_module, prepare_cached_lightweight_module_with_project}
+import refrain::frontend::parser::{FunctionItem, ImplStmt, ParsedBlock, Statement}
+import refrain::frontend::semantic::encode_semantic_checkpoint
+import refrain::frontend::semantic_index::PackageSemanticIndex
+import refrain::frontend::semantic_rebind::rebind_semantic_replay
+import refrain::target::host_target
+
+fn stub(item: FunctionItem) -> FunctionItem {
+    if item.body.is_none() {
+        ret item
+    }
+    ret FunctionItem {
+        item.attrs, item.decorators, item.is_public, item.is_extern, item.is_async, item.name,
+        item.documentation, item.generics, item.params, item.ret_type, item.returns_sending, item.returns_frozen,
+        Option[ParsedBlock]::Some(ParsedBlock::synthetic(Vec[Statement]::new())), item.source_name, item.line, item.column
+    }
+}
+fn headers(document: FrontendDocument) -> FrontendDocument {
+    let mut ast = Vec[Statement]::new()
+    for statement in document.ast {
+        match statement {
+            Statement::Function(item) => ast.push(Statement::Function(stub(item)))
+            Statement::Impl(item) => {
+                let mut methods = Vec[FunctionItem]::new()
+                for method in item.methods {
+                    methods.push(stub(method))
+                }
+                ast.push(Statement::Impl(ImplStmt {
+                            item.documentation, item.generics, item.trait_name,
+                            item.trait_args, item.target, methods, item.source_name, item.line, item.column
+                        }
+                    ))
+            }
+            _ => ast.push(statement)
+        }
+    }
+    ret FrontendDocument {
+        document.tokens, ast, document.module_documentation, document.diagnostics,
+        document.symbols, document.callables, document.dependencies, document.parsed
+    }
+}
+fn database(source: str, document: Option[FrontendDocument]) -> AnalysisDatabase {
+    let mut db = AnalysisDatabase::new()
+    match document {
+        Some(value) => db.apply_prepared_lightweight(prepare_cached_lightweight_module_with_project(
+                "app", "app.enq", source, value, ProjectConstants::empty(),))
+        None => db.set_module_full("app", "app.enq", source)
+    }
+    db.configure_safety("app", host_target(), Vec[str]::new())
+    ret db
+}
+fn same(left: PreparedModuleSafety, right: PreparedModuleSafety) -> bool {
+    if left.functions.len() != right.functions.len() || !right.diagnostics.is_empty() {
+        ret false
+    }
+    for index in 0_usize..left.functions.len() {
+        let a = left.functions.get_unchecked_borrowed(index)
+        let b = right.functions.get_unchecked_borrowed(index)
+        if a.owner != b.owner || a.item.name != b.item.name ||
+        stringify(encode_semantic_checkpoint(a.body, a.item.line, a.item.column)) !=
+        stringify(encode_semantic_checkpoint(b.body, b.item.line, b.item.column)) {
+            ret false
+        }
+    }
+    ret true
+}
+fn main() -> u32 {
+    let source = "\n\nextern fn foreign(value:u32)->u32\nfn answer()->u32 {let number=41_u32 ret number}\n" +
+    "struct Value {number:u32}\nimpl for Value {fn read(self:Self)->u32 {ret self.number}}\n"
+    let modules = vec!["app"]
+    let mut cold = database(source, Option[FrontendDocument]::None)
+    let identity = cold.semantic_package_identity(modules)
+    cold.prepare_package_semantics(modules, identity, Option[PackageSemanticIndex]::None)
+    let checked = check_prepared_safety_module(cold.prepare_module_safety_job("app", host_target(), Vec[str]::new(), Json::Null, true))
+    if !assert(checked.diagnostics.is_empty() && checked.checked == 3_usize) {
+        ret 1_u32
+    }
+    let replay = cold.finalize_semantic_replay("app", checked.replay)
+    let index = cold.package_semantic_index().unwrap_or(PackageSemanticIndex::empty())
+    let document = cold.document("app").unwrap_or(FrontendDocument::empty())
+    let mut warm = database(source, Option[FrontendDocument]::Some(headers(document)))
+    if !assert(warm.prepare_package_semantics(modules, warm.semantic_package_identity(modules), Option::Some(index))) {
+        ret 2_u32
+    }
+    let accepted = check_prepared_safety_module(warm.prepare_module_safety_job("app", host_target(), Vec[str]::new(), replay, true))
+    if !assert(accepted.checked == 0_usize && accepted.reused == 3_usize &&
+        accepted.replay.get("module_bodies_reused").unwrap_or(Json::Null).as_bool().unwrap_or(false) && same(checked, accepted)) {
+        ret 3_u32
+    }
+    let mut corrupt = Vec[(str, Json)]::new()
+    for field in replay.as_object().unwrap_or(Vec[(str, Json)]::new()) {
+        corrupt.push(if field.0 == "complete" {
+                (field.0, Json::Array(Vec[Json]::new()))
+            } else {
+                field
+            }
+        )
+    }
+    let mut fallback = database(source, Option[FrontendDocument]::None)
+    fallback.prepare_package_semantics(modules, fallback.semantic_package_identity(modules), Option::Some(index))
+    let repaired = check_prepared_safety_module(fallback.prepare_module_safety_job("app", host_target(), Vec[str]::new(), Json::Object(corrupt), true))
+    if !assert(!repaired.replay.get("module_bodies_reused").unwrap_or(Json::Null).as_bool().unwrap_or(false) &&
+        repaired.checked != 0_usize && same(checked, repaired)) {
+        ret 4_u32
+    }
+    let mut identities = Vec[str]::new()
+    for ordinal in 0_usize..index.types.len() {
+        identities.push("@" + Debug::fmt(ordinal))
+    }
+    if !assert(rebind_semantic_replay(replay, identities).get("complete").unwrap_or(Json::Null).is_null()) {
+        ret 5_u32
+    }
+    ret 0_u32
+}

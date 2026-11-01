@@ -3,6 +3,7 @@ import mod::static_value::{static_accessor, static_runtime_declarations}
 
 import core::fmt::Debug
 import core::option::Option
+import core::result::Result
 
 import std::dict::Hashable
 import std::io::eprintln
@@ -14,19 +15,22 @@ import std::vec::Vec
 
 import ehirlib::*
 import ehirlib::{EhirTextBuilder, ModuleBundle, parse_module_bundle_text, suppress_text_builder_output}
-import json::stringify
+import json::{Json, parse, stringify}
 import rich::panel::Panel
 import rich::style::{accent, error_text, muted}
 
 import mod::ir::{LoweringBuilder, LoweringScope, Operand, annotated, legacy_ir_text, reference, references}
 import refrain::cache_identity::compiler_content_digest
 import refrain::frontend::control_flow::{block_terminates_flow, match_arm_terminates_flow, match_stmt_terminates_flow, statement_terminates_flow}
-import refrain::frontend::import_paths::{expanded_import_paths, import_binding_names, import_namespace_target, normalized_import_target}
+import refrain::frontend::import_paths::{expanded_import_paths, import_binding_names, import_namespace_target, namespace_import_candidates, normalized_import_target}
 import refrain::frontend::lexer::Lexer
-import refrain::frontend::metadata_ast::encode_lowered_function_input
+import refrain::frontend::metadata_ast::{decode_function_snapshot, decode_generic_snapshot, decode_metadata_ast, decode_metadata_documentation, encode_function_snapshot, encode_generic_snapshot, encode_lowered_function_input, encode_metadata_ast, encode_metadata_contract_ast, encode_metadata_documentation}
 import refrain::frontend::parser::Parser
 import refrain::frontend::parser::statements::{ArrayLiteralExpr, ArrayRepeatExpr, AssignmentStmt, BinaryExpr, BlockExpr, CallExpr, CastExpr, ClosureExpr, DecoratorApplication, DoWhileStmt, Documentation, EhirStmt, EnumStmt, Expr, ExprNode, FieldExpr, ForStmt, FunctionItem, FunctionParam, GenericParam, IfBranch, IfExpr, IfExprBranch, IfStmt, ImplStmt, ImportStmt, IndexExpr, LetStmt, LoopStmt, MatchArmBody, MatchExpr, MatchExprArm, MatchPattern, MatchStmt, MethodCallExpr, NamedField, ParsedBlock, ParsedEnumVariant, ParsedMatchArm, Statement, StructInitExpr, StructStmt, TraitBound, TraitStmt, TupleLiteralExpr, UnaryExpr, WhileStmt, WithStmt}
 import refrain::frontend::reflection::{ReflectionShape, calls_reflection_templates, expand_reflection_function, function_uses_reflection, mark_reflection_templates, reflection_template_names, specialize_reflection_function}
+import refrain::frontend::semantic_slice::SemanticKeyIndex
+import refrain::frontend::translator_environment::*
+import refrain::frontend::translator_environment_codec::{decode_snapshot_TranslationEnvironmentArtifact, encode_snapshot_TranslationEnvironmentArtifact}
 import refrain::target::{TargetSpec, cfg_active_with_features, host_target}
 
 extern fn encore_text_sha256(value: str) -> str
@@ -290,26 +294,33 @@ pub fn set_translation_diagnostic_json(enabled: bool) ->() {
 }
 
 fn translation_source_line(source: str, target: usize) -> str {
-    let mut current = ""
     let mut line = 0_usize
-    let mut index = 0_usize
-    while index < source.len() {
-        let ch = source.slice(index, 1_usize)
-        if ch == "\n" {
+    let mut start = 0_usize
+    for index in 0_usize..source.byte_len() {
+        if source.byte_at(index) == 10_u8 {
             if line == target {
-                ret current
+                ret translation_frame_line(source, start, index)
             }
-            current = ""
             line += 1_usize
-        } elif ch != "\r" {
-            current += ch
+            start = index + 1_usize
         }
-        index += 1_usize
     }
     if line == target {
-        ret current
+        ret translation_frame_line(source, start, source.byte_len())
     }
     ret ""
+}
+
+fn translation_frame_line(source: str, start: usize, end: usize) -> str {
+    let mut result = ""
+    let mut cursor = start
+    for index in start..end {
+        if source.byte_at(index) == 13_u8 {
+            result += source.slice_bytes(cursor, index - cursor)
+            cursor = index + 1_usize
+        }
+    }
+    ret result + source.slice_bytes(cursor, end - cursor)
 }
 
 fn translation_json_escape(value: str) -> str {
@@ -446,6 +457,10 @@ impl for TranslatedModuleChunk {
         }
         ret Self { index, module }
     }
+    /// Restores typed cache records without routing them through the text parser.
+    pub fn from_module(index: usize, module: Module) -> Self {
+        ret Self { index, module }
+    }
     pub fn module_index(self: Self) -> usize {
         ret self.index
     }
@@ -555,12 +570,23 @@ struct TranslationExportSyntax {
     types: Vec[(str, bool)]
     traits: Vec[str]
     paths: Vec[(str, bool)]
+    namespace_imports: Vec[(str, Vec[str])]
     targets: Vec[usize]
     imports: Vec[str]
+    nominal_imports: Vec[TranslationNominalImport]
 }
 
 struct TranslationExportEdge {
     target: usize
+    bindings: Vec[(str, str, bool)]
+}
+
+// Import leaves are syntax facts. Decode them once, retaining target/path
+// order and the distinction between a selected import and a bare namespace.
+struct TranslationNominalImport {
+    target: usize
+    is_public: bool
+    is_selected: bool
     bindings: Vec[(str, str, bool)]
 }
 
@@ -825,8 +851,14 @@ pub fn translate_compilation_unit_to_ehir_chunks(modules: Vec[TranslationModule]
 /// identities against the complete checked lowering context before admission.
 pub struct CachedFunctionChunk {
     key: str
-    text: str
-    declarations: Vec[str]
+    module: Module
+    declarations: Vec[CachedFunctionDeclaration]
+}
+
+pub struct CachedFunctionDeclaration {
+    name: str
+    closure_name: str
+    module: Option[Module]
 }
 
 pub struct GeneratedDeclaration {
@@ -839,10 +871,25 @@ pub struct CachedCompilationChunks {
     modules: Vec[TranslatedModuleChunk]
     functions: Vec[CachedFunctionChunk]
     functions_reused: usize
+    environment: Option[str]
+    environment_reused: bool
 }
 
 pub fn lowering_function_key(module_id: str, item: FunctionItem) -> str {
     ret compiler_content_digest("encore-lowered-function-input-2\n" + module_id + "\n" +
+        stringify(encode_lowered_function_input(item, module_id)))
+}
+
+/// Method identities bind their impl owner, trait arguments and generic scope;
+/// identical method names in different implementations never share a record.
+pub fn lowering_method_key(module_id: str, implementation: ImplStmt, item: FunctionItem) -> str {
+    let header = ImplStmt {
+        Option[Documentation]::None, implementation.generics,
+        implementation.trait_name, implementation.trait_args, implementation.target,
+        Vec[FunctionItem]::new(), "", 0_usize, 0_usize
+    }
+    ret compiler_content_digest("encore-lowered-method-input-1\n" + module_id + "\n" +
+        stringify(encode_metadata_contract_ast(vec![Statement::Impl(header)])) + "\n" +
         stringify(encode_lowered_function_input(item, module_id)))
 }
 
@@ -861,12 +908,48 @@ pub fn lowering_function_site(module_id: str, ordinal: usize) -> str {
 /// Other callers retain the ordinary entrypoint and calculate keys on demand.
 pub fn translate_keyed_compilation_unit_to_ehir_chunks(modules: Vec[TranslationModule], target: TargetSpec,
     selected: Vec[usize], cached: Vec[CachedFunctionChunk], keys: Vec[(str, str)],) -> CachedCompilationChunks {
+    ret translate_delta_compilation_unit_to_ehir_chunks(modules, target, selected, cached, keys, Vec[FunctionLoweringDelta]::new())
+}
+
+/// A module receipt binds the unchanged declaration/template environment;
+/// only differing ordinary bodies are lowered against that environment.
+pub fn translate_delta_compilation_unit_to_ehir_chunks(modules: Vec[TranslationModule], target: TargetSpec,
+    selected: Vec[usize], cached: Vec[CachedFunctionChunk], keys: Vec[(str, str)], deltas: Vec[FunctionLoweringDelta],) -> CachedCompilationChunks {
+    ret translate_compilation_unit_with_environment(modules, target, selected, cached, keys, deltas, "", Option[str]::None)
+}
+
+/// A content-bound immutable declaration environment is restored independently
+/// of ordinary bodies. Native indexes are rebuilt in this process.
+pub fn translate_compilation_unit_with_environment(modules: Vec[TranslationModule], target: TargetSpec,
+    selected: Vec[usize], cached: Vec[CachedFunctionChunk], keys: Vec[(str, str)], deltas: Vec[FunctionLoweringDelta],
+    identity: str, environment: Option[str],) -> CachedCompilationChunks {
     let mut ast = Vec[Statement]::new()
     for module in modules {
         ast.extend(module.ast)
     }
     let context_started = perf_counter_ms()
-    let mut ctx = collect_context_with_abi(ast, modules, target, Vec[str]::new(), true)
+    let mut reused = false
+    let restored = match environment {
+        Some(payload) => match restore_translation_environment(modules, target, identity, payload) {
+            Ok(ctx) => Option[TranslatorContext]::Some(ctx)
+            Err(_) => Option[TranslatorContext]::None
+        }
+        None => Option[TranslatorContext]::None
+    }
+    let mut ctx = match restored {
+        Some(ctx) => {
+            reused = true ctx
+        }
+        None => collect_context_with_abi(ast, modules, target, Vec[str]::new(), true)
+    }
+    let snapshot = if reused || identity.is_empty() {
+        Option[str]::None
+    } else {
+        match encode_translation_environment(ctx, identity) {
+            Ok(payload) => Option[str]::Some(payload)
+            Err(_) => Option[str]::None
+        }
+    }
     if env("ENCORE_FRONTEND_PROFILE").is_some() {
         eprintln("frontend-context " + Debug::fmt(perf_counter_ms() - context_started) + " ms")
     }
@@ -895,11 +978,26 @@ pub fn translate_keyed_compilation_unit_to_ehir_chunks(modules: Vec[TranslationM
     let mut index = 0_usize
     for module in modules {
         if contains_module_index(selected, index) {
-            chunks.push(translate_module_chunk(ctx, module, target, index))
+            let mut patched = Option[TranslatedModuleChunk]::None
+            for delta in deltas {
+                if delta.index == index {
+                    patched = translate_function_delta(ctx, module, target, delta) break
+                }
+            }
+            match patched {
+                Some(chunk) => {
+                    chunks.push(chunk)
+                }
+                None => {
+                    chunks.push(translate_module_chunk(ctx, module, target, index))
+                }
+            }
         }
         index += 1
     }
-    let result = CachedCompilationChunks { chunks, ctx.lowered_functions, ctx.functions_reused }
+    let result = CachedCompilationChunks {
+        chunks, ctx.lowered_functions, ctx.functions_reused, snapshot, reused
+    }
     free_translation_indexes(ctx)
     ret result
 }
@@ -1227,18 +1325,13 @@ fn resolve_type_collision_uncached(ctx: mut TranslatorContext, module: usize, na
     let syntax = cached_export_syntax(ctx, module)
     if !cached_module_declares_type(ctx, module, name) {
         let mut imported = ""
-        for target_position in syntax.targets {
-            let target_id = module_id_at(ctx, target_position)
-            let target = cached_module_import_path(ctx, target_id)
-            for path in syntax.paths {
-                if !starts_with(path.0, target + "::") {
-                    continue
-                }
-                for binding in import_binding_names(path.0, target) {
+        for imported_path in syntax.nominal_imports {
+            if imported_path.is_selected {
+                for binding in imported_path.bindings {
                     if binding.1 != name {
                         continue
                     }
-                    let identity = exported_type_identity(ctx, target_position, binding.0, 0_usize)
+                    let identity = exported_type_identity(ctx, imported_path.target, binding.0, 0_usize)
                     if identity != "" {
                         if imported != "" && imported != identity {
                             ret ""
@@ -1722,9 +1815,7 @@ fn expand_translation_imports(ast: Vec[Statement]) -> Vec[Statement] {
     ret out
 }
 
-fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule], target: TargetSpec, features:
-    Vec[str], stable_abi: bool,) -> TranslatorContext {
-    let normalized_ast = expand_translation_imports(ast)
+fn empty_translation_context(modules: Vec[TranslationModule], target: TargetSpec, features: Vec[str], stable_abi: bool) -> TranslatorContext {
     let mut normalized_modules = Vec[TranslationModule]::new()
     for module in modules {
         normalized_modules.push(TranslationModule {
@@ -1824,6 +1915,14 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
         }
         , Vec[usize]::new(), "", "", 0, LoweringScope::new(Vec[Parameter]::new()), Vec[GeneratedDeclaration]::new()
     }
+    ret ctx
+}
+
+fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule], target: TargetSpec, features:
+    Vec[str], stable_abi: bool,) -> TranslatorContext {
+    let normalized_ast = expand_translation_imports(ast)
+    let mut ctx = empty_translation_context(modules, target, features, stable_abi)
+    let normalized_modules = ctx.modules
     // Struct/enum syntax nodes intentionally carry no source path. In a
     // resolved workspace, collect them through their owning module so two
     // same-named declarations receive distinct field and variant identities.
@@ -2270,6 +2369,7 @@ fn cached_export_syntax(ctx: mut TranslatorContext, module_position: usize) -> T
         }
     }
     let mut edges = Vec[TranslationExportEdge]::new()
+    let mut nominal_imports = Vec[TranslationNominalImport]::new()
     let mut targets = Vec[usize]::new()
     // Preserve module and import order, including duplicate module identities.
     for target in 0_usize..ctx.modules.len() {
@@ -2280,17 +2380,27 @@ fn cached_export_syntax(ctx: mut TranslatorContext, module_position: usize) -> T
         targets.push(target)
         let target_path = cached_module_import_path(ctx, target_id)
         for path in paths {
-            if path.1 && starts_with(path.0, target_path + "::") {
-                edges.push(TranslationExportEdge {
-                        target, import_binding_names(path.0, target_path)
+            let selected = starts_with(path.0, target_path + "::")
+            if selected || path.0 == target_path {
+                let bindings = import_binding_names(path.0, target_path)
+                nominal_imports.push(TranslationNominalImport {
+                        target, path.1, selected, bindings
                     }
                 )
+                if path.1 && selected {
+                    edges.push(TranslationExportEdge { target, bindings })
+                }
             }
         }
     }
+    let mut namespace_targets = Vec[str]::with_capacity(module.imports.len())
+    for target in module.imports {
+        namespace_targets.push(cached_module_import_path(ctx, target))
+    }
+    let namespace_imports = prepare_namespace_imports(paths, namespace_targets)
     let result = TranslationExportSyntax {
         module.module_id, functions, edges,
-        module.source_name, types, traits, paths, targets, module.imports
+        module.source_name, types, traits, paths, namespace_imports, targets, module.imports, nominal_imports
     }
     ctx.imports.exports.push(result)
     unsafe {
@@ -3300,20 +3410,16 @@ fn resolve_exported_type_identity(ctx: mut TranslatorContext, module: usize, nam
         }
     }
     let mut found = ""
-    for candidate in syntax.targets {
-        let target = cached_module_import_path(ctx, module_id_at(ctx, candidate))
-        for path in syntax.paths {
-            if !path.1 || !(path.0 == target || starts_with(path.0, target + "::")) {
-                continue
-            }
-            for binding in import_binding_names(path.0, target) {
+    for imported_path in syntax.nominal_imports {
+        if imported_path.is_public {
+            for binding in imported_path.bindings {
                 if binding.1 == name || binding.0 == "*" {
                     let original = if binding.0 == "*" {
                         name
                     } else {
                         binding.0
                     }
-                    let resolved = exported_type_identity(ctx, candidate, original, depth + 1_usize)
+                    let resolved = exported_type_identity(ctx, imported_path.target, original, depth + 1_usize)
                     if resolved != "" {
                         if found != "" && found != resolved {
                             ret ""
@@ -4412,10 +4518,60 @@ fn resolve_imported_namespace_path(ctx: mut TranslatorContext, source_name: str,
     }
     let caller = cached_export_syntax(ctx, encoded - 1_usize)
     let requested = module_import_target(caller.module_id, requested)
-    for path in caller.paths {
-        for target in caller.imports {
-            let target_path = cached_module_import_path(ctx, target)
-            let expanded = import_namespace_target(path.0, target_path, requested)
+    ret resolve_namespace_imports(caller.namespace_imports, requested)
+}
+
+// Decode candidate module paths once per immutable export summary. Keep path
+// order and the caller's import order; candidate spelling order is not priority.
+fn prepare_namespace_imports(paths: Vec[(str, bool)], targets: Vec[str]) -> Vec[(str, Vec[str])] {
+    let mut positions = SemanticKeyIndex::new(targets.len())
+    for ordinal in 0_usize..targets.len() {
+        let target = targets.get_unchecked_borrowed(ordinal)
+        if positions.get(target) == 0_usize {
+            positions.set(target, ordinal)
+        }
+    }
+    let mut imports = Vec[(str, Vec[str])]::new()
+    for path in paths {
+        let mut selected = Vec[str]::new()
+        match namespace_import_candidates(path.0) {
+            Some(candidates) => {
+                let mut ordinals = Vec[usize]::new()
+                for candidate in candidates {
+                    let ordinal = positions.get(candidate)
+                    if ordinal != 0_usize {
+                        ordinals.push(ordinal - 1_usize)
+                    }
+                }
+                for index in 1_usize..ordinals.len() {
+                    let mut cursor = index
+                    while cursor > 0_usize && ordinals.get_unchecked_borrowed(cursor) < ordinals.get_unchecked_borrowed(cursor - 1_usize) {
+                        let previous = ordinals.get_unchecked_borrowed(cursor - 1_usize)
+                        ordinals.set(cursor - 1_usize, ordinals.get_unchecked_borrowed(cursor))
+                        ordinals.set(cursor, previous)
+                        cursor -= 1_usize
+                    }
+                }
+                for ordinal in ordinals {
+                    selected.push(targets.get_unchecked_borrowed(ordinal))
+                }
+            }
+            None => {
+                // Incomplete/editor import text retains the tolerant scan.
+                selected = targets
+            }
+        }
+        if !selected.is_empty() {
+            imports.push((path.0, selected))
+        }
+    }
+    ret imports
+}
+
+fn resolve_namespace_imports(imports: Vec[(str, Vec[str])], requested: str) -> str {
+    for entry in imports {
+        for target in entry.1 {
+            let expanded = import_namespace_target(entry.0, target, requested)
             if expanded != "" {
                 ret expanded
             }
@@ -4423,6 +4579,58 @@ fn resolve_imported_namespace_path(ctx: mut TranslatorContext, source_name: str,
     }
     ret requested
 }
+
+#attr(test)
+fn translator_namespace_candidates_match_ordered_scan() -> bool {
+    let modules = vec!["a::c", "a::b", "a", "a::nested::d", "pkg::mod", "mod", "core::vec",
+        "a::*", "refrain::child", "пример::модуль", "a::b as chosen", "a as z::b", "a::as chosen", "a::b"]
+    let paths = vec!["a", "a::b", "a::b as chosen", "a::{b,c}", "a::{b as chosen,c as chosen}",
+        "a::{nested::{d as deep},b}", "a::*", "a::{*,b as chosen}", "pkg::mod", "pkg::mod as picked",
+        " core::vec as list ", "refrain::child as local", "пример::{модуль as имя}", "missing", "",
+        "a::{b,c", "a:: b as chosen", "a::\tb as chosen", "a as z::b as chosen", "a as z::b",
+        "a::{b as chosen,c", "a::", "a:: as chosen"]
+    let requests = vec!["a", "b", "c", "chosen", "chosen::inner", "deep", "mod", "picked::nested",
+        "list", "local", "имя", "unknown", "b as chosen", "*", "as chosen", ""]
+    let mut reversed = Vec[str]::new()
+    let mut position = modules.len()
+    while position > 0_usize {
+        position -= 1_usize
+        reversed.push(modules.get_unchecked_borrowed(position))
+    }
+    let mut combinations = Vec[Vec[(str, bool)]]::new()
+    for path in paths {
+        combinations.push(vec![(path, false)])
+    }
+    combinations.push(vec![("a::b as chosen", false),("a::c as chosen", true)])
+    combinations.push(vec![("a::c as chosen", true),("a::b as chosen", false)])
+    for targets in vec![modules, reversed, Vec[str]::new()] {
+        for imports in combinations {
+            let candidates = prepare_namespace_imports(imports, targets)
+            for requested in requests {
+                let mut reference = requested
+                let mut found = false
+                for path in imports {
+                    for target in targets {
+                        let expanded = import_namespace_target(path.0, target, requested)
+                        if !expanded.is_empty() {
+                            reference = expanded
+                            found = true
+                            break
+                        }
+                    }
+                    if found {
+                        break
+                    }
+                }
+                if resolve_namespace_imports(candidates, requested) != reference {
+                    ret false
+                }
+            }
+        }
+    }
+    ret true
+}
+
 fn ctx_lookup_function_for_args(ctx: mut TranslatorContext, source_name: str, name: str, actual_types:
     Vec[str],) -> Option[FunctionType] {
     if function_owner_is_generic(ctx, name) {
@@ -6433,8 +6641,13 @@ fn decorator_hidden_name(ctx: mut TranslatorContext, item: FunctionItem, layer: 
     } else {
         item.source_name
     }
-    let identity = source + "::" + item.name + ":" + Debug::fmt(item.line) + ":" +
-    Debug::fmt(item.column) + ":" + Debug::fmt(layer)
+    let signature = FunctionItem {
+        Vec[str]::new(), Vec[DecoratorApplication]::new(), item.is_public, item.is_extern, item.is_async,
+        item.name, Option[Documentation]::None, item.generics, item.params, item.ret_type,
+        item.returns_sending, item.returns_frozen, Option[ParsedBlock]::None, "", 0_usize, 0_usize
+    }
+    let callable = compiler_content_digest(stringify(encode_lowered_function_input(signature, source)))
+    let identity = function_body_identity(source, ctx.self_type, callable) + ":" + Debug::fmt(layer)
     ret "__encore_decorated_" + Debug::fmt(identity.hash()) + "_" + item.name
 }
 
@@ -6681,6 +6894,20 @@ fn translate_cached_function(ctx: mut TranslatorContext, item: FunctionItem, ord
     } else {
         ctx.function_keys.get(precomputed - 1).unwrap_or("")
     }
+    match replay_lowered_function(ctx, key) {
+        Some(value) => {
+            ret value
+        }
+        None => {
+        }
+    }
+    let before = ctx.extern_functions.len()
+    let lowered = translate_function(ctx, item)
+    record_lowered_function(ctx, key, lowered, before)
+    ret lowered
+}
+
+fn replay_lowered_function(ctx: mut TranslatorContext, key: str) -> Option[LoweringBuilder] {
     let encoded = unsafe {
         encore_strmap_get(ctx.cached_function_index, key)
     }
@@ -6688,71 +6915,96 @@ fn translate_cached_function(ctx: mut TranslatorContext, item: FunctionItem, ord
         match ctx.cached_functions.get(encoded - 1) {
             Some(cached) => {
                 for declaration in cached.declarations {
-                    let closure_prefix = "__encore_generated_closure__"
-                    let bridge_prefix = "__encore_generated_reflection_bridge__"
-                    let prefix = if starts_with(declaration, closure_prefix) {
-                        closure_prefix
-                    } elif starts_with(declaration, bridge_prefix) {
-                        bridge_prefix
-                    } else {
-                        ""
-                    }
-                    if prefix.is_empty() {
-                        ctx.extern_functions.push(declaration)
-                        continue
-                    }
-                    let module = parse_module_text("", declaration.slice_bytes(prefix.byte_len(), declaration.byte_len() - prefix.byte_len()))
-                    let mut closure_name = ""
-                    if prefix == closure_prefix {
-                        for item in module.directives {
-                            match item {
-                                Directive::Struct(value) => {
-                                    closure_name = value.name break
-                                }
-                                _ => {
+                    ctx.extern_functions.push(declaration.name)
+                    match declaration.module {
+                        Some(module) => {
+                            if !declaration.closure_name.is_empty() {
+                                remember_type(ctx, declaration.closure_name)
+                                let _owning = unsafe {
+                                    encore_strset_insert(ctx.owning_type_index, declaration.closure_name)
                                 }
                             }
+                            ctx.generated_declarations.push(GeneratedDeclaration {
+                                    declaration.name, declaration.closure_name, cached_module_items(module)
+                                }
+                            )
                         }
-                        remember_type(ctx, closure_name)
-                        let _owning = unsafe {
-                            encore_strset_insert(ctx.owning_type_index, closure_name)
+                        None => {
                         }
                     }
-                    ctx.extern_functions.push(declaration)
-                    ctx.generated_declarations.push(GeneratedDeclaration {
-                            declaration, closure_name, cached_module_items(module)
-                        }
-                    )
                 }
                 ctx.functions_reused += 1
-                let module = parse_module_text("", cached.text)
-                ret LoweringBuilder::from_items(ctx.ir_scope, cached_module_items(module))
+                ret Option[LoweringBuilder]::Some(LoweringBuilder::from_items(ctx.ir_scope, cached_module_items(cached.module)))
             }
             None => {
             }
         }
     }
-    let before = ctx.extern_functions.len()
-    let lowered = translate_function(ctx, item)
-    let mut declarations = Vec[str]::new()
+    ret Option[LoweringBuilder]::None
+}
+
+fn record_lowered_function(ctx: mut TranslatorContext, key: str, lowered: LoweringBuilder, before: usize) ->() {
+    let mut declarations = Vec[CachedFunctionDeclaration]::new()
     for index in before..ctx.extern_functions.len() {
         let name = ctx.extern_functions.get_unchecked_borrowed(index)
-        let mut text = name
+        let mut module = Option[Module]::None
+        let mut closure_name = ""
         for generated in ctx.generated_declarations {
             if generated.name == name {
-                let prefix = if generated.closure_name.is_empty() {
-                    "__encore_generated_reflection_bridge__"
-                } else {
-                    "__encore_generated_closure__"
-                }
-                text = prefix + LoweringBuilder::from_items(ctx.ir_scope, generated.items).finish()
+                module = Option[Module]::Some(cached_items_module(generated.items))
+                closure_name = generated.closure_name
                 break
             }
         }
-        declarations.push(text)
+        declarations.push(CachedFunctionDeclaration { name, closure_name, module })
     }
-    ctx.lowered_functions.push(CachedFunctionChunk { key, lowered.finish(), declarations })
+    ctx.lowered_functions.push(CachedFunctionChunk {
+            key, cached_items_module(lowered.finish_items()), declarations
+        }
+    )
+}
+
+fn translate_cached_method(ctx: mut TranslatorContext, implementation: ImplStmt, method: FunctionItem,
+    emitted_name: str, ret_type: str,) -> LoweringBuilder {
+    let mut eligible = ctx.record_function_cache && implementation.generics.is_empty() && method.generics.is_empty() &&
+    !method.is_async && !method.is_extern && method.decorators.is_empty() && !function_uses_reflection(method)
+    if !ctx.reflection_templates.is_empty() {
+        let mut names = Vec[str]::new()
+        for template in ctx.reflection_templates {
+            names.push(template.item.name)
+        }
+        if calls_reflection_templates(method, names) {
+            eligible = false
+        }
+    }
+    if !eligible {
+        ret translate_function_named(ctx, method, emitted_name, ret_type, implementation.generics)
+    }
+    let key = lowering_method_key(module_identity_for_source(ctx, method.source_name), implementation, method)
+    match replay_lowered_function(ctx, key) {
+        Some(value) => {
+            ret value
+        }
+        None => {
+        }
+    }
+    let before = ctx.extern_functions.len()
+    let lowered = translate_function_named(ctx, method, emitted_name, ret_type, implementation.generics)
+    record_lowered_function(ctx, key, lowered, before)
     ret lowered
+}
+
+fn cached_items_module(items: Vec[IrItem]) -> Module {
+    match module_from_ir_items("cached-function", Vec[EhirImport]::new(), Option[str]::None, items) {
+        Ok(value) => {
+            ret value
+        }
+        Err(message) => {
+            translation_invariant_error(message)
+            ret make_module("cached-function", Vec[Directive]::new())
+        }
+    }
+    ret make_module("cached-function", Vec[Directive]::new())
 }
 
 fn cached_module_items(module: Module) -> Vec[IrItem] {
@@ -6849,7 +7101,7 @@ fn translate_function_named_inner(ctx: mut TranslatorContext, fn_item: FunctionI
     let fn_item = expand_translation_reflection(ctx, fn_item, scope_generics)
     ctx.active_source_name = fn_item.source_name
     ctx.function_identity = if ctx.stable_abi {
-        compiler_content_digest(module_identity_for_source(ctx, fn_item.source_name) + "\n" + emitted_name)
+        function_body_identity(module_identity_for_source(ctx, fn_item.source_name), ctx.self_type, emitted_name)
     } else {
         ""
     }
@@ -7390,8 +7642,7 @@ fn translate_impl(ctx: mut TranslatorContext, item: ImplStmt) -> LoweringBuilder
                 builder = builder.append(translate_decorated_method(ctx, method,
                         emitted_method_name, ret_type, item.target, item.generics,))
             } else {
-                builder = builder.append(translate_function_named(ctx, method, emitted_method_name,
-                        ret_type, item.generics,))
+                builder = builder.append(translate_cached_method(ctx, item, method, emitted_method_name, ret_type))
             }
         }
     }
@@ -16312,12 +16563,34 @@ fn typed_params_in_context(ctx: mut TranslatorContext, item: FunctionItem) -> Ve
 fn qualify_typed_module_collisions(ctx: mut TranslatorContext, module: TranslationModule, value: Module) -> Module {
     let started = perf_counter_ms()
     let module_position = translation_module_position(ctx, module)
+    let referenced = unsafe {
+        encore_strset_new()
+    }
+    for name in module_nominal_type_names(value) {
+        let _ = unsafe {
+            encore_strset_insert(referenced, name)
+        }
+    }
     let mut replacements = Vec[(str, str)]::new()
     for name in ctx.type_collisions {
+        if !unsafe {
+            encore_strset_contains(referenced, name)
+        }
+        {
+            continue
+        }
         let resolved = resolved_type_collision(ctx, module_position, name)
         if !resolved.is_empty() && resolved != name {
             replacements.push((name, resolved))
+            // Preserve sequential substitutions when a replacement introduces
+            // a later candidate, including generated-looking user type names.
+            let _ = unsafe {
+                encore_strset_insert(referenced, resolved)
+            }
         }
+    }
+    unsafe {
+        encore_strset_free(referenced)
     }
     let resolved = perf_counter_ms()
     let result = rename_module_types(value, replacements)
@@ -16327,6 +16600,66 @@ fn qualify_typed_module_collisions(ctx: mut TranslatorContext, module: Translati
     }
     ret result
 }
+
+#attr(test)
+fn translator_nominal_typed_demand_matches_full_resolution() -> bool {
+    let modules = vec![
+        export_contract_module("left", Vec[str]::new(), "pub struct Value {} pub struct __encore_t6c656674__Value {}"),
+        export_contract_module("right", Vec[str]::new(), "pub struct Value {} pub struct __encore_t6c656674__Value {}")
+    ]
+    let mut ast = Vec[Statement]::new()
+    for module in modules {
+        ast.extend(module.ast)
+    }
+    let value = plain_type("Value", Vec[Type]::new())
+    let scalar = plain_type("u32", Vec[Type]::new())
+    let generic = FnDirective {
+        "identity", vec![value], vec![param("Value", value)], value,
+        vec![block("entry", Vec[Instruction]::new(), ret_term(var("Value", value)))], false, false
+    }
+    let method = FnDirective {
+        "sample", Vec[Type]::new(), Vec[Parameter]::new(), scalar,
+        vec![block("entry", vec![call(var("result", scalar), "Value::read", Vec[Type]::new(), Vec[Variable]::new(), false)],
+                ret_term(var("result", scalar)),)], false, false
+    }
+    let samples = vec![
+        make_module("empty", Vec[Directive]::new()),
+        make_module("declaration", vec![struct_directive("Value", Vec[Type]::new(), vec![param("Value", value)])]),
+        make_module("generic", vec![Directive::Function(generic)]),
+        make_module("method", vec![Directive::Function(method)]),
+        make_module_with_metadata("docs", Vec[EhirImport]::new(), Option[str]::None,
+            vec![ehir_documentation("impl Value", "Value is a literal here")], Vec[Directive]::new(),)
+    ]
+    let mut correct = true
+    for stable in vec![false, true] {
+        let mut ctx = collect_context_with_abi(ast, modules, host_target(), Vec[str]::new(), stable)
+        ctx.type_collisions = vec!["Value", "__encore_t6c656674__Value"]
+        ctx.type_identity_scope_size = ctx.type_collisions.len()
+        for position in 0_usize..modules.len() {
+            let owner = modules.get_unchecked_borrowed(position)
+            for sample in samples {
+                let before = ctx.type_identity_values.len()
+                let actual = qualify_typed_module_collisions(ctx, owner, sample)
+                if sample.name == "empty" && ctx.type_identity_values.len() != before {
+                    correct = false
+                }
+                let mut replacements = Vec[(str, str)]::new()
+                for name in ctx.type_collisions {
+                    let resolved = reference_resolve_type_collision_uncached(ctx, owner, name)
+                    if !resolved.is_empty() && resolved != name {
+                        replacements.push((name, resolved))
+                    }
+                }
+                if module_to_string(actual) != module_to_string(rename_module_types(sample, replacements)) {
+                    correct = false
+                }
+            }
+        }
+        free_translation_indexes(ctx)
+    }
+    ret correct
+}
+
 fn qualify_typed_items_collisions(ctx: mut TranslatorContext, owner: TranslationModule, items: Vec[IrItem]) -> Vec[IrItem] {
     let module = match module_from_ir_items(owner.module_id, Vec[EhirImport]::new(), Option[str]::None, items) {
         Ok(value) => value Err(message) => {
@@ -16834,6 +17167,51 @@ fn translator_nominal_index_matches_ast_reference() -> bool {
 }
 
 #attr(test)
+fn translator_nominal_import_plan_matches_ast_reference() -> bool {
+    let modules = vec![
+        export_contract_module("model@types/mod.enq", Vec[str]::new(),
+            "pub struct Shared {} pub struct Item {} pub enum Choice { Empty } struct Hidden {} pub struct Data {}",),
+        export_contract_module("other@lib.enq", Vec[str]::new(), "pub struct Shared {} pub struct Item {}"),
+        export_contract_module("facade@lib.enq", vec!["model@types/mod.enq", "other@lib.enq"],
+            "pub import model::types::{Shared as Alias,Choice,Data}\nimport other::Item as Private\npub import model::types::{Shared as Again}",),
+        export_contract_module("bare@lib.enq", vec!["model@types/mod.enq"], "pub import model::types"),
+        export_contract_module("left@lib.enq", vec!["model@types/mod.enq", "right@lib.enq"],
+            "pub import model::types::*\npub import right::*",),
+        export_contract_module("right@lib.enq", vec!["left@lib.enq", "other@lib.enq"],
+            "pub import left::*\npub import other::{Shared as Alias}",),
+        export_contract_module("consumer@lib.enq", vec!["facade@lib.enq", "bare@lib.enq", "left@lib.enq", "other@lib.enq"],
+            "import facade::{Alias as Selected,Again,Choice,Data,Private}\nimport bare::*\nimport left::*\nimport other::{Shared as Alias}\nstruct Item {}",)
+    ]
+    let mut ast = Vec[Statement]::new()
+    for module in modules {
+        ast.extend(module.ast)
+    }
+    let mut correct = true
+    for stable in vec![false, true] {
+        let mut ctx = collect_context_with_abi(ast, modules, host_target(), Vec[str]::new(), stable)
+        for _ in 0_usize..2_usize {
+            for position in 0_usize..modules.len() {
+                let module = modules.get_unchecked_borrowed(position)
+                for name in vec!["Shared", "Alias", "Selected", "Again", "Item", "Choice", "Hidden", "Data", "Private", "Missing"] {
+                    if resolve_type_collision_uncached(ctx, position, name) !=
+                    reference_resolve_type_collision_uncached(ctx, module, name) {
+                        correct = false
+                    }
+                    for depth in 0_usize..modules.len() + 2_usize {
+                        if exported_type_identity(ctx, position, name, depth) !=
+                        reference_exported_type_identity(ctx, module, name, depth) {
+                            correct = false
+                        }
+                    }
+                }
+            }
+        }
+        free_translation_indexes(ctx)
+    }
+    ret correct
+}
+
+#attr(test)
 fn translator_compact_module_labels_find_sdk() -> bool {
     let modules = vec![export_contract_module("first@lib.enq", Vec[str]::new(), "pub struct Value {}"),
         export_contract_module("platform@plugin/mod.enq", Vec[str]::new(), "pub struct Binding {}")]
@@ -16849,4 +17227,644 @@ fn translator_compact_module_labels_find_sdk() -> bool {
     module_source_at(ctx, 1_usize) == "platform@plugin/mod.enq"
     free_translation_indexes(ctx)
     ret correct
+}
+
+/// Previous typed module plus its function input identities. The caller binds
+/// this value to the same checked declaration/template context as the new AST.
+pub struct FunctionLoweringDelta {
+    index: usize
+    previous: Module
+    revisions: Vec[str]
+}
+
+pub fn lowering_module_revisions(module: TranslationModule) -> Vec[str] {
+    let mut revisions = Vec[str]::new()
+    for statement in module.ast {
+        match statement {
+            Statement::Function(item) => {
+                revisions.push(lowering_function_key(module.module_id, item))
+            }
+            Statement::Impl(item) => {
+                for method in item.methods {
+                    revisions.push(lowering_method_key(module.module_id, item, method))
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret revisions
+}
+
+fn ordinary_delta_function(item: FunctionItem) -> bool {
+    if item.body.is_none() || item.ret_type.is_none() || item.is_async || item.is_extern ||
+    !item.generics.is_empty() || !item.decorators.is_empty() || !item.attrs.is_empty() || function_uses_reflection(item) {
+        ret false
+    }
+    // Generated helpers still use the complete module adapter. The initial
+    // ordinary-body delta must never strand an old closure/worker definition.
+    let syntax = stringify(encode_lowered_function_input(item, "delta"))
+    ret !syntax.contains("\"Closure\"") && !syntax.contains("\"Spawn\"") && !syntax.contains("\"Ehir\"")
+}
+
+fn function_delta_ast(module: TranslationModule, previous: Vec[str]) -> Option[Vec[Statement]] {
+    let current = lowering_module_revisions(module)
+    if current.len() != previous.len() {
+        ret Option::None
+    }
+    let mut ast = Vec[Statement]::new()
+    let mut ordinal = 0_usize
+    for statement in module.ast {
+        match statement {
+            Statement::Function(item) => {
+                let changed = current.get(ordinal) != previous.get(ordinal)
+                ordinal += 1_usize
+                if changed {
+                    if !ordinary_delta_function(item) {
+                        ret Option::None
+                    }
+                    ast.push(statement)
+                }
+            }
+            Statement::Impl(item) => {
+                let mut methods = Vec[FunctionItem]::new()
+                for method in item.methods {
+                    let changed = current.get(ordinal) != previous.get(ordinal)
+                    ordinal += 1_usize
+                    if changed {
+                        if !item.generics.is_empty() || !ordinary_delta_function(method) {
+                            ret Option::None
+                        }
+                        methods.push(method)
+                    }
+                }
+                if !methods.is_empty() {
+                    ast.push(Statement::Impl(ImplStmt {
+                                item.documentation, item.generics, item.trait_name,
+                                item.trait_args, item.target, methods, item.source_name, item.line, item.column
+                            }
+                        ))
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    if ast.is_empty() {
+        ret Option::None
+    }
+    ret Option::Some(ast)
+}
+
+fn delta_callable_key(owner: str, function: FnDirective) -> str {
+    ret owner + "\n" + function.name
+}
+fn delta_impl_key(item: ImplDirective) -> str {
+    ret item.trait_name + "\n" + type_to_string(item.for_type)
+}
+
+fn patch_function_delta(previous: Module, replacement: Module) -> Option[Module] {
+    let mut changed = Vec[str]::new()
+    let mut owners = Vec[str]::new()
+    for directive in replacement.directives {
+        match directive {
+            Directive::Function(item) => {
+                changed.push(delta_callable_key("", item))
+                owners.push(function_body_identity(previous.name, "", item.name))
+            }
+            Directive::Impl(item) => {
+                let key = delta_impl_key(item)
+                for method in item.methods {
+                    changed.push(delta_callable_key(key, method))
+                    owners.push(function_body_identity(previous.name, type_to_string(item.for_type), method.name))
+                }
+            }
+            _ => {
+                ret Option::None
+            }
+        }
+    }
+    for directive in previous.directives {
+        let name = match directive {
+            Directive::Struct(item) => item.name
+            Directive::Impl(item) => type_to_string(item.for_type)
+            _ => ""
+        }
+        for owner in owners {
+            if name.contains("_f" + owner + "_") {
+                ret Option::None
+            }
+        }
+    }
+    let mut directives = Vec[Directive]::new()
+    let mut replaced = 0_usize
+    for directive in previous.directives {
+        match directive {
+            Directive::Function(item) => {
+                let mut value = Option[FnDirective]::None
+                for candidate in replacement.directives {
+                    match candidate {
+                        Directive::Function(next) => {
+                            if next.name == item.name {
+                                value = Option[FnDirective]::Some(next) replaced += 1_usize
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                directives.push(Directive::Function(value.unwrap_or(item)))
+            }
+            Directive::Impl(item) => {
+                let key = delta_impl_key(item)
+                let mut methods = Vec[FnDirective]::new()
+                for method in item.methods {
+                    let mut value = Option[FnDirective]::None
+                    for candidate in replacement.directives {
+                        match candidate {
+                            Directive::Impl(next) => {
+                                if delta_impl_key(next) == key {
+                                    for next_method in next.methods {
+                                        if method.name == next_method.name {
+                                            value = Option[FnDirective]::Some(next_method) replaced += 1_usize
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                            }
+                        }
+                    }
+                    methods.push(value.unwrap_or(method))
+                }
+                directives.push(Directive::Impl(ImplDirective {
+                            item.trait_name, item.trait_args,
+                            item.for_type, item.generics, methods
+                        }
+                    ))
+            }
+            _ => {
+                directives.push(directive)
+            }
+        }
+    }
+    if replaced != changed.len() || replaced == 0_usize {
+        ret Option::None
+    }
+    ret Option::Some(Module {
+            previous.name, previous.imports, previous.documentation,
+            previous.symbol_documentation, directives
+        }
+    )
+}
+
+fn translate_function_delta(ctx: mut TranslatorContext, module: TranslationModule, target: TargetSpec,
+    delta: FunctionLoweringDelta,) -> Option[TranslatedModuleChunk] {
+    if delta.previous.name != module.module_id {
+        ret Option::None
+    }
+    let ast = match function_delta_ast(module, delta.revisions) {
+        Some(ast) => ast None => {
+            ret Option::None
+        }
+    }
+    let mut reflection_names = Vec[str]::new()
+    for template in ctx.reflection_templates {
+        reflection_names.push(template.item.name)
+    }
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => {
+                if calls_reflection_templates(item, reflection_names) {
+                    ret Option::None
+                }
+            }
+            Statement::Impl(item) => {
+                for method in item.methods {
+                    if calls_reflection_templates(method, reflection_names) {
+                        ret Option::None
+                    }
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    let selected = TranslationModule {
+        module.module_id, module.source_name, module.source, module.documentation,
+        module.imports, ast, module.features, module.work_weight
+    }
+    // The filtered AST has different lexical ordinals. Recompute its input
+    // keys rather than looking them up by positions in the complete source.
+    let keys = ctx.function_key_index
+    ctx.function_key_index = 0_usize
+    let lowered = translate_module_chunk(ctx, selected, target, delta.index)
+    ctx.function_key_index = keys
+    match patch_function_delta(delta.previous, lowered.module) {
+        Some(module) => {
+            let mut changed = 0_usize
+            for statement in ast {
+                match statement {
+                    Statement::Function(_) => {
+                        changed += 1_usize
+                    }
+                    Statement::Impl(item) => {
+                        changed += item.methods.len()
+                    }
+                    _ => {
+                    }
+                }
+            }
+            ctx.functions_reused += delta.revisions.len() - changed
+            ret Option::Some(TranslatedModuleChunk { delta.index, module })
+        }
+        None => {
+            ret Option::None
+        }
+    }
+    ret Option::None
+}
+
+#attr(test)
+fn translation_source_frame_preserves_unicode_and_line_endings() -> bool {
+    let mut source = ""
+    for _index in 0_usize..4096_usize {
+        source += "// unicode: строка\r\n"
+    }
+    source += "последняя\rстрока\r\n"
+    ret translation_source_line(source, 4096_usize) == "последняястрока" &&
+    translation_source_line(source, 4097_usize) == "" && translation_source_line(source, 4098_usize) == "" &&
+    translation_source_line("одна строка", 0_usize) == "одна строка"
+}
+
+fn encode_translation_environment(ctx: TranslatorContext, identity: str) -> Result[str, str] {
+    let mut functions = Vec[StoredTranslationFunction]::new()
+    for item in ctx.functions {
+        functions.push(StoredTranslationFunction {
+                item.name, item.emitted_name, item.source_name, item.ret_type, item.params, item.sending_params, item.frozen_params, item.readonly_self, item.has_receiver, item.generics, item.is_extern, item.is_async, item.output_type, item.returns_sending, item.returns_frozen, item.is_static
+            }
+        )
+    }
+    let mut traits = Vec[StoredTranslationTrait]::new()
+    for item in ctx.traits {
+        let mut methods = Vec[str]::new()
+        for method in item.methods {
+            methods.push(encode_function_snapshot(method))
+        }
+        traits.push(StoredTranslationTrait {
+                item.plugin_interface, item.name, encode_generic_snapshot(item.generics), item.bases, methods, item.source_name, item.line, item.column
+            }
+        )
+    }
+    let mut implementations = Vec[StoredTranslationImpl]::new()
+    for item in ctx.trait_impls {
+        implementations.push(StoredTranslationImpl {
+                item.trait_name, item.trait_args, item.target, encode_generic_snapshot(item.generics)
+            }
+        )
+    }
+    let mut generics = Vec[StoredTranslationGeneric]::new()
+    for item in ctx.generic_callables {
+        generics.push(StoredTranslationGeneric { item.name, encode_generic_snapshot(item.params) })
+    }
+    let mut decorators = Vec[StoredTranslationDecorator]::new()
+    for item in ctx.decorators {
+        decorators.push(StoredTranslationDecorator {
+                item.owner, encode_function_snapshot(item.item)
+            }
+        )
+    }
+    let mut fields = Vec[StoredTranslationField]::new()
+    for item in ctx.fields {
+        fields.push(StoredTranslationField {
+                item.owner, item.field, item.typ, item.index, item.generic_names
+            }
+        )
+    }
+    let mut variants = Vec[StoredTranslationVariant]::new()
+    for item in ctx.enum_variants {
+        variants.push(StoredTranslationVariant {
+                item.path, item.owner, item.payload_type, item.generics, item.payload_arity
+            }
+        )
+    }
+    let mut reflection_templates = Vec[StoredTranslationReflection]::new()
+    for item in ctx.reflection_templates {
+        reflection_templates.push(StoredTranslationReflection {
+                item.name, encode_function_snapshot(item.item)
+            }
+        )
+    }
+    let mut modules = Vec[StoredTranslationModule]::new()
+    let mut declaration_keys = Vec[str]::new()
+    for module in ctx.modules {
+        for statement in module.ast {
+            match statement {
+                Statement::Function(item) => {
+                    declaration_keys.push(lowering_function_key(module.module_id, query_function_declaration(item)))
+                }
+                Statement::Impl(item) => {
+                    for method in item.methods {
+                        declaration_keys.push(lowering_method_key(module.module_id, item, query_function_declaration(method)))
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        modules.push(StoredTranslationModule {
+                module.module_id, module.source_name, module.imports, module.features,
+                stringify(encode_metadata_ast(translation_environment_declarations(module.ast))),
+                stringify(encode_metadata_documentation(module.documentation))
+            }
+        )
+    }
+    let mut source_aliases = Vec[StoredTranslationSourceAlias]::new()
+    for function in ctx.functions {
+        let position = lookup_module_source_alias(ctx.module_index, function.source_name)
+        if position != 0_usize {
+            source_aliases.push(StoredTranslationSourceAlias {
+                    function.source_name, position - 1_usize
+                }
+            )
+        }
+    }
+    let artifact = TranslationEnvironmentArtifact {
+        2_u32, identity, functions, ctx.types, traits, implementations,
+        generics, decorators, fields, variants, ctx.extern_functions, ctx.borrowed_return_functions,
+        ctx.borrowed_self_functions, reflection_templates, modules, source_aliases, declaration_keys
+    }
+    ret Result::Ok(prepared_bytes_payload(encode_snapshot_TranslationEnvironmentArtifact(artifact, identity)?))
+}
+
+fn restore_translation_environment(modules: Vec[TranslationModule], target: TargetSpec, identity: str,
+    payload: str,) -> Result[TranslatorContext, str] {
+    let artifact = decode_snapshot_TranslationEnvironmentArtifact(prepared_payload_bytes(payload), identity)?
+    if artifact.schema != 2_u32 || artifact.identity != identity || identity.is_empty() {
+        ret Result::Err("lowering environment identity mismatch")
+    }
+
+    let mut functions = Vec[FunctionType]::new()
+    for item in artifact.functions {
+        functions.push(FunctionType {
+                item.name, item.emitted_name, item.source_name, item.ret_type, item.params, item.sending_params, item.frozen_params, item.readonly_self, item.has_receiver, item.generics, item.is_extern, item.is_async, item.output_type, item.returns_sending, item.returns_frozen, item.is_static
+            }
+        )
+    }
+    let mut traits = Vec[TraitType]::new()
+    for item in artifact.traits {
+        let mut methods = Vec[FunctionItem]::new()
+        for payload in item.methods {
+            methods.push(decode_function_snapshot(payload)?)
+        }
+        traits.push(TraitType {
+                item.plugin_interface, item.name, decode_generic_snapshot(item.generics)?, item.bases, methods, item.source_name, item.line, item.column
+            }
+        )
+    }
+    let mut trait_impls = Vec[TraitImplType]::new()
+    for item in artifact.implementations {
+        trait_impls.push(TraitImplType {
+                item.trait_name, item.trait_args, item.target, decode_generic_snapshot(item.generics)?
+            }
+        )
+    }
+    let mut generic_callables = Vec[GenericCallable]::new()
+    for item in artifact.generics {
+        generic_callables.push(GenericCallable { item.name, decode_generic_snapshot(item.params)? })
+    }
+    let mut decorators = Vec[DecoratorType]::new()
+    for item in artifact.decorators {
+        decorators.push(DecoratorType { item.owner, decode_function_snapshot(item.item)? })
+    }
+    let mut fields = Vec[StructFieldType]::new()
+    for item in artifact.fields {
+        fields.push(StructFieldType {
+                item.owner, item.field, item.typ, item.index, item.generic_names
+            }
+        )
+    }
+    let mut enum_variants = Vec[EnumVariantType]::new()
+    for item in artifact.variants {
+        enum_variants.push(EnumVariantType {
+                item.path, item.owner, item.payload_type, item.generics, item.payload_arity
+            }
+        )
+    }
+    let mut reflection_templates = Vec[ReflectionSpecialization]::new()
+    for item in artifact.reflection_templates {
+        reflection_templates.push(ReflectionSpecialization {
+                item.name, decode_function_snapshot(item.item)?
+            }
+        )
+    }
+    for function in functions {
+        if function.params.len() != function.sending_params.len() || function.params.len() != function.frozen_params.len() {
+            ret Result::Err("invalid lowering function parameters")
+        }
+    }
+    for alias in artifact.source_aliases {
+        if alias.module >= modules.len() {
+            ret Result::Err("invalid lowering declaration module")
+        }
+    }
+    let mut ctx = empty_translation_context(modules, target, Vec[str]::new(), true)
+    for alias in artifact.source_aliases {
+        index_module_source_alias(ctx.module_index, alias.source_name, alias.module)
+    }
+    for function in functions {
+        if lookup_module_source_alias(ctx.module_index, function.source_name) == 0_usize {
+            free_translation_indexes(ctx)
+            ret Result::Err("unknown lowering declaration source")
+        }
+    }
+    for typ in artifact.types {
+        remember_type(ctx, typ)
+    }
+    for function in functions {
+        let previous = unsafe {
+            encore_strmap_get(ctx.function_heads, function.name)
+        }
+        ctx.function_next.push(previous)
+        ctx.functions.push(function)
+        if function.is_async {
+            ctx.async_functions.push(ctx.functions.len() - 1_usize)
+        }
+        let key = function.source_name + "\n" + function.name
+        let count = unsafe {
+            encore_strmap_get(ctx.function_overload_counts, key)
+        }
+        unsafe {
+            encore_strmap_put(ctx.function_heads, function.name, ctx.functions.len())
+            encore_strmap_put(ctx.function_overload_counts, key, if count == 0_usize {
+                    2_usize
+                } else {
+                    count + 1_usize
+                }
+                ,
+            )
+        }
+    }
+    for field in fields {
+        ctx_add_field(ctx, field)
+    }
+    for variant in enum_variants {
+        let previous = aggregate_member_head(ctx, variant.owner, true)
+        ctx.enum_variants.push(variant)
+        index_aggregate_member(ctx, variant.owner, true, ctx.enum_variants.len(), previous)
+        let _inserted = unsafe {
+            encore_strset_insert(ctx.owning_type_index, variant.owner)
+        }
+    }
+    ctx.traits = traits
+    ctx.trait_impls = trait_impls
+    ctx.generic_callables = generic_callables
+    ctx.decorators = decorators
+    ctx.extern_functions = artifact.extern_functions
+    ctx.borrowed_return_functions = artifact.borrowed_return_functions
+    ctx.borrowed_self_functions = artifact.borrowed_self_functions
+    ctx.reflection_templates = reflection_templates
+    ret Result::Ok(ctx)
+}
+
+/// Export/name lookup and reflection layout only need declarations. Runtime
+/// bodies remain in their independent typed function artifacts, while trait
+/// defaults and compile-time templates already belong to the environment.
+fn translation_environment_declarations(ast: Vec[Statement]) -> Vec[Statement] {
+    let mut declarations = Vec[Statement]::new()
+    for statement in ast {
+        match statement {
+            Statement::Function(item) => {
+                declarations.push(Statement::Function(FunctionItem {
+                            item.attrs, item.decorators, item.is_public,
+                            item.is_extern, item.is_async, item.name, item.documentation, item.generics, item.params,
+                            item.ret_type, item.returns_sending, item.returns_frozen, Option[ParsedBlock]::None,
+                            item.source_name, item.line, item.column
+                        }
+                    ))
+            }
+            Statement::Trait(item) => {
+                declarations.push(Statement::Trait(TraitStmt {
+                            item.is_public, item.name, item.documentation,
+                            item.generics, item.bases, Vec[FunctionItem]::new(), item.source_name, item.line, item.column, item.attrs
+                        }
+                    ))
+            }
+            Statement::Import(_) => {
+                declarations.push(statement)
+            }
+            Statement::Struct(_) => {
+                declarations.push(statement)
+            }
+            Statement::EnumItem(_) => {
+                declarations.push(statement)
+            }
+            _ => {
+            }
+        }
+    }
+    ret declarations
+}
+
+fn environment_module_declarations(artifact: TranslationEnvironmentArtifact) -> Result[Vec[TranslationModule], str] {
+    let mut modules = Vec[TranslationModule]::new()
+    for module in artifact.modules {
+        let ast = decode_metadata_ast(parse(module.declarations).unwrap_or(Json::Null))?
+        let documentation = decode_metadata_documentation(parse(module.documentation).unwrap_or(Json::Null))?
+        modules.push(TranslationModule {
+                module.id, module.source_name, "", documentation,
+                module.imports, ast, module.features, 0_usize
+            }
+        )
+    }
+    ret Result::Ok(modules)
+}
+
+/// Lower only explicitly selected ordinary bodies. The caller proves unchanged
+/// declaration/doc/lookup identities and supplies their accepted environment;
+/// neither source nor typed bodies of sibling functions are opened here.
+pub fn translate_function_queries_from_environment(changed: Vec[TranslationModule], target: TargetSpec,
+    identity: str, payload: str,) -> Result[CachedCompilationChunks, str] {
+    let artifact = decode_snapshot_TranslationEnvironmentArtifact(prepared_payload_bytes(payload), identity)?
+    let modules = environment_module_declarations(artifact)?
+    let mut ctx = restore_translation_environment(modules, target, identity, payload)?
+    let result = translate_function_queries_with_context(ctx, changed, target, artifact.declaration_keys)
+    free_translation_indexes(ctx)
+    ret result
+}
+
+fn translate_function_queries_with_context(ctx: mut TranslatorContext, changed: Vec[TranslationModule], target: TargetSpec,
+    declarations: Vec[str],) -> Result[CachedCompilationChunks, str] {
+    let mut reflection_names = Vec[str]::new()
+    for template in ctx.reflection_templates {
+        reflection_names.push(template.item.name)
+    }
+    // Validate the complete request before lowering any selected body.
+    let mut selected_modules = Vec[str]::new()
+    let mut selected_declarations = Vec[str]::new()
+    for module in changed {
+        let position = lookup_module_source_alias(ctx.module_index, module.module_id)
+        if position == 0_usize || lookup_module_source_alias(ctx.module_index, module.source_name) != position {
+            ret Result::Err("unknown function query module")
+        }
+        if contains_str(selected_modules, module.module_id) {
+            ret Result::Err("duplicate function query module")
+        }
+        selected_modules.push(module.module_id)
+        for statement in module.ast {
+            match statement {
+                Statement::Function(item) => {
+                    if !ordinary_delta_function(item) || calls_reflection_templates(item, reflection_names) ||
+                    lookup_module_source_alias(ctx.module_index, item.source_name) != position {
+                        ret Result::Err("function needs complete lowering")
+                    }
+                    let key = lowering_function_key(module.module_id, query_function_declaration(item))
+                    if !contains_str(declarations, key) || contains_str(selected_declarations, key) {
+                        ret Result::Err("function declaration changed")
+                    }
+                    selected_declarations.push(key)
+                }
+                Statement::Impl(item) => {
+                    if !item.generics.is_empty() {
+                        ret Result::Err("implementation needs complete lowering")
+                    }
+                    for method in item.methods {
+                        if !ordinary_delta_function(method) || calls_reflection_templates(method, reflection_names) ||
+                        lookup_module_source_alias(ctx.module_index, method.source_name) != position {
+                            ret Result::Err("method needs complete lowering")
+                        }
+                        let key = lowering_method_key(module.module_id, item, query_function_declaration(method))
+                        if !contains_str(declarations, key) || contains_str(selected_declarations, key) {
+                            ret Result::Err("method declaration changed")
+                        }
+                        selected_declarations.push(key)
+                    }
+                }
+                _ => {
+                    ret Result::Err("declaration changes need complete lowering")
+                }
+            }
+        }
+    }
+    ctx.record_function_cache = true
+    ctx.cached_function_index = unsafe {
+        encore_strmap_new()
+    }
+    let mut chunks = Vec[TranslatedModuleChunk]::new()
+    for module in changed {
+        let position = lookup_module_source_alias(ctx.module_index, module.module_id)
+        chunks.push(translate_module_chunk(ctx, module, target, position - 1_usize))
+    }
+    ret Result::Ok(CachedCompilationChunks {
+            chunks, ctx.lowered_functions, ctx.functions_reused, Option[str]::None, true
+        }
+    )
+}
+
+fn query_function_declaration(item: FunctionItem) -> FunctionItem {
+    ret FunctionItem {
+        item.attrs, item.decorators, item.is_public, item.is_extern, item.is_async, item.name,
+        item.documentation, item.generics, item.params, item.ret_type, item.returns_sending, item.returns_frozen,
+        Option[ParsedBlock]::None, item.source_name, item.line, item.column
+    }
 }

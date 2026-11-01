@@ -12,6 +12,7 @@
 #include <string.h>
 #include <errno.h>
 #include <stdatomic.h>
+#include <wchar.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -42,6 +43,36 @@ static inline wchar_t *encore_build_artifact_wide(const char *text) {
     return wide;
 }
 
+/* Cache snapshots can exceed MAX_PATH after adding content-addressed
+ * directories and atomic-write suffixes. Resolve first so extended paths keep
+ * ordinary relative-path, drive-relative, slash and dot-component semantics.
+ * Keep the plain UTF-16 converter separate for environment names and values. */
+static inline wchar_t *encore_build_artifact_path(const char *text) {
+    if (text == NULL || *text == '\0') return NULL;
+    wchar_t *wide = encore_build_artifact_wide(text);
+    if (wide == NULL) return NULL;
+    size_t length = wcslen(wide);
+    if (length >= 4 && wide[0] == L'\\' && wide[1] == L'\\' &&
+        (wide[2] == L'?' || wide[2] == L'.') && wide[3] == L'\\') return wide;
+    DWORD required = GetFullPathNameW(wide, 0, NULL, NULL);
+    if (required == 0 || required > 32760) { free(wide); return NULL; }
+    wchar_t *absolute = malloc((size_t)required * sizeof(*absolute));
+    if (absolute == NULL) { free(wide); return NULL; }
+    DWORD count = GetFullPathNameW(wide, required, absolute, NULL);
+    free(wide);
+    if (count == 0 || count >= required) { free(absolute); return NULL; }
+    for (DWORD i = 0; i < count; ++i) if (absolute[i] == L'/') absolute[i] = L'\\';
+    bool unc = count >= 2 && absolute[0] == L'\\' && absolute[1] == L'\\';
+    size_t prefix = unc ? 8 : 4, skip = unc ? 2 : 0;
+    wchar_t *extended = malloc(((size_t)count - skip + prefix + 1) * sizeof(*extended));
+    if (extended != NULL) {
+        memcpy(extended, unc ? L"\\\\?\\UNC\\" : L"\\\\?\\", prefix * sizeof(*extended));
+        memcpy(extended + prefix, absolute + skip, ((size_t)count - skip + 1) * sizeof(*extended));
+    }
+    free(absolute);
+    return extended;
+}
+
 /* Delete-sharing readers can leave a just-replaced destination temporarily
  * delete-pending. Retry that OS state without exposing a partial new record;
  * permanent failures remain bounded, just like receipt reads below. */
@@ -61,7 +92,7 @@ static inline size_t encore_build_cache_lock_open(const char *path) {
     encore_build_cache_lock *lock = malloc(sizeof(*lock));
     if (lock == NULL) return 0;
 #ifdef _WIN32
-    wchar_t *wide = encore_build_artifact_wide(path);
+    wchar_t *wide = encore_build_artifact_path(path);
     if (wide == NULL) { free(lock); return 0; }
     lock->file = CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL, OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
@@ -117,13 +148,13 @@ static inline bool encore_build_artifact_write(const char *path, const void *dat
     if (temporary == NULL) return false;
 #ifdef _WIN32
     wchar_t *wide_temp = NULL;
-    wchar_t *wide_path = encore_build_artifact_wide(path);
+    wchar_t *wide_path = encore_build_artifact_path(path);
     HANDLE file = INVALID_HANDLE_VALUE;
     for (size_t attempt = 0; attempt < 32; ++attempt) {
         uint64_t serial = atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
         snprintf(temporary, strlen(path) + 80, "%s.tmp-%lu-%llu", path, (unsigned long)GetCurrentProcessId(), (unsigned long long)serial);
         free(wide_temp);
-        wide_temp = encore_build_artifact_wide(temporary);
+        wide_temp = encore_build_artifact_path(temporary);
         if (wide_temp == NULL) break;
         file = CreateFileW(wide_temp, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
         if (file != INVALID_HANDLE_VALUE || (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS)) break;
@@ -177,7 +208,7 @@ static inline char *encore_build_artifact_read(const char *path, size_t *length)
     *length = 0;
     if (path == NULL) return NULL;
 #ifdef _WIN32
-    wchar_t *wide = encore_build_artifact_wide(path);
+    wchar_t *wide = encore_build_artifact_path(path);
     if (wide == NULL) return NULL;
     HANDLE file = INVALID_HANDLE_VALUE;
     for (size_t attempt = 0; attempt < 100; ++attempt) {

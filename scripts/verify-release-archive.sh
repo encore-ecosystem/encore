@@ -4,6 +4,7 @@ triple=${1:?target triple required}
 release=${2:?release required}
 archive=${3:?archive required}
 provenance=${4:?provenance required}
+jq -e '.profile == "extreme" and .lsp_profile == "extreme"' "$provenance" >/dev/null
 root="encore-$release-$triple"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT

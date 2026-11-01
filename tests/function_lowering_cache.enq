@@ -1,9 +1,17 @@
 //! Replayed function fragments, including closures, must match fresh lowering.
 import refrain::frontend::lexer::Lexer
+import core::fmt::Debug
+import core::option::Option
+
+import std::os::{mkdir_all, remove_dir_all}
+import std::path::Path
+import std::time::perf_counter_ns
 import std::vec::Vec
 
+import refrain::cache_identity::compiler_content_digest
 import refrain::frontend::parser::{Parser, Statement}
 import refrain::frontend::translator::{CachedCompilationChunks, CachedFunctionChunk, TranslationModule, assemble_ehir_module_bundle, lowering_function_key, lowering_function_site, translate_cached_compilation_unit_to_ehir_chunks, translate_keyed_compilation_unit_to_ehir_chunks}
+import refrain::modes::build_lowering_cache::{commit_lowered_function, restore_lowered_function}
 import refrain::target::host_target
 
 fn translate(source: str, cached: Vec[CachedFunctionChunk], keyed: bool) -> CachedCompilationChunks {
@@ -34,10 +42,43 @@ fn translate(source: str, cached: Vec[CachedFunctionChunk], keyed: bool) -> Cach
     ret translate_cached_compilation_unit_to_ehir_chunks(modules, host_target(), selected, cached)
 }
 
+fn persisted(functions: Vec[CachedFunctionChunk]) -> Vec[CachedFunctionChunk] {
+    let directory = Path::new("target/function-snapshot-" + Debug::fmt(perf_counter_ns())).resolve()
+    if mkdir_all(directory.as_str()) != 0 {
+        ret Vec[CachedFunctionChunk]::new()
+    }
+    let root = Option[Path]::Some(directory)
+    let context = compiler_content_digest("checked lowering fixture")
+    let mut restored = Vec[CachedFunctionChunk]::new()
+    for function in functions {
+        if commit_lowered_function(root, context, function).is_err() {
+            break
+        }
+        match restore_lowered_function(root, context, function.key) {
+            Ok(value) => {
+                match value {
+                    Some(chunk) => {
+                        restored.push(chunk)
+                    }
+                    None => {
+                        break
+                    }
+                }
+            }
+            Err(_) => {
+                break
+            }
+        }
+    }
+    let _removed = remove_dir_all(directory.as_str())
+    ret restored
+}
+
 fn parity(prefix: str, count: usize) -> bool {
     let before = translate(prefix + "\nfn changed() -> u32 { ret 1 }\n", Vec[CachedFunctionChunk]::new(), false)
     let source = prefix + "\nfn changed() -> u32 { ret 2 }\n"
-    let replayed = translate(source, before.functions, true)
+    let restored = persisted(before.functions)
+    let replayed = translate(source, restored, true)
     let fresh = translate(source, Vec[CachedFunctionChunk]::new(), false)
     ret replayed.functions_reused == count && replayed.functions.len() == 1 &&
     assemble_ehir_module_bundle(replayed.modules, 1, "cache@main.enq") ==
@@ -47,11 +88,32 @@ fn parity(prefix: str, count: usize) -> bool {
 fn relocated(prefix: str) -> bool {
     let before = translate(prefix, Vec[CachedFunctionChunk]::new(), false)
     let source = "\n\n\n" + prefix
-    let replayed = translate(source, before.functions, true)
+    let restored = persisted(before.functions)
+    let replayed = translate(source, restored, true)
     let fresh = translate(source, Vec[CachedFunctionChunk]::new(), false)
     ret replayed.functions_reused == before.functions.len() && replayed.functions.len() == 0 &&
     assemble_ehir_module_bundle(replayed.modules, 1, "cache@main.enq") ==
     assemble_ehir_module_bundle(fresh.modules, 1, "cache@main.enq")
+}
+
+fn method_changed() -> bool {
+    let header = "struct Value { count: u32 } impl for Value { fn stable(self: Self) -> u32 { ret 7 } "
+    let before = translate(header + "fn read(self: Self) -> u32 { ret self.count + 1 } }", Vec[CachedFunctionChunk]::new(), false)
+    let source = header + "fn read(self: Self) -> u32 { ret self.count + 2 } }"
+    let replayed = translate(source, persisted(before.functions), true)
+    let fresh = translate(source, Vec[CachedFunctionChunk]::new(), false)
+    ret replayed.functions_reused == 1 && replayed.functions.len() == 1 &&
+    assemble_ehir_module_bundle(replayed.modules, 1, "cache@main.enq") ==
+    assemble_ehir_module_bundle(fresh.modules, 1, "cache@main.enq")
+}
+
+fn decorator_relocated() -> bool {
+    let source = "#attr(decorator) fn wrap[Args](func: Callable[Args, u32], args: Args) -> u32 { ret func(args) + 1_u32 }\n" +
+    "@wrap fn value() -> u32 { ret 40_u32 }\nfn main() -> u32 { ret value() }\n"
+    let before = translate(source, Vec[CachedFunctionChunk]::new(), false)
+    let moved = translate("\n\n\n" + source, persisted(before.functions), true)
+    ret assemble_ehir_module_bundle(before.modules, 1, "cache@main.enq") ==
+    assemble_ehir_module_bundle(moved.modules, 1, "cache@main.enq")
 }
 
 fn main() -> u32 {
@@ -76,6 +138,21 @@ fn main() -> u32 {
         "fn stable(base: u32) -> u32 { let outer: dyn Handler = | value | { " +
         "let inner: dyn Handler = | next | base + next ret inner.handle(value) } ret outer.handle(2_u32) }\n") {
         ret 5
+    }
+    if !parity("struct Value { count: u32 } impl for Value { fn read(self: Self) -> u32 { ret self.count } }", 1) {
+        ret 6
+    }
+    if !relocated("trait Handler { fn handle(self: Self, value: u32) -> u32 } " +
+        "struct Value { count: u32 } impl for Value { fn read(self: Self) -> u32 { " +
+        "let handler: dyn Handler = | value | self.count + value ret handler.handle(2_u32) } }") {
+        ret 7
+    }
+    if !parity("struct Left {} struct Right {} impl for Left { fn read(self: Self) -> u32 { ret 1 } } " +
+        "impl for Right { fn read(self: Self) -> u32 { ret 2 } }", 2,) || !method_changed() {
+        ret 8
+    }
+    if !decorator_relocated() {
+        ret 9
     }
     ret 0
 }

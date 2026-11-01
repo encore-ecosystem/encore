@@ -1,0 +1,147 @@
+//! Private checkpoints reference independently verified compressed modules.
+//! Metadata/templates remain self-contained public package artifacts.
+import core::option::Option
+import core::result::Result
+
+import std::path::Path
+import std::vec::Vec
+
+import ehirlib::{Module, ModuleBundle, decode_typed_bundle, decode_typed_module, encode_typed_bundle, make_module_bundle}
+import json::{Json, parse, stringify}
+
+import mod::build_cache::valid_key
+import mod::build_lowering_cache::restore_lowered_module
+import refrain::frontend::semantic_slice::SemanticKeyIndex
+
+pub struct IndexedModuleBundle {
+    bundle: ModuleBundle
+    identities: Vec[(str, str)]
+}
+struct ModuleIndex {
+    entry: str
+    identities: Vec[(str, str)]
+}
+fn is_index(payload: str) -> bool {
+    ret payload.byte_len() >= 9_usize && payload.slice_bytes(0_usize, 9_usize) == "ENQMI001\n"
+}
+
+/// Producers already committed these module identities while lowering or
+/// normalizing. Contention/GC may remove a chunk; restoration then rebuilds it.
+pub fn encode_compilation_checkpoint(bundle: ModuleBundle, identities: Vec[(str, str)], identity: str,
+    cache: Option[Path],) -> Result[str, str] {
+    let mut indexed = cache.is_some() && identities.len() == bundle.modules.len() && identities.len() <= 65536_usize && valid_key(identity)
+    let mut seen = SemanticKeyIndex::new(identities.len())
+    let mut rows = Vec[Json]::new()
+    for ordinal in 0_usize..identities.len() {
+        let item = identities.get_unchecked_borrowed(ordinal)
+        if !valid_key(item.1) || seen.get(item.0) != 0_usize ||
+        bundle.modules.get(ordinal).is_none() || bundle.modules.get_unchecked_borrowed(ordinal).name != item.0 {
+            indexed = false break
+        }
+        seen.set(item.0, ordinal)
+        rows.push(Json::Array(vec![Json::String(item.0), Json::String(item.1)]))
+    }
+    if !bundle.entry_module.is_empty() && seen.get(bundle.entry_module) == 0_usize {
+        indexed = false
+    }
+    if !indexed {
+        ret encode_typed_bundle(bundle, identity)
+    }
+    let payload = "ENQMI001\n" + stringify(Json::Object(vec![("identity", Json::String(identity)),
+                ("entry", Json::String(bundle.entry_module)),("modules", Json::Array(rows))]))
+    if payload.byte_len() > 4194304_usize {
+        ret encode_typed_bundle(bundle, identity)
+    }
+    ret Result::Ok(payload)
+}
+
+fn decode_index(payload: str, identity: str) -> Result[ModuleIndex, str] {
+    if !is_index(payload) || payload.byte_len() > 4194304_usize {
+        ret Result::Err("invalid module checkpoint index")
+    }
+    let data = parse(payload.slice_bytes(9_usize, payload.byte_len() - 9_usize)).unwrap_or(Json::Null)
+    if data.get("identity").unwrap_or(Json::Null).as_str().unwrap_or("") != identity || !valid_key(identity) {
+        ret Result::Err("module checkpoint identity mismatch")
+    }
+    let entry = match data.get("entry").unwrap_or(Json::Null).as_str() {
+        Some(value) => value None => {
+            ret Result::Err("missing checkpoint entry")
+        }
+    }
+    let rows = match data.get("modules").unwrap_or(Json::Null).as_array() {
+        Some(value) => value None => {
+            ret Result::Err("missing checkpoint modules")
+        }
+    }
+    if rows.len() > 65536_usize {
+        ret Result::Err("module checkpoint collection limit")
+    }
+    let mut identities = Vec[(str, str)]::new()
+    let mut seen = SemanticKeyIndex::new(rows.len())
+    for row in rows {
+        let fields = row.as_array().unwrap_or(Vec[Json]::new())
+        let name = fields.get(0_usize).unwrap_or(Json::Null).as_str().unwrap_or("")
+        let key = fields.get(1_usize).unwrap_or(Json::Null).as_str().unwrap_or("")
+        if fields.len() != 2_usize || name.is_empty() || !valid_key(key) || seen.get(name) != 0_usize {
+            ret Result::Err("invalid checkpoint module identity")
+        }
+        seen.set(name, identities.len()) identities.push((name, key))
+    }
+    if !entry.is_empty() && seen.get(entry) == 0_usize {
+        ret Result::Err("checkpoint entry not found")
+    }
+    ret Result::Ok(ModuleIndex { entry, identities })
+}
+
+pub fn restore_compilation_checkpoint(payload: str, identity: str, cache: Option[Path]) -> Result[IndexedModuleBundle, str] {
+    if !is_index(payload) {
+        ret Result::Ok(IndexedModuleBundle {
+                decode_typed_bundle(payload, identity)?, Vec[(str, str)]::new()
+            }
+        )
+    }
+    let index = decode_index(payload, identity)?
+    let mut modules = Vec[Module]::new()
+    for item in index.identities {
+        let stored = match restore_lowered_module(cache, item.1)? {
+            Some(value) => value None => {
+                ret Result::Err("module checkpoint chunk missing")
+            }
+        }
+        let module = decode_typed_module(stored, item.1)?
+        if module.name != item.0 {
+            ret Result::Err("module checkpoint chunk name mismatch")
+        }
+        modules.push(module)
+    }
+    ret Result::Ok(IndexedModuleBundle {
+            make_module_bundle(index.entry, modules), index.identities
+        }
+    )
+}
+
+/// A missing/invalid chunk is a phase-cache miss before native consumers start.
+/// Ordinary complete archives need no private body chunks to remain usable.
+pub fn checkpoint_references_available(payload: str, identity: str, cache: Path) -> bool {
+    if !is_index(payload) {
+        ret true
+    }
+    let index = match decode_index(payload, identity) {
+        Ok(value) => value Err(_) => {
+            ret false
+        }
+    }
+    for item in index.identities {
+        match restore_lowered_module(Option[Path]::Some(cache), item.1) {
+            Ok(value) => {
+                if value.is_none() {
+                    ret false
+                }
+            }
+            Err(_) => {
+                ret false
+            }
+        }
+    }
+    ret true
+}

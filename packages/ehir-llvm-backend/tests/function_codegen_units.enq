@@ -1,0 +1,61 @@
+//! Function CGUs preserve the module emitter's precedence for duplicate symbols.
+import core::testing::assert
+import std::vec::Vec
+
+import ehir_core::parse_module_bundle_text
+
+import refrain::codegen::{emit_compact_unit_codegen_selected_parallel, emit_unit_codegen_selected_parallel, function_codegen_units, prepare_unit_codegen}
+
+fn main() -> u32 {
+    let source = "module collisions {\nstruct Counter {\nvalue: u32\n}\nstruct Other {\nvalue: u32\n}\n" +
+    "trait First {\nfn read(first: u32) -> u32\n}\ntrait Second {\nfn read(second: u32) -> u32\n}\n" +
+    "impl First for Counter {\nfn read(first: u32) -> u32 {\n$entry:\nret first: u32\n}\n}\n" +
+    "impl Second for Counter {\nfn read(second: u32) -> u32 {\n$entry:\nret second: u32\n}\n}\n" +
+    "fn Counter__read(third: u32) -> u32 {\n$entry:\nret third: u32\n}\n" +
+    "fn independent(value: u32) -> u32 {\n$entry:\nret value: u32\n}\n" +
+    "impl Other {\nfn read(other: u32) -> u32 {\n$entry:\nret other: u32\n}\n}\n}\n"
+    for target in vec!["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"] {
+        let original = prepare_unit_codegen(parse_module_bundle_text("", source), parse_module_bundle_text("", ""), target, 64_usize, 1_usize)
+        let unit = function_codegen_units(original)
+        if !assert(unit.owned.len() == 3_usize && unit.owned.get_unchecked_borrowed(0_usize).directives.len() == 3_usize) {
+            ret 1_u32
+        }
+        for compact in vec![false, true] {
+            let outputs = if compact {
+                emit_compact_unit_codegen_selected_parallel(unit, target, 64_usize, vec![0_usize, 1_usize, 2_usize], 2_usize)
+            } else {
+                emit_unit_codegen_selected_parallel(unit, target, 64_usize, vec![0_usize, 1_usize, 2_usize], 2_usize)
+            }
+            if !assert(outputs.len() == 3_usize) {
+                ret 2_u32
+            }
+            for item in outputs {
+                if !assert(item.diagnostic.is_empty()) {
+                    ret 3_u32
+                }
+            }
+            let mut counter = 0_usize
+            let mut other = 0_usize
+            let mut independent = 0_usize
+            for item in outputs {
+                if item.ir.contains("define i32 @Counter__read(") {
+                    counter += 1_usize
+                    if !assert(item.ir.contains("@Counter__read(i32 %first)") &&
+                        !item.ir.contains("@Counter__read(i32 %second)") && !item.ir.contains("@Counter__read(i32 %third)")) {
+                        ret 4_u32
+                    }
+                }
+                if item.ir.contains("define i32 @Other__read(i32 %other)") {
+                    other += 1_usize
+                }
+                if item.ir.contains("define i32 @independent(i32 %value)") {
+                    independent += 1_usize
+                }
+            }
+            if !assert(counter == 1_usize && other == 1_usize && independent == 1_usize) {
+                ret 5_u32
+            }
+        }
+    }
+    ret 0_u32
+}

@@ -90,3 +90,22 @@ size_t ehir_llvm_process_id(void) {
 size_t ehir_llvm_next_stage_id(void) {
     return atomic_fetch_add_explicit(&ehir_llvm_stage_sequence, 1, memory_order_relaxed);
 }
+
+#include "runtime_ir.h"
+extern char *encore_str_data(ehir_str value);
+extern size_t encore_str_size(ehir_str value);
+extern ehir_str encore_str_from_buffer(const char *bytes, size_t len);
+size_t ehir_llvm_declaration_index(ehir_str declarations) {
+    return (size_t)ehir_ir_index_new(encore_str_data(declarations), encore_str_size(declarations));
+}
+void ehir_llvm_declaration_index_free(size_t handle) {
+    ehir_ir_index_free((ehir_ir_index *)handle);
+}
+ehir_str ehir_llvm_compact_module(size_t handle, ehir_str body) {
+    size_t len = 0;
+    char *bytes = ehir_ir_emit((const ehir_ir_index *)handle, encore_str_data(body), encore_str_size(body), &len);
+    if (bytes == NULL) return encore_empty_str();
+    ehir_str result = encore_str_from_buffer(bytes, len);
+    free(bytes);
+    return result;
+}

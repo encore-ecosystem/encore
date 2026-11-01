@@ -1,9 +1,72 @@
 //! Exercise actual host script compilation, cwd, native linking and invalidation.
 import core::fmt::Debug
 import core::vec::Vec
+
+import std::os::{file_exists, file_sha256, read_dir, remove_file}
+
 import json::{Json, stringify}
-import refrain::ci_helpers::{Fixture, std_dependencies}
-import std::os::{file_exists, file_sha256}
+
+import refrain::ci_helpers::{Fixture, modified_ns, set_env, std_dependencies, unset_env}
+
+fn registry_script_leaf(fixture: Fixture, label: str, answer: u32) -> bool {
+    let source = label + "/source"
+    fixture.put(source + "/encore.toml", "[project]\nname=\"script_leaf\"\nversion=\"1.0.0\"\nbuild=\"build.enq\"\ndependencies=" + std_dependencies() + "\n[registry]\nindex=\"file:///invalid-dependency-registry\"\n")
+    fixture.put(source + "/src/lib.enq", "pub fn value() -> u32 { ret " + Debug::fmt(answer) + "_u32 }\n")
+    fixture.put(source + "/build.enq", script("{\"native\":{\"libraries\":[]}}", false))
+    if !fixture.tool("tar", vec!["-czf", label + "/leaf.tar.gz", "-C", source, "encore.toml", "src", "build.enq"]).success() {
+        ret false
+    }
+    let archive = fixture.root.join(label + "/leaf.tar.gz")
+    fixture.put(label + "/index/config.json", "{\"schema\":1,\"api\":\"/api/v1\"}")
+    fixture.put(label + "/index/api/v1/packages/script_leaf", "{\"name\":\"script_leaf\",\"versions\":[{\"version\":\"1.0.0\",\"archive\":" + stringify(Json::String("file://" + archive.as_str())) + ",\"checksum\":\"" + file_sha256(archive.as_str()) + "\",\"yanked\":false}]}")
+    ret true
+}
+
+// Like the registry fixtures in ci_registry, this uses POSIX absolute file URLs.
+#cfg(unix)
+#attr(test)
+fn integration_build_scripts_inherit_consumer_registry_and_lock() -> bool {
+    let fixture = Fixture::new("build-script-registry")
+    if !registry_script_leaf(fixture, "first", 42_u32) || !registry_script_leaf(fixture, "second", 43_u32) {
+        ret fixture.finish(false)
+    }
+    let dependencies = std_dependencies()
+    let provider = Fixture { fixture.root.join("native provider"), fixture.compiler }
+    provider.put("encore.toml", "[project]\nname=\"script_provider\"\nversion=\"0.0.0\"\nbuild=\"build.enq\"\ndependencies=" + dependencies.slice(0, dependencies.len() - 1) + ",\"index@script_leaf\"]\n[registry]\nindex=\"file:///invalid-provider-registry\"\n")
+    provider.put("src/lib.enq", "import script_leaf::value\npub fn answer() -> u32 { ret value() }\n")
+    provider.put("build.enq", script("{\"native\":{\"libraries\":[]}}", false))
+    let first = "file://" + fixture.root.join("first/index").as_str()
+    let second = "file://" + fixture.root.join("second/index").as_str()
+    let project = Fixture { fixture.root.join("consumer with spaces"), fixture.compiler }
+    project.put("encore.toml", "[project]\nname=\"script_consumer\"\nversion=\"0.0.0\"\ndependencies=[\"path@../native provider\"]\n[registry]\nindex=\"" + first + "\"\n")
+    project.put("src/main.enq", "import script_provider::answer\nfn main() -> u32 { ret answer() - 42_u32 }\n")
+    if !project.succeeds(vec!["sync"]) || !project.succeeds(vec!["run"]) || !file_exists(provider.root.join("script-executed").as_str()) || file_exists(project.root.join("script-executed").as_str()) {
+        ret fixture.finish(false)
+    }
+    let locked = project.read("encore.lock")
+    // A global default must not replace the consumer's explicit registry.
+    set_env("ENCORE_DEFAULT_INDEX", second)
+    if !project.succeeds(vec!["run"]) || project.read("encore.lock") != locked {
+        ret fixture.finish(false)
+    }
+    // A CLI environment override applies to every nested host compilation.
+    let override_project = Fixture { fixture.root.join("override consumer"), fixture.compiler }
+    override_project.put("encore.toml", project.read("encore.toml"))
+    override_project.put("src/main.enq", "import script_provider::answer\nfn main() -> u32 { ret answer() - 43_u32 }\n")
+    set_env("ENCORE_INDEX_URL", second)
+    let override_passed = override_project.succeeds(vec!["run"])
+    unset_env("ENCORE_INDEX_URL")
+    unset_env("ENCORE_DEFAULT_INDEX")
+    if !override_passed {
+        ret fixture.finish(false)
+    }
+    // Recompiling a script must use the locked archive even with no index.
+    if !fixture.tool("mv", vec!["first/index", "first/offline-index"]).success() || !fixture.tool("rm", vec!["first/leaf.tar.gz"]).success() {
+        ret fixture.finish(false)
+    }
+    provider.put("build.enq", script("{\"native\":{\"libraries\":[]}}", false) + "\n// offline rebuild\n")
+    ret fixture.finish(project.succeeds(vec!["run"]) && project.read("encore.lock") == locked)
+}
 
 fn script(metadata: str, fail: bool) -> str {
     ret "import std::os::{argv, write_file}\nfn main() -> u32 {\n" +
@@ -37,6 +100,25 @@ fn integration_native_build_scripts_contract() -> bool {
     }
     if !project.succeeds(vec!["build", "--timings"]) || !project.read("target/dev/encore-timings.json").contains("\"link_cache_hit\":true") {
         ret fixture.finish(false)
+    }
+    let mut script_binary = project.root.join("target/tests/bin")
+    let mut script_found = false
+    for name in read_dir(project.root.join("target/tests/bin").as_str()) {
+        if name.contains("build-script-") && !name.contains(".fingerprint") && !name.contains(".sha256") {
+            script_binary = project.root.join("target/tests/bin").join(name)
+            script_found = true break
+        }
+    }
+    if !script_found {
+        ret fixture.failure("missing compiled build script")
+    }
+    let script_digest = file_sha256(script_binary.as_str())
+    let script_stamp = modified_ns(script_binary)
+    remove_file(project.root.join("script-executed").as_str())
+    project.put("src/main.enq", "extern fn native_answer() -> u32\nfn main() -> u32 { ret unsafe { native_answer() } - 40_u32 - 2_u32 }\n")
+    if !project.succeeds(vec!["run"]) || !file_exists(project.root.join("script-executed").as_str()) ||
+    file_sha256(script_binary.as_str()) != script_digest || modified_ns(script_binary) != script_stamp {
+        ret fixture.failure("application edit recompiled or skipped its build script")
     }
     project.put("native code/answer.c", "#include <stdint.h>\nuint32_t native_answer(void) { return 43; }\n")
     if !project.succeeds(vec!["build"]) || project.tool(project.binary("script_probe", "dev").as_str(), Vec[str]::new()).code() != 1 {

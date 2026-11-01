@@ -1283,6 +1283,8 @@ encore_str encore_codec_format_f32(float value) {
     if (len < 0 || (size_t)len >= sizeof(buffer)) return encore_empty_str();
     return encore_str_from_buffer(buffer, (size_t)len);
 }
+#include "runtime_codec.h"
+
 uint64_t encore_codec_f64_bits(double value) { uint64_t bits; memcpy(&bits, &value, 8); return bits; }
 uint32_t encore_codec_f32_bits(float value) { uint32_t bits; memcpy(&bits, &value, 4); return bits; }
 double encore_codec_f64_from_bits(uint64_t bits) { double value; memcpy(&value, &bits, 8); return value; }

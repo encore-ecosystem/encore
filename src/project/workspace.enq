@@ -18,7 +18,9 @@ import mod::manifest::{ProjectManifest, project_manifest_dependencies, project_m
 import mod::plugin_codegen::{PluginSourceModule, plugin_adapter_sources}
 import mod::registry::{dependency_base_reference, dependency_requested_features, registry_package_checksum, resolve_cached_index_dependency, resolve_index_dependency, valid_dependency_name}
 import refrain::frontend::{AnalysisDatabase, DependencyEdge, DependencyGraph, Documentation, FrontendDiagnostic, FrontendDocument, Lexer, ModuleId, Parser, ProjectConstants, Statement, Token, qualified_source_paths}
+import refrain::frontend::analysis_database::prepare_cached_lightweight_module_with_project
 import refrain::frontend::safety::FunctionSafety
+import refrain::frontend::source_artifact::ParsedSourceArtifact
 import refrain::target::{TargetSpec, parse_target, target_is_host}
 import refrain::target::kits::{target_kit_installed, target_platform_root}
 
@@ -60,7 +62,13 @@ pub struct CompiledWorkspaceModule {
 /// Resolves the complete package graph before starting compilation workers.
 pub fn try_resolve_package_graph(root: Path, target_is_binary: bool, allow_dependency_install: bool)
 -> Result[ResolvedPackageGraph, ProjectFailure] {
-    let workspace = try_resolve_workspace_packages(root, target_is_binary, allow_dependency_install)?
+    ret try_resolve_package_graph_locked(root, target_is_binary, allow_dependency_install, root)
+}
+
+/// Resolves a package graph with the original consumer's registry and lock.
+pub fn try_resolve_package_graph_locked(root: Path, target_is_binary: bool, allow_dependency_install: bool, lock_root: Path)
+-> Result[ResolvedPackageGraph, ProjectFailure] {
+    let workspace = try_resolve_workspace_packages_locked(root, target_is_binary, allow_dependency_install, lock_root)?
     ret Result[ResolvedPackageGraph, ProjectFailure]::Ok(ResolvedPackageGraph {
             workspace.root_name, workspace.refrains, workspace.enabled_features
         }
@@ -117,6 +125,12 @@ impl for WorkspaceModule {
 }
 
 /// Owns the resolved packages, modules, and optional flattened AST of a build.
+pub struct CachedWorkspaceSource {
+    path: str
+    source: str
+    artifact: Option[ParsedSourceArtifact]
+}
+
 pub struct ProjectWorkspace {
     root_name: str
     refrains: Vec[WorkspaceRefrain]
@@ -129,6 +143,8 @@ pub struct ProjectWorkspace {
     overlay_source: str
     allow_dependency_install: bool
     compilation_unit: str
+    cached_sources: Vec[CachedWorkspaceSource]
+    syntax_reused: usize
 }
 
 impl for ProjectWorkspace {
@@ -155,6 +171,11 @@ pub fn try_load_library_workspace(root: Path) -> Result[ProjectWorkspace, Projec
 
 fn try_resolve_workspace_packages(root: Path, target_is_binary: bool, allow_dependency_install: bool)
 -> Result[ProjectWorkspace, ProjectFailure] {
+    ret try_resolve_workspace_packages_locked(root, target_is_binary, allow_dependency_install, root)
+}
+
+fn try_resolve_workspace_packages_locked(root: Path, target_is_binary: bool, allow_dependency_install: bool, lock_root: Path)
+-> Result[ProjectWorkspace, ProjectFailure] {
     let mut workspace = ProjectWorkspace {
         "",
         Vec[WorkspaceRefrain]::new(),
@@ -164,10 +185,10 @@ fn try_resolve_workspace_packages(root: Path, target_is_binary: bool, allow_depe
         Vec[str]::new(),
         AnalysisDatabase::new(),
         "",
-        "", allow_dependency_install, ""
+        "", allow_dependency_install, "", Vec[CachedWorkspaceSource]::new(), 0_usize
     }
 
-    workspace_set_root_name(workspace, try_load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), root.resolve(), target_is_binary, Vec[str]::new())?)
+    workspace_set_root_name(workspace, try_load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), lock_root.resolve(), target_is_binary, Vec[str]::new())?)
 
     ret Result[ProjectWorkspace, ProjectFailure]::Ok(workspace)
 }
@@ -177,10 +198,17 @@ fn try_resolve_workspace_packages(root: Path, target_is_binary: bool, allow_depe
 /// dependency sources or downloading a package in a compilation worker.
 pub fn try_load_compilation_unit(graph: ResolvedPackageGraph, unit: str,
     compiled: Vec[CompiledWorkspaceModule],) -> Result[ProjectWorkspace, ProjectFailure] {
+    ret try_load_compilation_unit_with_sources(graph, unit, compiled, Vec[CachedWorkspaceSource]::new())
+}
+
+/// Cached syntax has the exact source bytes and parser/package identity. It
+/// does not bypass import discovery, name resolution, semantic or safety work.
+pub fn try_load_compilation_unit_with_sources(graph: ResolvedPackageGraph, unit: str,
+    compiled: Vec[CompiledWorkspaceModule], sources: Vec[CachedWorkspaceSource],) -> Result[ProjectWorkspace, ProjectFailure] {
     let mut workspace = ProjectWorkspace {
         unit, graph.refrains, Vec[WorkspaceModule]::new(),
         Vec[Statement]::new(), Vec[str]::new(), graph.enabled_features, AnalysisDatabase::new(),
-        "", "", false, unit
+        "", "", false, unit, sources, 0_usize
     }
     let owner = match workspace_root_refrain(workspace) {
         Some(value) => value
@@ -358,22 +386,28 @@ pub fn workspace_release_modules(workspace: mut ProjectWorkspace) ->() {
 
 /// Loads a workspace starting from an explicit source entrypoint.
 pub fn try_load_entry_workspace(root: Path, entrypoint: Path) -> Result[ProjectWorkspace, ProjectFailure] {
-    ret Result[ProjectWorkspace, ProjectFailure]::Ok(try_load_entry_workspace_impl(root, entrypoint, false, "", true)?)
+    ret try_load_entry_workspace_locked(root, entrypoint, root)
+}
+
+/// Loads a package entrypoint using its consumer's registry and dependency lock.
+/// Source paths and workspace@ packages remain relative to the owning package.
+pub fn try_load_entry_workspace_locked(root: Path, entrypoint: Path, lock_root: Path) -> Result[ProjectWorkspace, ProjectFailure] {
+    ret try_load_entry_workspace_impl(root, entrypoint, false, "", true, lock_root)
 }
 
 /// Loads one editor entrypoint and its dependency graph, optionally replacing
 /// the entrypoint's disk contents with an unsaved source overlay.
 pub fn try_load_entry_workspace_source(root: Path, entrypoint: Path, source: str) -> Result[ProjectWorkspace, ProjectFailure] {
-    ret Result[ProjectWorkspace, ProjectFailure]::Ok(try_load_entry_workspace_impl(root, entrypoint, true, source, true)?)
+    ret Result[ProjectWorkspace, ProjectFailure]::Ok(try_load_entry_workspace_impl(root, entrypoint, true, source, true, root)?)
 }
 
 /// Loads an editor graph using installed dependencies only, including transitives.
 /// Missing packages produce a recoverable failure; no download or clone is started.
 pub fn try_load_cached_entry_workspace_source(root: Path, entrypoint: Path, source: str) -> Result[ProjectWorkspace, ProjectFailure] {
-    ret try_load_entry_workspace_impl(root, entrypoint, true, source, false)
+    ret try_load_entry_workspace_impl(root, entrypoint, true, source, false, root)
 }
 
-fn try_load_entry_workspace_impl(root: Path, entrypoint: Path, has_overlay: bool, source: str, allow_dependency_install: bool) -> Result[ProjectWorkspace, ProjectFailure] {
+fn try_load_entry_workspace_impl(root: Path, entrypoint: Path, has_overlay: bool, source: str, allow_dependency_install: bool, lock_root: Path) -> Result[ProjectWorkspace, ProjectFailure] {
     let resolved_entrypoint = entrypoint.resolve()
     let mut workspace = ProjectWorkspace {
         "", Vec[WorkspaceRefrain]::new(), Vec[WorkspaceModule]::new(), Vec[Statement]::new(), Vec[str]::new(), Vec[str]::new(), AnalysisDatabase::new(), if has_overlay {
@@ -381,9 +415,9 @@ fn try_load_entry_workspace_impl(root: Path, entrypoint: Path, has_overlay: bool
         } else {
             ""
         }
-        , source, allow_dependency_install, ""
+        , source, allow_dependency_install, "", Vec[CachedWorkspaceSource]::new(), 0_usize
     }
-    workspace_set_root_name(workspace, try_load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), root.resolve(), true, Vec[str]::new())?)
+    workspace_set_root_name(workspace, try_load_refrain(workspace, root.resolve(), root.resolve(), "workspace:" + root.resolve().as_str(), lock_root.resolve(), true, Vec[str]::new())?)
     match workspace_root_refrain(workspace) {
         Some(root_refrain) => {
             let visited_paths = unsafe {
@@ -743,7 +777,29 @@ fn try_visit_module(
         }
         ,
     )
-    workspace.analysis.set_module_full(analysis_name, module_path.as_str(), source)
+    let mut restored = false
+    for cached in workspace.cached_sources {
+        if cached.path != resolved_key || cached.source != source {
+            continue
+        }
+        match cached.artifact {
+            Some(artifact) => {
+                if artifact.analysis_name == analysis_name && artifact.document.parsed && artifact.document.diagnostics.is_empty() {
+                    workspace.analysis.apply_prepared_lightweight(prepare_cached_lightweight_module_with_project(
+                            analysis_name, module_path.as_str(), source, artifact.document,
+                            ProjectConstants { owner.manifest.name, owner.manifest.version },))
+                    workspace.syntax_reused += 1_usize
+                    restored = true
+                }
+            }
+            None => {
+            }
+        }
+        break
+    }
+    if !restored {
+        workspace.analysis.set_module_full(analysis_name, module_path.as_str(), source)
+    }
     let analysis_id = match workspace.analysis.module_id(analysis_name) {
         Option[ModuleId]::Some(value) => value
         Option[ModuleId]::None => ModuleId::invalid()
@@ -1976,7 +2032,7 @@ pub fn load_entry_workspace(root: Path, entrypoint: Path) -> ProjectWorkspace {
 }
 
 fn load_entry_workspace_impl(root: Path, entrypoint: Path, has_overlay: bool, source: str) -> ProjectWorkspace {
-    match try_load_entry_workspace_impl(root, entrypoint, has_overlay, source, true) {
+    match try_load_entry_workspace_impl(root, entrypoint, has_overlay, source, true, root) {
         Result[ProjectWorkspace, ProjectFailure]::Ok(value) => {
             ret value
         }

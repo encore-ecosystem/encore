@@ -1,0 +1,117 @@
+//! Cached formulas must propagate both increasing and decreasing effects when
+//! an unchanged caller is represented by its declaration instead of its body.
+import core::option::Option
+import core::testing::assert
+
+import std::vec::Vec
+
+import json::{Json, stringify}
+
+import refrain::frontend::{AnalysisDatabase, FunctionSafety, SafetyFunction}
+import refrain::frontend::parser::{FunctionItem, ParsedBlock}
+import refrain::frontend::safety::{infer_safety_with_known, infer_safety_with_verified_modules}
+import refrain::target::host_target
+
+fn functions(unsafe_leaf: bool) -> Vec[SafetyFunction] {
+    let mut db = AnalysisDatabase::new()
+    db.set_module("leaf", "leaf.enq", "pub fn value() -> u32 { " +
+        if unsafe_leaf {
+            "unsafe { ret 1_u32 }"
+        } else {
+            "ret 1_u32"
+        }
+        + " }\n",)
+    db.set_module("app", "app.enq", "import leaf::value\nfn caller() -> u32 { if false { ret caller() } ret value() }\n")
+    let mut result = db.prepare_module_safety_for_target("leaf", host_target(), Vec[str]::new()).functions
+    result.extend(db.prepare_module_safety_for_target("app", host_target(), Vec[str]::new()).functions)
+    ret result
+}
+fn declaration(function: SafetyFunction) -> SafetyFunction {
+    let item = function.item
+    let header = FunctionItem {
+        item.attrs, item.decorators, item.is_public, item.is_extern, item.is_async, item.name,
+        item.documentation, item.generics, item.params, item.ret_type, item.returns_sending, item.returns_frozen,
+        Option[ParsedBlock]::Some(ParsedBlock::synthetic(Vec[refrain::frontend::parser::Statement]::new())),
+        item.source_name, item.line, item.column
+    }
+    ret SafetyFunction {
+        function.module_name, function.owner, header, function.body, function.callables, function.methods,
+        function.symbol_line, function.symbol_column, function.constructors
+    }
+}
+fn equal(actual: Vec[FunctionSafety], expected: Vec[FunctionSafety]) -> bool {
+    if actual.len() != expected.len() {
+        ret false
+    }
+    for index in 0_usize..actual.len() {
+        let left = actual.get_unchecked_borrowed(index)
+        let right = expected.get_unchecked_borrowed(index)
+        if left.module_name != right.module_name || left.name != right.name || left.body_unsafe != right.body_unsafe ||
+        left.asserted_safe != right.asserted_safe || left.returns_unsafe_callable != right.returns_unsafe_callable {
+            ret false
+        }
+    }
+    ret true
+}
+fn corrupt(previous: Json, field_name: str) -> Json {
+    let mut records = Vec[(str, Json)]::new()
+    for record in previous.as_object().unwrap_or(Vec[(str, Json)]::new()) {
+        let mut fields = Vec[(str, Json)]::new()
+        for field in record.1.as_object().unwrap_or(Vec[(str, Json)]::new()) {
+            if field.0 == field_name {
+                fields.push((field.0, if field_name == "order" {
+                            Json::String("wrong declaration order")
+                        } else {
+                            Json::Array(vec![Json::String("safety-plan-1"), Json::Bool(false),
+                                    Json::Array(vec![Json::Number("18446744073709551615")]), Json::Bool(false), Json::Array(Vec[Json]::new())])
+                        }
+                        ,
+                    ))
+            } else {
+                fields.push(field)
+            }
+        }
+        records.push((record.0, Json::Object(fields)))
+    }
+    ret Json::Object(records)
+}
+fn main() -> u32 {
+    let contexts = vec![("leaf", "leaf-signatures"),("app", "app-signatures")]
+    let cold_functions = functions(false)
+    let cold = infer_safety_with_verified_modules(cold_functions, Vec[FunctionSafety]::new(), contexts, Json::Null, Vec[str]::new())
+    let mut previous = cold.replay
+    for unsafe_leaf in vec![true, false, true, false] {
+        let complete = functions(unsafe_leaf)
+        let mut headers = Vec[SafetyFunction]::new()
+        for function in complete {
+            headers.push(if function.module_name == "app" {
+                    declaration(function)
+                } else {
+                    function
+                }
+            )
+        }
+        let restored = infer_safety_with_verified_modules(headers, Vec[FunctionSafety]::new(), contexts, previous, vec!["app"])
+        if !assert(equal(restored.effects, infer_safety_with_known(complete, Vec[FunctionSafety]::new()))) {
+            ret 1_u32
+        }
+        let caller = restored.effects.get_unchecked_borrowed(1_usize)
+        if !assert(caller.is_unsafe() == unsafe_leaf && restored.checked == 2_usize) {
+            ret 2_u32
+        }
+        previous = restored.replay
+    }
+    // An unchanged artifact retains the exact record representation too.
+    let complete = functions(false)
+    let warm = infer_safety_with_verified_modules(complete, Vec[FunctionSafety]::new(), contexts, previous, Vec[str]::new())
+    if !assert(warm.checked == 0_usize && stringify(warm.replay) == stringify(previous)) {
+        ret 3_u32
+    }
+    for field in vec!["plan", "order"] {
+        let repaired = infer_safety_with_verified_modules(complete, Vec[FunctionSafety]::new(), contexts, corrupt(previous, field), vec!["app"])
+        if !assert(repaired.checked == 2_usize && equal(repaired.effects, warm.effects) && stringify(repaired.replay) == stringify(previous)) {
+            ret 4_u32
+        }
+    }
+    ret 0_u32
+}

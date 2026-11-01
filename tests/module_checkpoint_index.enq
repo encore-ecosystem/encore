@@ -1,0 +1,70 @@
+//! Small checkpoint indexes share typed chunks; loss/corruption is a cache miss.
+import core::option::Option
+import core::result::Result
+import core::testing::assert
+
+import std::os::{remove_dir_all, remove_file}
+import std::path::Path
+import std::time::perf_counter_ns
+import std::vec::Vec
+
+import ehirlib::{encode_typed_module, module_bundle_to_string, parse_module_bundle_text}
+import json::{Json, stringify}
+
+import refrain::cache_identity::compiler_content_digest
+import refrain::modes::build_lowering_cache::commit_lowered_module
+import refrain::modes::build_module_index::{checkpoint_references_available, encode_compilation_checkpoint, restore_compilation_checkpoint}
+import refrain::modes::cache_payload::write_payload
+
+fn contract(root: Path) -> Result[bool, str] {
+    let cache = Option[Path]::Some(root)
+    let bundle = parse_module_bundle_text("left", "module left {\nfn value() -> u32 {\n$entry:\nx: u32 = capprim 41_u32\nret x: u32\n}\n}\n" +
+        "module right {\nfn value() -> u32 {\n$entry:\nx: u32 = capprim 42_u32\nret x: u32\n}\n}\n",)
+    let mut identities = Vec[(str, str)]::new()
+    for module in bundle.modules {
+        let key = compiler_content_digest("checked module " + module.name)
+        commit_lowered_module(cache, key, encode_typed_module(module, key)?)?
+        identities.push((module.name, key))
+    }
+    let identity = compiler_content_digest("checked package phase")
+    let checkpoint = encode_compilation_checkpoint(bundle, identities, identity, cache)?
+    if !assert(checkpoint.slice_bytes(0_usize, 9_usize) == "ENQMI001\n" && checkpoint_references_available(checkpoint, identity, root)) {
+        ret Result::Ok(false)
+    }
+    let restored = restore_compilation_checkpoint(checkpoint, identity, cache)?
+    if !assert(restored.identities.len() == 2_usize && module_bundle_to_string(restored.bundle) == module_bundle_to_string(bundle) &&
+        restore_compilation_checkpoint(checkpoint, compiler_content_digest("wrong phase"), cache).is_err()) {
+        ret Result::Ok(false)
+    }
+    let flat = encode_compilation_checkpoint(bundle, identities, identity, Option[Path]::None)?
+    if !assert(flat.slice_bytes(0_usize, 8_usize) == "ENQTB002" &&
+        module_bundle_to_string(restore_compilation_checkpoint(flat, identity, Option[Path]::None)?.bundle) == module_bundle_to_string(bundle)) {
+        ret Result::Ok(false)
+    }
+    let first = identities.get_unchecked_borrowed(0_usize)
+    let path = root / "lowering-v2" / first.1.slice_bytes(0_usize, 2_usize) /(first.1 + ".entry")
+    remove_file(path.as_str())
+    if !assert(!checkpoint_references_available(checkpoint, identity, root) && restore_compilation_checkpoint(checkpoint, identity, cache).is_err()) {
+        ret Result::Ok(false)
+    }
+    if !write_payload(path, "invalid typed module in a valid transport", true) {
+        ret Result::Ok(false)
+    }
+    if !assert(restore_compilation_checkpoint(checkpoint, identity, cache).is_err()) {
+        ret Result::Ok(false)
+    }
+    let duplicate = "ENQMI001\n" + stringify(Json::Object(vec![("identity", Json::String(identity)),("entry", Json::String(first.0)),
+                ("modules", Json::Array(vec![Json::Array(vec![Json::String(first.0), Json::String(first.1)]),
+                            Json::Array(vec![Json::String(first.0), Json::String(first.1)])]))]))
+    ret Result::Ok(assert(!checkpoint_references_available(duplicate, identity, root) && restore_compilation_checkpoint(duplicate, identity, cache).is_err()))
+}
+fn main() -> u32 {
+    let root = Path::new("target/module-checkpoint-index-" + core::fmt::Debug::fmt(perf_counter_ns())).resolve()
+    let result = contract(root).unwrap_or(false)
+    remove_dir_all(root.as_str())
+    ret if result {
+        0_u32
+    } else {
+        1_u32
+    }
+}

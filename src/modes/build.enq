@@ -7,7 +7,7 @@ import core::result::Result
 
 import std::dict::Hashable
 import std::io::{eprint, eprintln}
-import std::os::{copy_file, env, executable_path, file_exists, file_sha256, home_dir, mkdir_all, read_file, remove_file, set_executable, write_file}
+import std::os::{copy_file, env, executable_path, file_exists, file_sha256, home_dir, mkdir_all, path_separator, read_file, remove_file, set_executable, write_file}
 import std::path::{Path, clone_path}
 import std::process::{Command, exit, run_args_owned}
 import std::thread::{JoinHandle, available_parallelism}
@@ -15,7 +15,7 @@ import std::time::{perf_counter_ms, perf_counter_ns, sleep_ms}
 import std::vec::Vec
 
 import argparse::{process_arg, process_arg_count}
-import ehirlib::{EhirModuleSource, Module, ModuleBundle, flatten_module_bundle, module_bundle_to_string, module_to_string, parse_module_bundle_artifact_parallel, parse_module_bundle_text, parse_module_text, split_module_bundle_text}
+import ehirlib::{EhirModuleSource, Module, ModuleBundle, decode_typed_bundle, flatten_module_bundle, module_bundle_to_string, module_to_string, parse_module_bundle_artifact_parallel, parse_module_bundle_text, parse_module_text, split_module_bundle_text}
 import ehirlib::codegen::{CodegenRequirements, EmittedIrModule, clear_codegen_error, emit_ir_bundle_for_target_parallel, emit_ir_bundle_for_target_selected, emit_ir_bundle_for_target_selected_with_analysis, emit_ir_for_target, emit_program_support, incremental_codegen_context_bundle, take_codegen_error}
 import ehirlib::core::make_module_bundle
 import json::{Json, parse, stringify}
@@ -25,10 +25,12 @@ import mod::build_archive::{UnitNativePlan, run_program_tool, stable_module_ir}
 import mod::build_artifacts::UnitReady
 import mod::build_cache::{UnitCacheLock, close_unit_cache_lock, try_unit_cache_lock}
 import mod::build_coordinator::{CompiledPackage, compile_cached_package_graph}
+import mod::build_ehir_artifacts::template_snapshot_key
 import mod::build_metadata::{MetadataContext, metadata_name_before}
 import mod::build_native_inputs::{native_source_identities, native_source_identity}
 import mod::build_output::{append_package_archives, append_shared_library_args, build_artifact_label, build_artifact_name, build_import_library_name, merge_static_library}
-import mod::build_requirements::UnitRequirements
+import mod::build_receipt::{build_input_inventory, publish_successful_build, successful_build_matches, watched_build_inputs}
+import mod::build_requirements::{UnitRequirements, requirements_content_digest}
 import mod::build_scripts::{NativeBuildMetadata, parse_native_build_metadata}
 import refrain::cache_identity::{compiler_binary_identity, compiler_content_digest}
 import refrain::diagnostics::render_diagnostic
@@ -36,8 +38,9 @@ import refrain::frontend::{FrontendDiagnostic, PreparedSemanticModule, check_pre
 import refrain::frontend::parser::statements::Statement
 import refrain::frontend::translator::{TranslatedModuleChunk, TranslationModule, assemble_ehir_module_bundle, filter_ast_for_target, translate_ast_with_modules_to_ehir, translate_modules_to_ehir, translate_modules_to_ehir_bundle, translate_modules_to_ehir_bundle_parallel, translate_modules_to_ehir_bundle_typed, translate_selected_modules_to_ehir_chunks, translate_to_ehir, translate_to_ehir_for_target, translate_to_ehir_for_target_and_features}
 import refrain::project::{ProjectWorkspace, WorkspaceModule, WorkspaceRefrain, load_binary_workspace, load_library_workspace, system_core_root, system_platform_root, workspace_release_modules, workspace_root_refrain}
+import refrain::project::build_graph::encode_build_graph
 import refrain::project::manifest::{project_build_kind, project_manifest_binary_name, project_manifest_name, project_manifest_target, project_target_toolchain, read_project_manifest}
-import refrain::project::workspace::{ResolvedPackageGraph, try_load_entry_workspace, try_resolve_package_graph}
+import refrain::project::workspace::{ResolvedPackageGraph, try_load_entry_workspace_locked, try_resolve_package_graph, try_resolve_package_graph_locked}
 import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host, target_is_supported, toolchain_driver_is_supported}
 import refrain::target::kits::{target_kit_installed, target_kit_toolchain, target_platform_root}
 import refrain::version::compiler_release_version
@@ -758,15 +761,16 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
             ret Result[(), str]::Err(failure.message)
         }
     }
-    let metadata = run_native_build_scripts(graph.refrains, "", target, profile, staging)?
+    profile_incremental_input("graph", pipeline_started)
+    let scripts_started = perf_counter_ms()
+    let metadata = run_native_build_scripts(graph.refrains, "", target, profile, staging, root)?
+    profile_incremental_input("scripts", scripts_started)
+    let native_started = perf_counter_ms()
     let native = UnitNativePlan {
         resolve_native_program(toolchain.compiler)?,
         resolve_native_program(toolchain.archiver)?, compiler_args(profile, target, toolchain)
     }
     let cache = env("ENCORE_BUILD_CACHE").unwrap_or(home_dir() + "/.cache/encore/units-v1")
-    let packages = compile_cached_package_graph(graph, target.triple, profile, requested_jobs(),
-        staging.join("graph"), native, Option[Path]::Some(Path::new(cache).expanduser().resolve()),)?
-    let packages_ms = perf_counter_ms() - pipeline_started
     let mut sources = package_native_sources(root, graph, target, toolchain)
     for source in metadata.sources {
         let mut present = false
@@ -784,7 +788,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     }
     let native_keys = native_source_identities(sources, native, staging, requested_jobs())?
     let mut link_inputs = Vec[Json]::new()
-    link_inputs.push(Json::String("encore-package-link-1"))
+    link_inputs.push(Json::String("encore-package-link-2"))
     link_inputs.push(Json::String(output_kind))
     link_inputs.push(Json::String(binary.as_str()))
     link_inputs.push(Json::String(native.identity()?))
@@ -807,12 +811,47 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     for key in native_keys {
         link_inputs.push(Json::String(key))
     }
+    profile_incremental_input("native closure", native_started)
+    let inventory_started = perf_counter_ms()
+    let inventory = build_input_inventory(graph)?
+    profile_incremental_input("source inventory", inventory_started)
+    let receipt_started = perf_counter_ms()
+    let receipt_configuration = compiler_content_digest(build_input_configuration(root, target, toolchain, profile, "binary") +
+        "\n" + encode_build_graph(graph)? + "\n" + file_sha256(root.join("encore.lock").as_str()) +
+        "\n" + stringify(Json::Array(link_inputs)))
+    let receipt_import = if import_name == "" {
+        Option[Path]::None
+    } else {
+        Option[Path]::Some(import_library)
+    }
+    let input_match = successful_build_matches(profile_dir, receipt_configuration, inventory, graph, binary, receipt_import)
+    profile_incremental_input("receipt", receipt_started)
+    if input_match {
+        write_package_pipeline_timing(profile_dir, Vec[CompiledPackage]::new(), 0, 0, 0,
+            perf_counter_ms() - pipeline_started, true,)?
+        ret Result::Ok(())
+    }
+    let packages = compile_cached_package_graph(graph, target.triple, profile, requested_jobs(),
+        staging.join("graph"), native, Option[Path]::Some(Path::new(cache).expanduser().resolve()),)?
+    let packages_ms = perf_counter_ms() - pipeline_started
+    let support_native_identity = native.identity()?
+    let mut support_parts = Vec[Json]::new()
+    support_parts.push(Json::String("encore-program-support-1"))
+    support_parts.push(Json::String(running_compiler_identity(root)))
+    support_parts.push(Json::String(support_native_identity))
+    support_parts.push(Json::String(target.triple))
+    support_parts.push(Json::String(profile))
+    support_parts.push(Json::String(output_kind))
     for package in packages {
+        let content = requirements_content_digest(read_file(package.directory.join("unit.errequirements").as_str()),
+            package.ready.context,)?
+        support_parts.push(Json::Array(vec![Json::String(package.ready.context.unit),
+                    Json::String(package.ready.template_digest), Json::String(content)]))
         let mut record = Vec[Json]::new()
         record.push(Json::String(package.ready.context.unit))
         record.push(Json::String(package.archive_digest))
         record.push(Json::String(package.ready.template_digest))
-        record.push(Json::String(package.ready.requirements_digest))
+        record.push(Json::String(content))
         link_inputs.push(Json::Array(record))
     }
     let link_key = compiler_content_digest(stringify(Json::Array(link_inputs)))
@@ -826,6 +865,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     previous.get("binary").unwrap_or(Json::Null).as_str().unwrap_or("") == file_sha256(binary.as_str()) &&
     file_exists(binary.as_str()) &&(import_name == "" ||
         (file_exists(import_library.as_str()) && previous.get("import-library").unwrap_or(Json::Null).as_str().unwrap_or("") == file_sha256(import_library.as_str()))) {
+        publish_successful_build(profile_dir, receipt_configuration, inventory, graph, binary, receipt_import)?
         write_package_pipeline_timing(profile_dir, packages, packages_ms, 0, 0, perf_counter_ms() - pipeline_started, true)?
         ret Result[(), str]::Ok(())
     }
@@ -847,41 +887,40 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
         }
         index += 1
     }
-    let mut contexts = Vec[Module]::new()
-    let mut requirements = Vec[CodegenRequirements]::new()
+    let support_key = compiler_content_digest(stringify(Json::Array(support_parts)))
+    let support_root = profile_dir.join("native-cache-v1").resolve()
+    let mut support_lock = Option[UnitCacheLock]::None
+    while support_lock.is_none() {
+        if unsafe {
+            encore_compiler_worker_interrupted()
+        }
+        != 0 {
+            ret Result::Err("support cache wait cancelled")
+        }
+        support_lock = try_unit_cache_lock(support_root, support_key)?
+        if support_lock.is_none() {
+            let _ = sleep_ms(5)
+        }
+    }
+    let support_lock = match support_lock {
+        Some(value) => value None => {
+            ret Result::Err("missing support cache lock")
+        }
+    }
+    let support_result = prepare_cached_program_support(support_lock, packages, names, graph.root_name,
+        output_kind, target, toolchain, profile, staging, native, support_native_identity,)
+    close_unit_cache_lock(support_lock)
+    support_result?
     let mut archives = Vec[str]::new()
     for name in names {
         for package in packages {
-            if package.ready.context.unit != name {
-                continue
+            if package.ready.context.unit == name {
+                archives.push(package.directory.join("unit.erlib").as_str())
             }
-            let bundle = parse_module_bundle_text("", read_file(package.directory.join("unit.ertemplate").as_str()))
-            contexts.extend(bundle.modules)
-            requirements.push(UnitRequirements::decode(read_file(package.directory.join("unit.errequirements").as_str()),
-                    package.ready.context,)?.requirements)
-            archives.push(package.directory.join("unit.erlib").as_str())
         }
-    }
-    let entry = graph.root_name + if output_kind == "executable" {
-        "@main.enq"
-    } else {
-        "@lib.enq"
-    }
-    let support = emit_program_support(make_module_bundle(entry, contexts), requirements, target.triple, target.pointer_width)
-    if !support.diagnostic.is_empty() {
-        ret Result::Err("LLVM support: " + support.diagnostic)
-    }
-    let support_path = staging.join("support.ll")
-    if !write_verified_artifact(support_path, stable_module_ir(support.ir, graph.root_name + "@__program_support")) {
-        ret Result[(), str]::Err("cannot commit final support code")
     }
     let mut objects = Vec[str]::new()
     let support_object = staging.join("support.o")
-    let mut support_args = compiler_args(profile, target, toolchain)
-    support_args.push("--target=" + target.triple)
-    support_args.push("-c") support_args.push(support_path.as_str())
-    support_args.push("-o") support_args.push(support_object.as_str())
-    run_program_tool(resolve_native_program(toolchain.compiler)?, support_args, staging, "support")?
     objects.push(support_object.as_str())
     index = 0
     for source in sources {
@@ -945,16 +984,77 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     if !write_verified_artifact(link_record, stringify(Json::Object(committed))) {
         ret Result[(), str]::Err("cannot commit final binary identity")
     }
+    publish_successful_build(profile_dir, receipt_configuration, inventory, graph, binary, receipt_import)?
     write_package_pipeline_timing(profile_dir, packages, packages_ms, support_native_ms,
         perf_counter_ms() - pipeline_started - packages_ms - support_native_ms, perf_counter_ms() - pipeline_started, false,)?
     ret Result[(), str]::Ok(())
+}
+
+fn profile_incremental_input(stage: str, started: u64) ->() {
+    if env("ENCORE_INPUT_PROFILE").is_some() {
+        eprintln("input-time " + stage + ": " + Debug::fmt(perf_counter_ms() - started) + " ms")
+    }
+}
+
+fn prepare_cached_program_support(lock: UnitCacheLock, packages: Vec[CompiledPackage], names: Vec[str],
+    root_name: str, output_kind: str, target: TargetSpec, toolchain: Toolchain, profile: str,
+    staging: Path, native: UnitNativePlan, expected_native: str,) -> Result[(), str] {
+    if native.identity()? != expected_native {
+        ret Result::Err("native toolchain changed before support preparation")
+    }
+    let cached = lock.directory.join("native.o")
+    let support_object = staging.join("support.o")
+    if verified_artifact(cached) && copy_verified_artifact(cached, support_object) {
+        ret Result::Ok(())
+    }
+    if mkdir_all(lock.directory.as_str()) != 0_i32 {
+        ret Result::Err("cannot create support object cache")
+    }
+    let mut contexts = Vec[Module]::new()
+    let mut requirements = Vec[CodegenRequirements]::new()
+    for name in names {
+        for package in packages {
+            if package.ready.context.unit != name {
+                continue
+            }
+            let bundle = decode_typed_bundle(read_file(package.directory.join("unit.ertemplate").as_str()), template_snapshot_key(package.ready.context))?
+            contexts.extend(bundle.modules)
+            requirements.push(UnitRequirements::decode(read_file(package.directory.join("unit.errequirements").as_str()),
+                    package.ready.context,)?.requirements)
+        }
+    }
+    let entry = root_name + if output_kind == "executable" {
+        "@main.enq"
+    } else {
+        "@lib.enq"
+    }
+    let support = emit_program_support(make_module_bundle(entry, contexts), requirements, target.triple, target.pointer_width)
+    if !support.diagnostic.is_empty() {
+        ret Result::Err("LLVM support: " + support.diagnostic)
+    }
+    let support_path = staging.join("support.ll")
+    if !write_verified_artifact(support_path, stable_module_ir(support.ir, root_name + "@__program_support")) {
+        ret Result[(), str]::Err("cannot commit final support code")
+    }
+    let mut support_args = compiler_args(profile, target, toolchain)
+    support_args.push("--target=" + target.triple)
+    support_args.push("-c") support_args.push(support_path.as_str())
+    support_args.push("-o") support_args.push(support_object.as_str())
+    run_program_tool(resolve_native_program(toolchain.compiler)?, support_args, staging, "support")?
+    if native.identity()? != expected_native {
+        ret Result::Err("native toolchain changed during support compilation")
+    }
+    if !write_verified_artifact(cached, read_file(support_object.as_str())) {
+        ret Result::Err("cannot commit support object")
+    }
+    ret Result::Ok(())
 }
 
 // A script is a host program, whereas its JSON is selected for the requested
 // target. Each invocation has isolated output; a failed script can never reuse
 // an older metadata file. Dependencies run before their consumers.
 fn run_native_build_scripts(packages: Vec[WorkspaceRefrain], skip: str, target: TargetSpec,
-    profile: str, staging: Path,) -> Result[NativeBuildMetadata, str] {
+    profile: str, staging: Path, lock_root: Path,) -> Result[NativeBuildMetadata, str] {
     let mut plans = Vec[NativeBuildMetadata]::new()
     let mut index = 0_usize
     for package in packages {
@@ -972,7 +1072,7 @@ fn run_native_build_scripts(packages: Vec[WorkspaceRefrain], skip: str, target: 
                     ret Result[NativeBuildMetadata, str]::Err("cannot create build-script directory")
                 }
                 let metadata = directory.join("native.json")
-                let args = vec!["__run-build-script", package.root.as_str(), script.as_str(), metadata.as_str(), target.triple, profile]
+                let args = vec!["__run-build-script", package.root.as_str(), script.as_str(), metadata.as_str(), target.triple, profile, lock_root.as_str()]
                 run_program_tool(executable_path(), args, directory, "build-script")?
                 if !file_exists(metadata.as_str()) {
                     ret Result[NativeBuildMetadata, str]::Err("build script did not write metadata: " + script.as_str())
@@ -1004,12 +1104,13 @@ fn run_native_build_scripts(packages: Vec[WorkspaceRefrain], skip: str, target: 
 /// parent compiler. Cached host script compilation is serialized per script.
 #attr(safe)
 pub fn run_build_script_worker() -> u32 {
-    if argc() < 7 {
+    if argc() < 8 {
         eprintln("invalid build-script worker arguments") ret 2
     }
     let root = Path::new(argv(2).unwrap_or("")).resolve()
     let script = Path::new(argv(3).unwrap_or("")).resolve()
     let output = Path::new(argv(4).unwrap_or("")).resolve()
+    let lock_root = Path::new(argv(7).unwrap_or("")).resolve()
     let key = compiler_content_digest(script.as_str())
     let locks = root.join("target/build-scripts/locks")
     let mut acquired = Option[UnitCacheLock]::None
@@ -1034,36 +1135,112 @@ pub fn run_build_script_worker() -> u32 {
             ret 1
         }
     }
-    let status = run_locked_build_script(root, script, output, key)
+    let status = run_locked_build_script(root, script, output, key, lock_root)
     close_unit_cache_lock(lock)
     ret status
 }
 
-fn run_locked_build_script(root: Path, script: Path, output: Path, key: str) -> u32 {
-    let workspace = match try_load_entry_workspace(root, script) {
-        Ok(workspace) => workspace Err(failure) => {
-            ret build_script_error(failure.message)
+fn run_locked_build_script(root: Path, script: Path, output: Path, key: str, lock_root: Path) -> u32 {
+    let binary = match prepare_build_script_binary(root, script, output, key, lock_root) {
+        Ok(value) => value Err(error) => {
+            ret build_script_error(error)
         }
     }
-    for module in workspace.modules {
-        for diagnostic in module.diagnostics {
-            eprintln(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
-            ret 1
-        }
-    }
-    let name = "build-script-" + key
-    if compile_entry_ast(root, workspace, workspace.flat_ast, name, true) != 0 {
-        ret 1
-    }
-    let binary = root.join("target/tests/bin").join(target_executable_name(host_target(), name))
-    // A script sees its own package cwd. Arguments 2/3 describe the requested
-    // target/profile; argument 1 remains the documented metadata destination.
+    // Compilation may be reused, execution and side effects never are.
     let result = Command::new(binary.as_str()).cwd(root.as_str())
     .arg(output.as_str()).arg(argv(5).unwrap_or("")).arg(argv(6).unwrap_or("dev")).output()
     if !result.success() {
         eprintln("build script failed: " + script.as_str() + "\n" + result.text()) ret 1
     }
     ret 0
+}
+
+fn prepare_build_script_binary(root: Path, script: Path, output: Path, key: str, lock_root: Path) -> Result[Path, str] {
+    let graph = match try_resolve_package_graph_locked(root, true, true, lock_root) {
+        Ok(value) => value Err(failure) => {
+            ret Result::Err(failure.message)
+        }
+    }
+    let staging = output.parent().unwrap_or(root)
+    let target = host_target()
+    let mut toolchain = requested_toolchain(root, target)
+    // Entry programs currently compile all host runtimes with these exact flags.
+    toolchain.hosted_runtime = true
+    toolchain.runtime_sources = Vec[str]::new()
+    let metadata = run_native_build_scripts(graph.refrains, graph.root_name, target, "dev", staging, lock_root)?
+    let plan = UnitNativePlan {
+        resolve_native_program(toolchain.compiler)?, resolve_native_program(toolchain.archiver)?,
+        vec!["-O0", "-g", "-fno-experimental-isel", "-Wno-override-module"]
+    }
+    let mut sources = package_native_sources(root, graph, target, toolchain)
+    sources.extend(metadata.sources)
+    let native = native_source_identities(sources, plan, staging, requested_jobs())?
+    let mut configuration = Vec[Json]::new()
+    configuration.push(Json::String("encore-build-script-inputs-1"))
+    configuration.push(Json::String(running_compiler_identity(root)))
+    configuration.push(Json::String(encode_build_graph(graph)?))
+    configuration.push(Json::String(file_sha256(script.as_str())))
+    configuration.push(Json::String(plan.identity()?))
+    for identity in native {
+        configuration.push(Json::String(identity))
+    }
+    for identity in metadata.identities() {
+        configuration.push(Json::String(identity))
+    }
+    for argument in metadata.link_arguments(target) {
+        configuration.push(Json::String(argument))
+    }
+    for argument in toolchain.link_args {
+        configuration.push(Json::String(argument))
+    }
+    let configuration = compiler_content_digest(stringify(Json::Array(configuration)))
+    let inventory = build_input_inventory(graph)?
+    let name = "build-script-" + key
+    let binary = root.join("target/tests/bin").join(target_executable_name(target, name))
+    let profile = root.join("target/build-scripts").join(key)
+    if successful_build_matches(profile, configuration, inventory, graph, binary, Option[Path]::None) {
+        ret Result::Ok(binary)
+    }
+    let workspace = match try_load_entry_workspace_locked(root, script, lock_root) {
+        Ok(workspace) => workspace Err(failure) => {
+            ret Result::Err(failure.message)
+        }
+    }
+    // Unusual entrypoints may import sources outside package src directories.
+    // Such programs retain the complete loader path on every invocation.
+    let mut eligible = true
+    for module in workspace.modules {
+        if module.module_path.as_str() == script.as_str() {
+            continue
+        }
+        let mut found = false
+        for package in graph.refrains {
+            let prefix = package.root.join("src").as_str() + path_separator()
+            let path = module.module_path.as_str()
+            if module.owner_name == package.name && path.byte_len() >= prefix.byte_len() &&
+            path.slice_bytes(0_usize, prefix.byte_len()) == prefix {
+                found = true
+            }
+        }
+        if !found {
+            eligible = false
+        }
+    }
+    // Native header/tool/flag changes must also invalidate the older test-binary
+    // cache, whose source-only key cannot prove this stronger entry contract.
+    remove_file(binary.as_str() + ".fingerprint")
+    if compile_entry_ast_with_metadata(root, workspace, workspace.flat_ast, name, true, Option[NativeBuildMetadata]::Some(metadata), lock_root) != 0 {
+        ret Result::Err("build script compilation failed: " + script.as_str())
+    }
+    if eligible {
+        let mut inputs = Vec[Path]::new()
+        for module in workspace.modules {
+            inputs.push(module.module_path)
+        }
+        publish_successful_build(profile, configuration, watched_build_inputs(inventory, graph, inputs),
+            graph, binary, Option[Path]::None,)?
+    }
+    ret Result::Ok(binary)
 }
 
 // Ordinary function statements remain compatible with the published seed,
@@ -1100,6 +1277,7 @@ fn write_package_pipeline_timing(profile_dir: Path, packages: Vec[CompiledPackag
     timings.push(("link_ms", Json::Number(Debug::fmt(link_ms))))
     timings.push(("total_ms", Json::Number(Debug::fmt(total_ms))))
     timings.push(("link_cache_hit", Json::Bool(cached)))
+    timings.push(("input_cache_hit", Json::Bool(cached && packages.is_empty())))
     timings.push(("units", Json::Array(units)))
     if !write_verified_artifact(profile_dir.join("encore-timings.json"), stringify(Json::Object(timings))) {
         ret Result[(), str]::Err("cannot record package pipeline timings")
@@ -3663,12 +3841,18 @@ fn normalize_profile(profile: str) -> str {
 
 /// Performs the `compile_test_ast` operation.
 pub fn compile_test_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str) -> u32 {
-    ret compile_entry_ast(root, workspace, ast, binary_name, false)
+    ret compile_entry_ast(root, workspace, ast, binary_name, false, root)
 }
 
 #attr(safe)
 fn compile_entry_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str,
-    build_script: bool,) -> u32 {
+    build_script: bool, lock_root: Path,) -> u32 {
+    ret compile_entry_ast_with_metadata(root, workspace, ast, binary_name, build_script, Option[NativeBuildMetadata]::None, lock_root)
+}
+
+#attr(safe)
+fn compile_entry_ast_with_metadata(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str,
+    build_script: bool, supplied_metadata: Option[NativeBuildMetadata], lock_root: Path,) -> u32 {
     // The workspace already includes a unique process/timestamp suffix. Keep
     // its name independent of the artifact hash to fit nested Windows projects.
     let managed = match BuildWorkspace::new(root / "target" / "tests", "native") {
@@ -3680,7 +3864,7 @@ fn compile_entry_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement
         }
     }
     with managed as scope {
-        let code = compile_entry_ast_in(root, workspace, ast, binary_name, build_script, scope.directory)
+        let code = compile_entry_ast_in(root, workspace, ast, binary_name, build_script, scope.directory, supplied_metadata, lock_root)
         scope.complete(code == 0_u32, if code == 0_u32 {
                 ""
             } else {
@@ -3694,7 +3878,7 @@ fn compile_entry_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement
 
 #attr(safe)
 fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str,
-    build_script: bool, staging: Path,) -> u32 {
+    build_script: bool, staging: Path, supplied_metadata: Option[NativeBuildMetadata], lock_root: Path,) -> u32 {
     let input_started = perf_counter_ms()
     // Parser/import failures are fatal even on a worker binary cache hit.
     // Lowering-time validation cannot recover diagnostics discarded by parsing.
@@ -3729,14 +3913,19 @@ fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
     let ehir_path = intermediate_dir /(intermediate_name + ".ehir")
     let llvm_path = intermediate_dir /(intermediate_name + ".ll")
     let binary_path = binary_dir.join(target_executable_name(host_target(), binary_name))
-    let native_metadata = match run_native_build_scripts(workspace.refrains, if build_script {
-            workspace.root_name
-        } else {
-            ""
-        }
-        , target, "dev", staging,) {
-        Ok(metadata) => metadata Err(error) => {
-            ret build_script_error(error)
+    let native_metadata = match supplied_metadata {
+        Some(value) => value
+        None => {
+            match run_native_build_scripts(workspace.refrains, if build_script {
+                    workspace.root_name
+                } else {
+                    ""
+                }
+                , target, "dev", staging, lock_root,) {
+                Ok(metadata) => metadata Err(error) => {
+                    ret build_script_error(error)
+                }
+            }
         }
     }
     let test_fingerprint_path = Path::new(binary_path.as_str() + ".fingerprint")

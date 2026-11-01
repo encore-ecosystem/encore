@@ -19,8 +19,8 @@ import refrain::frontend::lexer::{Lexer, Token, TokenType}
 import refrain::frontend::metadata_ast::{encode_codegen_context_ast, encode_lowered_function_input}
 import refrain::frontend::parser::{FunctionItem, GenericParam, Statement}
 import refrain::frontend::project_constants::ProjectConstants
-import refrain::frontend::safety::{FunctionSafety, SafetyFunction, SafetyReplayResult, infer_safety_with_known, infer_safety_with_replay, safety_dependencies}
-import refrain::frontend::semantic::{ScopedSemanticBinding, SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticDependencyKind, SemanticField, SemanticMember, SemanticMethod, SemanticVariant, append_bound_methods, append_bound_methods_view, check_function_body, check_function_body_with_scope, check_function_body_with_type_scope, check_function_body_with_types, check_function_body_with_variants, check_module_bodies, check_module_bodies_with_type_scope, check_module_bodies_with_types, check_module_bodies_with_variants, check_module_bodies_with_variants_view, check_module_declarations, prepare_module_bodies_with_replay, prepare_module_bodies_with_replay_view, prepare_module_bodies_with_variants, semantic_accessible_methods, semantic_associated_members, semantic_call_return_type, semantic_checkpoint_dependencies, semantic_members, semantic_named_members, semantic_same_owner, specialize_method_type_with_self}
+import refrain::frontend::safety::{FunctionSafety, SafetyFunction, SafetyReplayResult, infer_safety_with_known, infer_safety_with_replay, infer_safety_with_verified_modules, safety_dependencies}
+import refrain::frontend::semantic::{ScopedSemanticBinding, SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticDependencyKind, SemanticField, SemanticMember, SemanticMethod, SemanticVariant, append_bound_methods, append_bound_methods_view, check_function_body, check_function_body_with_scope, check_function_body_with_type_scope, check_function_body_with_types, check_function_body_with_variants, check_module_bodies, check_module_bodies_with_type_scope, check_module_bodies_with_types, check_module_bodies_with_variants, check_module_bodies_with_variants_view, check_module_declarations, prepare_module_bodies_with_replay, prepare_module_bodies_with_replay_view, prepare_module_bodies_with_variants, restore_accepted_module_bodies, semantic_accessible_methods, semantic_associated_members, semantic_call_return_type, semantic_checkpoint_dependencies, semantic_members, semantic_named_members, semantic_same_owner, specialize_method_type_with_self}
 import refrain::frontend::semantic_environment::{StoredSemanticEnvironment, decode_semantic_environment, encode_semantic_environment}
 import refrain::frontend::semantic_index::{ModuleSemanticView, PackageSemanticIndex, SemanticIndexBuilder}
 import refrain::frontend::semantic_slice::{SemanticKeyIndex, SemanticSlice}
@@ -305,6 +305,7 @@ pub struct PreparedSafetyModule {
     environment: Json
     environment_hit: bool
     skip_module_checks: bool
+    complete: Json
 }
 
 fn accepted_semantic_guards(previous: Json, bodies: Json) -> Json {
@@ -331,14 +332,18 @@ pub fn check_prepared_safety_module(prepared: sending PreparedSafetyModule) -> s
         check_module_declarations(syntax.ast, input.target, input.features)
     }
     diagnostics.extend(input.resolution_diagnostics)
-    let checked = prepare_module_bodies_with_replay_view(syntax.ast, input.callables, input.fields, input.methods,
-        input.aggregate_names, input.module_name, input.type_names, input.variants, prepared.previous,
-        if prepared.enabled {
-            input.source
-        } else {
-            ""
-        }
-        ,)
+    let accepted = restore_accepted_module_bodies(syntax.ast, input.type_names, prepared.previous, prepared.complete)
+    let checked = match accepted {
+        Some(value) => value
+        None => prepare_module_bodies_with_replay_view(syntax.ast, input.callables, input.fields, input.methods,
+            input.aggregate_names, input.module_name, input.type_names, input.variants, prepared.previous,
+            if prepared.enabled {
+                input.source
+            } else {
+                ""
+            }
+            ,)
+    }
     diagnostics.extend(checked.diagnostics)
     let mut functions = Vec[SafetyFunction]::new()
     for entry in checked.functions {
@@ -361,6 +366,7 @@ pub fn check_prepared_safety_module(prepared: sending PreparedSafetyModule) -> s
     ret PreparedModuleSafety {
         diagnostics, functions,
         Json::Object(vec![("context", Json::String(prepared.context)),("bodies", checked.replay),("guards", prepared.guards),
+                ("complete", checked.complete),("module_bodies_reused", Json::Bool(accepted.is_some())),
                 ("environment", prepared.environment),("valid", Json::Bool(valid))]), checked.checked, checked.reused, prepared.environment_hit, prepared.skip_module_checks
     }
 }
@@ -796,6 +802,11 @@ impl for AnalysisDatabase {
     }
 
     pub fn function_safety_effects_with_replay(self: mut Self, checked: Vec[SafetyFunction], previous: Json) -> SafetyReplayResult {
+        ret self.function_safety_effects_with_verified_modules(checked, previous, Vec[str]::new())
+    }
+    /// The caller proves content/context equality from accepted module receipts.
+    pub fn function_safety_effects_with_verified_modules(self: mut Self, checked: Vec[SafetyFunction], previous: Json,
+        verified_modules: Vec[str],) -> SafetyReplayResult {
         let functions = self.prechecked_safety_functions(checked)
         let mut names = Vec[str]::new()
         let mut contexts = Vec[(str, str)]::new()
@@ -805,7 +816,7 @@ impl for AnalysisDatabase {
                 contexts.push((function.module_name, self.semantic_replay_context(function.module_name)))
             }
         }
-        let result = infer_safety_with_replay(functions, self.metadata_safety_effects, contexts, previous)
+        let result = infer_safety_with_verified_modules(functions, self.metadata_safety_effects, contexts, previous, verified_modules)
         self.safety_effects = result.effects
         self.safety_revision = self.revision
         ret result
@@ -2392,7 +2403,9 @@ impl for AnalysisDatabase {
         }
         ret Json::Object(vec![("context", Json::String(context)),("structure", Json::String(self.semantic_replay_structure(module_name))),
                 ("guards", Json::Object(guards)),("bodies", replay.get("bodies").unwrap_or(Json::Null)),
+                ("complete", replay.get("complete").unwrap_or(Json::Null)),
                 ("source", Json::String(compiler_content_digest(self.source_text(module_name).unwrap_or("")))),
+                ("resolution", Json::String(self.semantic_resolution_identity(module_name))),
                 ("valid", replay.get("valid").unwrap_or(Json::Bool(false))),
                 ("environment", replay.get("environment").unwrap_or(Json::Null))])
     }
@@ -2699,6 +2712,14 @@ impl for AnalysisDatabase {
         }
         let context_finished = perf_counter_ms()
         let validated = self.validate_semantic_replay(module_name, previous, context)
+        let complete = if enabled && self.package_semantics_reused && !context.is_empty() &&
+        previous.get("valid").unwrap_or(Json::Null).as_bool().unwrap_or(false) &&
+        previous.get("context").unwrap_or(Json::Null).as_str().unwrap_or("") == context &&
+        previous.get("source").unwrap_or(Json::Null).as_str().unwrap_or("") == compiler_content_digest(self.source_text(module_name).unwrap_or("")) {
+            previous.get("complete").unwrap_or(Json::Null)
+        } else {
+            Json::Null
+        }
         let replay_finished = perf_counter_ms()
         match self.package_semantic_view(module_name) {
             Some(view) => {
@@ -2710,7 +2731,7 @@ impl for AnalysisDatabase {
                 self.preparation_timings.input_ms += perf_counter_ms() - replay_finished
                 ret PreparedSafetyModule {
                     input, view.constructors, validated, context, enabled,
-                    accepted_semantic_guards(previous, validated), Json::String(index.identity), self.package_semantics_reused, skip_module_checks
+                    accepted_semantic_guards(previous, validated), Json::String(index.identity), self.package_semantics_reused, skip_module_checks, complete
                 }
             }
             None => {
@@ -2726,7 +2747,7 @@ impl for AnalysisDatabase {
         self.preparation_timings.input_ms += perf_counter_ms() - environment_finished
         ret PreparedSafetyModule {
             input,
-            snapshot.value.constructors, validated, context, enabled, accepted_semantic_guards(previous, validated), snapshot.record, snapshot.reused, skip_module_checks
+            snapshot.value.constructors, validated, context, enabled, accepted_semantic_guards(previous, validated), snapshot.record, snapshot.reused, skip_module_checks, Json::Null
         }
     }
 
@@ -2734,10 +2755,43 @@ impl for AnalysisDatabase {
         ret self.preparation_timings
     }
 
-    fn replay_module_checks_current(self: Self, module_name: str, previous: Json, context: str) -> bool {
-        ret !context.is_empty() && previous.get("valid").unwrap_or(Json::Null).as_bool().unwrap_or(false) &&
-        previous.get("context").unwrap_or(Json::Null).as_str().unwrap_or("") == context &&
-        previous.get("source").unwrap_or(Json::Null).as_str().unwrap_or("") == compiler_content_digest(self.source_text(module_name).unwrap_or(""))
+    fn replay_module_checks_current(self: mut Self, module_name: str, previous: Json, context: str) -> bool {
+        if context.is_empty() || !previous.get("valid").unwrap_or(Json::Null).as_bool().unwrap_or(false) ||
+        previous.get("context").unwrap_or(Json::Null).as_str().unwrap_or("") != context {
+            ret false
+        }
+        if previous.get("source").unwrap_or(Json::Null).as_str().unwrap_or("") == compiler_content_digest(self.source_text(module_name).unwrap_or("")) {
+            ret true
+        }
+        ret previous.get("resolution").unwrap_or(Json::Null).as_str().unwrap_or("") == self.semantic_resolution_identity(module_name)
+    }
+
+    /// Resolution reads identifier spellings and token kinds, independently of
+    /// ordinary literal values and positions. Body typing still checks changed
+    /// literals; declaration/template identity is guarded by the caller context.
+    fn semantic_resolution_identity(self: mut Self, module_name: str) -> str {
+        self.ensure_replay_contract_cache()
+        let label = "resolution\n" + module_name
+        let found = self.replay_contract_index.get(label)
+        if found != 0_usize {
+            ret self.replay_contracts.get_unchecked_borrowed(found - 1_usize).2
+        }
+        let document = self.document(module_name).unwrap_or(FrontendDocument::empty())
+        let mut records = Vec[Json]::with_capacity(document.tokens.len())
+        for token in document.tokens {
+            match token.type {
+                TokenType::IDENTIFIER => {
+                    records.push(Json::String("identifier:" + token.value))
+                }
+                _ => {
+                    records.push(Json::String(Debug::fmt(token.type)))
+                }
+            }
+        }
+        let digest = compiler_content_digest("encore-resolution-input-1\n" + stringify(Json::Array(records)))
+        self.replay_contract_index.set(label, self.replay_contracts.len())
+        self.replay_contracts.push((label, self.revision, digest))
+        ret digest
     }
 
     /// Freezes all workspace-dependent facts needed to check one module on a

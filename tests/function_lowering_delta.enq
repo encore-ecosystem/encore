@@ -1,0 +1,59 @@
+//! An ordinary edit keeps sibling generic, inferred, async and closure bodies
+//! verbatim. Generated-helper edits retain the complete lowering adapter.
+import core::option::Option
+import core::testing::assert
+
+import std::vec::Vec
+
+import ehirlib::module_to_string
+
+import refrain::frontend::{Lexer, Parser}
+import refrain::frontend::translator::{CachedFunctionChunk, FunctionLoweringDelta, TranslationModule, lowering_module_revisions, translate_delta_compilation_unit_to_ehir_chunks, translate_keyed_compilation_unit_to_ehir_chunks}
+import refrain::target::host_target
+
+fn module(source: str) -> TranslationModule {
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source("delta.enq")
+    ret TranslationModule::new("delta@main.enq", "delta.enq", Vec[str]::new(), parser.parse(lexer.tokenize(source)), Vec[str]::new())
+}
+fn text(source: str) -> str {
+    let output = translate_keyed_compilation_unit_to_ehir_chunks(vec![module(source)], host_target(), vec![0_usize],
+        Vec[CachedFunctionChunk]::new(), Vec[(str, str)]::new(),)
+    ret module_to_string(output.modules.get_unchecked_borrowed(0_usize).as_module())
+}
+fn main() -> u32 {
+    let prefix = "trait Handler { fn handle(self: Self) -> u32 }\nstruct Left { value: u32 }\nstruct Right { value: str }\n" +
+    "impl for Left { pub fn read(self: Self) -> u32 { ret self.value + "
+    let suffix = "_u32 } }\nimpl for Right { pub fn read(self: Self) -> str { ret self.value } }\n" +
+    "fn identity[T](value: T) -> T { ret value }\nfn inferred() { let value = 5_u32 }\n" +
+    "async fn later() -> u32 { ret 6_u32 }\nfn closure() -> u32 { let call: dyn Handler = || 7_u32 ret call.handle() }\n" +
+    "fn value() -> u32 { ret "
+    let before = prefix + "1" + suffix + "40_u32 }\n"
+    let after = prefix + "2" + suffix + "41_u32 }\n"
+    let old = module(before)
+    let fresh = module(after)
+    let baseline = translate_keyed_compilation_unit_to_ehir_chunks(vec![old], host_target(), vec![0_usize],
+        Vec[CachedFunctionChunk]::new(), Vec[(str, str)]::new(),)
+    let previous = baseline.modules.get_unchecked_borrowed(0_usize).as_module()
+    let delta = FunctionLoweringDelta { 0_usize, previous, lowering_module_revisions(old) }
+    let actual = translate_delta_compilation_unit_to_ehir_chunks(vec![fresh], host_target(), vec![0_usize],
+        Vec[CachedFunctionChunk]::new(), Vec[(str, str)]::new(), vec![delta],)
+    if !assert(module_to_string(actual.modules.get_unchecked_borrowed(0_usize).as_module()) == text(after)) {
+        ret 1_u32
+    }
+    if !assert(actual.functions.len() == 2_usize && actual.functions_reused == lowering_module_revisions(old).len() - 2_usize) {
+        ret 2_u32
+    }
+    // Introducing/removing closures uses full lowering, including its owned
+    // helper definitions. A partial update cannot leave the old helpers behind.
+    let changed_closure = prefix + "1" + suffix + "{ let call: dyn Handler = || 43_u32 ret call.handle() } }\n"
+    let fallback = translate_delta_compilation_unit_to_ehir_chunks(vec![module(changed_closure)], host_target(), vec![0_usize],
+        Vec[CachedFunctionChunk]::new(), Vec[(str, str)]::new(), vec![delta],)
+    if !assert(module_to_string(fallback.modules.get_unchecked_borrowed(0_usize).as_module()) == text(changed_closure)) {
+        ret 3_u32
+    }
+    if !assert(fallback.functions_reused == 0_usize) {
+        ret 4_u32
+    }
+    ret 0_u32
+}

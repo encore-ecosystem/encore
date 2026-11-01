@@ -1,0 +1,98 @@
+//! Content-addressed strict syntax. Semantic acceptance is checked separately.
+import core::option::Option
+import core::result::Result
+
+import std::os::{file_exists, read_file}
+import std::path::Path
+import std::vec::Vec
+
+import ehirlib::{prepared_bytes_payload, prepared_payload_bytes}
+import json::Json
+
+import mod::build_lowering_cache::{commit_lowered_module, restore_lowered_module}
+import mod::build_request::unit_source_records
+import refrain::cache_identity::compiler_content_digest
+import refrain::frontend::source_artifact::ParsedSourceArtifact
+import refrain::frontend::source_codec::{decode_snapshot_ParsedSourceArtifact, encode_snapshot_ParsedSourceArtifact}
+import refrain::project::workspace::{CachedWorkspaceSource, ProjectWorkspace, WorkspaceRefrain}
+
+fn source_key(owner: WorkspaceRefrain, compiler: str, path: Path, source: str) -> str {
+    ret compiler_content_digest("encore-source-syntax-1\n" + compiler + "\n" + owner.name + "\n" +
+        owner.manifest.name + "\n" + owner.manifest.version + "\n" + path.as_str() + "\n" +
+        compiler_content_digest(source) + "\n" + if file_exists(owner.root.join("src/lib.enq").as_str()) {
+            "library-root"
+        } else {
+            "binary-root"
+        }
+    )
+}
+
+pub fn load_source_documents(owner: WorkspaceRefrain, compiler: str, cache: Option[Path]) -> Result[Vec[CachedWorkspaceSource], str] {
+    let mut sources = Vec[CachedWorkspaceSource]::new()
+    // The inventory deliberately includes unimported modules: the workspace
+    // loads them as well, and additions must retain their resolution effects.
+    for record in unit_source_records(owner)? {
+        let relative = record.get("source").unwrap_or(Json::Null).as_str().unwrap_or("")
+        let path = owner.root.join("src").join(relative).resolve()
+        let source = read_file(path.as_str())
+        let key = source_key(owner, compiler, path, source)
+        let mut document = Option[ParsedSourceArtifact]::None
+        match restore_lowered_module(cache, key)? {
+            Some(payload) => {
+                match decode_snapshot_ParsedSourceArtifact(prepared_payload_bytes(payload), key) {
+                    Ok(value) => {
+                        if value.document.parsed && value.document.diagnostics.is_empty() {
+                            document = Option[ParsedSourceArtifact]::Some(value)
+                        }
+                    }
+                    Err(_) => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        sources.push(CachedWorkspaceSource { path.as_str(), source, document })
+    }
+    ret Result::Ok(sources)
+}
+
+pub fn publish_source_documents(workspace: ProjectWorkspace, owner: WorkspaceRefrain, compiler: str,
+    cache: Option[Path],) -> Result[(), str] {
+    if cache.is_none() {
+        ret Result::Ok(())
+    }
+    for module in workspace.modules {
+        if module.owner_name != owner.name || !module.analysis.parsed || !module.diagnostics.is_empty() {
+            continue
+        }
+        let mut reused = false
+        for source in workspace.cached_sources {
+            if source.path == module.module_path.as_str() && source.source == module.source {
+                match source.artifact {
+                    Some(artifact) => {
+                        reused = artifact.analysis_name == module.analysis_id.key()
+                    }
+                    None => {
+                    }
+                }
+                break
+            }
+        }
+        if reused {
+            continue
+        }
+        let key = source_key(owner, compiler, module.module_path, module.source)
+        let artifact = ParsedSourceArtifact { module.analysis_id.key(), module.analysis }
+        // An overlarge/deep syntax tree remains a normal uncached parse.
+        match encode_snapshot_ParsedSourceArtifact(artifact, key) {
+            Ok(bytes) => {
+                let payload = prepared_bytes_payload(bytes)
+                commit_lowered_module(cache, key, payload)?
+            }
+            Err(_) => {
+            }
+        }
+    }
+    ret Result::Ok(())
+}

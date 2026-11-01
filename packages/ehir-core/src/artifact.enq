@@ -2,9 +2,8 @@
 import core::result::Result
 import std::vec::Vec
 
-import binary
-
-import mod::core::{Directive, FnDirective, make_module}
+import mod::artifact_codec::{decode_snapshot_FnDirective, decode_snapshot_Module, decode_snapshot_ModuleBundle, encode_snapshot_FnDirective, encode_snapshot_Module, encode_snapshot_ModuleBundle}
+import mod::core::{Directive, FnDirective, Module, ModuleBundle, make_module}
 import mod::validate::validate_module
 
 pub struct PreparedFunctionArtifact {
@@ -13,31 +12,37 @@ pub struct PreparedFunctionArtifact {
     function: FnDirective
 }
 
-pub fn encode_prepared_function(function: FnDirective, identity: str) -> Result[Vec[u8], str] {
-    match binary::encode(PreparedFunctionArtifact { 2_u32, identity, function }) {
-        Ok(bytes) => {
-            ret Result::Ok(bytes)
-        }
-        Err(error) => {
-            ret Result::Err(error.message())
-        }
+/// Typed snapshots bind the full schema and logical compiler cache identity.
+pub fn encode_typed_module(module: Module, identity: str) -> Result[str, str] {
+    ret Result::Ok(prepared_bytes_payload(encode_snapshot_Module(module, identity)?))
+}
+
+pub fn decode_typed_module(payload: str, identity: str) -> Result[Module, str] {
+    let module = decode_snapshot_Module(prepared_payload_bytes(payload), identity)?
+    let _checked = validate_module(module)?
+    ret Result::Ok(module)
+}
+
+pub fn encode_typed_bundle(bundle: ModuleBundle, identity: str) -> Result[str, str] {
+    ret Result::Ok(prepared_bytes_payload(encode_snapshot_ModuleBundle(bundle, identity)?))
+}
+
+pub fn decode_typed_bundle(payload: str, identity: str) -> Result[ModuleBundle, str] {
+    let bundle = decode_snapshot_ModuleBundle(prepared_payload_bytes(payload), identity)?
+    for module in bundle.modules {
+        let _checked = validate_module(module)?
     }
-    ret Result::Err("cannot encode prepared function")
+    ret Result::Ok(bundle)
+}
+
+pub fn encode_prepared_function(function: FnDirective, identity: str) -> Result[Vec[u8], str] {
+    ret encode_snapshot_FnDirective(function, identity)
 }
 
 pub fn decode_prepared_function(bytes: Vec[u8], identity: str) -> Result[FnDirective, str] {
-    let artifact = match binary::decode[PreparedFunctionArtifact](bytes) {
-        Ok(value) => value
-        Err(error) => {
-            ret Result::Err(error.message())
-        }
-    }
-    if artifact.schema != 2_u32 || artifact.identity != identity {
-        ret Result::Err("prepared EHIR identity or schema mismatch")
-    }
-    // Canonical typed functions are validated directly, with no index adapter.
-    let _checked = validate_module(make_module("prepared", vec![Directive::Function(artifact.function)]))?
-    ret Result::Ok(artifact.function)
+    let function = decode_snapshot_FnDirective(bytes, identity)?
+    let _checked = validate_module(make_module("prepared", vec![Directive::Function(function)]))?
+    ret Result::Ok(function)
 }
 
 /// Storage adapters own locking, integrity verification, accounting and pruning.
@@ -57,6 +62,8 @@ pub struct FunctionPreparationKey {
 }
 
 extern fn encore_codec_string(bytes: u8*, len: usize) -> str
+extern fn encore_str_data(value: str) -> u8*
+extern fn memcpy(destination: u8*, source: u8*, len: usize) -> u8*
 pub fn prepared_bytes_payload(bytes: Vec[u8]) -> str {
     ret unsafe {
         encore_codec_string(bytes.as_ptr(), bytes.len())
@@ -64,8 +71,13 @@ pub fn prepared_bytes_payload(bytes: Vec[u8]) -> str {
 }
 pub fn prepared_payload_bytes(payload: str) -> Vec[u8] {
     let mut bytes = Vec[u8]::with_capacity(payload.byte_len())
-    for index in 0_usize..payload.byte_len() {
-        bytes.push(payload.byte_at(index))
+    // The native call borrows both buffers synchronously. Only byte values are
+    // copied, and no uninitialized element becomes visible before completion.
+    if payload.byte_len() != 0_usize {
+        unsafe {
+            let _copied = memcpy(bytes.as_ptr(), encore_str_data(payload), payload.byte_len())
+        }
+        bytes.set_len(payload.byte_len())
     }
     ret bytes
 }

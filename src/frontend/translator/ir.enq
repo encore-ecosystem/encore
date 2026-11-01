@@ -1,5 +1,6 @@
 //! Direct typed construction. Source type spellings are interned once per scope;
 //! instruction syntax is never generated or parsed by these helpers.
+import core::fmt::Debug
 import core::option::Option
 import core::panic::panic
 import core::result::Result
@@ -23,12 +24,18 @@ pub fn annotated(name: str, typ: str) -> Operand {
 struct ScopeStorage {
     names: StringIndex
     values: Vec[Variable]
+    previous: Vec[usize]
+    parent: Option[ScopeParent]
     type_names: StringIndex
     types: Vec[Type]
     callable_names: StringIndex
     callables: Vec[(str, Vec[Type])]
     exclusive: u8*
     probing: bool
+}
+struct ScopeParent {
+    storage: ScopeStorage<H>
+    limit: usize
 }
 pub struct LoweringScope {
     storage: ScopeStorage<H>
@@ -40,7 +47,8 @@ impl for LoweringScope {
     }
     fn create(params: Vec[Parameter], probing: bool) -> Self {
         let storage = ScopeStorage<H> {
-            string_index_with_capacity(params.len()), Vec[Variable]::new(), string_index_with_capacity(16_usize), Vec[Type]::new(),
+            string_index_with_capacity(params.len()), Vec[Variable]::new(), Vec[usize]::new(), Option[ScopeParent]::None,
+            string_index_with_capacity(16_usize), Vec[Type]::new(),
             string_index_with_capacity(16_usize), Vec[(str, Vec[Type])]::new(), lowering_scope_marker(), probing
         }
         let scope = Self { storage }
@@ -50,13 +58,18 @@ impl for LoweringScope {
         ret scope
     }
     #attr(safe)
-    /// Type probes borrow known values but keep their temporary definitions local.
+    /// Capture a prefix of the parent bindings; probe definitions remain local.
     pub fn fork(self: Self) -> Self {
-        let mut parameters = Vec[Parameter]::with_capacity(self.storage.values.len())
-        for value in self.storage.values {
-            parameters.push(param(value.name, value.typ))
+        let parent = ScopeParent { self.storage, self.storage.values.len() }
+        let scope = Self::create(Vec[Parameter]::new(), true)
+        let address = lowering_scope_address(scope.storage)
+        unsafe {
+            unsafe ehir {
+                state: mut ScopeStorage = pcast address: ScopeStorage *, mut ScopeStorage
+            }
+            state.parent = Option[ScopeParent]::Some(parent)
         }
-        ret Self::create(parameters, true)
+        ret scope
     }
     pub fn is_type_probe(self: Self) -> bool {
         ret self.storage.probing
@@ -102,7 +115,9 @@ impl for LoweringScope {
             unsafe ehir {
                 state: mut ScopeStorage = pcast address: ScopeStorage *, mut ScopeStorage
             }
+            let previous = string_index_get(state.names, value.name)
             string_index_set(state.names, value.name, state.values.len())
+            state.previous.push(previous)
             state.values.push(value)
 
             ret()
@@ -128,9 +143,12 @@ impl for LoweringScope {
                 None => {
                 }
             }
-            let position = string_index_get(state.names, operand.name)
-            if position != 0_usize {
-                ret state.values.get_unchecked_borrowed(position - 1_usize)
+            match scope_binding(self.storage, state.values.len(), operand.name) {
+                Some(value) => {
+                    ret value
+                }
+                None => {
+                }
             }
             if operand.name == "void" || operand.name == "()" {
                 ret var("void", self.typ("()"))
@@ -148,7 +166,7 @@ impl for LoweringScope {
                 state: mut ScopeStorage = pcast address: ScopeStorage *, mut ScopeStorage
             }
             if (op == "ieq" || op == "neq") && operand.annotation.is_none() &&
-            string_index_get(state.names, operand.name) == 0_usize && !operand.name.is_empty() &&
+            scope_binding(self.storage, state.values.len(), operand.name).is_none() && !operand.name.is_empty() &&
             operand.name.byte_at(0_usize) >= 65_u8 && operand.name.byte_at(0_usize) <= 90_u8 {
                 ret enum_tag(operand.name)
             }
@@ -163,6 +181,66 @@ impl for LoweringScope {
         }
         ret out
     }
+}
+
+// A parent can continue appending and rebinding after a fork. Follow each
+// spelling's history back to the captured prefix, then the inherited parent.
+// No instruction, value, type or name table is copied when taking a snapshot.
+#attr(safe)
+fn scope_binding(storage: ScopeStorage<H>, limit: usize, name: str) -> Option[Variable] {
+    let mut cursor = storage
+    let mut bound = limit
+    let mut inherited = false
+    loop {
+        let address = lowering_scope_address(cursor)
+        unsafe {
+            unsafe ehir {
+                state: mut ScopeStorage = pcast address: ScopeStorage *, mut ScopeStorage
+            }
+            let mut position = string_index_get(state.names, name)
+            while position > bound {
+                position = state.previous.get_unchecked_borrowed(position - 1_usize)
+            }
+            if position != 0_usize {
+                let value = state.values.get_unchecked_borrowed(position - 1_usize)
+                // The former parameter-copy snapshot reconstructed inherited
+                // operands with var(), including its SSA/unit classification.
+                ret Option[Variable]::Some(if inherited {
+                        var(value.name, value.typ)
+                    } else {
+                        value
+                    }
+                )
+            }
+            match state.parent {
+                Some(parent) => {
+                    cursor = parent.storage
+                    bound = parent.limit
+                    inherited = true
+                }
+                None => {
+                    ret Option[Variable]::None
+                }
+            }
+        }
+    }
+}
+
+#attr(test)
+fn lowering_scope_fork_keeps_inherited_values_out_of_local_buffer() -> bool {
+    let root = LoweringScope::new(Vec[Parameter]::new())
+    for index in 0_usize..1024_usize {
+        let _ = root.output("value_" + index.fmt(), "u32")
+    }
+    let probe = root.fork()
+    if probe.storage.values.len() != 0_usize || !probe.is_type_probe() {
+        ret false
+    }
+    if probe.bind(reference("value_17")).typ.name != "u32" {
+        ret false
+    }
+    let _ = probe.output("local", "bool")
+    ret probe.storage.values.len() == 1_usize && root.storage.values.len() == 1024_usize
 }
 
 pub struct LoweringBuilder {

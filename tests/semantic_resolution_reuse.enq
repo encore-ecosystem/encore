@@ -1,0 +1,54 @@
+//! Reuse successful name resolution after literal edits, while still checking
+//! body types and invalidating changed lookup/type names.
+import core::option::Option
+import core::testing::assert
+
+import std::vec::Vec
+
+import json::Json
+
+import refrain::frontend::AnalysisDatabase
+import refrain::frontend::analysis_database::check_prepared_safety_module
+import refrain::frontend::semantic_index::PackageSemanticIndex
+import refrain::target::host_target
+
+fn database(literal: str, callee: str) -> AnalysisDatabase {
+    let mut db = AnalysisDatabase::new()
+    db.set_module("app", "app.enq", "fn helper() -> u32 { ret " + literal + " }\n" +
+        "fn value() -> u32 { ret " + callee + "() }\n",)
+    db.configure_safety("app", host_target(), Vec[str]::new())
+    ret db
+}
+fn main() -> u32 {
+    let modules = vec!["app"]
+    let mut cold = database("41_u32", "helper")
+    let identity = cold.semantic_package_identity(modules)
+    cold.prepare_package_semantics(modules, identity, Option[PackageSemanticIndex]::None)
+    let checked = check_prepared_safety_module(cold.prepare_module_safety_job("app", host_target(), Vec[str]::new(), Json::Null, true))
+    if !assert(checked.diagnostics.is_empty() && checked.checked == 2_usize) {
+        ret 1_u32
+    }
+    let previous = cold.finalize_semantic_replay("app", checked.replay)
+    let index = cold.package_semantic_index().unwrap_or(PackageSemanticIndex::empty())
+    let mut warm = database("42_u32", "helper")
+    if !assert(warm.prepare_package_semantics(modules, warm.semantic_package_identity(modules), Option::Some(index))) {
+        ret 2_u32
+    }
+    let edited = check_prepared_safety_module(warm.prepare_module_safety_job("app", host_target(), Vec[str]::new(), previous, true))
+    if !assert(edited.module_checks_reused && edited.checked == 1_usize && edited.reused == 1_usize && edited.diagnostics.is_empty()) {
+        ret 3_u32
+    }
+    let mut missing = database("41_u32", "missing")
+    missing.prepare_package_semantics(modules, missing.semantic_package_identity(modules), Option::Some(index))
+    let bad_name = check_prepared_safety_module(missing.prepare_module_safety_job("app", host_target(), Vec[str]::new(), previous, true))
+    if !assert(!bad_name.module_checks_reused && !bad_name.diagnostics.is_empty()) {
+        ret 4_u32
+    }
+    let mut wrong = database("\"wrong\"", "helper")
+    wrong.prepare_package_semantics(modules, wrong.semantic_package_identity(modules), Option::Some(index))
+    let bad_type = check_prepared_safety_module(wrong.prepare_module_safety_job("app", host_target(), Vec[str]::new(), previous, true))
+    if !assert(!bad_type.diagnostics.is_empty()) {
+        ret 5_u32
+    }
+    ret 0_u32
+}

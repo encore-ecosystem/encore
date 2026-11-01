@@ -1,0 +1,70 @@
+//! Measures LLVM emission from normalized owned EHIR and dependency templates.
+import core::fmt::Debug
+import core::option::Option
+
+import std::io::{eprintln, println}
+import std::os::{env, read_file}
+import std::time::perf_counter_ms
+import std::vec::Vec
+
+import ehir_core::{Module, make_module_bundle, parse_module_bundle_text}
+import ehir_llvm_backend::codegen::{clear_codegen_error, emit_unit_codegen_selected_parallel, prepare_normalized_unit_codegen, take_codegen_error}
+import json::{Json, stringify}
+extern fn encore_text_sha256(value: str) -> str
+fn main() -> u32 {
+    let directory = env("ENCORE_BACKEND_BENCH_INPUTS").unwrap_or("")
+    if directory.is_empty() {
+        ret 0_u32
+    }
+    let started = perf_counter_ms()
+    let owned = parse_module_bundle_text("", read_file(directory + "/owned.ehir"))
+    let mut modules = Vec[Module]::new()
+    let paths = read_file(directory + "/dependencies.txt")
+    let mut start = 0_usize
+    while start < paths.byte_len() {
+        let end = paths.find_byte_from(10_u8, start)
+        if end > start {
+            let bundle = parse_module_bundle_text("", read_file(paths.slice_bytes(start, end - start)))
+            modules.extend(bundle.modules)
+        }
+        if end >= paths.byte_len() {
+            break
+        }
+        start = end + 1_usize
+    }
+    let loaded = perf_counter_ms()
+    clear_codegen_error()
+    let prepared = prepare_normalized_unit_codegen(owned, make_module_bundle("", modules), "x86_64-unknown-linux-gnu", 64_usize)
+    let ready = perf_counter_ms()
+    eprintln("Prepared real input in " + Debug::fmt(ready - started) + " ms")
+    let limit = env("ENCORE_BACKEND_BENCH_MODULE").unwrap_or("")
+    let mut selected = Vec[usize]::new()
+    let mut index = 0_usize
+    for module in owned.modules {
+        if limit.is_empty() || module.name == limit {
+            selected.push(index)
+        }
+        index += 1_usize
+    }
+    if selected.is_empty() {
+        ret 1_u32
+    }
+    let outputs = emit_unit_codegen_selected_parallel(prepared, "x86_64-unknown-linux-gnu", 64_usize, selected, 8_usize)
+    let emitted = perf_counter_ms()
+    let error = take_codegen_error()
+    if !error.is_empty() {
+        eprintln(error) ret 2_u32
+    }
+    let mut hashes = Vec[Json]::new()
+    for output in outputs {
+        if !output.diagnostic.is_empty() {
+            eprintln(output.diagnostic) ret 3_u32
+        }
+        hashes.push(Json::Object(vec![("module", Json::String(output.module_id)),("bytes", Json::Number(Debug::fmt(output.ir.byte_len()))),("sha256", Json::String(unsafe {
+                                encore_text_sha256(output.ir)
+                            }
+                        ))]))
+    }
+    println(stringify(Json::Object(vec![("load_ms", Json::Number(Debug::fmt(loaded - started))),("prepare_ms", Json::Number(Debug::fmt(ready - loaded))),("emit_ms", Json::Number(Debug::fmt(emitted - ready))),("outputs", Json::Array(hashes))])))
+    ret 0_u32
+}
