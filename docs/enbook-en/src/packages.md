@@ -450,6 +450,12 @@ triple and profile. Paths in metadata are relative to the declaring package, not
 the consumer or the metadata output directory. Source files are compiled once;
 archives/objects are linked as files, and name-only entries select system libraries.
 
+Dependency build scripts, including nested scripts, resolve index packages using
+the original consumer's registry selection and `encore.lock`. A dependency's
+`[registry].index` does not override the consumer. `ENCORE_INDEX_URL` still takes
+precedence over the consumer's manifest, while `ENCORE_DEFAULT_INDEX` is only a
+fallback. Locked packages already in the registry cache remain usable offline.
+
 The compiled host script is cached, but executes on each build so changes to its
 inputs are observed. Its selected sources, included headers, native files and link
 arguments participate in native/link cache identities. A failed script, missing

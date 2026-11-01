@@ -40,7 +40,7 @@ import refrain::frontend::translator::{TranslatedModuleChunk, TranslationModule,
 import refrain::project::{ProjectWorkspace, WorkspaceModule, WorkspaceRefrain, load_binary_workspace, load_library_workspace, system_core_root, system_platform_root, workspace_release_modules, workspace_root_refrain}
 import refrain::project::build_graph::encode_build_graph
 import refrain::project::manifest::{project_build_kind, project_manifest_binary_name, project_manifest_name, project_manifest_target, project_target_toolchain, read_project_manifest}
-import refrain::project::workspace::{ResolvedPackageGraph, try_load_entry_workspace, try_resolve_package_graph}
+import refrain::project::workspace::{ResolvedPackageGraph, try_load_entry_workspace_locked, try_resolve_package_graph, try_resolve_package_graph_locked}
 import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host, target_is_supported, toolchain_driver_is_supported}
 import refrain::target::kits::{target_kit_installed, target_kit_toolchain, target_platform_root}
 import refrain::version::compiler_release_version
@@ -763,7 +763,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     }
     profile_incremental_input("graph", pipeline_started)
     let scripts_started = perf_counter_ms()
-    let metadata = run_native_build_scripts(graph.refrains, "", target, profile, staging)?
+    let metadata = run_native_build_scripts(graph.refrains, "", target, profile, staging, root)?
     profile_incremental_input("scripts", scripts_started)
     let native_started = perf_counter_ms()
     let native = UnitNativePlan {
@@ -1054,7 +1054,7 @@ fn prepare_cached_program_support(lock: UnitCacheLock, packages: Vec[CompiledPac
 // target. Each invocation has isolated output; a failed script can never reuse
 // an older metadata file. Dependencies run before their consumers.
 fn run_native_build_scripts(packages: Vec[WorkspaceRefrain], skip: str, target: TargetSpec,
-    profile: str, staging: Path,) -> Result[NativeBuildMetadata, str] {
+    profile: str, staging: Path, lock_root: Path,) -> Result[NativeBuildMetadata, str] {
     let mut plans = Vec[NativeBuildMetadata]::new()
     let mut index = 0_usize
     for package in packages {
@@ -1072,7 +1072,7 @@ fn run_native_build_scripts(packages: Vec[WorkspaceRefrain], skip: str, target: 
                     ret Result[NativeBuildMetadata, str]::Err("cannot create build-script directory")
                 }
                 let metadata = directory.join("native.json")
-                let args = vec!["__run-build-script", package.root.as_str(), script.as_str(), metadata.as_str(), target.triple, profile]
+                let args = vec!["__run-build-script", package.root.as_str(), script.as_str(), metadata.as_str(), target.triple, profile, lock_root.as_str()]
                 run_program_tool(executable_path(), args, directory, "build-script")?
                 if !file_exists(metadata.as_str()) {
                     ret Result[NativeBuildMetadata, str]::Err("build script did not write metadata: " + script.as_str())
@@ -1104,12 +1104,13 @@ fn run_native_build_scripts(packages: Vec[WorkspaceRefrain], skip: str, target: 
 /// parent compiler. Cached host script compilation is serialized per script.
 #attr(safe)
 pub fn run_build_script_worker() -> u32 {
-    if argc() < 7 {
+    if argc() < 8 {
         eprintln("invalid build-script worker arguments") ret 2
     }
     let root = Path::new(argv(2).unwrap_or("")).resolve()
     let script = Path::new(argv(3).unwrap_or("")).resolve()
     let output = Path::new(argv(4).unwrap_or("")).resolve()
+    let lock_root = Path::new(argv(7).unwrap_or("")).resolve()
     let key = compiler_content_digest(script.as_str())
     let locks = root.join("target/build-scripts/locks")
     let mut acquired = Option[UnitCacheLock]::None
@@ -1134,13 +1135,13 @@ pub fn run_build_script_worker() -> u32 {
             ret 1
         }
     }
-    let status = run_locked_build_script(root, script, output, key)
+    let status = run_locked_build_script(root, script, output, key, lock_root)
     close_unit_cache_lock(lock)
     ret status
 }
 
-fn run_locked_build_script(root: Path, script: Path, output: Path, key: str) -> u32 {
-    let binary = match prepare_build_script_binary(root, script, output, key) {
+fn run_locked_build_script(root: Path, script: Path, output: Path, key: str, lock_root: Path) -> u32 {
+    let binary = match prepare_build_script_binary(root, script, output, key, lock_root) {
         Ok(value) => value Err(error) => {
             ret build_script_error(error)
         }
@@ -1154,8 +1155,8 @@ fn run_locked_build_script(root: Path, script: Path, output: Path, key: str) -> 
     ret 0
 }
 
-fn prepare_build_script_binary(root: Path, script: Path, output: Path, key: str) -> Result[Path, str] {
-    let graph = match try_resolve_package_graph(root, true, true) {
+fn prepare_build_script_binary(root: Path, script: Path, output: Path, key: str, lock_root: Path) -> Result[Path, str] {
+    let graph = match try_resolve_package_graph_locked(root, true, true, lock_root) {
         Ok(value) => value Err(failure) => {
             ret Result::Err(failure.message)
         }
@@ -1166,7 +1167,7 @@ fn prepare_build_script_binary(root: Path, script: Path, output: Path, key: str)
     // Entry programs currently compile all host runtimes with these exact flags.
     toolchain.hosted_runtime = true
     toolchain.runtime_sources = Vec[str]::new()
-    let metadata = run_native_build_scripts(graph.refrains, graph.root_name, target, "dev", staging)?
+    let metadata = run_native_build_scripts(graph.refrains, graph.root_name, target, "dev", staging, lock_root)?
     let plan = UnitNativePlan {
         resolve_native_program(toolchain.compiler)?, resolve_native_program(toolchain.archiver)?,
         vec!["-O0", "-g", "-fno-experimental-isel", "-Wno-override-module"]
@@ -1200,7 +1201,7 @@ fn prepare_build_script_binary(root: Path, script: Path, output: Path, key: str)
     if successful_build_matches(profile, configuration, inventory, graph, binary, Option[Path]::None) {
         ret Result::Ok(binary)
     }
-    let workspace = match try_load_entry_workspace(root, script) {
+    let workspace = match try_load_entry_workspace_locked(root, script, lock_root) {
         Ok(workspace) => workspace Err(failure) => {
             ret Result::Err(failure.message)
         }
@@ -1228,7 +1229,7 @@ fn prepare_build_script_binary(root: Path, script: Path, output: Path, key: str)
     // Native header/tool/flag changes must also invalidate the older test-binary
     // cache, whose source-only key cannot prove this stronger entry contract.
     remove_file(binary.as_str() + ".fingerprint")
-    if compile_entry_ast_with_metadata(root, workspace, workspace.flat_ast, name, true, Option[NativeBuildMetadata]::Some(metadata)) != 0 {
+    if compile_entry_ast_with_metadata(root, workspace, workspace.flat_ast, name, true, Option[NativeBuildMetadata]::Some(metadata), lock_root) != 0 {
         ret Result::Err("build script compilation failed: " + script.as_str())
     }
     if eligible {
@@ -3840,18 +3841,18 @@ fn normalize_profile(profile: str) -> str {
 
 /// Performs the `compile_test_ast` operation.
 pub fn compile_test_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str) -> u32 {
-    ret compile_entry_ast(root, workspace, ast, binary_name, false)
+    ret compile_entry_ast(root, workspace, ast, binary_name, false, root)
 }
 
 #attr(safe)
 fn compile_entry_ast(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str,
-    build_script: bool,) -> u32 {
-    ret compile_entry_ast_with_metadata(root, workspace, ast, binary_name, build_script, Option[NativeBuildMetadata]::None)
+    build_script: bool, lock_root: Path,) -> u32 {
+    ret compile_entry_ast_with_metadata(root, workspace, ast, binary_name, build_script, Option[NativeBuildMetadata]::None, lock_root)
 }
 
 #attr(safe)
 fn compile_entry_ast_with_metadata(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str,
-    build_script: bool, supplied_metadata: Option[NativeBuildMetadata],) -> u32 {
+    build_script: bool, supplied_metadata: Option[NativeBuildMetadata], lock_root: Path,) -> u32 {
     // The workspace already includes a unique process/timestamp suffix. Keep
     // its name independent of the artifact hash to fit nested Windows projects.
     let managed = match BuildWorkspace::new(root / "target" / "tests", "native") {
@@ -3863,7 +3864,7 @@ fn compile_entry_ast_with_metadata(root: Path, workspace: ProjectWorkspace, ast:
         }
     }
     with managed as scope {
-        let code = compile_entry_ast_in(root, workspace, ast, binary_name, build_script, scope.directory, supplied_metadata)
+        let code = compile_entry_ast_in(root, workspace, ast, binary_name, build_script, scope.directory, supplied_metadata, lock_root)
         scope.complete(code == 0_u32, if code == 0_u32 {
                 ""
             } else {
@@ -3877,7 +3878,7 @@ fn compile_entry_ast_with_metadata(root: Path, workspace: ProjectWorkspace, ast:
 
 #attr(safe)
 fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statement], binary_name: str,
-    build_script: bool, staging: Path, supplied_metadata: Option[NativeBuildMetadata],) -> u32 {
+    build_script: bool, staging: Path, supplied_metadata: Option[NativeBuildMetadata], lock_root: Path,) -> u32 {
     let input_started = perf_counter_ms()
     // Parser/import failures are fatal even on a worker binary cache hit.
     // Lowering-time validation cannot recover diagnostics discarded by parsing.
@@ -3920,7 +3921,7 @@ fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
                 } else {
                     ""
                 }
-                , target, "dev", staging,) {
+                , target, "dev", staging, lock_root,) {
                 Ok(metadata) => metadata Err(error) => {
                     ret build_script_error(error)
                 }
