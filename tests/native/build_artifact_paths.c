@@ -1,8 +1,15 @@
 /* Exercise the actual cache writer, reader, metadata and locks before bootstrap. */
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
+#define _DARWIN_C_SOURCE
 #include "../../runtime/build_artifact.h"
 #include "../../runtime/cache_fs.h"
 #include <assert.h>
+
+static void directory_append(char *path, size_t capacity, const char *suffix) {
+    size_t length = strlen(path), bytes = strlen(suffix);
+    assert(length < capacity && bytes < capacity - length);
+    memcpy(path + length, suffix, bytes + 1);
+}
 
 static void directory_create(const char *path) {
 #ifdef _WIN32
@@ -77,10 +84,10 @@ int main(void) {
     size_t root_length = strlen(directory);
     directory_create(directory);
     snapshot_contract(directory);
-    strcat(directory, "/snapshots-\xd0\xba\xd0\xb5\xd1\x88");
+    directory_append(directory, sizeof(directory), "/snapshots-\xd0\xba\xd0\xb5\xd1\x88");
     directory_create(directory);
     while (strlen(directory) < 340) {
-        strcat(directory, "/cache-context-0123456789abcdef");
+        directory_append(directory, sizeof(directory), "/cache-context-0123456789abcdef");
         directory_create(directory);
     }
     snapshot_contract(directory);
