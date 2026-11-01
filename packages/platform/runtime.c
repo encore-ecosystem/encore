@@ -2220,16 +2220,32 @@ int32_t encore_fs_copy_file(encore_str source, encore_str destination) {
     if (destination_len > SIZE_MAX - 32) { fclose(input); free(destination_c); return -1; }
     char *temporary_c = malloc(destination_len + 32);
     if (temporary_c == NULL) { fclose(input); free(destination_c); return -1; }
-    memcpy(temporary_c, destination_c, destination_len);
+    /* Keep the temporary beside the destination, but do not append to its
+     * basename: content-addressed names can already approach MAX_PATH or
+     * NAME_MAX before the atomic-copy suffix is added. */
+    size_t directory_len = 0;
+#ifdef _WIN32
+    /* Preserve drive-relative destinations such as C:archive.erlib too. */
+    if (destination_len >= 2 && destination_c[1] == ':') directory_len = 2;
+#endif
+    for (size_t i = 0; i < destination_len; ++i) {
+        if (destination_c[i] == '/'
+#ifdef _WIN32
+            || destination_c[i] == '\\'
+#endif
+        ) directory_len = i + 1;
+    }
+    memcpy(temporary_c, destination_c, directory_len);
 #ifdef _WIN32
     int temporary_fd = -1;
     unsigned long process_id = GetCurrentProcessId();
     for (unsigned int attempt = 0; attempt < 100 && temporary_fd < 0; ++attempt) {
-        snprintf(temporary_c + destination_len, 32, ".tmp.%lu.%u", process_id, attempt);
+        snprintf(temporary_c + directory_len, destination_len + 32 - directory_len,
+                 ".encore-copy.%lu.%u", process_id, attempt);
         temporary_fd = encore_windows_open_exclusive(temporary_c);
     }
 #else
-    memcpy(temporary_c + destination_len, ".tmp.XXXXXX", 12);
+    memcpy(temporary_c + directory_len, ".encore-copy.XXXXXX", sizeof(".encore-copy.XXXXXX"));
     int temporary_fd = mkstemp(temporary_c);
 #endif
 #ifdef _WIN32
@@ -2244,9 +2260,9 @@ int32_t encore_fs_copy_file(encore_str source, encore_str destination) {
 #else
             close(temporary_fd);
 #endif
+            encore_path_remove(temporary_c);
         }
         fclose(input);
-        encore_path_remove(temporary_c);
         free(temporary_c);
         free(destination_c);
         return -1;
