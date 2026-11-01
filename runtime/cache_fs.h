@@ -5,7 +5,7 @@
 static uint64_t encore_cache_file_fact(const char *path, unsigned field) {
     if (path == NULL) return 0;
 #ifdef _WIN32
-    wchar_t *wide = encore_build_artifact_wide(path);
+    wchar_t *wide = encore_build_artifact_path(path);
     if (wide == NULL) return 0;
     HANDLE file = CreateFileW(wide, FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
@@ -46,7 +46,7 @@ static int encore_cache_lock_shared(size_t raw) {
 
 static void encore_cache_touch(const char *path) {
 #ifdef _WIN32
-    wchar_t *wide = encore_build_artifact_wide(path);
+    wchar_t *wide = encore_build_artifact_path(path);
     if (wide == NULL) return;
     HANDLE f = CreateFileW(wide, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
