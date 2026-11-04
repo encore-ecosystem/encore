@@ -22,6 +22,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--compiler-profile", default="unspecified", help="profile used to build the compiler executable")
     parser.add_argument("--endpoints", type=int, default=463)
     parser.add_argument("--repetitions", type=int, default=3)
     args = parser.parse_args()
@@ -36,7 +37,7 @@ def main() -> int:
     triple = host.group(1)
     report = {
         "schema": 1, "fixture": "generated-sdk-v1", "endpoints": args.endpoints,
-        "compiler_sha256": digest(compiler),
+        "compiler_sha256": digest(compiler), "compiler_profile": args.compiler_profile,
         "compiler_version": subprocess.check_output([str(compiler), "--version"], text=True).strip(),
         "platform": platform.platform(), "profile": "dev", "target": triple, "jobs": "automatic", "logical_cpus": os.cpu_count(),
         "cache_policy": "each repetition has a new private project/package cache; OS buffers and native tools retained",
@@ -83,7 +84,7 @@ def main() -> int:
                     raise RuntimeError(run.stdout + run.stderr)
                 binary = root / "target/dev" / ("sdk_benchmark.exe" if os.name == "nt" else "sdk_benchmark")
                 subprocess.run([str(binary)], check=True, timeout=10)
-                if case == "warm" and not sample["timings"].get("input_cache_hit"):
+                if case == "warm" and not sample["timings"].get("input_cache_hit", sample["timings"].get("link_cache_hit", False)):
                     raise RuntimeError("unchanged build missed its input receipt")
 
             measure("cold")

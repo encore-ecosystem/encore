@@ -31,7 +31,7 @@ import mod::build_output::{append_package_archives, append_shared_library_args, 
 import mod::build_receipt::{BuildInputInventory, build_input_inventory, publish_successful_build, successful_build_matches, successful_build_miss_reason, watched_build_inputs}
 import mod::build_requirements::{UnitRequirements, requirements_content_digest}
 import mod::build_scripts::{NativeBuildMetadata, parse_native_build_metadata}
-import mod::cache_policy::{BuildWorkspace, keep_build_artifacts, sweep_project}
+import mod::cache_policy::{BuildWorkspace, close_lock, keep_build_artifacts, open_lock, sweep_project}
 import refrain::cache_identity::{compiler_binary_identity, compiler_content_digest, compiler_file_digest}
 import refrain::diagnostics::render_diagnostic
 import refrain::frontend::{FrontendDiagnostic, PreparedSemanticModule, check_prepared_semantic_module}
@@ -739,8 +739,10 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
     let workspace = BuildWorkspace::new(profile_dir, "packages")?
     let mut result = Result[(), str]::Ok(())
     let mut pipeline_finished = command_started
+    let mut pipeline_report = Json::Null
     with workspace as scope {
         result = compile_package_binary_in(root, target, toolchain, profile, profile_dir, binary, scope.directory)
+        pipeline_report = parse(read_file(scope.directory.join("encore-timings.json").as_str())).unwrap_or(Json::Null)
         match result {
             Ok(_) => {
                 scope.complete(true, "")
@@ -758,7 +760,7 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
         eprintln("input-time cleanup and cache: " + Debug::fmt(cleanup_ms) + " ms")
     }
     if result.is_ok() {
-        let report = parse(read_file(profile_dir.join("encore-timings.json").as_str())).unwrap_or(Json::Null)
+        let report = pipeline_report
         let mut fields = Vec[(str, Json)]::new()
         for field in report.as_object().unwrap_or(Vec[(str, Json)]::new()) {
             if field.0 != "schema" && field.0 != "total_ms" {
@@ -766,6 +768,10 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
             }
         }
         fields.push(("schema", Json::Number("2")))
+        fields.push(("command_id", Json::Number(Debug::fmt(unsafe {
+                            encore_compiler_process_id()
+                        }
+                    ))))
         fields.push(("pipeline_ms", report.get("total_ms").unwrap_or(Json::Number("0"))))
         fields.push(("command_ms", Json::Number(Debug::fmt(unsafe {
                             encore_compiler_command_elapsed_ms()
@@ -774,7 +780,7 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
         fields.push(("workspace_sweep_ms", Json::Number(Debug::fmt(sweep_ms))))
         fields.push(("workspace_cleanup_and_cache_ms", Json::Number(Debug::fmt(cleanup_ms))))
         fields.push(("total_ms", Json::Number(Debug::fmt(perf_counter_ms() - command_started))))
-        if !write_verified_artifact(profile_dir.join("encore-timings.json"), stringify(Json::Object(fields))) {
+        if !publish_command_timing(profile_dir, stringify(Json::Object(fields))) {
             ret Result::Err("cannot record command timings")
         }
     }
@@ -785,7 +791,18 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
 /// Adds launch preparation time without including the user program runtime.
 pub fn record_run_timing(directory: Path) ->() {
     let path = directory.join("encore-timings.json")
+    let lease = command_timing_lock(directory)
+    if lease == 0_usize {
+        ret()
+    }
     let previous = parse(read_file(path.as_str())).unwrap_or(Json::Null)
+    let command_id = Debug::fmt(unsafe {
+            encore_compiler_process_id()
+        }
+    )
+    if previous.get("command_id").unwrap_or(Json::Null).as_number().unwrap_or("") != command_id {
+        close_lock(lease) ret()
+    }
     let mut fields = Vec[(str, Json)]::new()
     for field in previous.as_object().unwrap_or(Vec[(str, Json)]::new()) {
         if field.0 != "time_to_exec_ms" {
@@ -796,7 +813,41 @@ pub fn record_run_timing(directory: Path) ->() {
                         encore_compiler_command_elapsed_ms()
                     }
                 ))))
-    let _recorded = write_verified_artifact(path, stringify(Json::Object(fields)))
+    let _recorded = unsafe {
+        encore_compiler_write_atomic(native_path(path.as_str()), stringify(Json::Object(fields)))
+    }
+    close_lock(lease)
+}
+
+// Timing reports are diagnostics, not cache entries. Each pipeline records to
+// its private workspace; publish one complete command report under a short lock.
+fn command_timing_lock(directory: Path) -> usize {
+    loop {
+        let lease = open_lock(directory.join(".encore-timings.lock"), false)
+        if lease != 0_usize {
+            ret lease
+        }
+        if unsafe {
+            encore_compiler_worker_interrupted()
+        }
+        != 0_i32 {
+            ret 0_usize
+        }
+        let _slept = sleep_ms(5_u64)
+    }
+}
+fn publish_command_timing(directory: Path, contents: str) -> bool {
+    let lease = command_timing_lock(directory)
+    if lease == 0_usize {
+        ret false
+    }
+    let path = directory.join("encore-timings.json")
+    let written = unsafe {
+        encore_compiler_write_atomic(native_path(path.as_str()), contents)
+    }
+    let _legacy = remove_file(artifact_checksum_path(path).as_str())
+    close_lock(lease)
+    ret written
 }
 
 #attr(safe)
@@ -892,7 +943,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
         eprintln("input-cache miss: " + miss_reason)
     }
     if input_match {
-        write_package_pipeline_timing(profile_dir, Vec[CompiledPackage]::new(), 0, 0, 0,
+        write_package_pipeline_timing(staging, Vec[CompiledPackage]::new(), 0, 0, 0,
             perf_counter_ms() - pipeline_started, true, input_phases,)?
         ret Result::Ok(())
     }
@@ -931,7 +982,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     file_exists(binary.as_str()) &&(import_name == "" ||
         (file_exists(import_library.as_str()) && previous.get("import-library").unwrap_or(Json::Null).as_str().unwrap_or("") == file_sha256(import_library.as_str()))) {
         publish_successful_build(profile_dir, receipt_configuration, inventory, graph, binary, receipt_import)?
-        write_package_pipeline_timing(profile_dir, packages, packages_ms, 0, 0, perf_counter_ms() - pipeline_started, true, input_phases)?
+        write_package_pipeline_timing(staging, packages, packages_ms, 0, 0, perf_counter_ms() - pipeline_started, true, input_phases)?
         ret Result[(), str]::Ok(())
     }
     let mut names = Vec[str]::new()
@@ -1050,7 +1101,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
         ret Result[(), str]::Err("cannot commit final binary identity")
     }
     publish_successful_build(profile_dir, receipt_configuration, inventory, graph, binary, receipt_import)?
-    write_package_pipeline_timing(profile_dir, packages, packages_ms, support_native_ms,
+    write_package_pipeline_timing(staging, packages, packages_ms, support_native_ms,
         perf_counter_ms() - pipeline_started - packages_ms - support_native_ms, perf_counter_ms() - pipeline_started, false, input_phases,)?
     ret Result[(), str]::Ok(())
 }

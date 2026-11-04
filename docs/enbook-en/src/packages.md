@@ -115,7 +115,7 @@ Package entries default to `~/.cache/encore/units-v1`; `ENCORE_BUILD_CACHE`
 overrides that location. Private staging and native objects are under `target/`.
 `encore build --timings` writes `encore-timings.json` in the profile output
 directory, including queue time, package cache hits and total pipeline time.
-Schema 2 includes whole-command `command_ms`, pipeline, workspace sweep and
+Schema 2 identifies its producing process with `command_id` and includes whole-command `command_ms`, pipeline, workspace sweep and
 cleanup durations. `encore run` records `time_to_exec_ms` immediately before
 launch; program runtime is excluded from that measurement. `inputs` separates
 dependency graph resolution, executed build scripts, native input discovery,
@@ -124,7 +124,9 @@ verified input receipt hit; otherwise it identifies the first failed check
 (for example `source-changed`, `source-set-changed`, `configuration-changed`,
 `output-missing`, or `receipt-missing-or-corrupt`). Per-unit records retain the
 existing frontend/backend/native cache-hit and phase fields. Concurrent worker
-durations overlap and must not be summed as wall time.
+durations overlap and must not be summed as wall time. Each invocation prepares
+its report in a private workspace and atomically publishes a complete report
+under a short profile lock; concurrent invocations cannot splice their phases.
 
 These internal artifact formats are compiler-specific, not a public ABI or a
 replacement for the dependency lockfile. Build scripts still execute on every
