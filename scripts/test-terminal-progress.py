@@ -225,8 +225,15 @@ def cli_tests(compiler, temporary):
     for arguments in (["check", "--format", "json"], ["lint", "--format", "json"],
                       ["format", "--check"], ["test", "--list"], ["sync"],
                       ["build", "--jobs", "1"], ["run"]):
-        result = subprocess.run([compiler, *arguments], cwd=root, env=environment,
-                                capture_output=True, timeout=120)
+        # This probe checks output, not build speed. Cold single-worker SDK
+        # builds can exceed two minutes on hosted ARM runners.
+        timeout = 600 if arguments[0] == "build" else 120
+        try:
+            result = subprocess.run([compiler, *arguments], cwd=root, env=environment,
+                                    capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError(("CLI probe timed out", arguments, timeout,
+                                  error.stdout, error.stderr)) from error
         assert result.returncode == 0, (arguments, result.stdout, result.stderr)
         assert b"\x1b" not in result.stdout + result.stderr, (arguments, result)
     print("Redirected build/run/tooling/dependency CLI contracts: passed")
