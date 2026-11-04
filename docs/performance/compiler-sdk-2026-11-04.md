@@ -101,3 +101,10 @@ they are incomplete. `lint --allow unused-mut` completed with warnings and exit 
 No repository lint configuration was weakened. Changed Encore declarations were
 formatted and whitespace validation passed; whole-file formatting of the largest
 existing compiler modules was avoided after its similarly prolonged traversal.
+
+The existing cache-policy CLI suite passed all 12 checks, including read-only dry
+runs, corruption/allocation-failure handling, locked entries, symlinks and retained
+workspaces. Its isolated SHA-failure native probe supplies the new filesystem SHA
+and real monotonic-clock ABI dependencies. Existing terminal-progress integration
+also passed native frames/resize/lifecycle, redirected CLI output, parallel test
+events and user-program terminal handoff.
