@@ -4,6 +4,11 @@ import core::option::Option
 
 import std::vec::Vec
 
+extern fn encore_strmap_new() -> usize
+extern fn encore_strmap_get(map: usize, key: str) -> usize
+extern fn encore_strmap_put(map: usize, key: str, value: usize) ->()
+extern fn encore_strmap_free(map: usize) ->()
+
 import mod::import_edits::{import_bindings, import_removal_edits}
 import refrain::frontend::{DiagnosticLabelKind, DiagnosticSuggestion, Expr, FrontendDiagnostic, FrontendDocument, Lexer, MatchArmBody, Statement, SuggestionApplicability, Token, TokenType, tooling_tokens_from_tokens}
 import refrain::frontend::parser::Documentation
@@ -242,13 +247,17 @@ pub fn analyze_source_document(path: str, source: str, document: FrontendDocumen
         emit_trailing_whitespace(path, source, config, out)
     }
     let usage_tokens = tooling_tokens_from_tokens(document.tokens)
-    emit_unused_imports(path, document, usage_tokens, config, out)
-    emit_unused_variables(path, document, usage_tokens, config, out)
+    let occurrences = identifier_usage_index(usage_tokens)
+    emit_unused_imports(path, document, usage_tokens, occurrences, config, out)
+    emit_unused_variables(path, document, usage_tokens, occurrences, config, out)
     emit_unused_mut(path, document, config, out)
     emit_unreachable_code(path, document, config, out)
-    emit_dead_code(path, document, usage_tokens, config, out)
+    emit_dead_code(path, document, usage_tokens, occurrences, config, out)
     emit_redundant_conditions(path, document, config, out)
     emit_unreachable_patterns(path, document, config, out)
+    unsafe {
+        encore_strmap_free(occurrences)
+    }
     ret out
 }
 
@@ -343,7 +352,12 @@ pub fn analyzer_source_diagnostic_to_frontend(diagnostic: AnalyzerDiagnostic, so
 /// Groups all unused binding removals into non-overlapping source edits.
 pub fn unused_import_fixes(path: str, source: str, document: FrontendDocument, config: AnalyzerConfig) -> Vec[DiagnosticSuggestion] {
     let mut findings = Vec[AnalyzerDiagnostic]::new()
-    emit_unused_imports(path, document, tooling_tokens_from_tokens(document.tokens), config, findings)
+    let usage_tokens = tooling_tokens_from_tokens(document.tokens)
+    let occurrences = identifier_usage_index(usage_tokens)
+    emit_unused_imports(path, document, usage_tokens, occurrences, config, findings)
+    unsafe {
+        encore_strmap_free(occurrences)
+    }
     let mut removals = Vec[Token]::new()
     for finding in findings {
         removals.push(Token::new(TokenType::IDENTIFIER, "", finding.line, finding.column))
@@ -649,14 +663,14 @@ fn named_location(tokens: Vec[Token], name: str, fallback: TokenType) ->(usize, 
     ret first_location(tokens)
 }
 
-fn emit_unused_imports(path: str, document: FrontendDocument, usage_tokens: Vec[Token], config: AnalyzerConfig, out: mut Vec[AnalyzerDiagnostic])
+fn emit_unused_imports(path: str, document: FrontendDocument, usage_tokens: Vec[Token], occurrences: usize, config: AnalyzerConfig, out: mut Vec[AnalyzerDiagnostic])
 ->() {
     let level = config.level("unused-imports")
     if level == RuleLevel::Allow {
         ret()
     }
     for token in import_bindings(document.tokens) {
-        if identifier_occurrences(usage_tokens, token.value) <= 1_usize {
+        if identifier_occurrences(usage_tokens, token.value, occurrences) <= 1_usize {
             out.push(AnalyzerDiagnostic {
                     path, level, "unused-imports", "unused import '" + token.value + "'", token.line, token.column, token.value.char_len()
                 }
@@ -667,7 +681,7 @@ fn emit_unused_imports(path: str, document: FrontendDocument, usage_tokens: Vec[
     ret()
 }
 
-fn emit_unused_variables(path: str, document: FrontendDocument, usage_tokens: Vec[Token], config: AnalyzerConfig, out: mut Vec[AnalyzerDiagnostic])
+fn emit_unused_variables(path: str, document: FrontendDocument, usage_tokens: Vec[Token], occurrences: usize, config: AnalyzerConfig, out: mut Vec[AnalyzerDiagnostic])
 ->() {
     let level = config.level("unused-variables")
     if level == RuleLevel::Allow {
@@ -678,7 +692,7 @@ fn emit_unused_variables(path: str, document: FrontendDocument, usage_tokens: Ve
             Statement::Function(item) => {
                 match item.body {
                     Option::Some(body) => {
-                        emit_unused_in_statements(path, body.statements, usage_tokens, level, out)
+                        emit_unused_in_statements(path, body.statements, usage_tokens, occurrences, level, out)
                     }
                     Option::None => {
                     }
@@ -688,7 +702,7 @@ fn emit_unused_variables(path: str, document: FrontendDocument, usage_tokens: Ve
                 for method in item.methods {
                     match method.body {
                         Option::Some(body) => {
-                            emit_unused_in_statements(path, body.statements, usage_tokens, level,
+                            emit_unused_in_statements(path, body.statements, usage_tokens, occurrences, level,
                                 out,)
                         }
                         Option::None => {
@@ -703,12 +717,12 @@ fn emit_unused_variables(path: str, document: FrontendDocument, usage_tokens: Ve
     ret()
 }
 
-fn emit_unused_in_statements(path: str, statements: Vec[Statement], tokens: Vec[Token], level: RuleLevel,
+fn emit_unused_in_statements(path: str, statements: Vec[Statement], tokens: Vec[Token], occurrences: usize, level: RuleLevel,
     out: mut Vec[AnalyzerDiagnostic],) ->() {
     for statement in statements {
         match statement {
             Statement::Let(item) => {
-                if !starts_with_text(item.name, "_") && identifier_occurrences(tokens, item.name) <=
+                if !starts_with_text(item.name, "_") && identifier_occurrences(tokens, item.name, occurrences) <=
                 1_usize {
                     let location = named_location(tokens, item.name, TokenType::KW_LET)
                     out.push(AnalyzerDiagnostic {
@@ -721,33 +735,33 @@ fn emit_unused_in_statements(path: str, statements: Vec[Statement], tokens: Vec[
             }
             Statement::If(item) => {
                 for branch in item.branches {
-                    emit_unused_in_statements(path, branch.body.statements, tokens, level, out)
+                    emit_unused_in_statements(path, branch.body.statements, tokens, occurrences, level, out)
                 }
                 match item.else_body {
                     Option::Some(body) => {
-                        emit_unused_in_statements(path, body.statements, tokens, level, out)
+                        emit_unused_in_statements(path, body.statements, tokens, occurrences, level, out)
                     }
                     Option::None => {
                     }
                 }
             }
             Statement::While(item) => {
-                emit_unused_in_statements(path, item.body.statements, tokens, level, out)
+                emit_unused_in_statements(path, item.body.statements, tokens, occurrences, level, out)
             }
             Statement::Loop(item) => {
-                emit_unused_in_statements(path, item.body.statements, tokens, level, out)
+                emit_unused_in_statements(path, item.body.statements, tokens, occurrences, level, out)
             }
             Statement::DoWhile(item) => {
-                emit_unused_in_statements(path, item.body.statements, tokens, level, out)
+                emit_unused_in_statements(path, item.body.statements, tokens, occurrences, level, out)
             }
             Statement::For(item) => {
-                emit_unused_in_statements(path, item.body.statements, tokens, level, out)
+                emit_unused_in_statements(path, item.body.statements, tokens, occurrences, level, out)
             }
             Statement::With(item) => {
-                emit_unused_in_statements(path, item.body.statements, tokens, level, out)
+                emit_unused_in_statements(path, item.body.statements, tokens, occurrences, level, out)
             }
             Statement::Unsafe(body) => {
-                emit_unused_in_statements(path, body.statements, tokens, level, out)
+                emit_unused_in_statements(path, body.statements, tokens, occurrences, level, out)
             }
             _ => {
             }
@@ -1121,7 +1135,7 @@ fn expression_requires_mutable_name(value: Expr, name: str) -> bool {
     ret false
 }
 
-fn emit_dead_code(path: str, document: FrontendDocument, usage_tokens: Vec[Token], config: AnalyzerConfig, out: mut Vec[AnalyzerDiagnostic])
+fn emit_dead_code(path: str, document: FrontendDocument, usage_tokens: Vec[Token], occurrences: usize, config: AnalyzerConfig, out: mut Vec[AnalyzerDiagnostic])
 ->() {
     let level = config.level("dead-code")
     if level == RuleLevel::Allow {
@@ -1131,7 +1145,7 @@ fn emit_dead_code(path: str, document: FrontendDocument, usage_tokens: Vec[Token
         match statement {
             Statement::Function(item) => {
                 if !item.is_public && item.name != "main" && !function_is_test(item.attrs) && identifier_occurrences(usage_tokens,
-                    item.name,) <= 1_usize {
+                    item.name, occurrences,) <= 1_usize {
                     out.push(AnalyzerDiagnostic {
                             path, level, "dead-code", "function '" + item.name + "' is never used", item.line,
                             item.column, item.name.len()
@@ -1141,7 +1155,7 @@ fn emit_dead_code(path: str, document: FrontendDocument, usage_tokens: Vec[Token
                 }
             }
             Statement::Struct(item) => {
-                if !item.is_public && identifier_occurrences(usage_tokens, item.name) <= 1_usize {
+                if !item.is_public && identifier_occurrences(usage_tokens, item.name, occurrences) <= 1_usize {
                     let location = named_location(document.tokens, item.name, TokenType::KW_STRUCT)
                     out.push(AnalyzerDiagnostic {
                             path, level, "dead-code", "struct '" + item.name + "' is never used", location.0,
@@ -1152,7 +1166,7 @@ fn emit_dead_code(path: str, document: FrontendDocument, usage_tokens: Vec[Token
                 }
             }
             Statement::EnumItem(item) => {
-                if !item.is_public && identifier_occurrences(usage_tokens, item.name) <= 1_usize {
+                if !item.is_public && identifier_occurrences(usage_tokens, item.name, occurrences) <= 1_usize {
                     let location = named_location(document.tokens, item.name, TokenType::KW_ENUM)
                     out.push(AnalyzerDiagnostic {
                             path, level, "dead-code", "enum '" + item.name + "' is never used", location.0,
@@ -1163,7 +1177,7 @@ fn emit_dead_code(path: str, document: FrontendDocument, usage_tokens: Vec[Token
                 }
             }
             Statement::Trait(item) => {
-                if !item.is_public && identifier_occurrences(usage_tokens, item.name) <= 1_usize {
+                if !item.is_public && identifier_occurrences(usage_tokens, item.name, occurrences) <= 1_usize {
                     out.push(AnalyzerDiagnostic {
                             path, level, "dead-code", "trait '" + item.name + "' is never used", item.line,
                             item.column, item.name.len()
@@ -1519,7 +1533,30 @@ fn statement_location(statement: Statement) ->(usize, usize, usize) {
     ret(0_usize, 0_usize, 1_usize)
 }
 
-fn identifier_occurrences(tokens: Vec[Token], name: str) -> usize {
+// Count once per document. Re-scanning the complete token stream for every
+// local/import/declaration makes full-project lint quadratic in source size.
+fn identifier_usage_index(tokens: Vec[Token]) -> usize {
+    let index = unsafe {
+        encore_strmap_new()
+    }
+    if index != 0_usize {
+        for token in tokens {
+            if token.type == TokenType::IDENTIFIER {
+                unsafe {
+                    encore_strmap_put(index, token.value, encore_strmap_get(index, token.value) + 1_usize)
+                }
+            }
+        }
+    }
+    ret index
+}
+
+fn identifier_occurrences(tokens: Vec[Token], name: str, index: usize) -> usize {
+    if index != 0_usize {
+        ret unsafe {
+            encore_strmap_get(index, name)
+        }
+    }
     let mut count = 0_usize
     for token in tokens {
         if token.type == TokenType::IDENTIFIER && token.value == name {
@@ -1527,6 +1564,26 @@ fn identifier_occurrences(tokens: Vec[Token], name: str) -> usize {
         }
     }
     ret count
+}
+
+#attr(test)
+fn analyzer_identifier_usage_index_contract() -> bool {
+    let mut lexer = Lexer::new()
+    let tokens = tooling_tokens_from_tokens(lexer.tokenize("fn пример() -> u32 { let item = 1_u32 let other = item ret item + other }"))
+    let index = identifier_usage_index(tokens)
+    if index == 0_usize {
+        ret false
+    }
+    let mut matches = true
+    for name in vec!["пример", "item", "other", "absent", "1_u32"] {
+        if identifier_occurrences(tokens, name, index) != identifier_occurrences(tokens, name, 0_usize) {
+            matches = false
+        }
+    }
+    unsafe {
+        encore_strmap_free(index)
+    }
+    ret matches
 }
 
 fn find_substring(value: str, needle: str) -> usize {
