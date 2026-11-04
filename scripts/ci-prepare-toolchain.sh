@@ -3,6 +3,12 @@ set -euo pipefail
 
 [[ $# -le 1 ]] || { echo 'usage: ci-prepare-toolchain.sh [TARGET_TRIPLE]' >&2; exit 2; }
 triple=${1:-}
+if [[ "$triple" == *-apple-darwin ]]; then
+  # Use the current runner image without raising the released binary's minimum
+  # macOS version. Native C probes, compiler stages and LSP inherit this target.
+  export MACOSX_DEPLOYMENT_TARGET=15.0
+  printf 'MACOSX_DEPLOYMENT_TARGET=%s\n' "$MACOSX_DEPLOYMENT_TARGET" >> "${GITHUB_ENV:?GITHUB_ENV is required}"
+fi
 if [[ "$triple" == *-linux-gnu ]]; then
   sudo apt-get update
   sudo apt-get install -y libssl-dev libc-ares-dev lld

@@ -17,7 +17,7 @@ import refrain::frontend::hir::{DefinitionId, DefinitionKind, DefinitionNamespac
 import refrain::frontend::import_paths
 import refrain::frontend::lexer::{Lexer, Token, TokenType}
 import refrain::frontend::metadata_ast::{encode_codegen_context_ast, encode_lowered_function_input}
-import refrain::frontend::parser::{FunctionItem, GenericParam, Statement}
+import refrain::frontend::parser::{FunctionItem, GenericParam, ImplStmt, Statement, TraitStmt}
 import refrain::frontend::project_constants::ProjectConstants
 import refrain::frontend::safety::{FunctionSafety, SafetyFunction, SafetyReplayResult, infer_safety_with_known, infer_safety_with_replay, infer_safety_with_verified_modules, safety_dependencies}
 import refrain::frontend::semantic::{ScopedSemanticBinding, SemanticBinding, SemanticBody, SemanticCallable, SemanticDependency, SemanticDependencyKind, SemanticField, SemanticMember, SemanticMethod, SemanticVariant, append_bound_methods, append_bound_methods_view, check_function_body, check_function_body_with_scope, check_function_body_with_type_scope, check_function_body_with_types, check_function_body_with_variants, check_module_bodies, check_module_bodies_with_type_scope, check_module_bodies_with_types, check_module_bodies_with_variants, check_module_bodies_with_variants_view, check_module_declarations, prepare_module_bodies_with_replay, prepare_module_bodies_with_replay_view, prepare_module_bodies_with_variants, restore_accepted_module_bodies, semantic_accessible_methods, semantic_associated_members, semantic_call_return_type, semantic_checkpoint_dependencies, semantic_members, semantic_named_members, semantic_same_owner, specialize_method_type_with_self}
@@ -1486,9 +1486,9 @@ impl for AnalysisDatabase {
             }
         }
         let mut map = ModuleDefMap::new(module_name)
-        // Publish an in-progress sentinel before following re-exports. Cyclic
-        // module graphs then observe an empty map for the active edge instead
-        // of recursively rebuilding the same module forever.
+        // Reserve the slot before collecting declarations. Publish local
+        // declarations before following imports so a root/submodule cycle can
+        // resolve the root's types instead of permanently caching an empty map.
         let mut sentinel_index = 0_usize
         let mut sentinel_written = false
         while sentinel_index < self.def_maps.len() {
@@ -1521,7 +1521,7 @@ impl for AnalysisDatabase {
         for statement in document.ast {
             match statement {
                 Statement::Import(item) => {
-                    self.insert_import_definitions(module_name, item.path, item.is_public, map)
+                    let _import = item
                 }
                 Statement::Function(item) => {
                     let id = next_definition_id(module_name, "", "function", item.name, identity_keys)
@@ -1584,6 +1584,21 @@ impl for AnalysisDatabase {
                                 DefinitionNamespace::Value, method.is_public, method.source_name, position.0, position.1,
                                 method.name.char_len(), TypeId::named(function_type_key(method), method.ret_type.unwrap_or("void")),))
                     }
+                }
+                _ => {
+                }
+            }
+        }
+        let in_progress = self.def_maps.get_unchecked_borrowed(sentinel_index)
+        self.def_maps.set(sentinel_index, DefMapCache {
+                module_name, interface_fingerprint, map, in_progress.count, true
+            }
+            ,
+        )
+        for statement in document.ast {
+            match statement {
+                Statement::Import(item) => {
+                    self.insert_import_definitions(module_name, item.path, item.is_public, map)
                 }
                 _ => {
                 }
@@ -1661,6 +1676,20 @@ impl for AnalysisDatabase {
             requested = vec![(name, name, false)]
         }
         let mut exported = self.module_exports(owner_name)
+        // A selected value can share its name with a public namespace. Prefer
+        // the parent's explicit value export as well (ehirlib::prepare is both
+        // a namespace and a function re-exported from compiler).
+        if normalized == owner_name && parent_module_name(owner_name) != module_name {
+            let parent = parent_module_name(owner_name)
+            if parent != "" {
+                for definition in self.module_exports(parent) {
+                    if definition.namespace() == DefinitionNamespace::Value &&
+                    definition.name() == requested.get_unchecked_borrowed(0_usize).0 {
+                        exported.push(definition)
+                    }
+                }
+            }
+        }
         // A directory module is the public namespace of its source fragments.
         // This mirrors normal Encore resolution where
         // `refrain::frontend::parser::Expr` may be declared in
@@ -2104,6 +2133,7 @@ impl for AnalysisDatabase {
                 }
             }
         }
+        let document = configured_semantic_document(document, target, features)
         let mut diagnostics = check_module_declarations(document.ast, target, features)
         diagnostics.extend(self.module_resolution_diagnostics(module_name, document))
         diagnostics.extend(check_module_bodies_with_variants(document.ast, environment.callables, environment.fields,
@@ -2460,6 +2490,7 @@ impl for AnalysisDatabase {
             Some(value) => value
             None => self.document(module_name).unwrap_or(FrontendDocument::empty())
         }
+        let document = configured_semantic_document(document, target, features)
         let mut diagnostics = Vec[FrontendDiagnostic]::new()
         if !skip_module_checks {
             diagnostics.extend(check_module_declarations(document.ast, target, features))
@@ -2814,7 +2845,7 @@ impl for AnalysisDatabase {
                     let entry = self.sources.get_unchecked_borrowed(position - 1_usize)
                     source_name = entry.source_name source = entry.source
                 }
-                let document = self.document(module_name).unwrap_or(FrontendDocument::empty())
+                let document = configured_semantic_document(self.document(module_name).unwrap_or(FrontendDocument::empty()), target, features)
                 let diagnostics = if skip_module_checks {
                     Vec[FrontendDiagnostic]::new()
                 } else {
@@ -2845,6 +2876,7 @@ impl for AnalysisDatabase {
                 source = entry.source
             }
         }
+        let document = configured_semantic_document(document, target, features)
         let resolution_diagnostics = if skip_module_checks {
             Vec[FrontendDiagnostic]::new()
         } else {
@@ -2898,6 +2930,7 @@ impl for AnalysisDatabase {
         for site in qualified_call_sites(document.tokens) {
             let owner = parent_module_name(site.0)
             if owner == "Self" || owner == "self" || contains_string(generics, owner)
+            || owner == "Option" || owner == "Result" || owner == "Vec"
             || self.qualified_definition(module_name, owner, DefinitionNamespace::Type).is_some()
             || self.qualified_definition(module_name, owner, DefinitionNamespace::Trait).is_some() {
                 continue
@@ -3057,6 +3090,7 @@ impl for AnalysisDatabase {
                     }
                     let qualified = previous_type == TokenType::DOT || previous_type == TokenType::SCOPE
                     || previous_type == TokenType::KW_FN || previous_type == TokenType::HASH
+                    || type_position
                     if token.type == TokenType::IDENTIFIER && followed_by_call && !qualified && !in_attribute
                     {
                         if !unsafe {
@@ -5040,6 +5074,16 @@ impl for AnalysisDatabase {
         }
         let seen = encore_strset_new()
         let _ = encore_strset_insert(seen, module_name)
+        // Prelude type names already resolve to core's nominal declarations.
+        // Their methods and enum constructors must come from the same scope,
+        // even when a source file did not spell an explicit core import.
+        for index in 0_usize..self.semantic_graph.len() {
+            let name = self.semantic_graph.get_unchecked_borrowed(index).module_name
+            if (name == "core" || starts_with(name, "core::")) && encore_strset_insert(seen, name) {
+                modules.push(name)
+                pending.push(index)
+            }
+        }
         let mut position = 0_usize
         while position < pending.len() {
             let current = pending.get_unchecked_borrowed(position)
@@ -6007,6 +6051,90 @@ fn member_details(document: FrontendDocument, definition: HirDefinition, types: 
 /// declarations. Consumers must not confuse the `fn` span with its name.
 pub fn function_declaration_position(document: FrontendDocument, item: FunctionItem) ->(usize, usize) {
     ret semantic_function_position(document.tokens, document.symbols, item)
+}
+
+// Target-disabled bodies must not contribute either semantic checks or lexical
+// resolution diagnostics. Keep source positions intact for active code.
+fn configured_semantic_document(document: FrontendDocument, target: TargetSpec, features: Vec[str]) -> FrontendDocument {
+    let mut ast = Vec[Statement]::new()
+    let mut disabled = Vec[FunctionItem]::new()
+    for statement in document.ast {
+        match statement {
+            Statement::Function(item) => {
+                if semantic_cfg_enabled(item, target, features) {
+                    ast.push(statement)
+                } else {
+                    disabled.push(item)
+                }
+            }
+            Statement::Impl(item) => {
+                let mut methods = Vec[FunctionItem]::new()
+                for method in item.methods {
+                    if semantic_cfg_enabled(method, target, features) {
+                        methods.push(method)
+                    } else {
+                        disabled.push(method)
+                    }
+                }
+                ast.push(Statement::Impl(ImplStmt {
+                            item.documentation, item.generics, item.trait_name,
+                            item.trait_args, item.target, methods, item.source_name, item.line, item.column
+                        }
+                    ))
+            }
+            Statement::Trait(item) => {
+                let mut methods = Vec[FunctionItem]::new()
+                for method in item.methods {
+                    if semantic_cfg_enabled(method, target, features) {
+                        methods.push(method)
+                    } else {
+                        disabled.push(method)
+                    }
+                }
+                ast.push(Statement::Trait(TraitStmt {
+                            item.is_public, item.name, item.documentation,
+                            item.generics, item.bases, methods, item.source_name, item.line, item.column, item.attrs
+                        }
+                    ))
+            }
+            _ => ast.push(statement)
+        }
+    }
+    if disabled.is_empty() {
+        ret document
+    }
+    let mut tokens = Vec[Token]::new()
+    for token in document.tokens {
+        let mut active = true
+        for item in disabled {
+            match item.body {
+                Some(body) => {
+                    if (token.line > item.line ||(token.line == item.line && token.column >= item.column)) &&
+                    (token.line < body.end_line ||(token.line == body.end_line && token.column <= body.end_column)) {
+                        active = false break
+                    }
+                }
+                None => {
+                }
+            }
+        }
+        if active {
+            tokens.push(token)
+        }
+    }
+    ret FrontendDocument {
+        tokens, ast, document.module_documentation, document.diagnostics,
+        document.symbols, document.callables, document.dependencies, document.parsed
+    }
+}
+
+fn semantic_cfg_enabled(item: FunctionItem, target: TargetSpec, features: Vec[str]) -> bool {
+    for attr in item.attrs {
+        if starts_with(attr, "cfg:") && !cfg_active_with_features(target, attr.slice(4_usize, attr.len() - 4_usize), features) {
+            ret false
+        }
+    }
+    ret true
 }
 
 fn semantic_function_position(tokens: Vec[Token], symbols: Vec[FrontendSymbol], item: FunctionItem) ->(usize, usize) {

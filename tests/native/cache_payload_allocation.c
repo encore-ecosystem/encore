@@ -8,6 +8,15 @@ encore_compiler_str encore_text_sha256(encore_compiler_str value) {
     (void)value;
     return (encore_compiler_str){(encore_compiler_str_object *)&empty};
 }
+encore_compiler_str encore_fs_sha256(encore_compiler_str path) {
+    return encore_text_sha256(path);
+}
+uint64_t encore_clock_ns(uint8_t kind) {
+    (void)kind;
+    struct timespec value;
+    assert(clock_gettime(CLOCK_MONOTONIC, &value) == 0);
+    return (uint64_t)value.tv_sec * UINT64_C(1000000000) + (uint64_t)value.tv_nsec;
+}
 static encore_compiler_str string(const char *text) {
     size_t n = strlen(text); char *data = malloc(n + 1); assert(data); memcpy(data, text, n + 1);
     return encore_compiler_owned_string(data, n);

@@ -83,18 +83,15 @@ extern char *encore_to_cstr(encore_str value);
 #include "utf8_paths.h"
 #include "checked_io.h"
 #include "plugin_sdk.h"
-typedef struct {
-#ifdef _WIN32
-    CRITICAL_SECTION lock;
-    CONDITION_VARIABLE condition;
-#else
-    pthread_mutex_t lock;
-    pthread_cond_t condition;
-#endif
-    bool signaled;
-} encore_async_event;
-
-#include "async_waker_hooks.h"
+#include "owned_waker.h"
+#include "sync_runtime.h"
+#include "sync_time.h"
+#include "sync_channel.h"
+#include "sync_mutex.h"
+#include "sync_watch.h"
+#include "sync_signal.h"
+#include "sync_http.h"
+#include "sync_group.h"
 
 typedef void (*encore_thread_entry)(void *);
 typedef void (*encore_thread_cleanup)(void *);
@@ -225,68 +222,6 @@ size_t encore_thread_available_parallelism(void) {
     long count = sysconf(_SC_NPROCESSORS_ONLN);
     return count < 1 ? 1 : (size_t)count;
 #endif
-}
-
-size_t encore_async_waker_new(void) {
-    encore_async_event *event = calloc(1, sizeof(*event));
-    if (event == NULL) return 0;
-#ifdef _WIN32
-    InitializeCriticalSection(&event->lock);
-    InitializeConditionVariable(&event->condition);
-#else
-    if (pthread_mutex_init(&event->lock, NULL) != 0) { free(event); return 0; }
-    if (pthread_cond_init(&event->condition, NULL) != 0) {
-        pthread_mutex_destroy(&event->lock);
-        free(event);
-        return 0;
-    }
-#endif
-    return (size_t)(uintptr_t)event;
-}
-
-void encore_async_waker_wake(size_t token) {
-    encore_async_event *event = (encore_async_event *)(uintptr_t)token;
-    if (event == NULL) return;
-#ifdef _WIN32
-    EnterCriticalSection(&event->lock);
-    event->signaled = true;
-    WakeAllConditionVariable(&event->condition);
-    LeaveCriticalSection(&event->lock);
-#else
-    pthread_mutex_lock(&event->lock);
-    event->signaled = true;
-    pthread_cond_broadcast(&event->condition);
-    pthread_mutex_unlock(&event->lock);
-#endif
-}
-
-void encore_async_waker_wait(size_t token) {
-    encore_async_event *event = (encore_async_event *)(uintptr_t)token;
-    if (event == NULL) return;
-#ifdef _WIN32
-    EnterCriticalSection(&event->lock);
-    while (!event->signaled) SleepConditionVariableCS(&event->condition, &event->lock, INFINITE);
-    event->signaled = false;
-    LeaveCriticalSection(&event->lock);
-#else
-    pthread_mutex_lock(&event->lock);
-    while (!event->signaled) pthread_cond_wait(&event->condition, &event->lock);
-    event->signaled = false;
-    pthread_mutex_unlock(&event->lock);
-#endif
-}
-
-void encore_async_waker_drop(size_t token) {
-    encore_async_event *event = (encore_async_event *)(uintptr_t)token;
-    if (event == NULL) return;
-    encore_async_cleanup_waker(token);
-#ifdef _WIN32
-    DeleteCriticalSection(&event->lock);
-#else
-    pthread_cond_destroy(&event->condition);
-    pthread_mutex_destroy(&event->lock);
-#endif
-    free(event);
 }
 
 #define ENCORE_HTTP_ASYNC_IN_PLATFORM
@@ -2125,11 +2060,9 @@ static void encore_sha256_finish(encore_sha256_context *context, uint8_t digest[
     }
 }
 
-static encore_str encore_sha256_finish_text(encore_sha256_context *context) {
-    uint8_t digest[32];
+static encore_str encore_sha256_digest_text(const uint8_t digest[32]) {
     char encoded[65];
     static const char hexadecimal[] = "0123456789abcdef";
-    encore_sha256_finish(context, digest);
     for (size_t index = 0; index < 32; ++index) {
         encoded[index * 2] = hexadecimal[digest[index] >> 4];
         encoded[index * 2 + 1] = hexadecimal[digest[index] & 15U];
@@ -2138,9 +2071,43 @@ static encore_str encore_sha256_finish_text(encore_sha256_context *context) {
     return encore_from_cstr_copy(encoded);
 }
 
+static encore_str encore_sha256_finish_text(encore_sha256_context *context) {
+    uint8_t digest[32];
+    encore_sha256_finish(context, digest);
+    return encore_sha256_digest_text(digest);
+}
+
+#if defined(__linux__) && !defined(__ANDROID__)
+/* Reuse the already linked platform crypto provider. Its CPU dispatch remains
+ * optimized even when the caller and portable fallback are built with -O0. */
+static bool encore_sha256_fast_file(FILE *file, uint8_t digest[32]) {
+    EVP_MD_CTX *context = EVP_MD_CTX_new();
+    if (context == NULL) return false;
+    bool success = EVP_DigestInit_ex(context, EVP_sha256(), NULL) == 1;
+    uint8_t buffer[65536];
+    while (success) {
+        size_t count = fread(buffer, 1, sizeof(buffer), file);
+        if (count != 0 && EVP_DigestUpdate(context, buffer, count) != 1) { success = false; break; }
+        if (count < sizeof(buffer)) { if (ferror(file)) success = false; break; }
+    }
+    unsigned int length = 0;
+    if (success) success = EVP_DigestFinal_ex(context, digest, &length) == 1 && length == 32;
+    EVP_MD_CTX_free(context);
+    return success;
+}
+#endif
+
 /* Content identity for compiler metadata: hash the original bytes, not a
  * destination file which another build may have replaced concurrently. */
 encore_str encore_text_sha256(encore_str contents) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (encore_str_size(contents) >= 4096) {
+        uint8_t digest[32];
+        unsigned int length = 0;
+        if (EVP_Digest(encore_str_data(contents), encore_str_size(contents), digest, &length, EVP_sha256(), NULL) == 1 && length == 32)
+            return encore_sha256_digest_text(digest);
+    }
+#endif
     encore_sha256_context context;
     encore_sha256_init(&context);
     encore_sha256_update(&context, (const uint8_t *)encore_str_data(contents), encore_str_size(contents));
@@ -2153,6 +2120,17 @@ encore_str encore_fs_sha256(encore_str path) {
     FILE *file = encore_path_fopen(path_c, "rb");
     free(path_c);
     if (file == NULL) return encore_empty_str();
+#if defined(__linux__) && !defined(__ANDROID__)
+    uint8_t digest[32];
+    if (encore_sha256_fast_file(file, digest)) {
+        if (fclose(file) != 0) return encore_empty_str();
+        return encore_sha256_digest_text(digest);
+    }
+    // Provider failure cannot weaken cache identity or leave an incomplete
+    // digest. Retry from byte zero through the portable implementation.
+    clearerr(file);
+    if (fseek(file, 0, SEEK_SET) != 0) { fclose(file); return encore_empty_str(); }
+#endif
     encore_sha256_context context;
     encore_sha256_init(&context);
     uint8_t buffer[65536];

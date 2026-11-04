@@ -1,0 +1,260 @@
+//! Fair readiness races keep every unfinished future in the result.
+import core::future::{Context, Future, Poll}
+import core::result::Result
+
+import std::sync::atomic::AtomicU64
+import std::sync::cancellation::{CancellationToken, Cancelled}
+import std::time::{Clock, ClockError, Duration, Timer}
+
+pub struct Selector {
+    next: AtomicU64
+}
+pub enum Selected2[A, B, T, U] {
+    First((T, B))
+    Second((A, U))
+}
+pub struct Select2[A, B, T, U] {
+    first: A
+    second: B
+    second_first: bool
+}
+
+impl for Selector {
+    pub fn new() -> Self {
+        ret Self { AtomicU64::new(0_u64) }
+    }
+    #attr(borrowed_self)
+    pub fn select2[T, U, A: Future[T], B: Future[U]](self: Self, first: A, second: B) -> Select2[A, B, T, U] {
+        ret Select2[A, B, T, U] { first, second, self.next.fetch_add(1_u64) % 2_u64 != 0_u64 }
+    }
+}
+pub enum Selected3[A, B, C, T, U, V] {
+    First((T, B, C))
+    Second((A, U, C))
+    Third((A, B, V))
+}
+pub struct Select3[A, B, C, T, U, V] {
+    first: A
+    second: B
+    third: C
+    start: u64
+}
+
+impl for Selector {
+    #attr(borrowed_self)
+    pub fn select3[T, U, V, A: Future[T], B: Future[U], C: Future[V]](self: Self, first: A, second: B, third: C) -> Select3[A, B, C, T, U, V] {
+        ret Select3[A, B, C, T, U, V] { first, second, third, self.next.fetch_add(1_u64) % 3_u64 }
+    }
+}
+
+impl[A: Future[T], B: Future[U], C: Future[V], T, U, V] Future[Selected3[A, B, C, T, U, V]] for Select3[A, B, C, T, U, V] {
+    pub fn poll(self: Self, context: Context) -> Poll[Self, Selected3[A, B, C, T, U, V]] {
+        if self.start == 0_u64 {
+            match self.first.poll(context) {
+                Poll[A, T]::Ready(value) => {
+                    ret Poll::Ready(Selected3::First((value, self.second, self.third)))
+                }
+                Poll[A, T]::Pending(next_a) => {
+                    match self.second.poll(context) {
+                        Poll[B, U]::Ready(value) => {
+                            ret Poll::Ready(Selected3::Second((next_a, value, self.third)))
+                        }
+                        Poll[B, U]::Pending(next_b) => {
+                            match self.third.poll(context) {
+                                Poll[C, V]::Ready(value) => {
+                                    ret Poll::Ready(Selected3::Third((next_a, next_b, value)))
+                                }
+                                Poll[C, V]::Pending(next_c) => {
+                                    ret Poll::Pending(Self { next_a, next_b, next_c, self.start })
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if self.start == 1_u64 {
+            match self.second.poll(context) {
+                Poll[B, U]::Ready(value) => {
+                    ret Poll::Ready(Selected3::Second((self.first, value, self.third)))
+                }
+                Poll[B, U]::Pending(next_b) => {
+                    match self.third.poll(context) {
+                        Poll[C, V]::Ready(value) => {
+                            ret Poll::Ready(Selected3::Third((self.first, next_b, value)))
+                        }
+                        Poll[C, V]::Pending(next_c) => {
+                            match self.first.poll(context) {
+                                Poll[A, T]::Ready(value) => {
+                                    ret Poll::Ready(Selected3::First((value, next_b, next_c)))
+                                }
+                                Poll[A, T]::Pending(next_a) => {
+                                    ret Poll::Pending(Self { next_a, next_b, next_c, self.start })
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        match self.third.poll(context) {
+            Poll[C, V]::Ready(value) => {
+                ret Poll::Ready(Selected3::Third((self.first, self.second, value)))
+            }
+            Poll[C, V]::Pending(next_c) => {
+                match self.first.poll(context) {
+                    Poll[A, T]::Ready(value) => {
+                        ret Poll::Ready(Selected3::First((value, self.second, next_c)))
+                    }
+                    Poll[A, T]::Pending(next_a) => {
+                        match self.second.poll(context) {
+                            Poll[B, U]::Ready(value) => {
+                                ret Poll::Ready(Selected3::Second((next_a, value, next_c)))
+                            }
+                            Poll[B, U]::Pending(next_b) => {
+                                ret Poll::Pending(Self { next_a, next_b, next_c, self.start })
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl[A: Future[T], B: Future[U], T, U] Future[Selected2[A, B, T, U]] for Select2[A, B, T, U] {
+    pub fn poll(self: Self, context: Context) -> Poll[Self, Selected2[A, B, T, U]] {
+        if self.second_first {
+            match self.second.poll(context) {
+                Poll[B, U]::Ready(value) => {
+                    ret Poll::Ready(Selected2::Second((self.first, value)))
+                }
+                Poll[B, U]::Pending(next_b) => {
+                    match self.first.poll(context) {
+                        Poll[A, T]::Ready(value) => {
+                            ret Poll::Ready(Selected2::First((value, next_b)))
+                        }
+                        Poll[A, T]::Pending(next_a) => {
+                            ret Poll::Pending(Self {
+                                    next_a, next_b, self.second_first
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        match self.first.poll(context) {
+            Poll[A, T]::Ready(value) => {
+                ret Poll::Ready(Selected2::First((value, self.second)))
+            }
+            Poll[A, T]::Pending(next_a) => {
+                match self.second.poll(context) {
+                    Poll[B, U]::Ready(value) => {
+                        ret Poll::Ready(Selected2::Second((next_a, value)))
+                    }
+                    Poll[B, U]::Pending(next_b) => {
+                        ret Poll::Pending(Self {
+                                next_a, next_b, self.second_first
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+pub enum TimeoutOutcome[F, T] {
+    Ready(T)
+    Elapsed(F)
+    ClockFailed((F, ClockError))
+}
+pub struct TimeoutError[F] {
+    future: F
+    error: ClockError
+}
+pub struct TimeoutFuture[F, T] {
+    race: Select2[F, Timer, T, Result[(), ClockError]]
+}
+pub fn timeout[T, F: Future[T]](clock: Clock, duration: Duration, future: F) -> Result[TimeoutFuture[F, T], TimeoutError[F]] {
+    match clock.sleep(duration) {
+        Result[Timer, ClockError]::Ok(timer) => {
+            ret Result::Ok(TimeoutFuture[F, T] {
+                    Select2[F, Timer, T, Result[(), ClockError]] {
+                        future, timer, false
+                    }
+                }
+            )
+        }
+        Result[Timer, ClockError]::Err(error) => {
+            ret Result::Err(TimeoutError[F] { future, error })
+        }
+    }
+}
+
+impl[F: Future[T], T] Future[TimeoutOutcome[F, T]] for TimeoutFuture[F, T] {
+    pub fn poll(self: Self, context: Context) -> Poll[Self, TimeoutOutcome[F, T]] {
+        match self.race.poll(context) {
+            Poll[Select2[F, Timer, T, Result[(), ClockError]], Selected2[F, Timer, T, Result[(), ClockError]]]::Pending(next) => {
+                ret Poll::Pending(Self {
+                        next
+                    }
+                )
+            }
+            Poll[Select2[F, Timer, T, Result[(), ClockError]], Selected2[F, Timer, T, Result[(), ClockError]]]::Ready(selection) => {
+                match selection {
+                    Selected2[F, Timer, T, Result[(), ClockError]]::First(pair) => {
+                        ret Poll::Ready(TimeoutOutcome::Ready(pair.0))
+                    }
+                    Selected2[F, Timer, T, Result[(), ClockError]]::Second(pair) => {
+                        match pair.1 {
+                            Result[(), ClockError]::Ok(_) => {
+                                ret Poll::Ready(TimeoutOutcome::Elapsed(pair.0))
+                            }
+                            Result[(), ClockError]::Err(error) => {
+                                ret Poll::Ready(TimeoutOutcome::ClockFailed((pair.0, error)))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A cooperative cancellation race; cancellation returns the unfinished future.
+pub enum CancellationOutcome[F, T] {
+    Ready(T)
+    Cancelled(F)
+}
+pub struct CancellationFuture[F, T] {
+    race: Select2[F, Cancelled, T,()]
+}
+pub fn cancellable[T, F: Future[T]](future: F, token: CancellationToken) -> CancellationFuture[F, T] {
+    ret CancellationFuture[F, T] {
+        Select2[F, Cancelled, T,()] { future, token.cancelled(), false }
+    }
+}
+
+impl[F: Future[T], T] Future[CancellationOutcome[F, T]] for CancellationFuture[F, T] {
+    pub fn poll(self: Self, context: Context) -> Poll[Self, CancellationOutcome[F, T]] {
+        match self.race.poll(context) {
+            Poll[Select2[F, Cancelled, T,()], Selected2[F, Cancelled, T,()]]::Pending(next) => {
+                ret Poll::Pending(Self {
+                        next
+                    }
+                )
+            }
+            Poll[Select2[F, Cancelled, T,()], Selected2[F, Cancelled, T,()]]::Ready(selection) => {
+                match selection {
+                    Selected2[F, Cancelled, T,()]::First(pair) => {
+                        ret Poll::Ready(CancellationOutcome::Ready(pair.0))
+                    }
+                    Selected2[F, Cancelled, T,()]::Second(pair) => {
+                        ret Poll::Ready(CancellationOutcome::Cancelled(pair.0))
+                    }
+                }
+            }
+        }
+    }
+}

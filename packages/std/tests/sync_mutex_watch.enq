@@ -1,0 +1,52 @@
+//! Guards synchronize exclusive slots and watch preserves immutable snapshots.
+import core::option::Option
+import core::result::Result
+import core::testing::assert
+import core::vec::Vec
+import std::future::block_on
+import std::sync::{Frozen, Mutex, WatchError, WatchSnapshot, WatchFuture, watch}
+
+fn increment(mutex: Mutex[u64]) -> u32 {
+    for _index in 0_usize..1000_usize {
+        let guard = match mutex.lock() { Ok(value) => value Err(_) => { ret 1_u32 } }
+        let old = guard.take().unwrap_or(Option[u64]::None).unwrap_or(0_u64)
+        if guard.replace(old + 1_u64).is_err() { ret 2_u32 }
+        guard.release()
+    }
+    ret 0_u32
+}
+fn read_graph(snapshot: Frozen[Vec[str]]) -> usize { ret snapshot.get().len() }
+fn exercise() -> u32 {
+    let mutex = Mutex[u64]::new(0_u64)
+    let first = spawn increment(mutex)
+    let second = spawn increment(mutex)
+    if !assert(first.join() == 0_u32 && second.join() == 0_u32) { ret 1_u32 }
+    let guard = match mutex.lock() { Ok(value) => value Err(_) => { ret 2_u32 } }
+    if !assert(guard.take().unwrap_or(Option[u64]::None).unwrap_or(0_u64) == 2000_u64) { ret 3_u32 }
+    guard.release()
+    if !assert(guard.take().is_err()) { ret 4_u32 }
+    let pair = match watch[u64](Frozen[u64]::new(7_u64)) { Ok(value) => value Err(_) => { ret 5_u32 } }
+    let sender = pair.0
+    let receiver = pair.1
+    let initial = match receiver.snapshot() { Option[WatchSnapshot[u64]]::Some(value) => value _ => { ret 6_u32 } }
+    let pending = receiver.changed(initial.version)
+    sender.publish(Frozen[u64]::new(8_u64))
+    sender.publish(Frozen[u64]::new(9_u64))
+    let changed = match block_on[Result[WatchSnapshot[u64], WatchError], WatchFuture[u64]](pending) { Ok(value) => value Err(_) => { ret 7_u32 } }
+    if !assert(initial.value.get() == 7_u64 && changed.value.get() == 9_u64 && changed.version == 2_u64) { ret 8_u32 }
+    sender.close()
+    if !assert(block_on[Result[WatchSnapshot[u64], WatchError], WatchFuture[u64]](receiver.changed(changed.version)).is_err()) { ret 9_u32 }
+    let mut values = Vec[str]::new()
+    values.push("frozen")
+    let frozen = Frozen[Vec[str]]::new(values)
+    let left = spawn read_graph(frozen)
+    let right = spawn read_graph(frozen)
+    ret if assert(left.join() == 1_usize && right.join() == 1_usize) { 0_u32 } else { 10_u32 }
+}
+extern fn encore_sync_live_objects() -> usize
+fn main() -> u32 {
+    let before = unsafe { encore_sync_live_objects() }
+    let result = exercise()
+    if result != 0_u32 { ret result }
+    ret if assert(unsafe { encore_sync_live_objects() } == before) { 0_u32 } else { 11_u32 }
+}

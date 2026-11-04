@@ -169,6 +169,15 @@ jobs:
           python3 scripts/generate-translation-environment-codec.py --check
           python3 scripts/generate-source-artifact-codec.py --check
 
+      - name: Test synchronization ownership and races
+        if: inputs.triple == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          python3 scripts/test-sync-runtime.py
+          python3 scripts/test-sync-runtime.py --sanitizer thread
+          python3 scripts/test-http-async.py --compiler target/stage3/encore
+          python3 scripts/test-cache-lifecycle.py --compiler target/stage3/encore
+
       - name: Test concurrent LLVM declaration closure index
         if: runner.os == 'Linux'
         shell: bash
@@ -238,16 +247,6 @@ jobs:
           (cd examples/bare_metal && "$compiler" build --target thumbv7em-none-eabi --emit llvm-ir)
           (cd docs/enbook-en/examples/guide && "$compiler" build)
 
-      - name: Verify source tooling gates
-        if: inputs.triple == 'x86_64-unknown-linux-gnu'
-        shell: bash
-        run: |
-          set -euo pipefail
-          compiler="$PWD/target/stage3/${{ inputs.executable }}"
-          "$compiler" format --check
-          "$compiler" check
-          "$compiler" lint --format json
-
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -261,6 +260,39 @@ jobs:
             packages/*/target/diagnostics/**
           if-no-files-found: warn
           retention-days: 7
+
+  tooling:
+    name: Check source tools ${{ inputs.triple }}
+    if: inputs.triple == 'x86_64-unknown-linux-gnu'
+    needs: converge
+    runs-on: ${{ inputs.runner }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/registry
+      ENCORE_INDEX_URL: http://127.0.0.1:9/index
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/stage3-context
+        with:
+          triple: ${{ inputs.triple }}
+          executable: ${{ inputs.executable }}
+          seed_tag: ${{ inputs.seed_tag }}
+      - name: Prepare native toolchain
+        shell: bash
+        run: bash scripts/ci-prepare-toolchain.sh "${{ inputs.triple }}"
+      # Keep all three mandatory gates visible independently, and run them in
+      # parallel with library/compiler tests instead of after the examples.
+      - name: Check formatting
+        shell: bash
+        run: target/stage3/${{ inputs.executable }} format --check
+      - name: Check source semantics
+        if: '!cancelled()'
+        shell: bash
+        run: target/stage3/${{ inputs.executable }} check
+      - name: Lint source
+        if: '!cancelled()'
+        shell: bash
+        run: target/stage3/${{ inputs.executable }} lint --format json
 
   compiler-tests:
     name: Test compiler ${{ inputs.triple }}
@@ -357,6 +389,20 @@ jobs:
           python3 lsp/tests/code_actions.py "$PWD/target/stage3/encore-lsp"
           python3 lsp/tests/organize_imports.py "$PWD/target/stage3/encore-lsp"
           python3 lsp/tests/project_constants.py "$PWD/target/stage3/encore-lsp"
+
+      - name: Verify macOS deployment target
+        if: inputs.triple == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for executable in encore encore-lsp; do
+            minimum=$(xcrun vtool -show-build "target/stage3/$executable" |
+              awk '$1 == "minos" && !minimum { minimum = $2 } END { print minimum }')
+            case "$minimum" in
+              "$MACOSX_DEPLOYMENT_TARGET"|"$MACOSX_DEPLOYMENT_TARGET.0") ;;
+              *) echo "::error::$executable has unexpected minimum macOS $minimum"; exit 1 ;;
+            esac
+          done
 
       - name: Assemble release candidate
         shell: bash

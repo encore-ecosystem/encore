@@ -1,0 +1,52 @@
+//! Shared cells and cancellation own their state and wake without polling.
+import core::future::{Poll, context}
+import core::testing::assert
+import std::sync::{AtomicBool, AtomicU64, CancellationToken, Cancelled}
+
+extern fn encore_sync_live_objects() -> usize
+#attr(safe)
+fn live() -> usize { unsafe { ret encore_sync_live_objects() } }
+
+fn increment(counter: AtomicU64) -> u32 {
+    for _index in 0_usize..10000_usize { counter.fetch_add(1_u64) }
+    ret 0_u32
+}
+fn wait_for_cancel(token: CancellationToken) -> u32 { token.wait() ret if token.is_cancelled() { 0_u32 } else { 1_u32 } }
+
+fn exercise() -> u32 {
+    let counter = AtomicU64::new(0_u64)
+    let first = spawn increment(counter)
+    let second = spawn increment(counter)
+    if !assert(first.join() == 0_u32 && second.join() == 0_u32 && counter.load() == 20000_u64) { ret 1_u32 }
+    if !assert(counter.compare_exchange(20000_u64, 42_u64).is_ok() && counter.load() == 42_u64) { ret 2_u32 }
+    if !assert(counter.compare_exchange(41_u64, 0_u64).is_err() && counter.swap(7_u64) == 42_u64) { ret 3_u32 }
+    let flag = AtomicBool::new(false)
+    if !assert(!flag.swap(true) && flag.load() && flag.compare_exchange(true, false).is_ok() && !flag.load()) { ret 4_u32 }
+    let parent = CancellationToken::new()
+    let child = parent.child()
+    let sibling = parent.child()
+    child.cancel()
+    if !assert(child.is_cancelled() && !parent.is_cancelled() && !sibling.is_cancelled()) { ret 5_u32 }
+    let worker = spawn wait_for_cancel(sibling)
+    let pending = parent.cancelled().poll(context(0_usize))
+    match pending {
+        Poll[Cancelled, ()]::Pending(waiter) => {
+            parent.cancel()
+            match waiter.poll(context(0_usize)) {
+                Poll[Cancelled, ()]::Ready(_) => {}
+                Poll[Cancelled, ()]::Pending(_) => { ret 6_u32 }
+            }
+        }
+        Poll[Cancelled, ()]::Ready(_) => { ret 7_u32 }
+    }
+    if !assert(worker.join() == 0_u32 && sibling.is_cancelled()) { ret 8_u32 }
+    parent.cancel()
+    ret 0_u32
+}
+
+fn main() -> u32 {
+    let before = live()
+    let result = exercise()
+    if result != 0_u32 { ret result }
+    ret if assert(live() == before) { 0_u32 } else { 9_u32 }
+}

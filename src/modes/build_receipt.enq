@@ -82,26 +82,42 @@ pub fn watched_build_inputs(inventory: BuildInputInventory, graph: ResolvedPacka
 /// or source chunks are misses; they never permit execution of stale code.
 pub fn successful_build_matches(profile: Path, configuration: str, inventory: BuildInputInventory,
     graph: ResolvedPackageGraph, binary: Path, import_library: Option[Path],) -> bool {
+    ret successful_build_miss_reason(profile, configuration, inventory, graph, binary, import_library) == ""
+}
+
+/// Empty on a verified hit; otherwise identifies the failed receipt check.
+pub fn successful_build_miss_reason(profile: Path, configuration: str, inventory: BuildInputInventory,
+    graph: ResolvedPackageGraph, binary: Path, import_library: Option[Path],) -> str {
     let payload = read_packed_payload(profile.join(".encore-successful-build"))
     let previous = match binary::decode[SuccessfulBuildReceipt](prepared_payload_bytes(payload)) {
         Ok(value) => value Err(_) => {
-            ret false
+            ret "receipt-missing-or-corrupt"
         }
     }
-    if previous.schema != 2_u32 || previous.configuration != configuration ||
-    previous.files.len() != inventory.files.len() || !file_exists(binary.as_str()) ||
-    previous.binary != file_sha256(binary.as_str()) {
-        ret false
+    if previous.schema != 2_u32 {
+        ret "receipt-schema-changed"
+    }
+    if previous.configuration != configuration {
+        ret "configuration-changed"
+    }
+    if previous.files.len() != inventory.files.len() {
+        ret "source-set-changed"
+    }
+    if !file_exists(binary.as_str()) {
+        ret "output-missing"
+    }
+    if previous.binary != file_sha256(binary.as_str()) {
+        ret "output-modified"
     }
     match import_library {
         Some(path) => {
             if !file_exists(path.as_str()) || previous.import_library != file_sha256(path.as_str()) {
-                ret false
+                ret "import-library-modified"
             }
         }
         None => {
             if previous.import_library != "" {
-                ret false
+                ret "import-library-changed"
             }
         }
     }
@@ -111,12 +127,12 @@ pub fn successful_build_matches(profile: Path, configuration: str, inventory: Bu
     for file in inventory.files {
         let old = match previous.files.get(index) {
             Some(value) => value None => {
-                ret false
+                ret "source-set-changed"
             }
         }
         index += 1
         if old.unit != file.unit || old.source != file.source {
-            ret false
+            ret "source-set-changed"
         }
         accepted.push(InputFile { file.unit, file.source, file.digest, old.watched })
         if !old.watched || old.digest == file.digest {
@@ -124,18 +140,18 @@ pub fn successful_build_matches(profile: Path, configuration: str, inventory: Bu
         }
         let package = match owner(graph, file.unit) {
             Some(value) => value None => {
-                ret false
+                ret "package-set-changed"
             }
         }
         let before = match verified_payload(source_chunk(profile, old.digest), old.digest) {
             Ok(value) => value Err(_) => {
-                ret false
+                ret "input-snapshot-missing-or-corrupt"
             }
         }
         let path = package.root.join("src").join(file.source)
         let after = read_file(path.as_str())
         if compiler_content_digest(after) != file.digest {
-            ret false
+            ret "input-changed-during-check"
         }
         let constants = ProjectConstants {
             package.name, project_manifest_version(package.manifest)
@@ -143,16 +159,18 @@ pub fn successful_build_matches(profile: Path, configuration: str, inventory: Bu
         let left = executable_identity(before, constants)
         let right = executable_identity(after, constants)
         if left.is_none() || left != right {
-            ret false
+            ret "source-changed"
         }
         changed = true
     }
     // Publish the new physical source view only after proving every changed
     // file equivalent. Package artifacts still retain their original receipts.
     if changed {
-        ret publish_successful_build(profile, configuration, BuildInputInventory { accepted }, graph, binary, import_library).is_ok()
+        if publish_successful_build(profile, configuration, BuildInputInventory { accepted }, graph, binary, import_library).is_err() {
+            ret "receipt-update-failed"
+        }
     }
-    ret true
+    ret ""
 }
 
 pub fn publish_successful_build(profile: Path, configuration: str, inventory: BuildInputInventory,

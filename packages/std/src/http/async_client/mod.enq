@@ -1,5 +1,5 @@
 //! Nonblocking HTTP futures. The client owns one reactor; execute with await or block_on.
-import core::future::{Context, Future, Poll}
+import core::future::{Context, Future, Poll, Waker}
 import core::ops::ContextManager
 import core::option::Option
 import core::result::Result
@@ -9,6 +9,9 @@ import std::http::codec::{Decoder, response}
 import std::http::errors::{HTTPError, HTTPErrorKind}
 import std::http::types::{HttpRequest, HttpResponse, HttpClientConfig, Url}
 import std::thread::JoinHandle
+import std::sync::cancellation::CancellationToken
+import platform::sync as owned
+import platform::sync::__Lease
 import std::time::perf_counter_ms
 
 /// Cancels requests issued by its creating client. Cancellation is permanent.
@@ -25,8 +28,10 @@ impl for HTTPCancellationToken {
 
 /// Copies share the reactor. Use a with-context or close the owning client.
 pub struct HTTPAsyncClient {
+    stop: __Lease
     runtime: usize
     worker: JoinHandle[u32]
+    destroy: __Lease
     config: HttpClientConfig
 }
 
@@ -34,6 +39,7 @@ impl for HTTPAsyncClient {
     pub fn new() -> Result[Self, HTTPError] {
         ret Self::with_capacity(32_usize)
     }
+    #attr(safe)
     pub fn with_capacity(capacity: usize) -> Result[Self, HTTPError] {
         if !native::supported() {
             ret Result::Err(HTTPError {
@@ -50,23 +56,40 @@ impl for HTTPAsyncClient {
                 ,
             )
         }
+        let stop = owned::encore_sync_http_lease_new(handle, 1_u32)
+        if stop == 0_usize {
+            native::destroy(handle) ret Result::Err(HTTPError {
+                    HTTPErrorKind::Configuration, "cannot allocate reactor owner"
+                }
+            )
+        }
+        let stop_lease = owned::__adopt(stop)
+        let destroy = owned::encore_sync_http_lease_new(handle, 2_u32)
+        if destroy == 0_usize {
+            native::destroy(handle) ret Result::Err(HTTPError {
+                    HTTPErrorKind::Configuration, "cannot allocate reactor owner"
+                }
+            )
+        }
+        let destroy_lease = owned::__adopt(destroy)
         let worker = spawn reactor(handle)
-        ret Result::Ok(Self { handle, worker, HttpClientConfig::default() })
+        ret Result::Ok(Self {
+                stop_lease, handle, worker, destroy_lease, HttpClientConfig::default()
+            }
+        )
     }
     pub fn with_config(self: Self, config: HttpClientConfig) -> Self {
-        ret Self { self.runtime, self.worker, config }
+        ret Self { self.stop, self.runtime, self.worker, self.destroy, config }
     }
     pub fn cancellation_token(self: Self) -> HTTPCancellationToken {
         ret HTTPCancellationToken { self.runtime, native::token(self.runtime) }
     }
     /// Lazy: submitting a request starts when its future is first polled.
     pub fn send(self: Self, request: HttpRequest) -> HTTPResponseFuture {
-        ret HTTPResponseFuture {
-            PendingRequest {
+        ret response_future(PendingRequest {
                 self, request, Option[HTTPCancellationToken]::None, Option[HTTPError]::None
             }
-            , 0_usize
-        }
+        )
     }
     pub fn get(self: Self, value: str) -> HTTPResponseFuture {
         match Url::parse(value) {
@@ -74,17 +97,14 @@ impl for HTTPAsyncClient {
                 ret self.send(HttpRequest::get(url))
             }
             Result::Err(_) => {
-                ret HTTPResponseFuture {
-                    PendingRequest {
+                ret response_future(PendingRequest {
                         self, HttpRequest::get(Url::empty()), Option[HTTPCancellationToken]::None,
                         Option[HTTPError]::Some(HTTPError {
                                 HTTPErrorKind::Configuration, "invalid HTTP request URL"
                             }
-                            ,
                         )
                     }
-                    , 0_usize
-                }
+                )
             }
         }
     }
@@ -189,27 +209,58 @@ impl for PendingRequest {
     }
 }
 
-/// A single-consumer future. Pending copies must not be polled concurrently.
+/// A single-consumer future. Owned registrations keep unfinished requests alive
+/// when a select or timeout returns them to a different executor.
 pub struct HTTPResponseFuture {
+    ownership: __Lease
     request: PendingRequest
     handle: usize
+    waker: Option[Waker]
+    cancellation: Option[CancellationToken]
+    registration: __Lease
 }
-
+#attr(safe)
+fn response_future(request: PendingRequest) -> HTTPResponseFuture {
+    ret HTTPResponseFuture {
+        owned::__adopt(0_usize), request, 0_usize, Option[Waker]::None,
+        Option[CancellationToken]::None, owned::__adopt(0_usize)
+    }
+}
 impl for HTTPResponseFuture {
-    /// Set cancellation before the future is first polled.
     pub fn with_cancellation(self: Self, token: HTTPCancellationToken) -> Self {
         ret Self {
-            PendingRequest {
+            self.ownership, PendingRequest {
                 self.request.client, self.request.request, Option::Some(token), self.request.failure
             }
-            , self.handle
+            ,
+            self.handle, self.waker, self.cancellation, self.registration
+        }
+    }
+    /// The common cooperative token also works with children and selection.
+    pub fn with_token(self: Self, token: CancellationToken) -> Self {
+        ret Self {
+            self.ownership, self.request, self.handle, self.waker, Option::Some(token), self.registration
         }
     }
 }
-
 impl Future[Result[HttpResponse, HTTPError]] for HTTPResponseFuture {
+    #attr(safe)
     pub fn poll(self: Self, context: Context) -> Poll[Self, Result[HttpResponse, HTTPError]] {
+        match self.cancellation {
+            Option[CancellationToken]::Some(token) => {
+                if token.is_cancelled() {
+                    native::abandon(self.handle)
+                    ret Poll::Ready(Result::Err(HTTPError {
+                                HTTPErrorKind::Cancelled, "HTTP request cancelled"
+                            }
+                        ))
+                }
+            }
+            Option[CancellationToken]::None => {
+            }
+        }
         let mut handle = self.handle
+        let mut ownership = self.ownership
         if handle == 0_usize {
             handle = match self.request.start() {
                 Result::Ok(value) => value
@@ -217,10 +268,41 @@ impl Future[Result[HttpResponse, HTTPError]] for HTTPResponseFuture {
                     ret Poll::Ready(Result::Err(error))
                 }
             }
+            let lease = owned::encore_sync_http_lease_new(handle, 0_u32)
+            if lease == 0_usize {
+                native::abandon(handle)
+                ret Poll::Ready(Result::Err(HTTPError {
+                            HTTPErrorKind::Configuration, "cannot allocate request owner"
+                        }
+                    ))
+            }
+            ownership = owned::__adopt(lease)
         }
-        let status = native::status(handle, context.waker.token)
+        let status = native::status(handle, context.waker.raw_token())
         if status == 0_i32 {
-            ret Poll::Pending(Self { self.request, handle })
+            let mut registration = owned::__adopt(0_usize)
+            match self.cancellation {
+                Option[CancellationToken]::Some(token) => {
+                    match token.__register(context.waker) {
+                        Option[__Lease]::Some(waiting) => {
+                            registration = waiting
+                        }
+                        Option[__Lease]::None => {
+                            native::abandon(handle)
+                            ret Poll::Ready(Result::Err(HTTPError {
+                                        HTTPErrorKind::Cancelled, "HTTP request cancelled"
+                                    }
+                                ))
+                        }
+                    }
+                }
+                Option[CancellationToken]::None => {
+                }
+            }
+            ret Poll::Pending(Self {
+                    ownership, self.request, handle, Option::Some(context.waker), self.cancellation, registration
+                }
+            )
         }
         if status == 1_i32 {
             let value = response(native::http_status(handle) as u16, native::headers(handle), native::result(handle))
@@ -247,7 +329,6 @@ impl Future[Result[HttpResponse, HTTPError]] for HTTPResponseFuture {
                         message
                     }
                 }
-                ,
             ))
     }
 }

@@ -1,0 +1,92 @@
+//! Owned, coalescing SIGINT/SIGTERM subscriptions. One subscription per process.
+import core::future::{Context, Future, Poll}
+import core::ops::ContextManager
+import core::panic::panic
+import core::result::Result
+
+import std::future::block_on
+
+import platform::sync as native
+import platform::sync::__Lease
+
+pub enum Signal {
+    Interrupt
+    Terminate
+}
+pub enum SignalError {
+    Unsupported
+    InUse
+    AllocationFailed
+    Closed
+}
+pub struct Signals {
+    state: __Lease
+}
+pub struct SignalFuture {
+    signals: Signals
+    registration: __Lease
+}
+
+impl for Signals {
+    #attr(safe)
+    pub fn subscribe() -> Result[Self, SignalError] {
+        let status = native::encore_sync_signal_support()
+        if status == 1_u32 {
+            ret Result::Err(SignalError::Unsupported)
+        }
+        if status == 2_u32 {
+            ret Result::Err(SignalError::InUse)
+        }
+        let handle = native::encore_sync_signal_new()
+        if handle == 0_usize {
+            ret Result::Err(SignalError::AllocationFailed)
+        }
+        ret Result::Ok(Self { native::__adopt(handle) })
+    }
+    #attr(safe)
+    #attr(borrowed_self)
+    pub fn close(self: Self) ->() {
+        native::encore_sync_signal_close(self.state.raw())
+    }
+    #attr(safe)
+    pub fn next(self: Self) -> SignalFuture {
+        ret SignalFuture { self, native::__adopt(0_usize) }
+    }
+    pub fn wait(self: Self) -> Result[Signal, SignalError] {
+        ret block_on[Result[Signal, SignalError], SignalFuture](self.next())
+    }
+}
+
+impl Future[Result[Signal, SignalError]] for SignalFuture {
+    #attr(safe)
+    pub fn poll(self: Self, context: Context) -> Poll[Self, Result[Signal, SignalError]] {
+        loop {
+            let status = native::encore_sync_signal_next(self.signals.state.raw())
+            if status == 1_u32 {
+                ret Poll::Ready(Result::Ok(Signal::Interrupt))
+            }
+            if status == 2_u32 {
+                ret Poll::Ready(Result::Ok(Signal::Terminate))
+            }
+            if status == 3_u32 {
+                ret Poll::Ready(Result::Err(SignalError::Closed))
+            }
+            let handle = native::encore_sync_signal_register(self.signals.state.raw(), context.waker.raw_token())
+            if handle == 18446744073709551615_usize {
+                panic("cannot allocate signal registration")
+            }
+            if handle != 0_usize {
+                ret Poll::Pending(Self { self.signals, native::__adopt(handle) })
+            }
+        }
+    }
+}
+
+impl ContextManager for Signals {
+    pub fn with_enter(self: Self) -> Self {
+        ret self
+    }
+    pub fn with_exit(self: Self) -> bool {
+        self.close() ret true
+    }
+}

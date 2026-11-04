@@ -1,4 +1,3 @@
-import mod::cache_policy::{BuildWorkspace, keep_build_artifacts, sweep_project}
 //! Provides the `build` module.
 
 import core::fmt::Debug
@@ -29,16 +28,17 @@ import mod::build_ehir_artifacts::template_snapshot_key
 import mod::build_metadata::{MetadataContext, metadata_name_before}
 import mod::build_native_inputs::{native_source_identities, native_source_identity}
 import mod::build_output::{append_package_archives, append_shared_library_args, build_artifact_label, build_artifact_name, build_import_library_name, merge_static_library}
-import mod::build_receipt::{build_input_inventory, publish_successful_build, successful_build_matches, watched_build_inputs}
+import mod::build_receipt::{BuildInputInventory, build_input_inventory, publish_successful_build, successful_build_matches, successful_build_miss_reason, watched_build_inputs}
 import mod::build_requirements::{UnitRequirements, requirements_content_digest}
 import mod::build_scripts::{NativeBuildMetadata, parse_native_build_metadata}
-import refrain::cache_identity::{compiler_binary_identity, compiler_content_digest}
+import mod::cache_policy::{BuildWorkspace, close_lock, keep_build_artifacts, open_lock, sweep_project}
+import refrain::cache_identity::{compiler_binary_identity, compiler_content_digest, compiler_file_digest}
 import refrain::diagnostics::render_diagnostic
 import refrain::frontend::{FrontendDiagnostic, PreparedSemanticModule, check_prepared_semantic_module}
 import refrain::frontend::parser::statements::Statement
-import refrain::frontend::translator::{TranslatedModuleChunk, TranslationModule, assemble_ehir_module_bundle, filter_ast_for_target, translate_ast_with_modules_to_ehir, translate_modules_to_ehir, translate_modules_to_ehir_bundle, translate_modules_to_ehir_bundle_parallel, translate_modules_to_ehir_bundle_typed, translate_selected_modules_to_ehir_chunks, translate_to_ehir, translate_to_ehir_for_target, translate_to_ehir_for_target_and_features}
+import refrain::frontend::translator::{TranslatedModuleChunk, TranslationModule, assemble_ehir_module_bundle, assemble_typed_ehir_module_bundle, filter_ast_for_target, translate_ast_with_modules_to_ehir, translate_compilation_unit_to_ehir_chunks, translate_modules_to_ehir, translate_modules_to_ehir_bundle, translate_modules_to_ehir_bundle_parallel, translate_modules_to_ehir_bundle_typed, translate_selected_modules_to_ehir_chunks, translate_to_ehir, translate_to_ehir_for_target, translate_to_ehir_for_target_and_features}
 import refrain::project::{ProjectWorkspace, WorkspaceModule, WorkspaceRefrain, load_binary_workspace, load_library_workspace, system_core_root, system_platform_root, workspace_release_modules, workspace_root_refrain}
-import refrain::project::build_graph::encode_build_graph
+import refrain::project::build_graph::{decode_build_graph, encode_build_graph}
 import refrain::project::manifest::{project_build_kind, project_manifest_binary_name, project_manifest_name, project_manifest_target, project_target_toolchain, read_project_manifest}
 import refrain::project::workspace::{ResolvedPackageGraph, try_load_entry_workspace_locked, try_resolve_package_graph, try_resolve_package_graph_locked}
 import refrain::target::{TargetSpec, Toolchain, default_toolchain, host_target, parse_target, target_executable_name, target_is_host, target_is_supported, toolchain_driver_is_supported}
@@ -46,6 +46,7 @@ import refrain::target::kits::{target_kit_installed, target_kit_toolchain, targe
 import refrain::version::compiler_release_version
 
 extern fn encore_compiler_release_heap() ->()
+extern fn encore_compiler_command_elapsed_ms() -> u64
 extern fn encore_compiler_exec_parts(program: str, data: usize, len: usize) -> i32
 extern fn encore_build_queue_new(count: usize) -> usize
 extern fn encore_build_queue_next(queue: usize) -> usize
@@ -732,10 +733,16 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
 #attr(safe)
 pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolchain,
     profile: str, profile_dir: Path, binary: Path,) -> Result[(), str] {
+    let command_started = perf_counter_ms()
     let _swept = sweep_project(root, false)
+    let sweep_ms = perf_counter_ms() - command_started
     let workspace = BuildWorkspace::new(profile_dir, "packages")?
+    let mut result = Result[(), str]::Ok(())
+    let mut pipeline_finished = command_started
+    let mut pipeline_report = Json::Null
     with workspace as scope {
-        let result = compile_package_binary_in(root, target, toolchain, profile, profile_dir, binary, scope.directory)
+        result = compile_package_binary_in(root, target, toolchain, profile, profile_dir, binary, scope.directory)
+        pipeline_report = parse(read_file(scope.directory.join("encore-timings.json").as_str())).unwrap_or(Json::Null)
         match result {
             Ok(_) => {
                 scope.complete(true, "")
@@ -744,14 +751,110 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
                 scope.complete(false, error)
             }
         }
-        ret result
+        pipeline_finished = perf_counter_ms()
+        rich::ProgressReporter::current().stage("Cleaning build workspace", 0_usize)
     }
+    let cleanup_ms = perf_counter_ms() - pipeline_finished
+    if env("ENCORE_INPUT_PROFILE").is_some() {
+        eprintln("input-time workspace sweep: " + Debug::fmt(sweep_ms) + " ms")
+        eprintln("input-time cleanup and cache: " + Debug::fmt(cleanup_ms) + " ms")
+    }
+    if result.is_ok() {
+        let report = pipeline_report
+        let mut fields = Vec[(str, Json)]::new()
+        for field in report.as_object().unwrap_or(Vec[(str, Json)]::new()) {
+            if field.0 != "schema" && field.0 != "total_ms" {
+                fields.push(field)
+            }
+        }
+        fields.push(("schema", Json::Number("2")))
+        fields.push(("command_id", Json::Number(Debug::fmt(unsafe {
+                            encore_compiler_process_id()
+                        }
+                    ))))
+        fields.push(("pipeline_ms", report.get("total_ms").unwrap_or(Json::Number("0"))))
+        fields.push(("command_ms", Json::Number(Debug::fmt(unsafe {
+                            encore_compiler_command_elapsed_ms()
+                        }
+                    ))))
+        fields.push(("workspace_sweep_ms", Json::Number(Debug::fmt(sweep_ms))))
+        fields.push(("workspace_cleanup_and_cache_ms", Json::Number(Debug::fmt(cleanup_ms))))
+        fields.push(("total_ms", Json::Number(Debug::fmt(perf_counter_ms() - command_started))))
+        if !publish_command_timing(profile_dir, stringify(Json::Object(fields))) {
+            ret Result::Err("cannot record command timings")
+        }
+    }
+    ret result
+}
+
+#attr(safe)
+/// Adds launch preparation time without including the user program runtime.
+pub fn record_run_timing(directory: Path) ->() {
+    let path = directory.join("encore-timings.json")
+    let lease = command_timing_lock(directory)
+    if lease == 0_usize {
+        ret()
+    }
+    let previous = parse(read_file(path.as_str())).unwrap_or(Json::Null)
+    let command_id = Debug::fmt(unsafe {
+            encore_compiler_process_id()
+        }
+    )
+    if previous.get("command_id").unwrap_or(Json::Null).as_number().unwrap_or("") != command_id {
+        close_lock(lease) ret()
+    }
+    let mut fields = Vec[(str, Json)]::new()
+    for field in previous.as_object().unwrap_or(Vec[(str, Json)]::new()) {
+        if field.0 != "time_to_exec_ms" {
+            fields.push(field)
+        }
+    }
+    fields.push(("time_to_exec_ms", Json::Number(Debug::fmt(unsafe {
+                        encore_compiler_command_elapsed_ms()
+                    }
+                ))))
+    let _recorded = unsafe {
+        encore_compiler_write_atomic(native_path(path.as_str()), stringify(Json::Object(fields)))
+    }
+    close_lock(lease)
+}
+
+// Timing reports are diagnostics, not cache entries. Each pipeline records to
+// its private workspace; publish one complete command report under a short lock.
+fn command_timing_lock(directory: Path) -> usize {
+    loop {
+        let lease = open_lock(directory.join(".encore-timings.lock"), false)
+        if lease != 0_usize {
+            ret lease
+        }
+        if unsafe {
+            encore_compiler_worker_interrupted()
+        }
+        != 0_i32 {
+            ret 0_usize
+        }
+        let _slept = sleep_ms(5_u64)
+    }
+}
+fn publish_command_timing(directory: Path, contents: str) -> bool {
+    let lease = command_timing_lock(directory)
+    if lease == 0_usize {
+        ret false
+    }
+    let path = directory.join("encore-timings.json")
+    let written = unsafe {
+        encore_compiler_write_atomic(native_path(path.as_str()), contents)
+    }
+    let _legacy = remove_file(artifact_checksum_path(path).as_str())
+    close_lock(lease)
+    ret written
 }
 
 #attr(safe)
 fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchain,
     profile: str, profile_dir: Path, binary: Path, staging: Path,) -> Result[(), str] {
     let pipeline_started = perf_counter_ms()
+    rich::ProgressReporter::current().stage("Resolving build graph", 0_usize)
     let output_kind = project_build_kind(root, read_project_manifest(root))
     let import_name = build_import_library_name(target, project_manifest_name(read_project_manifest(root)), output_kind)
     let import_library = profile_dir.join(import_name)
@@ -763,9 +866,11 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     }
     profile_incremental_input("graph", pipeline_started)
     let scripts_started = perf_counter_ms()
+    rich::ProgressReporter::current().stage("Running build scripts", graph.refrains.len())
     let metadata = run_native_build_scripts(graph.refrains, "", target, profile, staging, root)?
     profile_incremental_input("scripts", scripts_started)
     let native_started = perf_counter_ms()
+    rich::ProgressReporter::current().stage("Checking native inputs", 0_usize)
     let native = UnitNativePlan {
         resolve_native_program(toolchain.compiler)?,
         resolve_native_program(toolchain.archiver)?, compiler_args(profile, target, toolchain)
@@ -792,7 +897,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     link_inputs.push(Json::String(output_kind))
     link_inputs.push(Json::String(binary.as_str()))
     link_inputs.push(Json::String(native.identity()?))
-    link_inputs.push(Json::String(file_sha256(resolve_native_program(toolchain.linker)?)))
+    link_inputs.push(Json::String(compiler_file_digest(resolve_native_program(toolchain.linker)?)))
     for argument in target_tool_args(target, toolchain) {
         link_inputs.push(Json::String(argument))
     }
@@ -813,6 +918,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     }
     profile_incremental_input("native closure", native_started)
     let inventory_started = perf_counter_ms()
+    rich::ProgressReporter::current().stage("Checking source inventory", 0_usize)
     let inventory = build_input_inventory(graph)?
     profile_incremental_input("source inventory", inventory_started)
     let receipt_started = perf_counter_ms()
@@ -824,11 +930,21 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     } else {
         Option[Path]::Some(import_library)
     }
-    let input_match = successful_build_matches(profile_dir, receipt_configuration, inventory, graph, binary, receipt_import)
+    let miss_reason = successful_build_miss_reason(profile_dir, receipt_configuration, inventory, graph, binary, receipt_import)
+    let input_match = miss_reason == ""
     profile_incremental_input("receipt", receipt_started)
+    let input_phases = vec![("graph_ms", Json::Number(Debug::fmt(scripts_started - pipeline_started))),
+        ("build_scripts_ms", Json::Number(Debug::fmt(native_started - scripts_started))),
+        ("native_inputs_ms", Json::Number(Debug::fmt(inventory_started - native_started))),
+        ("source_inventory_ms", Json::Number(Debug::fmt(receipt_started - inventory_started))),
+        ("receipt_ms", Json::Number(Debug::fmt(perf_counter_ms() - receipt_started))),
+        ("cache_miss_reason", Json::String(miss_reason))]
+    if !input_match && env("ENCORE_INPUT_PROFILE").is_some() {
+        eprintln("input-cache miss: " + miss_reason)
+    }
     if input_match {
-        write_package_pipeline_timing(profile_dir, Vec[CompiledPackage]::new(), 0, 0, 0,
-            perf_counter_ms() - pipeline_started, true,)?
+        write_package_pipeline_timing(staging, Vec[CompiledPackage]::new(), 0, 0, 0,
+            perf_counter_ms() - pipeline_started, true, input_phases,)?
         ret Result::Ok(())
     }
     let packages = compile_cached_package_graph(graph, target.triple, profile, requested_jobs(),
@@ -866,7 +982,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     file_exists(binary.as_str()) &&(import_name == "" ||
         (file_exists(import_library.as_str()) && previous.get("import-library").unwrap_or(Json::Null).as_str().unwrap_or("") == file_sha256(import_library.as_str()))) {
         publish_successful_build(profile_dir, receipt_configuration, inventory, graph, binary, receipt_import)?
-        write_package_pipeline_timing(profile_dir, packages, packages_ms, 0, 0, perf_counter_ms() - pipeline_started, true)?
+        write_package_pipeline_timing(staging, packages, packages_ms, 0, 0, perf_counter_ms() - pipeline_started, true, input_phases)?
         ret Result[(), str]::Ok(())
     }
     let mut names = Vec[str]::new()
@@ -985,8 +1101,8 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
         ret Result[(), str]::Err("cannot commit final binary identity")
     }
     publish_successful_build(profile_dir, receipt_configuration, inventory, graph, binary, receipt_import)?
-    write_package_pipeline_timing(profile_dir, packages, packages_ms, support_native_ms,
-        perf_counter_ms() - pipeline_started - packages_ms - support_native_ms, perf_counter_ms() - pipeline_started, false,)?
+    write_package_pipeline_timing(staging, packages, packages_ms, support_native_ms,
+        perf_counter_ms() - pipeline_started - packages_ms - support_native_ms, perf_counter_ms() - pipeline_started, false, input_phases,)?
     ret Result[(), str]::Ok(())
 }
 
@@ -1072,7 +1188,12 @@ fn run_native_build_scripts(packages: Vec[WorkspaceRefrain], skip: str, target: 
                     ret Result[NativeBuildMetadata, str]::Err("cannot create build-script directory")
                 }
                 let metadata = directory.join("native.json")
-                let args = vec!["__run-build-script", package.root.as_str(), script.as_str(), metadata.as_str(), target.triple, profile, lock_root.as_str()]
+                let graph_path = directory.join("host-graph.json")
+                let owner_graph = build_script_owner_graph(packages, package)
+                if !write_verified_artifact(graph_path, encode_build_graph(owner_graph)?) {
+                    ret Result::Err("cannot record build script dependency graph")
+                }
+                let args = vec!["__run-build-script", package.root.as_str(), script.as_str(), metadata.as_str(), target.triple, profile, lock_root.as_str(), graph_path.as_str()]
                 run_program_tool(executable_path(), args, directory, "build-script")?
                 if !file_exists(metadata.as_str()) {
                     ret Result[NativeBuildMetadata, str]::Err("build script did not write metadata: " + script.as_str())
@@ -1098,6 +1219,40 @@ fn run_native_build_scripts(packages: Vec[WorkspaceRefrain], skip: str, target: 
         }
     }
     ret Result[NativeBuildMetadata, str]::Ok(merged)
+}
+
+fn build_script_owner_graph(packages: Vec[WorkspaceRefrain], owner: WorkspaceRefrain) -> ResolvedPackageGraph {
+    let mut names = vec![owner.name]
+    let mut index = 0_usize
+    while index < names.len() {
+        let name = names.get_unchecked_borrowed(index)
+        index += 1_usize
+        for package in packages {
+            if package.name == name {
+                for dependency in package.dependency_names {
+                    if !string_list_contains(names, dependency) {
+                        names.push(dependency)
+                    }
+                }
+            }
+        }
+    }
+    let mut selected = Vec[WorkspaceRefrain]::new()
+    for package in packages {
+        if !string_list_contains(names, package.name) {
+            continue
+        }
+        if package.name == owner.name {
+            selected.push(WorkspaceRefrain {
+                    package.name, package.root, package.distribution_root,
+                    "workspace:" + package.root.resolve().as_str(), true, package.manifest, package.dependency_names, package.enabled_features
+                }
+            )
+        } else {
+            selected.push(package)
+        }
+    }
+    ret ResolvedPackageGraph { owner.name, selected, owner.enabled_features }
 }
 
 /// Private host worker; no registry, target or cwd state is changed in the
@@ -1155,13 +1310,65 @@ fn run_locked_build_script(root: Path, script: Path, output: Path, key: str, loc
     ret 0
 }
 
-fn prepare_build_script_binary(root: Path, script: Path, output: Path, key: str, lock_root: Path) -> Result[Path, str] {
-    let graph = match try_resolve_package_graph_locked(root, true, true, lock_root) {
-        Ok(value) => value Err(failure) => {
-            ret Result::Err(failure.message)
+struct BuildScriptInputs {
+    metadata: NativeBuildMetadata
+    configuration: str
+    inventory: BuildInputInventory
+}
+
+// Only packages whose modules the host script loads contribute native inputs.
+// The normal program graph still runs every selected package's build script.
+fn host_script_graph(full: ResolvedPackageGraph, owners: Vec[str]) -> ResolvedPackageGraph {
+    if string_list_contains(owners, "@project-runtime") {
+        ret full
+    }
+    let mut packages = Vec[WorkspaceRefrain]::new()
+    for package in full.refrains {
+        if package.name != full.root_name && !string_list_contains(owners, package.name) {
+            continue
+        }
+        let mut dependencies = Vec[str]::new()
+        for name in package.dependency_names {
+            if name == full.root_name || string_list_contains(owners, name) {
+                dependencies.push(name)
+            }
+        }
+        packages.push(WorkspaceRefrain {
+                package.name, package.root, package.distribution_root,
+                package.source_key, package.target_is_binary, package.manifest, dependencies, package.enabled_features
+            }
+        )
+    }
+    ret ResolvedPackageGraph { full.root_name, packages, full.enabled_features }
+}
+fn host_script_owners(workspace: ProjectWorkspace, script: Path) -> Vec[str] {
+    let mut owners = vec![workspace.root_name]
+    for module in workspace.modules {
+        if !string_list_contains(owners, module.owner_name) {
+            owners.push(module.owner_name)
+        }
+        if module.owner_name == workspace.root_name {
+            let mut native = module.module_path.as_str() != script.as_str()
+            for statement in module.ast {
+                match statement {
+                    Statement::Function(item) => {
+                        if item.is_extern {
+                            native = true
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            if native && !string_list_contains(owners, "@project-runtime") {
+                owners.push("@project-runtime")
+            }
         }
     }
-    let staging = output.parent().unwrap_or(root)
+    ret owners
+}
+fn prepare_build_script_inputs(root: Path, script: Path, graph: ResolvedPackageGraph,
+    staging: Path, project_runtime: bool, lock_root: Path,) -> Result[BuildScriptInputs, str] {
     let target = host_target()
     let mut toolchain = requested_toolchain(root, target)
     // Entry programs currently compile all host runtimes with these exact flags.
@@ -1172,7 +1379,16 @@ fn prepare_build_script_binary(root: Path, script: Path, output: Path, key: str,
         resolve_native_program(toolchain.compiler)?, resolve_native_program(toolchain.archiver)?,
         vec!["-O0", "-g", "-fno-experimental-isel", "-Wno-override-module"]
     }
-    let mut sources = package_native_sources(root, graph, target, toolchain)
+    let mut native_packages = Vec[WorkspaceRefrain]::new()
+    for package in graph.refrains {
+        if project_runtime || package.name != graph.root_name {
+            native_packages.push(package)
+        }
+    }
+    let native_graph = ResolvedPackageGraph {
+        graph.root_name, native_packages, graph.enabled_features
+    }
+    let mut sources = package_native_sources(root, native_graph, target, toolchain)
     sources.extend(metadata.sources)
     let native = native_source_identities(sources, plan, staging, requested_jobs())?
     let mut configuration = Vec[Json]::new()
@@ -1195,16 +1411,70 @@ fn prepare_build_script_binary(root: Path, script: Path, output: Path, key: str,
     }
     let configuration = compiler_content_digest(stringify(Json::Array(configuration)))
     let inventory = build_input_inventory(graph)?
+    ret Result::Ok(BuildScriptInputs { metadata, configuration, inventory })
+}
+
+fn prepare_build_script_binary(root: Path, script: Path, output: Path, key: str, lock_root: Path) -> Result[Path, str] {
+    let graph_path = argv(8_usize).unwrap_or("")
+    let full = if graph_path != "" {
+        let restored = decode_build_graph(read_file(graph_path))?
+        let mut matches_root = false
+        for package in restored.refrains {
+            if package.name == restored.root_name && package.root.resolve().as_str() == root.as_str() {
+                matches_root = true
+            }
+        }
+        if !matches_root {
+            ret Result::Err("build script graph does not match its project root")
+        }
+        restored
+    } else {
+        match try_resolve_package_graph_locked(root, true, true, lock_root) {
+            Ok(value) => value Err(failure) => {
+                ret Result::Err(failure.message)
+            }
+        }
+    }
+    let staging = output.parent().unwrap_or(root)
     let name = "build-script-" + key
-    let binary = root.join("target/tests/bin").join(target_executable_name(target, name))
+    let binary = root.join("target/tests/bin").join(target_executable_name(host_target(), name))
     let profile = root.join("target/build-scripts").join(key)
-    if successful_build_matches(profile, configuration, inventory, graph, binary, Option[Path]::None) {
+    let mut owners = Vec[str]::new()
+    for owner in parse(read_file(profile.join("host-packages.json").as_str())).unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new()) {
+        match owner {
+            Json::String(name) => owners.push(name) _ => {
+            }
+        }
+    }
+    let mut loaded = Option[ProjectWorkspace]::None
+    if owners.is_empty() {
+        let mut workspace = match try_load_entry_workspace_locked(root, script, lock_root) {
+            Ok(value) => value Err(failure) => {
+                ret Result::Err(failure.message)
+            }
+        }
+        owners = host_script_owners(workspace, script)
+        loaded = Option[ProjectWorkspace]::Some(workspace)
+    }
+    let mut graph = host_script_graph(full, owners)
+    let mut prepared = prepare_build_script_inputs(root, script, graph, staging, string_list_contains(owners, "@project-runtime"), lock_root)?
+    if successful_build_matches(profile, prepared.configuration, prepared.inventory, graph, binary, Option[Path]::None) {
         ret Result::Ok(binary)
     }
-    let workspace = match try_load_entry_workspace_locked(root, script, lock_root) {
-        Ok(workspace) => workspace Err(failure) => {
-            ret Result::Err(failure.message)
+    let mut workspace = match loaded {
+        Some(value) => value None => {
+            match try_load_entry_workspace_locked(root, script, lock_root) {
+                Ok(value) => value Err(failure) => {
+                    ret Result::Err(failure.message)
+                }
+            }
         }
+    }
+    let actual_owners = host_script_owners(workspace, script)
+    let actual = host_script_graph(full, actual_owners)
+    if encode_build_graph(actual)? != encode_build_graph(graph)? {
+        graph = actual
+        prepared = prepare_build_script_inputs(root, script, graph, staging, string_list_contains(actual_owners, "@project-runtime"), lock_root)?
     }
     // Unusual entrypoints may import sources outside package src directories.
     // Such programs retain the complete loader path on every invocation.
@@ -1229,7 +1499,14 @@ fn prepare_build_script_binary(root: Path, script: Path, output: Path, key: str,
     // Native header/tool/flag changes must also invalidate the older test-binary
     // cache, whose source-only key cannot prove this stronger entry contract.
     remove_file(binary.as_str() + ".fingerprint")
-    if compile_entry_ast_with_metadata(root, workspace, workspace.flat_ast, name, true, Option[NativeBuildMetadata]::Some(metadata), lock_root) != 0 {
+    let mut script_workspace = workspace
+    script_workspace.refrains = Vec[WorkspaceRefrain]::new()
+    for package in graph.refrains {
+        if package.name != graph.root_name || string_list_contains(actual_owners, "@project-runtime") {
+            script_workspace.refrains.push(package)
+        }
+    }
+    if compile_entry_ast_with_metadata(root, script_workspace, workspace.flat_ast, name, true, Option[NativeBuildMetadata]::Some(prepared.metadata), lock_root) != 0 {
         ret Result::Err("build script compilation failed: " + script.as_str())
     }
     if eligible {
@@ -1237,8 +1514,15 @@ fn prepare_build_script_binary(root: Path, script: Path, output: Path, key: str,
         for module in workspace.modules {
             inputs.push(module.module_path)
         }
-        publish_successful_build(profile, configuration, watched_build_inputs(inventory, graph, inputs),
+        publish_successful_build(profile, prepared.configuration, watched_build_inputs(prepared.inventory, graph, inputs),
             graph, binary, Option[Path]::None,)?
+        let mut owners = Vec[Json]::new()
+        for owner in actual_owners {
+            owners.push(Json::String(owner))
+        }
+        if !write_verified_artifact(profile.join("host-packages.json"), stringify(Json::Array(owners))) {
+            ret Result::Err("cannot record build script package closure")
+        }
     }
     ret Result::Ok(binary)
 }
@@ -1265,7 +1549,7 @@ fn append_thinlto_cache_args(args: mut Vec[str], profile: str, target: TargetSpe
 }
 
 fn write_package_pipeline_timing(profile_dir: Path, packages: Vec[CompiledPackage], packages_ms: u64,
-    support_native_ms: u64, link_ms: u64, total_ms: u64, cached: bool,) -> Result[(), str] {
+    support_native_ms: u64, link_ms: u64, total_ms: u64, cached: bool, inputs: Vec[(str, Json)],) -> Result[(), str] {
     let mut units = Vec[Json]::new()
     for package in packages {
         units.push(parse(read_file(package.directory.join("timing.json").as_str())).unwrap_or(Json::Null))
@@ -1279,6 +1563,7 @@ fn write_package_pipeline_timing(profile_dir: Path, packages: Vec[CompiledPackag
     timings.push(("link_cache_hit", Json::Bool(cached)))
     timings.push(("input_cache_hit", Json::Bool(cached && packages.is_empty())))
     timings.push(("units", Json::Array(units)))
+    timings.push(("inputs", Json::Object(inputs)))
     if !write_verified_artifact(profile_dir.join("encore-timings.json"), stringify(Json::Object(timings))) {
         ret Result[(), str]::Err("cannot record package pipeline timings")
     }
@@ -4013,6 +4298,7 @@ fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
     // A test cache hit must be decidable before translation and LLVM emission.
     // Never trust a nearby legacy build marker as executable identity: native
     // package builds need not refresh it when replacing the compiler binary.
+    test_fingerprint = fingerprint_mix(test_fingerprint, "encore-validated-entry-1")
     test_fingerprint = fingerprint_mix(test_fingerprint, running_compiler_identity(root))
     test_fingerprint = Debug::fmt(test_fingerprint.hash())
     if file_exists(native_path(binary_path.as_str())) &&
@@ -4022,9 +4308,28 @@ fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
     }
     remove_file(native_path(test_fingerprint_path.as_str()))
     profile_test_compilation("inputs", input_started)
+    // A miss must pass the same semantic rules as package builds. Cached
+    // binaries below were committed only after this validation, under the
+    // complete input/target/compiler fingerprint; old unchecked entries miss.
+    let mut analysis = workspace.analysis
+    for module in workspace.modules {
+        for diagnostic in analysis.module_semantic_diagnostics_for_target(
+            module.analysis_id.key(), target, module.enabled_features,) {
+            eprintln(render_diagnostic(module.module_path.as_str(), module.source, diagnostic))
+            ret 1_u32
+        }
+    }
     let frontend_started = perf_counter_ms()
     let translation_modules = test_translation_modules(workspace.modules, ast, target)
-    let ehir_bundle = translate_modules_to_ehir_bundle_typed(translation_modules, target, "encore_test")
+    // Native tests consume the same SDK/plugin ABI as independently compiled
+    // packages. Globally unique local spellings are not stable type identities.
+    let mut selected = Vec[usize]::new()
+    for index in 0_usize..translation_modules.len() {
+        selected.push(index)
+    }
+    let ehir_bundle = assemble_typed_ehir_module_bundle(
+        translate_compilation_unit_to_ehir_chunks(translation_modules, target, selected),
+        translation_modules.len(), "encore_test",)
     profile_test_compilation("frontend", frontend_started)
     let ehir_module = flatten_module_bundle("encore_test", ehir_bundle)
     let codegen_started = perf_counter_ms()

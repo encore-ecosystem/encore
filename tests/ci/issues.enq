@@ -1,8 +1,34 @@
 //! One executable regression contract for each audited compiler issue.
-import refrain::ci_helpers::{Fixture, repository}
+import refrain::ci_helpers::{Fixture, repository, std_dependencies}
 import std::os::{is_directory, read_dir, read_file}
 import std::path::Path
 import std::vec::Vec
+
+#attr(test)
+fn standalone_value_import_shares_module_name() -> bool {
+    let fixture = Fixture::new("value-namespace-import")
+    fixture.manifest("namespace_probe", "[]")
+    fixture.put("src/lib.enq", "pub import mod::{compiler, prepare}\npub import mod::compiler::*\npub fn marker() -> u32 { ret 1_u32 }\n")
+    fixture.put("src/compiler.enq", "pub fn prepare() -> u32 { ret 42_u32 }\n")
+    fixture.put("src/prepare.enq", "pub fn unrelated() -> u32 { ret 1_u32 }\n")
+    fixture.put("tests/selected.enq", "import namespace_probe::{marker, prepare}\nfn main() -> u32 { ret if prepare() + marker() == 43_u32 { 0_u32 } else { 1_u32 } }\n")
+    ret fixture.finish(fixture.succeeds(vec!["test"]) && fixture.succeeds(vec!["check"]))
+}
+
+#attr(test)
+fn standalone_cfg_and_prelude_resolution() -> bool {
+    let fixture = Fixture::new("standalone-cfg-prelude")
+    fixture.manifest("configured_probe", "[]")
+    fixture.put("src/lib.enq", "pub fn ok() -> bool { ret true }\n")
+    fixture.put("tests/configured.enq", "#cfg(target_os=\"impossible-os\")\nfn disabled() -> u32 { ret missing_disabled_symbol() }\n" +
+        "fn main() -> u32 { let value = Option[u32]::Some(42_u32) match value { Option::Some(n) => { ret n - 42_u32 } Option::None => { ret 1_u32 } } }\n",)
+    if !fixture.succeeds(vec!["test"]) {
+        ret fixture.finish(false)
+    }
+    // Active code must still be validated on both a cold and a repeated test.
+    fixture.put("tests/configured.enq", "fn main() -> u32 { ret missing_active_symbol() }\n")
+    ret fixture.finish(!fixture.command(vec!["test"]).success() && !fixture.command(vec!["test"]).success())
+}
 
 fn copy_sources(fixture: Fixture, source: Path, relative: str) {
     for name in read_dir(source.as_str()) {
@@ -93,4 +119,106 @@ fn open_issue_174_unit_block_owner_cleanup() -> bool {
 #attr(test)
 fn open_issue_175_struct_field_array_index() -> bool {
     ret regression("175", false)
+}
+
+#attr(test)
+fn open_issue_190_cast_tail_commands_agree() -> bool {
+    let fixture = Fixture::new("issue190-cast-tail")
+    fixture.manifest("cast_probe", "[]")
+    fixture.put("src/lib.enq", "pub fn quadrant(level: u32, depth: usize, x: u32, y: u32) -> usize {\n" +
+        "let index = if depth == 0_usize { 0_usize } else {\nlet shift = level - depth as u32\n" +
+        "(((y >> shift) & 1_u32) * 2_u32 + ((x >> shift) & 1_u32)) as usize\n}\nret index\n}\n",)
+    fixture.put("tests/tail.enq", "import cast_probe::quadrant\nfn main() -> u32 { ret if quadrant(2_u32, 1_usize, 2_u32, 3_u32) == 3_usize { 0_u32 } else { 7_u32 } }\n")
+    ret fixture.finish(fixture.succeeds(vec!["check"]) && fixture.succeeds(vec!["build"]) &&
+        fixture.succeeds(vec!["test"]))
+}
+
+#attr(test)
+fn open_issue_191_unmarked_standalone_rejects_missing_argument() -> bool {
+    let fixture = Fixture::new("issue191-method-arity")
+    fixture.manifest("arity_probe", "[]")
+    fixture.put("src/lib.enq", "pub struct Probe { value: u32 }\nimpl for Probe { pub fn read(self: Self, extra: u32) -> u32 { ret self.value + extra } }\n")
+    let source = "import arity_probe::Probe\nfn main() -> u32 { let probe = Probe{41_u32} ret probe.read() }\n"
+    fixture.put("tests/arity.enq", source)
+    // No expect.compile_error annotation: ordinary tests must validate too.
+    let first = fixture.command(vec!["test", "--filter", "arity"])
+    let second = fixture.command(vec!["test", "--filter", "arity"])
+    ret fixture.finish(!first.success() && !second.success() &&
+        read_file(fixture.test_log("arity_probe:tests/arity.enq").as_str()).contains("method-arity-mismatch"))
+}
+
+#attr(test)
+fn open_issue_192_format_preserves_authored_plugin_source() -> bool {
+    let fixture = Fixture::new("issue192-plugin-format")
+    fixture.put("encore.toml", "[project]\nname=\"format_probe\"\nversion=\"0.0.0\"\ntarget=\"shared_lib\"\ndependencies=" + std_dependencies() +
+        "\n[plugin.exports.counter]\ninterface=\"format_probe::Counter\"\nfactory=\"create_counter\"\nstateless=true\n",)
+    fixture.put("src/lib.enq", "#attr(plugin_interface)\npub trait Counter { fn value(self: Self) -> u64 }\n" +
+        "struct State {}\nimpl Counter for State { pub fn value(self: Self) -> u64 { ret 42_u64 } }\n" +
+        "fn create_counter() -> Result[State, str] { ret Result[State, str]::Ok(State{}) }\n",)
+    if !fixture.succeeds(vec!["check"]) || !fixture.succeeds(vec!["format"]) {
+        ret fixture.finish(false)
+    }
+    let once = fixture.read("src/lib.enq")
+    if once.contains("__encore_plugin") || !fixture.succeeds(vec!["format"]) ||
+    once != fixture.read("src/lib.enq") || !fixture.succeeds(vec!["check"]) {
+        ret fixture.failure("formatting must not materialize generated plugin ABI source")
+    }
+    ret fixture.finish(fixture.succeeds(vec!["build"]))
+}
+
+#attr(test)
+fn open_issue_181_submodule_root_return_identity() -> bool {
+    let fixture = Fixture::new("issue181-return-identity")
+    fixture.manifest("spatial_app", "[\"path@math\"]")
+    fixture.put("math/encore.toml", "[project]\nname=\"spatial_math\"\nversion=\"0.0.0\"\n")
+    fixture.put("math/src/lib.enq", "pub import mod::precision::DVec3\npub struct Vec3 { x: f32 }\nimpl for Vec3 { pub fn new(x: f32) -> Self { ret Self{x} } pub fn x(self: Self) -> f32 { ret self.x } }\n")
+    fixture.put("math/src/precision.enq", "import refrain::Vec3\npub struct DVec3 { x: f64 }\nimpl for DVec3 { pub fn new(x: f64) -> Self { ret Self{x} } pub fn to_vec3(self: Self) -> Vec3 { ret Vec3::new(self.x as f32) } }\n")
+    fixture.put("src/region.enq", "import spatial_math::{Vec3, DVec3}\npub fn local() -> Vec3 { let n = DVec3::new(1_f64).to_vec3() ret n }\n")
+    fixture.put("src/main.enq", "import mod::region::local\nfn main() -> u32 { ret if local().x() == 1_f32 { 0_u32 } else { 1_u32 } }\n")
+    if !fixture.succeeds(vec!["check"]) || !fixture.succeeds(vec!["build"]) ||
+    !fixture.tool(fixture.binary("spatial_app", "dev").as_str(), Vec[str]::new()).success() {
+        ret fixture.finish(false)
+    }
+    ret fixture.finish(fixture.succeeds(vec!["build"]))
+}
+
+#attr(test)
+fn open_issue_193_plugin_fingerprint_matches_standalone() -> bool {
+    let fixture = Fixture::new("issue193-fingerprint")
+    let standard = std_dependencies()
+    fixture.manifest("fingerprint_probe", standard.slice_bytes(0_usize, standard.byte_len() - 1_usize) + ",\"path@api\"]")
+    fixture.put("api/encore.toml", "[project]\nname=\"plugin_api\"\nversion=\"0.0.0\"\ndependencies=" + standard + "\n")
+    fixture.put("api/src/lib.enq", "import core::result::Result\nimport std::plugin::Resource\n" +
+        "pub struct Request { root: str values: Vec[str] }\npub struct Failure { code: i32 message: str }\n" +
+        "#attr(plugin_interface)\npub trait Operation { fn cancel(self: Self) -> bool }\n" +
+        "#attr(plugin_interface)\npub trait Service { fn start(self: Self, request: Request) -> Result[Resource[dyn Operation], Failure] }\n",)
+    let prefix = "import std::os::write_file\nimport std::plugin::__interface_fingerprint\nimport plugin_api::Service\nfn main() -> u32 { let code = write_file(\""
+    let suffix = "\", __interface_fingerprint[dyn Service]()) ret if code == 0_i32 { 0_u32 } else { 1_u32 } }\n"
+    fixture.put("src/main.enq", prefix + "normal.txt" + suffix)
+    fixture.put("tests/fingerprint.enq", prefix + "standalone.txt" + suffix)
+    if !fixture.succeeds(vec!["run"]) || !fixture.succeeds(vec!["test"]) {
+        ret fixture.finish(false)
+    }
+    let fingerprint = fixture.read("normal.txt")
+    ret fixture.finish(fingerprint.byte_len() == 64_usize && fingerprint == fixture.read("standalone.txt"))
+}
+
+#attr(test)
+fn open_issue_194_cached_ignored_resource_result() -> bool {
+    let fixture = Fixture::new("issue194-reflection-dependency")
+    fixture.manifest("reflection_probe", std_dependencies())
+    fixture.put("src/operation.enq", "import std::plugin::Resource\n" +
+        "#attr(plugin_interface)\npub trait Operation { fn cancel(self: Self) -> bool }\n" +
+        "pub fn cancel_slot(pending: Option[Resource[dyn Operation]]) -> () { match pending { Some(operation) => { let _cancel = operation.cancel() } None => {} } }\n",)
+    let source = "import mod::operation::{Operation, cancel_slot}\nimport std::plugin::Resource\nfn main() -> u32 { cancel_slot(Option[Resource[dyn Operation]]::None) ret 0_u32 }\n"
+    fixture.put("src/main.enq", source)
+    if !fixture.succeeds(vec!["run"]) {
+        ret fixture.finish(false)
+    }
+    fixture.put("src/main.enq", source + "fn unrelated() -> u32 { ret 1_u32 }\n")
+    if !fixture.succeeds(vec!["run"]) {
+        ret fixture.finish(false)
+    }
+    fixture.put("src/main.enq", source + "fn unrelated() -> u32 { ret 2_u32 }\n")
+    ret fixture.finish(fixture.succeeds(vec!["run"]))
 }

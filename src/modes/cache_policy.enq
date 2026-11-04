@@ -9,7 +9,7 @@ import std::fs::File
 import std::io::eprintln
 import std::os::{env, home_dir, mkdir_all, read_dir, read_file, remove_dir_all, remove_file, write_file}
 import std::path::Path
-import std::time::{perf_counter_ns, time_ms}
+import std::time::{perf_counter_ms, perf_counter_ns, time_ms}
 import std::vec::Vec
 
 import argparse::{process_arg, process_arg_count}
@@ -618,33 +618,220 @@ impl ContextManager for BuildWorkspace {
     }
 }
 
-/// Throttle automatic inventory across all test workers and projects. Two GiB
-/// of hysteresis absorbs ordinary writes between checks; manual prune is immediate.
+/// Automatic GC advances a persisted scan instead of walking the entire cache
+/// on the launch path. Explicit prune still performs a complete inventory.
 pub fn maintain_cache() ->() {
+    // Nested host/test workers must not each add a GC slice to one command.
+    let command = process_arg(1_usize).unwrap_or("")
+    if command.byte_len() >= 2_usize && command.slice_bytes(0_usize, 2_usize) == "__" {
+        ret()
+    }
     let root = cache_root()
     if file_fact(root, 0_u32) != 2_u64 {
         ret()
     }
+    let pending = root / ".maintenance-scan.json"
     let stamp = decimal(read_file((root / ".maintenance-last").as_str())).unwrap_or(0_u64)
     let now = time_ms()
-    if now >= stamp && now - stamp < 60000_u64 {
+    if file_fact(pending, 0_u32) != 1_u64 && now >= stamp && now - stamp < 60000_u64 {
         ret()
     }
     let handle = open_lock(root / ".maintenance.lock", false)
     if handle == 0_usize {
         ret()
     }
-    let updated = decimal(read_file((root / ".maintenance-last").as_str())).unwrap_or(0_u64)
-    if now >= updated && now - updated < 60000_u64 {
+    let collector = open_lock(root / ".gc.lock", false)
+    if collector == 0_usize {
         close_lock(handle) ret()
     }
-    let _marked = write_file((root / ".maintenance-last").as_str(), Debug::fmt(now))
-    let limit = cache_limit("").unwrap_or(21474836480_u64)
-    let result = prune_cache(root, limit, false, false)
-    if result.after > limit {
-        eprintln("Cache remains above its limit; busy entries will be retried after another build.")
+    let started = perf_counter_ms()
+    let state = parse(read_file(pending.as_str())).unwrap_or(Json::Null)
+    let compatible = state.get("schema").unwrap_or(Json::Null).as_str().unwrap_or("") == "encore-incremental-gc-1"
+    let mut bucket = if compatible {
+        gc_number(state, "bucket") as usize
+    } else {
+        0_usize
     }
-    close_lock(handle)
+    let mut offset = if compatible {
+        gc_number(state, "offset") as usize
+    } else {
+        0_usize
+    }
+    let mut total = if compatible {
+        gc_number(state, "bytes")
+    } else {
+        0_u64
+    }
+    let mut names = if compatible {
+        state.get("names").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new())
+    } else {
+        Vec[Json]::new()
+    }
+    let mut candidates = Vec[CacheEntry]::new()
+    if compatible {
+        for item in state.get("candidates").unwrap_or(Json::Null).as_array().unwrap_or(Vec[Json]::new()) {
+            let path = item.get("path").unwrap_or(Json::Null).as_str().unwrap_or("")
+            let kind = item.get("kind").unwrap_or(Json::Null).as_str().unwrap_or("")
+            if gc_owned_path(root, path, kind) {
+                candidates.push(CacheEntry {
+                        path, gc_number(item, "bytes"), gc_number(item, "used"), kind,
+                        if kind == "lowering-v2" {
+                            (root / "lowering-v1").join(Path::new(path).name().unwrap_or("").slice_bytes(0_usize, 64_usize) + ".lock").as_str()
+                        } else {
+                            path + ".lock"
+                        }
+                    }
+                )
+            }
+        }
+    }
+    while bucket < 259_usize && perf_counter_ms() - started < 50_u64 {
+        let base = gc_bucket(root, bucket)
+        if names.is_empty() {
+            for name in read_dir(base.as_str()) {
+                names.push(Json::String(name))
+            }
+            offset = 0_usize
+        }
+        while offset < names.len() && perf_counter_ms() - started < 50_u64 {
+            let name = names.get(offset).unwrap_or(Json::Null).as_str().unwrap_or("")
+            offset += 1_usize
+            let path = base.join(name).as_str()
+            let kind = if bucket >= 3_usize {
+                "lowering-v2"
+            } elif bucket == 1_usize {
+                "lowering-v1"
+            } elif bucket == 2_usize {
+                "objects-v1"
+            } else {
+                "units"
+            }
+            if !gc_owned_path(root, path, kind) {
+                continue
+            }
+            let bytes = if bucket >= 3_usize {
+                if file_fact_raw(path, 0_u32) != 1_u64 {
+                    continue
+                }
+                file_fact_raw(path, 1_u32)
+            } else {
+                if file_fact_raw(path, 0_u32) != 2_u64 || entry_category(path, kind) == "" {
+                    continue
+                }
+                recorded_usage(Path::new(path), false).bytes
+            }
+            if bytes > 18446744073709551615_u64 - total {
+                total = 18446744073709551615_u64
+            } else {
+                total += bytes
+            }
+            let used = if bucket >= 3_usize {
+                file_fact_raw(path, 2_u32)
+            } else {
+                decimal(read_file(path + "/.last-used")).unwrap_or(file_fact_raw(path, 2_u32))
+            }
+            let entry = CacheEntry {
+                path, bytes, used, kind,
+                if bucket >= 3_usize {
+                    (root / "lowering-v1").join(name.slice_bytes(0_usize, 64_usize) + ".lock").as_str()
+                } else {
+                    path + ".lock"
+                }
+            }
+            if candidates.len() < 32_usize || used < entry_at(candidates, candidates.len() - 1_usize).used {
+                candidates.push(entry)
+                candidates = oldest_first(candidates)
+                if candidates.len() > 32_usize {
+                    let _removed = candidates.pop()
+                }
+            }
+        }
+        if offset >= names.len() {
+            bucket += 1_usize offset = 0_usize names = Vec[Json]::new()
+        }
+    }
+    if bucket >= 259_usize {
+        let limit = cache_limit("").unwrap_or(21474836480_u64)
+        let mut remaining = Vec[CacheEntry]::new()
+        for entry in candidates {
+            if total <= limit || perf_counter_ms() - started >= 50_u64 {
+                remaining.push(entry) continue
+            }
+            let lease = open_lock_raw(entry.lock_path, false)
+            if lease == 0_usize {
+                continue
+            }
+            let used = if entry.category == "lowering-v2" {
+                file_fact_raw(entry.directory, 2_u32)
+            } else {
+                decimal(read_file(entry.directory + "/.last-used")).unwrap_or(file_fact_raw(entry.directory, 2_u32))
+            }
+            if used <= entry.used {
+                let removed = if entry.category == "lowering-v2" {
+                    remove_file(entry.directory) == 0_i32
+                } else {
+                    remove_dir_all(entry.directory) == 0_i32
+                }
+                if removed {
+                    total = if total >= entry.bytes {
+                        total - entry.bytes
+                    } else {
+                        0_u64
+                    }
+                }
+            }
+            close_lock(lease)
+        }
+        candidates = remaining
+        if candidates.is_empty() || total <= limit {
+            let _removed = remove_file(pending.as_str())
+            let _marked = atomic(root / ".maintenance-last", Debug::fmt(now))
+            close_lock(collector) close_lock(handle) ret()
+        }
+    }
+    let mut saved = Vec[Json]::new()
+    for entry in candidates {
+        saved.push(Json::Object(vec![("path", Json::String(entry.directory)),("kind", Json::String(entry.category)),
+                    ("bytes", Json::Number(Debug::fmt(entry.bytes))),("used", Json::Number(Debug::fmt(entry.used)))]))
+    }
+    let _saved = atomic(pending, stringify(Json::Object(vec![("schema", Json::String("encore-incremental-gc-1")),
+                    ("bucket", Json::Number(Debug::fmt(bucket))),("offset", Json::Number(Debug::fmt(offset))),
+                    ("bytes", Json::Number(Debug::fmt(total))),("names", Json::Array(names)),("candidates", Json::Array(saved))])))
+    close_lock(collector) close_lock(handle)
+}
+
+fn gc_number(value: Json, name: str) -> u64 {
+    ret decimal(value.get(name).unwrap_or(Json::Null).as_number().unwrap_or("")).unwrap_or(0_u64)
+}
+fn gc_bucket(root: Path, bucket: usize) -> Path {
+    if bucket == 0_usize {
+        ret root
+    }
+    if bucket == 1_usize {
+        ret root / "lowering-v1"
+    }
+    if bucket == 2_usize {
+        ret root / "objects-v1"
+    }
+    let digits = "0123456789abcdef"
+    let value = bucket - 3_usize
+    ret root / "lowering-v2" /(digits.slice_bytes(value / 16_usize, 1_usize) + digits.slice_bytes(value % 16_usize, 1_usize))
+}
+fn gc_owned_path(root: Path, path: str, kind: str) -> bool {
+    let name = Path::new(path).name().unwrap_or("")
+    if kind == "lowering-v2" {
+        if name.byte_len() != 70_usize || name.slice_bytes(64_usize, 6_usize) != ".entry" || !key_name(name.slice_bytes(0_usize, 64_usize)) {
+            ret false
+        }
+        ret path ==(root / "lowering-v2" / name.slice_bytes(0_usize, 2_usize) / name).as_str()
+    }
+    if !key_name(name) {
+        ret false
+    }
+    if kind == "units" {
+        ret path ==(root / name).as_str()
+    }
+    ret(kind == "lowering-v1" || kind == "objects-v1") && path ==(root / kind / name).as_str()
 }
 
 fn workspace_record(directory: Path) -> Json {

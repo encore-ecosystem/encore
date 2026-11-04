@@ -92,6 +92,9 @@ def main():
             strip = "-Wl,-dead_strip" if darwin else "-Wl,--gc-sections"
             sdk_flags = flags + (["-lws2_32", "-lsecur32", "-lcrypt32"] if windows else
                 ["-lm"] + (["-framework", "CoreFoundation", "-framework", "Security"] if darwin else []))
+            if sys.platform.startswith("linux"):
+                # The platform file/text SHA-256 APIs use OpenSSL EVP on Linux.
+                sdk_flags += ["-lcrypto"]
             run("build-sdk", cc + ["-ffunction-sections", "-fdata-sections", strip,
                 "packages/platform/tests/plugins/sdk.c", "packages/core/runtime.c", "-o", str(sdk)] + sdk_flags)
             run("sdk", [str(sdk)])

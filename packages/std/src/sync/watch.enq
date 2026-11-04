@@ -1,0 +1,130 @@
+//! Versioned immutable snapshots; slow readers observe the latest published state.
+import core::future::{Context, Future, Poll}
+import core::option::Option
+import core::panic::panic
+import core::result::Result
+
+import std::sync::frozen::Frozen
+
+import platform::sync as native
+import platform::sync::__Lease
+
+pub enum WatchError {
+    Closed
+    VersionOverflow
+    AllocationFailed
+}
+pub struct WatchSnapshot[T] {
+    version: u64
+    value: Frozen[T]
+}
+pub struct WatchSender[T] {
+    state: __Lease
+}
+pub struct WatchReceiver[T] {
+    state: __Lease
+}
+pub struct WatchFuture[T] {
+    receiver: WatchReceiver[T]
+    after: u64
+    registration: __Lease
+}
+
+#attr(safe)
+pub fn watch[T](initial: Frozen[T]) -> Result[(WatchSender[T], WatchReceiver[T]), WatchError] {
+    let token = native::encore_sync_watch_new(initial.state.raw())
+    if token == 0_usize {
+        ret Result::Err(WatchError::AllocationFailed)
+    }
+    let state = native::__adopt(token)
+    let sender = native::encore_sync_watch_endpoint_new(state.raw(), true)
+    if sender == 0_usize {
+        ret Result::Err(WatchError::AllocationFailed)
+    }
+    let owned_sender = native::__adopt(sender)
+    let receiver = native::encore_sync_watch_endpoint_new(state.raw(), false)
+    if receiver == 0_usize {
+        ret Result::Err(WatchError::AllocationFailed)
+    }
+    ret Result::Ok((WatchSender[T] { owned_sender }, WatchReceiver[T] { native::__adopt(receiver) }))
+}
+#attr(safe)
+fn read_snapshot[T](handle: usize) -> Option[WatchSnapshot[T]] {
+    if handle == 0_usize {
+        ret Option::None
+    }
+    if handle == 18446744073709551615_usize {
+        panic("cannot allocate watch snapshot") ret Option::None
+    }
+    let read = native::__adopt(handle)
+    ret Option::Some(WatchSnapshot[T] {
+            native::encore_sync_watch_read_version(read.raw()), Frozen[T] {
+                native::__adopt(native::encore_sync_watch_read_box(read.raw()))
+            }
+        }
+    )
+}
+
+impl[T] for WatchSender[T] {
+    #attr(safe)
+    #attr(borrowed_self)
+    pub fn publish(self: Self, value: Frozen[T]) -> Result[(), WatchError] {
+        let status = native::encore_sync_watch_publish(self.state.raw(), value.state.raw())
+        if status == 0_u32 {
+            ret Result::Ok(())
+        }
+        ret Result::Err(if status == 1_u32 {
+                WatchError::Closed
+            } else {
+                WatchError::VersionOverflow
+            }
+        )
+    }
+    #attr(safe)
+    #attr(borrowed_self)
+    pub fn close(self: Self) ->() {
+        native::encore_sync_watch_close(self.state.raw())
+    }
+}
+
+impl[T] for WatchReceiver[T] {
+    #attr(safe)
+    #attr(borrowed_self)
+    pub fn snapshot(self: Self) -> Option[WatchSnapshot[T]] {
+        ret read_snapshot[T](native::encore_sync_watch_snapshot(self.state.raw(), 0_u64, true))
+    }
+    #attr(safe)
+    pub fn changed(self: Self, after: u64) -> WatchFuture[T] {
+        ret WatchFuture[T] {
+            self, after, native::__adopt(0_usize)
+        }
+    }
+}
+
+impl[T] Future[Result[WatchSnapshot[T], WatchError]] for WatchFuture[T] {
+    #attr(safe)
+    pub fn poll(self: Self, context: Context) -> Poll[Self, Result[WatchSnapshot[T], WatchError]] {
+        loop {
+            match read_snapshot[T](native::encore_sync_watch_snapshot(self.receiver.state.raw(), self.after, false)) {
+                Option[WatchSnapshot[T]]::Some(snapshot) => {
+                    ret Poll::Ready(Result::Ok(snapshot))
+                }
+                Option[WatchSnapshot[T]]::None => {
+                }
+            }
+            if native::encore_sync_watch_closed(self.receiver.state.raw()) {
+                ret Poll::Ready(Result::Err(WatchError::Closed))
+            }
+            let handle = native::encore_sync_watch_register(self.receiver.state.raw(), self.after, context.waker.raw_token())
+            if handle == 18446744073709551615_usize {
+                panic("cannot allocate watch registration")
+            }
+            if handle != 0_usize {
+                ret Poll::Pending(Self {
+                        self.receiver, self.after, native::__adopt(handle)
+                    }
+                )
+            }
+        }
+    }
+}

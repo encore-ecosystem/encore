@@ -3,7 +3,8 @@ import refrain::frontend::lexer::Lexer
 import core::fmt::Debug
 import core::option::Option
 
-import std::os::{mkdir_all, remove_dir_all}
+import std::io::eprintln
+import std::os::{mkdir_all, remove_dir_all, write_file}
 import std::path::Path
 import std::time::perf_counter_ns
 import std::vec::Vec
@@ -80,9 +81,15 @@ fn parity(prefix: str, count: usize) -> bool {
     let restored = persisted(before.functions)
     let replayed = translate(source, restored, true)
     let fresh = translate(source, Vec[CachedFunctionChunk]::new(), false)
-    ret replayed.functions_reused == count && replayed.functions.len() == 1 &&
-    assemble_ehir_module_bundle(replayed.modules, 1, "cache@main.enq") ==
-    assemble_ehir_module_bundle(fresh.modules, 1, "cache@main.enq")
+    let replayed_text = assemble_ehir_module_bundle(replayed.modules, 1, "cache@main.enq")
+    let fresh_text = assemble_ehir_module_bundle(fresh.modules, 1, "cache@main.enq")
+    let same = replayed.functions_reused == count && replayed.functions.len() == 1 && replayed_text == fresh_text
+    if !same {
+        eprintln("cache parity: reused=" + Debug::fmt(replayed.functions_reused) + " expected=" + Debug::fmt(count) + " recorded=" + Debug::fmt(replayed.functions.len()))
+        let _replayed = write_file("target/function-cache-replayed.ehir", replayed_text)
+        let _fresh = write_file("target/function-cache-fresh.ehir", fresh_text)
+    }
+    ret same
 }
 
 fn relocated(prefix: str) -> bool {
@@ -114,6 +121,28 @@ fn decorator_relocated() -> bool {
     let moved = translate("\n\n\n" + source, persisted(before.functions), true)
     ret assemble_ehir_module_bundle(before.modules, 1, "cache@main.enq") ==
     assemble_ehir_module_bundle(moved.modules, 1, "cache@main.enq")
+}
+
+fn adapter_translation(value: u32, cached: Vec[CachedFunctionChunk]) -> CachedCompilationChunks {
+    let mut lexer = Lexer::new()
+    let mut sdk_parser = Parser::new_for_source("sync-sdk.enq")
+    let sdk = sdk_parser.parse(lexer.tokenize("pub fn __payload_drop_address[Value]() -> usize { ret 0_usize }\n" +
+            "pub fn __payload_drop[Value](token: usize) -> () {}\n"))
+    let mut parser = Parser::new_for_source("adapter-host.enq")
+    let ast = parser.parse(lexer.tokenize("import platform::sync as native\n" +
+            "fn address() -> usize { ret native::__payload_drop_address[u64]() }\n" +
+            "fn changed() -> u32 { ret " + Debug::fmt(value) + "_u32 }\n"))
+    let modules = vec![TranslationModule::new("platform@sync/mod.enq", "sync-sdk.enq", Vec[str]::new(), sdk, Vec[str]::new()),
+        TranslationModule::new("adapter@main.enq", "adapter-host.enq", vec!["platform@sync/mod.enq"], ast, Vec[str]::new())]
+    ret translate_cached_compilation_unit_to_ehir_chunks(modules, host_target(), vec![0_usize, 1_usize], cached)
+}
+fn payload_adapter_replayed() -> bool {
+    let first = adapter_translation(1_u32, Vec[CachedFunctionChunk]::new())
+    let replayed = adapter_translation(2_u32, persisted(first.functions))
+    let fresh = adapter_translation(2_u32, Vec[CachedFunctionChunk]::new())
+    ret replayed.functions_reused == 1_usize &&
+    assemble_ehir_module_bundle(replayed.modules, 1_usize, "adapter@main.enq") ==
+    assemble_ehir_module_bundle(fresh.modules, 1_usize, "adapter@main.enq")
 }
 
 fn main() -> u32 {
@@ -153,6 +182,13 @@ fn main() -> u32 {
     }
     if !decorator_relocated() {
         ret 9
+    }
+    if !parity("#attr(reflection_template) fn identity[T](value: T) -> T { ret value }\n" +
+        "fn stable() -> u32 { let ignored = identity[u32](41_u32) ret 0_u32 }\n", 0,) {
+        ret 10
+    }
+    if !payload_adapter_replayed() {
+        ret 11_u32
     }
     ret 0
 }
