@@ -24,3 +24,15 @@ Plain HTTP is restricted to loopback addresses.
 ```
 
 Configure body, header and timeout limits through `HttpClientConfig`.
+
+Async requests are lazy: their first poll submits them to the reactor. An
+unfinished `HTTPResponseFuture` returned by a select or timeout retains its
+waker registration and can be resumed by another `block_on` call on the same
+owning thread. Dropping the final future owner abandons its native request.
+Dropping the final client owner stops and joins the reactor before freeing it;
+`close()` remains available for explicit, shared shutdown.
+
+Use `.with_token(std::sync::CancellationToken)` for cancellation shared with
+other SDK operations. The existing `.with_cancellation(HTTPCancellationToken)`
+API remains client-specific and rejects a token from another reactor. Neither
+API makes a client or request transferable across threads.

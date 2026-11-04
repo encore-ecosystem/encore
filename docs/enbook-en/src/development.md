@@ -55,6 +55,22 @@ a profiler. Concurrent phase durations are not an additive wall-time breakdown.
 Package workers reuse their checked body facts during safety inference; this
 reuse stays inside the same compilation and does not create another disk cache.
 
+For a generated large-SDK workload, run:
+
+```sh
+python3 scripts/benchmark-sdk-builds.py --compiler target/dev/encore \
+  --output target/performance/sdk.json
+```
+
+This fixture generates 463 endpoint functions and response types. Each repetition
+uses a new private project and compiled-package cache, then measures an identical
+rebuild, application body, dependency body, public interface, reachable and
+unreachable generic bodies, and native compile flags. Each built executable is
+checked outside the timing interval. The schema-versioned report retains compiler
+hash/version, host platform, automatic worker selection, source fingerprints and
+the complete phase/cache reports. Run the same command with a baseline compiler
+to obtain a comparison; a cold sample is never treated as a warm speedup.
+
 Nominal type resolution also keeps a translation-local cache, limited to 4,096
 entries, 1,024-byte keys and 2,048-byte values. Generic shadowing scopes and
 oversized types use the ordinary resolver. An identifier index scans each EHIR

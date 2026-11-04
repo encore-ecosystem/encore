@@ -676,6 +676,7 @@ struct TranslatorContext {
     next_closure_ordinal: usize
     ir_scope: LoweringScope
     generated_declarations: Vec[GeneratedDeclaration]
+    reflection_declarations: Vec[GeneratedDeclaration]
 }
 
 struct ReflectionShapeCache {
@@ -1675,6 +1676,7 @@ fn free_translation_indexes(ctx: TranslatorContext) ->() {
 fn translate_ast_with_context(ctx: mut TranslatorContext, ast: Vec[Statement], target: TargetSpec, features:
     Vec[str], module_id: str,) -> LoweringBuilder {
     ctx.current_module = module_id
+    let first_cached_function = ctx.lowered_functions.len()
     reset_qualified_type_cache(ctx)
     reset_generated_closure_declarations(ctx)
     // Validate concrete plugin contracts before constructing their DTO types.
@@ -1754,7 +1756,14 @@ fn translate_ast_with_context(ctx: mut TranslatorContext, ast: Vec[Statement], t
                         }
                     }
                 }
-                builder = builder.append(LoweringBuilder::from_items(ctx.ir_scope, lowered))
+                ctx.reflection_declarations.push(GeneratedDeclaration {
+                        specialization.name, "", lowered
+                    }
+                )
+                if !contains_str(ctx.extern_functions, specialization.name) {
+                    ctx.extern_functions.push(specialization.name)
+                    builder = builder.append(LoweringBuilder::from_items(ctx.ir_scope, lowered))
+                }
                 ctx.self_type = old_self
             }
             None => {
@@ -1764,6 +1773,7 @@ fn translate_ast_with_context(ctx: mut TranslatorContext, ast: Vec[Statement], t
     for declaration in ctx.generated_declarations {
         builder = builder.append(LoweringBuilder::from_items(ctx.ir_scope, declaration.items))
     }
+    capture_cached_reflection_dependencies(ctx, first_cached_function)
     ret builder
 }
 
@@ -1913,7 +1923,7 @@ fn empty_translation_context(modules: Vec[TranslationModule], target: TargetSpec
             , Vec[str]::new(), Vec[Option[FunctionType]]::new(),
             Vec[TranslationExportSyntax]::new(), Vec[usize]::new(), Vec[str]::new(), Vec[str]::new()
         }
-        , Vec[usize]::new(), "", "", 0, LoweringScope::new(Vec[Parameter]::new()), Vec[GeneratedDeclaration]::new()
+        , Vec[usize]::new(), "", "", 0, LoweringScope::new(Vec[Parameter]::new()), Vec[GeneratedDeclaration]::new(), Vec[GeneratedDeclaration]::new()
     }
     ret ctx
 }
@@ -2897,6 +2907,9 @@ fn remember_trait_impl(ctx: mut TranslatorContext, item: ImplStmt) ->() {
         Option[str]::Some(raw_trait_name) => {
             let trait_name = trait_identity_for_source(ctx, item.source_name, raw_trait_name)
             let target = qualified_generic_type(ctx, item.source_name, item.target, generic_param_names(item.generics))
+            if trait_name == "Future" && sync_contains_local_handle(ctx, target, Vec[str]::new(), false) {
+                translation_error_at(item.source_name, item.line, item.column, "mutex-guard-in-future", "a Future state cannot own a mutex guard; acquire and release it within one poll")
+            }
             let mut arguments = Vec[str]::new()
             for argument in item.trait_args {
                 arguments.push(qualified_generic_type(ctx, item.source_name, argument, generic_param_names(item.generics)))
@@ -3927,6 +3940,13 @@ fn thread_type_is_send_inner(ctx: mut TranslatorContext, typ: str, seen: Vec[str
         ret true
     }
     let owner = base_type_name(value)
+    let sync_role = sync_type_thread_role(ctx, owner)
+    if sync_role == 1_u32 || sync_role == 2_u32 || sync_role == 4_u32 {
+        ret false
+    }
+    if sync_role == 3_u32 {
+        ret true
+    }
     if owner == "JoinHandle" {
         ret false
     }
@@ -4024,6 +4044,13 @@ fn thread_type_is_transferable_region_inner(ctx: mut TranslatorContext, typ: str
         ret true
     }
     let owner = base_type_name(raw)
+    let sync_role = sync_type_thread_role(ctx, owner)
+    if sync_role == 1_u32 {
+        ret true
+    }
+    if sync_role == 2_u32 || sync_role == 4_u32 {
+        ret false
+    }
     if owner == "Vec" || starts_with(owner, "__tuple_") || starts_with(owner, "__array_") {
         for generic in generic_args_from_path(raw) {
             if !thread_type_is_transferable_region_inner(ctx, generic, seen) {
@@ -4077,7 +4104,150 @@ fn thread_type_is_transferable_region_inner(ctx: mut TranslatorContext, typ: str
 }
 
 fn thread_type_is_freezable_region(ctx: mut TranslatorContext, typ: str) -> bool {
+    if sync_contains_local_handle(ctx, typ, Vec[str]::new(), true) {
+        ret false
+    }
     ret thread_type_is_transferable_region(ctx, typ)
+}
+
+// Rebinding an inline native endpoint does not grant mutation of a user graph.
+// It still obeys exclusive thread transfer and cannot be frozen or forged.
+fn type_contains_mutable_graph(ctx: mut TranslatorContext, typ: str, seen: Vec[str]) -> bool {
+    let raw = canonical_type(value_type_name(typ))
+    let owner = base_type_name(raw)
+    if sync_type_thread_role(ctx, owner) != 0_u32 {
+        ret false
+    }
+    if !thread_type_is_transferable_region(ctx, raw) {
+        ret false
+    }
+    if thread_type_is_send(ctx, raw, Vec[str]::new()) || contains_str(seen, raw) {
+        ret false
+    }
+    if owner == "Vec" || ends_with(raw, "<H>") || ends_with(raw, "<S>") || ends_with(raw, "&") {
+        ret true
+    }
+    let mut next = copy_str_vec(seen) next.push(raw)
+    let arguments = generic_args_from_path(raw)
+    if starts_with(owner, "__tuple_") || starts_with(owner, "__array_") {
+        for argument in arguments {
+            if type_contains_mutable_graph(ctx, argument, next) {
+                ret true
+            }
+        }
+    }
+    for position in aggregate_member_candidates(ctx, owner, false) {
+        match ctx.fields.get(position) {
+            Some(field) => {
+                if type_contains_mutable_graph(ctx, direct_generic_hint(field.typ, arguments), next) {
+                    ret true
+                }
+            }
+            None => {
+            }
+        }
+    }
+    for position in aggregate_member_candidates(ctx, owner, true) {
+        match ctx.enum_variants.get(position) {
+            Some(variant) => {
+                if variant.payload_type != "" && type_contains_mutable_graph(ctx, direct_generic_hint(variant.payload_type, arguments), next) {
+                    ret true
+                }
+            }
+            None => {
+            }
+        }
+    }
+    ret false
+}
+
+fn sync_contains_local_handle(ctx: mut TranslatorContext, typ: str, seen: Vec[str], receivers: bool) -> bool {
+    let raw = canonical_type(value_type_name(typ))
+    let owner = base_type_name(raw)
+    let role = sync_type_thread_role(ctx, owner)
+    if role == 2_u32 ||(receivers &&(role == 1_u32 || role == 4_u32)) {
+        ret true
+    }
+    if role == 3_u32 || contains_str(seen, raw) {
+        ret false
+    }
+    let mut next = copy_str_vec(seen) next.push(raw)
+    let arguments = generic_args_from_path(raw)
+    if owner == "Vec" || starts_with(owner, "__tuple_") || starts_with(owner, "__array_") {
+        for argument in arguments {
+            if sync_contains_local_handle(ctx, argument, next, receivers) {
+                ret true
+            }
+        }
+    }
+    for position in aggregate_member_candidates(ctx, owner, false) {
+        match ctx.fields.get(position) {
+            Some(field) => {
+                if sync_contains_local_handle(ctx, direct_generic_hint(field.typ, arguments), next, receivers) {
+                    ret true
+                }
+            }
+            None => {
+            }
+        }
+    }
+    for position in aggregate_member_candidates(ctx, owner, true) {
+        match ctx.enum_variants.get(position) {
+            Some(variant) => {
+                if variant.payload_type != "" && sync_contains_local_handle(ctx, direct_generic_hint(variant.payload_type, arguments), next, receivers) {
+                    ret true
+                }
+            }
+            None => {
+            }
+        }
+    }
+    ret false
+}
+
+fn validate_no_mutex_guard_at_await(ctx: mut TranslatorContext, source: str, line: usize, column: usize) ->() {
+    for variable in ctx.vars {
+        if !contains_str(ctx.moved_values, variable.emitted_name) && sync_contains_local_handle(ctx, variable.typ, Vec[str]::new(), false) {
+            translation_error_at(source, line, column, "mutex-guard-across-await", "end the mutex guard's scope before awaiting")
+        }
+    }
+}
+
+// Single-consumer endpoints may move exclusively. Mutex guards stay on their
+// locking thread. Frozen payload boxes publish recursively immutable values.
+fn sync_type_thread_role(ctx: mut TranslatorContext, owner: str) -> u32 {
+    let mut name = ""
+    for candidate in vec!["Receiver", "ReceiveFuture", "MutexGuard", "Frozen", "TaskGroup"] {
+        if ends_with(owner, candidate) {
+            name = candidate break
+        }
+    }
+    if name == "" {
+        ret 0_u32
+    }
+    let module = if name == "Receiver" || name == "ReceiveFuture" {
+        "std@sync/channel.enq"
+    } elif name == "MutexGuard" {
+        "std@sync/mutex.enq"
+    } elif name == "TaskGroup" {
+        "std@task/mod.enq"
+    } else {
+        "std@sync/frozen.enq"
+    }
+    for position in 0_usize..ctx.modules.len() {
+        if module_id_at(ctx, position) == module && owner == qualified_type_for_source(ctx, module_source_at(ctx, position), name) {
+            ret if name == "Receiver" {
+                1_u32
+            } elif name == "MutexGuard" {
+                2_u32
+            } elif name == "ReceiveFuture" || name == "TaskGroup" {
+                4_u32
+            } else {
+                3_u32
+            }
+        }
+    }
+    ret 0_u32
 }
 
 fn validate_sending_argument(ctx: mut TranslatorContext, typ: str, path: str, source_name: str,
@@ -5386,6 +5556,22 @@ fn ctx_function_returns_borrowed(ctx: mut TranslatorContext, name: str) -> bool 
     ret false
 }
 
+fn ctx_function_returns_frozen(ctx: mut TranslatorContext, name: str) -> bool {
+    let base = base_type_name(name)
+    for position in function_name_candidates(ctx, name, base) {
+        match ctx.functions.get(position) {
+            Some(function) => {
+                if function.name == name || function.name == base {
+                    ret function.returns_frozen
+                }
+            }
+            None => {
+            }
+        }
+    }
+    ret false
+}
+
 fn ctx_function_borrows_self(ctx: mut TranslatorContext, name: str) -> bool {
     let base = base_type_name(name)
     for item in ctx.borrowed_self_functions {
@@ -6451,6 +6637,10 @@ fn translate_struct(item: StructStmt, module_id: str) -> LoweringBuilder {
     }
     let directive = if module_id == "platform@plugin/mod.enq" && item.name == "__EncorePluginLease" {
         resource_struct_directive(item.name, typed_generics(item.generics), fields, "encore_plugin_handle_retain", "encore_plugin_handle_release")
+    } elif module_id == "core@future/mod.enq" && item.name == "Waker" {
+        resource_struct_directive(item.name, typed_generics(item.generics), fields, "encore_async_waker_retain_owned", "encore_async_waker_release")
+    } elif module_id == "platform@sync/mod.enq" && item.name == "__Lease" {
+        resource_struct_directive(item.name, typed_generics(item.generics), fields, "encore_sync_retain", "encore_sync_release")
     } else {
         struct_directive(item.name, typed_generics(item.generics), fields)
     }
@@ -6915,6 +7105,9 @@ fn replay_lowered_function(ctx: mut TranslatorContext, key: str) -> Option[Lower
         match ctx.cached_functions.get(encoded - 1) {
             Some(cached) => {
                 for declaration in cached.declarations {
+                    if contains_str(ctx.extern_functions, declaration.name) {
+                        continue
+                    }
                     ctx.extern_functions.push(declaration.name)
                     match declaration.module {
                         Some(module) => {
@@ -6941,6 +7134,126 @@ fn replay_lowered_function(ctx: mut TranslatorContext, key: str) -> Option[Lower
         }
     }
     ret Option[LoweringBuilder]::None
+}
+
+// A cached caller owns the generated definitions it references. Recording only
+// extern declarations loses reflection/plugin adapters on a warm package build.
+fn reflection_calls(function: FnDirective, names: mut Vec[str]) ->() {
+    for block in function.blocks {
+        for instruction in block.instructions {
+            match instruction {
+                Instruction::Call(call) => {
+                    let pointer_prefix = "__ehir_function_address__"
+                    let name = if starts_with(call.name, pointer_prefix) {
+                        base_type_name(call.name.slice_bytes(pointer_prefix.byte_len(), call.name.byte_len() - pointer_prefix.byte_len()))
+                    } else {
+                        call.name
+                    }
+                    if (starts_with(name, "__encore_reflect_") || starts_with(name, "__encore_plugin_") || starts_with(name, "__encore_sync_")) && !contains_str(names, name) {
+                        names.push(name)
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+    }
+}
+fn module_reflection_calls(module: Module, names: mut Vec[str]) ->() {
+    for directive in module.directives {
+        match directive {
+            Directive::Function(function) => {
+                reflection_calls(function, names)
+            }
+            Directive::Impl(implementation) => {
+                for method in implementation.methods {
+                    reflection_calls(method, names)
+                }
+            }
+            _ => {
+            }
+        }
+    }
+}
+fn module_defines_function(module: Module, name: str) -> bool {
+    for directive in module.directives {
+        match directive {
+            Directive::Function(function) => {
+                if function.name == name {
+                    ret true
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret false
+}
+fn capture_cached_reflection_dependencies(ctx: mut TranslatorContext, first: usize) ->() {
+    let mut generated_definitions = Vec[GeneratedDeclaration]::new()
+    generated_definitions.extend(ctx.reflection_declarations)
+    generated_definitions.extend(ctx.generated_declarations)
+    for index in first..ctx.lowered_functions.len() {
+        let function = ctx.lowered_functions.get_unchecked_borrowed(index)
+        let mut names = Vec[str]::new()
+        module_reflection_calls(function.module, names)
+        for declaration in function.declarations {
+            match declaration.module {
+                Some(module) => {
+                    module_reflection_calls(module, names)
+                }
+                None => {
+                }
+            }
+        }
+        let mut declarations = Vec[CachedFunctionDeclaration]::new()
+        declarations.extend(function.declarations)
+        let mut cursor = 0_usize
+        while cursor < names.len() {
+            let name = names.get_unchecked_borrowed(cursor)
+            cursor += 1_usize
+            let mut present = false
+            for declaration in declarations {
+                match declaration.module {
+                    Some(module) => {
+                        if module_defines_function(module, name) {
+                            present = true break
+                        }
+                    }
+                    None => {
+                    }
+                }
+            }
+            if present {
+                continue
+            }
+            for generated in generated_definitions {
+                let module = cached_items_module(generated.items)
+                if module_defines_function(module, name) {
+                    module_reflection_calls(module, names)
+                    let captured = CachedFunctionDeclaration {
+                        generated.name, generated.closure_name, Option[Module]::Some(module)
+                    }
+                    let mut replaced = false
+                    for position in 0_usize..declarations.len() {
+                        let previous = declarations.get_unchecked_borrowed(position)
+                        if previous.name == name && previous.module.is_none() {
+                            declarations.set(position, captured) replaced = true break
+                        }
+                    }
+                    if !replaced {
+                        declarations.push(captured)
+                    }
+                    break
+                }
+            }
+        }
+        ctx.lowered_functions.set(index, CachedFunctionChunk {
+                function.key, function.module, declarations
+            }
+            ,
+        )
+    }
 }
 
 fn record_lowered_function(ctx: mut TranslatorContext, key: str, lowered: LoweringBuilder, before: usize) ->() {
@@ -7479,7 +7792,7 @@ fn specialize_reflection_call(ctx: mut TranslatorContext, source_name: str, defi
         }
         let key = module_identity_for_source(ctx, template.item.source_name) + "\n" + name + "\n" +
         Debug::fmt(template.item.line) + ":" + Debug::fmt(template.item.column) + "\n" + join_strs(arguments, "\n") +
-        if function_has_attr(template.item, "plugin_resource_constructor") {
+        if function_has_attr(template.item, "plugin_resource_constructor") || function_has_attr(template.item, "scoped_reflection_template") {
             "\n" + ctx.current_module
         } else {
             ""
@@ -8487,31 +8800,11 @@ fn translate_statements_no_default(
 
 fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str, idx: usize) -> LoweringBuilder
 {
-    let source_path = expr_path_or_empty(let_stmt.expr)
-    let source_region = if source_path == "" {
+    let mut source_path = expr_path_or_empty(let_stmt.expr)
+    let mut source_region = if source_path == "" {
         0_usize
     } else {
         ctx_lookup_var_region(ctx, source_path)
-    }
-    // A new binding owns its own rebindable slot. Copying an aggregate shares
-    // nested node handles, not the source variable's slot. Mutating a shared
-    // collection remains visible through either name; rebinding must not be.
-    if let_stmt.is_mut {
-        if source_path != "" {
-            match ctx_lookup_var(ctx, source_path) {
-                Option[str]::Some(source_type) => {
-                    if strict_thread_capabilities() && !ctx_path_is_mutable(ctx, source_path) &&
-                    thread_type_is_transferable_region(ctx, source_type) {
-                        translation_error_at(let_stmt.expr.source_name, let_stmt.expr.line,
-                            let_stmt.expr.column, "mutable-alias-from-readonly",
-                            "cannot create mutable binding '" + let_stmt.name +
-                            "' from immutable region '" + source_path + "'",)
-                    }
-                }
-                Option[str]::None => {
-                }
-            }
-        }
     }
     let borrowed_copy = expr_is_borrowed_copy(let_stmt.expr)
     match let_stmt.typ {
@@ -8526,6 +8819,33 @@ fn translate_let_stmt(ctx: mut TranslatorContext, let_stmt: LetStmt, prefix: str
         lower_expr_with_hint(ctx, let_stmt.expr, ctx.expression_hint, prefix + "_let", idx)
     } else {
         lower_expr(ctx, let_stmt.expr, prefix + "_let", idx)
+    }
+    if source_path == "" && thread_type_is_transferable_region(ctx, lowered.typ) &&
+    sync_contains_local_handle(ctx, lowered.typ, Vec[str]::new(), true) {
+        source_path = expr_projection_root(let_stmt.expr)
+        if source_path != "" {
+            source_region = ctx_lookup_var_region(ctx, source_path)
+        }
+    }
+    // A new binding owns its own rebindable slot. Copying an aggregate shares
+    // nested node handles, not the source variable's slot. Mutating a shared
+    // collection remains visible through either name; rebinding must not be.
+    if let_stmt.is_mut {
+        if source_path != "" {
+            match ctx_lookup_var(ctx, source_path) {
+                Option[str]::Some(source_type) => {
+                    if strict_thread_capabilities() && !ctx_path_is_mutable(ctx, source_path) &&
+                    type_contains_mutable_graph(ctx, lowered.typ, Vec[str]::new()) {
+                        translation_error_at(let_stmt.expr.source_name, let_stmt.expr.line,
+                            let_stmt.expr.column, "mutable-alias-from-readonly",
+                            "cannot create mutable binding '" + let_stmt.name +
+                            "' from immutable region '" + source_path + "'",)
+                    }
+                }
+                Option[str]::None => {
+                }
+            }
+        }
     }
     let initializer_is_frozen = ctx_value_is_frozen(ctx, lowered.value) || ctx_path_is_frozen(ctx,
         source_path,)
@@ -9097,6 +9417,26 @@ fn expr_path_or_empty(expr: ExprNode) -> str {
     ret ""
 }
 
+fn expr_projection_root(expr: ExprNode) -> str {
+    match expr.value {
+        Expr::Field(item) => {
+            ret expr_h_frozen_root_path(item.base)
+        }
+        Expr::Index(item) => {
+            ret expr_h_frozen_root_path(item.base)
+        }
+        Expr::Parenthesized(inner) => {
+            let value = ExprNode {
+                inner.value, inner.line, inner.column, inner.length, inner.source_name
+            }
+            ret expr_projection_root(value)
+        }
+        _ => {
+        }
+    }
+    ret ""
+}
+
 fn expr_frozen_root_path(expr: ExprNode) -> str {
     match expr.value {
         Expr::Path(name) => {
@@ -9333,6 +9673,7 @@ fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usiz
             ret lower_expr_h(ctx, inner, prefix, idx)
         }
         Expr::Await(inner) => {
+            validate_no_mutex_guard_at_await(ctx, expr.source_name, expr.line, expr.column)
             if !ctx.in_async_function {
                 translation_error_at(expr.source_name, expr.line, expr.column, "await-outside-async",
                     "'await' can only be used inside an async function",)
@@ -9631,6 +9972,7 @@ fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx:
             ret lower_array_repeat_expr(ctx, repeat_expr, prefix, idx)
         }
         Expr::Await(inner) => {
+            validate_no_mutex_guard_at_await(ctx, expr.source_name, expr.line, expr.column)
             if !ctx.in_async_function {
                 translation_error_at(expr.source_name, expr.line, expr.column, "await-outside-async",
                     "'await' can only be used inside an async function",)
@@ -10867,6 +11209,31 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
     if generic_args.len() == 0_usize {
         generic_args = generic_args_from_path(callee)
     }
+    if last_type_path_segment(callee_base) == "__payload_drop_address" && generic_args.len() == 1_usize && call.args.len() == 0_usize {
+        match ctx_lookup_function_for_args(ctx, source_name, callee, Vec[str]::new()) {
+            Some(function) => {
+                if module_identity_for_source(ctx, function.source_name) == "platform@sync/mod.enq" {
+                    let value = qualified_type_for_source(ctx, source_name, generic_args.get(0).unwrap_or(""))
+                    let name = "__encore_sync_drop_" + compiler_content_digest(ctx.current_module + "|" + value)
+                    let mut exists = false
+                    for item in ctx.reflection_specializations {
+                        if item.name == name {
+                            exists = true
+                        }
+                    }
+                    if !exists {
+                        plugin_queue_adapter(ctx, name, "fn adapter(payload:usize) { unsafe { platform::sync::__payload_drop[" + value + "](payload) } }", "encore-sync-adapter:" + name)
+                    }
+                    let out = prefix + "_sync_drop_" + Debug::fmt(idx)
+                    ret LoweredExpr {
+                        LoweringBuilder::new(ctx.ir_scope).call((out), "usize", "__ehir_function_address__" + name + "[void,usize]", Vec[Operand]::new(), false), out, "usize"
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
     if last_type_path_segment(callee_base) == "__interface_fingerprint" && generic_args.len() == 1_usize {
         match ctx_lookup_function_for_args(ctx, source_name, callee, Vec[str]::new()) {
             Some(function) => {
@@ -11073,6 +11440,16 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
                 let argument_root = arg_frozen_roots.get(sending_index).unwrap_or("")
                 let argument_is_frozen = arg_is_frozen.get(sending_index).unwrap_or(false)
                 if is_sending {
+                    let actual = call.args.get(sending_index)
+                    match actual {
+                        Some(argument) => {
+                            if thread_type_is_transferable_region(ctx, argument_type) && sync_contains_local_handle(ctx, argument_type, Vec[str]::new(), true) && expr_projection_root(argument) != "" {
+                                translation_error_at(source_name, line, column, "sending-projection", "transfer the complete owner or extract an owned value before sending a projection")
+                            }
+                        }
+                        None => {
+                        }
+                    }
                     let consume_path = validate_sending_argument(ctx, argument_type, argument_path,
                         source_name, line, column,)
                     if consume_path {
@@ -12062,7 +12439,7 @@ fn lower_struct_init_expr(ctx: mut TranslatorContext, init_expr: StructInitExpr,
     let out_name = prefix + "_struct_" + Debug::fmt(idx)
     let struct_type = qualified_type_for_source(ctx, source_name,
         self_context_type(ctx, canonical_type(init_expr.path)),)
-    validate_plugin_handle_access(ctx, struct_type, source_name, 0_usize, 0_usize)
+    validate_plugin_handle_access(ctx, struct_type, source_name, 0_usize, 0_usize, true)
     let mut code = LoweringBuilder::new(ctx.ir_scope)
     let mut values = Vec[str]::new()
     let mut i = 0_usize
@@ -12254,8 +12631,17 @@ fn lower_array_repeat_expr(ctx: mut TranslatorContext, repeat_expr: ArrayRepeatE
     }
 }
 
-fn validate_plugin_handle_access(ctx: mut TranslatorContext, typ: str, source: str, line: usize, column: usize) ->() {
+fn validate_plugin_handle_access(ctx: mut TranslatorContext, typ: str, source: str, line: usize, column: usize, writable: bool) ->() {
     let owner = base_type_name(canonical_type(typ))
+    validate_sync_handle_access(ctx, owner, source, line, column)
+    if writable && ends_with(owner, "Waker") && module_identity_for_source(ctx, source) != "core@future/mod.enq" {
+        for position in 0_usize..ctx.modules.len() {
+            if module_id_at(ctx, position) == "core@future/mod.enq" &&
+            owner == qualified_type_for_source(ctx, module_source_at(ctx, position), "Waker") {
+                translation_error_at(source, line, column, "runtime-opaque-handle", "construct executor wakers through core::future::context; their storage is opaque")
+            }
+        }
+    }
     if !ends_with(owner, "Plugin") && !ends_with(owner, "Binding") &&
     !ends_with(owner, "Resource") && !ends_with(owner, "__EncorePluginLease") {
         ret()
@@ -12267,6 +12653,45 @@ fn validate_plugin_handle_access(ctx: mut TranslatorContext, typ: str, source: s
     for handle in vec!["Plugin", "Binding", "Resource", "__EncorePluginLease"] {
         if owner == qualified_type_for_source(ctx, sdk, handle) {
             translation_error_at(source, line, column, "plugin-opaque-handle", "plugin handle storage is opaque outside its SDK")
+        }
+    }
+}
+
+fn sync_sdk_source(module: str) -> bool {
+    ret module == "platform@sync/mod.enq" || starts_with(module, "std@sync/") ||
+    starts_with(module, "std@time/") || module == "std@signal.enq" || starts_with(module, "std@signal/") || starts_with(module, "std@task/")
+}
+
+fn validate_sync_handle_access(ctx: mut TranslatorContext, owner: str, source: str, line: usize, column: usize) ->() {
+    if sync_sdk_source(module_identity_for_source(ctx, source)) {
+        ret()
+    }
+    let mut candidate = false
+    for name in vec!["__Lease", "AtomicU64", "AtomicBool", "CancellationToken", "Cancelled", "Clock", "ClockInstant", "Timer", "VirtualClock", "Sender", "Receiver", "SendFuture", "ReceiveFuture", "Frozen", "Mutex", "MutexGuard", "WatchSender", "WatchReceiver", "WatchFuture", "LockFuture", "Signals", "SignalFuture", "TaskGroup", "GroupJoinFuture"] {
+        if ends_with(owner, name) {
+            candidate = true break
+        }
+    }
+    if !candidate {
+        ret()
+    }
+    for declaration in vec![("platform@sync/mod.enq", "__Lease"),
+        ("std@sync/atomic.enq", "AtomicU64"),("std@sync/atomic.enq", "AtomicBool"),
+        ("std@sync/cancellation.enq", "CancellationToken"),("std@sync/cancellation.enq", "Cancelled"),
+        ("std@time/clock.enq", "Clock"),("std@time/clock.enq", "ClockInstant"),
+        ("std@time/clock.enq", "Timer"),("std@time/clock.enq", "VirtualClock"),
+        ("std@sync/channel.enq", "Sender"),("std@sync/channel.enq", "Receiver"),
+        ("std@sync/channel.enq", "SendFuture"),("std@sync/channel.enq", "ReceiveFuture"),
+        ("std@sync/frozen.enq", "Frozen"),("std@sync/mutex.enq", "Mutex"),("std@sync/mutex.enq", "MutexGuard"),
+        ("std@sync/watch.enq", "WatchSender"),("std@sync/watch.enq", "WatchReceiver"),
+        ("std@sync/watch.enq", "WatchFuture"),("std@sync/mutex.enq", "LockFuture"),
+        ("std@signal.enq", "Signals"),("std@signal.enq", "SignalFuture"),
+        ("std@task/mod.enq", "TaskGroup"),("std@task/mod.enq", "GroupJoinFuture")] {
+        for position in 0_usize..ctx.modules.len() {
+            if module_id_at(ctx, position) == declaration.0 &&
+            owner == qualified_type_for_source(ctx, module_source_at(ctx, position), declaration.1) {
+                translation_error_at(source, line, column, "sync-opaque-handle", "synchronization storage is opaque; use its typed SDK methods")
+            }
         }
     }
 }
@@ -12294,7 +12719,7 @@ fn lower_field_expr(ctx: mut TranslatorContext, field_expr: FieldExpr, source_na
     } else {
         lower_expr_h(ctx, field_expr.base, prefix + "_field_base", idx + 1_usize)
     }
-    validate_plugin_handle_access(ctx, base.typ, source_name, line, column)
+    validate_plugin_handle_access(ctx, base.typ, source_name, line, column, false)
     let base_is_frozen = ctx_path_is_frozen(ctx, base_path) || ctx_value_is_frozen(ctx, base.value)
     let mut field_type = "void"
     match ctx_lookup_field(ctx, base.typ, field_expr.field) {
@@ -12532,6 +12957,11 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     match receiver_param {
         Option[str]::Some(expected_self) => {
             receiver_expects_borrow = ends_with(canonical_type(expected_self), "&")
+            if is_node_handle_type_text(capability_value_type(receiver.typ)) &&
+            !is_node_handle_type_text(capability_value_type(expected_self)) {
+                translation_error_at(source_name, line, column, "inline-receiver-required",
+                    "method '" + method_call.method + "' has an inline receiver; use Self& or mut Self& for a node receiver",)
+            }
             if receiver_expects_borrow {
                 let mut concrete_receiver_type = canonical_type(receiver.typ)
                 if starts_with(concrete_receiver_type, "mut ") {
@@ -12746,6 +13176,15 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
                 let is_sending = function.sending_params.get(capability_index).unwrap_or(false)
                 let is_frozen = function.frozen_params.get(capability_index).unwrap_or(false)
                 if is_sending {
+                    match method_call.args.get(capability_index - 1_usize) {
+                        Some(argument) => {
+                            if thread_type_is_transferable_region(ctx, argument_type) && sync_contains_local_handle(ctx, argument_type, Vec[str]::new(), true) && expr_projection_root(argument) != "" {
+                                translation_error_at(source_name, line, column, "sending-projection", "transfer the complete owner or extract an owned value before sending a projection")
+                            }
+                        }
+                        None => {
+                        }
+                    }
                     let consume_path = validate_sending_argument(ctx, argument_type, argument_path,
                         source_name, line, column,)
                     if consume_path {
@@ -12854,7 +13293,15 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
     code = protect_call_result_inputs(ctx, code, call_owners, fn_name)
     code = code.call((out_name),(ret_type),(emitted_name), references(args), false)
     code = own_call_result(ctx, code, fn_name, out_name, ret_type)
-    if receiver_is_frozen && !thread_type_is_send(ctx, ret_type, Vec[str]::new()) {
+    let mut result_is_frozen = ctx_function_returns_frozen(ctx, fn_name)
+    match generic_bound_method_contract(ctx, owner, method_call.method) {
+        Some(function) => {
+            result_is_frozen = function.returns_frozen
+        }
+        None => {
+        }
+    }
+    if (receiver_is_frozen || result_is_frozen) && !thread_type_is_send(ctx, ret_type, Vec[str]::new()) {
         ctx_mark_value_frozen(ctx, out_name)
     }
     code = finish_call_owners(ctx, code, call_owners, out_name,
@@ -13197,7 +13644,7 @@ fn lower_mutable_field_place(ctx: mut TranslatorContext, field_expr: FieldExpr,
     source_name: str, line: usize, column: usize, prefix: str, idx: usize,) -> LoweredExpr {
     let base = lower_mutable_place_h(ctx, field_expr.base, prefix + "_base", idx + 1_usize)
     let owner_type = canonical_type(value_type_name(base.typ))
-    validate_plugin_handle_access(ctx, owner_type, source_name, line, column)
+    validate_plugin_handle_access(ctx, owner_type, source_name, line, column, true)
     let mut field_type = "void"
     match ctx_lookup_field(ctx, owner_type, field_expr.field) {
         Option[str]::Some(found) => {
@@ -14542,6 +14989,20 @@ fn translate_do_while_stmt(ctx: mut TranslatorContext, do_stmt: DoWhileStmt, ret
     ret builder
 }
 
+fn context_method_target(ctx: mut TranslatorContext, typ: str, method: str) -> str {
+    let name = method_owner_name(typ) + "::" + method
+    let arguments = generic_args_from_path(typ)
+    let reflected = specialize_reflection_call(ctx, ctx.active_source_name, "", name, arguments)
+    if reflected != "" {
+        ret reflected
+    }
+    ret name + if arguments.is_empty() {
+        ""
+    } else {
+        "[" + join_strs(arguments, ", ") + "]"
+    }
+}
+
 fn translate_with_cleanups(ctx: mut TranslatorContext, prefix: str) -> LoweringBuilder {
     ret translate_with_cleanups_from(ctx, prefix, 0_usize)
 }
@@ -14553,7 +15014,7 @@ fn translate_with_cleanups_from(ctx: mut TranslatorContext, prefix: str, start: 
         index = index - 1_usize
         match ctx.with_cleanups.get(index) {
             Some(resource) => {
-                builder = builder.call((prefix) + "_" +(Debug::fmt(index)), "bool",(method_owner_name(resource.typ)) + "::with_exit", vec![reference((resource.emitted_name))], false)
+                builder = builder.call((prefix) + "_" +(Debug::fmt(index)), "bool", context_method_target(ctx, resource.typ, "with_exit"), vec![reference((resource.emitted_name))], false)
             }
             None => {
             }
@@ -14575,7 +15036,7 @@ fn translate_with_stmt(ctx: mut TranslatorContext, with_stmt: WithStmt, ret_type
     ctx_type_needs_ownership(ctx, resource_type) {
         builder = builder.retain(annotated((source.value),(resource_type)))
     }
-    builder = builder.call((resource_name),(resource_type),(method_owner_name(resource_type)) + "::with_enter", vec![reference((source.value))], false)
+    builder = builder.call((resource_name),(resource_type), context_method_target(ctx, resource_type, "with_enter"), vec![reference((source.value))], false)
     let bindings = save_translation_bindings(ctx)
     ctx_add_var_emitted(ctx, with_stmt.name, resource_name, resource_type)
     let cleanup_count = ctx.with_cleanups.len()
@@ -14587,7 +15048,7 @@ fn translate_with_stmt(ctx: mut TranslatorContext, with_stmt: WithStmt, ret_type
     builder = builder.append(translate_statements_no_default(ctx, with_stmt.body.statements, ret_type,
             prefix + "_with_body_" + Debug::fmt(idx), break_label, continue_label,))
     if !block_terminates_flow(with_stmt.body) {
-        builder = builder.call((prefix) + "_with_exit_" +(Debug::fmt(idx)), "bool",(method_owner_name(resource_type)) + "::with_exit", vec![reference((resource_name))], false)
+        builder = builder.call((prefix) + "_with_exit_" +(Debug::fmt(idx)), "bool", context_method_target(ctx, resource_type, "with_exit"), vec![reference((resource_name))], false)
         builder = append_translation_scope_drops(ctx, builder, bindings, resource_name + "_scope")
     }
     while ctx.with_cleanups.len() > cleanup_count {
@@ -16268,6 +16729,9 @@ fn plugin_resource_adapters(ctx: mut TranslatorContext, requested: str, value: s
     }
     let fingerprint = plugin_interface_fingerprint(ctx, requested, source)
     let name = "__encore_plugin_resource_" + compiler_content_digest(ctx.current_module + "|" + key)
+    if contains_str(ctx.extern_functions, name + "_drop") {
+        ret name + "_init"
+    }
     for existing in ctx.reflection_specializations {
         if existing.name == name + "_drop" {
             ret name + "_init"

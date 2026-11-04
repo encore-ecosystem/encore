@@ -301,6 +301,21 @@ encore_str encore_http_async_result(size_t id) {
   encore_str out = encore_str_from_buffer(j && j->result ? j->result : "", j ? j->result_len : 0);
   pthread_mutex_unlock(&encore_http_async_mutex); return out;
 }
+/* Last future owner abandons its request independently of executor lifetime. */
+void encore_http_async_abandon(size_t id) {
+  pthread_mutex_lock(&encore_http_async_mutex);
+  for (encore_http_async_runtime *r = encore_http_async_runtimes; r; r = r->next)
+    for (size_t i = 0; i < ENCORE_HTTP_ASYNC_LIMIT; ++i) {
+      encore_http_async_job *j = r->jobs[i];
+      if (j && j->id == id) {
+        j->waker = 0; j->owner = 0;
+        if (j->status) { encore_http_async_free_job(j); r->jobs[i] = NULL; }
+        else { j->cancelled = 1; j->abandoned = 1; encore_http_async_signal(r); }
+        pthread_mutex_unlock(&encore_http_async_mutex); return;
+      }
+    }
+  pthread_mutex_unlock(&encore_http_async_mutex);
+}
 void encore_http_async_release(size_t id) {
   pthread_mutex_lock(&encore_http_async_mutex);
   for (encore_http_async_runtime *r = encore_http_async_runtimes; r; r = r->next)
@@ -555,6 +570,7 @@ encore_str encore_http_async_headers(size_t request) { (void)request; return enc
 int32_t encore_http_async_http_status(size_t request) { (void)request; return 0; }
 size_t encore_http_async_setting(size_t request, int32_t key) { (void)request; (void)key; return 0; }
 void encore_http_async_release(size_t request) { (void)request; }
+void encore_http_async_abandon(size_t request) { (void)request; }
 void encore_http_async_complete(size_t request, int32_t status, int32_t http_status, encore_str headers, encore_str result) { (void)request; (void)status; (void)http_status; (void)headers; (void)result; }
 int32_t encore_http_async_cancelled(size_t request) { (void)request; return 0; }
 void encore_http_async_detach(size_t runtime, size_t waker) { (void)runtime; (void)waker; }

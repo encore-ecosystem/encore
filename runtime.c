@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include "runtime/command_timing.h"
 #include "runtime/build_queue.h"
 #include "runtime/build_jobserver.h"
 #include "runtime/build_process.h"
@@ -266,6 +267,7 @@ encore_compiler_str encore_compiler_read_artifact(encore_compiler_str path) {
 }
 
 extern encore_compiler_str encore_text_sha256(encore_compiler_str contents);
+#include "runtime/build_digest.h"
 
 encore_compiler_str encore_compiler_cache_encode(encore_compiler_str contents,
     encore_compiler_str digest, bool packed) {

@@ -5,11 +5,13 @@ seed=${1:?seed compiler required}
 seed_tag=${2:?published seed tag required}
 shift 2
 
-# The pre-reflection seed cannot lower typed codecs or the new async std APIs.
+# Older seeds cannot lower the new SDK's generic/ownership contracts reliably.
 # Bootstrap compiler code against the libraries from that exact published tag.
 # Stage2 and stage3 always use the unmodified checkout and isolated caches.
+needs_path_bridge=false
 case "$seed_tag" in
-  v0.1.[0-5]-neumann) ;;
+  v0.1.[0-5]-neumann) needs_path_bridge=true ;;
+  v0.1.[6-9]-neumann|v0.1.1[0-3]-neumann) ;;
   *) exec "$seed" "$@" ;;
 esac
 if [[ ! -f packages/core/src/reflect/mod.enq ]]; then
@@ -18,7 +20,7 @@ fi
 
 repository=$PWD
 compatibility_patch="$(cd "$(dirname "$0")" && pwd)/bootstrap-path-division.patch"
-if [[ -f src/modes/cache_policy.enq ]]; then
+if [[ "$needs_path_bridge" == true && -f src/modes/cache_policy.enq ]]; then
   # The published seed has Div in its std sources but only lowers numeric `/`.
   # Build a compiler from its own tagged sources with that operator backported,
   # then use it for the ordinary pre-reflection bootstrap below. Current source
@@ -82,6 +84,13 @@ for package in core platform std json; do
 done
 git -C "$(git rev-parse --show-toplevel)" archive "$seed_tag" packages/core packages/platform packages/std packages/json |
   tar -xf - -C "$source_root"
+# Current compiler checkpoints use four scalar codec helpers absent from older
+# SDKs. Add that standalone native ABI to the isolated stage1 runtime only.
+if [[ -f "$repository/packages/core/runtime_codec.h" ]] &&
+   ! grep -Eq 'encore_codec_read_u32_le|#include "runtime_codec.h"' "$source_root/packages/core/runtime.c"; then
+  cp "$repository/packages/core/runtime_codec.h" "$source_root/packages/core/runtime_codec.h"
+  printf '\n#include "runtime_codec.h"\n' >> "$source_root/packages/core/runtime.c"
+fi
 core_root="$source_root/packages/core"
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) core_root=$(cygpath -m "$core_root") ;;

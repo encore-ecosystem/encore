@@ -115,8 +115,21 @@ Package entries default to `~/.cache/encore/units-v1`; `ENCORE_BUILD_CACHE`
 overrides that location. Private staging and native objects are under `target/`.
 `encore build --timings` writes `encore-timings.json` in the profile output
 directory, including queue time, package cache hits and total pipeline time.
+Schema 2 includes whole-command `command_ms`, pipeline, workspace sweep and
+cleanup durations. `encore run` records `time_to_exec_ms` immediately before
+launch; program runtime is excluded from that measurement. `inputs` separates
+dependency graph resolution, executed build scripts, native input discovery,
+source inventory and receipt validation. `cache_miss_reason` is empty on a
+verified input receipt hit; otherwise it identifies the first failed check
+(for example `source-changed`, `source-set-changed`, `configuration-changed`,
+`output-missing`, or `receipt-missing-or-corrupt`). Per-unit records retain the
+existing frontend/backend/native cache-hit and phase fields. Concurrent worker
+durations overlap and must not be summed as wall time.
+
 These internal artifact formats are compiler-specific, not a public ABI or a
-replacement for the dependency lockfile.
+replacement for the dependency lockfile. Build scripts still execute on every
+build. Their host binaries may be reused only after verifying source contents,
+the imported package closure, native headers/flags, tools and compiler identity.
 
 ### Cache limits and build workspaces
 
@@ -140,8 +153,10 @@ separate from the compiled-cache budget.
 The shared compiled cache defaults to **20 GiB**, including package, lowering and
 native-object entries. Set `ENCORE_BUILD_CACHE_MAX_SIZE` to a nonnegative integer
 with an optional `B`, `MiB` or `GiB` suffix to change it. After a build, automatic
-maintenance runs at most once per minute. When usage exceeds the limit, it evicts
-least recently used entries down to 90% of the limit. This is a soft limit:
+maintenance resumes a persisted inventory in a cooperative 50 ms slice, at most
+once per minute. It does not scan the full cache on every launch. Once a scan
+finds usage above the limit, eviction removes least recently used entries down
+to 90% of the limit; a large cache can require several commands to converge. This is a soft limit:
 concurrent builds and locked entries can temporarily keep usage above it.
 
 ```sh

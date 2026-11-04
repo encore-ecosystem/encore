@@ -116,6 +116,9 @@ fn contains_name(names: Vec[str], value: str) -> bool {
 // Preserve the associated member after generic arguments; root_name is a
 // type helper and deliberately stops at the first opening bracket.
 fn template_path_matches(path: str, names: Vec[str]) -> bool {
+    if contains_name(names, "@local:" + path) {
+        ret false
+    }
     let mut plain = ""
     let mut depth = 0_usize
     let mut index = 0_usize
@@ -146,7 +149,7 @@ fn template_path_matches(path: str, names: Vec[str]) -> bool {
 }
 fn scoped_template_name(owner: str, method: FunctionItem) -> str {
     for attribute in method.attrs {
-        if attribute == "plugin_resource_constructor" || attribute == "attr:plugin_resource_constructor" {
+        if attribute == "plugin_resource_constructor" || attribute == "attr:plugin_resource_constructor" || attribute == "scoped_reflection_template" || attribute == "attr:scoped_reflection_template" {
             ret root_name(owner) + "::" + method.name
         }
     }
@@ -228,7 +231,8 @@ pub fn mark_reflection_templates(ast: Vec[Statement], names: Vec[str]) -> Vec[St
 }
 
 fn mark_function(item: FunctionItem, names: Vec[str], generic_owner: bool) -> FunctionItem {
-    if item.body.is_none() ||(!generic_owner && item.generics.is_empty()) || !contains_name(names, item.name) {
+    if item.body.is_none() ||(!generic_owner && item.generics.is_empty()) ||
+    (!function_uses_reflection(item) && !calls_reflection_templates(item, names)) {
         ret item
     }
     let mut attributes = Vec[str]::new()
@@ -1474,7 +1478,11 @@ pub fn calls_reflection_templates(item: FunctionItem, names: Vec[str]) -> bool {
     }
     match item.body {
         Some(body) => {
-            ret walk_statements(body.statements, names, false)
+            let mut scoped = copy_template_names(names)
+            for parameter in item.params {
+                scoped.push("@local:" + parameter.name)
+            }
+            ret walk_statements(body.statements, scoped, false)
         }
         None => {
             ret false
@@ -1547,38 +1555,55 @@ fn storage_bound(state: Expansion, owner: str, depth: usize) -> Result[usize, st
     ret Result::Ok(bytes)
 }
 
+fn copy_template_names(names: Vec[str]) -> Vec[str] {
+    let mut output = Vec[str]::new()
+    for name in names {
+        output.push(name)
+    }
+    ret output
+}
+fn template_local(names: Vec[str], local: str) -> Vec[str] {
+    let mut output = copy_template_names(names)
+    output.push("@local:" + local)
+    ret output
+}
+
 fn walk_statements(statements: Vec[Statement], names: Vec[str], reflection: bool) -> bool {
+    let mut scoped = copy_template_names(names)
     for statement in statements {
         match statement {
             Statement::Let(item) => {
-                if walk_expression(item.expr.value, names, reflection) {
+                if walk_expression(item.expr.value, scoped, reflection) {
                     ret true
+                }
+                if !reflection {
+                    scoped.push("@local:" + item.name)
                 }
             }
             Statement::Ret(item) => {
-                if walk_expression(item.value, names, reflection) {
+                if walk_expression(item.value, scoped, reflection) {
                     ret true
                 }
             }
             Statement::Expr(item) => {
-                if walk_expression(item.value, names, reflection) {
+                if walk_expression(item.value, scoped, reflection) {
                     ret true
                 }
             }
             Statement::Assignment(item) => {
-                if walk_expression(item.target.value, names, reflection) || walk_expression(item.expr.value, names, reflection) {
+                if walk_expression(item.target.value, scoped, reflection) || walk_expression(item.expr.value, scoped, reflection) {
                     ret true
                 }
             }
             Statement::If(item) => {
                 for branch in item.branches {
-                    if walk_expression(branch.condition.value, names, reflection) || walk_statements(branch.body.statements, names, reflection) {
+                    if walk_expression(branch.condition.value, scoped, reflection) || walk_statements(branch.body.statements, scoped, reflection) {
                         ret true
                     }
                 }
                 match item.else_body {
                     Some(body) => {
-                        if walk_statements(body.statements, names, reflection) {
+                        if walk_statements(body.statements, scoped, reflection) {
                             ret true
                         }
                     }
@@ -1587,18 +1612,18 @@ fn walk_statements(statements: Vec[Statement], names: Vec[str], reflection: bool
                 }
             }
             Statement::Match(item) => {
-                if walk_expression(item.expr.value, names, reflection) {
+                if walk_expression(item.expr.value, scoped, reflection) {
                     ret true
                 }
                 for arm in item.arms {
                     match arm.body {
                         MatchArmBody::Block(body) => {
-                            if walk_statements(body.statements, names, reflection) {
+                            if walk_statements(body.statements, scoped, reflection) {
                                 ret true
                             }
                         }
                         MatchArmBody::Expr(expr) => {
-                            if walk_expression(expr.value, names, reflection) {
+                            if walk_expression(expr.value, scoped, reflection) {
                                 ret true
                             }
                         }
@@ -1606,32 +1631,32 @@ fn walk_statements(statements: Vec[Statement], names: Vec[str], reflection: bool
                 }
             }
             Statement::For(item) => {
-                if walk_expression(item.iterable.value, names, reflection) || walk_statements(item.body.statements, names, reflection) {
+                if walk_expression(item.iterable.value, scoped, reflection) || walk_statements(item.body.statements, template_local(scoped, item.name), reflection) {
                     ret true
                 }
             }
             Statement::While(item) => {
-                if walk_expression(item.condition.value, names, reflection) || walk_statements(item.body.statements, names, reflection) {
+                if walk_expression(item.condition.value, scoped, reflection) || walk_statements(item.body.statements, scoped, reflection) {
                     ret true
                 }
             }
             Statement::Loop(item) => {
-                if walk_statements(item.body.statements, names, reflection) {
+                if walk_statements(item.body.statements, scoped, reflection) {
                     ret true
                 }
             }
             Statement::DoWhile(item) => {
-                if walk_expression(item.condition.value, names, reflection) || walk_statements(item.body.statements, names, reflection) {
+                if walk_expression(item.condition.value, scoped, reflection) || walk_statements(item.body.statements, scoped, reflection) {
                     ret true
                 }
             }
             Statement::With(item) => {
-                if walk_expression(item.expr.value, names, reflection) || walk_statements(item.body.statements, names, reflection) {
+                if walk_expression(item.expr.value, scoped, reflection) || walk_statements(item.body.statements, scoped, reflection) {
                     ret true
                 }
             }
             Statement::Unsafe(item) => {
-                if walk_statements(item.statements, names, reflection) {
+                if walk_statements(item.statements, scoped, reflection) {
                     ret true
                 }
             }
@@ -1749,7 +1774,13 @@ fn walk_expression(value: Expr, names: Vec[str], reflection: bool) -> bool {
             ret walk_statements(item.statements, names, reflection)
         }
         Expr::Closure(item) => {
-            ret walk_expression(item.body.value, names, reflection)
+            let mut scoped = copy_template_names(names)
+            for parameter in item.params {
+                if !reflection {
+                    scoped.push("@local:" + parameter.name)
+                }
+            }
+            ret walk_expression(item.body.value, scoped, reflection)
         }
         Expr::If(item) => {
             for branch in item.branches {
