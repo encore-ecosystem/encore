@@ -99,12 +99,12 @@ def app_source():
     return source + "    ret 99\n}\n"
 
 
-def format_inputs(compiler):
+def format_inputs(compiler, paths):
     output = ROOT / "target/probe"
     output.mkdir(parents=True, exist_ok=True)
     records = []
     failures = []
-    for relative in FORMAT_FILES:
+    for relative in paths:
         path = ROOT / relative
         before = path.read_bytes()
         try:
@@ -141,10 +141,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
     parser.add_argument("--format-candidates", action="store_true")
+    parser.add_argument("--format-file", action="append")
     args = parser.parse_args()
     compiler = args.compiler.resolve()
     if args.format_candidates:
-        format_inputs(compiler)
+        format_inputs(compiler, args.format_file or FORMAT_FILES)
         return
     output = ROOT / "target/toml-interop-probe"
     output.mkdir(parents=True, exist_ok=True)
