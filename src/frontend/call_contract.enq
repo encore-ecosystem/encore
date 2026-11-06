@@ -1,0 +1,167 @@
+//! Declaration-owned call binding, shared by semantics and lowering.
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+import std::vec::Vec
+import refrain::frontend::parser::statements::{CallParameter, Expr, ExprNode, FunctionParam, ParameterDefault, UnaryExpr}
+
+pub struct CallPlan {
+    arguments: Vec[ExprNode]
+    positions: Vec[usize]
+}
+
+pub fn call_parameters(parameters: Vec[FunctionParam], skip: usize) -> Vec[CallParameter] {
+    let mut out = Vec[CallParameter]::new()
+    let mut index = 0_usize
+    for parameter in parameters {
+        if index >= skip { out.push(CallParameter { parameter.name, parameter.default_value }) }
+        index += 1_usize
+    }
+    ret out
+}
+
+pub fn argument_name(value: ExprNode) -> str {
+    match value.value { Expr::NamedArgument(argument) => { ret argument.name } _ => {} }
+    ret ""
+}
+pub fn argument_value(value: ExprNode) -> ExprNode {
+    match value.value {
+        Expr::NamedArgument(argument) => {
+            let inner = argument.value
+            ret ExprNode { inner.value, inner.line, inner.column, inner.length, inner.source_name }
+        }
+        _ => {}
+    }
+    ret value
+}
+
+pub fn default_expression(value: ParameterDefault, source: str, line: usize, column: usize) -> ExprNode {
+    let expression = match value {
+        Integer(text) => { Expr::Integer(text) }
+        Float(text) => { Expr::Float(text) }
+        Boolean(flag) => { Expr::Boolean(flag) }
+        String(text) => { Expr::StringLiteral(text) }
+    }
+    let mut out = ExprNode { expression, line, column, 1_usize, source }
+    match value {
+        Integer(text) => {
+            if text.byte_len() > 0 && text.slice_bytes(0, 1) == "-" {
+                out = ExprNode { Expr::Unary(UnaryExpr { "-", ExprNode<H> { Expr::Integer(text.slice_bytes(1, text.byte_len() - 1)), line, column, text.char_len(), source } }), line, column, text.char_len(), source }
+            }
+        }
+        Float(text) => {
+            if text.byte_len() > 0 && text.slice_bytes(0, 1) == "-" {
+                out = ExprNode { Expr::Unary(UnaryExpr { "-", ExprNode<H> { Expr::Float(text.slice_bytes(1, text.byte_len() - 1)), line, column, text.char_len(), source } }), line, column, text.char_len(), source }
+            }
+        }
+        _ => {}
+    }
+    ret out
+}
+
+pub fn plan_call(parameters: Vec[CallParameter], arguments: Vec[ExprNode], skip: usize,
+    source: str, line: usize, column: usize) -> Result[CallPlan, str] {
+    let mut out = Vec[ExprNode]::new()
+    let mut positions = Vec[usize]::new()
+    let count = if parameters.len() >= skip { parameters.len() - skip } else { 0_usize }
+    let mut assigned = Vec[bool]::new()
+    for _ in 0..count { assigned.push(false) }
+    let mut positional = 0_usize
+    let mut named = false
+    for argument in arguments {
+        let name = argument_name(argument)
+        let mut position = positional
+        if name == "" {
+            if named { ret Result::Err("positional-after-named: positional arguments must precede named arguments") }
+            positional += 1_usize
+        } else {
+            named = true
+            position = count
+            let mut index = 0_usize
+            for parameter in parameters {
+                if index >= skip && parameter.name == name { position = index - skip break }
+                index += 1_usize
+            }
+            if position == count { ret Result::Err("unknown-argument: unknown parameter '" + name + "'") }
+        }
+        if position >= count { ret Result::Err("argument-mismatch: too many arguments") }
+        if assigned.get(position).unwrap_or(false) { ret Result::Err("duplicate-argument: parameter supplied more than once") }
+        assigned.set(position, true)
+        positions.push(position)
+        out.push(argument_value(argument))
+    }
+    let mut index = 0_usize
+    for parameter in parameters {
+        if index >= skip && !assigned.get(index - skip).unwrap_or(false) {
+            match parameter.default_value {
+                Some(value) => { positions.push(index - skip) out.push(default_expression(value, source, line, column)) }
+                None => { ret Result::Err("missing-argument: missing required parameter '" + parameter.name + "'") }
+            }
+        }
+        index += 1_usize
+    }
+    ret Result::Ok(CallPlan { out, positions })
+}
+
+pub fn identity_call(arguments: Vec[ExprNode]) -> CallPlan {
+    let mut positions = Vec[usize]::new()
+    for index in 0..arguments.len() { positions.push(index) }
+    ret CallPlan { arguments, positions }
+}
+
+pub fn ordered_expressions(plan: CallPlan) -> Vec[ExprNode] {
+    let mut out = Vec[ExprNode]::new()
+    for position in 0..plan.arguments.len() {
+        let mut index = 0_usize
+        for argument in plan.arguments {
+            if plan.positions.get(index).unwrap_or(plan.arguments.len()) == position { out.push(argument) break }
+            index += 1_usize
+        }
+    }
+    ret out
+}
+
+pub fn ordered_strings(values: Vec[str], positions: Vec[usize], skip: usize) -> Vec[str] {
+    let mut out = Vec[str]::new()
+    for index in 0..skip { out.push(values.get(index).unwrap_or("")) }
+    for position in 0..positions.len() {
+        let mut index = 0_usize
+        for original in positions {
+            if original == position { out.push(values.get(index + skip).unwrap_or("")) break }
+            index += 1_usize
+        }
+    }
+    ret out
+}
+pub fn ordered_flags(values: Vec[bool], positions: Vec[usize], skip: usize) -> Vec[bool] {
+    let mut out = Vec[bool]::new()
+    for index in 0..skip { out.push(values.get(index).unwrap_or(false)) }
+    for position in 0..positions.len() {
+        let mut index = 0_usize
+        for original in positions {
+            if original == position { out.push(values.get(index + skip).unwrap_or(false)) break }
+            index += 1_usize
+        }
+    }
+    ret out
+}
+
+pub fn contract_key(parameters: Vec[CallParameter]) -> str {
+    let mut out = ""
+    for parameter in parameters {
+        out += Debug::fmt(parameter.name.byte_len()) + ":" + parameter.name + "="
+        match parameter.default_value {
+            None => { out += "required;" }
+            Some(value) => {
+                let text = match value {
+                    Integer(text) => { "i" + text }
+                    Float(text) => { "f" + text }
+                    Boolean(flag) => { "b" + Debug::fmt(flag) }
+                    String(text) => { "s" + text }
+                }
+                out += Debug::fmt(text.byte_len()) + ":" + text + ";"
+            }
+        }
+    }
+    ret out
+}

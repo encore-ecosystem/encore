@@ -1,3 +1,5 @@
+import refrain::frontend::call_contract::{CallPlan, argument_name, argument_value, call_parameters, identity_call, ordered_expressions, ordered_flags, ordered_strings, plan_call}
+import refrain::frontend::parser::statements::{CallParameter, ParameterDefault}
 import mod::static_value::{static_accessor, static_runtime_declarations}
 //! Translates the Encore syntax tree into EHIR.
 
@@ -431,6 +433,7 @@ struct FunctionType {
     returns_sending: bool
     returns_frozen: bool
     is_static: bool
+    call_parameters: Vec[CallParameter]
 }
 
 /// Supplies one resolved source module to EHIR translation.
@@ -2011,6 +2014,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                         function_param_sending(fn_item), function_param_frozen(fn_item), false, false,
                         generic_param_names(fn_item.generics), fn_item.is_extern,
                         fn_item.is_async, output_type, fn_item.returns_sending, fn_item.returns_frozen, function_has_attr(fn_item, "static"),)
+                    ctx_remember_call_parameters(ctx, fn_item.params)
                     if fn_item.is_async {
                         remember_async_future(ctx, fn_item, callable_type)
                     }
@@ -2062,6 +2066,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                         function_param_frozen(method), function_receiver_is_readonly(method), function_has_receiver(method),
                         method_generics, false, method.is_async, output_type,
                         method.returns_sending, method.returns_frozen, false,)
+                    ctx_remember_call_parameters(ctx, method.params)
                     if method.is_async {
                         remember_async_future_output(ctx, method, callable_type, output_type)
                     }
@@ -2113,6 +2118,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                                 impl_item.target,), function_param_sending(method), function_param_frozen(method),
                             function_receiver_is_readonly(method), function_has_receiver(method), method_generics, false, method.is_async, output_type,
                             method.returns_sending, method.returns_frozen, false,)
+                    ctx_remember_call_parameters(ctx, method.params)
                         if method.is_async {
                             remember_async_future_output(ctx, method, callable_type, output_type)
                         }
@@ -2177,7 +2183,7 @@ fn infer_static_value_type(ctx: mut TranslatorContext, ast: Vec[Statement], item
                                         function.params, function.sending_params, function.frozen_params,
                                         function.readonly_self, function.has_receiver, function.generics,
                                         function.is_extern, function.is_async, inferred,
-                                        function.returns_sending, function.returns_frozen, function.is_static
+                                        function.returns_sending, function.returns_frozen, function.is_static, function.call_parameters
                                     }
                                     ,
                                 )
@@ -2229,6 +2235,11 @@ fn infer_static_dependencies(ctx: mut TranslatorContext, ast: Vec[Statement], ex
             for arg in item.values {
                 infer_static_dependencies(ctx, ast, arg.value, source, visiting, resolved)
             }
+        }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            infer_static_dependencies(ctx, ast, inner.value, source, visiting, resolved)
         }
         Expr::Parenthesized(inner) => {
             infer_static_dependencies(ctx, ast, inner.value, source, visiting, resolved)
@@ -3313,7 +3324,7 @@ fn ctx_add_function(ctx: mut TranslatorContext, source_name: str, name: str, ret
     }
     ctx.functions.push(FunctionType {
             name, emitted_name, source_name, resolved_ret_type, resolved_params, sending_params, frozen_params, readonly_self, has_receiver,
-            generics, is_extern, is_async, resolved_output_type, returns_sending, returns_frozen, is_static
+            generics, is_extern, is_async, resolved_output_type, returns_sending, returns_frozen, is_static, Vec[CallParameter]::new()
         }
         ,
     )
@@ -6814,6 +6825,11 @@ fn decorator_receiver_owner(ctx: mut TranslatorContext, receiver: ExprNode) -> s
         Expr::StructInit(item) => {
             ret base_type_name(qualified_type_for_source(ctx, receiver.source_name, item.path))
         }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret decorator_receiver_owner(ctx, inline_expr_node(inner))
+        }
         Expr::Parenthesized(inner) => {
             ret decorator_receiver_owner(ctx, inline_expr_node(inner))
         }
@@ -6890,7 +6906,7 @@ fn decorator_wrapper_params(item: FunctionItem) -> Vec[FunctionParam] {
     for param in item.params {
         params.push(FunctionParam {
                 "__decorated_arg_" + Debug::fmt(index), param.typ,
-                param.is_sending, param.is_frozen, param.line, param.column
+                param.is_sending, param.is_frozen, param.line, param.column, param.default_value
             }
             ,)
         index += 1_usize
@@ -6918,7 +6934,7 @@ fn required_decorator_param(item: FunctionItem, index: usize, source_name: str, 
         }
     }
     ret FunctionParam {
-        "", Option[str]::None, false, false, line, column
+        "", Option[str]::None, false, false, line, column, Option[ParameterDefault]::None
     }
 }
 
@@ -7004,6 +7020,7 @@ fn register_decorator_layer(ctx: mut TranslatorContext, item: FunctionItem, logi
         function_param_sending(item), function_param_frozen(item), false, false,
         generic_param_names(item.generics), false, item.is_async,
         output_type, item.returns_sending, item.returns_frozen, false,)
+                    ctx_remember_call_parameters(ctx, item.params)
     if item.is_async {
         remember_async_future(ctx, item, callable_type)
     }
@@ -7771,7 +7788,7 @@ fn register_reflection_templates(ctx: mut TranslatorContext, ast: Vec[Statement]
                     for param in scoped_method.params {
                         params.push(FunctionParam {
                                 param.name, Option[str]::Some(types.get(index).unwrap_or("void")),
-                                param.is_sending, param.is_frozen, param.line, param.column
+                                param.is_sending, param.is_frozen, param.line, param.column, param.default_value
                             }
                             ,)
                         index += 1
@@ -8022,6 +8039,7 @@ fn register_decorator_method_layer(ctx: mut TranslatorContext, item: FunctionIte
         function_param_frozen(item), function_receiver_is_readonly(item), function_has_receiver(item),
         generic_param_names(all_generics), false, item.is_async, output_type,
         item.returns_sending, item.returns_frozen, false,)
+                    ctx_remember_call_parameters(ctx, item.params)
     if item.is_async {
         remember_async_future_output(ctx, item, callable_type, output_type)
     }
@@ -9013,6 +9031,11 @@ fn expr_is_numeric_literal(expr: ExprNode) -> bool {
         Expr::Float(_) => {
             ret true
         }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret expr_h_is_numeric_literal(inner)
+        }
         Expr::Parenthesized(inner) => {
             ret expr_h_is_numeric_literal(inner)
         }
@@ -9030,6 +9053,11 @@ fn expr_h_is_numeric_literal(expr: ExprNode<H>) -> bool {
         }
         Expr::Float(_) => {
             ret true
+        }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret expr_h_is_numeric_literal(inner)
         }
         Expr::Parenthesized(inner) => {
             ret expr_h_is_numeric_literal(inner)
@@ -9056,6 +9084,11 @@ fn expr_is_borrowed_copy(expr: ExprNode) -> bool {
         Expr::Block(_) => {
             ret false
         }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret expr_h_is_borrowed_copy(inner)
+        }
         Expr::Parenthesized(inner) => {
             ret expr_h_is_borrowed_copy(inner)
         }
@@ -9079,6 +9112,11 @@ fn expr_h_is_borrowed_copy(expr: ExprNode<H>) -> bool {
         }
         Expr::Block(_) => {
             ret false
+        }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret expr_h_is_borrowed_copy(inner)
         }
         Expr::Parenthesized(inner) => {
             ret expr_h_is_borrowed_copy(inner)
@@ -9468,6 +9506,14 @@ fn expr_projection_root(expr: ExprNode) -> str {
         Expr::Index(item) => {
             ret expr_h_frozen_root_path(item.base)
         }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            let value = ExprNode {
+                inner.value, inner.line, inner.column, inner.length, inner.source_name
+            }
+            ret expr_projection_root(value)
+        }
         Expr::Parenthesized(inner) => {
             let value = ExprNode {
                 inner.value, inner.line, inner.column, inner.length, inner.source_name
@@ -9484,6 +9530,11 @@ fn expr_frozen_root_path(expr: ExprNode) -> str {
     match expr.value {
         Expr::Path(name) => {
             ret name
+        }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret expr_h_frozen_root_path(inner)
         }
         Expr::Parenthesized(inner) => {
             ret expr_h_frozen_root_path(inner)
@@ -9507,6 +9558,11 @@ fn expr_h_frozen_root_path(expr: ExprNode<H>) -> str {
     match expr.value {
         Expr::Path(name) => {
             ret name
+        }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret expr_h_frozen_root_path(inner)
         }
         Expr::Parenthesized(inner) => {
             ret expr_h_frozen_root_path(inner)
@@ -9711,6 +9767,11 @@ fn lower_expr(ctx: mut TranslatorContext, expr: ExprNode, prefix: str, idx: usiz
         Expr::MethodCall(method_call) => {
             ret lower_method_call_expr(ctx, method_call, expr.source_name, expr.line, expr.column, prefix,
                 idx,)
+        }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret lower_expr_h(ctx, inner, prefix, idx)
         }
         Expr::Parenthesized(inner) => {
             ret lower_expr_h(ctx, inner, prefix, idx)
@@ -9988,6 +10049,11 @@ fn lower_expr_h(ctx: mut TranslatorContext, expr: ExprNode<H>, prefix: str, idx:
                 LoweringBuilder::new(ctx.ir_scope), ctx_lookup_value_name(ctx, name), typ
             }
         }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret lower_expr_h(ctx, inner, prefix, idx)
+        }
         Expr::Parenthesized(inner) => {
             ret lower_expr_h(ctx, inner, prefix, idx)
         }
@@ -10153,7 +10219,7 @@ fn lower_closure_expr(ctx: mut TranslatorContext, closure: ClosureExpr, source_n
         }
         effective_params.push(FunctionParam {
                 parameter.name, Option[str]::Some(expected_type), parameter.is_sending, parameter.is_frozen,
-                parameter.line, parameter.column
+                parameter.line, parameter.column, parameter.default_value
             }
             ,
         )
@@ -10444,6 +10510,11 @@ fn collect_closure_captures_h(ctx: mut TranslatorContext, expr: ExprNode<H>, bou
         Expr::Path(name) => {
             remember_closure_capture(ctx, name, bound, captures)
         }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            collect_closure_captures_h(ctx, inner, bound, captures)
+        }
         Expr::Parenthesized(inner) => {
             collect_closure_captures_h(ctx, inner, bound, captures)
         }
@@ -10558,6 +10629,11 @@ fn collect_closure_captures(ctx: mut TranslatorContext, expr: ExprNode, bound: m
     match expr.value {
         Expr::Path(name) => {
             remember_closure_capture(ctx, name, bound, captures)
+        }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            collect_closure_captures_h(ctx, inner, bound, captures)
         }
         Expr::Parenthesized(inner) => {
             collect_closure_captures_h(ctx, inner, bound, captures)
@@ -11330,6 +11406,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
             }
         }
     }
+    let binding = ctx_call_plan(ctx, source_name, callee_base, call.args, 0_usize, line, column)
     let has_explicit_generic_args = generic_args.len() > 0_usize
     let constructor_owner = enum_constructor_owner(ctx, source_name, callee)
     let constructor_payload = if constructor_owner == "" {
@@ -11348,12 +11425,13 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
     let mut call_owners = Vec[CallOwner]::new()
     let mut i = 0_usize
 
-    for arg in call.args {
+    for arg in binding.arguments {
+        let parameter_index = binding.positions.get(i).unwrap_or(i)
         let borrowed_arg = expr_is_borrowed_copy(arg)
         let mut hint = ""
         let mut expected = ""
-        match ctx_lookup_function_param_for_call(ctx, source_name, callee_base, i,
-            generic_args, call.args,) {
+        match ctx_lookup_function_param_for_call(ctx, source_name, callee_base, parameter_index,
+            generic_args, ordered_expressions(binding),) {
             Option[str]::Some(found) => {
                 expected = found
                 hint = direct_generic_hint(found, generic_args)
@@ -11361,7 +11439,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
             Option[str]::None => {
             }
         }
-        if constructor_owner != "" && i == 0 && constructor_payload != "void" {
+        if constructor_owner != "" && parameter_index == 0 && constructor_payload != "void" {
             expected = constructor_payload
             hint = constructor_payload
         }
@@ -11370,7 +11448,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
             hint = "usize"
         }
         let callee_scope = last_scope_index(callee_base)
-        if i == 0_usize && callee_scope < callee_base.len() && hint == callee_base.slice(0_usize, callee_scope)
+        if parameter_index == 0_usize && callee_scope < callee_base.len() && hint == callee_base.slice(0_usize, callee_scope)
         {
             hint = ""
         }
@@ -11380,7 +11458,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         let arg_path = expr_path_or_empty(arg)
         let frozen_root = expr_frozen_root_path(arg)
         let expects_borrowed = ends_with(canonical_type(expected), "&")
-        let borrows_self = i == 0_usize && !spawning && ctx_function_borrows_self(ctx, callee_base)
+        let borrows_self = parameter_index == 0_usize && !spawning && ctx_function_borrows_self(ctx, callee_base)
         let mut lowered = if expects_borrowed {
             lower_borrowed_call_argument(ctx, arg,
                 prefix + "_arg_borrow_" + Debug::fmt(idx), idx + i + 1_usize, !borrows_self,)
@@ -11430,7 +11508,7 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         if base_type_name(lowered.typ) == "JoinHandle" && arg_path != "" {
             move_var_out_of_context(ctx, arg_path)
         } elif borrowed_arg && !ends_with(canonical_type(expected), "&")
-        && !(i == 0_usize && !spawning && ctx_function_borrows_self(ctx, callee_base))
+        && !(parameter_index == 0_usize && !spawning && ctx_function_borrows_self(ctx, callee_base))
         && ctx_type_needs_ownership(ctx, lowered.typ) {
             code = code.retain(annotated((lowered.value),(capability_value_type(lowered.typ))))
         }
@@ -11453,6 +11531,14 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         }
         i = i + 1_usize
     }
+
+    arg_values = ordered_strings(arg_values, binding.positions, 0_usize)
+    arg_types = ordered_strings(arg_types, binding.positions, 0_usize)
+    arg_paths = ordered_strings(arg_paths, binding.positions, 0_usize)
+    arg_frozen_roots = ordered_strings(arg_frozen_roots, binding.positions, 0_usize)
+    arg_is_frozen = ordered_flags(arg_is_frozen, binding.positions, 0_usize)
+    arg_borrowed = ordered_flags(arg_borrowed, binding.positions, 0_usize)
+    let call = CallExpr { call.callee, call.generics, ordered_expressions(binding) }
 
     let direct_function = ctx_lookup_function_for_args(ctx, source_name, callee, arg_types)
     let mut dispatch_callee = callee
@@ -11929,6 +12015,11 @@ fn translator_dispatch_type(ctx: mut TranslatorContext, expr: ExprNode) -> str {
         Expr::Path(name) => {
             ret dispatch_value_type(ctx_lookup_var(ctx, name).unwrap_or(""))
         }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret translator_dispatch_type_h(ctx, inner)
+        }
         Expr::Parenthesized(inner) => {
             ret translator_dispatch_type_h(ctx, inner)
         }
@@ -11983,6 +12074,11 @@ fn translator_dispatch_type_h(ctx: mut TranslatorContext, expr: ExprNode<H>) -> 
                     ret ""
                 }
             }
+        }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret translator_dispatch_type_h(ctx, inner)
         }
         Expr::Parenthesized(inner) => {
             ret translator_dispatch_type_h(ctx, inner)
@@ -13098,19 +13194,21 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
             borrows_self, prefix + "_" + Debug::fmt(idx),)
     }
 
+    let binding = ctx_call_plan(ctx, source_name, fn_name, method_call.args, 1_usize, line, column)
     let mut i = 0_usize
-    for arg in method_call.args {
+    for arg in binding.arguments {
+        let parameter_index = binding.positions.get(i).unwrap_or(i) + 1_usize
         let borrowed_arg = expr_is_borrowed_copy(arg)
         let arg_path = expr_path_or_empty(arg)
         let frozen_root = expr_frozen_root_path(arg)
         let mut expected = ""
         // Lexical trait bounds provide the parameter contract even when the
         // receiver is an unresolved generic (for example T: Integer).
-        let bound_parameter = generic_bound_method_param(ctx, owner, method_call.method, i + 1_usize)
+        let bound_parameter = generic_bound_method_param(ctx, owner, method_call.method, parameter_index)
         let parameter = if bound_parameter.is_some() {
             bound_parameter
         } else {
-            ctx_lookup_function_param(ctx, source_name, fn_name, i + 1_usize, concrete_generics)
+            ctx_lookup_function_param(ctx, source_name, fn_name, parameter_index, concrete_generics)
         }
         match parameter {
             Some(found) => {
@@ -13180,6 +13278,14 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         }
         i = i + 1_usize
     }
+
+    args = ordered_strings(args, binding.positions, 1_usize)
+    capability_types = ordered_strings(capability_types, binding.positions, 1_usize)
+    capability_paths = ordered_strings(capability_paths, binding.positions, 1_usize)
+    capability_roots = ordered_strings(capability_roots, binding.positions, 1_usize)
+    capability_frozen = ordered_flags(capability_frozen, binding.positions, 1_usize)
+    capability_borrowed = ordered_flags(capability_borrowed, binding.positions, 1_usize)
+    let method_call = MethodCallExpr { method_call.receiver, method_call.method, method_call.generics, ordered_expressions(binding) }
 
     let mut reflected_source = ""
     let mut capability_contract = ctx_lookup_function_for_args(ctx, source_name, fn_name, capability_types)
@@ -13631,6 +13737,11 @@ fn expr_h_is_mutable_place(ctx: mut TranslatorContext, expr: ExprNode<H>) -> boo
         Expr::Path(name) => {
             ret ctx_path_is_mutable(ctx, name)
         }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret expr_h_is_mutable_place(ctx, inner)
+        }
         Expr::Parenthesized(inner) => {
             ret expr_h_is_mutable_place(ctx, inner)
         }
@@ -13669,6 +13780,11 @@ fn lower_mutable_place_h(ctx: mut TranslatorContext, expr: ExprNode<H>,
                 Option[str]::None => {
                 }
             }
+        }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret lower_mutable_place_h(ctx, inner, prefix, idx)
         }
         Expr::Parenthesized(inner) => {
             ret lower_mutable_place_h(ctx, inner, prefix, idx)
@@ -14006,6 +14122,11 @@ fn branch_result_needs_numeric_context(expr: Expr) -> bool {
         Expr::Float(value) => {
             ret !contains_substring(value, "_")
         }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret branch_result_needs_numeric_context(inner.value)
+        }
         Expr::Parenthesized(inner) => {
             ret branch_result_needs_numeric_context(inner.value)
         }
@@ -14335,6 +14456,11 @@ fn expr_h_path_or_empty(expr: ExprNode<H>) -> str {
     match expr.value {
         Expr::Path(name) => {
             ret name
+        }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret expr_h_path_or_empty(inner)
         }
         Expr::Parenthesized(inner) => {
             ret expr_h_path_or_empty(inner)
@@ -18008,7 +18134,7 @@ fn encode_translation_environment(ctx: TranslatorContext, identity: str) -> Resu
     let mut functions = Vec[StoredTranslationFunction]::new()
     for item in ctx.functions {
         functions.push(StoredTranslationFunction {
-                item.name, item.emitted_name, item.source_name, item.ret_type, item.params, item.sending_params, item.frozen_params, item.readonly_self, item.has_receiver, item.generics, item.is_extern, item.is_async, item.output_type, item.returns_sending, item.returns_frozen, item.is_static
+                item.name, item.emitted_name, item.source_name, item.ret_type, item.params, item.sending_params, item.frozen_params, item.readonly_self, item.has_receiver, item.generics, item.is_extern, item.is_async, item.output_type, item.returns_sending, item.returns_frozen, item.is_static, item.call_parameters
             }
         )
     }
@@ -18114,7 +18240,7 @@ fn restore_translation_environment(modules: Vec[TranslationModule], target: Targ
     let mut functions = Vec[FunctionType]::new()
     for item in artifact.functions {
         functions.push(FunctionType {
-                item.name, item.emitted_name, item.source_name, item.ret_type, item.params, item.sending_params, item.frozen_params, item.readonly_self, item.has_receiver, item.generics, item.is_extern, item.is_async, item.output_type, item.returns_sending, item.returns_frozen, item.is_static
+                item.name, item.emitted_name, item.source_name, item.ret_type, item.params, item.sending_params, item.frozen_params, item.readonly_self, item.has_receiver, item.generics, item.is_extern, item.is_async, item.output_type, item.returns_sending, item.returns_frozen, item.is_static, item.call_parameters
             }
         )
     }
@@ -18374,4 +18500,56 @@ fn query_function_declaration(item: FunctionItem) -> FunctionItem {
         item.documentation, item.generics, item.params, item.ret_type, item.returns_sending, item.returns_frozen,
         Option[ParsedBlock]::None, item.source_name, item.line, item.column
     }
+}
+
+
+fn ctx_remember_call_parameters(ctx: mut TranslatorContext, parameters: Vec[FunctionParam]) -> () {
+    if ctx.functions.is_empty() { ret () }
+    let index = ctx.functions.len() - 1_usize
+    match ctx.functions.get(index) {
+        Some(function) => {
+            if function.params.len() == parameters.len() {
+                ctx.functions.set(index, FunctionType { function.name, function.emitted_name, function.source_name, function.ret_type, function.params, function.sending_params, function.frozen_params, function.readonly_self, function.has_receiver, function.generics, function.is_extern, function.is_async, function.output_type, function.returns_sending, function.returns_frozen, function.is_static, call_parameters(parameters, 0_usize) })
+            }
+        }
+        None => {}
+    }
+}
+
+fn ctx_call_plan(ctx: mut TranslatorContext, source: str, name: str, arguments: Vec[ExprNode], skip: usize, line: usize, column: usize) -> CallPlan {
+    let imported = function_import_alias(ctx, source, name)
+    let lookup = match imported { Some(binding) => binding.name None => name }
+    for candidate in function_name_candidates(ctx, lookup, base_type_name(lookup)) {
+        match ctx.functions.get(candidate) {
+            Some(function) => {
+                match imported { Some(binding) => { if function.source_name != binding.source_name { continue } } None => {} }
+                if !function.call_parameters.is_empty() {
+                    match plan_call(function.call_parameters, arguments, skip, source, line, column) {
+                        Ok(plan) => { ret plan }
+                        Err(message) => { translation_error_at(source, line, column, "call-arguments", message) }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    if skip > 0_usize {
+        let owner = function_owner_name(name)
+        let method = name.slice_bytes(owner.byte_len() + 2_usize, name.byte_len() - owner.byte_len() - 2_usize)
+        match generic_bound_method_contract(ctx, owner, method) {
+            Some(function) => {
+                if !function.call_parameters.is_empty() {
+                    match plan_call(function.call_parameters, arguments, skip, source, line, column) {
+                        Ok(plan) => { ret plan }
+                        Err(message) => { translation_error_at(source, line, column, "call-arguments", message) }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    for argument in arguments {
+        if argument_name(argument) != "" { translation_error_at(source, line, column, "named-call-contract", "named arguments require a declaration-owned signature") }
+    }
+    ret identity_call(arguments)
 }
