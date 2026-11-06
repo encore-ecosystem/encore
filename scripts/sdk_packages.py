@@ -16,7 +16,7 @@ import tomllib
 
 PACKAGES = (
     "core", "platform", "std", "rich", "serialize", "json", "binary", "log",
-    "profile", "ehir-core", "ehir", "ehir-llvm-backend", "toml", "colorterm",
+    "profile", "ehir-core", "ehir", "ehir-llvm-backend", "toml",
     "llvm", "argparse", "secret-store",
 )
 ROOT = Path(__file__).resolve().parents[1]

@@ -153,7 +153,7 @@ case "$CI_PROBE_CASE" in
       printf '%s\n' "$release" > "$root/VERSION"
       cp "$repository/tests/ci/mock-compiler.sh" "$root/bin/encore$extension"
       cp "$root/bin/encore$extension" "$root/bin/encore-lsp$extension"
-      for package in core platform std rich serialize json binary log profile ehir-core ehir ehir-llvm-backend toml colorterm llvm argparse secret-store; do
+      for package in core platform std rich serialize json binary log profile ehir-core ehir ehir-llvm-backend toml llvm argparse secret-store; do
         mkdir -p "$root/lib/encore/index/$package/src"
         cp "$repository/packages/$package/encore.toml" "$root/lib/encore/index/$package/"
         cp "$repository/packages/$package/src/lib.enq" "$root/lib/encore/index/$package/src/"

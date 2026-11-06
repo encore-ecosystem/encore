@@ -51,6 +51,8 @@ payload="$work/payload"
 mkdir -p "$payload/toolchain" "$out"
 cp -RL "$toolchain"/. "$payload/toolchain/"
 cp -RL "$platform" "$payload/platform"
+abi_header="$(dirname "$0")/../packages/core/runtime_abi.h"
+cp "$abi_header" "$payload/platform/runtime_abi.h"
 if test -n "$sdk_manifest"; then cp "$sdk_manifest" "$payload/SDK.json"; fi
 
 compiler_path="toolchain/$compiler"

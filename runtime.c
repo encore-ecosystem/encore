@@ -36,15 +36,9 @@
 #include <sys/wait.h>
 #endif
 
-typedef struct encore_compiler_str_object {
-    size_t ref_count;
-    size_t len;
-    char data[];
-} encore_compiler_str_object;
-
-typedef struct encore_compiler_str {
-    encore_compiler_str_object *object;
-} encore_compiler_str;
+#include "packages/core/runtime_string.h"
+typedef encore_str encore_compiler_str;
+typedef encore_str_object encore_compiler_str_object;
 
 static char *encore_compiler_cstr(encore_compiler_str value) {
     size_t len = value.object == NULL ? 0 : value.object->len;

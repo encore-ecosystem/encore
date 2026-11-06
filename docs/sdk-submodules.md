@@ -1,6 +1,6 @@
 # Compiler SDK submodules
 
-Encore pins 17 public package repositories in `.gitmodules`. The superproject's
+Encore pins 16 public package repositories in `.gitmodules`. The superproject's
 Git tree records the commit to use for each path. Builds never select a branch
 head or run `git submodule update --remote`.
 
@@ -19,7 +19,6 @@ head or run `git submodule update --remote`.
 | ehir | ehirlib |
 | ehir-llvm-backend | ehir_llvm_backend |
 | toml | toml |
-| colorterm | colorterm |
 | llvm | llvm |
 | argparse | argparse |
 | secret-store | secret_store |
@@ -60,7 +59,7 @@ Bootstrap overlays and release packaging use this exporter. Benchmark snapshots
 also walk submodules; working-tree measurements preserve edited and untracked
 source inputs while excluding Git metadata and ignored build outputs.
 
-Native distributions contain all 17 packages as ordinary directories under
+Native distributions contain all 16 packages as ordinary directories under
 `lib/encore/index`, including headers, native runtimes, build scripts and tests.
 They also include `SDK.json`, containing each package's repository, directory,
 manifest identity and commit. Git metadata and build caches are excluded.
@@ -83,3 +82,20 @@ Release 0.1.15 can then introduce the language bridge for defaults, named calls,
 conversions and both operator contracts. Release 0.1.16 adopts two-argument
 operator traits and requires a published seed of at least 0.1.15. Those changes
 update package commits and their compiler gitlinks together.
+
+## Selected package audit changes
+
+The colorterm sources were moved into rich::ansi, reducing the SDK to 16 pins.
+The remote colorterm repository is retained; it is no longer shipped by this SDK.
+Pure Dict/Set/num implementations live in core and are re-exported by std.
+Dict/Set preserve insertion order and shared-copy semantics while using hash
+buckets. JSON/binary/argparse no longer depend on std. Process argument helpers
+moved from argparse to std::args. Rich adapters opt into json/logging features;
+its basic facade only loads console/text/style code. Native string consumers
+share core/runtime_abi.h; only core owns the string object layout.
+
+TOML now has checked Result parsing and typed serialize implementations. JSON
+uses a streaming typed decoder and bounded plain parsing. Profile uses per-thread
+aggregates and registered label identities. The serialize interfaces and EHIR's
+optimizer are unchanged. These changes are part of the SDK preparation PR;
+no language-feature release is included.

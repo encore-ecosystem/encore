@@ -64,7 +64,7 @@ Language, package and cross-compilation documentation is in
 
 ## Development
 
-This checkout contains the compiler and language server (`lsp/`). Its 17 system
+This checkout contains the compiler and language server (`lsp/`). Its 16 system
 libraries and backend packages are pinned Git submodules from
 [`encore-language-index`](https://github.com/encore-language-index).
 Clone their exact versions with the compiler:
