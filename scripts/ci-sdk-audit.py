@@ -73,6 +73,7 @@ for package in ("json", "toml", "argparse", "binary", "log", "rich", "profile"):
     run("package-" + package, [str(compiler), "test", "--jobs", "2", "--report", "target/test-report.json"], root / "packages" / package)
 run("core-hash", [str(compiler), "test", "--jobs", "2", "--filter", "hash_collections"], root / "packages/core")
 run("optional-adapters", ["python3", "scripts/test-sdk-adapters.py", str(compiler)])
+run("reflection-codecs", ["python3", "tests/fixtures/reflection_codecs/check.py", str(compiler)])
 run("compiler-check", [str(compiler), "check"])
 (output / "result.json").write_text(json.dumps({"failed": failures, "formatted": formatted}, indent=2) + "\n")
 raise SystemExit(bool(failures))
