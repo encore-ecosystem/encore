@@ -27,7 +27,9 @@ def run(expected: int) -> None:
             try:
                 diagnostic = subprocess.run(
                     [debugger, "--batch", "-ex", "set pagination off", "-ex", "run",
-                     "-ex", "thread apply all bt full", "--args", str(binary)],
+                     "-ex", "thread apply all bt full", "-ex", "info registers",
+                     "-ex", "x/16i $pc-32", "-ex", "up", "-ex", "x/24i $pc-64",
+                     "--args", str(binary)],
                     cwd=fixture / "app", text=True, capture_output=True, timeout=60,
                 )
                 print(diagnostic.stdout, end="", flush=True)

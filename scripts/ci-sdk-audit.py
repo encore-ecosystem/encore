@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tarfile
 import json
@@ -31,6 +32,9 @@ def run(name, command, cwd=root):
     if result.returncode:
         failures.append(name)
         print(result.stdout, flush=True)
+        binary = root / "tests/fixtures/reflection_codecs/app/target/dev/codec_integration"
+        if name == "reflection-codecs" and binary.is_file():
+            shutil.copy2(binary, output / "codec-integration")
     print(name, "ok" if result.returncode == 0 else "FAILED", flush=True)
     return result.returncode
 
