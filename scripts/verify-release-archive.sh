@@ -44,3 +44,7 @@ for package in core platform std rich serialize json binary log profile ehir-cor
   read_member "lib/encore/index/$package/src/lib.enq" > "$scratch/source"
   test -s "$scratch/source"
 done
+
+read_member SDK.json > "$scratch/SDK.json"
+python3 "$(dirname "$0")/sdk_packages.py" verify-provenance "$provenance"
+python3 "$(dirname "$0")/sdk_packages.py" verify-archive "$archive" --prefix "$root" --manifest "$scratch/SDK.json"

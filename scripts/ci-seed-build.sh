@@ -28,8 +28,8 @@ if [[ "$needs_path_bridge" == true && -f src/modes/cache_policy.enq ]]; then
   bridge_root="$repository/target/seed-bridge-source"
   test ! -e "$bridge_root"
   mkdir -p "$bridge_root"
-  git archive "$seed_tag" src packages runtime runtime.c encore.toml VERSION README.md |
-    tar -xf - -C "$bridge_root"
+  python3 "$repository/scripts/sdk_packages.py" --ref "$seed_tag" export --destination "$bridge_root" \
+    --path src --path packages --path runtime --path runtime.c --path encore.toml --path VERSION --path README.md
   git apply --directory=target/seed-bridge-source "$compatibility_patch"
   bridge_args=(build --profile extreme)
   if [[ -n "${CI_BUILD_JOBS:-}" ]]; then bridge_args+=(--jobs "$CI_BUILD_JOBS"); fi
@@ -82,8 +82,8 @@ tar -cf - --exclude='packages/*/target' --exclude=.git \
 for package in core platform std json; do
   rm -rf "$source_root/packages/$package"
 done
-git -C "$(git rev-parse --show-toplevel)" archive "$seed_tag" packages/core packages/platform packages/std packages/json |
-  tar -xf - -C "$source_root"
+python3 "$repository/scripts/sdk_packages.py" --ref "$seed_tag" export --destination "$source_root" \
+  --path packages/core --path packages/platform --path packages/std --path packages/json
 # Current compiler checkpoints use four scalar codec helpers absent from older
 # SDKs. Add that standalone native ABI to the isolated stage1 runtime only.
 if [[ -f "$repository/packages/core/runtime_codec.h" ]] &&

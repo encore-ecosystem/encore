@@ -64,9 +64,19 @@ Language, package and cross-compilation documentation is in
 
 ## Development
 
-This checkout contains the compiler, system libraries and backends (`packages/`),
-and language server (`lsp/`). No separate package-index checkout is required.
-An installed Encore compiler can bootstrap it:
+This checkout contains the compiler and language server (`lsp/`). Its 17 system
+libraries and backend packages are pinned Git submodules from
+[`encore-language-index`](https://github.com/encore-language-index).
+Clone their exact versions with the compiler:
+
+```sh
+git clone --recurse-submodules --branch trunk https://github.com/encore-ecosystem/encore.git
+cd encore
+# Also run this after pulling a commit that changes package pins.
+git submodule update --init --recursive
+```
+
+An installed Encore compiler can bootstrap this complete checkout:
 
 ```sh
 encore build --profile extreme
@@ -74,7 +84,10 @@ encore build --profile extreme
 (cd lsp && ../target/extreme/encore build --profile release)
 ```
 
-The final two bootstrap compilers must be byte-identical.
+The final two bootstrap compilers must be byte-identical. See
+[SDK development](docs/sdk-submodules.md) for package changes, source snapshots
+and release provenance. Release distributions contain ordinary SDK files and
+work without Git or an index connection.
 
 For the published `v0.1.5-neumann` seed, first fetch that Git tag and run
 `bash scripts/ci-seed-build.sh /path/to/0.1.5/bin/encore v0.1.5-neumann build --profile extreme`.

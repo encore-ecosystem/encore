@@ -6,6 +6,9 @@ triple=${CI_TARGET:?}
 executable=${CI_EXECUTABLE:?}
 seed_tag=${CI_SEED_TAG:?}
 bootstrap=null
+sdk_manifest="$PWD/target/sdk-packages.json"
+python3 "$(dirname "$0")/sdk_packages.py" manifest --verify-checkout --output "$sdk_manifest"
+sdk_sha=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$sdk_manifest")
 build_args=(build --profile extreme)
 if [[ -n "${CI_BUILD_JOBS:-}" ]]; then
   build_args+=(--jobs "$CI_BUILD_JOBS")
@@ -47,7 +50,9 @@ test "$("$PWD/target/stage3/$executable" --version)" = "encore $release"
 jq -n --arg commit "${GITHUB_SHA:?}" --arg release "$release" --arg version "$version" \
   --arg nametag "$nametag" --arg target "$triple" --arg seed "$seed_tag" \
   --arg stage2 "$stage2_sha" --arg stage3 "$stage3_sha" --argjson bootstrap "$bootstrap" \
+  --arg sdk_sha "$sdk_sha" --slurpfile sdk "$sdk_manifest" \
   '{schema:3, commit:$commit, release:$release, version:$version, nametag:$nametag,
     target:$target, seed:$seed,
     compiler_sha256:$stage3, stage2_sha256:$stage2, stage3_sha256:$stage3,
-    profile:"extreme", converged:true, bootstrap:$bootstrap}' > target/convergence.json
+    profile:"extreme", converged:true, bootstrap:$bootstrap,
+    sdk_sha256:$sdk_sha, sdk_packages:$sdk[0].packages}' > target/convergence.json
