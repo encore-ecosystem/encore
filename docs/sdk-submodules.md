@@ -90,7 +90,7 @@ The remote colorterm repository is retained; it is no longer shipped by this SDK
 Pure Dict/Set/num implementations live in core and are re-exported by std.
 Dict/Set preserve insertion order and shared-copy semantics while using hash
 buckets. JSON/binary/argparse no longer depend on std. Process argument helpers
-moved from argparse to std::args. Rich adapters opt into json/logging features;
+moved from argparse to std::args. Rich adapters accept caller-provided JSON values and log formatters;
 its basic facade only loads console/text/style code. Native string consumers
 share core/runtime_abi.h; only core owns the string object layout.
 

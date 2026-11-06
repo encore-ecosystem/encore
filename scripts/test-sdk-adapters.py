@@ -42,3 +42,15 @@ if os.name == "posix":
         assert process.wait(timeout=30) == 0
         assert (b"\x1b[" in output) == expected, (no_color, term, output)
 print("Rich JSON/logging opt-in, redirection, TTY, NO_COLOR and TERM: ok")
+
+# Compile interactive examples without running their prompt loops. Each uses
+# the same consumer manifest and explicitly declares json/log/std dependencies.
+entry = fixture / "src/main.enq"
+original = entry.read_bytes()
+try:
+    for source in sorted((root / "packages/rich/examples").glob("*.enq")):
+        entry.write_bytes(source.read_bytes())
+        subprocess.run([str(compiler), "build", "--profile", "dev", "--jobs", "2"], cwd=fixture, check=True)
+        print("Rich example build:", source.name, "ok", flush=True)
+finally:
+    entry.write_bytes(original)
