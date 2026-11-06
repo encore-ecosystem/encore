@@ -1,6 +1,7 @@
 """Check retained format templates, warm caches, and body invalidation."""
 
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -20,6 +21,19 @@ def run(expected: int) -> None:
     if result.returncode != expected:
         print(result.stdout, end="")
         print(result.stderr, end="", file=sys.stderr)
+        debugger = shutil.which("gdb")
+        binary = fixture / "app/target/dev/codec_integration"
+        if result.returncode in (-11, -6, 139, 134) and debugger and binary.is_file():
+            try:
+                diagnostic = subprocess.run(
+                    [debugger, "--batch", "-ex", "set pagination off", "-ex", "run",
+                     "-ex", "thread apply all bt full", "--args", str(binary)],
+                    cwd=fixture / "app", text=True, capture_output=True, timeout=60,
+                )
+                print(diagnostic.stdout, end="", flush=True)
+                print(diagnostic.stderr, end="", file=sys.stderr, flush=True)
+            except subprocess.TimeoutExpired:
+                print("codec crash backtrace timed out", file=sys.stderr, flush=True)
         raise SystemExit(f"expected exit {expected}, got {result.returncode}")
 
 
