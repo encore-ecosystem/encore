@@ -632,6 +632,7 @@ struct TranslationNominalImport {
 }
 
 struct TranslatorContext {
+    generator_item_type: str
     cached_functions: Vec[CachedFunctionChunk]
     lowered_functions: Vec[CachedFunctionChunk]
     record_function_cache: bool
@@ -791,7 +792,7 @@ fn without_cfg_attrs(item: FunctionItem) -> FunctionItem {
     ret FunctionItem {
         attrs, item.decorators, item.is_public, item.is_extern, item.is_async, item.name, item.documentation, item.generics,
         item.params, item.ret_type, item.returns_sending, item.returns_frozen, item.body,
-        item.source_name, item.line, item.column
+        item.source_name, item.line, item.column, item.is_generator
     }
 }
 
@@ -1923,7 +1924,7 @@ fn empty_translation_context(modules: Vec[TranslationModule], target: TargetSpec
     }
     let type_collisions = build_type_collision_names(normalized_modules, stable_abi)
     let mut ctx = TranslatorContext {
-        Vec[CachedFunctionChunk]::new(), Vec[CachedFunctionChunk]::new(), false, 0, 0, 0, Vec[str]::new(),
+        "",        Vec[CachedFunctionChunk]::new(), Vec[CachedFunctionChunk]::new(), false, 0, 0, 0, Vec[str]::new(),
         Vec[VarType]::new(), Vec[VarType]::new(), Vec[FunctionType]::new(), normalized_modules, module_visibility,
         module_index, module_prefixes, visibility_index, direct_import_index, unsafe {
             encore_strmap_new()
@@ -2001,7 +2002,9 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                         ctx.borrowed_return_functions.push(fn_item.name)
                     }
                     let output_type = function_ret_type(fn_item)
-                    let callable_type = if fn_item.is_async {
+                    let callable_type = if fn_item.is_generator {
+                        qualified_type_for_source(ctx, fn_item.source_name, "core::iter::Generator[" + output_type + "]")
+                    } elif fn_item.is_async {
                         async_future_type(ctx_next_emitted_name(ctx, fn_item.source_name, fn_item.name),
                             fn_item.generics,)
                     } else {
@@ -2051,7 +2054,9 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                     if function_has_attr(method, "borrowed_return") {
                         ctx.borrowed_return_functions.push(callable_name)
                     }
-                    let callable_type = if method.is_async {
+                    let callable_type = if method.is_generator {
+                            qualified_type_for_source(ctx, method.source_name, "core::iter::Generator[" + output_type + "]")
+                        } elif method.is_async {
                         async_future_type(ctx_next_emitted_name(ctx, method.source_name, callable_name),
                             combined_generic_params(trait_item.generics, method.generics),)
                     } else {
@@ -2103,7 +2108,9 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                         if function_has_attr(method, "borrowed_return") {
                             ctx.borrowed_return_functions.push(callable_name)
                         }
-                        let callable_type = if method.is_async {
+                        let callable_type = if method.is_generator {
+                            qualified_type_for_source(ctx, method.source_name, "core::iter::Generator[" + output_type + "]")
+                        } elif method.is_async {
                             async_future_type(ctx_next_emitted_name(ctx, method.source_name, callable_name),
                                 combined_generic_params(impl_item.generics, method.generics),)
                         } else {
@@ -3223,7 +3230,7 @@ fn remember_reflective_await(ctx: mut TranslatorContext, future: str, output: st
                 }
             )
             .function_start(FnDirective {
-                    "poll", Vec[Type]::new(), parameters, parse_type_text(poll_type), Vec[Block]::new(), false, false
+                    "poll", Vec[Type]::new(), parameters, parse_type_text(poll_type), Vec[Block]::new(), false, false, Option[Type]::None
                 }
             )
             .label("entry").call("reflection_result", poll_type, emitted, vec![reference("self"), reference("context")], false)
@@ -3983,6 +3990,7 @@ fn thread_type_is_send_inner(ctx: mut TranslatorContext, typ: str, seen: Vec[str
         ret true
     }
     let owner = base_type_name(value)
+    if is_shared_generator_type(ctx, owner) { ret false }
     let sync_role = sync_type_thread_role(ctx, owner)
     if sync_role == 1_u32 || sync_role == 2_u32 || sync_role == 4_u32 {
         ret false
@@ -4087,6 +4095,7 @@ fn thread_type_is_transferable_region_inner(ctx: mut TranslatorContext, typ: str
         ret true
     }
     let owner = base_type_name(raw)
+    if is_shared_generator_type(ctx, owner) { ret false }
     let sync_role = sync_type_thread_role(ctx, owner)
     if sync_role == 1_u32 {
         ret true
@@ -6788,7 +6797,7 @@ fn decorator_named(ctx: mut TranslatorContext, name: str, owner: str, source_nam
             Vec[str]::new(), Vec[DecoratorApplication]::new(), false,
             false, false, "", Option[Documentation]::None, Vec[GenericParam]::new(),
             Vec[FunctionParam]::new(), Option[str]::None, false, false, Option[ParsedBlock]::None,
-            source_name, line, column
+            source_name, line, column, false
         }
     }
 }
@@ -6861,7 +6870,7 @@ fn resolve_decorator(ctx: mut TranslatorContext, application: DecoratorApplicati
             Vec[str]::new(), Vec[DecoratorApplication]::new(), false,
             false, false, "", Option[Documentation]::None, Vec[GenericParam]::new(),
             Vec[FunctionParam]::new(), Option[str]::None, false, false, Option[ParsedBlock]::None,
-            expression.source_name, expression.line, expression.column
+            expression.source_name, expression.line, expression.column, false
         }
         , Option[ExprNode]::None,
         Vec[ExprNode]::new()
@@ -6877,7 +6886,7 @@ fn decorator_hidden_name(ctx: mut TranslatorContext, item: FunctionItem, layer: 
     let signature = FunctionItem {
         Vec[str]::new(), Vec[DecoratorApplication]::new(), item.is_public, item.is_extern, item.is_async,
         item.name, Option[Documentation]::None, item.generics, item.params, item.ret_type,
-        item.returns_sending, item.returns_frozen, Option[ParsedBlock]::None, "", 0_usize, 0_usize
+        item.returns_sending, item.returns_frozen, Option[ParsedBlock]::None, "", 0_usize, 0_usize, item.is_generator
     }
     let callable = compiler_content_digest(stringify(encode_lowered_function_input(signature, source)))
     let identity = function_body_identity(source, ctx.self_type, callable) + ":" + Debug::fmt(layer)
@@ -6995,7 +7004,9 @@ fn decorator_wrapper_body(resolved: ResolvedDecorator, target: FunctionItem) -> 
 fn register_decorator_layer(ctx: mut TranslatorContext, item: FunctionItem, logical_name: str) -> str {
     let output_type = function_ret_type(item)
     let emitted = ctx_next_emitted_name(ctx, item.source_name, logical_name)
-    let callable_type = if item.is_async {
+    let callable_type = if item.is_generator {
+        qualified_type_for_source(ctx, item.source_name, "core::iter::Generator[" + output_type + "]")
+    } elif item.is_async {
         async_future_type(emitted, item.generics)
     } else {
         output_type
@@ -7021,7 +7032,7 @@ fn translate_decorated_function(ctx: mut TranslatorContext, item: FunctionItem,
         Vec[str]::new(), Vec[DecoratorApplication]::new(), false, false,
         item.is_async, raw_name, Option[Documentation]::None, item.generics, item.params,
         item.ret_type, item.returns_sending, item.returns_frozen, item.body, item.source_name,
-        item.line, item.column
+        item.line, item.column, item.is_generator
     }
     let raw_emitted = register_decorator_layer(ctx, raw_item, raw_name)
     let mut builder = translate_function_named(ctx, raw_item, raw_emitted, function_ret_type(item),
@@ -7071,7 +7082,7 @@ fn translate_decorated_function(ctx: mut TranslatorContext, item: FunctionItem,
             ,
             item.generics, wrapper_params, item.ret_type, item.returns_sending, item.returns_frozen,
             Option[ParsedBlock]::Some(decorator_wrapper_body(resolved, item)), item.source_name,
-            item.line, item.column
+            item.line, item.column, item.is_generator
         }
         let wrapper_emitted = if layer == 0_usize {
             emitted_name
@@ -7110,7 +7121,7 @@ fn translate_cached_function(ctx: mut TranslatorContext, item: FunctionItem, ord
             ret translate_function(ctx, item)
         }
     }
-    if !ctx.record_function_cache || item.is_async || item.is_extern || !item.generics.is_empty() ||
+    if !ctx.record_function_cache || item.is_async || item.is_generator || item.is_extern || !item.generics.is_empty() ||
     !item.decorators.is_empty() {
         ret translate_function(ctx, item)
     }
@@ -7403,7 +7414,7 @@ fn translate_function(ctx: mut TranslatorContext, fn_item: FunctionItem) -> Lowe
             fn_item.attrs, fn_item.decorators, fn_item.is_public, fn_item.is_extern, fn_item.is_async,
             fn_item.name, fn_item.documentation, fn_item.generics, fn_item.params,
             Option[str]::Some(output_type), fn_item.returns_sending, fn_item.returns_frozen,
-            fn_item.body, fn_item.source_name, fn_item.line, fn_item.column
+            fn_item.body, fn_item.source_name, fn_item.line, fn_item.column, fn_item.is_generator
         }
         let typ = qualified_type_for_source(ctx, static_item.source_name, function_ret_type(static_item))
         if fn_item.is_async || fn_item.is_extern || !fn_item.params.is_empty() || !fn_item.generics.is_empty() {
@@ -7492,6 +7503,18 @@ fn translate_function_named_inner(ctx: mut TranslatorContext, fn_item: FunctionI
             "frozen-extern-return", "extern functions cannot declare frozen returns",)
     }
     ctx.in_async_function = fn_item.is_async
+    ctx.generator_item_type = if fn_item.is_generator { ctx.return_type } else { "" }
+    if fn_item.is_generator && fn_item.is_async {
+        translation_error_at(fn_item.source_name, fn_item.line, fn_item.column, "async-generator", "async generators are not supported")
+    }
+    if fn_item.is_generator {
+        for parameter in fn_item.params {
+            let typ = unwrap_type_or_usize(parameter.typ)
+            if starts_with(typ, "mut ") || ends_with(typ, "<S>") {
+                translation_error_at(fn_item.source_name, fn_item.line, fn_item.column, "generator-capture-lifetime", "generator parameters must own values that can escape the call frame")
+            }
+        }
+    }
     ctx.async_poll_future_type = ""
     let mut signature_generics = generic_param_names(ctx.active_generics)
     for generic in generic_args_from_path(ctx.self_type) {
@@ -7565,7 +7588,7 @@ fn translate_function_named_inner(ctx: mut TranslatorContext, fn_item: FunctionI
     let mut builder = LoweringBuilder::new(ctx.ir_scope)
     builder = append_ehir_documentation(builder, fn_item.documentation, "///")
     let signature = FnDirective {
-        emitted_name, typed_generics(fn_item.generics), parameters, parse_type_text(ret_type), Vec[Block]::new(), fn_item.is_extern, fn_item.is_async
+        emitted_name, typed_generics(fn_item.generics), parameters, parse_type_text(ret_type), Vec[Block]::new(), fn_item.is_extern, fn_item.is_async, if fn_item.is_generator { Option[Type]::Some(parse_type_text(qualified_type_for_source(ctx, fn_item.source_name, "core::iter::Generator[" + ctx.return_type + "]"))) } else { Option[Type]::None }
     }
     if fn_item.is_extern {
         ret builder.declaration(Directive::Function(signature))
@@ -7578,7 +7601,7 @@ fn translate_function_named_inner(ctx: mut TranslatorContext, fn_item: FunctionI
             builder = builder.append(translate_statements(
                     ctx,
                     body.statements,
-                    ctx.return_type,
+                    if fn_item.is_generator { "void" } else { ctx.return_type },
                     "entry",
                     Option[str]::None,
                     Option[str]::None,
@@ -7783,7 +7806,7 @@ fn register_reflection_templates(ctx: mut TranslatorContext, ast: Vec[Statement]
                         scoped_method.is_async, scoped_method.name, scoped_method.documentation, generics, params,
                         Option[str]::Some(function_ret_type_for_owner(scoped_method, implementation.target)),
                         scoped_method.returns_sending, scoped_method.returns_frozen, scoped_method.body,
-                        scoped_method.source_name, scoped_method.line, scoped_method.column
+                        scoped_method.source_name, scoped_method.line, scoped_method.column, scoped_method.is_generator
                     }
                     ctx.reflection_templates.push(ReflectionSpecialization { name, item })
                 }
@@ -8012,7 +8035,9 @@ fn register_decorator_method_layer(ctx: mut TranslatorContext, item: FunctionIte
     let logical_name = base_type_name(owner) + "::" + item.name
     let output_type = function_ret_type_for_owner(item, owner)
     let all_generics = combined_generic_params(impl_generics, item.generics)
-    let callable_type = if item.is_async {
+    let callable_type = if item.is_generator {
+        qualified_type_for_source(ctx, item.source_name, "core::iter::Generator[" + output_type + "]")
+    } elif item.is_async {
         async_future_type(logical_name, all_generics)
     } else {
         output_type
@@ -8045,7 +8070,7 @@ LoweringBuilder {
         Vec[str]::new(), Vec[DecoratorApplication]::new(), false, false,
         item.is_async, raw_name, Option[Documentation]::None, item.generics, item.params,
         item.ret_type, item.returns_sending, item.returns_frozen, item.body, item.source_name,
-        item.line, item.column
+        item.line, item.column, item.is_generator
     }
     register_decorator_method_layer(ctx, raw_item, owner, impl_generics)
     let mut builder = translate_function_named(ctx, raw_item, raw_name, ret_type, impl_generics)
@@ -8095,7 +8120,7 @@ LoweringBuilder {
             ,
             item.generics, wrapper_params, item.ret_type, item.returns_sending, item.returns_frozen,
             Option[ParsedBlock]::Some(decorator_wrapper_body(resolved, item)), item.source_name,
-            item.line, item.column
+            item.line, item.column, item.is_generator
         }
         if layer > 0_usize {
             register_decorator_method_layer(ctx, wrapper_item, owner, impl_generics)
@@ -8209,7 +8234,7 @@ fn validate_trait_impl(ctx: mut TranslatorContext, item: ImplStmt) ->() {
                             specialization_args.push(generic_name)
                         }
                         validate_trait_method_types(expected, actual_params,
-                            qualified_type_for_source(ctx, method.source_name, function_ret_type_for_owner(method, target)),
+                            qualified_type_for_source(ctx, method.source_name, function_call_ret_type_for_owner(method, target)),
                             target, specialization_args, method,)
                     }
                 }
@@ -8670,6 +8695,9 @@ fn translate_statements(
             Statement::Assignment(assign_stmt) => {
                 builder = builder.append(translate_assignment_stmt(ctx, assign_stmt, prefix, i))
             }
+            Statement::Yield(expr) => {
+                builder = builder.append(translate_yield_stmt(ctx, expr, prefix + "_yield_" + Debug::fmt(i)))
+            }
             Statement::Expr(expr_stmt) => {
                 builder = builder.append(translate_expr_stmt(ctx, expr_stmt, prefix, i))
             }
@@ -8782,6 +8810,9 @@ fn translate_statements_no_default(
             }
             Statement::Assignment(assign_stmt) => {
                 builder = builder.append(translate_assignment_stmt(ctx, assign_stmt, prefix, i))
+            }
+            Statement::Yield(expr) => {
+                builder = builder.append(translate_yield_stmt(ctx, expr, prefix + "_yield_" + Debug::fmt(i)))
             }
             Statement::Expr(expr_stmt) => {
                 builder = builder.append(translate_expr_stmt(ctx, expr_stmt, prefix, i))
@@ -10322,6 +10353,7 @@ fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, 
     let saved_borrowed_return = ctx.return_is_borrowed
     let saved_hint = ctx.expression_hint
     let saved_generics = ctx.active_generics
+    let saved_generator_item = ctx.generator_item_type
     let saved_async = ctx.in_async_function
     let saved_future = ctx.async_poll_future_type
     let saved_value_id = ctx.next_value_id
@@ -10338,6 +10370,7 @@ fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, 
     ctx.return_is_borrowed = false
     ctx.expression_hint = signature.ret_type
     ctx.active_generics = Vec[GenericParam]::new()
+    ctx.generator_item_type = ""
     ctx.in_async_function = false
     ctx.async_poll_future_type = ""
 
@@ -10406,7 +10439,7 @@ fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, 
     )
     declaration = declaration.function_start(FnDirective {
             signature.method_name, Vec[Type]::new(), signature_parameters,
-            parse_type_text(signature.ret_type), Vec[Block]::new(), false, false
+            parse_type_text(signature.ret_type), Vec[Block]::new(), false, false, Option[Type]::None
         }
     ).label("entry").append(method).function_end().impl_end()
 
@@ -10419,6 +10452,7 @@ fn translate_closure_declaration(ctx: mut TranslatorContext, closure_name: str, 
     ctx.return_is_borrowed = saved_borrowed_return
     ctx.expression_hint = saved_hint
     ctx.active_generics = saved_generics
+    ctx.generator_item_type = saved_generator_item
     ctx.in_async_function = saved_async
     ctx.async_poll_future_type = saved_future
     ctx.next_value_id = saved_value_id
@@ -10679,6 +10713,9 @@ fn collect_closure_statement_captures(ctx: mut TranslatorContext, statements: Ve
             Statement::Ret(expr) => {
                 collect_closure_captures(ctx, expr, bound, captures)
             }
+            Statement::Yield(expr) => {
+                collect_closure_captures(ctx, expr, bound, captures)
+            }
             Statement::Expr(expr) => {
                 collect_closure_captures(ctx, expr, bound, captures)
             }
@@ -10776,6 +10813,9 @@ fn remember_closure_capture(ctx: mut TranslatorContext, name: str, bound: Vec[st
 
 fn lower_try_expr(ctx: mut TranslatorContext, inner: ExprNode<H>, source_name: str, line: usize, column:
     usize, prefix: str, idx: usize,) -> LoweredExpr {
+    if ctx.generator_item_type != "" {
+        translation_error_at(source_name, line, column, "generator-try", "use match to handle Result inside a generator; completion has no Result channel")
+    }
     let tried = lower_expr_h(ctx, inner, prefix + "_try_value", idx + 1_usize)
     let result_type = canonical_type(tried.typ)
     if method_owner_name(result_type) != "Result" {
@@ -16795,7 +16835,7 @@ fn plugin_resource_adapters(ctx: mut TranslatorContext, requested: str, value: s
         .declaration(native_ir_declaration("encore_plugin_descriptor_resource_ready", vec![("token", "usize")], "bool"))
         .declaration(native_ir_declaration("encore_plugin_generated_error", vec![("destination", "usize"),("code", "u32"),("message", "str")], "u32"))
         .function_start(FnDirective {
-                name + "_init", Vec[Type]::new(), parameters, parse_type_text("usize"), Vec[Block]::new(), false, false
+                name + "_init", Vec[Type]::new(), parameters, parse_type_text("usize"), Vec[Block]::new(), false, false, Option[Type]::None
             }
         ).label("entry")
         .primitive("key", "str", "\"" + escape_str(key) + "\"_str")
@@ -17122,12 +17162,12 @@ fn translator_nominal_typed_demand_matches_full_resolution() -> bool {
     let scalar = plain_type("u32", Vec[Type]::new())
     let generic = FnDirective {
         "identity", vec![value], vec![param("Value", value)], value,
-        vec![block("entry", Vec[Instruction]::new(), ret_term(var("Value", value)))], false, false
+        vec![block("entry", Vec[Instruction]::new(), ret_term(var("Value", value)))], false, false, Option[Type]::None
     }
     let method = FnDirective {
         "sample", Vec[Type]::new(), Vec[Parameter]::new(), scalar,
         vec![block("entry", vec![call(var("result", scalar), "Value::read", Vec[Type]::new(), Vec[Variable]::new(), false)],
-                ret_term(var("result", scalar)),)], false, false
+                ret_term(var("result", scalar)),)], false, false, Option[Type]::None
     }
     let samples = vec![
         make_module("empty", Vec[Directive]::new()),
@@ -17187,7 +17227,7 @@ fn native_ir_declaration(name: str, fields: Vec[(str, str)], result: str) -> Dir
         parameters.push(param(field.0, parse_type_text(field.1)))
     }
     ret Directive::Function(FnDirective {
-            name, Vec[Type]::new(), parameters, parse_type_text(result), Vec[Block]::new(), true, false
+            name, Vec[Type]::new(), parameters, parse_type_text(result), Vec[Block]::new(), true, false, Option[Type]::None
         }
     )
 }
@@ -17764,7 +17804,7 @@ pub fn lowering_module_revisions(module: TranslationModule) -> Vec[str] {
 }
 
 fn ordinary_delta_function(item: FunctionItem) -> bool {
-    if item.body.is_none() || item.ret_type.is_none() || item.is_async || item.is_extern ||
+    if item.body.is_none() || item.ret_type.is_none() || item.is_async || item.is_generator || item.is_extern ||
     !item.generics.is_empty() || !item.decorators.is_empty() || !item.attrs.is_empty() || function_uses_reflection(item) {
         ret false
     }
@@ -18246,7 +18286,7 @@ fn translation_environment_declarations(ast: Vec[Statement]) -> Vec[Statement] {
                             item.attrs, item.decorators, item.is_public,
                             item.is_extern, item.is_async, item.name, item.documentation, item.generics, item.params,
                             item.ret_type, item.returns_sending, item.returns_frozen, Option[ParsedBlock]::None,
-                            item.source_name, item.line, item.column
+                            item.source_name, item.line, item.column, item.is_generator
                         }
                     ))
             }
@@ -18372,6 +18412,51 @@ fn query_function_declaration(item: FunctionItem) -> FunctionItem {
     ret FunctionItem {
         item.attrs, item.decorators, item.is_public, item.is_extern, item.is_async, item.name,
         item.documentation, item.generics, item.params, item.ret_type, item.returns_sending, item.returns_frozen,
-        Option[ParsedBlock]::None, item.source_name, item.line, item.column
+        Option[ParsedBlock]::None, item.source_name, item.line, item.column, item.is_generator
     }
+}
+
+
+fn function_call_ret_type_for_owner(item: FunctionItem, owner: str) -> str {
+    let output = function_ret_type_for_owner(item, owner)
+    ret if item.is_generator { "core::iter::Generator[" + output + "]" } else { output }
+}
+
+fn translate_yield_stmt(ctx: mut TranslatorContext, expr: ExprNode, prefix: str) -> LoweringBuilder {
+    if ctx.generator_item_type == "" {
+        translation_error_at(expr.source_name, expr.line, expr.column, "yield-outside-generator", "yield requires a named synchronous generator")
+    }
+    let saved_hint = ctx.expression_hint
+    ctx.expression_hint = ctx.generator_item_type
+    let lowered = load_mutable_value(lower_expr(ctx, expr, prefix, 0_usize), prefix + "_load")
+    ctx.expression_hint = saved_hint
+    if canonical_type(ctx.generator_item_type) != canonical_type(value_type_name(lowered.typ)) {
+        translation_error_at(expr.source_name, expr.line, expr.column, "yield-type-mismatch", "cannot yield '" + lowered.typ + "' as '" + ctx.generator_item_type + "'")
+    }
+    let mut builder = lowered.code
+    if expr_is_borrowed_copy(expr) && ctx_type_needs_ownership(ctx, lowered.typ) {
+        builder = builder.retain(annotated(lowered.value, lowered.typ))
+    }
+    let mut cleanups = Vec[CallInstruction]::new()
+    let mut index = ctx.with_cleanups.len()
+    while index > 0_usize {
+        index -= 1_usize
+        match ctx.with_cleanups.get(index) {
+            Some(resource) => {
+                let target = ctx.ir_scope.callable(context_method_target(ctx, resource.typ, "with_exit"))
+                cleanups.push(CallInstruction { var(prefix + "_exit_" + Debug::fmt(index), parse_type_text("bool")), target.0, target.1, vec![var(resource.emitted_name, parse_type_text(resource.typ))], false })
+            }
+            None => {}
+        }
+    }
+    ret builder.emit(yield_value(var(lowered.value, parse_type_text(lowered.typ)), cleanups))
+}
+
+fn is_shared_generator_type(ctx: mut TranslatorContext, owner: str) -> bool {
+    for index in 0_usize..ctx.modules.len() {
+        if module_id_at(ctx, index) == "core@iter/mod.enq" && owner == qualified_type_for_source(ctx, module_source_at(ctx, index), "Generator") {
+            ret true
+        }
+    }
+    ret false
 }

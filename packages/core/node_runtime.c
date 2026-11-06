@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 enum {
     ENCORE_NODE_PREFIX_BYTES = 128,
@@ -67,6 +68,29 @@ static _Atomic size_t g_encore_node_ern_scan_count = 0;
 static _Thread_local encore_node_header_vec g_encore_node_finalizers = {0};
 static encore_node_header *g_encore_node_places = NULL;
 
+/* Generator close hooks are pre-death work, never shallow destructors. Keeping
+ * this optional registry outside the header preserves the common node ABI. */
+typedef struct encore_node_close_record {
+    encore_node_header *node;
+    void (*close)(uintptr_t);
+    const void *owner;
+    unsigned status; /* 0 suspended, 1 queued, 2 closing, 3 closed */
+    bool running;
+    struct encore_node_close_record *hash_next;
+    struct encore_node_close_record *pending_next;
+} encore_node_close_record;
+static encore_node_close_record **g_encore_node_closers;
+static size_t g_encore_node_closer_capacity;
+static _Atomic size_t g_encore_node_closer_count;
+static _Thread_local unsigned char g_encore_generator_thread;
+static _Thread_local encore_node_close_record *g_encore_node_close_head;
+static _Thread_local encore_node_close_record *g_encore_node_close_tail;
+static _Thread_local bool g_encore_node_draining_closers;
+static void encore_node_drain_closers(void);
+bool encore_node_release(void *payload);
+void encore_node_free_released(void *payload);
+
+
 static void encore_node_graph_lock(void) {
     while (atomic_flag_test_and_set_explicit(&g_encore_node_graph_lock,
                                              memory_order_acquire)) {
@@ -84,6 +108,139 @@ _Static_assert(sizeof(encore_node_header) + sizeof(encore_node_header *) <=
 static encore_node_header *encore_node_header_from_payload(void *payload) {
     if (payload == NULL) return NULL;
     return ((encore_node_header **)payload)[-1];
+}
+
+
+static size_t encore_node_close_bucket(encore_node_header *node, size_t capacity) {
+    uintptr_t key = (uintptr_t)node;
+    key ^= key >> 17;
+    key *= (uintptr_t)0x9e3779b1U;
+    return (size_t)(key ^ (key >> 11)) & (capacity - 1);
+}
+
+/* All registry and queue transitions happen under the graph lock. */
+static encore_node_close_record *encore_node_find_closer(encore_node_header *node) {
+    if (g_encore_node_closer_capacity == 0) return NULL;
+    size_t bucket = encore_node_close_bucket(node, g_encore_node_closer_capacity);
+    for (encore_node_close_record *item = g_encore_node_closers[bucket];
+         item != NULL; item = item->hash_next) {
+        if (item->node == node) return item;
+    }
+    return NULL;
+}
+
+static void encore_node_grow_closers(void) {
+    size_t capacity = g_encore_node_closer_capacity == 0 ? 64 :
+                      g_encore_node_closer_capacity * 2;
+    if (capacity < g_encore_node_closer_capacity) abort();
+    encore_node_close_record **buckets = calloc(capacity, sizeof(*buckets));
+    if (buckets == NULL) abort();
+    for (size_t index = 0; index < g_encore_node_closer_capacity; ++index) {
+        encore_node_close_record *item = g_encore_node_closers[index];
+        while (item != NULL) {
+            encore_node_close_record *next = item->hash_next;
+            size_t bucket = encore_node_close_bucket(item->node, capacity);
+            item->hash_next = buckets[bucket]; buckets[bucket] = item;
+            item = next;
+        }
+    }
+    free(g_encore_node_closers);
+    g_encore_node_closers = buckets;
+    g_encore_node_closer_capacity = capacity;
+}
+
+void encore_generator_register(uintptr_t payload, uintptr_t close_address) {
+    encore_node_header *node = encore_node_header_from_payload((void *)payload);
+    if (node == NULL || close_address == 0) abort();
+    encore_node_close_record *item = calloc(1, sizeof(*item));
+    if (item == NULL) abort();
+    item->node = node;
+    item->close = (void (*)(uintptr_t))close_address;
+    item->owner = &g_encore_generator_thread;
+    encore_node_graph_lock();
+    if (node->state != ENCORE_NODE_ALIVE || encore_node_find_closer(node) != NULL) abort();
+    size_t count = atomic_load_explicit(&g_encore_node_closer_count, memory_order_relaxed);
+    if (count >= g_encore_node_closer_capacity / 2) encore_node_grow_closers();
+    size_t bucket = encore_node_close_bucket(node, g_encore_node_closer_capacity);
+    item->hash_next = g_encore_node_closers[bucket];
+    g_encore_node_closers[bucket] = item;
+    atomic_fetch_add_explicit(&g_encore_node_closer_count, 1, memory_order_release);
+    encore_node_graph_unlock();
+}
+
+void encore_generator_enter(uintptr_t payload) {
+    encore_node_graph_lock();
+    encore_node_close_record *item = encore_node_find_closer(
+        encore_node_header_from_payload((void *)payload));
+    if (item == NULL || item->owner != &g_encore_generator_thread ||
+        item->status == 1 || item->status == 2 || item->running) {
+        encore_node_graph_unlock();
+        fputs("panic: generator already executing, closing, or used on another thread\n", stderr);
+        exit(1);
+    }
+    item->running = true;
+    encore_node_graph_unlock();
+}
+void encore_generator_leave(uintptr_t payload) {
+    encore_node_graph_lock();
+    encore_node_close_record *item = encore_node_find_closer(
+        encore_node_header_from_payload((void *)payload));
+    if (item == NULL || !item->running || item->owner != &g_encore_generator_thread) abort();
+    item->running = false;
+    encore_node_graph_unlock();
+}
+
+static bool encore_node_queue_closer(encore_node_header *node) {
+    encore_node_close_record *item = encore_node_find_closer(node);
+    if (item == NULL || item->status != 0) return false;
+    if (item->running || item->owner != &g_encore_generator_thread) abort();
+    item->status = 1;
+    /* This root is established before logical death and protects the complete
+     * captured graph while arbitrary with_exit code executes. */
+    atomic_fetch_add_explicit(&node->refs, 1, memory_order_relaxed);
+    if (g_encore_node_close_tail != NULL) g_encore_node_close_tail->pending_next = item;
+    else g_encore_node_close_head = item;
+    g_encore_node_close_tail = item;
+    return true;
+}
+
+static void encore_node_forget_closer(encore_node_header *node) {
+    if (g_encore_node_closer_capacity == 0) return;
+    size_t bucket = encore_node_close_bucket(node, g_encore_node_closer_capacity);
+    encore_node_close_record **cursor = &g_encore_node_closers[bucket];
+    while (*cursor != NULL) {
+        encore_node_close_record *item = *cursor;
+        if (item->node == node) {
+            if (item->status != 3 || item->running) abort();
+            *cursor = item->hash_next;
+            atomic_fetch_sub_explicit(&g_encore_node_closer_count, 1, memory_order_release);
+            free(item); return;
+        }
+        cursor = &item->hash_next;
+    }
+}
+
+static void encore_node_drain_closers(void) {
+    if (g_encore_node_draining_closers || g_encore_node_finalizers.len != 0) return;
+    g_encore_node_draining_closers = true;
+    while (g_encore_node_close_head != NULL) {
+        encore_node_graph_lock();
+        encore_node_close_record *item = g_encore_node_close_head;
+        g_encore_node_close_head = item->pending_next;
+        if (g_encore_node_close_head == NULL) g_encore_node_close_tail = NULL;
+        item->pending_next = NULL; item->status = 2;
+        void *payload = item->node->payload;
+        void (*close)(uintptr_t) = item->close;
+        encore_node_graph_unlock();
+        close((uintptr_t)payload);
+        encore_node_graph_lock();
+        item->status = 3;
+        encore_node_graph_unlock();
+        /* The compiler's close callback replaces the frame by empty Done and
+         * drops its captures. No typed payload remains to finalize here. */
+        if (encore_node_release(payload)) encore_node_free_released(payload);
+    }
+    g_encore_node_draining_closers = false;
 }
 
 static void encore_node_initialize_header(encore_node_header *header,
@@ -646,6 +803,32 @@ static bool encore_node_mark_ern(encore_node_header *root) {
         }
     }
 
+    bool queued_closer = false;
+    for (size_t index = 0; index < reachable.len; ++index) {
+        if (!survives[index] && encore_node_queue_closer(reachable.items[index]))
+            queued_closer = true;
+    }
+    if (queued_closer) {
+        queue_len = 0;
+        for (size_t index = 0; index < reachable.len; ++index) {
+            survives[index] = false;
+            size_t refs = atomic_load_explicit(&reachable.items[index]->refs, memory_order_relaxed);
+            if (refs > internal_indegree[index]) {
+                survives[index] = true; queue[queue_len++] = index;
+            }
+        }
+        for (size_t cursor = 0; cursor < queue_len; ++cursor) {
+            encore_node_header *source = reachable.items[queue[cursor]];
+            for (size_t edge = 0; edge < source->edge_count; ++edge) {
+                encore_node_header *target = encore_node_header_from_payload(source->edges[edge]);
+                size_t target_index = encore_node_index_map_find(&indices, target);
+                if (target_index != SIZE_MAX && !survives[target_index]) {
+                    survives[target_index] = true; queue[queue_len++] = target_index;
+                }
+            }
+        }
+    }
+
     bool root_released = false;
     for (size_t index = 0; index < reachable.len; ++index) {
         if (!survives[index]) {
@@ -735,7 +918,8 @@ bool encore_node_release(void *payload) {
         while (refs > 0) {
             size_t incoming = atomic_load_explicit(&header->incoming_edges,
                                                    memory_order_acquire);
-            if (refs == 1 && incoming == 0) {
+            if (refs == 1 && incoming == 0 &&
+                atomic_load_explicit(&g_encore_node_closer_count, memory_order_acquire) == 0) {
                 if (atomic_compare_exchange_weak_explicit(
                         &header->refs, &refs, 0,
                         memory_order_release, memory_order_relaxed)) {
@@ -795,6 +979,11 @@ bool encore_node_release(void *payload) {
         return false;
     }
     if (refs == 0 && header->incoming_edges == 0) {
+        if (encore_node_queue_closer(header)) {
+            encore_node_graph_unlock();
+            encore_node_drain_closers();
+            return false;
+        }
         header->state = ENCORE_NODE_FINALIZING;
         encore_node_header_vec_push(&g_encore_node_finalizers, header);
         encore_node_graph_unlock();
@@ -810,6 +999,7 @@ bool encore_node_release(void *payload) {
         encore_node_header_vec_push(&g_encore_node_finalizers, header);
     }
     encore_node_graph_unlock();
+    if (!should_finalize) encore_node_drain_closers();
     return should_finalize;
 }
 
@@ -840,11 +1030,13 @@ void encore_node_free_released(void *payload) {
     if (!can_free) abort();
     encore_node_graph_lock();
     g_encore_node_places = encore_node_place_remove(g_encore_node_places, header);
+    encore_node_forget_closer(header);
     encore_node_graph_unlock();
     free(edges);
     free(incoming_owners);
     if (placement == ENCORE_NODE_HEAP) free(allocation_base);
     else free(header);
+    encore_node_drain_closers();
 }
 
 size_t encore_node_debug_ref_count(void *payload) {

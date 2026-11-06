@@ -66,7 +66,7 @@ fn join_line_range(lines: Vec[str], start: usize, end: usize) -> str {
     ret ""
 }
 
-import refrain::core::{Block, Directive, EhirDocumentation, EhirImport, EnumVariant, FieldSelector, FnDirective, Instruction, MatchArm, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, Variable, add, add_edge, alias, and_op, annotated_field, async_fn_directive, await_value, binary, block, br_term, call, cbr_term, cfree, comment, div, drop_value, ehir_documentation, ehir_import, enum_directive, enum_tag, enum_value, enum_variant, extern_fn_directive, field, fn_directive, fn_item, gep, geq, getfield, getfieldptr, getptr, grt, halloc, hfree, hrealloc, ieq, impl_directive, indirect_call, lceos, lcpos, lcsos, leq, les, load, make_module, make_module_bundle, make_module_with_imports, make_module_with_metadata, make_type, match_arm, match_term, mod_op, mul, neq, or_op, param, pcast, phi, phi_pair, plain_type, remove_edge, represented_type_name, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, shl, shr, store, struct_directive, sub, switch_case, switch_term, trait_directive, trait_method, unreachable_term, var, xor_op}
+import refrain::core::{CallInstruction, YieldInstruction, Block, Directive, EhirDocumentation, EhirImport, EnumVariant, FieldSelector, FnDirective, Instruction, MatchArm, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, Variable, add, add_edge, alias, and_op, annotated_field, async_fn_directive, await_value, binary, block, br_term, call, cbr_term, cfree, comment, div, drop_value, ehir_documentation, ehir_import, enum_directive, enum_tag, enum_value, enum_variant, extern_fn_directive, field, fn_directive, fn_item, gep, geq, getfield, getfieldptr, getptr, grt, halloc, hfree, hrealloc, ieq, impl_directive, indirect_call, lceos, lcpos, lcsos, leq, les, load, make_module, make_module_bundle, make_module_with_imports, make_module_with_metadata, make_type, match_arm, match_term, mod_op, mul, neq, or_op, param, pcast, phi, phi_pair, plain_type, remove_edge, represented_type_name, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, shl, shr, store, struct_directive, sub, switch_case, switch_term, trait_directive, trait_method, unreachable_term, var, xor_op}
 
 /// A parsed EHIR bundle together with the exact per-module textual sources
 /// from which it was built. Compiler drivers use this typed boundary to feed a
@@ -276,6 +276,24 @@ pub fn try_parse_instruction_in_scope(source: str, known: mut SsaBindings) -> Re
     }
     if starts_with_text(value, "retain ") {
         ret Result::Ok(retain_value(try_parse_ssa_reference(trim_text(value.slice(7_usize, value.len() - 7_usize)), known)?))
+    }
+
+    if starts_with_text(value, "yield ") {
+        let separator = find_text(value, " cleanup [")
+        let end = if separator < value.len() { separator } else { value.len() }
+        let yielded = try_parse_ssa_reference(trim_text(value.slice(6_usize, end - 6_usize)), known)?
+        let mut cleanups = Vec[CallInstruction]::new()
+        if separator < value.len() {
+            if !ends_with_text(value, "]") { ret Result::Err("Malformed yield cleanup metadata") }
+            let text = value.slice(separator + 10_usize, value.len() - separator - 11_usize)
+            for source in try_split_top_level_text(text, ";")? {
+                match try_parse_instruction_in_scope(source, known)? {
+                    Instruction::Call(cleanup) => { cleanups.push(cleanup) }
+                    _ => { ret Result::Err("Yield cleanup must be a call") }
+                }
+            }
+        }
+        ret Result::Ok(Instruction::Yield(YieldInstruction { yielded, cleanups }))
     }
 
     let assignment = find_text(value, " = ")
@@ -702,6 +720,7 @@ fn try_parse_function_lines(lines: Vec[str], start: usize, end: usize) -> Result
     let header = trim_text(try_required_part(lines, start)?)
     let is_extern = starts_with_text(header, "extern fn ")
     let is_async = starts_with_text(header, "async fn ")
+    let is_generator = starts_with_text(header, "generator fn ")
     let mut prefix_len = 3_usize
     if is_extern {
         prefix_len = 10_usize
@@ -710,7 +729,8 @@ fn try_parse_function_lines(lines: Vec[str], start: usize, end: usize) -> Result
             prefix_len = 9_usize
         }
     }
-    if !is_extern && !is_async && !starts_with_text(header, "fn ") {
+    if is_generator { prefix_len = 13_usize }
+    if !is_extern && !is_async && !is_generator && !starts_with_text(header, "fn ") {
         ret Result::Err("Expected EHIR function header: " + header)
     }
 
@@ -727,6 +747,13 @@ fn try_parse_function_lines(lines: Vec[str], start: usize, end: usize) -> Result
         ret_text = trim_text(ret_text.slice(0_usize, ret_text.len() - 1_usize))
     }
 
+    let mut generator_type = Option[Type]::None
+    if is_generator {
+        let separator = find_text(ret_text, " => ")
+        if separator >= ret_text.len() { ret Result::Err("Generator header must declare its iterator result") }
+        generator_type = Option[Type]::Some(try_parse_type_text(ret_text.slice(separator + 4_usize, ret_text.len() - separator - 4_usize))?)
+        ret_text = trim_text(ret_text.slice(0_usize, separator))
+    }
     let generic_open = find_top_level_char(name_and_generics, "[")
     let mut name = name_and_generics
     let mut generics = Vec[Type]::new()
@@ -829,7 +856,7 @@ fn try_parse_function_lines(lines: Vec[str], start: usize, end: usize) -> Result
     }
     match directive {
         Directive::Function(function) => {
-            ret Result::Ok(function)
+            ret Result::Ok(FnDirective { function.name, function.generics, function.params, function.ret_type, function.blocks, function.is_extern, function.is_async, generator_type })
         }
         _ => {
             ret Result::Err("Internal EHIR function construction error")
@@ -1010,7 +1037,7 @@ pub fn try_parse_module_text(name: str, source: str) -> Result[Module, str] {
             index = index + 1_usize
             continue
         }
-        if starts_with_text(line, "fn ") || starts_with_text(line, "async fn ") {
+        if starts_with_text(line, "fn ") || starts_with_text(line, "async fn ") || starts_with_text(line, "generator fn ") {
             let start = index
             let mut depth = brace_delta(line)
             index = index + 1_usize
@@ -1462,7 +1489,7 @@ pub fn try_parse_impl_text(source: str) -> Result[Directive, str] {
             index = index + 1_usize
             continue
         }
-        if starts_with_text(line, "fn ") || starts_with_text(line, "async fn ") {
+        if starts_with_text(line, "fn ") || starts_with_text(line, "async fn ") || starts_with_text(line, "generator fn ") {
             let chunk = try_collect_braced_text(lines, index)?
             methods.push(try_parse_function_text(chunk.text)?)
             index = chunk.next_index

@@ -9,7 +9,7 @@ import std::time::perf_counter_ms
 import std::vec::{Vec, vec_singleton}
 
 import ehir_core::{PreparationOutcome, enum_value, parse_module_bundle_text, prepare_module}
-import ehir_core::core::{BinaryOpKind, Block, CallInstruction, Directive, EdgeInstruction, EhirDocumentation, EhirImport, EnumVariant, FieldSelector, FnDirective, Instruction, MatchArm, MatchInstruction, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, ValueKind, Variable, add_edge, alias, async_fn_item, await_value, binary, block, br_term, call, cbr_term, cfree, drop_value, ehir_documentation, ehir_import, enum_directive, enum_variant, extern_fn_item, fn_item, function_body_identity, gep, getfield, getfieldptr, getptr, halloc, hfree, hrealloc, impl_directive, lceos, lcpos, lcsos, load, local_place_type, make_module, make_module_bundle, make_module_with_metadata, mangle_plain_type_name, mangle_type_name, match_arm, match_term, memory_value_type, param, pcast, phi, phi_pair, put, raw_type, remove_edge, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, store, struct_directive, switch_case, switch_term, trait_directive, trait_method, unreachable_term}
+import ehir_core::core::{YieldInstruction, BinaryOpKind, Block, CallInstruction, Directive, EdgeInstruction, EhirDocumentation, EhirImport, EnumVariant, FieldSelector, FnDirective, Instruction, MatchArm, MatchInstruction, Module, ModuleBundle, Parameter, PhiPair, RepresentationKind, SwitchCase, Terminator, TraitMethod, Type, ValueKind, Variable, add_edge, alias, async_fn_item, await_value, binary, block, br_term, call, cbr_term, cfree, drop_value, ehir_documentation, ehir_import, enum_directive, enum_variant, extern_fn_item, fn_item, function_body_identity, gep, getfield, getfieldptr, getptr, halloc, hfree, hrealloc, impl_directive, lceos, lcpos, lcsos, load, local_place_type, make_module, make_module_bundle, make_module_with_metadata, mangle_plain_type_name, mangle_type_name, match_arm, match_term, memory_value_type, param, pcast, phi, phi_pair, put, raw_type, remove_edge, resource_struct_directive, ret_term, retain_value, salloc, setfield, sgetfield, sgetfieldptr, store, struct_directive, switch_case, switch_term, trait_directive, trait_method, unreachable_term}
 
 fn concat_instructions(left: Vec[LLVMInstruction], right: Vec[LLVMInstruction]) -> Vec[LLVMInstruction] {
     let mut out = Vec[LLVMInstruction]::new()
@@ -1009,6 +1009,7 @@ fn lower_dyn_ownership_function(directives: frozen Vec[Directive], dyn_type: fro
                 drop_symbol(concrete)
             }
             instructions.push(llvm_inst_call(Option[LLVMValue]::None, void_type(), callee, vec_singleton(concrete_value)))
+            instructions.push(llvm_inst_call(Option[LLVMValue]::None, void_type(), if retain { "encore_box_retain" } else { "encore_box_drop" }, vec_singleton(raw_data)))
             blocks.push(llvm_block(action_name, instructions, llvm_term_ret_void()))
             index = index + 1_usize
         }
@@ -2541,6 +2542,8 @@ fn collect_direct_generic_call(out: mut Vec[GenericCall], seen: usize, instructi
                     let is_spawn = required_variable_type(data.out).name == "JoinHandle" && is_thread_spawn_name(data.name)
                     let name = if is_spawn {
                         thread_spawn_target(data.name)
+                    } elif has_prefix(data.name, "__ehir_generator_close_address__") {
+                        data.name.slice_bytes(32_usize, data.name.byte_len() - 32_usize)
                     } else {
                         data.name
                     }
@@ -2749,6 +2752,8 @@ fn collect_nested_generic_call(out: mut Vec[GenericCall], seen: usize,
             is_thread_spawn_name(data_name)
             let call_name = if is_spawn {
                 thread_spawn_target(data_name)
+            } elif has_prefix(data_name, "__ehir_generator_close_address__") {
+                data_name.slice_bytes(32_usize, data_name.byte_len() - 32_usize)
             } else {
                 data_name
             }
@@ -3321,6 +3326,17 @@ fn specialize_instruction(instruction: frozen Instruction, params: frozen Vec[Ty
             }
             ret call(specialize_variable(data.out, params, args), call_name, generics, values,
                 call_is_unsafe,)
+        }
+        Instruction::Yield(data) => {
+            let mut cleanups = Vec[CallInstruction]::new()
+            for cleanup in data.cleanups {
+                let mut arguments = Vec[Variable]::new()
+                for argument in cleanup.args { arguments.push(specialize_variable(argument, params, args)) }
+                let mut generics = Vec[Type]::new()
+                for generic in cleanup.generics { generics.push(substitute_generic_type(generic, params, args)) }
+                cleanups.push(CallInstruction { specialize_variable(cleanup.out, params, args), cleanup.name, generics, arguments, cleanup.is_unsafe })
+            }
+            ret Instruction::Yield(YieldInstruction { specialize_variable(data.value, params, args), cleanups })
         }
         Instruction::Await(data) => {
             ret await_value(specialize_variable(data.out, params, args), specialize_variable(data.future, params, args))
@@ -5472,6 +5488,9 @@ fn lower_instruction(instruction: frozen Instruction, instruction_scope: str, lo
             if call_data.name == "__ehir_call_indirect" {
                 ret lower_indirect_call(call_data)
             }
+            if has_prefix(call_data.name, "__ehir_generator_close_address__") {
+                ret lower_generator_close_address(call_data)
+            }
             if has_prefix(call_data.name, "__ehir_function_address__") {
                 ret lower_function_address(call_data)
             }
@@ -5488,6 +5507,9 @@ fn lower_instruction(instruction: frozen Instruction, instruction_scope: str, lo
             let call_args: Vec[Variable] = call_data.args
             let lowered: LLVMInstruction = lower_call(out_var, callee_name, call_data.generics, call_args)
             ret vec_singleton(lowered)
+        }
+        Yield(_) => {
+            ret unsupported_instruction("yield must be lowered before LLVM emission")
         }
         Await(await_data) => {
             backend_invariant_error("internal compiler error: unlowered EHIR await for '" + await_data.out.name + "' reached LLVM codegen")
@@ -5737,7 +5759,7 @@ fn lower_instruction(instruction: frozen Instruction, instruction_scope: str, lo
                 let mut instructions = Vec[LLVMInstruction]::new()
                 instructions.push(llvm_inst_gep(size_ptr, concrete_type, const_text("null", concrete_ptr_type), vec_singleton(const_text("1", i64_type())), false))
                 instructions.push(llvm_inst_cast("ptrtoint", size, size_ptr))
-                instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw_box), ptr_type(i8_type()), "__ehir_hrealloc", concat_values(vec_singleton(const_text("null", ptr_type(i8_type()))), vec_singleton(size))))
+                instructions.push(llvm_inst_call(Option[LLVMValue]::Some(raw_box), ptr_type(i8_type()), "encore_box_alloc", vec_singleton(size)))
                 instructions.push(llvm_inst_cast("bitcast", typed_box, raw_box))
                 instructions.push(llvm_inst_store(src_value, typed_box))
                 instructions.push(llvm_inst_insertvalue(with_data, const_text("undef", lower_type(target_type)), raw_box, "0"))
@@ -7346,4 +7368,14 @@ fn compact_package_codegen_keeps_owned_closures_with_function() -> bool {
     ret module.diagnostic.is_empty() && module.ir.contains("define i32 @factory") &&
     module.ir.contains("define i32 @" + closure + "__handle") &&
     function_body_identity("owner", "Left", "read") != function_body_identity("owner", "Right", "read")
+}
+
+
+fn lower_generator_close_address(data: frozen CallInstruction) -> Vec[LLVMInstruction] {
+    let prefix = "__ehir_generator_close_address__"
+    let target = data.name.slice_bytes(prefix.byte_len(), data.name.byte_len() - prefix.byte_len())
+    let symbol = if data.generics.is_empty() { function_symbol(target) } else { generic_symbol(target, data.generics) }
+    let signature = "void (" + type_text(pointer_int_type()) + ")*"
+    let pointer = const_text("@" + symbol, llvm_raw_type(LLVMTypeKind::POINTER, signature))
+    ret vec_singleton(llvm_inst_cast("ptrtoint", lower_variable(data.out), pointer))
 }

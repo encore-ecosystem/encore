@@ -16,6 +16,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='encore-node-') as directory:
         for name, sources in (
             ('node-runtime', ['packages/core/tests/node_runtime.c', 'packages/core/node_runtime.c']),
+            ('generator-lifecycle', ['packages/core/tests/generator_lifecycle.c', 'packages/core/node_runtime.c']),
             ('node-owner-search', ['packages/core/tests/node_owner_search.c']),
         ):
             binary = Path(directory) / (name + ('.exe' if os.name == 'nt' else ''))
@@ -30,6 +31,10 @@ def main():
             print(result.stderr, end='')
             if result.returncode:
                 raise SystemExit(result.returncode)
+            if name == 'generator-lifecycle':
+                reentry = subprocess.run([str(binary), 'reenter'], text=True, capture_output=True, timeout=30)
+                if reentry.returncode != 1 or 'generator already executing' not in reentry.stderr:
+                    raise RuntimeError('generator reentry must fail deterministically')
 
 
 if __name__ == '__main__':

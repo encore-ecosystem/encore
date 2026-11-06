@@ -256,7 +256,9 @@ pub fn lower_coroutines(module: Module) -> Module {
     for directive in module.directives {
         match directive {
             Directive::Function(function) => {
-                if function.is_async {
+                if function.generator_type.is_some() {
+                    directives.extend(lower_generator_function(module, function))
+                } elif function.is_async {
                     directives.extend(lower_coroutine_function(function))
                 } else {
                     directives.push(Directive::Function(function))
@@ -265,7 +267,10 @@ pub fn lower_coroutines(module: Module) -> Module {
             Directive::Impl(item) => {
                 let mut synchronous = Vec[FnDirective]::new()
                 for method in item.methods {
-                    if method.is_async {
+                    if method.generator_type.is_some() {
+                        let function = FnDirective { item.for_type.name + "::" + method.name, combine_types(item.generics, method.generics), method.params, method.ret_type, method.blocks, false, false, method.generator_type }
+                        directives.extend(lower_generator_function(module, function))
+                    } elif method.is_async {
                         let full_name = item.for_type.name + "::" + method.name
                         let combined_generics = combine_types(item.generics, method.generics)
                         let coroutine = async_fn_item(full_name, combined_generics, method.params, method.ret_type, method.blocks)
@@ -1139,6 +1144,17 @@ pub fn analyze_await_liveness(function: FnDirective) -> Vec[AwaitLiveness] {
                     match block_item.instructions.get(instruction_index) {
                         Some(instruction) => {
                             match instruction {
+                                Instruction::Yield(item) => {
+                                    let mut live = live_after_instruction(block_item, instruction_index, state_live_out(states, block_item.name))
+                                    for cleanup in item.cleanups { extend_unique(live, cleanup.args) }
+                                    let mut captured = Vec[Variable]::new()
+                                    for value in live {
+                                        for definition in definitions {
+                                            if definition.name == value.name { add_unique(captured, definition) break }
+                                        }
+                                    }
+                                    sites.push(AwaitLiveness { block_item.name, instruction_index, var("__generator_unit", plain_type("void", Vec[Type]::new())), item.value, captured })
+                                }
                                 Instruction::Await(item) => {
                                     let live = live_after_instruction(block_item, instruction_index, state_live_out(states, block_item.name))
                                     let mut captured = Vec[Variable]::new()
@@ -1300,6 +1316,10 @@ fn add_instruction_uses(out: mut Vec[Variable], instruction: Instruction) ->() {
         }
         Instruction::Call(item) => {
             extend_unique(out, item.args)
+        }
+        Instruction::Yield(item) => {
+            add_unique(out, item.value)
+            for cleanup in item.cleanups { extend_unique(out, cleanup.args) }
         }
         Instruction::Await(item) => {
             add_unique(out, item.future)
@@ -1546,4 +1566,303 @@ fn clone_variables(values: Vec[Variable]) -> Vec[Variable] {
         out.push(value)
     }
     ret out
+}
+
+// Generators use the same typed spill slots and CFG edges as async functions.
+// Only the suspension protocol differs: a yielded item leaves through Option,
+// while the next state stays in a shared graph node.
+struct GeneratorBuild {
+    machine: CoroutineBuild
+    public_type: Type
+    frame: Type
+    handle: Type
+    resume_trait: str
+}
+
+fn lower_generator_function(module: Module, function: FnDirective) -> Vec[Directive] {
+    let public_type = function.generator_type.unwrap_or(plain_type("Generator", vec![function.ret_type]))
+    let state_name = coroutine_future_name(function.name) + "__generator_state"
+    let state_type = plain_type(state_name, function.generics)
+    let frame = plain_type(state_name + "__frame", function.generics)
+    let handle = plain_type(state_name + "__handle", function.generics)
+    let mut resume_trait = "__GeneratorResume"
+    for directive in module.directives {
+        match directive {
+            Directive::Struct(item) => {
+                if item.name == public_type.name {
+                    match item.fields.get(0_usize) {
+                        Some(field_item) => {
+                            let name = field_item.typ.name
+                            if name.byte_len() > 4_usize && name.slice_bytes(0_usize, 4_usize) == "dyn " {
+                                resume_trait = name.slice_bytes(4_usize, name.byte_len() - 4_usize)
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let definitions = collect_definitions(function)
+    let machine = CoroutineBuild {
+        definitions, make_slots(definitions), collect_stack_values(function), analyze_await_liveness(function), state_type, function.ret_type,
+        plain_type("Option", vec![function.ret_type]), 0_usize
+    }
+    let mut build = GeneratorBuild { machine, public_type, frame, handle, resume_trait }
+    let mut out = Vec[Directive]::new()
+    out.push(make_start_struct(function, state_name))
+    let mut variants = vec![enum_variant("Start", Option[Type]::Some(plain_type(state_name + "__start", function.generics))), enum_variant("Running", Option[Type]::None), enum_variant("Done", Option[Type]::None)]
+    let mut index = 0_usize
+    for site in machine.sites {
+        let mut fields = Vec[Parameter]::new()
+        for value in site.values { fields.push(param(value.name, captured_value_type(machine, value))) }
+        let payload_name = state_name + "__resume_" + usize_text(index)
+        out.push(struct_directive(payload_name, function.generics, fields))
+        variants.push(enum_variant("Resume" + usize_text(index), Option[Type]::Some(plain_type(payload_name, function.generics))))
+        index += 1_usize
+    }
+    out.push(enum_directive(state_name, function.generics, variants))
+    out.push(struct_directive(frame.name, function.generics, vec![param("state", state_type)]))
+    out.push(struct_directive(handle.name, function.generics, vec![param("frame", heap_type(frame))]))
+    out.push(Directive::Function(generator_factory(function, build)))
+    let resume = fn_item("resume", Vec[Type]::new(), vec![param("self", handle)], machine.poll_type, generator_resume_blocks(function, build))
+    out.push(impl_directive(function.generics, resume_trait, vec![function.ret_type], handle, vec![resume]))
+    out.push(Directive::Function(generator_close_function(function, build)))
+    let token = plain_type("usize", Vec[Type]::new())
+    let unit = plain_type("void", Vec[Type]::new())
+    for name in vec!["encore_generator_enter", "encore_generator_leave"] {
+        out.push(Directive::Function(extern_fn_item(name, Vec[Type]::new(), vec![param("node", token)], unit)))
+    }
+    out.push(Directive::Function(extern_fn_item("encore_generator_register", Vec[Type]::new(), vec![param("node", token), param("close", token)], unit)))
+    ret out
+}
+
+fn generator_factory(function: FnDirective, build: GeneratorBuild) -> FnDirective {
+    let token_type = plain_type("usize", Vec[Type]::new())
+    let state_name = build.machine.future_type.name
+    let start_type = plain_type(state_name + "__start", function.generics)
+    let start = var("__gen_start", start_type)
+    let state = var("__gen_state", build.machine.future_type)
+    let frame = var("__gen_frame", heap_type(build.frame))
+    let handle = var("__gen_handle", build.handle)
+    let dynamic_type = plain_type("dyn " + build.resume_trait, vec![function.ret_type])
+    let dynamic = var("__gen_dynamic", dynamic_type)
+    let result = var("__gen_result", build.public_type)
+    let token = var("__gen_token", token_type)
+    let callback = var("__gen_close", token_type)
+    let mut instructions = Vec[Instruction]::new()
+    let mut arguments = Vec[Variable]::new()
+    for parameter in function.params {
+        let value = var(parameter.name, parameter.typ)
+        instructions.push(retain_value(value))
+        arguments.push(value)
+    }
+    instructions.push(lcsos(start, start_type, arguments))
+    instructions.push(lceos(state, enum_value(state_name, function.generics, "Start", Option[Variable]::Some(start))))
+    instructions.push(lcsos(frame, heap_type(build.frame), vec![state]))
+    instructions.push(pcast(token, frame, token_type))
+    instructions.push(call(callback, "__ehir_generator_close_address__" + build.frame.name + "__close", function.generics, Vec[Variable]::new(), false))
+    instructions.push(call(var("__gen_registered", plain_type("void", Vec[Type]::new())), "encore_generator_register", Vec[Type]::new(), vec![token, callback], true))
+    instructions.push(lcsos(handle, build.handle, vec![frame]))
+    instructions.push(pcast(dynamic, handle, dynamic_type))
+    instructions.push(lcsos(result, build.public_type, vec![dynamic]))
+    for parameter in function.params { instructions.push(drop_value(var(parameter.name, parameter.typ))) }
+    ret fn_item(function.name, function.generics, function.params, build.public_type, vec![block("entry", instructions, ret_term(result))])
+}
+
+fn generator_frame(build: GeneratorBuild) -> Variable {
+    ret var("__gen_frame", heap_type(build.frame))
+}
+fn generator_token() -> Variable {
+    ret var("__gen_token", plain_type("usize", Vec[Type]::new()))
+}
+fn generator_set_state(build: GeneratorBuild, instructions: mut Vec[Instruction], state: Variable) -> () {
+    instructions.push(setfield(generator_frame(build), field("0"), state))
+}
+fn generator_empty_state(build: GeneratorBuild, instructions: mut Vec[Instruction], variant: str, purpose: str) -> () {
+    let state = var(purpose, build.machine.future_type)
+    instructions.push(lceos(state, enum_value(build.machine.future_type.name, build.machine.future_type.generics, variant, Option[Variable]::None)))
+    generator_set_state(build, instructions, state)
+}
+
+fn generator_resume_blocks(function: FnDirective, build: mut GeneratorBuild) -> Vec[Block] {
+    let mut blocks = Vec[Block]::new()
+    let mut entry = Vec[Instruction]::new()
+    for value in build.machine.definitions { entry.push(salloc(slot_for(build.machine, value.name), value_type(value))) }
+    entry.push(getfield(generator_frame(build), var("self", build.handle), field("0")))
+    entry.push(pcast(generator_token(), generator_frame(build), generator_token().typ))
+    entry.push(call(var("__gen_entered", plain_type("void", Vec[Type]::new())), "encore_generator_enter", Vec[Type]::new(), vec![generator_token()], true))
+    let state = var("__gen_current", build.machine.future_type)
+    entry.push(getfield(state, generator_frame(build), field("0")))
+    entry.push(retain_value(state))
+    generator_empty_state(build, entry, "Running", "__gen_running")
+    // Remove the field's previous owner; the retained snapshot remains live.
+    entry.push(drop_value(state))
+    let mut arms = vec![match_arm("Start", Option[Variable]::None, "__gen_start"), match_arm("Done", Option[Variable]::None, "__gen_done")]
+    let mut index = 0_usize
+    for site in build.machine.sites {
+        arms.push(match_arm("Resume" + usize_text(index), Option[Variable]::None, "__gen_resume_" + usize_text(index)))
+        index += 1_usize
+    }
+    blocks.push(block("entry", entry, match_term(state, "__gen_invalid", arms)))
+    let start_type = plain_type(build.machine.future_type.name + "__start", function.generics)
+    let payload = var("__gen_start_payload", start_type)
+    let mut start = vec![getfield(payload, state, field("Start")), retain_value(payload)]
+    index = 0_usize
+    for parameter in function.params {
+        let value = build_fresh(build.machine, "generator_argument", parameter.typ)
+        start.push(getfield(value, payload, field(usize_text(index))))
+        start.push(retain_value(value))
+        store_coroutine_value(start, value, slot_for(build.machine, parameter.name))
+        index += 1_usize
+    }
+    start.push(drop_value(payload)) start.push(drop_value(state))
+    let first_label = match function.blocks.get(0_usize) { Some(first) => body_label(first.name, 0_usize) None => "__gen_done" }
+    blocks.push(block("__gen_start", start, br_term(first_label)))
+    index = 0_usize
+    for site in build.machine.sites {
+        let typ = plain_type(build.machine.future_type.name + "__resume_" + usize_text(index), function.generics)
+        let saved = build_fresh(build.machine, "generator_saved", typ)
+        let mut instructions = vec![getfield(saved, state, field("Resume" + usize_text(index))), retain_value(saved)]
+        let mut field_index = 0_usize
+        for value in site.values {
+            let loaded = build_fresh(build.machine, "generator_restore", captured_value_type(build.machine, value))
+            instructions.push(getfield(loaded, saved, field(usize_text(field_index))))
+            instructions.push(retain_value(loaded))
+            if is_stack_value(build.machine, value.name) {
+                let local = build_fresh(build.machine, "generator_local", value.typ)
+                instructions.push(salloc(local, captured_value_type(build.machine, value)))
+                store_coroutine_value(instructions, loaded, local)
+                store_coroutine_value(instructions, local, slot_for(build.machine, value.name))
+            } else {
+                store_coroutine_value(instructions, loaded, slot_for(build.machine, value.name))
+            }
+            field_index += 1_usize
+        }
+        instructions.push(drop_value(saved)) instructions.push(drop_value(state))
+        blocks.push(block("__gen_resume_" + usize_text(index), instructions, br_term(body_label(site.block, site_segment(build.machine, site) + 1_usize))))
+        index += 1_usize
+    }
+    for source in function.blocks {
+        let mut instructions = Vec[Instruction]::new()
+        let mut segment = 0_usize
+        let mut instruction_index = 0_usize
+        for instruction in source.instructions {
+            match instruction {
+                Instruction::Yield(item) => {
+                    let site_index = site_index_at(build.machine, source.name, instruction_index)
+                    match build.machine.sites.get(site_index) {
+                        Some(site) => {
+                            let value = read_value(build.machine, instructions, item.value, "generator_yield")
+                            let mut captures = Vec[Variable]::new()
+                            for live in site.values {
+                                let loaded = read_value(build.machine, instructions, live, "generator_capture")
+                                if is_stack_value(build.machine, live.name) {
+                                    let pointee = build_fresh(build.machine, "generator_pointee", captured_value_type(build.machine, live))
+                                    instructions.push(load(pointee, loaded)) captures.push(pointee)
+                                } else { captures.push(loaded) }
+                            }
+                            let payload_type = plain_type(build.machine.future_type.name + "__resume_" + usize_text(site_index), function.generics)
+                            let saved = build_fresh(build.machine, "generator_capture_state", payload_type)
+                            instructions.push(lcsos(saved, payload_type, captures))
+                            let next = build_fresh(build.machine, "generator_next", build.machine.future_type)
+                            instructions.push(lceos(next, enum_value(build.machine.future_type.name, function.generics, "Resume" + usize_text(site_index), Option[Variable]::Some(saved))))
+                            generator_set_state(build, instructions, next)
+                            let result = build_fresh(build.machine, "generator_some", build.machine.poll_type)
+                            instructions.push(lceos(result, enum_value("Option", vec![function.ret_type], "Some", Option[Variable]::Some(value))))
+                            generator_leave(build, instructions)
+                            blocks.push(block(body_label(source.name, segment), instructions, ret_term(result)))
+                        }
+                        None => {}
+                    }
+                    instructions = Vec[Instruction]::new() segment += 1_usize
+                }
+                _ => { instructions.extend(normalize_instruction(build.machine, instruction)) }
+            }
+            instruction_index += 1_usize
+        }
+        let terminator = match source.terminator {
+            Terminator::Ret(_) => {
+                generator_empty_state(build, instructions, "Done", "__gen_completed_" + source.name)
+                let result = build_fresh(build.machine, "generator_none", build.machine.poll_type)
+                instructions.push(lceos(result, enum_value("Option", vec![function.ret_type], "None", Option[Variable]::None)))
+                generator_leave(build, instructions)
+                ret_term(result)
+            }
+            _ => { normalize_terminator(build.machine, instructions, source.name, source.terminator, build.machine.future_type.name) }
+        }
+        blocks.push(block(body_label(source.name, segment), instructions, terminator))
+    }
+    blocks.extend(make_edge_blocks(function, build.machine))
+    let mut done = vec![drop_value(state)]
+    generator_empty_state(build, done, "Done", "__gen_still_done")
+    let none = var("__gen_exhausted", build.machine.poll_type)
+    done.push(lceos(none, enum_value("Option", vec![function.ret_type], "None", Option[Variable]::None)))
+    generator_leave(build, done)
+    blocks.push(block("__gen_done", done, ret_term(none)))
+    blocks.push(block("__gen_invalid", Vec[Instruction]::new(), unreachable_term()))
+    ret blocks
+}
+
+fn generator_leave(build: GeneratorBuild, instructions: mut Vec[Instruction]) -> () {
+    instructions.push(call(var("__gen_left_" + usize_text(instructions.len()), plain_type("void", Vec[Type]::new())), "encore_generator_leave", Vec[Type]::new(), vec![generator_token()], true))
+    instructions.push(drop_value(var("self", build.handle)))
+}
+
+fn generator_close_function(function: FnDirective, build: mut GeneratorBuild) -> FnDirective {
+    let state = var("__gen_closing_state", build.machine.future_type)
+    let token = generator_token()
+    let mut entry = vec![pcast(generator_frame(build), token, heap_type(build.frame)), getfield(state, generator_frame(build), field("0")), retain_value(state)]
+    generator_empty_state(build, entry, "Done", "__gen_closed")
+    entry.push(drop_value(state))
+    let mut arms = Vec[MatchArm]::new()
+    let mut blocks = Vec[Block]::new()
+    let mut index = 0_usize
+    for site in build.machine.sites {
+        let label = "__gen_close_" + usize_text(index)
+        arms.push(match_arm("Resume" + usize_text(index), Option[Variable]::None, label))
+        let payload_type = plain_type(build.machine.future_type.name + "__resume_" + usize_text(index), function.generics)
+        let payload = build_fresh(build.machine, "generator_close_payload", payload_type)
+        let mut instructions = vec![getfield(payload, state, field("Resume" + usize_text(index))), retain_value(payload)]
+        let yield_item = generator_yield_at(function, site)
+        for cleanup in yield_item.cleanups {
+            let mut arguments = Vec[Variable]::new()
+            for argument in cleanup.args {
+                let mut field_index = 0_usize
+                for captured in site.values {
+                    if captured.name == argument.name {
+                        let value = build_fresh(build.machine, "generator_close_resource", captured_value_type(build.machine, captured))
+                        instructions.push(getfield(value, payload, field(usize_text(field_index))))
+                        instructions.push(retain_value(value)) arguments.push(value)
+                        break
+                    }
+                    field_index += 1_usize
+                }
+            }
+            instructions.push(call(build_fresh(build.machine, "generator_exit", cleanup.out.typ), cleanup.name, cleanup.generics, arguments, cleanup.is_unsafe))
+        }
+        instructions.push(drop_value(payload)) instructions.push(drop_value(state))
+        blocks.push(block(label, instructions, ret_term(var("void", plain_type("void", Vec[Type]::new())))))
+        index += 1_usize
+    }
+    let mut all = vec![block("entry", entry, match_term(state, "__gen_close_other", arms))]
+    all.extend(blocks)
+    all.push(block("__gen_close_other", vec![drop_value(state)], ret_term(var("void", plain_type("void", Vec[Type]::new())))))
+    ret fn_item(build.frame.name + "__close", function.generics, vec![param(token.name, token.typ)], plain_type("void", Vec[Type]::new()), all)
+}
+
+fn generator_yield_at(function: FnDirective, site: AwaitLiveness) -> YieldInstruction {
+    match find_block(function.blocks, site.block) {
+        Some(source) => {
+            match source.instructions.get(site.instruction) {
+                Some(instruction) => {
+                    match instruction { Instruction::Yield(item) => { ret item } _ => {} }
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    ret YieldInstruction { site.future, Vec[CallInstruction]::new() }
 }
