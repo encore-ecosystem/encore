@@ -1,3 +1,5 @@
+import refrain::frontend::parser::statements::NamedArgumentExpr
+import refrain::frontend::parser::statements::{CallParameter, ParameterDefault}
 //! Parses Encore tokens into the compiler syntax tree.
 
 import core::fmt::Debug
@@ -120,6 +122,15 @@ fn inferred_static_initializer_type(expression: ExprNode) -> Option[str] {
                 _ => {
                 }
             }
+        }
+        Expr::NamedArgument(__named_argument) => {
+            let inner = __named_argument.value
+
+            ret inferred_static_initializer_type(ExprNode {
+                    inner.value, inner.line, inner.column,
+                    inner.length, inner.source_name
+                }
+                ,)
         }
         Expr::Parenthesized(inner) => {
             ret inferred_static_initializer_type(ExprNode {
@@ -1069,6 +1080,15 @@ impl for Parser {
             }
         }
         self.safe_consume(TokenType::RIGHT_PAREN)?
+        let mut optional = false
+        for parameter in params {
+            if parameter.default_value.is_some() {
+                if parameter.name == "self" { self.error_at("default-self: self cannot have a default", signature_token)? }
+                optional = true
+            } elif optional {
+                self.error_at("required-after-default: required parameters must precede defaults", signature_token)?
+            }
+        }
 
         let mut ret_type = Option[str]::None
         let mut returns_sending = false
@@ -2412,6 +2432,16 @@ impl for Parser {
             ,)
     }
 
+    fn parse_call_argument(mut self) -> Result[ExprNode, ParseFailure] {
+        let token = self.peek_curr()
+        if token.type == TokenType::IDENTIFIER && self.peek_next_type() == TokenType::COLON {
+            self.consume() self.consume()
+            let value = self.parse_delimited_expression()?
+            ret Result::Ok(self.mk_expr_at(Expr::NamedArgument(NamedArgumentExpr { token.value, self.box_expr(value) }), token))
+        }
+        ret self.parse_delimited_expression()
+    }
+
     fn parse_call_args(mut self) -> Result[Vec[ExprNode], ParseFailure] {
         let mut args = Vec[ExprNode]::new()
         self.safe_consume(TokenType::LEFT_PAREN)?
@@ -2419,7 +2449,7 @@ impl for Parser {
             if self.peek_curr_type() == TokenType::RIGHT_PAREN {
                 break
             }
-            match self.parse_delimited_expression() {
+            match self.parse_call_argument() {
                 Result[ExprNode, ParseFailure]::Ok(argument) => {
                     args.push(argument)
                 }
@@ -2656,7 +2686,7 @@ impl for Parser {
                     typ = Option[str]::Some(self.parse_type()?)
                 }
                 params.push(FunctionParam {
-                        name, typ, false, false, name_token.line, name_token.column
+                        name, typ, false, false, name_token.line, name_token.column, Option[ParameterDefault]::None
                     }
                     ,
                 )
@@ -3093,13 +3123,48 @@ impl for Parser {
     }
 
     fn parse_param(mut self) -> Result[FunctionParam, ParseFailure] {
+        let value = self.parse_parameter_without_default()?
+        let default = if self.peek_curr_type() == TokenType::ASSIGN {
+            self.consume()
+            Option[ParameterDefault]::Some(self.parse_parameter_default()?)
+        } else { Option[ParameterDefault]::None }
+        ret Result::Ok(FunctionParam { value.name, value.typ, value.is_sending, value.is_frozen, value.line, value.column, default })
+    }
+
+    fn parse_parameter_default(mut self) -> Result[ParameterDefault, ParseFailure] {
+        let mut sign = ""
+        if self.peek_curr_type() == TokenType::MINUS { sign = "-" self.consume() }
+        let token = self.consume()
+        let value = match token.type {
+            TokenType::INTEGER => { ParameterDefault::Integer(sign + token.value) }
+            TokenType::FLOAT => { ParameterDefault::Float(sign + token.value) }
+            TokenType::BOOLEAN => {
+                if sign != "" { self.error_at("default-literal-required: expected a numeric literal", token)? }
+                ParameterDefault::Boolean(token.value == "true")
+            }
+            TokenType::STRING => {
+                if sign != "" { self.error_at("default-literal-required: expected a numeric literal", token)? }
+                ParameterDefault::String(token.value)
+            }
+            _ => {
+                self.error_at("default-literal-required: defaults must be number, bool or str literals", token)?
+                ParameterDefault::Boolean(false)
+            }
+        }
+        if self.peek_curr_type() != TokenType::COMMA && self.peek_curr_type() != TokenType::RIGHT_PAREN {
+            self.error_at("default-literal-required: expressions are not supported as defaults", self.peek_curr())?
+        }
+        ret Result::Ok(value)
+    }
+
+    fn parse_parameter_without_default(mut self) -> Result[FunctionParam, ParseFailure] {
         if self.peek_curr_type() == TokenType::KW_MUT {
             self.consume()
             let token = self.safe_consume(TokenType::IDENTIFIER)?
             if token.value != "self" {
                 self.error_at("Only `self` may use prefix `mut` before the parameter name", token)?
                 ret Result[FunctionParam, ParseFailure]::Ok(FunctionParam {
-                        "", Option[str]::None, false, false, token.line, token.column
+                        "", Option[str]::None, false, false, token.line, token.column, Option[ParameterDefault]::None
                     }
                     ,)
             }
@@ -3109,12 +3174,12 @@ impl for Parser {
                 let mut typ = "mut "
                 typ = typ + parsed_type
                 ret Result[FunctionParam, ParseFailure]::Ok(FunctionParam {
-                        "self", Option[str]::Some(typ), false, false, token.line, token.column
+                        "self", Option[str]::Some(typ), false, false, token.line, token.column, Option[ParameterDefault]::None
                     }
                     ,)
             }
             ret Result[FunctionParam, ParseFailure]::Ok(FunctionParam {
-                    "self", Option[str]::Some("mut Self"), false, false, token.line, token.column
+                    "self", Option[str]::Some("mut Self"), false, false, token.line, token.column, Option[ParameterDefault]::None
                 }
                 ,)
         }
@@ -3134,12 +3199,12 @@ impl for Parser {
                     is_frozen = true
                 }
                 ret Result[FunctionParam, ParseFailure]::Ok(FunctionParam {
-                        "self", Option[str]::Some(self.parse_type()?), is_sending, is_frozen, token.line, token.column
+                        "self", Option[str]::Some(self.parse_type()?), is_sending, is_frozen, token.line, token.column, Option[ParameterDefault]::None
                     }
                     ,)
             }
             ret Result[FunctionParam, ParseFailure]::Ok(FunctionParam {
-                    "self", Option[str]::Some("Self"), false, false, token.line, token.column
+                    "self", Option[str]::Some("Self"), false, false, token.line, token.column, Option[ParameterDefault]::None
                 }
                 ,)
         }
@@ -3159,7 +3224,7 @@ impl for Parser {
         }
         let typ = self.parse_type()?
         ret Result[FunctionParam, ParseFailure]::Ok(FunctionParam {
-                name, Option[str]::Some(typ), is_sending, is_frozen, name_token.line, name_token.column
+                name, Option[str]::Some(typ), is_sending, is_frozen, name_token.line, name_token.column, Option[ParameterDefault]::None
             }
             ,)
     }
@@ -3520,7 +3585,7 @@ fn plugin_qualified_type_parser_contract() -> bool {
             match statement {
                 Statement::Function(item) => {
                     ret item.ret_type.unwrap_or("") == "api::Report" && item.params.get(0).unwrap_or(FunctionParam {
-                            "", Option[str]::None, false, false, 0, 0
+                            "", Option[str]::None, false, false, 0, 0, Option[ParameterDefault]::None
                         }
                     ).typ.unwrap_or("") == "platform::plugin::Resource[dyn api::Counter]"
                 }

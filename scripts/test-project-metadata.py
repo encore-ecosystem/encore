@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check manifest-derived release identity and bootstrap compatibility."""
 
+import json
 import importlib.util
 from pathlib import Path
 import subprocess
@@ -66,6 +67,21 @@ class ProjectMetadataTests(unittest.TestCase):
                 module.check_seed(tag)
         for tag in ("v0.1.9-neumann", "v0.1.10-neumann", "v0.2.0-neumann", "v1.0.0"):
             module.check_seed(tag)
+
+    def test_release_specific_bootstrap_floor(self):
+        (self.root / "scripts").mkdir()
+        policy = self.root / "scripts/bootstrap-compatibility.json"
+        for version, rejected, accepted in (
+            ("0.1.14", "v0.1.13-neumann", "v0.1.14-neumann"),
+            ("0.1.15", "v0.1.14-neumann", "v0.1.15-neumann"),
+        ):
+            policy.write_text(json.dumps({"schema": 1, "minimum_seed": version}))
+            with self.assertRaisesRegex(ValueError, version):
+                module.check_seed(rejected, self.root)
+            module.check_seed(accepted, self.root)
+        policy.write_text('{"schema": 2, "minimum_seed": "0.1.15"}')
+        with self.assertRaisesRegex(ValueError, "schema"):
+            module.check_seed("v0.1.15-neumann", self.root)
 
     def test_cli_handles_paths_with_spaces(self):
         result = subprocess.run([sys.executable, str(HELPER), "--root", str(self.root),
