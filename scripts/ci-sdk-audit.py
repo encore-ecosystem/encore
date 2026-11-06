@@ -73,6 +73,7 @@ if formatted:
     failures.append("source formatting")
     print("Formatter changes:", formatted, flush=True)
 run("profile-native", ["python3", "scripts/test-profile-runtime.py"])
+run("hash-capacity", ["python3", "scripts/test-hash-capacity.py", "--compiler", str(compiler)])
 for package in ("json", "toml", "argparse", "binary", "log", "rich", "profile"):
     run("package-" + package, [str(compiler), "test", "--jobs", "2", "--report", "target/test-report.json"], root / "packages" / package)
 run("core-hash", [str(compiler), "test", "--jobs", "2", "--filter", "hash_collections"], root / "packages/core")
