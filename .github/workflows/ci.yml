@@ -16,6 +16,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       SOURCE_RUN: '42261156770'
       SOURCE_SHA: 51e5b5b39d1727c7405da2d9cd4bf0a0e953b866
+      CANDIDATE_JSON: b836df172ece40f493361f466a3c05086361284c
     steps:
       - uses: actions/checkout@v6
         with:
@@ -32,7 +33,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" --jq .head_sha)" = "$SOURCE_SHA"
-          git diff --exit-code "$SOURCE_SHA" HEAD -- . ':!.github/workflows/ci.yml' ':!scripts/sdk-toml-interop-probe.py'
+          git diff --exit-code "$SOURCE_SHA" HEAD -- . ':!packages/json' ':!.github/workflows/ci.yml' ':!scripts/sdk-toml-interop-probe.py'
           context=target/toml-probe-context
           gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" \
             --name test-context-x86_64-unknown-linux-gnu --dir "$context"
@@ -43,7 +44,38 @@ jobs:
           source_commit=$(jq -r .commit "$context/provenance.json")
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$source_commit" --jq .tree.sha)" = "$(git rev-parse "$SOURCE_SHA^{tree}")"
           test "$(sha256sum "$context/bin/encore" | awk '{print $1}')" = "$(jq -r .compiler_sha256 "$context/provenance.json")"
-          python3 scripts/sdk_packages.py verify-provenance "$context/provenance.json"
+          mkdir -p target/toml-interop-probe
+          python3 scripts/sdk_packages.py --ref "$SOURCE_SHA" manifest \
+            --output target/toml-interop-probe/baseline-SDK.json
+          python3 scripts/sdk_packages.py manifest --verify-checkout \
+            --output target/toml-interop-probe/candidate-SDK.json
+          python3 - <<'PY'
+          from copy import deepcopy
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, "scripts")
+          from sdk_packages import manifest_digest
+          output = Path("target/toml-interop-probe")
+          baseline = json.loads((output / "baseline-SDK.json").read_bytes())
+          candidate = json.loads((output / "candidate-SDK.json").read_bytes())
+          provenance = json.loads(Path("target/toml-probe-context/provenance.json").read_bytes())
+          if provenance.get("sdk_packages") != baseline["packages"] or provenance.get("sdk_sha256") != manifest_digest(baseline):
+              raise SystemExit("trusted compiler provenance differs from the parent SDK")
+          expected = deepcopy(baseline)
+          row = next(package for package in expected["packages"] if package["path"] == "packages/json")
+          row["commit"] = os.environ["CANDIDATE_JSON"]
+          if candidate != expected:
+              raise SystemExit("candidate SDK must differ only at the exact JSON candidate pin")
+          identity = dict(source_run=os.environ["SOURCE_RUN"], source_sha=os.environ["SOURCE_SHA"],
+                          compiler_sha256=provenance["compiler_sha256"],
+                          baseline_sdk_sha256=manifest_digest(baseline),
+                          candidate_sdk_sha256=manifest_digest(candidate),
+                          candidate_json=os.environ["CANDIDATE_JSON"])
+          (output / "input-identity.json").write_text(json.dumps(identity, indent=2) + "\n")
+          print(json.dumps(identity, indent=2))
+          PY
           chmod +x "$context/bin/encore"
       - name: Probe foreign TOML, JSON and binary codecs
         run: python3 scripts/sdk-toml-interop-probe.py --compiler target/toml-probe-context/bin/encore
