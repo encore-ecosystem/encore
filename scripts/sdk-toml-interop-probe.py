@@ -2,16 +2,25 @@
 """Probe foreign-model codec interop using a verified native CI compiler."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FORMAT_FILES = (
+    "src/frontend/translator/mod.enq",
+    "tests/module_function_identity.enq",
+    "tests/fixtures/reflection_codecs/model/src/lib.enq",
+    "tests/fixtures/reflection_codecs/app/src/main.enq",
+    "packages/json/src/lib.enq",
+)
 MODEL = '''import core::option::Option
 import core::vec::Vec
 pub struct Config {
@@ -90,11 +99,53 @@ def app_source():
     return source + "    ret 99\n}\n"
 
 
+def format_inputs(compiler):
+    output = ROOT / "target/probe"
+    output.mkdir(parents=True, exist_ok=True)
+    records = []
+    failures = []
+    for relative in FORMAT_FILES:
+        path = ROOT / relative
+        before = path.read_bytes()
+        try:
+            result = subprocess.run([str(compiler), "format", str(path)], cwd=ROOT,
+                                    text=True, capture_output=True, timeout=300)
+            code, stdout, stderr = result.returncode, result.stdout, result.stderr
+        except subprocess.TimeoutExpired:
+            code, stdout, stderr = None, "", "formatter timed out after 300s"
+        after = path.read_bytes()
+        item = dict(path=relative, returncode=code, stdout=stdout, stderr=stderr,
+                    changed=before != after, before_sha256=hashlib.sha256(before).hexdigest(),
+                    after_sha256=hashlib.sha256(after).hexdigest())
+        records.append(item)
+        if code != 0:
+            failures.append(relative)
+        print(json.dumps(item), flush=True)
+    changed = [item["path"] for item in records if item["changed"]]
+    (output / "format-records.json").write_text(json.dumps(records, indent=2) + "\n")
+    (output / "formatted-files.json").write_text(json.dumps(changed, indent=2) + "\n")
+    with tarfile.open(output / "formatted-sources.tar.gz", "w:gz") as archive:
+        for relative in changed:
+            archive.add(ROOT / relative, arcname=relative)
+    identity = dict(description="Candidate inputs after the explicitly recorded formatter edits",
+                    all_inputs_match_candidate_commit=not changed,
+                    sdk_checkout_matches_pins=not any(path.startswith("packages/") for path in changed),
+                    formatted_files=records)
+    (output / "formatted-input-identity.json").write_text(json.dumps(identity, indent=2) + "\n")
+    print(json.dumps(identity, indent=2), flush=True)
+    if failures:
+        raise SystemExit("candidate formatter failures: " + ", ".join(failures))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
+    parser.add_argument("--format-candidates", action="store_true")
     args = parser.parse_args()
     compiler = args.compiler.resolve()
+    if args.format_candidates:
+        format_inputs(compiler)
+        return
     output = ROOT / "target/toml-interop-probe"
     output.mkdir(parents=True, exist_ok=True)
     records = []
@@ -161,7 +212,6 @@ def main():
                     record(name + "-backtrace", [debugger, "--batch", "-ex", "set pagination off",
                            "-ex", "run", "-ex", "thread apply all bt full", "-ex", "info registers",
                            "-ex", "x/16i $pc-32", "--args", str(binary), name], app, environment, 90)
-                shutil.copy2(binary, output / "toml_interop")
         if failures:
             raise SystemExit("foreign codec runtime failures: " + ", ".join(failures))
     print("foreign Config passed all six TOML/JSON/binary codec APIs", flush=True)

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tarfile
 import json
+import uuid
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed-tag", required=True)
@@ -26,8 +27,8 @@ compiler = next((output / "seed").glob("*/bin/encore"))
 compiler.chmod(0o755)
 environment = dict(os.environ, ENCORE_CORE_DIR=str(root / "packages/core"), ENCORE_INDEX_URL="http://127.0.0.1:9/index")
 failures = []
-def run(name, command, cwd=root):
-    result = subprocess.run(command, cwd=cwd, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+def run(name, command, cwd=root, extra_environment=None):
+    result = subprocess.run(command, cwd=cwd, env=environment | (extra_environment or {}), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     (output / (name + ".log")).write_text(result.stdout)
     if result.returncode:
         failures.append(name)
@@ -40,6 +41,15 @@ def run(name, command, cwd=root):
 
 def git(*arguments, cwd=root):
     return subprocess.check_output(["git", *arguments], cwd=cwd, text=True).splitlines()
+
+# Fail on native bridge/header conflicts before running the SDK suites. Use the
+# full compiler suite's disposable layout without invoking any Encore tests.
+if run("compiler-native-runtime", ["bash", "scripts/ci-test.sh", str(compiler)], extra_environment={
+        "CI_TEST_RUN_ID": "sdk-native-" + uuid.uuid4().hex,
+        "CI_TEST_NATIVE_RUNTIME_ONLY": "1",
+}):
+    (output / "result.json").write_text(json.dumps({"failed": failures, "formatted": []}, indent=2) + "\n")
+    raise SystemExit(1)
 
 # A PR checkout points at GitHub's synthetic merge commit. Use its real source
 # head so the previous gitlinks describe exactly the last submitted SDK change.

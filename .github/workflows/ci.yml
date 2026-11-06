@@ -17,6 +17,10 @@ jobs:
       SOURCE_RUN: '42261156770'
       SOURCE_SHA: 51e5b5b39d1727c7405da2d9cd4bf0a0e953b866
       CANDIDATE_JSON: b836df172ece40f493361f466a3c05086361284c
+      CANDIDATE_PLATFORM: a2618097fb32e49712ec9c6f14f710b2f8dcb17e
+      ENCORE_CORE_DIR: ${{ github.workspace }}/packages/core
+      ENCORE_INDEX_URL: http://127.0.0.1:9/index
+      ENCORE_REGISTRY_CACHE: ${{ github.workspace }}/target/probe/registry
     steps:
       - uses: actions/checkout@v6
         with:
@@ -29,11 +33,16 @@ jobs:
       - name: Prepare Linux toolchain
         run: bash scripts/ci-prepare-toolchain.sh x86_64-unknown-linux-gnu
       - name: Restore exact trusted stage3 and verify SDK provenance
+        id: inputs
         shell: bash
         run: |
           set -euo pipefail
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" --jq .head_sha)" = "$SOURCE_SHA"
-          git diff --exit-code "$SOURCE_SHA" HEAD -- . ':!packages/json' ':!.github/workflows/ci.yml' ':!scripts/sdk-toml-interop-probe.py'
+          git diff --exit-code "$SOURCE_SHA" HEAD -- . \
+            ':!packages/json' ':!packages/platform' ':!.github/workflows/ci.yml' ':!scripts/sdk-toml-interop-probe.py' \
+            ':!src/frontend/translator/mod.enq' ':!tests/module_function_identity.enq' \
+            ':!tests/fixtures/reflection_codecs/model/src/lib.enq' ':!tests/fixtures/reflection_codecs/app/src/main.enq' \
+            ':!tests/fixtures/reflection_codecs/app/encore.toml' ':!scripts/ci-test.sh' ':!scripts/ci-sdk-audit.py'
           context=target/toml-probe-context
           gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" \
             --name test-context-x86_64-unknown-linux-gnu --dir "$context"
@@ -51,6 +60,7 @@ jobs:
             --output target/toml-interop-probe/candidate-SDK.json
           python3 - <<'PY'
           from copy import deepcopy
+          import hashlib
           import json
           import os
           from pathlib import Path
@@ -64,21 +74,62 @@ jobs:
           if provenance.get("sdk_packages") != baseline["packages"] or provenance.get("sdk_sha256") != manifest_digest(baseline):
               raise SystemExit("trusted compiler provenance differs from the parent SDK")
           expected = deepcopy(baseline)
-          row = next(package for package in expected["packages"] if package["path"] == "packages/json")
-          row["commit"] = os.environ["CANDIDATE_JSON"]
+          pins = {"packages/json": os.environ["CANDIDATE_JSON"], "packages/platform": os.environ["CANDIDATE_PLATFORM"]}
+          for package in expected["packages"]:
+              if package["path"] in pins:
+                  package["commit"] = pins[package["path"]]
           if candidate != expected:
-              raise SystemExit("candidate SDK must differ only at the exact JSON candidate pin")
+              raise SystemExit("candidate SDK must differ only at the exact JSON/platform candidate pins")
+          source_files = ("src/frontend/translator/mod.enq", "tests/module_function_identity.enq",
+                          "tests/fixtures/reflection_codecs/model/src/lib.enq",
+                          "tests/fixtures/reflection_codecs/app/src/main.enq",
+                          "tests/fixtures/reflection_codecs/app/encore.toml", "scripts/ci-test.sh", "scripts/ci-sdk-audit.py")
           identity = dict(source_run=os.environ["SOURCE_RUN"], source_sha=os.environ["SOURCE_SHA"],
+                          candidate_commit=os.environ["GITHUB_SHA"],
                           compiler_sha256=provenance["compiler_sha256"],
                           baseline_sdk_sha256=manifest_digest(baseline),
                           candidate_sdk_sha256=manifest_digest(candidate),
-                          candidate_json=os.environ["CANDIDATE_JSON"])
+                          candidate_pins=pins,
+                          raw_source_sha256={path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in source_files})
           (output / "input-identity.json").write_text(json.dumps(identity, indent=2) + "\n")
           print(json.dumps(identity, indent=2))
           PY
           chmod +x "$context/bin/encore"
+      - name: Format candidate Encore sources and record every change
+        id: formatter
+        run: python3 scripts/sdk-toml-interop-probe.py --compiler target/toml-probe-context/bin/encore --format-candidates
+      - name: Check copied native compiler runtime syntax
+        if: ${{ !cancelled() && steps.inputs.outcome == 'success' && steps.formatter.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CI_TEST_RUN_ID=probe-native CI_TEST_NATIVE_RUNTIME_ONLY=1 \
+            bash scripts/ci-test.sh "$PWD/target/toml-probe-context/bin/encore" 2>&1 | tee target/probe/native-runtime.log
+      - name: Test candidate translator module function identities
+        if: ${{ !cancelled() && steps.inputs.outcome == 'success' && steps.formatter.outcome == 'success' }}
+        shell: bash
+        env:
+          ENCORE_BUILD_CACHE: ${{ github.workspace }}/target/probe/unit-cache
+        run: |
+          set -euo pipefail
+          target/toml-probe-context/bin/encore test --jobs 2 --filter module_function_identity \
+            --report target/probe/module-function-report.json 2>&1 | tee target/probe/module-functions.log
+      - name: Check expanded foreign codec fixture cold warm and invalidation
+        if: ${{ !cancelled() && steps.inputs.outcome == 'success' && steps.formatter.outcome == 'success' }}
+        shell: bash
+        env:
+          ENCORE_BUILD_CACHE: ${{ github.workspace }}/target/probe/fixture-cache
+        run: |
+          set -euo pipefail
+          python3 tests/fixtures/reflection_codecs/check.py "$PWD/target/toml-probe-context/bin/encore" \
+            2>&1 | tee target/probe/expanded-codecs.log
       - name: Probe foreign TOML, JSON and binary codecs
-        run: python3 scripts/sdk-toml-interop-probe.py --compiler target/toml-probe-context/bin/encore
+        if: ${{ !cancelled() && steps.inputs.outcome == 'success' && steps.formatter.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/sdk-toml-interop-probe.py --compiler target/toml-probe-context/bin/encore \
+            2>&1 | tee target/probe/six-api-codecs.log
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -86,5 +137,9 @@ jobs:
           path: |
             target/toml-interop-probe/**
             target/toml-probe-context/provenance.json
+            target/probe/*.json
+            target/probe/*.log
+            target/probe/formatted-sources.tar.gz
+            target/tests/module_function_identity*.output.txt
           if-no-files-found: warn
           retention-days: 7

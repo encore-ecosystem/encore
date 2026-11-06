@@ -1,3 +1,5 @@
+import ehirlib::{Directive, Instruction, Module, RepresentationKind, parse_module_text}
+
 import refrain::frontend::lexer::Lexer
 import refrain::frontend::parser::Parser
 import refrain::frontend::translator::{
@@ -5,6 +7,7 @@ import refrain::frontend::translator::{
     translate_modules_to_ehir_bundle_typed
 }
 import refrain::target::host_target
+import std::io::eprintln
 
 fn main() -> u32 {
     let mut lexer_a = Lexer::new()
@@ -12,6 +15,8 @@ fn main() -> u32 {
     let ast_a = parser_a.parse(lexer_a.tokenize(
             "fn label() -> u32 { ret 11_u32 }\n" +
             "pub fn collision() -> u32 { ret 33_u32 }\n" +
+            "pub fn helper(value: u32) -> u32 { ret value }\n" +
+            "pub fn reverse_helper(value: mut u32) -> () { value += 1_u32 ret () }\n" +
             "struct Bucket[T] { value: T }\n" +
             "struct Vec[T] { value: T }\n" +
             "fn number(value: f32, next: usize, valid: bool) -> f32 { ret value }\n" +
@@ -23,11 +28,17 @@ fn main() -> u32 {
     let ast_b = parser_b.parse(lexer_b.tokenize(
             "import alpha::{collision}\nimport gamma::{append}\n" +
             "fn label() -> u32 { ret 22_u32 }\nfn number(value: str) -> str { ret value }\n" +
+            "fn helper(value: mut u32) -> () { value += 1_u32 ret () }\n" +
+            "fn reverse_helper(value: u32) -> u32 { ret value }\n" +
+            "fn mutable_helper_call() -> u32 { let mut value = 1_u32 helper(value) ret value }\n" +
+            "fn value_helper_call() -> u32 { let mut value = 1_u32 ret reverse_helper(value) }\n" +
             "fn beta_value(values: Vec[u32]) -> u32 { let value = number(\"ok\") let combined = append(values, values) let selected = collision() ret label() }"))
     let mut lexer_c = Lexer::new()
     let mut parser_c = Parser::new_for_source("gamma.enq")
     let ast_c = parser_c.parse(lexer_c.tokenize(
             "pub fn collision() -> u32 { ret 44_u32 }\n" +
+            "pub fn helper(value: mut u32) -> () { value += 1_u32 ret () }\n" +
+            "pub fn reverse_helper(value: u32) -> u32 { ret value }\n" +
             "fn append[T](left: Vec[T], right: Vec[T]) -> Vec[T] { ret right }"))
 
     let mut alpha_imports = Vec[str]::new()
@@ -71,6 +82,17 @@ fn main() -> u32 {
     output.contains("call " + gamma + "collision(") {
         ret 14_u32
     }
+    // Callee selection and argument hints must agree on the local helper,
+    // including when a visible sibling takes the same value with another ABI.
+    let argument_module = parse_module_text("function-argument-abi", output)
+    if !helper_call_has_abi(argument_module, beta + "mutable_helper_call", beta + "helper", true) {
+        eprintln(output)
+        ret 18_u32
+    }
+    if !helper_call_has_abi(argument_module, beta + "value_helper_call", beta + "reverse_helper", false) {
+        eprintln(output)
+        ret 19_u32
+    }
     let bundle = translate_modules_to_ehir_bundle(modules, host_target(), "beta")
     if !bundle.contains("entry beta") {
         ret 11_u32
@@ -82,15 +104,26 @@ fn main() -> u32 {
         ret 13_u32
     }
     let mut reordered = Vec[TranslationModule]::new()
-    reordered.push(TranslationModule::new("gamma", "gamma.enq", gamma_imports, ast_c, Vec[str]::new()))
-    reordered.push(TranslationModule::new("alpha", "alpha.enq", alpha_imports, ast_a, Vec[str]::new()))
+    // Both conflicting foreign hints precede the local candidate in the
+    // function-name chain, so lower-priority ambiguity must remain provisional.
     reordered.push(TranslationModule::new("beta", "beta.enq", beta_imports, ast_b, Vec[str]::new()))
+    reordered.push(TranslationModule::new("alpha", "alpha.enq", alpha_imports, ast_a, Vec[str]::new()))
+    reordered.push(TranslationModule::new("gamma", "gamma.enq", gamma_imports, ast_c, Vec[str]::new()))
     let reordered_output = translate_modules_to_ehir(reordered, host_target())
     if !reordered_output.contains("fn " + alpha + "label() -> u32") {
         ret 9_u32
     }
     if !reordered_output.contains("fn " + beta + "label() -> u32") {
         ret 10_u32
+    }
+    let reordered_arguments = parse_module_text("reordered-function-argument-abi", reordered_output)
+    if !helper_call_has_abi(reordered_arguments, beta + "mutable_helper_call", beta + "helper", true) {
+        eprintln(reordered_output)
+        ret 20_u32
+    }
+    if !helper_call_has_abi(reordered_arguments, beta + "value_helper_call", beta + "reverse_helper", false) {
+        eprintln(reordered_output)
+        ret 21_u32
     }
     let mut typed_lexer = Lexer::new()
     let mut typed_parser = Parser::new_for_source("typed.enq")
@@ -121,4 +154,40 @@ fn main() -> u32 {
     }
     if windows_output.contains("__encore_m443a") { ret 17_u32 }
     ret 0_u32
+}
+
+fn helper_call_has_abi(module: Module, caller: str, callee: str, expects_pointer: bool) -> bool {
+    for declaration in module.directives {
+        match declaration {
+            Directive::Function(function) => {
+                if function.name != caller {
+                    continue
+                }
+                for block in function.blocks {
+                    for instruction in block.instructions {
+                        match instruction {
+                            Instruction::Call(call) => {
+                                if call.name == callee && call.args.len() == 1_usize {
+                                    let argument = call.args.get_unchecked_borrowed(0_usize)
+                                    if argument.typ.name != "u32" {
+                                        ret false
+                                    }
+                                    ret match argument.typ.representation {
+                                        RepresentationKind::Raw => expects_pointer
+                                        RepresentationKind::Inline => !expects_pointer
+                                        _ => false
+                                    }
+                                }
+                            }
+                            _ => {
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret false
 }
