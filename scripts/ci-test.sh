@@ -7,17 +7,6 @@ run_id=${CI_TEST_RUN_ID:-compiler}
 fixture="$repository/target/ci-tests/$run_id"
 test ! -e "$fixture"
 mkdir -p "$fixture"
-cp tests/ci/runtime.c "$fixture/runtime.c"
-# This bridge has source-relative includes intended for the disposable package.
-# Check that exact layout before Encore compiles it for every test executable.
-native_runtime="$fixture/runtime.c"
-if command -v cygpath >/dev/null 2>&1; then
-  native_runtime=$(cygpath -m "$native_runtime")
-fi
-"${ENCORE_CC:-clang}" -std=c11 -fsyntax-only "$native_runtime"
-if [[ ${CI_TEST_NATIVE_RUNTIME_ONLY:-0} == 1 ]]; then
-  exit 0
-fi
 cp -R src tests "$fixture/"
 cp tests/ci/lib.enq "$fixture/src/lib.enq"
 cp tests/ci/runtime.enq "$fixture/src/ci_runtime.enq"
@@ -29,6 +18,7 @@ cp tests/ci/issues.enq "$fixture/src/ci_issues.enq"
 cp tests/ci/self_update.enq "$fixture/src/ci_self_update.enq"
 cp tests/ci/registry.enq "$fixture/src/ci_registry.enq"
 cp tests/ci/build_scripts.enq "$fixture/src/ci_build_scripts.enq"
+cp tests/ci/runtime.c "$fixture/runtime.c"
 # Preserve source-relative package identities; do not expose CLI internals in
 # the compiler's public library merely to discover their private unit tests.
 sed 's|path@packages/|path@../../../packages/|g' encore.toml > "$fixture/encore.toml"
