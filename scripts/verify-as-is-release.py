@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+import time
 import tomllib
 
 
@@ -14,6 +16,10 @@ BUILD_RUN = 42398340015
 VALIDATION_RUN = 42373979388
 TARGETS = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin",
            "x86_64-pc-windows-msvc", "x86_64-w64-windows-gnu", "aarch64-w64-windows-gnu"]
+REQUIRED_JOBS = [f"Verify {target} / {kind} {target}" for target in TARGETS for kind in ["Converge", "Package"]]
+REQUIRED_JOBS += ["Resolve trusted inputs", "kit-windows-gnu-x86 / Target kit x86_64-w64-windows-gnu",
+                  "kit-windows-gnu-arm / Target kit aarch64-w64-windows-gnu",
+                  "kit-linux-arm / Target kit aarch64-unknown-linux-gnu"]
 
 
 def api(path):
@@ -39,6 +45,33 @@ require(before["project"]["version"] == "0.1.14" and after["project"]["version"]
 before["project"]["version"] = after["project"]["version"]
 require(before == after, "Manifest changed beyond the release version")
 
+if "--wait" in sys.argv:
+    deadline = time.monotonic() + 75 * 60
+    previous = None
+    while time.monotonic() < deadline:
+        pending_run = api(f"actions/runs/{BUILD_RUN}")
+        require(pending_run["head_sha"] == RELEASE_COMMIT and pending_run["head_branch"] == "trunk",
+                "Refusing to cancel an unexpected build")
+        pending_jobs = api(f"actions/runs/{BUILD_RUN}/jobs?per_page=100")["jobs"]
+        bad = [job["name"] for job in pending_jobs if job["conclusion"] in ["failure", "timed_out", "action_required"]]
+        require(not bad, f"Native build or verification failed: {bad}")
+        good = {job["name"] for job in pending_jobs if job["conclusion"] == "success"}
+        missing = sorted(set(REQUIRED_JOBS) - good)
+        if missing != previous:
+            print(f"Required native jobs ready: {len(REQUIRED_JOBS) - len(missing)}/{len(REQUIRED_JOBS)}; remaining: {missing}", flush=True)
+            previous = missing
+        if not missing:
+            subprocess.check_call(["gh", "api", "--method", "POST", f"repos/{REPOSITORY}/actions/runs/{BUILD_RUN}/cancel"])
+            while time.monotonic() < deadline:
+                if api(f"actions/runs/{BUILD_RUN}")["status"] == "completed":
+                    print("Required native artifacts are ready; remaining full suites cancelled at the owner's request", flush=True)
+                    raise SystemExit(0)
+                time.sleep(10)
+            raise SystemExit("Cancellation did not complete before the deadline")
+        require(pending_run["status"] != "completed", "Native run ended before required release artifacts were ready")
+        time.sleep(30)
+    raise SystemExit("Required native artifacts were not ready before the deadline")
+
 run = api(f"actions/runs/{BUILD_RUN}")
 require(run["head_sha"] == RELEASE_COMMIT and run["head_branch"] == "trunk" and run["event"] == "push",
         "Release artifacts are not from the intended trunk commit")
@@ -49,11 +82,7 @@ require(run["status"] == "completed" and run["conclusion"] == "cancelled",
 jobs = api(f"actions/runs/{BUILD_RUN}/jobs?per_page=100")["jobs"]
 require(len(jobs) < 100, "Unexpected job count")
 by_name = {job["name"]: job for job in jobs}
-required = [f"Verify {target} / {kind} {target}" for target in TARGETS for kind in ["Converge", "Package"]]
-required += ["Resolve trusted inputs", "kit-windows-gnu-x86 / Target kit x86_64-w64-windows-gnu",
-             "kit-windows-gnu-arm / Target kit aarch64-w64-windows-gnu",
-             "kit-linux-arm / Target kit aarch64-unknown-linux-gnu"]
-for name in required:
+for name in REQUIRED_JOBS:
     require(name in by_name and by_name[name]["conclusion"] == "success", f"Required build failed: {name}")
     if "/ Converge " in name:
         runtime = [step for step in by_name[name]["steps"] if step["name"] == "Test native graph and generator lifecycle"]
