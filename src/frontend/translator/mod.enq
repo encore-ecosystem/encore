@@ -1402,9 +1402,9 @@ fn resolve_type_collision_uncached(ctx: mut TranslatorContext, module: usize, na
 // These declarations have a compiler/runtime ABI rather than a package-local
 // nominal ABI. A user type with the same spelling is not exempt.
 fn intrinsic_type_owner(module: str, name: str) -> bool {
-    // Ready is an ordinary generic wrapper with no compiler/runtime ABI.
-    // Preserve its nominal identity when a consumer declares its own Ready.
-    ret(starts_with(module, "core@") && name != "Ready") ||
+    // Ready and Generator are ordinary generic wrappers with no fixed runtime
+    // ABI name. Keep their identities distinct from same-named user types.
+    ret(starts_with(module, "core@") && name != "Ready" && name != "Generator") ||
     ((module == "std@thread/mod.enq" || module == "platform@thread/mod.enq") && name == "JoinHandle")
 }
 
@@ -1924,7 +1924,7 @@ fn empty_translation_context(modules: Vec[TranslationModule], target: TargetSpec
     }
     let type_collisions = build_type_collision_names(normalized_modules, stable_abi)
     let mut ctx = TranslatorContext {
-        "",        Vec[CachedFunctionChunk]::new(), Vec[CachedFunctionChunk]::new(), false, 0, 0, 0, Vec[str]::new(),
+        "", Vec[CachedFunctionChunk]::new(), Vec[CachedFunctionChunk]::new(), false, 0, 0, 0, Vec[str]::new(),
         Vec[VarType]::new(), Vec[VarType]::new(), Vec[FunctionType]::new(), normalized_modules, module_visibility,
         module_index, module_prefixes, visibility_index, direct_import_index, unsafe {
             encore_strmap_new()
@@ -2055,8 +2055,8 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                         ctx.borrowed_return_functions.push(callable_name)
                     }
                     let callable_type = if method.is_generator {
-                            qualified_type_for_source(ctx, method.source_name, "core::iter::Generator[" + output_type + "]")
-                        } elif method.is_async {
+                        qualified_type_for_source(ctx, method.source_name, "core::iter::Generator[" + output_type + "]")
+                    } elif method.is_async {
                         async_future_type(ctx_next_emitted_name(ctx, method.source_name, callable_name),
                             combined_generic_params(trait_item.generics, method.generics),)
                     } else {
@@ -3990,7 +3990,9 @@ fn thread_type_is_send_inner(ctx: mut TranslatorContext, typ: str, seen: Vec[str
         ret true
     }
     let owner = base_type_name(value)
-    if is_shared_generator_type(ctx, owner) { ret false }
+    if is_shared_generator_type(ctx, owner) {
+        ret false
+    }
     let sync_role = sync_type_thread_role(ctx, owner)
     if sync_role == 1_u32 || sync_role == 2_u32 || sync_role == 4_u32 {
         ret false
@@ -4095,7 +4097,9 @@ fn thread_type_is_transferable_region_inner(ctx: mut TranslatorContext, typ: str
         ret true
     }
     let owner = base_type_name(raw)
-    if is_shared_generator_type(ctx, owner) { ret false }
+    if is_shared_generator_type(ctx, owner) {
+        ret false
+    }
     let sync_role = sync_type_thread_role(ctx, owner)
     if sync_role == 1_u32 {
         ret true
@@ -7503,7 +7507,11 @@ fn translate_function_named_inner(ctx: mut TranslatorContext, fn_item: FunctionI
             "frozen-extern-return", "extern functions cannot declare frozen returns",)
     }
     ctx.in_async_function = fn_item.is_async
-    ctx.generator_item_type = if fn_item.is_generator { ctx.return_type } else { "" }
+    ctx.generator_item_type = if fn_item.is_generator {
+        ctx.return_type
+    } else {
+        ""
+    }
     if fn_item.is_generator && fn_item.is_async {
         translation_error_at(fn_item.source_name, fn_item.line, fn_item.column, "async-generator", "async generators are not supported")
     }
@@ -7594,21 +7602,32 @@ fn translate_function_named_inner(ctx: mut TranslatorContext, fn_item: FunctionI
     let mut builder = LoweringBuilder::new(ctx.ir_scope)
     builder = append_ehir_documentation(builder, fn_item.documentation, "///")
     let signature = FnDirective {
-        emitted_name, typed_generics(fn_item.generics), parameters, parse_type_text(ret_type), Vec[Block]::new(), fn_item.is_extern, fn_item.is_async, if fn_item.is_generator { Option[Type]::Some(parse_type_text(qualified_type_for_source(ctx, fn_item.source_name, "core::iter::Generator[" + ctx.return_type + "]"))) } else { Option[Type]::None }
+        emitted_name, typed_generics(fn_item.generics), parameters, parse_type_text(ret_type), Vec[Block]::new(), fn_item.is_extern, fn_item.is_async, if fn_item.is_generator {
+            Option[Type]::Some(parse_type_text(qualified_type_for_source(ctx, fn_item.source_name, "core::iter::Generator[" + ctx.return_type + "]")))
+        } else {
+            Option[Type]::None
+        }
     }
     if fn_item.is_extern {
         ret builder.declaration(Directive::Function(signature))
     }
     builder = builder.function_start(signature)
     builder = builder.label("entry")
-    if fn_item.is_generator { ctx.return_type = "void" }
+    if fn_item.is_generator {
+        ctx.return_type = "void"
+    }
 
     match fn_item.body {
         Option[ParsedBlock]::Some(body) => {
             builder = builder.append(translate_statements(
                     ctx,
                     body.statements,
-                    if fn_item.is_generator { "void" } else { ctx.return_type },
+                    if fn_item.is_generator {
+                        "void"
+                    } else {
+                        ctx.return_type
+                    }
+                    ,
                     "entry",
                     Option[str]::None,
                     Option[str]::None,
@@ -18457,10 +18476,13 @@ fn query_function_declaration(item: FunctionItem) -> FunctionItem {
     }
 }
 
-
 fn function_call_ret_type_for_owner(item: FunctionItem, owner: str) -> str {
     let output = function_ret_type_for_owner(item, owner)
-    ret if item.is_generator { "core::iter::Generator[" + output + "]" } else { output }
+    ret if item.is_generator {
+        "core::iter::Generator[" + output + "]"
+    } else {
+        output
+    }
 }
 
 fn translate_yield_stmt(ctx: mut TranslatorContext, expr: ExprNode, prefix: str) -> LoweringBuilder {
@@ -18471,7 +18493,7 @@ fn translate_yield_stmt(ctx: mut TranslatorContext, expr: ExprNode, prefix: str)
     ctx.expression_hint = ctx.generator_item_type
     let lowered = load_mutable_value(lower_expr(ctx, expr, prefix, 0_usize), prefix + "_load")
     ctx.expression_hint = saved_hint
-    if canonical_type(ctx.generator_item_type) != canonical_type(value_type_name(lowered.typ)) {
+    if canonical_type(ctx.generator_item_type) != canonical_type(capability_value_type(lowered.typ)) {
         translation_error_at(expr.source_name, expr.line, expr.column, "yield-type-mismatch", "cannot yield '" + lowered.typ + "' as '" + ctx.generator_item_type + "'")
     }
     let mut builder = lowered.code
@@ -18485,9 +18507,13 @@ fn translate_yield_stmt(ctx: mut TranslatorContext, expr: ExprNode, prefix: str)
         match ctx.with_cleanups.get(index) {
             Some(resource) => {
                 let target = ctx.ir_scope.callable(context_method_target(ctx, resource.typ, "with_exit"))
-                cleanups.push(CallInstruction { var(prefix + "_exit_" + Debug::fmt(index), parse_type_text("bool")), target.0, target.1, vec![var(resource.emitted_name, parse_type_text(resource.typ))], false })
+                cleanups.push(CallInstruction {
+                        var(prefix + "_exit_" + Debug::fmt(index), parse_type_text("bool")), target.0, target.1, vec![var(resource.emitted_name, parse_type_text(resource.typ))], false
+                    }
+                )
             }
-            None => {}
+            None => {
+            }
         }
     }
     ret builder.emit(yield_value(var(lowered.value, parse_type_text(lowered.typ)), cleanups))
