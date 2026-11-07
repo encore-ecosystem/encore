@@ -60,6 +60,35 @@ if group in ('all', 'build'):
         raise SystemExit(bool(failed))
 compiler = root / 'target/extreme/encore'
 compiler.chmod(0o755)
+if group == 'storage':
+    cases = {
+        'generic-capture': {
+            'main.enq': 'struct State { value: usize }\nfn values[T](state: T) -> usize { yield 1_usize yield 2_usize }\nfn main() -> u32 { let state = State<S>{3_usize} for value in values(state) {} ret 0_u32 }\n',
+        },
+        'foreign-capture': {
+            'state.enq': 'pub struct State { value: usize }\npub struct Holder { state: State<S> }\n',
+            'main.enq': 'import refrain::state::{State, Holder}\nfn values() -> usize { let state = Holder{State<S>{3_usize}} yield 1_usize yield state.state.value }\nfn main() -> u32 { for value in values() {} ret 0_u32 }\n',
+        },
+        'foreign-parameter': {
+            'state.enq': 'pub struct State { value: usize }\npub struct Holder { state: State<S> }\n',
+            'main.enq': 'import refrain::state::{State, Holder}\nfn values(state: Holder) -> usize { yield 1_usize yield state.state.value }\nfn main() -> u32 { let state = Holder{State<S>{3_usize}} for value in values(state) {} ret 0_u32 }\n',
+        },
+    }
+    for label, files in cases.items():
+        case = output / label
+        (case / 'src').mkdir(parents=True)
+        (case / 'encore.toml').write_text('[project]\nname="generator_storage"\nversion="0.0.0"\ndependencies=[]\n')
+        for name, source in files.items():
+            (case / 'src' / name).write_text(source)
+        # A successful compile is the regression: these values must not
+        # become owned by a heap frame after their stack placement expires.
+        result = subprocess.run([str(compiler), 'build'], cwd=case, env=environment,
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                timeout=600)
+        (output / ('storage-' + label + '.log')).write_text(result.stdout)
+        print(label, 'exit', result.returncode, result.stdout, flush=True)
+        if result.returncode == 0 or 'generator-stack-node-escape' not in result.stdout:
+            failed.append('storage-' + label)
 if group in ('all', 'language'):
     run('generator-language', [str(compiler), 'test', '--jobs', '2', '--filter', 'generator'])
     run('async-diagnostic', [str(compiler), 'test', '--jobs', '2', '--filter', 'negative_trait_method_async_mismatch'])
