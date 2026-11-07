@@ -1,13 +1,7 @@
-name: Promote Native Release
+name: Publish approved Encore 0.1.15 release
 
 on:
-  push:
-    tags:
-      - "v[0-9]*.[0-9]*.[0-9]*"
-      - "v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*"
-      - "v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*.[0-9]*"
-      - "v[0-9]*.[0-9]*.[0-9]*-nightly.[0-9]*"
-      - "v[0-9]*.[0-9]*.[0-9]*-[a-z]*"
+  workflow_dispatch:
 
 permissions:
   actions: read
@@ -19,16 +13,24 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      RELEASE_COMMIT: 10f7ecb80b3d0948746aeca74350dc39da31fe61
+      RELEASE_TAG: v0.1.15-neumann
+    defaults:
+      run:
+        working-directory: source
     steps:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
       - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
+          ref: 10f7ecb80b3d0948746aeca74350dc39da31fe61
+          path: source
           submodules: recursive
           fetch-depth: 0
 
-      - name: Verify tag and exact green source-tree candidate
+      - name: Verify exact native build and owner-approved test exception
         id: candidate
         shell: bash
         run: |
@@ -36,7 +38,7 @@ jobs:
           release=$(python3 scripts/project-metadata.py --field release)
           version=${release%%-*}
           release_name=${release#*-}
-          test "${GITHUB_REF_NAME#v}" = "$release"
+          test "${RELEASE_TAG#v}" = "$release"
           test "$release" = "$version-$release_name"
           if [[ "$release" =~ ^[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}$ ]]; then
             channel=nightly
@@ -49,8 +51,8 @@ jobs:
             exit 1
           fi
           git fetch origin trunk
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/trunk
-          bash scripts/select-ci-candidate.sh --required
+          git merge-base --is-ancestor "$RELEASE_COMMIT" origin/trunk
+          python3 ../scripts/verify-as-is-release.py
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "release=$release" >> "$GITHUB_OUTPUT"
@@ -130,7 +132,7 @@ jobs:
             bash scripts/verify-release-archive.sh "$triple" "$release" \
               "dist/$asset" "dist/provenance-$triple.json"
             printf '%s  %s\n' "$actual" "$asset" >> dist/SHA256SUMS
-            entry="{\"triple\":\"$triple\",\"url\":\"https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$asset\",\"sha256\":\"$actual\",\"format\":\"$format\"}"
+            entry="{\"triple\":\"$triple\",\"url\":\"https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$asset\",\"sha256\":\"$actual\",\"format\":\"$format\"}"
             if test -n "$assets"; then assets="$assets,$entry"; else assets=$entry; fi
           done
           for descriptor in dist/target-kit-*.json; do
@@ -147,19 +149,21 @@ jobs:
           done
           LC_ALL=C sort -o dist/SHA256SUMS dist/SHA256SUMS
           # Keep original build provenance unchanged; record adoption separately.
-          jq -n --arg release_commit "$GITHUB_SHA" \
+          jq -n --arg release_commit "$RELEASE_COMMIT" \
             --arg source_commit "${{ steps.candidate.outputs.source_commit }}" \
             --arg tree "$(git rev-parse HEAD^{tree})" \
             --arg run_id "${{ steps.candidate.outputs.run_id }}" \
             '{schema:1, release_commit:$release_commit, source_commit:$source_commit,
-              source_tree:$tree, verified_run_id:$run_id}' > dist/adoption.json
+              source_tree:$tree, build_run_id:$run_id, full_compiler_tests_complete:false,
+              verification_exception:"verification-exception.json"}' > dist/adoption.json
           jq -n --arg channel "$CHANNEL" --arg version "$version" \
             --arg nametag "$release_name" --arg release "$release" \
-            --arg tag "$GITHUB_REF_NAME" --arg commit "$GITHUB_SHA" \
+            --arg tag "$RELEASE_TAG" --arg commit "$RELEASE_COMMIT" \
             --argjson assets "[$assets]" '
             {schema:2, channel:$channel, version:$version, nametag:$nametag,
               release:$release, tag:$tag, commit:$commit,
-              verification:{converged:true, targets:($assets | length)}, assets:$assets}
+              verification:{converged:true, targets:($assets | length), compiler_tests_complete:false,
+                exception:"verification-exception.json", source_validation_run_id:42373979388}, assets:$assets}
           ' > dist/channel.json
 
       - uses: softprops/action-gh-release@v3
@@ -168,13 +172,20 @@ jobs:
           # draft. Publishing a prerelease first makes all subsequent uploads
           # fail, leaving behind an empty release.
           draft: true
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ env.RELEASE_COMMIT }}
+          body: |
+            Adds Python-style synchronous generators with shared lazy cursors, preserved locals and deterministic context cleanup. Includes the SDK submodule migration and selected package fixes.
+
+            Published as-is at the owner's explicit request. The full MSVC compiler suite was cancelled before completion (683/724 passing tests observed in the first attempt, no observed failures). Five other full compiler suites passed. Fresh release binaries passed native bootstrap convergence, lifecycle, archive and installed-SDK checks on all six targets. See verification-exception.json for the recorded exception.
           files: |
-            dist/encore-*
-            dist/target-kit-*
-            dist/SHA256SUMS
-            dist/channel.json
-            dist/provenance-*
-            dist/adoption.json
+            source/dist/encore-*
+            source/dist/target-kit-*
+            source/dist/SHA256SUMS
+            source/dist/channel.json
+            source/dist/provenance-*
+            source/dist/adoption.json
+            source/dist/verification-exception.json
           generate_release_notes: true
           name: Encore ${{ steps.candidate.outputs.version }} — ${{ steps.candidate.outputs.display_name }}
           prerelease: ${{ steps.candidate.outputs.channel != 'stable' }}
@@ -186,9 +197,9 @@ jobs:
         run: |
           set -euo pipefail
           if test "$CHANNEL" = stable; then
-            gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+            gh release edit "$RELEASE_TAG" --draft=false --latest
           else
-            gh release edit "$GITHUB_REF_NAME" --draft=false --latest=false
+            gh release edit "$RELEASE_TAG" --draft=false --latest=false
           fi
 
       - name: Publish atomic channel pointer
@@ -213,6 +224,6 @@ jobs:
           export GIT_AUTHOR_NAME=github-actions GIT_COMMITTER_NAME=github-actions
           export GIT_AUTHOR_EMAIL=41898282+github-actions[bot]@users.noreply.github.com
           export GIT_COMMITTER_EMAIL=$GIT_AUTHOR_EMAIL
-          commit=$(printf 'Update %s release channel to %s\n' "$CHANNEL" "$GITHUB_REF_NAME" | \
+          commit=$(printf 'Update %s release channel to %s\n' "$CHANNEL" "$RELEASE_TAG" | \
             git commit-tree "$tree" "${parent_args[@]}")
           git push origin "$commit:refs/heads/$pointer_branch"
