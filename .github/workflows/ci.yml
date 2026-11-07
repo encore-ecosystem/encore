@@ -1,195 +1,42 @@
-name: Native CI
-
+name: Compare MSVC compiler performance
 on:
   workflow_dispatch:
-  pull_request:
-  push:
-    branches: [trunk]
-
 permissions:
   contents: read
   actions: read
-  pull-requests: read
-
-concurrency:
-  group: native-ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  candidate:
-    name: Select verified candidate
-    runs-on: ubuntu-latest
-    outputs:
-      reused: ${{ steps.select.outputs.reused }}
+  compare:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ENCORE_INDEX_URL: http://127.0.0.1:9/index
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
-      - name: Reuse identical merged PR build
-        id: select
-        if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash scripts/select-ci-candidate.sh
-
-  resolve-inputs:
-    needs: candidate
-    if: needs.candidate.outputs.reused != 'true'
-    name: Resolve trusted inputs
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    outputs:
-      seed_tag: ${{ steps.seed.outputs.tag }}
-    steps:
       - uses: actions/checkout@v6
         with:
+          ref: 71843a74db8366f0171c25217ceca0861e81daff
+          path: baseline
           submodules: recursive
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
-      - name: Validate manifest-derived release metadata
-        run: python3 scripts/test-project-metadata.py
-      - name: Record original build identity
+          python-version: '3.13'
+      - name: Prepare native toolchain
+        shell: bash
+        run: bash scripts/ci-prepare-toolchain.sh x86_64-pc-windows-msvc
+      - name: Restore the two verified native compilers
         shell: bash
         run: |
-          jq -n --arg commit "$GITHUB_SHA" --arg tree "$(git rev-parse HEAD^{tree})" \
-            '{commit: $commit, tree: $tree}' > build-identity.json
+          gh run download 42350398703 --repo encore-ecosystem/encore --name test-context-x86_64-pc-windows-msvc --dir target/performance/baseline
+          gh run download 42373979388 --repo encore-ecosystem/encore --name test-context-x86_64-pc-windows-msvc --dir target/performance/candidate
+      - name: Compare the same compiler test on one runner
+        run: python scripts/ci-msvc-performance.py
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
-          name: build-identity
-          path: build-identity.json
-          retention-days: 30
-      - name: Select latest stable compiler once
-        id: seed
-        shell: bash
-        run: |
-          set -euo pipefail
-          required='[
-            "encore-x86_64-unknown-linux-gnu.tar.gz",
-            "encore-aarch64-unknown-linux-gnu.tar.gz",
-            "encore-aarch64-apple-darwin.tar.gz",
-            "encore-x86_64-pc-windows-msvc.zip",
-            "encore-x86_64-w64-windows-gnu.zip",
-            "encore-aarch64-w64-windows-gnu.zip"
-          ]'
-          releases=$(gh release list --limit 100 --json tagName,publishedAt,isDraft,isPrerelease)
-          selected=$(jq -r '[.[] | select(.isDraft == false and .isPrerelease == false)
-            | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-[a-z][a-z0-9-]*)?$"))]
-            | sort_by(.publishedAt) | last | .tagName // empty' <<<"$releases")
-          test -n "$selected" || { echo "::error::No stable compiler release is available"; exit 1; }
-          python3 scripts/project-metadata.py --check-seed "$selected"
-          assets=$(gh release view "$selected" --json isDraft,isPrerelease,assets)
-          test "$(jq -r '.isDraft or .isPrerelease' <<<"$assets")" = false
-          if ! jq -e --argjson required "$required" \
-            '([.assets[].name] as $actual |
-              ($required + ($required | map(. + ".sha256"))) - $actual | length) == 0' <<<"$assets" >/dev/null
-          then
-            echo "::error::Latest stable seed $selected is incomplete; refusing an older fallback"
-            exit 1
-          fi
-          echo "tag=$selected" >> "$GITHUB_OUTPUT"
-          echo "### Trusted seed: \`$selected\`" >> "$GITHUB_STEP_SUMMARY"
-
-  kit-windows-gnu-x86:
-    needs: candidate
-    if: needs.candidate.outputs.reused != 'true'
-    uses: ./.github/workflows/ci-target-kit.yml
-    with:
-      target: x86_64-w64-windows-gnu
-      kind: windows
-
-  kit-windows-gnu-arm:
-    needs: candidate
-    if: needs.candidate.outputs.reused != 'true'
-    uses: ./.github/workflows/ci-target-kit.yml
-    with:
-      target: aarch64-w64-windows-gnu
-      kind: windows
-
-  kit-linux-arm:
-    needs: candidate
-    if: needs.candidate.outputs.reused != 'true'
-    uses: ./.github/workflows/ci-target-kit.yml
-    with:
-      target: aarch64-unknown-linux-gnu
-      kind: linux-aarch64
-
-  verify-linux-x86:
-    name: Verify x86_64-unknown-linux-gnu
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: ubuntu-latest
-      triple: x86_64-unknown-linux-gnu
-      executable: encore
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-linux-arm:
-    name: Verify aarch64-unknown-linux-gnu
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: ubuntu-24.04-arm
-      triple: aarch64-unknown-linux-gnu
-      executable: encore
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-macos-arm:
-    name: Verify aarch64-apple-darwin
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: macos-26
-      triple: aarch64-apple-darwin
-      executable: encore
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-windows-msvc-x86:
-    name: Verify x86_64-pc-windows-msvc
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: windows-latest
-      triple: x86_64-pc-windows-msvc
-      executable: encore.exe
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-windows-gnu-x86:
-    name: Verify x86_64-w64-windows-gnu
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: windows-latest
-      triple: x86_64-w64-windows-gnu
-      executable: encore.exe
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-windows-gnu-arm:
-    name: Verify aarch64-w64-windows-gnu
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: windows-11-arm
-      triple: aarch64-w64-windows-gnu
-      executable: encore.exe
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  complete:
-    name: CI complete
-    if: always()
-    needs: [candidate, resolve-inputs, kit-windows-gnu-x86, kit-windows-gnu-arm, kit-linux-arm, verify-linux-x86, verify-linux-arm, verify-macos-arm, verify-windows-msvc-x86, verify-windows-gnu-x86, verify-windows-gnu-arm]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require a complete verified candidate
-        env:
-          REUSED: ${{ needs.candidate.outputs.reused }}
-          RESULTS: ${{ toJSON(needs) }}
-        run: |
-          set -euo pipefail
-          if test "$REUSED" = true; then
-            jq -e '.candidate.result == "success" and
-              (to_entries | all(.[]; .value.result == "success" or .value.result == "skipped"))' <<<"$RESULTS"
-          else
-            jq -e 'all(.[]; .result == "success")' <<<"$RESULTS"
-          fi
+          name: msvc-performance
+          path: |
+            target/performance/**
+          retention-days: 7
