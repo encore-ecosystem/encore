@@ -96,7 +96,7 @@ if group in ('all', 'ehir'):
     run('ehir-generators', [str(compiler), 'test', '--jobs', '2', '--filter', 'generators'], root / 'packages/ehir')
     run('preparation-cache', [str(compiler), 'test', '--jobs', '2', '--filter', 'preparation_cache'], root / 'packages/ehir')
 if group in ('all', 'metadata'):
-    run('package-metadata', ['bash', 'scripts/ci-test.sh', str(compiler), '--jobs', '2', '--filter', 'integration_generator_package_metadata'],
+    run('package-metadata', ['bash', 'scripts/ci-test.sh', str(compiler), '--jobs', '2', '--filter', 'integration_generator_'],
         extra={'CI_TEST_RUN_ID': 'generator-probe'})
 if group in ('all', 'language'):
     if not run('iterator-build', [str(compiler), 'build'], root / 'examples/iterator'):
