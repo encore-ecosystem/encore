@@ -1,6 +1,7 @@
 //! Imported generator contracts survive cached declarations and ABI changes.
 import std::vec::Vec
 import std::io::eprintln
+
 import refrain::ci_helpers::{Fixture, std_dependencies}
 
 #attr(test)
@@ -8,9 +9,11 @@ fn integration_generator_package_metadata() -> bool {
     let fixture = Fixture::new("generator-metadata")
     let provider = Fixture { fixture.root.join("provider"), fixture.compiler }
     provider.manifest("generator_provider", std_dependencies())
-    provider.put("src/lib.enq", "pub fn values() -> usize { yield 2_usize yield 3_usize }\npub fn twice[T](value: T) -> T { yield value yield value }\n")
+    let generic_source = "fn copied[T](value: T) -> T { ret value }\npub fn twice[T](value: T) -> T { yield copied(value) yield copied(value) }\n"
+    provider.put("src/lib.enq", "pub fn values() -> usize { yield 2_usize yield 3_usize }\n" + generic_source)
     let consumer = Fixture { fixture.root.join("consumer"), fixture.compiler }
-    consumer.manifest("generator_consumer", "[\"path@../provider\"]")
+    let dependencies = std_dependencies()
+    consumer.manifest("generator_consumer", dependencies.slice_bytes(0_usize, dependencies.byte_len() - 1_usize) + ",\"path@../provider\"]")
     consumer.put("src/main.enq", "import generator_provider::{values, twice}\nimport core::iter::Generator\nimport std::io::eprintln\nfn total(g: Generator[usize]) -> usize { let mut sum = 0_usize for n in g { sum += n } ret sum }\nfn main() -> u32 { let count = total(values()) if count != 5_usize { eprintln(f\"generator sum: {count}\") ret 1_u32 } let mut len = 0_usize for value in twice(\"owned\") { len += value.len() } if len != 10_usize { eprintln(f\"generator string length: {len}\") ret 2_u32 } ret 0_u32 }\n")
     let cold = consumer.command(vec!["run"])
     if !cold.success() {
@@ -21,11 +24,31 @@ fn integration_generator_package_metadata() -> bool {
         ret fixture.finish(false)
     }
     // Identical written return type, different caller-visible function kind.
-    provider.put("src/lib.enq", "pub fn values() -> usize { ret 5_usize }\npub fn twice[T](value: T) -> T { yield value yield value }\n")
+    provider.put("src/lib.enq", "pub fn values() -> usize { ret 5_usize }\n" + generic_source)
     let changed = consumer.command(vec!["check"])
     if changed.success() {
         ret fixture.finish(false)
     }
-    provider.put("src/lib.enq", "pub fn values() -> usize { yield 2_usize yield 3_usize }\npub fn twice[T](value: T) -> T { yield value yield value }\n")
+    provider.put("src/lib.enq", "pub fn values() -> usize { yield 2_usize yield 3_usize }\n" + generic_source)
     ret fixture.finish(consumer.succeeds(vec!["run"]) && consumer.succeeds(vec!["run"]))
+}
+
+#attr(test)
+fn integration_generator_stack_storage() -> bool {
+    let fixture = Fixture::new("generator-storage")
+    fixture.manifest("generator_storage", "[]")
+    fixture.put("src/state.enq", "pub struct State { value: usize }\npub struct Holder { state: State<S> }\npub struct HeapHolder { state: State<H> }\n")
+    for source in vec![
+        "import refrain::state::{State, Holder}\nfn values() -> usize { let state = Holder{State<S>{3_usize}} yield 1_usize yield state.state.value }\nfn main() -> u32 { for value in values() {} ret 0_u32 }\n",
+        "import refrain::state::{State, Holder}\nfn values(state: Holder) -> usize { yield 1_usize yield state.state.value }\nfn main() -> u32 { let state = Holder{State<S>{3_usize}} for value in values(state) {} ret 0_u32 }\n"
+    ] {
+        fixture.put("src/main.enq", source)
+        let output = fixture.command(vec!["build"])
+        if output.success() || !output.text().contains("generator-stack-node-escape") {
+            eprintln(output.text())
+            ret fixture.failure("imported stack placement escaped through a generator")
+        }
+    }
+    fixture.put("src/main.enq", "import refrain::state::{State, Holder, HeapHolder}\nfn owned() -> usize { let state = HeapHolder{State<H>{3_usize}} yield 1_usize yield state.state.value }\nfn scoped() -> usize { let mut first = 0_usize if true { let state = Holder{State<S>{3_usize}} first = state.state.value } yield first yield 2_usize }\nfn main() -> u32 { let mut sum = 0_usize for value in owned() { sum += value } for value in scoped() { sum += value } ret if sum == 9_usize { 0_u32 } else { 1_u32 } }\n")
+    ret fixture.finish(fixture.succeeds(vec!["run"]))
 }

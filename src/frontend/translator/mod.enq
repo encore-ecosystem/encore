@@ -7602,7 +7602,7 @@ fn translate_function_named_inner(ctx: mut TranslatorContext, fn_item: FunctionI
     let mut builder = LoweringBuilder::new(ctx.ir_scope)
     builder = append_ehir_documentation(builder, fn_item.documentation, "///")
     let signature = FnDirective {
-        emitted_name, typed_generics(fn_item.generics), parameters, parse_type_text(ret_type), Vec[Block]::new(), fn_item.is_extern, fn_item.is_async, if fn_item.is_generator {
+        emitted_name, typed_generics(fn_item.generics), parameters, parse_type_text(ctx.return_type), Vec[Block]::new(), fn_item.is_extern, fn_item.is_async, if fn_item.is_generator {
             Option[Type]::Some(parse_type_text(qualified_type_for_source(ctx, fn_item.source_name, "core::iter::Generator[" + ctx.return_type + "]")))
         } else {
             Option[Type]::None
@@ -11807,6 +11807,8 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
         ret_type = reflected_call_result(ctx, reflected_target, ret_type)
     }
 
+    validate_generator_call_storage(ctx, ret_type, arg_types, source_name, line, column)
+
     if spawning {
         if ctx_function_is_extern(ctx, dispatch_base) {
             translation_error_at(source_name, line, column, "extern-spawn-target", "spawn target must be an Encore function")
@@ -13433,6 +13435,7 @@ fn lower_method_call_expr(ctx: mut TranslatorContext, method_call: MethodCallExp
         emitted_name = reflected_target
         ret_type = reflected_call_result(ctx, reflected_target, ret_type)
     }
+    validate_generator_call_storage(ctx, ret_type, capability_types, source_name, line, column)
     code = protect_call_result_inputs(ctx, code, call_owners, fn_name)
     code = code.call((out_name),(ret_type),(emitted_name), references(args), false)
     code = own_call_result(ctx, code, fn_name, out_name, ret_type)
@@ -15263,8 +15266,9 @@ fn translate_for_stmt(ctx: mut TranslatorContext, for_stmt: ForStmt, ret_type: s
     let body_bindings = save_translation_bindings(ctx)
     builder = builder.branch((body_label))
     builder = builder.label(body_label)
-    builder = builder.load((iter_value_name) + "_current",(iter_type), reference((iter_slot)))
-    builder = builder.call((step_name),(step_type),(iterator_next_function(iter_type)) +(generic_suffix), vec![reference((iter_value_name) + "_current")], false)
+    let current_iter_name = iter_prefix + "_current"
+    builder = builder.load((current_iter_name),(iter_type), reference((iter_slot)))
+    builder = builder.call((step_name),(step_type),(iterator_next_function(iter_type)) +(generic_suffix), vec![reference((current_iter_name))], false)
     builder = builder.get_field((next_iter_name),(iter_type), reference((step_name)), "0")
     // next consumes the old iterator and returns (iterator, option). Transfer
     // only its first field here: dropping the tuple would invalidate option.
@@ -17162,7 +17166,9 @@ fn typed_params(item: FunctionItem) -> Vec[Parameter] {
 fn typed_params_in_context(ctx: mut TranslatorContext, item: FunctionItem) -> Vec[Parameter] {
     let mut parameters = Vec[Parameter]::new()
     for parameter in item.params {
-        parameters.push(param(parameter.name, parse_type_text(abi_parameter_type(self_context_type(ctx, canonical_type(unwrap_type_or_usize(parameter.typ)))))))
+        let typ = qualified_type_for_source(ctx, item.source_name,
+            self_context_type(ctx, canonical_type(unwrap_type_or_usize(parameter.typ))),)
+        parameters.push(param(parameter.name, parse_type_text(abi_parameter_type(typ))))
     }
     ret parameters
 }
@@ -18523,6 +18529,57 @@ fn is_shared_generator_type(ctx: mut TranslatorContext, owner: str) -> bool {
     for index in 0_usize..ctx.modules.len() {
         if module_id_at(ctx, index) == "core@iter/mod.enq" && owner == qualified_type_for_source(ctx, module_source_at(ctx, index), "Generator") {
             ret true
+        }
+    }
+    ret false
+}
+
+// Generic generator factories have already been lowered when a caller picks
+// concrete arguments. Validate those arguments before their placements disappear
+// into a generic heap-frame template.
+fn validate_generator_call_storage(ctx: mut TranslatorContext, result: str, arguments: Vec[str],
+    source: str, line: usize, column: usize,) ->() {
+    if !contains_substring(result, "Generator") || !is_shared_generator_type(ctx, base_type_name(result)) {
+        ret()
+    }
+    let mut stored = copy_str_vec(arguments)
+    stored.extend(generic_args_from_path(result))
+    for typ in stored {
+        if generator_type_contains_stack(ctx, typ, Vec[str]::new()) {
+            translation_error_at(source, line, column, "generator-stack-node-escape",
+                "generator captures and yielded items must not contain stack placements; use <H>",)
+        }
+    }
+}
+
+fn generator_type_contains_stack(ctx: mut TranslatorContext, typ: str, seen: Vec[str]) -> bool {
+    let value = capability_value_type(typ)
+    if ends_with(value, "*") { ret false }
+    if ends_with(value, "<S>") || ends_with(value, "&") { ret true }
+    if contains_str(seen, value) { ret false }
+    let mut next = copy_str_vec(seen)
+    next.push(value)
+    let arguments = generic_args_from_path(value)
+    for argument in arguments {
+        if generator_type_contains_stack(ctx, argument, next) { ret true }
+    }
+    let owner = base_type_name(value)
+    for position in aggregate_member_candidates(ctx, owner, false) {
+        match ctx.fields.get(position) {
+            Some(field) => {
+                if generator_type_contains_stack(ctx,
+                    specialize_named_type(field.typ, field.generic_names, arguments), next,) { ret true }
+            }
+            None => {}
+        }
+    }
+    for position in aggregate_member_candidates(ctx, owner, true) {
+        match ctx.enum_variants.get(position) {
+            Some(variant) => {
+                if variant.payload_type != "" && generator_type_contains_stack(ctx,
+                    specialize_named_type(variant.payload_type, variant.generics, arguments), next,) { ret true }
+            }
+            None => {}
         }
     }
     ret false
