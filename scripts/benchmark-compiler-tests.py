@@ -9,7 +9,6 @@ No profiler is enabled and no user cache is modified.
 
 import argparse
 import hashlib
-import io
 import json
 import math
 import os
@@ -23,6 +22,8 @@ import sys
 import tarfile
 import tempfile
 import time
+
+from sdk_packages import copy_working_tree, export_tree
 
 
 CASES = ("owned_shadowing_lifetime", "lexer_lifetime", "parser_lifetime", "translator_lifetime")
@@ -93,21 +94,10 @@ def source_snapshot(source, destination, ref=None):
     """Copy source once, before timing; support a release tag without a worktree."""
     destination.mkdir(parents=True, exist_ok=True)
     if ref:
-        archive = subprocess.check_output(["git", "-C", str(source), "archive", ref])
-        with tarfile.open(fileobj=io.BytesIO(archive)) as stream:
-            stream.extractall(destination, filter="data")
+        export_tree(source, ref, destination)
         names = [str(p.relative_to(destination)) for p in destination.rglob("*") if p.is_file()]
     else:
-        names = os.fsdecode(subprocess.check_output([
-            "git", "-C", str(source), "ls-files", "-z", "--cached", "--others", "--exclude-standard",
-        ])).split("\0")
-        for name in sorted(set(names) - {""}):
-            original = source / name
-            if not original.is_file():
-                continue
-            target = destination / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(original, target)
+        names = copy_working_tree(source, destination)
     digest = hashlib.sha256()
     for name in sorted(set(names) - {""}):
         path = destination / name
@@ -429,7 +419,7 @@ def main():
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--baseline-compiler", type=Path)
     parser.add_argument("--baseline-source", type=Path)
-    parser.add_argument("--baseline-ref", help="Freeze baseline sources with git archive, e.g. v0.1.6-neumann")
+    parser.add_argument("--baseline-ref", help="Freeze baseline sources and pinned submodules, e.g. v0.1.6-neumann")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scenario", choices=("all", "build", "suite", "standalone", "projects", "subset", "incremental"), default="all")
     parser.add_argument("--project-root", type=Path, help="Graphene source root for an incremental edit/build session")

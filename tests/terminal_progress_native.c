@@ -7,14 +7,15 @@
 #include <string.h>
 #include <pthread.h>
 
-typedef struct { size_t refs, len; char data[]; } str_object;
-typedef struct { str_object *object; } str;
+#include "../packages/core/runtime_string.h"
+typedef encore_str_object str_object;
+typedef encore_str str;
 
 void *encore_str_from_cstr(const char *text) {
     size_t length = strlen(text);
     str_object *object = malloc(sizeof(*object) + length + 1);
     if (object == NULL) abort();
-    object->refs = 1;
+    atomic_init(&object->ref_count, 1);
     object->len = length;
     memcpy(object->data, text, length + 1);
     return object;

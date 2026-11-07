@@ -4,6 +4,7 @@ import core::fmt::Debug
 import core::option::Option
 import core::result::Result
 
+import std::args::{process_arg, process_arg_count}
 import std::dict::Hashable
 import std::io::{eprint, eprintln}
 import std::os::{copy_file, env, executable_path, file_exists, file_sha256, home_dir, mkdir_all, path_separator, read_file, remove_file, set_executable, write_file}
@@ -13,12 +14,11 @@ import std::thread::{JoinHandle, available_parallelism}
 import std::time::{perf_counter_ms, perf_counter_ns, sleep_ms}
 import std::vec::Vec
 
-import argparse::{process_arg, process_arg_count}
 import ehirlib::{EhirModuleSource, Module, ModuleBundle, decode_typed_bundle, flatten_module_bundle, module_bundle_to_string, module_to_string, parse_module_bundle_artifact_parallel, parse_module_bundle_text, parse_module_text, split_module_bundle_text}
 import ehirlib::codegen::{CodegenRequirements, EmittedIrModule, clear_codegen_error, emit_ir_bundle_for_target_parallel, emit_ir_bundle_for_target_selected, emit_ir_bundle_for_target_selected_with_analysis, emit_ir_for_target, emit_program_support, incremental_codegen_context_bundle, take_codegen_error}
 import ehirlib::core::make_module_bundle
 import json::{Json, parse, stringify}
-import rich::BuildProgress
+import rich::build_progress::BuildProgress
 
 import mod::build_archive::{UnitNativePlan, run_program_tool, stable_module_ir}
 import mod::build_artifacts::UnitReady
@@ -499,7 +499,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
     let mut llvm_compile = Option[JoinHandle[i32]]::None
     let mut llvm_compile_active = false
     if !codegen_cached && !modular_codegen {
-        let mut llvm_args = compiler_args(profile, target, toolchain)
+        let mut llvm_args = compiler_args(root, profile, target, toolchain)
         llvm_args.push("-c")
         llvm_args.push(native_path(llvm_path.as_str()))
         llvm_args.push("-o")
@@ -533,7 +533,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             let scheduled_module_paths = schedule_module_paths(module_llvm_paths)
             let worker_count = min_usize(requested_jobs(), scheduled_module_paths.len())
             let mut module_compiles = Vec[JoinHandle[i32]]::new()
-            let base_args = compiler_args(profile, target, toolchain)
+            let base_args = compiler_args(root, profile, target, toolchain)
             let queue = unsafe {
                 encore_build_queue_new(scheduled_module_paths.len())
             }
@@ -599,12 +599,12 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             Option[Path]::Some(source) => {
                 let object = object_dir.join("native_" + Debug::fmt(source_index) + object_suffix)
                 let object_fingerprint_path = Path::new(object.as_str() + ".fingerprint")
-                let object_fingerprint = native_object_fingerprint(source, target, toolchain, profile)
+                let object_fingerprint = native_object_fingerprint(root, source, target, toolchain, profile)
                 let object_cached = file_exists(native_path(object.as_str())) &&
                 file_exists(native_path(object_fingerprint_path.as_str())) &&
                 read_file(native_path(object_fingerprint_path.as_str())) == object_fingerprint
                 if !object_cached {
-                    let mut native_args = compiler_args(profile, target, toolchain)
+                    let mut native_args = compiler_args(root, profile, target, toolchain)
                     native_args.push("-c")
                     native_args.push(native_path(source.as_str()))
                     native_args.push("-o")
@@ -752,7 +752,7 @@ pub fn compile_package_binary(root: Path, target: TargetSpec, toolchain: Toolcha
             }
         }
         pipeline_finished = perf_counter_ms()
-        rich::ProgressReporter::current().stage("Cleaning build workspace", 0_usize)
+        rich::live_progress::ProgressReporter::current().stage("Cleaning build workspace", 0_usize)
     }
     let cleanup_ms = perf_counter_ms() - pipeline_finished
     if env("ENCORE_INPUT_PROFILE").is_some() {
@@ -854,7 +854,7 @@ fn publish_command_timing(directory: Path, contents: str) -> bool {
 fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchain,
     profile: str, profile_dir: Path, binary: Path, staging: Path,) -> Result[(), str] {
     let pipeline_started = perf_counter_ms()
-    rich::ProgressReporter::current().stage("Resolving build graph", 0_usize)
+    rich::live_progress::ProgressReporter::current().stage("Resolving build graph", 0_usize)
     let output_kind = project_build_kind(root, read_project_manifest(root))
     let import_name = build_import_library_name(target, project_manifest_name(read_project_manifest(root)), output_kind)
     let import_library = profile_dir.join(import_name)
@@ -866,14 +866,14 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     }
     profile_incremental_input("graph", pipeline_started)
     let scripts_started = perf_counter_ms()
-    rich::ProgressReporter::current().stage("Running build scripts", graph.refrains.len())
+    rich::live_progress::ProgressReporter::current().stage("Running build scripts", graph.refrains.len())
     let metadata = run_native_build_scripts(graph.refrains, "", target, profile, staging, root)?
     profile_incremental_input("scripts", scripts_started)
     let native_started = perf_counter_ms()
-    rich::ProgressReporter::current().stage("Checking native inputs", 0_usize)
+    rich::live_progress::ProgressReporter::current().stage("Checking native inputs", 0_usize)
     let native = UnitNativePlan {
         resolve_native_program(toolchain.compiler)?,
-        resolve_native_program(toolchain.archiver)?, compiler_args(profile, target, toolchain)
+        resolve_native_program(toolchain.archiver)?, compiler_args(root, profile, target, toolchain)
     }
     let cache = env("ENCORE_BUILD_CACHE").unwrap_or(home_dir() + "/.cache/encore/units-v1")
     let mut sources = package_native_sources(root, graph, target, toolchain)
@@ -918,7 +918,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     }
     profile_incremental_input("native closure", native_started)
     let inventory_started = perf_counter_ms()
-    rich::ProgressReporter::current().stage("Checking source inventory", 0_usize)
+    rich::live_progress::ProgressReporter::current().stage("Checking source inventory", 0_usize)
     let inventory = build_input_inventory(graph)?
     profile_incremental_input("source inventory", inventory_started)
     let receipt_started = perf_counter_ms()
@@ -1023,7 +1023,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
             ret Result::Err("missing support cache lock")
         }
     }
-    let support_result = prepare_cached_program_support(support_lock, packages, names, graph.root_name,
+    let support_result = prepare_cached_program_support(root, support_lock, packages, names, graph.root_name,
         output_kind, target, toolchain, profile, staging, native, support_native_identity,)
     close_unit_cache_lock(support_lock)
     support_result?
@@ -1041,7 +1041,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     index = 0
     for source in sources {
         let object = staging.join("native-" + Debug::fmt(index) + ".o")
-        let mut args = compiler_args(profile, target, toolchain)
+        let mut args = compiler_args(root, profile, target, toolchain)
         args.push("-c") args.push(native_path(source.as_str())) args.push("-o") args.push(object.as_str())
         compile_cached_native_object(source, native, args, staging, profile_dir, object,
             native_keys.get(index).unwrap_or(""), index,)?
@@ -1112,7 +1112,7 @@ fn profile_incremental_input(stage: str, started: u64) ->() {
     }
 }
 
-fn prepare_cached_program_support(lock: UnitCacheLock, packages: Vec[CompiledPackage], names: Vec[str],
+fn prepare_cached_program_support(root: Path, lock: UnitCacheLock, packages: Vec[CompiledPackage], names: Vec[str],
     root_name: str, output_kind: str, target: TargetSpec, toolchain: Toolchain, profile: str,
     staging: Path, native: UnitNativePlan, expected_native: str,) -> Result[(), str] {
     if native.identity()? != expected_native {
@@ -1152,7 +1152,7 @@ fn prepare_cached_program_support(lock: UnitCacheLock, packages: Vec[CompiledPac
     if !write_verified_artifact(support_path, stable_module_ir(support.ir, root_name + "@__program_support")) {
         ret Result[(), str]::Err("cannot commit final support code")
     }
-    let mut support_args = compiler_args(profile, target, toolchain)
+    let mut support_args = compiler_args(root, profile, target, toolchain)
     support_args.push("--target=" + target.triple)
     support_args.push("-c") support_args.push(support_path.as_str())
     support_args.push("-o") support_args.push(support_object.as_str())
@@ -1749,7 +1749,7 @@ fn build_input_configuration(root: Path, target: TargetSpec, toolchain: Toolchai
     value = fingerprint_mix(value, toolchain.features)
     value = fingerprint_mix(value, toolchain.linker_script)
     value = fingerprint_mix(value, Debug::fmt(toolchain.hosted_runtime))
-    for arg in compiler_args(profile, target, toolchain) {
+    for arg in compiler_args(root, profile, target, toolchain) {
         value = fingerprint_mix(value, arg)
     }
     let mut link_args = Vec[str]::new()
@@ -2009,7 +2009,7 @@ fn workspace_codegen_fingerprint(root: Path, workspace: ProjectWorkspace, target
     for arg in toolchain.link_args {
         value = fingerprint_mix(value, arg)
     }
-    for arg in compiler_args(profile, target, toolchain) {
+    for arg in compiler_args(root, profile, target, toolchain) {
         value = fingerprint_mix(value, arg)
     }
     let mut profile_link_args = Vec[str]::new()
@@ -2116,7 +2116,7 @@ fn fingerprint_native_file(current: str, path: Path) -> str {
     ret value
 }
 
-fn native_object_fingerprint(source: Path, target: TargetSpec, toolchain: Toolchain, profile: str) -> str {
+fn native_object_fingerprint(root: Path, source: Path, target: TargetSpec, toolchain: Toolchain, profile: str) -> str {
     let mut value = "encore-native-object-v2\n" + target.triple + "\n" + profile
     value = fingerprint_mix(value, toolchain.compiler)
     value = fingerprint_mix(value, toolchain.sysroot)
@@ -2125,10 +2125,11 @@ fn native_object_fingerprint(source: Path, target: TargetSpec, toolchain: Toolch
     for arg in toolchain.compile_args {
         value = fingerprint_mix(value, arg)
     }
-    for arg in compiler_args(profile, target, toolchain) {
+    for arg in compiler_args(root, profile, target, toolchain) {
         value = fingerprint_mix(value, arg)
     }
     value = fingerprint_native_file(value, source)
+    value = fingerprint_native_file(value, system_core_root(root).join("runtime_abi.h"))
     ret Debug::fmt(value.hash())
 }
 
@@ -2818,7 +2819,7 @@ fn compile_object_job(compiler: str, args: frozen Vec[str], fingerprint_path: st
 // Captured tools cannot draw a second spinner or overwrite the parent's live
 // block. Keep the existing direct execution path when output is redirected.
 fn run_visible_tool(program: str, args: Vec[str]) -> i32 {
-    if !rich::ProgressReporter::current().is_active() {
+    if !rich::live_progress::ProgressReporter::current().is_active() {
         ret run_args_owned(program, args)
     }
     let mut command = Command::new(program)
@@ -3481,7 +3482,7 @@ fn module_ir_artifacts_verified(paths: Vec[Path]) -> bool {
 }
 
 fn exec_compiler(executable: str, args: Vec[str]) -> bool {
-    rich::ProgressReporter::current().finish()
+    rich::live_progress::ProgressReporter::current().finish()
     let len = args.len()
     let data = if len == 0_usize {
         0_usize
@@ -3843,8 +3844,9 @@ pub fn target_profile_dir(root: Path, target: TargetSpec, profile: str) -> Path 
     ret root.join("target").join(target.triple).join(profile)
 }
 
-fn compiler_args(profile: str, target: TargetSpec, toolchain: Toolchain) -> Vec[str] {
+fn compiler_args(root: Path, profile: str, target: TargetSpec, toolchain: Toolchain) -> Vec[str] {
     let mut args = target_tool_args(target, toolchain)
+    args.push("-I" + system_core_root(root).resolve().as_str())
     // Clang records a compilation directory even in ThinLTO's NoDebug
     // compile units. A PID-scoped staging cwd changes module hashes, promoted
     // local symbol names and PE build IDs across otherwise identical links.
@@ -3993,7 +3995,7 @@ fn native_explicit_target_contract() -> bool {
     let gnu = parse_target("x86_64-w64-windows-gnu")
     let gnu_args = target_tool_args(gnu, default_toolchain(gnu))
     let mut stable_directory = false
-    for argument in compiler_args("extreme", host, default_toolchain(host)) {
+    for argument in compiler_args(Path::new("."), "extreme", host, default_toolchain(host)) {
         if argument == "-fdebug-compilation-dir=." {
             stable_directory = true
         }
