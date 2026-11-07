@@ -11869,6 +11869,8 @@ fn ctx_lookup_function_param_for_call(ctx: mut TranslatorContext, source_name: s
     }
     let mut resolved = ""
     let mut found = false
+    let mut priority = 3_usize
+    let mut ambiguous = false
     // Function heads already index every overload by its base name. Scanning
     // the complete workspace here made every call argument O(all functions)
     // and repeatedly re-ran module visibility checks.
@@ -11923,11 +11925,22 @@ fn ctx_lookup_function_param_for_call(ctx: mut TranslatorContext, source_name: s
                     if compatible {
                         let candidate = function.params.get(wanted).unwrap_or("")
                         let specialized = specialize_named_type(candidate, function.generics, generic_args)
-                        if !found {
+                        // Use the same scope priority as final callee lookup:
+                        // local declarations, selected imports, then visibility.
+                        let candidate_priority = if binding_source != "" || function.source_name == source_name {
+                            0_usize
+                        } elif function_directly_imported(ctx, source_name, function.source_name, function.name) {
+                            1_usize
+                        } else {
+                            2_usize
+                        }
+                        if !found || candidate_priority < priority {
                             resolved = specialized
                             found = true
-                        } elif resolved != specialized {
-                            ret Option[str]::None
+                            priority = candidate_priority
+                            ambiguous = false
+                        } elif candidate_priority == priority && resolved != specialized {
+                            ambiguous = true
                         }
                     }
                 }
@@ -11944,7 +11957,7 @@ fn ctx_lookup_function_param_for_call(ctx: mut TranslatorContext, source_name: s
             }
         }
     }
-    ret if found {
+    ret if found && !ambiguous {
         Option[str]::Some(resolved)
     } else {
         Option[str]::None
@@ -11975,6 +11988,27 @@ fn translator_dispatch_type(ctx: mut TranslatorContext, expr: ExprNode) -> str {
         }
         Expr::Path(name) => {
             ret dispatch_value_type(ctx_lookup_var(ctx, name).unwrap_or(""))
+        }
+        Expr::Field(field_expr) => {
+            let owner = translator_dispatch_type_h(ctx, field_expr.base)
+            if owner == "" {
+                ret ""
+            }
+            ret ctx_lookup_field(ctx, owner, field_expr.field).unwrap_or("")
+        }
+        Expr::Index(index_expr) => {
+            let owner = translator_dispatch_type_h(ctx, index_expr.base)
+            if owner == "" {
+                ret ""
+            }
+            match index_expr.index.value {
+                Expr::Integer(raw_index) => {
+                    ret ctx_lookup_field(ctx, owner, numeric_literal_value(raw_index)).unwrap_or("")
+                }
+                _ => {
+                    ret ""
+                }
+            }
         }
         Expr::Parenthesized(inner) => {
             ret translator_dispatch_type_h(ctx, inner)

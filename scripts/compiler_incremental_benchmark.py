@@ -11,6 +11,8 @@ import statistics
 import subprocess
 import tomllib
 
+from sdk_packages import working_tree_files
+
 
 CASES = ("unchanged", "method-body", "function-body", "main-body", "relocate", "interface", "css")
 IGNORED = {".git", "target", "__pycache__", "node_modules", ".encore_cache", "artifacts", "bundles"}
@@ -32,10 +34,7 @@ def source_files(root):
     result = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
                             capture_output=True, text=True)
     if result.returncode == 0 and Path(result.stdout.strip()).resolve() == root.resolve():
-        names = os.fsdecode(subprocess.check_output([
-            "git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"
-        ])).split("\0")
-        return sorted({Path(n) for n in names if n and (root / n).is_file()})
+        return [Path(name) for name in working_tree_files(root)]
     names = []
     for directory, subdirs, files in os.walk(root):
         subdirs[:] = sorted(n for n in subdirs if n not in IGNORED)

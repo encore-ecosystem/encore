@@ -16,6 +16,8 @@ case "$CI_PROBE_CASE" in
     printf 'seed-build\n' > source/src/modes/build.enq
     touch source/runtime.c source/encore.toml source/README.md
     printf '0.1.6-neumann\n' > source/VERSION
+    mkdir -p source/scripts
+    cp "$repository/scripts/sdk_packages.py" source/scripts/
     git -C source init -q
     git -C source add .
     git -C source -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm seed
@@ -47,26 +49,32 @@ case "$CI_PROBE_CASE" in
     export CI_TARGET=x86_64-unknown-linux-gnu CI_EXECUTABLE=encore
     export CI_SEED_TAG=v0.1.1-neumann
     export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-    for scenario in valid corrupt missing-sources wrong-commit legacy-provenance wrong-profile missing-profile; do
+    for scenario in valid corrupt missing-sources wrong-commit legacy-provenance wrong-profile missing-profile wrong-sdk-digest wrong-sdk-commit missing-sdk-provenance; do
       workspace="$scratch/$scenario/encore"
       context="$workspace/target/test-context"
-      mkdir -p "$context/bin" "$workspace/packages/core" "$workspace/packages/platform" "$workspace/lsp"
+      mkdir -p "$(dirname "$workspace")"
+      git clone --quiet --shared --no-checkout "$repository" "$workspace"
+      mkdir -p "$context/bin" "$workspace/packages" "$workspace/lsp"
       mkdir -p "$workspace/scripts" "$workspace/src"
-      cp "$repository/scripts/project-metadata.py" "$workspace/scripts/"
+      cp "$repository/scripts/project-metadata.py" "$repository/scripts/sdk_packages.py" "$workspace/scripts/"
+      while IFS= read -r package; do
+        ln -s "$repository/$package" "$workspace/$package"
+      done < <(git -C "$repository" ls-tree --name-only HEAD packages/)
       cp "$repository/src/version.enq" "$workspace/src/"
       cp "$repository/encore.toml" "$workspace/"
       cp "$repository/tests/ci/mock-compiler.sh" "$context/bin/encore"
-      cp "$repository/packages/core/encore.toml" "$workspace/packages/core/"
-      cp "$repository/packages/platform/encore.toml" "$workspace/packages/platform/"
       cp "$repository/lsp/encore.toml" "$workspace/lsp/"
+      python3 "$workspace/scripts/sdk_packages.py" manifest --verify-checkout --output "$workspace/sdk-packages.json"
+      sdk_digest=$(sha256sum "$workspace/sdk-packages.json" | awk '{print $1}')
       digest=$(sha256sum "$context/bin/encore" | awk '{print $1}')
       release=$(python3 "$workspace/scripts/project-metadata.py" --field release)
       jq -n --arg commit "$GITHUB_SHA" --arg release "$release" \
         --arg target "$CI_TARGET" --arg seed "$CI_SEED_TAG" \
-        --arg digest "$digest" \
+        --arg digest "$digest" --arg sdk_digest "$sdk_digest" --slurpfile sdk "$workspace/sdk-packages.json" \
         '{schema:3, commit:$commit, release:$release, target:$target, seed:$seed,
           profile:"extreme", converged:true, stage2_sha256:$digest,
-          stage3_sha256:$digest, compiler_sha256:$digest}' \
+          stage3_sha256:$digest, compiler_sha256:$digest,
+          sdk_sha256:$sdk_digest, sdk_packages:$sdk[0].packages}' \
         > "$context/provenance.json"
       export GITHUB_ENV="$workspace/environment"
       case "$scenario" in
@@ -86,6 +94,18 @@ case "$CI_PROBE_CASE" in
           ;;
         legacy-provenance)
           jq '.schema = 2' "$context/provenance.json" > "$workspace/invalid.json"
+          mv "$workspace/invalid.json" "$context/provenance.json"
+          ;;
+        wrong-sdk-digest)
+          jq '.sdk_sha256 = "wrong"' "$context/provenance.json" > "$workspace/invalid.json"
+          mv "$workspace/invalid.json" "$context/provenance.json"
+          ;;
+        wrong-sdk-commit)
+          jq '.sdk_packages[0].commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' "$context/provenance.json" > "$workspace/invalid.json"
+          mv "$workspace/invalid.json" "$context/provenance.json"
+          ;;
+        missing-sdk-provenance)
+          jq 'del(.sdk_sha256, .sdk_packages)' "$context/provenance.json" > "$workspace/invalid.json"
           mv "$workspace/invalid.json" "$context/provenance.json"
           ;;
       esac
@@ -153,18 +173,21 @@ case "$CI_PROBE_CASE" in
       printf '%s\n' "$release" > "$root/VERSION"
       cp "$repository/tests/ci/mock-compiler.sh" "$root/bin/encore$extension"
       cp "$root/bin/encore$extension" "$root/bin/encore-lsp$extension"
-      for package in core platform std rich serialize json binary log profile ehir-core ehir ehir-llvm-backend toml colorterm llvm argparse secret-store; do
-        mkdir -p "$root/lib/encore/index/$package/src"
-        cp "$repository/packages/$package/encore.toml" "$root/lib/encore/index/$package/"
-        cp "$repository/packages/$package/src/lib.enq" "$root/lib/encore/index/$package/src/"
-      done
+      python3 "$repository/scripts/sdk_packages.py" export-sdk --destination "$root/lib/encore/index" --manifest "$root/SDK.json"
+      sdk_digest=$(sha256sum "$root/SDK.json" | awk '{print $1}')
       digest=$(sha256sum "$root/bin/encore$extension" | awk '{print $1}')
-      jq -n --arg sha "$digest" '{compiler_sha256:$sha, lsp_sha256:$sha, profile:"extreme", lsp_profile:"extreme"}' > provenance.json
+      jq -n --arg sha "$digest" --arg sdk_digest "$sdk_digest" --slurpfile sdk "$root/SDK.json" \
+        '{compiler_sha256:$sha, lsp_sha256:$sha, profile:"extreme", lsp_profile:"extreme",
+          sdk_sha256:$sdk_digest, sdk_packages:$sdk[0].packages}' > provenance.json
       if [[ -n "$extension" ]]; then zip -qr "$asset" "$root"; else tar -czf "$asset" "$root"; fi
       bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$asset" provenance.json
       if bash "$repository/scripts/verify-release-archive.sh" "$triple" wrong "$asset" provenance.json; then exit 1; fi
       jq '.lsp_sha256 = "wrong"' provenance.json > invalid.json
       if bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$asset" invalid.json; then exit 1; fi
+      jq '.sdk_sha256 = "wrong"' provenance.json > invalid-sdk.json
+      if bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$asset" invalid-sdk.json; then exit 1; fi
+      jq '.sdk_packages[0].commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' provenance.json > invalid-sdk.json
+      if bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$asset" invalid-sdk.json; then exit 1; fi
       for field in profile lsp_profile; do
         jq --arg field "$field" '.[$field] = "release"' provenance.json > invalid-profile.json
         if bash "$repository/scripts/verify-release-archive.sh" "$triple" "$release" "$asset" invalid-profile.json; then exit 1; fi
