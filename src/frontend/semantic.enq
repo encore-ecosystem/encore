@@ -71,7 +71,9 @@ pub struct SemanticCallable {
 /// Keep the output intact through bindings and generic substitution before await.
 pub fn semantic_call_return_type(item: FunctionItem) -> str {
     let output = item.ret_type.unwrap_or("void")
-    ret if item.is_async {
+    ret if item.is_generator {
+        "core::iter::Generator[" + output + "]"
+    } elif item.is_async {
         "__encore_async_future[" + output + "]"
     } else {
         output
@@ -309,6 +311,7 @@ struct SemanticContext {
     type_index: TypeScopeIndex
     callable_candidates: SemanticNameIndex
     method_candidates: SemanticNameIndex
+    generator_item_type: str
 }
 
 // Build against the exact view, including indirect selections and overlays.
@@ -749,7 +752,7 @@ fn check_function_body_indexed(item: FunctionItem, callables: SemanticSlice[Sema
         callables, fields, scoped_methods, self_type, generic_names, Vec[SemanticBinding]::new(), Vec[FrontendDiagnostic]::new(),
         Vec[SemanticDependency]::new(),
         (0_usize, 0_usize, 0_usize, 0_usize), Vec[ScopedSemanticBinding]::new(), aggregate_names,
-        Vec[(usize, usize, str)]::new(), type_names, type_scope, Vec[(usize, usize, str, str)]::new(), variants, item.is_async, type_index, callable_candidates, method_candidates
+        Vec[(usize, usize, str)]::new(), type_names, type_scope, Vec[(usize, usize, str, str)]::new(), variants, item.is_async, type_index, callable_candidates, method_candidates, ""
     }
     for generic in generics {
         if generic.bounds.len() > 0_usize {
@@ -813,10 +816,16 @@ fn check_function_body_indexed(item: FunctionItem, callables: SemanticSlice[Sema
             }
         }
     }
+    if item.is_generator {
+        ctx.generator_item_type = return_type
+        if item.is_async {
+            ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "async-generator", "async generators are not supported", item.line, item.column, item.name.len()))
+        }
+    }
     match item.body {
         Option::Some(body) => {
             check_statements(ctx, body.statements, return_type)
-            if return_type != "" && return_type != "void" && return_type != "()" && !statements_definitely_return(body.statements)
+            if !item.is_generator && return_type != "" && return_type != "void" && return_type != "()" && !statements_definitely_return(body.statements)
             {
                 ctx.diagnostics.push(
                     FrontendDiagnostic::new(
@@ -1441,6 +1450,22 @@ fn check_local_trait_impl(item: ImplStmt, traits: Vec[TraitStmt], out: mut Vec[F
             for method in item.methods {
                 if method.name == required.name {
                     found = true
+                    if required.is_async != method.is_async {
+                        let expected_kind = if required.is_async {
+                            "async"
+                        } else {
+                            "synchronous"
+                        }
+                        let actual_kind = if method.is_async {
+                            "async"
+                        } else {
+                            "synchronous"
+                        }
+                        out.push(FrontendDiagnostic::new(1_usize, "trait-method-async-mismatch",
+                                "method '" + method.name + "' is " + actual_kind + ", but the trait requires " + expected_kind,
+                                method.line, method.column, method.name.len(),))
+                        continue
+                    }
                     if !method_signatures_compatible(required, method, trait_item, item) {
                         let mismatch = method_signature_mismatch(required, method, trait_item, item)
                         out.push(
@@ -1490,8 +1515,8 @@ fn method_signature_mismatch(required: FunctionItem, actual: FunctionItem, trait
         }
         index += 1_usize
     }
-    let expected_return = substitute_trait_type(required.ret_type.unwrap_or("void"), trait_item, implementation)
-    let found_return = replace_type_name(actual.ret_type.unwrap_or("void"), "Self", implementation.target)
+    let expected_return = substitute_trait_type(semantic_call_return_type(required), trait_item, implementation)
+    let found_return = replace_type_name(semantic_call_return_type(actual), "Self", implementation.target)
     ret "method '" + actual.name + "' returns '" + found_return + "', expected '" + expected_return +
     "'"
 }
@@ -1511,8 +1536,8 @@ fn method_signatures_compatible(required: FunctionItem, actual: FunctionItem, tr
         }
         index += 1_usize
     }
-    let expected_return = substitute_trait_type(required.ret_type.unwrap_or("void"), trait_item, implementation)
-    ret semantic_types_compatible(expected_return, replace_type_name(actual.ret_type.unwrap_or("void"),
+    let expected_return = substitute_trait_type(semantic_call_return_type(required), trait_item, implementation)
+    ret semantic_types_compatible(expected_return, replace_type_name(semantic_call_return_type(actual),
             "Self", implementation.target,))
 }
 
@@ -1866,9 +1891,23 @@ fn check_statements(
                     , item.visible_line, item.visible_column,
                 )
             }
+            Statement::Yield(expr) => {
+                let actual = infer_expression(ctx, expr)
+                if ctx.generator_item_type == "" {
+                    ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "yield-outside-generator", "yield requires a named synchronous generator", expr.line, expr.column, expr.length))
+                } elif actual != "" && !semantic_types_compatible(ctx.generator_item_type, actual) && !expression_is_flexible_numeric(expr) {
+                    ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "yield-type-mismatch", "cannot yield '" + actual + "' as '" + ctx.generator_item_type + "'", expr.line, expr.column, expr.length))
+                }
+            }
             Statement::Ret(expr) => {
                 let flexible_numeric = expression_is_flexible_numeric(expr)
                 let actual = infer_expression(ctx, expr)
+                if ctx.generator_item_type != "" {
+                    if actual != "void" && actual != "()" {
+                        ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "generator-return-value", "a generator completes with ret ()", expr.line, expr.column, expr.length))
+                    }
+                    continue
+                }
                 if return_type != "" && return_type != "void" && actual != "" && !semantic_types_compatible(return_type,
                     actual,) && !flexible_numeric {
                     ctx.diagnostics.push(FrontendDiagnostic::new(1_usize, "return-type-mismatch", "cannot return value of type '"

@@ -287,7 +287,17 @@ ownership special case.
 
 Shallow finalization does not release child graph handles: the ERN transaction
 has already classified and detached those edges. Arbitrary user destructors and
-resurrection are not part of this model.
+resurrection of logically dead nodes are not part of this model.
+
+Generator context cleanup is a separate pre-death phase. Before reclaiming an
+unreachable generator, the runtime establishes a temporary root for its frame
+and queues its compiler-generated close callback. Active `with_exit` calls run
+outside the graph lock and outside shallow finalization, while their captured
+values remain alive. The callback closes the cursor and clears its owning state;
+releasing the temporary root then performs ordinary ERN classification again.
+Cycles receive the same treatment before any candidate node is marked dead.
+Closing is one-shot. A reference published during cleanup observes a completed
+generator; it cannot revive suspended execution.
 
 ## Strings, enums and dynamic values
 

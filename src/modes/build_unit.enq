@@ -16,7 +16,8 @@ import std::vec::Vec
 
 import ehirlib::{ModuleBundle, decode_typed_bundle, decode_typed_module, encode_typed_bundle, encode_typed_module}
 import ehirlib::codegen::{PreparedUnitCodegen, clear_codegen_error, incremental_codegen_context_bundle, prepare_normalized_unit_codegen, take_codegen_error, unit_codegen_context, unit_codegen_owned, unit_codegen_requirements}
-import ehirlib::core::{Module, make_module_bundle}
+import ehirlib::core::{Directive, FnDirective, Module, make_module, make_module_bundle}
+import ehirlib::coroutine::validate_generator_storage
 import json::{Json, parse, stringify}
 
 import mod::build_archive::{borrow_package_jobs, return_package_jobs}
@@ -130,6 +131,7 @@ pub fn prepare_package_worker_with_server(request: BuildUnitRequest, jobs: usize
         let dependency = decode_typed_bundle(input.payload, input.identity)?
         modules.extend(dependency.modules)
     }
+    validate_unit_generator_storage(frontend.owned, modules)?
     let entry = request.context.unit + if graph_package(request.graph, request.context.unit)?.target_is_binary {
         "@main.enq"
     } else {
@@ -206,6 +208,65 @@ pub fn prepare_package_worker_with_server(request: BuildUnitRequest, jobs: usize
 /// dependency payload validation is performed by preparation/restoration.
 pub fn package_backend_fingerprint(request: BuildUnitRequest) -> Result[str, str] {
     ret package_phase_fingerprint(request, false)
+}
+
+// Imported aggregates can hide a stack placement in one of their fields.
+// Liveness must inspect those layouts before coroutine lowering erases the
+// original generator body. Ordinary compilation never builds this catalog.
+fn validate_unit_generator_storage(owned: ModuleBundle, dependencies: Vec[Module]) -> Result[(), str] {
+    let mut generators = Vec[FnDirective]::new()
+    for module in owned.modules {
+        for directive in module.directives {
+            match directive {
+                Directive::Function(item) => {
+                    if item.generator_type.is_some() {
+                        generators.push(item)
+                    }
+                }
+                Directive::Impl(item) => {
+                    for method in item.methods {
+                        if method.generator_type.is_some() {
+                            generators.push(method)
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    if generators.is_empty() {
+        ret Result::Ok(())
+    }
+    let mut layouts = Vec[Directive]::new()
+    let mut modules = Vec[Module]::new()
+    modules.extend(dependencies)
+    modules.extend(owned.modules)
+    for module in modules {
+        for directive in module.directives {
+            match directive {
+                Directive::Struct(_) => {
+                    layouts.push(directive)
+                }
+                Directive::Enum(_) => {
+                    layouts.push(directive)
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    let catalog = make_module("generator-storage", layouts)
+    for generator in generators {
+        match validate_generator_storage(catalog, generator) {
+            Some(message) => {
+                ret Result::Err(message)
+            }
+            None => {
+            }
+        }
+    }
+    ret Result::Ok(())
 }
 
 pub fn package_frontend_fingerprint(request: BuildUnitRequest) -> Result[str, str] {
