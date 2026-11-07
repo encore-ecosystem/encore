@@ -78,9 +78,10 @@ release promotion verify both against the checked-out gitlinks. Target-kit
 metadata binds the same SDK digest and platform commit.
 
 The preparatory migration keeps source syntax supported by Encore 0.1.14.
-Release 0.1.15 can then introduce the language bridge for defaults, named calls,
-conversions and both operator contracts. Release 0.1.16 adopts two-argument
-operator traits and requires a published seed of at least 0.1.15. Those changes
+Release 0.1.15 adds synchronous generators while retaining that bootstrap seed.
+Release 0.1.16 can then introduce the language bridge for defaults, named calls,
+conversions and both operator contracts. Release 0.1.17 adopts two-argument
+operator traits and requires a published seed of at least 0.1.16. Those changes
 update package commits and their compiler gitlinks together.
 
 ## Selected package audit changes
