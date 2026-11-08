@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: build-target-kit.sh --host TRIPLE --target TRIPLE --toolchain DIR --platform DIR --out DIR --compiler PATH --linker PATH --archiver PATH [--sysroot PATH] [--compile-arg ARG] [--link-arg ARG] [--base-url URL]" >&2
+  echo "usage: build-target-kit.sh --host TRIPLE --target TRIPLE --toolchain DIR --platform DIR --out DIR --compiler PATH --linker PATH --archiver PATH [--sysroot PATH] [--compile-arg ARG] [--link-arg ARG] [--base-url URL] [--sdk-manifest FILE]" >&2
   exit 2
 }
 
@@ -16,6 +16,7 @@ linker=
 archiver=
 sysroot=
 base_url=
+sdk_manifest=
 compile_args=()
 link_args=()
 while (($#)); do
@@ -32,6 +33,7 @@ while (($#)); do
     --compile-arg) compile_args+=("$2"); shift 2 ;;
     --link-arg) link_args+=("$2"); shift 2 ;;
     --base-url) base_url=${2%/}; shift 2 ;;
+    --sdk-manifest) sdk_manifest=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -49,6 +51,9 @@ payload="$work/payload"
 mkdir -p "$payload/toolchain" "$out"
 cp -RL "$toolchain"/. "$payload/toolchain/"
 cp -RL "$platform" "$payload/platform"
+abi_header="$(dirname "$0")/../packages/core/runtime_abi.h"
+cp "$abi_header" "$payload/platform/runtime_abi.h"
+if test -n "$sdk_manifest"; then cp "$sdk_manifest" "$payload/SDK.json"; fi
 
 compiler_path="toolchain/$compiler"
 linker_path="toolchain/$linker"
@@ -106,3 +111,13 @@ jq -n \
   --arg sha256 "$checksum" \
   '{schema:1, abi:$abi, host:$host, target:$target, archive:$archive, sha256:$sha256, format:"tar.xz"}' \
   > "$out/target-kit-$host--$target.json"
+
+if test -n "$sdk_manifest"; then
+  sdk_sha=$(sha256sum "$sdk_manifest" | awk '{print $1}')
+  platform_commit=$(jq -r '.packages[] | select(.path == "packages/platform") | .commit' "$sdk_manifest")
+  test -n "$platform_commit"
+  descriptor="$out/target-kit-$host--$target.json"
+  jq --arg sdk "$sdk_sha" --arg platform "$platform_commit" \
+    '. + {sdk_sha256:$sdk, platform_commit:$platform}' "$descriptor" > "$work/descriptor.json"
+  mv "$work/descriptor.json" "$descriptor"
+fi

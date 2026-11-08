@@ -3,6 +3,16 @@
 Start with a correct, testable program. Measure before choosing a more complex
 representation or introducing concurrency.
 
+## Compiler and SDK checkout
+
+Clone the compiler with `git clone --recurse-submodules --branch trunk
+https://github.com/encore-ecosystem/encore.git`. For an existing clone, run
+`git submodule update --init --recursive` after selecting the compiler commit.
+The 17 packages under `packages/` are pinned repositories from
+`encore-language-index`. Commit a package change in its own repository, then
+update its gitlink in an Encore PR. Native CI tests that complete source set.
+Release archives expand those gitlinks into ordinary offline SDK directories.
+
 ## A short feedback loop
 
 Run `encore format --check`, `encore check`, and a focused `encore test --filter`
