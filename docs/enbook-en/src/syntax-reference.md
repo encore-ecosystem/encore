@@ -8,6 +8,7 @@ The [Language Guide](language-basics.md) and its feature pages show examples.
 | Spelling | Purpose | Read next |
 | --- | --- | --- |
 | `fn`, `ret`, `->` | function and return | [functions](features/functions-and-generics.md) |
+| `name: Type = literal`, `call(name: value)` | parameter default and named argument | [functions](features/functions-and-generics.md#default-parameters-and-named-arguments) |
 | `let`, `mut`, `static` | binding and capability | [bindings](features/bindings-and-static.md) |
 | `struct`, `enum` | product and alternative data | [structs](features/structs-and-placement.md), [enums](features/enums-and-match.md) |
 | `trait`, `impl ... for`, `Self`, `dyn` | behavior contracts and dispatch | [traits](features/traits-and-dyn.md) |
