@@ -1,195 +1,58 @@
-name: Native CI
-
+name: Language bridge focused verification
 on:
   workflow_dispatch:
-  pull_request:
-  push:
-    branches: [trunk]
-
 permissions:
   contents: read
   actions: read
-  pull-requests: read
-
-concurrency:
-  group: native-ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  candidate:
-    name: Select verified candidate
-    runs-on: ubuntu-latest
-    outputs:
-      reused: ${{ steps.select.outputs.reused }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-      - name: Reuse identical merged PR build
-        id: select
-        if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash scripts/select-ci-candidate.sh
-
-  resolve-inputs:
-    needs: candidate
-    if: needs.candidate.outputs.reused != 'true'
-    name: Resolve trusted inputs
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       GH_TOKEN: ${{ github.token }}
-    outputs:
-      seed_tag: ${{ steps.seed.outputs.tag }}
+      ENCORE_INDEX_URL: http://127.0.0.1:9/index
+      ENCORE_CORE_DIR: ${{ github.workspace }}/packages/core
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
-      - name: Validate manifest-derived release metadata
-        run: python3 scripts/test-project-metadata.py
-      - name: Record original build identity
-        shell: bash
+          python-version: '3.13'
+      - name: Prepare native toolchain
+        run: bash scripts/ci-prepare-toolchain.sh x86_64-unknown-linux-gnu
+      - name: Regenerate declaration, source and lowering codecs
         run: |
-          jq -n --arg commit "$GITHUB_SHA" --arg tree "$(git rev-parse HEAD^{tree})" \
-            '{commit: $commit, tree: $tree}' > build-identity.json
+          mkdir -p target/language-bridge-probe
+          python3 scripts/generate-frontend-artifact-codec.py
+          python3 scripts/generate-translation-environment-codec.py
+          python3 scripts/generate-source-artifact-codec.py
+          tar -czf target/language-bridge-probe/generated-sources.tar.gz src/frontend/semantic_codec.enq src/frontend/semantic_replay_codec.enq src/frontend/source_codec.enq src/frontend/translator_environment_codec.enq
+      - name: Verify release metadata and canonical SDK exports
+        run: |
+          python3 scripts/test-project-metadata.py
+          python3 scripts/test-sdk-packages.py
+      - name: Restore and verify published 0.1.15 seed
+        run: |
+          mkdir -p target/bridge-seed
+          gh release download v0.1.15-neumann --repo encore-ecosystem/encore --pattern encore-x86_64-unknown-linux-gnu.tar.gz --pattern encore-x86_64-unknown-linux-gnu.tar.gz.sha256 --dir target/bridge-seed
+          (cd target/bridge-seed && sha256sum -c encore-x86_64-unknown-linux-gnu.tar.gz.sha256)
+          tar -xzf target/bridge-seed/encore-x86_64-unknown-linux-gnu.tar.gz -C target/bridge-seed
+      - name: Build the language bridge from the published seed
+        run: |
+          seed="$PWD/target/bridge-seed/encore-0.1.15-neumann-x86_64-unknown-linux-gnu/bin/encore"
+          chmod +x "$seed"
+          "$seed" build --profile extreme > target/language-bridge-probe/build.log 2>&1 || { cat target/language-bridge-probe/build.log; exit 1; }
+          target/extreme/encore --version
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: language-bridge-build
+          path: |
+            target/language-bridge-probe/**
+            target/diagnostics/**
       - uses: actions/upload-artifact@v7
         with:
-          name: build-identity
-          path: build-identity.json
-          retention-days: 30
-      - name: Select latest stable compiler once
-        id: seed
-        shell: bash
-        run: |
-          set -euo pipefail
-          required='[
-            "encore-x86_64-unknown-linux-gnu.tar.gz",
-            "encore-aarch64-unknown-linux-gnu.tar.gz",
-            "encore-aarch64-apple-darwin.tar.gz",
-            "encore-x86_64-pc-windows-msvc.zip",
-            "encore-x86_64-w64-windows-gnu.zip",
-            "encore-aarch64-w64-windows-gnu.zip"
-          ]'
-          releases=$(gh release list --limit 100 --json tagName,publishedAt,isDraft,isPrerelease)
-          selected=$(jq -r '[.[] | select(.isDraft == false and .isPrerelease == false)
-            | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-[a-z][a-z0-9-]*)?$"))]
-            | sort_by(.publishedAt) | last | .tagName // empty' <<<"$releases")
-          test -n "$selected" || { echo "::error::No stable compiler release is available"; exit 1; }
-          python3 scripts/project-metadata.py --check-seed "$selected"
-          assets=$(gh release view "$selected" --json isDraft,isPrerelease,assets)
-          test "$(jq -r '.isDraft or .isPrerelease' <<<"$assets")" = false
-          if ! jq -e --argjson required "$required" \
-            '([.assets[].name] as $actual |
-              ($required + ($required | map(. + ".sha256"))) - $actual | length) == 0' <<<"$assets" >/dev/null
-          then
-            echo "::error::Latest stable seed $selected is incomplete; refusing an older fallback"
-            exit 1
-          fi
-          echo "tag=$selected" >> "$GITHUB_OUTPUT"
-          echo "### Trusted seed: \`$selected\`" >> "$GITHUB_STEP_SUMMARY"
-
-  kit-windows-gnu-x86:
-    needs: candidate
-    if: needs.candidate.outputs.reused != 'true'
-    uses: ./.github/workflows/ci-target-kit.yml
-    with:
-      target: x86_64-w64-windows-gnu
-      kind: windows
-
-  kit-windows-gnu-arm:
-    needs: candidate
-    if: needs.candidate.outputs.reused != 'true'
-    uses: ./.github/workflows/ci-target-kit.yml
-    with:
-      target: aarch64-w64-windows-gnu
-      kind: windows
-
-  kit-linux-arm:
-    needs: candidate
-    if: needs.candidate.outputs.reused != 'true'
-    uses: ./.github/workflows/ci-target-kit.yml
-    with:
-      target: aarch64-unknown-linux-gnu
-      kind: linux-aarch64
-
-  verify-linux-x86:
-    name: Verify x86_64-unknown-linux-gnu
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: ubuntu-latest
-      triple: x86_64-unknown-linux-gnu
-      executable: encore
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-linux-arm:
-    name: Verify aarch64-unknown-linux-gnu
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: ubuntu-24.04-arm
-      triple: aarch64-unknown-linux-gnu
-      executable: encore
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-macos-arm:
-    name: Verify aarch64-apple-darwin
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: macos-26
-      triple: aarch64-apple-darwin
-      executable: encore
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-windows-msvc-x86:
-    name: Verify x86_64-pc-windows-msvc
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: windows-latest
-      triple: x86_64-pc-windows-msvc
-      executable: encore.exe
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-windows-gnu-x86:
-    name: Verify x86_64-w64-windows-gnu
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: windows-latest
-      triple: x86_64-w64-windows-gnu
-      executable: encore.exe
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-windows-gnu-arm:
-    name: Verify aarch64-w64-windows-gnu
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: windows-11-arm
-      triple: aarch64-w64-windows-gnu
-      executable: encore.exe
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  complete:
-    name: CI complete
-    if: always()
-    needs: [candidate, resolve-inputs, kit-windows-gnu-x86, kit-windows-gnu-arm, kit-linux-arm, verify-linux-x86, verify-linux-arm, verify-macos-arm, verify-windows-msvc-x86, verify-windows-gnu-x86, verify-windows-gnu-arm]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require a complete verified candidate
-        env:
-          REUSED: ${{ needs.candidate.outputs.reused }}
-          RESULTS: ${{ toJSON(needs) }}
-        run: |
-          set -euo pipefail
-          if test "$REUSED" = true; then
-            jq -e '.candidate.result == "success" and
-              (to_entries | all(.[]; .value.result == "success" or .value.result == "skipped"))' <<<"$RESULTS"
-          else
-            jq -e 'all(.[]; .result == "success")' <<<"$RESULTS"
-          fi
+          name: language-bridge-compiler
+          path: target/extreme/encore
