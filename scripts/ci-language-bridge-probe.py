@@ -39,7 +39,7 @@ def run(label, command, cwd=root, timeout=1800, extra=None):
 if group == "calls":
     for label in ["default_and_named_arguments", "negative_default_", "negative_named_",
                   "negative_positional_after_named", "negative_trait_impl_default", "from_into",
-                  "negative_from_narrowing", "negative_into_unknown_target"]:
+                  "negative_from_narrowing", "negative_into_"]:
         run(label, [str(compiler), "test", "--jobs", "2", "--filter", ":tests/" + label])
 if group == "contracts":
     run("metadata-codecs", [str(compiler), "test", "--jobs", "2", "--filter", "metadata_codec"])
