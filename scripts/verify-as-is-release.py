@@ -52,6 +52,10 @@ if "--wait" in sys.argv:
         pending_run = api(f"actions/runs/{BUILD_RUN}")
         require(pending_run["head_sha"] == RELEASE_COMMIT and pending_run["head_branch"] == "trunk",
                 "Refusing to cancel an unexpected build")
+        if pending_run["status"] == "completed":
+            require(pending_run["conclusion"] == "cancelled", "Unexpected completed build result")
+            print("Native build is already cancelled; the next step rechecks every required artifact", flush=True)
+            raise SystemExit(0)
         pending_jobs = api(f"actions/runs/{BUILD_RUN}/jobs?per_page=100")["jobs"]
         bad = [job["name"] for job in pending_jobs if job["conclusion"] in ["failure", "timed_out", "action_required"]]
         require(not bad, f"Native build or verification failed: {bad}")
