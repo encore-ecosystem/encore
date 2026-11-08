@@ -93,9 +93,13 @@ for package in core platform std json; do
 done
 python3 "$repository/scripts/sdk_packages.py" --ref "$seed_tag" export --destination "$source_root" \
   --path packages/core --path packages/platform --path packages/std --path packages/json
-python3 "$repository/scripts/sdk_packages.py" --ref "$seed_tag" manifest --output "$repository/target/seed-sdk.json"
-jq -n --arg seed "$seed_tag" --slurpfile sdk "$repository/target/seed-sdk.json" \
-  '{schema:1, stage:1, sdk_source:$seed, sdk_packages:$sdk[0].packages}' > "$repository/target/seed-bootstrap.json"
+if [[ "$(git ls-tree "$seed_tag" -- packages/core)" == 160000* ]]; then
+  python3 "$repository/scripts/sdk_packages.py" --ref "$seed_tag" manifest --output "$repository/target/seed-sdk.json"
+  jq -n --arg seed "$seed_tag" --slurpfile sdk "$repository/target/seed-sdk.json" \
+    '{schema:1, stage:1, sdk_source:$seed, sdk_packages:$sdk[0].packages}' > "$repository/target/seed-bootstrap.json"
+else
+  jq -n --arg seed "$seed_tag" '{schema:1, stage:1, sdk_source:$seed}' > "$repository/target/seed-bootstrap.json"
+fi
 # Current compiler checkpoints use four scalar codec helpers absent from older
 # SDKs. Add that standalone native ABI to the isolated stage1 runtime only.
 if [[ -f "$repository/packages/core/runtime_codec.h" ]] &&
