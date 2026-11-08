@@ -1987,6 +1987,24 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
             collect_module_type_declarations(ctx, module)
         }
     }
+    // Register contracts before implementations so forward-declared traits
+    // supply the same public call signature as earlier declarations.
+    for statement in normalized_ast {
+        match statement {
+            Statement::Trait(item) => {
+                let owner = trait_identity_for_source(ctx, item.source_name, item.name)
+                let mut bases = Vec[str]::new()
+                for base in item.bases {
+                    bases.push(trait_identity_for_source(ctx, item.source_name, base))
+                }
+                remember_type(ctx, owner)
+                remember_trait(ctx, owner, resolved_generic_bounds(ctx, item.source_name, item.generics),
+                    bases, item.methods, item.source_name, item.line, item.column,
+                    contains_str(item.attrs, "plugin_interface"))
+            }
+            _ => {}
+        }
+    }
     for stmt in normalized_ast {
         match stmt {
             Statement::Function(fn_item) => {
@@ -2038,13 +2056,6 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
             }
             Statement::Trait(trait_item) => {
                 let trait_owner = trait_identity_for_source(ctx, trait_item.source_name, trait_item.name)
-                let mut bases = Vec[str]::new()
-                for base in trait_item.bases {
-                    bases.push(trait_identity_for_source(ctx, trait_item.source_name, base))
-                }
-                remember_type(ctx, trait_owner)
-                remember_trait(ctx, trait_owner, resolved_generic_bounds(ctx, trait_item.source_name, trait_item.generics), bases, trait_item.methods,
-                    trait_item.source_name, trait_item.line, trait_item.column, contains_str(trait_item.attrs, "plugin_interface"),)
                 let trait_generics = generic_param_names(trait_item.generics)
                 for method in trait_item.methods {
                     let mut method_generics = copy_str_vec(trait_generics)
@@ -2126,7 +2137,7 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
                                 impl_item.target,), function_param_sending(method), function_param_frozen(method),
                             function_receiver_is_readonly(method), function_has_receiver(method), method_generics, false, method.is_async, output_type,
                             method.returns_sending, method.returns_frozen, false,)
-                    ctx_remember_call_parameters(ctx, method.params)
+                        ctx_remember_impl_call_parameters(ctx, impl_item, method)
                         if method.is_async {
                             remember_async_future_output(ctx, method, callable_type, output_type)
                         }
@@ -2141,7 +2152,6 @@ fn collect_context_with_abi(ast: Vec[Statement], modules: Vec[TranslationModule]
     }
     validate_trait_declarations(ctx)
     validate_operator_coherence(ctx)
-    inherit_trait_call_parameters(ctx, normalized_ast)
     index_function_import_aliases(ctx)
     register_reflection_templates(ctx, normalized_ast)
     infer_static_value_types(ctx, normalized_ast)
@@ -3300,7 +3310,7 @@ fn ctx_add_function(ctx: mut TranslatorContext, source_name: str, name: str, ret
         name + "__overload_" + Debug::fmt(overload_index)
     }
     let is_member = last_scope_index(name) < name.len()
-    let emitted_name = if is_extern || name == "main" || name == "encore_plugin_entry_v1" || is_member {
+    let mut emitted_name = if is_extern || name == "main" || name == "encore_plugin_entry_v1" || is_member {
         local_name
     } else {
         module_symbol_prefix(ctx, source_name) + local_name
@@ -3321,6 +3331,24 @@ fn ctx_add_function(ctx: mut TranslatorContext, source_name: str, name: str, ret
     let mut resolved_params = Vec[str]::new()
     for param in params {
         resolved_params.push(qualified_generic_type(ctx, source_name, param, signature_generics))
+    }
+    // An inherent method and its trait adapter can declare the same ABI.
+    // Keep their original shared symbol; only distinct signatures overload it.
+    if is_member {
+        let mut encoded = previous_head
+        while encoded > 0_usize {
+            let index = encoded - 1_usize
+            let function = ctx.functions.get_unchecked_borrowed(index)
+            if function.source_name == source_name && function.ret_type == resolved_ret_type &&
+            function.output_type == resolved_output_type && function.has_receiver == has_receiver &&
+            function.is_async == is_async && function.is_extern == is_extern &&
+            join_strs(function.params, "\n") == join_strs(resolved_params, "\n") &&
+            join_strs(function.generics, "\n") == join_strs(generics, "\n") {
+                emitted_name = function.emitted_name
+                break
+            }
+            encoded = ctx.function_next.get(index).unwrap_or(0_usize)
+        }
     }
     ctx.functions.push(FunctionType {
             name, emitted_name, source_name, resolved_ret_type, resolved_params, sending_params, frozen_params, readonly_self, has_receiver,
@@ -18880,41 +18908,28 @@ fn lower_conversion(ctx: mut TranslatorContext, value: LoweredExpr, borrowed: bo
 }
 
 
-fn inherit_trait_call_parameters(ctx: mut TranslatorContext, ast: Vec[Statement]) -> () {
-    for statement in ast {
-        match statement {
-            Statement::Impl(item) => {
-                match item.trait_name {
-                    Some(raw_trait) => {
-                        let trait_name = trait_identity_for_source(ctx, item.source_name, raw_trait)
-                        for method in item.methods {
-                            let name = base_type_name(item.target) + "::" + trait_implementation_method(ctx, trait_name, method.name)
-                            match trait_method_declaration(ctx, trait_name, method.name) {
-                                Some(declaration) => {
-                                    for parameter in method.params {
-                                        if parameter.default_value.is_some() {
-                                            translation_error_at(method.source_name, parameter.line, parameter.column, "trait-impl-default", "declare parameter defaults on the trait, not its implementation")
-                                        }
-                                    }
-                                    let emitted = ctx_emitted_declaration_name(ctx, method.source_name, name,
-                                        function_param_types_for_owner(method, item.target), combined_generic_params(item.generics, method.generics))
-                                    for position in 0_usize..ctx.functions.len() {
-                                        let function = ctx.functions.get_unchecked_borrowed(position)
-                                        if function.emitted_name == emitted && function.source_name == method.source_name {
-                                            ctx.functions.set(position, FunctionType { function.name, function.emitted_name, function.source_name, function.ret_type, function.params, function.sending_params, function.frozen_params, function.readonly_self, function.has_receiver, function.generics, function.is_extern, function.is_async, function.output_type, function.returns_sending, function.returns_frozen, function.is_static, call_parameters(declaration.params, 0_usize) })
-                                        }
-                                    }
-                                }
-                                None => {}
-                            }
-                        }
-                    }
-                    None => {}
+fn ctx_remember_impl_call_parameters(ctx: mut TranslatorContext, item: ImplStmt, method: FunctionItem) -> () {
+    match item.trait_name {
+        Some(raw_trait) => {
+            for parameter in method.params {
+                if parameter.default_value.is_some() {
+                    translation_error_at(method.source_name, parameter.line, parameter.column,
+                        "trait-impl-default", "declare parameter defaults on the trait, not its implementation")
                 }
             }
-            _ => {}
+            let identity = trait_identity_for_source(ctx, item.source_name, raw_trait)
+            match trait_method_declaration(ctx, identity, method.name) {
+                Some(declaration) => {
+                    ctx_remember_call_parameters(ctx, declaration.params)
+                    ret ()
+                }
+                None => {}
+            }
         }
+        None => {}
     }
+    ctx_remember_call_parameters(ctx, method.params)
+    ret ()
 }
 
 
