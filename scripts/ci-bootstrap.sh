@@ -22,6 +22,9 @@ test ! -e target/extreme
 test ! -e target/bootstrap-cache-1
 ENCORE_BUILD_CACHE="$PWD/target/bootstrap-cache-1" \
   bash "$(dirname "$0")/ci-seed-build.sh" "$seed" "$seed_tag" "${build_args[@]}"
+if [[ -f target/seed-bootstrap.json ]]; then
+  bootstrap=$(cat target/seed-bootstrap.json)
+fi
 mkdir -p target/stage1
 cp "target/extreme/$executable" "target/stage1/$executable"
 mv target/extreme target/stage1-output
