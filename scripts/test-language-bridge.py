@@ -28,7 +28,9 @@ def next_operator_sdk(source: str) -> str:
 
 def verify(compiler: Path, root: Path) -> None:
     core = root / "core"
-    shutil.copytree(ROOT / "packages/core", core, ignore=shutil.ignore_patterns("target", ".encore"))
+    ignored = shutil.ignore_patterns("target", ".encore", ".encore_cache", ".git", "__pycache__")
+    shutil.copytree(ROOT / "packages/core", core, ignore=ignored)
+    shutil.copytree(ROOT / "packages/platform", root / "platform", ignore=ignored)
     ops = core / "src/ops/mod.enq"
     ops.write_text(next_operator_sdk(ops.read_text(encoding="utf-8")), encoding="utf-8")
     project = root / "app"
