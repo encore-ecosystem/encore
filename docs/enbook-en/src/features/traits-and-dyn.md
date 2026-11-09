@@ -29,7 +29,7 @@ An `impl` header accepts a qualified trait path, including a namespace alias:
 import core::ops as Operators
 
 struct Value { number: u32 }
-impl Operators::Add[Value] for Value {
+impl Operators::Add[Value, Value] for Value {
     fn op(self: Self, other: Self) -> Self {
         ret Self { self.number + other.number }
     }
