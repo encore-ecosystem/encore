@@ -11,7 +11,7 @@ shift 2
 needs_path_bridge=false
 case "$seed_tag" in
   v0.1.[0-5]-neumann) needs_path_bridge=true ;;
-  v0.1.[6-9]-neumann|v0.1.1[0-3]-neumann) ;;
+  v0.1.[6-9]-neumann|v0.1.1[0-3]-neumann|v0.1.15-neumann) ;;
   *) exec "$seed" "$@" ;;
 esac
 if [[ ! -f packages/core/src/reflect/mod.enq ]]; then
@@ -75,6 +75,15 @@ source_root="$repository/target/seed-source"
 test ! -e "$source_root"
 test ! -e target/extreme
 git rev-parse --verify "$seed_tag^{commit}" >/dev/null
+# Submodule-based seeds can pin an ancestor that a shallow SDK checkout has
+# not fetched. Fetch only those exact objects before exporting the seed SDK.
+while read -r mode kind object path; do
+  if [[ "$mode" == 160000 && -d "$repository/$path" ]]; then
+    if ! git -C "$repository/$path" cat-file -e "$object^{commit}" 2>/dev/null; then
+      git -C "$repository/$path" fetch origin "$object"
+    fi
+  fi
+done < <(git ls-tree -r "$seed_tag" -- packages/core packages/platform packages/std packages/json)
 mkdir -p "$source_root"
 tar -cf - --exclude='packages/*/target' --exclude=.git \
   src packages runtime runtime.c encore.toml README.md |
@@ -84,6 +93,13 @@ for package in core platform std json; do
 done
 python3 "$repository/scripts/sdk_packages.py" --ref "$seed_tag" export --destination "$source_root" \
   --path packages/core --path packages/platform --path packages/std --path packages/json
+if [[ "$(git ls-tree "$seed_tag" -- packages/core)" == 160000* ]]; then
+  python3 "$repository/scripts/sdk_packages.py" --ref "$seed_tag" manifest --output "$repository/target/seed-sdk.json"
+  jq -n --arg seed "$seed_tag" --slurpfile sdk "$repository/target/seed-sdk.json" \
+    '{schema:1, stage:1, sdk_source:$seed, sdk_packages:$sdk[0].packages}' > "$repository/target/seed-bootstrap.json"
+else
+  jq -n --arg seed "$seed_tag" '{schema:1, stage:1, sdk_source:$seed}' > "$repository/target/seed-bootstrap.json"
+fi
 # Current compiler checkpoints use four scalar codec helpers absent from older
 # SDKs. Add that standalone native ABI to the isolated stage1 runtime only.
 if [[ -f "$repository/packages/core/runtime_codec.h" ]] &&
