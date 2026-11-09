@@ -73,9 +73,8 @@ if group == "operators":
 if group == "selfhost":
     if not run("selfhost-stage2", [str(compiler), "build", "--profile", "extreme", "--jobs", "2"], timeout=2400,
                extra={"ENCORE_BUILD_CACHE": str(root / "target/operator-stage2-cache")}):
-        stage2 = root / "target/operator-stage2"
-        stage2.mkdir(exist_ok=True)
-        (root / "target/extreme/encore").rename(stage2 / "encore")
+        stage2 = root / "target/operator-stage2-output"
+        (root / "target/extreme").rename(stage2)
         if not run("selfhost-stage3", [str(stage2 / "encore"), "build", "--profile", "extreme", "--jobs", "2"], timeout=2400,
                    extra={"ENCORE_BUILD_CACHE": str(root / "target/operator-stage3-cache")}):
             run("convergence", ["cmp", str(stage2 / "encore"), str(root / "target/extreme/encore")])
