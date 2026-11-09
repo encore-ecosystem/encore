@@ -7,7 +7,7 @@ import tarfile
 
 root = Path.cwd()
 group = os.environ["LANGUAGE_BRIDGE_GROUP"]
-if group not in {"calls", "contracts", "metadata", "generators", "operators", "selfhost", "format", "regressions", "safety", "suite"}:
+if group not in {"calls", "contracts", "metadata", "generators", "operators", "selfhost", "format", "regressions", "safety", "suite", "libraries"}:
     raise SystemExit("Unknown verification group: " + group)
 output = root / "target/language-bridge-probe" / group
 output.mkdir(parents=True, exist_ok=True)
@@ -46,6 +46,10 @@ if group == "calls":
 if group == "suite":
     run("compiler-suite", ["bash", "scripts/ci-test.sh", str(compiler), "--jobs", "2"], timeout=3000,
         extra={"CI_TEST_RUN_ID": "operator-sdk-suite"})
+if group == "libraries":
+    for package in ["core", "platform", "std", "serialize", "json", "binary", "ehir-core", "ehir", "ehir-llvm-backend", "toml"]:
+        run("package-" + package, [str(compiler), "test", "--report", "target/test-report.json"],
+            cwd=root / "packages" / package, timeout=2400)
 if group == "contracts":
     run("metadata-codecs", [str(compiler), "test", "--jobs", "2", "--filter", "metadata_codec"])
     run("semantic-interning", [str(compiler), "test", "--jobs", "2", "--filter", ":tests/semantic_index_typed_interning.enq"])
