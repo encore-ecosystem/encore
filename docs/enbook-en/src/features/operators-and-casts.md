@@ -1,8 +1,11 @@
 # Operators and Casts
 
-Arithmetic, comparison, bitwise, shift, and compound-assignment operators are
+Arithmetic, comparison, bitwise and shift binary operators are
 resolved through `core::ops`. `as` performs an explicit supported conversion;
 it does not silently reinterpret an unrelated representation.
+
+Compound assignment preserves the target type and retains its existing
+conversion rules.
 
 A `*` after an `as` target can belong to a raw pointer type. Parenthesize a
 scalar cast before multiplying, for example `(cycles as f32) * duration`.
@@ -42,7 +45,7 @@ This applies to `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Pow`, `BitAnd`, `BitOr`,
 `bool` and take one type argument. Generic bounds use the same contract, for
 example `L: Add[R, O]` for a function returning `O` from `lhs + rhs`.
 
-Operators require an implementation for the actual operand types. A `u8`
+Binary operators require an implementation for the actual operand types. A `u8`
 variable and a `u16` variable cannot be added by implicit widening; convert
 explicitly with `as` or `From`/`Into`. Unsuffixed numeric literals can use the
 operand type required by the selected implementation. A pair of operand types
