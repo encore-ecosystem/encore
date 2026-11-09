@@ -83,7 +83,7 @@ if group == "format":
     changed = subprocess.check_output(["git", "diff", "--name-only", "origin/trunk...HEAD"], text=True).splitlines()
     changed += ["packages/core/src/lib.enq", "packages/core/src/convert/mod.enq",
                 "packages/std/src/lib.enq", "packages/std/src/convert/mod.enq",
-                "packages/core/src/ops/mod.enq", "packages/std/src/path/mod.enq"]
+                "packages/core/src/ops/mod.enq", "packages/std/src/path/mod.enq", "packages/binary/src/lib.enq"]
     formatted = []
     for index, relative in enumerate(sorted(set(changed))):
         path = root / relative
