@@ -7,7 +7,7 @@ import tarfile
 
 root = Path.cwd()
 group = os.environ["LANGUAGE_BRIDGE_GROUP"]
-if group not in {"calls", "contracts", "metadata", "generators", "operators", "selfhost", "format", "regressions", "safety", "suite", "libraries", "extras"}:
+if group not in {"calls", "contracts", "metadata", "generators", "operators", "selfhost", "format", "regressions", "safety", "suite", "libraries", "extras", "power"}:
     raise SystemExit("Unknown verification group: " + group)
 output = root / "target/language-bridge-probe" / group
 output.mkdir(parents=True, exist_ok=True)
@@ -54,6 +54,9 @@ if group == "extras":
     for package in ["argparse", "rich", "log", "profile"]:
         run("package-" + package, [str(compiler), "test", "--report", "target/test-report.json"],
             cwd=root / "packages" / package, timeout=2400)
+if group == "power":
+    run("power-regressions", [str(compiler), "test", "--jobs", "2", "--filter", ":tests/power_"])
+    run("book-examples", [str(compiler), "run", "--manifest-path", "docs/enbook-en/examples/guide/encore.toml", "--jobs", "2"])
 if group == "contracts":
     run("metadata-codecs", [str(compiler), "test", "--jobs", "2", "--filter", "metadata_codec"])
     run("semantic-interning", [str(compiler), "test", "--jobs", "2", "--filter", ":tests/semantic_index_typed_interning.enq"])
