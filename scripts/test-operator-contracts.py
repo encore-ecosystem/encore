@@ -45,13 +45,12 @@ def verify(compiler: Path, root: Path) -> None:
         run("build", error="missing-operator-implementation")
         source.write_text(f'fn main() -> u32 {{ let value = 1_u8 {operator} 2_u16 ret 0_u32 }}\n', encoding="utf-8")
         run("build", error="missing-operator-implementation")
-    source.write_text('''import core::ops::Add
-struct Number { value: u32 }
-impl Add[u32, u32] for Number { fn op(self: Self, other: u32) -> u32 { ret other } }
-impl Add[u32, u64] for Number { fn op(self: Self, other: u32) -> u64 { ret other as u64 } }
-fn main() -> u32 { let result = Number{1_u32} + 2_u32 ret 0_u32 }
-''', encoding="utf-8")
-    run("build", error="operator-implementation")
+    for fixture in ["negative_operator_mixed_operands", "negative_operator_legacy_arity",
+                    "negative_operator_ambiguous_output", "negative_operator_unconstrained_output"]:
+        case = (ROOT / "tests" / (fixture + ".enq")).read_text(encoding="utf-8")
+        expected = case.splitlines()[0].split("expect.compile_error=", 1)[1]
+        source.write_text(case, encoding="utf-8")
+        run("build", error=expected)
     print("operator SDK: exact operands, Output, generic dispatch, caches and diagnostics verified", flush=True)
 
 
