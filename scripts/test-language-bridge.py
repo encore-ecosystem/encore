@@ -45,7 +45,7 @@ def verify(compiler: Path, root: Path) -> None:
 
     def run(*args: str, error: str | None = None) -> None:
         result = subprocess.run([str(compiler), *args], cwd=project, env=env,
-                                capture_output=True, text=True, timeout=600)
+                                capture_output=True, text=True, encoding="utf-8", timeout=600)
         if error is None:
             if result.returncode == 0:
                 return
