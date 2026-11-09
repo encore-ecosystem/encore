@@ -43,6 +43,8 @@ def verify(compiler: Path, root: Path) -> None:
     for operator in ["+", "-", "*", "/", "%", "**", "&", "|", "^", "<<", ">>", "==", "!=", "<", "<=", ">", ">="]:
         source.write_text(f'fn main() -> u32 {{ let left = 1_u8 let right = 2_u16 let value = left {operator} right ret 0_u32 }}\n', encoding="utf-8")
         run("build", error="missing-operator-implementation")
+        source.write_text(f'fn main() -> u32 {{ let value = 1_u8 {operator} 2_u16 ret 0_u32 }}\n', encoding="utf-8")
+        run("build", error="missing-operator-implementation")
     source.write_text('''import core::ops::Add
 struct Number { value: u32 }
 impl Add[u32, u32] for Number { fn op(self: Self, other: u32) -> u32 { ret other } }
