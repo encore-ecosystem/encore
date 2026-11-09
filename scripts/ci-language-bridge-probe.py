@@ -7,6 +7,8 @@ import tarfile
 
 root = Path.cwd()
 group = os.environ["LANGUAGE_BRIDGE_GROUP"]
+if group not in {"calls", "contracts", "metadata", "generators", "operators", "selfhost", "format", "regressions", "safety"}:
+    raise SystemExit("Unknown verification group: " + group)
 output = root / "target/language-bridge-probe" / group
 output.mkdir(parents=True, exist_ok=True)
 compiler = root / "target/bridge-compiler/encore"
@@ -44,6 +46,8 @@ if group == "calls":
 if group == "contracts":
     run("metadata-codecs", [str(compiler), "test", "--jobs", "2", "--filter", "metadata_codec"])
     run("semantic-interning", [str(compiler), "test", "--jobs", "2", "--filter", ":tests/semantic_index_typed_interning.enq"])
+if group == "safety":
+    run("safety_plan_dependencies", [str(compiler), "test", "--jobs", "2", "--filter", ":tests/safety_plan_dependencies"])
 if group == "regressions":
     for label in ["semantic_shared_views", "safety_plan_dependencies", "poll_payload_binding",
                   "negative_method_missing_argument", "negative_call_argument_mismatch"]:
