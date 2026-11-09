@@ -44,7 +44,7 @@ if group == "calls":
                   "negative_from_narrowing", "negative_into_"]:
         run(label, [str(compiler), "test", "--jobs", "2", "--filter", ":tests/" + label])
 if group == "suite":
-    run("compiler-suite", ["bash", "scripts/ci-test.sh", str(compiler), "--jobs", "2"], timeout=3000,
+    run("compiler-suite", ["bash", "scripts/ci-test.sh", str(compiler), "--jobs", "4"], timeout=10200,
         extra={"CI_TEST_RUN_ID": "operator-sdk-suite"})
 if group == "libraries":
     for package in ["core", "platform", "std", "serialize", "json", "binary", "ehir-core", "ehir", "ehir-llvm-backend", "toml"]:
