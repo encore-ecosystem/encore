@@ -44,6 +44,13 @@ if group == "calls":
 if group == "contracts":
     run("metadata-codecs", [str(compiler), "test", "--jobs", "2", "--filter", "metadata_codec"])
     run("semantic-interning", [str(compiler), "test", "--jobs", "2", "--filter", ":tests/semantic_index_typed_interning.enq"])
+if group == "regressions":
+    for label in ["semantic_shared_views", "safety_plan_dependencies", "poll_payload_binding",
+                  "negative_method_missing_argument", "negative_call_argument_mismatch"]:
+        run(label, [str(compiler), "test", "--jobs", "2", "--filter", ":tests/" + label])
+    run("standalone-arity", ["bash", "scripts/ci-test.sh", str(compiler), "--jobs", "2", "--filter",
+                              "open_issue_191_unmarked_standalone_rejects_missing_argument"],
+        extra={"CI_TEST_RUN_ID": "language-bridge-arity"})
 if group == "metadata":
     run("package-defaults", ["bash", "scripts/ci-test.sh", str(compiler), "--jobs", "2", "--filter", "integration_language_call_metadata"],
         extra={"CI_TEST_RUN_ID": "language-bridge-metadata"})
@@ -72,5 +79,8 @@ if group == "format":
         for relative in formatted:
             stream.add(root / relative, arcname=relative)
     (output / "formatted.json").write_text(json.dumps(formatted, indent=2))
+    for generator in ["generate-frontend-artifact-codec.py", "generate-translation-environment-codec.py",
+                      "generate-source-artifact-codec.py"]:
+        run(generator, ["python3", "scripts/" + generator, "--check"])
 (output / "result.json").write_text(json.dumps({"group": group, "failed": failures}, indent=2))
 raise SystemExit(bool(failures))
