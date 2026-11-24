@@ -1,9 +1,6 @@
 # Network for Encore
 
-Synchronous and asynchronous TCP/TLS streams and listeners for macOS and Linux.
-Requires Encore 0.1.12, clang and OpenSSL 3. `build.enq` builds the native backend;
-set `OPENSSL_DIR` for a custom OpenSSL prefix. Homebrew's `openssl@3` and the Linux
-system installation are discovered automatically.
+Synchronous and asynchronous TCP/TLS streams and listeners for macOS, Linux and Windows. The native backend uses Clang and OpenSSL 3. Set `OPENSSL_DIR` for a custom OpenSSL prefix. For Windows it must contain headers and static libraries for the selected target. The build also accepts a bundled prefix under `openssl/<target>` beside the SDK packages.
 
 `Stream::connect(ConnectOptions::tcp(host, port))` opens TCP. Use
 `ConnectOptions::tls` for verified TLS and optionally set `ca_file`.
@@ -13,7 +10,7 @@ Streams expose `read(max)`, `write_all(bytes)`, and `close()`. Listeners expose
 Every I/O method has an `_async` counterpart returning a named Encore future.
 Binary data is a raw Encore byte string; `byte(u8)` constructs arbitrary bytes.
 
-One shared reactor handles TCP, TLS, Unix sockets and timers. It uses epoll on Linux and kqueue on macOS. Four DNS workers resolve names.
+One shared reactor handles TCP, TLS, IPC and timers. It uses epoll on Linux, kqueue on macOS, and IOCP on Windows. Four DNS workers resolve names.
 TLS requires version 1.2 or newer, verifies hostname/IP and CA trust, and sends
 SNI for DNS names. Operations use opaque IDs; native workers retain no Encore
 heap pointers. The backend follows Encore's std/platform networking and reactor

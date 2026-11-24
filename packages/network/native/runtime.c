@@ -4,27 +4,41 @@
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE
 #endif
-#include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
-#include <netdb.h>
-#include <poll.h>
-#include <pthread.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifdef _WIN32
+#include "network_win.h"
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <time.h>
 #include <unistd.h>
+static int mf_socket_open(int family, int type, int protocol) { return socket(family,type,protocol); }
+static int mf_socket_accept(int fd) { return accept(fd,NULL,NULL); }
+static void mf_socket_close(int fd) { if (fd>=0) close(fd); }
+static bool mf_retry_io(void) { return errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR; }
+static bool mf_retry_connect(void) { return errno==EINPROGRESS; }
+static bool mf_init_network(void) { return true; }
+#endif
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#ifdef _WIN32
+#include "reactor_windows.h"
+#else
 #include "reactor_posix.h"
+#endif
 
 typedef struct { size_t refs, len; char data[]; } mf_str_object;
 typedef struct { mf_str_object *object; } mf_str;
@@ -38,13 +52,33 @@ static char *scopy(mf_str s) {
     size_t n=slen(s); if (memchr(sdata(s),0,n)) return NULL;
     char *p=malloc(n+1); if(p) { memcpy(p,sdata(s),n); p[n]=0; } return p;
 }
-static uint64_t now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000+t.tv_nsec/1000000; }
+static uint64_t now_ms(void) {
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64_t)t.tv_sec*1000+t.tv_nsec/1000000;
+#endif
+}
 typedef struct message message;
 struct message { char *bytes; size_t length; message *next; };
 typedef struct endpoint endpoint;
 typedef struct operation operation;
-struct endpoint { size_t id, refs, group; int fd; bool closed, listener, local; SSL_CTX *ctx; SSL *ssl; char *state[16]; size_t state_length[16], flags[16]; bool mailbox, finished; size_t capacity, queued_count, queued_bytes; message *first, *last; endpoint *next; };
+struct endpoint {
+#ifdef _WIN32
+    HANDLE pipe;
+    wchar_t pipe_name[ENCORE_PIPE_NAME_CAPACITY];
+#endif
+ size_t id, refs, group; int fd; bool closed, listener, local; SSL_CTX *ctx; SSL *ssl; char *state[16]; size_t state_length[16], flags[16]; bool mailbox, finished; size_t capacity, queued_count, queued_bytes; message *first, *last; endpoint *next; };
 struct operation {
+#ifdef _WIN32
+    EncorePipeOperation pipe_operation;
+    bool pipe_pending, pipe_completed;
+    DWORD pipe_error, pipe_size;
+    uint64_t retry_at;
+#endif
+
     size_t id, endpoint_id, result_id, waker, owner, group;
     int kind, status, stage, dns; short interest;
     uint64_t deadline; bool released, cancelled;
@@ -58,15 +92,48 @@ enum { LOCAL_CONNECT = 9, LOCAL_BIND = 10, SHUTDOWN_WRITE = 11 };
 static pthread_mutex_t mu=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t dns_cv=PTHREAD_COND_INITIALIZER;
 static pthread_once_t once=PTHREAD_ONCE_INIT;
-static int wake_pipe[2]={-1,-1}; static int init_error;
+#ifndef _WIN32
+static int wake_pipe[2]={-1,-1};
+#endif
+static int init_error;
 static size_t next_id=1, operation_count;
 static endpoint *endpoints; static operation *operations;
-static void notify(void) { char b=1; if(wake_pipe[1]>=0) { ssize_t n=write(wake_pipe[1],&b,1); (void)n; } }
+static bool init_wake_pair(void) {
+#ifdef _WIN32
+    return true;
+#else
+    if (pipe(wake_pipe)<0) return false;
+    fcntl(wake_pipe[0],F_SETFL,O_NONBLOCK); fcntl(wake_pipe[1],F_SETFL,O_NONBLOCK);
+    fcntl(wake_pipe[0],F_SETFD,FD_CLOEXEC); fcntl(wake_pipe[1],F_SETFD,FD_CLOEXEC);
+    return true;
+#endif
+}
+static void notify(void) {
+#ifdef _WIN32
+    reactor_notify();
+#else
+    char byte = 1;
+    if (wake_pipe[1]>=0) {
+        ssize_t count=write(wake_pipe[1],&byte,1);
+        (void)count;
+    }
+#endif
+}
+#ifndef _WIN32
+static void drain_wakeup(void) {
+    char buffer[128];
+    while (read(wake_pipe[0],buffer,sizeof(buffer))>0) {}
+}
+#endif
 static endpoint *find_ep(size_t id) { for(endpoint *e=endpoints;e;e=e->next) if(e->id==id) return e; return NULL; }
 static operation *find_op(size_t id) { for(operation *o=operations;o;o=o->next) if(o->id==id && !o->released) return o; return NULL; }
-static void close_ep(endpoint *e) { if(!e || e->closed) return; e->closed=true; if(e->fd>=0) { shutdown(e->fd,SHUT_RDWR); close(e->fd); e->fd=-1; } for(endpoint *child=endpoints;child;child=child->next) if(child->group==e->id) close_ep(child); }
+static void close_ep(endpoint *e) { if(!e || e->closed) return; e->closed=true;
+#ifdef _WIN32
+    if (e->pipe) { CloseHandle(e->pipe); e->pipe = NULL; }
+#endif
+    if(e->fd>=0) { shutdown(e->fd,SHUT_RDWR); mf_socket_close(e->fd); e->fd=-1; } for(endpoint *child=endpoints;child;child=child->next) if(child->group==e->id) close_ep(child); }
 static endpoint *new_ep(int fd, bool listener) {
-    endpoint *e=calloc(1,sizeof(*e)); if(!e) { close(fd); return NULL; }
+    endpoint *e=calloc(1,sizeof(*e)); if(!e) { mf_socket_close(fd); return NULL; }
     e->id=next_id++; e->fd=fd; e->listener=listener; e->next=endpoints; endpoints=e; return e;
 }
 static void done(operation *o, int status, const char *error) {
@@ -76,26 +143,46 @@ static void done(operation *o, int status, const char *error) {
     if(w) encore_async_waker_wake(w);
 }
 static void fail(operation *o, int status, const char *error) {
+#ifdef _WIN32
+    if (o->pipe_pending && o->ep && o->ep->pipe) {
+        encore_pipe_cancel(o->ep->pipe, &o->pipe_operation);
+        if (o->kind == 4) {
+            CloseHandle(o->ep->pipe);
+            o->ep->pipe = NULL;
+        }
+    }
+#endif
     if(o->ep && (o->kind==1 || o->kind==LOCAL_CONNECT || (o->kind==4 && o->stage==2) || o->kind==3)) close_ep(o->ep);
     done(o,status,error);
 }
 static int nonblocking(int fd) {
+#ifdef _WIN32
+    return mf_nonblocking(fd);
+#else
     if(fcntl(fd,F_SETFL,fcntl(fd,F_GETFL,0)|O_NONBLOCK)<0) return -1;
     fcntl(fd,F_SETFD,FD_CLOEXEC);
 #ifdef SO_NOSIGPIPE
     int one=1; setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&one,sizeof(one));
 #endif
     return 0;
+#endif
 }
 static void ssl_error(operation *o, const char *context) {
     unsigned long code=ERR_get_error(); char text[160]="TLS connection failed";
     if(code) ERR_error_string_n(code,text,sizeof(text));
     char message[256]; snprintf(message,sizeof(message),"%s: %s",context,text); fail(o,7,message);
 }
+static int mf_default_trust(SSL_CTX *context) {
+#ifdef _WIN32
+    return SSL_CTX_load_verify_store(context, "org.openssl.winstore:");
+#else
+    return SSL_CTX_set_default_verify_paths(context);
+#endif
+}
 static bool setup_client_tls(operation *o) {
     endpoint *e=o->ep; e->ctx=SSL_CTX_new(TLS_client_method()); if(!e->ctx) { ssl_error(o,"TLS context"); return false; }
     SSL_CTX_set_min_proto_version(e->ctx,TLS1_2_VERSION); SSL_CTX_set_verify(e->ctx,SSL_VERIFY_PEER,NULL);
-    if((o->ca[0] ? SSL_CTX_load_verify_locations(e->ctx,o->ca,NULL) : SSL_CTX_set_default_verify_paths(e->ctx))!=1) { ssl_error(o,"CA certificates"); return false; }
+    if((o->ca[0] ? SSL_CTX_load_verify_locations(e->ctx,o->ca,NULL) : mf_default_trust(e->ctx))!=1) { ssl_error(o,"CA certificates"); return false; }
     e->ssl=SSL_new(e->ctx); if(!e->ssl) { ssl_error(o,"TLS allocation"); return false; }
     unsigned char ip[16];
     int is_ip=inet_pton(AF_INET,o->host,ip)==1 || inet_pton(AF_INET6,o->host,ip)==1;
@@ -105,16 +192,47 @@ static bool setup_client_tls(operation *o) {
 static void start_address(operation *o) {
     while(o->current) {
         struct addrinfo *a=o->current; o->current=a->ai_next;
-        int fd=socket(a->ai_family,a->ai_socktype,a->ai_protocol); if(fd<0) continue;
-        if(nonblocking(fd)<0) { close(fd); continue; }
+        int fd=mf_socket_open(a->ai_family,a->ai_socktype,a->ai_protocol); if(fd<0) continue;
+        if(nonblocking(fd)<0) { mf_socket_close(fd); continue; }
         int rc=connect(fd,a->ai_addr,a->ai_addrlen);
-        if(rc<0 && errno!=EINPROGRESS) { close(fd); continue; }
+        if(rc<0 && !mf_retry_connect()) { mf_socket_close(fd); continue; }
         endpoint *e=new_ep(fd,false); if(!e) { fail(o,8,"allocation failed"); return; }
         e->refs++; e->group=o->group; o->ep=e; o->stage=1; o->interest=POLLOUT; return;
     }
     fail(o,6,"TCP connection failed for all addresses");
 }
 static void start_local(operation *o) {
+#ifdef _WIN32
+    uint64_t now = now_ms();
+    if (o->retry_at > now) return;
+    wchar_t name[ENCORE_PIPE_NAME_CAPACITY];
+    if (encore_pipe_name(o->host, strlen(o->host), name) != ERROR_SUCCESS) {
+        fail(o, 6, "invalid local pipe name");
+        return;
+    }
+    bool listener = o->kind == LOCAL_BIND;
+    HANDLE pipe = listener ? encore_pipe_listen(&reactor_iocp, name, true, 0)
+                           : encore_pipe_connect(&reactor_iocp, name, 0);
+    if (pipe == INVALID_HANDLE_VALUE) {
+        if (!listener && GetLastError() == ERROR_PIPE_BUSY) {
+            o->retry_at = now + 5;
+            return;
+        }
+        fail(o, 6, listener ? "cannot bind local pipe" : "cannot connect to local pipe");
+        return;
+    }
+    endpoint *e = new_ep(-1, listener);
+    if (!e) {
+        CloseHandle(pipe);
+        fail(o, 8, "allocation failed");
+        return;
+    }
+    e->pipe = pipe;
+    e->local = true;
+    if (listener) wcscpy(e->pipe_name, name);
+    o->result_id = e->id;
+    done(o, 1, NULL);
+#else
     struct sockaddr_un address = {.sun_family = AF_UNIX};
     size_t length = strlen(o->host);
     if (!length || length >= sizeof(address.sun_path)) {
@@ -124,7 +242,7 @@ static void start_local(operation *o) {
     memcpy(address.sun_path, o->host, length + 1);
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0 || nonblocking(fd) < 0) {
-        if (fd >= 0) close(fd);
+        if (fd >= 0) mf_socket_close(fd);
         fail(o, 6, "cannot open Unix socket");
         return;
     }
@@ -149,7 +267,7 @@ static void start_local(operation *o) {
             return;
         }
     } else if (connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        if (errno == EINPROGRESS) {
+        if (mf_retry_connect()) {
             o->stage = 1;
             o->interest = POLLOUT;
             return;
@@ -160,7 +278,82 @@ static void start_local(operation *o) {
     }
     o->result_id = e->id;
     done(o, 1, NULL);
+#endif
 }
+
+#ifdef _WIN32
+static void win_operation_complete(EncoreIocpEvent event) {
+    operation *o = CONTAINING_RECORD(event.operation, operation, pipe_operation);
+    pthread_mutex_lock(&mu);
+    o->pipe_pending = false;
+    o->pipe_completed = true;
+    o->pipe_error = event.error;
+    o->pipe_size = event.size;
+    pthread_mutex_unlock(&mu);
+}
+
+static void step_pipe(operation *o, endpoint *e) {
+    if (o->pipe_pending) return;
+    if (o->pipe_completed) {
+        o->pipe_completed = false;
+        if (o->pipe_error != ERROR_SUCCESS && !(o->kind == 2 &&
+            (o->pipe_error == ERROR_BROKEN_PIPE || o->pipe_error == ERROR_PIPE_NOT_CONNECTED))) {
+            fail(o, 6, "local pipe operation failed");
+            return;
+        }
+        if (o->kind == 4) {
+            endpoint *child = new_ep(-1, false);
+            if (!child) {
+                CloseHandle(e->pipe);
+                e->pipe = NULL;
+                fail(o, 8, "allocation failed");
+                return;
+            }
+            child->local = true;
+            child->pipe = e->pipe;
+            e->pipe = NULL;
+            o->result_id = child->id;
+            done(o, 1, NULL);
+            return;
+        }
+        if (o->kind == 2) {
+            o->offset = o->pipe_size;
+            done(o, 1, NULL);
+            return;
+        }
+        o->offset += o->pipe_size;
+        if (o->offset == o->length) {
+            done(o, 1, NULL);
+            return;
+        }
+        if (o->pipe_size == 0) {
+            fail(o, 2, "local pipe write made no progress");
+            return;
+        }
+    }
+    DWORD status;
+    if (o->kind == 4) {
+        if (!e->pipe) {
+            HANDLE pipe = encore_pipe_listen(&reactor_iocp, e->pipe_name, false, 0);
+            if (pipe == INVALID_HANDLE_VALUE) {
+                fail(o, 6, "cannot create local pipe instance");
+                return;
+            }
+            e->pipe = pipe;
+        }
+        status = encore_pipe_accept(&reactor_iocp, e->pipe, 0, &o->pipe_operation);
+    } else if (o->kind == 2) {
+        status = encore_pipe_read(&reactor_iocp, e->pipe, 0, o->bytes, (DWORD)o->length, &o->pipe_operation);
+    } else if (o->kind == 3) {
+        status = encore_pipe_write(e->pipe, o->bytes + o->offset, (DWORD)(o->length - o->offset), &o->pipe_operation);
+    } else {
+        fail(o, 6, "operation is not supported on Windows named pipes");
+        return;
+    }
+    if (status == ERROR_SUCCESS) o->pipe_pending = true;
+    else fail(o, 6, "cannot submit local pipe operation");
+}
+#endif
 
 static void step(operation *o, short events) {
     if(o->status || o->released) return;
@@ -175,7 +368,7 @@ static void step(operation *o, short events) {
         } else if (events & (POLLOUT | POLLERR | POLLHUP)) {
             int error = 0;
             socklen_t length = sizeof(error);
-            if (getsockopt(o->ep->fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0 || error) {
+            if (getsockopt(o->ep->fd, SOL_SOCKET, SO_ERROR, (char *)&error, &length) < 0 || error) {
                 close_ep(o->ep);
                 fail(o, 6, "cannot connect to Unix socket");
             } else {
@@ -191,9 +384,9 @@ static void step(operation *o, short events) {
             if(!o->addresses) { fail(o,(o->kind==7 && o->tls && o->error[0] && strncmp(o->error,"cannot load",11)==0)?7:5,o->error[0]?o->error:"DNS resolution failed"); return; }
             if(o->kind==7) {
                 for(struct addrinfo *a=o->addresses;a;a=a->ai_next) {
-                    int fd=socket(a->ai_family,a->ai_socktype,a->ai_protocol); if(fd<0) continue;
-                    int one=1; setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one));
-                    if(nonblocking(fd)<0 || bind(fd,a->ai_addr,a->ai_addrlen)<0 || listen(fd,128)<0) { close(fd); continue; }
+                    int fd=mf_socket_open(a->ai_family,a->ai_socktype,a->ai_protocol); if(fd<0) continue;
+                    int one=1; setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,(const char *)&one,sizeof(one));
+                    if(nonblocking(fd)<0 || bind(fd,a->ai_addr,a->ai_addrlen)<0 || listen(fd,128)<0) { mf_socket_close(fd); continue; }
                     endpoint *e=new_ep(fd,true); if(!e) { fail(o,8,"allocation failed"); return; }
                     e->ctx=o->server_ctx; o->server_ctx=NULL; o->result_id=e->id; done(o,1,NULL); return;
                 }
@@ -204,7 +397,7 @@ static void step(operation *o, short events) {
         if(o->stage==1) {
             if(!(events&(POLLOUT|POLLERR|POLLHUP))) return;
             int error=0; socklen_t n=sizeof(error);
-            if(getsockopt(o->ep->fd,SOL_SOCKET,SO_ERROR,&error,&n)<0 || error) {
+            if(getsockopt(o->ep->fd,SOL_SOCKET,SO_ERROR,(char *)&error,&n)<0 || error) {
                 close_ep(o->ep); o->ep->refs--; o->ep=NULL; start_address(o); return;
             }
             if(!o->tls) { o->result_id=o->ep->id; done(o,1,NULL); return; }
@@ -214,6 +407,12 @@ static void step(operation *o, short events) {
     }
     endpoint *e=o->ep;
     if(!e || e->closed) { fail(o,2,"connection is closed"); return; }
+#ifdef _WIN32
+    if (e->local) {
+        step_pipe(o, e);
+        return;
+    }
+#endif
     if (o->kind == SHUTDOWN_WRITE) {
         if (e->local && shutdown(e->fd, SHUT_WR) == 0) done(o, 1, NULL);
         else fail(o, 6, "cannot close socket write side");
@@ -235,9 +434,9 @@ static void step(operation *o, short events) {
         ssl_error(o,"TLS handshake"); return;
     }
     if(o->kind==4) {
-        int fd=accept(e->fd,NULL,NULL);
-        if(fd<0) { if(errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR) { o->interest=POLLIN; return; } fail(o,6,"accept failed"); return; }
-        if(nonblocking(fd)<0) { close(fd); fail(o,6,"cannot configure accepted socket"); return; }
+        int fd=mf_socket_accept(e->fd);
+        if(fd<0) { if(mf_retry_io()) { o->interest=POLLIN; return; } fail(o,6,"accept failed"); return; }
+        if(nonblocking(fd)<0) { mf_socket_close(fd); fail(o,6,"cannot configure accepted socket"); return; }
         endpoint *child=new_ep(fd,false); if(!child) { fail(o,8,"allocation failed"); return; }
         if(!e->ctx) { child->local=e->local; o->result_id=child->id; done(o,1,NULL); return; }
         SSL_CTX_up_ref(e->ctx); child->ctx=e->ctx; child->ssl=SSL_new(child->ctx);
@@ -261,7 +460,7 @@ static void step(operation *o, short events) {
         int flags=0;
 #endif
         rc=o->kind==2 ? (int)recv(e->fd,o->bytes,o->length,0) : (int)send(e->fd,o->bytes+o->offset,o->length-o->offset,flags);
-        if(rc<0) { if(errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR) { o->interest=o->kind==2?POLLIN:POLLOUT; return; } fail(o,6,"socket I/O failed"); return; }
+        if(rc<0) { if(mf_retry_io()) { o->interest=o->kind==2?POLLIN:POLLOUT; return; } fail(o,6,"socket I/O failed"); return; }
     }
     if(o->kind==2) { o->offset=(size_t)rc; done(o,1,NULL); }
     else { o->offset+=(size_t)rc; if(o->offset==o->length) done(o,1,NULL); else o->interest=POLLOUT; }
@@ -276,31 +475,49 @@ static void destroy_op(operation *o) {
 }
 static void *reactor(void *unused) {
     (void)unused;
+#ifndef _WIN32
     sigset_t blocked; sigemptyset(&blocked); sigaddset(&blocked,SIGPIPE); pthread_sigmask(SIG_BLOCK,&blocked,NULL);
+#endif
     for(;;) {
         struct pollfd fds[1025]; size_t ids[1025], generations[1025], count=1; int wait=1000;
         pthread_mutex_lock(&mu);
         operation **at=&operations;
         while(*at) {
             operation *o=*at;
+#ifdef _WIN32
+            if (o->released && o->pipe_pending) {
+                if (!o->status) fail(o, 3, "operation released");
+                at = &o->next;
+                continue;
+            }
+#endif
             if(o->released && o->dns!=2) { *at=o->next; destroy_op(o); continue; }
             step(o,0);
             if(!o->status && !o->released) {
                 uint64_t now=now_ms(); uint64_t left=o->deadline>now?o->deadline-now:0;
                 if(left<(uint64_t)wait) wait=(int)left;
+#ifdef _WIN32
+                if (o->retry_at > now && o->retry_at - now < (uint64_t)wait) wait=(int)(o->retry_at-now);
+#endif
                 bool queued=false; if(o->kind==3) { for(operation *p=operations;p;p=p->next) if(p->kind==3 && p->ep==o->ep && p->id<o->id && !p->status && !p->released) queued=true; }
-                if(!queued && o->ep && !o->ep->closed && o->interest && count<1025) { fds[count]=(struct pollfd){o->ep->fd,o->interest,0}; generations[count]=o->ep->id; ids[count++]=o->id; }
+                if(!queued && o->ep && !o->ep->closed && o->ep->fd>=0 && o->interest && count<1025) { fds[count]=(struct pollfd){o->ep->fd,o->interest,0}; generations[count]=o->ep->id; ids[count++]=o->id; }
             }
             at=&o->next;
         }
         endpoint **ep=&endpoints;
         while(*ep) { endpoint *e=*ep; if(e->closed && !e->refs) { *ep=e->next; if(e->ssl) SSL_free(e->ssl); if(e->ctx) SSL_CTX_free(e->ctx); for(size_t i=0;i<16;i++) free(e->state[i]); while(e->first) { message *m=e->first; e->first=m->next; free(m->bytes); free(m); } free(e); } else ep=&e->next; }
         pthread_mutex_unlock(&mu);
+#ifdef _WIN32
+        fds[0]=(struct pollfd){0,0,0};
+#else
         fds[0]=(struct pollfd){wake_pipe[0],POLLIN,0};
+#endif
         generations[0] = 0;
         int rc=reactor_wait(fds,generations,count,wait);
         if(rc>0) {
-            if(fds[0].revents) { char b[128]; while(read(wake_pipe[0],b,sizeof(b))>0) {} }
+#ifndef _WIN32
+            if(fds[0].revents) drain_wakeup();
+#endif
             pthread_mutex_lock(&mu);
             for(size_t i=1;i<count;i++) if(fds[i].revents) { operation *o=find_op(ids[i]); if(o) step(o,fds[i].revents); }
             pthread_mutex_unlock(&mu);
@@ -335,9 +552,7 @@ static void cleanup_waker(size_t w) {
     pthread_mutex_unlock(&mu); notify();
 }
 static void initialize(void) {
-    if(!encore_async_register_waker_cleanup(cleanup_waker) || !reactor_init() || pipe(wake_pipe)<0) { init_error=1; return; }
-    fcntl(wake_pipe[0],F_SETFL,O_NONBLOCK); fcntl(wake_pipe[1],F_SETFL,O_NONBLOCK);
-    fcntl(wake_pipe[0],F_SETFD,FD_CLOEXEC); fcntl(wake_pipe[1],F_SETFD,FD_CLOEXEC);
+    if(!mf_init_network() || !encore_async_register_waker_cleanup(cleanup_waker) || !reactor_init() || !init_wake_pair()) { init_error=1; return; }
     pthread_t thread;
     if(pthread_create(&thread,NULL,reactor,NULL)) { init_error=1; return; } pthread_detach(thread);
     for(int i=0;i<4;i++) { if(pthread_create(&thread,NULL,dns_worker,NULL)) { init_error=1; return; } pthread_detach(thread); }
@@ -397,7 +612,7 @@ size_t mfnet_result_handle(size_t id) { pthread_mutex_lock(&mu); operation *o=fi
 void mfnet_release(size_t id) { pthread_mutex_lock(&mu); operation *o=find_op(id); if(o) { o->waker=0; o->owner=0; o->released=true; } pthread_mutex_unlock(&mu); notify(); }
 void mfnet_cancel(size_t id) { pthread_mutex_lock(&mu); operation *o=find_op(id); if(o) o->cancelled=true; pthread_mutex_unlock(&mu); notify(); }
 void mfnet_close(size_t id) { pthread_mutex_lock(&mu); close_ep(find_ep(id)); pthread_mutex_unlock(&mu); notify(); }
-size_t mfnet_port(size_t id) { pthread_mutex_lock(&mu); endpoint *e=find_ep(id); struct sockaddr_storage a; socklen_t n=sizeof(a); size_t p=0; if(e&&!e->closed && getsockname(e->fd,(struct sockaddr*)&a,&n)==0) p=a.ss_family==AF_INET?ntohs(((struct sockaddr_in*)&a)->sin_port):ntohs(((struct sockaddr_in6*)&a)->sin6_port); pthread_mutex_unlock(&mu); return p; }
+size_t mfnet_port(size_t id) { pthread_mutex_lock(&mu); endpoint *e=find_ep(id); struct sockaddr_storage a; socklen_t n=sizeof(a); size_t p=0; if(e&&!e->closed && e->fd>=0 && getsockname(e->fd,(struct sockaddr*)&a,&n)==0) { if (a.ss_family==AF_INET) p=ntohs(((struct sockaddr_in*)&a)->sin_port); else if (a.ss_family==AF_INET6) p=ntohs(((struct sockaddr_in6*)&a)->sin6_port); } pthread_mutex_unlock(&mu); return p; }
 mf_str mfnet_random(size_t n) { if(n>16777216) return encore_from_cstr_copy(""); char *data=malloc(n+1); if(!data) return encore_from_cstr_copy(""); if(n && RAND_bytes((unsigned char*)data,(int)n)!=1) { free(data); return encore_from_cstr_copy(""); } data[n]=0; return encore_from_owned_buffer(data,n); }
 mf_str mfnet_byte(uint8_t value) { char *data=malloc(2); if(!data) return encore_from_cstr_copy(""); data[0]=(char)value; data[1]=0; return encore_from_owned_buffer(data,1); }
 mf_str mfnet_xor(mf_str bytes,mf_str key) { size_t n=slen(bytes),k=slen(key); if(!k) return encore_from_cstr_copy(""); char *data=malloc(n+1); if(!data) return encore_from_cstr_copy(""); for(size_t i=0;i<n;i++) data[i]=sdata(bytes)[i]^sdata(key)[i%k]; data[n]=0; return encore_from_owned_buffer(data,n); }
