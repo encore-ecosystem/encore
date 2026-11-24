@@ -18,7 +18,9 @@ PACKAGES = (
     "core", "platform", "std", "rich", "serialize", "json", "binary", "log",
     "profile", "ehir-core", "ehir", "ehir-llvm-backend", "toml",
     "llvm", "argparse", "secret-store",
+    "network", "ipc", "asyncio",
 )
+IN_TREE_PACKAGES = frozenset(("network", "ipc", "asyncio"))
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -108,7 +110,6 @@ def export_package(root: Path, ref: str, folder: str, destination: Path) -> None
     if pinned:
         export_tree(repository_for_link(root, path, pinned), pinned, destination)
     else:
-        # Releases predating submodules keep ordinary package directories.
         export_tree(root, f"{ref}:{path}", destination)
 
 
@@ -119,6 +120,14 @@ def sdk_manifest(root: Path, ref: str = "HEAD", verify_checkout: bool = False,
     rows = []
     for folder in packages:
         path = f"packages/{folder}"
+        if folder in IN_TREE_PACKAGES:
+            tree = git(root, "rev-parse", f"{ref}:{path}").decode("ascii").strip()
+            manifest = tomllib.loads(git(root, "show", f"{tree}:encore.toml").decode("utf-8"))["project"]
+            if verify_checkout and git(root, "diff", "--name-only", ref, "--", path):
+                raise ValueError(f"SDK package has tracked changes: {path}")
+            rows.append({"path": path, "tree": tree,
+                         "name": manifest["name"], "version": manifest["version"]})
+            continue
         if path not in pinned or path not in urls:
             raise ValueError(f"expected a pinned SDK submodule: {path}")
         commit = pinned[path]
@@ -132,7 +141,7 @@ def sdk_manifest(root: Path, ref: str = "HEAD", verify_checkout: bool = False,
                 raise ValueError(f"SDK package has tracked changes: {path}")
         rows.append({"path": path, "repository": urls[path], "commit": commit,
                      "name": manifest["name"], "version": manifest["version"]})
-    if set(pinned) != {f"packages/{folder}" for folder in packages}:
+    if set(pinned) != {f"packages/{folder}" for folder in packages if folder not in IN_TREE_PACKAGES}:
         raise ValueError("unexpected or missing SDK submodule in the parent tree")
     return {"schema": 1, "packages": rows}
 
@@ -194,13 +203,18 @@ def check_sdk_archive(archive: Path, prefix: str, manifest: dict, root: Path | N
         if project["name"] != package["name"] or project["version"] != package["version"]:
             raise ValueError(f"bundled package identity differs: {folder}")
         if root is not None:
-            repository = repository_for_link(root, package["path"], package["commit"])
-            with tarfile.open(fileobj=io.BytesIO(git(repository, "archive", "--format=tar", package["commit"]))) as source:
+            if "tree" in package:
+                repository, object_id = root, package["tree"]
+            else:
+                object_id = package["commit"]
+                repository = repository_for_link(root, package["path"], object_id)
+            with tarfile.open(fileobj=io.BytesIO(git(repository, "archive", "--format=tar", object_id))) as source:
                 expected = {item.name: source.extractfile(item).read() for item in source.getmembers() if item.isfile()}
             package_prefix = f"{prefix}/lib/encore/index/{folder}/"
             actual = {name[len(package_prefix):]: data for name, data in files.items() if name.startswith(package_prefix)}
             if actual != expected:
-                raise ValueError(f"bundled package files differ from the pinned commit: {folder}")
+                recorded = "recorded source tree" if "tree" in package else "pinned commit"
+                raise ValueError(f"bundled package files differ from the {recorded}: {folder}")
 
 
 def main() -> int:
