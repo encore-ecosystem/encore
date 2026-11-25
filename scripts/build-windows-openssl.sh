@@ -28,18 +28,19 @@ cd "$work/source"
 prefix=$output
 if command -v cygpath >/dev/null 2>&1; then prefix=$(cygpath -m "$prefix"); fi
 options=("--prefix=$prefix" --libdir=lib no-shared no-tests)
+perl=${OPENSSL_PERL:-perl}
 case "$target" in
   x86_64-pc-windows-msvc)
-    perl Configure VC-WIN64A "${options[@]}"
+    "$perl" Configure VC-WIN64A "${options[@]}" no-asm
     nmake build_libs
     suffix=lib
     ;;
   x86_64-w64-windows-gnu|aarch64-w64-windows-gnu)
     if [[ -n "${CC:-}" ]]; then
       if [[ "$target" == aarch64-* ]]; then options+=(no-asm); fi
-      perl Configure mingw64 "${options[@]}"
+      "$perl" Configure mingw64 "${options[@]}"
     elif [[ "$target" == x86_64-* ]]; then
-      perl Configure mingw64 --cross-compile-prefix=x86_64-w64-mingw32- "${options[@]}"
+      "$perl" Configure mingw64 --cross-compile-prefix=x86_64-w64-mingw32- "${options[@]}"
     else
       echo "Set CC, AR and RANLIB for the AArch64 LLVM MinGW toolchain" >&2
       exit 2
