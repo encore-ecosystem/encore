@@ -1,46 +1,26 @@
-name: Native CI
+name: Release candidate corrections
 
 on:
   workflow_dispatch:
-  pull_request:
-  push:
-    branches: [trunk]
 
 permissions:
   contents: read
   actions: read
-  pull-requests: read
-
-concurrency:
-  group: native-ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  candidate:
-    name: Select verified candidate
-    runs-on: ubuntu-latest
-    outputs:
-      reused: ${{ steps.select.outputs.reused }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-      - name: Reuse identical merged PR build
-        id: select
-        if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash scripts/select-ci-candidate.sh
-
-  resolve-inputs:
-    needs: candidate
-    if: needs.candidate.outputs.reused != 'true'
-    name: Resolve trusted inputs
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    outputs:
-      seed_tag: ${{ steps.seed.outputs.tag }}
+  windows-native:
+    name: Native network ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-w64-windows-gnu
+            runner: windows-latest
+          - target: aarch64-w64-windows-gnu
+            runner: windows-11-arm
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -48,148 +28,74 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: Validate manifest-derived release metadata
-        run: python3 scripts/test-project-metadata.py
-      - name: Record original build identity
+      - name: Prepare native toolchain
         shell: bash
-        run: |
-          jq -n --arg commit "$GITHUB_SHA" --arg tree "$(git rev-parse HEAD^{tree})" \
-            '{commit: $commit, tree: $tree}' > build-identity.json
-      - uses: actions/upload-artifact@v7
+        run: bash scripts/ci-prepare-toolchain.sh "${{ matrix.target }}"
+      - uses: actions/download-artifact@v8
+        if: contains(matrix.target, 'windows-gnu')
         with:
-          name: build-identity
-          path: build-identity.json
-          retention-days: 30
-      - name: Select latest stable compiler once
-        id: seed
+          name: windows-openssl-${{ matrix.target }}
+          path: target/windows-openssl
+          github-token: ${{ github.token }}
+          run-id: 45617700138
+      - name: Build native Windows MSVC OpenSSL
+        if: contains(matrix.target, 'windows-msvc')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $install = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$install) { throw 'Visual Studio C++ installation is required' }
+          $vars = Join-Path $install 'VC\Auxiliary\Build\vcvars64.bat'
+          $environment = & $env:ComSpec /d /c "call `"$vars`" >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'vcvars64.bat failed' }
+          foreach ($line in $environment) {
+            if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
+          }
+          $perl = "$env:SystemDrive\Strawberry\perl\bin\perl.exe"
+          if (!(Test-Path $perl)) { $perl = (Get-Command perl.exe -CommandType Application).Source }
+          & $perl -MIPC::Cmd -e 1
+          if ($LASTEXITCODE -ne 0) { throw 'OpenSSL requires a complete Windows Perl installation' }
+          $env:OPENSSL_PERL = $perl
+          & bash scripts/build-windows-openssl.sh '${{ matrix.target }}' target/windows-openssl
+          if ($LASTEXITCODE -ne 0) { throw 'OpenSSL build failed' }
+
+      - name: Test native TCP, TLS and local IPC
         shell: bash
         run: |
           set -euo pipefail
-          required='[
-            "encore-x86_64-unknown-linux-gnu.tar.gz",
-            "encore-aarch64-unknown-linux-gnu.tar.gz",
-            "encore-aarch64-apple-darwin.tar.gz",
-            "encore-x86_64-pc-windows-msvc.zip",
-            "encore-x86_64-w64-windows-gnu.zip",
-            "encore-aarch64-w64-windows-gnu.zip"
-          ]'
-          releases=$(gh release list --limit 100 --json tagName,publishedAt,isDraft,isPrerelease)
-          selected=$(jq -r '[.[] | select(.isDraft == false and .isPrerelease == false)
-            | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-[a-z][a-z0-9-]*)?$"))]
-            | sort_by(.publishedAt) | last | .tagName // empty' <<<"$releases")
-          test -n "$selected" || { echo "::error::No stable compiler release is available"; exit 1; }
-          python3 scripts/project-metadata.py --check-seed "$selected"
-          assets=$(gh release view "$selected" --json isDraft,isPrerelease,assets)
-          test "$(jq -r '.isDraft or .isPrerelease' <<<"$assets")" = false
-          if ! jq -e --argjson required "$required" \
-            '([.assets[].name] as $actual |
-              ($required + ($required | map(. + ".sha256"))) - $actual | length) == 0' <<<"$assets" >/dev/null
-          then
-            echo "::error::Latest stable seed $selected is incomplete; refusing an older fallback"
-            exit 1
-          fi
-          echo "tag=$selected" >> "$GITHUB_OUTPUT"
-          echo "### Trusted seed: \`$selected\`" >> "$GITHUB_STEP_SUMMARY"
+          export CC="${ENCORE_CC:-clang}"
+          case '${{ matrix.target }}' in
+            *-windows-*) export OPENSSL_DIR=$(cygpath -m "$PWD/target/windows-openssl") ;;
+            *-apple-darwin) export OPENSSL_DIR=$(brew --prefix openssl@3) ;;
+          esac
+          python3 packages/network/tests/run-native.py
 
-  kit-windows-gnu-x86:
-    needs: candidate
-    if: needs.candidate.outputs.reused != 'true'
-    uses: ./.github/workflows/ci-target-kit.yml
-    with:
-      target: x86_64-w64-windows-gnu
-      kind: windows
 
-  kit-windows-gnu-arm:
-    needs: candidate
-    if: needs.candidate.outputs.reused != 'true'
-    uses: ./.github/workflows/ci-target-kit.yml
-    with:
-      target: aarch64-w64-windows-gnu
-      kind: windows
-
-  kit-linux-arm:
-    needs: candidate
-    if: needs.candidate.outputs.reused != 'true'
-    uses: ./.github/workflows/ci-target-kit.yml
-    with:
-      target: aarch64-unknown-linux-gnu
-      kind: linux-aarch64
-
-  verify-linux-x86:
-    name: Verify x86_64-unknown-linux-gnu
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: ubuntu-24.04
-      triple: x86_64-unknown-linux-gnu
-      executable: encore
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-linux-arm:
-    name: Verify aarch64-unknown-linux-gnu
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: ubuntu-24.04-arm
-      triple: aarch64-unknown-linux-gnu
-      executable: encore
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-macos-arm:
-    name: Verify aarch64-apple-darwin
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: macos-26
-      triple: aarch64-apple-darwin
-      executable: encore
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-windows-msvc-x86:
-    name: Verify x86_64-pc-windows-msvc
-    needs: resolve-inputs
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: windows-latest
-      triple: x86_64-pc-windows-msvc
-      executable: encore.exe
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-windows-gnu-x86:
-    name: Verify x86_64-w64-windows-gnu
-    needs: [resolve-inputs, kit-windows-gnu-x86]
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: windows-latest
-      triple: x86_64-w64-windows-gnu
-      executable: encore.exe
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  verify-windows-gnu-arm:
-    name: Verify aarch64-w64-windows-gnu
-    needs: [resolve-inputs, kit-windows-gnu-arm]
-    uses: ./.github/workflows/ci-native.yml
-    with:
-      runner: windows-11-arm
-      triple: aarch64-w64-windows-gnu
-      executable: encore.exe
-      seed_tag: ${{ needs.resolve-inputs.outputs.seed_tag }}
-
-  complete:
-    name: CI complete
-    if: always()
-    needs: [candidate, resolve-inputs, kit-windows-gnu-x86, kit-windows-gnu-arm, kit-linux-arm, verify-linux-x86, verify-linux-arm, verify-macos-arm, verify-windows-msvc-x86, verify-windows-gnu-x86, verify-windows-gnu-arm]
-    runs-on: ubuntu-latest
+  linux-cache:
+    name: Cache lifecycle on Ubuntu 24.04
+    runs-on: ubuntu-24.04
     steps:
-      - name: Require a complete verified candidate
-        env:
-          REUSED: ${{ needs.candidate.outputs.reused }}
-          RESULTS: ${{ toJSON(needs) }}
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v8
+        with:
+          name: test-context-x86_64-unknown-linux-gnu
+          path: target/test-context
+          github-token: ${{ github.token }}
+          run-id: 45617700138
+      - name: Prepare native toolchain
+        run: bash scripts/ci-prepare-toolchain.sh x86_64-unknown-linux-gnu
+      - name: Verify the compiler and exercise the cache lifecycle
+        shell: bash
         run: |
           set -euo pipefail
-          if test "$REUSED" = true; then
-            jq -e '.candidate.result == "success" and
-              (to_entries | all(.[]; .value.result == "success" or .value.result == "skipped"))' <<<"$RESULTS"
-          else
-            jq -e 'all(.[]; .result == "success")' <<<"$RESULTS"
-          fi
+          compiler="$PWD/target/test-context/bin/encore"
+          sha=$(jq -r .compiler_sha256 target/test-context/provenance.json)
+          echo "$sha  $compiler" | sha256sum -c -
+          chmod +x "$compiler"
+          python3 scripts/test-cache-lifecycle.py --compiler "$compiler"
