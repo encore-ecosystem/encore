@@ -1,6 +1,8 @@
 /* Native ABI, lifetime and real TCP/TLS integration tests. */
 #include "../native/runtime.c"
 #include <assert.h>
+// Refusal on Windows IPv6 loopback can take two seconds before IPv4 is tried.
+enum { TEST_CONNECTION_TIMEOUT_MS = 5000 };
 static void (*cleanup_hook)(size_t);
 static size_t wake_count;
 bool encore_async_register_waker_cleanup(void (*hook)(size_t)) { cleanup_hook=hook; return true; }
@@ -26,7 +28,7 @@ static int wait_for(size_t op) {
 }
 static size_t endpoint_op(int kind,const char *host,size_t port,bool tls,const char *ca,const char *cert,const char *key) {
     mf_str h=text(host),c=text(ca),crt=text(cert),k=text(key);
-    size_t op=mfnet_endpoint_operation(kind,h,port,tls,c,crt,k,2000);
+    size_t op=mfnet_endpoint_operation(kind,h,port,tls,c,crt,k,TEST_CONNECTION_TIMEOUT_MS);
     drop(h);drop(c);drop(crt);drop(k);return op;
 }
 static size_t io(int kind,size_t handle,const char *data,size_t max,size_t timeout) {
@@ -49,7 +51,7 @@ static size_t completed_handle(size_t op) {
 static size_t listener(bool tls,const char *cert,const char *key) { return completed_handle(endpoint_op(7,"127.0.0.1",0,tls,"",cert,key)); }
 static void roundtrip(bool tls,const char *cert,const char *key) {
     size_t server=listener(tls,cert,key),port=mfnet_port(server);assert(port);
-    size_t accept=io(4,server,"",0,2000);
+    size_t accept=io(4,server,"",0,TEST_CONNECTION_TIMEOUT_MS);
     size_t client=completed_handle(endpoint_op(1,tls?"localhost":"127.0.0.1",port,tls,cert,"",""));
     size_t peer=completed_handle(accept);
     size_t first=io(3,client,"first",0,2000),second=io(3,client,"second",0,2000);
