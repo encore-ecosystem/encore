@@ -14,6 +14,8 @@
 #include <time.h>
 #ifdef _WIN32
 #include "network_win.h"
+typedef int mf_addrlen;
+#define mf_dns_error gai_strerrorA
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -24,6 +26,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+typedef socklen_t mf_addrlen;
+#define mf_dns_error gai_strerror
 static int mf_socket_open(int family, int type, int protocol) { return socket(family,type,protocol); }
 static int mf_socket_accept(int fd) { return accept(fd,NULL,NULL); }
 static void mf_socket_close(int fd) { if (fd>=0) close(fd); }
@@ -367,7 +371,7 @@ static void step(operation *o, short events) {
             start_local(o);
         } else if (events & (POLLOUT | POLLERR | POLLHUP)) {
             int error = 0;
-            socklen_t length = sizeof(error);
+            mf_addrlen length = sizeof(error);
             if (getsockopt(o->ep->fd, SOL_SOCKET, SO_ERROR, (char *)&error, &length) < 0 || error) {
                 close_ep(o->ep);
                 fail(o, 6, "cannot connect to Unix socket");
@@ -396,7 +400,7 @@ static void step(operation *o, short events) {
         }
         if(o->stage==1) {
             if(!(events&(POLLOUT|POLLERR|POLLHUP))) return;
-            int error=0; socklen_t n=sizeof(error);
+            int error=0; mf_addrlen n=sizeof(error);
             if(getsockopt(o->ep->fd,SOL_SOCKET,SO_ERROR,(char *)&error,&n)<0 || error) {
                 close_ep(o->ep); o->ep->refs--; o->ep=NULL; start_address(o); return;
             }
@@ -535,7 +539,7 @@ static void *dns_worker(void *unused) {
         char service[16]; snprintf(service,sizeof(service),"%u",o->port);
         int rc=getaddrinfo(o->host[0]?o->host:NULL,service,&hints,&addresses);
         SSL_CTX *ctx=NULL; char error[256]="";
-        if(rc) snprintf(error,sizeof(error),"DNS: %s",gai_strerror(rc));
+        if(rc) snprintf(error,sizeof(error),"DNS: %s",mf_dns_error(rc));
         if(!rc && o->kind==7 && o->tls) {
             ctx=SSL_CTX_new(TLS_server_method());
             if(!ctx || SSL_CTX_set_min_proto_version(ctx,TLS1_2_VERSION)!=1 || SSL_CTX_use_certificate_chain_file(ctx,o->cert)!=1 || SSL_CTX_use_PrivateKey_file(ctx,o->key,SSL_FILETYPE_PEM)!=1 || SSL_CTX_check_private_key(ctx)!=1) {
@@ -612,7 +616,7 @@ size_t mfnet_result_handle(size_t id) { pthread_mutex_lock(&mu); operation *o=fi
 void mfnet_release(size_t id) { pthread_mutex_lock(&mu); operation *o=find_op(id); if(o) { o->waker=0; o->owner=0; o->released=true; } pthread_mutex_unlock(&mu); notify(); }
 void mfnet_cancel(size_t id) { pthread_mutex_lock(&mu); operation *o=find_op(id); if(o) o->cancelled=true; pthread_mutex_unlock(&mu); notify(); }
 void mfnet_close(size_t id) { pthread_mutex_lock(&mu); close_ep(find_ep(id)); pthread_mutex_unlock(&mu); notify(); }
-size_t mfnet_port(size_t id) { pthread_mutex_lock(&mu); endpoint *e=find_ep(id); struct sockaddr_storage a; socklen_t n=sizeof(a); size_t p=0; if(e&&!e->closed && e->fd>=0 && getsockname(e->fd,(struct sockaddr*)&a,&n)==0) { if (a.ss_family==AF_INET) p=ntohs(((struct sockaddr_in*)&a)->sin_port); else if (a.ss_family==AF_INET6) p=ntohs(((struct sockaddr_in6*)&a)->sin6_port); } pthread_mutex_unlock(&mu); return p; }
+size_t mfnet_port(size_t id) { pthread_mutex_lock(&mu); endpoint *e=find_ep(id); struct sockaddr_storage a; mf_addrlen n=sizeof(a); size_t p=0; if(e&&!e->closed && e->fd>=0 && getsockname(e->fd,(struct sockaddr*)&a,&n)==0) { if (a.ss_family==AF_INET) p=ntohs(((struct sockaddr_in*)&a)->sin_port); else if (a.ss_family==AF_INET6) p=ntohs(((struct sockaddr_in6*)&a)->sin6_port); } pthread_mutex_unlock(&mu); return p; }
 mf_str mfnet_random(size_t n) { if(n>16777216) return encore_from_cstr_copy(""); char *data=malloc(n+1); if(!data) return encore_from_cstr_copy(""); if(n && RAND_bytes((unsigned char*)data,(int)n)!=1) { free(data); return encore_from_cstr_copy(""); } data[n]=0; return encore_from_owned_buffer(data,n); }
 mf_str mfnet_byte(uint8_t value) { char *data=malloc(2); if(!data) return encore_from_cstr_copy(""); data[0]=(char)value; data[1]=0; return encore_from_owned_buffer(data,1); }
 mf_str mfnet_xor(mf_str bytes,mf_str key) { size_t n=slen(bytes),k=slen(key); if(!k) return encore_from_cstr_copy(""); char *data=malloc(n+1); if(!data) return encore_from_cstr_copy(""); for(size_t i=0;i<n;i++) data[i]=sdata(bytes)[i]^sdata(key)[i%k]; data[n]=0; return encore_from_owned_buffer(data,n); }

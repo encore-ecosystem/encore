@@ -15,7 +15,10 @@ def main():
     default = '/opt/homebrew/opt/openssl@3' if sys.platform == 'darwin' else '/usr'
     prefix = Path(os.environ.get('OPENSSL_DIR', default))
     windows = os.name == 'nt'
-    executable = shutil.which('openssl') or str(prefix / 'bin' / 'openssl')
+    openssl = prefix / 'bin' / ('openssl.exe' if windows else 'openssl')
+    executable = str(openssl) if openssl.is_file() else shutil.which('openssl')
+    if not executable:
+        raise SystemExit('OpenSSL CLI is required to generate the test certificate')
     with tempfile.TemporaryDirectory(prefix='encore-network-test-') as directory:
         output = Path(directory)
         key, cert = output / 'key.pem', output / 'cert.pem'
