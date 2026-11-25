@@ -34,7 +34,16 @@ static size_t io(int kind,size_t handle,const char *data,size_t max,size_t timeo
 }
 static size_t completed_handle(size_t op) {
     int status=wait_for(op);
-    if(status!=1) { mf_str s=mfnet_error(op); fprintf(stderr,"status=%d: %s\n",status,sdata(s));drop(s); }
+    if (status != 1) {
+        pthread_mutex_lock(&mu);
+        operation *failed = find_op(op);
+        if (failed) fprintf(stderr, "operation kind=%d stage=%d tls=%d: ",
+                            failed->kind, failed->stage, (int)failed->tls);
+        pthread_mutex_unlock(&mu);
+        mf_str error = mfnet_error(op);
+        fprintf(stderr, "status=%d: %s\n", status, sdata(error));
+        drop(error);
+    }
     assert(status==1); size_t handle=mfnet_result_handle(op);assert(handle);mfnet_release(op);return handle;
 }
 static size_t listener(bool tls,const char *cert,const char *key) { return completed_handle(endpoint_op(7,"127.0.0.1",0,tls,"",cert,key)); }
