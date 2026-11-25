@@ -233,7 +233,7 @@ static void start_local(operation *o) {
     }
     e->pipe = pipe;
     e->local = true;
-    if (listener) wcscpy(e->pipe_name, name);
+    if (listener) memcpy(e->pipe_name, name, (wcslen(name) + 1) * sizeof(*name));
     o->result_id = e->id;
     done(o, 1, NULL);
 #else
