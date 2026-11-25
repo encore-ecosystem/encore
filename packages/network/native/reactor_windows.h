@@ -9,6 +9,7 @@ typedef struct {
     size_t generation;
     short interests;
     bool active;
+    bool probed;
     bool seen;
 } MfWindowsWatch;
 
@@ -43,6 +44,8 @@ static void drop_socket_watch(MfWindowsWatch *watch) {
 }
 
 static MfWindowsWatch *add_socket_watch(SOCKET socket, short interests, size_t generation) {
+    MfWindowsWatch *previous = find_socket_watch(socket);
+    if (previous) drop_socket_watch(previous);
     long events = FD_CLOSE;
     if (interests & POLLIN) events |= FD_READ | FD_ACCEPT;
     if (interests & POLLOUT) events |= FD_WRITE | FD_CONNECT;
@@ -54,6 +57,7 @@ static MfWindowsWatch *add_socket_watch(SOCKET socket, short interests, size_t g
             return NULL;
         }
         watch->active = true;
+        watch->probed = false;
         watch->interests = interests;
         watch->generation = generation;
         return watch;
@@ -94,8 +98,10 @@ static int reactor_wait(struct pollfd *fds, const size_t *generations, size_t co
                 fds[i].revents = POLLERR;
                 return 1;
             }
-            /* A connect or write may already have become ready before its
-             * network event was registered. Sample it once at registration. */
+        }
+        if (!watch->probed) {
+            watch->probed = true;
+            /* Also observe sockets that became ready synchronously. */
             struct pollfd probe = {fds[i].fd, interests, 0};
             if (WSAPoll(&probe, 1, 0) > 0 && probe.revents) {
                 for (size_t j = i; j < count; ++j) {
