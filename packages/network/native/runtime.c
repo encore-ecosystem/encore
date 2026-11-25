@@ -198,9 +198,21 @@ static void start_address(operation *o) {
         struct addrinfo *a=o->current; o->current=a->ai_next;
         int fd=mf_socket_open(a->ai_family,a->ai_socktype,a->ai_protocol); if(fd<0) continue;
         if(nonblocking(fd)<0) { mf_socket_close(fd); continue; }
-        int rc=connect(fd,a->ai_addr,a->ai_addrlen);
-        if(rc<0 && !mf_retry_connect()) { mf_socket_close(fd); continue; }
         endpoint *e=new_ep(fd,false); if(!e) { fail(o,8,"allocation failed"); return; }
+#ifdef _WIN32
+        /* FD_CONNECT is delivered once, including immediate refusals on a
+         * fallback address. Register before starting the connection. */
+        MfWindowsWatch *watch = add_socket_watch((SOCKET)fd, POLLOUT, e->id);
+        if (!watch) { close_ep(e); continue; }
+#endif
+        int rc=connect(fd,a->ai_addr,a->ai_addrlen);
+        if(rc<0 && !mf_retry_connect()) {
+#ifdef _WIN32
+            drop_socket_watch(watch);
+#endif
+            close_ep(e);
+            continue;
+        }
         e->refs++; e->group=o->group; o->ep=e; o->stage=1; o->interest=POLLOUT; return;
     }
     fail(o,6,"TCP connection failed for all addresses");
@@ -401,7 +413,8 @@ static void step(operation *o, short events) {
         if(o->stage==1) {
             if(!(events&(POLLOUT|POLLERR|POLLHUP))) return;
             int error=0; mf_addrlen n=sizeof(error);
-            if(getsockopt(o->ep->fd,SOL_SOCKET,SO_ERROR,(char *)&error,&n)<0 || error) {
+            if ((events & POLLERR) ||
+                getsockopt(o->ep->fd,SOL_SOCKET,SO_ERROR,(char *)&error,&n)<0 || error) {
                 close_ep(o->ep); o->ep->refs--; o->ep=NULL; start_address(o); return;
             }
             if(!o->tls) { o->result_id=o->ep->id; done(o,1,NULL); return; }
