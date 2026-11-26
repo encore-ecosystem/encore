@@ -2080,18 +2080,7 @@ fn check_statements(
                             replace_scope(ctx,(expr.line, expr.column, expr.line, expr.column + expr.length))
                         }
                     }
-                    match arm.pattern.binding {
-                        Option[str]::Some(name) => {
-                            push_binding(ctx, SemanticBinding {
-                                    name, match_pattern_binding_type(ctx, matched, arm.pattern), item.expr.line,
-                                    item.expr.column
-                                }
-                                , ctx.scope.0, ctx.scope.1,
-                            )
-                        }
-                        Option[str]::None => {
-                        }
-                    }
+                    push_match_binding(ctx, matched, arm.pattern)
                     match arm.body {
                         MatchArmBody::Block(body) => {
                             check_statements(ctx, body.statements, return_type)
@@ -2177,6 +2166,38 @@ fn push_binding(ctx: mut SemanticContext, binding: SemanticBinding, line: usize,
         ,
     )
     ret()
+}
+
+fn push_match_binding(ctx: mut SemanticContext, matched: str, pattern: MatchPattern) ->() {
+    match pattern.binding {
+        Some(name) => {
+            let mut line = ctx.scope.0
+            let mut column = ctx.scope.1
+            if pattern.binding_line != 0_usize {
+                line = pattern.binding_line
+                column = pattern.binding_column
+                replace_scope(ctx,(line, column, ctx.scope.2, ctx.scope.3))
+            }
+            push_binding(ctx, SemanticBinding {
+                    name, match_pattern_binding_type(ctx, matched, pattern), line, column
+                }
+                , line, column,)
+        }
+        None => {
+        }
+    }
+    ret()
+}
+
+fn expression_scope(expr: ExprNode) ->(usize, usize, usize, usize) {
+    match expr.value {
+        Expr::Block(block) => {
+            ret(block.start_line, block.start_column, block.end_line, block.end_column)
+        }
+        _ => {
+            ret(expr.line, expr.column, expr.line, expr.column + expr.length)
+        }
+    }
 }
 
 fn block_scope(body: ParsedBlock) ->(usize, usize, usize, usize) {
@@ -2370,24 +2391,16 @@ fn infer_expression(
             let matched = infer_expression_h(ctx, item.expr)
             let mut resolved = ""
             let outer_bindings = ctx.bindings.len()
+            let outer_scope = ctx.scope
             for arm in item.arms {
                 replace_bindings(ctx, outer_bindings)
-                match arm.pattern.binding {
-                    Option[str]::Some(name) => {
-                        ctx.bindings.push(SemanticBinding {
-                                name, match_pattern_binding_type(ctx, matched, arm.pattern), arm.expr.line,
-                                arm.expr.column
-                            }
-                            ,
-                        )
-                    }
-                    Option[str]::None => {
-                    }
-                }
+                replace_scope(ctx, expression_scope(arm.expr))
+                push_match_binding(ctx, matched, arm.pattern)
                 let arm_type = infer_expression(ctx, arm.expr)
                 resolved = merge_expression_types(ctx, resolved, arm_type, arm.expr)
             }
             replace_bindings(ctx, outer_bindings)
+            replace_scope(ctx, outer_scope)
             ret resolved
         }
         Expr::Index(item) => {
@@ -2535,24 +2548,16 @@ fn infer_expression_h(ctx: mut SemanticContext, expr: ExprNode<H>) -> str {
             let matched = infer_expression_h(ctx, item.expr)
             let mut resolved = ""
             let outer_bindings = ctx.bindings.len()
+            let outer_scope = ctx.scope
             for arm in item.arms {
                 replace_bindings(ctx, outer_bindings)
-                match arm.pattern.binding {
-                    Option[str]::Some(name) => {
-                        ctx.bindings.push(SemanticBinding {
-                                name, match_pattern_binding_type(ctx, matched, arm.pattern), arm.expr.line,
-                                arm.expr.column
-                            }
-                            ,
-                        )
-                    }
-                    Option[str]::None => {
-                    }
-                }
+                replace_scope(ctx, expression_scope(arm.expr))
+                push_match_binding(ctx, matched, arm.pattern)
                 let arm_type = infer_expression(ctx, arm.expr)
                 resolved = merge_expression_types(ctx, resolved, arm_type, arm.expr)
             }
             replace_bindings(ctx, outer_bindings)
+            replace_scope(ctx, outer_scope)
             ret resolved
         }
         Expr::Index(item) => {
@@ -3161,6 +3166,17 @@ fn resolve_call(ctx: mut SemanticContext, name: str, type_arguments: Vec[str], a
                     generic_call_matches(callable.params, argument_types, args, callable.generic_names, substitutions)
                 }
                 if matches {
+                    // The iterator argument determines the item type in enumerate,
+                    // even though that type appears only in Iter's bound.
+                    if callable.module_name == "core::iter" && callable.declaration_name == "enumerate" && type_arguments.is_empty() {
+                        let element = callable.generic_names.get(0_usize).unwrap_or("")
+                        if element != "" {
+                            let item = iterable_item_type(ctx, argument_types.get(0_usize).unwrap_or(""))
+                            if item != "" {
+                                substitutions.push((element, item))
+                            }
+                        }
+                    }
                     remember_dependency(ctx, callable)
                     ret Option[str]::Some(if callable.generic_names.len() == 0 {
                             substitute_return_type(callable.ret_type, callable.params, argument_types)

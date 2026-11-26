@@ -74,6 +74,7 @@ class ProjectMetadataTests(unittest.TestCase):
         for version, rejected, accepted in (
             ("0.1.14", "v0.1.13-neumann", "v0.1.14-neumann"),
             ("0.1.15", "v0.1.14-neumann", "v0.1.15-neumann"),
+            ("0.1.16", "v0.1.15-neumann", "v0.1.16-neumann"),
         ):
             policy.write_text(json.dumps({"schema": 1, "minimum_seed": version}))
             with self.assertRaisesRegex(ValueError, version):

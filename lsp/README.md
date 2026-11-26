@@ -14,6 +14,9 @@ Current server capabilities:
 - Markdown hover includes structured `///` documentation for local and imported
   declarations.
 - Typed `textDocument/signatureHelp` for ordinary and f-string calls in open documents and indexed workspace files.
+- `textDocument/inlayHint` shows inferred types for `let` declarations, enum
+  payload bindings such as `Option::Some(data)`, and named `match` operands
+  including field chains. Explicit annotations and `_` payloads are omitted.
 - `textDocument/references` across open documents and indexed workspace files, using workspace import resolution for top-level symbols.
 - `textDocument/documentHighlight` for same-document identifiers.
 - `textDocument/prepareRename` and `textDocument/rename` across open documents and indexed workspace files, including import-based top-level symbol usages.
@@ -140,6 +143,7 @@ python3 tests/scheduler.py target/dev/lsp
 python3 tests/protocol_features.py target/dev/lsp
 python3 tests/workspace_graph.py target/dev/lsp
 python3 tests/async_imports.py target/dev/lsp
+python3 tests/match_bindings.py target/dev/lsp
 python3 tests/autoimports.py target/release/lsp
 python3 tests/offline_dependencies.py target/release/lsp
 python3 tests/member_completion.py target/release/lsp

@@ -10,7 +10,7 @@ retain syntax and operator declarations accepted by 0.1.15. Integration fixtures
 exercise the new syntax and preview the next SDK contract.
 
 Release 0.1.17 switches arithmetic, bitwise and shift traits to two mandatory
-arguments, removes implicit numeric operator casts, and can adopt the new call
+arguments, removes implicit numeric casts from binary expressions, and can adopt the new call
 syntax in compiler and SDK sources. Its minimum published seed is 0.1.16.
 
 `scripts/bootstrap-compatibility.json` records each checkout's minimum seed.

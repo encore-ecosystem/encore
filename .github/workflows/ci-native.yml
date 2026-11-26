@@ -209,9 +209,9 @@ jobs:
           fi
           python3 scripts/test-terminal-progress.py --cc "$progress_cc" --compiler "$PWD/target/stage3/${{ inputs.executable }}"
 
-      - name: Verify the next release operator SDK with the bridge compiler
+      - name: Verify operator traits, output types and exact numeric operands
         shell: bash
-        run: python3 scripts/test-language-bridge.py --compiler "$PWD/target/stage3/${{ inputs.executable }}"
+        run: python3 scripts/test-operator-contracts.py --compiler "$PWD/target/stage3/${{ inputs.executable }}"
 
       - name: Test package project constants
         shell: bash
@@ -407,13 +407,17 @@ jobs:
           cp "lsp/target/extreme/$source_name" "target/stage3/$installed_name"
           chmod +x "target/stage3/$installed_name" 2>/dev/null || true
 
-      - name: Test language server import actions
+      - name: Test language server editor features
         if: inputs.triple == 'x86_64-unknown-linux-gnu'
         shell: bash
         run: |
           python3 lsp/tests/code_actions.py "$PWD/target/stage3/encore-lsp"
           python3 lsp/tests/organize_imports.py "$PWD/target/stage3/encore-lsp"
           python3 lsp/tests/project_constants.py "$PWD/target/stage3/encore-lsp"
+          python3 lsp/tests/match_bindings.py "$PWD/target/stage3/encore-lsp"
+          python3 lsp/tests/editor_matrix.py "$PWD/target/stage3/encore-lsp" EditorMatrix.test_named_argument_signature
+          python3 lsp/tests/local_navigation.py "$PWD/target/stage3/encore-lsp"
+          python3 lsp/tests/local_navigation.py "$PWD/target/stage3/encore-lsp" --versioned
 
       - name: Verify macOS deployment target
         if: inputs.triple == 'aarch64-apple-darwin'
@@ -428,6 +432,45 @@ jobs:
               *) echo "::error::$executable has unexpected minimum macOS $minimum"; exit 1 ;;
             esac
           done
+
+      - uses: actions/download-artifact@v7
+        if: contains(inputs.triple, 'windows-gnu')
+        with:
+          name: windows-openssl-${{ inputs.triple }}
+          path: target/windows-openssl
+
+      - name: Build native Windows MSVC OpenSSL
+        if: contains(inputs.triple, 'windows-msvc')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $install = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$install) { throw 'Visual Studio C++ installation is required' }
+          $vars = Join-Path $install 'VC\Auxiliary\Build\vcvars64.bat'
+          $environment = & $env:ComSpec /d /c "call `"$vars`" >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'vcvars64.bat failed' }
+          foreach ($line in $environment) {
+            if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
+          }
+          $perl = "$env:SystemDrive\Strawberry\perl\bin\perl.exe"
+          if (!(Test-Path $perl)) { $perl = (Get-Command perl.exe -CommandType Application).Source }
+          & $perl -MIPC::Cmd -e 1
+          if ($LASTEXITCODE -ne 0) { throw 'OpenSSL requires a complete Windows Perl installation' }
+          $env:OPENSSL_PERL = $perl
+          & bash scripts/build-windows-openssl.sh '${{ inputs.triple }}' target/windows-openssl
+          if ($LASTEXITCODE -ne 0) { throw 'OpenSSL build failed' }
+
+      - name: Test native TCP, TLS and local IPC
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CC="${ENCORE_CC:-clang}"
+          case '${{ inputs.triple }}' in
+            *-windows-*) export OPENSSL_DIR=$(cygpath -m "$PWD/target/windows-openssl") ;;
+            *-apple-darwin) export OPENSSL_DIR=$(brew --prefix openssl@3) ;;
+          esac
+          python3 packages/network/tests/run-native.py
 
       - name: Assemble release candidate
         shell: bash
@@ -448,6 +491,10 @@ jobs:
           chmod +x "$root/bin/$lsp_executable" 2>/dev/null || true
           python3 scripts/sdk_packages.py verify-provenance target/convergence.json
           python3 scripts/sdk_packages.py export-sdk --destination "$root/lib/encore/index" --manifest "$root/SDK.json"
+          if [[ '${{ inputs.triple }}' == *-windows-* ]]; then
+            mkdir -p "$root/lib/encore/index/openssl"
+            cp -R target/windows-openssl "$root/lib/encore/index/openssl/${{ inputs.triple }}"
+          fi
           cp LICENSE README.md "$root/share/doc/encore/"
           printf '%s\n' "$release" > "$root/VERSION"
           hash_file() {
@@ -481,6 +528,8 @@ jobs:
           fi
           bash scripts/verify-release-archive.sh "${{ inputs.triple }}" "$release" \
             "$archive" "dist/provenance-${{ inputs.triple }}.json"
+          python3 scripts/test-installed-sdk.py --archive "$archive" \
+            --release "$release" --triple "${{ inputs.triple }}"
 
       - uses: actions/upload-artifact@v7
         with:

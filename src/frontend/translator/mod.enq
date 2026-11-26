@@ -18,7 +18,7 @@ import std::vec::Vec
 
 import ehirlib::*
 import ehirlib::{EhirTextBuilder, ModuleBundle, parse_module_bundle_text, suppress_text_builder_output}
-import json::{Json, parse, stringify}
+import json::{Json, stringify}
 import rich::panel::Panel
 import rich::style::{accent, error_text, muted}
 
@@ -7435,7 +7435,73 @@ fn cached_module_items(module: Module) -> Vec[IrItem] {
     ret items
 }
 
+fn has_asyncio_main_decorator(item: FunctionItem) -> bool {
+    for app in item.decorators {
+        match app.expression.value {
+            Expr::Field(field) => {
+                if field.field == "main" && expr_h_path_or_empty(field.base) == "asyncio" {
+                    ret true
+                }
+            }
+            Expr::Path(path) => {
+                if path == "asyncio::main" {
+                    ret true
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret false
+}
+
+fn translate_asyncio_main(ctx: mut TranslatorContext, item: FunctionItem) -> LoweringBuilder {
+    if item.name != "main" || !item.is_async || !item.params.is_empty() || !item.generics.is_empty()
+    || item.decorators.len() != 1_usize || function_ret_type(item) != "u32" {
+        translation_error_at(item.source_name, item.line, item.column, "invalid-async-main",
+            "@asyncio.main requires an async fn main() -> u32 with one decorator",)
+    }
+    let runtime = match ctx_lookup_function_for_args(ctx, item.source_name, "asyncio::run_main", vec!["u32"]) {
+        Some(function) => module_identity_for_source(ctx, function.source_name) == "asyncio@lib.enq"
+        None => false
+    }
+    if !runtime {
+        translation_error_at(item.source_name, item.line, item.column, "asyncio-main-dependency",
+            "@asyncio.main requires the asyncio SDK package",)
+    }
+    let raw_name = decorator_hidden_name(ctx, item, 0_usize)
+    let raw_item = FunctionItem {
+        Vec[str]::new(), Vec[DecoratorApplication]::new(), false, false, true, raw_name,
+        Option[Documentation]::None, item.generics, item.params, item.ret_type, false, false,
+        item.body, item.source_name, item.line, item.column, false
+    }
+    let emitted = register_decorator_layer(ctx, raw_item, raw_name)
+    let async_body = translate_async_function(ctx, raw_item, emitted)
+    let future_type = async_future_type(emitted, Vec[GenericParam]::new())
+    let code = "fn main() -> u32 { ret asyncio::run_main[" + future_type + "](" + raw_name + "()) }"
+    let mut lexer = Lexer::new()
+    let mut parser = Parser::new_for_source(item.source_name)
+    for statement in parser.parse(lexer.tokenize(code)) {
+        match statement {
+            Statement::Function(wrapper) => {
+                ret async_body.empty_line().append(translate_function_named(ctx, wrapper, "main", "u32", Vec[GenericParam]::new()))
+            }
+            _ => {
+            }
+        }
+    }
+    translation_invariant_error("asyncio entrypoint did not produce a wrapper")
+    ret async_body
+}
+
 fn translate_function(ctx: mut TranslatorContext, fn_item: FunctionItem) -> LoweringBuilder {
+    if has_asyncio_main_decorator(fn_item) {
+        ret translate_asyncio_main(ctx, fn_item)
+    }
+    if fn_item.name == "main" && fn_item.is_async {
+        translation_error_at(fn_item.source_name, fn_item.line, fn_item.column, "async-main-without-executor",
+            "use @asyncio.main or call an executor from a synchronous entrypoint",)
+    }
     if fn_item.is_async && fn_item.is_extern {
         translation_error_at(fn_item.source_name, fn_item.line, fn_item.column, "async-extern", "extern functions cannot be async")
     }
@@ -8097,7 +8163,7 @@ fn translate_impl(ctx: mut TranslatorContext, item: ImplStmt) -> LoweringBuilder
 
 fn register_decorator_method_layer(ctx: mut TranslatorContext, item: FunctionItem, owner: str,
     impl_generics: Vec[GenericParam],) ->() {
-    let logical_name = base_type_name(owner) + "::" + item.name
+    let logical_name = qualified_callable_name(ctx, item.source_name, base_type_name(owner) + "::" + item.name)
     let output_type = function_ret_type_for_owner(item, owner)
     let all_generics = combined_generic_params(impl_generics, item.generics)
     let callable_type = if item.is_generator {
@@ -11484,6 +11550,32 @@ fn lower_invocation_expr(ctx: mut TranslatorContext, call: CallExpr, source_name
                     let out = prefix + "_sync_drop_" + Debug::fmt(idx)
                     ret LoweredExpr {
                         LoweringBuilder::new(ctx.ir_scope).call((out), "usize", "__ehir_function_address__" + name + "[void,usize]", Vec[Operand]::new(), false), out, "usize"
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
+    if last_type_path_segment(callee_base) == "__poll_address" && generic_args.len() == 2_usize && call.args.is_empty() {
+        match ctx_lookup_function_for_args(ctx, source_name, callee, Vec[str]::new()) {
+            Some(function) => {
+                if module_identity_for_source(ctx, function.source_name) == "asyncio@lib.enq" {
+                    let output = qualified_type_for_source(ctx, source_name, generic_args.get(0).unwrap_or(""))
+                    let future = qualified_type_for_source(ctx, source_name, generic_args.get(1).unwrap_or(""))
+                    let name = "__encore_asyncio_poll_" + compiler_content_digest(ctx.current_module + "|" + output + "|" + future)
+                    let mut exists = false
+                    for adapter in ctx.reflection_specializations {
+                        if adapter.name == name {
+                            exists = true
+                        }
+                    }
+                    if !exists {
+                        plugin_queue_adapter(ctx, name, "fn adapter(payload:usize, waker:usize) -> usize { ret asyncio::__poll_payload[" + output + "," + future + "](payload, waker) }", "encore-asyncio-adapter:" + name)
+                    }
+                    let out = prefix + "_asyncio_poll_" + Debug::fmt(idx)
+                    ret LoweredExpr {
+                        LoweringBuilder::new(ctx.ir_scope).call(out, "usize", "__ehir_function_address__" + name + "[usize,usize,usize]", Vec[Operand]::new(), false), out, "usize"
                     }
                 }
             }
@@ -18618,8 +18710,8 @@ fn translation_environment_declarations(ast: Vec[Statement]) -> Vec[Statement] {
 fn environment_module_declarations(artifact: TranslationEnvironmentArtifact) -> Result[Vec[TranslationModule], str] {
     let mut modules = Vec[TranslationModule]::new()
     for module in artifact.modules {
-        let ast = decode_metadata_ast(parse(module.declarations).unwrap_or(Json::Null))?
-        let documentation = decode_metadata_documentation(parse(module.documentation).unwrap_or(Json::Null))?
+        let ast = decode_metadata_ast(json::parse(module.declarations).unwrap_or(Json::Null))?
+        let documentation = decode_metadata_documentation(json::parse(module.documentation).unwrap_or(Json::Null))?
         modules.push(TranslationModule {
                 module.id, module.source_name, "", documentation,
                 module.imports, ast, module.features, 0_usize

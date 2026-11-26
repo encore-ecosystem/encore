@@ -67,7 +67,8 @@ def main():
             request(p, 2, 'textDocument/diagnostic', {'textDocument': {'uri': uri}})
             for number, (line, column, expected_line, expected_column) in enumerate([
                 (6, 6, 1, 5), (4, 15, 3, 6), (3, 15, 1, 5), (3, 7, 3, 6),
-                (12, 15, 9, 1), (14, 6, 9, 1), (9, 2, 9, 1), (13, 24, 10, 1), (18, 6, 17, 5),
+                (12, 15, 9, 1), (14, 6, 9, 1), (9, 2, 9, 1), (10, 2, 10, 1),
+                (13, 24, 10, 1), (18, 6, 17, 5),
                 (23, 7, 22, 9),
             ], 10):
                 result = request(p, number, 'textDocument/definition', {
@@ -75,9 +76,16 @@ def main():
                 assert result and result[0]['uri'] == uri, (line, column, result)
                 assert result[0]['range']['start'] == {'line': expected_line, 'character': expected_column}, result
             for number, (line, column, expected) in enumerate([
+                (9, 2, 'value: u32'), (10, 2, 'other: u32'), (12, 15, 'value: u32'),
+            ], 100):
+                result = request(p, number, 'textDocument/hover', {
+                    'textDocument': {'uri': uri}, 'position': {'line': line, 'character': column}})
+                assert result and result['contents']['value'] == expected, (line, column, result)
+            for number, (line, column, expected) in enumerate([
                 (6, 6, {(1, 5), (3, 14), (6, 5)}),
                 (4, 15, {(3, 6), (4, 14)}),
                 (12, 15, {(9, 1), (12, 14), (14, 5)}),
+                (9, 2, {(9, 1), (12, 14), (14, 5)}),
                 (13, 24, {(10, 1), (13, 23)}),
                 (18, 6, {(17, 5), (18, 5)}),
             ], 20):

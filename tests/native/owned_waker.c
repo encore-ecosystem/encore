@@ -43,6 +43,13 @@ int main(void) {
   size_t next = encore_async_waker_new();
   if (next <= first)
     return 3;
+  size_t child = encore_async_waker_child(next);
+  if (child <= next)
+    return 9;
+  encore_async_waker_wake(child);
+  encore_async_waker_wait(next);
+  encore_async_waker_wait(child);
+  encore_async_waker_drop(child);
 #ifndef _WIN32
   pthread_t waiter;
   if (pthread_create(&waiter, NULL, wait_once, (void *)(uintptr_t)next))

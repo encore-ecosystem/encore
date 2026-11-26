@@ -57,9 +57,15 @@ case "$CI_PROBE_CASE" in
       mkdir -p "$context/bin" "$workspace/packages" "$workspace/lsp"
       mkdir -p "$workspace/scripts" "$workspace/src"
       cp "$repository/scripts/project-metadata.py" "$repository/scripts/sdk_packages.py" "$workspace/scripts/"
-      while IFS= read -r package; do
-        ln -s "$repository/$package" "$workspace/$package"
-      done < <(git -C "$repository" ls-tree --name-only HEAD packages/)
+      # Tracked in-tree packages need real files for checkout verification.
+      # Submodule worktrees can be shared with the original checkout.
+      git -C "$workspace" restore --source=HEAD --staged --worktree -- packages
+      while read -r mode kind object package; do
+        if [[ "$kind" == commit ]]; then
+          rmdir "$workspace/$package"
+          ln -s "$repository/$package" "$workspace/$package"
+        fi
+      done < <(git -C "$repository" ls-tree HEAD packages/)
       cp "$repository/src/version.enq" "$workspace/src/"
       cp "$repository/encore.toml" "$workspace/"
       cp "$repository/tests/ci/mock-compiler.sh" "$context/bin/encore"

@@ -15,6 +15,7 @@ compiler=
 linker=
 archiver=
 sysroot=
+openssl=
 base_url=
 sdk_manifest=
 compile_args=()
@@ -30,6 +31,7 @@ while (($#)); do
     --linker) linker=$2; shift 2 ;;
     --archiver) archiver=$2; shift 2 ;;
     --sysroot) sysroot=$2; shift 2 ;;
+    --openssl) openssl=$2; shift 2 ;;
     --compile-arg) compile_args+=("$2"); shift 2 ;;
     --link-arg) link_args+=("$2"); shift 2 ;;
     --base-url) base_url=${2%/}; shift 2 ;;
@@ -51,6 +53,10 @@ payload="$work/payload"
 mkdir -p "$payload/toolchain" "$out"
 cp -RL "$toolchain"/. "$payload/toolchain/"
 cp -RL "$platform" "$payload/platform"
+if test -n "$openssl"; then
+  test -d "$openssl/include/openssl" && test -d "$openssl/lib"
+  cp -RL "$openssl" "$payload/openssl"
+fi
 abi_header="$(dirname "$0")/../packages/core/runtime_abi.h"
 cp "$abi_header" "$payload/platform/runtime_abi.h"
 if test -n "$sdk_manifest"; then cp "$sdk_manifest" "$payload/SDK.json"; fi

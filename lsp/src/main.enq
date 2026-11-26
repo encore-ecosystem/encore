@@ -3525,7 +3525,7 @@ fn inlay_hint_result(state: mut ServerState, params: Json) -> Json {
             let end_line = json_number_usize(json_get(json_get(range, "end"), "line"), document_last_line(doc.text) + 1_usize)
             let start_column = json_number_usize(json_get(json_get(range, "start"), "character"), 0_usize)
             let end_column = json_number_usize(json_get(json_get(range, "end"), "character"), 0_usize)
-            ret inferred_let_hints(state, doc, start_line, start_column, end_line, end_column)
+            ret inferred_type_hints(state, doc, start_line, start_column, end_line, end_column)
         }
         Option[Document]::None => {
         }
@@ -3533,52 +3533,133 @@ fn inlay_hint_result(state: mut ServerState, params: Json) -> Json {
     ret Json::Array(Vec[Json]::new())
 }
 
-fn inferred_let_hints(state: mut ServerState, doc: Document, start_line: usize, start_column: usize,
+// Syntax selects hint sites; the shared semantic database supplies their types.
+// Keep ordinary references quiet while exposing inferred declarations and the
+// named value inspected by a match (including field chains).
+fn inferred_hint_token(doc: Document, index: usize) -> Option[usize] {
+    if token_has_type(doc, index, TokenType::KW_LET) {
+        let mut name = index + 1_usize
+        if token_has_type(doc, name, TokenType::KW_MUT) {
+            name += 1_usize
+        }
+        if token_has_type(doc, name, TokenType::IDENTIFIER)
+        && token_has_type(doc, name + 1_usize, TokenType::ASSIGN) {
+            ret Option[usize]::Some(name)
+        }
+    } elif token_has_type(doc, index, TokenType::KW_MATCH) {
+        let mut name = index + 1_usize
+        if token_has_type(doc, name, TokenType::IDENTIFIER) {
+            while token_has_type(doc, name + 1_usize, TokenType::DOT)
+            && token_has_type(doc, name + 2_usize, TokenType::IDENTIFIER) {
+                name += 2_usize
+            }
+            if token_has_type(doc, name + 1_usize, TokenType::LEFT_BRACE) {
+                ret Option[usize]::Some(name)
+            }
+        }
+    } elif token_has_type(doc, index, TokenType::FAT_ARROW) && index >= 3_usize {
+        if token_has_type(doc, index - 1_usize, TokenType::RIGHT_PAREN)
+        && token_has_type(doc, index - 2_usize, TokenType::IDENTIFIER)
+        && token_has_type(doc, index - 3_usize, TokenType::LEFT_PAREN) {
+            ret Option[usize]::Some(index - 2_usize)
+        }
+    }
+    ret Option[usize]::None
+}
+
+fn inferred_hint_type(state: mut ServerState, doc: Document, name: Token,
+    name_index: usize, declaration: bool,) -> str {
+    if !declaration && name_index > 0_usize
+    && token_has_type(doc, name_index - 1_usize, TokenType::DOT) {
+        match state.analysis.member_details_at(doc.uri, name.value, name.line, name.column) {
+            Some(details) => {
+                ret details.typ
+            }
+            None => {
+                ret ""
+            }
+        }
+    }
+    match state.analysis.semantic_binding_at(doc.uri, name.value, name.line, name.column) {
+        Some(binding) => {
+            if !declaration ||(binding.line == name.line && binding.column == name.column) {
+                ret binding.typ
+            }
+        }
+        None => {
+        }
+    }
+    ret ""
+}
+
+// Imported call signatures can refer to private imports in their declaring
+// module (notably a concrete Future's poll output). Prepare those same modules
+// as navigation does before checking the body for its first hint request.
+fn index_inlay_types(state: mut ServerState, doc: Document) ->() {
+    let visited = encore_strset_new()
+    index_query_module(state, doc, visited, true)
+    encore_strset_free(visited)
+    let owners = encore_strset_new()
+    let mut index = 0_usize
+    while index < doc.analysis.tokens.len() {
+        match doc.analysis.tokens.get(index) {
+            Some(token) => {
+                if token.type == TokenType::IDENTIFIER
+                &&(token_has_type(doc, index + 1_usize, TokenType::LEFT_PAREN)
+                    || token_has_type(doc, index + 1_usize, TokenType::LEFT_BRACKET)) {
+                    match resolved_symbol_in_index(state, doc, token) {
+                        Some(reference) => {
+                            if reference.callable.is_some() && encore_strset_insert(owners, reference.uri) {
+                                let origin = document_for_path(state, uri_to_path(reference.uri))
+                                let imports = encore_strset_new()
+                                index_query_module(state, origin, imports, true)
+                                encore_strset_free(imports)
+                            }
+                        }
+                        None => {
+                        }
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        index += 1_usize
+    }
+    encore_strset_free(owners)
+    ret()
+}
+
+fn inferred_type_hints(state: mut ServerState, doc: Document, start_line: usize, start_column: usize,
     end_line: usize, end_column: usize,) -> Json {
     let mut hints = Vec[Json]::new()
     let mut indexed = false
     let mut index = 0_usize
     while index < doc.analysis.tokens.len() {
-        match doc.analysis.tokens.get(index) {
-            Some(token) => {
-                if token.type == TokenType::KW_LET {
-                    let mut name_index = index + 1_usize
-                    if token_has_type(doc, name_index, TokenType::KW_MUT) {
-                        name_index += 1_usize
-                    }
-                    match doc.analysis.tokens.get(name_index) {
-                        Some(name) => {
-                            if name.type == TokenType::IDENTIFIER && name.line >= start_line
-                            && name.line <= end_line && token_has_type(doc, name_index + 1_usize, TokenType::ASSIGN) {
-                                let column = utf16_column(line_text_at(doc.text, name.line).unwrap_or(""),
-                                    actual_token_column_at_index(doc, name_index, name),) + utf16_len(name.value)
-                                if (name.line == start_line && column < start_column)
-                                ||(name.line == end_line && column >= end_column) {
-                                    index += 1_usize
-                                    continue
-                                }
-                                if !indexed {
-                                    let visited = encore_strset_new()
-                                    index_query_module(state, doc, visited, true)
-                                    encore_strset_free(visited)
-                                    indexed = true
-                                }
-                                // The same recovered body and declaration identity serve
-                                // hover, navigation, rename and inferred type hints.
-                                match state.analysis.semantic_binding_at(doc.uri, name.value, name.line, name.column) {
-                                    Some(binding) => {
-                                        if binding.name == name.value && binding.line == name.line
-                                        && binding.column == name.column && binding.typ != "" {
-                                            hints.push(type_inlay_hint(doc, name_index, name, binding.typ))
-                                        }
-                                    }
-                                    None => {
-                                    }
-                                }
+        match inferred_hint_token(doc, index) {
+            Some(name_index) => {
+                match doc.analysis.tokens.get(name_index) {
+                    Some(name) => {
+                        if name.value != "_" && name.line >= start_line && name.line <= end_line {
+                            let column = utf16_column(line_text_at(doc.text, name.line).unwrap_or(""),
+                                actual_token_column_at_index(doc, name_index, name),) + utf16_len(name.value)
+                            if (name.line == start_line && column < start_column)
+                            ||(name.line == end_line && column >= end_column) {
+                                index += 1_usize
+                                continue
+                            }
+                            if !indexed {
+                                index_inlay_types(state, doc)
+                                indexed = true
+                            }
+                            let typ = inferred_hint_type(state, doc, name, name_index,
+                                !token_has_type(doc, index, TokenType::KW_MATCH),)
+                            if typ != "" {
+                                hints.push(type_inlay_hint(doc, name_index, name, typ))
                             }
                         }
-                        None => {
-                        }
+                    }
+                    None => {
                     }
                 }
             }
@@ -3949,7 +4030,17 @@ fn signature_help_result(state: mut ServerState, params: Json) -> Json {
                         Option[ResolvedReference]::Some(reference) => {
                             match reference.callable {
                                 Option[FrontendCallable]::Some(callable) => {
-                                    ret signature_help_for_callable(callable, call.1)
+                                    let mut active = call.1
+                                    if call.2 != "" {
+                                        let mut index = 0_usize
+                                        for parameter in callable.params {
+                                            if starts_with(parameter, call.2 + ":") {
+                                                active = index break
+                                            }
+                                            index += 1_usize
+                                        }
+                                    }
+                                    ret signature_help_for_callable(callable, active)
                                 }
                                 Option[FrontendCallable]::None => {
                                 }
@@ -7744,6 +7835,7 @@ fn keyword_completion_items() -> Vec[Json] {
     push_keyword_completion(items, "unsafe")
     push_keyword_completion(items, "while")
     push_keyword_completion(items, "with")
+    push_keyword_completion(items, "yield")
     ret items
 }
 

@@ -132,6 +132,23 @@ class SdkPackagesTests(unittest.TestCase):
         sdk.export_package(legacy, old, "core", destination)
         self.assertEqual((destination / "runtime.c").read_bytes(), b"old release runtime\n")
 
+    def test_in_tree_sdk_package_has_a_stable_source_identity(self):
+        self.write(self.root, "packages/ipc/encore.toml", b'[project]\nname="ipc"\nversion="1.0.0"\n')
+        self.write(self.root, "packages/ipc/src/lib.enq", b"// Standalone IPC package\n")
+        self.commit(self.root)
+        packages = ("core", "ipc")
+        before = sdk.sdk_manifest(self.root, packages=packages, verify_checkout=True)
+        self.assertEqual(before["packages"][1]["tree"],
+                         self.run_git(self.root, "rev-parse", "HEAD:packages/ipc").strip())
+
+        self.write(self.root, "README.md", b"Unrelated compiler documentation\n")
+        self.commit(self.root)
+        self.assertEqual(before, sdk.sdk_manifest(self.root, packages=packages, verify_checkout=True))
+
+        self.write(self.root, "packages/ipc/src/lib.enq", b"// Dirty IPC source\n")
+        with self.assertRaisesRegex(ValueError, "tracked changes: packages/ipc"):
+            sdk.sdk_manifest(self.root, packages=packages, verify_checkout=True)
+
     def test_nested_gitlinks_are_expanded_at_their_own_pins(self):
         nested = self.directory / "native helper"
         self.initialize(nested)
