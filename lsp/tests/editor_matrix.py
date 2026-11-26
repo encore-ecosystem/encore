@@ -183,6 +183,16 @@ class EditorMatrix(unittest.TestCase):
         self.assertEqual(signature['signatures'][0]['label'],
                          'add(left: u32, right: u32) -> u32')
 
+    def test_named_argument_signature(self):
+        self.open('fn scale(value: u32, factor: u32 = 2) -> u32 { ret value * factor }\n'
+                  'fn run() -> u32 { ret scale(factor: 3_u32, value: 10_u32) }\n')
+        signature = self.call('textDocument/signatureHelp', self.at('3_u32'))
+        self.assertEqual(signature['signatures'][0]['label'],
+                         'scale(value: u32, factor: u32 = 2) -> u32')
+        self.assertEqual(signature['activeParameter'], 1)
+        signature = self.call('textDocument/signatureHelp', self.at('10_u32'))
+        self.assertEqual(signature['activeParameter'], 0)
+
     def test_19_empty_document_recovery(self):
         self.open('')
         self.assertEqual(self.call('textDocument/semanticTokens/full', {
