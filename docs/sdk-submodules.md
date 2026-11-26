@@ -59,10 +59,12 @@ Bootstrap overlays and release packaging use this exporter. Benchmark snapshots
 also walk submodules; working-tree measurements preserve edited and untracked
 source inputs while excluding Git metadata and ignored build outputs.
 
-Native distributions contain all 16 packages as ordinary directories under
-`lib/encore/index`, including headers, native runtimes, build scripts and tests.
-They also include `SDK.json`, containing each package's repository, directory,
-manifest identity and commit. Git metadata and build caches are excluded.
+Native distributions contain the 16 pinned packages and the in-tree SDK
+packages as ordinary directories under `lib/encore/index`, including headers,
+native runtimes, build scripts and tests. Starting with 0.1.18, the in-tree
+packages include `ehir-interpret` and `ehir-dbg`. The `SDK.json` manifest
+records each package's directory, manifest identity and source Git object.
+Git metadata and build caches are excluded.
 
 CI tests the extracted compiler and bundled SDK outside the source checkout with
 empty build/registry caches and an unreachable registry. Both cold and warm
