@@ -32,10 +32,22 @@ def metadata(root: Path) -> dict[str, str]:
             "release": f"{version}-{names[0]}"}
 
 
-def check_seed(tag: str) -> None:
+def check_seed(tag: str, root: Path | None = None) -> None:
     match = re.fullmatch(r"v([0-9]+)\.([0-9]+)\.([0-9]+)(?:-[a-z][a-z0-9-]*)?", tag)
-    if not match or tuple(map(int, match.groups())) < MINIMUM_SEED:
-        raise ValueError("bootstrapping requires published Encore 0.1.9 or newer (project constants)")
+    minimum = MINIMUM_SEED
+    if root is not None:
+        contract = root / "scripts/bootstrap-compatibility.json"
+        if contract.exists():
+            policy = json.loads(contract.read_text(encoding="utf-8"))
+            if policy.get("schema") != 1:
+                raise ValueError("unsupported bootstrap compatibility schema")
+            version = policy.get("minimum_seed", "")
+            if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
+                raise ValueError("invalid bootstrap minimum_seed")
+            minimum = max(minimum, tuple(map(int, version.split("."))))
+    if not match or tuple(map(int, match.groups())) < minimum:
+        required = ".".join(map(str, minimum))
+        raise ValueError(f"bootstrapping requires published Encore {required} or newer")
 
 
 def main() -> int:
@@ -47,7 +59,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.check_seed is not None:
-            check_seed(args.check_seed)
+            check_seed(args.check_seed, args.root)
             return 0
         values = metadata(args.root)
         print(values[args.field] if args.field else json.dumps(values, ensure_ascii=False))

@@ -80,6 +80,15 @@ class SdkPackagesTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differs from the gitlink"):
             self.manifest(verify=True)
 
+    def test_export_uses_pinned_bytes_with_windows_line_ending_configuration(self):
+        self.run_git(self.root, "config", "core.autocrlf", "true")
+        self.run_git(self.child, "config", "core.autocrlf", "true")
+        destination = self.directory / "canonical SDK"
+        sdk.export_package(self.root, self.parent, "core", destination)
+        for name in ("src/lib.enq", "runtime.c", "native.h", "build.enq", "encore.toml"):
+            expected = self.run_git(self.origin, "show", f"{self.first}:{name}").encode()
+            self.assertEqual((destination / name).read_bytes(), expected)
+
     def test_tracked_edits_are_rejected_but_ignored_build_outputs_are_allowed(self):
         before = sdk.manifest_digest(self.manifest(verify=True))
         self.write(self.child, "target/cache", b"build output")

@@ -83,7 +83,7 @@ def export_tree(root: Path, ref: str, destination: Path, paths: tuple[str, ...] 
     """Materialize a commit, expanding gitlinks at their recorded commits."""
     destination.mkdir(parents=True, exist_ok=True)
     pinned = links(root, ref)
-    command = ["archive", "--format=tar", ref]
+    command = ["-c", "core.autocrlf=false", "-c", "core.eol=lf", "archive", "--format=tar", ref]
     if paths:
         parent_paths = []
         for selected in paths:
@@ -195,7 +195,7 @@ def check_sdk_archive(archive: Path, prefix: str, manifest: dict, root: Path | N
             raise ValueError(f"bundled package identity differs: {folder}")
         if root is not None:
             repository = repository_for_link(root, package["path"], package["commit"])
-            with tarfile.open(fileobj=io.BytesIO(git(repository, "archive", "--format=tar", package["commit"]))) as source:
+            with tarfile.open(fileobj=io.BytesIO(git(repository, "-c", "core.autocrlf=false", "-c", "core.eol=lf", "archive", "--format=tar", package["commit"]))) as source:
                 expected = {item.name: source.extractfile(item).read() for item in source.getmembers() if item.isfile()}
             package_prefix = f"{prefix}/lib/encore/index/{folder}/"
             actual = {name[len(package_prefix):]: data for name, data in files.items() if name.startswith(package_prefix)}
